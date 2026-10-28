@@ -262,9 +262,14 @@ describe('switch-on: refused', () => {
     // A craps state up under a roulette switch: the other game's.
     come('craps-2', null);
     expect(a.table.switchComputedOn('craps-2', 'roulette', T0)).toBe('craps');
-    // A point on, a roll closing, a come bet on a number: refused.
+    // A point on (a pass line riding it), a roll closing, a come bet on a
+    // number: refused.
     come('craps-3', 6);
+    expect(a.casino.writeMyCrapsBets('craps-3', a.pid, [{ type: 'pass', amount: 10 }])).toBe(true);
     expect(a.table.switchComputedOn('craps-3', 'craps', T0)).toBe('contract');
+    // A point on with nothing on the felt holds nothing back: it goes.
+    come('craps-8', 6);
+    expect(a.table.switchComputedOn('craps-8', 'craps', T0)).toBe('ok');
     expect(a.table.SWITCH_ON_REFUSED.contract).toBe('WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER');
     come('craps-4', null, 'closing');
     expect(a.table.switchComputedOn('craps-4', 'craps', T0)).toBe('busy');
@@ -294,6 +299,7 @@ describe('switch-on: refused', () => {
     expect(a.table.switchComputedOn('craps-7', 'craps', T0)).toBe('craps');
     expect(a.table.switchComputedOn('craps-1', 'roulette', T0)).toBe('craps');
     expect(['craps-2', 'craps-3', 'craps-4'].some((t) => a.casino.isComputedTable(t))).toBe(false);
+    expect(a.casino.computedIncOf('craps-8')).toMatch(/^k[0-9a-f]{24}$/);
   });
 });
 
@@ -391,28 +397,255 @@ describe('writeComputedOn', () => {
 });
 
 describe('the dev flag', () => {
-  it("reads ?computed=1 on the page's address, or localStorage's ssf-dev-computed, and is off otherwise", async () => {
+  it("is on unless ?computed=0 on the page's address or localStorage's ssf-dev-computed is '0' (the address first)", async () => {
     const [a] = await room(['A']);
     a.table.setComputedTablesEnabledForTests(null);
     const loc = (window as unknown as { location: { search: string } }).location;
+    expect(a.table.computedTablesEnabled()).toBe(true);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toMatchObject({ show: true, on: false });
+    loc.search = '?room=x&computed=0';
     expect(a.table.computedTablesEnabled()).toBe(false);
     expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0).show).toBe(false);
-    loc.search = '?room=x&computed=1';
+    loc.search = '?computed=1';
     expect(a.table.computedTablesEnabled()).toBe(true);
-    loc.search = '?computed=0';
-    expect(a.table.computedTablesEnabled()).toBe(false);
     loc.search = '';
     const store = new Map<string, string>();
     vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null });
+    expect(a.table.computedTablesEnabled()).toBe(true);
+    store.set('ssf-dev-computed', '0');
     expect(a.table.computedTablesEnabled()).toBe(false);
+    loc.search = '?computed=1';
+    expect(a.table.computedTablesEnabled()).toBe(true);
+    loc.search = '';
     store.set('ssf-dev-computed', '1');
     expect(a.table.computedTablesEnabled()).toBe(true);
-    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toMatchObject({ show: true, on: false });
-    // Storage that throws reads as no flag there.
+    // Storage that throws reads as no flag there: on.
     vi.stubGlobal('localStorage', { getItem: () => { throw new Error('blocked'); } });
-    expect(a.table.computedTablesEnabled()).toBe(false);
+    expect(a.table.computedTablesEnabled()).toBe(true);
     vi.unstubAllGlobals();
     vi.stubGlobal('window', windowStub);
+  });
+
+  it('in a venture room (no page drives the tables) offers the way on only with the flag turned on by hand', async () => {
+    const [a] = await room(['A']);
+    a.table.setComputedTablesEnabledForTests(null);
+    const loc = (window as unknown as { location: { search: string } }).location;
+    a.croupier.setSoleCroupierPredicate(() => false);
+    try {
+      expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0).show).toBe(false);
+      loc.search = '?computed=1';
+      expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toMatchObject({ show: true, on: false, can: true });
+      loc.search = '';
+      const store = new Map<string, string>([['ssf-dev-computed', '1']]);
+      vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null });
+      expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0).show).toBe(true);
+      vi.unstubAllGlobals();
+      vi.stubGlobal('window', windowStub);
+      // A table computed already shows the way back there all the same.
+      expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
+      expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0)).toMatchObject({ show: true, on: true });
+    } finally {
+      vi.unstubAllGlobals();
+      vi.stubGlobal('window', windowStub);
+      loc.search = '';
+      a.croupier.setSoleCroupierPredicate(() => true);
+    }
+    // The deed holder's page: on with no flag.
+    expect(a.table.computedSwitchState(OTHER, 'roulette', true, T0)).toMatchObject({ show: true, on: false });
+  });
+});
+
+describe('tables computed by default (autoSwitchComputed)', () => {
+  /** Round 1 settled on page p, its result showing until `until` (none:
+   *  settled by hand, the robot's show beat not armed yet). */
+  const settle = (p: Page, until?: number): void => {
+    p.casino.writeTableState(TABLE, {
+      ...p.casino.readTableState(TABLE)!, phase: 'settled', result: 3, resultAt: T0, payouts: {}, phaseDeadline: until,
+    });
+  };
+
+  it('switches an owner-run table on by itself once the switch may go, trying at most once a second', async () => {
+    const [a, b] = await room(['A', 'B']);
+    at(a, T0);
+    a.croupier.openBetting(TABLE, 1);
+    sync(T0, a, b);
+    at(b, T0);
+    b.casino.writeMyBets(TABLE, b.pid, 1, [red(10)]);
+    sync(T0, a, b);
+    // A round under way: not yet.
+    at(a, T0);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0)).toBe(false);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    // Settled with its show over is quiet, but the next try waits out the
+    // second.
+    settle(a, T0 + 200);
+    at(a, T0 + 500);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 500)).toBe(false);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    at(a, T0 + 1_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(true);
+    expect(a.casino.isComputedTable(TABLE)).toBe(true);
+    expect(incOf(a)).toMatch(/^c[0-9a-f]{24}$/);
+    // Computed already: nothing more.
+    at(a, T0 + 2_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 2_000)).toBe(false);
+  });
+
+  it("waits out a settled round's show, switching where the robot would open the next window", async () => {
+    const [a, b] = await room(['A', 'B']);
+    const SHOW = a.croupier.SHOW_MS;
+    at(a, T0);
+    a.croupier.openBetting(TABLE, 1);
+    sync(T0, a, b);
+    at(b, T0);
+    b.casino.writeMyBets(TABLE, b.pid, 1, [red(10)]);
+    sync(T0, a, b);
+    // Settled by hand, its show beat not armed yet: the result shows.
+    settle(a);
+    at(a, T0);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0)).toBe(false);
+    settle(a, T0 + SHOW);
+    for (const T of [T0 + 1_000, T0 + 4_000, T0 + SHOW - 1]) {
+      at(a, T);
+      expect(a.table.autoSwitchComputed(TABLE, 'roulette', T)).toBe(false);
+      expect(a.casino.readTableState(TABLE)?.phase).toBe('settled');
+    }
+    // The card's switch still goes meanwhile, as the house presses it.
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0 + SHOW - 1)).toMatchObject({ show: true, on: false, can: true });
+    // The show over: at once (the tries while it showed don't count).
+    at(a, T0 + SHOW);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + SHOW)).toBe(true);
+    expect(a.casino.isComputedTable(TABLE)).toBe(true);
+    // At craps alike.
+    const T = 'craps-1';
+    const settled = (until: number): void => {
+      a.casino.writeCrapsTableState(T, {
+        kind: 'craps', phase: 'settled', round: 1, point: null, dice: null, result: null, resultAt: T0, payouts: null,
+        phaseDeadline: until, ...a.casino.tableOpening(T),
+      });
+    };
+    const end = T0 + SHOW + a.croupier.CRAPS_SHOW_MS;
+    settled(end);
+    at(a, end - 1);
+    expect(a.table.autoSwitchComputed(T, 'craps', end - 1)).toBe(false);
+    at(a, end);
+    expect(a.table.autoSwitchComputed(T, 'craps', end)).toBe(true);
+    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+  });
+
+  it("at craps never takes a window's bets back, nor a don't come bet on its number: those ride to a show's end", async () => {
+    const [a, b] = await room(['A', 'B']);
+    const T = 'craps-1';
+    const state = (phase: 'betting' | 'settled', until: number): void => {
+      a.casino.writeCrapsTableState(T, {
+        kind: 'craps', phase, round: 1, point: null, dice: null, result: null, resultAt: 0, payouts: null, phaseDeadline: until,
+        ...a.casino.tableOpening(T),
+      });
+    };
+    let now = T0;
+    const tryAt = (): boolean => {
+      now += 1_000;
+      at(a, now);
+      return a.table.autoSwitchComputed(T, 'craps', now);
+    };
+    const bets = (list: { type: string; pick?: number; amount: number }[]): void => {
+      sync(now, a, b);
+      at(b, now);
+      expect(b.casino.writeMyCrapsBets(T, b.pid, list as never)).toBe(true);
+      sync(now, a, b);
+    };
+    // A come-out window with a pass line and a field bet down: the roll
+    // goes on (the card's press would hand them back).
+    state('betting', T0 + 16_000);
+    bets([{ type: 'pass', amount: 10 }, { type: 'field', amount: 5 }]);
+    expect(tryAt()).toBe(false);
+    expect(a.table.computedSwitchState(T, 'craps', true, now)).toMatchObject({ can: true });
+    // Settled, with a don't come bet travelled to the 4: it waits for it.
+    state('settled', T0);
+    bets([{ type: 'dontcome', pick: 4, amount: 10 }, { type: 'place', pick: 6, amount: 12 }]);
+    expect(tryAt()).toBe(false);
+    // Its next window (a riding place bet on the felt): still not.
+    state('betting', now + 16_000);
+    expect(tryAt()).toBe(false);
+    expect(a.casino.isComputedTable(T)).toBe(false);
+    // The don't come decided, a show's end: the place bet goes back.
+    state('settled', T0);
+    bets([{ type: 'place', pick: 6, amount: 12 }]);
+    expect(tryAt()).toBe(true);
+    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+    sync(now, a, b);
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+  });
+
+  it('at craps on a quiet come-out, or with a point on and nothing on the felt, under a craps name', async () => {
+    const [a] = await room(['A']);
+    const T = 'craps-1';
+    at(a, T0);
+    const come = (point: number | null): void => {
+      a.casino.writeCrapsTableState(T, {
+        kind: 'craps', phase: 'settled', round: 1, point, dice: null, result: null, resultAt: 0, payouts: null, phaseDeadline: T0,
+        ...a.casino.tableOpening(T),
+      });
+    };
+    come(6);
+    expect(a.casino.writeMyCrapsBets(T, a.pid, [{ type: 'pass', amount: 10 }])).toBe(true);
+    expect(a.table.autoSwitchComputed(T, 'craps', T0)).toBe(false);
+    come(null);
+    at(a, T0 + 1_000);
+    expect(a.table.autoSwitchComputed(T, 'craps', T0 + 1_000)).toBe(true);
+    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.readChips(a.pid)).toBe(1_000);
+    // A point on, its window idle with nothing on the felt (the hand's
+    // bets decided or taken down): nothing to wait for.
+    const T2 = 'craps-2';
+    a.casino.writeCrapsTableState(T2, {
+      kind: 'craps', phase: 'betting', round: 4, point: 6, dice: null, result: null, resultAt: 0, payouts: null, ...a.casino.tableOpening(T2),
+    });
+    expect(a.table.autoSwitchComputed(T2, 'craps', T0 + 1_000)).toBe(true);
+    expect(a.casino.computedIncOf(T2)).toMatch(/^k[0-9a-f]{24}$/);
+  });
+
+  it('never at a table the house switched back: BACK TO THE OWNER marks it, RUN WITHOUT THE OWNER and taking the table out of the room clear the mark', async () => {
+    const [a, b] = await room(['A', 'B']);
+    at(a, T0);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0)).toBe(true);
+    expect(a.casino.ownerRunChosen(TABLE)).toBe(false);
+    expect(a.table.switchComputedOff(TABLE, T0)).toBe('ok');
+    sync(T0, a, b);
+    for (const p of [a, b]) {
+      expect(p.casino.ownerRunChosen(TABLE)).toBe(true);
+      expect(p.doc.getMap('casino').get(`cfg:ownerrun:${TABLE}`)).toBe(1);
+    }
+    at(a, T0 + 1_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(false);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    // The way on by hand clears it; the way back marks it again.
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0 + 1_000)).toBe('ok');
+    expect(a.casino.ownerRunChosen(TABLE)).toBe(false);
+    expect(a.table.switchComputedOff(TABLE, T0 + 1_000)).toBe('ok');
+    expect(a.casino.ownerRunChosen(TABLE)).toBe(true);
+    // Taken out of the room, the mark goes with its other settings: put
+    // back, it switches on by itself again.
+    a.croupier.closeTable(TABLE, 'local');
+    expect(a.casino.ownerRunChosen(TABLE)).toBe(false);
+    at(a, T0 + 2_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 2_000)).toBe(true);
+    // A switch the doc holds nothing of (a peer's alone) goes marked too.
+    expect(a.table.switchComputedOff(OTHER, T0 + 2_000)).toBe('ok');
+    a.doc.getMap('casino').set(`cfg:computed:${OTHER}`, { v: 1, inc: 'c' + '7'.repeat(24) });
+    expect(a.table.switchComputedOff(OTHER, T0 + 2_000)).toBe('ok');
+    expect(a.casino.ownerRunChosen(OTHER)).toBe(true);
+  });
+
+  it('not with the dev flag off', async () => {
+    const [a] = await room(['A']);
+    a.table.setComputedTablesEnabledForTests(false);
+    at(a, T0);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0)).toBe(false);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    a.table.setComputedTablesEnabledForTests(true);
+    at(a, T0 + 1_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(true);
   });
 });
 
@@ -1098,6 +1331,88 @@ describe('the switch deleted by hand (no checkpoint, no mark)', () => {
     expect(a.casino.readTableState(TABLE)).toBeNull();
   });
 
+  it("is waited for by the house's own switch-on (the driving page's, and the card's): it would end the live incarnation, its round void", async () => {
+    const { a, inc, H, revealed } = await cheatsClose(true);
+    expect(a.casino.computedSwitchLost(TABLE)).toBe(true);
+    at(a, T0 + 1_000);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(false);
+    expect(a.table.computedSwitchState(TABLE, 'roulette', true, T0 + 1_000)).toMatchObject({
+      show: true, on: false, can: false, reason: a.table.SWITCH_ON_REFUSED.reconnecting,
+    });
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0 + 1_000)).toBe('reconnecting');
+    expect(a.casino.computedIncEnded(TABLE, inc)).toBe(false);
+    expect(a.doc.getMap('casino').has(`gone:${TABLE}:${inc}`)).toBe(false);
+    // The page's frame puts it back, and the round goes on to its forfeit.
+    frame(T0 + 1_000, a);
+    expect(cfgOf(a)).toEqual({ v: 1, inc });
+    for (let T = T0 + 1_000 + STEP; T <= T0 + 60_000; T += STEP) {
+      if (T % 1_000 === 0) {
+        at(a, T);
+        a.table.autoSwitchComputed(TABLE, 'roulette', T);
+      }
+      frame(T, a);
+    }
+    expect(revealed()).toBe(true);
+    expect(incOf(a)).toBe(inc);
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'forfeit' });
+    expect(a.casino.readChips(H.pid)).toBe(990);
+  });
+
+  /** A peer's switch over table TABLE naming X with X's own end mark, in
+   *  one write; `tracked`: with a session of X too (the doc holds records of
+   *  it, as of an earlier incarnation of the table). */
+  function forgeEnded(p: Page, tracked: boolean): void {
+    const X = 'c' + '5'.repeat(24);
+    p.doc.transact(() => {
+      p.doc.getMap('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: X });
+      p.doc.getMap('casino').set(`gone:${TABLE}:${X}`, 1);
+      if (tracked) p.doc.getMap('casinoComputed').set(`ses:${TABLE}:${X}:g`, new Y.Map());
+    });
+  }
+
+  it.each([false, true])('is waited for so over a name a peer wrote with its own end mark too (a session of it: %s): the switch reads lost, the robot stands down, and it is put back', async (tracked) => {
+    const { a, inc, H, revealed } = await cheatsClose(false);
+    at(a, T0 + 1_000);
+    forgeEnded(a, tracked);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    expect(a.casino.computedSwitchLost(TABLE)).toBe(true);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(false);
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0 + 1_000)).toBe('reconnecting');
+    expect(a.casino.computedIncEnded(TABLE, inc)).toBe(false);
+    a.croupier.openBetting(TABLE, 1);
+    a.croupier.tickAutoCroupier(TABLE);
+    expect(a.casino.readTableState(TABLE)).toBeNull();
+    frame(T0 + 1_000, a);
+    expect(cfgOf(a)).toEqual({ v: 1, inc });
+    for (let T = T0 + 1_000 + STEP; T <= T0 + 60_000; T += STEP) {
+      if (T % 1_000 === 0) {
+        at(a, T);
+        a.table.autoSwitchComputed(TABLE, 'roulette', T);
+      }
+      frame(T, a);
+    }
+    expect(revealed()).toBe(true);
+    expect(incOf(a)).toBe(inc);
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'forfeit' });
+    expect(a.casino.readChips(H.pid)).toBe(990);
+  });
+
+  it("keeps a page's seeds over such a name while it can't put the switch back (asleep): it reveals once it has", async () => {
+    const { a, inc, H, revealed } = await cheatsClose(false);
+    at(a, T0 + 1_000);
+    forgeEnded(a, false);
+    // Its frames stop for a lapse (a tab in the background): it wakes asleep.
+    const W = T0 + 1_000 + LAPSE + 500;
+    frame(W, a);
+    expect(a.croupier.tablesAwake(W)).toBe(false);
+    expect(cfgOf(a)).toEqual({ v: 1, inc: 'c' + '5'.repeat(24) });
+    for (let T = W + STEP; T <= W + 60_000; T += STEP) frame(T, a);
+    expect(cfgOf(a)).toEqual({ v: 1, inc });
+    expect(revealed()).toBe(true);
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'forfeit' });
+    expect(a.casino.readChips(H.pid)).toBe(990);
+  });
+
   it('gives a withholder no free void: one who deletes it instead of revealing is forfeited all the same', async () => {
     const { a, H, revealed } = await cheatsClose(false);
     for (let T = T0 + 1_000; T <= T0 + 3_400; T += STEP) frame(T, a);
@@ -1533,7 +1848,16 @@ describe("World's frame (world.ts updateCroupier)", () => {
 
   it('marks the frame while a removed computed table waits to be compacted, with no table left in the room too', () => {
     expect(body).toContain('if (tables.length || computedCompactionPending()) noteTablesRunning();');
-    expect(world).toMatch(/import \{ computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
+    expect(world).toMatch(/import \{ autoSwitchComputed, computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
+  });
+
+  it("switches each owner-run table on by itself on the house's driving page (the table lease), before its beat", () => {
+    const lease = body.indexOf('if (tables.length && autoCroupier && takeTableTurn()) {');
+    const auto = body.indexOf('autoSwitchComputed(t.id, t.kind === "craps-table" ? "craps" : "roulette", now);');
+    expect(lease).toBeGreaterThan(-1);
+    expect(auto).toBeGreaterThan(lease);
+    expect(auto).toBeLessThan(body.indexOf('if (beatNow && !computed) beatCroupier(t.id);'));
+    expect(body.slice(lease, auto)).toContain('for (const t of tables) {');
   });
 
   it("posts no heartbeat for a computed table (at craps a craps one only), and still runs the robot's tick (its sweep)", () => {

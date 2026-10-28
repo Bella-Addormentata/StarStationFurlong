@@ -27,7 +27,7 @@ import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
 import type { TableClosing } from "./casinoDoc";
-import { computedCompactionPending, tickComputedTables } from "./computedTable";
+import { autoSwitchComputed, computedCompactionPending, tickComputedTables } from "./computedTable";
 import type { ComputedTableRef } from "./computedTable";
 import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
@@ -6339,6 +6339,10 @@ export class World {
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
       for (const t of tables) {
+        // 🔀 Tables run computed by default: an owner-run one switches on
+        // by itself once the switch may go, unless the house switched it
+        // back (autoSwitchComputed).
+        autoSwitchComputed(t.id, t.kind === "craps-table" ? "craps" : "roulette", now);
         // 🧮 A computed table has no operator: no heartbeat (so no robot is
         // posted there, nor narrates), and the robot only sweeps an
         // owner-run round an earlier build opened on it (tickAutoCroupier,

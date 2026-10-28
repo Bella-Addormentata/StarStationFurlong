@@ -2152,13 +2152,14 @@ describe("the house's switch at craps", () => {
   });
 
   it("isn't offered mid-point; switching off with line bets riding warns first, then hands them back on the second press", async () => {
-    // Owner-run, a point on: the row says why not.
+    // Owner-run, a point on (a pass line riding it): the row says why not.
     const [o] = await room(['O'], true);
     o.table.setComputedTablesEnabledForTests(true);
     clockOf(o, T0);
     o.casino.writeCrapsTableState(TABLE, {
       kind: 'craps', phase: 'settled', round: 1, point: 6, dice: null, result: null, resultAt: 0, payouts: null, ...o.casino.tableOpening(TABLE),
     });
+    expect(o.casino.writeMyCrapsBets(TABLE, o.pid, [{ type: 'pass', amount: 10 }])).toBe(true);
     const to = atCraps(o, { stand: 3, house: true });
     go([o], T0 + STEP, T0 + 2 * STEP);
     expect(to.card()).toContain('WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER');
