@@ -334,6 +334,96 @@ describe('a roll rewritten under the next', () => {
     for (const s of slipsOf(w, 2, w.pid)) expect(s.b).not.toContainEqual(bet('field', 5));
     expect(w.table.computedUndoneCount(TABLE)).toBe(1);
   });
+
+  it('a change that went in on the table before the roll before was rewritten under it is written over by the riding bets, and the table says so', async () => {
+    const pages = await room(['A', 'B']);
+    const stand = new Map([[pages[0], 1], [pages[1], 3]]);
+    for (const [p, s] of stand) standAt(p, s);
+    // As above: w's forfeit of roll 1 turns its natural 7 into a point of 6.
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX);
+    rigSplit(pages, 1, 7, w, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(0);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    const was = basisOf(carryOf(w), w.pid);
+
+    // Roll 2: w puts the pass line and a field bet down, and the slip goes in.
+    go(pages, decidedAt + STEP, showEnd + 1_000);
+    const T = showEnd + 1_000 + STEP;
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    sync(T, ...pages);
+    expect(slipsOf(w, 2, w.pid)).toHaveLength(1);
+    expect(latestOf(x, w.pid)).toMatchObject({ r: 2, v: 1, o: was });
+    expect(latestOf(x, w.pid)!.b).toContainEqual(bet('field', 5));
+
+    // The rewrite: the point is on, w's pass rides on it.
+    clockOf(w, T + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    sync(T + 100, ...pages);
+    for (const p of pages) expect(carryOf(p)).toMatchObject({ p: 6, h: w.pid, i: 1 });
+    const now = basisOf(carryOf(w), w.pid);
+    expect(now).not.toBe(was);
+    frame(T + STEP, w, [REF]);
+    // (Nothing held: the change went in, and plays as nothing on this table.)
+    expect(w.table.computedUndoneCount(TABLE)).toBe(0);
+
+    // Once roll 2 takes bets again, w's page writes the riding bets over it.
+    const again = go(pages, T + 2 * STEP, T + 30_000, () => pages.every((p) => latestOf(p, w.pid)?.v === 2));
+    expect(again).toBeGreaterThanOrEqual(T + 100 + SHOW);
+    for (const p of pages) {
+      expect(latestOf(p, w.pid)).toMatchObject({ r: 2, v: 2, b: [bet('pass', 10)], o: now, t: stand.get(w) });
+      expect(p.casino.readChips(w.pid)).toBe(990);
+    }
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    expect(x.table.computedUndoneCount(TABLE)).toBe(0);
+    go(pages, again + STEP, again + 5_000);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it('drops a stand held back over the riding bets with no notice (no change of the player\'s went with it): their ride slip goes again under the new stamp, at the stand', async () => {
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX);
+    standAt(w, 1);
+    standAt(x, 3);
+    // Every seed a 6, w's alone an 8: the point on either way, the pass riding.
+    rigSplit(pages, 1, 6, w, 8);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(6);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    const was = basisOf(carryOf(w), w.pid);
+
+    // Roll 2: w is off the table, its ride slip down with no stand (x's has
+    // chips); w is back at stand 1 within the coalescing of it.
+    standAt(w, null);
+    const T = go(pages, decidedAt + STEP, showEnd + 5_000, () => latestOf(w, w.pid)?.r === 2);
+    expect(latestOf(w, w.pid)).toMatchObject({ r: 2, v: 1, b: [bet('pass', 10)], o: was });
+    expect(latestOf(w, w.pid)!.t).toBeUndefined();
+    standAt(w, 1);
+    frame(T + STEP, w, [REF]);
+    expect(slipsOf(w, 2, w.pid)).toHaveLength(1);
+
+    // The rewrite: w's forfeit of roll 1 counts w's seed alone, an 8.
+    clockOf(w, T + STEP + 50);
+    const f = signAs(w, 'forfeit', { r: 1, x: close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    sync(T + STEP + 50, ...pages);
+    for (const p of pages) expect(carryOf(p)).toMatchObject({ p: 8 });
+    const now = basisOf(carryOf(w), w.pid);
+    expect(now).not.toBe(was);
+    frame(T + 2 * STEP, w, [REF]);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(0);
+
+    go(pages, T + 3 * STEP, T + 30_000, () => pages.every((p) => latestOf(p, w.pid)?.o === now));
+    for (const p of pages) expect(latestOf(p, w.pid)).toMatchObject({ r: 2, v: 2, b: [bet('pass', 10)], o: now, t: 1 });
+    expect(w.table.computedUndoneCount(TABLE)).toBe(0);
+  });
 });
 
 describe('a commitment out', () => {

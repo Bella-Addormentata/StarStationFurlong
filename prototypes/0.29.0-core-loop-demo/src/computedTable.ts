@@ -397,8 +397,9 @@ interface TableState {
    *  never frozen again, nor reused for a slip. */
   burned: Map<string, number>;
   /** A felt held back by the coalescing, for round r; at craps with the
-   *  stamp it was built on. */
-  pending: { r: number; felt: RouletteBet[] | CrapsBet[]; basis?: string } | null;
+   *  stamp it was built on, and `ride` for rideDuty's stand rewrite (the
+   *  felt as written, only the stand new: no change of the player's). */
+  pending: { r: number; felt: RouletteBet[] | CrapsBet[]; basis?: string; ride?: true } | null;
   /** The last round whose close came while a felt of this page's was held
    *  back, and froze another (the status bar's "too late"), with the slip
    *  of this page's it froze ('' for none): a close of that round played
@@ -428,8 +429,9 @@ interface TableState {
    *  writes no slip again until the doc is bound afresh or the page comes
    *  back from the back-forward cache. */
   left: boolean;
-  /** At craps: how many held changes this page dropped because the roll
-   *  before changed under them (flushDuty; the table's notice). */
+  /** At craps: how many changes this page dropped because the roll before
+   *  changed under them, held (flushDuty) or gone in (rideDuty writes the
+   *  riding bets over them); the table's notice. */
   undone: number;
   /** At craps: what each decided roll on the chain came to as this page
    *  last saw it, and whether this page's player's slip on it was built on
@@ -2332,10 +2334,14 @@ function flushDuty(st: TableState, me: string, now: number): void {
   }
   if (st.game === 'craps' && p.basis !== basisOf(res.carry as CrapsCarry, me)) {
     // (The roll before changed under it: a late seed, a rewritten roll. It
-    // never went in, and built on the old table it would play as nothing.)
+    // never went in, and built on the old table it would play as nothing.
+    // A stand rewrite held back undid no change of the player's: its felt
+    // went in, and rideDuty writes it again as the riding bets.)
     st.pending = null;
-    st.undone += 1;
-    notifyCasinoView(st.t);
+    if (!p.ride) {
+      st.undone += 1;
+      notifyCasinoView(st.t);
+    }
     return;
   }
   const e = bettingOn(st, res, now);
@@ -2409,16 +2415,27 @@ function rideDuty(st: TableState, me: string, now: number): void {
       return;
     }
     if (rec.o !== basis) {
-      if (ours(latest!)) writeSlip(st, res, o, C, false, now, { o: basis, t: stand });
+      // (Built on the table before the roll before changed under it: it
+      // plays as nothing, so the riding bets go in its place. A change of
+      // the player's it carried is undone, and the table says so, as for a
+      // held one: flushDuty.)
+      if (ours(latest!) && writeSlip(st, res, o, C, false, now, { o: basis, t: stand }) && !rodeAsBuilt(rec) && !sameFelt(rec.b, C)) {
+        st.undone += 1;
+        notifyCasinoView(st.t);
+      }
       return;
     }
   }
   if (stand === undefined || !rec || rec.t === stand || (!e && crapsDutyOn(st, res, now) === null)) return;
-  // (A held change goes with the stand: flushDuty.)
-  if (st.pending && st.pending.r === o) return;
+  // (While betting a held change goes with the stand: flushDuty. Past it a
+  // held felt never goes, so it no longer holds the stand back: a page whose
+  // frames stopped across W with one held is counted at its stand from its
+  // first tick of the wait. The held felt stays, so a close that froze the
+  // felt before it is too late for it.)
+  if (e && st.pending && st.pending.r === o) return;
   if (!ours(latest!)) return;
   if (e && !slipDue(st, o, e.view.phaseDeadline, now)) {
-    st.pending = { r: o, felt: rec.b, basis: rec.o };
+    st.pending = { r: o, felt: rec.b, basis: rec.o, ride: true };
     return;
   }
   writeSlip(st, res, o, rec.b, false, now, { o: rec.o, t: stand });
@@ -3396,16 +3413,17 @@ function offRefusal(t: string, now: number, again = false): ComputedSwitchRefusa
  * 🔀 The house switches roulette table `t` to computed (the ⚙ card, after
  * its confirmation): in ONE transaction, the owner-run incarnation ends as a
  * removal ends it (refundAndClear: its lists stop holding, what an earlier
- * build's took is refunded, its book counts on), and the computed one starts
- * under a name every page computes alike (computedIncFor: two of the house's
- * pages pressing at once open one table), with its first session. Refused
- * while the owner-run table has a round under way, while an earlier build
- * drives the room's tables (it would go on opening owner-run rounds on this
- * one), and on a page asleep or not whole. At craps also while a point is on
- * or a come bet sits on a number (contract bets: they can't come down), and
- * the bets on the felt go back to their players, as a take-down would; its
- * name is a craps one (`k…`), so every page plays it as craps. 'ok' for a
- * table that is computed already.
+ * build's took is refunded, its book counts on; the house's settings for the
+ * table stay, hidden while it is computed, for when it is owner-run again:
+ * keepConfig), and the computed one starts under a name every page computes
+ * alike (computedIncFor: two of the house's pages pressing at once open one
+ * table), with its first session. Refused while the owner-run table has a
+ * round under way, while an earlier build drives the room's tables (it would
+ * go on opening owner-run rounds on this one), and on a page asleep or not
+ * whole. At craps also while a point is on or a come bet sits on a number
+ * (contract bets: they can't come down), and the bets on the felt go back to
+ * their players, as a take-down would; its name is a craps one (`k…`), so
+ * every page plays it as craps. 'ok' for a table that is computed already.
  */
 export function switchComputedOn(t: string, game: GameName = 'roulette', now = Date.now()): ComputedSwitchResult {
   lookAtClock(now);
@@ -3413,7 +3431,7 @@ export function switchComputedOn(t: string, game: GameName = 'roulette', now = D
   if (refused) return refused;
   if (isComputedTable(t)) return 'ok';
   transactCasino(() => {
-    refundAndClear(t, 'local');
+    refundAndClear(t, 'local', { keepConfig: true });
     writeComputedOn(t, computedIncFor(t, game));
   });
   return 'ok';

@@ -393,6 +393,122 @@ describe('the shooter and the dice', () => {
     expect(ta.lines()).toContain('🎲 THE DICE ARE ROLLING…');
   });
 
+  it("a close counted while its signature waits to be checked, then found forged: the stickman's toss for it is called off, the dice go back to the shooter, and their fling flies on every page", async () => {
+    const { pages, decidedAt } = await pointOn(['A', 'B', 'C'], [3, 1, 5]);
+    const [a, b, c] = pages;
+    expect(carryOf(a)).toMatchObject({ h: a.pid, i: 1 });
+    rigRoll(pages, 2, 6);
+    const ta = atCraps(a, { stand: 3 });
+    const { T, W, D } = openRoll(pages, 2, decidedAt + STEP);
+    go(pages, T, W + 1_000);
+    expect(ta.status()).toMatch(/^🎲 YOUR ROLL/);
+    const home = [a.dice.rest(), c.dice.rest()];
+    expect(home[0]).not.toBeNull();
+    // B's page (a modified one) writes a close of roll 2 under the
+    // signature of another body. A's and C's pages count it before they
+    // check it (no budget left for the check this time round).
+    const f = Object.fromEntries(keysIn(b, 's', 2, TABLE).map((k) => [k.split(':')[2], k.split(':')[3]]));
+    const close = signAs(b, 'close', { r: 2, q: foldOf(b).parent, f }, CTX);
+    const forged = { ...close, g: signAs(b, 'close', { r: 2, q: 'nope', f }, CTX).g };
+    const key = b.fold.closeKey(forged)!;
+    for (const p of [a, c]) p.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    const markA = a.dice.log.length;
+    const markC = c.dice.log.length;
+    clockOf(b, W + 1_100);
+    putIn(b, [[key, forged]], TABLE);
+    sync(W + 1_100, ...pages);
+    frameOf(a, W + 1_100);
+    frameOf(c, W + 1_100);
+    expect(foldOf(a).openCloses.map((x) => x.state)).toEqual(['pending']);
+    const toss = tossOf(key.slice(key.lastIndexOf(':') + 1));
+    expect(a.dice.log.slice(markA)).toEqual([toss]);
+    expect(c.dice.log.slice(markC)).toEqual([toss]);
+    // Checked: forged. The roll waits for A's throw again, and the dice go
+    // back to A's stand, there to be picked up.
+    for (const p of [a, c]) p.casino.setComputedVerifyForTests({ now: () => 0 });
+    vi.advanceTimersByTime(1);
+    go(pages, W + 1_200, W + 1_400);
+    expect(foldOf(a).openCloses.map((x) => x.state)).toEqual(['invalid']);
+    expect(crapsOf(a)).toMatchObject({ phase: 'closing', round: 2, shooter: a.pid });
+    expect(a.dice.log.slice(markA)).toEqual([toss, 'cancel']);
+    expect(c.dice.log.slice(markC)).toEqual([toss, 'cancel']);
+    expect([a.dice.state(), c.dice.state()]).toEqual(['rest', 'rest']);
+    expect([a.dice.rest(), c.dice.rest()]).toEqual(home);
+    expect(ta.status()).toMatch(/^🎲 YOUR ROLL — GRAB THE DICE AND FLING THEM ACROSS THE TABLE/);
+    // A flings: one flight on each page, landing on the roll's faces.
+    clockOf(a, W + 2_000);
+    ta.key('r');
+    const thr = a.casino.readDiceThrow(TABLE)!;
+    expect(thr).toMatchObject({ round: 2, by: a.pid });
+    const at = decide(pages, 2, W + 2_200);
+    expect(at).toBeLessThan(D);
+    go(pages, at + STEP, at + 3 * STEP);
+    const faces = `land ${foldOf(a).rounds.find((v) => v.r === 2)!.craps!.dice!.join('')}`;
+    for (const p of [a, c]) {
+      expect(throws(p.dice.log.slice(p === a ? markA : markC))).toEqual([toss, `throw ${thr.seed}`]);
+      expect(p.dice.log.at(-1)).toBe(faces);
+    }
+  });
+
+  it("a page the table comes into view on with the roll's close in, its seeds still to come: once the close is deleted, the dice go back to the shooter, and their fling flies there", async () => {
+    const { pages, decidedAt } = await pointOn(['A', 'B', 'C'], [3, 1, 5]);
+    const [a, b, c] = pages;
+    expect(carryOf(a)).toMatchObject({ h: a.pid, i: 1 });
+    rigRoll(pages, 2, 6);
+    const ta = atCraps(a, { stand: 3 });
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    // C's page does its duties, the table out of its view (its pieces
+    // forgotten: World drives only the tables in view).
+    for (let t = T; t <= W + 1_000; t += STEP) {
+      sync(t, ...pages);
+      frameOf(a, t);
+      frameOf(b, t);
+      dutiesOf(c, t);
+      c.session.casinoTablesFrame(1 / 60, new Map());
+      sync(t, ...pages);
+    }
+    expect(ta.status()).toMatch(/^🎲 YOUR ROLL/);
+    const home = a.dice.rest();
+    expect(home).not.toBeNull();
+    // B's page closes the roll, and only C's hears it, which then has the
+    // table in view again.
+    const f = Object.fromEntries(keysIn(b, 's', 2, TABLE).map((k) => [k.split(':')[2], k.split(':')[3]]));
+    const close = signAs(b, 'close', { r: 2, q: foldOf(b).parent, f }, CTX);
+    const key = b.fold.closeKey(close)!;
+    clockOf(b, W + 1_100);
+    putIn(b, [[key, close]], TABLE);
+    sync(W + 1_100, b, c);
+    const markC = c.dice.log.length;
+    frameOf(c, W + 1_100);
+    expect(crapsOf(c)).toMatchObject({ phase: 'closing', round: 2 });
+    expect(closeOf(c, 2)).toBe(key.slice(key.lastIndexOf(':') + 1));
+    // (The dice show roll 1's faces, and the close flies nothing: it came in
+    // before this page looked.)
+    const last = `land ${foldOf(c).rounds.find((v) => v.r === 1)!.craps!.dice!.join('')}`;
+    expect(c.dice.log.slice(markC)).toEqual([last]);
+    // A peer deletes the close: the roll waits for A's throw again, and the
+    // dice go to A's stand.
+    clockOf(b, W + 1_200);
+    b.doc.transact(() => b.casino.computedSessionForWrite(TABLE)!.delete(key));
+    sync(W + 1_200, b, c);
+    frameOf(c, W + 1_200);
+    expect(closeOf(c, 2)).toBeUndefined();
+    expect(crapsOf(c)).toMatchObject({ phase: 'closing', round: 2, shooter: a.pid });
+    expect(c.dice.log.slice(markC)).toEqual([last, 'cancel']);
+    expect(c.dice.state()).toBe('rest');
+    expect(c.dice.rest()).toEqual(home);
+    // A flings: it flies on C's page, landing on the roll's faces.
+    go(pages, W + 1_300, W + 1_300);
+    clockOf(a, W + 2_000);
+    ta.key('r');
+    const thr = a.casino.readDiceThrow(TABLE)!;
+    expect(thr).toMatchObject({ round: 2, by: a.pid });
+    const at = decide(pages, 2, W + 2_200);
+    go(pages, at + STEP, at + 3 * STEP);
+    expect(throws(c.dice.log.slice(markC))).toEqual([`throw ${thr.seed}`]);
+    expect(c.dice.log.at(-1)).toBe(`land ${foldOf(c).rounds.find((v) => v.r === 2)!.craps!.dice!.join('')}`);
+  });
+
   it('the shooter picks the dice up and flicks them: a flick too slow drops them, saying so; a fast one throws from their page, which closes the roll', async () => {
     const { pages, decidedAt } = await pointOn(['A', 'B'], [3, 1]);
     const [a] = pages;
@@ -2159,9 +2275,11 @@ describe('rolls nobody finished or the room no longer has', () => {
     const at = go([c], W + STEP, W + 120_000, () => crapsOf(c)?.phase === 'settled' && crapsOf(c)?.voided === true);
     expect(at).toBeLessThan(W + 120_000);
     go([c], at + STEP, at + STEP);
-    // The stickman's toss flew at the close, and is called off at the void.
+    // The stickman's toss flew at the close, and is called off at the void:
+    // the dice, wherever the flight had them, go back to the stickman.
     expect(c.dice.log.slice(markV)).toEqual([tossOf(closeOf(c, 1)!), 'cancel']);
     expect(c.dice.state()).toBe('rest');
+    expect(c.dice.rest()).toEqual(CRAPS_DICE_SPOT);
     expect(tc.status()).toBe('⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL');
     expect(tc.card()).toContain('🔓 LAST ROLL · ROLL 1 · VOID — NOBODY COULD FINISH IT · EVERY BET STANDS');
     // Their pages were only asleep: when they wake, the roll is played
@@ -2174,6 +2292,54 @@ describe('rolls nobody finished or the room no longer has', () => {
     const flown = c.dice.log.slice(markC);
     expect(flown[0]).toMatch(/^throw \d+$/);
     expect(flown[1]).toMatch(/^land \d\d$/);
+  });
+
+  it('a page that first hears a roll closed with the void that ends it flies nothing for it: the dice lie where they were through its show, then go home', async () => {
+    const pages = await room(['A', 'B', 'C', 'D']);
+    const [a, b, c, d] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    for (const p of [a, b]) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const tc = atCraps(c, { stand: 5 });
+    atCraps(d, { stand: 7 });
+    const { T, W } = openRoll([c, d], 1, T0 + STEP);
+    go([c, d], T, W);
+    // A's page closes the roll, and only D's hears it; then A's and B's tabs
+    // are gone, seeds and all. C's link is down all the while (its frames
+    // run on), until D has voided the roll.
+    clockOf(a, W + 100);
+    sync(W + 100, a, d);
+    const f = Object.fromEntries([a, b].map((p) => {
+      const k = keysIn(a, 's', 1, TABLE).find((x) => x.startsWith(`s:1:${p.pid}:`))!;
+      return [p.pid, k.slice(k.lastIndexOf(':') + 1)];
+    }));
+    const close = signAs(a, 'close', { r: 1, q: foldOf(a).parent, f }, CTX);
+    putIn(a, [[a.fold.closeKey(close)!, close]], TABLE);
+    sync(W + 100, a, d);
+    const at = go([d], W + STEP, W + 120_000, () => {
+      frameOf(c, Date.now());
+      return crapsOf(d)?.phase === 'settled' && crapsOf(d)?.voided === true;
+    });
+    expect(at).toBeLessThan(W + 120_000);
+    const lay = c.dice.rest();
+    expect(lay).toEqual(CRAPS_DICE_SPOT);
+    // C hears the close and the void in one update.
+    const markC = c.dice.log.length;
+    sync(at + STEP, c, d);
+    frameOf(c, at + STEP);
+    expect(crapsOf(c)).toMatchObject({ phase: 'settled', round: 1, voided: true });
+    expect(tc.status()).toBe('⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL');
+    expect(c.dice.log.slice(markC)).toEqual([]);
+    expect(c.dice.state()).toBe('rest');
+    expect(c.dice.rest()).toEqual(lay);
+    // Through the void's show, nothing; then roll 1 takes bets again, and the
+    // dice lie with the stickman.
+    const again = go([c, d], at + 2 * STEP, at + 30_000, () => crapsOf(c)?.phase === 'betting');
+    expect(again).toBeLessThan(at + 30_000);
+    expect(throws(c.dice.log.slice(markC))).toEqual([]);
+    expect(c.dice.log.slice(markC)).not.toContain('cancel');
+    expect(c.dice.rest()).toEqual(CRAPS_DICE_SPOT);
   });
 
   it("the dice go by the first close of the open roll this page saw: a second one that comes later moves nothing", async () => {

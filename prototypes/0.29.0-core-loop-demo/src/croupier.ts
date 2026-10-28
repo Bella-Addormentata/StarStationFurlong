@@ -595,11 +595,11 @@ const legacySeen = new Map<string, { epoch: number; wake: number; inc: string; r
  * watched such a round sit for a lapse (its driver gone), it ends that
  * round's incarnation alone, as a removal would (refundAndClear,
  * keepComputed): its lists stop holding, what an earlier build's lists took
- * is refunded, its book counts on, and the computed incarnation, its switch
- * and its sessions are as they were. Only on a whole doc (the caller). At
- * craps the same, its state read by `read` (readCrapsTableState): the bets
- * still on its felt go back, riding ones too, and what its rolls already
- * paid stands.
+ * is refunded, its book counts on, and the computed incarnation, its switch,
+ * its sessions and the house's settings for the table are as they were
+ * (keepConfig). Only on a whole doc (the caller). At craps the same, its
+ * state read by `read` (readCrapsTableState): the bets still on its felt go
+ * back, riding ones too, and what its rolls already paid stands.
  */
 export function sweepLegacyRound(
   tableId: string, now: number, read: (tableId: string) => { round: number; inc?: string } | null = readTableState,
@@ -620,7 +620,7 @@ export function sweepLegacyRound(
   }
   if (now - seen.at < TABLE_LEASE_LAPSE_MS) return;
   legacySeen.delete(tableId);
-  transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true }));
+  transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true, keepConfig: true }));
 }
 
 /** When this page first saw each table's switch bare (its epoch, the
@@ -779,8 +779,12 @@ export function closeWhenWhole(tableId: string, close: () => void): void {
  *  settling this very round: a bettor's refund counts unless the doc kept
  *  that settle's book, which settled their list (creditTableOutcome). Then
  *  the keys go (clearTableKeys; `keepComputed`: a computed table's own
- *  incarnation stays, for the sweep of an owner-run round on it). */
-export function refundAndClear(tableId: string, closing: TableClosing, opts: { keepComputed?: boolean } = {}): void {
+ *  incarnation stays, for the sweep of an owner-run round on it;
+ *  `keepConfig`: the house's settings for the table stay, for that sweep and
+ *  the switch to computed). */
+export function refundAndClear(
+  tableId: string, closing: TableClosing, opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+): void {
   const end = tableEndingStakes(tableId);
   for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);
   clearTableKeys(tableId, closing, opts);

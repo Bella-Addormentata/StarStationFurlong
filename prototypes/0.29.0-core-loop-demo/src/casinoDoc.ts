@@ -1342,8 +1342,11 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  🧮 A computed table's incarnation ends with it (its switch goes, a
  *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
  *  of an owner-run round an earlier build opened on a computed table ends
- *  only that round's incarnation. */
-export function clearTableKeys(tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean } = {}): void {
+ *  only that round's incarnation. 🔀 `keepConfig`: the table stays (the
+ *  switch to computed, that sweep), and so do the house's settings for it. */
+export function clearTableKeys(
+  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
@@ -1370,10 +1373,14 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard',
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
-    // not leave orphaned settings behind (harmless no-op for roulette, which
-    // never writes them).
-    map.delete(`cfg:backend:${tableId}`);
-    map.delete(`cfg:fairness:${tableId}`);
+    // not leave orphaned settings behind (roulette writes only the
+    // fairness one). 🔀 A table that stays keeps them: switched to computed
+    // (which hides them), its owner-run table comes back on the house's
+    // WHEEL or DICE FAIRNESS and SETTLEMENT, not on the defaults.
+    if (!opts.keepConfig) {
+      map.delete(`cfg:backend:${tableId}`);
+      map.delete(`cfg:fairness:${tableId}`);
+    }
     // 🧮 And a computed table's incarnation is over (marked as a removed
     // one is, so a switch written at the same moment stays ended): its
     // decided nets count on, its open felts stop holding (nothing to

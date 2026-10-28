@@ -209,6 +209,68 @@ describe('the stand during the wait', () => {
     for (const p of pages) expect(carryOf(p)).toMatchObject({ p: 0, h: b.pid, i: 1 });
   });
 
+  /** B, away from the table, holds the dice in play on roll 2: a field bet
+   *  of B's goes down 3 s before W (at once), and B is back at stand 3
+   *  within the coalescing of it, `then` run there (B's next tick, or
+   *  another change). B's frames then stop until a second into the wait (a
+   *  tab in the background); A's run on. B's first frame back, and the end
+   *  of the wait. */
+  async function backAcrossW(then: (b: Page, at: number) => void) {
+    const { pages, decidedAt, showEnd } = await crapsPointOn(['A', 'B'], [1, 3], T0);
+    const [a, b] = pages;
+    standAt(b, null);
+    rigRoll(pages, 2, 6);
+    const { T, W, D } = openRoll2(pages, decidedAt, showEnd);
+    let L = T;
+    while (L + STEP <= W - 3_000) L += STEP;
+    go(pages, T, L);
+    expect(latestOf(a, b.pid)!.t).toBeUndefined();
+    expect(crapsBet(b, [bet('pass', 5), bet('field', 5)], L + 50)).toBe('ok');
+    sync(L + 50, a, b);
+    standAt(b, 3);
+    then(b, L + STEP);
+    expect(latestOf(b, b.pid)).toMatchObject({ b: [bet('field', 5), bet('pass', 5)] });
+    expect(latestOf(b, b.pid)!.t).toBeUndefined();
+    for (let t = L + STEP; t < W + 1_000; t += STEP) {
+      sync(t, a, b);
+      frame(t, a, [REF]);
+    }
+    return { pages, back: W + 1_000, D };
+  }
+
+  it("a stand held back with the coalescing when betting ended goes on the shooter's first tick of the wait: their frames stopped across W, they fling and keep the dice", async () => {
+    const { pages: [a, b], back, D } = await backAcrossW((p, at) => frame(at, p, [REF]));
+    expect(latestOf(a, b.pid)!.t).toBeUndefined();
+    go([a, b], back, back);
+    expect(latestOf(a, b.pid)).toMatchObject({ b: [bet('field', 5), bet('pass', 5)], t: 3 });
+    expect(crapsOf(a, back)).toMatchObject({ phase: 'closing', shooter: b.pid, shooterSlip: 'here' });
+    b.table.noteComputedFling(TABLE, 2, 9, back + 1_000);
+    const at = go([a, b], back + STEP, D + 10_000, closed(a, 2));
+    expect(at).toBeLessThan(D);
+    go([a, b], at + STEP, at + STEP);
+    expect(b.table.computedMine(TABLE, at + STEP)).toMatchObject({ frozen: true, tooLate: false });
+    decide([a, b], 2, at + 2 * STEP);
+    for (const p of [a, b]) expect(carryOf(p)).toMatchObject({ p: 0, h: b.pid, i: 1 });
+  });
+
+  it('so does one held back with a change of the felt, which then never goes: the close froze the felt before it, too late for it', async () => {
+    const { pages: [a, b], back, D } = await backAcrossW((p, at) => expect(crapsBet(p, [bet('pass', 5), bet('field', 10)], at)).toBe('ok'));
+    go([a, b], back, back);
+    expect(latestOf(a, b.pid)).toMatchObject({ b: [bet('field', 5), bet('pass', 5)], t: 3 });
+    b.table.noteComputedFling(TABLE, 2, 9, back + 1_000);
+    const at = go([a, b], back + STEP, D + 10_000, closed(a, 2));
+    expect(at).toBeLessThan(D);
+    go([a, b], at + STEP, at + STEP);
+    expect(b.table.computedMine(TABLE, at + STEP)).toMatchObject({ frozen: true, tooLate: true });
+    decide([a, b], 2, at + 2 * STEP);
+    // The point made, the dice B's: the pass's 5 won, the field's 5 lost
+    // (the 10 never went down).
+    for (const p of [a, b]) {
+      expect(carryOf(p)).toMatchObject({ p: 0, h: b.pid, i: 1 });
+      expect(p.casino.readChips(b.pid)).toBe(1_000);
+    }
+  });
+
   it("a change the holder makes within a turn of the wait's end gives their turn away: the next page closes, once, from what it heard", async () => {
     const { pages, decidedAt, showEnd } = await crapsPointOn(['A', 'B'], [1, 3], T0);
     const [a, b] = pages;

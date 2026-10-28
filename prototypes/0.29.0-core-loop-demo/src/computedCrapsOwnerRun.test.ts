@@ -172,12 +172,14 @@ describe('the stickman at a computed craps table', () => {
     expect(a.craps.crapsRunsItself(OWNER_RUN)).toBe(false);
   }, 30_000);
 
-  it("sweeps an earlier build's round off it once it has sat a lapse: its bets back, riding ones too, what its rolls paid standing, the computed incarnation as it was", async () => {
+  it("sweeps an earlier build's round off it once it has sat a lapse: its bets back, riding ones too, what its rolls paid standing, the computed incarnation and the house's settings as they were", async () => {
     const pages = await room(['A', 'B']);
     const [a, b] = pages;
     at(a, T0);
     expect(a.table.switchComputedOn(C, 'craps', T0)).toBe('ok');
     const cinc = a.casino.computedIncOf(C)!;
+    // (DICE FAIRNESS as the house set it before the switch: kept, hidden.)
+    expect(a.casino.readCrapsFairnessPref(C)).toBe('rng');
     expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
     sync(T0, ...pages);
     // An earlier build's page drives the room's tables meanwhile (B's doc
@@ -236,6 +238,7 @@ describe('the stickman at a computed craps table', () => {
       expect(p.casino.computedIncEnded(C, cinc)).toBe(false);
       expect(p.casino.isComputedFor(C, 'craps')).toBe(true);
       expect(sessionKeys(p)).toEqual([`ses:${C}:${cinc}:g`]);
+      expect(p.casino.readCrapsFairnessPref(C)).toBe('rng');
       expect(p.casino.computedFoldOf(C)!.felts.get(a.pid)?.rec.b).toEqual([bet('pass', 10)]);
       // B's pass (riding) and place back, the field's win kept; A's felt
       // held; E's 12, taken by its build, back exactly.

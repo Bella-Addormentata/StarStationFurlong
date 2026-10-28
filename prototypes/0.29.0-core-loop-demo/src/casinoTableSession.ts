@@ -255,8 +255,10 @@ interface TableRuntime {
   /** 🎲 A computed craps table: the flight this page started for a roll
    *  (the shooter's throw or the stickman's toss, one a roll: `at` −Infinity
    *  for one that showed before this page looked), and whether it got its
-   *  faces or was called off. `spun` holds each roll's dice (`d1d2`). */
-  flight: { r: number; at: number; done: boolean } | null;
+   *  faces or was called off; `close` when it stands for the roll's close
+   *  (the toss, or a close in before this page looked), not a throw. `spun`
+   *  holds each roll's dice (`d1d2`). */
+  flight: { r: number; at: number; done: boolean; close?: true } | null;
   /** …and by roll, the dice it handed it, the decision they came from
    *  (rollBy) and its close, kept through a hold, which forgets them in
    *  `spun`: the roll held again under that close flies nothing, nor does
@@ -684,9 +686,11 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, me: string
  * does a new decision of the roll on the same faces; the same decision
  * shown again flies nothing) and lie where the flight left them while the
  * roll is on screen; a flight whose roll gets no faces (a void, a roll
- * taken back to betting) is called off. Primed like roulette's: what
- * showed by the first view counted whole and checked showed before this
- * page looked, and doesn't fly.
+ * taken back to betting) is called off, as is a toss whose close is no
+ * longer in (forged, or deleted), the dice back where the roll is thrown
+ * from; none starts for a roll first seen void. Primed like roulette's:
+ * what showed by the first view counted whole and checked showed before
+ * this page looked, and doesn't fly.
  */
 function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readComputedCraps(id);
@@ -706,6 +710,8 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
   if (!s) return;
   seeComputed(id, s.inc, s.rollKey);
   const k = spinKeyParts(s.rollKey);
+  // (A roll settled with no faces: void.)
+  const faceless = s.phase === 'settled' && !k;
   const now = Date.now();
   if (s.phase !== 'settled') {
     // (Kept once the roll's close is in: a rewrite of the roll before then
@@ -730,7 +736,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         h.diceLand(diceOfKey(k.pocket));
       }
       if (s.phase !== 'betting' && (k?.round === s.round || computedCrapsClose(id, s.round) !== null)) {
-        rt.flight = { r: s.round, at: -Infinity, done: k?.round === s.round };
+        rt.flight = { r: s.round, at: -Infinity, done: k?.round === s.round, close: true };
       }
     }
   } else {
@@ -755,7 +761,10 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     // new decision of it tosses again when it shows, below.)
     const kept = rt.landed.get(s.round);
     const heldAgain = s.phase === 'closing' && kept !== undefined && kept.close === computedCrapsClose(id, s.round)?.hash;
-    if ((s.phase === 'closing' || s.phase === 'settled') && rt.flight?.r !== s.round && !landed && !heldAgain) {
+    // (Nor for a roll first seen void: its flight would be called off below
+    // in this same frame, the dice left where the throw starts, off the
+    // felt, through the void's show.)
+    if ((s.phase === 'closing' || s.phase === 'settled') && rt.flight?.r !== s.round && !landed && !heldAgain && !faceless) {
       const close = computedCrapsClose(id, s.round);
       const thr = readDiceThrow(id);
       const by = s.phase === 'settled' ? s.holderBefore : s.holder;
@@ -778,7 +787,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         rt.flight = { r: s.round, at: now, done: false };
       } else if (close) {
         tossDice(h, close.hash);
-        rt.flight = { r: s.round, at: now, done: false };
+        rt.flight = { r: s.round, at: now, done: false, close: true };
       }
     }
     if (k && rt.spun.get(k.round) !== k.pocket) {
@@ -822,15 +831,26 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     // re-arm, above).
     if (!rt.flight.done) h.diceCancel();
     rt.flight = null;
-  } else if (rt.flight && !rt.flight.done && (s.phase === 'betting' || s.round !== rt.flight.r || (s.phase === 'settled' && !k))) {
+  } else if (rt.flight && !rt.flight.done && (s.phase === 'betting' || s.round !== rt.flight.r || faceless)) {
     // A flight that will get no faces: the roll void, or no longer the one
     // on screen. A re-show of an earlier roll shows its faces where the
-    // dice stop.
+    // dice stop; a void's dice, perhaps still in the air, go back to the
+    // stickman (nothing below moves them while the void shows).
     h.diceCancel();
     if (s.phase === 'settled' && k?.round === s.round) {
       h.diceLand(diceOfKey(k.pocket));
       rt.flight = { r: s.round, at: -Infinity, done: true };
-    } else rt.flight.done = true;
+    } else {
+      rt.flight.done = true;
+      if (faceless) h.diceRestAt(STICKMAN_DICE_SPOT);
+    }
+  } else if (rt.flight?.close && !rt.flight.done && s.phase === 'closing' && computedCrapsClose(id, s.round) === null) {
+    // The close it stood for is no longer in: counted while its signature
+    // was still to check, then found forged, or deleted. The roll waits for
+    // its throw again, so the dice go back where it is thrown from (below),
+    // and fly again for the throw or the close that ends it.
+    h.diceCancel();
+    rt.flight = null;
   }
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   if (!animating) {

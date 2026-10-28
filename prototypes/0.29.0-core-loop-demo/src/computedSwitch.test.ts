@@ -866,6 +866,32 @@ describe('switch-off', () => {
     expect(b.casino.readChips(b.pid)).toBe(won[1] - 5);
   });
 
+  it("hands the owner-run table back on the house's settings, kept through the switch-on that hid them: WHEEL FAIRNESS at roulette, DICE FAIRNESS and SETTLEMENT at craps", async () => {
+    const pages = await room(['A', 'B']);
+    const [a] = pages;
+    const CRAPS = 'craps-1';
+    a.casino.writeCrapsFairnessPref(CRAPS, 'commit-reveal');
+    a.casino.writeCrapsBackendPref(CRAPS, 'chia');
+    sync(T0, ...pages);
+    const settings = (p: Page) => [p.casino.readCrapsFairnessPref(TABLE), p.casino.readCrapsFairnessPref(CRAPS), p.casino.readCrapsBackendPref(CRAPS)];
+    at(a, T0);
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
+    expect(a.table.switchComputedOn(CRAPS, 'craps', T0)).toBe('ok');
+    sync(T0, ...pages);
+    for (const p of pages) {
+      expect([p.casino.isComputedTable(TABLE), p.casino.isComputedTable(CRAPS)]).toEqual([true, true]);
+      expect(settings(p)).toEqual(['rng', 'commit-reveal', 'chia']);
+    }
+    at(a, T0 + 1_000);
+    expect(a.table.switchComputedOff(TABLE, T0 + 1_000)).toBe('ok');
+    expect(a.table.switchComputedOff(CRAPS, T0 + 1_000)).toBe('ok');
+    sync(T0 + 1_000, ...pages);
+    for (const p of pages) {
+      expect([p.casino.isComputedTable(TABLE), p.casino.isComputedTable(CRAPS)]).toEqual([false, false]);
+      expect(settings(p)).toEqual(['rng', 'commit-reveal', 'chia']);
+    }
+  });
+
   it('goes at once on a switch whose incarnation the doc holds nothing of (one a peer wrote alone: no build does), marked ended', async () => {
     const [a] = await room(['A']);
     at(a, T0);
