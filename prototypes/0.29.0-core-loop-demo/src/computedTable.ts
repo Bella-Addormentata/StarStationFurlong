@@ -2321,10 +2321,11 @@ function recommitOn(st: TableState, res: FoldResult, now: number): boolean {
 /** 🎲 Tell this page's player that a change of the roll before undid their
  *  changes: once for the changes this page took since it last said so, so a
  *  held one it dropped and a sent one written over later are one notice,
- *  through any number of rewrites. (A change their other tab took is that
- *  tab's to tell.) */
-function noteUndone(st: TableState): void {
-  if (st.changes <= st.changesTold) return;
+ *  through any number of rewrites. A version this page didn't write
+ *  (`theirs`: from before a reload with no goodbye, or another tab's) is
+ *  told whatever it took. */
+function noteUndone(st: TableState, theirs = false): void {
+  if (st.changes <= st.changesTold && !theirs) return;
   st.changesTold = st.changes;
   st.undone += 1;
   notifyCasinoView(st.t);
@@ -2422,10 +2423,12 @@ function rideDuty(st: TableState, me: string, now: number): void {
   const ours = (s: SlipInfo): boolean => st.mine.has(s.key) || now >= seen(st, s.key, now) + GRACE_MAX_MS;
   if (rec && rec.l === 1) {
     // (A goodbye's changes put back are its player's again, for the table's
-    // notice: noteUndone.)
-    if (writeSlip(st, res, o, rec.o === basis ? rec.b : C, false, now, { o: basis, t: stand }) && rec.o === basis && !rodeAsBuilt(rec)) {
-      st.changes += 1;
-    }
+    // notice; one on a table that is no more gives way to the riding bets,
+    // its changes undone: noteUndone.)
+    const theirs = !st.mine.has(latest!.key);
+    if (!writeSlip(st, res, o, rec.o === basis ? rec.b : C, false, now, { o: basis, t: stand }) || rodeAsBuilt(rec)) return;
+    if (rec.o === basis) st.changes += 1;
+    else if (!sameFelt(rec.b, C)) noteUndone(st, theirs);
     return;
   }
   const e = bettingOn(st, res, now);
@@ -2439,8 +2442,9 @@ function rideDuty(st: TableState, me: string, now: number): void {
       // plays as nothing, so the riding bets go in its place. A change of
       // the player's it carried is undone, and the table says so, as for a
       // held one: flushDuty.)
+      const theirs = !st.mine.has(latest!.key);
       if (ours(latest!) && writeSlip(st, res, o, C, false, now, { o: basis, t: stand }) && !rodeAsBuilt(rec) && !sameFelt(rec.b, C)) {
-        noteUndone(st);
+        noteUndone(st, theirs);
       }
       return;
     }
