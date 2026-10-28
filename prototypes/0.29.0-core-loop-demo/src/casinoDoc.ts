@@ -218,8 +218,8 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpoint, nextSid, parseKey, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, SigCheck } from './computedFold';
+import { asCheckpointFor, gameOfInc, nextSid, parseKey, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
 import { getPlayerId } from './identity';
 import { getIdentityPub, verifyIdentityStrict } from './keypair';
 import { forgetRoomHeard, noteRoomHeard } from './roomHearing';
@@ -1342,8 +1342,11 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  🧮 A computed table's incarnation ends with it (its switch goes, a
  *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
  *  of an owner-run round an earlier build opened on a computed table ends
- *  only that round's incarnation. */
-export function clearTableKeys(tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean } = {}): void {
+ *  only that round's incarnation. 🔀 `keepConfig`: the table stays (the
+ *  switch to computed, that sweep), and so do the house's settings for it. */
+export function clearTableKeys(
+  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
   boundDoc!.transact(() => {
@@ -1370,20 +1373,32 @@ export function clearTableKeys(tableId: string, closing: TableClosing = 'heard',
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
     // 🎲 The per-table config keys ride the same map — a removed table must
-    // not leave orphaned settings behind (harmless no-op for roulette, which
-    // never writes them).
-    map.delete(`cfg:backend:${tableId}`);
-    map.delete(`cfg:fairness:${tableId}`);
+    // not leave orphaned settings behind (roulette writes only the
+    // fairness one). 🔀 A table that stays keeps them: switched to computed
+    // (which hides them), its owner-run table comes back on the house's
+    // WHEEL or DICE FAIRNESS and SETTLEMENT, not on the defaults.
+    if (!opts.keepConfig) {
+      map.delete(`cfg:backend:${tableId}`);
+      map.delete(`cfg:fairness:${tableId}`);
+    }
     // 🧮 And a computed table's incarnation is over (marked as a removed
     // one is, so a switch written at the same moment stays ended): its
     // decided nets count on, its open felts stop holding (nothing to
     // refund: they took nothing), and its sessions stay until a page
     // compacts them (computedTable). A table put back is owner-run, on a
     // fresh incarnation (tableIncFor counts the mark). (A switch that is
-    // junk names nothing to end: it goes as any orphan setting does.)
+    // junk names nothing to end: it goes as any orphan setting does.) So too
+    // every incarnation of it whose session the doc holds live and nothing
+    // has ended, the switch naming it or not: one an earlier build's removal
+    // took the switch from alone (PR 2's reads a craps name as junk, and
+    // marks nothing of it), which a page that ran it would otherwise put
+    // back on the table put back under the same id (putComputedSwitchBack).
     if (!opts.keepComputed) {
       const cinc = computedIncOf(tableId);
       if (cinc !== null) markRemoved(map, tableId, cinc);
+      for (const inc of computedIncsOf.get(tableId) ?? []) {
+        if (inc !== cinc && computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
+      }
       map.delete(`cfg:computed:${tableId}`);
     }
     map.delete(`throw:${tableId}`);
@@ -1430,8 +1445,12 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
 // (computedTable switchComputedOn): it would go on opening owner-run rounds
 // on the table, reading none of the computed records.
 
-/** The build this page's lease carries: 2 knows computed tables. */
-export const TABLE_BUILD = 2;
+/** The build this page's lease carries: 2 knows computed roulette, 3
+ *  computed craps. */
+export const TABLE_BUILD = 3;
+/** The first build that knows each computed game: a table can't switch to
+ *  one while an earlier build drives (croupier leaseIsOldBuild). */
+export const COMPUTED_MIN_BUILD = { roulette: 2, craps: 3 } as const;
 
 export interface TableOperatorLease {
   /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
@@ -2053,10 +2072,12 @@ function bindHeldStakes(doc: Y.Doc, map: Y.Map<unknown>): void {
  *  checkpoint of the sessions before it. */
 let computedMap: Y.Map<unknown> | null = null;
 
-/** A computed incarnation's name: `c` + 24 hex, never one a PR 1 table takes
- *  (tableIncFor's 24 hex), so an earlier build opening a round on the table
- *  can't end the computed one by removing its own. */
-const COMPUTED_INC = /^c[0-9a-f]{24}$/;
+/** A computed incarnation's name: `c` (roulette) or `k` (craps) + 24 hex,
+ *  never one a PR 1 table takes (tableIncFor's 24 hex), so an earlier build
+ *  opening a round on the table can't end the computed one by removing its
+ *  own. The first letter is the game (computedFold gameOfInc); a build that
+ *  reads only `c` names (computed roulette's) sees a craps switch as junk. */
+const COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
 /** A session's id: `g` for an incarnation's first, else nextSid's 24 hex. */
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
@@ -2118,6 +2139,16 @@ const computedTouched = new Set<string>();
  *  again (pinPlayerKeys). */
 let computedKeysMoved = false;
 const NO_COMPUTED_HELD: ReadonlyMap<string, bigint> = new Map();
+/** The page's clock as a transaction began (onComputedTransaction), or null
+ *  outside one: every arrival it brings is stamped with the same time, so a
+ *  throw and a close that came in one update read as having come together. */
+let txNow: number | null = null;
+/** 🎲 When this page first saw each dice throw (`throw:<tableId>` values,
+ *  by table, then `<round>|<by>|<seed>`): a computed craps table plays a
+ *  throw only if it came before the roll's close (computedThrowSeenAt). The
+ *  last THROWS_KEPT per table. */
+let throwSeen = new Map<string, Map<string, number>>();
+const THROWS_KEPT = 8;
 
 /** The incarnation a casinoComputed key is of: `ses:<t>:<inc>:<sid>` (with
  *  its sid) or `sum:<t>:<inc>`, parsed from the right (an incarnation and a
@@ -2142,19 +2173,19 @@ function computedKeyParts(key: string): { t: string; inc: string; sid?: string }
 
 const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
 
-const checkpointCache = new WeakMap<object, Checkpoint | null>();
+const checkpointCache = new WeakMap<object, { inc: string; cp: Checkpoint | null }>();
 
-/** An incarnation's checkpoint as stored (asCheckpoint, once per value: up
- *  to 4,096 nets to check); null for none, or junk. */
+/** An incarnation's checkpoint as stored (its game's asCheckpoint, once per
+ *  value: up to 4,096 nets to check); null for none, or junk. */
 function checkpointAt(map: Y.Map<unknown>, t: string, inc: string): Checkpoint | null {
   const value = map.get(`sum:${t}:${inc}`);
   if (typeof value !== 'object' || value === null) return null;
-  let cp = checkpointCache.get(value);
-  if (cp === undefined) {
-    cp = asCheckpoint(value);
-    checkpointCache.set(value, cp);
+  let hit = checkpointCache.get(value);
+  if (hit?.inc !== inc) {
+    hit = { inc, cp: asCheckpointFor({ inc })(value) };
+    checkpointCache.set(value, hit);
   }
-  return cp;
+  return hit.cp;
 }
 
 /** The sid of the session checkpoint `cp` opens (nextSid, hashed once per
@@ -2187,6 +2218,18 @@ export function isComputedTable(tableId: string): boolean {
   return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && checkpointAt(computedMap!, tableId, inc)?.e !== 1;
 }
 
+/** Whether table `tableId` is a computed table of `game` now
+ *  (isComputedTable, the incarnation's name that game's: computedFold
+ *  gameOfInc). A switch naming the other game's incarnation leaves this
+ *  game's owner-run play going (unless this game's own is lost under it:
+ *  computedSwitchLost): no page of this build plays it there; it ends a
+ *  minute on when the doc holds its records (computedTable awayDuty), and
+ *  the lease holder drops it a lapse on when it holds none (croupier
+ *  dropBareSwitch). */
+export function isComputedFor(tableId: string, game: GameName): boolean {
+  return isComputedTable(tableId) && gameOfInc(computedIncOf(tableId)!) === game;
+}
+
 /** Whether incarnation `inc` of table `tableId` is over for good: a removal
  *  marked it (`gone:`), or its checkpoint says it ended (finalizeComputed
  *  writes both). A switch that is missing, or junk, ends nothing yet: a
@@ -2197,15 +2240,16 @@ export function computedIncEnded(tableId: string, inc: string): boolean {
   return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
 }
 
-/** The name a table's next computed incarnation takes: `c` + 24 hex of the
- *  table's removals (its `gone:` marks), as tableIncFor names an owner-run
- *  one, under a domain of its own, so the two never meet. Not at random:
+/** The name a table's next computed incarnation takes: `c` (roulette) or
+ *  `k` (craps) + 24 hex of the table's removals (its `gone:` marks), as
+ *  tableIncFor names an owner-run one, under a domain of each game's own, so
+ *  none of them ever meet. Not at random:
  *  two of the house's pages switching the table on at once name it alike,
  *  and their sessions meet on one key. Past any name the doc already holds
  *  a session or a checkpoint of (a switch-off that ended it on a page whose
  *  mark the doc didn't keep): that one is marked ended, and the next tried,
  *  as freshIncFor does. In the caller's transaction. */
-export function computedIncFor(tableId: string): string {
+export function computedIncFor(tableId: string, game: GameName = 'roulette'): string {
   const casino = ensureMap();
   const map = computedMap!;
   const prefix = `gone:${tableId}:`;
@@ -2213,8 +2257,8 @@ export function computedIncFor(tableId: string): string {
     const removals = [...casino.entries()].filter(([key]) => key.startsWith(prefix))
       .map(([key, value]): [string, unknown] => [key.slice(prefix.length), value])
       .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
-    const named = `ssf-computed-inc-v1|${tableId}|${JSON.stringify(removals)}`;
-    const inc = 'c' + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
+    const named = `${game === 'craps' ? 'ssf-computed-craps-inc-v1' : 'ssf-computed-inc-v1'}|${tableId}|${JSON.stringify(removals)}`;
+    const inc = (game === 'craps' ? 'k' : 'c') + bytesToHex(sha256(new TextEncoder().encode(named))).slice(0, 24);
     const used = map.has(`sum:${tableId}:${inc}`) || [...map.keys()].some((key) => {
       const at = computedKeyParts(key);
       return at?.sid !== undefined && at.t === tableId && at.inc === inc;
@@ -2262,12 +2306,17 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
 
 /** Whether table `tableId`'s switch is lost: it names no incarnation (gone,
  *  or junk) while the doc holds the live session of one nothing has ended
- *  (putComputedSwitchBack: a peer's doing, put back by the room's pages).
- *  The robot runs no owner-run round there meanwhile (croupier): the table's
- *  players are mid-round on the computed one. */
-export function computedSwitchLost(tableId: string): boolean {
-  if (computedIncOf(tableId) !== null) return false;
+ *  (putComputedSwitchBack: a peer's doing, put back by the room's pages);
+ *  given `game`, one of that game's, and a switch naming the other game's
+ *  incarnation names none of this game's (a peer's write over it, put back
+ *  the same way when the doc holds nothing of the name it wrote). The robot
+ *  runs no owner-run round there meanwhile (croupier, crapsCroupier): the
+ *  table's players are mid-round on the computed one. */
+export function computedSwitchLost(tableId: string, game?: GameName): boolean {
+  const named = computedIncOf(tableId);
+  if (named !== null && (game === undefined || gameOfInc(named) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
+    if (game !== undefined && gameOfInc(inc) !== game) continue;
     if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;
   }
   return false;
@@ -2485,8 +2534,29 @@ function stampArrivals(c: ComputedInc, keys: Iterable<string>): void {
   let now: number | undefined;
   for (const key of keys) {
     if (c.seen.has(key) || !parseKey(key)) continue;
-    c.seen.set(key, now ??= Date.now());
+    c.seen.set(key, now ??= txNow ?? Date.now());
   }
+}
+
+/** Stamp the dice throw table `tableId`'s `throw:` key holds now, if this
+ *  page hasn't seen it before. */
+function stampThrow(casino: Y.Map<unknown>, tableId: string): void {
+  const v = casino.get(`throw:${tableId}`);
+  if (!isDiceThrow(v)) return;
+  let m = throwSeen.get(tableId);
+  if (!m) throwSeen.set(tableId, m = new Map());
+  const key = `${v.round}|${v.by}|${v.seed}`;
+  if (m.has(key)) return;
+  m.set(key, txNow ?? Date.now());
+  while (m.size > THROWS_KEPT) m.delete(m.keys().next().value as string);
+}
+
+/** 🎲 When this page first saw dice throw `thr` at table `tableId` (its own
+ *  Date.now() as the update that brought it began, the same as a close in
+ *  that update carries: computedSeenAt), or undefined: a throw from before
+ *  this doc was bound, or from before a computed table was up. */
+export function computedThrowSeenAt(tableId: string, thr: DiceThrow): number | undefined {
+  return throwSeen.get(tableId)?.get(`${thr.round}|${thr.by}|${thr.seed}`);
 }
 
 /** What a key the live session holds holds, as the fold reads it. Yjs keeps
@@ -2610,6 +2680,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   computedKeysMoved = false;
   verifyQueued = false;
   verifySpent = 0;
+  throwSeen = new Map();
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
@@ -2626,7 +2697,18 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   });
 }
 
+/** Count what a transaction changed of the computed tables, every arrival
+ *  it brought stamped with one time (txNow). */
 function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
+  txNow = Date.now();
+  try {
+    countTransaction(tr, map, casino);
+  } finally {
+    txNow = null;
+  }
+}
+
+function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
   verifySpent = 0;
   const dirty = new Set<ComputedInc>();
   const whole = new Set<ComputedInc>();
@@ -2690,6 +2772,8 @@ function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y
       } else if (key.startsWith('gone:')) {
         const c = computedIncs.get(key.slice('gone:'.length));
         if (c) dirty.add(c);
+      } else if (key.startsWith('throw:')) {
+        stampThrow(casino, key.slice('throw:'.length));
       }
     }
   }
@@ -2793,7 +2877,7 @@ export function writeCheckpointAndTrim(
   ensureMap();
   const map = computedMap!;
   if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
-  const ok = asCheckpoint(cp);
+  const ok = asCheckpointFor({ inc })(cp);
   const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
   if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, checkpointAt(map, tableId, inc))) return false;
   const next = nextSid(ctx, ok);
@@ -2828,7 +2912,7 @@ export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | 
   if (!c || !casinoWhole(tableId)) return false;
   const was = checkpointAt(map, tableId, inc);
   if (cp !== null) {
-    const ok = asCheckpoint(cp);
+    const ok = asCheckpointFor({ inc })(cp);
     if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
   } else if (was?.e !== 1) {
     return false;

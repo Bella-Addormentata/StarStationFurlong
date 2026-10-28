@@ -28,6 +28,7 @@ import { STANDS, rebuildStands, standsForItem } from "./stands";
 import { isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
 import type { TableClosing } from "./casinoDoc";
 import { computedCompactionPending, tickComputedTables } from "./computedTable";
+import type { ComputedTableRef } from "./computedTable";
 import { forgetMissingTables, tickFairSeeds } from "./fairTableSeeds";
 import {
   beatCroupier,
@@ -46,6 +47,7 @@ import {
   closeCrapsTable,
   CRAPS_SHOW_MS,
   crapsBeatLine,
+  crapsRunsItself,
   tickAutoStickman,
   tickManualCraps,
 } from "./crapsCroupier";
@@ -6339,8 +6341,10 @@ export class World {
       for (const t of tables) {
         // 🧮 A computed table has no operator: no heartbeat (so no robot is
         // posted there, nor narrates), and the robot only sweeps an
-        // owner-run round an earlier build opened on it (tickAutoCroupier).
-        const computed = t.kind === "roulette-table" && isComputedTable(t.id);
+        // owner-run round an earlier build opened on it (tickAutoCroupier,
+        // tickAutoStickman). At craps only a craps name counts (a roulette
+        // one there is junk, and the stickman runs on): crapsRunsItself.
+        const computed = t.kind === "roulette-table" ? isComputedTable(t.id) : crapsRunsItself(t.id);
         if (beatNow && !computed) beatCroupier(t.id);
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
@@ -6364,13 +6368,15 @@ export class World {
       const me = getPlayerId();
       for (const t of tables) tickFairSeeds(t.id, t.kind === "craps-table" ? "craps" : "roulette", me);
     }
-    // 🧮 Computed roulette: every client, every frame, moves its computed
+    // 🧮 Computed tables: every client, every frame, moves its computed
     // tables along (its slips, closes, seeds, forfeits, trims: each table at
     // most every 200 ms), and compacts any ended incarnation, a removed
-    // table's too (so it runs with no table in the room as well). Never out
-    // of the frame: a throw there is told once and the frame goes on.
+    // table's too (so it runs with no table in the room as well). Every
+    // table goes with its game: one whose incarnation is named for the other
+    // game ends as a table out of the room does. Never out of the frame: a
+    // throw there is told once and the frame goes on.
     try {
-      tickComputedTables(rouletteTables.map((t) => t.id), Date.now());
+      tickComputedTables(tables.map((t): ComputedTableRef => ({ id: t.id, game: t.kind === "craps-table" ? "craps" : "roulette" })), Date.now());
     } catch (err) {
       if (!this.computedTickWarned) {
         this.computedTickWarned = true;

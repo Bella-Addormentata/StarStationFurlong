@@ -10,13 +10,23 @@
  * a spec fakes Date only, and a page's clock is the spec's time plus the
  * page's skew, set as the system time whenever the page hears an update or
  * runs a frame, so casinoDoc's arrival stamps are on that page's clock.
+ *
+ * A spec can choose a page's next fresh seeds (its `seeds` queue, drawn
+ * before any random one: fairDice randomSeedHex), so a craps roll's dice
+ * are the ones it wants (rigRoll); and where the page's table session
+ * stands (standAt), as a mounted craps table session marks it.
  */
 
 import { vi } from 'vitest';
 import * as Y from 'yjs';
+import { diceOf } from './computedCraps';
+import type { CrapsCarry } from './computedCraps';
+import { seedTable } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
+import type { ComputedTableRef } from './computedTable';
 import { ComputedKit } from './computedTestKit';
 import type { TestIdentity } from './computedTestKit';
+import type { CrapsBet } from './games/craps';
 
 export interface Page {
   name: string;
@@ -32,6 +42,9 @@ export interface Page {
   fair: typeof import('./fairTableSeeds');
   fold: typeof import('./computedFold');
   keypair: typeof import('./keypair');
+  stands: typeof import('./localStands');
+  /** This page's next fresh seeds, drawn first (then random ones). */
+  seeds: string[];
 }
 
 /** The room every page binds unless a spec says otherwise. */
@@ -39,6 +52,11 @@ export const PAGE_ROOM = 'room-ct';
 export const PAGE_TABLE = 'roulette-1';
 export const PAGE_INC = 'c' + '5a'.repeat(12);
 export const PAGE_CTX: FoldCtx = { room: PAGE_ROOM, t: PAGE_TABLE, inc: PAGE_INC };
+/** …and the craps table, under a craps name. */
+export const CRAPS_TABLE = 'craps-1';
+export const CRAPS_INC = 'k' + '5a'.repeat(12);
+export const CRAPS_CTX: FoldCtx = { room: PAGE_ROOM, t: CRAPS_TABLE, inc: CRAPS_INC };
+export const CRAPS_REF: ComputedTableRef = { id: CRAPS_TABLE, game: 'craps' };
 
 /** A page for player `pid` (Yjs client `clientID`), its key shown in the
  *  room's players map as main.ts shows it. Its checks never run out of time
@@ -68,12 +86,18 @@ export async function loadPage(
   const kept = opts.reloadOf?.keypair;
   if (kept) vi.doMock('./keypair', () => kept);
   else vi.doUnmock('./keypair');
+  const seeds: string[] = [];
+  vi.doMock('./games/fairDice', async (importOriginal) => {
+    const real = await importOriginal<typeof import('./games/fairDice')>();
+    return { ...real, randomSeedHex: () => seeds.shift() ?? real.randomSeedHex() };
+  });
   const casino = await import('./casinoDoc');
   const croupier = await import('./croupier');
   const table = await import('./computedTable');
   const fair = await import('./fairTableSeeds');
   const fold = await import('./computedFold');
   const keypair = await import('./keypair');
+  const stands = await import('./localStands');
   // (This load's own modules: a reload listens afresh, as a page loaded again does.)
   if (opts.hears) table.listenToRoom();
   const doc = new Y.Doc();
@@ -82,22 +106,27 @@ export async function loadPage(
   casino.bindCasinoDoc(doc, PAGE_ROOM, opts.resync);
   const pub = keypair.getIdentityPub();
   doc.transact(() => doc.getMap('players').set(pid, { keyB64: pub, name: pid }));
-  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair };
+  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair, stands, seeds };
 }
 
 /** Pages for `names` (Yjs clients 1, 2, …, clocks `skews` ahead of the
  *  spec's), 1,000 chips each, the table switched on by the first, all synced
  *  at the spec's time T. */
-export async function openRoom(names: string[], T: number, skews: number[] = []): Promise<Page[]> {
+export async function openRoom(names: string[], T: number, skews: number[] = [], at: { t: string; inc: string } = { t: PAGE_TABLE, inc: PAGE_INC }): Promise<Page[]> {
   const pages: Page[] = [];
   for (const [i, name] of names.entries()) pages.push(await loadPage(name, i + 1, { skew: skews[i] ?? 0 }));
   for (const p of pages) {
     clockOf(p, T);
     p.casino.buyInChips(p.pid, 1_000);
   }
-  switchOn(pages[0]);
+  switchOn(pages[0], at.t, at.inc);
   sync(T, ...pages);
   return pages;
+}
+
+/** …the craps table switched on instead. */
+export function openCrapsRoom(names: string[], T: number, skews: number[] = []): Promise<Page[]> {
+  return openRoom(names, T, skews, { t: CRAPS_TABLE, inc: CRAPS_INC });
 }
 
 /** Page p's clock at the spec's time T, set as the system time. */
@@ -128,7 +157,7 @@ export function send(T: number, x: Page, y: Page): void {
 
 /** One frame of page p at T: it runs its tables (croupier noteTablesRunning,
  *  as World does every frame) and ticks the computed one. */
-export function frame(T: number, p: Page, tables: string[] = [PAGE_TABLE]): void {
+export function frame(T: number, p: Page, tables: ComputedTableRef[] = [PAGE_TABLE]): void {
   const now = clockOf(p, T);
   p.croupier.noteTablesRunning(now);
   p.table.tickComputedTables(tables, now);
@@ -137,7 +166,9 @@ export function frame(T: number, p: Page, tables: string[] = [PAGE_TABLE]): void
 /** Frames of `pages` every `step` ms from `from` to `to` (inclusive), each
  *  synced before it runs; stops early, returning the time, once `until`
  *  holds after a step. Returns `to` + step when it never did. */
-export function run(pages: Page[], from: number, to: number, opts: { step?: number; until?: () => boolean; tables?: string[] } = {}): number {
+export function run(
+  pages: Page[], from: number, to: number, opts: { step?: number; until?: () => boolean; tables?: ComputedTableRef[] } = {},
+): number {
   const step = opts.step ?? 100;
   for (let T = from; T <= to; T += step) {
     sync(T, ...pages);
@@ -219,14 +250,16 @@ export function byRank(pages: Page[], duty: 'close' | 'forfeit' | 'abandon' | 't
 
 /** Trim table t's live session by hand on page p, as commit 3's trim will:
  *  a checkpoint at the last decided round (signed by `id`, nets the fold's
- *  unless given), the old session gone, the open round's felts copied into
- *  the new one, all in one transaction. The new session's id. */
-export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigint>, t = PAGE_TABLE): string {
+ *  unless given; at a craps name with the table's state after it, or
+ *  `carry`), the old session gone, the open round's felts copied into the
+ *  new one, all in one transaction. The new session's id. */
+export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigint>, t = PAGE_TABLE, given?: CrapsCarry): string {
   const res = p.casino.computedFoldOf(t)!;
   const inc = p.casino.computedIncOf(t)!;
   const kit = new ComputedKit({ room: PAGE_ROOM, t, inc });
   const D = res.rounds.filter((v) => v.decided).at(-1)!;
-  const cp = kit.checkpoint(id, res.base.sid, D.r, D.close, nets ?? Object.fromEntries(res.nets));
+  const carry = inc[0] === 'k' ? given ?? (res.carry as CrapsCarry) : undefined;
+  const cp = kit.checkpoint(id, res.base.sid, D.r, D.close, nets ?? Object.fromEntries(res.nets), undefined, carry);
   const sid = kit.sidAfter(cp);
   const old = p.casino.computedSessionForWrite(t)!;
   const copies = [...res.felts.values()].map((s): [string, unknown] => [s.key, old.get(s.key)]);
@@ -239,4 +272,125 @@ export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigi
     for (const [k, v] of copies) ses.set(k, v);
   });
   return sid;
+}
+
+// ── 🎲 Craps ─────────────────────────────────────────────────────────────────
+
+/** Page p's table session standing at craps stand `stand` (1–7), or at
+ *  none (null: off the table), as a mounted one marks it. */
+export function standAt(p: Page, stand: number | null, t = CRAPS_TABLE): void {
+  p.stands.setLocalStand(t, p.pid, stand !== null, stand);
+}
+
+/** The craps table's state on page p (readComputedCraps). */
+export function crapsOf(p: Page, now?: number, t = CRAPS_TABLE) {
+  return p.table.readComputedCraps(t, now);
+}
+
+/** The table's carried state on page p: the point, the riding bets, the dice. */
+export function carryOf(p: Page, t = CRAPS_TABLE): CrapsCarry {
+  return p.casino.computedFoldOf(t)!.carry as CrapsCarry;
+}
+
+/** Page p puts its whole felt `bets` down on the open roll at T, as its
+ *  table session does: built on the table as p has it now. */
+export function crapsBet(p: Page, bets: CrapsBet[], T: number, t = CRAPS_TABLE) {
+  const now = clockOf(p, T);
+  const v = p.table.readComputedCraps(t, now);
+  const { basis } = p.table.readMyComputedCrapsBets(t, p.pid, v?.round ?? 0, now);
+  return p.table.writeComputedCrapsSlip(t, bets, basis, now);
+}
+
+/** A seed from a tag. */
+export function tagSeed(tag: string): string {
+  let h = 0x811c9dc5;
+  const out: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    for (const ch of `${tag}#${i}`) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    out.push(h.toString(16).padStart(8, '0'));
+  }
+  return out.join('');
+}
+
+/** Queue on each of `pages` its next fresh seed so that roll r's dice, from
+ *  their seeds and `others` (seeds already committed), sum to `sum`. */
+export function rigRoll(pages: Page[], r: number, sum: number, others: string[] = [], ctx: FoldCtx = CRAPS_CTX): void {
+  const rest = pages.slice(1).map((p) => tagSeed(`${p.name}:${r}:${sum}`));
+  for (let n = 0; n < 10_000; n++) {
+    const first = tagSeed(`${pages[0].name}:${r}:${sum}:${n}`);
+    const [d1, d2] = diceOf(seedTable(ctx), r, [first, ...rest, ...others]);
+    if (d1 + d2 !== sum) continue;
+    pages[0].seeds.push(first);
+    pages.slice(1).forEach((p, i) => p.seeds.push(rest[i]));
+    return;
+  }
+  throw new Error(`rigRoll: no seeds for ${sum}`);
+}
+
+/** Queue roll r's seeds on `pages` so that all of theirs make `both` and
+ *  the seed of `w` alone (a forfeit counting w only) makes `alone`. */
+export function rigSplit(pages: Page[], r: number, both: number, w: Page, alone: number, ctx: FoldCtx = CRAPS_CTX): void {
+  const table = seedTable(ctx);
+  const sum = (seeds: string[]): number => diceOf(table, r, seeds).reduce((x, d) => x + d, 0);
+  for (let n = 0; n < 100_000; n++) {
+    const seeds = pages.map((p) => tagSeed(`${p.name}:${r}:split:${n}`));
+    if (sum([seeds[pages.indexOf(w)]]) !== alone || sum(seeds) !== both) continue;
+    pages.forEach((p, i) => p.seeds.push(seeds[i]));
+    return;
+  }
+  throw new Error(`rigSplit: no seeds for ${both} / ${alone}`);
+}
+
+/** Queue roll r's seeds on `pages` so that the seeds of each of `sums`'
+ *  sets of pages make its total (a forfeit counting that set): `[pages, 6]`
+ *  for all of them. */
+export function rigSums(pages: Page[], r: number, sums: [Page[], number][], ctx: FoldCtx = CRAPS_CTX): void {
+  const table = seedTable(ctx);
+  const sum = (seeds: string[]): number => diceOf(table, r, seeds).reduce((x, d) => x + d, 0);
+  for (let n = 0; n < 400_000; n++) {
+    const seeds = pages.map((p) => tagSeed(`${p.name}:${r}:sums:${n}`));
+    if (!sums.every(([set, want]) => sum(set.map((p) => seeds[pages.indexOf(p)])) === want)) continue;
+    pages.forEach((p, i) => p.seeds.push(seeds[i]));
+    return;
+  }
+  throw new Error(`rigSums: no seeds for ${sums.map(([set, want]) => `${set.length}:${want}`).join(' ')}`);
+}
+
+/** Queue roll r's seeds on `pages` so that all of theirs and the seed of `w`
+ *  alone throw the same dice, summing to `sum`: a forfeit counting w only
+ *  decides the roll again on the same faces. */
+export function rigSame(pages: Page[], r: number, sum: number, w: Page, ctx: FoldCtx = CRAPS_CTX): void {
+  const table = seedTable(ctx);
+  for (let n = 0; n < 100_000; n++) {
+    const seeds = pages.map((p) => tagSeed(`${p.name}:${r}:same:${n}`));
+    const all = diceOf(table, r, seeds);
+    const alone = diceOf(table, r, [seeds[pages.indexOf(w)]]);
+    if (all[0] + all[1] !== sum || all[0] !== alone[0] || all[1] !== alone[1]) continue;
+    pages.forEach((p, i) => p.seeds.push(seeds[i]));
+    return;
+  }
+  throw new Error(`rigSame: no seeds for ${sum}`);
+}
+
+/** Pages `names` at craps stands `stands` (null: off the table), synced,
+ *  bet the pass line on roll 1 at T (`amounts`: 10, 5, 20, 15 by default)
+ *  and roll a 6: the point is on, every pass riding on it, the dice with
+ *  the first of their stands clockwise. When roll 1 decided on every page
+ *  (framed every `step` ms), and when its show ends there. */
+export async function crapsPointOn(names: string[], stands: (number | null)[], T: number, opts: { amounts?: number[]; step?: number } = {}) {
+  const amounts = opts.amounts ?? [10, 5, 20, 15];
+  const pages = await openCrapsRoom(names, T);
+  pages.forEach((p, i) => standAt(p, stands[i] ?? null));
+  rigRoll(pages, 1, 6);
+  for (const [i, p] of pages.entries()) {
+    const put = crapsBet(p, [{ type: 'pass', amount: amounts[i] }], T);
+    if (put !== 'ok') throw new Error(`crapsPointOn: ${p.name}'s pass: ${put}`);
+  }
+  sync(T, ...pages);
+  const decided = (p: Page): boolean => p.casino.computedFoldOf(CRAPS_TABLE)?.rounds[0]?.decided === 'reveals';
+  const step = opts.step ?? 200;
+  const decidedAt = run(pages, T + step, T + 60_000, { step, tables: [CRAPS_REF], until: () => pages.every(decided) });
+  if (!pages.every(decided) || pages.some((p) => carryOf(p).p !== 6)) throw new Error('crapsPointOn: roll 1 made no point');
+  const showEnd = crapsOf(pages[0], decidedAt)!.resultAt + pages[0].croupier.CRAPS_SHOW_MS;
+  return { pages, decidedAt, showEnd };
 }

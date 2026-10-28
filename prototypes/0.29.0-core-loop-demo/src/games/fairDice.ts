@@ -136,6 +136,23 @@ export function pocketFromMaterialSync(base: string): number {
 }
 
 /**
+ * `diceFromMaterial`, synchronously: the same SHA-256 blocks (@noble/hashes
+ * instead of SubtleCrypto) and the same byte-≥-252 rejection, so it returns
+ * the same dice for every `base`. For the computed-table fold, as
+ * `pocketFromMaterialSync` is.
+ */
+export function diceFromMaterialSync(base: string): [number, number] {
+  const dice: number[] = [];
+  for (let block = 0; dice.length < 2; block++) {
+    for (const b of sha256(new TextEncoder().encode(`${base}|${block}`))) {
+      if (b < 252) dice.push((b % 6) + 1);
+      if (dice.length === 2) break;
+    }
+  }
+  return [dice[0], dice[1]];
+}
+
+/**
  * Verify a settled roll from its PUBLIC transcript — anyone (a player, an
  * auditor) can run this: the revealed seed must match the commit the house
  * published before bets, and the dice must be the deterministic derivation. A

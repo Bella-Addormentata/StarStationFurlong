@@ -17,7 +17,7 @@ const {
 } = await import('./casinoDoc');
 const { setSoleCroupierPredicate } = await import('./croupier');
 const {
-  CRAPS_SHOOTER_MS, MANUAL_TAKEOVER_MS, markLocalSeat, pressManualRoll, sampleSeats, SEAT_CONFIRM_MS, SEAT_STALE_MS,
+  CRAPS_SHOOTER_MS, localStandOf, MANUAL_TAKEOVER_MS, markLocalSeat, pressManualRoll, sampleSeats, SEAT_CONFIRM_MS, SEAT_STALE_MS,
   seatedPlayers, tickManualCraps,
 } = await import('./crapsCroupier');
 const { FURNITURE_DEFS } = await import('./furniture');
@@ -91,6 +91,25 @@ describe('who is at the table', () => {
     markLocalSeat(t, ME, true);
     expect(seatedPlayers(t, at(T0)).map((p) => p.pid)).toEqual([ME]);
     markLocalSeat(t, ME, false);
+  });
+
+  it("keeps this page's own stand for a computed slip only when it is a player stand: never the stickman's, none off the list, never the doc's seat record", () => {
+    const t = freshTable();
+    seat(t, ME, 1);
+    expect(localStandOf(t, ME)).toBeUndefined();
+    markLocalSeat(t, ME, true, STAND);
+    expect(localStandOf(t, ME)).toBe(STAND);
+    const stick = FURNITURE_DEFS['craps-table'].stands!.findIndex((s) => s.role === 'stickman');
+    expect(stick).toBeGreaterThanOrEqual(0);
+    for (const stand of [stick, 99, -1, 1.5, null, undefined]) {
+      markLocalSeat(t, ME, true, stand);
+      expect(localStandOf(t, ME)).toBeUndefined();
+      // (Still this page's seat: it counts at once all the same.)
+      expect(seatedPlayers(t, at(T0)).map((p) => p.pid)).toEqual([ME]);
+    }
+    markLocalSeat(t, ME, true, STAND);
+    markLocalSeat(t, ME, false);
+    expect(localStandOf(t, ME)).toBeUndefined();
   });
 
   it('a seat seen to move just before the clock went back an hour goes stale a stale time after, not an hour', () => {

@@ -32,19 +32,27 @@
  * 🧮 A COMPUTED roulette table (computedTable.ts) has no operator: its
  * state, felt and verdict come from the fold of the players' records on
  * this page's clock, a felt goes down as a signed slip, and the wheel spins
- * once per result (its spin key). Every branch asks isComputedTable live,
- * so a switch mid-visit turns the table under the player's hands.
+ * once per result (its spin key). Every branch asks isComputedFor live, so
+ * a switch mid-visit turns the table under the player's hands.
+ *
+ * 🎲 A computed CRAPS table the same way, its felt one amount per spot (a
+ * slip's), bets riding from roll to roll. The shooter's page offers the
+ * fling, and closes the roll at it, from its own fling only; the throw
+ * record is animation, and each page shows one flight a roll: the
+ * shooter's throw when it came before the roll's close (by casinoDoc's
+ * arrival stamps), else the stickman's toss at the close, on the shooter's
+ * own page only its own fling. The dice land on the fold's faces.
  */
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, casinoWhole, clearMySeat, computedIncEnded, computedSettled, isComputedTable, readAllBets, readAllCrapsBets,
-  readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
+  casinoDocEpoch, casinoWhole, clearMySeat, computedIncEnded, computedSettled, computedThrowSeenAt, isComputedFor, readAllBets,
+  readAllCrapsBets, readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
-import type { TableSeat } from './casinoDoc';
+import type { DiceThrow, TableSeat } from './casinoDoc';
 import { railStacks, RAIL_PITCH, TAKE_DOWN_R } from './casinoTable3d';
 import type { CasinoTableVisualHandle, FeltStack, RailSpec, RailStack } from './casinoTable3d';
 import { CHIP_DENOMS, railChipCounts } from './chipDisplay';
@@ -53,14 +61,16 @@ import {
   SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
 import {
-  computedDecidedTo, computedMine, computedOldBuildDriving, computedRoundCheck, computedSwitchState, readComputedBets,
-  readComputedRoulette, readMyComputedBets, SWITCH_OFF_REFUSED, SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff,
-  switchComputedOn, writeComputedSlip,
+  computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedRollChange,
+  computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
+  CRAPS_SWITCH_ON_CONFIRM, CRAPS_SWITCH_ON_REFUSED, noteComputedFling, readComputedBets, readComputedCraps,
+  readComputedCrapsBets, readComputedRoulette, readMyComputedBets, readMyComputedCrapsBets, SWITCH_OFF_REFUSED,
+  SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip, writeComputedSlip,
 } from './computedTable';
-import type { ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
 import { crapsBackend } from './crapsBackend';
 import {
-  markLocalSeat, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
+  markLocalSeat, NO_HAND_ROLL, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
 } from './crapsCroupier';
 import { deviceFocus } from './deviceFocus';
 import type { DeviceUI } from './devices';
@@ -73,6 +83,7 @@ import {
 import type { CrapsSpot, FeltLayout, FeltPoint, FeltRect, FeltRegion } from './games/casinoLayout';
 import {
   canPlaceBet, canTakeDown, crapsBetLabel, isOddsType, MAX_LAY_MULTIPLE, MAX_ODDS_MULTIPLE, oddsFlat, oddsRoom, pointWasOn,
+  rollCall,
 } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import { FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript } from './games/diceFairness';
@@ -80,6 +91,7 @@ import { isFairTable, MAX_TABLE_BETTORS, REVEAL_GRACE_MS, roundIsFair, tickFairS
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { betLabel, payoutFor, pocketColor } from './games/roulette';
 import { escapeHtml } from './htmlEscape';
+import { showHint } from './hud';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 
@@ -91,7 +103,7 @@ import { getPlayerId } from './identity';
  *  seeds is the ⚙ card's verdict line, which warns on house-seed-only. */
 export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
   // 🧮 A computed table has no owner to trust, and no house seed either.
-  if (game === 'roulette' && isComputedTable(tableId)) {
+  if (isComputedFor(tableId, game)) {
     return { text: "PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS", color: FRIENDLY_RED, fair: false };
   }
   return roundIsFair(tableId, game)
@@ -107,6 +119,15 @@ const LEASE_SETTLE_MS = 600;
 
 /** 🧮 What a press that runs a round says at a computed table. */
 const NO_HAND_SPIN = "NOBODY SPINS THIS TABLE BY HAND — IT SPINS ONCE THE BETTORS' SEEDS ARE IN";
+/** 🎲 A computed craps slip built on a table that changed under it. */
+const CHANGES_UNDONE = 'THE LAST ROLL CHANGED — YOUR CHANGES WERE UNDONE · PLACE THEM AGAIN';
+/** 🎲 Riding bets the leave notice names before `· AND N MORE`. */
+const LEAVE_LIST_MAX = 4;
+/** 🎲 How long the walk-off notice stays up (it names up to four bets). */
+const LEAVE_HINT_MS = 5_000;
+/** 🎲 How long the status bar calls a flight rolling: past it the dice lie
+ *  on the felt, faceless, until the seeds are in. */
+const ROLLING_MS = 3_200;
 
 /** Friendly tables this page has already warned about (once per table). */
 const friendlyWarned = new Set<string>();
@@ -231,6 +252,26 @@ interface TableRuntime {
   computed: string | null;
   counted: boolean;
   spun: Map<number, number>;
+  /** 🎲 A computed craps table: the flight this page started for a roll
+   *  (the shooter's throw or the stickman's toss, one a roll: `at` −Infinity
+   *  for one that showed before this page looked), and whether it got its
+   *  faces or was called off; `close` when it stands for the roll's close
+   *  (the toss, or a close in before this page looked), not a throw. `spun`
+   *  holds each roll's dice (`d1d2`). */
+  flight: { r: number; at: number; done: boolean; close?: true } | null;
+  /** …and by roll, the dice it handed it, the decision they came from
+   *  (rollBy) and its close, kept through a hold, which forgets them in
+   *  `spun`: the roll held again under that close flies nothing, nor does
+   *  the same decision shown again. */
+  landed: Map<number, { dice: number; by: string; close: string }>;
+  /** …and the end of the show before the open roll's window, as the view
+   *  last had it while that roll was open (a throw from before it doesn't
+   *  play, even once the roll has settled). */
+  openShow: { r: number; end: number } | null;
+  /** …and the last re-arm the view has shown for a roll (rearmAt), kept
+   *  here through a wake, which forgets the view's: a throw seen by then
+   *  doesn't play once the roll closes again. */
+  reopened: { r: number; at: number } | null;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
 }
@@ -243,7 +284,7 @@ function runtime(tableId: string): TableRuntime {
   if (!rt || rt.epoch !== casinoDocEpoch()) {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
-      spun: new Map(), dirty: true,
+      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, dirty: true,
     };
     runtimes.set(tableId, rt);
   }
@@ -263,10 +304,11 @@ function markDirty(tableId: string): void {
 }
 
 /** 🧮 What this page has shown of a computed table's results: the pocket of
- *  each round whose spin key it saw (a later key for one of those rounds
- *  with another pocket is a rewrite: counted, for the focused table's
- *  notice), and the last round it showed decided (one no longer on the
- *  chain is undone). Per table, for one room doc and incarnation. */
+ *  each round whose spin key it saw (at craps the dice of each roll, by its
+ *  roll key), a later key for one of those rounds with another pocket being
+ *  a rewrite (counted, for the focused table's notice), and the last round
+ *  it showed decided (one no longer on the chain is undone). Per table, for
+ *  one room doc and incarnation. */
 interface ComputedShown {
   epoch: number;
   inc: string;
@@ -281,20 +323,22 @@ const computedShown = new Map<string, ComputedShown>();
  *  than the session, TRIM_ROUNDS). */
 const SHOWN_ROUNDS = 64;
 
-/** The round and pocket of a spin key (`<round>:<pocket>`), or null. */
+/** The round and pocket of a spin key (`<round>:<pocket>`), or null; of a
+ *  craps roll key (`<roll>:<d1><d2>`), the roll and its dice as d1d2. */
 function spinKeyParts(key: string): { round: number; pocket: number } | null {
   const m = /^(\d+):(\d+)$/.exec(key);
   return m ? { round: Number(m[1]), pocket: Number(m[2]) } : null;
 }
 
-/** Note what computed table `tableId` shows now (its view `s`). */
-function seeComputed(tableId: string, s: ComputedRouletteState): ComputedShown {
+/** Note what computed table `tableId` shows now: its incarnation, and its
+ *  view's spin key (at craps its roll key). */
+function seeComputed(tableId: string, inc: string, key: string): ComputedShown {
   let c = computedShown.get(tableId);
-  if (!c || c.epoch !== casinoDocEpoch() || c.inc !== s.inc) {
-    c = { epoch: casinoDocEpoch(), inc: s.inc, pockets: new Map(), shown: 0, rewrites: 0, rewrittenRound: 0 };
+  if (!c || c.epoch !== casinoDocEpoch() || c.inc !== inc) {
+    c = { epoch: casinoDocEpoch(), inc, pockets: new Map(), shown: 0, rewrites: 0, rewrittenRound: 0 };
     computedShown.set(tableId, c);
   }
-  const k = spinKeyParts(s.spinKey);
+  const k = spinKeyParts(key);
   if (k) {
     const was = c.pockets.get(k.round);
     if (was !== undefined && was !== k.pocket) {
@@ -336,6 +380,19 @@ function chipsUpTo(amount: number, max: number): number[] {
     if (out.length >= max) break;
   }
   return out;
+}
+
+/** How many chips the felt draws `amount` as (chipsUpTo's, with no cap),
+ *  counted without making them: a merged stake can be any size. */
+function drawnChips(amount: number): number {
+  let left = Math.max(0, Math.floor(amount));
+  let n = 0;
+  for (const d of CHIP_DENOMS) {
+    const k = Math.floor(left / d);
+    n += k;
+    left -= k * d;
+  }
+  return n;
 }
 
 /** Where one bet's chips go. */
@@ -519,6 +576,17 @@ function rouletteWinners(result: number): Set<string> {
 const NO_HIGHLIGHT: ReadonlySet<string> = new Set();
 
 function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
+  if (isComputedFor(id, 'craps')) {
+    driveComputedCraps(id, h, rt, me);
+    return;
+  }
+  if (rt.computed !== null) {
+    // Switched back to owner-run: start afresh, as on walking up.
+    rt.computed = null;
+    rt.primed = false;
+    rt.landedRound = 0;
+    rt.flight = null;
+  }
   const s = readCrapsTableState(id);
   const t = readDiceThrow(id);
   h.setFairBadge(roundIsFair(id, 'craps'));
@@ -580,8 +648,250 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
   }
 }
 
+/** 🎲 A roll's dice, from the d1d2 a roll key carries. */
+const diceOfKey = (n: number): [number, number] => [Math.floor(n / 10), n % 10];
+
+/** 🎲 The stickman's toss at a computed table (local, never written): from
+ *  his spot, as owner-run's stand-in, its tumble from the roll's close. */
+function tossDice(h: CasinoTableVisualHandle, close: string): void {
+  h.diceThrow(STICKMAN_DICE_SPOT, { x: 0, z: -1 }, 0.5, parseInt(close.slice(0, 8), 16) % 2 ** 31);
+}
+
+/** 🎲 Every felt's chips of a computed craps roll as this page shows them
+ *  (its own held-back felt laid over its written one), and the boxes the
+ *  dice paid lit once they are down. */
+function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, me: string, s: ComputedCrapsState): void {
+  const seats = readSeats(id);
+  const bets = { ...readComputedCrapsBets(id, s.round) };
+  const mine = readMyComputedCrapsBets(id, me, s.round).felt;
+  if (mine.length > 0) bets[me] = mine;
+  else delete bets[me];
+  h.setFeltChips(layoutStacks(
+    bets,
+    seatAnchors('craps-table', seats),
+    (b: CrapsBet, pid) => crapsChipPlan(b, seats[pid]?.stand ?? null),
+    me,
+  ));
+  h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
+}
+
+/**
+ * 🎲 A computed craps table's frame. One flight a roll on each page: on the
+ * shooter's own page its own fling (startComputedFling, at the fling) and
+ * nothing else; on every other page the throw record for the roll by the
+ * player who held the dice when it came no earlier than the end of the show
+ * before the roll's window and no later than the roll's first close (one
+ * update brings both alike), else the stickman's toss when the close comes.
+ * The dice land on the roll key's faces (a rewrite tosses again, and so
+ * does a new decision of the roll on the same faces; the same decision
+ * shown again flies nothing) and lie where the flight left them while the
+ * roll is on screen; a flight whose roll gets no faces (a void, a roll
+ * taken back to betting) is called off, as is a toss whose close is no
+ * longer in (forged, or deleted), the dice back where the roll is thrown
+ * from; none starts for a roll first seen void. Primed like roulette's:
+ * what showed by the first view counted whole and checked showed before
+ * this page looked, and doesn't fly.
+ */
+function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
+  const s = readComputedCraps(id);
+  h.setFairBadge(false);
+  if (!rt.primed || rt.computed !== (s?.inc ?? '')) {
+    rt.primed = true;
+    rt.computed = s?.inc ?? '';
+    rt.counted = false;
+    rt.spun = new Map();
+    rt.flight = null;
+    rt.landed = new Map();
+    rt.openShow = null;
+    rt.reopened = null;
+    rt.dirty = true;
+    h.reset();
+  }
+  if (!s) return;
+  seeComputed(id, s.inc, s.rollKey);
+  const k = spinKeyParts(s.rollKey);
+  // (A roll settled with no faces: void.)
+  const faceless = s.phase === 'settled' && !k;
+  const now = Date.now();
+  if (s.phase !== 'settled') {
+    // (Kept once the roll's close is in: a rewrite of the roll before then
+    // shows nothing again, and the window the close ended came after the
+    // show as it was.)
+    if (rt.openShow?.r !== s.round || computedCrapsClose(id, s.round) === null) rt.openShow = { r: s.round, end: s.showEnd };
+    // A roll back before its result (taken back to betting, or held for a
+    // forfeit's show) has no faces yet: they travel again when they come,
+    // unless they come on the decision they landed for (rt.landed).
+    rt.spun.delete(s.round);
+  }
+  // (One the clock has gone back past is another clock's, and goes: the
+  // wake that saw the step shows the last roll again, which keeps out the
+  // throws from before it.)
+  if (rt.reopened && rt.reopened.at > now) rt.reopened = null;
+  if (s.rearmAt !== undefined) rt.reopened = { r: s.round, at: s.rearmAt };
+  if (!rt.counted) {
+    if (casinoWhole(id) && computedSettled(id)) {
+      rt.counted = true;
+      if (k) {
+        rt.spun.set(k.round, k.pocket);
+        h.diceLand(diceOfKey(k.pocket));
+      }
+      if (s.phase !== 'betting' && (k?.round === s.round || computedCrapsClose(id, s.round) !== null)) {
+        rt.flight = { r: s.round, at: -Infinity, done: k?.round === s.round, close: true };
+      }
+    }
+  } else {
+    // (A roll showing again whose faces already landed here flies nothing,
+    // nor does one held again first that comes back on the decision they
+    // landed for (a wake shows the last roll again, held for its forfeit's
+    // grace): it shows as any roll shown again does. A new decision of it
+    // flies, even on the same faces; a rewrite of them tosses again below.)
+    const was = k ? rt.landed.get(k.round) : undefined;
+    if (s.phase === 'settled' && k?.round === s.round && !rt.spun.has(k.round) && was?.dice === k.pocket && was.by === s.rollBy) {
+      rt.spun.set(k.round, k.pocket);
+      if (rt.flight?.r !== k.round && h.diceState() === 'rest') {
+        // Another roll's dice since, come down: its faces turn where they
+        // lie. (Ones still in the air are called off below.)
+        h.diceLand(diceOfKey(k.pocket));
+        rt.flight = { r: k.round, at: -Infinity, done: true };
+      }
+    }
+    const landed = s.phase === 'settled' && k?.round === s.round && rt.spun.has(s.round);
+    // (Nor while one is held again under the close its faces landed here
+    // for, as for a forfeit's grace: its dice lie as they came down, and a
+    // new decision of it tosses again when it shows, below.)
+    const kept = rt.landed.get(s.round);
+    const heldAgain = s.phase === 'closing' && kept !== undefined && kept.close === computedCrapsClose(id, s.round)?.hash;
+    // (Nor for a roll first seen void: its flight would be called off below
+    // in this same frame, the dice left where the throw starts, off the
+    // felt, through the void's show.)
+    if ((s.phase === 'closing' || s.phase === 'settled') && rt.flight?.r !== s.round && !landed && !heldAgain && !faceless) {
+      const close = computedCrapsClose(id, s.round);
+      const thr = readDiceThrow(id);
+      const by = s.phase === 'settled' ? s.holderBefore : s.holder;
+      let fling: DiceThrow | null = null;
+      if (thr && thr.round === s.round && by !== undefined) {
+        if (by === me) {
+          const own = computedFlungFor(id);
+          if (own && own.r === s.round && own.seed === thr.seed) fling = thr;
+        } else if (thr.by === by) {
+          const at = computedThrowSeenAt(id, thr);
+          // (Seen by a re-arm's instant, as a throw in the update whose
+          // goodbyes took the roll back: before it.)
+          const after = rt.reopened?.r === s.round ? rt.reopened.at : -Infinity;
+          const from = rt.openShow?.r === s.round ? rt.openShow.end : 0;
+          if (at !== undefined && at >= from && at > after && (close === null || at <= close.at)) fling = thr;
+        }
+      }
+      if (fling) {
+        h.diceThrow({ x: fling.sx, z: fling.sz }, { x: fling.dx, z: fling.dz }, fling.power, fling.seed);
+        rt.flight = { r: s.round, at: now, done: false };
+      } else if (close) {
+        tossDice(h, close.hash);
+        rt.flight = { r: s.round, at: now, done: false, close: true };
+      }
+    }
+    if (k && rt.spun.get(k.round) !== k.pocket) {
+      const rewrite = rt.spun.has(k.round);
+      rt.spun.delete(k.round);
+      rt.spun.set(k.round, k.pocket);
+      if (rt.spun.size > SHOWN_ROUNDS) rt.spun.delete(rt.spun.keys().next().value as number);
+      if (s.round === k.round) {
+        // A rewrite tosses again, so the new faces travel; so does a roll
+        // whose result came with no flight seen for it.
+        if (rewrite || rt.flight?.r !== k.round || rt.flight.done) {
+          const close = computedCrapsClose(id, k.round);
+          if (close) tossDice(h, close.hash);
+        }
+        h.diceLand(diceOfKey(k.pocket));
+        rt.flight = { r: k.round, at: rt.flight?.r === k.round ? rt.flight.at : now, done: true };
+      } else if (rt.flight?.r === k.round && !rt.flight.done) {
+        // Its show went by while its dice flew: they land on its faces.
+        h.diceLand(diceOfKey(k.pocket));
+        rt.flight = { r: k.round, at: rt.flight.at, done: true };
+      } else if (h.diceState() === 'rest') {
+        // An earlier roll, its show over: the faces turn where the dice lie.
+        // Not on dice in the air or in a hand: they're a later roll's.
+        h.diceLand(diceOfKey(k.pocket));
+      }
+    }
+  }
+  if (k && rt.spun.get(k.round) === k.pocket) {
+    // Which decision the roll's faces came from (a rival one on the same
+    // faces moves nothing, and takes its place).
+    const was = rt.landed.get(k.round);
+    if (was?.dice !== k.pocket || was.by !== s.rollBy) {
+      rt.landed.delete(k.round);
+      rt.landed.set(k.round, { dice: k.pocket, by: s.rollBy, close: computedCrapsClose(id, k.round)?.hash ?? '' });
+      if (rt.landed.size > SHOWN_ROUNDS) rt.landed.delete(rt.landed.keys().next().value as number);
+    }
+  }
+  if (rt.flight && s.phase === 'betting' && rt.flight.r === s.round) {
+    // Taken back to betting (a re-arm): no faces for the flight, and the
+    // roll flies again once it closes again (from no throw seen by the
+    // re-arm, above).
+    if (!rt.flight.done) h.diceCancel();
+    rt.flight = null;
+  } else if (rt.flight && !rt.flight.done && (s.phase === 'betting' || s.round !== rt.flight.r || faceless)) {
+    // A flight that will get no faces: the roll void, or no longer the one
+    // on screen. A re-show of an earlier roll shows its faces where the
+    // dice stop; a void's dice, perhaps still in the air, go back to the
+    // stickman (nothing below moves them while the void shows).
+    h.diceCancel();
+    if (s.phase === 'settled' && k?.round === s.round) {
+      h.diceLand(diceOfKey(k.pocket));
+      rt.flight = { r: s.round, at: -Infinity, done: true };
+    } else {
+      rt.flight.done = true;
+      if (faceless) h.diceRestAt(STICKMAN_DICE_SPOT);
+    }
+  } else if (
+    rt.flight?.close && !rt.flight.done && s.phase === 'closing' && s.round > (computedDecidedTo(id) ?? 0)
+    && computedCrapsClose(id, s.round) === null
+  ) {
+    // The close it stood for is no longer in: counted while its signature
+    // was still to check, then found forged, or deleted. The roll waits for
+    // its throw again, so the dice go back where it is thrown from (below),
+    // and fly again for the throw or the close that ends it. (Not a roll
+    // decided and held for its show, whose close a checkpoint now names
+    // alone: its faces come where the dice are.)
+    h.diceCancel();
+    rt.flight = null;
+  }
+  const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
+  if (!animating) {
+    h.setPuck(s.point);
+    // (Not while the roll on screen has had its flight here: the dice lie
+    // where it left them, through a forfeit's wait for the faces, which
+    // turn there when they come, and through a hold of the roll again.)
+    if (s.phase !== 'settled' && !localHold.has(id) && rt.flight?.r !== s.round) {
+      const seat = s.phase === 'closing' && s.shooter !== undefined ? readSeat(id, s.shooter) : null;
+      const stand = seat ? standLocal('craps-table', seat.stand) : null;
+      h.diceRestAt(stand ? diceSpotFor(stand, CRAPS_LAYOUT.felt) : STICKMAN_DICE_SPOT);
+    }
+    if (rt.dirty) {
+      rt.dirty = false;
+      layComputedCrapsFelt(id, h, me, s);
+    }
+  }
+}
+
+/** 🎲 The shooter's own fling at a computed craps table, flown at once on
+ *  this page (and only there: no other throw plays on it for the roll). */
+function startComputedFling(id: string, h: CasinoTableVisualHandle, thr: DiceThrow): void {
+  const rt = runtime(id);
+  h.diceThrow({ x: thr.sx, z: thr.sz }, { x: thr.dx, z: thr.dz }, thr.power, thr.seed);
+  rt.flight = { r: thr.round, at: Date.now(), done: false };
+}
+
+/** 🎲 How long ago the flight of roll `round` started on this page (for the
+ *  status bar's ROLLING), or Infinity: none, or one that showed before. */
+function flightAge(id: string, round: number): number {
+  const f = runtimes.get(id)?.flight;
+  return f && f.r === round ? Date.now() - f.at : Infinity;
+}
+
 function driveRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
-  if (isComputedTable(id)) {
+  if (isComputedFor(id, 'roulette')) {
     driveComputedRoulette(id, h, rt, me);
     return;
   }
@@ -665,7 +975,7 @@ function driveComputedRoulette(id: string, h: CasinoTableVisualHandle, rt: Table
     h.reset();
   }
   if (!s) return;
-  seeComputed(id, s);
+  seeComputed(id, s.inc, s.spinKey);
   const k = spinKeyParts(s.spinKey);
   if (!rt.counted) {
     if (casinoWhole(id) && computedSettled(id)) {
@@ -737,6 +1047,25 @@ const sumOf = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0);
  *  this betting window, by spot), outliving the focused UI. One entry per
  *  table visited; tagged with the room doc and round it belongs to. */
 const takeBackLedgers = new Map<string, { epoch: number; round: number; added: Map<string, number[]> }>();
+
+/** 🎲 Where each player stood at a computed craps table when they walked
+ *  off it with bets riding (computedTally): their incarnation, the last roll
+ *  decided and their net then, in this room doc. Coming back reads what the
+ *  table did meanwhile; a reload forgets it. */
+const awayMarks = new Map<string, { epoch: number; inc: string; roll: number; net: number }>();
+
+/** 🎲 A win or loss as the status bar writes it: +22, −40, ±0. */
+const signedChips = (n: number): string => (n > 0 ? `+${n}` : n < 0 ? `−${-n}` : '±0');
+
+/** 🎲 A computed craps roll's call as the stickman makes it: `3 + 4 = 7 —
+ *  SEVEN OUT` (games/craps rollCall). */
+const callOf = (dice: readonly [number, number], pointBefore: number | null, pointAfter: number | null): string =>
+  `${dice[0]} + ${dice[1]} = ${rollCall(dice[0] + dice[1], pointBefore, pointAfter)}`;
+
+/** 🎲 The rules block's last line at a computed craps table. */
+const COMPUTED_SHOOTER_RULE = 'The dice go clockwise to players counted at their stand on the last roll: they had a bet down at their stand, '
+  + 'with their seed in on time. A shooter keeps them until a seven-out; on a come-out, and on the roll that makes the point, '
+  + 'they must be counted at their stand to keep them.';
 
 /** The throw a fling of the held dice makes, from the cursor samples taken
  *  while they were held (felt metres, page-clock ms), or null when the flick
@@ -844,10 +1173,21 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let confirming = false;
   /** 🧮 The computed incarnation this table was last seen on here (null:
    *  owner-run), whether my felt held chips on it then, and the rewrites of
-   *  its results told (ComputedShown.rewrites; −1: none counted yet). */
+   *  its results told (ComputedShown.rewrites; −1: none counted yet). 🎲 At
+   *  craps also: whether my owner-run felt had chips on the last run (the
+   *  switch-on hands them back), and the earlier rolls' changes and the
+   *  undone changes told (computedRollChange, computedUndoneCount). */
   let watchedInc: string | null = null;
   let watchedStake = false;
   let rewritesTold = -1;
+  let ownerStake = false;
+  let changesTold = 0;
+  let undoneTold = 0;
+  /** 🎲 The last roll the computed view offered me the fling for, on its
+   *  incarnation (TIME'S UP when it went by unthrown), and a switch-off whose
+   *  first press warned of contract bets riding (the next hands them back). */
+  let offered: { inc: string; r: number } | null = null;
+  let offArmed = false;
   /** Tell the player what the table did that no status line says: a round
    *  it showed rewritten, and a switch-off handing their felt back. On a
    *  whole doc only (one holding part of an update can read the switch as
@@ -855,10 +1195,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  peer took it away, and the room's pages put it back on their next
    *  frame: computedTable putSwitchBack): the felt is back in play then. */
   const noteComputed = (): void => {
-    if (game !== 'roulette' || !casinoWhole(itemId)) return;
+    if (!casinoWhole(itemId)) return;
+    if (game === 'craps') {
+      noteComputedCraps();
+      return;
+    }
     const s = computed() ? readComputedRoulette(itemId) : null;
     if (s) {
-      const seen = seeComputed(itemId, s);
+      const seen = seeComputed(itemId, s.inc, s.spinKey);
       if (watchedInc !== s.inc) rewritesTold = seen.rewrites;
       else if (seen.rewrites > rewritesTold) {
         rewritesTold = seen.rewrites;
@@ -873,6 +1217,79 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     watchedInc = null;
     watchedStake = false;
     rewritesTold = -1;
+  };
+  /** 🎲 noteComputed at craps: a roll on screen rewritten, an earlier one
+   *  changed, a held change dropped because the roll before changed, and the
+   *  table switched either way with my bets on it. The switch-on hands back
+   *  every felt (switchComputedOn), so the notice goes to a player whose
+   *  owner-run felt had chips on the run before the computed table first
+   *  showed here; a page mounted on a computed table says nothing of it. */
+  const noteComputedCraps = (): void => {
+    if (computed()) {
+      const s = readComputedCraps(itemId);
+      // (Nothing counted of it yet: what the switch did shows once it is.)
+      if (!s) return;
+      const seen = seeComputed(itemId, s.inc, s.rollKey);
+      const change = computedRollChange(itemId);
+      const undone = computedUndoneCount(itemId);
+      if (watchedInc !== s.inc) {
+        offered = null;
+        rewritesTold = seen.rewrites;
+        changesTold = change.seq;
+        undoneTold = undone;
+        if (watchedInc === null && ownerStake) say('TABLE SWITCHED — YOUR BETS ARE BACK');
+      } else {
+        if (seen.rewrites > rewritesTold) {
+          rewritesTold = seen.rewrites;
+          say(`ROLL ${seen.rewrittenRound} WAS REWRITTEN — NEW DICE`);
+        }
+        if (change.seq > changesTold) {
+          changesTold = change.seq;
+          const u = change.undid;
+          say(u
+            ? `ROLL ${change.round} CHANGED — YOUR BETS ON ${u[0] === u[1] ? `ROLL ${u[0]}` : `ROLLS ${u[0]}–${u[1]}`} CAME BACK`
+            : `ROLL ${change.round} CHANGED — THE ROLLS AFTER IT PAID AGAIN ON THE SAME DICE`);
+        }
+        if (undone > undoneTold) {
+          undoneTold = undone;
+          say(CHANGES_UNDONE);
+        }
+      }
+      watchedInc = s.inc;
+      watchedStake = readMyComputedCrapsBets(itemId, me, s.round).felt.length > 0;
+      ownerStake = false;
+      return;
+    }
+    if (watchedInc !== null && !computedIncEnded(itemId, watchedInc)) return;
+    if (watchedInc !== null && watchedStake) say('TABLE SWITCHED — YOUR BETS ARE BACK');
+    watchedInc = null;
+    watchedStake = false;
+    rewritesTold = -1;
+    ownerStake = readMyCrapsBets(itemId, me).length > 0;
+  };
+  /** 🎲 Walking off a computed craps table with bets riding: say which
+   *  (they play on the rolls the table's other players play), and mark where
+   *  the table stood, so coming back can say what it did meanwhile. */
+  const noteLeaving = (): void => {
+    const tally = computed() ? computedTally(itemId) : null;
+    const felt = tally ? myCrapsFelt().felt : [];
+    if (!tally || felt.length === 0) return;
+    const named = felt.slice(0, LEAVE_LIST_MAX).map((b) => `${crapsBetLabel(b)} ${b.amount}`);
+    const more = felt.length > LEAVE_LIST_MAX ? ` · AND ${felt.length - LEAVE_LIST_MAX} MORE` : '';
+    showHint(`YOUR BETS RIDE WHILE YOU'RE AWAY — ${named.join(' · ')}${more}`, LEAVE_HINT_MS);
+    awayMarks.set(ledgerKey, { epoch: casinoDocEpoch(), inc: tally.inc, roll: tally.roll, net: tally.net });
+  };
+  /** 🎲 Back at the table walked off: the rolls decided meanwhile (a void
+   *  counts) and what they won or lost, on the same incarnation and room doc
+   *  only. */
+  const noteBack = (): void => {
+    const mark = awayMarks.get(ledgerKey);
+    if (!mark) return;
+    awayMarks.delete(ledgerKey);
+    const tally = computed() ? computedTally(itemId) : null;
+    if (!tally || mark.epoch !== casinoDocEpoch() || mark.inc !== tally.inc || tally.roll <= mark.roll) return;
+    const n = tally.roll - mark.roll;
+    say(`WHILE YOU WERE AWAY — ${n} ROLL${n === 1 ? '' : 'S'} · ${signedChips(tally.net - mark.net)}`);
   };
   /** The room doc this focus began in: rounds and bets from another room's
    *  table with the same id must not count as this window's. */
@@ -892,26 +1309,36 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
   // ── Reads ─────────────────────────────────────────────────────────────────
 
-  /** 🧮 Is this a computed roulette table now (asked live: the house may
-   *  switch it while the player stands here)? */
-  const computed = (): boolean => game === 'roulette' && isComputedTable(itemId);
-  const crapsState = (): CrapsTableState | null => readCrapsTableState(itemId);
+  /** 🧮 Is this a computed table now, under a name for its game (asked
+   *  live: the house may switch it while the player stands here)? */
+  const computed = (): boolean => isComputedFor(itemId, game);
+  /** 🎲 The computed craps table's view (null: owner-run, or nothing of it
+   *  counted yet). */
+  const computedCraps = (): ComputedCrapsState | null => (game === 'craps' && computed() ? readComputedCraps(itemId) : null);
+  const crapsState = (): CrapsTableState | null => (game === 'craps' && computed() ? readComputedCraps(itemId) : readCrapsTableState(itemId));
   const rouletteState = (): RouletteTableState | null => (computed() ? readComputedRoulette(itemId) : readTableState(itemId));
   const round = (): number => (game === 'craps' ? crapsState()?.round : rouletteState()?.round) ?? 1;
   const phase = (): 'betting' | 'closing' | 'settled' =>
     (game === 'craps' ? crapsState()?.phase : rouletteState()?.phase) ?? 'betting';
   const deadline = (): number | undefined =>
     game === 'craps' ? crapsState()?.phaseDeadline : rouletteState()?.phaseDeadline;
+  /** 🎲 My felt at a computed craps table (one amount a spot), and the stamp
+   *  a change of it is built on: an action reads both once and hands the
+   *  stamp to its write, so a change built before the roll before changed
+   *  never goes over the new felt. */
+  const myCrapsFelt = (): { felt: CrapsBet[]; basis: string } => readMyComputedCrapsBets(itemId, me, round());
   // (A computed felt this page holds back to write shows as mine at once.)
   const myBets = (): AnyBet[] => (game === 'craps'
-    ? readMyCrapsBets(itemId, me)
+    ? computed() ? myCrapsFelt().felt : readMyCrapsBets(itemId, me)
     : computed() ? readMyComputedBets(itemId, me, round()) : readMyBets(itemId, me, round()));
-  /** 🧮 Put my felt down on a computed table as a slip; false (and the
-   *  bettor told why) when it didn't go down. */
-  const writeSlip = (bets: RouletteBet[]): boolean => {
+  /** 🧮 Put my felt down on a computed table as a slip (at craps built on
+   *  `basis`); false (and the bettor told why) when it didn't go down. */
+  const writeSlip = (bets: AnyBet[], basis: string): boolean => {
     let wrote: ComputedSlipWrite;
     try {
-      wrote = writeComputedSlip(itemId, bets);
+      wrote = game === 'craps'
+        ? writeComputedCrapsSlip(itemId, bets as CrapsBet[], basis)
+        : writeComputedSlip(itemId, bets as RouletteBet[]);
     } catch {
       // (A felt a slip can't carry: never one this table built. Nothing goes.)
       wrote = 'reconnecting';
@@ -923,13 +1350,16 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     say(wrote === 'closed' ? 'NO MORE BETS'
       : wrote === 'full' ? 'THE TABLE IS FULL — WAIT FOR A PLACE'
         : wrote === 'chips' ? 'NOT ENOUGH CHIPS — VISIT THE CASHIER'
-          : RECONNECTING_NOTICE);
+          : wrote === 'rules' ? "THE TABLE RULES DON'T ALLOW THAT BET NOW"
+            : wrote === 'changed' ? CHANGES_UNDONE
+              : RECONNECTING_NOTICE);
     return false;
   };
-  /** Write my list; false (and the bettor told why) when it didn't go down:
-   *  the table full, or the doc holding part of an update (casinoWhole). */
-  const writeBets = (bets: AnyBet[]): boolean => {
-    if (computed()) return writeSlip(bets as RouletteBet[]);
+  /** Write my list (at a computed craps table, built on `basis`); false (and
+   *  the bettor told why) when it didn't go down: the table full, or the doc
+   *  holding part of an update (casinoWhole). */
+  const writeBets = (bets: AnyBet[], basis = ''): boolean => {
+    if (computed()) return writeSlip(bets, basis);
     const wrote = game === 'craps'
       ? writeMyCrapsBets(itemId, me, bets as CrapsBet[])
       : writeMyBets(itemId, me, round(), bets as RouletteBet[]);
@@ -951,6 +1381,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (game !== 'craps') return false;
     const s = crapsState();
     if (!s || s.phase !== 'closing' || s.shooter !== me) return false;
+    if (computed()) {
+      // 🎲 From this page's own fling only: the throw record is anyone's
+      // to write, and neither blocks my fling nor stands for it.
+      const pending = computedFlungFor(itemId)?.r !== s.round;
+      if (pending) offered = { inc: (s as ComputedCrapsState).inc, r: s.round };
+      return pending;
+    }
     const t = readDiceThrow(itemId);
     return !(t && t.round === s.round);
   };
@@ -1062,12 +1499,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say(phase() === 'settled' ? 'WAIT FOR THE NEXT ROUND' : 'NO MORE BETS');
       return;
     }
+    // 🎲 At a computed craps table my felt and the stamp it is built on, read
+    // once for this action: the riding bets odds go up behind are in it.
+    const crapsFelt = game === 'craps' && comp ? myCrapsFelt() : null;
     if (game === 'craps') {
       const s = crapsState();
       const type = rg.bet.type as CrapsBet['type'];
       if (isOddsType(type)) {
         // 🎲 Odds ride on a flat bet, up to the table's multiple of it.
-        const o = oddsRoom(readMyCrapsBets(itemId, me), type, rg.bet.pick, s?.point ?? null);
+        const o = oddsRoom(crapsFelt?.felt ?? readMyCrapsBets(itemId, me), type, rg.bet.pick, s?.point ?? null);
         if (o.reason) {
           say(o.reason);
           return;
@@ -1086,22 +1526,32 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const chips = [...hand];
     // The felt draws at most MAX_STACK_CHIPS of yours per box and
     // MAX_BETS_DRAWN_PER_PLAYER chips in all: say so at the table rather than
-    // take a chip nobody would see.
-    const mine = myBets();
+    // take a chip nobody would see. (🎲 A computed craps felt holds one
+    // amount a spot: its chips are counted as the felt draws them, the
+    // spot's amount and the hand's together.)
+    const mine = crapsFelt?.felt ?? myBets();
     const key0 = spotKey(rg.bet);
-    if (mine.filter((b) => spotKey(b) === key0).length + chips.length > MAX_STACK_CHIPS) {
+    const spotNow = sumOf(mine.filter((b) => spotKey(b) === key0).map((b) => b.amount));
+    const inBox = crapsFelt ? drawnChips(spotNow + sumOf(chips)) : mine.filter((b) => spotKey(b) === key0).length + chips.length;
+    if (inBox > MAX_STACK_CHIPS) {
       say(`THAT BOX IS FULL — ${MAX_STACK_CHIPS} CHIPS A BOX`);
       return;
     }
-    if (mine.length + chips.length > MAX_BETS_DRAWN_PER_PLAYER) {
+    const drawn = crapsFelt
+      ? sumOf(mine.filter((b) => spotKey(b) !== key0).map((b) => drawnChips(b.amount))) + inBox
+      : mine.length + chips.length;
+    if (drawn > MAX_BETS_DRAWN_PER_PLAYER) {
       say(`YOU HAVE ${MAX_BETS_DRAWN_PER_PLAYER} CHIPS DOWN — THE TABLE LIMIT`);
       return;
     }
     // ⚖️ A round carries at most MAX_TABLE_BETTORS bettors (a Fair round's
     // transcript, and the close's freeze of who is in it): a newcomer past
-    // that would be left out of the settle, so they wait.
+    // that would be left out of the settle, so they wait. (🎲 At a computed
+    // craps table the felt counts every rider, gone ones too.)
     if (mine.length === 0) {
-      const all = game === 'craps' ? readAllCrapsBets(itemId) : comp ? readComputedBets(itemId, round()) : readAllBets(itemId, round());
+      const all = game === 'craps'
+        ? comp ? readComputedCrapsBets(itemId, round()) : readAllCrapsBets(itemId)
+        : comp ? readComputedBets(itemId, round()) : readAllBets(itemId, round());
       if (Object.keys(all).filter((pid) => pid !== me).length >= MAX_TABLE_BETTORS) {
         say('THE TABLE IS FULL — WAIT FOR A PLACE');
         return;
@@ -1115,7 +1565,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     const placed = chips.map((amount) => ({ ...rg.bet, amount }));
-    if (!writeBets([...mine, ...placed])) return;
+    if (!writeBets([...mine, ...placed], crapsFelt?.basis)) return;
     const warnKey = `${casinoDocEpoch()}:${itemId}${comp ? ':computed' : ''}`;
     // Commit this bet's seed now, not on the next tick: a quick close must
     // still find it. (A computed slip carries its own commitment.)
@@ -1144,8 +1594,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // Odds, place, big 6 / 8 and hardways may come down any time the betting
     // is open, not only this window's chips (the flat bet under odds stays).
     // The don't side may too, but only with ↶, which takes its odds with it.
-    const mine = game === 'craps' && canTakeDown(rg.bet as CrapsBet, crapsState()?.point ?? null)
-      && rg.bet.type !== 'dontpass' && rg.bet.type !== 'dontcome'
+    const anyTime = game === 'craps' && canTakeDown(rg.bet as CrapsBet, crapsState()?.point ?? null)
+      && rg.bet.type !== 'dontpass' && rg.bet.type !== 'dontcome';
+    if (game === 'craps' && computed()) return takeBackSpot(key, anyTime);
+    const mine = anyTime
       ? myBets().filter((b) => spotKey(b) === key).map((b) => b.amount)
       : added.get(key) ?? [];
     if (mine.length === 0) return false;
@@ -1177,6 +1629,27 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return true;
   };
 
+  /** 🎲 takeBack at a computed craps table, by amount (the felt holds one a
+   *  spot): the whole spot when it may come down any time, else what I put
+   *  there this window, the rest left on it. An empty hand picks the chips
+   *  up as the felt draws them. */
+  const takeBackSpot = (key: string, anyTime: boolean): boolean => {
+    const { felt, basis } = myCrapsFelt();
+    const at = sumOf(felt.filter((b) => spotKey(b) === key).map((b) => b.amount));
+    const back = anyTime ? at : Math.min(at, sumOf(added.get(key) ?? []));
+    if (back <= 0) return false;
+    if (!bettingOpen()) {
+      say('NO MORE BETS — THOSE CHIPS STAY');
+      return true;
+    }
+    const keep = felt.flatMap((b) => (spotKey(b) !== key ? [b] : b.amount > back ? [{ ...b, amount: b.amount - back }] : []));
+    if (!writeBets(keep, basis)) return true;
+    added.delete(key);
+    if (hand.length === 0) hand = chipsUpTo(back, HAND_MAX);
+    refreshRail();
+    return true;
+  };
+
   /** ↶ "Take me down": every bet of mine that may come off goes back to the
    *  rail at once (contract bets stay — see splitTakeDown). */
   const takeDownAll = (): void => {
@@ -1186,7 +1659,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say(RECONNECTING_NOTICE);
       return;
     }
-    const bets = myBets();
+    const crapsFelt = game === 'craps' && computed() ? myCrapsFelt() : null;
+    const bets = crapsFelt?.felt ?? myBets();
     if (bets.length === 0) {
       say('NO BETS OF YOURS ON THE TABLE');
       return;
@@ -1202,7 +1676,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     // The list stops holding them: back on your rail. The chips slide back
     // across the felt as they come off.
-    if (!writeBets(keep)) return;
+    if (!writeBets(keep, crapsFelt?.basis)) return;
     if (railSplit) h?.sweepToRail({ x: railSplit.chips.x, z: railSplit.chips.z });
     const total = sumOf(back.map((b) => b.amount));
     for (const b of back) added.delete(spotKey(b));
@@ -1226,7 +1700,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       say('FLICK THE DICE HARDER TO THROW THEM');
       return; // the frame driver slides them back to your spot
     }
-    writeDiceThrow(itemId, {
+    sendThrow({
       round: s.round,
       by: me,
       sx: fling.from.x,
@@ -1236,6 +1710,19 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       power: fling.power,
       seed: Math.floor(Math.random() * 2 ** 31),
     });
+  };
+
+  /** The throw goes out for every page to animate. 🎲 At a computed table
+   *  this page notes its own fling too (it closes the roll at it, and offers
+   *  no fling again for it) and flies it at once: no throw record plays here.
+   *  The offer it took is gone (no TIME'S UP for it, even once a wake has
+   *  forgotten the fling); one made again comes as any does. */
+  const sendThrow = (thr: DiceThrow): void => {
+    writeDiceThrow(itemId, thr);
+    if (!computed()) return;
+    offered = null;
+    noteComputedFling(itemId, thr.round, thr.seed);
+    if (h) startComputedFling(itemId, h, thr);
   };
 
   // ── Pointer ───────────────────────────────────────────────────────────────
@@ -1266,7 +1753,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     if (game !== 'craps' || !isOddsType(rg.bet.type)) return rg;
     const point = crapsState()?.point ?? null;
     const t = rg.bet.type;
-    if (oddsFlat(readMyCrapsBets(itemId, me), t, rg.bet.pick) > 0 && !(point === null && (t === 'passodds' || t === 'dontpassodds'))) return rg;
+    if (oddsFlat(myBets() as CrapsBet[], t, rg.bet.pick) > 0 && !(point === null && (t === 'passodds' || t === 'dontpassodds'))) return rg;
     const tag = rg.side > 0 ? '+' : '-';
     const to = t === 'comeodds' || t === 'dontcomeodds'
       ? `place:${rg.bet.pick}@${tag}`
@@ -1438,7 +1925,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const pays = n === null
       ? `pays ${lay ? 'lay odds: 1 to 2 on 4 and 10, 2 to 3 on 5 and 9, 5 to 6 on 6 and 8' : 'true odds: 2 to 1 on 4 and 10, 3 to 2 on 5 and 9, 6 to 5 on 6 and 8'}`
       : `pays ${(lay ? LAY_PAYS : ODDS_PAYS)[n]?.toLowerCase() ?? ''} on the ${n}`;
-    const o = oddsRoom(readMyCrapsBets(itemId, me), t, b.pick, point);
+    const o = oddsRoom(myBets() as CrapsBet[], t, b.pick, point);
     const room = o.reason ? o.reason.toLowerCase() : `you can add up to ${o.room}`;
     const off = t === 'comeodds' && point === null ? ', off on the come-out' : '';
     return `${pays}${off}; ${room}`;
@@ -1504,7 +1991,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const spread = (Math.random() - 0.5) * 0.4;
     const dx = inward.x - inward.z * spread, dz = inward.z + inward.x * spread;
     const len = Math.hypot(dx, dz) || 1;
-    writeDiceThrow(itemId, {
+    sendThrow({
       round: s.round,
       by: me,
       sx: from.x,
@@ -1565,6 +2052,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     };
     const staked = myBets().length > 0;
     if (game === 'craps') {
+      const cs = computedCraps();
+      if (cs) return computedCrapsStatus(cs, remain, staked);
       const s = crapsState();
       if (animating()) return { line: '🎲 THE DICE ARE ROLLING…', color: PINK };
       if (!s) return { line: '🎲 COME OUT — PLACE YOUR BETS', color: GOLD_BRIGHT };
@@ -1606,12 +2095,115 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return { line: `🎡 ROUND ${round()} — PLACE YOUR BETS${remain()}${readChips(me) <= 0 && !staked ? ' · VISIT THE CASHIER FOR CHIPS' : ''}`, color: GOLD_BRIGHT };
   };
 
+  /** 🎲 A computed craps table's status line, in this order: rolls undone;
+   *  my fling's time gone by (until the dice land); a change too late for
+   *  the close, or new bets that missed it; the dice in the air (a flight
+   *  under ROLLING_MS old, or settling on their faces); my seed awaited, the
+   *  seeds awaited; the wait for the shooter's throw, by what the shooter's
+   *  slip says; my roll; another's; a roll the bettors' pages left; the
+   *  stickman's throw; then the void, the settled roll (its call, my win or
+   *  loss, the dice changing hands, what became of my felt), and betting
+   *  (the dice's holder, and what they need to throw). */
+  const computedCrapsStatus = (s: ComputedCrapsState, remain: () => string, staked: boolean): { line: string; color: string } => {
+    const now = Date.now();
+    const name = (pid: string): string => readPlayerDisplayName(pid).toUpperCase();
+    const secs = (at: number): string => `${Math.max(0, Math.ceil((at - now) / 1000))}s`;
+    const shown = seeComputed(itemId, s.inc, s.rollKey).shown;
+    const to = computedDecidedTo(itemId);
+    if (to !== null && shown > to) {
+      const rolls = to + 1 === shown ? `ROLL ${shown}` : `ROLLS ${to + 1}–${shown}`;
+      return { line: `⚠ ${rolls} UNDONE — BETS AS THE ROOM NOW HAS THEM`, color: GOLD_BRIGHT };
+    }
+    const mine = computedMine(itemId);
+    const pending = myThrowPending();
+    const moving = animating();
+    // (An offer lasts while its roll is on screen, taken back to betting
+    // or shown again no longer; and only for a roll whose dice I held.)
+    if (offered && (offered.inc !== s.inc || offered.r !== s.round || s.phase === 'betting')) offered = null;
+    const held = s.phase === 'closing' ? s.holder === me : s.holderBefore === me;
+    if (offered && held && !pending && computedFlungFor(itemId)?.r !== s.round
+      && (s.phase === 'closing' || (s.phase === 'settled' && moving))) {
+      return { line: "✋ TIME'S UP — THE STICKMAN THREW", color: PINK };
+    }
+    if (s.phase === 'closing' && mine?.tooLate) return { line: '✋ TOO LATE — THE CLOSE HAD YOUR EARLIER BETS', color: PINK };
+    // (A felt left out that added nothing plays as it rode in: nothing missed.)
+    if (s.phase === 'closing' && mine?.leftOut && mine.added) {
+      return { line: `✋ YOUR NEW BETS MISSED THE CLOSE — CHIPS BACK${mine.riding ? ' · THE REST PLAY' : ''}`, color: GOLD_BRIGHT };
+    }
+    if (moving && (s.phase === 'settled' || flightAge(itemId, s.round) < ROLLING_MS)) return { line: '🎲 THE DICE ARE ROLLING…', color: PINK };
+    if (s.phase === 'closing' && mine) {
+      return { line: mine.frozen && !mine.revealed ? '✋ NO MORE BETS — STAY UNTIL THE DICE LAND' : '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
+    }
+    if (s.phase === 'closing') {
+      if (s.shooterSlip !== undefined && s.phaseDeadline !== undefined) {
+        const throwsIn = `THE STICKMAN THROWS IN ${secs(s.phaseDeadline)}`;
+        if (s.holder === me && s.shooter === undefined) return { line: `✋ NO MORE BETS — YOU HAVE NO BET DOWN · ${throwsIn}`, color: PINK };
+        if (s.holder !== undefined && s.holder !== me) {
+          const who = name(s.holder);
+          const why = s.shooterSlip === 'gone' ? `${who} HAS GONE`
+            : s.shooterSlip === 'absent' ? `${who} ISN'T HERE`
+              : s.shooterSlip === 'none' ? `${who} HAS NO BET DOWN`
+                : s.shooterSlip === 'away' ? `WAITING FOR ${who}` : null;
+          if (why) return { line: `✋ NO MORE BETS — ${why} · ${throwsIn}`, color: PINK };
+        }
+      }
+      if (pending) return { line: `🎲 YOUR ROLL — GRAB THE DICE AND FLING THEM ACROSS THE TABLE${remain()}`, color: WIN };
+      if (s.shooter && s.shooter !== me) return { line: `✋ NO MORE BETS — ${name(s.shooter)} IS SHOOTING${remain()}`, color: PINK };
+      if (s.stallUntil !== undefined) {
+        return { line: `✋ NO MORE BETS — THE BETTORS HAVE GONE QUIET · BETTING REOPENS IN ${secs(s.stallUntil)}`, color: PINK };
+      }
+      return { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
+    }
+    if (s.phase === 'settled' && s.voided) {
+      return { line: '⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+    }
+    if (s.phase === 'settled' && s.dice) {
+      const parts = [`● ${callOf(s.dice, s.pointBefore ?? null, s.point)}`];
+      const amount = s.amounts?.[me];
+      if (s.pushes?.includes(me)) parts.push('PUSH');
+      else if (amount !== undefined) parts.push(signedChips(amount));
+      const before = s.holderBefore;
+      const after = s.shooterAfter;
+      if (s.sevenOut && before === me && after === me) parts.push('THE DICE COME BACK TO YOU');
+      else if (after !== before) {
+        parts.push(after === undefined ? 'THE STICKMAN HAS THE DICE' : after === me ? 'THE DICE PASS TO YOU' : `THE DICE PASS TO ${name(after)}`);
+      }
+      const check = computedRoundCheck(itemId);
+      const fate = check?.round === s.round ? check.mine : null;
+      const rest = mine?.riding ? ' · THE REST PLAYED' : '';
+      const lost = (mine?.lost ?? 0) > 0;
+      if (mine?.tooLate) parts.push('TOO LATE — THE CLOSE HAD YOUR EARLIER BETS');
+      else if (fate === 'left-out') {
+        if (mine?.added) parts.push(`YOUR NEW BETS MISSED THE CLOSE — CHIPS BACK${rest}`);
+      }
+      else if (fate === 'late') parts.push(lost ? `YOUR SEED CAME IN LATE — NEW BETS FORFEITED${rest}` : 'YOUR SEED CAME IN LATE — YOUR BETS PLAYED WITHOUT IT');
+      else if (fate === 'forfeited') parts.push(lost ? `YOUR SEED NEVER CAME — NEW BETS FORFEITED${rest}` : 'YOUR SEED NEVER CAME — YOUR BETS PLAYED WITHOUT IT');
+      else if (mine?.fate === 'full') parts.push('THE TABLE WAS FULL — YOUR NEW BETS CAME BACK');
+      else if (mine?.undone) parts.push('THE LAST ROLL CHANGED — YOUR CHANGES WERE UNDONE · BETS AS THEY STOOD');
+      return { line: parts.join(' · '), color: (amount ?? 0) > 0 ? WIN : GOLD_BRIGHT };
+    }
+    const head = s.point === null ? 'COME OUT' : `THE POINT IS ${s.point}`;
+    const cashier = readChips(me) <= 0 && !staked ? ' · VISIT THE CASHIER FOR CHIPS' : '';
+    const d = s.phaseDeadline;
+    if (d === undefined && s.riders > 0) return { line: `🎲 ${head} — BETS RIDE · PLACE A BET TO START THE NEXT ROLL${cashier}`, color: GOLD_BRIGHT };
+    let dice = '';
+    if (s.holder === me) {
+      dice = ' · YOU HAVE THE DICE';
+      if (!s.shooterInPlay) dice += ' · THE STICKMAN THROWS THIS ONE';
+      else if (!staked) dice += s.point === null ? ' · PUT A BET DOWN TO THROW AND KEEP THE DICE' : ' · PUT A BET DOWN TO THROW';
+    } else if (s.holder !== undefined) {
+      dice = ` · ${name(s.holder)} HAS THE DICE${s.shooterInPlay ? '' : ' · THE STICKMAN THROWS THIS ONE'}`;
+    }
+    const late = d !== undefined && now >= d ? '✋ NO MORE BETS' : `${head} — PLACE YOUR BETS`;
+    return { line: `🎲 ${late}${dice}${remain()}${cashier}`, color: GOLD_BRIGHT };
+  };
+
   /** 🧮 The status lines only a computed table has (null: the owner-run
    *  table's line says it): a round undone, the seeds awaited, and what
    *  became of my felt in the round closing or shown. */
   const computedStatus = (s: ComputedRouletteState | null, remain: () => string): { line: string; color: string } | null => {
     if (!s) return null;
-    const shown = seeComputed(itemId, s).shown;
+    const shown = seeComputed(itemId, s.inc, s.spinKey).shown;
     const to = computedDecidedTo(itemId);
     if (to !== null && shown > to) return { line: `⚠ ROUND ${shown} UNDONE — BETS BACK${remain()}`, color: GOLD_BRIGHT };
     const mine = computedMine(itemId);
@@ -1670,7 +2262,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
        <div>LAY ODDS behind DON'T PASS / DON'T COME — 4 · 10 — 1:2 &nbsp; 5 · 9 — 2:3 &nbsp; 6 · 8 — 5:6; up to ${MAX_LAY_MULTIPLE}× the flat bet</div>
        <div>Come odds are off on the come-out (returned if the come bet is decided then); lay odds always work. Odds come down any time bets are open.</div>
        <div>ANY 7 — 4:1 &nbsp; ANY CRAPS — 7:1 &nbsp; 2 · 12 — 30:1 &nbsp; 3 · 11 — 15:1</div>
-       <div>The dice go clockwise to players with a line bet; a shooter keeps them until a seven-out.</div>`
+       <div>${computed() ? COMPUTED_SHOOTER_RULE : 'The dice go clockwise to players with a line bet; a shooter keeps them until a seven-out.'}</div>`
     : `<div>SINGLE-ZERO WHEEL — straight up 35:1</div>
        <div>DOZENS and COLUMNS — 2:1</div>
        <div>RED / BLACK · ODD / EVEN · 1–18 / 19–36 — 1:1 (zero loses them)</div>`;
@@ -1769,9 +2361,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const computedCheckLines = (): { text: string; color: string }[] => {
     const out: { text: string; color: string }[] = [];
     const c = computedRoundCheck(itemId);
+    // 🎲 At craps a roll, its call, and bets that ride on: a missing or
+    // left-out slip leaves a rider's bets playing as they stood, and a late
+    // seed costs only the chips added that roll.
+    const craps = game === 'craps';
+    const many = (n: number, one: string, more: string): string => `${n} ${n === 1 ? one : more}`;
     if (c) {
-      const parts = [`🔓 LAST SPIN · ROUND ${c.round}`];
-      if (c.decided === 'void') parts.push('VOID — NOBODY COULD FINISH IT · STAKES RETURNED');
+      const parts = [craps ? `🔓 LAST ROLL · ROLL ${c.round}` : `🔓 LAST SPIN · ROUND ${c.round}`];
+      if (craps && c.roll?.dice) parts.push(callOf(c.roll.dice, c.roll.pointBefore, c.roll.pointAfter));
+      if (c.decided === 'void') parts.push(craps ? 'VOID — NOBODY COULD FINISH IT · EVERY BET STANDS' : 'VOID — NOBODY COULD FINISH IT · STAKES RETURNED');
       else {
         parts.push(`${c.counted} OF ${c.of} SEED${c.of === 1 ? '' : 'S'} COUNTED`);
         // (Named by the key this page pins for the player: display only. A
@@ -1779,23 +2377,65 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         // into the card's markup escaped, as text.)
         parts.push(c.decided === 'reveals' ? 'DECIDED BY ALL REVEALS'
           : `DECIDED BY A FORFEIT BY ${c.forfeitBy ? escapeHtml(readPlayerDisplayName(c.forfeitBy).toUpperCase()) : 'A KEY THIS PAGE DOESN\'T KNOW'}`);
+        // (Who held a seed back: a rider can take a second look at the dice
+        // that way, at no cost.)
+        const late = craps ? c.uncounted ?? [] : [];
+        if (late.length > 0) {
+          const named = late.slice(0, LEAVE_LIST_MAX).map((pid) => escapeHtml(readPlayerDisplayName(pid).toUpperCase()));
+          const more = late.length > LEAVE_LIST_MAX ? ` AND ${late.length - LEAVE_LIST_MAX} MORE` : '';
+          parts.push(`NO SEED IN TIME FROM ${named.join(', ')}${more}`);
+        }
       }
-      if (c.missing.length > 0) parts.push(`${c.missing.length} FROZEN SLIP${c.missing.length === 1 ? '' : 'S'} NEVER CAME (NOT STAKED)`);
+      if (c.missing.length > 0) {
+        parts.push(`${many(c.missing.length, 'FROZEN SLIP', 'FROZEN SLIPS')} NEVER CAME (${craps ? 'NEW BETS NOT STAKED' : 'NOT STAKED'})`);
+      }
+      if (craps && (c.unseeded ?? 0) > 0) parts.push(`${many(c.unseeded!, "PLAYER'S", "PLAYERS'")} BETS RODE WITHOUT A SEED`);
+      const without = craps && !c.mineAdded;
+      const forfeited = craps ? ((c.mineLost ?? 0) > 0 ? 'NEW BETS FORFEITED' : 'YOUR BETS PLAYED WITHOUT IT') : 'BETS FORFEITED';
       if (c.mine === 'frozen') parts.push('✓ YOUR SLIP WAS FROZEN');
-      if (c.mine === 'left-out') parts.push('YOUR SLIP WAS LEFT OUT — CHIPS BACK');
-      if (c.mine === 'late') parts.push('✗ YOUR SEED CAME IN LATE — BETS FORFEITED');
-      if (c.mine === 'forfeited') parts.push('✗ YOUR SEED NEVER CAME — BETS FORFEITED');
+      if (c.mine === 'left-out') parts.push(`YOUR SLIP WAS LEFT OUT — ${without ? 'YOUR BETS PLAYED WITHOUT IT' : craps ? 'NEW BETS BACK' : 'CHIPS BACK'}`);
+      if (c.mine === 'late') parts.push(`✗ YOUR SEED CAME IN LATE — ${forfeited}`);
+      if (c.mine === 'forfeited') parts.push(`✗ YOUR SEED NEVER CAME — ${forfeited}`);
       const bad = c.mine === 'late' || c.mine === 'forfeited';
       out.push({ text: parts.join(' · '), color: bad ? '#FF8A80' : c.decided === 'reveals' ? '#7CF5B0' : '#F5C26B' });
       if (c.dropped.length > 0) out.push({ text: '🚩 A FORFEIT DROPPED A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
-      if (c.checkpointDiff > 0) {
-        out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${c.checkpointDiff} CHIP${c.checkpointDiff === 1 ? '' : 'S'}`, color: '#FF8A80' });
-      }
+      // (At craps the nets apart from the table the checkpoint hands on.)
+      const chips = craps ? c.checkpointNets ?? 0 : c.checkpointDiff;
+      if (chips > 0) out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${many(chips, 'CHIP', 'CHIPS')}`, color: '#FF8A80' });
+      if (craps && c.checkpointCarry) out.push({ text: "🚩 THE CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S", color: '#FF8A80' });
       if (c.pinMismatch.length > 0) out.push({ text: "🚩 A FROZEN SLIP'S KEY ISN'T ITS PLAYER'S", color: '#FF8A80' });
-      if (c.replaced !== undefined) out.push({ text: `🚩 ROUND ${c.replaced} REPLACED AFTER ITS SEEDS WERE OUT`, color: '#FF8A80' });
+      if (c.replaced !== undefined) {
+        out.push({ text: `🚩 ${craps ? 'ROLL' : 'ROUND'} ${c.replaced} REPLACED AFTER ITS SEEDS WERE OUT`, color: '#FF8A80' });
+      }
+      if (craps && c.decided !== 'void' && c.counted === 1 && (c.unseeded ?? 0) > 0) {
+        out.push({ text: `🚩 ONE PLAYER'S SEED SETTLED ROLL ${c.round} WHILE ${many(c.unseeded!, 'OTHER', 'OTHERS')} HAD BETS RIDING`, color: '#FF8A80' });
+      }
+      if (craps && (c.illegal?.length ?? 0) > 0) out.push({ text: '🚩 A SLIP BROKE THE TABLE RULES — ITS CHANGES WERE IGNORED', color: '#FF8A80' });
+    }
+    if (craps) {
+      // (Named as this page knows them, escaped: a name is anyone's to set.)
+      const unknown = computedUnknownRiders(itemId);
+      if (unknown.length > 0) {
+        const named = unknown.slice(0, LEAVE_LIST_MAX).map((pid) => escapeHtml(readPlayerDisplayName(pid).toUpperCase()));
+        const more = unknown.length > LEAVE_LIST_MAX ? ` · AND ${unknown.length - LEAVE_LIST_MAX} MORE` : '';
+        const n = unknown.length === 1 ? '1 RIDER HAS' : `${unknown.length} RIDERS HAVE`;
+        out.push({ text: `🚩 ${n} A KEY THIS ROOM HAS NEVER SEEN · ${named.join(' · ')}${more}`, color: '#FF8A80' });
+      }
     }
     if (computedOldBuildDriving(itemId)) out.push({ text: '⚠ AN OLDER GAME VERSION IS ALSO RUNNING THIS TABLE', color: '#F5C26B' });
     return out;
+  };
+
+  /** 🎲 The ⚙ card's line for a computed craps table as it stands: the
+   *  point, how many have bets riding, and who has the dice. */
+  const computedCrapsLine = (): string | null => {
+    const s = computedCraps();
+    if (!s) return null;
+    const head = s.point === null ? 'COME OUT' : `THE POINT IS ${s.point}`;
+    const riders = s.riders === 0 ? 'NO BETS RIDING' : s.riders === 1 ? '1 PLAYER HAS BETS RIDING' : `${s.riders} PLAYERS HAVE BETS RIDING`;
+    const who = s.holder === undefined ? 'THE STICKMAN HAS THE DICE'
+      : `${s.holder === me ? 'YOU HAVE' : `${escapeHtml(readPlayerDisplayName(s.holder).toUpperCase())} HAS`} THE DICE${s.shooterInPlay ? '' : ' · THE STICKMAN THROWS NEXT'}`;
+    return `${head} · ${riders} · ${who}`;
   };
 
   /** 🔀 The house's switch row (computedSwitchState: the house, at a
@@ -1808,6 +2448,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const rows: string[] = [];
     if (confirming && !sw.on) {
       rows.push(`<div style="font-size:9.5px;font-weight:800;color:${FRIENDLY_RED};">${SWITCH_ON_CONFIRM}</div>`);
+      // 🎲 At craps the switch takes every bet down.
+      if (game === 'craps') rows.push(`<div style="font-size:9.5px;font-weight:800;color:${FRIENDLY_RED};">${CRAPS_SWITCH_ON_CONFIRM}</div>`);
       rows.push(`<div style="display:flex;gap:8px;justify-content:flex-end;">${btn('computed-cancel', 'CANCEL', true)}${btn('computed-confirm', 'CONFIRM', sw.can)}</div>`);
     } else {
       rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
@@ -1837,10 +2479,15 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
     if (comp) {
       // 🧮 No fairness to set, no robot, nothing to press: the fold's verdict,
-      // the house's switch, and how the round goes on.
+      // the house's switch, and how the round goes on (🎲 and at craps where
+      // the table stands).
+      const table = game === 'craps' ? computedCrapsLine() : null;
+      if (table) rows.push(`<div style="font-size:9.5px;color:${GOLD};">${table}</div>`);
       for (const line of computedCheckLines()) rows.push(`<div style="font-size:9px;color:${line.color};">${line.text}</div>`);
       rows.push(...switchRows(house));
-      rows.push(`<div style="font-size:9.5px;color:${DIM};">BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN</div>`);
+      rows.push(`<div style="font-size:9.5px;color:${DIM};">${game === 'craps'
+        ? "BETS CLOSE ON THE TIMER · THE ROLL IS DECIDED ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE DICE LAND"
+        : "BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN"}</div>`);
       pushHelp(rows);
       return;
     }
@@ -1910,10 +2557,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       renderCard();
       return;
     }
+    offArmed = false;
     // 🧮 Nothing to set or press on a computed table (none of it is shown):
-    // nobody runs its rounds. (SPIN says so itself: spinByHand.)
-    if (computed() && (act === 'fairness' || act === 'next')) {
-      say(NO_HAND_SPIN);
+    // nobody runs its rounds. (SPIN says so itself: spinByHand; ROLL too,
+    // pressManualRoll.)
+    if (computed() && (act === 'fairness' || act === 'next' || act === 'backend')) {
+      say(game === 'craps' ? NO_HAND_ROLL : NO_HAND_SPIN);
       renderCard();
       return;
     }
@@ -1960,22 +2609,29 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  a switch-off goes or says why not. Only where the row shows. */
   const pressSwitch = (act: string): void => {
     const sw = computedSwitchState(itemId, game, deps.isHouse());
+    const armed = offArmed;
+    offArmed = false;
     if (!sw.show) {
       confirming = false;
       return;
     }
+    const craps = game === 'craps';
     if (act === 'computed-on') confirming = !sw.on;
     else if (act === 'computed-cancel') confirming = false;
     else if (act === 'computed-confirm') {
       confirming = false;
       if (sw.on) return;
       const r = switchComputedOn(itemId, game);
-      say(r === 'ok' ? "THE PLAYERS RUN THIS TABLE NOW — NO OPERATOR · FRIENDLY" : SWITCH_ON_REFUSED[r]);
+      say(r === 'ok' ? "THE PLAYERS RUN THIS TABLE NOW — NO OPERATOR · FRIENDLY" : (craps ? CRAPS_SWITCH_ON_REFUSED : SWITCH_ON_REFUSED)[r]);
     } else if (act === 'computed-off') {
       confirming = false;
       if (!sw.on) return;
-      const r = switchComputedOff(itemId);
-      say(r === 'ok' ? 'THE OWNER RUNS THIS TABLE AGAIN FROM ITS NEXT ROUND' : SWITCH_OFF_REFUSED[r]);
+      // 🎲 With contract bets riding the first press warns; the next hands
+      // them back with the rest and switches.
+      const r = switchComputedOff(itemId, Date.now(), armed);
+      offArmed = r === 'contract';
+      say(r === 'ok' ? `THE OWNER RUNS THIS TABLE AGAIN FROM ITS NEXT ${craps ? 'ROLL' : 'ROUND'}`
+        : (craps ? CRAPS_SWITCH_OFF_REFUSED : SWITCH_OFF_REFUSED)[r]);
     }
   };
 
@@ -2064,6 +2720,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       card.remove();
       card = null;
       confirming = false;
+      offArmed = false;
       return;
     }
     const host = bar?.parentElement;
@@ -2104,7 +2761,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const beatSeat = (): void => {
     if (deps.stand === null || !stand) return;
     writeMySeat(itemId, me, { stand: deps.stand, angle: Math.atan2(stand.z, stand.x), at: Date.now() });
-    if (game === 'craps') markLocalSeat(itemId, me, true);
+    if (game === 'craps') markLocalSeat(itemId, me, true, deps.stand);
   };
 
   // ── DeviceUI ──────────────────────────────────────────────────────────────
@@ -2161,6 +2818,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         if (card) renderCard();
       });
       noteComputed();
+      if (game === 'craps') noteBack();
       refreshRail();
       renderBar();
     },
@@ -2170,6 +2828,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (seatTimer !== null) window.clearInterval(seatTimer);
       seatTimer = null;
       stopSpinPoll();
+      if (game === 'craps') noteLeaving();
       clearMySeat(itemId, me);
       markLocalSeat(itemId, me, false);
       localHold.delete(itemId);

@@ -88,7 +88,7 @@ describe('the fold module', () => {
       }
     };
     walk('computedFold');
-    expect([...seen].sort()).toEqual(['computedFold', 'games/craps', 'games/diceFairness', 'games/fairDice', 'games/roulette']);
+    expect([...seen].sort()).toEqual(['computedCraps', 'computedFold', 'games/craps', 'games/diceFairness', 'games/fairDice', 'games/roulette']);
     expect([...bare].sort()).toEqual(['@noble/hashes/sha256', '@noble/hashes/utils']);
   });
 });

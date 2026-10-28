@@ -246,16 +246,54 @@ describe('switch-on: refused', () => {
     expect(a.table.switchComputedOn(TABLE, 'roulette', T)).toBe('ok');
   });
 
-  it('at craps: never (by the game, and by a craps state up under the id)', async () => {
-    const [a] = await room(['A']);
+  it('at craps: on a quiet come-out, under a craps name; not mid-point, nor with a come bet on a number, a roll closing, a build older than 3, or the other game\'s records', async () => {
+    const [a, b] = await room(['A', 'B']);
     at(a, T0);
-    expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('craps');
-    expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: false, on: false, can: false });
-    a.casino.writeCrapsTableState('craps-2', {
-      kind: 'craps', phase: 'settled', round: 1, point: null, dice: null, result: null, resultAt: 0, payouts: null,
-    });
+    const come = (t: string, point: number | null, phase: 'betting' | 'closing' | 'settled' = 'settled'): void => {
+      a.casino.writeCrapsTableState(t, {
+        kind: 'craps', phase, round: 1, point, dice: null, result: null, resultAt: 0, payouts: null, ...a.casino.tableOpening(t),
+      });
+    };
+    // Nothing up: it goes, under a craps name.
+    expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('ok');
+    // (Its house sees the switch-off row, with or without the dev flag.)
+    expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: true, on: true, can: true });
+    expect(a.casino.computedIncOf('craps-1')).toMatch(/^k[0-9a-f]{24}$/);
+    // A craps state up under a roulette switch: the other game's.
+    come('craps-2', null);
     expect(a.table.switchComputedOn('craps-2', 'roulette', T0)).toBe('craps');
-    expect(a.casino.isComputedTable('craps-1') || a.casino.isComputedTable('craps-2')).toBe(false);
+    // A point on, a roll closing, a come bet on a number: refused.
+    come('craps-3', 6);
+    expect(a.table.switchComputedOn('craps-3', 'craps', T0)).toBe('contract');
+    expect(a.table.SWITCH_ON_REFUSED.contract).toBe('WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER');
+    come('craps-4', null, 'closing');
+    expect(a.table.switchComputedOn('craps-4', 'craps', T0)).toBe('busy');
+    expect(a.table.CRAPS_SWITCH_ON_REFUSED.busy).toBe('FINISH THIS ROLL FIRST');
+    come('craps-5', null, 'betting');
+    at(b, T0);
+    sync(T0, a, b);
+    expect(b.casino.writeMyCrapsBets('craps-5', b.pid, [{ type: 'come', pick: 5, amount: 10 }])).toBe(true);
+    sync(T0, a, b);
+    at(a, T0);
+    expect(a.table.switchComputedOn('craps-5', 'craps', T0)).toBe('contract');
+    // A come bet in the box (not yet on a number) comes back with the rest.
+    expect(b.casino.writeMyCrapsBets('craps-5', b.pid, [{ type: 'come', amount: 10 }, { type: 'field', amount: 5 }])).toBe(true);
+    sync(T0, a, b);
+    at(a, T0);
+    expect(a.table.switchComputedOn('craps-5', 'craps', T0)).toBe('ok');
+    sync(T0, a, b);
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+    // Under a lease of build 2 (PR 2's): roulette goes, craps waits for 3.
+    a.casino.writeTableOperatorLease({ page: 'other-page', player: a.pid, beat: 1, build: 2 });
+    expect(a.table.switchComputedOn('craps-6', 'craps', T0)).toBe('old-build');
+    expect(a.table.switchComputedOn(OTHER, 'roulette', T0)).toBe('ok');
+    a.casino.writeTableOperatorLease({ page: 'other-page', player: a.pid, beat: 2, build: 3 });
+    expect(a.table.switchComputedOn('craps-6', 'craps', T0)).toBe('ok');
+    // A roulette name at a craps table, and a craps one at a roulette table.
+    expect(a.table.switchComputedOn('craps-7', 'roulette', T0)).toBe('ok');
+    expect(a.table.switchComputedOn('craps-7', 'craps', T0)).toBe('craps');
+    expect(a.table.switchComputedOn('craps-1', 'roulette', T0)).toBe('craps');
+    expect(['craps-2', 'craps-3', 'craps-4'].some((t) => a.casino.isComputedTable(t))).toBe(false);
   });
 });
 
@@ -479,11 +517,20 @@ describe("an earlier build's operator on a computed table", () => {
     expect(b.casino.writeMyBets(TABLE, b.pid, 1, [red(10)])).toBe(true);
     // And on this build, the same player's felt on the computed table.
     expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    // And E, a player of the earlier build's with no page here (B's doc
+    // stands in for E's): its list as that build puts it down, its chips
+    // taken from its count (the bets shape: all of it taken, nothing held).
+    const E = 'player-Earlier';
+    b.doc.getMap('casino').set(`bought:${E}`, 100);
+    b.doc.getMap('casino').set(`bal:${E}`, 100 - 30);
+    b.doc.getMap('casino').set(`bets:${TABLE}:${E}`, { round: 1, bets: [black(30)] });
     sync(T0, ...pages);
     const ledger = a.casino.readCageLedger();
     for (const p of pages) {
       // Each held once: 10 on the list, 20 on the felt.
       expect(p.casino.readChips(b.pid)).toBe(970);
+      expect(p.casino.readChips(E)).toBe(70);
+      expect(p.casino.readAllBets(TABLE, 1)[E]).toEqual([black(30)]);
       expect(p.table.computedOldBuildDriving(TABLE)).toBe(true);
       expect(p.casino.isComputedTable(TABLE)).toBe(true);
       // The computed table's view is its own.
@@ -519,11 +566,13 @@ describe("an earlier build's operator on a computed table", () => {
       expect(p.casino.computedIncEnded(TABLE, cinc)).toBe(false);
       expect(sessionKeys(p)).toEqual([`ses:${TABLE}:${cinc}:g`]);
       expect(foldOf(p).felts.get(b.pid)?.rec.b).toEqual([black(20)]);
-      // The list's 10 back, the felt's 20 held: conserved.
+      // The list's 10 back, the felt's 20 held; E's 30, taken by its build,
+      // back exactly: conserved.
       expect(p.casino.readChips(b.pid)).toBe(980);
+      expect(p.casino.readChips(E)).toBe(100);
       expect(p.casino.readCageLedger()).toEqual({
-        ...ledger, outstanding: ledger.outstanding + 10, houseNet: ledger.houseNet - 10,
-        balances: { ...ledger.balances, [b.pid]: 980 },
+        ...ledger, outstanding: ledger.outstanding + 10 + 30, houseNet: ledger.houseNet - 10 - 30,
+        balances: { ...ledger.balances, [b.pid]: 980, [E]: 100 },
       });
     }
     expect(ownerRunKeys(a).filter((k) => !k.startsWith('casinoChips/'))).toEqual([]);
@@ -815,6 +864,32 @@ describe('switch-off', () => {
     at(b, T);
     expect(b.casino.writeMyBets(TABLE, b.pid, 1, [red(5)])).toBe(true);
     expect(b.casino.readChips(b.pid)).toBe(won[1] - 5);
+  });
+
+  it("hands the owner-run table back on the house's settings, kept through the switch-on that hid them: WHEEL FAIRNESS at roulette, DICE FAIRNESS and SETTLEMENT at craps", async () => {
+    const pages = await room(['A', 'B']);
+    const [a] = pages;
+    const CRAPS = 'craps-1';
+    a.casino.writeCrapsFairnessPref(CRAPS, 'commit-reveal');
+    a.casino.writeCrapsBackendPref(CRAPS, 'chia');
+    sync(T0, ...pages);
+    const settings = (p: Page) => [p.casino.readCrapsFairnessPref(TABLE), p.casino.readCrapsFairnessPref(CRAPS), p.casino.readCrapsBackendPref(CRAPS)];
+    at(a, T0);
+    expect(a.table.switchComputedOn(TABLE, 'roulette', T0)).toBe('ok');
+    expect(a.table.switchComputedOn(CRAPS, 'craps', T0)).toBe('ok');
+    sync(T0, ...pages);
+    for (const p of pages) {
+      expect([p.casino.isComputedTable(TABLE), p.casino.isComputedTable(CRAPS)]).toEqual([true, true]);
+      expect(settings(p)).toEqual(['rng', 'commit-reveal', 'chia']);
+    }
+    at(a, T0 + 1_000);
+    expect(a.table.switchComputedOff(TABLE, T0 + 1_000)).toBe('ok');
+    expect(a.table.switchComputedOff(CRAPS, T0 + 1_000)).toBe('ok');
+    sync(T0 + 1_000, ...pages);
+    for (const p of pages) {
+      expect([p.casino.isComputedTable(TABLE), p.casino.isComputedTable(CRAPS)]).toEqual([false, false]);
+      expect(settings(p)).toEqual(['rng', 'commit-reveal', 'chia']);
+    }
   });
 
   it('goes at once on a switch whose incarnation the doc holds nothing of (one a peer wrote alone: no build does), marked ended', async () => {
@@ -1272,16 +1347,16 @@ describe('a computed table, played as World plays it', () => {
 // ── 🪪 The lease's build ─────────────────────────────────────────────────────
 
 describe('the table lease carries the build', () => {
-  it('takeTableTurn writes build: 2 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
+  it('takeTableTurn writes build: 3 on the claim and on each renewal; an earlier build\'s renewal reads without one', async () => {
     const [a, b] = await room(['A', 'B']);
     at(a, T0);
     a.croupier.takeTableTurn(T0);
-    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toEqual({ page: a.croupier.ROULETTE_PAGE_ID, player: a.pid, beat: 1, build: 3 });
     for (let T = T0 + STEP; T <= T0 + 2 * a.croupier.TABLE_LEASE_RENEW_MS; T += STEP) {
       at(a, T);
       a.croupier.takeTableTurn(T);
     }
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 3, build: 3 });
     expect(a.croupier.leaseIsOldBuild(T0 + 4_000)).toBe(false);
     // An earlier build's page renews what it read: {page, player, beat}.
     sync(T0 + 4_000, a, b);
@@ -1293,7 +1368,7 @@ describe('the table lease carries the build', () => {
     // This build's next renewal puts it back.
     at(a, T0 + 6_000);
     a.croupier.takeTableTurn(T0 + 6_000);
-    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 2 });
+    expect(a.casino.readTableOperatorLease()).toMatchObject({ beat: 5, build: 3 });
   });
 
   it('reads a build that is no safe integer from 1 to 1000 as none', async () => {
@@ -1306,7 +1381,7 @@ describe('the table lease carries the build', () => {
       a.doc.getMap('casino').set('table-operator', { page: 'p', player: 'q', beat: 1, build });
       expect(a.casino.readTableOperatorLease()).toEqual({ page: 'p', player: 'q', beat: 1, build });
     }
-    expect(a.casino.TABLE_BUILD).toBe(2);
+    expect(a.casino.TABLE_BUILD).toBe(3);
   });
 });
 
@@ -1442,7 +1517,9 @@ describe("World's frame (world.ts updateCroupier)", () => {
 
   it('ticks the computed tables every frame, every client, never throwing out of the frame', () => {
     expect(start).toBeGreaterThan(-1);
-    const tick = body.indexOf('tickComputedTables(rouletteTables.map((t) => t.id), Date.now());');
+    const tick = body.indexOf(
+      'tickComputedTables(tables.map((t): ComputedTableRef => ({ id: t.id, game: t.kind === "craps-table" ? "craps" : "roulette" })), Date.now());',
+    );
     expect(tick).toBeGreaterThan(-1);
     // Inside a try whose catch warns once.
     const tryAt = body.lastIndexOf('try {', tick);
@@ -1459,8 +1536,8 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(world).toMatch(/import \{ computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
   });
 
-  it("posts no heartbeat for a computed roulette table, and still runs the robot's tick (its sweep)", () => {
-    expect(body).toContain('const computed = t.kind === "roulette-table" && isComputedTable(t.id);');
+  it("posts no heartbeat for a computed table (at craps a craps one only), and still runs the robot's tick (its sweep)", () => {
+    expect(body).toContain('const computed = t.kind === "roulette-table" ? isComputedTable(t.id) : crapsRunsItself(t.id);');
     expect(body).toContain('if (beatNow && !computed) beatCroupier(t.id);');
     expect(body).not.toMatch(/if \(beatNow\) beatCroupier\(t\.id\);/);
     expect(body).toContain('else tickAutoCroupier(t.id);');

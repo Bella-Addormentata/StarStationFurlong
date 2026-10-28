@@ -83,8 +83,10 @@ import { vi } from 'vitest';
 import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
+import { CrapsHarness, crapsChangeKind, crapsShownOf } from './computedCrapsSim';
+import type { CrapsBotSpec, Place } from './computedCrapsSim';
 import { parseKey, seedTable, slipCommit } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, RoundView, SigCheck } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
 import { loadPage, PAGE_ROOM } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { b64url, snapshot } from './computedTestKit';
@@ -105,7 +107,7 @@ export const SIM_MINUTES = SIM_LONG ? 15 : 3;
 export const SIM_SEED_OFFSET = typeof process !== 'undefined' ? Number(process.env.SIM_SEED ?? 0) || 0 : 0;
 
 const NET = Symbol('sim-net');
-const COMPUTED_INC = /^c[0-9a-f]{24}$/;
+const COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
 // ── 🎲 Seeded randomness ─────────────────────────────────────────────────────
@@ -230,22 +232,38 @@ export interface PageSpec {
   botTables?: string[];
   /** The house's page (default the first): it switches the tables on, and
    *  drives them as World does on the deed holder's page (takeTableTurn,
-   *  tickAutoCroupier). */
+   *  tickAutoCroupier, or at craps tickAutoStickman). */
   house?: boolean;
   /** Chips it buys in as it joins. */
   chips?: number;
+  /** 🎲 At craps tables: its bot (default the run's, else CRAPS_BOT), and
+   *  where its player is at first (computedCrapsSim Place: a stand 1–7, null
+   *  for the device front, 'off' for off the table; default a stand by its
+   *  index). */
+  crapsBot?: CrapsBotSpec;
+  place?: Place;
+  /** Run on each load of the page right after its modules load (its own
+   *  generation, before another page's load resets them): a scenario's
+   *  table UI (computedCrapsUiKit withUI). */
+  onLoad?: (p: Page) => Promise<void>;
 }
+
+/** A room's table: a bare id is a roulette table's (as the roulette
+ *  scenarios name them), or its id and game. */
+export type TableSpec = string | { id: string; game: GameName };
 
 /** A round as a page showed it: what its player saw (the pocket, the
  *  payouts and what each player's chips moved by), and the close and the
  *  decision behind it (and the deciding forfeit's writer). */
-interface Shown {
+export interface Shown {
   seen: string;
   close: string;
   decided: string;
   fk?: string;
   /** Since when it has read undecided or gone (ms into the run). */
   gone?: number;
+  /** 🎲 At craps: the table the roll played from (computedCrapsSim). */
+  sIn?: string;
 }
 
 function shownOf(v: RoundView): Shown {
@@ -281,9 +299,13 @@ function shownOf(v: RoundView): Shown {
  *    (a split: the checkpoint the doc kept, `sum:`'s last write, is the other
  *    side's; or it changed while the page was away);
  *  - 'checkpoint': a checkpoint that differs from the rounds it covers;
+ *  - 'repaid' (craps): the same close, decided the same way on the same
+ *    dice, paying otherwise: an earlier roll changed, and this one played
+ *    again from the state it left (counted once a roll a page showed);
  *  - 'other': anything else. */
 export type FlipKind =
-  'forfeit over reveals' | 'answer forfeit' | 'rival close' | 'void undone' | 'blip' | 'undone' | 'other branch' | 'checkpoint' | 'other';
+  'forfeit over reveals' | 'answer forfeit' | 'rival close' | 'void undone' | 'blip' | 'undone' | 'other branch' | 'checkpoint'
+  | 'repaid' | 'other';
 
 /** What took a round from `was` to `is` (both decided, not alike). */
 function changeKind(was: Shown, is: Shown): FlipKind {
@@ -393,6 +415,12 @@ export class SimPage {
   /** By `<t>:<inc>:<r>`, with backIsBlip: a round that reads otherwise than
    *  it showed, what it showed, and its flips since (blips once it is back). */
   readonly unlike = new Map<string, { shown: Shown; flips: { kind: FlipKind }[] }>();
+  /** 🎲 By `<t>:<inc>:<r>`, every load: the rolls it showed that it counted
+   *  as paid again ('repaid', once a roll). */
+  readonly repaid = new Set<string>();
+  /** 🎲 Its leaving second (Sim.leave at a craps table): frames run, its bot
+   *  doesn't, and then it is gone. */
+  leaving = false;
 
   constructor(readonly spec: PageSpec, readonly device: Device, readonly pid: string, tables: string[], rand: Rng) {
     this.inRoom = new Set(tables);
@@ -457,6 +485,13 @@ export class Net {
 
   connected(p: SimPage): boolean {
     return p.mode === 'up' || (p.mode === 'asleep' && p.syncing);
+  }
+
+  /** 🎲 Nothing is lost or cut off, and nothing takes over a second: no
+   *  partition, no deaf page, every link lossless and quick. */
+  clean(): boolean {
+    const quick = (l: { delay: [number, number]; loss: number }): boolean => l.loss === 0 && l.delay[1] <= 1_000;
+    return this.groups === null && this.deaf.size === 0 && quick(this.base) && [...this.links.values()].every(quick);
   }
 
   apart(a: SimPage, b: SimPage): boolean {
@@ -540,6 +575,14 @@ export class Net {
       this.diff(q, p, false);
       this.diff(p, q, false);
     }
+  }
+
+  /** 🎲 Page p, loaded again, hears its device's node: what `was` (its last
+   *  load's doc, all of it sent to that node) holds that p's doc lacks, as
+   *  a handshake (lossless, a link's delay). */
+  handshakeFrom(p: SimPage, was: Y.Doc): void {
+    const u = Y.encodeStateAsUpdate(was, Y.encodeStateVector(p.p.doc));
+    this.enqueue(p, p, u, true, false);
   }
 
   /** Hand on what is due by `T` (everything, with `all`), to pages that still
@@ -635,10 +678,12 @@ export interface SimOptions {
   name: string;
   seed: number;
   pages: PageSpec[];
-  /** The room's computed roulette tables (default one). */
-  tables?: string[];
+  /** The room's computed tables (default one roulette table). */
+  tables?: TableSpec[];
   link?: LinkSpec;
   bot?: BotSpec;
+  /** 🎲 Every page's craps bot unless its spec gives one (default CRAPS_BOT). */
+  crapsBot?: CrapsBotSpec;
   /** Each page's skew, when its spec gives none: drawn within ±this (ms). */
   skewMs?: number;
   /** A round a page showed that reads otherwise for a while, then as shown
@@ -654,7 +699,13 @@ export class Sim {
   readonly pages: SimPage[] = [];
   readonly devices = new Map<string, Device>();
   readonly net: Net;
+  /** The room's tables, by id, and each one's game. */
   readonly tables: string[];
+  readonly games = new Map<string, GameName>();
+  /** 🎲 The craps side of the run (bots, checker, oracles), with any craps
+   *  table in the room; null in a roulette room, which then runs as it
+   *  always did (no draw, import or check of craps's). */
+  readonly craps: CrapsHarness | null;
   readonly rand: Rng;
   /** The house's page: it switched the tables on, and drives them. */
   house!: SimPage;
@@ -678,21 +729,36 @@ export class Sim {
   maxPreTrimBytes = 0;
   maxRoundBytes = 0;
   worstStall = { ms: 0, at: '' };
+  /** 🎲 At craps tables: the worst stall with no close in (felts) and with
+   *  a close in waiting on its seeds (tip). */
+  readonly worstStallBy = { felts: { ms: 0, at: '' }, tip: { ms: 0, at: '' } };
   /** Each warm transaction's CPU time, and its wall time. */
   readonly warm: number[] = [];
   readonly warmWall: number[] = [];
   /** The chips every player bought (buyIn): what the cage issued. */
   readonly bought = new Map<string, bigint>();
   /** Decided rounds worked out afresh (by close, decision and count), and the
-   *  pocket checks under way (awaited at the end of each tick). */
-  private readonly checkedRounds = new Set<string>();
-  private pocketChecks: Promise<void>[] = [];
+   *  pocket checks under way (awaited at the end of each tick; at craps the
+   *  dice checks too). */
+  readonly checkedRounds = new Set<string>();
+  readonly pocketChecks: Promise<void>[] = [];
   forfeitsChecked = 0;
   abandonsChecked = 0;
   /** When any page first held each close (the room's time). */
   private readonly closeAt = new Map<string, number>();
   /** Players of one page each whose chips read below 0 before the clamp. */
   readonly debts = new Map<string, string>();
+  /** Chips an owner-run roll a scenario plays settled for good, by player
+   *  (an older build's paid roll: its own chip records, and the house's net,
+   *  count them; cageProblems), and what a removal or sweep refunded of a
+   *  list an earlier build took whole (its `end:` record). */
+  readonly ownerRunPaid = new Map<string, bigint>();
+  /** Chips an earlier build's buy-in issued, by player, as that build keeps
+   *  them: counts in the casino map (`bought:<pid>`, `bal:<pid>`), not chip
+   *  records. They are in `bought` too (the cage issued them); a list that
+   *  build puts down takes its stake off `bal:` (casinoDoc's legacy count,
+   *  part of every player's ledger total: ledgerProblems, cageProblems). */
+  readonly legacyBought = new Map<string, bigint>();
   /** The heal has run: the scenarios' disturbances stop. */
   healed = false;
   /** The heaviest live session seen, to fold cold at the end (coldFoldMs). */
@@ -701,8 +767,23 @@ export class Sim {
   private constructor(readonly opts: SimOptions) {
     this.rand = simRng(opts.seed);
     this.entropy = simRng(opts.seed ^ 0x5eed5eed);
-    this.tables = opts.tables ?? ['roulette-1'];
+    const specs = opts.tables ?? ['roulette-1'];
+    this.tables = specs.map((s) => (typeof s === 'string' ? s : s.id));
+    for (const s of specs) this.games.set(typeof s === 'string' ? s : s.id, typeof s === 'string' ? 'roulette' : s.game);
+    this.craps = [...this.games.values()].includes('craps') ? new CrapsHarness(this) : null;
     this.net = new Net(this, simRng(opts.seed ^ 0x0e7), opts.link ?? { delay: [40, 150], loss: 0 }, simRng(opts.seed ^ 0xbea7));
+  }
+
+  /** Table t's game. */
+  gameOf(t: string): GameName {
+    return this.games.get(t) ?? 'roulette';
+  }
+
+  /** The room's tables as World passes them to the computed duties: a bare
+   *  id for a roulette table (as it always passed them), {id, game} for a
+   *  craps one. */
+  private refsOf(tables: string[]): (string | { id: string; game: GameName })[] | string[] {
+    return this.craps ? tables.map((t) => (this.gameOf(t) === 'craps' ? { id: t, game: 'craps' as const } : t)) : tables;
   }
 
   /** "<name> seed=<n>": every failure message carries it, to replay the run. */
@@ -732,7 +813,7 @@ export class Sim {
     for (const t of sim.tables) {
       const now = sim.enter(house);
       house.p.table.setComputedTablesEnabledForTests(true);
-      const ok = house.p.table.switchComputedOn(t, 'roulette', now);
+      const ok = house.p.table.switchComputedOn(t, sim.gameOf(t), now);
       if (ok !== 'ok') throw new Error(`${sim.label}: the house's switch-on of ${t} answered ${ok}`);
     }
     await sim.syncAll();
@@ -777,10 +858,17 @@ export class Sim {
     sp.away.push([from, this.T]);
   }
 
-  /** Run `act` as page sp, then let what it queued (microtasks) run as sp too. */
+  /** Run `act` as page sp, then let what it queued (microtasks) run as sp too.
+   *  `act` runs wholly as sp: one that enters another page on the way (a
+   *  helper that reads another page's fold) would have sp's next writes made
+   *  on that page's clock, device and timers, which no real page can do; so
+   *  it is a harness error, thrown at once. */
   async as<R>(sp: SimPage, act: (now: number) => R): Promise<R> {
     const now = this.enter(sp);
     const out = act(now);
+    if (timersOf !== sp || device !== sp.device) {
+      throw new Error(`${this.label}: a step run as ${sp.name} at ${this.elapsed} ms entered ${timersOf?.name ?? 'no page'} on the way`);
+    }
     await Promise.resolve();
     await Promise.resolve();
     return out;
@@ -828,6 +916,11 @@ export class Sim {
     });
     page = p;
     sp.p = p;
+    if (spec.onLoad) await spec.onLoad(p);
+    // 🎲 This load's craps modules, imported now (this load's generation,
+    // before another page's load resets the modules): crapsCroupier for the
+    // house's stickman tick.
+    if (this.craps) await this.craps.loaded(sp);
     sp.loads += 1;
     sp.shown = new Map();
     sp.watch = new Map();
@@ -864,6 +957,12 @@ export class Sim {
     let behind = false;
     p.doc.on('beforeTransaction', (tr: Y.Transaction) => {
       pre = tr.origin === NET || sp.p !== p ? null : this.foldsNow(sp);
+      // 🎲 At craps the folds its own write starts from, walked by the
+      // checker (a trim's: the rolls it takes out of the session are played
+      // as the trimmer had them, so its checkpoint is held to them).
+      if (pre && this.craps) {
+        for (const [t, w] of pre) if (w.res && w.inc && w.inc[0] === 'k') this.craps.check(sp, this.ctxOf(t, w.inc), w.res, false);
+      }
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
       const was = pre;
@@ -875,6 +974,7 @@ export class Sim {
       this.checkOwnTrims(sp, tr, computed, was);
       this.checkOwnForfeits(sp, tr, computed, was);
       this.checkOwnAbandons(sp, tr, computed);
+      if (this.craps) this.craps.ownWrite(sp, tr, computed, was);
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
       if (tr.origin === NET || sp.p !== p || sp.cheats) return;
@@ -966,10 +1066,18 @@ export class Sim {
     for (const [t, w] of was) {
       const res = casino.computedFoldOf(t);
       if (!w.res || !res || w.inc !== casino.computedIncOf(t) || w.res.base.sid === res.base.sid) continue;
+      if (netsText(w.res.nets) !== netsText(res.nets)) this.violate(`${sp.name}'s trim of ${t} at ${this.elapsed} ms moved nets ${netsText(w.res.nets)} → ${netsText(res.nets)}`);
+      // (The final checkpoint of an incarnation an end mark ended while its
+      // switch still names it hands on no table and holds nothing: every
+      // hold and the carry go, by design, but the nets stay; checkEnded
+      // holds them to the checker's own.)
+      if (res.base.ended) continue;
       const burned = new Set([...w.res.felts.values()].filter((s) => w.res!.revealedCommits.has(s.rec.c)).map((s) => s.rec.p));
       const unburned = (m: ReadonlyMap<string, bigint>): Map<string, bigint> => new Map([...m].filter(([pid]) => !burned.has(pid)));
-      if (netsText(w.res.nets) !== netsText(res.nets)) this.violate(`${sp.name}'s trim of ${t} at ${this.elapsed} ms moved nets ${netsText(w.res.nets)} → ${netsText(res.nets)}`);
       if (netsText(unburned(w.res.held)) !== netsText(unburned(res.held))) this.violate(`${sp.name}'s trim of ${t} at ${this.elapsed} ms moved holds ${netsText(w.res.held)} → ${netsText(res.held)}`);
+      // 🎲 And at craps the table it hands on: the point, every bet riding,
+      // the dice's holder (the checkpoint's `s`), as the fold had it.
+      if (this.craps && this.gameOf(t) === 'craps') this.craps.checkTrimCarry(sp, t, w.res, res);
     }
   }
 
@@ -1086,7 +1194,11 @@ export class Sim {
   private sit(sp: SimPage, now: number): void {
     if (sp.spec.bot === null) return;
     for (const [i, t] of this.tables.entries()) {
-      if (sp.inRoom.has(t)) sp.p.casino.writeMySeat(t, sp.pid, { stand: (this.pages.indexOf(sp) + 1 + i) % 8, angle: 0, at: now });
+      if (!sp.inRoom.has(t)) continue;
+      // 🎲 At craps where its player is (computedCrapsSim): the stand
+      // page-local, marked again on every load, and the seat record beaten.
+      if (this.craps && this.gameOf(t) === 'craps') this.craps.sit(sp, t, now);
+      else sp.p.casino.writeMySeat(t, sp.pid, { stand: (this.pages.indexOf(sp) + 1 + i) % 8, angle: 0, at: now });
     }
   }
 
@@ -1095,9 +1207,15 @@ export class Sim {
    *  comes over the network. With `cache`, its doc starts from that (the
    *  room cache from before it left), and it waits for the room's state
    *  before it acts (roomStateIn). */
-  async reload(sp: SimPage, opts: { cache?: Uint8Array } = {}): Promise<void> {
+  async reload(sp: SimPage, opts: { cache?: Uint8Array; goodbye?: boolean } = {}): Promise<void> {
+    // 🎲 A real reload fires pagehide, which says goodbye at a craps table
+    // (leaveComputedTables, held to the goodbye oracle); without, it is a
+    // crash and then a load.
+    if (opts.goodbye && this.craps && sp.mode === 'up') await this.craps.goodbye(sp);
     if (sp.mode !== 'gone') sp.awayFrom = this.T;
+    const was = sp.p.doc;
     sp.mode = 'gone';
+    sp.leaving = false;
     sp.roomIn = false;
     await this.load(sp, sp.spec, sp.p.skew, sp.p, opts.cache);
     sp.mode = 'up';
@@ -1106,6 +1224,16 @@ export class Sim {
     this.wasAway(sp, sp.awayFrom ?? this.T);
     sp.awayFrom = null;
     this.net.connect(sp);
+    // 🎲 A page talks to the room through its device's own node, which holds
+    // a replica of the room's doc: every update the page sent went to it
+    // first (YjsSync: the node applies it, fans it out to the device's other
+    // tabs and relays it to the mesh). So a page loaded again on the same
+    // device has, in its handshake with that node, everything its last load
+    // wrote, its pagehide goodbye included, not only what the other pages
+    // have heard of it so far (an update of its still on its way to them
+    // would otherwise reach the new load only by the next resync). Only in
+    // a room with a craps table: roulette's runs stay as they were.
+    if (this.craps) this.net.handshakeFrom(sp, was);
   }
 
   /** Page sp leaves the room as main.ts leaves it: its felts down
@@ -1121,10 +1249,25 @@ export class Sim {
         return felt !== undefined && felt.rec.b.length > 0 && sp.myFelts.has(felt.hash);
       };
       const down = this.tables.filter((t) => able && table.readComputedRoulette(t, now)?.phase === 'betting' && mine(t));
-      table.leaveComputedTables(now);
+      // 🎲 At craps a goodbye instead (its oracle: computedCrapsSim).
+      const bye = this.craps ? this.craps.goodbyeDue(sp, now) : null;
+      if (this.craps) this.craps.saying(sp, true);
+      try {
+        table.leaveComputedTables(now);
+      } finally {
+        if (this.craps) this.craps.saying(sp, false);
+      }
       for (const t of this.tables) casino.clearMySeat(t, sp.pid);
       for (const t of down) if (mine(t)) this.violate(`${sp.name} left ${t} at ${this.elapsed} ms with its felt still down`);
+      if (bye) this.craps!.goodbyeSaid(sp, bye, now, true);
     });
+    // 🎲 With a craps table in the room, as main.ts leaves: the page keeps
+    // framing a second with no bot while the room's last writes go out,
+    // writing no new slip (computedCrapsSim ownWrite); then it is gone.
+    if (this.craps) {
+      this.craps.leavingSecond(sp);
+      return;
+    }
     sp.mode = 'gone';
     sp.awayFrom = this.T;
   }
@@ -1132,6 +1275,7 @@ export class Sim {
   /** Page sp gone with no leave (a crash, a killed tab). */
   crash(sp: SimPage): void {
     sp.mode = 'gone';
+    sp.leaving = false;
     sp.awayFrom = this.T;
   }
 
@@ -1185,6 +1329,11 @@ export class Sim {
   /** Run `fn` on every tick, before the deliveries and frames. */
   every(fn: (T: number) => void | Promise<void>): void {
     this.hooks.push(fn);
+  }
+
+  /** 🎲 The fold context of table t's incarnation inc in this room. */
+  ctxOf(t: string, inc: string): FoldCtx {
+    return { room: PAGE_ROOM, t, inc };
   }
 
   /** ms since the start. */
@@ -1270,7 +1419,10 @@ export class Sim {
   private async frame(sp: SimPage): Promise<void> {
     try {
       await this.as(sp, (now) => {
-        if (sp.betting && sp.spec.bot !== null) this.bot(sp, now);
+        if (sp.betting && sp.spec.bot !== null && !sp.leaving) this.bot(sp, now);
+        // 🎲 Off betting (the quiet period), a craps player still throws
+        // the dice it is offered.
+        else if (this.craps && sp.spec.bot !== null && !sp.leaving) this.craps.idle(sp, now);
         const { casino, croupier, table } = sp.p;
         const tables = this.tables.filter((t) => sp.inRoom.has(t));
         const wakes = croupier.tablesWakeCount();
@@ -1292,9 +1444,15 @@ export class Sim {
           for (const v of res.rounds) if (v.decided === 'reveals' && v.present.includes(sp.pid)) sp.keptFor.add(`${t}|${v.close}`);
         }
         if (sp === this.house && tables.length && croupier.canRunCroupier() && croupier.takeTableTurn(now)) {
-          for (const t of tables) croupier.tickAutoCroupier(t);
+          // (At a craps table the stickman's tick, as World runs it: never
+          // roulette's robot on a craps id.)
+          for (const t of tables) {
+            if (this.craps && this.gameOf(t) === 'craps') this.craps.stickman(sp, t);
+            else croupier.tickAutoCroupier(t);
+          }
         }
-        table.tickComputedTables(tables, now);
+        table.tickComputedTables(this.refsOf(tables), now);
+        if (this.craps) this.craps.framed(sp);
       });
     } catch (err) {
       if (err instanceof Error) err.message = `${this.label}: ${sp.name}'s frame threw at ${this.elapsed} ms: ${err.message}`;
@@ -1307,6 +1465,11 @@ export class Sim {
     const { casino, table } = sp.p;
     for (const t of sp.spec.botTables ?? this.tables) {
       if (!sp.inRoom.has(t)) continue;
+      // 🎲 A craps table's player: computedCrapsSim.
+      if (this.craps && this.gameOf(t) === 'craps') {
+        this.craps.bot(sp, t, now);
+        continue;
+      }
       const v = table.readComputedRoulette(t, now);
       if (!v || v.phase !== 'betting') continue;
       const mine = table.readMyComputedBets(t, sp.pid, v.round, now);
@@ -1378,7 +1541,7 @@ export class Sim {
       const to = D?.r ?? res.base.u;
       let w = sp.watch.get(key);
       if (!w || w.sid !== res.base.sid) {
-        const cp = sp.p.fold.asCheckpoint(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
+        const cp = sp.p.fold.asCheckpointFor({ inc })(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
         if (cp) this.cps.set(`${key}:${sp.p.fold.nextSid({ room: PAGE_ROOM, t, inc }, cp)}`, cp);
       }
       if (!w) {
@@ -1398,7 +1561,7 @@ export class Sim {
       if (res.rawBytes > this.maxSessionBytes) {
         this.maxSessionBytes = res.rawBytes;
         const ses = casino.computedSessionForWrite(t);
-        const cp = sp.p.fold.asCheckpoint(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
+        const cp = sp.p.fold.asCheckpointFor({ inc })(sp.p.doc.getMap('casinoComputed').get(`sum:${t}:${inc}`));
         if (ses) {
           this.biggest = {
             bytes: res.rawBytes, ctx: { room: PAGE_ROOM, t, inc }, cp,
@@ -1408,12 +1571,19 @@ export class Sim {
         }
       }
       if (casino.isComputedTable(t) && casino.computedIncOf(t) === inc) sp.lastLive.set(key, { u: to, nets: netsText(res.nets) });
+      const craps = this.craps !== null && inc[0] === 'k';
       for (const v of res.rounds) {
         if (!this.closeAt.has(v.close)) this.closeAt.set(v.close, this.T);
         if (!v.decided) continue;
         this.decisions.set(`${key}:${v.r}`, v.decided);
-        this.closes.set(v.close, { r: v.r, q: v.closeRec.q, shown: shownOf(v) });
-        this.workOut(sp, { room: PAGE_ROOM, t, inc }, v);
+        this.closes.set(v.close, { r: v.r, q: v.closeRec.q, shown: craps ? crapsShownOf(v) : shownOf(v) });
+        if (!craps) this.workOut(sp, { room: PAGE_ROOM, t, inc }, v);
+      }
+      // 🎲 At craps the rolls are worked out as a chain, each from the state
+      // the one before left (computedCrapsSim's checker), once a fold result.
+      if (craps) {
+        this.craps!.check(sp, { room: PAGE_ROOM, t, inc }, res);
+        this.craps!.observeCraps(sp, { room: PAGE_ROOM, t, inc }, res, now);
       }
       this.flipsOf(sp, t, inc, res, now);
       this.stallOf(sp, t, key, res, croupier.tablesAwake(now) && casino.casinoWhole(t) && casino.computedSettled(t));
@@ -1470,7 +1640,14 @@ export class Sim {
    *  it folded of the rounds it covers. */
   private flipsOf(sp: SimPage, t: string, inc: string, res: FoldResult, now: number): void {
     const { table } = sp.p;
-    const view = table.readComputedRoulette(t, now);
+    // 🎲 At craps the view's roll key names the roll the dice landed on, a
+    // roll shows what it paid and handed on (crapsShownOf), and a roll paid
+    // again on the same dice is its own kind, once a roll ('repaid').
+    const craps = this.craps !== null && inc[0] === 'k';
+    const shown = craps ? crapsShownOf : shownOf;
+    const kindOf = craps ? crapsChangeKind : changeKind;
+    const view = craps ? table.readComputedCraps(t, now) : table.readComputedRoulette(t, now);
+    const spinKey = view === null ? '' : 'rollKey' in view ? view.rollKey : view.spinKey;
     const flip = (kind: FlipKind, why: string, v?: RoundView, was?: Shown, is?: Shown, key?: string): void => {
       const unlike = key !== undefined && this.opts.backIsBlip ? sp.unlike.get(key) : undefined;
       if (unlike && is && is.close === unlike.shown.close && is.decided === unlike.shown.decided && is.seen === unlike.shown.seen) {
@@ -1497,13 +1674,13 @@ export class Sim {
     };
     // (A void shows too, with no spin: "stakes back".)
     const voidShown = view !== null && view.phase === 'settled' && view.voided === true;
-    if (view && (view.spinKey !== '' || voidShown) && view.inc === inc) {
-      const r = view.spinKey !== '' ? Number(view.spinKey.split(':')[0]) : view.round;
+    if (view && (spinKey !== '' || voidShown) && view.inc === inc) {
+      const r = spinKey !== '' ? Number(spinKey.split(':')[0]) : view.round;
       const v = res.rounds.find((x) => x.r === r && x.decided !== null);
       const key = `${t}:${inc}:${r}`;
       if (v && !sp.shown.has(key)) {
-        sp.shown.set(key, shownOf(v));
-        sp.shownAll.set(key, shownOf(v));
+        sp.shown.set(key, shown(v));
+        sp.shownAll.set(key, shown(v));
       }
     }
     const keep = (key: string, s: Shown): void => {
@@ -1522,17 +1699,24 @@ export class Sim {
         if (was.gone === undefined) keep(key, { ...was, gone: this.elapsed });
         continue;
       }
-      const is = shownOf(v);
+      const is = shown(v);
       if (was.gone !== undefined) {
         const away = `${((this.elapsed - was.gone) / 1000).toFixed(2)}s`;
-        flip(is.seen === was.seen ? 'blip' : changeKind(was, is), `round ${r} gone ${away}: ${said(was)} → ${said(is)}`, v, was, is, key);
+        flip(is.seen === was.seen ? 'blip' : kindOf(was, is), `round ${r} gone ${away}: ${said(was)} → ${said(is)}`, v, was, is, key);
         keep(key, is);
         continue;
       }
       // (Decided another way to the same pocket, payouts and deltas: the
       // wheel doesn't spin again and no chip moves; not a flip.)
       if (is.seen === was.seen) continue;
-      flip(changeKind(was, is), `round ${r} ${said(was)} → ${said(is)}`, v, was, is, key);
+      const kind = kindOf(was, is);
+      // (A roll paid again counts once, however often it is.)
+      if (kind === 'repaid' && sp.repaid.has(key)) {
+        keep(key, is);
+        continue;
+      }
+      if (kind === 'repaid') sp.repaid.add(key);
+      flip(kind, `round ${r} ${said(was)} → ${said(is)}`, v, was, is, key);
       keep(key, is);
     }
     const check = table.computedRoundCheck(t, now);
@@ -1626,7 +1810,11 @@ export class Sim {
    *  in sp's reach. */
   private stallOf(sp: SimPage, t: string, key: string, res: FoldResult, able: boolean): void {
     const w = sp.watch.get(key)!;
-    const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0).map((s) => s.rec.p);
+    // (At craps, the players whose latest version puts anything to the
+    // roll: computedCrapsSim stakedOf.)
+    const staked = this.craps && this.gameOf(t) === 'craps'
+      ? this.craps.stakedOf(res)
+      : [...res.felts.values()].filter((s) => s.rec.b.length > 0).map((s) => s.rec.p);
     const who = res.tip ? res.tip.present : staked;
     const sitting = res.tip !== null || staked.length > 0;
     const watched = this.pages.some((q) => q.honest && q.mode === 'up' && this.T >= q.pauseUntil && who.includes(q.pid) && this.net.reach(sp, q));
@@ -1640,8 +1828,17 @@ export class Sim {
       return;
     }
     const ms = this.T - w.stall.from;
-    if (ms > this.worstStall.ms) {
-      this.worstStall = { ms, at: `${sp.name} ${t} round ${res.open} ${res.tip ? 'tip' : 'felts'} from ${((w.stall.from - SIM_T0) / 1000).toFixed(2)}s` };
+    const at = `${sp.name} ${t} round ${res.open} ${res.tip ? 'tip' : 'felts'} from ${((w.stall.from - SIM_T0) / 1000).toFixed(2)}s`;
+    if (ms > this.worstStall.ms) this.worstStall = { ms, at };
+    // 🎲 At craps by phase: the felts' wait (the show, betting, the wait for
+    // the throw, the close turns) and the tip's (the seeds), held to budgets
+    // of their own.
+    if (this.craps && this.gameOf(t) === 'craps') {
+      const by = res.tip ? this.worstStallBy.tip : this.worstStallBy.felts;
+      if (ms > by.ms) {
+        by.ms = ms;
+        by.at = at;
+      }
     }
   }
 
@@ -1659,6 +1856,9 @@ export class Sim {
     // the nets this page last folded of it live, to the same round (an
     // ending moves no chips).
     for (const [key, f] of this.cold(sp).folds) {
+      // 🎲 At craps: an ended incarnation's nets, those the checker handed
+      // on at the close its final checkpoint names.
+      if (this.craps && f.res.base.ended && f.ctx.inc[0] === 'k') this.craps.checkEnded(sp, f.ctx, f.res);
       const last = sp.lastLive.get(key);
       if (!f.res.base.ended || !last || last.u !== f.res.base.u) continue;
       const nets = netsText(f.res.nets);
@@ -1707,7 +1907,7 @@ export class Sim {
     const keyOf = this.keyOf(sp);
     for (const [key, { t, inc }] of [...incs].sort(([a], [b]) => (a < b ? -1 : 1))) {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
-      const cp = fold.asCheckpoint(map.get(`sum:${t}:${inc}`));
+      const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`));
       const ses = map.get(`ses:${t}:${inc}:${fold.nextSid(ctx, cp)}`);
       const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
       const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf);
@@ -1737,11 +1937,11 @@ export class Sim {
     const pids = new Set<string>([...this.pages.map((q) => q.pid), ...Object.keys(L.balances), ...cold.nets.keys(), ...cold.held.keys()]);
     let outstanding = 0n;
     for (const pid of pids) {
-      let total = 0n;
+      let total = this.legacyBal(sp, pid) + this.endRefunds(sp, pid);
       for (const rec of casino.readChipRecords(pid)) total += BigInt(rec.d);
       total += cold.nets.get(pid) ?? 0n;
       total -= cold.held.get(pid) ?? 0n;
-      for (const t of this.tables) if (casino.readTableState(t)) total -= BigInt(casino.feltStake(t, pid).net);
+      for (const t of this.tables) if (this.ownerRunUp(sp, t)) total -= BigInt(casino.feltStake(t, pid).net);
       const want = total > 0n ? total : 0n;
       outstanding += want;
       if (BigInt(casino.readChips(pid)) !== want) out.push(`${pid} reads ${casino.readChips(pid)} chips, a cold count ${want}`);
@@ -1768,25 +1968,69 @@ export class Sim {
     let kept = 0n;
     for (const pid of pids) {
       const bought = this.bought.get(pid) ?? 0n;
-      const recs = casino.readChipRecords(pid).reduce((n, rec) => n + BigInt(rec.d), 0n);
-      if (recs !== bought) out.push(`${pid}'s chip records come to ${recs}, its buy-ins ${bought}`);
-      let total = bought + (cold.nets.get(pid) ?? 0n) - (cold.held.get(pid) ?? 0n);
-      for (const t of this.tables) if (casino.readTableState(t)) total -= BigInt(casino.feltStake(t, pid).net);
+      const paid = this.ownerRunPaid.get(pid) ?? 0n;
+      // (An earlier build's buy-in is no chip record: its counts, `bal:`
+      // what its lists left of it.)
+      const legacy = this.legacyBought.get(pid) ?? 0n;
+      const recs = casino.readChipRecords(pid).reduce((n, rec) => n + BigInt(rec.d), this.endRefunds(sp, pid));
+      if (recs !== bought - legacy + paid) {
+        out.push(`${pid}'s chip records come to ${recs}, its buy-ins ${bought - legacy}${paid ? ` and owner-run play ${paid}` : ''}${legacy ? ` (and ${legacy} an earlier build's)` : ''}`);
+      }
+      let total = bought - legacy + this.legacyBal(sp, pid) + paid + (cold.nets.get(pid) ?? 0n) - (cold.held.get(pid) ?? 0n);
+      for (const t of this.tables) if (this.ownerRunUp(sp, t)) total -= BigInt(casino.feltStake(t, pid).net);
       if (total > 0n) kept += total;
     }
     if (BigInt(L.houseNet) !== issued - kept) out.push(`the house's net ${L.houseNet}, the players' counts leave it ${issued - kept}`);
     return out;
   }
 
-  /** Once the run is over, page sp's doc whole, every count checked, awake,
-   *  nothing held back: what a page that has caught up reads. */
+  /** What the refunds (`end:<table>:<inc>:<pid>` chip keys: an incarnation's
+   *  removal or sweep handing back what an earlier build's list took whole)
+   *  give player pid on page sp's doc: each one whose book still has pid's
+   *  entry as the refund's writer saw it (its `seen`: else a settle it
+   *  hadn't heard of resolved the list). readChipRecords lists none of them. */
+  private endRefunds(sp: SimPage, pid: string): bigint {
+    const chips = sp.p.doc.getMap('casinoChips');
+    let n = 0n;
+    for (const [key, value] of chips.entries()) {
+      if (!key.startsWith('end:') || !key.endsWith(`:${pid}`)) continue;
+      const e = value as { p?: unknown; d?: unknown; seen?: unknown } | null;
+      if (!e || e.p !== pid || !Number.isSafeInteger(e.d) || (e.d as number) <= 0 || typeof e.seen !== 'string') continue;
+      const at = key.slice('end:'.length, key.length - pid.length - 1);
+      const book = chips.get(`book:${at}`) as { recs?: Record<string, { w?: unknown }> } | undefined;
+      const w = book && typeof book === 'object' && book.recs && Object.prototype.hasOwnProperty.call(book.recs, pid) ? book.recs[pid]?.w : undefined;
+      if ((typeof w === 'string' ? w : '') === e.seen) n += BigInt(e.d as number);
+    }
+    return n;
+  }
+
+  /** Player pid's chips as an earlier build counts them on page sp's doc
+   *  (`bal:<pid>`, a non-negative integer: casinoDoc's legacyCount, the
+   *  opening of every ledger total), 0 with none. */
+  private legacyBal(sp: SimPage, pid: string): bigint {
+    const v = sp.p.doc.getMap('casino').get(`bal:${pid}`);
+    return Number.isInteger(v) && (v as number) >= 0 ? BigInt(v as number) : 0n;
+  }
+
+  /** Whether table t has an owner-run state up on page sp (its lists hold
+   *  chips: casinoDoc feltStake): roulette's, or at a craps table craps's. */
+  private ownerRunUp(sp: SimPage, t: string): boolean {
+    const { casino } = sp.p;
+    return this.craps && this.gameOf(t) === 'craps' ? casino.readCrapsTableState(t) !== null : casino.readTableState(t) !== null;
+  }
+
+  /** Once the run is over, page sp's doc whole, every count checked, awake
+   *  (while it runs tables: a room whose last table went runs none, as
+   *  World notes them running only then, frame), nothing held back: what a
+   *  page that has caught up reads. */
   endProblems(sp: SimPage): string[] {
     const now = this.enter(sp);
-    const { casino, croupier } = sp.p;
+    const { casino, croupier, table } = sp.p;
     const out: string[] = [];
     if (sp.partial || !casino.casinoWhole()) out.push('its doc holds part of an update');
     if (!casino.computedSettled()) out.push('a count waits on its checks');
-    if (!croupier.tablesAwake(now)) out.push('its tables read asleep');
+    const runs = this.tables.some((t) => sp.inRoom.has(t)) || table.computedCompactionPending();
+    if (runs && !croupier.tablesAwake(now)) out.push('its tables read asleep');
     if (sp.timers.length > 0) out.push(`${sp.timers.length} timers wait`);
     return out;
   }
@@ -1794,7 +2038,7 @@ export class Sim {
   /** A player's chips before the clamp, as a cold count reads them on sp. */
   ledgerTotal(sp: SimPage, pid: string): bigint {
     const { casino } = sp.p;
-    let total = 0n;
+    let total = this.legacyBal(sp, pid) + this.endRefunds(sp, pid);
     for (const rec of casino.readChipRecords(pid)) total += BigInt(rec.d);
     const cold = this.cold(sp);
     return total + (cold.nets.get(pid) ?? 0n) - (cold.held.get(pid) ?? 0n);
@@ -1836,6 +2080,11 @@ export class Sim {
         const res = casino.computedFoldOf(t);
         if (!res || !casino.isComputedTable(t)) continue;
         if (res.tip) return false;
+        // 🎲 At craps: computedCrapsSim settledAt (riders' bets ride on).
+        if (this.craps && this.gameOf(t) === 'craps') {
+          if (!this.craps.settledAt(sp, t, now)) return false;
+          continue;
+        }
         const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0).map((s) => s.rec.p);
         if (staked.some((pid) => this.pages.some((q) => q.mode === 'up' && q.pid === pid))) return false;
         const v = table.readComputedRoulette(t, now);
@@ -1876,6 +2125,12 @@ export class Sim {
       const tables: Record<string, unknown> = {};
       for (const t of this.tables) {
         const res = casino.computedFoldOf(t);
+        // 🎲 At craps: computedCrapsSim agreement (the fold with its carry
+        // and every roll's craps fields; the view's roll, point, dice, holder).
+        if (this.craps && this.gameOf(t) === 'craps') {
+          tables[t] = this.craps.agreement(sp, t, res, now);
+          continue;
+        }
         const view = table.readComputedRoulette(t, now);
         const D = res && lastDecided(res);
         tables[t] = {

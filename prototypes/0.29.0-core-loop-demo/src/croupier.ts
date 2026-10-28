@@ -32,7 +32,8 @@
  * 🧮 COMPUTED TABLES (computedTable.ts) have no operator: the robot opens no
  * round there and posts no heartbeat. It only sweeps away an owner-run round
  * an earlier build's lease holder opened on one (sweepLegacyRound), and drops
- * a switch nothing stands behind, a peer's forgery (dropBareSwitch); and the
+ * a switch nothing stands behind, a peer's forgery (dropBareSwitch); the
+ * stickman does both at a computed craps table (crapsCroupier). And the
  * lease says which build drives (`build`), so the house can't switch a table
  * to computed while an earlier build runs the room's tables.
  */
@@ -41,6 +42,7 @@ import {
   casinoDocEpoch,
   casinoWhole,
   clearTableKeys,
+  COMPUTED_MIN_BUILD,
   computedIncOf,
   computedSwitchBare,
   computedSwitchLost,
@@ -89,6 +91,16 @@ export const CLOSING_MS = 3_000;
 /** How long the settled result + payouts stay up before the next round opens
  *  (≥ the 4 s local wheel animation, so the number lingers after it stops). */
 export const SHOW_MS = 9_000;
+/** 🎲 A craps table's betting window once the first chip lands (the clock
+ *  arms on a real bet, so a quiet come-out table never throws to an empty
+ *  felt; crapsCroupier.ts, and a computed craps table). */
+export const CRAPS_BET_WINDOW_MS = 16_000;
+/** How long a settled roll + payouts stay up before the next window opens
+ *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
+export const CRAPS_SHOW_MS = 6_000;
+/** 🎲 #226: how long a shooter has to pick the dice up and fling them before
+ *  the stickman throws for them. */
+export const CRAPS_SHOOTER_MS = 20_000;
 /** 🎡 A house member's SPIN lease is honoured this long before another page
  *  (a house member's SPIN, or the robot) may take the round over: the reveal
  *  wait plus a margin. Measured on the taking page's own clock. */
@@ -170,17 +182,19 @@ function leaseIsFree(lease: TableOperatorLease | null, now: number, playerId: st
     || (leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 
-/** 🧮 Does an earlier build drive this room's tables: a lease without this
- *  build's `build` (or one before it) that this page hasn't watched sit
- *  still for a lapse? Watched on this page's clock, as takeTableTurn watches
- *  it (the house's page may be one that never drives), so a lease left by a
- *  page that has gone reads as nobody's once it has sat for a lapse. The
- *  house's switch to a computed table waits for it: that page would go on
- *  opening owner-run rounds there. */
-export function leaseIsOldBuild(now = Date.now()): boolean {
+/** 🧮 Does a build before `min` drive this room's tables: a lease whose
+ *  `build` is below it (or that has none: a build before 2) that this page
+ *  hasn't watched sit still for a lapse? Watched on this page's clock, as
+ *  takeTableTurn watches it (the house's page may be one that never drives),
+ *  so a lease left by a page that has gone reads as nobody's once it has sat
+ *  for a lapse. The house's switch to a computed table waits for it: that
+ *  page would go on opening owner-run rounds there. `min` is the first build
+ *  that knows the table's game (casinoDoc COMPUTED_MIN_BUILD; roulette's by
+ *  default). */
+export function leaseIsOldBuild(now = Date.now(), min: number = COMPUTED_MIN_BUILD.roulette): boolean {
   const lease = readTableOperatorLease();
   noteLease(lease, now);
-  if (!lease || (lease.build ?? 0) >= TABLE_BUILD) return false;
+  if (!lease || (lease.build ?? 0) >= min) return false;
   return !(leaseSeen !== null && now - leaseSeen.at >= TABLE_LEASE_LAPSE_MS);
 }
 
@@ -581,11 +595,16 @@ const legacySeen = new Map<string, { epoch: number; wake: number; inc: string; r
  * watched such a round sit for a lapse (its driver gone), it ends that
  * round's incarnation alone, as a removal would (refundAndClear,
  * keepComputed): its lists stop holding, what an earlier build's lists took
- * is refunded, its book counts on, and the computed incarnation, its switch
- * and its sessions are as they were. Only on a whole doc (the caller).
+ * is refunded, its book counts on, and the computed incarnation, its switch,
+ * its sessions and the house's settings for the table are as they were
+ * (keepConfig). Only on a whole doc (the caller). At craps the same, its
+ * state read by `read` (readCrapsTableState): the bets still on its felt go
+ * back, riding ones too, and what its rolls already paid stands.
  */
-function sweepLegacyRound(tableId: string, now: number): void {
-  const s = readTableState(tableId);
+export function sweepLegacyRound(
+  tableId: string, now: number, read: (tableId: string) => { round: number; inc?: string } | null = readTableState,
+): void {
+  const s = read(tableId);
   if (!s) {
     legacySeen.delete(tableId);
     return;
@@ -601,7 +620,7 @@ function sweepLegacyRound(tableId: string, now: number): void {
   }
   if (now - seen.at < TABLE_LEASE_LAPSE_MS) return;
   legacySeen.delete(tableId);
-  transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true }));
+  transactCasino(() => refundAndClear(tableId, 'local', { keepComputed: true, keepConfig: true }));
 }
 
 /** When this page first saw each table's switch bare (its epoch, the
@@ -623,7 +642,7 @@ const bareSeen = new Map<string, { epoch: number; wake: number; inc: string; at:
  * same: the round under way is this build's own, not an earlier build's.
  * True when it dropped it (the caller's tick is over).
  */
-function dropBareSwitch(tableId: string, now: number): boolean {
+export function dropBareSwitch(tableId: string, now: number): boolean {
   const inc = computedSwitchBare(tableId) ? computedIncOf(tableId) : null;
   if (inc === null) {
     bareSeen.delete(tableId);
@@ -760,8 +779,12 @@ export function closeWhenWhole(tableId: string, close: () => void): void {
  *  settling this very round: a bettor's refund counts unless the doc kept
  *  that settle's book, which settled their list (creditTableOutcome). Then
  *  the keys go (clearTableKeys; `keepComputed`: a computed table's own
- *  incarnation stays, for the sweep of an owner-run round on it). */
-export function refundAndClear(tableId: string, closing: TableClosing, opts: { keepComputed?: boolean } = {}): void {
+ *  incarnation stays, for the sweep of an owner-run round on it;
+ *  `keepConfig`: the house's settings for the table stay, for that sweep and
+ *  the switch to computed). */
+export function refundAndClear(
+  tableId: string, closing: TableClosing, opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+): void {
   const end = tableEndingStakes(tableId);
   for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);
   clearTableKeys(tableId, closing, opts);
