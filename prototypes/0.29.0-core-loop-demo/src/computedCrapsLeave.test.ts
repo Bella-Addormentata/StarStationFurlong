@@ -20,7 +20,7 @@ import { basisOf, own } from './computedCraps';
 import { asClose, forfeitKey } from './computedFold';
 import type { CloseRec, CrapsSlipRec } from './computedFold';
 import {
-  byRank, carryOf, clockOf, CRAPS_CTX as CTX, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, crapsPointOn, frame, keysIn, loadPage,
+  byRank, carryOf, clockOf, CRAPS_CTX as CTX, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, crapsPointOn, deleteIn, frame, keysIn, loadPage,
   openCrapsRoom, putIn, rigRoll, rigSplit, run, signAs, standAt, sync,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
@@ -101,6 +101,34 @@ async function placeEight() {
   expect(carryOf(a)).toMatchObject({ p: 6, h: b.pid, i: 1 });
   expect(carryOf(a).w[a.pid]).toEqual([bet('pass', 10), bet('place', 6, 8)]);
   return { pages, decidedAt };
+}
+
+/** As placeEight, but both seeds make roll 1's 6 and A's alone an 8, and A
+ *  ranks first for roll 1's forfeit: A's forfeit (rewrite) makes the point
+ *  an 8, so a felt of A's on roll 2 is built on a table that is no more. */
+async function splitSix() {
+  let pages: Page[];
+  do pages = await openCrapsRoom(['A', 'B'], T0);
+  while (byRank(pages, 'forfeit', 1, CTX)[0] !== pages[0]);
+  const [a, b] = pages;
+  standAt(a, 1);
+  standAt(b, 3);
+  rigSplit(pages, 1, 6, a, 8);
+  expect(crapsBet(a, [bet('pass', 10), bet('place', 6, 8)], T0)).toBe('ok');
+  expect(crapsBet(b, [bet('pass', 5)], T0)).toBe('ok');
+  sync(T0, ...pages);
+  const decidedAt = decide(pages, 1, T0 + STEP);
+  expect(carryOf(a).p).toBe(6);
+  return { pages, decidedAt };
+}
+
+/** A's forfeit of roll 1, counting A's seed alone, put in on page p at T:
+ *  the point an 8. */
+function rewriteOn(p: Page, a: Page, T: number): void {
+  clockOf(p, T);
+  const f = signAs(a, 'forfeit', { r: 1, x: foldOf(p).rounds[0].close, n: [a.pid] }, CTX);
+  putIn(p, [[forfeitKey(f)!, f]], TABLE);
+  expect(carryOf(p).p).toBe(8);
 }
 
 describe('the goodbye', () => {
@@ -380,6 +408,132 @@ describe('back at the table', () => {
     expect(latestOf(a, a.pid)!.b).toContainEqual(bet('place', 6, 8));
     go(pages, at + STEP, at + 2_000);
     expect(a.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it('a take-down that went in, the tab reloaded with no goodbye at another stand, its version taken on there, then undone by a rewrite of the roll before: the reloaded page says so', async () => {
+    const { pages, decidedAt } = await splitSix();
+    const [a, b] = pages;
+    const { T } = openRoll2(pages, decidedAt);
+    expect(crapsBet(a, [bet('pass', 10)], T)).toBe('ok');
+    sync(T + 400, a, b);
+    const a2 = await reload(a, [b], T + 1_000, 2);
+    frame(T + 1_000, a2, [REF]);
+    const was = basisOf(carryOf(a2), a.pid);
+    // The old tab's version waits out the grace, then goes again at stand 2
+    // as it was: the take-down is the reloaded page's own from here.
+    const took = go([a2, b], T + 1_000 + STEP, T + 14_000, () => latestOf(a2, a.pid)?.t === 2);
+    expect(took).toBeGreaterThanOrEqual(T + 11_000);
+    expect(took).toBeLessThan(T + 14_000);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: [bet('pass', 10)], o: was, t: 2 });
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(0);
+    rewriteOn(a2, a, took + STEP);
+    const now = basisOf(carryOf(a2), a.pid);
+    expect(now).not.toBe(was);
+    const C = own(carryOf(a2).w, a.pid);
+    expect(C).toContainEqual(bet('place', 6, 8));
+    const at = go([a2, b], took + 2 * STEP, took + 30_000, () => latestOf(a2, a.pid)?.o === now);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: C, o: now, t: 2 });
+    go([a2, b], at + STEP, at + 3_000);
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it("an old tab's take-down written over, that write deleted by a peer and the take-down written over again: the reloaded page says so once", async () => {
+    const { pages, decidedAt } = await splitSix();
+    const [a, b] = pages;
+    const { T } = openRoll2(pages, decidedAt);
+    expect(crapsBet(a, [bet('pass', 10)], T)).toBe('ok');
+    sync(T + 400, a, b);
+    const a2 = await reload(a, [b], T + 1_000, 1);
+    frame(T + 1_000, a2, [REF]);
+    const old = foldOf(a2).felts.get(a.pid)!.key;
+    sync(T + 1_000, a2, b);
+    rewriteOn(a2, a, T + 1_200);
+    const now = basisOf(carryOf(a2), a.pid);
+    const C = own(carryOf(a2).w, a.pid);
+    const at = go([a2, b], T + 1_200 + STEP, T + 30_000, () => latestOf(a2, a.pid)?.o === now);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: C, o: now });
+    go([a2, b], at + STEP, at + 1_000);
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(1);
+    // B's page deletes the riding bets: the old tab's take-down is the
+    // latest again, and goes under the riding bets again, told already.
+    const over = foldOf(b).felts.get(a.pid)!.key;
+    expect(over).not.toBe(old);
+    deleteIn(b, [over], TABLE);
+    expect(foldOf(b).felts.get(a.pid)!.key).toBe(old);
+    const again = go([a2, b], at + 1_000 + STEP, at + 20_000, () => latestOf(b, a.pid)?.o === now);
+    expect(latestOf(b, a.pid)).toMatchObject({ r: 2, b: C, o: now });
+    go([a2, b], again + STEP, again + 2_000);
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it('a take-down that went in, the roll before rewritten and the page leaving while it is shown again: the goodbye goes as the riding bets, and the page says so', async () => {
+    const { pages, decidedAt } = await splitSix();
+    const [a, b] = pages;
+    const { T } = openRoll2(pages, decidedAt);
+    expect(crapsBet(a, [bet('pass', 10)], T)).toBe('ok');
+    go(pages, T + STEP, T + 2_000);
+    const was = basisOf(carryOf(a), a.pid);
+    expect(latestOf(b, a.pid)).toMatchObject({ b: [bet('pass', 10)], o: was });
+    rewriteOn(b, a, T + 2_200);
+    sync(T + 2_200, a, b);
+    const now = basisOf(carryOf(a), a.pid);
+    expect(now).not.toBe(was);
+    const C = own(carryOf(a).w, a.pid);
+    expect(C).toContainEqual(bet('place', 6, 8));
+    // Roll 1 is on screen again for its show: nothing written yet.
+    go(pages, T + 2_400, T + 4_000);
+    expect(crapsOf(a, T + 4_000)).toMatchObject({ phase: 'settled', round: 1 });
+    expect(latestOf(a, a.pid)).toMatchObject({ b: [bet('pass', 10)], o: was });
+    expect(a.table.computedUndoneCount(TABLE)).toBe(0);
+    a.table.leaveComputedTables(T + 4_000);
+    sync(T + 4_000, a, b);
+    expect(latestOf(b, a.pid)).toMatchObject({ l: 1, b: C, o: now });
+    expect(a.table.computedUndoneCount(TABLE)).toBe(1);
+    // Back from the back-forward cache: the goodbye goes again as its own
+    // felt, told already.
+    a.table.backAtComputedTables();
+    const at = go(pages, T + 4_000 + STEP, T + 30_000, () => latestOf(b, a.pid)?.l === undefined);
+    expect(latestOf(b, a.pid)).toMatchObject({ r: 2, b: C, o: now, t: 1 });
+    go(pages, at + STEP, at + 2_000);
+    expect(a.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it("an old tab's take-down frozen and its seed out, the tab reloaded with no goodbye, the close gone: the take-down goes again under a fresh seed as the reloaded page's own, and a rewrite of the roll before that undoes it is told", async () => {
+    const { pages, decidedAt } = await splitSix();
+    const [a, b] = pages;
+    const { T, W, D } = openRoll2(pages, decidedAt);
+    expect(crapsBet(a, [bet('pass', 10)], T)).toBe('ok');
+    go(pages, T + STEP, W);
+    const was = basisOf(carryOf(a), a.pid);
+    // Roll 2 closes with the take-down frozen; A's page shows its seed, B's
+    // doesn't yet.
+    const [first] = byRank(pages, 'close', 2, CTX);
+    const at = go([first], W + STEP, D + 10_000, closed(first, 2));
+    if (first !== a) sync(at, first, a);
+    frame(at + STEP, a, [REF]);
+    sync(at + STEP, a, b);
+    const old = latestOf(b, a.pid)!;
+    expect(old).toMatchObject({ b: [bet('pass', 10)], o: was });
+    expect(foldOf(b).revealedCommits.has(old.c)).toBe(true);
+    expect(foldOf(b).rounds.find((v) => v.r === 2)?.decided ?? null).toBeNull();
+    // A's tab reloads with no goodbye; on its page the close goes.
+    const a2 = await reload(a, [b], at + 2 * STEP, 1);
+    deleteIn(a2, keysIn(a2, 'c', 2, TABLE), TABLE);
+    expect(foldOf(a2).tip).toBeNull();
+    // (Once its own show of roll 1 is over.)
+    const put = go([a2], at + 3 * STEP, at + 20_000, () => latestOf(a2, a.pid)?.c !== old.c);
+    expect(put).toBeLessThan(at + 20_000);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: [bet('pass', 10)], o: was, t: 1 });
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(0);
+    rewriteOn(a2, a, put + STEP);
+    const now = basisOf(carryOf(a2), a.pid);
+    expect(now).not.toBe(was);
+    const C = own(carryOf(a2).w, a.pid);
+    expect(C).toContainEqual(bet('place', 6, 8));
+    const over = go([a2], put + 2 * STEP, put + 40_000, () => latestOf(a2, a.pid)?.o === now);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: C, o: now });
+    go([a2], over + STEP, over + 2_000);
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(1);
   });
 
   it('back from the back-forward cache, the same: its frames write the goodbye again; its writes go again', async () => {
