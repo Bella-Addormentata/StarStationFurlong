@@ -13,206 +13,32 @@
  * handle that logs the dice it was asked to fly and land; this file stubs
  * just enough of a DOM (as computedTablePresses.test.ts does) to mount the
  * focused table, press its keys, click its felt and press its card. A
- * page's frame runs as World runs it: the computed duties, every table's
- * pieces (casinoTablesFrame), then the focused table's UI.
+ * page's frame runs its computed duties, every table's pieces
+ * (casinoTablesFrame), then the focused table's UI; World runs the pieces
+ * before the duties (world.ts update), which the specs of a page back from
+ * a stop follow (piecesOf, then dutiesOf): it reads the table before its
+ * duties count the wake.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import * as THREE from 'three';
+import { basisOf, EMPTY_CARRY } from './computedCraps';
 import { forfeitKey } from './computedFold';
 import {
   byRank, carryOf, clockOf, CRAPS_CTX as CTX, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, keysIn,
-  loadPage, putIn, rigRoll, rigSame, rigSplit, send, signAs, standAt, switchOn, sync, trimByHand,
+  putIn, rigRoll, rigSame, rigSplit, send, signAs, standAt, switchOn, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { testIdentity } from './computedTestKit';
-import { CRAPS_DICE_SPOT, CRAPS_LAYOUT, hitRegion } from './games/casinoLayout';
-import type { FeltPoint, FeltRegion, CrapsSpot } from './games/casinoLayout';
+import { atCraps, hintsIn, loadUIPage, stubDom } from './computedCrapsUiKit';
+import type { AtCraps, UIPage } from './computedCrapsUiKit';
+import { ComputedKit, testIdentity } from './computedTestKit';
+import { CRAPS_DICE_SPOT } from './games/casinoLayout';
 import type { CrapsBet } from './games/craps';
 
-// ── A minimal DOM ────────────────────────────────────────────────────────────
+// ── A minimal DOM, the table's pieces, pages with a table UI ───────────────
 
-class FakeEl {
-  id = '';
-  tabIndex = -1;
-  innerHTML = '';
-  parentElement: FakeEl | null = null;
-  style: Record<string, string> = {};
-  dataset: Record<string, string> = {};
-  children: FakeEl[] = [];
-  listeners = new Map<string, ((e: unknown) => void)[]>();
-  /** Every text this element was given, in order. */
-  readonly texts: string[] = [];
-  private text = '';
-  private sub = new Map<string, FakeEl>();
-  get textContent(): string { return this.text; }
-  set textContent(v: string) {
-    this.text = v;
-    this.texts.push(v);
-  }
-  setAttribute(): void {}
-  addEventListener(type: string, fn: (e: unknown) => void): void {
-    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
-  }
-  removeEventListener(): void {}
-  appendChild(child: FakeEl): FakeEl {
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-  remove(): void {
-    if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((c) => c !== this);
-    this.parentElement = null;
-  }
-  focus(): void {}
-  contains(): boolean { return false; }
-  closest(): FakeEl | null { return null; }
-  setPointerCapture(): void {}
-  hasPointerCapture(): boolean { return false; }
-  releasePointerCapture(): void {}
-  querySelector(sel: string): FakeEl {
-    let el = this.sub.get(sel);
-    if (!el) {
-      el = new FakeEl();
-      this.sub.set(sel, el);
-    }
-    return el;
-  }
-  querySelectorAll(): FakeEl[] { return []; }
-  getBoundingClientRect(): { left: number; top: number; width: number; height: number } {
-    return { left: 0, top: 0, width: 100, height: 100 };
-  }
-  fire(type: string, e: unknown): void {
-    for (const fn of this.listeners.get(type) ?? []) fn(e);
-  }
-}
-
-/** Where the HUD's hint (showHint) goes. */
-const body = new FakeEl();
-vi.stubGlobal('document', {
-  createElement: () => new FakeEl(),
-  activeElement: null,
-  body,
-  addEventListener: () => {},
-  removeEventListener: () => {},
-});
-vi.stubGlobal('window', {
-  location: { search: '' },
-  innerWidth: 1000,
-  addEventListener: () => {},
-  removeEventListener: () => {},
-  innerHeight: 800,
-  // Through to the (faked) timers at call time.
-  setInterval: (fn: () => void, ms: number) => globalThis.setInterval(fn, ms),
-  clearInterval: (id: number) => globalThis.clearInterval(id),
-  setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
-  clearTimeout: (id: number) => globalThis.clearTimeout(id),
-});
-
-// ── The table's pieces ───────────────────────────────────────────────────────
-
-type CasinoTableVisualHandle = import('./casinoTable3d').CasinoTableVisualHandle;
-
-/** A craps table's pieces that log what the dice were asked to do (`throw
- *  <seed>`, `land <d1><d2>`, `cancel`), fly until given their faces and
- *  settle over the two updates after (a frame's own update and the next:
- *  the status line reads them settling); and that put a pointer press wherever `aim`
- *  says (on the felt at `p`, on my own stack there with `stack`, on the
- *  dice with `dice`, which a hold raises until they fly or go home). */
-interface FakeDice {
-  h: CasinoTableVisualHandle;
-  log: string[];
-  state: () => string;
-  aim: { p: FeltPoint | null; stack: boolean; dice: boolean };
-  /** The chips the hand shows. */
-  hand: () => readonly number[];
-  /** How many times the table's pieces were reset; where the dice last lay at rest. */
-  resets: () => number;
-  rest: () => FeltPoint | null;
-}
-
-function fakeDice(): FakeDice {
-  let state = 'rest';
-  let settle = 0;
-  let hand: readonly number[] = [];
-  let resets = 0;
-  let rest: FeltPoint | null = null;
-  const log: string[] = [];
-  const aim: FakeDice['aim'] = { p: null, stack: false, dice: false };
-  const h = new Proxy({} as Record<PropertyKey, unknown>, {
-    get: (_t, key) => {
-      switch (key) {
-        case 'game': return 'craps';
-        case 'halfX': return 1.2;
-        case 'halfZ': return 0.6;
-        case 'diceState': return () => state;
-        case 'diceThrow': return (_from: FeltPoint, _dir: FeltPoint, _power: number, seed: number) => {
-          log.push(`throw ${seed}`);
-          state = 'flying';
-        };
-        case 'diceLand': return (f: readonly [number, number]) => {
-          log.push(`land ${f[0]}${f[1]}`);
-          if (state === 'flying') {
-            state = 'settling';
-            settle = 2;
-          }
-        };
-        case 'diceCancel': return () => {
-          log.push('cancel');
-          state = 'rest';
-        };
-        case 'update': return () => {
-          if (state === 'settling' && --settle <= 0) state = 'rest';
-        };
-        case 'reset': return () => {
-          resets += 1;
-          state = 'rest';
-        };
-        case 'diceRestAt': return (at: FeltPoint) => {
-          rest = at;
-          if (state === 'held') state = 'rest';
-        };
-        case 'diceHold': return () => {
-          if (state !== 'flying' && state !== 'settling') state = 'held';
-        };
-        case 'setHand': return (_at: unknown, chips: readonly number[]) => {
-          hand = [...chips];
-        };
-        case 'pick': return () => (aim.dice ? { kind: 'dice' } : aim.p ? { kind: 'felt', p: aim.p } : null);
-        case 'projectToFelt': return () => aim.p;
-        case 'onMyStack': return () => (aim.stack ? aim.p : null);
-        case 'toScreen': return () => null;
-        default: return () => undefined;
-      }
-    },
-  }) as unknown as CasinoTableVisualHandle;
-  return { h, log, state: () => state, aim, hand: () => hand, resets: () => resets, rest: () => rest };
-}
-
-// ── Pages with a table UI ────────────────────────────────────────────────────
-
-interface UIPage extends Page {
-  session: typeof import('./casinoTableSession');
-  dice: FakeDice;
-  /** The focused table's UI on this page, while one is mounted. */
-  at: AtCraps | null;
-}
-
-/** Page `name` with the table UI loaded over its own modules, the craps
- *  table in its room's furniture (`reloadOf`: that page's tab loaded again,
- *  its key kept, its seeds gone). */
-async function loadUIPage(name: string, clientID: number, opts: { reloadOf?: Page; pid?: string } = {}): Promise<UIPage> {
-  const p = await loadPage(name, clientID, opts);
-  const session = await import('./casinoTableSession');
-  const furniture = await import('./furniture');
-  const focus = await import('./deviceFocus');
-  vi.spyOn(focus.deviceFocus, 'getCamera').mockReturnValue(new THREE.PerspectiveCamera() as never);
-  vi.spyOn(focus.deviceFocus, 'release').mockImplementation(() => {});
-  if (!furniture.FURNITURE.some((i) => i.id === TABLE)) {
-    furniture.FURNITURE.push({ id: TABLE, kind: 'craps-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
-  }
-  return { ...p, session, dice: fakeDice(), at: null };
-}
+/** Where the HUD's hint (showHint) goes. (The DOM, the dice and the mounted
+ *  table: computedCrapsUiKit.) */
+const body = stubDom();
 
 /** Pages `names`, 1,000 chips each, synced at T0; the craps table switched
  *  on by the first unless `owner` (an owner-run table). */
@@ -228,121 +54,8 @@ async function room(names: string[], owner = false): Promise<UIPage[]> {
   return pages;
 }
 
-interface AtCraps {
-  key: (k: string) => void;
-  /** The last notice (the screen reader's live line, zero-width space off). */
-  said: () => string;
-  /** Every notice, in order. */
-  heard: () => string[];
-  /** The status line. */
-  status: () => string;
-  /** Every status line shown, in order. */
-  lines: () => string[];
-  plaque: () => string;
-  /** The ⚙ card's markup (opened if it isn't). */
-  card: () => string;
-  press: (act: string) => void;
-  /** Pick up chips off the rail with key `keyNo` (1–6: 1, 5, 25, …), `times` times. */
-  pick: (keyNo: string, times?: number) => void;
-  /** A click on the felt box for `type` (and `pick`): the hand bets there. */
-  click: (type: CrapsBet['type'], pick?: number) => void;
-  /** A click on my own chips in that box: they come back. */
-  takeBack: (type: CrapsBet['type'], pick?: number) => void;
-  /** The dice picked up at `path[0]` and dragged along it, `stepMs` apart
-   *  (the page's performance clock), then let go. */
-  fling: (path: FeltPoint[], stepMs: number) => void;
-  update: () => void;
-  unmount: () => void;
-}
-
-/** A point inside the felt box for `type` (and `pick`) that hits that box. */
-function boxAt(type: CrapsBet['type'], pick?: number): FeltPoint {
-  const rg = CRAPS_LAYOUT.regions.find((r) => r.bet.type === type && r.bet.pick === pick) as FeltRegion<CrapsSpot> | undefined;
-  if (!rg) throw new Error(`no ${type} ${pick ?? ''} box`);
-  for (const r of rg.rects) {
-    for (let i = 1; i < 10; i++) {
-      for (let j = 1; j < 10; j++) {
-        const p = { x: r.x0 + ((r.x1 - r.x0) * i) / 10, z: r.z0 + ((r.z1 - r.z0) * j) / 10 };
-        if (hitRegion(CRAPS_LAYOUT, p) === rg) return p;
-      }
-    }
-  }
-  throw new Error(`no point hits the ${type} ${pick ?? ''} box`);
-}
-
-/** Mount the focused craps table on page p, a player at `stand` (null: the
- *  device front), the house with `house`. */
-function atCraps(p: UIPage, opts: { stand?: number | null; house?: boolean } = {}): AtCraps {
-  const ui = p.session.createCasinoTableUI({
-    itemId: TABLE, game: 'craps', isHouse: () => opts.house ?? false, stand: opts.stand ?? null, visual: p.dice.h,
-  });
-  const host = new FakeEl();
-  ui.mount(host as unknown as HTMLElement);
-  const capture = host.children[0];
-  const bar = host.children[1];
-  const key = (k: string): void => capture.fire('keydown', { key: k, preventDefault() {}, stopPropagation() {} });
-  const cardEl = (): FakeEl | undefined => host.children.find((c) => c !== capture && c !== bar);
-  const open = (): FakeEl => {
-    if (!cardEl()) key('s');
-    return cardEl()!;
-  };
-  const strip = (s: string): string => s.replace(/​/g, '');
-  const press = (point: FeltPoint, stack: boolean): void => {
-    p.dice.aim.p = point;
-    p.dice.aim.stack = stack;
-    capture.fire('pointerdown', {
-      button: 0, pointerType: 'mouse', pointerId: 1, clientX: 500, clientY: 400, stopPropagation() {}, preventDefault() {},
-    });
-    p.dice.aim.p = null;
-    p.dice.aim.stack = false;
-  };
-  const t: AtCraps = {
-    key,
-    said: () => strip(bar.querySelector('[data-live]').textContent),
-    heard: () => bar.querySelector('[data-live]').texts.map(strip),
-    status: () => bar.querySelector('[data-status]').textContent,
-    lines: () => [...bar.querySelector('[data-status]').texts],
-    plaque: () => bar.querySelector('[data-fair]').textContent,
-    card: () => open().innerHTML,
-    press: (act: string) => open().fire('click', {
-      target: { closest: () => ({ dataset: { act } }) }, preventDefault() {}, stopPropagation() {},
-    }),
-    pick: (keyNo, times = 1) => {
-      for (let i = 0; i < times; i++) key(keyNo);
-    },
-    click: (type, pick) => press(boxAt(type, pick), false),
-    takeBack: (type, pick) => press(boxAt(type, pick), true),
-    fling: (path, stepMs) => {
-      let t = 1_000;
-      const clock = vi.spyOn(performance, 'now').mockImplementation(() => t);
-      const ev = (): Record<string, unknown> => ({
-        button: 0, pointerType: 'mouse', pointerId: 1, clientX: 500, clientY: 400, stopPropagation() {}, preventDefault() {},
-      });
-      p.dice.aim.dice = true;
-      p.dice.aim.p = path[0];
-      capture.fire('pointerdown', ev());
-      p.dice.aim.dice = false;
-      for (const at of path.slice(1)) {
-        t += stepMs;
-        p.dice.aim.p = at;
-        capture.fire('pointermove', ev());
-      }
-      capture.fire('pointerup', ev());
-      p.dice.aim.p = null;
-      clock.mockRestore();
-    },
-    update: () => ui.update(1 / 60),
-    unmount: () => {
-      ui.unmount();
-      p.at = null;
-    },
-  };
-  p.at = t;
-  return t;
-}
-
 /** The HUD hints shown (walking off the table), in order. */
-const hints = (): string[] => body.children.filter((c) => c.id === 'hud-hint').flatMap((c) => c.texts);
+const hints = (): string[] => hintsIn(body);
 
 // ── Time ─────────────────────────────────────────────────────────────────────
 
@@ -364,14 +77,30 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** One frame of page p at T, as World runs it: its computed duties, every
- *  table's pieces, then its focused table. */
+/** One frame of page p at T: its computed duties, every table's pieces,
+ *  then its focused table. (World runs the pieces first: piecesOf, then
+ *  dutiesOf.) */
 function frameOf(p: UIPage, T: number): void {
   const now = clockOf(p, T);
   p.croupier.noteTablesRunning(now);
   p.table.tickComputedTables([REF], now);
   p.session.casinoTablesFrame(1 / 60, new Map([[TABLE, p.dice.h]]));
   p.at?.update();
+}
+
+/** Page p's tables' pieces at T, then its focused table: a frame as World
+ *  runs it up to the computed duties. */
+function piecesOf(p: UIPage, T: number): void {
+  clockOf(p, T);
+  p.session.casinoTablesFrame(1 / 60, new Map([[TABLE, p.dice.h]]));
+  p.at?.update();
+}
+
+/** …and its computed duties at T, as World runs them after the pieces. */
+function dutiesOf(p: UIPage, T: number): void {
+  const now = clockOf(p, T);
+  p.croupier.noteTablesRunning(now);
+  p.table.tickComputedTables([REF], now);
 }
 
 /** Frames of `pages` every STEP ms from `from` to `to`, synced before and
@@ -414,14 +143,15 @@ function openRoll(pages: UIPage[], r: number, from: number): { T: number; W: num
   return { T, W, D: W + WAIT_MS };
 }
 
-/** Pages `names` at stands `stands`, pass line bets (`amounts`) on roll 1,
- *  which rolls a 6: the point is on, every pass riding on it, the dice with
- *  the first stand clockwise (the one at 3 before the one at 1). */
-async function pointOn(names: string[], stands: (number | null)[], amounts = [10, 5, 20]) {
+/** Pages `names` at stands `stands`, pass line bets (`amounts`) on roll 1
+ *  from the first `bettors` of them (the rest bet nothing), which rolls a 6:
+ *  the point is on, every pass riding on it, the dice with the first stand
+ *  clockwise (the one at 3 before the one at 1). */
+async function pointOn(names: string[], stands: (number | null)[], amounts = [10, 5, 20], bettors = names.length) {
   const pages = await room(names);
   pages.forEach((p, i) => standAt(p, stands[i] ?? null));
-  rigRoll(pages, 1, 6);
-  for (const [i, p] of pages.entries()) expect(crapsBet(p, [bet('pass', amounts[i])], T0)).toBe('ok');
+  rigRoll(pages.slice(0, bettors), 1, 6);
+  for (const [i, p] of pages.slice(0, bettors).entries()) expect(crapsBet(p, [bet('pass', amounts[i])], T0)).toBe('ok');
   sync(T0, ...pages);
   const decidedAt = decide(pages, 1, T0 + STEP);
   for (const p of pages) expect(carryOf(p).p).toBe(6);
@@ -804,6 +534,34 @@ describe('the shooter and the dice', () => {
     expect(crapsOf(c)).toMatchObject({ phase: 'closing', round: 2 });
     expect(c.dice.log.slice(mark)).toEqual([tossOf(closeOf(c, 2)!)]);
     expect(c.dice.state()).toBe('flying');
+  });
+
+  it("a roll taken back to betting sends the called-off dice home, and closed again on the same slips flies them once, landing on the faces those slips make", async () => {
+    const { pages, a, b, c, tb, decidedAt } = await watched();
+    rigRoll([a, b], 2, 8);
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    go(pages, T, W + 1_000);
+    clockOf(b, W + 1_050);
+    tb.key('r');
+    const thr = b.casino.readDiceThrow(TABLE)!;
+    // C flies B's throw; A's and B's tabs go quiet before either closes, and
+    // C takes the roll back to betting.
+    const markC = c.dice.log.length;
+    send(W + 1_100, b, c);
+    frameOf(c, W + 1_100);
+    const reopened = go([c], W + 1_200, W + 120_000, () => crapsOf(c)?.phase === 'betting');
+    expect(reopened).toBeLessThan(W + 120_000);
+    go([c], reopened + STEP, reopened + STEP);
+    expect(c.dice.log.slice(markC)).toEqual([`throw ${thr.seed}`, 'cancel']);
+    expect(c.dice.rest()).toEqual(CRAPS_DICE_SPOT);
+    // A's and B's tabs come back, and the roll closes on their same slips:
+    // the stickman's toss flies once, landing on the 8 their seeds make.
+    const at = decide(pages, 2, reopened + 2 * STEP, reopened + 120_000);
+    go(pages, at + STEP, at + 3 * STEP);
+    const dice = foldOf(c).rounds.find((v) => v.r === 2)!.craps!.dice!;
+    expect(foldOf(c).rounds.find((v) => v.r === 2)).toMatchObject({ decided: 'reveals' });
+    expect(dice[0] + dice[1]).toBe(8);
+    expect(c.dice.log.slice(markC)).toEqual([`throw ${thr.seed}`, 'cancel', tossOf(closeOf(c, 2)!), `land ${dice.join('')}`]);
   });
 
   it("a throw heard with the goodbyes that take its roll back to betting never flies: at the close after, the stickman's toss does", async () => {
@@ -1474,6 +1232,233 @@ describe('a roll shown again', () => {
       expect(p.dice.log.slice(marks[i])).toEqual([tossOf(closeOf(p, 2)!), faces]);
     }
   });
+
+  it('a roll shown, then held again for a forfeit that beats its seeds on new faces: its dice lie where they came down while it is held, then fly again when it shows, landing on them', async () => {
+    // w first to forfeit roll 2, at 3: the dice are w's after roll 1's 6.
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 2, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigRoll(pages, 1, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    const d1 = decide(pages, 1, T0 + STEP);
+    // Roll 2: an 8 from both seeds, a 9 from w's alone.
+    rigSplit(pages, 2, 8, w, 9);
+    atCraps(w, { stand: 3 });
+    atCraps(x, { stand: 1 });
+    const { T, W } = openRoll(pages, 2, d1 + STEP);
+    go(pages, T, W - STEP);
+    w.table.noteComputedFling(TABLE, 2, 9, W);
+    const d2 = decide(pages, 2, W);
+    go(pages, d2 + STEP, d2 + 3 * STEP);
+    const sum = (e: string | undefined): number => [...(e ?? '').slice('land '.length)].reduce((n, d) => n + Number(d), 0);
+    for (const p of pages) {
+      expect(crapsOf(p)).toMatchObject({ phase: 'settled', round: 2 });
+      expect(sum(p.dice.log.at(-1))).toBe(8);
+    }
+    const marks = pages.map((p) => p.dice.log.length);
+    // w's forfeit of roll 2 comes before its result's grace is out: the
+    // roll is held for the forfeit's show, then shows on new dice.
+    const F = d2 + 4 * STEP;
+    clockOf(w, F);
+    const f = signAs(w, 'forfeit', { r: 2, x: foldOf(w).rounds.find((v) => v.r === 2)!.close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    go(pages, F + STEP, F + STEP);
+    for (const p of pages) expect(crapsOf(p)).toMatchObject({ phase: 'closing', round: 2 });
+    const held = (p: UIPage): boolean => crapsOf(p)?.phase === 'closing';
+    const shown = go(pages, F + 2 * STEP, F + 30_000, () => {
+      // (Held, the dice lie where they came down: nothing slides them off.)
+      for (const p of pages) if (held(p)) expect(p.dice.rest()).toBeNull();
+      return pages.every((p) => crapsOf(p)?.phase === 'settled');
+    });
+    go(pages, shown + STEP, shown + 3 * STEP);
+    const faces = `land ${foldOf(w).rounds.find((v) => v.r === 2)!.craps!.dice!.join('')}`;
+    expect(sum(faces)).toBe(9);
+    for (const [i, p] of pages.entries()) {
+      expect(foldOf(p).rounds.find((v) => v.r === 2)).toMatchObject({ decided: 'forfeit' });
+      expect(p.dice.log.slice(marks[i])).toEqual([tossOf(closeOf(p, 2)!), faces]);
+    }
+  });
+
+  it("a page whose frames stop with its dice in the air, across a forfeit of its own seed: back, it shows the roll again on the same forfeit, and its dice flew once and lie where they came down", async () => {
+    // A at 3 has the dice after roll 1's 6; roll 2 an 8 from A's seed alone.
+    const { pages, decidedAt } = await pointOn(['A', 'B'], [3, 1]);
+    const [a, b] = pages;
+    rigSplit(pages, 2, 9, a, 8);
+    const ta = atCraps(a, { stand: 3 });
+    atCraps(b, { stand: 1 });
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    go(pages, T, W + 1_000);
+    clockOf(a, W + 1_050);
+    ta.key('r');
+    const thr = a.casino.readDiceThrow(TABLE)!;
+    go([a], W + 1_200, W + 1_200);
+    expect(closeOf(a, 2)).toBeDefined();
+    // B hears the throw and the close; its tab is throttled from this frame
+    // on: its pieces run (the dice fly), its duties don't (its seed never
+    // goes out). Its doc hears the room meanwhile: A forfeits B's seed.
+    const markB = b.dice.log.length;
+    sync(W + 1_400, a, b);
+    piecesOf(b, W + 1_400);
+    expect(throws(b.dice.log.slice(markB))).toEqual([`throw ${thr.seed}`]);
+    const forfeited = (): boolean => foldOf(b).rounds.some((v) => v.r === 2 && v.decided === 'forfeit');
+    const F = go([a], W + 1_600, W + 60_000, () => {
+      sync(Date.now(), a, b);
+      return forfeited();
+    });
+    expect(forfeited()).toBe(true);
+    const dice = foldOf(b).rounds.find((v) => v.r === 2)!.craps!.dice!;
+    expect(dice[0] + dice[1]).toBe(8);
+    // B's tab comes back 10 s on, A's quiet by then. B's first frame reads
+    // the table before its duties count the wake: the roll's show went by
+    // while its dice flew, and they come down on its faces. The wake then
+    // shows the roll again: held for the forfeit's grace, then settled.
+    const back = F + 10_000;
+    const wakes = b.croupier.tablesWakeCount();
+    const seen: string[] = [];
+    for (let t = back; t <= back + 30_000; t += STEP) {
+      piecesOf(b, t);
+      const v = crapsOf(b, t)!;
+      if (seen.at(-1) !== `${v.phase} ${v.round}`) seen.push(`${v.phase} ${v.round}`);
+      // (Held, the dice lie where they came down: nothing slides them off.)
+      if (v.phase === 'closing') expect(b.dice.rest()).toBeNull();
+      dutiesOf(b, t);
+      if (seen.length === 4) break;
+    }
+    expect(b.croupier.tablesWakeCount()).toBe(wakes + 1);
+    expect(seen).toEqual(['betting 3', 'closing 2', 'settled 2', 'betting 3']);
+    expect(foldOf(b).rounds.find((v) => v.r === 2)).toMatchObject({ decided: 'forfeit', craps: { dice } });
+    // One flight of roll 2 on B's page, come down on its faces once.
+    expect(throws(b.dice.log.slice(markB))).toEqual([`throw ${thr.seed}`]);
+    expect(b.dice.log.slice(markB).filter((e) => e.startsWith('land'))).toEqual([`land ${dice.join('')}`]);
+  });
+
+  /** w (first to forfeit roll 2, at 3) and x (at 1): roll 1 a 6, the dice
+   *  w's; roll 2 an 8 from both seeds, decided, then w's forfeit makes it a
+   *  9 (the point still 6, the dice still w's). Both pages toss it again and
+   *  land the 9. Once every page shows roll 2 settled on the forfeit. */
+  async function forfeitRoll2() {
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 2, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigRoll(pages, 1, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    const d1 = decide(pages, 1, T0 + STEP);
+    rigSplit(pages, 2, 8, w, 9);
+    const tw = atCraps(w, { stand: 3 });
+    atCraps(x, { stand: 1 });
+    const { T, W } = openRoll(pages, 2, d1 + STEP);
+    go(pages, T, W - STEP);
+    w.table.noteComputedFling(TABLE, 2, 9, W);
+    const d2 = decide(pages, 2, W);
+    go(pages, d2 + STEP, d2 + 3 * STEP);
+    const F = d2 + 4 * STEP;
+    clockOf(w, F);
+    const f = signAs(w, 'forfeit', { r: 2, x: foldOf(w).rounds.find((v) => v.r === 2)!.close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    go(pages, F + STEP, F + STEP);
+    const shown = go(pages, F + 2 * STEP, F + 30_000, () => pages.every((p) => crapsOf(p)?.phase === 'settled'));
+    go(pages, shown + STEP, shown + 3 * STEP);
+    const dice = foldOf(x).rounds.find((v) => v.r === 2)!.craps!.dice!;
+    expect(dice[0] + dice[1]).toBe(9);
+    for (const p of pages) expect(p.dice.log.at(-1)).toBe(`land ${dice.join('')}`);
+    return { pages, w, x, tw, dice, at: shown + 3 * STEP };
+  }
+
+  /** Page p's frames from `back`, as World runs them (its pieces, then its
+   *  duties), until four views have shown: each one's phase and round, and
+   *  while it showed the dice's state and the status lines. */
+  function backFrom(p: UIPage, back: number) {
+    const seen: string[] = [];
+    const stateIn: Record<string, string> = {};
+    const lines: Record<string, string[]> = {};
+    for (let t = back; t <= back + 30_000; t += STEP) {
+      piecesOf(p, t);
+      const v = crapsOf(p, t)!;
+      const tag = `${v.phase} ${v.round}`;
+      if (seen.at(-1) !== tag) seen.push(tag);
+      stateIn[tag] = p.dice.state();
+      const line = p.at!.status();
+      if (!(lines[tag] ??= []).includes(line)) lines[tag].push(line);
+      dutiesOf(p, t);
+      if (seen.length >= 4) break;
+    }
+    return { seen, stateIn, lines };
+  }
+
+  it("roll 3's throw in the air on x when its tab stops: back, the wake shows roll 2 again, held, then settled; roll 3's dice are called off, roll 2's faces turn where they lie, and roll 2 never flies again", async () => {
+    const { pages, w, x, tw, dice, at } = await forfeitRoll2();
+    const { T: T3, W: W3 } = openRoll(pages, 3, at + STEP);
+    go(pages, T3, W3 + 1_000);
+    clockOf(w, W3 + 1_050);
+    tw.key('r');
+    const thr = w.casino.readDiceThrow(TABLE)!;
+    expect(thr).toMatchObject({ round: 3, by: w.pid });
+    // x hears the throw (no close yet) and flies it; then its tab stops.
+    const markX = x.dice.log.length;
+    send(W3 + 1_100, w, x);
+    frameOf(x, W3 + 1_100);
+    expect(x.dice.log.slice(markX)).toEqual([`throw ${thr.seed}`]);
+    // x's tab comes back 10 s on, having heard nothing more.
+    const mark = x.dice.log.length;
+    const wakes = x.croupier.tablesWakeCount();
+    const { seen, stateIn, lines } = backFrom(x, W3 + 11_100);
+    expect(x.croupier.tablesWakeCount()).toBe(wakes + 1);
+    expect(seen).toEqual(['closing 3', 'closing 2', 'settled 2', 'betting 3']);
+    expect(x.dice.log.slice(mark)).toEqual(['cancel', `land ${dice.join('')}`]);
+    expect(stateIn['settled 2']).not.toBe('flying');
+    expect(lines['settled 2']).not.toContain('🎲 THE DICE ARE ROLLING…');
+  });
+
+  it("a page loaded after a forfeit roll's show: a wake shows the roll again, and its dice neither fly nor stay in the air", async () => {
+    const { pages, dice, at } = await forfeitRoll2();
+    // Past roll 2's show: betting on roll 3 on every page.
+    const open = go(pages, at + STEP, at + 30_000, () => pages.every((p) => crapsOf(p)?.phase === 'betting' && crapsOf(p)?.round === 3));
+    const c = await loadUIPage('C', 3);
+    clockOf(c, open + STEP);
+    sync(open + STEP, c, ...pages);
+    atCraps(c, { stand: null });
+    go([c], open + 2 * STEP, open + 6 * STEP);
+    const mark = c.dice.log.length;
+    // C's tab stops 10 s; back, the wake shows roll 2 again.
+    const { seen, stateIn } = backFrom(c, open + 6 * STEP + 10_000);
+    expect(seen).toEqual(['betting 3', 'closing 2', 'settled 2', 'betting 3']);
+    expect(throws(c.dice.log.slice(mark))).toEqual([]);
+    expect(c.dice.log.slice(mark).at(-1)).toBe(`land ${dice.join('')}`);
+    expect(stateIn['settled 2']).not.toBe('flying');
+  });
+
+  it("a page whose frames stop before the throw, across a forfeit of its own seed: back past the show, the roll's faces turn where the dice lie, and the wake's show of it again flies nothing and leaves no dice in the air", async () => {
+    // A at 3 has the dice after roll 1's 6; roll 2 an 8 from A's seed alone.
+    const { pages, decidedAt } = await pointOn(['A', 'B'], [3, 1]);
+    const [a, b] = pages;
+    rigSplit(pages, 2, 9, a, 8);
+    const ta = atCraps(a, { stand: 3 });
+    atCraps(b, { stand: 1 });
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    go(pages, T, W + 1_000);
+    // B's tab stops now, before the throw; its doc hears the room meanwhile.
+    const markB = b.dice.log.length;
+    clockOf(a, W + 1_050);
+    ta.key('r');
+    const forfeited = (): boolean => foldOf(b).rounds.some((v) => v.r === 2 && v.decided === 'forfeit');
+    const F = go([a], W + 1_200, W + 60_000, () => {
+      sync(Date.now(), a, b);
+      return forfeited();
+    });
+    expect(forfeited()).toBe(true);
+    const dice = foldOf(b).rounds.find((v) => v.r === 2)!.craps!.dice!;
+    const wakes = b.croupier.tablesWakeCount();
+    const { seen, stateIn, lines } = backFrom(b, F + 10_000);
+    expect(b.croupier.tablesWakeCount()).toBe(wakes + 1);
+    expect(seen).toEqual(['betting 3', 'closing 2', 'settled 2', 'betting 3']);
+    // No flight of roll 2 on B's page: its faces, never dice in the air.
+    expect(throws(b.dice.log.slice(markB))).toEqual([]);
+    expect(b.dice.log.slice(markB).at(-1)).toBe(`land ${dice.join('')}`);
+    expect(stateIn['settled 2']).not.toBe('flying');
+    expect(lines['settled 2']?.every((l) => l !== '🎲 THE DICE ARE ROLLING…')).toBe(true);
+  });
 });
 
 // ── What became of my felt ───────────────────────────────────────────────────
@@ -1686,7 +1671,8 @@ describe('what became of my felt', () => {
     go([w], shown + STEP, shown + 3 * STEP);
     expect(tw.lines().slice(lines)).not.toContain("✋ TIME'S UP — THE STICKMAN THREW");
     expect(tw.status()).toMatch(/^● \d \+ \d = 4 — /);
-    expect(tw.card()).toContain(`DECIDED BY A FORFEIT BY ${nameOf(w)}`);
+    // (x's seed never came: the card names x.)
+    expect(tw.card()).toContain(`1 OF 2 SEEDS COUNTED · DECIDED BY A FORFEIT BY ${nameOf(w)} · NO SEED IN TIME FROM ${nameOf(x)}`);
   });
 
   it("a shooter who flung and then hid their tab reads no TIME'S UP: the wake forgets the fling, not that it was made", async () => {
@@ -1983,11 +1969,13 @@ describe("the house's switch at craps", () => {
     go([o], T0 + STEP, T0 + 2 * STEP);
     expect(to.card()).toContain('WAIT FOR A COME-OUT WITH NO COME BETS ON A NUMBER');
 
-    // Computed, the point on, A's and B's pass lines riding into roll 2.
-    const { pages, decidedAt } = await pointOn(['A', 'B'], [1, 3]);
-    const [a, b] = pages;
+    // Computed, the point on, A's and B's pass lines riding into roll 2; C
+    // at stand 5 with no bets.
+    const { pages, decidedAt } = await pointOn(['A', 'B', 'C'], [1, 3, 5], [10, 5], 2);
+    const [a, b, c] = pages;
     const ta = atCraps(a, { stand: 1, house: true });
     const tb = atCraps(b, { stand: 3 });
+    const tc = atCraps(c, { stand: 5 });
     const { T } = openRoll(pages, 2, decidedAt + STEP);
     expect(ta.card()).toContain("PLAYERS' TABLE · ON");
     expect(ta.card()).toContain('PASS LINE AND COME BETS STILL RIDE — PRESS AGAIN TO HAND THEM BACK AND SWITCH');
@@ -2009,6 +1997,9 @@ describe("the house's switch at craps", () => {
     expect(a.casino.isComputedTable(TABLE)).toBe(false);
     for (const p of pages) expect(p.casino.readChips(p.pid)).toBe(1_000);
     for (const t of [ta, tb]) expect(t.heard()).toContain(SWITCHED);
+    // (Told only to the players whose bets came back: not C, at the table
+    // with none.)
+    expect(tc.heard()).not.toContain(SWITCHED);
     // The owner-run table starts afresh on the page: the pieces reset once,
     // the computed rolls' last throw flying nowhere.
     expect(a.dice.resets()).toBe(resets + 1);
@@ -2080,6 +2071,38 @@ describe('the ⚙ card at a computed craps table', () => {
     expect(foldOf(b).rounds.find((v) => v.r === 2)).toMatchObject({ decided: 'forfeit', missing: [a.pid] });
     go(pages, decidedOnB + STEP, decidedOnB + 3 * STEP);
     expect(ta.card()).toContain(`1 OF 2 SEEDS COUNTED · DECIDED BY A FORFEIT BY ${nameOf(b)} · 1 FROZEN SLIP NEVER CAME (NEW BETS NOT STAKED)`);
+  });
+
+  it('a forfeit names the players whose seed never came, as text: four, then how many more', async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    // Five more players bet the field on roll 1, their slips written by hand
+    // (one named to break the card's markup, its name cut to 8 as names are), and none of them reveals: a
+    // forfeit decides the roll on A's and B's seeds.
+    const kit = new ComputedKit(CTX);
+    const xs = Array.from({ length: 5 }, (_, i) => testIdentity(`late-x${i}`, i === 0 ? '<i>late-x0' : `late-x${i}`));
+    for (const p of pages) {
+      p.doc.transact(() => {
+        for (const id of xs) p.doc.getMap('players').set(id.pid, { keyB64: id.pub, name: id.pid });
+      });
+    }
+    for (const id of xs) a.casino.buyInChips(id.pid, 1_000);
+    putIn(a, xs.map((id) => {
+      const s = kit.crapsSlip(id, 1, [bet('field', 1)], basisOf(EMPTY_CARRY, id.pid));
+      return [s.key, s.rec] as [string, unknown];
+    }), TABLE);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const ta = atCraps(a, { stand: 1 });
+    const at = go(pages, T0 + STEP, T0 + 120_000, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === 1 && v.decided !== null)));
+    expect(foldOf(a).rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'forfeit', counted: [a.pid, b.pid].sort() });
+    go(pages, at + STEP, at + 3 * STEP);
+    const card = ta.card();
+    expect(card).toContain('2 OF 7 SEEDS COUNTED · DECIDED BY A FORFEIT BY ');
+    expect(card).toContain(' · NO SEED IN TIME FROM &lt;I&gt;LATE-, LATE-X1, LATE-X2, LATE-X3 AND 1 MORE');
+    expect(card).not.toContain('<I>');
   });
 
   it('has the computed rules and the table as it stands, and nothing the owner sets or presses', async () => {
@@ -2227,6 +2250,38 @@ describe('rolls nobody finished or the room no longer has', () => {
     expect(back).toBeLessThan(again + 120_000);
     go(pages, back + STEP, back + 2 * STEP);
     expect(ta.status()).toBe('● 6 + 3 = 9 — ROLL AGAIN, POINT IS 6');
+  });
+
+  it("a roll this page showed at the checkpoint's roll that the checkpoint didn't keep reads UNDONE until the next roll is decided", async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    const tb = atCraps(b, { stand: 3 });
+    // Apart: A's pass rolls a 6 and A trims at it; B's pass, on a roll 1 of
+    // its own, an 8.
+    rigRoll([a], 1, 6);
+    rigRoll([b], 1, 8);
+    expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('pass', 5)], T0)).toBe('ok');
+    const da = decide([a], 1, T0 + STEP);
+    clockOf(a, da + STEP);
+    trimByHand(a, testIdentity('craps-split-at-u'), undefined, TABLE);
+    const db = decide([b], 1, T0 + STEP);
+    go([b], db + STEP, db + 2 * STEP);
+    expect(tb.status()).toMatch(/^● \d \+ \d = 8 — /);
+    // They meet: A's checkpoint at roll 1 is the only one.
+    const T = Math.max(da, db) + 3 * STEP;
+    sync(T, a, b);
+    for (const p of pages) expect([foldOf(p).base.u, foldOf(p).rounds.length, carryOf(p).p]).toEqual([1, 0, 6]);
+    expect(tb.status()).toBe('⚠ ROLL 1 UNDONE — BETS AS THE ROOM NOW HAS THEM');
+    // Roll 2 decided: the line goes.
+    const { T: T2, W } = openRoll(pages, 2, T + STEP);
+    go(pages, T2, W - STEP);
+    b.table.noteComputedFling(TABLE, 2, 9, W);
+    const d2 = decide(pages, 2, W);
+    go(pages, d2 + STEP, d2 + STEP);
+    expect(tb.status()).not.toContain('UNDONE');
   });
 
   it('bets left riding by players off the table wait: BETS RIDE until somebody bets', async () => {

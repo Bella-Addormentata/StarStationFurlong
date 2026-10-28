@@ -517,11 +517,20 @@ describe("an earlier build's operator on a computed table", () => {
     expect(b.casino.writeMyBets(TABLE, b.pid, 1, [red(10)])).toBe(true);
     // And on this build, the same player's felt on the computed table.
     expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    // And E, a player of the earlier build's with no page here (B's doc
+    // stands in for E's): its list as that build puts it down, its chips
+    // taken from its count (the bets shape: all of it taken, nothing held).
+    const E = 'player-Earlier';
+    b.doc.getMap('casino').set(`bought:${E}`, 100);
+    b.doc.getMap('casino').set(`bal:${E}`, 100 - 30);
+    b.doc.getMap('casino').set(`bets:${TABLE}:${E}`, { round: 1, bets: [black(30)] });
     sync(T0, ...pages);
     const ledger = a.casino.readCageLedger();
     for (const p of pages) {
       // Each held once: 10 on the list, 20 on the felt.
       expect(p.casino.readChips(b.pid)).toBe(970);
+      expect(p.casino.readChips(E)).toBe(70);
+      expect(p.casino.readAllBets(TABLE, 1)[E]).toEqual([black(30)]);
       expect(p.table.computedOldBuildDriving(TABLE)).toBe(true);
       expect(p.casino.isComputedTable(TABLE)).toBe(true);
       // The computed table's view is its own.
@@ -557,11 +566,13 @@ describe("an earlier build's operator on a computed table", () => {
       expect(p.casino.computedIncEnded(TABLE, cinc)).toBe(false);
       expect(sessionKeys(p)).toEqual([`ses:${TABLE}:${cinc}:g`]);
       expect(foldOf(p).felts.get(b.pid)?.rec.b).toEqual([black(20)]);
-      // The list's 10 back, the felt's 20 held: conserved.
+      // The list's 10 back, the felt's 20 held; E's 30, taken by its build,
+      // back exactly: conserved.
       expect(p.casino.readChips(b.pid)).toBe(980);
+      expect(p.casino.readChips(E)).toBe(100);
       expect(p.casino.readCageLedger()).toEqual({
-        ...ledger, outstanding: ledger.outstanding + 10, houseNet: ledger.houseNet - 10,
-        balances: { ...ledger.balances, [b.pid]: 980 },
+        ...ledger, outstanding: ledger.outstanding + 10 + 30, houseNet: ledger.houseNet - 10 - 30,
+        balances: { ...ledger.balances, [b.pid]: 980, [E]: 100 },
       });
     }
     expect(ownerRunKeys(a).filter((k) => !k.startsWith('casinoChips/'))).toEqual([]);

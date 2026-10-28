@@ -400,9 +400,12 @@ interface TableState {
    *  stamp it was built on. */
   pending: { r: number; felt: RouletteBet[] | CrapsBet[]; basis?: string } | null;
   /** The last round whose close came while a felt of this page's was held
-   *  back, and froze another (the status bar's "too late"); at craps,
-   *  whether that felt added chips over what rode in (the ⚙ card's words). */
-  lateFelt: number | null;
+   *  back, and froze another (the status bar's "too late"), with the slip
+   *  of this page's it froze ('' for none): a close of that round played
+   *  again (past a checkpoint) that froze a felt written since is not; at
+   *  craps, whether that felt added chips over what rode in (the ⚙ card's
+   *  words). */
+  lateFelt: { r: number; frozen: string } | null;
   lateAdded: boolean;
   /** This page's last slip written: round and when. */
   lastSlip: { r: number; at: number } | null;
@@ -411,11 +414,15 @@ interface TableState {
   rearm: { r: number; at: number } | null;
   /** When round r's window started on this page (windowOf), kept for the
    *  round: a version that left the session (a trim) or one counted late
-   *  doesn't move it. Gone with a re-arm and with every first-seen time. */
+   *  doesn't move it. Gone with a re-arm, with every first-seen time, and
+   *  with a checkpoint, unless it is for the round after it and this page
+   *  never saw that round closed (noteResult). */
   window: { r: number; at: number } | null;
   /** At craps: this page's own fling for round r (noteComputedFling), when
    *  and with which seed; never from the throw record. A re-show of the
-   *  roll before forgets one made before it (buildCraps). */
+   *  roll before forgets one made before it (buildCraps); a checkpoint, any
+   *  but one for the roll after it that this page never saw closed
+   *  (noteResult). */
   flung: { r: number; at: number; seed: number } | null;
   /** At craps: this page has said goodbye (leaveComputedTables), and
    *  writes no slip again until the doc is bound afresh or the page comes
@@ -433,7 +440,8 @@ interface TableState {
   tickedAt: number | null;
   reputAt: number | null;
   /** The last decided round this page saw on the chain: what the felt
-   *  shows once a trim has taken the round out of the session. */
+   *  shows once a trim has taken the round out of the session, when it is
+   *  the round the checkpoint kept (its close). */
   lastD: RoundView | null;
   lastRes: FoldResult | null;
   /** By how many chips the checkpoint that opened session `sid` differs
@@ -445,9 +453,11 @@ interface TableState {
   view: ViewEntry | null;
   /** The phase listeners were last told of, for one fold result. */
   told: { res: FoldResult; key: string } | null;
-  /** The ⚙ card's verdict, kept for a round a trim takes out of the session. */
+  /** The ⚙ card's verdict; and each one it gave in the session, by its
+   *  round's close: a trim that takes the rounds out of the session keeps
+   *  the one on the round the checkpoint kept (noteResult). */
   check: { res: FoldResult; gen: number; out: ComputedRoundCheck | null } | null;
-  lastCheck: ComputedRoundCheck | null;
+  checks: Map<string, ComputedRoundCheck>;
   /** By close hash: when this page first saw that decided round with a
    *  frozen slip missing (a trim waits MISSING_WAIT_MS for it). */
   missingAt: Map<string, number>;
@@ -592,7 +602,7 @@ function newTable(t: string, inc: string): TableState {
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
-    lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, lastCheck: null,
+    lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
@@ -669,6 +679,21 @@ function noteResult(st: TableState, res: FoldResult): void {
     const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
     const ses = computedSessionForWrite(st.t);
     letGo(st, (m, key) => m.r === u + 1 && (m.r > lastClosed || ses?.has(key) === true));
+    // So too this page's window and fling: kept for the round after the
+    // checkpoint if this page never saw it closed, else of a round the room
+    // may not have kept, whose number the chain plays again. Kept, the
+    // window would end betting on that round at once, and the fling would
+    // close it at W with no fling offered its shooter.
+    if (st.window && (st.window.r !== u + 1 || st.window.r <= lastClosed)) st.window = null;
+    if (st.flung && (st.flung.r !== u + 1 || st.flung.r <= lastClosed)) st.flung = null;
+    // The round the checkpoint kept, as this page last read it, if it did,
+    // and its verdict: what the felt and the card show through the trim,
+    // even once this page decided a round past it that the room didn't keep.
+    const kept = was.rounds.find((v) => v.decided !== null && v.r === u && v.close === res.base.l);
+    if (kept) st.lastD = kept;
+    const check = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
+    st.checks.clear();
+    if (check) st.checks.set(res.base.l!, check);
   }
   const D = lastDecided(res);
   if (D) st.lastD = D;
@@ -1158,7 +1183,12 @@ function payoutsOf(D: RoundView): Record<string, number> {
 function build(st: TableState, res: FoldResult, now: number): ViewEntry {
   const sc = scanOf(st, res);
   const chain = lastDecided(res);
-  const D = chain ?? (st.lastD && st.lastD.r === res.base.u ? st.lastD : null);
+  // (Past a trim, the round the checkpoint kept, if this page saw it: not
+  // one it saw decided at that round on the other side of a split, which
+  // the checkpoint dropped. The close is all the checkpoint names of it, so
+  // a page that hears a forfeit beat the reveals it saw only with the trim
+  // still shows the reveals' result, its card flagging the checkpoint.)
+  const D = chain ?? (st.lastD && st.lastD.r === res.base.u && st.lastD.close === res.base.l ? st.lastD : null);
   const onChain = chain !== null;
   // The ⚙ card's verdict on D while its records are in the session: a trim
   // that takes them away leaves it (roundCheck), the card opened or not.
@@ -1303,6 +1333,12 @@ export type ShooterSlip = 'gone' | 'absent' | 'none' | 'away' | 'here';
 export interface ComputedCrapsState extends CrapsTableState {
   inc: string;
   rollKey: string;
+  /** With the roll key, the record that decided its roll: the forfeit's
+   *  hash, else the close's (a void has no faces, so no key). A roll held
+   *  again for a forfeit's show that comes back on the decision whose faces
+   *  already landed (a wake shows the last roll again) flies nothing; a new
+   *  decision of it flies, even on the same faces. '' with no key. */
+  rollBy: string;
   /** Who holds the dice now (absent: the stickman's hand). */
   holder?: string;
   /** The holder was counted at their stand on the last roll that had dice:
@@ -1459,6 +1495,7 @@ function buildCraps(
     ...(phase === 'betting' && holder !== undefined ? { shooter: holder } : shooter !== undefined ? { shooter } : {}),
     inc: st.inc,
     rollKey: D && roll?.dice && !held ? `${D.r}:${roll.dice[0]}${roll.dice[1]}` : '',
+    rollBy: D && roll?.dice && !held ? D.forfeit?.hash ?? D.close : '',
     ...(holder !== undefined ? { holder } : {}),
     shooterInPlay: inPlay,
     ...(shooterSlip !== undefined ? { shooterSlip, shooterNoBet: shooterSlip === 'none' } : {}),
@@ -1603,6 +1640,12 @@ export interface ComputedRoundCheck {
    *  changes didn't apply). A slip built on a table that changed under it,
    *  or a newcomer at a full table, is no rule broken. */
   illegal?: string[];
+  /** At craps, on a roll a forfeit decided: the other bettors the close
+   *  froze whose seed didn't count (it never came, or came late), sorted. A
+   *  rider who adds nothing can hold its seed back once it has seen the
+   *  others' and have the forfeit draw again without it: the card names
+   *  them. */
+  uncounted?: string[];
   /** At craps: the roll as it went (no dice on a void), the point after it
    *  and whether it sevened out; how many players' bets rode on it with no
    *  slip of theirs frozen, so no seed of theirs in the dice; this page's
@@ -1633,6 +1676,7 @@ function crapsCheck(st: TableState, sc: Scan, res: FoldResult, D: RoundView, me:
   const mine = crapsMine(st, sc, D, me, getIdentityPub());
   return {
     illegal: [...roll.fates].filter(([, f]) => f === 'illegal').map(([pid]) => pid).sort(),
+    uncounted: D.decided === 'forfeit' ? D.present.filter((pid) => pid !== me && !D.counted.includes(pid)) : [],
     roll: { dice: roll.dice, pointBefore: roll.pointBefore, pointAfter: roll.pointAfter, sevenOut: roll.sevenOut },
     unseeded: [...roll.fates.values()].filter((f) => f === 'rider').length,
     mineLost: mine.lost,
@@ -1645,9 +1689,10 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
   const D = lastDecided(res);
   const diff = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff.chips : 0;
   if (!D) {
-    // A trim took the round out of the session: what this page said of it.
-    const kept = st.lastCheck && st.lastCheck.round === res.base.u ? st.lastCheck : null;
-    return kept ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res) } : null;
+    // A trim took the round out of the session: what this page said of it,
+    // if it is the round the checkpoint kept.
+    const kept = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
+    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res) } : null;
   }
   const sc = scanOf(st, res);
   const me = getPlayerId();
@@ -1693,7 +1738,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     ...replacedOf(st),
     ...(D.craps ? crapsCheck(st, sc, res, D, me) : {}),
   };
-  st.lastCheck = out;
+  st.checks.set(D.close, out);
   return out;
 }
 
@@ -2278,7 +2323,7 @@ function flushDuty(st: TableState, me: string, now: number): void {
     if (closed) {
       const frozen = closed.present.includes(me) ? frozenSlip(scanOf(st, res), closed, me)?.b ?? [] : [];
       if (!sameFelt(frozen, p.felt)) {
-        st.lateFelt = p.r;
+        st.lateFelt = { r: p.r, frozen: closed.frozen[me] ?? '' };
         st.lateAdded = closed.craps !== undefined && addedOver(p.felt as CrapsBet[], own(closed.craps.sIn.w, me)) > 0;
         if (st.view) st.view.mine = undefined;
       }
@@ -3494,9 +3539,13 @@ function crapsMine(st: TableState, sc: Scan, R: RoundView, me: string, pub: stri
   const C = own(roll.sIn.w, me);
   const lost = clampSafe(roll.lost.get(me) ?? 0n);
   const B = R.present.includes(me) ? frozenSlip(sc, R, me)?.b : latestOwnSlip(st, sc, R.r, me, pub)?.b;
-  const added = lost > 0 || (B !== undefined && addedOver(B as CrapsBet[], C) > 0) || (st.lateFelt === R.r && st.lateAdded);
+  const added = lost > 0 || (B !== undefined && addedOver(B as CrapsBet[], C) > 0) || (lateFor(st, R, me) && st.lateAdded);
   return { lost, added, riding: C.length > 0 };
 }
+
+/** Whether round R's close is the one a felt of this page's held back came
+ *  too late for (lateFelt): it froze the same slip of this page's. */
+const lateFor = (st: TableState, R: RoundView, me: string): boolean => st.lateFelt?.r === R.r && (R.frozen[me] ?? '') === st.lateFelt.frozen;
 
 function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
   const me = getPlayerId();
@@ -3522,8 +3571,8 @@ function mineIn(st: TableState, res: FoldResult, R: RoundView): ComputedMine {
     round: R.r,
     frozen,
     revealed: frozen && R.revealed.includes(me),
-    leftOut: !frozen && (frozenHash !== undefined || staked || st.lateFelt === R.r),
-    tooLate: frozen && (later || st.lateFelt === R.r),
+    leftOut: !frozen && (frozenHash !== undefined || staked || lateFor(st, R, me)),
+    tooLate: frozen && (later || lateFor(st, R, me)),
     ...(fate !== undefined ? { fate } : {}),
     ...(fate === 'basis' ? { undone: !rodeAsBuilt(frozenSlip(sc, R, me)) } : {}),
     ...(R.craps ? crapsMine(st, sc, R, me, pub) : {}),
@@ -3571,7 +3620,8 @@ export function noteComputedFling(t: string, round: number, seed: number, now = 
 
 /** This page's own fling at computed craps table `t` (noteComputedFling),
  *  or null: its roll and seed. A re-show of the roll before forgets one made
- *  before it (the view, built here when the table moved), as does a wake. */
+ *  before it (the view, built here when the table moved), as do a wake
+ *  and a checkpoint (noteResult). */
 export function computedFlungFor(t: string, now = Date.now()): { r: number; seed: number } | null {
   lookAtClock(now);
   const at = tableOf(t, 'craps');
@@ -3597,10 +3647,16 @@ export function computedUndoneCount(t: string): number {
 /** The last round of computed table `t`'s live chain that is decided (its
  *  checkpoint's, with none since), or null: a round this page showed decided
  *  past it is undone (a delete took what it rests on, or the room kept the
- *  other side of a split). */
+ *  other side of a split). So is one it showed decided at the checkpoint's
+ *  round that the checkpoint didn't keep (the other side of a split): the
+ *  checkpoint's round is then not counted. */
 export function computedDecidedTo(t: string): number | null {
   const at = tableOf(t);
-  return at ? lastDecided(at.res)?.r ?? at.res.base.u : null;
+  if (!at) return null;
+  const D = lastDecided(at.res);
+  if (D) return D.r;
+  const { u, l } = at.res.base;
+  return at.st.lastD && at.st.lastD.r === u && at.st.lastD.close !== l ? u - 1 : u;
 }
 
 /** 🎲 The close of roll `round` of computed craps table `t` this page saw

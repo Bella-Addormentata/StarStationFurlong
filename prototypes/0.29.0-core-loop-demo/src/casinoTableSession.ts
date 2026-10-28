@@ -257,6 +257,11 @@ interface TableRuntime {
    *  for one that showed before this page looked), and whether it got its
    *  faces or was called off. `spun` holds each roll's dice (`d1d2`). */
   flight: { r: number; at: number; done: boolean } | null;
+  /** …and by roll, the dice it handed it, the decision they came from
+   *  (rollBy) and its close, kept through a hold, which forgets them in
+   *  `spun`: the roll held again under that close flies nothing, nor does
+   *  the same decision shown again. */
+  landed: Map<number, { dice: number; by: string; close: string }>;
   /** …and the end of the show before the open roll's window, as the view
    *  last had it while that roll was open (a throw from before it doesn't
    *  play, even once the roll has settled). */
@@ -277,7 +282,7 @@ function runtime(tableId: string): TableRuntime {
   if (!rt || rt.epoch !== casinoDocEpoch()) {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
-      spun: new Map(), flight: null, openShow: null, reopened: null, dirty: true,
+      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, dirty: true,
     };
     runtimes.set(tableId, rt);
   }
@@ -675,10 +680,13 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, me: string
  * player who held the dice when it came no earlier than the end of the show
  * before the roll's window and no later than the roll's first close (one
  * update brings both alike), else the stickman's toss when the close comes.
- * The dice land on the roll key's faces (a rewrite tosses again); a flight
- * whose roll gets no faces (a void, a roll taken back to betting) is called
- * off. Primed like roulette's: what showed by the first view counted whole
- * and checked showed before this page looked, and doesn't fly.
+ * The dice land on the roll key's faces (a rewrite tosses again, and so
+ * does a new decision of the roll on the same faces; the same decision
+ * shown again flies nothing) and lie where the flight left them while the
+ * roll is on screen; a flight whose roll gets no faces (a void, a roll
+ * taken back to betting) is called off. Primed like roulette's: what
+ * showed by the first view counted whole and checked showed before this
+ * page looked, and doesn't fly.
  */
 function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readComputedCraps(id);
@@ -689,6 +697,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     rt.counted = false;
     rt.spun = new Map();
     rt.flight = null;
+    rt.landed = new Map();
     rt.openShow = null;
     rt.reopened = null;
     rt.dirty = true;
@@ -704,7 +713,8 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     // show as it was.)
     if (rt.openShow?.r !== s.round || computedCrapsClose(id, s.round) === null) rt.openShow = { r: s.round, end: s.showEnd };
     // A roll back before its result (taken back to betting, or held for a
-    // forfeit's show) has no faces yet: they travel again when they come.
+    // forfeit's show) has no faces yet: they travel again when they come,
+    // unless they come on the decision they landed for (rt.landed).
     rt.spun.delete(s.round);
   }
   // (One the clock has gone back past is another clock's, and goes: the
@@ -724,10 +734,28 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
       }
     }
   } else {
-    // (A roll showing again whose faces already landed here flies nothing:
-    // a rewrite of them tosses again below.)
+    // (A roll showing again whose faces already landed here flies nothing,
+    // nor does one held again first that comes back on the decision they
+    // landed for (a wake shows the last roll again, held for its forfeit's
+    // grace): it shows as any roll shown again does. A new decision of it
+    // flies, even on the same faces; a rewrite of them tosses again below.)
+    const was = k ? rt.landed.get(k.round) : undefined;
+    if (s.phase === 'settled' && k?.round === s.round && !rt.spun.has(k.round) && was?.dice === k.pocket && was.by === s.rollBy) {
+      rt.spun.set(k.round, k.pocket);
+      if (rt.flight?.r !== k.round && h.diceState() === 'rest') {
+        // Another roll's dice since, come down: its faces turn where they
+        // lie. (Ones still in the air are called off below.)
+        h.diceLand(diceOfKey(k.pocket));
+        rt.flight = { r: k.round, at: -Infinity, done: true };
+      }
+    }
     const landed = s.phase === 'settled' && k?.round === s.round && rt.spun.has(s.round);
-    if ((s.phase === 'closing' || s.phase === 'settled') && rt.flight?.r !== s.round && !landed) {
+    // (Nor while one is held again under the close its faces landed here
+    // for, as for a forfeit's grace: its dice lie as they came down, and a
+    // new decision of it tosses again when it shows, below.)
+    const kept = rt.landed.get(s.round);
+    const heldAgain = s.phase === 'closing' && kept !== undefined && kept.close === computedCrapsClose(id, s.round)?.hash;
+    if ((s.phase === 'closing' || s.phase === 'settled') && rt.flight?.r !== s.round && !landed && !heldAgain) {
       const close = computedCrapsClose(id, s.round);
       const thr = readDiceThrow(id);
       const by = s.phase === 'settled' ? s.holderBefore : s.holder;
@@ -778,6 +806,16 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
       }
     }
   }
+  if (k && rt.spun.get(k.round) === k.pocket) {
+    // Which decision the roll's faces came from (a rival one on the same
+    // faces moves nothing, and takes its place).
+    const was = rt.landed.get(k.round);
+    if (was?.dice !== k.pocket || was.by !== s.rollBy) {
+      rt.landed.delete(k.round);
+      rt.landed.set(k.round, { dice: k.pocket, by: s.rollBy, close: computedCrapsClose(id, k.round)?.hash ?? '' });
+      if (rt.landed.size > SHOWN_ROUNDS) rt.landed.delete(rt.landed.keys().next().value as number);
+    }
+  }
   if (rt.flight && s.phase === 'betting' && rt.flight.r === s.round) {
     // Taken back to betting (a re-arm): no faces for the flight, and the
     // roll flies again once it closes again (from no throw seen by the
@@ -797,7 +835,10 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   if (!animating) {
     h.setPuck(s.point);
-    if (s.phase !== 'settled' && !localHold.has(id)) {
+    // (Not while the roll on screen has had its flight here: the dice lie
+    // where it left them, through a forfeit's wait for the faces, which
+    // turn there when they come, and through a hold of the roll again.)
+    if (s.phase !== 'settled' && !localHold.has(id) && rt.flight?.r !== s.round) {
       const seat = s.phase === 'closing' && s.shooter !== undefined ? readSeat(id, s.shooter) : null;
       const stand = seat ? standLocal('craps-table', seat.stand) : null;
       h.diceRestAt(stand ? diceSpotFor(stand, CRAPS_LAYOUT.felt) : STICKMAN_DICE_SPOT);
@@ -2311,6 +2352,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         // into the card's markup escaped, as text.)
         parts.push(c.decided === 'reveals' ? 'DECIDED BY ALL REVEALS'
           : `DECIDED BY A FORFEIT BY ${c.forfeitBy ? escapeHtml(readPlayerDisplayName(c.forfeitBy).toUpperCase()) : 'A KEY THIS PAGE DOESN\'T KNOW'}`);
+        // (Who held a seed back: a rider can take a second look at the dice
+        // that way, at no cost.)
+        const late = craps ? c.uncounted ?? [] : [];
+        if (late.length > 0) {
+          const named = late.slice(0, LEAVE_LIST_MAX).map((pid) => escapeHtml(readPlayerDisplayName(pid).toUpperCase()));
+          const more = late.length > LEAVE_LIST_MAX ? ` AND ${late.length - LEAVE_LIST_MAX} MORE` : '';
+          parts.push(`NO SEED IN TIME FROM ${named.join(', ')}${more}`);
+        }
       }
       if (c.missing.length > 0) {
         parts.push(`${many(c.missing.length, 'FROZEN SLIP', 'FROZEN SLIPS')} NEVER CAME (${craps ? 'NEW BETS NOT STAKED' : 'NOT STAKED'})`);

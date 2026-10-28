@@ -578,6 +578,45 @@ describe('the status line and notices', () => {
     t.unmount();
   });
 
+  it("TOO LATE goes with the close it came too late for: the round played again past a checkpoint before it, a close that froze my felt since isn't", () => {
+    switchOn(a);
+    at(a, T0);
+    const t = atTable(a);
+    // Round 1, Bob's alone, decided.
+    const bob1 = kit.slip(BOB, 1, [red(10)]);
+    put(a, T0 + 500, bob1);
+    wait(a, T0 + 500, T0 + 19_000, t);
+    const close1 = kit.close(BOB, 1, SID, [bob1]);
+    put(a, T0 + 19_000, close1, kit.reveal(1, BOB.pid));
+    const T2 = T0 + 30_000;
+    wait(a, T0 + 19_000, T2, t);
+    // Round 2: my felt goes, a change to it waits to go, and Bob's close
+    // freezes the first; the flush finds the round closed.
+    expect(a.table.writeComputedSlip(TABLE, [red(5)], T2)).toBe('ok');
+    at(a, T2 + 100);
+    expect(a.table.writeComputedSlip(TABLE, [red(5), black(5)], T2 + 100)).toBe('ok');
+    expect(mySlips(a, 2)).toHaveLength(1);
+    const bob2 = kit.slip(BOB, 2, [red(10)]);
+    put(a, T2 + 200, bob2, kit.close(BOB, 2, close1.hash, [bob2, myNewest(a, 2)]));
+    a.table.tickComputedTables([TABLE], T2 + 200);
+    t.update();
+    expect(t.status()).toBe('✋ TOO LATE — THE CLOSE HAD YOUR EARLIER BETS');
+    // A checkpoint at round 1 from a page that never heard of that close:
+    // round 2 is open again. My felt goes again, and a close freezes it.
+    const sid = trimByHand(a, BOB);
+    expect(foldOf(a).base.u).toBe(1);
+    expect(foldOf(a).tip).toBeNull();
+    const T3 = T2 + 2_000;
+    at(a, T3);
+    expect(a.table.writeComputedSlip(TABLE, [black(20)], T3)).toBe('ok');
+    const mine = myNewest(a, 2);
+    expect(mine.rec.b).toEqual([black(20)]);
+    put(a, T3 + 600, kit.close(BOB, 2, sid, { [BOB.pid]: foldOf(a).felts.get(BOB.pid)!.hash, [a.pid]: mine.hash }));
+    t.update();
+    expect(t.status()).toBe('✋ NO MORE BETS — STAY UNTIL THE SPIN');
+    t.unmount();
+  });
+
   it('MISSED THE CLOSE when the close left my felt out, and the result line says so', () => {
     switchOn(a);
     at(a, T0);
@@ -1216,9 +1255,17 @@ describe("the ⚙ card's replaced flag", () => {
     // Read (noted), but no check asked for, before the trim lands.
     expect(a.table.computedDecidedTo(TABLE)).toBe(1);
     at(a, T0 + 19_600);
-    trimByHand(a, W);
+    const sid = trimByHand(a, W);
     expect(foldOf(a).rounds).toEqual([]);
-    expect(a.table.computedRoundCheck(TABLE, T0 + 19_600)).toMatchObject({ round: 1, replaced: 1 });
+    // The only verdict this page has is on L's close (1 seed of 1), not the
+    // one the checkpoint kept (W's, 2 of 2): no card for round 1…
+    expect(a.table.computedRoundCheck(TABLE, T0 + 19_600)).toBeNull();
+    // …and the flag on the next round's.
+    const s2 = kit.slip(W, 2, [red(10)]);
+    put(a, T0 + 20_000, s2);
+    wait(a, T0 + 20_000, T0 + 39_000);
+    put(a, T0 + 39_000, kit.close(W, 2, sid, [s2]), kit.reveal(2, W.pid));
+    expect(a.table.computedRoundCheck(TABLE, T0 + 39_000)).toMatchObject({ round: 2, replaced: 1 });
   });
 });
 

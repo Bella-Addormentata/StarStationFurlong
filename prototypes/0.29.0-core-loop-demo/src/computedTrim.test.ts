@@ -752,6 +752,83 @@ describe('races', () => {
     for (const { r, c } of commits) expect(b.fair.seedFor(c, seedCtx(b, r))).toBeNull();
   });
 
+  it("a split where one side trimmed at the round the other side played as its own: that side's felt shows none of its round there, and its card no verdict on it", async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    // Apart: A plays round 1 and trims at it; B plays only a round 1 of its own.
+    const ra = decideRound([a], T0, [[straight(3, 10)]]);
+    const ta = run([a], ra.at + STEP, T0 + 200_000, { step: STEP, until: () => trimmedTo(a, 1) });
+    const r1 = playRound([b], T0 + 30_000, [[black(20)]]);
+    expect(trimmedTo(b, 1)).toBe(false);
+    const own = foldOf(b).rounds[0].close;
+    const T = Math.max(ta, r1.openAt) + 1_000;
+    const shown = viewOf(a, T)!.spinKey;
+    expect(shown).toMatch(/^1:\d+$/);
+    expect(viewOf(b, T)!.spinKey).toMatch(/^1:\d+$/);
+    expect(b.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1 });
+    // They meet: A's checkpoint at round 1 is the only one, and B's round 1
+    // is gone with the session B played it in.
+    sync(T, a, b);
+    for (const p of pages) expect([foldOf(p).base.u, foldOf(p).base.l, foldOf(p).rounds.length]).toEqual([1, foldOf(a).base.l, 0]);
+    expect(foldOf(b).base.l).not.toBe(own);
+    // A's felt shows its round 1 through the trim, its card its verdict; B
+    // never saw that round 1, and shows none of it, as of a dropped round
+    // past the checkpoint (above).
+    expect(viewOf(a, T)!.spinKey).toBe(shown);
+    expect(a.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1 });
+    expect(viewOf(b, T)).toMatchObject({ phase: 'betting', round: 2, result: null, spinKey: '' });
+    expect(b.table.computedRoundCheck(TABLE, T)).toBeNull();
+  });
+
+  it("a split where one side trimmed at a round both sides saw decided, the other playing a round past it as its own: that side's felt shows the round the checkpoint kept again, and its card its verdict", async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    // Together: round 1, its result and verdict read on both pages.
+    const { openAt } = playRound(pages, T0);
+    const r1 = foldOf(a).rounds[0];
+    const shown = viewOf(a, openAt)!.spinKey;
+    expect(shown).toBe(`1:${r1.pocket}`);
+    expect(a.table.computedRoundCheck(TABLE, openAt)).toMatchObject({ round: 1, decided: 'reveals' });
+    // Apart: B trims at round 1; A plays a round 2 of its own.
+    weigh(b, b.table.TRIM_BYTES);
+    const tb = run([b], openAt + STEP, openAt + 60_000, { step: STEP, until: () => trimmedTo(b, 1) });
+    expect(tb).toBeLessThan(openAt + 60_000);
+    const r2 = playRound([a], openAt, [[red(7)]]);
+    expect(trimmedTo(a, 1)).toBe(false);
+    expect(viewOf(a, r2.openAt)!.spinKey).toMatch(/^2:\d+$/);
+    // They meet: B's checkpoint at round 1, under the close A saw decide
+    // it, is the only one, and A's round 2 is gone with its session.
+    const T = Math.max(tb, r2.openAt) + 1_000;
+    sync(T, a, b);
+    expect(foldOf(a).base).toMatchObject({ u: 1, l: r1.close });
+    expect(foldOf(a).rounds).toEqual([]);
+    expect(a.table.computedDecidedTo(TABLE)).toBe(1);
+    // A shows round 1 again through the trim, as B does, and its verdict.
+    expect(viewOf(a, T)).toMatchObject({ round: 2, spinKey: shown });
+    expect(a.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1, decided: 'reveals' });
+  });
+
+  it('a split where one side trimmed before the round the other side played past it: that side gives the round on the chain a full window of its own', async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    // Apart: A plays round 1 and trims at it; B plays rounds 1 and 2 of its
+    // own, its window for round 2 long run out, and runs on with nothing on round 3.
+    const ra = decideRound([a], T0, [[straight(3, 10)]]);
+    const ta = run([a], ra.at + STEP, T0 + 200_000, { step: STEP, until: () => trimmedTo(a, 1) });
+    const r1 = playRound([b], T0, [[black(20)]]);
+    const r2 = playRound([b], r1.openAt, [[red(15)]]);
+    const T = Math.max(ta, r2.openAt) + 20_000;
+    run([b], r2.openAt + STEP, T - STEP, { step: STEP });
+    // A bets on its round 2 just before they meet.
+    run([a], ta + STEP, T - 1_000, { step: STEP });
+    expect(a.table.writeComputedSlip(TABLE, [red(6)], T - 1_000)).toBe('ok');
+    sync(T, a, b);
+    for (const p of pages) expect([foldOf(p).base.u, foldOf(p).rounds.length]).toEqual([1, 0]);
+    // B first saw a chip on the chain's round 2 now: its window starts now,
+    // not when B's own round 2 took its first chip.
+    expect(viewOf(b, T)).toMatchObject({ phase: 'betting', round: 2, phaseDeadline: T + b.table.BET_WINDOW_MS });
+  });
+
   it('a commitment out is never frozen again across a trim: the trim leaves it behind, and its player puts the felt back under a fresh seed', async () => {
     const pages = await room(['A', 'B', 'W']);
     const { openAt } = playRound(pages, T0);

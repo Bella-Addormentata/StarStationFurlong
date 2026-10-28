@@ -193,12 +193,24 @@ describe('the stickman at a computed craps table', () => {
     }));
     expect(b.casino.readAllCrapsBets(C)[b.pid]).toEqual([bet('pass', 10)]);
     expect(b.casino.writeMyCrapsBets(C, b.pid, [bet('pass', 10), bet('place', 6, 8)])).toBe(true);
+    // And E, a player of the earlier build's with no page here (B's doc
+    // stands in for E's): its list as that build puts it down
+    // (tableIncarnation's earlierCraps), its chips taken from its count (the
+    // bets shape: all of it taken, nothing held).
+    const E = 'player-Earlier';
+    b.doc.getMap('casino').set(`bought:${E}`, 100);
+    b.doc.getMap('casino').set(`bal:${E}`, 100 - 12);
+    b.doc.getMap('casino').set(`bets:${C}:${E}`, { kind: 'craps', bets: [bet('place', 12, 6)] });
     const legacyInc = stateOf(b)!.inc!;
     expect(legacyInc).toMatch(/^[0-9a-f]{24}$/);
     sync(T0 + 10_000, ...pages);
     const legacy = stateOf(a);
     expect(legacy).toMatchObject({ phase: 'betting', round: 2, point: 4, inc: legacyInc });
-    for (const p of pages) expect(chipsOf(p, a, b)).toEqual([990, 989]);
+    for (const p of pages) {
+      expect(chipsOf(p, a, b)).toEqual([990, 989]);
+      expect(p.casino.readChips(E)).toBe(88);
+      expect(p.casino.readAllCrapsBets(C)[E]).toEqual([bet('place', 12, 6)]);
+    }
     const ledger = a.casino.readCageLedger();
     // (A's page framing all the while: no wake.)
     const from = T0 + 10_000;
@@ -225,11 +237,13 @@ describe('the stickman at a computed craps table', () => {
       expect(p.casino.isComputedFor(C, 'craps')).toBe(true);
       expect(sessionKeys(p)).toEqual([`ses:${C}:${cinc}:g`]);
       expect(p.casino.computedFoldOf(C)!.felts.get(a.pid)?.rec.b).toEqual([bet('pass', 10)]);
-      // B's pass (riding) and place back, the field's win kept; A's felt held.
+      // B's pass (riding) and place back, the field's win kept; A's felt
+      // held; E's 12, taken by its build, back exactly.
       expect(chipsOf(p, a, b)).toEqual([990, 1_005]);
+      expect(p.casino.readChips(E)).toBe(100);
       expect(p.casino.readCageLedger()).toEqual({
-        ...ledger, outstanding: ledger.outstanding + 16, houseNet: ledger.houseNet - 16,
-        balances: { ...ledger.balances, [b.pid]: 1_005 },
+        ...ledger, outstanding: ledger.outstanding + 16 + 12, houseNet: ledger.houseNet - 16 - 12,
+        balances: { ...ledger.balances, [b.pid]: 1_005, [E]: 100 },
       });
     }
     expect(ownerRunKeys(a).filter((k) => !k.startsWith('casinoChips/'))).toEqual([]);

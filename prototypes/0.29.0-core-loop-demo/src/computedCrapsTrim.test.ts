@@ -5,7 +5,8 @@
  * byte with the stamps they were built on, every page keeps the window it
  * had, and nobody's chips move. A seven-out once the hand has run long is a
  * trim of its own, and a checkpoint that hands on another table than the
- * one a page played shows on that page's ⚙ card.
+ * one a page played shows on that page's ⚙ card; one at a roll the page
+ * played otherwise shows no roll there, and waits for a fling of its own.
  *
  * Each page is its own load of the casino modules with its own Y.Doc,
  * player id and identity key (computedPageKit), synced by hand, every clock
@@ -385,5 +386,116 @@ describe('a checkpoint handing on another table', () => {
         expect(p.table.computedRoundCheck(TABLE, T), what).toMatchObject({ round: 1, checkpointDiff: diff });
       }
     }
+  });
+
+  it('at a roll another page played as its own on the other side of a split: that page shows no roll there, and its card no verdict on its own', async () => {
+    const pages = await openCrapsRoom(['A', 'B'], T0);
+    const [a, b] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    // Apart: A's pass rolls a 6 and A trims at it; B's pass, on a roll 1 of
+    // its own, an 8.
+    rigRoll([a], 1, 6);
+    rigRoll([b], 1, 8);
+    expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('pass', 5)], T0)).toBe('ok');
+    const da = decide([a], 1, T0 + STEP);
+    weigh(a);
+    const ta = go([a], da + STEP, da + 60_000, () => trimmedTo(a, 1));
+    expect(ta).toBeLessThan(da + 60_000);
+    const db = decide([b], 1, T0 + STEP);
+    expect(trimmedTo(b, 1)).toBe(false);
+    const own = roundOf(b, 1).close;
+    const T = Math.max(ta, db) + 10_000;
+    const sum = (key: string): number => [...key.slice(key.indexOf(':') + 1)].reduce((n, d) => n + Number(d), 0);
+    const shown = crapsOf(a, T)!.rollKey;
+    expect(sum(shown)).toBe(6);
+    expect(crapsOf(b, T)).toMatchObject({ phase: 'betting', round: 2, point: 8 });
+    expect(sum(crapsOf(b, T)!.rollKey)).toBe(8);
+    expect(b.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1, roll: { pointAfter: 8 } });
+    // They meet: A's checkpoint at roll 1 is the only one, and B's roll 1 is
+    // gone with the session B played it in.
+    sync(T, a, b);
+    for (const p of pages) {
+      expect([foldOf(p).base.u, foldOf(p).base.l, foldOf(p).rounds.length]).toEqual([1, foldOf(a).base.l, 0]);
+      expect(carryOf(p).p).toBe(6);
+    }
+    expect(foldOf(b).base.l).not.toBe(own);
+    // A shows its roll 1 through the trim, its card its verdict; B never saw
+    // that roll 1, and shows no roll and no verdict, not its own.
+    expect(crapsOf(a, T)!.rollKey).toBe(shown);
+    expect(a.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1, roll: { pointAfter: 6 } });
+    expect(crapsOf(b, T)).toMatchObject({ phase: 'betting', round: 2, point: 6, dice: null, result: null, rollKey: '', rollBy: '' });
+    expect(b.table.computedRoundCheck(TABLE, T)).toBeNull();
+  });
+
+  it('at a roll both sides saw decided, the other side playing a roll past it as its own: that side shows the roll the checkpoint kept again, and its card its verdict', async () => {
+    const pages = await openCrapsRoom(['A', 'B'], T0);
+    const [a, b] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    // Together: roll 1 a 6, the point on.
+    rigRoll(pages, 1, 6);
+    expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('pass', 5)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const d1 = decide(pages, 1, T0 + STEP);
+    const close1 = roundOf(a, 1).close;
+    const T1 = d1 + 10_000;
+    go(pages, d1 + STEP, T1);
+    const sum = (key: string): number => [...key.slice(key.indexOf(':') + 1)].reduce((n, d) => n + Number(d), 0);
+    const shown = crapsOf(a, T1)!.rollKey;
+    expect(sum(shown)).toBe(6);
+    expect(a.table.computedRoundCheck(TABLE, T1)).toMatchObject({ round: 1, roll: { pointAfter: 6 } });
+    // Apart: B trims at roll 1; A plays a roll 2 alone.
+    weigh(b);
+    const tb = go([b], T1 + STEP, T1 + 60_000, () => trimmedTo(b, 1));
+    expect(tb).toBeLessThan(T1 + 60_000);
+    expect(crapsBet(a, [bet('pass', 10), bet('field', 5)], T1 + STEP)).toBe('ok');
+    const d2 = decide([a], 2, T1 + 2 * STEP, T1 + 90_000);
+    expect(trimmedTo(a, 1)).toBe(false);
+    const T = Math.max(tb, d2) + 10_000;
+    go([a], d2 + STEP, T - STEP);
+    expect(crapsOf(a, T)!.rollKey).toMatch(/^2:\d\d$/);
+    // They meet: B's checkpoint at roll 1, under the close A saw decide it,
+    // is the only one, and A's roll 2 is gone with its session.
+    sync(T, a, b);
+    expect(foldOf(a).base).toMatchObject({ u: 1, l: close1 });
+    expect(foldOf(a).rounds).toEqual([]);
+    expect(carryOf(a).p).toBe(6);
+    expect(a.table.computedDecidedTo(TABLE)).toBe(1);
+    // A shows roll 1 again through the trim, as B does, and its verdict.
+    expect(crapsOf(a, T)).toMatchObject({ round: 2, point: 6, rollKey: shown, rollBy: close1 });
+    expect(a.table.computedRoundCheck(TABLE, T)).toMatchObject({ round: 1, roll: { pointAfter: 6 } });
+  });
+
+  it('at a roll the shooter flung and closed on the other side of a split: the roll on the chain waits for a fling of its own', async () => {
+    const { pages, decidedAt } = await crapsPointOn(['A', 'B', 'C'], [1, 3, 5], T0);
+    const [a, b, c] = pages;
+    // Apart: A trims at roll 1; B, with the dice, and C play roll 2, B
+    // flinging and closing it, C's seed not in yet.
+    weigh(a);
+    const ta = go([a], decidedAt + STEP, decidedAt + 60_000, () => trimmedTo(a, 1));
+    expect(ta).toBeLessThan(decidedAt + 60_000);
+    const opened = go([b, c], decidedAt + STEP, decidedAt + 30_000, () => [b, c].every((p) => crapsOf(p)?.phaseDeadline !== undefined));
+    const W = crapsOf(b)!.phaseDeadline!;
+    go([b, c], opened + STEP, W + 1_000);
+    b.table.noteComputedFling(TABLE, 2, 9, W + 1_050);
+    const closed = go([b], W + 1_000 + STEP, W + 3_000, () => keysIn(b, 'c', 2, TABLE).length > 0);
+    expect(roundOf(b, 2).decided).toBeNull();
+    expect(b.table.computedFlungFor(TABLE, closed)).toEqual({ r: 2, seed: 9 });
+    // They meet: A's checkpoint at roll 1 is the only one, and B's roll 2 is
+    // gone with the session B played it in. B's fling was for that roll.
+    const T = closed + STEP;
+    sync(T, ...pages);
+    for (const p of pages) expect([foldOf(p).base.u, foldOf(p).rounds.length, carryOf(p).h]).toEqual([1, 0, b.pid]);
+    expect(b.table.computedFlungFor(TABLE, T)).toBeNull();
+    // Nobody closes the chain's roll 2 at the end of its betting: B's page
+    // offers the fling, and the others wait for it.
+    const reopened = go(pages, T + STEP, T + 30_000, () => crapsOf(b)?.phase === 'betting' && crapsOf(b)?.phaseDeadline !== undefined);
+    const W2 = crapsOf(b)!.phaseDeadline!;
+    go(pages, reopened + STEP, W2 + 3_000);
+    expect(keysIn(a, 'c', 2, TABLE)).toEqual([]);
+    expect(crapsOf(b, W2 + 3_000)).toMatchObject({ phase: 'closing', round: 2, shooter: b.pid, shooterSlip: 'here' });
   });
 });
