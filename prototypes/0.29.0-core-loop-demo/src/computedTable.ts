@@ -159,6 +159,7 @@ import {
   computedSeenAt,
   computedSessionForWrite,
   computedSettled,
+  computedSwitchLost,
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
   finalizeComputed,
@@ -195,7 +196,7 @@ import {
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
 import {
-  BET_WINDOW_MS, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
+  BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
 } from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
@@ -3315,13 +3316,10 @@ export function setComputedTablesEnabledForTests(on: boolean | null): void {
   enabledForTests = on;
 }
 
-/** The dev flag: may this page's house switch a table to computed, and
- *  does its driving page switch the room's tables on by itself
- *  (autoSwitchComputed)? On unless turned off: `localStorage['ssf-dev-computed']
- *  = '0'` or `?computed=0` on the page's address (the address first; `1`
- *  turns it on in either). It gates only who may switch: a table switched
- *  already runs on every page of this build, flag or not. */
-export function computedTablesEnabled(): boolean {
+/** The dev flag as this page's address or storage sets it: `?computed=1`
+ *  or `localStorage['ssf-dev-computed'] = '1'` on, `0` off (the address
+ *  first), null where neither says (or a spec's setting). */
+function devFlag(): boolean | null {
   if (enabledForTests !== null) return enabledForTests;
   try {
     const search = typeof window !== 'undefined' ? window.location?.search : undefined;
@@ -3331,11 +3329,22 @@ export function computedTablesEnabled(): boolean {
     /* no address to read */
   }
   try {
-    if (typeof localStorage !== 'undefined' && localStorage.getItem('ssf-dev-computed') === '0') return false;
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem('ssf-dev-computed') : null;
+    if (v === '0' || v === '1') return v === '1';
   } catch {
     /* storage blocked: no flag there */
   }
-  return true;
+  return null;
+}
+
+/** The dev flag: may this page's house switch a table to computed, and
+ *  does its driving page switch the room's tables on by itself
+ *  (autoSwitchComputed)? On unless turned off (devFlag: `0`). It gates only
+ *  who may switch: a table switched already runs on every page of this
+ *  build, flag or not. In a venture room the ⚙ card offers the way on only
+ *  with the flag turned on by hand (computedSwitchState). */
+export function computedTablesEnabled(): boolean {
+  return devFlag() ?? true;
 }
 
 /** How often the driving page tries a table's switch by itself, at most. */
@@ -3348,16 +3357,28 @@ const autoTriedAt = new Map<string, number>();
  * itself, as the ⚙ card's RUN WITHOUT THE OWNER would, once the switch may
  * go (switchComputedOn's own refusals: a round under way, a point on or a
  * come bet on a number, an earlier build driving the room, a page asleep or
- * not whole). Not with the dev flag off, and not at a table the house
- * switched back (ownerRunChosen). At most every AUTO_SWITCH_MS a table.
- * True when it switched the table on.
+ * not whole, a computed incarnation's switch taken away). Not with the dev
+ * flag off, not at a table the house switched back (ownerRunChosen), and
+ * not while a settled round's result shows: the switch goes where the
+ * robot would open the next window (its deadline passed), so the wheel's
+ * ball lands and the dice stop on every page first. At most every
+ * AUTO_SWITCH_MS a table. True when it switched the table on.
  */
 export function autoSwitchComputed(t: string, game: GameName, now = Date.now()): boolean {
+  if (!computedTablesEnabled() || isComputedTable(t) || ownerRunChosen(t) || resultShowing(t, game, now)) return false;
   const at = autoTriedAt.get(t);
   if (at !== undefined && now >= at && now - at < AUTO_SWITCH_MS) return false;
   autoTriedAt.set(t, now);
-  if (!computedTablesEnabled() || isComputedTable(t) || ownerRunChosen(t)) return false;
   return switchComputedOn(t, game, now) === 'ok';
+}
+
+/** Whether owner-run table t shows a settled round's result still: until
+ *  the deadline the robot opens the next window at (croupier
+ *  tickAutoCroupier, crapsCroupier tickAutoStickman: the robot arms it on
+ *  this page's clock first, timerOnThisClock). */
+function resultShowing(t: string, game: GameName, now: number): boolean {
+  const s = game === 'craps' ? readCrapsTableState(t) : readTableState(t);
+  return s?.phase === 'settled' && !(s.phaseDeadline != null && now >= s.phaseDeadline);
 }
 
 /** Why the house's switch can't go now: this page asleep or waiting out a
@@ -3423,13 +3444,18 @@ function switchGate(t: string, now: number): ComputedSwitchRefusal | null {
  *  settle in flight; 'contract' for a point on), with no come bet on a
  *  number on any felt; the bets on it go back. Not where the table's records
  *  are the other game's, nor while a build older than the game's least
- *  drives the room's tables. */
+ *  drives the room's tables, nor while a computed incarnation of the table
+ *  is live with its switch taken away ('reconnecting': it comes back). */
 function onRefusal(t: string, game: GameName, now: number): ComputedSwitchRefusal | null {
   if (game === 'roulette' ? readCrapsTableState(t) !== null : readTableState(t) !== null) return 'craps';
   const inc = computedIncOf(t);
   if (inc !== null && isComputedTable(t) && gameOfInc(inc) !== game) return 'craps';
   const gate = switchGate(t, now);
   if (gate) return gate;
+  // (A computed incarnation still live whose switch a peer took away: a
+  // page that ran it puts it back by its next frame, putSwitchBack. A
+  // switch-on now would end that incarnation, its open round void.)
+  if (computedSwitchLost(t)) return 'reconnecting';
   if (leaseIsOldBuild(now, COMPUTED_MIN_BUILD[game])) return 'old-build';
   if (game === 'craps') {
     const c = readCrapsTableState(t);
@@ -3583,12 +3609,17 @@ export interface ComputedSwitchState {
  *  switch is on, whoever wrote it, and a peer can write one (a forgery
  *  naming nothing the doc holds: the robot stands down, and no felt goes
  *  down); a house without the flag, shown no row, could only take the table
- *  out of the room and put it back. */
+ *  out of the room and put it back. In a venture room (every shareholder the
+ *  house, no page driving the tables: canRunCroupier) the way on shows only
+ *  with the flag turned on by hand: no table lease is written there, so an
+ *  earlier build's shareholder driving the tables by hand can't be told
+ *  (leaseIsOldBuild), and would go on opening owner-run rounds on the
+ *  table. */
 export function computedSwitchState(t: string, game: 'craps' | 'roulette', house: boolean, now = Date.now()): ComputedSwitchState {
   // (Under any game's name: a name for the other game, forged or a peer's,
   // is the house's to take away too.)
   const on = isComputedTable(t);
-  const show = house && (on || computedTablesEnabled());
+  const show = house && (on || (canRunCroupier() ? computedTablesEnabled() : devFlag() === true));
   if (!show) return { show, on, can: false };
   lookAtClock(now);
   const refused = on ? offRefusal(t, now) : onRefusal(t, game, now);
