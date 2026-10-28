@@ -1955,6 +1955,46 @@ describe('what became of my felt', () => {
     expect(myFelt(w, 2)).not.toContainEqual(bet('field', 10));
   });
 
+  it("a change that went in, the roll before rewritten under it, and the page gone into the back-forward cache while that roll shows again: THE LAST ROLL CHANGED — YOUR CHANGES WERE UNDONE once it is back, not as it goes", async () => {
+    const UNDONE = 'THE LAST ROLL CHANGED — YOUR CHANGES WERE UNDONE · PLACE THEM AGAIN';
+    const pages = await room(['A', 'B']);
+    standAt(pages[0], 1);
+    standAt(pages[1], 3);
+    // As above: both seeds a natural 7; w's alone a 6.
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX) as UIPage[];
+    rigSplit(pages, 1, 7, w, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(0);
+    const tw = atCraps(w, { stand: w === pages[0] ? 1 : 3 });
+    atCraps(x, { stand: x === pages[0] ? 1 : 3 });
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    go(pages, decidedAt + STEP, showEnd + 1_000);
+    // Roll 2: w's field bet goes in.
+    const T = showEnd + 1_000 + STEP;
+    clockOf(w, T);
+    tw.pick('2', 2);
+    tw.click('field');
+    expect(myFelt(w, 2)).toEqual([bet('field', 10)]);
+    // The rewrite: roll 1 a 6, w's pass of roll 1 riding on it in the field
+    // bet's place; roll 1 shows again.
+    clockOf(w, T + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: foldOf(w).rounds[0].close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    go(pages, T + STEP, T + STEP);
+    expect(crapsOf(w, T + STEP)).toMatchObject({ phase: 'settled', round: 1 });
+    expect(tw.heard()).not.toContain(UNDONE);
+    // Off to another page: the goodbye goes as the riding bets, and nothing
+    // is said on a page going out of sight.
+    clockOf(w, T + 2 * STEP);
+    w.table.leaveComputedTables(T + 2 * STEP);
+    expect(tw.heard()).not.toContain(UNDONE);
+    // Back: said once.
+    w.table.backAtComputedTables();
+    go(pages, T + 3 * STEP, T + 3_000);
+    expect(tw.heard().filter((s) => s === UNDONE)).toHaveLength(1);
+  });
+
   it('an earlier roll changed under a later one: whose later bets came back, and that the rolls after it paid again on the same dice', async () => {
     const pages = await room(['A', 'B', 'C']);
     const [w, x, y] = byRank(pages.slice(0, 2), 'forfeit', 1, CTX).concat([pages[2]]) as UIPage[];

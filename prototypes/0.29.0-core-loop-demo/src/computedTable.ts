@@ -436,11 +436,14 @@ interface TableState {
    *  this page took for its player (held or written, or a goodbye's felt put
    *  back, or a version this page didn't write taken on as its own),
    *  `changesTold` what `changes` was at the last notice; `toldOver` the
-   *  versions this page didn't write that it has told of (→ their round). */
+   *  versions this page didn't write that it has told of or taken on (→
+   *  their round); `undoneAway` a notice due once this page is back (it
+   *  came as the page left). */
   undone: number;
   changes: number;
   changesTold: number;
   toldOver: Map<string, number>;
+  undoneAway: boolean;
   /** At craps: what each decided roll on the chain came to as this page
    *  last saw it, and whether this page's player's slip on it was built on
    *  another state; and the last earlier roll this page saw change
@@ -609,7 +612,7 @@ function newTable(t: string, inc: string): TableState {
   return {
     t, inc, ctx, game: gameOfInc(inc), slipOf: asSlipFor(ctx), keyOf: slipKeyFor(ctx),
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
-    pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(),
+    pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, checks: new Map(),
@@ -2333,8 +2336,23 @@ function noteUndone(st: TableState, o: number, theirs?: string): void {
   if (st.changes <= st.changesTold && !other) return;
   if (other) st.toldOver.set(theirs, o);
   st.changesTold = st.changes;
+  // (One that comes as the page leaves is said once it is back: said now,
+  // it would flash on a page going into the back-forward cache.)
+  if (st.left) {
+    st.undoneAway = true;
+    return;
+  }
   st.undone += 1;
   notifyCasinoView(st.t);
+}
+
+/** 🎲 A version of the player's on round o taken on as this page's own (put
+ *  back from a goodbye, or written again): its changes are the player's from
+ *  here, for the table's notice (noteUndone), and a version this page didn't
+ *  write (`theirs`, its key) is told of by them, not again on its own. */
+function tookOn(st: TableState, o: number, theirs?: string): void {
+  st.changes += 1;
+  if (theirs !== undefined) st.toldOver.set(theirs, o);
 }
 
 /** 1. Write the felt the coalescing held back, once COALESCE_MS have passed
@@ -2433,7 +2451,7 @@ function rideDuty(st: TableState, me: string, now: number): void {
     // its changes undone: noteUndone.)
     const theirs = st.mine.has(latest!.key) ? undefined : latest!.key;
     if (!writeSlip(st, res, o, rec.o === basis ? rec.b : C, false, now, { o: basis, t: stand }) || rodeAsBuilt(rec)) return;
-    if (rec.o === basis) st.changes += 1;
+    if (rec.o === basis) tookOn(st, o, theirs);
     else if (!sameFelt(rec.b, C)) noteUndone(st, o, theirs);
     return;
   }
@@ -2468,10 +2486,10 @@ function rideDuty(st: TableState, me: string, now: number): void {
   const adopted = !st.mine.has(latest!.key) && !rodeAsBuilt(rec);
   if (e && !slipDue(st, o, e.view.phaseDeadline, now)) {
     st.pending = { r: o, felt: rec.b, basis: rec.o, ride: true };
-    if (adopted) st.changes += 1;
+    if (adopted) tookOn(st, o, latest!.key);
     return;
   }
-  if (writeSlip(st, res, o, rec.b, false, now, { o: rec.o, t: stand }) && adopted) st.changes += 1;
+  if (writeSlip(st, res, o, rec.b, false, now, { o: rec.o, t: stand }) && adopted) tookOn(st, o, latest!.key);
 }
 
 /** 2. A felt of this page's player on the open round whose commitment is out
@@ -2492,7 +2510,7 @@ function recommitDuty(st: TableState, me: string, now: number): void {
   // older table stays one, and plays as the riding bets. One this page
   // didn't write is its own from here, for the table's notice.)
   const adopted = st.game === 'craps' && !st.mine.has(cur.key) && !rodeAsBuilt(cur.rec);
-  if (writeSlip(st, res, res.open, cur.rec.b as RouletteBet[] | CrapsBet[], true, now, extraOf(st, cur.rec)) && adopted) st.changes += 1;
+  if (writeSlip(st, res, res.open, cur.rec.b as RouletteBet[] | CrapsBet[], true, now, extraOf(st, cur.rec)) && adopted) tookOn(st, res.open, cur.key);
 }
 
 /** Whether a felt of the open round is anything to freeze: chips on it, or
@@ -3827,8 +3845,9 @@ function leaveCraps(st: TableState, me: string, now: number): void {
   const basis = basisOf(carry, me);
   st.lastSlip = null;
   // (One built on a table that is no more goes as the riding bets, its
-  // changes undone, as rideDuty would have written them after the show.)
-  if (rec.o !== basis && !rodeAsBuilt(rec) && !sameFelt(rec.b, C)) noteUndone(st, res.open);
+  // changes undone, as rideDuty would have written them after the show: not
+  // on a roll this page saw played, open again only by a peer's delete.)
+  if (res.open > playedTo(st, res) && rec.o !== basis && !rodeAsBuilt(rec) && !sameFelt(rec.b, C)) noteUndone(st, res.open);
   try {
     writeSlip(st, res, res.open, rec.o === basis ? minPerSpot(rec.b, C) : C, false, now, { o: basis, l: 1 });
   } catch {
@@ -3838,9 +3857,16 @@ function leaveCraps(st: TableState, me: string, now: number): void {
 
 /** Back in the room without a new binding (the back-forward cache): this
  *  page's goodbyes no longer hold, and its slip writers run again (rideDuty
- *  writes each goodbye again as the felt it was). */
+ *  writes each goodbye again as the felt it was); changes undone as it left
+ *  are said now (noteUndone). */
 export function backAtComputedTables(): void {
-  for (const st of tables.values()) st.left = false;
+  for (const st of tables.values()) {
+    st.left = false;
+    if (!st.undoneAway) continue;
+    st.undoneAway = false;
+    st.undone += 1;
+    notifyCasinoView(st.t);
+  }
 }
 
 // Best effort on page close: the write may not flush.
