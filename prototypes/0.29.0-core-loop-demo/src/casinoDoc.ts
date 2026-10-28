@@ -2305,8 +2305,9 @@ export function writeComputedOn(tableId: string, inc: string): void {
 }
 
 /** 🔀 Put table `tableId`'s switch back on incarnation `inc` (computedTable,
- *  the page that runs it): when a peer took it away, or wrote junk or a
- *  name the doc holds nothing of in its place. No build takes a switch away
+ *  the page that runs it): when a peer took it away, or wrote junk, a name
+ *  the doc holds nothing of, or one that has ended (an earlier incarnation
+ *  of the table, say) in its place. No build takes a switch away
  *  but in the transaction that ends its incarnation (the house's switch-off,
  *  a removal: both mark it), so one gone with its incarnation unended is a
  *  peer's doing. Only while the doc holds the incarnation's live session,
@@ -2317,7 +2318,7 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
   const c = computedIncs.get(`${tableId}:${inc}`);
   if (!c?.live || computedIncEnded(tableId, inc) || computedIncOf(tableId) === inc) return false;
   const now = computedIncOf(tableId);
-  if (now !== null && computedIncs.has(`${tableId}:${now}`)) return false;
+  if (now !== null && computedIncs.has(`${tableId}:${now}`) && !computedIncEnded(tableId, now)) return false;
   boundDoc!.transact(() => {
     casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
   });
@@ -2325,7 +2326,8 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
 }
 
 /** Whether table `tableId`'s switch is lost: it names no incarnation (gone,
- *  or junk) while the doc holds the live session of one nothing has ended
+ *  or junk), or one that has ended (a peer's write of a name and its mark),
+ *  while the doc holds the live session of one nothing has ended
  *  (putComputedSwitchBack: a peer's doing, put back by the room's pages);
  *  given `game`, one of that game's, and a switch naming the other game's
  *  incarnation names none of this game's (a peer's write over it, put back
@@ -2334,7 +2336,7 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
  *  table's players are mid-round on the computed one. */
 export function computedSwitchLost(tableId: string, game?: GameName): boolean {
   const named = computedIncOf(tableId);
-  if (named !== null && (game === undefined || gameOfInc(named) === game)) return false;
+  if (named !== null && !computedIncEnded(tableId, named) && (game === undefined || gameOfInc(named) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
     if (game !== undefined && gameOfInc(inc) !== game) continue;
     if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;

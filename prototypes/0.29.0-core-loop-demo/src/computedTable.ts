@@ -3257,11 +3257,14 @@ function compactDuty(pub: string, now: number): void {
   // (Of another binding: the next look at the clock starts afresh.)
   if (casinoDocEpoch() !== clock.epoch) return;
   // What this page wrote for an incarnation that is over goes, seeds and
-  // all: no duty runs for it now, so nothing of it will be revealed.
+  // all: no duty runs for it now, so nothing of it will be revealed. (A
+  // switch naming an incarnation that has ended is a lost one, as a missing
+  // switch is: computedSwitchLost. It is put back, and the seeds go only if
+  // the incarnation ends.)
   for (const st of tables.values()) {
     if (st.mine.size === 0 || !casinoWhole(st.t)) continue;
     const inc = computedIncOf(st.t);
-    if (computedIncEnded(st.t, st.inc) || (inc !== null && inc !== st.inc)) letGo(st, () => false);
+    if (computedIncEnded(st.t, st.inc) || (inc !== null && inc !== st.inc && !computedIncEnded(st.t, inc))) letGo(st, () => false);
   }
   // (Timed from when this page saw it ended, or woke: asleep or not.)
   const awake = tablesAwake(now);
@@ -3361,15 +3364,29 @@ const autoTriedAt = new Map<string, number>();
  * flag off, not at a table the house switched back (ownerRunChosen), and
  * not while a settled round's result shows: the switch goes where the
  * robot would open the next window (its deadline passed), so the wheel's
- * ball lands and the dice stop on every page first. At most every
- * AUTO_SWITCH_MS a table. True when it switched the table on.
+ * ball lands and the dice stop on every page first. At craps nor over a
+ * window's bets or a don't come bet on its number (crapsBetsWait). At most
+ * every AUTO_SWITCH_MS a table. True when it switched the table on.
  */
 export function autoSwitchComputed(t: string, game: GameName, now = Date.now()): boolean {
   if (!computedTablesEnabled() || isComputedTable(t) || ownerRunChosen(t) || resultShowing(t, game, now)) return false;
   const at = autoTriedAt.get(t);
   if (at !== undefined && now >= at && now - at < AUTO_SWITCH_MS) return false;
   autoTriedAt.set(t, now);
+  if (game === 'craps' && crapsBetsWait(t)) return false;
   return switchComputedOn(t, game, now) === 'ok';
+}
+
+/** At craps, bets the automatic switch leaves up where the house's own
+ *  press (after its warning) would hand them back, nobody having chosen
+ *  it: a window's once any is down (the roll goes on: the switch comes at
+ *  a show's end, as at roulette), and a don't come bet on its number,
+ *  which stands in its player's favour (the switch waits for it to win or
+ *  lose). */
+function crapsBetsWait(t: string): boolean {
+  const lists = Object.values(readAllCrapsBets(t));
+  if (readCrapsTableState(t)?.phase === 'betting' && lists.length > 0) return true;
+  return lists.some((bets) => bets.some((b) => b.type === 'dontcome' && b.pick !== undefined));
 }
 
 /** Whether owner-run table t shows a settled round's result still: until
@@ -3441,11 +3458,12 @@ function switchGate(t: string, now: number): ComputedSwitchRefusal | null {
  *  roulette: no round up, or one settled, or one betting with no list on it
  *  (a SPIN pressed is a closing round: never quiet). At craps: no roll up,
  *  or one betting or settled on a come-out ('busy' for a roll closing, its
- *  settle in flight; 'contract' for a point on), with no come bet on a
- *  number on any felt; the bets on it go back. Not where the table's records
- *  are the other game's, nor while a build older than the game's least
- *  drives the room's tables, nor while a computed incarnation of the table
- *  is live with its switch taken away ('reconnecting': it comes back). */
+ *  settle in flight; 'contract' for a point on, unless no felt has a bet),
+ *  with no come bet on a number on any felt; the bets on it go back. Not
+ *  where the table's records are the other game's, nor while a build older
+ *  than the game's least drives the room's tables, nor while a computed
+ *  incarnation of the table is live with its switch taken away
+ *  ('reconnecting': it comes back). */
 function onRefusal(t: string, game: GameName, now: number): ComputedSwitchRefusal | null {
   if (game === 'roulette' ? readCrapsTableState(t) !== null : readTableState(t) !== null) return 'craps';
   const inc = computedIncOf(t);
@@ -3460,8 +3478,10 @@ function onRefusal(t: string, game: GameName, now: number): ComputedSwitchRefusa
   if (game === 'craps') {
     const c = readCrapsTableState(t);
     if (c?.phase === 'closing') return 'busy';
-    if (c && c.point !== null) return 'contract';
     const lists = Object.values(readAllCrapsBets(t));
+    // (A point on with nothing on the felt holds nothing back: the computed
+    // table starts on a come-out.)
+    if (c && c.point !== null && lists.length > 0) return 'contract';
     return lists.some((bets) => bets.some((b) => b.type === 'come' && b.pick !== undefined)) ? 'contract' : null;
   }
   const s = readTableState(t);
