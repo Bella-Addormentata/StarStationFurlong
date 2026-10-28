@@ -1380,6 +1380,7 @@ export function clearTableKeys(
     if (!opts.keepConfig) {
       map.delete(`cfg:backend:${tableId}`);
       map.delete(`cfg:fairness:${tableId}`);
+      map.delete(`cfg:ownerrun:${tableId}`);
     }
     // 🧮 And a computed table's incarnation is over (marked as a removed
     // one is, so a switch written at the same moment stays ended): its
@@ -2266,6 +2267,25 @@ export function computedIncFor(tableId: string, game: GameName = 'roulette'): st
     if (!used) return inc;
     markRemoved(casino, tableId, inc);
   }
+}
+
+/** 🔀 Whether the house switched table `tableId` back to owner-run (the ⚙
+ *  card's BACK TO THE OWNER: computedTable switchComputedOff), so its page
+ *  doesn't switch it on again by itself (autoSwitchComputed). Its RUN
+ *  WITHOUT THE OWNER clears it, and so does taking the table out of the
+ *  room. A plain `1` under `cfg:ownerrun:<tableId>`. */
+export function ownerRunChosen(tableId: string): boolean {
+  return ensureMap().get(`cfg:ownerrun:${tableId}`) === 1;
+}
+
+/** 🔀 Mark or clear the house's choice of owner-run play at table `tableId`
+ *  (ownerRunChosen), in the caller's transaction. */
+export function writeOwnerRunChosen(tableId: string, chosen: boolean): void {
+  const casino = ensureMap();
+  boundDoc!.transact(() => {
+    if (chosen) casino.set(`cfg:ownerrun:${tableId}`, 1);
+    else if (casino.has(`cfg:ownerrun:${tableId}`)) casino.delete(`cfg:ownerrun:${tableId}`);
+  });
 }
 
 /** 🔀 Switch table `tableId` on as computed incarnation `inc`, in the
