@@ -341,6 +341,21 @@ export function rigSplit(pages: Page[], r: number, both: number, w: Page, alone:
   throw new Error(`rigSplit: no seeds for ${both} / ${alone}`);
 }
 
+/** Queue roll r's seeds on `pages` so that the seeds of each of `sums`'
+ *  sets of pages make its total (a forfeit counting that set): `[pages, 6]`
+ *  for all of them. */
+export function rigSums(pages: Page[], r: number, sums: [Page[], number][], ctx: FoldCtx = CRAPS_CTX): void {
+  const table = seedTable(ctx);
+  const sum = (seeds: string[]): number => diceOf(table, r, seeds).reduce((x, d) => x + d, 0);
+  for (let n = 0; n < 400_000; n++) {
+    const seeds = pages.map((p) => tagSeed(`${p.name}:${r}:sums:${n}`));
+    if (!sums.every(([set, want]) => sum(set.map((p) => seeds[pages.indexOf(p)])) === want)) continue;
+    pages.forEach((p, i) => p.seeds.push(seeds[i]));
+    return;
+  }
+  throw new Error(`rigSums: no seeds for ${sums.map(([set, want]) => `${set.length}:${want}`).join(' ')}`);
+}
+
 /** Queue roll r's seeds on `pages` so that all of theirs and the seed of `w`
  *  alone throw the same dice, summing to `sum`: a forfeit counting w only
  *  decides the roll again on the same faces. */

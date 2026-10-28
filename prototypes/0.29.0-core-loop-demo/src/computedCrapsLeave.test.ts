@@ -270,6 +270,48 @@ describe('back at the table', () => {
     expect(b.table.readComputedCrapsBets(TABLE, 2, T + 1_000)[a.pid]).toEqual([bet('pass', 10)]);
   });
 
+  it('a take-down put back from the goodbye, then undone by a rewrite of the roll before: the reloaded page says so', async () => {
+    // As above (the goodbye left out of a close): A ranks first for roll 1's
+    // forfeit; both seeds a 6, A's alone an 8.
+    let pages: Page[];
+    do pages = await openCrapsRoom(['A', 'B'], T0);
+    while (byRank(pages, 'forfeit', 1, CTX)[0] !== pages[0]);
+    const [a, b] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    rigSplit(pages, 1, 6, a, 8);
+    expect(crapsBet(a, [bet('pass', 10), bet('place', 6, 8)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('pass', 5)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    const { T } = openRoll2(pages, decidedAt);
+    // A takes its place 8 down, reloads, and the goodbye's felt goes back in.
+    expect(crapsBet(a, [bet('pass', 10)], T)).toBe('ok');
+    a.table.leaveComputedTables(T + 400);
+    sync(T + 400, a, b);
+    const a2 = await reload(a, [b], T + 1_000, 1);
+    frame(T + 1_000, a2, [REF]);
+    const was = basisOf(carryOf(a2), a.pid);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: [bet('pass', 10)], o: was, t: 1 });
+    expect(latestOf(a2, a.pid)!.l).toBeUndefined();
+    sync(T + 1_000, a2, b);
+    // A's forfeit of roll 1 counts A's seed alone: the point is an 8.
+    clockOf(a2, T + 1_200);
+    const f = signAs(a, 'forfeit', { r: 1, x: foldOf(a2).rounds[0].close, n: [a.pid] }, CTX);
+    putIn(a2, [[forfeitKey(f)!, f]], TABLE);
+    expect(carryOf(a2).p).toBe(8);
+    const now = basisOf(carryOf(a2), a.pid);
+    expect(now).not.toBe(was);
+    // Once roll 2 takes bets again, A's riding bets go over the take-down.
+    const C = own(carryOf(a2).w, a.pid);
+    expect(C).toContainEqual(bet('place', 6, 8));
+    const at = go([a2, b], T + 1_200 + STEP, T + 30_000, () => latestOf(a2, a.pid)?.o === now);
+    expect(latestOf(a2, a.pid)).toMatchObject({ r: 2, b: C, o: now });
+    go([a2, b], at + STEP, at + 3_000);
+    expect(a2.table.computedUndoneCount(TABLE)).toBe(1);
+    expect(b.table.computedUndoneCount(TABLE)).toBe(0);
+  });
+
   it('back from the back-forward cache, the same: its frames write the goodbye again; its writes go again', async () => {
     const { pages, decidedAt } = await placeEight();
     const [a, b] = pages;

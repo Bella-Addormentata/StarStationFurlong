@@ -19,7 +19,7 @@ import { asClose, forfeitKey } from './computedFold';
 import type { CloseRec, CrapsSlipRec } from './computedFold';
 import {
   byRank, carryOf, clockOf, CRAPS_CTX as CTX, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, crapsPointOn,
-  deleteIn, frame, keysIn, loadPage, openCrapsRoom, openRoom, PAGE_INC, PAGE_TABLE, putIn, rigRoll, rigSplit, run, signAs, standAt, switchOn,
+  deleteIn, frame, keysIn, loadPage, openCrapsRoom, openRoom, PAGE_INC, PAGE_TABLE, putIn, rigRoll, rigSplit, rigSums, run, signAs, standAt, switchOn,
   sync,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
@@ -421,6 +421,133 @@ describe('a roll rewritten under the next', () => {
     go(pages, again + STEP, again + 5_000);
     expect(w.table.computedUndoneCount(TABLE)).toBe(1);
     expect(x.table.computedUndoneCount(TABLE)).toBe(0);
+  });
+
+  it('a sent change and a held one, undone across two rewrites of the roll before in one show: the table says so once', async () => {
+    const pages = await room(['A', 'B', 'C']);
+    // w ranks last for forfeits of roll 1: its page answers nobody's.
+    const [a, b, w] = byRank(pages, 'forfeit', 1, CTX);
+    standAt(a, 3);
+    standAt(b, 5);
+    standAt(w, 1);
+    // Every seed a 6; b's and w's an 8; a's and w's a 7.
+    rigSums(pages, 1, [[pages, 6], [[b, w], 8], [[a, w], 7]]);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(6);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    go(pages, decidedAt + STEP, showEnd + 1_000);
+    // From here only w's page runs.
+    const T = showEnd + 1_000 + STEP;
+    // (Its ride slip is in already: the pass rides on the 6.)
+    const ride = slipsOf(w, 2, w.pid).length;
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 10)], T + 50)).toBe('ok');
+    expect(slipsOf(w, 2, w.pid)).toHaveLength(ride + 1);
+    const forfeit = (by: Page, ns: Page[], at: number): void => {
+      clockOf(w, at);
+      const f = signAs(by, 'forfeit', { r: 1, x: close, n: ns.map((p) => p.pid).sort() }, CTX);
+      putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    };
+    // b's forfeit: point 8. The held change is dropped at once.
+    forfeit(b, [b, w], T + 100);
+    expect(carryOf(w).p).toBe(8);
+    frame(T + STEP, w, [REF]);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    // a's better one in the same show: a natural. Betting comes back, and the
+    // riding bets (none) go over the change that went in: nothing new to tell.
+    forfeit(a, [a, w], T + 2 * STEP + 100);
+    expect(carryOf(w)).toMatchObject({ p: 0, w: {} });
+    const now = basisOf(carryOf(w), w.pid);
+    const at = go([w], T + 3 * STEP, T + 40_000, () => latestOf(w, w.pid)?.o === now);
+    expect(latestOf(w, w.pid)).toMatchObject({ r: 2, o: now, b: [] });
+    go([w], at + STEP, at + 3_000);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+  });
+
+  it("a change held back just after the ride slip went in, dropped by a rewrite of the roll before: the table says so (the ride slip was no change of the player's)", async () => {
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX);
+    standAt(w, 1);
+    standAt(x, 3);
+    // Every seed a 6, w's alone an 8: the pass rides either way.
+    rigSplit(pages, 1, 6, w, 8);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    // w's tab reloads during the show (no change of the player's taken on
+    // the page since), back at stand 1.
+    const w2 = await loadPage(`${w.name}'`, 9, { reloadOf: w });
+    standAt(w2, 1);
+    sync(decidedAt + STEP, w2, x);
+    const T = go([w2, x], decidedAt + 2 * STEP, showEnd + 5_000, () => latestOf(w2, w.pid)?.r === 2);
+    expect(latestOf(w2, w.pid)).toMatchObject({ r: 2, b: [bet('pass', 10)] });
+    const ride = slipsOf(w2, 2, w.pid).length;
+    // A field bet within the coalescing of the ride slip: held back.
+    expect(crapsBet(w2, [bet('pass', 10), bet('field', 5)], T + 50)).toBe('ok');
+    expect(slipsOf(w2, 2, w.pid)).toHaveLength(ride);
+    clockOf(w2, T + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: close, n: [w.pid] }, CTX);
+    putIn(w2, [[forfeitKey(f)!, f]], TABLE);
+    sync(T + 100, w2, x);
+    expect(carryOf(w2).p).toBe(8);
+    frame(T + STEP, w2, [REF]);
+    expect(w2.table.computedUndoneCount(TABLE)).toBe(1);
+    expect(x.table.computedUndoneCount(TABLE)).toBe(0);
+  });
+
+  it('a second change undone by a later rewrite is told again, though the roll before comes back to the table the first notice was for', async () => {
+    const pages = await room(['A', 'B', 'C', 'D']);
+    // w ranks last for forfeits of roll 1: its page answers nobody's.
+    const [a, b, c, w] = byRank(pages, 'forfeit', 1, CTX);
+    standAt(a, 3);
+    standAt(b, 5);
+    standAt(c, 7);
+    standAt(w, 1);
+    // Every seed a 6; c's and w's a 7; b's, c's and w's an 8; a's, c's and w's a 7.
+    rigSums(pages, 1, [[pages, 6], [[c, w], 7], [[b, c, w], 8], [[a, c, w], 7]]);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(6);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    go(pages, decidedAt + STEP, showEnd + 1_000);
+    // From here only w's page runs: c's forfeit, then b's answer, then a's.
+    const forfeit = (by: Page, ns: Page[], at: number): void => {
+      clockOf(w, at);
+      const f = signAs(by, 'forfeit', { r: 1, x: close, n: ns.map((p) => p.pid).sort() }, CTX);
+      putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    };
+    let T = showEnd + 1_000 + STEP;
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    // A natural: the hand is over, and the field bet is undone.
+    forfeit(c, [c, w], T + 100);
+    const X = basisOf(carryOf(w), w.pid);
+    let at = go([w], T + STEP, T + 40_000, () => latestOf(w, w.pid)?.o === X);
+    expect(latestOf(w, w.pid)).toMatchObject({ o: X, b: [] });
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    // Point 8, the pass back up, riding: no change of w's undone.
+    T = at + 2_000;
+    forfeit(b, [b, c, w], T);
+    expect(carryOf(w).p).toBe(8);
+    const Y = basisOf(carryOf(w), w.pid);
+    at = go([w], T + STEP, T + 40_000, () => latestOf(w, w.pid)?.o === Y);
+    expect(latestOf(w, w.pid)).toMatchObject({ o: Y, b: [bet('pass', 10)] });
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    // A new field bet on that table goes in; a natural again undoes it.
+    T = at + 2_000;
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    forfeit(a, [a, c, w], T + 100);
+    expect(basisOf(carryOf(w), w.pid)).toBe(X);
+    at = go([w], T + STEP, T + 40_000, () => latestOf(w, w.pid)?.o === X);
+    expect(latestOf(w, w.pid)).toMatchObject({ r: 2, o: X, b: [] });
+    go([w], at + STEP, at + 3_000);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(2);
   });
 
   it('a ride slip written over by other riding bets once the roll before is rewritten reads nothing: no change of the player\'s was in it', async () => {
