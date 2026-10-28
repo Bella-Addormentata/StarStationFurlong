@@ -9,6 +9,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+## v0.48.0 — 2026-10-28
+
 - **🔀 Computed casino tables on by default ([#312](https://github.com/Bella-Addormentata/StarStationFurlong/pull/312)), so the owner can try them without the console.** Roulette and craps tables now run without the owner with no setup: the house's page switches each owner-run table to computed by itself once the switch may go, after the last result has shown (at craps at the end of a hand, never over a window's bets or a don't come bet on its number). BACK TO THE OWNER on the ⚙ card keeps a table owner-run, and RUN WITHOUT THE OWNER switches it back. To turn it off, add `?computed=0` to the address or set `localStorage ssf-dev-computed` to `0`. In venture rooms the switch still needs the flag set by hand (`?computed=1`): no page there holds the table lease, so an older build driving the tables can't be spotted. Computed tables are Friendly only and have no robot stickman or croupier yet (PR 4). Also: a peer's deleted or forged switch can no longer make the house's page void a round under way (the switch is waited for and put back), and a craps table idling with a point on and nothing on the felt can now switch.
 
 ## v0.47.0 — 2026-10-28
