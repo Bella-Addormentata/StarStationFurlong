@@ -384,6 +384,77 @@ describe('a roll rewritten under the next', () => {
     expect(w.table.computedUndoneCount(TABLE)).toBe(1);
   });
 
+  it('a change that went in and one held back after it, both undone by one rewrite of the roll before: the table says so once', async () => {
+    const pages = await room(['A', 'B']);
+    const stand = new Map([[pages[0], 1], [pages[1], 3]]);
+    for (const [p, s] of stand) standAt(p, s);
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX);
+    rigSplit(pages, 1, 7, w, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    const was = basisOf(carryOf(w), w.pid);
+
+    // Roll 2: a field bet goes in, a bigger one is held back with the coalescing.
+    go(pages, decidedAt + STEP, showEnd + 1_000);
+    const T = showEnd + 1_000 + STEP;
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    expect(crapsBet(w, [bet('pass', 10), bet('field', 10)], T + 50)).toBe('ok');
+    expect(slipsOf(w, 2, w.pid)).toHaveLength(1);
+    sync(T + 50, ...pages);
+    expect(latestOf(x, w.pid)).toMatchObject({ r: 2, v: 1, o: was });
+
+    // The rewrite drops the held one at once, and writes the riding bets
+    // over the one that went in once betting is back: one notice.
+    clockOf(w, T + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    sync(T + 100, ...pages);
+    const now = basisOf(carryOf(w), w.pid);
+    expect(now).not.toBe(was);
+    frame(T + STEP, w, [REF]);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    const again = go(pages, T + 2 * STEP, T + 30_000, () => pages.every((p) => latestOf(p, w.pid)?.v === 2));
+    for (const p of pages) expect(latestOf(p, w.pid)).toMatchObject({ r: 2, v: 2, b: [bet('pass', 10)], o: now });
+    go(pages, again + STEP, again + 5_000);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(1);
+    expect(x.table.computedUndoneCount(TABLE)).toBe(0);
+  });
+
+  it('a ride slip written over by other riding bets once the roll before is rewritten reads nothing: no change of the player\'s was in it', async () => {
+    const pages = await room(['A', 'B']);
+    const stand = new Map([[pages[0], 1], [pages[1], 3]]);
+    for (const [p, s] of stand) standAt(p, s);
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX);
+    // Every seed a 6, w's alone a 7: the point on, then a natural, which
+    // pays both pass lines and takes them off the felt.
+    rigSplit(pages, 1, 6, w, 7);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(w).p).toBe(6);
+    const close = foldOf(w).rounds[0].close;
+    const showEnd = crapsOf(w, decidedAt)!.resultAt + SHOW;
+    const was = basisOf(carryOf(w), w.pid);
+    const T = go(pages, decidedAt + STEP, showEnd + 5_000, () => latestOf(w, w.pid)?.r === 2 && latestOf(x, x.pid)?.r === 2);
+    expect(latestOf(w, w.pid)).toMatchObject({ r: 2, v: 1, b: [bet('pass', 10)], o: was });
+
+    clockOf(w, T + 50);
+    const f = signAs(w, 'forfeit', { r: 1, x: close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    sync(T + 50, ...pages);
+    expect(carryOf(w)).toMatchObject({ p: 0, w: {} });
+    const now = basisOf(carryOf(w), w.pid);
+    const again = go(pages, T + STEP, T + 30_000, () => pages.every((p) => latestOf(p, w.pid)?.o === now && latestOf(p, x.pid)?.o === basisOf(carryOf(p), x.pid)));
+    expect(again).toBeLessThan(T + 30_000);
+    for (const p of pages) expect(latestOf(p, w.pid)).toMatchObject({ r: 2, b: [], o: now });
+    go(pages, again + STEP, again + 5_000);
+    expect(w.table.computedUndoneCount(TABLE)).toBe(0);
+    expect(x.table.computedUndoneCount(TABLE)).toBe(0);
+  });
+
   it('drops a stand held back over the riding bets with no notice (no change of the player\'s went with it): their ride slip goes again under the new stamp, at the stand', async () => {
     const pages = await room(['A', 'B']);
     const [w, x] = byRank(pages, 'forfeit', 1, CTX);

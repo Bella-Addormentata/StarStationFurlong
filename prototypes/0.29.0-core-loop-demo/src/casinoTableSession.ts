@@ -844,11 +844,16 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
       rt.flight.done = true;
       if (faceless) h.diceRestAt(STICKMAN_DICE_SPOT);
     }
-  } else if (rt.flight?.close && !rt.flight.done && s.phase === 'closing' && computedCrapsClose(id, s.round) === null) {
+  } else if (
+    rt.flight?.close && !rt.flight.done && s.phase === 'closing' && s.round > (computedDecidedTo(id) ?? 0)
+    && computedCrapsClose(id, s.round) === null
+  ) {
     // The close it stood for is no longer in: counted while its signature
     // was still to check, then found forged, or deleted. The roll waits for
     // its throw again, so the dice go back where it is thrown from (below),
-    // and fly again for the throw or the close that ends it.
+    // and fly again for the throw or the close that ends it. (Not a roll
+    // decided and held for its show, whose close a checkpoint now names
+    // alone: its faces come where the dice are.)
     h.diceCancel();
     rt.flight = null;
   }

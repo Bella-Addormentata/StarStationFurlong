@@ -1757,6 +1757,44 @@ describe('what became of my felt', () => {
     expect(tw.card()).toContain('COME OUT · NO BETS RIDING');
   });
 
+  it("a trim that comes while a forfeit holds the roll for its show leaves the stickman's toss in the air: its faces land where it flies", async () => {
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 2, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigRoll(pages, 1, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    rigSplit(pages, 2, 8, w, 4);
+    atCraps(w, { stand: 3 });
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    go(pages, T, W - STEP);
+    w.table.noteComputedFling(TABLE, 2, 9, W);
+    const mark = w.dice.log.length;
+    // x's page hears no more: w's forfeit decides roll 2, and w holds it.
+    const closedAt = go([w], W, W + 5_000, () => closeOf(w, 2) !== undefined);
+    const toss = tossOf(closeOf(w, 2)!);
+    const decidedOnW = go([w], closedAt + STEP, closedAt + GRACE + 10_000, () => foldOf(w).rounds.some((v) => v.r === 2 && v.decided !== null));
+    expect(crapsOf(w, decidedOnW)).toMatchObject({ phase: 'closing', round: 2 });
+    expect(w.dice.log.slice(mark)).toEqual([toss]);
+    // Another page's checkpoint at roll 2 comes in mid-hold: it names the
+    // roll's close alone, and the roll is still held for its show.
+    clockOf(w, decidedOnW + STEP);
+    trimByHand(w, testIdentity('trimmer'), undefined, TABLE);
+    frameOf(w, decidedOnW + STEP);
+    expect(foldOf(w).base.u).toBe(2);
+    expect(crapsOf(w)).toMatchObject({ phase: 'closing', round: 2 });
+    expect(w.dice.log.slice(mark)).toEqual([toss]);
+    expect(w.dice.state()).toBe('flying');
+    const shown = go([w], decidedOnW + 2 * STEP, decidedOnW + 30_000, () => crapsOf(w)?.phase === 'settled');
+    go([w], shown + STEP, shown + 3 * STEP);
+    const key = crapsOf(w)!.rollKey;
+    expect(key).toMatch(/^2:\d\d$/);
+    expect(w.dice.log.slice(mark)).toEqual([toss, `land ${key.slice(2)}`]);
+    expect(w.dice.state()).toBe('rest');
+  });
+
   it("a shooter who flung reads no TIME'S UP: not while a forfeit holds their roll, nor as its dice land; the card says whose forfeit decided it", async () => {
     // w first to forfeit roll 2, at stand 3: it holds the dice after roll 1.
     const pages = await room(['A', 'B']);

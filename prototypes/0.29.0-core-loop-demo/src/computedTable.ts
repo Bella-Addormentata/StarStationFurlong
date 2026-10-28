@@ -431,8 +431,10 @@ interface TableState {
   left: boolean;
   /** At craps: how many changes this page dropped because the roll before
    *  changed under them, held (flushDuty) or gone in (rideDuty writes the
-   *  riding bets over them); the table's notice. */
+   *  riding bets over them); the table's notice. One a change of the table
+   *  (noteUndone): `undoneFor` names the last, as round and stamp. */
   undone: number;
+  undoneFor: string | null;
   /** At craps: what each decided roll on the chain came to as this page
    *  last saw it, and whether this page's player's slip on it was built on
    *  another state; and the last earlier roll this page saw change
@@ -601,7 +603,7 @@ function newTable(t: string, inc: string): TableState {
   return {
     t, inc, ctx, game: gameOfInc(inc), slipOf: asSlipFor(ctx), keyOf: slipKeyFor(ctx),
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
-    pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0,
+    pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, undoneFor: null,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
     lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, checks: new Map(),
@@ -2311,6 +2313,18 @@ function recommitOn(st: TableState, res: FoldResult, now: number): boolean {
   return st.game === 'craps' ? crapsDutyOn(st, res, now) !== null : bettingOn(st, res, now) !== null;
 }
 
+/** 🎲 Tell this page's player that a change of the roll before undid their
+ *  changes on round `o`, its stamp now `basis`: once a change of the table,
+ *  so a held change it dropped and a sent one written over for it are one
+ *  notice. */
+function noteUndone(st: TableState, o: number, basis: string): void {
+  const at = `${o}:${basis}`;
+  if (st.undoneFor === at) return;
+  st.undoneFor = at;
+  st.undone += 1;
+  notifyCasinoView(st.t);
+}
+
 /** 1. Write the felt the coalescing held back, once COALESCE_MS have passed
  *  since the last, or in the window's last second; one for a round that has
  *  moved on is dropped, as is one the chip check now refuses. */
@@ -2338,10 +2352,7 @@ function flushDuty(st: TableState, me: string, now: number): void {
     // A stand rewrite held back undid no change of the player's: its felt
     // went in, and rideDuty writes it again as the riding bets.)
     st.pending = null;
-    if (!p.ride) {
-      st.undone += 1;
-      notifyCasinoView(st.t);
-    }
+    if (!p.ride) noteUndone(st, p.r, basisOf(res.carry as CrapsCarry, me));
     return;
   }
   const e = bettingOn(st, res, now);
@@ -2420,8 +2431,7 @@ function rideDuty(st: TableState, me: string, now: number): void {
       // the player's it carried is undone, and the table says so, as for a
       // held one: flushDuty.)
       if (ours(latest!) && writeSlip(st, res, o, C, false, now, { o: basis, t: stand }) && !rodeAsBuilt(rec) && !sameFelt(rec.b, C)) {
-        st.undone += 1;
-        notifyCasinoView(st.t);
+        noteUndone(st, o, basis);
       }
       return;
     }
