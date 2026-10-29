@@ -1884,6 +1884,7 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(body).toContain('const hasDedicated = [...this.robots.keys()].some(\n      (k) => routineOf(k) === "croupier",\n    );');
     const eligibleAt = body.slice(body.indexOf('const eligible = '), body.indexOf('const operatorPost = '));
     expect(eligibleAt).not.toContain('parked');
+    expect(body).toContain('const isParked = (k: string): boolean => readRobotConfig(k)?.parked === true;');
     expect(body).toContain('const hasDedicatedAtComputed = [...this.robots.keys()].some((k) => !isParked(k) && routineOf(k) === "croupier");');
     expect(body).toContain('this.robots.has(k) && !isParked(k) && mayCroupier(routineOf(k), hasDedicatedAtComputed);');
   });
@@ -1897,6 +1898,8 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(handOut).toContain('owner: eligible(key), computed: eligibleAtComputed(key)');
     expect(handOut).toContain('assignCroupiers(');
     expect(handOut).toContain('bot.setCroupierPost(tid ? operatorPost(tid) : null);');
+    expect(handOut).toContain('levelOf.set(t.id, pull);');
+    expect(body).toContain('const gameOf = (t: { kind: string }): "craps" | "roulette" => (t.kind === "craps-table" ? "craps" : "roulette");');
     expect(body).toContain('const selfRun = new Set(tables.filter((t) => tableRunsItself(t.id, gameOf(t))).map((t) => t.id));');
     expect(body).not.toContain('.filter((t) => isCroupierLive(t.id) && operatorPost(t.id))');
   });
@@ -1911,6 +1914,11 @@ describe("World's frame (world.ts updateCroupier)", () => {
     const branch = narration.slice(ours, owners);
     for (const line of [
       'this.croupierNarrated.delete(t.id);',
+      'const stand = standsForItem(t.id).find((x) => x.role != null);',
+      'const h = this.casinoTableVisuals.get(t.id);',
+      // (The hold: the felt's wheel or dice, as the status bar waits on them.)
+      'const moving = h ? (h.game === "craps" ? h.diceState() === "flying" || h.diceState() === "settling" : h.wheelSpinning()) : false;',
+      'const live = (levelOf.get(t.id) ?? 0) > 0;',
       'const call = computedTableCall(t.id, gameOf(t), frameNow, moving, h !== undefined);',
       'if (call && (!live || !stand || this.robotSay(`croupier:${t.id}`, call.text, stand.front.x, stand.front.z))) {',
       'noteComputedCallSaid(t.id, call);',

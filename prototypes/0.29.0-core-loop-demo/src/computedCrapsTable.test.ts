@@ -2652,6 +2652,42 @@ describe("the robot stickman at a players' craps table", () => {
     }
   });
 
+  it("a roll held again for a forfeit on the same faces: each felt tosses them again, noted once, and its robot says nothing more", async () => {
+    // As 'a roll shown, then held again for a forfeit that beats its seeds
+    // on the same faces', each page's robot heard.
+    const pages = await room(['A', 'B']);
+    const [w, x] = byRank(pages, 'forfeit', 2, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigRoll(pages, 1, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    const d1 = decide(pages, 1, T0 + STEP);
+    rigSame(pages, 2, 8, w);
+    atCraps(w, { stand: 3 });
+    atCraps(x, { stand: 1 });
+    const ears = pages.map(earOf);
+    const { T, W } = openRoll(pages, 2, d1 + STEP);
+    goHearing(pages, ears, T, W - STEP);
+    w.table.noteComputedFling(TABLE, 2, 9, W);
+    const d2 = goHearing(pages, ears, W, W + 60_000, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === 2 && v.decided !== null)));
+    goHearing(pages, ears, d2 + STEP, d2 + 3 * STEP);
+    for (const e of ears) expect(e.said.filter((t) => /^🎲 \d\+\d = 8 — /.test(t)), JSON.stringify(e.said)).toHaveLength(1);
+    const marks = ears.map((e) => ({ said: e.said.length, tossed: e.tossed }));
+    const F = d2 + 4 * STEP;
+    clockOf(w, F);
+    const f = signAs(w, 'forfeit', { r: 2, x: foldOf(w).rounds.find((v) => v.r === 2)!.close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    goHearing(pages, ears, F + STEP, F + STEP);
+    for (const p of pages) expect(crapsOf(p)).toMatchObject({ phase: 'closing', round: 2 });
+    const shown = goHearing(pages, ears, F + 2 * STEP, F + 30_000, () => pages.every((p) => crapsOf(p)?.phase === 'settled'));
+    goHearing(pages, ears, shown + STEP, shown + 3 * STEP);
+    for (const [i, e] of ears.entries()) {
+      expect(foldOf(pages[i]).rounds.find((v) => v.r === 2)).toMatchObject({ decided: 'forfeit' });
+      expect(e.said.slice(marks[i].said), pages[i].name).toEqual([]);
+      expect(e.tossed - marks[i].tossed, pages[i].name).toBe(1);
+    }
+  });
+
   it("the shooter flings: no toss noted and no TIME'S UP, on the shooter's page or the other", async () => {
     const { pages, decidedAt } = await pointOn(['A', 'B'], [3, 1]);
     const [a] = pages;
