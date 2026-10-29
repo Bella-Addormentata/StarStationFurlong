@@ -26,19 +26,32 @@
  * from the one remembered (A, then B, then A again: three calls), while the
  * round is on show, or after its show as a correction of a round called
  * before; a round first seen after its show is remembered without a word.
- * The result waits while this page's wheel spins or its dice fly (at most
- * RESULT_HOLD_MAX_MS), so the robot never gives it away.
+ * The result waits a frame on a drawn table, then while this page's wheel
+ * spins or its dice fly (at most RESULT_HOLD_MAX_MS), so the robot never
+ * gives it away.
+ *
+ * WHEN A ROBOT COMES. A table that runs itself (tableRunsItself) is in play
+ * on this page (level 2) while someone stands at one of its stands or a
+ * round runs that this page saw run: past "no more bets", betting before
+ * its deadline, or a result on show of a round it saw betting or closing
+ * (a load or a wake shows every table's last result again, and must not
+ * call a robot to each). It is quiet (level 1) for COMPUTED_LIVE_LINGER_MS
+ * after, and at craps while bets ride on it; idle (0) otherwise. Robots are
+ * handed out (assignCroupiers): owner-run tables with a fresh heartbeat
+ * first, as today; then tables in play, from the free robots or a quiet
+ * table's; then quiet tables, from the free ones.
  */
 
-import { casinoDocEpoch, casinoWhole, computedSettled } from './casinoDoc';
+import { casinoDocEpoch, casinoWhole, computedSettled, computedSwitchLost, isComputedFor, isComputedTable } from './casinoDoc';
 import { readComputedCraps, readComputedRoulette } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState } from './computedTable';
 import type { GameName } from './computedFold';
-import { croupierBeatLine } from './croupier';
-import { crapsBeatLine } from './crapsCroupier';
+import { croupierBeatLine, TABLE_CLOCK_SLACK_MS, tablesWakeCount } from './croupier';
+import { crapsBeatLine } from './crapsCalls';
 import { readPlayerDisplayName } from './games/gamesDoc';
 import { pocketColor } from './games/roulette';
 import { PLAYER_NAME_MAX_LENGTH } from './identity';
+import type { RobotRoutine } from './robotDoc';
 
 /** The longest a result call waits for this page's wheel or dice to stop. */
 export const RESULT_HOLD_MAX_MS = 8_000;
@@ -47,6 +60,11 @@ export const RESULT_HOLD_MAX_MS = 8_000;
 export const CALLED_ROUNDS = 64;
 /** A void, in the memory of what was called. */
 export const VOID = 'void';
+/** How long a players' table keeps its robot after its last sign of play. */
+export const COMPUTED_LIVE_LINGER_MS = 10_000;
+/** An avatar this near a stand's front stands at it (the walk-up's own
+ *  test of a taken stand, World pickFreeStand). */
+export const AT_STAND_M = 0.7;
 /** What the robot calls a shooter whose name is nothing once cleaned. */
 export const NAME_FALLBACK = 'the shooter';
 /** A void's call (the status bar's ROLL VOID / NO SPIN in a robot's words). */
@@ -55,6 +73,7 @@ export const NO_ROLL_CALL = '⚠ No roll — every bet stands';
 
 export type TableView = ComputedRouletteState | ComputedCrapsState;
 export type NameOf = (pid: string) => string;
+export type Level = 0 | 1 | 2;
 
 // ── 🗣 Names ─────────────────────────────────────────────────────────────────
 
@@ -194,6 +213,10 @@ export interface CallCtx {
   /** This page's wheel spins, or its dice fly or settle (false with no
    *  table drawn). */
   moving: boolean;
+  /** This page draws the table: its felt takes a new result on its next
+   *  frame (World drives the felt before its own duties write, so a round
+   *  this page's own seed decides shows here before the wheel can spin). */
+  drawn: boolean;
   name: NameOf;
 }
 
@@ -249,9 +272,14 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
     if (!onShow && !before) remember(m, k.r, k.value);
     else {
       const id = `${k.r}:${k.value}`;
-      const held = m.hold?.id === id ? m.hold.at : null;
-      if (ctx.moving && (held === null || ctx.now - held < RESULT_HOLD_MAX_MS)) {
-        if (held === null) m.hold = { id, at: ctx.now };
+      const since = m.hold?.id === id ? m.hold.at : null;
+      // On a drawn table it waits a frame first, for the felt to take it,
+      // then while the wheel spins or the dice fly.
+      const waits = since === null
+        ? ctx.moving || ctx.drawn
+        : ctx.now - since < RESULT_HOLD_MAX_MS && (ctx.moving || (ctx.drawn && ctx.now <= since));
+      if (waits) {
+        if (since === null) m.hold = { id, at: ctx.now };
       } else {
         const text = !onShow ? correctionText(game, k.r, k.value) : before ? rewriteText(v, ctx.name) : resultText(v, ctx.name);
         if (text !== null) return { kind: 'result', key: `${v.inc}|${k.r}|result|${k.value}`, text, r: k.r, value: k.value };
@@ -287,10 +315,131 @@ export function callSaid(m: CallMemory, c: TableCall): void {
   }
 }
 
+// ── 🚶 When a robot comes ────────────────────────────────────────────────────
+
+/** Whether table `t` runs itself, so its robot comes by this page's view of
+ *  it and never by a heartbeat: at craps, the stickman's own test
+ *  (crapsCroupier crapsRunsItself: a craps name, or one lost); at roulette,
+ *  the croupier's (a computed table, or one whose switch is lost). */
+export function tableRunsItself(t: string, game: GameName): boolean {
+  return game === 'craps' ? isComputedFor(t, 'craps') || computedSwitchLost(t, 'craps') : isComputedTable(t) || computedSwitchLost(t);
+}
+
+/** Whether any avatar in `spots` stands at one of the player stands in
+ *  `stands` (the robot's own stand never counts). */
+export function someoneAtStands(
+  stands: readonly { front: { x: number; z: number }; role?: string }[],
+  spots: readonly { x: number; z: number }[],
+): boolean {
+  return stands.some((s) => s.role == null
+    && spots.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < AT_STAND_M));
+}
+
+/** One table's liveness on this page: the last time it was in play, and
+ *  the last round this page saw run (betting before its deadline, or
+ *  closing), so a result shown again after a load or a wake isn't one. */
+export interface LiveMemory {
+  hotAt: number | null;
+  ran: { inc: string; r: number } | null;
+}
+
+/** Whether the view shows a round running, by this page's clock. */
+export function roundRuns(v: TableView, ran: LiveMemory['ran'], now: number): boolean {
+  if (v.phase === 'closing') return true;
+  if (v.phase === 'betting') return v.phaseDeadline !== undefined && now < v.phaseDeadline;
+  return ran !== null && ran.inc === v.inc && ran.r === v.round;
+}
+
+/** The table's level this frame (the memory moves with it). With no view
+ *  (just after the switch, a lost switch) only someone standing there
+ *  counts. A clock gone back lingers from now. */
+export function liveStep(m: LiveMemory, v: TableView | null, someoneThere: boolean, now: number): Level {
+  if (v && (v.phase === 'closing' || (v.phase === 'betting' && v.phaseDeadline !== undefined && now < v.phaseDeadline))) {
+    m.ran = { inc: v.inc, r: v.round };
+  }
+  if (someoneThere || (v !== null && roundRuns(v, m.ran, now))) {
+    m.hotAt = now;
+    return 2;
+  }
+  if (m.hotAt !== null && m.hotAt > now) m.hotAt = now;
+  if (m.hotAt !== null && now - m.hotAt < COMPUTED_LIVE_LINGER_MS) return 1;
+  return v?.kind === 'craps' && v.riders > 0 ? 1 : 0;
+}
+
+/** Routines that never work a table (World's croupier test). */
+const NEVER_AT_A_TABLE: ReadonlySet<RobotRoutine> = new Set(['idle', 'custom', 'coach', 'dance', 'pilot', 'disassemble']);
+
+/** Whether a robot of `routine` may work a table, when the room has a
+ *  dedicated croupier (`dedicated`) or not: World's owner-run test as a
+ *  function (a spec ties the two together). */
+export function mayCroupier(routine: RobotRoutine, dedicated: boolean): boolean {
+  return !NEVER_AT_A_TABLE.has(routine) && (!dedicated || routine === 'croupier');
+}
+
+/** A robot as the hand-out sees it: where it stands, and whether it may
+ *  work an owner-run table (`owner`) and a players' table (`computed`). */
+export interface RobotAt { key: string; x: number; z: number; owner: boolean; computed: boolean }
+/** A table that wants a robot, at its post: 3, owner-run with a fresh
+ *  heartbeat; 2, a players' table in play; 1, a quiet one. */
+export interface TablePull { id: string; x: number; z: number; pull: 1 | 2 | 3 }
+
+/**
+ * Hand robots out to `tables` (in the room's order), keeping `assign`
+ * (robot key → table id) sticky: a robot keeps its table while that table
+ * still wants it and it may work there. Owner-run tables first, the nearest
+ * robot not already at one (one at a players' table counts as free, so an
+ * owner-run-only room goes exactly as World's hand-out did); then tables in
+ * play, the nearest free robot, else the nearest at a quiet table; then
+ * quiet tables, free robots only. Ties go to the first robot in the list.
+ */
+export function assignCroupiers(assign: Map<string, string>, robots: readonly RobotAt[], tables: readonly TablePull[]): void {
+  const table = new Map(tables.map((t) => [t.id, t]));
+  const robot = new Map(robots.map((r) => [r.key, r]));
+  for (const [key, tid] of [...assign]) {
+    const r = robot.get(key);
+    const t = table.get(tid);
+    if (!r || !t || !(t.pull === 3 ? r.owner : r.computed)) assign.delete(key);
+  }
+  const taken = new Set(assign.values());
+  const pullAt = (key: string): number => {
+    const tid = assign.get(key);
+    return tid === undefined ? 0 : table.get(tid)!.pull;
+  };
+  const nearest = (t: TablePull, ok: (r: RobotAt) => boolean): RobotAt | null => {
+    let best = Infinity;
+    let out: RobotAt | null = null;
+    for (const r of robots) {
+      if (!ok(r)) continue;
+      const d = Math.hypot(r.x - t.x, r.z - t.z);
+      if (d < best) {
+        best = d;
+        out = r;
+      }
+    }
+    return out;
+  };
+  const give = (r: RobotAt | null, t: TablePull): void => {
+    if (!r) return;
+    const was = assign.get(r.key);
+    if (was !== undefined) taken.delete(was);
+    assign.set(r.key, t.id);
+    taken.add(t.id);
+  };
+  for (const t of tables) if (t.pull === 3 && !taken.has(t.id)) give(nearest(t, (r) => r.owner && pullAt(r.key) !== 3), t);
+  for (const t of tables) {
+    if (t.pull !== 2 || taken.has(t.id)) continue;
+    give(nearest(t, (r) => r.computed && pullAt(r.key) === 0) ?? nearest(t, (r) => r.computed && pullAt(r.key) === 1), t);
+  }
+  for (const t of tables) if (t.pull === 1 && !taken.has(t.id)) give(nearest(t, (r) => r.computed && pullAt(r.key) === 0), t);
+}
+
 // ── 📄 This page's memory, by table ──────────────────────────────────────────
 
 const calls = new Map<string, CallMemory>();
+const live = new Map<string, LiveMemory>();
 let docEpoch: number | null = null;
+let wakes: number | null = null;
+let lastAt: number | null = null;
 
 /** A new room doc (casinoDocEpoch) starts every table afresh. */
 function sameDoc(): void {
@@ -298,6 +447,18 @@ function sameDoc(): void {
   if (epoch === docEpoch) return;
   docEpoch = epoch;
   calls.clear();
+  live.clear();
+}
+
+/** A wake (tablesWakeCount), or a clock gone back a second or more, forgets
+ *  which rounds this page saw run: every table's last result shows again. */
+function sameWake(now: number): void {
+  const n = tablesWakeCount();
+  if (n !== wakes || (lastAt !== null && lastAt - now >= TABLE_CLOCK_SLACK_MS)) {
+    wakes = n;
+    for (const m of live.values()) m.ran = null;
+  }
+  lastAt = now;
 }
 
 const nameOf: NameOf = (pid) => speakableName(readPlayerDisplayName(pid));
@@ -313,7 +474,7 @@ function viewOf(t: string, game: GameName, now: number): TableView | null {
  * page has nothing of it to show (a lost switch keeps what was said). The
  * caller says it, or drops it, then tells noteComputedCallSaid.
  */
-export function computedTableCall(t: string, game: GameName, now = Date.now(), moving = false): TableCall | null {
+export function computedTableCall(t: string, game: GameName, now = Date.now(), moving = false, drawn = false): TableCall | null {
   sameDoc();
   const v = viewOf(t, game, now);
   if (!v) return null;
@@ -329,7 +490,7 @@ export function computedTableCall(t: string, game: GameName, now = Date.now(), m
     if (casinoWhole(t) && computedSettled(t)) primeCalls(m, v);
     return null;
   }
-  return nextCall(game, v, m, { now, moving, name: nameOf });
+  return nextCall(game, v, m, { now, moving, drawn, name: nameOf });
 }
 
 /** The call computedTableCall gave was said, or dropped unsaid. */
@@ -338,7 +499,25 @@ export function noteComputedCallSaid(t: string, c: TableCall): void {
   if (m && c.key.startsWith(`${m.inc}|`)) callSaid(m, c);
 }
 
+/**
+ * Players' table `t`'s level on this page this frame (liveStep), with
+ * `someoneThere` whether an avatar stands at one of its stands. Every
+ * frame, for every table that runs itself, whether it has a post or not:
+ * the linger and the rounds seen run live here.
+ */
+export function computedTableLevel(t: string, game: GameName, someoneThere: boolean, now = Date.now()): Level {
+  sameDoc();
+  sameWake(now);
+  let m = live.get(t);
+  if (!m) {
+    m = { hotAt: null, ran: null };
+    live.set(t, m);
+  }
+  return liveStep(m, viewOf(t, game, now), someoneThere, now);
+}
+
 /** Table `t` left the room: forget it. */
 export function forgetComputedTable(t: string): void {
   calls.delete(t);
+  live.delete(t);
 }

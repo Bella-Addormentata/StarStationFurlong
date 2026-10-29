@@ -186,7 +186,7 @@ describe('every call fits the bubble', () => {
 });
 
 describe('each call once (built views, frame by frame)', () => {
-  type Seg = { v: ComputedRouletteState | ComputedCrapsState; ms: number; moving?: boolean };
+  type Seg = { v: ComputedRouletteState | ComputedCrapsState; ms: number; moving?: boolean; drawn?: boolean };
   /** Step each view for `ms` at 50 ms a frame, saying every call due. */
   function play(segs: Seg[], m = robot.newCallMemory('c1'), start = T): { said: string[]; keys: string[]; m: typeof m; now: number } {
     const said: string[] = [];
@@ -196,7 +196,7 @@ describe('each call once (built views, frame by frame)', () => {
     for (const s of segs) {
       for (const end = now + s.ms; now < end; now += 50) {
         robot.observeCalls(m, s.v, now);
-        const c = robot.nextCall(s.v.kind, s.v, m, { now, moving: s.moving ?? false, name });
+        const c = robot.nextCall(s.v.kind, s.v, m, { now, moving: s.moving ?? false, drawn: s.drawn ?? false, name });
         if (c) {
           said.push(c.text);
           keys.push(c.key);
@@ -330,10 +330,34 @@ describe('each call once (built views, frame by frame)', () => {
     const said: number[] = [];
     for (let now = T; now < T + 9_000; now += 50) {
       robot.observeCalls(m, shown(5, 17), now);
-      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving: true, name });
+      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving: true, drawn: false, name });
       if (c) { said.push(now - T); robot.callSaid(m, c); }
     }
     expect(said).toEqual([robot.RESULT_HOLD_MAX_MS]);
+  });
+
+  it('on a drawn table waits a frame for the felt, then while the wheel spins', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const at: number[] = [];
+    const frames: [number, boolean][] = [[T, false], [T + 16, true], [T + 3_000, true], [T + 5_000, false]];
+    for (const [now, moving] of frames) {
+      robot.observeCalls(m, shown(5, 17), now);
+      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving, drawn: true, name });
+      if (c) { at.push(now); robot.callSaid(m, c); }
+    }
+    expect(at).toEqual([T + 5_000]);
+    // A felt that takes it with nothing to move (the same decision shown again): the next frame.
+    const still = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const got: number[] = [];
+    for (const now of [T, T, T + 16, T + 32]) {
+      robot.observeCalls(still, shown(5, 4), now);
+      const c = robot.nextCall('roulette', shown(5, 4), still, { now, moving: false, drawn: true, name });
+      if (c) { got.push(now); robot.callSaid(still, c); }
+    }
+    expect(got).toEqual([T + 16]);
+    // Endless motion: 8 seconds.
+    const out = play([{ v: shown(5, 17), ms: 9_000, moving: true, drawn: true }], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(out.said).toEqual(['🎡 17 BLACK — house wins']);
   });
 
   it('drops a first call whose show ends while it is held, and closes during a hold', () => {
@@ -352,5 +376,242 @@ describe('each call once (built views, frame by frame)', () => {
     expect(close.said).toEqual(['✋ No more bets!', '🎡 3 RED — house wins']);
     const gone = play([{ v: voided(5), ms: 1_000 }]);
     expect(gone.said).toEqual([]);
+  });
+});
+
+describe('when a robot comes (built views)', () => {
+  const live = (): import('./computedRobot').LiveMemory => ({ hotAt: null, ran: null });
+  const W = T + 18_000;
+
+  it('is in play past no more bets, and betting until the deadline', () => {
+    expect(robot.liveStep(live(), wheel({ phase: 'closing' }), false, T)).toBe(2);
+    expect(robot.liveStep(live(), dice({ phase: 'closing' }), false, T)).toBe(2);
+    expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W - 1)).toBe(2);
+    expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W)).toBe(0);
+    expect(robot.liveStep(live(), wheel({}), false, T)).toBe(0);
+  });
+
+  it('counts a result on show only for a round this page saw run', () => {
+    const m = live();
+    expect(robot.liveStep(m, wheel({ phase: 'settled', result: 4, payouts: {}, spinKey: '5:4' }), false, T)).toBe(0);
+    expect(robot.liveStep(m, wheel({ phase: 'closing', round: 5 }), false, T + 1_000)).toBe(2);
+    expect(m.ran).toEqual({ inc: 'c1', r: 5 });
+    expect(robot.liveStep(m, wheel({ phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 20_000)).toBe(2);
+    // Another incarnation's round 5 is another round.
+    expect(robot.liveStep(m, wheel({ inc: 'c2', phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 40_000)).toBe(0);
+  });
+
+  it('lingers 10 seconds, then is idle; riders keep a craps table quiet', () => {
+    const m = live();
+    expect(robot.liveStep(m, wheel({ phase: 'closing' }), false, T)).toBe(2);
+    expect(robot.liveStep(m, wheel({}), false, T + robot.COMPUTED_LIVE_LINGER_MS - 1)).toBe(1);
+    expect(robot.liveStep(m, wheel({}), false, T + robot.COMPUTED_LIVE_LINGER_MS)).toBe(0);
+    expect(robot.liveStep(live(), dice({ riders: 2 }), false, T)).toBe(1);
+    expect(robot.liveStep(live(), dice({ riders: 0 }), false, T)).toBe(0);
+  });
+
+  it('lingers from now when the clock goes back', () => {
+    const m = live();
+    robot.liveStep(m, wheel({ phase: 'closing' }), false, T + 60_000);
+    expect(robot.liveStep(m, wheel({}), false, T)).toBe(1);
+    expect(m.hotAt).toBe(T);
+    expect(robot.liveStep(m, wheel({}), false, T + robot.COMPUTED_LIVE_LINGER_MS)).toBe(0);
+  });
+
+  it('is in play while someone stands there, even with nothing to show', () => {
+    expect(robot.liveStep(live(), null, true, T)).toBe(2);
+    expect(robot.liveStep(live(), null, false, T)).toBe(0);
+    expect(robot.liveStep(live(), wheel({}), true, T)).toBe(2);
+  });
+
+  it('counts an avatar within 0.7 m of a player stand, never at the robot\'s own', () => {
+    const stands = [{ front: { x: 0, z: 0 } }, { front: { x: 5, z: 0 }, role: 'wheelHead' }];
+    expect(robot.someoneAtStands(stands, [{ x: 0.69, z: 0 }])).toBe(true);
+    expect(robot.someoneAtStands(stands, [{ x: 0.7, z: 0 }])).toBe(false);
+    expect(robot.someoneAtStands(stands, [{ x: 0.4, z: 0.4 }])).toBe(true);
+    expect(robot.someoneAtStands(stands, [{ x: 5, z: 0 }])).toBe(false);
+    expect(robot.someoneAtStands(stands, [])).toBe(false);
+  });
+});
+
+describe('which robot works a table', () => {
+  const ROUTINES = ['serve', 'croupier', 'idle', 'custom', 'coach', 'dance', 'pilot', 'disassemble'] as const;
+  /** world.ts updateCroupier's owner-run robot test, copied (routineOf
+   *  given): a players' table's test must match it. */
+  const todays = (routine: string, hasDedicated: boolean): boolean =>
+    routine !== 'idle' &&
+    routine !== 'custom' &&
+    routine !== 'coach' &&
+    routine !== 'dance' &&
+    routine !== 'pilot' &&
+    routine !== 'disassemble' &&
+    (!hasDedicated || routine === 'croupier');
+
+  it('allows the routines World allows, with and without a dedicated croupier', () => {
+    for (const r of ROUTINES) for (const d of [false, true]) expect(robot.mayCroupier(r, d)).toBe(todays(r, d));
+  });
+
+  /** world.ts updateCroupier's hand-out before PR 4, copied: the drop and
+   *  the fill over the live tables, as a function of what it reads. */
+  function todaysHandOut(
+    assign: Map<string, string>, keys: readonly string[], pos: Map<string, { x: number; z: number }>,
+    liveTableIds: readonly string[], posts: Map<string, { x: number; z: number }>, eligible: (k: string) => boolean,
+  ): void {
+    const liveIdSet = new Set(liveTableIds);
+    for (const [key, tid] of [...assign]) {
+      if (!eligible(key) || !liveIdSet.has(tid)) assign.delete(key);
+    }
+    const takenTables = new Set(assign.values());
+    const freeRobots = keys.filter((k) => eligible(k) && !assign.has(k));
+    for (const tid of liveTableIds) {
+      if (takenTables.has(tid)) continue;
+      const post = posts.get(tid)!;
+      let bestKey: string | null = null;
+      let best = Infinity;
+      for (const key of freeRobots) {
+        const bp = pos.get(key)!;
+        const d = Math.hypot(bp.x - post.x, bp.z - post.z);
+        if (d < best) {
+          best = d;
+          bestKey = key;
+        }
+      }
+      if (bestKey) {
+        assign.set(bestKey, tid);
+        takenTables.add(tid);
+        freeRobots.splice(freeRobots.indexOf(bestKey), 1);
+      }
+    }
+  }
+
+  /** A seeded room: robots and tables on a small grid (ties happen), some
+   *  robots unable to work, some tables owner-run with a heartbeat. */
+  function randomRoom(seed: number, mixed: boolean) {
+    let s = seed >>> 0;
+    const rnd = (): number => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 2 ** 32;
+    };
+    const cell = (): number => Math.floor(rnd() * 5);
+    const robots = Array.from({ length: 1 + Math.floor(rnd() * 5) }, (_, i) => ({
+      key: `r${i}`, x: cell(), z: cell(), owner: rnd() < 0.8, computed: rnd() < 0.8,
+    }));
+    const tables = Array.from({ length: 1 + Math.floor(rnd() * 5) }, (_, i) => {
+      const owner = !mixed || rnd() < 0.5;
+      return { id: `t${i}`, x: cell(), z: cell(), owner, pull: (owner ? 3 : 2) as 0 | 1 | 2 | 3 };
+    });
+    /** Frame to frame an owner-run table's heartbeat starts and stops, and
+     *  a players' table goes in and out of play (a table keeps its kind). */
+    const flip = (t: (typeof tables)[number]): void => {
+      t.pull = t.owner ? (t.pull === 3 ? 0 : 3) : ([0, 1, 2].filter((x) => x !== t.pull)[Math.floor(rnd() * 2)] as 0 | 1 | 2);
+    };
+    return { robots, tables, rnd, flip };
+  }
+
+  it('in a room with only owner-run tables, hands out exactly as World did (500 rooms, 6 frames each)', () => {
+    for (let seed = 1; seed <= 500; seed++) {
+      const { robots, tables, rnd, flip } = randomRoom(seed, false);
+      const ours = new Map<string, string>();
+      const theirs = new Map<string, string>();
+      for (let f = 0; f < 6; f++) {
+        // Frame to frame tables come and go and robots walk.
+        for (const t of tables) if (rnd() < 0.2) flip(t);
+        for (const r of robots) if (rnd() < 0.3) { r.x = Math.floor(rnd() * 5); r.z = Math.floor(rnd() * 5); }
+        const pulls = tables.filter((t) => t.pull === 3).map((t) => ({ id: t.id, x: t.x, z: t.z, pull: 3 as const }));
+        robot.assignCroupiers(ours, robots, pulls);
+        todaysHandOut(
+          theirs, robots.map((r) => r.key), new Map(robots.map((r) => [r.key, r])), pulls.map((t) => t.id),
+          new Map(pulls.map((t) => [t.id, t])), (k) => robots.find((r) => r.key === k)!.owner,
+        );
+        expect([...ours].sort(), `room ${seed}, frame ${f}`).toEqual([...theirs].sort());
+      }
+    }
+  });
+
+  it('in a room with both kinds, the owner-run tables get what World would give them alone (500 rooms)', () => {
+    for (let seed = 1; seed <= 500; seed++) {
+      const { robots, tables, rnd, flip } = randomRoom(seed, true);
+      const ours = new Map<string, string>();
+      const theirs = new Map<string, string>();
+      for (let f = 0; f < 6; f++) {
+        for (const t of tables) if (rnd() < 0.3) flip(t);
+        for (const r of robots) if (rnd() < 0.3) { r.x = Math.floor(rnd() * 5); r.z = Math.floor(rnd() * 5); }
+        const pulls = tables.filter((t) => t.pull > 0).map((t) => ({ id: t.id, x: t.x, z: t.z, pull: t.pull as 1 | 2 | 3 }));
+        robot.assignCroupiers(ours, robots, pulls);
+        const owned = pulls.filter((t) => t.pull === 3);
+        todaysHandOut(
+          theirs, robots.map((r) => r.key), new Map(robots.map((r) => [r.key, r])), owned.map((t) => t.id),
+          new Map(owned.map((t) => [t.id, t])), (k) => robots.find((r) => r.key === k)!.owner,
+        );
+        const ownedIds = new Set(owned.map((t) => t.id));
+        const oursOwned = [...ours].filter(([, tid]) => ownedIds.has(tid)).sort();
+        expect(oursOwned, `room ${seed}, frame ${f}`).toEqual([...theirs].sort());
+        // Every robot works one table at most, and every table has one robot at most.
+        expect(new Set(ours.values()).size).toBe(ours.size);
+        // Each robot may work the table it has.
+        const pullOf = new Map(pulls.map((t) => [t.id, t.pull]));
+        for (const [key, tid] of ours) {
+          const r = robots.find((x) => x.key === key)!;
+          expect(pullOf.get(tid) === 3 ? r.owner : r.computed).toBe(true);
+        }
+      }
+    }
+  });
+
+  const R = (key: string, x: number, over: Partial<import('./computedRobot').RobotAt> = {}) => ({ key, x, z: 0, owner: true, computed: true, ...over });
+  const P = (id: string, x: number, pull: 1 | 2 | 3) => ({ id, x, z: 0, pull });
+
+  it('an owner-run table takes the nearest robot, even one at a players\' table, which then takes a free one', () => {
+    const assign = new Map([['a', 'players']]);
+    robot.assignCroupiers(assign, [R('a', 1), R('b', 9)], [P('owner', 0, 3), P('players', 2, 2)]);
+    expect(Object.fromEntries(assign)).toEqual({ a: 'owner', b: 'players' });
+  });
+
+  it('a table in play takes a free robot first, then one from a quiet table, never from another in play or an owner-run table', () => {
+    const free = new Map([['a', 'quiet']]);
+    robot.assignCroupiers(free, [R('a', 1), R('b', 9)], [P('quiet', 1, 1), P('play', 0, 2)]);
+    expect(Object.fromEntries(free)).toEqual({ a: 'quiet', b: 'play' });
+    const handover = new Map([['a', 'quiet']]);
+    robot.assignCroupiers(handover, [R('a', 1)], [P('quiet', 1, 1), P('play', 0, 2)]);
+    expect(Object.fromEntries(handover)).toEqual({ a: 'play' });
+    const busy = new Map([['a', 'other'], ['b', 'owner']]);
+    robot.assignCroupiers(busy, [R('a', 1), R('b', 0)], [P('other', 1, 2), P('owner', 0, 3), P('play', 0, 2)]);
+    expect(Object.fromEntries(busy)).toEqual({ a: 'other', b: 'owner' });
+  });
+
+  it('quiet tables get only free robots; ties go to the first robot; assignments stick', () => {
+    const q = new Map([['a', 'q1']]);
+    robot.assignCroupiers(q, [R('a', 1)], [P('q1', 5, 1), P('q2', 1, 1)]);
+    expect(Object.fromEntries(q)).toEqual({ a: 'q1' });
+    const tie = new Map<string, string>();
+    robot.assignCroupiers(tie, [R('b', 1), R('a', -1)], [P('t', 0, 2)]);
+    expect(Object.fromEntries(tie)).toEqual({ b: 't' });
+    const stick = new Map([['far', 't']]);
+    robot.assignCroupiers(stick, [R('near', 0), R('far', 9)], [P('t', 0, 2)]);
+    expect(Object.fromEntries(stick)).toEqual({ far: 't' });
+  });
+
+  it('lets go of a robot that may no longer work its table, or whose table no longer wants one', () => {
+    const a = new Map([['a', 'players'], ['b', 'owner']]);
+    robot.assignCroupiers(a, [R('a', 0, { computed: false }), R('b', 0, { owner: false })], [P('players', 0, 2), P('owner', 0, 3)]);
+    expect(Object.fromEntries(a)).toEqual({ a: 'owner', b: 'players' });
+    const none = new Map([['a', 'players'], ['b', 'owner']]);
+    robot.assignCroupiers(none, [R('a', 0, { computed: false, owner: false }), R('b', 0, { owner: false, computed: false })], [P('players', 0, 2), P('owner', 0, 3)]);
+    expect(none.size).toBe(0);
+    const b = new Map([['a', 'gone']]);
+    robot.assignCroupiers(b, [R('a', 0)], []);
+    expect(b.size).toBe(0);
+  });
+});
+
+describe("the craps table's test of running itself", () => {
+  it("is the stickman's own (crapsCroupier crapsRunsItself), read from casinoDoc", async () => {
+    const { readFileSync } = await import('node:fs');
+    const stickman = readFileSync(new URL('./crapsCroupier.ts', import.meta.url), 'utf8');
+    const ours = readFileSync(new URL('./computedRobot.ts', import.meta.url), 'utf8');
+    expect(stickman).toContain("return isComputedFor(tableId, 'craps') || computedSwitchLost(tableId, 'craps');");
+    expect(ours).toContain("game === 'craps' ? isComputedFor(t, 'craps') || computedSwitchLost(t, 'craps')");
+    // (And no import of the stickman's module graph.)
+    expect(ours).not.toMatch(/from '\.\/crapsCroupier'/);
   });
 });

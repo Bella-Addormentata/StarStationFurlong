@@ -15,11 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { dutyRank } from './computedFold';
 import {
-  clockOf, CRAPS_REF, CRAPS_TABLE, crapsBet, deleteIn, frame, keysIn, loadPage, openCrapsRoom, openRoom, PAGE_CTX as CTX,
-  PAGE_TABLE as TABLE, putIn, rigRoll, run, standAt, switchOn, sync,
+  clockOf, CRAPS_REF, CRAPS_TABLE, crapsBet, crapsPointOn, deleteIn, frame, loadPage, openCrapsRoom, openRoom, PAGE_CTX as CTX,
+  PAGE_TABLE as TABLE, putIn, rigRoll, standAt, switchOn, sync,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { ComputedKit, red, straight, testIdentity } from './computedTestKit';
+import { ComputedKit, red, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
@@ -64,7 +64,8 @@ const foldOf = (p: Page, t = TABLE) => p.casino.computedFoldOf(t)!;
 
 interface Ear {
   said: { at: number; text: string; key: string }[];
-  /** One frame of the page's robot at T: the call it gives, taken as said. */
+  /** One frame of the page's robot at T (its level, then its call), the
+   *  call it gives taken as said. */
   hear(T: number, moving?: boolean): void;
   /** Frames from `from` to `to` (inclusive). */
   hearFor(from: number, to: number, moving?: boolean): void;
@@ -78,6 +79,8 @@ function ear(p: Page, game: 'roulette' | 'craps' = 'roulette', t = TABLE): Ear {
     hear(T, moving = false) {
       const now = clockOf(p, T);
       p.croupier.noteTablesRunning(now);
+      // (World asks the level first, every frame, then the call.)
+      p.robot.computedTableLevel(t, game, false, now);
       const c = p.robot.computedTableCall(t, game, now, moving);
       if (!c) return;
       said.push({ at: T, text: c.text, key: c.key });
@@ -315,6 +318,114 @@ describe('a craps roll on real pages', () => {
     // The point is on: the pass line rides, and the dice go to the first stand.
     expect(ea.texts()[2]).toMatch(new RegExp(`^🎲 \\d\\+\\d = 6 — house collects, the dice pass to ${v.holder === a.pid ? 'player-A' : 'player-B'}$`));
     expect(ea.texts()[3]).toBe('🎲 The point is 6 — place your bets!');
+  });
+});
+
+describe('when a robot comes, on real pages', () => {
+  /** Page p's level for table t at T, nobody standing there unless `there`. */
+  const level = (p: Page, T: number, game: 'roulette' | 'craps' = 'roulette', t = TABLE, there = false) => {
+    const now = clockOf(p, T);
+    p.croupier.noteTablesRunning(now);
+    return p.robot.computedTableLevel(t, game, there, now);
+  };
+
+  it('a round seen run is in play through its show, then lingers 10 seconds', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const levels: [number, number][] = [];
+    const script = roundOf(o, 1, T0 + 1_000);
+    for (let T = T0; T <= T0 + 45_000; T += STEP) {
+      for (const [at, act] of script) if (at === T) { clockOf(o, T); act(); }
+      e.hear(T);
+      const l = level(o, T);
+      if (levels.at(-1)?.[1] !== l) levels.push([T, l]);
+    }
+    const showEnd = T0 + 20_000 + o.table.SHOW_MS;
+    // (In play last on the show's last frame.)
+    expect(levels).toEqual([[T0, 0], [T0 + 1_000, 2], [showEnd, 1], [showEnd - STEP + o.robot.COMPUTED_LIVE_LINGER_MS, 0]]);
+  });
+
+  /** Page p's level at every frame from `from` to `to`, as [time, level]
+   *  at each change. */
+  const levelsFor = (p: Page, from: number, to: number): [number, number][] => {
+    const out: [number, number][] = [];
+    for (let T = from; T <= to; T += STEP) {
+      const l = level(p, T);
+      if (out.at(-1)?.[1] !== l) out.push([T, l]);
+    }
+    return out;
+  };
+
+  it("a stuck round (its only bettor gone before the close) is in play until the deadline, then quiet 10 seconds, then idle", async () => {
+    const o = await watch();
+    putAt(o, T0, kit.slip(X, 1, [red(5)]));
+    const deadline = T0 + o.table.BET_WINDOW_MS;
+    expect(levelsFor(o, T0, deadline + 20_000)).toEqual([[T0, 2], [deadline, 1], [deadline - STEP + o.robot.COMPUTED_LIVE_LINGER_MS, 0]]);
+    expect(o.table.readComputedRoulette(TABLE, deadline + 20_000)).toMatchObject({ phase: 'betting', round: 1, phaseDeadline: deadline });
+  });
+
+  it('a page that loads during a show stays idle: the result shown again is no round it saw run', async () => {
+    const o = await watch();
+    const e0 = ear(o);
+    play(o, e0, roundOf(o, 1, T0), T0, T0 + 20_000);
+    expect(level(o, T0 + 20_000)).toBe(2);
+    const p = await loadPage('P', 2);
+    sync(T0 + 21_000, o, p);
+    expect(p.table.readComputedRoulette(TABLE, T0 + 21_000)).toMatchObject({ phase: 'settled', round: 1 });
+    expect(levelsFor(p, T0 + 21_000, T0 + 21_000 + p.table.SHOW_MS + 1_000)).toEqual([[T0 + 21_000, 0]]);
+    // The same after a wake on a page that had seen it run.
+    const wake = T0 + 60_000;
+    expect(level(o, wake)).toBe(0);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(o.table.readComputedRoulette(TABLE, wake)).toMatchObject({ phase: 'settled', round: 1 });
+    expect(levelsFor(o, wake, wake + o.table.SHOW_MS)).toEqual([[wake, 0]]);
+  });
+
+  it('a heartbeat (an earlier build, or a lost switch) moves no level, and the table still runs itself', async () => {
+    const o = await watch();
+    const twin = await watch();
+    for (const p of [o, twin]) putAt(p, T0, kit.slip(X, 1, [red(5)]));
+    for (let T = T0; T <= T0 + 40_000; T += 1_000) {
+      if (T % 3_000 === 0) {
+        clockOf(o, T);
+        o.casino.writeCroupierBeat(TABLE, T);
+      }
+      expect(o.robot.tableRunsItself(TABLE, 'roulette')).toBe(true);
+      expect(level(o, T)).toBe(level(twin, T));
+    }
+    // The switch lost under a live incarnation: still the players', at both games.
+    clockOf(o, T0 + 41_000);
+    o.doc.getMap('casino').delete(`cfg:computed:${TABLE}`);
+    o.casino.writeCroupierBeat(TABLE, T0 + 41_000);
+    expect(o.casino.computedSwitchLost(TABLE)).toBe(true);
+    expect(o.croupier.isCroupierLive(TABLE)).toBe(true);
+    expect(o.robot.tableRunsItself(TABLE, 'roulette')).toBe(true);
+    expect(level(o, T0 + 41_000)).toBe(0);
+    expect(level(o, T0 + 41_000, 'roulette', TABLE, true)).toBe(2);
+    const { pages: [a] } = await crapsPointOn(['A'], [1], T0 + 50_000);
+    clockOf(a, T0 + 120_000);
+    a.doc.getMap('casino').delete(`cfg:computed:${CRAPS_TABLE}`);
+    a.casino.writeCroupierBeat(CRAPS_TABLE, T0 + 120_000);
+    expect(a.robot.tableRunsItself(CRAPS_TABLE, 'craps')).toBe(true);
+  });
+
+  it('bets riding on a craps table keep it quiet, with nobody there and no window', async () => {
+    const { pages, showEnd } = await crapsPointOn(['A', 'B'], [1, 3], T0);
+    const [a] = pages;
+    const after = showEnd + 20_000;
+    const v = a.table.readComputedCraps(CRAPS_TABLE, after)!;
+    expect(v).toMatchObject({ phase: 'betting', point: 6, riders: 2 });
+    expect(v.phaseDeadline).toBeUndefined();
+    expect(level(a, after, 'craps', CRAPS_TABLE)).toBe(1);
+    expect(level(a, after + 60_000, 'craps', CRAPS_TABLE)).toBe(1);
+  });
+
+  it('never reads seat records', async () => {
+    const o = await watch();
+    const twin = await watch();
+    clockOf(o, T0);
+    o.casino.writeMySeat(TABLE, X.pid, { stand: 1, angle: 0, at: T0 });
+    for (let T = T0; T <= T0 + 20_000; T += 1_000) expect(level(o, T)).toBe(level(twin, T));
   });
 });
 
