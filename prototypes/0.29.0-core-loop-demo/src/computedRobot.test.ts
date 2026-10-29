@@ -184,3 +184,173 @@ describe('every call fits the bubble', () => {
     }
   });
 });
+
+describe('each call once (built views, frame by frame)', () => {
+  type Seg = { v: ComputedRouletteState | ComputedCrapsState; ms: number; moving?: boolean };
+  /** Step each view for `ms` at 50 ms a frame, saying every call due. */
+  function play(segs: Seg[], m = robot.newCallMemory('c1'), start = T): { said: string[]; keys: string[]; m: typeof m; now: number } {
+    const said: string[] = [];
+    const keys: string[] = [];
+    let now = start;
+    if (!m.primed) robot.primeCalls(m, segs[0].v);
+    for (const s of segs) {
+      for (const end = now + s.ms; now < end; now += 50) {
+        robot.observeCalls(m, s.v, now);
+        const c = robot.nextCall(s.v.kind, s.v, m, { now, moving: s.moving ?? false, name });
+        if (c) {
+          said.push(c.text);
+          keys.push(c.key);
+          robot.callSaid(m, c);
+        }
+      }
+    }
+    return { said, keys, m, now };
+  }
+  const W = T + 18_000;
+  const open = (r: number, d: number | undefined, key = ''): ComputedRouletteState =>
+    wheel({ round: r, ...(d !== undefined ? { phaseDeadline: d } : {}), spinKey: key });
+  const closing = (r: number, key = ''): ComputedRouletteState => wheel({ phase: 'closing', round: r, spinKey: key });
+  const shown = (r: number, pocket: number, paid = false): ComputedRouletteState =>
+    wheel({ phase: 'settled', round: r, result: pocket, payouts: paid ? { 'player-Ann': 36 } : {}, spinKey: `${r}:${pocket}`, phaseDeadline: T });
+  const voided = (r: number): ComputedRouletteState => wheel({ phase: 'settled', round: r, voided: true, payouts: {}, spinKey: '' });
+
+  it('a full round gives open, close and result once each over 300 frames', () => {
+    const out = play([
+      { v: open(5, undefined, '4:9'), ms: 2_000 },
+      { v: open(5, W, '4:9'), ms: 5_000 },
+      { v: closing(5, '4:9'), ms: 3_000 },
+      { v: shown(5, 17, true), ms: 5_000 },
+    ], robot.newCallMemory('c1'));
+    expect(out.said).toEqual(['🎲 Place your bets!', '✋ No more bets!', '🎡 17 BLACK — winners paid!']);
+    expect(out.keys).toEqual([`c1|5|open|${W}`, 'c1|5|close|' + W, 'c1|5|result|17']);
+  });
+
+  it('calls A, then B, then A again: three results', () => {
+    const out = play([
+      { v: shown(5, 17), ms: 1_000 },
+      { v: shown(5, 4), ms: 1_000 },
+      { v: shown(5, 17), ms: 1_000 },
+    ], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(out.said).toEqual(['🎡 17 BLACK — house wins', '🎡 Round 5 is now 4 BLACK — house wins', '🎡 Round 5 is now 17 BLACK — house wins']);
+  });
+
+  it('corrects a result changed after its show, once', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const out = play([
+      { v: shown(5, 17), ms: 1_000 },
+      { v: open(6, W, '5:17'), ms: 1_000 },
+      { v: open(6, W, '5:4'), ms: 2_000 },
+    ], m);
+    expect(out.said).toEqual(['🎡 17 BLACK — house wins', '🎲 Place your bets!', '🎡 Round 5 is now 4 BLACK']);
+  });
+
+  it('says nothing of a round first seen after its show', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const out = play([{ v: closing(6, '5:17'), ms: 1_000 }, { v: open(7, W, '5:17'), ms: 500 }], m);
+    expect(out.said).toEqual(['✋ No more bets!', '🎲 Place your bets!']);
+    expect(m.called.get(5)).toBe('17');
+  });
+
+  it('is silent for a re-show after a sleep or an undo, and for a new decision on the same dice', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const out = play([
+      { v: shown(5, 17), ms: 1_000 },
+      { v: open(6, W, '5:17'), ms: 500 },
+      { v: shown(5, 17), ms: 1_000 }, // the undo takes round 6 back; round 5 shows again
+    ], m);
+    expect(out.said).toEqual(['🎡 17 BLACK — house wins', '🎲 Place your bets!']);
+    const k = robot.newCallMemory('k1');
+    k.primed = true;
+    const craps = play([
+      { v: roll(3, 5, { inc: 'k1', rollBy: 'close-a' }), ms: 1_000 },
+      { v: roll(3, 5, { inc: 'k1', rollBy: 'forfeit-b' }), ms: 1_000 },
+    ], k);
+    expect(craps.said).toEqual(['🎲 3+5 = 8 — house collects']);
+  });
+
+  it('calls a void once, and a void turned into a result, and back', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const out = play([
+      { v: voided(5), ms: 1_000 },
+      { v: shown(5, 17), ms: 1_000 },
+      { v: voided(5), ms: 1_000 },
+    ], m);
+    expect(out.said).toEqual(['⚠ No spin — stakes returned', '🎡 Round 5 is now 17 BLACK — house wins', '⚠ No spin — stakes returned']);
+    const k = Object.assign(robot.newCallMemory('k1'), { primed: true });
+    expect(play([{ v: dice({ inc: 'k1', phase: 'settled', voided: true, payouts: {} }), ms: 1_000 }], k).said)
+      .toEqual(['⚠ No roll — every bet stands']);
+  });
+
+  it("a forfeit's hold, then its result: one close and one result", () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const out = play([
+      { v: open(5, W, '4:9'), ms: 500 },
+      { v: closing(5, '4:9'), ms: 1_000 },
+      { v: closing(5, ''), ms: 3_000 }, // the grace holds the result
+      { v: shown(5, 2), ms: 1_000 },
+    ], m);
+    expect(out.said).toEqual(['🎲 Place your bets!', '✋ No more bets!', '🎡 2 BLACK — house wins']);
+  });
+
+  it('opens a window again once it ran out, and closes once', () => {
+    const W2 = W + 30_000;
+    const out = play([
+      { v: open(5, W, '4:9'), ms: 500 },
+      { v: open(5, undefined, '4:9'), ms: 500 }, // ran out with every chip taken down
+      { v: open(5, W2, '4:9'), ms: 500 },
+      { v: closing(5, '4:9'), ms: 500 },
+    ], Object.assign(robot.newCallMemory('c1'), { primed: true }), W - 500);
+    expect(out.said).toEqual(['🎲 Place your bets!', '🎲 Place your bets!', '✋ No more bets!']);
+    expect(out.keys[2]).toBe(`c1|5|close|${W2}`);
+  });
+
+  it('stays quiet for a flap back to the same window, and for a deadline that moves', () => {
+    const out = play([
+      { v: open(5, W, '4:9'), ms: 500 },
+      { v: open(5, W + 2_000, '4:9'), ms: 500 }, // a late re-show pushed it back
+      { v: closing(5, '4:9'), ms: 500 },
+      { v: open(5, W + 2_000, '4:9'), ms: 500 }, // an invalid close, taken back
+      { v: closing(5, '4:9'), ms: 500 },
+    ], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(out.said).toEqual(['🎲 Place your bets!', '✋ No more bets!']);
+  });
+
+  it('never says place your bets at or after the deadline', () => {
+    const out = play([{ v: open(5, T + 100, '4:9'), ms: 1_000 }], Object.assign(robot.newCallMemory('c1'), { primed: true }), T + 100);
+    expect(out.said).toEqual([]);
+  });
+
+  it('holds the result while the wheel spins, at most 8 seconds', () => {
+    const still = play([
+      { v: shown(5, 17), ms: 5_000, moving: true },
+      { v: shown(5, 17), ms: 1_000 },
+    ], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(still.said).toEqual(['🎡 17 BLACK — house wins']);
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const said: number[] = [];
+    for (let now = T; now < T + 9_000; now += 50) {
+      robot.observeCalls(m, shown(5, 17), now);
+      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving: true, name });
+      if (c) { said.push(now - T); robot.callSaid(m, c); }
+    }
+    expect(said).toEqual([robot.RESULT_HOLD_MAX_MS]);
+  });
+
+  it('drops a first call whose show ends while it is held, and closes during a hold', () => {
+    const out = play([
+      { v: shown(5, 17), ms: 2_000, moving: true },
+      { v: closing(6, '5:17'), ms: 1_000, moving: true },
+      { v: closing(6, '5:17'), ms: 1_000 },
+    ], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(out.said).toEqual(['✋ No more bets!']);
+  });
+
+  it('primes mid-show and mid-close with nothing old, then speaks the next round', () => {
+    const mid = play([{ v: shown(5, 17), ms: 2_000 }, { v: open(6, W, '5:17'), ms: 500 }]);
+    expect(mid.said).toEqual(['🎲 Place your bets!']);
+    const close = play([{ v: closing(6, '5:17'), ms: 1_000 }, { v: shown(6, 3), ms: 500 }]);
+    expect(close.said).toEqual(['✋ No more bets!', '🎡 3 RED — house wins']);
+    const gone = play([{ v: voided(5), ms: 1_000 }]);
+    expect(gone.said).toEqual([]);
+  });
+});

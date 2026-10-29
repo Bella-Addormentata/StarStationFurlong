@@ -43,6 +43,8 @@ export interface Page {
   fold: typeof import('./computedFold');
   keypair: typeof import('./keypair');
   stands: typeof import('./localStands');
+  /** Its robot at the players' tables (computedRobot), of this load. */
+  robot: typeof import('./computedRobot');
   /** This page's next fresh seeds, drawn first (then random ones). */
   seeds: string[];
 }
@@ -98,6 +100,7 @@ export async function loadPage(
   const fold = await import('./computedFold');
   const keypair = await import('./keypair');
   const stands = await import('./localStands');
+  const robot = await import('./computedRobot');
   // (This load's own modules: a reload listens afresh, as a page loaded again does.)
   if (opts.hears) table.listenToRoom();
   const doc = new Y.Doc();
@@ -106,7 +109,7 @@ export async function loadPage(
   casino.bindCasinoDoc(doc, PAGE_ROOM, opts.resync);
   const pub = keypair.getIdentityPub();
   doc.transact(() => doc.getMap('players').set(pid, { keyB64: pub, name: pid }));
-  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair, stands, seeds };
+  return { name, pid, pub, skew: opts.skew ?? 0, doc, casino, croupier, table, fair, fold, keypair, stands, robot, seeds };
 }
 
 /** Pages for `names` (Yjs clients 1, 2, …, clocks `skews` ahead of the
