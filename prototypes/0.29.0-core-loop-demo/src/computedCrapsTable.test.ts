@@ -2306,7 +2306,9 @@ describe('the ⚙ card at a computed craps table', () => {
     const ta = atCraps(a, { stand: 1, house: true });
     go(pages, decidedAt + STEP, decidedAt + 2 * STEP);
     const card = ta.card();
-    expect(card).toContain("NOBODY RUNS THIS TABLE · THE PLAYERS' PAGES MOVE IT ALONG · ANYONE CAN LOOK");
+    expect(card).not.toContain('NOBODY RUNS THIS TABLE');
+    expect(card).not.toContain('YOU RUN THIS TABLE');
+    expect(card).not.toContain('THE OWNER SETS THIS TABLE');
     expect(card).toContain('The dice go clockwise to players counted at their stand on the last roll: they had a bet down at their stand, '
       + 'with their seed in on time. A shooter keeps them until a seven-out; on a come-out, and on the roll that makes the point, '
       + 'they must be counted at their stand to keep them.');

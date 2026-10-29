@@ -382,7 +382,9 @@ describe("a computed table's ⚙ card", () => {
     at(a, T0);
     const t = atTable(a, { house: true });
     const card = t.card();
-    expect(card).toContain("NOBODY RUNS THIS TABLE · THE PLAYERS' PAGES MOVE IT ALONG · ANYONE CAN LOOK");
+    expect(card).not.toContain('NOBODY RUNS THIS TABLE');
+    expect(card).not.toContain('YOU RUN THIS TABLE');
+    expect(card).not.toContain('THE OWNER SETS THIS TABLE');
     expect(card).toContain("BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN");
     expect(card).toContain("PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS");
     for (const act of ['spin', 'next', 'fairness']) expect(card).not.toContain(`data-act="${act}"`);
@@ -400,6 +402,9 @@ describe("a computed table's ⚙ card", () => {
     expect(legacy.card()).toContain('data-act="spin"');
     expect(legacy.card()).toContain('YOU RUN THIS TABLE');
     legacy.unmount();
+    const guest = atTable(a, { house: false, t: 'roulette-legacy' });
+    expect(guest.card()).toContain('THE OWNER SETS THIS TABLE · ANYONE CAN LOOK');
+    guest.unmount();
   });
 
   it("shows the house's switch row with the dev flag only, at either game, never to a player", () => {
