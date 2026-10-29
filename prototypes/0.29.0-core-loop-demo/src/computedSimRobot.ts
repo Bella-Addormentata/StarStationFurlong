@@ -156,11 +156,15 @@ interface Track {
    *  design's silent one; one that left the screen meanwhile, `left`, is on
    *  screen afresh when it shows again). */
   pending: { r: number; value: string; since: number; due: number; excused: boolean; left?: boolean } | null;
+  /** The result (or void) on screen, and the frame it first showed here
+   *  (a frame whose records wait for their check, or before the table was
+   *  first counted, too). */
+  shownAt: { r: number; value: string; at: number } | null;
   /** What the screen showed at the last frame since the table was first
    *  counted (a frame whose records wait for their check too), and whether
-   *  its wheel or dice were still bringing it: moving, or the frame a drawn
-   *  table waits for its felt (a wake counts it as called, but one still
-   *  coming). */
+   *  its wheel or dice were still bringing it: moving, or the frame it first
+   *  showed on a drawn table, before its felt takes it (a wake counts it as
+   *  called, but one still coming). */
   lastShown: { r: number; value: string } | null;
   lastHeld: boolean;
 }
@@ -271,9 +275,12 @@ export class RobotWatch {
         if (!id.startsWith(`${sp.name}|`) || tr.load !== sp.loads) continue;
         if (tr.lastShown && tr.lastHeld) {
           // (Still coming: due again from the wake's first checked frame,
-          // its hold started afresh; or, its show passed meanwhile, the
-          // design's silent one, as for records that waited for a check.)
-          if (tr.pending?.r === tr.lastShown.r && tr.pending.value === tr.lastShown.value) Object.assign(tr.pending, { since: now, due: now, excused: true, left: false });
+          // its hold started afresh there; or, its show passed meanwhile,
+          // the design's silent one, as for records that waited for a
+          // check. A change that left the screen before is gone: the robot's
+          // hold of it ended, and one that comes back is new.)
+          if (tr.pending?.r === tr.lastShown.r && tr.pending.value === tr.lastShown.value) Object.assign(tr.pending, { due: now, excused: true, left: true });
+          else tr.pending = null;
           continue;
         }
         if (tr.lastShown) tr.known.set(tr.lastShown.r, tr.lastShown.value);
@@ -338,7 +345,7 @@ export class RobotWatch {
     const id = `${sp.name}|${t}`;
     let tr = this.tracks.get(id);
     if (!tr || tr.load !== sp.loads) {
-      tr = { load: sp.loads, inc: null, primed: false, known: new Map(), opens: new Map(), closes: new Map(), timesUp: new Set(), wait: null, pending: null, lastShown: null, lastHeld: false };
+      tr = { load: sp.loads, inc: null, primed: false, known: new Map(), opens: new Map(), closes: new Map(), timesUp: new Set(), wait: null, pending: null, shownAt: null, lastShown: null, lastHeld: false };
       this.tracks.set(id, tr);
     }
     if (!v) {
@@ -354,6 +361,7 @@ export class RobotWatch {
       tr.timesUp.clear();
       tr.wait = null;
       tr.pending = null;
+      tr.shownAt = null;
       tr.lastShown = null;
       tr.lastHeld = false;
     }
@@ -362,7 +370,13 @@ export class RobotWatch {
     else if (tr.wait?.r === v.round && v.phase === 'betting' && d !== undefined && now < d) tr.wait = null;
     const k = keyOf(v);
     const onShow = (r: number): boolean => v.phase === 'settled' && v.round === r;
-    // (A hold started in the future is a clock gone back.)
+    // What the screen shows (a void only on show), and since when, every
+    // frame. (A hold started in the future is a clock gone back: it holds
+    // from now; and a show: it showed before now.)
+    const shown = k ?? (v.phase === 'settled' && v.voided ? { r: v.round, value: VOID } : null);
+    if (!shown) tr.shownAt = null;
+    else if (tr.shownAt?.r !== shown.r || tr.shownAt.value !== shown.value) tr.shownAt = { ...shown, at: now };
+    else if (tr.shownAt.at > now) tr.shownAt.at = now - 1;
     if (tr.pending && tr.pending.since > now) tr.pending.since = now;
     if (!tr.primed) {
       // R3.
@@ -377,13 +391,12 @@ export class RobotWatch {
     // A window's deadline that moved while it ran is the same window.
     const o = tr.opens.get(v.round);
     if (v.phase === 'betting' && d !== undefined && o && now < o.deadline) o.deadline = d;
-    // What the screen shows (a void only on show), and whether it is still
-    // coming, for a wake: while the dice fly, or the frame a drawn table
-    // first shows it (at craps only a roll on show; never a void).
-    const shown = k ?? (v.phase === 'settled' && v.voided ? { r: v.round, value: VOID } : null);
+    // Whether what shows is still coming, for a wake: while the dice fly, or
+    // on the frame it first shows on a drawn table (at craps only a roll on
+    // show; never a void).
     const isPending = (x: { r: number; value: string } | null): boolean => x !== null && tr.pending?.r === x.r && tr.pending.value === x.value;
     const stillComing = (): boolean => shown !== null && shown.value !== VOID && (game === 'roulette' || onShow(shown.r))
-      && (moving || (drawn && isPending(shown) && now <= tr.pending!.since));
+      && (moving || (drawn && now <= tr.shownAt!.at));
     tr.lastShown = shown;
     // R3's second half: nothing while a record waits for its check (and no
     // change seen is due until it is checked).
@@ -405,10 +418,10 @@ export class RobotWatch {
         tr.known.set(shown.r, shown.value);
         // (A show that passed while its records waited for their check is
         // the design's silent one; any other passed uncalled.)
-        if (tr.pending?.r === shown.r && tr.pending.value === shown.value) {
-          if (!tr.pending.excused) this.wrong(sp, t, `never called round ${shown.r}'s ${shown.value} during its show, on screen since ${tr.pending.since}`);
-          tr.pending = null;
+        if (tr.pending?.r === shown.r && tr.pending.value === shown.value && !tr.pending.excused) {
+          this.wrong(sp, t, `never called round ${shown.r}'s ${shown.value} during its show, on screen since ${tr.pending.since}`);
         }
+        tr.pending = null; // (or another change took its place)
       } else if (tr.pending?.r !== shown.r || tr.pending.value !== shown.value) {
         tr.pending = { r: shown.r, value: shown.value, since: now, due: now, excused: false };
       } else if (tr.pending.excused) {
@@ -501,8 +514,8 @@ export class RobotWatch {
   }
 
   /** Whether page sp's last robot frame at table t showed a result its
-   *  wheel or dice were still bringing (moving, or the frame a drawn table
-   *  waits for its felt), as the harness has it. */
+   *  wheel or dice were still bringing (moving, or the frame it first showed
+   *  on a drawn table), as the harness has it. */
   stillComing(sp: SimPage, t: string): boolean {
     const tr = this.tracks.get(`${sp.name}|${t}`);
     return tr !== undefined && tr.load === sp.loads && tr.lastHeld;

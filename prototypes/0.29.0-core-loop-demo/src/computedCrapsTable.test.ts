@@ -2676,6 +2676,37 @@ describe("the robot stickman at a players' craps table", () => {
     }
   });
 
+  it("a toss noted before this page's wait ran out, then the clock back 50 s: the toss goes with its window, and after a sleep in the wait run again the next toss gets its TIME'S UP", async () => {
+    const { pages: [a], decidedAt } = await pointOn(['A'], [1]);
+    rigRoll([a], 2, 8);
+    const e = worldEarOf(a, () => false);
+    const { T, W } = openRoll([a], 2, decidedAt + STEP);
+    goHearing([a], [e], T, W + 1_000);
+    // A close heard before this page's wait ran out: the felt tossed for it
+    // (noted here as the felt notes it), no time's up; then the close came
+    // to nothing (forged, say).
+    const X = W + 2_000;
+    a.robot.noteComputedToss(TABLE, INC, 2, true, clockOf(a, X));
+    goHearing([a], [e], X, X + 1_000);
+    expect(crapsOf(a)).toMatchObject({ phase: 'closing', round: 2 });
+    expect(timesUps(e)).toBe(0);
+    // The clock goes back 50 s: roll 2's window runs again, its wait ending
+    // before the old toss's stamp. Hidden 7 s into that wait.
+    const S = X - 50_000;
+    const waits = goHearing([a], [e], S, S + 60_000, () => crapsOf(a)?.phase === 'closing' && crapsOf(a)?.shooterSlip !== undefined);
+    expect(crapsOf(a)!.phaseDeadline!).toBeLessThan(X);
+    const back = waits + 7_000;
+    const at = goHearing([a], [e], back, back + 120_000, () => crapsOf(a)?.phase === 'settled' && crapsOf(a)?.round === 2);
+    goHearing([a], [e], at + STEP, at + 2 * STEP);
+    expect(a.croupier.tablesWakeCount()).toBe(2);
+    // Once: after the wake's wait, never in the wait run again.
+    expect(timesUps(e), JSON.stringify(e.said)).toBe(1);
+    const [wait, up, dice] = e.said.slice(-3);
+    expect(wait, JSON.stringify(e.said)).toMatch(/^✋ No more bets — /);
+    expect(up).toBe(TIMES_UP);
+    expect(dice).toMatch(/^🎲 \d\+\d = 8 — /);
+  });
+
   it("a roll held again for a forfeit on the same faces: each felt tosses them again, noted once, and its robot says nothing more", async () => {
     // As 'a roll shown, then held again for a forfeit that beats its seeds
     // on the same faces', each page's robot heard.

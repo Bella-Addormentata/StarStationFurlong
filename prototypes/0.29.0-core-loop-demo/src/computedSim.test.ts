@@ -1368,52 +1368,75 @@ describe('added for PR 2', () => {
     // (The robot's wake rule: a result not on screen yet isn't counted as
     // said. It is called after the wake while its show runs, or is the
     // design's silent one if its show passed meanwhile.)
-    const sim = await Sim.open({ name: 'felt-sleeps', seed: seed(20), pages: named('ABCD') });
-    const did: Record<string, number> = {};
-    const count = (k: string): void => { did[k] = (did[k] ?? 0) + 1; };
-    /** Pages asleep until the room closes a later round than theirs. */
-    const past: { sp: SimPage; r: number }[] = [];
+    // (Slow links, so a page woken on a close still shows it a while
+    // before the seeds come.)
+    const sim = await Sim.open({ name: 'felt-sleeps', seed: seed(20), pages: named('ABCD'), link: { delay: [300, 800], loss: 0 } });
+    /** The sleeps meant, in turn (whatever the draws), and how each came
+     *  out, told on the page's first frame back. */
+    const KINDS = ['wake in the show', 'pause', 'wake past the show'] as const;
+    const meant: Record<string, number> = {};
+    const came: Record<string, number> = {};
+    type Sleep = { sp: SimPage; kind: string; wakes: number; r: number };
+    let sleeps = 0;
+    /** The sleep each page is in (one at a time: a waker of an earlier one
+     *  wakes nothing), and those asleep until their doc has a later round
+     *  closed, its result not in yet. */
+    const asleep = new Map<SimPage, Sleep>();
+    const past: Sleep[] = [];
+    const wakeIf = (e: Sleep): void => {
+      if (asleep.get(e.sp) === e && e.sp.mode === 'asleep') sim.wake(e.sp);
+    };
     for (const sp of sim.pages.slice(0, 2)) {
       sp.robotMotion = () => ({ moving: false, drawn: true });
       sp.afterRobot = (now) => {
-        if (sim.healed || !sim.robots.stillComing(sp, T1) || sim.rand() > 0.6) return;
-        const x = sim.rand();
-        // A pause too short to be a wake: the robot calls it as it would have.
-        let ms = between(sim.rand, 1_000, 4_000);
-        if (x < 0.25) count('pause');
-        else if (x < 0.6) {
-          // A wake back in the show it brings again.
-          ms = between(sim.rand, 7_000, 12_000);
-          count('wake in the show');
-        } else {
-          // A wake once the next round has closed (its doc hearing the
-          // room): the result's show long past, its key still on screen.
-          past.push({ sp, r: sp.p.table.readComputedRoulette(T1, now)?.round ?? 0 });
-          ms = 90_000;
-          count('wake past the show');
+        const back = asleep.get(sp);
+        if (back) {
+          asleep.delete(sp);
+          // (A wake moves the count on this frame's noteTablesRunning.)
+          const v = sp.p.table.readComputedRoulette(T1, now);
+          const k = sp.p.croupier.tablesWakeCount() === back.wakes ? 'paused'
+            : v?.phase === 'settled' && v.round === back.r ? 'woke in the show'
+              : v?.spinKey.startsWith(`${back.r}:`) ? 'woke past the show' : 'woke to a later result';
+          came[k] = (came[k] ?? 0) + 1;
         }
-        sim.sleep(sp, x >= 0.6 || sim.rand() < 0.5);
-        sim.at(sim.elapsed + ms, () => {
-          if (sp.mode === 'asleep') sim.wake(sp);
-        });
+        if (sim.healed || !sim.robots.stillComing(sp, T1)) return;
+        const kind = KINDS[sleeps++ % KINDS.length];
+        meant[kind] = (meant[kind] ?? 0) + 1;
+        const e: Sleep = { sp, kind, wakes: sp.p.croupier.tablesWakeCount(), r: sp.p.table.readComputedRoulette(T1, now)?.round ?? 0 };
+        asleep.set(sp, e);
+        // A pause too short to be a wake: the robot calls it as it would
+        // have. A wake back in the show it brings again. Or a wake once the
+        // next round has closed (its doc hearing the room): the result's
+        // show long past, its key still on screen.
+        const ms = kind === 'pause' ? between(sim.rand, 1_000, 4_000) : kind === 'wake in the show' ? between(sim.rand, 7_000, 12_000) : 90_000;
+        if (kind === 'wake past the show') past.push(e);
+        sim.sleep(sp, kind === 'wake past the show' || sim.rand() < 0.5);
+        sim.at(sim.elapsed + ms, () => wakeIf(e));
       };
     }
     sim.every(() => {
       for (const w of [...past]) {
-        const other = sim.pages.find((c) => c !== w.sp && c.mode === 'up');
-        if (!other) continue;
-        sim.enter(other);
-        const tip = other.p.casino.computedFoldOf(T1)?.tip;
+        if (asleep.get(w.sp) !== w) {
+          past.splice(past.indexOf(w), 1);
+          continue;
+        }
+        // (Its own doc: a wake before a later close would show the last
+        // result again, and one after that round's seeds, a new one.)
+        sim.enter(w.sp);
+        const tip = w.sp.p.casino.computedFoldOf(T1)?.tip;
         if (!tip || tip.r <= w.r) continue;
         past.splice(past.indexOf(w), 1);
-        if (w.sp.mode === 'asleep') sim.wake(w.sp);
+        wakeIf(w);
       }
     });
     await sim.run(RUN_MS);
     // Scoped as clock steps are: a page asleep as a round closed reveals late.
     const s = await finish(sim, { awayFlips: ['forfeit over reveals', 'answer forfeit'] });
-    for (const k of ['pause', 'wake in the show', 'wake past the show']) expect(did[k] ?? 0, `${sim.label} ${k}`).toBeGreaterThan(0);
+    // (A wake on a close shows it until the seeds come, or, if they come
+    // that tick, the next result: either way the slept one's show passed.)
+    for (const k of ['paused', 'woke in the show']) expect(came[k] ?? 0, `${sim.label} ${k}`).toBeGreaterThan(0);
+    expect((came['woke past the show'] ?? 0) + (came['woke to a later result'] ?? 0), `${sim.label} woke past the show`).toBeGreaterThan(0);
     expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
-    console.log(`[sim] felt-sleeps seed=${sim.opts.seed}: sleeps on the felt's frame ${JSON.stringify(did)}`);
+    console.log(`[sim] felt-sleeps seed=${sim.opts.seed}: sleeps on the felt's frame ${JSON.stringify(meant)}, back ${JSON.stringify(came)}`);
   }, TIMEOUT);
 });

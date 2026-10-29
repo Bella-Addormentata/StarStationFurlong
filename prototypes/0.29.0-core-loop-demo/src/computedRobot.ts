@@ -202,9 +202,13 @@ export interface CallMemory {
   /** Round → the window last closed on it: the deadline of the window this
    *  page saw open on that round (null if it saw none). */
   closes: Map<number, number | null>;
-  /** A result waiting for the wheel or dice (`r:value`), since `at`: on
-   *  screen since then (a hold whose result leaves the screen ends). */
+  /** A result waiting for the wheel or dice (`r:value`), since `at` (a
+   *  hold whose result leaves the screen ends). */
   hold: { id: string; at: number } | null;
+  /** The result (or void) on screen (`r:value`), since `at`: the frame it
+   *  first showed here, whether or not a record waited for its check (the
+   *  felt takes it that frame, or the next on a drawn table). */
+  shownAt: { id: string; at: number } | null;
   /** Craps: the wait for the holder's throw this page last saw (its roll,
    *  and when it ends on this page's clock), until that roll takes bets
    *  again. */
@@ -216,8 +220,9 @@ export interface CallMemory {
    *  the felt doesn't wait): the result (or void) on screen, whether the
    *  wheel or dice were still bringing it (`held`: moving, or the frame a
    *  drawn table waits for its felt to take it; not on screen yet), and the
-   *  stickman's toss at a close the felt had shown. A wake counts them as
-   *  said (wokeCalls), but a result still held. */
+   *  stickman's toss at a close the felt had shown. A wake counts the
+   *  result as said (but one still held), and the toss if its time's up
+   *  was due (wokeCalls). */
   seen: { result: { r: number; value: string } | null; held: boolean; toss: CloseToss | null } | null;
 }
 
@@ -256,7 +261,7 @@ export interface CallCtx {
 }
 
 export function newCallMemory(inc: string): CallMemory {
-  return { inc, primed: false, called: new Map(), opens: new Map(), lastOpen: null, closes: new Map(), hold: null, wait: null, timesUp: null, seen: null };
+  return { inc, primed: false, called: new Map(), opens: new Map(), lastOpen: null, closes: new Map(), hold: null, shownAt: null, wait: null, timesUp: null, seen: null };
 }
 
 /** `r:value` of a spin or roll key, or null for '' (no result may show). */
@@ -281,8 +286,9 @@ function remember(m: CallMemory, r: number, value: string): void {
  *  craps the wait for the throw, as it stands, until its roll takes bets
  *  again (a window of its own: a rewrite of the roll before restarts it);
  *  a hold whose result left the screen ends (one that comes back waits for
- *  the wheel or dice afresh); and a hold started in the future is a clock
- *  gone back. */
+ *  the wheel or dice afresh); when the result on screen first showed; and a
+ *  hold started in the future is a clock gone back (it holds from now), as
+ *  is a show (it showed before now). */
 export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const d = v.phaseDeadline;
   const was = m.opens.get(v.round);
@@ -292,6 +298,11 @@ export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const k = keyOf(v);
   if (m.hold && (k === null || m.hold.id !== `${k.r}:${k.value}`)) m.hold = null;
   if (m.hold && m.hold.at > now) m.hold.at = now;
+  const s = shownOf(v);
+  const id = s ? `${s.r}:${s.value}` : null;
+  if (id === null) m.shownAt = null;
+  else if (m.shownAt?.id !== id) m.shownAt = { id, at: now };
+  else if (m.shownAt.at > now) m.shownAt.at = now - 1;
 }
 
 /** The records are whole and checked for the first time here: the result on
@@ -329,12 +340,11 @@ export function wokeCalls(m: CallMemory): void {
 }
 
 /** Whether the wheel or dice are still bringing result `k`, not on screen
- *  yet, as the hold has it: while they move, or on the frame a drawn table
- *  waits for its felt to take it (at craps only a roll on show is held).
- *  Never a void. */
+ *  yet: while they move, or on the frame it first shows on a drawn table,
+ *  before its felt takes it (at craps only a roll on show). Never a void. */
 function stillComing(game: GameName, v: TableView, m: CallMemory, k: { r: number; value: string } | null, ctx: Pick<CallCtx, 'now' | 'moving' | 'drawn'>): boolean {
   if (k === null || k.value === VOID || !(game === 'roulette' || (v.phase === 'settled' && v.round === k.r))) return false;
-  return ctx.moving || (ctx.drawn && m.hold?.id === `${k.r}:${k.value}` && ctx.now <= m.hold.at);
+  return ctx.moving || (ctx.drawn && m.shownAt?.id === `${k.r}:${k.value}` && ctx.now <= m.shownAt.at);
 }
 
 /**
@@ -597,11 +607,14 @@ function sameDoc(): void {
 
 /** A wake (tablesWakeCount), or a clock gone back a second or more, forgets
  *  which rounds this page saw run: every table's last result shows again,
- *  and what each showed before counts as said (wokeCalls). */
+ *  and what each showed before counts as said (wokeCalls). A toss stamped
+ *  ahead of the clock then is from before it went back: the window it came
+ *  in runs again, so the toss goes with it. */
 function sameWake(now: number): void {
   const n = tablesWakeCount();
   if (n !== wakes || (lastAt !== null && lastAt - now >= TABLE_CLOCK_SLACK_MS)) {
     if (wakes !== null) for (const m of calls.values()) wokeCalls(m);
+    for (const e of tosses.values()) if (e.close && e.close.at > now) e.close = null;
     wakes = n;
     for (const m of live.values()) wokeLive(m, now);
   }

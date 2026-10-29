@@ -299,6 +299,88 @@ describe('a roulette round on a real page', () => {
     expect(e.said).toHaveLength(2);
   });
 
+  it('a result that first shows on a frame whose records wait for their check, on a drawn table, then a sleep: called as the wheel stops after the wake', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    expect(e.texts()).toEqual(['🎲 Place your bets!', '✋ No more bets!']);
+    // Z's felt for round 2 comes and waits for its check; the seeds (no
+    // signature to check) decide round 1 all the same, after the felt's
+    // frame. The tab is hidden right then, 9 s.
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, shows, kit.slip(Z, 2, [red(5)]));
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    expect(o.table.readComputedRoulette(TABLE, shows)).toMatchObject({ phase: 'settled', round: 1 });
+    e.hear(shows, false, true);
+    expect(e.said).toHaveLength(2);
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    const wake = shows + 9_000;
+    e.hearFor(wake, wake + 2_000, true, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
+    e.hearFor(wake + 2_100, wake + 3_000, false, true);
+    expect(e.texts().slice(2)).toEqual([resultCall(o, 1)]);
+    expect(e.said[2].at).toBe(wake + 2_100);
+  });
+
+  it('a result the felt took while records waited for their check, its first checked frame, then a sleep: nothing is said over the re-show', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, shows, kit.slip(Z, 2, [red(5)]));
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    // The wheel spins and stops on the pocket while Z's felt waits.
+    e.hearFor(shows, shows + 2_000, true, true);
+    e.hearFor(shows + 2_100, shows + 3_000, false, true);
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    expect(e.said).toHaveLength(2);
+    // Checked: one frame (the robot waits it, the result long on screen),
+    // and the tab is hidden.
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(o.casino.computedSettled(TABLE)).toBe(true);
+    e.hear(shows + 3_100, false, true);
+    expect(e.said).toHaveLength(2);
+    const wake = shows + 10_000;
+    e.hearFor(wake, wake + 3_000, false, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
+  });
+
+  it('a clock gone back under a second while a result shows, its call refused, then a sleep: the result was on screen, and nothing is said over the re-show', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    // The pocket shows on a drawn table, the wheel at rest; the bubble
+    // refuses the call (nobody in the room). Then the clock goes back
+    // 0.6 s (no wake), to before the frame it first showed, for one frame
+    // (the result was on screen before it, so it isn't still coming), and
+    // the tab is hidden.
+    const refused = (T: number): void => {
+      const now = clockOf(o, T);
+      o.croupier.noteTablesRunning(now);
+      o.robot.computedTableLevel(TABLE, 'roulette', false, now);
+      o.robot.computedTableCall(TABLE, 'roulette', now, false, true);
+    };
+    for (let T = shows; T <= shows + 300; T += STEP) refused(T);
+    refused(shows - 300);
+    expect(o.croupier.tablesWakeCount()).toBe(0);
+    const wake = shows + 9_000;
+    e.hearFor(wake, wake + 3_000, false, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
+  });
+
   /** Round 1 on page o, every frame heard: X, Y and Z bet, X closes, X's
    *  and Y's seeds come, and the forfeit of whichever of X and Y ranks
    *  worse decides it 4 s after the close (Z's seed never came). */
