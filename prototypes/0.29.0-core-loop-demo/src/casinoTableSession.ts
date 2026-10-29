@@ -68,6 +68,7 @@ import {
   SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip, writeComputedSlip,
 } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import { noteComputedToss } from './computedRobot';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, NO_HAND_ROLL, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -787,6 +788,8 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         rt.flight = { r: s.round, at: now, done: false };
       } else if (close) {
         tossDice(h, close.hash);
+        // (The robot stickman says time's up for a wait it saw run out.)
+        noteComputedToss(id, s.inc, s.round, true, now);
         rt.flight = { r: s.round, at: now, done: false, close: true };
       }
     }
@@ -800,7 +803,10 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         // whose result came with no flight seen for it.
         if (rewrite || rt.flight?.r !== k.round || rt.flight.done) {
           const close = computedCrapsClose(id, k.round);
-          if (close) tossDice(h, close.hash);
+          if (close) {
+            tossDice(h, close.hash);
+            noteComputedToss(id, s.inc, k.round, false, now);
+          }
         }
         h.diceLand(diceOfKey(k.pocket));
         rt.flight = { r: k.round, at: rt.flight?.r === k.round ? rt.flight.at : now, done: true };
@@ -2470,17 +2476,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;">
       <span style="font-size:12px;font-weight:900;letter-spacing:1px;color:${GOLD_BRIGHT};">⚙️ ${game === 'craps' ? 'CRAPS' : 'ROULETTE'} TABLE</span>
       <button data-act="close" aria-label="Close the table card" style="background:none;border:none;color:${GOLD};font-size:16px;cursor:pointer;">✕</button></div>`);
-    rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${comp
-      ? "NOBODY RUNS THIS TABLE · THE PLAYERS' PAGES MOVE IT ALONG · ANYONE CAN LOOK"
-      : house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
+    // (A players' table's badge below says who runs it: nobody. Its robot,
+    // if one stands there, only calls the round, computedRobot.)
+    if (!comp) rows.push(`<div style="font-size:9px;color:${DIM};letter-spacing:1px;">${house ? 'YOU RUN THIS TABLE' : 'THE OWNER SETS THIS TABLE · ANYONE CAN LOOK'}</div>`);
     rows.push(`<div style="font-size:10px;line-height:1.7;color:${GOLD};border-top:1px solid rgba(212,168,75,0.18);padding-top:8px;">${rulesHtml()}</div>`);
     // ⚖️ Fair / Friendly, how the result is made, and the last result's check.
     const badge = fairnessBadge(itemId, game);
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
     if (comp) {
-      // 🧮 No fairness to set, no robot, nothing to press: the fold's verdict,
-      // the house's switch, and how the round goes on (🎲 and at craps where
-      // the table stands).
+      // 🧮 No fairness to set (Friendly only until the house's seed, PR 5),
+      // no robot line (the robot runs nothing here), nothing to press: the
+      // fold's verdict, the house's switch, and how the round goes on (🎲 and
+      // at craps where the table stands).
       const table = game === 'craps' ? computedCrapsLine() : null;
       if (table) rows.push(`<div style="font-size:9.5px;color:${GOLD};">${table}</div>`);
       for (const line of computedCheckLines()) rows.push(`<div style="font-size:9px;color:${line.color};">${line.text}</div>`);

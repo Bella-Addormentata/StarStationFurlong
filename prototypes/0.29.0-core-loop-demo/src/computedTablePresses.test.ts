@@ -382,7 +382,9 @@ describe("a computed table's ⚙ card", () => {
     at(a, T0);
     const t = atTable(a, { house: true });
     const card = t.card();
-    expect(card).toContain("NOBODY RUNS THIS TABLE · THE PLAYERS' PAGES MOVE IT ALONG · ANYONE CAN LOOK");
+    expect(card).not.toContain('NOBODY RUNS THIS TABLE');
+    expect(card).not.toContain('YOU RUN THIS TABLE');
+    expect(card).not.toContain('THE OWNER SETS THIS TABLE');
     expect(card).toContain("BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN");
     expect(card).toContain("PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS");
     for (const act of ['spin', 'next', 'fairness']) expect(card).not.toContain(`data-act="${act}"`);
@@ -400,6 +402,9 @@ describe("a computed table's ⚙ card", () => {
     expect(legacy.card()).toContain('data-act="spin"');
     expect(legacy.card()).toContain('YOU RUN THIS TABLE');
     legacy.unmount();
+    const guest = atTable(a, { house: false, t: 'roulette-legacy' });
+    expect(guest.card()).toContain('THE OWNER SETS THIS TABLE · ANYONE CAN LOOK');
+    guest.unmount();
   });
 
   it("shows the house's switch row with the dev flag only, at either game, never to a player", () => {
@@ -857,6 +862,51 @@ describe('the status line and notices', () => {
     expect(t.flash()).toBe(said);
     expect(a.casino.readChips(a.pid)).toBe(999);
     t.unmount();
+  });
+});
+
+describe("the robot at a computed table, in World's frame order", () => {
+  it("calls the pocket once the wheel stops, on the page whose own seed decides the round", () => {
+    switchOn(a);
+    at(a, T0);
+    if (!a.furniture.FURNITURE.some((i) => i.id === TABLE)) {
+      a.furniture.FURNITURE.push({ id: TABLE, kind: 'roulette-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    }
+    // A wheel that spins 5 s from when the felt starts it.
+    let stopsAt = -Infinity;
+    const spins: number[] = [];
+    const wheel = fakeTable();
+    const h = new Proxy(wheel.h as unknown as Record<PropertyKey, unknown>, {
+      get: (target, key) => {
+        if (key === 'wheelSpinning') return () => Date.now() < stopsAt;
+        if (key === 'wheelSpin') return (pocket: number) => { spins.push(pocket); stopsAt = Date.now() + 5_000; };
+        return target[key as never];
+      },
+    }) as unknown as CasinoTableVisualHandle;
+    const said: { at: number; text: string; spins: number; spinning: boolean }[] = [];
+    // World's frame: the felt, then this page's duties, then the robot.
+    const frameAt = (T: number): void => {
+      at(a, T);
+      a.session.casinoTablesFrame(1 / 60, new Map([[TABLE, h]]));
+      a.table.tickComputedTables([TABLE], T);
+      const moving = h.wheelSpinning();
+      a.robot.computedTableLevel(TABLE, 'roulette', true, T);
+      const c = a.robot.computedTableCall(TABLE, 'roulette', T, moving, true);
+      if (c) {
+        said.push({ at: T, text: c.text, spins: spins.length, spinning: moving });
+        a.robot.noteComputedCallSaid(TABLE, c);
+      }
+    };
+    clockOf(a, T0 + 500);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0 + 500)).toBe('ok');
+    for (let T = T0 + 500; T <= T0 + 32_000; T += 100) frameAt(T);
+    const D = foldOf(a).rounds[0];
+    expect(D).toMatchObject({ decided: 'reveals', counted: [a.pid] });
+    expect(spins).toEqual([D.pocket]);
+    const result = said.find((x) => x.text.startsWith('🎡'))!;
+    expect(said.map((x) => x.text)).toEqual(['🎲 Place your bets!', '✋ No more bets!', result.text]);
+    expect(result).toMatchObject({ spins: 1, spinning: false });
+    expect(result.at).toBeGreaterThanOrEqual(stopsAt);
   });
 });
 

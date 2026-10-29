@@ -98,7 +98,7 @@ async function finish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
   await sim.syncAll();
   sim.settleFlips();
   const s = sim.summary();
-  const line = Sim.line(s, sim.worstStall.at);
+  const line = `${Sim.line(s, sim.worstStall.at)}\n${sim.robots.line()}`;
   lines.push(line);
   console.log(line);
   const log = sim.pages.flatMap((sp) => sp.flipLog.map((f) => `${sp.name} ${f}`));
@@ -116,6 +116,8 @@ async function finish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
   // Every page up agrees, and on each the books add up: each player's chips,
   // and the cage against what the run bought.
   expect(sim.disagreements(), sim.label).toEqual([]);
+  // (Nor in the robot frame it runs on every page first.)
+  expect(sim.violations, sim.label).toEqual([]);
   for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
     expect(sim.ledgerProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
     expect(sim.cageProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
@@ -785,6 +787,7 @@ describe('added for PR 2', () => {
     await sim.syncAll();
     for (const sp of sim.pages) expect(sp.p.casino.readChips('player-X'), `${sim.label} ${sp.name}`).toBe(Number(total > 0n ? total : 0n) + 100);
     expect(sim.disagreements(), sim.label).toEqual([]);
+    expect(sim.violations, sim.label).toEqual([]);
   }, TIMEOUT);
 
   it('removal mid-session: the house takes one of two tables out with a round under way; compaction finalises it', async () => {
@@ -863,6 +866,9 @@ describe('added for PR 2', () => {
       });
       // It renews the lease as its build does (only what it read), then goes.
       for (let beat = 2; beat <= 5; beat++) sim.at(at + 3_000 + (beat - 1) * 2_000, () => sim.as(ghost, () => oldBuildLease(ghost, house.pid, beat)));
+      // And beats its robot croupier, as its build's operator does (every
+      // 3 s): no robot of this build's at the table moves for it.
+      for (let b = at + 4_000; b < at + 12_000; b += 3_000) sim.at(b, () => sim.as(ghost, (now) => ghost.p.casino.writeCroupierBeat(T1, now)));
       sim.at(at + 12_000, () => sim.crash(ghost));
     }
     sim.every(() => {
@@ -1356,5 +1362,81 @@ describe('added for PR 2', () => {
     expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
     // (How many came back in time, for the line.)
     console.log(`[sim] two-page-away seed=${sim.opts.seed}: ${episodes.length} sleeps (${episodes.filter((e) => e.aimed).length} aimed, ${episodes.filter((e) => e.relink > 0).length} its link back late), ${slept.size} rounds slept through: ${voids} void, ${back} by the seed back in time`);
+  }, TIMEOUT);
+
+  it("felt sleeps: two pages draw the table, and sleep right as their robot waits a frame for the felt to take a result", async () => {
+    // (The robot's wake rule: a result not on screen yet isn't counted as
+    // said. It is called after the wake while its show runs, or is the
+    // design's silent one if its show passed meanwhile.)
+    // (Slow links, so a page woken on a close still shows it a while
+    // before the seeds come.)
+    const sim = await Sim.open({ name: 'felt-sleeps', seed: seed(20), pages: named('ABCD'), link: { delay: [300, 800], loss: 0 } });
+    /** The sleeps meant, in turn (whatever the draws), and how each came
+     *  out, told on the page's first frame back. */
+    const KINDS = ['wake in the show', 'pause', 'wake past the show'] as const;
+    const meant: Record<string, number> = {};
+    const came: Record<string, number> = {};
+    type Sleep = { sp: SimPage; kind: string; wakes: number; r: number };
+    let sleeps = 0;
+    /** The sleep each page is in (one at a time: a waker of an earlier one
+     *  wakes nothing), and those asleep until their doc has a later round
+     *  closed, its result not in yet. */
+    const asleep = new Map<SimPage, Sleep>();
+    const past: Sleep[] = [];
+    const wakeIf = (e: Sleep): void => {
+      if (asleep.get(e.sp) === e && e.sp.mode === 'asleep') sim.wake(e.sp);
+    };
+    for (const sp of sim.pages.slice(0, 2)) {
+      sp.robotMotion = () => ({ moving: false, drawn: true });
+      sp.afterRobot = (now) => {
+        const back = asleep.get(sp);
+        if (back) {
+          asleep.delete(sp);
+          // (A wake moves the count on this frame's noteTablesRunning.)
+          const v = sp.p.table.readComputedRoulette(T1, now);
+          const k = sp.p.croupier.tablesWakeCount() === back.wakes ? 'paused'
+            : v?.phase === 'settled' && v.round === back.r ? 'woke in the show'
+              : v?.spinKey.startsWith(`${back.r}:`) ? 'woke past the show' : 'woke to a later result';
+          came[k] = (came[k] ?? 0) + 1;
+        }
+        if (sim.healed || !sim.robots.stillComing(sp, T1)) return;
+        const kind = KINDS[sleeps++ % KINDS.length];
+        meant[kind] = (meant[kind] ?? 0) + 1;
+        const e: Sleep = { sp, kind, wakes: sp.p.croupier.tablesWakeCount(), r: sp.p.table.readComputedRoulette(T1, now)?.round ?? 0 };
+        asleep.set(sp, e);
+        // A pause too short to be a wake: the robot calls it as it would
+        // have. A wake back in the show it brings again. Or a wake once the
+        // next round has closed (its doc hearing the room): the result's
+        // show long past, its key still on screen.
+        const ms = kind === 'pause' ? between(sim.rand, 1_000, 4_000) : kind === 'wake in the show' ? between(sim.rand, 7_000, 12_000) : 90_000;
+        if (kind === 'wake past the show') past.push(e);
+        sim.sleep(sp, kind === 'wake past the show' || sim.rand() < 0.5);
+        sim.at(sim.elapsed + ms, () => wakeIf(e));
+      };
+    }
+    sim.every(() => {
+      for (const w of [...past]) {
+        if (asleep.get(w.sp) !== w) {
+          past.splice(past.indexOf(w), 1);
+          continue;
+        }
+        // (Its own doc: a wake before a later close would show the last
+        // result again, and one after that round's seeds, a new one.)
+        sim.enter(w.sp);
+        const tip = w.sp.p.casino.computedFoldOf(T1)?.tip;
+        if (!tip || tip.r <= w.r) continue;
+        past.splice(past.indexOf(w), 1);
+        wakeIf(w);
+      }
+    });
+    await sim.run(RUN_MS);
+    // Scoped as clock steps are: a page asleep as a round closed reveals late.
+    const s = await finish(sim, { awayFlips: ['forfeit over reveals', 'answer forfeit'] });
+    // (A wake on a close shows it until the seeds come, or, if they come
+    // that tick, the next result: either way the slept one's show passed.)
+    for (const k of ['paused', 'woke in the show']) expect(came[k] ?? 0, `${sim.label} ${k}`).toBeGreaterThan(0);
+    expect((came['woke past the show'] ?? 0) + (came['woke to a later result'] ?? 0), `${sim.label} woke past the show`).toBeGreaterThan(0);
+    expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
+    console.log(`[sim] felt-sleeps seed=${sim.opts.seed}: sleeps on the felt's frame ${JSON.stringify(meant)}, back ${JSON.stringify(came)}`);
   }, TIMEOUT);
 });

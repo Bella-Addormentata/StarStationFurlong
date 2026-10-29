@@ -219,6 +219,11 @@ class Stage {
       sim.enter(sp);
       stage.mount(sp);
       sp.beforeFrame = (now) => stage.frame(sp, now);
+      // (The robot's hold reads the felt's dice, as World's does.)
+      sp.robotMotion = () => {
+        const st = (sp.p as UIPage).dice.state();
+        return { moving: st === 'flying' || st === 'settling', drawn: true };
+      };
     }
     return stage;
   }

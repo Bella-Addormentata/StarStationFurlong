@@ -283,6 +283,12 @@ export class PoolWaiter {
    *  the head of the wheel, and stands the table as the croupier. Overrides dock
    *  and serving — one bot per client, croupier duty first. */
   private croupierPost: { x: number; z: number; faceAngle: number } | null = null;
+  /** 🎲 Whether the bot stood its croupier post on its last frame there
+   *  (updateCroupierPost), and the seconds left of the stickman's toss its
+   *  right arm swings (tossGesture). */
+  private postArrived = false;
+  private tossLeft = 0;
+  private static readonly TOSS_SWING_S = 0.6;
   /** 🚀 Ship pilot routine (robot pilot routes, design §2a): where the robot
    *  captain stands now — the helm, or inside the berth door — or null for
    *  its charging dock. The WORLD works it out from the ship's shared
@@ -1285,6 +1291,7 @@ export class PoolWaiter {
   public setParked(parked: boolean): void {
     if (parked && !this.parked) {
       this.activity = "DOCK";
+      this.endTossSwing();
       // 🏋️ STOP can land mid-rep: clear the exercise joints so the bot doesn't
       // walk home with raised arms / splayed legs, and put the class back at
       // the first move's announce so START opens a fresh class.
@@ -1364,6 +1371,13 @@ export class PoolWaiter {
   public setCroupierPost(
     post: { x: number; z: number; faceAngle: number } | null,
   ): void {
+    // (The world sends a fresh post every frame: only a moved or cleared one
+    // is a new post, to walk to again.)
+    const was = this.croupierPost;
+    if (!post || !was || post.x !== was.x || post.z !== was.z) {
+      this.postArrived = false;
+      this.endTossSwing();
+    }
     this.croupierPost = post;
     if (!post && this.activity === "CROUPIER") {
       this.activity = "PATROL";
@@ -1437,13 +1451,44 @@ export class PoolWaiter {
   private updateCroupierPost(dt: number): void {
     const post = this.croupierPost;
     if (!post) return;
-    if (this.walkTo(dt, post.x, post.z, 0.12)) {
+    this.postArrived = this.walkTo(dt, post.x, post.z, 0.12);
+    if (this.postArrived) {
       // Posted: face the wheel, legs settle, a small croupier idle.
       this.turnToward(post.faceAngle, dt);
       this.legL.rotation.x = 0;
       this.legR.rotation.x = 0;
       this.body.position.y = Math.sin(this.time * 2.2) * 0.02;
-    }
+      if (this.tossLeft > 0) {
+        // 🎲 The stickman's toss: the right arm swings out and back.
+        this.tossLeft = Math.max(0, this.tossLeft - dt);
+        this.armR.rotation.x = this.tossLeft > 0
+          ? -1.3 * Math.sin(Math.PI * (1 - this.tossLeft / PoolWaiter.TOSS_SWING_S))
+          : 0;
+      }
+    } else this.endTossSwing();
+  }
+
+  /** 🎲 Whether the bot stands its croupier post now: on duty, not parked,
+   *  and within 0.2 m of it (walkTo also arrives at the nearest clear floor
+   *  to a post it can't reach). */
+  public atCroupierPost(): boolean {
+    const post = this.croupierPost;
+    if (!post || this.parked || this.activity !== "CROUPIER" || !this.postArrived) return false;
+    const p = this.group.position;
+    return Math.hypot(post.x - p.x, post.z - p.z) <= 0.2;
+  }
+
+  /** 🎲 The stickman tossed the dice at the table this bot stands: swing the
+   *  right arm, if it stands its post. */
+  public tossGesture(): void {
+    if (this.atCroupierPost()) this.tossLeft = PoolWaiter.TOSS_SWING_S;
+  }
+
+  /** A swing cut short puts the arm back (other poses set their own). */
+  private endTossSwing(): void {
+    if (this.tossLeft <= 0) return;
+    this.tossLeft = 0;
+    this.armR.rotation.x = 0;
   }
 
   /**

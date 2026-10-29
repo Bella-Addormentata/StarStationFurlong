@@ -51,6 +51,20 @@ import {
   tickAutoStickman,
   tickManualCraps,
 } from "./crapsCroupier";
+// 🤖🧮 PR 4: the robot at a players' (computed) table: when it comes, which
+// one, and what it calls, from the table as this page shows it.
+import {
+  assignCroupiers,
+  computedTableCall,
+  computedTableLevel,
+  forgetComputedTable,
+  mayCroupier,
+  noteComputedCallSaid,
+  someoneAtStands,
+  tableRunsItself,
+  takeComputedTosses,
+} from "./computedRobot";
+import type { TablePull } from "./computedRobot";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
 import {
@@ -3412,6 +3426,7 @@ export class World {
     forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
+    forgetComputedTable(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
     // operator) and wipe its casino keys — else bettors' debited chips vanish
     // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
@@ -6418,8 +6433,11 @@ export class World {
     // adds a charging dock per table game, so a floor of tables can each get
     // their own dealer. Assignments are sticky (a robot keeps its table so bots
     // don't swap tables frame to frame); a freed table pulls the nearest
-    // unassigned eligible robot. Only LIVE tables (a fresh operator heartbeat)
-    // get a body — manual venture/legacy rooms keep the robots serving.
+    // unassigned eligible robot. An owner-run table is live while its operator
+    // heartbeat is fresh (manual venture/legacy rooms keep the robots
+    // serving); 🧮 a players' table (one that runs itself) while this page
+    // shows it in play or quiet (computedRobot computedTableLevel), never by
+    // a heartbeat. Owner-run tables pick first (assignCroupiers).
     // 🤖 #77C s3: routine-aware eligibility. A dock robot programmed 'croupier'
     // is preferred; if none is, a non-'idle' (serve) robot fills in so a default
     // casino still gets a dealer; an 'idle'/'custom' robot never croupiers.
@@ -6445,38 +6463,36 @@ export class World {
         ? { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle }
         : null;
     };
-    const liveTableIds = tables
-      .filter((t) => isCroupierLive(t.id) && operatorPost(t.id))
-      .map((t) => t.id);
-    const liveIdSet = new Set(liveTableIds);
-    // Drop stale assignments (robot gone/ineligible, or its table no longer live).
-    for (const [key, tid] of [...this.croupierAssign]) {
-      if (!eligible(key) || !liveIdSet.has(tid)) this.croupierAssign.delete(key);
+    // 🧮 At a players' table a STOPped (parked) robot never works, nor counts
+    // as the room's croupier (the owner-run test above stays as it was).
+    const isParked = (k: string): boolean => readRobotConfig(k)?.parked === true;
+    const hasDedicatedAtComputed = [...this.robots.keys()].some((k) => !isParked(k) && routineOf(k) === "croupier");
+    const eligibleAtComputed = (k: string): boolean =>
+      this.robots.has(k) && !isParked(k) && mayCroupier(routineOf(k), hasDedicatedAtComputed);
+    // Each table's pull: an owner-run one with a fresh heartbeat 3; a players'
+    // one its level on this page (2 in play, 1 quiet, 0 idle). Only tables
+    // with a post want a robot.
+    const frameNow = Date.now();
+    const gameOf = (t: { kind: string }): "craps" | "roulette" => (t.kind === "craps-table" ? "craps" : "roulette");
+    const selfRun = new Set(tables.filter((t) => tableRunsItself(t.id, gameOf(t))).map((t) => t.id));
+    const levelOf = new Map<string, number>();
+    const pulls: TablePull[] = [];
+    for (const t of tables) {
+      const post = operatorPost(t.id);
+      let pull: TablePull["pull"] | 0;
+      if (selfRun.has(t.id)) {
+        // Every frame for every such table, post or none: the linger and the
+        // rounds seen run live here.
+        pull = computedTableLevel(t.id, gameOf(t), someoneAtStands(standsForItem(t.id), this.robotAvatarSpots), frameNow);
+        levelOf.set(t.id, pull);
+      } else pull = isCroupierLive(t.id) ? 3 : 0;
+      if (post && pull !== 0) pulls.push({ id: t.id, x: post.x, z: post.z, pull });
     }
-    // Fill each still-unmanned live table with the nearest free eligible robot.
-    const takenTables = new Set(this.croupierAssign.values());
-    const freeRobots = [...this.robots.keys()].filter(
-      (k) => eligible(k) && !this.croupierAssign.has(k),
+    assignCroupiers(
+      this.croupierAssign,
+      [...this.robots].map(([key, bot]) => ({ key, ...bot.getPosition(), owner: eligible(key), computed: eligibleAtComputed(key) })),
+      pulls,
     );
-    for (const tid of liveTableIds) {
-      if (takenTables.has(tid)) continue;
-      const post = operatorPost(tid)!;
-      let bestKey: string | null = null;
-      let best = Infinity;
-      for (const key of freeRobots) {
-        const bp = this.robots.get(key)!.getPosition();
-        const d = Math.hypot(bp.x - post.x, bp.z - post.z);
-        if (d < best) {
-          best = d;
-          bestKey = key;
-        }
-      }
-      if (bestKey) {
-        this.croupierAssign.set(bestKey, tid);
-        takenTables.add(tid);
-        freeRobots.splice(freeRobots.indexOf(bestKey), 1);
-      }
-    }
     // Post every robot at its assigned table's operator slot (or release it).
     for (const [key, bot] of this.robots) {
       const tid = this.croupierAssign.get(key);
@@ -6485,8 +6501,29 @@ export class World {
 
     // Narration (all clients): edge-detect each table's synced phase beat and
     // pop one bubble over the operator slot — only while a robot croupier is
-    // live. Dispatch the beat line by game kind.
+    // live. Dispatch the beat line by game kind. 🧮 A players' table's robot
+    // calls the round as this page shows it, each call once (computedRobot
+    // computedTableCall); one due while the table is idle here, or with no
+    // post, is dropped unsaid, so nothing is said late. Said over the post
+    // whether a robot stands it or not (no dock, every robot STOPped, or the
+    // robot taken by an owner-run table), as an owner-run table's beat is.
     for (const t of tables) {
+      if (selfRun.has(t.id)) {
+        this.croupierNarrated.delete(t.id); // (as when a heartbeat stops)
+        // The felt showed the stickman's toss: the robot standing the table swings.
+        if (takeComputedTosses(t.id) > 0) {
+          for (const [key, tid] of this.croupierAssign) if (tid === t.id) this.robots.get(key)?.tossGesture();
+        }
+        const stand = standsForItem(t.id).find((x) => x.role != null);
+        const h = this.casinoTableVisuals.get(t.id);
+        const moving = h ? (h.game === "craps" ? h.diceState() === "flying" || h.diceState() === "settling" : h.wheelSpinning()) : false;
+        const live = (levelOf.get(t.id) ?? 0) > 0;
+        const call = computedTableCall(t.id, gameOf(t), frameNow, moving, h !== undefined);
+        if (call && (!live || !stand || this.robotSay(`croupier:${t.id}`, call.text, stand.front.x, stand.front.z))) {
+          noteComputedCallSaid(t.id, call);
+        }
+        continue;
+      }
       if (!isCroupierLive(t.id)) {
         this.croupierNarrated.delete(t.id);
         continue;

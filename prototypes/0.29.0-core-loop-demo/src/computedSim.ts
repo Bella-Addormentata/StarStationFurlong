@@ -89,6 +89,7 @@ import { parseKey, seedTable, slipCommit } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
 import { loadPage, PAGE_ROOM } from './computedPageKit';
 import type { Page } from './computedPageKit';
+import { RobotWatch } from './computedSimRobot';
 import { b64url, snapshot } from './computedTestKit';
 import { combinePocketSeeds } from './games/diceFairness';
 import { resolveRound } from './games/roulette';
@@ -421,6 +422,13 @@ export class SimPage {
   /** 🎲 Its leaving second (Sim.leave at a craps table): frames run, its bot
    *  doesn't, and then it is gone. */
   leaving = false;
+  /** 🤖 Whether its table's pieces move, and are drawn (a page with the
+   *  table UI: computedCrapsSimShooter), for the robot's hold; none: no
+   *  pieces. */
+  robotMotion: ((t: string) => { moving: boolean; drawn: boolean }) | null = null;
+  /** 🤖 Run after its robot frame (a spec's page that sleeps as its robot
+   *  waits a frame for its felt). */
+  afterRobot: ((now: number) => void) | null = null;
 
   constructor(readonly spec: PageSpec, readonly device: Device, readonly pid: string, tables: string[], rand: Rng) {
     this.inRoom = new Set(tables);
@@ -709,6 +717,8 @@ export class Sim {
   readonly rand: Rng;
   /** The house's page: it switched the tables on, and drives them. */
   house!: SimPage;
+  /** 🤖 The robot at the players' tables, watched on every page's frame. */
+  readonly robots: RobotWatch = new RobotWatch(this);
   /** What broke an invariant while it ran (empty when all held). */
   readonly violations: string[] = [];
   private readonly entropy: Rng;
@@ -1452,6 +1462,9 @@ export class Sim {
           }
         }
         table.tickComputedTables(this.refsOf(tables), now);
+        // 🤖 Then the robot, as World runs it (computedSimRobot).
+        this.robots.frame(sp, tables, now, sp.robotMotion ?? undefined);
+        sp.afterRobot?.(now);
         if (this.craps) this.craps.framed(sp);
       });
     } catch (err) {
@@ -2055,6 +2068,8 @@ export class Sim {
     for (const sp of this.pages) {
       sp.pauseUntil = 0;
       sp.beforeFrame = null;
+      sp.robotMotion = null;
+      sp.afterRobot = null;
       if (sp.mode === 'asleep') this.wake(sp);
     }
   }
@@ -2149,6 +2164,8 @@ export class Sim {
         cage: { ...L, balances },
       };
     };
+    // 🤖 Each page's robot called what its screen shows (computedSimRobot R6).
+    for (const sp of up) out.push(...this.robots.agreement(sp, this.enter(sp)));
     const want = read(ref);
     for (const sp of up.slice(1)) {
       const got = read(sp);

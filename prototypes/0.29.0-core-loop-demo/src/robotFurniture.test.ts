@@ -316,3 +316,111 @@ describe('robot still reaches posts beside tables', () => {
     expect(Math.hypot(p.x - dock.pos.x, p.z - dock.pos.z)).toBeLessThan(0.15);
   });
 });
+
+describe("the stickman's toss swings a posted robot's arm", () => {
+  /** The robot's right arm and its swing left (private: the pose is all a
+   *  player sees of it). */
+  const swingOf = (bot: PoolWaiter): { arm: number; left: number } => {
+    const b = bot as unknown as { armR: THREE.Group; tossLeft: number };
+    return { arm: b.armR.rotation.x, left: b.tossLeft };
+  };
+  const DT = 1 / 30;
+  /** Frames for `secs`, the post re-sent each one as World sends it (a fresh
+   *  object); the arm's lowest angle seen. */
+  const stand = (bot: PoolWaiter, post: { x: number; z: number; faceAngle: number } | null, secs: number): number => {
+    let lowest = Infinity;
+    for (let t = 0; t < secs; t += DT) {
+      bot.setCroupierPost(post && { ...post });
+      bot.update(DT, null);
+      lowest = Math.min(lowest, swingOf(bot).arm);
+    }
+    return lowest;
+  };
+  const postAt = (table: FurnitureItem): { x: number; z: number; faceAngle: number } => {
+    const head = standsForItem(table.id).find((s) => s.role != null)!;
+    return { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
+  };
+
+  it('swings only once it stands its post, out and back to rest in 0.6 s, the post re-sent every frame', () => {
+    loadRoom(CASINO_FURNITURE);
+    const post = postAt(CASINO_FURNITURE.find((i) => i.kind === 'craps-table')!);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL);
+    stand(bot, post, DT);
+    expect(bot.atCroupierPost()).toBe(false);
+    bot.tossGesture();
+    expect(swingOf(bot).left).toBe(0);
+    stand(bot, post, 40);
+    expect(bot.atCroupierPost()).toBe(true);
+    expect(swingOf(bot).arm).toBe(0);
+    bot.tossGesture();
+    expect(swingOf(bot).left).toBeCloseTo(0.6);
+    const lowest = stand(bot, post, 0.5);
+    expect(lowest).toBeLessThan(-1.2);
+    expect(swingOf(bot).left).toBeGreaterThan(0);
+    stand(bot, post, 0.2);
+    expect(swingOf(bot)).toEqual({ arm: 0, left: 0 });
+  });
+
+  it('never swings while walking its last steps to the post, inside 0.2 m of it', () => {
+    loadRoom(CASINO_FURNITURE);
+    const post = postAt(CASINO_FURNITURE.find((i) => i.kind === 'craps-table')!);
+    const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL);
+    const near: boolean[] = [];
+    for (let t = 0; t < 40 && near.length < 10; t += DT) {
+      stand(bot, post, DT);
+      const p = bot.getPosition();
+      const away = Math.hypot(p.x - post.x, p.z - post.z);
+      if (away <= 0.12) break;
+      if (away <= 0.2) {
+        bot.tossGesture();
+        near.push(bot.atCroupierPost() || swingOf(bot).left > 0);
+      }
+    }
+    expect(near.length).toBeGreaterThan(0);
+    expect(near.every((x) => !x)).toBe(true);
+  });
+
+  it('a cleared or moved post mid-swing puts the arm back', () => {
+    loadRoom(CASINO_FURNITURE);
+    const post = postAt(CASINO_FURNITURE.find((i) => i.kind === 'craps-table')!);
+    for (const next of [null, { ...post, x: post.x + 1 }]) {
+      const bot = new PoolWaiter(new THREE.Scene(), CASINO_PATROL);
+      stand(bot, post, 40);
+      bot.tossGesture();
+      stand(bot, post, 0.2);
+      expect(swingOf(bot).arm).toBeLessThan(-0.5);
+      bot.setCroupierPost(next);
+      expect(swingOf(bot)).toEqual({ arm: 0, left: 0 });
+      expect(bot.atCroupierPost()).toBe(false);
+    }
+  });
+
+  it('never swings with no post, parked, or stopped short of a post it cannot reach', () => {
+    loadRoom(CASINO_FURNITURE);
+    const post = postAt(CASINO_FURNITURE.find((i) => i.kind === 'craps-table')!);
+    const idle = new PoolWaiter(new THREE.Scene(), CASINO_PATROL);
+    stand(idle, null, 1);
+    idle.tossGesture();
+    expect(swingOf(idle).left).toBe(0);
+    const parked = new PoolWaiter(new THREE.Scene(), CASINO_PATROL);
+    stand(parked, post, 40);
+    expect(parked.atCroupierPost()).toBe(true);
+    parked.tossGesture();
+    parked.setParked(true);
+    expect(swingOf(parked)).toEqual({ arm: 0, left: 0 });
+    parked.tossGesture();
+    expect(parked.atCroupierPost()).toBe(false);
+    expect(swingOf(parked).left).toBe(0);
+    // The narrow aisle of 'does not edge down a long narrow aisle': the
+    // robot waits on clear floor, short of the post.
+    const t = (id: string, x: number, z: number): FurnitureItem => ({ ...craps(x, z, 0), id });
+    loadRoom([t('a', -1.5, 0), t('b', 1.5, 0), t('c', -1.5, 1.5), t('d', 1.5, 1.5)]);
+    const short = new PoolWaiter(new THREE.Scene(), CASINO_PATROL, { x: 0.25, z: 3.75 });
+    stand(short, { x: 0.25, z: 0.75, faceAngle: 0 }, 40);
+    const p = short.getPosition();
+    expect(Math.hypot(p.x - 0.25, p.z - 0.75)).toBeGreaterThan(0.2);
+    short.tossGesture();
+    expect(short.atCroupierPost()).toBe(false);
+    expect(swingOf(short).left).toBe(0);
+  });
+});
