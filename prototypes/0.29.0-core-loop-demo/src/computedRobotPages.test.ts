@@ -66,10 +66,10 @@ const foldOf = (p: Page, t = TABLE) => p.casino.computedFoldOf(t)!;
 interface Ear {
   said: { at: number; text: string; key: string }[];
   /** One frame of the page's robot at T (its level, then its call), the
-   *  call it gives taken as said. */
-  hear(T: number, moving?: boolean): void;
+   *  call it gives taken as said; `drawn`, a page with the table UI. */
+  hear(T: number, moving?: boolean, drawn?: boolean): void;
   /** Frames from `from` to `to` (inclusive). */
-  hearFor(from: number, to: number, moving?: boolean): void;
+  hearFor(from: number, to: number, moving?: boolean, drawn?: boolean): void;
   texts(): string[];
 }
 
@@ -77,18 +77,18 @@ function ear(p: Page, game: 'roulette' | 'craps' = 'roulette', t = TABLE): Ear {
   const said: Ear['said'] = [];
   const e: Ear = {
     said,
-    hear(T, moving = false) {
+    hear(T, moving = false, drawn = false) {
       const now = clockOf(p, T);
       p.croupier.noteTablesRunning(now);
       // (World asks the level first, every frame, then the call.)
       p.robot.computedTableLevel(t, game, false, now);
-      const c = p.robot.computedTableCall(t, game, now, moving);
+      const c = p.robot.computedTableCall(t, game, now, moving, drawn);
       if (!c) return;
       said.push({ at: T, text: c.text, key: c.key });
       p.robot.noteComputedCallSaid(t, c);
     },
-    hearFor(from, to, moving = false) {
-      for (let T = from; T <= to; T += STEP) e.hear(T, moving);
+    hearFor(from, to, moving = false, drawn = false) {
+      for (let T = from; T <= to; T += STEP) e.hear(T, moving, drawn);
     },
     texts: () => said.map((s) => s.text),
   };
@@ -250,6 +250,53 @@ describe('a roulette round on a real page', () => {
     e.hearFor(wake + 2_100, wake + 3_000);
     expect(e.texts().slice(2)).toEqual([resultCall(o, 1)]);
     expect(e.said[2].at).toBe(wake + 2_100);
+  });
+
+  it("a sleep on the frame a result first shows on a drawn table, before its felt takes it: called as the wheel stops after the wake", async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    expect(e.texts()).toEqual(['🎲 Place your bets!', '✋ No more bets!']);
+    // The seeds come after the felt's frame (World drives the felt before
+    // the page's own duties write): the robot sees the pocket, the wheel
+    // not spinning yet. Then the tab is hidden 9 s.
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    e.hear(shows, false, true);
+    expect(e.said).toHaveLength(2);
+    const wake = shows + 9_000;
+    e.hearFor(wake, wake + 2_000, true, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
+    e.hearFor(wake + 2_100, wake + 3_000, false, true);
+    expect(e.texts().slice(2)).toEqual([resultCall(o, 1)]);
+    expect(e.said[2].at).toBe(wake + 2_100);
+  });
+
+  it('a wheel that stops while a record waits for its check, then a sleep: its result was on screen, and nothing is said over the re-show', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    e.hearFor(shows, shows + 2_000, true, true);
+    expect(e.said).toHaveLength(2);
+    // Z's felt for round 2 comes and waits for its check; meanwhile the wheel
+    // stops on the pocket. The tab is hidden before the checks are done.
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, shows + 2_100, kit.slip(Z, 2, [red(5)]));
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    e.hearFor(shows + 2_100, shows + 3_000, false, true);
+    expect(e.said).toHaveLength(2);
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(o.casino.computedSettled(TABLE)).toBe(true);
+    const wake = shows + 10_000;
+    e.hearFor(wake, wake + 3_000, false, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
   });
 
   /** Round 1 on page o, every frame heard: X, Y and Z bet, X closes, X's

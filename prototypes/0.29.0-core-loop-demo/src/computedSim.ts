@@ -426,6 +426,9 @@ export class SimPage {
    *  table UI: computedCrapsSimShooter), for the robot's hold; none: no
    *  pieces. */
   robotMotion: ((t: string) => { moving: boolean; drawn: boolean }) | null = null;
+  /** 🤖 Run after its robot frame (a spec's page that sleeps as its robot
+   *  waits a frame for its felt). */
+  afterRobot: ((now: number) => void) | null = null;
 
   constructor(readonly spec: PageSpec, readonly device: Device, readonly pid: string, tables: string[], rand: Rng) {
     this.inRoom = new Set(tables);
@@ -1461,6 +1464,7 @@ export class Sim {
         table.tickComputedTables(this.refsOf(tables), now);
         // 🤖 Then the robot, as World runs it (computedSimRobot).
         this.robots.frame(sp, tables, now, sp.robotMotion ?? undefined);
+        sp.afterRobot?.(now);
         if (this.craps) this.craps.framed(sp);
       });
     } catch (err) {
@@ -2065,6 +2069,7 @@ export class Sim {
       sp.pauseUntil = 0;
       sp.beforeFrame = null;
       sp.robotMotion = null;
+      sp.afterRobot = null;
       if (sp.mode === 'asleep') this.wake(sp);
     }
   }

@@ -6504,7 +6504,9 @@ export class World {
     // live. Dispatch the beat line by game kind. 🧮 A players' table's robot
     // calls the round as this page shows it, each call once (computedRobot
     // computedTableCall); one due while the table is idle here, or with no
-    // post, is dropped unsaid, so nothing is said late.
+    // post, is dropped unsaid, so nothing is said late. Said over the post
+    // whether a robot stands it or not (no dock, every robot STOPped, or the
+    // robot taken by an owner-run table), as an owner-run table's beat is.
     for (const t of tables) {
       if (selfRun.has(t.id)) {
         this.croupierNarrated.delete(t.id); // (as when a heartbeat stops)

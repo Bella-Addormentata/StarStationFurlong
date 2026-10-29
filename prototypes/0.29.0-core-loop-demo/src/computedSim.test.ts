@@ -1363,4 +1363,57 @@ describe('added for PR 2', () => {
     // (How many came back in time, for the line.)
     console.log(`[sim] two-page-away seed=${sim.opts.seed}: ${episodes.length} sleeps (${episodes.filter((e) => e.aimed).length} aimed, ${episodes.filter((e) => e.relink > 0).length} its link back late), ${slept.size} rounds slept through: ${voids} void, ${back} by the seed back in time`);
   }, TIMEOUT);
+
+  it("felt sleeps: two pages draw the table, and sleep right as their robot waits a frame for the felt to take a result", async () => {
+    // (The robot's wake rule: a result not on screen yet isn't counted as
+    // said. It is called after the wake while its show runs, or is the
+    // design's silent one if its show passed meanwhile.)
+    const sim = await Sim.open({ name: 'felt-sleeps', seed: seed(20), pages: named('ABCD') });
+    const did: Record<string, number> = {};
+    const count = (k: string): void => { did[k] = (did[k] ?? 0) + 1; };
+    /** Pages asleep until the room closes a later round than theirs. */
+    const past: { sp: SimPage; r: number }[] = [];
+    for (const sp of sim.pages.slice(0, 2)) {
+      sp.robotMotion = () => ({ moving: false, drawn: true });
+      sp.afterRobot = (now) => {
+        if (sim.healed || !sim.robots.stillComing(sp, T1) || sim.rand() > 0.6) return;
+        const x = sim.rand();
+        // A pause too short to be a wake: the robot calls it as it would have.
+        let ms = between(sim.rand, 1_000, 4_000);
+        if (x < 0.25) count('pause');
+        else if (x < 0.6) {
+          // A wake back in the show it brings again.
+          ms = between(sim.rand, 7_000, 12_000);
+          count('wake in the show');
+        } else {
+          // A wake once the next round has closed (its doc hearing the
+          // room): the result's show long past, its key still on screen.
+          past.push({ sp, r: sp.p.table.readComputedRoulette(T1, now)?.round ?? 0 });
+          ms = 90_000;
+          count('wake past the show');
+        }
+        sim.sleep(sp, x >= 0.6 || sim.rand() < 0.5);
+        sim.at(sim.elapsed + ms, () => {
+          if (sp.mode === 'asleep') sim.wake(sp);
+        });
+      };
+    }
+    sim.every(() => {
+      for (const w of [...past]) {
+        const other = sim.pages.find((c) => c !== w.sp && c.mode === 'up');
+        if (!other) continue;
+        sim.enter(other);
+        const tip = other.p.casino.computedFoldOf(T1)?.tip;
+        if (!tip || tip.r <= w.r) continue;
+        past.splice(past.indexOf(w), 1);
+        if (w.sp.mode === 'asleep') sim.wake(w.sp);
+      }
+    });
+    await sim.run(RUN_MS);
+    // Scoped as clock steps are: a page asleep as a round closed reveals late.
+    const s = await finish(sim, { awayFlips: ['forfeit over reveals', 'answer forfeit'] });
+    for (const k of ['pause', 'wake in the show', 'wake past the show']) expect(did[k] ?? 0, `${sim.label} ${k}`).toBeGreaterThan(0);
+    expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
+    console.log(`[sim] felt-sleeps seed=${sim.opts.seed}: sleeps on the felt's frame ${JSON.stringify(did)}`);
+  }, TIMEOUT);
 });

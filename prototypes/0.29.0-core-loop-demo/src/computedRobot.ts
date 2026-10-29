@@ -202,7 +202,8 @@ export interface CallMemory {
   /** Round → the window last closed on it: the deadline of the window this
    *  page saw open on that round (null if it saw none). */
   closes: Map<number, number | null>;
-  /** A result waiting for the wheel or dice (`r:value`), since `at`. */
+  /** A result waiting for the wheel or dice (`r:value`), since `at`: on
+   *  screen since then (a hold whose result leaves the screen ends). */
   hold: { id: string; at: number } | null;
   /** Craps: the wait for the holder's throw this page last saw (its roll,
    *  and when it ends on this page's clock), until that roll takes bets
@@ -210,10 +211,13 @@ export interface CallMemory {
   wait: { r: number; until: number } | null;
   /** Craps: the roll whose time's up was said. */
   timesUp: number | null;
-  /** What nextCall last looked at: the result (or void) on screen, whether
-   *  the wheel or dice were still bringing it (`held`: not on screen yet),
-   *  and the stickman's toss at a close the felt had shown. A wake counts
-   *  them as said (wokeCalls), but a result still held. */
+  /** What the page last showed, at its last frame since the records were
+   *  first whole and checked (a frame whose records wait for a check too:
+   *  the felt doesn't wait): the result (or void) on screen, whether the
+   *  wheel or dice were still bringing it (`held`: moving, or the frame a
+   *  drawn table waits for its felt to take it; not on screen yet), and the
+   *  stickman's toss at a close the felt had shown. A wake counts them as
+   *  said (wokeCalls), but a result still held. */
   seen: { result: { r: number; value: string } | null; held: boolean; toss: CloseToss | null } | null;
 }
 
@@ -276,13 +280,17 @@ function remember(m: CallMemory, r: number, value: string): void {
  *  moved while it ran is the same window (a late re-show pushed it back); at
  *  craps the wait for the throw, as it stands, until its roll takes bets
  *  again (a window of its own: a rewrite of the roll before restarts it);
- *  and a hold started in the future is a clock gone back. */
+ *  a hold whose result left the screen ends (one that comes back waits for
+ *  the wheel or dice afresh); and a hold started in the future is a clock
+ *  gone back. */
 export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const d = v.phaseDeadline;
   const was = m.opens.get(v.round);
   if (v.phase === 'betting' && d !== undefined && was !== undefined && was !== d && now < was) m.opens.set(v.round, d);
   if (v.kind === 'craps' && v.phase === 'closing' && v.shooterSlip !== undefined && d !== undefined) m.wait = { r: v.round, until: d };
   else if (m.wait?.r === v.round && v.phase === 'betting' && d !== undefined && now < d) m.wait = null;
+  const k = keyOf(v);
+  if (m.hold && (k === null || m.hold.id !== `${k.r}:${k.value}`)) m.hold = null;
   if (m.hold && m.hold.at > now) m.hold.at = now;
 }
 
@@ -306,23 +314,27 @@ export function shownOf(v: TableView): { r: number; value: string } | null {
 
 /** A wake, or a clock gone back: what the page showed before it counts as
  *  said (as a load's priming counts what it finds). The result or void on
- *  screen at the last look, and the toss the felt had shown, so a call the
- *  bubble refused until then isn't said late, over the show the wake brings
- *  again. A result the wheel or dice were still bringing isn't on screen
- *  yet: its hold starts again, and it is called as they stop. A toss the
- *  felt shows after the wake is a new one. */
+ *  screen at the last look, and the toss the felt had shown if its time's
+ *  up was due, so a call the bubble refused until then isn't said late,
+ *  over the show the wake brings again. A result the wheel or dice were
+ *  still bringing isn't on screen yet: its hold starts again, and it is
+ *  called as they stop. A toss the felt shows after the wake is a new one
+ *  (so is one after a toss that came before this page's wait ran out). */
 export function wokeCalls(m: CallMemory): void {
   const s = m.seen;
   if (!s) return;
   if (s.result && !s.held && m.called.get(s.result.r) !== s.result.value) remember(m, s.result.r, s.result.value);
-  if (s.toss && s.toss.inc === m.inc) m.timesUp = s.toss.r;
+  if (s.toss && s.toss.inc === m.inc && m.wait?.r === s.toss.r && s.toss.at >= m.wait.until) m.timesUp = s.toss.r;
   m.hold = null;
 }
 
-/** Whether the wheel or dice are still bringing result `k` (the hold's own
- *  test of motion: at craps only a roll on show moves). Never a void. */
-function stillComing(game: GameName, v: TableView, k: { r: number; value: string } | null, moving: boolean): boolean {
-  return moving && k !== null && k.value !== VOID && (game === 'roulette' || (v.phase === 'settled' && v.round === k.r));
+/** Whether the wheel or dice are still bringing result `k`, not on screen
+ *  yet, as the hold has it: while they move, or on the frame a drawn table
+ *  waits for its felt to take it (at craps only a roll on show is held).
+ *  Never a void. */
+function stillComing(game: GameName, v: TableView, m: CallMemory, k: { r: number; value: string } | null, ctx: Pick<CallCtx, 'now' | 'moving' | 'drawn'>): boolean {
+  if (k === null || k.value === VOID || !(game === 'roulette' || (v.phase === 'settled' && v.round === k.r))) return false;
+  return ctx.moving || (ctx.drawn && m.hold?.id === `${k.r}:${k.value}` && ctx.now <= m.hold.at);
 }
 
 /**
@@ -641,13 +653,18 @@ export function computedTableCall(t: string, game: GameName, now = Date.now(), m
     if (casinoWhole(t) && computedSettled(t) && !heldAgain(v, computedDecidedTo(t, game))) primeCalls(m, v, tosses.get(t)?.close ?? null);
     return null;
   }
-  // (Nor while a record that came since waits for its check: what shows may
-  // be part of a fold.)
-  if (!computedSettled(t)) return null;
   const toss = tosses.get(t)?.close ?? null;
   const shown = shownOf(v);
-  m.seen = { result: shown, held: stillComing(game, v, shown, moving), toss };
-  return nextCall(game, v, m, { now, moving, drawn, toss, name: nameOf });
+  const ctx: CallCtx = { now, moving, drawn, toss, name: nameOf };
+  // (Nor while a record that came since waits for its check: what shows may
+  // be part of a fold. The felt shows it all the same, for a wake to count.)
+  if (!computedSettled(t)) {
+    m.seen = { result: shown, held: stillComing(game, v, m, shown, ctx), toss };
+    return null;
+  }
+  const call = nextCall(game, v, m, ctx);
+  m.seen = { result: shown, held: stillComing(game, v, m, shown, ctx), toss };
+  return call;
 }
 
 /** The call computedTableCall gave was said, or dropped unsaid. */

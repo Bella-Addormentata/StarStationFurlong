@@ -384,6 +384,30 @@ describe('each call once (built views, frame by frame)', () => {
     expect(said).toEqual([robot.RESULT_HOLD_MAX_MS]);
   });
 
+  it('a rewrite that left the screen and comes back waits for the wheel afresh, not on its first hold', () => {
+    // 17 called; a rewrite to 4 shows while the wheel spins, then 17 again
+    // for 9 s; 4 comes back, the wheel spinning for it: called as it stops.
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const spun = play([
+      { v: shown(5, 17), ms: 1_000 },
+      { v: shown(5, 4), ms: 1_000, moving: true },
+      { v: shown(5, 17), ms: 9_000 },
+      { v: shown(5, 4), ms: 2_000, moving: true },
+    ], m);
+    expect(spun.said).toEqual(['🎡 17 BLACK — house wins']);
+    expect(play([{ v: shown(5, 4), ms: 100 }], m, spun.now).said).toEqual(['🎡 Round 5 is now 4 BLACK — house wins']);
+    // Back within the 8 s: its 8 s count from its return, not its first hold.
+    const n = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    const back = play([
+      { v: shown(5, 17), ms: 1_000 },
+      { v: shown(5, 4), ms: 2_000, moving: true, drawn: true },
+      { v: shown(5, 17), ms: 1_500, drawn: true },
+      { v: shown(5, 4), ms: 6_000, moving: true, drawn: true },
+    ], n);
+    expect(back.said).toEqual(['🎡 17 BLACK — house wins']);
+    expect(play([{ v: shown(5, 4), ms: 100, drawn: true }], n, back.now).said).toEqual(['🎡 Round 5 is now 4 BLACK — house wins']);
+  });
+
   it("at craps calls an earlier roll's correction at once, though the next roll's dice fly", () => {
     const m = Object.assign(robot.newCallMemory('k1'), { primed: true });
     m.called.set(5, '34');
@@ -911,12 +935,27 @@ describe("time's up (built views)", () => {
     expect(play([{ v: landed, ms: 1_000, toss: toss(WAIT_END) }], m, WAIT_END + 60_000).said).toEqual([]);
     // Another incarnation's toss isn't this memory's; nothing seen, nothing marked.
     const n = primedK();
+    n.wait = { r: 5, until: WAIT_END };
     n.seen = { result: null, held: false, toss: toss(WAIT_END, 5, 'k2') };
     robot.wokeCalls(n);
     expect(n.timesUp).toBeNull();
     const o = primedK();
     robot.wokeCalls(o);
     expect([o.called.size, o.timesUp]).toEqual([0, null]);
+  });
+
+  it("a wake counts no toss whose time's up wasn't due: one before this page's wait ran out leaves the roll's next toss its time's up", () => {
+    const m = primedK();
+    m.wait = { r: 5, until: WAIT_END };
+    m.seen = { result: null, held: false, toss: toss(WAIT_END - 1_000) };
+    robot.wokeCalls(m);
+    expect(m.timesUp).toBeNull();
+    // That close came to nothing: after the wake roll 5 waits for Ann's
+    // throw again, the wait runs out here, and the stickman throws.
+    const W2 = WAIT_END + 60_000;
+    const again = dice({ inc: 'k1', phase: 'closing', holder: 'player-Ann', shooterInPlay: true, shooterSlip: 'gone', phaseDeadline: W2 });
+    const out = play([{ v: again, ms: 1_000 }, { v: tossed, ms: 1_000, toss: toss(W2) }], m, W2 - 1_000);
+    expect(out.said).toEqual(['✋ No more bets — the stickman throws for Ann in 1 second', TIMES_UP]);
   });
 
   it('never at roulette, and a toss shown before priming counts as said', () => {
