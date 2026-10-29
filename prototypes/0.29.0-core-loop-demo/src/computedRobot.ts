@@ -58,6 +58,8 @@ export const RESULT_HOLD_MAX_MS = 8_000;
 /** Rounds whose result call a page remembers per table (the felt's own
  *  memory of what it spun or threw keeps as many). */
 export const CALLED_ROUNDS = 64;
+/** How many rounds' windows the call memory keeps (opened, closed). */
+const WINDOW_ROUNDS = 8;
 /** A void, in the memory of what was called. */
 export const VOID = 'void';
 /** How long a players' table keeps its robot after its last sign of play. */
@@ -188,11 +190,15 @@ export interface CallMemory {
   /** Round → the pocket, the dice as `d1d2`, or VOID: oldest first,
    *  CALLED_ROUNDS kept. */
   called: Map<number, string>;
-  /** The betting window last opened (its round and deadline). */
-  open: { r: number; deadline: number } | null;
-  /** The window last closed: its round, and the deadline of the window this
+  /** Round → the deadline of the betting window last opened on it, oldest
+   *  first, WINDOW_ROUNDS kept: a view that flips to another round and back
+   *  (a record deleted, then put back) is the same window. */
+  opens: Map<number, number>;
+  /** The round of the window last opened. */
+  lastOpen: number | null;
+  /** Round → the window last closed on it: the deadline of the window this
    *  page saw open on that round (null if it saw none). */
-  close: { r: number; window: number | null } | null;
+  closes: Map<number, number | null>;
   /** A result waiting for the wheel or dice (`r:value`), since `at`. */
   hold: { id: string; at: number } | null;
   /** Craps: the wait for the holder's throw this page last saw (its roll,
@@ -237,7 +243,7 @@ export interface CallCtx {
 }
 
 export function newCallMemory(inc: string): CallMemory {
-  return { inc, primed: false, called: new Map(), open: null, close: null, hold: null, wait: null, timesUp: null };
+  return { inc, primed: false, called: new Map(), opens: new Map(), lastOpen: null, closes: new Map(), hold: null, wait: null, timesUp: null };
 }
 
 /** `r:value` of a spin or roll key, or null for '' (no result may show). */
@@ -246,10 +252,15 @@ function keyOf(v: TableView): { r: number; value: string } | null {
   return m ? { r: Number(m[1]), value: m[2] } : null;
 }
 
+/** Round r's entry set to v, the oldest dropped past `cap` (the latest last). */
+function keep<V>(map: Map<number, V>, r: number, v: V, cap: number): void {
+  map.delete(r);
+  map.set(r, v);
+  if (map.size > cap) map.delete(map.keys().next().value as number);
+}
+
 function remember(m: CallMemory, r: number, value: string): void {
-  m.called.delete(r);
-  m.called.set(r, value);
-  if (m.called.size > CALLED_ROUNDS) m.called.delete(m.called.keys().next().value as number);
+  keep(m.called, r, value, CALLED_ROUNDS);
 }
 
 /** Every frame, before nextCall, saying nothing: a window's deadline that
@@ -258,9 +269,8 @@ function remember(m: CallMemory, r: number, value: string): void {
  *  future is a clock gone back. */
 export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const d = v.phaseDeadline;
-  if (v.phase === 'betting' && d !== undefined && m.open?.r === v.round && m.open.deadline !== d && now < m.open.deadline) {
-    m.open.deadline = d;
-  }
+  const was = m.opens.get(v.round);
+  if (v.phase === 'betting' && d !== undefined && was !== undefined && was !== d && now < was) m.opens.set(v.round, d);
   if (v.kind === 'craps' && v.phase === 'closing' && v.shooterSlip !== undefined && d !== undefined) m.wait = { r: v.round, until: d };
   if (m.hold && m.hold.at > now) m.hold.at = now;
 }
@@ -320,14 +330,14 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
   }
   // (Not for a round called already, or one before the window last opened:
   // held again after a wake, or back to its close for an undo.)
-  if (v.phase === 'closing' && !m.called.has(v.round) && !(m.open !== null && m.open.r > v.round)) {
-    const window = m.open?.r === v.round ? m.open.deadline : null;
-    if (m.close?.r === v.round && m.close.window === window) return null;
+  if (v.phase === 'closing' && !m.called.has(v.round) && !(m.lastOpen !== null && m.lastOpen > v.round)) {
+    const window = m.opens.get(v.round) ?? null;
+    if (m.closes.has(v.round) && m.closes.get(v.round) === window) return null;
     const text = (v.kind === 'craps' ? waitText(v, ctx.name, ctx.now) : null) ?? '✋ No more bets!';
     return { kind: 'close', key: `${v.inc}|${v.round}|close|${window ?? ''}`, text, r: v.round, window };
   }
   const d = v.phaseDeadline;
-  if (v.phase === 'betting' && d !== undefined && ctx.now < d && !(m.open?.r === v.round && m.open.deadline === d)) {
+  if (v.phase === 'betting' && d !== undefined && ctx.now < d && m.opens.get(v.round) !== d) {
     const text = (v.kind === 'roulette' ? croupierBeatLine(v) : crapsBeatLine(v))?.text;
     if (text) return { kind: 'open', key: `${v.inc}|${v.round}|open|${d}`, text, r: v.round, deadline: d };
   }
@@ -336,8 +346,10 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
 
 /** The call was said (or dropped unsaid at an idle table): remember it. */
 export function callSaid(m: CallMemory, c: TableCall): void {
-  if (c.kind === 'open') m.open = { r: c.r, deadline: c.deadline! };
-  else if (c.kind === 'close') m.close = { r: c.r, window: c.window ?? null };
+  if (c.kind === 'open') {
+    keep(m.opens, c.r, c.deadline!, WINDOW_ROUNDS);
+    m.lastOpen = c.r;
+  } else if (c.kind === 'close') keep(m.closes, c.r, c.window ?? null, WINDOW_ROUNDS);
   else if (c.kind === 'timesup') m.timesUp = c.r;
   else {
     remember(m, c.r, c.value!);

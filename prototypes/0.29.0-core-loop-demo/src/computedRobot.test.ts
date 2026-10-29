@@ -305,6 +305,19 @@ describe('each call once (built views, frame by frame)', () => {
     expect(out.keys[2]).toBe(`c1|5|close|${W2}`);
   });
 
+  it('at craps closes a window, opens the roll again once it ran out, and closes the fresh window', () => {
+    const W2 = W + 30_000;
+    const roll5 = (over: Partial<ComputedCrapsState>): ComputedCrapsState => dice({ inc: 'k1', ...over });
+    const out = play([
+      { v: roll5({ phaseDeadline: W }), ms: 500 },
+      { v: roll5({ phase: 'closing' }), ms: 500 },
+      { v: roll5({ phaseDeadline: W2 }), ms: 500 }, // its close taken back, after W: a fresh window
+      { v: roll5({ phase: 'closing' }), ms: 500 },
+    ], Object.assign(robot.newCallMemory('k1'), { primed: true }), W - 1_000);
+    expect(out.said).toEqual(['🎲 Coming out — place your bets!', '✋ No more bets!', '🎲 Coming out — place your bets!', '✋ No more bets!']);
+    expect(out.keys).toEqual([`k1|5|open|${W}`, `k1|5|close|${W}`, `k1|5|open|${W2}`, `k1|5|close|${W2}`]);
+  });
+
   it('stays quiet for a flap back to the same window, and for a deadline that moves', () => {
     const out = play([
       { v: open(5, W, '4:9'), ms: 500 },
@@ -314,6 +327,21 @@ describe('each call once (built views, frame by frame)', () => {
       { v: closing(5, '4:9'), ms: 500 },
     ], Object.assign(robot.newCallMemory('c1'), { primed: true }));
     expect(out.said).toEqual(['🎲 Place your bets!', '✋ No more bets!']);
+  });
+
+  it('stays quiet when the view flips to another round and back (a record deleted, then put back)', () => {
+    const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
+    m.called.set(2, '7');
+    const out = play([
+      { v: open(6, W, '5:23'), ms: 500 },
+      { v: open(2, W - 5_000, '1:12'), ms: 500 }, // the chain back to round 2, for a moment
+      { v: open(6, W, '5:23'), ms: 500 },
+      { v: closing(6, '5:23'), ms: 500 },
+      { v: closing(2, '1:12'), ms: 500 },
+      { v: closing(6, '5:23'), ms: 500 },
+    ], m);
+    expect(out.said).toEqual(['🎲 Place your bets!', '🎲 Place your bets!', '✋ No more bets!']);
+    expect(out.keys).toEqual([`c1|6|open|${W}`, `c1|2|open|${W - 5_000}`, `c1|6|close|${W}`]);
   });
 
   it('never says place your bets at or after the deadline', () => {
