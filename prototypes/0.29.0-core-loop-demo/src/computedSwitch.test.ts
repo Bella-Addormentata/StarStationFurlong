@@ -1866,6 +1866,70 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(body).not.toMatch(/if \(beatNow\) beatCroupier\(t\.id\);/);
     expect(body).toContain('else tickAutoCroupier(t.id);');
   });
+
+  // 🤖 PR 4: the robot at a players' table (computedRobot).
+  it('keeps the owner-run robot test as it was, and leaves STOPped robots out at players\' tables only', () => {
+    expect(world).toContain('} from "./computedRobot";\nimport type { TablePull } from "./computedRobot";');
+    expect(body).toContain([
+      '    const eligible = (k: string): boolean =>',
+      '      this.robots.has(k) &&',
+      '      routineOf(k) !== "idle" &&',
+      '      routineOf(k) !== "custom" &&',
+      '      routineOf(k) !== "coach" && // a coach runs its class, never a table',
+      '      routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table',
+      '      routineOf(k) !== "pilot" && // 🚀 a ship pilot keeps to the helm and the berth door',
+      '      routineOf(k) !== "disassemble" && // 🔧 a robot taking a module apart stays on the job',
+      '      (!hasDedicated || routineOf(k) === "croupier");',
+    ].join('\n'));
+    expect(body).toContain('const hasDedicated = [...this.robots.keys()].some(\n      (k) => routineOf(k) === "croupier",\n    );');
+    const eligibleAt = body.slice(body.indexOf('const eligible = '), body.indexOf('const operatorPost = '));
+    expect(eligibleAt).not.toContain('parked');
+    expect(body).toContain('const hasDedicatedAtComputed = [...this.robots.keys()].some((k) => !isParked(k) && routineOf(k) === "croupier");');
+    expect(body).toContain('this.robots.has(k) && !isParked(k) && mayCroupier(routineOf(k), hasDedicatedAtComputed);');
+  });
+
+  it("gives an owner-run table its heartbeat's pull and a players' table its level, then hands robots out", () => {
+    const handOut = body.slice(body.indexOf('const pulls: TablePull[] = [];'), body.indexOf('// Narration (all clients)'));
+    expect(handOut).toContain('if (selfRun.has(t.id)) {');
+    expect(handOut).toContain('pull = computedTableLevel(t.id, gameOf(t), someoneAtStands(standsForItem(t.id), this.robotAvatarSpots), frameNow);');
+    expect(handOut).toContain('} else pull = isCroupierLive(t.id) ? 3 : 0;');
+    expect(handOut).toContain('if (post && pull !== 0) pulls.push({ id: t.id, x: post.x, z: post.z, pull });');
+    expect(handOut).toContain('owner: eligible(key), computed: eligibleAtComputed(key)');
+    expect(handOut).toContain('assignCroupiers(');
+    expect(handOut).toContain('bot.setCroupierPost(tid ? operatorPost(tid) : null);');
+    expect(body).toContain('const selfRun = new Set(tables.filter((t) => tableRunsItself(t.id, gameOf(t))).map((t) => t.id));');
+    expect(body).not.toContain('.filter((t) => isCroupierLive(t.id) && operatorPost(t.id))');
+  });
+
+  it("narrates a players' table from computedRobot before the owner-run lines, dropping a call due while it is idle", () => {
+    const narration = body.slice(body.indexOf('// Narration (all clients)'));
+    const ours = narration.indexOf('if (selfRun.has(t.id)) {');
+    const owners = narration.indexOf('if (!isCroupierLive(t.id)) {');
+    expect(ours).toBeGreaterThan(-1);
+    expect(ours).toBeLessThan(owners);
+    expect(narration.slice(0, ours)).toContain('for (const t of tables) {');
+    const branch = narration.slice(ours, owners);
+    for (const line of [
+      'this.croupierNarrated.delete(t.id);',
+      'const call = computedTableCall(t.id, gameOf(t), frameNow, moving, h !== undefined);',
+      'if (call && (!live || !stand || this.robotSay(`croupier:${t.id}`, call.text, stand.front.x, stand.front.z))) {',
+      'noteComputedCallSaid(t.id, call);',
+      'continue;',
+    ]) expect(branch).toContain(line);
+    expect(branch).not.toMatch(/readCrapsTableState|readTableState|BeatLine|isCroupierLive/);
+    // The owner-run lines, as they were.
+    for (const line of [
+      'beat = s ? crapsBeatLine(s) : null;',
+      'beat = s ? croupierBeatLine(s) : null;',
+      'if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;',
+      'this.croupierNarrated.set(t.id, beat.key);',
+    ]) expect(narration.slice(owners)).toContain(line);
+    expect(body).toContain('const robot = autoCroupier || isCroupierLive(t.id);');
+  });
+
+  it("forgets a players' table's robot memory when the table leaves the room", () => {
+    expect(world).toContain('this.croupierNarrated.delete(itemId);\n    forgetComputedTable(itemId);');
+  });
 });
 
 /** Another page's two writes elsewhere, the second given to p's doc first:
