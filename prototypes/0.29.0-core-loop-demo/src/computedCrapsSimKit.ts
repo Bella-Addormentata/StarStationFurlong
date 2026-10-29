@@ -80,7 +80,7 @@ export async function finish(sim: Sim, lines: string[], opts: Finish = {}): Prom
   await Promise.all(sim.pocketChecks.splice(0));
   const s = sim.summary();
   const budget = crapsStallBudget(sim, opts.bettors ?? sim.pages.length);
-  const line = `${Sim.line(s, sim.worstStall.at)}\n${crapsLine(sim, s, craps, quietMs, budget)}`;
+  const line = `${Sim.line(s, sim.worstStall.at)}\n${crapsLine(sim, s, craps, quietMs, budget)}\n${sim.robots.line()}`;
   lines.push(line);
   console.log(line);
   const log = sim.pages.flatMap((sp) => sp.flipLog.map((f) => `${sp.name} ${f}`));

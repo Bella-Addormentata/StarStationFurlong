@@ -1177,6 +1177,9 @@ describe('computed craps: an older build in the room', () => {
       });
       // It renews the lease as its build does, then goes.
       for (let beat = 3; beat <= 6; beat++) sim.at(t0 + 8_000 + (beat - 2) * 2_000, () => sim.as(g, () => lease(beat)));
+      // And beats its robot croupier, as its build's operator does (every
+      // 3 s): no robot of this build's at the table moves for it.
+      for (let b = t0 + 1_000; b < t0 + 18_000; b += 3_000) sim.at(b, () => sim.as(g, (now) => g.p.casino.writeCroupierBeat(T, now)));
       sim.at(t0 + 18_000, () => {
         sim.crash(g);
         crashedAt = sim.elapsed;
@@ -1316,6 +1319,9 @@ describe("computed craps: a page shaped like PR 2's", () => {
       for (let beat = 2; t0 + (beat - 1) * 2_000 < quietAt; beat++) {
         sim.at(t0 + (beat - 1) * 2_000, () => sim.as(g, () => g.p.casino.writeTableOperatorLease({ page: `pr2-${g.name}`, player: house.pid, beat, build: 2 })));
       }
+      // And its robot croupier's beat, as PR 2's operator writes it at an
+      // owner-run table (every 3 s): no robot of this build's moves for it.
+      for (let b = t0 + 1_000; b < quietAt; b += 3_000) sim.at(b, () => sim.as(g, (now) => g.p.casino.writeCroupierBeat(T, now)));
       // Its removal: the furniture out of its room, and PR 2's
       // clearTableKeys on its page (no state up as it reads it, the house
       // having swept its round: it marks the owner-run name a fresh round

@@ -98,7 +98,7 @@ async function finish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
   await sim.syncAll();
   sim.settleFlips();
   const s = sim.summary();
-  const line = Sim.line(s, sim.worstStall.at);
+  const line = `${Sim.line(s, sim.worstStall.at)}\n${sim.robots.line()}`;
   lines.push(line);
   console.log(line);
   const log = sim.pages.flatMap((sp) => sp.flipLog.map((f) => `${sp.name} ${f}`));
@@ -863,6 +863,9 @@ describe('added for PR 2', () => {
       });
       // It renews the lease as its build does (only what it read), then goes.
       for (let beat = 2; beat <= 5; beat++) sim.at(at + 3_000 + (beat - 1) * 2_000, () => sim.as(ghost, () => oldBuildLease(ghost, house.pid, beat)));
+      // And beats its robot croupier, as its build's operator does (every
+      // 3 s): no robot of this build's at the table moves for it.
+      for (let b = at + 4_000; b < at + 12_000; b += 3_000) sim.at(b, () => sim.as(ghost, (now) => ghost.p.casino.writeCroupierBeat(T1, now)));
       sim.at(at + 12_000, () => sim.crash(ghost));
     }
     sim.every(() => {
