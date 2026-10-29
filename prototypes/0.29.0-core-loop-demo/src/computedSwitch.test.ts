@@ -1927,6 +1927,13 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(body).toContain('const robot = autoCroupier || isCroupierLive(t.id);');
   });
 
+  it("swings the arm of the robot standing a players' table when its felt showed the stickman's toss", () => {
+    const narration = body.slice(body.indexOf('// Narration (all clients)'));
+    const branch = narration.slice(narration.indexOf('if (selfRun.has(t.id)) {'), narration.indexOf('if (!isCroupierLive(t.id)) {'));
+    expect(branch).toContain('if (takeComputedTosses(t.id) > 0) {');
+    expect(branch).toContain('for (const [key, tid] of this.croupierAssign) if (tid === t.id) this.robots.get(key)?.tossGesture();');
+  });
+
   it("forgets a players' table's robot memory when the table leaves the room", () => {
     expect(world).toContain('this.croupierNarrated.delete(itemId);\n    forgetComputedTable(itemId);');
   });

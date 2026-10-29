@@ -62,6 +62,7 @@ import {
   noteComputedCallSaid,
   someoneAtStands,
   tableRunsItself,
+  takeComputedTosses,
 } from "./computedRobot";
 import type { TablePull } from "./computedRobot";
 import { spawnFixedBubble } from "./chatBubbles";
@@ -6507,6 +6508,10 @@ export class World {
     for (const t of tables) {
       if (selfRun.has(t.id)) {
         this.croupierNarrated.delete(t.id); // (as when a heartbeat stops)
+        // The felt showed the stickman's toss: the robot standing the table swings.
+        if (takeComputedTosses(t.id) > 0) {
+          for (const [key, tid] of this.croupierAssign) if (tid === t.id) this.robots.get(key)?.tossGesture();
+        }
         const stand = standsForItem(t.id).find((x) => x.role != null);
         const h = this.casinoTableVisuals.get(t.id);
         const moving = h ? (h.game === "craps" ? h.diceState() === "flying" || h.diceState() === "settling" : h.wheelSpinning()) : false;
