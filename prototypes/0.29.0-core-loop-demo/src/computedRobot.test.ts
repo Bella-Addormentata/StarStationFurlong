@@ -337,6 +337,21 @@ describe('each call once (built views, frame by frame)', () => {
     expect(said).toEqual([robot.RESULT_HOLD_MAX_MS]);
   });
 
+  it("at craps calls an earlier roll's correction at once, though the next roll's dice fly", () => {
+    const m = Object.assign(robot.newCallMemory('k1'), { primed: true });
+    m.called.set(5, '34');
+    const closing6 = dice({ phase: 'closing', round: 6, rollKey: '5:25' });
+    robot.observeCalls(m, closing6, T);
+    const c = robot.nextCall('craps', closing6, m, { now: T, moving: true, drawn: true, toss: null, name });
+    expect(c).toMatchObject({ kind: 'result', r: 5, value: '25', text: '🎲 Roll 5 is now 2+5 = 7' });
+    // (A roll on show still waits for its dice.)
+    const shown5 = roll(2, 5);
+    const m2 = Object.assign(robot.newCallMemory('k1'), { primed: true });
+    m2.called.set(5, '34');
+    robot.observeCalls(m2, shown5, T);
+    expect(robot.nextCall('craps', shown5, m2, { now: T, moving: true, drawn: true, toss: null, name })).toBeNull();
+  });
+
   it('on a drawn table waits a frame for the felt, then while the wheel spins', () => {
     const m = Object.assign(robot.newCallMemory('c1'), { primed: true });
     const at: number[] = [];
@@ -381,14 +396,17 @@ describe('each call once (built views, frame by frame)', () => {
 });
 
 describe('when a robot comes (built views)', () => {
-  const live = (): import('./computedRobot').LiveMemory => ({ hotAt: null, ran: null });
+  const live = (): import('./computedRobot').LiveMemory => ({ hotAt: null, ran: null, at: null });
   const W = T + 18_000;
 
   it('is in play past no more bets, and betting until the deadline', () => {
     expect(robot.liveStep(live(), wheel({ phase: 'closing' }), false, T)).toBe(2);
     expect(robot.liveStep(live(), dice({ phase: 'closing' }), false, T)).toBe(2);
     expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W - 1)).toBe(2);
-    expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W)).toBe(0);
+    // (Roulette: chips down, a little past the deadline for its close.)
+    expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W + robot.COMPUTED_CLOSE_SLACK_MS - 1)).toBe(2);
+    expect(robot.liveStep(live(), wheel({ phaseDeadline: W }), false, W + robot.COMPUTED_CLOSE_SLACK_MS)).toBe(0);
+    expect(robot.liveStep(live(), dice({ phaseDeadline: W }), false, W)).toBe(0);
     expect(robot.liveStep(live(), wheel({}), false, T)).toBe(0);
   });
 
@@ -396,10 +414,15 @@ describe('when a robot comes (built views)', () => {
     const m = live();
     expect(robot.liveStep(m, wheel({ phase: 'settled', result: 4, payouts: {}, spinKey: '5:4' }), false, T)).toBe(0);
     expect(robot.liveStep(m, wheel({ phase: 'closing', round: 5 }), false, T + 1_000)).toBe(2);
-    expect(m.ran).toEqual({ inc: 'c1', r: 5 });
+    expect(m.ran).toEqual({ inc: 'c1', rounds: [5] });
     expect(robot.liveStep(m, wheel({ phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 20_000)).toBe(2);
+    // Round 6 betting on the timer, then round 5 shown again for a rewrite:
+    // a round this page saw run, so in play.
+    expect(robot.liveStep(m, wheel({ round: 6, phaseDeadline: T + 40_000, spinKey: '5:4' }), false, T + 30_000)).toBe(2);
+    expect(m.ran).toEqual({ inc: 'c1', rounds: [5, 6] });
+    expect(robot.liveStep(m, wheel({ phase: 'settled', round: 5, result: 7, payouts: {}, spinKey: '5:7' }), false, T + 31_000)).toBe(2);
     // Another incarnation's round 5 is another round.
-    expect(robot.liveStep(m, wheel({ inc: 'c2', phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 40_000)).toBe(0);
+    expect(robot.liveStep(m, wheel({ inc: 'c2', phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 50_000)).toBe(0);
   });
 
   it('lingers 10 seconds, then is idle; riders keep a craps table quiet', () => {
@@ -411,12 +434,51 @@ describe('when a robot comes (built views)', () => {
     expect(robot.liveStep(live(), dice({ riders: 0 }), false, T)).toBe(0);
   });
 
-  it('lingers from now when the clock goes back', () => {
+  it('keeps what was left of the linger when the clock goes back', () => {
     const m = live();
     robot.liveStep(m, wheel({ phase: 'closing' }), false, T + 60_000);
     expect(robot.liveStep(m, wheel({}), false, T)).toBe(1);
     expect(m.hotAt).toBe(T);
     expect(robot.liveStep(m, wheel({}), false, T + robot.COMPUTED_LIVE_LINGER_MS)).toBe(0);
+    // A table idle 20 s stays idle across a step back of a minute; one 4 s
+    // into its linger keeps the 6 s left.
+    const idle = live();
+    robot.liveStep(idle, wheel({ phase: 'closing' }), false, T + 40_000);
+    expect(robot.liveStep(idle, wheel({}), false, T + 60_000)).toBe(0);
+    expect(robot.liveStep(idle, wheel({}), false, T)).toBe(0);
+    const warm = live();
+    robot.liveStep(warm, wheel({ phase: 'closing' }), false, T + 56_000);
+    expect(robot.liveStep(warm, wheel({}), false, T + 60_000)).toBe(1);
+    expect(robot.liveStep(warm, wheel({}), false, T)).toBe(1);
+    expect(robot.liveStep(warm, wheel({}), false, T + 5_999)).toBe(1);
+    expect(robot.liveStep(warm, wheel({}), false, T + 6_000)).toBe(0);
+  });
+
+  it('counts nothing of a view not yet checked but someone there and the linger', () => {
+    const unchecked = { checked: false, decidedTo: null };
+    expect(robot.liveStep(live(), wheel({ phase: 'closing' }), false, T, unchecked)).toBe(0);
+    expect(robot.liveStep(live(), dice({ riders: 2 }), false, T, unchecked)).toBe(0);
+    expect(robot.liveStep(live(), wheel({ phase: 'closing' }), true, T, unchecked)).toBe(2);
+    const m = live();
+    robot.liveStep(m, wheel({ phase: 'closing' }), false, T);
+    expect(robot.liveStep(m, wheel({ phase: 'closing' }), false, T + 1_000, unchecked)).toBe(1);
+    // (Nor does it mark the round as seen run.)
+    const n = live();
+    robot.liveStep(n, wheel({ phaseDeadline: W }), false, T, unchecked);
+    expect(n.ran).toBeNull();
+  });
+
+  it("doesn't count a decided round held again for its forfeit's grace as running, unless this page saw it run", () => {
+    const decided = { checked: true, decidedTo: 5 };
+    expect(robot.liveStep(live(), wheel({ phase: 'closing', round: 5 }), false, T, decided)).toBe(0);
+    expect(robot.liveStep(live(), wheel({ phase: 'closing', round: 6 }), false, T, decided)).toBe(2);
+    const m = live();
+    expect(robot.liveStep(m, wheel({ phase: 'closing', round: 5 }), false, T, { checked: true, decidedTo: 4 })).toBe(2);
+    expect(robot.liveStep(m, wheel({ phase: 'closing', round: 5 }), false, T + 1_000, decided)).toBe(2);
+    // (A replay marks nothing: its show isn't in play either.)
+    const n = live();
+    robot.liveStep(n, wheel({ phase: 'closing', round: 5 }), false, T, decided);
+    expect(robot.liveStep(n, wheel({ phase: 'settled', round: 5, result: 4, payouts: {}, spinKey: '5:4' }), false, T + 20_000, decided)).toBe(0);
   });
 
   it('is in play while someone stands there, even with nothing to show', () => {

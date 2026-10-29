@@ -43,7 +43,7 @@
  */
 
 import { casinoDocEpoch, casinoWhole, computedSettled, computedSwitchLost, isComputedFor, isComputedTable } from './casinoDoc';
-import { readComputedCraps, readComputedRoulette } from './computedTable';
+import { computedDecidedTo, readComputedCraps, readComputedRoulette, STAGGER_MS } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState } from './computedTable';
 import type { GameName } from './computedFold';
 import { croupierBeatLine, TABLE_CLOCK_SLACK_MS, tablesWakeCount } from './croupier';
@@ -62,6 +62,9 @@ export const CALLED_ROUNDS = 64;
 export const VOID = 'void';
 /** How long a players' table keeps its robot after its last sign of play. */
 export const COMPUTED_LIVE_LINGER_MS = 10_000;
+/** How long past its deadline a roulette round with chips down still runs,
+ *  waiting for its close (the first close turns, STAGGER_MS apart). */
+export const COMPUTED_CLOSE_SLACK_MS = 3 * STAGGER_MS;
 /** An avatar this near a stand's front stands at it (the walk-up's own
  *  test of a taken stand, World pickFreeStand). */
 export const AT_STAND_M = 0.7;
@@ -297,8 +300,9 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
       const id = `${k.r}:${k.value}`;
       const since = m.hold?.id === id ? m.hold.at : null;
       // On a drawn table it waits a frame first, for the felt to take it,
-      // then while the wheel spins or the dice fly.
-      const waits = since === null
+      // then while the wheel spins or the dice fly. (At craps only a roll on
+      // show moves: an earlier one's faces turn at rest, never in the air.)
+      const waits = game === 'craps' && !onShow ? false : since === null
         ? ctx.moving || ctx.drawn
         : ctx.now - since < RESULT_HOLD_MAX_MS && (ctx.moving || (ctx.drawn && ctx.now <= since));
       if (waits) {
@@ -314,7 +318,9 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
       r: v.round, value: VOID,
     };
   }
-  if (v.phase === 'closing') {
+  // (Not for a round called already, or one before the window last opened:
+  // held again after a wake, or back to its close for an undo.)
+  if (v.phase === 'closing' && !m.called.has(v.round) && !(m.open !== null && m.open.r > v.round)) {
     const window = m.open?.r === v.round ? m.open.deadline : null;
     if (m.close?.r === v.round && m.close.window === window) return null;
     const text = (v.kind === 'craps' ? waitText(v, ctx.name, ctx.now) : null) ?? '✋ No more bets!';
@@ -359,35 +365,61 @@ export function someoneAtStands(
     && spots.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < AT_STAND_M));
 }
 
-/** One table's liveness on this page: the last time it was in play, and
- *  the last round this page saw run (betting before its deadline, or
- *  closing), so a result shown again after a load or a wake isn't one. */
+/** One table's liveness on this page: the last time it was in play, the
+ *  rounds of one incarnation this page saw run (betting before its
+ *  deadline, or closing; the latest RAN_ROUNDS), so a result shown again
+ *  after a load or a wake isn't one, and a rewrite's on a round it saw is;
+ *  and the clock at its last frame. */
 export interface LiveMemory {
   hotAt: number | null;
-  ran: { inc: string; r: number } | null;
+  ran: { inc: string; rounds: number[] } | null;
+  at: number | null;
 }
 
-/** Whether the view shows a round running, by this page's clock. */
-export function roundRuns(v: TableView, ran: LiveMemory['ran'], now: number): boolean {
-  if (v.phase === 'closing') return true;
-  if (v.phase === 'betting') return v.phaseDeadline !== undefined && now < v.phaseDeadline;
-  return ran !== null && ran.inc === v.inc && ran.r === v.round;
+const RAN_ROUNDS = 8;
+
+/** What the view rests on: whether this page has counted the table's
+ *  records whole and checked (the robot's call memory primed: a view before
+ *  that may show a close whose reveals aren't checked yet), and the last
+ *  round it holds decided. */
+export interface LiveSeen { checked: boolean; decidedTo: number | null }
+
+const SEEN_ANYWAY: LiveSeen = { checked: true, decidedTo: null };
+
+/** Whether the view shows a round running, by this page's clock: past no
+ *  more bets (but not a decided round held again for its forfeit's grace,
+ *  as a load or a wake shows the last one, unless this page saw it run),
+ *  betting before its deadline (at roulette, with chips down, a little past
+ *  it for the close), or the result of a round this page saw run. */
+export function roundRuns(v: TableView, ran: LiveMemory['ran'], now: number, decidedTo: number | null = null): boolean {
+  const saw = ran !== null && ran.inc === v.inc && ran.rounds.includes(v.round);
+  if (v.phase === 'closing') return saw || decidedTo === null || v.round > decidedTo;
+  if (v.phase === 'betting') return v.phaseDeadline !== undefined && now < v.phaseDeadline + (v.kind === 'roulette' ? COMPUTED_CLOSE_SLACK_MS : 0);
+  return saw;
 }
 
 /** The table's level this frame (the memory moves with it). With no view
- *  (just after the switch, a lost switch) only someone standing there
- *  counts. A clock gone back lingers from now. */
-export function liveStep(m: LiveMemory, v: TableView | null, someoneThere: boolean, now: number): Level {
-  if (v && (v.phase === 'closing' || (v.phase === 'betting' && v.phaseDeadline !== undefined && now < v.phaseDeadline))) {
-    m.ran = { inc: v.inc, r: v.round };
+ *  (just after the switch, a lost switch), or one not yet checked, only
+ *  someone standing there and the linger count. A clock gone back keeps
+ *  what was left of the linger. */
+export function liveStep(m: LiveMemory, v: TableView | null, someoneThere: boolean, now: number, seen: LiveSeen = SEEN_ANYWAY): Level {
+  if (m.at !== null && now < m.at && m.hotAt !== null) m.hotAt = now - (m.at - m.hotAt);
+  m.at = now;
+  const view = seen.checked ? v : null;
+  const opens = view?.phase === 'betting' && view.phaseDeadline !== undefined && now < view.phaseDeadline;
+  if (view && (opens || (view.phase === 'closing' && roundRuns(view, m.ran, now, seen.decidedTo)))) {
+    if (m.ran?.inc !== view.inc) m.ran = { inc: view.inc, rounds: [] };
+    if (!m.ran.rounds.includes(view.round)) {
+      m.ran.rounds.push(view.round);
+      if (m.ran.rounds.length > RAN_ROUNDS) m.ran.rounds.shift();
+    }
   }
-  if (someoneThere || (v !== null && roundRuns(v, m.ran, now))) {
+  if (someoneThere || (view !== null && roundRuns(view, m.ran, now, seen.decidedTo))) {
     m.hotAt = now;
     return 2;
   }
-  if (m.hotAt !== null && m.hotAt > now) m.hotAt = now;
   if (m.hotAt !== null && now - m.hotAt < COMPUTED_LIVE_LINGER_MS) return 1;
-  return v?.kind === 'craps' && v.riders > 0 ? 1 : 0;
+  return view?.kind === 'craps' && view.riders > 0 ? 1 : 0;
 }
 
 /** Routines that never work a table (World's croupier test). */
@@ -492,6 +524,9 @@ function sameWake(now: number): void {
 
 const nameOf: NameOf = (pid) => speakableName(readPlayerDisplayName(pid));
 
+/** A decided round shown closing: held again for its forfeit's grace. */
+const heldAgain = (v: TableView, decidedTo: number | null): boolean => v.phase === 'closing' && decidedTo !== null && v.round <= decidedTo;
+
 function viewOf(t: string, game: GameName, now: number): TableView | null {
   return game === 'craps' ? readComputedCraps(t, now) : readComputedRoulette(t, now);
 }
@@ -515,8 +550,9 @@ export function computedTableCall(t: string, game: GameName, now = Date.now(), m
   observeCalls(m, v, now);
   if (!m.primed) {
     // (casinoWhole asks the room for what's missing: only until primed, as
-    // the felt asks.)
-    if (casinoWhole(t) && computedSettled(t)) primeCalls(m, v, tosses.get(t)?.close ?? null);
+    // the felt asks. A load shows a last round a forfeit decided held again
+    // for its grace: primed at its show, so its result counts as said.)
+    if (casinoWhole(t) && computedSettled(t) && !heldAgain(v, computedDecidedTo(t))) primeCalls(m, v, tosses.get(t)?.close ?? null);
     return null;
   }
   return nextCall(game, v, m, { now, moving, drawn, toss: tosses.get(t)?.close ?? null, name: nameOf });
@@ -539,10 +575,12 @@ export function computedTableLevel(t: string, game: GameName, someoneThere: bool
   sameWake(now);
   let m = live.get(t);
   if (!m) {
-    m = { hotAt: null, ran: null };
+    m = { hotAt: null, ran: null, at: null };
     live.set(t, m);
   }
-  return liveStep(m, viewOf(t, game, now), someoneThere, now);
+  const v = viewOf(t, game, now);
+  const said = calls.get(t);
+  return liveStep(m, v, someoneThere, now, { checked: said?.primed === true && said.inc === v?.inc, decidedTo: computedDecidedTo(t) });
 }
 
 /** The felt showed the stickman's toss at players' craps table `t` for roll

@@ -222,6 +222,81 @@ describe('a roulette round on a real page', () => {
     expect(e.texts().slice(3)).toEqual([resultCall(o, 1).replace('🎡 ', '🎡 Round 1 is now ')]);
   });
 
+  /** Round 1 on page o, every frame heard: X, Y and Z bet, X closes, X's
+   *  and Y's seeds come, and the forfeit of whichever of X and Y ranks
+   *  worse decides it 4 s after the close (Z's seed never came). */
+  function forfeited(o: Page, e: Ear): { closeSeen: number } {
+    const slips = [X, Y_, Z].map((id) => kit.slip(id, 1, [red(5)]));
+    const closeSeen = T0 + 18_000;
+    const worse = [X, Y_].sort((a, b) => (dutyRank('forfeit', CTX, 1, a.pub) < dutyRank('forfeit', CTX, 1, b.pub) ? -1 : 1))[1];
+    let closeHash = '';
+    play(o, e, [
+      [T0, () => putIn(o, slips.map((x): [string, unknown] => [x.key, x.rec]))],
+      [closeSeen, () => { const c = kit.close(X, 1, foldOf(o).parent, slips); closeHash = c.hash; putIn(o, [[c.key, c.rec]]); }],
+      [closeSeen + 500, () => putIn(o, [X, Y_].map((id): [string, unknown] => { const x = kit.reveal(1, id.pid); return [x.key, x.rec]; }))],
+      [closeSeen + 4_000, () => { const f = kit.forfeit(worse, 1, closeHash, [worse.pid]); putIn(o, [[f.key, f.rec]]); }],
+    ], T0, closeSeen + 6_000);
+    expect(e.texts()).toEqual(['🎲 Place your bets!', '✋ No more bets!', resultCall(o, 1)]);
+    return { closeSeen };
+  }
+
+  /** Frames of page p's robot from `from` to `to`: what it says, and every
+   *  level and phase it shows, in order. */
+  function watchFrom(p: Page, e: Ear, from: number, to: number): { levels: number[]; phases: string[] } {
+    const levels: number[] = [];
+    const phases: string[] = [];
+    for (let T = from; T <= to; T += STEP) {
+      const now = clockOf(p, T);
+      p.croupier.noteTablesRunning(now);
+      const l = p.robot.computedTableLevel(TABLE, 'roulette', false, now);
+      if (levels.at(-1) !== l) levels.push(l);
+      const c = p.robot.computedTableCall(TABLE, 'roulette', now);
+      if (c) {
+        e.said.push({ at: T, text: c.text, key: c.key });
+        p.robot.noteComputedCallSaid(TABLE, c);
+      }
+      const v = p.table.readComputedRoulette(TABLE, T);
+      const ph = v ? `${v.phase}:${v.round}` : 'none';
+      if (phases.at(-1) !== ph) phases.push(ph);
+    }
+    return { levels, phases };
+  }
+
+  it("a page that loads as the last round, a forfeit's, is held again for its grace stays idle and says nothing: neither no more bets nor the old result", async () => {
+    const o = await watch();
+    const { closeSeen } = forfeited(o, ear(o));
+    const p = await loadPage('P', 2);
+    const load = closeSeen + 30_000;
+    sync(load, o, p);
+    const e = ear(p);
+    const seen = watchFrom(p, e, load, load + 8_000 + p.table.SHOW_MS);
+    expect(seen.phases.slice(0, 2)).toEqual(['closing:1', 'settled:1']);
+    expect(seen.levels).toEqual([0]);
+    expect(e.said).toEqual([]);
+  });
+
+  it("a page that wakes after the next round opened shows the last round held again: no second no more bets, and idle", async () => {
+    const o = await watch();
+    const e = ear(o);
+    const { closeSeen } = forfeited(o, e);
+    // Round 2 opens (X's felt) and runs on this page a while; then the page
+    // sleeps past the lapse and wakes before round 2's deadline.
+    const open = closeSeen + 6_000 + o.table.SHOW_MS;
+    e.hearFor(closeSeen + 6_000 + STEP, open - STEP);
+    putAt(o, open, kit.slip(X, 2, [red(5)]));
+    e.hearFor(open, open + 2_000);
+    expect(e.texts().slice(3)).toEqual(['🎲 Place your bets!']);
+    const wake = open + 9_000;
+    const seen = watchFrom(o, e, wake, wake + 8_000);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(seen.phases[0]).toBe('closing:1');
+    expect(e.texts().slice(4).filter((x) => x.startsWith('✋'))).toEqual([]);
+    expect(e.texts().slice(4).filter((x) => x.startsWith('🎡'))).toEqual([]);
+    // (Lingering from round 2's window, then idle through round 1's hold and
+    // show: never in play for it.)
+    expect(seen.levels).toEqual([1, 0]);
+  });
+
   it('calls a rewritten round again, and again when it is rewritten back', async () => {
     const o = await watch();
     const e = ear(o);
@@ -323,10 +398,15 @@ describe('a craps roll on real pages', () => {
 
 describe('when a robot comes, on real pages', () => {
   /** Page p's level for table t at T, nobody standing there unless `there`. */
+  /** Page p's level at T, then its call heard (World asks both every frame:
+   *  a level counts the table's rounds once its calls are primed). */
   const level = (p: Page, T: number, game: 'roulette' | 'craps' = 'roulette', t = TABLE, there = false) => {
     const now = clockOf(p, T);
     p.croupier.noteTablesRunning(now);
-    return p.robot.computedTableLevel(t, game, there, now);
+    const l = p.robot.computedTableLevel(t, game, there, now);
+    const c = p.robot.computedTableCall(t, game, now);
+    if (c) p.robot.noteComputedCallSaid(t, c);
+    return l;
   };
 
   it('a round seen run is in play through its show, then lingers 10 seconds', async () => {
@@ -356,12 +436,14 @@ describe('when a robot comes, on real pages', () => {
     return out;
   };
 
-  it("a stuck round (its only bettor gone before the close) is in play until the deadline, then quiet 10 seconds, then idle", async () => {
+  it("a stuck round (its only bettor gone before the close) is in play until a little past the deadline, then quiet 10 seconds, then idle", async () => {
     const o = await watch();
     putAt(o, T0, kit.slip(X, 1, [red(5)]));
     const deadline = T0 + o.table.BET_WINDOW_MS;
-    expect(levelsFor(o, T0, deadline + 20_000)).toEqual([[T0, 2], [deadline, 1], [deadline - STEP + o.robot.COMPUTED_LIVE_LINGER_MS, 0]]);
-    expect(o.table.readComputedRoulette(TABLE, deadline + 20_000)).toMatchObject({ phase: 'betting', round: 1, phaseDeadline: deadline });
+    const slack = deadline + o.robot.COMPUTED_CLOSE_SLACK_MS;
+    // (Its first frame counts the table: idle until then.)
+    expect(levelsFor(o, T0, slack + 20_000)).toEqual([[T0, 0], [T0 + STEP, 2], [slack, 1], [slack - STEP + o.robot.COMPUTED_LIVE_LINGER_MS, 0]]);
+    expect(o.table.readComputedRoulette(TABLE, slack + 20_000)).toMatchObject({ phase: 'betting', round: 1, phaseDeadline: deadline });
   });
 
   it('a page that loads during a show stays idle: the result shown again is no round it saw run', async () => {
@@ -416,6 +498,8 @@ describe('when a robot comes, on real pages', () => {
     const v = a.table.readComputedCraps(CRAPS_TABLE, after)!;
     expect(v).toMatchObject({ phase: 'betting', point: 6, riders: 2 });
     expect(v.phaseDeadline).toBeUndefined();
+    // (Its first frame counts the table: idle until then.)
+    expect(level(a, after - STEP, 'craps', CRAPS_TABLE)).toBe(0);
     expect(level(a, after, 'craps', CRAPS_TABLE)).toBe(1);
     expect(level(a, after + 60_000, 'craps', CRAPS_TABLE)).toBe(1);
   });
