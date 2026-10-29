@@ -129,6 +129,47 @@ const closeOf = (p: Page, r: number): string | undefined => {
 const tossOf = (hash: string): string => `throw ${parseInt(hash.slice(0, 8), 16) % 2 ** 31}`;
 const throws = (log: readonly string[]): string[] => log.filter((e) => e.startsWith('throw '));
 
+/** The robot stickman at the table on page p (computedRobot), heard after
+ *  each of its frames as World hears it, after the felt and the duties:
+ *  what it says, and how many stickman's tosses the felt noted for it from
+ *  now on. */
+interface Ear { said: string[]; tossed: number; hear(T: number): void }
+function earOf(p: UIPage): Ear {
+  const ear: Ear = {
+    said: [],
+    tossed: 0,
+    hear(T) {
+      const now = clockOf(p, T);
+      ear.tossed += p.robot.takeComputedTosses(TABLE);
+      const st = p.dice.state();
+      const call = p.robot.computedTableCall(TABLE, 'craps', now, st === 'flying' || st === 'settling', true);
+      if (call) {
+        ear.said.push(call.text);
+        p.robot.noteComputedCallSaid(TABLE, call);
+      }
+    },
+  };
+  p.robot.takeComputedTosses(TABLE);
+  return ear;
+}
+
+/** go, each page's robot heard after its frame. */
+function goHearing(pages: UIPage[], ears: Ear[], from: number, to: number, until?: () => boolean): number {
+  for (let T = from; T <= to; T += STEP) {
+    sync(T, ...pages);
+    for (const [i, p] of pages.entries()) {
+      frameOf(p, T);
+      ears[i].hear(T);
+    }
+    sync(T, ...pages);
+    if (until?.()) return T;
+  }
+  return to + STEP;
+}
+
+const TIMES_UP = "🎲 Time's up — the stickman throws";
+const timesUps = (e: Ear): number => e.said.filter((x) => x === TIMES_UP).length;
+
 function decide(pages: UIPage[], r: number, from: number, to = from + 60_000): number {
   const at = go(pages, from, to, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === r && v.decided !== null)));
   if (at > to) throw new Error(`roll ${r} never decided`);
@@ -1575,6 +1616,34 @@ describe('a roll shown again', () => {
     expect(stateIn['settled 2']).not.toBe('flying');
     expect(lines['settled 2']?.every((l) => l !== '🎲 THE DICE ARE ROLLING…')).toBe(true);
   });
+
+  it("roll 1 rewritten during roll 2's wait: the felt notes the rewrite's toss, the robot calls the new dice and no TIME'S UP for them, then TIME'S UP once when roll 2's wait runs out", async () => {
+    // Both seeds a 6 (x at 3 has the dice); w's alone an 8, which hands them
+    // to w. Nobody throws.
+    const { pages, w, x, W, forfeit } = await shownAgain((ps, w) => rigSplit(ps, 1, 6, w, 8));
+    const ears = pages.map(earOf);
+    goHearing(pages, ears, W + 1_020, W + 1_020);
+    for (const e of ears) e.said = [];
+    forfeit(W + 1_100);
+    goHearing(pages, ears, W + 1_200, W + 1_200 + SHOW);
+    for (const [i, e] of ears.entries()) {
+      expect(e.tossed, pages[i].name).toBe(1);
+      expect(e.said.filter((t) => t.startsWith('🎲 Roll 1 is now ')), pages[i].name).toHaveLength(1);
+      expect(timesUps(e)).toBe(0);
+    }
+    expect(carryOf(x)).toMatchObject({ p: 8, h: w.pid, i: 1 });
+    const open = goHearing(pages, ears, W + 1_400 + SHOW, W + 1_400 + 2 * SHOW, () => pages.every((p) => crapsOf(p)?.phase === 'betting'));
+    const W2 = crapsOf(x, open)!.phaseDeadline!;
+    const at = goHearing(pages, ears, open + STEP, W2 + WAIT_MS + 10_000, () => pages.every((p) => closeOf(p, 2) !== undefined));
+    expect(at).toBeGreaterThanOrEqual(W2 + WAIT_MS);
+    goHearing(pages, ears, at + STEP, at + SHOW);
+    for (const [i, e] of ears.entries()) {
+      expect(e.tossed, pages[i].name).toBe(2);
+      expect(timesUps(e), pages[i].name).toBe(1);
+      const up = e.said.indexOf(TIMES_UP);
+      expect(e.said.slice(up + 1).some((t) => /^🎲 \d\+\d = \d+ — /.test(t)), JSON.stringify(e.said)).toBe(true);
+    }
+  });
 });
 
 // ── What became of my felt ───────────────────────────────────────────────────
@@ -2555,5 +2624,126 @@ describe('rolls nobody finished or the room no longer has', () => {
     const { T } = openRoll(pages, 2, show + 5_000 + STEP);
     go(pages, T, T);
     expect(tc.status()).toMatch(new RegExp(`^🎲 THE POINT IS 6 — PLACE YOUR BETS · ${nameOf(b)} HAS THE DICE · \\d+s$`));
+  });
+});
+
+// ── The robot stickman: the tosses it sees, and time's up ─────────────────────
+
+describe("the robot stickman at a players' craps table", () => {
+  it("the shooter's wait runs out: each felt notes the stickman's toss once, and its robot says the wait, TIME'S UP once, then the dice", async () => {
+    const { pages, decidedAt } = await pointOn(['A', 'B'], [1, 3]);
+    rigRoll(pages, 2, 8);
+    const ears = pages.map(earOf);
+    goHearing(pages, ears, decidedAt + STEP, decidedAt + STEP);
+    const { T, W, D } = openRoll(pages, 2, decidedAt + 2 * STEP);
+    const at = goHearing(pages, ears, T, D + 10_000, () => pages.every((p) => crapsOf(p)?.phase === 'settled' && crapsOf(p)?.round === 2));
+    expect(at).toBeGreaterThanOrEqual(D);
+    expect(W).toBeLessThan(D);
+    goHearing(pages, ears, at + STEP, at + SHOW - STEP);
+    for (const [i, e] of ears.entries()) {
+      expect(e.tossed, pages[i].name).toBe(1);
+      expect(timesUps(e), pages[i].name).toBe(1);
+      const wait = e.said.findIndex((t) => t.startsWith('✋ No more bets — '));
+      const up = e.said.indexOf(TIMES_UP);
+      const dice = e.said.findIndex((t) => /^🎲 \d\+\d = 8 — /.test(t));
+      expect(wait, JSON.stringify(e.said)).toBeGreaterThanOrEqual(0);
+      expect(up).toBeGreaterThan(wait);
+      expect(dice).toBeGreaterThan(up);
+    }
+  });
+
+  it("the shooter flings: no toss noted and no TIME'S UP, on the shooter's page or the other", async () => {
+    const { pages, decidedAt } = await pointOn(['A', 'B'], [3, 1]);
+    const [a] = pages;
+    const ta = atCraps(a, { stand: 3 });
+    const ears = pages.map(earOf);
+    const { T, W } = openRoll(pages, 2, decidedAt + STEP);
+    goHearing(pages, ears, T, W + 1_000);
+    expect(ta.status()).toMatch(/^🎲 YOUR ROLL/);
+    clockOf(a, W + 1_050);
+    ta.fling([{ x: 0, z: 0.3 }, { x: 0, z: 0.1 }, { x: 0, z: -0.1 }, { x: 0, z: -0.3 }], 20);
+    expect(a.casino.readDiceThrow(TABLE)).toMatchObject({ round: 2, by: a.pid });
+    const at = goHearing(pages, ears, W + 1_200, W + 40_000, () => pages.every((p) => crapsOf(p)?.phase === 'settled' && crapsOf(p)?.round === 2));
+    goHearing(pages, ears, at + STEP, at + SHOW - STEP);
+    for (const [i, e] of ears.entries()) {
+      expect(e.tossed, pages[i].name).toBe(0);
+      expect(timesUps(e), pages[i].name).toBe(0);
+      expect(e.said.some((t) => /^🎲 \d\+\d = \d+ — /.test(t)), JSON.stringify(e.said)).toBe(true);
+    }
+  });
+
+  it("a page that hears the close before the shooter's throw tosses for the stickman, and says TIME'S UP: what it shows", async () => {
+    const pages = await room(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    rigRoll([a, b], 1, 6);
+    for (const p of [a, b]) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const decidedAt = decide(pages, 1, T0 + STEP);
+    expect(carryOf(c)).toMatchObject({ p: 6, h: b.pid });
+    const tb = atCraps(b, { stand: 3 });
+    const ears = pages.map(earOf);
+    const { T, W, D } = openRoll(pages, 2, decidedAt + STEP);
+    goHearing(pages, ears, T, W + 1_000);
+    goHearing([b, c], [ears[1], ears[2]], W + 1_200, D - 1_000);
+    clockOf(b, D - 900);
+    tb.key('r');
+    expect(b.casino.readDiceThrow(TABLE)).toMatchObject({ round: 2, by: b.pid });
+    const closedAt = goHearing([a], [ears[0]], W + 1_200, D + 10_000, () => closeOf(a, 2) !== undefined);
+    expect(closedAt).toBeLessThan(D + 10_000);
+    const markC = c.dice.log.length;
+    send(closedAt + 150, a, c);
+    send(closedAt + 250, b, c);
+    frameOf(c, closedAt + 300);
+    ears[2].hear(closedAt + 300);
+    expect(throws(c.dice.log.slice(markC))).toEqual([tossOf(closeOf(a, 2)!)]);
+    expect(ears[2].tossed).toBe(1);
+    expect(ears[2].said.at(-1)).toBe(TIMES_UP);
+  });
+
+  it("a page that saw the roll open late, its wait still running when the close comes: the toss, and no TIME'S UP", async () => {
+    // C hears roll 1 decided 3 s after A and B, so its show, its window and
+    // its wait for the throw all end 3 s later.
+    const pages = await room(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    standAt(a, 1);
+    standAt(b, 3);
+    rigRoll([a, b], 1, 6);
+    for (const p of [a, b]) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const ears = pages.map(earOf);
+    const decidedAt = decide([a, b], 1, T0 + STEP);
+    goHearing([a, b], [ears[0], ears[1]], decidedAt + STEP, decidedAt + 3_000);
+    const { T, W, D } = openRoll(pages, 2, decidedAt + 3_000 + STEP);
+    goHearing(pages, ears, T, W + 4_000);
+    expect(crapsOf(a, W + 4_000)).toMatchObject({ phase: 'closing', phaseDeadline: D });
+    expect(crapsOf(c, W + 4_000)?.phase).toBe('closing');
+    const late = crapsOf(c, W + 4_000)!.phaseDeadline!;
+    expect(late).toBeGreaterThanOrEqual(D + 2_000);
+    const at = goHearing(pages, ears, W + 4_200, D + 10_000, () => pages.every((p) => closeOf(p, 2) !== undefined));
+    expect(at).toBeGreaterThanOrEqual(D);
+    expect(at).toBeLessThan(late);
+    goHearing(pages, ears, at + STEP, at + SHOW);
+    for (const e of [ears[0], ears[1]]) expect(timesUps(e)).toBe(1);
+    expect(ears[2].tossed).toBe(1);
+    expect(timesUps(ears[2]), JSON.stringify(ears[2].said)).toBe(0);
+    expect(ears[2].said.some((t) => t.startsWith('✋ No more bets — '))).toBe(true);
+    expect(ears[2].said.some((t) => /^🎲 \d\+\d = \d+ — /.test(t)), JSON.stringify(ears[2].said)).toBe(true);
+  });
+
+  it("an owner-run table's stand-in toss is never noted", async () => {
+    const [o] = await room(['O'], true);
+    const base = { kind: 'craps', round: 1, point: null, result: null, resultAt: 0, payouts: null, ...o.casino.tableOpening(TABLE) } as const;
+    clockOf(o, T0);
+    o.casino.writeCrapsTableState(TABLE, { ...base, phase: 'closing', dice: null });
+    frameOf(o, T0 + STEP);
+    clockOf(o, T0 + 2 * STEP);
+    o.casino.writeCrapsTableState(TABLE, { ...base, phase: 'settled', dice: [3, 4], result: 7 });
+    const mark = o.dice.log.length;
+    frameOf(o, T0 + 2 * STEP);
+    expect(throws(o.dice.log.slice(mark))).toEqual([`throw ${7919}`]);
+    expect(o.robot.takeComputedTosses(TABLE)).toBe(0);
+    expect(o.robot.computedTableCall(TABLE, 'craps', T0 + 2 * STEP, true, true)).toBeNull();
   });
 });

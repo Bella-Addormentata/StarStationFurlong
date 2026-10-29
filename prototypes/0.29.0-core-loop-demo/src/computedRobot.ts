@@ -70,6 +70,8 @@ export const NAME_FALLBACK = 'the shooter';
 /** A void's call (the status bar's ROLL VOID / NO SPIN in a robot's words). */
 export const NO_SPIN_CALL = '⚠ No spin — stakes returned';
 export const NO_ROLL_CALL = '⚠ No roll — every bet stands';
+/** The stickman throws for a shooter whose wait ran out. */
+export const TIMES_UP_CALL = "🎲 Time's up — the stickman throws";
 
 export type TableView = ComputedRouletteState | ComputedCrapsState;
 export type NameOf = (pid: string) => string;
@@ -190,9 +192,14 @@ export interface CallMemory {
   close: { r: number; window: number | null } | null;
   /** A result waiting for the wheel or dice (`r:value`), since `at`. */
   hold: { id: string; at: number } | null;
+  /** Craps: the wait for the holder's throw this page last saw (its roll,
+   *  and when it ends on this page's clock). */
+  wait: { r: number; until: number } | null;
+  /** Craps: the roll whose time's up was said. */
+  timesUp: number | null;
 }
 
-export type CallKind = 'open' | 'close' | 'result';
+export type CallKind = 'open' | 'close' | 'result' | 'timesup';
 
 export interface TableCall {
   kind: CallKind;
@@ -208,8 +215,14 @@ export interface TableCall {
   deadline?: number;
 }
 
+/** The stickman's toss this page's felt showed at a roll's close
+ *  (noteComputedToss): which roll, when. */
+export interface CloseToss { inc: string; r: number; at: number }
+
 export interface CallCtx {
   now: number;
+  /** The last stickman's toss at a close on this table, if any. */
+  toss: CloseToss | null;
   /** This page's wheel spins, or its dice fly or settle (false with no
    *  table drawn). */
   moving: boolean;
@@ -221,7 +234,7 @@ export interface CallCtx {
 }
 
 export function newCallMemory(inc: string): CallMemory {
-  return { inc, primed: false, called: new Map(), open: null, close: null, hold: null };
+  return { inc, primed: false, called: new Map(), open: null, close: null, hold: null, wait: null, timesUp: null };
 }
 
 /** `r:value` of a spin or roll key, or null for '' (no result may show). */
@@ -237,34 +250,44 @@ function remember(m: CallMemory, r: number, value: string): void {
 }
 
 /** Every frame, before nextCall, saying nothing: a window's deadline that
- *  moved while it ran is the same window (a late re-show pushed it back), and
- *  a hold started in the future is a clock gone back. */
+ *  moved while it ran is the same window (a late re-show pushed it back); at
+ *  craps the wait for the throw, as it stands; and a hold started in the
+ *  future is a clock gone back. */
 export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const d = v.phaseDeadline;
   if (v.phase === 'betting' && d !== undefined && m.open?.r === v.round && m.open.deadline !== d && now < m.open.deadline) {
     m.open.deadline = d;
   }
+  if (v.kind === 'craps' && v.phase === 'closing' && v.shooterSlip !== undefined && d !== undefined) m.wait = { r: v.round, until: d };
   if (m.hold && m.hold.at > now) m.hold.at = now;
 }
 
 /** The records are whole and checked for the first time here: the result on
- *  show, or the one last shown, and a void on show, count as said. Betting
- *  and its close are not marked, so a page that comes in during betting
- *  hears it open. */
-export function primeCalls(m: CallMemory, v: TableView): void {
+ *  show, or the one last shown, a void on show, and a toss already shown,
+ *  count as said. Betting and its close are not marked, so a page that
+ *  comes in during betting hears it open. */
+export function primeCalls(m: CallMemory, v: TableView, toss: CloseToss | null = null): void {
   const k = keyOf(v);
   if (k) remember(m, k.r, k.value);
   if (v.phase === 'settled' && v.voided) remember(m, v.round, VOID);
+  if (toss && toss.inc === m.inc) m.timesUp = toss.r;
   m.primed = true;
 }
 
 /**
- * The call due at the table this frame, if any, first that applies: the
- * result (once the wheel or dice stop), no more bets, place your bets. One a
- * frame; the next comes on a later frame. Nothing is remembered until
- * callSaid, except a round first seen after its show.
+ * The call due at the table this frame, if any, first that applies: time's
+ * up (craps: this page showed the stickman's toss at the close of a roll
+ * whose wait it saw run out, and hasn't called its result), the result
+ * (once the wheel or dice stop), no more bets, place your bets. One a frame;
+ * the next comes on a later frame. Nothing is remembered until callSaid,
+ * except a round first seen after its show.
  */
 export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallCtx): TableCall | null {
+  const toss = ctx.toss;
+  if (game === 'craps' && toss && toss.inc === v.inc && m.wait?.r === toss.r && toss.at >= m.wait.until
+    && m.timesUp !== toss.r && !m.called.has(toss.r)) {
+    return { kind: 'timesup', key: `${v.inc}|${toss.r}|timesup`, text: TIMES_UP_CALL, r: toss.r };
+  }
   const k = keyOf(v);
   if (k && m.called.get(k.r) !== k.value) {
     const onShow = v.phase === 'settled' && v.round === k.r;
@@ -309,6 +332,7 @@ export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallC
 export function callSaid(m: CallMemory, c: TableCall): void {
   if (c.kind === 'open') m.open = { r: c.r, deadline: c.deadline! };
   else if (c.kind === 'close') m.close = { r: c.r, window: c.window ?? null };
+  else if (c.kind === 'timesup') m.timesUp = c.r;
   else {
     remember(m, c.r, c.value!);
     m.hold = null;
@@ -437,6 +461,10 @@ export function assignCroupiers(assign: Map<string, string>, robots: readonly Ro
 
 const calls = new Map<string, CallMemory>();
 const live = new Map<string, LiveMemory>();
+/** Per table, the stickman's tosses this page's felt showed: how many, how
+ *  many of them the robot's arm took (takeComputedTosses), and the last one
+ *  at a close. */
+const tosses = new Map<string, { n: number; taken: number; close: CloseToss | null }>();
 let docEpoch: number | null = null;
 let wakes: number | null = null;
 let lastAt: number | null = null;
@@ -448,6 +476,7 @@ function sameDoc(): void {
   docEpoch = epoch;
   calls.clear();
   live.clear();
+  tosses.clear();
 }
 
 /** A wake (tablesWakeCount), or a clock gone back a second or more, forgets
@@ -487,10 +516,10 @@ export function computedTableCall(t: string, game: GameName, now = Date.now(), m
   if (!m.primed) {
     // (casinoWhole asks the room for what's missing: only until primed, as
     // the felt asks.)
-    if (casinoWhole(t) && computedSettled(t)) primeCalls(m, v);
+    if (casinoWhole(t) && computedSettled(t)) primeCalls(m, v, tosses.get(t)?.close ?? null);
     return null;
   }
-  return nextCall(game, v, m, { now, moving, drawn, name: nameOf });
+  return nextCall(game, v, m, { now, moving, drawn, toss: tosses.get(t)?.close ?? null, name: nameOf });
 }
 
 /** The call computedTableCall gave was said, or dropped unsaid. */
@@ -516,8 +545,32 @@ export function computedTableLevel(t: string, game: GameName, someoneThere: bool
   return liveStep(m, viewOf(t, game, now), someoneThere, now);
 }
 
+/** The felt showed the stickman's toss at players' craps table `t` for roll
+ *  `round` of incarnation `inc` (casinoTableSession): at the roll's close
+ *  (`atClose`), or again for a rewrite. Never for a shooter's own throw, nor
+ *  an owner-run table's stand-in toss. */
+export function noteComputedToss(t: string, inc: string, round: number, atClose: boolean, now = Date.now()): void {
+  sameDoc();
+  const e = tosses.get(t) ?? { n: 0, taken: 0, close: null };
+  e.n += 1;
+  if (atClose) e.close = { inc, r: round, at: now };
+  tosses.set(t, e);
+}
+
+/** How many stickman's tosses the felt showed at table `t` since the last
+ *  call (noteComputedToss): World swings the arm of the robot posted there. */
+export function takeComputedTosses(t: string): number {
+  sameDoc();
+  const e = tosses.get(t);
+  if (!e) return 0;
+  const n = e.n - e.taken;
+  e.taken = e.n;
+  return n;
+}
+
 /** Table `t` left the room: forget it. */
 export function forgetComputedTable(t: string): void {
   calls.delete(t);
   live.delete(t);
+  tosses.delete(t);
 }

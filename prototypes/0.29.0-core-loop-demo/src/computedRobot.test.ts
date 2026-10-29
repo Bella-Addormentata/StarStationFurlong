@@ -38,6 +38,27 @@ function roll(a: number, b: number, over: Partial<ComputedCrapsState> = {}): Com
   return dice({ phase: 'settled', dice: [a, b], result: a + b, rollKey: `5:${a}${b}`, rollBy: 'h', payouts: {}, ...over });
 }
 
+type Seg = { v: ComputedRouletteState | ComputedCrapsState; ms: number; moving?: boolean; drawn?: boolean; toss?: import('./computedRobot').CloseToss };
+/** Step each view for `ms` at 50 ms a frame, saying every call due. */
+function play(segs: Seg[], m = robot.newCallMemory('c1'), start = T): { said: string[]; keys: string[]; m: typeof m; now: number } {
+  const said: string[] = [];
+  const keys: string[] = [];
+  let now = start;
+  if (!m.primed) robot.primeCalls(m, segs[0].v);
+  for (const s of segs) {
+    for (const end = now + s.ms; now < end; now += 50) {
+      robot.observeCalls(m, s.v, now);
+      const c = robot.nextCall(s.v.kind, s.v, m, { now, moving: s.moving ?? false, drawn: s.drawn ?? false, toss: s.toss ?? null, name });
+      if (c) {
+        said.push(c.text);
+        keys.push(c.key);
+        robot.callSaid(m, c);
+      }
+    }
+  }
+  return { said, keys, m, now };
+}
+
 describe('speakableName', () => {
   it('collapses spaces and cuts a long name to 24 characters', () => {
     const long = `${'Ann '.repeat(40)}\n\n${'Bob\t'.repeat(40)}`;
@@ -186,26 +207,6 @@ describe('every call fits the bubble', () => {
 });
 
 describe('each call once (built views, frame by frame)', () => {
-  type Seg = { v: ComputedRouletteState | ComputedCrapsState; ms: number; moving?: boolean; drawn?: boolean };
-  /** Step each view for `ms` at 50 ms a frame, saying every call due. */
-  function play(segs: Seg[], m = robot.newCallMemory('c1'), start = T): { said: string[]; keys: string[]; m: typeof m; now: number } {
-    const said: string[] = [];
-    const keys: string[] = [];
-    let now = start;
-    if (!m.primed) robot.primeCalls(m, segs[0].v);
-    for (const s of segs) {
-      for (const end = now + s.ms; now < end; now += 50) {
-        robot.observeCalls(m, s.v, now);
-        const c = robot.nextCall(s.v.kind, s.v, m, { now, moving: s.moving ?? false, drawn: s.drawn ?? false, name });
-        if (c) {
-          said.push(c.text);
-          keys.push(c.key);
-          robot.callSaid(m, c);
-        }
-      }
-    }
-    return { said, keys, m, now };
-  }
   const W = T + 18_000;
   const open = (r: number, d: number | undefined, key = ''): ComputedRouletteState =>
     wheel({ round: r, ...(d !== undefined ? { phaseDeadline: d } : {}), spinKey: key });
@@ -330,7 +331,7 @@ describe('each call once (built views, frame by frame)', () => {
     const said: number[] = [];
     for (let now = T; now < T + 9_000; now += 50) {
       robot.observeCalls(m, shown(5, 17), now);
-      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving: true, drawn: false, name });
+      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving: true, drawn: false, toss: null, name });
       if (c) { said.push(now - T); robot.callSaid(m, c); }
     }
     expect(said).toEqual([robot.RESULT_HOLD_MAX_MS]);
@@ -342,7 +343,7 @@ describe('each call once (built views, frame by frame)', () => {
     const frames: [number, boolean][] = [[T, false], [T + 16, true], [T + 3_000, true], [T + 5_000, false]];
     for (const [now, moving] of frames) {
       robot.observeCalls(m, shown(5, 17), now);
-      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving, drawn: true, name });
+      const c = robot.nextCall('roulette', shown(5, 17), m, { now, moving, drawn: true, toss: null, name });
       if (c) { at.push(now); robot.callSaid(m, c); }
     }
     expect(at).toEqual([T + 5_000]);
@@ -351,7 +352,7 @@ describe('each call once (built views, frame by frame)', () => {
     const got: number[] = [];
     for (const now of [T, T, T + 16, T + 32]) {
       robot.observeCalls(still, shown(5, 4), now);
-      const c = robot.nextCall('roulette', shown(5, 4), still, { now, moving: false, drawn: true, name });
+      const c = robot.nextCall('roulette', shown(5, 4), still, { now, moving: false, drawn: true, toss: null, name });
       if (c) { got.push(now); robot.callSaid(still, c); }
     }
     expect(got).toEqual([T + 16]);
@@ -613,5 +614,62 @@ describe("the craps table's test of running itself", () => {
     expect(ours).toContain("game === 'craps' ? isComputedFor(t, 'craps') || computedSwitchLost(t, 'craps')");
     // (And no import of the stickman's module graph.)
     expect(ours).not.toMatch(/from '\.\/crapsCroupier'/);
+  });
+});
+
+describe("time's up (built views)", () => {
+  const WAIT_END = T + 36_000;
+  /** Roll 5 in the wait for Ann's throw, until WAIT_END. */
+  const waiting = (): ComputedCrapsState => dice({
+    inc: 'k1', phase: 'closing', holder: 'player-Ann', shooterInPlay: true, shooterSlip: 'gone', phaseDeadline: WAIT_END,
+  });
+  const tossed = dice({ inc: 'k1', phase: 'closing', holder: 'player-Ann', shooterInPlay: true });
+  const landed = roll(2, 3, { inc: 'k1', holderBefore: 'player-Ann', shooterAfter: 'player-Ann' });
+  const primedK = () => Object.assign(robot.newCallMemory('k1'), { primed: true });
+  const toss = (at: number, r = 5, inc = 'k1') => ({ inc, r, at });
+
+  it('a wait seen run out, then the stickman\'s toss at the close: time\'s up once, then the dice', () => {
+    const out = play([
+      { v: waiting(), ms: 1_000 },
+      { v: tossed, ms: 1_000, toss: toss(WAIT_END) },
+      { v: landed, ms: 1_000, toss: toss(WAIT_END) },
+    ], primedK(), WAIT_END - 1_000);
+    expect(out.said).toEqual([
+      '✋ No more bets — the stickman throws for Ann in 1 second',
+      "🎲 Time's up — the stickman throws",
+      '🎲 2+3 = 5 — house collects',
+    ]);
+    expect(out.keys[1]).toBe('k1|5|timesup');
+  });
+
+  it('comes before the result when both are due, and not once the result is called', () => {
+    const both = play([
+      { v: waiting(), ms: 500 },
+      { v: landed, ms: 500, toss: toss(WAIT_END) },
+    ], primedK(), WAIT_END - 500);
+    expect(both.said.slice(1)).toEqual(["🎲 Time's up — the stickman throws", '🎲 2+3 = 5 — house collects']);
+    const late = play([
+      { v: waiting(), ms: 500 },
+      { v: landed, ms: 500 },
+      { v: landed, ms: 500, toss: toss(WAIT_END + 500) },
+    ], primedK(), WAIT_END - 500);
+    expect(late.said.slice(1)).toEqual(['🎲 2+3 = 5 — house collects']);
+  });
+
+  it('says nothing for a toss before the wait ended here, of another roll or incarnation, or with no wait seen', () => {
+    for (const t of [toss(WAIT_END - 1), toss(WAIT_END, 6), toss(WAIT_END, 5, 'k2')]) {
+      const out = play([{ v: waiting(), ms: 1_000 }, { v: tossed, ms: 1_000, toss: t }], primedK(), WAIT_END - 1_000);
+      expect(out.said).toEqual(['✋ No more bets — the stickman throws for Ann in 1 second']);
+    }
+    const unseen = play([{ v: tossed, ms: 1_000, toss: toss(WAIT_END) }], primedK(), WAIT_END);
+    expect(unseen.said).toEqual(['✋ No more bets!']);
+  });
+
+  it('never at roulette, and a toss shown before priming counts as said', () => {
+    const m = robot.newCallMemory('k1');
+    robot.primeCalls(m, waiting(), toss(WAIT_END));
+    expect(m.timesUp).toBe(5);
+    const wheelOut = play([{ v: wheel({ phase: 'closing', round: 5 }), ms: 500, toss: toss(T, 5, 'c1') }], Object.assign(robot.newCallMemory('c1'), { primed: true }));
+    expect(wheelOut.said).toEqual(['✋ No more bets!']);
   });
 });

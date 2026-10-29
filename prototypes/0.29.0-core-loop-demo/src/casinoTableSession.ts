@@ -68,6 +68,7 @@ import {
   SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip, writeComputedSlip,
 } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import { noteComputedToss } from './computedRobot';
 import { crapsBackend } from './crapsBackend';
 import {
   markLocalSeat, NO_HAND_ROLL, openCrapsBetting, pressManualRoll, STICKMAN_DICE_SPOT,
@@ -787,6 +788,8 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         rt.flight = { r: s.round, at: now, done: false };
       } else if (close) {
         tossDice(h, close.hash);
+        // (The robot stickman says time's up for a wait it saw run out.)
+        noteComputedToss(id, s.inc, s.round, true, now);
         rt.flight = { r: s.round, at: now, done: false, close: true };
       }
     }
@@ -800,7 +803,10 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
         // whose result came with no flight seen for it.
         if (rewrite || rt.flight?.r !== k.round || rt.flight.done) {
           const close = computedCrapsClose(id, k.round);
-          if (close) tossDice(h, close.hash);
+          if (close) {
+            tossDice(h, close.hash);
+            noteComputedToss(id, s.inc, k.round, false, now);
+          }
         }
         h.diceLand(diceOfKey(k.pocket));
         rt.flight = { r: k.round, at: rt.flight?.r === k.round ? rt.flight.at : now, done: true };
