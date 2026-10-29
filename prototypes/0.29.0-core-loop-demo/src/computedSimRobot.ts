@@ -18,19 +18,28 @@
  *   value between; every result the page's screen changes to is called
  *   (during its show, or as a correction once the next round is under way),
  *   within the hold's 8 s at most, unless another change takes its place
- *   first.
+ *   first; a void during its show. Unless its records waited for their
+ *   check meanwhile, or the page slept: a wake counts what it showed before
+ *   as said.
  * - R3, nothing before the checks: no call before the page's first frame
  *   of the incarnation whose records were whole and checked, and not
  *   showing a decided round held again for its forfeit's grace (a load
- *   shows the last one so: the robot waits for its show).
- * - R4, one open and one close per window; at craps, time's up at most
- *   once a roll, and never once its result was called.
+ *   shows the last one so: the robot waits for its show); none either
+ *   while a record that came since waits for its check.
+ * - R4, one open and one close per window (the window the harness saw
+ *   opened, the close naming it); at craps, time's up at most once a roll,
+ *   never once its result was called, only while its roll is on screen
+ *   (closing or on show), and only once a wait for the throw the page saw
+ *   in that window has run out.
  * - R5, corrections only for rounds the page called (or found on show as
  *   it first counted the table), with another value.
  * - R6 (agreement, at the end): on every page up, the last value called of
- *   the round its screen names is the one it shows.
+ *   the round its screen names is the one it shows, and no change its
+ *   screen showed waits uncalled (but one the hold may still keep).
  * - L1/L3, the level: 2 exactly while a round runs, by a view counted
- *   only from the frame after the checks (R3's): betting before its
+ *   only from the frame after the checks (R3's), and only while no record
+ *   waits for its check (meanwhile the level it had stands, for 10 s at
+ *   most, and nothing counts): betting before its
  *   deadline (at roulette, 4.5 s past it, for the close), closing (but a
  *   decided round held again only if this page saw it run), or the result
  *   of a round this page saw run since its last load, wake or clock step
@@ -135,8 +144,19 @@ interface Track {
   opens: Map<number, { deadline: number; at: number }>;
   closes: Map<number, Set<number | null>>;
   timesUp: Set<number>;
-  /** A result the screen changed to, not yet called. */
-  pending: { r: number; value: string; since: number } | null;
+  /** Craps: the wait for the throw last seen (its roll, its end), until
+   *  that roll takes bets again (a window of its own). */
+  wait: { r: number; until: number } | null;
+  /** A result the screen changed to, not yet called: since when, and from
+   *  when it is due (a frame whose records wait for their check puts it
+   *  off: `excused`, and a round whose show passed meanwhile is the
+   *  design's silent one). */
+  pending: { r: number; value: string; since: number; due: number; excused: boolean } | null;
+  /** What the screen showed at the last checked frame, and whether its
+   *  wheel or dice were still bringing it (a wake counts it as called, but
+   *  one still coming). */
+  lastShown: { r: number; value: string } | null;
+  lastHeld: boolean;
 }
 
 interface Liveness {
@@ -148,12 +168,17 @@ interface Liveness {
   ran: Map<string, Set<string>>;
   hotAt: Map<string, number>;
   at: Map<string, number>;
+  /** Per table: the level at its last frame, and since when its records
+   *  have waited for their check. */
+  last: Map<string, number>;
+  waitsFrom: Map<string, number>;
 }
 
 /** What a view rests on this frame: whether the page's records of its
- *  incarnation were checked by its last frame (R3's, the harness's own),
- *  and the last round the page's fold holds decided. */
-interface Seen { checked: boolean; decidedTo: number | null }
+ *  incarnation were checked by its last frame (R3's, the harness's own);
+ *  whether, so, a record that came since waits for its check now; and the
+ *  last round the page's fold holds decided. */
+interface Seen { checked: boolean; waits: boolean; decidedTo: number | null }
 
 /** A decided round shown closing: held again for its forfeit's grace. */
 const heldAgain = (v: View, decidedTo: number | null): boolean => v.phase === 'closing' && decidedTo !== null && v.round <= decidedTo;
@@ -201,14 +226,13 @@ export class RobotWatch {
         // (As the robot reads its wake: at the first table's level of the frame.)
         life ??= this.lifeOf(sp, now, croupier.tablesWakeCount());
         const tr = this.tracks.get(`${sp.name}|${t}`);
-        const seen: Seen = {
-          checked: tr !== undefined && tr.load === sp.loads && tr.primed && tr.inc === view?.inc,
-          decidedTo: table.computedDecidedTo(t),
-        };
+        const settled = casino.computedSettled(t);
+        const primed = tr !== undefined && tr.load === sp.loads && tr.primed && tr.inc === view?.inc;
+        const seen: Seen = { checked: primed && settled, waits: primed && !settled, decidedTo: table.computedDecidedTo(t, game) };
         this.checkLevel(sp, t, view, level, life, now, seen);
         // (Asked only while unprimed, as the robot asks: casinoWhole asks the
         // room for what's missing, at most once a few seconds.)
-        this.checkCall(sp, t, game, view, call, () => casino.casinoWhole(t) && casino.computedSettled(t), seen.decidedTo, moving, now);
+        this.checkCall(sp, t, game, view, call, () => casino.casinoWhole(t) && settled, settled, seen.decidedTo, moving, now);
         if (call) robot.noteComputedCallSaid(t, call);
       }
     } finally {
@@ -218,14 +242,36 @@ export class RobotWatch {
   }
 
   /** Page sp's liveness memory, across a load (fresh), a wake or a clock
-   *  step back (the rounds seen run forgotten). */
+   *  step back (the rounds seen run forgotten, and what each table showed
+   *  before counted as called). */
   private lifeOf(sp: SimPage, now: number, wakes: number): Liveness {
     let l = this.lives.get(sp);
     if (!l || l.load !== sp.loads) {
-      l = { load: sp.loads, wakes, lastNow: null, ran: new Map(), hotAt: new Map(), at: new Map() };
+      l = { load: sp.loads, wakes, lastNow: null, ran: new Map(), hotAt: new Map(), at: new Map(), last: new Map(), waitsFrom: new Map() };
       this.lives.set(sp, l);
     }
-    if (l.wakes !== wakes || (l.lastNow !== null && l.lastNow - now >= CLOCK_SLACK_MS)) l.ran.clear();
+    if (l.wakes !== wakes || (l.lastNow !== null && l.lastNow - now >= CLOCK_SLACK_MS)) {
+      l.ran.clear();
+      l.waitsFrom.clear();
+      // (No level in play kept from before it: only what the linger leaves.)
+      for (const [t, last] of l.last) {
+        if (last !== 2) continue;
+        const hot = l.hotAt.get(t);
+        const at = l.at.get(t);
+        const since = hot === undefined ? null : at !== undefined && now < at ? at - hot : now - hot;
+        l.last.set(t, since !== null && since < LINGER_MS ? 1 : 0);
+      }
+      for (const [id, tr] of this.tracks) {
+        if (!id.startsWith(`${sp.name}|`) || tr.load !== sp.loads) continue;
+        if (tr.lastShown && tr.lastHeld) {
+          // (Still coming: due again from the wake, its hold started afresh.)
+          if (tr.pending?.r === tr.lastShown.r && tr.pending.value === tr.lastShown.value) Object.assign(tr.pending, { since: now, due: now, excused: false });
+          continue;
+        }
+        if (tr.lastShown) tr.known.set(tr.lastShown.r, tr.lastShown.value);
+        tr.pending = null;
+      }
+    }
     l.wakes = wakes;
     l.lastNow = now;
     return l;
@@ -236,9 +282,29 @@ export class RobotWatch {
     let ran = life.ran.get(t);
     if (!ran) life.ran.set(t, ran = new Set());
     let hot = life.hotAt.get(t);
+    let waits = life.waitsFrom.get(t);
     const was = life.at.get(t);
-    if (was !== undefined && now < was && hot !== undefined) life.hotAt.set(t, hot = now - (was - hot));
+    if (was !== undefined && now < was) {
+      if (hot !== undefined) life.hotAt.set(t, hot = now - (was - hot));
+      if (waits !== undefined) life.waitsFrom.set(t, waits = now - (was - waits));
+    }
     life.at.set(t, now);
+    if (!seen.waits) life.waitsFrom.delete(t);
+    else if (waits === undefined) life.waitsFrom.set(t, waits = now);
+    const kept = seen.waits && waits !== undefined && now - waits < LINGER_MS ? life.last.get(t) ?? 0 : null;
+    const want = kept ?? this.levelWanted(t, v, life, now, seen, ran);
+    life.last.set(t, want);
+    if (want === 2) this.stats.live += 1;
+    else if (want === 1) this.stats.quiet += 1;
+    if (level !== want) {
+      const riders = v?.kind === 'craps' ? v.riders : 0;
+      this.wrong(sp, t, `level ${level}, the design's ${want} (view ${v ? `${v.inc} ${v.phase} ${v.round} deadline ${v.phaseDeadline ?? '-'}${seen.checked ? '' : seen.waits ? ', waiting for its check' : ', unchecked'}` : 'none'}, decided to ${seen.decidedTo ?? '-'}, riders ${riders})`);
+    }
+  }
+
+  /** The level by the rules, with nothing waiting for its check (L1/L3). */
+  private levelWanted(t: string, v: View | null, life: Liveness, now: number, seen: Seen, ran: Set<string>): number {
+    let hot = life.hotAt.get(t);
     const view = seen.checked ? v : null;
     let running = false;
     if (view) {
@@ -256,20 +322,15 @@ export class RobotWatch {
     }
     if (running) life.hotAt.set(t, hot = now);
     const riders = view?.kind === 'craps' ? view.riders : 0;
-    const want = running ? 2 : hot !== undefined && now - hot < LINGER_MS ? 1 : riders > 0 ? 1 : 0;
-    if (want === 2) this.stats.live += 1;
-    else if (want === 1) this.stats.quiet += 1;
-    if (level !== want) {
-      this.wrong(sp, t, `level ${level}, the design's ${want} (view ${v ? `${v.inc} ${v.phase} ${v.round} deadline ${v.phaseDeadline ?? '-'}${seen.checked ? '' : ', unchecked'}` : 'none'}, decided to ${seen.decidedTo ?? '-'}, riders ${riders})`);
-    }
+    return running ? 2 : hot !== undefined && now - hot < LINGER_MS ? 1 : riders > 0 ? 1 : 0;
   }
 
   /** R1–R5 and H1 for the call (or none) this frame. */
-  private checkCall(sp: SimPage, t: string, game: GameName, v: View | null, call: Call | null, whole: () => boolean, decidedTo: number | null, moving: boolean, now: number): void {
+  private checkCall(sp: SimPage, t: string, game: GameName, v: View | null, call: Call | null, whole: () => boolean, settled: boolean, decidedTo: number | null, moving: boolean, now: number): void {
     const id = `${sp.name}|${t}`;
     let tr = this.tracks.get(id);
     if (!tr || tr.load !== sp.loads) {
-      tr = { load: sp.loads, inc: null, primed: false, known: new Map(), opens: new Map(), closes: new Map(), timesUp: new Set(), pending: null };
+      tr = { load: sp.loads, inc: null, primed: false, known: new Map(), opens: new Map(), closes: new Map(), timesUp: new Set(), wait: null, pending: null, lastShown: null, lastHeld: false };
       this.tracks.set(id, tr);
     }
     if (!v) {
@@ -283,8 +344,14 @@ export class RobotWatch {
       tr.opens.clear();
       tr.closes.clear();
       tr.timesUp.clear();
+      tr.wait = null;
       tr.pending = null;
+      tr.lastShown = null;
+      tr.lastHeld = false;
     }
+    const d = v.phaseDeadline;
+    if (v.kind === 'craps' && v.phase === 'closing' && v.shooterSlip !== undefined && d !== undefined) tr.wait = { r: v.round, until: d };
+    else if (tr.wait?.r === v.round && v.phase === 'betting' && d !== undefined && now < d) tr.wait = null;
     const k = keyOf(v);
     const onShow = (r: number): boolean => v.phase === 'settled' && v.round === r;
     if (!tr.primed) {
@@ -299,19 +366,46 @@ export class RobotWatch {
     }
     // A window's deadline that moved while it ran is the same window.
     const o = tr.opens.get(v.round);
-    if (v.phase === 'betting' && v.phaseDeadline !== undefined && o && now < o.deadline) o.deadline = v.phaseDeadline;
+    if (v.phase === 'betting' && d !== undefined && o && now < o.deadline) o.deadline = d;
+    // R3's second half: nothing while a record waits for its check (and no
+    // change seen is due until it is checked).
+    if (!settled) {
+      if (call) this.wrong(sp, t, `"${call.text}" while a record of ${v.inc} waits for its check`);
+      if (tr.pending) tr.pending.excused = true;
+      return;
+    }
+    // (What the robot remembers before its call: R2 and R5 against it.)
+    const before = call?.kind === 'result' ? tr.known.get(call.r) : undefined;
     // What the screen changed to (R2's second half), or a round first seen
     // after its show (remembered without a word). A void shows only on show.
     const shown = k ?? (v.phase === 'settled' && v.voided ? { r: v.round, value: VOID } : null);
+    tr.lastShown = shown;
+    tr.lastHeld = moving && shown !== null && shown.value !== VOID && (game === 'roulette' || onShow(shown.r));
     if (shown && tr.known.get(shown.r) !== shown.value) {
-      if (!onShow(shown.r) && !tr.known.has(shown.r)) tr.known.set(shown.r, shown.value);
-      else if (tr.pending?.r !== shown.r || tr.pending.value !== shown.value) tr.pending = { r: shown.r, value: shown.value, since: now };
+      if (!onShow(shown.r) && !tr.known.has(shown.r)) {
+        tr.known.set(shown.r, shown.value);
+        // (A show that passed while its records waited for their check is
+        // the design's silent one; any other passed uncalled.)
+        if (tr.pending?.r === shown.r && tr.pending.value === shown.value) {
+          if (!tr.pending.excused) this.wrong(sp, t, `never called round ${shown.r}'s ${shown.value} during its show, on screen since ${tr.pending.since}`);
+          tr.pending = null;
+        }
+      } else if (tr.pending?.r !== shown.r || tr.pending.value !== shown.value) {
+        tr.pending = { r: shown.r, value: shown.value, since: now, due: now, excused: false };
+      } else if (tr.pending.excused) {
+        tr.pending.due = now;
+        tr.pending.excused = false;
+      }
     } else if (tr.pending && (!shown || shown.r !== tr.pending.r || shown.value !== tr.pending.value)) {
+      // (A void's show over, the next round's window up, with no call.)
+      if (!shown && tr.pending.value === VOID && !tr.pending.excused && v.phase === 'betting') {
+        this.wrong(sp, t, `never called round ${tr.pending.r}'s void during its show, on screen since ${tr.pending.since}`);
+      }
       tr.pending = null; // (another change took its place)
     }
     if (call) {
       this.stats.calls += 1;
-      if (call.kind === 'result') this.checkResult(sp, t, game, v, call, tr, k, moving, now);
+      if (call.kind === 'result') this.checkResult(sp, t, game, v, call, tr, k, before, moving, now);
       else if (call.kind === 'open') {
         this.stats.opens += 1;
         const was = tr.opens.get(call.r);
@@ -323,27 +417,33 @@ export class RobotWatch {
       } else if (call.kind === 'close') {
         this.stats.closes += 1;
         if (v.phase !== 'closing' || v.round !== call.r) this.wrong(sp, t, `closed round ${call.r}, the screen ${v.phase} ${v.round}`);
+        // (The window is the one the harness saw opened on the round.)
+        const w = tr.opens.get(call.r)?.deadline ?? null;
+        if ((call.window ?? null) !== w) this.wrong(sp, t, `closed round ${call.r} naming window ${call.window}, the window opened ${w}`);
         let set = tr.closes.get(call.r);
         if (!set) tr.closes.set(call.r, set = new Set());
-        if (set.has(call.window ?? null)) this.wrong(sp, t, `closed round ${call.r}'s window ${call.window} twice`);
-        set.add(call.window ?? null);
+        if (set.has(w)) this.wrong(sp, t, `closed round ${call.r}'s window ${w} twice`);
+        set.add(w);
       } else if (call.kind === 'timesup') {
         this.stats.timesUps += 1;
         if (game !== 'craps' || call.text !== TIMES_UP) this.wrong(sp, t, `said "${call.text}" for time's up at ${game}`);
         if (tr.timesUp.has(call.r)) this.wrong(sp, t, `said time's up for roll ${call.r} twice`);
         if (tr.known.has(call.r)) this.wrong(sp, t, `said time's up for roll ${call.r}, its result called`);
+        if (v.round !== call.r || v.phase === 'betting') this.wrong(sp, t, `said time's up for roll ${call.r}, the screen ${v.phase} ${v.round}`);
+        if (tr.wait?.r !== call.r || now < tr.wait.until) {
+          this.wrong(sp, t, `said time's up for roll ${call.r}, the wait seen ${tr.wait ? `roll ${tr.wait.r}'s to ${tr.wait.until}` : 'none'}`);
+        }
         tr.timesUp.add(call.r);
       }
     }
-    if (tr.pending && now - tr.pending.since > HOLD_MAX_MS + 1_000) {
+    if (tr.pending && now - tr.pending.due > HOLD_MAX_MS + 1_000) {
       this.wrong(sp, t, `never called round ${tr.pending.r}'s ${tr.pending.value}, on screen since ${tr.pending.since}`);
       tr.pending = null;
     }
   }
 
-  private checkResult(sp: SimPage, t: string, game: GameName, v: View, call: Call, tr: Track, k: { r: number; value: string } | null, moving: boolean, now: number): void {
+  private checkResult(sp: SimPage, t: string, game: GameName, v: View, call: Call, tr: Track, k: { r: number; value: string } | null, before: string | undefined, moving: boolean, now: number): void {
     this.stats.results += 1;
-    const before = tr.known.get(call.r);
     // R2: not the value last called.
     if (before === call.value) this.wrong(sp, t, `called round ${call.r}'s ${call.value} again: ${call.text}`);
     let want: string | null;
@@ -389,10 +489,22 @@ export class RobotWatch {
       if (!sp.p.robot.tableRunsItself(t, game)) continue;
       const v: View | null = game === 'craps' ? sp.p.table.readComputedCraps(t, now) : sp.p.table.readComputedRoulette(t, now);
       const tr = this.tracks.get(`${sp.name}|${t}`);
-      const k = v && keyOf(v);
-      if (!v || !k || !tr || tr.load !== sp.loads || tr.inc !== v.inc || !tr.primed) continue;
+      if (!v || !tr || tr.load !== sp.loads || tr.inc !== v.inc || !tr.primed) continue;
+      const p = tr.pending;
+      if (p) {
+        // (Still due, but the hold may keep a result a little: while the dice
+        // fly, or for a frame on a drawn table; at craps only a roll on show.
+        // Or its records wait for their check. A void is never held.)
+        const { moving, drawn } = sp.robotMotion?.(t) ?? { moving: false, drawn: false };
+        const mayHold = p.value !== VOID && (game === 'roulette' || (v.phase === 'settled' && v.round === p.r));
+        const held = p.excused || (mayHold && now - p.since < HOLD_MAX_MS && (moving || (drawn && now <= p.since)));
+        if (!held) out.push(`${this.sim.label}: ${sp.name}'s robot at ${t} never called round ${p.r}'s ${p.value}, on screen since ${p.since}`);
+        continue;
+      }
+      const k = keyOf(v);
+      if (!k) continue;
       const said = tr.known.get(k.r);
-      if (said !== k.value && tr.pending === null) out.push(`${this.sim.label}: ${sp.name}'s robot at ${t} last called round ${k.r} as ${said ?? 'nothing'}, the screen ${k.value}`);
+      if (said !== k.value) out.push(`${this.sim.label}: ${sp.name}'s robot at ${t} last called round ${k.r} as ${said ?? 'nothing'}, the screen ${k.value}`);
     }
     return out;
   }

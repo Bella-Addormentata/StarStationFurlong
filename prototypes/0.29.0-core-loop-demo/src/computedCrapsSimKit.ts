@@ -94,6 +94,8 @@ export async function finish(sim: Sim, lines: string[], opts: Finish = {}): Prom
   expect(quietMs, sim.label).toBeLessThan(QUIET_MAX_MS);
   for (const sp of sim.pages.filter((q) => q.mode === 'up')) expect(sim.endProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
   expect(sim.disagreements(), sim.label).toEqual([]);
+  // (Nor in the robot frame it runs on every page first.)
+  expect(sim.violations, sim.label).toEqual([]);
   for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
     expect(sim.ledgerProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
     expect(sim.cageProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);

@@ -116,6 +116,8 @@ async function finish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
   // Every page up agrees, and on each the books add up: each player's chips,
   // and the cage against what the run bought.
   expect(sim.disagreements(), sim.label).toEqual([]);
+  // (Nor in the robot frame it runs on every page first.)
+  expect(sim.violations, sim.label).toEqual([]);
   for (const sp of sim.pages.filter((q) => q.mode === 'up')) {
     expect(sim.ledgerProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
     expect(sim.cageProblems(sp), `${sim.label} ${sp.name}`).toEqual([]);
@@ -785,6 +787,7 @@ describe('added for PR 2', () => {
     await sim.syncAll();
     for (const sp of sim.pages) expect(sp.p.casino.readChips('player-X'), `${sim.label} ${sp.name}`).toBe(Number(total > 0n ? total : 0n) + 100);
     expect(sim.disagreements(), sim.label).toEqual([]);
+    expect(sim.violations, sim.label).toEqual([]);
   }, TIMEOUT);
 
   it('removal mid-session: the house takes one of two tables out with a round under way; compaction finalises it', async () => {

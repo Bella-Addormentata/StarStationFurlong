@@ -153,6 +153,30 @@ function earOf(p: UIPage): Ear {
   return ear;
 }
 
+/** As earOf, as World asks: the table's level first (a wake is counted
+ *  there), then the call, refused while `shut` holds (the bubble shut:
+ *  nobody of this page in the room) and then left un-noted, as World
+ *  leaves it. */
+function worldEarOf(p: UIPage, shut: () => boolean): Ear {
+  const ear: Ear = {
+    said: [],
+    tossed: 0,
+    hear(T) {
+      const now = clockOf(p, T);
+      ear.tossed += p.robot.takeComputedTosses(TABLE);
+      p.robot.computedTableLevel(TABLE, 'craps', false, now);
+      const st = p.dice.state();
+      const call = p.robot.computedTableCall(TABLE, 'craps', now, st === 'flying' || st === 'settling', true);
+      if (call && !shut()) {
+        ear.said.push(call.text);
+        p.robot.noteComputedCallSaid(TABLE, call);
+      }
+    },
+  };
+  p.robot.takeComputedTosses(TABLE);
+  return ear;
+}
+
 /** go, each page's robot heard after its frame. */
 function goHearing(pages: UIPage[], ears: Ear[], from: number, to: number, until?: () => boolean): number {
   for (let T = from; T <= to; T += STEP) {
@@ -2766,6 +2790,36 @@ describe("the robot stickman at a players' craps table", () => {
     expect(timesUps(ears[2]), JSON.stringify(ears[2].said)).toBe(0);
     expect(ears[2].said.some((t) => t.startsWith('✋ No more bets — '))).toBe(true);
     expect(ears[2].said.some((t) => /^🎲 \d\+\d = \d+ — /.test(t)), JSON.stringify(ears[2].said)).toBe(true);
+  });
+
+  it("a sleep in the show: the TIME'S UP and the dice the bubble refused before it aren't said over the show the wake brings again", async () => {
+    const { pages, decidedAt } = await pointOn(['A', 'B'], [1, 3]);
+    const [a] = pages;
+    rigRoll(pages, 2, 8);
+    let shut = false;
+    const ears = pages.map((p) => worldEarOf(p, () => p === a && shut));
+    goHearing(pages, ears, decidedAt + STEP, decidedAt + STEP);
+    const { T, D } = openRoll(pages, 2, decidedAt + 2 * STEP);
+    goHearing(pages, ears, T, D - 1_000);
+    // A's player steps out of the room before the wait runs out.
+    shut = true;
+    const mark = ears[0].said.length;
+    const at = goHearing(pages, ears, D - 800, D + 10_000, () => pages.every((p) => crapsOf(p)?.phase === 'settled' && crapsOf(p)?.round === 2));
+    goHearing(pages, ears, at + STEP, at + 2_000);
+    expect(ears[0].tossed).toBe(1);
+    expect(timesUps(ears[1])).toBe(1);
+    // A's tab is hidden a minute, two seconds into the show; it comes back,
+    // and its player into the room: the roll shows again, unsaid.
+    const wakes = a.croupier.tablesWakeCount();
+    shut = false;
+    const wake = at + 62_000;
+    sync(wake, ...pages);
+    frameOf(a, wake);
+    ears[0].hear(wake);
+    expect(a.croupier.tablesWakeCount()).toBe(wakes + 1);
+    expect(crapsOf(a, wake)).toMatchObject({ phase: 'settled', round: 2 });
+    goHearing([a], [ears[0]], wake + STEP, wake + SHOW - STEP);
+    expect(ears[0].said.slice(mark)).toEqual([]);
   });
 
   it("an owner-run table's stand-in toss is never noted", async () => {

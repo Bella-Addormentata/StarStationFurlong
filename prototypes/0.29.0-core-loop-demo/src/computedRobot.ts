@@ -28,7 +28,8 @@
  * before; a round first seen after its show is remembered without a word.
  * The result waits a frame on a drawn table, then while this page's wheel
  * spins or its dice fly (at most RESULT_HOLD_MAX_MS), so the robot never
- * gives it away.
+ * gives it away. A wake (or a clock gone back) counts what the page showed
+ * before it as said, so the show it brings again is silent.
  *
  * WHEN A ROBOT COMES. A table that runs itself (tableRunsItself) is in play
  * on this page (level 2) while someone stands at one of its stands or a
@@ -36,7 +37,9 @@
  * its deadline, or a result on show of a round it saw betting or closing
  * (a load or a wake shows every table's last result again, and must not
  * call a robot to each). It is quiet (level 1) for COMPUTED_LIVE_LINGER_MS
- * after, and at craps while bets ride on it; idle (0) otherwise. Robots are
+ * after, and at craps while bets ride on it; idle (0) otherwise. While a
+ * record that came since waits for its signature check, what shows counts
+ * for nothing and the table keeps its level, for the linger at most. Robots are
  * handed out (assignCroupiers): owner-run tables with a fresh heartbeat
  * first, as today; then tables in play, from the free robots or a quiet
  * table's; then quiet tables, from the free ones.
@@ -202,10 +205,16 @@ export interface CallMemory {
   /** A result waiting for the wheel or dice (`r:value`), since `at`. */
   hold: { id: string; at: number } | null;
   /** Craps: the wait for the holder's throw this page last saw (its roll,
-   *  and when it ends on this page's clock). */
+   *  and when it ends on this page's clock), until that roll takes bets
+   *  again. */
   wait: { r: number; until: number } | null;
   /** Craps: the roll whose time's up was said. */
   timesUp: number | null;
+  /** What nextCall last looked at: the result (or void) on screen, whether
+   *  the wheel or dice were still bringing it (`held`: not on screen yet),
+   *  and the stickman's toss at a close the felt had shown. A wake counts
+   *  them as said (wokeCalls), but a result still held. */
+  seen: { result: { r: number; value: string } | null; held: boolean; toss: CloseToss | null } | null;
 }
 
 export type CallKind = 'open' | 'close' | 'result' | 'timesup';
@@ -243,7 +252,7 @@ export interface CallCtx {
 }
 
 export function newCallMemory(inc: string): CallMemory {
-  return { inc, primed: false, called: new Map(), opens: new Map(), lastOpen: null, closes: new Map(), hold: null, wait: null, timesUp: null };
+  return { inc, primed: false, called: new Map(), opens: new Map(), lastOpen: null, closes: new Map(), hold: null, wait: null, timesUp: null, seen: null };
 }
 
 /** `r:value` of a spin or roll key, or null for '' (no result may show). */
@@ -265,13 +274,15 @@ function remember(m: CallMemory, r: number, value: string): void {
 
 /** Every frame, before nextCall, saying nothing: a window's deadline that
  *  moved while it ran is the same window (a late re-show pushed it back); at
- *  craps the wait for the throw, as it stands; and a hold started in the
- *  future is a clock gone back. */
+ *  craps the wait for the throw, as it stands, until its roll takes bets
+ *  again (a window of its own: a rewrite of the roll before restarts it);
+ *  and a hold started in the future is a clock gone back. */
 export function observeCalls(m: CallMemory, v: TableView, now: number): void {
   const d = v.phaseDeadline;
   const was = m.opens.get(v.round);
   if (v.phase === 'betting' && d !== undefined && was !== undefined && was !== d && now < was) m.opens.set(v.round, d);
   if (v.kind === 'craps' && v.phase === 'closing' && v.shooterSlip !== undefined && d !== undefined) m.wait = { r: v.round, until: d };
+  else if (m.wait?.r === v.round && v.phase === 'betting' && d !== undefined && now < d) m.wait = null;
   if (m.hold && m.hold.at > now) m.hold.at = now;
 }
 
@@ -287,18 +298,46 @@ export function primeCalls(m: CallMemory, v: TableView, toss: CloseToss | null =
   m.primed = true;
 }
 
+/** The result (or void) a view puts on screen, as remembered: a void only
+ *  while on show. */
+export function shownOf(v: TableView): { r: number; value: string } | null {
+  return keyOf(v) ?? (v.phase === 'settled' && v.voided ? { r: v.round, value: VOID } : null);
+}
+
+/** A wake, or a clock gone back: what the page showed before it counts as
+ *  said (as a load's priming counts what it finds). The result or void on
+ *  screen at the last look, and the toss the felt had shown, so a call the
+ *  bubble refused until then isn't said late, over the show the wake brings
+ *  again. A result the wheel or dice were still bringing isn't on screen
+ *  yet: its hold starts again, and it is called as they stop. A toss the
+ *  felt shows after the wake is a new one. */
+export function wokeCalls(m: CallMemory): void {
+  const s = m.seen;
+  if (!s) return;
+  if (s.result && !s.held && m.called.get(s.result.r) !== s.result.value) remember(m, s.result.r, s.result.value);
+  if (s.toss && s.toss.inc === m.inc) m.timesUp = s.toss.r;
+  m.hold = null;
+}
+
+/** Whether the wheel or dice are still bringing result `k` (the hold's own
+ *  test of motion: at craps only a roll on show moves). Never a void. */
+function stillComing(game: GameName, v: TableView, k: { r: number; value: string } | null, moving: boolean): boolean {
+  return moving && k !== null && k.value !== VOID && (game === 'roulette' || (v.phase === 'settled' && v.round === k.r));
+}
+
 /**
  * The call due at the table this frame, if any, first that applies: time's
  * up (craps: this page showed the stickman's toss at the close of a roll
- * whose wait it saw run out, and hasn't called its result), the result
- * (once the wheel or dice stop), no more bets, place your bets. One a frame;
- * the next comes on a later frame. Nothing is remembered until callSaid,
- * except a round first seen after its show.
+ * whose wait it saw run out, and hasn't called its result; only while that
+ * roll is on screen, closing or on show), the result (once the wheel or
+ * dice stop), no more bets, place your bets. One a frame; the next comes on
+ * a later frame. Nothing is remembered until callSaid, except a round first
+ * seen after its show.
  */
 export function nextCall(game: GameName, v: TableView, m: CallMemory, ctx: CallCtx): TableCall | null {
   const toss = ctx.toss;
-  if (game === 'craps' && toss && toss.inc === v.inc && m.wait?.r === toss.r && toss.at >= m.wait.until
-    && m.timesUp !== toss.r && !m.called.has(toss.r)) {
+  if (game === 'craps' && toss && toss.inc === v.inc && v.round === toss.r && v.phase !== 'betting'
+    && m.wait?.r === toss.r && toss.at >= m.wait.until && m.timesUp !== toss.r && !m.called.has(toss.r)) {
     return { kind: 'timesup', key: `${v.inc}|${toss.r}|timesup`, text: TIMES_UP_CALL, r: toss.r };
   }
   const k = keyOf(v);
@@ -381,20 +420,29 @@ export function someoneAtStands(
  *  rounds of one incarnation this page saw run (betting before its
  *  deadline, or closing; the latest RAN_ROUNDS), so a result shown again
  *  after a load or a wake isn't one, and a rewrite's on a round it saw is;
- *  and the clock at its last frame. */
+ *  the clock at its last frame, the level it gave then, and since when its
+ *  records wait for their check (null while none does). */
 export interface LiveMemory {
   hotAt: number | null;
   ran: { inc: string; rounds: number[] } | null;
   at: number | null;
+  last: Level;
+  waitsFrom: number | null;
+}
+
+export function newLiveMemory(): LiveMemory {
+  return { hotAt: null, ran: null, at: null, last: 0, waitsFrom: null };
 }
 
 const RAN_ROUNDS = 8;
 
 /** What the view rests on: whether this page has counted the table's
- *  records whole and checked (the robot's call memory primed: a view before
- *  that may show a close whose reveals aren't checked yet), and the last
- *  round it holds decided. */
-export interface LiveSeen { checked: boolean; decidedTo: number | null }
+ *  records whole and checked (the robot's call memory primed, and no record
+ *  waiting for its check now: a view before that may show a close whose
+ *  reveals or forfeit aren't checked yet); whether, primed, a record that
+ *  came since waits for its check now (`waits`); and the last round it
+ *  holds decided. */
+export interface LiveSeen { checked: boolean; waits?: boolean; decidedTo: number | null }
 
 const SEEN_ANYWAY: LiveSeen = { checked: true, decidedTo: null };
 
@@ -412,11 +460,23 @@ export function roundRuns(v: TableView, ran: LiveMemory['ran'], now: number, dec
 
 /** The table's level this frame (the memory moves with it). With no view
  *  (just after the switch, a lost switch), or one not yet checked, only
- *  someone standing there and the linger count. A clock gone back keeps
- *  what was left of the linger. */
+ *  someone standing there and the linger count. While a record that came
+ *  since waits for its check, the table keeps the level it had, for the
+ *  linger at most (a catch-up's checks take a few frames: a round in play
+ *  keeps its robot), and nothing that shows counts. A clock gone back keeps
+ *  what was left of the linger, and of the wait's. */
 export function liveStep(m: LiveMemory, v: TableView | null, someoneThere: boolean, now: number, seen: LiveSeen = SEEN_ANYWAY): Level {
-  if (m.at !== null && now < m.at && m.hotAt !== null) m.hotAt = now - (m.at - m.hotAt);
+  if (m.at !== null && now < m.at) {
+    if (m.hotAt !== null) m.hotAt = now - (m.at - m.hotAt);
+    if (m.waitsFrom !== null) m.waitsFrom = now - (m.at - m.waitsFrom);
+  }
   m.at = now;
+  m.waitsFrom = seen.waits === true ? m.waitsFrom ?? now : null;
+  return m.last = levelOf(m, v, someoneThere, now, seen);
+}
+
+function levelOf(m: LiveMemory, v: TableView | null, someoneThere: boolean, now: number, seen: LiveSeen): Level {
+  if (m.waitsFrom !== null && !someoneThere && now - m.waitsFrom < COMPUTED_LIVE_LINGER_MS) return m.last;
   const view = seen.checked ? v : null;
   const opens = view?.phase === 'betting' && view.phaseDeadline !== undefined && now < view.phaseDeadline;
   if (view && (opens || (view.phase === 'closing' && roundRuns(view, m.ran, now, seen.decidedTo)))) {
@@ -524,14 +584,27 @@ function sameDoc(): void {
 }
 
 /** A wake (tablesWakeCount), or a clock gone back a second or more, forgets
- *  which rounds this page saw run: every table's last result shows again. */
+ *  which rounds this page saw run: every table's last result shows again,
+ *  and what each showed before counts as said (wokeCalls). */
 function sameWake(now: number): void {
   const n = tablesWakeCount();
   if (n !== wakes || (lastAt !== null && lastAt - now >= TABLE_CLOCK_SLACK_MS)) {
+    if (wakes !== null) for (const m of calls.values()) wokeCalls(m);
     wakes = n;
-    for (const m of live.values()) m.ran = null;
+    for (const m of live.values()) wokeLive(m, now);
   }
   lastAt = now;
+}
+
+/** A wake, or a clock gone back, for one table's liveness: the rounds seen
+ *  run forgotten, and no level in play kept from before it (a wait for the
+ *  checks that comes next keeps only what the linger leaves). */
+export function wokeLive(m: LiveMemory, now: number): void {
+  m.ran = null;
+  m.waitsFrom = null;
+  if (m.last !== 2) return;
+  const since = m.hotAt === null ? null : m.at !== null && now < m.at ? m.at - m.hotAt : now - m.hotAt;
+  m.last = since !== null && since < COMPUTED_LIVE_LINGER_MS ? 1 : 0;
 }
 
 const nameOf: NameOf = (pid) => speakableName(readPlayerDisplayName(pid));
@@ -546,8 +619,9 @@ function viewOf(t: string, game: GameName, now: number): TableView | null {
 /**
  * The call due at players' table `t` this frame, from the table as this page
  * shows it, or null. Null too until its records are first whole and checked
- * here (casinoWhole, computedSettled: the felt's own start), and while the
- * page has nothing of it to show (a lost switch keeps what was said). The
+ * here (casinoWhole, computedSettled: the felt's own start), while a record
+ * that came since waits for its check, and while the page has nothing of it
+ * to show (a lost switch keeps what was said). The
  * caller says it, or drops it, then tells noteComputedCallSaid.
  */
 export function computedTableCall(t: string, game: GameName, now = Date.now(), moving = false, drawn = false): TableCall | null {
@@ -564,10 +638,16 @@ export function computedTableCall(t: string, game: GameName, now = Date.now(), m
     // (casinoWhole asks the room for what's missing: only until primed, as
     // the felt asks. A load shows a last round a forfeit decided held again
     // for its grace: primed at its show, so its result counts as said.)
-    if (casinoWhole(t) && computedSettled(t) && !heldAgain(v, computedDecidedTo(t))) primeCalls(m, v, tosses.get(t)?.close ?? null);
+    if (casinoWhole(t) && computedSettled(t) && !heldAgain(v, computedDecidedTo(t, game))) primeCalls(m, v, tosses.get(t)?.close ?? null);
     return null;
   }
-  return nextCall(game, v, m, { now, moving, drawn, toss: tosses.get(t)?.close ?? null, name: nameOf });
+  // (Nor while a record that came since waits for its check: what shows may
+  // be part of a fold.)
+  if (!computedSettled(t)) return null;
+  const toss = tosses.get(t)?.close ?? null;
+  const shown = shownOf(v);
+  m.seen = { result: shown, held: stillComing(game, v, shown, moving), toss };
+  return nextCall(game, v, m, { now, moving, drawn, toss, name: nameOf });
 }
 
 /** The call computedTableCall gave was said, or dropped unsaid. */
@@ -587,12 +667,17 @@ export function computedTableLevel(t: string, game: GameName, someoneThere: bool
   sameWake(now);
   let m = live.get(t);
   if (!m) {
-    m = { hotAt: null, ran: null, at: null };
+    m = newLiveMemory();
     live.set(t, m);
   }
   const v = viewOf(t, game, now);
   const said = calls.get(t);
-  return liveStep(m, v, someoneThere, now, { checked: said?.primed === true && said.inc === v?.inc, decidedTo: computedDecidedTo(t) });
+  // (Only of the game the table is: a read of the other's would let go of
+  // this page's state for its own. Checked: primed, and nothing waits for
+  // its check now.)
+  const primed = said?.primed === true && said.inc === v?.inc;
+  const settled = computedSettled(t);
+  return liveStep(m, v, someoneThere, now, { checked: primed && settled, waits: primed && !settled, decidedTo: computedDecidedTo(t, game) });
 }
 
 /** The felt showed the stickman's toss at players' craps table `t` for roll

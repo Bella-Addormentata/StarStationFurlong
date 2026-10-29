@@ -1882,7 +1882,11 @@ describe("World's frame (world.ts updateCroupier)", () => {
       '      (!hasDedicated || routineOf(k) === "croupier");',
     ].join('\n'));
     expect(body).toContain('const hasDedicated = [...this.robots.keys()].some(\n      (k) => routineOf(k) === "croupier",\n    );');
-    const eligibleAt = body.slice(body.indexOf('const eligible = '), body.indexOf('const operatorPost = '));
+    // (Nor the routine they read: a STOP check there would leave stopped
+    // robots out at owner-run tables too.)
+    expect(body).toContain('    const routineOf = (key: string): RobotRoutine =>\n      readRobotConfig(key)?.routine ?? "serve";\n');
+    const eligibleAt = body.slice(body.indexOf('const routineOf = '), body.indexOf('const operatorPost = '));
+    expect(eligibleAt).toContain('const eligible = ');
     expect(eligibleAt).not.toContain('parked');
     expect(body).toContain('const isParked = (k: string): boolean => readRobotConfig(k)?.parked === true;');
     expect(body).toContain('const hasDedicatedAtComputed = [...this.robots.keys()].some((k) => !isParked(k) && routineOf(k) === "croupier");');

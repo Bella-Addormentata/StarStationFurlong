@@ -18,6 +18,7 @@ import {
   clockOf, CRAPS_REF, CRAPS_TABLE, crapsBet, crapsPointOn, deleteIn, frame, loadPage, openCrapsRoom, openRoom, PAGE_CTX as CTX,
   PAGE_TABLE as TABLE, putIn, rigRoll, standAt, switchOn, sync,
 } from './computedPageKit';
+import type { ComputedTableRef } from './computedTable';
 import type { Page } from './computedPageKit';
 import { ComputedKit, red, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
@@ -140,14 +141,23 @@ describe('a roulette round on a real page', () => {
     expect(e.said).toEqual([]);
     const sv = Y.encodeStateVector(o.doc);
     const script = roundOf(o, 1, T0 + 1_100);
-    // (Only the script writes: the robot's frames between its steps don't.)
+    // (Only the script writes: the robot's frames between its steps don't,
+    // not even a delete, which moves no state vector: no transaction at all.)
+    let robotWrites = 0;
+    const count = (): void => {
+      robotWrites += 1;
+    };
     for (let T = T0 + 1_100; T <= T0 + 40_000; T += STEP) {
       const due = script.filter(([at]) => at === T);
       for (const [, act] of due) { clockOf(o, T); act(); }
-      const before = Y.encodeStateVector(o.doc);
-      e.hear(T);
-      expect(Y.encodeStateVector(o.doc)).toEqual(before);
+      o.doc.on('beforeTransaction', count);
+      try {
+        e.hear(T);
+      } finally {
+        o.doc.off('beforeTransaction', count);
+      }
     }
+    expect(robotWrites).toBe(0);
     expect(Y.encodeStateVector(o.doc)).not.toEqual(sv);
     expect(e.texts()).toEqual(['🎲 Place your bets!', '✋ No more bets!', resultCall(o, 1)]);
     expect(e.said.map((x) => x.at)).toEqual([T0 + 1_100, T0 + 19_100, T0 + 20_100]);
@@ -220,6 +230,26 @@ describe('a roulette round on a real page', () => {
     e.hearFor(wake2, wake2 + 8_000);
     expect(o.croupier.tablesWakeCount()).toBe(2);
     expect(e.texts().slice(3)).toEqual([resultCall(o, 1).replace('🎡 ', '🎡 Round 1 is now ')]);
+  });
+
+  it('a sleep while the wheel still spins: the result is called as it stops after the wake, not before', async () => {
+    const o = await watch();
+    const e = ear(o);
+    const script = roundOf(o, 1, T0);
+    const shows = T0 + 19_000;
+    play(o, e, script, T0, shows - STEP);
+    expect(e.texts()).toEqual(['🎲 Place your bets!', '✋ No more bets!']);
+    // The seeds come and the wheel spins for the pocket; 2 s in, the tab is
+    // hidden 7 s, and the wheel spins on for 2 s when it comes back.
+    for (const [at, act] of script) if (at === shows) { clockOf(o, shows); act(); }
+    e.hearFor(shows, shows + 2_000, true);
+    const wake = shows + 9_000;
+    e.hearFor(wake, wake + 2_000, true);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(e.said).toHaveLength(2);
+    e.hearFor(wake + 2_100, wake + 3_000);
+    expect(e.texts().slice(2)).toEqual([resultCall(o, 1)]);
+    expect(e.said[2].at).toBe(wake + 2_100);
   });
 
   /** Round 1 on page o, every frame heard: X, Y and Z bet, X closes, X's
@@ -510,6 +540,158 @@ describe('when a robot comes, on real pages', () => {
     clockOf(o, T0);
     o.casino.writeMySeat(TABLE, X.pid, { stand: 1, angle: 0, at: T0 });
     for (let T = T0; T <= T0 + 20_000; T += 1_000) expect(level(o, T)).toBe(level(twin, T));
+  });
+});
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe('what the robot reads changes nothing a table runs on', () => {
+  /** Page p's frame at T as World runs it: the duties, then the robot's
+   *  level and call at the table (the call taken as said). */
+  const worldFrame = (p: Page, T: number, ref: ComputedTableRef): void => {
+    frame(T, p, [ref]);
+    const t = typeof ref === 'string' ? ref : ref.id;
+    const game = typeof ref === 'string' ? 'roulette' : ref.game;
+    const now = clockOf(p, T);
+    p.robot.computedTableLevel(t, game, false, now);
+    const c = p.robot.computedTableCall(t, game, now);
+    if (c) p.robot.noteComputedCallSaid(t, c);
+  };
+
+  /** A peer's write over table t's switch: another game's name `forged`,
+   *  with its session (what the house's switch-on writes). */
+  const forge = (b: Page, T: number, t: string, forged: string): void => {
+    clockOf(b, T);
+    b.doc.transact(() => {
+      b.doc.getMap('casino').set(`cfg:computed:${t}`, { v: 1, inc: forged });
+      b.doc.getMap('casinoComputed').set(`ses:${t}:${forged}:g`, new Y.Map());
+    });
+  };
+
+  for (const game of ['craps', 'roulette'] as const) {
+    it(`a ${game} table's switch written over with the other game's name and its session, then deleted: the page puts back its own incarnation, never the other game's`, async () => {
+      const craps = game === 'craps';
+      const t = craps ? CRAPS_TABLE : TABLE;
+      const ref: ComputedTableRef = craps ? CRAPS_REF : TABLE;
+      const pages = craps ? await openCrapsRoom(['A', 'B'], T0) : await openRoom(['A', 'B'], T0);
+      const [a, b] = pages;
+      if (craps) {
+        standAt(a, 1);
+        expect(crapsBet(a, [{ type: 'pass', amount: 10 }], T0)).toBe('ok');
+      } else {
+        clockOf(a, T0);
+        expect(a.table.writeComputedSlip(t, [red(5)], T0)).toBe('ok');
+      }
+      sync(T0, ...pages);
+      const inc = a.casino.computedIncOf(t)!;
+      for (let T = T0; T <= T0 + 1_000; T += STEP) worldFrame(a, T, ref);
+      // (The duties stand down while the switch names the other game: no
+      // per-frame read makes a state for it, the robot's included.)
+      const forged = (craps ? 'c' : 'k') + '12'.repeat(12);
+      forge(b, T0 + 1_100, t, forged);
+      sync(T0 + 1_100, a, b);
+      expect(a.robot.tableRunsItself(t, game)).toBe(true);
+      for (let T = T0 + 1_200; T <= T0 + 3_000; T += STEP) worldFrame(a, T, ref);
+      expect(a.casino.computedIncOf(t)).toBe(forged);
+      clockOf(b, T0 + 3_100);
+      b.doc.getMap('casino').delete(`cfg:computed:${t}`);
+      sync(T0 + 3_100, a, b);
+      for (let T = T0 + 3_200; T <= T0 + 5_000; T += STEP) worldFrame(a, T, ref);
+      expect(a.casino.computedIncOf(t)).toBe(inc);
+      expect(a.casino.isComputedFor(t, game)).toBe(true);
+    }, 30_000);
+  }
+
+  it('counts nothing while a record waits for its check: no level from what shows, and no call, until it is checked', async () => {
+    const o = await watch();
+    const heard: [number, number, string | null][] = [];
+    const hear = (T: number): void => {
+      const now = clockOf(o, T);
+      o.croupier.noteTablesRunning(now);
+      const l = o.robot.computedTableLevel(TABLE, 'roulette', false, now);
+      const c = o.robot.computedTableCall(TABLE, 'roulette', now);
+      if (c) o.robot.noteComputedCallSaid(TABLE, c);
+      heard.push([T, l, c?.text ?? null]);
+    };
+    for (let T = T0; T <= T0 + 500; T += STEP) hear(T);
+    // X's felt comes and is checked; Y's comes with it and waits for its check.
+    putAt(o, T0 + 600, kit.slip(X, 1, [red(5)]));
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, T0 + 600, kit.slip(Y_, 1, [red(5)]));
+    expect(o.table.readComputedRoulette(TABLE, T0 + 600)).toMatchObject({ phase: 'betting', round: 1, phaseDeadline: T0 + 600 + o.table.BET_WINDOW_MS });
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    for (let T = T0 + 600; T <= T0 + 1_000; T += STEP) hear(T);
+    expect(heard.filter(([, l, c]) => l !== 0 || c !== null)).toEqual([]);
+    // Checked a moment later: in play, and the window opens.
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(o.casino.computedSettled(TABLE)).toBe(true);
+    hear(T0 + 1_100);
+    expect(heard.at(-1)).toEqual([T0 + 1_100, 2, '🎲 Place your bets!']);
+  });
+
+  it('a wake keeps no level in play from before it while a record waits for its check', async () => {
+    const o = await watch();
+    const levels: [number, number][] = [];
+    const hear = (T: number): void => {
+      const now = clockOf(o, T);
+      o.croupier.noteTablesRunning(now);
+      const l = o.robot.computedTableLevel(TABLE, 'roulette', false, now);
+      const c = o.robot.computedTableCall(TABLE, 'roulette', now);
+      if (c) o.robot.noteComputedCallSaid(TABLE, c);
+      levels.push([T, l]);
+    };
+    const script = roundOf(o, 1, T0);
+    for (let T = T0; T <= T0 + 21_000; T += STEP) {
+      for (const [at, act] of script) if (at === T) { clockOf(o, T); act(); }
+      hear(T);
+    }
+    expect(levels.at(-1)).toEqual([T0 + 21_000, 2]);
+    // Hidden 30 s; a felt for round 2 comes meanwhile, and its check waits
+    // for the frames the tab runs once it is back.
+    const wake = T0 + 51_000;
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, wake, kit.slip(Z, 2, [red(5)]));
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    const mark = levels.length;
+    for (let T = wake; T <= wake + 1_000; T += STEP) hear(T);
+    expect(o.croupier.tablesWakeCount()).toBe(1);
+    expect(levels.slice(mark).filter(([, l]) => l !== 0)).toEqual([]);
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(o.casino.computedSettled(TABLE)).toBe(true);
+  });
+
+  it('a round in play keeps its level while a record that came since waits for its check, and gets no call meanwhile', async () => {
+    const o = await watch();
+    const heard: [number, number, string | null][] = [];
+    const hear = (T: number): void => {
+      const now = clockOf(o, T);
+      o.croupier.noteTablesRunning(now);
+      const l = o.robot.computedTableLevel(TABLE, 'roulette', false, now);
+      const c = o.robot.computedTableCall(TABLE, 'roulette', now);
+      if (c) o.robot.noteComputedCallSaid(TABLE, c);
+      heard.push([T, l, c?.text ?? null]);
+    };
+    putAt(o, T0, kit.slip(X, 1, [red(5)]));
+    for (let T = T0; T <= T0 + 1_000; T += STEP) hear(T);
+    expect(heard.at(-1)?.[1]).toBe(2);
+    expect(heard.flatMap(([, , c]) => (c ? [c] : []))).toEqual(['🎲 Place your bets!']);
+    // Y's felt comes and waits for its check (a catch-up's checks take a few
+    // frames): still in play, so no other table takes its robot.
+    o.casino.setComputedVerifyForTests({ budgetMs: 0 });
+    putAt(o, T0 + 1_100, kit.slip(Y_, 1, [red(5)]));
+    expect(o.casino.computedSettled(TABLE)).toBe(false);
+    const mark = heard.length;
+    for (let T = T0 + 1_100; T <= T0 + 3_000; T += STEP) hear(T);
+    expect(heard.slice(mark).filter(([, l, c]) => l !== 2 || c !== null)).toEqual([]);
+    o.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(o.casino.computedSettled(TABLE)).toBe(true);
+    hear(T0 + 3_100);
+    expect(heard.at(-1)).toEqual([T0 + 3_100, 2, null]);
   });
 });
 

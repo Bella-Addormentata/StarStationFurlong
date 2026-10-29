@@ -3805,9 +3805,12 @@ export function computedUndoneCount(t: string): number {
  *  past it is undone (a delete took what it rests on, or the room kept the
  *  other side of a split). So is one it showed decided at the checkpoint's
  *  round that the checkpoint didn't keep (the other side of a split): the
- *  checkpoint's round is then not counted. */
-export function computedDecidedTo(t: string): number | null {
-  const at = tableOf(t);
+ *  checkpoint's round is then not counted. With `game`, null too while
+ *  the switch names the other game's incarnation (as every per-frame read:
+ *  a game-blind read there would let go of this page's state for the live
+ *  one, its seeds among it, for the other's). */
+export function computedDecidedTo(t: string, game?: GameName): number | null {
+  const at = tableOf(t, game);
   if (!at) return null;
   const D = lastDecided(at.res);
   if (D) return D.r;
