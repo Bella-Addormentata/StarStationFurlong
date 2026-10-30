@@ -270,9 +270,11 @@ export function changeOk(C: readonly CrapsBet[], B: readonly CrapsBet[], point: 
 
 /** The two dice from the counted seeds: the same bytes as
  *  diceFairness.combineSeeds(seeds, table, r), synchronously. `table` is
- *  computedFold seedTable(ctx). */
-export function diceOf(table: string, r: number, seeds: readonly string[]): [number, number] {
-  return diceFromMaterialSync(`ssf-craps-combine-v1|${[...seeds].sort().join('|')}|${table}|${r}`);
+ *  computedFold seedTable(ctx). A house table's Fair roll adds the house's
+ *  seed, `|house:<seed>` last (as computedFold pocketOf). */
+export function diceOf(table: string, r: number, seeds: readonly string[], house?: string): [number, number] {
+  const tail = house === undefined ? '' : `|house:${house}`;
+  return diceFromMaterialSync(`ssf-craps-combine-v1|${[...seeds].sort().join('|')}|${table}|${r}${tail}`);
 }
 
 // ── The shooter ──────────────────────────────────────────────────────────────
@@ -327,9 +329,10 @@ export interface RollSlip {
 export interface RollIn {
   /** The carry the roll plays from. */ sIn: CrapsCarry;
   /** P: the frozen slips present, by pid. */ slips: ReadonlyMap<string, RollSlip>;
-  /** How the close was decided; null while it isn't. */ decided: 'reveals' | 'forfeit' | 'void' | null;
+  /** How the close was decided; null while it isn't. A house reveal
+   *  (`house`) counts some seeds, as a forfeit does. */ decided: 'reveals' | 'forfeit' | 'house' | 'void' | null;
   /** The pids whose seeds made the dice. */ counted: readonly string[];
-  /** The dice, when decided by reveals or a forfeit. */ dice: readonly [number, number] | null;
+  /** The dice, when decided by reveals, a forfeit or the house. */ dice: readonly [number, number] | null;
 }
 
 export interface RollOut {
@@ -353,7 +356,8 @@ export interface RollOut {
  * newcomer only while the table has a place (riders first, then newcomers in
  * pid order). A frozen player the decision didn't count (a late or missing
  * seed under a forfeit) plays only what was already on the felt and loses
- * what it added. Riders' bets with no decision ride on in the carry.
+ * what it added (a seed the house didn't count, likewise). Riders' bets with
+ * no decision ride on in the carry.
  */
 export function playRoll(input: RollIn): RollOut {
   const { sIn, slips, decided, counted, dice } = input;
@@ -368,7 +372,7 @@ export function playRoll(input: RollIn): RollOut {
     amounts: new Map(), pushes: new Set(), pointBefore: point, pointAfter: point, sevenOut: false, sOut: sIn,
   };
   const w: Record<string, CrapsBet[]> = Object.create(null);
-  const rolled = decided === 'reveals' || decided === 'forfeit';
+  const rolled = decided === 'reveals' || decided === 'forfeit' || decided === 'house';
   if (rolled && !dice) throw new TypeError('playRoll: a roll decided by seeds needs its dice');
   const [d1, d2] = dice ?? [0, 0];
   const seated = new Map<string, number>();

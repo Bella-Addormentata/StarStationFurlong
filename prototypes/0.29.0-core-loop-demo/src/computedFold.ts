@@ -17,18 +17,26 @@
  *   x:<r>:<pid>:<h>   reveal   {r, p, s}          (unsigned)
  *   f:<r>:<h>         forfeit  {r, x, n, k, g}
  *   z:<r>:<h>         abandon  {r, x, k, g}
- *   h:…               reserved for the house record (PR 5) — ignored here
+ *   h:<r>:<h>         house reveal  {r, s, x, n, c?, k, g}   (house tables only)
+ *   o:<r>:<h>         house join    {r, c, k, g}             (house tables only)
+ * A close at a house table may also name a house commitment (`h`).
  * `<h>` = recHash(body). A key whose round, pid or hash doesn't match its
  * body, or a body with a float, an unknown field or a wrong type, is junk and
  * is never indexed. Keys parse from both ends: r and h hold no ':', pid may.
  *
  * Checkpoint `sum:<t>:<inc>` (top level of casinoComputed, LWW):
- *   {v: 1, b, u, l, n, e?, k, g}; a live craps table's also holds `s`, the
- *   state its next roll plays from. Counted on shape alone on Friendly tables.
+ *   {v: 1, b, u, l, n, e?, h?, k, g}; a live craps table's also holds `s`,
+ *   the state its next roll plays from, and a house table's `h`, the house
+ *   commitment its next session's first round must name. Counted on shape
+ *   alone on Friendly tables.
  *
- * THE GAME comes from the incarnation's name (gameOfInc): `c…` is roulette,
- * `k…` craps. Slips and checkpoints are read by that game's shapes, so a
- * record written for one game is junk at the other.
+ * THE GAME comes from the incarnation's name (gameOfInc): `c…` and `r…` are
+ * roulette, `k…` and `d…` craps. Slips and checkpoints are read by that
+ * game's shapes, so a record written for one game is junk at the other.
+ * `r…` and `d…` are HOUSE TABLES (houseRules, PR 5): the owner's node may
+ * add a seed of its own to their rounds (THE HOUSE, below). At `c…` and
+ * `k…` (PR 2–4's) a house record, or a close or checkpoint naming a house
+ * commitment, is junk.
  *
  * ONE ROUND, AS THE FOLD SEES IT:
  *   1. Players write slips: each version is the player's whole felt, and the
@@ -54,6 +62,31 @@
  * next round, and also what lets a modified client rewrite any round since
  * the last checkpoint by outgrowing the honest chain (a documented Friendly
  * lever; trims make history final).
+ *
+ * THE HOUSE (house tables only). A house is a key the room's deed holder
+ * delegated (casinoDoc says which: the fold's HouseCheck). For each round it
+ * commits to a seed (houseCommitOf) before the round closes and reveals it
+ * after the bettors have revealed theirs, so nobody, a bettor alone at the
+ * table included, can know a result before it is decided.
+ *   - A round is FAIR when its close names a house commitment (`h`). Such a
+ *     close is decided only by a house reveal that lists it in `x` and whose
+ *     seed opens `h`, once every seed the reveal counts is in: the counted
+ *     bettors are those of P whose frozen slip's hash is in the reveal's `n`
+ *     (a seed that came after the house's counts nothing). One that counts
+ *     nobody voids the round. Forfeits and "every reveal in" don't decide a
+ *     Fair round; an abandon voids it only while no house reveal does.
+ *   - REQUIRED: the close of the round after one a house reveal decided must
+ *     name the commitment that reveal carried (`c`); the first round of a
+ *     session, the checkpoint's `h`. A house reveal of that round listing no
+ *     close (a STEP-DOWN: the house leaving cleanly) lifts the requirement.
+ *     A close that skips a required commitment, or names another, is
+ *     invalid. Otherwise the round is JOINABLE: its close names nothing (a
+ *     Friendly round, decided as above) or the commitment of a house join
+ *     record of that round (`o:`), and no other.
+ *   - The chain's length counts second: the chain whose latest house-decided
+ *     round is the latest wins, so a round the house decided, and every
+ *     round before it, can't be outgrown by a chain written after it.
+ *   - The house's seed joins the mix (pocketOf / computedCraps diceOf).
  */
 
 import { sha256 } from '@noble/hashes/sha256';
@@ -83,6 +116,8 @@ export const MAX_FORFEITS_PER_CLOSE = 32;
 export const MAX_SESSION_ROUNDS = 500;
 /** Players a checkpoint may carry. */
 export const MAX_CHECKPOINT_PIDS = 4_096;
+/** Slip hashes one house reveal may count (`n`): two closes' worth. */
+export const MAX_HOUSE_COUNTED = 2 * MAX_FROZEN + 2;
 
 // ── Records ──────────────────────────────────────────────────────────────────
 
@@ -91,7 +126,8 @@ export interface FoldCtx {
   room: string;
   /** The table's furniture id. */
   t: string;
-  /** The computed incarnation, /^[ck][0-9a-f]{24}$/: `c` roulette, `k` craps. */
+  /** The computed incarnation, /^[ckrd][0-9a-f]{24}$/: `c` and `r` roulette,
+   *  `k` and `d` craps; `r` and `d` are house tables (houseRules). */
   inc: string;
 }
 
@@ -129,6 +165,8 @@ export interface CloseRec {
   /** Parent: the session id when r = base+1, else the hash of a close of round r−1. */ q: string;
   /** pid → hash of the slip version frozen; 1–MAX_FROZEN entries. */ f: Record<string, string>;
   /** Must be the `k` of a present, valid slip this close freezes. */ k: string;
+  /** House tables only: the house commitment the round's seed comes from
+   *  (64 hex); absent on a Friendly round. */ h?: string;
   g: string;
 }
 
@@ -148,6 +186,24 @@ export interface ForfeitRec {
 
 export interface AbandonRec { r: number; x: string; k: string; g: string }
 
+/** The house's reveal of round r (house tables only), signed by the house. */
+export interface HouseRevealRec {
+  r: number;
+  /** The house's seed, 64 hex: counts iff it opens the close's `h` (houseCommitOf). */ s: string;
+  /** The closes of round r it decides: sorted, unique close hashes, at most
+   *  MAX_CLOSES_PER_ROUND. Empty on a STEP-DOWN (the house leaving: it lifts
+   *  the round's required commitment and decides nothing). */ x: string[];
+  /** The frozen slips whose seeds the house saw before its own: sorted,
+   *  unique slip hashes, at most MAX_HOUSE_COUNTED; empty on a step-down. */ n: string[];
+  /** The commitment the next round's close must name (64 hex); absent when
+   *  the house steps down after this round. Absent on a step-down. */ c?: string;
+  /** The house key (a delegated one: HouseCheck). */ k: string;
+  g: string;
+}
+
+/** The house's commitment for round r of a joinable round (house tables only). */
+export interface HouseCommitRec { r: number; /** houseCommitOf(ctx, r, seed) */ c: string; k: string; g: string }
+
 export interface Checkpoint {
   v: 1;
   /** The sid of the session it closed. */ b: string;
@@ -158,11 +214,14 @@ export interface Checkpoint {
   /** 1 = the incarnation has ended. */ e?: 1;
   /** Craps only, and only while live: the state the next roll plays from
    *  (required then; asCrapsCheckpoint). */ s?: CrapsCarry;
+  /** House tables only, and only while live: the house commitment the next
+   *  session's first round must name (the one the house reveal deciding
+   *  round u carried, unless a step-down lifted it). */ h?: string;
   k: string;
   g: string;
 }
 
-export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum';
+export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum' | 'hreveal' | 'hcommit';
 
 // ── Encoding ─────────────────────────────────────────────────────────────────
 
@@ -170,7 +229,7 @@ const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnPropert
 
 /** A plain object (an object literal or JSON, prototype Object or none) —
  *  never an array, Map, Date, typed array or class instance. */
-function isPlain(v: unknown): v is Record<string, unknown> {
+export function isPlain(v: unknown): v is Record<string, unknown> {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const proto = Object.getPrototypeOf(v);
   return proto === Object.prototype || proto === null;
@@ -243,13 +302,14 @@ export function slipCommit(ctx: FoldCtx, r: number, pid: string, seed: string): 
 }
 
 /** Session id after `cp`: first 24 hex of sha256(utf8('ssf-ct-sid-v1|' +
- *  canon({t, inc, b, u, l, n, e, s}))) — `k` and `g` left out, so two pages
- *  that trim the same history open the same session. 'g' when cp is null.
- *  `s` is a game's carried state (craps): absent, canon skips it, so a
- *  roulette sid is what it always was. */
-export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e' | 's'> | null): string {
+ *  canon({t, inc, b, u, l, n, e, s, h}))) — `k` and `g` left out, so two
+ *  pages that trim the same history open the same session. 'g' when cp is
+ *  null. `s` is a game's carried state (craps), `h` a house table's required
+ *  commitment: absent, canon skips them, so a roulette sid is what it always
+ *  was. */
+export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n' | 'e' | 's' | 'h'> | null): string {
   if (!cp) return 'g';
-  const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e, s: cp.s });
+  const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e, s: cp.s, h: cp.h });
   if (c === null) throw new TypeError('nextSid: the checkpoint must be canonical');
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v1|${c}`))).slice(0, 24);
 }
@@ -260,12 +320,21 @@ export function dutyRank(duty: 'close' | 'forfeit' | 'abandon' | 'trim', ctx: Fo
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-rank-v1|${duty}|${ctx.room}|${ctx.t}|${ctx.inc}|${round}|${pub}`)));
 }
 
+/** The house's commitment to `seed` for round r: the slip commitment's
+ *  bytes with an empty party (no player id is empty), so no slip's
+ *  commitment is ever a house one. 64 hex. */
+export function houseCommitOf(ctx: FoldCtx, r: number, seed: string): string {
+  return slipCommit(ctx, r, '', seed);
+}
+
 /** The unbiased pocket (0–36) from the counted seeds: the same bytes as
  *  diceFairness.combinePocketSeeds(seeds, seedTable(ctx), r) with fairDice's
- *  byte-≥-222 rejection, synchronously (fairDice.pocketFromMaterialSync). */
-export function pocketOf(ctx: FoldCtx, r: number, seeds: readonly string[]): number {
+ *  byte-≥-222 rejection, synchronously (fairDice.pocketFromMaterialSync).
+ *  A house table's Fair round adds the house's seed, `|house:<seed>` last. */
+export function pocketOf(ctx: FoldCtx, r: number, seeds: readonly string[], house?: string): number {
   const ordered = [...seeds].sort();
-  return pocketFromMaterialSync(`ssf-roulette-combine-v1|${ordered.join('|')}|${seedTable(ctx)}|${r}`);
+  const tail = house === undefined ? '' : `|house:${house}`;
+  return pocketFromMaterialSync(`ssf-roulette-combine-v1|${ordered.join('|')}|${seedTable(ctx)}|${r}${tail}`);
 }
 
 // ── Shape guards ─────────────────────────────────────────────────────────────
@@ -292,15 +361,22 @@ function isPid(v: unknown): v is string {
 const isRound = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 1;
 const isStr = (re: RegExp) => (v: unknown): v is string => typeof v === 'string' && re.test(v);
 const isHex32 = isStr(HEX32);
-const isHex64 = isStr(HEX64);
+export const isHex64 = isStr(HEX64);
 const isSid = isStr(SID);
 const isParent = isStr(PARENT);
 const isNet = isStr(NET);
-const isPub = isStr(PUB);
-const isSig = isStr(SIG);
+export const isPub = isStr(PUB);
+export const isSig = isStr(SIG);
+
+/** Sorted (strictly: so unique) hex32 strings, at most `max`. */
+function isSortedHex32s(v: unknown, max: number): v is string[] {
+  if (!Array.isArray(v) || v.length > max) return false;
+  for (let i = 0; i < v.length; i++) if (!isHex32(v[i]) || (i > 0 && !(v[i - 1] < v[i]))) return false;
+  return true;
+}
 
 /** Exactly these fields (an undefined field counts as absent, as in canon). */
-function hasFields(o: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+export function hasFields(o: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   for (const k of Object.keys(o)) {
     if (o[k] !== undefined && !required.includes(k) && !optional.includes(k)) return false;
   }
@@ -332,8 +408,9 @@ export function asSlip(v: unknown): SlipRec | null {
 }
 
 export function asClose(v: unknown): CloseRec | null {
-  if (!isPlain(v) || !hasFields(v, ['r', 'q', 'f', 'k', 'g'])) return null;
+  if (!isPlain(v) || !hasFields(v, ['r', 'q', 'f', 'k', 'g'], ['h'])) return null;
   if (!isRound(v.r) || !isParent(v.q) || !isPub(v.k) || !isSig(v.g) || !isPlain(v.f)) return null;
+  if (v.h !== undefined && !isHex64(v.h)) return null;
   const pids = Object.keys(v.f);
   if (pids.length < 1 || pids.length > MAX_FROZEN) return null;
   const f = v.f;
@@ -363,14 +440,16 @@ export function asAbandon(v: unknown): AbandonRec | null {
 }
 
 export function asCheckpoint(v: unknown): Checkpoint | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e'])) return null;
+  if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e', 'h'])) return null;
   return checkpointBody(v);
 }
 
-/** The checks every checkpoint shares, once its fields are known. */
+/** The checks every checkpoint shares, once its fields are known. A house
+ *  commitment `h` only on a live one (an ended incarnation plays no round). */
 function checkpointBody(v: Record<string, unknown>): Checkpoint | null {
   if (v.v !== 1 || !isSid(v.b) || !isRound(v.u) || !isHex32(v.l) || !isPub(v.k) || !isSig(v.g)) return null;
   if (v.e !== undefined && v.e !== 1) return null;
+  if (v.h !== undefined && (!isHex64(v.h) || v.e === 1)) return null;
   if (!isPlain(v.n)) return null;
   const n = v.n;
   const pids = Object.keys(n);
@@ -413,14 +492,30 @@ function isCarry(v: unknown): v is CrapsCarry {
 /** A craps table's checkpoint: a live one carries the state its next roll
  *  plays from (`s`, required); an ended one carries none. */
 export function asCrapsCheckpoint(v: unknown): Checkpoint | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e', 's'])) return null;
+  if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'k', 'g'], ['e', 's', 'h'])) return null;
   if (v.e === 1 ? v.s !== undefined : !isCarry(v.s)) return null;
   return checkpointBody(v);
 }
 
+/** A house reveal: a step-down (no close listed) counts no seed and carries
+ *  no commitment. */
+export function asHouseReveal(v: unknown): HouseRevealRec | null {
+  if (!isPlain(v) || !hasFields(v, ['r', 's', 'x', 'n', 'k', 'g'], ['c'])) return null;
+  if (!isRound(v.r) || !isHex64(v.s) || !isPub(v.k) || !isSig(v.g)) return null;
+  if (!isSortedHex32s(v.x, MAX_CLOSES_PER_ROUND) || !isSortedHex32s(v.n, MAX_HOUSE_COUNTED)) return null;
+  if (v.c !== undefined && !isHex64(v.c)) return null;
+  if (v.x.length === 0 && (v.n.length > 0 || v.c !== undefined)) return null;
+  return v as unknown as HouseRevealRec;
+}
+
+export function asHouseCommit(v: unknown): HouseCommitRec | null {
+  if (!isPlain(v) || !hasFields(v, ['r', 'c', 'k', 'g'])) return null;
+  return isRound(v.r) && isHex64(v.c) && isPub(v.k) && isSig(v.g) ? (v as unknown as HouseCommitRec) : null;
+}
+
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
-export type RecKind = 's' | 'c' | 'x' | 'f' | 'z';
+export type RecKind = 's' | 'c' | 'x' | 'f' | 'z' | 'h' | 'o';
 
 /** A session key's parts, parsed from both ends (r and h hold no ':', a pid
  *  may), or null for a key no record could be stored under. Only the key:
@@ -428,7 +523,7 @@ export type RecKind = 's' | 'c' | 'x' | 'f' | 'z';
 export function parseKey(key: string): { kind: RecKind; r: number; pid?: string; h: string } | null {
   if (typeof key !== 'string' || key[1] !== ':') return null;
   const kind = key[0];
-  if (kind !== 's' && kind !== 'c' && kind !== 'x' && kind !== 'f' && kind !== 'z') return null;
+  if (kind !== 's' && kind !== 'c' && kind !== 'x' && kind !== 'f' && kind !== 'z' && kind !== 'h' && kind !== 'o') return null;
   const last = key.lastIndexOf(':');
   const second = key.indexOf(':', 2);
   if (second < 0) return null;
@@ -469,6 +564,16 @@ export function abandonKey(rec: AbandonRec): string | null {
   const h = z && recHash(z);
   return z && h ? `z:${z.r}:${h}` : null;
 }
+export function houseRevealKey(rec: HouseRevealRec): string | null {
+  const x = asHouseReveal(rec);
+  const h = x && recHash(x);
+  return x && h ? `h:${x.r}:${h}` : null;
+}
+export function houseCommitKey(rec: HouseCommitRec): string | null {
+  const o = asHouseCommit(rec);
+  const h = o && recHash(o);
+  return o && h ? `o:${o.r}:${h}` : null;
+}
 
 // ── Verification (injected) ──────────────────────────────────────────────────
 
@@ -488,11 +593,22 @@ export type KeyOf = (pid: string) => string | undefined;
  */
 export type SigCheck = (hash: string, kind: SignedKind, pub: string, bytes: () => Uint8Array, sig: string) => boolean | undefined;
 
+/**
+ * Whether a key is a house of this room (casinoDoc: delegated by the room's
+ * deed holder): true/false = known; undefined = not known yet (the
+ * delegation's signature, or the deed holder's key, still to come), which
+ * marks the pass pending. Once true, true for good (the caller pins it).
+ * The caller's: it calls TableFold.houseChanged when an answer may change.
+ * Without one, no key is a house.
+ */
+export type HouseCheck = (pub: string) => boolean | undefined;
+
 // ── Output ───────────────────────────────────────────────────────────────────
 
 export interface SlipInfo { key: string; hash: string; rec: AnySlipRec }
 
-export type Decision = 'reveals' | 'forfeit' | 'void';
+/** `house`: a house reveal decided a Fair round (computedFold THE HOUSE). */
+export type Decision = 'reveals' | 'forfeit' | 'house' | 'void';
 
 export interface RoundView {
   r: number;
@@ -505,8 +621,10 @@ export interface RoundView {
   /** null while undecided. */ decided: Decision | null;
   /** Pids whose seeds made the pocket (sorted); [] when undecided or void. */ counted: string[];
   /** The deciding forfeit, when decided === 'forfeit'. */ forfeit?: { hash: string; rec: ForfeitRec };
-  /** The deciding abandon, when decided === 'void'. */ abandon?: { hash: string; rec: AbandonRec };
-  /** 0–36 when decided by reveals or forfeit; null otherwise. */ pocket: number | null;
+  /** The deciding abandon, when an abandon voided it. */ abandon?: { hash: string; rec: AbandonRec };
+  /** The deciding house reveal, when decided === 'house', or 'void' by a
+   *  house reveal that counted nobody. */ house?: { hash: string; rec: HouseRevealRec };
+  /** 0–36 when decided by reveals, a forfeit or the house; null otherwise. */ pocket: number | null;
   /** pid (P) → stake, payout and delta (payout − stake; 0 when void).
    *  While undecided only `stakes` is filled; on a void every payout is 0
    *  (nobody is counted) and so is every delta. Read-only: the fold reuses them. */
@@ -520,7 +638,7 @@ export interface RoundView {
  *  payouts and deltas cover every rider as well as P: riding bets play
  *  whether or not their player wrote a slip. `payouts` is `credited`. */
 export interface CrapsRoll {
-  /** When decided by reveals or a forfeit; null otherwise. */ dice: [number, number] | null;
+  /** When decided by reveals, a forfeit or the house; null otherwise. */ dice: [number, number] | null;
   pointBefore: number | null;
   /** The point after the roll (as before while undecided or on a void). */ pointAfter: number | null;
   sevenOut: boolean;
@@ -542,6 +660,8 @@ export interface FoldBase {
   /** The checkpoint says the incarnation ended: the session counts nothing
    *  (no rounds, no felts, nothing held; the nets are the checkpoint's). */ ended: boolean;
   /** The game's carried state at the base (FoldGame.start): null at roulette. */ state: unknown;
+  /** A house table's checkpoint `h`: the commitment the session's first
+   *  round must name (null for none). */ h: string | null;
 }
 
 export interface FoldResult {
@@ -552,6 +672,13 @@ export interface FoldResult {
   /** The undecided chosen close of the open round, or null. */ tip: RoundView | null;
   /** The open round: tip.r, else (last decided round, or base.u) + 1. */ open: number;
   /** Hash a close for `open` must name as `q` (base.sid, or the last decided close). */ parent: string;
+  /** Whether the table follows THE HOUSE's rules (houseRules). */ houseTable: boolean;
+  /** The house commitment a close for `open` must name as `h` (null: none
+   *  required, the round is joinable; always null at other tables). What a
+   *  trim writes as the checkpoint's `h`. */ required: string | null;
+  /** The house join records of `open` a close may name instead, while
+   *  `required` is null: verified, by a house, in record-hash order (a
+   *  closer names the first). */ joins: { hash: string; rec: HouseCommitRec }[];
   /** Every indexed close for `open` naming `parent`, with its standing
    *  (by dutyRank('close'), then hash). */
   openCloses: { hash: string; rec: CloseRec; state: 'valid' | 'pending' | 'invalid' }[];
@@ -586,7 +713,7 @@ export interface SlipEntry extends EntryBase<'s', AnySlipRec>, Signed {
 
 /** How one close was decided, before the game plays it: a RoundView's
  *  decision fields, plus the seeds that opened P's slips. */
-export type Outcome = Pick<RoundView, 'present' | 'missing' | 'revealed' | 'decided' | 'counted' | 'forfeit' | 'abandon'> & {
+export type Outcome = Pick<RoundView, 'present' | 'missing' | 'revealed' | 'decided' | 'counted' | 'forfeit' | 'abandon' | 'house'> & {
   /** pid (P) → the seed its reveal gave, for every revealed pid. */
   seeds: ReadonlyMap<string, string>;
 };
@@ -638,8 +765,8 @@ export const rouletteGame: FoldGame<null> = {
   start: () => null,
   key: () => '',
   play(ctx, r, out, P) {
-    const pocket = out.decided === 'reveals' || out.decided === 'forfeit'
-      ? pocketOf(ctx, r, out.counted.map((pid) => out.seeds.get(pid)!))
+    const pocket = out.decided === 'reveals' || out.decided === 'forfeit' || out.decided === 'house'
+      ? pocketOf(ctx, r, out.counted.map((pid) => out.seeds.get(pid)!), out.house?.rec.s)
       : null;
     const stakes = new Map<string, bigint>();
     const payouts = new Map<string, bigint>();
@@ -706,8 +833,8 @@ export const crapsGame: FoldGame<CrapsCarry> = {
     // A pid only in M plays as a rider if it has riding bets, else not at all.
     const slips = new Map<string, RollSlip>();
     for (const [pid, s] of P) slips.set(pid, rollSlip(s.rec as CrapsSlipRec, sIn));
-    const dice = out.decided === 'reveals' || out.decided === 'forfeit'
-      ? diceOf(seedTable(ctx), r, out.counted.map((pid) => out.seeds.get(pid)!))
+    const dice = out.decided === 'reveals' || out.decided === 'forfeit' || out.decided === 'house'
+      ? diceOf(seedTable(ctx), r, out.counted.map((pid) => out.seeds.get(pid)!), out.house?.rec.s)
       : null;
     const roll = playRoll({ sIn, slips, decided: out.decided, counted: out.counted, dice });
     const credited = bigints(roll.credited);
@@ -732,9 +859,15 @@ export const crapsGame: FoldGame<CrapsCarry> = {
 
 export type GameName = 'roulette' | 'craps';
 
-/** The game an incarnation plays, from its name: `k…` craps, else roulette. */
+/** The game an incarnation plays, from its name: `k…` and `d…` craps, else roulette. */
 export function gameOfInc(inc: string): GameName {
-  return inc[0] === 'k' ? 'craps' : 'roulette';
+  return inc[0] === 'k' || inc[0] === 'd' ? 'craps' : 'roulette';
+}
+
+/** Whether an incarnation is a house table (PR 5's names, `r…` and `d…`):
+ *  its rounds may take the house's seed, by THE HOUSE's rules above. */
+export function houseRules(inc: string): boolean {
+  return inc[0] === 'r' || inc[0] === 'd';
 }
 
 /** The rules an incarnation's rounds are played by. */
@@ -758,9 +891,15 @@ export function slipKeyFor(ctx: Pick<FoldCtx, 'inc'>): (rec: unknown) => string 
   };
 }
 
-/** The checkpoint reader for an incarnation's game. */
+/** The checkpoint reader for an incarnation's game: one naming a house
+ *  commitment is junk at a table that isn't a house table. */
 export function asCheckpointFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => Checkpoint | null {
-  return foldGameOf(ctx).asCheckpoint;
+  const read = foldGameOf(ctx).asCheckpoint;
+  if (houseRules(ctx.inc)) return read;
+  return (v) => {
+    const cp = read(v);
+    return cp && cp.h === undefined ? cp : null;
+  };
 }
 
 // ── The index ────────────────────────────────────────────────────────────────
@@ -797,7 +936,12 @@ interface RevealEntry extends EntryBase<'x', RevealRec> {
 }
 type ForfeitEntry = EntryBase<'f', ForfeitRec> & Signed;
 type AbandonEntry = EntryBase<'z', AbandonRec> & Signed;
-type Entry = SlipEntry | CloseEntry | RevealEntry | ForfeitEntry | AbandonEntry;
+interface HouseRevealEntry extends EntryBase<'h', HouseRevealRec>, Signed {
+  /** The commitment the house's seed opens (houseCommitOf). */
+  commit: string;
+}
+type HouseCommitEntry = EntryBase<'o', HouseCommitRec> & Signed;
+type Entry = SlipEntry | CloseEntry | RevealEntry | ForfeitEntry | AbandonEntry | HouseRevealEntry | HouseCommitEntry;
 
 /** A close's frozen slips, split. */
 interface CloseInfo {
@@ -871,7 +1015,10 @@ export class TableFold {
   private readonly check: SigCheck;
   private readonly keyOf: KeyOf | undefined;
   private readonly game: FoldGame<unknown>;
-  private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false, state: null };
+  /** THE HOUSE's rules apply (houseRules): else house records are junk. */
+  private readonly house: boolean;
+  private readonly houseOk: HouseCheck;
+  private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false, state: null, h: null };
 
   private entries = new Map<string, Entry>();
   private slipsByHash = new Map<string, SlipEntry>();
@@ -888,12 +1035,18 @@ export class TableFold {
   /** close hash → hash → forfeit / abandon */
   private forfeitsOf = new Map<string, Map<string, ForfeitEntry>>();
   private abandonsOf = new Map<string, Map<string, AbandonEntry>>();
+  /** r → hash → house reveal / house join record */
+  private hRevealsAt = new Map<number, Map<string, HouseRevealEntry>>();
+  private joinsAt = new Map<number, Map<string, HouseCommitEntry>>();
 
   /** Versions: the value of `clock` when the thing last changed. */
   private clock = 0;
   private slipVer = new Map<number, number>();
   private revealVer = new Map<number, number>();
   private ffaVer = new Map<string, number>();
+  /** A round's house reveals; and every HouseCheck answer (houseChanged). */
+  private hrevVer = new Map<number, number>();
+  private houseVer = 0;
 
   private bytes = 0;
   /** key → rawSize-based weight of every key of the live session, junk too. */
@@ -911,20 +1064,25 @@ export class TableFold {
    *  their chips until a close froze the real one. Closes, decisions and
    *  nets don't read it: a close froze what its signer pinned.
    *  `game` is the rules the rounds are played by: by default the game the
-   *  incarnation's name says (foldGameOf). */
-  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf, game: FoldGame<unknown> = foldGameOf(ctx)) {
+   *  incarnation's name says (foldGameOf). `houseOk` says which keys are
+   *  houses, at a house table (none without it). */
+  constructor(ctx: FoldCtx, check: SigCheck, keyOf?: KeyOf, game: FoldGame<unknown> = foldGameOf(ctx), houseOk?: HouseCheck) {
     this.ctx = ctx;
     this.check = check;
     this.keyOf = keyOf;
     this.game = game;
+    this.house = houseRules(ctx.inc);
+    this.houseOk = houseOk ?? (() => false);
     this.base = { ...this.base, state: game.start(null) };
   }
 
   /** Point at the incarnation's checkpoint (null = none) — the live session id
    *  follows from it (nextSid). A changed sid clears the index. A checkpoint
-   *  that fails the game's asCheckpoint counts as none. */
+   *  that fails the game's asCheckpoint counts as none, as does one naming a
+   *  house commitment at a table that isn't a house table. */
   setBase(cp: Checkpoint | null): void {
-    const ok = cp === null ? null : this.game.asCheckpoint(cp);
+    let ok = cp === null ? null : this.game.asCheckpoint(cp);
+    if (ok?.h !== undefined && !this.house) ok = null;
     const sid = nextSid(this.ctx, ok);
     // The sid hashes everything the base holds (all but k and g), so the
     // same sid is the same base: nothing to redo.
@@ -932,7 +1090,16 @@ export class TableFold {
     this.clearIndex();
     const n = new Map<string, bigint>();
     if (ok) for (const pid of Object.keys(ok.n).sort()) n.set(pid, BigInt(ok.n[pid]));
-    this.base = { sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok) };
+    this.base = {
+      sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok), h: ok?.h ?? null,
+    };
+    this.dirty = true;
+  }
+
+  /** The HouseCheck may answer differently now (a delegation was checked, or
+   *  the deed holder's key showed up): the next result() asks it again. */
+  houseChanged(): void {
+    this.houseVer = ++this.clock;
     this.dirty = true;
   }
 
@@ -976,9 +1143,12 @@ export class TableFold {
     this.revealCommits.clear();
     this.forfeitsOf.clear();
     this.abandonsOf.clear();
+    this.hRevealsAt.clear();
+    this.joinsAt.clear();
     this.slipVer.clear();
     this.revealVer.clear();
     this.ffaVer.clear();
+    this.hrevVer.clear();
     this.bytes = 0;
     this.raw.clear();
     this.rawBytes = 0;
@@ -1000,15 +1170,21 @@ export class TableFold {
 
   /** The entry for a record stored under `key`, or null for junk: an
    *  unknown kind, a bad shape, or a key that isn't the body's own. The shape
-   *  comes first, so canon only ever walks a small, known structure. */
+   *  comes first, so canon only ever walks a small, known structure. A house
+   *  record, or a close naming a house commitment, is junk at a table that
+   *  isn't a house table. */
   private entryFor(key: string, value: unknown): Entry | null {
     const pk = parseKey(key);
     if (!pk) return null;
+    if ((pk.kind === 'h' || pk.kind === 'o') && !this.house) return null;
     const rec = pk.kind === 's' ? this.game.asSlip(value)
       : pk.kind === 'c' ? asClose(value)
       : pk.kind === 'x' ? asReveal(value)
       : pk.kind === 'f' ? asForfeit(value)
-      : asAbandon(value);
+      : pk.kind === 'z' ? asAbandon(value)
+      : pk.kind === 'h' ? asHouseReveal(value)
+      : asHouseCommit(value);
+    if (pk.kind === 'c' && (rec as CloseRec | null)?.h !== undefined && !this.house) return null;
     const c = rec && canon(rec);
     if (!rec || c === null) return null;
     const hash = hashOfCanon(c);
@@ -1031,6 +1207,12 @@ export class TableFold {
         return { kind: 'f', key, hash, rec: rec as ForfeitRec, size };
       case 'z':
         return { kind: 'z', key, hash, rec: rec as AbandonRec, size };
+      case 'h': {
+        const h = rec as HouseRevealRec;
+        return { kind: 'h', key, hash, rec: h, size, commit: houseCommitOf(this.ctx, h.r, h.s) };
+      }
+      case 'o':
+        return { kind: 'o', key, hash, rec: rec as HouseCommitRec, size };
     }
   }
 
@@ -1081,6 +1263,13 @@ export class TableFold {
         addIn(this.abandonsOf, e.rec.x, e.hash, e);
         this.ffaVer.set(e.rec.x, now);
         break;
+      case 'h':
+        addIn(this.hRevealsAt, e.rec.r, e.hash, e);
+        this.hrevVer.set(e.rec.r, now);
+        break;
+      case 'o':
+        addIn(this.joinsAt, e.rec.r, e.hash, e);
+        break;
     }
   }
 
@@ -1121,6 +1310,13 @@ export class TableFold {
         dropIn(this.abandonsOf, e.rec.x, e.hash);
         this.ffaVer.set(e.rec.x, now);
         break;
+      case 'h':
+        dropIn(this.hRevealsAt, e.rec.r, e.hash);
+        this.hrevVer.set(e.rec.r, now);
+        break;
+      case 'o':
+        dropIn(this.joinsAt, e.rec.r, e.hash);
+        break;
     }
   }
 
@@ -1128,7 +1324,7 @@ export class TableFold {
 
   /** The record's verdict: cached once final, undefined while the caller
    *  hasn't checked it (which marks this pass pending). */
-  private ask(e: SlipEntry | CloseEntry | ForfeitEntry | AbandonEntry, kind: SignedKind): boolean | undefined {
+  private ask(e: SlipEntry | CloseEntry | ForfeitEntry | AbandonEntry | HouseRevealEntry | HouseCommitEntry, kind: SignedKind): boolean | undefined {
     if (e.verdict !== undefined) return e.verdict;
     const rec = e.rec;
     const v = this.check(e.hash, kind, rec.k, () => signBytes(kind, this.ctx, rec), rec.g);
@@ -1237,12 +1433,103 @@ export class TableFold {
     return null;
   }
 
-  /** Decide a valid close: (a) the best valid forfeit, (b) every reveal in
-   *  with nothing missing, (c) a verified abandon (void), (d) undecided.
-   *  What it pays is the game's (playOf), not this. */
+  // ── The house ─────────────────────────────────────────────────────────────
+
+  /** Whether `pub` is a house (HouseCheck); not known yet marks the pass pending. */
+  private isHouse(pub: string): boolean | undefined {
+    const ok = this.houseOk(pub);
+    if (ok === undefined) this.sawPending = true;
+    return ok;
+  }
+
+  /** A house record counts: a house's, its signature good. undefined while
+   *  either isn't known (no signature is checked for a key not yet known to
+   *  be a house's, nor for one known not to be). */
+  private houseRecOk(e: HouseRevealEntry | HouseCommitEntry): boolean | undefined {
+    const by = this.isHouse(e.rec.k);
+    if (by !== true) return by;
+    return this.ask(e, e.kind === 'h' ? 'hreveal' : 'hcommit');
+  }
+
+  /** Whether a step-down of round r (a house reveal listing no close) has
+   *  revealed the seed of commitment `h`: the requirement lifts, and no
+   *  close may name `h` any more (its seed is out). */
+  private steppedDown(r: number, h: string): boolean {
+    const at = this.hRevealsAt.get(r);
+    if (at) for (const e of at.values()) if (e.rec.x.length === 0 && e.commit === h && this.houseRecOk(e) === true) return true;
+    return false;
+  }
+
+  /** Round r's house join records that count, in record-hash order, among the
+   *  first MAX_CLOSES_PER_ROUND that might (one that fails takes no place):
+   *  `pending` when one of those isn't known yet. */
+  private joinsOf(r: number): { ok: HouseCommitEntry[]; pending: boolean } {
+    const ok: HouseCommitEntry[] = [];
+    let pending = false;
+    let considered = 0;
+    const at = this.joinsAt.get(r);
+    if (at) {
+      for (const o of [...at.values()].sort((a, b) => cmp(a.hash, b.hash))) {
+        if (considered >= MAX_CLOSES_PER_ROUND) break;
+        const v = this.houseRecOk(o);
+        if (v === false) continue;
+        considered++;
+        if (v === undefined) pending = true;
+        else ok.push(o);
+      }
+    }
+    return { ok, pending };
+  }
+
+  /** Whether close c names what its round asks for, `req` being the
+   *  commitment required after its parent (null for none): that one, unless a
+   *  step-down lifted it; else nothing, or a counted join record's
+   *  commitment whose seed no step-down revealed. 'pending' while the join
+   *  record it names is being checked. */
+  private commitState(c: CloseEntry, req: string | null): 'valid' | 'pending' | 'invalid' {
+    if (!this.house) return 'valid';
+    const r = c.rec.r;
+    if (req !== null && !this.steppedDown(r, req)) return c.rec.h === req ? 'valid' : 'invalid';
+    const h = c.rec.h;
+    if (h === undefined) return 'valid';
+    if (this.steppedDown(r, h)) return 'invalid';
+    const joins = this.joinsOf(r);
+    if (joins.ok.some((o) => o.rec.c === h)) return 'valid';
+    return joins.pending ? 'pending' : 'invalid';
+  }
+
+  /** The commitment the round after `parent` must name (before any
+   *  step-down): the one the house reveal deciding it carried; for the
+   *  session's first round (parent null), the checkpoint's. */
+  private requiredAfter(parent: Pick<Outcome, 'house'> | null): string | null {
+    if (!this.house) return null;
+    return parent === null ? this.base.h : parent.house?.rec.c ?? null;
+  }
+
+  /** The house reveal that decides Fair close c: of its round, listing it,
+   *  its seed opening the close's `h`, a house's and verified; of several,
+   *  the lowest hash (one not checked yet is passed over for now: the pass
+   *  is pending). */
+  private houseRevealFor(c: CloseEntry): HouseRevealEntry | null {
+    const at = this.hRevealsAt.get(c.rec.r);
+    if (!at) return null;
+    const cands = [...at.values()]
+      .filter((e) => e.commit === c.rec.h && e.rec.x.includes(c.hash))
+      .sort((a, b) => cmp(a.hash, b.hash));
+    for (const e of cands) if (this.houseRecOk(e) === true) return e;
+    return null;
+  }
+
+  /** Decide a valid close. A Friendly one: (a) the best valid forfeit, (b)
+   *  every reveal in with nothing missing, (c) a verified abandon (void), (d)
+   *  undecided. A Fair one (naming a house commitment): (a) its house reveal,
+   *  once every seed it counts is in (none counted: void), (c), (d). What it
+   *  pays is the game's (playOf), not this. */
   private decide(c: CloseEntry, info: CloseInfo): Outcome {
     const r = c.rec.r;
-    const key = `${this.slipVer.get(r) ?? 0}|${this.revealVer.get(r) ?? 0}|${this.ffaVer.get(c.hash) ?? 0}`;
+    const fair = c.rec.h !== undefined;
+    const key = `${this.slipVer.get(r) ?? 0}|${this.revealVer.get(r) ?? 0}|${this.ffaVer.get(c.hash) ?? 0}`
+      + (fair ? `|${this.hrevVer.get(r) ?? 0}|${this.houseVer}` : '');
     if (c.decision && c.decision.key === key) return c.decision.d;
     const outer = this.sawPending;
     this.sawPending = false;
@@ -1260,10 +1547,26 @@ export class TableFold {
     let counted: string[] = [];
     let forfeit: Outcome['forfeit'];
     let abandon: Outcome['abandon'];
+    let house: Outcome['house'];
 
-    // (a) A forfeit counts only seeds that are in (n ⊆ P, all revealed), and
-    // only if its writer counts itself — so no round is decided on zero seeds.
-    const forfeits = this.forfeitsOf.get(c.hash);
+    // (a) Fair: the house's reveal counts the seeds it saw before its own
+    // (their slips' hashes in `n`), once each is on this page too; a seed
+    // that came after it counts nothing. Counting nobody, it voids the
+    // round: the house never decides one on its own seed alone.
+    const hr = fair ? this.houseRevealFor(c) : null;
+    if (hr) {
+      const inN = new Set(hr.rec.n);
+      const need = present.filter((pid) => inN.has(P.get(pid)!.hash));
+      if (need.every((pid) => seeds.has(pid))) {
+        decided = need.length > 0 ? 'house' : 'void';
+        counted = need;
+        house = { hash: hr.hash, rec: hr.rec };
+      }
+    }
+    // (a) Friendly: a forfeit counts only seeds that are in (n ⊆ P, all
+    // revealed), and only if its writer counts itself — so no round is
+    // decided on zero seeds.
+    const forfeits = fair ? undefined : this.forfeitsOf.get(c.hash);
     if (forfeits) {
       const cands: ForfeitEntry[] = [];
       for (const f of forfeits.values()) {
@@ -1279,7 +1582,7 @@ export class TableFold {
       }
     }
     // (b) Every frozen slip present, every seed in.
-    if (!decided && M.length === 0 && revealed.length === present.length) {
+    if (!fair && !decided && M.length === 0 && revealed.length === present.length) {
       decided = 'reveals';
       counted = present;
     }
@@ -1295,7 +1598,7 @@ export class TableFold {
 
     const d: Outcome = {
       present, missing: M, revealed, decided, counted,
-      ...(forfeit ? { forfeit } : {}), ...(abandon ? { abandon } : {}),
+      ...(forfeit ? { forfeit } : {}), ...(abandon ? { abandon } : {}), ...(house ? { house } : {}),
       seeds,
     };
     if (!this.sawPending) c.decision = { key, d };
@@ -1325,7 +1628,8 @@ export class TableFold {
     // there is. (It still weighs what it weighs: rawBytes.)
     if (this.base.ended) {
       return {
-        base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, openCloses: [], felts: new Map(),
+        base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, houseTable: this.house, required: null, joins: [],
+        openCloses: [], felts: new Map(),
         nets: new Map(this.base.n), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
         pending: false, bytes: this.bytes, rawBytes: this.rawBytes, records: this.entries.size,
       };
@@ -1333,7 +1637,9 @@ export class TableFold {
 
     // 1. Round by round from the base: which closes are eligible, and which
     //    of those are decided. A close is eligible only under an eligible,
-    //    decided parent, so the first round with nothing decided ends it.
+    //    decided parent, so the first round with nothing decided ends it. At
+    //    a house table, only if it names the commitment its parent asks for
+    //    (commitState): one that doesn't takes no place in the cap.
     const states = new Map<string, 'valid' | 'pending' | 'invalid'>();
     const infos = new Map<string, CloseInfo>();
     const outcomes = new Map<string, Outcome>();
@@ -1358,11 +1664,17 @@ export class TableFold {
       let considered = 0;
       for (const c of cands) {
         if (considered >= MAX_CLOSES_PER_ROUND) break;
+        const named = this.commitState(c, this.requiredAfter(i === 0 ? null : outcomes.get(c.rec.q)!));
+        if (named === 'invalid') {
+          states.set(c.hash, 'invalid');
+          continue;
+        }
         const info = this.closeInfo(c);
-        states.set(c.hash, info.state);
-        if (info.state === 'invalid') continue;
+        const state = info.state === 'valid' && named === 'pending' ? 'pending' : info.state;
+        states.set(c.hash, state);
+        if (state === 'invalid') continue;
         considered++;
-        if (info.state !== 'valid') continue;
+        if (state !== 'valid') continue;
         ok.push(c);
         infos.set(c.hash, info);
         const d = this.decide(c, info);
@@ -1374,15 +1686,34 @@ export class TableFold {
       decidedBefore = decidedHere;
     }
 
-    // 2. Scores, deepest round first (no recursion): a decided close scores
-    //    one more than its best eligible child; an undecided one scores 0.
-    const score = new Map<string, number>();
+    // 2. Scores, deepest round first (no recursion), two numbers compared
+    //    in turn: the latest round the house decided on the close's best line
+    //    of descent (0 for none), then the line's length. A decided close
+    //    scores its best eligible child's, one longer (its own round as the
+    //    latest when that line has none and the house decided it); an
+    //    undecided one scores 0, 0. At a table with no house the first is
+    //    always 0: the longest decided chain wins, as it always has.
+    const scoreH = new Map<string, number>();
+    const scoreD = new Map<string, number>();
     for (let i = eligible.length - 1; i >= 0; i--) {
-      const bestChild = new Map<string, number>();
+      const bestChild = new Map<string, [number, number]>();
       for (const k of eligible[i + 1] ?? []) {
-        bestChild.set(k.rec.q, Math.max(bestChild.get(k.rec.q) ?? 0, score.get(k.hash)!));
+        const h = scoreH.get(k.hash)!;
+        const d = scoreD.get(k.hash)!;
+        const b = bestChild.get(k.rec.q);
+        if (!b || h > b[0] || (h === b[0] && d > b[1])) bestChild.set(k.rec.q, [h, d]);
       }
-      for (const c of eligible[i]) score.set(c.hash, outcomes.get(c.hash)!.decided ? 1 + (bestChild.get(c.hash) ?? 0) : 0);
+      for (const c of eligible[i]) {
+        const out = outcomes.get(c.hash)!;
+        if (!out.decided) {
+          scoreH.set(c.hash, 0);
+          scoreD.set(c.hash, 0);
+          continue;
+        }
+        const [h, d] = bestChild.get(c.hash) ?? [0, 0];
+        scoreH.set(c.hash, h > 0 ? h : out.house ? c.rec.r : 0);
+        scoreD.set(c.hash, 1 + d);
+      }
     }
 
     // 3. Walk from the base: the highest score, then the lowest closeRank,
@@ -1398,7 +1729,7 @@ export class TableFold {
       for (const c of eligible[i]) {
         if (c.rec.q !== parent) continue;
         if (!best) { best = c; continue; }
-        const ds = score.get(c.hash)! - score.get(best.hash)!;
+        const ds = (scoreH.get(c.hash)! - scoreH.get(best.hash)!) || (scoreD.get(c.hash)! - scoreD.get(best.hash)!);
         if (ds > 0 || (ds === 0 && this.byRank(c, best) < 0)) best = c;
       }
       if (!best) break;
@@ -1415,6 +1746,20 @@ export class TableFold {
       state = play.sOut;
     }
     const open = tip ? tip.r : u + rounds.length + 1;
+
+    // The commitment a close for `open` must name, and else the join records
+    // it may: after the open round's parent (the last decided round shown,
+    // or the base).
+    let required: string | null = null;
+    let joins: FoldResult['joins'] = [];
+    if (this.house) {
+      const decidedViews = tip ? rounds.length - 1 : rounds.length;
+      const req = this.requiredAfter(decidedViews > 0 ? rounds[decidedViews - 1] : null);
+      required = req !== null && !this.steppedDown(open, req) ? req : null;
+      if (required === null) {
+        joins = this.joinsOf(open).ok.filter((o) => !this.steppedDown(open, o.rec.c)).map((o) => ({ hash: o.hash, rec: o.rec }));
+      }
+    }
 
     const openCloses: FoldResult['openCloses'] = [];
     const atOpen = this.closesAt.get(open);
@@ -1470,6 +1815,9 @@ export class TableFold {
       tip,
       open,
       parent,
+      houseTable: this.house,
+      required,
+      joins,
       openCloses,
       felts,
       nets,

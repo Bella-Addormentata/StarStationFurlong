@@ -162,16 +162,23 @@ import {
   computedSwitchLost,
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
+  delegationHeld,
+  fairSettingSeq,
   finalizeComputed,
+  holdsDeed,
+  houseOnline,
+  houseSetUp,
   isComputedTable,
   markComputedVerdict,
   notifyCasinoView,
   ownerRunChosen,
+  putBackHouseRecords,
   putComputedSwitchBack,
   readAllBets,
   readAllCrapsBets,
   readChips,
   readCrapsTableState,
+  readFairSetting,
   readSeat,
   readSeats,
   readTableState,
@@ -180,12 +187,15 @@ import {
   writeComputedGone,
   writeComputedOff,
   writeComputedOn,
+  writeDelegation,
+  writeFairSetting,
   writeOwnerRunChosen,
 } from './casinoDoc';
 import type { EndedComputed } from './casinoDoc';
 import {
-  abandonKey, asAbandon, asClose, asForfeit, asReveal, asSlipFor, canon, closeKey, dutyRank, forfeitKey, gameOfInc,
-  MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey, recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
+  abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
+  forfeitKey, gameOfInc, houseCommitKey, houseCommitOf, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey,
+  recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
 } from './computedFold';
 import type {
   AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, FoldCtx, FoldResult, ForfeitRec, GameName, RecKind,
@@ -195,6 +205,7 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
+import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import {
   BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
@@ -333,6 +344,9 @@ interface Scan {
   closes: Map<number, string[]>;
   forfeits: Map<number, string[]>;
   abandons: Map<number, string[]>;
+  /** r → keys of the house's reveals and join records (a house table's). */
+  houses: Map<number, string[]>;
+  joins: Map<number, string[]>;
   /** When this page first saw the newest record in the session (lastSeenOf;
    *  undefined until asked, null for none). */
   last?: number | null;
@@ -886,7 +900,7 @@ function scanOf(st: TableState, res: FoldResult): Scan {
   const ses = computedSessionForWrite(st.t);
   const sc: Scan = {
     res, gen: clock.gen, ses, slipOf: st.slipOf,
-    slips: new Map(), reveals: new Map(), closes: new Map(), forfeits: new Map(), abandons: new Map(),
+    slips: new Map(), reveals: new Map(), closes: new Map(), forfeits: new Map(), abandons: new Map(), houses: new Map(), joins: new Map(),
   };
   if (ses) {
     for (const key of ses.keys()) {
@@ -898,7 +912,9 @@ function scanOf(st: TableState, res: FoldResult): Scan {
         if (!byPid) at.set(pk.r, byPid = new Map());
         pushIn(byPid, pk.pid!, key);
       } else {
-        pushIn(pk.kind === 'c' ? sc.closes : pk.kind === 'f' ? sc.forfeits : sc.abandons, pk.r, key);
+        const at = pk.kind === 'c' ? sc.closes : pk.kind === 'f' ? sc.forfeits : pk.kind === 'z' ? sc.abandons
+          : pk.kind === 'h' ? sc.houses : sc.joins;
+        pushIn(at, pk.r, key);
       }
     }
   }
@@ -920,7 +936,7 @@ function lastSeenOf(st: TableState, sc: Scan, now: number): number | null {
     }
   };
   for (const at of [sc.slips, sc.reveals]) for (const byPid of at.values()) for (const keys of byPid.values()) take(keys);
-  for (const at of [sc.closes, sc.forfeits, sc.abandons]) for (const keys of at.values()) take(keys);
+  for (const at of [sc.closes, sc.forfeits, sc.abandons, sc.houses, sc.joins]) for (const keys of at.values()) take(keys);
   sc.last = last;
   return last;
 }
@@ -1642,6 +1658,14 @@ export interface ComputedRoundCheck {
   mine: MySlipFate | null;
   /** 🚩 Bettors a forfeit left out whose seed this page saw in the grace. */
   dropped: string[];
+  /** 🏠 Whether the round was a Fair one (its close named a house
+   *  commitment); `decided` is 'house' when the house's reveal decided it. */
+  fair: boolean;
+  /** 🚩 Bettors the house's reveal left out whose seed this page saw in the
+   *  grace, before it saw the house's reveal. */
+  houseDropped: string[];
+  /** A Fair round an abandon voided: the house never revealed its seed. */
+  houseVoid: boolean;
   /** 🚩 Bettors whose frozen slip a key other than their pinned one signed. */
   pinMismatch: string[];
   /** 🚩 Chips by which the checkpoint opening this session differs from what
@@ -1692,7 +1716,7 @@ function crapsCheck(st: TableState, sc: Scan, res: FoldResult, D: RoundView, me:
   const mine = crapsMine(st, sc, D, me, getIdentityPub());
   return {
     illegal: [...roll.fates].filter(([, f]) => f === 'illegal').map(([pid]) => pid).sort(),
-    uncounted: D.decided === 'forfeit' ? D.present.filter((pid) => pid !== me && !D.counted.includes(pid)) : [],
+    uncounted: D.decided === 'forfeit' || D.decided === 'house' ? D.present.filter((pid) => pid !== me && !D.counted.includes(pid)) : [],
     roll: { dice: roll.dice, pointBefore: roll.pointBefore, pointAfter: roll.pointAfter, sevenOut: roll.sevenOut },
     unseeded: [...roll.fates.values()].filter((f) => f === 'rider').length,
     mineLost: mine.lost,
@@ -1723,16 +1747,23 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     mine = 'left-out';
   }
   let dropped: string[] = [];
+  let houseDropped: string[] = [];
   // Only of a close stamped as it came (not before a wake: a load stamps it
-  // with everything else) and seen before the forfeit: otherwise every seed
-  // reads as seen with it, in time or not.
+  // with everything else) and seen before the forfeit, or the house's
+  // reveal: otherwise every seed reads as seen with it, in time or not. (Of
+  // the house's, only a seed seen before its reveal: one that crossed it on
+  // the way counts nothing, and the house can't have had it.)
   const closeAt = computedSeenAt(st.t, `c:${D.r}:${D.close}`);
-  if (F && closeAt !== undefined && closeAt > clock.realFrom) {
+  const H = D.decided === 'house' ? D.house : undefined;
+  if ((F || H) && closeAt !== undefined && closeAt > clock.realFrom) {
     const closeSeen = seen(st, `c:${D.r}:${D.close}`, now);
-    if (closeSeen < seen(st, `f:${D.r}:${D.forfeit!.hash}`, now)) {
+    const byAt = F ? seen(st, `f:${D.r}:${D.forfeit!.hash}`, now) : seen(st, `h:${D.r}:${H!.hash}`, now);
+    if (closeSeen < byAt) {
       const times = revealsSeen(st, sc, D, now);
       const until = closeSeen + graceOf(closeSeen, times.values());
-      dropped = D.present.filter((pid) => !F.n.includes(pid) && (times.get(pid) ?? Infinity) <= until);
+      const inTime = (pid: string): boolean => (times.get(pid) ?? Infinity) <= until;
+      if (F) dropped = D.present.filter((pid) => !F.n.includes(pid) && inTime(pid));
+      else houseDropped = D.present.filter((pid) => !D.counted.includes(pid) && inTime(pid) && times.get(pid)! < byAt);
     }
   }
   const pinMismatch = D.present.filter((pid) => {
@@ -1749,6 +1780,9 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     forfeitBy: F ? D.present.find((pid) => keyFor(pid) === F.k) ?? null : null,
     mine,
     dropped,
+    fair: D.closeRec.h !== undefined,
+    houseDropped,
+    houseVoid: D.decided === 'void' && D.closeRec.h !== undefined && D.house === undefined,
     pinMismatch,
     checkpointDiff: diff,
     ...replacedOf(st),
@@ -2073,6 +2107,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   // were passed (a removed one isn't), are compacted.
   awayDuty(inRoom, now);
   compactDuty(getIdentityPub(), now);
+  houseDuty(now);
 }
 
 /**
@@ -2564,6 +2599,13 @@ function noteSeedOut(st: TableState, now: number): void {
  * riding bets (a rider who took everything down), but no goodbye that only
  * rides, nor one built on a table that has since changed: either plays as
  * the riding bets anyway, and its page, gone, would never send its seed.
+ *
+ * At a house table it names the house commitment the round asks for (the
+ * fold's `required`), else the first of the house's join records for it
+ * (`joins`), else none (a Friendly round). A close in already, Friendly or
+ * Fair, stands it down as any close does: none is written to take a round
+ * the house joined late from one already closed Friendly (the house reveals
+ * for no close of a round another close of names nothing: house.rs).
  */
 function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -2591,7 +2633,8 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
     .sort((a, b) => a.at - b.at || (a.s.rec.p < b.s.rec.p ? -1 : 1));
   const f: Record<string, string> = { [me]: own.hash };
   for (const { s } of others.slice(0, MAX_FROZEN - 1)) f[s.rec.p] = s.hash;
-  const rec = signed(st.ctx, 'close', { r: o, q: res.parent, f, k: pub });
+  const h = res.required ?? res.joins[0]?.rec.c;
+  const rec = signed(st.ctx, 'close', { r: o, q: res.parent, f, ...(h !== undefined ? { h } : {}), k: pub });
   const key = closeKey(rec);
   if (key) put(st, key, rec, o, true);
 }
@@ -2726,7 +2769,9 @@ function writeForfeit(st: TableState, round: RoundView, n: string[], pub: string
  * be its own link's loss, and its forfeit, landing as the link comes back,
  * would beat the full set every other page showed. The pages that heard
  * the room forfeit what truly didn't come; with none, the abandon voids the
- * round.
+ * round. Never of a Fair round (its close names a house commitment): only
+ * the house's reveal decides one, counting the seeds it saw (computedFold
+ * THE HOUSE), and a forfeit there decides nothing.
  */
 function forfeitDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -2734,6 +2779,7 @@ function forfeitDuty(st: TableState, me: string, pub: string, now: number): void
   const sc = scanOf(st, res);
   for (const round of res.rounds) {
     if (round.decided !== null && round.decided !== 'void') continue;
+    if (round.closeRec.h !== undefined) continue;
     if (!round.present.includes(me) || !round.revealed.includes(me)) continue;
     if (round.missing.length === 0 && round.revealed.length === round.present.length) continue;
     if (round.decided === 'void' && !watchedClose(st, round)) continue;
@@ -2805,13 +2851,17 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
  * a page that keeps no copy of it (it only watched the round), while the
  * chain falls short of a round it saw decided (noteChain), MISSING_WAIT_MS
  * at most, as the trim waits: the round's witnesses put it back meanwhile.
+ * A Fair tip (its close names a house commitment) waits for the house as
+ * long, or only HOUSE_HEARD_MS once this page hasn't heard the house for
+ * that long (abandonWait): the house has gone, and the round is voided
+ * sooner. Its next round is joinable, and Friendly while no house joins it.
  */
 function abandonDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
   const tip = res?.tip;
   if (!res || !tip) return;
   const closeSeen = seen(st, `c:${tip.r}:${tip.close}`, now);
-  if (now < closeSeen + ABANDON_MS) return;
+  if (now < closeSeen + (tip.closeRec.h !== undefined ? HOUSE_HEARD_MS : ABANDON_MS)) return;
   let wrote = false;
   for (const m of st.mine.values()) if (m.r > res.base.u) wrote = true;
   if (!wrote && readSeat(st.t, me) === null) return;
@@ -2825,10 +2875,25 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
     if (k) pubs.add(k);
   }
   const idx = placeOf('abandon', st.ctx, tip.r, pubs, pub);
-  if (now < closeSeen + ABANDON_MS + idx * STAGGER_MS) return;
+  if (now < closeSeen + abandonWait(sc, tip, now) + idx * STAGGER_MS) return;
   const rec = signed(st.ctx, 'abandon', { r: tip.r, x: tip.close, k: pub });
   const key = abandonKey(rec);
   if (key) put(st, key, rec, tip.r, true);
+}
+
+/** How long after its close the abandon waits to void tip: ABANDON_MS, or
+ *  at a Fair round HOUSE_HEARD_MS while this page hasn't heard the house for
+ *  that long (casinoDoc houseOnline) — unless a house reveal listing the
+ *  close is in: it waits on a seed it counted, which the room has (one this
+ *  page hasn't heard yet), and voided meanwhile the round would read void,
+ *  then decided as the seed came. */
+function abandonWait(sc: Scan, tip: RoundView, now: number): number {
+  if (tip.closeRec.h === undefined || houseOnline(now)) return ABANDON_MS;
+  for (const key of sc.houses.get(tip.r) ?? []) {
+    const x = asHouseReveal(sc.ses?.get(key));
+    if (x && x.x.includes(tip.close)) return ABANDON_MS;
+  }
+  return HOUSE_HEARD_MS;
 }
 
 /**
@@ -2914,6 +2979,34 @@ function keepCopy(w: Witnessed, ses: Session, key: string, rec: (v: unknown) => 
 const closeOf = (v: unknown): string | null => { const c = asClose(v); return c && closeKey(c); };
 const forfeitOf = (v: unknown): string | null => { const f = asForfeit(v); return f && forfeitKey(f); };
 const abandonOf = (v: unknown): string | null => { const z = asAbandon(v); return z && abandonKey(z); };
+const houseRevealOf = (v: unknown): string | null => { const x = asHouseReveal(v); return x && houseRevealKey(x); };
+const houseJoinOf = (v: unknown): string | null => { const o = asHouseCommit(v); return o && houseCommitKey(o); };
+
+/** At a house table, the house records a decided round's close rests on
+ *  besides its decider: the join record whose commitment it names (lost, the
+ *  close names nothing a house wrote, and is invalid), or the step-down that
+ *  lifted the commitment its parent asked for (lost, a close naming another
+ *  is invalid). The first such key, in key order, of the round; each a list
+ *  of none or one. */
+function houseRestsOn(st: TableState, sc: Scan, res: FoldResult, round: RoundView, i: number): string[] {
+  const ses = sc.ses;
+  if (!ses || !res.houseTable) return [];
+  const req = i === 0 ? res.base.h : res.rounds[i - 1].house?.rec.c ?? null;
+  const h = round.closeRec.h;
+  if (req !== null && h !== req) {
+    for (const key of [...(sc.houses.get(round.r) ?? [])].sort()) {
+      const x = asHouseReveal(ses.get(key));
+      if (x && x.x.length === 0 && houseRevealKey(x) === key && houseCommitOf(st.ctx, x.r, x.s) === req) return [key];
+    }
+  }
+  if (h !== undefined && h !== req) {
+    for (const key of [...(sc.joins.get(round.r) ?? [])].sort()) {
+      const o = asHouseCommit(ses.get(key));
+      if (o && o.c === h && houseCommitKey(o) === key) return [key];
+    }
+  }
+  return [];
+}
 
 /**
  * Keep a witness copy of what each round this page's player is frozen in
@@ -2925,7 +3018,9 @@ const abandonOf = (v: unknown): string | null => { const z = asAbandon(v); retur
  * abandon would void it); and once the round's result has shown here
  * (showStart), the rest: the close, the seed the fold counts for each
  * revealed bettor (the one revealsSeen finds: under its own key, opening the
- * frozen slip), and the forfeit or abandon that decided it. Its own records
+ * frozen slip), and the forfeit, abandon or house reveal that decided it; at
+ * a house table also the house record its close rests on (houseRestsOn: the
+ * join it names, or the step-down that let it name nothing). Its own records
  * among them too: what goes back of those is its own re-put's (witnessDuty
  * skips them), but a round missing one is a round a delete moved all the
  * same (heldBack). Copies only gather: a record the round rested on that a
@@ -2943,7 +3038,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
   if (!res) return;
   let sc: Scan | null = null;
-  for (const round of res.rounds) {
+  for (const [i, round] of res.rounds.entries()) {
     if (!round.present.includes(me)) continue;
     sc ??= scanOf(st, res);
     const ses = sc.ses;
@@ -2951,7 +3046,8 @@ function noteWitness(st: TableState, me: string, now: number): void {
     let w = st.witness.get(round.close);
     const shown = round.decided !== null && now >= showStart(st, sc, round, true, now);
     const decider = !shown ? null
-      : round.forfeit ? `f:${round.r}:${round.forfeit.hash}` : round.abandon ? `z:${round.r}:${round.abandon.hash}` : null;
+      : round.forfeit ? `f:${round.r}:${round.forfeit.hash}` : round.abandon ? `z:${round.r}:${round.abandon.hash}`
+      : round.house ? `h:${round.r}:${round.house.hash}` : null;
     const noted = shown ? `${round.decided}|${round.present.length}|${round.revealed.length}|${decider ?? ''}` : `-|${round.present.length}`;
     if (w && w.noted === noted) continue;
     if (!w) st.witness.set(round.close, w = { r: round.r, pubs: new Set(), copies: new Map(), decider: null, noted: '' });
@@ -2964,6 +3060,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
     }
     if (shown) {
       if (!keepCopy(w, ses, `c:${round.r}:${round.close}`, closeOf)) whole = false;
+      for (const key of houseRestsOn(st, sc, res, round, i)) keepCopy(w, ses, key, key[0] === 'h' ? houseRevealOf : houseJoinOf);
       for (const pid of round.revealed) {
         const keys = sc.reveals.get(round.r)?.get(pid) ?? [];
         if (keys.some((key) => w!.copies.has(key))) continue;
@@ -2977,7 +3074,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
       if (decider !== null && decider !== w.decider) {
         const old = w.decider === null ? undefined : w.copies.get(w.decider);
         if (!old || heldIn(ses, w.decider!, old)) {
-          if (keepCopy(w, ses, decider, decider[0] === 'f' ? forfeitOf : abandonOf)) {
+          if (keepCopy(w, ses, decider, decider[0] === 'f' ? forfeitOf : decider[0] === 'z' ? abandonOf : houseRevealOf)) {
             if (w.decider !== null) w.copies.delete(w.decider);
             w.decider = decider;
           } else {
@@ -3114,7 +3211,9 @@ function witnessDuty(st: TableState, pub: string, now: number): void {
  * decided; a page none of them is on only after TRIM_FALLBACK_MS idle. The
  * checkpoint holds the nets as the fold reads them, so on every page that
  * agreed nothing moves; the open round's felts go into the next session byte
- * for byte, but not one whose seed this page knows is out: in the next
+ * for byte (at a house table with the house's join records of it, and the
+ * checkpoint names the commitment the open round must name: `h`, the fold's
+ * `required`), but not one whose seed this page knows is out: in the next
  * session its reveal is gone, and a page that never saw it would freeze it
  * (its player puts the felt back under a fresh seed: the re-put). Two pages
  * trimming the same rounds write the same checkpoint but for its signer, so
@@ -3179,9 +3278,17 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   // the dice's holder. The open felts' stamps were made from it, so they
   // stay current in the next session.)
   const carried = st.game === 'craps' ? { s: res.carry as CrapsCarry } : {};
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u: D.r, l: D.close, n, ...carried, k: pub });
+  // (At a house table with the commitment the next round must name, and
+  // the house's join records of it: the next session's first round asks
+  // what this one's open round did.)
+  const house = res.required !== null ? { h: res.required } : {};
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u: D.r, l: D.close, n, ...carried, ...house, k: pub });
   const copies: [string, unknown][] = [];
   for (const s of res.felts.values()) if (!burnedCommit(st, res, s.rec.c)) copies.push([s.key, sc.ses?.get(s.key)]);
+  for (const j of res.joins) {
+    const v = sc.ses?.get(`o:${res.open}:${j.hash}`);
+    if (v !== undefined) copies.push([`o:${res.open}:${j.hash}`, v]);
+  }
   // Refused if the checkpoint moved on meanwhile (another page's trim). What
   // it covers is let go of, seeds and all, as the page next reads the table
   // (noteResult: tellPhase, right after).
@@ -3291,6 +3398,127 @@ function compactDuty(pub: string, now: number): void {
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
 }
 
+// ── 🏠 The house ─────────────────────────────────────────────────────────────
+
+/** The house key of this page's own node (its fingerprint's `house`:
+ *  main.ts setLocalHouse), or null without one. */
+let localHouse: string | null = null;
+/** When the house duty last looked (at most every REPUT_MS). */
+let houseDutyAt: number | null = null;
+
+/** 🏠 The house key this page's own node answers with (ssf-p2p-node's
+ *  fingerprint `house`), or null: main.ts, on every fingerprint read. A
+ *  key not in base64url's 43 characters reads as none. */
+export function setLocalHouse(pub: string | null): void {
+  localHouse = typeof pub === 'string' && isPub(pub) ? pub : null;
+}
+
+/**
+ * 10. The house's room records: every REPUT_MS, on an awake page with its
+ * doc whole, each page puts back what it counted of them that the doc lost
+ * (casinoDoc putBackHouseRecords: the delegations, each table's newest Fair
+ * setting), so a peer's delete can't take the house away; and the page of
+ * the room's deed holder (holdsDeed) delegates its own node's house key
+ * (`hk:<house>`, computedHouse) while the doc doesn't hold that delegation
+ * as it signed it. That node is the house from then on: it commits to a
+ * seed for each round of the room's house tables set Fair (house.rs), and a
+ * close names it (closeDuty). A deed holder with no node of its own (a
+ * browser alone) delegates nothing, and its tables play Friendly.
+ */
+function houseDuty(now: number): void {
+  if (houseDutyAt !== null && now >= houseDutyAt && now - houseDutyAt < REPUT_MS) return;
+  houseDutyAt = now;
+  if (!tablesAwake(now) || !casinoWhole()) return;
+  putBackHouseRecords();
+  if (localHouse === null || !holdsDeed() || delegationHeld(localHouse)) return;
+  const body = { v: 1 as const, h: localHouse, k: getIdentityPub() };
+  writeDelegation({ ...body, g: signIdentity(roomSignBytes('hkey', casinoRoomId(), '', body)) });
+}
+
+/** What setComputedFairness did: 'ok', or 'owner' from a page that isn't
+ *  the deed holder's, or 'reconnecting' on a doc not whole. */
+export type ComputedFairnessResult = 'ok' | 'owner' | 'reconnecting';
+
+/**
+ * 🏠 The deed holder sets house table `t` Fair (the house adds its seed while
+ * it is online) or Friendly (seeds from the players only): its signed
+ * setting (`hf:<t>`, computedHouse), ordered past the newest one this page
+ * has seen. The house reads it (it steps down from a table set Friendly,
+ * and joins one set Fair again); the fold never does. The ⚙ card's FAIRNESS.
+ */
+export function setComputedFairness(t: string, mode: 'fair' | 'friendly', now = Date.now()): ComputedFairnessResult {
+  if (!holdsDeed()) return 'owner';
+  if (!casinoWhole(t)) return 'reconnecting';
+  const body = { v: 1 as const, m: mode === 'friendly' ? 1 as const : 0 as const, s: Math.max(Math.floor(now), fairSettingSeq(t) + 1), k: getIdentityPub() };
+  writeFairSetting(t, { ...body, g: signIdentity(roomSignBytes('hfair', casinoRoomId(), t, body)) });
+  return 'ok';
+}
+
+/** What the ⚙ card and the plaque show of the house at table t (null at a
+ *  table PR 2–4 opened, which no house plays): whether the room has a house
+ *  at all (`setUp`: a delegation this page counted), whether it is heard now
+ *  (`online`), the owner's setting (`fairness`), whether this page may set
+ *  it (`canSet`: the deed holder's), whether the open round is a Fair one
+ *  (`openFair`: its close names a house commitment; before the close, one
+ *  must name the commitment the last round carried, or will name a house
+ *  join of this round), and what a Fair round closed and undecided waits on
+ *  (`waiting`): 'house' once every bettor's seed is in, 'offline' when no
+ *  house is heard (nobody can reveal its seed: an abandon will void the
+ *  round, and the next one runs Friendly); null otherwise. */
+export interface ComputedHouseState {
+  setUp: boolean;
+  online: boolean;
+  fairness: 'fair' | 'friendly';
+  canSet: boolean;
+  openFair: boolean;
+  waiting: 'house' | 'offline' | null;
+}
+
+export function computedHouseState(t: string, now = Date.now()): ComputedHouseState | null {
+  const inc = computedIncOf(t);
+  if (inc === null || !houseRules(inc)) return null;
+  const res = computedFoldOf(t);
+  const tip = res?.tip ?? null;
+  const online = houseOnline(now);
+  const openFair = tip ? tip.closeRec.h !== undefined : res !== null && (res.required !== null || res.joins.length > 0);
+  const waiting = !tip || tip.closeRec.h === undefined ? null
+    : !online ? 'offline'
+      : tip.revealed.length === tip.present.length ? 'house' : null;
+  return { setUp: houseSetUp(), online, fairness: readFairSetting(t), canSet: holdsDeed(), openFair, waiting };
+}
+
+/**
+ * 🏠 Move a table PR 2–4 opened (a `c` or `k` name: no house plays it) onto
+ * a house table, once the room has a house (casinoDoc houseSetUp) and the
+ * table is quiet: betting with no chip held (nothing on any felt, nothing
+ * riding), no close in, the last result shown. In ONE transaction the old
+ * incarnation ends as a switch-off ends it (its final checkpoint: its nets
+ * count on, finalizeComputed) and the house table opens under the name
+ * every page computes alike (computedIncFor: `r` or `d`). The house's
+ * choice of owner-run play is untouched (the table stays computed). The
+ * driving page's, with the automatic switch-on (autoSwitchComputed). True
+ * when it moved the table.
+ */
+function migrateComputed(t: string, game: GameName, now: number): boolean {
+  const inc = computedIncOf(t);
+  if (inc === null || houseRules(inc) || gameOfInc(inc) !== game || !houseSetUp() || switchGate(t, now)) return false;
+  const at = tableOf(t, game);
+  if (!at) return false;
+  const { st, res } = at;
+  if (res.tip || res.held.size > 0 || res.openCloses.some((c) => c.state !== 'invalid')) return false;
+  const e = viewOf(st, res, now);
+  if (e.view.phase !== 'betting' || e.holding !== null) return false;
+  const D = lastDecided(res);
+  const u = D ? D.r : Math.max(1, res.base.u);
+  const l = D ? D.close : res.base.l ?? NO_CLOSE;
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  return transactCasino(() => {
+    if (!finalizeComputed(t, st.inc, cp)) return false;
+    writeComputedOn(t, computedIncFor(t, game));
+    return true;
+  });
+}
+
 /** Whether compaction has an ended incarnation to finalise (computedEndedIncs:
  *  its sessions still in the doc), the room's tables or none: a removed
  *  table's is, after the room's last table goes; or one still to end, its
@@ -3366,13 +3594,17 @@ const autoTriedAt = new Map<string, number>();
  * robot would open the next window (its deadline passed), so the wheel's
  * ball lands and the dice stop on every page first. At craps nor over a
  * window's bets or a don't come bet on its number (crapsBetsWait). At most
- * every AUTO_SWITCH_MS a table. True when it switched the table on.
+ * every AUTO_SWITCH_MS a table. True when it switched the table on. A table
+ * already computed under a name PR 2–4 gave it, it moves onto a house table
+ * once the room has a house (migrateComputed).
  */
 export function autoSwitchComputed(t: string, game: GameName, now = Date.now()): boolean {
-  if (!computedTablesEnabled() || isComputedTable(t) || ownerRunChosen(t) || resultShowing(t, game, now)) return false;
+  if (!computedTablesEnabled() || ownerRunChosen(t)) return false;
+  if (!isComputedTable(t) && resultShowing(t, game, now)) return false;
   const at = autoTriedAt.get(t);
   if (at !== undefined && now >= at && now - at < AUTO_SWITCH_MS) return false;
   autoTriedAt.set(t, now);
+  if (isComputedTable(t)) return migrateComputed(t, game, now);
   if (game === 'craps' && crapsBetsWait(t)) return false;
   return switchComputedOn(t, game, now) === 'ok';
 }

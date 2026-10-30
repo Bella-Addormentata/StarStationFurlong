@@ -85,13 +85,16 @@ import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
 import { CrapsHarness, crapsChangeKind, crapsShownOf } from './computedCrapsSim';
 import type { CrapsBotSpec, Place } from './computedCrapsSim';
-import { parseKey, seedTable, slipCommit } from './computedFold';
+import { canon, gameOfInc, houseCommitOf, parseKey, seedTable, slipCommit } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
 import { loadPage, PAGE_ROOM } from './computedPageKit';
 import type { Page } from './computedPageKit';
+import { HOUSE_HEARD_MS } from './computedHouse';
+import { HOUSE_ORIGIN, SimHouse } from './computedSimHouse';
 import { RobotWatch } from './computedSimRobot';
 import { b64url, snapshot } from './computedTestKit';
 import { combinePocketSeeds } from './games/diceFairness';
+import { pocketFromMaterial } from './games/fairDice';
 import { resolveRound } from './games/roulette';
 import type { RouletteBet } from './games/roulette';
 
@@ -108,7 +111,7 @@ export const SIM_MINUTES = SIM_LONG ? 15 : 3;
 export const SIM_SEED_OFFSET = typeof process !== 'undefined' ? Number(process.env.SIM_SEED ?? 0) || 0 : 0;
 
 const NET = Symbol('sim-net');
-const COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
+const COMPUTED_INC = /^[ckrd][0-9a-f]{24}$/;
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
 // ── 🎲 Seeded randomness ─────────────────────────────────────────────────────
@@ -651,6 +654,8 @@ export interface SimSummary {
   /** Rounds seen decided, by how (each incarnation's rounds, once each). */
   byReveals: number;
   byForfeit: number;
+  /** 🏠 …by a house reveal (a Fair round). */
+  byHouse: number;
   voids: number;
   flips: Record<string, number>;
   flipKinds: Partial<Record<FlipKind, number>>;
@@ -699,6 +704,10 @@ export interface SimOptions {
    *  as blips once it is back): a delete's (pr2-pr-notes.md lever 8: what
    *  a decided round rests on goes back, and the round with it). */
   backIsBlip?: boolean;
+  /** 🏠 The owner's node as the room's house (computedSimHouse): the house's
+   *  page holds the room's deed and delegates the node's key; the node joins,
+   *  reveals and beats through that page's doc (nodeUp: it runs). */
+  houseNode?: boolean;
 }
 
 /** ms for which no per-tick bookkeeping runs (a spec's own loop may). */
@@ -719,6 +728,11 @@ export class Sim {
   house!: SimPage;
   /** 🤖 The robot at the players' tables, watched on every page's frame. */
   readonly robots: RobotWatch = new RobotWatch(this);
+  /** 🏠 The owner's node as the house (houseNode), and whether it runs; and
+   *  the load of the house's page it last told its key to. */
+  readonly node: SimHouse | null;
+  nodeUp = true;
+  private nodeOn: Page | null = null;
   /** What broke an invariant while it ran (empty when all held). */
   readonly violations: string[] = [];
   private readonly entropy: Rng;
@@ -782,6 +796,7 @@ export class Sim {
     for (const s of specs) this.games.set(typeof s === 'string' ? s : s.id, typeof s === 'string' ? 'roulette' : s.game);
     this.craps = [...this.games.values()].includes('craps') ? new CrapsHarness(this) : null;
     this.net = new Net(this, simRng(opts.seed ^ 0x0e7), opts.link ?? { delay: [40, 150], loss: 0 }, simRng(opts.seed ^ 0xbea7));
+    this.node = opts.houseNode ? new SimHouse(sha256(utf8ToBytes(`sim-house-node|${opts.seed}`))) : null;
   }
 
   /** Table t's game. */
@@ -820,6 +835,8 @@ export class Sim {
     vi.setSystemTime(sim.T);
     for (const spec of opts.pages) await sim.add(spec, { connect: false });
     const house = sim.house = sim.pages.find((sp) => sp.spec.house) ?? sim.pages[0];
+    // 🏠 With a node, the house's page holds the room's deed.
+    if (sim.node) await sim.as(house, () => house.p.doc.getMap('roomInfo').set('owner', house.pid));
     for (const t of sim.tables) {
       const now = sim.enter(house);
       house.p.table.setComputedTablesEnabledForTests(true);
@@ -971,7 +988,7 @@ export class Sim {
       // checker (a trim's: the rolls it takes out of the session are played
       // as the trimmer had them, so its checkpoint is held to them).
       if (pre && this.craps) {
-        for (const [t, w] of pre) if (w.res && w.inc && w.inc[0] === 'k') this.craps.check(sp, this.ctxOf(t, w.inc), w.res, false);
+        for (const [t, w] of pre) if (w.res && w.inc && gameOfInc(w.inc) === 'craps') this.craps.check(sp, this.ctxOf(t, w.inc), w.res, false);
       }
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
@@ -987,7 +1004,7 @@ export class Sim {
       if (this.craps) this.craps.ownWrite(sp, tr, computed, was);
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
-      if (tr.origin === NET || sp.p !== p || sp.cheats) return;
+      if (tr.origin === NET || tr.origin === HOUSE_ORIGIN || sp.p !== p || sp.cheats) return;
       const partial = (p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
       if (sp.roomIn && !partial) return;
       for (const [type, keys] of tr.changed) {
@@ -1117,6 +1134,12 @@ export class Sim {
         const t = this.tables.find((x) => casino.computedSessionForWrite(x) === ses);
         const w = t === undefined ? undefined : was.get(t);
         const round = w?.res && w.inc === casino.computedIncOf(t!) ? w.res.rounds.find((v) => v.close === F.x) : undefined;
+        // 🏠 A Fair round is the house's to decide: no page forfeits it.
+        const fairClose = ses.get(`c:${F.r}:${F.x}`) as { h?: unknown } | undefined;
+        if (fairClose?.h !== undefined) {
+          this.violate(`${sp.name} forfeited ${t} round ${F.r} at ${this.elapsed} ms, a Fair round (its close names the house's commitment)`);
+          continue;
+        }
         // Not of a round it showed decided by the reveals that reads
         // undecided only as a peer took away what it rests on (its tables
         // keep a copy of it, and it goes back: computedTable heldBack).
@@ -1189,10 +1212,14 @@ export class Sim {
         // later: a clock gone back reads a stamp ahead of it as now.)
         const restart = sp.restartAt !== null && sp.restartAt.T >= closeIn.T ? sp.restartAt : null;
         const from = restart ? restart.at : closeIn.at;
+        // 🏠 A Fair round's, while this page hasn't heard the house for
+        // HOUSE_HEARD_MS: that long (computedTable abandonWait).
+        const fair = (ses.get(`c:${z.r}:${z.x}`) as { h?: unknown } | undefined)?.h !== undefined;
+        const wait = fair && !sp.p.casino.houseOnline(now) ? HOUSE_HEARD_MS : table.ABANDON_MS;
         this.abandonsChecked += 1;
-        if (now < from + table.ABANDON_MS) {
+        if (now < from + wait) {
           this.violate(`${sp.name}'s abandon of round ${z.r} at ${this.elapsed} ms came ${now - closeIn.at} ms after the close came`
-            + `${restart ? ` and ${now - restart.at} ms after it woke (at ${restart.T - SIM_T0} ms)` : ''}, before ABANDON_MS`);
+            + `${restart ? ` and ${now - restart.at} ms after it woke (at ${restart.T - SIM_T0} ms)` : ''}, before its wait (${wait} ms${fair ? ', a Fair round' : ''})`);
         }
       }
     }
@@ -1368,6 +1395,7 @@ export class Sim {
     this.net.answerAsks();
     const beat = (this.T - SIM_T0) % RESYNC_MS === 0;
     if (beat) this.net.resync();
+    if (this.node) await this.houseTick();
     for (const sp of this.pages) {
       if (sp.mode !== 'up' || this.T < sp.pauseUntil) continue;
       if (beat) await this.as(sp, (now) => this.sit(sp, now));
@@ -1383,6 +1411,22 @@ export class Sim {
       if (beat) this.audit(sp);
     }
     if (this.pocketChecks.length > 0) await Promise.all(this.pocketChecks.splice(0));
+  }
+
+  /** 🏠 The owner's node's tick (computedSimHouse), on the doc of the
+   *  house's page while that page hears the room and the node runs: its key
+   *  told to each load of the page (main.ts setLocalHouse, from the node's
+   *  fingerprint), its clock the room's (monotonic) and the page's (wall). */
+  private async houseTick(): Promise<void> {
+    const sp = this.house;
+    if (!this.nodeUp || !this.net.connected(sp)) return;
+    await this.as(sp, (now) => {
+      if (this.nodeOn !== sp.p) {
+        sp.p.table.setLocalHouse(this.node!.pub);
+        this.nodeOn = sp.p;
+      }
+      this.node!.tick(PAGE_ROOM, sp.p.doc, this.T, now);
+    });
   }
 
   /** Page sp hears update `u` (from the network). While its doc holds part
@@ -1584,7 +1628,7 @@ export class Sim {
         }
       }
       if (casino.isComputedTable(t) && casino.computedIncOf(t) === inc) sp.lastLive.set(key, { u: to, nets: netsText(res.nets) });
-      const craps = this.craps !== null && inc[0] === 'k';
+      const craps = this.craps !== null && gameOfInc(inc) === 'craps';
       for (const v of res.rounds) {
         if (!this.closeAt.has(v.close)) this.closeAt.set(v.close, this.T);
         if (!v.decided) continue;
@@ -1613,12 +1657,31 @@ export class Sim {
    *  combinePocketSeeds, the async draw a Fair table makes; awaited at the
    *  end of the tick). */
   private workOut(sp: SimPage, ctx: FoldCtx, v: RoundView): void {
-    const id = `${sp.name}|${ctx.t}:${ctx.inc}:${v.close}|${v.decided}|${v.forfeit?.hash ?? v.abandon?.hash ?? ''}|${v.counted.join(',')}`;
+    const id = `${sp.name}|${ctx.t}:${ctx.inc}:${v.close}|${v.decided}|${v.forfeit?.hash ?? v.abandon?.hash ?? v.house?.hash ?? ''}|${v.counted.join(',')}`;
     if (this.checkedRounds.has(id)) return;
     const ses = sp.p.casino.computedSessionForWrite(ctx.t);
     if (!ses || sp.p.casino.computedIncOf(ctx.t) !== ctx.inc) return;
     const wrong = (why: string): void => this.violate(`${sp.name} ${ctx.t} round ${v.r} (${v.decided}) at ${this.elapsed} ms: ${why}`);
-    const counted = v.decided === 'reveals' ? v.present : v.decided === 'forfeit' ? [...(v.forfeit?.rec.n ?? [])].sort() : [];
+    // 🏠 A Fair round (its close names a commitment) is decided by a house
+    // reveal of this round listing its close, whose seed opens the
+    // commitment, in the session as the fold names it; or voided by an
+    // abandon. The house counts the bettors whose frozen slip it lists.
+    const H = v.house?.rec;
+    if (v.closeRec.h !== undefined) {
+      if (v.decided === 'reveals' || v.decided === 'forfeit') wrong('a Fair round decided without the house');
+      if (H) {
+        const rec = ses.get(`h:${v.r}:${v.house!.hash}`);
+        if (rec === undefined) return;
+        if (canon(rec) !== canon(H)) wrong(`its house reveal reads ${canon(rec)}, the fold's ${canon(H)}`);
+        if (H.r !== v.r || !H.x.includes(v.close) || houseCommitOf(ctx, v.r, H.s) !== v.closeRec.h) wrong('its house reveal is of another round, close or commitment');
+      } else if (v.decided !== 'void' || !v.abandon) {
+        wrong('a Fair round decided with no house reveal');
+      }
+    } else if (H) {
+      wrong('a Friendly round decided by a house reveal');
+    }
+    const counted = v.decided === 'reveals' ? v.present : v.decided === 'forfeit' ? [...(v.forfeit?.rec.n ?? [])].sort()
+      : v.decided === 'house' ? v.present.filter((pid) => H!.n.includes(v.frozen[pid])) : [];
     if (JSON.stringify(v.counted) !== JSON.stringify(counted)) wrong(`counted ${v.counted.join(',')}, not ${counted.join(',')}`);
     const seeds: string[] = [];
     for (const pid of v.present) {
@@ -1642,7 +1705,11 @@ export class Sim {
       return;
     }
     const pocket = v.pocket;
-    this.pocketChecks.push(combinePocketSeeds(seeds, seedTable(ctx), v.r).then((want) => {
+    // (A Fair round's draw takes the house's seed last.)
+    const draw = H && v.decided === 'house'
+      ? pocketFromMaterial(`ssf-roulette-combine-v1|${[...seeds].sort().join('|')}|${seedTable(ctx)}|${v.r}|house:${H.s}`)
+      : combinePocketSeeds(seeds, seedTable(ctx), v.r);
+    this.pocketChecks.push(draw.then((want) => {
       if (want !== pocket) wrong(`pocket ${pocket}, the counted seeds draw ${want}`);
     }));
   }
@@ -1656,7 +1723,7 @@ export class Sim {
     // 🎲 At craps the view's roll key names the roll the dice landed on, a
     // roll shows what it paid and handed on (crapsShownOf), and a roll paid
     // again on the same dice is its own kind, once a roll ('repaid').
-    const craps = this.craps !== null && inc[0] === 'k';
+    const craps = this.craps !== null && gameOfInc(inc) === 'craps';
     const shown = craps ? crapsShownOf : shownOf;
     const kindOf = craps ? crapsChangeKind : changeKind;
     const view = craps ? table.readComputedCraps(t, now) : table.readComputedRoulette(t, now);
@@ -1871,7 +1938,7 @@ export class Sim {
     for (const [key, f] of this.cold(sp).folds) {
       // 🎲 At craps: an ended incarnation's nets, those the checker handed
       // on at the close its final checkpoint names.
-      if (this.craps && f.res.base.ended && f.ctx.inc[0] === 'k') this.craps.checkEnded(sp, f.ctx, f.res);
+      if (this.craps && f.res.base.ended && gameOfInc(f.ctx.inc) === 'craps') this.craps.checkEnded(sp, f.ctx, f.res);
       const last = sp.lastLive.get(key);
       if (!f.res.base.ended || !last || last.u !== f.res.base.u) continue;
       const nets = netsText(f.res.nets);
@@ -1923,7 +1990,9 @@ export class Sim {
       const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`));
       const ses = map.get(`ses:${t}:${inc}:${fold.nextSid(ctx, cp)}`);
       const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
-      const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf);
+      // (A house table's fold asks casinoDoc which keys are houses, as the
+      // page's own does.)
+      const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf, fold.foldGameOf(ctx), (pub) => sp.p.casino.houseOkOf(pub));
       tf.setBase(cp);
       tf.reset(entries);
       const res = tf.result();
@@ -2187,7 +2256,7 @@ export class Sim {
     if (!b) return { cpu: 0, wall: 0 };
     const wall = performance.now();
     const cpu = process.cpuUsage();
-    const tf = new sp.p.fold.TableFold(b.ctx, this.checkFor(sp, b.ctx, false), b.keyOf);
+    const tf = new sp.p.fold.TableFold(b.ctx, this.checkFor(sp, b.ctx, false), b.keyOf, sp.p.fold.foldGameOf(b.ctx), (pub) => sp.p.casino.houseOkOf(pub));
     tf.setBase(b.cp);
     tf.reset(b.entries);
     tf.result();
@@ -2201,7 +2270,7 @@ export class Sim {
     this.enter(ref);
     let rounds = 0;
     for (const f of this.cold(ref).folds.values()) rounds += lastDecided(f.res)?.r ?? f.res.base.u;
-    const by = { reveals: 0, forfeit: 0, void: 0 } as Record<string, number>;
+    const by = { reveals: 0, forfeit: 0, house: 0, void: 0 } as Record<string, number>;
     for (const d of this.decisions.values()) by[d] = (by[d] ?? 0) + 1;
     const sorted = [...this.warm].sort((a, b) => a - b);
     const wall = [...this.warmWall].sort((a, b) => a - b);
@@ -2226,6 +2295,7 @@ export class Sim {
       rounds,
       byReveals: by.reveals,
       byForfeit: by.forfeit,
+      byHouse: by.house,
       voids: by.void,
       flips,
       flipKinds,
@@ -2258,7 +2328,7 @@ export class Sim {
     const kinds = Object.entries(s.flipKinds).map(([k, n]) => `${k} ${n}`).join(', ');
     const flips = Object.entries(s.flips).map(([k, n]) => `${k}:${n}`).join(',') + (kinds ? ` (${kinds})` : '');
     return `[sim] ${s.name} seed=${s.seed} ${s.pages}p ${s.minutes}min: rounds=${s.rounds} `
-      + `(reveals ${s.byReveals}, forfeit ${s.byForfeit}, void ${s.voids}) flips=${flips} trims=${s.trims} `
+      + `(reveals ${s.byReveals}, forfeit ${s.byForfeit}${s.byHouse ? `, house ${s.byHouse}` : ''}, void ${s.voids}) flips=${flips} trims=${s.trims} `
       + `doc≤${kb(s.maxDocBytes)} session≤${kb(s.maxSessionBytes)} (pre-trim ≤${kb(s.maxPreTrimBytes)}, round ≤${kb(s.maxRoundBytes)}) `
       + `stall≤${(s.worstStallMs / 1000).toFixed(1)}s${worst ? ` [${worst}]` : ''} `
       + `coldFold=${s.coldFoldMs.toFixed(0)}ms cpu (${s.coldFoldWallMs.toFixed(0)} wall) `

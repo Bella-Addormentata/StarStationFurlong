@@ -62,10 +62,11 @@ import {
 } from './croupier';
 import {
   computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedRollChange,
-  computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
+  computedHouseState, computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
   CRAPS_SWITCH_ON_CONFIRM, CRAPS_SWITCH_ON_REFUSED, noteComputedFling, readComputedBets, readComputedCraps,
   readComputedCrapsBets, readComputedRoulette, readMyComputedBets, readMyComputedCrapsBets, SWITCH_OFF_REFUSED,
-  SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip, writeComputedSlip,
+  setComputedFairness, SWITCH_ON_CONFIRM, SWITCH_ON_REFUSED, switchComputedOff, switchComputedOn, writeComputedCrapsSlip,
+  writeComputedSlip,
 } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
 import { noteComputedToss } from './computedRobot';
@@ -103,9 +104,19 @@ import { getPlayerId } from './identity';
  *  the mode, not the outcome: whether a given result really took bettors'
  *  seeds is the ⚙ card's verdict line, which warns on house-seed-only. */
 export function fairnessBadge(tableId: string, game: 'craps' | 'roulette'): { text: string; color: string; fair: boolean } {
-  // 🧮 A computed table has no owner to trust, and no house seed either.
+  // 🧮 A computed table has no owner to trust. 🏠 Its round is Fair when the
+  // house adds a seed to it (the owner's node: nobody, a bettor alone at the
+  // table included, knows the result before it is decided); else the seeds
+  // are the players' only. A table PR 2–4 opened, or one in a room with no
+  // house, never has the house's.
   if (isComputedFor(tableId, game)) {
-    return { text: "PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS", color: FRIENDLY_RED, fair: false };
+    const h = computedHouseState(tableId);
+    if (!h?.setUp) return { text: "PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS", color: FRIENDLY_RED, fair: false };
+    if (h.openFair) return { text: "✔ FAIR · PLAYERS' TABLE · THE HOUSE AND EVERY BETTOR ADD A SEED", color: '#7CF5B0', fair: true };
+    const why = h.fairness === 'friendly' ? 'FRIENDLY · THE OWNER CHOSE NO HOUSE SEED'
+      : !h.online ? 'FRIENDLY · THE HOUSE IS OFFLINE'
+        : `FRIENDLY THIS ${game === 'craps' ? 'ROLL' : 'ROUND'} · THE HOUSE JOINS THE NEXT`;
+    return { text: `PLAYERS' TABLE · ${why}`, color: FRIENDLY_RED, fair: false };
   }
   return roundIsFair(tableId, game)
     ? { text: '✔ FAIR TABLE · EVERY BETTOR ADDS A SEED · CHECK EACH RESULT ON ⚙', color: '#7CF5B0', fair: true }
@@ -1194,6 +1205,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
    *  first press warned of contract bets riding (the next hands them back). */
   let offered: { inc: string; r: number } | null = null;
   let offArmed = false;
+  /** 🏠 The house as the open card last drew it: a heartbeat isn't a casino
+   *  change, and going quiet is no change at all, so the frame redraws the
+   *  card when it differs. */
+  let houseDrawn = '';
   /** Tell the player what the table did that no status line says: a round
    *  it showed rewritten, and a switch-off handing their felt back. On a
    *  whole doc only (one holding part of an update can read the switch as
@@ -1576,7 +1591,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     // Commit this bet's seed now, not on the next tick: a quick close must
     // still find it. (A computed slip carries its own commitment.)
     if (!comp) tickFairSeeds(itemId, game, me, Date.now(), true);
-    if (!roundIsFair(itemId, game) && !friendlyWarned.has(warnKey)) {
+    if (!fairnessBadge(itemId, game).fair && !friendlyWarned.has(warnKey)) {
       friendlyWarned.add(warnKey);
       say(comp
         ? '🤝 FRIENDLY TABLE — SEEDS COME FROM THE PLAYERS ONLY · A MODIFIED GAME CAN STEER OR REWRITE A ROUND'
@@ -2137,8 +2152,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return { line: `✋ YOUR NEW BETS MISSED THE CLOSE — CHIPS BACK${mine.riding ? ' · THE REST PLAY' : ''}`, color: GOLD_BRIGHT };
     }
     if (moving && (s.phase === 'settled' || flightAge(itemId, s.round) < ROLLING_MS)) return { line: '🎲 THE DICE ARE ROLLING…', color: PINK };
+    const wait = s.phase === 'closing' ? houseWait() : null;
     if (s.phase === 'closing' && mine) {
-      return { line: mine.frozen && !mine.revealed ? '✋ NO MORE BETS — STAY UNTIL THE DICE LAND' : '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
+      if (mine.frozen && !mine.revealed) return { line: '✋ NO MORE BETS — STAY UNTIL THE DICE LAND', color: PINK };
+      return wait ?? { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
     }
     if (s.phase === 'closing') {
       if (s.shooterSlip !== undefined && s.phaseDeadline !== undefined) {
@@ -2158,7 +2175,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (s.stallUntil !== undefined) {
         return { line: `✋ NO MORE BETS — THE BETTORS HAVE GONE QUIET · BETTING REOPENS IN ${secs(s.stallUntil)}`, color: PINK };
       }
-      return { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
+      return wait ?? { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
     }
     if (s.phase === 'settled' && s.voided) {
       return { line: '⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
@@ -2204,6 +2221,17 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return { line: `🎲 ${late}${dice}${remain()}${cashier}`, color: GOLD_BRIGHT };
   };
 
+  /** 🏠 What a Fair round closed and undecided waits on, as the status line
+   *  says it (null: the bettors' seeds, or no Fair round): the house's seed,
+   *  once every bettor's is in; or nobody's, the house unheard. */
+  const houseWait = (): { line: string; color: string } | null => {
+    const w = computedHouseState(itemId)?.waiting ?? null;
+    if (w === 'offline') {
+      return { line: `⚠ THE HOUSE WENT OFFLINE · THIS ${game === 'craps' ? 'ROLL' : 'ROUND'} GOES VOID UNLESS IT COMES BACK · THEN THE TABLE RUNS FRIENDLY`, color: GOLD_BRIGHT };
+    }
+    return w === 'house' ? { line: "✋ NO MORE BETS — WAITING FOR THE HOUSE'S SEED", color: PINK } : null;
+  };
+
   /** 🧮 The status lines only a computed table has (null: the owner-run
    *  table's line says it): a round undone, the seeds awaited, and what
    *  became of my felt in the round closing or shown. */
@@ -2217,7 +2245,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (mine?.tooLate) return { line: '✋ TOO LATE — THE CLOSE HAD YOUR EARLIER BETS', color: PINK };
       if (mine?.leftOut) return { line: '✋ YOUR BET MISSED THE CLOSE — CHIPS BACK', color: GOLD_BRIGHT };
       if (mine?.frozen && !mine.revealed) return { line: '✋ NO MORE BETS — STAY UNTIL THE SPIN', color: PINK };
-      return { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
+      return houseWait() ?? { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
     }
     if (s.phase === 'settled' && s.voided) return { line: '⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED', color: GOLD_BRIGHT };
     if (s.phase === 'settled' && s.result !== null) {
@@ -2377,12 +2405,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (craps && c.roll?.dice) parts.push(callOf(c.roll.dice, c.roll.pointBefore, c.roll.pointAfter));
       if (c.decided === 'void') parts.push(craps ? 'VOID — NOBODY COULD FINISH IT · EVERY BET STANDS' : 'VOID — NOBODY COULD FINISH IT · STAKES RETURNED');
       else {
-        parts.push(`${c.counted} OF ${c.of} SEED${c.of === 1 ? '' : 'S'} COUNTED`);
+        // 🏠 (A Fair round's: the bettors' seeds counted, and the house's.)
+        parts.push(`${c.counted} OF ${c.of} SEED${c.of === 1 ? '' : 'S'} ${c.decided === 'house' ? "+ THE HOUSE'S" : 'COUNTED'}`);
         // (Named by the key this page pins for the player: display only. A
         // name is the player's own to set, and any peer's to rewrite: it goes
         // into the card's markup escaped, as text.)
         parts.push(c.decided === 'reveals' ? 'DECIDED BY ALL REVEALS'
-          : `DECIDED BY A FORFEIT BY ${c.forfeitBy ? escapeHtml(readPlayerDisplayName(c.forfeitBy).toUpperCase()) : 'A KEY THIS PAGE DOESN\'T KNOW'}`);
+          : c.decided === 'house' ? "DECIDED BY THE HOUSE'S REVEAL"
+            : `DECIDED BY A FORFEIT BY ${c.forfeitBy ? escapeHtml(readPlayerDisplayName(c.forfeitBy).toUpperCase()) : 'A KEY THIS PAGE DOESN\'T KNOW'}`);
         // (Who held a seed back: a rider can take a second look at the dice
         // that way, at no cost.)
         const late = craps ? c.uncounted ?? [] : [];
@@ -2403,8 +2433,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (c.mine === 'late') parts.push(`✗ YOUR SEED CAME IN LATE — ${forfeited}`);
       if (c.mine === 'forfeited') parts.push(`✗ YOUR SEED NEVER CAME — ${forfeited}`);
       const bad = c.mine === 'late' || c.mine === 'forfeited';
-      out.push({ text: parts.join(' · '), color: bad ? '#FF8A80' : c.decided === 'reveals' ? '#7CF5B0' : '#F5C26B' });
+      out.push({ text: parts.join(' · '), color: bad ? '#FF8A80' : c.decided === 'reveals' || c.decided === 'house' ? '#7CF5B0' : '#F5C26B' });
+      if (c.houseVoid) out.push({ text: 'THE HOUSE NEVER REVEALED ITS SEED · VOID', color: '#F5C26B' });
       if (c.dropped.length > 0) out.push({ text: '🚩 A FORFEIT DROPPED A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
+      if (c.houseDropped.length > 0) out.push({ text: '🚩 THE HOUSE LEFT OUT A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
       // (At craps the nets apart from the table the checkpoint hands on.)
       const chips = craps ? c.checkpointNets ?? 0 : c.checkpointDiff;
       if (chips > 0) out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${many(chips, 'CHIP', 'CHIPS')}`, color: '#FF8A80' });
@@ -2466,6 +2498,29 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return rows;
   };
 
+  /** 🏠 The ⚙ card's house rows at a house table (none at a table PR 2–4
+   *  opened): whether the room's house is online, and the owner's FAIRNESS
+   *  (a press for the deed holder, a line for everyone else) while the room
+   *  has a house. */
+  const houseRows = (house: boolean): string[] => {
+    const h = computedHouseState(itemId);
+    houseDrawn = h ? `${h.setUp}|${h.online}|${h.fairness}|${h.openFair}` : '';
+    if (!h) return [];
+    const rows: string[] = [];
+    const state = !h.setUp ? `NOT SET UP${h.canSet ? ' · YOUR NODE ADDS IT WHEN IT RUNS THIS ROOM' : ''}`
+      : h.online ? 'ONLINE' : `OFFLINE · ${game === 'craps' ? 'ROLLS' : 'ROUNDS'} RUN FRIENDLY`;
+    rows.push(`<div style="font-size:9px;color:${h.setUp && h.online ? '#7CF5B0' : DIM};letter-spacing:1.2px;">THE HOUSE · ${state}</div>`);
+    if (!h.setUp) return rows;
+    const label = h.fairness === 'fair' ? 'FAIR WHILE THE HOUSE IS ONLINE' : 'FRIENDLY';
+    rows.push(`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+      <span style="font-size:9px;color:${DIM};letter-spacing:1.2px;">FAIRNESS</span>
+      ${h.canSet && house ? btn('house-fair', label, true) : `<span style="font-size:10px;color:${GOLD_BRIGHT};">${label}</span>`}</div>`);
+    if (h.online && (h.fairness === 'fair') !== h.openFair) {
+      rows.push(`<div style="font-size:9px;color:${DIM};">THE NEW SETTING STARTS WITH THE NEXT ${game === 'craps' ? 'ROLL' : 'ROUND'}</div>`);
+    }
+    return rows;
+  };
+
   const renderCard = (): void => {
     if (!card) return;
     const house = deps.isHouse();
@@ -2484,17 +2539,19 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     const badge = fairnessBadge(itemId, game);
     rows.push(`<div style="font-size:10px;font-weight:900;letter-spacing:1px;color:${badge.color};">${badge.text}</div>`);
     if (comp) {
-      // 🧮 No fairness to set (Friendly only until the house's seed, PR 5),
-      // no robot line (the robot runs nothing here), nothing to press: the
-      // fold's verdict, the house's switch, and how the round goes on (🎲 and
-      // at craps where the table stands).
+      // 🧮 No robot line (the robot runs nothing here), nothing to press but
+      // the owner's: 🏠 the house and its FAIRNESS, the fold's verdict, the
+      // switch, and how the round goes on (🎲 and at craps where the table
+      // stands).
+      rows.push(...houseRows(house));
       const table = game === 'craps' ? computedCrapsLine() : null;
       if (table) rows.push(`<div style="font-size:9.5px;color:${GOLD};">${table}</div>`);
       for (const line of computedCheckLines()) rows.push(`<div style="font-size:9px;color:${line.color};">${line.text}</div>`);
       rows.push(...switchRows(house));
+      const seeds = badge.fair ? "THE BETTORS' SEEDS AND THE HOUSE'S ARE IN" : "THE BETTORS' SEEDS ARE IN";
       rows.push(`<div style="font-size:9.5px;color:${DIM};">${game === 'craps'
-        ? "BETS CLOSE ON THE TIMER · THE ROLL IS DECIDED ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE DICE LAND"
-        : "BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN · STAY UNTIL THE SPIN"}</div>`);
+        ? `BETS CLOSE ON THE TIMER · THE ROLL IS DECIDED ONCE ${seeds} · STAY UNTIL THE DICE LAND`
+        : `BETS CLOSE ON THE TIMER · THE WHEEL SPINS ONCE ${seeds} · STAY UNTIL THE SPIN`}</div>`);
       pushHelp(rows);
       return;
     }
@@ -2565,6 +2622,18 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return;
     }
     offArmed = false;
+    // 🏠 The owner's FAIRNESS at a house table: Fair while the house is
+    // online, or Friendly (the house steps down from the table).
+    if (act === 'house-fair') {
+      const h = computedHouseState(itemId);
+      if (h) {
+        const done = setComputedFairness(itemId, h.fairness === 'fair' ? 'friendly' : 'fair');
+        if (done === 'reconnecting') say(RECONNECTING_NOTICE);
+        else if (done === 'owner') say("ONLY THE ROOM'S OWNER SETS THE HOUSE");
+      }
+      renderCard();
+      return;
+    }
     // 🧮 Nothing to set or press on a computed table (none of it is shown):
     // nobody runs its rounds. (SPIN says so itself: spinByHand; ROLL too,
     // pressManualRoll.)
@@ -2870,6 +2939,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       noteComputed();
       syncTakeDown();
       renderBar();
+      if (card) {
+        const h = computedHouseState(itemId);
+        const drawn = h ? `${h.setUp}|${h.online}|${h.fairness}|${h.openFair}` : '';
+        if (drawn !== houseDrawn) renderCard();
+      }
     },
   };
 }

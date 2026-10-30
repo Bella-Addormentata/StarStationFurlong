@@ -28,6 +28,7 @@ import type { AtCraps, FakeEl, UIPage } from './computedCrapsUiKit';
 import { putIn, rigRoll, rigSplit, signAs } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import type { CloseRec, CrapsSlipRec, ForfeitRec, RoundView } from './computedFold';
+import { TRIM_SEVEN_OUT_MIN } from './computedCraps';
 import type { CrapsCarry } from './computedCraps';
 import type { ComputedCrapsState } from './computedTable';
 import type { CrapsBet } from './games/craps';
@@ -1868,6 +1869,13 @@ function rewriteCases(): { cases: Record<string, Case>; each: NonNullable<Scenar
     const X = c.sim.pages[XI];
     return c.sim.pages.every((q) => q === X || rank(X) < rank(q));
   };
+  /** Whether roll r stays in the session through the roll after it: a
+   *  seven-out there that long past the checkpoint is trimmed a second after
+   *  it shows, before X's forfeit of r (written once it shows) goes in. */
+  const keptPast = (c: Run, r: number): boolean => {
+    const base = c.stage.ref()?.p.casino.computedFoldOf(T)?.base.u;
+    return base !== undefined && r + 1 - base < TRIM_SEVEN_OUT_MIN;
+  };
   const cases: Record<string, Case> = {
     shown: {
       ready: (c, K, r) => K.h !== undefined && xFirst(c, r),
@@ -1880,7 +1888,7 @@ function rewriteCases(): { cases: Record<string, Case>; each: NonNullable<Scenar
       },
     },
     earlier: {
-      ready: (c, K, r) => K.h !== undefined && c.done.shown !== undefined && xFirst(c, r),
+      ready: (c, K, r) => K.h !== undefined && c.done.shown !== undefined && xFirst(c, r) && keptPast(c, r),
       setup: (c, plan) => split(c, plan, 'next'),
       ok,
       check(c, plan, P) {

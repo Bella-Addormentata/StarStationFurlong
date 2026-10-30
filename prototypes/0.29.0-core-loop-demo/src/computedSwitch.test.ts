@@ -258,7 +258,7 @@ describe('switch-on: refused', () => {
     expect(a.table.switchComputedOn('craps-1', 'craps', T0)).toBe('ok');
     // (Its house sees the switch-off row, with or without the dev flag.)
     expect(a.table.computedSwitchState('craps-1', 'craps', true, T0)).toEqual({ show: true, on: true, can: true });
-    expect(a.casino.computedIncOf('craps-1')).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf('craps-1')).toMatch(/^d[0-9a-f]{24}$/);
     // A craps state up under a roulette switch: the other game's.
     come('craps-2', null);
     expect(a.table.switchComputedOn('craps-2', 'roulette', T0)).toBe('craps');
@@ -299,7 +299,7 @@ describe('switch-on: refused', () => {
     expect(a.table.switchComputedOn('craps-7', 'craps', T0)).toBe('craps');
     expect(a.table.switchComputedOn('craps-1', 'roulette', T0)).toBe('craps');
     expect(['craps-2', 'craps-3', 'craps-4'].some((t) => a.casino.isComputedTable(t))).toBe(false);
-    expect(a.casino.computedIncOf('craps-8')).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf('craps-8')).toMatch(/^d[0-9a-f]{24}$/);
   });
 });
 
@@ -318,7 +318,7 @@ describe('switch-on', () => {
     sync(T0, ...pages);
     for (const p of pages) {
       expect(p.casino.isComputedTable(TABLE)).toBe(true);
-      expect(incOf(p)).toMatch(/^c[0-9a-f]{24}$/);
+      expect(incOf(p)).toMatch(/^r[0-9a-f]{24}$/);
       expect(cfgOf(p)).toEqual({ v: 1, inc: incOf(a) });
       expect(sessionKeys(p)).toEqual([`ses:${TABLE}:${incOf(a)}:g`]);
       // The owner-run incarnation is over, its book kept.
@@ -371,7 +371,7 @@ describe('switch-on', () => {
     a.doc.transact(() => a.doc.getMap('casinoComputed').set(`ses:${TABLE}:${first}:g`, new Y.Map()));
     const second = a.casino.computedIncFor(TABLE);
     expect(second).not.toBe(first);
-    expect(second).toMatch(/^c[0-9a-f]{24}$/);
+    expect(second).toMatch(/^r[0-9a-f]{24}$/);
     expect(a.casino.tableIncRemoved(TABLE, first)).toBe(true);
     // A checkpoint does as much.
     a.doc.transact(() => a.doc.getMap('casinoComputed').set(`sum:${TABLE}:${second}`, { v: 1 }));
@@ -485,7 +485,7 @@ describe('tables computed by default (autoSwitchComputed)', () => {
     at(a, T0 + 1_000);
     expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 1_000)).toBe(true);
     expect(a.casino.isComputedTable(TABLE)).toBe(true);
-    expect(incOf(a)).toMatch(/^c[0-9a-f]{24}$/);
+    expect(incOf(a)).toMatch(/^r[0-9a-f]{24}$/);
     // Computed already: nothing more.
     at(a, T0 + 2_000);
     expect(a.table.autoSwitchComputed(TABLE, 'roulette', T0 + 2_000)).toBe(false);
@@ -530,7 +530,7 @@ describe('tables computed by default (autoSwitchComputed)', () => {
     expect(a.table.autoSwitchComputed(T, 'craps', end - 1)).toBe(false);
     at(a, end);
     expect(a.table.autoSwitchComputed(T, 'craps', end)).toBe(true);
-    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf(T)).toMatch(/^d[0-9a-f]{24}$/);
   });
 
   it("at craps never takes a window's bets back, nor a don't come bet on its number: those ride to a show's end", async () => {
@@ -572,7 +572,7 @@ describe('tables computed by default (autoSwitchComputed)', () => {
     state('settled', T0);
     bets([{ type: 'place', pick: 6, amount: 12 }]);
     expect(tryAt()).toBe(true);
-    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf(T)).toMatch(/^d[0-9a-f]{24}$/);
     sync(now, a, b);
     expect(b.casino.readChips(b.pid)).toBe(1_000);
   });
@@ -593,7 +593,7 @@ describe('tables computed by default (autoSwitchComputed)', () => {
     come(null);
     at(a, T0 + 1_000);
     expect(a.table.autoSwitchComputed(T, 'craps', T0 + 1_000)).toBe(true);
-    expect(a.casino.computedIncOf(T)).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf(T)).toMatch(/^d[0-9a-f]{24}$/);
     expect(a.casino.readChips(a.pid)).toBe(1_000);
     // A point on, its window idle with nothing on the felt (the hand's
     // bets decided or taken down): nothing to wait for.
@@ -602,7 +602,7 @@ describe('tables computed by default (autoSwitchComputed)', () => {
       kind: 'craps', phase: 'betting', round: 4, point: 6, dice: null, result: null, resultAt: 0, payouts: null, ...a.casino.tableOpening(T2),
     });
     expect(a.table.autoSwitchComputed(T2, 'craps', T0 + 1_000)).toBe(true);
-    expect(a.casino.computedIncOf(T2)).toMatch(/^k[0-9a-f]{24}$/);
+    expect(a.casino.computedIncOf(T2)).toMatch(/^d[0-9a-f]{24}$/);
   });
 
   it('never at a table the house switched back: BACK TO THE OWNER marks it, RUN WITHOUT THE OWNER and taking the table out of the room clear the mark', async () => {
@@ -1821,7 +1821,7 @@ describe('leaving the room', () => {
     const leave = body.indexOf('leaveComputedTables();');
     expect(leave).toBeGreaterThan(-1);
     expect(leave).toBeLessThan(body.indexOf('sync.flush()'));
-    expect(main).toMatch(/import \{ leaveComputedTables \} from "\.\/computedTable";/);
+    expect(main).toMatch(/import \{ leaveComputedTables, setLocalHouse \} from "\.\/computedTable";/);
   });
 });
 
