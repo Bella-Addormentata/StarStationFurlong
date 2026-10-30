@@ -91,6 +91,7 @@
 - [ ] **Register follow-up: name the hosts the release workflow's actions download from** — the build-time row names `dtolnay/rust-toolchain@stable` and `actions/setup-node@v5` but not their endpoints (rustup's `static.rust-lang.org` through `sh.rustup.rs`/`win.rustup.rs`; `nodejs.org` when setup-node's toolcache misses), and the §6 workflow grep sees only the action refs, so an endpoint change inside an action would leave the row stamped current; name those endpoint classes on the row and add a §6 check of the resolved action code (Copilot on [#253](https://github.com/Bella-Addormentata/StarStationFurlong/pull/253), after the merge)
 - [ ] After B‑1: keep `Cargo.lock` committed; consider `cargo vendor` for F-Droid reproducibility (P‑2′)
 - [ ] Sprint retrospectives update the Phase plans (per [03-Implementation/README](docs/TDD/03-Implementation/README.md) workflow)
+- [ ] **Test waits on hashing:** eight test files flush async work with a fixed 20 turns of the event loop, and some wait on SHA-256 hashing (`computedSwitch`, `tableTurn`, `computedCrapsOwnerRun`, `computedLedger`, `computedTrim`, `casinoOperatorsRejoin`, `tableSplit`, `tableIncarnation`). None has failed yet; if one does on a busy CI machine, move [#323](https://github.com/Bella-Addormentata/StarStationFurlong/pull/323)'s digest counter (slotCroupier.test.ts) into a shared test helper.
 
 ## ⏳ Phase 2 horizon (gated — don't start early)
 
