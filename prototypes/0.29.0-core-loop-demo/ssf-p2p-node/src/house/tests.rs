@@ -643,11 +643,133 @@ fn heartbeats_count_up_past_the_one_in_the_doc() {
     assert!(beat.get("n").and_then(CVal::as_int).unwrap() > n1);
     let bytes = hb::room_sign_bytes("hbeat", ROOM, "", &beat).unwrap();
     assert!(hb::verify(room.house.public(), &bytes, str_of(&beat, "g").unwrap()));
-    // A beat from the future in the doc (another clock): the next passes it.
-    let ahead = with(&beat, "n", CVal::Int(9_000_000_000_000_000));
-    room.put_top(&key, &ahead);
+    // A peer's copy with a higher count, unsigned: it counts on from its own.
+    let n2 = beat.get("n").and_then(CVal::as_int).unwrap();
+    let forged = with(&with(&beat, "n", CVal::Int(MAX_SAFE)), "g", s(&"A".repeat(86)));
+    room.put_top(&key, &forged);
+    room.tick(5_000);
+    let n3 = room.top(&key).unwrap().get("n").and_then(CVal::as_int).unwrap();
+    assert!(n3 > n2 && n3 < 9_000_000_000_000_000, "{n3}");
+    // A beat of its own from the future in the doc (another clock): the
+    // next passes it.
+    let body = obj(vec![("v", CVal::Int(1)), ("n", CVal::Int(9_000_000_000_000_000)), ("k", s(room.house.public()))]);
+    let g = room.house.key.sign(&hb::room_sign_bytes("hbeat", ROOM, "", &body).unwrap());
+    room.put_top(&key, &with(&body, "g", s(&g)));
     room.tick(5_000);
     assert!(room.top(&key).unwrap().get("n").and_then(CVal::as_int).unwrap() > 9_000_000_000_000_000);
+}
+
+#[test]
+fn a_forged_setting_with_a_higher_count_is_put_back_over() {
+    let mut room = Room::new("forged-setting", true);
+    room.set_fair(1, 3);
+    room.tick(0);
+    let setting = room.top(&format!("hf:{T}")).unwrap();
+    // Fair, numbered past it, under the owner's key, not their signature.
+    let forged = room_signed("hfair", T, &who("mallory"), obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(9))]));
+    room.put_top(&format!("hf:{T}"), &with(&forged, "k", s(&room.owner.public)));
+    room.tick(REPUT_MS);
+    assert_eq!(room.top(&format!("hf:{T}")).and_then(|v| hb::canon(&v)), hb::canon(&setting));
+    assert!(room.records("o:").is_empty(), "still Friendly");
+    // The owner's own newer one stands.
+    room.set_fair(0, 4);
+    let newer = room.top(&format!("hf:{T}")).unwrap();
+    room.tick(REPUT_MS);
+    assert_eq!(room.top(&format!("hf:{T}")).and_then(|v| hb::canon(&v)), hb::canon(&newer));
+    assert_eq!(room.records("o:1:").len(), 1, "Fair: it joins");
+}
+
+#[test]
+fn a_signature_verdict_holds_only_where_it_was_given() {
+    let mut room = Room::new("scope", true);
+    room.set_fair(1, 1);
+    let rec = room.top(&format!("hf:{T}")).unwrap();
+    let (hash, g) = (hb::rec_hash(&rec).unwrap(), str_of(&rec, "g").unwrap().to_string());
+    let k = room.owner.public.clone();
+    assert!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g));
+    // The same record copied to another table, or another room.
+    assert!(!room.house.verified("hfair", [ROOM, "roulette-2", ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, "roulette-2", &rec), &g));
+    assert!(!room.house.verified("hfair", ["room-2", T, ""], &hash, &k, hb::room_sign_bytes("hfair", "room-2", T, &rec), &g));
+    assert!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g));
+}
+
+#[test]
+fn records_under_its_key_it_did_not_sign_are_not_its_own() {
+    let mut room = Room::new("forged-own", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    // A "reveal" of round 1000 and a "join" of round 1, the house's key on
+    // them, mallory's signature.
+    let mallory = who("mallory");
+    let fake = |kind: &str, body: CVal| with(&signed(kind, &mallory, body), "k", s(room.house.public()));
+    let h = fake("hreveal", obj(vec![("r", CVal::Int(1000)), ("s", s(&"0".repeat(64))), ("x", CVal::Arr(vec![])), ("n", CVal::Arr(vec![]))]));
+    let o = fake("hcommit", obj(vec![("r", CVal::Int(1)), ("c", s(&room.commit(1)))]));
+    room.put('h', &h);
+    room.put('o', &o);
+    room.tick(0);
+    let joins = room.records("o:1:");
+    assert_eq!(joins.len(), 2, "it joins round 1 itself");
+    let mine: Vec<_> = joins.iter().filter(|(_, v)| hb::canon(v) != hb::canon(&o)).collect();
+    assert_eq!(mine.len(), 1);
+    assert_house_rec(&room, "hcommit", &mine[0].1);
+    // ...and reveals it.
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+#[test]
+fn a_close_skipping_rounds_is_not_on_the_chain() {
+    let mut room = Room::new("jump", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    // Round 50 "after" round 1: it would make round 1 one with a later round
+    // on top, and the next round to join 51.
+    let a50 = room.slip(&alice, 50);
+    room.close(&alice, 50, &c, &[("alice", &a50)], None);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+    for _ in 0..5 {
+        room.tick(1_000);
+    }
+    assert!(room.records("o:51:").is_empty());
+}
+
+#[test]
+fn reveals_one_close_a_round_and_carries_on_its_line_alone() {
+    let mut room = Room::new("rivals", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c1, a, b) = room.closed_on_the_join(&alice, &bob);
+    // A rival close of round 1, by bob, freezing bob alone.
+    let c1b = room.close(&bob, 1, "g", &[("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let h = &room.records("h:1:")[0].1;
+    let x = strs(h, "x");
+    assert_eq!(x.len(), 1, "one close: {x:?}");
+    let (picked, other) = if x[0] == c1 { (c1.clone(), c1b.clone()) } else { (c1b.clone(), c1.clone()) };
+    let frozen = if picked == c1 { sorted(vec![a.clone(), b.clone()]) } else { vec![b.clone()] };
+    assert_eq!(strs(h, "n"), frozen, "the slips of that close alone");
+
+    // Round 2 on the close it passed over, naming the commitment it carried:
+    // never revealed.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &other, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..20 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:2:").is_empty());
+    // On the close it decided: revealed.
+    let d = room.close(&bob, 2, &picked, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:2:")[0].1, "x"), vec![d]);
 }
 
 #[test]

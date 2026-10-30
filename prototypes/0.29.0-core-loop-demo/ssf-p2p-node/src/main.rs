@@ -3733,7 +3733,7 @@ async fn house_loop(hub: SharedHub) {
         tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
         let updates = house_tick(&hub);
         for (room_id, update) in updates {
-            send_house_update(&hub, &room_id, update).await;
+            send_house_update(&hub, &room_id, update, false).await;
         }
     }
 }
@@ -3758,8 +3758,9 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Step the house down in every served room now, and send it: how many
-/// records it wrote. Waits for the sends (at most ~1 s), as the app gives
-/// it one second before it stops the node.
+/// records it wrote. Waits until each tab and peer has acknowledged it (at
+/// most 900 ms, as the app gives the node about a second before it stops
+/// it): bytes still in a buffer when the node stops are a void for nothing.
 async fn house_step_down(hub: &SharedHub) -> usize {
     let Some(house) = hub.house.as_ref() else { return 0 };
     house.lock().unwrap().begin_step_down();
@@ -3781,7 +3782,7 @@ async fn house_step_down(hub: &SharedHub) -> usize {
     let mut sends = Vec::new();
     for (room_id, update, n) in updates {
         wrote += n;
-        sends.extend(send_house_update(hub, &room_id, update).await);
+        sends.extend(send_house_update(hub, &room_id, update, true).await);
     }
     let left = std::time::Duration::from_millis(900).saturating_sub(started.elapsed());
     let _ = tokio::time::timeout(left, futures_join(sends)).await;
@@ -3798,8 +3799,9 @@ async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
 /// updates go: a ysync frame (sync, update) to this node's own tabs and to
 /// the room's mesh neighbours, kept for their lazy pulls and in the dedup
 /// cache so an echo can't come back as new. Unsigned at the envelope, as the
-/// node's other answers are: each record carries its own signature.
-async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>) -> Vec<tokio::task::JoinHandle<()>> {
+/// node's other answers are: each record carries its own signature. With
+/// `acked`, each send ends once the other side has acknowledged all of it.
+async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>, acked: bool) -> Vec<tokio::task::JoinHandle<()>> {
     let mut encoder = EncoderV1::new();
     encoder.write_var(0u32); // messageType = Sync
     encoder.write_var(2u32); // syncSubType = Update
@@ -3842,8 +3844,12 @@ async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>) -> V
         sends.push(tokio::spawn(async move {
             if let Ok(opening) = wt_conn.open_bi().await {
                 if let Ok((mut send_stream, _recv_stream)) = opening.await {
-                    let _ = send_stream.write_all(&len_bytes).await;
-                    let _ = send_stream.write_all(&bytes).await;
+                    let wrote = send_stream.write_all(&len_bytes).await.is_ok() && send_stream.write_all(&bytes).await.is_ok();
+                    if wrote && acked {
+                        // FIN, done once the tab has acknowledged every byte
+                        // (the page's reader ends the stream cleanly on it).
+                        let _ = send_stream.finish().await;
+                    }
                 }
             }
         }));
@@ -3852,9 +3858,12 @@ async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>) -> V
         let bytes = bytes.clone();
         sends.push(tokio::spawn(async move {
             if let Ok((mut send_stream, _recv_stream)) = peer_conn.open_bi().await {
-                let _ = send_stream.write_all(&len_bytes).await;
-                let _ = send_stream.write_all(&bytes).await;
+                let wrote = send_stream.write_all(&len_bytes).await.is_ok() && send_stream.write_all(&bytes).await.is_ok();
                 let _ = send_stream.finish(); // graceful FIN, not RESET (host->joiner fix)
+                if wrote && acked {
+                    // Resolves once the peer has acknowledged all of it.
+                    let _ = send_stream.stopped().await;
+                }
             }
         }));
     }

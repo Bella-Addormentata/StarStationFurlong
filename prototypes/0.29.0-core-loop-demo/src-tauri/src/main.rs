@@ -35,26 +35,44 @@ async fn rotate_fingerprint(hub: State<'_, SharedHub>) -> Result<Fingerprint, St
 
 /// 🏠 Ask the node we spawned to step its house down before it is stopped
 /// (ssf-p2p-node house.rs): the tables it runs go on Friendly with no void.
-/// Its local HTTP API (8080, or 8081 when that was taken), one second at
-/// most; a node that doesn't answer is stopped all the same.
+/// Its local HTTP API (8080, or 8081 when that was taken), a second and a
+/// half at most in all; a node that doesn't answer is stopped all the same.
 fn house_step_down() {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
-    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_millis(1_500);
+    let left = || deadline.saturating_duration_since(Instant::now());
     for port in [8080u16, 8081] {
+        if left().is_zero() {
+            return;
+        }
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else { continue };
-        let left = Duration::from_millis(1_000).saturating_sub(started.elapsed()).max(Duration::from_millis(50));
-        let _ = stream.set_write_timeout(Some(left));
-        let _ = stream.set_read_timeout(Some(left));
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, left().min(Duration::from_millis(200))) else { continue };
+        let _ = stream.set_write_timeout(Some(left().max(Duration::from_millis(1))));
         let req = "POST /api/house/stepdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         if stream.write_all(req.as_bytes()).is_err() {
             continue;
         }
+        // The answer is a few hundred bytes: read at most 4 KB, by the
+        // deadline, so whatever listens there can't hold the app's exit.
         let mut answer = Vec::new();
-        let _ = stream.read_to_end(&mut answer);
-        if answer.starts_with(b"HTTP/1.1 200") {
+        let mut buf = [0u8; 512];
+        while answer.len() < 4_096 {
+            let wait = left();
+            if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+                break;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => answer.extend_from_slice(&buf[..n]),
+            }
+        }
+        // The node's own answer ({"ok":true,"wrote":N}), not any server's 200:
+        // something else on 8080 sends us on to 8081.
+        let text = String::from_utf8_lossy(&answer);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.trim_start()).unwrap_or("");
+        if text.starts_with("HTTP/1.1 200") && body.starts_with("{\"ok\":true,\"wrote\":") {
             println!("🏠 The node's house stepped down");
             return;
         }

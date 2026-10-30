@@ -69,10 +69,14 @@ interface TableRead {
   slips: Map<string, Slip>;
   /** `${r}|${pid}` → the seeds revealed. */
   seeds: Map<string, string[]>;
-  /** Closes on the chain, by round order. */
+  /** Closes on the chain (parent the session or a close of the round
+   *  before; after a round this house decided, the close it decided), by
+   *  round order. */
   closes: Close[];
   abandoned: Set<string>;
-  ownReveals: { r: number; c: string | undefined }[];
+  /** Its own reveals (x: the close it decided; none, a step-down) and joins,
+   *  as it signed them. */
+  ownReveals: { r: number; c: string | undefined; x: string[] }[];
   ownJoins: { r: number; c: string }[];
 }
 
@@ -142,21 +146,25 @@ export class SimHouse {
     return { ...body, g: houseSign(this.secret, signBytes(kind, ctx, body)) };
   }
 
-  private verified(id: string, k: string, bytes: () => Uint8Array, g: string): boolean {
-    let ok = this.verdicts.get(id);
+  /** Whether `g` is `k`'s signature of `bytes`, checked once per `id`: kind,
+   *  room, table, incarnation and record hash (the signed bytes are bound to
+   *  each: a copy elsewhere is checked anew). */
+  private verified(id: [string, string, string, string, string], k: string, bytes: () => Uint8Array, g: string): boolean {
+    const key = JSON.stringify(id);
+    let ok = this.verdicts.get(key);
     if (ok === undefined) {
       try {
         ok = verifyIdentityStrict(k, bytes(), g);
       } catch {
         ok = false;
       }
-      this.verdicts.set(id, ok);
+      this.verdicts.set(key, ok);
     }
     return ok;
   }
 
   private roomOk(kind: RoomKind, room: string, t: string, v: Record<string, unknown>, k: string): boolean {
-    return this.verified(`${kind}|${recHash(v)}`, k, () => roomSignBytes(kind, room, t, v), v.g as string);
+    return this.verified([kind, room, t, '', recHash(v) ?? ''], k, () => roomSignBytes(kind, room, t, v), v.g as string);
   }
 
   private doneOf(ctx: FoldCtx): number {
@@ -207,7 +215,9 @@ export class SimHouse {
     if (!delegation) return writes;
     mem.delegation = delegation;
 
-    // The owner's Fair settings, newest first seen.
+    // The owner's Fair settings, newest first seen (a new deed holder's count
+    // afresh: the last one's settings go).
+    for (const [t, v] of mem.fair) if (v.k !== ownerKey) mem.fair.delete(t);
     for (const [key, v] of comp.entries()) {
       if (!key.startsWith('hf:') || key.length <= 3) continue;
       const t = key.slice(3);
@@ -241,8 +251,12 @@ export class SimHouse {
 
     // The heartbeat, while a table runs Fair.
     if (fairTables > 0 && !this.steppingDown && (mem.lastBeat === null || now - mem.lastBeat >= HEARTBEAT_MS)) {
-      const inDoc = (comp.get(beatKey(this.pub)) as { n?: unknown } | undefined)?.n;
-      const n = Math.max(Math.min(wall, Number.MAX_SAFE_INTEGER), (isRound(inDoc) ? inDoc : 0) + 1, mem.beatN + 1);
+      // It counts on from the doc's beat only as it signed it: a peer's copy
+      // with a higher count would push its own past what the pages take.
+      const beat = comp.get(beatKey(this.pub));
+      const inDoc = isPlain(beat) && hasFields(beat, ['v', 'n', 'k', 'g']) && beat.v === 1 && beat.k === this.pub && isRound(beat.n)
+        && this.roomOk('hbeat', room, '', beat, this.pub) ? beat.n as number : 0;
+      const n = Math.min(Math.max(Math.min(wall, Number.MAX_SAFE_INTEGER), inDoc + 1, mem.beatN + 1), Number.MAX_SAFE_INTEGER);
       const body = { v: 1, n, k: this.pub };
       writes.push({ ses: null, key: beatKey(this.pub), value: { ...body, g: houseSign(this.secret, roomSignBytes('hbeat', room, '', body)) } });
       mem.beatN = n;
@@ -258,11 +272,12 @@ export class SimHouse {
         writes.push({ ses: null, key: delegKey, value: delegation });
         out.putBacks += 1;
       }
+      // Each table's setting is the newest the deed holder signed, as read
+      // above: anything else in its place goes, a forged one with a higher
+      // count included.
       for (const [t, rec] of mem.fair) {
         const key = `hf:${t}`;
-        const nowV = comp.get(key) as { s?: unknown } | undefined;
-        const nowS = isRound(nowV?.s) ? nowV!.s as number : 0;
-        if (nowS < (rec.s as number) || (nowS === rec.s && !same(nowV, rec))) {
+        if (!same(comp.get(key), rec)) {
           writes.push({ ses: null, key, value: rec });
           out.putBacks += 1;
         }
@@ -296,6 +311,7 @@ export class SimHouse {
     };
     const closes: [Close, Record<string, unknown>][] = [];
     const abandons: [string, string, Record<string, unknown>][] = [];
+    const own: ['h' | 'o', number, string, Record<string, unknown>][] = [];
     let n = 0;
     for (const [key, v] of (ses as Y.Map<unknown>).entries()) {
       if (n++ >= MAX_SESSION_KEYS) break;
@@ -337,16 +353,25 @@ export class SimHouse {
           if (hasFields(v, ['r', 'x', 'k', 'g']) && gOk && isHex(HEX32)(v.x) && k) abandons.push([v.x as string, k, v]);
           break;
         }
-        case 'h': {
-          if (k === this.pub) read.ownReveals.push({ r: pk.r, c: typeof v.c === 'string' ? v.c : undefined });
-          break;
-        }
+        case 'h':
         case 'o': {
-          if (k === this.pub && typeof v.c === 'string') read.ownJoins.push({ r: pk.r, c: v.c });
+          if (k === this.pub && gOk) own.push([pk.kind, pk.r, pk.h, v]);
           break;
         }
         default:
       }
+    }
+    // Its own records count as it signed them: a peer's copy under its key (a
+    // reveal of a high round, say) would stop it joining and revealing.
+    const at = (kind: string, hash: string): [string, string, string, string, string] => [kind, ctx.room, ctx.t, ctx.inc, hash];
+    for (const [kind, r, hash, v] of own) {
+      const signed = kind === 'h' ? 'hreveal' : 'hcommit';
+      const shapeOk = kind === 'h' ? hasFields(v, ['r', 's', 'x', 'n', 'k', 'g'], ['c']) : hasFields(v, ['r', 'c', 'k', 'g']);
+      if (!shapeOk || !this.verified(at(signed, hash), this.pub, () => signBytes(signed, ctx, v), v.g as string)) continue;
+      if (kind === 'h') {
+        const x = Array.isArray(v.x) ? v.x.filter((h): h is string => typeof h === 'string') : [];
+        read.ownReveals.push({ r, c: typeof v.c === 'string' ? v.c : undefined, x });
+      } else if (typeof v.c === 'string') read.ownJoins.push({ r, c: v.c });
     }
     // A close counts when one of the slips it freezes is its signer's...
     const good: Close[] = [];
@@ -355,21 +380,24 @@ export class SimHouse {
         const s = read.slips.get(sh);
         return s !== undefined && s.pid === p && s.r === c.r && s.k === c.k;
       });
-      if (signer && this.verified(`close|${c.hash}`, c.k, () => signBytes('close', ctx, v), v.g as string)) good.push(c);
+      if (signer && this.verified(at('close', c.hash), c.k, () => signBytes('close', ctx, v), v.g as string)) good.push(c);
     }
     // ...and its parent is the session (its first round) or a close counted
-    // at the round before.
+    // at the round before, no round skipped; after a round this house
+    // decided, the close it decided: it reveals one close a round, and
+    // carries on that line alone, so no rival gets a second look.
     good.sort((a, b) => a.r - b.r);
-    const onChain = new Set<string>();
+    const onChain = new Map<string, number>();
     for (const c of good) {
-      const ok = c.r === read.baseU + 1 ? c.q === sid : c.r > read.baseU + 1 && onChain.has(c.q);
-      if (!ok) continue;
-      onChain.add(c.hash);
+      const parentOk = c.r === read.baseU + 1 ? c.q === sid : c.r > read.baseU + 1 && onChain.get(c.q) === c.r - 1;
+      const decided = read.ownReveals.filter((h) => h.r === c.r - 1).flatMap((h) => h.x);
+      if (!parentOk || (decided.length > 0 && !decided.includes(c.q))) continue;
+      onChain.set(c.hash, c.r);
       read.closes.push(c);
     }
     for (const [x, k, v] of abandons) {
       if (!onChain.has(x) || read.abandoned.has(x)) continue;
-      if (this.verified(`abandon|${recHash(v)}`, k, () => signBytes('abandon', ctx, v), v.g as string)) read.abandoned.add(x);
+      if (this.verified(at('abandon', recHash(v) ?? ''), k, () => signBytes('abandon', ctx, v), v.g as string)) read.abandoned.add(x);
     }
     return read;
   }
@@ -438,12 +466,11 @@ export class SimHouse {
       const due = allIn || now >= t0 + graceOf(t0, times);
       if (this.steppingDown && !allIn) break;
       if (!due) break;
-      const n: string[] = [];
-      for (const c of listed) {
-        for (const [, sh] of c.f) if (mem.seedSeen.has(sh) && !n.includes(sh) && n.length < MAX_HOUSE_COUNTED) n.push(sh);
-      }
-      n.sort();
-      const x = listed.map((c) => c.hash).sort();
+      // The best-ranked close alone, and the slips it froze whose seeds it
+      // saw: listing a rival too would show both outcomes, and let a bettor
+      // carry on the one they liked.
+      const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem!.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
+      const x = [best.hash];
       this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, r);
       const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x, n };
       if (!friendly && !this.steppingDown) body.c = this.commit(ctx, r + 1);

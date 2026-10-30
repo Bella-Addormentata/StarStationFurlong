@@ -2534,7 +2534,9 @@ function computedPinOf(pid: string): string | undefined {
 let housePinned = new Set<string>();
 /** The delegations this page counted, to put back if they go (putBackHouseRecords). */
 let houseDelegations = new Map<string, DelegationRec>();
-/** Verdicts on the room records' signatures, by recHash. */
+/** Verdicts on the room records' signatures, by kind, room, table and
+ *  recHash (the signed bytes are bound to each: a copy elsewhere is checked
+ *  anew). */
 let houseVerdicts = new Map<string, boolean>();
 /** Each house's highest heartbeat seen, and when (this page's clock). */
 let houseBeats = new Map<string, { n: number; at: number }>();
@@ -2551,18 +2553,20 @@ function deedHolderKey(): string | null | undefined {
   return computedPinOf(owner);
 }
 
-/** A room record's signature (computedHouse roomSignBytes), checked once. */
+/** A room record's signature (computedHouse roomSignBytes), checked once
+ *  for its kind and table. */
 function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }): boolean {
   const hash = recHash(rec);
   if (hash === null) return false;
-  let ok = houseVerdicts.get(hash);
+  const id = JSON.stringify([kind, boundRoomId, t, hash]);
+  let ok = houseVerdicts.get(id);
   if (ok === undefined) {
     try {
       ok = (verifyWith ?? verifyIdentityStrict)(rec.k, roomSignBytes(kind, boundRoomId, t, rec), rec.g) === true;
     } catch {
       ok = false;
     }
-    houseVerdicts.set(hash, ok);
+    houseVerdicts.set(id, ok);
   }
   return ok;
 }
@@ -2603,15 +2607,22 @@ function houseChangedAll(dirty?: Set<ComputedInc>): void {
 }
 
 /** Note table `t`'s Fair setting as the doc holds it now, if the deed holder
- *  signed it and it is newer than any this page saw. */
+ *  signed it and it is newer than any this page saw of theirs. */
 function noteFairSetting(t: string): void {
   const rec = asFairSetting(computedMap?.get(fairSettingKey(t)));
   if (!rec) return;
   const owner = deedHolderKey();
   if (!owner || rec.k !== owner) return;
-  const seen = fairSeen.get(t);
+  const seen = fairOf(t);
   if (seen && seen.s >= rec.s) return;
   if (roomRecOk('hfair', t, rec)) fairSeen.set(t, rec);
+}
+
+/** The newest Fair setting of table `t` this page saw by the deed holder as
+ *  they are now (a new holder's settings count afresh), or undefined. */
+function fairOf(t: string): FairSettingRec | undefined {
+  const rec = fairSeen.get(t);
+  return rec && rec.k === deedHolderKey() ? rec : undefined;
 }
 
 /** Note a house's heartbeat as the doc holds it now: by a house, newer than
@@ -2635,14 +2646,14 @@ export function holdsDeed(): boolean {
 /** 🏠 The order number (`s`) of the newest Fair setting of table `tableId`
  *  this page has seen by the deed holder, or 0: a new one must pass it. */
 export function fairSettingSeq(tableId: string): number {
-  return fairSeen.get(tableId)?.s ?? 0;
+  return fairOf(tableId)?.s ?? 0;
 }
 
 /** 🏠 The owner's Fair setting for table `tableId`: 'friendly' when the
  *  newest one the deed holder signed (as this page has seen them) says so,
  *  else 'fair' (no record: Fair while the house is online). */
 export function readFairSetting(tableId: string): 'fair' | 'friendly' {
-  return fairSeen.get(tableId)?.m === 1 ? 'friendly' : 'fair';
+  return fairOf(tableId)?.m === 1 ? 'friendly' : 'fair';
 }
 
 /** 🏠 When this page last heard any house of the room (its clock), or null. */
@@ -2706,9 +2717,18 @@ export function putBackHouseRecords(): number {
     const now = asDelegation(map.get(delegationKey(pub)));
     if (!now || recHash(now) !== recHash(rec)) back.push([delegationKey(pub), rec]);
   }
-  for (const [t, rec] of fairSeen) {
+  for (const t of fairSeen.keys()) {
+    const rec = fairOf(t);
+    if (!rec) continue;
     const now = asFairSetting(map.get(fairSettingKey(t)));
-    if (!now || now.s < rec.s || (now.s === rec.s && recHash(now) !== recHash(rec))) back.push([fairSettingKey(t), rec]);
+    if (now && recHash(now) === recHash(rec)) continue;
+    // A newer one by the deed holder that this page hasn't noted yet stands;
+    // anything else goes, a forged one with a higher count included.
+    if (now && now.k === rec.k && now.s > rec.s && roomRecOk('hfair', t, now)) {
+      fairSeen.set(t, now);
+      continue;
+    }
+    back.push([fairSettingKey(t), rec]);
   }
   if (back.length === 0) return 0;
   boundDoc!.transact(() => {

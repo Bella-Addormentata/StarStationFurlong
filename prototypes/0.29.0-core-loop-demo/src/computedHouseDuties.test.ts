@@ -150,10 +150,33 @@ describe('the Fair setting', () => {
     expect(b.casino.readFairSetting(TABLE)).toBe('fair');
     run([b], T0 + 2_000, T0 + 2_000, { step: STEP });
     expect(top(b).get(fairSettingKey(TABLE))).toMatchObject({ m: 0, s: T0 + 1 });
-    // One the deed holder never signed counts nothing.
+    // One the deed holder never signed counts nothing, and goes back too,
+    // for all its higher number.
     const forged = { v: 1, m: 1, s: T0 + 5, k: a.pub, g: 'A'.repeat(86) };
     b.doc.transact(() => top(b).set(fairSettingKey(TABLE), forged));
     expect(b.casino.readFairSetting(TABLE)).toBe('fair');
+    run([b], T0 + 4_000, T0 + 4_000, { step: STEP });
+    expect(top(b).get(fairSettingKey(TABLE))).toMatchObject({ m: 0, s: T0 + 1, k: a.pub });
+    expect(b.casino.fairSettingSeq(TABLE)).toBe(T0 + 1);
+  });
+
+  it('one signed for a table counts at no other, whichever this page checks first', async () => {
+    const pages = await houseRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    expect(a.table.setComputedFairness(TABLE, 'friendly', T0)).toBe('ok');
+    const rec = top(a).get(fairSettingKey(TABLE));
+    const OTHER = 'roulette-other';
+    // c sees a copy at another table's key before the genuine one.
+    c.doc.transact(() => top(c).set(fairSettingKey(OTHER), rec));
+    sync(T0, a, b, c);
+    for (const p of [b, c]) {
+      expect(p.casino.readFairSetting(TABLE)).toBe('friendly');
+      expect(p.casino.readFairSetting(OTHER)).toBe('fair');
+    }
+    // b, which checked the genuine one first, as the copy comes again.
+    b.doc.transact(() => top(b).delete(fairSettingKey(OTHER)));
+    b.doc.transact(() => top(b).set(fairSettingKey(OTHER), rec));
+    expect(b.casino.readFairSetting(OTHER)).toBe('fair');
   });
 });
 
