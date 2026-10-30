@@ -1,5 +1,5 @@
 {
-  "note": "Bytes the owner's node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank('close'). houseRecords: the house's reveals and join, signed by node \"one\". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic).",
+  "note": "Bytes the owner's node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank('close'). houseRecords: the house's reveals and join, signed by node \"one\". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic). felts: a slip's felt `b` and whether the fold takes a slip holding it (asSlipFor; house.rs felt_ok).",
   "canon": [
     {
       "value": "plain",
@@ -616,6 +616,677 @@
         "bytes": "a62903c2a585a0ec240dc70cfa7695a50cdca83ea25a5ac1fa63a9dea5285779",
         "sig": "9DVzh77lCGE3uFGmvRb1bHmuFl2kcWKTjAV783zm6agTFwmTq2FeAGW1VcLRyzEkduQ2JLxxI5xvwKQ-AJB-Dg"
       }
+    }
+  ],
+  "felts": [
+    {
+      "game": "roulette",
+      "b": [],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 25
+        },
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 17
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 0
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 36
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 37
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": -1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "dozen",
+          "amount": 5,
+          "pick": 2
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "dozen",
+          "amount": 5,
+          "pick": 3
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "column",
+          "amount": 5,
+          "pick": 0
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5,
+          "pick": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 0
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": -5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": "5"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "purple",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": 5,
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5,
+          "x": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        null
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        "red"
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        []
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": "red",
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": {},
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 5
+        },
+        {
+          "type": "pass",
+          "amount": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 10
+        },
+        {
+          "type": "field",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1
+        },
+        {
+          "type": "pass",
+          "amount": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 7
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 10
+        },
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        },
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 10
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "hard",
+          "amount": 5,
+          "pick": 6
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "hard",
+          "amount": 5,
+          "pick": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 7
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5
+        },
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 4
+        },
+        {
+          "type": "come",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "dontcome",
+          "amount": 5,
+          "pick": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "comeodds",
+          "amount": 5,
+          "pick": 9
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "comeodds",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "dontcomeodds",
+          "amount": 5,
+          "pick": 8
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 0
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": "5"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1000000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1000000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 500000000000
+        },
+        {
+          "type": "pass",
+          "amount": 500000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 500000000000
+        },
+        {
+          "type": "pass",
+          "amount": 500000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "passodds",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "purple",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1,
+          "x": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        null
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": "pass",
+      "ok": false
     }
   ]
 }

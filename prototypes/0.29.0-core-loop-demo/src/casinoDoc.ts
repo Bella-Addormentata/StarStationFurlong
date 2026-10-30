@@ -2529,9 +2529,12 @@ function computedPinOf(pid: string): string | undefined {
 
 // ── 🏠 The house (computedHouse.ts: its room records) ───────────────────────
 
-/** House keys this page has seen delegated by the room's deed holder: a
- *  house for the binding's life, so a delete can't stall a round it decides. */
-let housePinned = new Set<string>();
+/** House keys this page has seen delegated, each with the deed holder's key
+ *  that signed it: a house while that key holds the deed, so a delete can't
+ *  stall a round it decides. A handover ends the old holder's houses on every
+ *  page alike: a deed's history isn't signed, so nothing in the doc can tell
+ *  a page loaded later that the old holder held it when a round was decided. */
+let housePinned = new Map<string, string>();
 /** The delegations this page counted, to put back if they go (putBackHouseRecords). */
 let houseDelegations = new Map<string, DelegationRec>();
 /** Verdicts on the room records' signatures, by kind, room, table and
@@ -2573,20 +2576,26 @@ function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }): bo
 
 /** 🏠 Whether `pub` is a house of the bound room (computedFold HouseCheck): its
  *  delegation (`hk:<pub>`) is there, signed by the deed holder's pinned key.
- *  True for good once seen. Never "not known yet": while the deed holder's
- *  key hasn't shown up it is false, and countTransaction asks again when it
- *  does (houseChangedAll). A pending answer would hold every spend in the
- *  casino (computedSettled) for as long as a forged delegation and a key
- *  that never comes stayed in the doc. */
+ *  True from then on while that key holds the deed (housePinned). Never "not
+ *  known yet": while the deed holder's key hasn't shown up it is false, and
+ *  countTransaction asks again when it does, or when the deed moves
+ *  (houseChangedAll). A pending answer would hold every spend in the casino
+ *  (computedSettled) for as long as a forged delegation and a key that never
+ *  comes stayed in the doc. */
 export function houseOkOf(pub: string): boolean {
-  if (housePinned.has(pub)) return true;
-  const rec = asDelegation(computedMap?.get(delegationKey(pub)));
-  if (!rec || rec.h !== pub) return false;
   const owner = deedHolderKey();
-  if (!owner || rec.k !== owner || !roomRecOk('hkey', '', rec)) return false;
-  housePinned.add(pub);
+  if (!owner) return false;
+  if (housePinned.get(pub) === owner) return true;
+  const rec = asDelegation(computedMap?.get(delegationKey(pub)));
+  if (!rec || rec.h !== pub || rec.k !== owner || !roomRecOk('hkey', '', rec)) return false;
+  housePinned.set(pub, owner);
   houseDelegations.set(pub, rec);
   return true;
+}
+
+/** Whether `pub` is pinned as a house under the deed holder as they are now. */
+function pinnedHouse(pub: string, owner = deedHolderKey()): boolean {
+  return !!owner && housePinned.get(pub) === owner;
 }
 
 /** Every fold asks its HouseCheck again (a delegation, or the deed holder's
@@ -2658,8 +2667,9 @@ export function readFairSetting(tableId: string): 'fair' | 'friendly' {
 
 /** 🏠 When this page last heard any house of the room (its clock), or null. */
 export function houseHeardAt(): number | null {
+  const owner = deedHolderKey();
   let at: number | null = null;
-  for (const [pub, b] of houseBeats) if (housePinned.has(pub) && (at === null || b.at > at)) at = b.at;
+  for (const [pub, b] of houseBeats) if (pinnedHouse(pub, owner) && (at === null || b.at > at)) at = b.at;
   return at;
 }
 
@@ -2673,7 +2683,8 @@ export function houseOnline(now = Date.now()): boolean {
 /** 🏠 Whether the room has a house at all: a delegation this page counted. */
 export function houseSetUp(): boolean {
   // (Pinned once counted: the plaque asks every frame.)
-  if (housePinned.size > 0) return true;
+  const owner = deedHolderKey();
+  for (const pub of housePinned.keys()) if (pinnedHouse(pub, owner)) return true;
   const map = computedMap;
   if (!map) return false;
   for (const key of map.keys()) {
@@ -2708,12 +2719,17 @@ export function writeFairSetting(tableId: string, rec: FairSettingRec): void {
 }
 
 /** 🏠 Put back what a delete or an older copy took away: each delegation this
- *  page counted, and each table's newest Fair setting. Returns how many. */
+ *  page counted by the deed holder as they are now, and each table's newest
+ *  Fair setting. Returns how many. */
 export function putBackHouseRecords(): number {
   if (!docAlive() || !computedMap) return 0;
   const map = computedMap;
   const back: [string, unknown][] = [];
-  for (const [pub, rec] of houseDelegations) {
+  for (const pub of houseDelegations.keys()) {
+    // A previous holder's delegation would stand over the new holder's own
+    // (houseOkOf takes the new holder's of the same key, if the doc holds it).
+    if (!houseOkOf(pub)) continue;
+    const rec = houseDelegations.get(pub)!;
     const now = asDelegation(map.get(delegationKey(pub)));
     if (!now || recHash(now) !== recHash(rec)) back.push([delegationKey(pub), rec]);
   }
@@ -2929,7 +2945,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   verifyQueued = false;
   verifySpent = 0;
   throwSeen = new Map();
-  housePinned = new Set();
+  housePinned = new Map();
   houseDelegations = new Map();
   houseVerdicts = new Map();
   houseBeats = new Map();
@@ -2976,7 +2992,7 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   if (top) {
     for (const key of top) {
       const house = key === null ? null : houseKeyParts(key);
-      if (house?.kind === 'hkey' && !housePinned.has(house.of)) houseMoved = true;
+      if (house?.kind === 'hkey' && !pinnedHouse(house.of)) houseMoved = true;
       else if (house?.kind === 'hbeat') noteBeat(house.of);
       else if (house?.kind === 'hfair') noteFairSetting(house.of);
       const at = key === null ? null : computedKeyParts(key);

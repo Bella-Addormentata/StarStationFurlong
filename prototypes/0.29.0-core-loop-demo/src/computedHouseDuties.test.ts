@@ -16,7 +16,7 @@ import type { CloseRec, FoldCtx } from './computedFold';
 import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './computedHouse';
 import { houseSign } from './computedHouse';
 import {
-  keysIn, openRoom, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, sync,
+  clockOf, keysIn, loadPage, openRoom, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, sync,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
@@ -319,6 +319,41 @@ describe('a Fair round on the pages', () => {
     run(pages, closedAt + 6_000 + STEP, closedAt + 12_000, { step: STEP, until: () => recOf(b, hr.key) !== undefined });
     expect(recOf(b, hr.key)).toEqual(hr.rec);
     expect(foldOf(b).rounds[0].decided).toBe('house');
+  });
+
+  it('a deed handover ends the old holder\'s house on every page alike, loaded before it or after, and the new holder\'s delegation of it stands', async () => {
+    const { pages, a, b, close, closedAt, closeHash } = await closedFairRound();
+    run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });
+    house(a, kit.houseReveal(H, 1, [closeHash], frozenOf(close)));
+    sync(closedAt + 2_000, ...pages);
+    for (const p of pages) expect(foldOf(p).rounds[0].decided).toBe('house');
+    // What a page reads of the house and the table, the same on every page.
+    const reading = (p: Page) => ({
+      house: p.casino.houseOkOf(H.pub), setUp: p.casino.houseSetUp(), rounds: foldOf(p).rounds.map((v) => [v.r, v.close, v.decided]),
+      chips: [a.pid, b.pid].map((pid) => p.casino.readChips(pid)),
+    });
+    // The deed goes to b (main.ts executeDeedHandover: the owner id, unsigned).
+    let T = closedAt + 4_000;
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', b.pid));
+    sync(T, ...pages);
+    const c = await loadPage('C', 3);
+    clockOf(c, T);
+    const all = [...pages, c];
+    sync(T, ...all);
+    for (const p of all) expect(reading(p), p.name).toEqual({ ...reading(c), house: false, setUp: false });
+    // a's page doesn't put its delegation back over the new holder's own, of
+    // the same node.
+    b.table.setLocalHouse(H.pub);
+    run(all, T + STEP, T + 6_000, { step: STEP });
+    T += 6_000;
+    const d = await loadPage('D', 4);
+    clockOf(d, T);
+    all.push(d);
+    sync(T, ...all);
+    for (const p of all) {
+      expect(top(p).get(delegationKey(H.pub)), p.name).toMatchObject({ h: H.pub, k: b.pub });
+      expect(reading(p), p.name).toEqual({ ...reading(d), house: true, setUp: true });
+    }
   });
 });
 

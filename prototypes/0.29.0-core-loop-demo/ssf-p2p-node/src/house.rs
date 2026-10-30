@@ -138,6 +138,82 @@ fn has_fields(v: &CVal, required: &[&str], optional: &[&str]) -> bool {
         && required.iter().all(|k| v.get(k).is_some())
 }
 
+/// games/roulette.ts and games/craps.ts BET_TYPES; computedFold
+/// MAX_SLIP_BETS, computedCraps MAX_CRAPS_SPOTS and MAX_FELT_STAKE, craps.ts
+/// MAX_BET_AMOUNT (a roulette record's), POINT_NUMBERS and HARD_NUMBERS.
+const ROULETTE_BETS: &[&str] = &["straight", "red", "black", "odd", "even", "low", "high", "dozen", "column"];
+const CRAPS_BETS: &[&str] = &[
+    "pass", "dontpass", "come", "dontcome", "field", "place", "big6", "big8", "hard", "anyseven", "anycraps", "two", "three", "yo",
+    "twelve", "passodds", "dontpassodds", "comeodds", "dontcomeodds",
+];
+const MAX_SLIP_BETS: usize = 400;
+const MAX_CRAPS_SPOTS: usize = 49;
+const MAX_FELT_STAKE: i64 = 1_000_000_000_000;
+const MAX_BET_AMOUNT: i64 = 1_000_000_000;
+const POINT_NUMBERS: &[i64] = &[4, 5, 6, 8, 9, 10];
+const HARD_NUMBERS: &[i64] = &[4, 6, 8, 10];
+
+/// A slip's felt as the fold reads it (computedFold asSlip isFelt, asCrapsSlip
+/// isCanonFelt): a close signed over a felt the pages throw out counts on no
+/// page, so the house must not reveal it either.
+fn felt_ok(craps: bool, b: &[CVal]) -> bool {
+    if !craps {
+        // Exactly {type, amount}, plus `pick` for the three that have one.
+        return b.len() <= MAX_SLIP_BETS
+            && b.iter().all(|e| {
+                let (Some(t), Some(amount)) = (str_of(e, "type"), e.get("amount").and_then(CVal::as_int)) else { return false };
+                if !ROULETTE_BETS.contains(&t) || amount < 1 || amount > MAX_BET_AMOUNT {
+                    return false;
+                }
+                let pick = e.get("pick").and_then(CVal::as_int);
+                match t {
+                    "straight" => has_fields(e, &["type", "amount", "pick"], &[]) && pick.is_some_and(|p| (0..=36).contains(&p)),
+                    "dozen" | "column" => has_fields(e, &["type", "amount", "pick"], &[]) && pick.is_some_and(|p| (0..=2).contains(&p)),
+                    _ => has_fields(e, &["type", "amount"], &[]),
+                }
+            });
+    }
+    // Canonical: {type, amount} or {type, pick, amount}, the pick the type
+    // allows, ascending by spot (`type:pick`), MAX_FELT_STAKE in all.
+    if b.len() > MAX_CRAPS_SPOTS {
+        return false;
+    }
+    let mut last = String::new();
+    let mut sum: i64 = 0;
+    for (i, e) in b.iter().enumerate() {
+        if !has_fields(e, &["type", "amount"], &["pick"]) {
+            return false;
+        }
+        let (Some(t), Some(amount)) = (str_of(e, "type"), e.get("amount").and_then(CVal::as_int)) else { return false };
+        if !CRAPS_BETS.contains(&t) || amount < 1 || amount > MAX_FELT_STAKE {
+            return false;
+        }
+        let pick = match e.get("pick") {
+            None => None,
+            Some(p) => match p.as_int() {
+                Some(p) => Some(p),
+                None => return false,
+            },
+        };
+        let pick_ok = match t {
+            "place" | "comeodds" | "dontcomeodds" => pick.is_some_and(|p| POINT_NUMBERS.contains(&p)),
+            "hard" => pick.is_some_and(|p| HARD_NUMBERS.contains(&p)),
+            "come" | "dontcome" => pick.is_none_or(|p| POINT_NUMBERS.contains(&p)),
+            _ => pick.is_none(),
+        };
+        let spot = format!("{t}:{}", pick.map(|p| p.to_string()).unwrap_or_default());
+        if !pick_ok || (i > 0 && spot <= last) {
+            return false;
+        }
+        last = spot;
+        sum += amount;
+        if sum > MAX_FELT_STAKE {
+            return false;
+        }
+    }
+    true
+}
+
 /// The game of an incarnation (computedFold gameOfInc): `k…` and `d…` craps.
 fn craps_inc(inc: &str) -> bool {
     inc.starts_with('k') || inc.starts_with('d')
@@ -226,6 +302,9 @@ struct Slip {
     pid: String,
     c: String,
     k: String,
+    /// Chips on it: only such a slip can sign a close.
+    chips: bool,
+    v: CVal,
 }
 
 #[derive(Clone, Debug)]
@@ -311,7 +390,7 @@ struct TableMem {
 
 #[derive(Default)]
 struct RoomMem {
-    /// Each owner id's key as first seen (trust on first use, as the pages pin).
+    /// Each player's key as first seen (trust on first use, as the pages pin).
     pins: HashMap<String, String>,
     /// The delegation as first verified (pinned for the run, put back).
     delegation: Option<CVal>,
@@ -323,12 +402,24 @@ struct RoomMem {
     last_reput: Option<u64>,
 }
 
+/// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
+/// round it revealed or stepped down, the close it decided there (none: a
+/// step-down), and whether that reveal carried the next round's commitment.
+/// The doc's copy of the reveal can be deleted; the line the next round must
+/// carry on, and the commitment it must name, hold all the same.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Done {
+    r: i64,
+    x: Option<String>,
+    c: bool,
+}
+
 /// The house of this node: its key, what it has revealed, what it has seen.
 pub struct House {
     key: HouseKey,
     state_path: Option<PathBuf>,
-    /// (room, t, inc) → the highest round revealed or stepped down.
-    done: HashMap<(String, String, String), i64>,
+    /// (room, t, inc) → what it last revealed or stepped down.
+    done: HashMap<(String, String, String), Done>,
     rooms: HashMap<String, RoomMem>,
     /// Signature verdicts by kind, room, table, incarnation and record hash
     /// (the signed bytes are bound to each: a copy elsewhere is checked anew).
@@ -403,15 +494,38 @@ impl House {
         ok
     }
 
+    /// Player `pid`'s key as this house first saw it in the room's players
+    /// map (trust on first use, as the pages pin: casinoDoc computedPinOf).
+    fn pin_of<T: ReadTxn>(&mut self, room: &str, txn: &T, pid: &str) -> Option<String> {
+        let mem = self.rooms.get_mut(room)?;
+        if let Some(k) = mem.pins.get(pid) {
+            return Some(k.clone());
+        }
+        let k = txn.get_map("players").and_then(|m| match m.get(txn, pid) {
+            Some(Out::Any(Any::Map(entry))) => match entry.get("keyB64") {
+                Some(Any::String(k)) if !k.is_empty() && k.len() <= 128 => Some(k.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })?;
+        mem.pins.insert(pid.to_string(), k.clone());
+        Some(k)
+    }
+
+    fn last_of(&self, ctx: &Ctx) -> Option<&Done> {
+        self.done.get(&(ctx.room.clone(), ctx.t.clone(), ctx.inc.clone()))
+    }
+
     fn done_of(&self, ctx: &Ctx) -> i64 {
-        *self.done.get(&(ctx.room.clone(), ctx.t.clone(), ctx.inc.clone())).unwrap_or(&0)
+        self.last_of(ctx).map_or(0, |d| d.r)
     }
 
     /// Note round r revealed (or stepped down), on disk first: false when it
     /// could not be written, and then nothing is revealed.
-    fn mark_done(&mut self, ctx: &Ctx, r: i64) -> bool {
+    fn mark_done(&mut self, ctx: &Ctx, done: Done) -> bool {
         let key = (ctx.room.clone(), ctx.t.clone(), ctx.inc.clone());
-        let was = self.done.insert(key.clone(), r);
+        let r = done.r;
+        let was = self.done.insert(key.clone(), done);
         if let Some(path) = &self.state_path {
             if let Err(e) = write_state(path, &self.done) {
                 eprintln!("🏠 house: cannot write {}: {e} — not revealing round {r} of {}", path.display(), ctx.t);
@@ -458,23 +572,8 @@ impl House {
             _ => None,
         });
         let Some(owner) = owner else { return writes };
-        let mem = self.rooms.entry(room.to_string()).or_default();
-        if !mem.pins.contains_key(&owner) {
-            let key = txn.get_map("players").and_then(|m| match m.get(&txn, &owner) {
-                Some(Out::Any(Any::Map(entry))) => match entry.get("keyB64") {
-                    Some(Any::String(k)) if !k.is_empty() && k.len() <= 128 => Some(k.to_string()),
-                    _ => None,
-                },
-                _ => None,
-            });
-            match key {
-                Some(k) => {
-                    mem.pins.insert(owner.clone(), k);
-                }
-                None => return writes,
-            }
-        }
-        let owner_key = mem.pins[&owner].clone();
+        self.rooms.entry(room.to_string()).or_default();
+        let Some(owner_key) = self.pin_of(room, &txn, &owner) else { return writes };
 
         // The delegation: this house's key, signed by the deed holder.
         let deleg_key = format!("hk:{pub_key}");
@@ -603,8 +702,13 @@ impl House {
             }
             for table in mem.tables.values() {
                 for (ses, key, value) in &table.written {
+                    // There as it wrote it: junk under its key reads as
+                    // nothing on every page, and goes too.
                     let present = match comp.get(&txn, ses) {
-                        Some(Out::YMap(m)) => m.contains_key(&txn, key),
+                        Some(Out::YMap(m)) => match m.get(&txn, key) {
+                            Some(Out::Any(any)) => hb::rec_hash(&CVal::from_any(&any)) == hb::rec_hash(value),
+                            _ => false,
+                        },
                         _ => true,
                     };
                     let queued = writes.iter().any(|w| matches!(w, Write::Session { key: k, .. } if k == key));
@@ -663,14 +767,19 @@ impl House {
             match kind {
                 's' => {
                     let fields_ok = if craps {
-                        has_fields(&v, &["r", "p", "v", "b", "o", "c", "k", "g"], &["t", "l"]) && str_of(&v, "o").is_some_and(|o| hex_of(o, 32))
+                        has_fields(&v, &["r", "p", "v", "b", "o", "c", "k", "g"], &["t", "l"])
+                            && str_of(&v, "o").is_some_and(|o| hex_of(o, 32))
+                            && v.get("t").is_none_or(|t| t.as_int().is_some_and(|t| (1..=7).contains(&t)))
+                            && v.get("l").is_none_or(|l| l.as_int() == Some(1))
                     } else {
                         has_fields(&v, &["r", "p", "v", "b", "c", "k", "g"], &[])
                     };
                     let c = str_of(&v, "c").filter(|c| hex_of(c, 64));
-                    if fields_ok && g_ok && v.get("b").and_then(CVal::as_arr).is_some() && is_round(v.get("v")).is_some() {
-                        if let (Some(c), Some(k)) = (c, k) {
-                            read.slips.insert(h.to_string(), Slip { r, pid: pid.unwrap().to_string(), c: c.to_string(), k });
+                    let felt = v.get("b").and_then(CVal::as_arr).filter(|b| felt_ok(craps, b));
+                    if fields_ok && g_ok && is_round(v.get("v")).is_some() && pid.is_some_and(is_pid) {
+                        if let (Some(c), Some(k), Some(b)) = (c, k, felt) {
+                            let chips = !b.is_empty();
+                            read.slips.insert(h.to_string(), Slip { r, pid: pid.unwrap().to_string(), c: c.to_string(), k, chips, v });
                         }
                     }
                 }
@@ -733,10 +842,24 @@ impl House {
             }
         }
 
-        // A close counts when it is signed by one of the slips it freezes.
+        // A close counts when it is signed by one of the slips it freezes,
+        // that slip as the pages take it (computedFold closeInfo): its
+        // player's pinned key, its signature, chips on it. One the pages
+        // throw out would only void the round's real close if revealed.
         let mut good: Vec<Close> = Vec::new();
         for (c, v) in closes {
-            let signer = c.f.iter().any(|(p, sh)| read.slips.get(sh).is_some_and(|s| s.pid == *p && s.r == c.r && s.k == c.k));
+            let mut signer = false;
+            for (p, sh) in &c.f {
+                let Some(s) = read.slips.get(sh) else { continue };
+                if s.pid != *p || s.r != c.r || s.k != c.k || !s.chips || self.pin_of(&read.ctx.room, txn, p).as_deref() != Some(s.k.as_str()) {
+                    continue;
+                }
+                let g = str_of(&s.v, "g").unwrap_or("").to_string();
+                if self.verified("slip", at, sh, &s.k, hb::sign_bytes("slip", &read.ctx, &s.v), &g) {
+                    signer = true;
+                    break;
+                }
+            }
             if !signer {
                 continue;
             }
@@ -751,11 +874,18 @@ impl House {
         // and carries on that line alone, so no rival gets a second look.
         good.sort_by_key(|c| c.r);
         let sid = read.ses_key.rsplit(':').next().unwrap_or("").to_string();
+        let last = self.last_of(&read.ctx).cloned();
         let mut on_chain: HashMap<String, i64> = HashMap::new();
         for c in good {
             let parent_ok = if c.r == read.base_u + 1 { c.q == sid } else { c.r > read.base_u + 1 && on_chain.get(&c.q) == Some(&(c.r - 1)) };
-            let decided: Vec<&String> = read.own_reveals.iter().filter(|h| h.r == c.r - 1).flat_map(|h| &h.x).collect();
-            if parent_ok && (decided.is_empty() || decided.contains(&&c.q)) {
+            let mut decided: Vec<&String> = read.own_reveals.iter().filter(|h| h.r == c.r - 1).flat_map(|h| &h.x).collect();
+            // (Its own memory too: a peer can delete the reveal from the doc.)
+            if let Some(Done { r, x: Some(x), .. }) = &last {
+                if *r == c.r - 1 && *r > read.base_u {
+                    decided.push(x);
+                }
+            }
+            if parent_ok && (decided.is_empty() || decided.iter().all(|x| **x == c.q)) {
                 on_chain.insert(c.hash.clone(), c.r);
                 read.closes.push(c);
             }
@@ -780,6 +910,7 @@ impl House {
         let carried = |r: i64, me: &House| {
             let c = me.commit(ctx, r);
             read.own_reveals.iter().any(|h| h.r == r - 1 && h.c.as_deref() == Some(c.as_str()))
+                || me.last_of(ctx).is_some_and(|d| d.r == r - 1 && d.c)
                 || (r == read.base_u + 1 && read.cp_h.as_deref() == Some(c.as_str()))
         };
         let joined = |r: i64, me: &House| {
@@ -868,7 +999,7 @@ impl House {
             n.truncate(MAX_HOUSE_COUNTED);
             let x = vec![best.hash.clone()];
             let next = (!friendly && !self.stepping_down).then(|| self.commit(ctx, r + 1));
-            if !self.mark_done(ctx, r) {
+            if !self.mark_done(ctx, Done { r, x: Some(best.hash.clone()), c: next.is_some() }) {
                 break;
             }
             let mut body = vec![
@@ -900,7 +1031,7 @@ impl House {
             if read.closes_at(r).any(|c| c.h.as_deref() == Some(commit.as_str())) {
                 return;
             }
-            if !self.mark_done(ctx, r) {
+            if !self.mark_done(ctx, Done { r, x: None, c: false }) {
                 return;
             }
             let body = vec![
@@ -1013,24 +1144,36 @@ fn apply(doc: &Doc, writes: &[Write]) -> Option<Vec<u8>> {
 
 // ── The state file ───────────────────────────────────────────────────────────
 
-fn parse_state(bytes: &[u8]) -> Option<HashMap<(String, String, String), i64>> {
+/// The state file: `{"v": 2, "done": [[room, t, inc, r, x | null, c], …]}`
+/// (v 1 rows, `[room, t, inc, r]`, read as having decided nothing to carry on).
+fn parse_state(bytes: &[u8]) -> Option<HashMap<(String, String, String), Done>> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    if v.get("v")?.as_u64()? != 1 {
+    let version = v.get("v")?.as_u64()?;
+    if version != 1 && version != 2 {
         return None;
     }
     let mut out = HashMap::new();
     for row in v.get("done")?.as_array()? {
         let row = row.as_array()?;
         let (room, t, inc, r) = (row.first()?.as_str()?, row.get(1)?.as_str()?, row.get(2)?.as_str()?, row.get(3)?.as_i64()?);
-        out.insert((room.to_string(), t.to_string(), inc.to_string()), r);
+        let done = if version == 1 {
+            (row.len() == 4).then_some(Done { r, x: None, c: false })?
+        } else {
+            let x = match row.get(4)? {
+                serde_json::Value::Null => None,
+                x => Some(x.as_str().filter(|x| hex_of(x, 32))?.to_string()),
+            };
+            (row.len() == 6).then_some(Done { r, x, c: row.get(5)?.as_bool()? })?
+        };
+        out.insert((room.to_string(), t.to_string(), inc.to_string()), done);
     }
     Some(out)
 }
 
-fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), i64>) -> std::io::Result<()> {
-    let mut rows: Vec<_> = done.iter().map(|((room, t, inc), r)| serde_json::json!([room, t, inc, r])).collect();
+fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), Done>) -> std::io::Result<()> {
+    let mut rows: Vec<_> = done.iter().map(|((room, t, inc), d)| serde_json::json!([room, t, inc, d.r, d.x, d.c])).collect();
     rows.sort_by_key(|row| row.to_string());
-    let body = serde_json::to_vec(&serde_json::json!({ "v": 1, "done": rows }))?;
+    let body = serde_json::to_vec(&serde_json::json!({ "v": 2, "done": rows }))?;
     let tmp = path.with_extension("json.tmp");
     {
         use std::io::Write as _;

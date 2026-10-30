@@ -26,7 +26,7 @@
 
 import * as Y from 'yjs';
 import {
-  asCheckpointFor, dutyRank, gameOfInc, hasFields, houseCommitOf, houseRules, isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND,
+  asCheckpointFor, asSlipFor, dutyRank, hasFields, houseCommitOf, houseRules, isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND,
   MAX_FROZEN, MAX_HOUSE_COUNTED, nextSid, parseKey, recHash, signBytes, slipCommit,
 } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
@@ -58,7 +58,9 @@ const isRound = (v: unknown): v is number => Number.isSafeInteger(v) && (v as nu
 /** casinoDoc isPlayerKey: 1–256 UTF-16 units, not `__proto__`. */
 const isPid = (s: string): boolean => s.length > 0 && s.length <= 256 && s !== '__proto__';
 
-interface Slip { r: number; pid: string; c: string; k: string }
+/** A slip as the fold reads it (asSlipFor): `chips`, something on it (only
+ *  such a slip can sign a close). */
+interface Slip { r: number; pid: string; c: string; k: string; chips: boolean; v: Record<string, unknown> }
 interface Close { hash: string; r: number; q: string; f: [string, string][]; k: string; h: string | undefined; rank: string }
 
 interface TableRead {
@@ -92,6 +94,7 @@ interface TableMem {
 }
 
 interface RoomMem {
+  /** Each player's key as first seen (trust on first use, as the pages pin). */
   pins: Map<string, string>;
   delegation: Record<string, unknown> | null;
   fair: Map<string, Record<string, unknown>>;
@@ -101,6 +104,12 @@ interface RoomMem {
   lastReput: number | null;
 }
 
+/** What it last did at a table (house.rs Done, in its state file): the
+ *  highest round revealed or stepped down, the close it decided there (none:
+ *  a step-down), and whether that reveal carried the next commitment. The
+ *  doc's copy of the reveal can be deleted; these hold all the same. */
+interface Done { r: number; x: string | undefined; c: boolean }
+
 type Write = { ses: string; key: string; value: Record<string, unknown> } | { ses: null; key: string; value: Record<string, unknown> };
 
 /** What one tick wrote, by kind (for a scenario's counters). */
@@ -109,9 +118,9 @@ export interface HouseTickOut { joins: number; reveals: number; stepDowns: numbe
 /** The house of a node whose secret key is `secret` (32 bytes). */
 export class SimHouse {
   readonly pub: string;
-  /** (room|t|inc) → the highest round revealed or stepped down: house.rs's
-   *  state file. */
-  readonly done = new Map<string, number>();
+  /** (room|t|inc) → what it last revealed or stepped down: house.rs's state
+   *  file. */
+  readonly done = new Map<string, Done>();
   private rooms = new Map<string, RoomMem>();
   private verdicts = new Map<string, boolean>();
   steppingDown = false;
@@ -167,8 +176,25 @@ export class SimHouse {
     return this.verified([kind, room, t, '', recHash(v) ?? ''], k, () => roomSignBytes(kind, room, t, v), v.g as string);
   }
 
+  private lastOf(ctx: FoldCtx): Done | undefined {
+    return this.done.get(`${ctx.room}|${ctx.t}|${ctx.inc}`);
+  }
+
   private doneOf(ctx: FoldCtx): number {
-    return this.done.get(`${ctx.room}|${ctx.t}|${ctx.inc}`) ?? 0;
+    return this.lastOf(ctx)?.r ?? 0;
+  }
+
+  /** Player `pid`'s key as this house first saw it in the room's players map
+   *  (trust on first use, as the pages pin: casinoDoc computedPinOf). */
+  private pinOf(mem: RoomMem, doc: Y.Doc, pid: string): string | undefined {
+    let k = mem.pins.get(pid);
+    if (k === undefined) {
+      const entry = doc.getMap('players').get(pid) as { keyB64?: unknown } | undefined;
+      const seen = isPlain(entry) ? entry.keyB64 : undefined;
+      if (typeof seen !== 'string' || seen === '' || seen.length > 128) return undefined;
+      mem.pins.set(pid, k = seen);
+    }
+    return k;
   }
 
   /** One tick in room `room` (doc `doc`), `now` the node's monotonic clock and
@@ -196,13 +222,9 @@ export class SimHouse {
     if (typeof owner !== 'string' || owner === '' || owner === 'Local-Clone') return writes;
     let mem = this.rooms.get(room);
     if (!mem) this.rooms.set(room, mem = { pins: new Map(), delegation: null, fair: new Map(), tables: new Map(), lastBeat: null, beatN: 0, lastReput: null });
-    if (!mem.pins.has(owner)) {
-      const entry = doc.getMap('players').get(owner) as { keyB64?: unknown } | undefined;
-      const k = entry?.keyB64;
-      if (typeof k !== 'string' || k === '' || k.length > 128) return writes;
-      mem.pins.set(owner, k);
-    }
-    const ownerKey = mem.pins.get(owner)!;
+    const roomMem = mem;
+    const ownerKey = this.pinOf(roomMem, doc, owner);
+    if (ownerKey === undefined) return writes;
 
     // The delegation: this house's key, signed by the deed holder.
     const delegKey = delegationKey(this.pub);
@@ -242,7 +264,7 @@ export class SimHouse {
 
     let fairTables = 0;
     for (const [t, inc] of tables) {
-      const read = this.readTable(comp, { room, t, inc });
+      const read = this.readTable(comp, { room, t, inc }, (pid) => this.pinOf(roomMem, doc, pid));
       if (!read) continue;
       const friendly = mem.fair.get(t)?.m === 1;
       if (!friendly) fairTables += 1;
@@ -284,8 +306,10 @@ export class SimHouse {
       }
       for (const table of mem.tables.values()) {
         for (const [ses, key, value] of table.written) {
+          // There as it wrote it: junk under its key reads as nothing on
+          // every page, and goes too.
           const m = comp.get(ses);
-          const present = m instanceof Y.Map ? m.has(key) : true;
+          const present = m instanceof Y.Map ? same(m.get(key), value) : true;
           if (!present && !writes.some((w) => w.ses !== null && w.key === key)) {
             writes.push({ ses, key, value });
             out.putBacks += 1;
@@ -298,14 +322,14 @@ export class SimHouse {
 
   /** Table ctx's live session, as house.rs read_table reads it (null with
    *  none, or once its incarnation has ended). */
-  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx): TableRead | null {
+  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx, pinOf: (pid: string) => string | undefined): TableRead | null {
     const cp = asCheckpointFor(ctx)(comp.get(`sum:${ctx.t}:${ctx.inc}`));
     if (cp?.e === 1) return null;
     const sid = nextSid(ctx, cp);
     const sesKey = `ses:${ctx.t}:${ctx.inc}:${sid}`;
     const ses = comp.get(sesKey);
     if (!(ses instanceof Y.Map)) return null;
-    const craps = gameOfInc(ctx.inc) === 'craps';
+    const asSlip = asSlipFor(ctx);
     const read: TableRead = {
       ctx, baseU: cp?.u ?? 0, cpH: cp?.h, sesKey, slips: new Map(), seeds: new Map(), closes: [], abandoned: new Set(), ownReveals: [], ownJoins: [],
     };
@@ -324,12 +348,11 @@ export class SimHouse {
       const gOk = isSig(v.g);
       switch (pk.kind) {
         case 's': {
-          const fieldsOk = craps
-            ? hasFields(v, ['r', 'p', 'v', 'b', 'o', 'c', 'k', 'g'], ['t', 'l']) && isHex(HEX32)(v.o)
-            : hasFields(v, ['r', 'p', 'v', 'b', 'c', 'k', 'g']);
-          if (fieldsOk && gOk && Array.isArray(v.b) && isRound(v.v) && isHex(HEX64)(v.c) && k) {
-            read.slips.set(pk.h, { r: pk.r, pid: pk.pid!, c: v.c as string, k });
-          }
+          // As the fold reads it, its felt included: a close signed over a
+          // felt the pages throw out counts on no page, so the house must not
+          // reveal it either.
+          const s = asSlip(v);
+          if (s) read.slips.set(pk.h, { r: pk.r, pid: pk.pid!, c: s.c, k: s.k, chips: s.b.length > 0, v });
           break;
         }
         case 'x': {
@@ -373,12 +396,16 @@ export class SimHouse {
         read.ownReveals.push({ r, c: typeof v.c === 'string' ? v.c : undefined, x });
       } else if (typeof v.c === 'string') read.ownJoins.push({ r, c: v.c });
     }
-    // A close counts when one of the slips it freezes is its signer's...
+    // A close counts when one of the slips it freezes is its signer's, that
+    // slip as the pages take it (computedFold closeInfo): its player's pinned
+    // key, its signature, chips on it. One the pages throw out would only
+    // void the round's real close if revealed...
     const good: Close[] = [];
     for (const [c, v] of closes) {
       const signer = c.f.some(([p, sh]) => {
         const s = read.slips.get(sh);
-        return s !== undefined && s.pid === p && s.r === c.r && s.k === c.k;
+        return s !== undefined && s.pid === p && s.r === c.r && s.k === c.k && s.chips && pinOf(p) === s.k
+          && this.verified(at('slip', sh), s.k, () => signBytes('slip', ctx, s.v), s.v.g as string);
       });
       if (signer && this.verified(at('close', c.hash), c.k, () => signBytes('close', ctx, v), v.g as string)) good.push(c);
     }
@@ -387,11 +414,14 @@ export class SimHouse {
     // decided, the close it decided: it reveals one close a round, and
     // carries on that line alone, so no rival gets a second look.
     good.sort((a, b) => a.r - b.r);
+    const last = this.lastOf(ctx);
     const onChain = new Map<string, number>();
     for (const c of good) {
       const parentOk = c.r === read.baseU + 1 ? c.q === sid : c.r > read.baseU + 1 && onChain.get(c.q) === c.r - 1;
       const decided = read.ownReveals.filter((h) => h.r === c.r - 1).flatMap((h) => h.x);
-      if (!parentOk || (decided.length > 0 && !decided.includes(c.q))) continue;
+      // (Its own memory too: a peer can delete the reveal from the doc.)
+      if (last?.x !== undefined && last.r === c.r - 1 && last.r > read.baseU) decided.push(last.x);
+      if (!parentOk || !decided.every((x) => x === c.q)) continue;
       onChain.set(c.hash, c.r);
       read.closes.push(c);
     }
@@ -408,7 +438,9 @@ export class SimHouse {
     let done = Math.max(this.doneOf(ctx), ...read.ownReveals.map((h) => h.r));
     const carried = (r: number): boolean => {
       const c = this.commit(ctx, r);
-      return read.ownReveals.some((h) => h.r === r - 1 && h.c === c) || (r === read.baseU + 1 && read.cpH === c);
+      const last = this.lastOf(ctx);
+      return read.ownReveals.some((h) => h.r === r - 1 && h.c === c) || (last?.r === r - 1 && last.c)
+        || (r === read.baseU + 1 && read.cpH === c);
     };
     const joined = (r: number): boolean => {
       const c = this.commit(ctx, r);
@@ -471,9 +503,10 @@ export class SimHouse {
       // carry on the one they liked.
       const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem!.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
       const x = [best.hash];
-      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, r);
+      const next = !friendly && !this.steppingDown;
+      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, { r, x: best.hash, c: next });
       const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x, n };
-      if (!friendly && !this.steppingDown) body.c = this.commit(ctx, r + 1);
+      if (next) body.c = this.commit(ctx, r + 1);
       body.k = this.pub;
       this.writeSession(mem, read.sesKey, 'h', r, this.signed('hreveal', ctx, body), writes);
       out.reveals += 1;
@@ -495,7 +528,7 @@ export class SimHouse {
       if (r === null) return;
       const commit = this.commit(ctx, r);
       if (closesAt(r).some((c) => c.h === commit)) return;
-      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, r);
+      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, { r, x: undefined, c: false });
       this.writeSession(mem, read.sesKey, 'h', r, this.signed('hreveal', ctx, { r, s: this.seed(ctx, r), x: [], n: [], k: this.pub }), writes);
       out.stepDowns += 1;
       return;

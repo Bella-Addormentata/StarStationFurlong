@@ -145,6 +145,15 @@ impl Room {
         key
     }
 
+    /// Put `v` under `key` in the live session as it is (junk included).
+    fn put_raw(&self, key: &str, v: &CVal) {
+        let ses = self.ses_key();
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, to_any(v));
+    }
+
     fn delete(&self, key: &str) {
         let ses = self.ses_key();
         let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
@@ -156,10 +165,15 @@ impl Room {
         }
     }
 
-    /// A slip by `w` at round r with seed seed_of(w, r): (its key, its hash).
+    /// A slip by `w` at round r with seed seed_of(w, r), 5 on red: its hash.
     fn slip(&self, w: &Who, r: i64) -> String {
+        self.slip_on(w, r, CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])]))
+    }
+
+    /// The same with felt `b`.
+    fn slip_on(&self, w: &Who, r: i64, b: CVal) -> String {
         let c = hb::slip_commit(&ctx(), r, &w.pid, &seed_of(&w.pid, r));
-        let body = obj(vec![("r", CVal::Int(r)), ("p", s(&w.pid)), ("v", CVal::Int(1)), ("b", CVal::Arr(vec![])), ("c", s(&c))]);
+        let body = obj(vec![("r", CVal::Int(r)), ("p", s(&w.pid)), ("v", CVal::Int(1)), ("b", b), ("c", s(&c))]);
         let rec = signed("slip", w, body);
         self.put('s', &rec);
         hb::rec_hash(&rec).unwrap()
@@ -846,4 +860,153 @@ fn keys_parse_as_the_fold_parses_them() {
     for bad in [format!("c:0:{h}"), format!("c:01:{h}"), format!("c:1:x:{h}"), format!("s:1:{h}"), format!("q:1:{h}"), format!("c:1:{}", &h[1..])] {
         assert_eq!(parse_key(&bad), None, "{bad}");
     }
+}
+
+#[test]
+fn closes_signed_over_a_slip_the_pages_refuse_are_never_revealed() {
+    let red5 = || CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])]);
+    let mallory = who("mallory");
+    // The signer's slip: no chips; bets no table takes; under mallory's id
+    // with carol's key; mallory's, its signature forged.
+    let cases: Vec<(&str, Box<dyn Fn(&Room) -> (String, Who)>)> = vec![
+        ("empty", Box::new(|room: &Room| (room.slip_on(&who("mallory"), 1, CVal::Arr(vec![])), who("mallory")))),
+        ("junk bets", Box::new(|room: &Room| (room.slip_on(&who("mallory"), 1, CVal::Arr(vec![obj(vec![("type", s("purple")), ("amount", CVal::Int(5))])])), who("mallory")))),
+        ("another's key", Box::new(move |room: &Room| {
+            let carol = who("carol");
+            let c = hb::slip_commit(&ctx(), 1, "mallory", &seed_of("mallory", 1));
+            let body = obj(vec![("r", CVal::Int(1)), ("p", s("mallory")), ("v", CVal::Int(1)), ("b", red5()), ("c", s(&c))]);
+            let rec = signed("slip", &carol, body);
+            room.put('s', &rec);
+            (hb::rec_hash(&rec).unwrap(), carol)
+        })),
+        ("forged signature", Box::new(|room: &Room| {
+            let m = who("mallory");
+            let c = hb::slip_commit(&ctx(), 1, "mallory", &seed_of("mallory", 1));
+            let body = obj(vec![("r", CVal::Int(1)), ("p", s("mallory")), ("v", CVal::Int(1)), ("b", CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])])), ("c", s(&c))]);
+            let rec = with(&signed("slip", &m, body), "g", s(&"A".repeat(86)));
+            room.put('s', &rec);
+            (hb::rec_hash(&rec).unwrap(), m)
+        })),
+    ];
+    for (name, slip) in cases {
+        let mut room = Room::new(&format!("signer-{}", name.replace(' ', "-").replace('\'', "")), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.tick(0);
+        let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+        let (m, signer) = slip(&room);
+        room.close(&signer, 1, "g", &[("alice", &a), ("bob", &b), ("mallory", &m)], Some(&room.commit(1)));
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.reveal(&mallory, 1);
+        for _ in 0..20 {
+            room.tick(1_000);
+        }
+        assert!(room.records("h:").is_empty(), "{name}");
+        // The round's real close is revealed when it comes.
+        let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+        room.tick(200);
+        assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c], "{name}");
+    }
+}
+
+#[test]
+fn a_deleted_reveal_still_holds_the_line_it_decided_across_a_restart() {
+    let mut room = Room::new("deleted", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c1, _, b) = room.closed_on_the_join(&alice, &bob);
+    let c1b = room.close(&bob, 1, "g", &[("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let (key, h) = room.records("h:1:")[0].clone();
+    let picked = strs(&h, "x")[0].clone();
+    let other = if picked == c1 { c1b } else { c1 };
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(room.dir.join(STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(state["v"], 2);
+    assert_eq!(state["done"][0], serde_json::json!([ROOM, T, INC, 1, picked, true]));
+    // A peer deletes the reveal; the node restarts, so it has no copy to put
+    // back. Round 2 still asks for the commitment it carried: no join, and a
+    // close on the close it passed over is never revealed.
+    room.delete(&key);
+    room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+    room.house.settle_ms = 0;
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &other, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..20 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:2:").is_empty());
+    assert!(room.records("o:2:").is_empty(), "no join of a round its reveal carried");
+    let d = room.close(&bob, 2, &picked, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:2:")[0].1, "x"), vec![d]);
+}
+
+#[test]
+fn a_state_file_from_before_the_decided_close_reads_as_nothing_to_carry_on() {
+    let dir = scratch("state-v1");
+    let path = dir.join(STATE_FILE);
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({ "v": 1, "done": [[ROOM, T, INC, 4]] })).unwrap()).unwrap();
+    let house = House::open(&NODE, Some(path)).unwrap();
+    assert_eq!(house.last_of(&ctx()), Some(&Done { r: 4, x: None, c: false }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn junk_under_the_key_of_its_reveal_is_put_back_over() {
+    let mut room = Room::new("junk-key", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let (key, rec) = room.records("h:1:")[0].clone();
+    room.put_raw(&key, &obj(vec![("r", CVal::Int(1)), ("s", s("junk"))]));
+    room.tick(REPUT_MS);
+    let back = room.records("h:1:");
+    assert_eq!(back.len(), 1);
+    assert_eq!(hb::canon(&back[0].1), hb::canon(&rec));
+}
+
+#[test]
+fn felts_read_as_the_fold_reads_them() {
+    // test-vectors/computed-house-v1.json `felts`: each with whether the
+    // fold (asSlipFor) takes a slip holding it.
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/computed-house-v1.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let cases = v["felts"].as_array().unwrap();
+    assert!(cases.len() >= 60);
+    for case in cases {
+        let craps = case["game"] == "craps";
+        let b = CVal::from_json(&case["b"]);
+        let ok = b.as_arr().is_some_and(|b| felt_ok(craps, b));
+        assert_eq!(ok, case["ok"].as_bool().unwrap(), "{case}");
+    }
+    // The caps on a felt's length (computedFold MAX_SLIP_BETS, computedCraps
+    // MAX_CRAPS_SPOTS: every spot once is 49 of them).
+    let red = obj(vec![("type", s("red")), ("amount", CVal::Int(1))]);
+    assert!(felt_ok(false, &vec![red.clone(); MAX_SLIP_BETS]));
+    assert!(!felt_ok(false, &vec![red; MAX_SLIP_BETS + 1]));
+    let mut spots: Vec<CVal> = Vec::new();
+    for t in CRAPS_BETS {
+        let picks: Vec<Option<i64>> = match *t {
+            "place" | "comeodds" | "dontcomeodds" => POINT_NUMBERS.iter().map(|p| Some(*p)).collect(),
+            "hard" => HARD_NUMBERS.iter().map(|p| Some(*p)).collect(),
+            "come" | "dontcome" => std::iter::once(None).chain(POINT_NUMBERS.iter().map(|p| Some(*p))).collect(),
+            _ => vec![None],
+        };
+        for p in picks {
+            let mut fields = vec![("type", s(t)), ("amount", CVal::Int(1))];
+            if let Some(p) = p {
+                fields.push(("pick", CVal::Int(p)));
+            }
+            spots.push(obj(fields));
+        }
+    }
+    let spot = |e: &CVal| format!("{}:{}", str_of(e, "type").unwrap(), e.get("pick").and_then(CVal::as_int).map(|p| p.to_string()).unwrap_or_default());
+    spots.sort_by_key(spot);
+    assert_eq!(spots.len(), MAX_CRAPS_SPOTS);
+    assert!(felt_ok(true, &spots));
 }

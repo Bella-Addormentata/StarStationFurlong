@@ -12,7 +12,8 @@ import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './compute
 import type { RoomKind } from './computedHouse';
 import { SETTLE_MS, SimHouse } from './computedSimHouse';
 import { ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
-import type { Built } from './computedTestKit';
+import type { Built, TestIdentity } from './computedTestKit';
+import type { RouletteBet } from './games/roulette';
 
 const ROOM = 'room-twin';
 const T = 'roulette-1';
@@ -26,6 +27,7 @@ const OWNER = testIdentity('twin-owner', 'owner');
 const MALLORY = testIdentity('twin-mallory', 'mallory');
 const alice = testIdentity('twin-alice', 'alice');
 const bob = testIdentity('twin-bob', 'bob');
+const carol = testIdentity('twin-carol', 'carol');
 const BAD_SIG = 'A'.repeat(86);
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
@@ -44,7 +46,7 @@ class TwinRoom {
   constructor(two = false) {
     this.doc.transact(() => {
       this.doc.getMap('roomInfo').set('owner', OWNER.pid);
-      this.doc.getMap('players').set(OWNER.pid, { keyB64: OWNER.pub });
+      for (const id of [OWNER, MALLORY, alice, bob, carol]) this.doc.getMap('players').set(id.pid, { keyB64: id.pub });
       for (const [t, inc] of two ? [[T, INC], [T2, INC2]] : [[T, INC]]) {
         this.doc.getMap('casino').set(`cfg:computed:${t}`, { v: 1, inc });
         this.top().set(`ses:${t}:${inc}:${nextSid({ room: ROOM, t, inc }, null)}`, new Y.Map());
@@ -80,7 +82,11 @@ class TwinRoom {
 
   /** The live session's records under a key prefix (`h:1:`, `o:`). */
   recs(prefix: string, t = T, inc = INC): Record<string, unknown>[] {
-    return [...this.ses(t, inc).entries()].filter(([k]) => k.startsWith(prefix)).map(([, v]) => v as Record<string, unknown>);
+    return this.entries(prefix, t, inc).map(([, v]) => v);
+  }
+
+  entries(prefix: string, t = T, inc = INC): [string, Record<string, unknown>][] {
+    return [...this.ses(t, inc).entries()].filter(([k]) => k.startsWith(prefix)) as [string, Record<string, unknown>][];
   }
 
   /** Round 1 closed by alice on the house's join, alice and bob frozen. */
@@ -188,5 +194,78 @@ describe('the simulations\' house, as house.rs', () => {
     expect(room.house.wrote.stepDowns).toBe(1);
     expect(room.recs('h:1:', T)).toHaveLength(1);
     expect(room.recs('h:', T2, INC2)).toHaveLength(0);
+  });
+
+  it('reveals no close signed over a slip the pages refuse', () => {
+    // (The kit builds no slip the fold would throw out.)
+    const junkSlip = (id: TestIdentity, r: number, b: unknown[]): Built<SlipRec> => {
+      const rec = kit.sign<SlipRec>('slip', id, { r, p: id.pid, v: 1, b: b as RouletteBet[], c: kit.commit(r, id.pid, kit.seed(id.pid, r)) });
+      return { key: `s:${r}:${id.pid}:${recHash(rec)}`, hash: recHash(rec)!, rec };
+    };
+    const forged = (b: Built<SlipRec>): Built<SlipRec> => {
+      const rec = { ...b.rec, g: BAD_SIG };
+      return { key: `s:${rec.r}:${rec.p}:${recHash(rec)}`, hash: recHash(rec)!, rec };
+    };
+    // The signer's slip: no chips; bets no table takes; under mallory's id
+    // with carol's key; mallory's, its signature forged.
+    const cases: [string, () => [Built<SlipRec>, TestIdentity]][] = [
+      ['empty', () => [kit.slip(MALLORY, 1, []), MALLORY]],
+      ['junk bets', () => [junkSlip(MALLORY, 1, [{ type: 'purple', amount: 5 }]), MALLORY]],
+      ['another\'s key', () => [kit.slip(carol, 1, [red(5)], { p: MALLORY.pid }), carol]],
+      ['forged signature', () => [forged(kit.slip(MALLORY, 1, [red(5)])), MALLORY]],
+    ];
+    for (const [name, slip] of cases) {
+      const room = new TwinRoom().start();
+      expect(room.recs('o:1:'), name).toHaveLength(1);
+      const [a, b] = [kit.slip(alice, 1, [red(5)]), kit.slip(bob, 1, [red(5)])];
+      const [m, signer] = slip();
+      room.put(a, b, m, kit.close(signer, 1, kit.sidAfter(null), [a, b, m], kit.houseCommit(H, 1)));
+      room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'), kit.reveal(1, MALLORY.pid));
+      for (let i = 0; i < 20; i++) room.tick(1_000);
+      expect(room.recs('h:'), name).toHaveLength(0);
+      // The round's real close is revealed when it comes.
+      const c = kit.close(alice, 1, kit.sidAfter(null), [a, b], kit.houseCommit(H, 1));
+      room.put(c);
+      room.tick(200);
+      expect(room.recs('h:1:').map((v) => v.x), name).toEqual([[c.hash]]);
+    }
+  });
+
+  it('a deleted reveal still holds the line it decided across a restart', () => {
+    const room = new TwinRoom().start();
+    const { c: c1, b } = room.closedOnTheJoin();
+    const c1b = kit.close(bob, 1, kit.sidAfter(null), [b], kit.houseCommit(H, 1));
+    room.put(c1b, kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.tick(200);
+    const [[key, h]] = room.entries('h:1:');
+    const picked = (h.x as string[])[0];
+    const other = picked === c1.hash ? c1b : c1;
+    expect(room.house.done.get(`${ROOM}|${T}|${INC}`)).toEqual({ r: 1, x: picked, c: true });
+    // A peer deletes the reveal; the node restarts, so it has no copy to put
+    // back. Round 2 still asks for the commitment it carried: no join, and a
+    // close on the close it passed over is never revealed.
+    room.doc.transact(() => room.ses().delete(key));
+    room.house.restart();
+    room.start();
+    const [a2, b2] = [kit.slip(alice, 2, [red(5)]), kit.slip(bob, 2, [red(5)])];
+    room.put(a2, b2, kit.close(alice, 2, other.hash, [a2, b2], kit.houseCommit(H, 2)), kit.reveal(2, 'alice'), kit.reveal(2, 'bob'));
+    for (let i = 0; i < 20; i++) room.tick(1_000);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    expect(room.recs('o:2:')).toHaveLength(0);
+    const d = kit.close(bob, 2, picked, [a2, b2], kit.houseCommit(H, 2));
+    room.put(d);
+    room.tick(200);
+    expect(room.recs('h:2:').map((v) => v.x)).toEqual([[d.hash]]);
+  });
+
+  it('puts its reveal back over junk under its key', () => {
+    const room = new TwinRoom().start();
+    room.closedOnTheJoin();
+    room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.tick(200);
+    const [[key, rec]] = room.entries('h:1:');
+    room.doc.transact(() => room.ses().set(key, { r: 1, s: 'junk' }));
+    room.tick(1_000);
+    expect(room.entries('h:1:')).toEqual([[key, rec]]);
   });
 });

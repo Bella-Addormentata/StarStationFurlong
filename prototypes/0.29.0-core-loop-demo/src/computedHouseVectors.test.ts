@@ -20,8 +20,9 @@ import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
 import { describe, expect, it } from 'vitest';
 import {
-  canon, closeKey, dutyRank, houseCommitKey, houseCommitOf, houseRevealKey, nextSid, recHash, signBytes, slipCommit,
+  asSlipFor, canon, closeKey, dutyRank, houseCommitKey, houseCommitOf, houseRevealKey, nextSid, recHash, signBytes, slipCommit,
 } from './computedFold';
+import { MAX_FELT_STAKE } from './computedCraps';
 import type { Checkpoint, FoldCtx, HouseCommitRec, HouseRevealRec, SignedKind } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairSettingKey, housePubOf, houseSeedOf, houseSign, roomSignBytes,
@@ -50,6 +51,34 @@ function canonCases(): { value: unknown; canon: string | null; hash: string | nu
     const c = canon(value);
     return { value, canon: c, hash: recHash(value) };
   });
+}
+
+/** Felts (a slip's `b`) and whether the fold takes a slip holding each
+ *  (asSlipFor): house.rs felt_ok must say the same, or it would reveal a
+ *  close no page counts. (Its caps on a felt's length, house.rs tests.) */
+function feltCases(): { game: 'roulette' | 'craps'; b: unknown; ok: boolean }[] {
+  const e = (type: unknown, amount: unknown, pick?: unknown) => ({ type, amount, ...(pick !== undefined ? { pick } : {}) });
+  const roulette: unknown[] = [
+    [], [e('red', 5)], [e('red', 25), e('straight', 5, 17)], [e('straight', 5, 0)], [e('straight', 5, 36)], [e('straight', 5, 37)],
+    [e('straight', 5, -1)], [e('straight', 5)], [e('straight', 5, 1.5)], [e('dozen', 5, 2)], [e('dozen', 5, 3)], [e('column', 5, 0)],
+    [e('red', 5, 1)], [e('red', 0)], [e('red', -5)], [e('red', 1_000_000_000)], [e('red', 1_000_000_001)], [e('red', 1.5)], [e('red', '5')],
+    [e('purple', 5)], [e(5, 5)], [{ type: 'red', amount: 5, x: 1 }], [{ type: 'red' }], [null], ['red'], [[]], 'red', {},
+  ];
+  const craps: unknown[] = [
+    [], [e('pass', 10)], [e('field', 5), e('pass', 10)], [e('pass', 10), e('field', 5)], [e('pass', 1), e('pass', 1)],
+    [e('place', 5, 4)], [e('place', 5, 7)], [e('place', 5)], [e('place', 5, 10), e('place', 5, 4)], [e('place', 5, 4), e('place', 5, 10)],
+    [e('hard', 5, 6)], [e('hard', 5, 5)], [e('come', 5)], [e('come', 5, 5)], [e('come', 5, 7)], [e('come', 5), e('come', 5, 4)],
+    [e('come', 5, 4), e('come', 5)], [e('dontcome', 5, 10)], [e('comeodds', 5, 9)], [e('comeodds', 5)], [e('dontcomeodds', 5, 8)],
+    [e('pass', 5, 4)], [e('pass', 0)], [e('pass', 1.5)], [e('pass', '5')], [e('pass', MAX_FELT_STAKE)], [e('pass', MAX_FELT_STAKE + 1)],
+    [e('field', MAX_FELT_STAKE / 2), e('pass', MAX_FELT_STAKE / 2)], [e('field', MAX_FELT_STAKE / 2), e('pass', MAX_FELT_STAKE / 2 + 1)],
+    [e('passodds', 5)], [e('purple', 5)], [e('red', 5)], [{ type: 'pass', amount: 1, x: 1 }], [{ type: 'pass' }], [null], 'pass',
+  ];
+  const slip = { r: 1, p: 'alice', v: 1, c: 'c'.repeat(64), k: 'K'.repeat(43), g: 'G'.repeat(86) };
+  const read = (ctx: FoldCtx, b: unknown) => asSlipFor(ctx)({ ...slip, b, ...(ctx === CRAPS_CTX ? { o: 'a'.repeat(32) } : {}) }) !== null;
+  return [
+    ...roulette.map((b) => ({ game: 'roulette' as const, b, ok: read(CTX, b) })),
+    ...craps.map((b) => ({ game: 'craps' as const, b, ok: read(CRAPS_CTX, b) })),
+  ];
 }
 
 function build(): Record<string, unknown> {
@@ -136,7 +165,7 @@ function build(): Record<string, unknown> {
   });
 
   return {
-    note: 'Bytes the owner\'s node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank(\'close\'). houseRecords: the house\'s reveals and join, signed by node "one". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic).',
+    note: 'Bytes the owner\'s node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank(\'close\'). houseRecords: the house\'s reveals and join, signed by node "one". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic). felts: a slip\'s felt `b` and whether the fold takes a slip holding it (asSlipFor; house.rs felt_ok).',
     canon: canonCases(),
     sessionRecords,
     houseRecords,
@@ -148,6 +177,7 @@ function build(): Record<string, unknown> {
       { ctx: CRAPS_CTX, r: 9, party: '', seed: seed4, commit: houseCommitOf(CRAPS_CTX, 9, seed4) },
     ],
     houses,
+    felts: feltCases(),
   };
 }
 

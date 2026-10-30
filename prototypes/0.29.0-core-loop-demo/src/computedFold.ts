@@ -597,8 +597,9 @@ export type SigCheck = (hash: string, kind: SignedKind, pub: string, bytes: () =
  * Whether a key is a house of this room (casinoDoc: delegated by the room's
  * deed holder): true/false = known; undefined = not known yet (the
  * delegation's signature, or the deed holder's key, still to come), which
- * marks the pass pending. Once true, true for good (the caller pins it).
- * The caller's: it calls TableFold.houseChanged when an answer may change.
+ * marks the pass pending. Once true, true while that deed holder holds the
+ * deed (the caller pins it). The caller's: it calls TableFold.houseChanged
+ * when an answer may change.
  * Without one, no key is a house.
  */
 export type HouseCheck = (pub: string) => boolean | undefined;
