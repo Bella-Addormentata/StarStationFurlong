@@ -9,7 +9,7 @@
  * machine leases, and leaving a room.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindCasinoDoc,
@@ -131,9 +131,19 @@ const TENURE = expect.stringMatching(/^[0-9a-f-]{36}$/);
 const spinning = (machineId: string): boolean =>
   readSlotMachineState(machineId)?.phase === 'spinning';
 
-/** Let the operator's async accept (it hashes the house seed) run out. */
+/** SHA-256 digests started and not yet finished. The operator's accepts,
+ *  settles and refunds wait on nothing else, so none in flight means they
+ *  have run out. */
+let digestsInFlight = 0;
+
+/** Let the operator's async accept (it hashes the house seed) run out: turns
+ *  of the event loop until no digest has been in flight for ten of them,
+ *  however long a loaded machine takes over each one. */
 async function acceptsDone(): Promise<void> {
-  for (let i = 0; i < 10; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  for (let quiet = 0; quiet < 10;) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    quiet = digestsInFlight === 0 ? quiet + 1 : 0;
+  }
 }
 
 /** Take the room's lease at `t`, then tick past the settling wait. */
@@ -143,6 +153,24 @@ function becomeOperator(machineIds: readonly string[], t = T0, manual = false): 
   tickSlotMachineRoom(machineIds, manual, ready);
   return ready;
 }
+
+// Every digest is counted while it runs (a plain wrapper, not a spy, so the
+// tests that spy on digest still can).
+beforeAll(() => {
+  const digest = SubtleCrypto.prototype.digest;
+  Object.defineProperty(crypto.subtle, 'digest', {
+    configurable: true,
+    writable: true,
+    value: (algorithm: AlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer> => {
+      digestsInFlight += 1;
+      return digest.call(crypto.subtle, algorithm, data).finally(() => { digestsInFlight -= 1; });
+    },
+  });
+});
+
+afterAll(() => {
+  delete (crypto.subtle as { digest?: unknown }).digest;
+});
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
