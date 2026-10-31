@@ -29,7 +29,7 @@ vi.mock('./stationPlan', async (importOriginal) => ({
 }));
 
 const { buildMapHologram, REFRESH_MS } = await import('./mapHologram');
-const { setSparkProvider } = await import('./mapHologramSplats');
+const { commitRoomSplatsFrame, setSparkProvider } = await import('./mapHologramSplats');
 const { FADE_SECONDS, PLOT_SECONDS, STATION_SECONDS } = await import('./mapHologramLayout');
 
 function module(roomId: string, x: number, z: number, opts: Partial<PlanModule> = {}): PlanModule {
@@ -206,6 +206,48 @@ describe('buildMapHologram', () => {
       let splatOpacity = -1;
       splatGroup!.traverse((o) => { if (o instanceof FakeSplatMesh && o.name === 'sun') splatOpacity = o.opacity; });
       expect(splatOpacity).toBeCloseTo(mat.opacity / base, 6);
+    } finally {
+      setSparkProvider(null);
+    }
+  });
+
+  it('draws the room\'s splats only while a table there shows its plot (#327)', async () => {
+    class FakeSplatMesh extends THREE.Object3D { packedSplats = { numSplats: 0 }; opacity = 1; constructor(o: { constructSplats?: (s: { pushSplat: () => void }) => void } = {}) { super(); o.constructSplats?.({ pushSplat: () => { this.packedSplats.numSplats++; } }); } dispose() {} }
+    // The room's SparkRenderer: it draws the last picture its sort finished,
+    // so the only sure way to put a gone table's rings out is to hide it.
+    const renderer = { visible: true };
+    setSparkProvider(async () => ({ spark: { SplatMesh: FakeSplatMesh } as never, renderer: renderer as never }));
+    plan = { rootRoomId: 'room-a', modules: [module('room-a', 0, 0, { here: true })], ships: [], bounds: { minX: -1, maxX: 1, minZ: -1, maxZ: 1 } };
+    try {
+      const scene = new THREE.Scene();
+      const { group, handle, root, sun } = build();
+      scene.add(group);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(root.getObjectByName('map-hologram-splats')).toBeDefined();
+      // Made hidden: nothing has drawn yet.
+      expect(renderer.visible).toBe(false);
+      // World's fade-in has brought the table up.
+      const mat = sun.material as THREE.MeshBasicMaterial;
+      mat.opacity = mat.userData.baseOpacity as number;
+      const frame = (): boolean => { handle.update(0.05); commitRoomSplatsFrame(); return renderer.visible; };
+      expect(frame()).toBe(true);
+      // World's zoom hide (the sun carries it): out, and back.
+      sun.visible = false;
+      expect(frame()).toBe(false);
+      sun.visible = true;
+      expect(frame()).toBe(true);
+      // The station phase shows no plot, so no splats; then the plot again.
+      const frames = (seconds: number): boolean => { let v = false; for (let t = 0; t < seconds; t += 0.05) v = frame(); return v; };
+      expect(frames(PLOT_SECONDS)).toBe(false);
+      expect(frames(STATION_SECONDS + FADE_SECONDS)).toBe(true);
+      // The table leaves the room: out on the next frame, whether its
+      // hologram still runs or World has dropped it with the table.
+      group.removeFromParent();
+      expect(frame()).toBe(false);
+      scene.add(group);
+      expect(frame()).toBe(true);
+      commitRoomSplatsFrame();
+      expect(renderer.visible).toBe(false);
     } finally {
       setSparkProvider(null);
     }

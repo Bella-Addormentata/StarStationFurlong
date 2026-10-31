@@ -28,23 +28,61 @@ export interface SparkHost {
 
 let provider: (() => Promise<SparkHost | null>) | null = null;
 let hostPromise: Promise<SparkHost | null> | null = null;
+/** The room scene's SparkRenderer once the provider has made it. */
+let roomRenderer: Pick<SparkRenderer, 'visible'> | null = null;
+/** Whether the room renderer is let draw (commitRoomSplatsFrame). */
+let roomSplatsShown = false;
+/** Whether a map table has drawn its splat plot in the frame under way. */
+let drawnThisFrame = false;
 
 /** main.ts: how to get Spark and the scene's SparkRenderer (lazily, once). */
 export function setSparkProvider(p: (() => Promise<SparkHost | null>) | null): void {
   provider = p;
   hostPromise = null;
+  roomRenderer = null;
+  roomSplatsShown = false;
+  drawnThisFrame = false;
 }
 
 /** Spark and the scene's SparkRenderer, once; null where there is none. */
 export function sparkHost(): Promise<SparkHost | null> {
   if (!provider) return Promise.resolve(null);
   if (!hostPromise) {
-    hostPromise = provider().catch((err) => {
-      console.warn('[hologram] Spark unavailable — the mesh plot stays:', err);
-      return null;
-    });
+    hostPromise = provider()
+      .then((host) => {
+        roomRenderer = host?.renderer ?? null;
+        if (roomRenderer) roomRenderer.visible = roomSplatsShown;
+        return host;
+      })
+      .catch((err) => {
+        console.warn('[hologram] Spark unavailable — the mesh plot stays:', err);
+        return null;
+      });
   }
   return hostPromise;
+}
+
+/** mapHologram.ts: this table drew its splat plot in the room this frame. */
+export function noteRoomSplatsDrawn(): void {
+  drawnThisFrame = true;
+}
+
+/**
+ * 🧹 #327: World, once a frame after every map table's hologram has run —
+ * the room's splats are drawn only while some table there shows its plot.
+ *
+ * Spark does not draw the scene's splats as they stand: it draws the last
+ * picture its background sort finished, and a new picture needs the
+ * renderer drawn for a while first. So a table removed, swapped out with
+ * its room or zoomed away could leave its rings lit in the next room until
+ * that sort caught up, and for good if it never did. Hiding the renderer
+ * itself the frame no table draws puts the picture out on that frame. The
+ * map table's 3D panel (mapPlot3d) has a SparkRenderer of its own.
+ */
+export function commitRoomSplatsFrame(): void {
+  roomSplatsShown = drawnThisFrame;
+  drawnThisFrame = false;
+  if (roomRenderer && roomRenderer.visible !== roomSplatsShown) roomRenderer.visible = roomSplatsShown;
 }
 
 /** What mapHologram.ts drives each frame the plot is shown. */

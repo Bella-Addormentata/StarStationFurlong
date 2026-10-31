@@ -210,6 +210,7 @@ import {
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
 import type { MapHologramHandle } from './mapHologram';
+import { commitRoomSplatsFrame } from './mapHologramSplats';
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
@@ -4196,6 +4197,9 @@ export class World {
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
     // 🔮 #251: the map table's hologram turns and keeps to the shared clock.
     for (const holo of this.mapHolograms.values()) holo.update(deltaTime);
+    // 🧹 #327: and the room's splat renderer draws only while one of them
+    // shows its plot — never a picture left from a table that is gone.
+    commitRoomSplatsFrame();
     this.updateSeatedSlotSession();
 
     // 🏒 #115: advance every air-hockey table — operator puck sim + doc
