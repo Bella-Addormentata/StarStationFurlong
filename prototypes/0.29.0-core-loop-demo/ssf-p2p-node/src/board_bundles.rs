@@ -65,8 +65,10 @@ pub const BUNDLES_DIR: &str = "board-bundles";
 pub const DAY: u64 = 86_400;
 /// How long a carrier keeps a bundle after its stamp.
 pub const TTL_SECS: u64 = 14 * DAY;
-/// Days of tags a reader asks for (the TTL's worth).
-pub const READ_EPOCHS: u64 = 14;
+/// Days of tags a reader asks for: today and every day a bundle still under
+/// its TTL can be stamped in (a bundle stamped late on the day fourteen days
+/// back lives on into today).
+pub const READ_EPOCHS: u64 = TTL_SECS / DAY + 1;
 /// A stamp may run this far ahead of our clock.
 pub const FUTURE_SKEW_SECS: u64 = 600;
 /// Sealed bytes, at most (128 of the longest notes and 256 take-downs fit).
@@ -78,6 +80,14 @@ pub const MAX_DOWN: usize = 256;
 /// Keys of the doc's `boardNotes` map a publisher looks at (the map is
 /// anyone's to pad).
 pub const MAX_KEYS_SCANNED: usize = 1024;
+/// One record's JSON, at most: a real note (280 characters, escaped, a photo
+/// reference and a signature) stays well under it, so an outsized value is
+/// junk, and one must never keep a board from sealing.
+pub const MAX_ENTRY_BYTES: usize = 4096;
+/// Distinct records a view carries under one key, at most: a carrier may hold
+/// a junk record, or an older CLEAR, under the same key as the real or newer
+/// one, and only the tab can tell them apart (it checks signatures).
+pub const MAX_VALUES_PER_KEY: usize = 4;
 /// Bundles a carrier keeps under one tag (the newest).
 pub const PER_TAG: usize = 8;
 pub const MAX_BUNDLES: usize = 512;
@@ -99,8 +109,11 @@ pub const MAX_VIEW_NOTES: usize = 512;
 pub const MAX_VIEW_DOWN: usize = 1024;
 /// The loop's pace when nothing nudges it.
 pub const TICK_SECS: u64 = 60;
-/// Peers whose adverts we remember (what we told them), at most.
+/// Digests remembered per peer (what it holds, what we offered it), at most.
 const MAX_TOLD_PER_PEER: usize = 4096;
+/// Adverts of one bundle a peer never asks for before we stop offering it
+/// (its store refused it, or holds it from someone else).
+const MAX_OFFERS: u8 = 3;
 
 pub type Digest = [u8; 32];
 pub type Tag = [u8; 32];
@@ -306,6 +319,9 @@ fn signed_entries(doc: &yrs::Doc, name: &str, now_ms: u64, cap: usize) -> Vec<(S
             continue;
         }
         let Ok(json) = serde_json::to_value(&any) else { continue };
+        if json.to_string().len() > MAX_ENTRY_BYTES {
+            continue;
+        }
         found.push((ts, key.to_string(), json));
     }
     found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -316,26 +332,38 @@ fn signed_entries(doc: &yrs::Doc, name: &str, now_ms: u64, cap: usize) -> Vec<(S
 /// A room's board records as its readers' tab should see them: each
 /// publisher's newest bundle only (a note gone from it was unpinned or
 /// trimmed there), our own node's left out (its records are our doc's
-/// already), then the union by key, newest publisher first. A take-down in
-/// any publisher's bundle reaches the tab, which drops the note it names.
+/// already), then the union, newest publisher first. Under one key the view
+/// keeps up to MAX_VALUES_PER_KEY distinct records, never just the first:
+/// the node can't check signatures, so a junk record, or an owner's older
+/// CLEAR republished after a newer one, must not hide the record the tab
+/// would choose (#332 review). A take-down in any publisher's bundle reaches
+/// the tab, which drops the note it names.
 pub fn merge_view(mut plains: Vec<BoardPlain>, self_id: &str) -> BoardContent {
     plains.retain(|p| p.publisher != self_id);
     plains.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.publisher.cmp(&b.publisher)));
     let mut seen_publishers: HashSet<String> = HashSet::new();
-    let mut note_keys: HashSet<String> = HashSet::new();
-    let mut down_keys: HashSet<String> = HashSet::new();
+    let mut note_values: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut down_values: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let mut out = BoardContent::default();
+    let take = |seen: &mut HashMap<String, Vec<serde_json::Value>>, k: &str, v: &serde_json::Value| -> bool {
+        let values = seen.entry(k.to_string()).or_default();
+        if values.len() >= MAX_VALUES_PER_KEY || values.contains(v) {
+            return false;
+        }
+        values.push(v.clone());
+        true
+    };
     for p in plains {
         if !seen_publishers.insert(p.publisher.clone()) {
             continue; // an older bundle of a publisher already taken
         }
         for (k, v) in p.notes {
-            if out.notes.len() < MAX_VIEW_NOTES && note_keys.insert(k.clone()) {
+            if out.notes.len() < MAX_VIEW_NOTES && take(&mut note_values, &k, &v) {
                 out.notes.push((k, v));
             }
         }
         for (k, v) in p.down {
-            if out.down.len() < MAX_VIEW_DOWN && down_keys.insert(k.clone()) {
+            if out.down.len() < MAX_VIEW_DOWN && take(&mut down_values, &k, &v) {
                 out.down.push((k, v));
             }
         }
@@ -541,8 +569,13 @@ pub struct BoardLane {
     published: HashMap<String, ([u8; 32], u64)>,
     /// Room → fingerprint of the last view handed to its tabs.
     pushed: HashMap<String, [u8; 32]>,
-    /// Peer → digests already advertised to (or received from) it.
+    /// Peer → digests it is known to hold: it offered them to us, sent them
+    /// to us, or we served them to it. Never offered to it again.
     told: HashMap<String, HashSet<Digest>>,
+    /// Peer → how often we offered it a digest it hasn't taken (#332
+    /// review: an offer is not a delivery, so what a want or a serve cut
+    /// short is offered again, up to MAX_OFFERS times).
+    offers: HashMap<String, HashMap<Digest, u8>>,
     /// Peer → (window start, bundles admitted in it).
     budget: HashMap<String, (u64, u32)>,
     /// Peer → (window start, bundles served to it in it).
@@ -570,6 +603,7 @@ impl BoardLane {
             published: HashMap::new(),
             pushed: HashMap::new(),
             told: HashMap::new(),
+            offers: HashMap::new(),
             budget: HashMap::new(),
             served: HashMap::new(),
         }
@@ -624,6 +658,9 @@ impl BoardLane {
             told.clear();
         }
         told.insert(d);
+        if let Some(offers) = self.offers.get_mut(peer) {
+            offers.remove(&d);
+        }
     }
 
     /// A peer said it holds these: never advertise them back to it.
@@ -634,26 +671,48 @@ impl BoardLane {
     }
 
     /// The bundles a peer asked for that we hold, within what we serve it a
-    /// window (a want is a few bytes; what it asks for is up to 4 MB).
+    /// window (a want is a few bytes; what it asks for is up to 4 MB). What
+    /// goes out, it holds; what it wanted and a cap cut short is offered
+    /// again in full.
     pub fn serve(&mut self, peer: &str, wanted: &[Digest], now: u64) -> Vec<Bundle> {
         let mut out = Vec::new();
-        for d in wanted.iter().take(SERVE_MAX) {
-            let Some(b) = self.store.get(d) else { continue };
-            if !spend(&mut self.served, peer, now, PEER_SERVE_PER_WINDOW) {
-                break;
+        for (i, d) in wanted.iter().enumerate() {
+            if !self.store.has(d) {
+                continue;
             }
+            if i >= SERVE_MAX || !spend(&mut self.served, peer, now, PEER_SERVE_PER_WINDOW) {
+                if let Some(offers) = self.offers.get_mut(peer) {
+                    offers.remove(d);
+                }
+                continue;
+            }
+            let Some(b) = self.store.get(d) else { continue };
             out.push(b.clone());
+            self.mark_told(peer, *d);
         }
         out
     }
 
-    /// The bundles to advertise to a peer: the newest it hasn't heard of.
+    /// The bundles to advertise to a peer: of the whole store, what it isn't
+    /// known to hold, the least offered first and then the newest, each
+    /// offered at most MAX_OFFERS times.
     pub fn advert_for(&mut self, peer: &str) -> Vec<(Digest, Tag, u64)> {
-        let recent = self.store.recent(ADVERT_MAX);
+        let all = self.store.recent(usize::MAX);
         let told = self.told.entry(peer.to_string()).or_default();
-        let fresh: Vec<(Digest, Tag, u64)> = recent.into_iter().filter(|(d, _, _)| !told.contains(d)).collect();
+        let offers = self.offers.entry(peer.to_string()).or_default();
+        if offers.len() >= MAX_TOLD_PER_PEER {
+            offers.clear();
+        }
+        let mut open: Vec<(u8, (Digest, Tag, u64))> = all
+            .into_iter()
+            .filter(|(d, _, _)| !told.contains(d))
+            .map(|item| (offers.get(&item.0).copied().unwrap_or(0), item))
+            .filter(|(n, _)| *n < MAX_OFFERS)
+            .collect();
+        open.sort_by_key(|(n, _)| *n); // stable: the newest first within a count
+        let fresh: Vec<(Digest, Tag, u64)> = open.into_iter().take(ADVERT_MAX).map(|(_, item)| item).collect();
         for (d, _, _) in &fresh {
-            self.mark_told(peer, *d);
+            *offers.entry(*d).or_insert(0) += 1;
         }
         fresh
     }
@@ -661,6 +720,7 @@ impl BoardLane {
     /// Forget the peers no longer connected.
     pub fn retain_peers(&mut self, connected: &HashSet<String>) {
         self.told.retain(|p, _| connected.contains(p));
+        self.offers.retain(|p, _| connected.contains(p));
         self.budget.retain(|p, _| connected.contains(p));
         self.served.retain(|p, _| connected.contains(p));
     }
@@ -727,7 +787,8 @@ pub fn parse_have(p: &HavePayload) -> Vec<(Digest, Tag, u64)> {
 }
 
 pub fn parse_want(p: &WantPayload) -> Vec<Digest> {
-    p.ids.iter().take(SERVE_MAX).filter_map(|d| hex::decode(d).ok()?.try_into().ok()).collect()
+    // The whole want (WANT_MAX): what a serve can't send now it offers again.
+    p.ids.iter().take(WANT_MAX).filter_map(|d| hex::decode(d).ok()?.try_into().ok()).collect()
 }
 
 /// The lane is on unless `SSF_BOARD_BUNDLES=0` (read once).
@@ -919,6 +980,31 @@ mod tests {
     }
 
     #[test]
+    fn a_view_keeps_competing_records_under_one_key() {
+        // A newer publisher carries junk under a real note's key and an older
+        // CLEAR; the older publisher's real note and newer CLEAR still reach
+        // the tab, which checks them and picks.
+        let mut a = plain("node-a", NOW, vec![("cork|1", note(1, "junk"))]);
+        a.down = vec![("cork|*".to_string(), down(5))];
+        let mut b = plain("node-b", NOW - 10, vec![("cork|1", note(1, "real"))]);
+        b.down = vec![("cork|*".to_string(), down(9))];
+        let view = merge_view(vec![a, b], "node-me");
+        assert_eq!(view.notes.len(), 2);
+        assert_eq!(view.down.len(), 2);
+        // The same record twice is one; never more than MAX_VALUES_PER_KEY.
+        let many: Vec<BoardPlain> = (0..8u64)
+            .map(|i| {
+                let mut p = plain(&format!("node-{i}"), NOW - i, vec![("cork|1", note(1, "same"))]);
+                p.down = vec![("cork|*".to_string(), down(i + 1))];
+                p
+            })
+            .collect();
+        let view = merge_view(many, "node-me");
+        assert_eq!(view.notes.len(), 1);
+        assert_eq!(view.down.len(), MAX_VALUES_PER_KEY);
+    }
+
+    #[test]
     fn a_publisher_reads_note_shaped_entries_from_its_doc_newest_first() {
         use yrs::{Any, Map, Transact};
         let doc = yrs::Doc::new();
@@ -943,6 +1029,12 @@ mod tests {
             map.insert(&mut txn, "cork|unsigned", entry(3_000.0, false));
             map.insert(&mut txn, "nobar", entry(4_000.0, true));
             map.insert(&mut txn, "cork|future", entry(10_000_000.0, true));
+            // An outsized value is junk, and must not keep the rest from sealing.
+            let mut huge = std::collections::HashMap::new();
+            huge.insert("ts".to_string(), Any::Number(4_500.0));
+            huge.insert("sig".to_string(), Any::from("sig"));
+            huge.insert("text".to_string(), Any::from("x".repeat(MAX_ENTRY_BYTES)));
+            map.insert(&mut txn, "cork|huge", Any::from(huge));
             downs.insert(&mut txn, "cork|gone", entry(1_500.0, true));
             downs.insert(&mut txn, "cork|*", entry(2_500.0, true));
             downs.insert(&mut txn, "cork|unsigned", entry(2_600.0, false));
@@ -981,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_is_held_to_its_budget_and_never_told_what_it_sent() {
+    fn a_peer_is_held_to_its_budget_and_offered_what_it_lacks() {
         let mut lane = BoardLane::new(BundleStore::new(None));
         let none = HashSet::new();
         for i in 0..PEER_ADMIT_PER_WINDOW as u64 {
@@ -992,8 +1084,24 @@ mod tests {
         assert_eq!(lane.admit_from_peer("p", junk([200; 32], NOW, 1), NOW, &none), Admit::Refused("the peer is over its budget"));
         assert_eq!(lane.admit_from_peer("p", junk([200; 32], NOW, 1), NOW + PEER_WINDOW_SECS, &none), Admit::New);
         assert!(lane.advert_for("p").is_empty(), "everything came from p");
-        assert_eq!(lane.advert_for("q").len(), ADVERT_MAX.min(lane.store.len()));
-        assert!(lane.advert_for("q").is_empty(), "told once");
+        // q hears of the newest 64 of the 65, then of the one left first.
+        assert_eq!(lane.store.len(), ADVERT_MAX + 1);
+        let first = lane.advert_for("q");
+        assert_eq!(first.len(), ADVERT_MAX);
+        let second = lane.advert_for("q");
+        assert!(!first.iter().any(|(d, _, _)| *d == second[0].0), "the one left over comes first");
+        // q asks for 32 and is sent 16: those it holds; the other 16 it wanted
+        // are offered again ahead of the rest.
+        let want: Vec<Digest> = first.iter().take(WANT_MAX).map(|(d, _, _)| *d).collect();
+        assert_eq!(lane.serve("q", &want, NOW).len(), SERVE_MAX);
+        let third = lane.advert_for("q");
+        assert!(!third.iter().any(|(d, _, _)| want[..SERVE_MAX].contains(d)), "what was sent is never offered again");
+        assert!(want[SERVE_MAX..].iter().all(|d| third[..WANT_MAX - SERVE_MAX].iter().any(|(x, _, _)| x == d)));
+        // An offer q never takes stops after MAX_OFFERS adverts.
+        for _ in 0..MAX_OFFERS {
+            lane.advert_for("q");
+        }
+        assert!(lane.advert_for("q").is_empty(), "offered enough");
         // What a peer offers is never advertised back to it.
         let held = lane.store.recent(1);
         lane.note_offered("r", &held);

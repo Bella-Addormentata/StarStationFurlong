@@ -117,6 +117,14 @@ const MAX_ID = 128;
 /** Boards a room may hold (the dev menu's placement refuses a fifth), which
  *  keeps a room's notes far under roomCache.ts's 1 MB per-room cap. */
 export const MAX_BOARDS_PER_ROOM = 4;
+/** A take-down is kept at least this long, past the count above (#332
+ *  review): longer than a bundle lives (14 days), so no bundle sealed before
+ *  it, and no copy offline for less than this, can bring its note back. */
+export const DOWN_KEEP_MS = 30 * 24 * 3600 * 1000;
+/** Take-downs a board keeps at most, however young: the newest. */
+export const MAX_DOWN_RETAINED = 512;
+/** Keys the take-down trim visits: every board's retained ones, and junk. */
+const MAX_DOWN_KEYS_VISITED = MAX_BOARDS_PER_ROOM * MAX_DOWN_RETAINED + MAX_KEYS_VISITED;
 
 export const MAX_PHOTO_CAPTION = 80;
 export const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
@@ -363,6 +371,18 @@ export interface ReadCtx {
   verify?: (pub: string, bytes: Uint8Array, sig: string) => boolean;
   /** The take-down filed under a key, if any (the `boardDown` map). */
   downOf?: (key: string) => unknown;
+  /** The note filed under a key, if any (the `boardNotes` map): the trim
+   *  judges a take-down of a note it holds by that note's author. */
+  noteOf?: (key: string) => unknown;
+}
+
+/** The author a note filed under a key names, when it is filed under its own
+ *  id. The id hashes the author, so this needs no signature check: whatever
+ *  is filed under that id, it is that author's note or junk. */
+function authorOf(raw: unknown, roomId: string, itemId: string, id: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const note = noteFromWire(raw);
+  return note && noteIdOf(roomId, itemId, note) === id ? note.author : undefined;
 }
 
 /** The stamp up to which the owner's CLEAR covers a board's notes, or -1.
@@ -477,7 +497,9 @@ export function readBoardEntries(
 }
 
 /** The take-downs a trim may delete on a board: junk, a CLEAR not the
- *  owner's, a bad signature, or past the newest MAX_DOWN_PER_BOARD. A
+ *  owner's, a bad signature, one of a note this copy holds by neither its
+ *  author nor the owner, or one past the newest MAX_DOWN_PER_BOARD that is
+ *  also older than DOWN_KEEP_MS (and any past MAX_DOWN_RETAINED). A
  *  take-down whose note is gone is KEPT: it is what stops a copy that never
  *  saw the take-down from bringing the note back. */
 export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: string, ctx: ReadCtx): string[] {
@@ -487,7 +509,7 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
   const valid: Array<{ key: string; d: BoardDown }> = [];
   let visited = 0;
   for (const [key, value] of entries) {
-    if (++visited > MAX_KEYS_VISITED) break;
+    if (++visited > MAX_DOWN_KEYS_VISITED) break;
     if (!key.startsWith(prefix)) continue;
     const target = key.slice(prefix.length);
     const d = downFromWire(value);
@@ -500,17 +522,30 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
       if (ctx.ownerPub && clearStampOf(itemId, { ...ctx, verify, downOf: (k) => (k === key ? value : undefined) }) < 0) trimmable.push(key);
       continue;
     }
+    // A take-down of a note this copy holds counts only by its author or the
+    // owner (#332 review): anyone else's would sit on the key for nothing.
+    if (ctx.ownerPub) {
+      const author = authorOf(ctx.noteOf?.(key), ctx.roomId, itemId, target);
+      if (author !== undefined && d.by !== author && d.by !== ctx.ownerPub) {
+        trimmable.push(key);
+        continue;
+      }
+    }
     valid.push({ key, d });
   }
-  valid.sort((a, b) => b.d.ts - a.d.ts || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  // Newest first; a stamp ahead of the clock counts as now, so a take-down
+  // stamped far ahead can't push the real ones out.
+  const at = (d: BoardDown) => Math.min(d.ts, ctx.now);
+  valid.sort((a, b) => at(b.d) - at(a.d) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   let kept = 0;
   let checked = 0;
-  for (const { key, d } of valid) {
-    if (kept >= MAX_DOWN_PER_BOARD) {
+  for (let i = 0; i < valid.length; i++) {
+    const { key, d } = valid[i];
+    if (i >= MAX_DOWN_RETAINED || (kept >= MAX_DOWN_PER_BOARD && ctx.now - d.ts >= DOWN_KEEP_MS)) {
       trimmable.push(key);
       continue;
     }
-    if (checked >= 2 * MAX_DOWN_PER_BOARD) break; // unchecked: neither kept nor trimmed
+    if (checked >= 2 * MAX_DOWN_PER_BOARD) continue; // unchecked: neither kept nor trimmed
     checked++;
     const target = key.slice(prefix.length);
     if (verify(d.by, downSignBytes(ctx.roomId, itemId, target, d.by, d.ts), d.sig)) kept++;
@@ -595,6 +630,7 @@ export function bindBoardDoc(doc: Y.Doc): void {
   notesMap.observe(() => notify());
   downMap.observe(() => notify());
   pendingView = null;
+  cancelRetry();
   notify();
 }
 
@@ -603,6 +639,9 @@ export function bindBoardDoc(doc: Y.Doc): void {
 export function refreshBoards(): void {
   readCache = null;
   notify();
+  // Entries that waited for the owner's key may be judged now. On a timer,
+  // never here: this runs inside the doc's own observers.
+  if (pendingView) scheduleRetry();
 }
 
 export function subscribeBoards(listener: () => void): () => void {
@@ -645,7 +684,11 @@ export function readBoard(itemId: string, kind: BoardKind): BoardRead {
 
 function readCtx(kind: BoardKind, now: number): ReadCtx {
   const down = downMap!;
-  return { roomId: deps!.roomId(), kind, now, ownerPub: deps!.ownerPub(), verify: cachedVerify, downOf: (k) => down.get(k) };
+  const notes = notesMap!;
+  return {
+    roomId: deps!.roomId(), kind, now, ownerPub: deps!.ownerPub(), verify: cachedVerify,
+    downOf: (k) => down.get(k), noteOf: (k) => notes.get(k),
+  };
 }
 
 /** Whether the local player may post on a board of this kind. */
@@ -790,8 +833,33 @@ export interface BoardView {
   down: Array<[string, unknown]>;
 }
 
-/** A view the node sent before the host's state arrived, merged once it has. */
+/** What a merge left for later: a view the node sent before the host's state
+ *  arrived, entries past a board's verify budget, and entries only the
+ *  owner's key can judge. */
 let pendingView: BoardView | null = null;
+/** A merge left entries past a budget: the next round runs on a timer, so a
+ *  long view (or one led by junk) is merged in rounds, never dropped (#332
+ *  review; the node sends a view only when it changes). */
+const RETRY_MS = 1500;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRetry(): void {
+  if (retryTimer !== null || !pendingView) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    retryBoardView();
+  }, RETRY_MS);
+}
+
+function cancelRetry(): void {
+  if (retryTimer !== null) clearTimeout(retryTimer);
+  retryTimer = null;
+}
+
+/** Entries a merge left for later (tests, and the dev console). */
+export function pendingBoardEntries(): number {
+  return pendingView ? pendingView.notes.length + pendingView.down.length : 0;
+}
 
 /** The node's `board` envelope body, shape-checked, or null. */
 export function boardViewFromWire(raw: unknown): BoardView | null {
@@ -817,12 +885,20 @@ function splitKey(key: string): { itemId: string; target: string } | null {
   return { itemId: key.slice(0, bar), target: key.slice(bar + 1) };
 }
 
+const NOTE_ID_RE = /^[0-9a-f]{32}$/;
+
 /**
  * Merge what other copies of this room sealed (the local node's `board`
  * lane): take-downs first, then notes, each checked as a reader checks the
  * doc. Writes only what this copy has never held, onto boards the room has.
- * Before the host's state arrives the view is kept and merged by
- * `retryBoardView`. Returns what was written, or null when nothing ran.
+ * The view may hold competing records under one key (the node keeps a few):
+ * a take-down by the note's author or the owner wins over one that can't be
+ * judged, the newest valid CLEAR wins, and a record already filed here is
+ * replaced only by one that outranks it. What can't be merged yet is kept:
+ * before the host's state arrives, the whole view (`retryBoardView`); past a
+ * board's verify budget, the rest, in rounds on a timer; and while the
+ * owner's key is unknown, what only it can judge (until `refreshBoards`).
+ * Returns what was written, or null when nothing ran.
  */
 export function mergeBoardView(raw: unknown): { notes: number; down: number } | null {
   const view = boardViewFromWire(raw);
@@ -832,12 +908,13 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
     return null;
   }
   pendingView = null;
+  cancelRetry();
   const boardOf = deps.boardOfItem ?? (() => null);
   const now = Date.now();
   const roomId = deps.roomId();
   const ownerPub = deps.ownerPub();
-  const downs: Array<[string, BoardDown]> = [];
-  const notes: Array<[string, BoardNote]> = [];
+  const rest: BoardView = { room: view.room, notes: [], down: [] };
+  let overBudget = false;
   const touched = new Map<string, BoardKind>();
   const budget = new Map<string, number>();
   const spend = (itemId: string): boolean => {
@@ -846,29 +923,86 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
     budget.set(itemId, used + 1);
     return true;
   };
-  const filed = new Map<string, unknown>();
+  const verifyDown = (itemId: string, target: string, d: BoardDown): boolean =>
+    cachedVerify(d.by, downSignBytes(roomId, itemId, target, d.by, d.ts), d.sig);
+  // The note each key names, from this copy or from the view (its id binds
+  // its author, so no signature is needed to know whose it is).
+  const viewNotes = new Map<string, BoardNote>();
+  for (const [key, value] of view.notes) {
+    const k = splitKey(key);
+    if (!k || viewNotes.has(key) || !NOTE_ID_RE.test(k.target)) continue;
+    const note = noteFromWire(value);
+    if (note && noteIdOf(roomId, k.itemId, note) === k.target) viewNotes.set(key, note);
+  }
+  const authorFor = (key: string, itemId: string, target: string): string | undefined =>
+    authorOf(notesMap!.get(key), roomId, itemId, target) ?? viewNotes.get(key)?.author;
+  // 2: by the note's author or the owner. 1: the note is unknown here, so
+  // it can't be judged yet (kept to stop that note if it comes). 0: neither.
+  const rankOf = (d: BoardDown, author: string | undefined): number =>
+    d.by === ownerPub || (author !== undefined && d.by === author) ? 2 : author === undefined ? 1 : 0;
+
+  // Each key's chosen take-down, verified.
+  const filed = new Map<string, BoardDown>();
+  const waitsForOwner = new Set<string>(); // keys and CLEAR keys put off
   for (const [key, value] of view.down) {
     const k = splitKey(key);
     if (!k || !TARGET_RE.test(k.target)) continue;
     const kind = boardOf(k.itemId);
-    if (!kind || deletedHere(downMap!, key)) continue;
+    if (!kind) continue;
     const d = downFromWire(value);
     if (!d) continue;
     if (k.target === CLEAR_TARGET) {
-      if (!ownerPub || d.by !== ownerPub) continue;
-      const mine = downFromWire(downMap!.get(key));
-      if (mine && mine.ts >= d.ts) continue;
-    } else if (downMap!.has(key)) {
-      continue;
+      if (!ownerPub) {
+        rest.down.push([key, value]);
+        waitsForOwner.add(key);
+        continue;
+      }
+      if (d.by !== ownerPub) continue;
+      const best = filed.get(key);
+      if (best && best.ts >= d.ts) continue;
+      const mine = best ? null : downFromWire(downMap!.get(key));
+      if (mine && mine.by === ownerPub && mine.ts >= d.ts) {
+        if (!spend(k.itemId)) {
+          rest.down.push([key, value]);
+          overBudget = true;
+          continue;
+        }
+        if (verifyDown(k.itemId, k.target, mine)) continue; // ours is as new
+      }
     } else {
-      // A take-down of a note this copy holds counts only by its author or
-      // the owner; one of a note it never saw is kept to stop that note.
-      const held = noteFromWire(notesMap!.get(key));
-      if (held && d.by !== held.author && d.by !== ownerPub) continue;
+      const author = authorFor(key, k.itemId, k.target);
+      const rank = rankOf(d, author);
+      if (rank === 0) {
+        // Neither the author's nor the owner's, unless it is the owner's
+        // and their key hasn't arrived.
+        if (!ownerPub) {
+          rest.down.push([key, value]);
+          waitsForOwner.add(key);
+        }
+        continue;
+      }
+      const best = filed.get(key);
+      if (best && rankOf(best, author) >= rank) continue;
+      const mine = best ? null : downFromWire(downMap!.get(key));
+      if (mine && rankOf(mine, author) >= rank) {
+        if (!spend(k.itemId)) {
+          rest.down.push([key, value]);
+          overBudget = true;
+          continue;
+        }
+        if (verifyDown(k.itemId, k.target, mine)) continue; // ours stands
+      }
+      // A take-down this copy trimmed stays gone, unless this one is the
+      // author's or the owner's and young: the trim may have taken one that
+      // sat on the key for nothing, which must not lock the real one out.
+      if (!downMap!.has(key) && deletedHere(downMap!, key) && !(rank === 2 && now - d.ts < DOWN_KEEP_MS)) continue;
     }
-    if (!spend(k.itemId)) continue;
-    if (!cachedVerify(d.by, downSignBytes(roomId, k.itemId, k.target, d.by, d.ts), d.sig)) continue;
-    downs.push([key, d]);
+    if (!spend(k.itemId)) {
+      rest.down.push([key, value]);
+      overBudget = true;
+      continue;
+    }
+    if (!verifyDown(k.itemId, k.target, d)) continue;
     filed.set(key, d);
     touched.set(k.itemId, kind);
   }
@@ -877,42 +1011,67 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
     downOf: (k) => (filed.has(k) ? filed.get(k) : downMap!.get(k)),
   });
   const clears = new Map<string, number>();
+  const merged = new Map<string, BoardNote>();
   for (const [key, value] of view.notes) {
     const k = splitKey(key);
-    if (!k || !/^[0-9a-f]{32}$/.test(k.target)) continue;
+    if (!k || !NOTE_ID_RE.test(k.target)) continue;
     const kind = boardOf(k.itemId);
-    if (!kind || notesMap!.has(key) || deletedHere(notesMap!, key)) continue;
+    if (!kind || merged.has(key) || notesMap!.has(key) || deletedHere(notesMap!, key)) continue;
     const note = noteFromWire(value);
     if (!note || noteIdOf(roomId, k.itemId, note) !== k.target) continue;
     if (note.ts > now + MAX_FUTURE_SKEW_MS) continue;
-    if (kind === 'owner' && (!ownerPub || note.author !== ownerPub)) continue;
     const ctx = ctxFor(kind);
+    const clearKey = `${k.itemId}|${CLEAR_TARGET}`;
+    const downHere = ctx.downOf!(key);
+    if (!ownerPub) {
+      // What only the owner's key can judge waits for it: a notice, a note
+      // a CLEAR may cover, one taken down by someone other than its author.
+      const byOther = downHere !== undefined && downFromWire(downHere)?.by !== note.author;
+      if (kind === 'owner' || waitsForOwner.has(clearKey) || ctx.downOf!(clearKey) !== undefined || waitsForOwner.has(key) || byOther) {
+        rest.notes.push([key, value]);
+        continue;
+      }
+    }
+    if (kind === 'owner' && note.author !== ownerPub) continue;
     if (!clears.has(k.itemId)) clears.set(k.itemId, clearStampOf(k.itemId, ctx));
     if (note.ts <= clears.get(k.itemId)!) continue;
-    if (ctx.downOf!(key) !== undefined) {
-      if (!spend(k.itemId)) continue;
+    if (downHere !== undefined) {
+      if (!spend(k.itemId)) {
+        rest.notes.push([key, value]);
+        overBudget = true;
+        continue;
+      }
       if (isTakenDown(key, k.itemId, k.target, note, ctx)) continue;
     }
-    if (!spend(k.itemId)) continue;
+    if (!spend(k.itemId)) {
+      rest.notes.push([key, value]);
+      overBudget = true;
+      continue;
+    }
     const { sig, ...unsigned } = note;
     if (!cachedVerify(note.author, noteSignBytes(roomId, k.itemId, unsigned), sig)) continue;
-    notes.push([key, note]);
+    merged.set(key, note);
     touched.set(k.itemId, kind);
   }
-  if (downs.length === 0 && notes.length === 0) return { notes: 0, down: 0 };
+  if (rest.notes.length > 0 || rest.down.length > 0) {
+    pendingView = rest;
+    if (overBudget) scheduleRetry();
+  }
+  if (filed.size === 0 && merged.size === 0) return { notes: 0, down: 0 };
   boundDoc!.transact(() => {
-    for (const [key, d] of downs) {
+    for (const [key, d] of filed) {
       downMap!.set(key, d);
       notesMap!.delete(key); // a CLEAR's key holds no note; a take-down's note goes
     }
-    for (const [key, note] of notes) notesMap!.set(key, note);
+    for (const [key, note] of merged) notesMap!.set(key, note);
   });
   // What the merge pushed past a board's caps comes off again here.
   for (const [itemId, kind] of touched) trimBoard(itemId, kind);
-  return { notes: notes.length, down: downs.length };
+  return { notes: merged.size, down: filed.size };
 }
 
-/** The host's state has arrived: merge the view the node sent before it. */
+/** Merge what an earlier merge left: once the host's state has arrived, the
+ *  next round past a budget, or once the owner's key is known. */
 export function retryBoardView(): void {
   if (pendingView) mergeBoardView(pendingView);
 }
@@ -1027,6 +1186,7 @@ export function resetBoardLocalStateForTest(): void {
   verdicts.clear();
   readCache = null;
   pendingView = null;
+  cancelRetry();
 }
 
 // ── What a board's face draws ────────────────────────────────────────────────
