@@ -76,7 +76,9 @@ pub const FUTURE_SKEW_SECS: u64 = 600;
 pub const MAX_SEALED: usize = 256 * 1024;
 /// Notes a bundle carries, at most (the newest by stamp).
 pub const MAX_NOTES: usize = 128;
-/// Take-downs a bundle carries, at most (the newest by stamp).
+/// Take-downs a bundle carries, at most (the newest by stamp), besides its
+/// CLEARs (MAX_CLEARS): a board's retained take-downs and its CLEAR all go
+/// (#336 review).
 pub const MAX_DOWN: usize = 256;
 /// Keys of the doc's `boardNotes` map a publisher looks at (the map is
 /// anyone's to pad).
@@ -333,24 +335,23 @@ pub fn open_bundle(room_key: &[u8], room_id: &str, b: &Bundle) -> Option<BoardPl
         && plain.at == b.at
         && b.tag == board_tag(room_key, epoch_of(plain.at))
         && plain.notes.len() <= MAX_NOTES
-        && plain.down.len() <= MAX_DOWN;
+        && plain.down.len() <= MAX_DOWN + MAX_CLEARS;
     ok.then_some(plain)
 }
 
 /// What a publisher seals: the doc's `boardNotes` and `boardDown` entries
 /// that look like records (a `sig` string, a stamp no more than ten minutes
-/// ahead), newest first, at most MAX_NOTES and MAX_DOWN. Signatures are the
-/// reader's to check.
+/// ahead), newest first, at most MAX_NOTES and MAX_DOWN (the owner's CLEARs
+/// besides). Signatures are the reader's to check.
 pub fn board_from_doc(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> BoardContent {
     // A board's CLEAR goes first, whatever its age (#332 review): newest
     // first alone, a CLEAR followed by enough unpins elsewhere would fall out
     // of the bundle, and a reader could then take the cleared notes back
     // from another publisher's older one. The owner's newest few per board,
     // ahead of the rest.
-    let mut down = owner_clears(doc, room_id, now_ms);
-    let room = MAX_DOWN - down.len();
+    let mut down = owner_clears(doc, room_id);
     let rest = signed_entries(doc, "boardDown", now_ms, MAX_KEYS_SCANNED);
-    down.extend(rest.into_iter().filter(|(k, _)| !is_clear_key(k)).take(room));
+    down.extend(rest.into_iter().filter(|(k, _)| !is_clear_key(k)).take(MAX_DOWN));
     BoardContent { notes: signed_entries(doc, "boardNotes", now_ms, MAX_NOTES), down }
 }
 
@@ -415,20 +416,26 @@ fn clear_verdicts() -> &'static std::sync::Mutex<HashMap<[u8; 32], bool>> {
 /// CLEAR-shaped record anyone else filed, or one claiming the owner's key
 /// with a bad signature, must not take a real one's place). Nothing while
 /// the doc names no owner: the tabs count no CLEAR then either.
-fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serde_json::Value)> {
+fn owner_clears(doc: &yrs::Doc, room_id: &str) -> Vec<(String, serde_json::Value)> {
     use yrs::{Any, Map, Out, ReadTxn, Transact};
     let txn = doc.transact();
     let Some(owner) = owner_pub(&txn) else { return Vec::new() };
     let Some(map) = txn.get_map("boardDown") else { return Vec::new() };
     // Board → (stamp, key, record, signature), the owner's, filed under
     // their own stamp.
-    let mut boards: HashMap<String, Vec<(u64, String, Any, String)>> = HashMap::new();
+    let mut boards: HashMap<String, Vec<(u64, String, String)>> = HashMap::new();
     for (key, value) in map.iter(&txn).take(MAX_CLEAR_SCAN) {
         if key.len() > 200 || !is_clear_key(key) {
             continue;
         }
         let Out::Any(any) = value else { continue };
         let Any::Map(fields) = &any else { continue };
+        // A record the tab reads (downFromWire): version 1, the owner's
+        // (#336 review: `v` isn't signed, so a replay under another version
+        // must not take a real one's place).
+        if !matches!(fields.get("v"), Some(Any::Number(v)) if *v == 1.0) && !matches!(fields.get("v"), Some(Any::BigInt(1))) {
+            continue;
+        }
         if !matches!(fields.get("by"), Some(Any::String(b)) if **b == *owner) {
             continue;
         }
@@ -439,10 +446,12 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
             _ => continue,
         };
         let Some((item, target)) = key.rsplit_once('|') else { continue };
-        if target != format!("*{ts}") || ts > now_ms + FUTURE_SKEW_SECS * 1000 {
+        // A CLEAR stamped ahead goes too: the tab clamps how far one reaches
+        // (#336 review), and leaving it out could let older notes back.
+        if target != format!("*{ts}") {
             continue;
         }
-        boards.entry(item.to_string()).or_default().push((ts, key.to_string(), any.clone(), sig.to_string()));
+        boards.entry(item.to_string()).or_default().push((ts, key.to_string(), sig.to_string()));
     }
     let mut verdicts = clear_verdicts().lock().unwrap();
     let mut checks = 0;
@@ -453,7 +462,7 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let mut kept: Vec<(String, serde_json::Value)> = Vec::new();
         let mut newest = 0;
-        for (ts, key, any, sig) in found {
+        for (ts, key, sig) in found {
             if kept.len() >= CLEARS_PER_BOARD {
                 break;
             }
@@ -472,10 +481,12 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
                 }
                 None => continue, // judged in a later build
             };
-            let Ok(json) = serde_json::to_value(&any) else { continue };
-            if ok && json.to_string().len() <= MAX_ENTRY_BYTES {
+            // Carried as the fields the tab reads and the signature covers,
+            // so padding added beside them can't push it past a size limit
+            // (#336 review).
+            if ok {
                 newest = newest.max(ts);
-                kept.push((key, json));
+                kept.push((key, serde_json::json!({ "v": 1, "by": owner, "ts": ts, "sig": sig })));
             }
         }
         if !kept.is_empty() {
@@ -532,7 +543,9 @@ fn signed_entries(doc: &yrs::Doc, name: &str, now_ms: u64, cap: usize) -> Vec<(S
 /// the node can't check signatures, so a junk record, or an owner's older
 /// CLEAR republished after a newer one, must not hide the record the tab
 /// would choose (#332 review). A take-down in any publisher's bundle reaches
-/// the tab, which drops the note it names.
+/// the tab, which drops the note it names. Every publisher's CLEARs go
+/// ahead of anyone's take-downs (#336 review): publishers listed first with
+/// a full load of take-downs can't fill the view before a later one's CLEAR.
 pub fn merge_view(mut plains: Vec<BoardPlain>, self_id: &str) -> BoardContent {
     plains.retain(|p| p.publisher != self_id);
     plains.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.publisher.cmp(&b.publisher)));
@@ -548,18 +561,21 @@ pub fn merge_view(mut plains: Vec<BoardPlain>, self_id: &str) -> BoardContent {
         values.push(v.clone());
         true
     };
-    for p in plains {
-        if !seen_publishers.insert(p.publisher.clone()) {
-            continue; // an older bundle of a publisher already taken
-        }
-        for (k, v) in p.notes {
-            if out.notes.len() < MAX_VIEW_NOTES && take(&mut note_values, &k, &v) {
-                out.notes.push((k, v));
+    // An older bundle of a publisher already taken is left out.
+    plains.retain(|p| seen_publishers.insert(p.publisher.clone()));
+    for p in &plains {
+        for (k, v) in &p.notes {
+            if out.notes.len() < MAX_VIEW_NOTES && take(&mut note_values, k, v) {
+                out.notes.push((k.clone(), v.clone()));
             }
         }
-        for (k, v) in p.down {
-            if out.down.len() < MAX_VIEW_DOWN && take(&mut down_values, &k, &v) {
-                out.down.push((k, v));
+    }
+    for clears in [true, false] {
+        for p in &plains {
+            for (k, v) in p.down.iter().filter(|(k, _)| is_clear_key(k) == clears) {
+                if out.down.len() < MAX_VIEW_DOWN && take(&mut down_values, k, v) {
+                    out.down.push((k.clone(), v.clone()));
+                }
             }
         }
     }
@@ -944,14 +960,18 @@ impl BoardLane {
     /// (#332 review): before this node had the room key, junk under the
     /// room's tag looked like anyone's bundle and counted toward the tag's
     /// eight, and would keep crowding out the real ones. Checked once per
-    /// bundle (`readable` remembers what opened). Returns how many went.
-    pub fn evict_unreadable(&mut self, room: &str, room_key: &[u8], now: u64) -> usize {
+    /// bundle (`readable` remembers what opened). `rooms` are all the rooms
+    /// under this key (#336 review): rooms can share one (a legacy pass takes
+    /// the home room's), and so their tags, so a bundle stays if it opens as
+    /// any of them. Returns how many went.
+    pub fn evict_unreadable(&mut self, rooms: &[String], room_key: &[u8], now: u64) -> usize {
         let tags: HashSet<Tag> = read_tags(room_key, now).into_iter().collect();
         let unchecked: Vec<Digest> =
             self.store.under(&tags).into_iter().filter(|(d, _)| !self.readable.contains(d)).map(|(d, _)| d).collect();
         let mut gone = 0;
         for d in unchecked {
-            let opens = self.store.get(&d).is_some_and(|b| open_bundle(room_key, room, b).is_some());
+            let opens =
+                self.store.get(&d).is_some_and(|b| rooms.iter().any(|room| open_bundle(room_key, room, b).is_some()));
             if opens {
                 self.readable.insert(d);
             } else {
@@ -1282,6 +1302,66 @@ mod tests {
         assert_eq!(view.down.len(), MAX_VALUES_PER_KEY);
     }
 
+    #[test]
+    fn rooms_sharing_a_key_keep_each_others_bundles() {
+        // A legacy pass takes the home room's key, so two rooms share it and
+        // its tags (#336 review): each room's sweep must leave the other's be.
+        let mut lane = BoardLane::new(BundleStore::new(None));
+        let a = seal_bundle(&KEY, &plain(&pk("node-b"), NOW, vec![("cork|1", note(1, "a"))]), &sk("node-b")).unwrap();
+        let mut in_b = plain(&pk("node-b"), NOW + 1, vec![("cork|1", note(1, "b"))]);
+        in_b.room = "room-b".into();
+        let b = seal_bundle(&KEY, &in_b, &sk("node-b")).unwrap();
+        let none = HashSet::new();
+        lane.store.admit(a.clone(), NOW, &none);
+        lane.store.admit(b.clone(), NOW, &none);
+        lane.store.admit(junk(board_tag(&KEY, epoch_of(NOW)), NOW + 2, 3), NOW, &none);
+        assert_eq!(lane.evict_unreadable(&["room-a".to_string(), "room-b".to_string()], &KEY, NOW), 1);
+        assert!(lane.store.has(&a.digest()) && lane.store.has(&b.digest()));
+        assert_eq!(lane.tab_view("room-b", &KEY, "node-me", b"tab", NOW).unwrap().notes.len(), 1);
+    }
+
+    #[test]
+    fn a_view_takes_every_publishers_clears_before_anyones_take_downs() {
+        // Four newer publishers with a full load of take-downs each fill the
+        // view's take-downs before a fifth's CLEAR is reached (#336 review).
+        let mut many: Vec<BoardPlain> = (0..4u64)
+            .map(|i| {
+                let mut p = plain(&format!("node-{i}"), NOW - i, vec![]);
+                p.down = (0..MAX_DOWN).map(|j| (format!("cork|n{i}-{j:04}"), down(NOW * 1000 - j as u64))).collect();
+                p
+            })
+            .collect();
+        let mut last = plain("node-old", NOW - 100, vec![]);
+        last.down = vec![("cork|*9000".to_string(), down(9000))];
+        many.push(last);
+        let view = merge_view(many, "node-me");
+        assert_eq!(view.down.len(), MAX_VIEW_DOWN);
+        assert_eq!(view.down.first().map(|(k, _)| k.as_str()), Some("cork|*9000"));
+    }
+
+    #[test]
+    fn a_publisher_carries_a_boards_clear_and_all_its_retained_take_downs() {
+        // One board's CLEAR and as many unpins as the tab retains (#336
+        // review): a CLEAR's place must not cost an unpin its own.
+        use yrs::{Map, Transact};
+        let (owner, by) = owner_key();
+        let doc = yrs::Doc::new();
+        name_owner(&doc, &by);
+        let downs = doc.get_or_insert_map("boardDown");
+        {
+            let mut txn = doc.transact_mut();
+            downs.insert(&mut txn, "cork|*1000", signed_clear("r", "cork", 1_000, &owner, &by));
+            for i in 0..MAX_DOWN {
+                downs.insert(&mut txn, format!("cork|{:032x}", i), signed_clear("r", "cork", 2_000 + i as u64, &owner, &by));
+            }
+        }
+        let read = board_from_doc(&doc, "r", 5_000);
+        assert_eq!(read.down.len(), MAX_DOWN + 1);
+        assert_eq!(read.down.first().map(|(k, _)| k.as_str()), Some("cork|*1000"));
+        let b = seal_fitting(&KEY, BoardPlain { v: 1, room: "r".into(), publisher: pk("node-b"), at: NOW, notes: read.notes, down: read.down }, &sk("node-b")).unwrap();
+        assert_eq!(open_bundle(&KEY, "r", &b).unwrap().down.len(), MAX_DOWN + 1, "and it opens");
+    }
+
     /// The room owner a test doc names: an identity key the way the tabs
     /// write one, and its signer.
     fn owner_key() -> (iroh::SecretKey, String) {
@@ -1352,6 +1432,37 @@ mod tests {
         let read = board_from_doc(&doc, "r", 5_000);
         assert_eq!(read.down.first().map(|(k, _)| k.as_str()), Some("cork|*1000"));
         assert_eq!(read.down.iter().filter(|(k, _)| is_clear_key(k)).count(), 1);
+        {
+            let mut txn = doc.transact_mut();
+            // The owner's genuine CLEARs replayed under another version, and
+            // one padded with fields nobody signed: the version ones count
+            // for nothing, the padded one goes as its signed fields.
+            for (ts, v) in [(4_000u64, 2.0), (4_500, 0.0)] {
+                let mut rec = signed_clear("r", "cork", ts, &sk, &by);
+                if let yrs::Any::Map(m) = &rec {
+                    let mut m = (**m).clone();
+                    m.insert("v".to_string(), yrs::Any::Number(v));
+                    rec = yrs::Any::from(m);
+                }
+                downs.insert(&mut txn, format!("cork|*{ts}"), rec);
+            }
+            let mut padded = signed_clear("r", "case", 900, &sk, &by);
+            if let yrs::Any::Map(m) = &padded {
+                let mut m = (**m).clone();
+                m.insert("pad".to_string(), yrs::Any::from("x".repeat(MAX_ENTRY_BYTES)));
+                padded = yrs::Any::from(m);
+            }
+            downs.insert(&mut txn, "case|*900", padded);
+            // A CLEAR stamped far ahead of this node's clock still goes:
+            // the tab clamps its reach.
+            downs.insert(&mut txn, "desk|*99000000", signed_clear("r", "desk", 99_000_000, &sk, &by));
+        }
+        let read = board_from_doc(&doc, "r", 5_000);
+        let clears: Vec<&str> = read.down.iter().filter(|(k, _)| is_clear_key(k)).map(|(k, _)| k.as_str()).collect();
+        assert_eq!(clears, vec!["desk|*99000000", "cork|*1000", "case|*900"]);
+        let case = &read.down.iter().find(|(k, _)| k == "case|*900").unwrap().1;
+        assert!(case.get("pad").is_none());
+        assert_eq!(case["v"], 1);
         // Nothing counts while the doc names no owner.
         let bare = yrs::Doc::new();
         let d = bare.get_or_insert_map("boardDown");
@@ -1524,10 +1635,11 @@ mod tests {
         assert_eq!(lane.store.admit(real.clone(), NOW, &none), Admit::New);
         assert_eq!(lane.store.admit(junk(tag, NOW + 2, 3), NOW, &none), Admit::New);
         assert_eq!(lane.store.admit(forged, NOW, &none), Admit::New);
-        assert_eq!(lane.evict_unreadable("room-a", &KEY, NOW), 2);
+        let room_a = ["room-a".to_string()];
+        assert_eq!(lane.evict_unreadable(&room_a, &KEY, NOW), 2);
         assert_eq!(lane.store.len(), 1);
         assert!(lane.store.has(&real.digest()));
-        assert_eq!(lane.evict_unreadable("room-a", &KEY, NOW), 0, "what opened isn't opened again");
+        assert_eq!(lane.evict_unreadable(&room_a, &KEY, NOW), 0, "what opened isn't opened again");
         // A peer is charged before its bundle is opened, so failing to open
         // costs it all the same.
         for _ in 0..PEER_ADMIT_PER_WINDOW {

@@ -25,6 +25,7 @@ import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
+import { keeperNodeTrust } from './coHostNodes';
 import { roomStateArrived, withTimeout } from './farDoorWrite';
 
 /** The same seams the far writes are given (main.ts wires them alike). */
@@ -100,6 +101,7 @@ export function openRoomSession(deps: RoomSessionDeps, address: string): Promise
       roomId: boot.roomId,
       channel,
       ...ysyncSigner(),
+      ...keeperNodeTrust, // 🤝 C3: the room's keeper nodes count as its own state
       // THIS room's dial hints on our envelopes, never the active room's.
       bootRecord: () => p.getBootRecord(),
     });
