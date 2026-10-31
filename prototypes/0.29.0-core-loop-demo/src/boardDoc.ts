@@ -755,6 +755,13 @@ export function readBoardScreen(itemId: string, kind: BoardKind): BoardScreen {
   };
 }
 
+/** The room the board store is bound to now ('' when unbound): a panel
+ *  checks it is still in the room it was opened in (an ACCESS beam rebinds
+ *  the store before the panel comes down). */
+export function boardRoomId(): string {
+  return deps && docAlive() ? deps.roomId() : '';
+}
+
 /** The room owner's key as the boards read it (undefined: not known yet). */
 export function boardOwnerPub(): string | undefined {
   return deps?.ownerPub();

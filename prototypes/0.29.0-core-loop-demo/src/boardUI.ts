@@ -31,6 +31,7 @@ import {
   MAX_NOTE_TEXT,
   MAX_NOTES_PER_AUTHOR,
   boardOwnerPub,
+  boardRoomId,
   canModerate,
   canPost,
   clearBoard,
@@ -99,6 +100,17 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   /** The notes that were unseen when the player walked up, or that arrived
    *  while they read: marked NEW in the panel until it closes. */
   const fresh = new Set<string>();
+  /** The room the panel was opened in. An ACCESS beam rebinds the board
+   *  store to the next room before the panel comes down (#330 review), and
+   *  the same item id can be a board there too: until the panel closes, it
+   *  marks, posts and draws nothing anywhere else. */
+  let roomAtMount = '';
+  const here = (): boolean => roomAtMount !== '' && boardRoomId() === roomAtMount;
+  /** Notes unseen now join the NEW set, then count as seen on the face. */
+  const takeInNew = (): void => {
+    for (const id of unseenIds(itemId, kind)) fresh.add(id);
+    markBoardSeen(itemId, kind);
+  };
   let colour: BoardColour = open ? 'yellow' : 'white';
   let clearArmedUntil = 0;
   let status = '';
@@ -159,7 +171,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   };
 
   const render = (): void => {
-    if (!panel) return;
+    if (!panel || !here()) return;
     const notes = panel.querySelector<HTMLElement>('[data-notes]');
     if (notes) notes.innerHTML = notesHtml();
     const hidden = panel.querySelector<HTMLElement>('[data-hidden]');
@@ -187,7 +199,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   };
 
   const post = (): void => {
-    if (!panel) return;
+    if (!panel || !here()) return;
     const box = panel.querySelector<HTMLTextAreaElement>('[data-text]');
     if (!box) return;
     const result = postNote(itemId, kind, { text: box.value, colour });
@@ -210,7 +222,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   const onClick = (e: MouseEvent): void => {
     e.stopPropagation();
     const btn = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-act]');
-    if (!btn) return;
+    if (!btn || !here()) return;
     switch (btn.dataset.act) {
       case 'down':
         if (btn.dataset.id && !takeDownNote(itemId, btn.dataset.id, kind)) status = 'That note is already gone.';
@@ -316,14 +328,14 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       host.appendChild(panel);
       // What was new when the player walked up stays marked NEW here; the
       // face's glow goes out now that they've seen it.
-      for (const id of unseenIds(itemId, kind)) fresh.add(id);
-      markBoardSeen(itemId, kind);
+      roomAtMount = boardRoomId();
+      takeInNew();
       trimBoard(itemId, kind);
       unsubscribe = subscribeBoards(() => {
+        if (!here()) return;
         // A note pinned while the player reads the board is NEW here and
         // seen on the face.
-        for (const id of unseenIds(itemId, kind)) fresh.add(id);
-        markBoardSeen(itemId, kind);
+        takeInNew();
         render();
       });
       deps.onEngagedChange?.(true);
@@ -337,7 +349,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       panel = null;
     },
     update(dt: number): void {
-      if (!panel) return;
+      if (!panel || !here()) return;
       // An armed CLEAR disarms itself.
       if (clearArmedUntil && Date.now() >= clearArmedUntil) {
         clearArmedUntil = 0;
@@ -346,8 +358,11 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       since += dt;
       if (since < AGE_REFRESH_S) return;
       since = 0;
-      const notes = panel.querySelector<HTMLElement>('[data-notes]');
-      if (notes) notes.innerHTML = notesHtml();
+      // The ages move on, and a note stamped a little ahead can come due with
+      // no change to the map (#330 review): it is NEW here and seen on the
+      // face like one that arrives, and the hidden list is redrawn with it.
+      takeInNew();
+      render();
     },
   };
 }

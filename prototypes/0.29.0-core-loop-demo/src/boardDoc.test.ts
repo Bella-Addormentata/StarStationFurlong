@@ -16,6 +16,7 @@ import {
   MAX_NOTE_TEXT,
   MAX_NOTES_PER_AUTHOR,
   bindBoardDoc,
+  boardRoomId,
   boardKindOf,
   canPost,
   cleanNoteText,
@@ -389,6 +390,14 @@ describe('the bound store', () => {
     const forgedId = signNote(ROOM, BOARD, { ...unsigned }, { pub: owner.pub, sign: () => genuine.sig }).id;
     map.set(noteKey(BOARD, forgedId), { ...unsigned, sig: genuine.sig });
     expect(readBoard(BOARD, 'owner').shown.map((n) => n.text)).toEqual(['Rules: be kind']);
+  });
+
+  it('says which room it is bound to, so an open panel can tell it was beamed away (#330 review)', () => {
+    expect(boardRoomId()).toBe(ROOM);
+    setBoardDeps({ roomId: () => 'room-b', ownerPub: () => undefined, isOwner: () => false, myName: () => 'T', canTrim: () => true });
+    expect(boardRoomId()).toBe('room-b');
+    setBoardDeps(null);
+    expect(boardRoomId()).toBe('');
   });
 
   it('hides an author on this screen only', () => {
