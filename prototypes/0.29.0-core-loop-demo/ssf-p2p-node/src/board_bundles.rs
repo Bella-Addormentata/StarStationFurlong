@@ -89,8 +89,20 @@ pub const MAX_ENTRY_BYTES: usize = 4096;
 /// but a copy may still hold an older one or junk under another stamp.
 pub const CLEARS_PER_BOARD: usize = 2;
 /// CLEARs a bundle carries ahead of the take-downs, in all (four boards' and
-/// room to spare: a key naming a board the room hasn't got is anyone's to add).
+/// room to spare). Only the owner's, signatures checked, so nobody else's
+/// records can take these places.
 pub const MAX_CLEARS: usize = 16;
+/// Keys of the doc's `boardDown` map a publisher looks through for CLEARs
+/// (#336 review): its own scan, past the take-downs', so four boards'
+/// retained take-downs, or keys anyone files for other boards, can't hide
+/// one. Most are only looked at by key.
+pub const MAX_CLEAR_SCAN: usize = 8192;
+/// CLEAR signatures one bundle build checks that it hasn't judged before.
+/// Verdicts are kept, so records with bad signatures stand in front of a
+/// real CLEAR for a few builds at most, and the tab's trim takes them.
+pub const MAX_CLEAR_CHECKS: usize = 64;
+/// CLEAR verdicts a node remembers.
+const MAX_CLEAR_VERDICTS: usize = 4096;
 /// Distinct records a view carries under one key, at most: a carrier may hold
 /// a junk record, or an older CLEAR, under the same key as the real or newer
 /// one, and only the tab can tell them apart (it checks signatures).
@@ -329,29 +341,149 @@ pub fn open_bundle(room_key: &[u8], room_id: &str, b: &Bundle) -> Option<BoardPl
 /// that look like records (a `sig` string, a stamp no more than ten minutes
 /// ahead), newest first, at most MAX_NOTES and MAX_DOWN. Signatures are the
 /// reader's to check.
-pub fn board_from_doc(doc: &yrs::Doc, now_ms: u64) -> BoardContent {
+pub fn board_from_doc(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> BoardContent {
     // A board's CLEAR goes first, whatever its age (#332 review): newest
     // first alone, a CLEAR followed by enough unpins elsewhere would fall out
     // of the bundle, and a reader could then take the cleared notes back
-    // from another publisher's older one. The newest few per board, ahead
-    // of the rest.
-    let all = signed_entries(doc, "boardDown", now_ms, MAX_KEYS_SCANNED);
-    let mut per_board: HashMap<String, usize> = HashMap::new();
-    let (mut down, mut rest): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
-    for (k, v) in all {
-        let board = k.rsplit_once('|').map(|(b, _)| b.to_string()).unwrap_or_default();
-        let n = per_board.entry(board).or_default();
-        if is_clear_key(&k) && *n < CLEARS_PER_BOARD {
-            *n += 1;
-            down.push((k, v));
-        } else if !is_clear_key(&k) {
-            rest.push((k, v));
+    // from another publisher's older one. The owner's newest few per board,
+    // ahead of the rest.
+    let mut down = owner_clears(doc, room_id, now_ms);
+    let room = MAX_DOWN - down.len();
+    let rest = signed_entries(doc, "boardDown", now_ms, MAX_KEYS_SCANNED);
+    down.extend(rest.into_iter().filter(|(k, _)| !is_clear_key(k)).take(room));
+    BoardContent { notes: signed_entries(doc, "boardNotes", now_ms, MAX_NOTES), down }
+}
+
+/// The room owner's identity key as its tabs read it (main.ts
+/// roomOwnerInfo): `roomInfo.owner` names a player, whose `players` entry
+/// holds the key. None for the legacy marker, which names no player.
+fn owner_pub(txn: &impl yrs::ReadTxn) -> Option<String> {
+    use yrs::{Any, Map, Out};
+    let owner = match txn.get_map("roomInfo")?.get(txn, "owner")? {
+        Out::Any(Any::String(s)) => s.to_string(),
+        _ => return None,
+    };
+    if owner.is_empty() || owner == "Local-Clone" {
+        return None;
+    }
+    match txn.get_map("players")?.get(txn, &owner)? {
+        Out::Any(Any::Map(fields)) => match fields.get("keyB64") {
+            Some(Any::String(k)) if !k.is_empty() => Some(k.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The bytes a board take-down's signature covers (boardDoc.ts
+/// downSignBytes: `JSON.stringify` of these fields, in this order).
+fn down_sign_bytes(room_id: &str, item_id: &str, target: &str, by: &str, ts: u64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Signed<'a> {
+        k: &'a str,
+        #[serde(rename = "roomId")]
+        room_id: &'a str,
+        #[serde(rename = "itemId")]
+        item_id: &'a str,
+        target: &'a str,
+        by: &'a str,
+        ts: u64,
+    }
+    serde_json::to_vec(&Signed { k: "ssf-board-down:v1", room_id, item_id, target, by, ts }).unwrap_or_default()
+}
+
+/// Whether an identity key (base64url, as the tabs write it) signed these
+/// bytes (base64url signature).
+fn identity_signed(by: &str, bytes: &[u8], sig: &str) -> bool {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (Ok(key), Ok(sig)) = (b64.decode(by), b64.decode(sig)) else { return false };
+    let (Ok(key), Ok(sig)) = (<[u8; 32]>::try_from(key.as_slice()), <[u8; 64]>::try_from(sig.as_slice())) else {
+        return false;
+    };
+    let Ok(key) = iroh::PublicKey::from_bytes(&key) else { return false };
+    key.verify(bytes, &iroh::Signature::from_bytes(&sig)).is_ok()
+}
+
+fn clear_verdicts() -> &'static std::sync::Mutex<HashMap<[u8; 32], bool>> {
+    static VERDICTS: std::sync::OnceLock<std::sync::Mutex<HashMap<[u8; 32], bool>>> = std::sync::OnceLock::new();
+    VERDICTS.get_or_init(Default::default)
+}
+
+/// Each board's newest CLEARs the room's owner signed, CLEARS_PER_BOARD a
+/// board, boards with the newest first, MAX_CLEARS in all (#336 review: a
+/// CLEAR-shaped record anyone else filed, or one claiming the owner's key
+/// with a bad signature, must not take a real one's place). Nothing while
+/// the doc names no owner: the tabs count no CLEAR then either.
+fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serde_json::Value)> {
+    use yrs::{Any, Map, Out, ReadTxn, Transact};
+    let txn = doc.transact();
+    let Some(owner) = owner_pub(&txn) else { return Vec::new() };
+    let Some(map) = txn.get_map("boardDown") else { return Vec::new() };
+    // Board → (stamp, key, record, signature), the owner's, filed under
+    // their own stamp.
+    let mut boards: HashMap<String, Vec<(u64, String, Any, String)>> = HashMap::new();
+    for (key, value) in map.iter(&txn).take(MAX_CLEAR_SCAN) {
+        if key.len() > 200 || !is_clear_key(key) {
+            continue;
+        }
+        let Out::Any(any) = value else { continue };
+        let Any::Map(fields) = &any else { continue };
+        if !matches!(fields.get("by"), Some(Any::String(b)) if **b == *owner) {
+            continue;
+        }
+        let Some(Any::String(sig)) = fields.get("sig") else { continue };
+        let ts = match fields.get("ts") {
+            Some(Any::Number(n)) if n.fract() == 0.0 && *n > 0.0 && *n <= 9_007_199_254_740_991.0 => *n as u64,
+            Some(Any::BigInt(n)) if *n > 0 => *n as u64,
+            _ => continue,
+        };
+        let Some((item, target)) = key.rsplit_once('|') else { continue };
+        if target != format!("*{ts}") || ts > now_ms + FUTURE_SKEW_SECS * 1000 {
+            continue;
+        }
+        boards.entry(item.to_string()).or_default().push((ts, key.to_string(), any.clone(), sig.to_string()));
+    }
+    let mut verdicts = clear_verdicts().lock().unwrap();
+    let mut checks = 0;
+    // (the board's newest kept stamp, the board, its CLEARs)
+    type Picked = (u64, String, Vec<(String, serde_json::Value)>);
+    let mut picked: Vec<Picked> = Vec::new();
+    for (item, mut found) in boards {
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut kept: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut newest = 0;
+        for (ts, key, any, sig) in found {
+            if kept.len() >= CLEARS_PER_BOARD {
+                break;
+            }
+            let bytes = down_sign_bytes(room_id, &item, "*", &owner, ts);
+            let id = *blake3::hash(&[bytes.as_slice(), sig.as_bytes()].concat()).as_bytes();
+            let ok = match verdicts.get(&id) {
+                Some(ok) => *ok,
+                None if checks < MAX_CLEAR_CHECKS => {
+                    checks += 1;
+                    let ok = identity_signed(&owner, &bytes, &sig);
+                    if verdicts.len() >= MAX_CLEAR_VERDICTS {
+                        verdicts.clear();
+                    }
+                    verdicts.insert(id, ok);
+                    ok
+                }
+                None => continue, // judged in a later build
+            };
+            let Ok(json) = serde_json::to_value(&any) else { continue };
+            if ok && json.to_string().len() <= MAX_ENTRY_BYTES {
+                newest = newest.max(ts);
+                kept.push((key, json));
+            }
+        }
+        if !kept.is_empty() {
+            picked.push((newest, item, kept));
         }
     }
-    down.truncate(MAX_CLEARS);
-    let room = MAX_DOWN - down.len();
-    down.extend(rest.into_iter().take(room));
-    BoardContent { notes: signed_entries(doc, "boardNotes", now_ms, MAX_NOTES), down }
+    picked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    picked.into_iter().flat_map(|(_, _, kept)| kept).take(MAX_CLEARS).collect()
 }
 
 /// A take-down key naming a board's CLEAR (`<item>|*…`).
@@ -1150,10 +1282,89 @@ mod tests {
         assert_eq!(view.down.len(), MAX_VALUES_PER_KEY);
     }
 
+    /// The room owner a test doc names: an identity key the way the tabs
+    /// write one, and its signer.
+    fn owner_key() -> (iroh::SecretKey, String) {
+        use base64::Engine;
+        let sk = iroh::SecretKey::from_bytes(&[7; 32]);
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.public().as_bytes());
+        (sk, pub_b64)
+    }
+
+    /// A CLEAR record as a tab files it (boardDoc.ts signDown), signed by `sk`.
+    fn signed_clear(room: &str, item: &str, ts: u64, sk: &iroh::SecretKey, by: &str) -> yrs::Any {
+        use base64::Engine;
+        let sig = sk.sign(&down_sign_bytes(room, item, "*", by, ts));
+        let mut m = std::collections::HashMap::new();
+        m.insert("v".to_string(), yrs::Any::Number(1.0));
+        m.insert("by".to_string(), yrs::Any::from(by));
+        m.insert("ts".to_string(), yrs::Any::Number(ts as f64));
+        m.insert("sig".to_string(), yrs::Any::from(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())));
+        yrs::Any::from(m)
+    }
+
+    /// Name `by` as the doc's owner, as the tabs do.
+    fn name_owner(doc: &yrs::Doc, by: &str) {
+        use yrs::{Map, Transact};
+        let info = doc.get_or_insert_map("roomInfo");
+        let players = doc.get_or_insert_map("players");
+        let mut txn = doc.transact_mut();
+        info.insert(&mut txn, "owner", "player-owner");
+        let mut p = std::collections::HashMap::new();
+        p.insert("keyB64".to_string(), yrs::Any::from(by));
+        players.insert(&mut txn, "player-owner", yrs::Any::from(p));
+    }
+
+    #[test]
+    fn a_take_downs_signed_bytes_are_the_tabs() {
+        // boardDoc.test.ts checks the same string from downSignBytes.
+        let bytes = down_sign_bytes("room-a", "cork", "*", "abc", 500);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"k":"ssf-board-down:v1","roomId":"room-a","itemId":"cork","target":"*","by":"abc","ts":500}"#
+        );
+    }
+
+    #[test]
+    fn a_publisher_carries_only_the_owners_signed_clears_however_many_keys_are_ahead() {
+        use yrs::{Map, Transact};
+        let (sk, by) = owner_key();
+        let (other, other_by) = (iroh::SecretKey::from_bytes(&[9; 32]), "x".to_string());
+        let doc = yrs::Doc::new();
+        name_owner(&doc, &by);
+        let downs = doc.get_or_insert_map("boardDown");
+        {
+            let mut txn = doc.transact_mut();
+            // Four boards' worth of take-downs, and junk for boards that
+            // aren't there, all ahead of the CLEAR in the map.
+            let td = signed_clear("r", "ghost", 4_000, &sk, &by);
+            for i in 0..(MAX_KEYS_SCANNED + 600) {
+                downs.insert(&mut txn, format!("ghost-{i}|{:032x}", i), td.clone());
+            }
+            downs.insert(&mut txn, "cork|*1000", signed_clear("r", "cork", 1_000, &sk, &by));
+            // Newer records that must not take its place: one claiming the
+            // owner with another's signature, one by someone else's key, one
+            // signed for another room.
+            downs.insert(&mut txn, "cork|*3000", signed_clear("r", "cork", 3_000, &other, &by));
+            downs.insert(&mut txn, "cork|*2500", signed_clear("r", "cork", 2_500, &other, &other_by));
+            downs.insert(&mut txn, "cork|*2000", signed_clear("elsewhere", "cork", 2_000, &sk, &by));
+        }
+        let read = board_from_doc(&doc, "r", 5_000);
+        assert_eq!(read.down.first().map(|(k, _)| k.as_str()), Some("cork|*1000"));
+        assert_eq!(read.down.iter().filter(|(k, _)| is_clear_key(k)).count(), 1);
+        // Nothing counts while the doc names no owner.
+        let bare = yrs::Doc::new();
+        let d = bare.get_or_insert_map("boardDown");
+        d.insert(&mut bare.transact_mut(), "cork|*1000", signed_clear("r", "cork", 1_000, &sk, &by));
+        assert!(board_from_doc(&bare, "r", 5_000).down.is_empty());
+    }
+
     #[test]
     fn a_publisher_reads_note_shaped_entries_from_its_doc_newest_first() {
         use yrs::{Any, Map, Transact};
+        let (sk, by) = owner_key();
         let doc = yrs::Doc::new();
+        name_owner(&doc, &by);
         let map = doc.get_or_insert_map("boardNotes");
         // Both maps before the write transaction: getting one inside it would
         // wait on the transaction itself.
@@ -1182,15 +1393,15 @@ mod tests {
             huge.insert("text".to_string(), Any::from("x".repeat(MAX_ENTRY_BYTES)));
             map.insert(&mut txn, "cork|huge", Any::from(huge));
             downs.insert(&mut txn, "cork|gone", entry(1_500.0, true));
-            downs.insert(&mut txn, "cork|*500", entry(500.0, true));
+            downs.insert(&mut txn, "cork|*500", signed_clear("r", "cork", 500, &sk, &by));
             downs.insert(&mut txn, "cork|unsigned", entry(2_600.0, false));
             // An old CLEAR goes ahead of every take-down; a board's oldest
             // CLEAR past CLEARS_PER_BOARD doesn't go at all.
-            downs.insert(&mut txn, "case|*300", entry(300.0, true));
-            downs.insert(&mut txn, "case|*200", entry(200.0, true));
-            downs.insert(&mut txn, "case|*100", entry(100.0, true));
+            downs.insert(&mut txn, "case|*300", signed_clear("r", "case", 300, &sk, &by));
+            downs.insert(&mut txn, "case|*200", signed_clear("r", "case", 200, &sk, &by));
+            downs.insert(&mut txn, "case|*100", signed_clear("r", "case", 100, &sk, &by));
         }
-        let read = board_from_doc(&doc, 5_000);
+        let read = board_from_doc(&doc, "r", 5_000);
         let downs: Vec<&str> = read.down.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(downs, vec!["cork|*500", "case|*300", "case|*200", "cork|gone"]);
         let notes = read.notes;

@@ -4339,7 +4339,7 @@ async fn board_bundle_tick(hub: &SharedHub) {
             .iter()
             .filter_map(|(room, key)| {
                 let r = rooms.get(room)?;
-                r.served.then(|| (room.clone(), *key, board_bundles::board_from_doc(&r.doc, now_ms)))
+                r.served.then(|| (room.clone(), *key, board_bundles::board_from_doc(&r.doc, room, now_ms)))
             })
             .collect();
         let mut peers: HashMap<PublicKey, (String, iroh::endpoint::Connection)> = HashMap::new();
