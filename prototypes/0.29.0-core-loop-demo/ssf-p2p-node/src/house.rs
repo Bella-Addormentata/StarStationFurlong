@@ -49,7 +49,7 @@
 //! 5. **puts back** what it wrote, its delegation and the owner's newest
 //!    Fair setting (`hf:<t>`), when a peer deletes or replaces them;
 //! 6. **steps down** when the owner sets a table Friendly, and when it is
-//!    told to stop ([`House::begin_step_down`]): a reveal listing no close
+//!    told to stop ([`step_down`]): a reveal listing no close
 //!    (computedFold's STEP-DOWN) lifts the requirement its last commitment
 //!    set, so the table carries on Friendly with no void. A round already
 //!    closed on that commitment is revealed instead, without a next one
@@ -60,19 +60,28 @@
 //! checked before (the pages' 40 ms slices, casinoDoc computedCheck), and a
 //! room or table whose read needed more does nothing that tick, the checks
 //! carrying on at the next: a peer's flood of forged records in one room
-//! holds the node's loop, and the rooms its lock serves, no longer than a
-//! budget a tick. After a tick a read was short, the next starts at the
-//! table after the one it started at: a flood at one table holds the
-//! room's others back no more than a tick in turn. Only what a table's
-//! records name is checked: another house's delegation as its records
-//! come, the owner's setting of each house table switched on.
+//! holds the node's loop no longer than a budget a tick. After a tick a
+//! read was short, the next starts at the table after the one it started
+//! at: a flood at one table holds the room's others back no more than a
+//! tick in turn. Only what a table's records name is checked: another
+//! house's delegation as its records come, the owner's setting of each house
+//! table switched on. And none inside the doc's transaction: a tick reads
+//! in passes ([`House::tick`]), each asking for the checks it lacks, which
+//! are made with the doc let go, so a room's own sync waits on the house no
+//! longer than a read, and another room's not at all (main.rs room_doc).
+//!
+//! Stopping ([`step_down`]) steps every room down within a tick's budget
+//! first, each room's records sent as they are written, then the rooms
+//! that were short of it with every check they need: a flood in one room
+//! holds back no other room's step-down. A tick that panics is that room's
+//! alone ([`tick_room`]): the other rooms, and the step-down, go on.
 //!
 //! The rules are computedFold's (THE HOUSE) and the bytes house_bytes.rs's.
 //! The node never decides a round: the pages' fold does, from the records.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, Transact, TransactionMut, WriteTxn};
 
@@ -121,6 +130,11 @@ pub const MAX_KEPT: usize = 64;
 /// Signatures a tick of a room checks that it hasn't before (about 15 ms of
 /// strict ed25519): past it, what waits on them waits a tick.
 pub const VERIFY_PER_TICK: usize = 256;
+/// A tick's passes: a slip, then a close it signed, then a forfeit of it,
+/// then what the house does, all in a tick; anything deeper waits a tick.
+pub const MAX_PASSES: usize = 4;
+/// The step-down's last word reads on deeper than that ([`step_down`]).
+const MAX_PASSES_STOPPING: usize = 64;
 /// Verdicts kept, the oldest going first.
 const MAX_VERDICTS: usize = 50_000;
 
@@ -545,14 +559,29 @@ pub struct House {
     /// anew): the latest [`MAX_VERDICTS`], in the order they were given.
     verdicts: HashMap<VerdictId, bool>,
     verdict_order: VecDeque<VerdictId>,
-    /// Checks this tick may still make ([`VERIFY_PER_TICK`]; unbounded while
-    /// stepping down: the last tick must write what it owes), and whether
-    /// one was put off since `deferred` was last cleared.
+    /// Checks this tick may still ask for ([`VERIFY_PER_TICK`]; unbounded
+    /// in the step-down's last word), and whether one was put off since
+    /// `deferred` was last cleared.
     budget: usize,
     deferred: bool,
+    /// The checks this pass asked for (key, bytes, signature by verdict),
+    /// made with the doc let go, and whether a read of this pass was short
+    /// (a table's, the room's own).
+    wanted: HashMap<VerdictId, (String, Option<[u8; 32]>, String)>,
+    short: bool,
+    /// The verdicts given this tick (the newest of `verdict_order`): none of
+    /// them goes to make room while it runs, so a pass never asks again.
+    fresh: usize,
+    /// Each table this tick is through with (its duties done, or short of a
+    /// check past the budget), whether it counts as running Fair, and
+    /// whether it was short: a later pass reads only the others.
+    through: HashMap<(String, String), (bool, bool)>,
     stepping_down: bool,
     /// [`SETTLE_MS`] (tests set 0).
     settle_ms: u64,
+    /// Called with the room before each signature check (tests).
+    #[cfg(test)]
+    on_check: Option<Box<dyn FnMut(&str) + Send>>,
 }
 
 /// What [`House::tick`] did in a room.
@@ -562,6 +591,9 @@ pub struct TickOut {
     pub update: Option<Vec<u8>>,
     /// How many records it wrote.
     pub wrote: usize,
+    /// Whether a read was short of checks when it ended (the next tick, or
+    /// the step-down's last word, carries on).
+    pub short: bool,
 }
 
 impl House {
@@ -587,8 +619,14 @@ impl House {
             verdict_order: VecDeque::new(),
             budget: VERIFY_PER_TICK,
             deferred: false,
+            wanted: HashMap::new(),
+            short: false,
+            fresh: 0,
+            through: HashMap::new(),
             stepping_down: false,
             settle_ms: SETTLE_MS,
+            #[cfg(test)]
+            on_check: None,
         })
     }
 
@@ -609,27 +647,39 @@ impl House {
 
     /// Whether `g` is `k`'s signature of `bytes`, record `hash` of `kind` at
     /// `at` (room, table, incarnation; "" where the kind has none): checked
-    /// once there. None when this tick's checks are spent (`deferred` set):
-    /// not known yet.
+    /// once there. None (`deferred` set) when not checked yet: asked for
+    /// while the budget lasts, and checked with the doc let go (a check
+    /// inside the doc's transaction would hold the room's sync on it).
     fn verified(&mut self, kind: &'static str, at: [&str; 3], hash: &str, k: &str, bytes: Option<[u8; 32]>, g: &str) -> Option<bool> {
         let id = (kind, at.map(str::to_string), hash.to_string());
         if let Some(v) = self.verdicts.get(&id) {
             return Some(*v);
         }
-        if self.budget == 0 {
-            self.deferred = true;
-            return None;
+        self.deferred = true;
+        if self.budget > 0 && !self.wanted.contains_key(&id) {
+            self.budget -= 1;
+            self.wanted.insert(id, (k.to_string(), bytes, g.to_string()));
         }
-        self.budget -= 1;
-        let ok = bytes.is_some_and(|b| hb::verify(k, &b, g));
-        if self.verdicts.len() >= MAX_VERDICTS {
-            if let Some(old) = self.verdict_order.pop_front() {
-                self.verdicts.remove(&old);
+        None
+    }
+
+    /// The checks the pass asked for, the doc let go.
+    fn check_wanted(&mut self) {
+        for (id, (k, bytes, g)) in std::mem::take(&mut self.wanted) {
+            #[cfg(test)]
+            if let Some(f) = self.on_check.as_mut() {
+                f(&id.1[0]);
             }
+            let ok = bytes.is_some_and(|b| hb::verify(&k, &b, &g));
+            while self.verdicts.len() >= MAX_VERDICTS && self.verdict_order.len() > self.fresh {
+                if let Some(old) = self.verdict_order.pop_front() {
+                    self.verdicts.remove(&old);
+                }
+            }
+            self.verdict_order.push_back(id.clone());
+            self.verdicts.insert(id, ok);
+            self.fresh += 1;
         }
-        self.verdict_order.push_back(id.clone());
-        self.verdicts.insert(id, ok);
-        Some(ok)
     }
 
     /// Whether `k` is a house of room `room` under the deed holder's key
@@ -716,16 +766,66 @@ impl House {
 
     /// One tick of the house in room `room` (its doc `doc`), at `now` on a
     /// monotonic clock (ms) and `wall` (ms since the epoch: the heartbeat's
-    /// count). Reads the doc and writes what it decided in one transaction:
-    /// nothing a peer sent comes between (the node lets the room's lock go
-    /// while it ticks, main.rs served_docs).
+    /// count), in passes. A pass reads the doc and writes what it decided in
+    /// one transaction (nothing a peer sent comes between: the node lets the
+    /// rooms lock go while it ticks, main.rs room_doc), asking for the checks
+    /// it lacks; they are made with the doc let go, and the next pass reads
+    /// the tables still short of them, [`MAX_PASSES`] at most and
+    /// [`VERIFY_PER_TICK`] checks in all. Its update is every pass's.
     pub fn tick(&mut self, room: &str, doc: &Doc, now: u64, wall: u64) -> TickOut {
-        self.budget = if self.stepping_down { usize::MAX } else { VERIFY_PER_TICK };
-        self.deferred = false;
-        let mut txn = doc.transact_mut();
-        let writes = self.plan(room, &txn, now, wall);
-        let wrote = writes.len();
-        TickOut { update: apply(&mut txn, &writes), wrote }
+        self.tick_with(room, doc, now, wall, VERIFY_PER_TICK, MAX_PASSES)
+    }
+
+    /// A tick with every check it needs: the step-down's last word in a room
+    /// whose tick was short ([`step_down`]).
+    pub fn tick_unbounded(&mut self, room: &str, doc: &Doc, now: u64, wall: u64) -> TickOut {
+        self.tick_with(room, doc, now, wall, usize::MAX, MAX_PASSES_STOPPING)
+    }
+
+    fn tick_with(&mut self, room: &str, doc: &Doc, now: u64, wall: u64, budget: usize, passes: usize) -> TickOut {
+        self.budget = budget;
+        self.fresh = 0;
+        self.through.clear();
+        self.wanted.clear();
+        let mut out = TickOut::default();
+        let mut updates = Vec::new();
+        for pass in 1..=passes {
+            self.deferred = false;
+            self.short = false;
+            {
+                let mut txn = doc.transact_mut();
+                let writes = self.plan(room, &txn, now, wall);
+                out.wrote += writes.len();
+                updates.extend(apply(&mut txn, &writes));
+            }
+            out.short = self.short;
+            if self.wanted.is_empty() {
+                break;
+            }
+            self.check_wanted();
+            // (The last pass's checks too: the next tick reads them.)
+            if pass == passes {
+                out.short = true;
+            }
+        }
+        self.through.clear();
+        while self.verdicts.len() > MAX_VERDICTS {
+            if let Some(old) = self.verdict_order.pop_front() {
+                self.verdicts.remove(&old);
+            }
+        }
+        // After a tick a read was short, the next starts at the next table.
+        if out.short {
+            if let Some(mem) = self.rooms.get_mut(room) {
+                mem.turn = mem.turn.wrapping_add(1);
+            }
+        }
+        out.update = match updates.len() {
+            0 => None,
+            1 => updates.pop(),
+            _ => Some(yrs::merge_updates_v1(&updates).expect("the doc's own updates decode")),
+        };
+        out
     }
 
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
@@ -762,8 +862,11 @@ impl House {
             }
             _ => None,
         };
-        // (Its check put off: next tick.)
-        let Some(delegation) = delegation else { return writes };
+        // (Its check put off: the next pass.)
+        let Some(delegation) = delegation else {
+            self.short |= self.deferred;
+            return writes;
+        };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
 
         // Every house the deed holder delegated (another of their nodes is a
@@ -809,35 +912,45 @@ impl House {
                 self.rooms.get_mut(room).unwrap().fair.insert(t.to_string(), v);
             }
         }
-        // (A setting not checked yet: nothing at any table, next tick.)
+        // (A setting not checked yet: nothing at any table, the next pass.)
         if self.deferred {
+            self.short = true;
             return writes;
         }
 
         let mut fair_tables = 0;
-        let mut short = false;
         if !tables.is_empty() {
             let turn = self.rooms[room].turn % tables.len();
             tables.rotate_left(turn);
         }
         for (t, inc) in tables {
+            let key = (t.clone(), inc.clone());
+            if let Some((fair, short)) = self.through.get(&key) {
+                fair_tables += usize::from(*fair);
+                self.short |= *short;
+                continue;
+            }
             let ctx = Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() };
             self.deferred = false;
-            let Some(read) = self.read_table(&comp, txn, ctx, &owner_key) else { continue };
+            let Some(read) = self.read_table(&comp, txn, ctx, &owner_key) else {
+                self.through.insert(key, (false, false));
+                continue;
+            };
             let friendly = self.rooms[room].fair.get(&t).and_then(|v| v.get("m").and_then(CVal::as_int)) == Some(1);
             if !friendly {
                 fair_tables += 1;
             }
-            // (Read short of a check: it does nothing there this tick.)
+            // (Read short of a check: it does nothing there this pass; and
+            // no pass of this tick reads it again once the budget is spent.)
             if self.deferred {
-                short = true;
+                self.short = true;
+                if self.budget == 0 {
+                    self.through.insert(key, (!friendly, true));
+                }
             } else {
                 self.table_duties(room, &read, friendly, now, &mut writes);
+                self.through.insert(key, (!friendly, false));
             }
-        }
-        if short {
-            let mem = self.rooms.get_mut(room).unwrap();
-            mem.turn = mem.turn.wrapping_add(1);
         }
 
         // The heartbeat, while a table runs Fair.
@@ -847,7 +960,7 @@ impl House {
             // It counts on from the doc's beat only as it signed it: a peer's
             // copy with a higher count would push its own past what the
             // pages take.
-            // (Its check put off: the beat waits a tick.)
+            // (Its check put off: the beat waits a pass.)
             self.deferred = false;
             let in_doc = top_value(&comp, txn, &beat_key)
                 .filter(|v| {
@@ -1455,6 +1568,59 @@ impl House {
         let mem = self.rooms.get_mut(room).unwrap().tables.get_mut(table).unwrap();
         mem.written.push((ses.to_string(), key.clone(), rec.clone()));
         writes.push(Write::Session { ses: ses.to_string(), key, value: rec });
+    }
+}
+
+/// The house, a tick that panicked while holding it notwithstanding: its
+/// memory is at worst a round ahead of the doc (a reveal noted and never
+/// written voids that round, as a crash there would), and a house that
+/// stopped at one room's panic would leave every room's tables to void, its
+/// step-down undone.
+pub fn lock(house: &Mutex<House>) -> MutexGuard<'_, House> {
+    house.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One tick of the house in one room (`unbounded`: the step-down's last
+/// word, [`House::tick_unbounded`]), a panic in it that room's alone: logged,
+/// nothing sent, and the other rooms ticked as ever.
+pub fn tick_room(house: &Mutex<House>, room: &str, doc: &Doc, now: u64, wall: u64, unbounded: bool) -> TickOut {
+    let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut house = lock(house);
+        if unbounded {
+            house.tick_unbounded(room, doc, now, wall)
+        } else {
+            house.tick(room, doc, now, wall)
+        }
+    }));
+    ticked.unwrap_or_else(|e| {
+        let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        eprintln!("🏠 house: its tick in room {room} failed ({why}); the other rooms go on");
+        TickOut::default()
+    })
+}
+
+/// Step the house down in every room of `docs` (main.rs house_step_down),
+/// handing each room's update to `sent` (room, update, records) as soon as
+/// it is written: first every room within a tick's budget (the loop has
+/// made most of the checks), then each room that was short of it with every
+/// check it needs: a flood in one room holds back no other's step-down.
+pub fn step_down(house: &Mutex<House>, docs: Vec<(String, Doc)>, now: u64, mut sent: impl FnMut(String, Vec<u8>, usize)) {
+    lock(house).begin_step_down();
+    let mut short = Vec::new();
+    for (room, doc) in docs {
+        let out = tick_room(house, &room, &doc, now, 0, false);
+        if let Some(update) = out.update {
+            sent(room.clone(), update, out.wrote);
+        }
+        if out.short {
+            short.push((room, doc));
+        }
+    }
+    for (room, doc) in short {
+        let out = tick_room(house, &room, &doc, now, 0, true);
+        if let Some(update) = out.update {
+            sent(room, update, out.wrote);
+        }
     }
 }
 

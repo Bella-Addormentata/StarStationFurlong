@@ -1762,17 +1762,7 @@ async fn main() -> Result<()> {
             let mut last_hash: HashMap<String, [u8; 32]> = HashMap::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                let snapshots: Vec<(String, Vec<u8>)> = {
-                    let rooms = hub_persist.rooms.lock().unwrap();
-                    rooms
-                        .iter()
-                        .filter(|(_, room)| room.served)
-                        .map(|(id, room)| {
-                            let txn = room.doc.transact();
-                            (id.clone(), txn.encode_diff_v1(&StateVector::default()))
-                        })
-                        .collect()
-                };
+                let snapshots = served_snapshots(&hub_persist.rooms);
                 for (room_id, snapshot) in snapshots {
                     if snapshot.is_empty() {
                         continue; // never persist an empty doc over a good file
@@ -1839,21 +1829,14 @@ async fn main() -> Result<()> {
         mesh_maintenance_loop(hub_heartbeat, iroh_heartbeat).await;
     });
 
-    // 🏠 The house's loop (house.rs), and its step-down on Ctrl-C: the
-    // tables it runs go on Friendly with no void.
+    // 🏠 The house's loop (house.rs), and its step-down on a stop signal
+    // (house_stop_on_signal): the tables it runs go on Friendly with no void.
     if hub.house.is_some() {
         let hub_house = hub.clone();
         tokio::spawn(async move {
             house_loop(hub_house).await;
         });
-        let hub_stop = hub.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                let wrote = house_step_down(&hub_stop).await;
-                println!("🏠 House stepped down ({wrote} record(s)) — stopping");
-                std::process::exit(130);
-            }
-        });
+        tokio::spawn(house_stop_on_signal(hub.clone()));
     }
 
     // 📦🏠 The room's host keeps copies of what its rooms' TVs played
@@ -3579,20 +3562,12 @@ fn handle_iroh_connection(
                             });
                             match sub {
                                 Some((0, 0, cursor)) => {
-                                    // Relayed SyncStep1: answer from our doc when served.
-                                    // Diff built under the lock, sent after dropping it.
-                                    let diff = {
-                                        let rooms = hub_clone.rooms.lock().unwrap();
-                                        match rooms.get(room_id) {
-                                            Some(room) if room.served => {
-                                                read_length_and_buf(&envelope.payload, cursor)
-                                                    .ok()
-                                                    .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok())
-                                                    .map(|client_sv| room.doc.transact().encode_diff_v1(&client_sv))
-                                            }
-                                            _ => None,
-                                        }
-                                    };
+                                    // Relayed SyncStep1: answer from our doc when served
+                                    // (read with the rooms lock let go: room_diff).
+                                    let diff = read_length_and_buf(&envelope.payload, cursor)
+                                        .ok()
+                                        .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok())
+                                        .and_then(|client_sv| room_diff(&hub_clone.rooms, room_id, &client_sv, true));
                                     if let Some(diff) = diff {
                                         let mut encoder = EncoderV1::new();
                                         encoder.write_var(0u32); // messageType = Sync
@@ -3624,11 +3599,7 @@ fn handle_iroh_connection(
                                     // SyncStep2 / Update: merge into our replica (as before).
                                     if let Ok((update_bytes, _)) = read_length_and_buf(&envelope.payload, cursor) {
                                         if let Ok(update) = Update::decode_v1(&update_bytes) {
-                                            let rooms = hub_clone.rooms.lock().unwrap();
-                                            if let Some(room) = rooms.get(room_id) {
-                                                let mut txn = room.doc.transact_mut();
-                                                let _ = txn.apply_update(update);
-                                            }
+                                            let _ = apply_to_room(&hub_clone.rooms, room_id, update);
                                         }
                                     }
                                 }
@@ -3748,7 +3719,13 @@ async fn house_loop(hub: SharedHub) {
         let mut sent = house_sends().lock().await;
         // Its checks are CPU work: off the runtime's threads.
         let hub_tick = hub.clone();
-        let updates = tokio::task::spawn_blocking(move || house_tick(&hub_tick)).await.unwrap_or_default();
+        let updates = match tokio::task::spawn_blocking(move || house_tick(&hub_tick)).await {
+            Ok(updates) => updates,
+            Err(e) => {
+                eprintln!("🏠 house: its tick failed ({e})");
+                Vec::new()
+            }
+        };
         let now = house_now();
         while sent.front().is_some_and(|(at, _, _)| now.saturating_sub(*at) > HOUSE_RESEND_MS) {
             sent.pop_front();
@@ -3760,12 +3737,95 @@ async fn house_loop(hub: SharedHub) {
     }
 }
 
-/// The served rooms and their docs (a doc is a handle on the room's own),
-/// taken under the rooms lock and let go: every room's sync waits on that
-/// lock, and a tick of the house (its signature checks) must not hold them.
-fn served_docs(hub: &SharedHub) -> Vec<(String, yrs::Doc)> {
-    let rooms = hub.rooms.lock().unwrap();
+/// Room `room_id`'s doc (a handle on the room's own; `served_only`: a room
+/// this node serves), taken under the rooms lock and let go. Every room's
+/// sync waits on that lock, so nothing transacts a doc holding it: a doc's
+/// transaction (a tick of the house, a big room's diff) waits on, and holds,
+/// that room alone.
+fn room_doc(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, served_only: bool) -> Option<Doc> {
+    rooms.lock().unwrap().get(room_id).filter(|r| r.served || !served_only).map(|r| r.doc.clone())
+}
+
+/// The served rooms and their docs, as [`room_doc`] takes one.
+fn served_docs(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Doc)> {
+    let rooms = rooms.lock().unwrap();
     rooms.iter().filter(|(_, r)| r.served).map(|(id, r)| (id.clone(), r.doc.clone())).collect()
+}
+
+/// What room `room_id`'s doc holds past `sv` (a SyncStep2's diff), the doc
+/// read with the rooms lock let go ([`room_doc`]).
+fn room_diff(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, sv: &StateVector, served_only: bool) -> Option<Vec<u8>> {
+    room_doc(rooms, room_id, served_only).map(|doc| doc.transact().encode_diff_v1(sv))
+}
+
+/// `update` merged into room `room_id`'s doc, the same way (None: no such room).
+fn apply_to_room(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, update: Update) -> Option<Result<(), yrs::error::UpdateError>> {
+    room_doc(rooms, room_id, false).map(|doc| doc.transact_mut().apply_update(update))
+}
+
+/// Every served room's whole doc, for the disk, the same way.
+fn served_snapshots(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Vec<u8>)> {
+    served_docs(rooms).into_iter().map(|(id, doc)| (id, doc.transact().encode_diff_v1(&StateVector::default()))).collect()
+}
+
+#[cfg(test)]
+mod room_lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use yrs::Map;
+
+    fn room(doc: &Doc) -> Room {
+        Room {
+            doc: doc.clone(),
+            local_connections: HashMap::new(),
+            remote_peers: HashMap::new(),
+            candidates: HashMap::new(),
+            retained: RetainStore::new(),
+            served: true,
+        }
+    }
+
+    /// 🏠 A room's doc held (the house's tick, a big room's diff): every sync
+    /// of that room waits on it with the rooms lock let go, so another room's
+    /// sync, and the lock itself, never wait on it.
+    #[test]
+    fn a_sync_waiting_on_one_rooms_doc_holds_no_other_room() {
+        let (a, b) = (Doc::new(), Doc::new());
+        let rooms = Arc::new(Mutex::new(HashMap::from([("a".to_string(), room(&a)), ("b".to_string(), room(&b))])));
+        let update = {
+            let other = Doc::new();
+            let m = other.get_or_insert_map("m");
+            let mut txn = other.transact_mut();
+            m.insert(&mut txn, "k", 1.0);
+            txn.encode_update_v1()
+        };
+        let held = a.transact_mut();
+        let waiting: Vec<std::thread::JoinHandle<bool>> = vec![
+            {
+                let rooms = rooms.clone();
+                std::thread::spawn(move || room_diff(&rooms, "a", &StateVector::default(), true).is_some())
+            },
+            {
+                let (rooms, update) = (rooms.clone(), update.clone());
+                std::thread::spawn(move || matches!(apply_to_room(&rooms, "a", Update::decode_v1(&update).unwrap()), Some(Ok(()))))
+            },
+            {
+                let rooms = rooms.clone();
+                std::thread::spawn(move || served_snapshots(&rooms).len() == 2)
+            },
+        ];
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(waiting.iter().all(|w| !w.is_finished()), "each waits on room a's doc");
+        assert!(rooms.try_lock().is_ok(), "with the rooms lock let go");
+        let t = Instant::now();
+        assert!(room_diff(&rooms, "b", &StateVector::default(), true).is_some());
+        assert!(matches!(apply_to_room(&rooms, "b", Update::decode_v1(&update).unwrap()), Some(Ok(()))));
+        assert!(t.elapsed() < Duration::from_millis(150), "room b's sync goes on");
+        drop(held);
+        assert!(waiting.into_iter().all(|w| w.join().unwrap()));
+        let txn = a.transact();
+        assert!(txn.get_map("m").is_some_and(|m| m.get(&txn, "k").is_some()), "room a's update went in once let go");
+    }
 }
 
 /// One tick of the house over the served rooms: (room, update) for each it wrote in.
@@ -3777,53 +3837,126 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut out = Vec::new();
-    for (room_id, doc) in served_docs(hub) {
-        if let Some(update) = house.lock().unwrap().tick(&room_id, &doc, now, wall).update {
+    for (room_id, doc) in served_docs(&hub.rooms) {
+        if let Some(update) = house::tick_room(house, &room_id, &doc, now, wall, false).update {
             out.push((room_id, update));
         }
     }
     out
 }
 
-/// Step the house down in every served room now, and send it: how many
-/// records it wrote. Not inside a tick of the loop (it waits for one to have
-/// sent), and with the loop's recent updates sent again before its own: it
-/// waits until each tab and peer has acknowledged all of them (at most
-/// 900 ms, as the app gives the node about a second before it stops it):
-/// bytes still in a buffer when the node stops are a void for nothing.
-async fn house_step_down(hub: &SharedHub) -> usize {
-    let Some(house) = hub.house.as_ref() else { return 0 };
+/// Step the house down in every served room now (house.rs step_down), and
+/// send it: how many records it sent. Not inside a tick of the loop (it
+/// waits for one to have sent). The loop's recent updates go again before
+/// its own, and each room's as soon as it is written (a flood in one room
+/// holds back no other's); then it waits until each tab and peer has
+/// acknowledged all of them, at most `within_ms` from its start (the app
+/// stops the node a second and a half after asking), since bytes still in a
+/// buffer when the node stops are a void for nothing. A room still being
+/// checked by then is left to finish, its records going out with the sync.
+async fn house_step_down(hub: &SharedHub, within_ms: u64) -> usize {
+    if hub.house.is_none() {
+        return 0;
+    }
     let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(within_ms);
     let mut sent = house_sends().lock().await;
-    house.lock().unwrap().begin_step_down();
-    let mut wrote = 0;
-    let hub_tick = hub.clone();
-    let updates: Vec<(String, Vec<u8>, usize)> = tokio::task::spawn_blocking(move || {
-        let Some(house) = hub_tick.house.as_ref() else { return Vec::new() };
-        let now = house_now();
-        served_docs(&hub_tick)
-            .into_iter()
-            .filter_map(|(id, doc)| {
-                let out = house.lock().unwrap().tick(&id, &doc, now, 0);
-                out.update.map(|u| (id, u, out.wrote))
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
     let mut sends = Vec::new();
     let now = house_now();
     for (_, room_id, update) in sent.drain(..).filter(|(at, _, _)| now.saturating_sub(*at) <= HOUSE_RESEND_MS) {
         sends.extend(send_house_update(hub, &room_id, update, true).await);
     }
-    for (room_id, update, n) in updates {
-        wrote += n;
-        sends.extend(send_house_update(hub, &room_id, update, true).await);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>, usize)>();
+    let hub_tick = hub.clone();
+    let ticking = tokio::task::spawn_blocking(move || {
+        if let Some(house) = hub_tick.house.as_ref() {
+            house::step_down(house, served_docs(&hub_tick.rooms), house_now(), |room, update, n| {
+                let _ = tx.send((room, update, n));
+            });
+        }
+    });
+    let mut wrote = 0;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((room_id, update, n))) => {
+                wrote += n;
+                sends.extend(send_house_update(hub, &room_id, update, true).await);
+            }
+            Ok(None) => {
+                if let Err(e) = ticking.await {
+                    eprintln!("🏠 house: its step-down failed ({e})");
+                }
+                break;
+            }
+            Err(_) => {
+                eprintln!("🏠 house: a room still being checked {} ms on; stepping down with what went out", started.elapsed().as_millis());
+                break;
+            }
+        }
     }
-    let left = std::time::Duration::from_millis(900).saturating_sub(started.elapsed());
-    let _ = tokio::time::timeout(left, futures_join(sends)).await;
+    let _ = tokio::time::timeout_at(deadline, futures_join(sends)).await;
     drop(sent);
     wrote
+}
+
+/// The first signal that stops the node, by name: Ctrl-C everywhere; on
+/// unix SIGTERM too (a service manager's stop, `kill`); on Windows the
+/// console closing, a log-off and a shutdown (each waits on the handler).
+/// SIGHUP is left as it was: under `nohup` it is ignored, and stays so.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            Ok(()) = tokio::signal::ctrl_c() => "SIGINT",
+            Some(()) = async { term.as_mut()?.recv().await } => "SIGTERM",
+            else => std::future::pending().await,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut close = ctrl_close().ok();
+        let mut logoff = ctrl_logoff().ok();
+        let mut shutdown = ctrl_shutdown().ok();
+        tokio::select! {
+            Ok(()) = tokio::signal::ctrl_c() => "Ctrl-C",
+            Some(()) = async { close.as_mut()?.recv().await } => "the console closing",
+            Some(()) = async { logoff.as_mut()?.recv().await } => "a log-off",
+            Some(()) = async { shutdown.as_mut()?.recv().await } => "a shutdown",
+            else => std::future::pending().await,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
+/// How long a signal's step-down may take before the node stops all the
+/// same (a second signal stops it at once).
+const HOUSE_STOP_MS: u64 = 5_000;
+
+/// On the first stop signal, step the house down and stop; on a second, or
+/// past [`HOUSE_STOP_MS`], stop at once. A step-down that fails still stops
+/// the node: the signal's handler took the place of the default one.
+async fn house_stop_on_signal(hub: SharedHub) {
+    let why = stop_signal().await;
+    println!("🏠 {why}: stepping the house down");
+    let stepping = tokio::spawn(async move { house_step_down(&hub, HOUSE_STOP_MS - 500).await });
+    tokio::select! {
+        done = stepping => match done {
+            Ok(wrote) => println!("🏠 House stepped down ({wrote} record(s)) — stopping"),
+            Err(e) => eprintln!("🏠 house: its step-down failed ({e}) — stopping"),
+        },
+        again = stop_signal() => println!("🏠 {again} again — stopping now"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(HOUSE_STOP_MS)) => {
+            eprintln!("🏠 house: its step-down took over {HOUSE_STOP_MS} ms — stopping");
+        }
+    }
+    std::process::exit(if why == "SIGTERM" { 143 } else { 130 });
 }
 
 async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -4592,12 +4725,7 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             encoder.write_var(0u32); // messageType = Sync
             encoder.write_var(1u32); // syncSubType = SyncStep2
 
-            let missing_diff = {
-                let rooms = hub.rooms.lock().unwrap();
-                let room = rooms.get(room_id).unwrap();
-                let txn = room.doc.transact();
-                txn.encode_diff_v1(&client_sv)
-            };
+            let missing_diff = room_diff(&hub.rooms, room_id, &client_sv, false).ok_or_else(|| anyhow!("no room {room_id}"))?;
             encoder.write_buf(&missing_diff);
 
             let reply_env = SsfEnvelope {
@@ -4625,13 +4753,9 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             let update = Update::decode_v1(&update_bytes)
                 .map_err(|e| anyhow!("Failed decoding update block: {:?}", e))?;
 
-            {
-                let rooms = hub.rooms.lock().unwrap();
-                let room = rooms.get(room_id).unwrap();
-                let mut txn = room.doc.transact_mut();
-                txn.apply_update(update)
-                    .map_err(|e| anyhow!("Failed to apply browser update: {:?}", e))?;
-            }
+            apply_to_room(&hub.rooms, room_id, update)
+                .ok_or_else(|| anyhow!("no room {room_id}"))?
+                .map_err(|e| anyhow!("Failed to apply browser update: {:?}", e))?;
         }
     }
 
@@ -4864,7 +4988,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 // local process sends no Origin; a page must be one the API
                 // grants, so no website can make the house leave.
                 let (status, body) = if origin_header.is_none() || origin_ok {
-                    let wrote = house_step_down(&hub_clone).await;
+                    let wrote = house_step_down(&hub_clone, 900).await;
                     ("200 OK", format!("{{\"ok\":true,\"wrote\":{wrote}}}"))
                 } else {
                     ("403 Forbidden", "{\"ok\":false}".to_string())

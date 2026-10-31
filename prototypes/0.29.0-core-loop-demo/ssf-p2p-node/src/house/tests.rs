@@ -723,11 +723,21 @@ fn a_signature_verdict_holds_only_where_it_was_given() {
     let rec = room.top(&format!("hf:{T}")).unwrap();
     let (hash, g) = (hb::rec_hash(&rec).unwrap(), str_of(&rec, "g").unwrap().to_string());
     let k = room.owner.public.clone();
-    assert_eq!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g), Some(true));
+    // (Asked for, checked as between a tick's passes, then known.)
+    let mut verdict = |at: [&str; 3]| {
+        let house = &mut room.house;
+        house.budget = VERIFY_PER_TICK;
+        let bytes = hb::room_sign_bytes("hfair", at[0], at[1], &rec);
+        if house.verified("hfair", at, &hash, &k, bytes, &g).is_none() {
+            house.check_wanted();
+        }
+        house.verified("hfair", at, &hash, &k, bytes, &g)
+    };
+    assert_eq!(verdict([ROOM, T, ""]), Some(true));
     // The same record copied to another table, or another room.
-    assert_eq!(room.house.verified("hfair", [ROOM, "roulette-2", ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, "roulette-2", &rec), &g), Some(false));
-    assert_eq!(room.house.verified("hfair", ["room-2", T, ""], &hash, &k, hb::room_sign_bytes("hfair", "room-2", T, &rec), &g), Some(false));
-    assert_eq!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g), Some(true));
+    assert_eq!(verdict([ROOM, "roulette-2", ""]), Some(false));
+    assert_eq!(verdict(["room-2", T, ""]), Some(false));
+    assert_eq!(verdict([ROOM, T, ""]), Some(true));
 }
 
 /// 600 bettors' closes, each over a slip whose signature is forged: a
@@ -806,13 +816,17 @@ fn a_flood_at_one_table_holds_another_back_a_tick_at_most() {
 }
 
 #[test]
-fn stepping_down_checks_all_it_must_in_its_one_tick() {
+fn stepping_down_checks_all_it_must_in_its_last_word() {
     let mut room = Room::new("flood-stop", true);
     room.tick(0);
     assert_eq!(room.records("o:1:").len(), 1);
     flood(&room);
     room.house.begin_step_down();
-    room.tick(200);
+    // A tick's budget is short of the flood: nothing yet.
+    assert!(room.tick(200).short);
+    assert!(room.records("h:1:").is_empty());
+    let out = room.house.tick_unbounded(ROOM, &room.doc, room.now, 0);
+    assert!(!out.short);
     // Its join of round 1 stepped down: a reveal listing no close.
     let d = &room.records("h:1:")[0].1;
     assert!(strs(d, "x").is_empty());
@@ -1385,4 +1399,122 @@ fn a_close_on_an_undecided_close_is_on_no_chain_beside_a_decided_one() {
     room.tick(200);
     assert_eq!(room.records("o:2:").len(), 1);
     assert!(room.records("o:3:").is_empty());
+}
+
+
+/// A second room of the owner's, `id`: its table switched on, `house`
+/// delegated there (signed for that room), nothing else.
+fn bare_room(id: &str, house: &House) -> Doc {
+    let owner = who("owner");
+    let body = obj(vec![("v", CVal::Int(1)), ("h", s(house.public())), ("k", s(&owner.public))]);
+    let deleg = with(&body, "g", s(&sign(&owner, &hb::room_sign_bytes("hkey", id, "", &body).unwrap())));
+    let doc = Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("owner")));
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "owner", to_any(&obj(vec![("keyB64", s(&owner.public))])));
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut txn, format!("ses:{T}:{INC}:g"), MapPrelim::default());
+        comp.insert(&mut txn, format!("hk:{}", house.public()), to_any(&deleg));
+    }
+    doc
+}
+
+/// Room `id`'s records of a kind in its live session (no checkpoint).
+fn records_in(doc: &Doc, prefix: &str) -> Vec<CVal> {
+    let txn = doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(m)) = comp.get(&txn, &format!("ses:{T}:{INC}:g")) else { return vec![] };
+    m.iter(&txn)
+        .filter(|(k, _)| k.starts_with(prefix))
+        .filter_map(|(_, v)| match v {
+            Out::Any(a) => Some(CVal::from_any(&a)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The house in a lock, as the node holds it (main.rs HubState), and a
+/// fresh one left in the test's room.
+fn locked(room: &mut Room) -> Mutex<House> {
+    let mut stand_in = House::open(&NODE, None).unwrap();
+    stand_in.settle_ms = 0;
+    Mutex::new(std::mem::replace(&mut room.house, stand_in))
+}
+
+/// 🏠 No signature is checked while the house holds the doc: a check waits
+/// for the pass that asked for it to let the doc go, so a room's sync waits
+/// on the house no longer than a read.
+#[test]
+fn no_signature_is_checked_while_the_house_holds_the_doc() {
+    let mut room = Room::new("no-txn", true);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (doc, n) = (room.doc.clone(), checks.clone());
+    room.house.on_check = Some(Box::new(move |_| {
+        assert!(doc.try_transact_mut().is_ok(), "a check with the doc held");
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }));
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    // Two slips, then the close they sign, then the reveal: one tick.
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    flood(&room);
+    room.tick(TICK_MS);
+    assert!(checks.load(std::sync::atomic::Ordering::Relaxed) > VERIFY_PER_TICK);
+}
+
+/// 🏠 Stopping, a room flooded past a tick's budget has its last word after
+/// every other room's step-down has gone out.
+#[test]
+fn stepping_down_steps_every_other_room_down_before_a_flooded_ones_last_word() {
+    let mut room = Room::new("stop-rooms", true);
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1);
+    flood(&room);
+    let house = locked(&mut room);
+    let other = bare_room("room-2", &lock(&house));
+    lock(&house).tick("room-2", &other, room.now, 0);
+    assert_eq!(records_in(&other, "o:1:").len(), 1, "its join in room-2");
+    let mut sent: Vec<(String, usize)> = Vec::new();
+    let docs = vec![(ROOM.to_string(), room.doc.clone()), ("room-2".to_string(), other.clone())];
+    step_down(&house, docs, room.now + TICK_MS, |r, _, n| sent.push((r, n)));
+    assert_eq!(sent, [("room-2".to_string(), 1), (ROOM.to_string(), 1)]);
+    assert!(strs(&records_in(&other, "h:1:")[0], "x").is_empty());
+    assert!(strs(&room.records("h:1:")[0].1, "x").is_empty());
+}
+
+/// 🏠 A tick that panics is its room's alone: the house goes on in the other
+/// rooms, and steps down there.
+#[test]
+fn a_tick_that_panics_in_one_room_holds_back_no_other_room_nor_the_step_down() {
+    let mut room = Room::new("panic", true);
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1);
+    let house = locked(&mut room);
+    let other = bare_room("room-2", &lock(&house));
+    lock(&house).on_check = Some(Box::new(|r| assert_ne!(r, "room-2", "a bug in room-2")));
+    assert_eq!(tick_room(&house, "room-2", &other, room.now, 0, false), TickOut::default());
+    assert!(house.is_poisoned());
+    // The other room ticks on.
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    assert_eq!(tick_room(&house, ROOM, &room.doc, room.now + TICK_MS, 0, false).wrote, 1);
+    let h = &room.records("h:1:")[0].1;
+    assert_eq!(strs(h, "x").len(), 1);
+    // And steps down there, room-2's tick failing again.
+    let mut sent = Vec::new();
+    let docs = vec![("room-2".to_string(), other.clone()), (ROOM.to_string(), room.doc.clone())];
+    step_down(&house, docs, room.now + 2 * TICK_MS, |r, _, _| sent.push(r));
+    assert_eq!(sent, [ROOM]);
+    assert!(strs(&room.records("h:2:")[0].1, "x").is_empty());
 }
