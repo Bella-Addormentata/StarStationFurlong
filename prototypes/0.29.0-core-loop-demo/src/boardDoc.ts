@@ -91,7 +91,11 @@ import { getIdentityPub, signIdentity, verifyIdentityStrict } from './keypair';
 export const BOARD_NOTES_MAP = 'boardNotes';
 /** Signed take-downs, keyed like the notes they take down. */
 export const BOARD_DOWN_MAP = 'boardDown';
-/** The take-down target of the owner's CLEAR: every note up to its stamp. */
+/** The take-down target of the owner's CLEAR: every note up to its stamp.
+ *  Each CLEAR is filed under its own stamp, `<itemId>|*<ts>` (clearKey), so
+ *  two copies' CLEARs never race for one key (#332 review: under a shared
+ *  key, an older CLEAR merged from a bundle could win it back by client id
+ *  and bring back what a newer one cleared). Its signature names `*`. */
 export const CLEAR_TARGET = '*';
 /** Take-downs a board keeps (the newest valid ones; a CLEAR besides). */
 export const MAX_DOWN_PER_BOARD = 128;
@@ -121,8 +125,13 @@ export const MAX_BOARDS_PER_ROOM = 4;
  *  review): longer than a bundle lives (14 days), so no bundle sealed before
  *  it, and no copy offline for less than this, can bring its note back. */
 export const DOWN_KEEP_MS = 30 * 24 * 3600 * 1000;
-/** Take-downs a board keeps at most, however young: the newest. */
-export const MAX_DOWN_RETAINED = 512;
+/** Take-downs a board keeps at most, however young: the newest verified. */
+export const MAX_DOWN_RETAINED = 256;
+/** Signatures a take-down trim checks per board: past them, the rest wait
+ *  for a later trim, neither kept nor trimmed. */
+const MAX_DOWN_CHECKS = 2 * MAX_DOWN_RETAINED;
+/** CLEARs a reader checks per board, newest first (the trim keeps one). */
+const MAX_CLEAR_CHECKS = 8;
 /** Keys the take-down trim visits: every board's retained ones, and junk. */
 const MAX_DOWN_KEYS_VISITED = MAX_BOARDS_PER_ROOM * MAX_DOWN_RETAINED + MAX_KEYS_VISITED;
 
@@ -319,8 +328,17 @@ export function downFromWire(raw: unknown): BoardDown | null {
   return { v: 1, by: r.by, ts: r.ts as number, sig: r.sig };
 }
 
-/** A take-down's target from its key: a note id, or CLEAR_TARGET. */
-const TARGET_RE = /^(?:[0-9a-f]{32}|\*)$/;
+/** A take-down's target from its key: a note id, or a CLEAR's `*<ts>`. */
+const TARGET_RE = /^(?:[0-9a-f]{32}|\*[1-9][0-9]{0,15})$/;
+
+/** The key a CLEAR stamped `ts` is filed under. */
+export function clearKey(itemId: string, ts: number): string {
+  return `${itemId}|${CLEAR_TARGET}${ts}`;
+}
+
+function isClearTarget(target: string): boolean {
+  return target.startsWith(CLEAR_TARGET);
+}
 
 /** Who signs: the local identity by default; tests hand in their own. */
 export interface NoteSigner {
@@ -374,6 +392,8 @@ export interface ReadCtx {
   /** The note filed under a key, if any (the `boardNotes` map): the trim
    *  judges a take-down of a note it holds by that note's author. */
   noteOf?: (key: string) => unknown;
+  /** A board's CLEARs as filed (`[clearKey, record]`), any order. */
+  clearsOf?: (itemId: string) => Iterable<[string, unknown]>;
 }
 
 /** The author a note filed under a key names, when it is filed under its own
@@ -385,17 +405,30 @@ function authorOf(raw: unknown, roomId: string, itemId: string, id: string): str
   return note && noteIdOf(roomId, itemId, note) === id ? note.author : undefined;
 }
 
-/** The stamp up to which the owner's CLEAR covers a board's notes, or -1.
- *  Only the owner's signed CLEAR counts, and never further ahead than a note
- *  may sit: a CLEAR far in the future would hide every note until then. */
-export function clearStampOf(itemId: string, ctx: ReadCtx): number {
-  const raw = ctx.downOf?.(`${itemId}|${CLEAR_TARGET}`);
-  if (raw === undefined || !ctx.ownerPub) return -1;
-  const d = downFromWire(raw);
-  if (!d || d.by !== ctx.ownerPub) return -1;
+/** The owner's newest valid CLEAR on a board, or null: the owner's, filed
+ *  under its own stamp, its signature checked newest first. */
+export function newestClear(itemId: string, ctx: ReadCtx): BoardDown | null {
+  if (!ctx.ownerPub) return null;
   const verify = ctx.verify ?? verifyIdentityStrict;
-  if (!verify(d.by, downSignBytes(ctx.roomId, itemId, CLEAR_TARGET, d.by, d.ts), d.sig)) return -1;
-  return Math.min(d.ts, ctx.now + MAX_FUTURE_SKEW_MS);
+  const found: BoardDown[] = [];
+  for (const [key, raw] of ctx.clearsOf?.(itemId) ?? []) {
+    const d = downFromWire(raw);
+    if (d && d.by === ctx.ownerPub && key === clearKey(itemId, d.ts)) found.push(d);
+  }
+  found.sort((a, b) => b.ts - a.ts);
+  for (const d of found.slice(0, MAX_CLEAR_CHECKS)) {
+    if (verify(d.by, downSignBytes(ctx.roomId, itemId, CLEAR_TARGET, d.by, d.ts), d.sig)) return d;
+  }
+  return null;
+}
+
+/** The stamp up to which the owner's CLEAR covers a board's notes, or -1.
+ *  Only the owner's signed CLEAR counts, the newest of them, and never
+ *  further ahead than a note may sit: a CLEAR far in the future would hide
+ *  every note until then. */
+export function clearStampOf(itemId: string, ctx: ReadCtx): number {
+  const d = newestClear(itemId, ctx);
+  return d ? Math.min(d.ts, ctx.now + MAX_FUTURE_SKEW_MS) : -1;
 }
 
 /** Whether a note has a valid take-down: signed by its author, or by the
@@ -497,7 +530,7 @@ export function readBoardEntries(
 }
 
 /** The take-downs a trim may delete on a board: junk, a CLEAR not the
- *  owner's, a bad signature, one of a note this copy holds by neither its
+ *  owner's or older than the newest valid one, a bad signature, one of a note this copy holds by neither its
  *  author nor the owner, or one past the newest MAX_DOWN_PER_BOARD that is
  *  also older than DOWN_KEEP_MS (and any past MAX_DOWN_RETAINED). A
  *  take-down whose note is gone is KEPT: it is what stops a copy that never
@@ -507,6 +540,7 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
   const prefix = `${itemId}|`;
   const trimmable: string[] = [];
   const valid: Array<{ key: string; d: BoardDown }> = [];
+  const clears: Array<{ key: string; d: BoardDown }> = [];
   let visited = 0;
   for (const [key, value] of entries) {
     if (++visited > MAX_DOWN_KEYS_VISITED) break;
@@ -517,9 +551,9 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
       trimmable.push(key);
       continue;
     }
-    if (target === CLEAR_TARGET) {
-      // Judged only once the owner's key is known.
-      if (ctx.ownerPub && clearStampOf(itemId, { ...ctx, verify, downOf: (k) => (k === key ? value : undefined) }) < 0) trimmable.push(key);
+    if (isClearTarget(target)) {
+      if (key !== clearKey(itemId, d.ts)) trimmable.push(key); // filed under another stamp
+      else clears.push({ key, d });
       continue;
     }
     // A take-down of a note this copy holds counts only by its author or the
@@ -537,19 +571,36 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
   // stamped far ahead can't push the real ones out.
   const at = (d: BoardDown) => Math.min(d.ts, ctx.now);
   valid.sort((a, b) => at(b.d) - at(a.d) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  // Only verified take-downs count toward either limit (#332 review): junk
+  // stamped ahead of a real take-down can't push it out.
   let kept = 0;
   let checked = 0;
-  for (let i = 0; i < valid.length; i++) {
-    const { key, d } = valid[i];
-    if (i >= MAX_DOWN_RETAINED || (kept >= MAX_DOWN_PER_BOARD && ctx.now - d.ts >= DOWN_KEEP_MS)) {
+  for (const { key, d } of valid) {
+    if (kept >= MAX_DOWN_RETAINED || (kept >= MAX_DOWN_PER_BOARD && ctx.now - d.ts >= DOWN_KEEP_MS)) {
       trimmable.push(key);
       continue;
     }
-    if (checked >= 2 * MAX_DOWN_PER_BOARD) continue; // unchecked: neither kept nor trimmed
+    if (checked >= MAX_DOWN_CHECKS) continue; // unchecked: neither kept nor trimmed
     checked++;
     const target = key.slice(prefix.length);
     if (verify(d.by, downSignBytes(ctx.roomId, itemId, target, d.by, d.ts), d.sig)) kept++;
     else trimmable.push(key);
+  }
+  // A board keeps its newest valid CLEAR, which covers all an older one
+  // did. Judged only once the owner's key is known.
+  if (ctx.ownerPub) {
+    clears.sort((a, b) => b.d.ts - a.d.ts);
+    let found = false;
+    let checks = 0;
+    for (const { key, d } of clears) {
+      if (found || d.by !== ctx.ownerPub) {
+        trimmable.push(key);
+        continue;
+      }
+      if (checks++ >= MAX_CLEAR_CHECKS) continue; // unchecked: neither kept nor trimmed
+      if (verify(d.by, downSignBytes(ctx.roomId, itemId, CLEAR_TARGET, d.by, d.ts), d.sig)) found = true;
+      else trimmable.push(key);
+    }
   }
   return trimmable;
 }
@@ -687,8 +738,20 @@ function readCtx(kind: BoardKind, now: number): ReadCtx {
   const notes = notesMap!;
   return {
     roomId: deps!.roomId(), kind, now, ownerPub: deps!.ownerPub(), verify: cachedVerify,
-    downOf: (k) => down.get(k), noteOf: (k) => notes.get(k),
+    downOf: (k) => down.get(k), noteOf: (k) => notes.get(k), clearsOf: (itemId) => clearEntriesIn(down, itemId),
   };
+}
+
+/** A board's CLEARs in a take-down map, as filed. */
+function clearEntriesIn(map: Y.Map<unknown>, itemId: string): Array<[string, unknown]> {
+  const prefix = `${itemId}|${CLEAR_TARGET}`;
+  const out: Array<[string, unknown]> = [];
+  let visited = 0;
+  for (const [key, value] of map.entries()) {
+    if (++visited > MAX_DOWN_KEYS_VISITED) break;
+    if (key.startsWith(prefix)) out.push([key, value]);
+  }
+  return out;
 }
 
 /** Whether the local player may post on a board of this kind. */
@@ -777,8 +840,10 @@ export function clearBoard(itemId: string, signer: NoteSigner = localSigner()): 
   if (keys.length === 0) return false;
   const now = Date.now();
   const clear = signDown(deps.roomId(), itemId, CLEAR_TARGET, Math.max(now, Math.min(newest, now + MAX_FUTURE_SKEW_MS)), signer);
+  const older = clearEntriesIn(downMap!, itemId).map(([k]) => k);
   boundDoc!.transact(() => {
-    downMap!.set(`${prefix}${CLEAR_TARGET}`, clear);
+    downMap!.set(clearKey(itemId, clear.ts), clear);
+    for (const k of older) if (k !== clearKey(itemId, clear.ts)) downMap!.delete(k); // the new one covers them
     for (const k of keys) notesMap!.delete(k);
   });
   return true;
@@ -841,14 +906,22 @@ let pendingView: BoardView | null = null;
  *  long view (or one led by junk) is merged in rounds, never dropped (#332
  *  review; the node sends a view only when it changes). */
 const RETRY_MS = 1500;
+/** The longest a kept note stamped ahead waits for its next look. */
+const MAX_RETRY_WAIT_MS = 10 * 60 * 1000;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryAt = 0;
 
-function scheduleRetry(): void {
-  if (retryTimer !== null || !pendingView) return;
+/** The next round in `delayMs` (sooner than one already set, never later). */
+function scheduleRetry(delayMs: number = RETRY_MS): void {
+  if (!pendingView) return;
+  const at = Date.now() + delayMs;
+  if (retryTimer !== null && retryAt <= at) return;
+  cancelRetry();
+  retryAt = at;
   retryTimer = setTimeout(() => {
     retryTimer = null;
     retryBoardView();
-  }, RETRY_MS);
+  }, delayMs);
 }
 
 function cancelRetry(): void {
@@ -941,9 +1014,18 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
   const rankOf = (d: BoardDown, author: string | undefined): number =>
     d.by === ownerPub || (author !== undefined && d.by === author) ? 2 : author === undefined ? 1 : 0;
 
-  // Each key's chosen take-down, verified.
+  // Each key's chosen take-down, verified; each board's newest CLEAR.
   const filed = new Map<string, BoardDown>();
-  const waitsForOwner = new Set<string>(); // keys and CLEAR keys put off
+  const bestClear = new Map<string, BoardDown>();
+  const waitsForOwner = new Set<string>(); // take-down keys put off
+  const clearWaits = new Set<string>(); // boards whose CLEARs were put off
+  const docClears = new Map<string, BoardDown | null>();
+  const docClear = (itemId: string): BoardDown | null => {
+    if (!docClears.has(itemId)) {
+      docClears.set(itemId, newestClear(itemId, { roomId, kind: 'open', now, ownerPub, verify: cachedVerify, clearsOf: (i) => clearEntriesIn(downMap!, i) }));
+    }
+    return docClears.get(itemId)!;
+  };
   for (const [key, value] of view.down) {
     const k = splitKey(key);
     if (!k || !TARGET_RE.test(k.target)) continue;
@@ -951,24 +1033,26 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
     if (!kind) continue;
     const d = downFromWire(value);
     if (!d) continue;
-    if (k.target === CLEAR_TARGET) {
+    if (isClearTarget(k.target)) {
+      // Each CLEAR under its own stamp; the board's newest valid one is
+      // what counts, so only one newer than that is taken.
       if (!ownerPub) {
         rest.down.push([key, value]);
-        waitsForOwner.add(key);
+        clearWaits.add(k.itemId);
         continue;
       }
-      if (d.by !== ownerPub) continue;
-      const best = filed.get(key);
+      if (d.by !== ownerPub || key !== clearKey(k.itemId, d.ts)) continue;
+      const best = bestClear.get(k.itemId) ?? docClear(k.itemId);
       if (best && best.ts >= d.ts) continue;
-      const mine = best ? null : downFromWire(downMap!.get(key));
-      if (mine && mine.by === ownerPub && mine.ts >= d.ts) {
-        if (!spend(k.itemId)) {
-          rest.down.push([key, value]);
-          overBudget = true;
-          continue;
-        }
-        if (verifyDown(k.itemId, k.target, mine)) continue; // ours is as new
+      if (!spend(k.itemId)) {
+        rest.down.push([key, value]);
+        overBudget = true;
+        continue;
       }
+      if (!verifyDown(k.itemId, CLEAR_TARGET, d)) continue;
+      bestClear.set(k.itemId, d);
+      touched.set(k.itemId, kind);
+      continue;
     } else {
       const author = authorFor(key, k.itemId, k.target);
       const rank = rankOf(d, author);
@@ -1009,7 +1093,13 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
   const ctxFor = (kind: BoardKind): ReadCtx => ({
     roomId, kind, now, ownerPub, verify: cachedVerify,
     downOf: (k) => (filed.has(k) ? filed.get(k) : downMap!.get(k)),
+    clearsOf: (itemId) => {
+      const mine = clearEntriesIn(downMap!, itemId);
+      const taken = bestClear.get(itemId);
+      return taken ? [...mine, [clearKey(itemId, taken.ts), taken]] : mine;
+    },
   });
+  let dueAt = Infinity; // when the first note kept for being ahead may show
   const clears = new Map<string, number>();
   const merged = new Map<string, BoardNote>();
   for (const [key, value] of view.notes) {
@@ -1019,15 +1109,24 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
     if (!kind || merged.has(key) || notesMap!.has(key) || deletedHere(notesMap!, key)) continue;
     const note = noteFromWire(value);
     if (!note || noteIdOf(roomId, k.itemId, note) !== k.target) continue;
-    if (note.ts > now + MAX_FUTURE_SKEW_MS) continue;
+    if (note.ts > now + MAX_FUTURE_SKEW_MS) {
+      // Ahead of this clock (another node's runs ahead): kept until it may
+      // show, as the doc's reader keeps one (#332 review), unless it is
+      // stamped so far ahead the trim would take it.
+      if (note.ts <= now + TRIM_FUTURE_MS) {
+        rest.notes.push([key, value]);
+        dueAt = Math.min(dueAt, note.ts - MAX_FUTURE_SKEW_MS);
+      }
+      continue;
+    }
     const ctx = ctxFor(kind);
-    const clearKey = `${k.itemId}|${CLEAR_TARGET}`;
     const downHere = ctx.downOf!(key);
     if (!ownerPub) {
       // What only the owner's key can judge waits for it: a notice, a note
       // a CLEAR may cover, one taken down by someone other than its author.
       const byOther = downHere !== undefined && downFromWire(downHere)?.by !== note.author;
-      if (kind === 'owner' || waitsForOwner.has(clearKey) || ctx.downOf!(clearKey) !== undefined || waitsForOwner.has(key) || byOther) {
+      const cleared = clearWaits.has(k.itemId) || clearEntriesIn(downMap!, k.itemId).length > 0;
+      if (kind === 'owner' || cleared || waitsForOwner.has(key) || byOther) {
         rest.notes.push([key, value]);
         continue;
       }
@@ -1056,18 +1155,21 @@ export function mergeBoardView(raw: unknown): { notes: number; down: number } | 
   if (rest.notes.length > 0 || rest.down.length > 0) {
     pendingView = rest;
     if (overBudget) scheduleRetry();
+    else if (dueAt !== Infinity) scheduleRetry(Math.min(MAX_RETRY_WAIT_MS, Math.max(RETRY_MS, dueAt - now)));
   }
-  if (filed.size === 0 && merged.size === 0) return { notes: 0, down: 0 };
+  if (filed.size === 0 && bestClear.size === 0 && merged.size === 0) return { notes: 0, down: 0 };
   boundDoc!.transact(() => {
     for (const [key, d] of filed) {
       downMap!.set(key, d);
-      notesMap!.delete(key); // a CLEAR's key holds no note; a take-down's note goes
+      notesMap!.delete(key); // the note it takes down goes
     }
+    for (const [itemId, d] of bestClear) downMap!.set(clearKey(itemId, d.ts), d);
     for (const [key, note] of merged) notesMap!.set(key, note);
   });
-  // What the merge pushed past a board's caps comes off again here.
+  // What the merge pushed past a board's caps comes off again here (and a
+  // CLEAR it took makes the board's older ones redundant).
   for (const [itemId, kind] of touched) trimBoard(itemId, kind);
-  return { notes: merged.size, down: filed.size };
+  return { notes: merged.size, down: filed.size + bestClear.size };
 }
 
 /** Merge what an earlier merge left: once the host's state has arrived, the
