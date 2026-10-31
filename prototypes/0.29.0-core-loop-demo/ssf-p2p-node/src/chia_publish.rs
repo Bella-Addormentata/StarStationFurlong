@@ -2321,6 +2321,21 @@ pub async fn heartbeat_loop(
                 *hub.chia_peak.lock().unwrap() = agreed_peak;
             }
         }
+        // Every era-bound write of this tick (presence, knock, beacon) is
+        // signed for the era of that peak, and the era guard's budget
+        // ([`ERA_GUARD_BLOCKS`]) counts the peak's age from its read; the
+        // tick's lookups (a mark's standing, the lease's reconciliation) run
+        // several requests between the read and a write. So right before each
+        // write the peak's age is read again: aged out meanwhile, the write
+        // could be signed for an era the chain has left, and is held for the
+        // next tick, which reads the peak anew (#334 review).
+        let peak_aged = |what: &str| -> bool {
+            let aged = agreed_peak.fresh(crate::chia_resolve::unix_now()).is_none();
+            if aged {
+                println!("⛓️ ChiaHub {what}: the agreed peak aged out during this tick's lookups — holding this write for the next tick");
+            }
+            aged
+        };
 
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
         if findable {
@@ -2432,15 +2447,8 @@ pub async fn heartbeat_loop(
                     .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
                     .unwrap_or(true);
                 let due = node_publish_due(node_mark.as_ref(), era, &sig, now_unix, era_hint, &self_id, spend_held) && retry_ok;
-                // The era guard judged the agreed peak as read at the top of
-                // the tick, and its budget ([`ERA_GUARD_BLOCKS`]) counts the
-                // peak's age from that read; the lookups above ran their
-                // several requests since. A peak aged out meanwhile could sign
-                // the write for an era the chain has left: held for the next
-                // tick, which reads the peak anew.
-                if due && agreed_peak.fresh(crate::chia_resolve::unix_now()).is_none() {
-                    println!("⛓️ ChiaHub presence: the agreed peak aged out during this tick's lookups — holding this write for the next tick");
-                } else if due {
+                // Due, and the peak not aged out during the lookups above.
+                if due && !peak_aged("presence") {
                     node_attempt = Some(Instant::now());
                     match publish_node_presence(&iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await {
                         Ok((hint, write)) => {
@@ -2522,8 +2530,9 @@ pub async fn heartbeat_loop(
         // have flipped, the browser may have declared the room public), the
         // host was not knocked on this era already, and the two are not linked
         // meanwhile (a link by any path cancels the knock). Era-bound like
-        // presence: no write without a peak or inside the era's guard blocks.
-        if knock_waiting && peak > 0 && !era_guard(peak) {
+        // presence: no write without a peak, inside the era's guard blocks, or
+        // on a peak the presence lookups above let age out.
+        if knock_waiting && peak > 0 && !era_guard(peak) && !peak_aged("knock") {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -2691,11 +2700,8 @@ pub async fn heartbeat_loop(
                     welcome_warned = true;
                 }
                 let due = reachable && serves_welcome && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id);
-                // As for the presence write: the agreed peak the era guard
-                // judged may have aged out during this tick's lookups.
-                if due && agreed_peak.fresh(crate::chia_resolve::unix_now()).is_none() {
-                    println!("⛓️ ChiaHub beacon: the agreed peak aged out during this tick's lookups — holding this write for the next tick");
-                } else if due {
+                // Due, and the peak not aged out during the lookups above.
+                if due && !peak_aged("beacon") {
                     beacon_attempt = Some(Instant::now());
                     match publish_beacon(&iroh_sk, beacon_sk, era, now_unix).await {
                         Ok((hint, write)) => {
