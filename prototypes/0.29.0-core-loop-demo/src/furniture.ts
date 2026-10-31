@@ -115,6 +115,8 @@ import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
 import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // 📺 #186: the TV screen draws the view World derives from the room record.
 import type { TvScreenView } from "./tvDoc";
+import type { BoardKind, BoardScreen } from "./boardDoc";
+import { BOARD_FACE_H, BOARD_FACE_SCALE, BOARD_FACE_W, boardFaceKey, paintBoardFace } from "./boardFace";
 // …and its own menu while stopped or paused (#258): the cells and the
 // highlight come in the view; the page of library titles is worked out here.
 import { tvHomeShelf } from "./tvMenu";
@@ -178,6 +180,10 @@ export type FurnitureKind =
   | "birthday-balloons-wall"
   | "wall-computer"
   | "departures-board"
+  // 📌 Room boards (#315): the corkboard anyone posts on, and the owner's
+  // notice case behind locked glass.
+  | "corkboard"
+  | "notice-case"
   | "map-table"
   | "storage-trunk"
   | "game-table"
@@ -2139,6 +2145,82 @@ const buildDeparturesBoard = (ctx: BuildCtx) => {
   };
   draw(undefined);
   screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+};
+
+// ── 📌 Room boards (#315): the corkboard and the notice case ────────────────
+// Both hang on the wall like the smart TV (Dorkmo 2026-10-31): flush-mounted,
+// face to local +z, never an obstacle. The face is a CanvasTexture painted by
+// boardFace.ts from the notes World pushes at ~1 Hz (the handle says
+// `board: 'open' | 'owner'`, the departures board's idiom), repainted only
+// when they change. The CORKBOARD is a wood frame round cork; the NOTICE
+// CASE is a deeper metal frame with felt behind a glass pane and a brass
+// lock on its right stile: only the room owner posts there.
+const CB_W = 1.2; // frame outside width
+const CB_H = 0.9;
+const CB_Y = 1.5; // centre height: a standing eye reads it straight on
+const CB_FRAME = 0.05;
+const CB_D = 0.05; // the corkboard's depth
+const NC_D = 0.09; // the case is deeper: its glass stands off the felt
+
+const buildRoomBoard = (ctx: BuildCtx, kind: BoardKind) => {
+  const { m, place } = ctx;
+  const owner = kind === "owner";
+  const D = owner ? NC_D : CB_D;
+  const frame = owner ? m(0x2b2f36, 0.35, 0.7) : m(0x7a5230, 0.7, 0.05);
+  const innerW = CB_W - 2 * CB_FRAME;
+  const innerH = CB_H - 2 * CB_FRAME;
+  place(new THREE.BoxGeometry(CB_W - 0.02, CB_H - 0.02, 0.02), m(0x3a2a1c, 0.9, 0), 0, CB_Y, 0.01); // backing
+  place(new THREE.BoxGeometry(CB_W, CB_FRAME, D), frame, 0, CB_Y + CB_H / 2 - CB_FRAME / 2, D / 2); // top rail
+  place(new THREE.BoxGeometry(CB_W, CB_FRAME, D), frame, 0, CB_Y - CB_H / 2 + CB_FRAME / 2, D / 2); // bottom rail
+  place(new THREE.BoxGeometry(CB_FRAME, innerH, D), frame, -CB_W / 2 + CB_FRAME / 2, CB_Y, D / 2); // left stile
+  place(new THREE.BoxGeometry(CB_FRAME, innerH, D), frame, CB_W / 2 - CB_FRAME / 2, CB_Y, D / 2); // right stile
+
+  const cv = document.createElement("canvas");
+  cv.width = BOARD_FACE_W * BOARD_FACE_SCALE;
+  cv.height = BOARD_FACE_H * BOARD_FACE_SCALE;
+  const c2d = cv.getContext("2d")!;
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  // Unlit like every screen, a shade under white so cork doesn't glare in a
+  // dim room and an unseen note's glow still stands out.
+  const mat = new THREE.MeshBasicMaterial({ map: tex, color: 0xe6e6e6, transparent: true, opacity: 0 });
+  const face = place(new THREE.PlaneGeometry(innerW, innerH), mat, 0, CB_Y, 0.021);
+
+  if (owner) {
+    // The glass: a faint blue tint, no depth write (baseOpacity, never raw
+    // opacity, so the morph fade keeps it — the skylight's rule).
+    const glass = m(0xbfd8e8, 0.05, 0.1, 0x0a1a2a, 0.04);
+    glass.depthWrite = false;
+    glass.userData.baseOpacity = 0.16;
+    place(new THREE.BoxGeometry(innerW + 0.01, innerH + 0.01, 0.006), glass, 0, CB_Y, D - 0.012);
+    // The lock: a brass body on the right stile and its keyhole.
+    place(new THREE.BoxGeometry(0.035, 0.07, 0.02), m(0xc9a24a, 0.35, 0.8), CB_W / 2 - CB_FRAME / 2, CB_Y, D + 0.01);
+    place(new THREE.BoxGeometry(0.008, 0.02, 0.004), m(0x111111, 0.8, 0.2), CB_W / 2 - CB_FRAME / 2, CB_Y - 0.01, D + 0.021);
+  }
+
+  const look = owner ? "felt" : "cork";
+  let lastKey = "";
+  const paint = (screen: BoardScreen | undefined) => {
+    paintBoardFace(c2d, screen, look);
+    tex.needsUpdate = true;
+  };
+  const handle: WallScreenHandle = {
+    board: kind,
+    updateStatus: (status) => {
+      const key = boardFaceKey(status.board);
+      if (key === lastKey) return;
+      lastKey = key;
+      paint(status.board);
+    },
+    // A board stays readable while someone reads it up close.
+    setEngaged: () => undefined,
+  };
+  // Boot frame so the prop is never blank before the first push.
+  paint(undefined);
+  face.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
 // ── Map table / holograph table (M4 of #33) ──────────────────────────────────
@@ -4986,6 +5068,37 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.5, z: 1.25 },
       anchor: { x: 0, y: 1.62, z: 0.06 },
+    },
+  },
+  // 📌 Room boards (#315): on the wall like the smart TV, never an obstacle.
+  // The focus camera stands a pace back and a little to the board's right,
+  // so the board sits left of centre with room for its panel beside it.
+  corkboard: {
+    kind: "corkboard",
+    build: (ctx) => buildRoomBoard(ctx, "open"),
+    footprint: null,
+    wallMount: { halfW: CB_W / 2 },
+    functions: ["corkboard"],
+    device: {
+      kind: "corkboard",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0.55, y: 1.5, z: 2.1 },
+      anchor: { x: 0.55, y: CB_Y, z: 0.05 },
+    },
+  },
+  "notice-case": {
+    kind: "notice-case",
+    build: (ctx) => buildRoomBoard(ctx, "owner"),
+    footprint: null,
+    wallMount: { halfW: CB_W / 2 },
+    functions: ["corkboard"],
+    device: {
+      kind: "corkboard",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0.55, y: 1.5, z: 2.1 },
+      anchor: { x: 0.55, y: CB_Y, z: 0.05 },
     },
   },
   // Holographic map table (M4 of #33): footprint 2×2 — a REAL obstacle (both

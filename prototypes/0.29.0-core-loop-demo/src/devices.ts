@@ -214,6 +214,7 @@ import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/c
 /** The drop board's holes as the panel names them, left to right. */
 const COIN_PUSHER_HOLE_NAMES = ['LEFT', 'MIDDLE', 'RIGHT'] as const;
 import type { ArcadeScreenPainter } from './arcadeScreen';
+import type { BoardKind, BoardScreen } from './boardDoc';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, RECONNECTING_NOTICE } from './croupier';
@@ -295,7 +296,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade' | 'faucetDish';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'alligators' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade' | 'faucetDish' | 'corkboard';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -387,6 +388,9 @@ export interface WallComputerStatus {
    *  screen, for the screens that ask (WallScreenHandle.departures); the
    *  plain terminal ignores them. */
   departures?: DepartureScreen;
+  /** 📌 A room board's notes (#315): World fills them for the screens that
+   *  ask (WallScreenHandle.board), as the departures rows above. */
+  board?: BoardScreen;
 }
 
 /** 🚏📋 A board's rows as its screen prints them (departuresBoard.rowText). */
@@ -411,6 +415,9 @@ export interface WallScreenHandle {
   /** 🚏📋 A departures board (the wall computer's wide variant): World adds
    *  its rows to the status it pushes. */
   readonly departures?: boolean;
+  /** 📌 A room board (#315): World adds its notes (boardDoc.readBoardScreen)
+   *  to the status it pushes. 'open' is the corkboard, 'owner' the case. */
+  readonly board?: BoardKind;
 }
 
 // ── 🚏📋 Departures boards (robot pilot routes, A6 + A9 item 7) ──────────────

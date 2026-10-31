@@ -199,6 +199,8 @@ import {
   readLiveRoomStatus,
 } from "./devices";
 import { boardGate } from "./departuresDoc";
+import { boardKindOf, readBoardScreen } from "./boardDoc";
+import { createBoardUI } from "./boardUI";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
@@ -4291,8 +4293,13 @@ export class World {
           for (const [itemId, screen] of this.wallScreens) {
             // 🚏📋 A departures board adds its own rows (its gate setting is
             // its own); the plain terminal's status carries none.
+            // 📌 A room board adds its notes (#315).
             screen.updateStatus(
-              screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+              screen.departures
+                ? { ...status, departures: readDepartureScreen(itemId) }
+                : screen.board
+                  ? { ...status, board: readBoardScreen(itemId, screen.board) }
+                  : status,
             );
           }
         }
@@ -7187,6 +7194,22 @@ export class World {
         ],
         defaultGate: () => boardGate(null, roomGates()),
         // Dim the in-world screen while focused, as the terminal does (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "corkboard") {
+      // 📌 #315: a room board's panel — every note in full, the post box,
+      // and the take-down / unpin / hide controls. The kind of board (open
+      // corkboard or the owner's notice case) is its furniture kind's.
+      const kind = boardKindOf(FURNITURE.find((i) => i.id === deviceId)?.kind);
+      if (!kind) return;
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const ui = createBoardUI({
+        itemId: deviceId,
+        kind,
         onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
       deviceFocus.beginFocus(this.player, device, ui);
