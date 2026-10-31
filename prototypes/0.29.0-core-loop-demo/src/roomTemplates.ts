@@ -32,6 +32,7 @@ import {
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
 import { clearRobotConfig, readRobotConfig, writeRobotConfig, type RobotRoutine } from "./robotDoc";
+import { boardKindOf, forgetBoard } from "./boardDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { PLAYER_R } from "./player";
@@ -833,11 +834,24 @@ function releaseDroppedDocks(next: readonly FurnitureItem[]): void {
   }
 }
 
+/** 📌 #315: a board the new layout doesn't keep takes its notes and
+ *  take-downs with it, as edit mode's REMOVE does for one board, so
+ *  template swaps never pile orphaned notes into the room's doc. A board is
+ *  kept only by a board of the same id AND kind: a corkboard's notes don't
+ *  pass to a notice case that takes its id. */
+function forgetDroppedBoards(next: readonly FurnitureItem[]): void {
+  const kept = new Map(next.filter((i) => boardKindOf(i.kind)).map((i) => [i.id, i.kind] as const));
+  for (const [id, rec] of readAllFurniture()) {
+    if (boardKindOf(rec.kind) && kept.get(id) !== rec.kind) forgetBoard(id);
+  }
+}
+
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   const items = templateItemsFor(t);
   releaseDroppedDocks(items);
+  forgetDroppedBoards(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   // 🌌 …and the room IS this now: stamping the theme makes the change
@@ -962,6 +976,7 @@ export function seedRoomTemplate(id: string): boolean {
   if (!t) return false;
   const items = templateItemsFor(t);
   releaseDroppedDocks(items);
+  forgetDroppedBoards(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   return true;

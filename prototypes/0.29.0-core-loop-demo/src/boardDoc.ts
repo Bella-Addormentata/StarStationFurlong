@@ -47,6 +47,26 @@
  * safe even on a stale copy, because a note outside the newest 24 of a partial
  * view is outside them in the full one too.
  *
+ * ─── Take-downs ──────────────────────────────────────────────────────────────
+ *
+ * Unpinning a note deletes it AND files a signed take-down beside it in
+ * `boardDown` (same key; `<itemId>|*` for the owner's CLEAR, which covers
+ * every note stamped at or before it). Needed since board bundles (#315's
+ * second PR, ssf-p2p-node board_bundles.rs) carry notes between copies of
+ * the room: a copy that had not yet seen a note merges it as a new Yjs item,
+ * and a take-down elsewhere deletes only the item IT held, so the merged one
+ * could win the key and bring the note back. Every reader drops a note with
+ * a valid take-down (by its author, or by the owner), and a merge never
+ * brings back a note one names or one this copy already deleted.
+ *
+ * ─── Board bundles ───────────────────────────────────────────────────────────
+ *
+ * The local node hands its tabs what other nodes sealed for this room (local
+ * lane `board`): their copies' notes and take-downs. `mergeBoardView` checks
+ * every one as a reader would and writes only what is new to this copy: on a
+ * board the room has, never deleted here, signed, bound and not taken down.
+ * It waits for the host's state (routeRoomReady) as a trim does.
+ *
  * ─── What this is not ────────────────────────────────────────────────────────
  *
  * Nothing authorizes a write to a room doc today (roomOwner.ts), so a modified
@@ -69,6 +89,12 @@ import { getIdentityPub, signIdentity, verifyIdentityStrict } from './keypair';
 // ── Shapes and limits ────────────────────────────────────────────────────────
 
 export const BOARD_NOTES_MAP = 'boardNotes';
+/** Signed take-downs, keyed like the notes they take down. */
+export const BOARD_DOWN_MAP = 'boardDown';
+/** The take-down target of the owner's CLEAR: every note up to its stamp. */
+export const CLEAR_TARGET = '*';
+/** Take-downs a board keeps (the newest valid ones; a CLEAR besides). */
+export const MAX_DOWN_PER_BOARD = 128;
 /** Characters a note's text may hold (DMs take 500; a sticky note is smaller). */
 export const MAX_NOTE_TEXT = 280;
 /** Notes a board shows; the oldest falls off. */
@@ -91,6 +117,14 @@ const MAX_ID = 128;
 /** Boards a room may hold (the dev menu's placement refuses a fifth), which
  *  keeps a room's notes far under roomCache.ts's 1 MB per-room cap. */
 export const MAX_BOARDS_PER_ROOM = 4;
+/** A take-down is kept at least this long, past the count above (#332
+ *  review): longer than a bundle lives (14 days), so no bundle sealed before
+ *  it, and no copy offline for less than this, can bring its note back. */
+export const DOWN_KEEP_MS = 30 * 24 * 3600 * 1000;
+/** Take-downs a board keeps at most, however young: the newest. */
+export const MAX_DOWN_RETAINED = 512;
+/** Keys the take-down trim visits: every board's retained ones, and junk. */
+const MAX_DOWN_KEYS_VISITED = MAX_BOARDS_PER_ROOM * MAX_DOWN_RETAINED + MAX_KEYS_VISITED;
 
 export const MAX_PHOTO_CAPTION = 80;
 export const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
@@ -159,6 +193,16 @@ const CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f]/;
 /** Clean a note's text for posting: trimmed, control characters out. */
 export function cleanNoteText(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim();
+}
+
+/** A name as a note can carry it: no control characters or line breaks
+ *  (the shape check refuses them, and a saved name is only whitespace-
+ *  normalized, so a pasted one can hold them), at most MAX_NAME units and
+ *  never half of a surrogate pair. Empty becomes 'Clone'. */
+export function cleanAuthorName(raw: string): string {
+  let name = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_NAME);
+  if (/[\ud800-\udbff]$/.test(name)) name = name.slice(0, -1);
+  return name.trim() || 'Clone';
 }
 
 /** A photo reference as a record may carry it, or null. */
@@ -252,6 +296,32 @@ export function noteKey(itemId: string, noteId: string): string {
   return `${itemId}|${noteId}`;
 }
 
+/** A take-down: who took a note down (its author, or the room's owner) and
+ *  when. Its signature binds the room, the board and the note id. */
+export interface BoardDown {
+  v: 1;
+  by: string;
+  ts: number;
+  sig: string;
+}
+
+export function downSignBytes(roomId: string, itemId: string, target: string, by: string, ts: number): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({ k: 'ssf-board-down:v1', roomId, itemId, target, by, ts }));
+}
+
+export function downFromWire(raw: unknown): BoardDown | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (r.v !== 1) return null;
+  if (!isStr(r.by, MAX_ID) || r.by.length === 0) return null;
+  if (!Number.isSafeInteger(r.ts) || (r.ts as number) <= 0) return null;
+  if (!isStr(r.sig, 128) || r.sig.length === 0) return null;
+  return { v: 1, by: r.by, ts: r.ts as number, sig: r.sig };
+}
+
+/** A take-down's target from its key: a note id, or CLEAR_TARGET. */
+const TARGET_RE = /^(?:[0-9a-f]{32}|\*)$/;
+
 /** Who signs: the local identity by default; tests hand in their own. */
 export interface NoteSigner {
   pub: string;
@@ -272,7 +342,7 @@ export function signNote(
   const unsigned: Unsigned = {
     v: 1,
     author: signer.pub,
-    authorName: fields.authorName.slice(0, MAX_NAME),
+    authorName: cleanAuthorName(fields.authorName),
     text: fields.text,
     colour: fields.colour,
     x: round(fields.x),
@@ -282,6 +352,11 @@ export function signNote(
   if (fields.attach) unsigned.attach = fields.attach;
   const sig = signer.sign(noteSignBytes(roomId, itemId, unsigned));
   return { id: noteIdOf(roomId, itemId, unsigned), note: { ...unsigned, sig } };
+}
+
+export function signDown(roomId: string, itemId: string, target: string, ts: number, signer: NoteSigner): BoardDown {
+  const at = Math.floor(ts);
+  return { v: 1, by: signer.pub, ts: at, sig: signer.sign(downSignBytes(roomId, itemId, target, signer.pub, at)) };
 }
 
 // ── The read rule (pure) ─────────────────────────────────────────────────────
@@ -294,6 +369,44 @@ export interface ReadCtx {
   ownerPub?: string;
   /** Signature check (verifyIdentityStrict by default; cached by the store). */
   verify?: (pub: string, bytes: Uint8Array, sig: string) => boolean;
+  /** The take-down filed under a key, if any (the `boardDown` map). */
+  downOf?: (key: string) => unknown;
+  /** The note filed under a key, if any (the `boardNotes` map): the trim
+   *  judges a take-down of a note it holds by that note's author. */
+  noteOf?: (key: string) => unknown;
+}
+
+/** The author a note filed under a key names, when it is filed under its own
+ *  id. The id hashes the author, so this needs no signature check: whatever
+ *  is filed under that id, it is that author's note or junk. */
+function authorOf(raw: unknown, roomId: string, itemId: string, id: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const note = noteFromWire(raw);
+  return note && noteIdOf(roomId, itemId, note) === id ? note.author : undefined;
+}
+
+/** The stamp up to which the owner's CLEAR covers a board's notes, or -1.
+ *  Only the owner's signed CLEAR counts, and never further ahead than a note
+ *  may sit: a CLEAR far in the future would hide every note until then. */
+export function clearStampOf(itemId: string, ctx: ReadCtx): number {
+  const raw = ctx.downOf?.(`${itemId}|${CLEAR_TARGET}`);
+  if (raw === undefined || !ctx.ownerPub) return -1;
+  const d = downFromWire(raw);
+  if (!d || d.by !== ctx.ownerPub) return -1;
+  const verify = ctx.verify ?? verifyIdentityStrict;
+  if (!verify(d.by, downSignBytes(ctx.roomId, itemId, CLEAR_TARGET, d.by, d.ts), d.sig)) return -1;
+  return Math.min(d.ts, ctx.now + MAX_FUTURE_SKEW_MS);
+}
+
+/** Whether a note has a valid take-down: signed by its author, or by the
+ *  owner. Costs a signature check when one is filed. */
+export function isTakenDown(key: string, itemId: string, id: string, note: BoardNote, ctx: ReadCtx): boolean {
+  const raw = ctx.downOf?.(key);
+  if (raw === undefined) return false;
+  const d = downFromWire(raw);
+  if (!d || !(d.by === note.author || (!!ctx.ownerPub && d.by === ctx.ownerPub))) return false;
+  const verify = ctx.verify ?? verifyIdentityStrict;
+  return verify(d.by, downSignBytes(ctx.roomId, itemId, id, d.by, d.ts), d.sig);
 }
 
 export interface BoardRead {
@@ -346,8 +459,13 @@ export function readBoardEntries(
   candidates.sort((a, b) => b.note.ts - a.note.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const shown: ShownNote[] = [];
   const perAuthor = new Map<string, number>();
-  let checked = 0;
+  const cleared = clearStampOf(itemId, { ...ctx, verify });
+  let checked = cleared >= 0 ? 1 : 0;
   for (const c of candidates) {
+    if (c.note.ts <= cleared) {
+      trimmable.push(c.key); // the owner cleared the board after it
+      continue;
+    }
     if (shown.length >= MAX_BOARD_NOTES) {
       trimmable.push(c.key);
       continue;
@@ -358,6 +476,14 @@ export function readBoardEntries(
       continue;
     }
     if (checked >= MAX_VERIFIED_PER_BOARD) continue; // unchecked: neither shown nor trimmed
+    if (ctx.downOf?.(c.key) !== undefined) {
+      checked++;
+      if (isTakenDown(c.key, itemId, c.id, c.note, { ...ctx, verify })) {
+        trimmable.push(c.key);
+        continue;
+      }
+      if (checked >= MAX_VERIFIED_PER_BOARD) continue;
+    }
     checked++;
     const { sig, ...unsigned } = c.note;
     if (!verify(c.note.author, noteSignBytes(ctx.roomId, itemId, unsigned), sig)) {
@@ -368,6 +494,64 @@ export function readBoardEntries(
     shown.push({ ...c.note, id: c.id });
   }
   return { shown, trimmable };
+}
+
+/** The take-downs a trim may delete on a board: junk, a CLEAR not the
+ *  owner's, a bad signature, one of a note this copy holds by neither its
+ *  author nor the owner, or one past the newest MAX_DOWN_PER_BOARD that is
+ *  also older than DOWN_KEEP_MS (and any past MAX_DOWN_RETAINED). A
+ *  take-down whose note is gone is KEPT: it is what stops a copy that never
+ *  saw the take-down from bringing the note back. */
+export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: string, ctx: ReadCtx): string[] {
+  const verify = ctx.verify ?? verifyIdentityStrict;
+  const prefix = `${itemId}|`;
+  const trimmable: string[] = [];
+  const valid: Array<{ key: string; d: BoardDown }> = [];
+  let visited = 0;
+  for (const [key, value] of entries) {
+    if (++visited > MAX_DOWN_KEYS_VISITED) break;
+    if (!key.startsWith(prefix)) continue;
+    const target = key.slice(prefix.length);
+    const d = downFromWire(value);
+    if (!d || !TARGET_RE.test(target)) {
+      trimmable.push(key);
+      continue;
+    }
+    if (target === CLEAR_TARGET) {
+      // Judged only once the owner's key is known.
+      if (ctx.ownerPub && clearStampOf(itemId, { ...ctx, verify, downOf: (k) => (k === key ? value : undefined) }) < 0) trimmable.push(key);
+      continue;
+    }
+    // A take-down of a note this copy holds counts only by its author or the
+    // owner (#332 review): anyone else's would sit on the key for nothing.
+    if (ctx.ownerPub) {
+      const author = authorOf(ctx.noteOf?.(key), ctx.roomId, itemId, target);
+      if (author !== undefined && d.by !== author && d.by !== ctx.ownerPub) {
+        trimmable.push(key);
+        continue;
+      }
+    }
+    valid.push({ key, d });
+  }
+  // Newest first; a stamp ahead of the clock counts as now, so a take-down
+  // stamped far ahead can't push the real ones out.
+  const at = (d: BoardDown) => Math.min(d.ts, ctx.now);
+  valid.sort((a, b) => at(b.d) - at(a.d) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  let kept = 0;
+  let checked = 0;
+  for (let i = 0; i < valid.length; i++) {
+    const { key, d } = valid[i];
+    if (i >= MAX_DOWN_RETAINED || (kept >= MAX_DOWN_PER_BOARD && ctx.now - d.ts >= DOWN_KEEP_MS)) {
+      trimmable.push(key);
+      continue;
+    }
+    if (checked >= 2 * MAX_DOWN_PER_BOARD) continue; // unchecked: neither kept nor trimmed
+    checked++;
+    const target = key.slice(prefix.length);
+    if (verify(d.by, downSignBytes(ctx.roomId, itemId, target, d.by, d.ts), d.sig)) kept++;
+    else trimmable.push(key);
+  }
+  return trimmable;
 }
 
 /** A free spot for a new note on the face: the first of 24 slots (6 × 4)
@@ -401,13 +585,17 @@ export interface BoardDeps {
   myName: () => string;
   /** The host's own state has arrived (routeKeeper.routeRoomReady: a frame
    *  from the live host, or this machine's node for a room it hosts): trims
-   *  may run. */
+   *  and bundle merges may run. */
   canTrim: () => boolean;
+  /** Which board an item of the room's furniture is, if it is one (bundle
+   *  merges write only to boards the room has). */
+  boardOfItem?: (itemId: string) => BoardKind | null;
 }
 
 let deps: BoardDeps | null = null;
 let boundDoc: Y.Doc | null = null;
 let notesMap: Y.Map<unknown> | null = null;
+let downMap: Y.Map<unknown> | null = null;
 let version = 0;
 const listeners = new Set<() => void>();
 /** Signature verdicts, by key, signature AND a hash of the signed bytes:
@@ -431,14 +619,18 @@ function notify(): void {
 }
 
 function docAlive(): boolean {
-  return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && notesMap !== null;
+  return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && notesMap !== null && downMap !== null;
 }
 
 /** Bind the room doc: main.ts's room-join seam, beside bindDeparturesDoc. */
 export function bindBoardDoc(doc: Y.Doc): void {
   boundDoc = doc;
   notesMap = doc.getMap(BOARD_NOTES_MAP);
+  downMap = doc.getMap(BOARD_DOWN_MAP);
   notesMap.observe(() => notify());
+  downMap.observe(() => notify());
+  pendingView = null;
+  cancelRetry();
   notify();
 }
 
@@ -447,6 +639,9 @@ export function bindBoardDoc(doc: Y.Doc): void {
 export function refreshBoards(): void {
   readCache = null;
   notify();
+  // Entries that waited for the owner's key may be judged now. On a timer,
+  // never here: this runs inside the doc's own observers.
+  if (pendingView) scheduleRetry();
 }
 
 export function subscribeBoards(listener: () => void): () => void {
@@ -482,15 +677,18 @@ export function readBoard(itemId: string, kind: BoardKind): BoardRead {
   const cacheKey = `${kind}|${itemId}`;
   const hit = readCache.reads.get(cacheKey);
   if (hit) return hit;
-  const read = readBoardEntries(notesMap!.entries(), itemId, {
-    roomId: deps.roomId(),
-    kind,
-    now,
-    ownerPub: deps.ownerPub(),
-    verify: cachedVerify,
-  });
+  const read = readBoardEntries(notesMap!.entries(), itemId, readCtx(kind, now));
   readCache.reads.set(cacheKey, read);
   return read;
+}
+
+function readCtx(kind: BoardKind, now: number): ReadCtx {
+  const down = downMap!;
+  const notes = notesMap!;
+  return {
+    roomId: deps!.roomId(), kind, now, ownerPub: deps!.ownerPub(), verify: cachedVerify,
+    downOf: (k) => down.get(k), noteOf: (k) => notes.get(k),
+  };
 }
 
 /** Whether the local player may post on a board of this kind. */
@@ -526,10 +724,13 @@ export function postNote(
   if (input.attach && !photo) return { ok: false, why: 'That photo can’t be pinned.' };
   const before = readBoard(itemId, kind);
   const spot = freeSpot(before.shown, rand);
+  // Never at or before the owner's last CLEAR, which a clock a little
+  // behind theirs would otherwise put the new note under.
+  const ts = Math.max(Date.now(), clearStampOf(itemId, readCtx(kind, Date.now())) + 1);
   const { id, note } = signNote(
     deps.roomId(),
     itemId,
-    { authorName: deps.myName() || 'Clone', text, colour: input.colour, x: spot.x, y: spot.y, ts: Date.now(), ...(photo ? { attach: photo } : {}) },
+    { authorName: deps.myName(), text, colour: input.colour, x: spot.x, y: spot.y, ts, ...(photo ? { attach: photo } : {}) },
     signer,
   );
   const mine = before.shown.filter((n) => n.author === signer.pub).sort((a, b) => a.ts - b.ts);
@@ -542,28 +743,44 @@ export function postNote(
   return { ok: true, id };
 }
 
-/** Take a note down: the author's own, or any note for the owner. */
-export function takeDownNote(itemId: string, noteId: string, kind: BoardKind, me: string = getIdentityPub()): boolean {
+/** Take a note down: the author's own, or any note for the owner. Files a
+ *  signed take-down beside the deletion, so no copy of the room brings it
+ *  back. */
+export function takeDownNote(itemId: string, noteId: string, kind: BoardKind, signer: NoteSigner = localSigner()): boolean {
   if (!deps || !docAlive()) return false;
   const note = readBoard(itemId, kind).shown.find((n) => n.id === noteId);
   if (!note) return false;
-  if (note.author !== me && !canModerate()) return false;
-  boundDoc!.transact(() => { notesMap!.delete(noteKey(itemId, noteId)); });
+  if (note.author !== signer.pub && !canModerate()) return false;
+  const key = noteKey(itemId, noteId);
+  const down = signDown(deps.roomId(), itemId, noteId, Date.now(), signer);
+  boundDoc!.transact(() => {
+    downMap!.set(key, down);
+    notesMap!.delete(key);
+  });
   return true;
 }
 
-/** The owner clears a board: every key filed under it. */
-export function clearBoard(itemId: string): boolean {
-  if (!canModerate()) return false;
+/** The owner clears a board: every key filed under it, and a signed CLEAR
+ *  stamped after the newest of them so it covers each copy's notes too. */
+export function clearBoard(itemId: string, signer: NoteSigner = localSigner()): boolean {
+  if (!deps || !canModerate()) return false;
   const prefix = `${itemId}|`;
   const keys: string[] = [];
+  let newest = 0;
   let visited = 0;
-  for (const key of notesMap!.keys()) {
+  for (const [key, value] of notesMap!.entries()) {
     if (++visited > 4 * MAX_KEYS_VISITED) break;
-    if (key.startsWith(prefix)) keys.push(key);
+    if (!key.startsWith(prefix)) continue;
+    keys.push(key);
+    newest = Math.max(newest, noteFromWire(value)?.ts ?? 0);
   }
   if (keys.length === 0) return false;
-  boundDoc!.transact(() => { for (const k of keys) notesMap!.delete(k); });
+  const now = Date.now();
+  const clear = signDown(deps.roomId(), itemId, CLEAR_TARGET, Math.max(now, Math.min(newest, now + MAX_FUTURE_SKEW_MS)), signer);
+  boundDoc!.transact(() => {
+    downMap!.set(`${prefix}${CLEAR_TARGET}`, clear);
+    for (const k of keys) notesMap!.delete(k);
+  });
   return true;
 }
 
@@ -573,8 +790,12 @@ export function forgetBoard(itemId: string): number {
   if (!docAlive()) return 0;
   const prefix = `${itemId}|`;
   const keys = [...notesMap!.keys()].filter((k) => k.startsWith(prefix));
-  if (keys.length === 0) return 0;
-  boundDoc!.transact(() => { for (const k of keys) notesMap!.delete(k); });
+  const downs = [...downMap!.keys()].filter((k) => k.startsWith(prefix));
+  if (keys.length === 0 && downs.length === 0) return 0;
+  boundDoc!.transact(() => {
+    for (const k of keys) notesMap!.delete(k);
+    for (const k of downs) downMap!.delete(k);
+  });
   return keys.length;
 }
 
@@ -590,9 +811,269 @@ export function trimBoard(itemId: string, kind: BoardKind): number {
   // become "delete everything".
   if (kind === 'owner' && !deps.ownerPub()) return 0;
   const { trimmable } = readBoard(itemId, kind);
-  if (trimmable.length === 0) return 0;
-  boundDoc!.transact(() => { for (const k of trimmable) notesMap!.delete(k); });
-  return trimmable.length;
+  const downs = planDownTrim(downMap!.entries(), itemId, readCtx(kind, Date.now()));
+  if (trimmable.length === 0 && downs.length === 0) return 0;
+  boundDoc!.transact(() => {
+    for (const k of trimmable) notesMap!.delete(k);
+    for (const k of downs) downMap!.delete(k);
+  });
+  return trimmable.length + downs.length;
+}
+
+// ── Board bundles: what other copies of the room sealed ──────────────────────
+
+/** Entries a merge looks at, at most (the node sends up to 512 notes and
+ *  1024 take-downs). */
+const MAX_MERGE_NOTES = 512;
+const MAX_MERGE_DOWN = 1024;
+
+export interface BoardView {
+  room: string;
+  notes: Array<[string, unknown]>;
+  down: Array<[string, unknown]>;
+}
+
+/** What a merge left for later: a view the node sent before the host's state
+ *  arrived, entries past a board's verify budget, and entries only the
+ *  owner's key can judge. */
+let pendingView: BoardView | null = null;
+/** A merge left entries past a budget: the next round runs on a timer, so a
+ *  long view (or one led by junk) is merged in rounds, never dropped (#332
+ *  review; the node sends a view only when it changes). */
+const RETRY_MS = 1500;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRetry(): void {
+  if (retryTimer !== null || !pendingView) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    retryBoardView();
+  }, RETRY_MS);
+}
+
+function cancelRetry(): void {
+  if (retryTimer !== null) clearTimeout(retryTimer);
+  retryTimer = null;
+}
+
+/** Entries a merge left for later (tests, and the dev console). */
+export function pendingBoardEntries(): number {
+  return pendingView ? pendingView.notes.length + pendingView.down.length : 0;
+}
+
+/** The node's `board` envelope body, shape-checked, or null. */
+export function boardViewFromWire(raw: unknown): BoardView | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.room !== 'string' || !Array.isArray(r.notes) || !Array.isArray(r.down)) return null;
+  const pairs = (list: unknown[], max: number): Array<[string, unknown]> =>
+    list.slice(0, max).filter((e): e is [string, unknown] => Array.isArray(e) && e.length === 2 && typeof e[0] === 'string' && e[0].length <= 2 * MAX_ID + 1);
+  return { room: r.room, notes: pairs(r.notes, MAX_MERGE_NOTES), down: pairs(r.down, MAX_MERGE_DOWN) };
+}
+
+/** A key this copy held and deleted (Yjs keeps the deleted item as the
+ *  key's last value): a trim, an unpin or a REMOVE here, never undone by a
+ *  bundle sealed before it. */
+function deletedHere(map: Y.Map<unknown>, key: string): boolean {
+  const item = (map as unknown as { _map?: Map<string, { deleted?: boolean }> })._map?.get(key);
+  return !!item && item.deleted === true;
+}
+
+function splitKey(key: string): { itemId: string; target: string } | null {
+  const bar = key.lastIndexOf('|');
+  if (bar <= 0) return null;
+  return { itemId: key.slice(0, bar), target: key.slice(bar + 1) };
+}
+
+const NOTE_ID_RE = /^[0-9a-f]{32}$/;
+
+/**
+ * Merge what other copies of this room sealed (the local node's `board`
+ * lane): take-downs first, then notes, each checked as a reader checks the
+ * doc. Writes only what this copy has never held, onto boards the room has.
+ * The view may hold competing records under one key (the node keeps a few):
+ * a take-down by the note's author or the owner wins over one that can't be
+ * judged, the newest valid CLEAR wins, and a record already filed here is
+ * replaced only by one that outranks it. What can't be merged yet is kept:
+ * before the host's state arrives, the whole view (`retryBoardView`); past a
+ * board's verify budget, the rest, in rounds on a timer; and while the
+ * owner's key is unknown, what only it can judge (until `refreshBoards`).
+ * Returns what was written, or null when nothing ran.
+ */
+export function mergeBoardView(raw: unknown): { notes: number; down: number } | null {
+  const view = boardViewFromWire(raw);
+  if (!view || !deps || !docAlive() || view.room !== deps.roomId()) return null;
+  if (!deps.canTrim()) {
+    pendingView = view;
+    return null;
+  }
+  pendingView = null;
+  cancelRetry();
+  const boardOf = deps.boardOfItem ?? (() => null);
+  const now = Date.now();
+  const roomId = deps.roomId();
+  const ownerPub = deps.ownerPub();
+  const rest: BoardView = { room: view.room, notes: [], down: [] };
+  let overBudget = false;
+  const touched = new Map<string, BoardKind>();
+  const budget = new Map<string, number>();
+  const spend = (itemId: string): boolean => {
+    const used = budget.get(itemId) ?? 0;
+    if (used >= MAX_VERIFIED_PER_BOARD) return false;
+    budget.set(itemId, used + 1);
+    return true;
+  };
+  const verifyDown = (itemId: string, target: string, d: BoardDown): boolean =>
+    cachedVerify(d.by, downSignBytes(roomId, itemId, target, d.by, d.ts), d.sig);
+  // The note each key names, from this copy or from the view (its id binds
+  // its author, so no signature is needed to know whose it is).
+  const viewNotes = new Map<string, BoardNote>();
+  for (const [key, value] of view.notes) {
+    const k = splitKey(key);
+    if (!k || viewNotes.has(key) || !NOTE_ID_RE.test(k.target)) continue;
+    const note = noteFromWire(value);
+    if (note && noteIdOf(roomId, k.itemId, note) === k.target) viewNotes.set(key, note);
+  }
+  const authorFor = (key: string, itemId: string, target: string): string | undefined =>
+    authorOf(notesMap!.get(key), roomId, itemId, target) ?? viewNotes.get(key)?.author;
+  // 2: by the note's author or the owner. 1: the note is unknown here, so
+  // it can't be judged yet (kept to stop that note if it comes). 0: neither.
+  const rankOf = (d: BoardDown, author: string | undefined): number =>
+    d.by === ownerPub || (author !== undefined && d.by === author) ? 2 : author === undefined ? 1 : 0;
+
+  // Each key's chosen take-down, verified.
+  const filed = new Map<string, BoardDown>();
+  const waitsForOwner = new Set<string>(); // keys and CLEAR keys put off
+  for (const [key, value] of view.down) {
+    const k = splitKey(key);
+    if (!k || !TARGET_RE.test(k.target)) continue;
+    const kind = boardOf(k.itemId);
+    if (!kind) continue;
+    const d = downFromWire(value);
+    if (!d) continue;
+    if (k.target === CLEAR_TARGET) {
+      if (!ownerPub) {
+        rest.down.push([key, value]);
+        waitsForOwner.add(key);
+        continue;
+      }
+      if (d.by !== ownerPub) continue;
+      const best = filed.get(key);
+      if (best && best.ts >= d.ts) continue;
+      const mine = best ? null : downFromWire(downMap!.get(key));
+      if (mine && mine.by === ownerPub && mine.ts >= d.ts) {
+        if (!spend(k.itemId)) {
+          rest.down.push([key, value]);
+          overBudget = true;
+          continue;
+        }
+        if (verifyDown(k.itemId, k.target, mine)) continue; // ours is as new
+      }
+    } else {
+      const author = authorFor(key, k.itemId, k.target);
+      const rank = rankOf(d, author);
+      if (rank === 0) {
+        // Neither the author's nor the owner's, unless it is the owner's
+        // and their key hasn't arrived.
+        if (!ownerPub) {
+          rest.down.push([key, value]);
+          waitsForOwner.add(key);
+        }
+        continue;
+      }
+      const best = filed.get(key);
+      if (best && rankOf(best, author) >= rank) continue;
+      const mine = best ? null : downFromWire(downMap!.get(key));
+      if (mine && rankOf(mine, author) >= rank) {
+        if (!spend(k.itemId)) {
+          rest.down.push([key, value]);
+          overBudget = true;
+          continue;
+        }
+        if (verifyDown(k.itemId, k.target, mine)) continue; // ours stands
+      }
+      // A take-down this copy trimmed stays gone, unless this one is the
+      // author's or the owner's and young: the trim may have taken one that
+      // sat on the key for nothing, which must not lock the real one out.
+      if (!downMap!.has(key) && deletedHere(downMap!, key) && !(rank === 2 && now - d.ts < DOWN_KEEP_MS)) continue;
+    }
+    if (!spend(k.itemId)) {
+      rest.down.push([key, value]);
+      overBudget = true;
+      continue;
+    }
+    if (!verifyDown(k.itemId, k.target, d)) continue;
+    filed.set(key, d);
+    touched.set(k.itemId, kind);
+  }
+  const ctxFor = (kind: BoardKind): ReadCtx => ({
+    roomId, kind, now, ownerPub, verify: cachedVerify,
+    downOf: (k) => (filed.has(k) ? filed.get(k) : downMap!.get(k)),
+  });
+  const clears = new Map<string, number>();
+  const merged = new Map<string, BoardNote>();
+  for (const [key, value] of view.notes) {
+    const k = splitKey(key);
+    if (!k || !NOTE_ID_RE.test(k.target)) continue;
+    const kind = boardOf(k.itemId);
+    if (!kind || merged.has(key) || notesMap!.has(key) || deletedHere(notesMap!, key)) continue;
+    const note = noteFromWire(value);
+    if (!note || noteIdOf(roomId, k.itemId, note) !== k.target) continue;
+    if (note.ts > now + MAX_FUTURE_SKEW_MS) continue;
+    const ctx = ctxFor(kind);
+    const clearKey = `${k.itemId}|${CLEAR_TARGET}`;
+    const downHere = ctx.downOf!(key);
+    if (!ownerPub) {
+      // What only the owner's key can judge waits for it: a notice, a note
+      // a CLEAR may cover, one taken down by someone other than its author.
+      const byOther = downHere !== undefined && downFromWire(downHere)?.by !== note.author;
+      if (kind === 'owner' || waitsForOwner.has(clearKey) || ctx.downOf!(clearKey) !== undefined || waitsForOwner.has(key) || byOther) {
+        rest.notes.push([key, value]);
+        continue;
+      }
+    }
+    if (kind === 'owner' && note.author !== ownerPub) continue;
+    if (!clears.has(k.itemId)) clears.set(k.itemId, clearStampOf(k.itemId, ctx));
+    if (note.ts <= clears.get(k.itemId)!) continue;
+    if (downHere !== undefined) {
+      if (!spend(k.itemId)) {
+        rest.notes.push([key, value]);
+        overBudget = true;
+        continue;
+      }
+      if (isTakenDown(key, k.itemId, k.target, note, ctx)) continue;
+    }
+    if (!spend(k.itemId)) {
+      rest.notes.push([key, value]);
+      overBudget = true;
+      continue;
+    }
+    const { sig, ...unsigned } = note;
+    if (!cachedVerify(note.author, noteSignBytes(roomId, k.itemId, unsigned), sig)) continue;
+    merged.set(key, note);
+    touched.set(k.itemId, kind);
+  }
+  if (rest.notes.length > 0 || rest.down.length > 0) {
+    pendingView = rest;
+    if (overBudget) scheduleRetry();
+  }
+  if (filed.size === 0 && merged.size === 0) return { notes: 0, down: 0 };
+  boundDoc!.transact(() => {
+    for (const [key, d] of filed) {
+      downMap!.set(key, d);
+      notesMap!.delete(key); // a CLEAR's key holds no note; a take-down's note goes
+    }
+    for (const [key, note] of merged) notesMap!.set(key, note);
+  });
+  // What the merge pushed past a board's caps comes off again here.
+  for (const [itemId, kind] of touched) trimBoard(itemId, kind);
+  return { notes: merged.size, down: filed.size };
+}
+
+/** Merge what an earlier merge left: once the host's state has arrived, the
+ *  next round past a budget, or once the owner's key is known. */
+export function retryBoardView(): void {
+  if (pendingView) mergeBoardView(pendingView);
 }
 
 // ── Local state: seen notes and hidden authors ───────────────────────────────
@@ -704,6 +1185,8 @@ export function resetBoardLocalStateForTest(): void {
   hiddenMemo = null;
   verdicts.clear();
   readCache = null;
+  pendingView = null;
+  cancelRetry();
 }
 
 // ── What a board's face draws ────────────────────────────────────────────────
