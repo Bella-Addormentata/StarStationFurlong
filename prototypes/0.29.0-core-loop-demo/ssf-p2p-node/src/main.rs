@@ -49,6 +49,10 @@ mod chia_knock;
 // and — in a publish build — the keyless claim and the give spend.
 #[cfg(feature = "chia-read")]
 mod chia_faucet;
+// 📌 #315: sealed room-board bundles any connected node carries and only the
+// room's pass holders read (the ChiaHub seal and hint, reused).
+#[cfg(feature = "chia-read")]
+mod board_bundles;
 // Chain WRITES (`chia-publish`, runtime-gated by SSF_CHIA_LANE=1): wallet seed,
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
@@ -267,6 +271,16 @@ pub struct Fingerprint {
     /// never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_address: Option<String>,
+    /// 📖 Whether this node's latest public addresses are listed in the Phone
+    /// Book (its per-node presence record on Chia, #231 P6a): the SpacePhone's
+    /// top bar draws a phone book from it, green when the current addresses
+    /// are confirmed on chain, grey when an older listing has gone stale.
+    /// Mirrored by the presence publisher each tick (chia_publish.rs); absent
+    /// while the node does not publish presence (a read-only build, no wallet,
+    /// `SSF_CHIA_FINDABLE=0`, no durable contact key). Loopback only, like the
+    /// address: it never rides in a pass or a card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_presence: Option<ChiaPresence>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -284,6 +298,49 @@ pub struct Fingerprint {
     /// unreadable) or the node is older.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub house: Option<String>,
+}
+
+/// 📖 The node's Phone Book listing as the browser sees it (`Fingerprint::
+/// chia_presence`). Defined here, always compiled, because the fingerprint
+/// carries it in every build while the publisher that fills it
+/// (chia_publish.rs) exists only with the `chia-publish` feature.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChiaPresence {
+    pub state: ChiaPresenceState,
+    /// The current era (edition) by the agreed chain peak, 0 while no peak is
+    /// agreed yet.
+    pub era: u64,
+    /// The era of the listing on record, 0 when there is none.
+    pub listed_era: u64,
+    /// Unix seconds of the last write on record, 0 when there is none.
+    pub last_at: u64,
+    /// The watcher has read the listing on record back from the chain.
+    pub confirmed: bool,
+    /// The listing on record is for this era and carries the node's current
+    /// public address set.
+    pub current: bool,
+    /// How many public addresses the node would list right now.
+    pub public_addrs: u32,
+    /// The last publish error, kept until a write succeeds (the unfunded
+    /// wallet is the one the Bank app can fix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 📖 The four looks of the phone book icon.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiaPresenceState {
+    /// This era's listing is confirmed on chain with the current addresses.
+    Listed,
+    /// This era's listing with the current addresses is out, awaiting the
+    /// watcher's confirmation.
+    Sent,
+    /// A listing exists but is stale: an older era, other addresses, or no
+    /// agreed peak to judge it by.
+    Outdated,
+    /// No listing of ours on record (or the first one failed).
+    Unlisted,
 }
 
 // ── Mesh tuning (M3/M5.x — see brainstorming/m345-v029-build-plan.md §2) ──────
@@ -526,6 +583,11 @@ pub struct HubState {
     /// coin) on the local browser's request. `None` while publishing is off.
     #[cfg(feature = "chia-publish")]
     pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
+    /// 📖 The Phone Book listing state the presence publisher mirrors here
+    /// each tick for the loopback fingerprint (`None` until its first tick,
+    /// or for good while the node does not publish presence).
+    #[cfg(feature = "chia-publish")]
+    pub presence_status: Mutex<Option<ChiaPresence>>,
     /// 📦 The blob lane, or None when its store could not be opened (the
     /// node runs on without it; its routes answer 503).
     pub blobs: Option<Arc<blob_lane::BlobLane>>,
@@ -533,6 +595,11 @@ pub struct HubState {
     /// (a house that forgot what it revealed could reveal a round twice).
     /// Locked after `rooms`, never before.
     pub house: Option<Mutex<house::House>>,
+    /// 📌 #315: the board-bundle lane: the bundles this node carries for
+    /// anyone (`board-bundles/`), what it published, and each peer's budget.
+    /// Locked briefly, never across an await, never inside another lock.
+    #[cfg(feature = "chia-read")]
+    pub board_bundles: Mutex<board_bundles::BoardLane>,
 }
 
 /// R1 live reachability posture. The auto public-IP echo loop writes here as
@@ -767,6 +834,7 @@ pub fn compute_fingerprint(
         iroh_port,
         share_card: false,
         chia_address: None,
+        chia_presence: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -789,6 +857,7 @@ mod fingerprint_json_tests {
             iroh_port: 44442,
             share_card: false,
             chia_address: None,
+            chia_presence: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -810,6 +879,52 @@ mod fingerprint_json_tests {
         assert_eq!(back.chia_address, None);
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_address.as_deref(), Some("txch1qq"));
+    }
+
+    /// 📖 The Phone Book listing rides the same way: absent while the node
+    /// does not publish presence, otherwise with its state spelled in
+    /// lowercase for the browser's parser, and the error only when there is
+    /// one.
+    #[test]
+    fn the_phone_book_listing_rides_in_the_fingerprint_only_while_presence_publishes() {
+        use super::{ChiaPresence, ChiaPresenceState};
+        let none = serde_json::to_string(&fp()).unwrap();
+        assert!(!none.contains("chia_presence"), "{none}");
+        let back: Fingerprint = serde_json::from_str(&none).unwrap();
+        assert_eq!(back.chia_presence, None);
+
+        let mut some = fp();
+        some.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Listed,
+            era: 7,
+            listed_era: 7,
+            last_at: 1_700_000_000,
+            confirmed: true,
+            current: true,
+            public_addrs: 2,
+            error: None,
+        });
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains("\"chia_presence\":{\"state\":\"listed\",\"era\":7,\"listed_era\":7,\"last_at\":1700000000,\"confirmed\":true,\"current\":true,\"public_addrs\":2}"), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, some.chia_presence);
+
+        let mut failing = fp();
+        failing.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Unlisted,
+            era: 7,
+            listed_era: 0,
+            last_at: 0,
+            confirmed: false,
+            current: false,
+            public_addrs: 1,
+            error: Some("chia wallet unfunded".into()),
+        });
+        let json = serde_json::to_string(&failing).unwrap();
+        assert!(json.contains("\"state\":\"unlisted\""), "{json}");
+        assert!(json.contains("\"error\":\"chia wallet unfunded\""), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, failing.chia_presence);
     }
 }
 
@@ -1699,8 +1814,15 @@ async fn main() -> Result<()> {
         knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
+        #[cfg(feature = "chia-publish")]
+        presence_status: Mutex::new(None),
         blobs,
         house: house.map(Mutex::new),
+        #[cfg(feature = "chia-read")]
+        board_bundles: Mutex::new(board_bundles::BoardLane::load(
+            std::path::Path::new(board_bundles::BUNDLES_DIR),
+            chia_resolve::unix_now(),
+        )),
     });
 
     // 💾 C4/B restore: load persisted room docs and serve them from boot.
@@ -1837,6 +1959,19 @@ async fn main() -> Result<()> {
             house_loop(hub_house).await;
         });
         tokio::spawn(house_stop_on_signal(hub.clone()));
+    }
+
+    // 📌 #315: the board-bundle lane — seal this node's rooms' boards, tell
+    // every connected peer what we carry, hand our tabs what others sealed.
+    // On by default; SSF_BOARD_BUNDLES=0 turns it off.
+    #[cfg(feature = "chia-read")]
+    if board_bundles::enabled() {
+        let held = hub.board_bundles.lock().unwrap().store.len();
+        println!("📌 Board bundles on — carrying {held} sealed bundle(s) from the last run (board-bundles/)");
+        let hub_boards = hub.clone();
+        tokio::spawn(async move {
+            board_bundle_loop(hub_boards).await;
+        });
     }
 
     // 📦🏠 The room's host keeps copies of what its rooms' TVs played
@@ -2082,6 +2217,11 @@ async fn handle_wt_connection_inner(
                                         &envelope.payload,
                                         chia_rooms::persist_room_cap,
                                     );
+                                    // 📌 A room key arrived: its board can be sealed and
+                                    // its tabs handed what others sealed, now.
+                                    if accepted.is_some() {
+                                        board_bundles::nudge();
+                                    }
                                     // #231 P6b: the cards the room's pass carries for its
                                     // members, filed like a card handed over a live
                                     // connection — only where the room's cards may be used
@@ -4181,7 +4321,10 @@ struct IdsPayload {
 /// flooded, never merged) BEFORE the ysync relay. Kept as a single predicate so
 /// the reader loop's branch and any future sender agree on the set.
 fn is_control_kind(kind: &str) -> bool {
-    matches!(kind, "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant" | "contact")
+    matches!(
+        kind,
+        "roster" | "mesh-join" | "graft" | "prune" | "px" | "ihave" | "iwant" | "contact" | "bb-have" | "bb-want" | "bb"
+    )
 }
 
 /// Kinds this node speaks only with its own browser tabs (`cap` and `faucet`
@@ -4190,7 +4333,7 @@ fn is_control_kind(kind: &str) -> bool {
 /// remote peer is dropped at the iroh ingress before it can be forwarded to
 /// the tabs as if the node had said it.
 fn is_local_lane_kind(kind: &str) -> bool {
-    matches!(kind, "cap" | "faucet" | "bridge" | "card")
+    matches!(kind, "cap" | "faucet" | "bridge" | "card" | "board")
 }
 
 /// M5.0 STRICT admission: a control envelope must be sig-Valid. Unlike
@@ -4463,7 +4606,279 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
                 }
             }
         }
+        // 📌 #315 board bundles. Only ever between the two ends of a link: a
+        // relayed copy (an older node forwards kinds it doesn't know) is
+        // dropped, never answered, so nobody can aim our serves elsewhere.
+        #[cfg(feature = "chia-read")]
+        "bb-have" | "bb-want" | "bb" if board_bundles::enabled() => {
+            if env.author.as_slice() == remote_id.as_bytes() {
+                board_control(hub, room_id, remote_id, env).await;
+            }
+        }
         _ => {}
+    }
+}
+
+/// 📌 #315: every tag this node can read (each room it holds a key for, over
+/// the TTL's days), and the room and key it opens as.
+#[cfg(feature = "chia-read")]
+fn board_tag_index(hub: &SharedHub, now: u64) -> HashMap<board_bundles::Tag, (String, [u8; 32])> {
+    let caps: Vec<(String, [u8; 32])> =
+        hub.chia_rooms.lock().unwrap().iter().map(|(room, cap)| (room.clone(), cap.room_key)).collect();
+    let mut index = HashMap::new();
+    for (room, key) in caps {
+        for tag in board_bundles::read_tags(&key, now) {
+            index.insert(tag, (room.clone(), key));
+        }
+    }
+    index
+}
+
+/// 📌 #315: one board-bundle control envelope from the connection's own peer.
+#[cfg(feature = "chia-read")]
+async fn board_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, env: &SsfEnvelope) {
+    let now = chia_resolve::unix_now();
+    let peer = remote_id.to_string();
+    let conn = || {
+        let rooms = hub.rooms.lock().unwrap();
+        rooms.get(room_id).and_then(|r| r.remote_peers.get(&remote_id)).map(|m| m.conn.clone())
+    };
+    match env.kind.as_str() {
+        // What the peer carries: ask for what we lack and would keep.
+        "bb-have" => {
+            let Ok(p) = serde_json::from_slice::<board_bundles::HavePayload>(&env.payload) else { return };
+            let offered = board_bundles::parse_have(&p);
+            let protected: std::collections::HashSet<board_bundles::Tag> = board_tag_index(hub, now).into_keys().collect();
+            let want = {
+                let mut lane = hub.board_bundles.lock().unwrap();
+                lane.note_offered(&peer, &offered);
+                lane.store.wanted(&offered, &protected, now)
+            };
+            if want.is_empty() {
+                return;
+            }
+            if let Some(c) = conn() {
+                let payload = board_bundles::WantPayload { ids: want.iter().map(hex::encode).collect() };
+                send_control(hub, &c, room_id, "bb-want", 0, serde_json::to_vec(&payload).unwrap_or_default()).await;
+            }
+        }
+        // What the peer asks for: serve it, within its window.
+        "bb-want" => {
+            let Ok(p) = serde_json::from_slice::<board_bundles::WantPayload>(&env.payload) else { return };
+            let ids = board_bundles::parse_want(&p);
+            let bundles = hub.board_bundles.lock().unwrap().serve(&peer, &ids, now);
+            if bundles.is_empty() {
+                return;
+            }
+            if let Some(c) = conn() {
+                for b in bundles {
+                    send_control(hub, &c, room_id, "bb", 0, b.to_bytes()).await;
+                }
+            }
+        }
+        // A bundle. Under a tag we can read, it must open as that room's.
+        "bb" => {
+            let Some(b) = board_bundles::Bundle::from_bytes(&env.payload) else {
+                eprintln!("📌 BOARD-DROP: malformed bundle from {remote_id}");
+                return;
+            };
+            // Charged before any work on it, so a bundle that won't open
+            // costs its sender too (#332 review).
+            if !hub.board_bundles.lock().unwrap().charge_peer(&peer, now) {
+                eprintln!("📌 BOARD-DROP: bundle from {remote_id}: the peer is over its budget");
+                return;
+            }
+            let index = board_tag_index(hub, now);
+            let ours = index.get(&b.tag).cloned();
+            if let Some((room, key)) = &ours {
+                if board_bundles::open_bundle(key, room, &b).is_none() {
+                    eprintln!("📌 BOARD-DROP: a bundle from {remote_id} under room {room}'s tag doesn't open as that room's");
+                    return;
+                }
+            }
+            let protected = index.into_keys().collect();
+            let verdict = hub.board_bundles.lock().unwrap().admit_charged(&peer, b, now, &protected);
+            match verdict {
+                board_bundles::Admit::New => {
+                    if let Some((room, _)) = ours {
+                        println!("📌 board bundle for room {room} from {}", peer.chars().take(16).collect::<String>());
+                        board_bundles::nudge();
+                    }
+                }
+                board_bundles::Admit::Known => {}
+                board_bundles::Admit::Refused(why) => eprintln!("📌 BOARD-DROP: bundle from {remote_id}: {why}"),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 📌 #315: the board-bundle loop. Every minute, or soon after a nudge (a new
+/// room key, a new bundle for one of our rooms), never twice in two seconds.
+#[cfg(feature = "chia-read")]
+async fn board_bundle_loop(hub: SharedHub) {
+    let min_gap = std::time::Duration::from_secs(2);
+    // The first pass waits for the browser's caps (or a nudge).
+    let mut wait = std::time::Duration::from_secs(15);
+    let mut last: Option<std::time::Instant> = None;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = board_bundles::NUDGE.notified() => {}
+        }
+        wait = std::time::Duration::from_secs(board_bundles::TICK_SECS);
+        if let Some(since) = last.map(|t| t.elapsed()) {
+            if since < min_gap {
+                tokio::time::sleep(min_gap - since).await;
+            }
+        }
+        last = Some(std::time::Instant::now());
+        board_bundle_tick(&hub).await;
+    }
+}
+
+/// 📌 #315: one pass: expire, publish what changed, advertise, feed the tabs.
+#[cfg(feature = "chia-read")]
+async fn board_bundle_tick(hub: &SharedHub) {
+    use board_bundles::{BoardPlain, Tag};
+    let now = chia_resolve::unix_now();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(now * 1000);
+    let self_id = hub.secret_key.public().to_string();
+    let caps: Vec<(String, [u8; 32])> =
+        hub.chia_rooms.lock().unwrap().iter().map(|(room, cap)| (room.clone(), cap.room_key)).collect();
+    let protected: std::collections::HashSet<Tag> =
+        caps.iter().flat_map(|(_, key)| board_bundles::read_tags(key, now)).collect();
+
+    // Under the rooms lock: each served room's doc (a handle, read below),
+    // one link per connected peer (any room), and the rooms' loopback tabs.
+    let (docs, peers, tabs) = {
+        let rooms = hub.rooms.lock().unwrap();
+        let docs: Vec<(String, [u8; 32], Doc)> = caps
+            .iter()
+            .filter_map(|(room, key)| {
+                let r = rooms.get(room)?;
+                r.served.then(|| (room.clone(), *key, r.doc.clone()))
+            })
+            .collect();
+        let mut peers: HashMap<PublicKey, (String, iroh::endpoint::Connection)> = HashMap::new();
+        for (room_id, r) in rooms.iter() {
+            for (k, m) in r.remote_peers.iter() {
+                peers.entry(*k).or_insert_with(|| (room_id.clone(), m.conn.clone()));
+            }
+        }
+        let tabs: HashMap<String, Vec<u8>> = caps
+            .iter()
+            .filter_map(|(room, _)| {
+                let r = rooms.get(room)?;
+                let mut addrs: Vec<String> = r
+                    .local_connections
+                    .keys()
+                    .filter(|a| chia_rooms::cap_source_is_local(a))
+                    .map(|a| a.to_string())
+                    .collect();
+                if addrs.is_empty() {
+                    return None;
+                }
+                addrs.sort();
+                Some((room.clone(), addrs.join("|").into_bytes()))
+            })
+            .collect();
+        (docs, peers, tabs)
+    };
+    // Each board as our copy holds it, with the rooms lock let go and off the
+    // runtime's threads: a doc's transaction (the house's pass) can hold one
+    // a while, and its CLEARs' signatures are checked here.
+    let contents: Vec<(String, [u8; 32], board_bundles::BoardContent)> = off_runtime(move || {
+        docs.into_iter()
+            .map(|(room, key, doc)| {
+                let content = board_bundles::board_from_doc(&doc, &room, now_ms);
+                (room, key, content)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    // Publish: a room's bundle goes out when its board changed, the day
+    // turned, or six hours passed.
+    {
+        let mut lane = hub.board_bundles.lock().unwrap();
+        lane.store.expire(now);
+        // Junk carried under a room's tag before this node had its key goes
+        // now, before our own bundle needs the room under that tag.
+        for (room, key) in &caps {
+            let gone = lane.evict_unreadable(room, key, now);
+            if gone > 0 {
+                eprintln!("📌 dropped {gone} bundle(s) under room {room}'s tags that don't open as its own");
+            }
+        }
+        for (room, key, content) in contents {
+            if !lane.publish_due(&room, &content, now) {
+                continue;
+            }
+            let at = lane.next_stamp(&room, now);
+            let plain = BoardPlain {
+                v: 1,
+                room: room.clone(),
+                publisher: self_id.clone(),
+                at,
+                notes: content.notes.clone(),
+                down: content.down.clone(),
+            };
+            // Published only once the store keeps it (#332 review): a bundle
+            // the store refuses (its tag full of bundles stamped ahead of
+            // ours) or one that can't be sealed stays due for the next tick.
+            match board_bundles::seal_fitting(&key, plain, &hub.secret_key) {
+                Some(b) => match lane.store.admit(b, now, &protected) {
+                    board_bundles::Admit::Refused(why) => {
+                        eprintln!("📌 board bundle for room {room} not kept ({why}); trying again next tick");
+                    }
+                    _ => {
+                        println!(
+                            "📌 board bundle sealed for room {room}: {} note(s), {} take-down(s)",
+                            content.notes.len(),
+                            content.down.len()
+                        );
+                        lane.note_published(&room, &content, at);
+                    }
+                },
+                None => eprintln!("📌 board bundle for room {room} could not be sealed; trying again next tick"),
+            }
+        }
+    }
+
+    // Advertise to every connected peer what it hasn't heard of yet.
+    let connected: std::collections::HashSet<String> = peers.keys().map(|k| k.to_string()).collect();
+    let adverts: Vec<(String, iroh::endpoint::Connection, Vec<u8>)> = {
+        let mut lane = hub.board_bundles.lock().unwrap();
+        lane.retain_peers(&connected);
+        peers
+            .into_iter()
+            .filter_map(|(k, (room, conn))| {
+                let items = lane.advert_for(&k.to_string(), now);
+                (!items.is_empty())
+                    .then(|| (room, conn, serde_json::to_vec(&board_bundles::have_payload(&items)).unwrap_or_default()))
+            })
+            .collect()
+    };
+    for (room, conn, payload) in adverts {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            send_control(&hub, &conn, &room, "bb-have", 0, payload).await;
+        });
+    }
+
+    // Our rooms' tabs: what other publishers sealed, when it changed.
+    for (room, key) in &caps {
+        let Some(fp) = tabs.get(room) else { continue };
+        let view = hub.board_bundles.lock().unwrap().tab_view(room, key, &self_id, fp, now);
+        if let Some(view) = view {
+            let body = serde_json::json!({ "room": room, "notes": view.notes, "down": view.down });
+            broadcast_loopback_envelope(hub, room, "board", body.to_string().into_bytes()).await;
+        }
     }
 }
 
@@ -5006,6 +5421,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     #[cfg(feature = "chia-publish")]
                     {
                         fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
+                        // 📖 And the Phone Book listing state the publisher
+                        // mirrored on its last tick, for the top bar's icon.
+                        fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
                     }
                     // 📦 The blob lane's token, for this machine's own page
                     // only: an origin the API does not grant cannot read the

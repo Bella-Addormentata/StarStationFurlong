@@ -15,6 +15,7 @@ import { bindFloorPlan, writeRoomDims } from './floorPlanDoc';
 import { assignDisassembly, bindRobotDoc, readDisassemblyJob, readRobotConfig } from './robotDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
 import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag, writeFurnitureItem } from './furnitureDoc';
+import { bindBoardDoc } from './boardDoc';
 import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, roomOccupancy, addRoomTemplateItems, applyRoomTemplate, reconcileConcurrentAdds, type PlacementSpec } from './roomTemplates';
 import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, poolWaterContains, poolBasinAt, type Box, type FurnitureItem } from './furniture';
 
@@ -429,6 +430,24 @@ describe('a layout replacing the room', () => {
     // It worked ten minutes before its dock went, and that work is kept.
     expect(readDisassemblyJob('room-b')).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN, crew: [] });
     expect(readRobotConfig(id)).toBeNull();
+  });
+});
+
+describe('a layout replacing the room\'s boards', () => {
+  it('takes a dropped board\'s notes and take-downs with it, and nothing else (#330 review)', () => {
+    const doc = new Y.Doc();
+    bindFurnitureDoc(doc);
+    bindBoardDoc(doc);
+    writeFurnitureItem({ id: 'cork-x', kind: 'corkboard', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    doc.getMap('boardNotes').set('cork-x|' + 'a'.repeat(32), { v: 1 });
+    doc.getMap('boardDown').set('cork-x|*', { v: 1 });
+    // Notes of a board that is not in this room's furniture are not this
+    // swap's to forget (the board trim's rules are).
+    doc.getMap('boardNotes').set('elsewhere|' + 'b'.repeat(32), { v: 1 });
+    applyRoomTemplate('party-2');
+    expect(readAllFurniture().has('cork-x')).toBe(false);
+    expect([...doc.getMap('boardNotes').keys()]).toEqual(['elsewhere|' + 'b'.repeat(32)]);
+    expect(doc.getMap('boardDown').size).toBe(0);
   });
 });
 

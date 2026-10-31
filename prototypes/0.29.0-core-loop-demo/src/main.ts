@@ -201,6 +201,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // (departuresWrite.ts, a background session like the far dock write), and
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
+import { bindBoardDoc, boardKindOf, mergeBoardView, refreshBoards, retryBoardView, setBoardDeps } from "./boardDoc";
 import {
   applyDeparturesPublish,
   bindDeparturesDoc,
@@ -281,6 +282,7 @@ import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tv
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
+import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -301,6 +303,7 @@ import {
   subscribeFurniture,
   writeFurnitureItem,
   deleteFurnitureItem,
+  placedFurnitureIn,
 } from "./furnitureDoc";
 import {
   seedRoomTemplate,
@@ -1001,6 +1004,28 @@ function reachabilityUdpPort(fp: LocalFingerprint | null): number {
   return fp?.iroh_port && fp.iroh_port > 0
     ? fp.iroh_port
     : DEFAULT_IROH_UDP_PORT;
+}
+
+/** 📖 The Phone Book icon in the SpacePhone's top bar (phoneBook.ts): is this
+ *  node's latest connection information listed on Chia? Drawn from each
+ *  fingerprint round beside the REACHABILITY row, and written out as the
+ *  PHONE BOOK row of the Network rows, where keyboard and screen-reader
+ *  users read it (the top bar's button is a pointer shortcut to views the
+ *  home screen reaches anyway). Hidden while the node does not publish
+ *  presence, or did not answer this round. The SVG is this page's own glyph
+ *  in one of two fixed colours, never text from outside it. */
+function renderPhoneBookIndicator(fp: LocalFingerprint | null): void {
+  const ind = phoneBookIndicator(fp);
+  setNetworkRow("network-phone-book", ind.row.value, ind.row.colour);
+  const btn = document.getElementById("phone-chia-presence") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.hidden = !ind.visible;
+  if (!ind.visible) return;
+  btn.innerHTML = phoneBookIconSvg(ind.colour, ind.filled);
+  btn.title = ind.title;
+  btn.setAttribute("aria-label", ind.title);
+  btn.dataset.state = ind.state ?? "";
+  btn.dataset.opens = ind.opens ?? "";
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -2081,6 +2106,20 @@ async function joinRoomAtEpoch(
         }
         return;
       }
+      // 📌 #315: what other nodes sealed for this room's boards, opened by
+      // the LOCAL node (node-local lane: a remote peer's `board` envelope is
+      // dropped at the node). Every note and take-down in it is checked as
+      // a reader checks the doc, so an older node forwarding a peer's copy
+      // can hand us nothing a peer couldn't write into the doc itself.
+      if (env.kind === "board" && typeof env.payload === "string") {
+        try {
+          const bytes = Uint8Array.from(atob(env.payload), (c) => c.charCodeAt(0));
+          mergeBoardView(JSON.parse(new TextDecoder().decode(bytes)));
+        } catch {
+          /* malformed view: ignored */
+        }
+        return;
+      }
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -2154,6 +2193,26 @@ async function joinRoomAtEpoch(
   // this room, as their riders' games published them, and each board's gate
   // setting. Same T0 seam — the boards re-read on the fresh doc.
   bindDeparturesDoc(sync.doc);
+
+  // 📌 Bind the room boards (#315): the corkboard's and the notice case's
+  // signed notes. Same T0 seam. The getters are this join's: the room the
+  // notes are signed into, its owner's key (read live, it can land after
+  // the doc), the deed, our name, and whether the host's own state has
+  // arrived (only then may a board trim what no reader would show): a frame
+  // from the live host, or this machine's node's answer for a room it hosts
+  // (routeRoomReady, #330 review: an owner alone in their own room never
+  // links to a peer, so `linkedSynced` alone would never let them trim).
+  bindBoardDoc(sync.doc);
+  setBoardDeps({
+    roomId: () => boot.roomId,
+    ownerPub: () => roomOwnerInfo(boot.roomId).ownerPub,
+    isOwner: () => yjsSync === sync && currentRoomDeedIsMine(),
+    myName: () => getPlayerName(),
+    canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)),
+    // From this room's doc, never the scene's FURNITURE (#332 review): the
+    // scene can still hold a board the layout removed, or its old kind.
+    boardOfItem: (itemId) => boardKindOf(placedFurnitureIn(sync.doc, itemId)?.kind),
+  });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
   // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
@@ -2316,6 +2375,8 @@ async function joinRoomAtEpoch(
     void synced.then(() => {
       if (epoch !== sessionEpoch || yjsSync !== sync) return;
       refreshWarmNeighbours();
+      // 📌 A board view the node sent before the host's state arrived.
+      retryBoardView();
       void networkProvider.refreshRoomCap();
     });
   }
@@ -3108,6 +3169,8 @@ async function joinRoomAtEpoch(
     if (_event.keysChanged.has("name")) publishPlanetSummary();
     // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
     if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
+    // 📌 A new owner is a new notice-case author (#315).
+    if (_event.keysChanged.has("owner")) refreshBoards();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some
@@ -3140,7 +3203,11 @@ async function joinRoomAtEpoch(
     // 🗺️ #192: the owner's display name rides into the atlas once their
     // entry lands or changes (only theirs: the rest of the roster is noise).
     const owner = sync.doc.getMap("roomInfo").get("owner");
-    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) harvestStationAtlas();
+    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) {
+      harvestStationAtlas();
+      // 📌 The notice case reads the owner's key from here (#315).
+      refreshBoards();
+    }
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -8378,6 +8445,22 @@ function setupSpacePhoneOverlay() {
     }
   });
 
+  // 📖 The Phone Book icon in the top bar opens the Network rows, where the
+  // REACHABILITY line explains the addresses, or the Bank app when the listing
+  // fails for want of a coin: its RECEIVE section is the fix (phoneBook.ts).
+  document.getElementById("phone-chia-presence")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opens = (e.currentTarget as HTMLElement).dataset.opens;
+    // The bar stays on screen while the IR blaster aims (the shell is slid
+    // away under it, `active` off) and while the quick chat peeks: put the
+    // blaster down, close the bar and unfold the phone first, or the view
+    // would change offscreen (the posture of __ssfOpenTreasury and Tab).
+    if (isAiming()) stopAiming();
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView(opens === "bank" ? "bank" : "setnet");
+  });
+
   // Keep phone date-stamp live
   const updatePhoneTime = () => {
     const elTime = document.getElementById("phone-time");
@@ -8757,6 +8840,9 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
     renderReachabilityRow(localFingerprint);
+    // 📖 Not the listing icon, though: a cached green would outlive the node,
+    // old tooltip and all, so it is withdrawn until the node answers again.
+    renderPhoneBookIndicator(null);
     return localFingerprint;
   }
   localFingerprint = fingerprint;
@@ -8765,6 +8851,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // (computedTable houseDuty). Kept while the node is away a round.
   setLocalHouse(fingerprint.house ?? null);
   renderReachabilityRow(fingerprint);
+  renderPhoneBookIndicator(fingerprint);
   return fingerprint;
 }
 

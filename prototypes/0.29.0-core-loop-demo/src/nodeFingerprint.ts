@@ -44,6 +44,14 @@ export interface LocalFingerprint {
    *  and a QR code; absent from read-only nodes and older ones. Kept only
    *  when it has the shape of a testnet11 address (`isTestnetAddress`). */
   chia_address?: string;
+  /** 📖 How the node's Phone Book listing stands (its per-node presence
+   *  record on Chia, #231 P6a), for the top bar's icon (phoneBook.ts): green
+   *  when the current addresses are listed, grey when an older listing has
+   *  gone stale. Present only while the node publishes presence (the publish
+   *  build with a wallet, a durable contact key and `SSF_CHIA_FINDABLE` not
+   *  `0`) and has ticked once; kept only in the node's shape
+   *  (`parseChiaPresence`). */
+  chia_presence?: ChiaPresence;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
@@ -56,6 +64,57 @@ export interface LocalFingerprint {
    *  deed holder delegates it (computedTable houseDuty). Absent from older
    *  nodes. Kept only in that shape. */
   house?: string;
+}
+
+/** 📖 The four looks of the phone book: this edition's listing confirmed
+ *  with the current addresses (`listed`), out but not yet read back (`sent`),
+ *  a listing of ours that is stale (`outdated`: an older edition, other
+ *  addresses, no chain peak to judge by), none of ours (`unlisted`). */
+export type ChiaPresenceState = 'listed' | 'sent' | 'outdated' | 'unlisted';
+
+/** The node's readout (`ChiaPresence` in ssf-p2p-node main.rs): `era` is the
+ *  current edition by the agreed peak (0 while none is agreed), `listed_era`
+ *  and `last_at` describe the listing on record (0 when there is none),
+ *  `confirmed` says the chain showed it back, `current` that it names this
+ *  edition and these addresses, `public_addrs` how many the node would list
+ *  now, and `error` is the last failed attempt's text when there is one. */
+export interface ChiaPresence {
+  state: ChiaPresenceState;
+  era: number;
+  listed_era: number;
+  last_at: number;
+  confirmed: boolean;
+  current: boolean;
+  public_addrs: number;
+  error?: string;
+}
+
+const PRESENCE_STATES: ReadonlySet<string> = new Set<ChiaPresenceState>(['listed', 'sent', 'outdated', 'unlisted']);
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+/** The node's `chia_presence` in its own shape, or undefined for anything
+ *  else: an unknown state, a count that is not a non-negative integer, a flag
+ *  that is not a boolean, or an error that is not a string. A readout the
+ *  page cannot trust is no readout: the icon stays hidden rather than guess. */
+export function parseChiaPresence(v: unknown): ChiaPresence | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.state !== 'string' || !PRESENCE_STATES.has(r.state)) return undefined;
+  if (!isCount(r.era) || !isCount(r.listed_era) || !isCount(r.last_at) || !isCount(r.public_addrs)) return undefined;
+  if (typeof r.confirmed !== 'boolean' || typeof r.current !== 'boolean') return undefined;
+  if (r.error !== undefined && typeof r.error !== 'string') return undefined;
+  const p: ChiaPresence = {
+    state: r.state as ChiaPresenceState,
+    era: r.era,
+    listed_era: r.listed_era,
+    last_at: r.last_at,
+    confirmed: r.confirmed,
+    current: r.current,
+    public_addrs: r.public_addrs,
+  };
+  if (typeof r.error === 'string') p.error = r.error;
+  return p;
 }
 
 /** A testnet11 standard-puzzle address: the `txch` prefix, the bech32m
@@ -120,6 +179,8 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   }
   if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
   if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
+  const presence = parseChiaPresence(r.chia_presence);
+  if (presence) fp.chia_presence = presence;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;
