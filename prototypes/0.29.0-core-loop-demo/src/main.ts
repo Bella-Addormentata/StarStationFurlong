@@ -407,7 +407,7 @@ import {
   isCoHost,
   hasCoHostRequest,
 } from "./roomRoles";
-import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode } from "./coHostNodes";
+import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust } from "./coHostNodes";
 import {
   bindVentures,
   subscribeVentures,
@@ -1494,7 +1494,10 @@ let coHostHintMemo: { roomId: string; at: number; hints: RoomMemberHint[] } | nu
 function coHostRouteHints(roomId: string): RoomMemberHint[] {
   const now = Date.now();
   if (coHostHintMemo && coHostHintMemo.roomId === roomId && now - coHostHintMemo.at < 5_000) return coHostHintMemo.hints;
-  const hints = coHostHintsHere(roomId, readCoHosts().filter((g) => isCoHost(g.pub)), now);
+  // The owner's node first (its record, when it filed one), then the co-hosts'.
+  const ownerPub = roomOwnerInfo(roomId).ownerPub;
+  const keepers = [...(ownerPub ? [{ pub: ownerPub, grantedAt: 0 }] : []), ...readCoHosts().filter((g) => isCoHost(g.pub) && g.pub !== ownerPub)];
+  const hints = coHostHintsHere(roomId, keepers, now);
   coHostHintMemo = { roomId, at: now, hints };
   return hints;
 }
@@ -1508,15 +1511,19 @@ function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBoot
   return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), coHosts) };
 }
 
-/** 🤝 C3: a co-host's game files its node's route in the room, signed with
- *  its key (and refreshes it as its node's routes change); a former
- *  co-host's takes its record down. Only once the room's own state has
- *  arrived: a cached copy may not list the grant yet. */
+/** 🤝 C3: a keeper's game (the owner's, or a co-host's) files its node's
+ *  route in the room, signed with its key (and refreshes it as its node's
+ *  routes change); a former keeper's takes its record down. A visitor's tab
+ *  then counts that node's copy of the room as the room's own state
+ *  (nodeProof.ts), and passes name it. Only once the room's own state has
+ *  arrived: a cached copy may not list the grant or the owner yet. */
 function refileCoHostNode(): void {
   const roomId = activeBootstrap?.roomId ?? "";
   if (!roomId || !roomStateArrivedNow()) return;
+  const me = getIdentityPub();
+  const keeper = isCoHost(me) || roomOwnerInfo(roomId).ownerPub === me;
   const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
-  if (fileMyCoHostNode(roomId, isCoHost(getIdentityPub()), hint ? routeHint(hint) : null) !== "kept") coHostHintMemo = null;
+  if (fileMyCoHostNode(roomId, keeper, hint ? routeHint(hint) : null) !== "kept") coHostHintMemo = null;
 }
 
 /**
@@ -2004,6 +2011,9 @@ async function joinRoomAtEpoch(
     roomId: boot.roomId,
     channel,
     ...ysyncSigner(), // Slice 2: sign outgoing + verify-before-apply on inbound
+    // 🤝 C3: a node the room's owner or a co-host keeps it on counts as
+    // the room's own state (nodeProof.ts), with the owner's game closed.
+    ...keeperNodeTrust,
     // 🤝 C3: the node dials the room's co-hosts beside the pass's own
     // hints, so a returning visitor reaches the room through a co-host's
     // node while the owner's is off.
@@ -2417,7 +2427,7 @@ async function joinRoomAtEpoch(
       refreshWarmNeighbours();
       // 📌 A board view the node sent before the host's state arrived.
       retryBoardView();
-      // 🤝 C3: a co-host's node, filed now the room's grants are known.
+      // 🤝 C3: a keeper's node, filed now the room's owner and grants are known.
       refileCoHostNode();
       void networkProvider.refreshRoomCap();
     });
@@ -3217,7 +3227,12 @@ async function joinRoomAtEpoch(
     // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
     if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
     // 📌 A new owner is a new notice-case author (#315).
-    if (_event.keysChanged.has("owner")) refreshBoards();
+    if (_event.keysChanged.has("owner")) {
+      refreshBoards();
+      // 🤝 C3: a new owner's game files its node; a former owner's takes its down.
+      coHostHintMemo = null;
+      refileCoHostNode();
+    }
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some

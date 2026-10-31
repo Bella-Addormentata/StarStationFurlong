@@ -105,6 +105,42 @@ pub struct SsfEnvelope {
     /// node learns the whole roster instead of one host. `None`/absent on legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_member_hints: Option<Vec<MemberHint>>,
+    /// 🤝 C3: this node built the frame from its own copy of the room (a
+    /// SyncStep2 answering a peer): see `NodeProof`. Absent on every other
+    /// frame, and on frames from nodes before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_proof: Option<NodeProof>,
+}
+
+/// 🤝 C3 (#332 review): a node's signature, with its iroh key, over a stamp
+/// and a frame's canonical bytes (`node_state_sign_bytes`), proving the node
+/// built that frame for that room and sequence. A visitor's tab counts such
+/// a SyncStep2 as the room's own state when the node is one the room's owner
+/// or a co-host filed as theirs (src/network/nodeProof.ts), so a room whose
+/// owner's game is closed still counts as synced from the nodes that keep it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NodeProof {
+    /// Unix milliseconds when the node signed.
+    pub at: u64,
+    /// Base64 of the 64-byte ed25519 signature.
+    pub sig: String,
+}
+
+/// What a node signs for a frame it builds (nodeProof.ts nodeStateSignBytes).
+fn node_state_sign_bytes(room: &str, seq: u32, at: u64, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = format!("ssf-node-state:v1\n{at}\n").into_bytes();
+    bytes.extend_from_slice(&canonical_sign_bytes(1, room, "ysync", seq, payload));
+    bytes
+}
+
+/// A node's proof for a frame it builds now.
+fn node_proof(secret: &SecretKey, room: &str, seq: u32, payload: &[u8]) -> NodeProof {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let sig = secret.sign(&node_state_sign_bytes(room, seq, at, payload));
+    NodeProof { at, sig: base64::Engine::encode(&base64::prelude::BASE64_STANDARD, sig.to_bytes()) }
 }
 
 /// One member's dial hints from the room bootstrap (M4). Field names match the
@@ -823,6 +859,53 @@ pub fn compute_fingerprint(
         blob_cap: None,
         torrent: false,
     })
+}
+
+#[cfg(test)]
+mod node_proof_tests {
+    use super::*;
+
+    #[test]
+    fn a_node_proof_signs_the_tabs_bytes() {
+        // src/network/nodeProof.test.ts pins the same bytes.
+        let bytes = node_state_sign_bytes("room-a", 7, 1234, &[0, 1]);
+        assert_eq!(
+            hex::encode(&bytes),
+            "7373662d6e6f64652d73746174653a76310a313233340a792e371c081e586fe3427f6b24296df18572cec235d7e93d744ad676fa4c423f"
+        );
+    }
+
+    #[test]
+    fn a_node_proof_verifies_under_the_node_id_and_only_for_its_frame() {
+        let sk = SecretKey::from_bytes(&[3; 32]);
+        let proof = node_proof(&sk, "room-a", 9, b"payload");
+        let sig = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &proof.sig).unwrap();
+        let sig = iroh::Signature::from_bytes(<&[u8; 64]>::try_from(sig.as_slice()).unwrap());
+        let node: PublicKey = sk.public().to_string().parse().unwrap();
+        assert!(node.verify(&node_state_sign_bytes("room-a", 9, proof.at, b"payload"), &sig).is_ok());
+        assert!(node.verify(&node_state_sign_bytes("room-a", 10, proof.at, b"payload"), &sig).is_err());
+        assert!(node.verify(&node_state_sign_bytes("room-b", 9, proof.at, b"payload"), &sig).is_err());
+        // Only proved frames carry the field; others serialize as before.
+        let env = SsfEnvelope {
+            v: 1,
+            room: "room-a".into(),
+            kind: "ysync".into(),
+            seq: 9,
+            author: vec![],
+            payload: b"payload".to_vec(),
+            sig: None,
+            iroh_node_id: None,
+            iroh_relay_urls: None,
+            iroh_direct_addrs: None,
+            trust_tier: None,
+            iroh_member_hints: None,
+            node_proof: None,
+        };
+        assert!(!serde_json::to_string(&env).unwrap().contains("node_proof"));
+        let proved = SsfEnvelope { node_proof: Some(proof), ..env };
+        let back: SsfEnvelope = serde_json::from_str(&serde_json::to_string(&proved).unwrap()).unwrap();
+        assert!(back.node_proof.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -3689,19 +3772,26 @@ fn handle_iroh_connection(
                                         encoder.write_var(0u32); // messageType = Sync
                                         encoder.write_var(1u32); // syncSubType = SyncStep2
                                         encoder.write_buf(&diff);
+                                        let payload = encoder.to_vec();
+                                        let seq = envelope.seq.wrapping_add(1);
+                                        // 🤝 C3: signed as built by this node, so a visitor's
+                                        // tab can count it as the room's own state when the
+                                        // room names this node as its owner's or a co-host's.
+                                        let proof = node_proof(&hub_clone.secret_key, room_id, seq, &payload);
                                         let reply_env = SsfEnvelope {
                                             v: 1,
                                             room: room_id.clone(),
                                             kind: "ysync".to_string(),
-                                            seq: envelope.seq + 1,
+                                            seq,
                                             author: vec![],
-                                            payload: encoder.to_vec(),
+                                            payload,
                                             sig: None,
                                             iroh_node_id: Some(self_id_inner.to_string()),
                                             iroh_relay_urls: None,
                                             iroh_direct_addrs: None,
                                             trust_tier: None,
                                             iroh_member_hints: None,
+                                            node_proof: Some(proof),
                                         };
                                         if let Ok(bytes) = serde_json::to_vec(&reply_env) {
                                             let reply_conn = connection_clone.clone();
@@ -3781,6 +3871,7 @@ async fn broadcast_tab_envelope(hub: &SharedHub, room_id: &str, kind: &str, payl
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
+        node_proof: None,
     };
     let Ok(bytes) = serde_json::to_vec(&env) else { return };
     let len_bytes = (bytes.len() as u32).to_le_bytes();
@@ -3828,6 +3919,7 @@ async fn write_faucet_reply<W: AsyncWriteExt + Unpin>(
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
+        node_proof: None,
     };
     let bytes = serde_json::to_vec(&env)?;
     writer.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
@@ -3863,6 +3955,7 @@ async fn write_bridge_status<W: AsyncWriteExt + Unpin>(
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
+        node_proof: None,
     };
     let bytes = serde_json::to_vec(&env)?;
     let len_bytes = (bytes.len() as u32).to_le_bytes();
@@ -3984,6 +4077,7 @@ fn node_signed_control(hub: &SharedHub, room: &str, kind: &str, seq: u32, payloa
         iroh_direct_addrs: None,
         trust_tier: None,
         iroh_member_hints: None,
+        node_proof: None,
     }
 }
 
@@ -4795,6 +4889,7 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
                 iroh_direct_addrs: None,
                 trust_tier: None,
                 iroh_member_hints: None,
+                node_proof: None,
             };
 
             let reply_bytes = serde_json::to_vec(&reply_env)?;

@@ -161,6 +161,50 @@ export function readCoHostHints(
   return out;
 }
 
+// ── Keepers: the owner and the co-hosts ─────────────────────────────────────
+
+/** Map names the keeper reader looks in (roomRoles.ts, main.ts roomInfo). */
+const CO_HOSTS_MAP = 'coHosts';
+
+/** The room owner's identity key as a doc names it (main.ts roomOwnerInfo):
+ *  `roomInfo.owner` names a player whose `players` entry holds the key.
+ *  Never for the legacy marker, which names no player. */
+export function ownerPubIn(doc: Y.Doc): string | undefined {
+  const owner = doc.getMap('roomInfo').get('owner');
+  if (typeof owner !== 'string' || owner.length === 0 || owner === 'Local-Clone') return undefined;
+  const entry = doc.getMap('players').get(owner) as { keyB64?: unknown } | undefined;
+  return typeof entry?.keyB64 === 'string' && entry.keyB64.length > 0 ? entry.keyB64 : undefined;
+}
+
+/** Who keeps a room: its owner first, then its co-hosts as the doc lists
+ *  them (`coHosts`). */
+export function keepersIn(doc: Y.Doc, ownerPub = ownerPubIn(doc)): CoHostGrantLike[] {
+  const out: CoHostGrantLike[] = ownerPub ? [{ pub: ownerPub, grantedAt: 0 }] : [];
+  for (const v of doc.getMap(CO_HOSTS_MAP).values()) {
+    const g = v as { pub?: unknown; grantedAt?: unknown } | null;
+    if (g && typeof g.pub === 'string' && g.pub !== ownerPub && Number.isFinite(g.grantedAt)) {
+      out.push({ pub: g.pub, grantedAt: Math.max(1, g.grantedAt as number) });
+    }
+  }
+  return out;
+}
+
+/** 🤝 The nodes that keep a room, from its own doc: each keeper's record,
+ *  signed by that keeper's key for this room, and fresh. What a node such
+ *  as these proves it built (nodeProof.ts) a tab takes as the room's own
+ *  state (YjsSync `keeperNode`). Reads the doc it is given, not the bound
+ *  store: a warm neighbour's or a far door's session asks too. */
+export function keeperNodesIn(doc: Y.Doc, roomId: string, now = Date.now()): Set<string> {
+  const records = doc.getMap(CO_HOST_NODES_MAP);
+  const hints = readCoHostHints(keepersIn(doc), (pub) => records.get(pub), { roomId, now, verify: cachedVerify });
+  return new Set(hints.map((h) => h.irohNodeId));
+}
+
+/** YjsSync's `keeperNode` for any room session. */
+export const keeperNodeTrust = {
+  keeperNode: (node: string, doc: Y.Doc, roomId: string): boolean => keeperNodesIn(doc, roomId).has(node),
+};
+
 /** Whether a co-host's stored record should be rewritten with `next`. */
 export function needsRefile(stored: CoHostNode | null, next: CoHostNode, now: number): boolean {
   if (!stored) return true;
