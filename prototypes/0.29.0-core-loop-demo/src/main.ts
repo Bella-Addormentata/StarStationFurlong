@@ -2160,14 +2160,17 @@ async function joinRoomAtEpoch(
   // signed notes. Same T0 seam. The getters are this join's: the room the
   // notes are signed into, its owner's key (read live, it can land after
   // the doc), the deed, our name, and whether the host's own state has
-  // arrived (only then may a board trim what no reader would show).
+  // arrived (only then may a board trim what no reader would show): a frame
+  // from the live host, or this machine's node's answer for a room it hosts
+  // (routeRoomReady, #330 review: an owner alone in their own room never
+  // links to a peer, so `linkedSynced` alone would never let them trim).
   bindBoardDoc(sync.doc);
   setBoardDeps({
     roomId: () => boot.roomId,
     ownerPub: () => roomOwnerInfo(boot.roomId).ownerPub,
     isOwner: () => yjsSync === sync && currentRoomDeedIsMine(),
     myName: () => getPlayerName(),
-    canTrim: () => yjsSync === sync && sync.linkedSynced,
+    canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)),
   });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's

@@ -22,6 +22,7 @@ import {
   clearBoard,
   freeSpot,
   isUnseen,
+  unseenIds,
   markBoardSeen,
   noteFromWire,
   noteKey,
@@ -352,8 +353,42 @@ describe('the bound store', () => {
     const n = readBoard(BOARD, 'open').shown[0];
     expect(isUnseen(ROOM, BOARD, n, bob.pub)).toBe(true);
     expect(isUnseen(ROOM, BOARD, n, alice.pub)).toBe(false);
+    expect([...unseenIds(BOARD, 'open', bob.pub)]).toEqual([n.id]);
     markBoardSeen(BOARD, 'open');
     expect(isUnseen(ROOM, BOARD, n, bob.pub)).toBe(false);
+    expect(unseenIds(BOARD, 'open', bob.pub).size).toBe(0);
+  });
+
+  it('remembers seen notes by id, so a note stamped ahead hides no later one (#330 review)', () => {
+    const map = doc.getMap(BOARD_NOTES_MAP);
+    const ahead = note(alice, 'my clock runs fast', Date.now() + 5 * 60_000);
+    map.set(noteKey(BOARD, ahead.id), ahead.note);
+    markBoardSeen(BOARD, 'open');
+    // Posted after the board was opened, by a writer whose clock is right.
+    const later = note(owner, 'posted afterwards', Date.now());
+    map.set(noteKey(BOARD, later.id), later.note);
+    const shown = readBoard(BOARD, 'open').shown;
+    expect(shown.map((n) => n.text)).toEqual(['my clock runs fast', 'posted afterwards']);
+    expect(isUnseen(ROOM, BOARD, shown[0], bob.pub)).toBe(false);
+    expect(isUnseen(ROOM, BOARD, shown[1], bob.pub)).toBe(true);
+    // And one that arrives late with an old stamp still glows.
+    const late = note(signer('late'), 'sent from a slow link', Date.now() - 3600_000);
+    map.set(noteKey(BOARD, late.id), late.note);
+    expect(readBoardScreen(BOARD, 'open').notes.find((n) => n.text === 'sent from a slow link')?.unseen).toBe(true);
+  });
+
+  it('never lends a genuine note’s cached verdict to an altered copy (#330 review)', () => {
+    const map = doc.getMap(BOARD_NOTES_MAP);
+    state.isOwner = true;
+    const r = postNote(BOARD, 'owner', { text: 'Rules: be kind', colour: 'white' }, owner);
+    if (!r.ok) throw new Error(r.why);
+    expect(readBoard(BOARD, 'owner').shown.map((n) => n.text)).toEqual(['Rules: be kind']); // warms the cache
+    const genuine = map.get(noteKey(BOARD, r.id)) as BoardNote;
+    // Same author and signature, new text, filed under the id its bytes hash to.
+    const { sig: _sig, ...unsigned } = { ...genuine, text: 'Rules: send me your coins' };
+    const forgedId = signNote(ROOM, BOARD, { ...unsigned }, { pub: owner.pub, sign: () => genuine.sig }).id;
+    map.set(noteKey(BOARD, forgedId), { ...unsigned, sig: genuine.sig });
+    expect(readBoard(BOARD, 'owner').shown.map((n) => n.text)).toEqual(['Rules: be kind']);
   });
 
   it('hides an author on this screen only', () => {

@@ -42,7 +42,7 @@
  *
  * Trimming the doc (`trimBoard`): deletes what a reader would never show
  * (malformed, unverifiable, past the caps, stamped far in the future). It runs
- * only when the caller says the host's own state has arrived (linkedSynced),
+ * only when the caller says the host's own state has arrived (routeRoomReady),
  * the durability plan's do-not-clean rule (room-durability-plan.md §2); it is
  * safe even on a stale copy, because a note outside the newest 24 of a partial
  * view is outside them in the full one too.
@@ -399,7 +399,9 @@ export interface BoardDeps {
   isOwner: () => boolean;
   /** Our display name. */
   myName: () => string;
-  /** The host's own state has arrived (YjsSync.linkedSynced): trims may run. */
+  /** The host's own state has arrived (routeKeeper.routeRoomReady: a frame
+   *  from the live host, or this machine's node for a room it hosts): trims
+   *  may run. */
   canTrim: () => boolean;
 }
 
@@ -408,8 +410,11 @@ let boundDoc: Y.Doc | null = null;
 let notesMap: Y.Map<unknown> | null = null;
 let version = 0;
 const listeners = new Set<() => void>();
-/** Signature verdicts by the signature itself (a note's bytes are fixed by
- *  its id, and its id by its key): the face redraws every second. */
+/** Signature verdicts, by key, signature AND a hash of the signed bytes:
+ *  the face redraws every second. The bytes belong in the key (#330 review):
+ *  keyed by signature alone, a peer could change a note's text, re-file it
+ *  under the id its new bytes hash to, keep the old signature and be handed
+ *  the genuine note's cached `true`. */
 const verdicts = new Map<string, boolean>();
 const MAX_VERDICTS = 2048;
 
@@ -455,7 +460,7 @@ export function boardsVersion(): number {
 }
 
 const cachedVerify = (pub: string, bytes: Uint8Array, sig: string): boolean => {
-  const key = `${pub}|${sig}`;
+  const key = `${pub}|${sig}|${bytesToHex(sha512(bytes)).slice(0, 32)}`;
   const hit = verdicts.get(key);
   if (hit !== undefined) return hit;
   const ok = verifyIdentityStrict(pub, bytes, sig);
@@ -594,7 +599,11 @@ export function trimBoard(itemId: string, kind: BoardKind): number {
 
 const SEEN_KEY = 'ssf-board-seen';
 const HIDDEN_KEY = 'ssf-board-hidden';
-const MAX_SEEN = 200;
+/** Boards whose seen notes are remembered (the newest-opened kept). */
+const MAX_SEEN = 100;
+/** Note ids remembered per board: twice what a board shows, so a note that
+ *  drops off and comes back within a few posts stays seen. */
+const MAX_SEEN_IDS = 2 * MAX_BOARD_NOTES;
 const MAX_HIDDEN = 256;
 
 function loadJson<T>(key: string, fallback: T): T {
@@ -610,16 +619,18 @@ function saveJson(key: string, value: unknown): void {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* privacy mode: this session only */ }
 }
 
-let seenMemo: Record<string, number> | null = null;
+let seenMemo: Record<string, string[]> | null = null;
 let hiddenMemo: string[] | null = null;
 
-function seenMap(): Record<string, number> {
+function seenMap(): Record<string, string[]> {
   if (!seenMemo) {
     const raw = loadJson<unknown>(SEEN_KEY, {});
     seenMemo = {};
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-        if (typeof v === 'number' && Number.isFinite(v)) seenMemo[k] = v;
+        if (Array.isArray(v)) {
+          seenMemo[k] = v.filter((id): id is string => typeof id === 'string' && id.length <= MAX_ID).slice(0, MAX_SEEN_IDS);
+        }
       }
     }
   }
@@ -634,26 +645,35 @@ function hiddenList(): string[] {
   return hiddenMemo;
 }
 
-/** The newest note stamp this player has seen on a board (0: none). */
-export function seenUpTo(roomId: string, itemId: string): number {
-  return seenMap()[`${roomId}|${itemId}`] ?? 0;
+/** A note glows until its reader opens the board (never their own). Seen is
+ *  remembered by note id, never by stamp (#330 review): stamps are the
+ *  authors' clocks, so one note stamped ahead, or one that arrived late with
+ *  an old stamp, would have put a watermark over notes nobody had opened. */
+export function isUnseen(roomId: string, itemId: string, note: Pick<ShownNote, 'id' | 'author'>, me: string): boolean {
+  return note.author !== me && !(seenMap()[`${roomId}|${itemId}`] ?? []).includes(note.id);
 }
 
-/** A note glows until its reader opens the board (never their own). */
-export function isUnseen(roomId: string, itemId: string, note: Pick<BoardNote, 'ts' | 'author'>, me: string): boolean {
-  return note.author !== me && note.ts > seenUpTo(roomId, itemId);
+/** The ids of a board's notes this player has not seen yet (not their own):
+ *  what the panel marks NEW. */
+export function unseenIds(itemId: string, kind: BoardKind, me: string = getIdentityPub()): Set<string> {
+  if (!deps || !docAlive()) return new Set();
+  const roomId = deps.roomId();
+  return new Set(readBoard(itemId, kind).shown.filter((n) => isUnseen(roomId, itemId, n, me)).map((n) => n.id));
 }
 
 /** The player opened the board: everything on it now counts as seen. */
 export function markBoardSeen(itemId: string, kind: BoardKind): void {
   if (!deps || !docAlive()) return;
   const roomId = deps.roomId();
-  const newest = readBoard(itemId, kind).shown.reduce((m, n) => Math.max(m, n.ts), 0);
+  const shown = readBoard(itemId, kind).shown.map((n) => n.id);
   const key = `${roomId}|${itemId}`;
   const map = seenMap();
-  if ((map[key] ?? 0) >= newest) return;
+  const before = map[key] ?? [];
+  if (shown.every((id) => before.includes(id))) return;
   delete map[key];
-  map[key] = newest; // re-inserted last: the newest entries survive the cap
+  // Re-inserted last: the boards opened most lately survive the cap. The
+  // board's own ids first, so the oldest remembered ones fall off.
+  map[key] = [...shown, ...before.filter((id) => !shown.includes(id))].slice(0, MAX_SEEN_IDS);
   const keys = Object.keys(map);
   for (let i = 0; i < keys.length - MAX_SEEN; i++) delete map[keys[i]];
   saveJson(SEEN_KEY, map);
@@ -733,11 +753,6 @@ export function readBoardScreen(itemId: string, kind: BoardKind): BoardScreen {
     hiddenCount: shown.length - visible.length,
     ...(notes.length === 0 ? { empty } : {}),
   };
-}
-
-/** The current room's id as the board store has it ('' when unbound). */
-export function boardRoomId(): string {
-  return deps?.roomId() ?? '';
 }
 
 /** The room owner's key as the boards read it (undefined: not known yet). */

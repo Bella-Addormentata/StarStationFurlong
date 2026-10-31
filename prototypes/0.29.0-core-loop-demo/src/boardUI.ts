@@ -31,7 +31,6 @@ import {
   MAX_NOTE_TEXT,
   MAX_NOTES_PER_AUTHOR,
   boardOwnerPub,
-  boardRoomId,
   canModerate,
   canPost,
   clearBoard,
@@ -39,11 +38,11 @@ import {
   markBoardSeen,
   postNote,
   readBoard,
-  seenUpTo,
   setAuthorHidden,
   subscribeBoards,
   takeDownNote,
   trimBoard,
+  unseenIds,
   type BoardColour,
   type BoardKind,
   type ShownNote,
@@ -97,8 +96,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let since = 0;
-  /** Notes newer than this were unseen when the player walked up. */
-  let seenBefore = 0;
+  /** The notes that were unseen when the player walked up, or that arrived
+   *  while they read: marked NEW in the panel until it closes. */
+  const fresh = new Set<string>();
   let colour: BoardColour = open ? 'yellow' : 'white';
   let clearArmedUntil = 0;
   let status = '';
@@ -116,7 +116,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       return `<span style="font-size:10px; color:${DIM};">${why}</span>`;
     }
     return notes.map((n) => {
-      const fresh = n.author !== me && n.ts > seenBefore;
+      const isNew = n.author !== me && fresh.has(n.id);
       const mine = n.author === me;
       const photo = n.attach
         ? `<div style="font-size:9.5px; color:${DIM}; margin-top:4px;">📷 Photo${n.attach.caption ? ` · ${escapeHtml(n.attach.caption)}` : ''} <span style="opacity:0.7;">(shows with the camera app)</span></div>`
@@ -129,12 +129,12 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       return `<div style="
           border-left:4px solid ${NOTE_FILL[n.colour]}; background:rgba(255,255,255,0.03);
           border-radius:6px; padding:8px 10px;
-          ${fresh ? 'box-shadow:0 0 0 1px rgba(255,236,140,0.55), 0 0 14px rgba(255,236,140,0.25);' : ''}">
+          ${isNew ? 'box-shadow:0 0 0 1px rgba(255,236,140,0.55), 0 0 14px rgba(255,236,140,0.25);' : ''}">
         <div style="font-size:11px; line-height:1.45; color:#E8E2D0; white-space:pre-wrap; word-break:break-word;">${escapeHtml(n.text)}</div>
         ${photo}
         <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-top:6px;">
           <span style="font-size:9px; color:${DIM};">
-            ${fresh ? `<span style="color:#FFE88C; font-weight:800;">NEW</span> · ` : ''}${authorLabel(n, me)}${owner && n.author === owner ? ` · <span style="color:${GOLD_BRIGHT};">OWNER</span>` : ''} · ${noteAge(n.ts, now)}
+            ${isNew ? `<span style="color:#FFE88C; font-weight:800;">NEW</span> · ` : ''}${authorLabel(n, me)}${owner && n.author === owner ? ` · <span style="color:${GOLD_BRIGHT};">OWNER</span>` : ''} · ${noteAge(n.ts, now)}
           </span>
           <span style="display:flex; gap:4px;">${buttons}</span>
         </div>
@@ -142,9 +142,11 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     }).join('');
   };
 
-  /** Authors this player hid who have notes on this board, to show again. */
+  /** Authors this player hid who have notes on this board, to show again.
+   *  On the notice case too (#330 review): the hidden list is one for every
+   *  board, so hiding someone on a corkboard hides their notices as well, and
+   *  the case must offer them back. */
   const hiddenHtml = (): string => {
-    if (!open) return '';
     const byAuthor = new Map<string, string>();
     for (const n of readBoard(itemId, kind).shown) {
       if (isHiddenAuthor(n.author) && !byAuthor.has(n.author)) byAuthor.set(n.author, n.authorName);
@@ -314,11 +316,13 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       host.appendChild(panel);
       // What was new when the player walked up stays marked NEW here; the
       // face's glow goes out now that they've seen it.
-      seenBefore = seenUpTo(boardRoomId(), itemId);
+      for (const id of unseenIds(itemId, kind)) fresh.add(id);
       markBoardSeen(itemId, kind);
       trimBoard(itemId, kind);
       unsubscribe = subscribeBoards(() => {
-        // A note pinned while the player reads the board is seen too.
+        // A note pinned while the player reads the board is NEW here and
+        // seen on the face.
+        for (const id of unseenIds(itemId, kind)) fresh.add(id);
         markBoardSeen(itemId, kind);
         render();
       });
