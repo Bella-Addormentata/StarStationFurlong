@@ -13,6 +13,7 @@ import {
   BOARD_NOTES_MAP,
   BOARD_DOWN_MAP,
   CLEAR_TARGET,
+  clearKey,
   MAX_DOWN_PER_BOARD,
   MAX_DOWN_RETAINED,
   DOWN_KEEP_MS,
@@ -23,6 +24,7 @@ import {
   planDownTrim,
   retryBoardView,
   signDown,
+  downSignBytes,
   MAX_BOARD_NOTES,
   MAX_KEYS_VISITED,
   MAX_NOTE_TEXT,
@@ -476,7 +478,7 @@ describe('the bound store', () => {
     notes.set(noteKey(BOARD, early.id), early.note);
     state.isOwner = true;
     expect(clearBoard(BOARD, owner)).toBe(true);
-    expect(doc.getMap(BOARD_DOWN_MAP).has(`${BOARD}|${CLEAR_TARGET}`)).toBe(true);
+    expect([...doc.getMap(BOARD_DOWN_MAP).keys()].some((k) => k.startsWith(`${BOARD}|${CLEAR_TARGET}`))).toBe(true);
     notes.set(noteKey(BOARD, early.id), early.note); // a copy that never saw the clear
     expect(readBoard(BOARD, 'open').shown).toEqual([]);
     const r = postNote(BOARD, 'open', { text: 'after the clear', colour: 'blue' }, bob);
@@ -484,11 +486,18 @@ describe('the bound store', () => {
     expect(readBoard(BOARD, 'open').shown.map((x) => x.text)).toEqual(['after the clear']);
   });
 
+  it('signs a take-down over the bytes the node checks (board_bundles.rs down_sign_bytes)', () => {
+    expect(new TextDecoder().decode(downSignBytes('room-a', 'cork', '*', 'abc', 500))).toBe(
+      '{"k":"ssf-board-down:v1","roomId":"room-a","itemId":"cork","target":"*","by":"abc","ts":500}',
+    );
+  });
+
   it('ignores a CLEAR not signed by the owner', () => {
     const notes = doc.getMap(BOARD_NOTES_MAP);
     const n = note(alice, 'still here', Date.now() - 5000);
     notes.set(noteKey(BOARD, n.id), n.note);
-    doc.getMap(BOARD_DOWN_MAP).set(`${BOARD}|${CLEAR_TARGET}`, signDown(ROOM, BOARD, CLEAR_TARGET, Date.now(), bob));
+    const fake = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now(), bob);
+    doc.getMap(BOARD_DOWN_MAP).set(clearKey(BOARD, fake.ts), fake);
     expect(readBoard(BOARD, 'open').shown).toHaveLength(1);
     expect(trimBoard(BOARD, 'open')).toBe(1); // the false CLEAR itself
     expect(readBoard(BOARD, 'open').shown).toHaveLength(1);
@@ -571,15 +580,18 @@ describe('the bound store', () => {
     const n = note(alice, 'held here', Date.now() - 60_000);
     notes.set(noteKey(BOARD, n.id), n.note);
     const strangers = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now(), bob);
-    expect(mergeBoardView(view([], [[`${BOARD}|${CLEAR_TARGET}`, strangers]]))).toEqual({ notes: 0, down: 0 });
+    expect(mergeBoardView(view([], [[clearKey(BOARD, strangers.ts), strangers]]))).toEqual({ notes: 0, down: 0 });
     const byBob = signDown(ROOM, BOARD, n.id, Date.now(), bob);
     expect(mergeBoardView(view([], [[noteKey(BOARD, n.id), byBob]]))).toEqual({ notes: 0, down: 0 }); // not the author
     const clear = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now(), owner);
-    expect(mergeBoardView(view([], [[`${BOARD}|${CLEAR_TARGET}`, clear]]))).toEqual({ notes: 0, down: 1 });
+    expect(mergeBoardView(view([], [[clearKey(BOARD, clear.ts), clear]]))).toEqual({ notes: 0, down: 1 });
     expect(readBoard(BOARD, 'open').shown).toEqual([]);
     expect(notes.has(noteKey(BOARD, n.id))).toBe(false); // the merge's trim took it off
     const older = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 10_000, owner);
-    expect(mergeBoardView(view([], [[`${BOARD}|${CLEAR_TARGET}`, older]]))).toEqual({ notes: 0, down: 0 });
+    expect(mergeBoardView(view([], [[clearKey(BOARD, older.ts), older]]))).toEqual({ notes: 0, down: 0 });
+    // Filed under a stamp other than its own, it is no CLEAR.
+    const newer = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() + 1000, owner);
+    expect(mergeBoardView(view([], [[clearKey(BOARD, newer.ts + 1), newer]]))).toEqual({ notes: 0, down: 0 });
   });
 
   it('merges notice-case notes only by the owner, and waits for the host before writing', () => {
@@ -622,7 +634,6 @@ describe('the bound store', () => {
   });
 
   it('takes the newest valid CLEAR whatever order the view lists them in (#332 review)', () => {
-    const clearKey = `${BOARD}|${CLEAR_TARGET}`;
     const t1 = Date.now() - 60_000;
     const t2 = Date.now() - 10_000;
     const between = note(bob, 'cleared at T2', t1 + 5_000);
@@ -630,11 +641,11 @@ describe('the bound store', () => {
     for (const order of [[t1, t2], [t2, t1]]) {
       doc = new Y.Doc();
       bindBoardDoc(doc);
-      const clears = order.map((t) => [clearKey, signDown(ROOM, BOARD, CLEAR_TARGET, t, owner)] as [string, unknown]);
+      const clears = order.map((t) => [clearKey(BOARD, t), signDown(ROOM, BOARD, CLEAR_TARGET, t, owner)] as [string, unknown]);
       // A forged CLEAR claiming the owner and a later stamp doesn't count.
-      clears.push([clearKey, { ...signDown(ROOM, BOARD, CLEAR_TARGET, t1, owner), ts: t2 + 5_000 }]);
+      clears.push([clearKey(BOARD, t2 + 5_000), { ...signDown(ROOM, BOARD, CLEAR_TARGET, t1, owner), ts: t2 + 5_000 }]);
       expect(mergeBoardView(view([entry(between), entry(after)], clears))).toEqual({ notes: 1, down: 1 });
-      expect((doc.getMap(BOARD_DOWN_MAP).get(clearKey) as { ts: number }).ts, `order ${order}`).toBe(t2);
+      expect([...doc.getMap(BOARD_DOWN_MAP).keys()], `order ${order}`).toEqual([clearKey(BOARD, t2)]);
       expect(readBoard(BOARD, 'open').shown.map((x) => x.text)).toEqual(['after both']);
     }
   });
@@ -668,7 +679,8 @@ describe('the bound store', () => {
       const notice = note(owner, 'official', Date.now() - 1000, { board: CASE });
       const covered = note(alice, 'before the clear', Date.now() - 60_000);
       const elsewhere = note(bob, 'on the other board', Date.now() - 60_000, { board: 'corkboard-2' });
-      const clear: [string, unknown] = [`${BOARD}|${CLEAR_TARGET}`, signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 30_000, owner)];
+      const clearRec = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 30_000, owner);
+      const clear: [string, unknown] = [clearKey(BOARD, clearRec.ts), clearRec];
       expect(mergeBoardView(view([entry(notice, CASE), entry(covered), entry(elsewhere, 'corkboard-2')], [clear]))).toEqual({ notes: 1, down: 0 });
       expect(pendingBoardEntries()).toBe(3);
       vi.advanceTimersByTime(10_000);
@@ -678,9 +690,155 @@ describe('the bound store', () => {
       vi.advanceTimersByTime(2_000);
       expect(pendingBoardEntries()).toBe(0);
       expect(readBoard(CASE, 'owner').shown.map((n) => n.text)).toEqual(['official']);
-      expect(doc.getMap(BOARD_DOWN_MAP).has(`${BOARD}|${CLEAR_TARGET}`)).toBe(true);
+      expect(doc.getMap(BOARD_DOWN_MAP).has(clearKey(BOARD, clearRec.ts))).toBe(true);
       expect(readBoard(BOARD, 'open').shown).toEqual([]);
       expect(readBoard('corkboard-2', 'open').shown.map((n) => n.text)).toEqual(['on the other board']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a newer CLEAR across two copies, whichever copy’s items win (#332 review)', () => {
+    // Copy B took the owner's first CLEAR (T1) and a later note from a
+    // bundle, as its own items; the owner's copy A then clears again (T2).
+    // Under one shared key, B's T1 could win it back on sync and show the
+    // note again; each under its own stamp, both survive and T2 covers it.
+    for (const [idA, idB] of [[1, 2], [2, 1]]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = idA;
+      b.clientID = idB;
+      const t1 = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 60_000, owner);
+      const late = note(alice, 'after the first clear', Date.now() - 30_000);
+      for (const d of [a, b]) {
+        d.getMap(BOARD_DOWN_MAP).set(clearKey(BOARD, t1.ts), t1);
+        d.getMap(BOARD_NOTES_MAP).set(noteKey(BOARD, late.id), late.note);
+      }
+      bindBoardDoc(a);
+      state.isOwner = true;
+      expect(clearBoard(BOARD, owner)).toBe(true);
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+      for (const d of [a, b]) {
+        bindBoardDoc(d);
+        expect(readBoard(BOARD, 'open').shown, `client ids ${idA}/${idB}`).toEqual([]);
+      }
+    }
+  });
+
+  it('counts only verified take-downs toward the cap, so junk ahead can’t push a real one out (#332 review)', () => {
+    const entries: Array<[string, unknown]> = [];
+    const idOf = (i: number) => i.toString(16).padStart(32, '0');
+    const other = signDown(ROOM, BOARD, 'e'.repeat(32), NOW, alice);
+    for (let i = 0; i < MAX_DOWN_RETAINED; i++) entries.push([`${BOARD}|${idOf(i)}`, { ...signDown(ROOM, BOARD, idOf(i), NOW, alice), sig: other.sig }]);
+    const realKey = `${BOARD}|${'f'.repeat(32)}`;
+    entries.push([realKey, signDown(ROOM, BOARD, 'f'.repeat(32), NOW - 1000, alice)]);
+    const trim = planDownTrim(entries, BOARD, { roomId: ROOM, kind: 'open', now: NOW, ownerPub: owner.pub });
+    expect(trim).not.toContain(realKey);
+    expect(trim).toHaveLength(MAX_DOWN_RETAINED); // every bad signature
+  });
+
+  it('keeps a bundled note stamped a little ahead until it may show (#332 review)', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      vi.setSystemTime(NOW);
+      const ahead = note(bob, 'from a clock ahead', NOW + 15 * 60_000);
+      const far = note(bob, 'from days ahead', NOW + 3 * 24 * 3600_000);
+      expect(mergeBoardView(view([entry(ahead), entry(far)]))).toEqual({ notes: 0, down: 0 });
+      expect(pendingBoardEntries()).toBe(1); // the far one is junk a trim would take
+      vi.advanceTimersByTime(6 * 60_000);
+      expect(readBoard(BOARD, 'open').shown.map((n) => n.text)).toEqual(['from a clock ahead']);
+      expect(pendingBoardEntries()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('finds the owner’s CLEAR behind more forged ones than a search checks, holding back what they may cover (#336 review)', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const down = doc.getMap(BOARD_DOWN_MAP);
+      const notes = doc.getMap(BOARD_NOTES_MAP);
+      const t = Date.now() - 60_000;
+      const real = signDown(ROOM, BOARD, CLEAR_TARGET, t, owner);
+      down.set(clearKey(BOARD, t), real);
+      // Newer records claiming the owner's key, each with the real one's
+      // signature: more than one search checks.
+      for (let i = 1; i <= 20; i++) down.set(clearKey(BOARD, t + i * 1000), { ...real, ts: t + i * 1000 });
+      const covered = note(alice, 'cleared', t - 1000);
+      const later = note(bob, 'after everything', Date.now() - 1000);
+      notes.set(noteKey(BOARD, covered.id), covered.note);
+      notes.set(noteKey(BOARD, later.id), later.note);
+      const first = readBoard(BOARD, 'open');
+      expect(first.clearPending).toBe(true);
+      expect(first.shown.map((n) => n.text)).toEqual(['after everything']);
+      expect(first.trimmable).not.toContain(noteKey(BOARD, covered.id));
+      // A merge meanwhile waits for the search rather than taking the note.
+      expect(mergeBoardView(view([entry(covered)]))).toEqual({ notes: 0, down: 0 });
+      for (let i = 0; i < 5; i++) {
+        readBoard(BOARD, 'open');
+        vi.advanceTimersByTime(2_000);
+      }
+      const settled = readBoard(BOARD, 'open');
+      expect(settled.clearPending).toBeUndefined();
+      expect(settled.shown.map((n) => n.text)).toEqual(['after everything']);
+      expect([...down.keys()]).toEqual([clearKey(BOARD, t)]); // the forged ones trimmed
+      expect(pendingBoardEntries()).toBe(0);
+      expect(notes.has(noteKey(BOARD, covered.id))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a later-stamped CLEAR when the owner clears again on a clock gone back (#336 review)', () => {
+    const down = doc.getMap(BOARD_DOWN_MAP);
+    const ahead = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() + 5 * 60_000, owner);
+    const old = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 60_000, owner);
+    down.set(clearKey(BOARD, ahead.ts), ahead);
+    down.set(clearKey(BOARD, old.ts), old);
+    const n = note(alice, 'pinned', Date.now() - 1000);
+    doc.getMap(BOARD_NOTES_MAP).set(noteKey(BOARD, n.id), n.note);
+    state.isOwner = true;
+    expect(clearBoard(BOARD, owner)).toBe(true);
+    const keys = [...down.keys()];
+    expect(keys).toContain(clearKey(BOARD, ahead.ts));
+    expect(keys).not.toContain(clearKey(BOARD, old.ts));
+    expect(keys).toHaveLength(2);
+  });
+
+  it('finds a CLEAR however many keys other boards fill the take-down map with (#336 review)', () => {
+    const down = doc.getMap(BOARD_DOWN_MAP);
+    const notes = doc.getMap(BOARD_NOTES_MAP);
+    expect(readBoard(BOARD, 'open').shown).toEqual([]); // the index is built here, then kept
+    const junk = signDown(ROOM, 'nowhere', 'a'.repeat(32), Date.now(), bob);
+    doc.transact(() => {
+      for (let i = 0; i < 2000; i++) down.set(`ghost-${i}|${'a'.repeat(32)}`, junk);
+    });
+    const covered = note(alice, 'cleared', Date.now() - 60_000);
+    notes.set(noteKey(BOARD, covered.id), covered.note);
+    const clear = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() - 30_000, owner);
+    down.set(clearKey(BOARD, clear.ts), clear);
+    expect(readBoard(BOARD, 'open').shown).toEqual([]);
+    // A fresh bind indexes the map as it stands.
+    bindBoardDoc(doc);
+    expect(readBoard(BOARD, 'open').shown).toEqual([]);
+    expect(trimBoard(BOARD, 'open')).toBe(1); // the covered note
+    expect(down.has(clearKey(BOARD, clear.ts))).toBe(true);
+  });
+
+  it('keeps a note put off for being ahead when the next view comes without it (#336 review)', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      vi.setSystemTime(NOW);
+      const ahead = note(bob, 'from a clock ahead', NOW + 15 * 60_000);
+      expect(mergeBoardView(view([entry(ahead)]))).toEqual({ notes: 0, down: 0 });
+      expect(pendingBoardEntries()).toBe(1);
+      const other = note(alice, 'another', NOW - 1000);
+      expect(mergeBoardView(view([entry(other)]))).toEqual({ notes: 1, down: 0 });
+      expect(pendingBoardEntries()).toBe(1);
+      vi.advanceTimersByTime(6 * 60_000);
+      expect(readBoard(BOARD, 'open').shown.map((n) => n.text).sort()).toEqual(['another', 'from a clock ahead']);
+      expect(pendingBoardEntries()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
