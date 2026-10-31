@@ -7,14 +7,25 @@
  *
  * A note the reader hasn't seen yet glows (Dorkmo 2026-10-31: no count
  * anywhere; the glow stays until they walk up to the board and look). A note
- * with a photo pins up as a Polaroid; until issue 319's camera exists the
- * picture area is a placeholder.
+ * with a photo pins up as a Polaroid: the shot itself once the viewer's node
+ * holds it (boardPhotos.ts), else a frame that says why it isn't there yet.
  *
  * Pure apart from the 2D context it is handed, and free of three.js, so a
  * test can paint it onto a fake canvas.
  */
 
-import type { BoardColour, BoardFaceNote, BoardScreen } from './boardDoc';
+import type { BoardColour, BoardFaceNote, BoardScreen, PhotoLook } from './boardDoc';
+
+/** A photo's decoded picture by its hash, when the page holds it. */
+export type PictureOf = (hash: string) => { img: CanvasImageSource & { width: number; height: number } } | null;
+
+/** What a Polaroid's frame says while its picture isn't there. */
+export const PHOTO_LOOK_LINES: Readonly<Record<Exclude<PhotoLook, 'ready'>, readonly [string, string]>> = {
+  loading: ['PHOTO', 'LOADING…'],
+  fetch: ['WALK UP', 'TO FETCH'],
+  unreachable: ['SHARER NOT', 'REACHABLE'],
+  'no-node': ['NEEDS THE', 'DESKTOP APP'],
+};
 
 /** The face's layout size (canvas units); the canvas is this times BOARD_FACE_SCALE. */
 export const BOARD_FACE_W = 528;
@@ -164,7 +175,18 @@ function glow(c: CanvasRenderingContext2D, w: number, h: number): void {
   c.restore();
 }
 
-function paintNote(c: CanvasRenderingContext2D, n: BoardFaceNote, look: BoardLook): void {
+/** Draw `img` to fill a w × h box at (x, y), cropped to keep its shape. */
+function drawCover(c: CanvasRenderingContext2D, img: CanvasImageSource & { width: number; height: number }, x: number, y: number, w: number, h: number): void {
+  const iw = img.width;
+  const ih = img.height;
+  if (!(iw > 0) || !(ih > 0)) return;
+  const scale = Math.max(w / iw, h / ih);
+  const sw = w / scale;
+  const sh = h / scale;
+  c.drawImage(img, (iw - sw) / 2, (ih - sh) / 2, sw, sh, x, y, w, h);
+}
+
+function paintNote(c: CanvasRenderingContext2D, n: BoardFaceNote, look: BoardLook, pictureOf?: PictureOf): void {
   const area = noteArea(look);
   const w = n.photo ? POLAROID_W : NOTE;
   const h = n.photo ? POLAROID_H : NOTE;
@@ -181,19 +203,40 @@ function paintNote(c: CanvasRenderingContext2D, n: BoardFaceNote, look: BoardLoo
   if (n.photo) {
     c.fillStyle = '#FBFAF6';
     c.fillRect(-w / 2, -h / 2, w, h);
-    // The picture area: a placeholder until the camera (issue 319) fills it.
+    // The picture: the shot once this viewer's page holds it, else a dark
+    // frame with a lens ring and why it isn't there yet.
+    const px = -w / 2 + 5;
+    const py = -h / 2 + 5;
+    const pw = w - 10;
+    const ph = w - 14;
+    const pic = n.attach && n.photoLook === 'ready' ? pictureOf?.(n.attach.hash) ?? null : null;
     c.fillStyle = '#3A4A5C';
-    c.fillRect(-w / 2 + 5, -h / 2 + 5, w - 10, w - 14);
-    c.strokeStyle = 'rgba(220,230,240,0.7)';
-    c.lineWidth = 1.5;
-    c.beginPath();
-    c.arc(0, -h / 2 + 5 + (w - 14) / 2, 9, 0, Math.PI * 2);
-    c.stroke();
+    c.fillRect(px, py, pw, ph);
+    if (pic) {
+      drawCover(c, pic.img, px, py, pw, ph);
+    } else {
+      c.strokeStyle = 'rgba(220,230,240,0.35)';
+      c.lineWidth = 1.5;
+      c.beginPath();
+      c.arc(0, py + ph / 2, 9, 0, Math.PI * 2);
+      c.stroke();
+      const lines = n.photoLook && n.photoLook !== 'ready' ? PHOTO_LOOK_LINES[n.photoLook] : null;
+      if (lines) {
+        c.font = 'bold 6px sans-serif';
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillStyle = 'rgba(230,236,244,0.9)';
+        c.fillText(lines[0], 0, py + ph / 2 - 4);
+        c.fillText(lines[1], 0, py + ph / 2 + 4);
+      }
+    }
     c.font = '7px sans-serif';
     c.textAlign = 'center';
     c.textBaseline = 'alphabetic';
     c.fillStyle = INK;
-    const caption = wrapNoteText((s) => c.measureText(s).width, n.text, w - 8, 1)[0] ?? '';
+    // The shot's own caption, else the note's words, else who pinned it.
+    const line = n.attach?.caption || n.text.trim() || `— ${n.authorName}`;
+    const caption = wrapNoteText((s) => c.measureText(s).width, line, w - 8, 1)[0] ?? '';
     c.fillText(caption, 0, h / 2 - 6);
   } else {
     c.fillStyle = NOTE_FILL[n.colour] ?? NOTE_FILL.yellow;
@@ -246,12 +289,12 @@ function paintEmpty(c: CanvasRenderingContext2D, text: string, look: BoardLook):
  * BOARD_FACE_W × BOARD_FACE_H times BOARD_FACE_SCALE; nothing on `screen`
  * (not loaded yet) paints the bare board.
  */
-export function paintBoardFace(c: CanvasRenderingContext2D, screen: BoardScreen | undefined, look: BoardLook): void {
+export function paintBoardFace(c: CanvasRenderingContext2D, screen: BoardScreen | undefined, look: BoardLook, pictureOf?: PictureOf): void {
   c.setTransform(BOARD_FACE_SCALE, 0, 0, BOARD_FACE_SCALE, 0, 0);
   paintBackground(c, look);
   if (!screen) return;
   // Oldest first, so the newest notes lie on top where they overlap.
-  for (const n of [...screen.notes].reverse()) paintNote(c, n, look);
+  for (const n of [...screen.notes].reverse()) paintNote(c, n, look, pictureOf);
   if (screen.notes.length === 0 && screen.empty) paintEmpty(c, screen.empty, look);
   if (screen.hiddenCount > 0) {
     c.font = '8px sans-serif';

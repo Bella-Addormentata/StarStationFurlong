@@ -200,6 +200,7 @@ import {
 } from "./devices";
 import { boardGate } from "./departuresDoc";
 import { boardKindOf, readBoardScreen } from "./boardDoc";
+import { lookBoardPhotos } from "./boardPhotos";
 import { createBoardUI } from "./boardUI";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
@@ -4328,12 +4329,13 @@ export class World {
           for (const [itemId, screen] of this.wallScreens) {
             // 🚏📋 A departures board adds its own rows (its gate setting is
             // its own); the plain terminal's status carries none.
-            // 📌 A room board adds its notes (#315).
+            // 📌 A room board adds its notes (#315), each photo's look with
+            // them (boardPhotos.ts moves the photos along at this beat).
             screen.updateStatus(
               screen.departures
                 ? { ...status, departures: readDepartureScreen(itemId) }
                 : screen.board
-                  ? { ...status, board: readBoardScreen(itemId, screen.board) }
+                  ? { ...status, board: lookBoardPhotos(readBoardScreen(itemId, screen.board)) }
                   : status,
             );
           }

@@ -247,7 +247,8 @@ export function noteFromWire(raw: unknown): BoardNote | null {
   if (r.v !== 1) return null;
   if (!isStr(r.author, MAX_ID) || r.author.length === 0) return null;
   if (!isStr(r.authorName, MAX_NAME) || CONTROL.test(r.authorName) || r.authorName.includes('\n')) return null;
-  if (!isStr(r.text, MAX_NOTE_TEXT) || CONTROL.test(r.text) || r.text.trim().length === 0) return null;
+  // A photo note may carry no words (#315 PR 5); any other needs some.
+  if (!isStr(r.text, MAX_NOTE_TEXT) || CONTROL.test(r.text) || (r.text.trim().length === 0 && r.attach === undefined)) return null;
   if (typeof r.colour !== 'string' || !(BOARD_COLOURS as readonly string[]).includes(r.colour)) return null;
   if (!isUnit(r.x) || !isUnit(r.y)) return null;
   if (!Number.isSafeInteger(r.ts) || (r.ts as number) <= 0) return null;
@@ -911,11 +912,11 @@ export function postNote(
   if (!canPost(kind)) return { ok: false, why: 'Only the room owner can post in the notice case.' };
   if (itemId.length === 0 || itemId.length > MAX_ID || itemId.includes('|')) return { ok: false, why: 'This board has no id.' };
   const text = cleanNoteText(input.text);
-  if (!text) return { ok: false, why: 'Write something first.' };
-  if (text.length > MAX_NOTE_TEXT) return { ok: false, why: `A note holds up to ${MAX_NOTE_TEXT} characters.` };
-  if (!(BOARD_COLOURS as readonly string[]).includes(input.colour)) return { ok: false, why: 'Pick a colour.' };
   const photo = input.attach ? photoFromWire(input.attach) : null;
   if (input.attach && !photo) return { ok: false, why: 'That photo can’t be pinned.' };
+  if (!text && !photo) return { ok: false, why: 'Write something or add a photo first.' };
+  if (text.length > MAX_NOTE_TEXT) return { ok: false, why: `A note holds up to ${MAX_NOTE_TEXT} characters.` };
+  if (!(BOARD_COLOURS as readonly string[]).includes(input.colour)) return { ok: false, why: 'Pick a colour.' };
   const before = readBoard(itemId, kind);
   const spot = freeSpot(before.shown, rand);
   // Never at or before the owner's last CLEAR, which a clock a little
@@ -1484,6 +1485,11 @@ export function resetBoardLocalStateForTest(): void {
 
 // ── What a board's face draws ────────────────────────────────────────────────
 
+/** Where a note's photo is for this viewer (boardPhotos.ts): drawn, on its
+ *  way, waiting for a FETCH press at the board, not reachable from here,
+ *  or out of reach with no node (the desktop app) on this machine. */
+export type PhotoLook = 'ready' | 'loading' | 'fetch' | 'unreachable' | 'no-node';
+
 export interface BoardFaceNote {
   id: string;
   text: string;
@@ -1493,6 +1499,10 @@ export interface BoardFaceNote {
   y: number;
   unseen: boolean;
   photo: boolean;
+  /** The photo's reference, for the viewer's node to fetch and the face to
+   *  draw (boardPhotos.lookBoardPhotos adds `photoLook`). */
+  attach?: BoardPhoto;
+  photoLook?: PhotoLook;
 }
 
 export interface BoardScreen {
@@ -1522,6 +1532,7 @@ export function readBoardScreen(itemId: string, kind: BoardKind): BoardScreen {
     y: n.y,
     unseen: isUnseen(roomId, itemId, n, me),
     photo: !!n.attach,
+    ...(n.attach ? { attach: n.attach } : {}),
   }));
   return {
     kind,

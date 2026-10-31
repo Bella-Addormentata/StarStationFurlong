@@ -117,6 +117,7 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 import type { TvScreenView } from "./tvDoc";
 import type { BoardKind, BoardScreen } from "./boardDoc";
 import { BOARD_FACE_H, BOARD_FACE_SCALE, BOARD_FACE_W, boardFaceKey, paintBoardFace } from "./boardFace";
+import { photoPicture } from "./boardPhotos";
 // …and its own menu while stopped or paused (#258): the cells and the
 // highlight come in the view; the page of library titles is worked out here.
 import { tvHomeShelf } from "./tvMenu";
@@ -2204,7 +2205,7 @@ const buildRoomBoard = (ctx: BuildCtx, kind: BoardKind) => {
   const look = owner ? "felt" : "cork";
   let lastKey = "";
   const paint = (screen: BoardScreen | undefined) => {
-    paintBoardFace(c2d, screen, look);
+    paintBoardFace(c2d, screen, look, photoPicture);
     tex.needsUpdate = true;
   };
   const handle: WallScreenHandle = {

@@ -15,6 +15,7 @@
  */
 
 import { escapeHtml } from './htmlEscape';
+import { isFlightKey } from './freeFlightStick';
 import { cleanCaption, listShots, MAX_CAPTION, onRollChange, removeShot, rollIsLasting, ROLL_MAX, setCaption, shotLabel, type FilmShot } from './filmRoll';
 
 const PHONE_ID = 'spacephone-container';
@@ -95,9 +96,11 @@ export function startViewfinder(shoot: CameraShooter): void {
   }
   window.addEventListener('keydown', onKey, true);
   // Opened again by any path (Tab, the bezel, a TV clicked, the quick chat
-  // raising it a sliver): the camera goes down.
+  // raising it a sliver): the camera goes down, a shot still encoding too.
+  // That shot still goes on the roll, and the phone stays on what opened it
+  // (main.ts takePhoto asks `stillUp`).
   watcher ??= new MutationObserver(() => {
-    if (viewfinding && !busy && (phone.classList.contains('active') || phone.classList.contains('peek'))) stopViewfinder();
+    if (viewfinding && (phone.classList.contains('active') || phone.classList.contains('peek'))) stopViewfinder();
   });
   watcher.observe(phone, { attributes: true, attributeFilter: ['class'] });
 }
@@ -218,6 +221,18 @@ function cameraOnScreen(host: HTMLElement): boolean {
 
 /** The controls ↑/↓ step through. */
 const NAV_STOPS = 'button:not([disabled]), input:not([disabled])';
+/** The attributes that name a control across repaints. */
+const CONTROL_KEYS = ['cameraShoot', 'cameraZoom', 'cameraCaption', 'cameraDiscard'] as const;
+
+/** A control's identity across repaints: which of CONTROL_KEYS it carries,
+ *  and for which shot. Null for anything else. */
+export function controlKeyOf(dataset: DOMStringMap): { key: (typeof CONTROL_KEYS)[number]; value: string } | null {
+  for (const key of CONTROL_KEYS) {
+    const value = dataset[key];
+    if (value !== undefined) return { key, value };
+  }
+  return null;
+}
 
 /** Which of `count` controls a step of ±1 from the one at `at` lands on,
  *  wrapping; from none (`at` < 0) the first. */
@@ -288,24 +303,33 @@ async function paint(host: HTMLElement, focusShot?: string): Promise<void> {
     }
   }
   if (armedDiscard && !live.has(armedDiscard)) armedDiscard = null;
-  // Keep a caption being typed, and the caret, across the repaint.
+  // Keep the focused control across the repaint: a caption being typed
+  // with its caret, or the button pressed (a discard asking to be sure).
   const active = document.activeElement;
-  const typing = onScreen && active instanceof HTMLInputElement && host.contains(active) && active.dataset.cameraCaption
-    ? { id: active.dataset.cameraCaption, value: active.value, start: active.selectionStart, end: active.selectionEnd }
+  const focusIn = onScreen && active instanceof HTMLElement && host.contains(active);
+  const held = focusIn && active !== host ? controlKeyOf(active.dataset) : null;
+  const typing = focusIn && active instanceof HTMLInputElement && held?.key === 'cameraCaption'
+    ? { value: active.value, start: active.selectionStart, end: active.selectionEnd }
     : null;
   host.innerHTML = cameraAppHtml(shots, { notice, lasting: rollIsLasting(), armed: armedDiscard, urlOf: urlFor });
-  const box = (id: string) =>
-    [...host.querySelectorAll<HTMLInputElement>('input[data-camera-caption]')].find((el) => el.dataset.cameraCaption === id) ?? null;
-  if (typing) {
-    const el = box(typing.id);
-    if (el) {
+  const control = (key: (typeof CONTROL_KEYS)[number], value: string) =>
+    [...host.querySelectorAll<HTMLElement>('[data-camera-shoot], [data-camera-zoom], [data-camera-caption], [data-camera-discard]')]
+      .find((el) => el.dataset[key] === value) ?? null;
+  if (held) {
+    const el = control(held.key, held.value);
+    if (el instanceof HTMLInputElement && typing) {
       el.value = typing.value;
       el.focus({ preventScroll: true });
       el.setSelectionRange(typing.start, typing.end);
+    } else if (el) {
+      el.focus({ preventScroll: true });
+    } else {
+      host.focus({ preventScroll: true }); // the control went: ↑/↓ still work from the view
     }
   } else if (focusShot && onScreen) {
-    const el = box(focusShot);
-    el?.focus({ preventScroll: false });
+    control('cameraCaption', focusShot)?.focus({ preventScroll: false });
+  } else if (focusIn && active !== host) {
+    host.focus({ preventScroll: true });
   }
 }
 
@@ -376,8 +400,31 @@ function wire(host: HTMLElement): void {
     if (e.key === 'Enter') {
       e.preventDefault();
       saveCaption(t);
-      t.blur();
+      // Out of the box onto the view, not the page: ↑/↓ go on from here.
+      host.focus({ preventScroll: true });
     }
+  });
+  wireCameraStick(host);
+}
+
+/** At a helm with the flight stick taken, the stick reads the arrows and
+ *  Space in the window's capture phase, before the roll could: the view
+ *  is marked `data-stick-aside` while it is on screen, so a key pressed in
+ *  it is the roll's, and a flight key it was given goes no further to the
+ *  world (tvUI.ts wireTvStick). */
+function wireCameraStick(host: HTMLElement): void {
+  const sync = () => {
+    if (cameraOnScreen(host)) host.dataset.stickAside = '1';
+    else delete host.dataset.stickAside;
+  };
+  const observer = new MutationObserver(sync);
+  observer.observe(host, { attributes: true, attributeFilter: ['class'] });
+  const phone = host.closest<HTMLElement>(`#${PHONE_ID}`);
+  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ['class'] });
+  sync();
+  host.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (cameraOnScreen(host) && isFlightKey(e.code)) e.stopPropagation();
   });
 }
 
