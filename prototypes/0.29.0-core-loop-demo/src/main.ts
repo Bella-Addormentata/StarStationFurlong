@@ -407,6 +407,7 @@ import {
   isCoHost,
   hasCoHostRequest,
 } from "./roomRoles";
+import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust, subscribeCoHostNodes } from "./coHostNodes";
 import {
   bindVentures,
   subscribeVentures,
@@ -1485,6 +1486,64 @@ function roomStateArrivedNow(): boolean {
   return !!sync && !!roomId && routeRoomReady(sync, roomHostedHere(roomId));
 }
 
+/** 🤝 C3: the route hints of the active room's co-hosts, from the records
+ *  each co-host's own key signed for this room (coHostNodes.ts); a grant the
+ *  room lists under another key counts for nothing. Kept for a few seconds:
+ *  every outgoing sync envelope asks. */
+let coHostHintMemo: { roomId: string; at: number; hints: RoomMemberHint[] } | null = null;
+function coHostRouteHints(roomId: string): RoomMemberHint[] {
+  const now = Date.now();
+  if (coHostHintMemo && coHostHintMemo.roomId === roomId && now - coHostHintMemo.at < 5_000) return coHostHintMemo.hints;
+  // The owner's node first (its record, when it filed one), then the co-hosts'.
+  const ownerPub = roomOwnerInfo(roomId).ownerPub;
+  const keepers = [...(ownerPub ? [{ pub: ownerPub, grantedAt: 0 }] : []), ...readCoHosts().filter((g) => isCoHost(g.pub) && g.pub !== ownerPub)];
+  const hints = coHostHintsHere(roomId, keepers, now);
+  coHostHintMemo = { roomId, at: now, hints };
+  return hints;
+}
+
+/** 🤝 C3: the keepers' records changed (or the room's state that judges
+ *  them arrived): drop the hint memo, and mint the displayed MY PASS again
+ *  (#338 review: the join mints it before the records are read). Not over
+ *  a pass the player generated themselves. Debounced: records land in
+ *  bursts. */
+let passHintsTimer: ReturnType<typeof setTimeout> | null = null;
+function refreshPassHints(): void {
+  coHostHintMemo = null;
+  if (passHintsTimer) clearTimeout(passHintsTimer);
+  passHintsTimer = setTimeout(() => {
+    passHintsTimer = null;
+    const out = document.getElementById("access-pass-output") as HTMLInputElement | null;
+    if (!out) return;
+    const playersOwn = out.value !== "" && out.value !== lastAutoPass && /^(ssf|https?):/.test(out.value);
+    if (!playersOwn) void syncAccessPass();
+  }, 1_000);
+}
+
+/** 🤝 C3: a boot record with the room's co-hosts among its dial hints, after
+ *  the record's own; the same record when the room has none. */
+function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBootstrap | null {
+  if (!record || record.roomId !== roomId) return record;
+  const coHosts = coHostRouteHints(roomId);
+  if (coHosts.length === 0) return record;
+  return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), coHosts) };
+}
+
+/** 🤝 C3: a keeper's game (the owner's, or a co-host's) files its node's
+ *  route in the room, signed with its key (and refreshes it as its node's
+ *  routes change); a former keeper's takes its record down. A visitor's tab
+ *  then counts that node's copy of the room as the room's own state
+ *  (nodeProof.ts), and passes name it. Only once the room's own state has
+ *  arrived: a cached copy may not list the grant or the owner yet. */
+function refileCoHostNode(): void {
+  const roomId = activeBootstrap?.roomId ?? "";
+  if (!roomId || !roomStateArrivedNow()) return;
+  const me = getIdentityPub();
+  const keeper = isCoHost(me) || roomOwnerInfo(roomId).ownerPub === me;
+  const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
+  if (fileMyCoHostNode(roomId, keeper, hint ? routeHint(hint) : null) !== "kept") coHostHintMemo = null;
+}
+
 /**
  * 🚏🛟 The route's keeper (routeKeeper.ts, build notes A5): once a second, in
  * EVERY game in the ship's room (not only the helm's commander — any rider
@@ -1970,6 +2029,13 @@ async function joinRoomAtEpoch(
     roomId: boot.roomId,
     channel,
     ...ysyncSigner(), // Slice 2: sign outgoing + verify-before-apply on inbound
+    // 🤝 C3: a node the room's owner or a co-host keeps it on counts as
+    // the room's own state (nodeProof.ts), with the owner's game closed.
+    ...keeperNodeTrust,
+    // 🤝 C3: the node dials the room's co-hosts beside the pass's own
+    // hints, so a returning visitor reaches the room through a co-host's
+    // node while the owner's is off.
+    bootRecord: () => withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
@@ -2317,6 +2383,8 @@ async function joinRoomAtEpoch(
 
   // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
   bindRoomRoles(sync.doc);
+  // 🤝 C3: and the nodes the co-hosts run, each signed by its co-host.
+  bindCoHostNodes(sync.doc);
 
   // 🧱 #66 S1: the floor plan (door placements) rides the doc; re-derive the
   // door anchors from the fresh doc immediately (joiners see slid doors).
@@ -2377,6 +2445,10 @@ async function joinRoomAtEpoch(
       refreshWarmNeighbours();
       // 📌 A board view the node sent before the host's state arrived.
       retryBoardView();
+      // 🤝 C3: a keeper's node, filed now the room's owner and grants are known,
+      // and the pass's hints read again.
+      refileCoHostNode();
+      refreshPassHints();
       void networkProvider.refreshRoomCap();
     });
   }
@@ -2501,7 +2573,14 @@ async function joinRoomAtEpoch(
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).
-    subscribeRoomRoles(() => renderCoHostsSection());
+    subscribeRoomRoles(() => {
+      renderCoHostsSection();
+      // 🤝 C3: a grant just landed (or went): file, or take down, our node.
+      refreshPassHints();
+      refileCoHostNode();
+    });
+    // 🤝 C3: a keeper's node record landed, moved or went: the pass's hints.
+    subscribeCoHostNodes(refreshPassHints);
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
@@ -3170,7 +3249,12 @@ async function joinRoomAtEpoch(
     // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
     if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
     // 📌 A new owner is a new notice-case author (#315).
-    if (_event.keysChanged.has("owner")) refreshBoards();
+    if (_event.keysChanged.has("owner")) {
+      refreshBoards();
+      // 🤝 C3: a new owner's game files its node; a former owner's takes its down.
+      refreshPassHints();
+      refileCoHostNode();
+    }
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some
@@ -7780,6 +7864,7 @@ function renderCoHostsSection(): void {
         removeCoHostRequest(pub);
       } else if (action === "revoke" && pub) {
         removeCoHost(pub);
+        forgetCoHostNode(pub); // 🤝 C3: its node leaves the passes with it
       }
       renderCoHostsSection();
     });
@@ -7799,7 +7884,7 @@ function renderCoHostsSection(): void {
   const requests = readCoHostRequests();
 
   const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 CO-HOSTS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· room keepers</span></div>
-    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Designation now — node-side serving lands in the next node update.</div>`;
+    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Their nodes keep the room, and every pass names them, so visitors can still load it while the owner's machine is off.</div>`;
 
   const coHostRows = coHosts
     .map(
@@ -8848,6 +8933,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
+  refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
 
@@ -8917,9 +9003,17 @@ function buildOutgoingBootstrap(
     : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
+  // 🤝 C3: the room's co-hosts ride every pass, after our node and the
+  // host's (the pass's first hint), so a visitor's node can load the room
+  // from a co-host's while the owner's machine is off. A pass minted for a
+  // fresh room (roomIdOverride) gets none: the records are signed for the
+  // room they were filed in.
+  const inherited = collectMemberHints(activeBootstrap);
   const allHints = mergeMemberHints(
     localHint ? [localHint] : [],
-    collectMemberHints(activeBootstrap),
+    inherited.slice(0, 1),
+    coHostRouteHints(roomId),
+    inherited.slice(1),
   );
   // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
   // walk into) carries no contact card — N8 extends to `ck`; a private room's
@@ -9526,6 +9620,10 @@ function setupNetworkDetailsPanel() {
  *  (pre-#52 this fed the network panel's share-link input). Runs per join,
  *  so after a transit/beam the visible pass always belongs to the CURRENT
  *  room without pressing GENERATE. */
+/** The pass syncAccessPass last painted: a different one in the field is the
+ *  player's own (GENERATE), which refreshPassHints leaves alone. */
+let lastAutoPass = "";
+
 async function syncAccessPass(): Promise<void> {
   const passOutput = document.getElementById(
     "access-pass-output",
@@ -9534,9 +9632,14 @@ async function syncAccessPass(): Promise<void> {
     return;
   }
 
+  const roomId = activeBootstrap?.roomId ?? "";
   const minted = await mintBootstrapLink();
+  // 🤝 Moved rooms while minting (#338 review): the next room's join paints
+  // its own pass.
+  if ((activeBootstrap?.roomId ?? "") !== roomId) return;
   if (minted.link) {
     passOutput.value = minted.link;
+    lastAutoPass = minted.link;
   } else {
     passOutput.value =
       minted.error ??
