@@ -12,10 +12,20 @@ const listed: ChiaPresence = { state: 'listed', era: 7, listed_era: 7, last_at: 
 const withPresence = (p: Partial<ChiaPresence>): LocalFingerprint => ({ ...BASE, chia_presence: { ...listed, ...p } });
 
 describe('phoneBookIndicator', () => {
-  it('stays hidden while the node does not publish presence, or has not answered', () => {
-    expect(phoneBookIndicator(null).visible).toBe(false);
-    expect(phoneBookIndicator(undefined).visible).toBe(false);
-    expect(phoneBookIndicator(BASE).visible).toBe(false);
+  it('stays hidden while the node does not publish presence, or did not answer, and the Network row says which', () => {
+    for (const none of [null, undefined]) {
+      const ind = phoneBookIndicator(none);
+      expect(ind.visible).toBe(false);
+      expect(ind.row).toEqual({ value: 'NO NODE', colour: '#ff1744' });
+    }
+    const off = phoneBookIndicator(BASE);
+    expect(off.visible).toBe(false);
+    expect(off.row.value).toBe('OFF — this node does not publish presence (a read-only build, no wallet, or SSF_CHIA_FINDABLE=0)');
+    // The row carries the icon's own words and colour whenever there is an icon.
+    const listedInd = phoneBookIndicator(withPresence({}));
+    expect(listedInd.row).toEqual({ value: listedInd.title, colour: PHONE_BOOK_GREEN });
+    const stale = phoneBookIndicator(withPresence({ state: 'outdated', current: false }));
+    expect(stale.row).toEqual({ value: stale.title, colour: PHONE_BOOK_GREY });
   });
 
   it('is a solid green book while this edition lists the current addresses', () => {
@@ -32,6 +42,10 @@ describe('phoneBookIndicator', () => {
     expect(ind.title).toBe('Listing sent to the Phone Book, awaiting confirmation (up to 30 min)');
     expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: 'peers refused the spend' })).title)
       .toBe('Listing sent to the Phone Book, awaiting confirmation (up to 30 min) · peers refused the spend');
+    // A node with the chain watcher off never gets past sent; the node says so.
+    const watcherOff = 'the chain watcher is off (SSF_CHIA_WATCH=0), so the listing is never read back';
+    expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: watcherOff })).title)
+      .toBe(`Listing sent to the Phone Book, awaiting confirmation (up to 30 min) · ${watcherOff}`);
   });
 
   it('is a solid grey book once a listing of ours has gone stale, and says why', () => {

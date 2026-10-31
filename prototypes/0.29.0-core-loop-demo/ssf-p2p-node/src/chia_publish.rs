@@ -1464,6 +1464,13 @@ pub struct NodePublishMark {
     /// the write is pending and is retried after [`PRESENCE_CONFIRM_TIMEOUT_SECS`].
     #[serde(default)]
     pub confirmed: bool,
+    /// 📖 The watcher read this exact write back from the chain. `confirmed`
+    /// also ends the retries when no watcher runs (the peers' acceptance is
+    /// all there is then); this flag is set by a chain read alone, and it is
+    /// what the Phone Book's solid green stands for. A mark an older build
+    /// saved reads as not yet seen until the watcher's next read of our key.
+    #[serde(default)]
+    pub chain_seen: bool,
     /// The node id (signer) the record was written as. With `hint` this binds
     /// the mark to the identity that produced it: a mark left by a replaced
     /// `contact.key` or `iroh_node_id.key` satisfies nothing, since readers
@@ -1510,9 +1517,11 @@ pub fn mark_is_ours(mark: &NodePublishMark, hint: &str, node_id: &str) -> bool {
 /// confirm this mark? Only the EXACT write counts: the mark's `last_at` is the
 /// `issued_at` it was published with, so an older record of the same era,
 /// re-read inside the cursor overlap, never confirms a newer write that may
-/// still be pending or dropped.
+/// still be pending or dropped. A mark the chain already showed back needs
+/// nothing; one only the peers accepted (no watcher ran when it was written)
+/// is still confirmed the first time the chain shows it.
 pub fn mark_confirmed_by(mark: &NodePublishMark, seen_issued_at: u64) -> bool {
-    !mark.confirmed && seen_issued_at != 0 && seen_issued_at == mark.last_at
+    !mark.chain_seen && seen_issued_at != 0 && seen_issued_at == mark.last_at
 }
 
 /// Is a presence write due? Always for a new era (or none ever), and for a mark
@@ -1565,9 +1574,11 @@ pub fn addrs_signature(entries: &[AddrEntry]) -> String {
 /// `ours` per [`mark_is_ours`]) judged against the agreed era (`None` while no
 /// peak is agreed) and the live address signature. No listing of ours is
 /// *unlisted*; one that names this era and these addresses is *listed* once the
-/// watcher read it back, *sent* until then; anything else of ours (an older
-/// era, other addresses, no era to judge by) is *outdated*: the node once
-/// stood in the book, and the publisher is on its way to the new listing.
+/// watcher read it back from the chain (`chain_seen`), *sent* until then, the
+/// peers' acceptance alone included (a node with the watcher off never gets
+/// past *sent*); anything else of ours (an older era, other addresses, no era
+/// to judge by) is *outdated*: the node once stood in the book, and the
+/// publisher is on its way to the new listing.
 pub fn presence_state(
     mark: Option<&NodePublishMark>,
     ours: bool,
@@ -1580,7 +1591,7 @@ pub fn presence_state(
         (Some(_), _) if !ours => Unlisted,
         (Some(_), None) => Outdated,
         (Some(m), Some(era)) if m.era == era && m.addrs_sig == addrs_sig => {
-            if m.confirmed {
+            if m.chain_seen {
                 Listed
             } else {
                 Sent
@@ -1617,7 +1628,7 @@ pub fn presence_status(
         era: era.unwrap_or(0),
         listed_era: on_record.map_or(0, |m| m.era),
         last_at: on_record.map_or(0, |m| m.last_at),
-        confirmed: on_record.is_some_and(|m| m.confirmed),
+        confirmed: on_record.is_some_and(|m| m.chain_seen),
         current: matches!(state, crate::ChiaPresenceState::Listed | crate::ChiaPresenceState::Sent),
         public_addrs: u32::try_from(public_addrs).unwrap_or(u32::MAX),
         error: error.map(str::to_owned),
@@ -2108,7 +2119,13 @@ pub async fn heartbeat_loop(
             m.era,
             m.writes,
             &m.hint[..m.hint.len().min(16)],
-            if m.confirmed { "confirmed" } else { "awaiting confirmation" }
+            if m.chain_seen {
+                "read back from the chain"
+            } else if m.confirmed {
+                "accepted by the peers"
+            } else {
+                "awaiting confirmation"
+            }
         );
     }
     // #231 P6b/D7: the beacon role, when opted into — its own payer, its own mark.
@@ -2169,18 +2186,26 @@ pub async fn heartbeat_loop(
         if findable {
             // The watcher read THIS write back from the chain (the record's
             // signed issued_at is the mark's push time): confirmed, nothing
-            // more to retry. An older record of ours re-read inside the
-            // cursor overlap names another issued_at and confirms nothing. A
-            // read of the chain, not a write, so it is recorded whatever the
-            // peak says (the top bar's phone book turns solid green on it).
+            // more to retry, and seen on chain, which is what the top bar's
+            // phone book turns solid green on (the peers' acceptance alone,
+            // all a node with the watcher off ever gets, is not). An older
+            // record of ours re-read inside the cursor overlap names another
+            // issued_at and confirms nothing. A read of the chain, not a
+            // write, so it is recorded whatever the peak says.
             if let Some(m) = node_mark.as_mut() {
                 let seen_at = hub.presence_confirmed_at.load(std::sync::atomic::Ordering::Relaxed);
                 if mark_confirmed_by(m, seen_at) {
+                    let first_word = !m.confirmed;
                     m.confirmed = true;
+                    m.chain_seen = true;
                     if let Err(e) = m.save(mark_path) {
                         eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
                     }
-                    println!("⛓️ ChiaHub presence: the era {} write is confirmed on chain", m.era);
+                    println!(
+                        "⛓️ ChiaHub presence: the era {} write is {} on chain",
+                        m.era,
+                        if first_word { "confirmed" } else { "read back" }
+                    );
                 }
             }
             // The era and hint of a write this tick, when a peak is agreed; the
@@ -2217,6 +2242,7 @@ pub async fn heartbeat_loop(
                                 last_at: now_unix,
                                 hint: hex::encode(hint.to_bytes()),
                                 confirmed: !watcher_confirms,
+                                chain_seen: false,
                                 node_id: Some(self_id.clone()),
                             };
                             if let Err(e) = mark.save(mark_path) {
@@ -2254,7 +2280,10 @@ pub async fn heartbeat_loop(
             let why_not = node_last_error
                 .as_deref()
                 .or(budget_spent.then_some("this era's write budget is spent; the next listing goes out with the new era"));
-            let status = presence_status(node_mark.as_ref(), hint_now.as_deref(), &self_id, era_now, &sig, entries.len(), why_not);
+            let mut status = presence_status(node_mark.as_ref(), hint_now.as_deref(), &self_id, era_now, &sig, entries.len(), why_not);
+            if !watcher_confirms && status.error.is_none() && status.state == crate::ChiaPresenceState::Sent {
+                status.error = Some("the chain watcher is off (SSF_CHIA_WATCH=0), so the listing is never read back".into());
+            }
             *hub.presence_status.lock().unwrap() = Some(status);
             if spent_this_tick {
                 continue; // one spend per tick — see the doc comment
@@ -2620,6 +2649,7 @@ mod tests {
             last_at: now,
             hint: "h".into(),
             confirmed: true,
+            chain_seen: true,
             node_id: Some("n".into()),
         };
         assert!(!node_publish_due(Some(&mark), 5, "a", now + 3600, "h", "n"), "same era, same addresses: idle writes nothing");
@@ -2635,20 +2665,27 @@ mod tests {
         assert!(node_publish_due(Some(&spent), 6, "b", now + 3600, "h", "n"), "…until the next era");
         // A write the chain never showed back is retried after the timeout —
         // and not before, so a spend still waiting in the mempool is left alone.
-        let pending = NodePublishMark { confirmed: false, ..mark.clone() };
+        let pending = NodePublishMark { confirmed: false, chain_seen: false, ..mark.clone() };
         assert!(!node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS - 1, "h", "n"), "pending, inside the window");
         assert!(node_publish_due(Some(&pending), 5, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "pending too long: retry");
         assert!(node_publish_due(Some(&pending), 5, "b", now + ADDR_CHANGE_DEBOUNCE_SECS, "h", "n"), "pending, but the addresses changed: the change rule still applies");
-        let pending_spent = NodePublishMark { confirmed: false, writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
+        let pending_spent = NodePublishMark { confirmed: false, chain_seen: false, writes: 1 + MAX_NODE_WRITES_PER_ERA, ..mark.clone() };
         assert!(!node_publish_due(Some(&pending_spent), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "retries spend the same era budget");
         // Confirmation names the exact write: the record carrying the mark's own
         // issued_at, not any record of ours from the same era.
         assert!(mark_confirmed_by(&pending, now), "the record published at the mark's time confirms it");
         assert!(!mark_confirmed_by(&pending, now - 1), "an older record of ours (same era) confirms nothing");
         assert!(!mark_confirmed_by(&pending, 0), "nothing read back yet");
-        assert!(!mark_confirmed_by(&mark, now), "a confirmed mark needs nothing");
+        assert!(!mark_confirmed_by(&mark, now), "a mark the chain showed back needs nothing");
+        // No watcher ran when the write went out: the peers' acceptance ended
+        // the retries (confirmed) but the chain never showed it (not seen), so
+        // the first read that does still counts.
+        let accepted = NodePublishMark { chain_seen: false, ..mark.clone() };
+        assert!(mark_confirmed_by(&accepted, now), "accepted by the peers alone: the chain's first word still confirms it");
+        assert!(!node_publish_due(Some(&accepted), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "…and it is not retried meanwhile");
         let legacy: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":""}"#).unwrap();
         assert!(!legacy.confirmed, "a mark file without the field reads as unconfirmed");
+        assert!(!legacy.chain_seen, "…and as not yet seen on chain");
         assert!(!mark_is_ours(&legacy, "", "n"), "a mark without a node id is nobody's");
     }
 
@@ -2666,12 +2703,17 @@ mod tests {
             last_at: now,
             hint: "h".into(),
             confirmed: true,
+            chain_seen: true,
             node_id: Some("n".into()),
         };
         assert_eq!(presence_state(None, false, Some(5), "a"), Unlisted, "never written");
-        assert_eq!(presence_state(Some(&mark), true, Some(5), "a"), Listed, "this era, these addresses, confirmed");
-        let pending = NodePublishMark { confirmed: false, ..mark.clone() };
+        assert_eq!(presence_state(Some(&mark), true, Some(5), "a"), Listed, "this era, these addresses, read back from the chain");
+        let pending = NodePublishMark { confirmed: false, chain_seen: false, ..mark.clone() };
         assert_eq!(presence_state(Some(&pending), true, Some(5), "a"), Sent, "pushed, not read back yet");
+        let accepted = NodePublishMark { chain_seen: false, ..mark.clone() };
+        assert_eq!(presence_state(Some(&accepted), true, Some(5), "a"), Sent, "the peers' acceptance alone (the watcher off) is sent, not listed");
+        let accepted_status = presence_status(Some(&accepted), Some("h"), "n", Some(5), "a", 2, None);
+        assert_eq!((accepted_status.state, accepted_status.confirmed, accepted_status.current), (Sent, false, true));
         assert_eq!(presence_state(Some(&mark), true, Some(6), "a"), Outdated, "a new era: the listing is last week's");
         assert_eq!(presence_state(Some(&mark), true, Some(5), "b"), Outdated, "the addresses changed");
         assert_eq!(presence_state(Some(&mark), true, None, "a"), Outdated, "no agreed peak to judge the era by");

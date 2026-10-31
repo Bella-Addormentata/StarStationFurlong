@@ -1006,13 +1006,17 @@ function reachabilityUdpPort(fp: LocalFingerprint | null): number {
 
 /** 📖 The Phone Book icon in the SpacePhone's top bar (phoneBook.ts): is this
  *  node's latest connection information listed on Chia? Drawn from each
- *  fingerprint round beside the REACHABILITY row, hidden while the node does
- *  not publish presence. The SVG is this page's own glyph in one of two fixed
- *  colours, never text from outside it. */
+ *  fingerprint round beside the REACHABILITY row, and written out as the
+ *  PHONE BOOK row of the Network rows, where keyboard and screen-reader
+ *  users read it (the top bar's button is a pointer shortcut to views the
+ *  home screen reaches anyway). Hidden while the node does not publish
+ *  presence, or did not answer this round. The SVG is this page's own glyph
+ *  in one of two fixed colours, never text from outside it. */
 function renderPhoneBookIndicator(fp: LocalFingerprint | null): void {
+  const ind = phoneBookIndicator(fp);
+  setNetworkRow("network-phone-book", ind.row.value, ind.row.colour);
   const btn = document.getElementById("phone-chia-presence") as HTMLButtonElement | null;
   if (!btn) return;
-  const ind = phoneBookIndicator(fp);
   btn.hidden = !ind.visible;
   if (!ind.visible) return;
   btn.innerHTML = phoneBookIconSvg(ind.colour, ind.filled);
@@ -8785,7 +8789,9 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
     renderReachabilityRow(localFingerprint);
-    renderPhoneBookIndicator(localFingerprint);
+    // 📖 Not the listing icon, though: a cached green would outlive the node,
+    // old tooltip and all, so it is withdrawn until the node answers again.
+    renderPhoneBookIndicator(null);
     return localFingerprint;
   }
   localFingerprint = fingerprint;

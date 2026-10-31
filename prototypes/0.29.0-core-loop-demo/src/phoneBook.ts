@@ -45,48 +45,50 @@ export interface PhoneBookIndicator {
   /** Where a tap goes: the Bank app when the listing fails for want of a
    *  coin (its RECEIVE section is the fix), else the Network rows. */
   opens: 'bank' | 'setnet' | null;
+  /** The PHONE BOOK row of the Network rows: the same readout in words, for
+   *  whoever reads the rows rather than the bar (keyboard and screen-reader
+   *  users among them), and the reason when there is no icon at all. */
+  row: { value: string; colour: string };
 }
 
-const HIDDEN: PhoneBookIndicator = { visible: false, state: null, colour: PHONE_BOOK_GREY, filled: false, title: '', opens: null };
+/** The row's colour for text that is not a listing: no node, or none published. */
+const ROW_GREY = 'rgba(224, 226, 238, 0.6)';
+const ROW_RED = '#ff1744';
 
-/** The icon for a fingerprint round, or hidden when the node does not publish
- *  presence (a read-only build, no wallet, `SSF_CHIA_FINDABLE=0`, no durable
- *  contact key) or has not answered yet. */
+const NO_NODE: PhoneBookIndicator = {
+  visible: false, state: null, colour: PHONE_BOOK_GREY, filled: false, title: '', opens: null,
+  row: { value: 'NO NODE', colour: ROW_RED },
+};
+const NOT_PUBLISHED: PhoneBookIndicator = {
+  ...NO_NODE,
+  row: { value: 'OFF — this node does not publish presence (a read-only build, no wallet, or SSF_CHIA_FINDABLE=0)', colour: ROW_GREY },
+};
+
+/** The icon for a fingerprint round. Hidden, with the row saying why, when
+ *  the node did not answer this round (`null`: a cached green must not
+ *  outlive the node) or does not publish presence at all (a read-only build,
+ *  no wallet, `SSF_CHIA_FINDABLE=0`, no durable contact key). */
 export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): PhoneBookIndicator {
-  const p = fp?.chia_presence;
-  if (!p) return HIDDEN;
+  if (!fp) return NO_NODE;
+  const p = fp.chia_presence;
+  if (!p) return NOT_PUBLISHED;
   const error = trimError(p.error);
   const opens: PhoneBookIndicator['opens'] = /unfunded/i.test(error ?? '') ? 'bank' : 'setnet';
+  const shown = (colour: string, filled: boolean, title: string): PhoneBookIndicator =>
+    ({ visible: true, state: p.state, colour, filled, title, opens, row: { value: title, colour } });
   switch (p.state) {
     case 'listed':
-      return { visible: true, state: p.state, colour: PHONE_BOOK_GREEN, filled: true, title: listedTitle(p), opens };
+      return shown(PHONE_BOOK_GREEN, true, listedTitle(p));
     case 'sent':
-      return {
-        visible: true,
-        state: p.state,
-        colour: PHONE_BOOK_GREEN,
-        filled: false,
-        title: `Listing sent to the Phone Book, awaiting confirmation (up to ${CONFIRM_MIN} min)` + (error ? ` · ${error}` : ''),
-        opens,
-      };
+      return shown(PHONE_BOOK_GREEN, false, `Listing sent to the Phone Book, awaiting confirmation (up to ${CONFIRM_MIN} min)` + (error ? ` · ${error}` : ''));
     case 'outdated':
-      return {
-        visible: true,
-        state: p.state,
-        colour: PHONE_BOOK_GREY,
-        filled: true,
-        title: `Phone Book listing outdated: ${outdatedReason(p, error)}`,
-        opens,
-      };
+      return shown(PHONE_BOOK_GREY, true, `Phone Book listing outdated: ${outdatedReason(p, error)}`);
     case 'unlisted':
-      return {
-        visible: true,
-        state: p.state,
-        colour: PHONE_BOOK_GREY,
-        filled: false,
-        title: 'Not in the Phone Book yet: ' + (error ?? (p.era === 0 ? 'waiting for a chain peak to date the edition' : 'the first listing goes out shortly')),
-        opens,
-      };
+      return shown(
+        PHONE_BOOK_GREY,
+        false,
+        'Not in the Phone Book yet: ' + (error ?? (p.era === 0 ? 'waiting for a chain peak to date the edition' : 'the first listing goes out shortly')),
+      );
   }
 }
 
