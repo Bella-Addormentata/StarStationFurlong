@@ -649,7 +649,9 @@ export function planDownTrim(entries: Iterable<[string, unknown]>, itemId: strin
   // did. Judged only once the owner's key is known. A verdict already known
   // costs no check, so records with bad signatures go a few at a time and
   // never stand in front of the real one for good.
-  if (indexed) for (const [key, value] of indexed) if (TARGET_RE.test(key.slice(prefix.length))) fileClear(key, value);
+  // Every indexed key goes through fileClear, which marks one that doesn't
+  // name its own stamp (`*0`, `*junk`) trimmable (#336 review).
+  if (indexed) for (const [key, value] of indexed) fileClear(key, value);
   if (ctx.ownerPub) {
     clears.sort((a, b) => b.d.ts - a.d.ts);
     let found = false;

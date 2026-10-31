@@ -347,7 +347,7 @@ pub fn board_from_doc(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> BoardConten
     // of the bundle, and a reader could then take the cleared notes back
     // from another publisher's older one. The owner's newest few per board,
     // ahead of the rest.
-    let mut down = owner_clears(doc, room_id, now_ms);
+    let mut down = owner_clears(doc, room_id);
     let room = MAX_DOWN - down.len();
     let rest = signed_entries(doc, "boardDown", now_ms, MAX_KEYS_SCANNED);
     down.extend(rest.into_iter().filter(|(k, _)| !is_clear_key(k)).take(room));
@@ -415,20 +415,26 @@ fn clear_verdicts() -> &'static std::sync::Mutex<HashMap<[u8; 32], bool>> {
 /// CLEAR-shaped record anyone else filed, or one claiming the owner's key
 /// with a bad signature, must not take a real one's place). Nothing while
 /// the doc names no owner: the tabs count no CLEAR then either.
-fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serde_json::Value)> {
+fn owner_clears(doc: &yrs::Doc, room_id: &str) -> Vec<(String, serde_json::Value)> {
     use yrs::{Any, Map, Out, ReadTxn, Transact};
     let txn = doc.transact();
     let Some(owner) = owner_pub(&txn) else { return Vec::new() };
     let Some(map) = txn.get_map("boardDown") else { return Vec::new() };
     // Board → (stamp, key, record, signature), the owner's, filed under
     // their own stamp.
-    let mut boards: HashMap<String, Vec<(u64, String, Any, String)>> = HashMap::new();
+    let mut boards: HashMap<String, Vec<(u64, String, String)>> = HashMap::new();
     for (key, value) in map.iter(&txn).take(MAX_CLEAR_SCAN) {
         if key.len() > 200 || !is_clear_key(key) {
             continue;
         }
         let Out::Any(any) = value else { continue };
         let Any::Map(fields) = &any else { continue };
+        // A record the tab reads (downFromWire): version 1, the owner's
+        // (#336 review: `v` isn't signed, so a replay under another version
+        // must not take a real one's place).
+        if !matches!(fields.get("v"), Some(Any::Number(v)) if *v == 1.0) && !matches!(fields.get("v"), Some(Any::BigInt(1))) {
+            continue;
+        }
         if !matches!(fields.get("by"), Some(Any::String(b)) if **b == *owner) {
             continue;
         }
@@ -439,10 +445,12 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
             _ => continue,
         };
         let Some((item, target)) = key.rsplit_once('|') else { continue };
-        if target != format!("*{ts}") || ts > now_ms + FUTURE_SKEW_SECS * 1000 {
+        // A CLEAR stamped ahead goes too: the tab clamps how far one reaches
+        // (#336 review), and leaving it out could let older notes back.
+        if target != format!("*{ts}") {
             continue;
         }
-        boards.entry(item.to_string()).or_default().push((ts, key.to_string(), any.clone(), sig.to_string()));
+        boards.entry(item.to_string()).or_default().push((ts, key.to_string(), sig.to_string()));
     }
     let mut verdicts = clear_verdicts().lock().unwrap();
     let mut checks = 0;
@@ -453,7 +461,7 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let mut kept: Vec<(String, serde_json::Value)> = Vec::new();
         let mut newest = 0;
-        for (ts, key, any, sig) in found {
+        for (ts, key, sig) in found {
             if kept.len() >= CLEARS_PER_BOARD {
                 break;
             }
@@ -472,10 +480,12 @@ fn owner_clears(doc: &yrs::Doc, room_id: &str, now_ms: u64) -> Vec<(String, serd
                 }
                 None => continue, // judged in a later build
             };
-            let Ok(json) = serde_json::to_value(&any) else { continue };
-            if ok && json.to_string().len() <= MAX_ENTRY_BYTES {
+            // Carried as the fields the tab reads and the signature covers,
+            // so padding added beside them can't push it past a size limit
+            // (#336 review).
+            if ok {
                 newest = newest.max(ts);
-                kept.push((key, json));
+                kept.push((key, serde_json::json!({ "v": 1, "by": owner, "ts": ts, "sig": sig })));
             }
         }
         if !kept.is_empty() {
@@ -1352,6 +1362,37 @@ mod tests {
         let read = board_from_doc(&doc, "r", 5_000);
         assert_eq!(read.down.first().map(|(k, _)| k.as_str()), Some("cork|*1000"));
         assert_eq!(read.down.iter().filter(|(k, _)| is_clear_key(k)).count(), 1);
+        {
+            let mut txn = doc.transact_mut();
+            // The owner's genuine CLEARs replayed under another version, and
+            // one padded with fields nobody signed: the version ones count
+            // for nothing, the padded one goes as its signed fields.
+            for (ts, v) in [(4_000u64, 2.0), (4_500, 0.0)] {
+                let mut rec = signed_clear("r", "cork", ts, &sk, &by);
+                if let yrs::Any::Map(m) = &rec {
+                    let mut m = (**m).clone();
+                    m.insert("v".to_string(), yrs::Any::Number(v));
+                    rec = yrs::Any::from(m);
+                }
+                downs.insert(&mut txn, format!("cork|*{ts}"), rec);
+            }
+            let mut padded = signed_clear("r", "case", 900, &sk, &by);
+            if let yrs::Any::Map(m) = &padded {
+                let mut m = (**m).clone();
+                m.insert("pad".to_string(), yrs::Any::from("x".repeat(MAX_ENTRY_BYTES)));
+                padded = yrs::Any::from(m);
+            }
+            downs.insert(&mut txn, "case|*900", padded);
+            // A CLEAR stamped far ahead of this node's clock still goes:
+            // the tab clamps its reach.
+            downs.insert(&mut txn, "desk|*99000000", signed_clear("r", "desk", 99_000_000, &sk, &by));
+        }
+        let read = board_from_doc(&doc, "r", 5_000);
+        let clears: Vec<&str> = read.down.iter().filter(|(k, _)| is_clear_key(k)).map(|(k, _)| k.as_str()).collect();
+        assert_eq!(clears, vec!["desk|*99000000", "cork|*1000", "case|*900"]);
+        let case = &read.down.iter().find(|(k, _)| k == "case|*900").unwrap().1;
+        assert!(case.get("pad").is_none());
+        assert_eq!(case["v"], 1);
         // Nothing counts while the doc names no owner.
         let bare = yrs::Doc::new();
         let d = bare.get_or_insert_map("boardDown");

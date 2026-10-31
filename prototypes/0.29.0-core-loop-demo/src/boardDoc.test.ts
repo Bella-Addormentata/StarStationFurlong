@@ -824,6 +824,12 @@ describe('the bound store', () => {
     expect(readBoard(BOARD, 'open').shown).toEqual([]);
     expect(trimBoard(BOARD, 'open')).toBe(1); // the covered note
     expect(down.has(clearKey(BOARD, clear.ts))).toBe(true);
+    // CLEAR-shaped keys that name no stamp of their own are junk the trim
+    // takes, found through the index too.
+    down.set(`${BOARD}|*0`, clear);
+    down.set(`${BOARD}|*junk`, clear);
+    expect(trimBoard(BOARD, 'open')).toBe(2);
+    expect(down.has(`${BOARD}|*0`) || down.has(`${BOARD}|*junk`)).toBe(false);
   });
 
   it('keeps a note put off for being ahead when the next view comes without it (#336 review)', () => {
