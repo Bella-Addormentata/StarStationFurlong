@@ -4198,16 +4198,31 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
     }
 }
 
-/// 📌 #315: every tag this node can read (each room it holds a key for, over
-/// the TTL's days), and the room and key it opens as.
+/// 📌 #315: the rooms this node holds a key for, grouped by key: rooms can
+/// share one (a legacy pass takes the home room's, #336 review), and so
+/// their tags. Sorted, so a log names the same room each time.
 #[cfg(feature = "chia-read")]
-fn board_tag_index(hub: &SharedHub, now: u64) -> HashMap<board_bundles::Tag, (String, [u8; 32])> {
-    let caps: Vec<(String, [u8; 32])> =
-        hub.chia_rooms.lock().unwrap().iter().map(|(room, cap)| (room.clone(), cap.room_key)).collect();
+fn board_rooms_by_key(hub: &SharedHub) -> Vec<([u8; 32], Vec<String>)> {
+    let mut by_key: HashMap<[u8; 32], Vec<String>> = HashMap::new();
+    for (room, cap) in hub.chia_rooms.lock().unwrap().iter() {
+        by_key.entry(cap.room_key).or_default().push(room.clone());
+    }
+    let mut out: Vec<([u8; 32], Vec<String>)> = by_key.into_iter().collect();
+    for (_, rooms) in out.iter_mut() {
+        rooms.sort();
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+/// 📌 #315: every tag this node can read (each key it holds, over the TTL's
+/// days), and the key and rooms it opens as.
+#[cfg(feature = "chia-read")]
+fn board_tag_index(hub: &SharedHub, now: u64) -> HashMap<board_bundles::Tag, ([u8; 32], Vec<String>)> {
     let mut index = HashMap::new();
-    for (room, key) in caps {
+    for (key, rooms) in board_rooms_by_key(hub) {
         for tag in board_bundles::read_tags(&key, now) {
-            index.insert(tag, (room.clone(), key));
+            index.insert(tag, (key, rooms.clone()));
         }
     }
     index
@@ -4268,18 +4283,25 @@ async fn board_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, env
                 return;
             }
             let index = board_tag_index(hub, now);
-            let ours = index.get(&b.tag).cloned();
-            if let Some((room, key)) = &ours {
-                if board_bundles::open_bundle(key, room, &b).is_none() {
-                    eprintln!("📌 BOARD-DROP: a bundle from {remote_id} under room {room}'s tag doesn't open as that room's");
-                    return;
-                }
-            }
+            // The room it opens as, under a tag we can read.
+            let ours = match index.get(&b.tag) {
+                Some((key, rooms)) => match rooms.iter().find(|room| board_bundles::open_bundle(key, room, &b).is_some()) {
+                    Some(room) => Some(room.clone()),
+                    None => {
+                        eprintln!(
+                            "📌 BOARD-DROP: a bundle from {remote_id} under room {}'s tag doesn't open as that room's",
+                            rooms.join(", ")
+                        );
+                        return;
+                    }
+                },
+                None => None,
+            };
             let protected = index.into_keys().collect();
             let verdict = hub.board_bundles.lock().unwrap().admit_charged(&peer, b, now, &protected);
             match verdict {
                 board_bundles::Admit::New => {
-                    if let Some((room, _)) = ours {
+                    if let Some(room) = ours {
                         println!("📌 board bundle for room {room} from {}", peer.chars().take(16).collect::<String>());
                         board_bundles::nudge();
                     }
@@ -4328,6 +4350,7 @@ async fn board_bundle_tick(hub: &SharedHub) {
     let self_id = hub.secret_key.public().to_string();
     let caps: Vec<(String, [u8; 32])> =
         hub.chia_rooms.lock().unwrap().iter().map(|(room, cap)| (room.clone(), cap.room_key)).collect();
+    let rooms_by_key = board_rooms_by_key(hub);
     let protected: std::collections::HashSet<Tag> =
         caps.iter().flat_map(|(_, key)| board_bundles::read_tags(key, now)).collect();
 
@@ -4375,10 +4398,10 @@ async fn board_bundle_tick(hub: &SharedHub) {
         lane.store.expire(now);
         // Junk carried under a room's tag before this node had its key goes
         // now, before our own bundle needs the room under that tag.
-        for (room, key) in &caps {
-            let gone = lane.evict_unreadable(room, key, now);
+        for (key, rooms) in &rooms_by_key {
+            let gone = lane.evict_unreadable(rooms, key, now);
             if gone > 0 {
-                eprintln!("📌 dropped {gone} bundle(s) under room {room}'s tags that don't open as its own");
+                eprintln!("📌 dropped {gone} bundle(s) under room {}'s tags that don't open as its own", rooms.join(", "));
             }
         }
         for (room, key, content) in contents {

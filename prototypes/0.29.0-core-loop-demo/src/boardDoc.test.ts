@@ -806,6 +806,24 @@ describe('the bound store', () => {
     expect(keys).toHaveLength(2);
   });
 
+  it('posts after a CLEAR stamped a little ahead, and waits out one further ahead than a note may sit (#336 review)', () => {
+    const down = doc.getMap(BOARD_DOWN_MAP);
+    const near = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() + 5 * 60_000, owner);
+    down.set(clearKey(BOARD, near.ts), near);
+    const r = postNote(BOARD, 'open', { text: 'after a clock a little ahead', colour: 'blue' }, bob);
+    expect(r.ok).toBe(true);
+    const posted = [...doc.getMap(BOARD_NOTES_MAP).values()] as Array<{ ts: number }>;
+    expect(posted).toHaveLength(1);
+    expect(posted[0].ts).toBeGreaterThan(near.ts);
+    // An hour ahead: a note stamped now would be covered once the clock got
+    // there, and one stamped after it couldn't show until then.
+    const far = signDown(ROOM, BOARD, CLEAR_TARGET, Date.now() + 3600_000, owner);
+    down.set(clearKey(BOARD, far.ts), far);
+    const refused = postNote(BOARD, 'open', { text: 'under a clock far ahead', colour: 'blue' }, alice);
+    expect(refused.ok).toBe(false);
+    expect(doc.getMap(BOARD_NOTES_MAP).size).toBe(1);
+  });
+
   it('finds a CLEAR however many keys other boards fill the take-down map with (#336 review)', () => {
     const down = doc.getMap(BOARD_DOWN_MAP);
     const notes = doc.getMap(BOARD_NOTES_MAP);

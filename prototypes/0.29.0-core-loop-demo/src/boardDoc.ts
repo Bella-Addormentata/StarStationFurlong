@@ -466,12 +466,14 @@ export function clearStampOf(itemId: string, ctx: ReadCtx): number {
   return d ? clearReach(d.ts, ctx) : -1;
 }
 
-/** The stamp up to which a board's notes are covered or may be: past the
- *  owner's newest valid CLEAR, up to the newest record a search hasn't
- *  judged yet. A new note goes after it. */
+/** The stamp up to which a board's notes are covered or may be: the
+ *  owner's newest valid CLEAR at its own stamp, however far ahead (a note
+ *  stamped under it would be covered once the clock got there: #336
+ *  review), or the newest record a search hasn't judged yet, as far as it
+ *  may reach now. A new note goes after it. */
 export function clearHoldOf(itemId: string, ctx: ReadCtx): number {
   const f = findClear(itemId, ctx);
-  return Math.max(f.clear ? clearReach(f.clear.ts, ctx) : -1, f.unchecked >= 0 ? clearReach(f.unchecked, ctx) : -1);
+  return Math.max(f.clear ? f.clear.ts : -1, f.unchecked >= 0 ? clearReach(f.unchecked, ctx) : -1);
 }
 
 /** Whether a note has a valid take-down: signed by its author, or by the
@@ -913,8 +915,13 @@ export function postNote(
   const spot = freeSpot(before.shown, rand);
   // Never at or before the owner's last CLEAR, which a clock a little
   // behind theirs would otherwise put the new note under (nor before one a
-  // search hasn't judged yet: it may be the CLEAR).
-  const ts = Math.max(Date.now(), clearHoldOf(itemId, readCtx(kind, Date.now())) + 1);
+  // search hasn't judged yet: it may be the CLEAR). A CLEAR stamped further
+  // ahead than a note may sit is waited out: a note after it couldn't show
+  // until then, and one before it would be covered once the clock got there.
+  const now = Date.now();
+  const hold = clearHoldOf(itemId, readCtx(kind, now));
+  if (hold > now + MAX_FUTURE_SKEW_MS) return { ok: false, why: 'This board was cleared on a clock ahead of yours. Try again in a few minutes.' };
+  const ts = Math.max(now, hold + 1);
   const { id, note } = signNote(
     deps.roomId(),
     itemId,
