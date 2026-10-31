@@ -1568,9 +1568,16 @@ pub fn mark_is_ours(mark: &NodePublishMark, hint: &str, node_id: &str) -> bool {
 /// re-read inside the cursor overlap, never confirms a newer write that may
 /// still be pending or dropped. A mark the chain already showed back needs
 /// nothing; one only the peers accepted (no watcher ran when it was written)
-/// is still confirmed the first time the chain shows it.
+/// is still confirmed the first time the chain shows it. 📖 A mark that names
+/// its coin is never confirmed here: its own lookup ([`presence_standing`],
+/// judged by [`presence_step`]) confirms it, with the height the Phone Book's
+/// green then stands on. The watcher's sighting is of the write, not of the
+/// chain's current word, so once a reorganization returned such a mark to
+/// pending it would set the green back at height 0, which no later absence
+/// could take down ([`crate::chia_resolve::HintChild::gone_since`] says nothing
+/// of a height 0), and the clock's retry would be stopped with it.
 pub fn mark_confirmed_by(mark: &NodePublishMark, seen_issued_at: u64) -> bool {
-    !mark.chain_seen && seen_issued_at != 0 && seen_issued_at == mark.last_at
+    mark.coin_id.is_empty() && !mark.chain_seen && seen_issued_at != 0 && seen_issued_at == mark.last_at
 }
 
 /// Is a presence write due? Always for a new era (or none ever), and for a mark
@@ -2227,9 +2234,6 @@ pub async fn heartbeat_loop(
     // under, since a peer lying about the height would file the record where
     // no reader looks. Read within `PEAK_MAX_AGE_SECS`, it serves the next ticks.
     let mut agreed_peak = crate::chia_resolve::ChainPeak::default();
-    // Without the watcher nothing ever reads our record back, so the peers'
-    // acceptance is the only confirmation there is.
-    let watcher_confirms = crate::chia_watch::watch_enabled();
     // Findable: told so (D4 default) AND holding a durable contact key — a key
     // for this run only is never published under, since the record would
     // outlive it and contradict the node's one-key identity.
@@ -2314,11 +2318,14 @@ pub async fn heartbeat_loop(
             // The watcher read THIS write back from the chain (the record's
             // signed issued_at is the mark's push time): confirmed, nothing
             // more to retry, and seen on chain, which is what the top bar's
-            // phone book turns solid green on (the peers' acceptance alone,
-            // all a node with the watcher off ever gets, is not). An older
-            // record of ours re-read inside the cursor overlap names another
-            // issued_at and confirms nothing. A read of the chain, not a
-            // write, so it is recorded whatever the peak says.
+            // phone book turns solid green on (the peers' acceptance alone is
+            // not). An older record of ours re-read inside the cursor overlap
+            // names another issued_at and confirms nothing. A read of the
+            // chain, not a write, so it is recorded whatever the peak says.
+            // 📖 Only a mark an older node wrote, naming no coin, is confirmed
+            // this way: one that names its coin is judged by its own lookup
+            // below, which also records the height the green stands on
+            // ([`mark_confirmed_by`] says why the watcher must not).
             if let Some(m) = node_mark.as_mut() {
                 let seen_at = hub.presence_confirmed_at.load(std::sync::atomic::Ordering::Relaxed);
                 if mark_confirmed_by(m, seen_at) {
@@ -2358,6 +2365,10 @@ pub async fn heartbeat_loop(
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
                             }
                             node_mark = Some(void);
+                            // The write is due at once, so the retry cadence
+                            // of the attempt it followed does not hold it: the
+                            // era guard and the write budget still do.
+                            node_attempt = None;
                         }
                         PresenceStep::Save(mark) => {
                             if mark.settled {
@@ -2420,7 +2431,11 @@ pub async fn heartbeat_loop(
                                 addrs_sig: sig.clone(),
                                 last_at: now_unix,
                                 hint: hex::encode(hint.to_bytes()),
-                                confirmed: !watcher_confirms,
+                                // 📖 Pending until the chain's own word: the
+                                // mark's lookup confirms it (or voids it), with
+                                // or without the watcher, which only ever read
+                                // back the marks of older nodes.
+                                confirmed: false,
                                 chain_seen: false,
                                 coin_id: hex::encode(write.coin.to_bytes()),
                                 confirmed_height: 0,
@@ -2464,10 +2479,7 @@ pub async fn heartbeat_loop(
             let why_not = node_last_error
                 .as_deref()
                 .or(budget_spent.then_some("this era's write budget is spent; the next listing goes out with the new era"));
-            let mut status = presence_status(node_mark.as_ref(), hint_now.as_deref(), &self_id, era_now, &sig, entries.len(), why_not);
-            if !watcher_confirms && status.error.is_none() && status.state == crate::ChiaPresenceState::Sent {
-                status.error = Some("the chain watcher is off (SSF_CHIA_WATCH=0), so the listing is never read back".into());
-            }
+            let status = presence_status(node_mark.as_ref(), hint_now.as_deref(), &self_id, era_now, &sig, entries.len(), why_not);
             *hub.presence_status.lock().unwrap() = Some(status);
             if spent_this_tick {
                 continue; // one spend per tick — see the doc comment
@@ -2870,6 +2882,9 @@ mod tests {
         // the first read that does still counts.
         let accepted = NodePublishMark { chain_seen: false, ..mark.clone() };
         assert!(mark_confirmed_by(&accepted, now), "accepted by the peers alone: the chain's first word still confirms it");
+        // 📖 A mark that names its coin is confirmed by its own lookup, never
+        // by the watcher's sighting of the write.
+        assert!(!mark_confirmed_by(&NodePublishMark { coin_id: "c".into(), ..pending.clone() }, now), "coin-backed: the lookup confirms it");
         assert!(!node_publish_due(Some(&accepted), 5, "a", now + 2 * PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "…and it is not retried meanwhile");
         let legacy: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":""}"#).unwrap();
         assert!(!legacy.confirmed, "a mark file without the field reads as unconfirmed");
@@ -2990,6 +3005,16 @@ mod tests {
         assert_eq!(presence_state(Some(&again), true, Some(era), "a"), crate::ChiaPresenceState::Sent, "no longer on chain: no longer solid green");
         assert!(again.unsettled_for(era, "n"));
         assert!(node_publish_due(Some(&again), era, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "pending again past the window: the clock asks the lease");
+        // The next heartbeats: the watcher's sighting of the write (its
+        // issued_at is still the mark's last_at) does not set the green back —
+        // at height 0 no later absence could take it down, and the clock's
+        // retry would stop with it; the lookup alone confirms, with its height.
+        assert!(!mark_confirmed_by(&again, now), "a stale sighting resurrects nothing");
+        assert!(!mark_confirmed_by(&pending, now), "nor does a fresh one confirm a coin-backed mark: its lookup does");
+        assert_eq!(presence_step(&again, Some((Pending, true)), era, h0 + 101), PresenceStep::Keep, "still absent: still pending");
+        assert!(node_publish_due(Some(&again), era, "a", now + PRESENCE_CONFIRM_TIMEOUT_SECS, "h", "n"), "…and still due on the clock");
+        let PresenceStep::Save(back) = presence_step(&again, Some((found(h0 + 60, Some(h0 + 102)), false)), era, h0 + 102) else { panic!("landed again: saved") };
+        assert_eq!((back.chain_seen, back.confirmed_height), (true, h0 + 60), "landed again: green, at the new height");
         // … but a listing judged below the block, or undated, is no such word.
         assert_eq!(presence_step(&confirmed, Some((Pending, false)), era, h0 + 100), PresenceStep::Keep, "peers behind the confirmation: nothing is decided");
         // Dead on the lease's word, or confirmed outside its era: the write is
@@ -3013,6 +3038,7 @@ mod tests {
         let old: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":"h","confirmed":true,"chain_seen":true,"node_id":"n"}"#).unwrap();
         assert!(old.coin_id.is_empty() && old.confirmed_height == 0 && !old.settled && old.spend.is_none());
         assert!(!old.unsettled_for(era, "n"), "no coin to look up: not judged");
+        assert!(mark_confirmed_by(&NodePublishMark { chain_seen: false, ..old.clone() }, 1), "…the watcher's read confirms it, as before");
     }
 
     #[test]

@@ -50,11 +50,10 @@ describe('phoneBookIndicator', () => {
     expect(ind.title).toBe('Listing sent to the Phone Book, awaiting confirmation from the chain (the node writes it again if none comes within 30 min)');
     expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: 'peers refused the spend' })).title)
       .toBe('Listing sent to the Phone Book, awaiting confirmation from the chain · peers refused the spend');
-    // A node with the chain watcher off never gets past sent and never writes again
-    // for confirmation's sake; its own words replace the retry note.
-    const watcherOff = 'the chain watcher is off (SSF_CHIA_WATCH=0), so the listing is never read back';
-    expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: watcherOff })).title)
-      .toBe(`Listing sent to the Phone Book, awaiting confirmation from the chain · ${watcherOff}`);
+    // The node's own words replace the retry note whatever they say.
+    const noPeers = 'no full-node peer answered, so the listing could not be looked up';
+    expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: noPeers })).title)
+      .toBe(`Listing sent to the Phone Book, awaiting confirmation from the chain · ${noPeers}`);
   });
 
   it('is a solid grey book once a listing of ours has gone stale, and says why', () => {
