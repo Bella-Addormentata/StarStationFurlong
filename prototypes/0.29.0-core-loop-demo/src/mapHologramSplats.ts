@@ -29,7 +29,7 @@ export interface SparkHost {
 let provider: (() => Promise<SparkHost | null>) | null = null;
 let hostPromise: Promise<SparkHost | null> | null = null;
 /** The room scene's SparkRenderer once the provider has made it. */
-let roomRenderer: Pick<SparkRenderer, 'visible'> | null = null;
+let roomRenderer: SparkRenderer | null = null;
 /** Whether the room renderer is let draw (commitRoomSplatsFrame). */
 let roomSplatsShown = false;
 /** Whether a map table has drawn its splat plot in the frame under way. */
@@ -82,7 +82,33 @@ export function noteRoomSplatsDrawn(): void {
 export function commitRoomSplatsFrame(): void {
   roomSplatsShown = drawnThisFrame;
   drawnThisFrame = false;
-  if (roomRenderer && roomRenderer.visible !== roomSplatsShown) roomRenderer.visible = roomSplatsShown;
+  if (!roomRenderer || roomRenderer.visible === roomSplatsShown) return;
+  // Shown again: the picture it kept from before it was hidden may be of
+  // a table since removed or moved (another room's, or the same table
+  // re-posed by a room swap), so it starts from nothing instead.
+  if (roomSplatsShown) dropSparkPicture(roomRenderer);
+  roomRenderer.visible = roomSplatsShown;
+}
+
+/**
+ * Forget the last picture Spark sorted (its default view's display, the
+ * state it starts in), so it draws nothing until it has sorted the room as
+ * it is now. Spark does not update while hidden, so that sort only starts
+ * once it is shown; a sort still running from before the hide could put
+ * the old picture back, but would have to outlast the whole hidden stretch.
+ */
+function dropSparkPicture(renderer: SparkRenderer): void {
+  try {
+    const view = renderer.defaultView;
+    const picture = view?.display;
+    if (!picture) return;
+    view.display = null;
+    renderer.releaseAccumulator(picture.accumulator);
+    picture.geometry.dispose();
+    renderer.prepareViewpoint();
+  } catch (err) {
+    console.warn('[hologram] could not clear the splat picture:', err);
+  }
 }
 
 /** What mapHologram.ts drives each frame the plot is shown. */

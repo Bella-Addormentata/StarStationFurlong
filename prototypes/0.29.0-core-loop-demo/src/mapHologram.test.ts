@@ -253,6 +253,56 @@ describe('buildMapHologram', () => {
     }
   });
 
+  it('shows a table after a hidden stretch from an empty picture, not the one Spark kept (#327)', async () => {
+    class FakeSplatMesh extends THREE.Object3D { packedSplats = { numSplats: 0 }; opacity = 1; constructor(o: { constructSplats?: (s: { pushSplat: () => void }) => void } = {}) { super(); o.constructSplats?.({ pushSplat: () => { this.packedSplats.numSplats++; } }); } dispose() {} }
+    // Spark's default view keeps the last picture it sorted (`display`), and
+    // does not update while hidden: shown again, it would draw that picture
+    // (another room's table, or this one where it stood) until a new sort.
+    type Picture = { accumulator: object; geometry: { dispose: () => void } };
+    const renderer = {
+      visible: true,
+      defaultView: { display: null as Picture | null },
+      releaseAccumulator: vi.fn(),
+      prepareViewpoint: vi.fn(),
+    };
+    setSparkProvider(async () => ({ spark: { SplatMesh: FakeSplatMesh } as never, renderer: renderer as never }));
+    try {
+      const scene = new THREE.Scene();
+      const { group, handle, sun } = build();
+      scene.add(group);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      const mat = sun.material as THREE.MeshBasicMaterial;
+      mat.opacity = mat.userData.baseOpacity as number;
+      const frame = (): boolean => { handle.update(0.05); commitRoomSplatsFrame(); return renderer.visible; };
+      expect(frame()).toBe(true);
+      // Spark sorts the table's picture while it is drawn, and keeps it.
+      const picture: Picture = { accumulator: {}, geometry: { dispose: vi.fn() } };
+      renderer.defaultView.display = picture;
+      expect(frame()).toBe(true);
+      expect(renderer.defaultView.display).toBe(picture);
+      // The table leaves: hidden, the picture still held.
+      group.removeFromParent();
+      expect(frame()).toBe(false);
+      expect(renderer.defaultView.display).toBe(picture);
+      expect(renderer.releaseAccumulator).not.toHaveBeenCalled();
+      // A table comes back: shown with nothing to draw until Spark sorts anew.
+      scene.add(group);
+      expect(frame()).toBe(true);
+      expect(renderer.defaultView.display).toBeNull();
+      expect(renderer.releaseAccumulator).toHaveBeenCalledWith(picture.accumulator);
+      expect(picture.geometry.dispose).toHaveBeenCalled();
+      expect(renderer.prepareViewpoint).toHaveBeenCalled();
+      // Staying shown keeps whatever Spark sorts next.
+      const next: Picture = { accumulator: {}, geometry: { dispose: vi.fn() } };
+      renderer.defaultView.display = next;
+      expect(frame()).toBe(true);
+      expect(renderer.defaultView.display).toBe(next);
+      expect(renderer.releaseAccumulator).toHaveBeenCalledTimes(1);
+    } finally {
+      setSparkProvider(null);
+    }
+  });
+
   it('never frustum-culls a course line, whose points change under it', () => {
     const { root } = build();
     root.traverse((o) => { if (o instanceof THREE.Line) expect(o.frustumCulled).toBe(false); });
