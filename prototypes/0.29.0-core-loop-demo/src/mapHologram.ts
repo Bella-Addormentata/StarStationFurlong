@@ -20,7 +20,7 @@ import { MAX_ORBIT_SLOTS, PLANETS, currentRoomId, listStations } from './station
 import { MAX_ENTRIES, readAtlas } from './stationAtlas';
 import { stationPlan } from './stationPlan';
 import { holotableStation } from './devices';
-import { buildSplatPlot, type SplatPlotHandle } from './mapHologramSplats';
+import { buildSplatPlot, noteRoomSplatsDrawn, type SplatPlotHandle } from './mapHologramSplats';
 import {
   FADE_SECONDS,
   HOLO_RADIUS,
@@ -31,6 +31,16 @@ import {
   stationLayout,
   type StationHologram,
 } from './mapHologramLayout';
+
+/** Is `obj` drawn: it and every parent visible, all the way up to a scene
+ *  (a table taken out of the room hangs from nothing)? */
+function drawnInScene(obj: THREE.Object3D): boolean {
+  for (let o: THREE.Object3D | null = obj; o; o = o.parent) {
+    if (!o.visible) return false;
+    if ((o as THREE.Scene).isScene) return true;
+  }
+  return false;
+}
 
 /** What World drives: one call per frame. */
 export interface MapHologramHandle {
@@ -413,6 +423,8 @@ export function buildMapHologram(ctx: MapHologramCtx, planeY: number, apexY: num
       for (const pool of [stations, stationRings, modules, links]) for (const m of pool.grown) m.visible = sun.visible;
       if (plotFade > 0) layoutPlot(now, plotFade);
       else for (const line of courses) line.visible = false;
+      // #327: the room's splats are drawn only while a table shows its plot.
+      if (splatPlot && plotFade > 0 && drawnInScene(splatPlot.group)) noteRoomSplatsDrawn();
       if (stationFade > 0) layoutStation();
     },
   };
