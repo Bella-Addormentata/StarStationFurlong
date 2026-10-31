@@ -360,22 +360,29 @@ describe("PR 2's build and a craps table", () => {
     clockOf(a, T0);
     const k = a.casino.computedIncFor(CRAPS, 'craps');
     const c = a.casino.computedIncFor(CRAPS, 'roulette');
-    expect(k).toMatch(/^k[0-9a-f]{24}$/);
-    expect(c).toMatch(/^c[0-9a-f]{24}$/);
+    // House tables since PR 5: `d` for craps, `r` for roulette.
+    expect(k).toMatch(/^d[0-9a-f]{24}$/);
+    expect(c).toMatch(/^r[0-9a-f]{24}$/);
     expect(k.slice(1)).not.toBe(c.slice(1)); // a domain of its own
-    expect(a.casino.computedIncFor(CRAPS)).toBe(c); // roulette's, as PR 2 named it
+    expect(a.casino.computedIncFor(CRAPS)).toBe(c); // roulette's by default
     expect(a.casino.computedIncFor(CRAPS, 'craps')).toBe(k); // the same doc, the same name
-    // Every craps name, of any table: junk to PR 2's readers.
+    // Every name this build gives, of any table: junk to PR 2's readers, and
+    // to PR 3–4's (v0.49's), whose names are `c` and `k` only.
+    const PR4_COMPUTED_INC = /^[ck][0-9a-f]{24}$/;
     for (let i = 0; i < 200; i++) {
       const t = `craps-${i}`;
       const inc = a.casino.computedIncFor(t, 'craps');
       const roul = a.casino.computedIncFor(t, 'roulette');
-      expect(pr2CfgInc({ v: 1, inc })).toBeNull();
-      expect(pr2KeyParts(`ses:${t}:${inc}:g`)).toBeNull();
-      expect(pr2KeyParts(`sum:${t}:${inc}`)).toBeNull();
-      // (The copies are faithful: they take a roulette name.)
-      expect(pr2CfgInc({ v: 1, inc: roul })).toBe(roul);
-      expect(pr2KeyParts(`ses:${t}:${roul}:g`)).toEqual({ t, inc: roul, sid: 'g' });
+      for (const name of [inc, roul]) {
+        expect(pr2CfgInc({ v: 1, inc: name })).toBeNull();
+        expect(pr2KeyParts(`ses:${t}:${name}:g`)).toBeNull();
+        expect(pr2KeyParts(`sum:${t}:${name}`)).toBeNull();
+        expect(PR4_COMPUTED_INC.test(name)).toBe(false);
+      }
+      // (The copies are faithful: they take PR 2's roulette name.)
+      const old = `c${roul.slice(1)}`;
+      expect(pr2CfgInc({ v: 1, inc: old })).toBe(old);
+      expect(pr2KeyParts(`ses:${t}:${old}:g`)).toEqual({ t, inc: old, sid: 'g' });
     }
     // The records under such a name: PR 2's slip and checkpoint readers
     // (asSlip and asCheckpoint, unchanged) refuse them too.
@@ -395,7 +402,7 @@ describe("PR 2's build and a craps table", () => {
     a.doc.transact(() => a.doc.getMap('casinoComputed').set(`ses:${CRAPS}:${first}:g`, new Y.Map()));
     const second = a.casino.computedIncFor(CRAPS, 'craps');
     expect(second).not.toBe(first);
-    expect(second).toMatch(/^k[0-9a-f]{24}$/);
+    expect(second).toMatch(/^d[0-9a-f]{24}$/);
     expect(a.casino.tableIncRemoved(CRAPS, first)).toBe(true);
   });
 

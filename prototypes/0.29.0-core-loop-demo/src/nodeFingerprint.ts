@@ -59,6 +59,11 @@ export interface LocalFingerprint {
   /** 🧲 The node was built with the `torrent` feature and its blob lane is
    *  running: the TV's TORRENT tile can hand it a magnet (torrentLane.ts). */
   torrent?: boolean;
+  /** 🏠 The node's house key (base64url, 43 characters): the key it signs
+   *  its seeds for computed tables with (ssf-p2p-node house.rs). The room's
+   *  deed holder delegates it (computedTable houseDuty). Absent from older
+   *  nodes. Kept only in that shape. */
+  house?: string;
 }
 
 /** 📖 The four looks of the phone book: this edition's listing confirmed
@@ -178,5 +183,6 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (presence) fp.chia_presence = presence;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
+  if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;
   return fp;
 }

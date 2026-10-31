@@ -1,0 +1,1292 @@
+{
+  "note": "Bytes the owner's node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank('close'). houseRecords: the house's reveals and join, signed by node \"one\". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic). felts: a slip's felt `b` and whether the fold takes a slip holding it (asSlipFor; house.rs felt_ok).",
+  "canon": [
+    {
+      "value": "plain",
+      "canon": "\"plain\"",
+      "hash": "92b9ce479fb5f9ec5ab899337e2e11d2"
+    },
+    {
+      "value": "",
+      "canon": "\"\"",
+      "hash": "aaa87ac8edfea47962b7ce3108e4bedc"
+    },
+    {
+      "value": "quote \" backslash \\ slash /",
+      "canon": "\"quote \\\" backslash \\\\ slash /\"",
+      "hash": "d4db5a2d6b82aa53616bc146204c55dc"
+    },
+    {
+      "value": "controls \u0000\u0001\b\t\n\u000b\f\r\u001f",
+      "canon": "\"controls \\u0000\\u0001\\b\\t\\n\\u000b\\f\\r\\u001f\"",
+      "hash": "c2e166404b48062829539f4e8c0623c6"
+    },
+    {
+      "value": "line   sep  ",
+      "canon": "\"line   sep  \"",
+      "hash": "ba4e7d9e070fc1436dcc6860cfb6e055"
+    },
+    {
+      "value": "unicode é ü 😀 ﬀ",
+      "canon": "\"unicode é ü 😀 ﬀ\"",
+      "hash": "ca659541f931a7b1133e65bb03754392"
+    },
+    {
+      "value": 0,
+      "canon": "0",
+      "hash": "d1e4b7e3aa1a91a9c914bec628612440"
+    },
+    {
+      "value": 7,
+      "canon": "7",
+      "hash": "e57a800fd4c6f17b2ae294e1edce29e9"
+    },
+    {
+      "value": -12,
+      "canon": "-12",
+      "hash": "107a10199731dfc8308c4d506b8df986"
+    },
+    {
+      "value": 9007199254740991,
+      "canon": "9007199254740991",
+      "hash": "fead900e03e06f6a2f4296265a3e8c97"
+    },
+    {
+      "value": -9007199254740991,
+      "canon": "-9007199254740991",
+      "hash": "bd321df26396e902f1fc08f1eaaea2fe"
+    },
+    {
+      "value": 9007199254740992,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": 1.5,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": -0.25,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": true,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": null,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": [],
+      "canon": "[]",
+      "hash": "a1bd777c645d15326020a7590e081026"
+    },
+    {
+      "value": [
+        1,
+        "a",
+        [
+          2,
+          []
+        ]
+      ],
+      "canon": "[1,\"a\",[2,[]]]",
+      "hash": "b501c30e139a97055609f6991c0fa9db"
+    },
+    {
+      "value": [
+        1,
+        null
+      ],
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": {},
+      "canon": "{}",
+      "hash": "55ea98862b38785c988df7db951e4df1"
+    },
+    {
+      "value": {
+        "b": 1,
+        "a": 2
+      },
+      "canon": "{\"a\":2,\"b\":1}",
+      "hash": "2723299f0a61e0ca83ab337a857f6603"
+    },
+    {
+      "value": {
+        "é": 1,
+        "z": 2,
+        "a": 3,
+        "😀": 4,
+        "ﬀ": 5,
+        "Z": 6,
+        "_": 7,
+        "~": 8
+      },
+      "canon": "{\"Z\":6,\"_\":7,\"a\":3,\"z\":2,\"~\":8,\"é\":1,\"😀\":4,\"ﬀ\":5}",
+      "hash": "9a7551b25c41bb391004ba4af0494516"
+    },
+    {
+      "value": {
+        "a": {
+          "d": [
+            1,
+            2
+          ],
+          "c": "x"
+        },
+        "b": []
+      },
+      "canon": "{\"a\":{\"c\":\"x\",\"d\":[1,2]},\"b\":[]}",
+      "hash": "e0a8cb47fd359bffeaefc346e156dbc9"
+    },
+    {
+      "value": {
+        "a": true
+      },
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": {
+        "a": 1.25
+      },
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": {
+        "a": [
+          {
+            "b": null
+          }
+        ]
+      },
+      "canon": null,
+      "hash": null
+    },
+    {
+      "value": {
+        "r": 3,
+        "q": "g",
+        "f": {
+          "alice": "00000000000000000000000000000000"
+        },
+        "k": "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+        "g": "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG"
+      },
+      "canon": "{\"f\":{\"alice\":\"00000000000000000000000000000000\"},\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"q\":\"g\",\"r\":3}",
+      "hash": "f4f75c00d329b16e2327b57b0a2e6cc3"
+    }
+  ],
+  "sessionRecords": [
+    {
+      "kind": "slip",
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "key": "s:4:alice:1105535ff99efe620421a884260d9a8a",
+      "value": {
+        "r": 4,
+        "p": "alice",
+        "v": 1,
+        "b": [
+          {
+            "type": "red",
+            "amount": 25
+          },
+          {
+            "type": "straight",
+            "pick": 17,
+            "amount": 5
+          }
+        ],
+        "c": "2249d565b6998d069f811bab43fba29df61aab55c04477c04e0427955897c3a8",
+        "k": "63BgZ6nusHRSlvOA5k6JEzSFEA03L9AM5xsi6GE45lE",
+        "g": "mcaxcIhTnDjilU7MVXufgHGSkXTocJJExSbWEMIDioVfqPby4_3aTSLh6dFIuyk5XLGKCxILVoWx8GFZqZqVBA"
+      },
+      "bytes": "39bac2656ea7f7f81e2f26fe5b0341cf218847654fc39d6315dd5b4f3625088f"
+    },
+    {
+      "kind": "slip",
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "key": "s:4:bob:98e8c52b6ab3a7f096691d39db140443",
+      "value": {
+        "r": 4,
+        "p": "bob",
+        "v": 3,
+        "b": [
+          {
+            "type": "black",
+            "amount": 10
+          }
+        ],
+        "c": "58d973d39c3944face7710258c3e3971e387431302e738f6990844ef99ebab1c",
+        "k": "oZc2Bl0v18nXcQOPiFKGCmOcxUTuww-RrmleIiKguu8",
+        "g": "jraTmTBH6v60YsPczSvHX_U71Ndtr25JgBIO-UZ2kobgzpUPpXuePe31c9vQn_koIqT9zR3nqgz4V2hzLAIlBw"
+      },
+      "bytes": "9c839bd8f1aeac5dd65bacf5c8735edac28e6fb98d7b74d224d16ff93a2c3a54"
+    },
+    {
+      "kind": "slip",
+      "ctx": {
+        "room": "room-test",
+        "t": "craps:1",
+        "inc": "d0123456789abcdef01234567"
+      },
+      "key": "s:9:alice:655077077406e07e17523d27996c415c",
+      "value": {
+        "r": 9,
+        "p": "alice",
+        "v": 1,
+        "b": [
+          {
+            "type": "pass",
+            "amount": 10
+          }
+        ],
+        "o": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "c": "ed39a672d577bc02ed6469af129ebff6b60097aab0c5728d9b581af86420c195",
+        "t": 3,
+        "k": "63BgZ6nusHRSlvOA5k6JEzSFEA03L9AM5xsi6GE45lE",
+        "g": "7ab16E4VSvmRIq0RTNx5J_DZEPNLVU_hBoTm7qjANF_7TTVEsqVVEG9gLUwGh_YFSFfeUr_lcH5dfNwwCsy3CA"
+      },
+      "bytes": "2cf5ecc1846219e80706f7c4019b002493f76fc43acea38d66a4622087719729"
+    },
+    {
+      "kind": "close",
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "key": "c:4:84a2e493846a1d940727dd531519c7c2",
+      "value": {
+        "r": 4,
+        "q": "g",
+        "f": {
+          "alice": "1105535ff99efe620421a884260d9a8a",
+          "bob": "98e8c52b6ab3a7f096691d39db140443"
+        },
+        "k": "63BgZ6nusHRSlvOA5k6JEzSFEA03L9AM5xsi6GE45lE",
+        "g": "LXNz5qpeel3y8k9YG1YaJGUv6UVWk70XL9s4ZXuRgrVQLusjXYk_Qi__8T-KJZ_CrrkKqc8YZ5WscjCzoojOAg"
+      },
+      "bytes": "cceec0ef6e80c82ab52b710457f534f23b7cff397275de092fd8cdf925c0511e",
+      "rank": "9228c3bd62054a518a05b487d2a2c7a1f5acdbee71ddf3ba2fcc180d53ff110f"
+    },
+    {
+      "kind": "close",
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "key": "c:4:4e50181c3a7ef8aefe3b08fd82a2eb0d",
+      "value": {
+        "r": 4,
+        "q": "g",
+        "f": {
+          "alice": "1105535ff99efe620421a884260d9a8a",
+          "bob": "98e8c52b6ab3a7f096691d39db140443"
+        },
+        "h": "1e1bd0f8fa5f4210b40d6ef34b33a74ec492df2e6353757eafcf90ee44f16a72",
+        "k": "63BgZ6nusHRSlvOA5k6JEzSFEA03L9AM5xsi6GE45lE",
+        "g": "VaMq9y7gFsei49t-VZ6HamJ1lkhQthUV6EU9bLoM9U_6JVU-Hgdz0ZdiMkQTWBPiQhU5SV2sGtCa5gZeFpZ8DA"
+      },
+      "bytes": "1dc95bae6bbcf1a22a97ea22dc7843912ef709974ca64933da0d02fcbf225c20",
+      "rank": "9228c3bd62054a518a05b487d2a2c7a1f5acdbee71ddf3ba2fcc180d53ff110f"
+    }
+  ],
+  "houseRecords": [
+    {
+      "kind": "hreveal",
+      "key": "h:4:1f173f987e9debd508c2b3b73e79c88d",
+      "value": {
+        "r": 4,
+        "s": "1bd00e8f2b48c631b63307742b176ffb27f8d074eda7d69d4bf9cf0a76005d61",
+        "x": [
+          "4e50181c3a7ef8aefe3b08fd82a2eb0d"
+        ],
+        "n": [
+          "1105535ff99efe620421a884260d9a8a",
+          "98e8c52b6ab3a7f096691d39db140443"
+        ],
+        "c": "d4d787299d4f0d30c9a207fd5976897b5aa8a9219ae61b273204b099514f0674",
+        "k": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+        "g": "fxxS9GYfmUGSyFVeyEagnBs0Qnd0ehg9eJlgJEfgSLP1eclEMRPY5dcILXpfnfOil1Jl3x0ZgtyrnA4L1w0vAw"
+      },
+      "bytes": "0ad99917096dcce5f7e320c6cb168e274047253d1482a6e4d7029b92884b84ae"
+    },
+    {
+      "kind": "hreveal",
+      "key": "h:5:e18dbbc004a2845e7383a1b175c8263b",
+      "value": {
+        "r": 5,
+        "s": "c83200df89998ed60dd2c5322a88652497c1c122b7283598123c3f0f104caae5",
+        "x": [],
+        "n": [],
+        "k": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+        "g": "hNlxnDN0gDPwuzSemxlb5iiE-MalZZXD9ydwdkqe9CoVK-BZms2KSgjXj_Dk_edkbOjCfrXbAbQ5NrJtxDGEAw"
+      },
+      "bytes": "18c1db8db4bf7eb2b24696736598a626c293f0d6313cbbc6dd71363f201de4b3"
+    },
+    {
+      "kind": "hcommit",
+      "key": "o:6:80a2500a5f9d5c3ae759026ab7ada4a6",
+      "value": {
+        "r": 6,
+        "c": "cf6f96f5282874417b421d1b16a21ef1f62329e2e2f412d92231059ec7ef4099",
+        "k": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+        "g": "8za8w3iO8NZdI26e13M-1FplbY4gH9r5cqMVEEZ5M05MvFZ_SKJe6m-eRcYBiocA5JHOcGwRMaoBuX0DLRD-DQ"
+      },
+      "bytes": "11d7747cba66c24611693b6f38b21036503c4f27ddac6d9301bffc0c4eee0f51"
+    }
+  ],
+  "roomRecords": [
+    {
+      "kind": "hkey",
+      "t": "",
+      "key": "hk:jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+      "value": {
+        "v": 1,
+        "h": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+        "k": "VvwwuIS4wxkurec8v4IxijRdvQdDrgRZutsaTE7n-l0",
+        "g": "7D25PAj4qGh_4W3XZhhwD2gj9GJI6bAyWAN_u_SqhcOZnbWBvZSnVc-o4vJd3efq0IoZWQAZc_k1mhiTaLWgAA"
+      },
+      "bytes": "301967ceb76b9079c9544f3d13c6d80616ace02785ce8920b60d3ac2286536d5"
+    },
+    {
+      "kind": "hfair",
+      "t": "roulette-1",
+      "key": "hf:roulette-1",
+      "value": {
+        "v": 1,
+        "m": 1,
+        "s": 1730000000000,
+        "k": "VvwwuIS4wxkurec8v4IxijRdvQdDrgRZutsaTE7n-l0",
+        "g": "pJgqLVfWWAkxFB_XQgFswLDM5qcSrZhk2BqXm2tEMIObKhKllMxFS0wBrfjJ8JnVJEvtLT_w2GEn9Rvw3jbTAw"
+      },
+      "bytes": "353e24b9f5605af34c50eec5fd18232eb8c5b8cee41cd270f5eb903217adddec"
+    },
+    {
+      "kind": "hbeat",
+      "t": "",
+      "key": "hb:jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+      "value": {
+        "v": 1,
+        "n": 1730000000123,
+        "k": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+        "g": "8hTvrvlE7KdfoKKa2N4xXzOCYpvpkDs4H4vWiLKcqEEmRRoY_ZRQjgwbbDugjLTuk2oeWwBzM8UZIG_OdMxbDw"
+      },
+      "bytes": "12fc9f24d190572c731a7345f8769f8c72ba03f6423428cde2a9e27c0ddf5d5f"
+    }
+  ],
+  "sids": [
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "cp": null,
+      "sid": "g"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "cp": {
+        "b": "g",
+        "u": 12,
+        "l": "84a2e493846a1d940727dd531519c7c2",
+        "n": {
+          "alice": "-35",
+          "bob": "120"
+        }
+      },
+      "sid": "7c829526b60c3af93322f19c"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "cp": {
+        "b": "g",
+        "u": 12,
+        "l": "84a2e493846a1d940727dd531519c7c2",
+        "n": {
+          "alice": "-35",
+          "bob": "120"
+        },
+        "h": "1e1bd0f8fa5f4210b40d6ef34b33a74ec492df2e6353757eafcf90ee44f16a72"
+      },
+      "sid": "6ee9c34fa88bdb015e80d58e"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "cp": {
+        "b": "g",
+        "u": 12,
+        "l": "84a2e493846a1d940727dd531519c7c2",
+        "n": {
+          "alice": "-35",
+          "bob": "120"
+        },
+        "e": 1
+      },
+      "sid": "d0abd1137f1b7e8dde96b415"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "craps:1",
+        "inc": "d0123456789abcdef01234567"
+      },
+      "cp": {
+        "b": "g",
+        "u": 12,
+        "l": "84a2e493846a1d940727dd531519c7c2",
+        "n": {
+          "alice": "-35",
+          "bob": "120"
+        },
+        "s": {
+          "p": 6,
+          "w": {
+            "alice": [
+              {
+                "type": "pass",
+                "amount": 10
+              }
+            ]
+          },
+          "h": "alice",
+          "i": 1
+        },
+        "h": "1e1bd0f8fa5f4210b40d6ef34b33a74ec492df2e6353757eafcf90ee44f16a72"
+      },
+      "sid": "3370cabd10b79fb0d2310461"
+    }
+  ],
+  "commits": [
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "r": 4,
+      "party": "alice",
+      "seed": "761b30ab12bfbfda94854db34774f7a655fe12813674445dc682d56b7cb9eade",
+      "commit": "2249d565b6998d069f811bab43fba29df61aab55c04477c04e0427955897c3a8"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "roulette-1",
+        "inc": "r0123456789abcdef01234567"
+      },
+      "r": 4,
+      "party": "",
+      "seed": "1bd00e8f2b48c631b63307742b176ffb27f8d074eda7d69d4bf9cf0a76005d61",
+      "commit": "1e1bd0f8fa5f4210b40d6ef34b33a74ec492df2e6353757eafcf90ee44f16a72"
+    },
+    {
+      "ctx": {
+        "room": "room-test",
+        "t": "craps:1",
+        "inc": "d0123456789abcdef01234567"
+      },
+      "r": 9,
+      "party": "",
+      "seed": "1bd00e8f2b48c631b63307742b176ffb27f8d074eda7d69d4bf9cf0a76005d61",
+      "commit": "d267921bb64975af65e9dcb4a0b95e081d754f47f78cd8c6edf6824168e51a6d"
+    }
+  ],
+  "houses": [
+    {
+      "nodeSecret": "8f83906a76081a4996fb637aa50c9c3f68aa3eca52a0febdf3231a7f84967092",
+      "pub": "jSMUpc5n1K_BnnemC3YBpb3-tVEelCTKdBvNLVzmQ90",
+      "seeds": [
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 1,
+          "seed": "3a1bebe643bcc0e63761289ed0ec6b0368f68ba863b34f958c5de8cb233b7326"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 4,
+          "seed": "1bd00e8f2b48c631b63307742b176ffb27f8d074eda7d69d4bf9cf0a76005d61"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 1000,
+          "seed": "b19bff0fcd70eeb03cf7b34dbd31922ed3a203ebafb06d7b3e5c9ebd246cf611"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "craps:1",
+            "inc": "d0123456789abcdef01234567"
+          },
+          "r": 9,
+          "seed": "0eb6d3887b14c1b7efd3177af27232a8ca91fe9a7bdf18c253f6a52462af29d1"
+        }
+      ],
+      "sign": {
+        "bytes": "d0b47921a788e6e8126b9148ae094b47798d045e7e1416e9cd16dcd7e1d0282a",
+        "sig": "UKzJGwB7X6KlHmNnFS3PSaV3mqNXum7r2pyjv2CP0YhsqkMUHsU-HU5bn2aov_5KnwjDKnU86aup512C9XD0Aw"
+      }
+    },
+    {
+      "nodeSecret": "a3cc1c496a95214b672b117fda700e32b19a1536cb4c072ec8c44ac545790c87",
+      "pub": "olN5vaFwbBhVPaKjG7_lZG3p-Nm9x6FMplczXBR44E0",
+      "seeds": [
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 1,
+          "seed": "7f469a5879ee0e045a0298624dd414965edca1c22079d34b2851f507dab9450e"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 4,
+          "seed": "f6df385d2c8dadf0068d7cff667a1bbb8c0d51309545f32432fd5241116281fc"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "roulette-1",
+            "inc": "r0123456789abcdef01234567"
+          },
+          "r": 1000,
+          "seed": "83ae9a872d2eb57ee2db0e419057ebe1eeff0f51b1cd351bd8d0dfef13c460f1"
+        },
+        {
+          "ctx": {
+            "room": "room-test",
+            "t": "craps:1",
+            "inc": "d0123456789abcdef01234567"
+          },
+          "r": 9,
+          "seed": "72384612013f8ebde536dd07eb443613d464e801dd61178015f5bc3cc6bcbcf4"
+        }
+      ],
+      "sign": {
+        "bytes": "a62903c2a585a0ec240dc70cfa7695a50cdca83ea25a5ac1fa63a9dea5285779",
+        "sig": "9DVzh77lCGE3uFGmvRb1bHmuFl2kcWKTjAV783zm6agTFwmTq2FeAGW1VcLRyzEkduQ2JLxxI5xvwKQ-AJB-Dg"
+      }
+    }
+  ],
+  "felts": [
+    {
+      "game": "roulette",
+      "b": [],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 25
+        },
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 17
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 0
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 36
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 37
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": -1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "straight",
+          "amount": 5,
+          "pick": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "dozen",
+          "amount": 5,
+          "pick": 2
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "dozen",
+          "amount": 5,
+          "pick": 3
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "column",
+          "amount": 5,
+          "pick": 0
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5,
+          "pick": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 0
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": -5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": "5"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "purple",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": 5,
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5,
+          "x": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        {
+          "type": "red"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        null
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        "red"
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": [
+        []
+      ],
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": "red",
+      "ok": false
+    },
+    {
+      "game": "roulette",
+      "b": {},
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 5
+        },
+        {
+          "type": "pass",
+          "amount": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 10
+        },
+        {
+          "type": "field",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1
+        },
+        {
+          "type": "pass",
+          "amount": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 7
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 10
+        },
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 4
+        },
+        {
+          "type": "place",
+          "amount": 5,
+          "pick": 10
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "hard",
+          "amount": 5,
+          "pick": 6
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "hard",
+          "amount": 5,
+          "pick": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 7
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5
+        },
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "come",
+          "amount": 5,
+          "pick": 4
+        },
+        {
+          "type": "come",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "dontcome",
+          "amount": 5,
+          "pick": 10
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "comeodds",
+          "amount": 5,
+          "pick": 9
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "comeodds",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "dontcomeodds",
+          "amount": 5,
+          "pick": 8
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 5,
+          "pick": 4
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 0
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1.5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": "5"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1000000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1000000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 500000000000
+        },
+        {
+          "type": "pass",
+          "amount": 500000000000
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "field",
+          "amount": 500000000000
+        },
+        {
+          "type": "pass",
+          "amount": 500000000001
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "passodds",
+          "amount": 5
+        }
+      ],
+      "ok": true
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "purple",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "red",
+          "amount": 5
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass",
+          "amount": 1,
+          "x": 1
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        {
+          "type": "pass"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": [
+        null
+      ],
+      "ok": false
+    },
+    {
+      "game": "craps",
+      "b": "pass",
+      "ok": false
+    }
+  ]
+}

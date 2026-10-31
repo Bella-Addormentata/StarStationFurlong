@@ -67,6 +67,11 @@ mod chia_craps_fair;
 #[cfg(feature = "chia-publish")]
 mod treasury_codec;
 
+// 🏠 The house (PR 5 of "Computed casino tables"): the bytes the pages'
+// computed-table fold computes, and the owner's node's house job.
+mod house;
+mod house_bytes;
+
 mod b64 {
     use base64::prelude::*;
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
@@ -287,6 +292,12 @@ pub struct Fingerprint {
     /// (torrent_lane.rs). Absent (false) otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub torrent: bool,
+    /// 🏠 This node's house key (house.rs), base64url: the owner's page
+    /// delegates it in the room (`hk:<pub>`), and its tables then run Fair
+    /// with this node's seed. Absent when the house is off (its state file
+    /// unreadable) or the node is older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub house: Option<String>,
 }
 
 /// 📖 The node's Phone Book listing as the browser sees it (`Fingerprint::
@@ -580,6 +591,10 @@ pub struct HubState {
     /// 📦 The blob lane, or None when its store could not be opened (the
     /// node runs on without it; its routes answer 503).
     pub blobs: Option<Arc<blob_lane::BlobLane>>,
+    /// 🏠 The house (house.rs), or None when its state file can't be read
+    /// (a house that forgot what it revealed could reveal a round twice).
+    /// Locked after `rooms`, never before.
+    pub house: Option<Mutex<house::House>>,
     /// 📌 #315: the board-bundle lane: the bundles this node carries for
     /// anyone (`board-bundles/`), what it published, and each peer's budget.
     /// Locked briefly, never across an await, never inside another lock.
@@ -822,6 +837,7 @@ pub fn compute_fingerprint(
         chia_presence: None,
         blob_cap: None,
         torrent: false,
+        house: None,
     })
 }
 
@@ -844,6 +860,7 @@ mod fingerprint_json_tests {
             chia_presence: None,
             blob_cap: None,
             torrent: false,
+            house: None,
         }
     }
 
@@ -1745,6 +1762,20 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // 🏠 The house: its key comes from the node's own secret key, and what
+    // it has revealed is kept beside the room docs.
+    let house = match house::House::open(&secret_key.to_bytes(), Some(std::path::PathBuf::from(house::STATE_FILE))) {
+        Ok(h) => {
+            println!("🏠 House key {} (its owner's tables run Fair once the owner's page names it)", h.public());
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("⚠️ House off — {e}: its owner's tables run Friendly (fix or remove the file to turn it on)");
+            None
+        }
+    };
+    let mut fingerprint = fingerprint;
+    fingerprint.house = house.as_ref().map(|h| h.public().to_string());
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
         fingerprint: Mutex::new(fingerprint),
@@ -1786,6 +1817,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-publish")]
         presence_status: Mutex::new(None),
         blobs,
+        house: house.map(Mutex::new),
         #[cfg(feature = "chia-read")]
         board_bundles: Mutex::new(board_bundles::BoardLane::load(
             std::path::Path::new(board_bundles::BUNDLES_DIR),
@@ -1852,17 +1884,7 @@ async fn main() -> Result<()> {
             let mut last_hash: HashMap<String, [u8; 32]> = HashMap::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                let snapshots: Vec<(String, Vec<u8>)> = {
-                    let rooms = hub_persist.rooms.lock().unwrap();
-                    rooms
-                        .iter()
-                        .filter(|(_, room)| room.served)
-                        .map(|(id, room)| {
-                            let txn = room.doc.transact();
-                            (id.clone(), txn.encode_diff_v1(&StateVector::default()))
-                        })
-                        .collect()
-                };
+                let snapshots = served_snapshots(&hub_persist.rooms).await;
                 for (room_id, snapshot) in snapshots {
                     if snapshot.is_empty() {
                         continue; // never persist an empty doc over a good file
@@ -1928,6 +1950,16 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         mesh_maintenance_loop(hub_heartbeat, iroh_heartbeat).await;
     });
+
+    // 🏠 The house's loop (house.rs), and its step-down on a stop signal
+    // (house_stop_on_signal): the tables it runs go on Friendly with no void.
+    if hub.house.is_some() {
+        let hub_house = hub.clone();
+        tokio::spawn(async move {
+            house_loop(hub_house).await;
+        });
+        tokio::spawn(house_stop_on_signal(hub.clone()));
+    }
 
     // 📌 #315: the board-bundle lane — seal this node's rooms' boards, tell
     // every connected peer what we carry, hand our tabs what others sealed.
@@ -3670,19 +3702,14 @@ fn handle_iroh_connection(
                             });
                             match sub {
                                 Some((0, 0, cursor)) => {
-                                    // Relayed SyncStep1: answer from our doc when served.
-                                    // Diff built under the lock, sent after dropping it.
-                                    let diff = {
-                                        let rooms = hub_clone.rooms.lock().unwrap();
-                                        match rooms.get(room_id) {
-                                            Some(room) if room.served => {
-                                                read_length_and_buf(&envelope.payload, cursor)
-                                                    .ok()
-                                                    .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok())
-                                                    .map(|client_sv| room.doc.transact().encode_diff_v1(&client_sv))
-                                            }
-                                            _ => None,
-                                        }
+                                    // Relayed SyncStep1: answer from our doc when served
+                                    // (read with the rooms lock let go: room_diff).
+                                    let client_sv = read_length_and_buf(&envelope.payload, cursor)
+                                        .ok()
+                                        .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok());
+                                    let diff = match client_sv {
+                                        Some(sv) => room_diff(&hub_clone.rooms, room_id, sv, true).await,
+                                        None => None,
                                     };
                                     if let Some(diff) = diff {
                                         let mut encoder = EncoderV1::new();
@@ -3715,11 +3742,7 @@ fn handle_iroh_connection(
                                     // SyncStep2 / Update: merge into our replica (as before).
                                     if let Ok((update_bytes, _)) = read_length_and_buf(&envelope.payload, cursor) {
                                         if let Ok(update) = Update::decode_v1(&update_bytes) {
-                                            let rooms = hub_clone.rooms.lock().unwrap();
-                                            if let Some(room) = rooms.get(room_id) {
-                                                let mut txn = room.doc.transact_mut();
-                                                let _ = txn.apply_update(update);
-                                            }
+                                            let _ = apply_to_room(&hub_clone.rooms, room_id, update).await;
                                         }
                                     }
                                 }
@@ -3802,6 +3825,404 @@ async fn broadcast_tab_envelope(hub: &SharedHub, room_id: &str, kind: &str, payl
             }
         });
     }
+}
+
+// ── 🏠 The house's loop (house.rs) ──────────────────────────────────────────
+
+/// The `seq` of the house's own ysync envelopes: from a random start, so a
+/// restart's first ones can't collide with the last run's in a peer's dedup.
+static HOUSE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The house's monotonic clock starts here (its ticks' `now`).
+static HOUSE_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The house's sends, one tick and its send at a time (the loop's or the
+/// step-down's), and what the loop sent in the last [`HOUSE_RESEND_MS`]
+/// (when, room, update), for the step-down to send again and wait on: a
+/// Yjs update waits on every earlier one from the same doc, so one still in
+/// a buffer when the node stops would hold the step-down back with it.
+static HOUSE_SENDS: std::sync::OnceLock<tokio::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<u8>)>>> = std::sync::OnceLock::new();
+/// How long the loop's updates are kept to send again (a send on a working
+/// connection lands well inside it; one that doesn't was lost anyway, and
+/// the next sync carries it).
+const HOUSE_RESEND_MS: u64 = 10_000;
+
+fn house_sends() -> &'static tokio::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<u8>)>> {
+    HOUSE_SENDS.get_or_init(|| tokio::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn house_now() -> u64 {
+    HOUSE_CLOCK.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Tick the house over every room this node serves, every house::TICK_MS,
+/// and send what it wrote.
+async fn house_loop(hub: SharedHub) {
+    HOUSE_SEQ.store(rand::random::<u32>() >> 1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
+        let mut sent = house_sends().lock().await;
+        // Its checks are CPU work: off the runtime's threads.
+        let hub_tick = hub.clone();
+        let updates = match tokio::task::spawn_blocking(move || house_tick(&hub_tick)).await {
+            Ok(updates) => updates,
+            Err(e) => {
+                eprintln!("🏠 house: its tick failed ({e})");
+                Vec::new()
+            }
+        };
+        let now = house_now();
+        while sent.front().is_some_and(|(at, _, _)| now.saturating_sub(*at) > HOUSE_RESEND_MS) {
+            sent.pop_front();
+        }
+        for (room_id, update) in updates {
+            send_house_update(&hub, &room_id, update.clone(), false).await;
+            sent.push_back((now, room_id, update));
+        }
+    }
+}
+
+/// Room `room_id`'s doc (a handle on the room's own; `served_only`: a room
+/// this node serves), taken under the rooms lock and let go. Every room's
+/// sync waits on that lock, so nothing transacts a doc holding it: a doc's
+/// transaction (a tick of the house, a big room's diff) waits on, and holds,
+/// that room alone.
+fn room_doc(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, served_only: bool) -> Option<Doc> {
+    rooms.lock().unwrap().get(room_id).filter(|r| r.served || !served_only).map(|r| r.doc.clone())
+}
+
+/// The served rooms and their docs, as [`room_doc`] takes one.
+fn served_docs(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Doc)> {
+    let rooms = rooms.lock().unwrap();
+    rooms.iter().filter(|(_, r)| r.served).map(|(id, r)| (id.clone(), r.doc.clone())).collect()
+}
+
+/// `f` on the runtime's blocking pool (None: it panicked). A doc's
+/// transaction can be held a while (the house's pass, a big room's diff),
+/// and a runtime thread waiting on it would hold up every task queued on
+/// that thread, other rooms' among them.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// What room `room_id`'s doc holds past `sv` (a SyncStep2's diff): the doc
+/// taken with the rooms lock let go ([`room_doc`]), read off the runtime's
+/// threads ([`off_runtime`]).
+async fn room_diff(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, sv: StateVector, served_only: bool) -> Option<Vec<u8>> {
+    let doc = room_doc(rooms, room_id, served_only)?;
+    off_runtime(move || doc.transact().encode_diff_v1(&sv)).await
+}
+
+/// `update` merged into room `room_id`'s doc, the same way (None: no such room).
+async fn apply_to_room(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, update: Update) -> Option<Result<(), yrs::error::UpdateError>> {
+    let doc = room_doc(rooms, room_id, false)?;
+    off_runtime(move || doc.transact_mut().apply_update(update)).await
+}
+
+/// Every served room's whole doc, for the disk, the same way.
+async fn served_snapshots(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Vec<u8>)> {
+    let docs = served_docs(rooms);
+    off_runtime(move || docs.into_iter().map(|(id, doc)| (id, doc.transact().encode_diff_v1(&StateVector::default()))).collect())
+        .await
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod room_lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use yrs::Map;
+
+    fn room(doc: &Doc) -> Room {
+        Room {
+            doc: doc.clone(),
+            local_connections: HashMap::new(),
+            remote_peers: HashMap::new(),
+            candidates: HashMap::new(),
+            retained: RetainStore::new(),
+            served: true,
+        }
+    }
+
+    /// 🏠 A room's doc held (the house's pass, a big room's diff): every sync
+    /// of that room waits on it with the rooms lock let go and off the
+    /// runtime's threads, so another room's sync, the lock and the runtime
+    /// itself never wait on it (one runtime thread here, as a busy node's
+    /// threads can all be).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sync_waiting_on_one_rooms_doc_holds_no_other_room() {
+        let (a, b) = (Doc::new(), Doc::new());
+        let rooms = Arc::new(Mutex::new(HashMap::from([("a".to_string(), room(&a)), ("b".to_string(), room(&b))])));
+        let update = {
+            let other = Doc::new();
+            let m = other.get_or_insert_map("m");
+            let mut txn = other.transact_mut();
+            m.insert(&mut txn, "k", 1.0);
+            txn.encode_update_v1()
+        };
+        // Room a's doc held for 600 ms on a thread of its own.
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                let _txn = a.transact_mut();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+            })
+        };
+        held.recv().unwrap();
+        let t = Instant::now();
+        let waiting = vec![
+            {
+                let rooms = rooms.clone();
+                tokio::spawn(async move { room_diff(&rooms, "a", StateVector::default(), true).await.is_some() })
+            },
+            {
+                let (rooms, update) = (rooms.clone(), update.clone());
+                tokio::spawn(async move { matches!(apply_to_room(&rooms, "a", Update::decode_v1(&update).unwrap()).await, Some(Ok(()))) })
+            },
+            {
+                let rooms = rooms.clone();
+                tokio::spawn(async move { served_snapshots(&rooms).await.len() == 2 })
+            },
+        ];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(t.elapsed() < Duration::from_millis(300), "the runtime goes on while they wait");
+        assert!(waiting.iter().all(|w| !w.is_finished()), "each waits on room a's doc");
+        assert!(rooms.try_lock().is_ok(), "with the rooms lock let go");
+        assert!(room_diff(&rooms, "b", StateVector::default(), true).await.is_some());
+        assert!(matches!(apply_to_room(&rooms, "b", Update::decode_v1(&update).unwrap()).await, Some(Ok(()))));
+        assert!(t.elapsed() < Duration::from_millis(400), "room b's sync goes on");
+        for w in waiting {
+            assert!(w.await.unwrap());
+        }
+        holder.join().unwrap();
+        let txn = a.transact();
+        assert!(txn.get_map("m").is_some_and(|m| m.get(&txn, "k").is_some()), "room a's update went in once let go");
+    }
+}
+
+/// One tick of the house over the served rooms: (room, update) for each it wrote in.
+fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
+    let Some(house) = hub.house.as_ref() else { return Vec::new() };
+    let now = house_now();
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for (room_id, doc) in served_docs(&hub.rooms) {
+        if let Some(update) = house::tick_room(house, &room_id, &doc, now, wall, false).update {
+            out.push((room_id, update));
+        }
+    }
+    out
+}
+
+/// Step the house down in every served room now (house.rs step_down), and
+/// send it: how many records it sent. Not inside a tick of the loop (it
+/// waits for one to have sent). The loop's recent updates go again before
+/// its own, and each room's as soon as it is written (a flood in one room
+/// holds back no other's); then it waits until each tab and peer has
+/// acknowledged all of them, at most `within_ms` from its start (the app
+/// stops the node a second and a half after asking), since bytes still in a
+/// buffer when the node stops are a void for nothing. A room still being
+/// checked by then is left to finish, its records going out with the sync.
+async fn house_step_down(hub: &SharedHub, within_ms: u64) -> usize {
+    if hub.house.is_none() {
+        return 0;
+    }
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(within_ms);
+    // Stepping down from now: a tick of the loop still running steps down
+    // each room it has yet to reach (the flag is set as soon as its room's
+    // tick lets the house go, off the runtime's threads).
+    let hub_flag = hub.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(house) = hub_flag.house.as_ref() {
+            house::lock(house).begin_step_down();
+        }
+    });
+    // That tick sends before the step-down does, within the deadline too.
+    let Ok(mut sent) = tokio::time::timeout_at(deadline, house_sends().lock()).await else {
+        eprintln!("🏠 house: the loop's tick ran past the step-down's {within_ms} ms; it steps down the rooms it reaches");
+        return 0;
+    };
+    let mut sends = Vec::new();
+    let now = house_now();
+    for (_, room_id, update) in sent.drain(..).filter(|(at, _, _)| now.saturating_sub(*at) <= HOUSE_RESEND_MS) {
+        sends.extend(send_house_update(hub, &room_id, update, true).await);
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>, usize)>();
+    let hub_tick = hub.clone();
+    let ticking = tokio::task::spawn_blocking(move || {
+        if let Some(house) = hub_tick.house.as_ref() {
+            house::step_down(house, served_docs(&hub_tick.rooms), house_now(), |room, update, n| {
+                let _ = tx.send((room, update, n));
+            });
+        }
+    });
+    let mut wrote = 0;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((room_id, update, n))) => {
+                wrote += n;
+                sends.extend(send_house_update(hub, &room_id, update, true).await);
+            }
+            Ok(None) => {
+                if let Err(e) = ticking.await {
+                    eprintln!("🏠 house: its step-down failed ({e})");
+                }
+                break;
+            }
+            Err(_) => {
+                eprintln!("🏠 house: a room still being checked {} ms on; stepping down with what went out", started.elapsed().as_millis());
+                break;
+            }
+        }
+    }
+    let _ = tokio::time::timeout_at(deadline, futures_join(sends)).await;
+    drop(sent);
+    wrote
+}
+
+/// The first signal that stops the node, by name: Ctrl-C everywhere; on
+/// unix SIGTERM too (a service manager's stop, `kill`); on Windows the
+/// console closing, a log-off and a shutdown (each waits on the handler).
+/// SIGHUP is left as it was: under `nohup` it is ignored, and stays so.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            Ok(()) = tokio::signal::ctrl_c() => "SIGINT",
+            Some(()) = async { term.as_mut()?.recv().await } => "SIGTERM",
+            else => std::future::pending().await,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut close = ctrl_close().ok();
+        let mut logoff = ctrl_logoff().ok();
+        let mut shutdown = ctrl_shutdown().ok();
+        tokio::select! {
+            Ok(()) = tokio::signal::ctrl_c() => "Ctrl-C",
+            Some(()) = async { close.as_mut()?.recv().await } => "the console closing",
+            Some(()) = async { logoff.as_mut()?.recv().await } => "a log-off",
+            Some(()) = async { shutdown.as_mut()?.recv().await } => "a shutdown",
+            else => std::future::pending().await,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
+/// How long a signal's step-down may take before the node stops all the
+/// same (a second signal stops it at once).
+const HOUSE_STOP_MS: u64 = 5_000;
+
+/// On the first stop signal, step the house down and stop; on a second, or
+/// past [`HOUSE_STOP_MS`], stop at once. A step-down that fails still stops
+/// the node: the signal's handler took the place of the default one.
+async fn house_stop_on_signal(hub: SharedHub) {
+    let why = stop_signal().await;
+    println!("🏠 {why}: stepping the house down");
+    let stepping = tokio::spawn(async move { house_step_down(&hub, HOUSE_STOP_MS - 500).await });
+    tokio::select! {
+        done = stepping => match done {
+            Ok(wrote) => println!("🏠 House stepped down ({wrote} record(s)) — stopping"),
+            Err(e) => eprintln!("🏠 house: its step-down failed ({e}) — stopping"),
+        },
+        again = stop_signal() => println!("🏠 {again} again — stopping now"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(HOUSE_STOP_MS)) => {
+            eprintln!("🏠 house: its step-down took over {HOUSE_STOP_MS} ms — stopping");
+        }
+    }
+    std::process::exit(if why == "SIGTERM" { 143 } else { 130 });
+}
+
+async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+/// Send an update the house wrote into room `room_id`'s doc as the browsers'
+/// updates go: a ysync frame (sync, update) to this node's own tabs and to
+/// the room's mesh neighbours, kept for their lazy pulls and in the dedup
+/// cache so an echo can't come back as new. Unsigned at the envelope, as the
+/// node's other answers are: each record carries its own signature. With
+/// `acked`, each send ends once the other side has acknowledged all of it.
+async fn send_house_update(hub: &SharedHub, room_id: &str, update: Vec<u8>, acked: bool) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut encoder = EncoderV1::new();
+    encoder.write_var(0u32); // messageType = Sync
+    encoder.write_var(2u32); // syncSubType = Update
+    encoder.write_buf(&update);
+    let payload = encoder.to_vec();
+    let seq = HOUSE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let self_id = hub.secret_key.public().to_string();
+    let env = SsfEnvelope {
+        v: 1,
+        room: room_id.to_string(),
+        kind: "ysync".to_string(),
+        seq,
+        author: vec![],
+        payload,
+        sig: None,
+        iroh_node_id: Some(self_id.clone()),
+        iroh_relay_urls: None,
+        iroh_direct_addrs: None,
+        trust_tier: None,
+        iroh_member_hints: None,
+    };
+    let Ok(bytes) = serde_json::to_vec(&env) else { return Vec::new() };
+    hub.seen_envelopes
+        .lock()
+        .unwrap()
+        .check_and_insert(envelope_seen_key(&self_id, room_id, seq, &env.payload));
+    let (tabs, peers): (Vec<Connection>, Vec<iroh::endpoint::Connection>) = {
+        let mut rooms = hub.rooms.lock().unwrap();
+        let Some(room) = rooms.get_mut(room_id) else { return Vec::new() };
+        room.retained.put(envelope_msg_id(&env.author, seq, &env.payload), bytes.clone());
+        (
+            room.local_connections.values().cloned().collect(),
+            room.remote_peers.values().filter(|m| m.in_mesh).map(|m| m.conn.clone()).collect(),
+        )
+    };
+    let len_bytes = (bytes.len() as u32).to_le_bytes();
+    let mut sends = Vec::new();
+    for wt_conn in tabs {
+        let bytes = bytes.clone();
+        sends.push(tokio::spawn(async move {
+            if let Ok(opening) = wt_conn.open_bi().await {
+                if let Ok((mut send_stream, _recv_stream)) = opening.await {
+                    let wrote = send_stream.write_all(&len_bytes).await.is_ok() && send_stream.write_all(&bytes).await.is_ok();
+                    if wrote && acked {
+                        // FIN, done once the tab has acknowledged every byte
+                        // (the page's reader ends the stream cleanly on it).
+                        let _ = send_stream.finish().await;
+                    }
+                }
+            }
+        }));
+    }
+    for peer_conn in peers {
+        let bytes = bytes.clone();
+        sends.push(tokio::spawn(async move {
+            if let Ok((mut send_stream, _recv_stream)) = peer_conn.open_bi().await {
+                let wrote = send_stream.write_all(&len_bytes).await.is_ok() && send_stream.write_all(&bytes).await.is_ok();
+                let _ = send_stream.finish(); // graceful FIN, not RESET (host->joiner fix)
+                if wrote && acked {
+                    // Resolves once the peer has acknowledged all of it.
+                    let _ = send_stream.stopped().await;
+                }
+            }
+        }));
+    }
+    sends
 }
 
 /// ⛓️🥣 Answer a `faucet` request on the stream it came in on (same framing as
@@ -4331,15 +4752,15 @@ async fn board_bundle_tick(hub: &SharedHub) {
     let protected: std::collections::HashSet<Tag> =
         caps.iter().flat_map(|(_, key)| board_bundles::read_tags(key, now)).collect();
 
-    // Under the rooms lock: each served room's board as our copy holds it,
+    // Under the rooms lock: each served room's doc (a handle, read below),
     // one link per connected peer (any room), and the rooms' loopback tabs.
-    let (contents, peers, tabs) = {
+    let (docs, peers, tabs) = {
         let rooms = hub.rooms.lock().unwrap();
-        let contents: Vec<(String, [u8; 32], board_bundles::BoardContent)> = caps
+        let docs: Vec<(String, [u8; 32], Doc)> = caps
             .iter()
             .filter_map(|(room, key)| {
                 let r = rooms.get(room)?;
-                r.served.then(|| (room.clone(), *key, board_bundles::board_from_doc(&r.doc, room, now_ms)))
+                r.served.then(|| (room.clone(), *key, r.doc.clone()))
             })
             .collect();
         let mut peers: HashMap<PublicKey, (String, iroh::endpoint::Connection)> = HashMap::new();
@@ -4365,8 +4786,21 @@ async fn board_bundle_tick(hub: &SharedHub) {
                 Some((room.clone(), addrs.join("|").into_bytes()))
             })
             .collect();
-        (contents, peers, tabs)
+        (docs, peers, tabs)
     };
+    // Each board as our copy holds it, with the rooms lock let go and off the
+    // runtime's threads: a doc's transaction (the house's pass) can hold one
+    // a while, and its CLEARs' signatures are checked here.
+    let contents: Vec<(String, [u8; 32], board_bundles::BoardContent)> = off_runtime(move || {
+        docs.into_iter()
+            .map(|(room, key, doc)| {
+                let content = board_bundles::board_from_doc(&doc, &room, now_ms);
+                (room, key, content)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
 
     // Publish: a room's bundle goes out when its board changed, the day
     // turned, or six hours passed.
@@ -4751,12 +5185,7 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             encoder.write_var(0u32); // messageType = Sync
             encoder.write_var(1u32); // syncSubType = SyncStep2
 
-            let missing_diff = {
-                let rooms = hub.rooms.lock().unwrap();
-                let room = rooms.get(room_id).unwrap();
-                let txn = room.doc.transact();
-                txn.encode_diff_v1(&client_sv)
-            };
+            let missing_diff = room_diff(&hub.rooms, room_id, client_sv, false).await.ok_or_else(|| anyhow!("no room {room_id}"))?;
             encoder.write_buf(&missing_diff);
 
             let reply_env = SsfEnvelope {
@@ -4784,13 +5213,10 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             let update = Update::decode_v1(&update_bytes)
                 .map_err(|e| anyhow!("Failed decoding update block: {:?}", e))?;
 
-            {
-                let rooms = hub.rooms.lock().unwrap();
-                let room = rooms.get(room_id).unwrap();
-                let mut txn = room.doc.transact_mut();
-                txn.apply_update(update)
-                    .map_err(|e| anyhow!("Failed to apply browser update: {:?}", e))?;
-            }
+            apply_to_room(&hub.rooms, room_id, update)
+                .await
+                .ok_or_else(|| anyhow!("no room {room_id}"))?
+                .map_err(|e| anyhow!("Failed to apply browser update: {:?}", e))?;
         }
     }
 
@@ -5019,6 +5445,25 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     cors_origin,
                     fp_json.len(),
                     fp_json
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/house/stepdown") {
+                // 🏠 The app asks before it stops the node (src-tauri): a
+                // local process sends no Origin; a page must be one the API
+                // grants, so no website can make the house leave.
+                let (status, body) = if origin_header.is_none() || origin_ok {
+                    let wrote = house_step_down(&hub_clone, 900).await;
+                    ("200 OK", format!("{{\"ok\":true,\"wrote\":{wrote}}}"))
+                } else {
+                    ("403 Forbidden", "{\"ok\":false}".to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else if req.starts_with("OPTIONS ") {

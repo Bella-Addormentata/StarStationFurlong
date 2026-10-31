@@ -133,6 +133,8 @@ export interface FakeDice {
    *  slid to rest (null once thrown, until they are slid again). */
   resets: () => number;
   rest: () => FeltPoint | null;
+  /** What the table's plaque was last set to: Fair or not (null: never). */
+  fair: () => boolean | null;
 }
 
 export function fakeDice(): FakeDice {
@@ -141,6 +143,7 @@ export function fakeDice(): FakeDice {
   let hand: readonly number[] = [];
   let resets = 0;
   let rest: FeltPoint | null = null;
+  let fair: boolean | null = null;
   const log: string[] = [];
   const aim: FakeDice['aim'] = { p: null, stack: false, dice: false };
   const h = new Proxy({} as Record<PropertyKey, unknown>, {
@@ -184,6 +187,9 @@ export function fakeDice(): FakeDice {
           hand = [...chips];
         };
         case 'pick': return () => (aim.dice ? { kind: 'dice' } : aim.p ? { kind: 'felt', p: aim.p } : null);
+        case 'setFairBadge': return (f: boolean) => {
+          fair = f;
+        };
         case 'projectToFelt': return () => aim.p;
         case 'onMyStack': return () => (aim.stack ? aim.p : null);
         case 'toScreen': return () => null;
@@ -191,7 +197,7 @@ export function fakeDice(): FakeDice {
       }
     },
   }) as unknown as CasinoTableVisualHandle;
-  return { h, log, state: () => state, aim, hand: () => hand, resets: () => resets, rest: () => rest };
+  return { h, log, state: () => state, aim, hand: () => hand, resets: () => resets, rest: () => rest, fair: () => fair };
 }
 
 // ── Pages with a table UI ────────────────────────────────────────────────────

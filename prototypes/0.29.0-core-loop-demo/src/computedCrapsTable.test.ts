@@ -30,7 +30,8 @@ import {
 import type { Page } from './computedPageKit';
 import { atCraps, hintsIn, loadUIPage, stubDom } from './computedCrapsUiKit';
 import type { AtCraps, UIPage } from './computedCrapsUiKit';
-import { ComputedKit, testIdentity } from './computedTestKit';
+import { beatKey, houseSign, roomSignBytes } from './computedHouse';
+import { ComputedKit, testHouse, testIdentity } from './computedTestKit';
 import { CRAPS_DICE_SPOT } from './games/casinoLayout';
 import type { CrapsBet } from './games/craps';
 
@@ -2215,7 +2216,7 @@ describe("the house's switch at craps", () => {
     ta.press('computed-confirm');
     expect(ta.said()).toBe('THE PLAYERS RUN THIS TABLE NOW — NO OPERATOR · FRIENDLY');
     go(pages, T0 + 3 * STEP, T0 + 5 * STEP);
-    expect(a.casino.computedIncOf(TABLE)).toMatch(/^k/);
+    expect(a.casino.computedIncOf(TABLE)).toMatch(/^d/);
     for (const p of pages) expect(p.casino.readMyCrapsBets(TABLE, b.pid)).toEqual([]);
     expect(b.casino.readChips(b.pid)).toBe(1_000);
     expect(c.casino.readChips(c.pid)).toBe(1_000);
@@ -2419,6 +2420,73 @@ describe('the ⚙ card at a computed craps table', () => {
     expect(ta.heard().at(-1)).toBe("NOBODY ROLLS THIS TABLE BY HAND — THE ROLL IS DECIDED ONCE THE BETTORS' SEEDS ARE IN");
     expect(a.casino.readCrapsBackendPref(TABLE)).toBe(backend);
     expect(ta.plaque()).toBe("PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS");
+  });
+});
+
+// ── 🏠 A house table ─────────────────────────────────────────────────────────
+
+describe('a craps house table (PR 5)', () => {
+  it("the plaque names the roll, a Fair roll waits on the house's seed once the bettors' are in, and the card counts it", async () => {
+    const DINC = 'd' + '5a'.repeat(12);
+    const dkit = new ComputedKit({ ...CTX, inc: DINC });
+    const H = testHouse('owner-node');
+    const pages: UIPage[] = [];
+    for (const [i, name] of ['A', 'B'].entries()) pages.push(await loadUIPage(name, i + 1));
+    for (const p of pages) {
+      clockOf(p, T0);
+      p.casino.buyInChips(p.pid, 1_000);
+    }
+    const [a, b] = pages;
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+    switchOn(a, TABLE, DINC);
+    sync(T0, ...pages);
+    standAt(a, 1);
+    standAt(b, 3);
+    const tb = atCraps(b, { stand: 3 });
+    // A's node is the house (A's house duty delegates it); its beats, by hand.
+    a.table.setLocalHouse(H.pub);
+    let n = 0;
+    const beat = (T: number): void => {
+      clockOf(a, T);
+      const body = { v: 1 as const, n: ++n, k: H.pub };
+      a.doc.transact(() => a.doc.getMap('casinoComputed').set(beatKey(H.pub), { ...body, g: houseSign(H.secret, roomSignBytes('hbeat', CTX.room, '', body)) }));
+    };
+    go(pages, T0, T0 + 1_000);
+    expect(b.casino.houseSetUp()).toBe(true);
+    beat(T0 + 1_200);
+    go(pages, T0 + 1_200, T0 + 1_200);
+    expect(tb.plaque()).toBe("PLAYERS' TABLE · FRIENDLY THIS ROLL · THE HOUSE JOINS THE NEXT");
+    expect(b.dice.fair()).toBe(false); // the table's own plaque too
+    // The house joins roll 1.
+    const join = dkit.houseJoin(H, 1);
+    clockOf(a, T0 + 1_400);
+    putIn(a, [[join.key, join.rec]], TABLE);
+    go(pages, T0 + 1_400, T0 + 1_600);
+    expect(tb.plaque()).toBe("✔ FAIR · PLAYERS' TABLE · THE HOUSE AND EVERY BETTOR ADD A SEED");
+    expect(b.dice.fair()).toBe(true);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0 + 1_600)).toBe('ok');
+    // Frames, a beat every 5 s, until both seeds are in; then the dice land.
+    const seedsIn = (): boolean => (foldOf(b).tip?.revealed.length ?? 0) === 2;
+    let T = T0 + 1_800;
+    while (!seedsIn() && T < T0 + 80_000) {
+      beat(T);
+      T = go(pages, T, T + 4_800, seedsIn) + STEP;
+    }
+    expect(seedsIn()).toBe(true);
+    const tip = foldOf(b).tip!;
+    expect(tip.closeRec.h).toBe(join.rec.c);
+    beat(T);
+    T = go(pages, T, T + 4_000);
+    expect(foldOf(b).tip?.decided).toBe(null);
+    expect(tb.status()).toBe("✋ NO MORE BETS — WAITING FOR THE HOUSE'S SEED");
+    const hr = dkit.houseReveal(H, 1, [tip.close], Object.values(tip.closeRec.f));
+    clockOf(a, T);
+    putIn(a, [[hr.key, hr.rec]], TABLE);
+    const at = decide(pages, 1, T);
+    go(pages, at + STEP, at + 2 * STEP);
+    expect(foldOf(b).rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', counted: [a.pid, b.pid].sort() });
+    expect(tb.card()).toMatch(/🔓 LAST ROLL · ROLL 1 · \d \+ \d = .* · 2 OF 2 SEEDS \+ THE HOUSE'S · DECIDED BY THE HOUSE'S REVEAL/);
+    expect(tb.card()).toContain('THE HOUSE · ONLINE');
   });
 });
 

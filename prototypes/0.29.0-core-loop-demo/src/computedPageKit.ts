@@ -21,7 +21,7 @@ import { vi } from 'vitest';
 import * as Y from 'yjs';
 import { diceOf } from './computedCraps';
 import type { CrapsCarry } from './computedCraps';
-import { seedTable } from './computedFold';
+import { gameOfInc, seedTable } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
 import type { ComputedTableRef } from './computedTable';
 import { ComputedKit } from './computedTestKit';
@@ -261,11 +261,12 @@ export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigi
   const inc = p.casino.computedIncOf(t)!;
   const kit = new ComputedKit({ room: PAGE_ROOM, t, inc });
   const D = res.rounds.filter((v) => v.decided).at(-1)!;
-  const carry = inc[0] === 'k' ? given ?? (res.carry as CrapsCarry) : undefined;
-  const cp = kit.checkpoint(id, res.base.sid, D.r, D.close, nets ?? Object.fromEntries(res.nets), undefined, carry);
+  const carry = gameOfInc(inc) === 'craps' ? given ?? (res.carry as CrapsCarry) : undefined;
+  const cp = kit.checkpoint(id, res.base.sid, D.r, D.close, nets ?? Object.fromEntries(res.nets), undefined, carry, res.required ?? undefined);
   const sid = kit.sidAfter(cp);
   const old = p.casino.computedSessionForWrite(t)!;
   const copies = [...res.felts.values()].map((s): [string, unknown] => [s.key, old.get(s.key)]);
+  for (const j of res.joins) copies.push([`o:${res.open}:${j.hash}`, old.get(`o:${res.open}:${j.hash}`)]);
   p.doc.transact(() => {
     const m = p.doc.getMap('casinoComputed');
     m.set(`sum:${t}:${inc}`, cp);

@@ -138,7 +138,10 @@ describe('canon and recHash', () => {
     const h = 'a'.repeat(32);
     expect(parseKey(`s:3:pl:ay:er:${h}`)).toEqual({ kind: 's', r: 3, pid: 'pl:ay:er', h });
     expect(parseKey(`c:12:${h}`)).toEqual({ kind: 'c', r: 12, h });
-    for (const bad of [`c:0:${h}`, `c:01:${h}`, `c:1.5:${h}`, `c:1:x:${h}`, `s:1:${h}`, `s:1::${h}`, `c:1:${h}0`, `h:1:${h}`, `x:1:__proto__:${h}`, 'c:1', '']) {
+    // The house's records (PR 5): no pid.
+    expect(parseKey(`h:4:${h}`)).toEqual({ kind: 'h', r: 4, h });
+    expect(parseKey(`o:5:${h}`)).toEqual({ kind: 'o', r: 5, h });
+    for (const bad of [`c:0:${h}`, `c:01:${h}`, `c:1.5:${h}`, `c:1:x:${h}`, `s:1:${h}`, `s:1::${h}`, `c:1:${h}0`, `q:1:${h}`, `h:1:x:${h}`, `x:1:__proto__:${h}`, 'c:1', '']) {
       expect(parseKey(bad), bad).toBeNull();
     }
   });

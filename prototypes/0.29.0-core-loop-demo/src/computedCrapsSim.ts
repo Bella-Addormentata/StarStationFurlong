@@ -50,7 +50,7 @@ import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { CHIP_DENOMS } from './chipDisplay';
-import { canon, parseKey, seedTable, slipCommit } from './computedFold';
+import { canon, gameOfInc, houseCommitOf, parseKey, seedTable, slipCommit } from './computedFold';
 import type { CloseRec, CrapsSlipRec, FoldCtx, FoldResult, RoundView } from './computedFold';
 import type { ComputedCrapsState, ComputedSlipWrite } from './computedTable';
 import type { Shown, Sim, SimPage, FlipKind } from './computedSim';
@@ -61,6 +61,7 @@ import {
 } from './games/craps';
 import type { CrapsBet, CrapsBetType } from './games/craps';
 import { combineSeeds } from './games/diceFairness';
+import { diceFromMaterial } from './games/fairDice';
 
 // ── The felt's own numbers (copied: casinoTableSession keeps them private) ──
 
@@ -1168,7 +1169,7 @@ export class CrapsHarness {
     for (const t of this.crapsTables()) {
       const res = casino.computedFoldOf(t);
       const inc = casino.computedIncOf(t);
-      if (!res || !inc || inc[0] !== 'k' || !casino.isComputedTable(t)) continue;
+      if (!res || !inc || gameOfInc(inc) !== 'craps' || !casino.isComputedTable(t)) continue;
       const able = croupier.tablesAwake(now) && casino.casinoWhole(t) && casino.computedSettled(t);
       const latest = res.felts.get(sp.pid);
       const rec = latest?.rec as CrapsSlipRec | undefined;
@@ -1225,7 +1226,7 @@ export class CrapsHarness {
   private isCrapsSession(sesKey: string): boolean {
     const cut = sesKey.lastIndexOf(':');
     const rest = sesKey.slice(0, cut);
-    return rest.slice(rest.lastIndexOf(':') + 1)[0] === 'k';
+    return gameOfInc(rest.slice(rest.lastIndexOf(':') + 1)) === 'craps';
   }
 
   /** A reload's pagehide: the goodbye, held to its oracle. */
@@ -1635,7 +1636,7 @@ export class CrapsHarness {
       for (const t of this.crapsTables()) {
         const res = casino.computedFoldOf(t);
         const inc = casino.computedIncOf(t);
-        if (!res || !inc || inc[0] !== 'k') continue;
+        if (!res || !inc || gameOfInc(inc) !== 'craps') continue;
         const ctx = this.sim.ctxOf(t, inc);
         this.check(sp, ctx, res);
         if (!this.walked.has(res)) out.push(`${sp.name}'s fold of ${t} isn't walked to its end (stops ${JSON.stringify(this.stats.stops)})`);
@@ -1786,9 +1787,21 @@ export class CrapsHarness {
     if (canon(v.frozen) !== canon(v.closeRec.f)) at(`frozen ${canon(v.frozen)}, the close freezes ${canon(v.closeRec.f)}`);
     const pm = [...v.present, ...v.missing].sort();
     if (JSON.stringify(pm) !== JSON.stringify(Object.keys(v.closeRec.f).sort())) at(`present ${v.present} and missing ${v.missing}, the close freezes ${Object.keys(v.closeRec.f).sort()}`);
+    // 🏠 A Fair roll (its close names a commitment) is the house's: decided
+    // by its reveal listing the close, whose seed opens the commitment (or
+    // voided by it, counting nobody), or voided by an abandon.
+    const H = v.house;
+    if (v.closeRec.h !== undefined && (v.decided === 'reveals' || v.decided === 'forfeit')) at('a Fair roll decided without the house');
+    if (v.closeRec.h === undefined && H) at('a Friendly roll decided by a house reveal');
     if (v.decided === 'reveals') {
       if (v.forfeit || v.abandon) at('decided by the reveals, naming a forfeit or an abandon');
       if (v.missing.length > 0) at(`decided by the reveals with ${v.missing.join(',')} missing`);
+    } else if (H) {
+      if (v.forfeit || v.abandon) at('decided by the house, naming a forfeit or an abandon');
+      const rec = ses.get(`h:${v.r}:${H.hash}`);
+      if (rec === undefined) return this.stop('decision');
+      if (canon(rec) !== canon(H.rec)) at(`its house reveal reads ${canon(rec)}, the fold's ${canon(H.rec)}`);
+      if (H.rec.r !== v.r || !H.rec.x.includes(v.close) || houseCommitOf(ctx, v.r, H.rec.s) !== v.closeRec.h) at('its house reveal is of another roll, close or commitment');
     } else {
       const d = v.decided === 'forfeit' ? v.forfeit : v.abandon;
       if (!d || (v.decided === 'forfeit' ? v.abandon : v.forfeit)) {
@@ -1803,7 +1816,7 @@ export class CrapsHarness {
       if (v.forfeit && !v.forfeit.rec.n.every((pid) => v.present.includes(pid))) at(`its forfeit counts ${v.forfeit.rec.n}, not all frozen and present`);
     }
     const kText = carryText(k);
-    const id = `${sp.name}|${ctx.t}:${ctx.inc}:${v.close}|${v.decided}|${v.forfeit?.hash ?? v.abandon?.hash ?? ''}|${v.counted.join(',')}|${bytesToHex(sha256(utf8ToBytes(kText))).slice(0, 16)}`;
+    const id = `${sp.name}|${ctx.t}:${ctx.inc}:${v.close}|${v.decided}|${v.forfeit?.hash ?? v.abandon?.hash ?? H?.hash ?? ''}|${v.counted.join(',')}|${bytesToHex(sha256(utf8ToBytes(kText))).slice(0, 16)}`;
     const memo = this.memo.get(id);
     if (memo) {
       // The same roll from the same table: the fold's figures as they were
@@ -1819,7 +1832,8 @@ export class CrapsHarness {
     }
     // Who is counted: the reveals every frozen bettor present, a forfeit its
     // own list, a void nobody.
-    const counted = v.decided === 'reveals' ? v.present : v.decided === 'forfeit' ? [...(v.forfeit?.rec.n ?? [])].sort() : [];
+    const counted = v.decided === 'reveals' ? v.present : v.decided === 'forfeit' ? [...(v.forfeit?.rec.n ?? [])].sort()
+      : v.decided === 'house' ? v.present.filter((pid) => H!.rec.n.includes(v.frozen[pid])) : [];
     if (JSON.stringify(v.counted) !== JSON.stringify(counted)) at(`counted ${v.counted.join(',')}, not ${counted.join(',')}`);
     const inCount = new Set(counted);
     // The inputs, from the session's records.
@@ -1855,7 +1869,7 @@ export class CrapsHarness {
     if (fateText(fate) !== fateText(roll.fates)) at(`fates ${fateText(roll.fates)}, the checker's ${fateText(fate)}`);
     this.riderOracle(ctx, v, k, fate, at);
     this.oddsCap(k, fate, B, at);
-    const rolled = v.decided === 'reveals' || v.decided === 'forfeit';
+    const rolled = v.decided === 'reveals' || v.decided === 'forfeit' || v.decided === 'house';
     // The dice: the fold's, held to the counted seeds' async draw (at the end
     // of the tick), and nothing on a void.
     const dice = roll.dice;
@@ -1864,7 +1878,11 @@ export class CrapsHarness {
         at(`dice ${JSON.stringify(dice)}`);
         return null;
       }
-      this.sim.pocketChecks.push(combineSeeds(seeds, seedTable(ctx), v.r).then((want) => {
+      // (A Fair roll's draw takes the house's seed last.)
+      const draw = v.decided === 'house'
+        ? diceFromMaterial(`ssf-craps-combine-v1|${[...seeds].sort().join('|')}|${seedTable(ctx)}|${v.r}|house:${H!.rec.s}`)
+        : combineSeeds(seeds, seedTable(ctx), v.r);
+      this.sim.pocketChecks.push(draw.then((want) => {
         if (want[0] !== dice[0] || want[1] !== dice[1]) at(`dice ${dice.join('')}, the counted seeds draw ${want.join('')}`);
       }));
     } else if (dice !== null) {

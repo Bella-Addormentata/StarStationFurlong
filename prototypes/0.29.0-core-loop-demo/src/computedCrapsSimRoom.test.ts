@@ -19,6 +19,7 @@ import { atCraps, stubDom, withUI } from './computedCrapsUiKit';
 import type { AtCraps, UIPage } from './computedCrapsUiKit';
 import { putIn, signAs, tagSeed } from './computedPageKit';
 import type { Page } from './computedPageKit';
+import { gameOfInc } from './computedFold';
 import type { Checkpoint, CrapsRoll, CrapsSlipRec } from './computedFold';
 import type { CrapsBet } from './games/craps';
 
@@ -388,7 +389,7 @@ function ghosts(sim: Sim, x: SimPage, a: SimPage) {
       const { casino, table } = x.p;
       const inc = casino.computedIncOf(T);
       const res = casino.computedFoldOf(T);
-      if (!inc || inc[0] !== 'k' || !res) return;
+      if (!inc || gameOfInc(inc) !== 'craps' || !res) return;
       // Every ghost seed a close in freezes, out at once.
       const ses = casino.computedSessionForWrite(T);
       for (const cl of [res.tip?.closeRec, ...res.openCloses.map((o) => o.rec)]) {

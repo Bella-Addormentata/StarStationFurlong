@@ -903,11 +903,14 @@ impl BlobLane {
         let rooms: Vec<String> = self.hosting.lock().unwrap().rooms.iter().filter(|(_, on)| **on).map(|(r, _)| r.clone()).collect();
         let me = endpoint.id();
         for room in rooms {
-            let (entries, connected) = {
+            // The doc under the rooms lock, read after letting it go: a doc's
+            // transaction (the house's tick) holds that room alone.
+            let (doc, connected) = {
                 let rooms = hub.rooms.lock().unwrap();
                 let Some(r) = rooms.get(&room) else { continue };
-                (library_blobs(&r.doc), r.remote_peers.keys().copied().collect::<HashSet<PublicKey>>())
+                (r.doc.clone(), r.remote_peers.keys().copied().collect::<HashSet<PublicKey>>())
             };
+            let entries = library_blobs(&doc);
             if let Some((hash, size, provider)) = self.next_copy(&room, entries, &|p| connected.contains(p), &me, now_ms()) {
                 println!("📦 blob {}: this room's host keeps a copy ({size} bytes, from {})", hash.fmt_short(), provider.fmt_short());
                 tokio::spawn(self.clone().run_fetch(endpoint.clone(), hash, size, vec![provider]));
@@ -1467,7 +1470,10 @@ pub fn spawn_host_copier(lane: Arc<BlobLane>, hub: SharedHub, endpoint: iroh::En
         loop {
             tokio::time::sleep(HOST_SCAN).await;
             lane.met_round(&hub);
-            lane.copy_round(&hub, &endpoint);
+            // Off the runtime's threads: it reads each room's doc, which a
+            // transaction (the house's pass) can hold a while.
+            let (l, h, e) = (lane.clone(), hub.clone(), endpoint.clone());
+            let _ = tokio::task::spawn_blocking(move || l.copy_round(&h, &e)).await;
         }
     });
 }
