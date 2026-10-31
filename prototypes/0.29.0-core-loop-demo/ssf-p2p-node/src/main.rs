@@ -266,6 +266,16 @@ pub struct Fingerprint {
     /// never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_address: Option<String>,
+    /// 📖 Whether this node's latest public addresses are listed in the Phone
+    /// Book (its per-node presence record on Chia, #231 P6a): the SpacePhone's
+    /// top bar draws a phone book from it, green when the current addresses
+    /// are confirmed on chain, grey when an older listing has gone stale.
+    /// Mirrored by the presence publisher each tick (chia_publish.rs); absent
+    /// while the node does not publish presence (a read-only build, no wallet,
+    /// `SSF_CHIA_FINDABLE=0`, no durable contact key). Loopback only, like the
+    /// address: it never rides in a pass or a card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_presence: Option<ChiaPresence>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -277,6 +287,49 @@ pub struct Fingerprint {
     /// (torrent_lane.rs). Absent (false) otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub torrent: bool,
+}
+
+/// 📖 The node's Phone Book listing as the browser sees it (`Fingerprint::
+/// chia_presence`). Defined here, always compiled, because the fingerprint
+/// carries it in every build while the publisher that fills it
+/// (chia_publish.rs) exists only with the `chia-publish` feature.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChiaPresence {
+    pub state: ChiaPresenceState,
+    /// The current era (edition) by the agreed chain peak, 0 while no peak is
+    /// agreed yet.
+    pub era: u64,
+    /// The era of the listing on record, 0 when there is none.
+    pub listed_era: u64,
+    /// Unix seconds of the last write on record, 0 when there is none.
+    pub last_at: u64,
+    /// The watcher has read the listing on record back from the chain.
+    pub confirmed: bool,
+    /// The listing on record is for this era and carries the node's current
+    /// public address set.
+    pub current: bool,
+    /// How many public addresses the node would list right now.
+    pub public_addrs: u32,
+    /// The last publish error, kept until a write succeeds (the unfunded
+    /// wallet is the one the Bank app can fix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 📖 The four looks of the phone book icon.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiaPresenceState {
+    /// This era's listing is confirmed on chain with the current addresses.
+    Listed,
+    /// This era's listing with the current addresses is out, awaiting the
+    /// watcher's confirmation.
+    Sent,
+    /// A listing exists but is stale: an older era, other addresses, or no
+    /// agreed peak to judge it by.
+    Outdated,
+    /// No listing of ours on record (or the first one failed).
+    Unlisted,
 }
 
 // ── Mesh tuning (M3/M5.x — see brainstorming/m345-v029-build-plan.md §2) ──────
@@ -519,6 +572,11 @@ pub struct HubState {
     /// coin) on the local browser's request. `None` while publishing is off.
     #[cfg(feature = "chia-publish")]
     pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
+    /// 📖 The Phone Book listing state the presence publisher mirrors here
+    /// each tick for the loopback fingerprint (`None` until its first tick,
+    /// or for good while the node does not publish presence).
+    #[cfg(feature = "chia-publish")]
+    pub presence_status: Mutex<Option<ChiaPresence>>,
     /// 📦 The blob lane, or None when its store could not be opened (the
     /// node runs on without it; its routes answer 503).
     pub blobs: Option<Arc<blob_lane::BlobLane>>,
@@ -761,6 +819,7 @@ pub fn compute_fingerprint(
         iroh_port,
         share_card: false,
         chia_address: None,
+        chia_presence: None,
         blob_cap: None,
         torrent: false,
     })
@@ -782,6 +841,7 @@ mod fingerprint_json_tests {
             iroh_port: 44442,
             share_card: false,
             chia_address: None,
+            chia_presence: None,
             blob_cap: None,
             torrent: false,
         }
@@ -802,6 +862,52 @@ mod fingerprint_json_tests {
         assert_eq!(back.chia_address, None);
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_address.as_deref(), Some("txch1qq"));
+    }
+
+    /// 📖 The Phone Book listing rides the same way: absent while the node
+    /// does not publish presence, otherwise with its state spelled in
+    /// lowercase for the browser's parser, and the error only when there is
+    /// one.
+    #[test]
+    fn the_phone_book_listing_rides_in_the_fingerprint_only_while_presence_publishes() {
+        use super::{ChiaPresence, ChiaPresenceState};
+        let none = serde_json::to_string(&fp()).unwrap();
+        assert!(!none.contains("chia_presence"), "{none}");
+        let back: Fingerprint = serde_json::from_str(&none).unwrap();
+        assert_eq!(back.chia_presence, None);
+
+        let mut some = fp();
+        some.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Listed,
+            era: 7,
+            listed_era: 7,
+            last_at: 1_700_000_000,
+            confirmed: true,
+            current: true,
+            public_addrs: 2,
+            error: None,
+        });
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains("\"chia_presence\":{\"state\":\"listed\",\"era\":7,\"listed_era\":7,\"last_at\":1700000000,\"confirmed\":true,\"current\":true,\"public_addrs\":2}"), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, some.chia_presence);
+
+        let mut failing = fp();
+        failing.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Unlisted,
+            era: 7,
+            listed_era: 0,
+            last_at: 0,
+            confirmed: false,
+            current: false,
+            public_addrs: 1,
+            error: Some("chia wallet unfunded".into()),
+        });
+        let json = serde_json::to_string(&failing).unwrap();
+        assert!(json.contains("\"state\":\"unlisted\""), "{json}");
+        assert!(json.contains("\"error\":\"chia wallet unfunded\""), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, failing.chia_presence);
     }
 }
 
@@ -1677,6 +1783,8 @@ async fn main() -> Result<()> {
         knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
+        #[cfg(feature = "chia-publish")]
+        presence_status: Mutex::new(None),
         blobs,
         #[cfg(feature = "chia-read")]
         board_bundles: Mutex::new(board_bundles::BoardLane::load(
@@ -4866,6 +4974,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     #[cfg(feature = "chia-publish")]
                     {
                         fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
+                        // 📖 And the Phone Book listing state the publisher
+                        // mirrored on its last tick, for the top bar's icon.
+                        fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
                     }
                     // 📦 The blob lane's token, for this machine's own page
                     // only: an origin the API does not grant cannot read the

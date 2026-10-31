@@ -3,7 +3,7 @@
  * hex, the same 32 bytes in base64, a port — or it is not the node.
  */
 import { describe, expect, it } from 'vitest';
-import { isTestnetAddress, parseNodeFingerprint } from './nodeFingerprint';
+import { isTestnetAddress, parseChiaPresence, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -36,6 +36,27 @@ describe('parseNodeFingerprint', () => {
       expect(isTestnetAddress(bad)).toBe(false);
       expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: bad })?.chia_address).toBeUndefined();
     }
+  });
+
+  it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
+    const listed = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: listed })?.chia_presence).toEqual(listed);
+    const failing = { ...listed, state: 'unlisted', listed_era: 0, last_at: 0, confirmed: false, current: false, error: 'chia wallet unfunded' };
+    expect(parseChiaPresence(failing)).toEqual(failing);
+    // A node that does not publish presence sends none; an older node sends none.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_presence).toBeUndefined();
+    // Not the node's shape: an unknown state, a count that is negative, fractional or
+    // a string, a flag that is not a boolean, an error that is not a string, or no object.
+    for (const bad of [
+      { ...listed, state: 'green' }, { ...listed, state: 7 }, { ...listed, era: -1 }, { ...listed, last_at: 1.5 },
+      { ...listed, public_addrs: '2' }, { ...listed, confirmed: 'yes' }, { ...listed, current: undefined },
+      { ...listed, error: 42 }, 'listed', null, 7, [],
+    ]) {
+      expect(parseChiaPresence(bad)).toBeUndefined();
+      expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: bad })?.chia_presence).toBeUndefined();
+    }
+    // Extra keys from a newer node are not carried along.
+    expect(parseChiaPresence({ ...listed, writes: 3 })).toEqual(listed);
   });
 
   it('refuses what is not a fingerprint: a stranger on the port, or a shape that merely passes a truthiness check', () => {

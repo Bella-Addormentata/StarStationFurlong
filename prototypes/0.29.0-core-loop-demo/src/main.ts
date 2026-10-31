@@ -282,6 +282,7 @@ import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tv
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
+import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -1002,6 +1003,28 @@ function reachabilityUdpPort(fp: LocalFingerprint | null): number {
   return fp?.iroh_port && fp.iroh_port > 0
     ? fp.iroh_port
     : DEFAULT_IROH_UDP_PORT;
+}
+
+/** 📖 The Phone Book icon in the SpacePhone's top bar (phoneBook.ts): is this
+ *  node's latest connection information listed on Chia? Drawn from each
+ *  fingerprint round beside the REACHABILITY row, and written out as the
+ *  PHONE BOOK row of the Network rows, where keyboard and screen-reader
+ *  users read it (the top bar's button is a pointer shortcut to views the
+ *  home screen reaches anyway). Hidden while the node does not publish
+ *  presence, or did not answer this round. The SVG is this page's own glyph
+ *  in one of two fixed colours, never text from outside it. */
+function renderPhoneBookIndicator(fp: LocalFingerprint | null): void {
+  const ind = phoneBookIndicator(fp);
+  setNetworkRow("network-phone-book", ind.row.value, ind.row.colour);
+  const btn = document.getElementById("phone-chia-presence") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.hidden = !ind.visible;
+  if (!ind.visible) return;
+  btn.innerHTML = phoneBookIconSvg(ind.colour, ind.filled);
+  btn.title = ind.title;
+  btn.setAttribute("aria-label", ind.title);
+  btn.dataset.state = ind.state ?? "";
+  btn.dataset.opens = ind.opens ?? "";
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -8419,6 +8442,22 @@ function setupSpacePhoneOverlay() {
     }
   });
 
+  // 📖 The Phone Book icon in the top bar opens the Network rows, where the
+  // REACHABILITY line explains the addresses, or the Bank app when the listing
+  // fails for want of a coin: its RECEIVE section is the fix (phoneBook.ts).
+  document.getElementById("phone-chia-presence")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opens = (e.currentTarget as HTMLElement).dataset.opens;
+    // The bar stays on screen while the IR blaster aims (the shell is slid
+    // away under it, `active` off) and while the quick chat peeks: put the
+    // blaster down, close the bar and unfold the phone first, or the view
+    // would change offscreen (the posture of __ssfOpenTreasury and Tab).
+    if (isAiming()) stopAiming();
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView(opens === "bank" ? "bank" : "setnet");
+  });
+
   // Keep phone date-stamp live
   const updatePhoneTime = () => {
     const elTime = document.getElementById("phone-time");
@@ -8798,10 +8837,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
     renderReachabilityRow(localFingerprint);
+    // 📖 Not the listing icon, though: a cached green would outlive the node,
+    // old tooltip and all, so it is withdrawn until the node answers again.
+    renderPhoneBookIndicator(null);
     return localFingerprint;
   }
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
+  renderPhoneBookIndicator(fingerprint);
   return fingerprint;
 }
 
