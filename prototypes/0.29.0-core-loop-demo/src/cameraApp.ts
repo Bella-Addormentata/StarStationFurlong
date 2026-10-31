@@ -25,9 +25,16 @@ const VIEWFINDER_LINE = 'VIEWFINDER · CLICK OR SPACE SHOOTS · ESC STOPS';
 
 // ── The viewfinder ──────────────────────────────────────────────────────────
 
+/** What takes the picture. `stillUp` says whether this viewfinder is still
+ *  the one up: false once Escape, a room change or another path put it
+ *  down while the frame was read (#339 review). */
+export type CameraShooter = (stillUp: () => boolean) => Promise<void> | void;
+
 let viewfinding = false;
 let busy = false;
-let onShoot: (() => Promise<void> | void) | null = null;
+/** Each viewfinder put up or down is a new one. */
+let session = 0;
+let onShoot: CameraShooter | null = null;
 let subtitleBefore: string | null = null;
 let watcher: MutationObserver | null = null;
 
@@ -68,7 +75,7 @@ const onKey = (e: KeyboardEvent): void => {
 
 /** 📷 The phone down to its tip and the frame marks up; `shoot` takes the
  *  picture when the player presses. */
-export function startViewfinder(shoot: () => Promise<void> | void): void {
+export function startViewfinder(shoot: CameraShooter): void {
   const phone = document.getElementById(PHONE_ID);
   if (!phone) return;
   // A control left focused in a phone slid away would take the next key.
@@ -76,6 +83,7 @@ export function startViewfinder(shoot: () => Promise<void> | void): void {
   if (focused instanceof HTMLElement && phone.contains(focused)) focused.blur();
   onShoot = shoot;
   viewfinding = true;
+  session++;
   viewfinderEl();
   phone.classList.remove('active');
   phone.classList.add('viewfinding');
@@ -97,6 +105,7 @@ export function startViewfinder(shoot: () => Promise<void> | void): void {
 export function stopViewfinder(): void {
   if (!viewfinding) return;
   viewfinding = false;
+  session++;
   onShoot = null;
   document.getElementById(PHONE_ID)?.classList.remove('viewfinding');
   document.body.classList.remove('camera-viewfinding');
@@ -113,10 +122,12 @@ export function stopViewfinder(): void {
 export function shootViewfinder(): void {
   if (!viewfinding || busy || !onShoot) return;
   busy = true;
+  const shoot = onShoot;
+  const mine = session;
   cameraFlash();
   shutterSound();
   Promise.resolve()
-    .then(() => onShoot?.())
+    .then(() => shoot(() => viewfinding && session === mine))
     .catch(() => {})
     .finally(() => {
       busy = false;
@@ -196,6 +207,26 @@ let notice = '';
 let armedDiscard: string | null = null;
 let paintSeq = 0;
 
+/** Whether the roll is in front of the player: its view active and the
+ *  phone up. The phone only slides away, so a control left focused in it
+ *  still takes keys (tvUI.ts tvAppOnScreen). */
+function cameraOnScreen(host: HTMLElement): boolean {
+  if (!host.classList.contains('active')) return false;
+  const phone = host.closest<HTMLElement>(`#${PHONE_ID}`);
+  return !phone || phone.classList.contains('active');
+}
+
+/** The controls ↑/↓ step through. */
+const NAV_STOPS = 'button:not([disabled]), input:not([disabled])';
+
+/** Which of `count` controls a step of ±1 from the one at `at` lands on,
+ *  wrapping; from none (`at` < 0) the first. */
+export function cameraNavIndex(count: number, at: number, step: number): number {
+  if (count <= 0) return -1;
+  if (at < 0 || at >= count) return 0;
+  return (((at + step) % count) + count) % count;
+}
+
 function urlFor(shot: FilmShot): string {
   let url = urls.get(shot.id);
   if (!url) {
@@ -233,6 +264,9 @@ export function cameraAppHtml(shots: readonly FilmShot[], opts: { notice?: strin
     parts.push('</div>');
   }
   parts.push(`<div class="camera-count">${shots.length} of ${ROLL_MAX} · the oldest goes when the roll is full</div>`);
+  // A private window opens IndexedDB too, and forgets it when it closes:
+  // nothing here can tell, so the roll says it (#339 review).
+  if (opts.lasting) parts.push('<div class="camera-count">Kept in this browser only. A private window forgets them when it closes.</div>');
   return parts.join('');
 }
 
@@ -241,6 +275,10 @@ async function paint(host: HTMLElement, focusShot?: string): Promise<void> {
   const seq = ++paintSeq;
   const shots = await listShots();
   if (seq !== paintSeq) return; // a newer paint is on its way
+  if (!host.classList.contains('active')) return; // another app opened meanwhile; the next open paints
+  // The phone put away meanwhile (Tab): painted, but focus stays out of a
+  // phone nobody can see, where it would take the next key.
+  const onScreen = cameraOnScreen(host);
   // Object URLs only for the shots still on the roll.
   const live = new Set(shots.map((s) => s.id));
   for (const [id, url] of urls) {
@@ -252,7 +290,7 @@ async function paint(host: HTMLElement, focusShot?: string): Promise<void> {
   if (armedDiscard && !live.has(armedDiscard)) armedDiscard = null;
   // Keep a caption being typed, and the caret, across the repaint.
   const active = document.activeElement;
-  const typing = active instanceof HTMLInputElement && host.contains(active) && active.dataset.cameraCaption
+  const typing = onScreen && active instanceof HTMLInputElement && host.contains(active) && active.dataset.cameraCaption
     ? { id: active.dataset.cameraCaption, value: active.value, start: active.selectionStart, end: active.selectionEnd }
     : null;
   host.innerHTML = cameraAppHtml(shots, { notice, lasting: rollIsLasting(), armed: armedDiscard, urlOf: urlFor });
@@ -265,7 +303,7 @@ async function paint(host: HTMLElement, focusShot?: string): Promise<void> {
       el.focus({ preventScroll: true });
       el.setSelectionRange(typing.start, typing.end);
     }
-  } else if (focusShot) {
+  } else if (focusShot && onScreen) {
     const el = box(focusShot);
     el?.focus({ preventScroll: false });
   }
@@ -313,6 +351,24 @@ function wire(host: HTMLElement): void {
   host.addEventListener('change', (e) => {
     const t = e.target;
     if (t instanceof HTMLInputElement && t.dataset.cameraCaption) saveCaption(t);
+  });
+  // By keyboard: Tab is the phone's own toggle (main.ts), so ↑/↓ step
+  // through the roll's controls, wrapping, as the TV's remote and the
+  // board's panel do; Enter and Space press a button. A caption box keeps
+  // ←/→, Home and End for its caret; ↑/↓ leave it.
+  host.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
+  host.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    if (!cameraOnScreen(host)) return;
+    const stops = [...host.querySelectorAll<HTMLElement>(NAV_STOPS)].filter((el) => el.offsetParent !== null);
+    if (stops.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation(); // a step through the roll is not a key for the world
+    const from = e.target instanceof HTMLElement ? e.target : null;
+    const next = stops[cameraNavIndex(stops.length, from ? stops.indexOf(from) : -1, e.key === 'ArrowDown' ? 1 : -1)]!;
+    next.focus({ preventScroll: true });
+    next.scrollIntoView({ block: 'nearest' });
   });
   host.addEventListener('keydown', (e) => {
     const t = e.target;

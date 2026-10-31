@@ -6,8 +6,10 @@
  * lane then.
  *
  * Kept in IndexedDB (`ssf-film-roll`), the JPEG as a Blob beside its fields.
- * Where IndexedDB can't open (a private window, blocked storage) the roll
- * lives in memory for the session and says so (`rollIsLasting`).
+ * Where IndexedDB can't open (blocked storage, an old private window) the
+ * roll lives in memory for the session and says so (`rollIsLasting`). Most
+ * private windows do open it, and forget it when they close: the CAMERA
+ * view says that too (cameraApp.ts).
  */
 
 /** Shots the roll keeps; the oldest goes when a new one would pass it. */
@@ -35,6 +37,10 @@ export interface RollStore {
   all(): Promise<FilmShot[]>;
   put(shot: FilmShot): Promise<void>;
   remove(id: string): Promise<void>;
+  /** Read a shot and write `edit`'s result back as one step, so nothing
+   *  (a discard, the roll's overflow, another tab) can come between them.
+   *  `edit` returning null writes nothing. False if the shot is gone. */
+  update(id: string, edit: (shot: FilmShot) => FilmShot | null): Promise<boolean>;
   /** Whether it outlives a reload. */
   readonly lasting: boolean;
 }
@@ -100,6 +106,13 @@ export function memoryRollStore(): RollStore {
     remove: async (id) => {
       shots.delete(id);
     },
+    update: async (id, edit) => {
+      const shot = shots.get(id);
+      if (!shot) return false;
+      const next = edit(shot);
+      if (next) shots.set(id, next);
+      return true;
+    },
   };
 }
 
@@ -110,6 +123,16 @@ function idbRequest<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  });
+}
+
+/** A write is done when its transaction commits, not when its request
+ *  succeeds: one that aborts while committing rolls the write back. */
+function idbCommitted(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error ?? new DOMException('The write was rolled back.', 'AbortError'));
+    tx.onerror = () => reject(tx.error);
   });
 }
 
@@ -149,12 +172,36 @@ function idbRollStore(): RollStore | null {
     put: async (shot) => {
       const d = await db();
       if (!d) return fallback!.put(shot);
-      await idbRequest(d.transaction(STORE, 'readwrite').objectStore(STORE).put(shot));
+      const tx = d.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(shot);
+      await idbCommitted(tx);
     },
     remove: async (id) => {
       const d = await db();
       if (!d) return fallback!.remove(id);
-      await idbRequest(d.transaction(STORE, 'readwrite').objectStore(STORE).delete(id));
+      const tx = d.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(id);
+      await idbCommitted(tx);
+    },
+    update: async (id, edit) => {
+      const d = await db();
+      if (!d) return fallback!.update(id, edit);
+      // The read and the write in one readwrite transaction: IndexedDB runs
+      // overlapping readwrite transactions on a store one after another,
+      // in this tab and every other.
+      const tx = d.transaction(STORE, 'readwrite');
+      const os = tx.objectStore(STORE);
+      let found = false;
+      const read = os.get(id);
+      read.onsuccess = () => {
+        const shot = shotFromStore(read.result);
+        if (!shot) return;
+        found = true;
+        const next = edit(shot);
+        if (next) os.put(next);
+      };
+      await idbCommitted(tx);
+      return found;
     },
   };
   return store;
@@ -211,14 +258,17 @@ export async function addShot(
 
 /** Write a shot's caption. False if the shot is gone. */
 export async function setCaption(id: string, caption: string): Promise<boolean> {
-  const s = rollStore();
-  const shot = (await s.all()).find((x) => x.id === id);
-  if (!shot) return false;
   const text = cleanCaption(caption);
-  if (text === shot.caption) return true;
-  await s.put({ ...shot, caption: text });
-  changed();
-  return true;
+  let wrote = false;
+  // One step: a shot thrown away or pushed off the roll while the caption
+  // was on its way stays gone.
+  const found = await rollStore().update(id, (shot) => {
+    if (shot.caption === text) return null;
+    wrote = true;
+    return { ...shot, caption: text };
+  });
+  if (wrote) changed();
+  return found;
 }
 
 /** Throw a shot away. */

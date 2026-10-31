@@ -8312,26 +8312,34 @@ function setupSpacePhoneOverlay() {
   // 📷 #319: what the CAMERA view opens on next (a shot just taken).
   let cameraOpen: { focusShot?: string; notice?: string } = {};
   /** The shutter: the next frame drawn, printed onto the roll, and the
-   *  phone back up on it with the new shot's caption box ready. */
-  const takePhoto = async (): Promise<void> => {
+   *  phone back up on it with the new shot's caption box ready. The room is
+   *  the one the shutter fired in (#339 review): a frame read after the
+   *  room changed may be the next room's, so it is dropped, and a shot
+   *  whose viewfinder was put down meanwhile (Escape) goes on the roll
+   *  without bringing the phone back up. */
+  const takePhoto = async (stillUp: () => boolean): Promise<void> => {
+    const roomId = activeBootstrap?.roomId ?? "";
+    const roomName = currentRoomDisplayName();
+    const sameRoom = () => (activeBootstrap?.roomId ?? "") === roomId;
     const shot = await requestShot();
-    stopViewfinder();
+    if (!sameRoom()) return; // the room change put the camera down already
+    const up = stillUp();
+    if (up) stopViewfinder();
+    let open: typeof cameraOpen;
     if (shot) {
       try {
-        const saved = await addShot({
-          jpeg: shot.blob,
-          width: shot.width,
-          height: shot.height,
-          roomId: activeBootstrap?.roomId ?? "",
-          roomName: currentRoomDisplayName(),
-        });
-        cameraOpen = { focusShot: saved.id };
+        const saved = await addShot({ jpeg: shot.blob, width: shot.width, height: shot.height, roomId, roomName });
+        open = { focusShot: saved.id };
       } catch {
-        cameraOpen = { notice: "The photo couldn't be saved. Try again." };
+        open = { notice: "The photo couldn't be saved. Try again." };
       }
     } else {
-      cameraOpen = { notice: "The shot didn't take. Try again." };
+      open = { notice: "The shot didn't take. Try again." };
     }
+    // Put down by the player, a new viewfinder up, or another room since:
+    // the phone stays where it is (an open roll repaints by itself).
+    if (!up || !sameRoom() || isViewfinding()) return;
+    cameraOpen = open;
     closeMiniChat();
     container?.classList.add("active");
     showPhoneView("camera");

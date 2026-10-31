@@ -3,7 +3,7 @@
  * and date line, escaped.
  */
 import { describe, expect, it } from 'vitest';
-import { cameraAppHtml } from './cameraApp';
+import { cameraAppHtml, cameraNavIndex } from './cameraApp';
 import type { FilmShot } from './filmRoll';
 
 const shot = (id: string, caption: string, roomName: string): FilmShot => ({
@@ -37,5 +37,21 @@ describe('📷 the film roll view', () => {
     expect(html).toContain('the roll empties when the page closes');
     expect(html).toContain('The shot didn’t take.');
     expect(cameraAppHtml([], { lasting: true, urlOf: () => '' })).toContain('No photos yet');
+  });
+
+  it('says a private window forgets the roll, even where it opens (#339 review)', () => {
+    const kept = cameraAppHtml([], { lasting: true, urlOf: () => '' });
+    expect(kept).toContain('A private window forgets them when it closes.');
+    expect(kept).not.toContain('the roll empties when the page closes');
+    // A roll in memory says the stronger thing, once.
+    expect(cameraAppHtml([], { lasting: false, urlOf: () => '' })).not.toContain('A private window forgets');
+  });
+
+  it('steps through the controls by ↑/↓, wrapping both ways', () => {
+    expect(cameraNavIndex(4, -1, 1)).toBe(0); // from the view itself: the first
+    expect(cameraNavIndex(4, 0, 1)).toBe(1);
+    expect(cameraNavIndex(4, 3, 1)).toBe(0);
+    expect(cameraNavIndex(4, 0, -1)).toBe(3);
+    expect(cameraNavIndex(0, -1, 1)).toBe(-1);
   });
 });

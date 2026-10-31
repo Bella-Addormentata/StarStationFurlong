@@ -59,6 +59,31 @@ describe('🎞️ the film roll', () => {
     expect(cleanLine(42, 10)).toBe('');
   });
 
+  it('never brings back a shot thrown away while its caption was on the way (#339 review)', async () => {
+    const shot = await take(7_000);
+    const saving = setCaption(shot.id, 'late caption');
+    await removeShot(shot.id);
+    await saving;
+    expect(await listShots()).toHaveLength(0);
+    // Nor one pushed off the full roll meanwhile.
+    const oldest = await take(8_000);
+    for (let i = 1; i < ROLL_MAX; i++) await take(8_000 + i);
+    const late = setCaption(oldest.id, 'too late');
+    await take(9_000);
+    await late;
+    expect((await listShots()).some((s) => s.id === oldest.id)).toBe(false);
+  });
+
+  it('writes nothing, and tells no one, for a caption that didn’t change', async () => {
+    const shot = await take(10_000);
+    await setCaption(shot.id, 'same');
+    let changes = 0;
+    const off = onRollChange(() => changes++);
+    expect(await setCaption(shot.id, ' same ')).toBe(true);
+    expect(changes).toBe(0);
+    off();
+  });
+
   it('says when it lives only in memory', () => {
     expect(rollIsLasting()).toBe(false);
   });
