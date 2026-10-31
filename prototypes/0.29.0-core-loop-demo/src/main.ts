@@ -407,7 +407,7 @@ import {
   isCoHost,
   hasCoHostRequest,
 } from "./roomRoles";
-import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust } from "./coHostNodes";
+import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust, subscribeCoHostNodes } from "./coHostNodes";
 import {
   bindVentures,
   subscribeVentures,
@@ -1502,6 +1502,24 @@ function coHostRouteHints(roomId: string): RoomMemberHint[] {
   return hints;
 }
 
+/** 🤝 C3: the keepers' records changed (or the room's state that judges
+ *  them arrived): drop the hint memo, and mint the displayed MY PASS again
+ *  (#338 review: the join mints it before the records are read). Not over
+ *  a pass the player generated themselves. Debounced: records land in
+ *  bursts. */
+let passHintsTimer: ReturnType<typeof setTimeout> | null = null;
+function refreshPassHints(): void {
+  coHostHintMemo = null;
+  if (passHintsTimer) clearTimeout(passHintsTimer);
+  passHintsTimer = setTimeout(() => {
+    passHintsTimer = null;
+    const out = document.getElementById("access-pass-output") as HTMLInputElement | null;
+    if (!out) return;
+    const playersOwn = out.value !== "" && out.value !== lastAutoPass && /^(ssf|https?):/.test(out.value);
+    if (!playersOwn) void syncAccessPass();
+  }, 1_000);
+}
+
 /** 🤝 C3: a boot record with the room's co-hosts among its dial hints, after
  *  the record's own; the same record when the room has none. */
 function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBootstrap | null {
@@ -2427,8 +2445,10 @@ async function joinRoomAtEpoch(
       refreshWarmNeighbours();
       // 📌 A board view the node sent before the host's state arrived.
       retryBoardView();
-      // 🤝 C3: a keeper's node, filed now the room's owner and grants are known.
+      // 🤝 C3: a keeper's node, filed now the room's owner and grants are known,
+      // and the pass's hints read again.
       refileCoHostNode();
+      refreshPassHints();
       void networkProvider.refreshRoomCap();
     });
   }
@@ -2556,9 +2576,11 @@ async function joinRoomAtEpoch(
     subscribeRoomRoles(() => {
       renderCoHostsSection();
       // 🤝 C3: a grant just landed (or went): file, or take down, our node.
-      coHostHintMemo = null;
+      refreshPassHints();
       refileCoHostNode();
     });
+    // 🤝 C3: a keeper's node record landed, moved or went: the pass's hints.
+    subscribeCoHostNodes(refreshPassHints);
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
@@ -3230,7 +3252,7 @@ async function joinRoomAtEpoch(
     if (_event.keysChanged.has("owner")) {
       refreshBoards();
       // 🤝 C3: a new owner's game files its node; a former owner's takes its down.
-      coHostHintMemo = null;
+      refreshPassHints();
       refileCoHostNode();
     }
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
@@ -9598,6 +9620,10 @@ function setupNetworkDetailsPanel() {
  *  (pre-#52 this fed the network panel's share-link input). Runs per join,
  *  so after a transit/beam the visible pass always belongs to the CURRENT
  *  room without pressing GENERATE. */
+/** The pass syncAccessPass last painted: a different one in the field is the
+ *  player's own (GENERATE), which refreshPassHints leaves alone. */
+let lastAutoPass = "";
+
 async function syncAccessPass(): Promise<void> {
   const passOutput = document.getElementById(
     "access-pass-output",
@@ -9606,9 +9632,14 @@ async function syncAccessPass(): Promise<void> {
     return;
   }
 
+  const roomId = activeBootstrap?.roomId ?? "";
   const minted = await mintBootstrapLink();
+  // 🤝 Moved rooms while minting (#338 review): the next room's join paints
+  // its own pass.
+  if ((activeBootstrap?.roomId ?? "") !== roomId) return;
   if (minted.link) {
     passOutput.value = minted.link;
+    lastAutoPass = minted.link;
   } else {
     passOutput.value =
       minted.error ??

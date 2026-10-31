@@ -134,11 +134,13 @@ export interface CoHostReadCtx {
   roomId: string;
   now: number;
   verify?: (pub: string, bytes: Uint8Array, sig: string) => boolean;
+  /** Hints at most (a pass's MAX_CO_HOST_HINTS by default). */
+  max?: number;
 }
 
 /** The route hints of the room's co-hosts: for each grant, longest-standing
  *  first, the record its own key signed for this room, if fresh. One hint per
- *  node, at most MAX_CO_HOST_HINTS. Pure. */
+ *  node, at most `ctx.max` (MAX_CO_HOST_HINTS). Pure. */
 export function readCoHostHints(
   grants: readonly CoHostGrantLike[],
   recordOf: (pub: string) => unknown,
@@ -148,8 +150,9 @@ export function readCoHostHints(
   const out: RoomMemberHint[] = [];
   const nodes = new Set<string>();
   const sorted = [...grants].sort((a, b) => a.grantedAt - b.grantedAt || (a.pub < b.pub ? -1 : a.pub > b.pub ? 1 : 0));
+  const max = ctx.max ?? MAX_CO_HOST_HINTS;
   for (const g of sorted) {
-    if (out.length >= MAX_CO_HOST_HINTS) break;
+    if (out.length >= max) break;
     if (typeof g.pub !== 'string' || g.pub.length === 0 || g.pub.length > MAX_PUB) continue;
     const r = coHostNodeFromWire(recordOf(g.pub));
     if (!r || nodes.has(r.node)) continue;
@@ -177,14 +180,16 @@ export function ownerPubIn(doc: Y.Doc): string | undefined {
 }
 
 /** Who keeps a room: its owner first, then its co-hosts as the doc lists
- *  them (`coHosts`). */
+ *  them (`coHosts`). A grant counts only as roomRoles.ts reads one: filed
+ *  under its own key, with a name and a stamp (#338 review), so the owner's
+ *  revoke of that key takes it away. */
 export function keepersIn(doc: Y.Doc, ownerPub = ownerPubIn(doc)): CoHostGrantLike[] {
   const out: CoHostGrantLike[] = ownerPub ? [{ pub: ownerPub, grantedAt: 0 }] : [];
-  for (const v of doc.getMap(CO_HOSTS_MAP).values()) {
-    const g = v as { pub?: unknown; grantedAt?: unknown } | null;
-    if (g && typeof g.pub === 'string' && g.pub !== ownerPub && Number.isFinite(g.grantedAt)) {
-      out.push({ pub: g.pub, grantedAt: Math.max(1, g.grantedAt as number) });
-    }
+  for (const [key, v] of doc.getMap(CO_HOSTS_MAP).entries()) {
+    const g = v as { pub?: unknown; name?: unknown; grantedAt?: unknown } | null;
+    if (!g || g.pub !== key || key === ownerPub || typeof g.name !== 'string' || typeof g.grantedAt !== 'number') continue;
+    if (!Number.isFinite(g.grantedAt)) continue;
+    out.push({ pub: key, grantedAt: Math.max(1, g.grantedAt) });
   }
   return out;
 }
@@ -196,7 +201,9 @@ export function keepersIn(doc: Y.Doc, ownerPub = ownerPubIn(doc)): CoHostGrantLi
  *  store: a warm neighbour's or a far door's session asks too. */
 export function keeperNodesIn(doc: Y.Doc, roomId: string, now = Date.now()): Set<string> {
   const records = doc.getMap(CO_HOST_NODES_MAP);
-  const hints = readCoHostHints(keepersIn(doc), (pub) => records.get(pub), { roomId, now, verify: cachedVerify });
+  // Every keeper's node, not a pass's eight (#338 review): a visitor may
+  // reach only the newest co-host's.
+  const hints = readCoHostHints(keepersIn(doc), (pub) => records.get(pub), { roomId, now, verify: cachedVerify, max: Infinity });
   return new Set(hints.map((h) => h.irohNodeId));
 }
 
@@ -239,9 +246,22 @@ function docAlive(): boolean {
   return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && nodesMap !== null;
 }
 
+const nodeListeners = new Set<() => void>();
+const onNodesChanged = (): void => {
+  for (const l of [...nodeListeners]) l();
+};
+
 export function bindCoHostNodes(doc: Y.Doc): void {
+  nodesMap?.unobserve(onNodesChanged);
   boundDoc = doc;
   nodesMap = doc.getMap(CO_HOST_NODES_MAP);
+  nodesMap.observe(onNodesChanged);
+}
+
+/** Called when the bound room's node records change (a pass's hints may). */
+export function subscribeCoHostNodes(listener: () => void): () => void {
+  nodeListeners.add(listener);
+  return () => nodeListeners.delete(listener);
 }
 
 /** The co-host hints of the bound room, for a pass or the node's dial. */

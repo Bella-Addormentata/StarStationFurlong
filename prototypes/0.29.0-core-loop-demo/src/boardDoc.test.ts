@@ -824,6 +824,24 @@ describe('the bound store', () => {
     expect(doc.getMap(BOARD_NOTES_MAP).size).toBe(1);
   });
 
+  it('judges the records ahead of a far-ahead CLEAR before posting, and waits on ones it can’t (#338 review)', () => {
+    const down = doc.getMap(BOARD_DOWN_MAP);
+    const t = Date.now() + 3600_000;
+    const real = signDown(ROOM, BOARD, CLEAR_TARGET, t, owner);
+    // More forged records an hour ahead, claiming the owner's key, than one
+    // search checks: a post judges them all, finds no CLEAR, and posts.
+    for (let i = 1; i <= 20; i++) down.set(clearKey(BOARD, t + i), { ...real, ts: t + i });
+    expect(postNote(BOARD, 'open', { text: 'past the forgeries', colour: 'blue' }, bob).ok).toBe(true);
+    // The owner's real CLEAR behind them, an hour ahead: waited out.
+    down.set(clearKey(BOARD, real.ts), real);
+    expect(postNote(BOARD, 'open', { text: 'under the hour-ahead clear', colour: 'blue' }, bob).ok).toBe(false);
+    // Too many to judge in one post: one of them may be a real CLEAR.
+    down.delete(clearKey(BOARD, real.ts));
+    for (let i = 21; i <= 200; i++) down.set(clearKey(BOARD, t + i), { ...real, ts: t + i });
+    expect(postNote(BOARD, 'open', { text: 'behind the forgeries', colour: 'blue' }, bob).ok).toBe(false);
+    expect(doc.getMap(BOARD_NOTES_MAP).size).toBe(1);
+  });
+
   it('finds a CLEAR however many keys other boards fill the take-down map with (#336 review)', () => {
     const down = doc.getMap(BOARD_DOWN_MAP);
     const notes = doc.getMap(BOARD_NOTES_MAP);

@@ -4876,20 +4876,28 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             };
             encoder.write_buf(&missing_diff);
 
+            // 🤝 C3 (#338 review): signed as built by this node, as for a
+            // peer, so a tab whose own node keeps the room (its owner's or a
+            // co-host's) counts this copy as the room's state with nobody
+            // else online. Any other tab's node is no keeper: it gains
+            // nothing from the proof.
+            let payload = encoder.to_vec();
+            let seq = envelope.seq.wrapping_add(1);
+            let proof = node_proof(&hub.secret_key, room_id, seq, &payload);
             let reply_env = SsfEnvelope {
                 v: 1,
                 room: room_id.to_string(),
                 kind: "ysync".to_string(),
-                seq: envelope.seq + 1,
+                seq,
                 author: vec![],
-                payload: encoder.to_vec(),
+                payload,
                 sig: None,
-                iroh_node_id: None,
+                iroh_node_id: Some(hub.secret_key.public().to_string()),
                 iroh_relay_urls: None,
                 iroh_direct_addrs: None,
                 trust_tier: None,
                 iroh_member_hints: None,
-                node_proof: None,
+                node_proof: Some(proof),
             };
 
             let reply_bytes = serde_json::to_vec(&reply_env)?;

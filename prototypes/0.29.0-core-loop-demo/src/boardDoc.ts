@@ -466,14 +466,19 @@ export function clearStampOf(itemId: string, ctx: ReadCtx): number {
   return d ? clearReach(d.ts, ctx) : -1;
 }
 
-/** The stamp up to which a board's notes are covered or may be: the
- *  owner's newest valid CLEAR at its own stamp, however far ahead (a note
- *  stamped under it would be covered once the clock got there: #336
- *  review), or the newest record a search hasn't judged yet, as far as it
- *  may reach now. A new note goes after it. */
-export function clearHoldOf(itemId: string, ctx: ReadCtx): number {
-  const f = findClear(itemId, ctx);
-  return Math.max(f.clear ? f.clear.ts : -1, f.unchecked >= 0 ? clearReach(f.unchecked, ctx) : -1);
+/** Rounds of the CLEAR search a post runs before it stamps its note, each
+ *  judging up to MAX_CLEAR_CHECKS records not judged before (#338 review). */
+const POST_CLEAR_ROUNDS = 8;
+
+/** The stamp a new note must come after: the owner's newest valid CLEAR, or
+ *  the newest record claiming the owner's key that `rounds` searches
+ *  couldn't judge (it may be the CLEAR), each at its own stamp however far
+ *  ahead: a note stamped under either could be covered once the clock got
+ *  there (#336, #338 review). -1 for none. */
+export function clearHoldOf(itemId: string, ctx: ReadCtx, rounds = 1): number {
+  let f = findClear(itemId, ctx);
+  for (let round = 1; f.unchecked >= 0 && round < rounds; round++) f = findClear(itemId, ctx);
+  return Math.max(f.clear ? f.clear.ts : -1, f.unchecked);
 }
 
 /** Whether a note has a valid take-down: signed by its author, or by the
@@ -918,9 +923,10 @@ export function postNote(
   // search hasn't judged yet: it may be the CLEAR). A CLEAR stamped further
   // ahead than a note may sit is waited out: a note after it couldn't show
   // until then, and one before it would be covered once the clock got there.
+  // So is a record still unjudged that far ahead, until the sweep gets to it.
   const now = Date.now();
-  const hold = clearHoldOf(itemId, readCtx(kind, now));
-  if (hold > now + MAX_FUTURE_SKEW_MS) return { ok: false, why: 'This board was cleared on a clock ahead of yours. Try again in a few minutes.' };
+  const hold = clearHoldOf(itemId, readCtx(kind, now), POST_CLEAR_ROUNDS);
+  if (hold > now + MAX_FUTURE_SKEW_MS) return { ok: false, why: 'This board’s last clear is stamped ahead of your clock. Try again in a few minutes.' };
   const ts = Math.max(now, hold + 1);
   const { id, note } = signNote(
     deps.roomId(),

@@ -117,6 +117,41 @@ describe('🤝 the nodes that keep a room', () => {
     doc.getMap('roomInfo').set('owner', 'Local-Clone');
     expect([...keeperNodesIn(doc, ROOM, now)]).toEqual([n2.id]);
   });
+
+  it('count a grant only as the room reads one: under its own key, named (#338 review)', () => {
+    const now = Date.now();
+    const owner = identity('owner');
+    const coHost = identity('co-host');
+    const n1 = nodeKey('1');
+    const n2 = nodeKey('2');
+    const doc = roomKeptBy(owner, n1, now);
+    doc.getMap(CO_HOST_NODES_MAP).set(coHost.pub, signCoHostNode(ROOM, { irohNodeId: n2.id }, now - 1000, coHost)!);
+    // Filed under another key (the owner's revoke of the co-host's key
+    // wouldn't reach it), or without a name: no grant.
+    doc.getMap('coHosts').set('someone-else', { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
+    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(false);
+    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, grantedAt: now - 5000 });
+    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(false);
+    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
+    expect(keeperNodesIn(doc, ROOM, now).has(n2.id)).toBe(true);
+  });
+
+  it('are every keeper’s, past the eight a pass carries (#338 review)', () => {
+    const now = Date.now();
+    const owner = identity('owner');
+    const doc = roomKeptBy(owner, nodeKey('owner'), now);
+    const nodes: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const c = identity(`co-${i}`);
+      const n = nodeKey(`co-${i}`);
+      nodes.push(n.id);
+      doc.getMap('coHosts').set(c.pub, { pub: c.pub, name: `Co ${i}`, grantedAt: now - 10_000 + i });
+      doc.getMap(CO_HOST_NODES_MAP).set(c.pub, signCoHostNode(ROOM, { irohNodeId: n.id }, now - 1000, c)!);
+    }
+    const keepers = keeperNodesIn(doc, ROOM, now);
+    expect(keepers.size).toBe(11);
+    expect(keepers.has(nodes[9])).toBe(true);
+  });
 });
 
 describe('🤝 a room whose owner’s game is closed', () => {
