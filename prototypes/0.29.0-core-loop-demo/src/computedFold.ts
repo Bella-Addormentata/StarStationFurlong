@@ -629,6 +629,11 @@ export interface RoundView {
    *  bettors whose seed it counts (their slip in its `n`) that this page
    *  doesn't have. Sorted. Absent when no house reveal lists it, or one
    *  decided it. (An abandon may void it meanwhile: the house did reveal.) */ houseWaits?: string[];
+  /** At a house table, the keys of the house records the close's commitment
+   *  rests on besides its decider, each verified and a house's as this fold
+   *  counted it: the step-down that lifted the commitment its parent asked
+   *  for, and the join record whose commitment it names. Lost, the close is
+   *  invalid. Absent when there are none. */ restsOn?: string[];
   /** 0–36 when decided by reveals, a forfeit or the house; null otherwise. */ pocket: number | null;
   /** pid (P) → stake, payout and delta (payout − stake; 0 when void).
    *  While undecided only `stakes` is filled; on a void every payout is 0
@@ -1465,6 +1470,37 @@ export class TableFold {
     return false;
   }
 
+  /** Of round r's step-downs revealing the seed of commitment `h`, the one
+   *  of lowest hash that counts (steppedDown's, its verdict known), or null. */
+  private stepDownOf(r: number, h: string): HouseRevealEntry | null {
+    const at = this.hRevealsAt.get(r);
+    if (!at) return null;
+    for (const e of [...at.values()].sort((a, b) => cmp(a.hash, b.hash))) {
+      if (e.rec.x.length === 0 && e.commit === h && this.houseRecOk(e) === true) return e;
+    }
+    return null;
+  }
+
+  /** The house records valid close c's commitment rests on (RoundView
+   *  restsOn), `req` as commitState had it: the step-down that lifted it, if
+   *  one did; the counted join whose commitment c names, if it names one
+   *  other than `req`. Both, when one house's step-down let another's join
+   *  be named. */
+  private restsOn(c: CloseEntry, req: string | null): string[] {
+    if (!this.house) return [];
+    const { r, h } = c.rec;
+    const keys: string[] = [];
+    if (req !== null && h !== req) {
+      const down = this.stepDownOf(r, req);
+      if (down) keys.push(down.key);
+    }
+    if (h !== undefined && h !== req) {
+      const join = this.joinsOf(r).ok.find((o) => o.rec.c === h);
+      if (join) keys.push(join.key);
+    }
+    return keys;
+  }
+
   /** Round r's house join records that count, in record-hash order, among the
    *  first MAX_CLOSES_PER_ROUND that might (one that fails takes no place):
    *  `pending` when one of those isn't known yet. */
@@ -1652,6 +1688,7 @@ export class TableFold {
     const states = new Map<string, 'valid' | 'pending' | 'invalid'>();
     const infos = new Map<string, CloseInfo>();
     const outcomes = new Map<string, Outcome>();
+    const rests = new Map<string, string[]>();
     const eligible: CloseEntry[][] = [];
     let decidedBefore = new Set<string>();
     for (let i = 0; i < MAX_SESSION_ROUNDS; i++) {
@@ -1673,7 +1710,8 @@ export class TableFold {
       let considered = 0;
       for (const c of cands) {
         if (considered >= MAX_CLOSES_PER_ROUND) break;
-        const named = this.commitState(c, this.requiredAfter(i === 0 ? null : outcomes.get(c.rec.q)!));
+        const req = this.requiredAfter(i === 0 ? null : outcomes.get(c.rec.q)!);
+        const named = this.commitState(c, req);
         if (named === 'invalid') {
           states.set(c.hash, 'invalid');
           continue;
@@ -1686,6 +1724,8 @@ export class TableFold {
         if (state !== 'valid') continue;
         ok.push(c);
         infos.set(c.hash, info);
+        const on = this.restsOn(c, req);
+        if (on.length > 0) rests.set(c.hash, on);
         const d = this.decide(c, info);
         outcomes.set(c.hash, d);
         if (d.decided) decidedHere.add(c.hash);
@@ -1748,6 +1788,7 @@ export class TableFold {
         r: best.rec.r, close: best.hash, closeRec: best.rec, frozen: best.rec.f, ...d,
         pocket: play.pocket, stakes: play.stakes, payouts: play.payouts, deltas: play.deltas,
         ...(play.craps ? { craps: play.craps } : {}),
+        ...(rests.has(best.hash) ? { restsOn: rests.get(best.hash) } : {}),
       };
       rounds.push(view);
       if (!view.decided) { tip = view; break; }

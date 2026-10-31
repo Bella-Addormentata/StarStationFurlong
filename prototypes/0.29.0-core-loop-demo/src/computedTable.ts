@@ -194,7 +194,7 @@ import {
 import type { EndedComputed } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
-  forfeitKey, gameOfInc, houseCommitKey, houseCommitOf, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey,
+  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey,
   recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
 } from './computedFold';
 import type {
@@ -1134,10 +1134,10 @@ export interface ComputedRouletteState extends RouletteTableState {
 /**
  * When the result of decided round D shows on this page: when it saw D
  * decided (the latest first-seen of the records that decided it: the close,
- * each counted slip and seed, the forfeit or abandon), or for a round a
- * forfeit decided, not before the grace on this page's clock and a second
- * more. Kept per close and decision; for D taken out of the session by a
- * trim (`onChain` false), what was kept, or now.
+ * each counted slip and seed, the forfeit, abandon or house reveal), or for
+ * a round a forfeit decided, not before the grace on this page's clock and
+ * a second more. Kept per close and decision; for D taken out of the
+ * session by a trim (`onChain` false), what was kept, or now.
  */
 function showStart(st: TableState, sc: Scan, D: RoundView, onChain: boolean, now: number): number {
   const id = `${D.close}|${D.decided}`;
@@ -1152,6 +1152,7 @@ function showStart(st: TableState, sc: Scan, D: RoundView, onChain: boolean, now
       }
       if (D.forfeit) at = Math.max(at, seen(st, `f:${D.r}:${D.forfeit.hash}`, now));
       if (D.abandon) at = Math.max(at, seen(st, `z:${D.r}:${D.abandon.hash}`, now));
+      if (D.house) at = Math.max(at, seen(st, `h:${D.r}:${D.house.hash}`, now));
     }
     st.decided.set(id, e = { r: D.r, at });
   }
@@ -2881,7 +2882,7 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
     if (k) pubs.add(k);
   }
   const idx = placeOf('abandon', st.ctx, tip.r, pubs, pub);
-  if (now < closeSeen + abandonWait(sc, tip, now) + idx * STAGGER_MS) return;
+  if (now < closeSeen + abandonWait(tip, now) + idx * STAGGER_MS) return;
   const rec = signed(st.ctx, 'abandon', { r: tip.r, x: tip.close, k: pub });
   const key = abandonKey(rec);
   if (key) put(st, key, rec, tip.r, true);
@@ -2889,16 +2890,13 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
 
 /** How long after its close the abandon waits to void tip: ABANDON_MS, or
  *  at a Fair round HOUSE_HEARD_MS while this page hasn't heard the house for
- *  that long (casinoDoc houseOnline) — unless a house reveal listing the
- *  close is in: it waits on a seed it counted, which the room has (one this
+ *  that long (casinoDoc houseOnline) — unless the house's reveal of the
+ *  close is in, as the fold counts it (verified, a house's: RoundView
+ *  houseWaits): it waits on a seed it counted, which the room has (one this
  *  page hasn't heard yet), and voided meanwhile the round would read void,
- *  then decided as the seed came. */
-function abandonWait(sc: Scan, tip: RoundView, now: number): number {
-  if (tip.closeRec.h === undefined || houseOnline(now)) return ABANDON_MS;
-  for (const key of sc.houses.get(tip.r) ?? []) {
-    const x = asHouseReveal(sc.ses?.get(key));
-    if (x && x.x.includes(tip.close)) return ABANDON_MS;
-  }
+ *  then decided as the seed came. A forged one holds nothing. */
+function abandonWait(tip: RoundView, now: number): number {
+  if (tip.closeRec.h === undefined || houseOnline(now) || tip.houseWaits !== undefined) return ABANDON_MS;
   return HOUSE_HEARD_MS;
 }
 
@@ -2988,32 +2986,6 @@ const abandonOf = (v: unknown): string | null => { const z = asAbandon(v); retur
 const houseRevealOf = (v: unknown): string | null => { const x = asHouseReveal(v); return x && houseRevealKey(x); };
 const houseJoinOf = (v: unknown): string | null => { const o = asHouseCommit(v); return o && houseCommitKey(o); };
 
-/** At a house table, the house records a decided round's close rests on
- *  besides its decider: the join record whose commitment it names (lost, the
- *  close names nothing a house wrote, and is invalid), or the step-down that
- *  lifted the commitment its parent asked for (lost, a close naming another
- *  is invalid). The first such key, in key order, of the round; each a list
- *  of none or one. */
-function houseRestsOn(st: TableState, sc: Scan, res: FoldResult, round: RoundView, i: number): string[] {
-  const ses = sc.ses;
-  if (!ses || !res.houseTable) return [];
-  const req = i === 0 ? res.base.h : res.rounds[i - 1].house?.rec.c ?? null;
-  const h = round.closeRec.h;
-  if (req !== null && h !== req) {
-    for (const key of [...(sc.houses.get(round.r) ?? [])].sort()) {
-      const x = asHouseReveal(ses.get(key));
-      if (x && x.x.length === 0 && houseRevealKey(x) === key && houseCommitOf(st.ctx, x.r, x.s) === req) return [key];
-    }
-  }
-  if (h !== undefined && h !== req) {
-    for (const key of [...(sc.joins.get(round.r) ?? [])].sort()) {
-      const o = asHouseCommit(ses.get(key));
-      if (o && o.c === h && houseCommitKey(o) === key) return [key];
-    }
-  }
-  return [];
-}
-
 /**
  * Keep a witness copy of what each round this page's player is frozen in
  * rests on, as the session held it (so only what the fold counted): each
@@ -3025,8 +2997,10 @@ function houseRestsOn(st: TableState, sc: Scan, res: FoldResult, round: RoundVie
  * (showStart), the rest: the close, the seed the fold counts for each
  * revealed bettor (the one revealsSeen finds: under its own key, opening the
  * frozen slip), and the forfeit, abandon or house reveal that decided it; at
- * a house table also the house record its close rests on (houseRestsOn: the
- * join it names, or the step-down that let it name nothing). Its own records
+ * a house table also the house records its close rests on, as the fold
+ * counted them (RoundView restsOn: the join it names, the step-down that
+ * lifted the commitment its parent asked for, or both): verified, a house's,
+ * so a forged copy of one is never what goes back. Its own records
  * among them too: what goes back of those is its own re-put's (witnessDuty
  * skips them), but a round missing one is a round a delete moved all the
  * same (heldBack). Copies only gather: a record the round rested on that a
@@ -3044,7 +3018,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
   if (!res) return;
   let sc: Scan | null = null;
-  for (const [i, round] of res.rounds.entries()) {
+  for (const round of res.rounds) {
     if (!round.present.includes(me)) continue;
     sc ??= scanOf(st, res);
     const ses = sc.ses;
@@ -3066,7 +3040,7 @@ function noteWitness(st: TableState, me: string, now: number): void {
     }
     if (shown) {
       if (!keepCopy(w, ses, `c:${round.r}:${round.close}`, closeOf)) whole = false;
-      for (const key of houseRestsOn(st, sc, res, round, i)) keepCopy(w, ses, key, key[0] === 'h' ? houseRevealOf : houseJoinOf);
+      for (const key of round.restsOn ?? []) if (!keepCopy(w, ses, key, key[0] === 'h' ? houseRevealOf : houseJoinOf)) whole = false;
       for (const pid of round.revealed) {
         const keys = sc.reveals.get(round.r)?.get(pid) ?? [];
         if (keys.some((key) => w!.copies.has(key))) continue;

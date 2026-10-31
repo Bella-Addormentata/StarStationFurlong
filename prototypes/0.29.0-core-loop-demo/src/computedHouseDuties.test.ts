@@ -351,8 +351,9 @@ describe('a Fair round on the pages', () => {
       expect(foldOf(p).required).toBe(kit.houseCommit(H, 2));
       for (const q of pages) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(v.deltas.get(q.pid)));
     }
-    // Round 2: the close names the commitment the reveal carried.
-    const at = closedAt + 20_000;
+    // Round 2 (once the result has shown its 9 s from the reveal): the close
+    // names the commitment the reveal carried.
+    const at = closedAt + 22_000;
     run(pages, closedAt + 12_000 + STEP, at, { step: STEP });
     expect(a.table.writeComputedSlip(TABLE, [red(5)], at)).toBe('ok');
     sync(at, ...pages);
@@ -418,6 +419,19 @@ describe('a Fair round on the pages', () => {
     void b;
   });
 
+  it('unheard, a forged reveal listing the close holds nothing: the void comes at 15 s', async () => {
+    const { pages, a, b, closedAt, closeHash, close } = await closedFairRound();
+    run([a], closedAt + STEP, closedAt + 2_000, { step: STEP });
+    const real = kit.houseReveal(H, 1, [closeHash], frozenOf(close));
+    const rec = { ...real.rec, g: 'A'.repeat(86) };
+    putIn(a, [[`h:1:${recHash(rec)}`, rec]]);
+    const at = run([a], closedAt + 2_000, closedAt + 40_000, { step: STEP, until: () => keysIn(a, 'z', 1).length > 0 });
+    expect(at).toBeGreaterThanOrEqual(closedAt + 15_000);
+    expect(at).toBeLessThanOrEqual(closedAt + 15_000 + a.table.STAGGER_MS + STEP);
+    void pages;
+    void b;
+  });
+
   it('a page that played it puts the house\'s reveal back when a peer deletes it', async () => {
     const { pages, a, b, close, closedAt, closeHash } = await closedFairRound();
     run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });
@@ -431,6 +445,93 @@ describe('a Fair round on the pages', () => {
     run(pages, closedAt + 6_000 + STEP, closedAt + 12_000, { step: STEP, until: () => recOf(b, hr.key) !== undefined });
     expect(recOf(b, hr.key)).toEqual(hr.rec);
     expect(foldOf(b).rounds[0].decided).toBe('house');
+  });
+
+  it('a house reveal that comes long after the seeds shows its result for the whole show, from when it came', async () => {
+    const { pages, b, close, closedAt, closeHash } = await closedFairRound();
+    // Both seeds in within a second or two; the house's reveal 12 s on, past
+    // the 9 s a result shows for.
+    run(pages, closedAt + STEP, closedAt + 12_000, { step: STEP });
+    for (const p of pages) expect(keysIn(p, 'x', 1)).toHaveLength(2);
+    const T = closedAt + 12_000 + STEP;
+    house(b, kit.houseReveal(H, 1, [closeHash], frozenOf(close)));
+    run(pages, T, T, { step: STEP });
+    for (const p of pages) {
+      expect(foldOf(p).rounds[0].decided).toBe('house');
+      expect(p.table.readComputedRoulette(TABLE)).toMatchObject({ phase: 'settled', round: 1 });
+    }
+    run(pages, T + STEP, T + 8_000, { step: STEP });
+    for (const p of pages) expect(p.table.readComputedRoulette(TABLE)).toMatchObject({ phase: 'settled', round: 1 });
+  });
+
+  it('keeps the house records the close rests on as the fold counted them: a forged copy of the join is not what goes back', async () => {
+    const { pages, a, b, join, close, closedAt, closeHash } = await closedFairRound();
+    // A copy of the join with a bad signature, under a key sorting before the real one's.
+    let forged: { key: string; rec: Record<string, unknown> } | null = null;
+    for (let i = 0; !forged; i++) {
+      const rec = { ...join.rec, g: `${'A'.repeat(80)}${String(i).padStart(6, '0')}` };
+      const hash = recHash(rec)!;
+      if (hash < join.hash) forged = { key: `o:1:${hash}`, rec };
+    }
+    putIn(b, [[forged.key, forged.rec]]);
+    run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });
+    house(a, kit.houseReveal(H, 1, [closeHash], frozenOf(close)));
+    run(pages, closedAt + 2_000, closedAt + 6_000, { step: STEP });
+    for (const p of pages) expect(foldOf(p).rounds[0].restsOn).toEqual([join.key]);
+    // A peer deletes both: the real one goes back, the forged one doesn't.
+    b.doc.transact(() => {
+      const ses = b.casino.computedSessionForWrite(TABLE)!;
+      ses.delete(join.key);
+      ses.delete(forged!.key);
+    });
+    run(pages, closedAt + 6_000 + STEP, closedAt + 14_000, { step: STEP, until: () => recOf(b, join.key) !== undefined });
+    run(pages, closedAt + 14_000, closedAt + 16_000, { step: STEP });
+    for (const p of pages) {
+      expect(recOf(p, join.key)).toEqual(join.rec);
+      expect(recOf(p, forged.key)).toBeUndefined();
+      expect(foldOf(p).rounds[0].decided).toBe('house');
+    }
+  });
+
+  it("a round on one house's step-down and another's join keeps both, and either deleted goes back", async () => {
+    const { pages, a, b, close, closedAt, closeHash } = await closedFairRound();
+    // The owner delegates a second node.
+    const body = { v: 1 as const, h: H2.pub, k: a.pub };
+    a.doc.transact(() => top(a).set(delegationKey(H2.pub), { ...body, g: a.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', body)) }));
+    run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });
+    for (const p of pages) expect(p.casino.houseOkOf(H2.pub)).toBe(true);
+    // H decides round 1, carrying its round-2 commitment, then steps down
+    // there; H2 joins round 2.
+    house(a, kit.houseReveal(H, 1, [closeHash], frozenOf(close)));
+    const down = kit.stepDown(H, 2);
+    const join2 = kit.houseJoin(H2, 2);
+    house(a, down, join2);
+    let T = closedAt + 12_000;
+    run(pages, closedAt + 2_000, T, { step: STEP });
+    for (const p of pages) expect(foldOf(p)).toMatchObject({ open: 2, required: null, joins: [{ hash: join2.hash }] });
+    // Round 2: b bets, its close names H2's commitment, and H2 decides it.
+    expect(b.table.writeComputedSlip(TABLE, [red(5)], T)).toBe('ok');
+    T = run(pages, T, T + 30_000, { step: STEP, until: () => keysIn(a, 'c', 2).length > 0 });
+    const [close2] = closesOf(a, 2);
+    expect(close2.h).toBe(join2.rec.c);
+    const close2Hash = hashIn(keysIn(a, 'c', 2)[0]);
+    T = run(pages, T + STEP, T + 12_000, { step: STEP, until: () => keysIn(a, 'x', 2).length > 0 });
+    house(a, kit.houseReveal(H2, 2, [close2Hash], frozenOf(close2)));
+    run(pages, T + STEP, T + 4_000, { step: STEP });
+    T += 4_000;
+    for (const p of pages) {
+      expect(foldOf(p).rounds[1]).toMatchObject({ decided: 'house', restsOn: [down.key, join2.key] });
+    }
+    // b played round 2: a peer deleting either on a's doc gets it back.
+    for (const gone of [join2, down]) {
+      a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(gone.key));
+      expect(foldOf(a).rounds[1]?.decided ?? null).not.toBe('house');
+      T = run(pages, T + STEP, T + 12_000, { step: STEP, until: () => recOf(a, gone.key) !== undefined });
+      for (const p of pages) {
+        expect(recOf(p, gone.key)).toEqual(gone.rec);
+        expect(foldOf(p).rounds[1].decided).toBe('house');
+      }
+    }
   });
 
   it('a deed handover ends the old holder\'s house on every page alike, loaded before it or after, and the new holder\'s delegation of it stands', async () => {

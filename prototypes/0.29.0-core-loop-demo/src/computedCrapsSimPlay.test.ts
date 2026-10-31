@@ -142,7 +142,11 @@ describe("computed craps with the house: the owner's node adds its seed to the r
     expect(s.voids, sim.label).toBeGreaterThanOrEqual(1);
     expect(s.voids, sim.label).toBeLessThanOrEqual(2);
     expect(node.wrote.joins, sim.label).toBeGreaterThanOrEqual(2);
-    expect(node.refusals + node.blockedSeen, sim.label).toBe(0);
+    expect(node.refusals, sim.label).toBe(0);
+    // A close of its first seen after the restart already voided (the roll
+    // it left, while no trim has taken it out of the session yet) is never
+    // revealed: at most the voided ones.
+    expect(node.blockedSeen, sim.label).toBeLessThanOrEqual(s.voids);
     expect(craps.stats.rollsChecked, sim.label).toBeGreaterThanOrEqual(s.rounds);
   }, TIMEOUT);
 });
