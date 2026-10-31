@@ -207,9 +207,30 @@ export function keeperNodesIn(doc: Y.Doc, roomId: string, now = Date.now()): Set
   return new Set(hints.map((h) => h.irohNodeId));
 }
 
+/** This machine's node (its fingerprint's iroh id), as main.ts last read it. */
+let localNode: string | null = null;
+
+/** main.ts, at every fingerprint probe: this machine's node id, or null. */
+export function setLocalKeeperNode(node: string | null): void {
+  localNode = typeof node === 'string' && NODE_RE.test(node) ? node : null;
+}
+
+/** 🤝 Whether a room's state proved built by `node` counts as the room's
+ *  own (YjsSync `keeperNode`): a node its keepers filed as theirs, or this
+ *  machine's own node while the doc it serves lists this player as a keeper.
+ *  The second is the way in for a keeper whose record is missing or older
+ *  than MAX_AGE_MS, reopening a room nobody else keeps online (#338 review):
+ *  their game files the record only once the room's state has arrived, so
+ *  without it they could never file one. A visitor's own node gains nothing:
+ *  the doc must list the player's key as the owner's or a co-host's. */
+export function keeperNodeOk(node: string, doc: Y.Doc, roomId: string, now = Date.now(), me = getIdentityPub()): boolean {
+  if (keeperNodesIn(doc, roomId, now).has(node)) return true;
+  return localNode !== null && node === localNode && me.length > 0 && keepersIn(doc).some((k) => k.pub === me);
+}
+
 /** YjsSync's `keeperNode` for any room session. */
 export const keeperNodeTrust = {
-  keeperNode: (node: string, doc: Y.Doc, roomId: string): boolean => keeperNodesIn(doc, roomId).has(node),
+  keeperNode: (node: string, doc: Y.Doc, roomId: string): boolean => keeperNodeOk(node, doc, roomId),
 };
 
 /** Whether a co-host's stored record should be rewritten with `next`. */
