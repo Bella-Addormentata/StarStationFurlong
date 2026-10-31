@@ -410,7 +410,7 @@ import {
   isCoHost,
   hasCoHostRequest,
 } from "./roomRoles";
-import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust, subscribeCoHostNodes } from "./coHostNodes";
+import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode, keeperNodeTrust, setLocalKeeperNode, subscribeCoHostNodes } from "./coHostNodes";
 import {
   bindVentures,
   subscribeVentures,
@@ -8998,6 +8998,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     return localFingerprint;
   }
   localFingerprint = fingerprint;
+  setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
   refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
@@ -9374,6 +9375,7 @@ function setupNetworkDetailsPanel() {
         return;
       }
       localFingerprint = null;
+      setLocalKeeperNode(null);
       if (feedback) feedback.textContent = "Retrying local node handshake...";
       // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
       // its Y.Doc) before reconnecting, instead of a bare disconnect().
@@ -9690,6 +9692,8 @@ function setupNetworkDetailsPanel() {
 /** The pass syncAccessPass last painted: a different one in the field is the
  *  player's own (GENERATE), which refreshPassHints leaves alone. */
 let lastAutoPass = "";
+/** Moves at every syncAccessPass: only the newest mint paints. */
+let autoPassSeq = 0;
 
 async function syncAccessPass(): Promise<void> {
   const passOutput = document.getElementById(
@@ -9700,10 +9704,14 @@ async function syncAccessPass(): Promise<void> {
   }
 
   const roomId = activeBootstrap?.roomId ?? "";
+  const seq = ++autoPassSeq;
+  const before = passOutput.value;
   const minted = await mintBootstrapLink();
   // 🤝 Moved rooms while minting (#338 review): the next room's join paints
-  // its own pass.
-  if ((activeBootstrap?.roomId ?? "") !== roomId) return;
+  // its own pass. Nor over a newer mint, or a pass GENERATE or the
+  // diagnostics override wrote while this one minted (#338 second review).
+  if ((activeBootstrap?.roomId ?? "") !== roomId || seq !== autoPassSeq) return;
+  if (passOutput.value !== before && passOutput.value !== lastAutoPass) return;
   if (minted.link) {
     passOutput.value = minted.link;
     lastAutoPass = minted.link;

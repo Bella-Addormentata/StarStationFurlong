@@ -9,7 +9,7 @@ import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { CO_HOST_NODES_MAP, keeperNodeTrust, keeperNodesIn, signCoHostNode, type CoHostSigner } from '../coHostNodes';
+import { CO_HOST_NODES_MAP, keeperNodeOk, keeperNodeTrust, keeperNodesIn, setLocalKeeperNode, signCoHostNode, type CoHostSigner } from '../coHostNodes';
 import { NODE_PROOF_SKEW_MS, nodeProofSigner, nodeStateSignBytes } from './nodeProof';
 import { YjsSync } from './YjsSync';
 
@@ -151,6 +151,42 @@ describe('🤝 the nodes that keep a room', () => {
     const keepers = keeperNodesIn(doc, ROOM, now);
     expect(keepers.size).toBe(11);
     expect(keepers.has(nodes[9])).toBe(true);
+  });
+});
+
+describe('🤝 a keeper’s own node, with no record of it yet (#338 second review)', () => {
+  it('counts for the room only while the doc it serves lists this player as a keeper', () => {
+    const now = Date.now();
+    const owner = identity('owner');
+    const coHost = identity('co-host');
+    const visitor = identity('visitor');
+    const mine = nodeKey('mine');
+    const doc = roomKeptBy(owner, nodeKey('owner'), now);
+    doc.getMap('coHosts').set(coHost.pub, { pub: coHost.pub, name: 'Co', grantedAt: now - 5000 });
+    try {
+      // No node known on this machine: nothing.
+      setLocalKeeperNode(null);
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(false);
+      setLocalKeeperNode(mine.id);
+      // The co-host's own node, filed nowhere: it counts for them, so their
+      // game can file the record that lets everyone else count it too.
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(true);
+      expect(keeperNodesIn(doc, ROOM, now).has(mine.id)).toBe(false);
+      // The owner's too, in a room the owner's machine doesn't host.
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(true);
+      // A visitor's own node gains nothing, nor does another node that
+      // claims to be this one's keeper.
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, visitor.pub)).toBe(false);
+      expect(keeperNodeOk(nodeKey('other').id, doc, ROOM, now, coHost.pub)).toBe(false);
+      // A grant the owner took back counts for nothing either.
+      doc.getMap('coHosts').delete(coHost.pub);
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, coHost.pub)).toBe(false);
+      // Not a node id at all: none is kept.
+      setLocalKeeperNode('not-a-node');
+      expect(keeperNodeOk(mine.id, doc, ROOM, now, owner.pub)).toBe(false);
+    } finally {
+      setLocalKeeperNode(null);
+    }
   });
 });
 
