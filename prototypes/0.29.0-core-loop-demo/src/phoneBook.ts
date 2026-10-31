@@ -24,8 +24,9 @@ export const PHONE_BOOK_GREY = 'rgba(224, 226, 238, 0.45)';
 
 /** How the publisher paces itself, in the words the tooltip uses: a changed
  *  address set is written after a ten-minute debounce, and a sent listing is
- *  retried when the chain has not shown it back within thirty minutes
- *  (chia_publish.rs: ADDR_CHANGE_DEBOUNCE_SECS, PRESENCE_CONFIRM_TIMEOUT_SECS). */
+ *  written again when the chain has not shown it back within thirty minutes
+ *  (chia_publish.rs: ADDR_CHANGE_DEBOUNCE_SECS, PRESENCE_CONFIRM_TIMEOUT_SECS).
+ *  Neither is a promise about the chain: they say what the node does next. */
 const DEBOUNCE_MIN = 10;
 const CONFIRM_MIN = 30;
 
@@ -51,7 +52,9 @@ export interface PhoneBookIndicator {
   row: { value: string; colour: string };
 }
 
-/** The row's colour for text that is not a listing: no node, or none published. */
+/** The row's grey. The icon's grey is for a 12 px glyph; as 12 px text on
+ *  the panel's dark background it falls short of the 4.5:1 contrast the row
+ *  needs, so grey rows (outdated, unlisted, none published) use this one. */
 const ROW_GREY = 'rgba(224, 226, 238, 0.6)';
 const ROW_RED = '#ff1744';
 
@@ -75,7 +78,7 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
   const error = trimError(p.error);
   const opens: PhoneBookIndicator['opens'] = /unfunded/i.test(error ?? '') ? 'bank' : 'setnet';
   const shown = (colour: string, filled: boolean, title: string): PhoneBookIndicator =>
-    ({ visible: true, state: p.state, colour, filled, title, opens, row: { value: title, colour } });
+    ({ visible: true, state: p.state, colour, filled, title, opens, row: { value: title, colour: colour === PHONE_BOOK_GREY ? ROW_GREY : colour } });
   switch (p.state) {
     case 'listed':
       // A listing back in force (the addresses changed and changed back) can
@@ -83,7 +86,15 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
       // write succeeds, and it is the reason a tap goes to the Bank app.
       return shown(PHONE_BOOK_GREEN, true, listedTitle(p) + (error ? ` · ${error}` : ''));
     case 'sent':
-      return shown(PHONE_BOOK_GREEN, false, `Listing sent to the Phone Book, awaiting confirmation (up to ${CONFIRM_MIN} min)` + (error ? ` · ${error}` : ''));
+      // What the node does if the chain stays silent, not how long the chain
+      // takes: a zero-fee spend can wait longer, and a node with the watcher
+      // off says so in its own words instead.
+      return shown(
+        PHONE_BOOK_GREEN,
+        false,
+        'Listing sent to the Phone Book, awaiting confirmation from the chain'
+          + (error ? ` · ${error}` : ` (the node writes it again if none comes within ${CONFIRM_MIN} min)`),
+      );
     case 'outdated':
       return shown(PHONE_BOOK_GREY, true, `Phone Book listing outdated: ${outdatedReason(p, error)}`);
     case 'unlisted':

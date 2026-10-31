@@ -24,8 +24,10 @@ describe('phoneBookIndicator', () => {
     // The row carries the icon's own words and colour whenever there is an icon.
     const listedInd = phoneBookIndicator(withPresence({}));
     expect(listedInd.row).toEqual({ value: listedInd.title, colour: PHONE_BOOK_GREEN });
+    // A grey row reads in a text grey, not the glyph's: 12 px text needs more contrast than a 12 px book.
     const stale = phoneBookIndicator(withPresence({ state: 'outdated', current: false }));
-    expect(stale.row).toEqual({ value: stale.title, colour: PHONE_BOOK_GREY });
+    expect(stale.row).toEqual({ value: stale.title, colour: 'rgba(224, 226, 238, 0.6)' });
+    expect(stale.colour).toBe(PHONE_BOOK_GREY);
   });
 
   it('is a solid green book while this edition lists the current addresses', () => {
@@ -44,13 +46,15 @@ describe('phoneBookIndicator', () => {
   it('is a green outline while the listing is sent and not yet read back', () => {
     const ind = phoneBookIndicator(withPresence({ state: 'sent', confirmed: false }));
     expect(ind).toMatchObject({ visible: true, state: 'sent', colour: PHONE_BOOK_GREEN, filled: false, opens: 'setnet' });
-    expect(ind.title).toBe('Listing sent to the Phone Book, awaiting confirmation (up to 30 min)');
+    // The parenthesis is the node's next step, not a deadline for the chain.
+    expect(ind.title).toBe('Listing sent to the Phone Book, awaiting confirmation from the chain (the node writes it again if none comes within 30 min)');
     expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: 'peers refused the spend' })).title)
-      .toBe('Listing sent to the Phone Book, awaiting confirmation (up to 30 min) · peers refused the spend');
-    // A node with the chain watcher off never gets past sent; the node says so.
+      .toBe('Listing sent to the Phone Book, awaiting confirmation from the chain · peers refused the spend');
+    // A node with the chain watcher off never gets past sent and never writes again
+    // for confirmation's sake; its own words replace the retry note.
     const watcherOff = 'the chain watcher is off (SSF_CHIA_WATCH=0), so the listing is never read back';
     expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: watcherOff })).title)
-      .toBe(`Listing sent to the Phone Book, awaiting confirmation (up to 30 min) · ${watcherOff}`);
+      .toBe(`Listing sent to the Phone Book, awaiting confirmation from the chain · ${watcherOff}`);
   });
 
   it('is a solid grey book once a listing of ours has gone stale, and says why', () => {
