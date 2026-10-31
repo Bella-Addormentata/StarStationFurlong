@@ -335,7 +335,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     }
     picker.innerHTML = roll.length === 0
       ? `<span style="font-size:9.5px; color:${DIM};">Your film roll is empty. Open 📷 CAMERA on your SpacePhone to take a shot.</span>`
-      : roll.map((shot) => `<button data-act="pick-shot" data-shot="${escapeHtml(shot.id)}" title="${escapeHtml(shot.caption || shotLabel(shot))}" aria-label="Pin ${escapeHtml(shot.caption || shotLabel(shot))}" style="
+      : roll.map((shot) => `<button data-act="pick-shot" data-shot="${escapeHtml(shot.id)}" data-id="${escapeHtml(shot.id)}" title="${escapeHtml(shot.caption || shotLabel(shot))}" aria-label="Pin ${escapeHtml(shot.caption || shotLabel(shot))}" style="
           padding:0; border:2px solid ${chosen?.id === shot.id ? GOLD_BRIGHT : '#FBFAF6'}; border-radius:2px; background:#FBFAF6; cursor:pointer;">
           <img src="${escapeHtml(thumbOf(shot))}" alt="" style="display:block; width:52px; height:52px; object-fit:cover;"></button>`).join('');
   };
@@ -414,7 +414,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
         // the same id carries the same signed photo, but the hash is checked
         // anyway (the theatre's FETCH rule).
         const n = readBoard(itemId, kind).shown.find((x) => x.id === btn.dataset.id);
-        if (n?.attach && n.attach.hash === btn.dataset.hash) pressFetch(n.attach);
+        if (n?.attach && n.attach.hash === btn.dataset.hash) void pressFetch(n.attach);
         break;
       }
       case 'auto':

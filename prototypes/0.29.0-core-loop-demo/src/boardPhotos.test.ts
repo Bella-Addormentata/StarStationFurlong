@@ -17,11 +17,16 @@ const lane = vi.hoisted(() => ({
   imports: [] as File[],
   importAnswer: null as { hash: string; size: number } | { error: string } | null,
   rechecks: [] as string[],
+  room: 'room-1',
+  whereAsks: [] as string[][],
+  /** WHERE's answer: true fills the asked files' holders at once. */
+  whereAnswers: true,
 }));
 
 vi.mock('./blobLane', () => ({
   blobLaneReady: () => lane.ready,
   blobLaneNodeId: () => (lane.ready ? lane.nodeId : null),
+  blobLaneRoom: () => lane.room,
   blobState: (hash: string) => lane.states.get(hash) ?? { state: 'unknown' },
   blobUrl: (hash: string) => (lane.ready ? `http://node.test/blob/${hash}` : null),
   fetchBlob: async (hash: string, size: number, provider: string, mime: string) => {
@@ -31,7 +36,8 @@ vi.mock('./blobLane', () => ({
   },
   freshNodeHolders: (hash: string) => lane.holders.get(hash) ?? null,
   refreshHolders: async (hashes: string[]) => {
-    for (const h of hashes) lane.holders.set(h, []);
+    lane.whereAsks.push([...hashes]);
+    if (lane.whereAnswers) for (const h of hashes) lane.holders.set(h, []);
   },
   importBlob: async (file: File) => {
     lane.imports.push(file);
@@ -55,6 +61,7 @@ import {
   photoPicture,
   photoTrouble,
   pressFetch,
+  readAtMost,
   resetBoardPhotosForTest,
   type Picture,
   type PictureMaker,
@@ -130,6 +137,9 @@ beforeEach(() => {
   lane.imports.length = 0;
   lane.importAnswer = null;
   lane.rechecks.length = 0;
+  lane.room = 'room-1';
+  lane.whereAsks.length = 0;
+  lane.whereAnswers = true;
   try { localStorage.clear(); } catch { /* none in this runner */ }
   resetBoardPhotosForTest(fakeMaker());
   vi.unstubAllGlobals();
@@ -205,8 +215,7 @@ describe('📷 where a photo is for this viewer', () => {
     expect(photoLook(photo())).toBe('unreachable');
     expect(photoTrouble(photo())).toBe('not connected to anyone who has it');
     lane.refuse = null;
-    pressFetch(photo());
-    await flush();
+    await pressFetch(photo());
     expect(lane.fetches).toHaveLength(2);
     expect(photoLook(photo())).toBe('loading');
   });
@@ -230,7 +239,7 @@ describe('📷 where a photo is for this viewer', () => {
 
   it('won’t draw bytes that aren’t the photo the note names', async () => {
     const bytes = jpegHeader(512, 384, 200);
-    lane.states.set(HASH, { state: 'complete' });
+    lane.states.set(HASH, { state: 'complete', have: bytes.length + 5, size: bytes.length + 5 });
     vi.stubGlobal('fetch', async () => new Response(bytes));
     const p = photo({ size: bytes.length + 5 });
     photoLook(p, 0);
@@ -240,6 +249,94 @@ describe('📷 where a photo is for this viewer', () => {
     expect(lane.rechecks).toContain(HASH);
     // Said, and not read again before the retry is due.
     expect(photoLook(p, 1)).toBe('unreachable');
+  });
+
+  it('never reads past the size a note names, nor a file of another size (#340 review)', async () => {
+    // A stream that would go on: the read stops at the first chunk past the limit.
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(c) {
+        pulled++;
+        c.enqueue(new Uint8Array(64 * 1024));
+      },
+    });
+    expect(await readAtMost(new Response(endless), 100_000)).toBeNull();
+    expect(pulled).toBeLessThan(5);
+    expect(await readAtMost(new Response('x'.repeat(10), { headers: { 'content-length': '10' } }), 9)).toBeNull();
+    expect((await readAtMost(new Response(new Uint8Array(9)), 9))?.length).toBe(9);
+    // The node's file under the photo's name is a film: not read at all.
+    const asked: string[] = [];
+    vi.stubGlobal('fetch', async (url: string) => {
+      asked.push(url);
+      return new Response(new Uint8Array(10));
+    });
+    lane.states.set(HASH, { state: 'complete', have: 2 ** 30, size: 2 ** 30 });
+    expect(photoLook(photo())).toBe('unreachable');
+    expect(photoTrouble(photo())).toMatch(/different file/);
+    await flush();
+    expect(asked).toHaveLength(0);
+  });
+
+  it('asks WHERE once for every photo waiting, and waits for it before an ask by itself (#340 review)', async () => {
+    const other = 'd'.repeat(64);
+    lane.states.set(HASH, { state: 'none' });
+    lane.states.set(other, { state: 'none' });
+    lane.whereAnswers = false; // the node is slow to answer
+    expect(photoLook(photo(), 0)).toBe('loading');
+    expect(photoLook(photo({ hash: other }), 0)).toBe('loading');
+    expect(lane.whereAsks.at(-1)).toEqual([HASH, other]);
+    // Still no answer after the old 3 s: no ask yet.
+    expect(photoLook(photo(), 5_000)).toBe('loading');
+    expect(lane.fetches).toHaveLength(0);
+    // Its answer arrives: the ask goes, naming the room's holders.
+    lane.holders.set(HASH, ['e'.repeat(64)]);
+    expect(photoLook(photo(), 6_000)).toBe('loading');
+    expect(lane.fetches.map((f) => f.hash)).toEqual([HASH]);
+    // A node that never answers WHERE: the provider alone, past the wait.
+    expect(photoLook(photo({ hash: other }), 10_001)).toBe('loading');
+    expect(lane.fetches.map((f) => f.hash)).toEqual([HASH, other]);
+  });
+
+  it('asks WHERE before a pressed FETCH, so the host’s copy is found (#340 review)', async () => {
+    lane.states.set(HASH, { state: 'none' });
+    photoAutoFetch.setOn(false);
+    expect(photoLook(photo())).toBe('fetch');
+    expect(lane.whereAsks).toHaveLength(0);
+    const pressed = pressFetch(photo());
+    expect(photoLook(photo())).toBe('loading');
+    await pressed;
+    expect(lane.whereAsks[0]).toContain(HASH);
+    expect(lane.fetches).toHaveLength(1);
+  });
+
+  it('keeps every photo in view without reading them again and again (#340 review)', async () => {
+    const reads: string[] = [];
+    vi.stubGlobal('fetch', async (url: string) => {
+      reads.push(url);
+      return new Response(jpegHeader(512, 384, 100));
+    });
+    const size = jpegHeader(512, 384, 100).length;
+    const many = Array.from({ length: 100 }, (_, i) => photo({ hash: i.toString(16).padStart(64, '0'), size }));
+    for (const p of many) lane.states.set(p.hash, { state: 'complete', have: size, size });
+    const round = async (now: number) => {
+      const looks = many.map((p) => photoLook(p, now));
+      for (let i = 0; i < 4; i++) await flush();
+      return looks;
+    };
+    await round(0);
+    expect(reads).toHaveLength(96); // the most a page holds; the rest wait
+    for (let t = 1_000; t <= 5_000; t += 1_000) await round(t);
+    expect(reads).toHaveLength(96); // every second's look reads nothing again
+    expect((await round(6_000)).filter((l) => l === 'ready')).toHaveLength(96);
+    // Out of view a while: dropped for those waiting.
+    const inView = many.slice(0, 40);
+    for (let t = 7_000; t <= 20_000; t += 1_000) {
+      inView.forEach((p) => photoLook(p, t));
+      many.slice(96).forEach((p) => photoLook(p, t));
+      for (let i = 0; i < 4; i++) await flush();
+    }
+    expect(reads).toHaveLength(100);
+    expect(inView.every((p) => photoLook(p, 21_000) === 'ready')).toBe(true);
   });
 
   it('adds each photo’s look to a board’s face', () => {
@@ -285,5 +382,17 @@ describe('📷 pinning a shot from the film roll', () => {
     expect(await photoFromShot(shot(new Uint8Array(40)))).toEqual({ error: 'That shot can’t be read.' });
     lane.importAnswer = { error: 'Your node: full.' };
     expect(await photoFromShot(shot(bytes))).toEqual({ error: 'Your node: full.' });
+  });
+
+  it('sends nothing to the node after a room change while the shot was read (#340 review)', async () => {
+    const bytes = jpegHeader(512, 384, 300);
+    lane.importAnswer = { hash: HASH, size: bytes.length };
+    const s = shot(bytes);
+    s.jpeg.arrayBuffer = async () => {
+      lane.room = 'room-2';
+      return bytes.buffer;
+    };
+    expect(await photoFromShot(s)).toEqual({ error: expect.stringContaining('changed rooms') });
+    expect(lane.imports).toHaveLength(0);
   });
 });

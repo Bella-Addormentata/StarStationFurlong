@@ -29,6 +29,7 @@
 import {
   blobLaneNodeId,
   blobLaneReady,
+  blobLaneRoom,
   blobState,
   blobUrl,
   fetchBlob,
@@ -64,14 +65,25 @@ export const MAX_PHOTO_PIXELS = 4_000_000;
 /** Asks out to the node at once by themselves (it runs two transfers and
  *  queues the rest). */
 const MAX_ASKING = 4;
-/** How long an ask by itself waits for WHERE to say which of the room's
- *  nodes hold the photo (the ask names them beside its provider). */
-const WHERE_WAIT_MS = 3_000;
+/** How long an ask waits for WHERE to say which of the room's nodes hold
+ *  the photo (the ask names them beside its provider, so the host's copy is
+ *  found once the poster has left). The node gives WHERE 4 s, and the asks
+ *  for every photo waiting go together, so this leaves room for a second
+ *  batch; past it the ask goes to the provider alone (a node without WHERE). */
+const WHERE_WAIT_MS = 10_000;
 /** A picture that could not be read is tried again after this long. */
 const LOAD_RETRY_MS = 15_000;
-/** Decoded pictures kept in this page, the ones drawn longest ago go first:
- *  four boards of 24 notes would be 96. */
+/** Decoded pictures kept in this page when some are no longer looked at:
+ *  the ones looked at longest ago go first. */
 const KEPT_PICTURES = 48;
+/** Pictures looked at within this long are on a board in front of the
+ *  player (the faces are looked at every second), and are never dropped
+ *  for another: dropping one only to read it again next second would read
+ *  and decode photos without end (#340 review). */
+const IN_USE_MS = 10_000;
+/** The most pictures a page holds, all in use: four boards of 24 notes.
+ *  Past it a photo stays LOADING until one goes out of view. */
+const MOST_PICTURES = 96;
 
 export interface Picture {
   /** An object URL of the bytes, for the panel's <img>. */
@@ -106,8 +118,10 @@ const browserMaker: PictureMaker = {
 };
 
 let maker: PictureMaker = browserMaker;
-/** hash → picture, the most recently used last. */
-const pictures = new Map<string, Picture>();
+/** hash → picture and when it was last looked at, the longest ago first. */
+const pictures = new Map<string, { pic: Picture; usedAt: number }>();
+/** The photos whose FETCH press waits for WHERE before it asks. */
+const pressing = new Set<string>();
 const loading = new Set<string>();
 /** hash → when a read last failed (performance.now ms). */
 const loadFailed = new Map<string, number>();
@@ -171,26 +185,65 @@ export function photoBytesOk(bytes: Uint8Array, photo: Pick<BoardPhoto, 'size'>)
 
 // ── The pictures this page keeps ────────────────────────────────────────────
 
-function keep(hash: string, p: Picture): void {
-  const old = pictures.get(hash);
-  if (old && old !== p) maker.drop(old);
-  pictures.delete(hash);
-  pictures.set(hash, p);
-  while (pictures.size > KEPT_PICTURES) {
-    const [first, pic] = pictures.entries().next().value as [string, Picture];
-    pictures.delete(first);
-    maker.drop(pic);
+/** Drop pictures nobody has looked at lately, the longest ago first, down
+ *  to KEPT_PICTURES. Those in use stay, however many. */
+function dropIdle(now: number): void {
+  for (const [hash, e] of pictures) {
+    if (pictures.size <= KEPT_PICTURES || now - e.usedAt < IN_USE_MS) break; // the rest were looked at later
+    pictures.delete(hash);
+    maker.drop(e.pic);
   }
+}
+
+function keep(hash: string, p: Picture, now: number): void {
+  const old = pictures.get(hash);
+  if (old && old.pic !== p) maker.drop(old.pic);
+  pictures.delete(hash);
+  pictures.set(hash, { pic: p, usedAt: now });
+  dropIdle(now);
+}
+
+/** A look at a held picture: kept, as in use. */
+function touch(hash: string, now: number): boolean {
+  const e = pictures.get(hash);
+  if (!e) return false;
+  e.usedAt = Math.max(e.usedAt, now);
+  pictures.delete(hash);
+  pictures.set(hash, e);
+  return true;
 }
 
 /** The decoded picture for `hash`, when this page holds it (a use: it is
  *  kept longer). */
-export function photoPicture(hash: string): Picture | null {
-  const p = pictures.get(hash);
-  if (!p) return null;
-  pictures.delete(hash);
-  pictures.set(hash, p);
-  return p;
+export function photoPicture(hash: string, now = performance.now()): Picture | null {
+  return touch(hash, now) ? pictures.get(hash)!.pic : null;
+}
+
+/** At most `limit` bytes of a response, or null when it holds more: the
+ *  read stops at the first chunk past the limit, so a note naming some big
+ *  file this node holds under a photo's small size costs no more than the
+ *  limit (#340 review). */
+export async function readAtMost(res: Response, limit: number): Promise<Uint8Array<ArrayBuffer> | null> {
+  const declared = Number(res.headers.get('content-length') ?? '');
+  if (Number.isFinite(declared) && declared > limit) {
+    void res.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return null;
+  const out = new Uint8Array(limit);
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (n + value.length > limit) {
+      void reader.cancel().catch(() => undefined);
+      return null;
+    }
+    out.set(value, n);
+    n += value.length;
+  }
+  return out.slice(0, n);
 }
 
 /** Read a whole photo from this page's node and decode it, once at a time
@@ -199,6 +252,9 @@ export function photoPicture(hash: string): Picture | null {
 function loadPicture(photo: BoardPhoto, now: number): void {
   const { hash } = photo;
   if (loading.has(hash) || pictures.has(hash) || now - (loadFailed.get(hash) ?? -Infinity) < LOAD_RETRY_MS) return;
+  // Room for it first: none while every picture held is in use.
+  dropIdle(now);
+  if (pictures.size + loading.size >= MOST_PICTURES) return;
   const url = blobUrl(hash);
   if (!url) return;
   loading.add(hash);
@@ -206,9 +262,9 @@ function loadPicture(photo: BoardPhoto, now: number): void {
     try {
       const res = await fetch(url, { redirect: 'error' });
       if (!res.ok) throw new Error(`node answered ${res.status}`);
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      if (!photoBytesOk(bytes, photo)) throw new Error('not a photo this board shows');
-      keep(hash, await maker.make(new Blob([bytes], { type: photo.mime }), photo.mime));
+      const bytes = await readAtMost(res, Math.min(photo.size, MAX_PHOTO_BYTES));
+      if (!bytes || !photoBytesOk(bytes, photo)) throw new Error('not a photo this board shows');
+      keep(hash, await maker.make(new Blob([bytes], { type: photo.mime }), photo.mime), now);
       loadFailed.delete(hash);
     } catch {
       loadFailed.set(hash, now);
@@ -232,9 +288,11 @@ function askByItself(photo: BoardPhoto, now: number): boolean {
   if (verdict !== 'go') return false;
   if (inFlight.size >= MAX_ASKING) return true;
   if (freshNodeHolders(photo.hash, now) === null) {
-    void refreshHolders([photo.hash], now);
     const since = whereSince.get(photo.hash) ?? now;
     whereSince.set(photo.hash, since);
+    // One WHERE for every photo waiting: the node answers one at a time,
+    // and one asked alone would leave the others to their fallback.
+    void refreshHolders([...whereSince.keys()], now);
     if (now - since < WHERE_WAIT_MS) return true;
   }
   whereSince.delete(photo.hash);
@@ -261,17 +319,24 @@ function ask(photo: BoardPhoto): void {
  *  when the budget allows, and a read once the node holds it. Called by the
  *  board's 1 Hz face push and by its open panel. */
 export function photoLook(photo: BoardPhoto, now = performance.now()): PhotoLook {
-  if (pictures.has(photo.hash)) return 'ready';
+  if (touch(photo.hash, now)) return 'ready';
   if (!blobLaneReady()) return 'no-node';
   const st = blobState(photo.hash, now);
   switch (st.state) {
     case 'complete':
+      // The node's file under this name isn't the size the note says: not
+      // this photo, and not read.
+      if (st.size !== photo.size) {
+        refusedWhy.set(photo.hash, 'your node holds a different file under this photo’s name');
+        return 'unreachable';
+      }
       loadPicture(photo, now);
       // A read that failed waits for its retry, and says so meanwhile.
       return loadFailed.has(photo.hash) && !loading.has(photo.hash) ? 'unreachable' : 'loading';
     case 'failed':
       return 'unreachable';
     case 'none':
+      if (pressing.has(photo.hash) || inFlight.has(photo.hash)) return 'loading';
       if (refusedWhy.has(photo.hash)) return 'unreachable';
       return askByItself(photo, now) ? 'loading' : 'fetch';
     default:
@@ -287,11 +352,33 @@ export function photoTrouble(photo: BoardPhoto, now = performance.now()): string
 }
 
 /** The panel's FETCH: this press is the consent, for this photo at this size
- *  from this provider. Asks no more by itself for it from this page. */
-export function pressFetch(photo: BoardPhoto): void {
+ *  from this provider. Asks no more by itself for it from this page. WHERE
+ *  first, as for an ask by itself, so the ask names the room's nodes that
+ *  hold it (the host's copy, once the poster has left), not the poster
+ *  alone (#340 review). */
+export async function pressFetch(photo: BoardPhoto): Promise<void> {
   photoAutoFetch.notePressed(photo.hash);
   loadFailed.delete(photo.hash);
+  refusedWhy.delete(photo.hash);
+  if (pressing.has(photo.hash) || inFlight.has(photo.hash)) return;
+  pressing.add(photo.hash);
+  try {
+    await holdersFor(photo.hash);
+  } finally {
+    pressing.delete(photo.hash);
+  }
   ask(photo);
+}
+
+/** Wait, up to WHERE_WAIT_MS, for a fresh WHERE on `hash`: asked with the
+ *  others waiting, and again while another ask is out. */
+async function holdersFor(hash: string): Promise<void> {
+  const until = performance.now() + WHERE_WAIT_MS;
+  while (freshNodeHolders(hash) === null && performance.now() < until) {
+    await refreshHolders([hash, ...whereSince.keys()]);
+    if (freshNodeHolders(hash) !== null) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
 }
 
 /** A board's face with each photo's look added, moving each photo along. */
@@ -308,8 +395,12 @@ export function lookBoardPhotos(screen: BoardScreen, now = performance.now()): B
 export async function photoFromShot(shot: FilmShot): Promise<{ photo: BoardPhoto } | { error: string }> {
   if (!blobLaneReady()) return { error: 'Pinning a photo needs this station’s node (the desktop app) running here.' };
   if (shot.jpeg.size === 0 || shot.jpeg.size > MAX_PHOTO_BYTES) return { error: 'That shot is too big to pin.' };
+  // The node shares an import with the room it is sent for: one sent after
+  // a room change would go to the next room's members (#340 review).
+  const room = blobLaneRoom();
   const bytes = new Uint8Array(await shot.jpeg.arrayBuffer());
   if (!photoBytesOk(bytes, { size: bytes.length })) return { error: 'That shot can’t be read.' };
+  if (blobLaneRoom() !== room) return { error: 'You changed rooms while the photo was read. Pin it again here.' };
   const file = new File([bytes], `ssf-shot-${shot.id}.jpg`, { type: 'image/jpeg' });
   const got = await importBlob(file);
   if ('error' in got) return got;
@@ -328,7 +419,7 @@ export async function photoFromShot(shot: FilmShot): Promise<{ photo: BoardPhoto
   if (!photo) return { error: 'That shot can’t be pinned.' };
   if (!pictures.has(photo.hash)) {
     try {
-      keep(photo.hash, await maker.make(new Blob([bytes], { type: 'image/jpeg' }), 'image/jpeg'));
+      keep(photo.hash, await maker.make(new Blob([bytes], { type: 'image/jpeg' }), 'image/jpeg'), performance.now());
     } catch { /* read back from the node like anyone's */ }
   }
   return { photo };
@@ -336,8 +427,9 @@ export async function photoFromShot(shot: FilmShot): Promise<{ photo: BoardPhoto
 
 /** Tests: a fresh page, decoding with `m` (the browser's <img> by default). */
 export function resetBoardPhotosForTest(m: PictureMaker | null = null): void {
-  for (const p of pictures.values()) maker.drop(p);
+  for (const e of pictures.values()) maker.drop(e.pic);
   pictures.clear();
+  pressing.clear();
   loading.clear();
   loadFailed.clear();
   refusedWhy.clear();
