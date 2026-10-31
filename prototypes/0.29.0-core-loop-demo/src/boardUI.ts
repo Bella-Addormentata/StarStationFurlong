@@ -13,6 +13,12 @@
  *    in this panel until it closes. There is no count anywhere (Dorkmo
  *    2026-10-31).
  *
+ * 📷 A note can carry a photo from the player's CAMERA film roll (#315 PR 5,
+ * boardPhotos.ts): ADD A PHOTO picks a shot, PIN IT puts it on their node and
+ * pins the note naming it. A photo shows here once this viewer's node holds
+ * it; photos under a small cap come by themselves (the switch at the foot),
+ * and FETCH asks for one that doesn't.
+ *
  * Who wrote a note: a saved contact's name with ✔ (the player's own record of
  * that key), else the name the author signed with and their key's
  * fingerprint, so two people can't pass for each other by name alone.
@@ -46,10 +52,23 @@ import {
   unseenIds,
   type BoardColour,
   type BoardKind,
+  type BoardPhoto,
   type ShownNote,
 } from './boardDoc';
 import { NOTE_FILL } from './boardFace';
+import {
+  PHOTO_AUTO_FETCH_DAY,
+  PHOTO_AUTO_FETCH_MAX,
+  photoAutoFetch,
+  photoFromShot,
+  photoLook,
+  photoPicture,
+  photoTrouble,
+  pressFetch,
+} from './boardPhotos';
+import { formatBytes } from './blobLane';
 import { getContact } from './contacts';
+import { listShots, shotLabel, type FilmShot } from './filmRoll';
 import { escapeHtml } from './htmlEscape';
 import { fingerprintOf, getIdentityPub } from './keypair';
 
@@ -65,6 +84,8 @@ const DIM = '#6A7580';
 const CLEAR_CONFIRM_MS = 4_000;
 /** How often an open panel refreshes its "5 min ago" stamps. */
 const AGE_REFRESH_S = 30;
+/** How often an open panel looks whether a photo moved along. */
+const PHOTO_REFRESH_S = 1;
 
 /** "just now", "5 min ago", "3 h ago", "2 d ago", else the date. */
 export function noteAge(ts: number, now: number): string {
@@ -85,6 +106,50 @@ function authorLabel(n: ShownNote, me: string): string {
   const contact = getContact(n.author);
   if (contact) return `${escapeHtml(contact.name)} ✔`;
   return `${escapeHtml(n.authorName)} · ${escapeHtml(fingerprintOf(n.author))}`;
+}
+
+/** Why a photo waits for FETCH rather than coming by itself. */
+function waitsWhy(size: number, hash: string): string {
+  switch (photoAutoFetch.verdict(hash, size)) {
+    case 'off': return 'Photos don’t come by themselves while that’s off below.';
+    case 'big': return `It’s bigger than the ${formatBytes(PHOTO_AUTO_FETCH_MAX)} a photo takes by itself.`;
+    case 'day': return `Today’s ${formatBytes(PHOTO_AUTO_FETCH_DAY)} for photos is used up.`;
+    default: return '';
+  }
+}
+
+/** A note's photo in the panel: the picture (bigger at a press), or where it
+ *  is and the FETCH press, then its caption and who took it when. */
+function photoHtml(n: ShownNote, me: string, big: boolean): string {
+  const a = n.attach!;
+  const look = photoLook(a);
+  const pic = look === 'ready' ? photoPicture(a.hash) : null;
+  const when = new Date(a.takenAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const caption = `<div style="font-size:9.5px; color:${DIM}; margin-top:4px;">📷 ${a.caption ? `${escapeHtml(a.caption)} · ` : ''}taken ${escapeHtml(when)} by ${authorLabel(n, me)}</div>`;
+  if (pic) {
+    return `<button data-act="zoom" data-id="${escapeHtml(n.id)}" aria-label="${big ? 'Show the photo small' : 'Show the photo big'}" style="
+        display:block; padding:0; margin-top:6px; border:0; background:none; cursor:${big ? 'zoom-out' : 'zoom-in'};">
+        <img src="${escapeHtml(pic.url)}" alt="${escapeHtml(a.caption || 'A photo')}" style="
+          display:block; width:${big ? '100%' : '132px'}; max-width:100%; box-sizing:border-box; background:#FBFAF6;
+          border:4px solid #FBFAF6; border-bottom-width:14px; border-radius:2px; box-shadow:0 3px 10px rgba(0,0,0,0.6);">
+      </button>${caption}`;
+  }
+  const size = formatBytes(a.size);
+  const fetchBtn = `<button data-act="fetch" data-id="${escapeHtml(n.id)}" data-hash="${escapeHtml(a.hash)}" style="
+      margin-top:6px; padding:4px 9px; background:rgba(47,230,160,0.1); border:1px solid #2fe6a0; border-radius:6px;
+      color:#2fe6a0; font-family:inherit; font-size:9.5px; font-weight:800; letter-spacing:0.5px; cursor:pointer;">📦 FETCH ${escapeHtml(size)}</button>`;
+  const trouble = photoTrouble(a);
+  const says = look === 'loading'
+    ? 'Photo loading…'
+    : look === 'no-node'
+      ? 'Photos come from the sharer’s node to yours: they need this station’s node (the desktop app) running here.'
+      : look === 'unreachable'
+        ? `The sharer’s node isn’t reachable from here${trouble ? ` (${escapeHtml(trouble)})` : ''}. It comes once a node that has it is in the room.`
+        : `${escapeHtml(waitsWhy(a.size, a.hash))} Your node takes it from the sharer’s node or another in this room that has it.`;
+  const press = look === 'fetch' || look === 'unreachable' ? fetchBtn : '';
+  return `<div style="margin-top:6px; padding:8px; border:1px dashed rgba(212,168,75,0.3); border-radius:6px; font-size:9.5px; line-height:1.45; color:${DIM};">
+      ${says}${press ? `<div>${press}</div>` : ''}
+    </div>${caption}`;
 }
 
 const smallBtn = (act: string, label: string, extra = '', tone = GOLD): string => `<button data-act="${act}" ${extra} style="
@@ -128,6 +193,28 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   let colour: BoardColour = open ? 'yellow' : 'white';
   let clearArmedUntil = 0;
   let status = '';
+  /** 📷 The note whose photo shows big, if any. */
+  let zoomed: string | null = null;
+  /** The film-roll shot the next note carries, and the roll while the
+   *  picker is open. Their thumbnails' object URLs go when the panel does. */
+  let chosen: FilmShot | null = null;
+  let roll: FilmShot[] | null = null;
+  const thumbUrls = new Map<string, string>();
+  const thumbOf = (shot: FilmShot): string => {
+    let url = thumbUrls.get(shot.id);
+    if (!url) {
+      url = URL.createObjectURL(shot.jpeg);
+      thumbUrls.set(shot.id, url);
+    }
+    return url;
+  };
+  /** A post is on its way (its photo going to the player's node). */
+  let posting = false;
+  let photoSince = 0;
+  let photoKey = '';
+  /** Every photo note's look now, which moves them along too. */
+  const photoLooks = (): string =>
+    readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author)).map((n) => `${n.id}:${photoLook(n.attach!)}`).join(',');
 
   const notesHtml = (): string => {
     const me = getIdentityPub();
@@ -144,9 +231,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     return notes.map((n) => {
       const isNew = n.author !== me && fresh.has(n.id);
       const mine = n.author === me;
-      const photo = n.attach
-        ? `<div style="font-size:9.5px; color:${DIM}; margin-top:4px;">📷 Photo${n.attach.caption ? ` · ${escapeHtml(n.attach.caption)}` : ''} <span style="opacity:0.7;">(shows with the camera app)</span></div>`
-        : '';
+      const photo = n.attach ? photoHtml(n, me, zoomed === n.id) : '';
       const buttons = [
         mine ? smallBtn('down', 'TAKE DOWN', `data-id="${escapeHtml(n.id)}"`) : '',
         !mine && moderator ? smallBtn('down', 'UNPIN', `data-id="${escapeHtml(n.id)}"`, '#FF6B6B') : '',
@@ -156,7 +241,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
           border-left:4px solid ${NOTE_FILL[n.colour]}; background:rgba(255,255,255,0.03);
           border-radius:6px; padding:8px 10px;
           ${isNew ? 'box-shadow:0 0 0 1px rgba(255,236,140,0.55), 0 0 14px rgba(255,236,140,0.25);' : ''}">
-        <div style="font-size:11px; line-height:1.45; color:#E8E2D0; white-space:pre-wrap; word-break:break-word;">${escapeHtml(n.text)}</div>
+        ${n.text.trim() ? `<div style="font-size:11px; line-height:1.45; color:#E8E2D0; white-space:pre-wrap; word-break:break-word;">${escapeHtml(n.text)}</div>` : ''}
         ${photo}
         <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-top:6px;">
           <span style="font-size:9px; color:${DIM};">
@@ -208,6 +293,14 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     });
     const statusEl = panel.querySelector<HTMLElement>('[data-status]');
     if (statusEl) statusEl.textContent = status;
+    const postBtn = panel.querySelector<HTMLButtonElement>('[data-act="post"]');
+    if (postBtn) postBtn.disabled = posting;
+    paintPhotoRow();
+    const auto = panel.querySelector<HTMLElement>('[data-auto]');
+    if (auto) {
+      const on = photoAutoFetch.on();
+      auto.innerHTML = `Photos up to ${formatBytes(PHOTO_AUTO_FETCH_MAX)} come to your node by themselves, ${formatBytes(PHOTO_AUTO_FETCH_DAY)} a day at most. ${smallBtn('auto', on ? 'BY THEMSELVES: ON' : 'BY THEMSELVES: OFF', `aria-pressed="${on ? 'true' : 'false'}"`, on ? GOLD : DIM)}`;
+    }
     const tools = panel.querySelector<HTMLElement>('[data-tools]');
     if (tools) {
       const armed = Date.now() < clearArmedUntil;
@@ -219,18 +312,71 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     }
   };
 
-  const post = (): void => {
-    if (!panel || !here()) return;
+  /** The post box's photo row and the film-roll picker. Built apart from
+   *  the note box, which a repaint never touches. */
+  const paintPhotoRow = (): void => {
+    if (!panel) return;
+    const row = panel.querySelector<HTMLElement>('[data-chosen]');
+    if (row) {
+      row.innerHTML = chosen
+        ? `<img src="${escapeHtml(thumbOf(chosen))}" alt="" style="width:36px; height:36px; object-fit:cover; border:2px solid #FBFAF6; border-radius:2px;">
+           <span style="font-size:9px; color:${DIM};">${escapeHtml(chosen.caption || shotLabel(chosen))}</span>
+           ${smallBtn('unpick', '✕', 'aria-label="Take the photo off this note"', DIM)}`
+        : '';
+    }
+    const pickBtn = panel.querySelector<HTMLElement>('[data-act="pick"]');
+    if (pickBtn) pickBtn.textContent = roll ? 'CLOSE THE ROLL' : chosen ? '📷 ANOTHER PHOTO' : '📷 ADD A PHOTO';
+    const picker = panel.querySelector<HTMLElement>('[data-picker]');
+    if (!picker) return;
+    picker.style.display = roll ? 'flex' : 'none';
+    if (!roll) {
+      picker.innerHTML = '';
+      return;
+    }
+    picker.innerHTML = roll.length === 0
+      ? `<span style="font-size:9.5px; color:${DIM};">Your film roll is empty. Open 📷 CAMERA on your SpacePhone to take a shot.</span>`
+      : roll.map((shot) => `<button data-act="pick-shot" data-shot="${escapeHtml(shot.id)}" title="${escapeHtml(shot.caption || shotLabel(shot))}" aria-label="Pin ${escapeHtml(shot.caption || shotLabel(shot))}" style="
+          padding:0; border:2px solid ${chosen?.id === shot.id ? GOLD_BRIGHT : '#FBFAF6'}; border-radius:2px; background:#FBFAF6; cursor:pointer;">
+          <img src="${escapeHtml(thumbOf(shot))}" alt="" style="display:block; width:52px; height:52px; object-fit:cover;"></button>`).join('');
+  };
+
+  const post = async (): Promise<void> => {
+    if (!panel || !here() || posting) return;
     const box = panel.querySelector<HTMLTextAreaElement>('[data-text]');
     if (!box) return;
-    const result = postNote(itemId, kind, { text: box.value, colour });
+    const shot = chosen;
+    let attach: BoardPhoto | undefined;
+    if (shot) {
+      posting = true;
+      status = 'Handing the photo to your node…';
+      render();
+      const got = await photoFromShot(shot);
+      posting = false;
+      // The panel may have closed, or moved rooms, while the node took it.
+      if (!panel || !here()) return;
+      if ('error' in got) {
+        status = got.error;
+        render();
+        return;
+      }
+      attach = got.photo;
+    }
+    const result = postNote(itemId, kind, { text: box.value, colour, ...(attach ? { attach } : {}) });
     if (result.ok) {
       box.value = '';
+      if (shot && chosen?.id === shot.id) chosen = null;
       status = 'Pinned.';
       updateCount();
     } else {
       status = result.why;
     }
+    render();
+  };
+
+  const openRoll = async (): Promise<void> => {
+    const shots = await listShots();
+    if (!panel || !here()) return;
+    roll = shots;
     render();
   };
 
@@ -258,8 +404,38 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
         if ((BOARD_COLOURS as readonly string[]).includes(btn.dataset.colour ?? '')) colour = btn.dataset.colour as BoardColour;
         break;
       case 'post':
-        post();
+        void post();
         return;
+      case 'zoom':
+        zoomed = zoomed === btn.dataset.id ? null : btn.dataset.id ?? null;
+        break;
+      case 'fetch': {
+        // The press is for the photo the button showed: a note filed under
+        // the same id carries the same signed photo, but the hash is checked
+        // anyway (the theatre's FETCH rule).
+        const n = readBoard(itemId, kind).shown.find((x) => x.id === btn.dataset.id);
+        if (n?.attach && n.attach.hash === btn.dataset.hash) pressFetch(n.attach);
+        break;
+      }
+      case 'auto':
+        photoAutoFetch.setOn(!photoAutoFetch.on());
+        break;
+      case 'pick':
+        if (roll) roll = null;
+        else void openRoll();
+        break;
+      case 'pick-shot': {
+        const shot = roll?.find((x) => x.id === btn.dataset.shot);
+        if (shot) {
+          chosen = shot;
+          roll = null;
+          status = '';
+        }
+        break;
+      }
+      case 'unpick':
+        chosen = null;
+        break;
       case 'clear':
         if (Date.now() < clearArmedUntil) {
           clearArmedUntil = 0;
@@ -283,7 +459,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     </div>
     <div style="font-size:9.5px; line-height:1.45; color:${DIM};">
       ${open
-        ? `Anyone in this room can pin a note. Each note is signed with its writer’s key. You can have ${MAX_NOTES_PER_AUTHOR} notes here; a new one replaces your oldest.`
+        ? `Anyone in this room can pin a note, with a photo from their CAMERA if they like. Each note is signed with its writer’s key. You can have ${MAX_NOTES_PER_AUTHOR} notes here; a new one replaces your oldest.`
         : 'Official notices from the room’s owner, behind locked glass. Each one is signed with the owner’s key.'}
     </div>
     <div data-notes style="display:flex; flex-direction:column; gap:8px;"></div>
@@ -298,6 +474,11 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
           <span style="display:flex; gap:5px;">${swatches}</span>
           <span data-count style="font-size:9px; color:${DIM};">0/${MAX_NOTE_TEXT}</span>
         </div>
+        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+          ${smallBtn('pick', '📷 ADD A PHOTO')}
+          <span data-chosen style="display:flex; align-items:center; gap:6px;"></span>
+        </div>
+        <div data-picker style="display:none; flex-wrap:wrap; gap:5px; max-height:132px; overflow-y:auto;"></div>
         <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
           <span data-status style="font-size:9.5px; color:${GOLD};"></span>
           <button data-act="post" style="
@@ -310,6 +491,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       </div>
     </div>
     <div data-tools style="display:none; justify-content:flex-end;"></div>
+    <div data-auto style="font-size:9px; line-height:1.8; color:${DIM};"></div>
     <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
       SSF BOARD v1 · notes live in this room and travel with it
     </div>
@@ -343,7 +525,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       box?.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
           e.preventDefault();
-          post();
+          void post();
         }
       });
       const mounted = panel;
@@ -388,6 +570,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      for (const url of thumbUrls.values()) URL.revokeObjectURL(url);
+      thumbUrls.clear();
+      roll = null;
       deps.onEngagedChange?.(false);
       panel?.remove();
       panel = null;
@@ -398,6 +583,16 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       if (clearArmedUntil && Date.now() >= clearArmedUntil) {
         clearArmedUntil = 0;
         render();
+      }
+      // 📷 A photo that arrived, or one that stopped on its way, shows.
+      photoSince += dt;
+      if (photoSince >= PHOTO_REFRESH_S) {
+        photoSince = 0;
+        const key = photoLooks();
+        if (key !== photoKey) {
+          photoKey = key;
+          render();
+        }
       }
       since += dt;
       if (since < AGE_REFRESH_S) return;

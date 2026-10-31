@@ -29,10 +29,39 @@ export const TV_AUTO_FETCH_DAY = 8 * 2 ** 30;
 export const TV_AUTO_FETCH_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** What an ask counts against the day at the least: 128 asks a day. */
 export const TV_AUTO_FETCH_MIN_CHARGE = 64 * 2 ** 20;
-const charge = (size: number): number => Math.max(size, TV_AUTO_FETCH_MIN_CHARGE);
 
-const SWITCH_KEY = 'ssf-tv-auto-fetch';
-const SPENT_KEY = 'ssf-tv-auto-fetch-spent';
+/** One kind of fetch without a press: its cap per file, its budget per day
+ *  and the least an ask is charged, and where its switch and spends are
+ *  kept in this browser. The TV's is below; the room boards' photos have
+ *  their own (boardPhotos.ts, #315), with photo-sized numbers. */
+export interface AutoFetchRules {
+  max: number;
+  day: number;
+  minCharge: number;
+  switchKey: string;
+  spentKey: string;
+}
+
+export type AutoFetchVerdict = 'go' | 'off' | 'big' | 'day' | 'asked';
+
+export interface AutoFetchBudget {
+  readonly rules: Readonly<AutoFetchRules>;
+  on(): boolean;
+  setOn(on: boolean): void;
+  /** What this browser has fetched by itself in the last day, in bytes. */
+  spent(now?: number): number;
+  /** May it ask for `hash` (`size` bytes) by itself now? */
+  verdict(hash: string, size: number, now?: number): AutoFetchVerdict;
+  /** It asked for `hash` by itself: counted against the day, and never
+   *  asked for by itself again from this page. */
+  note(hash: string, size: number, now?: number): void;
+  /** A press took the ask for `hash`: no ask of its own for it from this
+   *  page, and nothing charged. */
+  notePressed(hash: string): void;
+  /** Tests: a fresh page. */
+  reset(): void;
+}
+
 /** Entries kept: the oldest are folded together past this (compact), never
  *  dropped, so the record stays small and every byte still counts. */
 const SPENT_MAX = 64;
@@ -43,32 +72,6 @@ interface Spend {
   /** The file's first digits: two asks for the same file at the same
    *  moment, read from storage and from this page, are one. */
   h: string;
-}
-
-/** What this page could not keep in storage — one that throws on every
- *  call (a private window, blocked site data), or only on a write (its
- *  quota full) — and that holds for this page all the same: its switch
- *  over what storage says, and the spends storage did not take (those
- *  alone: what storage holds is read from storage) on top of what it
- *  holds. Cleared by the next write that storage takes. Otherwise storage
- *  is read every time, so two tabs share one budget and one switch. */
-let switchHere: boolean | null = null;
-let spentHere: Spend[] | null = null;
-/** The files this page has asked for by itself. */
-const asked = new Set<string>();
-
-export function autoFetchOn(): boolean {
-  if (switchHere !== null) return switchHere;
-  try { return localStorage.getItem(SWITCH_KEY) !== '0'; } catch { return true; }
-}
-
-export function setAutoFetchOn(on: boolean): void {
-  try {
-    localStorage.setItem(SWITCH_KEY, on ? '1' : '0');
-    switchHere = null;
-  } catch {
-    switchHere = on;
-  }
 }
 
 function spends(list: unknown): Spend[] {
@@ -91,70 +94,118 @@ function compact(list: Spend[]): Spend[] {
   return out;
 }
 
-function readSpent(now: number): Spend[] {
-  let stored: unknown = [];
-  try {
-    stored = JSON.parse(localStorage.getItem(SPENT_KEY) ?? '[]');
-  } catch {
-    stored = []; // storage that throws (then spentHere is all there is), or a value that is not JSON
-  }
-  const seen = new Set<string>();
-  return compact([...spends(stored), ...(spentHere ?? [])]
-    // A spend stamped ahead of now (a clock set back) still counts until it
-    // is a day old by the clock as it reads now: never forgotten early.
-    .filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS)
-    .filter((e) => {
-      const k = `${e.at}:${e.size}:${e.h}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    }));
+export function makeAutoFetch(rules: AutoFetchRules): AutoFetchBudget {
+  const charge = (size: number): number => Math.max(size, rules.minCharge);
+  /** What this page could not keep in storage — one that throws on every
+   *  call (a private window, blocked site data), or only on a write (its
+   *  quota full) — and that holds for this page all the same: its switch
+   *  over what storage says, and the spends storage did not take (those
+   *  alone: what storage holds is read from storage) on top of what it
+   *  holds. Cleared by the next write that storage takes. Otherwise storage
+   *  is read every time, so two tabs share one budget and one switch. */
+  let switchHere: boolean | null = null;
+  let spentHere: Spend[] | null = null;
+  /** The files this page has asked for by itself. */
+  const asked = new Set<string>();
+
+  const on = (): boolean => {
+    if (switchHere !== null) return switchHere;
+    try { return localStorage.getItem(rules.switchKey) !== '0'; } catch { return true; }
+  };
+
+  const readSpent = (now: number): Spend[] => {
+    let stored: unknown = [];
+    try {
+      stored = JSON.parse(localStorage.getItem(rules.spentKey) ?? '[]');
+    } catch {
+      stored = []; // storage that throws (then spentHere is all there is), or a value that is not JSON
+    }
+    const seen = new Set<string>();
+    return compact([...spends(stored), ...(spentHere ?? [])]
+      // A spend stamped ahead of now (a clock set back) still counts until it
+      // is a day old by the clock as it reads now: never forgotten early.
+      .filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS)
+      .filter((e) => {
+        const k = `${e.at}:${e.size}:${e.h}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }));
+  };
+
+  const spent = (now = Date.now()): number => readSpent(now).reduce((sum, e) => sum + e.size, 0);
+
+  return {
+    rules,
+    on,
+    setOn(next: boolean): void {
+      try {
+        localStorage.setItem(rules.switchKey, next ? '1' : '0');
+        switchHere = null;
+      } catch {
+        switchHere = next;
+      }
+    },
+    spent,
+    verdict(hash: string, size: number, now = Date.now()): AutoFetchVerdict {
+      if (!on()) return 'off';
+      if (asked.has(hash)) return 'asked';
+      if (!Number.isSafeInteger(size) || size < 0 || size > rules.max) return 'big';
+      if (spent(now) + charge(size) > rules.day) return 'day';
+      return 'go';
+    },
+    note(hash: string, size: number, now = Date.now()): void {
+      asked.add(hash);
+      const spend = { at: now, size: charge(size), h: hash.slice(0, 16) };
+      try {
+        localStorage.setItem(rules.spentKey, JSON.stringify(compact([...readSpent(now), spend])));
+        spentHere = null;
+      } catch {
+        // Folded only among themselves (none of them is in storage to be
+        // counted twice), and only those still inside the day: a spend that
+        // has expired, folded into a newer one, would count for another day.
+        spentHere = compact([...(spentHere ?? []).filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS), spend]);
+      }
+    },
+    notePressed(hash: string): void {
+      asked.add(hash);
+    },
+    reset(): void {
+      switchHere = null;
+      spentHere = null;
+      asked.clear();
+    },
+  };
 }
+
+/** The theatre's: its switch and spends under the keys they always had. */
+const tv = makeAutoFetch({
+  max: TV_AUTO_FETCH_MAX,
+  day: TV_AUTO_FETCH_DAY,
+  minCharge: TV_AUTO_FETCH_MIN_CHARGE,
+  switchKey: 'ssf-tv-auto-fetch',
+  spentKey: 'ssf-tv-auto-fetch-spent',
+});
+
+export const autoFetchOn = (): boolean => tv.on();
+export const setAutoFetchOn = (on: boolean): void => tv.setOn(on);
 
 /** What this browser has fetched by itself in the last day, in bytes (each
  *  ask at least TV_AUTO_FETCH_MIN_CHARGE). */
-export function autoFetchSpent(now = Date.now()): number {
-  return readSpent(now).reduce((sum, e) => sum + e.size, 0);
-}
-
-export type AutoFetchVerdict = 'go' | 'off' | 'big' | 'day' | 'asked';
+export const autoFetchSpent = (now = Date.now()): number => tv.spent(now);
 
 /** May the theatre ask for `hash` (`size` bytes) by itself now? */
-export function autoFetchVerdict(hash: string, size: number, now = Date.now()): AutoFetchVerdict {
-  if (!autoFetchOn()) return 'off';
-  if (asked.has(hash)) return 'asked';
-  if (!Number.isSafeInteger(size) || size < 0 || size > TV_AUTO_FETCH_MAX) return 'big';
-  if (autoFetchSpent(now) + charge(size) > TV_AUTO_FETCH_DAY) return 'day';
-  return 'go';
-}
+export const autoFetchVerdict = (hash: string, size: number, now = Date.now()): AutoFetchVerdict => tv.verdict(hash, size, now);
 
 /** The theatre asked for `hash` by itself: counted against the day, and
  *  never asked for by itself again from this page. */
-export function noteAutoFetch(hash: string, size: number, now = Date.now()): void {
-  asked.add(hash);
-  const spend = { at: now, size: charge(size), h: hash.slice(0, 16) };
-  try {
-    localStorage.setItem(SPENT_KEY, JSON.stringify(compact([...readSpent(now), spend])));
-    spentHere = null;
-  } catch {
-    // Folded only among themselves (none of them is in storage to be
-    // counted twice), and only those still inside the day: a spend that
-    // has expired, folded into a newer one, would count for another day.
-    spentHere = compact([...(spentHere ?? []).filter((e) => now - e.at < TV_AUTO_FETCH_WINDOW_MS), spend]);
-  }
-}
+export const noteAutoFetch = (hash: string, size: number, now = Date.now()): void => tv.note(hash, size, now);
 
 /** A press took the ask for `hash` (FETCH): AUTO-FETCH makes none of its
  *  own for it from this page, and charges the day nothing for it — the
  *  press's answer may still be on its way, with the file's state reading
  *  'none' until it lands. */
-export function notePressedFetch(hash: string): void {
-  asked.add(hash);
-}
+export const notePressedFetch = (hash: string): void => tv.notePressed(hash);
 
 /** Tests: a fresh page. */
-export function resetAutoFetchForTest(): void {
-  switchHere = null;
-  spentHere = null;
-  asked.clear();
-}
+export const resetAutoFetchForTest = (): void => tv.reset();
