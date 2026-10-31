@@ -12,12 +12,20 @@
 //! 1. **joins** a round that asks for no commitment, writing its commitment
 //!    for it (`o:<r>:<h>`), unless it already has one for that round (its
 //!    reveal of the round before carried it, or the checkpoint does), or has
-//!    revealed that round or a later one;
-//! 2. **watches** each close naming its commitment (signature checked, its
-//!    signer one of the slips it froze, its parent a close of the round
-//!    before or the session itself; after a round it revealed, the close it
-//!    decided there), noting when it first saw it on its own clock, and when
-//!    it first saw each frozen bettor's seed;
+//!    revealed that round or a later one, or another house of the owner's
+//!    has it (a join of that round, a reveal of the round before carrying
+//!    one): one house to a round;
+//! 2. **watches** each close naming its commitment that the pages' fold
+//!    takes as eligible (computedFold compute, step 1: signature checked,
+//!    its signer one of the slips it froze, under a parent decided at the
+//!    round before or the session itself, naming what its round asks for,
+//!    among the first [`MAX_CLOSES_PER_ROUND`] by rank), every delegated
+//!    house's reveals, joins and step-downs counted as each signed them; and
+//!    after a round a house decided, only the close it decided there has
+//!    children (this house's own last decision held in [`STATE_FILE`], so a
+//!    deleted reveal or a step-down forgets nothing). It notes when it first
+//!    saw each close on its own clock, and when it first saw each frozen
+//!    bettor's seed;
 //! 3. **reveals** (`h:<r>:<h>`) once every seed of the best-ranked such close
 //!    is in, or once the grace has run out (the pages' forfeit grace:
 //!    computedTable graceOf): its seed, that close alone (a rival listed too
@@ -33,9 +41,9 @@
 //!    a close it first saw in its first [`SETTLE_MS`] at the table (after a
 //!    start or a restart it can't tell how long the pages have waited on a
 //!    close already there, nor whether their void is on its way); and not
-//!    at a round it joined where another close names something else (the
-//!    cheat's free second look: see a Friendly close's result, then
-//!    choose);
+//!    at a round it joined where another close names nothing (the cheat's
+//!    free second look: see a Friendly close's result, then choose), nor
+//!    where another house's join is the one the pages name (the lowest);
 //! 4. **beats** (`hb:<pub>`) every [`HEARTBEAT_MS`] while a table of the
 //!    room runs Fair, so the ⚙ card can say whether the house is online;
 //! 5. **puts back** what it wrote, its delegation and the owner's newest
@@ -93,8 +101,12 @@ const MAX_SAFE: i64 = 9_007_199_254_740_991;
 /// and round, and is trimmed at 20 rounds or 96 KB).
 pub const MAX_SESSION_KEYS: usize = 8_192;
 /// The highest round of each table the house has revealed or stepped down,
+/// the last close it decided there and its reveals in the live session,
 /// beside the node's other state files.
 pub const STATE_FILE: &str = "house-state.json";
+/// The most reveals of a session the state file keeps per table (a session
+/// is trimmed at 20 rounds: a reveal and a step-down each, at most).
+pub const MAX_KEPT: usize = 64;
 
 const CASINO_MAP: &str = "casino";
 const COMPUTED_MAP: &str = "casinoComputed";
@@ -319,12 +331,46 @@ struct Close {
     rank: String,
 }
 
+/// A house reveal (`h:`) of any house the deed holder delegated, as it
+/// signed it: `commit` is the commitment its seed opens.
 #[derive(Clone, Debug)]
-struct OwnReveal {
+struct Reveal {
+    k: String,
     r: i64,
-    c: Option<String>,
+    hash: String,
+    commit: String,
     /// The close it decided (none: a step-down).
     x: Vec<String>,
+    n: Vec<String>,
+    c: Option<String>,
+}
+
+/// A house join (`o:`) of any house the deed holder delegated.
+#[derive(Clone, Debug)]
+struct Join {
+    k: String,
+    r: i64,
+    hash: String,
+    c: String,
+}
+
+#[derive(Clone, Debug)]
+struct Forfeit {
+    hash: String,
+    r: i64,
+    x: String,
+    n: Vec<String>,
+    k: String,
+    v: CVal,
+}
+
+/// How a close on the chain was decided (computedFold decide): by a house's
+/// reveal (carrying the commitment the next round must name, if any), or
+/// otherwise (a forfeit, every seed in, an abandon).
+#[derive(Clone, Debug, PartialEq)]
+enum Decision {
+    House(Option<String>),
+    Other,
 }
 
 /// One live table: its checkpoint's base, its live session's records.
@@ -336,16 +382,24 @@ struct TableRead {
     slips: HashMap<String, Slip>,
     /// (round, pid) → the seeds revealed.
     seeds: HashMap<(i64, String), Vec<String>>,
-    /// Closes whose signature and signer hold and whose parent is the
-    /// session or a close of the round before (after a round this house
-    /// decided, the close it decided), by round.
+    /// Closes the pages' fold takes as eligible (computedFold compute, step
+    /// 1), by round: signed by one of the slips they freeze, under a parent
+    /// decided at the round before (the session, for the first), naming
+    /// what their round asks for. After a round a house decided, only the
+    /// close it decided has children here: no rival gets a second look.
     closes: Vec<Close>,
+    /// The latest round a signed close reaches on a line of them from the
+    /// base (each on a close of the round before, decided or not): a round
+    /// below it when the house first saw it may be one the pages have moved
+    /// past, its void perhaps not here yet (a map's keys arrive in no order).
+    top: i64,
     /// close hash → it has a verified abandon.
     abandoned: HashSet<String>,
-    /// Its own reveals and joins, as it signed them.
-    own_reveals: Vec<OwnReveal>,
-    /// Rounds this house has a join of, with its commitment.
-    own_joins: Vec<(i64, String)>,
+    /// Every delegated house's reveals and joins, this one's among them.
+    reveals: Vec<Reveal>,
+    joins: Vec<Join>,
+    /// This house's key.
+    me: String,
 }
 
 impl TableRead {
@@ -356,6 +410,23 @@ impl TableRead {
     /// The round after the last one closed: what the house joins.
     fn next_round(&self) -> i64 {
         self.closes.iter().map(|c| c.r).max().unwrap_or(self.base_u) + 1
+    }
+
+    fn own_reveals(&self) -> impl Iterator<Item = &Reveal> {
+        self.reveals.iter().filter(|h| h.k == self.me)
+    }
+
+    /// computedFold steppedDown: a house's step-down at round r opened `h`.
+    fn stepped_down(&self, r: i64, h: &str) -> bool {
+        self.reveals.iter().any(|e| e.r == r && e.x.is_empty() && e.commit == h)
+    }
+
+    /// Round r's joins that count (not stepped down), lowest hash first: the
+    /// pages' close names the first (computedTable, `res.joins[0]`).
+    fn joins_at(&self, r: i64) -> Vec<&Join> {
+        let mut js: Vec<&Join> = self.joins.iter().filter(|o| o.r == r && !self.stepped_down(r, &o.c)).collect();
+        js.sort_by(|a, b| a.hash.cmp(&b.hash));
+        js
     }
 }
 
@@ -394,6 +465,10 @@ struct RoomMem {
     pins: HashMap<String, String>,
     /// The delegation as first verified (pinned for the run, put back).
     delegation: Option<CVal>,
+    /// Every house the deed holder delegated, with the key that signed its
+    /// delegation, as first verified (pinned while that key holds the deed,
+    /// as the pages pin them: casinoDoc housePinned).
+    houses: HashMap<String, String>,
     /// The newest owner-signed Fair setting seen per table.
     fair: HashMap<String, CVal>,
     tables: HashMap<(String, String), TableMem>,
@@ -403,15 +478,28 @@ struct RoomMem {
 }
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
-/// round it revealed or stepped down, the close it decided there (none: a
-/// step-down), and whether that reveal carried the next round's commitment.
-/// The doc's copy of the reveal can be deleted; the line the next round must
-/// carry on, and the commitment it must name, hold all the same.
+/// round it revealed or stepped down; the last round it decided and the
+/// close it decided there (a step-down after it keeps them); whether the
+/// reveal of round `r` carried the next round's commitment; and its reveals
+/// in the live session, as it wrote them. The doc's copy of a reveal can be
+/// deleted; the line the round after it must carry on, and the commitment
+/// it must name, hold all the same, and after a restart it puts its reveals
+/// back as it does during a run (the pages' witnesses do too, for a round
+/// they bet in: this is for a round nobody else will).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Done {
     r: i64,
-    x: Option<String>,
+    d: Option<(i64, String)>,
     c: bool,
+    kept: Vec<Kept>,
+}
+
+/// A record the house wrote, with the session it went into and its key.
+#[derive(Clone, Debug, PartialEq)]
+struct Kept {
+    ses: String,
+    key: String,
+    rec: CVal,
 }
 
 /// The house of this node: its key, what it has revealed, what it has seen.
@@ -598,6 +686,35 @@ impl House {
         let Some(delegation) = delegation else { return writes };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
 
+        // Every house the deed holder delegated: another of their nodes is a
+        // house of the room as this one is, and its records hold the line,
+        // the joins and the step-downs as this one's do.
+        let others: Vec<(String, CVal)> = comp
+            .iter(&txn)
+            .filter_map(|(key, out)| {
+                let h = key.strip_prefix("hk:").filter(|h| is_pub(h) && *h != pub_key)?;
+                let Out::Any(any) = out else { return None };
+                Some((h.to_string(), CVal::from_any(&any)))
+            })
+            .collect();
+        for (h, v) in others {
+            if self.rooms[room].houses.get(&h) == Some(&owner_key) {
+                continue;
+            }
+            let shape_ok = has_fields(&v, &["v", "h", "k", "g"], &[])
+                && v.get("v").and_then(CVal::as_int) == Some(1)
+                && str_of(&v, "h") == Some(h.as_str())
+                && str_of(&v, "k") == Some(owner_key.as_str());
+            let hash = hb::rec_hash(&v).unwrap_or_default();
+            let g = str_of(&v, "g").unwrap_or("").to_string();
+            if shape_ok && self.verified("hkey", [room, "", ""], &hash, &owner_key, hb::room_sign_bytes("hkey", room, "", &v), &g) {
+                self.rooms.get_mut(room).unwrap().houses.insert(h, owner_key.clone());
+            }
+        }
+        let mut houses: HashSet<String> =
+            self.rooms[room].houses.iter().filter(|(_, k)| **k == owner_key).map(|(h, _)| h.clone()).collect();
+        houses.insert(pub_key.clone());
+
         // The owner's Fair settings, newest first seen (a new deed holder's
         // count afresh: the last one's settings go).
         self.rooms.get_mut(room).unwrap().fair.retain(|_, v| str_of(v, "k") == Some(owner_key.as_str()));
@@ -643,7 +760,7 @@ impl House {
         let mut fair_tables = 0;
         for (t, inc) in tables {
             let ctx = Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() };
-            let Some(read) = self.read_table(&comp, &txn, ctx) else { continue };
+            let Some(read) = self.read_table(&comp, &txn, ctx, &houses) else { continue };
             let friendly = self.rooms[room].fair.get(&t).and_then(|v| v.get("m").and_then(CVal::as_int)) == Some(1);
             if !friendly {
                 fair_tables += 1;
@@ -722,8 +839,9 @@ impl House {
     }
 
     /// Read table `ctx`'s live session (None when the doc holds none, or its
-    /// incarnation has ended).
-    fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx) -> Option<TableRead> {
+    /// incarnation has ended). `houses`: every house the deed holder
+    /// delegated, this one among them.
+    fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx, houses: &HashSet<String>) -> Option<TableRead> {
         let cp = top_value(comp, txn, &format!("sum:{}:{}", ctx.t, ctx.inc)).filter(|v| checkpoint_ok(v, &ctx.inc));
         if cp.as_ref().is_some_and(|v| v.get("e").is_some()) {
             return None;
@@ -734,7 +852,7 @@ impl House {
         let base_u = cp.as_ref().and_then(|v| v.get("u").and_then(CVal::as_int)).unwrap_or(0);
         let cp_h = cp.as_ref().and_then(|v| str_of(v, "h")).map(str::to_string);
         let craps = craps_inc(&ctx.inc);
-        let pub_key = self.key.public.clone();
+        let me = self.key.public.clone();
 
         let mut read = TableRead {
             ctx,
@@ -744,13 +862,16 @@ impl House {
             slips: HashMap::new(),
             seeds: HashMap::new(),
             closes: Vec::new(),
+            top: base_u,
             abandoned: HashSet::new(),
-            own_reveals: Vec::new(),
-            own_joins: Vec::new(),
+            reveals: Vec::new(),
+            joins: Vec::new(),
+            me,
         };
         let mut closes: Vec<(Close, CVal)> = Vec::new();
-        let mut abandons: Vec<(String, String, CVal)> = Vec::new();
-        let mut own: Vec<(char, i64, String, CVal)> = Vec::new();
+        let mut abandons: Vec<(String, i64, String, CVal)> = Vec::new();
+        let mut forfeits: Vec<Forfeit> = Vec::new();
+        let mut house_recs: Vec<(char, i64, String, CVal, String)> = Vec::new();
         for (key, out) in ses.iter(txn).take(MAX_SESSION_KEYS) {
             let Some((kind, r, pid, h)) = parse_key(key) else { continue };
             let Out::Any(any) = out else { continue };
@@ -807,55 +928,79 @@ impl House {
                     let close = Close { hash: h.to_string(), r, q: q.to_string(), f, k, h: ch.flatten().map(str::to_string), rank };
                     closes.push((close, v));
                 }
-                'z' => {
-                    if has_fields(&v, &["r", "x", "k", "g"], &[]) && g_ok {
-                        if let (Some(x), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), k) {
-                            abandons.push((x.to_string(), k, v.clone()));
+                'f' => {
+                    // computedFold asForfeit: n sorted, unique, 1–MAX_FROZEN player ids.
+                    let n: Option<Vec<String>> = v.get("n").and_then(CVal::as_arr).and_then(|n| {
+                        let ids: Option<Vec<String>> = n.iter().map(|p| p.as_str().filter(|p| is_pid(p)).map(str::to_string)).collect();
+                        ids.filter(|ids| !ids.is_empty() && ids.len() <= MAX_FROZEN && ids.windows(2).all(|w| w[0] < w[1]))
+                    });
+                    if has_fields(&v, &["r", "x", "n", "k", "g"], &[]) && g_ok {
+                        if let (Some(x), Some(n), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), n, k) {
+                            forfeits.push(Forfeit { hash: h.to_string(), r, x: x.to_string(), n, k, v });
                         }
                     }
                 }
-                'h' | 'o' if k.as_deref() == Some(pub_key.as_str()) && g_ok => own.push((kind, r, h.to_string(), v)),
+                'z' => {
+                    if has_fields(&v, &["r", "x", "k", "g"], &[]) && g_ok {
+                        if let (Some(x), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), k) {
+                            abandons.push((x.to_string(), r, k, v));
+                        }
+                    }
+                }
+                'h' | 'o' if g_ok => {
+                    if let Some(k) = k.filter(|k| houses.contains(k)) {
+                        house_recs.push((kind, r, h.to_string(), v, k));
+                    }
+                }
                 _ => {}
             }
         }
 
-        // Its own records count as it signed them: a peer's copy under its
-        // key (a reveal of a high round, say) would stop it joining and
-        // revealing.
+        // The houses' records count as each signed them: a peer's copy under
+        // this house's key (a reveal of a high round, say) would stop it
+        // joining and revealing; under another's, change what a round may
+        // name. Shapes as computedFold asHouseReveal and asHouseCommit.
         let at = [read.ctx.room.clone(), read.ctx.t.clone(), read.ctx.inc.clone()];
         let at = [at[0].as_str(), at[1].as_str(), at[2].as_str()];
-        for (kind, r, hash, v) in own {
-            let (signed, shape_ok) = if kind == 'h' {
-                ("hreveal", has_fields(&v, &["r", "s", "x", "n", "k", "g"], &["c"]))
-            } else {
-                ("hcommit", has_fields(&v, &["r", "c", "k", "g"], &[]))
-            };
+        let hexes = |v: &CVal, key: &str, max: usize| -> Option<Vec<String>> {
+            let xs: Option<Vec<String>> = v.get(key)?.as_arr()?.iter().map(|x| x.as_str().filter(|x| hex_of(x, 32)).map(str::to_string)).collect();
+            xs.filter(|xs| xs.len() <= max && xs.windows(2).all(|w| w[0] < w[1]))
+        };
+        for (kind, r, hash, v, k) in house_recs {
             let g = str_of(&v, "g").unwrap_or("").to_string();
-            if !shape_ok || !self.verified(signed, at, &hash, &pub_key, hb::sign_bytes(signed, &read.ctx, &v), &g) {
-                continue;
-            }
             if kind == 'h' {
-                let x = v.get("x").and_then(CVal::as_arr).map(|xs| xs.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-                read.own_reveals.push(OwnReveal { r, c: str_of(&v, "c").map(str::to_string), x });
-            } else if let Some(c) = str_of(&v, "c") {
-                read.own_joins.push((r, c.to_string()));
+                let (Some(s), Some(x), Some(n)) = (str_of(&v, "s").filter(|s| hex_of(s, 64)), hexes(&v, "x", MAX_CLOSES_PER_ROUND), hexes(&v, "n", MAX_HOUSE_COUNTED)) else {
+                    continue;
+                };
+                let c = v.get("c").map(|c| c.as_str().filter(|c| hex_of(c, 64)).map(str::to_string));
+                if !has_fields(&v, &["r", "s", "x", "n", "k", "g"], &["c"]) || c == Some(None) || (x.is_empty() && (!n.is_empty() || c.is_some())) {
+                    continue;
+                }
+                if self.verified("hreveal", at, &hash, &k, hb::sign_bytes("hreveal", &read.ctx, &v), &g) {
+                    let commit = hb::house_commit(&read.ctx, r, s);
+                    read.reveals.push(Reveal { k, r, hash, commit, x, n, c: c.flatten() });
+                }
+            } else if let Some(c) = str_of(&v, "c").filter(|c| hex_of(c, 64) && has_fields(&v, &["r", "c", "k", "g"], &[])) {
+                let c = c.to_string();
+                if self.verified("hcommit", at, &hash, &k, hb::sign_bytes("hcommit", &read.ctx, &v), &g) {
+                    read.joins.push(Join { k, r, hash, c });
+                }
             }
         }
 
         // A close counts when it is signed by one of the slips it freezes,
         // that slip as the pages take it (computedFold closeInfo): its
-        // player's pinned key, its signature, chips on it. One the pages
-        // throw out would only void the round's real close if revealed.
+        // signature good, chips on it. One the pages throw out would only
+        // void the round's real close if revealed.
         let mut good: Vec<Close> = Vec::new();
         for (c, v) in closes {
             let mut signer = false;
             for (p, sh) in &c.f {
                 let Some(s) = read.slips.get(sh) else { continue };
-                if s.pid != *p || s.r != c.r || s.k != c.k || !s.chips || self.pin_of(&read.ctx.room, txn, p).as_deref() != Some(s.k.as_str()) {
+                if s.pid != *p || s.r != c.r || s.k != c.k || !s.chips {
                     continue;
                 }
-                let g = str_of(&s.v, "g").unwrap_or("").to_string();
-                if self.verified("slip", at, sh, &s.k, hb::sign_bytes("slip", &read.ctx, &s.v), &g) {
+                if self.slip_ok(at, sh, s, &read.ctx) {
                     signer = true;
                     break;
                 }
@@ -868,59 +1013,197 @@ impl House {
                 good.push(c);
             }
         }
-        // ...and its parent is the session (its first round) or a close
-        // counted at the round before, no round skipped; after a round this
-        // house decided, the close it decided: it reveals one close a round,
-        // and carries on that line alone, so no rival gets a second look.
-        good.sort_by_key(|c| c.r);
+
+        // The chain as the pages' fold walks it (computedFold compute, step
+        // 1): round by round from the base, a close is eligible under a
+        // parent decided at the round before (the session, for the first),
+        // naming what its round asks for; the first round with nothing
+        // decided ends it, and only the first MAX_CLOSES_PER_ROUND by rank
+        // take a place. And the house's own rule on top: after a round a
+        // house decided, only the close it decided has children (its own
+        // memory of it too: a peer can delete the reveal), so no rival gets
+        // a second look.
+        good.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.hash.cmp(&b.hash)));
         let sid = read.ses_key.rsplit(':').next().unwrap_or("").to_string();
-        let last = self.last_of(&read.ctx).cloned();
-        let mut on_chain: HashMap<String, i64> = HashMap::new();
-        for c in good {
-            let parent_ok = if c.r == read.base_u + 1 { c.q == sid } else { c.r > read.base_u + 1 && on_chain.get(&c.q) == Some(&(c.r - 1)) };
-            let mut decided: Vec<&String> = read.own_reveals.iter().filter(|h| h.r == c.r - 1).flat_map(|h| &h.x).collect();
-            // (Its own memory too: a peer can delete the reveal from the doc.)
-            if let Some(Done { r, x: Some(x), .. }) = &last {
-                if *r == c.r - 1 && *r > read.base_u {
-                    decided.push(x);
-                }
+        let mut line: HashSet<&str> = HashSet::from([sid.as_str()]);
+        loop {
+            let on: HashSet<&str> = good.iter().filter(|c| c.r == read.top + 1 && line.contains(c.q.as_str())).map(|c| c.hash.as_str()).collect();
+            if on.is_empty() {
+                break;
             }
-            if parent_ok && (decided.is_empty() || decided.iter().all(|x| **x == c.q)) {
-                on_chain.insert(c.hash.clone(), c.r);
+            read.top += 1;
+            line = on;
+        }
+        let remembered = self.last_of(&read.ctx).and_then(|d| d.d.clone());
+        let mut before: HashMap<String, Decision> = HashMap::new();
+        let mut r = read.base_u + 1;
+        loop {
+            let at_r: Vec<Close> = good.iter().filter(|c| c.r == r).cloned().collect();
+            if at_r.is_empty() {
+                break;
+            }
+            let first = r == read.base_u + 1;
+            let house_line: Vec<String> = before.iter().filter(|(_, d)| matches!(d, Decision::House(_))).map(|(h, _)| h.clone()).collect();
+            let mut here: HashMap<String, Decision> = HashMap::new();
+            let mut considered = 0;
+            for c in at_r {
+                if (first && c.q != sid) || (!first && !before.contains_key(&c.q)) {
+                    continue;
+                }
+                let req = if first {
+                    read.cp_h.clone()
+                } else {
+                    match &before[&c.q] {
+                        Decision::House(c) => c.clone(),
+                        Decision::Other => None,
+                    }
+                };
+                if !commit_ok(&read, &c, req.as_deref()) {
+                    continue;
+                }
+                if considered >= MAX_CLOSES_PER_ROUND {
+                    break;
+                }
+                considered += 1;
+                if !house_line.is_empty() && !house_line.contains(&c.q) {
+                    continue;
+                }
+                if remembered.as_ref().is_some_and(|(dr, x)| *dr == r - 1 && *dr > read.base_u && *x != c.q) {
+                    continue;
+                }
+                if let Some(d) = self.decide(&read, &c, &forfeits, &abandons) {
+                    here.insert(c.hash.clone(), d);
+                }
                 read.closes.push(c);
             }
+            if here.is_empty() {
+                break;
+            }
+            before = here;
+            r += 1;
         }
-        for (x, k, v) in abandons {
-            if !on_chain.contains_key(&x) || read.abandoned.contains(&x) {
+        let eligible: HashSet<String> = read.closes.iter().map(|c| c.hash.clone()).collect();
+        for (x, r, k, v) in abandons {
+            if !eligible.contains(&x) || read.abandoned.contains(&x) {
                 continue;
             }
-            let hash = hb::rec_hash(&v).unwrap_or_default();
-            let g = str_of(&v, "g").unwrap_or("").to_string();
-            if self.verified("abandon", at, &hash, &k, hb::sign_bytes("abandon", &read.ctx, &v), &g) {
+            if self.abandon_ok(at, &read.ctx, r, &k, &v) {
                 read.abandoned.insert(x);
             }
         }
         Some(read)
     }
 
+    /// A slip's signature, checked once.
+    fn slip_ok(&mut self, at: [&str; 3], hash: &str, s: &Slip, ctx: &Ctx) -> bool {
+        let g = str_of(&s.v, "g").unwrap_or("").to_string();
+        self.verified("slip", at, hash, &s.k, hb::sign_bytes("slip", ctx, &s.v), &g)
+    }
+
+    fn abandon_ok(&mut self, at: [&str; 3], ctx: &Ctx, _r: i64, k: &str, v: &CVal) -> bool {
+        let hash = hb::rec_hash(v).unwrap_or_default();
+        let g = str_of(v, "g").unwrap_or("").to_string();
+        self.verified("abandon", at, &hash, k, hb::sign_bytes("abandon", ctx, v), &g)
+    }
+
+    /// Whether close c is decided, and how (computedFold decide): a Fair one
+    /// by a house's reveal listing it once every seed it counts is in, a
+    /// Friendly one by a forfeit, or by every frozen slip there with its seed;
+    /// either by an abandon.
+    fn decide(&mut self, read: &TableRead, c: &Close, forfeits: &[Forfeit], abandons: &[(String, i64, String, CVal)]) -> Option<Decision> {
+        let ctx = &read.ctx;
+        let at = [ctx.room.clone(), ctx.t.clone(), ctx.inc.clone()];
+        let at = [at[0].as_str(), at[1].as_str(), at[2].as_str()];
+        let craps = craps_inc(&ctx.inc);
+        // P, the frozen slips there and good (at roulette with chips on:
+        // computedFold frozenOk), and how many aren't (M).
+        let mut present: Vec<(String, String, Slip)> = Vec::new();
+        let mut missing = 0;
+        for (p, sh) in &c.f {
+            match read.slips.get(sh) {
+                Some(s) if s.pid == *p && s.r == c.r && (craps || s.chips) && self.slip_ok(at, sh, s, ctx) => {
+                    present.push((p.clone(), sh.clone(), s.clone()))
+                }
+                _ => missing += 1,
+            }
+        }
+        let seeded = |p: &str, s: &Slip| read.seeds.get(&(c.r, p.to_string())).is_some_and(|ss| ss.iter().any(|x| hb::slip_commit(ctx, c.r, p, x) == s.c));
+        let mut decided = None;
+        if let Some(h) = &c.h {
+            let mut cands: Vec<&Reveal> = read.reveals.iter().filter(|e| e.r == c.r && e.commit == *h && e.x.contains(&c.hash)).collect();
+            cands.sort_by(|a, b| a.hash.cmp(&b.hash));
+            if let Some(hr) = cands.first() {
+                if present.iter().filter(|(_, sh, _)| hr.n.contains(sh)).all(|(p, _, s)| seeded(p, s)) {
+                    decided = Some(Decision::House(hr.c.clone()));
+                }
+            }
+        } else {
+            for f in forfeits.iter().filter(|f| f.x == c.hash && f.r == c.r) {
+                let in_p = |p: &String| present.iter().find(|(q, _, _)| q == p);
+                if !f.n.iter().all(|p| in_p(p).is_some_and(|(q, _, s)| seeded(q, s))) || !f.n.iter().any(|p| in_p(p).is_some_and(|(_, _, s)| s.k == f.k)) {
+                    continue;
+                }
+                let g = str_of(&f.v, "g").unwrap_or("").to_string();
+                if self.verified("forfeit", at, &f.hash, &f.k, hb::sign_bytes("forfeit", ctx, &f.v), &g) {
+                    decided = Some(Decision::Other);
+                    break;
+                }
+            }
+            if decided.is_none() && missing == 0 && present.iter().all(|(p, _, s)| seeded(p, s)) {
+                decided = Some(Decision::Other);
+            }
+        }
+        if decided.is_none() {
+            for (x, r, k, v) in abandons.iter().filter(|(x, r, _, _)| *x == c.hash && *r == c.r) {
+                let _ = x;
+                if self.abandon_ok(at, ctx, *r, k, v) {
+                    decided = Some(Decision::Other);
+                    break;
+                }
+            }
+        }
+        decided
+    }
+
+    /// Its reveals at table `ctx` in session `ses` so far, and `rec`: the
+    /// newest [`MAX_KEPT`].
+    fn kept_with(&self, ctx: &Ctx, ses: &str, rec: &CVal) -> Vec<Kept> {
+        let mut kept: Vec<Kept> = self.last_of(ctx).map_or(vec![], |d| d.kept.iter().filter(|k| k.ses == ses).cloned().collect());
+        let r = rec.get("r").and_then(CVal::as_int).unwrap_or(0);
+        let hash = hb::rec_hash(rec).expect("the house's own records are canonical");
+        kept.push(Kept { ses: ses.to_string(), key: format!("h:{r}:{hash}"), rec: rec.clone() });
+        let over = kept.len().saturating_sub(MAX_KEPT);
+        kept.drain(..over);
+        kept
+    }
+
     /// One table's join, reveal and step-down.
     fn table_duties(&mut self, room: &str, read: &TableRead, friendly: bool, now: u64, writes: &mut Vec<Write>) {
         let ctx = &read.ctx;
-        let done = read.own_reveals.iter().map(|h| h.r).fold(self.done_of(ctx), i64::max);
+        let done = read.own_reveals().map(|h| h.r).fold(self.done_of(ctx), i64::max);
         let carried = |r: i64, me: &House| {
             let c = me.commit(ctx, r);
-            read.own_reveals.iter().any(|h| h.r == r - 1 && h.c.as_deref() == Some(c.as_str()))
+            read.own_reveals().any(|h| h.r == r - 1 && h.c.as_deref() == Some(c.as_str()))
                 || me.last_of(ctx).is_some_and(|d| d.r == r - 1 && d.c)
                 || (r == read.base_u + 1 && read.cp_h.as_deref() == Some(c.as_str()))
         };
         let joined = |r: i64, me: &House| {
             let c = me.commit(ctx, r);
-            read.own_joins.iter().any(|(jr, jc)| *jr == r && *jc == c)
+            read.joins.iter().any(|o| o.r == r && o.k == read.me && o.c == c)
         };
 
         let key = (ctx.t.clone(), ctx.inc.clone());
         let settle_ms = self.settle_ms;
+        let kept = self.last_of(ctx).map(|d| d.kept.clone()).unwrap_or_default();
         let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
+        if mem.first_read.is_none() {
+            // After a start: its reveals from before go back as this run's do.
+            for k in kept {
+                if !mem.written.iter().any(|(_, key, _)| *key == k.key) {
+                    mem.written.push((k.ses, k.key, k.rec));
+                }
+            }
+        }
         let settling = now.saturating_sub(*mem.first_read.get_or_insert(now)) < settle_ms;
         // A trim opened a new session: what was written into the old one is
         // the trim's to carry (its copies and the checkpoint's `h`).
@@ -942,7 +1225,6 @@ impl House {
         let mut rounds: Vec<i64> = read.closes.iter().map(|c| c.r).filter(|r| *r > done).collect();
         rounds.sort();
         rounds.dedup();
-        let last_closed = read.closes.iter().map(|c| c.r).max().unwrap_or(0);
         let mut revealed_now: Option<i64> = None;
         for r in rounds {
             let commit = self.commit(ctx, r);
@@ -951,7 +1233,7 @@ impl House {
             for c in read.closes_at(r).filter(|c| c.h.as_deref() == Some(commit.as_str())) {
                 if !mem.first_seen.contains_key(&c.hash) {
                     mem.first_seen.insert(c.hash.clone(), now);
-                    if settling || read.abandoned.contains(&c.hash) || last_closed > r {
+                    if settling || read.abandoned.contains(&c.hash) || read.top > r {
                         mem.blocked.insert(c.hash.clone());
                     }
                 }
@@ -966,9 +1248,12 @@ impl House {
             listed.truncate(MAX_CLOSES_PER_ROUND);
             let joinable = !carried(r, self);
             let mem = self.rooms.get_mut(room).unwrap().tables.get_mut(&key).unwrap();
-            // At a round it joined, a close naming anything else is a choice
-            // the house won't hand out.
-            if joinable && read.closes_at(r).any(|c| c.h.as_deref() != Some(commit.as_str())) {
+            // At a round it joined: a Friendly close beside is a choice the
+            // house won't hand out (see that close's result, then choose);
+            // and of several houses' joins the pages name the lowest, so the
+            // round is that one's (no second house's outcome to choose).
+            let first_join = read.joins_at(r).first().map(|o| o.c.as_str() == commit);
+            if joinable && (read.closes_at(r).any(|c| c.h.is_none()) || first_join != Some(true)) {
                 mem.refused.insert(r);
                 continue;
             }
@@ -999,9 +1284,7 @@ impl House {
             n.truncate(MAX_HOUSE_COUNTED);
             let x = vec![best.hash.clone()];
             let next = (!friendly && !self.stepping_down).then(|| self.commit(ctx, r + 1));
-            if !self.mark_done(ctx, Done { r, x: Some(best.hash.clone()), c: next.is_some() }) {
-                break;
-            }
+            let carries = next.is_some();
             let mut body = vec![
                 ("r".to_string(), CVal::Int(r)),
                 ("s".to_string(), CVal::Str(self.key.seed(ctx, r))),
@@ -1013,6 +1296,10 @@ impl House {
             }
             body.push(("k".to_string(), CVal::Str(self.key.public.clone())));
             let rec = self.signed("hreveal", ctx, body);
+            let kept = self.kept_with(ctx, &read.ses_key, &rec);
+            if !self.mark_done(ctx, Done { r, d: Some((r, best.hash.clone())), c: carries, kept }) {
+                break;
+            }
             self.write_session(room, &key, &read.ses_key, 'h', r, rec, writes);
             revealed_now = Some(r);
             break;
@@ -1031,9 +1318,6 @@ impl House {
             if read.closes_at(r).any(|c| c.h.as_deref() == Some(commit.as_str())) {
                 return;
             }
-            if !self.mark_done(ctx, Done { r, x: None, c: false }) {
-                return;
-            }
             let body = vec![
                 ("r".to_string(), CVal::Int(r)),
                 ("s".to_string(), CVal::Str(self.key.seed(ctx, r))),
@@ -1042,6 +1326,13 @@ impl House {
                 ("k".to_string(), CVal::Str(self.key.public.clone())),
             ];
             let rec = self.signed("hreveal", ctx, body);
+            // (The close it last decided stays: the round after it carries
+            // on that line alone, whatever is deleted.)
+            let d = self.last_of(ctx).and_then(|d| d.d.clone());
+            let kept = self.kept_with(ctx, &read.ses_key, &rec);
+            if !self.mark_done(ctx, Done { r, d, c: false, kept }) {
+                return;
+            }
             self.write_session(room, &key, &read.ses_key, 'h', r, rec, writes);
             return;
         }
@@ -1051,6 +1342,13 @@ impl House {
         // whose reveal carries the next commitment).
         let r = read.next_round();
         if settling || r <= done || revealed_now.is_some() || carried(r, self) || joined(r, self) {
+            return;
+        }
+        // Nor when another of the owner's houses has: it joined the round,
+        // or its reveal of the round before carried a commitment no
+        // step-down has lifted (one house to a round: two would let a bettor
+        // see both outcomes).
+        if !read.joins_at(r).is_empty() || read.reveals.iter().any(|h| h.r == r - 1 && h.c.as_deref().is_some_and(|c| !read.stepped_down(r, c))) {
             return;
         }
         let mem = &self.rooms[room].tables[&key];
@@ -1080,6 +1378,20 @@ impl House {
         let mem = self.rooms.get_mut(room).unwrap().tables.get_mut(table).unwrap();
         mem.written.push((ses.to_string(), key.clone(), rec.clone()));
         writes.push(Write::Session { ses: ses.to_string(), key, value: rec });
+    }
+}
+
+/// computedFold commitState: whether close c names what its round asks for,
+/// `req` being the commitment required after its parent: that one, unless a
+/// step-down lifted it; else nothing, or a join's commitment no step-down
+/// opened.
+fn commit_ok(read: &TableRead, c: &Close, req: Option<&str>) -> bool {
+    if let Some(req) = req.filter(|req| !read.stepped_down(c.r, req)) {
+        return c.h.as_deref() == Some(req);
+    }
+    match &c.h {
+        None => true,
+        Some(h) => !read.stepped_down(c.r, h) && read.joins.iter().any(|o| o.r == c.r && o.c == *h),
     }
 }
 
@@ -1144,26 +1456,49 @@ fn apply(doc: &Doc, writes: &[Write]) -> Option<Vec<u8>> {
 
 // ── The state file ───────────────────────────────────────────────────────────
 
-/// The state file: `{"v": 2, "done": [[room, t, inc, r, x | null, c], …]}`
-/// (v 1 rows, `[room, t, inc, r]`, read as having decided nothing to carry on).
+/// The state file: `{"v": 3, "done": [[room, t, inc, r, dr | null, x | null, c, kept], …]}`,
+/// `dr` and `x` the last round decided and its close, `kept` its reveals in
+/// the live session (`[ses, key, canon]` each). Older rows read as deciding what their
+/// round revealed (v 2, `[room, t, inc, r, x | null, c]`) or nothing to
+/// carry on (v 1, `[room, t, inc, r]`), neither keeping a reveal.
 fn parse_state(bytes: &[u8]) -> Option<HashMap<(String, String, String), Done>> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let version = v.get("v")?.as_u64()?;
-    if version != 1 && version != 2 {
+    if !(1..=3).contains(&version) {
         return None;
     }
+    let hash = |x: &serde_json::Value| -> Option<Option<String>> {
+        match x {
+            serde_json::Value::Null => Some(None),
+            x => Some(Some(x.as_str().filter(|x| hex_of(x, 32))?.to_string())),
+        }
+    };
+    let kept = |k: &serde_json::Value| -> Option<Kept> {
+        let k = k.as_array().filter(|k| k.len() == 3)?;
+        let (ses, key) = (k[0].as_str()?, k[1].as_str()?);
+        let rec = CVal::from_json(&serde_json::from_str(k[2].as_str()?).ok()?);
+        let (kind, _, _, h) = parse_key(key)?;
+        (kind == 'h' && ses.starts_with("ses:") && hb::rec_hash(&rec).as_deref() == Some(h)).then(|| Kept { ses: ses.to_string(), key: key.to_string(), rec })
+    };
     let mut out = HashMap::new();
     for row in v.get("done")?.as_array()? {
         let row = row.as_array()?;
         let (room, t, inc, r) = (row.first()?.as_str()?, row.get(1)?.as_str()?, row.get(2)?.as_str()?, row.get(3)?.as_i64()?);
-        let done = if version == 1 {
-            (row.len() == 4).then_some(Done { r, x: None, c: false })?
-        } else {
-            let x = match row.get(4)? {
-                serde_json::Value::Null => None,
-                x => Some(x.as_str().filter(|x| hex_of(x, 32))?.to_string()),
-            };
-            (row.len() == 6).then_some(Done { r, x, c: row.get(5)?.as_bool()? })?
+        let done = match version {
+            1 => (row.len() == 4).then_some(Done { r, ..Done::default() })?,
+            2 => {
+                let x = hash(row.get(4)?)?;
+                (row.len() == 6).then_some(Done { r, d: x.map(|x| (r, x)), c: row.get(5)?.as_bool()?, kept: vec![] })?
+            }
+            _ => {
+                let d = match (row.get(4)?, hash(row.get(5)?)?) {
+                    (serde_json::Value::Null, None) => None,
+                    (dr, Some(x)) => Some((dr.as_i64().filter(|dr| (1..=r).contains(dr))?, x)),
+                    _ => return None,
+                };
+                let kept: Vec<Kept> = row.get(7)?.as_array()?.iter().map(kept).collect::<Option<_>>()?;
+                (row.len() == 8).then_some(Done { r, d, c: row.get(6)?.as_bool()?, kept })?
+            }
         };
         out.insert((room.to_string(), t.to_string(), inc.to_string()), done);
     }
@@ -1171,9 +1506,16 @@ fn parse_state(bytes: &[u8]) -> Option<HashMap<(String, String, String), Done>> 
 }
 
 fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), Done>) -> std::io::Result<()> {
-    let mut rows: Vec<_> = done.iter().map(|((room, t, inc), d)| serde_json::json!([room, t, inc, d.r, d.x, d.c])).collect();
+    let mut rows: Vec<_> = done
+        .iter()
+        .map(|((room, t, inc), d)| {
+            let (dr, x) = d.d.clone().map_or((None, None), |(dr, x)| (Some(dr), Some(x)));
+            let kept: Vec<_> = d.kept.iter().map(|k| serde_json::json!([k.ses, k.key, hb::canon(&k.rec)])).collect();
+            serde_json::json!([room, t, inc, d.r, dr, x, d.c, kept])
+        })
+        .collect();
     rows.sort_by_key(|row| row.to_string());
-    let body = serde_json::to_vec(&serde_json::json!({ "v": 2, "done": rows }))?;
+    let body = serde_json::to_vec(&serde_json::json!({ "v": 3, "done": rows }))?;
     let tmp = path.with_extension("json.tmp");
     {
         use std::io::Write as _;

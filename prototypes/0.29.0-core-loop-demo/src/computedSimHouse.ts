@@ -5,18 +5,19 @@
  * A twin of ssf-p2p-node's house job (house.rs), rule for rule, in
  * TypeScript: the same reads (a room counts once it holds this house's
  * delegation by the deed holder's pinned key; the house tables switched on
- * and live; each live session's slips, seeds, closes on the chain, abandons,
- * and its own records), the same duties (join, reveal, step down, beat, put
- * back) and the same bytes (computedHouse's derivations and signatures, the
+ * and live; each live session's slips, seeds, the closes the pages' fold
+ * takes as eligible, forfeits, abandons, and every delegated house's
+ * records), the same duties (join, reveal, step down, beat, put back) and
+ * the same bytes (computedHouse's derivations and signatures, the
  * fold's signed bytes: house_bytes.rs is held to them by the shared test
  * vectors). A change to one is a change to both.
  *
  * Where it runs: the owner's node is the house, and the owner's page talks to
  * the room through it. The sim has no node of its own, so the twin reads and
  * writes the doc of the house's page (the owner's), on its own clock, with
- * its own memory: what it revealed (house.rs's state file, kept across a
- * restart unless a scenario wipes it), when it first saw each close and
- * seed. Its writes are local transactions of that doc under HOUSE_ORIGIN, so
+ * its own memory: what it revealed and decided, and its reveals (house.rs's
+ * state file, kept across a restart unless a scenario wipes it), when it
+ * first saw each close and seed. Its writes are local transactions of that doc under HOUSE_ORIGIN, so
  * the page sends them to the room as it sends its own (and the sim's
  * oracles of a page's own writes leave them alone). While the owner's page is
  * gone, or asleep with its doc not syncing, the house hears nothing and
@@ -26,8 +27,8 @@
 
 import * as Y from 'yjs';
 import {
-  asCheckpointFor, asSlipFor, dutyRank, hasFields, houseCommitOf, houseRules, isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND,
-  MAX_FROZEN, MAX_HOUSE_COUNTED, nextSid, parseKey, recHash, signBytes, slipCommit,
+  asAbandon, asCheckpointFor, asForfeit, asHouseCommit, asHouseReveal, asSlipFor, dutyRank, hasFields, houseCommitOf, houseRules,
+  isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND, MAX_FROZEN, MAX_HOUSE_COUNTED, nextSid, parseKey, recHash, signBytes, slipCommit,
 } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
 import { beatKey, delegationKey, HEARTBEAT_MS, housePubOf, houseSeedOf, houseSign, roomSignBytes } from './computedHouse';
@@ -48,6 +49,8 @@ export const REVEAL_CUTOFF_MS = 14_000;
  *  of a close first seen in this long. */
 export const SETTLE_MS = 5_000;
 const MAX_SESSION_KEYS = 8_192;
+/** house.rs MAX_KEPT: the most reveals of a session its state file keeps. */
+const MAX_KEPT = 64;
 
 const HEX = (n: number): RegExp => new RegExp(`^[0-9a-f]{${n}}$`);
 const HEX24 = HEX(24);
@@ -62,6 +65,15 @@ const isPid = (s: string): boolean => s.length > 0 && s.length <= 256 && s !== '
  *  such a slip can sign a close). */
 interface Slip { r: number; pid: string; c: string; k: string; chips: boolean; v: Record<string, unknown> }
 interface Close { hash: string; r: number; q: string; f: [string, string][]; k: string; h: string | undefined; rank: string }
+/** A reveal of any house the deed holder delegated, as it signed it:
+ *  `commit` is the commitment its seed opens; `x` empty, a step-down. */
+interface Reveal { k: string; r: number; hash: string; commit: string; x: string[]; n: string[]; c: string | undefined }
+interface Join { k: string; r: number; hash: string; c: string }
+interface Forfeit { hash: string; r: number; x: string; n: string[]; k: string; v: Record<string, unknown> }
+/** How a close on the chain was decided (computedFold decide): by a house's
+ *  reveal (carrying the commitment the next round must name, if any), or
+ *  otherwise (a forfeit, every seed in, an abandon). */
+type Decision = { house: true; c: string | undefined } | { house: false };
 
 interface TableRead {
   ctx: FoldCtx;
@@ -71,15 +83,19 @@ interface TableRead {
   slips: Map<string, Slip>;
   /** `${r}|${pid}` → the seeds revealed. */
   seeds: Map<string, string[]>;
-  /** Closes on the chain (parent the session or a close of the round
-   *  before; after a round this house decided, the close it decided), by
-   *  round order. */
+  /** The closes the pages' fold takes as eligible (computedFold compute,
+   *  step 1), by round: signed by a slip they freeze, under a parent decided
+   *  at the round before (the session, for the first), naming what their
+   *  round asks for, the first MAX_CLOSES_PER_ROUND by rank. After a round a
+   *  house decided, only the close it decided has children here. */
   closes: Close[];
+  /** The latest round a signed close reaches on a line of them from the
+   *  base, decided or not (house.rs TableRead top). */
+  top: number;
   abandoned: Set<string>;
-  /** Its own reveals (x: the close it decided; none, a step-down) and joins,
-   *  as it signed them. */
-  ownReveals: { r: number; c: string | undefined; x: string[] }[];
-  ownJoins: { r: number; c: string }[];
+  /** Every delegated house's reveals and joins, this one's among them. */
+  reveals: Reveal[];
+  joins: Join[];
 }
 
 interface TableMem {
@@ -97,6 +113,9 @@ interface RoomMem {
   /** Each player's key as first seen (trust on first use, as the pages pin). */
   pins: Map<string, string>;
   delegation: Record<string, unknown> | null;
+  /** Every other house the deed holder delegated, with the key that signed
+   *  its delegation, as first verified (casinoDoc housePinned). */
+  houses: Map<string, string>;
   fair: Map<string, Record<string, unknown>>;
   tables: Map<string, TableMem>;
   lastBeat: number | null;
@@ -105,10 +124,13 @@ interface RoomMem {
 }
 
 /** What it last did at a table (house.rs Done, in its state file): the
- *  highest round revealed or stepped down, the close it decided there (none:
- *  a step-down), and whether that reveal carried the next commitment. The
- *  doc's copy of the reveal can be deleted; these hold all the same. */
-interface Done { r: number; x: string | undefined; c: boolean }
+ *  highest round revealed or stepped down; the last round it decided and the
+ *  close it decided there (a step-down after keeps them); whether the reveal
+ *  of round `r` carried the next commitment; and its reveals in the live
+ *  session, as it wrote them (put back after a restart, as during a run).
+ *  The doc's copy of a reveal can be deleted; these hold all the same. */
+interface Done { r: number; d: [number, string] | undefined; c: boolean; kept: Kept[] }
+interface Kept { ses: string; key: string; rec: Record<string, unknown> }
 
 type Write = { ses: string; key: string; value: Record<string, unknown> } | { ses: null; key: string; value: Record<string, unknown> };
 
@@ -221,7 +243,9 @@ export class SimHouse {
     const owner = doc.getMap('roomInfo').get('owner');
     if (typeof owner !== 'string' || owner === '' || owner === 'Local-Clone') return writes;
     let mem = this.rooms.get(room);
-    if (!mem) this.rooms.set(room, mem = { pins: new Map(), delegation: null, fair: new Map(), tables: new Map(), lastBeat: null, beatN: 0, lastReput: null });
+    if (!mem) {
+      this.rooms.set(room, mem = { pins: new Map(), delegation: null, houses: new Map(), fair: new Map(), tables: new Map(), lastBeat: null, beatN: 0, lastReput: null });
+    }
     const roomMem = mem;
     const ownerKey = this.pinOf(roomMem, doc, owner);
     if (ownerKey === undefined) return writes;
@@ -236,6 +260,19 @@ export class SimHouse {
     }
     if (!delegation) return writes;
     mem.delegation = delegation;
+
+    // Every house the deed holder delegated: another of their nodes is a
+    // house of the room as this one is, and its records hold the line, the
+    // joins and the step-downs as this one's do.
+    for (const [key, v] of comp.entries()) {
+      const h = key.startsWith('hk:') ? key.slice(3) : '';
+      if (!isPub(h) || h === this.pub || mem.houses.get(h) === ownerKey) continue;
+      if (isPlain(v) && hasFields(v, ['v', 'h', 'k', 'g']) && v.v === 1 && v.h === h && v.k === ownerKey && this.roomOk('hkey', room, '', v, ownerKey)) {
+        mem.houses.set(h, ownerKey);
+      }
+    }
+    const houses = new Set([...mem.houses].filter(([, k]) => k === ownerKey).map(([h]) => h));
+    houses.add(this.pub);
 
     // The owner's Fair settings, newest first seen (a new deed holder's count
     // afresh: the last one's settings go).
@@ -264,7 +301,7 @@ export class SimHouse {
 
     let fairTables = 0;
     for (const [t, inc] of tables) {
-      const read = this.readTable(comp, { room, t, inc }, (pid) => this.pinOf(roomMem, doc, pid));
+      const read = this.readTable(comp, { room, t, inc }, houses);
       if (!read) continue;
       const friendly = mem.fair.get(t)?.m === 1;
       if (!friendly) fairTables += 1;
@@ -321,8 +358,9 @@ export class SimHouse {
   }
 
   /** Table ctx's live session, as house.rs read_table reads it (null with
-   *  none, or once its incarnation has ended). */
-  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx, pinOf: (pid: string) => string | undefined): TableRead | null {
+   *  none, or once its incarnation has ended). `houses`: every house the deed
+   *  holder delegated, this one among them. */
+  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx, houses: Set<string>): TableRead | null {
     const cp = asCheckpointFor(ctx)(comp.get(`sum:${ctx.t}:${ctx.inc}`));
     if (cp?.e === 1) return null;
     const sid = nextSid(ctx, cp);
@@ -331,11 +369,13 @@ export class SimHouse {
     if (!(ses instanceof Y.Map)) return null;
     const asSlip = asSlipFor(ctx);
     const read: TableRead = {
-      ctx, baseU: cp?.u ?? 0, cpH: cp?.h, sesKey, slips: new Map(), seeds: new Map(), closes: [], abandoned: new Set(), ownReveals: [], ownJoins: [],
+      ctx, baseU: cp?.u ?? 0, cpH: cp?.h, sesKey, slips: new Map(), seeds: new Map(), closes: [], top: cp?.u ?? 0, abandoned: new Set(),
+      reveals: [], joins: [],
     };
     const closes: [Close, Record<string, unknown>][] = [];
-    const abandons: [string, string, Record<string, unknown>][] = [];
-    const own: ['h' | 'o', number, string, Record<string, unknown>][] = [];
+    const abandons: [string, number, string, Record<string, unknown>][] = [];
+    const forfeits: Forfeit[] = [];
+    const houseRecs: ['h' | 'o', number, string, Record<string, unknown>, string][] = [];
     let n = 0;
     for (const [key, v] of (ses as Y.Map<unknown>).entries()) {
       if (n++ >= MAX_SESSION_KEYS) break;
@@ -372,85 +412,185 @@ export class SimHouse {
           closes.push([{ hash: pk.h, r: pk.r, q, f: fs as [string, string][], k, h: v.h as string | undefined, rank: dutyRank('close', ctx, pk.r, k) }, v]);
           break;
         }
+        case 'f': {
+          const f = asForfeit(v);
+          if (f) forfeits.push({ hash: pk.h, r: pk.r, x: f.x, n: [...f.n], k: f.k, v });
+          break;
+        }
         case 'z': {
-          if (hasFields(v, ['r', 'x', 'k', 'g']) && gOk && isHex(HEX32)(v.x) && k) abandons.push([v.x as string, k, v]);
+          if (asAbandon(v)) abandons.push([v.x as string, pk.r, v.k as string, v]);
           break;
         }
         case 'h':
         case 'o': {
-          if (k === this.pub && gOk) own.push([pk.kind, pk.r, pk.h, v]);
+          if (gOk && k !== undefined && houses.has(k)) houseRecs.push([pk.kind, pk.r, pk.h, v, k]);
           break;
         }
         default:
       }
     }
-    // Its own records count as it signed them: a peer's copy under its key (a
-    // reveal of a high round, say) would stop it joining and revealing.
+    // The houses' records count as each signed them: a peer's copy under this
+    // house's key (a reveal of a high round, say) would stop it joining and
+    // revealing; under another's, change what a round may name.
     const at = (kind: string, hash: string): [string, string, string, string, string] => [kind, ctx.room, ctx.t, ctx.inc, hash];
-    for (const [kind, r, hash, v] of own) {
-      const signed = kind === 'h' ? 'hreveal' : 'hcommit';
-      const shapeOk = kind === 'h' ? hasFields(v, ['r', 's', 'x', 'n', 'k', 'g'], ['c']) : hasFields(v, ['r', 'c', 'k', 'g']);
-      if (!shapeOk || !this.verified(at(signed, hash), this.pub, () => signBytes(signed, ctx, v), v.g as string)) continue;
+    for (const [kind, r, hash, v, k] of houseRecs) {
       if (kind === 'h') {
-        const x = Array.isArray(v.x) ? v.x.filter((h): h is string => typeof h === 'string') : [];
-        read.ownReveals.push({ r, c: typeof v.c === 'string' ? v.c : undefined, x });
-      } else if (typeof v.c === 'string') read.ownJoins.push({ r, c: v.c });
+        const e = asHouseReveal(v);
+        if (e && this.verified(at('hreveal', hash), k, () => signBytes('hreveal', ctx, v), v.g as string)) {
+          read.reveals.push({ k, r, hash, commit: houseCommitOf(ctx, r, e.s), x: [...e.x], n: [...e.n], c: e.c });
+        }
+      } else {
+        const o = asHouseCommit(v);
+        if (o && this.verified(at('hcommit', hash), k, () => signBytes('hcommit', ctx, v), v.g as string)) read.joins.push({ k, r, hash, c: o.c });
+      }
     }
-    // A close counts when one of the slips it freezes is its signer's, that
-    // slip as the pages take it (computedFold closeInfo): its player's pinned
-    // key, its signature, chips on it. One the pages throw out would only
-    // void the round's real close if revealed...
+    // A close counts when it is signed by one of the slips it freezes, that
+    // slip as the pages take it (computedFold closeInfo): its signature good,
+    // chips on it. One the pages throw out would only void the round's real
+    // close if revealed.
     const good: Close[] = [];
     for (const [c, v] of closes) {
       const signer = c.f.some(([p, sh]) => {
         const s = read.slips.get(sh);
-        return s !== undefined && s.pid === p && s.r === c.r && s.k === c.k && s.chips && pinOf(p) === s.k
-          && this.verified(at('slip', sh), s.k, () => signBytes('slip', ctx, s.v), s.v.g as string);
+        return s !== undefined && s.pid === p && s.r === c.r && s.k === c.k && s.chips && this.slipOk(ctx, sh, s);
       });
       if (signer && this.verified(at('close', c.hash), c.k, () => signBytes('close', ctx, v), v.g as string)) good.push(c);
     }
-    // ...and its parent is the session (its first round) or a close counted
-    // at the round before, no round skipped; after a round this house
-    // decided, the close it decided: it reveals one close a round, and
-    // carries on that line alone, so no rival gets a second look.
-    good.sort((a, b) => a.r - b.r);
-    const last = this.lastOf(ctx);
-    const onChain = new Map<string, number>();
-    for (const c of good) {
-      const parentOk = c.r === read.baseU + 1 ? c.q === sid : c.r > read.baseU + 1 && onChain.get(c.q) === c.r - 1;
-      const decided = read.ownReveals.filter((h) => h.r === c.r - 1).flatMap((h) => h.x);
-      // (Its own memory too: a peer can delete the reveal from the doc.)
-      if (last?.x !== undefined && last.r === c.r - 1 && last.r > read.baseU) decided.push(last.x);
-      if (!parentOk || !decided.every((x) => x === c.q)) continue;
-      onChain.set(c.hash, c.r);
-      read.closes.push(c);
+    good.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
+    // How far a line of signed closes reaches, decided or not.
+    let line = new Set([sid]);
+    for (;;) {
+      const on = new Set(good.filter((c) => c.r === read.top + 1 && line.has(c.q)).map((c) => c.hash));
+      if (on.size === 0) break;
+      read.top += 1;
+      line = on;
     }
-    for (const [x, k, v] of abandons) {
-      if (!onChain.has(x) || read.abandoned.has(x)) continue;
-      if (this.verified(at('abandon', recHash(v) ?? ''), k, () => signBytes('abandon', ctx, v), v.g as string)) read.abandoned.add(x);
+    // The chain as the pages' fold walks it (computedFold compute, step 1):
+    // round by round from the base, a close is eligible under a parent
+    // decided at the round before (the session, for the first), naming what
+    // its round asks for; the first round with nothing decided ends it, and
+    // only the first MAX_CLOSES_PER_ROUND by rank take a place. And the
+    // house's own rule on top: after a round a house decided, only the close
+    // it decided has children (its own memory of it too: a peer can delete
+    // the reveal), so no rival gets a second look.
+    const remembered = this.lastOf(ctx)?.d;
+    let before = new Map<string, Decision>();
+    for (let r = read.baseU + 1; ; r++) {
+      const atR = good.filter((c) => c.r === r);
+      if (atR.length === 0) break;
+      const first = r === read.baseU + 1;
+      const houseLine = [...before].filter(([, d]) => d.house).map(([h]) => h);
+      const here = new Map<string, Decision>();
+      let considered = 0;
+      for (const c of atR) {
+        if (first ? c.q !== sid : !before.has(c.q)) continue;
+        const parent = before.get(c.q);
+        const req = first ? read.cpH : parent?.house ? parent.c : undefined;
+        if (!commitOk(read, c, req)) continue;
+        if (considered >= MAX_CLOSES_PER_ROUND) break;
+        considered += 1;
+        if (houseLine.length > 0 && !houseLine.includes(c.q)) continue;
+        if (remembered !== undefined && remembered[0] === r - 1 && remembered[0] > read.baseU && remembered[1] !== c.q) continue;
+        const d = this.decide(read, c, forfeits, abandons);
+        if (d) here.set(c.hash, d);
+        read.closes.push(c);
+      }
+      if (here.size === 0) break;
+      before = here;
+    }
+    const eligible = new Set(read.closes.map((c) => c.hash));
+    for (const [x, r, k, v] of abandons) {
+      if (!eligible.has(x) || read.abandoned.has(x)) continue;
+      if (this.abandonOk(ctx, r, k, v)) read.abandoned.add(x);
     }
     return read;
+  }
+
+  private slipOk(ctx: FoldCtx, hash: string, s: Slip): boolean {
+    return this.verified(['slip', ctx.room, ctx.t, ctx.inc, hash], s.k, () => signBytes('slip', ctx, s.v), s.v.g as string);
+  }
+
+  private abandonOk(ctx: FoldCtx, _r: number, k: string, v: Record<string, unknown>): boolean {
+    return this.verified(['abandon', ctx.room, ctx.t, ctx.inc, recHash(v) ?? ''], k, () => signBytes('abandon', ctx, v), v.g as string);
+  }
+
+  /** Whether close c is decided, and how (computedFold decide): a Fair one by
+   *  a house's reveal listing it once every seed it counts is in, a Friendly
+   *  one by a forfeit, or by every frozen slip there with its seed; either by
+   *  an abandon. */
+  private decide(read: TableRead, c: Close, forfeits: Forfeit[], abandons: [string, number, string, Record<string, unknown>][]): Decision | null {
+    const { ctx } = read;
+    const craps = ctx.inc.startsWith('k') || ctx.inc.startsWith('d');
+    // P, the frozen slips there and good (at roulette with chips on:
+    // computedFold frozenOk), and how many aren't (M).
+    const present: [string, string, Slip][] = [];
+    let missing = 0;
+    for (const [p, sh] of c.f) {
+      const s = read.slips.get(sh);
+      if (s && s.pid === p && s.r === c.r && (craps || s.chips) && this.slipOk(ctx, sh, s)) present.push([p, sh, s]);
+      else missing += 1;
+    }
+    const seeded = (p: string, s: Slip): boolean => (read.seeds.get(`${c.r}|${p}`) ?? []).some((x) => slipCommit(ctx, c.r, p, x) === s.c);
+    let decided: Decision | null = null;
+    if (c.h !== undefined) {
+      const hr = read.reveals.filter((e) => e.r === c.r && e.commit === c.h && e.x.includes(c.hash)).sort((a, b) => (a.hash < b.hash ? -1 : 1))[0];
+      if (hr && present.filter(([, sh]) => hr.n.includes(sh)).every(([p, , s]) => seeded(p, s))) decided = { house: true, c: hr.c };
+    } else {
+      for (const f of forfeits.filter((x) => x.x === c.hash && x.r === c.r)) {
+        const inP = (p: string): [string, string, Slip] | undefined => present.find(([q]) => q === p);
+        if (!f.n.every((p) => { const e = inP(p); return e !== undefined && seeded(e[0], e[2]); })) continue;
+        if (!f.n.some((p) => inP(p)?.[2].k === f.k)) continue;
+        if (this.verified(['forfeit', ctx.room, ctx.t, ctx.inc, f.hash], f.k, () => signBytes('forfeit', ctx, f.v), f.v.g as string)) {
+          decided = { house: false };
+          break;
+        }
+      }
+      if (!decided && missing === 0 && present.every(([p, , s]) => seeded(p, s))) decided = { house: false };
+    }
+    if (!decided) {
+      for (const [x, r, k, v] of abandons) {
+        if (x === c.hash && r === c.r && this.abandonOk(ctx, r, k, v)) {
+          decided = { house: false };
+          break;
+        }
+      }
+    }
+    return decided;
+  }
+
+  /** Its reveals at table `ctx` in session `ses` so far, and `rec`: the
+   *  newest MAX_KEPT. */
+  private keptWith(ctx: FoldCtx, ses: string, rec: Record<string, unknown>): Kept[] {
+    const kept = (this.lastOf(ctx)?.kept ?? []).filter((k) => k.ses === ses);
+    kept.push({ ses, key: `h:${rec.r as number}:${recHash(rec)}`, rec });
+    return kept.slice(-MAX_KEPT);
   }
 
   /** One table's reveal, step-down and join (house.rs table_duties). */
   private tableDuties(room: RoomMem, read: TableRead, friendly: boolean, now: number, writes: Write[], out: HouseTickOut): void {
     const { ctx } = read;
-    let done = Math.max(this.doneOf(ctx), ...read.ownReveals.map((h) => h.r));
+    const own = read.reveals.filter((h) => h.k === this.pub);
+    const doneKey = `${ctx.room}|${ctx.t}|${ctx.inc}`;
+    let done = Math.max(this.doneOf(ctx), ...own.map((h) => h.r));
     const carried = (r: number): boolean => {
       const c = this.commit(ctx, r);
       const last = this.lastOf(ctx);
-      return read.ownReveals.some((h) => h.r === r - 1 && h.c === c) || (last?.r === r - 1 && last.c)
+      return own.some((h) => h.r === r - 1 && h.c === c) || (last?.r === r - 1 && last.c)
         || (r === read.baseU + 1 && read.cpH === c);
     };
     const joined = (r: number): boolean => {
       const c = this.commit(ctx, r);
-      return read.ownJoins.some((j) => j.r === r && j.c === c);
+      return read.joins.some((o) => o.r === r && o.k === this.pub && o.c === c);
     };
     const closesAt = (r: number): Close[] => read.closes.filter((c) => c.r === r);
     const nextRound = (): number => Math.max(read.baseU, ...read.closes.map((c) => c.r)) + 1;
     const tkey = `${ctx.t}|${ctx.inc}`;
     let mem = room.tables.get(tkey);
-    if (!mem) room.tables.set(tkey, mem = { firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: now });
+    if (!mem) {
+      room.tables.set(tkey, mem = { firstSeen: new Map(), blocked: new Set(), seedSeen: new Map(), refused: new Set(), written: [], firstRead: now });
+      // After a start: its reveals from before go back as this run's do.
+      for (const k of this.lastOf(ctx)?.kept ?? []) mem.written.push([k.ses, k.key, k.rec]);
+    }
     const settling = now - mem.firstRead < SETTLE_MS;
     // A trim opened a new session: what went into the old one is the trim's.
     mem.written = mem.written.filter(([ses]) => ses === read.sesKey);
@@ -461,7 +601,6 @@ export class SimHouse {
     }
 
     const rounds = [...new Set(read.closes.map((c) => c.r).filter((r) => r > done))].sort((a, b) => a - b);
-    const lastClosed = Math.max(0, ...read.closes.map((c) => c.r));
     let revealedNow: number | null = null;
     for (const r of rounds) {
       const commit = this.commit(ctx, r);
@@ -469,7 +608,7 @@ export class SimHouse {
       for (const c of closesAt(r).filter((x) => x.h === commit)) {
         if (!mem.firstSeen.has(c.hash)) {
           mem.firstSeen.set(c.hash, now);
-          if (settling || read.abandoned.has(c.hash) || lastClosed > r) {
+          if (settling || read.abandoned.has(c.hash) || read.top > r) {
             mem.blocked.add(c.hash);
             this.blockedSeen += 1;
           }
@@ -479,9 +618,11 @@ export class SimHouse {
       if (listed.length === 0 || mem.refused.has(r)) continue;
       listed.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
       listed.length = Math.min(listed.length, MAX_CLOSES_PER_ROUND);
-      // At a round it joined, a close naming anything else is a choice the
-      // house won't hand out.
-      if (!carried(r) && closesAt(r).some((c) => c.h !== commit)) {
+      // At a round it joined: a Friendly close beside is a choice the house
+      // won't hand out (see that close's result, then choose); and of several
+      // houses' joins the pages name the lowest, so the round is that one's.
+      const firstJoin = joinsAt(read, r)[0];
+      if (!carried(r) && (closesAt(r).some((c) => c.h === undefined) || firstJoin?.c !== commit)) {
         mem.refused.add(r);
         this.refusals += 1;
         continue;
@@ -502,13 +643,13 @@ export class SimHouse {
       // saw: listing a rival too would show both outcomes, and let a bettor
       // carry on the one they liked.
       const n = [...new Set(best.f.map(([, sh]) => sh).filter((sh) => mem!.seedSeen.has(sh)))].sort().slice(0, MAX_HOUSE_COUNTED);
-      const x = [best.hash];
       const next = !friendly && !this.steppingDown;
-      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, { r, x: best.hash, c: next });
-      const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x, n };
+      const body: Record<string, unknown> = { r, s: this.seed(ctx, r), x: [best.hash], n };
       if (next) body.c = this.commit(ctx, r + 1);
       body.k = this.pub;
-      this.writeSession(mem, read.sesKey, 'h', r, this.signed('hreveal', ctx, body), writes);
+      const rec = this.signed('hreveal', ctx, body);
+      this.done.set(doneKey, { r, d: [r, best.hash], c: next, kept: this.keptWith(ctx, read.sesKey, rec) });
+      this.writeSession(mem, read.sesKey, 'h', r, rec, writes);
       out.reveals += 1;
       revealedNow = r;
       break;
@@ -528,8 +669,11 @@ export class SimHouse {
       if (r === null) return;
       const commit = this.commit(ctx, r);
       if (closesAt(r).some((c) => c.h === commit)) return;
-      this.done.set(`${ctx.room}|${ctx.t}|${ctx.inc}`, { r, x: undefined, c: false });
-      this.writeSession(mem, read.sesKey, 'h', r, this.signed('hreveal', ctx, { r, s: this.seed(ctx, r), x: [], n: [], k: this.pub }), writes);
+      const rec = this.signed('hreveal', ctx, { r, s: this.seed(ctx, r), x: [], n: [], k: this.pub });
+      // (The close it last decided stays: the round after it carries on
+      // that line alone, whatever is deleted.)
+      this.done.set(doneKey, { r, d: this.lastOf(ctx)?.d, c: false, kept: this.keptWith(ctx, read.sesKey, rec) });
+      this.writeSession(mem, read.sesKey, 'h', r, rec, writes);
       out.stepDowns += 1;
       return;
     }
@@ -538,6 +682,10 @@ export class SimHouse {
     // will: the round before is not one of its own still to reveal).
     const r = nextRound();
     if (settling || r <= done || revealedNow !== null || carried(r) || joined(r)) return;
+    // Nor when another of the owner's houses has: it joined the round, or its
+    // reveal of the round before carried a commitment no step-down has lifted
+    // (one house to a round: two would let a bettor see both outcomes).
+    if (joinsAt(read, r).length > 0 || read.reveals.some((h) => h.r === r - 1 && h.c !== undefined && !steppedDown(read, r, h.c))) return;
     if (mem.written.some(([, k]) => k.startsWith(`o:${r}:`))) return;
     const before = this.commit(ctx, r - 1);
     const toReveal = r - 1 > done && !mem.refused.has(r - 1)
@@ -552,6 +700,28 @@ export class SimHouse {
     mem.written.push([ses, key, rec]);
     writes.push({ ses, key, value: rec });
   }
+}
+
+/** computedFold steppedDown: a house's step-down at round r opened `h`. */
+function steppedDown(read: TableRead, r: number, h: string): boolean {
+  return read.reveals.some((e) => e.r === r && e.x.length === 0 && e.commit === h);
+}
+
+/** Round r's joins that count (not stepped down), lowest hash first: the
+ *  pages' close names the first (computedTable, `res.joins[0]`). */
+function joinsAt(read: TableRead, r: number): Join[] {
+  return read.joins.filter((o) => o.r === r && !steppedDown(read, r, o.c)).sort((a, b) => (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
+}
+
+/** computedFold commitState: whether close c names what its round asks for,
+ *  `req` the commitment its parent's deciding reveal carried (the
+ *  checkpoint's, for the first round): that one, unless a step-down lifted
+ *  it; else nothing, or a counted join's commitment no step-down revealed. */
+function commitOk(read: TableRead, c: Close, req: string | undefined): boolean {
+  if (req !== undefined && !steppedDown(read, c.r, req)) return c.h === req;
+  if (c.h === undefined) return true;
+  const h = c.h;
+  return !steppedDown(read, c.r, h) && read.joins.some((o) => o.r === c.r && o.c === h);
 }
 
 /** computedTable graceOf, as house.rs grace_of has it. */

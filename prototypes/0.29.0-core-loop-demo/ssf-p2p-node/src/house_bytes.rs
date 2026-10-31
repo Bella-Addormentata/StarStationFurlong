@@ -39,8 +39,7 @@ fn number(f: f64) -> CVal {
 }
 
 impl CVal {
-    /// From a JSON value (the test vectors).
-    #[cfg(test)]
+    /// From a JSON value (the test vectors, the house's state file).
     pub fn from_json(v: &serde_json::Value) -> CVal {
         use serde_json::Value;
         match v {

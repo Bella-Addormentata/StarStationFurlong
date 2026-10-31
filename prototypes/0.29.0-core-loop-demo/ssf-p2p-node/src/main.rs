@@ -3720,6 +3720,20 @@ async fn broadcast_tab_envelope(hub: &SharedHub, room_id: &str, kind: &str, payl
 static HOUSE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The house's monotonic clock starts here (its ticks' `now`).
 static HOUSE_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The house's sends, one tick and its send at a time (the loop's or the
+/// step-down's), and what the loop sent in the last [`HOUSE_RESEND_MS`]
+/// (when, room, update), for the step-down to send again and wait on: a
+/// Yjs update waits on every earlier one from the same doc, so one still in
+/// a buffer when the node stops would hold the step-down back with it.
+static HOUSE_SENDS: std::sync::OnceLock<tokio::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<u8>)>>> = std::sync::OnceLock::new();
+/// How long the loop's updates are kept to send again (a send on a working
+/// connection lands well inside it; one that doesn't was lost anyway, and
+/// the next sync carries it).
+const HOUSE_RESEND_MS: u64 = 10_000;
+
+fn house_sends() -> &'static tokio::sync::Mutex<std::collections::VecDeque<(u64, String, Vec<u8>)>> {
+    HOUSE_SENDS.get_or_init(|| tokio::sync::Mutex::new(std::collections::VecDeque::new()))
+}
 
 fn house_now() -> u64 {
     HOUSE_CLOCK.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
@@ -3731,9 +3745,15 @@ async fn house_loop(hub: SharedHub) {
     HOUSE_SEQ.store(rand::random::<u32>() >> 1, std::sync::atomic::Ordering::Relaxed);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
+        let mut sent = house_sends().lock().await;
         let updates = house_tick(&hub);
+        let now = house_now();
+        while sent.front().is_some_and(|(at, _, _)| now.saturating_sub(*at) > HOUSE_RESEND_MS) {
+            sent.pop_front();
+        }
         for (room_id, update) in updates {
-            send_house_update(&hub, &room_id, update, false).await;
+            send_house_update(&hub, &room_id, update.clone(), false).await;
+            sent.push_back((now, room_id, update));
         }
     }
 }
@@ -3758,13 +3778,16 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
 }
 
 /// Step the house down in every served room now, and send it: how many
-/// records it wrote. Waits until each tab and peer has acknowledged it (at
-/// most 900 ms, as the app gives the node about a second before it stops
-/// it): bytes still in a buffer when the node stops are a void for nothing.
+/// records it wrote. Not inside a tick of the loop (it waits for one to have
+/// sent), and with the loop's recent updates sent again before its own: it
+/// waits until each tab and peer has acknowledged all of them (at most
+/// 900 ms, as the app gives the node about a second before it stops it):
+/// bytes still in a buffer when the node stops are a void for nothing.
 async fn house_step_down(hub: &SharedHub) -> usize {
     let Some(house) = hub.house.as_ref() else { return 0 };
-    house.lock().unwrap().begin_step_down();
     let started = std::time::Instant::now();
+    let mut sent = house_sends().lock().await;
+    house.lock().unwrap().begin_step_down();
     let mut wrote = 0;
     let updates: Vec<(String, Vec<u8>, usize)> = {
         let rooms = hub.rooms.lock().unwrap();
@@ -3780,12 +3803,17 @@ async fn house_step_down(hub: &SharedHub) -> usize {
             .collect()
     };
     let mut sends = Vec::new();
+    let now = house_now();
+    for (_, room_id, update) in sent.drain(..).filter(|(at, _, _)| now.saturating_sub(*at) <= HOUSE_RESEND_MS) {
+        sends.extend(send_house_update(hub, &room_id, update, true).await);
+    }
     for (room_id, update, n) in updates {
         wrote += n;
         sends.extend(send_house_update(hub, &room_id, update, true).await);
     }
     let left = std::time::Duration::from_millis(900).saturating_sub(started.elapsed());
     let _ = tokio::time::timeout(left, futures_join(sends)).await;
+    drop(sent);
     wrote
 }
 

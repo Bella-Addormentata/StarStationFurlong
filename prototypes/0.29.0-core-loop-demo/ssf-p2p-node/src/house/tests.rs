@@ -468,14 +468,17 @@ fn never_reveals_a_round_twice_and_puts_its_reveal_back() {
     let back = room.records("h:1:");
     assert_eq!(back.len(), 1);
     assert_eq!((back[0].0.as_str(), hb::canon(&back[0].1)), (key.as_str(), hb::canon(&rec)));
-    // A restart that finds it gone reveals nothing more for round 1.
+    // A restart that finds it gone puts the same one back, from its state
+    // file, and reveals nothing more for round 1.
     room.delete(&key);
     room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
     room.house.settle_ms = 0;
     for _ in 0..10 {
         room.tick(1_000);
     }
-    assert!(room.records("h:1:").is_empty());
+    let back = room.records("h:1:");
+    assert_eq!(back.len(), 1);
+    assert_eq!((back[0].0.as_str(), hb::canon(&back[0].1)), (key.as_str(), hb::canon(&rec)));
     assert_eq!(room.records("o:1:").len(), 1, "and joins nothing it already revealed");
 }
 
@@ -864,21 +867,13 @@ fn keys_parse_as_the_fold_parses_them() {
 
 #[test]
 fn closes_signed_over_a_slip_the_pages_refuse_are_never_revealed() {
-    let red5 = || CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])]);
     let mallory = who("mallory");
-    // The signer's slip: no chips; bets no table takes; under mallory's id
-    // with carol's key; mallory's, its signature forged.
+    // The signer's slip: no chips; bets no table takes; mallory's, its
+    // signature forged. (One under another's key is the pages' to flag: the
+    // fold takes a close as its signer signed it.)
     let cases: Vec<(&str, Box<dyn Fn(&Room) -> (String, Who)>)> = vec![
         ("empty", Box::new(|room: &Room| (room.slip_on(&who("mallory"), 1, CVal::Arr(vec![])), who("mallory")))),
         ("junk bets", Box::new(|room: &Room| (room.slip_on(&who("mallory"), 1, CVal::Arr(vec![obj(vec![("type", s("purple")), ("amount", CVal::Int(5))])])), who("mallory")))),
-        ("another's key", Box::new(move |room: &Room| {
-            let carol = who("carol");
-            let c = hb::slip_commit(&ctx(), 1, "mallory", &seed_of("mallory", 1));
-            let body = obj(vec![("r", CVal::Int(1)), ("p", s("mallory")), ("v", CVal::Int(1)), ("b", red5()), ("c", s(&c))]);
-            let rec = signed("slip", &carol, body);
-            room.put('s', &rec);
-            (hb::rec_hash(&rec).unwrap(), carol)
-        })),
         ("forged signature", Box::new(|room: &Room| {
             let m = who("mallory");
             let c = hb::slip_commit(&ctx(), 1, "mallory", &seed_of("mallory", 1));
@@ -910,7 +905,7 @@ fn closes_signed_over_a_slip_the_pages_refuse_are_never_revealed() {
 }
 
 #[test]
-fn a_deleted_reveal_still_holds_the_line_it_decided_across_a_restart() {
+fn a_deleted_reveal_is_put_back_after_a_restart_and_its_line_holds() {
     let mut room = Room::new("deleted", true);
     let (alice, bob) = (who("alice"), who("bob"));
     let (c1, _, b) = room.closed_on_the_join(&alice, &bob);
@@ -922,14 +917,20 @@ fn a_deleted_reveal_still_holds_the_line_it_decided_across_a_restart() {
     let picked = strs(&h, "x")[0].clone();
     let other = if picked == c1 { c1b } else { c1 };
     let state: serde_json::Value = serde_json::from_slice(&std::fs::read(room.dir.join(STATE_FILE)).unwrap()).unwrap();
-    assert_eq!(state["v"], 2);
-    assert_eq!(state["done"][0], serde_json::json!([ROOM, T, INC, 1, picked, true]));
-    // A peer deletes the reveal; the node restarts, so it has no copy to put
-    // back. Round 2 still asks for the commitment it carried: no join, and a
-    // close on the close it passed over is never revealed.
+    assert_eq!(state["v"], 3);
+    let ses = room.ses_key();
+    assert_eq!(state["done"][0], serde_json::json!([ROOM, T, INC, 1, 1, picked, true, [[ses, key, hb::canon(&h)]]]));
+    // A peer deletes the reveal; the node restarts, and puts it back from
+    // its state file as it would have during the run.
     room.delete(&key);
     room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
     room.house.settle_ms = 0;
+    room.tick(0);
+    room.tick(REPUT_MS);
+    let back: Vec<_> = room.records("h:1:").into_iter().map(|(k, v)| (k, hb::canon(&v))).collect();
+    assert_eq!(back, vec![(key, hb::canon(&h))]);
+    // Round 2 asks for the commitment it carried: no join, and a close on
+    // the close it passed over is never revealed.
     let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
     room.close(&alice, 2, &other, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
     room.reveal(&alice, 2);
@@ -945,12 +946,21 @@ fn a_deleted_reveal_still_holds_the_line_it_decided_across_a_restart() {
 }
 
 #[test]
-fn a_state_file_from_before_the_decided_close_reads_as_nothing_to_carry_on() {
-    let dir = scratch("state-v1");
+fn older_state_files_read_as_what_they_held() {
+    let dir = scratch("state-old");
     let path = dir.join(STATE_FILE);
     std::fs::write(&path, serde_json::to_vec(&serde_json::json!({ "v": 1, "done": [[ROOM, T, INC, 4]] })).unwrap()).unwrap();
-    let house = House::open(&NODE, Some(path)).unwrap();
-    assert_eq!(house.last_of(&ctx()), Some(&Done { r: 4, x: None, c: false }));
+    let house = House::open(&NODE, Some(path.clone())).unwrap();
+    assert_eq!(house.last_of(&ctx()), Some(&Done { r: 4, d: None, c: false, kept: vec![] }), "v 1: nothing to carry on");
+    let x = "0123456789abcdef0123456789abcdef";
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({ "v": 2, "done": [[ROOM, T, INC, 4, x, true]] })).unwrap()).unwrap();
+    let house = House::open(&NODE, Some(path.clone())).unwrap();
+    assert_eq!(house.last_of(&ctx()), Some(&Done { r: 4, d: Some((4, x.to_string())), c: true, kept: vec![] }), "v 2: its round's close");
+    // A kept record whose key isn't its own hash: unreadable (the house stays off).
+    let rec = obj(vec![("r", CVal::Int(4)), ("s", s(&"0".repeat(64)))]);
+    let bad = serde_json::json!({ "v": 3, "done": [[ROOM, T, INC, 4, 4, x, true, [[format!("ses:{T}:{INC}:g"), format!("h:4:{x}"), hb::canon(&rec)]]]] });
+    std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(House::open(&NODE, Some(path)).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1009,4 +1019,243 @@ fn felts_read_as_the_fold_reads_them() {
     spots.sort_by_key(spot);
     assert_eq!(spots.len(), MAX_CRAPS_SPOTS);
     assert!(felt_ok(true, &spots));
+}
+
+/// Round 1 on the house's join, alice's close and bob's rival, every seed
+/// in, revealed: (the close it picked, the other, alice's slip, bob's).
+fn revealed_with_a_rival(room: &mut Room, alice: &Who, bob: &Who) -> (String, String) {
+    let (c1, _, b) = room.closed_on_the_join(alice, bob);
+    let c1b = room.close(bob, 1, "g", &[("bob", &b)], Some(&room.commit(1)));
+    room.reveal(alice, 1);
+    room.reveal(bob, 1);
+    room.tick(200);
+    let picked = strs(&room.records("h:1:")[0].1, "x")[0].clone();
+    let other = if picked == c1 { c1b } else { c1 };
+    (picked, other)
+}
+
+#[test]
+fn a_step_down_a_deleted_reveal_and_a_restart_never_carry_on_the_rival_line() {
+    let mut room = Room::new("down-deleted", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (picked, other) = revealed_with_a_rival(&mut room, &alice, &bob);
+    let key = room.records("h:1:")[0].0.clone();
+    // The rival voided; the owner sets the table Friendly: a step-down at 2.
+    room.abandon(&bob, 1, &other);
+    room.set_fair(1, 1);
+    room.tick(200);
+    assert!(strs(&room.records("h:2:")[0].1, "x").is_empty(), "a step-down");
+    // Round 2 played Friendly on the voided rival.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &other, &[("alice", &a2), ("bob", &b2)], None);
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    // A peer keeps deleting the round-1 reveal; the node restarts; Fair again.
+    room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+    room.house.settle_ms = 0;
+    room.set_fair(0, 2);
+    for _ in 0..20 {
+        room.delete(&key);
+        room.tick(1_000);
+    }
+    assert!(room.records("o:3:").is_empty(), "no join on top of the rival line");
+    // Its reveal back, round 2 played on the close it decided: it joins 3.
+    room.tick(REPUT_MS);
+    assert_eq!(room.records("h:1:").len(), 1);
+    room.close(&bob, 2, &picked, &[("alice", &a2), ("bob", &b2)], None);
+    room.tick(200);
+    assert_eq!(room.records("o:3:").len(), 1);
+}
+
+#[test]
+fn a_close_the_fold_throws_out_neither_refuses_a_round_nor_is_revealed() {
+    let mut room = Room::new("ineligible", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    // Beside the round's close: one naming a commitment no house wrote, and
+    // one on a parent that isn't the session.
+    let junk = "ab".repeat(32);
+    room.close(&bob, 1, "g", &[("alice", &a), ("bob", &b)], Some(&junk));
+    room.close(&bob, 1, &"cd".repeat(16), &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let h = room.records("h:1:");
+    assert_eq!(h.len(), 1, "the round isn't refused");
+    assert_eq!(strs(&h[0].1, "x"), vec![c]);
+}
+
+#[test]
+fn a_close_on_a_round_nothing_decided_is_never_revealed() {
+    let mut room = Room::new("undecided", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c1, _, _) = room.closed_on_the_join(&alice, &bob);
+    // Round 1 waits on bob's seed; a close of round 2 on it, naming the
+    // commitment round 1's reveal will carry, comes first.
+    room.reveal(&alice, 1);
+    room.tick(200);
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &c1, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    room.tick(200);
+    assert!(room.records("h:").is_empty(), "nothing yet: round 1 is undecided");
+}
+
+/// A second node of the owner's, delegated as the first.
+fn second_house(room: &Room) -> House {
+    let mut other = House::open(&[9u8; 32], None).unwrap();
+    other.settle_ms = 0;
+    let rec = room_signed("hkey", "", &room.owner, obj(vec![("v", CVal::Int(1)), ("h", s(other.public()))]));
+    room.put_top(&format!("hk:{}", other.public()), &rec);
+    other
+}
+
+fn tick_both(room: &mut Room, other: &mut House, after: u64) {
+    room.tick(after);
+    other.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+}
+
+#[test]
+fn a_second_house_carries_on_the_line_the_first_decided_and_nothing_else() {
+    let mut room = Room::new("two-houses", true);
+    let mut b_house = second_house(&room);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c1, _, b) = room.closed_on_the_join(&alice, &bob);
+    let c1b = room.close(&bob, 1, "g", &[("bob", &b)], Some(&room.commit(1)));
+    // The first stops: it reveals round 1 carrying nothing on.
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.house.begin_step_down();
+    tick_both(&mut room, &mut b_house, 200);
+    let h = &room.records("h:1:")[0].1;
+    assert!(h.get("c").is_none());
+    let picked = strs(h, "x")[0].clone();
+    let other = if picked == c1 { c1b } else { c1 };
+    // The second joins round 2 (it asks for nothing now).
+    room.abandon(&bob, 1, &other);
+    tick_both(&mut room, &mut b_house, 200);
+    let joins = room.records("o:2:");
+    assert_eq!(joins.len(), 1);
+    let b_commit = str_of(&joins[0].1, "c").unwrap().to_string();
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_house.public()));
+    // A close on the voided rival naming the second's commitment (on the
+    // pages it would carry the rival's line past the first's decision):
+    // never revealed.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &other, &[("alice", &a2), ("bob", &b2)], Some(&b_commit));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..20 {
+        tick_both(&mut room, &mut b_house, 1_000);
+    }
+    assert!(room.records("h:2:").is_empty());
+    // On the close the first decided: the second reveals it.
+    let d = room.close(&bob, 2, &picked, &[("alice", &a2), ("bob", &b2)], Some(&b_commit));
+    tick_both(&mut room, &mut b_house, 200);
+    let h2 = room.records("h:2:");
+    assert_eq!(h2.len(), 1);
+    assert_eq!(strs(&h2[0].1, "x"), vec![d]);
+    assert_eq!(str_of(&h2[0].1, "k"), Some(b_house.public()));
+}
+
+#[test]
+fn a_second_house_joins_no_round_the_first_holds() {
+    let mut room = Room::new("two-hold", true);
+    let mut b_house = second_house(&room);
+    let (alice, bob) = (who("alice"), who("bob"));
+    tick_both(&mut room, &mut b_house, 0);
+    let joins = room.records("o:1:");
+    assert_eq!(joins.len(), 1, "one house to a round");
+    assert_eq!(str_of(&joins[0].1, "k"), Some(room.house.public()));
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        tick_both(&mut room, &mut b_house, 1_000);
+    }
+    assert!(room.records("h:1:")[0].1.get("c").is_some());
+    assert!(room.records("o:").iter().all(|(k, _)| k.starts_with("o:1:")), "nor one the first's reveal carried");
+    // The first stops, stepping its commitment down: round 2 is the second's.
+    room.house.begin_step_down();
+    tick_both(&mut room, &mut b_house, 200);
+    assert!(strs(&room.records("h:2:")[0].1, "x").is_empty());
+    tick_both(&mut room, &mut b_house, 200);
+    let joins = room.records("o:2:");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_house.public()));
+}
+
+#[test]
+fn of_two_houses_joining_a_round_only_the_one_the_pages_name_reveals() {
+    let mut room = Room::new("two-joins", true);
+    let mut b_house = second_house(&room);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    // Both joined round 1, neither seeing the other's yet.
+    let b_join = b_house.signed(
+        "hcommit",
+        &ctx(),
+        vec![("r".into(), CVal::Int(1)), ("c".into(), CVal::Str(b_house.commit(&ctx(), 1))), ("k".into(), CVal::Str(b_house.public().to_string()))],
+    );
+    room.put('o', &b_join);
+    let joins = room.records("o:1:");
+    assert_eq!(joins.len(), 2);
+    let lowest = str_of(&joins[0].1, "k").unwrap().to_string();
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let ca = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    let cb = room.close(&bob, 1, "g", &[("alice", &a), ("bob", &b)], Some(&b_house.commit(&ctx(), 1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..20 {
+        tick_both(&mut room, &mut b_house, 1_000);
+    }
+    let h = room.records("h:1:");
+    assert_eq!(h.len(), 1, "one reveal: no second outcome to choose");
+    assert_eq!(str_of(&h[0].1, "k"), Some(lowest.as_str()));
+    let named = if lowest == room.house.public() { ca } else { cb };
+    assert_eq!(strs(&h[0].1, "x"), vec![named]);
+}
+
+#[test]
+fn a_close_naming_nothing_where_its_round_asks_for_a_commitment_takes_the_table_nowhere() {
+    let mut room = Room::new("names-nothing", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (picked, _) = revealed_with_a_rival(&mut room, &alice, &bob);
+    // Round 2 asks for the commitment round 1's reveal carried: a Friendly
+    // close is no close of it, its seeds all in or not.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &picked, &[("alice", &a2), ("bob", &b2)], None);
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..10 {
+        room.tick(1_000);
+    }
+    assert!(room.records("o:3:").is_empty(), "no join of a round the table hasn't reached");
+}
+
+#[test]
+fn a_close_on_an_undecided_close_is_on_no_chain_beside_a_decided_one() {
+    let mut room = Room::new("undecided-parent", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.set_fair(1, 1);
+    room.tick(0);
+    // Friendly round 1: alice's close decided, bob's waiting on his seed;
+    // round 2 played on bob's.
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    room.close(&alice, 1, "g", &[("alice", &a)], None);
+    let c1b = room.close(&bob, 1, "g", &[("bob", &b)], None);
+    room.reveal(&alice, 1);
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &c1b, &[("alice", &a2), ("bob", &b2)], None);
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    // Fair again: the table is at round 2.
+    room.set_fair(0, 2);
+    room.tick(200);
+    assert_eq!(room.records("o:2:").len(), 1);
+    assert!(room.records("o:3:").is_empty());
 }
