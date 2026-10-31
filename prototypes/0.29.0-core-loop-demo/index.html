@@ -199,6 +199,10 @@
               <div style="width: 2px; height: 8px; background: rgba(255,255,255,0.2);"></div>
               <div style="width: 2px; height: 10px; background: rgba(255,255,255,0.2);"></div>
             </div>
+            <!-- 📖 The Phone Book listing icon (phoneBook.ts): green when this node's current
+                 addresses are listed on Chia, grey when an older listing has gone stale.
+                 Hidden until the node reports that it publishes presence. -->
+            <button id="phone-chia-presence" type="button" hidden aria-label="Phone Book listing" style="background: none; border: 0; padding: 0; margin: 0 2px; width: 12px; height: 12px; line-height: 0; cursor: pointer; color: inherit;"></button>
             <span style="font-size: 10px; font-weight: 600;">🔋 100%</span>
           </div>
         </div>
