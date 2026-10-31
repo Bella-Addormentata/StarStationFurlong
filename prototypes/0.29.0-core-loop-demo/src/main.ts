@@ -8407,6 +8407,13 @@ function setupSpacePhoneOverlay() {
   document.getElementById("phone-chia-presence")?.addEventListener("click", (e) => {
     e.stopPropagation();
     const opens = (e.currentTarget as HTMLElement).dataset.opens;
+    // The bar stays on screen while the IR blaster aims (the shell is slid
+    // away under it, `active` off) and while the quick chat peeks: put the
+    // blaster down, close the bar and unfold the phone first, or the view
+    // would change offscreen (the posture of __ssfOpenTreasury and Tab).
+    if (isAiming()) stopAiming();
+    closeMiniChat();
+    container?.classList.add("active");
     showPhoneView(opens === "bank" ? "bank" : "setnet");
   });
 

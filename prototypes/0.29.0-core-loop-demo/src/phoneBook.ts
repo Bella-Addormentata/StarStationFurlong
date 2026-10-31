@@ -78,7 +78,10 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
     ({ visible: true, state: p.state, colour, filled, title, opens, row: { value: title, colour } });
   switch (p.state) {
     case 'listed':
-      return shown(PHONE_BOOK_GREEN, true, listedTitle(p));
+      // A listing back in force (the addresses changed and changed back) can
+      // carry the failed attempt in between: the node keeps that text until a
+      // write succeeds, and it is the reason a tap goes to the Bank app.
+      return shown(PHONE_BOOK_GREEN, true, listedTitle(p) + (error ? ` · ${error}` : ''));
     case 'sent':
       return shown(PHONE_BOOK_GREEN, false, `Listing sent to the Phone Book, awaiting confirmation (up to ${CONFIRM_MIN} min)` + (error ? ` · ${error}` : ''));
     case 'outdated':

@@ -34,6 +34,11 @@ describe('phoneBookIndicator', () => {
     expect(ind.title).toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 7)");
     expect(phoneBookIndicator(withPresence({ public_addrs: 1 })).title).toContain("your node's public address is on chain");
     expect(phoneBookIndicator(withPresence({ public_addrs: 0 })).title).toContain('no public address right now, and the book says so');
+    // Listed again after a failed change in between: the failure still shows,
+    // and still sends an unfunded node to the Bank app.
+    const relisted = phoneBookIndicator(withPresence({ error: 'chia wallet unfunded — no unspent coin at puzzle hash ab12' }));
+    expect(relisted.title).toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 7) · chia wallet unfunded — no unspent coin at puzzle hash ab12");
+    expect(relisted.opens).toBe('bank');
   });
 
   it('is a green outline while the listing is sent and not yet read back', () => {
