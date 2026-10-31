@@ -37,7 +37,12 @@ import {
   type StripEdge,
   type HullSurface,
 } from './hullSection';
-import { resolveWallpaper, type WallpaperPresetId, type WallpaperSpec } from './wallpaper';
+import {
+  resolveWallpaper,
+  type WallpaperPresetId,
+  type WallpaperSpec,
+  type WallpaperSurface,
+} from './wallpaper';
 import { cupolaPlans, cupolaStripRun, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
@@ -108,14 +113,18 @@ export interface HullDoorOpening {
   height: number;
 }
 
-/** 🖼️ #80 S6: a wall-covering preset per hull surface (any of the 8 strips).
- *  Absent / `plain` → the bare hull colour. Painted on by the wallpaper editor. */
-export type HullWallpapers = Partial<Record<HullSurface, WallpaperPresetId>>;
+/** 🖼️ #80 S6: a wall-covering preset per hull surface (any of the 8 strips,
+ *  and since issue 326 either octagon end wall). Absent / `plain` → the bare
+ *  hull colour. Painted on by the wallpaper editor. The room floor (`deck`)
+ *  rides the same record but is world.ts's to paint, so the hull ignores it. */
+export type HullWallpapers = Partial<Record<WallpaperSurface, WallpaperPresetId>>;
 
 /**
  * Build the octagon hull for the given room half-extents (+ optional tuning).
  * `windows` cuts rounded-rect openings in the two side walls (look outside).
- * `wallpapers` paints a covering texture onto individual strips (#80 S6).
+ * `wallpapers` paints a covering texture onto individual strips (#80 S6) and
+ * onto either end wall above the floor (issue 326; a cupola end is glass and
+ * takes none).
  * `doors` opens a floor-standing aperture in a side wall or end cap (#159) —
  * world.ts passes the doors whose leaves are not shut.
  * `world.ts` calls this behind the flag and adds `.group` to platformGroup.
@@ -249,7 +258,16 @@ export function buildOctagonHull(
   for (const sign of [-1, 1] as const) {
     if (cupolas.some((cupola) => cupola.sign === sign)) continue; // 🔭 built as glass below
     const b = sign * longHalf;
-    const normal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
+    const cap = sign > 0 ? 'cap-pos' : 'cap-neg';
+    const normal = verticalFaceNormal(narrowAxis, cap);
+    // 🖼️ issue 326: one covering dresses the octagon end above the floor —
+    // the wall band and the roof gable, the way brick runs up a real gable
+    // end. The basement gable stays bare hull like the rest of the basement:
+    // the iso view always shows it, from OUTSIDE, under the near end.
+    const wp = resolveWallpaper(wallpapers[cap] ?? 'plain');
+    // Cap-local UVs in METRES (u = narrow-axis `a`, v = height), the same scale
+    // as the strips' and the notched band's ShapeGeometry (whose UVs are its
+    // own (a, y) coords), so a covering tiles evenly up the band and gables.
     const capQuad = (
       pa: { a: number; y: number },
       pb: { a: number; y: number },
@@ -261,14 +279,15 @@ export function buildOctagonHull(
         sectionToWorld(narrowAxis, pb.a, pb.y, b),
         sectionToWorld(narrowAxis, pc.a, pc.y, b),
         sectionToWorld(narrowAxis, pd.a, pd.y, b),
+        [pa, pb, pc, pd].map((p) => ({ u: p.a, v: p.y })) as CornerUvs,
       );
       geometries.push(geo);
       return geo;
     };
     // wall band (vertical [0, wallHeight]) — 🚪 notched open at its doors
     {
-      const mat = mkMat(HULL_COLOR.wall);
-      const notches = doorNotches[sign > 0 ? 'cap-pos' : 'cap-neg'];
+      const mat = mkMat(HULL_COLOR.wall, true, wp);
+      const notches = doorNotches[cap];
       let bandGeo: THREE.BufferGeometry;
       if (notches.length === 0) {
         bandGeo = capQuad(
@@ -288,7 +307,7 @@ export function buildOctagonHull(
     }
     // roof gable (trapezoid above the walls)
     {
-      const mat = mkMat(HULL_COLOR.roof);
+      const mat = mkMat(HULL_COLOR.roof, true, wp);
       const mesh = new THREE.Mesh(
         capQuad(
           { a: -narrowHalf, y: wallHeight },
@@ -910,20 +929,23 @@ function openingHitsNotch(o: WindowOpening, notches: readonly DoorNotch[]): bool
   return notches.some((n) => lo < n.hi && hi > n.lo && bottom < n.top);
 }
 
+/** A UV per quad corner (a, b, c, d). */
+type CornerUvs = [
+  { u: number; v: number },
+  { u: number; v: number },
+  { u: number; v: number },
+  { u: number; v: number },
+];
+
 /** A double-sided quad (two triangles a-b-c / a-c-d) from four world corners.
  *  Optional `uvs` (per corner a,b,c,d) attach a UV attribute in the same winding
- *  — used to tile a wallpaper texture; omit for the untextured caps. */
+ *  — used to tile a wallpaper texture. */
 function quadGeometry(
   a: { x: number; y: number; z: number },
   b: { x: number; y: number; z: number },
   c: { x: number; y: number; z: number },
   d: { x: number; y: number; z: number },
-  uvs?: [
-    { u: number; v: number },
-    { u: number; v: number },
-    { u: number; v: number },
-    { u: number; v: number },
-  ],
+  uvs?: CornerUvs,
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   const pos = new Float32Array([

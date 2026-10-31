@@ -310,6 +310,7 @@ import {
   readAllWallpaper,
   subscribeWallpaperLayout,
 } from "./wallpaperLayoutDoc";
+import { resolveFloorWallpaper } from "./wallpaper";
 import { airHockeyTheme } from "./airHockeyTheme";
 import {
   readAirHockeyTheme,
@@ -645,6 +646,10 @@ export class World {
   private sandFloorTex: THREE.Texture | null = null;
   /** Lazy-created casino carpet texture (created on first casino entry). */
   private casinoFloorTex: THREE.Texture | null = null;
+  /** 🖼️ issue 326: which floor the room's THEME gives it (applyRoomVisuals),
+   *  kept so applyFloorLook can put it back when a room-floor covering is
+   *  cleared. A covering painted on the floor wins over it. */
+  private themeFloor: "wood" | "sand" | "stone" | "carpet" = "wood";
   /** 🏊 Legacy hull (no octagon) only: the floor is hidden because a SWIM
    *  pool's deck slabs are the flooring. Decided by what the room CONTAINS
    *  (refreshOutdoorFloor), never by its theme — deriving it from the theme
@@ -1667,6 +1672,7 @@ export class World {
       this.platformFloor.geometry = this.makeFloorGeometry();
       old.dispose();
     }
+    this.applyFloorLook(); // 🖼️ a floor covering tiles per metre: re-size it
     // 🔭 …and the edit grid's lines, trimmed to the new floor.
     if (this.platformGrid) {
       const old = this.platformGrid.geometry;
@@ -1682,6 +1688,7 @@ export class World {
    * re-reads collectWallpaper so each strip's material follows the doc.
    */
   private reconcileWallpaper(): void {
+    this.applyFloorLook(); // 🖼️ issue 326: the room floor's covering (`deck`)
     if (!OCTAGON_HULL || !this.octagonHull) return;
     this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes + edit index
   }
@@ -2859,37 +2866,14 @@ export class World {
     if (this.deckPlanet) this.deckPlanet.visible = showSpace;
     this.dockingSystem?.setGhostDoors(deck);
 
-    if (this.floorMat) {
-      if (beach) {
-        if (!this.sandFloorTex) this.sandFloorTex = this.makeSandFloorTex();
-        this.floorMat.map = this.sandFloorTex;
-        this.floorMat.color.setHex(0xffffff);
-        this.floorMat.roughness = 0.98;
-        this.floorMat.metalness = 0.0;
-      } else if (deck) {
-        // Swap to a stone-tile texture (created once, cached).
-        if (!this.outdoorFloorTex)
-          this.outdoorFloorTex = this.makeOutdoorFloorTex();
-        this.floorMat.map = this.outdoorFloorTex;
-        this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
-        this.floorMat.roughness = 0.92;
-        this.floorMat.metalness = 0.0;
-      } else if (casinoTheme) {
-        if (!this.casinoFloorTex)
-          this.casinoFloorTex = this.makeCasinoFloorTex();
-        this.floorMat.map = this.casinoFloorTex;
-        this.floorMat.color.setHex(0xffffff);
-        this.floorMat.roughness = 0.48;
-        this.floorMat.metalness = 0.08;
-      } else {
-        // Restore original lobby wood herringbone.
-        this.floorMat.map = this.woodTex;
-        this.floorMat.color.setHex(0xffffff);
-        this.floorMat.roughness = 0.78;
-        this.floorMat.metalness = 0.0;
-      }
-      this.floorMat.needsUpdate = true;
-    }
+    this.themeFloor = beach
+      ? "sand"
+      : deck
+        ? "stone"
+        : casinoTheme
+          ? "carpet"
+          : "wood";
+    this.applyFloorLook();
 
     // 🧊 Walls: the pale-blue tile wall shows in BOTH rooms (owner request —
     // it carries the starry windows and reads light/airy at its glassy
@@ -2918,6 +2902,53 @@ export class World {
     console.log(
       `🏝️ Room visuals applied: ${themeLabel} · theme=${resolvedTheme}`,
     );
+  }
+
+  /**
+   * 🖼️ Dress the room floor: a covering the owner painted on it (the `deck`
+   * wallpaper surface, issue 326) when there is one, else the floor the room's
+   * theme gives it (themeFloor). Re-run when the theme changes
+   * (applyRoomVisuals), when the coverings change (reconcileWallpaper) and when
+   * the room is resized (reconcileCupola), since a covering tiles per metre.
+   * Only the look changes: the floor's opacity (the morph fade) is left alone.
+   */
+  private applyFloorLook(): void {
+    const mat = this.floorMat;
+    if (!mat) return;
+    const { halfX, halfZ } = roomHalfExtents();
+    const covering = resolveFloorWallpaper(
+      readAllWallpaper().get("deck") ?? "plain",
+      2 * halfX,
+      2 * halfZ,
+    );
+    let map: THREE.Texture | null;
+    let roughness: number;
+    let metalness: number;
+    if (covering) {
+      ({ map, roughness, metalness } = covering);
+    } else if (this.themeFloor === "sand") {
+      if (!this.sandFloorTex) this.sandFloorTex = this.makeSandFloorTex();
+      [map, roughness, metalness] = [this.sandFloorTex, 0.98, 0.0];
+    } else if (this.themeFloor === "stone") {
+      // Swap to a stone-tile texture (created once, cached).
+      if (!this.outdoorFloorTex)
+        this.outdoorFloorTex = this.makeOutdoorFloorTex();
+      [map, roughness, metalness] = [this.outdoorFloorTex, 0.92, 0.0];
+    } else if (this.themeFloor === "carpet") {
+      if (!this.casinoFloorTex)
+        this.casinoFloorTex = this.makeCasinoFloorTex();
+      [map, roughness, metalness] = [this.casinoFloorTex, 0.48, 0.08];
+    } else {
+      // Restore original lobby wood herringbone.
+      [map, roughness, metalness] = [this.woodTex, 0.78, 0.0];
+    }
+    mat.map = map;
+    // No tint: every texture here carries its own palette (a covering's spec
+    // colour is white too).
+    mat.color.setHex(covering ? covering.color : 0xffffff);
+    mat.roughness = roughness;
+    mat.metalness = metalness;
+    mat.needsUpdate = true;
   }
 
   private makeCasinoFloorTex(): THREE.Texture {

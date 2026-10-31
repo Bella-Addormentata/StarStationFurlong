@@ -18,6 +18,46 @@
  */
 
 import * as THREE from 'three';
+import { SURFACES, type HullSurface } from './hullSection';
+
+/**
+ * Everything a covering can be painted onto (issue 326): the 8 barrel strips,
+ * the two octagon END WALLS (`cap-neg` / `cap-pos`: the octagon at each end
+ * above the floor, wall band and roof gable) and the ROOM FLOOR players stand on
+ * (`deck`). The strip called `floor` is the basement floor under the deck,
+ * seen only through a pool hole, so it is not the room floor.
+ */
+export type WallpaperSurface = HullSurface | 'cap-neg' | 'cap-pos' | 'deck';
+
+/** Every wallpaper surface: the doc guard and the editor's cycle order
+ *  (the walls, then the room floor, then the roof and the basement). */
+export const WALLPAPER_SURFACES: readonly WallpaperSurface[] = [
+  'wall-neg',
+  'wall-pos',
+  'cap-neg',
+  'cap-pos',
+  'deck',
+  ...SURFACES.filter((s) => s !== 'wall-neg' && s !== 'wall-pos'),
+];
+
+/**
+ * The surface `delta` steps (±1) from `current` in the editor's cycle,
+ * wrapping and stepping past `skip` (a cupola end: glass, no covering).
+ * Steps from `current`'s own place even when it is in `skip`.
+ */
+export function stepWallpaperSurface(
+  current: WallpaperSurface,
+  delta: number,
+  skip: readonly WallpaperSurface[] = [],
+): WallpaperSurface {
+  const n = WALLPAPER_SURFACES.length;
+  let i = Math.max(0, WALLPAPER_SURFACES.indexOf(current));
+  for (let tries = 0; tries < n; tries++) {
+    i = (((i + delta) % n) + n) % n;
+    if (!skip.includes(WALLPAPER_SURFACES[i])) break;
+  }
+  return WALLPAPER_SURFACES[i];
+}
 
 export type WallpaperPresetId =
   | 'plain'
@@ -229,4 +269,31 @@ export function resolveWallpaper(id: WallpaperPresetId): WallpaperSpec | null {
     default:
       return null;
   }
+}
+
+// ── the room floor's copies (never disposed with a floor) ───────────────────
+const floorTexCache = new Map<WallpaperPresetId, THREE.Texture>();
+
+/**
+ * A covering for the ROOM FLOOR (`deck`). The floor's UVs run 0..1 across the
+ * whole room (world.makeFloorGeometry), not in metres like the hull's, so it
+ * wears its own copy of the covering's texture (same image, its own repeat)
+ * scaled by the room's size so a tile is the same size on the floor as on a
+ * wall. One floor is drawn at a time, so each preset keeps one copy, re-sized
+ * on every call. `null` for `plain` (the room's own floor stays).
+ */
+export function resolveFloorWallpaper(
+  id: WallpaperPresetId,
+  widthM: number,
+  depthM: number,
+): WallpaperSpec | null {
+  const spec = resolveWallpaper(id);
+  if (!spec) return null;
+  let map = floorTexCache.get(id);
+  if (!map) {
+    map = spec.map.clone(); // shares the canvas; only the repeat differs
+    floorTexCache.set(id, map);
+  }
+  map.repeat.set(spec.map.repeat.x * widthM, spec.map.repeat.y * depthM);
+  return { ...spec, map };
 }
