@@ -706,7 +706,8 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, me: string
  */
 function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readComputedCraps(id);
-  h.setFairBadge(false);
+  // 🏠 The table's own plaque says what the line under it says (fairnessBadge).
+  h.setFairBadge(fairnessBadge(id, 'craps').fair);
   if (!rt.primed || rt.computed !== (s?.inc ?? '')) {
     rt.primed = true;
     rt.computed = s?.inc ?? '';
@@ -982,7 +983,8 @@ function layRouletteFelt(
  *  new. */
 function driveComputedRoulette(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string): void {
   const s = readComputedRoulette(id);
-  h.setFairBadge(false);
+  // 🏠 The table's own plaque says what the line under it says (fairnessBadge).
+  h.setFairBadge(fairnessBadge(id, 'roulette').fair);
   if (!rt.primed || rt.computed !== (s?.inc ?? '')) {
     rt.primed = true;
     rt.computed = s?.inc ?? '';
@@ -2435,6 +2437,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const bad = c.mine === 'late' || c.mine === 'forfeited';
       out.push({ text: parts.join(' · '), color: bad ? '#FF8A80' : c.decided === 'reveals' || c.decided === 'house' ? '#7CF5B0' : '#F5C26B' });
       if (c.houseVoid) out.push({ text: 'THE HOUSE NEVER REVEALED ITS SEED · VOID', color: '#F5C26B' });
+      if (c.houseWaited.length > 0) {
+        // (Its reveal counts seeds this page never had: whose. Names as
+        // forfeitBy's: display only, escaped.)
+        const named = c.houseWaited.slice(0, LEAVE_LIST_MAX).map((pid) => escapeHtml(readPlayerDisplayName(pid).toUpperCase()));
+        const more = c.houseWaited.length > LEAVE_LIST_MAX ? ` AND ${c.houseWaited.length - LEAVE_LIST_MAX} MORE` : '';
+        const seeds = c.houseWaited.length === 1 ? 'A SEED' : 'SEEDS';
+        out.push({ text: `THE HOUSE REVEALED ITS SEED · IT COUNTED ${seeds} FROM ${named.join(', ')}${more} THAT NEVER CAME HERE · VOID`, color: '#F5C26B' });
+      }
       if (c.dropped.length > 0) out.push({ text: '🚩 A FORFEIT DROPPED A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
       if (c.houseDropped.length > 0) out.push({ text: '🚩 THE HOUSE LEFT OUT A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
       // (At craps the nets apart from the table the checkpoint hands on.)

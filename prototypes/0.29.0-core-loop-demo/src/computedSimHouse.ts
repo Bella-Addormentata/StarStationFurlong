@@ -31,8 +31,8 @@ import {
   isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND, MAX_FROZEN, MAX_HOUSE_COUNTED, nextSid, parseKey, recHash, signBytes, slipCommit,
 } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
-import { beatKey, delegationKey, HEARTBEAT_MS, housePubOf, houseSeedOf, houseSign, roomSignBytes } from './computedHouse';
-import type { RoomKind } from './computedHouse';
+import { beatKey, delegationKey, fairAfter, HEARTBEAT_MS, housePubOf, houseSeedOf, houseSign, roomSignBytes } from './computedHouse';
+import type { FairSettingRec, RoomKind } from './computedHouse';
 import { verifyIdentityStrict } from './keypair';
 
 /** The origin of the twin's transactions on the owner's page's doc. */
@@ -274,15 +274,16 @@ export class SimHouse {
     const houses = new Set([...mem.houses].filter(([, k]) => k === ownerKey).map(([h]) => h));
     houses.add(this.pub);
 
-    // The owner's Fair settings, newest first seen (a new deed holder's count
-    // afresh: the last one's settings go).
+    // The owner's Fair settings, the one standing over every other seen
+    // (fairAfter; a new deed holder's count afresh: the last one's settings
+    // go).
     for (const [t, v] of mem.fair) if (v.k !== ownerKey) mem.fair.delete(t);
     for (const [key, v] of comp.entries()) {
       if (!key.startsWith('hf:') || key.length <= 3) continue;
       const t = key.slice(3);
       if (!isPlain(v) || !hasFields(v, ['v', 'm', 's', 'k', 'g']) || v.v !== 1 || (v.m !== 0 && v.m !== 1) || !isRound(v.s) || v.k !== ownerKey) continue;
-      const seen = mem.fair.get(t)?.s as number | undefined;
-      if (seen !== undefined && seen >= v.s) continue;
+      const seen = mem.fair.get(t);
+      if (seen !== undefined && !fairAfter(v as unknown as FairSettingRec, seen as unknown as FairSettingRec)) continue;
       if (this.roomOk('hfair', room, t, v, ownerKey)) mem.fair.set(t, v);
     }
 

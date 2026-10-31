@@ -1664,8 +1664,13 @@ export interface ComputedRoundCheck {
   /** 🚩 Bettors the house's reveal left out whose seed this page saw in the
    *  grace, before it saw the house's reveal. */
   houseDropped: string[];
-  /** A Fair round an abandon voided: the house never revealed its seed. */
+  /** A Fair round an abandon voided, no house reveal listing its close
+   *  (this page has): the house never revealed its seed. */
   houseVoid: boolean;
+  /** A Fair round an abandon voided while the house's reveal listing it
+   *  waited on seeds this page never had: those bettors (sorted). The house
+   *  revealed; the round went void for want of theirs. */
+  houseWaited: string[];
   /** 🚩 Bettors whose frozen slip a key other than their pinned one signed. */
   pinMismatch: string[];
   /** 🚩 Chips by which the checkpoint opening this session differs from what
@@ -1782,7 +1787,8 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     dropped,
     fair: D.closeRec.h !== undefined,
     houseDropped,
-    houseVoid: D.decided === 'void' && D.closeRec.h !== undefined && D.house === undefined,
+    houseVoid: D.decided === 'void' && D.closeRec.h !== undefined && D.house === undefined && D.houseWaits === undefined,
+    houseWaited: D.decided === 'void' ? D.houseWaits ?? [] : [],
     pinMismatch,
     checkpointDiff: diff,
     ...replacedOf(st),
@@ -3430,7 +3436,8 @@ function houseDuty(now: number): void {
   houseDutyAt = now;
   if (!tablesAwake(now) || !casinoWhole()) return;
   putBackHouseRecords();
-  if (localHouse === null || !holdsDeed() || delegationHeld(localHouse)) return;
+  // (Held, or its check waiting: it is read again REPUT_MS on.)
+  if (localHouse === null || !holdsDeed() || delegationHeld(localHouse) !== false) return;
   const body = { v: 1 as const, h: localHouse, k: getIdentityPub() };
   writeDelegation({ ...body, g: signIdentity(roomSignBytes('hkey', casinoRoomId(), '', body)) });
 }

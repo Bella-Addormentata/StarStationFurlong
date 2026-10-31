@@ -115,10 +115,12 @@ async function loadUIPage(name: string, clientID: number): Promise<UIPage> {
   return { ...p, session, furniture, focus };
 }
 
-/** A table handle that remembers its felt chips and the spins it was asked
- *  for, and is never mid-spin. */
-function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknown[]; spins: [number, number][] } {
+/** A table handle that remembers its felt chips, the spins it was asked
+ *  for and what its plaque was last set to (Fair or not), and is never
+ *  mid-spin. */
+function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknown[]; spins: [number, number][]; fair: () => boolean | null } {
   let last: readonly unknown[] = [];
+  let fair: boolean | null = null;
   const spins: [number, number][] = [];
   const h = new Proxy({} as Record<PropertyKey, unknown>, {
     get: (_t, key) => {
@@ -129,11 +131,12 @@ function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknow
       if (key === 'wheelSpinning') return () => false;
       if (key === 'wheelSpin') return (pocket: number, seed: number) => { spins.push([pocket, seed]); };
       if (key === 'setFeltChips') return (s: readonly unknown[]) => { last = s; };
+      if (key === 'setFairBadge') return (f: boolean) => { fair = f; };
       if (key === 'toScreen') return () => null;
       return () => undefined;
     },
   }) as unknown as CasinoTableVisualHandle;
-  return { h, chips: () => last, spins };
+  return { h, chips: () => last, spins, fair: () => fair };
 }
 
 interface AtTable {
@@ -1505,6 +1508,30 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     t.unmount();
   });
 
+  it("the table's own plaque reads as the line does: Friendly before the house is in the round, Fair once it is, Friendly once it steps down", () => {
+    houseTable();
+    if (!a.furniture.FURNITURE.some((i) => i.id === TABLE)) {
+      a.furniture.FURNITURE.push({ id: TABLE, kind: 'roulette-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    }
+    const wheel = fakeTable();
+    const frame = (T: number): void => {
+      at(a, T);
+      a.session.casinoTablesFrame(1 / 60, new Map([[TABLE, wheel.h]]));
+    };
+    beat(T0 + 100);
+    frame(T0 + 100);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(false);
+    expect(wheel.fair()).toBe(false);
+    put(a, T0 + 200, rkit.houseJoin(H, 1));
+    frame(T0 + 200);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(true);
+    expect(wheel.fair()).toBe(true);
+    put(a, T0 + 400, rkit.houseReveal(H, 1, [], [], { c: null }));
+    frame(T0 + 400);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(false);
+    expect(wheel.fair()).toBe(false);
+  });
+
   it("the setting is a line on anyone else's card, and a press there sets nothing", () => {
     pinOn(a, BOB);
     houseTable({ owner: BOB });
@@ -1557,8 +1584,27 @@ describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () =
     t.update();
     expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'void' });
     expect(t.card()).toContain('THE HOUSE NEVER REVEALED ITS SEED · VOID');
-    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ fair: true, houseVoid: true });
+    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ fair: true, houseVoid: true, houseWaited: [] });
     expect(t.plaque()).toBe("PLAYERS' TABLE · FRIENDLY · THE HOUSE IS OFFLINE");
+    t.unmount();
+  });
+
+  it("an abandon voids a round whose house reveal waits on a seed this page never had: the card says the house revealed, and whose seed it counted", () => {
+    houseTable();
+    const t = atTable(a);
+    const { bob, cat, close } = fairClose(t);
+    put(a, T0 + 19_200, rkit.reveal(1, BOB.pid));
+    put(a, T0 + 19_400, rkit.houseReveal(H, 1, [close.hash], [bob.hash, cat.hash]));
+    t.update();
+    expect(foldOf(a).tip).toMatchObject({ decided: null, houseWaits: [CAT.pid] });
+    put(a, T0 + 50_000, rkit.abandon(BOB, 1, close.hash));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'void', houseWaits: [CAT.pid] });
+    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ fair: true, houseVoid: false, houseWaited: [CAT.pid] });
+    const card = t.card();
+    expect(card).not.toContain('THE HOUSE NEVER REVEALED ITS SEED');
+    expect(card).toContain('THE HOUSE REVEALED ITS SEED · IT COUNTED A SEED FROM ');
+    expect(card).toContain(' THAT NEVER CAME HERE · VOID');
     t.unmount();
   });
 

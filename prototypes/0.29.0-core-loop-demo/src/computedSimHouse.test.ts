@@ -200,6 +200,20 @@ describe('the simulations\' house, as house.rs', () => {
     expect(room.top().get(fairSettingKey(T))).toEqual(setting);
   });
 
+  it('of two settings with one number, the higher hash stands, whichever came first', () => {
+    for (const hiFirst of [false, true]) {
+      const room = new TwinRoom().start();
+      const [lo, hi] = [roomSigned('hfair', T, { v: 1, m: 0, s: 7 }), roomSigned('hfair', T, { v: 1, m: 1, s: 7 })]
+        .sort((x, y) => (recHash(x)! < recHash(y)! ? -1 : 1));
+      const [first, then] = hiFirst ? [hi, lo] : [lo, hi];
+      room.doc.transact(() => room.top().set(fairSettingKey(T), first));
+      room.tick(1_000);
+      room.doc.transact(() => room.top().set(fairSettingKey(T), then));
+      room.tick(1_000);
+      expect(room.top().get(fairSettingKey(T)), `hi first: ${hiFirst}`).toEqual(hi);
+    }
+  });
+
   it('a setting signed for one table counts at no other', () => {
     const room = new TwinRoom(true).start();
     const joinsBefore = room.house.wrote.joins;

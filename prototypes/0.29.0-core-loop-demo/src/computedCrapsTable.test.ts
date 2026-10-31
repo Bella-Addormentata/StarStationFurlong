@@ -2456,12 +2456,14 @@ describe('a craps house table (PR 5)', () => {
     beat(T0 + 1_200);
     go(pages, T0 + 1_200, T0 + 1_200);
     expect(tb.plaque()).toBe("PLAYERS' TABLE · FRIENDLY THIS ROLL · THE HOUSE JOINS THE NEXT");
+    expect(b.dice.fair()).toBe(false); // the table's own plaque too
     // The house joins roll 1.
     const join = dkit.houseJoin(H, 1);
     clockOf(a, T0 + 1_400);
     putIn(a, [[join.key, join.rec]], TABLE);
     go(pages, T0 + 1_400, T0 + 1_600);
     expect(tb.plaque()).toBe("✔ FAIR · PLAYERS' TABLE · THE HOUSE AND EVERY BETTOR ADD A SEED");
+    expect(b.dice.fair()).toBe(true);
     for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0 + 1_600)).toBe('ok');
     // Frames, a beat every 5 s, until both seeds are in; then the dice land.
     const seedsIn = (): boolean => (foldOf(b).tip?.revealed.length ?? 0) === 2;

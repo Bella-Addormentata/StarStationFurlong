@@ -17,7 +17,9 @@
  *
  * The FAIR SETTING of table `t`: `m` 0 = Fair while the house is online, 1 =
  * Friendly (the house adds no seed). `s` orders the owner's choices: the
- * highest one standing wins, and no record at all means Fair. It is read by
+ * highest one standing wins (fairAfter: of two with one `s`, as two of the
+ * owner's pages may sign, the higher recHash), and no record at all means
+ * Fair. It is read by
  * the house and the ⚙ card only; the fold never reads it (the house steps
  * down itself when set Friendly).
  *
@@ -42,7 +44,7 @@ import { blake3 } from '@noble/hashes/blake3';
 import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
-import { canon, hasFields, isPlain, isPub, isSig } from './computedFold';
+import { canon, hasFields, isPlain, isPub, isSig, recHash } from './computedFold';
 import type { FoldCtx } from './computedFold';
 
 // The derivations below sign synchronously (keypair.ts wires the same).
@@ -93,6 +95,18 @@ export function asFairSetting(v: unknown): FairSettingRec | null {
 export function asBeat(v: unknown): BeatRec | null {
   if (!isPlain(v) || !hasFields(v, ['v', 'n', 'k', 'g'])) return null;
   return v.v === 1 && isCount(v.n) && isPub(v.k) && isSig(v.g) ? (v as unknown as BeatRec) : null;
+}
+
+/** Whether Fair setting `a` stands over `b`: a higher `s`, or the same `s`
+ *  and a higher recHash. Every page and the house (house.rs fair_after)
+ *  order them so, so two the owner signed with one number (two pages of
+ *  theirs, each a step past the newest it had seen) settle on the same one
+ *  everywhere, and no page puts back the one another has set aside. */
+export function fairAfter(a: FairSettingRec, b: FairSettingRec): boolean {
+  if (a.s !== b.s) return a.s > b.s;
+  const ha = recHash(a) ?? '';
+  const hb = recHash(b) ?? '';
+  return ha > hb;
 }
 
 export const delegationKey = (house: string): string => `hk:${house}`;

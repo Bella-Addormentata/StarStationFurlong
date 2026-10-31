@@ -246,6 +246,16 @@ fn switch_inc(v: &CVal) -> Option<String> {
     ok.then(|| inc.to_string())
 }
 
+/// Whether Fair setting `a` stands over `b` (both of the owner's shape): a
+/// higher `s`, or the same `s` and a higher record hash, as computedHouse
+/// fairAfter orders them on every page. Two the owner signed with one
+/// number (two pages of theirs) settle on the same one everywhere, and the
+/// house puts back the one every page keeps.
+fn fair_after(a: &CVal, b: &CVal) -> bool {
+    let s = |v: &CVal| v.get("s").and_then(CVal::as_int).unwrap_or(0);
+    (s(a), hb::rec_hash(a).unwrap_or_default()) > (s(b), hb::rec_hash(b).unwrap_or_default())
+}
+
 /// A checkpoint as asCheckpointFor reads it, as far as the session id and
 /// the house need: its shape (the carry only as an object).
 fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
@@ -715,8 +725,9 @@ impl House {
             self.rooms[room].houses.iter().filter(|(_, k)| **k == owner_key).map(|(h, _)| h.clone()).collect();
         houses.insert(pub_key.clone());
 
-        // The owner's Fair settings, newest first seen (a new deed holder's
-        // count afresh: the last one's settings go).
+        // The owner's Fair settings, the one standing over every other seen
+        // (fair_after; a new deed holder's count afresh: the last one's
+        // settings go).
         self.rooms.get_mut(room).unwrap().fair.retain(|_, v| str_of(v, "k") == Some(owner_key.as_str()));
         for (key, out) in comp.iter(&txn) {
             let Some(t) = key.strip_prefix("hf:").filter(|t| !t.is_empty()) else { continue };
@@ -730,9 +741,7 @@ impl House {
             {
                 continue;
             }
-            let s = v.get("s").and_then(CVal::as_int).unwrap();
-            let seen = self.rooms[room].fair.get(t).and_then(|x| x.get("s").and_then(CVal::as_int));
-            if seen.is_some_and(|was| was >= s) {
+            if self.rooms[room].fair.get(t).is_some_and(|was| !fair_after(&v, was)) {
                 continue;
             }
             let hash = hb::rec_hash(&v).unwrap_or_default();

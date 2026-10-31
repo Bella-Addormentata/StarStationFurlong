@@ -625,6 +625,10 @@ export interface RoundView {
   /** The deciding abandon, when an abandon voided it. */ abandon?: { hash: string; rec: AbandonRec };
   /** The deciding house reveal, when decided === 'house', or 'void' by a
    *  house reveal that counted nobody. */ house?: { hash: string; rec: HouseRevealRec };
+  /** A Fair close the house's reveal lists but hasn't decided: the frozen
+   *  bettors whose seed it counts (their slip in its `n`) that this page
+   *  doesn't have. Sorted. Absent when no house reveal lists it, or one
+   *  decided it. (An abandon may void it meanwhile: the house did reveal.) */ houseWaits?: string[];
   /** 0–36 when decided by reveals, a forfeit or the house; null otherwise. */ pocket: number | null;
   /** pid (P) → stake, payout and delta (payout − stake; 0 when void).
    *  While undecided only `stakes` is filled; on a void every payout is 0
@@ -714,7 +718,7 @@ export interface SlipEntry extends EntryBase<'s', AnySlipRec>, Signed {
 
 /** How one close was decided, before the game plays it: a RoundView's
  *  decision fields, plus the seeds that opened P's slips. */
-export type Outcome = Pick<RoundView, 'present' | 'missing' | 'revealed' | 'decided' | 'counted' | 'forfeit' | 'abandon' | 'house'> & {
+export type Outcome = Pick<RoundView, 'present' | 'missing' | 'revealed' | 'decided' | 'counted' | 'forfeit' | 'abandon' | 'house' | 'houseWaits'> & {
   /** pid (P) → the seed its reveal gave, for every revealed pid. */
   seeds: ReadonlyMap<string, string>;
 };
@@ -1549,6 +1553,7 @@ export class TableFold {
     let forfeit: Outcome['forfeit'];
     let abandon: Outcome['abandon'];
     let house: Outcome['house'];
+    let houseWaits: string[] | undefined;
 
     // (a) Fair: the house's reveal counts the seeds it saw before its own
     // (their slips' hashes in `n`), once each is on this page too; a seed
@@ -1562,6 +1567,8 @@ export class TableFold {
         decided = need.length > 0 ? 'house' : 'void';
         counted = need;
         house = { hash: hr.hash, rec: hr.rec };
+      } else {
+        houseWaits = need.filter((pid) => !seeds.has(pid));
       }
     }
     // (a) Friendly: a forfeit counts only seeds that are in (n ⊆ P, all
@@ -1600,6 +1607,7 @@ export class TableFold {
     const d: Outcome = {
       present, missing: M, revealed, decided, counted,
       ...(forfeit ? { forfeit } : {}), ...(abandon ? { abandon } : {}), ...(house ? { house } : {}),
+      ...(houseWaits ? { houseWaits } : {}),
       seeds,
     };
     if (!this.sawPending) c.decision = { key, d };

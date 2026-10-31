@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { asCheckpoint, asClose } from './computedFold';
+import { asCheckpoint, asClose, recHash } from './computedFold';
 import type { CloseRec, FoldCtx } from './computedFold';
 import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './computedHouse';
 import { houseSign } from './computedHouse';
@@ -21,6 +21,7 @@ import {
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
 import type { Built, TestHouse } from './computedTestKit';
+import { verifyIdentityStrict } from './keypair';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -177,6 +178,117 @@ describe('the Fair setting', () => {
     b.doc.transact(() => top(b).delete(fairSettingKey(OTHER)));
     b.doc.transact(() => top(b).set(fairSettingKey(OTHER), rec));
     expect(b.casino.readFairSetting(OTHER)).toBe('fair');
+  });
+});
+
+describe('two Fair settings with one number', () => {
+  it("as two of the owner's pages may sign: every page settles on the one with the higher hash, whichever it saw first", async () => {
+    const pages = await houseRoom(['A', 'B', 'C']);
+    const [a, b, c] = pages;
+    const sign = (m: 0 | 1) => {
+      const body = { v: 1 as const, m, s: T0 + 7, k: a.pub };
+      return { ...body, g: a.keypair.signIdentity(roomSignBytes('hfair', PAGE_ROOM, TABLE, body)) };
+    };
+    const [lo, hi] = [sign(0), sign(1)].sort((x, y) => (recHash(x)! < recHash(y)! ? -1 : 1));
+    const want = hi.m === 1 ? 'friendly' : 'fair';
+    b.doc.transact(() => top(b).set(fairSettingKey(TABLE), lo));
+    c.doc.transact(() => top(c).set(fairSettingKey(TABLE), hi));
+    b.doc.transact(() => top(b).set(fairSettingKey(TABLE), hi));
+    c.doc.transact(() => top(c).set(fairSettingKey(TABLE), lo));
+    for (const p of [b, c]) {
+      expect(p.casino.readFairSetting(TABLE)).toBe(want);
+      expect(p.casino.fairSettingSeq(TABLE)).toBe(T0 + 7);
+    }
+    // Whichever the docs keep as they meet, the one every page keeps goes back.
+    run(pages, T0 + 2_000, T0 + 2_000, { step: STEP });
+    sync(T0 + 2_000, ...pages);
+    for (const p of pages) {
+      expect(p.casino.readFairSetting(TABLE)).toBe(want);
+      expect(recHash(top(p).get(fairSettingKey(TABLE)))).toBe(recHash(hi));
+    }
+  });
+});
+
+describe("the room records' signature checks", () => {
+  it("share a recount's 40 ms: a flood of forged ones under the deed holder's key is checked in slices, each once; the real ones count after, the fold waiting meanwhile", async () => {
+    const [a, b] = await houseRoom(['A', 'B'], { delegate: false });
+    // b's checks are real, and take 2 ms each on its clock (strict noble's).
+    let clock = 0;
+    let checks = 0;
+    b.casino.setComputedVerifyForTests({
+      verify: (pub, bytes, sig) => {
+        checks += 1;
+        clock += 2;
+        return verifyIdentityStrict(pub, bytes, sig);
+      },
+      now: () => clock,
+    });
+    const perTx: number[] = [];
+    let before = 0;
+    b.doc.on('afterTransaction', () => {
+      perTx.push(checks - before);
+      before = checks;
+    });
+    const BAD = 'A'.repeat(86);
+    const junk = Array.from({ length: 40 }, (_, i) => testHouse(`junk-${i}`).pub);
+    const deleg = { v: 1 as const, h: H.pub, k: a.pub };
+    const setting = { v: 1 as const, m: 1 as const, s: 5, k: a.pub };
+    const beatBody = { v: 1 as const, n: 100, k: H.pub };
+    const join = kit.houseJoin(H, 1);
+    b.doc.transact(() => {
+      for (const pub of junk) top(b).set(delegationKey(pub), { v: 1, h: pub, k: a.pub, g: BAD });
+      for (let i = 0; i < 20; i++) top(b).set(fairSettingKey(`roulette-junk-${i}`), { v: 1, m: 1, s: 9, k: a.pub, g: BAD });
+      top(b).set(delegationKey(H.pub), { ...deleg, g: a.keypair.signIdentity(roomSignBytes('hkey', PAGE_ROOM, '', deleg)) });
+      top(b).set(fairSettingKey(TABLE), { ...setting, g: a.keypair.signIdentity(roomSignBytes('hfair', PAGE_ROOM, TABLE, setting)) });
+      top(b).set(beatKey(H.pub), { ...beatBody, g: houseSign(H.secret, roomSignBytes('hbeat', PAGE_ROOM, '', beatBody)) });
+      b.casino.computedSessionForWrite(TABLE)!.set(join.key, join.rec);
+    });
+    expect(perTx).toEqual([20]); // 40 ms at 2 ms a check
+    expect(b.casino.houseSetUp()).toBe(false);
+    expect(b.casino.readFairSetting(TABLE)).toBe('fair');
+    expect(b.casino.houseOnline(T0)).toBe(false);
+    expect(foldOf(b).pending).toBe(true); // the join's house not known yet
+    expect(b.casino.computedSettled()).toBe(false);
+    // The slices, one after another once the page has drawn a frame.
+    const done = (): boolean => b.casino.houseSetUp() && b.casino.readFairSetting(TABLE) === 'friendly'
+      && b.casino.houseOnline(T0) && !foldOf(b).pending;
+    for (let i = 0; i < 20 && !done(); i++) await new Promise((r) => setTimeout(r, 0));
+    expect(done()).toBe(true);
+    expect(perTx.length).toBeGreaterThan(3);
+    expect(Math.max(...perTx)).toBeLessThanOrEqual(20);
+    // Each checked once: 60 forged, the delegation, the setting, the beat, the join.
+    expect(checks).toBe(64);
+    expect(foldOf(b).joins.map((o) => o.hash)).toEqual([join.hash]);
+    expect(b.casino.computedSettled()).toBe(true);
+    // The deed read again (every delegation and setting with it): nothing checked anew.
+    b.doc.transact(() => b.doc.getMap('roomInfo').set('owner', a.pid));
+    expect(checks).toBe(64);
+    expect(b.casino.houseSetUp()).toBe(true);
+  });
+});
+
+describe('the room records\' verdicts', () => {
+  it('are kept for the latest 2,048: the oldest goes first, and its record is checked again if it comes again', async () => {
+    const [a, b] = await houseRoom(['A', 'B']);
+    let checks = 0;
+    b.casino.setComputedVerifyForTests({ verify: () => { checks += 1; return false; }, now: () => 0 });
+    const BAD = 'A'.repeat(86);
+    // (One forged setting, copied under each table's key: a verdict apiece.)
+    const forged = { v: 1, m: 1, s: 9, k: a.pub, g: BAD };
+    const tables = Array.from({ length: 2_100 }, (_, i) => `roulette-junk-${i}`);
+    b.doc.transact(() => {
+      for (const t of tables) top(b).set(fairSettingKey(t), forged);
+    });
+    expect(checks).toBe(2_100);
+    // Written again: the last one's verdict is kept, the first one's went.
+    const again = (t: string): void => {
+      b.doc.transact(() => top(b).delete(fairSettingKey(t)));
+      b.doc.transact(() => top(b).set(fairSettingKey(t), forged));
+    };
+    again(tables[2_099]);
+    expect(checks).toBe(2_100);
+    again(tables[0]);
+    expect(checks).toBe(2_101);
   });
 });
 

@@ -697,6 +697,26 @@ fn a_forged_setting_with_a_higher_count_is_put_back_over() {
 }
 
 #[test]
+fn of_two_settings_with_one_number_the_higher_hash_stands_whichever_came_first() {
+    let sign = |room: &Room, m: i64| room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(m)), ("s", CVal::Int(7))]));
+    for hi_first in [false, true] {
+        let mut room = Room::new(if hi_first { "tie-hi" } else { "tie-lo" }, true);
+        let (mut lo, mut hi) = (sign(&room, 0), sign(&room, 1));
+        if hb::rec_hash(&lo) > hb::rec_hash(&hi) {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        let (first, then) = if hi_first { (&hi, &lo) } else { (&lo, &hi) };
+        room.put_top(&format!("hf:{T}"), first);
+        room.tick(0);
+        room.put_top(&format!("hf:{T}"), then);
+        room.tick(REPUT_MS);
+        // It reads the higher one, and that is the one in the doc after it.
+        assert_eq!(room.house.rooms[ROOM].fair.get(T).and_then(hb::canon), hb::canon(&hi), "hi first: {hi_first}");
+        assert_eq!(room.top(&format!("hf:{T}")).and_then(|v| hb::canon(&v)), hb::canon(&hi), "hi first: {hi_first}");
+    }
+}
+
+#[test]
 fn a_signature_verdict_holds_only_where_it_was_given() {
     let mut room = Room::new("scope", true);
     room.set_fair(1, 1);

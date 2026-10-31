@@ -228,7 +228,7 @@ import type {
 import { asCheckpointFor, gameOfInc, nextSid, parseKey, recHash, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
 import {
-  asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
+  asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
 } from './computedHouse';
 import type { DelegationRec, FairSettingRec, RoomKind } from './computedHouse';
 import { legacyOwnerMarker } from './roomOwner';
@@ -2453,6 +2453,7 @@ export function setComputedVerifyForTests(opts: {
   verifyWith = opts.verify ?? null;
   verifyBudgetMs = opts.budgetMs ?? COMPUTED_VERIFY_MS;
   verifyNow = opts.now ?? defaultVerifyNow;
+  if (roomWaiting.size > 0) queueVerifySlice();
   for (const c of computedIncs.values()) {
     if (c.last?.pending) {
       queueVerifySlice();
@@ -2539,8 +2540,16 @@ let housePinned = new Map<string, string>();
 let houseDelegations = new Map<string, DelegationRec>();
 /** Verdicts on the room records' signatures, by kind, room, table and
  *  recHash (the signed bytes are bound to each: a copy elsewhere is checked
- *  anew). */
+ *  anew): the latest HOUSE_VERDICTS_MAX, the oldest going first (a page in
+ *  a room for hours hears a beat every 5 s). What a verdict let in stays in
+ *  without it (housePinned, houseBeats, fairSeen), so one that goes costs at
+ *  most a check of a record read again. */
 let houseVerdicts = new Map<string, boolean>();
+const HOUSE_VERDICTS_MAX = 2_048;
+/** The room records (by doc key: `hk:<pub>`, `hf:<t>`, `hb:<pub>`) whose
+ *  check a recount's budget put off: the slice it queued reads each again
+ *  (recheckRoomRecords). */
+let roomWaiting = new Set<string>();
 /** Each house's highest heartbeat seen, and when (this page's clock). */
 let houseBeats = new Map<string, { n: number; at: number }>();
 /** The newest Fair setting by the deed holder this page has seen, per table. */
@@ -2557,37 +2566,75 @@ function deedHolderKey(): string | null | undefined {
 }
 
 /** A room record's signature (computedHouse roomSignBytes), checked once
- *  for its kind and table. */
-function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }): boolean {
+ *  for its kind and table, out of the recount's budget as the fold's are
+ *  (computedCheck): past it, undefined, and the record under doc key
+ *  `key` waits for the slice that queues (recheckRoomRecords). A peer's
+ *  flood of records naming the deed holder's key, every signature bad,
+ *  costs a page no more a recount than one of slips. */
+function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }, key: string): boolean | undefined {
   const hash = recHash(rec);
   if (hash === null) return false;
   const id = JSON.stringify([kind, boundRoomId, t, hash]);
-  let ok = houseVerdicts.get(id);
-  if (ok === undefined) {
-    try {
-      ok = (verifyWith ?? verifyIdentityStrict)(rec.k, roomSignBytes(kind, boundRoomId, t, rec), rec.g) === true;
-    } catch {
-      ok = false;
-    }
-    houseVerdicts.set(id, ok);
+  const known = houseVerdicts.get(id);
+  if (known !== undefined) return known;
+  if (verifySpent >= verifyBudgetMs) {
+    roomWaiting.add(key);
+    queueVerifySlice();
+    return undefined;
   }
+  const from = verifyNow();
+  let ok: boolean;
+  try {
+    ok = (verifyWith ?? verifyIdentityStrict)(rec.k, roomSignBytes(kind, boundRoomId, t, rec), rec.g) === true;
+  } catch {
+    ok = false;
+  }
+  verifySpent += Math.max(0, verifyNow() - from);
+  if (houseVerdicts.size >= HOUSE_VERDICTS_MAX) houseVerdicts.delete(houseVerdicts.keys().next().value as string);
+  houseVerdicts.set(id, ok);
   return ok;
+}
+
+/** Read again each room record whose check waited (roomWaiting), now the
+ *  budget is fresh: the delegations first, as a beat counts only from a
+ *  house. Those the budget puts off again wait for the next slice. The
+ *  keys of houses pinned now (the folds ask their HouseCheck again). */
+function recheckRoomRecords(): string[] {
+  const keys = [...roomWaiting].sort((a, b) => Number(!a.startsWith('hk:')) - Number(!b.startsWith('hk:')));
+  roomWaiting = new Set();
+  const pinned: string[] = [];
+  for (const key of keys) {
+    const at = houseKeyParts(key);
+    if (at?.kind === 'hkey') {
+      if (!pinnedHouse(at.of) && houseOkOf(at.of) === true) pinned.push(at.of);
+    } else if (at?.kind === 'hfair') {
+      noteFairSetting(at.of);
+    } else if (at?.kind === 'hbeat') {
+      noteBeat(at.of);
+    }
+  }
+  return pinned;
 }
 
 /** 🏠 Whether `pub` is a house of the bound room (computedFold HouseCheck): its
  *  delegation (`hk:<pub>`) is there, signed by the deed holder's pinned key.
- *  True from then on while that key holds the deed (housePinned). Never "not
- *  known yet": while the deed holder's key hasn't shown up it is false, and
+ *  True from then on while that key holds the deed (housePinned). "Not
+ *  known yet" (undefined) only while the check of its signature waits for
+ *  a slice (roomRecOk), which comes once the page has drawn a frame, and a
+ *  record is checked once: never for as long as something stays in the
+ *  doc. While the deed holder's key hasn't shown up it is false, and
  *  countTransaction asks again when it does, or when the deed moves
- *  (houseChangedAll). A pending answer would hold every spend in the casino
- *  (computedSettled) for as long as a forged delegation and a key that never
- *  comes stayed in the doc. */
-export function houseOkOf(pub: string): boolean {
+ *  (houseChangedAll): a pending answer would hold every spend in the casino
+ *  (computedSettled) for as long as a forged delegation and a key that
+ *  never comes stayed in the doc. */
+export function houseOkOf(pub: string): boolean | undefined {
   const owner = deedHolderKey();
   if (!owner) return false;
   if (housePinned.get(pub) === owner) return true;
   const rec = asDelegation(computedMap?.get(delegationKey(pub)));
-  if (!rec || rec.h !== pub || rec.k !== owner || !roomRecOk('hkey', '', rec)) return false;
+  if (!rec || rec.h !== pub || rec.k !== owner) return false;
+  const ok = roomRecOk('hkey', '', rec, delegationKey(pub));
+  if (ok !== true) return ok;
   housePinned.set(pub, owner);
   houseDelegations.set(pub, rec);
   return true;
@@ -2616,15 +2663,15 @@ function houseChangedAll(dirty?: Set<ComputedInc>): void {
 }
 
 /** Note table `t`'s Fair setting as the doc holds it now, if the deed holder
- *  signed it and it is newer than any this page saw of theirs. */
+ *  signed it and it stands over any this page saw of theirs (fairAfter). */
 function noteFairSetting(t: string): void {
   const rec = asFairSetting(computedMap?.get(fairSettingKey(t)));
   if (!rec) return;
   const owner = deedHolderKey();
   if (!owner || rec.k !== owner) return;
   const seen = fairOf(t);
-  if (seen && seen.s >= rec.s) return;
-  if (roomRecOk('hfair', t, rec)) fairSeen.set(t, rec);
+  if (seen && !fairAfter(rec, seen)) return;
+  if (roomRecOk('hfair', t, rec, fairSettingKey(t)) === true) fairSeen.set(t, rec);
 }
 
 /** The newest Fair setting of table `t` this page saw by the deed holder as
@@ -2638,10 +2685,14 @@ function fairOf(t: string): FairSettingRec | undefined {
  *  any this page saw of it, its signature good. */
 function noteBeat(pub: string): void {
   const rec = asBeat(computedMap?.get(beatKey(pub)));
-  if (!rec || rec.k !== pub || houseOkOf(pub) !== true) return;
+  if (!rec || rec.k !== pub) return;
+  const house = houseOkOf(pub);
+  // (Its delegation's check put off: the beat is read again after it.)
+  if (house === undefined) roomWaiting.add(beatKey(pub));
+  if (house !== true) return;
   const was = houseBeats.get(pub);
   if (was && was.n >= rec.n) return;
-  if (roomRecOk('hbeat', '', rec)) houseBeats.set(pub, { n: rec.n, at: txNow ?? Date.now() });
+  if (roomRecOk('hbeat', '', rec, beatKey(pub)) === true) houseBeats.set(pub, { n: rec.n, at: txNow ?? Date.now() });
 }
 
 /** 🏠 Whether this page holds the room's deed (its key is the deed holder's,
@@ -2680,24 +2731,22 @@ export function houseOnline(now = Date.now()): boolean {
   return at !== null && now - at <= HOUSE_HEARD_MS;
 }
 
-/** 🏠 Whether the room has a house at all: a delegation this page counted. */
+/** 🏠 Whether the room has a house at all: a delegation this page counted.
+ *  (Pinned once counted, which each delegation is as it comes, as the deed
+ *  holder's key does or the deed moves, or after its check waited: the
+ *  plaque asks every frame, and reads no record.) */
 export function houseSetUp(): boolean {
-  // (Pinned once counted: the plaque asks every frame.)
   const owner = deedHolderKey();
   for (const pub of housePinned.keys()) if (pinnedHouse(pub, owner)) return true;
-  const map = computedMap;
-  if (!map) return false;
-  for (const key of map.keys()) {
-    const at = houseKeyParts(key);
-    if (at?.kind === 'hkey' && houseOkOf(at.of) === true) return true;
-  }
   return false;
 }
 
-/** 🏠 Whether `pub`'s delegation is in the doc now, as its deed holder signed it. */
-export function delegationHeld(pub: string): boolean {
+/** 🏠 Whether `pub`'s delegation is in the doc now, as its deed holder signed
+ *  it: undefined while its check waits (roomRecOk). */
+export function delegationHeld(pub: string): boolean | undefined {
   const rec = asDelegation(computedMap?.get(delegationKey(pub)));
-  return rec !== null && rec.h === pub && rec.k === deedHolderKey() && roomRecOk('hkey', '', rec);
+  if (rec === null || rec.h !== pub || rec.k !== deedHolderKey()) return false;
+  return roomRecOk('hkey', '', rec, delegationKey(pub));
 }
 
 /** 🏠 Write a delegation the deed holder's page signed (computedHouse). */
@@ -2738,11 +2787,16 @@ export function putBackHouseRecords(): number {
     if (!rec) continue;
     const now = asFairSetting(map.get(fairSettingKey(t)));
     if (now && recHash(now) === recHash(rec)) continue;
-    // A newer one by the deed holder that this page hasn't noted yet stands;
-    // anything else goes, a forged one with a higher count included.
-    if (now && now.k === rec.k && now.s > rec.s && roomRecOk('hfair', t, now)) {
-      fairSeen.set(t, now);
-      continue;
+    // A newer one by the deed holder that this page hasn't noted yet stands
+    // (one whose check waits, until it is checked); anything else goes, a
+    // forged one with a higher count included.
+    if (now && now.k === rec.k && fairAfter(now, rec)) {
+      const ok = roomRecOk('hfair', t, now, fairSettingKey(t));
+      if (ok === undefined) continue;
+      if (ok) {
+        fairSeen.set(t, now);
+        continue;
+      }
     }
     back.push([fairSettingKey(t), rec]);
   }
@@ -2948,6 +3002,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   housePinned = new Map();
   houseDelegations = new Map();
   houseVerdicts = new Map();
+  roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
   for (const key of map.keys()) {
@@ -2989,11 +3044,17 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // incarnation is read whole.
   const top = tr.changed.get(map as unknown as Y.AbstractType<Y.YEvent<any>>);
   let houseMoved = false;
+  // 🏠 The room records whose checks waited first, then what came: each
+  // delegation that came is checked alone (a flood of them is checked in
+  // slices, and never read again whole), and a house pinned now has every
+  // fold ask its HouseCheck again, and its beat read.
+  const pinned = roomWaiting.size > 0 ? recheckRoomRecords() : [];
   if (top) {
     for (const key of top) {
       const house = key === null ? null : houseKeyParts(key);
-      if (house?.kind === 'hkey' && !pinnedHouse(house.of)) houseMoved = true;
-      else if (house?.kind === 'hbeat') noteBeat(house.of);
+      if (house?.kind === 'hkey') {
+        if (!pinnedHouse(house.of) && houseOkOf(house.of) === true) pinned.push(house.of);
+      } else if (house?.kind === 'hbeat') noteBeat(house.of);
       else if (house?.kind === 'hfair') noteFairSetting(house.of);
       const at = key === null ? null : computedKeyParts(key);
       if (!at) continue;
@@ -3015,7 +3076,14 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   if (houseMoved) {
     houseChangedAll(dirty);
     if (top) for (const key of top) if (key !== null && key.startsWith('hb:')) noteBeat(key.slice(3));
+  } else if (pinned.length > 0) {
+    for (const c of computedIncs.values()) {
+      c.fold.houseChanged();
+      dirty.add(c);
+    }
   }
+  // (A beat that came before its house was pinned: read now.)
+  for (const pub of pinned) noteBeat(pub);
   if (computedIncs.size === 0) return;
   if (computedKeysMoved) {
     computedKeysMoved = false;

@@ -311,7 +311,7 @@ describe('the round check', () => {
     putAt(o, T0 + 23_000, kit.forfeit(X, 1, c1.hash, [X.pid]));
     expect(o.table.computedRoundCheck(TABLE, T0 + 23_000)).toEqual({
       round: 1, decided: 'forfeit', counted: 1, of: 2, missing: [], forfeitBy: X.pid, mine: 'forfeited', dropped: [],
-      fair: false, houseDropped: [], houseVoid: false, pinMismatch: [], checkpointDiff: 0,
+      fair: false, houseDropped: [], houseVoid: false, houseWaited: [], pinMismatch: [], checkpointDiff: 0,
     });
     // Its seed after all, too late.
     revealMine(o, 1, T0 + 24_000);
