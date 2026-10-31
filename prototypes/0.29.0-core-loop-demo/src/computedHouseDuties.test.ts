@@ -297,6 +297,10 @@ describe("the deed holder's player entry", () => {
     const [a, b] = await houseRoom(['A', 'B']);
     let checks = 0;
     b.casino.setComputedVerifyForTests({ verify: () => { checks += 1; return false; }, now: () => 0 });
+    // a's page counts too, so it checks the forged settings by count, not by
+    // 2,100 real signature checks (seconds on a slow runner).
+    let aChecks = 0;
+    a.casino.setComputedVerifyForTests({ verify: () => { aChecks += 1; return false; }, now: () => 0 });
     const BAD = 'A'.repeat(86);
     // More forged settings under the deed holder's key than the verdict
     // cache keeps (2,048): read again, some would be checked again.
@@ -312,6 +316,9 @@ describe("the deed holder's player entry", () => {
     a.doc.transact(() => a.doc.getMap('players').set(a.pid, { keyB64: a.pub, name: 'A, again' }));
     sync(T0, a, b);
     expect(checks).toBe(2_100);
+    // a read each forged setting once as it came, and its own rename and
+    // b's read none of them again.
+    expect(aChecks).toBe(2_100);
     expect(b.casino.houseSetUp()).toBe(true);
     // Another owner: the old holder's house is the room's no longer.
     b.doc.transact(() => b.doc.getMap('roomInfo').set('owner', b.pid));
