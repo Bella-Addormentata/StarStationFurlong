@@ -3,8 +3,9 @@
  * COVERINGS. WHICH covering each octagon hull surface wears — surface → preset —
  * lives in a room-doc `wallpaperLayout` Y.Map, so a joiner sees the host's
  * coverings on entry and the owner's paint / clear propagates to everyone. The
- * covering is a tiled material the hull paints onto that strip's face
- * (world.collectWallpaper → buildOctagonHull); the same discipline as
+ * covering is a tiled material the hull paints onto that strip's or end wall's
+ * face (world.collectWallpaper → buildOctagonHull), or onto the room floor
+ * (`deck` → world.applyFloorLook); the same discipline as
  * windowLayoutDoc / doorLayoutDoc / furnitureDoc.
  *
  * Keyed by SURFACE (not a uuid): a surface wears at most ONE covering, so the
@@ -16,17 +17,21 @@
  */
 
 import * as Y from 'yjs';
-import { SURFACES } from './hullSection';
-import type { HullSurface } from './hullSection';
-import { isWallpaperPreset, type WallpaperPresetId } from './wallpaper';
+import {
+  WALLPAPER_SURFACES,
+  isWallpaperPreset,
+  type WallpaperPresetId,
+  type WallpaperSurface,
+} from './wallpaper';
 
-export type { HullSurface };
+export type { WallpaperSurface };
 export type { WallpaperPresetId };
 
 /** Serializable wallpaper record — one per painted surface. Plain JSON. */
 export interface WallpaperLayoutRecord {
-  /** The hull surface this covering is painted onto (also the Y.Map key). */
-  surface: HullSurface;
+  /** The surface this covering is painted onto (also the Y.Map key): a hull
+   *  strip, an octagon end wall or the room floor (wallpaper.WALLPAPER_SURFACES). */
+  surface: WallpaperSurface;
   /** Which covering preset — never `plain` (that's the absence of a record). */
   preset: WallpaperPresetId;
 }
@@ -73,15 +78,15 @@ export function isWallpaperLayoutRecord(value: unknown): value is WallpaperLayou
   const r = value as Partial<WallpaperLayoutRecord>;
   return (
     typeof r.surface === 'string' &&
-    SURFACES.includes(r.surface as HullSurface) &&
+    WALLPAPER_SURFACES.includes(r.surface as WallpaperSurface) &&
     isWallpaperPreset(r.preset) &&
     r.preset !== 'plain'
   );
 }
 
 /** Snapshot the coverings as surface → preset (malformed / mis-keyed skipped). */
-export function readAllWallpaper(): Map<HullSurface, WallpaperPresetId> {
-  const out = new Map<HullSurface, WallpaperPresetId>();
+export function readAllWallpaper(): Map<WallpaperSurface, WallpaperPresetId> {
+  const out = new Map<WallpaperSurface, WallpaperPresetId>();
   if (!docAlive()) return out;
   for (const [key, value] of wallpaperMap!.entries()) {
     if (isWallpaperLayoutRecord(value) && value.surface === key) {
@@ -101,7 +106,7 @@ export function wallpaperLayoutDocSize(): number {
  * record) — a surface wears at most one covering, so the surface id is the key.
  * Owner-only in practice (editor-gated).
  */
-export function writeWallpaper(surface: HullSurface, preset: WallpaperPresetId): void {
+export function writeWallpaper(surface: WallpaperSurface, preset: WallpaperPresetId): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
     if (preset === 'plain') {
