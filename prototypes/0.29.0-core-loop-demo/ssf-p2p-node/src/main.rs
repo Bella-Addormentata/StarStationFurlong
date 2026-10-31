@@ -3746,7 +3746,9 @@ async fn house_loop(hub: SharedHub) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
         let mut sent = house_sends().lock().await;
-        let updates = house_tick(&hub);
+        // Its checks are CPU work: off the runtime's threads.
+        let hub_tick = hub.clone();
+        let updates = tokio::task::spawn_blocking(move || house_tick(&hub_tick)).await.unwrap_or_default();
         let now = house_now();
         while sent.front().is_some_and(|(at, _, _)| now.saturating_sub(*at) > HOUSE_RESEND_MS) {
             sent.pop_front();
@@ -3758,6 +3760,14 @@ async fn house_loop(hub: SharedHub) {
     }
 }
 
+/// The served rooms and their docs (a doc is a handle on the room's own),
+/// taken under the rooms lock and let go: every room's sync waits on that
+/// lock, and a tick of the house (its signature checks) must not hold them.
+fn served_docs(hub: &SharedHub) -> Vec<(String, yrs::Doc)> {
+    let rooms = hub.rooms.lock().unwrap();
+    rooms.iter().filter(|(_, r)| r.served).map(|(id, r)| (id.clone(), r.doc.clone())).collect()
+}
+
 /// One tick of the house over the served rooms: (room, update) for each it wrote in.
 fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
     let Some(house) = hub.house.as_ref() else { return Vec::new() };
@@ -3766,12 +3776,10 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let rooms = hub.rooms.lock().unwrap();
-    let mut house = house.lock().unwrap();
     let mut out = Vec::new();
-    for (room_id, room) in rooms.iter().filter(|(_, r)| r.served) {
-        if let Some(update) = house.tick(room_id, &room.doc, now, wall).update {
-            out.push((room_id.clone(), update));
+    for (room_id, doc) in served_docs(hub) {
+        if let Some(update) = house.lock().unwrap().tick(&room_id, &doc, now, wall).update {
+            out.push((room_id, update));
         }
     }
     out
@@ -3789,19 +3797,20 @@ async fn house_step_down(hub: &SharedHub) -> usize {
     let mut sent = house_sends().lock().await;
     house.lock().unwrap().begin_step_down();
     let mut wrote = 0;
-    let updates: Vec<(String, Vec<u8>, usize)> = {
-        let rooms = hub.rooms.lock().unwrap();
-        let mut house = house.lock().unwrap();
+    let hub_tick = hub.clone();
+    let updates: Vec<(String, Vec<u8>, usize)> = tokio::task::spawn_blocking(move || {
+        let Some(house) = hub_tick.house.as_ref() else { return Vec::new() };
         let now = house_now();
-        rooms
-            .iter()
-            .filter(|(_, r)| r.served)
-            .filter_map(|(id, room)| {
-                let out = house.tick(id, &room.doc, now, 0);
-                out.update.map(|u| (id.clone(), u, out.wrote))
+        served_docs(&hub_tick)
+            .into_iter()
+            .filter_map(|(id, doc)| {
+                let out = house.lock().unwrap().tick(&id, &doc, now, 0);
+                out.update.map(|u| (id, u, out.wrote))
             })
             .collect()
-    };
+    })
+    .await
+    .unwrap_or_default();
     let mut sends = Vec::new();
     let now = house_now();
     for (_, room_id, update) in sent.drain(..).filter(|(at, _, _)| now.saturating_sub(*at) <= HOUSE_RESEND_MS) {

@@ -56,14 +56,25 @@
 //!    (when stopping, only if every seed is in: a void hands every stake
 //!    back, a reveal short of seeds would cost the late ones theirs).
 //!
+//! Signatures cost: a tick checks at most [`VERIFY_PER_TICK`] it hasn't
+//! checked before (the pages' 40 ms slices, casinoDoc computedCheck), and a
+//! room or table whose read needed more does nothing that tick, the checks
+//! carrying on at the next: a peer's flood of forged records in one room
+//! holds the node's loop, and the rooms its lock serves, no longer than a
+//! budget a tick. After a tick a read was short, the next starts at the
+//! table after the one it started at: a flood at one table holds the
+//! room's others back no more than a tick in turn. Only what a table's
+//! records name is checked: another house's delegation as its records
+//! come, the owner's setting of each house table switched on.
+//!
 //! The rules are computedFold's (THE HOUSE) and the bytes house_bytes.rs's.
 //! The node never decides a round: the pages' fold does, from the records.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, Transact};
+use yrs::{Any, Doc, Map, MapRef, Out, ReadTxn, Transact, TransactionMut, WriteTxn};
 
 use crate::house_bytes::{self as hb, CVal, Ctx, HouseKey};
 
@@ -107,6 +118,11 @@ pub const STATE_FILE: &str = "house-state.json";
 /// The most reveals of a session the state file keeps per table (a session
 /// is trimmed at 20 rounds: a reveal and a step-down each, at most).
 pub const MAX_KEPT: usize = 64;
+/// Signatures a tick of a room checks that it hasn't before (about 15 ms of
+/// strict ed25519): past it, what waits on them waits a tick.
+pub const VERIFY_PER_TICK: usize = 256;
+/// Verdicts kept, the oldest going first.
+const MAX_VERDICTS: usize = 50_000;
 
 const CASINO_MAP: &str = "casino";
 const COMPUTED_MAP: &str = "casinoComputed";
@@ -485,6 +501,9 @@ struct RoomMem {
     last_beat: Option<u64>,
     beat_n: i64,
     last_reput: Option<u64>,
+    /// Which table a tick reads first (in name order, from this one on):
+    /// one on from the last after a tick a read was short.
+    turn: usize,
 }
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
@@ -512,6 +531,8 @@ struct Kept {
     rec: CVal,
 }
 
+type VerdictId = (&'static str, [String; 3], String);
+
 /// The house of this node: its key, what it has revealed, what it has seen.
 pub struct House {
     key: HouseKey,
@@ -520,8 +541,15 @@ pub struct House {
     done: HashMap<(String, String, String), Done>,
     rooms: HashMap<String, RoomMem>,
     /// Signature verdicts by kind, room, table, incarnation and record hash
-    /// (the signed bytes are bound to each: a copy elsewhere is checked anew).
-    verdicts: HashMap<(&'static str, [String; 3], String), bool>,
+    /// (the signed bytes are bound to each: a copy elsewhere is checked
+    /// anew): the latest [`MAX_VERDICTS`], in the order they were given.
+    verdicts: HashMap<VerdictId, bool>,
+    verdict_order: VecDeque<VerdictId>,
+    /// Checks this tick may still make ([`VERIFY_PER_TICK`]; unbounded while
+    /// stepping down: the last tick must write what it owes), and whether
+    /// one was put off since `deferred` was last cleared.
+    budget: usize,
+    deferred: bool,
     stepping_down: bool,
     /// [`SETTLE_MS`] (tests set 0).
     settle_ms: u64,
@@ -556,6 +584,9 @@ impl House {
             done,
             rooms: HashMap::new(),
             verdicts: HashMap::new(),
+            verdict_order: VecDeque::new(),
+            budget: VERIFY_PER_TICK,
+            deferred: false,
             stepping_down: false,
             settle_ms: SETTLE_MS,
         })
@@ -578,18 +609,52 @@ impl House {
 
     /// Whether `g` is `k`'s signature of `bytes`, record `hash` of `kind` at
     /// `at` (room, table, incarnation; "" where the kind has none): checked
-    /// once there.
-    fn verified(&mut self, kind: &'static str, at: [&str; 3], hash: &str, k: &str, bytes: Option<[u8; 32]>, g: &str) -> bool {
+    /// once there. None when this tick's checks are spent (`deferred` set):
+    /// not known yet.
+    fn verified(&mut self, kind: &'static str, at: [&str; 3], hash: &str, k: &str, bytes: Option<[u8; 32]>, g: &str) -> Option<bool> {
         let id = (kind, at.map(str::to_string), hash.to_string());
         if let Some(v) = self.verdicts.get(&id) {
-            return *v;
+            return Some(*v);
         }
+        if self.budget == 0 {
+            self.deferred = true;
+            return None;
+        }
+        self.budget -= 1;
         let ok = bytes.is_some_and(|b| hb::verify(k, &b, g));
-        if self.verdicts.len() >= 50_000 {
-            self.verdicts.clear();
+        if self.verdicts.len() >= MAX_VERDICTS {
+            if let Some(old) = self.verdict_order.pop_front() {
+                self.verdicts.remove(&old);
+            }
         }
+        self.verdict_order.push_back(id.clone());
         self.verdicts.insert(id, ok);
-        ok
+        Some(ok)
+    }
+
+    /// Whether `k` is a house of room `room` under the deed holder's key
+    /// `owner_key`: this one, one pinned so, or one whose delegation
+    /// (`hk:<k>`) the doc holds signed by them (pinned from then on). None
+    /// while its check waits ([`House::verified`]).
+    fn house_of<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, room: &str, owner_key: &str, k: &str) -> Option<bool> {
+        if k == self.key.public || self.rooms.get(room).and_then(|m| m.houses.get(k)).is_some_and(|o| o == owner_key) {
+            return Some(true);
+        }
+        let Some(v) = top_value(comp, txn, &format!("hk:{k}")) else { return Some(false) };
+        let shape_ok = has_fields(&v, &["v", "h", "k", "g"], &[])
+            && v.get("v").and_then(CVal::as_int) == Some(1)
+            && str_of(&v, "h") == Some(k)
+            && str_of(&v, "k") == Some(owner_key);
+        if !shape_ok {
+            return Some(false);
+        }
+        let hash = hb::rec_hash(&v).unwrap_or_default();
+        let g = str_of(&v, "g").unwrap_or("").to_string();
+        let ok = self.verified("hkey", [room, "", ""], &hash, owner_key, hb::room_sign_bytes("hkey", room, "", &v), &g)?;
+        if ok {
+            self.rooms.entry(room.to_string()).or_default().houses.insert(k.to_string(), owner_key.to_string());
+        }
+        Some(ok)
     }
 
     /// Player `pid`'s key as this house first saw it in the room's players
@@ -651,31 +716,35 @@ impl House {
 
     /// One tick of the house in room `room` (its doc `doc`), at `now` on a
     /// monotonic clock (ms) and `wall` (ms since the epoch: the heartbeat's
-    /// count). Writes what it decided into the doc, in one transaction.
+    /// count). Reads the doc and writes what it decided in one transaction:
+    /// nothing a peer sent comes between (the node lets the room's lock go
+    /// while it ticks, main.rs served_docs).
     pub fn tick(&mut self, room: &str, doc: &Doc, now: u64, wall: u64) -> TickOut {
-        let writes = self.plan(room, doc, now, wall);
+        self.budget = if self.stepping_down { usize::MAX } else { VERIFY_PER_TICK };
+        self.deferred = false;
+        let mut txn = doc.transact_mut();
+        let writes = self.plan(room, &txn, now, wall);
         let wrote = writes.len();
-        TickOut { update: apply(doc, &writes), wrote }
+        TickOut { update: apply(&mut txn, &writes), wrote }
     }
 
-    fn plan(&mut self, room: &str, doc: &Doc, now: u64, wall: u64) -> Vec<Write> {
+    fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
-        let txn = doc.transact();
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
         // The deed holder and their key, pinned on first sight.
-        let owner = txn.get_map("roomInfo").and_then(|m| match m.get(&txn, "owner") {
+        let owner = txn.get_map("roomInfo").and_then(|m| match m.get(txn, "owner") {
             Some(Out::Any(Any::String(s))) if !s.is_empty() && &*s != "Local-Clone" => Some(s.to_string()),
             _ => None,
         });
         let Some(owner) = owner else { return writes };
         self.rooms.entry(room.to_string()).or_default();
-        let Some(owner_key) = self.pin_of(room, &txn, &owner) else { return writes };
+        let Some(owner_key) = self.pin_of(room, txn, &owner) else { return writes };
 
         // The delegation: this house's key, signed by the deed holder.
         let deleg_key = format!("hk:{pub_key}");
-        let deleg_now = top_value(&comp, &txn, &deleg_key);
+        let deleg_now = top_value(&comp, txn, &deleg_key);
         let deleg_ok = |v: &CVal| {
             has_fields(v, &["v", "h", "k", "g"], &[])
                 && v.get("v").and_then(CVal::as_int) == Some(1)
@@ -689,50 +758,40 @@ impl House {
                 let hash = hb::rec_hash(v).unwrap_or_default();
                 let bytes = hb::room_sign_bytes("hkey", room, "", v);
                 let g = str_of(v, "g").unwrap_or("").to_string();
-                self.verified("hkey", [room, "", ""], &hash, &owner_key, bytes, &g).then(|| v.clone())
+                (self.verified("hkey", [room, "", ""], &hash, &owner_key, bytes, &g) == Some(true)).then(|| v.clone())
             }
             _ => None,
         };
+        // (Its check put off: next tick.)
         let Some(delegation) = delegation else { return writes };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
 
-        // Every house the deed holder delegated: another of their nodes is a
+        // Every house the deed holder delegated (another of their nodes is a
         // house of the room as this one is, and its records hold the line,
-        // the joins and the step-downs as this one's do.
-        let others: Vec<(String, CVal)> = comp
-            .iter(&txn)
-            .filter_map(|(key, out)| {
-                let h = key.strip_prefix("hk:").filter(|h| is_pub(h) && *h != pub_key)?;
-                let Out::Any(any) = out else { return None };
-                Some((h.to_string(), CVal::from_any(&any)))
-            })
-            .collect();
-        for (h, v) in others {
-            if self.rooms[room].houses.get(&h) == Some(&owner_key) {
-                continue;
-            }
-            let shape_ok = has_fields(&v, &["v", "h", "k", "g"], &[])
-                && v.get("v").and_then(CVal::as_int) == Some(1)
-                && str_of(&v, "h") == Some(h.as_str())
-                && str_of(&v, "k") == Some(owner_key.as_str());
-            let hash = hb::rec_hash(&v).unwrap_or_default();
-            let g = str_of(&v, "g").unwrap_or("").to_string();
-            if shape_ok && self.verified("hkey", [room, "", ""], &hash, &owner_key, hb::room_sign_bytes("hkey", room, "", &v), &g) {
-                self.rooms.get_mut(room).unwrap().houses.insert(h, owner_key.clone());
+        // the joins and the step-downs as this one's do) counts as its
+        // records come: read_table asks house_of.
+
+        // The switched-on house tables, live.
+        let casino = txn.get_map(CASINO_MAP);
+        let mut tables: Vec<(String, String)> = Vec::new();
+        if let Some(casino) = &casino {
+            for (key, out) in casino.iter(txn) {
+                let Some(t) = key.strip_prefix("cfg:computed:") else { continue };
+                let Out::Any(any) = out else { continue };
+                let Some(inc) = switch_inc(&CVal::from_any(&any)) else { continue };
+                if house_inc(&inc) && !casino.contains_key(txn, &format!("gone:{t}:{inc}")) {
+                    tables.push((t.to_string(), inc));
+                }
             }
         }
-        let mut houses: HashSet<String> =
-            self.rooms[room].houses.iter().filter(|(_, k)| **k == owner_key).map(|(h, _)| h.clone()).collect();
-        houses.insert(pub_key.clone());
+        tables.sort();
 
-        // The owner's Fair settings, the one standing over every other seen
-        // (fair_after; a new deed holder's count afresh: the last one's
-        // settings go).
+        // The owner's Fair setting of each of them, the one standing over
+        // every other seen (fair_after; a new deed holder's count afresh:
+        // the last one's settings go).
         self.rooms.get_mut(room).unwrap().fair.retain(|_, v| str_of(v, "k") == Some(owner_key.as_str()));
-        for (key, out) in comp.iter(&txn) {
-            let Some(t) = key.strip_prefix("hf:").filter(|t| !t.is_empty()) else { continue };
-            let Out::Any(any) = out else { continue };
-            let v = CVal::from_any(&any);
+        for (t, _) in &tables {
+            let Some(v) = top_value(&comp, txn, &format!("hf:{t}")) else { continue };
             if !has_fields(&v, &["v", "m", "s", "k", "g"], &[])
                 || v.get("v").and_then(CVal::as_int) != Some(1)
                 || !matches!(v.get("m").and_then(CVal::as_int), Some(0 | 1))
@@ -741,40 +800,44 @@ impl House {
             {
                 continue;
             }
-            if self.rooms[room].fair.get(t).is_some_and(|was| !fair_after(&v, was)) {
+            if self.rooms[room].fair.get(t.as_str()).is_some_and(|was| !fair_after(&v, was)) {
                 continue;
             }
             let hash = hb::rec_hash(&v).unwrap_or_default();
             let g = str_of(&v, "g").unwrap_or("").to_string();
-            if self.verified("hfair", [room, t, ""], &hash, &owner_key, hb::room_sign_bytes("hfair", room, t, &v), &g) {
+            if self.verified("hfair", [room, t, ""], &hash, &owner_key, hb::room_sign_bytes("hfair", room, t, &v), &g) == Some(true) {
                 self.rooms.get_mut(room).unwrap().fair.insert(t.to_string(), v);
             }
         }
-
-        // The switched-on house tables, live.
-        let casino = txn.get_map(CASINO_MAP);
-        let mut tables: Vec<(String, String)> = Vec::new();
-        if let Some(casino) = &casino {
-            for (key, out) in casino.iter(&txn) {
-                let Some(t) = key.strip_prefix("cfg:computed:") else { continue };
-                let Out::Any(any) = out else { continue };
-                let Some(inc) = switch_inc(&CVal::from_any(&any)) else { continue };
-                if house_inc(&inc) && !casino.contains_key(&txn, &format!("gone:{t}:{inc}")) {
-                    tables.push((t.to_string(), inc));
-                }
-            }
+        // (A setting not checked yet: nothing at any table, next tick.)
+        if self.deferred {
+            return writes;
         }
-        tables.sort();
 
         let mut fair_tables = 0;
+        let mut short = false;
+        if !tables.is_empty() {
+            let turn = self.rooms[room].turn % tables.len();
+            tables.rotate_left(turn);
+        }
         for (t, inc) in tables {
             let ctx = Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() };
-            let Some(read) = self.read_table(&comp, &txn, ctx, &houses) else { continue };
+            self.deferred = false;
+            let Some(read) = self.read_table(&comp, txn, ctx, &owner_key) else { continue };
             let friendly = self.rooms[room].fair.get(&t).and_then(|v| v.get("m").and_then(CVal::as_int)) == Some(1);
             if !friendly {
                 fair_tables += 1;
             }
-            self.table_duties(room, &read, friendly, now, &mut writes);
+            // (Read short of a check: it does nothing there this tick.)
+            if self.deferred {
+                short = true;
+            } else {
+                self.table_duties(room, &read, friendly, now, &mut writes);
+            }
+        }
+        if short {
+            let mem = self.rooms.get_mut(room).unwrap();
+            mem.turn = mem.turn.wrapping_add(1);
         }
 
         // The heartbeat, while a table runs Fair.
@@ -784,7 +847,9 @@ impl House {
             // It counts on from the doc's beat only as it signed it: a peer's
             // copy with a higher count would push its own past what the
             // pages take.
-            let in_doc = top_value(&comp, &txn, &beat_key)
+            // (Its check put off: the beat waits a tick.)
+            self.deferred = false;
+            let in_doc = top_value(&comp, txn, &beat_key)
                 .filter(|v| {
                     has_fields(v, &["v", "n", "k", "g"], &[])
                         && v.get("v").and_then(CVal::as_int) == Some(1)
@@ -794,13 +859,13 @@ impl House {
                     let n = is_round(v.get("n")).filter(|n| *n <= MAX_SAFE)?;
                     let hash = hb::rec_hash(&v)?;
                     let g = str_of(&v, "g").unwrap_or("").to_string();
-                    self.verified("hbeat", [room, "", ""], &hash, &pub_key, hb::room_sign_bytes("hbeat", room, "", &v), &g).then_some(n)
+                    (self.verified("hbeat", [room, "", ""], &hash, &pub_key, hb::room_sign_bytes("hbeat", room, "", &v), &g) == Some(true)).then_some(n)
                 })
                 .unwrap_or(0);
             let mem = self.rooms.get_mut(room).unwrap();
             let n = (wall.min(MAX_SAFE as u64) as i64).max(in_doc + 1).max(mem.beat_n + 1).min(MAX_SAFE);
             let body = CVal::Obj(vec![("v".into(), CVal::Int(1)), ("n".into(), CVal::Int(n)), ("k".into(), CVal::Str(pub_key.clone()))]);
-            if let Some(bytes) = hb::room_sign_bytes("hbeat", room, "", &body) {
+            if let Some(bytes) = hb::room_sign_bytes("hbeat", room, "", &body).filter(|_| !self.deferred) {
                 let CVal::Obj(mut fields) = body else { unreachable!() };
                 fields.push(("g".into(), CVal::Str(self.key.sign(&bytes))));
                 writes.push(Write::Top { key: beat_key, value: CVal::Obj(fields) });
@@ -822,7 +887,7 @@ impl House {
             // with a higher count included.
             for (t, rec) in &mem.fair {
                 let key = format!("hf:{t}");
-                if !same(&top_value(&comp, &txn, &key), rec) {
+                if !same(&top_value(&comp, txn, &key), rec) {
                     writes.push(Write::Top { key, value: rec.clone() });
                 }
             }
@@ -830,8 +895,8 @@ impl House {
                 for (ses, key, value) in &table.written {
                     // There as it wrote it: junk under its key reads as
                     // nothing on every page, and goes too.
-                    let present = match comp.get(&txn, ses) {
-                        Some(Out::YMap(m)) => match m.get(&txn, key) {
+                    let present = match comp.get(txn, ses) {
+                        Some(Out::YMap(m)) => match m.get(txn, key) {
                             Some(Out::Any(any)) => hb::rec_hash(&CVal::from_any(&any)) == hb::rec_hash(value),
                             _ => false,
                         },
@@ -848,9 +913,10 @@ impl House {
     }
 
     /// Read table `ctx`'s live session (None when the doc holds none, or its
-    /// incarnation has ended). `houses`: every house the deed holder
-    /// delegated, this one among them.
-    fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx, houses: &HashSet<String>) -> Option<TableRead> {
+    /// incarnation has ended). `owner_key`: the deed holder's, whose
+    /// delegations make the houses (house_of). A check put off on the way
+    /// sets `deferred`: the read is short of it.
+    fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx, owner_key: &str) -> Option<TableRead> {
         let cp = top_value(comp, txn, &format!("sum:{}:{}", ctx.t, ctx.inc)).filter(|v| checkpoint_ok(v, &ctx.inc));
         if cp.as_ref().is_some_and(|v| v.get("e").is_some()) {
             return None;
@@ -957,8 +1023,10 @@ impl House {
                     }
                 }
                 'h' | 'o' if g_ok => {
-                    if let Some(k) = k.filter(|k| houses.contains(k)) {
-                        house_recs.push((kind, r, h.to_string(), v, k));
+                    if let Some(k) = k {
+                        if self.house_of(comp, txn, &read.ctx.room, owner_key, &k) == Some(true) {
+                            house_recs.push((kind, r, h.to_string(), v, k));
+                        }
                     }
                 }
                 _ => {}
@@ -985,13 +1053,13 @@ impl House {
                 if !has_fields(&v, &["r", "s", "x", "n", "k", "g"], &["c"]) || c == Some(None) || (x.is_empty() && (!n.is_empty() || c.is_some())) {
                     continue;
                 }
-                if self.verified("hreveal", at, &hash, &k, hb::sign_bytes("hreveal", &read.ctx, &v), &g) {
+                if self.verified("hreveal", at, &hash, &k, hb::sign_bytes("hreveal", &read.ctx, &v), &g) == Some(true) {
                     let commit = hb::house_commit(&read.ctx, r, s);
                     read.reveals.push(Reveal { k, r, hash, commit, x, n, c: c.flatten() });
                 }
             } else if let Some(c) = str_of(&v, "c").filter(|c| hex_of(c, 64) && has_fields(&v, &["r", "c", "k", "g"], &[])) {
                 let c = c.to_string();
-                if self.verified("hcommit", at, &hash, &k, hb::sign_bytes("hcommit", &read.ctx, &v), &g) {
+                if self.verified("hcommit", at, &hash, &k, hb::sign_bytes("hcommit", &read.ctx, &v), &g) == Some(true) {
                     read.joins.push(Join { k, r, hash, c });
                 }
             }
@@ -1018,7 +1086,7 @@ impl House {
                 continue;
             }
             let g = str_of(&v, "g").unwrap_or("").to_string();
-            if self.verified("close", at, &c.hash, &c.k, hb::sign_bytes("close", &read.ctx, &v), &g) {
+            if self.verified("close", at, &c.hash, &c.k, hb::sign_bytes("close", &read.ctx, &v), &g) == Some(true) {
                 good.push(c);
             }
         }
@@ -1106,13 +1174,13 @@ impl House {
     /// A slip's signature, checked once.
     fn slip_ok(&mut self, at: [&str; 3], hash: &str, s: &Slip, ctx: &Ctx) -> bool {
         let g = str_of(&s.v, "g").unwrap_or("").to_string();
-        self.verified("slip", at, hash, &s.k, hb::sign_bytes("slip", ctx, &s.v), &g)
+        self.verified("slip", at, hash, &s.k, hb::sign_bytes("slip", ctx, &s.v), &g) == Some(true)
     }
 
     fn abandon_ok(&mut self, at: [&str; 3], ctx: &Ctx, _r: i64, k: &str, v: &CVal) -> bool {
         let hash = hb::rec_hash(v).unwrap_or_default();
         let g = str_of(v, "g").unwrap_or("").to_string();
-        self.verified("abandon", at, &hash, k, hb::sign_bytes("abandon", ctx, v), &g)
+        self.verified("abandon", at, &hash, k, hb::sign_bytes("abandon", ctx, v), &g) == Some(true)
     }
 
     /// Whether close c is decided, and how (computedFold decide): a Fair one
@@ -1153,7 +1221,7 @@ impl House {
                     continue;
                 }
                 let g = str_of(&f.v, "g").unwrap_or("").to_string();
-                if self.verified("forfeit", at, &f.hash, &f.k, hb::sign_bytes("forfeit", ctx, &f.v), &g) {
+                if self.verified("forfeit", at, &f.hash, &f.k, hb::sign_bytes("forfeit", ctx, &f.v), &g) == Some(true) {
                     decided = Some(Decision::Other);
                     break;
                 }
@@ -1440,27 +1508,24 @@ pub fn to_any(v: &CVal) -> Any {
 }
 
 /// Write `writes` in one transaction; the update to send (None: nothing).
-fn apply(doc: &Doc, writes: &[Write]) -> Option<Vec<u8>> {
+fn apply(txn: &mut TransactionMut, writes: &[Write]) -> Option<Vec<u8>> {
     if writes.is_empty() {
         return None;
     }
-    let comp = doc.get_or_insert_map(COMPUTED_MAP);
-    let mut txn = doc.transact_mut();
+    let comp = txn.get_or_insert_map(COMPUTED_MAP);
     for w in writes {
         match w {
             Write::Top { key, value } => {
-                comp.insert(&mut txn, key.as_str(), to_any(value));
+                comp.insert(txn, key.as_str(), to_any(value));
             }
             Write::Session { ses, key, value } => {
-                if let Some(Out::YMap(m)) = comp.get(&txn, ses) {
-                    m.insert(&mut txn, key.as_str(), to_any(value));
+                if let Some(Out::YMap(m)) = comp.get(txn, ses) {
+                    m.insert(txn, key.as_str(), to_any(value));
                 }
             }
         }
     }
-    let update = txn.encode_update_v1();
-    drop(txn);
-    Some(update)
+    Some(txn.encode_update_v1())
 }
 
 // ── The state file ───────────────────────────────────────────────────────────

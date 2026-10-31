@@ -382,6 +382,22 @@ describe('the simulations\' house, as house.rs', () => {
     expect(room.recs('o:3:')).toHaveLength(0);
   });
 
+  it('checks no delegation and no setting a table it serves does not name', () => {
+    const room = new TwinRoom();
+    // Delegations of 300 keys and settings of 300 tables, every signature forged.
+    room.doc.transact(() => {
+      for (let i = 0; i < 300; i++) {
+        const j = testIdentity(`twin-junk-${i}`, `junk${i}`);
+        room.top().set(delegationKey(j.pub), { v: 1, h: j.pub, k: OWNER.pub, g: BAD_SIG });
+        room.top().set(fairSettingKey(`roulette-junk-${i}`), { v: 1, m: 1, s: 9, k: OWNER.pub, g: BAD_SIG });
+      }
+    });
+    room.start();
+    // Its own delegation and its own join, read back: it joins.
+    expect((room.house as unknown as { verdicts: Map<string, boolean> }).verdicts.size).toBe(2);
+    expect(room.recs('o:1:')).toHaveLength(1);
+  });
+
   it('a second house joins no round the first holds', () => {
     const room = new TwinRoom();
     const other = room.secondHouse();

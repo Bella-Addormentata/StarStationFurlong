@@ -723,11 +723,118 @@ fn a_signature_verdict_holds_only_where_it_was_given() {
     let rec = room.top(&format!("hf:{T}")).unwrap();
     let (hash, g) = (hb::rec_hash(&rec).unwrap(), str_of(&rec, "g").unwrap().to_string());
     let k = room.owner.public.clone();
-    assert!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g));
+    assert_eq!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g), Some(true));
     // The same record copied to another table, or another room.
-    assert!(!room.house.verified("hfair", [ROOM, "roulette-2", ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, "roulette-2", &rec), &g));
-    assert!(!room.house.verified("hfair", ["room-2", T, ""], &hash, &k, hb::room_sign_bytes("hfair", "room-2", T, &rec), &g));
-    assert!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g));
+    assert_eq!(room.house.verified("hfair", [ROOM, "roulette-2", ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, "roulette-2", &rec), &g), Some(false));
+    assert_eq!(room.house.verified("hfair", ["room-2", T, ""], &hash, &k, hb::room_sign_bytes("hfair", "room-2", T, &rec), &g), Some(false));
+    assert_eq!(room.house.verified("hfair", [ROOM, T, ""], &hash, &k, hb::room_sign_bytes("hfair", ROOM, T, &rec), &g), Some(true));
+}
+
+/// 600 bettors' closes, each over a slip whose signature is forged: a
+/// signature check apiece.
+fn flood(room: &Room) {
+    flood_as(room, "junk");
+}
+
+fn flood_as(room: &Room, names: &str) {
+    let sid = room.ses_key().rsplit(':').next().unwrap().to_string();
+    for i in 0..600 {
+        let w = who(&format!("{names}{i}"));
+        let c = hb::slip_commit(&ctx(), 1, &w.pid, &seed_of(&w.pid, 1));
+        let felt = CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])]);
+        let body = obj(vec![("r", CVal::Int(1)), ("p", s(&w.pid)), ("v", CVal::Int(1)), ("b", felt), ("c", s(&c)), ("k", s(&w.public)), ("g", s(&"A".repeat(86)))]);
+        room.put('s', &body);
+        let sh = hb::rec_hash(&body).unwrap();
+        room.close(&w, 1, &sid, &[(w.pid.as_str(), sh.as_str())], None);
+    }
+}
+
+#[test]
+fn a_flood_of_forged_records_is_checked_a_budget_a_tick_and_the_house_acts_once_through() {
+    let mut room = Room::new("flood", true);
+    flood(&room);
+    // The delegation and 255 slips this tick: the table waits.
+    room.tick(0);
+    assert_eq!(room.house.verdicts.len(), VERIFY_PER_TICK);
+    assert!(room.records("o:").is_empty());
+    room.tick(TICK_MS);
+    assert_eq!(room.house.verdicts.len(), 2 * VERIFY_PER_TICK);
+    assert!(room.records("o:").is_empty());
+    // 601 in all: through at the third, and it joins round 1 (no close counts).
+    room.tick(TICK_MS);
+    assert_eq!(room.house.verdicts.len(), 601);
+    assert_eq!(room.records("o:1:").len(), 1);
+    // Its own join read back, and nothing checked again.
+    room.tick(TICK_MS);
+    assert_eq!(room.house.verdicts.len(), 602);
+    room.tick(TICK_MS);
+    assert_eq!(room.house.verdicts.len(), 602);
+}
+
+#[test]
+fn a_flood_at_one_table_holds_another_back_a_tick_at_most() {
+    let mut room = Room::new("flood-turn", true);
+    // A second table, its session holding a "join" under the house's key it
+    // did not sign: a check before the house may act there.
+    const T2: &str = "roulette-2";
+    const INC2: &str = "r89abcdef0123456789abcdef";
+    let ctx2 = Ctx { room: ROOM.into(), t: T2.into(), inc: INC2.into() };
+    let ses2 = format!("ses:{T2}:{INC2}:{}", hb::next_sid(&ctx2, None).unwrap());
+    let fake = with(&obj(vec![("r", CVal::Int(1)), ("c", s(&"0".repeat(64))), ("k", s(room.house.public()))]), "g", s(&"A".repeat(86)));
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T2}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC2))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        let m = comp.insert(&mut txn, ses2.as_str(), MapPrelim::default());
+        m.insert(&mut txn, format!("o:1:{}", hb::rec_hash(&fake).unwrap()), to_any(&fake));
+    }
+    let joins2 = |room: &Room| {
+        let txn = room.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
+        m.keys(&txn).filter(|k| k.starts_with("o:1:")).count()
+    };
+    // Floods at the first table, tick after tick.
+    flood_as(&room, "junk-a");
+    room.tick(0);
+    assert_eq!(joins2(&room), 1, "only the fake");
+    flood_as(&room, "junk-b");
+    room.tick(TICK_MS);
+    assert_eq!(joins2(&room), 2, "its own join at the second table, the flood going on at the first");
+    assert!(room.records("o:").is_empty());
+}
+
+#[test]
+fn stepping_down_checks_all_it_must_in_its_one_tick() {
+    let mut room = Room::new("flood-stop", true);
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1);
+    flood(&room);
+    room.house.begin_step_down();
+    room.tick(200);
+    // Its join of round 1 stepped down: a reveal listing no close.
+    let d = &room.records("h:1:")[0].1;
+    assert!(strs(d, "x").is_empty());
+    // The delegation, its own join and the 600 slips.
+    assert_eq!(room.house.verdicts.len(), 602);
+}
+
+#[test]
+fn records_no_table_names_are_never_checked() {
+    let mut room = Room::new("unnamed", true);
+    // Delegations of 300 keys and settings of 300 tables, every signature forged.
+    for i in 0..300 {
+        let j = who(&format!("junk{i}"));
+        let deleg = obj(vec![("v", CVal::Int(1)), ("h", s(&j.public)), ("k", s(&room.owner.public)), ("g", s(&"A".repeat(86)))]);
+        room.put_top(&format!("hk:{}", j.public), &deleg);
+        let setting = obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(9)), ("k", s(&room.owner.public)), ("g", s(&"A".repeat(86)))]);
+        room.put_top(&format!("hf:roulette-junk-{i}"), &setting);
+    }
+    room.tick(0);
+    // Its own delegation alone, and it joins.
+    assert_eq!(room.house.verdicts.len(), 1);
+    assert_eq!(room.records("o:1:").len(), 1);
 }
 
 #[test]

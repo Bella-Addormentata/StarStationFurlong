@@ -198,6 +198,20 @@ export class SimHouse {
     return this.verified([kind, room, t, '', recHash(v) ?? ''], k, () => roomSignBytes(kind, room, t, v), v.g as string);
   }
 
+  /** Whether `k` is a house of room `room` under the deed holder's key
+   *  `ownerKey` (house.rs house_of): this one, one pinned so, or one whose
+   *  delegation (`hk:<k>`) the doc holds signed by them (pinned from then
+   *  on). Asked only for the keys on house records: a delegation nothing
+   *  names is never checked. */
+  private houseOf(comp: Y.Map<unknown>, mem: RoomMem, room: string, ownerKey: string, k: string): boolean {
+    if (k === this.pub || mem.houses.get(k) === ownerKey) return true;
+    const v = comp.get(delegationKey(k));
+    if (!isPlain(v) || !hasFields(v, ['v', 'h', 'k', 'g']) || v.v !== 1 || v.h !== k || v.k !== ownerKey) return false;
+    if (!this.roomOk('hkey', room, '', v, ownerKey)) return false;
+    mem.houses.set(k, ownerKey);
+    return true;
+  }
+
   private lastOf(ctx: FoldCtx): Done | undefined {
     return this.done.get(`${ctx.room}|${ctx.t}|${ctx.inc}`);
   }
@@ -261,31 +275,10 @@ export class SimHouse {
     if (!delegation) return writes;
     mem.delegation = delegation;
 
-    // Every house the deed holder delegated: another of their nodes is a
+    // Every house the deed holder delegated (another of their nodes is a
     // house of the room as this one is, and its records hold the line, the
-    // joins and the step-downs as this one's do.
-    for (const [key, v] of comp.entries()) {
-      const h = key.startsWith('hk:') ? key.slice(3) : '';
-      if (!isPub(h) || h === this.pub || mem.houses.get(h) === ownerKey) continue;
-      if (isPlain(v) && hasFields(v, ['v', 'h', 'k', 'g']) && v.v === 1 && v.h === h && v.k === ownerKey && this.roomOk('hkey', room, '', v, ownerKey)) {
-        mem.houses.set(h, ownerKey);
-      }
-    }
-    const houses = new Set([...mem.houses].filter(([, k]) => k === ownerKey).map(([h]) => h));
-    houses.add(this.pub);
-
-    // The owner's Fair settings, the one standing over every other seen
-    // (fairAfter; a new deed holder's count afresh: the last one's settings
-    // go).
-    for (const [t, v] of mem.fair) if (v.k !== ownerKey) mem.fair.delete(t);
-    for (const [key, v] of comp.entries()) {
-      if (!key.startsWith('hf:') || key.length <= 3) continue;
-      const t = key.slice(3);
-      if (!isPlain(v) || !hasFields(v, ['v', 'm', 's', 'k', 'g']) || v.v !== 1 || (v.m !== 0 && v.m !== 1) || !isRound(v.s) || v.k !== ownerKey) continue;
-      const seen = mem.fair.get(t);
-      if (seen !== undefined && !fairAfter(v as unknown as FairSettingRec, seen as unknown as FairSettingRec)) continue;
-      if (this.roomOk('hfair', room, t, v, ownerKey)) mem.fair.set(t, v);
-    }
+    // joins and the step-downs as this one's do) counts as its records come:
+    // readTable asks houseOf.
 
     // The switched-on house tables, live.
     const casino = doc.getMap('casino');
@@ -300,9 +293,21 @@ export class SimHouse {
     }
     tables.sort(([a, x], [b, y]) => (a < b ? -1 : a > b ? 1 : x < y ? -1 : x > y ? 1 : 0));
 
+    // The owner's Fair setting of each of them, the one standing over every
+    // other seen (fairAfter; a new deed holder's count afresh: the last
+    // one's settings go).
+    for (const [t, v] of mem.fair) if (v.k !== ownerKey) mem.fair.delete(t);
+    for (const [t] of tables) {
+      const v = comp.get(`hf:${t}`);
+      if (!isPlain(v) || !hasFields(v, ['v', 'm', 's', 'k', 'g']) || v.v !== 1 || (v.m !== 0 && v.m !== 1) || !isRound(v.s) || v.k !== ownerKey) continue;
+      const seen = mem.fair.get(t);
+      if (seen !== undefined && !fairAfter(v as unknown as FairSettingRec, seen as unknown as FairSettingRec)) continue;
+      if (this.roomOk('hfair', room, t, v, ownerKey)) mem.fair.set(t, v);
+    }
+
     let fairTables = 0;
     for (const [t, inc] of tables) {
-      const read = this.readTable(comp, { room, t, inc }, houses);
+      const read = this.readTable(comp, { room, t, inc }, mem, ownerKey);
       if (!read) continue;
       const friendly = mem.fair.get(t)?.m === 1;
       if (!friendly) fairTables += 1;
@@ -359,9 +364,9 @@ export class SimHouse {
   }
 
   /** Table ctx's live session, as house.rs read_table reads it (null with
-   *  none, or once its incarnation has ended). `houses`: every house the deed
-   *  holder delegated, this one among them. */
-  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx, houses: Set<string>): TableRead | null {
+   *  none, or once its incarnation has ended). `ownerKey`: the deed
+   *  holder's, whose delegations make the houses (houseOf). */
+  private readTable(comp: Y.Map<unknown>, ctx: FoldCtx, mem: RoomMem, ownerKey: string): TableRead | null {
     const cp = asCheckpointFor(ctx)(comp.get(`sum:${ctx.t}:${ctx.inc}`));
     if (cp?.e === 1) return null;
     const sid = nextSid(ctx, cp);
@@ -424,7 +429,7 @@ export class SimHouse {
         }
         case 'h':
         case 'o': {
-          if (gOk && k !== undefined && houses.has(k)) houseRecs.push([pk.kind, pk.r, pk.h, v, k]);
+          if (gOk && k !== undefined && this.houseOf(comp, mem, ctx.room, ownerKey, k)) houseRecs.push([pk.kind, pk.r, pk.h, v, k]);
           break;
         }
         default:
