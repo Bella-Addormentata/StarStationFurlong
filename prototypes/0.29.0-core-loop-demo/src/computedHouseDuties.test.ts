@@ -292,6 +292,47 @@ describe('the room records\' verdicts', () => {
   });
 });
 
+describe("the deed holder's player entry", () => {
+  it("written again reads no delegation or Fair setting again; another owner, or the owner's key showing up, does", async () => {
+    const [a, b] = await houseRoom(['A', 'B']);
+    let checks = 0;
+    b.casino.setComputedVerifyForTests({ verify: () => { checks += 1; return false; }, now: () => 0 });
+    const BAD = 'A'.repeat(86);
+    // More forged settings under the deed holder's key than the verdict
+    // cache keeps (2,048): read again, some would be checked again.
+    const forged = { v: 1, m: 1, s: 9, k: a.pub, g: BAD };
+    const tables = Array.from({ length: 2_100 }, (_, i) => `roulette-junk-${i}`);
+    b.doc.transact(() => {
+      for (const t of tables) top(b).set(fairSettingKey(t), forged);
+    });
+    expect(checks).toBe(2_100);
+    // The owner's entry written again (a rename), here and on a's page:
+    // the key in it is pinned already, so nothing is read again.
+    b.doc.transact(() => b.doc.getMap('players').set(a.pid, { keyB64: a.pub, name: 'A, renamed' }));
+    a.doc.transact(() => a.doc.getMap('players').set(a.pid, { keyB64: a.pub, name: 'A, again' }));
+    sync(T0, a, b);
+    expect(checks).toBe(2_100);
+    expect(b.casino.houseSetUp()).toBe(true);
+    // Another owner: the old holder's house is the room's no longer.
+    b.doc.transact(() => b.doc.getMap('roomInfo').set('owner', b.pid));
+    expect(b.casino.houseSetUp()).toBe(false);
+    // And back: it is again.
+    b.doc.transact(() => b.doc.getMap('roomInfo').set('owner', a.pid));
+    expect(b.casino.houseSetUp()).toBe(true);
+    // A page with the owner and the delegation but not yet the owner's
+    // entry: no house, until the entry (the owner's key) comes.
+    const c = await loadPage('C', 3);
+    const deleg = top(a).get(delegationKey(H.pub));
+    c.doc.transact(() => {
+      c.doc.getMap('roomInfo').set('owner', a.pid);
+      top(c).set(delegationKey(H.pub), deleg);
+    });
+    expect(c.casino.houseSetUp()).toBe(false);
+    c.doc.transact(() => c.doc.getMap('players').set(a.pid, { keyB64: a.pub, name: a.pid }));
+    expect(c.casino.houseSetUp()).toBe(true);
+  });
+});
+
 describe('the heartbeat', () => {
   it("a house's beat puts it online for HOUSE_HEARD_MS on this page's clock; an old or a stranger's beat doesn't", async () => {
     const [a, b] = await houseRoom(['A', 'B']);

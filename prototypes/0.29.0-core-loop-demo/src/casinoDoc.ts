@@ -2554,6 +2554,9 @@ let roomWaiting = new Set<string>();
 let houseBeats = new Map<string, { n: number; at: number }>();
 /** The newest Fair setting by the deed holder this page has seen, per table. */
 let fairSeen = new Map<string, FairSettingRec>();
+/** The deed holder's key the houses were last read under (deedHolderKey):
+ *  they read otherwise only as it changes (onComputedTransaction). */
+let houseDeedKey: string | null | undefined;
 
 /** The room's deed holder's identity key, as this page pinned it: null when
  *  the room names no owner (or the legacy marker: nobody's), undefined while
@@ -3005,6 +3008,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
+  houseDeedKey = deedHolderKey();
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
@@ -3067,12 +3071,17 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // A key pinned in this transaction counts for its player's felt in it.
   const players = playersMap ? tr.changed.get(playersMap as unknown as Y.AbstractType<Y.YEvent<any>>) : undefined;
   if (players && pinPlayer) for (const pid of players) if (pid !== null) pinPlayer(pid, playersMap!.get(pid));
-  // 🏠 The houses may read otherwise: a delegation came or changed, the
-  // deed holder's key showed up, or the room names another owner.
-  const owner = boundDoc?.getMap('roomInfo');
-  if (owner && tr.changed.get(owner as unknown as Y.AbstractType<Y.YEvent<any>>)?.has('owner')) houseMoved = true;
-  const ownerId = owner?.get('owner');
-  if (players && typeof ownerId === 'string' && players.has(ownerId)) houseMoved = true;
+  // 🏠 The houses may read otherwise: a delegation came or changed, or the
+  // deed holder's key did (the room names another owner, or the owner's key
+  // showed up). Not as the owner's player entry is merely written again: a
+  // key is pinned once, and every delegation and Fair setting read again
+  // each time would ask again for checks the verdict cache let go (a flood
+  // of forged ones past its 2,048).
+  const deedKey = deedHolderKey();
+  if (deedKey !== houseDeedKey) {
+    houseDeedKey = deedKey;
+    houseMoved = true;
+  }
   if (houseMoved) {
     houseChangedAll(dirty);
     if (top) for (const key of top) if (key !== null && key.startsWith('hb:')) noteBeat(key.slice(3));

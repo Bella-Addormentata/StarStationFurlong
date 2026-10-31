@@ -104,10 +104,12 @@ clvm-utils = { version = "0.36", optional = true }
 # in all of them.
 sha2 = "0.10"
 # #231 P6a: the per-node presence record carries an X25519 key (`kx_pk`) that
-# P6b's knocks are sealed to. Only the base-point multiplication is needed here;
-# pinned to the exact version iroh-base already locks, so no second copy of the
-# curve lands in the binary (Windows-GNU export-ordinal budget, see above).
-curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional = true }
+# P6b's knocks are sealed to; and the house checks the pages' signatures by
+# their own rule (house_bytes.rs verify: the cofactored equation, which
+# ed25519-dalek doesn't offer). Every build: the house runs in all of them.
+# Pinned to the exact version iroh-base already locks, so no second copy of
+# the curve lands in the binary (Windows-GNU export-ordinal budget, see above).
+curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false }
 # 🧲 `torrent` feature only (torrent_lane.rs). rust-tls keeps OpenSSL out
 # (its SHA-1 is ring's); its reqwest brings aws-lc-rs, so main.rs names ring
 # as rustls' process default. `url` turns the blocklist path into the file://
@@ -133,7 +135,6 @@ chia-read = [
     "dep:chia-ssl", "dep:chia-traits", "dep:tokio-tungstenite", "dep:tokio-rustls",
     "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
-    "dep:curve25519-dalek",
 ]
 # Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
 # the craps fairness hook and the treasury codec tests. Runtime-gated by

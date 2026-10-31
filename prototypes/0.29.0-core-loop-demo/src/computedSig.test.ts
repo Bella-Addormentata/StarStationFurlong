@@ -42,6 +42,7 @@ describe('the pinned verifier', () => {
   it('gives every vector its pinned verdict: strict, noble\'s zip215:false alone, and loose', () => {
     expect(vectors.vectors.map((v) => v.name)).toEqual([
       'honest', 'torsion-r', 's-plus-l', 'noncanonical-r', 'small-order-key', 'identity-r', 'identity-r-rfc',
+      'torsion-key', 'small-order-r', 'noncanonical-r-own-k',
     ]);
     for (const v of vectors.vectors) {
       const msg = hexToBytes(v.msg);
@@ -52,9 +53,12 @@ describe('the pinned verifier', () => {
     }
   });
 
-  it('accepts a torsion component in R (the cofactored equation), and refuses a small-order key\'s universal signature', () => {
-    const torsion = vectors.vectors.find((v) => v.name === 'torsion-r')!;
-    expect(verifyIdentityStrict(torsion.pub, hexToBytes(torsion.msg), torsion.sig)).toBe(true);
+  it('accepts a torsion component in R or the key, or a small-order R (the cofactored equation), and refuses a small-order key\'s universal signature', () => {
+    // The node's house checks these the same way (house_bytes.rs verify).
+    for (const name of ['torsion-r', 'torsion-key', 'small-order-r']) {
+      const v = vectors.vectors.find((x) => x.name === name)!;
+      expect(verifyIdentityStrict(v.pub, hexToBytes(v.msg), v.sig), name).toBe(true);
+    }
     const small = vectors.vectors.find((v) => v.name === 'small-order-key')!;
     for (const msg of [hexToBytes(small.msg), new TextEncoder().encode('cash out everything')]) {
       expect(verifyIdentity(small.pub, msg, small.sig)).toBe(true); // why the fold can't use verifyIdentity

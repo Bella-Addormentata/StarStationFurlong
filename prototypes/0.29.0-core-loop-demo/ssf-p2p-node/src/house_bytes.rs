@@ -10,7 +10,7 @@
 //! (src/computedHouseVectors.test.ts) and checks too.
 
 use base64::Engine;
-use iroh::{PublicKey, SecretKey, Signature};
+use iroh::SecretKey;
 use sha2::{Digest, Sha256};
 
 /// A record value as canon reads it: a string, a SAFE integer, an array, a
@@ -305,15 +305,40 @@ impl HouseKey {
     }
 }
 
-/// Whether `sig` (base64url) is `pub_key`'s (base64url) over `bytes`. Strict,
-/// as the node verifies anything (ed25519 verify_strict); the pages' noble
-/// check accepts a few signatures this refuses (a torsion component in R),
-/// none of which an honest page writes.
+/// Whether `sig` (base64url) is `pub_key`'s (base64url) over `bytes`, by
+/// the pages' own rule (keypair.ts verifyIdentityStrict): every page and the
+/// house must give every record the same verdict, or a record the pages count
+/// and the house refuses (a bettor's slip or close, say) leaves the house
+/// unable to follow the chain the pages fold. So, as there: the key and the
+/// signature are the canonical base64url of 32 and 64 bytes; A and R each
+/// the canonical encoding of a curve point (y < p, no x = 0 with its sign bit
+/// set); A not of small order; R not the identity; S < L; and the cofactored
+/// equation [8]([S]B - [k]A - R) = 0, k = SHA-512(R || A || M) mod L. That
+/// last part takes a torsion component in R or A, as noble 2.3.0 does with
+/// zip215:false (ed25519-dalek's verify, cofactorless, refuses them).
+/// test-vectors/ed25519-strict.json pins the verdicts on both sides.
 pub fn verify(pub_key: &str, bytes: &[u8], sig: &str) -> bool {
+    use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+    use curve25519_dalek::scalar::Scalar;
+    use curve25519_dalek::traits::IsIdentity;
     let (Some(pk), Some(sg)) = (b64url_strict(pub_key, 32), b64url_strict(sig, 64)) else { return false };
-    let Ok(pk) = PublicKey::from_bytes(&pk.try_into().unwrap()) else { return false };
-    let sg: [u8; 64] = sg.try_into().unwrap();
-    pk.verify(bytes, &Signature::from_bytes(&sg)).is_ok()
+    let a_bytes: [u8; 32] = pk.try_into().unwrap();
+    let r_bytes: [u8; 32] = sg[..32].try_into().unwrap();
+    let s_bytes: [u8; 32] = sg[32..].try_into().unwrap();
+    // A point read back from its one canonical spelling, or none.
+    let point = |b: &[u8; 32]| CompressedEdwardsY(*b).decompress().filter(|p| p.compress().to_bytes() == *b);
+    let (Some(a), Some(r)) = (point(&a_bytes), point(&r_bytes)) else { return false };
+    if a.is_small_order() || r.is_identity() {
+        return false;
+    }
+    let Some(s) = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes)) else { return false };
+    let mut h = sha2::Sha512::new();
+    h.update(r_bytes);
+    h.update(a_bytes);
+    h.update(bytes);
+    let k = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+    // [S]B - [k]A - R, times the cofactor.
+    (EdwardsPoint::vartime_double_scalar_mul_basepoint(&-k, &a, &s) - r).mul_by_cofactor().is_identity()
 }
 
 #[cfg(test)]
@@ -423,6 +448,30 @@ mod tests {
         ]));
         assert_eq!(canon(&CVal::from_any(&m)).unwrap(), "{\"b\":1}");
         assert_eq!(canon(&CVal::from_any(&yrs::Any::from(vec![yrs::Any::Undefined]))), None);
+    }
+
+    /// The pages' verdict on every edge case keypair.ts verifyIdentityStrict
+    /// pins (computedSig.test.ts holds the pages to the same file): a record
+    /// one side counts and the other refuses splits the chain they follow.
+    #[test]
+    fn signatures_get_the_pages_verdict_on_every_strict_vector() {
+        const STRICT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/ed25519-strict.json");
+        let raw = std::fs::read_to_string(STRICT).unwrap_or_else(|e| panic!("cannot read {STRICT}: {e}"));
+        let file: Value = serde_json::from_str(&raw).unwrap();
+        let vectors = file["vectors"].as_array().unwrap();
+        let names: Vec<&str> = vectors.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["honest", "torsion-r", "s-plus-l", "noncanonical-r", "small-order-key", "identity-r", "identity-r-rfc", "torsion-key", "small-order-r", "noncanonical-r-own-k"]
+        );
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let msg = hex::decode(v["msg"].as_str().unwrap()).unwrap();
+            let (k, g) = (v["pub"].as_str().unwrap(), v["sig"].as_str().unwrap());
+            assert_eq!(verify(k, &msg, g), v["strict"].as_bool().unwrap(), "{name}");
+            // Under another message, none of them is anyone's signature.
+            assert!(!verify(k, b"cash out everything", g), "{name} on another message");
+        }
     }
 
     #[test]

@@ -1000,7 +1000,7 @@ export class Sim {
       if (!was) return;
       this.checkOwnTrims(sp, tr, computed, was);
       this.checkOwnForfeits(sp, tr, computed, was);
-      this.checkOwnAbandons(sp, tr, computed);
+      this.checkOwnAbandons(sp, tr, computed, was);
       if (this.craps) this.craps.ownWrite(sp, tr, computed, was);
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
@@ -1193,9 +1193,9 @@ export class Sim {
    *  its croupier counted a wake since (a sleep, a stop, its clock gone back
    *  or on by a lapse: restartAt), ABANDON_MS at least after that — the wait
    *  spanned it, and starts again (computedTable lookAtClock). */
-  private checkOwnAbandons(sp: SimPage, tr: Y.Transaction, computed: Y.Map<unknown>): void {
+  private checkOwnAbandons(sp: SimPage, tr: Y.Transaction, computed: Y.Map<unknown>, was: Map<string, { inc: string | null; res: FoldResult | null }>): void {
     if (!sp.honest || sp.cheats) return;
-    const { pub, table } = sp.p;
+    const { casino, pub, table } = sp.p;
     const now = Date.now();
     for (const [type, keys] of tr.changed) {
       const item = (type as Y.AbstractType<unknown>)._item;
@@ -1213,9 +1213,15 @@ export class Sim {
         const restart = sp.restartAt !== null && sp.restartAt.T >= closeIn.T ? sp.restartAt : null;
         const from = restart ? restart.at : closeIn.at;
         // 🏠 A Fair round's, while this page hasn't heard the house for
-        // HOUSE_HEARD_MS: that long (computedTable abandonWait).
+        // HOUSE_HEARD_MS: that long (computedTable abandonWait), unless the
+        // house's reveal of the close was in, as the fold the page's duty
+        // read counted it (verified, a house's: houseWaits), waiting on a
+        // seed this page lacked: then the full ABANDON_MS.
         const fair = (ses.get(`c:${z.r}:${z.x}`) as { h?: unknown } | undefined)?.h !== undefined;
-        const wait = fair && !sp.p.casino.houseOnline(now) ? HOUSE_HEARD_MS : table.ABANDON_MS;
+        const t = this.tables.find((x) => casino.computedSessionForWrite(x) === ses);
+        const w = t === undefined ? undefined : was.get(t);
+        const round = w?.res && w.inc === casino.computedIncOf(t!) ? w.res.rounds.find((v) => v.close === z.x) : undefined;
+        const wait = fair && !casino.houseOnline(now) && round?.houseWaits === undefined ? HOUSE_HEARD_MS : table.ABANDON_MS;
         this.abandonsChecked += 1;
         if (now < from + wait) {
           this.violate(`${sp.name}'s abandon of round ${z.r} at ${this.elapsed} ms came ${now - closeIn.at} ms after the close came`

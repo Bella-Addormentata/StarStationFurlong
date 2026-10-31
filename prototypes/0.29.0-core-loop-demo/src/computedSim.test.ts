@@ -33,6 +33,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import * as Y from 'yjs';
 import vectors from '../test-vectors/ed25519-strict.json';
 import { canon } from './computedFold';
+import { HOUSE_HEARD_MS } from './computedHouse';
 import type { Checkpoint, FoldCtx, FoldResult } from './computedFold';
 import { PAGE_ROOM } from './computedPageKit';
 import { ComputedKit, red } from './computedTestKit';
@@ -1544,5 +1545,49 @@ describe("the house: the owner's node adds its seed to the rounds (computedSimHo
     expect(s.abandonsChecked, sim.label).toBeGreaterThanOrEqual(1);
     expect(s.flips.C + s.flips.D, sim.label).toBeGreaterThan(0);
     expect(s.flips.A + s.flips.B, sim.label).toBe(0);
+  }, TIMEOUT);
+
+  it("reveal, then deaf: a page has the house's reveal but not a seed it counted, and stops hearing anyone; it waits the full 30 s, not the 15 s of an unheard house", async () => {
+    // C's uplink is slow, to the house's page (A) less so than to B and D:
+    // its seed is the last the house sees, and D has the house's reveal of
+    // the close before C's seed in it (the fold's houseWaits). Then D's downlink
+    // stalls (Net.deaf) until 26 s after the close reached it: no seed and
+    // no beat of the house's. An unheard house voids a Fair round at 15 s,
+    // but not one whose reveal is in (computedTable abandonWait): D waits
+    // 30 s, so it hears the seed as the stall ends and nothing goes void.
+    // (The sim's own check holds every abandon to that: checkOwnAbandons.)
+    const sim = await Sim.open({ name: 'house-reveal-deaf', seed: seed(907), pages: named('ABCD'), houseNode: true });
+    const [a, b, c, d] = sim.pages;
+    sim.net.setLink(c, a, { delay: [1_500, 2_000] });
+    sim.net.setLink(c, b, { delay: [6_000, 7_000] });
+    sim.net.setLink(c, d, { delay: [6_000, 7_000] });
+    const stalls: { r: number; from: number; to: number; waits: string[] }[] = [];
+    let until: number | null = null;
+    let closeIn: { close: string; T: number } | null = null;
+    sim.every(() => {
+      if (until !== null) {
+        if (sim.T < until && !sim.healed) return;
+        sim.net.deaf.clear();
+        until = null;
+      }
+      if (sim.healed || stalls.length >= 3) return;
+      sim.enter(d);
+      const tip = d.p.casino.computedFoldOf(T1)?.tip;
+      if (!tip) return;
+      if (closeIn?.close !== tip.close) closeIn = { close: tip.close, T: sim.T };
+      if (tip.houseWaits === undefined || stalls.some((x) => sim.T < x.to + 30_000)) return;
+      until = closeIn.T + 26_000;
+      sim.net.deaf.add(d.name);
+      stalls.push({ r: tip.r, from: sim.T, to: until, waits: tip.houseWaits });
+    });
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    console.log(`[sim] house-reveal-deaf: ${stalls.map((x) => `round ${x.r} deaf ${x.from - SIM_T0}-${x.to - SIM_T0} ms waiting on ${x.waits.length}`).join('; ')}`);
+    expect(stalls.length, sim.label).toBeGreaterThan(0);
+    // Each stall began well over 15 s before D would hear again, with the
+    // house's beats unheard for more than HOUSE_HEARD_MS by its end.
+    for (const x of stalls) expect(x.to - x.from, sim.label).toBeGreaterThan(HOUSE_HEARD_MS + 5_000);
+    expect(s.voids, sim.label).toBe(0);
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
   }, TIMEOUT);
 });
