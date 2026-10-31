@@ -114,7 +114,8 @@ import {
 } from './airHockeyTheme';
 import { readAirHockeyTheme, writeAirHockeyTheme } from './airHockeyThemeDoc';
 import {
-  WALLPAPER_PRESETS, WALLPAPER_LABELS, type WallpaperPresetId,
+  WALLPAPER_PRESETS, WALLPAPER_LABELS, stepWallpaperSurface,
+  type WallpaperPresetId, type WallpaperSurface,
 } from './wallpaper';
 import { SURFACES, narrowAxisFor } from './hullSection';
 import type { HullSurface } from './hullSection';
@@ -1015,6 +1016,18 @@ const SURFACE_LABEL: Record<HullSurface, string> = {
   floor: 'Floor (pool bottom)',
 };
 
+/** 🖼️ Labels for the wallpaper panel's Surface row (issue 326): the window
+ *  chips, plus the two octagon end walls and the room floor. The `floor`
+ *  strip is the basement floor under the deck, so here it says where it
+ *  shows: through a pool. */
+const WALLPAPER_SURFACE_LABEL: Record<WallpaperSurface, string> = {
+  ...SURFACE_LABEL,
+  'cap-neg': 'End wall −',
+  'cap-pos': 'End wall +',
+  deck: 'Room floor',
+  floor: 'Pool bottom',
+};
+
 /**
  * May a `w`×`h` window sit on `surface` at (along, across)? A window only needs
  * to clear the OTHER windows on the SAME surface — a 2-D interval-overlap test
@@ -1251,8 +1264,9 @@ class RoomEditController {
   /** 🖼️ #80 S6: the wall-covering editor is armed (pick a surface + preset —
    *  applies live to the hull). Exclusive with add-door / add-window. */
   private wallpaperMode = false;
-  /** The surface being re-skinned (any of the 8 strips). */
-  private wallpaperSurface: HullSurface = 'wall-neg';
+  /** The surface being re-skinned: any of the 8 strips, an end wall or the
+   *  room floor (wallpaper.WALLPAPER_SURFACES). */
+  private wallpaperSurface: WallpaperSurface = 'wall-neg';
   /** Whether the 🖼 WALLPAPER button belongs on screen for the current scope
    *  (interior + octagon) — so disarming add-window can restore it. */
   private wallpaperEligible = false;
@@ -4064,7 +4078,7 @@ class RoomEditController {
       this.wallpaperBtnEl = document.createElement('button');
       this.wallpaperBtnEl.id = 'room-edit-wallpaper-btn';
       this.wallpaperBtnEl.type = 'button';
-      this.wallpaperBtnEl.title = 'Re-skin a hull wall — pick a surface + covering';
+      this.wallpaperBtnEl.title = 'Re-skin a wall or the floor — pick a surface + covering';
       this.wallpaperBtnEl.style.cssText = `
         position: fixed;
         top: 128px;
@@ -4330,15 +4344,16 @@ class RoomEditController {
 
   private syncWallpaperPanel(): void {
     const surfLabel = document.getElementById('room-edit-wp-surface');
-    if (surfLabel) surfLabel.textContent = SURFACE_LABEL[this.wallpaperSurface];
+    if (surfLabel) surfLabel.textContent = WALLPAPER_SURFACE_LABEL[this.wallpaperSurface];
     const presetLabel = document.getElementById('room-edit-wp-preset');
     if (presetLabel) presetLabel.textContent = WALLPAPER_LABELS[this.currentWallpaperPreset()];
   }
 
   /** Cycle which surface we're re-skinning (wraps); reloads its covering label. */
   private cycleWallpaperSurface(delta: number): void {
-    const i = SURFACES.indexOf(this.wallpaperSurface);
-    this.wallpaperSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    // A cupola end is glass and takes no covering, so the row steps past it.
+    const glass = roomCupolas().map((plan) => plan.cap);
+    this.wallpaperSurface = stepWallpaperSurface(this.wallpaperSurface, delta, glass);
     this.syncWallpaperPanel();
   }
 
