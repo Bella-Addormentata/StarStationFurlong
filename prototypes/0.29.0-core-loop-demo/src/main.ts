@@ -303,6 +303,7 @@ import {
   subscribeFurniture,
   writeFurnitureItem,
   deleteFurnitureItem,
+  placedFurnitureIn,
 } from "./furnitureDoc";
 import {
   seedRoomTemplate,
@@ -2208,7 +2209,9 @@ async function joinRoomAtEpoch(
     isOwner: () => yjsSync === sync && currentRoomDeedIsMine(),
     myName: () => getPlayerName(),
     canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)),
-    boardOfItem: (itemId) => boardKindOf(FURNITURE.find((i) => i.id === itemId)?.kind),
+    // From this room's doc, never the scene's FURNITURE (#332 review): the
+    // scene can still hold a board the layout removed, or its old kind.
+    boardOfItem: (itemId) => boardKindOf(placedFurnitureIn(sync.doc, itemId)?.kind),
   });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's

@@ -4261,6 +4261,12 @@ async fn board_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, env
                 eprintln!("📌 BOARD-DROP: malformed bundle from {remote_id}");
                 return;
             };
+            // Charged before any work on it, so a bundle that won't open
+            // costs its sender too (#332 review).
+            if !hub.board_bundles.lock().unwrap().charge_peer(&peer, now) {
+                eprintln!("📌 BOARD-DROP: bundle from {remote_id}: the peer is over its budget");
+                return;
+            }
             let index = board_tag_index(hub, now);
             let ours = index.get(&b.tag).cloned();
             if let Some((room, key)) = &ours {
@@ -4270,7 +4276,7 @@ async fn board_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, env
                 }
             }
             let protected = index.into_keys().collect();
-            let verdict = hub.board_bundles.lock().unwrap().admit_from_peer(&peer, b, now, &protected);
+            let verdict = hub.board_bundles.lock().unwrap().admit_charged(&peer, b, now, &protected);
             match verdict {
                 board_bundles::Admit::New => {
                     if let Some((room, _)) = ours {
@@ -4333,7 +4339,7 @@ async fn board_bundle_tick(hub: &SharedHub) {
             .iter()
             .filter_map(|(room, key)| {
                 let r = rooms.get(room)?;
-                r.served.then(|| (room.clone(), *key, board_bundles::board_from_doc(&r.doc, now_ms)))
+                r.served.then(|| (room.clone(), *key, board_bundles::board_from_doc(&r.doc, room, now_ms)))
             })
             .collect();
         let mut peers: HashMap<PublicKey, (String, iroh::endpoint::Connection)> = HashMap::new();
@@ -4367,6 +4373,14 @@ async fn board_bundle_tick(hub: &SharedHub) {
     {
         let mut lane = hub.board_bundles.lock().unwrap();
         lane.store.expire(now);
+        // Junk carried under a room's tag before this node had its key goes
+        // now, before our own bundle needs the room under that tag.
+        for (room, key) in &caps {
+            let gone = lane.evict_unreadable(room, key, now);
+            if gone > 0 {
+                eprintln!("📌 dropped {gone} bundle(s) under room {room}'s tags that don't open as its own");
+            }
+        }
         for (room, key, content) in contents {
             if !lane.publish_due(&room, &content, now) {
                 continue;
@@ -4380,18 +4394,25 @@ async fn board_bundle_tick(hub: &SharedHub) {
                 notes: content.notes.clone(),
                 down: content.down.clone(),
             };
-            match board_bundles::seal_fitting(&key, plain) {
-                Some(b) => {
-                    lane.store.admit(b, now, &protected);
-                    println!(
-                        "📌 board bundle sealed for room {room}: {} note(s), {} take-down(s)",
-                        content.notes.len(),
-                        content.down.len()
-                    );
-                }
-                None => eprintln!("📌 board bundle for room {room} could not be sealed"),
+            // Published only once the store keeps it (#332 review): a bundle
+            // the store refuses (its tag full of bundles stamped ahead of
+            // ours) or one that can't be sealed stays due for the next tick.
+            match board_bundles::seal_fitting(&key, plain, &hub.secret_key) {
+                Some(b) => match lane.store.admit(b, now, &protected) {
+                    board_bundles::Admit::Refused(why) => {
+                        eprintln!("📌 board bundle for room {room} not kept ({why}); trying again next tick");
+                    }
+                    _ => {
+                        println!(
+                            "📌 board bundle sealed for room {room}: {} note(s), {} take-down(s)",
+                            content.notes.len(),
+                            content.down.len()
+                        );
+                        lane.note_published(&room, &content, at);
+                    }
+                },
+                None => eprintln!("📌 board bundle for room {room} could not be sealed; trying again next tick"),
             }
-            lane.note_published(&room, &content, at);
         }
     }
 
@@ -4403,7 +4424,7 @@ async fn board_bundle_tick(hub: &SharedHub) {
         peers
             .into_iter()
             .filter_map(|(k, (room, conn))| {
-                let items = lane.advert_for(&k.to_string());
+                let items = lane.advert_for(&k.to_string(), now);
                 (!items.is_empty())
                     .then(|| (room, conn, serde_json::to_vec(&board_bundles::have_payload(&items)).unwrap_or_default()))
             })
