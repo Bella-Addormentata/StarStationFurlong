@@ -309,6 +309,16 @@ describe('📷 where a photo is for this viewer', () => {
     expect(lane.fetches).toHaveLength(1);
   });
 
+  it('drops a pressed FETCH whose room changed while WHERE was asked (#340 review)', async () => {
+    lane.states.set(HASH, { state: 'none' });
+    lane.whereAnswers = false;
+    const pressed = pressFetch(photo());
+    lane.room = 'room-2';
+    lane.holders.set(HASH, []); // WHERE answers, in the next room
+    await pressed;
+    expect(lane.fetches).toHaveLength(0);
+  });
+
   it('keeps every photo in view without reading them again and again (#340 review)', async () => {
     const reads: string[] = [];
     vi.stubGlobal('fetch', async (url: string) => {

@@ -962,7 +962,6 @@ impl BlobLane {
     fn next_copy_of(&self, kind: CopyKind, room: &str, mut entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
         let (cap, day) = self.rules_of(kind);
         let mut evicted = false;
-        let mut shared_more = false;
         let picked = {
             let mut h = self.hosting.lock().unwrap();
             if h.rooms.get(room) != Some(&true) {
@@ -978,17 +977,6 @@ impl BlobLane {
             let (spent, files) = Self::spent_of(&mut h, kind, room, now);
             let mut picked = None;
             for e in entries {
-                // Already here for another room (the same shot pinned in two
-                // rooms this node hosts): this room shares it too, as a FETCH
-                // for it here would, with nothing fetched or charged. Only
-                // while its provider is connected here, so the room could
-                // have it from them anyway (#340 review).
-                if let Some(x) = held.get_mut(&e.hash) {
-                    if !matches!(x.phase, Phase::Failed(_)) && !x.rooms.contains(room) && e.size <= cap && e.provider != *me && connected(&e.provider) {
-                        x.rooms.insert(room.to_string());
-                        shared_more = true;
-                    }
-                }
                 if held.get(&e.hash).is_some_and(|x| !matches!(x.phase, Phase::Failed(_)))
                     || h.tried.contains_key(&e.hash)
                     || e.size > cap
@@ -1026,9 +1014,8 @@ impl BlobLane {
             }
             picked
         };
-        // What went, the charge, and a room newly sharing a file are on disk
-        // before the transfer starts.
-        if evicted || shared_more || picked.is_some() {
+        // What went, and the charge, are on disk before the transfer starts.
+        if evicted || picked.is_some() {
             self.persist();
         }
         picked
@@ -2822,32 +2809,6 @@ mod tests {
         let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, quiet).await.unwrap();
         let spent = BlobLane::spent_of(&mut lane.hosting.lock().unwrap(), CopyKind::Photo, "r", now_ms());
         assert_eq!(spent, (40_000, 1));
-        lane.store.shutdown().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_photo_held_for_one_hosted_room_is_shared_with_another_that_pins_it() {
-        let dir = std::env::temp_dir().join(format!("ssf-blob-host-photo-two-rooms-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, Duration::from_secs(3600)).await.unwrap();
-        let (sharer, me) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
-        let hash = Hash::new(b"shot");
-        // The host already keeps the shot for room "a".
-        lane.held.lock().unwrap().insert(hash, Held {
-            rooms: HashSet::from(["a".to_string()]), size: 50_000, have: 50_000, mime: "image/jpeg".into(), phase: Phase::Complete,
-            charged: storage_bound(50_000), used: 0, readers: 0, shared: false, via: Vec::new(),
-        });
-        lane.host_room("b", Some(true)).unwrap();
-        let photo = LibBlob { hash, size: 50_000, provider: sharer, mime: "image/jpeg".into(), played: 1 };
-        let now = now_ms();
-        // Its poster isn't connected in "b": "b" gets nothing it couldn't have had.
-        assert_eq!(lane.next_photo_copy("b", vec![photo.clone()], &|_| false, &me, now), None);
-        assert!(!lane.held.lock().unwrap()[&hash].rooms.contains("b"));
-        // They are: "b" shares the copy, with nothing fetched or charged.
-        assert_eq!(lane.next_photo_copy("b", vec![photo], &|p| *p == sharer, &me, now), None);
-        assert!(lane.held.lock().unwrap()[&hash].rooms.contains("b"));
-        assert_eq!(lane.host_json("b")["photos"]["files"], 0);
         lane.store.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

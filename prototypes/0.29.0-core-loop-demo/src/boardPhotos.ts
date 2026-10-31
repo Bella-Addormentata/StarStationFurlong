@@ -361,12 +361,17 @@ export async function pressFetch(photo: BoardPhoto): Promise<void> {
   loadFailed.delete(photo.hash);
   refusedWhy.delete(photo.hash);
   if (pressing.has(photo.hash) || inFlight.has(photo.hash)) return;
+  // The press is for this room's board: a fetch sent after a room change
+  // would be the next room's, and the node shares a fetched file with the
+  // room it was asked for (#340 review).
+  const room = blobLaneRoom();
   pressing.add(photo.hash);
   try {
     await holdersFor(photo.hash);
   } finally {
     pressing.delete(photo.hash);
   }
+  if (blobLaneRoom() !== room) return;
   ask(photo);
 }
 
