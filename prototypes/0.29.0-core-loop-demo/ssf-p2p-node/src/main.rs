@@ -1762,7 +1762,7 @@ async fn main() -> Result<()> {
             let mut last_hash: HashMap<String, [u8; 32]> = HashMap::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                let snapshots = served_snapshots(&hub_persist.rooms);
+                let snapshots = served_snapshots(&hub_persist.rooms).await;
                 for (room_id, snapshot) in snapshots {
                     if snapshot.is_empty() {
                         continue; // never persist an empty doc over a good file
@@ -3564,10 +3564,13 @@ fn handle_iroh_connection(
                                 Some((0, 0, cursor)) => {
                                     // Relayed SyncStep1: answer from our doc when served
                                     // (read with the rooms lock let go: room_diff).
-                                    let diff = read_length_and_buf(&envelope.payload, cursor)
+                                    let client_sv = read_length_and_buf(&envelope.payload, cursor)
                                         .ok()
-                                        .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok())
-                                        .and_then(|client_sv| room_diff(&hub_clone.rooms, room_id, &client_sv, true));
+                                        .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok());
+                                    let diff = match client_sv {
+                                        Some(sv) => room_diff(&hub_clone.rooms, room_id, sv, true).await,
+                                        None => None,
+                                    };
                                     if let Some(diff) = diff {
                                         let mut encoder = EncoderV1::new();
                                         encoder.write_var(0u32); // messageType = Sync
@@ -3599,7 +3602,7 @@ fn handle_iroh_connection(
                                     // SyncStep2 / Update: merge into our replica (as before).
                                     if let Ok((update_bytes, _)) = read_length_and_buf(&envelope.payload, cursor) {
                                         if let Ok(update) = Update::decode_v1(&update_bytes) {
-                                            let _ = apply_to_room(&hub_clone.rooms, room_id, update);
+                                            let _ = apply_to_room(&hub_clone.rooms, room_id, update).await;
                                         }
                                     }
                                 }
@@ -3752,20 +3755,34 @@ fn served_docs(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Doc)> {
     rooms.iter().filter(|(_, r)| r.served).map(|(id, r)| (id.clone(), r.doc.clone())).collect()
 }
 
-/// What room `room_id`'s doc holds past `sv` (a SyncStep2's diff), the doc
-/// read with the rooms lock let go ([`room_doc`]).
-fn room_diff(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, sv: &StateVector, served_only: bool) -> Option<Vec<u8>> {
-    room_doc(rooms, room_id, served_only).map(|doc| doc.transact().encode_diff_v1(sv))
+/// `f` on the runtime's blocking pool (None: it panicked). A doc's
+/// transaction can be held a while (the house's pass, a big room's diff),
+/// and a runtime thread waiting on it would hold up every task queued on
+/// that thread, other rooms' among them.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// What room `room_id`'s doc holds past `sv` (a SyncStep2's diff): the doc
+/// taken with the rooms lock let go ([`room_doc`]), read off the runtime's
+/// threads ([`off_runtime`]).
+async fn room_diff(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, sv: StateVector, served_only: bool) -> Option<Vec<u8>> {
+    let doc = room_doc(rooms, room_id, served_only)?;
+    off_runtime(move || doc.transact().encode_diff_v1(&sv)).await
 }
 
 /// `update` merged into room `room_id`'s doc, the same way (None: no such room).
-fn apply_to_room(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, update: Update) -> Option<Result<(), yrs::error::UpdateError>> {
-    room_doc(rooms, room_id, false).map(|doc| doc.transact_mut().apply_update(update))
+async fn apply_to_room(rooms: &Mutex<HashMap<String, Room>>, room_id: &str, update: Update) -> Option<Result<(), yrs::error::UpdateError>> {
+    let doc = room_doc(rooms, room_id, false)?;
+    off_runtime(move || doc.transact_mut().apply_update(update)).await
 }
 
 /// Every served room's whole doc, for the disk, the same way.
-fn served_snapshots(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Vec<u8>)> {
-    served_docs(rooms).into_iter().map(|(id, doc)| (id, doc.transact().encode_diff_v1(&StateVector::default()))).collect()
+async fn served_snapshots(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, Vec<u8>)> {
+    let docs = served_docs(rooms);
+    off_runtime(move || docs.into_iter().map(|(id, doc)| (id, doc.transact().encode_diff_v1(&StateVector::default()))).collect())
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3785,11 +3802,13 @@ mod room_lock_tests {
         }
     }
 
-    /// 🏠 A room's doc held (the house's tick, a big room's diff): every sync
-    /// of that room waits on it with the rooms lock let go, so another room's
-    /// sync, and the lock itself, never wait on it.
-    #[test]
-    fn a_sync_waiting_on_one_rooms_doc_holds_no_other_room() {
+    /// 🏠 A room's doc held (the house's pass, a big room's diff): every sync
+    /// of that room waits on it with the rooms lock let go and off the
+    /// runtime's threads, so another room's sync, the lock and the runtime
+    /// itself never wait on it (one runtime thread here, as a busy node's
+    /// threads can all be).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sync_waiting_on_one_rooms_doc_holds_no_other_room() {
         let (a, b) = (Doc::new(), Doc::new());
         let rooms = Arc::new(Mutex::new(HashMap::from([("a".to_string(), room(&a)), ("b".to_string(), room(&b))])));
         let update = {
@@ -3799,30 +3818,43 @@ mod room_lock_tests {
             m.insert(&mut txn, "k", 1.0);
             txn.encode_update_v1()
         };
-        let held = a.transact_mut();
-        let waiting: Vec<std::thread::JoinHandle<bool>> = vec![
+        // Room a's doc held for 600 ms on a thread of its own.
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                let _txn = a.transact_mut();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+            })
+        };
+        held.recv().unwrap();
+        let t = Instant::now();
+        let waiting = vec![
             {
                 let rooms = rooms.clone();
-                std::thread::spawn(move || room_diff(&rooms, "a", &StateVector::default(), true).is_some())
+                tokio::spawn(async move { room_diff(&rooms, "a", StateVector::default(), true).await.is_some() })
             },
             {
                 let (rooms, update) = (rooms.clone(), update.clone());
-                std::thread::spawn(move || matches!(apply_to_room(&rooms, "a", Update::decode_v1(&update).unwrap()), Some(Ok(()))))
+                tokio::spawn(async move { matches!(apply_to_room(&rooms, "a", Update::decode_v1(&update).unwrap()).await, Some(Ok(()))) })
             },
             {
                 let rooms = rooms.clone();
-                std::thread::spawn(move || served_snapshots(&rooms).len() == 2)
+                tokio::spawn(async move { served_snapshots(&rooms).await.len() == 2 })
             },
         ];
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(t.elapsed() < Duration::from_millis(300), "the runtime goes on while they wait");
         assert!(waiting.iter().all(|w| !w.is_finished()), "each waits on room a's doc");
         assert!(rooms.try_lock().is_ok(), "with the rooms lock let go");
-        let t = Instant::now();
-        assert!(room_diff(&rooms, "b", &StateVector::default(), true).is_some());
-        assert!(matches!(apply_to_room(&rooms, "b", Update::decode_v1(&update).unwrap()), Some(Ok(()))));
-        assert!(t.elapsed() < Duration::from_millis(150), "room b's sync goes on");
-        drop(held);
-        assert!(waiting.into_iter().all(|w| w.join().unwrap()));
+        assert!(room_diff(&rooms, "b", StateVector::default(), true).await.is_some());
+        assert!(matches!(apply_to_room(&rooms, "b", Update::decode_v1(&update).unwrap()).await, Some(Ok(()))));
+        assert!(t.elapsed() < Duration::from_millis(400), "room b's sync goes on");
+        for w in waiting {
+            assert!(w.await.unwrap());
+        }
+        holder.join().unwrap();
         let txn = a.transact();
         assert!(txn.get_map("m").is_some_and(|m| m.get(&txn, "k").is_some()), "room a's update went in once let go");
     }
@@ -3860,7 +3892,20 @@ async fn house_step_down(hub: &SharedHub, within_ms: u64) -> usize {
     }
     let started = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(within_ms);
-    let mut sent = house_sends().lock().await;
+    // Stepping down from now: a tick of the loop still running steps down
+    // each room it has yet to reach (the flag is set as soon as its room's
+    // tick lets the house go, off the runtime's threads).
+    let hub_flag = hub.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(house) = hub_flag.house.as_ref() {
+            house::lock(house).begin_step_down();
+        }
+    });
+    // That tick sends before the step-down does, within the deadline too.
+    let Ok(mut sent) = tokio::time::timeout_at(deadline, house_sends().lock()).await else {
+        eprintln!("🏠 house: the loop's tick ran past the step-down's {within_ms} ms; it steps down the rooms it reaches");
+        return 0;
+    };
     let mut sends = Vec::new();
     let now = house_now();
     for (_, room_id, update) in sent.drain(..).filter(|(at, _, _)| now.saturating_sub(*at) <= HOUSE_RESEND_MS) {
@@ -4725,7 +4770,7 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
             encoder.write_var(0u32); // messageType = Sync
             encoder.write_var(1u32); // syncSubType = SyncStep2
 
-            let missing_diff = room_diff(&hub.rooms, room_id, &client_sv, false).ok_or_else(|| anyhow!("no room {room_id}"))?;
+            let missing_diff = room_diff(&hub.rooms, room_id, client_sv, false).await.ok_or_else(|| anyhow!("no room {room_id}"))?;
             encoder.write_buf(&missing_diff);
 
             let reply_env = SsfEnvelope {
@@ -4754,6 +4799,7 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
                 .map_err(|e| anyhow!("Failed decoding update block: {:?}", e))?;
 
             apply_to_room(&hub.rooms, room_id, update)
+                .await
                 .ok_or_else(|| anyhow!("no room {room_id}"))?
                 .map_err(|e| anyhow!("Failed to apply browser update: {:?}", e))?;
         }

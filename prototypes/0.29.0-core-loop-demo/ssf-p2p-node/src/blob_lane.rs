@@ -1470,7 +1470,10 @@ pub fn spawn_host_copier(lane: Arc<BlobLane>, hub: SharedHub, endpoint: iroh::En
         loop {
             tokio::time::sleep(HOST_SCAN).await;
             lane.met_round(&hub);
-            lane.copy_round(&hub, &endpoint);
+            // Off the runtime's threads: it reads each room's doc, which a
+            // transaction (the house's pass) can hold a while.
+            let (l, h, e) = (lane.clone(), hub.clone(), endpoint.clone());
+            let _ = tokio::task::spawn_blocking(move || l.copy_round(&h, &e)).await;
         }
     });
 }
