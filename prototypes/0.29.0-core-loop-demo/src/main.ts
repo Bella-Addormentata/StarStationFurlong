@@ -201,7 +201,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // (departuresWrite.ts, a background session like the far dock write), and
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
-import { bindBoardDoc, refreshBoards, setBoardDeps } from "./boardDoc";
+import { bindBoardDoc, boardKindOf, mergeBoardView, refreshBoards, retryBoardView, setBoardDeps } from "./boardDoc";
 import {
   applyDeparturesPublish,
   bindDeparturesDoc,
@@ -2082,6 +2082,20 @@ async function joinRoomAtEpoch(
         }
         return;
       }
+      // 📌 #315: what other nodes sealed for this room's boards, opened by
+      // the LOCAL node (node-local lane: a remote peer's `board` envelope is
+      // dropped at the node). Every note and take-down in it is checked as
+      // a reader checks the doc, so an older node forwarding a peer's copy
+      // can hand us nothing a peer couldn't write into the doc itself.
+      if (env.kind === "board" && typeof env.payload === "string") {
+        try {
+          const bytes = Uint8Array.from(atob(env.payload), (c) => c.charCodeAt(0));
+          mergeBoardView(JSON.parse(new TextDecoder().decode(bytes)));
+        } catch {
+          /* malformed view: ignored */
+        }
+        return;
+      }
       if (env.kind === "bridge" && typeof env.payload === "string") {
         try {
           const status = JSON.parse(atob(env.payload)) as {
@@ -2171,6 +2185,7 @@ async function joinRoomAtEpoch(
     isOwner: () => yjsSync === sync && currentRoomDeedIsMine(),
     myName: () => getPlayerName(),
     canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)),
+    boardOfItem: (itemId) => boardKindOf(FURNITURE.find((i) => i.id === itemId)?.kind),
   });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
@@ -2334,6 +2349,8 @@ async function joinRoomAtEpoch(
     void synced.then(() => {
       if (epoch !== sessionEpoch || yjsSync !== sync) return;
       refreshWarmNeighbours();
+      // 📌 A board view the node sent before the host's state arrived.
+      retryBoardView();
       void networkProvider.refreshRoomCap();
     });
   }

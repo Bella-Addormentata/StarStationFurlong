@@ -91,6 +91,20 @@ const smallBtn = (act: string, label: string, extra = '', tone = GOLD): string =
     padding:3px 7px; background:rgba(212,168,75,0.06); border:1px solid ${tone}55; border-radius:5px;
     color:${tone}; font-family:inherit; font-size:9px; font-weight:800; letter-spacing:0.5px; cursor:pointer;">${label}</button>`;
 
+/** 📌 By keyboard (#330 review): Tab is the phone's toggle, not a tab stop
+ *  (main.ts), so the panel carries the terminal pane's traversal (devices.ts):
+ *  ↑/↓ step through its visible controls, wrapping, and Enter and Space
+ *  press a button natively. In the note box ↑ leaves only from its very
+ *  start and ↓ only from its very end, so its own lines keep their caret
+ *  keys. */
+const NAV_STOPS = 'button:not([disabled]), textarea:not([disabled])';
+const navStops = (root: HTMLElement): HTMLElement[] =>
+  [...root.querySelectorAll<HTMLElement>(NAV_STOPS)].filter((el) => el.offsetParent !== null);
+/** What a control does and to what, so focus survives a repaint that
+ *  rebuilds it. */
+const stopKey = (el: HTMLElement): string =>
+  [el.dataset.act ?? (el.hasAttribute('data-text') ? 'text' : ''), el.dataset.id ?? '', el.dataset.pub ?? '', el.dataset.colour ?? ''].join('|');
+
 export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   const { itemId, kind } = deps;
   const open = kind === 'open';
@@ -172,6 +186,10 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
 
   const render = (): void => {
     if (!panel || !here()) return;
+    // The lists below are rebuilt; a control that held focus comes back as
+    // its twin, or the panel holds focus, never the page's body.
+    const active = document.activeElement;
+    const held = active instanceof HTMLElement && active !== panel && panel.contains(active) ? stopKey(active) : null;
     const notes = panel.querySelector<HTMLElement>('[data-notes]');
     if (notes) notes.innerHTML = notesHtml();
     const hidden = panel.querySelector<HTMLElement>('[data-hidden]');
@@ -195,6 +213,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       const armed = Date.now() < clearArmedUntil;
       tools.style.display = canModerate() ? 'flex' : 'none';
       tools.innerHTML = smallBtn('clear', armed ? 'CLICK AGAIN TO CLEAR EVERY NOTE' : 'CLEAR BOARD', '', '#FF6B6B');
+    }
+    if (held !== null && !panel.contains(document.activeElement)) {
+      (navStops(panel).find((el) => stopKey(el) === held) ?? panel).focus({ preventScroll: true });
     }
   };
 
@@ -305,7 +326,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
         border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
         padding: 18px; display: flex; flex-direction: column; gap: 12px;
         color: ${GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-        box-sizing: border-box; pointer-events: auto;
+        box-sizing: border-box; pointer-events: auto; outline: none;
       `;
       panel.innerHTML = shell();
       panel.addEventListener('click', onClick);
@@ -325,6 +346,26 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
           post();
         }
       });
+      const mounted = panel;
+      mounted.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
+      mounted.addEventListener('keydown', (e) => {
+        if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        const from = e.target instanceof HTMLElement ? e.target : null;
+        if (from instanceof HTMLTextAreaElement) {
+          const edge = step < 0 ? 0 : from.value.length;
+          if (from.selectionStart !== edge || from.selectionEnd !== edge) return; // the box's own lines
+        }
+        const stops = navStops(mounted);
+        if (stops.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const at = from ? stops.indexOf(from) : -1;
+        const next = stops[at < 0 ? 0 : (at + step + stops.length) % stops.length];
+        next.focus({ preventScroll: true });
+        next.scrollIntoView({ block: 'nearest' });
+      });
       host.appendChild(panel);
       // What was new when the player walked up stays marked NEW here; the
       // face's glow goes out now that they've seen it.
@@ -340,6 +381,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       });
       deps.onEngagedChange?.(true);
       render();
+      // Somewhere to start from: ↑/↓ from the panel itself land on its
+      // first control, and nothing is typed into the note box by accident.
+      mounted.focus({ preventScroll: true });
     },
     unmount(): void {
       unsubscribe?.();
