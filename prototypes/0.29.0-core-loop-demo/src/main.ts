@@ -201,6 +201,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // (departuresWrite.ts, a background session like the far dock write), and
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
+import { bindBoardDoc, refreshBoards, setBoardDeps } from "./boardDoc";
 import {
   applyDeparturesPublish,
   bindDeparturesDoc,
@@ -2155,6 +2156,23 @@ async function joinRoomAtEpoch(
   // setting. Same T0 seam — the boards re-read on the fresh doc.
   bindDeparturesDoc(sync.doc);
 
+  // 📌 Bind the room boards (#315): the corkboard's and the notice case's
+  // signed notes. Same T0 seam. The getters are this join's: the room the
+  // notes are signed into, its owner's key (read live, it can land after
+  // the doc), the deed, our name, and whether the host's own state has
+  // arrived (only then may a board trim what no reader would show): a frame
+  // from the live host, or this machine's node's answer for a room it hosts
+  // (routeRoomReady, #330 review: an owner alone in their own room never
+  // links to a peer, so `linkedSynced` alone would never let them trim).
+  bindBoardDoc(sync.doc);
+  setBoardDeps({
+    roomId: () => boot.roomId,
+    ownerPub: () => roomOwnerInfo(boot.roomId).ownerPub,
+    isOwner: () => yjsSync === sync && currentRoomDeedIsMine(),
+    myName: () => getPlayerName(),
+    canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)),
+  });
+
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
   // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
   // into a party that has already happened and see the candles already out.
@@ -3108,6 +3126,8 @@ async function joinRoomAtEpoch(
     if (_event.keysChanged.has("name")) publishPlanetSummary();
     // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
     if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
+    // 📌 A new owner is a new notice-case author (#315).
+    if (_event.keysChanged.has("owner")) refreshBoards();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some
@@ -3140,7 +3160,11 @@ async function joinRoomAtEpoch(
     // 🗺️ #192: the owner's display name rides into the atlas once their
     // entry lands or changes (only theirs: the rest of the roster is noise).
     const owner = sync.doc.getMap("roomInfo").get("owner");
-    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) harvestStationAtlas();
+    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) {
+      harvestStationAtlas();
+      // 📌 The notice case reads the owner's key from here (#315).
+      refreshBoards();
+    }
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
