@@ -205,7 +205,8 @@ function paintNote(c: CanvasRenderingContext2D, n: BoardFaceNote, look: BoardLoo
     c.textAlign = 'left';
     c.textBaseline = 'alphabetic';
     c.fillStyle = INK;
-    const lines = wrapNoteText((s) => c.measureText(s).width, n.text, w - 10, 5);
+    // Four lines: a fifth would run into the author's name.
+    const lines = wrapNoteText((s) => c.measureText(s).width, n.text, w - 10, 4);
     lines.forEach((line, i) => c.fillText(line, -w / 2 + 5, -h / 2 + 20 + i * 9.5));
     c.font = 'italic 7px sans-serif';
     c.fillStyle = 'rgba(42,36,24,0.7)';
