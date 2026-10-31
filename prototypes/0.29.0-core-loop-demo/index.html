@@ -256,6 +256,11 @@
               <span class="phone-app-tile-icon">⚙️</span>
               <span class="phone-app-tile-label">SETTINGS</span>
             </button>
+            <!-- 📷 Camera (#319): the viewfinder and the film roll. -->
+            <button type="button" class="phone-app-tile" data-phone-app="camera" aria-label="Open the Camera app">
+              <span class="phone-app-tile-icon">📷</span>
+              <span class="phone-app-tile-label">CAMERA</span>
+            </button>
             <!-- 🧰 Tools (#258): the phone's utilities, the IR blaster first. -->
             <button type="button" class="phone-app-tile" data-phone-app="tools" aria-label="Open Tools">
               <span class="phone-app-tile-icon">🧰</span>
@@ -438,6 +443,10 @@
              renderTvPhoneApp on open and on every tv-map change while the
              view is active. -->
         <div id="phone-app-tv" class="phone-app-view"></div>
+
+        <!-- 📷 Camera (#319): the film roll, rendered by cameraApp.ts
+             renderCameraApp on open and on every change to the roll. -->
+        <div id="phone-app-camera" class="phone-app-view"></div>
       </div>
     </div>
     

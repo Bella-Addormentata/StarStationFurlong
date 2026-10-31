@@ -278,6 +278,9 @@ import { bindTvDoc, setTvIdentity, setTvPageId, tvNow, tvWallNow } from "./tvDoc
 import { aimTvRemote, focusTvApp, renderTvPhoneApp, resolveArchiveFile, tvHasSomethingOn } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvPictureOpener, setTvRemoteOpener, setTvTheatreDeps } from "./tvTheatre";
 import { irBlink, isAiming, startAiming, stopAiming } from "./irBlaster";
+import { isViewfinding, renderCameraApp, shootViewfinder, startViewfinder, stopViewfinder } from "./cameraApp";
+import { requestShot, servePendingShot, shotPending } from "./cameraShot";
+import { addShot } from "./filmRoll";
 import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tvConsent";
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
@@ -3567,6 +3570,7 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // flush below. The IR blaster comes down with them.
   closeTvTheatre();
   stopAiming();
+  stopViewfinder(); // 📷 #319: the camera comes down too
   leaveTvRoom(roomTvIds());
   // 🕹 #193: the same for the cabinet — the stage (its frame, its seat
   // renewals) is this room's; a P1 who leaves stands up before the doc goes.
@@ -8045,7 +8049,8 @@ function setupSpacePhoneOverlay() {
     | "setnet"
     | "setstats"
     | "tools"
-    | "tv";
+    | "tv"
+    | "camera";
   const phoneViewMeta: Record<
     PhoneViewId,
     { elId: string; title: string; subtitle: string }
@@ -8110,6 +8115,12 @@ function setupSpacePhoneOverlay() {
       elId: "phone-app-tv",
       title: "📡 IR BLASTER",
       subtitle: "Tools · Aim at a TV",
+    },
+    // 📷 #319: the viewfinder and the film roll.
+    camera: {
+      elId: "phone-app-camera",
+      title: "📷 CAMERA",
+      subtitle: "Film roll · your last 20 shots",
     },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
@@ -8283,6 +8294,55 @@ function setupSpacePhoneOverlay() {
         focusTvApp(view);
       }
     }
+    // 📷 #319: the film roll; TAKE A PHOTO puts the viewfinder up.
+    if (id === "camera") {
+      const view = document.getElementById("phone-app-camera");
+      if (view) {
+        const open = cameraOpen;
+        cameraOpen = {};
+        renderCameraApp(view, { shoot: putCameraUp }, open);
+        if (!open.focusShot) {
+          view.setAttribute("tabindex", "-1");
+          view.focus({ preventScroll: true });
+        }
+      }
+    }
+  };
+
+  // 📷 #319: what the CAMERA view opens on next (a shot just taken).
+  let cameraOpen: { focusShot?: string; notice?: string } = {};
+  /** The shutter: the next frame drawn, printed onto the roll, and the
+   *  phone back up on it with the new shot's caption box ready. */
+  const takePhoto = async (): Promise<void> => {
+    const shot = await requestShot();
+    stopViewfinder();
+    if (shot) {
+      try {
+        const saved = await addShot({
+          jpeg: shot.blob,
+          width: shot.width,
+          height: shot.height,
+          roomId: activeBootstrap?.roomId ?? "",
+          roomName: currentRoomDisplayName(),
+        });
+        cameraOpen = { focusShot: saved.id };
+      } catch {
+        cameraOpen = { notice: "The photo couldn't be saved. Try again." };
+      }
+    } else {
+      cameraOpen = { notice: "The shot didn't take. Try again." };
+    }
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView("camera");
+  };
+  const putCameraUp = (): void => {
+    phoneOpener = null; // the room is where the viewfinder leaves focus
+    // A device still focused would take the click meant for the shutter.
+    deviceFocus.forceRelease();
+    closeMiniChat();
+    stopAiming();
+    startViewfinder(takePhoto);
   };
 
   // App tiles on the home screen route into their views. Delegated from the
@@ -8442,6 +8502,13 @@ function setupSpacePhoneOverlay() {
       stopAiming();
       container.classList.add("active");
       showPhoneView("tv");
+      return;
+    }
+    // 📷 #319: the same for the viewfinder, back to the roll.
+    if (isViewfinding() && container) {
+      stopViewfinder();
+      container.classList.add("active");
+      showPhoneView("camera");
       return;
     }
 
@@ -11248,6 +11315,12 @@ function onCanvasClick(event: MouseEvent): void {
     return;
   }
 
+  // ── 📷 #319: with the viewfinder up, a click on the room is the shutter.
+  if (isViewfinding()) {
+    shootViewfinder();
+    return;
+  }
+
   // ── While the device-focus camera is live, cabinet controls keep the view;
   //    every other canvas click retains #33 D0.3's release behavior.
   const focusRenderer = window.gameRenderer;
@@ -11751,6 +11824,9 @@ function animate() {
   const airlock = world.getAirlockScene();
   if (airlock) renderer.render(airlock, camera);
   else renderWithFarPass(renderer, scene, camera);
+  // 📷 #319: a shot reads the frame just drawn, before the browser shows it
+  // (the drawing buffer isn't kept).
+  if (shotPending()) servePendingShot(renderer.domElement);
 }
 
 /**
