@@ -407,6 +407,7 @@ import {
   isCoHost,
   hasCoHostRequest,
 } from "./roomRoles";
+import { bindCoHostNodes, coHostHintsHere, fileMyCoHostNode, forgetCoHostNode } from "./coHostNodes";
 import {
   bindVentures,
   subscribeVentures,
@@ -1485,6 +1486,39 @@ function roomStateArrivedNow(): boolean {
   return !!sync && !!roomId && routeRoomReady(sync, roomHostedHere(roomId));
 }
 
+/** 🤝 C3: the route hints of the active room's co-hosts, from the records
+ *  each co-host's own key signed for this room (coHostNodes.ts); a grant the
+ *  room lists under another key counts for nothing. Kept for a few seconds:
+ *  every outgoing sync envelope asks. */
+let coHostHintMemo: { roomId: string; at: number; hints: RoomMemberHint[] } | null = null;
+function coHostRouteHints(roomId: string): RoomMemberHint[] {
+  const now = Date.now();
+  if (coHostHintMemo && coHostHintMemo.roomId === roomId && now - coHostHintMemo.at < 5_000) return coHostHintMemo.hints;
+  const hints = coHostHintsHere(roomId, readCoHosts().filter((g) => isCoHost(g.pub)), now);
+  coHostHintMemo = { roomId, at: now, hints };
+  return hints;
+}
+
+/** 🤝 C3: a boot record with the room's co-hosts among its dial hints, after
+ *  the record's own; the same record when the room has none. */
+function withCoHostHints(record: RoomBootstrap | null, roomId: string): RoomBootstrap | null {
+  if (!record || record.roomId !== roomId) return record;
+  const coHosts = coHostRouteHints(roomId);
+  if (coHosts.length === 0) return record;
+  return { ...record, memberHints: mergeMemberHints(collectMemberHints(record), coHosts) };
+}
+
+/** 🤝 C3: a co-host's game files its node's route in the room, signed with
+ *  its key (and refreshes it as its node's routes change); a former
+ *  co-host's takes its record down. Only once the room's own state has
+ *  arrived: a cached copy may not list the grant yet. */
+function refileCoHostNode(): void {
+  const roomId = activeBootstrap?.roomId ?? "";
+  if (!roomId || !roomStateArrivedNow()) return;
+  const hint = localFingerprint ? getLocalNodeHint(localFingerprint) : null;
+  if (fileMyCoHostNode(roomId, isCoHost(getIdentityPub()), hint ? routeHint(hint) : null) !== "kept") coHostHintMemo = null;
+}
+
 /**
  * 🚏🛟 The route's keeper (routeKeeper.ts, build notes A5): once a second, in
  * EVERY game in the ship's room (not only the helm's commander — any rider
@@ -1970,6 +2004,10 @@ async function joinRoomAtEpoch(
     roomId: boot.roomId,
     channel,
     ...ysyncSigner(), // Slice 2: sign outgoing + verify-before-apply on inbound
+    // 🤝 C3: the node dials the room's co-hosts beside the pass's own
+    // hints, so a returning visitor reaches the room through a co-host's
+    // node while the owner's is off.
+    bootRecord: () => withCoHostHints(networkProvider.getBootRecord(), boot.roomId),
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
@@ -2317,6 +2355,8 @@ async function joinRoomAtEpoch(
 
   // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
   bindRoomRoles(sync.doc);
+  // 🤝 C3: and the nodes the co-hosts run, each signed by its co-host.
+  bindCoHostNodes(sync.doc);
 
   // 🧱 #66 S1: the floor plan (door placements) rides the doc; re-derive the
   // door anchors from the fresh doc immediately (joiners see slid doors).
@@ -2377,6 +2417,8 @@ async function joinRoomAtEpoch(
       refreshWarmNeighbours();
       // 📌 A board view the node sent before the host's state arrived.
       retryBoardView();
+      // 🤝 C3: a co-host's node, filed now the room's grants are known.
+      refileCoHostNode();
       void networkProvider.refreshRoomCap();
     });
   }
@@ -2501,7 +2543,12 @@ async function joinRoomAtEpoch(
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).
-    subscribeRoomRoles(() => renderCoHostsSection());
+    subscribeRoomRoles(() => {
+      renderCoHostsSection();
+      // 🤝 C3: a grant just landed (or went): file, or take down, our node.
+      coHostHintMemo = null;
+      refileCoHostNode();
+    });
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
@@ -7780,6 +7827,7 @@ function renderCoHostsSection(): void {
         removeCoHostRequest(pub);
       } else if (action === "revoke" && pub) {
         removeCoHost(pub);
+        forgetCoHostNode(pub); // 🤝 C3: its node leaves the passes with it
       }
       renderCoHostsSection();
     });
@@ -7799,7 +7847,7 @@ function renderCoHostsSection(): void {
   const requests = readCoHostRequests();
 
   const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 CO-HOSTS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· room keepers</span></div>
-    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Designation now — node-side serving lands in the next node update.</div>`;
+    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Their nodes keep the room, and every pass names them, so visitors can still load it while the owner's machine is off.</div>`;
 
   const coHostRows = coHosts
     .map(
@@ -8848,6 +8896,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
+  refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
 
@@ -8917,9 +8966,17 @@ function buildOutgoingBootstrap(
     : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
+  // 🤝 C3: the room's co-hosts ride every pass, after our node and the
+  // host's (the pass's first hint), so a visitor's node can load the room
+  // from a co-host's while the owner's machine is off. A pass minted for a
+  // fresh room (roomIdOverride) gets none: the records are signed for the
+  // room they were filed in.
+  const inherited = collectMemberHints(activeBootstrap);
   const allHints = mergeMemberHints(
     localHint ? [localHint] : [],
-    collectMemberHints(activeBootstrap),
+    inherited.slice(0, 1),
+    coHostRouteHints(roomId),
+    inherited.slice(1),
   );
   // #231 P6b: a pass to a PUBLIC room (the welcome room, or one anyone may
   // walk into) carries no contact card — N8 extends to `ck`; a private room's
