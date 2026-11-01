@@ -5,8 +5,9 @@
  * the winner paid out of it onto their rail), and the winner's rail shows
  * the payout only once its chips have landed there, even when the credit
  * reaches the page between its frames or before its player steps up to the
- * table; a roll rewritten by a forfeit plays its new decision, on the pages
- * that saw it before a result. And at an owner-run table, across two pages:
+ * table; a payout a forfeit takes back while its chips are on their way
+ * leaves the rail at the balance; a roll rewritten by a forfeit plays its
+ * new decision, on the pages that saw it before a result. And at an owner-run table, across two pages:
  * a settle that reaches a page out of order still plays there.
  *
  * Built on the kits computedCrapsTable.test.ts uses (computedPageKit,
@@ -240,6 +241,40 @@ describe('💰 the settle on screen at a computed craps table', () => {
     go(pages, at + STEP, at + 10_000);
     for (const p of pages) expect(p.dice.settles).toHaveLength(1);
     tw.unmount();
+    tx.unmount();
+  });
+
+  it('a payout taken back while its chips are on their way (a forfeit holds the roll again): my rail shows my balance, not the payout off it too', async () => {
+    const pages = await room(['A', 'B']);
+    // w first to forfeit roll 1: both seeds throw a 7 (a natural: x's pass
+    // line paid), w's alone a 6 (the point).
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigSplit(pages, 1, 7, w, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const tx = atCraps(x, { stand: 1 });
+    const chipsBefore = x.casino.readChips(x.pid);
+    const at = go(pages, T0 + STEP, T0 + 60_000, () => x.dice.settles.length > 0);
+    expect(at).toBeLessThan(T0 + 60_000);
+    expect(crapsOf(x)).toMatchObject({ phase: 'settled', round: 1, result: 7 });
+    expect(x.casino.readChips(x.pid)).toBe(chipsBefore + 20);
+    expect(railTotal(x.dice.rail())).toBe(chipsBefore);
+    // w's forfeit, the chips still on their way: the roll held again, x's
+    // payout taken back off x's balance.
+    clockOf(w, at + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: foldOf(w).rounds[0].close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    go(pages, at + STEP, at + STEP);
+    expect(crapsOf(x)).toMatchObject({ phase: 'closing', round: 1 });
+    expect(x.casino.readChips(x.pid)).toBe(chipsBefore);
+    expect(railTotal(x.dice.rail())).toBe(chipsBefore);
+    // …and through the hold, a spend of mine still comes off at once.
+    expect(x.casino.spendChips(x.pid, 5)).toBe(true);
+    go(pages, at + 2 * STEP, at + 3 * STEP);
+    expect(crapsOf(x)?.phase).toBe('closing');
+    expect(railTotal(x.dice.rail())).toBe(chipsBefore - 5);
     tx.unmount();
   });
 

@@ -300,8 +300,10 @@ interface TableRuntime {
    *  shown again plays nothing); whether the roll on screen is closed with
    *  its result still to show here (inPlay); the most my rail shows
    *  (railCap, crapsRailCap), kept here, focused or not, with my balance as
-   *  last seen (railSeen: what I spend comes off it at once); and at an
-   *  owner-run table, the incarnation its rolls are of (ownerInc: the table
+   *  last seen (railSeen: what I spend comes off it at once), and the roll
+   *  whose result was on screen at the last frame (resultOn, 0 for none: one
+   *  taken back before its result takes its credit with it, noteTakenBack);
+   *  and at an owner-run table, the incarnation its rolls are of (ownerInc: the table
    *  put back under the same id is a new one, whose rolls start afresh). */
   played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
   decidedTo: number;
@@ -309,6 +311,7 @@ interface TableRuntime {
   inPlay: boolean;
   railCap: number | null;
   railSeen: number;
+  resultOn: number;
   ownerInc: string | null;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
@@ -323,7 +326,7 @@ function runtime(tableId: string): TableRuntime {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
       spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), decidedTo: 0, paid: new Set(),
-      inPlay: false, railCap: null, railSeen: 0, ownerInc: null,
+      inPlay: false, railCap: null, railSeen: 0, resultOn: 0, ownerInc: null,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -678,6 +681,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     h.diceLand(s.dice);
   }
   noteDecided(rt, s);
+  noteTakenBack(rt, s);
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   const kind: TableKind = 'craps-table';
   if (!animating) {
@@ -712,6 +716,16 @@ function noteDecided(rt: TableRuntime, s: CrapsTableState, carried = 0): void {
   rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, carried);
 }
 
+/** 💰 A roll on screen taken back before its result (held again for a
+ *  forfeit, or back to betting): what its result credited me goes with it,
+ *  so my rail holds nothing back for it any more and shows my balance, the
+ *  hold started afresh (holdRail). A drop in my balance then is no spend of
+ *  mine, which would otherwise come off the rail on top. */
+function noteTakenBack(rt: TableRuntime, s: CrapsTableState): void {
+  if (s.phase !== 'settled' && rt.resultOn === s.round) rt.railCap = null;
+  rt.resultOn = s.phase === 'settled' ? s.round : 0;
+}
+
 /** 💰 An owner-run craps table's incarnation (tableIncOf): the table put
  *  back under the same id after a removal is a new one, whose rolls' felts
  *  and how far they are past a result start afresh. Read only off a doc
@@ -731,7 +745,8 @@ function noteOwnerRun(id: string, rt: TableRuntime, s: CrapsTableState | null): 
 /** 💰 The most my rail at a craps table shows, kept every frame whether
  *  the table is focused or not: my balance while no roll is in play here;
  *  while one is, what I had at the last frame before (or when I first saw
- *  it), less anything I've spent since (seeRail). What the roll pays joins
+ *  it, or when a roll was taken back before its result: noteTakenBack),
+ *  less anything I've spent since (seeRail). What the roll pays joins
  *  the rail as its chips land there, even a credit that came between
  *  frames, or before the table was focused. */
 function holdRail(rt: TableRuntime, me: string): void {
@@ -1072,6 +1087,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     rt.flight = null;
   }
   noteDecided(rt, s, k?.round ?? 0);
+  noteTakenBack(rt, s);
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   if (!animating) {
     h.setPuck(s.point);
