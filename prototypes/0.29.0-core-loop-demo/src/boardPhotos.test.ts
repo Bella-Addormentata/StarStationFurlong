@@ -79,6 +79,7 @@ import type { BoardPhoto, BoardScreen } from './boardDoc';
 import {
   MAX_PHOTO_PIXELS,
   PHOTO_AUTO_FETCH_MAX,
+  closePanelPhotos,
   imageSizeOf,
   lookBoardPhotos,
   photoAutoFetch,
@@ -90,6 +91,7 @@ import {
   pressFetch,
   readAtMost,
   resetBoardPhotosForTest,
+  showPanelPhotos,
   type Picture,
   type PictureMaker,
 } from './boardPhotos';
@@ -381,8 +383,9 @@ describe('📷 where a photo is for this viewer', () => {
     expect(lane.fetchedBlind).toEqual([HASH]);
   });
 
-  it('gives the open panel’s photos room ahead of the faces’ (#340 review)', async () => {
-    const reads: string[] = [];
+  /** 120 photos on the room's boards, read on the faces' first look: the
+   *  page holds the most it does (96), and the faces look every second. */
+  const facesFull = async (reads: string[]) => {
     vi.stubGlobal('fetch', async (url: string) => {
       reads.push(url);
       return new Response(jpegHeader(512, 384, 100));
@@ -395,17 +398,71 @@ describe('📷 where a photo is for this viewer', () => {
       for (let i = 0; i < 4; i++) await flush();
     };
     await faces(0);
-    expect(reads).toHaveLength(96); // the faces hold the most a page does
-    // A panel opens on the board whose photos the faces had no room for.
-    const panel = many.slice(96);
+    expect(reads).toHaveLength(96);
+    return { many, faces };
+  };
+
+  it('gives the open panel’s photos room ahead of the faces’, all of them at once (#340, #341 review)', async () => {
+    const reads: string[] = [];
+    const { many, faces } = await facesFull(reads);
+    // A panel opens on a board with 12 photos the faces had no room for, and
+    // 12 held that were looked at longest ago, after the missing ones.
+    const shows = [...many.slice(96, 108), ...many.slice(0, 12)];
+    const panel = {};
     for (let t = 1_000; t <= 5_000; t += 1_000) {
-      panel.forEach((p) => photoLook(p, t, true));
+      showPanelPhotos(panel, shows.map((p) => p.hash));
+      shows.forEach((p) => photoLook(p, t));
       await faces(t);
     }
-    expect(panel.every((p) => photoLook(p, 5_500, true) === 'ready')).toBe(true);
-    // Each photo read once: the faces that gave up their place wait for
-    // room, and take none back from the panel.
+    expect(shows.every((p) => photoLook(p, 5_500) === 'ready')).toBe(true);
+    // Only the 12 missing were read: none of the panel's own made room for
+    // another, and the faces that gave up their place wait for room.
+    expect(reads).toHaveLength(108);
+  });
+
+  it('lets a closed panel’s photos go like any face’s (#341 review)', async () => {
+    const reads: string[] = [];
+    const { many, faces } = await facesFull(reads);
+    // Four boards' panels opened and closed in turn, over every photo held.
+    for (let b = 0; b < 4; b++) {
+      const panel = {};
+      const shows = many.slice(b * 24, b * 24 + 24);
+      showPanelPhotos(panel, shows.map((p) => p.hash));
+      shows.forEach((p) => photoLook(p, 1_000 + b * 100));
+      closePanelPhotos(panel);
+    }
+    // A fifth board's panel gets room at once.
+    const fifth = {};
+    const shows = many.slice(96);
+    showPanelPhotos(fifth, shows.map((p) => p.hash));
+    shows.forEach((p) => photoLook(p, 2_000));
+    await faces(2_000);
+    expect(shows.every((p) => photoLook(p, 2_500) === 'ready')).toBe(true);
     expect(reads).toHaveLength(120);
+    // Closing another panel leaves this one's alone.
+    closePanelPhotos({});
+    expect(shows.every((p) => photoLook(p, 3_000) === 'ready')).toBe(true);
+  });
+
+  it('sends a pressed FETCH 10 s after its WHERE went out, even when WHERE never answers (#341 review)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      lane.whereHeld = true;
+      lane.states.set(HASH, { state: 'none' });
+      photoAutoFetch.setOn(false);
+      const pressed = pressFetch(photo());
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(lane.whereAsks).toHaveLength(1);
+      expect(lane.fetches).toHaveLength(0);
+      expect(photoLook(photo(), performance.now())).toBe('loading');
+      await vi.advanceTimersByTimeAsync(1_500);
+      await pressed;
+      expect(lane.fetchedBlind).toEqual([HASH]); // the provider alone
+      // The press is over: another may ask again.
+      expect(photoLook(photo(), performance.now())).toBe('loading');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps every photo in view without reading them again and again (#340 review)', async () => {

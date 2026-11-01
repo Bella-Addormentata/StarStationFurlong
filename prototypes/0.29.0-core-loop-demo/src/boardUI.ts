@@ -59,12 +59,14 @@ import { NOTE_FILL } from './boardFace';
 import {
   PHOTO_AUTO_FETCH_DAY,
   PHOTO_AUTO_FETCH_MAX,
+  closePanelPhotos,
   photoAutoFetch,
   photoFromShot,
   photoLook,
   photoPicture,
   photoTrouble,
   pressFetch,
+  showPanelPhotos,
 } from './boardPhotos';
 import { formatBytes } from './blobLane';
 import { getContact } from './contacts';
@@ -122,8 +124,7 @@ function waitsWhy(size: number, hash: string): string {
  *  is and the FETCH press, then its caption and who took it when. */
 function photoHtml(n: ShownNote, me: string, big: boolean): string {
   const a = n.attach!;
-  // The panel's look: its photos get room ahead of the faces'.
-  const look = photoLook(a, performance.now(), true);
+  const look = photoLook(a);
   const pic = look === 'ready' ? photoPicture(a.hash) : null;
   const when = new Date(a.takenAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const caption = `<div style="font-size:9.5px; color:${DIM}; margin-top:4px;">📷 ${a.caption ? `${escapeHtml(a.caption)} · ` : ''}taken ${escapeHtml(when)} by ${authorLabel(n, me)}</div>`;
@@ -213,10 +214,17 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   let posting = false;
   let photoSince = 0;
   let photoKey = '';
-  /** Every photo note's look now, which moves them along too (the panel's
-   *  looks: its photos get room ahead of the faces'). */
-  const photoLooks = (): string =>
-    readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author)).map((n) => `${n.id}:${photoLook(n.attach!, performance.now(), true)}`).join(',');
+  /** This panel, to the photo cache: the photos it shows get room ahead of
+   *  the faces', named all at once before any is looked at. */
+  const photoPanel = {};
+  const showingPhotos = (notes: readonly ShownNote[]): void =>
+    showPanelPhotos(photoPanel, notes.flatMap((n) => (n.attach ? [n.attach.hash] : [])));
+  /** Every photo note's look now, which moves them along too. */
+  const photoLooks = (): string => {
+    const notes = readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author));
+    showingPhotos(notes);
+    return notes.map((n) => `${n.id}:${photoLook(n.attach!)}`).join(',');
+  };
 
   const notesHtml = (): string => {
     const me = getIdentityPub();
@@ -224,6 +232,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     const moderator = canModerate();
     const now = Date.now();
     const notes = readBoard(itemId, kind).shown.filter((n) => !isHiddenAuthor(n.author));
+    showingPhotos(notes);
     if (notes.length === 0) {
       const why = !open && !owner
         ? 'The owner’s key hasn’t arrived yet, so notices can’t be checked.'
@@ -580,6 +589,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       for (const url of thumbUrls.values()) URL.revokeObjectURL(url);
       thumbUrls.clear();
       roll = null;
+      closePanelPhotos(photoPanel);
       deps.onEngagedChange?.(false);
       panel?.remove();
       panel = null;

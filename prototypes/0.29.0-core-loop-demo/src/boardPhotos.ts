@@ -127,9 +127,12 @@ const browserMaker: PictureMaker = {
 };
 
 let maker: PictureMaker = browserMaker;
-/** hash → picture, when it was last looked at (the longest ago first), and
- *  when the open panel last showed it. */
-const pictures = new Map<string, { pic: Picture; usedAt: number; panelAt: number }>();
+/** hash → picture and when it was last looked at, the longest ago first. */
+const pictures = new Map<string, { pic: Picture; usedAt: number }>();
+/** The photos the open board panel shows, and which panel: they get room
+ *  ahead of the faces', all of them at once and only while it is open
+ *  (#341 review). */
+let panelShows: { panel: object; hashes: Set<string> } | null = null;
 /** The photos whose FETCH press waits for WHERE before it asks. */
 const pressing = new Set<string>();
 const loading = new Set<string>();
@@ -208,32 +211,44 @@ function dropIdle(now: number): void {
   }
 }
 
-function keep(hash: string, p: Picture, now: number, panel = false): void {
+function keep(hash: string, p: Picture, now: number): void {
   const old = pictures.get(hash);
   if (old && old.pic !== p) maker.drop(old.pic);
   pictures.delete(hash);
-  pictures.set(hash, { pic: p, usedAt: now, panelAt: panel ? now : -Infinity });
+  pictures.set(hash, { pic: p, usedAt: now });
   dropIdle(now);
 }
 
-/** A look at a held picture: kept, as in use (and as the panel's, from it). */
-function touch(hash: string, now: number, panel = false): boolean {
+/** A look at a held picture: kept, as in use. */
+function touch(hash: string, now: number): boolean {
   const e = pictures.get(hash);
   if (!e) return false;
   e.usedAt = Math.max(e.usedAt, now);
-  if (panel) e.panelAt = Math.max(e.panelAt, now);
   pictures.delete(hash);
   pictures.set(hash, e);
   return true;
 }
 
+/** The open board panel's photos, set by the panel before it looks at any
+ *  of them, so none of them makes room by dropping another. */
+export function showPanelPhotos(panel: object, hashes: Iterable<string>): void {
+  panelShows = { panel, hashes: new Set(hashes) };
+}
+
+/** That panel closed: its photos are the faces' like any others. */
+export function closePanelPhotos(panel: object): void {
+  if (panelShows?.panel === panel) panelShows = null;
+}
+
+const onPanel = (hash: string): boolean => panelShows?.hashes.has(hash) ?? false;
+
 /** Room for one of the open panel's photos when every picture held is in
- *  use: the one looked at longest ago that the panel isn't showing goes. A
+ *  use: the one looked at longest ago that the panel doesn't show goes. A
  *  face that loses it waits, as for any photo past the most, and takes no
  *  room back from the panel. */
-function dropForPanel(now: number): boolean {
+function dropForPanel(): boolean {
   for (const [hash, e] of pictures) {
-    if (now - e.panelAt < IN_USE_MS) continue;
+    if (onPanel(hash)) continue;
     pictures.delete(hash);
     maker.drop(e.pic);
     return true;
@@ -277,13 +292,13 @@ export async function readAtMost(res: Response, limit: number): Promise<Uint8Arr
 /** Read a whole photo from this page's node and decode it, once at a time
  *  per photo. A read that fails is tried again after LOAD_RETRY_MS, the
  *  node asked again meanwhile whether it still holds the file. */
-function loadPicture(photo: BoardPhoto, now: number, panel: boolean): void {
+function loadPicture(photo: BoardPhoto, now: number): void {
   const { hash } = photo;
   if (loading.has(hash) || pictures.has(hash) || now - (loadFailed.get(hash) ?? -Infinity) < LOAD_RETRY_MS) return;
   // Room for it first: none while every picture held is in use, unless the
   // open panel shows it and a face's can go.
   dropIdle(now);
-  if (pictures.size + loading.size >= MOST_PICTURES && !(panel && dropForPanel(now))) return;
+  if (pictures.size + loading.size >= MOST_PICTURES && !(onPanel(hash) && dropForPanel())) return;
   const url = blobUrl(hash);
   if (!url) return;
   loading.add(hash);
@@ -293,7 +308,7 @@ function loadPicture(photo: BoardPhoto, now: number, panel: boolean): void {
       if (!res.ok) throw new Error(`node answered ${res.status}`);
       const bytes = await readAtMost(res, Math.min(photo.size, MAX_PHOTO_BYTES));
       if (!bytes || !photoBytesOk(bytes, photo)) throw new Error('not a photo this board shows');
-      keep(hash, await maker.make(new Blob([bytes], { type: photo.mime }), photo.mime), now, panel);
+      keep(hash, await maker.make(new Blob([bytes], { type: photo.mime }), photo.mime), now);
       loadFailed.delete(hash);
     } catch {
       loadFailed.set(hash, now);
@@ -376,10 +391,10 @@ function ask(photo: BoardPhoto): void {
 
 /** Where `photo` is for this viewer now, moving it along: an ask by itself
  *  when the budget allows, and a read once the node holds it. Called by the
- *  board's 1 Hz face push, and by its open panel with `panel` set: the
- *  panel's photos get room ahead of the faces' (#340 review). */
-export function photoLook(photo: BoardPhoto, now = performance.now(), panel = false): PhotoLook {
-  if (touch(photo.hash, now, panel)) return 'ready';
+ *  board's 1 Hz face push and by its open panel (whose photos get room
+ *  ahead of the faces': showPanelPhotos). */
+export function photoLook(photo: BoardPhoto, now = performance.now()): PhotoLook {
+  if (touch(photo.hash, now)) return 'ready';
   if (!blobLaneReady()) return 'no-node';
   const st = blobState(photo.hash, now);
   switch (st.state) {
@@ -390,7 +405,7 @@ export function photoLook(photo: BoardPhoto, now = performance.now(), panel = fa
         refusedWhy.set(photo.hash, 'your node holds a different file under this photo’s name');
         return 'unreachable';
       }
-      loadPicture(photo, now, panel);
+      loadPicture(photo, now);
       // A read that failed waits for its retry, and says so meanwhile.
       return loadFailed.has(photo.hash) && !loading.has(photo.hash) ? 'unreachable' : 'loading';
     case 'failed':
@@ -437,7 +452,9 @@ export async function pressFetch(photo: BoardPhoto): Promise<void> {
 
 /** Wait for a fresh WHERE on `hash`, as an ask by itself does: asked ahead
  *  of the others waiting, again while another ask is out, and for up to
- *  WHERE_WAIT_MS once one naming it has gone out. */
+ *  WHERE_WAIT_MS once one naming it has gone out. The answer is looked for
+ *  every 250 ms, not awaited: one that never comes holds the wait no
+ *  longer (#341 review). */
 async function holdersFor(hash: string): Promise<void> {
   const since = performance.now();
   let sentAt: number | null = null;
@@ -445,10 +462,8 @@ async function holdersFor(hash: string): Promise<void> {
     const now = performance.now();
     if (freshNodeHolders(hash, now) !== null) return;
     if ((sentAt !== null && now - sentAt >= WHERE_WAIT_MS) || now - since >= WHERE_MOST_MS) return;
-    const asking = askWhere(now, hash);
+    void askWhere(now, hash);
     sentAt ??= sentSince(hash, since);
-    await asking;
-    if (freshNodeHolders(hash) !== null) return;
     await new Promise((r) => setTimeout(r, 250));
   }
 }
@@ -507,6 +522,7 @@ export function resetBoardPhotosForTest(m: PictureMaker | null = null): void {
   refusedWhy.clear();
   whereWaits.clear();
   inFlight.clear();
+  panelShows = null;
   photoAutoFetch.reset();
   maker = m ?? browserMaker;
 }
