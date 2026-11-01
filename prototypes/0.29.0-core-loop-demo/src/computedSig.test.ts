@@ -22,7 +22,7 @@ import { signBytes, TableFold } from './computedFold';
 import type { FoldCtx, SlipRec } from './computedFold';
 import { b64url, cachingCheck, ComputedKit, red, TEST_CTX, TestSession, testIdentity } from './computedTestKit';
 import type { TestIdentity } from './computedTestKit';
-import { verifyIdentity, verifyIdentityStrict } from './keypair';
+import { verifyIdentity, verifyIdentityStrict, ysyncSigner } from './keypair';
 
 const unb64url = (s: string): Uint8Array => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
@@ -49,7 +49,9 @@ describe('the pinned verifier', () => {
       expect(verifyIdentityStrict(v.pub, msg, v.sig), `${v.name} strict`).toBe(v.strict);
       expect(ed.verify(unb64url(v.sig), msg, unb64url(v.pub), { zip215: false }), `${v.name} noble zip215:false`).toBe(v.noble);
       expect(ed.verify(unb64url(v.sig), msg, unb64url(v.pub)), `${v.name} noble default`).toBe(v.loose);
-      expect(verifyIdentity(v.pub, msg, v.sig), `${v.name} verifyIdentity`).toBe(v.loose);
+      // The vectors are spelled canonically, so verifyIdentity (the strict point
+      // checks, a forgiving spelling) gives the strict verdict on every one.
+      expect(verifyIdentity(v.pub, msg, v.sig), `${v.name} verifyIdentity`).toBe(v.strict);
     }
   });
 
@@ -61,9 +63,20 @@ describe('the pinned verifier', () => {
     }
     const small = vectors.vectors.find((v) => v.name === 'small-order-key')!;
     for (const msg of [hexToBytes(small.msg), new TextEncoder().encode('cash out everything')]) {
-      expect(verifyIdentity(small.pub, msg, small.sig)).toBe(true); // why the fold can't use verifyIdentity
+      expect(ed.verify(unb64url(small.sig), msg, unb64url(small.pub))).toBe(true); // noble's default takes it
       expect(verifyIdentityStrict(small.pub, msg, small.sig)).toBe(false);
+      expect(verifyIdentity(small.pub, msg, small.sig)).toBe(false);
     }
+  });
+
+  it('gives the room sync\'s envelope check (ysyncSigner().verify) the same point checks', () => {
+    const { verify } = ysyncSigner();
+    for (const v of vectors.vectors) {
+      expect(verify(unb64url(v.pub), hexToBytes(v.msg), unb64url(v.sig)), v.name).toBe(v.strict);
+    }
+    const small = vectors.vectors.find((v) => v.name === 'small-order-key')!;
+    expect(verify(unb64url(small.pub), new TextEncoder().encode('any envelope at all'), unb64url(small.sig))).toBe(false);
+    expect(verify(unb64url(honest.pub), hexToBytes(honest.msg), new Uint8Array(10))).toBe(false); // short junk: false, no throw
   });
 
   it('refuses a key or signature spelled any way but the canonical one', () => {

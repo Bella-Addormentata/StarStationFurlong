@@ -98,10 +98,17 @@ export function signIdentity(bytes: Uint8Array): string {
   return b64urlEncode(ed.sign(bytes, getSeed()));
 }
 
-/** Verify a base64url signature over bytes against a base64url public key. */
+/** Verify a base64url signature over bytes against a base64url public key.
+ *  Refuses what verifyIdentityStrict refuses about the points: a small-order
+ *  public key (noble's `zip215: false`; such a key's "signatures" verify any
+ *  message, so anyone could sign as it) and an identity R (identityR: one
+ *  signature that verifies every message under its key). It still forgives
+ *  the spelling (b64urlDecode reads padded or stray-bit base64 as the same
+ *  bytes); records that hash their spelling use verifyIdentityStrict. */
 export function verifyIdentity(pubB64: string, bytes: Uint8Array, sigB64: string): boolean {
   try {
-    return ed.verify(b64urlDecode(sigB64), bytes, b64urlDecode(pubB64));
+    const sig = b64urlDecode(sigB64);
+    return !identityR(sig) && ed.verify(sig, bytes, b64urlDecode(pubB64), { zip215: false });
   } catch {
     return false;
   }
@@ -152,7 +159,8 @@ function identityR(sig: Uint8Array): boolean {
  * version (package.json), so pages agree. A later fast path (WebCrypto) must
  * make the same byte checks first: it accepts an identity R whose S fits the
  * real k, which noble and this refuse.
- * Any throw is a false. verifyIdentity keeps noble's defaults (zip215: true).
+ * Any throw is a false. verifyIdentity makes the same point checks but
+ * forgives the spelling.
  */
 export function verifyIdentityStrict(pubB64: string, bytes: Uint8Array, sigB64: string): boolean {
   try {
@@ -228,7 +236,8 @@ export function ysyncSigner(): {
     authorPub: () => getPubBytes(),
     sign: (bytes: Uint8Array) => Promise.resolve(ed.sign(bytes, getSeed())),
     verify: (authorBytes: Uint8Array, bytes: Uint8Array, sigBytes: Uint8Array): boolean => {
-      try { return ed.verify(sigBytes, bytes, authorBytes); } catch { return false; }
+      // The same point checks as verifyIdentity: no small-order author key, no identity R.
+      try { return !identityR(sigBytes) && ed.verify(sigBytes, bytes, authorBytes, { zip215: false }); } catch { return false; }
     },
   };
 }
