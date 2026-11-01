@@ -58,7 +58,9 @@ import {
   cabinetView, clockOffset, noteClock, queueDrops, restingView, type CabinetView, type ReplayGeometry, type ScheduledReplay, type TablePose,
 } from "./coinPusherReplay";
 // 🕹️ The arcade cabinet's screen painter (menu, game frames, attract card).
-import { createArcadeScreenPainter } from "./arcadeScreen";
+import { createArcadeScreenPainter, paintStandby } from "./arcadeScreen";
+import { paintSign, signFor } from "./arcadeSigns";
+import { standbyLogo, standbyPicture, whenStandbyArrives } from "./arcadeStandby";
 // 🕹🕹 The double-wide's stations wear Lantern Road's ninjas' colours.
 import { SEAT_COLOURS } from "./lanternRoadPaint";
 import { CASHIER_SCREEN_H, CASHIER_SCREEN_W, paintCashierAttract, paintCashierMenu } from "./cashierScreen";
@@ -9121,13 +9123,13 @@ function buildUprightCabinet(ctx: BuildCtx, spec: UprightSpec) {
 
   // The marquee's lit name and the screen both emulators paint
   // (arcadeMarquee, arcadeScreenSurface: the single cabinet's).
-  const marquee = arcadeMarquee(W - 0.02, 0.155);
+  const marquee = arcadeMarquee(W - 0.02, 0.155, 1024);
   const screenGlow = new THREE.PointLight(0x9fe8ff, 0, 1.6);
   addLight(screenGlow, 0, screenY, -0.40, 0.22);
   const surface = arcadeScreenSurface(spec.players.length === 2 ? "2 PLAYERS" : "1 PLAYER", (i) => {
     screenGlow.userData.targetIntensity = 0.22 * i;
     screenGlow.intensity = 0.22 * i;
-  }, (view) => marquee.show(view.title));
+  }, (view) => marquee.show(view.title, view.game));
 
   // ── Monitor: the tube behind smoked glass in the housing's face ──────────
   const [screen] = placeArcadeMonitorBay(ctx, {
@@ -11858,13 +11860,29 @@ function arcadeScreenSurface(
   texture.generateMipmaps = false;
   texture.colorSpace = THREE.SRGBColorSpace;
   let nesHolds = false;
-  let latest: ArcadeScreenView = { mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER PICKS A GAME", lane: "", blink: false, plays: 0 };
+  let latest: ArcadeScreenView = {
+    mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER PICKS A GAME", lane: "", blink: false, plays: 0, game: "",
+  };
   let latestKey = "";
+  /** The game whose standby picture the card is waiting on, and how to stop. */
+  let waitingFor = "";
+  let stopWaiting: (() => void) | null = null;
   const paintCard = () => {
-    c2d.save();
-    c2d.setTransform(canvas.width / ARCADE_TEX_W, 0, 0, canvas.height / ARCADE_TEX_H, 0, 0);
-    setGlow(paintArcadeScreen(c2d, ARCADE_TEX_W, ARCADE_TEX_H, latest, players));
-    c2d.restore();
+    // 🕹 A bundled game, idle: its own standby screen — title and menu —
+    // with the tally and PRESS START along the bottom (#333), once its
+    // picture is here; the card until then, and for anything else.
+    const picture = latest.mode === "attract" ? standbyPicture(latest.game) : null;
+    if (picture) {
+      paintStandby(c2d, canvas.width, canvas.height, picture, {
+        centre: latest.line, on: latest.blink, left: `PLAYS ${latest.plays}`, right: players,
+      });
+      setGlow(0.85);
+    } else {
+      c2d.save();
+      c2d.setTransform(canvas.width / ARCADE_TEX_W, 0, 0, canvas.height / ARCADE_TEX_H, 0, 0);
+      setGlow(paintArcadeScreen(c2d, ARCADE_TEX_W, ARCADE_TEX_H, latest, players));
+      c2d.restore();
+    }
     texture.needsUpdate = true;
   };
   const screen: ArcadeScreenHandle = {
@@ -11874,6 +11892,13 @@ function arcadeScreenSurface(
       latestKey = key;
       latest = view;
       onView?.(view);
+      if (view.game !== waitingFor) {
+        stopWaiting?.();
+        waitingFor = view.game;
+        stopWaiting = whenStandbyArrives(view.game, () => {
+          if (!nesHolds) paintCard();
+        });
+      }
       if (!nesHolds) paintCard();
     },
   };
@@ -11985,10 +12010,17 @@ function arcadeControls(stations: readonly ArcadeStation[], face: 1 | -1): (pads
 }
 
 /**
- * 🕹 The marquee (#193): the game's name, lit from behind in a box above the
- * screen, like the cabinets of old. Repainted only when the name changes.
+ * 🕹 The marquee (#193): the game's sign, lit from behind in a box above the
+ * screen, like the cabinets of old — dressed for the game on the cabinet
+ * (#333, arcadeSigns.ts): a bundled game's own logo, cut from its standby
+ * picture, on glass in its title screen's colours; the plain amber sign with
+ * the name for anything else. Repainted only when the game changes, and
+ * once more when the game's picture (its logo) arrives.
  */
-function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): { texture: THREE.CanvasTexture; show: (title: string) => void } {
+function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): {
+  texture: THREE.CanvasTexture;
+  show: (title: string, game: string) => void;
+} {
   const canvas = document.createElement("canvas");
   canvas.width = canvasW;
   canvas.height = Math.round((canvasW * planeH) / planeW);
@@ -11996,37 +12028,17 @@ function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): { texture
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   let shown: string | null = null;
-  const show = (title: string) => {
-    if (title === shown) return;
-    shown = title;
-    const W = canvas.width;
-    const H = canvas.height;
-    // Backlit glass: warm at the centre, darker at the ends.
-    const glass = g.createLinearGradient(0, 0, W, 0);
-    glass.addColorStop(0, "#3a1606");
-    glass.addColorStop(0.5, "#ffb84a");
-    glass.addColorStop(1, "#3a1606");
-    g.fillStyle = glass;
-    g.fillRect(0, 0, W, H);
-    g.fillStyle = "rgba(255,240,200,0.25)";
-    g.fillRect(0, H * 0.08, W, H * 0.12);
-    g.strokeStyle = "#d4a84b";
-    g.lineWidth = 6;
-    g.strokeRect(3, 3, W - 6, H - 6);
-    const name = title.length > 22 ? `${title.slice(0, 21)}…` : title;
-    let size = 64;
-    g.font = `900 ${size}px 'SF Mono','Consolas',monospace`;
-    while (size > 24 && g.measureText(name).width > W - 40) {
-      size -= 4;
-      g.font = `900 ${size}px 'SF Mono','Consolas',monospace`;
-    }
-    g.textAlign = "center";
-    g.textBaseline = "middle";
-    g.lineWidth = 5;
-    g.strokeStyle = "#1a0a14";
-    g.strokeText(name, W / 2, H / 2 + 3, W - 30);
-    g.fillStyle = "#fff6e0";
-    g.fillText(name, W / 2, H / 2 + 3, W - 30);
+  let stopWaiting: (() => void) | null = null;
+  const show = (title: string, game: string) => {
+    const logo = standbyLogo(game);
+    const key = `${title}|${game}|${logo ? "logo" : ""}`;
+    if (key === shown) return;
+    shown = key;
+    stopWaiting?.();
+    stopWaiting = null;
+    const sign = signFor(game);
+    if (sign.logo && !logo) stopWaiting = whenStandbyArrives(game, () => show(title, game));
+    paintSign(g, canvas.width, canvas.height, title, sign, logo, game || title);
     texture.needsUpdate = true;
   };
   return { texture, show };
@@ -12247,7 +12259,7 @@ function buildArcadeCabinet(ctx: BuildCtx) {
     glow.userData.targetIntensity = i;
     glow.intensity = i;
   };
-  const surface = arcadeScreenSurface("1 PLAYER", setGlow, (view) => marquee.show(view.title));
+  const surface = arcadeScreenSurface("1 PLAYER", setGlow, (view) => marquee.show(view.title, view.game));
   const [screen] = placeArcadeMonitorBay(ctx, {
     y: 1.25, z: ARCADE_UPPER_FACE_Z, face: 1, w, h: 0.7,
     tubes: [0], tubeY: ARCADE_SCREEN_Y - 1.25, tubeW: ARCADE_TUBE_W, tubeH: ARCADE_TUBE_H, tilt: ARCADE_TUBE_TILT,
@@ -12288,8 +12300,10 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
   place(new THREE.BoxGeometry(w, 0.7, d - 0.25 - bayDepth), m(BODY, 0.6, 0.15), 0, 1.25, -0.11 - bayDepth / 2);
   place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
+  // Side art: a lit cyan stripe on each flank, standing proud of it as on
+  // the single cabinet (#333: flush with the wall, it read as a mistake).
   for (const sx of [-1, 1]) {
-    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 - 0.006), 1.0, 0.05);
+    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 + 0.004), 1.0, 0.05);
   }
   // The control deck: four stations, a stick and two buttons each, and a
   // coin slot each below, lit in the player's colour: the balls and buttons
@@ -12341,7 +12355,7 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   // no bezel between them, the left half of the picture on the left tube and
   // the right half on the right.
   const lines = { value: new THREE.Vector2(...ARCADE_CRT_LOOK.lines) };
-  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title), {
+  const surface = arcadeScreenSurface(`${ARCADE_WIDE_SEATS} PLAYERS`, setGlow, (view) => marquee.show(view.title, view.game), {
     size: ARCADE_WIDE_CANVAS,
     lines,
   });

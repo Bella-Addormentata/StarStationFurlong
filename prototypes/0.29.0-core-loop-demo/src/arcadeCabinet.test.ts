@@ -62,7 +62,7 @@ function screenPlane(group: THREE.Group): THREE.Mesh | null {
 }
 
 const view = (mode: ArcadeScreenView['mode'], blink = false, title = 'PACMAN.ZIP'): ArcadeScreenView =>
-  ({ mode, title, line: mode === 'inplay' ? 'P1 · Alice' : 'INSERT COIN', lane: mode === 'empty' ? '' : 'SOVEREIGN', blink, plays: 3 });
+  ({ mode, title, line: mode === 'inplay' ? 'P1 · Alice' : 'INSERT COIN', lane: mode === 'empty' ? '' : 'SOVEREIGN', blink, plays: 3, game: '' });
 
 describe('the arcade cabinet as built', () => {
   it('keeps every mesh inside its 1×1 footprint', () => {
@@ -278,6 +278,26 @@ describe('the double-wide cabinet as built', () => {
     }
   });
 
+  it('lights its flanks with bars that stand proud of the walls, not flush with them (#333)', () => {
+    const meshes: THREE.Mesh[] = [];
+    buildWide().traverse((obj) => { if (obj instanceof THREE.Mesh) meshes.push(obj); });
+    const size = (mesh: THREE.Mesh) => new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3());
+    const bars = meshes.filter((mesh) => {
+      const v = size(mesh);
+      return Math.abs(v.x - 0.012) < 1e-6 && Math.abs(v.y - 0.9) < 1e-6;
+    });
+    expect(bars).toHaveLength(2);
+    const rest = meshes.filter((mesh) => !bars.includes(mesh)).map((mesh) => new THREE.Box3().setFromObject(mesh));
+    const wallR = Math.max(...rest.map((b) => b.max.x));
+    const wallL = Math.min(...rest.map((b) => b.min.x));
+    const [left, right] = bars.map((b) => new THREE.Box3().setFromObject(b)).sort((a, b) => a.min.x - b.min.x);
+    expect(right!.max.x - wallR).toBeGreaterThan(0.005);
+    expect(wallL - left!.min.x).toBeGreaterThan(0.005);
+    // …still fixed to the wall, not floating off it.
+    expect(right!.min.x).toBeLessThan(wallR);
+    expect(left!.max.x).toBeGreaterThan(wallL);
+  });
+
   it('counts every size as an arcade cabinet', () => {
     expect([...ARCADE_CABINET_KINDS].sort()).toEqual(['arcade-cabinet', 'arcade-cabinet-2p', 'arcade-cabinet-wide']);
   });
@@ -410,4 +430,52 @@ describe('the sticks and buttons, moving with the players (setControls)', () => 
       expect(ARCADE_STICK_THROW).toBeGreaterThan(0.2);
     });
   }
+});
+
+describe("each game's sign (#333)", () => {
+  it('dresses a bundled or own game in its own sign, and anything else in the plain one', async () => {
+    const { ARCADE_SIGNS, DEFAULT_SIGN, signFor } = await import('./arcadeSigns');
+    const { ARCADE_GAMES } = await import('./arcadeLibrary');
+    const { NATIVE_GAMES } = await import('./arcadeNativeGames');
+    for (const game of [...ARCADE_GAMES, ...NATIVE_GAMES]) {
+      expect(ARCADE_SIGNS[game.id], game.id).toBeDefined();
+      expect(signFor(game.id)).toBe(ARCADE_SIGNS[game.id]);
+    }
+    expect(signFor('')).toBe(DEFAULT_SIGN);
+    expect(signFor('pacman.zip')).toBe(DEFAULT_SIGN);
+  });
+
+  it('paints every sign, with its logo or its name', async () => {
+    const { ARCADE_SIGNS, DEFAULT_SIGN, paintSign } = await import('./arcadeSigns');
+    const canvas = fakeCanvas();
+    const g = canvas.getContext() as unknown as CanvasRenderingContext2D;
+    for (const sign of [DEFAULT_SIGN, ...Object.values(ARCADE_SIGNS)]) {
+      fills = 0;
+      expect(() => paintSign(g, 512, 104, 'A GAME', sign, null)).not.toThrow();
+      expect(() => paintSign(g, 1024, 86, 'A GAME', sign, {} as CanvasImageSource)).not.toThrow();
+      expect(fills).toBeGreaterThan(0);
+    }
+  });
+
+  it("repaints the marquee when the cabinet's game changes", () => {
+    const group = build();
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, ID, obj); });
+    const handle = s.arcadeScreens.get(ID)!;
+    const marquee = (() => {
+      let found: THREE.CanvasTexture | null = null;
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh) || obj.userData.arcadeScreen || obj.userData.arcadeControl) return;
+        const map = (obj.material as THREE.MeshBasicMaterial).map;
+        if (map instanceof THREE.CanvasTexture) found = map;
+      });
+      return found!;
+    })();
+    handle.draw({ ...view('attract', true, 'THWAITE'), game: 'thwaite' });
+    const v = marquee.version;
+    handle.draw({ ...view('attract', false, 'THWAITE'), game: 'thwaite' });
+    expect(marquee.version).toBe(v); // a blink isn't a new sign
+    handle.draw({ ...view('attract', false, 'NESERT GOLFING'), game: 'nesert-golfing' });
+    expect(marquee.version).toBeGreaterThan(v);
+  });
 });
