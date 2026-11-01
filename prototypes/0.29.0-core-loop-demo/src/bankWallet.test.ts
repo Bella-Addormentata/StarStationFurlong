@@ -118,5 +118,15 @@ describe('turnSsfWallet', () => {
     const late = await turnSsfWallet('http://127.0.0.1:8080', true, hangs as unknown as typeof fetch, 20);
     expect(late.ok).toBe(false);
     expect((late as { error: string }).error).toContain('did not answer in time');
+    // Headers in time, the body not: still a timeout, not "answered 200".
+    const trickles = async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: () => new Promise((_, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      }),
+    }) as unknown as Response;
+    const slowBody = await turnSsfWallet('http://127.0.0.1:8080', true, trickles as unknown as typeof fetch, 20);
+    expect((slowBody as { error: string }).error).toContain('did not answer in time');
   });
 });

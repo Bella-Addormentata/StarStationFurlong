@@ -5000,6 +5000,10 @@ const BANK_WALLET_SETTLE_MS = 500;
 /** The origin the last fingerprint answered from: where the switch is sent.
  *  Empty until the node has answered once. */
 let localNodeOrigin = "";
+/** Whether the node answered the last fingerprint probe. The Bank shows the
+ *  wallet, and sends the switch, only while it does: the fingerprint kept
+ *  from before is a stopped node's, and so is its origin. */
+let localNodeLive = false;
 
 /** Ask the node to turn its SSF wallet on or off, then read its fingerprint
  *  again so the Bank shows what the node now holds, not what the page hoped. */
@@ -5101,7 +5105,8 @@ function renderBankApp(): void {
       // whatever it says, so focus stays on it through CONFIRM and TURNING ON.
       const btnStyle = (lit: boolean) =>
         `flex-shrink:0; padding:6px 10px; background:rgba(212,168,75,${lit ? "0.25" : "0.10"}); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:#f0c060; font:800 9px 'Courier New', monospace; letter-spacing:1px; cursor:pointer;`;
-      const wv = bankWalletView(localFingerprint, { armed: bankWalletArmed, turning: bankWalletTurning, error: bankWalletError });
+      const liveFp = localNodeLive ? localFingerprint : null;
+      const wv = bankWalletView(liveFp, { armed: bankWalletArmed, turning: bankWalletTurning, error: bankWalletError });
       const b = wv.button;
       const switchHtml = `
         ${wv.text || b ? `<div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
@@ -5110,7 +5115,7 @@ function renderBankApp(): void {
         </div>` : ""}
         ${wv.warning ? `<div style="font-size:9px; color:#ffb300; margin-top:4px; line-height:1.6;">${esc(wv.warning)}</div>` : ""}
         ${wv.error ? `<div role="status" style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">${esc(wv.error)}</div>` : ""}`;
-      const addr = localFingerprint?.chia_address;
+      const addr = liveFp?.chia_address;
       if (!addr || !wv.showsAddress) return switchHtml;
       const roomId = activeBootstrap?.roomId ?? null;
       const st = roomId ? latestFaucetStatus(roomId) : null;
@@ -9076,6 +9081,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     ? { origin: nodeOrigin, cap: fingerprint.blob_cap, irohId: fingerprint.iroh_node_id, torrent: fingerprint.torrent === true }
     : null);
   if (!fingerprint) {
+    // 🏦 The Bank, though, shows only a node that answers: no wallet, no
+    // switch, and nowhere to send one while it is away.
+    if (localNodeLive) {
+      localNodeLive = false;
+      localNodeOrigin = "";
+      bankWalletArmed = false;
+      if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
+    }
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
@@ -9089,10 +9102,12 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // fingerprint: repaint it while open when either changed (a wallet turned
   // on or off here, or by SSF_CHIA_LANE at the node's restart).
   const bankSaw = JSON.stringify([localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  const wasLive = localNodeLive;
   localFingerprint = fingerprint;
   localNodeOrigin = nodeOrigin;
+  localNodeLive = true;
   if (
-    bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null]) &&
+    (!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
     document.getElementById("phone-app-bank")?.classList.contains("active")
   ) {
     renderBankApp();

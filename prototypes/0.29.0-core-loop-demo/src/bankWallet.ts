@@ -146,7 +146,10 @@ export async function turnSsfWallet(
     let body: unknown = null;
     try {
       body = await res.json();
-    } catch {
+    } catch (e) {
+      // The deadline can land while the body is read: that is a timeout,
+      // worded below, not an answer.
+      if (ctl.signal.aborted) throw e;
       // not JSON: worded from the status below
     }
     const r = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
