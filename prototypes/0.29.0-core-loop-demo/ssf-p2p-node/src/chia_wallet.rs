@@ -6,9 +6,10 @@
 //! secret key minted from it, and the `txch1…` testnet11 receive address printed
 //! at startup for faucet funding.
 //!
-//! Runtime is gated by `SSF_CHIA_LANE=1` at the CALLER (main.rs): a build that
-//! HAS the feature stays silent, and keeps no seed file, unless the operator
-//! opts into publishing. The per-room `cap` plumbing that used to live here is
+//! Runtime is gated at the CALLER (main.rs, by chia_wallet_switch.rs): a build
+//! that HAS the feature keeps no seed file until the player turns the SSF
+//! wallet on in the SpacePhone's Bank (or the operator starts the node with
+//! `SSF_CHIA_LANE=1`). The per-room `cap` plumbing that used to live here is
 //! read-side since D3 and moved to `chia_rooms`.
 //!
 //! Every chia-wallet-sdk 0.34 symbol/path/signature below was source-verified
@@ -17,7 +18,9 @@
 //! chia-puzzle-types 0.36.1, chia-protocol 0.36.1, chia-sdk-utils 0.34.
 #![cfg(feature = "chia-publish")]
 
-use std::path::Path;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -50,42 +53,100 @@ const SEED_LEN: usize = 32;
 /// Mirrors the iroh key convention (`iroh_node_id.key`, a bare CWD-relative
 /// path — see `load_or_create_secret_key` in main.rs).
 pub fn load_or_mint_bls_key(path: &Path) -> Result<SecretKey> {
-    let seed: [u8; SEED_LEN] = if path.exists() {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading chia identity seed {}", path.display()))?;
-        // Refuse to silently re-mint over a wrong-length file — that would change
-        // the node's on-chain identity and orphan any coins already funded to it.
-        bytes.as_slice().try_into().map_err(|_| {
-            anyhow!(
-                "chia identity seed {} is {} bytes, expected {} — refusing to \
-                 overwrite a corrupt identity file; move it aside to re-mint",
-                path.display(),
-                bytes.len(),
-                SEED_LEN,
-            )
-        })?
-    } else {
-        // First run: mint a fresh seed from the OS CSPRNG (the same `OsRng` the
-        // lane's `seal` nonce uses at chia_lane.rs:119) and persist it beside the
-        // node data.
-        let mut fresh = [0u8; SEED_LEN];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fresh);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating chia identity dir {}", parent.display()))?;
-            }
-        }
-        std::fs::write(path, fresh)
-            .with_context(|| format!("writing chia identity seed {}", path.display()))?;
-        // Best-effort lock-down of the secret file (no-op on Windows).
-        restrict_permissions(path);
-        fresh
-    };
-
+    // `try_exists`, not `exists`: a seed that is there but cannot be looked at
+    // (a permission error) is reported, never minted over.
+    let present = path
+        .try_exists()
+        .with_context(|| format!("looking for chia identity seed {}", path.display()))?;
+    let seed = if present { read_seed(path)? } else { mint_seed(path)? };
     // `from_seed` takes `&[u8]` and asserts len >= 32 (panics if shorter);
     // SEED_LEN guarantees the precondition. Key != seed bytes (EIP-2333).
     Ok(SecretKey::from_seed(&seed))
+}
+
+fn read_seed(path: &Path) -> Result<[u8; SEED_LEN]> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading chia identity seed {}", path.display()))?;
+    // Refuse to silently re-mint over a wrong-length file — that would change
+    // the node's on-chain identity and orphan any coins already funded to it.
+    bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "chia identity seed {} is {} bytes, expected {} — refusing to \
+             overwrite a corrupt identity file; move it aside to re-mint",
+            path.display(),
+            bytes.len(),
+            SEED_LEN,
+        )
+    })
+}
+
+/// First run: mint a fresh seed from the OS CSPRNG (the same `OsRng` the
+/// lane's `seal` nonce uses) and persist it so that it is never torn and never
+/// minted twice. Since the SpacePhone's Bank can turn the wallet on at any
+/// moment of a run (chia_wallet_switch.rs), not only at startup, the seed may
+/// be written while the app is about to stop the node, or while a second tap
+/// asks for the same thing.
+///
+/// The bytes go to a temporary file first (created new, owner-only on Unix,
+/// synced), which is then hard-linked to the seed's name. A link never
+/// replaces an existing file: when two minters race, the second finds the
+/// first one's seed and loads that, so nobody holds a key whose seed is gone
+/// (its address shown, funded, and orphaned at the next start). A filesystem
+/// without hard links gets the seed created in place, still never over an
+/// existing one.
+fn mint_seed(path: &Path) -> Result<[u8; SEED_LEN]> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut fresh = [0u8; SEED_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fresh);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating chia identity dir {}", dir.display()))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "seed".to_string());
+    let tmp = dir.join(format!(".{name}.{}-{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    write_new(&tmp, &fresh).with_context(|| format!("writing chia identity seed {}", tmp.display()))?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
+        // Another minter's seed got there first: it is the identity.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return read_seed(path),
+        Err(_) => match write_new(path, &fresh) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => return read_seed(path),
+            Err(e) => return Err(e).with_context(|| format!("writing chia identity seed {}", path.display())),
+        },
+    }
+    // The new name is directory metadata: sync it so a power loss right after
+    // cannot lose the seed of a wallet whose address was just shown. Windows
+    // has no directory handle to sync; NTFS journals the link.
+    #[cfg(unix)]
+    let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
+    // Best-effort lock-down of the secret file (no-op on Windows).
+    restrict_permissions(path);
+    Ok(fresh)
+}
+
+/// Create `at` (never over an existing file), write `bytes` and sync them; a
+/// file this call created and could not fill is removed again, so no short
+/// seed is left for the next start to refuse.
+fn write_new(at: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(at)?;
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    if written.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(at);
+    }
+    written
 }
 
 /// The `txch1…` standard-puzzle receive address for this key on testnet11.
@@ -120,8 +181,9 @@ pub fn testnet_address_to_puzzle_hash(address: &str) -> Result<Bytes32> {
         .map_err(|e| anyhow!("address is not a testnet ({TESTNET_PREFIX}) address: {e:?}"))
 }
 
-/// Startup line (the caller gates it on `SSF_CHIA_LANE=1`): print the receive
-/// address so the operator can fund it at the testnet11 faucet. TXCH only.
+/// Printed when the wallet loads (at startup, or when the Bank turns it on):
+/// the receive address, so the operator can fund it at a testnet11 faucet.
+/// TXCH only.
 pub fn log_receive_address(sk: &SecretKey) {
     let addr = testnet_address(sk);
     println!(
@@ -170,5 +232,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ssf-chia-seed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 🏦 Two taps in the Bank, or two tabs, may ask for the wallet at once:
+    /// every minter ends up with the one seed on disk, never a key of its own
+    /// whose seed another minter's write replaced.
+    #[test]
+    fn minters_racing_for_one_seed_all_load_the_seed_on_disk() {
+        let dir = fresh_dir("race");
+        let path = dir.join("chia_identity.seed");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let keys: Vec<[u8; 48]> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    load_or_mint_bls_key(&path).unwrap().public_key().to_bytes()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let on_disk = load_or_mint_bls_key(&path).unwrap().public_key().to_bytes();
+        assert!(keys.iter().all(|k| *k == on_disk), "every minter holds the seed that stayed");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("chia_identity.seed")], "no temporary file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the seed is owner-only from the moment it exists");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seed_of_the_wrong_length_is_refused_and_left_alone() {
+        let dir = fresh_dir("short");
+        let path = dir.join("chia_identity.seed");
+        std::fs::write(&path, [7u8; 5]).unwrap();
+        let err = format!("{:#}", load_or_mint_bls_key(&path).unwrap_err());
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 5], "the file is left for recovery");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

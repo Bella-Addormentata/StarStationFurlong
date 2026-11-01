@@ -384,7 +384,8 @@ jobs:
         shell: bash
         run: |
           # One node binary (#231 D3): chain reads are in the default build and
-          # publishing is compiled in too, behind the SSF_CHIA_LANE=1 runtime toggle.
+          # publishing is compiled in too, behind the SSF wallet switch (the
+          # SpacePhone's Bank turns it on; SSF_CHIA_LANE=1 or 0 overrides it).
           # 🧲 The TV's torrent lane too (torrent_lane.rs): it opens no socket
           # until the remote's holder presses START on a pasted magnet.
           cargo build --release --features chia-publish,torrent --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
@@ -432,7 +433,8 @@ jobs:
   # This standalone asset remains for headless/always-on node operators
   # (reachable members, future beacons) and for patching older installs.
   # Since #231 D3 it is ONE binary: chain reads on by default, publishing
-  # compiled in behind SSF_CHIA_LANE=1 (the separate `ssf-p2p-node-chia.exe`
+  # compiled in behind the SSF wallet switch (the Bank, or SSF_CHIA_LANE=1
+  # for a headless node; the separate `ssf-p2p-node-chia.exe`
   # opt-in asset is retired).
   # Independent job: if it fails, the installers above are unaffected.
   publish-p2p-node:
@@ -459,7 +461,8 @@ jobs:
         run: |
           NODE="$RELEASE_FRONTEND/ssf-p2p-node"
           # The one node binary (#231 D3): chain reads in the default feature set,
-          # publishing compiled in behind the SSF_CHIA_LANE=1 runtime toggle. CI is
+          # publishing compiled in behind the SSF wallet switch (the Bank, or
+          # SSF_CHIA_LANE=1 for a headless node). CI is
           # MSVC, so the Windows-GNU iroh-relay cdylib export-ordinal wall does NOT
           # apply here and no special linker flag is needed (that flag is a
           # local-GNU-only workaround).

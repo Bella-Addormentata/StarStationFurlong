@@ -3,6 +3,8 @@ rooms/
 iroh_node_id.key
 chia_identity.seed
 wallet_lease.json
+# 🏦 The SSF wallet switch the Bank remembers (chia_wallet_switch.rs)
+chia_wallet.json
 target/
 blob-cache/
 torrent-cache/
