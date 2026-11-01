@@ -155,16 +155,22 @@ import {
   computedIncFor,
   computedIncOf,
   computedLiveTables,
+  computedRecoveries,
+  computedRestorePending,
+  computedRecoveryOn,
   computedRoomBytes,
   computedSeenAt,
   computedSessionForWrite,
   computedSettled,
+  computedSlipDoubted,
   computedSwitchLost,
+  computedTablePids,
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
   delegationHeld,
   fairSettingSeq,
   finalizeComputed,
+  giveUpComputed,
   holdsDeed,
   houseOnline,
   houseSetUp,
@@ -182,6 +188,8 @@ import {
   readSeat,
   readSeats,
   readTableState,
+  reopenComputedSession,
+  restoreComputedCheckpoint,
   transactCasino,
   writeCheckpointAndTrim,
   writeComputedGone,
@@ -191,14 +199,14 @@ import {
   writeFairSetting,
   writeOwnerRunChosen,
 } from './casinoDoc';
-import type { EndedComputed } from './casinoDoc';
+import type { ComputedRecovery, EndedComputed, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
-  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, parseKey,
+  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, MAX_TABLE_PIDS, parseKey,
   recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
 } from './computedFold';
 import type {
-  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, FoldCtx, FoldResult, ForfeitRec, GameName, RecKind,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, Duty, FoldCtx, FoldResult, ForfeitRec, GameName, RecKind,
   RevealRec, RoundView, SignedKind, SlipInfo,
 } from './computedFold';
 import {
@@ -277,6 +285,34 @@ export const COMPACT_FALLBACK_MS = 60_000;
  *  page (awake, its doc whole and checked), is ended as its removal would
  *  have ended it (awayDuty). */
 export const AWAY_MS = 60_000;
+/** 🩹 A rewound or jumped checkpoint is put back this long after this page
+ *  first saw it so (a deleted one, or junk, at once), in turn; a deleted
+ *  session is opened again this long after, in turn; and the rounds of a
+ *  session deleted for this long are given up (recoverDuty). */
+export const RESTORE_WAIT_MS = 5_000;
+export const OPEN_WAIT_MS = 5_000;
+export const GIVE_UP_MS = 60_000;
+/** A page whose key isn't among an incarnation's (ComputedRecovery pubs)
+ *  waits this much more for its turn at a restore or a reopen; and no page
+ *  waits more than RECOVERY_PLACES places (restores of one head write the
+ *  same bytes, so pages writing at once cost the room only bandwidth). So a
+ *  reopen comes well inside GIVE_UP_MS, whoever is listed. */
+export const OUTSIDER_WAIT_MS = 15_000;
+export const RECOVERY_PLACES = 8;
+/** A put-back of a deleted or junk checkpoint waits this long after this
+ *  page's last restore of it: a peer writing junk on every tick costs the
+ *  room a checkpoint a second, not five. */
+export const JUNK_GAP_MS = 1_000;
+/** 🚩 A page whose restores of an incarnation's checkpoint are written over
+ *  CONTESTED_COUNT times in a row by values that put a restore in motion
+ *  again, with no CONTESTED_CALM_MS between them, says so on its ⚙ card
+ *  until that long passes with none. It never stops restoring: no honest
+ *  page writes a rewind or a jump over a restore for long (one that took a
+ *  jump as its head drops it once the head it jumped over is back:
+ *  casinoDoc noteCounted), so what keeps writing them over is a cheat, and
+ *  a page that stopped would leave the table to it. */
+export const CONTESTED_COUNT = 3;
+export const CONTESTED_CALM_MS = 60_000;
 
 /** A round a forfeit decided shows its result this long after the grace on
  *  this page ran out: every page has seen the seeds it was going to see. */
@@ -479,6 +515,12 @@ interface TableState {
    *  how many in the nets, and at craps whether the table it hands on
    *  differs (its riding bets, point or dice's hands). */
   cpDiff: { sid: string; chips: number; nets: number; carry: boolean } | null;
+  /** 🩹 While the table counts a checkpoint that puts a restore in motion
+   *  (noteResult): the head's session, the fold of it, and the keys of what
+   *  this page had written into it; and the session the table last moved to
+   *  meanwhile, with the keys this page held then (what it wrote since went
+   *  into that session). */
+  forged: { sid: string; res: FoldResult; mine: Set<string>; on: string; since: Set<string> } | null;
   scan: Scan | null;
   view: ViewEntry | null;
   /** The phase listeners were last told of, for one fold result. */
@@ -632,7 +674,7 @@ function newTable(t: string, inc: string): TableState {
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
-    lastD: null, lastRes: null, cpDiff: null, scan: null, view: null, told: null, check: null, checks: new Map(),
+    lastD: null, lastRes: null, cpDiff: null, forged: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
@@ -674,62 +716,37 @@ function lastDecided(res: FoldResult): RoundView | null {
 /** Keep what the fold said that a trim takes away: the last decided round
  *  (the felt shows it through the trim), and, when the session moves on, by
  *  how much the checkpoint differs from what this page had folded; what
- *  this page kept of rounds the checkpoint covers goes. */
+ *  this page kept of rounds the checkpoint covers goes.
+ *
+ *  🩹 A checkpoint that puts a restore in motion (a peer's rewind or jump,
+ *  casinoDoc computedRestorePending) is counted as every build counts it,
+ *  but is no trim here: what this page wrote and witnessed of the head's
+ *  session stays (`forged`), for when the head is back, or for putting it
+ *  back should that session go. The head back, what it wrote meanwhile
+ *  goes; the table moved on from it instead (an honest trim that came in
+ *  meanwhile), the move is the head's session's. (Which slips this page's
+ *  closes leave out after such a move: casinoDoc noteDoubted.) */
 function noteResult(st: TableState, res: FoldResult): void {
   const was = st.lastRes;
   if (was === res) return;
-  if (was && was.base.sid !== res.base.sid) {
-    const d = checkpointDiff(was, res);
-    st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n };
-    const u = res.base.u;
-    for (const key of [...st.seen.keys()]) if ((parseKey(key)?.r ?? 0) <= u) st.seen.delete(key);
-    for (const [id, e] of [...st.decided]) if (e.r < u) st.decided.delete(id);
-    for (const [h, e] of [...st.opened]) if (e.r <= u) st.opened.delete(h);
-    if (st.pending && st.pending.r <= u) st.pending = null;
-    st.missingAt.clear();
-    st.seedOutAt = null;
-    st.askedFor = null;
-    // What a checkpoint covers is final, and what the next session doesn't
-    // hold of the rounds it saw past it is void (below): no copy of any of
-    // it goes into the next session, nor is a stand-down timed from it.
-    if (st.witness.size > 0) {
-      st.witness.clear();
-      st.witnessVer += 1;
+  const moved = was !== null && was.base.sid !== res.base.sid;
+  if (forgedStands(st)) {
+    if (moved) {
+      const keys = new Set(st.mine.keys());
+      st.forged ??= { sid: was!.base.sid, res: was!, mine: keys, on: res.base.sid, since: keys };
+      st.forged.on = res.base.sid;
+      st.forged.since = keys;
     }
-    // Of what this page wrote, only its felt for the round after the
-    // checkpoint goes on, and only if this page never saw that round closed
-    // or the session holds it (the trim's copy): anything else is of a round
-    // the checkpoint covers, or of one this page saw played past it that the
-    // room didn't keep (the other side of a split, or a trim that hadn't
-    // heard of it: void, its stakes back), and put back it would only be
-    // played again. Closed: on the chain as this page last read it, or
-    // decided on it at any time since the last checkpoint (playedTo) — a
-    // peer's delete may have taken the round off the chain before the trim
-    // came, and its seeds are out all the same.
-    const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
-    const ses = computedSessionForWrite(st.t);
-    letGo(st, (m, key) => m.r === u + 1 && (m.r > lastClosed || ses?.has(key) === true));
-    // So too this page's window and fling: kept for the round after the
-    // checkpoint if this page never saw it closed, else of a round the room
-    // may not have kept, whose number the chain plays again. Kept, the
-    // window would end betting on that round at once, and the fling would
-    // close it at W with no fling offered its shooter.
-    if (st.window && (st.window.r !== u + 1 || st.window.r <= lastClosed)) st.window = null;
-    if (st.flung && (st.flung.r !== u + 1 || st.flung.r <= lastClosed)) st.flung = null;
-    // The round the checkpoint kept, as this page last read it, if it did,
-    // and its verdict: what the felt and the card show through the trim,
-    // even once this page decided a round past it that the room didn't keep.
-    const kept = was.rounds.find((v) => v.decided !== null && v.r === u && v.close === res.base.l);
-    if (kept) st.lastD = kept;
-    const check = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
-    st.checks.clear();
-    if (check) st.checks.set(res.base.l!, check);
+  } else if (st.forged) {
+    endForged(st, res);
+  } else if (moved) {
+    movedOn(st, was!, res);
   }
   const D = lastDecided(res);
   if (D) st.lastD = D;
   st.lastRes = res;
-  noteReplaced(st, res, was !== null && was.base.sid !== res.base.sid);
-  noteChanged(st, res, was !== null && was.base.sid !== res.base.sid);
+  noteReplaced(st, res, moved);
+  noteChanged(st, res, moved);
   // Every commitment this page has seen a reveal open stays burned for it,
   // the reveal gone or not (a peer's delete, a trim): its seed is out.
   let fresh: Set<string> | null = null;
@@ -745,6 +762,84 @@ function noteResult(st: TableState, res: FoldResult): void {
       }
     }
   }
+}
+
+/** Whether the checkpoint table st counts puts a restore in motion. */
+function forgedStands(st: TableState): boolean {
+  return computedRestorePending(st.t, st.inc);
+}
+
+/** 🩹 The forged checkpoint gone: the head back, what this page wrote
+ *  meanwhile goes (its seeds kept: the same forged checkpoint may be
+ *  written again, and a close of that session then freezes its slips);
+ *  else the table moved on from the head's session. What this page wrote
+ *  since into the session that now stands goes on. */
+function endForged(st: TableState, res: FoldResult): void {
+  const f = st.forged!;
+  st.forged = null;
+  if (res.base.sid === f.sid) {
+    letGo(st, (_m, key) => f.mine.has(key), () => false);
+    return;
+  }
+  const since = res.base.sid === f.on ? new Set([...st.mine.keys()].filter((key) => !f.since.has(key))) : null;
+  movedOn(st, f.res, res, since);
+}
+
+/** The session moved on from `was`'s to `res`'s (a trim): by how much the
+ *  checkpoint differs from what this page had folded, and what this page
+ *  kept of the rounds it covers goes (noteResult); but for `since`, what it
+ *  wrote into `res`'s session since (endForged). */
+function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null): void {
+  const d = checkpointDiff(was, res);
+  st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n };
+  const u = res.base.u;
+  for (const key of [...st.seen.keys()]) if ((parseKey(key)?.r ?? 0) <= u) st.seen.delete(key);
+  for (const [id, e] of [...st.decided]) if (e.r < u) st.decided.delete(id);
+  for (const [h, e] of [...st.opened]) if (e.r <= u) st.opened.delete(h);
+  if (st.pending && st.pending.r <= u) st.pending = null;
+  st.missingAt.clear();
+  st.seedOutAt = null;
+  st.askedFor = null;
+  // What a checkpoint covers is final, and what the next session doesn't
+  // hold of the rounds it saw past it is void (below): no copy of any of
+  // it goes into the next session, nor is a stand-down timed from it.
+  if (st.witness.size > 0) {
+    st.witness.clear();
+    st.witnessVer += 1;
+  }
+  // Of what this page wrote, only its felt for the round after the
+  // checkpoint goes on, and only if this page never saw that round closed
+  // or the session holds it (the trim's copy): anything else is of a round
+  // the checkpoint covers, or of one this page saw played past it that the
+  // room didn't keep (the other side of a split, or a trim that hadn't
+  // heard of it: void, its stakes back), and put back it would only be
+  // played again. Closed: on the chain as this page last read it, or
+  // decided on it at any time since the last checkpoint (playedTo) — a
+  // peer's delete may have taken the round off the chain before the trim
+  // came, and its seeds are out all the same.
+  //
+  // (Their seeds go only for the rounds the checkpoint covers: the session
+  // moved from may come back, the lower of two rival trims restored over
+  // by the page that counted the higher, and a close of it then freezes
+  // them. The seed store holds 256. An earlier build forgot them all.)
+  const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
+  const ses = computedSessionForWrite(st.t);
+  letGo(st, (m, key) => since?.has(key) === true || (m.r === u + 1 && (m.r > lastClosed || ses?.has(key) === true)), (r) => !computedRecoveryOn() || r <= u);
+  // So too this page's window and fling: kept for the round after the
+  // checkpoint if this page never saw it closed, else of a round the room
+  // may not have kept, whose number the chain plays again. Kept, the
+  // window would end betting on that round at once, and the fling would
+  // close it at W with no fling offered its shooter.
+  if (st.window && (st.window.r !== u + 1 || st.window.r <= lastClosed)) st.window = null;
+  if (st.flung && (st.flung.r !== u + 1 || st.flung.r <= lastClosed)) st.flung = null;
+  // The round the checkpoint kept, as this page last read it, if it did,
+  // and its verdict: what the felt and the card show through the trim,
+  // even once this page decided a round past it that the room didn't keep.
+  const kept = was.rounds.find((v) => v.decided !== null && v.r === u && v.close === res.base.l);
+  if (kept) st.lastD = kept;
+  const check = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
+  st.checks.clear();
+  if (check) st.checks.set(res.base.l!, check);
 }
 
 /** 🎲 Note an earlier roll on the chain that came to something else since
@@ -866,19 +961,21 @@ function carryDiff(a: CrapsCarry, b: CrapsCarry): bigint {
 }
 
 /** Let go of what this page wrote that `keep` doesn't keep, and of the seeds
- *  behind those slips but a kept one's (a slip's versions share one): nothing
- *  will reveal them now, and the seed store holds 256. */
-function letGo(st: TableState, keep: (m: Mine, key: string) => boolean): void {
+ *  behind those slips but a kept one's (a slip's versions share one) of the
+ *  rounds `forget` gives up: nothing will reveal them now, and the seed
+ *  store holds 256. */
+function letGo(st: TableState, keep: (m: Mine, key: string) => boolean, forget: (r: number) => boolean = () => true): void {
   const me = getPlayerId();
   const gone = new Map<string, number>();
   for (const [key, m] of [...st.mine]) {
     if (keep(m, key)) continue;
     st.mine.delete(key);
-    if (m.kind === 's') gone.set((m.rec as AnySlipRec).c, m.r);
+    if (m.kind === 's' && forget(m.r)) gone.set((m.rec as AnySlipRec).c, m.r);
   }
   for (const m of st.mine.values()) if (m.kind === 's') gone.delete((m.rec as AnySlipRec).c);
   for (const [c, r] of gone) forgetSeed(c, seedCtx(st, r, me));
 }
+
 
 function clampSafe(n: bigint): number {
   const max = BigInt(Number.MAX_SAFE_INTEGER);
@@ -998,11 +1095,23 @@ function countedBy(round: RoundView, times: ReadonlyMap<string, number>, until: 
 
 /** This page's place for a duty among `pubs` (deduplicated), by dutyRank:
  *  the number of pubs when it isn't among them. */
-function placeOf(duty: 'close' | 'forfeit' | 'abandon' | 'trim', ctx: FoldCtx, r: number, pubs: Iterable<string>, pub: string): number {
-  const ranked = [...new Set(pubs)].map((k) => [dutyRank(duty, ctx, r, k), k] as const).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+function placeOf(duty: Duty, ctx: FoldCtx, r: number, pubs: Iterable<string>, pub: string, memo?: Map<string, string>): number {
+  const rank = (k: string): string => {
+    if (!memo) return dutyRank(duty, ctx, r, k);
+    const key = `${duty}|${ctx.room}|${ctx.t}|${ctx.inc}|${r}|${k}`;
+    let v = memo.get(key);
+    if (v === undefined) {
+      if (memo.size >= RANKS_KEPT) memo.clear();
+      memo.set(key, v = dutyRank(duty, ctx, r, k));
+    }
+    return v;
+  };
+  const ranked = [...new Set(pubs)].map((k) => [rank(k), k] as const).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   const i = ranked.findIndex(([, k]) => k === pub);
   return i < 0 ? ranked.length : i;
 }
+
+const RANKS_KEPT = 16_384;
 
 /** The pubs that signed a round's present frozen slips. */
 function frozenPubs(sc: Scan, round: RoundView): string[] {
@@ -1947,8 +2056,10 @@ function refusal(res: FoldResult, me: string, felt: readonly RouletteBet[], hold
 
 /** …and at craps, a change the table rules don't allow now ('rules'), or
  *  one built before the roll before changed ('changed': the felt it was
- *  built on is gone, so nothing of it is written). */
-export type ComputedSlipWrite = 'ok' | 'reconnecting' | 'closed' | 'full' | 'chips' | 'rules' | 'changed';
+ *  built on is gone, so nothing of it is written); and chips from a
+ *  newcomer at a table holding MAX_TABLE_PIDS players ('crowded': no close
+ *  freezes them, until the table is switched off and on). */
+export type ComputedSlipWrite = 'ok' | 'reconnecting' | 'closed' | 'full' | 'chips' | 'rules' | 'changed' | 'crowded';
 
 /**
  * Put this page's player's whole felt down on computed table `t`'s open
@@ -1978,6 +2089,7 @@ export function writeComputedSlip(t: string, felt: readonly RouletteBet[], now =
   if (!computedSessionForWrite(t)) return 'reconnecting';
   const me = getPlayerId();
   const cur = res.felts.get(me);
+  if (clean.length > 0 && crowdedOut(t, me)) return 'crowded';
   // A place at a full table is a written felt with chips on it: a held one
   // isn't on the table yet (the flush asks again).
   const refused = refusal(res, me, clean, (cur?.rec.b.length ?? 0) > 0);
@@ -2054,6 +2166,7 @@ export function writeComputedCrapsSlip(t: string, perChip: readonly CrapsBet[], 
   if (basis !== basisOf(carry, me)) return 'changed';
   if (!changeOk(own(carry.w, me), clean, carry.p === 0 ? null : carry.p)) return 'rules';
   if (!computedSessionForWrite(t)) return 'reconnecting';
+  if (feltSum(clean) > 0 && own(carry.w, me).length === 0 && crowdedOut(t, me)) return 'crowded';
   const refused = crapsRefusal(res, me, clean);
   if (refused) return refused;
   if (!slipDue(st, o, e.view.phaseDeadline, now)) {
@@ -2114,6 +2227,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   // were passed (a removed one isn't), are compacted.
   awayDuty(inRoom, now);
   compactDuty(getIdentityPub(), now);
+  recoverDuty(getIdentityPub(), now);
   houseDuty(now);
 }
 
@@ -2192,9 +2306,18 @@ function tickTable(st: TableState, now: number): void {
   revealDuty(st, me, now);
   noteMissing(st, now);
   if (!casinoWhole(st.t) || !tablesAwake(now) || !computedSettled(st.t)) return;
+  // 🩹 While a peer's rewind or jump stands, in its restore's wait, nothing
+  // of the head's session goes into the session it opens, nor does a trim
+  // build on it, nor does what this page saw played of the head's session
+  // give way to the forged one's (noteChain: put back over a deleted
+  // session, the head's rounds are held until they come back); the rest
+  // plays on, as on every build (noteResult). (The trigger gone since the
+  // fold last moved can't be: the checkpoint is read whole on every change,
+  // a new fold result, which noteResult (tableOf, every frame) ends it on.)
+  const forged = st.forged !== null;
   // (First: what a round rests on is kept before any duty reads it lost.)
-  noteChain(st, now);
-  noteWitness(st, me, now);
+  if (!forged) noteChain(st, now);
+  if (!forged) noteWitness(st, me, now);
   flushDuty(st, me, now);
   rideDuty(st, me, now);
   recommitDuty(st, me, now);
@@ -2204,6 +2327,7 @@ function tickTable(st: TableState, now: number): void {
   forfeitDuty(st, me, pub, now);
   answerDuty(st, me, pub, now);
   abandonDuty(st, me, pub, now);
+  if (forged) return;
   reputDuty(st, me, now);
   witnessDuty(st, pub, now);
   // (The incarnation is live, and the table among those passed: tableOf.)
@@ -2624,6 +2748,9 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const own = res.felts.get(me);
   if (!own || own.rec.b.length === 0 || burnedCommit(st, res, own.rec.c)) return;
   if (res.openCloses.some((c) => c.state !== 'invalid')) return;
+  // (A table holding MAX_TABLE_PIDS players freezes no newcomer: its next
+  // checkpoint couldn't carry them all. This page's own player either.)
+  if (crowdedOut(st.t, me)) return;
   const sc = scanOf(st, res);
   if (signedIn<CloseRec>(st, sc, 'close', asClose, sc.closes, o, pub, (c) => c.q === res.parent)) return;
   const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
@@ -2635,7 +2762,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   // (Seen just now, as this tick noted it: noteSeedOut.)
   if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
   const others = (craps ? [...res.felts.values()].filter((s) => crapsFreezable(res.carry as CrapsCarry, s)) : staked)
-    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c))
+    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c) && !crowdedOut(st.t, s.rec.p) && !computedSlipDoubted(st.t, s.hash))
     .map((s) => ({ s, at: seen(st, s.key, now) }))
     .sort((a, b) => a.at - b.at || (a.s.rec.p < b.s.rec.p ? -1 : 1));
   const f: Record<string, string> = { [me]: own.hash };
@@ -3361,7 +3488,9 @@ function compactDuty(pub: string, now: number): void {
     listed.add(key);
     let at = endedAt.get(key);
     if (at === undefined) endedAt.set(key, at = now);
-    if (!awake || !casinoWhole(e.t) || !computedSettled(e.t)) continue;
+    // (Nor on a rewind or a jump a peer wrote over its checkpoint: the end
+    // would make it final. The recovery duty puts the head back first.)
+    if (!awake || !casinoWhole(e.t) || !computedSettled(e.t) || computedRestorePending(e.t, e.inc)) continue;
     const ctx: FoldCtx = { room: casinoRoomId(), t: e.t, inc: e.inc };
     const pubs = sessionPubs(e);
     const idx = placeOf('trim', ctx, e.res.open, pubs, pub);
@@ -3376,6 +3505,172 @@ function compactDuty(pub: string, now: number): void {
     finalizeComputed(e.t, e.inc, cp);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
+}
+
+// ── 🩹 Recovery ──────────────────────────────────────────────────────────────
+
+/** What the recovery duty waits out at one incarnation, on this page's
+ *  clock (by `<tableId>:<inc>`). */
+interface Recovering {
+  /** The restore trigger in motion, and when this page first saw one in
+   *  motion since the doc was last calm (ComputedRecovery calm: found calm
+   *  so many times before). */
+  trigger: RecoveryTrigger | null;
+  at: number;
+  calm: number;
+  /** When this page first saw the session its base opens missing (D5), and
+   *  a session it counted from lost (D6). */
+  missingAt: number | null;
+  lostAt: number | null;
+  /** The value this page last put back, while the doc may still hold it,
+   *  and when; how many of its restores in a row were written over by
+   *  values that put one in motion again, and when the last was
+   *  (computedContested). */
+  wrote: object | null;
+  wroteAt: number | null;
+  overwrites: number;
+  overAt: number | null;
+}
+const recovering = new Map<string, Recovering>();
+/** When the recovery duty last looked (at most every TICK_MS). */
+let recoveredAt: number | null = null;
+
+/**
+ * 11. 🩹 Put back what a peer deleted or rewound of a computed incarnation,
+ * of every one this page tracks (ended ones too: an ended one's checkpoint
+ * holds the nets that go on counting), on an awake page with the room's
+ * state in and its doc whole (no build deletes a checkpoint or a session
+ * with nothing in its place, nor writes one back, nor rewinds one):
+ * - **Restore** (casinoDoc restoreComputedCheckpoint): this page's head,
+ *   byte for byte, when the doc's checkpoint is gone or junk (at once, in
+ *   turn), or rewound below it, or jumped past where any session reaches
+ *   (RESTORE_WAIT_MS on, in turn). Turns go by dutyRank('restore') among the
+ *   incarnation's keys (ComputedRecovery pubs), STAGGER_MS apart; a page
+ *   with none of them waits OUTSIDER_WAIT_MS more. Never over an end, nor
+ *   over an extension of the head (no page can tell one from an honest
+ *   trim). The page counts from its head meanwhile (casinoDoc heldBase).
+ * - **Reopen** (reopenComputedSession): the session the base opens, when its
+ *   map is missing, OPEN_WAIT_MS on, in turn (dutyRank('open')), with the
+ *   room heard all the while: the records' authors and witnesses put them
+ *   back into it (reputDuty, witnessDuty).
+ * - **Give up** (giveUpComputed): the rounds of a session this page counted
+ *   from, deleted for GIVE_UP_MS with the room heard all the while: it reads
+ *   the incarnation as a page that never counted them does.
+ * A wake, a frame that isn't ready, or another trigger starts its wait
+ * again. Not on a frame whose doc was bound afresh since this page looked
+ * at its clock. No signature waits on any of it: what is put back is what
+ * this page counted, or an empty map.
+ */
+function recoverDuty(pub: string, now: number): void {
+  if (!computedRecoveryOn()) return;
+  if (recoveredAt !== null && now >= recoveredAt && now - recoveredAt < TICK_MS) return;
+  recoveredAt = now;
+  if (casinoDocEpoch() !== clock.epoch) return;
+  const ready = roomStateIn(now) && tablesAwake(now) && casinoWhole();
+  const listed = new Set<string>();
+  for (const r of computedRecoveries()) {
+    const key = `${r.t}:${r.inc}`;
+    listed.add(key);
+    let w = recovering.get(key);
+    if (!w) recovering.set(key, w = { trigger: null, at: now, calm: r.calm, missingAt: null, lostAt: null, wrote: null, wroteAt: null, overwrites: 0, overAt: null });
+    if (!ready) {
+      w.trigger = null;
+      w.missingAt = null;
+      w.lostAt = null;
+      continue;
+    }
+    restoreStep(w, r, pub, now);
+    reopenStep(w, r, pub, now);
+    giveUpStep(w, r, now);
+  }
+  for (const key of [...recovering.keys()]) if (!listed.has(key)) recovering.delete(key);
+}
+
+/** This page's turn for a duty among an incarnation's keys: STAGGER_MS a
+ *  place (RECOVERY_PLACES at most), and OUTSIDER_WAIT_MS more for a page
+ *  with none of them. */
+function turnOf(duty: Duty, r: ComputedRecovery, round: number, pub: string): number {
+  const idx = placeOf(duty, r.ctx, round, r.pubs, pub, recoveryRanks);
+  return Math.min(idx, RECOVERY_PLACES) * STAGGER_MS + (idx >= r.pubs.length ? OUTSIDER_WAIT_MS : 0);
+}
+/** The recovery duties' ranks, by duty, incarnation, round and key: the
+ *  duty looks every tick, at up to MAX_TABLE_PIDS keys, while a wait runs. */
+const recoveryRanks = new Map<string, string>();
+
+function restoreStep(w: Recovering, r: ComputedRecovery, pub: string, now: number): void {
+  // This page's last restore written over by a value that puts one in
+  // motion again: a peer writing a rewind or a jump over it, in a row
+  // unless CONTESTED_CALM_MS passed since the last (computedContested).
+  // (Once this page's head moves on, its last restore is behind it. Junk or
+  // a delete over it isn't counted: no page writes either, and the first in
+  // turn puts the head back at once each time.)
+  if (w.wrote !== null && w.wrote !== r.head) w.wrote = null;
+  if (w.wrote !== null && (r.trigger === 'rewind' || r.trigger === 'jump')) {
+    w.wrote = null;
+    if (w.overAt === null || w.overAt > now || now - w.overAt > CONTESTED_CALM_MS) w.overwrites = 0;
+    w.overwrites += 1;
+    w.overAt = now;
+  }
+  if (r.trigger === null || r.head === null) {
+    w.trigger = null;
+    return;
+  }
+  // (A restore in motion keeps its wait until the doc is calm again,
+  // whatever triggers it meanwhile: values written again and again, rewinds
+  // and jumps of any bytes in turn, start nothing afresh. The doc calm since,
+  // though this page never looked then, or this page's clock back: they do.)
+  if (w.trigger === null || w.at > now || w.calm !== r.calm) {
+    w.at = now;
+    w.calm = r.calm;
+  }
+  w.trigger = r.trigger;
+  const due = r.trigger === 'junk'
+    ? Math.max(w.at + turnOf('restore', r, r.headU, pub), w.wroteAt !== null && w.wroteAt <= now ? w.wroteAt + JUNK_GAP_MS : -Infinity)
+    : w.at + RESTORE_WAIT_MS + turnOf('restore', r, r.headU, pub);
+  if (now < due) return;
+  const head = r.head;
+  if (transactCasino(() => restoreComputedCheckpoint(r.t, r.inc, head))) {
+    w.wrote = head;
+    w.wroteAt = now;
+    w.trigger = null;
+  }
+}
+
+function reopenStep(w: Recovering, r: ComputedRecovery, pub: string, now: number): void {
+  if (!r.live || !r.sessionMissing || r.trigger !== null) {
+    w.missingAt = null;
+    return;
+  }
+  if (w.missingAt === null || w.missingAt > now) w.missingAt = now;
+  if (now < w.missingAt + OPEN_WAIT_MS + turnOf('open', r, r.u, pub) || !heardThrough(now - OPEN_WAIT_MS, now)) return;
+  if (transactCasino(() => reopenComputedSession(r.t, r.inc))) w.missingAt = null;
+}
+
+function giveUpStep(w: Recovering, r: ComputedRecovery, now: number): void {
+  if (!r.lost) {
+    w.lostAt = null;
+    return;
+  }
+  if (w.lostAt === null || w.lostAt > now) w.lostAt = now;
+  if (now - w.lostAt < GIVE_UP_MS || !heardThrough(now - GIVE_UP_MS, now)) return;
+  if (giveUpComputed(r.t, r.inc)) w.lostAt = null;
+}
+
+/** 🚩 Whether this page's restores of table `t`'s checkpoint keep being
+ *  written over: CONTESTED_COUNT in a row, the last CONTESTED_CALM_MS ago at
+ *  most. It goes on putting the head back all the same. */
+export function computedContested(t: string, now = Date.now()): boolean {
+  const inc = computedIncOf(t);
+  const w = inc === null ? undefined : recovering.get(`${t}:${inc}`);
+  return !!w && w.overAt !== null && w.overwrites >= CONTESTED_COUNT && w.overAt <= now && now - w.overAt <= CONTESTED_CALM_MS;
+}
+
+/** Whether pid `me` would join table `t` as a newcomer it has no place for
+ *  (MAX_TABLE_PIDS: computedTablePids). */
+function crowdedOut(t: string, me: string): boolean {
+  if (!computedRecoveryOn()) return false;
+  const pids = computedTablePids(t);
+  return pids.size >= MAX_TABLE_PIDS && !pids.has(me);
 }
 
 // ── 🏠 The house ─────────────────────────────────────────────────────────────
@@ -3664,6 +3959,10 @@ export const CRAPS_SWITCH_ON_CONFIRM = 'BETS ON THE FELT GO BACK TO THEIR PLAYER
 function switchGate(t: string, now: number): ComputedSwitchRefusal | null {
   if (!tablesAwake(now)) return 'asleep';
   if (!casinoWhole(t) || !computedSettled()) return 'reconnecting';
+  // 🩹 (Nor while a peer's rewind or jump stands, in its restore's wait: an
+  // end, or a migration's, would make the forged checkpoint final, as a
+  // trim would, and nothing restores an end.)
+  if (computedRestorePending(t)) return 'reconnecting';
   return null;
 }
 

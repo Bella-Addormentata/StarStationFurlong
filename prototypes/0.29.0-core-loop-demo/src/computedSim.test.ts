@@ -32,11 +32,11 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import vectors from '../test-vectors/ed25519-strict.json';
-import { canon } from './computedFold';
+import { asCheckpoint, canon, nextSid } from './computedFold';
 import { HOUSE_HEARD_MS } from './computedHouse';
 import type { Checkpoint, FoldCtx, FoldResult } from './computedFold';
 import { PAGE_ROOM } from './computedPageKit';
-import { ComputedKit, red } from './computedTestKit';
+import { ComputedKit, red, testIdentity } from './computedTestKit';
 import type { TestIdentity } from './computedTestKit';
 import {
   between, BOT, HEAVY_BOT, RESYNC_MS, Sim, SIM_LONG, SIM_MINUTES, SIM_SEED_OFFSET, SIM_STEP, SIM_T0,
@@ -88,6 +88,10 @@ interface Finish {
   /** Kinds it allows only where a page was away or its clock moved: the
    *  forfeit that dropped a seed is of such a page (Sim.unexplained). */
   awayFlips?: readonly FlipKind[];
+  /** How many rounds past TRIM_BYTES the live session may run (1 unless
+   *  given): a trim waits for no close in (computedTable trimDuty), so a
+   *  cheat standing over a round's show puts it off a round. */
+  sessionRounds?: number;
 }
 
 /** The heal, the quiet period, everything synced; then every assertion the
@@ -126,7 +130,7 @@ async function finish(sim: Sim, opts: Finish = {}): Promise<SimSummary> {
   expect(s.maxDocBytes, sim.label).toBeLessThan(1_000_000);
   // The live session within a round of TRIM_BYTES: a trim runs in the show
   // of the round that takes it past.
-  expect(s.maxSessionBytes, sim.label).toBeLessThanOrEqual(table.TRIM_BYTES + s.maxRoundBytes);
+  expect(s.maxSessionBytes, sim.label).toBeLessThanOrEqual(table.TRIM_BYTES + (opts.sessionRounds ?? 1) * s.maxRoundBytes);
   expect(s.worstStallMs, `${sim.label} ${sim.worstStall.at}`).toBeLessThanOrEqual(table.ABANDON_MS + 2 * table.GRACE_MAX_MS);
   expect(s.coldFoldMs, sim.label).toBeLessThan(COLD_FOLD_MS);
   expect(s.warmP95Ms, sim.label).toBeLessThan(WARM_MS);
@@ -1589,5 +1593,174 @@ describe("the house: the owner's node adds its seed to the rounds (computedSimHo
     for (const x of stalls) expect(x.to - x.from, sim.label).toBeGreaterThan(HOUSE_HEARD_MS + 5_000);
     expect(s.voids, sim.label).toBe(0);
     expect(s.byHouse, sim.label).toBeGreaterThan(0);
+  }, TIMEOUT);
+});
+
+// ── Added for PR 6a ──────────────────────────────────────────────────────────
+
+describe('added for PR 6a', () => {
+  it('checkpoint forger: junk once and every 4 s, a replay, a deleted session and a jump; a third of the pages on the build before', async () => {
+    // E and F read as v0.50 pages do: no base held, no recovery duties.
+    const before: Partial<PageSpec> = { onLoad: async (p) => { p.casino.setComputedRecoveryForTests(false); } };
+    const sim = await Sim.open({
+      name: 'checkpoint-forger', seed: seed(21), bot: HEAVY_BOT,
+      pages: [...named('ABCD'), ...named('EF', before), { name: 'X', bot: null, honest: false }],
+    });
+    const x = sim.pages.find((sp) => sp.name === 'X')!;
+    x.cheats = true;
+    // A peer's doc writes and nothing more: it never runs its tables.
+    x.beforeFrame = () => false;
+    const honest = sim.pages.filter((sp) => sp !== x);
+    const { table } = honest[0].p;
+    const inc = x.p.casino.computedIncOf(T1)!;
+    const SUM = `sum:${T1}:${inc}`;
+    const ctx: FoldCtx = { room: PAGE_ROOM, t: T1, inc };
+    const kit = new ComputedKit(ctx);
+    const forger = testIdentity('forger');
+    const map = (sp: SimPage): Y.Map<unknown> => sp.p.doc.getMap('casinoComputed');
+    const liveOn = (sp: SimPage): Checkpoint | null => {
+      const cp = asCheckpoint(map(sp).get(SUM));
+      return cp && cp.e !== 1 ? cp : null;
+    };
+    // Every live checkpoint the room has had, in order (for the replay),
+    // and the last of the honest pages' trims (the head; none forged).
+    const seen: unknown[] = [];
+    const forged = new Set<string>();
+    let head: Checkpoint | null = null;
+    sim.every(() => {
+      const v = map(x).get(SUM);
+      if (!liveOn(x) || forged.has(canon(v)!)) return;
+      if (!seen.some((w) => canon(w) === canon(v))) seen.push(v);
+      head = liveOn(x);
+    });
+    const write = (act: (m: Y.Map<unknown>) => void): void => x.p.doc.transact(() => act(map(x)));
+    // What each cheat must have back on every honest page up, and by when:
+    // the head before it (or a later trim) under the checkpoint's key, or
+    // the session's map. In turn, a STAGGER_MS a place among at most the
+    // honest pages' keys, the room's resync bringing it each way.
+    const room = 2 * RESYNC_MS + 2_000;
+    const turns = honest.length * table.STAGGER_MS;
+    // Judged on each page from the first tick it holds the cheat's write
+    // (`on`): back once it holds something else that is good (`ok`). (Back
+    // once on a page is enough: a later cheat may take it again. A page
+    // that never held it, a later write over it first, has nothing to
+    // put back.)
+    const checks: {
+      what: string; due: number; on: (sp: SimPage) => boolean; ok: (sp: SimPage) => boolean; seen: Set<SimPage>; back: Set<SimPage>;
+    }[] = [];
+    const late: string[] = [];
+    // (Each kind of cheat judged on some page: the oracle bites.)
+    const judged = new Set<string>();
+    const keyOf = (v: unknown): string => (v === undefined ? 'none' : canon(v) ?? JSON.stringify(v));
+    const backFrom = (what: string, wait: number, bad: unknown): void => {
+      const u = head!.u;
+      const badKey = keyOf(bad);
+      checks.push({
+        what, due: sim.T + wait + turns + room,
+        on: (sp) => keyOf(map(sp).get(SUM)) === badKey,
+        // Live, no forgery, and the head or a later trim.
+        ok: (sp) => (liveOn(sp)?.u ?? -1) >= u && !forged.has(keyOf(map(sp).get(SUM))),
+        seen: new Set(), back: new Set(),
+      });
+    };
+    sim.every(() => {
+      for (const c of [...checks]) {
+        for (const sp of honest) {
+          if (c.on(sp)) c.seen.add(sp);
+          else if (c.seen.has(sp) && c.ok(sp)) c.back.add(sp);
+        }
+        if (sim.T < c.due) continue;
+        if (c.seen.size > 0) judged.add(c.what.split(' ')[0]);
+        for (const sp of honest.filter((q) => q.mode === 'up' && c.seen.has(q) && !c.back.has(q))) late.push(`${c.what} at ${c.due - SIM_T0} ms: not back on ${sp.name}`);
+        checks.splice(checks.indexOf(c), 1);
+      }
+    });
+    const done = { junk: 0, replay: 0, deleted: 0, jump: 0 };
+    const cycle = SIM_LONG ? 150_000 : RUN_MS;
+    for (let c = 0; c + 140_000 <= RUN_MS; c += cycle) {
+      // Junk in the checkpoint's place, once (at the first look past 20 s
+      // with one there), then every 4 s for 16 s.
+      const junk = (): void => {
+        const bad = { junk: sim.T };
+        backFrom(`junk ${sim.elapsed}`, 0, bad);
+        write((m) => m.set(SUM, bad));
+        done.junk += 1;
+      };
+      let once = false;
+      sim.every(() => {
+        if (once || sim.elapsed < c + 20_000 || !liveOn(x) || !head) return;
+        once = true;
+        junk();
+      });
+      for (const ms of [40_000, 44_000, 48_000, 52_000, 56_000]) sim.at(c + ms, () => { if (head) junk(); });
+      // An older checkpoint written back, its session too.
+      let replayed = false;
+      sim.every(() => {
+        if (replayed || sim.elapsed < c + 75_000 || sim.elapsed > c + 100_000) return;
+        const old = seen.find((v) => canon(v) !== canon(map(x).get(SUM)) && asCheckpoint(v)!.u < (liveOn(x)?.u ?? -1));
+        if (!old) return;
+        replayed = true;
+        forged.add(canon(old)!);
+        backFrom(`replay ${sim.elapsed}`, table.RESTORE_WAIT_MS, old);
+        const sid = nextSid(ctx, asCheckpoint(old)!);
+        write((m) => {
+          m.set(SUM, old);
+          if (!(m.get(`ses:${T1}:${inc}:${sid}`) instanceof Y.Map)) m.set(`ses:${T1}:${inc}:${sid}`, new Y.Map());
+        });
+        done.replay += 1;
+      });
+      // The live session deleted, nothing in its place.
+      sim.at(c + 105_000, () => {
+        const cp = liveOn(x);
+        if (!cp) return;
+        const key = `ses:${T1}:${inc}:${nextSid(ctx, cp)}`;
+        if (!(map(x).get(key) instanceof Y.Map)) return;
+        checks.push({
+          what: `deleted session ${c + 105_000}`, due: sim.T + table.OPEN_WAIT_MS + turns + room,
+          on: (sp) => !(map(sp).get(key) instanceof Y.Map) && liveOn(sp)?.u === cp.u,
+          ok: (sp) => map(sp).get(key) instanceof Y.Map || (liveOn(sp)?.u ?? -1) > cp.u, seen: new Set(), back: new Set(),
+        });
+        write((m) => m.delete(key));
+        done.deleted += 1;
+      });
+      // MAX_SESSION_ROUNDS + 1 rounds past the head on its session, the
+      // head's nets kept (a jump no trim could write), its session too.
+      sim.at(c + 130_000, () => {
+        const cp = liveOn(x);
+        if (!cp) return;
+        const nets = Object.fromEntries(Object.entries(cp.n).map(([pid, n]) => [pid, BigInt(n)]));
+        const P = kit.checkpoint(forger, nextSid(ctx, cp), cp.u + 501, cp.l, nets, undefined, cp.s, cp.h);
+        forged.add(canon(P)!);
+        backFrom(`jump ${c + 130_000}`, table.RESTORE_WAIT_MS, P);
+        write((m) => {
+          m.set(SUM, P);
+          m.set(`ses:${T1}:${inc}:${nextSid(ctx, P)}`, new Y.Map());
+        });
+        done.jump += 1;
+      });
+    }
+    await sim.run(RUN_MS);
+    // Scoped: while a forged checkpoint stands (RESTORE_WAIT_MS, in turn)
+    // every page counts it, as a valid checkpoint (A1): the rounds of the
+    // head's session read undecided, and come back alike with the head.
+    // (And a forged checkpoint over a round's show, the pages counting its
+    // empty session, puts that round's trim off to the next one's.)
+    const s = await finish(sim, { flips: ['blip'], sessionRounds: 2 });
+    console.log(`[sim] checkpoint-forger: ${JSON.stringify(done)}, ${seen.length} checkpoints`);
+    expect(late, sim.label).toEqual([]);
+    expect([...judged].sort(), sim.label).toEqual(['deleted', 'jump', 'junk', 'replay']);
+    expect(done.junk, sim.label).toBeGreaterThanOrEqual(6);
+    expect(done.replay, sim.label).toBeGreaterThanOrEqual(1);
+    expect(done.deleted, sim.label).toBeGreaterThanOrEqual(1);
+    expect(done.jump, sim.label).toBeGreaterThanOrEqual(1);
+    // Every page ends on the head of the honest trims, none parked.
+    for (const sp of honest.filter((q) => q.mode === 'up')) {
+      sim.enter(sp);
+      expect(sp.p.casino.casinoWhole(T1), `${sim.label} ${sp.name}`).toBe(true);
+      expect(canon(map(sp).get(SUM)), `${sim.label} ${sp.name}`).toBe(canon(map(honest[0]).get(SUM)));
+    }
+    expect(forged.has(keyOf(map(honest[0]).get(SUM))), `${sim.label}: a forgery stands`).toBe(false);
+    expect(s.trims, sim.label).toBeGreaterThanOrEqual(2);
+    expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(20));
   }, TIMEOUT);
 });

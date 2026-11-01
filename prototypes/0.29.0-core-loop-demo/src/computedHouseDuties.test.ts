@@ -11,12 +11,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { asCheckpoint, asClose, recHash } from './computedFold';
+import * as Y from 'yjs';
+import { asCheckpoint, asClose, nextSid, recHash } from './computedFold';
 import type { CloseRec, FoldCtx } from './computedFold';
 import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './computedHouse';
 import { houseSign } from './computedHouse';
 import {
-  clockOf, keysIn, loadPage, openRoom, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, sync,
+  clockOf, keysIn, loadPage, openRoom, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
@@ -694,4 +695,57 @@ describe('a table PR 2–4 opened', () => {
       expect(pages.map((q) => p.casino.readChips(q.pid))).toEqual(chips);
     }
   });
+
+  it('waits while a peer\'s rewind of its checkpoint stands, and moves once the head is back, from the head', async () => {
+    const pages = await houseRoom(['A', 'B'], { delegate: false, inc: PAGE_INC });
+    const [a] = pages;
+    const SUM = `sum:${TABLE}:${PAGE_INC}`;
+    const ctx: FoldCtx = { room: PAGE_ROOM, t: TABLE, inc: PAGE_INC };
+    // Two rounds, each trimmed by hand.
+    const values: unknown[] = [];
+    let T = T0;
+    for (let i = 0; i < 2; i++) {
+      const r = foldOf(a).open;
+      for (const [j, p] of pages.entries()) expect(p.table.writeComputedSlip(TABLE, [red(10 + j)], T)).toBe('ok');
+      sync(T, ...pages);
+      T = run(pages, T + STEP, T + 60_000, { step: STEP, until: () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === r && v.decided !== null)) });
+      trimByHand(a, testIdentity(`trimmer-${i}`));
+      sync(T, ...pages);
+      values.push(top(a).get(SUM));
+      T = run(pages, T + STEP, T + 60_000, { step: STEP, until: () => pages.every((p) => p.table.readComputedRoulette(TABLE, Date.now())?.phase === 'betting') });
+    }
+    const head = asCheckpoint(values[1])!;
+    a.table.setLocalHouse(H.pub);
+    T = run(pages, T + STEP, T + 1_200, { step: STEP });
+    expect(a.casino.houseSetUp()).toBe(true);
+    // A peer's replay of the first checkpoint, its session with it.
+    const cheat = await loadPage('X', 99);
+    cheat.casino.setComputedRecoveryForTests(false);
+    sync(T, cheat, ...pages);
+    cheat.doc.transact(() => {
+      top(cheat).set(SUM, JSON.parse(JSON.stringify(values[0])));
+      top(cheat).set(`ses:${TABLE}:${PAGE_INC}:${nextSid(ctx, asCheckpoint(values[0])!)}`, new Y.Map());
+    });
+    T += STEP;
+    sync(T, cheat, ...pages);
+    expect(a.casino.computedRestorePending(TABLE)).toBe(true);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', T)).toBe(false);
+    expect(a.casino.computedIncOf(TABLE)).toBe(PAGE_INC);
+    // The head back (no felt down: every page an outsider), then the move.
+    let back = -1;
+    for (const until = T + 60_000; T <= until && back < 0; T += STEP) {
+      sync(T, cheat, ...pages);
+      run(pages, T, T, { step: STEP });
+      sync(T, cheat, ...pages);
+      if (pages.every((p) => JSON.stringify(top(p).get(SUM)) === JSON.stringify(values[1]))) back = T;
+    }
+    expect(back).toBeGreaterThan(0);
+    expect(a.casino.computedRestorePending(TABLE)).toBe(false);
+    expect(a.table.autoSwitchComputed(TABLE, 'roulette', back + 5_000)).toBe(true);
+    sync(back + 5_000, cheat, ...pages);
+    const end = asCheckpoint(top(a).get(SUM))!;
+    expect([end.e, end.u]).toEqual([1, head.u]);
+    expect(end.n).toEqual(head.n);
+    for (const p of pages) expect(p.casino.computedIncOf(TABLE), p.name).toMatch(/^r[0-9a-f]{24}$/);
+  }, 90_000);
 });
