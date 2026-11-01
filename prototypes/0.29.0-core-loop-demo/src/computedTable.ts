@@ -784,19 +784,25 @@ function forgedStands(st: TableState): boolean {
 function endForged(st: TableState, res: FoldResult): void {
   const f = st.forged!;
   st.forged = null;
+  // 🩹 A felt the player queued while the forgery stood was composed against
+  // the forged view, so drop it: flushDuty must never write it into the
+  // restored session (the window is still open, so it is re-placed on the true
+  // view). Only the forged-ending path clears it here; a plain move keeps the
+  // round-after felt through movedOn's own r <= u rule.
+  st.pending = null;
   if (res.base.sid === f.sid) {
     letGo(st, (_m, key) => f.mine.has(key), () => false);
     return;
   }
   const since = res.base.sid === f.on ? new Set([...st.mine.keys()].filter((key) => !f.since.has(key))) : null;
-  movedOn(st, f.res, res, since);
+  movedOn(st, f.res, res, since, true);
 }
 
 /** The session moved on from `was`'s to `res`'s (a trim): by how much the
  *  checkpoint differs from what this page had folded, and what this page
  *  kept of the rounds it covers goes (noteResult); but for `since`, what it
  *  wrote into `res`'s session since (endForged). */
-function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null): void {
+function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null, fromForged = false): void {
   const d = checkpointDiff(was, res);
   st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n };
   const u = res.base.u;
@@ -831,7 +837,14 @@ function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: Readon
   // them. The seed store holds 256. An earlier build forgot them all.)
   const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
   const ses = computedSessionForWrite(st.t);
-  letGo(st, (m, key) => since?.has(key) === true || (m.r === u + 1 && (m.r > lastClosed || ses?.has(key) === true)), (r) => !computedRecoveryOn() || r <= u);
+  // 🩹 The "round after, never seen closed" keep is for a plain trim, where
+  // this page's own round-(u+1) slip was composed against the session that
+  // the trim carried forward. Ending a forgery is not that: the round-(u+1)
+  // slip was composed against the forged view, so it is kept only where the
+  // surviving session actually holds it (`ses`) or this page wrote it there
+  // since (`since`) — never reput into the honest session on `m.r > lastClosed`
+  // alone, which would copy the forged slip across.
+  letGo(st, (m, key) => since?.has(key) === true || (m.r === u + 1 && (ses?.has(key) === true || (!fromForged && m.r > lastClosed))), (r) => !computedRecoveryOn() || r <= u);
   // So too this page's window and fling: kept for the round after the
   // checkpoint if this page never saw it closed, else of a round the room
   // may not have kept, whose number the chain plays again. Kept, the

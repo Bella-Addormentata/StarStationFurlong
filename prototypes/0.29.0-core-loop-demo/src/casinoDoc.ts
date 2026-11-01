@@ -2421,7 +2421,16 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   // UNSEEN (load-taken) head can't tell the honest head coming back from a
   // replay, so its rewind is NOT refuted here — it gives way to it (firmAt
   // within the window, giveWayComputed past it).
-  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) refute(c, liveSidOf(c, cp));
+  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
+    // Exempt a session the counted chain is built on: a rewind that replays a
+    // checkpoint in the chain opens the chain's OWN next session, and refuting
+    // it would reject a legitimate higher trim of that session as a jump (a
+    // same-base trim race — two seen heads restoring different checkpoints).
+    // The forger's rewind of the F2 case is on an unrelated base no chain
+    // entry continues from, so it is still refuted.
+    const rewoundSid = liveSidOf(c, cp);
+    if (!c.chain.some((e) => e.cp.b === rewoundSid)) refute(c, rewoundSid);
+  }
   if (cp === null || typeof value !== 'object' || value === null) return;
   const head = c.chain[c.chain.length - 1];
   const sid = liveSidOf(c, cp);
@@ -3811,6 +3820,14 @@ export function giveWayComputed(tableId: string, inc: string): boolean {
   if (j >= c.chain.length) return false;
   for (const e of c.chain.slice(j)) drop(c, e.sid);
   c.chain.length = j;
+  // 🩹 Recount at once (as giveUpComputed does): dropping every trailing
+  // unseen entry can empty the chain, leaving no head and so no held base, and
+  // a delete of sum: before any other table write would then lose the restored
+  // checkpoint's balances. The recount counts the doc's value afresh into the
+  // chain, giving the page a head to hold the base from.
+  c.countedSid = null;
+  recountWhole.add(c);
+  boundDoc!.transact(() => {}, CT_RECOUNT);
   return true;
 }
 
@@ -3950,6 +3967,13 @@ export function computedTablePids(tableId: string): ReadonlySet<string> {
   if (!out) {
     out = new Set(res.base.n.keys());
     for (const round of res.rounds) for (const pid of Object.keys(round.frozen)) out.add(pid);
+    // 🎲 A craps checkpoint carries its riders in base.state (CrapsCarry.w):
+    // pids whose felt rides across the checkpoint that no net entry and no
+    // frozen round names. They carry into the next checkpoint, so they are
+    // at the table — counting them keeps a rider from being read as a
+    // newcomer with no place (crowdedOut), which would deny their own slips.
+    const riders = (res.base.state as { w?: Record<string, unknown> } | null)?.w;
+    if (riders) for (const pid of Object.keys(riders)) out.add(pid);
     tablePids.set(res, out);
   }
   return out;
