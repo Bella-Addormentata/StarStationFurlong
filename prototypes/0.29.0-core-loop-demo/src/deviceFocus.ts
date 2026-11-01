@@ -162,6 +162,15 @@ class DeviceFocusController {
     return this.isActive() ? this.focusCam : null;
   }
 
+  /** 🦊👁 #345: where the focus camera looks from and at — the device's eye
+   *  and anchor — while it flies in or sits there, so World can keep other
+   *  players' foxes out of that view (sightline.ts); null otherwise, from
+   *  the moment the release ease begins. */
+  public getView(): { eye: THREE.Vector3; anchor: THREE.Vector3 } | null {
+    if ((this.state !== 'FOCUSING' && this.state !== 'FOCUSED') || !this.active) return null;
+    return { eye: this.active.device.eye, anchor: this.active.device.anchor };
+  }
+
   /** 🔍 The focused view's wheel / pinch zoom, once the camera has arrived
    *  at the device; null otherwise. */
   public getZoom(): FovZoom | null {

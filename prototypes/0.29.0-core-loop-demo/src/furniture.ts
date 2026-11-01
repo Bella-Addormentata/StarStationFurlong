@@ -338,6 +338,14 @@ export interface StandTemplate {
    *  throws the craps dice. Regular stands are open to anyone; any operator role
    *  is auto-skipped by the walk-up picker and is where the robot croupier posts. */
   role?: "wheelHead" | "stickman";
+  /** 🕹 #345: the closest this stand may come in when the item's stands
+   *  cannot all be had where they are spread out (`stand`; a wall or a
+   *  piece of furniture on one of them). They then close up TOGETHER, each
+   *  the same part of the way toward its `near` spot (buildStandList tries
+   *  SPREAD_STEPS), so they stay as far apart as the floor allows and one
+   *  stand pushed onto the walk grid never lands on the next. Absent ⇒ the
+   *  stand stays where it is. */
+  near?: { stand: { x: number; z: number }; faceAngle: number };
 }
 
 /** A StandTemplate derived into world space (see buildStandList). */
@@ -1835,6 +1843,25 @@ const ARCADE_TEX_H = 240;
 const ARCADE_WIDE_W = 1.6;
 const ARCADE_WIDE_D = ARCADE_D;
 const ARCADE_WIDE_SEATS = 4;
+/** 🕹🕹🕹🕹 #345: the double-wide's four panels, s0's to s3's: their centres
+ *  across the cabinet (local x) and the deck's front edge they sit on
+ *  (local z). Its stands go by them, and so does a click on its screens. */
+const ARCADE_WIDE_PANEL_X: readonly number[] = Array.from(
+  { length: ARCADE_WIDE_SEATS },
+  (_, p) => (p - (ARCADE_WIDE_SEATS - 1) / 2) * (ARCADE_WIDE_W / ARCADE_WIDE_SEATS),
+);
+const ARCADE_WIDE_PANEL_Z = 0.3;
+/** #345: its four players stand this far apart, a pace back, centred on it.
+ *  Its panels are 0.4 m apart, but a fox is about 1.75 m across its cheeks
+ *  and 1.4 m across its head (voxelCharacter.ts, FOX_HALF_WIDTH_M): four
+ *  foxes at their panels stood as one. A metre apart they read as four, the
+ *  outer two past the cabinet's ends and turned in toward the screens.
+ *  Where the floor will not have that (a wall at an end, a sofa), they close
+ *  up together, as far as they must, toward their panels (StandTemplate.near). */
+export const ARCADE_WIDE_STAND_GAP = 1.0;
+const ARCADE_WIDE_STAND_Z = 1.2;
+/** Where they stood before #345, and still do when they must close up. */
+const ARCADE_WIDE_NEAR_Z = 1.05;
 /** The double-wide's two tubes stand this far apart: one screen, a seam. */
 const ARCADE_WIDE_TUBE_GAP = 0.008;
 /** The double-wide's screen canvas: its two tubes' 8:3, 512×384 each, so a
@@ -4017,14 +4044,36 @@ const arcadeCabinet2PStands: StandTemplate[] = [
   { stand: { x: -0.5, z: -1.0 }, faceAngle: 0 },
 ];
 
-// 🕹🕹🕹🕹 The double-wide cabinet (#242): a stand a pace back from each of
-// its four panels, s0 player 1 (red, left as you face the screens, local
-// -x) to s3 player 4 — the template index is the seat (arcadeDoc's
-// seat:<id>:<n>), the cabinet faced from +z.
-const arcadeCabinetWideStands: StandTemplate[] = Array.from({ length: ARCADE_WIDE_SEATS }, (_, p) => ({
-  stand: { x: (p - (ARCADE_WIDE_SEATS - 1) / 2) * (ARCADE_WIDE_W / ARCADE_WIDE_SEATS), z: 1.05 },
-  faceAngle: Math.PI,
-}));
+// 🕹🕹🕹🕹 The double-wide cabinet (#242): four stands a pace back, s0
+// player 1 (red, left as you face the screens, local -x) to s3 player 4 —
+// the template index is the seat (arcadeDoc's seat:<id>:<n>), the cabinet
+// faced from +z. #345: a metre apart (ARCADE_WIDE_STAND_GAP), the middle two
+// facing the screens and the outer two turned in to them by an eighth of a
+// turn (avatars face one of eight ways). Where the floor will not have them
+// spread out they close up toward their own panels, where they stood
+// before, all facing the screens once they are right there.
+const arcadeCabinetWideStands: StandTemplate[] = Array.from({ length: ARCADE_WIDE_SEATS }, (_, p) => {
+  const mid = (ARCADE_WIDE_SEATS - 1) / 2;
+  const turn = p === 0 ? -Math.PI / 4 : p === ARCADE_WIDE_SEATS - 1 ? Math.PI / 4 : 0;
+  return {
+    stand: { x: (p - mid) * ARCADE_WIDE_STAND_GAP, z: ARCADE_WIDE_STAND_Z },
+    faceAngle: Math.PI + turn,
+    near: { stand: { x: ARCADE_WIDE_PANEL_X[p]!, z: ARCADE_WIDE_NEAR_Z }, faceAngle: Math.PI },
+  };
+});
+
+/**
+ * 🕹🕹🕹🕹 #345: the double-wide cabinet's four panels in the room, s0's to
+ * s3's (indexed by seat): where a click on its screens is measured from to
+ * pick the station below it, now that its stands are spread wider than its
+ * panels.
+ */
+export function arcadeWidePanels(item: Pick<FurnitureItem, "pos" | "rot">): Array<{ x: number; z: number }> {
+  return ARCADE_WIDE_PANEL_X.map((x) => {
+    const r = rotXZ(x, ARCADE_WIDE_PANEL_Z, item.rot);
+    return { x: item.pos.x + r.x, z: item.pos.z + r.z };
+  });
+}
 
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
@@ -12222,7 +12271,7 @@ function buildWideArcadeCabinet(ctx: BuildCtx) {
   deck.rotation.x = -0.22;
   const stations: ArcadeStation[] = [];
   for (let p = 0; p < ARCADE_WIDE_SEATS; p++) {
-    const cx = (p - (ARCADE_WIDE_SEATS - 1) / 2) * (w / ARCADE_WIDE_SEATS);
+    const cx = ARCADE_WIDE_PANEL_X[p]!;
     const color = PLAYER[p]!;
     // The stick on a pivot at its foot, and the buttons, B then A: they
     // move with that player's pad (arcadeControls).
@@ -14313,6 +14362,11 @@ export function buildDeviceList(
   return devices;
 }
 
+/** 🕹 #345: how far out a table's stands go when they cannot all be had
+ *  spread out (StandTemplate.near): the first of these parts of the way
+ *  from their closest spots to their spread ones that the floor allows. */
+const SPREAD_STEPS: readonly number[] = [1, 0.75, 0.5, 0.25];
+
 /**
  * 🎰 Derive world-space standing positions from the furniture registry — one
  * StandSlot per StandTemplate on each item's def, rotated + translated into the
@@ -14327,13 +14381,27 @@ export function buildStandList(
   for (const item of items) {
     const tmpls = FURNITURE_DEFS[item.kind].stands;
     if (!tmpls) continue;
+    // 🕹 #345: as far out as every stand that can close up can be had (a
+    // part of the way from its `near` spot to its `stand`), all alike.
+    const spot = (t: StandTemplate, f: number) => {
+      const p = t.near && f < 1
+        ? { x: t.near.stand.x + (t.stand.x - t.near.stand.x) * f, z: t.near.stand.z + (t.stand.z - t.near.stand.z) * f }
+        : t.stand;
+      const s = rotXZ(p.x, p.z, item.rot);
+      return { x: item.pos.x + s.x, z: item.pos.z + s.z };
+    };
+    const fits = (k: number) => tmpls.every((t) => {
+      if (!t.near) return true;
+      const p = spot(t, k);
+      return isWalkable(p.x, p.z);
+    });
+    const f = SPREAD_STEPS.find(fits) ?? 0;
     tmpls.forEach((t, n) => {
-      const s = rotXZ(t.stand.x, t.stand.z, item.rot);
-      const preferred = { x: item.pos.x + s.x, z: item.pos.z + s.z };
+      const face = t.near && f === 0 ? t.near.faceAngle : t.faceAngle;
       stands.push({
         id: `${item.id}:s${n}`,
-        front: computeFront(preferred, itemAabb(item), isWalkable),
-        faceAngle: normalizeAngle(t.faceAngle + item.rot * (Math.PI / 2)),
+        front: computeFront(spot(t, f), itemAabb(item), isWalkable),
+        faceAngle: normalizeAngle(face + item.rot * (Math.PI / 2)),
         ...(t.role ? { role: t.role } : {}),
       });
     });

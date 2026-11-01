@@ -91,6 +91,7 @@ import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
   ARCADE_CABINET_KINDS,
+  arcadeWidePanels,
   FURNITURE,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
@@ -249,6 +250,7 @@ import {
 } from "./arcadeNativeSession";
 // 🕹🕹 Which of the double-wide's four stations a click or a walk-up names.
 import { wideClick, wideStationFor, type WideClick } from "./arcadeStations";
+import { blocksSight } from "./sightline";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
@@ -375,7 +377,8 @@ const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
 
 /** 🕹🕹 A double-wide cabinet stand counts as taken by somebody standing
- *  this close to it: under half the 0.4 m between its stands. */
+ *  this close to it: under half the 0.4 m between its stands when they
+ *  close up at its panels (#345; a metre apart otherwise). */
 const NATIVE_STAND_TAKEN_M = 0.18;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
@@ -4668,12 +4671,17 @@ export class World {
   private updateRemoteAvatars(deltaTime: number): void {
     // Frame-rate-safe equivalent of the old fixed 0.28-per-frame lerp at 60fps.
     const factor = 1 - Math.pow(1 - 0.28, deltaTime * 60);
+    // 🦊👁 #345: while the camera is focused on a device, a fox standing
+    // across the line to it is hidden (the players beside you at the
+    // double-wide cabinet, whose heads the camera would sit inside).
+    const view = deviceFocus.getView();
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
       avatar.lastX = pos.x;
       avatar.lastZ = pos.z;
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
+      avatar.rig.masterGroup.visible = !view || !blocksSight(view.eye, view.anchor, pos);
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.
@@ -6693,13 +6701,21 @@ export class World {
       all.push(s);
       if (seatStatus(deviceId, n) === "free" && reachable(s)) free.push(s);
     }
-    return wideStationFor(all, free, this.player.getPosition(), click);
+    return wideStationFor(all, free, this.player.getPosition(), click, this.arcadeWidePanels(deviceId));
+  }
+
+  /** 🕹🕹🕹🕹 #345: the double-wide cabinet's four panels in the room (by
+   *  seat), for a click on its screens to pick the station below it. */
+  private arcadeWidePanels(deviceId: string): Array<{ x: number; z: number }> | undefined {
+    const item = FURNITURE.find((i) => i.id === deviceId);
+    return item ? arcadeWidePanels(item) : undefined;
   }
 
   /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
    *  there, else the station it walked up to or clicked (`click`) whose seat
-   *  is free and nobody stands on. Its stands are a stride apart, too close
-   *  for pickFreeStand's 0.7 m test: one player would shut out the next. */
+   *  is free and nobody stands on. Its stands close up to a stride apart
+   *  where the floor is short (#345), too close for pickFreeStand's 0.7 m
+   *  test: one player would shut out the next. */
   private pickNativeSeatStand(deviceId: string, click?: WideClick): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
@@ -6723,7 +6739,7 @@ export class World {
         reachable(s)
       ) free.push(s);
     });
-    return wideStationFor(all, free, this.player.getPosition(), click);
+    return wideStationFor(all, free, this.player.getPosition(), click, this.arcadeWidePanels(deviceId));
   }
 
   /**

@@ -75,3 +75,39 @@ describe('wideStationFor', () => {
     expect(wideStationFor(stands, [], { x: 0, z: 1 })).toBeNull();
   });
 });
+
+describe('wideStationFor, with the stands spread wider than the panels (#345)', () => {
+  /** The stands a metre apart, a pace back; the panels 0.4 m apart. */
+  const spread: StandSlot[] = [0, 1, 2, 3].map((n) => ({
+    id: `wide-1:s${n}`,
+    front: { x: (n - 1.5) * 1.0, z: 1.2 },
+    faceAngle: Math.PI,
+  }));
+  const panels = [0, 1, 2, 3].map((n) => ({ x: (n - 1.5) * 0.4, z: 0.3 }));
+  const far = { x: 0, z: 4 };
+
+  it("picks the station below a click on the screens, by its panel, not the stand nearest it", () => {
+    // Above player 1's panel (-0.6): player 2's stand (-0.5) is nearer the
+    // click than player 1's (-1.5), but it is player 1's station.
+    expect(seat(wideStationFor(spread, spread, far, wideClick({ x: -0.55, z: 0.2 }, screen), panels))).toBe(0);
+    expect(seat(wideStationFor(spread, spread, far, wideClick({ x: -0.25, z: 0.2 }, screen), panels))).toBe(1);
+    expect(seat(wideStationFor(spread, spread, far, wideClick({ x: 0.15, z: 0.2 }, screen), panels))).toBe(2);
+    expect(seat(wideStationFor(spread, spread, far, wideClick({ x: 0.58, z: 0.2 }, screen), panels))).toBe(3);
+    // Without the panels it can only go by the stands.
+    expect(seat(wideStationFor(spread, spread, far, wideClick({ x: -0.55, z: 0.2 }, screen)))).toBe(1);
+  });
+
+  it("keeps the station a player walked up to, and falls back by panel when the one below the click is taken", () => {
+    const click = wideClick({ x: 0.55, z: 0.2 }, screen);
+    expect(seat(wideStationFor(spread, spread, spread[0]!.front, click, panels))).toBe(0);
+    const free = [spread[0]!, spread[1]!, spread[2]!]; // player 4 is taken
+    expect(seat(wideStationFor(spread, free, far, click, panels))).toBe(2);
+    // A taken station's own part clicked: the free one whose panel is nearest.
+    expect(seat(wideStationFor(spread, free, far, wideClick({ x: 0.6, z: 0.3 }, station(3)), panels))).toBe(2);
+  });
+
+  it("walks a player who pressed with no click to the free stand nearest them", () => {
+    expect(seat(wideStationFor(spread, spread, { x: -1.4, z: 2.5 }, undefined, panels))).toBe(0);
+    expect(seat(wideStationFor(spread, spread, { x: 1.2, z: 2.5 }, undefined, panels))).toBe(3);
+  });
+});
