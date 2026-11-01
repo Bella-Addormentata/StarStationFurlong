@@ -11916,6 +11916,14 @@ function arcadeScreenSurface(
     },
   };
   if (wide) visual.setPictureLines = (w, h) => void wide.lines.value.set(w, h);
+  // A cabinet taken away (World.removeFurnitureVisuals disposes its maps)
+  // stops waiting on its picture: the loader's queue must not keep this
+  // canvas, texture and light alive if the picture never comes.
+  texture.addEventListener("dispose", () => {
+    stopWaiting?.();
+    stopWaiting = null;
+    waitingFor = "";
+  });
   paintCard();
   onView?.(latest);
   return { texture, screen, visual };
@@ -12041,6 +12049,12 @@ function arcadeMarquee(planeW: number, planeH: number, canvasW = 512): {
     paintSign(g, canvas.width, canvas.height, title, sign, logo, game || title);
     texture.needsUpdate = true;
   };
+  // Taken away: stop waiting on the logo (as the screen does, above).
+  texture.addEventListener("dispose", () => {
+    stopWaiting?.();
+    stopWaiting = null;
+    shown = null;
+  });
   return { texture, show };
 }
 

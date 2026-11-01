@@ -18,6 +18,7 @@ function fakeCanvas() {
       if (key === 'fillRect') return () => { fills++; };
       if (key === 'measureText') return () => ({ width: 40 });
       if (key === 'createLinearGradient') return () => ({ addColorStop: () => undefined });
+      if (key === 'getImageData') return () => ({ data: new Uint8ClampedArray(16) });
       return () => undefined;
     },
     set: (target, key, value) => { target[key] = value; return true; },
@@ -477,5 +478,51 @@ describe("each game's sign (#333)", () => {
     expect(marquee.version).toBe(v); // a blink isn't a new sign
     handle.draw({ ...view('attract', false, 'NESERT GOLFING'), game: 'nesert-golfing' });
     expect(marquee.version).toBeGreaterThan(v);
+  });
+
+  it('a cabinet taken away stops waiting on its picture and logo', () => {
+    // A page with pictures that arrive when the test says so.
+    const pictures: { src: string; onload: (() => void) | null }[] = [];
+    class SlowImage {
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      decoding = '';
+      private url = '';
+      get src() { return this.url; }
+      set src(url: string) { this.url = url; pictures.push(this); }
+    }
+    vi.stubGlobal('Image', SlowImage);
+    try {
+      const textures = (group: THREE.Group) => {
+        const maps: THREE.Texture[] = [];
+        group.traverse((obj) => {
+          const map = obj instanceof THREE.Mesh ? (obj.material as THREE.MeshBasicMaterial).map : null;
+          if (map instanceof THREE.CanvasTexture && !maps.includes(map)) maps.push(map);
+        });
+        return maps;
+      };
+      const cabinet = () => {
+        const group = build();
+        const s = sinks();
+        group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, ID, obj); });
+        s.arcadeScreens.get(ID)!.draw({ ...view('attract', true, 'THWAITE'), game: 'thwaite' });
+        return textures(group);
+      };
+      const kept = cabinet();
+      const gone = cabinet();
+      for (const map of gone) map.dispose(); // as World.removeFurnitureVisuals does
+      const before = (maps: THREE.Texture[]) => maps.map((m) => m.version);
+      const [keptAt, goneAt] = [before(kept), before(gone)];
+
+      const thwaite = pictures.find((p) => p.src.endsWith('/thwaite.png'))!;
+      expect(thwaite).toBeDefined();
+      thwaite.onload!();
+      // The one still standing repaints its screen and its sign…
+      expect(kept.filter((m, i) => m.version > keptAt[i]!).length).toBeGreaterThanOrEqual(2);
+      // …the one taken away was no longer waiting.
+      expect(before(gone)).toEqual(goneAt);
+    } finally {
+      vi.stubGlobal('Image', undefined);
+    }
   });
 });
