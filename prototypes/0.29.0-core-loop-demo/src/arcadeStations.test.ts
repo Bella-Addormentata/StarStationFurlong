@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { StandSlot } from './furniture';
-import { WIDE_STAND_AT_M, wideClick, wideStationFor } from './arcadeStations';
+import { WIDE_STAND_AT_M, standCrowded, wideClick, wideStationFor } from './arcadeStations';
 
 /** The four stands a pace in front of a cabinet at the origin, 0.4 m apart. */
 const stands: StandSlot[] = [0, 1, 2, 3].map((n) => ({
@@ -109,5 +109,18 @@ describe('wideStationFor, with the stands spread wider than the panels (#345)', 
   it("walks a player who pressed with no click to the free stand nearest them", () => {
     expect(seat(wideStationFor(spread, spread, { x: -1.4, z: 2.5 }, undefined, panels))).toBe(0);
     expect(seat(wideStationFor(spread, spread, { x: 1.2, z: 2.5 }, undefined, panels))).toBe(3);
+  });
+});
+
+describe('standCrowded (#345)', () => {
+  it('counts a stand as taken by somebody nearer it than half way to the next one', () => {
+    // Closed up, 0.4 m apart: a player on one stand leaves the next one free.
+    expect(standCrowded(stands, stands[1]!, [stands[0]!.front])).toBe(false);
+    expect(standCrowded(stands, stands[0]!, [{ x: stands[0]!.front.x + 0.1, z: 1.05 }])).toBe(true);
+    expect(standCrowded(stands, stands[0]!, [])).toBe(false);
+    // Spread a metre apart: anyone within half a metre.
+    const spread = stands.map((s, n) => ({ ...s, front: { x: (n - 1.5) * 1.0, z: 1.2 } }));
+    expect(standCrowded(spread, spread[1]!, [{ x: -0.1, z: 1.4 }])).toBe(true);
+    expect(standCrowded(spread, spread[1]!, [{ x: 0, z: 1.2 }])).toBe(false);
   });
 });

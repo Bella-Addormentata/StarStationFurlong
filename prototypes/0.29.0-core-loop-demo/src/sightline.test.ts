@@ -28,6 +28,7 @@ vi.stubGlobal('window', { location: { search: '' } });
 const { ARCADE_WIDE_STAND_GAP, FURNITURE_DEFS, arcadeWidePanels, buildStandList } = await import('./furniture');
 const { VoxelCharacter } = await import('./voxelCharacter');
 const { PLAYER_R, playerFitsAt } = await import('./obstacles');
+const { standCrowded } = await import('./arcadeStations');
 
 type Xz = { x: number; z: number };
 
@@ -164,6 +165,22 @@ describe("the double-wide cabinet's four stands (#345)", () => {
     }
     // Closed up only as far as that takes, still wider apart than the panels.
     expect(closest(stands)).toBeGreaterThan(0.5);
+  });
+
+  it('are not walked onto when they spread out round a player who played on where they had closed up (#347)', () => {
+    // A sofa by the cabinet closed the stands up; player 1 took theirs.
+    // Then the sofa went: the stands spread, but player 1 plays on where
+    // they stood, right beside player 2's new stand.
+    const before = wideStands((x) => x > -0.7);
+    const after = wideStands();
+    const playing = [before[0]!.front];
+    expect(Math.hypot(after[1]!.front.x - playing[0]!.x, after[1]!.front.z - playing[0]!.z)).toBeLessThan(0.3);
+    expect(standCrowded(after, after[1]!, playing)).toBe(true);
+    // The stands nobody is beside stay open, a metre or more from them.
+    for (const s of [after[2]!, after[3]!]) {
+      expect(standCrowded(after, s, playing)).toBe(false);
+      expect(Math.hypot(s.front.x - playing[0]!.x, s.front.z - playing[0]!.z)).toBeGreaterThan(1);
+    }
   });
 
   it('turn with the cabinet, and so do its panels', () => {

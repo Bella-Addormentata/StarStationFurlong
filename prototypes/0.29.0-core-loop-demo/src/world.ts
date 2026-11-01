@@ -249,7 +249,7 @@ import {
   setNativeCabinetGameReader,
 } from "./arcadeNativeSession";
 // 🕹🕹 Which of the double-wide's four stations a click or a walk-up names.
-import { wideClick, wideStationFor, type WideClick } from "./arcadeStations";
+import { standCrowded, wideClick, wideStationFor, type WideClick } from "./arcadeStations";
 import { blocksSight } from "./sightline";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
@@ -375,11 +375,6 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
-
-/** 🕹🕹 A double-wide cabinet stand counts as taken by somebody standing
- *  this close to it: under half the 0.4 m between its stands when they
- *  close up at its panels (#345; a metre apart otherwise). */
-const NATIVE_STAND_TAKEN_M = 0.18;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -6694,13 +6689,14 @@ export class World {
       const own = at(mine);
       return own && reachable(own) ? own : null;
     }
+    const others = this.getRemoteAvatarSnapshots();
     const all: StandSlot[] = [];
     const free: StandSlot[] = [];
     for (let n = 0; n < 4; n++) {
       const s = at(n);
       if (!s) continue;
       all.push(s);
-      if (seatStatus(deviceId, n) === "free" && reachable(s)) free.push(s);
+      if (seatStatus(deviceId, n) === "free" && !standCrowded(stands, s, others) && reachable(s)) free.push(s);
     }
     return wideStationFor(all, free, this.player.getPosition(), click, this.arcadeWidePanels(deviceId));
   }
@@ -6714,9 +6710,9 @@ export class World {
 
   /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
    *  there, else the station it walked up to or clicked (`click`) whose seat
-   *  is free and nobody stands on. Its stands close up to a stride apart
-   *  where the floor is short (#345), too close for pickFreeStand's 0.7 m
-   *  test: one player would shut out the next. */
+   *  is free and nobody stands on (standCrowded). Its stands close up to a
+   *  stride apart where the floor is short (#345), too close for
+   *  pickFreeStand's 0.7 m test: one player would shut out the next. */
   private pickNativeSeatStand(deviceId: string, click?: WideClick): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
@@ -6736,7 +6732,7 @@ export class World {
       all.push(s);
       if (
         st === "free" &&
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < NATIVE_STAND_TAKEN_M) &&
+        !standCrowded(stands, s, others) &&
         reachable(s)
       ) free.push(s);
     });
