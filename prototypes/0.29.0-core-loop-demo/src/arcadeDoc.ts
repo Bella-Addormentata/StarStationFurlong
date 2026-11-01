@@ -974,6 +974,10 @@ export interface ArcadeScreenView {
   /** The attract card's INSERT COIN blink phase. */
   blink: boolean;
   plays: number;
+  /** The game's id where it is one of ours (a bundled ROM, or a cabinet's
+   *  own game), else '': what the screen's standby picture and the sign
+   *  above it are dressed for (arcadeStandby, arcadeSigns). */
+  game: string;
 }
 
 /** Derive what the cabinet's screen shows from the records alone, so every
@@ -981,8 +985,11 @@ export interface ArcadeScreenView {
 export function arcadeScreenView(itemId: string, now = clock()): ArcadeScreenView {
   const rec = readCabinet(itemId);
   if (!rec.game) {
-    return { mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: rec.plays };
+    return {
+      mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: rec.plays, game: '',
+    };
   }
+  const game = rec.game.bundled ?? '';
   // A built-in game's picture is the shared game itself (arcadeNesSession
   // paints over this card while one runs); the seats are EmulatorJS's.
   const seated = rec.game.bundled ? [] : seatHolders(itemId, ARCADE_SEATS_MAX, now)
@@ -994,7 +1001,7 @@ export function arcadeScreenView(itemId: string, now = clock()): ArcadeScreenVie
     const line = seated.length === 1
       ? `P${seated[0]!.n + 1} · ${seated[0]!.name || 'a clone'}`
       : `${seated.length} PLAYERS · ${seated.map((p) => `P${p.n + 1}`).join(' ')}`;
-    return { mode: 'inplay', title: gameTitle(rec.game), line, lane: gameLane(rec.game), blink: false, plays: rec.plays };
+    return { mode: 'inplay', title: gameTitle(rec.game), line, lane: gameLane(rec.game), blink: false, plays: rec.plays, game };
   }
   const blink = Math.floor(now / ARCADE_BLINK_MS) % 2 === 0;
   return {
@@ -1004,5 +1011,6 @@ export function arcadeScreenView(itemId: string, now = clock()): ArcadeScreenVie
     lane: gameLane(rec.game),
     blink,
     plays: rec.plays,
+    game,
   };
 }

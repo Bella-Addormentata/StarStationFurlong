@@ -18,6 +18,7 @@
  */
 
 import { Controller, NES } from 'jsnes';
+import { STANDBY_START_FRAMES, type StandbyRecipe } from './arcadeLibrary';
 
 export type NesButton = 'A' | 'B' | 'SELECT' | 'START' | 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
 export type NesPlayer = 1 | 2;
@@ -68,6 +69,8 @@ export class ArcadeMachine {
   private frame: Uint32Array | null = null;
   private acc = 0;
   private held = new Set<string>();
+  /** Running up to the standby screen: the sound of it isn't played. */
+  private quiet = false;
 
   constructor(private readonly opts: ArcadeMachineOptions = {}) {}
 
@@ -79,7 +82,11 @@ export class ArcadeMachine {
       onFrame: (buffer) => {
         this.frame = buffer;
       },
-      onAudioSample: this.opts.onAudioSample,
+      onAudioSample: this.opts.onAudioSample
+        ? (left, right) => {
+          if (!this.quiet) this.opts.onAudioSample!(left, right);
+        }
+        : undefined,
       emulateSound: !!this.opts.onAudioSample,
       sampleRate: this.opts.sampleRate ?? 48000,
     });
@@ -171,6 +178,26 @@ export class ArcadeMachine {
     } catch (err) {
       this.stop();
       throw err;
+    }
+  }
+
+  /**
+   * Run a freshly loaded game to its standby screen (arcadeLibrary's
+   * recipe): `frames` frames, START held for STANDBY_START_FRAMES from
+   * frame `start` (let go before the last frame, so the game starts from a
+   * clean pad). Pads only, so every copy that runs it lands on the same
+   * frame. Silent: it is a few dozen frames at once, not something to hear.
+   */
+  toStandby(recipe: StandbyRecipe): void {
+    const start = 1 << BUTTON.START;
+    this.quiet = true;
+    try {
+      for (let f = 0; f < recipe.frames; f++) {
+        const on = recipe.start !== undefined && f >= recipe.start && f < recipe.start + STANDBY_START_FRAMES;
+        this.runFrame(on ? start : 0, 0);
+      }
+    } finally {
+      this.quiet = false;
     }
   }
 
