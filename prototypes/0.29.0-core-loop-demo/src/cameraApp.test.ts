@@ -3,7 +3,7 @@
  * and date line, escaped.
  */
 import { describe, expect, it } from 'vitest';
-import { cameraAppHtml, cameraNavIndex } from './cameraApp';
+import { cameraAppHtml, cameraNavIndex, controlKeyOf } from './cameraApp';
 import type { FilmShot } from './filmRoll';
 
 const shot = (id: string, caption: string, roomName: string): FilmShot => ({
@@ -53,5 +53,12 @@ describe('📷 the film roll view', () => {
     expect(cameraNavIndex(4, 3, 1)).toBe(0);
     expect(cameraNavIndex(4, 0, -1)).toBe(3);
     expect(cameraNavIndex(0, -1, 1)).toBe(-1);
+  });
+
+  it('knows a control again after a repaint by what it does and to which shot', () => {
+    expect(controlKeyOf({ cameraDiscard: 'a1' })).toEqual({ key: 'cameraDiscard', value: 'a1' });
+    expect(controlKeyOf({ cameraCaption: 'a2' })).toEqual({ key: 'cameraCaption', value: 'a2' });
+    expect(controlKeyOf({ cameraShoot: '' })).toEqual({ key: 'cameraShoot', value: '' });
+    expect(controlKeyOf({ shot: 'a1' })).toBeNull(); // the figure itself is no control
   });
 });

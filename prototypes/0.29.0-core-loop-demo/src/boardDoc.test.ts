@@ -152,6 +152,13 @@ describe('the signed note', () => {
     expect(noteFromWire(null)).toBeNull();
   });
 
+  it('takes a photo note with no words, and no other (#315 PR 5)', () => {
+    const photoOnly = note(alice, '', NOW - 1000, { attach: PHOTO });
+    expect(noteFromWire(photoOnly.note)).not.toBeNull();
+    expect(readBoardEntries([entry(photoOnly)], BOARD, { roomId: ROOM, kind: 'open', now: NOW }).shown).toHaveLength(1);
+    expect(noteFromWire(note(alice, '', NOW - 1000).note)).toBeNull();
+  });
+
   it('cleans the author name it signs, so a pasted name still makes a readable note (#330 review)', () => {
     const sign = (authorName: string) => signNote(ROOM, BOARD, { authorName, text: 'hi', colour: 'yellow', x: 0.5, y: 0.5, ts: NOW - 1000 }, alice);
     const readName = (n: { id: string; note: BoardNote }) =>
@@ -299,6 +306,9 @@ describe('the bound store', () => {
 
   it('refuses empty, long and owner-only posts', () => {
     expect(postNote(BOARD, 'open', { text: '   ', colour: 'pink' }, alice).ok).toBe(false);
+    // A photo may go up with no words; a broken photo reference never.
+    expect(postNote(BOARD, 'open', { text: '   ', colour: 'pink', attach: PHOTO }, alice).ok).toBe(true);
+    expect(postNote(BOARD, 'open', { text: 'hi', colour: 'pink', attach: { ...PHOTO, size: 0 } }, alice)).toEqual({ ok: false, why: 'That photo can’t be pinned.' });
     expect(postNote(BOARD, 'open', { text: 'x'.repeat(MAX_NOTE_TEXT + 1), colour: 'pink' }, alice).ok).toBe(false);
     expect(canPost('owner')).toBe(false);
     expect(postNote(BOARD, 'owner', { text: 'notice', colour: 'white' }, alice).ok).toBe(false);

@@ -145,6 +145,16 @@ const HOST_SCAN_ENTRIES: usize = 400;
 const HOST_SCAN_KEYS: usize = 2_000;
 /// The most rooms one node keeps copies for.
 const MAX_HOST_ROOMS: usize = 64;
+/// 📷 Room-board photos (#315): the largest the host copies without asking
+/// (a CAMERA shot is 40 to 60 KB), and how much and how many a room in a
+/// day: their own day, apart from the TV's, so neither crowds out the other.
+const HOST_PHOTO_CAP: u64 = 512 * 1024;
+const HOST_PHOTO_DAY: u64 = 32 * 1024 * 1024;
+const HOST_PHOTO_DAY_COUNT: usize = 96;
+/// The least one photo is charged against its day.
+const HOST_PHOTO_MIN_CHARGE: u64 = 16 * 1024;
+/// The largest photo a note may name (boardDoc.ts `MAX_PHOTO_BYTES`).
+const MAX_PHOTO_BYTES: u64 = 2 * 1024 * 1024;
 /// WHERE: the most files and members one ask covers, how long an answer
 /// stays good, and how long a member gets to answer.
 const WHERE_MAX_HASHES: usize = 16;
@@ -271,6 +281,7 @@ struct Saved {
     files: Vec<KeptFile>,
     host: HashMap<String, bool>,
     spent: HashMap<String, Vec<(u64, u64)>>,
+    photo_spent: HashMap<String, Vec<(u64, u64)>>,
     met: HashMap<String, HashMap<String, u64>>,
 }
 
@@ -296,10 +307,36 @@ struct Hosting {
     rooms: HashMap<String, bool>,
     /// Per room: when each copy of the last day started, and its charge.
     spent: HashMap<String, Vec<(u64, u64)>>,
+    /// 📷 The same for the room's board photos, a day of their own.
+    photo_spent: HashMap<String, Vec<(u64, u64)>>,
     /// Files tried lately (unix ms): not tried again before `HOST_RETRY`.
     tried: HashMap<Hash, u64>,
-    /// Per room: the file being copied now (one at a time).
-    running: HashMap<String, Hash>,
+    /// Per room and kind: the file being copied now (one of each at a time).
+    running: HashMap<(String, CopyKind), Hash>,
+}
+
+/// 🏠 What the host copies: what a room's TV played, or the photos on its
+/// boards' notes. Each has its own per-file cap and its own day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CopyKind {
+    Tv,
+    Photo,
+}
+
+impl CopyKind {
+    fn day_count(self) -> usize {
+        match self {
+            CopyKind::Tv => HOST_COPY_DAY_COUNT,
+            CopyKind::Photo => HOST_PHOTO_DAY_COUNT,
+        }
+    }
+
+    fn min_charge(self) -> u64 {
+        match self {
+            CopyKind::Tv => HOST_COPY_MIN_CHARGE,
+            CopyKind::Photo => HOST_PHOTO_MIN_CHARGE,
+        }
+    }
 }
 
 /// 🤝 The nodes met as connected members of each room lately.
@@ -470,6 +507,50 @@ pub(crate) fn library_blobs(doc: &yrs::Doc) -> Vec<LibBlob> {
     out
 }
 
+/// 📷 The photos a room's boards carry (#315): each `boardNotes` record's
+/// `attach`, as boardDoc.ts writes it (`photoFromWire`), stamped with the
+/// note's own time so the newest go first. Peer-written and unchecked here
+/// (the note's signature is the tabs' to check), so each is only a
+/// candidate, as a TV library entry is: a copy dials its provider by id,
+/// only while connected, under the photos' own cap and day, and checks
+/// every byte against the hash.
+pub(crate) fn board_photos(doc: &yrs::Doc) -> Vec<LibBlob> {
+    use yrs::{Any, Map, Out, ReadTxn, Transact};
+    let txn = doc.transact();
+    let Some(notes) = txn.get_map("boardNotes") else { return Vec::new() };
+    let num = |v: Option<&Any>| match v {
+        Some(Any::Number(n)) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
+        Some(Any::BigInt(n)) if *n >= 0 => Some(*n as u64),
+        _ => None,
+    };
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let mut out = Vec::new();
+    // Every key looked at counts, kept or not: the map is anyone's to pad.
+    for (key, value) in notes.iter(&txn).take(HOST_SCAN_KEYS) {
+        if key.len() > 200 || !key.contains('|') {
+            continue;
+        }
+        let Out::Any(Any::Map(note)) = value else { continue };
+        let Some(Any::Map(attach)) = note.get("attach") else { continue };
+        let text = |k: &str| match attach.get(k) {
+            Some(Any::String(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        if text("kind").as_deref() != Some("blob") {
+            continue;
+        }
+        let Some(mime) = text("mime").filter(|m| matches!(m.as_str(), "image/jpeg" | "image/png" | "image/webp")) else { continue };
+        let Some(hash) = text("hash").filter(|h| hex64(h)).and_then(|h| Hash::from_str(&h).ok()) else { continue };
+        let Some(size) = num(attach.get("size")).filter(|s| *s > 0 && *s <= MAX_PHOTO_BYTES) else { continue };
+        let Some(provider) = text("provider").and_then(|p| PublicKey::from_str(&p).ok()) else { continue };
+        out.push(LibBlob { hash, size, provider, mime, played: num(note.get("ts")).unwrap_or(0) });
+        if out.len() >= HOST_SCAN_ENTRIES {
+            break;
+        }
+    }
+    out
+}
+
 pub struct BlobLane {
     store: FsStore,
     dir: PathBuf,
@@ -590,6 +671,7 @@ impl BlobLane {
             files: field("files").and_then(|f| serde_json::from_value(f).ok()).unwrap_or_default(),
             host: field("host").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
             spent: field("hostSpent").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
+            photo_spent: field("hostPhotoSpent").and_then(|h| serde_json::from_value(h).ok()).unwrap_or_default(),
             met: field("met").and_then(|m| serde_json::from_value(m).ok()).unwrap_or_default(),
         }
     }
@@ -598,17 +680,21 @@ impl BlobLane {
     /// most recently used first, as far as the quota goes; the rooms this
     /// node hosts, with the day's copy charges; and who it met where.
     async fn restore(&self, saved: Saved) {
-        let Saved { files: listed, host, spent, met } = saved;
+        let Saved { files: listed, host, spent, photo_spent, met } = saved;
         *self.met.lock().unwrap() = Met::restored(met, now_ms());
         {
             let mut h = self.hosting.lock().unwrap();
             h.rooms = host.into_iter().filter(|(r, _)| valid_room(r)).take(MAX_HOST_ROOMS).collect();
             let (now, since) = (now_ms(), now_ms().saturating_sub(DAY_MS));
-            h.spent = spent
-                .into_iter()
-                .filter(|(r, _)| h.rooms.contains_key(r))
-                .map(|(r, list)| (r, list.into_iter().filter(|(at, _)| *at > since && *at <= now).take(HOST_COPY_DAY_COUNT).collect::<Vec<_>>()))
-                .collect();
+            let day = |saved: HashMap<String, Vec<(u64, u64)>>, rooms: &HashMap<String, bool>, kind: CopyKind| -> HashMap<String, Vec<(u64, u64)>> {
+                saved
+                    .into_iter()
+                    .filter(|(r, _)| rooms.contains_key(r))
+                    .map(|(r, list)| (r, list.into_iter().filter(|(at, _)| *at > since && *at <= now).take(kind.day_count()).collect::<Vec<_>>()))
+                    .collect()
+            };
+            h.spent = day(spent, &h.rooms, CopyKind::Tv);
+            h.photo_spent = day(photo_spent, &h.rooms, CopyKind::Photo);
         }
         let mut listed: Vec<KeptFile> = listed.into_iter().filter(|k| k.size > 0).collect();
         listed.sort_by(|a, b| b.used.cmp(&a.used));
@@ -656,16 +742,17 @@ impl BlobLane {
         };
         // The rooms hosted, and the day's copy charges: a restart neither
         // forgets a switch nor hands out a fresh day.
-        let (host, spent) = {
+        let (host, spent, photo_spent) = {
             let h = self.hosting.lock().unwrap();
             let since = now_ms().saturating_sub(DAY_MS);
-            let spent: HashMap<String, Vec<(u64, u64)>> = h
-                .spent
-                .iter()
-                .map(|(r, list)| (r.clone(), list.iter().copied().filter(|(at, _)| *at > since).collect::<Vec<_>>()))
-                .filter(|(_, list)| !list.is_empty())
-                .collect();
-            (h.rooms.clone(), spent)
+            let day = |spent: &HashMap<String, Vec<(u64, u64)>>| -> HashMap<String, Vec<(u64, u64)>> {
+                spent
+                    .iter()
+                    .map(|(r, list)| (r.clone(), list.iter().copied().filter(|(at, _)| *at > since).collect::<Vec<_>>()))
+                    .filter(|(_, list)| !list.is_empty())
+                    .collect()
+            };
+            (h.rooms.clone(), day(&h.spent), day(&h.photo_spent))
         };
         // The roster's flags go with the snapshot, and come back when the
         // write fails: the next scan tries again.
@@ -676,7 +763,7 @@ impl BlobLane {
                 m.rooms.iter().map(|(r, nodes)| (r.clone(), nodes.iter().map(|(k, at)| (k.to_string(), *at)).collect())).collect();
             (rooms, flags.0, flags.1)
         };
-        let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent, "met": met }).to_string();
+        let body = serde_json::json!({ "v": 1, "files": files, "host": host, "hostSpent": spent, "hostPhotoSpent": photo_spent, "met": met }).to_string();
         let tmp = self.dir.join(format!("{LIBRARY_FILE}.tmp"));
         if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.dir.join(LIBRARY_FILE))) {
             eprintln!("⚠️ blob-cache/{LIBRARY_FILE} could not be written: {e}");
@@ -820,11 +907,28 @@ impl BlobLane {
         Ok(())
     }
 
-    /// The day's copies for `room`: bytes charged and files, the older gone.
+    /// The day's TV copies for `room`: bytes charged and files, the older gone.
     fn spent_today(h: &mut Hosting, room: &str, now: u64) -> (u64, usize) {
-        let Some(list) = h.spent.get_mut(room) else { return (0, 0) };
+        Self::spent_of(h, CopyKind::Tv, room, now)
+    }
+
+    /// The day's copies of one kind for `room`.
+    fn spent_of(h: &mut Hosting, kind: CopyKind, room: &str, now: u64) -> (u64, usize) {
+        let days = match kind {
+            CopyKind::Tv => &mut h.spent,
+            CopyKind::Photo => &mut h.photo_spent,
+        };
+        let Some(list) = days.get_mut(room) else { return (0, 0) };
         list.retain(|(at, _)| now.saturating_sub(*at) < DAY_MS);
         (list.iter().map(|(_, b)| b).sum(), list.len())
+    }
+
+    /// One kind's per-file cap and daily bytes on this node.
+    fn rules_of(&self, kind: CopyKind) -> (u64, u64) {
+        match kind {
+            CopyKind::Tv => (self.host_cap, self.host_day),
+            CopyKind::Photo => (HOST_PHOTO_CAP, HOST_PHOTO_DAY),
+        }
     }
 
     /// What the held route says of copies for `room`: null when its page
@@ -832,15 +936,31 @@ impl BlobLane {
     fn host_json(&self, room: &str) -> serde_json::Value {
         let mut h = self.hosting.lock().unwrap();
         let Some(&on) = h.rooms.get(room) else { return serde_json::Value::Null };
-        let (spent, files) = Self::spent_today(&mut h, room, now_ms());
-        serde_json::json!({ "on": on, "cap": self.host_cap, "day": self.host_day, "spent": spent, "files": files, "dayFiles": HOST_COPY_DAY_COUNT })
+        let now = now_ms();
+        let (spent, files) = Self::spent_today(&mut h, room, now);
+        let (photo_spent, photo_files) = Self::spent_of(&mut h, CopyKind::Photo, room, now);
+        serde_json::json!({
+            "on": on, "cap": self.host_cap, "day": self.host_day, "spent": spent, "files": files, "dayFiles": HOST_COPY_DAY_COUNT,
+            "photos": { "cap": HOST_PHOTO_CAP, "day": HOST_PHOTO_DAY, "spent": photo_spent, "files": photo_files, "dayFiles": HOST_PHOTO_DAY_COUNT },
+        })
     }
 
     /// The next copy for `room`, queued and charged: the most recently
     /// played library file this node lacks, from a member `connected` now,
     /// under the cap, the day's budget and the quota. None while one is
     /// still on its way, or when nothing qualifies.
-    fn next_copy(&self, room: &str, mut entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
+    fn next_copy(&self, room: &str, entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
+        self.next_copy_of(CopyKind::Tv, room, entries, connected, me, now)
+    }
+
+    /// 📷 The same for the photos on the room's boards (`board_photos`),
+    /// under their own cap and day.
+    fn next_photo_copy(&self, room: &str, entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
+        self.next_copy_of(CopyKind::Photo, room, entries, connected, me, now)
+    }
+
+    fn next_copy_of(&self, kind: CopyKind, room: &str, mut entries: Vec<LibBlob>, connected: &dyn Fn(&PublicKey) -> bool, me: &PublicKey, now: u64) -> Option<(Hash, u64, PublicKey)> {
+        let (cap, day) = self.rules_of(kind);
         let mut evicted = false;
         let picked = {
             let mut h = self.hosting.lock().unwrap();
@@ -848,27 +968,28 @@ impl BlobLane {
                 return None;
             }
             let mut held = self.held.lock().unwrap();
-            if h.running.get(room).and_then(|r| held.get(r)).is_some_and(|x| matches!(x.phase, Phase::Queued | Phase::Fetching)) {
+            let running = (room.to_string(), kind);
+            if h.running.get(&running).and_then(|r| held.get(r)).is_some_and(|x| matches!(x.phase, Phase::Queued | Phase::Fetching)) {
                 return None;
             }
             h.tried.retain(|_, at| now.saturating_sub(*at) < HOST_RETRY.as_millis() as u64);
             entries.sort_by(|a, b| b.played.cmp(&a.played));
-            let (spent, files) = Self::spent_today(&mut h, room, now);
+            let (spent, files) = Self::spent_of(&mut h, kind, room, now);
             let mut picked = None;
             for e in entries {
                 if held.get(&e.hash).is_some_and(|x| !matches!(x.phase, Phase::Failed(_)))
                     || h.tried.contains_key(&e.hash)
-                    || e.size > self.host_cap
+                    || e.size > cap
                     || e.provider == *me
                     || !connected(&e.provider)
                 {
                     continue;
                 }
-                if files >= HOST_COPY_DAY_COUNT {
+                if files >= kind.day_count() {
                     break; // the day's files: nothing more without asking
                 }
-                let charge = e.size.max(HOST_COPY_MIN_CHARGE);
-                if spent + charge > self.host_day {
+                let charge = e.size.max(kind.min_charge());
+                if spent + charge > day {
                     continue; // too big for what is left of the day; a smaller one may fit
                 }
                 // A failed try's bytes stay counted, as for a FETCH.
@@ -883,8 +1004,11 @@ impl BlobLane {
                     rooms: HashSet::from([room.to_string()]), size: e.size, have: 0, mime: safe_mime(&e.mime), phase: Phase::Queued, charged, used: now, readers: 0, shared: false, via: Vec::new(),
                 });
                 h.tried.insert(e.hash, now);
-                h.spent.entry(room.to_string()).or_default().push((now, charge));
-                h.running.insert(room.to_string(), e.hash);
+                match kind {
+                    CopyKind::Tv => h.spent.entry(room.to_string()).or_default().push((now, charge)),
+                    CopyKind::Photo => h.photo_spent.entry(room.to_string()).or_default().push((now, charge)),
+                }
+                h.running.insert(running, e.hash);
                 picked = Some((e.hash, e.size, e.provider));
                 break;
             }
@@ -911,8 +1035,14 @@ impl BlobLane {
                 (r.doc.clone(), r.remote_peers.keys().copied().collect::<HashSet<PublicKey>>())
             };
             let entries = library_blobs(&doc);
+            let photos = board_photos(&doc);
             if let Some((hash, size, provider)) = self.next_copy(&room, entries, &|p| connected.contains(p), &me, now_ms()) {
                 println!("📦 blob {}: this room's host keeps a copy ({size} bytes, from {})", hash.fmt_short(), provider.fmt_short());
+                tokio::spawn(self.clone().run_fetch(endpoint.clone(), hash, size, vec![provider]));
+            }
+            // 📷 And of the photos on its boards, beside whatever the TV copies.
+            if let Some((hash, size, provider)) = self.next_photo_copy(&room, photos, &|p| connected.contains(p), &me, now_ms()) {
+                println!("📦 blob {}: this room's host keeps a board photo ({size} bytes, from {})", hash.fmt_short(), provider.fmt_short());
                 tokio::spawn(self.clone().run_fetch(endpoint.clone(), hash, size, vec![provider]));
             }
         }
@@ -2568,6 +2698,124 @@ mod tests {
         let spent = BlobLane::spent_today(&mut lane.hosting.lock().unwrap(), "r", now_ms());
         assert_eq!(spent, ((5u64 << 30) + (1 << 30), 2));
         assert_eq!(lane.hosting.lock().unwrap().rooms.get("r"), Some(&true));
+        lane.store.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A room doc whose boards hold these notes: (key, attach fields, ts).
+    fn board_doc(notes: &[(&str, Option<Vec<(&str, yrs::Any)>>, f64)]) -> yrs::Doc {
+        use yrs::{Map, Transact};
+        let doc = yrs::Doc::new();
+        let map = doc.get_or_insert_map("boardNotes");
+        let mut txn = doc.transact_mut();
+        for (key, attach, ts) in notes {
+            let mut note: HashMap<String, yrs::Any> = HashMap::from([
+                ("v".to_string(), yrs::Any::Number(1.0)),
+                ("text".to_string(), yrs::Any::from("hello")),
+                ("sig".to_string(), yrs::Any::from("sig")),
+                ("ts".to_string(), yrs::Any::Number(*ts)),
+            ]);
+            if let Some(a) = attach {
+                let a: HashMap<String, yrs::Any> = a.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                note.insert("attach".to_string(), yrs::Any::from(a));
+            }
+            map.insert(&mut txn, *key, yrs::Any::from(note));
+        }
+        drop(txn);
+        doc
+    }
+
+    fn photo_attach(hash: &str, size: f64, provider: &str, mime: &str) -> Vec<(&'static str, yrs::Any)> {
+        vec![
+            ("kind", yrs::Any::from("blob")),
+            ("hash", yrs::Any::from(hash)),
+            ("size", yrs::Any::Number(size)),
+            ("provider", yrs::Any::from(provider)),
+            ("mime", yrs::Any::from(mime)),
+            ("takenAt", yrs::Any::Number(1.0)),
+        ]
+    }
+
+    #[test]
+    fn the_boards_photos_are_read_with_care() {
+        let provider = iroh::SecretKey::generate().public().to_string();
+        let h = |n: u8| Hash::new([n]).to_hex().to_string();
+        let doc = board_doc(&[
+            ("board-1|aa", Some(photo_attach(&h(1), 50_000.0, &provider, "image/jpeg")), 2_000.0),
+            ("board-1|bb", None, 3_000.0),
+            // Not an image, too big, not a hash, not a node, not a blob, not a note key.
+            ("board-1|cc", Some(photo_attach(&h(2), 50_000.0, &provider, "video/webm")), 4_000.0),
+            ("board-1|dd", Some(photo_attach(&h(3), (3 * 1024 * 1024) as f64, &provider, "image/jpeg")), 4_000.0),
+            ("board-1|ee", Some(photo_attach("not-a-hash", 50_000.0, &provider, "image/jpeg")), 4_000.0),
+            ("board-1|ff", Some(photo_attach(&h(4), 50_000.0, "not-a-node", "image/jpeg")), 4_000.0),
+            ("board-1|gg", Some({
+                let mut a = photo_attach(&h(5), 50_000.0, &provider, "image/png");
+                a[0] = ("kind", yrs::Any::from("url"));
+                a
+            }), 4_000.0),
+            ("no-bar", Some(photo_attach(&h(6), 50_000.0, &provider, "image/jpeg")), 4_000.0),
+            ("board-2|hh", Some(photo_attach(&h(7), 60_000.0, &provider, "image/webp")), 5_000.0),
+        ]);
+        let mut got = board_photos(&doc);
+        got.sort_by_key(|b| b.played);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got[0].hash.to_hex().to_string(), got[0].size, got[0].played), (h(1), 50_000, 2_000));
+        assert_eq!((got[1].hash.to_hex().to_string(), got[1].mime.as_str(), got[1].played), (h(7), "image/webp", 5_000));
+        assert_eq!(got[0].provider.to_string(), provider);
+        assert!(board_photos(&yrs::Doc::new()).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_copies_board_photos_on_a_day_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("ssf-blob-host-photos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Duration::from_secs(3600);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, quiet).await.unwrap();
+        let (sharer, me) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+        let photo = |n: u8, size: u64, played: u64| LibBlob { hash: Hash::new([b'p', n]), size, provider: sharer, mime: "image/jpeg".into(), played };
+        // Not a room the host's page said it hosts: nothing.
+        assert_eq!(lane.next_photo_copy("r", vec![photo(1, 50_000, 1)], &|_| true, &me, now_ms()), None);
+        lane.host_room("r", Some(true)).unwrap();
+        let now = now_ms();
+        // The TV's day is spent and a film is on its way: photos still go.
+        lane.hosting.lock().unwrap().spent.insert("r".into(), vec![(now - 1_000, HOST_COPY_DAY_MB << 20)]);
+        let film = Hash::new(b"film");
+        let lib = LibBlob { hash: film, size: 1 << 20, provider: sharer, mime: "video/mp4".into(), played: 1 };
+        assert_eq!(lane.next_copy("r", vec![lib], &|_| true, &me, now), None, "the TV's day is spent");
+        // Over the photos' cap: never without asking. The newest under it goes first.
+        let entries = || vec![photo(1, 50_000, 1_000), photo(2, HOST_PHOTO_CAP + 1, 3_000), photo(3, 40_000, 2_000)];
+        let (hash, size, from) = lane.next_photo_copy("r", entries(), &|_| true, &me, now).expect("a photo copy");
+        assert_eq!((hash, size, from), (Hash::new([b'p', 3]), 40_000, sharer));
+        // One photo at a time per room.
+        assert_eq!(lane.next_photo_copy("r", entries(), &|_| true, &me, now), None);
+        // Charged to the photos' day, at least their least charge, and not the TV's.
+        let json = lane.host_json("r");
+        assert_eq!(json["photos"]["files"], 1);
+        assert_eq!(json["photos"]["spent"], 40_000);
+        assert_eq!(json["files"], 1, "the TV's day is as it was");
+        // The day's photo count: nothing more without asking.
+        {
+            let mut h = lane.hosting.lock().unwrap();
+            h.running.clear();
+            h.tried.clear();
+            h.photo_spent.insert("r".into(), vec![(now - 1_000, HOST_PHOTO_MIN_CHARGE); HOST_PHOTO_DAY_COUNT]);
+        }
+        lane.held.lock().unwrap().clear();
+        assert_eq!(lane.next_photo_copy("r", entries(), &|_| true, &me, now), None);
+        // A tiny photo still costs its least charge against the bytes.
+        {
+            let mut h = lane.hosting.lock().unwrap();
+            h.photo_spent.insert("r".into(), vec![(now - 1_000, HOST_PHOTO_DAY - HOST_PHOTO_MIN_CHARGE + 1)]);
+        }
+        assert_eq!(lane.next_photo_copy("r", vec![photo(4, 10, 1)], &|_| true, &me, now), None);
+        // The photos' day outlives a restart.
+        lane.hosting.lock().unwrap().photo_spent.insert("r".into(), vec![(now - 1_000, 40_000)]);
+        lane.persist();
+        lane.store.shutdown().await.unwrap();
+        drop(lane);
+        let lane = BlobLane::open_with(dir.clone(), 1 << 40, true, quiet).await.unwrap();
+        let spent = BlobLane::spent_of(&mut lane.hosting.lock().unwrap(), CopyKind::Photo, "r", now_ms());
+        assert_eq!(spent, (40_000, 1));
         lane.store.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

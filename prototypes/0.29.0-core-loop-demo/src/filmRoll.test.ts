@@ -50,7 +50,8 @@ describe('🎞️ the film roll', () => {
   });
 
   it('labels a shot with its day, time and room, and keeps a room name short and clean', async () => {
-    const shot = await take(Date.UTC(2026, 9, 31, 21, 40), 'The\tBlue  Lounge');
+    // Noon on Oct 31 where the test runs: the label is in local time.
+    const shot = await take(new Date(2026, 9, 31, 12, 0).getTime(), 'The\tBlue  Lounge');
     expect(shot.roomName).toBe('The Blue Lounge');
     const label = shotLabel(shot, 'en-US');
     expect(label).toMatch(/Oct 31/);
