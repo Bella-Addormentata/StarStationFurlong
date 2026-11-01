@@ -97,6 +97,7 @@ async function openPage(name: string, viewer: { x: number; z: number } | null = 
         const info = mod.arcadeCopyInfo(ITEM);
         if (info) page.hashes.set(info.next - 1, hashFrame(frame));
       },
+      drawStandby: () => undefined,
       drawMenu: () => undefined,
       drawCredits: () => undefined,
       drawCard: (_title: string, line: string) => page.cards.push(line),
@@ -177,6 +178,7 @@ function addCabinet(page: Page, itemId: string): void {
   page.mod.registerArcadeVisual(itemId, {
     painter: {
       drawFrame: () => undefined,
+      drawStandby: () => undefined,
       drawMenu: () => undefined,
       drawCredits: () => undefined,
       drawCard: () => undefined,
@@ -240,6 +242,28 @@ async function startGame(host: Page, seat: 0 | 1, seats: 1 | 2, game: ArcadeGame
   expect(l.shared()).toMatchObject({ role: 'host', phase: 'playing', title: game.title });
   return l;
 }
+
+describe("a shared game starts on the game's standby screen (#333)", () => {
+  it.each(ARCADE_GAMES.map((g) => [g.id, g] as const))(
+    '%s: frame 0 on every page follows on from the standby picture',
+    async (_id, game) => {
+      const [a, b] = await room(['a', null], ['b', null]);
+      await startGame(a, 0, 1, game);
+      await run(200);
+      // What the standby picture is (arcadeStandby.test.ts), one frame on
+      // with nothing pressed.
+      const { ArcadeMachine } = await import('./arcadeMachine');
+      const machine = new ArcadeMachine();
+      machine.load(romBytes.get(game.romUrl)!);
+      machine.toStandby(game.standby);
+      machine.runFrame(0, 0);
+      const expected = hashFrame(machine.frameBuffer()!);
+      expect(a.hashes.get(0), 'the host').toBe(expected);
+      expect(b.hashes.get(0), 'a watcher').toBe(expected);
+    },
+    30_000,
+  );
+});
 
 describe('a shared game, played by two and watched by a third', () => {
   it('runs the same frames on every page, with player 2 pressing from another computer', async () => {
