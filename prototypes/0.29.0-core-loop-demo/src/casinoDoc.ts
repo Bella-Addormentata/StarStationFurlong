@@ -2445,22 +2445,28 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   // firm at once and no rewind can give way to the honest head coming back.
   // It waits afresh (taken), unless it is built on the very session this page
   // was counting from, a plain forward move it saw come (firm now, 0).
+  // 🩹 A base this page gave way over (dropped) is not a session it counted
+  // from: a checkpoint built on it is a fresh take, not a seen extension, even
+  // when `watched` still points there (a page that took a jump J, adopted a
+  // lower checkpoint R on J's session, then dropped J — R and anything built
+  // on it must not inherit `seen`/firm-now, or an extension of R above the
+  // honest head would be firm at once and never give way).
   const firmAt = c.dropped.includes(sid)
     ? taken
     : head && cp.b === head.sid
       ? head.firmAt
-      : cp.b === watched
+      : cp.b === watched && !c.dropped.includes(cp.b)
         ? 0
         : taken;
   // `seen` mirrors firmAt's branches: a head given way over is unseen again,
   // an extension inherits the head's, one on the session this page was
-  // counting from was seen come, anything else (a fresh take, mostly at load)
-  // is unseen.
+  // counting from (and did not give way over) was seen come, anything else (a
+  // fresh take, mostly at load) is unseen.
   const seen = c.dropped.includes(sid)
     ? false
     : head && cp.b === head.sid
       ? head.seen
-      : cp.b === watched;
+      : cp.b === watched && !c.dropped.includes(cp.b);
   c.chain.push({ value, cp, sid, pubs: new Set(), firmAt, seen });
   if (c.chain.length > CHAIN_KEPT) c.chain.shift();
   if (c.gaveUp && c.gaveUp.sid !== sid) c.gaveUp = null;
@@ -3810,8 +3816,19 @@ export function giveWayComputed(tableId: string, inc: string): boolean {
   if (!c || !computedMap || !recoveryOn) return false;
   const head = c.chain[c.chain.length - 1];
   if (!head || head.seen) return false;
-  const trigger = recoveryTrigger(c, checkpointAt(computedMap, c.t, c.inc));
-  if (trigger !== 'rewind' && trigger !== 'jump') return false;
+  const cp = checkpointAt(computedMap, c.t, c.inc);
+  const trigger = recoveryTrigger(c, cp);
+  // 🩹 Give way only to a rewind this page cannot otherwise reject — a lower
+  // checkpoint it took at load and can't tell from the honest head coming
+  // back. NEVER to a jump: a jump is always a checkpoint over a counted chain
+  // entry more than MAX_SESSION_ROUNDS past it, or one on a refuted base — the
+  // page has proved it impossible, so it defends its head against it rather
+  // than adopting it. Nor to a rewind that is itself on a refuted base or
+  // jumps a chain entry. Were the chain dropped for one of these, the recount
+  // below would take the impossible value as the new head and the forged
+  // balances would stick even when every honest page still holds the head.
+  if (trigger !== 'rewind') return false;
+  if (cp === null || c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return false;
   // Drop every trailing unseen entry (a load-taken head and what extends it,
   // never a seen one along the chain): the page stops defending the line it
   // took at load and adopts the doc's value on the next count.

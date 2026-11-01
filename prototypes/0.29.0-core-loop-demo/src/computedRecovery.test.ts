@@ -2487,6 +2487,63 @@ describe('🩹 a seen head under a sustained rewind: contested, always put back,
   }, 240_000);
 });
 
+describe('🩹 a load-taken honest head under a sustained impossible jump (F6)', () => {
+  // Copilot round-3: a page that loads the honest head H (unseen) and then
+  // meets a jump J built on H's session more than MAX_SESSION_ROUNDS past it
+  // has PROVED J impossible — no session reaches that far. The contest-driven
+  // give-way is for a rewind the page cannot classify; it must NOT fire for a
+  // provable jump, or it would empty the chain and the recount would adopt the
+  // forged jump as the new head, keeping its balances even though every honest
+  // page still holds H. One honest page, so N is always the page that restores.
+  it('defends its head and never gives way to the forged jump, however many restores it overwrites', async () => {
+    const pages = await openRoom(['A'], T0);
+    const { at, values } = playAndTrim(pages, T0, 1);
+    const H = asCheckpoint(values[0])!;
+    const cheat = await withCheat(pages, at + STEP);
+    // N loads on the doc holding H: H is its head, taken at load (unseen).
+    const fresh = await loadPage('N', 7);
+    fresh.casino.buyInChips(fresh.pid, 1_000);
+    send(at + 2 * STEP, cheat, fresh);
+    expect(bytesOf(cpOf(fresh))).toBe(bytesOf(values[0]));
+    expect(recoveryOf(fresh).trigger).toBeNull();
+    // A jump on H's session beyond MAX_SESSION_ROUNDS, forging a million for N.
+    const J = kit.checkpoint(testIdentity('forger'), nextSid(CTX, H), H.u + fresh.fold.MAX_SESSION_ROUNDS + 5, 'f'.repeat(32), { [fresh.pid]: 1_000_000n });
+    forge(cheat, J);
+    let T = at + 3 * STEP;
+    sync(T, cheat, fresh);
+    expect(recoveryOf(fresh).trigger).toBe('jump');
+    // Drive the contest well past the give-way decision point: a replay a
+    // second after each time N has put the head back. N is a newcomer to H (no
+    // felt on it), so its restore turn is an outsider's — each cycle takes a
+    // restore wait plus the turn — and CONTESTED_COUNT overwrites take over a
+    // minute. Give-way must decline every one, because J is a jump N has proved
+    // impossible, so N goes on restoring H rather than adopting the forgery.
+    let headSince = -1;
+    let forged = 1;
+    for (const driveEnd = T + 120_000; T <= driveEnd; T += STEP) {
+      sync(T, cheat, fresh);
+      restoreWrites(fresh, T);
+      sync(T, cheat, fresh);
+      const holds = bytesOf(computedOf(cheat).get(SUM)) === bytesOf(values[0]);
+      if (!holds) headSince = -1;
+      else if (headSince < 0) headSince = T;
+      else if (T - headSince >= 1_000) { forge(cheat, J); forged += 1; headSince = -1; }
+    }
+    // The contest ran: N kept winning the head back, so the cheat kept
+    // re-forging — enough cycles that the give-way decision point was reached.
+    expect(forged).toBeGreaterThanOrEqual(3);
+    // The cheat stops. Because N never gave way to the provable jump, it puts
+    // the head back and the doc converges on H; had it given way (dropping H
+    // and recounting J as its head) it would stop restoring and the doc would
+    // keep J and its forged million.
+    const back = run([fresh], T + STEP, T + STEP + 60_000, { step: STEP, until: () => bytesOf(computedOf(fresh).get(SUM)) === bytesOf(values[0]) });
+    expect(back).toBeLessThanOrEqual(T + STEP + 60_000);
+    expect(foldOf(fresh).base.u).toBe(H.u);
+    expect(foldOf(fresh).base.sid).toBe(nextSid(CTX, H));
+    expect(fresh.casino.readChips(fresh.pid)).toBe(1_000);
+  }, 240_000);
+});
+
 describe('🩹 recovery state is of its binding (F4)', () => {
   // The recovery duty's waits and contest counts belong to the document
   // binding they were taken on: rejoining the same table (a fresh epoch) must

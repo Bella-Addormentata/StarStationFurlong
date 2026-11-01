@@ -2006,6 +2006,11 @@ export class Sim {
     // (While the doc holds no checkpoint, deleted or junk, a page on this
     // build counts from the head it holds: casinoDoc heldBase.)
     const held = new Map(sp.p.casino.computedRecoveryOn() ? sp.p.casino.computedRecoveries().map((r) => [`${r.t}:${r.inc}`, r.head]) : []);
+    // 🩹 An ended incarnation whose checkpoint was deleted leaves no sum:/ses:
+    // key, but casinoDoc still counts its held head's balances (the recoveries
+    // above), so fold it too — else the cold ledger omits those balances and
+    // the oracle reports a false chip/cage violation while recovery is owed.
+    if (sp.p.casino.computedRecoveryOn()) for (const r of sp.p.casino.computedRecoveries()) incs.set(`${r.t}:${r.inc}`, { t: r.t, inc: r.inc });
     for (const [key, { t, inc }] of [...incs].sort(([a], [b]) => (a < b ? -1 : 1))) {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
       const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`)) ?? fold.asCheckpointFor(ctx)(held.get(key) ?? undefined);
