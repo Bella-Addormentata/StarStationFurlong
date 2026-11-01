@@ -14372,10 +14372,15 @@ const SPREAD_STEPS: readonly number[] = [1, 0.75, 0.5, 0.25];
  * StandSlot per StandTemplate on each item's def, rotated + translated into the
  * room like buildDeviceList. `front` is computeFront-snapped so it's walkable
  * and A*-reachable; faceAngle points toward the table. id `${item.id}:s${n}`.
+ * `canStand` (#345, default `isWalkable`) is whether a player can stand right
+ * at a spot, their collision radius clear of furniture (obstacles.ts
+ * playerFitsAt): stands that close up (StandTemplate.near) go only as far out
+ * as every one of them can be stood on.
  */
 export function buildStandList(
   items: FurnitureItem[],
   isWalkable: (x: number, z: number) => boolean,
+  canStand: (x: number, z: number) => boolean = isWalkable,
 ): StandSlot[] {
   const stands: StandSlot[] = [];
   for (const item of items) {
@@ -14393,7 +14398,7 @@ export function buildStandList(
     const fits = (k: number) => tmpls.every((t) => {
       if (!t.near) return true;
       const p = spot(t, k);
-      return isWalkable(p.x, p.z);
+      return canStand(p.x, p.z);
     });
     const f = SPREAD_STEPS.find(fits) ?? 0;
     tmpls.forEach((t, n) => {

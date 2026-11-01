@@ -70,7 +70,7 @@ import type { WorkoutPose } from "./voxelCharacter";
 import { WaypointReticle } from "./waypoint";
 import { findPath, worldToCol, worldToRow } from "./pathfinding";
 import { roomWalkBounds, clampToRoomWalk } from "./floorPlanDoc";
-import { OBSTACLES } from "./obstacles";
+import { OBSTACLES, PLAYER_R } from "./obstacles";
 import {
   VAT_HOLD_ALONG,
   vatPallorAt,
@@ -101,8 +101,9 @@ import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import type { DeviceTarget, DeviceFocusHooks } from "./devices";
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
-/** Collision radius — exported for the E3 move-furniture player-overlap check. */
-export const PLAYER_R = 0.38;
+/** Collision radius (obstacles.ts) — re-exported for the E3 move-furniture
+ *  player-overlap check. */
+export { PLAYER_R };
 
 /**
  * 👁️ First-person eye height above the mesh root while STANDING. The historical

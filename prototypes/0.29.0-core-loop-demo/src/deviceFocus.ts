@@ -162,13 +162,19 @@ class DeviceFocusController {
     return this.isActive() ? this.focusCam : null;
   }
 
-  /** 🦊👁 #345: where the focus camera looks from and at — the device's eye
-   *  and anchor — while it flies in or sits there, so World can keep other
-   *  players' foxes out of that view (sightline.ts); null otherwise, from
-   *  the moment the release ease begins. */
-  public getView(): { eye: THREE.Vector3; anchor: THREE.Vector3 } | null {
-    if ((this.state !== 'FOCUSING' && this.state !== 'FOCUSED') || !this.active) return null;
-    return { eye: this.active.device.eye, anchor: this.active.device.anchor };
+  /** 🦊👁 #345: the lines the focus camera looks along, from and to, so
+   *  World can keep other players' foxes out of them (sightline.ts). While
+   *  it flies in: from where it is now to what it looks at now (the eased
+   *  position and look), and the device's eye to its anchor, where it is
+   *  going, so whoever will stand in the way is gone before the screens
+   *  fill the view rather than half way down. Once there, that line alone.
+   *  Empty otherwise, from the moment the release ease begins. */
+  public getViews(): Array<{ eye: THREE.Vector3; anchor: THREE.Vector3 }> {
+    if (!this.active || !this.focusCam) return [];
+    const there = { eye: this.active.device.eye, anchor: this.active.device.anchor };
+    if (this.state === 'FOCUSED') return [there];
+    if (this.state === 'FOCUSING') return [{ eye: this.focusCam.position, anchor: this.currentLook }, there];
+    return [];
   }
 
   /** 🔍 The focused view's wheel / pinch zoom, once the camera has arrived

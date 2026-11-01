@@ -4671,17 +4671,18 @@ export class World {
   private updateRemoteAvatars(deltaTime: number): void {
     // Frame-rate-safe equivalent of the old fixed 0.28-per-frame lerp at 60fps.
     const factor = 1 - Math.pow(1 - 0.28, deltaTime * 60);
-    // 🦊👁 #345: while the camera is focused on a device, a fox standing
-    // across the line to it is hidden (the players beside you at the
-    // double-wide cabinet, whose heads the camera would sit inside).
-    const view = deviceFocus.getView();
+    // 🦊👁 #345: while the camera flies in to a device or is focused on
+    // it, a fox standing across its line of sight is hidden (the players
+    // beside you at the double-wide cabinet, whose heads the camera would
+    // sit inside).
+    const views = deviceFocus.getViews();
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
       avatar.lastX = pos.x;
       avatar.lastZ = pos.z;
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
-      avatar.rig.masterGroup.visible = !view || !blocksSight(view.eye, view.anchor, pos);
+      avatar.rig.masterGroup.visible = !views.some((v) => blocksSight(v.eye, v.anchor, pos));
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.

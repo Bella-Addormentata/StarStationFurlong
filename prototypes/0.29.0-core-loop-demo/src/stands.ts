@@ -13,6 +13,7 @@
  */
 
 import { FURNITURE, buildStandList, type StandSlot } from "./furniture";
+import { playerFitsAt } from "./obstacles";
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from "./pathfinding";
 
 export type { StandSlot };
@@ -22,18 +23,19 @@ export const STANDS: StandSlot[] = [];
 /** Re-derive STANDS from the furniture registry + current walkable grid. */
 export function rebuildStands(): void {
   STANDS.length = 0;
+  const isWalkable = (x: number, z: number): boolean => {
+    const row = worldToRow(z);
+    const col = worldToCol(x);
+    return (
+      row >= 0 &&
+      row < GRID_SIZE &&
+      col >= 0 &&
+      col < GRID_SIZE &&
+      walkable[row][col]
+    );
+  };
   STANDS.push(
-    ...buildStandList(FURNITURE, (x, z) => {
-      const row = worldToRow(z);
-      const col = worldToCol(x);
-      return (
-        row >= 0 &&
-        row < GRID_SIZE &&
-        col >= 0 &&
-        col < GRID_SIZE &&
-        walkable[row][col]
-      );
-    }),
+    ...buildStandList(FURNITURE, isWalkable, (x, z) => isWalkable(x, z) && playerFitsAt(x, z)),
   );
 }
 

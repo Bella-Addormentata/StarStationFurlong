@@ -27,6 +27,7 @@ vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
 const { ARCADE_WIDE_STAND_GAP, FURNITURE_DEFS, arcadeWidePanels, buildStandList } = await import('./furniture');
 const { VoxelCharacter } = await import('./voxelCharacter');
+const { PLAYER_R, playerFitsAt } = await import('./obstacles');
 
 type Xz = { x: number; z: number };
 
@@ -120,6 +121,28 @@ describe("the double-wide cabinet's four stands (#345)", () => {
       expect(s.faceAngle).toBeCloseTo(Math.PI, 6);
     });
     expect(closest(stands)).toBeGreaterThan(0.39);
+  });
+
+  it('go only where a player can stand, their collision radius clear of furniture behind them (#347)', () => {
+    // A sofa's back edge 0.3 m behind the spread stands: the walk grid (cell
+    // centres against the raw box, as pathfinding bakes it) has z 1.2 free,
+    // but collision keeps a player PLAYER_R from the box, 0.08 m short of it.
+    const behind = [{ x0: -3, z0: 1.5, x1: 3, z1: 2.5 }];
+    const centre = (w: number) => (Math.floor(w / 0.5) + 0.5) * 0.5;
+    const grid = (x: number, z: number) =>
+      !behind.some((b) => centre(x) > b.x0 && centre(x) < b.x1 && centre(z) > b.z0 && centre(z) < b.z1);
+    expect(wideStands(grid).every((s) => !playerFitsAt(s.front.x, s.front.z, behind))).toBe(true);
+    const stands = buildStandList(
+      [{ id: 'wide-1', kind: 'arcade-cabinet-wide', pos: { x: 0, z: 0 }, rot: 0, movable: true }],
+      grid,
+      (x, z) => grid(x, z) && playerFitsAt(x, z, behind),
+    );
+    for (const s of stands) {
+      expect(playerFitsAt(s.front.x, s.front.z, behind)).toBe(true);
+      expect(s.front.z).toBeLessThanOrEqual(behind[0]!.z0 - PLAYER_R);
+    }
+    // Closed up only as far as that takes, still wider apart than the panels.
+    expect(closest(stands)).toBeGreaterThan(0.5);
   });
 
   it('turn with the cabinet, and so do its panels', () => {
