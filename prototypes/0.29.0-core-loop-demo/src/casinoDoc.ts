@@ -2182,6 +2182,16 @@ interface Counted {
    *  after it meanwhile. Until then a rewind the page can't tell from the
    *  head others counted gives way (noteCounted). */
   firmAt: number;
+  /** 🩹 Whether this page SAW this checkpoint come — built on the session it
+   *  was counting from, or extending one it saw come — rather than taking it
+   *  at load. A seen head is grounded: a rewind of it is a forgery (its
+   *  session refuted, noteCounted; it is defended, never given way). An
+   *  unseen head (load-taken) can't be told from a peer's replay, so it gives
+   *  way — within TAKEN_WAIT_MS of load (firmAt), and, past that (a
+   *  partition outlasting the window), once its restore keeps losing to a
+   *  persistent rival the room puts back over it (computedTable restoreStep →
+   *  giveWayComputed), which no fixed timeout can cover. */
+  seen: boolean;
 }
 
 /** Checkpoints of an incarnation kept to put back (ComputedInc chain). */
@@ -2403,6 +2413,15 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   }
   if (trigger === null) c.calm++;
   if (trigger === 'jump' && cp !== null) refute(c, liveSidOf(c, cp));
+  // 🩹 A rewind of a SEEN head is a forgery (this page is grounded in its
+  // head): refute the session that rewind opens, so a checkpoint the forger
+  // then builds on it, above the head, puts a restore in motion too instead
+  // of slipping in as a new head (an extension of a forged rewind). Only a
+  // rewind that stayed one through the adoption/give-way above is refuted. An
+  // UNSEEN (load-taken) head can't tell the honest head coming back from a
+  // replay, so its rewind is NOT refuted here — it gives way to it (firmAt
+  // within the window, giveWayComputed past it).
+  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) refute(c, liveSidOf(c, cp));
   if (cp === null || typeof value !== 'object' || value === null) return;
   const head = c.chain[c.chain.length - 1];
   const sid = liveSidOf(c, cp);
@@ -2424,7 +2443,16 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
       : cp.b === watched
         ? 0
         : taken;
-  c.chain.push({ value, cp, sid, pubs: new Set(), firmAt });
+  // `seen` mirrors firmAt's branches: a head given way over is unseen again,
+  // an extension inherits the head's, one on the session this page was
+  // counting from was seen come, anything else (a fresh take, mostly at load)
+  // is unseen.
+  const seen = c.dropped.includes(sid)
+    ? false
+    : head && cp.b === head.sid
+      ? head.seen
+      : cp.b === watched;
+  c.chain.push({ value, cp, sid, pubs: new Set(), firmAt, seen });
   if (c.chain.length > CHAIN_KEPT) c.chain.shift();
   if (c.gaveUp && c.gaveUp.sid !== sid) c.gaveUp = null;
 }
@@ -3747,6 +3775,66 @@ export function computedRestorePending(tableId: string, inc: string | null = com
   if (!c || !computedMap || !recoveryOn) return false;
   const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
   return trigger === 'rewind' || trigger === 'jump';
+}
+
+/**
+ * 🩹 Give way to the rival the room keeps putting back, when this page's head
+ * is one it took at LOAD (unseen) and its restore of it keeps losing. The
+ * firmAt window (TAKEN_WAIT_MS) converges a load-taken head to the honest one
+ * while the page hears the room soon after loading; but a partition that
+ * outlasts the window leaves the load-taken head looking firm by the clock,
+ * and no longer a timeout can tell a late-arriving honest head from a replay.
+ * So, driven by the restore duty once this page's restore of an unseen head
+ * has been written over again and again by a rewind or a jump the page can't
+ * classify (computedTable restoreStep: the room backs the rival — a lone
+ * forger can't keep a value in the doc against the pages that counted the
+ * honest head), the page drops the unseen head and what it extends, and takes
+ * the doc's value as every build reads it. A SEEN head never gives way (a
+ * grounded page defends it against a cheat), and nothing happens unless a
+ * rewind or a jump stands now, so an honest trim that moved the head on is
+ * untouched. Converges two honest pages that each hold a different head after
+ * any partition; the one-honest-page-vs-forger case still needs the house's
+ * signed head (PR 6a-2). Returns whether it gave way.
+ */
+export function giveWayComputed(tableId: string, inc: string): boolean {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c || !computedMap || !recoveryOn) return false;
+  const head = c.chain[c.chain.length - 1];
+  if (!head || head.seen) return false;
+  const trigger = recoveryTrigger(c, checkpointAt(computedMap, c.t, c.inc));
+  if (trigger !== 'rewind' && trigger !== 'jump') return false;
+  // Drop every trailing unseen entry (a load-taken head and what extends it,
+  // never a seen one along the chain): the page stops defending the line it
+  // took at load and adopts the doc's value on the next count.
+  let j = c.chain.length;
+  while (j > 0 && !c.chain[j - 1].seen) j--;
+  if (j >= c.chain.length) return false;
+  for (const e of c.chain.slice(j)) drop(c, e.sid);
+  c.chain.length = j;
+  return true;
+}
+
+/** 🩹 Whether any incarnation this page tracks has recovery work outstanding
+ *  — a restore in motion, a session to reopen, or one to give up. World keeps
+ *  marking its table frames while this is true (computedTable
+ *  computedCompactionPending's caller, the croupier noteTablesRunning), as it
+ *  does while the room has a table, so that after the room's last table is
+ *  gone and an ended incarnation's checkpoint or session was deleted the page
+ *  doesn't read as asleep a lapse on and leave the recovery stuck. Reads the
+ *  doc only; the real sleep guard (tablesAwake) still gates the duty. */
+export function computedRecoveryPending(): boolean {
+  const map = computedMap;
+  const casino = casinoMap;
+  if (!map || !casino || !recoveryOn) return false;
+  for (const c of computedIncs.values()) {
+    const base = heldBase(c, map);
+    if (recoveryTrigger(c, checkpointAt(map, c.t, c.inc)) !== null) return true;
+    const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+      && !casino.has(goneKey(c.t, c.inc)) && base?.e !== 1;
+    if (live && !(map.get(sessionKey(c.t, c.inc, liveSidOf(c, base))) instanceof Y.Map)) return true;
+    if (sessionLost(c, map, base)) return true;
+  }
+  return false;
 }
 
 /**

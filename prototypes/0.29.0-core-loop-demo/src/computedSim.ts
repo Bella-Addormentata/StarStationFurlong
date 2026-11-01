@@ -1496,7 +1496,7 @@ export class Sim {
         const { casino, croupier, table } = sp.p;
         const tables = this.tables.filter((t) => sp.inRoom.has(t));
         const wakes = croupier.tablesWakeCount();
-        if (tables.length || table.computedCompactionPending()) croupier.noteTablesRunning(now);
+        if (tables.length || table.computedCompactionPending() || casino.computedRecoveryPending()) croupier.noteTablesRunning(now);
         if (croupier.tablesWakeCount() !== wakes) {
           this.wasAway(sp);
           sp.restartAt = { at: now, T: this.T };
@@ -2132,7 +2132,7 @@ export class Sim {
     const out: string[] = [];
     if (sp.partial || !casino.casinoWhole()) out.push('its doc holds part of an update');
     if (!casino.computedSettled()) out.push('a count waits on its checks');
-    const runs = this.tables.some((t) => sp.inRoom.has(t)) || table.computedCompactionPending();
+    const runs = this.tables.some((t) => sp.inRoom.has(t)) || table.computedCompactionPending() || casino.computedRecoveryPending();
     if (runs && !croupier.tablesAwake(now)) out.push('its tables read asleep');
     if (sp.timers.length > 0) out.push(`${sp.timers.length} timers wait`);
     return out;
@@ -2180,7 +2180,7 @@ export class Sim {
       if (sp.mode !== 'up') continue;
       const now = this.enter(sp);
       const { casino, table } = sp.p;
-      if (table.computedCompactionPending()) return false;
+      if (table.computedCompactionPending() || casino.computedRecoveryPending()) return false;
       for (const t of this.tables) {
         const res = casino.computedFoldOf(t);
         if (!res || !casino.isComputedTable(t)) continue;

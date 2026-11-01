@@ -25,7 +25,7 @@ import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
+import { computedRecoveryPending, isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
 import type { TableClosing } from "./casinoDoc";
 import { autoSwitchComputed, computedCompactionPending, tickComputedTables } from "./computedTable";
 import type { ComputedTableRef } from "./computedTable";
@@ -6408,10 +6408,12 @@ export class World {
     // 💤 Every page running tables marks the frame, so one waking from a
     // sleep acts on none until its doc has caught up (croupier.ts). 🧮 So
     // too while a computed table removed from the room waits to be compacted
-    // (its incarnation ended, its sessions still in the doc): with no table
-    // left, unmarked frames would read as asleep a lapse on, and compaction
-    // runs only on an awake page.
-    if (tables.length || computedCompactionPending()) noteTablesRunning();
+    // (its incarnation ended, its sessions still in the doc), or while any
+    // recovery is still owed (computedRecoveryPending): with no table left,
+    // unmarked frames would read as asleep a lapse on, and both run only on
+    // an awake page — so a deleted ended checkpoint or session would never be
+    // put back or given up once the room's last table is gone.
+    if (tables.length || computedCompactionPending() || computedRecoveryPending()) noteTablesRunning();
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.

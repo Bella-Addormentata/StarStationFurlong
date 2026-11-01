@@ -171,6 +171,7 @@ import {
   fairSettingSeq,
   finalizeComputed,
   giveUpComputed,
+  giveWayComputed,
   holdsDeed,
   houseOnline,
   houseSetUp,
@@ -599,6 +600,12 @@ function lookAtClock(now: number): void {
     compactedAt = null;
     away.clear();
     awayAt.clear();
+    // 🩹 The recovery duty's waits and contest counts were of that binding
+    // too: rejoining the same table must not reuse an expired reopen/give-up
+    // wait or show a stale 🚩 contested warning from the old document.
+    recovering.clear();
+    recoveredAt = null;
+    recoveryRanks.clear();
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -2311,10 +2318,13 @@ function tickTable(st: TableState, now: number): void {
   // build on it, nor does what this page saw played of the head's session
   // give way to the forged one's (noteChain: put back over a deleted
   // session, the head's rounds are held until they come back); the rest
-  // plays on, as on every build (noteResult). (The trigger gone since the
-  // fold last moved can't be: the checkpoint is read whole on every change,
-  // a new fold result, which noteResult (tableOf, every frame) ends it on.)
-  const forged = st.forged !== null;
+  // plays on, as on every build (noteResult). Gated on the LIVE trigger
+  // (forgedStands → computedRestorePending), not st.forged: a rewind read
+  // before this table's first fold had a `was` to move from leaves st.forged
+  // null though the restore is pending, and the duties must still stand off
+  // the forged session. st.forged carries only the what-this-page-wrote
+  // bookkeeping; the live trigger decides whether the forgery stands.
+  const forged = forgedStands(st);
   // (First: what a round rests on is kept before any duty reads it lost.)
   if (!forged) noteChain(st, now);
   if (!forged) noteWitness(st, me, now);
@@ -3610,6 +3620,22 @@ function restoreStep(w: Recovering, r: ComputedRecovery, pub: string, now: numbe
     if (w.overAt === null || w.overAt > now || now - w.overAt > CONTESTED_CALM_MS) w.overwrites = 0;
     w.overwrites += 1;
     w.overAt = now;
+  }
+  // 🩹 An unseen head that keeps losing the contest — this page's restore of
+  // it written over again and again by a rewind or a jump it can't classify,
+  // the room backing that rival — gives way to it, converging a page that
+  // took its head at load after a partition the firmAt window couldn't cover
+  // (no fixed timeout can). Only an UNSEEN head gives way (giveWayComputed
+  // self-gates on `seen`): a page grounded in its head defends it against a
+  // cheat and flies the 🚩 instead. Gated on hearing the room now, so stale
+  // cached forgeries this page can't yet see the room answer don't count.
+  if (w.overwrites >= CONTESTED_COUNT && w.overAt !== null && now - w.overAt <= CONTESTED_CALM_MS
+      && heardThrough(now - RESTORE_WAIT_MS, now) && giveWayComputed(r.t, r.inc)) {
+    w.trigger = null;
+    w.wrote = null;
+    w.overwrites = 0;
+    w.overAt = null;
+    return;
   }
   if (r.trigger === null || r.head === null) {
     w.trigger = null;

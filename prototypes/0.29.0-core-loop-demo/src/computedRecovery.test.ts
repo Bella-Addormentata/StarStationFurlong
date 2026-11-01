@@ -2333,3 +2333,219 @@ describe('🩹 a page that took its head at load', () => {
     expect(bytesOf(computedOf(fresh).get(SUM))).toBe(bytesOf(values[past ? 2 : 0]));
   }, 90_000);
 });
+
+// 🩹 The Copilot findings on this PR's first review round, each with the
+// convergence or gating it turns on.
+describe('🩹 a load-taken head after a partition the firmAt window could not cover (F1)', () => {
+  // A page that loads a forged jump over an OLDER checkpoint takes it as its
+  // head — it never counted the checkpoint the jump overshoots, so it cannot
+  // classify it — firm TAKEN_WAIT_MS on. If it meets the honest head the room
+  // restores only AFTER that window (a partition longer than 45 s), the firmAt
+  // give-way can no longer fire, and two honest pages used to restore their
+  // different heads over each other forever. No fixed timeout covers an
+  // arbitrary partition; the page gives way once its restore keeps losing to
+  // the rival the room puts back (giveWayComputed, driven by the contest).
+  it('converges: the late page gives way when its restore keeps losing to the restored head', async () => {
+    const pages = await openRoom(['A'], T0);
+    const [a] = pages;
+    const { at, values } = playAndTrim(pages, T0, 2);
+    feltsDown([a], at + STEP);
+    const older = asCheckpoint(values[0])!;
+    const head = asCheckpoint(values[1])!;
+    // A jump over the OLDER checkpoint, with a forged million for A. A, which
+    // counted the older one, refutes it and restores the head.
+    const J = kit.checkpoint(testIdentity('forger'), nextSid(CTX, older), older.u + 501, 'f'.repeat(32), { [a.pid]: 1_000_000n });
+    const cheat = await withCheat(pages, at + STEP);
+    forge(cheat, J);
+    // N loads on the cheat's doc (partitioned from A): it takes the jump as
+    // its head, a player on the forgery, and A never hears the jump.
+    const fresh = await loadPage('N', 7);
+    fresh.casino.buyInChips(fresh.pid, 1_000);
+    send(at + 2 * STEP, cheat, fresh);
+    expect(bytesOf(recoveryOf(fresh).head)).toBe(bytesOf(J));
+    expect(foldOf(fresh).base.u).toBe(J.u);
+    expect(fresh.table.writeComputedSlip(TABLE, [red(7)], at + 2 * STEP)).toBe('ok');
+    send(at + 2 * STEP, fresh, cheat);
+    // The partition heals only past TAKEN_WAIT_MS, so the jump is now firm by
+    // N's clock and the firmAt give-way is spent.
+    let T = at + 2 * STEP + fresh.casino.TAKEN_WAIT_MS + STEP;
+    expect(recoveryOf(fresh).trigger).toBeNull(); // its own head: nothing in motion yet
+    const end = T + 150_000;
+    for (; T <= end; T += STEP) {
+      sync(T, cheat, a, fresh);
+      for (const p of [a, fresh]) restoreWrites(p, T);
+      sync(T, cheat, a, fresh);
+    }
+    // The late page gave way: the pages agree on the head's line, nothing is
+    // in motion, nothing flags a contest, and the forged million never stuck.
+    const now = cpOf(a)!;
+    expect(now.u).toBeGreaterThanOrEqual(head.u);
+    expect(now.u).toBeLessThan(J.u);
+    for (const p of [a, fresh]) {
+      expect(bytesOf(computedOf(p).get(SUM)), p.name).toBe(bytesOf(computedOf(a).get(SUM)));
+      expect(recoveryOf(p).trigger, p.name).toBeNull();
+      expect(p.table.computedContested(TABLE, end), p.name).toBe(false);
+      expect(chipsOn(p, [a, fresh]), p.name).toEqual(chipsOn(a, [a, fresh]));
+    }
+  }, 240_000);
+});
+
+describe('🩹 an extension of a forged rewind (F2)', () => {
+  // A rewind of a SEEN head is a forgery: its session is refuted, so a
+  // checkpoint the forger then builds on it, above the head, puts a restore in
+  // motion (a jump) instead of slipping in as the new head and keeping its
+  // forged balances.
+  it('a checkpoint built above the head on a rewind\'s session is put back over too', async () => {
+    const pages = await openRoom(['A', 'B'], T0);
+    const { at, values } = playAndTrim(pages, T0, 3);
+    feltsDown(pages, at + STEP);
+    const chips = chipsOn(pages[0], pages);
+    const head = asCheckpoint(values[2])!;
+    expect(head.u).toBeGreaterThan(1);
+    const cheat = await withCheat(pages, at + STEP);
+    const nets = { [pages[0].pid]: 1_000_000n };
+    // A rewind below the head on an UNRELATED session (not a replay of any
+    // checkpoint the pages counted).
+    const R = kit.checkpoint(testIdentity('forger'), 'd'.repeat(24), 1, 'f'.repeat(32), nets);
+    forge(cheat, R);
+    let T = at + 2 * STEP;
+    sync(T, cheat, ...pages);
+    for (const p of pages) expect(recoveryOf(p).trigger, p.name).toBe('rewind');
+    const holdsHead = (): boolean => pages.every((p) => bytesOf(computedOf(p).get(SUM)) === bytesOf(values[2]));
+    ({ at: T } = watchWrites(pages, cheat, T, T + 40_000, holdsHead));
+    expect(holdsHead()).toBe(true);
+    // The extension, built on the session the rewind opens, above the head.
+    const E = kit.checkpoint(testIdentity('forger'), nextSid(CTX, R), head.u + 5, 'e'.repeat(32), nets);
+    forge(cheat, E);
+    T += STEP;
+    sync(T, cheat, ...pages);
+    for (const p of pages) expect(recoveryOf(p).trigger, p.name).toBe('jump');
+    const { at: back } = watchWrites(pages, cheat, T, T + 40_000, holdsHead);
+    expect(back).toBeLessThanOrEqual(T + 40_000);
+    for (const p of pages) expect(chipsOn(p, pages), p.name).toEqual(chips);
+  }, 90_000);
+});
+
+describe('🩹 a seen head under a sustained rewind: contested, always put back, never adopted', () => {
+  // The whole-system invariant behind Copilot's F3 finding: a grounded (seen)
+  // head meeting a relentless replay-forgery flies the 🚩 contested warning,
+  // is put back every time, is never adopted or finalised, and the room
+  // converges to it with chips intact once the forging stops. Nothing of this
+  // page ever lands in the forged session.
+  //
+  // The finding itself was that the tick's stand-off duties (noteChain,
+  // noteWitness, reput, witness, the trim) were gated on `st.forged`, the
+  // what-this-page-wrote snapshot, which stays null until a fold MOVES off the
+  // head's session — so a rewind read before this table's first fold leaves it
+  // null though the restore is pending, and the duties would briefly run on the
+  // forged session. The fix gates them on the LIVE trigger (forgedStands →
+  // computedRestorePending) instead, so they stand off however the snapshot
+  // lags. That gate is defence-in-depth: with recovery live the restore
+  // converges the doc and the tick bails early (casinoWhole/computedSettled)
+  // before any write on the forged session can be observed, so the gate has no
+  // distinguishing unit observable — its adversarial cover is the
+  // checkpoint-forger simulation, not this test. This test pins the invariant
+  // the gate serves.
+  it('a sustained rewind is held off, flagged and put back, never written on or finalised', async () => {
+    // One honest page, so the page we watch is always the one that restores:
+    // with two, the recovery turn (placeOf, by the pages' random keys) decides
+    // which puts the head back first each cycle, and only that page's restore
+    // is ever written over, so only it counts the contest.
+    const pages = await openRoom(['A'], T0);
+    const [a] = pages;
+    const { at, values } = playAndTrim(pages, T0, 2);
+    feltsDown(pages, at + STEP);
+    const chips = chipsOn(pages[0], pages);
+    const forgedSes = `ses:${TABLE}:${INC}:${nextSid(CTX, asCheckpoint(values[0])!)}`;
+    const forgedBefore = [...(computedOf(a).get(forgedSes) as Y.Map<unknown> | undefined)?.keys() ?? []].sort();
+    const cheat = await withCheat(pages, at + STEP);
+    forge(cheat, values[0]);
+    // Drive the contest: a replay a second after each time the head is back.
+    let T = at + 2 * STEP;
+    const stop = T + 180_000;
+    let headSince = -1;
+    for (; T <= stop && !a.table.computedContested(TABLE, T); T += STEP) {
+      sync(T, cheat, ...pages);
+      for (const p of pages) restoreWrites(p, T);
+      sync(T, cheat, ...pages);
+      const holds = bytesOf(computedOf(cheat).get(SUM)) === bytesOf(values[1]);
+      if (!holds) headSince = -1;
+      else if (headSince < 0) headSince = T;
+      else if (T - headSince >= 1_000) { forge(cheat, values[0]); headSince = -1; }
+    }
+    // The flag was reached (the restore contest works), nothing of the pages'
+    // ever went into the forged session, and no page built a checkpoint on it.
+    expect(a.table.computedContested(TABLE, T)).toBe(true);
+    for (const p of pages) {
+      const ses = [...(computedOf(p).get(forgedSes) as Y.Map<unknown> | undefined)?.keys() ?? []].sort();
+      expect(ses, p.name).toEqual(forgedBefore);
+    }
+    // The cheat stops: the head comes back and the pages agree, chips intact.
+    const back = run(pages, T + STEP, T + STEP + 60_000, { step: STEP, until: () => pages.every((p) => bytesOf(computedOf(p).get(SUM)) === bytesOf(values[1])) });
+    expect(back).toBeLessThanOrEqual(T + STEP + 60_000);
+    for (const p of pages) expect(chipsOn(p, pages), p.name).toEqual(chips);
+  }, 240_000);
+});
+
+describe('🩹 recovery state is of its binding (F4)', () => {
+  // The recovery duty's waits and contest counts belong to the document
+  // binding they were taken on: rejoining the same table (a fresh epoch) must
+  // not keep showing a 🚩 contested warning from the old document.
+  it('a rebind clears the contested flag taken on the old binding', async () => {
+    // One honest page, so A is always the page that restores and so the one
+    // that counts the contest (with two, the recovery turn by the pages'
+    // random keys would decide that, and A would flag only some runs).
+    const pages = await openRoom(['A'], T0);
+    const [a] = pages;
+    const { at, values } = playAndTrim(pages, T0, 2);
+    feltsDown(pages, at + STEP);
+    const cheat = await withCheat(pages, at + STEP);
+    forge(cheat, values[0]);
+    // Drive A's card into the 🚩 contested state: a replay over each restore.
+    let T = at + 2 * STEP;
+    const stop = T + 150_000;
+    let headSince = -1;
+    for (; T <= stop && !a.table.computedContested(TABLE, T); T += STEP) {
+      sync(T, cheat, ...pages);
+      for (const p of pages) restoreWrites(p, T);
+      sync(T, cheat, ...pages);
+      const holds = bytesOf(computedOf(cheat).get(SUM)) === bytesOf(values[1]);
+      if (!holds) headSince = -1;
+      else if (headSince < 0) headSince = T;
+      else if (T - headSince >= 1_000) { forge(cheat, values[0]); headSince = -1; }
+    }
+    expect(a.table.computedContested(TABLE, T)).toBe(true);
+    // Rejoin: the doc is bound afresh (a new epoch). One frame later the stale
+    // contest is gone.
+    a.casino.bindCasinoDoc(a.doc, CTX.room);
+    frame(T + STEP, a);
+    expect(a.table.computedContested(TABLE, T + STEP)).toBe(false);
+  }, 240_000);
+});
+
+describe('🩹 recovery keeps the page marked awake (F5)', () => {
+  // World marks table frames while computedRecoveryPending, so a deleted ended
+  // checkpoint or session is still put back or given up once the room's last
+  // table is gone. The predicate reflects outstanding work only.
+  it('is false on a whole doc, true while a restore or a reopen is owed', async () => {
+    const pages = await openRoom(['A'], T0);
+    const [a] = pages;
+    const { at, values } = playAndTrim(pages, T0, 2);
+    expect(a.casino.computedRecoveryPending()).toBe(false);
+    const cheat = await withCheat(pages, at + STEP);
+    // A replay (rewind) owed → pending.
+    forge(cheat, values[0]);
+    sync(at + 2 * STEP, cheat, a);
+    expect(a.casino.computedRecoveryPending()).toBe(true);
+    // Put back → nothing owed.
+    const back = run([a], at + 3 * STEP, at + 3 * STEP + 60_000, { step: STEP, until: () => bytesOf(computedOf(a).get(SUM)) === bytesOf(values[1]) });
+    expect(back).toBeLessThanOrEqual(at + 3 * STEP + 60_000);
+    expect(a.casino.computedRecoveryPending()).toBe(false);
+    // A deleted live session → a reopen owed.
+    const sid = foldOf(a).base.sid;
+    cheatWrites(cheat, (m) => m.delete(`ses:${TABLE}:${INC}:${sid}`));
+    sync(back + STEP, cheat, a);
+    expect(a.casino.computedRecoveryPending()).toBe(true);
+  }, 90_000);
+});
+
