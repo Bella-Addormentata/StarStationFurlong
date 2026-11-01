@@ -122,7 +122,8 @@ function waitsWhy(size: number, hash: string): string {
  *  is and the FETCH press, then its caption and who took it when. */
 function photoHtml(n: ShownNote, me: string, big: boolean): string {
   const a = n.attach!;
-  const look = photoLook(a);
+  // The panel's look: its photos get room ahead of the faces'.
+  const look = photoLook(a, performance.now(), true);
   const pic = look === 'ready' ? photoPicture(a.hash) : null;
   const when = new Date(a.takenAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const caption = `<div style="font-size:9.5px; color:${DIM}; margin-top:4px;">📷 ${a.caption ? `${escapeHtml(a.caption)} · ` : ''}taken ${escapeHtml(when)} by ${authorLabel(n, me)}</div>`;
@@ -212,9 +213,10 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   let posting = false;
   let photoSince = 0;
   let photoKey = '';
-  /** Every photo note's look now, which moves them along too. */
+  /** Every photo note's look now, which moves them along too (the panel's
+   *  looks: its photos get room ahead of the faces'). */
   const photoLooks = (): string =>
-    readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author)).map((n) => `${n.id}:${photoLook(n.attach!)}`).join(',');
+    readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author)).map((n) => `${n.id}:${photoLook(n.attach!, performance.now(), true)}`).join(',');
 
   const notesHtml = (): string => {
     const me = getIdentityPub();
@@ -344,6 +346,11 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     if (!panel || !here() || posting) return;
     const box = panel.querySelector<HTMLTextAreaElement>('[data-text]');
     if (!box) return;
+    // The note is what the player had at the press: words typed or a colour
+    // picked while the photo goes to the node stay for the next note
+    // (#340 review).
+    const text = box.value;
+    const tint = colour;
     const shot = chosen;
     let attach: BoardPhoto | undefined;
     if (shot) {
@@ -361,9 +368,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       }
       attach = got.photo;
     }
-    const result = postNote(itemId, kind, { text: box.value, colour, ...(attach ? { attach } : {}) });
+    const result = postNote(itemId, kind, { text, colour: tint, ...(attach ? { attach } : {}) });
     if (result.ok) {
-      box.value = '';
+      if (box.value === text) box.value = '';
       if (shot && chosen?.id === shot.id) chosen = null;
       status = 'Pinned.';
       updateCount();

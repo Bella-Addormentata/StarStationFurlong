@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   __test, blobLaneNodeId, blobNodeTag, blobLaneReady, blobState, blobUrl, fetchFromLink, forgetBlob, forgetBlobLane, formatBytes, freshNodeHolders, nodeHolders,
-  nodeShares, recheckBlob, refreshHeldBlobs, refreshHolders, setBlobLaneNode, setBlobLaneRoom, shareBlob,
+  nodeShares, recheckBlob, refreshHeldBlobs, refreshHolders, setBlobLaneNode, setBlobLaneRoom, shareBlob, whereAskedAt,
 } from './blobLane';
 import { setNodeMediaOrigin } from './tvConsent';
 import { tvNow, tvWallNow } from './tvDoc';
@@ -86,6 +86,35 @@ describe('blobLane', () => {
     expect(freshNodeHolders(HASH, 30_999)).toEqual([ID]);
     expect(freshNodeHolders(HASH, 31_000)).toBeNull(); // due to be asked again: not an answer for now
     expect(nodeHolders(HASH)).toEqual([ID]); // still what FETCH names meanwhile
+  });
+
+  it('says when a WHERE naming a file went out: not before its turn, and only for this room (#340 review)', async () => {
+    setNodeMediaOrigin(ORIGIN, tvNow(), tvWallNow());
+    setBlobLaneRoom('room-1');
+    setBlobLaneNode({ origin: ORIGIN, cap: CAP, irohId: ID });
+    const asked: string[][] = [];
+    let answer = (): void => undefined;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      asked.push(new URL(url).searchParams.get('hashes')!.split(','));
+      await new Promise<void>((r) => { answer = r; });
+      return new Response(JSON.stringify({ holders: {} }), { status: 200 });
+    }));
+    const files = Array.from({ length: 20 }, (_, i) => (i + 1).toString(16).padStart(64, '0'));
+    const first = refreshHolders(files, 1_000);
+    expect(asked).toEqual([files.slice(0, 16)]); // the most one ask names
+    expect(files.slice(0, 16).every((h) => whereAskedAt(h) === 1_000)).toBe(true);
+    expect(whereAskedAt(files[16])).toBeNull();
+    void refreshHolders(files.slice(16), 2_000); // one out already: none sent
+    expect(asked).toHaveLength(1);
+    expect(whereAskedAt(files[16])).toBeNull();
+    answer();
+    await first;
+    const second = refreshHolders(files.slice(16), 3_000);
+    expect(whereAskedAt(files[16])).toBe(3_000);
+    setBlobLaneRoom('room-2');
+    expect(whereAskedAt(files[16])).toBeNull(); // asked for the last room
+    answer();
+    await second;
   });
 
   it('formats sizes for the FETCH button', () => {

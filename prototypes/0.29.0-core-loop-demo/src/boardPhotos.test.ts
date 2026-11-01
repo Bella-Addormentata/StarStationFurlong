@@ -21,7 +21,24 @@ const lane = vi.hoisted(() => ({
   whereAsks: [] as string[][],
   /** WHERE's answer: true fills the asked files' holders at once. */
   whereAnswers: true,
+  /** As the lane: the files one WHERE names at most, and an answer the test
+   *  hands back itself (`answerWhere`), with no other ask sent meanwhile. */
+  whereMax: Infinity,
+  whereHeld: false,
+  whereOut: null as null | { at: number; hashes: string[]; done: () => void },
+  whereSent: new Map<string, number>(),
+  fetchedBlind: [] as string[],
 }));
+
+/** The node answers the WHERE out: none of the room's nodes hold them yet. */
+async function answerWhere(): Promise<void> {
+  const out = lane.whereOut;
+  if (!out) return;
+  lane.whereOut = null;
+  for (const h of out.hashes) lane.holders.set(h, []);
+  out.done();
+  await new Promise((r) => setTimeout(r, 0));
+}
 
 vi.mock('./blobLane', () => ({
   blobLaneReady: () => lane.ready,
@@ -31,14 +48,24 @@ vi.mock('./blobLane', () => ({
   blobUrl: (hash: string) => (lane.ready ? `http://node.test/blob/${hash}` : null),
   fetchBlob: async (hash: string, size: number, provider: string, mime: string) => {
     lane.fetches.push({ hash, size, provider, mime });
+    if (!lane.holders.has(hash)) lane.fetchedBlind.push(hash);
     if (!lane.refuse) lane.states.set(hash, { state: 'queued', have: 0, size });
     return lane.refuse;
   },
   freshNodeHolders: (hash: string) => lane.holders.get(hash) ?? null,
-  refreshHolders: async (hashes: string[]) => {
-    lane.whereAsks.push([...hashes]);
-    if (lane.whereAnswers) for (const h of hashes) lane.holders.set(h, []);
+  refreshHolders: async (hashes: string[], now = performance.now()) => {
+    if (lane.whereOut) return; // one ask out at a time
+    const due = [...new Set(hashes)].filter((h) => !lane.holders.has(h)).slice(0, lane.whereMax);
+    if (due.length === 0) return;
+    lane.whereAsks.push(due);
+    for (const h of due) lane.whereSent.set(h, now);
+    if (lane.whereHeld) {
+      await new Promise<void>((done) => { lane.whereOut = { at: now, hashes: due, done }; });
+      return;
+    }
+    if (lane.whereAnswers) for (const h of due) lane.holders.set(h, []);
   },
+  whereAskedAt: (hash: string) => lane.whereSent.get(hash) ?? null,
   importBlob: async (file: File) => {
     lane.imports.push(file);
     return lane.importAnswer ?? { error: 'no answer' };
@@ -140,6 +167,11 @@ beforeEach(() => {
   lane.room = 'room-1';
   lane.whereAsks.length = 0;
   lane.whereAnswers = true;
+  lane.whereMax = Infinity;
+  lane.whereHeld = false;
+  lane.whereOut = null;
+  lane.whereSent.clear();
+  lane.fetchedBlind.length = 0;
   try { localStorage.clear(); } catch { /* none in this runner */ }
   resetBoardPhotosForTest(fakeMaker());
   vi.unstubAllGlobals();
@@ -317,6 +349,63 @@ describe('📷 where a photo is for this viewer', () => {
     lane.holders.set(HASH, []); // WHERE answers, in the next room
     await pressed;
     expect(lane.fetches).toHaveLength(0);
+  });
+
+  it('counts each photo’s wait for WHERE from when a WHERE naming it goes out, so a full board finds the host’s copy (#340 review)', async () => {
+    lane.whereMax = 16; // as the node takes
+    lane.whereHeld = true; // one WHERE out at a time, answered after 4 s
+    const board = Array.from({ length: 24 }, (_, i) => photo({ hash: (i + 1).toString(16).padStart(64, '0') }));
+    for (const p of board) lane.states.set(p.hash, { state: 'none' });
+    for (let t = 0; t <= 30_000; t += 1_000) {
+      if (lane.whereOut && t - lane.whereOut.at >= 4_000) await answerWhere();
+      board.forEach((p) => photoLook(p, t)); // the face's 1 Hz push
+      for (let i = 0; i < 4; i++) await flush();
+    }
+    // WHERE went out in turns: the first photo looked at, then 16, then the
+    // last 7, which went out 8 s in and were answered past the 10 s an ask
+    // counted from the first look would have waited.
+    expect(lane.whereAsks.map((a) => a.length)).toEqual([1, 16, 7]);
+    // Every photo asked for once, each only once WHERE had said who holds it.
+    expect(lane.fetches.map((f) => f.hash).sort()).toEqual(board.map((p) => p.hash).sort());
+    expect(lane.fetchedBlind).toEqual([]);
+  });
+
+  it('still asks the provider alone when WHERE never answers, once a WHERE naming the photo has waited 10 s', async () => {
+    lane.whereHeld = true;
+    lane.states.set(HASH, { state: 'none' });
+    expect(photoLook(photo(), 0)).toBe('loading');
+    expect(lane.whereSent.get(HASH)).toBe(0);
+    expect(photoLook(photo(), 9_999)).toBe('loading');
+    expect(lane.fetches).toHaveLength(0);
+    expect(photoLook(photo(), 10_000)).toBe('loading');
+    expect(lane.fetchedBlind).toEqual([HASH]);
+  });
+
+  it('gives the open panel’s photos room ahead of the faces’ (#340 review)', async () => {
+    const reads: string[] = [];
+    vi.stubGlobal('fetch', async (url: string) => {
+      reads.push(url);
+      return new Response(jpegHeader(512, 384, 100));
+    });
+    const size = jpegHeader(512, 384, 100).length;
+    const many = Array.from({ length: 120 }, (_, i) => photo({ hash: i.toString(16).padStart(64, '0'), size }));
+    for (const p of many) lane.states.set(p.hash, { state: 'complete', have: size, size });
+    const faces = async (now: number) => {
+      many.forEach((p) => photoLook(p, now));
+      for (let i = 0; i < 4; i++) await flush();
+    };
+    await faces(0);
+    expect(reads).toHaveLength(96); // the faces hold the most a page does
+    // A panel opens on the board whose photos the faces had no room for.
+    const panel = many.slice(96);
+    for (let t = 1_000; t <= 5_000; t += 1_000) {
+      panel.forEach((p) => photoLook(p, t, true));
+      await faces(t);
+    }
+    expect(panel.every((p) => photoLook(p, 5_500, true) === 'ready')).toBe(true);
+    // Each photo read once: the faces that gave up their place wait for
+    // room, and take none back from the panel.
+    expect(reads).toHaveLength(120);
   });
 
   it('keeps every photo in view without reading them again and again (#340 review)', async () => {
