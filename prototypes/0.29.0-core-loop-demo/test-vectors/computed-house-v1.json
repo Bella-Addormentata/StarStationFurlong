@@ -3893,6 +3893,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -3905,6 +3906,7 @@
       "proto": false,
       "unclear": false,
       "refused": true,
+      "unknown": true,
       "ok": null,
       "canon": null,
       "hash": null
@@ -3917,6 +3919,7 @@
       "proto": false,
       "unclear": false,
       "refused": true,
+      "unknown": true,
       "ok": null,
       "canon": null,
       "hash": null
@@ -3929,6 +3932,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -3941,6 +3945,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -3953,6 +3958,7 @@
       "proto": true,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": null,
       "hash": null
@@ -3965,6 +3971,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -3977,6 +3984,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -3989,6 +3997,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -4001,6 +4010,7 @@
       "proto": true,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": null,
       "hash": null
@@ -4013,6 +4023,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"u\":12,\"v\":1}",
       "hash": "7070f7619d2ba0e88c212bedb8393050"
@@ -4025,6 +4036,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": "{\"f\":{\"alice\":\"abababababababababababababababab\"},\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"q\":\"g\",\"r\":3}",
       "hash": "2e7bfdc215e4f9d9331f0f7208491db7"
@@ -4037,6 +4049,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"f\":{\"alice\":\"abababababababababababababababab\"},\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"q\":\"g\",\"r\":3}",
       "hash": "2e7bfdc215e4f9d9331f0f7208491db7"
@@ -4049,6 +4062,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"s\":{\"p\":6,\"w\":{\"alice\":[{\"amount\":10,\"type\":\"pass\"}]}},\"u\":12,\"v\":1}",
       "hash": "a5b5b4962e9bb8dcd428422485a08c8f"
@@ -4061,6 +4075,7 @@
       "proto": true,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": null,
       "hash": null
@@ -4073,6 +4088,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"s\":{\"p\":6,\"w\":{\"alice\":[{\"amount\":10,\"type\":\"pass\"}]}},\"u\":12,\"v\":1}",
       "hash": "a5b5b4962e9bb8dcd428422485a08c8f"
@@ -4085,6 +4101,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": true,
       "canon": "{\"b\":\"g\",\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"l\":\"abababababababababababababababab\",\"n\":{\"alice\":\"-35\"},\"s\":{\"p\":6,\"w\":{\"alice\":[{\"amount\":10,\"type\":\"pass\"}]}},\"u\":12,\"v\":1}",
       "hash": "a5b5b4962e9bb8dcd428422485a08c8f"
@@ -4097,6 +4114,7 @@
       "proto": true,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": null,
       "canon": null,
       "hash": null
@@ -4109,6 +4127,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": null,
       "canon": "{\"a\":1}",
       "hash": "173143e68c60d0c2a795ec6d4fe51dc9"
@@ -4121,6 +4140,7 @@
       "proto": false,
       "unclear": false,
       "refused": false,
+      "unknown": false,
       "ok": null,
       "canon": null,
       "hash": null
@@ -4133,6 +4153,7 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": null,
       "hash": null
@@ -4145,9 +4166,127 @@
       "proto": true,
       "unclear": true,
       "refused": false,
+      "unknown": false,
       "ok": false,
       "canon": null,
       "hash": null
+    },
+    {
+      "name": "a close with __proto__ a buffer, a numeric field, then null",
+      "kind": "close",
+      "inc": "r0123456789abcdef01234567",
+      "update": "010101002801016d0176017608095f5f70726f746f5f5f740005373737373777017801727d0301717701670166760105616c69636577206162616261626162616261626162616261626162616261626162616261626162016b772b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b016777564747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747095f5f70726f746f5f5f7e00",
+      "proto": true,
+      "unclear": true,
+      "refused": false,
+      "unknown": true,
+      "ok": true,
+      "canon": "{\"f\":{\"alice\":\"abababababababababababababababab\"},\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"q\":\"g\",\"r\":3}",
+      "hash": "2e7bfdc215e4f9d9331f0f7208491db7"
+    },
+    {
+      "name": "a close with __proto__ a buffer, a length, then an object",
+      "kind": "close",
+      "inc": "r0123456789abcdef01234567",
+      "update": "010101002801016d0176017608095f5f70726f746f5f5f7400066c656e6774687d0101727d0301717701670166760105616c69636577206162616261626162616261626162616261626162616261626162616261626162016b772b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b016777564747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747095f5f70726f746f5f5f760000",
+      "proto": true,
+      "unclear": false,
+      "refused": true,
+      "unknown": true,
+      "ok": null,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "name": "a close with __proto__ a buffer, a byteLength, then null",
+      "kind": "close",
+      "inc": "r0123456789abcdef01234567",
+      "update": "010101002801016d0176017608095f5f70726f746f5f5f74000a627974654c656e6774687d0101727d0301717701670166760105616c69636577206162616261626162616261626162616261626162616261626162616261626162016b772b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b016777564747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747095f5f70726f746f5f5f7e00",
+      "proto": true,
+      "unclear": true,
+      "refused": true,
+      "unknown": true,
+      "ok": null,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "name": "a close with __proto__ null, then a string",
+      "kind": "close",
+      "inc": "r0123456789abcdef01234567",
+      "update": "010101002801016d017601760701727d0301717701670166760105616c69636577206162616261626162616261626162616261626162616261626162616261626162016b772b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b016777564747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747474747095f5f70726f746f5f5f7e095f5f70726f746f5f5f77017800",
+      "proto": true,
+      "unclear": true,
+      "refused": false,
+      "unknown": false,
+      "ok": false,
+      "canon": "{\"__proto__\":\"x\",\"f\":{\"alice\":\"abababababababababababababababab\"},\"g\":\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\",\"k\":\"KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK\",\"q\":\"g\",\"r\":3}",
+      "hash": "eb37b3bbb7bcfccd5e826e32d9c9fc0f"
+    },
+    {
+      "name": "a switch",
+      "kind": "switch",
+      "inc": "",
+      "update": "010101002801016d017601760201767d0103696e6377197230313233343536373839616263646566303132333435363700",
+      "proto": false,
+      "unclear": false,
+      "refused": false,
+      "unknown": false,
+      "ok": true,
+      "canon": "{\"inc\":\"r0123456789abcdef01234567\",\"v\":1}",
+      "hash": "562054fb2665fd3d7ebcedf0ef5b48c1"
+    },
+    {
+      "name": "a switch with __proto__ an object",
+      "kind": "switch",
+      "inc": "",
+      "update": "010101002801016d017601760301767d0103696e63771972303132333435363738396162636465663031323334353637095f5f70726f746f5f5f760000",
+      "proto": true,
+      "unclear": false,
+      "refused": false,
+      "unknown": false,
+      "ok": true,
+      "canon": null,
+      "hash": null
+    },
+    {
+      "name": "a switch with __proto__ a string",
+      "kind": "switch",
+      "inc": "",
+      "update": "010101002801016d017601760301767d0103696e63771972303132333435363738396162636465663031323334353637095f5f70726f746f5f5f77017800",
+      "proto": true,
+      "unclear": true,
+      "refused": false,
+      "unknown": false,
+      "ok": true,
+      "canon": "{\"inc\":\"r0123456789abcdef01234567\",\"v\":1}",
+      "hash": "562054fb2665fd3d7ebcedf0ef5b48c1"
+    },
+    {
+      "name": "a switch with __proto__ null, then a string",
+      "kind": "switch",
+      "inc": "",
+      "update": "010101002801016d017601760401767d0103696e63771972303132333435363738396162636465663031323334353637095f5f70726f746f5f5f7e095f5f70726f746f5f5f77017800",
+      "proto": true,
+      "unclear": true,
+      "refused": false,
+      "unknown": false,
+      "ok": false,
+      "canon": "{\"__proto__\":\"x\",\"inc\":\"r0123456789abcdef01234567\",\"v\":1}",
+      "hash": "d61118cb2e59075590e3bac066b7ecbc"
+    },
+    {
+      "name": "a switch with __proto__ null, then undefined",
+      "kind": "switch",
+      "inc": "",
+      "update": "010101002801016d017601760401767d0103696e63771972303132333435363738396162636465663031323334353637095f5f70726f746f5f5f7e095f5f70726f746f5f5f7f00",
+      "proto": true,
+      "unclear": true,
+      "refused": false,
+      "unknown": false,
+      "ok": false,
+      "canon": "{\"inc\":\"r0123456789abcdef01234567\",\"v\":1}",
+      "hash": "562054fb2665fd3d7ebcedf0ef5b48c1"
     }
   ]
 }

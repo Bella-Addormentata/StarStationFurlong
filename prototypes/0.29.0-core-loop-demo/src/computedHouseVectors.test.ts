@@ -24,6 +24,7 @@ import {
   asCheckpointFor, asClose, asForfeit, asSlipFor, canon, closeKey, dutyRank, houseCommitKey, houseCommitOf, houseRevealKey, nextSid,
   recHash, signBytes, slipCommit,
 } from './computedFold';
+import { computedCfgInc } from './casinoDoc';
 import { MAX_FELT_STAKE } from './computedCraps';
 import type { Checkpoint, FoldCtx, HouseCommitRec, HouseRevealRec, SignedKind } from './computedFold';
 import {
@@ -170,10 +171,10 @@ function closeCases(): { value: unknown; ok: boolean }[] {
 const withProto = (o: Record<string, unknown>, proto: unknown): Record<string, unknown> =>
   Object.defineProperty({ ...o }, '__proto__', { value: proto, enumerable: true, writable: true, configurable: true });
 
-type YjsKind = 'checkpoint' | 'close' | 'canon';
+type YjsKind = 'checkpoint' | 'close' | 'canon' | 'switch';
 interface YjsCase {
   name: string; kind: YjsKind; inc: string; update: string; proto: boolean; unclear: boolean; refused: boolean;
-  ok: boolean | null; canon: string | null; hash: string | null;
+  unknown: boolean; ok: boolean | null; canon: string | null; hash: string | null;
 }
 
 /** Whether `v` holds an own `__proto__` field anywhere. */
@@ -189,6 +190,12 @@ const holdsUnclear = (v: unknown): boolean => typeof v === 'object' && v !== nul
   && ((!Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, '__proto__')
     && (() => { const p = (v as Record<string, unknown>)['__proto__']; return p === null || typeof p !== 'object'; })())
     || Object.values(v).some(holdsUnclear));
+
+/** `update` with each only written `from` (a key's bytes) turned into
+ *  its `to`, as long. */
+function renameAll(update: Uint8Array, renames: [string, string][]): Uint8Array {
+  return renames.reduce((u, [from, to]) => rename(u, from, to), update);
+}
 
 /** `update` with the only written `from` (a key's bytes) turned into `to`,
  *  as long. */
@@ -226,13 +233,21 @@ function spoil(update: Uint8Array, find: string): Uint8Array {
  *  (house_bytes.rs CVal::from_any), and knows which a page may read
  *  otherwise (Clarity): one holding a `__proto__` field that is no object
  *  (a field of that name before it, an object, as in the update renamed
- *  into one, leaves a page junk) or one a page refuses. */
+ *  into one, leaves a page junk) or one a page refuses. And the ones a page
+ *  may read otherwise entirely (`unknown`): a typed array the update made
+ *  the prototype before a key it keeps from being a field (dropped, or the
+ *  update refused), which the node, keeping one entry per key, can't see. A
+ *  switch with a `__proto__` field is one the node serves nothing under:
+ *  a page counts it an own key or not as the update had it. */
 function yjsCases(): YjsCase[] {
   const base = { v: 1, b: 'g', u: 12, l: H32, n: { alice: '-35' }, k: K, g: G };
   const pass = [{ type: 'pass', amount: 10 }];
   const carry = (w: unknown) => ({ ...base, s: { p: 6, w } });
   const close = (f: unknown) => ({ r: 3, q: 'g', f, k: K, g: G });
-  const cases: [string, YjsKind, string, unknown, string?, [string, string]?][] = [
+  const frozen = { alice: H32 };
+  const toProto: [string, string] = ['aaaaaaaaa', '__proto__'];
+  const sw = { v: 1, inc: CTX.inc };
+  const cases: [string, YjsKind, string, unknown, string?, [string, string][]?, boolean?][] = [
     ['a checkpoint', 'checkpoint', CTX.inc, base],
     ['a net that is no UTF-8', 'checkpoint', CTX.inc, base, '-35'],
     ['a pid that is no UTF-8', 'checkpoint', CTX.inc, base, 'alice'],
@@ -253,15 +268,32 @@ function yjsCases(): YjsCase[] {
     ['a canon value named __proto__, a map', 'canon', '', withProto({ a: 1 }, { b: 2 })],
     ['a canon value named __proto__, a number', 'canon', '', withProto({ a: 1 }, 2)],
     ['an array entry undefined', 'canon', '', { a: [1, undefined] }],
-    ['a field named __proto__ twice, an array then a string', 'checkpoint', CTX.inc, withProto({ ...base, aaaaaaaaa: ['x'] }, 'x'), undefined, ['aaaaaaaaa', '__proto__']],
-    ['a net named __proto__ twice, an object then undefined', 'checkpoint', CTX.inc, { ...base, n: withProto({ alice: '-35', aaaaaaaaa: { x: '1' } }, undefined) }, undefined, ['aaaaaaaaa', '__proto__']],
+    ['a field named __proto__ twice, an array then a string', 'checkpoint', CTX.inc, withProto({ ...base, aaaaaaaaa: ['x'] }, 'x'), undefined, [toProto]],
+    ['a net named __proto__ twice, an object then undefined', 'checkpoint', CTX.inc, { ...base, n: withProto({ alice: '-35', aaaaaaaaa: { x: '1' } }, undefined) }, undefined, [toProto]],
+    // A typed array as the prototype: a numeric key past its end is dropped,
+    // and a later `__proto__: null` leaves a plain object without it.
+    ['a close with __proto__ a buffer, a numeric field, then null', 'close', CTX.inc,
+      withProto({ aaaaaaaaa: new Uint8Array(0), zqzqz: 'x', ...close(frozen) }, null), undefined, [toProto, ['zqzqz', '77777']], true],
+    // …and writing one of its getters throws: the update is refused, and a
+    // page keeps what was under the key before.
+    ['a close with __proto__ a buffer, a length, then an object', 'close', CTX.inc,
+      withProto({ aaaaaaaaa: new Uint8Array(0), length: 1, ...close(frozen) }, {}), undefined, [toProto], true],
+    ['a close with __proto__ a buffer, a byteLength, then null', 'close', CTX.inc,
+      withProto({ aaaaaaaaa: new Uint8Array(0), byteLength: 1, ...close(frozen) }, null), undefined, [toProto], true],
+    // A `__proto__: null` takes the setter away: the next `__proto__` is a field.
+    ['a close with __proto__ null, then a string', 'close', CTX.inc, withProto({ ...close(frozen), aaaaaaaaa: null }, 'x'), undefined, [toProto]],
+    ['a switch', 'switch', '', sw],
+    ['a switch with __proto__ an object', 'switch', '', withProto(sw, {})],
+    ['a switch with __proto__ a string', 'switch', '', withProto(sw, 'x')],
+    ['a switch with __proto__ null, then a string', 'switch', '', withProto({ ...sw, aaaaaaaaa: null }, 'x'), undefined, [toProto]],
+    ['a switch with __proto__ null, then undefined', 'switch', '', withProto({ ...sw, aaaaaaaaa: null }, undefined), undefined, [toProto]],
   ];
-  return cases.map(([name, kind, inc, value, spoilAt, twice]) => {
+  return cases.map(([name, kind, inc, value, spoilAt, renames, unknown]) => {
     const doc = new Y.Doc();
     doc.clientID = 1;
     doc.getMap('m').set('v', value);
     const written = Y.encodeStateAsUpdate(doc);
-    const update = spoilAt !== undefined ? spoil(written, spoilAt) : twice ? rename(written, ...twice) : written;
+    const update = spoilAt !== undefined ? spoil(written, spoilAt) : renames ? renameAll(written, renames) : written;
     const page = new Y.Doc();
     let refused = false;
     try {
@@ -271,10 +303,11 @@ function yjsCases(): YjsCase[] {
     }
     const read = page.getMap('m').get('v');
     const ok = refused || kind === 'canon' ? null
-      : kind === 'checkpoint' ? asCheckpointFor({ inc })(read) !== null : asClose(read) !== null;
+      : kind === 'checkpoint' ? asCheckpointFor({ inc })(read) !== null
+      : kind === 'switch' ? computedCfgInc(read) === CTX.inc : asClose(read) !== null;
     return {
-      name, kind, inc, update: bytesToHex(update), proto: holdsProto(value) || twice !== undefined,
-      unclear: holdsUnclear(value), refused,
+      name, kind, inc, update: bytesToHex(update), proto: holdsProto(value) || renames !== undefined,
+      unclear: holdsUnclear(value), refused, unknown: refused || unknown === true,
       ok, canon: refused ? null : canon(read), hash: refused ? null : recHash(read),
     };
   });
@@ -448,13 +481,31 @@ describe('the house\'s bytes (test-vectors/computed-house-v1.json)', () => {
       'an array entry undefined': null,
       'a field named __proto__ twice, an array then a string': false,
       'a net named __proto__ twice, an object then undefined': false,
+      'a close with __proto__ a buffer, a numeric field, then null': true,
+      'a close with __proto__ a buffer, a length, then an object': 'refused',
+      'a close with __proto__ a buffer, a byteLength, then null': 'refused',
+      'a close with __proto__ null, then a string': false,
+      'a switch': true,
+      'a switch with __proto__ an object': true,
+      'a switch with __proto__ a string': true,
+      'a switch with __proto__ null, then a string': false,
+      'a switch with __proto__ null, then undefined': false,
     });
+    // The page reads the close past the buffer as the close itself: junk
+    // to the node, it would let the house reveal over a rival's close.
+    const dropped = yjs.find((c) => c.name === 'a close with __proto__ a buffer, a numeric field, then null')!;
+    expect(dropped.canon).toBe(canon({ r: 3, q: 'g', f: { alice: H32 }, k: K, g: G }));
+    expect(dropped.ok).toBe(true);
+    expect(yjs.filter((c) => c.unknown && !c.refused).map((c) => c.name)).toEqual(['a close with __proto__ a buffer, a numeric field, then null']);
     expect(yjs.filter((c) => c.proto).map((c) => c.name)).toEqual(yjs.filter((c) => c.name.includes('__proto__')).map((c) => c.name));
     expect(yjs.filter((c) => c.unclear).map((c) => c.name)).toEqual([
       'a net named __proto__, a string', 'a net named __proto__, null', 'a net named __proto__, undefined',
       'a field named __proto__, a string', 'a frozen slip named __proto__, a string', 'a rider named __proto__, a string',
       'a felt entry with a field named __proto__', 'a canon value named __proto__, a number',
       'a field named __proto__ twice, an array then a string', 'a net named __proto__ twice, an object then undefined',
+      'a close with __proto__ a buffer, a numeric field, then null', 'a close with __proto__ a buffer, a byteLength, then null',
+      'a close with __proto__ null, then a string',
+      'a switch with __proto__ a string', 'a switch with __proto__ null, then a string', 'a switch with __proto__ null, then undefined',
     ]);
     // The pages compare pids by UTF-16 code units: an astral one sorts
     // below U+E000–U+FFFF, which byte (or code point) order puts it above.

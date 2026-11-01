@@ -923,6 +923,47 @@ fn weighing_a_value_stops_at_its_cap_and_its_depth() {
     assert!(hb::weight(&deep, usize::MAX).is_some());
     let deeper = Any::Array(Arc::from(vec![deep]));
     assert_eq!(hb::weight(&deeper, usize::MAX), None);
+    assert_eq!(hb::weigh(&deeper, usize::MAX), hb::Weighed::Heavy);
+}
+
+/// Padding a page reads past (an undefined field; a field a typed-array
+/// prototype keeps out) weighs toward the cap like anything, so no value
+/// costs more than the cap to weigh; but past it, a value holding any is
+/// `Unsure` (a page may read it light), and only one past it by what a page
+/// reads of it alone is `Heavy` (junk on every page).
+#[test]
+fn padding_a_page_reads_past_never_makes_a_record_heavy() {
+    let map = |fields: Vec<(String, Any)>| Any::Map(Arc::new(fields.into_iter().collect::<HashMap<_, _>>()));
+    let cap = 1_000;
+    // An undefined field with a long name, or many: past the cap, Unsure.
+    let long_name = map(vec![("r".into(), Any::Number(1.0)), ("x".repeat(cap), Any::Undefined)]);
+    assert_eq!(hb::weigh(&long_name, cap), hb::Weighed::Unsure);
+    let many = map((0..cap).map(|i| (format!("u{i}"), Any::Undefined)).collect());
+    assert_eq!(hb::weigh(&many, cap), hb::Weighed::Unsure);
+    // Inside a map inside the record too.
+    let inner = map(vec![("n".into(), many.clone())]);
+    assert_eq!(hb::weigh(&inner, cap), hb::Weighed::Unsure);
+    // Under the cap: light, and every page reads it as the node does.
+    let light = map(vec![("r".into(), Any::Number(1.0)), ("u".into(), Any::Undefined)]);
+    assert_eq!(hb::weigh(&light, cap), hb::Weighed::Light { w: 2 + 5 + 8 + 5 + 8, scan: 0 });
+    assert_eq!(hb::clarity(&light), hb::Clarity::Clear);
+    // Past it by a field a page reads: Heavy, padding or none.
+    let heavy = map(vec![("s".into(), Any::String(Arc::from("x".repeat(cap))))]);
+    assert_eq!(hb::weigh(&heavy, cap), hb::Weighed::Heavy);
+    let padded_heavy = map(vec![("s".into(), Any::String(Arc::from("x".repeat(cap)))), ("u".into(), Any::Undefined)]);
+    assert_eq!(hb::weigh(&padded_heavy, cap), hb::Weighed::Heavy);
+    let long = Any::Array(Arc::from(vec![Any::Number(1.0); 1_000_000]));
+    assert_eq!(hb::weigh(&long, cap), hb::Weighed::Heavy);
+    // A typed-array key beside a `__proto__` field: its value unread,
+    // however big, and the map Unknown (junk to read: no page may agree).
+    let big = Any::String(Arc::from("x".repeat(100 * cap)));
+    let typed = map(vec![("r".into(), Any::Number(1.0)), ("77777".into(), big.clone()), ("__proto__".into(), Any::Null)]);
+    assert_eq!(hb::weigh(&typed, cap), hb::Weighed::Light { w: 2 + 5 + 8 + 9 + 8 + 13 + 8, scan: 0 });
+    assert_eq!(hb::clarity(&typed), hb::Clarity::Unknown);
+    assert_eq!(CVal::from_any(&typed), CVal::Junk);
+    // The same key without a `__proto__` field is a field like any.
+    let plain = map(vec![("r".into(), Any::Number(1.0)), ("77777".into(), big)]);
+    assert_eq!(hb::weigh(&plain, cap), hb::Weighed::Heavy);
 }
 
 /// `n` records under slip keys of round 1 in table `ses`'s session, each
@@ -1803,15 +1844,17 @@ fn checkpoints_forfeits_and_closes_read_as_the_fold_reads_them() {
 }
 
 /// test-vectors `yjs`: values a peer can write that no JSON holds
-/// (undefined entries, own `__proto__` fields), each in the Yjs update a
-/// page wrote, read as a page receiving it reads it: the same canon and
-/// hash, and the same verdict from the reader.
+/// (undefined entries, own `__proto__` fields, a typed array as the
+/// prototype), each in the Yjs update a page wrote, read as a page
+/// receiving it reads it: the same canon and hash, and the same verdict
+/// from the reader; or, where the node can't tell, held (Unknown) or, for a
+/// switch, served nothing.
 #[test]
 fn values_no_json_holds_read_as_a_page_receiving_them_reads_them() {
     let v = vectors();
     let cases = v["yjs"].as_array().unwrap();
-    assert!(cases.len() >= 22);
-    let (mut exact, mut unclear, mut twice, mut refused) = (0, 0, 0, 0);
+    assert!(cases.len() >= 31);
+    let (mut exact, mut unclear, mut twice, mut refused, mut unknown, mut switches) = (0, 0, 0, 0, 0, 0);
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let doc = Doc::new();
@@ -1823,26 +1866,42 @@ fn values_no_json_holds_read_as_a_page_receiving_them_reads_them() {
         let txn = doc.transact();
         let m = txn.get_map("m").unwrap();
         let Some(Out::Any(any)) = m.get(&txn, "v") else { panic!("{name}: no value") };
-        let val = CVal::from_any(&any);
         let kind = case["kind"].as_str().unwrap();
+        if kind == "switch" {
+            // The node serves a table only under a switch every page takes.
+            let page = case["ok"].as_bool().unwrap();
+            match switch_of(&any) {
+                Some(inc) => assert!(page && !case["proto"].as_bool().unwrap(), "{name}: {inc}"),
+                None => assert!(!page || case["proto"].as_bool().unwrap(), "{name}: a page's switch"),
+            }
+            switches += 1;
+            continue;
+        }
+        let val = CVal::from_any(&any);
         let ok = match kind {
             "checkpoint" => Some(checkpoint_ok(&val, case["inc"].as_str().unwrap())),
             "close" => Some(close_ok(&val)),
             _ => None,
         };
         let clarity = hb::clarity(&any);
+        assert!(matches!(hb::weigh(&any, MAX_RECORD_BYTES), hb::Weighed::Light { .. }), "{name}");
         let as_page = hb::canon(&val).as_deref() == case["canon"].as_str()
             && hb::rec_hash(&val).as_deref() == case["hash"].as_str()
             && ok == case["ok"].as_bool();
-        if case["refused"].as_bool().unwrap() {
-            // No page holds it: the house won't act where it would count.
+        if case["unknown"].as_bool().unwrap() {
+            // No page holds it, or one may hold what the node can't see: the
+            // house won't act where it would count.
             assert_eq!(clarity, hb::Clarity::Unknown, "{name}");
-            refused += 1;
+            if case["refused"].as_bool().unwrap() {
+                refused += 1;
+            } else {
+                unknown += 1;
+            }
         } else if case["unclear"].as_bool().unwrap() {
             // A page reads it as the house does, or (a `__proto__` object
             // before the field the node sees) as junk; the house knows.
             assert_eq!(clarity, hb::Clarity::Proto, "{name}");
-            let page_junk = case["canon"].is_null() && case["ok"].as_bool() != Some(true);
+            let page_junk = case["canon"].is_null() || case["ok"].as_bool() == Some(false);
             assert!(as_page || page_junk, "{name}: neither the house's reading nor junk");
             if !as_page {
                 assert_eq!(ok, Some(true), "{name}: the house's reading is good, a page's junk");
@@ -1855,7 +1914,10 @@ fn values_no_json_holds_read_as_a_page_receiving_them_reads_them() {
             exact += 1;
         }
     }
-    assert!(exact >= 10 && unclear >= 10 && twice >= 2 && refused >= 2, "{exact} exact, {unclear} unclear ({twice} junk on a page), {refused} refused");
+    assert!(
+        exact >= 10 && unclear >= 11 && twice >= 3 && refused >= 4 && unknown >= 1 && switches >= 5,
+        "{exact} exact, {unclear} unclear ({twice} junk on a page), {refused} refused, {unknown} unknown, {switches} switches"
+    );
 }
 
 #[test]
@@ -1877,12 +1939,13 @@ fn a_switch_holds_v_and_inc_and_nothing_else() {
     assert_eq!(switch_of(&sw(vec![("x", s("1"))])), None);
     assert_eq!(switch_of(&to_any(&obj(vec![("v", CVal::Int(1)), ("x", s(INC))]))), None);
     assert_eq!(switch_of(&to_any(&obj(vec![("v", CVal::Int(2)), ("inc", s(INC))]))), None);
-    // A `__proto__` field is never an own key on a page, whatever it holds
-    // and however much it weighs: the switch stands.
+    // A `__proto__` field, whatever it holds and however much it weighs: a
+    // page counts it an own key (after an earlier `__proto__: null` in the
+    // update, which the node can't see) or not. No switch.
     let real = obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]);
     let big = Any::String(Arc::from("x".repeat(2 * MAX_TOP_BYTES)));
     for pad in [Any::Undefined, Any::Null, Any::String(Arc::from("x")), Any::Map(Arc::new(HashMap::new())), Any::Array(Arc::from(vec![])), big] {
-        assert_eq!(switch_of(&padded(&real, pad.clone())).as_deref(), Some(INC), "{pad:?}");
+        assert_eq!(switch_of(&padded(&real, pad.clone())), None, "{pad:?}");
     }
 }
 
@@ -1905,18 +1968,26 @@ fn a_switch_whose_inc_is_no_utf8_is_none() {
     assert!(switch_of(&v).is_none());
 }
 
-/// A padded switch, as a page plays it: the house serves the table.
+/// A padded switch, which a page may take or not: the house serves
+/// nothing there while it is there, and the table once it is clean.
 #[test]
-fn a_padded_switch_still_has_the_house_serve_its_table() {
-    let mut room = Room::new("padded-switch", true);
-    let real = obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]);
-    {
-        let casino = room.doc.get_or_insert_map(CASINO_MAP);
-        let mut txn = room.doc.transact_mut();
-        casino.insert(&mut txn, format!("cfg:computed:{T}"), padded(&real, Any::Map(Arc::new(HashMap::new()))));
+fn a_padded_switch_has_the_house_serve_nothing_there() {
+    for pad in [Any::Map(Arc::new(HashMap::new())), Any::String(Arc::from("x")), Any::Null] {
+        let mut room = Room::new("padded-switch", true);
+        let real = obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]);
+        let put = |room: &Room, v: Any| {
+            let casino = room.doc.get_or_insert_map(CASINO_MAP);
+            let mut txn = room.doc.transact_mut();
+            casino.insert(&mut txn, format!("cfg:computed:{T}"), v);
+        };
+        put(&room, padded(&real, pad.clone()));
+        room.tick(0);
+        room.tick(1_000);
+        assert!(room.records("o:").is_empty(), "{pad:?}");
+        put(&room, to_any(&real));
+        room.tick(1_000);
+        assert_eq!(room.records("o:1:").len(), 1, "{pad:?}");
     }
-    room.tick(0);
-    assert_eq!(room.records("o:1:").len(), 1);
 }
 
 impl Room {
@@ -2844,7 +2915,7 @@ fn padding_a_page_drops_still_costs_the_tick_its_bytes() {
     let stray = |i: u8| obj(vec![("r", CVal::Int(1)), ("p", s("carol")), ("s", s(&format!("{i:064x}")))]);
     let pad = |n: usize| Any::String(Arc::from("x".repeat(n)));
     let w = hb::weight(&to_any(&stray(0)), MAX_RECORD_BYTES).unwrap();
-    assert_eq!(hb::weigh(&padded(&stray(0), pad(1_000)), MAX_RECORD_BYTES), Some((w + "__proto__".len() + 4 + 8, 1_000)));
+    assert_eq!(hb::weigh(&padded(&stray(0), pad(1_000)), MAX_RECORD_BYTES), hb::Weighed::Light { w: w + "__proto__".len() + 4 + 8, scan: 1_000 });
     for (n, short) in [(2, false), (5, true)] {
         let mut room = Room::new(&format!("padding-cost-{n}"), true);
         // (Every check made: a tick of one pass.)
@@ -2986,4 +3057,375 @@ fn its_own_padded_delegation_goes_back_clean() {
     room.tick(0);
     room.tick(REPUT_MS);
     assert!(clean(room.raw_top(&key), &rec));
+}
+
+// ── Values a page reads otherwise than the node can see (round 2) ───────────
+
+/// A rival a page reads past a typed array (a `__proto__` buffer first in
+/// the update, a numeric key past its end, a `__proto__: null` last: the
+/// page drops the key, test-vectors "a close with __proto__ a buffer, a
+/// numeric field, then null"), the key holding more than any record
+/// weighs: the house reads it no further, holds the table while it is
+/// there, and the read costs the tick no more than a light record.
+#[test]
+fn a_rival_a_page_reads_past_a_typed_array_holds_its_table_however_heavy() {
+    let mut room = Room::new("typed-heavy", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let key = key_of('c', &rival);
+    let Any::Map(m) = padded(&rival, Any::Null) else { unreachable!() };
+    let mut m = (*m).clone();
+    m.insert("77777".into(), Any::String(Arc::from("x".repeat(4 * MAX_RECORD_BYTES))));
+    let pad = Any::Map(Arc::new(m));
+    assert!(matches!(hb::weigh(&pad, MAX_RECORD_BYTES), hb::Weighed::Light { w, .. } if w < 1_000));
+    assert_eq!(hb::clarity(&pad), hb::Clarity::Unknown);
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), pad);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(1_000);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the key's value unread");
+    }
+    assert!(room.records("h:").is_empty(), "no reveal over a rival a page may count");
+    room.delete(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A rival padded past the cap with undefined fields, which no page reader
+/// counts (computedFold hasFields, canon): every page takes it, so the
+/// house never reads it as junk. It can't tell what a page reads without
+/// reading it all: it holds the table while it is there.
+#[test]
+fn a_rival_padded_past_the_cap_with_undefined_fields_holds_its_table() {
+    for many in [false, true] {
+        let mut room = Room::new(&format!("undefined-heavy-{many}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+        let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+        let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+        let key = key_of('c', &rival);
+        let Any::Map(m) = to_any(&rival) else { unreachable!() };
+        let mut m = (*m).clone();
+        if many {
+            for i in 0..MAX_RECORD_BYTES / 8 {
+                m.insert(format!("u{i}"), Any::Undefined);
+            }
+        } else {
+            m.insert("u".repeat(MAX_RECORD_BYTES), Any::Undefined);
+        }
+        let pad = Any::Map(Arc::new(m));
+        assert_eq!(hb::canon(&CVal::from_any(&pad)), hb::canon(&rival), "a page's reading, the padding skipped");
+        assert_eq!(hb::weigh(&pad, MAX_RECORD_BYTES), hb::Weighed::Unsure);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), pad);
+        }
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        for _ in 0..5 {
+            room.tick(1_000);
+        }
+        assert!(room.records("h:").is_empty(), "no reveal over a rival every page counts");
+        room.delete(&key);
+        room.tick(200);
+        assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+    }
+}
+
+/// A key a typed array keeps from being a field, beside a `__proto__`
+/// field holding anything (the node sees the last of several: an earlier
+/// buffer may have been the prototype as the key came, and a getter's key
+/// refuses the update, test-vectors "a close with __proto__ a buffer, a
+/// length, then an object"): Unknown, and a rival so padded holds the table.
+#[test]
+fn a_typed_array_key_beside_any_proto_field_is_unknown() {
+    let mut room = Room::new("typed-any-proto", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let pads = [
+        Any::Null,
+        Any::Undefined,
+        Any::String(Arc::from("x")),
+        Any::Map(Arc::new(HashMap::new())),
+        Any::Array(Arc::from(vec![])),
+        Any::Buffer(Arc::from(vec![0u8; 4])),
+    ];
+    for pad in &pads {
+        for k in ["7", "length", "byteLength", "BYTES_PER_ELEMENT"] {
+            assert_eq!(hb::clarity(&padded(&with(&rival, k, CVal::Int(1)), pad.clone())), hb::Clarity::Unknown, "{k} beside {pad:?}");
+        }
+    }
+    let key = key_of('c', &rival);
+    let odd = padded(&with(&rival, "length", CVal::Int(1)), Any::Map(Arc::new(HashMap::new())));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), odd);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty(), "no reveal while a page may hold the rival");
+    room.delete(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A setting a page may hold otherwise entirely, over the older one the
+/// house holds (the deed holder's newer Friendly setting, as a page reads
+/// it past a typed array, or past undefined fields that take it over the
+/// cap): the house puts nothing back over it (a page keeps the newer one
+/// whatever comes after, fairAfter), and the table waits; once it is
+/// clean, the house plays the newer one.
+#[test]
+fn a_setting_a_page_may_hold_otherwise_is_never_put_back_over_with_an_older_one() {
+    for typed in [true, false] {
+        let mut room = Room::new(&format!("unknown-setting-{typed}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.set_fair(0, 1);
+        room.closed_on_the_join(&alice, &bob);
+        let key = format!("hf:{T}");
+        let newer = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(2))]));
+        let odd = if typed {
+            padded(&with(&newer, "7", s("x")), Any::Null)
+        } else {
+            let Any::Map(m) = to_any(&newer) else { unreachable!() };
+            let mut m = (*m).clone();
+            m.insert("u".repeat(MAX_TOP_BYTES), Any::Undefined);
+            Any::Map(Arc::new(m))
+        };
+        {
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            comp.insert(&mut txn, key.as_str(), odd.clone());
+        }
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        for _ in 0..5 {
+            room.tick(REPUT_MS);
+            assert_eq!(room.raw_top(&key).as_ref(), Some(&odd), "nothing put back over it");
+        }
+        assert!(room.records("h:").is_empty(), "nothing at the table meanwhile");
+        room.put_top(&key, &newer);
+        // (Its check, then the records the hold left unread: two ticks.)
+        room.tick(200);
+        room.tick(200);
+        let h = &room.records("h:1:")[0].1;
+        assert_eq!(strs(h, "x").len(), 1);
+        assert!(h.get("c").is_none(), "Friendly: no next commitment");
+    }
+}
+
+/// Stepping down with its own record a page may read otherwise entirely
+/// (`__proto__: undefined`, `7: undefined`): the put-back writes it again
+/// and the step-down's word reads the table again (the next pass; after a
+/// tick's last pass, short, for the step-down's unbounded tick), and lifts
+/// the commitment.
+#[test]
+fn stepping_down_reads_a_table_again_once_its_own_record_is_put_back() {
+    for last_pass in [false, true] {
+        let mut room = Room::new(&format!("stop-own-unknown-{last_pass}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        room.house.begin_step_down();
+        if last_pass {
+            let out = room.tick_passes(REPUT_MS, 1);
+            assert!(clean(room.raw(&key), &h1), "put back");
+            assert!(out.short, "short: the step-down's last word reads it again");
+            assert!(room.records("h:2:").is_empty());
+            room.house.tick_unbounded(ROOM, &room.doc, room.now, 0);
+        } else {
+            room.tick(REPUT_MS);
+        }
+        let words = room.records("h:2:");
+        let d = &words.first().expect("the step-down's word").1;
+        assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+    }
+}
+
+/// A record put back for a table the tick never held (its switch gone, so
+/// not read at all) asks for no second read: the tick isn't short.
+#[test]
+fn a_record_put_back_for_a_table_not_held_reads_nothing_again() {
+    let mut room = Room::new("put-back-not-held", true);
+    room.tick(0);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    room.delete(&key);
+    let out = room.tick_passes(REPUT_MS, 1);
+    assert!(clean(room.raw(&key), &join), "put back");
+    assert!(!out.short, "nothing held: no second read");
+}
+
+/// A session key longer than any record's goes under: the tick reads
+/// nothing of its bytes (not even whether they are UTF-8) before it is
+/// charged its length, which here is more than a tick reads.
+#[test]
+fn a_key_longer_than_any_records_is_charged_before_anything_reads_it() {
+    let mut room = Room::new("long-key", true);
+    room.tick(0);
+    let long = format!("s:1:{}", "x".repeat(2 * READ_PER_TICK));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, long.as_str(), Any::Number(1.0));
+    }
+    hb::UTF8_READ.with(|n| n.set(0));
+    let out = room.tick(200);
+    let read = hb::UTF8_READ.with(|n| n.get());
+    assert!(read < 64 * 1024, "{read} bytes read for UTF-8");
+    assert!(out.short, "more than a tick reads: short");
+}
+
+/// Records under the longest keys a page writes (a pid of 256 UTF-16
+/// units, 3 bytes each): read as ever.
+#[test]
+fn records_under_the_longest_keys_are_read() {
+    let mut room = Room::new("longest-keys", true);
+    let (alice, bob) = (who(&long_pid(1)), who(&long_pid(2)));
+    {
+        let mut txn = room.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        for w in [&alice, &bob] {
+            players.insert(&mut txn, w.pid.as_str(), to_any(&obj(vec![("keyB64", s(&w.public))])));
+        }
+    }
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1, "the house joined round 1");
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let c = room.close(&alice, 1, "g", &[(alice.pid.as_str(), &a), (bob.pid.as_str(), &b)], Some(&room.commit(1)));
+    let longest = room.records("s:1:").iter().map(|(k, _)| k.len()).max().unwrap();
+    assert!(longest > 800 && longest <= MAX_KEY_BYTES, "{longest}");
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A setting the house holds written over with a copy padded with a
+/// `__proto__` string longer than a tick reads: the house reads none of it
+/// (not even whether it is UTF-8, which would cost its bytes), neither
+/// where it reads the table's setting nor where it looks to put its own
+/// back, so what a page reads of it is Unknown: it holds its table and is
+/// never put back over. Clean again, it stands.
+#[test]
+fn a_setting_padded_with_a_long_proto_string_is_read_no_further() {
+    let mut room = Room::new("long-proto-setting", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))]));
+    let key = format!("hf:{T}");
+    room.put_top(&key, &rec);
+    room.tick(200);
+    assert_eq!(room.records("h:2:").len(), 1, "Friendly: round 2's commitment stepped down");
+    let pad = Any::String(Arc::from("x".repeat(READ_PER_TICK + 1)));
+    assert!(matches!(hb::weigh(&padded(&rec, pad.clone()), MAX_TOP_BYTES), hb::Weighed::Light { scan, .. } if scan > READ_PER_TICK));
+    room.put_top_padded(&key, &rec, pad);
+    for _ in 0..3 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(200);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the padding unread");
+    }
+    assert!(!clean(room.raw_top(&key), &rec), "never put back over");
+    room.put_top(&key, &rec);
+    room.tick(200);
+    room.tick(200);
+    assert!(clean(room.raw_top(&key), &rec), "clean again: it stands");
+}
+
+/// A record of the house's written over with a copy padded with a
+/// `__proto__` string longer than any record weighs: it goes back clean,
+/// and the put-back reads none of the padding to find it is not.
+#[test]
+fn a_record_padded_with_a_long_proto_string_goes_back_unread() {
+    let mut room = Room::new("reput-long-proto", true);
+    room.tick(0);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    // (No table to read: only the put-back looks at it.)
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    let pad = Any::String(Arc::from("x".repeat(4 * MAX_RECORD_BYTES)));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), padded(&join, pad));
+    }
+    hb::UTF8_READ.with(|n| n.set(0));
+    room.tick_passes(REPUT_MS, 1);
+    let read = hb::UTF8_READ.with(|n| n.get());
+    assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the padding unread");
+    assert!(clean(room.raw(&key), &join), "put back");
+}
+
+/// A switch whose `inc` is no house incarnation's length: refused, and
+/// nothing reads that string (not even whether it is UTF-8), however long.
+#[test]
+fn a_switch_whose_inc_is_no_houses_length_is_read_no_further() {
+    let mut room = Room::new("switch-long-inc", true);
+    room.tick(0);
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.insert(&mut txn, format!("cfg:computed:{T}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(&"h".repeat(4 * MAX_RECORD_BYTES)))])));
+    }
+    for _ in 0..3 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(200);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the inc unread");
+    }
 }
