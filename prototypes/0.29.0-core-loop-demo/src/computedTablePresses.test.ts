@@ -18,12 +18,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { seedTable } from './computedFold';
-import type { SlipRec } from './computedFold';
+import type { FoldCtx, SlipRec } from './computedFold';
+import { beatKey, delegationKey, houseSign, roomSignBytes } from './computedHouse';
 import {
   clockOf, deleteIn, keysIn, loadPage, PAGE_CTX as CTX, PAGE_TABLE as TABLE, putIn, switchOn, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { black, ComputedKit, red, testIdentity } from './computedTestKit';
+import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
 
 // ── A minimal DOM ────────────────────────────────────────────────────────────
@@ -114,10 +115,12 @@ async function loadUIPage(name: string, clientID: number): Promise<UIPage> {
   return { ...p, session, furniture, focus };
 }
 
-/** A table handle that remembers its felt chips and the spins it was asked
- *  for, and is never mid-spin. */
-function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknown[]; spins: [number, number][] } {
+/** A table handle that remembers its felt chips, the spins it was asked
+ *  for and what its plaque was last set to (Fair or not), and is never
+ *  mid-spin. */
+function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknown[]; spins: [number, number][]; fair: () => boolean | null } {
   let last: readonly unknown[] = [];
+  let fair: boolean | null = null;
   const spins: [number, number][] = [];
   const h = new Proxy({} as Record<PropertyKey, unknown>, {
     get: (_t, key) => {
@@ -128,11 +131,12 @@ function fakeTable(): { h: CasinoTableVisualHandle; chips: () => readonly unknow
       if (key === 'wheelSpinning') return () => false;
       if (key === 'wheelSpin') return (pocket: number, seed: number) => { spins.push([pocket, seed]); };
       if (key === 'setFeltChips') return (s: readonly unknown[]) => { last = s; };
+      if (key === 'setFairBadge') return (f: boolean) => { fair = f; };
       if (key === 'toScreen') return () => null;
       return () => undefined;
     },
   }) as unknown as CasinoTableVisualHandle;
-  return { h, chips: () => last, spins };
+  return { h, chips: () => last, spins, fair: () => fair };
 }
 
 interface AtTable {
@@ -1410,5 +1414,224 @@ describe('the wheel when the table is switched back', () => {
     settle(11);
     frame();
     expect(wheel.spins).toHaveLength(2);
+  });
+});
+
+// ── 🏠 A house table ─────────────────────────────────────────────────────────
+
+describe('a house table (PR 5): the plaque, the ⚙ card, the status line', () => {
+  /** A roulette name this build opens once the room has a house (`r`). */
+  const RINC = 'r' + '5a'.repeat(12);
+  const RCTX: FoldCtx = { ...CTX, inc: RINC };
+  const rkit = new ComputedKit(RCTX);
+  const RSID = rkit.sidAfter(null);
+  const H = testHouse('owner-node');
+  const FAIR = "✔ FAIR · PLAYERS' TABLE · THE HOUSE AND EVERY BETTOR ADD A SEED";
+  const top = (p: Page) => p.doc.getMap('casinoComputed');
+  let beats = 0;
+
+  /** The room's deed with `owner` (page a's player unless given), its house
+   *  table switched on; with `house`, the owner's node's key delegated. */
+  function houseTable(opts: { house?: boolean; owner?: TestIdentity } = {}): void {
+    const owner = opts.owner;
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', owner?.pid ?? a.pid));
+    switchOn(a, TABLE, RINC);
+    at(a, T0);
+    if (opts.house === false) return;
+    const body = { v: 1 as const, h: H.pub, k: owner?.pub ?? a.pub };
+    const g = owner ? owner.sign(roomSignBytes('hkey', CTX.room, '', body)) : a.keypair.signIdentity(roomSignBytes('hkey', CTX.room, '', body));
+    a.doc.transact(() => top(a).set(delegationKey(H.pub), { ...body, g }));
+  }
+  /** A heartbeat of the house, seen at T. */
+  function beat(T: number): void {
+    at(a, T);
+    const body = { v: 1 as const, n: ++beats, k: H.pub };
+    a.doc.transact(() => top(a).set(beatKey(H.pub), { ...body, g: houseSign(H.secret, roomSignBytes('hbeat', CTX.room, '', body)) }));
+  }
+  /** Bob's felt and Cat's down, the house in round 1, and Bob's close at
+   *  T0 + 19 s naming its commitment; the house heard just before, unless
+   *  `heard` is false. */
+  function fairClose(t: AtTable, heard = true) {
+    const join = rkit.houseJoin(H, 1);
+    const bob = rkit.slip(BOB, 1, [red(10)]);
+    const cat = rkit.slip(CAT, 1, [black(10)]);
+    put(a, T0 + 500, join, bob, cat);
+    wait(a, T0 + 500, T0 + 18_800, t);
+    if (heard) beat(T0 + 18_800);
+    const close = rkit.close(BOB, 1, RSID, [bob, cat], join.rec.c);
+    put(a, T0 + 19_000, close);
+    t.update();
+    return { join, bob, cat, close };
+  }
+
+  it("the plaque and the card: no house, the house offline, heard and not in yet, in; the owner's FAIRNESS, Friendly once the house steps down", () => {
+    houseTable({ house: false });
+    const t = atTable(a, { house: true });
+    t.update();
+    expect(t.plaque()).toBe("PLAYERS' TABLE · NO OPERATOR · SEEDS FROM THE PLAYERS");
+    expect(t.card()).toContain('THE HOUSE · NOT SET UP · YOUR NODE ADDS IT WHEN IT RUNS THIS ROOM');
+    expect(t.card()).not.toContain('FAIRNESS');
+    houseTable();
+    t.update();
+    expect(t.plaque()).toBe("PLAYERS' TABLE · FRIENDLY · THE HOUSE IS OFFLINE");
+    expect(t.card()).toContain('THE HOUSE · OFFLINE · ROUNDS RUN FRIENDLY');
+    beat(T0 + 100);
+    t.update();
+    expect(t.plaque()).toBe("PLAYERS' TABLE · FRIENDLY THIS ROUND · THE HOUSE JOINS THE NEXT");
+    expect(t.card()).toContain('THE HOUSE · ONLINE');
+    expect(t.card()).toContain("THE WHEEL SPINS ONCE THE BETTORS' SEEDS ARE IN ·");
+    put(a, T0 + 200, rkit.houseJoin(H, 1));
+    t.update();
+    expect(a.session.fairnessBadge(TABLE, 'roulette')).toEqual({ text: FAIR, color: '#7CF5B0', fair: true });
+    expect(t.plaque()).toBe(FAIR);
+    expect(t.card()).toContain("THE WHEEL SPINS ONCE THE BETTORS' SEEDS AND THE HOUSE'S ARE IN");
+    // A bet at a Fair round: no Friendly warning.
+    t.bet('1');
+    expect(mySlips(a)).toHaveLength(1);
+    expect(t.said()).not.toContain('FRIENDLY');
+    // The owner sets the table Friendly: from the next round on.
+    expect(t.card()).toContain('>FAIR WHILE THE HOUSE IS ONLINE</button>');
+    expect(t.card()).not.toContain('THE NEW SETTING STARTS');
+    t.press('house-fair');
+    expect(a.casino.readFairSetting(TABLE)).toBe('friendly');
+    expect(t.card()).toContain('>FRIENDLY</button>');
+    expect(t.card()).toContain('THE NEW SETTING STARTS WITH THE NEXT ROUND');
+    expect(t.plaque()).toBe(FAIR);
+    // The house steps down from round 1 (its seed out: nothing may name it).
+    put(a, T0 + 400, rkit.houseReveal(H, 1, [], [], { c: null }));
+    t.update();
+    expect(t.plaque()).toBe("PLAYERS' TABLE · FRIENDLY · THE OWNER CHOSE NO HOUSE SEED");
+    expect(t.card()).not.toContain('THE NEW SETTING STARTS');
+    // And back to Fair.
+    t.press('house-fair');
+    expect(a.casino.readFairSetting(TABLE)).toBe('fair');
+    t.unmount();
+  });
+
+  it("the table's own plaque reads as the line does: Friendly before the house is in the round, Fair once it is, Friendly once it steps down", () => {
+    houseTable();
+    if (!a.furniture.FURNITURE.some((i) => i.id === TABLE)) {
+      a.furniture.FURNITURE.push({ id: TABLE, kind: 'roulette-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    }
+    const wheel = fakeTable();
+    const frame = (T: number): void => {
+      at(a, T);
+      a.session.casinoTablesFrame(1 / 60, new Map([[TABLE, wheel.h]]));
+    };
+    beat(T0 + 100);
+    frame(T0 + 100);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(false);
+    expect(wheel.fair()).toBe(false);
+    put(a, T0 + 200, rkit.houseJoin(H, 1));
+    frame(T0 + 200);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(true);
+    expect(wheel.fair()).toBe(true);
+    put(a, T0 + 400, rkit.houseReveal(H, 1, [], [], { c: null }));
+    frame(T0 + 400);
+    expect(a.session.fairnessBadge(TABLE, 'roulette').fair).toBe(false);
+    expect(wheel.fair()).toBe(false);
+  });
+
+  it("the setting is a line on anyone else's card, and a press there sets nothing", () => {
+    pinOn(a, BOB);
+    houseTable({ owner: BOB });
+    beat(T0 + 100);
+    const t = atTable(a, { house: true });
+    t.update();
+    expect(a.casino.houseSetUp()).toBe(true);
+    expect(t.card()).toContain('THE HOUSE · ONLINE');
+    expect(t.card()).toContain('>FAIR WHILE THE HOUSE IS ONLINE</span>');
+    expect(t.card()).not.toContain('data-act="house-fair"');
+    t.press('house-fair');
+    expect(a.casino.readFairSetting(TABLE)).toBe('fair');
+    expect(t.said()).toBe("ONLY THE ROOM'S OWNER SETS THE HOUSE");
+    t.unmount();
+  });
+
+  it("a Fair round closed: the bettors' seeds, then WAITING FOR THE HOUSE'S SEED; its reveal decides it, counting its seed", () => {
+    houseTable();
+    const t = atTable(a);
+    const { bob, cat, close } = fairClose(t);
+    expect(t.plaque()).toBe(FAIR);
+    expect(t.status()).toBe('✋ NO MORE BETS — WAITING FOR SEEDS');
+    put(a, T0 + 19_200, rkit.reveal(1, BOB.pid));
+    t.update();
+    expect(t.status()).toBe('✋ NO MORE BETS — WAITING FOR SEEDS');
+    put(a, T0 + 19_400, rkit.reveal(1, CAT.pid));
+    t.update();
+    expect(foldOf(a).tip).toMatchObject({ decided: null });
+    expect(t.status()).toBe("✋ NO MORE BETS — WAITING FOR THE HOUSE'S SEED");
+    put(a, T0 + 20_000, rkit.houseReveal(H, 1, [close.hash], [bob.hash, cat.hash]));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'house', counted: [BOB.pid, CAT.pid].sort() });
+    const card = t.card();
+    expect(card).toContain("🔓 LAST SPIN · ROUND 1 · 2 OF 2 SEEDS + THE HOUSE'S · DECIDED BY THE HOUSE'S REVEAL");
+    expect(card).not.toContain('🚩');
+    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ decided: 'house', fair: true, houseDropped: [], houseVoid: false });
+    // The next round names the commitment the reveal carried: Fair from its start.
+    expect(t.plaque()).toBe(FAIR);
+    t.unmount();
+  });
+
+  it('the house unheard at a Fair close: the offline line, then the void the card names', () => {
+    houseTable();
+    beat(T0 + 100);
+    const t = atTable(a);
+    const { close } = fairClose(t, false);
+    expect(a.casino.houseOnline()).toBe(false);
+    expect(t.status()).toBe('⚠ THE HOUSE WENT OFFLINE · THIS ROUND GOES VOID UNLESS IT COMES BACK · THEN THE TABLE RUNS FRIENDLY');
+    put(a, T0 + 34_000, rkit.abandon(BOB, 1, close.hash));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'void' });
+    expect(t.card()).toContain('THE HOUSE NEVER REVEALED ITS SEED · VOID');
+    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ fair: true, houseVoid: true, houseWaited: [] });
+    expect(t.plaque()).toBe("PLAYERS' TABLE · FRIENDLY · THE HOUSE IS OFFLINE");
+    t.unmount();
+  });
+
+  it("an abandon voids a round whose house reveal waits on a seed this page never had: the card says the house revealed, and whose seed it counted", () => {
+    houseTable();
+    const t = atTable(a);
+    const { bob, cat, close } = fairClose(t);
+    put(a, T0 + 19_200, rkit.reveal(1, BOB.pid));
+    put(a, T0 + 19_400, rkit.houseReveal(H, 1, [close.hash], [bob.hash, cat.hash]));
+    t.update();
+    expect(foldOf(a).tip).toMatchObject({ decided: null, houseWaits: [CAT.pid] });
+    put(a, T0 + 50_000, rkit.abandon(BOB, 1, close.hash));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'void', houseWaits: [CAT.pid] });
+    expect(a.table.computedRoundCheck(TABLE)).toMatchObject({ fair: true, houseVoid: false, houseWaited: [CAT.pid] });
+    const card = t.card();
+    expect(card).not.toContain('THE HOUSE NEVER REVEALED ITS SEED');
+    expect(card).toContain('THE HOUSE REVEALED ITS SEED · IT COUNTED A SEED FROM ');
+    expect(card).toContain(' THAT NEVER CAME HERE · VOID');
+    t.unmount();
+  });
+
+  it('flags a house reveal that left out a seed this page saw in time, before the reveal', () => {
+    houseTable();
+    const t = atTable(a);
+    const { bob, close } = fairClose(t);
+    put(a, T0 + 19_200, rkit.reveal(1, BOB.pid), rkit.reveal(1, CAT.pid));
+    put(a, T0 + 19_400, rkit.houseReveal(H, 1, [close.hash], [bob.hash]));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'house', counted: [BOB.pid] });
+    expect(t.card()).toContain("1 OF 2 SEEDS + THE HOUSE'S");
+    expect(t.card()).toContain('🚩 THE HOUSE LEFT OUT A SEED THIS PAGE SAW IN TIME');
+    expect(a.table.computedRoundCheck(TABLE)?.houseDropped).toEqual([CAT.pid]);
+    t.unmount();
+  });
+
+  it("but not a seed this page saw only after the house's reveal", () => {
+    houseTable();
+    const t = atTable(a);
+    const { bob, close } = fairClose(t);
+    put(a, T0 + 19_200, rkit.reveal(1, BOB.pid), rkit.houseReveal(H, 1, [close.hash], [bob.hash]));
+    put(a, T0 + 19_400, rkit.reveal(1, CAT.pid));
+    t.update();
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'house', counted: [BOB.pid] });
+    expect(t.card()).not.toContain('🚩');
+    expect(a.table.computedRoundCheck(TABLE)?.houseDropped).toEqual([]);
+    t.unmount();
   });
 });

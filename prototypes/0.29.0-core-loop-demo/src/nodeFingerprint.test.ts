@@ -93,3 +93,15 @@ describe('the torrent lane flag', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.torrent).toBeUndefined();
   });
 });
+
+describe('the house key', () => {
+  it('is kept only as 43 characters of base64url', () => {
+    const house = 'A-_z'.repeat(10) + 'abc';
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house })?.house).toBe(house);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: `${house}=` })?.house).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: house.slice(1) })?.house).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 'A+/z'.repeat(10) + 'abc' })?.house).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 43 })?.house).toBeUndefined();
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.house).toBeUndefined();
+  });
+});

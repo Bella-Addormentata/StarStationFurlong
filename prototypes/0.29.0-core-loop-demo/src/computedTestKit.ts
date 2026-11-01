@@ -4,7 +4,8 @@
  *
  * Builds records the way an honest page would: hashed, keyed and signed for
  * one FoldCtx, by deterministic test identities (the same name always gives
- * the same key), with deterministic seeds. Plus SigChecks: a caching one on
+ * the same key), with deterministic seeds; and a house's, as the owner's
+ * node would (computedHouse's mirror of house.rs). Plus SigChecks: a caching one on
  * the real verifier (keypair.verifyIdentityStrict) that can hold chosen
  * records back as "not checked yet", and a trusting one for timing runs that
  * must not spend their budget on signatures.
@@ -18,6 +19,9 @@ import {
   abandonKey,
   closeKey,
   forfeitKey,
+  houseCommitKey,
+  houseCommitOf,
+  houseRevealKey,
   nextSid,
   recHash,
   revealKey,
@@ -28,9 +32,10 @@ import {
   TableFold,
 } from './computedFold';
 import type {
-  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, FoldCtx, FoldResult, ForfeitRec, RevealRec, SigCheck,
-  SignedKind, SlipRec,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, FoldCtx, FoldResult, ForfeitRec, HouseCheck, HouseCommitRec,
+  HouseRevealRec, RevealRec, SigCheck, SignedKind, SlipRec,
 } from './computedFold';
+import { housePubOf, houseSeedOf, houseSign } from './computedHouse';
 import type { CrapsCarry } from './computedCraps';
 import type { CrapsBet } from './games/craps';
 import type { RouletteBet } from './games/roulette';
@@ -80,6 +85,22 @@ export interface CachingCheck {
   /** How many records were actually verified. */
   verified: number;
 }
+
+/** A house: a node secret from a fixed seed (sha256('ssf-ct-test-house|<name>'))
+ *  and the house key house.rs derives from it. */
+export interface TestHouse {
+  secret: Uint8Array;
+  /** base64url house key. */
+  pub: string;
+}
+
+export function testHouse(name: string): TestHouse {
+  const secret = sha256(utf8ToBytes(`ssf-ct-test-house|${name}`));
+  return { secret, pub: housePubOf(secret) };
+}
+
+/** A HouseCheck: these houses are delegated, every other key is not. */
+export const housesAre = (...houses: TestHouse[]): HouseCheck => (pub) => houses.some((h) => h.pub === pub);
 
 /** A SigCheck on keypair.verifyIdentityStrict that verifies each record once.
  *  Hashes in `hold` read as pending until taken out. */
@@ -157,12 +178,12 @@ export class ComputedKit {
   }
 
   /** A close of round r under parent q, freezing the given slips (or a raw
-   *  pid → hash map). */
-  close(id: TestIdentity, r: number, q: string, frozen: Built<AnySlipRec>[] | Record<string, string>): Built<CloseRec> {
+   *  pid → hash map); at a house table, naming house commitment `h`. */
+  close(id: TestIdentity, r: number, q: string, frozen: Built<AnySlipRec>[] | Record<string, string>, h?: string): Built<CloseRec> {
     const f: Record<string, string> = {};
     if (Array.isArray(frozen)) for (const s of frozen) f[s.rec.p] = s.hash;
     else Object.assign(f, frozen);
-    return built(this.sign<CloseRec>('close', id, { r, q, f }), closeKey);
+    return built(this.sign<CloseRec>('close', id, { r, q, f, ...(h !== undefined ? { h } : {}) }), closeKey);
   }
 
   /** The reveal for a slip made with the default seed (or `seed`). */
@@ -180,11 +201,55 @@ export class ComputedKit {
   }
 
   /** A checkpoint closing session `b` at round u, with nets given as bigints
-   *  (and, for a live craps table, the carried state `s`). */
-  checkpoint(id: TestIdentity, b: string, u: number, l: string, nets: Record<string, bigint>, e?: 1, s?: CrapsCarry): Checkpoint {
+   *  (and, for a live craps table, the carried state `s`; for a live house
+   *  table, the commitment `h` its next session must name first). */
+  checkpoint(
+    id: TestIdentity, b: string, u: number, l: string, nets: Record<string, bigint>, e?: 1, s?: CrapsCarry, h?: string,
+  ): Checkpoint {
     const n: Record<string, string> = {};
     for (const pid of Object.keys(nets).sort()) if (nets[pid] !== 0n) n[pid] = nets[pid].toString();
-    return this.sign<Checkpoint>('sum', id, { v: 1, b, u, l, n, ...(e ? { e } : {}), ...(s ? { s } : {}) });
+    return this.sign<Checkpoint>('sum', id, { v: 1, b, u, l, n, ...(e ? { e } : {}), ...(s ? { s } : {}), ...(h ? { h } : {}) });
+  }
+
+  // ── The house's ──
+
+  /** The house's seed for round r (computedHouse houseSeedOf). */
+  houseSeed(house: TestHouse, r: number): string {
+    return houseSeedOf(house.secret, this.ctx, r);
+  }
+
+  /** The house's commitment for round r: to houseSeed unless given a seed. */
+  houseCommit(house: TestHouse, r: number, seed: string = this.houseSeed(house, r)): string {
+    return houseCommitOf(this.ctx, r, seed);
+  }
+
+  /** `body` with k = the house key, signed by the house over signBytes(kind, ctx, body). */
+  signHouse<T extends { k: string; g: string }>(kind: 'hreveal' | 'hcommit', house: TestHouse, body: Omit<T, 'k' | 'g'>): T {
+    const withKey = { ...(body as object), k: house.pub };
+    return { ...withKey, g: houseSign(house.secret, signBytes(kind, this.ctx, withKey)) } as unknown as T;
+  }
+
+  /** The house's reveal of round r, deciding closes `x` and counting the
+   *  slips `n` (both sorted here), carrying the next round's commitment
+   *  unless `c` is null (or the one given). `s` defaults to the house's seed. */
+  houseReveal(
+    house: TestHouse, r: number, x: string[], n: string[], opts: { c?: string | null; s?: string } = {},
+  ): Built<HouseRevealRec> {
+    const c = opts.c === null ? undefined : opts.c ?? this.houseCommit(house, r + 1);
+    const body = {
+      r, s: opts.s ?? this.houseSeed(house, r), x: [...new Set(x)].sort(), n: [...new Set(n)].sort(), ...(c !== undefined ? { c } : {}),
+    };
+    return built(this.signHouse<HouseRevealRec>('hreveal', house, body), houseRevealKey);
+  }
+
+  /** The house stepping down at round r: its seed out, no close listed. */
+  stepDown(house: TestHouse, r: number, s: string = this.houseSeed(house, r)): Built<HouseRevealRec> {
+    return built(this.signHouse<HouseRevealRec>('hreveal', house, { r, s, x: [], n: [] }), houseRevealKey);
+  }
+
+  /** The house joining round r with commitment `c` (to its own seed by default). */
+  houseJoin(house: TestHouse, r: number, c: string = this.houseCommit(house, r)): Built<HouseCommitRec> {
+    return built(this.signHouse<HouseCommitRec>('hcommit', house, { r, c }), houseCommitKey);
   }
 
   /** The session id a checkpoint opens. */
@@ -222,9 +287,9 @@ export class TestSession {
     return this;
   }
 
-  /** A fold built cold from this session. */
-  fold(check: SigCheck, cp: Checkpoint | null = null, ctx: FoldCtx = TEST_CTX): TableFold {
-    const fold = new TableFold(ctx, check);
+  /** A fold built cold from this session (with `houseOk`, at a house table). */
+  fold(check: SigCheck, cp: Checkpoint | null = null, ctx: FoldCtx = TEST_CTX, houseOk?: HouseCheck): TableFold {
+    const fold = new TableFold(ctx, check, undefined, undefined, houseOk);
     fold.setBase(cp);
     fold.reset(this.records.entries());
     return fold;
@@ -254,5 +319,18 @@ export function snapshot(res: FoldResult): string {
     pending: res.pending,
     bytes: res.bytes,
     records: res.records,
+  });
+}
+
+/** snapshot, plus what THE HOUSE adds: each round's deciding house reveal,
+ *  the open round's required commitment and the join records it may name.
+ *  (snapshot itself stays as PR 2 hashed it: computedFoldGolden pins it.) */
+export function houseSnapshot(res: FoldResult): string {
+  return JSON.stringify({
+    s: snapshot(res),
+    houseTable: res.houseTable,
+    house: res.rounds.map((v) => v.house?.hash ?? null),
+    required: res.required,
+    joins: res.joins.map((j) => j.hash),
   });
 }

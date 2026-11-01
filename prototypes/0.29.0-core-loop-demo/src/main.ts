@@ -268,7 +268,7 @@ import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
-import { leaveComputedTables } from "./computedTable";
+import { leaveComputedTables, setLocalHouse } from "./computedTable";
 import { listenToRoom, noteRoomHeard } from "./roomHearing";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -9006,6 +9006,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     return localFingerprint;
   }
   localFingerprint = fingerprint;
+  // 🏠 The node's house key: what this page delegates, as the room's deed
+  // holder, for the node to add a seed to its computed tables' rounds
+  // (computedTable houseDuty). Kept while the node is away a round.
+  setLocalHouse(fingerprint.house ?? null);
   setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);

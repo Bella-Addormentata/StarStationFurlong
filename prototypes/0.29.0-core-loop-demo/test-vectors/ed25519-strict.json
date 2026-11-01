@@ -1,5 +1,5 @@
 {
-  "note": "Ed25519 verdicts pinned for keypair.verifyIdentityStrict (strict: its byte checks, then @noble/ed25519 2.3.0 verify with zip215:false), for that noble call alone (noble) and for noble's default (loose: zip215:true, what keypair.verifyIdentity uses). Deterministic: fixed seeds sha256(\"ssf-ed25519-strict-vector-v1|<name>\") and fixed scalars. pub and sig are base64url, msg is hex. honest: an ordinary signature. torsion-r: R = 123456789·B + T8 (T8 of order 8), S = r + k·a; the cofactored equation accepts it in both modes. s-plus-l: an honest signature with S + L in place of S. noncanonical-r: R is the order-4 point T4 = 2·T8 (y = 0) spelled with y = p, S = k·a; its canonical spelling passes strict. small-order-key: the key is T8 and (42·B, 42) verifies every message under it. identity-r: R is the identity point (01 00…00) and S = SHA-512(\"\")·a; noble 2.3.0 drops the message from k when R is the identity (R.toBytes() throws inside its try), so under an ordinary key this one signature verifies every message in both noble modes, and verifyIdentityStrict refuses any identity R before calling noble. identity-r-rfc: the same R with S = SHA-512(R‖A‖M)·a, valid under RFC 8032 and in the WebCrypto of Node 22 but refused by noble and by verifyIdentityStrict. strict is the verdict of verifyIdentityStrict, noble is @noble/ed25519 2.3.0 with zip215:false on its own (they differ only for identity-r), loose is the noble default. A change to any verdict means the verifier changed: pages on different versions would fold different rounds.",
+  "note": "Ed25519 verdicts pinned for keypair.verifyIdentityStrict (strict: its byte checks, then @noble/ed25519 2.3.0 verify with zip215:false), for that noble call alone (noble) and for noble's default (loose: zip215:true, what keypair.verifyIdentity uses). Deterministic: fixed seeds sha256(\"ssf-ed25519-strict-vector-v1|<name>\") and fixed scalars. pub and sig are base64url, msg is hex. honest: an ordinary signature. torsion-r: R = 123456789·B + T8 (T8 of order 8), S = r + k·a; the cofactored equation accepts it in both modes. s-plus-l: an honest signature with S + L in place of S. noncanonical-r: R is the order-4 point T4 = 2·T8 (y = 0) spelled with y = p, S = k·a; its canonical spelling passes strict. small-order-key: the key is T8 and (42·B, 42) verifies every message under it. identity-r: R is the identity point (01 00…00) and S = SHA-512(\"\")·a; noble 2.3.0 drops the message from k when R is the identity (R.toBytes() throws inside its try), so under an ordinary key this one signature verifies every message in both noble modes, and verifyIdentityStrict refuses any identity R before calling noble. identity-r-rfc: the same R with S = SHA-512(R‖A‖M)·a, valid under RFC 8032 and in the WebCrypto of Node 22 but refused by noble and by verifyIdentityStrict. torsion-key: the key is a·B + T8 (not of small order) and the signature an honest one over that key as spelled; the cofactored equation accepts it. small-order-r: R is T4 spelled canonically (y = 0, the sign bit set), S = k·a under an ordinary key; the cofactored equation accepts it. noncanonical-r-own-k: R is T4 spelled with y = p again, now with S = k·a for k hashed over R as spelled (noble hashes R re-encoded, so neither mode accepts it); a check that read R leniently and hashed its bytes would. Those three (torsion-r, torsion-key, small-order-r) are where ed25519-dalek's verify and verify_strict, cofactorless, say no: the house's check (ssf-p2p-node house_bytes.rs verify) follows these verdicts instead, with its own test. strict is the verdict of verifyIdentityStrict, noble is @noble/ed25519 2.3.0 with zip215:false on its own (they differ only for identity-r), loose is the noble default. A change to any verdict means the verifier changed: pages on different versions would fold different rounds.",
   "vectors": [
     {
       "name": "honest",
@@ -60,6 +60,33 @@
       "pub": "xFy2DpiY92_J_ZtJHb_gLdaUQlkTs9p3cr77VI9rOSU",
       "msg": "ee9551a3eed59387ccac2303122e6a7d73911fa58a57746d7da0ec325d62d7ad",
       "sig": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD1gS1icpHiMcPvJFvuM_ptmnPTnoma9VMvQ2q9Gqv6BQ",
+      "strict": false,
+      "noble": false,
+      "loose": false
+    },
+    {
+      "name": "torsion-key",
+      "pub": "Tw1zkOWIm7YUBjw0MsXTbTv8plRZJ4CZqS7KKNXeZjQ",
+      "msg": "d0b215eba4e5a3854ab602a7d43eac526593e410027e3f3da8a83fd063fc4d48",
+      "sig": "ysVPHjKxZs4IkitPN5TcOqciakrcSB9YZx_HRJkjKQ63it84f2NWtGIxAGIrVqWbRZFp-Ha6scw4cWZh1N-0Cw",
+      "strict": true,
+      "noble": true,
+      "loose": true
+    },
+    {
+      "name": "small-order-r",
+      "pub": "Ou7DHA6v9eWPGqGTzEBAIxtmv5gVyvSMhxCWVPuAkjQ",
+      "msg": "f8b6cb93bc79b219b9a4d890be317cce2453b6df50c13a37d9c9dbc492cf8c86",
+      "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDAEPvFYLan2-Jv3ZK-C4u_0iNVt9FM_djqVDTo6PduCQ",
+      "strict": true,
+      "noble": true,
+      "loose": true
+    },
+    {
+      "name": "noncanonical-r-own-k",
+      "pub": "VnaRJZkWnWSPsE_2Xv318b0H08jHf2vdIpUlmOairWA",
+      "msg": "7a1b2c2f9ae40f8ae9d0a92751ca4acce03a8655edf381812d4283da65da2755",
+      "sig": "7f_______________________________________381GX92OR1cTRrZXQRnkpIJ4Bj9hfUsXZuLeEKduW4qCQ",
       "strict": false,
       "noble": false,
       "loose": false

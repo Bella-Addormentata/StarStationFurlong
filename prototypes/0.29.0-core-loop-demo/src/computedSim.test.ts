@@ -33,6 +33,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import * as Y from 'yjs';
 import vectors from '../test-vectors/ed25519-strict.json';
 import { canon } from './computedFold';
+import { HOUSE_HEARD_MS } from './computedHouse';
 import type { Checkpoint, FoldCtx, FoldResult } from './computedFold';
 import { PAGE_ROOM } from './computedPageKit';
 import { ComputedKit, red } from './computedTestKit';
@@ -1438,5 +1439,155 @@ describe('added for PR 2', () => {
     expect((came['woke past the show'] ?? 0) + (came['woke to a later result'] ?? 0), `${sim.label} woke past the show`).toBeGreaterThan(0);
     expect(s.rounds, sim.label).toBeGreaterThanOrEqual(scaled(10));
     console.log(`[sim] felt-sleeps seed=${sim.opts.seed}: sleeps on the felt's frame ${JSON.stringify(meant)}, back ${JSON.stringify(came)}`);
+  }, TIMEOUT);
+});
+
+// ── 🏠 The house (PR 5) ──────────────────────────────────────────────────────
+
+describe("the house: the owner's node adds its seed to the rounds (computedSimHouse, house.rs's twin)", () => {
+  it("fair: the owner's node runs the whole time; its reveal decides every round, none forfeited or void", async () => {
+    // Heavy felts, so the session trims under the house's rounds.
+    const sim = await Sim.open({ name: 'house-fair', seed: seed(901), pages: named('ABCD'), houseNode: true, bot: HEAVY_BOT });
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    const node = sim.node!;
+    expect(s.byHouse, sim.label).toBeGreaterThanOrEqual(scaled(26));
+    expect(s.byReveals + s.byForfeit + s.voids, sim.label).toBe(0);
+    // It joined round 1 and carried every commitment on from there (its
+    // reveals, and the checkpoints' `h` across each trim).
+    expect(node.wrote.joins, sim.label).toBe(1);
+    expect(node.wrote.reveals, sim.label).toBeGreaterThanOrEqual(s.byHouse);
+    expect(node.wrote.beats, sim.label).toBeGreaterThan(0);
+    expect(node.refusals + node.blockedSeen, sim.label).toBe(0);
+    expect(s.trims, sim.label).toBeGreaterThan(0);
+  }, TIMEOUT);
+
+  it('outage: the node is down for 40 s twice and restarts; the round it left goes void, and it joins the next', async () => {
+    const sim = await Sim.open({ name: 'house-outage', seed: seed(902), pages: named('ABCD'), houseNode: true });
+    for (const at of [50_000, 115_000]) {
+      sim.at(at, () => { sim.nodeUp = false; });
+      sim.at(at + 40_000, () => {
+        sim.node!.restart();
+        sim.nodeUp = true;
+      });
+    }
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    const node = sim.node!;
+    // 40 s is too short for a Friendly round between: the void takes the
+    // round its close named the house in, and the node's join the next.
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    expect(s.voids, sim.label).toBeGreaterThanOrEqual(1);
+    expect(s.voids, sim.label).toBeLessThanOrEqual(4);
+    expect(node.wrote.joins, sim.label).toBeGreaterThanOrEqual(3);
+  }, TIMEOUT);
+
+  it('long outage: the node is down for 70 s; after the void the table runs Friendly on the bettors\' seeds, then the house joins again', async () => {
+    const sim = await Sim.open({ name: 'house-long-outage', seed: seed(906), pages: named('ABCD'), houseNode: true });
+    const episodes = SIM_LONG ? [40_000, 400_000, 700_000] : [40_000];
+    for (const at of episodes) {
+      sim.at(at, () => { sim.nodeUp = false; });
+      sim.at(at + 70_000, () => {
+        sim.node!.restart();
+        sim.nodeUp = true;
+      });
+    }
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    const node = sim.node!;
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    expect(s.byReveals, sim.label).toBeGreaterThan(0);
+    expect(s.voids, sim.label).toBeGreaterThanOrEqual(1);
+    expect(s.voids, sim.label).toBeLessThanOrEqual(2 * episodes.length);
+    expect(node.wrote.joins, sim.label).toBeGreaterThanOrEqual(1 + episodes.length);
+  }, TIMEOUT);
+
+  it('owner sets Friendly and back: the house steps down with no void, and joins again', async () => {
+    const sim = await Sim.open({ name: 'house-friendly', seed: seed(903), pages: named('ABCD'), houseNode: true });
+    const set = (mode: 'fair' | 'friendly') => async (): Promise<void> => {
+      const answer = await sim.as(sim.house, (now) => sim.house.p.table.setComputedFairness(T1, mode, now));
+      if (answer !== 'ok') sim.violate(`setComputedFairness ${mode} answered ${answer}`);
+    };
+    sim.at(55_000, set('friendly'));
+    sim.at(110_000, set('fair'));
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    const node = sim.node!;
+    expect(s.voids, sim.label).toBe(0);
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    expect(s.byReveals, sim.label).toBeGreaterThan(0);
+    expect(node.wrote.joins, sim.label).toBeGreaterThanOrEqual(2);
+  }, TIMEOUT);
+
+  it('the app quits: the node steps down and stops a second later; at most the round it closed on goes void', async () => {
+    const sim = await Sim.open({ name: 'house-quit', seed: seed(904), pages: named('ABCD'), houseNode: true });
+    sim.at(80_000, () => { sim.node!.steppingDown = true; });
+    sim.at(81_000, () => { sim.nodeUp = false; });
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    expect(s.byReveals, sim.label).toBeGreaterThan(0);
+    expect(s.voids, sim.label).toBeLessThanOrEqual(1);
+  }, TIMEOUT);
+
+  it('split: the owner and one player apart from two for 50 s; the far side gives up the round that named the house, and the house side\'s chain stands', async () => {
+    const sim = await Sim.open({ name: 'house-split', seed: seed(905), pages: named('ABCD'), houseNode: true });
+    sim.at(60_000, () => { sim.net.groups = [['A', 'B'], ['C', 'D']]; });
+    sim.at(110_000, () => { sim.net.groups = null; });
+    await sim.run(RUN_MS);
+    // The far side's rounds while apart are undone, or replaced by the house
+    // side's (whose chain has the latest round the house decided).
+    const s = await finish(sim, { flips: ['other branch', 'checkpoint', 'undone', 'rival close', 'forfeit over reveals', 'answer forfeit'] });
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    // The far side gave up on the round that named the house (an abandon),
+    // and its pages read the house side's rounds once healed. The house
+    // side's chain, with the latest round the house decided, never flipped.
+    expect(s.abandonsChecked, sim.label).toBeGreaterThanOrEqual(1);
+    expect(s.flips.C + s.flips.D, sim.label).toBeGreaterThan(0);
+    expect(s.flips.A + s.flips.B, sim.label).toBe(0);
+  }, TIMEOUT);
+
+  it("reveal, then deaf: a page has the house's reveal but not a seed it counted, and stops hearing anyone; it waits the full 30 s, not the 15 s of an unheard house", async () => {
+    // C's uplink is slow, to the house's page (A) less so than to B and D:
+    // its seed is the last the house sees, and D has the house's reveal of
+    // the close before C's seed in it (the fold's houseWaits). Then D's downlink
+    // stalls (Net.deaf) until 26 s after the close reached it: no seed and
+    // no beat of the house's. An unheard house voids a Fair round at 15 s,
+    // but not one whose reveal is in (computedTable abandonWait): D waits
+    // 30 s, so it hears the seed as the stall ends and nothing goes void.
+    // (The sim's own check holds every abandon to that: checkOwnAbandons.)
+    const sim = await Sim.open({ name: 'house-reveal-deaf', seed: seed(907), pages: named('ABCD'), houseNode: true });
+    const [a, b, c, d] = sim.pages;
+    sim.net.setLink(c, a, { delay: [1_500, 2_000] });
+    sim.net.setLink(c, b, { delay: [6_000, 7_000] });
+    sim.net.setLink(c, d, { delay: [6_000, 7_000] });
+    const stalls: { r: number; from: number; to: number; waits: string[] }[] = [];
+    let until: number | null = null;
+    let closeIn: { close: string; T: number } | null = null;
+    sim.every(() => {
+      if (until !== null) {
+        if (sim.T < until && !sim.healed) return;
+        sim.net.deaf.clear();
+        until = null;
+      }
+      if (sim.healed || stalls.length >= 3) return;
+      sim.enter(d);
+      const tip = d.p.casino.computedFoldOf(T1)?.tip;
+      if (!tip) return;
+      if (closeIn?.close !== tip.close) closeIn = { close: tip.close, T: sim.T };
+      if (tip.houseWaits === undefined || stalls.some((x) => sim.T < x.to + 30_000)) return;
+      until = closeIn.T + 26_000;
+      sim.net.deaf.add(d.name);
+      stalls.push({ r: tip.r, from: sim.T, to: until, waits: tip.houseWaits });
+    });
+    await sim.run(RUN_MS);
+    const s = await finish(sim);
+    console.log(`[sim] house-reveal-deaf: ${stalls.map((x) => `round ${x.r} deaf ${x.from - SIM_T0}-${x.to - SIM_T0} ms waiting on ${x.waits.length}`).join('; ')}`);
+    expect(stalls.length, sim.label).toBeGreaterThan(0);
+    // Each stall began well over 15 s before D would hear again, with the
+    // house's beats unheard for more than HOUSE_HEARD_MS by its end.
+    for (const x of stalls) expect(x.to - x.from, sim.label).toBeGreaterThan(HOUSE_HEARD_MS + 5_000);
+    expect(s.voids, sim.label).toBe(0);
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
   }, TIMEOUT);
 });

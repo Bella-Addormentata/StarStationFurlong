@@ -23,7 +23,7 @@ iroh-mdns-address-lookup = "0.4"
 iroh-blobs = { version = "0.103.1", default-features = false, features = ["fs-store"] }
 # The blob lane's progress stream (already in the graph through iroh).
 n0-future = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -97,14 +97,19 @@ clvmr = { version = "0.16", optional = true }
 # create_coin memos back out (already transitive; direct dep makes them nameable).
 clvm-traits = { version = "0.36", optional = true }
 clvm-utils = { version = "0.36", optional = true }
-# Craps fairness (plan §12 / T1): SHA-256 for the commit-reveal + beacon dice
-# derivation, byte-for-byte identical to the browser's src/games/fairDice.ts.
-sha2 = { version = "0.10", optional = true }
+# SHA-256: the craps fairness commit-reveal + beacon dice derivation (plan §12
+# / T1), byte-for-byte identical to the browser's src/games/fairDice.ts, and
+# the house's bytes (house_bytes.rs: record hashes, signed bytes, seed
+# commitments), identical to src/computedFold.ts. Every build: the house runs
+# in all of them.
+sha2 = "0.10"
 # #231 P6a: the per-node presence record carries an X25519 key (`kx_pk`) that
-# P6b's knocks are sealed to. Only the base-point multiplication is needed here;
-# pinned to the exact version iroh-base already locks, so no second copy of the
-# curve lands in the binary (Windows-GNU export-ordinal budget, see above).
-curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false, optional = true }
+# P6b's knocks are sealed to; and the house checks the pages' signatures by
+# their own rule (house_bytes.rs verify: the cofactored equation, which
+# ed25519-dalek doesn't offer). Every build: the house runs in all of them.
+# Pinned to the exact version iroh-base already locks, so no second copy of
+# the curve lands in the binary (Windows-GNU export-ordinal budget, see above).
+curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false }
 # 🧲 `torrent` feature only (torrent_lane.rs). rust-tls keeps OpenSSL out
 # (its SHA-1 is ring's); its reqwest brings aws-lc-rs, so main.rs names ring
 # as rustls' process default. `url` turns the blocklist path into the file://
@@ -130,7 +135,6 @@ chia-read = [
     "dep:chia-ssl", "dep:chia-traits", "dep:tokio-tungstenite", "dep:tokio-rustls",
     "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
-    "dep:curve25519-dalek",
 ]
 # Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
 # the craps fairness hook and the treasury codec tests. Runtime-gated by
@@ -138,7 +142,6 @@ chia-read = [
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
-    "dep:sha2",
 ]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]

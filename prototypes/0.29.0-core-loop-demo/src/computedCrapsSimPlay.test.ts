@@ -117,3 +117,36 @@ describe('computed craps: the baseline', () => {
     }, TIMEOUT);
   }
 });
+
+// ── 🏠 The house (PR 5) ──────────────────────────────────────────────────────
+
+describe("computed craps with the house: the owner's node adds its seed to the rolls (computedSimHouse)", () => {
+  it('house seed 1: the node runs, goes down for 70 s at 4 minutes and restarts; the roll it left goes void, the rolls run Friendly, then it joins again', async () => {
+    const sim = await Sim.open({ name: 'craps-house', seed: seed(901), pages: named('ABCD'), tables: [{ id: T, game: 'craps' }], houseNode: true });
+    const craps = sim.craps!;
+    sim.at(240_000, () => { sim.nodeUp = false; });
+    sim.at(310_000, () => {
+      sim.node!.restart();
+      sim.nodeUp = true;
+    });
+    await sim.run(RUN_MS);
+    const s = await finish(sim, lines, { basesKnown: true });
+    const node = sim.node!;
+    // The house's reveal decided the rolls either side of the outage, the
+    // bettors' seeds the Friendly ones while it was away; at most the roll
+    // whose close named it, and the one it may have joined just as it went,
+    // void.
+    expect(s.byHouse, sim.label).toBeGreaterThan(0);
+    expect(s.byReveals, sim.label).toBeGreaterThan(0);
+    expect(s.byForfeit, sim.label).toBe(0);
+    expect(s.voids, sim.label).toBeGreaterThanOrEqual(1);
+    expect(s.voids, sim.label).toBeLessThanOrEqual(2);
+    expect(node.wrote.joins, sim.label).toBeGreaterThanOrEqual(2);
+    expect(node.refusals, sim.label).toBe(0);
+    // A close of its first seen after the restart already voided (the roll
+    // it left, while no trim has taken it out of the session yet) is never
+    // revealed: at most the voided ones.
+    expect(node.blockedSeen, sim.label).toBeLessThanOrEqual(s.voids);
+    expect(craps.stats.rollsChecked, sim.label).toBeGreaterThanOrEqual(s.rounds);
+  }, TIMEOUT);
+});

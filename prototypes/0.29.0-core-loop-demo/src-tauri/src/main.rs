@@ -33,6 +33,71 @@ async fn rotate_fingerprint(hub: State<'_, SharedHub>) -> Result<Fingerprint, St
     Ok(fp)
 }
 
+/// 🏠 Ask the node we spawned to step its house down before it is stopped
+/// (ssf-p2p-node house.rs): the tables it runs go on Friendly with no void.
+/// Its local HTTP API is on 8080, or 8081 when that was taken: both are asked
+/// at once, each with the whole second and a half, so something else on 8080
+/// that holds its answer open can't spend the time the node on 8081 needs.
+/// Only the node holding UDP 4443 serves that API, and that is the one we
+/// spawned, so no other node is asked. One that doesn't answer is stopped all
+/// the same.
+fn house_step_down() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(1_500);
+    let (tx, rx) = mpsc::channel();
+    for port in [8080u16, 8081] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ask_house_step_down(port, deadline));
+        });
+    }
+    drop(tx);
+    // The first port that is the node's ends the wait; a port that isn't
+    // leaves it to the other. Both answered no, or the deadline: we're done.
+    while let Ok(stepped) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if stepped {
+            println!("🏠 The node's house stepped down");
+            return;
+        }
+    }
+}
+
+/// One port's ask: true when the node's own answer came back by `deadline`.
+fn ask_house_step_down(port: u16, deadline: std::time::Instant) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, left().min(Duration::from_millis(200)).max(Duration::from_millis(1))) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(left().max(Duration::from_millis(1))));
+    let req = "POST /api/house/stepdown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    // The answer is a few hundred bytes: read at most 4 KB, by the deadline,
+    // so whatever listens there can't hold the app's exit.
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 512];
+    while answer.len() < 4_096 {
+        let wait = left();
+        if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => answer.extend_from_slice(&buf[..n]),
+        }
+    }
+    // The node's own answer ({"ok":true,"wrote":N}), not any server's 200.
+    let text = String::from_utf8_lossy(&answer);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.trim_start()).unwrap_or("");
+    text.starts_with("HTTP/1.1 200") && body.starts_with("{\"ok\":true,\"wrote\":")
+}
+
 /// How we ended up with (or without) a sovereign P2P node this launch.
 enum NodeMode {
     /// UDP 4443 is already bound — an external ssf-p2p-node (or prior spawn) is serving.
@@ -234,6 +299,7 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(mut child) = node_child_on_exit.lock().unwrap().take() {
                     println!("🛑 Stopping spawned ssf-p2p-node (pid {})", child.id());
+                    house_step_down();
                     let _ = child.kill();
                     let _ = child.wait();
                 }
