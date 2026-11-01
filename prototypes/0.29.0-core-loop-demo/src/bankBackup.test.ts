@@ -21,6 +21,7 @@ import {
   backupPageKind,
   bankBackupView,
   clipboardWipeDue,
+  copyStays,
   closeBackupPanel,
   copyWords,
   freshTap,
@@ -618,6 +619,25 @@ describe('the clipboard', () => {
     expect(afterWipe(stuck, 10_000, 'stuck')).toMatchObject({ copy: 'stuck' });
     expect(afterWipe(afterCopy(stuck, 'held', 20_000), 10_000, 'wiped').copy).toBe('held');
     expect(afterWipe(afterAddressCopy(stuck), 10_000, 'wiped').copy).toBe('none');
+  });
+
+  it('keeps a COPY on the clipboard only while the panel it was tapped in still shows its words', () => {
+    const ui = shown();
+    const gen = ui.gen;
+    expect(copyStays(afterCopy(ui, 'held', 3000), gen, true)).toBe(true);
+    expect(copyStays(afterCopy(ui, 'held', 3000), gen, false)).toBe(false);
+    // HIDE while the write was out.
+    const hidden = hideWords(ui, 2500);
+    expect(copyStays(afterCopy(hidden, 'held', 3000), gen, true)).toBe(false);
+    // HIDE, then another SHOW, before the write was done: new words are on
+    // screen, but the COPY was tapped in the panel that went.
+    const again = startReveal(hidden, 2600)!;
+    const reshown = applyReveal(again.ui, again.ticket, { ok: true, words: [...WORDS], key: KEY, address: ADDR }, true, 2700);
+    expect(reshown.words).not.toBeNull();
+    expect(copyStays(afterCopy(reshown, 'held', 3000), gen, true)).toBe(false);
+    // LATER, then the panel opened again and shown.
+    const later = closeBackupPanel(ui, 2500);
+    expect(copyStays(afterCopy(later, 'held', 3000), gen, true)).toBe(false);
   });
 
   it('is due for a wipe at 60 s; the address\'s COPY cancels it, and a newer copy outlives an older wipe', () => {

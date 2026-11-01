@@ -290,7 +290,7 @@ import { BANK_WALLET_BUTTON_ID, bankWalletView, turnSsfWallet } from "./bankWall
 import {
   BACKUP_COPY_ID, BACKUP_GRID_ID, BACKUP_ID, BACKUP_IDLE, BACKUP_LATER_ID, BACKUP_SAVED_ID, BACKUP_SHOW_ID,
   afterAddressCopy, afterCopy, afterWipe, applyReveal, applySave, armSave, backupGridHtml, backupPageKind,
-  bankBackupView, clipboardWipeDue, closeBackupPanel, copyWords, freshTap, heldKeyRepeat, hideWords,
+  bankBackupView, clipboardWipeDue, closeBackupPanel, copyStays, copyWords, freshTap, heldKeyRepeat, hideWords,
   markWordsSaved, openBackupPanel, opensAfterTurnOn, reconcileBackupUi, resetBackupUi, revealWords,
   startReveal, startSave, wipeClipboard, wipeWanted, wordsExpireIn, CLIPBOARD_WIPE_MS,
 } from "./bankBackup";
@@ -5171,12 +5171,14 @@ async function saveBankBackup(): Promise<void> {
 /** COPY: the words onto the clipboard, with the wipe scheduled. */
 async function copyBankBackup(): Promise<void> {
   if (!bankBackup.words) return;
+  const gen = bankBackup.gen;
   const result = await copyWords(bankBackup.words, navigator.clipboard);
   setBankBackup(afterCopy(bankBackup, result, performance.now()));
   scheduleBankClipboardWipe();
-  // The words went while the write was out (HIDE, the phone put away):
-  // they do not stay on the clipboard either.
-  if (!bankBackup.words || !bankViewOnScreen()) wipeBankClipboard();
+  // The panel the COPY was tapped in went while the write was out (HIDE,
+  // LATER, expiry, another SHOW, the phone put away): its words do not stay
+  // on the clipboard either, whatever the screen shows now.
+  if (!copyStays(bankBackup, gen, bankViewOnScreen())) wipeBankClipboard();
   renderBankApp();
 }
 

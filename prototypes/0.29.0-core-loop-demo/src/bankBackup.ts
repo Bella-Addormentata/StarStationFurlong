@@ -583,6 +583,15 @@ export function clipboardWipeDue(ui: BankBackupUi, now: number): boolean {
   return ui.copy === 'held' && now - ui.copiedAt >= CLIPBOARD_WIPE_MS;
 }
 
+/** Whether the words a COPY wrote may stay on the clipboard once the write
+ *  is done: only while the panel it was tapped in (`gen`, read before the
+ *  write) still shows them on screen. A HIDE, LATER, expiry or another SHOW
+ *  meanwhile abandoned that copy, so it is wiped at once, even when newer
+ *  words are on screen; the player can COPY those again. */
+export function copyStays(ui: BankBackupUi, gen: number, onScreen: boolean): boolean {
+  return ui.words !== null && onScreen && ui.gen === gen;
+}
+
 // ── The grid ─────────────────────────────────────────────────────────────────
 
 const escText = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
