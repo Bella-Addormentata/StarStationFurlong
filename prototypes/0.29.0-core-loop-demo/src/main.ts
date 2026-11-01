@@ -4997,6 +4997,11 @@ let bankWalletError: string | null = null;
  *  the second half of a double-click or a held Enter, not a decision. */
 let bankWalletChangedAt = 0;
 const BANK_WALLET_SETTLE_MS = 500;
+/** What the switch did at the last render, so a change from any cause (a
+ *  tap, a turn finishing, the node's own answer on a fingerprint round)
+ *  starts the settle time: a tap aimed at the old action never lands on
+ *  the new one. */
+let bankWalletShownAct: string | null = null;
 /** The origin the last fingerprint answered from: where the switch is sent.
  *  Empty until the node has answered once. */
 let localNodeOrigin = "";
@@ -5108,6 +5113,10 @@ function renderBankApp(): void {
       const liveFp = localNodeLive ? localFingerprint : null;
       const wv = bankWalletView(liveFp, { armed: bankWalletArmed, turning: bankWalletTurning, error: bankWalletError });
       const b = wv.button;
+      if ((b?.act ?? null) !== bankWalletShownAct) {
+        bankWalletShownAct = b?.act ?? null;
+        bankWalletChangedAt = performance.now();
+      }
       const switchHtml = `
         ${wv.text || b ? `<div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
           <span style="flex:1; min-width:0; font-size:10px; color:rgba(212,168,75,${wv.showsAddress ? "0.7" : "0.5"}); line-height:1.6;">${esc(wv.text)}</span>
