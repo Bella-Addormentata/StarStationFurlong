@@ -1,0 +1,111 @@
+# 🍎 PROBE — never merge. Branch claude/mac-node-probe only.
+#
+# The release builds the macOS app without its ssf-p2p-node sidecar since
+# v0.20.0, when the mac `tauri build` failed with `bundle.externalBin` and
+# release.yml step 4b was skipped on mac "until that failure is reproduced
+# with logs". This runs the release's own mac steps WITH the sidecar staged
+# and externalBin kept, then checks the bundled node starts, and keeps the
+# .dmg as an artifact for a hands-on try on a real Mac.
+name: 🍎 Mac node probe (never merge)
+
+on:
+  push:
+    branches: [claude/mac-node-probe]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
+  EJS_CORES: ''
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '${{ env.RELEASE_FRONTEND }}/package-lock.json'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ${{ env.RELEASE_FRONTEND }}/src-tauri -> target
+            ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target
+
+      - name: 📦 Install & build the frontend (as the release does)
+        shell: bash
+        run: |
+          cd "$RELEASE_FRONTEND"
+          npm ci
+          EJS_REQUIRE_PIN=1 npm run --if-present fetch:emulatorjs
+          npm run build
+
+      - name: 🛰️ Build & stage the node sidecar (release step 4b, on mac)
+        shell: bash
+        run: |
+          cargo build --release --features chia-publish,torrent --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          echo "host triple: $triple"
+          mkdir -p "$RELEASE_FRONTEND/src-tauri/binaries"
+          cp "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node" \
+             "$RELEASE_FRONTEND/src-tauri/binaries/ssf-p2p-node-$triple"
+          ls -la "$RELEASE_FRONTEND/src-tauri/binaries"
+          file "$RELEASE_FRONTEND/src-tauri/binaries/ssf-p2p-node-$triple"
+
+      - name: 🔀 Release overlay, externalBin KEPT
+        shell: bash
+        run: |
+          name="${RELEASE_FRONTEND##*/}"
+          cat > "$RELEASE_FRONTEND/release-frontend.json" <<EOF
+          {
+            "build": {
+              "beforeBuildCommand": "echo frontend prebuilt by workflow",
+              "frontendDist": "../../${name}/dist"
+            }
+          }
+          EOF
+          cat "$RELEASE_FRONTEND/release-frontend.json"
+
+      - name: 🛠️ tauri build (no release, no upload)
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ${{ env.RELEASE_FRONTEND }}
+          args: --config release-frontend.json
+
+      - name: 🔎 The node is in the app, and starts
+        shell: bash
+        run: |
+          app=$(find "$RELEASE_FRONTEND/src-tauri/target" -maxdepth 5 -type d -name '*.app' | head -1)
+          echo "app: $app"
+          ls -la "$app/Contents/MacOS"
+          codesign -dv "$app/Contents/MacOS/ssf-p2p-node" 2>&1 || true
+          mkdir -p "$RUNNER_TEMP/nodecwd" && cd "$RUNNER_TEMP/nodecwd"
+          SSF_NO_DHT=1 SSF_EXTERNAL_ADDRS=off "$app/Contents/MacOS/ssf-p2p-node" > node.log 2>&1 &
+          pid=$!
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS -H 'Origin: tauri://localhost' http://127.0.0.1:8080/api/fingerprint -o fp.json; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          sleep 1
+          head -c 400 fp.json 2>/dev/null; echo
+          head -80 node.log
+          [ "$ok" = 1 ] || { echo "::error::the bundled node never answered /api/fingerprint"; exit 1; }
+
+      - name: 📤 Keep the .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg-with-node
+          path: |
+            ${{ env.RELEASE_FRONTEND }}/src-tauri/target/release/bundle/dmg/*.dmg
+          retention-days: 14
