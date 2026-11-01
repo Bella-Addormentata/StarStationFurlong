@@ -5137,17 +5137,28 @@ async function revealBankBackup(): Promise<void> {
   renderBankApp();
 }
 
+/** ⚠ CONFIRM's start: the save goes out in the Bank's state, and the caller
+ *  gets back only what it sends and what its answer is matched by. */
+function beginBankSave(): { key: number; ticket: number | null } | null {
+  const next = startSave(bankBackup);
+  if (next === bankBackup || next.key === null) return null;
+  setBankBackup(next);
+  return { key: next.key, ticket: next.saveTicket };
+}
+
 /** ⚠ CONFIRM: tell the node the words are written down. The fingerprint is
  *  read again after a save, or whenever the answer says the wallet may have
  *  changed, so the Bank says what the node now holds. */
 async function saveBankBackup(): Promise<void> {
-  const next = startSave(bankBackup);
-  if (next === bankBackup || next.key === null) return;
-  setBankBackup(next);
+  // Only the key and the ticket wait for the answer: the started state holds
+  // the shown words, and a HIDE, LATER or expiry meanwhile must leave this
+  // request with no reference to them.
+  const started = beginBankSave();
+  if (!started) return;
   renderBankApp();
-  const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", next.key);
-  const landed = bankBackup.saving && bankBackup.saveTicket === next.saveTicket;
-  setBankBackup(applySave(bankBackup, next.saveTicket, r, performance.now()));
+  const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", started.key);
+  const landed = bankBackup.saving && bankBackup.saveTicket === started.ticket;
+  setBankBackup(applySave(bankBackup, started.ticket, r, performance.now()));
   if (r.ok || r.refresh) await refreshLocalFingerprint();
   renderBankApp();
   // Saved: the panel is gone, so focus goes to the view itself.
