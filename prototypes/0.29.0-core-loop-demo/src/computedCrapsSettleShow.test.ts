@@ -6,7 +6,8 @@
  * the payout only once its chips have landed there, even when the credit
  * reaches the page between its frames or before its player steps up to the
  * table; a roll rewritten by a forfeit plays its new decision, on the pages
- * that saw it before a result.
+ * that saw it before a result. And at an owner-run table, across two pages:
+ * a settle that reaches a page out of order still plays there.
  *
  * Built on the kits computedCrapsTable.test.ts uses (computedPageKit,
  * computedCrapsUiKit): each page its own load of the casino modules, synced
@@ -17,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { forfeitKey } from './computedFold';
 import {
   byRank, clockOf, CRAPS_CTX as CTX, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, putIn, rigRoll,
-  rigSplit, signAs, standAt, switchOn, sync,
+  rigSplit, signAs, standAt, switchOn, sync, deliver, updatesOf,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { atCraps, loadUIPage, stubDom } from './computedCrapsUiKit';
@@ -296,5 +297,58 @@ describe('💰 the settle on screen at a computed craps table', () => {
     expect(c.dice.settles).toEqual([]);
     tw.unmount();
     tx.unmount();
+  });
+});
+
+describe('💰 the settle on screen at an owner-run craps table, across pages', () => {
+  it('a settle that reaches a page out of order (the table reads as gone meanwhile) still plays there, from the felt as it played', async () => {
+    const o = await loadUIPage('O', 1);
+    const oc = await import('./crapsCroupier');
+    const b = await loadUIPage('B', 2);
+    for (const p of [o, b]) {
+      clockOf(p, T0);
+      p.casino.buyInChips(p.pid, 1_000);
+    }
+    o.casino.writeCrapsFairnessPref(TABLE, 'rng');
+    oc.openCrapsBetting(TABLE, 1, null);
+    sync(T0, o, b);
+    expect(b.casino.writeMyCrapsBets(TABLE, b.pid, [bet('pass', 10)])).toBe(true);
+    expect(o.casino.writeMyCrapsBets(TABLE, o.pid, [bet('dontpass', 5)])).toBe(true);
+    sync(T0, o, b);
+    oc.closeCrapsBetting(TABLE, o.casino.readCrapsTableState(TABLE)!);
+    sync(T0, o, b);
+    const frameB = (): void => b.session.casinoTablesFrame(1 / 60, new Map([[TABLE, b.dice.h]]));
+    frameB();
+    frameB();
+    expect(b.dice.felt()).toHaveLength(2);
+    // O's next writes: a note elsewhere, then the settle. B hears the settle
+    // first, which it can't apply yet.
+    const first = updatesOf(o, () => o.doc.getMap('elsewhere').set('n', 1));
+    const rest: Uint8Array[] = [];
+    const take = (u: Uint8Array): void => { rest.push(u); };
+    o.doc.on('update', take);
+    let n = 0;
+    vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(<T extends ArrayBufferView | null>(arr: T): T => {
+      (arr as unknown as Uint32Array)[0] = [3, 4][n++ % 2] - 1;
+      return arr;
+    });
+    const s1 = o.casino.readCrapsTableState(TABLE)!;
+    oc.rollAndSettleCraps(TABLE, s1.round, s1.point);
+    for (let i = 0; i < 40 && o.casino.readCrapsTableState(TABLE)?.phase !== 'settled'; i++) await vi.advanceTimersByTimeAsync(1);
+    o.doc.off('update', take);
+    expect(o.casino.readCrapsTableState(TABLE)?.phase).toBe('settled');
+    deliver(T0, b, rest);
+    expect(b.casino.casinoWhole(TABLE)).toBe(false);
+    expect(b.casino.readCrapsTableState(TABLE)?.phase).not.toBe('settled');
+    frameB();
+    frameB();
+    deliver(T0, b, first);
+    expect(b.casino.readCrapsTableState(TABLE)?.phase).toBe('settled');
+    for (let i = 0; i < 6; i++) frameB();
+    expect(b.dice.settles).toHaveLength(1);
+    const [m] = b.dice.settles;
+    expect(m.lost.map((x) => [x.pid, x.spot])).toEqual([[o.pid, 'dontpass:']]);
+    expect(m.back.map((x) => [x.s.pid, x.s.spot, x.mine])).toEqual([[b.pid, 'pass:', true]]);
+    expect(m.paid.map((x) => x.chips)).toEqual([[5, 5]]);
   });
 });

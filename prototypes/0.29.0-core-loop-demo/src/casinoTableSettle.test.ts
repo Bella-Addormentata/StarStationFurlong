@@ -14,7 +14,7 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => undefined, removeEventListener: () => undefined });
 
 const {
-  bindCasinoDoc, buyInChips, readCrapsTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyCrapsBets, writeMySeat,
+  bindCasinoDoc, buyInChips, clearTableKeys, readCrapsTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyCrapsBets, writeMySeat,
 } = await import('./casinoDoc');
 const { casinoTablesFrame, crapsRollInPlay, railFor, railWithTakeDown } = await import('./casinoTableSession');
 const { closeCrapsBetting, openCrapsBetting, rollAndSettleCraps } = await import('./crapsCroupier');
@@ -183,7 +183,10 @@ describe('💰 the settle on screen at an owner-run craps table', () => {
     await settle(table);
     frame();
     expect(settles.map((m) => m.back.map((b) => [b.s.pid, b.s.spot]))).toEqual([[[me, 'pass:']]]);
-    // Taken away and put back: roll 1 again, someone else's field bet.
+    // Taken away and put back: roll 1 again (a new incarnation), someone
+    // else's field bet.
+    clearTableKeys(table);
+    frame();
     closedWith({ [other]: [bet('field', 5)] });
     frame();
     rig([3, 4]);

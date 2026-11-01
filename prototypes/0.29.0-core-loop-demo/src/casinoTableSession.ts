@@ -52,7 +52,7 @@ import {
   casinoDocEpoch, casinoWhole, clearMySeat, computedIncEnded, computedSettled, computedThrowSeenAt, isComputedFor, readAllBets,
   readAllCrapsBets, readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
-  subscribeCasino, writeCrapsBackendPref, writeCrapsFairnessPref,
+  subscribeCasino, tableIncOf, writeCrapsBackendPref, writeCrapsFairnessPref,
   writeDiceThrow, writeMyBets, writeMyCrapsBets, writeMySeat, writeTableState,
 } from './casinoDoc';
 import type { DiceThrow, TableSeat } from './casinoDoc';
@@ -301,16 +301,15 @@ interface TableRuntime {
    *  its result still to show here (inPlay); the most my rail shows
    *  (railCap, crapsRailCap), kept here, focused or not, with my balance as
    *  last seen (railSeen: what I spend comes off it at once); and at an
-   *  owner-run table, how far its state has gone (ownerAt: a state that
-   *  goes back from it is the table put back under the same id, or reset,
-   *  whose rolls start afresh). */
+   *  owner-run table, the incarnation its rolls are of (ownerInc: the table
+   *  put back under the same id is a new one, whose rolls start afresh). */
   played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
   decidedTo: number;
   paid: Set<string>;
   inPlay: boolean;
   railCap: number | null;
   railSeen: number;
-  ownerAt: { round: number; step: number } | null;
+  ownerInc: string | null;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
 }
@@ -324,7 +323,7 @@ function runtime(tableId: string): TableRuntime {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
       spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), decidedTo: 0, paid: new Set(),
-      inPlay: false, railCap: null, railSeen: 0, ownerAt: null,
+      inPlay: false, railCap: null, railSeen: 0, ownerInc: null,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -647,7 +646,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     rt.played = new Map();
     rt.decidedTo = 0;
     rt.paid = new Set();
-    rt.ownerAt = null;
+    rt.ownerInc = null;
     rt.thrownSeed = t?.seed ?? null;
     if (s?.phase === 'settled' && s.dice) {
       rt.landedRound = s.round;
@@ -655,7 +654,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     }
     h.setPuck(s?.point ?? null);
   }
-  noteOwnerRun(rt, s);
+  noteOwnerRun(id, rt, s);
   if (!s) {
     rt.inPlay = false;
     return;
@@ -713,21 +712,20 @@ function noteDecided(rt: TableRuntime, s: CrapsTableState, carried = 0): void {
   rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, carried);
 }
 
-const PHASE_STEP: Record<CrapsTableState['phase'], number> = { betting: 0, closing: 1, settled: 2 };
-
-/** 💰 An owner-run craps table's state goes only forward (its round, and
- *  within a round betting → closing → settled), so one that goes back, or
- *  is gone, is the table put back under the same id (or reset): its rolls'
- *  felts and how far they are past a result start afresh. (The settles
+/** 💰 An owner-run craps table's incarnation (tableIncOf): the table put
+ *  back under the same id after a removal is a new one, whose rolls' felts
+ *  and how far they are past a result start afresh. Read only off a doc
+ *  holding every update whole (casinoWhole): a state that reads as gone, or
+ *  as another, while part of an update waits says nothing. (The settles
  *  played stay: theirs are keyed by when they were written.) */
-function noteOwnerRun(rt: TableRuntime, s: CrapsTableState | null): void {
-  const at = s ? { round: s.round, step: PHASE_STEP[s.phase] } : null;
-  const was = rt.ownerAt;
-  if (!at || (was && (at.round < was.round || (at.round === was.round && at.step < was.step)))) {
+function noteOwnerRun(id: string, rt: TableRuntime, s: CrapsTableState | null): void {
+  if (!s || !casinoWhole(id)) return;
+  const inc = tableIncOf(id, s);
+  if (rt.ownerInc !== null && rt.ownerInc !== inc) {
     rt.played = new Map();
     rt.decidedTo = 0;
   }
-  rt.ownerAt = at;
+  rt.ownerInc = inc;
 }
 
 /** 💰 The most my rail at a craps table shows, kept every frame whether
@@ -798,8 +796,11 @@ function layCrapsFelt(
     (b: CrapsBet, pid) => crapsChipPlan(b, seats[pid]?.stand ?? null),
     me,
   );
+  // (Not off a doc holding part of an update, casinoWhole: the felt or the
+  // result may be another's once the rest comes, which lays it again.)
+  const whole = casinoWhole(id);
   const was = rt.played.get(s.round);
-  if (s.phase === 'settled' && s.dice && was && !rt.paid.has(rec.key)) {
+  if (whole && s.phase === 'settled' && s.dice && was && !rt.paid.has(rec.key)) {
     rt.paid.add(rec.key);
     if (rt.paid.size > PAID_KEYS) rt.paid.delete(rt.paid.values().next().value as string);
     const moves = crapsSettleMoves({
@@ -817,7 +818,7 @@ function layCrapsFelt(
   }
   h.setFeltChips(stacks);
   h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
-  if (s.phase !== 'settled' && s.round > rt.decidedTo) {
+  if (whole && s.phase !== 'settled' && s.round > rt.decidedTo) {
     rt.played.delete(s.round);
     rt.played.set(s.round, { bets, stacks, point: s.point });
     if (rt.played.size > PLAYED_ROUNDS) rt.played.delete(rt.played.keys().next().value as number);
