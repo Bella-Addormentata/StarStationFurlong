@@ -5302,11 +5302,13 @@ function renderBankApp(): void {
         `<div${status ? ' role="status"' : ""} style="font-size:9px; color:${color}; margin-top:4px; line-height:1.6;">${esc(text)}</div>`;
       let backupHtml = "";
       if (bv && !bv.panel) {
+        // A `notice` view (no wallet to back up now) carries only the
+        // clipboard's notice.
         backupHtml = `
-        <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+        ${bv.line || bv.open ? `<div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <span style="flex:1; min-width:0; font-size:9px; color:${bv.state === "done" ? "rgba(212,168,75,0.5)" : "#ffb300"}; line-height:1.6;">${esc(bv.line ?? "")}</span>
           ${bv.open ? ctl(BACKUP_ID, "BACK UP") : ""}
-        </div>
+        </div>` : ""}
         ${bv.elsewhere ? line(bv.elsewhere, "rgba(212,168,75,0.7)") : ""}
         ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}
         ${bv.error ? line(bv.error, "#f0a060", true) : ""}`;
