@@ -131,7 +131,7 @@ describe('💰 the settle on screen at a computed craps table', () => {
     tb.unmount();
   });
 
-  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips (even before my table’s first frame, and after chips I spent since)', async () => {
+  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips (even before my table’s first frame; chips I spend before or after the credit come off at once)', async () => {
     const pages = await room(['A', 'B']);
     const [a, b] = pages;
     standAt(a, 3);
@@ -166,13 +166,16 @@ describe('💰 the settle on screen at a computed craps table', () => {
     expect(a.casino.readChips(a.pid)).toBe(chipsBefore + 20);
     expect(crapsOf(a)?.phase).toBe('settled');
     expect(railTotal(a.dice.rail())).toBe(railBefore);
+    // A spend now, the credit in: it comes off the rail at once.
+    expect(a.casino.spendChips(a.pid, 5)).toBe(true);
+    expect(railTotal(a.dice.rail())).toBe(railBefore - 5);
     // The show plays when A's frames come back, the rail held through it…
     const at = go(pages, T, T + 60_000, () => a.dice.settles.length > 0);
     expect(a.dice.settles).toHaveLength(1);
-    expect(railTotal(a.dice.rail())).toBe(railBefore);
+    expect(railTotal(a.dice.rail())).toBe(railBefore - 5);
     // …until A's chips have landed.
     go(pages, at + STEP, at + 3 * STEP);
-    expect(railTotal(a.dice.rail())).toBe(railBefore + 20);
+    expect(railTotal(a.dice.rail())).toBe(railBefore + 15);
     ta.unmount();
   });
 

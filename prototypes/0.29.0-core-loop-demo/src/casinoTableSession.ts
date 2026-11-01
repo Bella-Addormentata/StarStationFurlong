@@ -298,13 +298,19 @@ interface TableRuntime {
    *  before this page looked, lays no felt as it played); the settles whose
    *  chip moves have played (paid, by SettleRecord key: the same decision
    *  shown again plays nothing); whether the roll on screen is closed with
-   *  its result still to show here (inPlay); and the most my rail shows
-   *  (railCap, crapsRailCap), kept here, focused or not. */
+   *  its result still to show here (inPlay); the most my rail shows
+   *  (railCap, crapsRailCap), kept here, focused or not, with my balance as
+   *  last seen (railSeen: what I spend comes off it at once); and at an
+   *  owner-run table, how far its state has gone (ownerAt: a state that
+   *  goes back from it is the table put back under the same id, or reset,
+   *  whose rolls start afresh). */
   played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
   decidedTo: number;
   paid: Set<string>;
   inPlay: boolean;
   railCap: number | null;
+  railSeen: number;
+  ownerAt: { round: number; step: number } | null;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
 }
@@ -318,7 +324,7 @@ function runtime(tableId: string): TableRuntime {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
       spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), decidedTo: 0, paid: new Set(),
-      inPlay: false, railCap: null,
+      inPlay: false, railCap: null, railSeen: 0, ownerAt: null,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -641,6 +647,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     rt.played = new Map();
     rt.decidedTo = 0;
     rt.paid = new Set();
+    rt.ownerAt = null;
     rt.thrownSeed = t?.seed ?? null;
     if (s?.phase === 'settled' && s.dice) {
       rt.landedRound = s.round;
@@ -648,6 +655,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     }
     h.setPuck(s?.point ?? null);
   }
+  noteOwnerRun(rt, s);
   if (!s) {
     rt.inPlay = false;
     return;
@@ -705,15 +713,44 @@ function noteDecided(rt: TableRuntime, s: CrapsTableState, carried = 0): void {
   rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, carried);
 }
 
+const PHASE_STEP: Record<CrapsTableState['phase'], number> = { betting: 0, closing: 1, settled: 2 };
+
+/** 💰 An owner-run craps table's state goes only forward (its round, and
+ *  within a round betting → closing → settled), so one that goes back, or
+ *  is gone, is the table put back under the same id (or reset): its rolls'
+ *  felts and how far they are past a result start afresh. (The settles
+ *  played stay: theirs are keyed by when they were written.) */
+function noteOwnerRun(rt: TableRuntime, s: CrapsTableState | null): void {
+  const at = s ? { round: s.round, step: PHASE_STEP[s.phase] } : null;
+  const was = rt.ownerAt;
+  if (!at || (was && (at.round < was.round || (at.round === was.round && at.step < was.step)))) {
+    rt.played = new Map();
+    rt.decidedTo = 0;
+  }
+  rt.ownerAt = at;
+}
+
 /** 💰 The most my rail at a craps table shows, kept every frame whether
  *  the table is focused or not: my balance while no roll is in play here;
  *  while one is, what I had at the last frame before (or when I first saw
- *  it), lower if my balance dropped since. What the roll pays joins the
- *  rail as its chips land there, even a credit that came between frames,
- *  or before the table was focused. */
+ *  it), less anything I've spent since (seeRail). What the roll pays joins
+ *  the rail as its chips land there, even a credit that came between
+ *  frames, or before the table was focused. */
 function holdRail(rt: TableRuntime, me: string): void {
   const balance = readChips(me);
-  rt.railCap = !rt.inPlay || rt.railCap === null ? balance : Math.min(rt.railCap, balance);
+  if (!rt.inPlay || rt.railCap === null) {
+    rt.railCap = balance;
+    rt.railSeen = balance;
+  } else seeRail(rt, balance);
+}
+
+/** 💰 My balance seen while the rail is held: what it dropped by since it
+ *  was last seen comes off the rail at once (a credit doesn't come on). */
+function seeRail(rt: TableRuntime, balance: number): void {
+  if (rt.railCap === null) return;
+  if (balance < rt.railSeen) rt.railCap = Math.max(0, rt.railCap - (rt.railSeen - balance));
+  rt.railSeen = balance;
+  rt.railCap = Math.min(rt.railCap, balance);
 }
 
 /** 💰 How a craps table's shared record settled a roll, for its chip moves:
@@ -796,13 +833,13 @@ export function crapsRollInPlay(tableId: string): boolean {
 }
 
 /** 💰 The most my rail at craps table `tableId` shows now (holdRail), or
- *  null with no table running here; lowered at once to `balance` when that
- *  is less (a bet down between frames shows at once, and nothing it held
- *  back shows early). */
+ *  null with no table running here, my balance now being `balance`: what I
+ *  spent since it was last seen comes off at once, before or after the
+ *  roll's credit came, and nothing held back shows early. */
 export function crapsRailCap(tableId: string, balance: number): number | null {
   const rt = runtimes.get(tableId);
   if (!rt || rt.railCap === null) return null;
-  rt.railCap = Math.min(rt.railCap, balance);
+  seeRail(rt, balance);
   return rt.railCap;
 }
 

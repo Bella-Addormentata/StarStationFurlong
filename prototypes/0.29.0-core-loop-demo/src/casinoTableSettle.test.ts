@@ -174,6 +174,27 @@ describe('💰 the settle on screen at an owner-run craps table', () => {
     expect(settles).toEqual([]);
   });
 
+  it('the table put back under the same id (its rolls start again at 1): its first roll plays from its own felt, not the old one', async () => {
+    const { h, settles } = fakeTable();
+    const frame = () => casinoTablesFrame(1 / 60, new Map([[table, h]]));
+    closedWith({ [me]: [bet('pass', 10)] });
+    frame();
+    rig([3, 4]);
+    await settle(table);
+    frame();
+    expect(settles.map((m) => m.back.map((b) => [b.s.pid, b.s.spot]))).toEqual([[[me, 'pass:']]]);
+    // Taken away and put back: roll 1 again, someone else's field bet.
+    closedWith({ [other]: [bet('field', 5)] });
+    frame();
+    rig([3, 4]);
+    await settle(table);
+    frame();
+    expect(settles).toHaveLength(2);
+    expect(settles[1].lost.map((s) => [s.pid, s.spot, s.chips])).toEqual([[other, 'field:', [5]]]);
+    expect(settles[1].back).toEqual([]);
+    expect(settles[1].paid).toEqual([]);
+  });
+
   it('a page that first sees the roll already settled (it walked up during the show) plays none of it', async () => {
     const { h, settles } = fakeTable();
     closedWith({ [me]: [bet('field', 10)], [other]: [bet('field', 5)] });
