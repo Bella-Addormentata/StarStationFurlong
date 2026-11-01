@@ -1104,7 +1104,11 @@ mod tests {
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, text).unwrap();
             let e = load_or_mint_wallet(&identity, &dir.join("chia_identity.seed")).unwrap_err();
+            // The path is the test's own (on Windows it can hold an 8.3 name
+            // such as RUNNER~1): only what the file held must stay out.
+            let path = identity.display().to_string();
             for shown in [format!("{e:#}"), format!("{e:?}"), format!("{e}")] {
+                let shown = shown.replace(&path, "<path>");
                 for i in 0..HAMSTER_HEX.len() - 8 {
                     let piece = &HAMSTER_HEX[i..i + 8];
                     assert!(!shown.contains(piece), "{text}: the error quotes {piece}: {shown}");
