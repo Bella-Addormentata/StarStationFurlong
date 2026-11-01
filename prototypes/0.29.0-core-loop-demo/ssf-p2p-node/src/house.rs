@@ -75,7 +75,10 @@
 //! short as checks past the budget are, so however much junk a peer writes,
 //! a tick holds the doc and the house for about that much reading. A record
 //! heavier than any the pages take ([`MAX_RECORD_BYTES`], [`MAX_TOP_BYTES`])
-//! is junk, found out at the cost of the cap, not of its size.
+//! is junk, found out at the cost of the cap, not of its size; unless what
+//! makes it so heavy may be padding a page reads past (an undefined field,
+//! a field a typed-array prototype keeps out): then a page may read it
+//! light, and the house holds its table while it is there.
 //!
 //! Stopping ([`step_down`]) steps every room down within a tick's budget
 //! first, each room's records sent as they are written, then the rooms
@@ -163,6 +166,10 @@ pub const MAX_TOP_BYTES: usize = 4 * 1024;
 pub const READ_PER_TICK: usize = 4 * 1024 * 1024;
 /// What reading a key costs on top of its value's weight.
 pub const VISIT_BYTES: usize = 64;
+/// The longest key a session's record goes under (its kind, round, a pid
+/// of 256 UTF-16 units, at most 3 bytes each, and hash: some 820 bytes):
+/// a longer one is no record's, and nothing reads its bytes.
+pub const MAX_KEY_BYTES: usize = 1_024;
 
 const CASINO_MAP: &str = "casino";
 const COMPUTED_MAP: &str = "casinoComputed";
@@ -289,18 +296,37 @@ fn craps_inc(inc: &str) -> bool {
 
 /// computedFold houseRules: `r…` and `d…` are house tables.
 fn house_inc(inc: &str) -> bool {
-    (inc.starts_with('r') || inc.starts_with('d')) && inc.len() == 25 && hex_of(&inc[1..], 24)
+    (inc.starts_with('r') || inc.starts_with('d')) && inc.len() == HOUSE_INC_BYTES && hex_of(&inc[1..], 24)
 }
 
-/// A switch exactly as casinoDoc computedCfgInc reads it: {v: 1, inc}.
-fn switch_inc(v: &CVal) -> Option<String> {
-    if !has_fields(v, &["v", "inc"], &[]) || v.get("v").and_then(CVal::as_int) != Some(1) {
+/// A house table's `inc`: its letter and 24 hex digits.
+const HOUSE_INC_BYTES: usize = 25;
+
+/// A switch as casinoDoc computedCfgInc reads it: an object, not an
+/// array, whose own keys (`Object.keys`, which lists an undefined one too)
+/// are `v`, 1, and `inc`, a string, and nothing else. None, too, for one
+/// holding a `__proto__` field, whatever it holds: a page's decoder makes
+/// it an own key or not as the update had it (`o.__proto__ = x` sets the
+/// prototype; after an earlier `__proto__: null` in the same map, it makes
+/// a field), and the node, keeping one entry per key, can't tell. Such a
+/// switch is no honest page's: the house serves nothing there, as where
+/// the pages find `v` or `inc` through such a prototype, not their own
+/// (TODO). It costs the same however big the switch is ([`SWITCH_BYTES`]):
+/// it counts no keys and reads no string longer than a house's `inc`.
+fn switch_of(v: &Any) -> Option<String> {
+    let Any::Map(m) = v else { return None };
+    if m.len() != 2 || !matches!(m.get("v"), Some(Any::Number(n)) if *n == 1.0) {
         return None;
     }
-    let inc = str_of(v, "inc")?;
-    let ok = inc.len() == 25 && matches!(inc.as_bytes()[0], b'c' | b'k' | b'r' | b'd') && hex_of(&inc[1..], 24);
-    ok.then(|| inc.to_string())
+    // (UTF-8 before anything slices it; [`house_inc`] reads the rest.)
+    match m.get("inc") {
+        Some(Any::String(inc)) if inc.len() == HOUSE_INC_BYTES && hb::utf8(inc) => Some(inc.to_string()),
+        _ => None,
+    }
 }
+
+/// What reading a switch costs a tick, past its key (it weighs some 50).
+const SWITCH_BYTES: usize = 64;
 
 /// Whether Fair setting `a` stands over `b` (both of the owner's shape): a
 /// higher `s`, or the same `s` and a higher record hash, as computedHouse
@@ -312,8 +338,41 @@ fn fair_after(a: &CVal, b: &CVal) -> bool {
     (s(a), hb::rec_hash(a).unwrap_or_default()) > (s(b), hb::rec_hash(b).unwrap_or_default())
 }
 
-/// A checkpoint as asCheckpointFor reads it, as far as the session id and
-/// the house need: its shape (the carry only as an object).
+/// computedCraps CARRY_POINTS (0: no point), MAX_RIDERS and MAX_SHOOTER_PID.
+const CARRY_POINTS: &[i64] = &[0, 4, 5, 6, 8, 9, 10];
+const MAX_RIDERS: usize = 31;
+const MAX_SHOOTER_PID: usize = 128;
+
+/// computedFold isCarry: a craps checkpoint's carry, held to every rule
+/// CrapsCarry states. The point one of CARRY_POINTS; at most MAX_RIDERS
+/// riders, each a player id with a canonical felt that has chips on it
+/// (every rider Object.keys lists: an undefined one has no felt); a shooter
+/// `h` and a last shooter `a` that are player ids of at most
+/// MAX_SHOOTER_PID UTF-16 units; `i` only as 1, and only with a shooter.
+fn is_carry(v: &CVal) -> bool {
+    if !has_fields(v, &["p", "w"], &["h", "a", "i"]) || !v.get("p").and_then(CVal::as_int).is_some_and(|p| CARRY_POINTS.contains(&p)) {
+        return false;
+    }
+    let Some(w) = v.get("w").and_then(CVal::entries) else { return false };
+    if w.len() > MAX_RIDERS || !w.iter().all(|(pid, f)| is_pid(pid) && f.as_arr().is_some_and(|f| !f.is_empty() && felt_ok(true, f))) {
+        return false;
+    }
+    let shooter = |k: &str| match v.get(k) {
+        None => true,
+        Some(x) => x.as_str().is_some_and(|x| is_pid(x) && x.encode_utf16().count() <= MAX_SHOOTER_PID),
+    };
+    let i_ok = match v.get("i") {
+        None => true,
+        Some(i) => i.as_int() == Some(1) && v.get("h").is_some(),
+    };
+    shooter("h") && shooter("a") && i_ok
+}
+
+/// A checkpoint as computedFold asCheckpointFor reads it: its shape; a
+/// house commitment `h` only on a live one at a house table; at craps the
+/// carry `s` (isCarry) on a live one and none on an ended one; every net
+/// Object.keys lists (an undefined one is no net). The house reads the
+/// checkpoints the pages read, and no other: one they throw out is no base.
 fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
     let craps = craps_inc(inc);
     let optional: &[&str] = if craps { &["e", "s", "h"] } else { &["e", "h"] };
@@ -333,21 +392,41 @@ fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
         return false;
     }
     if let Some(h) = v.get("h") {
-        if ended || !h.as_str().is_some_and(|h| hex_of(h, 64)) {
+        if ended || !house_inc(inc) || !h.as_str().is_some_and(|h| hex_of(h, 64)) {
             return false;
         }
     }
-    if craps && (ended != v.get("s").is_none() || v.get("s").is_some_and(|s| s.fields().is_none())) {
+    if craps && (ended != v.get("s").is_none() || v.get("s").is_some_and(|s| !is_carry(s))) {
         return false;
     }
     let net = |s: &str| {
         let d = s.strip_prefix('-').unwrap_or(s);
         !d.is_empty() && d.len() <= 40 && !d.starts_with('0') && d.bytes().all(|b| b.is_ascii_digit())
     };
-    match v.get("n").and_then(CVal::fields) {
+    match v.get("n").and_then(CVal::entries) {
         Some(n) => n.len() <= 4_096 && n.iter().all(|(pid, x)| is_pid(pid) && x.as_str().is_some_and(net)),
         None => false,
     }
+}
+
+/// computedFold asForfeit's `n`: 1–MAX_FROZEN player ids, strictly
+/// ascending as the pages compare strings, by UTF-16 code units (not by
+/// bytes: an astral pid sorts below one in U+E000–U+FFFF there).
+fn forfeit_ids(v: &CVal) -> Option<Vec<String>> {
+    let ids: Vec<String> = v.get("n")?.as_arr()?.iter().map(|p| p.as_str().filter(|p| is_pid(p)).map(str::to_string)).collect::<Option<_>>()?;
+    let ascending = ids.windows(2).all(|w| w[0].encode_utf16().cmp(w[1].encode_utf16()) == std::cmp::Ordering::Less);
+    (!ids.is_empty() && ids.len() <= MAX_FROZEN && ascending).then_some(ids)
+}
+
+/// computedFold asClose's `f`: 1–MAX_FROZEN entries, each a player id and
+/// the hash of the slip frozen (every entry Object.keys lists: an
+/// undefined one is no hash).
+fn close_frozen(v: &CVal) -> Option<Vec<(String, String)>> {
+    let fs = v.get("f")?.entries()?;
+    if fs.is_empty() || fs.len() > MAX_FROZEN {
+        return None;
+    }
+    fs.iter().map(|(p, x)| x.as_str().filter(|x| is_pid(p) && hex_of(x, 32)).map(|x| (p.clone(), x.to_string()))).collect()
 }
 
 /// A record's key parts (computedFold parseKey): kind, round, pid (s and x), hash.
@@ -448,6 +527,10 @@ struct TableRead {
     slips: HashMap<String, Slip>,
     /// (round, pid) → the seeds revealed.
     seeds: HashMap<(i64, String), Vec<String>>,
+    /// (round, pid) → the commitments of slips there its seeds open: each
+    /// seed hashed once, and only for a round and player a slip here has
+    /// ([`TableRead::opens`]).
+    opened: HashMap<(i64, String), HashSet<String>>,
     /// Closes the pages' fold takes as eligible (computedFold compute, step
     /// 1), by round: signed by one of the slips they freeze, under a parent
     /// decided at the round before (the session, for the first), naming
@@ -479,6 +562,7 @@ impl TableRead {
             ses_key: String::new(),
             slips: HashMap::new(),
             seeds: HashMap::new(),
+            opened: HashMap::new(),
             closes: Vec::new(),
             top: 0,
             abandoned: HashSet::new(),
@@ -486,6 +570,11 @@ impl TableRead {
             joins: Vec::new(),
             me,
         }
+    }
+
+    /// Whether a seed here opens slip `s` (its round and player's).
+    fn opens(&self, s: &Slip) -> bool {
+        self.opened.get(&(s.r, s.pid.clone())).is_some_and(|cs| cs.contains(&s.c))
     }
 
     fn closes_at(&self, r: i64) -> impl Iterator<Item = &Close> {
@@ -528,8 +617,11 @@ pub enum Write {
 
 #[derive(Default)]
 struct TableMem {
-    /// When this house first saw each close naming its commitment.
-    first_seen: HashMap<String, u64>,
+    /// When this house first saw each close naming its commitment, and
+    /// when the ticks it held the table just before began, if it did (else
+    /// the same): the grace runs from the first, [`REVEAL_CUTOFF_MS`] from
+    /// the second ([`TableMem::held_since`]).
+    first_seen: HashMap<String, (u64, u64)>,
     /// Closes it never reveals: when first seen, they already had an
     /// abandon or a later round on top.
     blocked: HashSet<String>,
@@ -540,8 +632,19 @@ struct TableMem {
     refused: HashSet<i64>,
     /// Its own session records this run, to put back: (session key, key, value).
     written: Vec<(String, String, CVal)>,
+    /// Whether its reveals from before a start ([`Done::kept`]) went into
+    /// `written`: the first time it reads the table, or holds it
+    /// ([`House::own_from_before`]).
+    kept_in: bool,
     /// When it first read the table this run ([`SETTLE_MS`]).
     first_read: Option<u64>,
+    /// When the ticks it last held the table (a value there a page may read
+    /// otherwise, [`House::unclear`]) began: a close it first sees once they
+    /// are over counts as there since then for [`REVEAL_CUTOFF_MS`], which
+    /// so still bounds how long a close it reveals has been there (the
+    /// pages void it). Its grace still runs from when the house saw it: a
+    /// hold never cuts a seed's time.
+    held_since: Option<u64>,
 }
 
 #[derive(Default)]
@@ -613,6 +716,27 @@ pub struct House {
     /// step-down's last word), and whether a read found it spent.
     read_left: usize,
     read_out: bool,
+    /// Whether the table being read holds a value a page may read otherwise
+    /// than the house ([`hb::Clarity`]) where it would count: the house
+    /// does nothing there that pass, and writes `heals`, each such value as
+    /// read (its `__proto__` fields out), back under its key, so the next
+    /// pass reads what every page does.
+    unclear: bool,
+    heals: Vec<Write>,
+    /// Whether the table being read names a house whose delegation an
+    /// earlier table of this pass put back (`unclear_houses`): it goes back
+    /// for this table too.
+    healing: bool,
+    /// Houses whose delegation a page may read otherwise, found this pass,
+    /// and whether it goes back (each table naming one waits; it goes back
+    /// once).
+    unclear_houses: HashMap<String, bool>,
+    /// A table held this pass with its values put back: the next pass reads
+    /// it again, and it plays on in the same tick. (In the tick's last pass
+    /// it is held: the next tick reads it.)
+    reread: bool,
+    /// Whether this pass is the tick's last.
+    last_pass: bool,
     /// The checks this pass asked for (key, bytes, signature by verdict),
     /// made with the doc let go, and whether a read of this pass was short
     /// (a table's, the room's own).
@@ -625,20 +749,31 @@ pub struct House {
     /// check past the budget), whether it counts as running Fair, and
     /// whether it was short: a later pass reads only the others.
     through: HashMap<(String, String), (bool, bool)>,
+    /// The tables held this tick: one whose own record the put-back writes
+    /// again is read again ([`House::plan`]).
+    held_now: HashSet<(String, String)>,
     stepping_down: bool,
     /// [`SETTLE_MS`] (tests set 0).
     settle_ms: u64,
     /// Called with the room before each signature check (tests).
     #[cfg(test)]
     on_check: Option<Box<dyn FnMut(&str) + Send>>,
+    /// Tables read (tests).
+    #[cfg(test)]
+    table_reads: usize,
 }
 
 /// A value [`House::read_charged`] read.
 enum Read {
     Val(CVal),
+    /// A value a page may read otherwise ([`hb::Clarity`]): as read, or
+    /// as junk (`Proto`); or as anything (`Unknown`, never read: `Junk`).
+    Unclear(CVal, hb::Clarity),
     /// None there, or not a value (a nested map, say).
     Absent,
-    /// Heavier than the read allows: junk, or for a checkpoint, unread.
+    /// Heavier than the read allows by what a page reads of it: junk, or
+    /// for a checkpoint, unread. (Past it with padding a page reads past:
+    /// `Unknown`.)
     Heavy,
     /// This tick's reads are spent.
     Spent,
@@ -681,14 +816,23 @@ impl House {
             deferred: false,
             read_left: READ_PER_TICK,
             read_out: false,
+            unclear: false,
+            heals: Vec::new(),
+            healing: false,
+            unclear_houses: HashMap::new(),
+            reread: false,
+            last_pass: false,
             wanted: HashMap::new(),
             short: false,
             fresh: 0,
             through: HashMap::new(),
+            held_now: HashSet::new(),
             stepping_down: false,
             settle_ms: SETTLE_MS,
             #[cfg(test)]
             on_check: None,
+            #[cfg(test)]
+            table_reads: 0,
         })
     }
 
@@ -752,9 +896,21 @@ impl House {
         if k == self.key.public || self.rooms.get(room).and_then(|m| m.houses.get(k)).is_some_and(|o| o == owner_key) {
             return Some(true);
         }
+        if let Some(&back) = self.unclear_houses.get(k) {
+            self.unclear = true;
+            self.healing |= back;
+            return Some(false);
+        }
         let key = format!("hk:{k}");
-        let v = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
-            Read::Val(v) => v,
+        let (v, clarity) = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
+            Read::Val(v) => (v, hb::Clarity::Clear),
+            // (A page may hold something else there: k's delegation, maybe.)
+            Read::Unclear(_, hb::Clarity::Unknown) => {
+                self.unclear = true;
+                self.unclear_houses.insert(k.to_string(), false);
+                return Some(false);
+            }
+            Read::Unclear(v, c) => (v, c),
             Read::Spent => return None,
             Read::Absent | Read::Heavy => return Some(false),
         };
@@ -768,6 +924,14 @@ impl House {
         let hash = hb::rec_hash(&v).unwrap_or_default();
         let g = str_of(&v, "g").unwrap_or("").to_string();
         let ok = self.verified("hkey", [room, "", ""], &hash, owner_key, hb::room_sign_bytes("hkey", room, "", &v), &g)?;
+        // A page may not count k a house: the table waits, and the
+        // delegation goes back as every page reads it.
+        if ok && clarity != hb::Clarity::Clear {
+            self.unclear = true;
+            self.unclear_houses.insert(k.to_string(), true);
+            self.heals.push(Write::Top { key, value: v });
+            return Some(false);
+        }
         if ok {
             self.rooms.entry(room.to_string()).or_default().houses.insert(k.to_string(), owner_key.to_string());
         }
@@ -811,24 +975,37 @@ impl House {
 
     /// The value under a key of `key_len` bytes, read and charged ([`charge`]:
     /// the key, and the value's weight, or `cap` for one heavier, which is
-    /// what finding that out costs).
+    /// what finding that out costs; and the `__proto__` strings that
+    /// [`hb::clarity`] reads, which no weight counts, unless they come to
+    /// more than a tick reads: those it never reads, and the value is
+    /// Unknown). One past `cap` with padding a page reads past in it
+    /// ([`hb::Weighed::Unsure`]) is Unknown too, read no further.
     ///
     /// [`charge`]: House::charge
     fn read_charged(&mut self, key_len: usize, out: Option<Out>, cap: usize) -> Read {
         let (weight, read) = match out {
-            Some(Out::Any(any)) => match hb::weight(&any, cap) {
-                Some(w) => (w, Some(any)),
-                None => (cap, None),
-            },
+            Some(Out::Any(any)) => {
+                let weighed = hb::weigh(&any, cap);
+                let weight = match weighed {
+                    hb::Weighed::Light { w, scan } => w.saturating_add(if scan > READ_PER_TICK { 0 } else { scan }),
+                    hb::Weighed::Heavy | hb::Weighed::Unsure => cap,
+                };
+                (weight, Some((any, weighed)))
+            }
             _ => (0, None),
         };
         if !self.charge(key_len.saturating_add(VISIT_BYTES).saturating_add(weight)) {
             return Read::Spent;
         }
         match read {
-            Some(any) => Read::Val(CVal::from_any(&any)),
-            None if weight == 0 => Read::Absent,
-            None => Read::Heavy,
+            Some((any, hb::Weighed::Light { scan, .. })) => match hb::clarity_within(&any, scan, READ_PER_TICK) {
+                hb::Clarity::Clear => Read::Val(CVal::from_any(&any)),
+                hb::Clarity::Unknown => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
+                c => Read::Unclear(CVal::from_any(&any), c),
+            },
+            Some((_, hb::Weighed::Unsure)) => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
+            Some((_, hb::Weighed::Heavy)) => Read::Heavy,
+            None => Read::Absent,
         }
     }
 
@@ -895,12 +1072,15 @@ impl House {
         self.read_out = false;
         self.fresh = 0;
         self.through.clear();
+        self.held_now.clear();
         self.wanted.clear();
         let mut out = TickOut::default();
         let mut updates = Vec::new();
         for pass in 1..=passes {
             self.deferred = false;
             self.short = false;
+            self.reread = false;
+            self.last_pass = pass == passes;
             {
                 let mut txn = doc.transact_mut();
                 let writes = self.plan(room, &txn, now, wall);
@@ -908,7 +1088,7 @@ impl House {
                 updates.extend(apply(&mut txn, &writes));
             }
             out.short = self.short;
-            if self.wanted.is_empty() {
+            if self.wanted.is_empty() && !self.reread {
                 break;
             }
             self.check_wanted();
@@ -918,6 +1098,7 @@ impl House {
             }
         }
         self.through.clear();
+        self.held_now.clear();
         while self.verdicts.len() > MAX_VERDICTS {
             if let Some(old) = self.verdict_order.pop_front() {
                 self.verdicts.remove(&old);
@@ -939,6 +1120,7 @@ impl House {
 
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
+        self.unclear_houses.clear();
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
@@ -953,7 +1135,10 @@ impl House {
 
         // The delegation: this house's key, signed by the deed holder.
         let deleg_key = format!("hk:{pub_key}");
-        let deleg_now = top_value(&comp, txn, &deleg_key);
+        let (deleg_now, deleg_clear) = match top_read(&comp, txn, &deleg_key) {
+            Some((v, c)) => (Some(v), c == hb::Clarity::Clear),
+            None => (None, true),
+        };
         let deleg_ok = |v: &CVal| {
             has_fields(v, &["v", "h", "k", "g"], &[])
                 && v.get("v").and_then(CVal::as_int) == Some(1)
@@ -994,12 +1179,15 @@ impl House {
                     }
                     continue;
                 };
-                let v = match self.read_charged(key.len(), Some(out), MAX_TOP_BYTES) {
-                    Read::Val(v) => v,
-                    Read::Spent => break,
-                    Read::Absent | Read::Heavy => continue,
+                if !self.charge(key.len() + VISIT_BYTES + SWITCH_BYTES) {
+                    break;
+                }
+                let Some(inc) = (match out {
+                    Out::Any(any) => switch_of(&any),
+                    _ => None,
+                }) else {
+                    continue;
                 };
-                let Some(inc) = switch_inc(&v) else { continue };
                 if house_inc(&inc) && !casino.contains_key(txn, &format!("gone:{t}:{inc}")) {
                     tables.push((t.to_string(), inc));
                 }
@@ -1016,10 +1204,19 @@ impl House {
         // every other seen (fair_after; a new deed holder's count afresh:
         // the last one's settings go).
         self.rooms.get_mut(room).unwrap().fair.retain(|_, v| str_of(v, "k") == Some(owner_key.as_str()));
+        let mut unclear_at: HashSet<String> = HashSet::new();
+        let mut unknown_at: HashSet<String> = HashSet::new();
         for (t, _) in &tables {
             let key = format!("hf:{t}");
-            let v = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
-                Read::Val(v) => v,
+            let (v, clarity) = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
+                Read::Val(v) => (v, hb::Clarity::Clear),
+                // (A page may hold a setting there the house never read: one
+                // standing over the one it holds, maybe.)
+                Read::Unclear(_, hb::Clarity::Unknown) => {
+                    unknown_at.insert(t.clone());
+                    continue;
+                }
+                Read::Unclear(v, c) => (v, c),
                 Read::Spent => break,
                 Read::Absent | Read::Heavy => continue,
             };
@@ -1031,12 +1228,26 @@ impl House {
             {
                 continue;
             }
+            // The setting it plays by, as a copy a page may read otherwise:
+            // the table waits, and it goes back clean, on every pass the
+            // doc holds it so (whatever put off the pass that first took
+            // it: a check at another table, say).
+            if self.rooms[room].fair.get(t.as_str()).is_some_and(|was| hb::rec_hash(was) == hb::rec_hash(&v)) {
+                if clarity != hb::Clarity::Clear {
+                    unclear_at.insert(t.clone());
+                }
+                continue;
+            }
             if self.rooms[room].fair.get(t.as_str()).is_some_and(|was| !fair_after(&v, was)) {
                 continue;
             }
             let hash = hb::rec_hash(&v).unwrap_or_default();
             let g = str_of(&v, "g").unwrap_or("").to_string();
             if self.verified("hfair", [room, t, ""], &hash, &owner_key, hb::room_sign_bytes("hfair", room, t, &v), &g) == Some(true) {
+                // A newer setting a page may not take: the table waits.
+                if clarity != hb::Clarity::Clear {
+                    unclear_at.insert(t.clone());
+                }
                 self.rooms.get_mut(room).unwrap().fair.insert(t.to_string(), v);
             }
         }
@@ -1058,9 +1269,50 @@ impl House {
                 self.short |= *short;
                 continue;
             }
+            // A setting a page may hold otherwise entirely: nothing at the
+            // table while it is there, and nothing goes back over it (a
+            // page keeps the newest setting it saw, which may stand over
+            // the one the house holds: putting that back makes no page
+            // agree with it).
+            if unknown_at.contains(&t) {
+                self.held(room, &key, now);
+                continue;
+            }
+            // A newer setting a page may read as junk: nothing at the table
+            // this pass, and it goes back clean (the next pass reads it).
+            if unclear_at.contains(&t) {
+                if let Some(rec) = self.rooms[room].fair.get(&t) {
+                    writes.push(Write::Top { key: format!("hf:{t}"), value: rec.clone() });
+                    if !self.last_pass {
+                        // (Held from now, though the reread may come a
+                        // tick later: the cutoff's origin stays.)
+                        self.hold_began(room, &key, now);
+                        self.reread = true;
+                        continue;
+                    }
+                }
+                self.held(room, &key, now);
+                continue;
+            }
             let ctx = Ctx { room: room.to_string(), t: t.clone(), inc: inc.clone() };
             self.deferred = false;
-            let Some(read) = self.read_table(&comp, txn, ctx, &owner_key) else {
+            let read = self.read_table(&comp, txn, ctx, &owner_key);
+            // A record there a page may read otherwise: nothing at the table
+            // this pass, and each such record good as read goes back so, for
+            // the next pass to read what every page does (with what the
+            // house does there, in the same update).
+            let healed = !self.heals.is_empty() || self.healing;
+            writes.append(&mut self.heals);
+            if self.unclear {
+                if healed && !self.last_pass {
+                    self.hold_began(room, &key, now);
+                    self.reread = true;
+                } else {
+                    self.held(room, &key, now);
+                }
+                continue;
+            }
+            let Some(read) = read else {
                 self.through.insert(key, (false, false));
                 continue;
             };
@@ -1115,30 +1367,46 @@ impl House {
             }
         }
 
-        // Put back what was taken away, every REPUT_MS.
+        // Put back what was taken away, every REPUT_MS; stepping down, every
+        // pass (a table held over its own record waits on it, and the
+        // step-down's last word may come before REPUT_MS is due).
+        let stepping_down = self.stepping_down;
         let mem = self.rooms.get_mut(room).unwrap();
-        if mem.last_reput.is_none_or(|at| now.saturating_sub(at) >= REPUT_MS) {
+        if stepping_down || mem.last_reput.is_none_or(|at| now.saturating_sub(at) >= REPUT_MS) {
             mem.last_reput = Some(now);
-            let same = |a: &Option<CVal>, b: &CVal| a.as_ref().and_then(hb::rec_hash) == hb::rec_hash(b);
-            if !same(&deleg_now, &delegation) {
+            // (One a page may read otherwise is no copy: it goes too.)
+            let same = |a: Option<(CVal, hb::Clarity)>, b: &CVal| a.is_some_and(|(a, c)| c == hb::Clarity::Clear && hb::rec_hash(&a) == hb::rec_hash(b));
+            if !deleg_clear || !same(deleg_now.map(|v| (v, hb::Clarity::Clear)), &delegation) {
                 writes.push(Write::Top { key: deleg_key, value: delegation });
             }
             // Each table's setting is the newest the deed holder signed, as
             // read above: anything else in its place goes, a forged one
-            // with a higher count included.
+            // with a higher count included; but for one a page may hold
+            // otherwise entirely (maybe a newer one, which the table waits
+            // on, as read above).
             for (t, rec) in &mem.fair {
                 let key = format!("hf:{t}");
-                if !same(&top_value(&comp, txn, &key), rec) {
+                let queued = writes.iter().any(|w| matches!(w, Write::Top { key: k, .. } if *k == key));
+                let there = top_read(&comp, txn, &key);
+                let unknown = there.as_ref().is_some_and(|(_, c)| *c == hb::Clarity::Unknown);
+                if !queued && !unknown && !same(there, rec) {
                     writes.push(Write::Top { key, value: rec.clone() });
                 }
             }
-            for table in mem.tables.values() {
+            let mut restored: Vec<(String, String)> = Vec::new();
+            for (tkey, table) in &mem.tables {
                 for (ses, key, value) in &table.written {
                     // There as it wrote it: junk under its key reads as
                     // nothing on every page, and goes too.
                     let present = match comp.get(txn, ses) {
                         Some(Out::YMap(m)) => match m.get(txn, key) {
-                            Some(Out::Any(any)) => CVal::from_any_within(&any, MAX_RECORD_BYTES).is_some_and(|v| hb::rec_hash(&v) == hb::rec_hash(value)),
+                            Some(Out::Any(any)) => match hb::weigh(&any, MAX_RECORD_BYTES) {
+                                hb::Weighed::Light { scan, .. } => {
+                                    hb::clarity_within(&any, scan, MAX_RECORD_BYTES) == hb::Clarity::Clear
+                                        && hb::rec_hash(&CVal::from_any(&any)) == hb::rec_hash(value)
+                                }
+                                hb::Weighed::Heavy | hb::Weighed::Unsure => false,
+                            },
                             _ => false,
                         },
                         _ => true,
@@ -1146,7 +1414,18 @@ impl House {
                     let queued = writes.iter().any(|w| matches!(w, Write::Session { key: k, .. } if k == key));
                     if !present && !queued {
                         writes.push(Write::Session { ses: ses.clone(), key: key.clone(), value: value.clone() });
+                        restored.push(tkey.clone());
                     }
+                }
+            }
+            // A table held this tick with its own record back now is read
+            // again: the next pass, or (after the tick's last: tick_with)
+            // the next tick, the tick short, so that a step-down's last
+            // word reads it too and lifts its commitment.
+            for tkey in restored {
+                if self.held_now.remove(&tkey) {
+                    self.through.remove(&tkey);
+                    self.reread = true;
                 }
             }
         }
@@ -1160,9 +1439,33 @@ impl House {
     fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx, owner_key: &str) -> Option<TableRead> {
         // (This tick's reads spent, or a checkpoint heavier than a tick may
         // read: short, the table does nothing.)
+        #[cfg(test)]
+        {
+            self.table_reads += 1;
+        }
+        self.unclear = false;
+        self.healing = false;
+        self.heals.clear();
         let cp_key = format!("sum:{}:{}", ctx.t, ctx.inc);
         let cp = match self.read_charged(cp_key.len(), comp.get(txn, &cp_key), READ_PER_TICK.max(self.read_left)) {
             Read::Val(v) => Some(v).filter(|v| checkpoint_ok(v, &ctx.inc)),
+            // One a page may read otherwise: a page taking it counts from
+            // it, one that doesn't from the first session. The table waits,
+            // and it goes back as read (junk either way: no base).
+            Read::Unclear(v, hb::Clarity::Proto) => {
+                if !checkpoint_ok(&v, &ctx.inc) {
+                    None
+                } else {
+                    self.unclear = true;
+                    self.heals.push(Write::Top { key: cp_key, value: v });
+                    return None;
+                }
+            }
+            // (A page holds the checkpoint there before.)
+            Read::Unclear(_, _) => {
+                self.unclear = true;
+                return None;
+            }
             Read::Absent => None,
             Read::Heavy | Read::Spent => {
                 self.deferred = true;
@@ -1187,6 +1490,7 @@ impl House {
             ses_key,
             slips: HashMap::new(),
             seeds: HashMap::new(),
+            opened: HashMap::new(),
             closes: Vec::new(),
             top: base_u,
             abandoned: HashSet::new(),
@@ -1194,23 +1498,44 @@ impl House {
             joins: Vec::new(),
             me,
         };
-        let mut closes: Vec<(Close, CVal)> = Vec::new();
+        let at = [read.ctx.room.clone(), read.ctx.t.clone(), read.ctx.inc.clone()];
+        let at = [at[0].as_str(), at[1].as_str(), at[2].as_str()];
+        let ses_name = read.ses_key.clone();
+        // Each record a page may read otherwise ([`hb::Clarity::Proto`]): a
+        // page reads it as the house does, or as junk. One that is junk
+        // either way is no matter; one good as read, a page might count or
+        // not, and the table waits ([`House::heal`]). Closes and seeds
+        // carry their key here for that.
+        let mut closes: Vec<(Close, CVal, Option<String>)> = Vec::new();
+        let mut unclear_seeds: Vec<(i64, String, String, String, CVal)> = Vec::new();
         let mut abandons: Vec<(String, i64, String, CVal)> = Vec::new();
         let mut forfeits: Vec<Forfeit> = Vec::new();
-        let mut house_recs: Vec<(char, i64, String, CVal, String)> = Vec::new();
+        let mut house_recs: Vec<(char, i64, String, CVal, String, Option<String>)> = Vec::new();
         for (key, out) in ses.iter(txn).take(MAX_SESSION_KEYS) {
-            // (This tick's reads spent: the read is short, `deferred` set.)
-            let Some((kind, r, pid, h)) = parse_key(key) else {
+            // (This tick's reads spent: the read is short, `deferred` set. A
+            // key that isn't UTF-8 no page holds: the update bringing it was
+            // refused. One longer than any record's is read no further than
+            // its length, which the tick is charged.)
+            let parsed = if key.len() <= MAX_KEY_BYTES && hb::utf8(key) { parse_key(key) } else { None };
+            let Some((kind, r, pid, h)) = parsed else {
                 if !self.charge(key.len() + VISIT_BYTES) {
                     return Some(read);
                 }
                 continue;
             };
-            let v = match self.read_charged(key.len(), Some(out), MAX_RECORD_BYTES) {
-                Read::Val(v) => v,
+            let (v, clarity) = match self.read_charged(key.len(), Some(out), MAX_RECORD_BYTES) {
+                Read::Val(v) => (v, hb::Clarity::Clear),
+                // (A page holds what was under the key before: maybe the
+                // record the key names.)
+                Read::Unclear(_, hb::Clarity::Unknown) => {
+                    self.unclear = true;
+                    continue;
+                }
+                Read::Unclear(v, c) => (v, c),
                 Read::Spent => return Some(read),
                 Read::Absent | Read::Heavy => continue,
             };
+            let clear = clarity == hb::Clarity::Clear;
             // The key must be the body's own (its round, pid and hash).
             if is_round(v.get("r")) != Some(r) || hb::rec_hash(&v).as_deref() != Some(h) {
                 continue;
@@ -1235,13 +1560,22 @@ impl House {
                     if fields_ok && g_ok && is_round(v.get("v")).is_some() && pid.is_some_and(is_pid) {
                         if let (Some(c), Some(k), Some(b)) = (c, k, felt) {
                             let chips = !b.is_empty();
-                            read.slips.insert(h.to_string(), Slip { r, pid: pid.unwrap().to_string(), c: c.to_string(), k, chips, v });
+                            let slip = Slip { r, pid: pid.unwrap().to_string(), c: c.to_string(), k, chips, v };
+                            if clear {
+                                read.slips.insert(h.to_string(), slip);
+                            } else if self.slip_ok(at, h, &slip, &read.ctx) {
+                                self.heal(&ses_name, key, slip.v);
+                            }
                         }
                     }
                 }
                 'x' => {
                     if let Some(s) = str_of(&v, "s").filter(|s| hex_of(s, 64) && has_fields(&v, &["r", "p", "s"], &[])) {
-                        read.seeds.entry((r, pid.unwrap().to_string())).or_default().push(s.to_string());
+                        if clear {
+                            read.seeds.entry((r, pid.unwrap().to_string())).or_default().push(s.to_string());
+                        } else {
+                            unclear_seeds.push((r, pid.unwrap().to_string(), s.to_string(), key.to_string(), v.clone()));
+                        }
                     }
                 }
                 'c' => {
@@ -1250,42 +1584,46 @@ impl House {
                     }
                     let q = str_of(&v, "q").filter(|q| *q == "g" || hex_of(q, 24) || hex_of(q, 32));
                     let ch = v.get("h").map(|x| x.as_str().filter(|x| hex_of(x, 64)));
-                    let f: Option<Vec<(String, String)>> = v.get("f").and_then(CVal::fields).and_then(|fs| {
-                        (!fs.is_empty() && fs.len() <= MAX_FROZEN)
-                            .then(|| fs.iter().map(|(p, x)| x.as_str().filter(|x| is_pid(p) && hex_of(x, 32)).map(|x| (p.clone(), x.to_string()))).collect())
-                            .flatten()
-                    });
+                    let f = close_frozen(&v);
                     let (Some(q), Some(f), Some(k)) = (q, f, k) else { continue };
                     if ch == Some(None) {
                         continue;
                     }
                     let rank = hb::duty_rank("close", &read.ctx, r, &k);
                     let close = Close { hash: h.to_string(), r, q: q.to_string(), f, k, h: ch.flatten().map(str::to_string), rank };
-                    closes.push((close, v));
+                    closes.push((close, v, (!clear).then(|| key.to_string())));
                 }
                 'f' => {
-                    // computedFold asForfeit: n sorted, unique, 1–MAX_FROZEN player ids.
-                    let n: Option<Vec<String>> = v.get("n").and_then(CVal::as_arr).and_then(|n| {
-                        let ids: Option<Vec<String>> = n.iter().map(|p| p.as_str().filter(|p| is_pid(p)).map(str::to_string)).collect();
-                        ids.filter(|ids| !ids.is_empty() && ids.len() <= MAX_FROZEN && ids.windows(2).all(|w| w[0] < w[1]))
-                    });
+                    let n = forfeit_ids(&v);
                     if has_fields(&v, &["r", "x", "n", "k", "g"], &[]) && g_ok {
                         if let (Some(x), Some(n), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), n, k) {
-                            forfeits.push(Forfeit { hash: h.to_string(), r, x: x.to_string(), n, k, v });
+                            let f = Forfeit { hash: h.to_string(), r, x: x.to_string(), n, k, v };
+                            if clear {
+                                forfeits.push(f);
+                            } else {
+                                let g = str_of(&f.v, "g").unwrap_or("").to_string();
+                                if self.verified("forfeit", at, h, &f.k, hb::sign_bytes("forfeit", &read.ctx, &f.v), &g) == Some(true) {
+                                    self.heal(&ses_name, key, f.v);
+                                }
+                            }
                         }
                     }
                 }
                 'z' => {
                     if has_fields(&v, &["r", "x", "k", "g"], &[]) && g_ok {
                         if let (Some(x), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), k) {
-                            abandons.push((x.to_string(), r, k, v));
+                            if clear {
+                                abandons.push((x.to_string(), r, k, v));
+                            } else if self.abandon_ok(at, &read.ctx, r, &k, &v) {
+                                self.heal(&ses_name, key, v);
+                            }
                         }
                     }
                 }
                 'h' | 'o' if g_ok => {
                     if let Some(k) = k {
                         if self.house_of(comp, txn, &read.ctx.room, owner_key, &k) == Some(true) {
-                            house_recs.push((kind, r, h.to_string(), v, k));
+                            house_recs.push((kind, r, h.to_string(), v, k, (!clear).then(|| key.to_string())));
                         }
                     }
                 }
@@ -1293,17 +1631,27 @@ impl House {
             }
         }
 
+        // Which slips the seeds here open: each seed hashed once, and only
+        // for a round and player a slip here has (a peer's many slips and
+        // seeds for one player cost a read their count, not its square).
+        let wanted: HashSet<(i64, &str)> = read.slips.values().map(|s| (s.r, s.pid.as_str())).collect();
+        let mut opened: HashMap<(i64, String), HashSet<String>> = HashMap::new();
+        for ((r, pid), ss) in &read.seeds {
+            if wanted.contains(&(*r, pid.as_str())) {
+                opened.entry((*r, pid.clone())).or_default().extend(ss.iter().map(|x| hb::slip_commit(&read.ctx, *r, pid, x)));
+            }
+        }
+        read.opened = opened;
+
         // The houses' records count as each signed them: a peer's copy under
         // this house's key (a reveal of a high round, say) would stop it
         // joining and revealing; under another's, change what a round may
         // name. Shapes as computedFold asHouseReveal and asHouseCommit.
-        let at = [read.ctx.room.clone(), read.ctx.t.clone(), read.ctx.inc.clone()];
-        let at = [at[0].as_str(), at[1].as_str(), at[2].as_str()];
         let hexes = |v: &CVal, key: &str, max: usize| -> Option<Vec<String>> {
             let xs: Option<Vec<String>> = v.get(key)?.as_arr()?.iter().map(|x| x.as_str().filter(|x| hex_of(x, 32)).map(str::to_string)).collect();
             xs.filter(|xs| xs.len() <= max && xs.windows(2).all(|w| w[0] < w[1]))
         };
-        for (kind, r, hash, v, k) in house_recs {
+        for (kind, r, hash, v, k, unclear) in house_recs {
             let g = str_of(&v, "g").unwrap_or("").to_string();
             if kind == 'h' {
                 let (Some(s), Some(x), Some(n)) = (str_of(&v, "s").filter(|s| hex_of(s, 64)), hexes(&v, "x", MAX_CLOSES_PER_ROUND), hexes(&v, "n", MAX_HOUSE_COUNTED)) else {
@@ -1314,12 +1662,20 @@ impl House {
                     continue;
                 }
                 if self.verified("hreveal", at, &hash, &k, hb::sign_bytes("hreveal", &read.ctx, &v), &g) == Some(true) {
+                    if let Some(key) = &unclear {
+                        self.heal(&ses_name, key, v.clone());
+                        continue;
+                    }
                     let commit = hb::house_commit(&read.ctx, r, s);
                     read.reveals.push(Reveal { k, r, hash, commit, x, n, c: c.flatten() });
                 }
             } else if let Some(c) = str_of(&v, "c").filter(|c| hex_of(c, 64) && has_fields(&v, &["r", "c", "k", "g"], &[])) {
                 let c = c.to_string();
                 if self.verified("hcommit", at, &hash, &k, hb::sign_bytes("hcommit", &read.ctx, &v), &g) == Some(true) {
+                    if let Some(key) = &unclear {
+                        self.heal(&ses_name, key, v.clone());
+                        continue;
+                    }
                     read.joins.push(Join { k, r, hash, c });
                 }
             }
@@ -1330,7 +1686,7 @@ impl House {
         // signature good, chips on it. One the pages throw out would only
         // void the round's real close if revealed.
         let mut good: Vec<Close> = Vec::new();
-        for (c, v) in closes {
+        for (c, v, unclear) in closes {
             let mut signer = false;
             for (p, sh) in &c.f {
                 let Some(s) = read.slips.get(sh) else { continue };
@@ -1347,7 +1703,18 @@ impl House {
             }
             let g = str_of(&v, "g").unwrap_or("").to_string();
             if self.verified("close", at, &c.hash, &c.k, hb::sign_bytes("close", &read.ctx, &v), &g) == Some(true) {
-                good.push(c);
+                match unclear {
+                    Some(key) => self.heal(&ses_name, &key, v),
+                    None => good.push(c),
+                }
+            }
+        }
+        // A seed a page may not have: one opening a slip there.
+        // (Each hashed once, its slips looked up.)
+        let commits: HashSet<(i64, &str, &str)> = read.slips.values().map(|s| (s.r, s.pid.as_str(), s.c.as_str())).collect();
+        for (r, pid, seed, key, v) in unclear_seeds {
+            if commits.contains(&(r, pid.as_str(), hb::slip_commit(&read.ctx, r, &pid, &seed).as_str())) {
+                self.heal(&ses_name, &key, v);
             }
         }
 
@@ -1431,6 +1798,51 @@ impl House {
         Some(read)
     }
 
+    /// Table `key` held this tick: nothing there, and closes it first sees
+    /// once the hold is over count as seen when it began.
+    fn held(&mut self, room: &str, key: &(String, String), now: u64) {
+        self.through.insert(key.clone(), (false, false));
+        self.held_now.insert(key.clone());
+        self.hold_began(room, key, now);
+    }
+
+    /// Table `key` waits from `now` on, if it did not already: a close the
+    /// house first sees once it reads the table again counts as there since
+    /// then ([`TableMem::held_since`]), whether that is the next pass or,
+    /// the tick's reading spent first, a later tick.
+    fn hold_began(&mut self, room: &str, key: &(String, String), now: u64) {
+        self.own_from_before(room, key);
+        let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
+        mem.held_since.get_or_insert(now);
+    }
+
+    /// After a start, its reveals at table `key` from before ([`Done::kept`])
+    /// go back as this run's do: once, the first time it reads the table or
+    /// holds it (held over its own record, a value a page may read
+    /// otherwise, the table waits on the put-back to read it again).
+    fn own_from_before(&mut self, room: &str, key: &(String, String)) {
+        let done = self.done.get(&(room.to_string(), key.0.clone(), key.1.clone()));
+        let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
+        if mem.kept_in {
+            return;
+        }
+        mem.kept_in = true;
+        for k in done.map_or(&[][..], |d| &d.kept[..]) {
+            if !mem.written.iter().any(|(_, key, _)| *key == k.key) {
+                mem.written.push((k.ses.clone(), k.key.clone(), k.rec.clone()));
+            }
+        }
+    }
+
+    /// Record `key` of session `ses`, good as the house reads it, a page may
+    /// count or not ([`hb::Clarity::Proto`]): the table waits this pass,
+    /// and the record goes back under its key as read, which every page
+    /// reads alike (the same record, if it counted it already).
+    fn heal(&mut self, ses: &str, key: &str, v: CVal) {
+        self.unclear = true;
+        self.heals.push(Write::Session { ses: ses.to_string(), key: key.to_string(), value: v });
+    }
+
     /// A slip's signature, checked once.
     fn slip_ok(&mut self, at: [&str; 3], hash: &str, s: &Slip, ctx: &Ctx) -> bool {
         let g = str_of(&s.v, "g").unwrap_or("").to_string();
@@ -1464,7 +1876,7 @@ impl House {
                 _ => missing += 1,
             }
         }
-        let seeded = |p: &str, s: &Slip| read.seeds.get(&(c.r, p.to_string())).is_some_and(|ss| ss.iter().any(|x| hb::slip_commit(ctx, c.r, p, x) == s.c));
+        let seeded = |_: &str, s: &Slip| read.opens(s);
         let mut decided = None;
         if let Some(h) = &c.h {
             let mut cands: Vec<&Reveal> = read.reveals.iter().filter(|e| e.r == c.r && e.commit == *h && e.x.contains(&c.hash)).collect();
@@ -1531,17 +1943,12 @@ impl House {
 
         let key = (ctx.t.clone(), ctx.inc.clone());
         let settle_ms = self.settle_ms;
-        let kept = self.last_of(ctx).map(|d| d.kept.clone()).unwrap_or_default();
+        self.own_from_before(room, &key);
         let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
-        if mem.first_read.is_none() {
-            // After a start: its reveals from before go back as this run's do.
-            for k in kept {
-                if !mem.written.iter().any(|(_, key, _)| *key == k.key) {
-                    mem.written.push((k.ses, k.key, k.rec));
-                }
-            }
-        }
         let settling = now.saturating_sub(*mem.first_read.get_or_insert(now)) < settle_ms;
+        // (After a hold, a close first seen counts as there since it began,
+        // for the cutoff.)
+        let there_from = mem.held_since.take().map_or(now, |h| h.min(now));
         // A trim opened a new session: what was written into the old one is
         // the trim's to carry (its copies and the checkpoint's `h`).
         mem.written.retain(|(ses, _, _)| *ses == read.ses_key);
@@ -1550,10 +1957,7 @@ impl House {
             if mem.seed_seen.contains_key(hash) {
                 continue;
             }
-            let opens = read.seeds.get(&(slip.r, slip.pid.clone())).is_some_and(|ss| {
-                ss.iter().any(|s| hb::slip_commit(ctx, slip.r, &slip.pid, s) == slip.c)
-            });
-            if opens {
+            if read.opens(slip) {
                 mem.seed_seen.insert(hash.clone(), now);
             }
         }
@@ -1569,7 +1973,7 @@ impl House {
             let mut listed: Vec<&Close> = Vec::new();
             for c in read.closes_at(r).filter(|c| c.h.as_deref() == Some(commit.as_str())) {
                 if !mem.first_seen.contains_key(&c.hash) {
-                    mem.first_seen.insert(c.hash.clone(), now);
+                    mem.first_seen.insert(c.hash.clone(), (now, there_from));
                     if settling || read.abandoned.contains(&c.hash) || read.top > r {
                         mem.blocked.insert(c.hash.clone());
                     }
@@ -1594,8 +1998,9 @@ impl House {
                 mem.refused.insert(r);
                 continue;
             }
-            let t0 = listed.iter().map(|c| mem.first_seen[&c.hash]).min().unwrap();
-            if now.saturating_sub(t0) > REVEAL_CUTOFF_MS {
+            let t0 = listed.iter().map(|c| mem.first_seen[&c.hash].0).min().unwrap();
+            let there = listed.iter().map(|c| mem.first_seen[&c.hash].1).min().unwrap();
+            if now.saturating_sub(there) > REVEAL_CUTOFF_MS {
                 mem.refused.insert(r);
                 continue;
             }
@@ -1804,6 +2209,23 @@ fn grace_of(t0: u64, times: &mut [u64]) -> u64 {
 /// well when it weighs more than [`MAX_TOP_BYTES`], which none of them does.
 fn top_value<T: ReadTxn>(map: &MapRef, txn: &T, key: &str) -> Option<CVal> {
     top_value_within(map, txn, key, MAX_TOP_BYTES)
+}
+
+/// Top-level record `key` as [`top_value`] reads it, and how sure a page's
+/// reading of it is to be that ([`hb::clarity`]).
+fn top_read<T: ReadTxn>(map: &MapRef, txn: &T, key: &str) -> Option<(CVal, hb::Clarity)> {
+    match map.get(txn, key) {
+        Some(Out::Any(any)) => match hb::weigh(&any, MAX_TOP_BYTES) {
+            hb::Weighed::Light { scan, .. } => match hb::clarity_within(&any, scan, MAX_TOP_BYTES) {
+                hb::Clarity::Unknown => Some((CVal::Junk, hb::Clarity::Unknown)),
+                c => Some((CVal::from_any(&any), c)),
+            },
+            // (A page may read it light.)
+            hb::Weighed::Unsure => Some((CVal::Junk, hb::Clarity::Unknown)),
+            hb::Weighed::Heavy => None,
+        },
+        _ => None,
+    }
 }
 
 /// Top-level record `key`, when it weighs at most `cap` ([`hb::weight`]).

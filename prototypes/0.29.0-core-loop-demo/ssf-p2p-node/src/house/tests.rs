@@ -217,6 +217,12 @@ impl Room {
         self.house.tick(ROOM, &self.doc, self.now, 1_700_000_000_000 + self.now)
     }
 
+    /// A tick of `passes` passes at most.
+    fn tick_passes(&mut self, after: u64, passes: usize) -> TickOut {
+        self.now += after;
+        self.house.tick_with(ROOM, &self.doc, self.now, 1_700_000_000_000 + self.now, VERIFY_PER_TICK, passes)
+    }
+
     /// The live session's records of a kind, by key.
     fn records(&self, prefix: &str) -> Vec<(String, CVal)> {
         let ses = self.ses_key();
@@ -917,6 +923,47 @@ fn weighing_a_value_stops_at_its_cap_and_its_depth() {
     assert!(hb::weight(&deep, usize::MAX).is_some());
     let deeper = Any::Array(Arc::from(vec![deep]));
     assert_eq!(hb::weight(&deeper, usize::MAX), None);
+    assert_eq!(hb::weigh(&deeper, usize::MAX), hb::Weighed::Heavy);
+}
+
+/// Padding a page reads past (an undefined field; a field a typed-array
+/// prototype keeps out) weighs toward the cap like anything, so no value
+/// costs more than the cap to weigh; but past it, a value holding any is
+/// `Unsure` (a page may read it light), and only one past it by what a page
+/// reads of it alone is `Heavy` (junk on every page).
+#[test]
+fn padding_a_page_reads_past_never_makes_a_record_heavy() {
+    let map = |fields: Vec<(String, Any)>| Any::Map(Arc::new(fields.into_iter().collect::<HashMap<_, _>>()));
+    let cap = 1_000;
+    // An undefined field with a long name, or many: past the cap, Unsure.
+    let long_name = map(vec![("r".into(), Any::Number(1.0)), ("x".repeat(cap), Any::Undefined)]);
+    assert_eq!(hb::weigh(&long_name, cap), hb::Weighed::Unsure);
+    let many = map((0..cap).map(|i| (format!("u{i}"), Any::Undefined)).collect());
+    assert_eq!(hb::weigh(&many, cap), hb::Weighed::Unsure);
+    // Inside a map inside the record too.
+    let inner = map(vec![("n".into(), many.clone())]);
+    assert_eq!(hb::weigh(&inner, cap), hb::Weighed::Unsure);
+    // Under the cap: light, and every page reads it as the node does.
+    let light = map(vec![("r".into(), Any::Number(1.0)), ("u".into(), Any::Undefined)]);
+    assert_eq!(hb::weigh(&light, cap), hb::Weighed::Light { w: 2 + 5 + 8 + 5 + 8, scan: 0 });
+    assert_eq!(hb::clarity(&light), hb::Clarity::Clear);
+    // Past it by a field a page reads: Heavy, padding or none.
+    let heavy = map(vec![("s".into(), Any::String(Arc::from("x".repeat(cap))))]);
+    assert_eq!(hb::weigh(&heavy, cap), hb::Weighed::Heavy);
+    let padded_heavy = map(vec![("s".into(), Any::String(Arc::from("x".repeat(cap)))), ("u".into(), Any::Undefined)]);
+    assert_eq!(hb::weigh(&padded_heavy, cap), hb::Weighed::Heavy);
+    let long = Any::Array(Arc::from(vec![Any::Number(1.0); 1_000_000]));
+    assert_eq!(hb::weigh(&long, cap), hb::Weighed::Heavy);
+    // A typed-array key beside a `__proto__` field: its value unread,
+    // however big, and the map Unknown (junk to read: no page may agree).
+    let big = Any::String(Arc::from("x".repeat(100 * cap)));
+    let typed = map(vec![("r".into(), Any::Number(1.0)), ("77777".into(), big.clone()), ("__proto__".into(), Any::Null)]);
+    assert_eq!(hb::weigh(&typed, cap), hb::Weighed::Light { w: 2 + 5 + 8 + 9 + 8 + 13 + 8, scan: 0 });
+    assert_eq!(hb::clarity(&typed), hb::Clarity::Unknown);
+    assert_eq!(CVal::from_any(&typed), CVal::Junk);
+    // The same key without a `__proto__` field is a field like any.
+    let plain = map(vec![("r".into(), Any::Number(1.0)), ("77777".into(), big)]);
+    assert_eq!(hb::weigh(&plain, cap), hb::Weighed::Heavy);
 }
 
 /// `n` records under slip keys of round 1 in table `ses`'s session, each
@@ -1746,4 +1793,1895 @@ fn a_tick_that_panics_in_one_room_holds_back_no_other_room_nor_the_step_down() {
     step_down(&house, docs, room.now + 2 * TICK_MS, |r, _, _| sent.push(r));
     assert_eq!(sent, [ROOM]);
     assert!(strs(&room.records("h:2:")[0].1, "x").is_empty());
+}
+
+// ── PR 6n: what the house reads is what the pages read ───────────────────────
+
+fn vectors() -> serde_json::Value {
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/computed-house-v1.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+/// A close as the house reads it (read_table's checks, the round aside:
+/// the key's): computedFold asClose.
+fn close_ok(v: &CVal) -> bool {
+    has_fields(v, &["r", "q", "f", "k", "g"], &["h"])
+        && is_round(v.get("r")).is_some()
+        && str_of(v, "q").is_some_and(|q| q == "g" || hex_of(q, 24) || hex_of(q, 32))
+        && str_of(v, "k").is_some_and(is_pub)
+        && str_of(v, "g").is_some_and(is_sig)
+        && v.get("h").is_none_or(|h| h.as_str().is_some_and(|h| hex_of(h, 64)))
+        && close_frozen(v).is_some()
+}
+
+/// test-vectors `checkpoints`, `forfeits` and `closes`: the house takes
+/// the ones the fold takes, and no other. A carry is held to isCarry (the
+/// point, the riders and their felts, the shooters' lengths in UTF-16
+/// units, `i`), a house commitment only at a house table, and a forfeit's
+/// ids ascend as JS compares strings.
+#[test]
+fn checkpoints_forfeits_and_closes_read_as_the_fold_reads_them() {
+    let v = vectors();
+    let cases = v["checkpoints"].as_array().unwrap();
+    assert!(cases.len() >= 70);
+    for case in cases {
+        let inc = case["inc"].as_str().unwrap();
+        let cp = CVal::from_json(&case["value"]);
+        assert_eq!(checkpoint_ok(&cp, inc), case["ok"].as_bool().unwrap(), "{inc}: {}", case["value"]);
+    }
+    let cases = v["forfeits"].as_array().unwrap();
+    assert!(cases.len() >= 20);
+    for case in cases {
+        let f = CVal::from_json(&case["value"]);
+        assert_eq!(forfeit_ids(&f).is_some(), case["ok"].as_bool().unwrap(), "{}", case["value"]["n"]);
+    }
+    let cases = v["closes"].as_array().unwrap();
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let c = CVal::from_json(&case["value"]);
+        assert_eq!(close_ok(&c), case["ok"].as_bool().unwrap(), "{}", case["value"]["f"]);
+    }
+}
+
+/// test-vectors `yjs`: values a peer can write that no JSON holds
+/// (undefined entries, own `__proto__` fields, a typed array as the
+/// prototype), each in the Yjs update a page wrote, read as a page
+/// receiving it reads it: the same canon and hash, and the same verdict
+/// from the reader; or, where the node can't tell, held (Unknown) or, for a
+/// switch, served nothing.
+#[test]
+fn values_no_json_holds_read_as_a_page_receiving_them_reads_them() {
+    let v = vectors();
+    let cases = v["yjs"].as_array().unwrap();
+    assert!(cases.len() >= 31);
+    let (mut exact, mut unclear, mut twice, mut refused, mut unknown, mut switches) = (0, 0, 0, 0, 0, 0);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let bytes = hex::decode(case["update"].as_str().unwrap()).unwrap();
+            txn.apply_update(yrs::Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        let txn = doc.transact();
+        let m = txn.get_map("m").unwrap();
+        let Some(Out::Any(any)) = m.get(&txn, "v") else { panic!("{name}: no value") };
+        let kind = case["kind"].as_str().unwrap();
+        if kind == "switch" {
+            // The node serves a table only under a switch every page takes.
+            let page = case["ok"].as_bool().unwrap();
+            match switch_of(&any) {
+                Some(inc) => assert!(page && !case["proto"].as_bool().unwrap(), "{name}: {inc}"),
+                None => assert!(!page || case["proto"].as_bool().unwrap(), "{name}: a page's switch"),
+            }
+            switches += 1;
+            continue;
+        }
+        let val = CVal::from_any(&any);
+        let ok = match kind {
+            "checkpoint" => Some(checkpoint_ok(&val, case["inc"].as_str().unwrap())),
+            "close" => Some(close_ok(&val)),
+            _ => None,
+        };
+        let clarity = hb::clarity(&any);
+        assert!(matches!(hb::weigh(&any, MAX_RECORD_BYTES), hb::Weighed::Light { .. }), "{name}");
+        let as_page = hb::canon(&val).as_deref() == case["canon"].as_str()
+            && hb::rec_hash(&val).as_deref() == case["hash"].as_str()
+            && ok == case["ok"].as_bool();
+        if case["unknown"].as_bool().unwrap() {
+            // No page holds it, or one may hold what the node can't see: the
+            // house won't act where it would count.
+            assert_eq!(clarity, hb::Clarity::Unknown, "{name}");
+            if case["refused"].as_bool().unwrap() {
+                refused += 1;
+            } else {
+                unknown += 1;
+            }
+        } else if case["unclear"].as_bool().unwrap() {
+            // A page reads it as the house does, or (a `__proto__` object
+            // before the field the node sees) as junk; the house knows.
+            assert_eq!(clarity, hb::Clarity::Proto, "{name}");
+            let page_junk = case["canon"].is_null() || case["ok"].as_bool() == Some(false);
+            assert!(as_page || page_junk, "{name}: neither the house's reading nor junk");
+            if !as_page {
+                assert_eq!(ok, Some(true), "{name}: the house's reading is good, a page's junk");
+                twice += 1;
+            }
+            unclear += 1;
+        } else {
+            assert_eq!(clarity, hb::Clarity::Clear, "{name}");
+            assert!(as_page, "{name}: read as a page reads it");
+            exact += 1;
+        }
+    }
+    assert!(
+        exact >= 10 && unclear >= 11 && twice >= 3 && refused >= 4 && unknown >= 1 && switches >= 5,
+        "{exact} exact, {unclear} unclear ({twice} junk on a page), {refused} refused, {unknown} unknown, {switches} switches"
+    );
+}
+
+#[test]
+fn a_switch_holds_v_and_inc_and_nothing_else() {
+    let sw = |extra: Vec<(&str, CVal)>| {
+        let mut f = vec![("v", CVal::Int(1)), ("inc", s(INC))];
+        f.extend(extra);
+        to_any(&obj(f))
+    };
+    assert_eq!(switch_of(&sw(vec![])).as_deref(), Some(INC));
+    // computedCfgInc counts Object.keys, which lists an undefined entry.
+    let with_undef = |m: Any| {
+        let Any::Map(m) = m else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("x".into(), Any::Undefined);
+        Any::Map(Arc::new(m))
+    };
+    assert_eq!(switch_of(&with_undef(sw(vec![]))), None);
+    assert_eq!(switch_of(&sw(vec![("x", s("1"))])), None);
+    assert_eq!(switch_of(&to_any(&obj(vec![("v", CVal::Int(1)), ("x", s(INC))]))), None);
+    assert_eq!(switch_of(&to_any(&obj(vec![("v", CVal::Int(2)), ("inc", s(INC))]))), None);
+    // A `__proto__` field, whatever it holds and however much it weighs: a
+    // page counts it an own key (after an earlier `__proto__: null` in the
+    // update, which the node can't see) or not. No switch.
+    let real = obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]);
+    let big = Any::String(Arc::from("x".repeat(2 * MAX_TOP_BYTES)));
+    for pad in [Any::Undefined, Any::Null, Any::String(Arc::from("x")), Any::Map(Arc::new(HashMap::new())), Any::Array(Arc::from(vec![])), big] {
+        assert_eq!(switch_of(&padded(&real, pad.clone())), None, "{pad:?}");
+    }
+}
+
+/// A switch whose `inc` is no UTF-8 (yrs reads strings unchecked; a page
+/// refuses the update): none, and nothing slices it on the way.
+#[test]
+fn a_switch_whose_inc_is_no_utf8_is_none() {
+    let doc = Doc::with_client_id(5);
+    let m = doc.get_or_insert_map(CASINO_MAP);
+    let inc = format!("rq{}", "0".repeat(23));
+    m.insert(&mut doc.transact_mut(), "sw", to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(&inc))])));
+    let mut update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    let at = update.windows(inc.len()).position(|w| w == inc.as_bytes()).unwrap();
+    // (Byte 1 a continuation byte: no char starts there.)
+    update[at + 1] = 0x80;
+    let peer = Doc::new();
+    peer.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+    let txn = peer.transact();
+    let Some(Out::Any(v)) = txn.get_map(CASINO_MAP).unwrap().get(&txn, "sw") else { panic!("no switch") };
+    assert!(switch_of(&v).is_none());
+}
+
+/// A padded switch, which a page may take or not: the house serves
+/// nothing there while it is there, and the table once it is clean.
+#[test]
+fn a_padded_switch_has_the_house_serve_nothing_there() {
+    for pad in [Any::Map(Arc::new(HashMap::new())), Any::String(Arc::from("x")), Any::Null] {
+        let mut room = Room::new("padded-switch", true);
+        let real = obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]);
+        let put = |room: &Room, v: Any| {
+            let casino = room.doc.get_or_insert_map(CASINO_MAP);
+            let mut txn = room.doc.transact_mut();
+            casino.insert(&mut txn, format!("cfg:computed:{T}"), v);
+        };
+        put(&room, padded(&real, pad.clone()));
+        room.tick(0);
+        room.tick(1_000);
+        assert!(room.records("o:").is_empty(), "{pad:?}");
+        put(&room, to_any(&real));
+        room.tick(1_000);
+        assert_eq!(room.records("o:1:").len(), 1, "{pad:?}");
+    }
+}
+
+impl Room {
+    /// A trim as a page writes it: checkpoint `body` signed by `by`, the
+    /// live session deleted, the next one opened holding the records under
+    /// `copies` byte for byte (a v0.51 trim's round-u copies): the next
+    /// session's key.
+    fn trim(&self, by: &Who, body: CVal, copies: &[String]) -> String {
+        let old = self.ses_key();
+        let cp = signed("sum", by, body);
+        let sid = hb::next_sid(&ctx(), Some(&cp)).unwrap();
+        let next = format!("ses:{T}:{INC}:{sid}");
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let kept: Vec<(String, Any)> = match comp.get(&txn, &old) {
+            Some(Out::YMap(m)) => copies
+                .iter()
+                .map(|k| match m.get(&txn, k) {
+                    Some(Out::Any(a)) => (k.clone(), a),
+                    _ => panic!("no record {k} to copy"),
+                })
+                .collect(),
+            _ => panic!("no session {old}"),
+        };
+        comp.insert(&mut txn, format!("sum:{T}:{INC}"), to_any(&cp));
+        comp.remove(&mut txn, &old);
+        let ses = comp.insert(&mut txn, next.as_str(), MapPrelim::default());
+        for (k, a) in kept {
+            ses.insert(&mut txn, k.as_str(), a);
+        }
+        next
+    }
+
+    fn forfeit(&self, by: &Who, r: i64, x: &str, n: &[&str]) -> String {
+        let rec = signed("forfeit", by, obj(vec![("r", CVal::Int(r)), ("x", s(x)), ("n", CVal::Arr(n.iter().map(|p| s(p)).collect()))]));
+        self.put('f', &rec)
+    }
+
+    /// Everything in the room's computed map but `skip`: each top-level
+    /// key, and each record of the live session, with its canon.
+    fn snapshot(&self, skip: &[String]) -> Vec<(String, Option<String>)> {
+        let ses = self.ses_key();
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let mut out = Vec::new();
+        for (k, v) in comp.iter(&txn) {
+            match v {
+                Out::Any(a) => out.push((k.to_string(), hb::canon(&CVal::from_any(&a)))),
+                Out::YMap(m) if k == ses => {
+                    for (rk, rv) in m.iter(&txn) {
+                        if let (false, Out::Any(a)) = (skip.iter().any(|s| s == rk), rv) {
+                            out.push((format!("{k}/{rk}"), hb::canon(&CVal::from_any(&a))));
+                        }
+                    }
+                }
+                _ => out.push((k.to_string(), None)),
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+/// How round 1 was decided before the trim after it.
+#[derive(Clone, Copy, Debug)]
+enum Decided {
+    /// The house revealed the close on its join.
+    House,
+    /// A Friendly close, by alice's forfeit of bob's seed.
+    Forfeit,
+    /// The close on the house's join, abandoned before the house saw it.
+    Abandon,
+}
+
+/// Round 1 decided as `how`, a trim after it (copying round 1's deciding
+/// record and counted reveals into the next session when `copy`, as a
+/// v0.51 trim does), then rounds 2 and 3 on the house: what the room's
+/// computed map holds after each tick, the copies aside.
+fn after_a_trim(how: Decided, copy: bool) -> Vec<Vec<(String, Option<String>)>> {
+    let mut room = Room::new(&format!("copies-{how:?}-{copy}"), true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (l, h, copies) = match how {
+        Decided::House => {
+            let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+            room.reveal(&alice, 1);
+            room.reveal(&bob, 1);
+            room.tick(200);
+            let reveal = room.records("h:1:");
+            assert_eq!(reveal.len(), 1, "round 1 revealed");
+            let next = str_of(&reveal[0].1, "c").map(str::to_string);
+            let mut copies: Vec<String> = room.records("x:1:").into_iter().map(|(k, _)| k).collect();
+            copies.push(reveal[0].0.clone());
+            (c, next, copies)
+        }
+        Decided::Forfeit => {
+            room.set_fair(1, 1);
+            room.tick(200);
+            let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+            let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], None);
+            room.reveal(&alice, 1);
+            let f = room.forfeit(&alice, 1, &c, &["alice"]);
+            room.tick(200);
+            let mut copies: Vec<String> = room.records("x:1:").into_iter().map(|(k, _)| k).collect();
+            copies.push(f);
+            (c, None, copies)
+        }
+        Decided::Abandon => {
+            let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+            room.abandon(&bob, 1, &c);
+            room.tick(200);
+            assert!(room.records("h:").is_empty(), "round 1 void");
+            let copies: Vec<String> = room.records("z:1:").into_iter().map(|(k, _)| k).collect();
+            (c, None, copies)
+        }
+    };
+    assert!(!copies.is_empty());
+    let mut body = vec![
+        ("v", CVal::Int(1)),
+        ("b", s("g")),
+        ("u", CVal::Int(1)),
+        ("l", s(&l)),
+        ("n", obj(vec![("alice", s("-5")), ("bob", s("5"))])),
+    ];
+    if let Some(h) = &h {
+        body.push(("h", s(h)));
+    }
+    let skip = if copy { copies.clone() } else { Vec::new() };
+    room.trim(&alice, obj(body), &skip);
+    let sid = room.ses_key().rsplit(':').next().unwrap().to_string();
+
+    let mut seen = Vec::new();
+    room.tick(200);
+    seen.push(room.snapshot(&skip));
+    if matches!(how, Decided::Forfeit) {
+        // Fair again: the house joins round 2.
+        room.set_fair(0, 2);
+        room.tick(200);
+        seen.push(room.snapshot(&skip));
+    }
+    // Round 2 on the house: closed on its commitment (the checkpoint's, or
+    // its join's), every seed in, revealed.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    let c2 = room.close(&alice, 2, &sid, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..3 {
+        room.tick(200);
+        seen.push(room.snapshot(&skip));
+    }
+    assert_eq!(room.records("h:2:").len(), 1, "{how:?}: round 2 revealed");
+    // Friendly mid-way: round 3's commitment is stepped down.
+    let (a3, b3) = (room.slip(&alice, 3), room.slip(&bob, 3));
+    room.close(&bob, 3, &c2, &[("alice", &a3), ("bob", &b3)], Some(&room.commit(3)));
+    room.set_fair(1, 3);
+    for _ in 0..3 {
+        room.tick(500);
+        seen.push(room.snapshot(&skip));
+    }
+    seen
+}
+
+/// 🧷 PR 6a's round-u copies change nothing the house does: a v0.51 trim
+/// copies round u's deciding record (the house's reveal, a forfeit, an
+/// abandon) and its counted reveals into the next session, and the house
+/// (this build, and so v0.50's) writes exactly what it writes without them,
+/// tick for tick. Its walk starts past the checkpoint's round, and its own
+/// reveal of round u carries only what the checkpoint's `h` carries.
+#[test]
+fn round_u_copies_after_a_trim_leave_the_house_unchanged() {
+    for how in [Decided::House, Decided::Forfeit, Decided::Abandon] {
+        let with = after_a_trim(how, true);
+        let without = after_a_trim(how, false);
+        assert_eq!(with.len(), without.len());
+        for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+            assert_eq!(a, b, "{how:?}: tick {i}");
+        }
+        // And the house did write: a reveal of round 2 and more.
+        assert!(with.last().unwrap().iter().any(|(k, _)| k.contains("/h:2:")), "{how:?}");
+    }
+}
+
+// ── Values a page may read otherwise (hb::Clarity) ──────────────────────────
+
+/// `v` as the doc holds it with a `__proto__` field `pad` as well: a peer's
+/// write (no page's encoder makes one from an object it signed), which a
+/// page decodes as `o.__proto__ = pad`.
+fn padded(v: &CVal, pad: Any) -> Any {
+    let Any::Map(m) = to_any(v) else { unreachable!() };
+    let mut m = (*m).clone();
+    m.insert("__proto__".to_string(), pad);
+    Any::Map(Arc::new(m))
+}
+
+/// The key a record goes under in a session (as Room::put).
+fn key_of(kind: char, v: &CVal) -> String {
+    let r = v.get("r").and_then(CVal::as_int).unwrap();
+    let h = hb::rec_hash(v).unwrap();
+    match v.get("p").and_then(CVal::as_str) {
+        Some(p) if kind == 's' || kind == 'x' => format!("{kind}:{r}:{p}:{h}"),
+        _ => format!("{kind}:{r}:{h}"),
+    }
+}
+
+/// Session `ses`'s records whose key starts `prefix`.
+fn count_in(room: &Room, ses: &str, prefix: &str) -> usize {
+    let txn = room.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(m)) = comp.get(&txn, ses) else { return 0 };
+    m.keys(&txn).filter(|k| k.starts_with(prefix)).count()
+}
+
+impl Room {
+    /// Put `v` padded with `__proto__: pad` under its own key in the live
+    /// session: the key.
+    fn put_padded(&self, kind: char, v: &CVal, pad: Any) -> String {
+        let key = key_of(kind, v);
+        let ses = self.ses_key();
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key.as_str(), padded(v, pad));
+        key
+    }
+
+    fn put_top_padded(&self, key: &str, v: &CVal, pad: Any) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, key, padded(v, pad));
+    }
+
+    /// The value under `key` in the live session as the doc holds it.
+    fn raw(&self, key: &str) -> Option<Any> {
+        let ses = self.ses_key();
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        match comp.get(&txn, &ses) {
+            Some(Out::YMap(m)) => match m.get(&txn, key) {
+                Some(Out::Any(a)) => Some(a),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn raw_top(&self, key: &str) -> Option<Any> {
+        let txn = self.doc.transact();
+        match txn.get_map(COMPUTED_MAP).unwrap().get(&txn, key) {
+            Some(Out::Any(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// A peer's update writing a string that isn't UTF-8 under `key` in
+    /// the live session (a page's decoder refuses the whole update).
+    fn put_refused(&self, key: &str) {
+        let peer = Doc::with_client_id(77);
+        let sv = {
+            let txn = self.doc.transact();
+            let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+            peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+            txn.state_vector()
+        };
+        let ses = self.ses_key();
+        {
+            let comp = peer.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = peer.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!("no session {ses}") };
+            m.insert(&mut txn, key, Any::String(Arc::from("zqzqzqzqzq")));
+        }
+        let mut update = peer.transact().encode_state_as_update_v1(&sv);
+        let at = update.windows(10).position(|w| w == b"zqzqzqzqzq").unwrap();
+        update[at] = 0xff;
+        self.doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+    }
+}
+
+/// Whether `a` is `v` as every page reads it.
+fn clean(a: Option<Any>, v: &CVal) -> bool {
+    a.is_some_and(|a| hb::clarity(&a) == hb::Clarity::Clear && hb::rec_hash(&CVal::from_any(&a)) == hb::rec_hash(v))
+}
+
+/// A Friendly close padded with `__proto__: undefined` is one every page
+/// receiving it takes (the field leaves none): at the round the house
+/// joined, it is the rival that keeps the house's seed in.
+#[test]
+fn a_padded_friendly_close_beside_the_house_one_still_refuses_the_round() {
+    let mut room = Room::new("padded-rival", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (_, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let key = room.put_padded('c', &rival, Any::Undefined);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert!(clean(room.raw(&key), &rival), "back as every page reads it");
+    for _ in 0..20 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty());
+}
+
+/// A slip by `w` at round r as Room::slip writes it, not yet put.
+fn slip_rec(w: &Who, r: i64) -> CVal {
+    let c = hb::slip_commit(&ctx(), r, &w.pid, &seed_of(&w.pid, r));
+    let b = CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(5))])]);
+    signed("slip", w, obj(vec![("r", CVal::Int(r)), ("p", s(&w.pid)), ("v", CVal::Int(1)), ("b", b), ("c", s(&c))]))
+}
+
+/// A record padded with a string (the close, the slip that signs it, a
+/// seed that opens a slip): a page may take it, or (an object under that
+/// name before it in the bytes, which the node can't see) hold junk. The
+/// house does nothing at the table the pass it reads it, and puts it back
+/// clean: the next pass reads what every page does, and the house plays on
+/// in the same tick (after a tick's last pass, the next tick).
+#[test]
+fn a_record_a_page_may_read_otherwise_goes_back_clean_before_the_house_counts_it() {
+    for which in ["close", "slip", "seed"] {
+        for last_pass in [true, false] {
+            let mut room = Room::new(&format!("padded-{which}-{last_pass}"), true);
+            let (alice, bob) = (who("alice"), who("bob"));
+            room.tick(0);
+            let alice_slip = slip_rec(&alice, 1);
+            let a = hb::rec_hash(&alice_slip).unwrap();
+            let s_key = room.put('s', &alice_slip);
+            let b = room.slip(&bob, 1);
+            let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+            let close = signed("close", &alice, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f), ("h", s(&room.commit(1)))]));
+            let c_key = room.put('c', &close);
+            let alice_seed = obj(vec![("r", CVal::Int(1)), ("p", s("alice")), ("s", s(&seed_of("alice", 1)))]);
+            let x_key = room.put('x', &alice_seed);
+            // Every check made, bob's seed not in: nothing yet.
+            room.tick(200);
+            assert!(room.records("h:").is_empty());
+            let (kind, key, rec) = match which {
+                "close" => ('c', c_key, close.clone()),
+                "slip" => ('s', s_key, alice_slip.clone()),
+                _ => ('x', x_key, alice_seed.clone()),
+            };
+            assert_eq!(room.put_padded(kind, &rec, Any::String(Arc::from("x"))), key);
+            room.reveal(&bob, 1);
+            if last_pass {
+                room.tick_passes(200, 1);
+                assert!(room.records("h:").is_empty(), "{which}: nothing the pass it may read otherwise");
+                assert!(clean(room.raw(&key), &rec), "{which}: back clean");
+                let mem = &room.house.rooms[ROOM].tables[&(T.to_string(), INC.to_string())];
+                assert!(mem.held_since.is_some(), "{which}: held, for the cutoff");
+                room.tick(200);
+            } else {
+                room.tick(200);
+                assert!(clean(room.raw(&key), &rec), "{which}: back clean");
+            }
+            let h = room.records("h:1:");
+            assert_eq!(h.len(), 1, "{which} {last_pass}: revealed that tick");
+            assert_eq!(strs(&h[0].1, "x"), vec![hb::rec_hash(&close).unwrap()]);
+            assert_eq!(strs(&h[0].1, "n"), sorted(vec![a.clone(), b.clone()]), "{which}: both seeds counted");
+        }
+    }
+}
+
+/// An abandon padded so: a page takes it, and the close it names is never
+/// revealed.
+#[test]
+fn a_padded_abandon_still_keeps_its_close_unrevealed() {
+    let mut room = Room::new("padded-abandon", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    let z = signed("abandon", &bob, obj(vec![("r", CVal::Int(1)), ("x", s(&c))]));
+    let key = room.put_padded('z', &z, Any::Undefined);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert!(clean(room.raw(&key), &z));
+    for _ in 0..20 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty());
+}
+
+/// A forfeit padded so holds its table a tick and goes back clean.
+#[test]
+fn a_padded_forfeit_goes_back_clean() {
+    let mut room = Room::new("padded-forfeit", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], None);
+    let f = signed("forfeit", &alice, obj(vec![("r", CVal::Int(1)), ("x", s(&c)), ("n", CVal::Arr(vec![s("alice")]))]));
+    let key = room.put_padded('f', &f, Any::Undefined);
+    room.tick(200);
+    assert!(clean(room.raw(&key), &f));
+}
+
+/// Another house's join padded so: the table waits a tick (no join of its
+/// own beside it) and it goes back clean.
+#[test]
+fn another_houses_padded_join_holds_the_table_and_goes_back_clean() {
+    let mut room = Room::new("padded-join", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    assert_eq!(str_of(&join, "k"), Some(b_house.public()));
+    room.put_padded('o', &join, Any::Undefined);
+    room.tick(0);
+    assert!(clean(room.raw(&key), &join));
+    assert_eq!(room.records("o:1:").len(), 1, "no second join beside it");
+    room.tick(200);
+    assert_eq!(room.records("o:1:").len(), 1);
+}
+
+/// A rival padded past what a record may weigh, with a `__proto__` string
+/// a page drops: it still counts, and the round stays refused.
+#[test]
+fn a_rival_padded_heavy_still_refuses_the_round() {
+    let mut room = Room::new("heavy-rival", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (_, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let key = room.put_padded('c', &rival, Any::String(Arc::from("x".repeat(MAX_RECORD_BYTES + 1))));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert!(clean(room.raw(&key), &rival));
+    for _ in 0..20 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty());
+}
+
+/// A rival a page reads without a field the node sees (a typed array as
+/// the prototype before, a `__proto__: null` after, drop a numeric key):
+/// the house can't know, and holds the table while it is there.
+#[test]
+fn a_record_a_page_may_read_as_another_holds_its_table_while_it_is_there() {
+    let mut room = Room::new("typed-proto", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let key = key_of('c', &rival);
+    let odd = with(&rival, "7", s("x"));
+    let pad = padded(&odd, Any::Null);
+    assert_eq!(hb::clarity(&pad), hb::Clarity::Unknown);
+    // Each key such a prototype keeps from being a field, and no other.
+    let beside = |k: &str| hb::clarity(&padded(&with(&rival, k, s("x")), Any::Null));
+    for k in ["7", "-1", "-.5", "-Infinity", ".5", "1e3", "NaN", "Infinity", "length", "byteLength", "byteOffset", "buffer", "BYTES_PER_ELEMENT"] {
+        assert_eq!(beside(k), hb::Clarity::Unknown, "{k}");
+    }
+    for k in ["x7", "lengthy", "Length", "-", "-x", ".", "nan"] {
+        assert_eq!(beside(k), hb::Clarity::Proto, "{k}");
+    }
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), pad);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty());
+    // Gone (and no rival): the close is revealed, within the cutoff.
+    room.delete(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// Stepping down with a padded record at the table: the step-down's word
+/// reads it again once it is back, and lifts the commitment.
+#[test]
+fn stepping_down_reads_a_held_table_again_once_its_values_are_back() {
+    let mut room = Room::new("stop-held", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (_, a, _) = room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let slip = room.records(&format!("s:1:alice:{a}")).pop().unwrap().1;
+    room.put_padded('s', &slip, Any::Undefined);
+    room.house.begin_step_down();
+    room.tick(200);
+    let d = &room.records("h:2:")[0].1;
+    assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+}
+
+/// Stepping down with nothing to check (every verdict in from an earlier
+/// hold): the step-down's word still reads the table again once its
+/// values are back, in the same tick.
+#[test]
+fn stepping_down_with_nothing_to_check_reads_a_held_table_again() {
+    let mut room = Room::new("stop-held-checked", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (_, a, _) = room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let slip = room.records(&format!("s:1:alice:{a}")).pop().unwrap().1;
+    room.put_padded('s', &slip, Any::Undefined);
+    room.tick(200);
+    assert!(clean(room.raw(&format!("s:1:alice:{a}")), &slip));
+    room.put_padded('s', &slip, Any::Undefined);
+    room.house.begin_step_down();
+    room.tick(200);
+    let words = room.records("h:2:");
+    let d = &words.first().expect("the step-down's word").1;
+    assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+}
+
+/// The owner's setting where a page may hold another (a typed array's
+/// prototype keeps a key from it): the table waits while it is there.
+#[test]
+fn a_setting_a_page_may_read_as_another_holds_its_table_while_it_is_there() {
+    let mut room = Room::new("typed-setting", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+    let odd = padded(&with(&rec, "7", s("x")), Any::Null);
+    assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+    let key = format!("hf:{T}");
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.insert(&mut txn, key.as_str(), odd);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty());
+    room.delete_top(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// Another house's delegation where a page may hold another: no join of
+/// the house's beside that house's while it is there.
+#[test]
+fn another_houses_delegation_a_page_may_read_as_another_holds_its_table() {
+    let mut room = Room::new("typed-house", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let b_pub = b_house.public().to_string();
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    let odd = padded(&with(&deleg, "7", s("x")), Any::Null);
+    assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.insert(&mut txn, key.as_str(), odd);
+    }
+    for _ in 0..3 {
+        room.tick(1_000);
+    }
+    let joins = room.records("o:1:");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_pub.as_str()));
+    // Back: the other house's join is the table's, and stands alone.
+    room.put_top(&key, &deleg);
+    room.tick(1_000);
+    assert_eq!(room.records("o:1:").len(), 1);
+}
+
+/// Two tables naming another house whose delegation is padded: both wait
+/// (the second reads what the first found), and it goes back once.
+#[test]
+fn a_padded_delegation_holds_every_table_naming_its_house() {
+    let mut room = Room::new("padded-house-two", true);
+    const T2: &str = "roulette-2";
+    const INC2: &str = "r89abcdef0123456789abcdef";
+    let ctx2 = Ctx { room: ROOM.into(), t: T2.into(), inc: INC2.into() };
+    let ses2 = format!("ses:{T2}:{INC2}:{}", hb::next_sid(&ctx2, None).unwrap());
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T2}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC2))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut txn, ses2.as_str(), MapPrelim::default());
+    }
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let b_pub = b_house.public().to_string();
+    let joins2 = |room: &Room| {
+        let txn = room.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
+        m.keys(&txn).filter(|k| k.starts_with("o:1:")).count()
+    };
+    assert_eq!((room.records("o:1:").len(), joins2(&room)), (1, 1), "the other house's joins");
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    let out = room.tick(0);
+    assert!(clean(room.raw_top(&key), &deleg));
+    let g = str_of(&deleg, "g").unwrap().as_bytes();
+    assert_eq!(out.update.unwrap().windows(g.len()).filter(|w| *w == g).count(), 1, "one write of it");
+    assert_eq!((room.records("o:1:").len(), joins2(&room)), (1, 1), "no join beside them");
+}
+
+/// Two tables naming another house whose delegation is padded: the first
+/// puts it back, and the second, reading what the first found, plays on in
+/// the same tick too (here: the house's reveal at its own table).
+#[test]
+fn a_padded_delegation_goes_back_once_and_every_table_naming_its_house_plays_on() {
+    let mut room = Room::new("padded-house-plays", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    // A table read before this one ("roulette-0" < T), naming that house.
+    const T0: &str = "roulette-0";
+    const INC0: &str = "r89abcdef0123456789abcdef";
+    let ctx0 = Ctx { room: ROOM.into(), t: T0.into(), inc: INC0.into() };
+    let ses0 = format!("ses:{T0}:{INC0}:{}", hb::next_sid(&ctx0, None).unwrap());
+    let b_house = second_house(&room);
+    let b_pub = b_house.public().to_string();
+    let naming = |i: u8| obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(&b_pub)), ("g", s(&"A".repeat(86)))]);
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T0}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC0))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        let ses = comp.insert(&mut txn, ses0.as_str(), MapPrelim::default());
+        ses.insert(&mut txn, key_of('o', &naming(0)), to_any(&naming(0)));
+    }
+    room.put_raw(&key_of('o', &naming(1)), &naming(1));
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    let out = room.tick(200);
+    assert!(clean(room.raw_top(&key), &deleg));
+    let g = str_of(&deleg, "g").unwrap().as_bytes();
+    assert_eq!(out.update.unwrap().windows(g.len()).filter(|w| *w == g).count(), 1, "one write of it");
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c], "revealed in the same tick");
+}
+
+/// Stepping down with another house's delegation padded and two tables
+/// naming it: both get the step-down's word.
+#[test]
+fn stepping_down_with_a_padded_delegation_steps_every_table_naming_its_house_down() {
+    let mut room = Room::new("stop-padded-house", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    const T0: &str = "roulette-0";
+    const INC0: &str = "r89abcdef0123456789abcdef";
+    let ctx0 = Ctx { room: ROOM.into(), t: T0.into(), inc: INC0.into() };
+    let ses0 = format!("ses:{T0}:{INC0}:{}", hb::next_sid(&ctx0, None).unwrap());
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T0}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC0))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut txn, ses0.as_str(), MapPrelim::default());
+    }
+    // Round 1 revealed here (round 2's commitment carried), and round 1
+    // joined at the new table.
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let in0 = |room: &Room, prefix: &str| {
+        let txn = room.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses0) else { panic!("no session") };
+        m.iter(&txn).filter(|(k, _)| k.starts_with(prefix)).count()
+    };
+    assert_eq!((in0(&room, "o:1:"), in0(&room, "h:1:")), (1, 0));
+    // Then records at both naming another house, its delegation padded.
+    let b_house = second_house(&room);
+    let b_pub = b_house.public().to_string();
+    let naming = |i: u8| obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(&b_pub)), ("g", s(&"A".repeat(86)))]);
+    {
+        let mut txn = room.doc.transact_mut();
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses0) else { panic!("no session") };
+        m.insert(&mut txn, key_of('o', &naming(0)), to_any(&naming(0)));
+    }
+    room.put_raw(&key_of('o', &naming(1)), &naming(1));
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    room.house.begin_step_down();
+    room.tick(200);
+    assert!(clean(room.raw_top(&key), &deleg));
+    assert_eq!(in0(&room, "h:1:"), 1, "the new table's step-down word");
+    let words = room.records("h:2:");
+    let d = &words.first().expect("this table's step-down word").1;
+    assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+}
+
+/// A second table, "roulette-0" (read before T), and a record at each
+/// naming another house (a join of round 9 with a signature's shape).
+fn two_tables_naming(room: &Room, b_pub: &str) -> String {
+    const T0: &str = "roulette-0";
+    const INC0: &str = "r89abcdef0123456789abcdef";
+    let ctx0 = Ctx { room: ROOM.into(), t: T0.into(), inc: INC0.into() };
+    let ses0 = format!("ses:{T0}:{INC0}:{}", hb::next_sid(&ctx0, None).unwrap());
+    let naming = |i: u8| obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(b_pub)), ("g", s(&"A".repeat(86)))]);
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T0}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC0))])));
+        let comp = txn.get_or_insert_map(COMPUTED_MAP);
+        let ses = comp.insert(&mut txn, ses0.as_str(), MapPrelim::default());
+        ses.insert(&mut txn, key_of('o', &naming(0)), to_any(&naming(0)));
+    }
+    room.put_raw(&key_of('o', &naming(1)), &naming(1));
+    ses0
+}
+
+/// Another house's delegation no page may read as the node does: each
+/// table naming it waits, read once a tick (no table reads it again for
+/// what another found).
+#[test]
+fn an_unknown_delegation_costs_each_table_naming_it_one_read() {
+    let mut room = Room::new("unknown-house-reads", true);
+    room.tick(0);
+    let b_house = second_house(&room);
+    let b_pub = b_house.public().to_string();
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.insert(&mut txn, key.as_str(), padded(&with(&deleg, "7", s("x")), Any::Null));
+    }
+    two_tables_naming(&room, &b_pub);
+    room.tick(200);
+    room.house.table_reads = 0;
+    room.tick(200);
+    assert_eq!(room.house.table_reads, 2);
+}
+
+/// After a delegation went back for a table, the next table with a value
+/// no heal can mend waits as it would have: read once a tick.
+#[test]
+fn a_delegation_put_back_leaves_no_later_table_reading_again() {
+    let mut room = Room::new("healed-house-reads", true);
+    room.tick(0);
+    let b_house = second_house(&room);
+    let b_pub = b_house.public().to_string();
+    let key = format!("hk:{b_pub}");
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    two_tables_naming(&room, &b_pub);
+    room.tick(200);
+    assert!(clean(room.raw_top(&key), &deleg));
+    let seed = obj(vec![("r", CVal::Int(1)), ("p", s("alice")), ("s", s(&seed_of("alice", 1)))]);
+    room.put_refused(&key_of('x', &seed));
+    room.tick(200);
+    room.house.table_reads = 0;
+    room.tick(200);
+    assert_eq!(room.house.table_reads, 2, "this table held, the other through");
+}
+
+/// Its own record padded goes back with the put-back even where no read
+/// reaches it (here: the table switched off since).
+#[test]
+fn its_own_padded_record_goes_back_with_the_put_back() {
+    let mut room = Room::new("padded-own-record", true);
+    room.tick(0);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    room.delete(&key);
+    room.put_padded('o', &join, Any::Undefined);
+    room.tick(REPUT_MS);
+    assert!(clean(room.raw(&key), &join));
+}
+
+/// A checkpoint padded so (an ended one, or a live one): the house never
+/// serves the first session a peer kept beside it, and goes by the
+/// checkpoint once it has put it back.
+#[test]
+fn a_padded_checkpoint_sends_the_house_to_no_other_session() {
+    for ended in [true, false] {
+        let mut room = Room::new(if ended { "padded-ended" } else { "padded-live" }, true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        let first = format!("ses:{T}:{INC}:g");
+        // Round 1 of the first session, closed on the commitment, seeds in:
+        // the house would reveal it there at once.
+        let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+        room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        let mut body = vec![("v", CVal::Int(1)), ("b", s("g")), ("u", CVal::Int(4)), ("l", s(&"ab".repeat(16))), ("n", obj(vec![]))];
+        if ended {
+            body.push(("e", CVal::Int(1)));
+        } else {
+            body.push(("h", s(&room.commit(5))));
+        }
+        let cp = signed("sum", &alice, obj(body));
+        assert!(checkpoint_ok(&cp, INC));
+        let sid = hb::next_sid(&ctx(), Some(&cp)).unwrap();
+        let next = format!("ses:{T}:{INC}:{sid}");
+        {
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            comp.insert(&mut txn, format!("sum:{T}:{INC}"), padded(&cp, Any::Null));
+            comp.insert(&mut txn, next.clone(), MapPrelim::default());
+        }
+        room.tick(0);
+        assert!(clean(room.raw_top(&format!("sum:{T}:{INC}")), &cp), "back as every page reads it");
+        for _ in 0..10 {
+            room.tick(1_000);
+        }
+        assert_eq!(count_in(&room, &first, "h:") + count_in(&room, &first, "o:"), 0, "ended {ended}: nothing in the first session");
+        if !ended {
+            // The live one carries round 5's commitment: round 5 there plays.
+            let (a5, b5) = (room.slip(&alice, 5), room.slip(&bob, 5));
+            let c = room.close(&alice, 5, &sid, &[("alice", &a5), ("bob", &b5)], Some(&room.commit(5)));
+            room.reveal(&alice, 5);
+            room.reveal(&bob, 5);
+            room.tick(200);
+            assert_eq!(strs(&room.records("h:5:")[0].1, "x"), vec![c]);
+        } else {
+            assert_eq!(count_in(&room, &next, ""), 0, "an ended table: nothing at all");
+        }
+    }
+}
+
+/// A value no page holds (a string that isn't UTF-8: a page refuses the
+/// update that brought it, keeping what was under its key before) holds
+/// its table while it is there, past every grace. Gone, the table plays,
+/// and a close that came during the hold counts as first seen when the
+/// hold began: past REVEAL_CUTOFF_MS from then (the pages have voided
+/// it), it is given up, never revealed.
+#[test]
+fn a_value_a_page_refuses_holds_its_table_while_it_is_there() {
+    for hold_ms in [3_000u64, 40_000] {
+        let mut room = Room::new(&format!("refused-{hold_ms}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+        room.reveal(&bob, 1);
+        // Where alice's seed goes: a page may hold it there, the node can't know.
+        let seed = obj(vec![("r", CVal::Int(1)), ("p", s("alice")), ("s", s(&seed_of("alice", 1)))]);
+        let key = key_of('x', &seed);
+        room.put_refused(&key);
+        assert_eq!(room.raw(&key).map(|a| hb::clarity(&a)), Some(hb::Clarity::Unknown));
+        for _ in 0..hold_ms / 1_000 {
+            room.tick(1_000);
+        }
+        assert!(room.records("h:").is_empty(), "held {hold_ms}: nothing");
+        room.put('x', &seed);
+        room.tick(200);
+        if hold_ms < REVEAL_CUTOFF_MS {
+            assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c.clone()]);
+        } else {
+            for _ in 0..5 {
+                room.tick(1_000);
+            }
+            assert!(room.records("h:").is_empty(), "held {hold_ms}: given up");
+        }
+    }
+}
+
+/// A hold that ends before a close comes changes nothing for it.
+#[test]
+fn a_close_after_a_hold_counts_from_when_it_is_seen() {
+    let mut room = Room::new("after-hold", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    let seed = obj(vec![("r", CVal::Int(1)), ("p", s("alice")), ("s", s(&seed_of("alice", 1)))]);
+    let key = key_of('x', &seed);
+    room.put_refused(&key);
+    for _ in 0..30 {
+        room.tick(1_000);
+    }
+    room.delete(&key);
+    room.tick(200);
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A close that comes during a hold: once the hold is over, its seeds
+/// still get the whole grace from when the house first saw it (a hold
+/// counts only toward the cutoff).
+#[test]
+fn a_close_during_a_hold_still_gives_its_seeds_their_grace() {
+    let mut room = Room::new("grace-after-hold", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.tick(0);
+    let seed = obj(vec![("r", CVal::Int(1)), ("p", s("alice")), ("s", s(&seed_of("alice", 1)))]);
+    let key = key_of('x', &seed);
+    room.put_refused(&key);
+    room.tick(1_000);
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    room.tick(1_000);
+    let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], Some(&room.commit(1)));
+    for _ in 0..4 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty(), "held");
+    // The hold over, alice's seed in, bob's not yet.
+    room.put('x', &seed);
+    room.tick(200);
+    room.tick(REVEAL_GRACE_MS / 2);
+    assert!(room.records("h:").is_empty(), "bob's seed still has its time");
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let h = room.records("h:1:");
+    assert_eq!(strs(&h[0].1, "x"), vec![c]);
+    assert_eq!(strs(&h[0].1, "n"), sorted(vec![a, b]), "both seeds counted");
+}
+
+/// The `__proto__` strings a page drops weigh nothing toward a record's
+/// cap, but reading them (are they UTF-8?) costs the tick their bytes, and
+/// more than a tick reads is never read: the value is Unknown.
+#[test]
+fn padding_a_page_drops_still_costs_the_tick_its_bytes() {
+    let stray = |i: u8| obj(vec![("r", CVal::Int(1)), ("p", s("carol")), ("s", s(&format!("{i:064x}")))]);
+    let pad = |n: usize| Any::String(Arc::from("x".repeat(n)));
+    let w = hb::weight(&to_any(&stray(0)), MAX_RECORD_BYTES).unwrap();
+    assert_eq!(hb::weigh(&padded(&stray(0), pad(1_000)), MAX_RECORD_BYTES), hb::Weighed::Light { w: w + "__proto__".len() + 4 + 8, scan: 1_000 });
+    for (n, short) in [(2, false), (5, true)] {
+        let mut room = Room::new(&format!("padding-cost-{n}"), true);
+        // (Every check made: a tick of one pass.)
+        room.tick(0);
+        room.tick(200);
+        // Junk however it is read (a seed that opens no slip): it stays.
+        for i in 0..n {
+            room.put_padded('x', &stray(i as u8), pad(READ_PER_TICK / 4));
+        }
+        assert_eq!(room.tick(200).short, short, "{n} MB of padding");
+        assert_eq!(room.tick(200).short, short, "{n} MB of padding, still there");
+    }
+    // Past what a tick reads: never read, Unknown, and the table waits.
+    let mut room = Room::new("padding-past-a-tick", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    let seed = obj(vec![("r", CVal::Int(1)), ("p", s("bob")), ("s", s(&seed_of("bob", 1)))]);
+    let key = room.put_padded('x', &seed, pad(READ_PER_TICK + 1));
+    for _ in 0..5 {
+        assert!(!room.tick(1_000).short);
+    }
+    assert!(room.records("h:").is_empty());
+    room.put('x', &seed);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1, "gone: revealed");
+    assert!(clean(room.raw(&key), &seed));
+}
+
+/// Junk on every page holds nothing: a record padded with an object (no
+/// page holds a plain object there), a seed padded so that opens no slip.
+#[test]
+fn junk_on_every_page_and_an_idle_unclear_seed_hold_no_table() {
+    let mut room = Room::new("junk-either-way", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    room.put_padded('c', &rival, Any::Map(Arc::new(HashMap::new())));
+    let stray = obj(vec![("r", CVal::Int(1)), ("p", s("carol")), ("s", s(&"5a".repeat(32)))]);
+    let stray_key = room.put_padded('x', &stray, Any::Undefined);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+    // A seed opening no slip there is nobody's to need: it stays as it is.
+    assert!(room.raw(&stray_key).is_some_and(|a| hb::clarity(&a) != hb::Clarity::Clear), "not written back");
+}
+
+/// Another house's delegation padded: a page may not count that house, so
+/// the table waits while its delegation goes back clean.
+#[test]
+fn a_padded_delegation_of_another_house_goes_back_clean() {
+    let mut room = Room::new("padded-house", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let key = format!("hk:{}", b_house.public());
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    // Records naming that house, each asking for its delegation: it goes
+    // back once.
+    let b_pub = b_house.public().to_string();
+    for i in 0..5 {
+        let body = obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(&b_pub)), ("g", s(&"A".repeat(86)))]);
+        room.put_raw(&key_of('o', &body), &body);
+    }
+    let out = room.tick(0);
+    assert!(clean(room.raw_top(&key), &deleg));
+    // (A write over a key names the item it follows, not the key, so the
+    // delegation's signature is what shows each write of it.)
+    let update = out.update.unwrap();
+    let g = str_of(&deleg, "g").unwrap().as_bytes();
+    assert_eq!(update.windows(g.len()).filter(|w| *w == g).count(), 1, "one write of it");
+    // Nothing at the table that tick: no join beside the other house's.
+    let joins = room.records("o:1:");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_pub.as_str()));
+}
+
+/// A newer setting padded: the table waits a pass, the setting goes back
+/// clean and stands, and the table plays by it in the same tick (after a
+/// tick's last pass, the next).
+#[test]
+fn a_padded_newer_setting_goes_back_clean_and_stands() {
+    for last_pass in [true, false] {
+        let mut room = Room::new(&format!("padded-setting-{last_pass}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        assert_eq!(room.records("h:1:").len(), 1);
+        let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))]));
+        room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+        if last_pass {
+            // (A pass for its check, then the last.)
+            room.tick_passes(200, 2);
+            assert!(room.records("h:2:").is_empty(), "no step-down the pass it may read otherwise");
+            assert!(clean(room.raw_top(&format!("hf:{T}")), &rec));
+            let mem = &room.house.rooms[ROOM].tables[&(T.to_string(), INC.to_string())];
+            assert!(mem.held_since.is_some(), "held, for the cutoff");
+        }
+        room.tick(200);
+        assert!(clean(room.raw_top(&format!("hf:{T}")), &rec));
+        let down = room.records("h:2:");
+        assert_eq!(down.len(), 1, "Friendly: round 2's commitment stepped down");
+        assert!(strs(&down[0].1, "x").is_empty());
+    }
+}
+
+/// Stepping down with a newer setting padded: it goes back, and the
+/// step-down's word reads the table again.
+#[test]
+fn stepping_down_with_a_padded_newer_setting_still_steps_its_table_down() {
+    let mut room = Room::new("stop-padded-setting", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+    room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+    room.house.begin_step_down();
+    room.tick(200);
+    assert!(clean(room.raw_top(&format!("hf:{T}")), &rec));
+    let words = room.records("h:2:");
+    let d = &words.first().expect("the step-down's word").1;
+    assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+}
+
+/// Its own delegation padded goes back clean with the put-back.
+#[test]
+fn its_own_padded_delegation_goes_back_clean() {
+    let mut room = Room::new("padded-own", false);
+    let key = format!("hk:{}", room.house.public());
+    let rec = room_signed("hkey", "", &room.owner, obj(vec![("v", CVal::Int(1)), ("h", s(room.house.public()))]));
+    room.put_top_padded(&key, &rec, Any::Undefined);
+    room.tick(0);
+    room.tick(REPUT_MS);
+    assert!(clean(room.raw_top(&key), &rec));
+}
+
+// ── Values a page reads otherwise than the node can see (round 2) ───────────
+
+/// A rival a page reads past a typed array (a `__proto__` buffer first in
+/// the update, a numeric key past its end, a `__proto__: null` last: the
+/// page drops the key, test-vectors "a close with __proto__ a buffer, a
+/// numeric field, then null"), the key holding more than any record
+/// weighs: the house reads it no further, holds the table while it is
+/// there, and the read costs the tick no more than a light record.
+#[test]
+fn a_rival_a_page_reads_past_a_typed_array_holds_its_table_however_heavy() {
+    let mut room = Room::new("typed-heavy", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let key = key_of('c', &rival);
+    let Any::Map(m) = padded(&rival, Any::Null) else { unreachable!() };
+    let mut m = (*m).clone();
+    m.insert("77777".into(), Any::String(Arc::from("x".repeat(4 * MAX_RECORD_BYTES))));
+    let pad = Any::Map(Arc::new(m));
+    assert!(matches!(hb::weigh(&pad, MAX_RECORD_BYTES), hb::Weighed::Light { w, .. } if w < 1_000));
+    assert_eq!(hb::clarity(&pad), hb::Clarity::Unknown);
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), pad);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(1_000);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the key's value unread");
+    }
+    assert!(room.records("h:").is_empty(), "no reveal over a rival a page may count");
+    room.delete(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A rival padded past the cap with undefined fields, which no page reader
+/// counts (computedFold hasFields, canon): every page takes it, so the
+/// house never reads it as junk. It can't tell what a page reads without
+/// reading it all: it holds the table while it is there.
+#[test]
+fn a_rival_padded_past_the_cap_with_undefined_fields_holds_its_table() {
+    for many in [false, true] {
+        let mut room = Room::new(&format!("undefined-heavy-{many}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+        let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+        let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+        let key = key_of('c', &rival);
+        let Any::Map(m) = to_any(&rival) else { unreachable!() };
+        let mut m = (*m).clone();
+        if many {
+            for i in 0..MAX_RECORD_BYTES / 8 {
+                m.insert(format!("u{i}"), Any::Undefined);
+            }
+        } else {
+            m.insert("u".repeat(MAX_RECORD_BYTES), Any::Undefined);
+        }
+        let pad = Any::Map(Arc::new(m));
+        assert_eq!(hb::canon(&CVal::from_any(&pad)), hb::canon(&rival), "a page's reading, the padding skipped");
+        assert_eq!(hb::weigh(&pad, MAX_RECORD_BYTES), hb::Weighed::Unsure);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), pad);
+        }
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        for _ in 0..5 {
+            room.tick(1_000);
+        }
+        assert!(room.records("h:").is_empty(), "no reveal over a rival every page counts");
+        room.delete(&key);
+        room.tick(200);
+        assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+    }
+}
+
+/// A key a typed array keeps from being a field, beside a `__proto__`
+/// field holding anything (the node sees the last of several: an earlier
+/// buffer may have been the prototype as the key came, and a getter's key
+/// refuses the update, test-vectors "a close with __proto__ a buffer, a
+/// length, then an object"): Unknown, and a rival so padded holds the table.
+#[test]
+fn a_typed_array_key_beside_any_proto_field_is_unknown() {
+    let mut room = Room::new("typed-any-proto", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, a, b) = room.closed_on_the_join(&alice, &bob);
+    let f = obj(vec![("alice", s(&a)), ("bob", s(&b))]);
+    let rival = signed("close", &bob, obj(vec![("r", CVal::Int(1)), ("q", s("g")), ("f", f)]));
+    let pads = [
+        Any::Null,
+        Any::Undefined,
+        Any::String(Arc::from("x")),
+        Any::Map(Arc::new(HashMap::new())),
+        Any::Array(Arc::from(vec![])),
+        Any::Buffer(Arc::from(vec![0u8; 4])),
+    ];
+    for pad in &pads {
+        for k in ["7", "length", "byteLength", "BYTES_PER_ELEMENT"] {
+            assert_eq!(hb::clarity(&padded(&with(&rival, k, CVal::Int(1)), pad.clone())), hb::Clarity::Unknown, "{k} beside {pad:?}");
+        }
+    }
+    let key = key_of('c', &rival);
+    let odd = padded(&with(&rival, "length", CVal::Int(1)), Any::Map(Arc::new(HashMap::new())));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), odd);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    for _ in 0..5 {
+        room.tick(1_000);
+    }
+    assert!(room.records("h:").is_empty(), "no reveal while a page may hold the rival");
+    room.delete(&key);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A setting a page may hold otherwise entirely, over the older one the
+/// house holds (the deed holder's newer Friendly setting, as a page reads
+/// it past a typed array, or past undefined fields that take it over the
+/// cap): the house puts nothing back over it (a page keeps the newer one
+/// whatever comes after, fairAfter), and the table waits; once it is
+/// clean, the house plays the newer one.
+#[test]
+fn a_setting_a_page_may_hold_otherwise_is_never_put_back_over_with_an_older_one() {
+    for typed in [true, false] {
+        let mut room = Room::new(&format!("unknown-setting-{typed}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.set_fair(0, 1);
+        room.closed_on_the_join(&alice, &bob);
+        let key = format!("hf:{T}");
+        let newer = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(2))]));
+        let odd = if typed {
+            padded(&with(&newer, "7", s("x")), Any::Null)
+        } else {
+            let Any::Map(m) = to_any(&newer) else { unreachable!() };
+            let mut m = (*m).clone();
+            m.insert("u".repeat(MAX_TOP_BYTES), Any::Undefined);
+            Any::Map(Arc::new(m))
+        };
+        {
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            comp.insert(&mut txn, key.as_str(), odd.clone());
+        }
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        for _ in 0..5 {
+            room.tick(REPUT_MS);
+            assert_eq!(room.raw_top(&key).as_ref(), Some(&odd), "nothing put back over it");
+        }
+        assert!(room.records("h:").is_empty(), "nothing at the table meanwhile");
+        room.put_top(&key, &newer);
+        // (Its check, then the records the hold left unread: two ticks.)
+        room.tick(200);
+        room.tick(200);
+        let h = &room.records("h:1:")[0].1;
+        assert_eq!(strs(h, "x").len(), 1);
+        assert!(h.get("c").is_none(), "Friendly: no next commitment");
+    }
+}
+
+/// Stepping down with its own record a page may read otherwise entirely
+/// (`__proto__: undefined`, `7: undefined`): the put-back writes it again
+/// and the step-down's word reads the table again (the next pass; after a
+/// tick's last pass, short, for the step-down's unbounded tick), and lifts
+/// the commitment.
+#[test]
+fn stepping_down_reads_a_table_again_once_its_own_record_is_put_back() {
+    for last_pass in [false, true] {
+        let mut room = Room::new(&format!("stop-own-unknown-{last_pass}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        room.house.begin_step_down();
+        if last_pass {
+            let out = room.tick_passes(REPUT_MS, 1);
+            assert!(clean(room.raw(&key), &h1), "put back");
+            assert!(out.short, "short: the step-down's last word reads it again");
+            assert!(room.records("h:2:").is_empty());
+            room.house.tick_unbounded(ROOM, &room.doc, room.now, 0);
+        } else {
+            room.tick(REPUT_MS);
+        }
+        let words = room.records("h:2:");
+        let d = &words.first().expect("the step-down's word").1;
+        assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+    }
+}
+
+/// A record put back for a table the tick never held (its switch gone, so
+/// not read at all) asks for no second read: the tick isn't short.
+#[test]
+fn a_record_put_back_for_a_table_not_held_reads_nothing_again() {
+    let mut room = Room::new("put-back-not-held", true);
+    room.tick(0);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    room.delete(&key);
+    let out = room.tick_passes(REPUT_MS, 1);
+    assert!(clean(room.raw(&key), &join), "put back");
+    assert!(!out.short, "nothing held: no second read");
+}
+
+/// A session key longer than any record's goes under: the tick reads
+/// nothing of its bytes (not even whether they are UTF-8) before it is
+/// charged its length, which here is more than a tick reads.
+#[test]
+fn a_key_longer_than_any_records_is_charged_before_anything_reads_it() {
+    let mut room = Room::new("long-key", true);
+    room.tick(0);
+    let long = format!("s:1:{}", "x".repeat(2 * READ_PER_TICK));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, long.as_str(), Any::Number(1.0));
+    }
+    hb::UTF8_READ.with(|n| n.set(0));
+    let out = room.tick(200);
+    let read = hb::UTF8_READ.with(|n| n.get());
+    assert!(read < 64 * 1024, "{read} bytes read for UTF-8");
+    assert!(out.short, "more than a tick reads: short");
+}
+
+/// Records under the longest keys a page writes (a pid of 256 UTF-16
+/// units, 3 bytes each): read as ever.
+#[test]
+fn records_under_the_longest_keys_are_read() {
+    let mut room = Room::new("longest-keys", true);
+    let (alice, bob) = (who(&long_pid(1)), who(&long_pid(2)));
+    {
+        let mut txn = room.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        for w in [&alice, &bob] {
+            players.insert(&mut txn, w.pid.as_str(), to_any(&obj(vec![("keyB64", s(&w.public))])));
+        }
+    }
+    room.tick(0);
+    assert_eq!(room.records("o:1:").len(), 1, "the house joined round 1");
+    let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+    let c = room.close(&alice, 1, "g", &[(alice.pid.as_str(), &a), (bob.pid.as_str(), &b)], Some(&room.commit(1)));
+    let longest = room.records("s:1:").iter().map(|(k, _)| k.len()).max().unwrap();
+    assert!(longest > 800 && longest <= MAX_KEY_BYTES, "{longest}");
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    room.tick(200);
+    assert_eq!(strs(&room.records("h:1:")[0].1, "x"), vec![c]);
+}
+
+/// A setting the house holds written over with a copy padded with a
+/// `__proto__` string longer than a tick reads: the house reads none of it
+/// (not even whether it is UTF-8, which would cost its bytes), neither
+/// where it reads the table's setting nor where it looks to put its own
+/// back, so what a page reads of it is Unknown: it holds its table and is
+/// never put back over. Clean again, it stands.
+#[test]
+fn a_setting_padded_with_a_long_proto_string_is_read_no_further() {
+    let mut room = Room::new("long-proto-setting", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:1:").len(), 1);
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))]));
+    let key = format!("hf:{T}");
+    room.put_top(&key, &rec);
+    room.tick(200);
+    assert_eq!(room.records("h:2:").len(), 1, "Friendly: round 2's commitment stepped down");
+    let pad = Any::String(Arc::from("x".repeat(READ_PER_TICK + 1)));
+    assert!(matches!(hb::weigh(&padded(&rec, pad.clone()), MAX_TOP_BYTES), hb::Weighed::Light { scan, .. } if scan > READ_PER_TICK));
+    room.put_top_padded(&key, &rec, pad);
+    for _ in 0..3 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(200);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the padding unread");
+    }
+    assert!(!clean(room.raw_top(&key), &rec), "never put back over");
+    room.put_top(&key, &rec);
+    room.tick(200);
+    room.tick(200);
+    assert!(clean(room.raw_top(&key), &rec), "clean again: it stands");
+}
+
+/// A record of the house's written over with a copy padded with a
+/// `__proto__` string longer than any record weighs: it goes back clean,
+/// and the put-back reads none of the padding to find it is not.
+#[test]
+fn a_record_padded_with_a_long_proto_string_goes_back_unread() {
+    let mut room = Room::new("reput-long-proto", true);
+    room.tick(0);
+    let (key, join) = room.records("o:1:").pop().unwrap();
+    // (No table to read: only the put-back looks at it.)
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    let pad = Any::String(Arc::from("x".repeat(4 * MAX_RECORD_BYTES)));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, key.as_str(), padded(&join, pad));
+    }
+    hb::UTF8_READ.with(|n| n.set(0));
+    room.tick_passes(REPUT_MS, 1);
+    let read = hb::UTF8_READ.with(|n| n.get());
+    assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the padding unread");
+    assert!(clean(room.raw(&key), &join), "put back");
+}
+
+/// A switch whose `inc` is no house incarnation's length: refused, and
+/// nothing reads that string (not even whether it is UTF-8), however long.
+#[test]
+fn a_switch_whose_inc_is_no_houses_length_is_read_no_further() {
+    let mut room = Room::new("switch-long-inc", true);
+    room.tick(0);
+    {
+        let casino = room.doc.get_or_insert_map(CASINO_MAP);
+        let mut txn = room.doc.transact_mut();
+        casino.insert(&mut txn, format!("cfg:computed:{T}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(&"h".repeat(4 * MAX_RECORD_BYTES)))])));
+    }
+    for _ in 0..3 {
+        hb::UTF8_READ.with(|n| n.set(0));
+        room.tick(200);
+        let read = hb::UTF8_READ.with(|n| n.get());
+        assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the inc unread");
+    }
+}
+
+/// A heal that asks for a reread begins the table's hold then, though the
+/// reread runs short of the tick's reading (a peer's junk) and the house
+/// reads the table only a tick or more later: a close first seen then
+/// counts as there since the heal, for the cutoff. (A record healed, and a
+/// setting, which waits a pass for its check.)
+#[test]
+fn a_heal_whose_reread_runs_short_still_marks_when_the_hold_began() {
+    for which in ["seed", "setting"] {
+        let mut room = Room::new(&format!("heal-short-{which}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        let ses = room.ses_key();
+        let tkey = (T.to_string(), INC.to_string());
+        let junk: Vec<String>;
+        if which == "seed" {
+            // ~3 MB: the first pass reads it, the reread no longer can.
+            junk_in(&room, &ses, 50, 60_000);
+            junk = (0..50).map(|i| format!("s:1:junk{i}:{i:032x}")).collect();
+            let seed = obj(vec![("r", CVal::Int(1)), ("p", s("bob")), ("s", s(&seed_of("bob", 1)))]);
+            room.put_padded('x', &seed, Any::Null);
+        } else {
+            // ~3 MB at another table, read the pass the setting heals,
+            // and ~1.5 MB at this one: more than the reread has left.
+            let ses2 = second_table(&room);
+            junk_in(&room, &ses2, 50, 60_000);
+            junk_in(&room, &ses, 25, 60_000);
+            junk = (0..25).map(|i| format!("s:1:junk{i}:{i:032x}")).collect();
+            let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+            room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+        }
+        let out = room.tick(200);
+        let healed_at = room.now;
+        assert!(out.short, "{which}: the reread ran short");
+        assert!(room.records("h:").is_empty());
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, Some(healed_at), "{which}: held from the heal on");
+        // Read again a while later: the hold over, the round revealed.
+        for k in &junk {
+            room.delete(k);
+        }
+        room.reveal(&bob, 1);
+        // (The other table's junk read each pass it waits: a tick or two.)
+        for _ in 0..3 {
+            room.tick(1_000);
+            if !room.records("h:1:").is_empty() {
+                break;
+            }
+        }
+        assert_eq!(room.records("h:1:").len(), 1, "{which}: revealed once read");
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{which}: the hold over");
+    }
+}
+
+/// Weighing a map with a `__proto__` field looks at each key only as far
+/// as the capped loop goes, however many keys it holds (undefined ones
+/// weigh little, so a peer's map may hold millions).
+#[test]
+fn weighing_a_map_with_a_proto_field_looks_at_its_keys_no_further_than_its_cap() {
+    let mut m: HashMap<String, Any> = (0..1_000_000).map(|i| (format!("u{i}"), Any::Undefined)).collect();
+    m.insert("__proto__".to_string(), Any::Null);
+    m.insert("r".to_string(), Any::Number(1.0));
+    let v = Any::Map(Arc::new(m));
+    hb::TYPED_KEYS_READ.with(|n| n.set(0));
+    assert!(matches!(hb::weigh(&v, MAX_RECORD_BYTES), hb::Weighed::Heavy | hb::Weighed::Unsure));
+    let looked = hb::TYPED_KEYS_READ.with(|n| n.get());
+    assert!(looked < MAX_RECORD_BYTES / 8, "{looked} keys looked at");
+}
+
+/// After a restart, a value a page may read otherwise in place of the
+/// house's reveal holds the table, and the reveal goes back from the state
+/// file as it would have during the run: the table is read again, and a
+/// step-down then lifts round 2's commitment.
+#[test]
+fn after_a_restart_its_own_reveal_held_over_goes_back_from_its_state_file() {
+    for step_down in [false, true] {
+        let mut room = Room::new(&format!("restart-own-unknown-{step_down}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+        room.house.settle_ms = 0;
+        if step_down {
+            room.house.begin_step_down();
+        }
+        for _ in 0..3 {
+            room.tick(REPUT_MS);
+        }
+        assert!(clean(room.raw(&key), &h1), "{step_down}: put back from the state file");
+        let tkey = (T.to_string(), INC.to_string());
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{step_down}: read again");
+        if step_down {
+            let words = room.records("h:2:");
+            let d = &words.first().expect("the step-down's word").1;
+            assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+        }
+    }
+}
+
+/// Stopping right after a tick (REPUT_MS not due), a table held over the
+/// house's own record still has it back and its last word: the step-down
+/// puts back what was taken away on every pass.
+#[test]
+fn a_step_down_right_after_a_tick_puts_its_own_record_back_and_lifts_the_commitment() {
+    for restart in [false, true] {
+        let mut room = Room::new(&format!("stop-soon-{restart}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        if restart {
+            room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+            room.house.settle_ms = 0;
+            room.tick(0);
+        }
+        // A tick that put back what it had to: the next put-back not due.
+        room.tick(REPUT_MS);
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        let house = locked(&mut room);
+        let mut sent = 0;
+        step_down(&house, vec![(ROOM.to_string(), room.doc.clone())], room.now + TICK_MS, |_, _, _| sent += 1);
+        assert!(sent > 0, "{restart}: the step-down sent its word");
+        assert!(clean(room.raw(&key), &h1), "{restart}: put back");
+        let words = room.records("h:2:");
+        let d = &words.first().expect("the step-down's word").1;
+        assert!(strs(d, "x").is_empty(), "{restart}: round 2's commitment stepped down");
+    }
+}
+
+/// Playing on, what was taken away goes back once every REPUT_MS at most:
+/// a peer deleting the house's reveal on every tick costs the room one
+/// write of it a second.
+#[test]
+fn its_own_record_deleted_again_goes_back_once_every_reput_ms() {
+    let mut room = Room::new("reput-pace", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let (key, h1) = room.records("h:1:").pop().unwrap();
+    room.delete(&key);
+    room.tick(REPUT_MS);
+    assert!(clean(room.raw(&key), &h1), "put back");
+    let mut back = 0;
+    for _ in 0..(2 * REPUT_MS / TICK_MS) {
+        room.delete(&key);
+        room.tick(TICK_MS);
+        back += usize::from(room.raw(&key).is_some());
+    }
+    assert_eq!(back, 2, "twice in {} ms", 2 * REPUT_MS);
+}
+
+/// A copy of the setting the house plays by, padded so a page may read it
+/// otherwise, holds its table and goes back clean, as a newer one does:
+/// on every pass the doc holds it so, a pass another table's check put off
+/// before the table loop included.
+#[test]
+fn a_padded_copy_of_the_setting_it_holds_holds_its_table_and_goes_back_clean() {
+    for put_off in [false, true] {
+        let mut room = Room::new(&format!("padded-held-setting-{put_off}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.set_fair(0, 1);
+        room.tick(200);
+        let key = format!("hf:{T}");
+        let rec = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+        let tkey = (T.to_string(), INC.to_string());
+        assert!(room.house.rooms[ROOM].fair.contains_key(T), "held");
+        room.tick(REPUT_MS);
+        // A copy padded so a page may read it otherwise; and (put_off) a
+        // newer setting at another table, whose check puts the first pass
+        // off before any table is read.
+        room.put_top_padded(&key, &rec, Any::Undefined);
+        let passes = if put_off {
+            const T2: &str = "roulette-2";
+            second_table(&room);
+            let other = room_signed("hfair", T2, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+            room.put_top(&format!("hf:{T2}"), &other);
+            2
+        } else {
+            1
+        };
+        room.tick_passes(TICK_MS, passes);
+        assert!(clean(room.raw_top(&key), &rec), "{put_off}: back clean");
+        assert!(room.house.rooms[ROOM].tables[&tkey].held_since.is_some(), "{put_off}: the table waited");
+        room.tick(TICK_MS);
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{put_off}: and plays on");
+    }
+}
+
+/// Many slips and seeds for one player cost a read their count, not its
+/// square: each seed's commitment is hashed once a read (a seed a page may
+/// read otherwise too), and a seed of a player with no slip there not at
+/// all; deciding a Friendly close looks the seeds up.
+#[test]
+fn a_players_many_slips_and_seeds_are_hashed_once_each() {
+    let mut room = Room::new("seeds-squared", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    room.set_fair(1, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:2:").len(), 1, "stepped down: Friendly");
+    // Round 2 closed, bob's seed in, alice's not: the fold waits on it.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &c, &[("alice", &a2), ("bob", &b2)], None);
+    room.reveal(&bob, 2);
+    const N: usize = 200;
+    for i in 0..N {
+        let b = CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(1 + i as i64))])]);
+        let c = format!("{i:064x}");
+        room.put('s', &signed("slip", &alice, obj(vec![("r", CVal::Int(2)), ("p", s("alice")), ("v", CVal::Int(1)), ("b", b), ("c", s(&c))])));
+        let seed = |p: &str, j: usize| obj(vec![("r", CVal::Int(2)), ("p", s(p)), ("s", s(&format!("{j:064x}")))]);
+        room.put('x', &seed("alice", i + N));
+        room.put_padded('x', &seed("alice", i + 2 * N), Any::String(Arc::from("x")));
+        room.put('x', &seed("carol", i));
+    }
+    room.tick(200);
+    room.tick(TICK_MS);
+    hb::COMMITS_HASHED.with(|n| n.set(0));
+    room.tick_passes(TICK_MS, 1);
+    let hashed = hb::COMMITS_HASHED.with(|n| n.get());
+    assert!(hashed <= 2 * N + 8, "{hashed} commitments hashed in a pass");
 }

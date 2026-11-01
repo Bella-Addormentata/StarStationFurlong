@@ -2213,8 +2213,9 @@ function liveSidOf(c: ComputedInc, cp: Checkpoint | null): string {
 
 /** The incarnation a switch names: exactly {v: 1, inc}, `inc` a computed
  *  one's name. Null for none, or anything else (no timestamp: identical
- *  switches written at once merge). */
-function computedCfgInc(value: unknown): string | null {
+ *  switches written at once merge). (Exported for the house's test
+ *  vectors: the owner's node reads switches as this does.) */
+export function computedCfgInc(value: unknown): string | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const cfg = value as { v?: unknown; inc?: unknown };
   return Object.keys(cfg).length === 2 && cfg.v === 1 && typeof cfg.inc === 'string' && COMPUTED_INC.test(cfg.inc)

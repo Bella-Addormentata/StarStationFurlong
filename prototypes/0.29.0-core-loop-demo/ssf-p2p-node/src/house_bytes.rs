@@ -30,6 +30,110 @@ pub enum CVal {
 /// Number.MAX_SAFE_INTEGER.
 const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
 
+/// The field name a page's decoder never keeps as a field (see [`CVal::from_any`]).
+const PROTO: &str = "__proto__";
+
+/// Whether a string yrs decoded (unchecked) is UTF-8.
+pub fn utf8(s: &str) -> bool {
+    #[cfg(test)]
+    UTF8_READ.with(|n| n.set(n.get() + s.len()));
+    std::str::from_utf8(s.as_bytes()).is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes [`utf8`] has read on this thread (tests).
+    pub static UTF8_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The keys `typed_array_key` has looked at on this thread (tests).
+    pub static TYPED_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The commitments [`slip_commit`] has hashed on this thread (tests).
+    pub static COMMITS_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How sure a page's reading of a value is to be [`CVal::from_any`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Clarity {
+    /// Every page reads it so.
+    Clear,
+    /// A page reads it so, or as junk: a map holds a `__proto__` field that
+    /// is no object (it leaves no field), and the update that wrote it may
+    /// have held another `__proto__` field before it, an object, which
+    /// leaves a page no plain object. yrs keeps one entry per key (the
+    /// last), so the node can't tell.
+    Proto,
+    /// A page may hold something else entirely:
+    /// - a string or a key in it isn't UTF-8, and a page refuses the whole
+    ///   update that brought it, keeping whatever was under its key before;
+    /// - or a map holding a `__proto__` field, whatever it holds last, also
+    ///   holds a key that a typed array put before it as the prototype (an
+    ///   earlier `__proto__` buffer of the update, which the node can't see)
+    ///   would keep from being a field: a canonical numeric one past the
+    ///   array's end is dropped, and one of its getters (`length`, …) or
+    ///   `BYTES_PER_ELEMENT` makes the strict-mode decoder throw, refusing
+    ///   the update. A later `__proto__: null` leaves a plain object without
+    ///   them, one holding an object leaves junk, or the page holds what was
+    ///   under its key before;
+    /// - or it weighs more than a read takes ([`weigh`]: `Unsure`) with
+    ///   padding a page reads past in it: what a page reads of it may be
+    ///   light.
+    Unknown,
+}
+
+/// The keys a typed array as a map's prototype keeps from being fields
+/// (see [`Clarity::Unknown`]): its getters, `BYTES_PER_ELEMENT`, and every
+/// key that may be a canonical numeric string (`-0`, `NaN`, `Infinity` and
+/// anything a digit begins, with or without a sign or a point; more than
+/// the spec's, never fewer).
+fn typed_array_key(k: &str) -> bool {
+    #[cfg(test)]
+    TYPED_KEYS_READ.with(|n| n.set(n.get() + 1));
+    let b = k.as_bytes();
+    let numeric = match b {
+        [b'-', rest @ ..] => rest.first().is_some_and(|c| c.is_ascii_digit() || *c == b'.' || *c == b'I'),
+        [b'.', c, ..] => c.is_ascii_digit(),
+        [c, ..] => c.is_ascii_digit(),
+        [] => false,
+    };
+    numeric || matches!(k, "NaN" | "Infinity" | "length" | "byteLength" | "byteOffset" | "buffer" | "BYTES_PER_ELEMENT")
+}
+
+/// How sure a page's reading of `v` is to be [`CVal::from_any`]'s: the
+/// least sure of its parts. (Only of a value [`weigh`] found `Light`: it
+/// goes as deep as the value does, but for the fields of a map that is
+/// Unknown on its own, which `weigh` skips too, and reads every `__proto__`
+/// string in it, which [`clarity_within`] bounds.)
+pub fn clarity(v: &yrs::Any) -> Clarity {
+    use yrs::Any;
+    match v {
+        Any::String(s) if !utf8(s) => Clarity::Unknown,
+        Any::Array(a) => a.iter().map(clarity).max().unwrap_or(Clarity::Clear),
+        Any::Map(m) => {
+            let own = match m.get(PROTO) {
+                None => Clarity::Clear,
+                Some(_) if typed_array_map(m) => return Clarity::Unknown,
+                Some(Any::Map(_) | Any::Array(_) | Any::Buffer(_)) => Clarity::Clear,
+                Some(_) => Clarity::Proto,
+            };
+            m.iter().map(|(k, v)| if utf8(k) { clarity(v) } else { Clarity::Unknown }).fold(own, Clarity::max)
+        }
+        _ => Clarity::Clear,
+    }
+}
+
+/// A map holding a `__proto__` field and a key that a typed array as its
+/// prototype keeps from being a field ([`Clarity::Unknown`]): neither
+/// [`weigh`] nor [`CVal::from_any`] reads what is under such a key.
+fn typed_array_map(m: &std::collections::HashMap<String, yrs::Any>) -> bool {
+    m.contains_key(PROTO) && m.keys().any(|k| typed_array_key(k))
+}
+
+/// [`clarity`] of a value whose `__proto__` strings [`weigh`] found to
+/// be `scan` bytes, reading `most` of them at most: past it Unknown, unread
+/// (one may not be UTF-8, and a page refuses the update that brought it).
+pub fn clarity_within(v: &yrs::Any, scan: usize, most: usize) -> Clarity {
+    if scan > most { Clarity::Unknown } else { clarity(v) }
+}
+
 fn number(f: f64) -> CVal {
     if f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_SAFE {
         CVal::Int(f as i64)
@@ -60,7 +164,8 @@ impl CVal {
     }
 
     /// From a Yjs value, when it weighs at most `cap` ([`weight`]): None
-    /// for a heavier one, which costs no more than `cap` to find out.
+    /// for a heavier one, or one that may be lighter on a page, which costs
+    /// no more than `cap` to find out.
     pub fn from_any_within(v: &yrs::Any, cap: usize) -> Option<CVal> {
         weight(v, cap).map(|_| CVal::from_any(v))
     }
@@ -68,15 +173,31 @@ impl CVal {
     /// From a Yjs value (a record as the room's doc holds it). Yjs writes a
     /// JS number as an integer or a float, and either reads back as
     /// `Number`; a JS bigint is `BigInt`, which canon refuses.
+    ///
+    /// A page decodes a map into `{}` one field at a time (lib0 readAny), so
+    /// a `__proto__` field is `o.__proto__ = v` there: an object (a map, an
+    /// array, a buffer) becomes the prototype, and the value is no plain
+    /// object, which every record reader refuses (computedFold isPlain;
+    /// junk here; the switch's reader is apart, `switch_of`); null or
+    /// anything else leaves no field, as here. A string or a key that isn't UTF-8 reads as
+    /// junk (a page's decoder, lib0 in fatal mode, refuses the whole update
+    /// holding one). Where a page may read the value otherwise than this,
+    /// [`clarity`] says so: a reader acts on it only when it's `Clear`. A
+    /// map whose reading turns on a typed array the node can't see
+    /// ([`Clarity::Unknown`]) is junk here, read no further than [`weigh`]
+    /// read it.
     pub fn from_any(v: &yrs::Any) -> CVal {
         use yrs::Any;
         match v {
-            Any::String(s) => CVal::Str(s.to_string()),
+            Any::String(s) if utf8(s) => CVal::Str(s.to_string()),
             Any::Number(f) => number(*f),
             Any::Array(a) => CVal::Arr(a.iter().map(CVal::from_any).collect()),
-            Any::Map(m) => CVal::Obj(m.iter().map(|(k, v)| (k.clone(), CVal::from_any(v))).collect()),
+            Any::Map(m) if typed_array_map(m) => CVal::Junk,
+            Any::Map(m) if m.keys().all(|k| utf8(k)) && !matches!(m.get(PROTO), Some(Any::Map(_) | Any::Array(_) | Any::Buffer(_))) => {
+                CVal::Obj(m.iter().filter(|(k, _)| k.as_str() != PROTO).map(|(k, v)| (k.clone(), CVal::from_any(v))).collect())
+            }
             Any::Undefined => CVal::Undef,
-            Any::Null | Any::Bool(_) | Any::BigInt(_) | Any::Buffer(_) => CVal::Junk,
+            Any::String(_) | Any::Map(_) | Any::Null | Any::Bool(_) | Any::BigInt(_) | Any::Buffer(_) => CVal::Junk,
         }
     }
 
@@ -113,6 +234,17 @@ impl CVal {
     pub fn fields(&self) -> Option<Vec<&(String, CVal)>> {
         match self {
             CVal::Obj(fields) => Some(fields.iter().filter(|(_, v)| *v != CVal::Undef).collect()),
+            _ => None,
+        }
+    }
+
+    /// The object's own fields, undefined ones included: what
+    /// `Object.keys` lists, for the readers that check every entry of a
+    /// field (a checkpoint's nets, a close's frozen slips, a carry's
+    /// riders), where an undefined entry makes the record junk.
+    pub fn entries(&self) -> Option<&[(String, CVal)]> {
+        match self {
+            CVal::Obj(fields) => Some(fields),
             _ => None,
         }
     }
@@ -185,7 +317,6 @@ fn canon_into(out: &mut String, v: &CVal) -> bool {
     true
 }
 
-/// computedFold canon: sorted-key JSON, or None for junk.
 /// Nesting a record of the doc may have and still be weighed: the pages'
 /// records go 3 deep (a slip's felt of bets), a checkpoint's carry 5.
 pub const MAX_DEPTH: usize = 16;
@@ -195,39 +326,108 @@ pub const MAX_DEPTH: usize = 16;
 /// member and an object's keys. Weighed only as far as `cap` and
 /// [`MAX_DEPTH`]: None past either, so finding a heavy one out costs about
 /// `cap` however big it is (each member is counted as it is reached, before
-/// anything inside it).
+/// anything inside it). None as well for one [`weigh`] finds `Unsure`.
 pub fn weight(v: &yrs::Any, cap: usize) -> Option<usize> {
+    match weigh(v, cap) {
+        Weighed::Light { w, .. } => Some(w),
+        Weighed::Heavy | Weighed::Unsure => None,
+    }
+}
+
+/// What [`weigh`] finds of a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weighed {
+    /// It weighs `w` ([`weight`]), padding included, and holds `scan` bytes
+    /// of `__proto__` strings, which [`clarity`] reads past it: a page
+    /// drops each, so no cap counts one, but whether it is UTF-8 is still a
+    /// page's question, and finding that out costs its bytes.
+    Light { w: usize, scan: usize },
+    /// Past the cap (or [`MAX_DEPTH`]) by what a page reads of it alone:
+    /// junk on every page, which takes no record that heavy.
+    Heavy,
+    /// Past the cap with padding a page reads past in it (an undefined
+    /// field, which no reader counts; a field a typed-array prototype keeps
+    /// out): a page may read it light, and the node can't tell without
+    /// reading it all ([`Clarity::Unknown`]).
+    Unsure,
+}
+
+/// [`weight`], and what [`clarity`] reads past it ([`Weighed`]). Padding
+/// a page reads past weighs as it is reached, as everything does, so no
+/// value costs more than `cap` to weigh; the fields under keys a typed
+/// array keeps from being fields go unread, as the map is Unknown anyway.
+pub fn weigh(v: &yrs::Any, cap: usize) -> Weighed {
     use yrs::Any;
     let mut total: usize = 0;
+    let mut pad: usize = 0;
+    let mut scan: usize = 0;
     let mut stack: Vec<(&Any, usize)> = vec![(v, 0)];
+    // Past the cap: Heavy when what a page reads of it is past it alone.
+    let past = |total: usize, pad: usize| if total.saturating_sub(pad) > cap { Weighed::Heavy } else { Weighed::Unsure };
     while let Some((v, depth)) = stack.pop() {
         if depth > MAX_DEPTH {
-            return None;
+            return Weighed::Heavy;
         }
         let own = match v {
             Any::String(s) => s.len() + 2,
             Any::Buffer(b) => b.len() + 2,
             Any::Array(a) => {
                 for x in a.iter() {
-                    total = total.checked_add(1).filter(|t| *t <= cap)?;
+                    total = total.saturating_add(1);
+                    if total > cap {
+                        return past(total, pad);
+                    }
                     stack.push((x, depth + 1));
                 }
                 2
             }
             Any::Map(m) => {
+                // (Whether a key is one a typed-array prototype drops, as
+                // the capped loop reaches it: no scan of every key first.)
+                let typed = m.contains_key(PROTO);
                 for (k, x) in m.iter() {
-                    total = total.checked_add(k.len() + 4).filter(|t| *t <= cap)?;
+                    total = total.saturating_add(k.len() + 4);
+                    // An undefined field no reader counts, and a field a
+                    // typed-array prototype may drop: padding, unread.
+                    let padding = matches!(x, Any::Undefined) || (typed && typed_array_key(k));
+                    if padding {
+                        total = total.saturating_add(8);
+                        pad = pad.saturating_add(k.len() + 12);
+                    }
+                    if total > cap {
+                        return past(total, pad);
+                    }
+                    if padding {
+                        continue;
+                    }
+                    // A `__proto__` that is no object leaves a page no field
+                    // (CVal::from_any): weighed as a number, so padding one
+                    // never makes a record a page counts too heavy to read.
+                    if k.as_str() == PROTO && !matches!(x, Any::Map(_) | Any::Array(_) | Any::Buffer(_)) {
+                        total = total.saturating_add(8);
+                        if total > cap {
+                            return past(total, pad);
+                        }
+                        if let Any::String(s) = x {
+                            scan = scan.saturating_add(s.len());
+                        }
+                        continue;
+                    }
                     stack.push((x, depth + 1));
                 }
                 2
             }
             Any::Null | Any::Undefined | Any::Bool(_) | Any::Number(_) | Any::BigInt(_) => 8,
         };
-        total = total.checked_add(own).filter(|t| *t <= cap)?;
+        total = total.saturating_add(own);
+        if total > cap {
+            return past(total, pad);
+        }
     }
-    Some(total)
+    Weighed::Light { w: total, scan }
 }
 
+/// computedFold canon: sorted-key JSON, or None for junk.
 pub fn canon(v: &CVal) -> Option<String> {
     let mut out = String::new();
     canon_into(&mut out, v).then_some(out)
@@ -301,6 +501,8 @@ pub fn duty_rank(duty: &str, ctx: &Ctx, round: i64, pub_key: &str) -> String {
 /// computedFold slipCommit: sha256 hex of diceFairness tableCommitMessage
 /// (`ssf-table-commit-v3|room|table|round|party|house|seed`, house '').
 pub fn slip_commit(ctx: &Ctx, r: i64, party: &str, seed: &str) -> String {
+    #[cfg(test)]
+    COMMITS_HASHED.with(|n| n.set(n.get() + 1));
     sha256_hex(&format!("ssf-table-commit-v3|{}|{}|{r}|{party}||{seed}", ctx.room, ctx.seed_table()))
 }
 
