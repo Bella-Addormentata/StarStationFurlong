@@ -72,6 +72,11 @@ mod treasury_codec;
 mod house;
 mod house_bytes;
 
+// 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
+// the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on
+// deep Any, OOM-aborts on a huge length — a page's lib0 throws first).
+mod ingest_parity;
+
 mod b64 {
     use base64::prelude::*;
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
@@ -1917,6 +1922,16 @@ async fn main() -> Result<()> {
             let mut rooms = hub.rooms.lock().unwrap();
             let mut ok = 0usize;
             for (room_id, bytes) in restored {
+                // 🛑 A snapshot whose bytes a page would refuse (e.g. a non-UTF-8
+                // string merged before this guard existed, re-emitted whole by
+                // encode_diff_v1) must not reach Update::decode_v1 — it would crash
+                // the node on boot. Re-validate on the raw bytes first; a refused
+                // snapshot takes the corrupt-snapshot branch (fresh doc, file kept).
+                if let Some(reason) = ingest_parity::pages_refuse(&bytes) {
+                    REFUSED_INGEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("💾 room persist: snapshot for {room_id} refused ({reason:?}) — starting fresh (file kept for inspection)");
+                    continue;
+                }
                 let doc = Doc::new();
                 let applied = Update::decode_v1(&bytes)
                     .ok()
@@ -2477,6 +2492,16 @@ async fn handle_wt_connection_inner(
                         // only logs it. The dial above is reachability (gated by M5.0), not
                         // state, so it's left to run.
                         if envelope.kind == "ysync" && sig_should_drop(&envelope, "wt-in") {
+                            continue;
+                        }
+
+                        // 🛑 Refuse a v1 update every page refuses (non-UTF-8 string,
+                        // deep Any, over-long length, bad content/type ref) BEFORE it is
+                        // relayed, retained, seeded into the dedup cache or merged — and
+                        // before the node ever decodes it (yrs 0.27.2 crashes on some of
+                        // these). One bad frame must not drop the peer's good later ones,
+                        // so continue the reader loop.
+                        if ysync_ingest_drop(&envelope, "wt-in", "browser") {
                             continue;
                         }
 
@@ -3594,6 +3619,16 @@ fn handle_iroh_connection(
                             continue;
                         }
 
+                        // 🛑 The critical lane: a relayed ysync is forwarded to every mesh
+                        // peer and local tab, and retained, BEFORE this node decodes it.
+                        // Refuse a v1 update every page refuses here, ahead of the dedup
+                        // gate, retain, the gossip dial, the tab forward, the hub relay and
+                        // the merge — and never decode it (yrs 0.27.2 crashes on some).
+                        // continue, so the peer's good later frames still apply.
+                        if ysync_ingest_drop(&envelope, "iroh-in", &remote_id.to_string()) {
+                            continue;
+                        }
+
                         // 🌐 Relay-dedup gate (0.18.0): drop envelopes we've already seen so
                         // hub relaying can never echo-storm once meshes form. The origin
                         // identity travels in iroh_node_id (stamped by the origin node).
@@ -4014,6 +4049,78 @@ async fn served_snapshots(rooms: &Mutex<HashMap<String, Room>>) -> Vec<(String, 
     off_runtime(move || docs.into_iter().map(|(id, doc)| (id, doc.transact().encode_diff_v1(&StateVector::default()))).collect())
         .await
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod ingest_wiring_tests {
+    use super::*;
+
+    /// A ysync payload: msgType 0, the given subtype, then the update's length
+    /// and bytes. (Values are all < 128, so one varint byte each.)
+    fn ysync(sub: u8, update: &[u8]) -> Vec<u8> {
+        assert!(update.len() < 128);
+        let mut p = vec![0u8, sub, update.len() as u8];
+        p.extend_from_slice(update);
+        p
+    }
+
+    /// The ysync framing feeds the parity guard the update bytes of a
+    /// state-bearing frame, and lets a SyncStep1 handshake through.
+    #[test]
+    fn ysync_framing_refuses_only_state_frames_with_bad_updates() {
+        // The crash update (a non-UTF-8 ContentString), wrapped as SyncStep2
+        // and as Update — both refused.
+        let crash = hex::decode("010101000401017403ff626300").unwrap();
+        assert!(ysync_update_refused(&ysync(1, &crash)).is_some(), "SyncStep2 crash update");
+        assert!(ysync_update_refused(&ysync(2, &crash)).is_some(), "Update crash update");
+
+        // A clean update (a YMap set) — accepted.
+        let clean = {
+            let d = Doc::new();
+            {
+                let m = d.get_or_insert_map("m");
+                let mut txn = d.transact_mut();
+                yrs::Map::insert(&m, &mut txn, "k", "hello");
+            }
+            let txn = d.transact();
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        assert!(ysync_update_refused(&ysync(1, &clean)).is_none(), "clean SyncStep2");
+        assert!(ysync_update_refused(&ysync(2, &clean)).is_none(), "clean Update");
+
+        // SyncStep1 (subtype 0) carries a state vector, not an update — never
+        // refused, whatever its bytes, so the handshake still answers.
+        assert!(ysync_update_refused(&ysync(0, &crash)).is_none(), "SyncStep1 not an update");
+
+        // A non-ysync-sync payload (msgType != 0) — left alone.
+        assert!(ysync_update_refused(&[9, 9, 9]).is_none());
+    }
+
+    /// `ysync_ingest_drop` bumps the counter once per refused frame and only
+    /// for ysync envelopes.
+    #[test]
+    fn ingest_drop_counts_and_gates_on_kind() {
+        let crash = hex::decode("010101000401017403ff626300").unwrap();
+        let env = |kind: &str| SsfEnvelope {
+            v: 1,
+            room: "r".into(),
+            kind: kind.into(),
+            seq: 0,
+            author: vec![],
+            payload: ysync(2, &crash),
+            sig: None,
+            iroh_node_id: None,
+            iroh_relay_urls: None,
+            iroh_direct_addrs: None,
+            trust_tier: None,
+            iroh_member_hints: None,
+            node_proof: None,
+        };
+        let before = REFUSED_INGEST.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ysync_ingest_drop(&env("ysync"), "test", "peer"));
+        assert!(!ysync_ingest_drop(&env("cap"), "test", "peer"), "non-ysync kind left alone");
+        assert_eq!(REFUSED_INGEST.load(std::sync::atomic::Ordering::Relaxed), before + 1);
+    }
 }
 
 #[cfg(test)]
@@ -5263,6 +5370,47 @@ async fn mesh_maintenance_loop(hub: SharedHub, iroh_ep: IrohEndpoint) {
     }
 }
 
+/// 🛑 How many ingress frames the parity guard has refused (observability;
+/// read by a test). Bumped once per refused frame at any lane.
+static REFUSED_INGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 🛑 If this ysync payload is a state-bearing frame (SyncStep2 or Update)
+/// whose update bytes **every page refuses** (ingest_parity::pages_refuse),
+/// the reason; else `None` — a SyncStep1 handshake (a state vector, not an
+/// update, no string-decode crash surface), or an update a page accepts. Never
+/// calls `Update::decode_v1`, so it is safe on the raw bytes of a frame that
+/// would crash the decoder.
+fn ysync_update_refused(payload: &[u8]) -> Option<ingest_parity::Refuse> {
+    let (msg_type, n1) = read_var_uint(payload, 0).ok()?;
+    if msg_type != 0 {
+        return None;
+    }
+    let (sub, n2) = read_var_uint(payload, n1).ok()?;
+    if sub != 1 && sub != 2 {
+        return None; // SyncStep1 (state vector) or unknown subtype — not an update
+    }
+    let (update, _) = read_length_and_buf(payload, n1 + n2).ok()?;
+    ingest_parity::pages_refuse(&update)
+}
+
+/// 🛑 True (and logs + counts once) when a ysync `envelope` carries an update
+/// every page refuses, so the caller must drop it **before** relaying,
+/// retaining, seeding the dedup cache, or merging it. `lane` names the ingress
+/// for the log.
+fn ysync_ingest_drop(envelope: &SsfEnvelope, lane: &str, remote: &str) -> bool {
+    if envelope.kind != "ysync" {
+        return false;
+    }
+    match ysync_update_refused(&envelope.payload) {
+        Some(reason) => {
+            REFUSED_INGEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("🛑 INGEST-DROP {lane}: {reason:?} from {remote} (a v1 update every page refuses)");
+            true
+        }
+        None => false,
+    }
+}
+
 /// True when a ysync payload is a STATE-bearing frame (SyncStep2 or Update) —
 /// it carries doc changes to apply — versus a SyncStep1 handshake request.
 /// Used to decide which browser-originated frames to fan out to sibling tabs.
@@ -5338,6 +5486,13 @@ async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
 
         } else if sync_sub_type == 1 || sync_sub_type == 2 {
             let (update_bytes, _) = read_length_and_buf(payload, cursor)?;
+            // 🛑 Belt: never decode an update a page would refuse (the ingress
+            // lanes drop it first, but this is the one shared merge path).
+            if let Some(reason) = ingest_parity::pages_refuse(&update_bytes) {
+                REFUSED_INGEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("🛑 INGEST-DROP merge: {reason:?} for room {room_id} (a v1 update every page refuses)");
+                return Ok(());
+            }
             let update = Update::decode_v1(&update_bytes)
                 .map_err(|e| anyhow!("Failed decoding update block: {:?}", e))?;
 

@@ -1,0 +1,161 @@
+{
+  "note": "v1 updates and the page oracle (Y.applyUpdate throws) for ssf-p2p-node ingest_parity.rs",
+  "cases": [
+    {
+      "name": "ymap: nested object/array/number/string/bool/null",
+      "group": "clean",
+      "update": "010601002801016d017301770568656c6c6f2801016d016e017d072801016d016201782801016d017a017e2801016d016f01760301617d01016275027d027d0301637701782801016d036172720175037d01770374776f76010574687265657d0300",
+      "refused": false
+    },
+    {
+      "name": "yarray: inserts",
+      "group": "clean",
+      "update": "0101010008010161037d01770374776f7601016b77017600",
+      "refused": false
+    },
+    {
+      "name": "ytext: insert with a format",
+      "group": "clean",
+      "update": "01040100060101740162047472756584010004626f6c648601040162046e756c6cc4010401050620706c61696e00",
+      "refused": false
+    },
+    {
+      "name": "ymap: unicode string",
+      "group": "clean",
+      "update": "010101002801016d016b01770f68c3a96c6c6f20f09f988020efac8000",
+      "refused": false
+    },
+    {
+      "name": "contentstring: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100040101740361ff6300",
+      "refused": true
+    },
+    {
+      "name": "any string: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100080104726f6f74017702ff2800",
+      "refused": true
+    },
+    {
+      "name": "any map key: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100080104726f6f7401760102ff287e00",
+      "refused": true
+    },
+    {
+      "name": "parentSub: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100240104726f6f7402ff28017600",
+      "refused": true
+    },
+    {
+      "name": "contentstring: valid UTF-8",
+      "group": "utf8",
+      "update": "01010100040101740361626300",
+      "refused": false
+    },
+    {
+      "name": "typeref 0 (YArray)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740000",
+      "refused": false
+    },
+    {
+      "name": "typeref 1 (YMap)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740100",
+      "refused": false
+    },
+    {
+      "name": "typeref 2 (YText)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740200",
+      "refused": false
+    },
+    {
+      "name": "typeref 4 (YXmlFragment)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740400",
+      "refused": false
+    },
+    {
+      "name": "typeref 3 (YXmlElement, reads a name)",
+      "group": "typeref",
+      "update": "01010100070104726f6f74030364697600",
+      "refused": false
+    },
+    {
+      "name": "typeref 5 (XmlHook, reads a name — accepted)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740504686f6f6b00",
+      "refused": false
+    },
+    {
+      "name": "typeref 7 (no reader)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740700",
+      "refused": true
+    },
+    {
+      "name": "typeref 9 (SubDoc on yrs, no page reader)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740900",
+      "refused": true
+    },
+    {
+      "name": "typeref 15 (no page reader)",
+      "group": "typeref",
+      "update": "01010100070104726f6f740f00",
+      "refused": true
+    },
+    {
+      "name": "contentdoc: map opts",
+      "group": "contentdoc",
+      "update": "01010100090104726f6f7406677569642d31760000",
+      "refused": false
+    },
+    {
+      "name": "contentdoc: null opts",
+      "group": "contentdoc",
+      "update": "01010100090104726f6f7406677569642d317e00",
+      "refused": true
+    },
+    {
+      "name": "contentdoc: undefined opts",
+      "group": "contentdoc",
+      "update": "01010100090104726f6f7406677569642d317f00",
+      "refused": true
+    },
+    {
+      "name": "contentdoc: number opts (page reads, no throw)",
+      "group": "contentdoc",
+      "update": "01010100090104726f6f7406677569642d317d0500",
+      "refused": false
+    },
+    {
+      "name": "info high-bit: content ref 0x14 (no reader)",
+      "group": "inforef",
+      "update": "01010100140104726f6f740100",
+      "refused": true
+    },
+    {
+      "name": "client id >= 2^53",
+      "group": "varint",
+      "update": "010180808080808080100000",
+      "refused": true
+    },
+    {
+      "name": "deep any (300 arrays)",
+      "group": "depth",
+      "update": "01010100080104726f6f74017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017501750175017e00",
+      "refused": false
+    },
+    {
+      "name": "string length past the buffer",
+      "group": "length",
+      "update": "01010100040104726f6f74c0843d6100",
+      "refused": true
+    }
+  ]
+}
