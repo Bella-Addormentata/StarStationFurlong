@@ -165,6 +165,31 @@ export const BACKUP_FUNDING =
   'Fund your node only at the address shown here. Sage and the Chia wallet show other addresses of the same words, which your node does not watch.';
 export const BACKUP_ARMED = 'Written all 24, in order? The Bank stops asking and will not show them again. Tap CONFIRM.';
 export const BACKUP_EXPIRED = 'Hidden after 5 minutes. Tap SHOW to see them again.';
+/** 🔒 How the wallet's file keeps its key on disk, under BACK UP's line. */
+export const AT_REST_DPAPI =
+  'On disk, its key is locked to your Windows account on this PC. Reinstalling Windows, an administrator resetting your password, or another PC loses that copy: the 24 words you saved are the backup.';
+export const AT_REST_UNTIL_SAVED =
+  'On disk, its key is in the clear in chia_identity.json until you save the 24 words; then your node locks the file to your Windows account.';
+export const AT_REST_RETRY =
+  'On disk, its key is still in the clear in chia_identity.json: your node locks the file to your Windows account at its next start.';
+export const AT_REST_CLEAR =
+  'On disk, its key is in the clear in chia_identity.json, readable only by your user account: anyone who gets that file has this wallet.';
+export const AT_REST_REWRAPPED =
+  'Copies of your node\'s folder made before today (a synced or zipped folder, a backup) still hold the key in the clear: delete them.';
+
+/** The at-rest lines for an on 24-word wallet, from what its node says;
+ *  none from an older node, which does not say. */
+export function atRestLines(fp: LocalFingerprint | null | undefined): string[] {
+  const w = fp?.chia_wallet;
+  if (!w || w.state !== 'on' || w.mnemonic !== true || w.at_rest === undefined) return [];
+  const lines: string[] = [];
+  if (w.at_rest === 'dpapi') lines.push(AT_REST_DPAPI);
+  else if (w.at_rest_next === 'dpapi') lines.push(w.backed_up === true ? AT_REST_RETRY : AT_REST_UNTIL_SAVED);
+  else lines.push(AT_REST_CLEAR);
+  if (w.rewrapped === true) lines.push(AT_REST_REWRAPPED);
+  return lines;
+}
+
 const COPY_NOTICE: Record<Exclude<BackupCopy, 'none'>, string> = {
   held:
     'COPIED. The Bank empties the clipboard when you tap HIDE, I SAVED or LATER. After 60 s, or when you put the phone away, it tries to, but the page may not be allowed to then. Clipboard history (Win+V, clipboard apps) and cloud clipboard sync can keep a copy of their own: paper is safer.',
@@ -206,6 +231,9 @@ export interface BankBackupView {
   panel: BackupPanelView | null;
   copyNotice: string | null;
   error: string | null;
+  /** 🔒 How the file keeps its key on disk ([`atRestLines`]); shown with
+   *  the nag or the done line, not in the panel. */
+  atRest: string[];
 }
 
 /** What RECEIVE shows about the 24 words, or null when there is nothing to
@@ -217,14 +245,15 @@ export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: Bank
   // Outside the panel only what still matters there: a clipboard that may
   // hold the words, or that was emptied.
   const outside = ui.copy === 'stuck' || ui.copy === 'wiped' ? COPY_NOTICE[ui.copy] : null;
+  const atRest = atRestLines(fp);
   if (backedUp(fp) || ui.savedFor === address) {
-    return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: ui.error };
+    return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest };
   }
   if (page === 'elsewhere') {
-    return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_ELSEWHERE, panel: null, copyNotice: null, error: null };
+    return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_ELSEWHERE, panel: null, copyNotice: null, error: null, atRest };
   }
   if (!ui.open || ui.address !== address) {
-    return { state: 'nag', line: BACKUP_NAG, open: true, elsewhere: null, panel: null, copyNotice: outside, error: ui.error };
+    return { state: 'nag', line: BACKUP_NAG, open: true, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest };
   }
   const shown = ui.words !== null && ui.words.length === WORD_COUNT;
   const revealed = ui.key !== null;
@@ -255,6 +284,7 @@ export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: Bank
     },
     copyNotice: ui.copy === 'none' ? null : COPY_NOTICE[ui.copy],
     error: ui.error,
+    atRest: [],
   };
 }
 

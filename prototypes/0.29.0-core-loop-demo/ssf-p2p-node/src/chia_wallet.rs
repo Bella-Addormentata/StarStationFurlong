@@ -18,6 +18,12 @@
 //! each time (main.rs, `POST /api/chia/words`). The node keeps no copy of the
 //! entropy or the words, only the derived wallet key.
 //!
+//! 🔒 Once the words are marked saved, [`wrap_at_rest`] locks the file with
+//! this computer's store (chia_at_rest.rs: Windows DPAPI): the entropy is
+//! replaced by a `blob` only this account can open, in one guarded rename
+//! that never leaves the wallet without a whole file. Minting always writes
+//! the clear form first.
+//!
 //! A node from before the words kept a raw 32-byte seed in
 //! `chia_identity.seed`. No words reproduce its key, so turning such a wallet
 //! on mints fresh entropy, and the raw seed is archived as
@@ -37,6 +43,7 @@
 //! bip39 2.2.2 (with `zeroize`).
 #![cfg(feature = "chia-publish")]
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,18 +62,30 @@ use chia_protocol::Bytes32;
 use chia_puzzle_types::standard::StandardArgs;
 use chia_puzzle_types::DeriveSynthetic;
 use chia_sdk_utils::Address;
+use base64::Engine;
 use serde::Deserialize;
 use zeroize::Zeroizing;
+
+use crate::chia_at_rest::{self, AtRest, Policy, SecretStore};
 
 /// Testnet11 human-readable prefix (mainnet would be `"xch"`).
 const TESTNET_PREFIX: &str = "txch";
 
-/// The identity file's format, and the one `kind` and `protect` this node
-/// reads. The at-rest PR adds other `protect` values (with a `blob` in place
-/// of `entropy`); this node refuses them rather than minting over them.
+/// The identity file's format, its one `kind`, and the `protect` values this
+/// node reads: `none` (the entropy in the clear) and `dpapi` (a `blob` in
+/// place of the entropy). Any other `protect`, or a field this node does not
+/// know, is a newer Star Station's file: refused, never minted over.
 const IDENTITY_V: u64 = 1;
 const IDENTITY_KIND: &str = "bip39-english";
 const PROTECT_NONE: &str = "none";
+const PROTECT_DPAPI: &str = "dpapi";
+
+/// Every field a v1 file can carry.
+const KNOWN_FIELDS: [&str; 8] = ["v", "kind", "protect", "entropy", "blob", "fingerprint", "at", "wrapped_at"];
+
+/// The longest `blob` a reader takes, in base64 characters. DPAPI's for 32
+/// bytes is a few hundred; this keeps the file well under [`FILE_MAX`].
+const BLOB_MAX: usize = 2048;
 
 /// Bytes of BIP39 entropy in the identity: 24 words.
 const ENTROPY_LEN: usize = 32;
@@ -138,6 +157,8 @@ pub struct WalletIdentity {
     pub minted: bool,
     /// This load archived a legacy raw seed.
     pub retired: Option<RetiredSeed>,
+    /// How the identity file keeps its key on disk.
+    pub at_rest: AtRest,
 }
 
 /// Fingerprint and what the load did; never the key.
@@ -147,6 +168,7 @@ impl fmt::Debug for WalletIdentity {
             .field("fingerprint", &self.fingerprint)
             .field("minted", &self.minted)
             .field("retired", &self.retired)
+            .field("at_rest", &self.at_rest)
             .finish_non_exhaustive()
     }
 }
@@ -194,27 +216,40 @@ impl fmt::Debug for Revealed {
 ///
 /// Before reading or minting, temporary files a stopped mint left beside the
 /// identity are removed: one can hold the entropy (or a raw seed), and the
-/// at-rest PR's re-wrap would not reach it.
+/// lock once the words are saved would not reach it. So are the leftovers of
+/// a lock that stopped ([`recover_rewrap`]).
 ///
 /// A file that is there and cannot be read is reported and never minted
 /// over; see [`read_identity`]'s refusals.
 pub fn load_or_mint_wallet(identity: &Path, legacy: &Path) -> Result<WalletIdentity> {
+    load_or_mint_wallet_with(identity, legacy, chia_at_rest::os_store())
+}
+
+/// [`load_or_mint_wallet`] with the store a locked file is opened by.
+pub(crate) fn load_or_mint_wallet_with(
+    identity: &Path,
+    legacy: &Path,
+    store: Option<&dyn SecretStore>,
+) -> Result<WalletIdentity> {
     sweep_stale_tmp(&[identity, legacy]);
+    // No lock is taken here: a lock replaces the identity in one rename, so
+    // a load reads either whole file, and both open to the same wallet.
+    recover_rewrap(identity, store);
     // `try_exists`, not `exists`: an identity that is there but cannot be
     // looked at (a permission error) is reported, never minted over.
     let present = identity
         .try_exists()
         .with_context(|| format!("looking for chia identity file {}", identity.display()))?;
-    let (entropy, keys, minted) = if present {
-        let (entropy, keys) = read_identity(identity)?;
+    let (opened, minted) = if present {
+        let opened = read_identity(identity, store)?;
         // Owner-only again, for a copy the operator put back (from a zip, a
         // cloud folder, a FAT stick) with the modes it picked up there.
         restrict_permissions(identity);
-        (entropy, keys, false)
+        (opened, false)
     } else {
-        mint_identity(identity)?
+        mint_identity(identity, store)?
     };
-    drop(entropy);
+    let Opened { keys, protect: at_rest, .. } = opened;
     // Only now, with the identity durable (installed and its directory
     // synced, or already there), is the raw seed archived.
     let retired = retire_legacy_seed(legacy, unix_now()).unwrap_or_else(|e| {
@@ -224,14 +259,20 @@ pub fn load_or_mint_wallet(identity: &Path, legacy: &Path) -> Result<WalletIdent
         );
         None
     });
-    Ok(WalletIdentity { wallet: keys.wallet, fingerprint: keys.fingerprint, minted, retired })
+    Ok(WalletIdentity { wallet: keys.wallet, fingerprint: keys.fingerprint, minted, retired, at_rest })
 }
 
 /// For the Bank's reveal only: the 24 words of the identity on disk, read
 /// again (the node keeps no copy), with the fingerprint and wallet key they
 /// make so the caller can check they are the wallet in use.
 pub fn reveal_words(identity: &Path) -> Result<Revealed> {
-    let (entropy, keys) = read_identity(identity)?;
+    reveal_words_with(identity, chia_at_rest::os_store())
+}
+
+/// [`reveal_words`] with the store a locked file is opened by. It only
+/// reads: nothing is written, locked or minted.
+pub(crate) fn reveal_words_with(identity: &Path, store: Option<&dyn SecretStore>) -> Result<Revealed> {
+    let Opened { entropy, keys, .. } = read_identity(identity, store)?;
     let mnemonic = Mnemonic::from_entropy(&entropy[..])
         .map_err(|_| anyhow!("the identity's entropy does not make words"))?;
     if mnemonic.word_count() != 24 {
@@ -268,7 +309,7 @@ pub fn reveal_body(rev: &Revealed, address: &str) -> Zeroizing<String> {
 }
 
 /// The identity file's header: read first, alone, so a newer file (another
-/// `protect`, a `blob` in place of `entropy`) is told apart from a damaged
+/// `protect`, a field this node does not know) is told apart from a damaged
 /// one before anything else is asked of it.
 #[derive(Deserialize)]
 struct IdentityHeader<'a> {
@@ -279,27 +320,47 @@ struct IdentityHeader<'a> {
     protect: Option<&'a str>,
 }
 
-/// The v1 body (`protect:"none"`). Borrowed from the read buffer, so the
-/// entropy's hex is never copied out of it.
+/// The v1 body, for every `protect` this node reads; which fields one must
+/// have is checked against its `protect`. Borrowed from the read buffer, so
+/// the entropy's hex is never copied out of it.
 #[derive(Deserialize)]
-struct IdentityV1<'a> {
-    #[serde(borrow)]
-    entropy: &'a str,
+struct IdentityBody<'a> {
+    #[serde(borrow, default)]
+    entropy: Option<&'a str>,
+    #[serde(borrow, default)]
+    blob: Option<&'a str>,
     fingerprint: u32,
+    #[serde(default)]
+    at: Option<u64>,
+    #[serde(default)]
+    wrapped_at: Option<u64>,
+}
+
+/// An identity file read and checked: its entropy, the keys it makes, how it
+/// keeps them, when it was made, and its bytes as read (a lock checks the
+/// file did not change under it).
+pub(crate) struct Opened {
+    entropy: Zeroizing<[u8; ENTROPY_LEN]>,
+    keys: ChiaKeys,
+    protect: AtRest,
+    at: u64,
+    raw: Zeroizing<Vec<u8>>,
 }
 
 /// Read and check the identity file: the only read site.
 ///
-/// The file is read into a buffer that is wiped when dropped, parsed in two
-/// steps (the header, then the v1 body), its entropy decoded into another
-/// wiped buffer, and the keys derived again: the fingerprint written beside
-/// the entropy must match, since the entropy carries no checksum of its own.
+/// The file is read into a buffer that is wiped when dropped, parsed in
+/// steps (the header, the names of its fields, then the body), its entropy
+/// decoded, or opened by `store` for a locked file, into another wiped
+/// buffer, and the keys derived again: the fingerprint written beside the
+/// entropy must match, since the entropy carries no checksum of its own.
 ///
 /// Every refusal is a fixed sentence built fresh, with no source error under
 /// it: serde and hex errors can quote the bytes they choked on (a piece of
-/// the entropy), and `{e:#}` prints a whole chain. A refused file is left as
-/// it is, and nothing is minted over it.
-fn read_identity(path: &Path) -> Result<(Zeroizing<[u8; ENTROPY_LEN]>, ChiaKeys)> {
+/// the entropy), and `{e:#}` prints a whole chain. A store's refusal names
+/// only its class and number (chia_at_rest::refusal_words). A refused file
+/// is left as it is, and nothing is minted over it.
+fn read_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<Opened> {
     let damaged = || {
         anyhow!(
             "chia identity file {} is damaged — refusing to overwrite a corrupt identity file; move it aside to re-mint",
@@ -323,35 +384,109 @@ fn read_identity(path: &Path) -> Result<(Zeroizing<[u8; ENTROPY_LEN]>, ChiaKeys)
     let (Some(kind), Some(protect)) = (header.kind, header.protect) else {
         return Err(damaged());
     };
-    if kind != IDENTITY_KIND || protect != PROTECT_NONE {
+    if kind != IDENTITY_KIND {
         return Err(newer());
     }
-    let body: IdentityV1 = serde_json::from_slice(&buf).map_err(|_| damaged())?;
-    if body.entropy.len() != 2 * ENTROPY_LEN {
-        return Err(damaged());
+    let protect = match protect {
+        PROTECT_NONE => AtRest::None,
+        PROTECT_DPAPI => AtRest::Dpapi,
+        _ => return Err(newer()),
+    };
+    // A file locked by a store this computer does not have: say whose,
+    // before anything else is asked of it.
+    let store = match protect {
+        AtRest::None => None,
+        locked => match store.filter(|s| s.protect() == locked) {
+            Some(s) => Some(s),
+            None => {
+                let e = chia_at_rest::StoreError { refusal: chia_at_rest::Refusal::Foreign(locked), code: 0 };
+                return Err(anyhow!("{}", chia_at_rest::refusal_words(path, e)));
+            }
+        },
+    };
+    // The names of the fields alone (their values are skipped, not copied):
+    // one this node does not know is a newer node's.
+    let fields: BTreeMap<&str, serde::de::IgnoredAny> = serde_json::from_slice(&buf).map_err(|_| damaged())?;
+    if fields.keys().any(|k| !KNOWN_FIELDS.contains(k)) {
+        return Err(newer());
     }
+    let body: IdentityBody = serde_json::from_slice(&buf).map_err(|_| damaged())?;
     let mut entropy = Zeroizing::new([0u8; ENTROPY_LEN]);
-    hex::decode_to_slice(body.entropy, &mut entropy[..]).map_err(|_| damaged())?;
+    match (protect, store) {
+        (AtRest::None, _) => {
+            let (Some(hex), None, None) = (body.entropy, body.blob, body.wrapped_at) else {
+                return Err(damaged());
+            };
+            if hex.len() != 2 * ENTROPY_LEN {
+                return Err(damaged());
+            }
+            hex::decode_to_slice(hex, &mut entropy[..]).map_err(|_| damaged())?;
+        }
+        (_, Some(store)) => {
+            let (None, Some(blob)) = (body.entropy, body.blob) else {
+                return Err(damaged());
+            };
+            if blob.len() > BLOB_MAX {
+                return Err(damaged());
+            }
+            let sealed = base64::engine::general_purpose::STANDARD.decode(blob).map_err(|_| damaged())?;
+            let opened = store
+                .unwrap(&sealed, body.fingerprint)
+                .map_err(|e| anyhow!("{}", chia_at_rest::refusal_words(path, e)))?;
+            if opened.len() != ENTROPY_LEN {
+                return Err(damaged());
+            }
+            entropy.copy_from_slice(&opened);
+        }
+        (_, None) => unreachable!("a locked file without its store was refused above"),
+    }
     let keys = keys_from_entropy(&entropy);
     if keys.fingerprint != body.fingerprint {
         return Err(damaged());
     }
-    Ok((entropy, keys))
+    Ok(Opened { entropy, keys, protect, at: body.at.unwrap_or(0), raw: buf })
 }
 
-/// The identity file's bytes: the one encode site. Always this exact shape,
-/// with nothing that needs escaping:
-/// `{"v":1,"kind":"bip39-english","protect":"none","entropy":"<64 hex>","fingerprint":N,"at":T}`.
-fn encode_identity(entropy: &[u8; ENTROPY_LEN], fingerprint: u32, at: u64) -> Zeroizing<String> {
-    let mut digits = Zeroizing::new([0u8; 2 * ENTROPY_LEN]);
-    hex::encode_to_slice(&entropy[..], &mut digits[..]).expect("64 hex digits for 32 bytes");
-    let mut out = Zeroizing::new(String::with_capacity(256));
-    out.push_str(r#"{"v":1,"kind":"bip39-english","protect":"none","entropy":""#);
-    out.push_str(std::str::from_utf8(&digits[..]).expect("hex digits are ASCII"));
+/// What an identity file keeps of its entropy.
+pub(crate) enum Body<'a> {
+    /// The entropy itself (`protect:"none"`).
+    Clear(&'a [u8; ENTROPY_LEN]),
+    /// A store's blob of it (`protect:"dpapi"`).
+    Locked(AtRest, &'a [u8]),
+}
+
+/// The identity file's bytes: the one encode site. Always one of these exact
+/// shapes, with nothing that needs escaping:
+/// `{"v":1,"kind":"bip39-english","protect":"none","entropy":"<64 hex>","fingerprint":N,"at":T}`, or
+/// `{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"<base64>","fingerprint":N,"at":T,"wrapped_at":W}`.
+fn encode_identity(body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(256 + BLOB_MAX));
+    match body {
+        Body::Clear(entropy) => {
+            let mut digits = Zeroizing::new([0u8; 2 * ENTROPY_LEN]);
+            hex::encode_to_slice(&entropy[..], &mut digits[..]).expect("64 hex digits for 32 bytes");
+            out.push_str(r#"{"v":1,"kind":"bip39-english","protect":"none","entropy":""#);
+            out.push_str(std::str::from_utf8(&digits[..]).expect("hex digits are ASCII"));
+        }
+        Body::Locked(protect, blob) => {
+            let protect = match protect {
+                AtRest::Dpapi => PROTECT_DPAPI,
+                AtRest::None => unreachable!("a clear body is Body::Clear"),
+            };
+            out.push_str(r#"{"v":1,"kind":"bip39-english","protect":""#);
+            out.push_str(protect);
+            out.push_str(r#"","blob":""#);
+            out.push_str(&base64::engine::general_purpose::STANDARD.encode(blob));
+        }
+    }
     out.push_str(r#"","fingerprint":"#);
     out.push_str(&fingerprint.to_string());
     out.push_str(r#","at":"#);
     out.push_str(&at.to_string());
+    if let Body::Locked(..) = body {
+        out.push_str(r#","wrapped_at":"#);
+        out.push_str(&wrapped_at.to_string());
+    }
     out.push('}');
     out
 }
@@ -359,17 +494,18 @@ fn encode_identity(entropy: &[u8; ENTROPY_LEN], fingerprint: u32, at: u64) -> Ze
 /// First load: fresh entropy from the OS CSPRNG (the same `OsRng` the lane's
 /// `seal` nonce uses), installed once ([`install_once`]). The loser of a race
 /// loads the winner's identity.
-fn mint_identity(path: &Path) -> Result<(Zeroizing<[u8; ENTROPY_LEN]>, ChiaKeys, bool)> {
+fn mint_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<(Opened, bool)> {
     let mut entropy = Zeroizing::new([0u8; ENTROPY_LEN]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..]);
     let keys = keys_from_entropy(&entropy);
-    let bytes = encode_identity(&entropy, keys.fingerprint, unix_now());
+    let at = unix_now();
+    let bytes = encode_identity(Body::Clear(&entropy), keys.fingerprint, at, 0);
     match install_once(path, bytes.as_bytes())? {
-        Installed::Ours => Ok((entropy, keys, true)),
-        Installed::Theirs => {
-            let (entropy, keys) = read_identity(path)?;
-            Ok((entropy, keys, false))
+        Installed::Ours => {
+            let raw = Zeroizing::new(bytes.as_bytes().to_vec());
+            Ok((Opened { entropy, keys, protect: AtRest::None, at, raw }, true))
         }
+        Installed::Theirs => Ok((read_identity(path, store)?, false)),
     }
 }
 
@@ -642,6 +778,318 @@ fn sweep_stale_tmp(paths: &[&Path]) {
     }
 }
 
+/// What [`wrap_at_rest`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wrapped {
+    /// The file is locked now; `linked` when another name still points at
+    /// the old clear file (a hard link someone made), which keeps the key in
+    /// the clear there.
+    Done { linked: bool },
+    /// It was locked already.
+    Already(AtRest),
+    /// Nothing changed, for this reason; the next start tries again.
+    Skipped(String),
+}
+
+/// The steps of a lock, for tests that stop it at each one as a crash would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    Read,
+    Sealed,
+    Written,
+    Probed,
+    Locked,
+    Rechecked,
+    Renamed,
+}
+
+/// 🔒 Lock the identity file with this computer's store (chia_at_rest.rs),
+/// once its words are marked saved: the caller decides that
+/// (`chia_at_rest::should_wrap`). The same wallet, the same fingerprint and
+/// address; only how the file keeps the entropy changes.
+pub fn wrap_at_rest(identity: &Path, fingerprint: u32, policy: Policy) -> Wrapped {
+    wrap_at_rest_with(identity, fingerprint, policy, chia_at_rest::os_store(), &|_| false)
+}
+
+/// [`wrap_at_rest`] with its store, and `stop`, which a test uses to end the
+/// call at a step the way a crash would: at once, with nothing cleaned up.
+///
+/// The steps, each of which leaves the file byte for byte as it was until
+/// the rename:
+/// 1. read the file; a locked one is `Already`, another wallet is skipped;
+/// 2. lock the entropy and open the result again, which must give it back;
+/// 3. write the locked file whole under `.<name>.rewrap-<pid>-<n>`, synced
+///    (no `.tmp` suffix, so the temporary-file sweep leaves it to
+///    [`recover_rewrap`]);
+/// 4. hard-link it once and remove that link: a folder that cannot (exFAT,
+///    FAT) cannot replace a file in one step either, so it stays in the clear;
+/// 5. take the identity's lock file, or skip while another node holds it;
+/// 6. under it, check the file still holds the bytes read in step 1;
+/// 7. rename the locked file over the identity: the one step that replaces
+///    the clear file, and it either lands whole or not at all;
+/// 8. sync the folder on Unix (the old and the new file both open to the
+///    same wallet, so a failure there is only logged).
+///
+/// No store item is ever deleted and nothing ever unlocks a file. Until the
+/// rename, the entropy is whole in the identity; after it, in the locked file.
+pub(crate) fn wrap_at_rest_with(
+    identity: &Path,
+    fingerprint: u32,
+    policy: Policy,
+    store: Option<&dyn SecretStore>,
+    stop: &dyn Fn(Step) -> bool,
+) -> Wrapped {
+    let stopped = |step: Step| Wrapped::Skipped(format!("stopped at {step:?}"));
+    let Some(store) = store else {
+        return Wrapped::Skipped("this computer has no store to lock it with".into());
+    };
+    if policy != Policy::Os {
+        return Wrapped::Skipped(format!("{}=none", chia_at_rest::POLICY_ENV));
+    }
+    // 1. Read.
+    let opened = match read_identity(identity, Some(store)) {
+        Ok(opened) => opened,
+        Err(e) => return Wrapped::Skipped(format!("{e:#}")),
+    };
+    if opened.protect != AtRest::None {
+        return Wrapped::Already(opened.protect);
+    }
+    if opened.keys.fingerprint != fingerprint {
+        return Wrapped::Skipped("the file holds another wallet than the one in use".into());
+    }
+    if stop(Step::Read) {
+        return stopped(Step::Read);
+    }
+    // 2. Lock, and open again.
+    let blob = match store.wrap(&opened.entropy, fingerprint) {
+        Ok(blob) => blob,
+        Err(e) => return Wrapped::Skipped(format!("the store refused to lock it (code {:#x})", e.code)),
+    };
+    match store.unwrap(&blob, fingerprint) {
+        Ok(back) if back.as_slice() == &opened.entropy[..] => {}
+        Ok(_) => return Wrapped::Skipped("the store gave back other bytes than it locked".into()),
+        Err(e) => return Wrapped::Skipped(format!("the store could not open what it locked (code {:#x})", e.code)),
+    }
+    let bytes = encode_identity(Body::Locked(store.protect(), &blob), fingerprint, opened.at, unix_now());
+    if bytes.len() > FILE_MAX || base64::engine::general_purpose::STANDARD.encode(&blob).len() > BLOB_MAX {
+        return Wrapped::Skipped("the store's locked bytes are too long for the file".into());
+    }
+    if stop(Step::Sealed) {
+        return stopped(Step::Sealed);
+    }
+    // 3. Write the locked file beside it.
+    let dir = parent_dir(identity);
+    let name = file_name_of(identity);
+    let mut rewrap = None;
+    for n in 0..TMP_NAME_ATTEMPTS {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let at = dir.join(format!(".{name}.rewrap-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        match write_new(&at, bytes.as_bytes()) {
+            Ok(()) => {
+                rewrap = Some(at);
+                break;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && n + 1 < TMP_NAME_ATTEMPTS => {}
+            Err(e) => return Wrapped::Skipped(format!("could not write the locked file ({e})")),
+        }
+    }
+    let Some(rewrap) = rewrap else {
+        return Wrapped::Skipped("every name for the locked file is taken".into());
+    };
+    let give_up = |why: String| {
+        let _ = std::fs::remove_file(&rewrap);
+        Wrapped::Skipped(why)
+    };
+    if stop(Step::Written) {
+        return stopped(Step::Written);
+    }
+    // 4. Probe for hard links.
+    let probe = PathBuf::from(format!("{}.probe", rewrap.display()));
+    let linked = std::fs::hard_link(&rewrap, &probe);
+    let _ = std::fs::remove_file(&probe);
+    if let Err(e) = linked {
+        return give_up(format!(
+            "this folder's filesystem cannot hard-link files ({e}), so it cannot replace the file in one step either \
+             (exFAT and FAT cannot); run the node from a folder on the system drive"
+        ));
+    }
+    if stop(Step::Probed) {
+        return stopped(Step::Probed);
+    }
+    // 5. The lock file.
+    let held = match try_lock_identity(identity) {
+        Ok(held) => held,
+        Err(why) => return give_up(why),
+    };
+    if stop(Step::Locked) {
+        return stopped(Step::Locked);
+    }
+    // 6. Unchanged since step 1?
+    match read_capped(identity, FILE_MAX) {
+        Ok(Some(now)) if now.as_slice() == opened.raw.as_slice() => {}
+        Ok(_) => return give_up("the file changed while it was being locked".into()),
+        Err(e) => return give_up(format!("the file could not be read again ({e})")),
+    }
+    let linked = link_count(identity) > 1;
+    if stop(Step::Rechecked) {
+        return stopped(Step::Rechecked);
+    }
+    // 7. The rename.
+    if let Err(e) = std::fs::rename(&rewrap, identity) {
+        return give_up(format!("the locked file could not replace it ({e})"));
+    }
+    if stop(Step::Renamed) {
+        return stopped(Step::Renamed);
+    }
+    // 8. The folder.
+    #[cfg(unix)]
+    if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+        eprintln!(
+            "🔒 SSF wallet: locked {}, but its folder could not be synced ({e}); both forms open to the same wallet",
+            identity.display()
+        );
+    }
+    drop(held);
+    Wrapped::Done { linked }
+}
+
+/// The line a lock prints: what it did, and what it did not reach.
+pub fn log_wrapped(identity: &Path, outcome: &Wrapped) {
+    match outcome {
+        Wrapped::Done { linked } => {
+            println!(
+                "🔒 SSF wallet: locked {} to this Windows account, since its 24 words are saved; copies of it made before today \
+                 (a synced or zipped folder, a backup) still hold the key in the clear: delete them",
+                identity.display()
+            );
+            if *linked {
+                eprintln!(
+                    "🔒 SSF wallet: another name still points at the old {} (a hard link), and it keeps the key in the clear: delete it",
+                    identity.display()
+                );
+            }
+        }
+        Wrapped::Already(_) => {}
+        Wrapped::Skipped(why) => eprintln!(
+            "🔒 SSF wallet: {} stays in the clear for now ({why}); the node tries again at its next start",
+            identity.display()
+        ),
+    }
+}
+
+/// Leftovers of a lock that stopped (`.<name>.rewrap-*` and their probes),
+/// looked at before every load.
+///
+/// With the identity gone and a locked file beside it that opens (a rename
+/// some filesystem lost, or an identity moved aside mid-lock), the newest
+/// such file is put back as the identity, with the same never-replace link
+/// as a mint, and nothing is minted over it. Otherwise a leftover older than
+/// a minute is removed: the identity holds the wallet. A younger one may be
+/// a lock in flight in another node, and is left to it.
+fn recover_rewrap(identity: &Path, store: Option<&dyn SecretStore>) {
+    let dir = parent_dir(identity);
+    let prefix = format!(".{}.rewrap-", file_name_of(identity));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut leftovers: Vec<(PathBuf, Option<std::time::SystemTime>)> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)))
+        .map(|e| (e.path(), e.metadata().and_then(|m| m.modified()).ok()))
+        .collect();
+    if leftovers.is_empty() {
+        return;
+    }
+    if matches!(identity.try_exists(), Ok(false)) {
+        leftovers.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+        let newest = leftovers
+            .iter()
+            .filter(|(p, _)| p.extension().is_none_or(|x| x != "probe"))
+            .find(|(p, _)| read_identity(p, store).is_ok());
+        if let Some((found, _)) = newest {
+            match std::fs::hard_link(found, identity) {
+                Ok(()) => {
+                    println!(
+                        "🔒 SSF wallet: {} was missing; put back the locked copy a stopped lock left ({})",
+                        identity.display(),
+                        found.display()
+                    );
+                    #[cfg(unix)]
+                    let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "🔒 SSF wallet: {} is missing and the locked copy {} could not be put back ({e}); it is kept",
+                        identity.display(),
+                        found.display()
+                    );
+                    return;
+                }
+            }
+        } else {
+            return;
+        }
+    }
+    for (path, modified) in leftovers {
+        let old = modified.and_then(|t| t.elapsed().ok()).is_some_and(|a| a >= TMP_IN_FLIGHT);
+        if !old || !matches!(identity.try_exists(), Ok(true)) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("🔒 SSF wallet: removed {}, left by a lock that stopped", path.display()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => eprintln!("🔒 SSF wallet: could not remove {}, left by a lock that stopped ({e})", path.display()),
+        }
+    }
+}
+
+/// The identity's lock file, `.<name>.lock` beside it, which two nodes
+/// locking the same file take in turn. Empty; never removed (removing a lock
+/// file is what lets two holders in).
+fn lock_path(identity: &Path) -> PathBuf {
+    parent_dir(identity).join(format!(".{}.lock", file_name_of(identity)))
+}
+
+fn open_lock(identity: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(lock_path(identity))
+}
+
+/// The identity's lock, now or not at all: a lock skips while another node
+/// holds it, or where the folder cannot be locked.
+fn try_lock_identity(identity: &Path) -> std::result::Result<std::fs::File, String> {
+    let f = open_lock(identity).map_err(|e| format!("its lock file could not be opened ({e})"))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err("another node is loading or locking it right now".into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("this folder cannot lock files ({e})")),
+    }
+}
+
+/// How many names point at the file (Unix); 1 elsewhere.
+fn link_count(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.nlink()).unwrap_or(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        1
+    }
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "identity".to_string())
+}
+
 fn parent_dir(path: &Path) -> PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -705,12 +1153,16 @@ pub fn log_receive_address(id: &WalletIdentity) {
     }
     if id.minted {
         println!(
-            "🏦 SSF wallet: made a new wallet from 24 words, key fingerprint {} — back the words up in the SpacePhone's 🏦 BANK, \
-             or keep a copy of chia_identity.json (the node never prints them)",
+            "🏦 SSF wallet: made a new wallet from 24 words, key fingerprint {} — back the words up in the SpacePhone's 🏦 BANK \
+             (the node never prints them)",
             id.fingerprint
         );
     } else {
-        println!("🏦 SSF wallet: loaded the wallet made from 24 words, key fingerprint {}", id.fingerprint);
+        let kept = match id.at_rest {
+            AtRest::None => "",
+            AtRest::Dpapi => " (its file locked to this Windows account)",
+        };
+        println!("🏦 SSF wallet: loaded the wallet made from 24 words, key fingerprint {}{kept}", id.fingerprint);
     }
     let addr = testnet_address(&id.wallet);
     println!(
@@ -1056,12 +1508,9 @@ mod tests {
         ];
         let newer: Vec<(&str, String)> = vec![
             ("v2", good.replace(r#""v":1"#, r#""v":2"#)),
-            ("dpapi", good.replace(r#""protect":"none""#, r#""protect":"dpapi""#)),
-            (
-                "a future envelope with a blob and no entropy",
-                format!(r#"{{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"AAECAwQ=","fingerprint":{fp}}}"#),
-            ),
+            ("the keychain, which this node does not open yet", good.replace(r#""protect":"none""#, r#""protect":"keychain""#)),
             ("another kind", good.replace("bip39-english", "bip39-japanese")),
+            ("a field this node does not know", good.replace(r#""at":"#, r#""salt":"x","at":"#)),
         ];
         for (why, text, says) in damaged
             .iter()
@@ -1104,7 +1553,11 @@ mod tests {
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, text).unwrap();
             let e = load_or_mint_wallet(&identity, &dir.join("chia_identity.seed")).unwrap_err();
+            // The path is the test's own (on Windows it can hold an 8.3 name
+            // such as RUNNER~1): only what the file held must stay out.
+            let path = identity.display().to_string();
             for shown in [format!("{e:#}"), format!("{e:?}"), format!("{e}")] {
+                let shown = shown.replace(&path, "<path>");
                 for i in 0..HAMSTER_HEX.len() - 8 {
                     let piece = &HAMSTER_HEX[i..i + 8];
                     assert!(!shown.contains(piece), "{text}: the error quotes {piece}: {shown}");
@@ -1380,6 +1833,275 @@ mod tests {
             assert!(!shown.contains(&HAMSTER_HEX[..12]) && !shown.contains(&secret_hex[..12]), "{shown}");
             assert!(!shown.contains(&old_hex[..12]), "{shown}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- 🔒 At rest ---------------------------------------------------------
+
+    use crate::chia_at_rest::fake::FakeStore;
+
+    fn fields_of(path: &Path) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    fn no_stop(_: Step) -> bool {
+        false
+    }
+
+    /// The locked file's exact bytes, and the clear one's.
+    #[test]
+    fn the_locked_envelope_has_one_exact_shape() {
+        assert_eq!(
+            encode_identity(Body::Locked(AtRest::Dpapi, &[0, 1, 2, 3, 4]), 7, 100, 200).as_str(),
+            r#"{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"AAECAwQ=","fingerprint":7,"at":100,"wrapped_at":200}"#
+        );
+        assert_eq!(
+            encode_identity(Body::Clear(&entropy_of(HAMSTER_HEX)), 7, 100, 200).as_str(),
+            format!(r#"{{"v":1,"kind":"bip39-english","protect":"none","entropy":"{HAMSTER_HEX}","fingerprint":7,"at":100}}"#)
+        );
+        // The longest blob the reader takes still fits the file.
+        let longest = vec![0u8; BLOB_MAX / 4 * 3];
+        assert!(base64::engine::general_purpose::STANDARD.encode(&longest).len() <= BLOB_MAX);
+        assert!(encode_identity(Body::Locked(AtRest::Dpapi, &longest), u32::MAX, u64::MAX, u64::MAX).len() < FILE_MAX);
+    }
+
+    #[test]
+    fn a_saved_wallet_is_locked_in_place_and_opens_to_the_same_wallet() {
+        let dir = fresh_dir("wrap");
+        let identity = dir.join("chia_identity.json");
+        let legacy = dir.join("chia_identity.seed");
+        let store = FakeStore::new();
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+        let before = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        assert_eq!(before.at_rest, AtRest::None);
+
+        let clear = std::fs::read(&identity).unwrap();
+        reveal_words_with(&identity, Some(&store)).unwrap();
+        assert_eq!(std::fs::read(&identity).unwrap(), clear, "a reveal never writes");
+
+        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        let text = std::fs::read_to_string(&identity).unwrap();
+        assert!(!text.contains(&HAMSTER_HEX[..16]) && !text.contains("entropy"), "the entropy is gone from the file: {text}");
+        assert!(text.contains(r#""protect":"dpapi""#) && text.contains(&format!(r#""fingerprint":{fp},"at":1730000000,"wrapped_at":"#)));
+        assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "protect", "v", "wrapped_at"]);
+        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"], "no leftovers beside it");
+        #[cfg(unix)]
+        assert_eq!(mode(&identity), 0o600);
+
+        let after = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        assert!(!after.minted);
+        assert_eq!(after.at_rest, AtRest::Dpapi);
+        assert_eq!((after.fingerprint, after.wallet.public_key()), (before.fingerprint, before.wallet.public_key()));
+        let rev = reveal_words_with(&identity, Some(&store)).unwrap();
+        assert_eq!(rev.words().collect::<Vec<_>>().join(" "), HAMSTER);
+
+        let locked = std::fs::read(&identity).unwrap();
+        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Already(AtRest::Dpapi));
+        assert_eq!(std::fs::read(&identity).unwrap(), locked);
+        assert_eq!(store.wraps.load(std::sync::atomic::Ordering::Relaxed), 1, "locked once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A locked file this node cannot open, or one that is damaged, is
+    /// refused with a sentence that says what to keep, and left alone.
+    #[test]
+    fn a_locked_file_that_does_not_open_is_refused_and_left_alone() {
+        use crate::chia_at_rest::{Refusal, StoreError};
+        let store = FakeStore::new();
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let blob = store.wrap(&entropy_of(HAMSTER_HEX), fp).unwrap();
+        let locked = encode_identity(Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+        let short = base64::engine::general_purpose::STANDARD.encode(store.wrap(&[1u8; 32], fp).unwrap()[..20].to_vec());
+        let no_store: Option<&dyn SecretStore> = None;
+        let lost = FakeStore::new();
+        *lost.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::DpapiLost, code: 0x8009_000B });
+        let busy = FakeStore::new();
+        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
+        let cases: Vec<(&str, String, Option<&dyn SecretStore>, &str)> = vec![
+            ("no store here", locked.clone(), no_store, "locked to a Windows account on the computer that made it"),
+            ("another account's", locked.clone(), Some(&lost), "another Windows account or PC"),
+            ("not now", locked.clone(), Some(&busy), "start the node again"),
+            ("entropy beside the blob", locked.replace(r#""blob":"#, &format!(r#""entropy":"{HAMSTER_HEX}","blob":"#)), Some(&store), "refusing to overwrite"),
+            ("no blob", locked.replace(&format!(r#""blob":"{b64}","#), ""), Some(&store), "refusing to overwrite"),
+            ("not base64", locked.replace(&b64, "%%%%"), Some(&store), "refusing to overwrite"),
+            ("an oversized blob", locked.replace(&b64, &"A".repeat(BLOB_MAX + 4)), Some(&store), "refusing to overwrite"),
+            ("opens to 20 bytes", locked.replace(&b64, &short), Some(&store), "refusing to overwrite"),
+            ("another fingerprint", locked.replace(&format!(r#""fingerprint":{fp}"#), &format!(r#""fingerprint":{}"#, fp ^ 1)), Some(&store), "refusing to overwrite"),
+            ("a field this node does not know", locked.replace(r#""at":"#, r#""salt":"x","at":"#), Some(&store), "update Star Station"),
+            ("a clear file that says it was locked", envelope(HAMSTER_HEX, fp).replace(r#""at":"#, r#""wrapped_at":1,"at":"#), Some(&store), "refusing to overwrite"),
+        ];
+        for (why, text, store, says) in cases {
+            let dir = fresh_dir("locked-refuse");
+            let identity = dir.join("chia_identity.json");
+            std::fs::write(&identity, &text).unwrap();
+            let err = format!("{:#}", load_or_mint_wallet_with(&identity, &dir.join("chia_identity.seed"), store).unwrap_err());
+            assert!(err.contains(says), "{why}: {err}");
+            if says != "refusing to overwrite" && says != "update Star Station" && says != "start the node again" {
+                assert!(err.contains("keep this file") && err.contains("move it aside"), "{why}: {err}");
+            }
+            assert!(!err.contains(&b64[..12]) && !err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
+            assert_eq!(std::fs::read_to_string(&identity).unwrap(), text, "{why}: the file is left as it is");
+            assert_eq!(names(&dir), ["chia_identity.json"], "{why}: nothing minted beside it");
+            assert!(reveal_words_with(&identity, store).is_err(), "{why}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Every way a lock does not land leaves the file byte for byte as it
+    /// was, and nothing beside it.
+    #[test]
+    fn a_lock_that_cannot_land_changes_nothing() {
+        use crate::chia_at_rest::{Refusal, StoreError};
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let refuses = FakeStore::new();
+        *refuses.wrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
+        let lies = FakeStore::new();
+        *lies.unwrap_lies.lock().unwrap() = true;
+        let good = FakeStore::new();
+        let no_store: Option<&dyn SecretStore> = None;
+        let cases: Vec<(&str, u32, Policy, Option<&dyn SecretStore>, &str)> = vec![
+            ("no store", fp, Policy::Os, no_store, "no store"),
+            ("policy none", fp, Policy::None, Some(&good), "=none"),
+            ("another wallet", fp ^ 1, Policy::Os, Some(&good), "another wallet"),
+            ("the store refuses", fp, Policy::Os, Some(&refuses), "refused to lock"),
+            ("the store gives back other bytes", fp, Policy::Os, Some(&lies), "other bytes"),
+        ];
+        for (why, key, policy, store, says) in cases {
+            let dir = fresh_dir("wrap-skip");
+            let identity = dir.join("chia_identity.json");
+            let text = envelope(HAMSTER_HEX, fp);
+            std::fs::write(&identity, &text).unwrap();
+            match wrap_at_rest_with(&identity, key, policy, store, &no_stop) {
+                Wrapped::Skipped(reason) => assert!(reason.contains(says), "{why}: {reason}"),
+                other => panic!("{why}: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&identity).unwrap(), text, "{why}");
+            assert_eq!(names(&dir), ["chia_identity.json"], "{why}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Another node holds the lock file.
+        let dir = fresh_dir("wrap-busy");
+        let identity = dir.join("chia_identity.json");
+        let text = envelope(HAMSTER_HEX, fp);
+        std::fs::write(&identity, &text).unwrap();
+        let other = open_lock(&identity).unwrap();
+        other.lock().unwrap();
+        match wrap_at_rest_with(&identity, fp, Policy::Os, Some(&good), &no_stop) {
+            Wrapped::Skipped(reason) => assert!(reason.contains("another node"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        drop(other);
+        assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
+        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
+
+        // The file changes between the read and the rename (another node's
+        // write): the lock gives up, and the new bytes stay.
+        let changed = text.replace("1730000000", "1730000099");
+        let rewrite = |step: Step| {
+            if step == Step::Probed {
+                std::fs::write(&identity, &changed).unwrap();
+            }
+            false
+        };
+        match wrap_at_rest_with(&identity, fp, Policy::Os, Some(&good), &rewrite) {
+            Wrapped::Skipped(reason) => assert!(reason.contains("changed"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&identity).unwrap(), changed);
+        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock stopped at any step, as a crash would stop it, loses nothing:
+    /// the next load opens the same wallet and mints nothing, a leftover is
+    /// kept for a minute and then removed, and the next lock lands.
+    #[test]
+    fn a_lock_stopped_at_any_step_loses_nothing() {
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let store = FakeStore::new();
+        for at in [Step::Read, Step::Sealed, Step::Written, Step::Probed, Step::Locked, Step::Rechecked, Step::Renamed] {
+            let dir = fresh_dir("wrap-stop");
+            let identity = dir.join("chia_identity.json");
+            let legacy = dir.join("chia_identity.seed");
+            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+            let stop = |step: Step| step == at;
+            assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)), "{at:?}");
+            let left: Vec<String> = names(&dir).into_iter().filter(|n| n.contains(".rewrap-")).collect();
+            let expect_left = matches!(at, Step::Written | Step::Probed | Step::Locked | Step::Rechecked);
+            assert_eq!(left.len(), usize::from(expect_left), "{at:?}: {left:?}");
+            assert!(left.iter().all(|n| !n.ends_with(".probe")), "{at:?}: no probe is left");
+
+            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            assert!(!id.minted, "{at:?}");
+            assert_eq!(id.fingerprint, fp, "{at:?}");
+            assert_eq!(id.at_rest, if at == Step::Renamed { AtRest::Dpapi } else { AtRest::None }, "{at:?}");
+            // A fresh leftover may be another node's lock in flight: kept.
+            assert_eq!(names(&dir).iter().filter(|n| n.contains(".rewrap-")).count(), left.len(), "{at:?}");
+            let two_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+            for n in &left {
+                std::fs::File::options().write(true).open(dir.join(n)).unwrap().set_modified(two_minutes_ago).unwrap();
+            }
+            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            assert_eq!((id.fingerprint, id.minted), (fp, false), "{at:?}");
+            assert!(names(&dir).iter().all(|n| !n.contains(".rewrap-")), "{at:?}: the old leftover is removed");
+
+            assert!(
+                matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { .. } | Wrapped::Already(AtRest::Dpapi)),
+                "{at:?}"
+            );
+            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{at:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// With the identity gone and a stopped lock's file beside it, the load
+    /// puts that file back rather than minting a new wallet; a leftover
+    /// that does not open is never put back.
+    #[test]
+    fn a_missing_identity_comes_back_from_a_stopped_locks_file() {
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let store = FakeStore::new();
+        let dir = fresh_dir("wrap-recover");
+        let identity = dir.join("chia_identity.json");
+        let legacy = dir.join("chia_identity.seed");
+        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+        let stop = |step: Step| step == Step::Rechecked;
+        assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
+        std::fs::remove_file(&identity).unwrap();
+        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = fresh_dir("wrap-recover-junk");
+        let identity = dir.join("chia_identity.json");
+        let junk = dir.join(".chia_identity.json.rewrap-1-0");
+        std::fs::write(&junk, b"{\"v\":1").unwrap();
+        let id = load_or_mint_wallet_with(&identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
+        assert!(id.minted, "nothing that opens: a new wallet");
+        assert!(junk.exists(), "a leftover that does not open is left as it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hard link someone made to the clear file keeps the key in the clear
+    /// under that name: the lock says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_says_when_another_name_still_holds_the_clear_file() {
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let store = FakeStore::new();
+        let dir = fresh_dir("wrap-linked");
+        let identity = dir.join("chia_identity.json");
+        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+        std::fs::hard_link(&identity, dir.join("backup.json")).unwrap();
+        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: true });
+        assert!(std::fs::read_to_string(dir.join("backup.json")).unwrap().contains(HAMSTER_HEX));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

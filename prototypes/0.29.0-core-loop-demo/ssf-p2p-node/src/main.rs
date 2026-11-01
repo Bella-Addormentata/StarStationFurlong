@@ -61,6 +61,9 @@ mod board_bundles;
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
 mod chia_wallet;
+// 🔒 The wallet's file locked at rest once its words are saved (Windows DPAPI).
+#[cfg(feature = "chia-publish")]
+mod chia_at_rest;
 #[cfg(feature = "chia-publish")]
 mod chia_publish;
 #[cfg(feature = "chia-publish")]
@@ -1010,11 +1013,21 @@ mod fingerprint_json_tests {
         let cases = [
             (
                 view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true}"#,
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#,
             ),
             (
                 view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true}"#,
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#,
+            ),
+            (
+                view(
+                    true,
+                    EnvSwitch::Unset,
+                    true,
+                    &memo,
+                    &KeyFacts { mnemonic: true, backed_up: true, at_rest: crate::chia_wallet_switch::AtRest::Dpapi, rewrapped: true, ..KeyFacts::default() },
+                ),
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true}"#,
             ),
             (
                 view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }),
@@ -1778,16 +1791,23 @@ async fn main() -> Result<()> {
             chia_wallet_switch::dev_pages().join(", ")
         );
     }
+    // 🔒 How the wallet's file is kept at rest (chia_at_rest.rs), said once.
+    #[cfg(feature = "chia-publish")]
+    match chia_at_rest::policy() {
+        Ok(policy) => {
+            if let Some(line) = chia_at_rest::policy_line(policy, chia_at_rest::os_store().map(|s| s.protect())) {
+                println!("{line}");
+            }
+        }
+        Err(why) => eprintln!("🏦 SSF wallet: {why}"),
+    }
     #[cfg(feature = "chia-publish")]
     if wallet_starts {
-        match chia_wallet::load_or_mint_wallet(
-            std::path::Path::new(chia_wallet_switch::IDENTITY_FILE),
-            std::path::Path::new(chia_wallet_switch::LEGACY_SEED_FILE),
-        ) {
-            Ok(id) => {
+        match load_wallet() {
+            Ok((id, meta)) => {
                 let chia_sk = id.wallet.clone();
                 announce_wallet(&id);
-                startup_wallet_meta = Some(wallet_meta_of(&id));
+                startup_wallet_meta = Some(meta);
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
                 // a restart, and the restored parking keeps its inputs, and a
@@ -5664,6 +5684,9 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
                 mnemonic: true,
                 backed_up: meta.backed_up,
                 reminted: meta.reminted,
+                at_rest: meta.at_rest,
+                at_rest_next: chia_at_rest::next_lock(chia_at_rest::policy(), chia_at_rest::os_store().map(|s| s.protect())),
+                rewrapped: meta.rewrapped,
                 ..Default::default()
             },
             (true, None) => chia_wallet_switch::KeyFacts::default(),
@@ -5717,7 +5740,86 @@ fn wallet_meta_of(id: &chia_wallet::WalletIdentity) -> chia_wallet_switch::Walle
             false
         }
     };
-    chia_wallet_switch::WalletMeta { fingerprint: id.fingerprint, backed_up, reminted: id.retired.is_some(), revealed: false }
+    chia_wallet_switch::WalletMeta {
+        fingerprint: id.fingerprint,
+        backed_up,
+        reminted: id.retired.is_some(),
+        revealed: false,
+        at_rest: id.at_rest,
+        rewrapped: false,
+    }
+}
+
+/// 🏦 Load the wallet (minting it once), then lock its file if its words are
+/// saved ([`lock_if_due`]): at startup and when the Bank turns it on.
+/// Blocking. A `SSF_WALLET_AT_REST` that is neither `os` nor `none` loads
+/// nothing, so a typo cannot quietly leave a file in the clear.
+#[cfg(feature = "chia-publish")]
+fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::WalletMeta)> {
+    let policy = chia_at_rest::policy().map_err(|why| anyhow!(why))?;
+    let mut id = chia_wallet::load_or_mint_wallet(
+        std::path::Path::new(chia_wallet_switch::IDENTITY_FILE),
+        std::path::Path::new(chia_wallet_switch::LEGACY_SEED_FILE),
+    )?;
+    let mut meta = wallet_meta_of(&id);
+    lock_if_due(&mut meta, policy);
+    id.at_rest = meta.at_rest;
+    Ok((id, meta))
+}
+
+/// 🔒 Lock the loaded wallet's file with this computer's store when its
+/// words are saved, it is still in the clear and the policy allows it
+/// (chia_at_rest::should_wrap), and note in `meta` what the file is now.
+/// Blocking; one at a time in this process. A lock that does not land
+/// changes nothing and is tried again at the next start.
+#[cfg(feature = "chia-publish")]
+fn lock_if_due(meta: &mut chia_wallet_switch::WalletMeta, policy: chia_at_rest::Policy) {
+    static LOCKING: Mutex<()> = Mutex::new(());
+    let _one = LOCKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store = chia_at_rest::os_store().map(|s| s.protect());
+    if !chia_at_rest::should_wrap(meta.backed_up, meta.at_rest, policy, store) {
+        return;
+    }
+    let identity = std::path::Path::new(chia_wallet_switch::IDENTITY_FILE);
+    let outcome = chia_wallet::wrap_at_rest(identity, meta.fingerprint, policy);
+    chia_wallet::log_wrapped(identity, &outcome);
+    match outcome {
+        chia_wallet::Wrapped::Done { .. } => {
+            meta.at_rest = store.unwrap_or_default();
+            meta.rewrapped = true;
+        }
+        chia_wallet::Wrapped::Already(at_rest) => meta.at_rest = at_rest,
+        chia_wallet::Wrapped::Skipped(_) => {}
+    }
+}
+
+/// 🔒 Right after the player marked the words of `key` saved: lock the
+/// file, then keep what it is now in the hub's meta (for the same key only).
+#[cfg(feature = "chia-publish")]
+async fn lock_after_save(hub: &SharedHub, key: u32) {
+    let Ok(policy) = chia_at_rest::policy() else {
+        return;
+    };
+    let Some(meta) = *hub.wallet_meta.lock().unwrap() else {
+        return;
+    };
+    if meta.fingerprint != key {
+        return;
+    }
+    let locked = tokio::task::spawn_blocking(move || {
+        let mut meta = meta;
+        lock_if_due(&mut meta, policy);
+        meta
+    })
+    .await;
+    if let Ok(locked) = locked {
+        if let Some(m) = hub.wallet_meta.lock().unwrap().as_mut() {
+            if m.fingerprint == key {
+                m.at_rest = locked.at_rest;
+                m.rewrapped |= locked.rewrapped;
+            }
+        }
+    }
 }
 
 /// Start the heartbeat publisher for the loaded wallet: at startup, or when
@@ -5790,17 +5892,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     }
     let loaded = hub.chia_wallet.lock().unwrap().is_some();
     if !loaded {
-        let minted = tokio::task::spawn_blocking(|| {
-            chia_wallet::load_or_mint_wallet(
-                std::path::Path::new(chia_wallet_switch::IDENTITY_FILE),
-                std::path::Path::new(chia_wallet_switch::LEGACY_SEED_FILE),
-            )
-            .map(|id| {
-                let meta = wallet_meta_of(&id);
-                (id, meta)
-            })
-        })
-        .await;
+        let minted = tokio::task::spawn_blocking(load_wallet).await;
         let (id, meta) = match minted {
             Ok(Ok(loaded)) => loaded,
             Ok(Err(e)) => return fail(format!("the wallet could not be loaded: {e:#}")),
@@ -5924,6 +6016,7 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
             let failed = match saved {
                 Ok(Ok(())) => {
                     mark();
+                    lock_after_save(hub, asked).await;
                     return plain(saved_answer(&wallet_switch_view(hub).0, None));
                 }
                 Ok(Err(e)) => e.to_string(),
@@ -5938,6 +6031,7 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                 FailedMark::Landed { note } => {
                     mark();
                     eprintln!("🏦 SSF wallet: the saved mark was written but not confirmed on disk ({failed})");
+                    lock_after_save(hub, asked).await;
                     plain(saved_answer(&wallet_switch_view(hub).0, Some(&note)))
                 }
                 FailedMark::Lost { error } => {

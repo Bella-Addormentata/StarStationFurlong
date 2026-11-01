@@ -125,6 +125,11 @@ curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false }
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"], optional = true }
 url = { version = "2", optional = true }
 
+# 🔒 Windows DPAPI locks the SSF wallet's file at rest once its 24 words are
+# saved (chia_at_rest.rs). Already in the lockfile through other crates.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [dev-dependencies]
 # The tests' mock full node builds a header block, whose BLS fields need the
 # crate the publish feature makes optional.
@@ -144,14 +149,15 @@ chia-read = [
     "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
 ]
-# Chain WRITES: the SSF wallet's 24-word identity + `txch1…` address, spend-to-self publish,
+# Chain WRITES: the SSF wallet's 24-word identity + `txch1…` address (its file
+# locked by DPAPI on Windows once the words are saved), spend-to-self publish,
 # the craps fairness hook and the treasury codec tests. Runtime-gated by the
 # SSF wallet switch (the Bank's TURN ON, remembered in chia_wallet.json;
 # SSF_CHIA_LANE=1 holds it on, any other value off — chia_wallet_switch.rs).
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
-    "dep:bip39", "dep:zeroize",
+    "dep:bip39", "dep:zeroize", "dep:windows-sys",
 ]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]

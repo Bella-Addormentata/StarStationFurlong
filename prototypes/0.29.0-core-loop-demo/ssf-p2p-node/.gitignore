@@ -6,6 +6,10 @@ iroh_node_id.key
 chia_identity.json
 chia_identity.seed
 chia_identity.seed.retired-*
+# 🔒 A stopped lock's copy of the identity (chia_wallet.rs, wrap_at_rest),
+# and the lock file two nodes locking it take in turn.
+.chia_identity.json.rewrap-*
+.chia_identity.json.lock
 wallet_lease.json
 # 🏦 The SSF wallet switch the Bank remembers, and the player's "I saved the
 # 24 words" (chia_wallet_switch.rs)
