@@ -243,6 +243,7 @@ import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
 import { createCheckersTableLayer } from "./checkersSession";
 import { createChessTableLayer, paintGameTable } from "./chessSession";
 import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet";
+import { standbyPicture } from "./arcadeStandby";
 // 🕹️ Shared arcade games: every cabinet's game runs on every page in the
 // room from the host's button presses (arcadeNesSession.ts).
 import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
@@ -6667,10 +6668,14 @@ export class World {
         openLink: wide ? () => linkNativeArcade(deviceId, seat) : undefined,
         keys: own.controls,
         notice: wide ? undefined : "MADE FOR THE DOUBLE-WIDE CABINET",
+        // Its own title, as the idle cabinet shows it (#333): drawn for the
+        // double-wide's 8:3 screen, so only there.
+        standby: wide ? { kind: "title", lines: own.lines, paint: own.paintTitle } : undefined,
         requestRelease: () => deviceFocus.release(),
       });
     }
-    if (view === "play" && builtInEntry(readCabinet(deviceId).game)) {
+    const lib = view === "play" ? builtInEntry(readCabinet(deviceId).game) : null;
+    if (lib) {
       return createNesCabinetUI({
         itemId: deviceId,
         visual: this.arcadeCabinetVisuals.get(deviceId),
@@ -6680,6 +6685,9 @@ export class World {
         onPlay: () => countBuiltInPlay(deviceId),
         seat: seat === 1 ? 1 : 0,
         seats,
+        // The game's own standby screen — title and menu — in the menu's
+        // place (#333); the game starts from it (arcadeNesSession).
+        standby: { kind: "picture", picture: () => standbyPicture(lib.id) },
         requestRelease: () => deviceFocus.release(),
       });
     }

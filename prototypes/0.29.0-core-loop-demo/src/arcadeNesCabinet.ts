@@ -1,10 +1,15 @@
 /**
  * 🕹️ The arcade cabinet's focus UI for a BUILT-IN game: step up to the
  * cabinet and its one game — the owner's pick (arcadeDoc) — comes up ON the
- * cabinet's own screen, no popup. Press Enter (or Start) and it plays.
+ * cabinet's own screen, no popup: the game's own standby screen, its title
+ * and menu (#333), with a band saying what to press. Press Enter (or Start)
+ * and the game comes to life right there, on its own menu.
  *
- *   MENU     the cabinet's game, then CREDITS & LICENSES · ↑/↓ choose ·
- *            Enter or X play
+ *   STANDBY  the game's standby screen · Enter or X play · Shift (Select)
+ *            the CREDITS & LICENSES · the D-pad moves nothing: the picture
+ *            is the game's own menu, which works once the game is live
+ *            (without a standby — tests — the MENU: the game, then the
+ *            credits, ↑/↓ choose)
  *   PLAYING  the NES pad; Backspace (or Select+Start held on a gamepad)
  *            ends the game and returns to the menu
  *   ⚙️       the strip's SETTINGS button: what the owner set (World swaps
@@ -27,7 +32,7 @@
 import { ARCADE_GAMES, LICENSE_LABEL, type CabinetGame } from './arcadeLibrary';
 import type { NesButton, NesPlayer } from './arcadeMachine';
 import { padByte } from './arcadeNet';
-import { CREDIT_PAGES, type ArcadeMenuRow } from './arcadeScreen';
+import { CREDIT_PAGES, NES_H, NES_W, type ArcadeMenuRow, type ArcadeScreenPainter, type StandbyBand } from './arcadeScreen';
 import { linkArcade, type ArcadeLink, type SharedView } from './arcadeNesSession';
 import { ArcadeSpeaker } from './arcadeSpeaker';
 import type { ArcadeCabinetVisualHandle, DeviceUI } from './devices';
@@ -72,9 +77,24 @@ export type MenuAction =
   | { kind: 'none' }
   | { kind: 'start'; game: CabinetGame };
 
-/** A button pressed while the menu or credits are up. */
-export function menuInput(view: ArcadeView, button: NesButton, menu: readonly MenuEntry[]): { view: ArcadeView; action: MenuAction } {
+/**
+ * A button pressed while the menu or credits are up. On the game's STANDBY
+ * screen (`standby`, #333) the picture is the game's own menu, so the D-pad
+ * moves nothing there (a player reaching for the game's cursor must not
+ * land on the credits): Start or A plays, Select opens the credits.
+ */
+export function menuInput(
+  view: ArcadeView, button: NesButton, menu: readonly MenuEntry[], standby = false,
+): { view: ArcadeView; action: MenuAction } {
   const none = { kind: 'none' } as const;
+  if (view.screen === 'menu' && standby) {
+    const game = menu.find((e) => e.kind === 'game');
+    if ((button === 'START' || button === 'A') && game?.kind === 'game') return { view, action: { kind: 'start', game: game.game } };
+    if (button === 'SELECT' && menu.some((e) => e.kind === 'credits')) {
+      return { view: { screen: 'credits', page: firstCreditPage(menu) }, action: none };
+    }
+    return { view, action: none };
+  }
   if (view.screen === 'menu') {
     const n = menu.length;
     if (button === 'UP') return { view: { ...view, cursor: (view.cursor + n - 1) % n, status: null }, action: none };
@@ -96,7 +116,8 @@ export function menuInput(view: ArcadeView, button: NesButton, menu: readonly Me
       return { view: { screen: 'credits', page: (view.page + 1) % CREDIT_PAGES }, action: none };
     }
     if (button === 'START' || button === 'A' || button === 'B') {
-      return { view: { screen: 'menu', cursor: menu.findIndex((e) => e.kind === 'credits'), status: null }, action: none };
+      const cursor = standby ? 0 : menu.findIndex((e) => e.kind === 'credits');
+      return { view: { screen: 'menu', cursor, status: null }, action: none };
     }
   }
   return { view, action: none };
@@ -107,7 +128,16 @@ export function menuInput(view: ArcadeView, button: NesButton, menu: readonly Me
  * the menu and credits are painted into a 3D texture, which assistive tech
  * cannot read.
  */
-export function describeView(view: ArcadeView, menu: readonly MenuEntry[]): string {
+export function describeView(view: ArcadeView, menu: readonly MenuEntry[], standby = false): string {
+  if (view.screen === 'menu' && standby) {
+    const game = menu.find((e) => e.kind === 'game');
+    const credits = menu.some((e) => e.kind === 'credits') ? ', Shift shows the credits' : '';
+    const parts = game?.kind === 'game'
+      ? [`${game.game.title}, its title screen. Enter plays${credits}.`, game.game.blurb, game.game.controls]
+      : [];
+    if (view.status) parts.unshift(`${view.status}.`);
+    return parts.join(' ');
+  }
   if (view.screen === 'menu') {
     const row = menuRows(menu)[view.cursor];
     const parts = row ? [`${row.label}, ${view.cursor + 1} of ${menu.length}.`, ...(row.detail ?? [])] : [];
@@ -179,6 +209,29 @@ export function connectedPads(): Gamepad[] {
   }
 }
 
+/** What the band under the standby picture says, for the menu `view`:
+ *  PRESS START blinking (or why there's nothing to play), and the way to
+ *  the credits where the game has a page there. */
+export function standbyBand(
+  view: Extract<ArcadeView, { screen: 'menu' }>, menu: readonly MenuEntry[], blink: boolean,
+): StandbyBand {
+  const right = menu.some((e) => e.kind === 'credits') ? 'SELECT CREDITS' : undefined;
+  if (view.status) return { centre: view.status, on: true, right };
+  return { centre: 'PRESS START', on: blink, right };
+}
+
+/** The game's standby screen at the cabinet, for the UI to show on step-up. */
+export type CabinetStandby =
+  /** A bundled ROM's: a picture of its title screen, null until it loads. */
+  | { kind: 'picture'; picture: () => CanvasImageSource | null }
+  /** A cabinet's own game draws its title itself, `line` under it while
+   *  `blink` is on, in its own picture's rows. */
+  | {
+    kind: 'title';
+    lines: readonly [number, number];
+    paint: (ctx: CanvasRenderingContext2D, line: string, blink: boolean, w: number, h: number) => void;
+  };
+
 // ── The focus UI ─────────────────────────────────────────────────────────────
 
 export interface ArcadeCabinetUIDeps {
@@ -211,13 +264,20 @@ export interface ArcadeCabinetUIDeps {
   keys?: string;
   /** The menu's status line when it opens (why there's nothing to play). */
   notice?: string;
+  /** The game's standby screen, shown in the menu's place (absent: the
+   *  menu, as a list). */
+  standby?: CabinetStandby;
 }
 
 const STRIP_MENU = 'ENTER PLAY · ↑↓ CHOOSE · ESC LEAVE';
+const STRIP_STANDBY = 'ENTER PLAY · SHIFT CREDITS · ESC LEAVE';
+const STRIP_STANDBY_OWN = 'ENTER PLAY · ESC LEAVE';
+const STRIP_CREDITS = '◀▶ PAGE · ENTER BACK · ESC LEAVE';
 const STRIP_KEYS = 'WASD + N M  OR  ARROWS + Z X · ENTER START · SHIFT SELECT';
 
-function stripFor(view: ArcadeView, keys = STRIP_KEYS): string {
-  if (view.screen !== 'shared') return STRIP_MENU;
+function stripFor(view: ArcadeView, keys = STRIP_KEYS, standby: 'none' | 'credits' | 'own' = 'none'): string {
+  if (view.screen === 'credits') return standby === 'none' ? STRIP_MENU : STRIP_CREDITS;
+  if (view.screen !== 'shared') return standby === 'none' ? STRIP_MENU : standby === 'credits' ? STRIP_STANDBY : STRIP_STANDBY_OWN;
   if (view.phase === 'ended') return 'PLAYER 1 LEFT · ESC LEAVE';
   if (view.phase === 'loading') return 'LOADING… · ESC LEAVE';
   if (view.phase === 'joining') return 'JOINING THE GAME… · ESC LEAVE';
@@ -238,6 +298,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
   /** The game this UI was built for; the menu is its game and the credits. */
   const game = currentGame();
   const menu = menuFor(game);
+  /** The menu is the game's standby screen (#333): its input and words. */
+  const standby = deps.standby !== undefined && game !== null;
+  const stripMode = !standby ? 'none' : menu.some((e) => e.kind === 'credits') ? 'credits' : 'own';
 
   let view: ArcadeView = { screen: 'menu', cursor: 0, status: null };
   /** The menu row last selected, so leaving a game lands back on it. */
@@ -273,9 +336,9 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     view = next;
     if (next.screen === 'menu') menuCursor = next.cursor;
     dirty = true;
-    if (stripText) stripText.textContent = stripFor(next, deps.keys);
+    if (stripText) stripText.textContent = stripFor(next, deps.keys, stripMode);
     if (spoken) {
-      const words = describeView(next, menu);
+      const words = describeView(next, menu, standby);
       if (spoken.textContent !== words) spoken.textContent = words;
     }
     // The UI's own screens are painted here; the shared game is painted by
@@ -284,11 +347,37 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
     link?.setAudio(speaker?.push ?? null, speaker?.sampleRate ?? 48000);
   };
 
+  /** The menu as the game's standby screen: its own title (a cabinet's own
+   *  game), its picture once that has loaded, or its name until then. */
+  const paintStandby = (p: ArcadeScreenPainter, v: Extract<ArcadeView, { screen: 'menu' }>): void => {
+    const art = deps.standby!;
+    if (art.kind === 'title') {
+      const line = v.status ?? 'PRESS START';
+      deps.visual?.setPictureLines?.(art.lines[0], art.lines[1]);
+      p.drawWith((ctx, w, h) => art.paint(ctx, line, v.status !== null || blinkOn, w, h));
+      return;
+    }
+    deps.visual?.setPictureLines?.(NES_W, NES_H);
+    const picture = art.picture();
+    if (picture) p.drawStandby(picture, standbyBand(v, menu, blinkOn));
+    else p.drawCard(game!.title, v.status ?? (blinkOn ? 'PRESS START' : ''));
+  };
+
   const paint = () => {
     if (!painter) return;
-    if (view.screen === 'menu') painter.drawMenu(menuRows(menu), view.cursor, view.status, blinkOn);
-    else if (view.screen === 'credits') painter.drawCredits(view.page);
-    else return; // the shared game: the session paints it
+    if (view.screen === 'menu') {
+      if (standby) {
+        paintStandby(painter, view);
+      } else {
+        deps.visual?.setPictureLines?.(NES_W, NES_H);
+        painter.drawMenu(menuRows(menu), view.cursor, view.status, blinkOn);
+      }
+    } else if (view.screen === 'credits') {
+      deps.visual?.setPictureLines?.(NES_W, NES_H);
+      painter.drawCredits(view.page);
+    } else {
+      return; // the shared game: the session paints it
+    }
     present();
     dirty = false;
   };
@@ -323,7 +412,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
 
   /** A press while the menu/credits are up. */
   const menuPress = (button: NesButton) => {
-    const { view: next, action } = menuInput(view, button, menu);
+    const { view: next, action } = menuInput(view, button, menu, standby);
     if (next !== view) setView(next);
     if (action.kind === 'start') startShared(action.game);
   };
@@ -463,7 +552,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
         color:#7CFFB0; font:12px 'SF Mono','Monaco','Consolas',monospace;
         box-sizing:border-box; pointer-events:auto;`;
       stripText = document.createElement('span');
-      stripText.textContent = stripFor(view, deps.keys);
+      stripText.textContent = stripFor(view, deps.keys, stripMode);
       const leave = document.createElement('button');
       leave.textContent = 'LEAVE';
       leave.style.cssText = `
@@ -493,7 +582,7 @@ export function createArcadeCabinetUI(deps: ArcadeCabinetUIDeps): DeviceUI {
       spoken.style.cssText = `
         position:absolute; width:1px; height:1px; overflow:hidden;
         clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;`;
-      spoken.textContent = describeView(view, menu);
+      spoken.textContent = describeView(view, menu, standby);
       strip.append(...[stripText, settings, leave, spoken].filter((el): el is HTMLElement => el !== null));
       host.append(capture, strip);
 

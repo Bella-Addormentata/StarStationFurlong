@@ -39,6 +39,7 @@ import {
 } from './games/arcade';
 import { readArcade, readArcadeMatches, readArcadeSnapshot, writeArcade, writeArcadeSnapshot } from './games/gamesDoc';
 import { casinoDocEpoch } from './casinoDoc';
+import { standbyPicture } from './arcadeStandby';
 import { getPlayerId } from './identity';
 import type { ArcadeCabinetVisualHandle } from './devices';
 
@@ -315,6 +316,14 @@ function newCopy(
         onAudioSample: (l, r) => s.link?.audio?.(l, r),
       });
       if (!machine.load(rom).ok) {
+        failed();
+        return;
+      }
+      // Frame 0 of every match is the game's standby screen, the picture
+      // the idle cabinet showed: every copy runs the same way there first.
+      try {
+        machine.toStandby(game.standby);
+      } catch {
         failed();
         return;
       }
@@ -638,8 +647,9 @@ function followFrame(itemId: string, s: CabinetSession, copy: Copy, m: ArcadeMat
   if (hostSilentFor(s, copy, now) > HOST_SILENT_MS) return; // nothing to run until the host is back
 
   if (!copy.started && !copy.needSync) {
-    // Heard the match from its first frame: run it from power-on. (A frame
-    // 0 in an older match is the clock wrapping: that needs a save state.)
+    // Heard the match from its first frame: run it from there, the standby
+    // screen. (A frame 0 in an older match is the clock wrapping: that needs
+    // a save state.)
     const young = now - m.startedAt < FIRST_FRAME_WITHIN_MS;
     if (young && copy.log.has(0) && copy.log.latest !== null && frameDiff(copy.log.latest, 0) < 4096) copy.started = true;
     else if (copy.log.latest !== null) copy.needSync = true;
@@ -763,9 +773,13 @@ function paint(s: CabinetSession, m: ArcadeMatch | null, now: number, viewer: { 
     s.shown = key;
     draw();
   };
+  // While its game isn't running here, the cabinet keeps the game's standby
+  // picture up (once it has loaded), saying why under it.
+  const picture = copy ? standbyPicture(copy.game.id) : null;
   const card = (line: string) =>
-    show(`card:${copy?.game.title}:${line}`, () => {
-      s.handle.painter.drawCard(copy?.game.title ?? 'SSF ARCADE', line);
+    show(`card:${copy?.game.title}:${line}:${picture ? 'standby' : 'words'}`, () => {
+      if (picture) s.handle.painter.drawStandby(picture, { centre: line, on: true });
+      else s.handle.painter.drawCard(copy?.game.title ?? 'SSF ARCADE', line);
       s.handle.present();
     });
   if (!copy || (copy.role === 'follow' && !m)) {

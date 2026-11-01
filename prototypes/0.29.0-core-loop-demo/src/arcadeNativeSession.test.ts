@@ -77,6 +77,7 @@ async function openPage(name: string): Promise<Page> {
   mod.registerNativeArcadeVisual(ITEM, {
     painter: {
       drawFrame: () => undefined,
+      drawStandby: () => undefined,
       drawMenu: () => undefined,
       drawCredits: () => undefined,
       drawCard: () => undefined,
@@ -610,7 +611,7 @@ describe('the double-wide cabinet\'s own game, four players', () => {
     // Eighteen minutes of frames, quickly: one page, a screen that keeps nothing.
     a.mod.registerNativeArcadeVisual(ITEM, {
       painter: {
-        drawFrame: () => undefined, drawMenu: () => undefined, drawCredits: () => undefined,
+        drawFrame: () => undefined, drawStandby: () => undefined, drawMenu: () => undefined, drawCredits: () => undefined,
         drawCard: () => undefined, drawAttract: () => undefined, drawWith: () => undefined,
       },
       present: () => undefined, showAttract: () => undefined, setPictureLines: () => undefined,
