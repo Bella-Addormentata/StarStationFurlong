@@ -116,6 +116,11 @@ export const MAX_FORFEITS_PER_CLOSE = 32;
 export const MAX_SESSION_ROUNDS = 500;
 /** Players a checkpoint may carry. */
 export const MAX_CHECKPOINT_PIDS = 4_096;
+/** Players an honest closer lets a table reach (its checkpoint's nets and
+ *  every slip its session froze): a newcomer past them isn't frozen
+ *  (computedTable closeDuty), so the next checkpoint's nets stay under
+ *  MAX_CHECKPOINT_PIDS and trims go on. */
+export const MAX_TABLE_PIDS = 4_000;
 /** Slip hashes one house reveal may count (`n`): two closes' worth. */
 export const MAX_HOUSE_COUNTED = 2 * MAX_FROZEN + 2;
 
@@ -314,9 +319,14 @@ export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n'
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v1|${c}`))).slice(0, 24);
 }
 
+/** A duty pages take in turn: dutyRank orders them for each. 'restore' puts
+ *  back a checkpoint a peer deleted or rewound, 'open' a deleted session
+ *  (computedTable recoverDuty). */
+export type Duty = 'close' | 'forfeit' | 'abandon' | 'trim' | 'restore' | 'open';
+
 /** Turn order for a duty: sha256 hex of `ssf-ct-rank-v1|<duty>|<room>|<t>|<inc>|<round>|<pub>`.
  *  Lower goes first. */
-export function dutyRank(duty: 'close' | 'forfeit' | 'abandon' | 'trim', ctx: FoldCtx, round: number, pub: string): string {
+export function dutyRank(duty: Duty, ctx: FoldCtx, round: number, pub: string): string {
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-rank-v1|${duty}|${ctx.room}|${ctx.t}|${ctx.inc}|${round}|${pub}`)));
 }
 

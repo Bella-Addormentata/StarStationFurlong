@@ -225,7 +225,7 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, gameOfInc, nextSid, parseKey, recHash, TableFold } from './computedFold';
+import { asCheckpointFor, gameOfInc, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
@@ -2118,9 +2118,22 @@ interface ComputedInc {
    *  changed then wasn't applied. */
   stale: boolean;
   /** What computedLost goes by: the session this page last counted from
-   *  (null for none), and whether it has counted a checkpoint. */
+   *  (null for none). */
   countedSid: string | null;
-  countedCp: boolean;
+  /** The last CHAIN_KEPT checkpoints this page counted of it, each as the
+   *  doc held it, oldest first: the last is its head (heldBase). One that
+   *  reads as a rewind or a jump of the head (recoveryTrigger) never
+   *  becomes one, so the head is only ever followed forward. */
+  chain: Counted[];
+  /** ⚠ The rounds this page gave up on when the session they were decided
+   *  in was deleted with nothing in its place (giveUpComputed), until the
+   *  next checkpoint. */
+  gaveUp: { sid: string; from: number; to: number } | null;
+  /** How many counts found the doc's checkpoint of it putting no restore in
+   *  motion (recoveryTrigger null): a restore's wait starts afresh once one
+   *  did, though the recovery duty never looked at the doc meanwhile (the
+   *  head put back by another page, then junk again in one tick). */
+  calm: number;
   /** The result last counted (null: none yet), and whether its felts held
    *  then (the incarnation was live). */
   last: FoldResult | null;
@@ -2128,6 +2141,90 @@ interface ComputedInc {
   /** When this page first saw each record key in the live session
    *  (Date.now()): computedSeenAt. */
   seen: Map<string, number>;
+  /** The sessions of the jumps this page refuted (recoveryTrigger 'jump'),
+   *  and of every checkpoint it saw built on one, the last REFUTED_KEPT:
+   *  no honest page writes a jump, so nothing built on one is honest, and
+   *  a trim of a jump's session (by a page that counted it: an earlier
+   *  build's, or one that came while it stood) is restored over too. */
+  refuted: string[];
+  /** 🩹 The sessions of the heads this page gave way over (noteCounted: it
+   *  took them at load, and the pages that counted the head put theirs
+   *  back), the last REFUTED_KEPT: one of them written again is taken as
+   *  at load again (Counted firmAt), not as the head it once was. */
+  dropped: string[];
+  /** 🩹 The hashes of slips whose players may have let them go, seeds and
+   *  all, as a page of an earlier build does when the table moves on from
+   *  their session (noteDoubted), the last DOUBTED_KEPT: should that session
+   *  come back, this page's closes freeze none of them but its own
+   *  player's (computedTable closeDuty), and their stakes go back instead
+   *  of being forfeited. */
+  doubted: Set<string>;
+  /** Whether a rewind or a jump stood at this page's last count
+   *  (recoveryTrigger): its head back, noteDoubted. */
+  forged: boolean;
+}
+
+/** A checkpoint this page counted: the value the doc held (put back as it
+ *  is: every page that counted it writes the same bytes), as read, the
+ *  session it opens, and the signers of every felt this page counted in
+ *  that session (at most MAX_TABLE_PIDS): the players who take turns at
+ *  putting it back, though a rewind or a jump has the page counting
+ *  another session meanwhile (computedRecoveries pubs). */
+interface Counted {
+  value: object;
+  cp: Checkpoint;
+  sid: string;
+  pubs: Set<string>;
+  /** 🩹 From when this page puts it back over a rewind (its time, as
+   *  counted): 0 for a checkpoint it saw come, built on the session it was
+   *  counting from, or after one it put back so; TAKEN_WAIT_MS after it
+   *  took one it never saw come (at load, mostly), for it and what comes
+   *  after it meanwhile. Until then a rewind the page can't tell from the
+   *  head others counted gives way (noteCounted). */
+  firmAt: number;
+  /** 🩹 Whether this page SAW this checkpoint come — built on the session it
+   *  was counting from, or extending one it saw come — rather than taking it
+   *  at load. A seen head is grounded: a rewind of it is a forgery (its
+   *  session refuted, noteCounted; it is defended, never given way). An
+   *  unseen head (load-taken) can't be told from a peer's replay, so it gives
+   *  way — within TAKEN_WAIT_MS of load (firmAt), and, past that (a
+   *  partition outlasting the window), once its restore keeps losing to a
+   *  persistent rival the room puts back over it (computedTable restoreStep →
+   *  giveWayComputed), which no fixed timeout can cover. */
+  seen: boolean;
+}
+
+/** Checkpoints of an incarnation kept to put back (ComputedInc chain). */
+export const CHAIN_KEPT = 8;
+/** Refuted sessions kept per incarnation (ComputedInc refuted), and the
+ *  sessions of heads given way over (ComputedInc dropped). */
+const REFUTED_KEPT = 64;
+/** 🩹 How long a checkpoint this page never saw come (it was there when the
+ *  page loaded) gives way to a rewind (Counted firmAt): longer than the
+ *  longest a page that counted the head before a peer's jump waits to put
+ *  it back (computedTable RESTORE_WAIT_MS + RECOVERY_PLACES × STAGGER_MS +
+ *  OUTSIDER_WAIT_MS), so the head such a page puts back is never fought
+ *  over by a page that took the jump. */
+export const TAKEN_WAIT_MS = 45_000;
+/** Doubted slips kept per incarnation (ComputedInc doubted). */
+const DOUBTED_KEPT = 1_024;
+
+/** What sets a checkpoint's restore going (recoveryTrigger). */
+export type RecoveryTrigger = 'junk' | 'rewind' | 'jump';
+
+/** 🧪 Whether this page holds its base, and the recovery duties run
+ *  (computedTable recoverDuty): off, it reads as v0.50 pages do, a deleted
+ *  checkpoint freezing the table (computedLost). The sims' older pages. */
+let recoveryOn = true;
+
+/** 🧪 Hold the base and recover (true, the default), or read as v0.50 does. */
+export function setComputedRecoveryForTests(on: boolean | null): void {
+  recoveryOn = on ?? true;
+}
+
+/** Whether this page holds its base and runs the recovery duties. */
+export function computedRecoveryOn(): boolean {
+  return recoveryOn;
 }
 
 let computedIncs = new Map<string, ComputedInc>();
@@ -2211,6 +2308,213 @@ function liveSidOf(c: ComputedInc, cp: Checkpoint | null): string {
   return c.sidOf.sid;
 }
 
+/** The checkpoint incarnation `c` counts from: the doc's, or while the doc
+ *  holds none (deleted, or junk in its place: no build writes either) the
+ *  head this page counted (the held base). The page folds from it, and
+ *  writes into the session it opens, while the recovery duty puts it back
+ *  (computedTable recoverDuty), so a peer's delete or junk loop stops no
+ *  table on it: its counts are the ones every page reaches once the head
+ *  is back. A page that never counted one reads the doc as it is. */
+function heldBase(c: ComputedInc, map: Y.Map<unknown>): Checkpoint | null {
+  const cp = checkpointAt(map, c.t, c.inc);
+  if (cp !== null || !recoveryOn || c.chain.length === 0) return cp;
+  return c.chain[c.chain.length - 1].cp;
+}
+
+/** heldBase of incarnation `inc` of table `tableId`: the doc's checkpoint
+ *  for one this page doesn't track. */
+function baseOf(tableId: string, inc: string): Checkpoint | null {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  return c ? heldBase(c, computedMap!) : checkpointAt(computedMap!, tableId, inc);
+}
+
+/** What puts a recovery in motion at incarnation `c`, read from the doc's
+ *  checkpoint `cp` (null: none, or junk) against this page's head:
+ *  - 'junk': none, though this page counted one (put back at once, in turn);
+ *  - 'rewind': a live one below the head (a replay, or the lower of two
+ *    rival trims: no honest trim goes back);
+ *  - 'jump': a live one on the session of a checkpoint this page counted
+ *    (any in its chain) more than MAX_SESSION_ROUNDS past it (no session
+ *    reaches further, so no honest trim does), or one built on a session
+ *    this page refuted so (ComputedInc refuted).
+ *  Null for the head itself, for anything else, an end above all (no
+ *  restore touches an `e: 1`) and an extension of the head no page can
+ *  tell from an honest one. */
+function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+  const head = c.chain[c.chain.length - 1];
+  if (!head) return null;
+  if (cp === null) return 'junk';
+  if (cp.e === 1) return null;
+  if (cp.u < head.cp.u) return 'rewind';
+  if (liveSidOf(c, cp) === head.sid) return null;
+  if (c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return 'jump';
+  return null;
+}
+
+/** Whether `cp` is a jump over counted checkpoint `e`: on the session `e`
+ *  opens, more than MAX_SESSION_ROUNDS past it. */
+function jumpsOver(cp: Checkpoint, e: Counted): boolean {
+  return cp.b === e.sid && cp.u - e.cp.u > MAX_SESSION_ROUNDS;
+}
+
+/** Refute session `sid` of incarnation `c` (ComputedInc refuted). */
+function refute(c: ComputedInc, sid: string): void {
+  if (c.refuted.includes(sid)) return;
+  c.refuted.push(sid);
+  if (c.refuted.length > REFUTED_KEPT) c.refuted.shift();
+}
+
+/** 🩹 Note the head of session `sid` as given way over (ComputedInc
+ *  dropped). */
+function drop(c: ComputedInc, sid: string): void {
+  if (c.dropped.includes(sid)) return;
+  c.dropped.push(sid);
+  if (c.dropped.length > REFUTED_KEPT) c.dropped.shift();
+}
+
+/** Note the doc's checkpoint of `c` as counted (`watched`: the session
+ *  this page counted from before it, `now` its time): the head from now on,
+ *  unless it is the head already, or would put a recovery in motion. A
+ *  jump's session is refuted, and so stays whatever is built on it. A
+ *  rewind below a checkpoint in the chain that jumps over it (this page
+ *  took a jump as its head: it came while the jump stood) is the honest
+ *  line coming back: the jump and what came after it in the chain go, and
+ *  the rewind is the head (so two pages that each hold another head stop
+ *  putting theirs back over each other's).
+ *
+ *  🩹 So too a rewind of a head this page took without seeing it come
+ *  (Counted firmAt), within TAKEN_WAIT_MS: a page that loaded while a jump
+ *  over an older checkpoint stood, its head the jump, can't tell the head
+ *  the pages that counted it put back from a peer's replay. It gives way
+ *  (what it took goes from its chain, to be taken as at load again should
+ *  it come back: ComputedInc dropped), unless the rewind is the checkpoint
+ *  one in its chain was built on, a replay it can tell. */
+function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null, now: number): void {
+  const value = map.get(`sum:${c.t}:${c.inc}`);
+  const cp = checkpointAt(map, c.t, c.inc);
+  let trigger = recoveryTrigger(c, cp);
+  if (trigger === 'rewind' && cp !== null) {
+    const sid = liveSidOf(c, cp);
+    const i = c.chain.findIndex((e) => e.cp.b === sid && e.cp.u - cp.u > MAX_SESSION_ROUNDS);
+    if (i >= 0) {
+      for (const e of c.chain.slice(i)) if (e === c.chain[i] || c.refuted.includes(e.cp.b)) refute(c, e.sid);
+      c.chain.length = i;
+      trigger = recoveryTrigger(c, cp);
+    } else if (!c.chain.some((e) => e.cp.b === sid)) {
+      // (firmAt never falls along the chain: what gives way is its end.)
+      let j = c.chain.length;
+      while (j > 0 && now < c.chain[j - 1].firmAt) j--;
+      if (j < c.chain.length) {
+        for (const e of c.chain.slice(j)) drop(c, e.sid);
+        c.chain.length = j;
+        trigger = recoveryTrigger(c, cp);
+      }
+    }
+  }
+  if (trigger === null) c.calm++;
+  if (trigger === 'jump' && cp !== null) refute(c, liveSidOf(c, cp));
+  // 🩹 A rewind of a SEEN head is a forgery (this page is grounded in its
+  // head): refute the session that rewind opens, so a checkpoint the forger
+  // then builds on it, above the head, puts a restore in motion too instead
+  // of slipping in as a new head (an extension of a forged rewind). Only a
+  // rewind that stayed one through the adoption/give-way above is refuted. An
+  // UNSEEN (load-taken) head can't tell the honest head coming back from a
+  // replay, so its rewind is NOT refuted here — it gives way to it (firmAt
+  // within the window, giveWayComputed past it).
+  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
+    // Exempt a session the counted chain is built on: a rewind that replays a
+    // checkpoint in the chain opens the chain's OWN next session, and refuting
+    // it would reject a legitimate higher trim of that session as a jump (a
+    // same-base trim race — two seen heads restoring different checkpoints).
+    // The forger's rewind of the F2 case is on an unrelated base no chain
+    // entry continues from, so it is still refuted.
+    const rewoundSid = liveSidOf(c, cp);
+    if (!c.chain.some((e) => e.cp.b === rewoundSid)) refute(c, rewoundSid);
+  }
+  if (cp === null || typeof value !== 'object' || value === null) return;
+  const head = c.chain[c.chain.length - 1];
+  const sid = liveSidOf(c, cp);
+  if (head && (head.sid === sid || trigger !== null)) return;
+  const taken = now + TAKEN_WAIT_MS;
+  // A checkpoint inherits the head's firmAt only when it EXTENDS the head
+  // (built on the session the head opens): then it is as firm as the head it
+  // carries on from. A checkpoint on any other base is a fresh take, not an
+  // extension — a jump this page can't classify as one (it never counted a
+  // checkpoint of the session the jump overshoots, so recoveryTrigger let it
+  // through) must not borrow the head's possibly-elapsed firmAt, or it is
+  // firm at once and no rewind can give way to the honest head coming back.
+  // It waits afresh (taken), unless it is built on the very session this page
+  // was counting from, a plain forward move it saw come (firm now, 0).
+  // 🩹 A base this page gave way over (dropped) is not a session it counted
+  // from: a checkpoint built on it is a fresh take, not a seen extension, even
+  // when `watched` still points there (a page that took a jump J, adopted a
+  // lower checkpoint R on J's session, then dropped J — R and anything built
+  // on it must not inherit `seen`/firm-now, or an extension of R above the
+  // honest head would be firm at once and never give way).
+  const firmAt = c.dropped.includes(sid)
+    ? taken
+    : head && cp.b === head.sid
+      ? head.firmAt
+      : cp.b === watched && !c.dropped.includes(cp.b)
+        ? 0
+        : taken;
+  // `seen` mirrors firmAt's branches: a head given way over is unseen again,
+  // an extension inherits the head's, one on the session this page was
+  // counting from (and did not give way over) was seen come, anything else (a
+  // fresh take, mostly at load) is unseen.
+  const seen = c.dropped.includes(sid)
+    ? false
+    : head && cp.b === head.sid
+      ? head.seen
+      : cp.b === watched && !c.dropped.includes(cp.b);
+  c.chain.push({ value, cp, sid, pubs: new Set(), firmAt, seen });
+  if (c.chain.length > CHAIN_KEPT) c.chain.shift();
+  if (c.gaveUp && c.gaveUp.sid !== sid) c.gaveUp = null;
+}
+
+/**
+ * 🩹 Doubt the slips a page of the build before v0.51 may have let go of,
+ * seeds and all, as that build does when the table moves on from their
+ * session (computedTable movedOn) to a base past the round before theirs:
+ * - on a move past the round after the new base, every slip on an open felt
+ *   of the session moved from (`was`) that the new one (`res`) doesn't
+ *   hold;
+ * - and on the head's return after a rewind or a jump stood, every slip its
+ *   session holds then: they were there before the forgery, which that
+ *   build counted as a move (a jump's past every round they were on), and
+ *   this page may not have counted them before it came (one update brought
+ *   both).
+ * Counted on every count, as the doc changes, so a page that ran no frame
+ * between a felt and the forgery doubts it all the same.
+ */
+function noteDoubted(c: ComputedInc, was: FoldResult | null, res: FoldResult, map: Y.Map<unknown>): void {
+  const trigger = recoveryTrigger(c, checkpointAt(map, c.t, c.inc));
+  const forged = trigger === 'rewind' || trigger === 'jump';
+  const back = c.forged && !forged;
+  c.forged = forged;
+  if (!was || was.base.sid === res.base.sid) return;
+  const doubt = (h: string): void => {
+    c.doubted.delete(h);
+    c.doubted.add(h);
+  };
+  if (was.open > res.base.u + 1) {
+    for (const s of was.felts.values()) if (res.felts.get(s.rec.p)?.hash !== s.hash) doubt(s.hash);
+  }
+  if (back) for (const s of res.felts.values()) doubt(s.hash);
+  for (const h of c.doubted) {
+    if (c.doubted.size <= DOUBTED_KEPT) break;
+    c.doubted.delete(h);
+  }
+}
+
+/** 🩹 Whether this page doubts slip `hash` at table `tableId`'s
+ *  switched-on incarnation (ComputedInc doubted): its closes freeze it only
+ *  for its own player. */
+export function computedSlipDoubted(tableId: string, hash: string): boolean {
+  const inc = computedIncOf(tableId);
+  return inc !== null && computedIncs.get(`${tableId}:${inc}`)?.doubted.has(hash) === true;
+}
+
 /** The incarnation a switch names: exactly {v: 1, inc}, `inc` a computed
  *  one's name. Null for none, or anything else (no timestamp: identical
  *  switches written at once merge). (Exported for the house's test
@@ -2232,7 +2536,7 @@ export function computedIncOf(tableId: string): string | null {
  *  say it ended. (Its decided nets count either way: the ledger.) */
 export function isComputedTable(tableId: string): boolean {
   const inc = computedIncOf(tableId);
-  return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && checkpointAt(computedMap!, tableId, inc)?.e !== 1;
+  return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && baseOf(tableId, inc)?.e !== 1;
 }
 
 /** Whether table `tableId` is a computed table of `game` now
@@ -2254,7 +2558,7 @@ export function isComputedFor(tableId: string, game: GameName): boolean {
  *  incarnation goes on. */
 export function computedIncEnded(tableId: string, inc: string): boolean {
   const casino = ensureMap();
-  return casino.has(goneKey(tableId, inc)) || checkpointAt(computedMap!, tableId, inc)?.e === 1;
+  return casino.has(goneKey(tableId, inc)) || baseOf(tableId, inc)?.e === 1;
 }
 
 /** The name a table's next computed incarnation takes: `r` (roulette) or
@@ -2391,7 +2695,7 @@ export function computedSwitchBare(tableId: string): boolean {
   const inc = computedIncOf(tableId);
   if (inc === null || computedIncEnded(tableId, inc)) return false;
   const map = computedMap!;
-  return checkpointAt(map, tableId, inc) === null && !sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map);
+  return baseOf(tableId, inc) === null && !sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map);
 }
 
 /** 🧮 End computed incarnation `inc` of table `tableId` as a removal of the
@@ -2904,7 +3208,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   c = {
     t, inc, key, ctx, fold: new TableFold(ctx, computedCheck(key), computedPinOf, undefined, houseOkOf),
     cp: null, sid: 'g', live: null, sidOf: { cp: null, sid: 'g' }, stale: true,
-    countedSid: null, countedCp: false, last: null, liveHeld: false, seen: new Map(),
+    countedSid: null, chain: [], gaveUp: null, calm: 0, last: null, liveHeld: false, seen: new Map(), refuted: [], dropped: [], doubted: new Set(), forged: false,
   };
   computedIncs.set(key, c);
   let incs = computedIncsOf.get(t);
@@ -2914,25 +3218,34 @@ function trackComputed(t: string, inc: string): ComputedInc {
 }
 
 /** Whether something of table `tableId` this page counted is gone from the
- *  doc, nothing having closed it (casinoWhole): a checkpoint (the doc holds
- *  one per incarnation once one is written, and no build deletes it), or the
- *  live session's map while the checkpoint still opens it. A trim deletes
- *  the session in the transaction that writes the checkpoint closing it, so
- *  the session reads as lost only on a doc holding part of that (whose
- *  deletes Yjs applies first), or after a page deleted it with nothing in
- *  its place: its decided rounds would read as never played. */
+ *  doc, nothing having closed it (casinoWhole): the live session's map
+ *  while the checkpoint still opens it (sessionLost). A checkpoint this page
+ *  counted gone, or junk in its place, is no longer one: the page holds its
+ *  head meanwhile (heldBase). (An older build, or this one with recovery
+ *  off, reads that as lost too: no build deletes a checkpoint.) */
 function computedLost(tableId: string): boolean {
   const incs = computedIncsOf.get(tableId);
   const map = computedMap;
   if (!incs || !map) return false;
-  for (const inc of incs) {
-    const c = computedIncs.get(`${tableId}:${inc}`)!;
-    const cp = checkpointAt(map, tableId, inc);
-    if (c.countedCp && !cp) return true;
-    if (c.countedSid !== null && liveSidOf(c, cp) === c.countedSid
-      && !(map.get(sessionKey(tableId, inc, c.countedSid)) instanceof Y.Map)) return true;
-  }
+  for (const inc of incs) if (incLost(computedIncs.get(`${tableId}:${inc}`)!, map)) return true;
   return false;
+}
+
+/** computedLost of one incarnation. A trim deletes the session in the
+ *  transaction that writes the checkpoint closing it, so the session reads
+ *  as lost only on a doc holding part of that (whose deletes Yjs applies
+ *  first), or after a page deleted it with nothing in its place: its decided
+ *  rounds would read as never played. The recovery duty opens it again, and
+ *  past GIVE_UP_MS gives those rounds up (giveUpComputed). */
+function incLost(c: ComputedInc, map: Y.Map<unknown>): boolean {
+  const cp = heldBase(c, map);
+  if (c.chain.length > 0 && cp === null) return true;
+  return sessionLost(c, map, cp);
+}
+
+function sessionLost(c: ComputedInc, map: Y.Map<unknown>, cp: Checkpoint | null): boolean {
+  return c.countedSid !== null && liveSidOf(c, cp) === c.countedSid
+    && !(map.get(sessionKey(c.t, c.inc, c.countedSid)) instanceof Y.Map);
 }
 
 /** Stamp the record keys this page sees in an incarnation's live session
@@ -2978,7 +3291,7 @@ const heldValue = (value: unknown): unknown => (value === undefined ? null : val
  *  copied into the next session keeps its stamp: same key), and once it is
  *  another session, the verdicts of records it doesn't hold. */
 function readComputedWhole(c: ComputedInc, map: Y.Map<unknown>): void {
-  const cp = checkpointAt(map, c.t, c.inc);
+  const cp = heldBase(c, map);
   const sid = liveSidOf(c, cp);
   const raw = map.get(sessionKey(c.t, c.inc, sid));
   const live = raw instanceof Y.Map ? (raw as Y.Map<unknown>) : null;
@@ -3065,10 +3378,20 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
   recountComputed(chipIndex, c.key, res.nets);
   recountComputedHeld(c.key, live ? res.held : NO_COMPUTED_HELD);
   if (res !== c.last || live !== c.liveHeld) viewTouched.add(`computed:${c.t}`);
+  const was = c.last;
   c.last = res;
   c.liveHeld = live;
+  const watched = c.countedSid;
   c.countedSid = c.live ? c.sid : null;
-  c.countedCp ||= c.cp !== null;
+  noteCounted(c, map, watched, txNow ?? Date.now());
+  if (recoveryOn) noteDoubted(c, was, res, map);
+  const head = c.chain[c.chain.length - 1];
+  if (head && head.sid === c.sid) {
+    for (const s of res.felts.values()) {
+      if (head.pubs.size >= MAX_TABLE_PIDS) break;
+      if (s.rec.b.length > 0) head.pubs.add(s.rec.k);
+    }
+  }
 }
 
 /** Track every computed incarnation the doc holds, count each, and recount
@@ -3233,6 +3556,14 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   }
   // A slice: what waited for its checks.
   if (tr.origin === CT_VERIFY) for (const c of computedIncs.values()) if (c.last?.pending) dirty.add(c);
+  // A recount asked for (giveUpComputed): read whole.
+  if (tr.origin === CT_RECOUNT) {
+    for (const c of recountWhole) {
+      whole.add(c);
+      dirty.add(c);
+    }
+    recountWhole.clear();
+  }
   for (const c of dirty) countComputed(c, map, casino, whole.has(c), changed.get(c));
   // The rest of an update came: what waited reads as it is.
   if (computedParked.size > 0 && casinoWhole()) {
@@ -3283,7 +3614,7 @@ export function computedSessionForWrite(tableId: string): Y.Map<unknown> | null 
   if (!isComputedTable(tableId)) return null;
   const inc = computedIncOf(tableId)!;
   const map = computedMap!;
-  const sid = nextSid({ room: boundRoomId, t: tableId, inc }, checkpointAt(map, tableId, inc));
+  const sid = nextSid({ room: boundRoomId, t: tableId, inc }, baseOf(tableId, inc));
   const live = map.get(sessionKey(tableId, inc, sid));
   return live instanceof Y.Map ? (live as Y.Map<unknown>) : null;
 }
@@ -3333,7 +3664,7 @@ export function writeCheckpointAndTrim(
   if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
   const ok = asCheckpointFor({ inc })(cp);
   const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
-  if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, checkpointAt(map, tableId, inc))) return false;
+  if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, baseOf(tableId, inc))) return false;
   const next = nextSid(ctx, ok);
   boundDoc!.transact(() => {
     map.set(`sum:${tableId}:${inc}`, cp);
@@ -3364,7 +3695,7 @@ export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | 
   const map = computedMap!;
   const c = computedIncs.get(`${tableId}:${inc}`);
   if (!c || !casinoWhole(tableId)) return false;
-  const was = checkpointAt(map, tableId, inc);
+  const was = heldBase(c, map);
   if (cp !== null) {
     const ok = asCheckpointFor({ inc })(cp);
     if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
@@ -3378,6 +3709,294 @@ export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | 
   });
   return true;
 }
+
+// ── 🩹 Recovery: what a peer deleted or rewound, put back ───────────────────
+
+/** One computed incarnation as the recovery duty reads it (computedTable
+ *  recoverDuty). */
+export interface ComputedRecovery {
+  t: string;
+  inc: string;
+  ctx: FoldCtx;
+  /** What puts its checkpoint's restore in motion now (null: nothing), and
+   *  how many counts found nothing that did (ComputedInc calm): a change of
+   *  it starts a restore's wait afresh. */
+  trigger: RecoveryTrigger | null;
+  calm: number;
+  /** The value a restore writes, this page's head as the doc held it; its
+   *  round. Null with none counted. */
+  head: object | null;
+  headU: number;
+  /** Live: its switch names it and nothing ended it. */
+  live: boolean;
+  /** The session the base this page counts from opens has no map in the
+   *  doc (the recovery duty opens one), and whether that is a session this
+   *  page counted from (computedLost: given up past GIVE_UP_MS). */
+  sessionMissing: boolean;
+  lost: boolean;
+  /** The base's round (0 for none). */
+  u: number;
+  /** The keys that take turns at it: every staked felt's this page counted
+   *  in the session its head opens (Counted pubs) and the head's; and,
+   *  unless the doc's checkpoint puts a restore in motion, the base's and
+   *  its open felts' signers as last counted (a forger, and the felts of
+   *  the session a forged checkpoint opens, take no turn). */
+  pubs: string[];
+}
+
+/** Every incarnation this page tracks, as the recovery duty reads it. */
+export function computedRecoveries(): ComputedRecovery[] {
+  const map = computedMap;
+  const casino = casinoMap;
+  if (!map || !casino) return [];
+  const out: ComputedRecovery[] = [];
+  for (const c of computedIncs.values()) {
+    const base = heldBase(c, map);
+    const doc = checkpointAt(map, c.t, c.inc);
+    const head = c.chain[c.chain.length - 1];
+    const sid = liveSidOf(c, base);
+    const pubs = new Set<string>();
+    for (const k of head?.pubs ?? []) pubs.add(k);
+    // (A checkpoint that puts a restore in motion gives its signer no turn,
+    // nor the felts of the session it opens: the forger wrote those too.)
+    const trigger = recoveryOn ? recoveryTrigger(c, doc) : null;
+    if (trigger === null) {
+      for (const s of c.last?.felts.values() ?? []) if (s.rec.b.length > 0) pubs.add(s.rec.k);
+      if (base) pubs.add(base.k);
+    }
+    if (head) pubs.add(head.cp.k);
+    out.push({
+      t: c.t, inc: c.inc, ctx: c.ctx,
+      trigger, calm: c.calm,
+      head: head?.value ?? null, headU: head?.cp.u ?? 0,
+      live: computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc && !casino.has(goneKey(c.t, c.inc)) && base?.e !== 1,
+      sessionMissing: !(map.get(sessionKey(c.t, c.inc, sid)) instanceof Y.Map),
+      lost: sessionLost(c, map, base),
+      u: base?.u ?? 0,
+      pubs: [...pubs].sort(),
+    });
+  }
+  return out;
+}
+
+/** 🩹 Whether table `tableId`'s switched-on incarnation (or incarnation
+ *  `inc` of it) counts from a checkpoint that puts its restore in motion: a
+ *  live one rewound below this page's head, or jumped past it
+ *  (recoveryTrigger 'rewind', 'jump'). The page counts it as every build
+ *  does while the head comes back; nothing builds on it meanwhile (no trim,
+ *  no end: computedTable). */
+export function computedRestorePending(tableId: string, inc: string | null = computedIncOf(tableId)): boolean {
+  const c = inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`);
+  if (!c || !computedMap || !recoveryOn) return false;
+  const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
+  return trigger === 'rewind' || trigger === 'jump';
+}
+
+/**
+ * 🩹 Give way to the rival the room keeps putting back, when this page's head
+ * is one it took at LOAD (unseen) and its restore of it keeps losing. The
+ * firmAt window (TAKEN_WAIT_MS) converges a load-taken head to the honest one
+ * while the page hears the room soon after loading; but a partition that
+ * outlasts the window leaves the load-taken head looking firm by the clock,
+ * and no longer a timeout can tell a late-arriving honest head from a replay.
+ * So, driven by the restore duty once this page's restore of an unseen head
+ * has been written over again and again by a rewind or a jump the page can't
+ * classify (computedTable restoreStep: the room backs the rival — a lone
+ * forger can't keep a value in the doc against the pages that counted the
+ * honest head), the page drops the unseen head and what it extends, and takes
+ * the doc's value as every build reads it. A SEEN head never gives way (a
+ * grounded page defends it against a cheat), and nothing happens unless a
+ * rewind or a jump stands now, so an honest trim that moved the head on is
+ * untouched. Converges two honest pages that each hold a different head after
+ * any partition; the one-honest-page-vs-forger case still needs the house's
+ * signed head (PR 6a-2). Returns whether it gave way.
+ */
+export function giveWayComputed(tableId: string, inc: string): boolean {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!c || !computedMap || !recoveryOn) return false;
+  const head = c.chain[c.chain.length - 1];
+  if (!head || head.seen) return false;
+  const cp = checkpointAt(computedMap, c.t, c.inc);
+  const trigger = recoveryTrigger(c, cp);
+  // 🩹 Give way only to a rewind this page cannot otherwise reject — a lower
+  // checkpoint it took at load and can't tell from the honest head coming
+  // back. NEVER to a jump: a jump is always a checkpoint over a counted chain
+  // entry more than MAX_SESSION_ROUNDS past it, or one on a refuted base — the
+  // page has proved it impossible, so it defends its head against it rather
+  // than adopting it. Nor to a rewind that is itself on a refuted base or
+  // jumps a chain entry. Were the chain dropped for one of these, the recount
+  // below would take the impossible value as the new head and the forged
+  // balances would stick even when every honest page still holds the head.
+  if (trigger !== 'rewind') return false;
+  if (cp === null || c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return false;
+  // Drop every trailing unseen entry (a load-taken head and what extends it,
+  // never a seen one along the chain): the page stops defending the line it
+  // took at load and adopts the doc's value on the next count.
+  let j = c.chain.length;
+  while (j > 0 && !c.chain[j - 1].seen) j--;
+  if (j >= c.chain.length) return false;
+  for (const e of c.chain.slice(j)) drop(c, e.sid);
+  c.chain.length = j;
+  // 🩹 Recount at once (as giveUpComputed does): dropping every trailing
+  // unseen entry can empty the chain, leaving no head and so no held base, and
+  // a delete of sum: before any other table write would then lose the restored
+  // checkpoint's balances. The recount counts the doc's value afresh into the
+  // chain, giving the page a head to hold the base from.
+  c.countedSid = null;
+  recountWhole.add(c);
+  boundDoc!.transact(() => {}, CT_RECOUNT);
+  return true;
+}
+
+/** 🩹 Whether any incarnation this page tracks has recovery work outstanding
+ *  — a restore in motion, a session to reopen, or one to give up. World keeps
+ *  marking its table frames while this is true (computedTable
+ *  computedCompactionPending's caller, the croupier noteTablesRunning), as it
+ *  does while the room has a table, so that after the room's last table is
+ *  gone and an ended incarnation's checkpoint or session was deleted the page
+ *  doesn't read as asleep a lapse on and leave the recovery stuck. Reads the
+ *  doc only; the real sleep guard (tablesAwake) still gates the duty. */
+export function computedRecoveryPending(): boolean {
+  const map = computedMap;
+  const casino = casinoMap;
+  if (!map || !casino || !recoveryOn) return false;
+  for (const c of computedIncs.values()) {
+    const base = heldBase(c, map);
+    if (recoveryTrigger(c, checkpointAt(map, c.t, c.inc)) !== null) return true;
+    const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+      && !casino.has(goneKey(c.t, c.inc)) && base?.e !== 1;
+    if (live && !(map.get(sessionKey(c.t, c.inc, liveSidOf(c, base))) instanceof Y.Map)) return true;
+    if (sessionLost(c, map, base)) return true;
+  }
+  return false;
+}
+
+/**
+ * 🩹 Put back this page's head of incarnation `inc` of table `tableId` as
+ * its checkpoint, byte for byte as the doc held it (every page that counted
+ * it writes the same bytes, so whichever write the doc keeps is the same
+ * checkpoint), in ONE transaction with an empty map for the session it
+ * opens if the doc has none. Only while what the doc holds now still puts
+ * the restore in motion (recoveryTrigger: an honest trim that came in
+ * meanwhile moved the checkpoint on, and nothing is written), and `head` is
+ * this page's head still; on a doc holding every update whole. False
+ * (nothing written) otherwise. The only write of a checkpoint besides a
+ * trim's and an end's: no page signs one again in place.
+ */
+export function restoreComputedCheckpoint(tableId: string, inc: string, head: object): boolean {
+  const map = computedMap;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  const last = c?.chain[c.chain.length - 1];
+  if (!map || !c || !last || last.value !== head || !recoveryOn || docHoldsPart()) return false;
+  if (recoveryTrigger(c, checkpointAt(map, tableId, inc)) === null) return false;
+  boundDoc!.transact(() => {
+    map.set(`sum:${tableId}:${inc}`, head);
+    // (An end opens no session: compaction would only delete it again.)
+    const key = sessionKey(tableId, inc, last.sid);
+    if (last.cp.e !== 1 && !(map.get(key) instanceof Y.Map)) map.set(key, new Y.Map<unknown>());
+  });
+  return true;
+}
+
+/**
+ * 🩹 Open again the session incarnation `inc` of table `tableId` counts
+ * from, deleted with nothing in its place (no build does that: a trim
+ * writes the next one as it deletes the last, an end deletes them all as it
+ * ends): one empty map, where the room's pages put their records back
+ * (computedTable reputDuty, witnessDuty). Only the session the base this
+ * page counts from opens (never a base chosen from what maps the doc
+ * holds), of a live incarnation, on a doc holding every update whole, and
+ * while its checkpoint puts no restore in motion. False (nothing written)
+ * otherwise.
+ */
+export function reopenComputedSession(tableId: string, inc: string): boolean {
+  const map = computedMap;
+  const casino = casinoMap;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!map || !casino || !c || !recoveryOn || docHoldsPart()) return false;
+  const base = heldBase(c, map);
+  if (base?.e === 1 || computedCfgInc(casino.get(`cfg:computed:${tableId}`)) !== inc || casino.has(goneKey(tableId, inc))) return false;
+  if (recoveryTrigger(c, checkpointAt(map, tableId, inc)) !== null) return false;
+  const key = sessionKey(tableId, inc, liveSidOf(c, base));
+  if (map.get(key) instanceof Y.Map) return false;
+  boundDoc!.transact(() => {
+    map.set(key, new Y.Map<unknown>());
+  });
+  return true;
+}
+
+/** Recounts asked for outside any transaction of the doc's own: the
+ *  incarnations to read whole (giveUpComputed). */
+const CT_RECOUNT = Symbol('casino-computed-recount');
+const recountWhole = new Set<ComputedInc>();
+
+/**
+ * ⚠ Give up the rounds incarnation `inc` of table `tableId` decided in a
+ * session that was deleted with nothing in its place (computedLost, held so
+ * for GIVE_UP_MS: computedTable recoverDuty): this page reads it whole again
+ * as a page that never counted that session does, so its counts are theirs
+ * (the table counts from its checkpoint, and is whole again: casinoWhole).
+ * Its ⚙ card says which rounds went (computedGaveUp). False when it isn't
+ * lost, or the doc holds part of an update.
+ */
+export function giveUpComputed(tableId: string, inc: string): boolean {
+  const map = computedMap;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!map || !c || !recoveryOn || docHoldsPart() || !sessionLost(c, map, heldBase(c, map))) return false;
+  const res = c.last;
+  const to = res ? Math.max(res.base.u, ...res.rounds.filter((r) => r.decided !== null).map((r) => r.r)) : 0;
+  if (res && to > res.base.u) c.gaveUp = { sid: c.countedSid!, from: res.base.u + 1, to };
+  c.countedSid = null;
+  recountWhole.add(c);
+  boundDoc!.transact(() => {}, CT_RECOUNT);
+  return true;
+}
+
+/** ⚠ The rounds of table `tableId`'s switched-on incarnation this page gave
+ *  up on (giveUpComputed), until the next checkpoint; null for none. */
+export function computedGaveUp(tableId: string): { from: number; to: number } | null {
+  const inc = computedIncOf(tableId);
+  const g = inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.gaveUp;
+  return g ? { from: g.from, to: g.to } : null;
+}
+
+/** ⚠ Whether table `tableId`'s switched-on incarnation counts from a
+ *  checkpoint no round can follow (its round + 1 no safe integer) that
+ *  nothing this page counted refutes (no restore in motion: a jump past its
+ *  head is put back): switching the table off and on is the way out. */
+export function computedCheckpointBroken(tableId: string): boolean {
+  const inc = computedIncOf(tableId);
+  const base = inc === null ? null : baseOf(tableId, inc);
+  if (base === null || base.e === 1 || Number.isSafeInteger(base.u + 1)) return false;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  return !(c && computedMap && recoveryOn && recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc)) !== null);
+}
+
+/** The players table `tableId`'s switched-on incarnation counts as at the
+ *  table, as last counted: its base's nets, and every one a close froze in
+ *  its session (an upper bound on the next checkpoint's nets: closeDuty
+ *  freezes no newcomer once it holds MAX_TABLE_PIDS). */
+export function computedTablePids(tableId: string): ReadonlySet<string> {
+  const inc = computedIncOf(tableId);
+  const res = inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.last;
+  if (!res) return EMPTY_PIDS;
+  let out = tablePids.get(res);
+  if (!out) {
+    out = new Set(res.base.n.keys());
+    for (const round of res.rounds) for (const pid of Object.keys(round.frozen)) out.add(pid);
+    // 🎲 A craps checkpoint carries its riders in base.state (CrapsCarry.w):
+    // pids whose felt rides across the checkpoint that no net entry and no
+    // frozen round names. They carry into the next checkpoint, so they are
+    // at the table — counting them keeps a rider from being read as a
+    // newcomer with no place (crowdedOut), which would deny their own slips.
+    const riders = (res.base.state as { w?: Record<string, unknown> } | null)?.w;
+    if (riders) for (const pid of Object.keys(riders)) out.add(pid);
+    tablePids.set(res, out);
+  }
+  return out;
+}
+const EMPTY_PIDS: ReadonlySet<string> = new Set();
+const tablePids = new WeakMap<FoldResult, Set<string>>();
 
 /** What the room's computed sessions weigh: Σ rawBytes (computedFold: every
  *  key, junk included) over each incarnation's live session as last counted,
@@ -3419,7 +4038,7 @@ export function computedEndedIncs(): EndedComputed[] {
     const c = computedIncs.get(key);
     if (!c?.last) continue;
     const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
-      && !casino.has(goneKey(c.t, c.inc)) && checkpointAt(map, c.t, c.inc)?.e !== 1;
+      && !casino.has(goneKey(c.t, c.inc)) && heldBase(c, map)?.e !== 1;
     if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
   }
   return out;

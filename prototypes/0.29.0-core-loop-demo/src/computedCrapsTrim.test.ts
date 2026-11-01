@@ -24,7 +24,7 @@ import { asCheckpointFor, nextSid } from './computedFold';
 import type { Checkpoint, CrapsSlipRec } from './computedFold';
 import {
   carryOf, clockOf, CRAPS_CTX as CTX, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, crapsPointOn, keysIn,
-  openCrapsRoom, putIn, rigRoll, run, standAt, sync, trimByHand,
+  loadPage, openCrapsRoom, putIn, rigRoll, run, standAt, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { ComputedKit, testIdentity } from './computedTestKit';
@@ -498,4 +498,47 @@ describe('a checkpoint handing on another table', () => {
     expect(keysIn(a, 'c', 2, TABLE)).toEqual([]);
     expect(crapsOf(b, W2 + 3_000)).toMatchObject({ phase: 'closing', round: 2, shooter: b.pid, shooterSlip: 'here' });
   });
+});
+
+describe('🪑 a checkpoint whose carry rides a player the nets do not name', () => {
+  // computedTablePids bounds the next checkpoint's players, so that a full
+  // table takes no newcomer (computedTable crowdedOut, MAX_TABLE_PIDS). A craps
+  // checkpoint carries its riders in its state (CrapsCarry.w), not its nets: a
+  // pass bet riding on the point is unsettled, so the rider holds no net of its
+  // own, and after a trim it has no frozen round either. Counting nets and
+  // frozen rounds alone left the riders out, so a rider at a table of
+  // MAX_TABLE_PIDS read as a newcomer with no place; the membership now adds
+  // the carried riders too.
+  it('counts the rider toward the cap: at a full table a newcomer is crowded out, the rider itself is not', async () => {
+    const { pages, decidedAt } = await crapsPointOn(['A'], [1], T0);
+    const [a] = pages;
+    // A rides its pass on the point.
+    expect(own(carryOf(a).w, a.pid).length).toBeGreaterThan(0);
+    // A checkpoint of MAX_TABLE_PIDS - 1 players in its nets — A not among them
+    // — carrying A's ride on: with A counted, the table is exactly full.
+    const ghosts: Record<string, bigint> = {};
+    for (let i = 0; i < a.fold.MAX_TABLE_PIDS - 1; i++) ghosts[`ghost-${i}`] = 1n;
+    expect(ghosts[a.pid]).toBeUndefined();
+    // One short of the cap in the nets alone: A's carried ride is the member
+    // that fills the last place, so the refusal below is its doing.
+    expect(Object.keys(ghosts)).toHaveLength(a.fold.MAX_TABLE_PIDS - 1);
+    const T = decidedAt + STEP;
+    clockOf(a, T);
+    trimByHand(a, testIdentity('cap'), ghosts, TABLE);
+    // After the trim A is in neither the nets nor a frozen round: only the
+    // carry names it.
+    expect(foldOf(a).base.n.has(a.pid)).toBe(false);
+    expect(foldOf(a).rounds).toHaveLength(0);
+    expect(own(carryOf(a).w, a.pid).length).toBeGreaterThan(0);
+    // A newcomer with chips and no ride: counting A's, the table is full, so its
+    // field bet is refused — uncounted, A would leave room for a 4001st player.
+    const n = await loadPage('N', 50);
+    clockOf(n, T);
+    n.casino.buyInChips(n.pid, 1_000);
+    standAt(n, 5);
+    sync(T, a, n);
+    const open = go([a, n], T + STEP, T + 50_000, () => crapsOf(n)?.phase === 'betting' && crapsOf(n)?.phaseDeadline !== undefined);
+    sync(open, a, n);
+    expect(crapsBet(n, [bet('field', 5)], open)).toBe('crowded');
+  }, 60_000);
 });

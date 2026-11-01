@@ -49,7 +49,8 @@
 
 import * as THREE from 'three';
 import {
-  casinoDocEpoch, casinoWhole, clearMySeat, computedIncEnded, computedSettled, computedThrowSeenAt, isComputedFor, readAllBets,
+  casinoDocEpoch, casinoWhole, clearMySeat, computedCheckpointBroken, computedGaveUp, computedIncEnded, computedSettled, computedThrowSeenAt,
+  isComputedFor, readAllBets,
   readAllCrapsBets, readChips, readSeedRecord, readCrapsBackendPref, readCrapsFairnessPref, readCrapsTableState,
   readDiceThrow, readMyBets, readMyCrapsBets, readSeat, readSeats, readTableState,
   subscribeCasino, tableIncOf, writeCrapsBackendPref, writeCrapsFairnessPref,
@@ -64,7 +65,7 @@ import {
   SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
 import {
-  computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedRollChange,
+  computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedContested, computedRollChange,
   computedHouseState, computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
   CRAPS_SWITCH_ON_CONFIRM, CRAPS_SWITCH_ON_REFUSED, noteComputedFling, readComputedBets, readComputedCraps,
   readComputedCrapsBets, readComputedRoulette, readMyComputedBets, readMyComputedCrapsBets, SWITCH_OFF_REFUSED,
@@ -1593,10 +1594,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     say(wrote === 'closed' ? 'NO MORE BETS'
       : wrote === 'full' ? 'THE TABLE IS FULL — WAIT FOR A PLACE'
-        : wrote === 'chips' ? 'NOT ENOUGH CHIPS — VISIT THE CASHIER'
-          : wrote === 'rules' ? "THE TABLE RULES DON'T ALLOW THAT BET NOW"
-            : wrote === 'changed' ? CHANGES_UNDONE
-              : RECONNECTING_NOTICE);
+        : wrote === 'crowded' ? 'TABLE FULL · ASK THE OWNER TO SWITCH IT OFF AND ON'
+          : wrote === 'chips' ? 'NOT ENOUGH CHIPS — VISIT THE CASHIER'
+            : wrote === 'rules' ? "THE TABLE RULES DON'T ALLOW THAT BET NOW"
+              : wrote === 'changed' ? CHANGES_UNDONE
+                : RECONNECTING_NOTICE);
     return false;
   };
   /** Write my list (at a computed craps table, built on `basis`); false (and
@@ -2694,6 +2696,17 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
     }
     if (computedOldBuildDriving(itemId)) out.push({ text: '⚠ AN OLDER GAME VERSION IS ALSO RUNNING THIS TABLE', color: '#F5C26B' });
+    // 🩹 What a peer deleted or rewound, and what this page could do about it.
+    const gaveUp = computedGaveUp(itemId);
+    if (gaveUp) {
+      const what = craps ? 'ROLLS' : 'ROUNDS';
+      const span = gaveUp.from === gaveUp.to ? `${craps ? 'ROLL' : 'ROUND'} ${gaveUp.from}` : `${what} ${gaveUp.from}–${gaveUp.to}`;
+      out.push({ text: `⚠ ${span} UNDONE · THE SESSION WAS DELETED`, color: '#F5C26B' });
+    }
+    if (computedContested(itemId)) out.push({ text: "🚩 THIS TABLE'S CHECKPOINT KEEPS BEING WRITTEN OVER", color: '#FF8A80' });
+    if (computedCheckpointBroken(itemId)) {
+      out.push({ text: "⚠ THIS TABLE'S CHECKPOINT IS BROKEN · SWITCH THE TABLE OFF AND ON", color: '#FF8A80' });
+    }
     return out;
   };
 
