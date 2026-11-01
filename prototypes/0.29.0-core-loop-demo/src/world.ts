@@ -251,6 +251,7 @@ import {
 // 🕹🕹 Which of the double-wide's four stations a click or a walk-up names.
 import { standCrowded, wideClick, wideStationFor, type WideClick } from "./arcadeStations";
 import { blocksSight } from "./sightline";
+import { foxSquish } from "./foxSquish";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
@@ -4671,6 +4672,24 @@ export class World {
     // beside you at the double-wide cabinet, whose heads the camera would
     // sit inside).
     const views = deviceFocus.getViews();
+    // 🦊🦊 #345: every fox in the room, where it stood last frame, for each
+    // to squish to fit beside the others (foxSquish.ts). Ours counts while
+    // we stand in the room, seen or not (focused, first person), as it does
+    // on everyone else's screen.
+    const me = this.player.mesh;
+    const foxes = [
+      ...(this.isPlayerActive()
+        ? [{ rig: null as VoxelCharacter | null, x: me.position.x, y: me.position.y, z: me.position.z }]
+        : []),
+      ...[...this.remotePlayers.values()].map((a) => {
+        const p = a.rig.masterGroup.position;
+        return { rig: a.rig as VoxelCharacter | null, x: p.x, y: p.y, z: p.z };
+      }),
+    ];
+    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number) =>
+      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig));
+    const mine = squishOf(null, me.position, this.player.getDrawnFacing());
+    this.player.squishTo(mine.width, mine.shift);
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
       avatar.lastX = pos.x;
@@ -4678,6 +4697,8 @@ export class World {
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
       avatar.rig.masterGroup.visible = !views.some((v) => blocksSight(v.eye, v.anchor, pos));
+      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing());
+      avatar.rig.squishTo(squish.width, squish.shift);
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.

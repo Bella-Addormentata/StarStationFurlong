@@ -445,6 +445,11 @@ export class VoxelCharacter {
    */
   private logicalRotation = 0;
 
+  /** 🦊🦊 #345: squished to fit beside other foxes (foxSquish.ts): the
+   *  width and sideways shift it eases to, and where it has got to. */
+  private squishTarget = { width: 1, shift: 0 };
+  private squish = { width: 1, shift: 0 };
+
   private clock: THREE.Clock;
 
   // ── Outfit state (TR3, issue #35) ──────────────────────────────────────────
@@ -1646,6 +1651,24 @@ export class VoxelCharacter {
     this.logicalRotation = networkRotation;
   }
 
+  /** 🦊🦊 The yaw the fox is drawn at: its facing snapped to one of eight
+   *  ways (the visual group's, see update). */
+  getFacing(): number {
+    return snapTo8Ways(this.logicalRotation);
+  }
+
+  /**
+   * 🦊🦊 #345: squish the fox to `width` of its full width across, its
+   * middle moved `shift` metres toward its own +x (foxSquish.ts), easing
+   * there over a few frames; (1, 0) lets it back out to full size. Only the
+   * drawing changes, never masterGroup (where the fox is, and the clone
+   * vat's own squeeze on it).
+   */
+  squishTo(width: number, shift: number): void {
+    this.squishTarget.width = width;
+    this.squishTarget.shift = shift;
+  }
+
   /**
    * Dress the rig in an outfit: absolute palette-role recolor + optional head
    * accessory. Additive to the frozen API (TR3, issue #35).
@@ -2024,6 +2047,16 @@ export class VoxelCharacter {
     this.masterGroup.rotation.y = this.logicalRotation;
     this.visualGroup.rotation.y = -this.logicalRotation;
     this.visualGroup.rotation.y += snapTo8Ways(this.logicalRotation);
+
+    // ── 4. 🦊🦊 Squished beside other foxes (#345) ───────────────────────────
+    // The visual group's own x is the drawn fox's across; its position is in
+    // masterGroup's frame, turned from the drawn one by the snap.
+    this.squish.width = THREE.MathUtils.lerp(this.squish.width, this.squishTarget.width, lerpSpeed);
+    this.squish.shift = THREE.MathUtils.lerp(this.squish.shift, this.squishTarget.shift, lerpSpeed);
+    this.visualGroup.scale.x = this.squish.width;
+    const turn = this.visualGroup.rotation.y;
+    this.visualGroup.position.x = this.squish.shift * Math.cos(turn);
+    this.visualGroup.position.z = -this.squish.shift * Math.sin(turn);
   }
 
   private _updateFaceRig(blink: number, smile: number): void {

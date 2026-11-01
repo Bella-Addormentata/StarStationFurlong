@@ -2908,6 +2908,18 @@ export class Player {
     return this.vatPhase !== "NONE";
   }
 
+  /** 🦊🦊 #345: the yaw this fox is drawn at (eight ways). */
+  public getDrawnFacing(): number {
+    return this.character.getFacing();
+  }
+
+  /** 🦊🦊 #345: squish this fox to fit beside others (foxSquish.ts); full
+   *  size while the clone vat's own squeeze has it. */
+  public squishTo(width: number, shift: number): void {
+    if (this.vatPhase !== "NONE") this.character.squishTo(1, 0);
+    else this.character.squishTo(width, shift);
+  }
+
   /**
    * The vat this clone is bound to is being removed (edit mode, a synced
    * removal). A pending seal fires now, so nothing stays tied to the removed
