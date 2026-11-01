@@ -3,6 +3,11 @@ rooms/
 iroh_node_id.key
 chia_identity.seed
 wallet_lease.json
+# 🏦 The SSF wallet switch the Bank remembers (chia_wallet_switch.rs)
+chia_wallet.json
+# Private temporary files (`.<name>.<pid>-<seq>.tmp`, chia_wallet.rs and
+# chia_contact.rs): a node stopped mid-write can leave one holding a secret.
+.*.tmp
 target/
 blob-cache/
 torrent-cache/

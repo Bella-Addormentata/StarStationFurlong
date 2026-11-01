@@ -14,8 +14,8 @@
 //!
 //! Read side (the default build): the room's faucet address, the coins sitting
 //! at it, which of them are ready, and the status the browser draws the dish
-//! from. Publish side (`chia-publish` with the wallet loaded, i.e.
-//! `SSF_CHIA_LANE=1`): the CLAIM spend — keyless, puzzle reveal + solution and an
+//! from. Publish side (`chia-publish` with the wallet loaded, i.e. the SSF
+//! wallet on, chia_wallet_switch.rs): the CLAIM spend — keyless, puzzle reveal + solution and an
 //! EMPTY aggregated signature, the faucet coin the spend's only input — and the
 //! GIVE spend, our standard-puzzle coins paying into the faucet address. Both
 //! run under the wallet spend lease (`chia_publish::WALLET_LEASE`): GIVE so it
@@ -410,7 +410,7 @@ impl FaucetReply {
 }
 
 /// What a request needs from the node: the room caps (for the room key) and,
-/// in a publish build, the wallet key when `SSF_CHIA_LANE=1` loaded one.
+/// in a publish build, the wallet key while the SSF wallet is on.
 pub struct FaucetContext<'a> {
     pub rooms: &'a Mutex<HashMap<String, ChiaRoomCap>>,
     #[cfg(feature = "chia-publish")]
@@ -519,7 +519,7 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 st.note = part.note;
             }
             None => {
-                st.note = "this node has no wallet loaded (start it with SSF_CHIA_LANE=1 to take or give)".into();
+                st.note = crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "take or give");
             }
         }
     }
@@ -690,7 +690,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| anyhow!("no wallet loaded: start the node with SSF_CHIA_LANE=1 to take a mojo"))?;
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "take a mojo")))?;
     // One TAKE at a time, serialized with every other wallet writer: the
     // courtesy check, the coin pick and the push are one critical section, and
     // a gift still landing (its faucet coin parked until the chain or the
@@ -804,7 +804,7 @@ async fn give(
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| anyhow!("no wallet loaded: start the node with SSF_CHIA_LANE=1 to give"))?;
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "give")))?;
     if amount < params.gift {
         return Err(anyhow!("a gift below {} mojo(s) could never leave the jar", params.gift));
     }
