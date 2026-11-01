@@ -160,6 +160,20 @@ describe('the settle’s chip moves', () => {
     expect(m.paid).toEqual([{ chips: [5, 5, 1, 1, 1, 1], to: RAILS.a, order: 0, mine: true, dim: false }]);
   });
 
+  it('a come bet on its number that comes, with another travelling onto it: the winner still comes down; a don’t come replaced the same way still goes to the house', () => {
+    const before = {
+      a: [bet('come', 5, 6), bet('come', 5)],
+      b: [bet('dontcome', 5, 6), bet('dontcome', 5)],
+    };
+    const after = riding(before, 2, 4, 8);
+    // (The felt after looks the same at 6: the travellers took their places.)
+    expect(after).toEqual({ a: [bet('come', 5, 6)], b: [bet('dontcome', 5, 6)] });
+    const m = crapsSettleMoves(input(before, after, [2, 4], 8));
+    expect(m.back.map((b) => [b.s.pid, b.s.spot, b.s.chips])).toEqual([['a', 'come:6', [5]]]);
+    expect(m.paid.map((p) => [p.to, p.chips])).toEqual([[RAILS.a, [5]]]);
+    expect(m.lost.map((s) => [s.pid, s.spot, s.chips])).toEqual([['b', 'dontcome:6', [5]]]);
+  });
+
   it('winners are paid one after another in player order, others’ payouts drawn dim', () => {
     const before = { b: [bet('field', 5)], a: [bet('field', 1)] };
     const m = crapsSettleMoves(input(before, riding(before, 1, 1, null), [1, 1], null));

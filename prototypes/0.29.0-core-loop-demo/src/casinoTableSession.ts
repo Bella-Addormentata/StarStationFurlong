@@ -289,13 +289,15 @@ interface TableRuntime {
    *  here through a wake, which forgets the view's: a throw seen by then
    *  doesn't play once the roll closes again. */
   reopened: { r: number; at: number } | null;
-  /** 💰 Craps: the felt as last laid for a roll (each bettor's bets, the
-   *  stacks drawn, the point in force, and whether it was the roll's
-   *  result), the settle whose chip moves were played last (paidKey), and
-   *  whether the roll on screen is closed with its result still to show
-   *  here (crapsRollInPlay). */
-  played: { round: number; settled: boolean; bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null } | null;
-  paidKey: string;
+  /** 💰 Craps: the felt as last laid for each recent roll before its
+   *  result (each bettor's bets, the stacks drawn, the point in force), kept
+   *  through the result so a rewrite or a new decision of the roll, even one
+   *  shown again after the next roll opened, plays from it again; the
+   *  settles whose chip moves have played (paid, by SettleRecord key: the
+   *  same decision shown again plays nothing); and whether the roll on
+   *  screen is closed with its result still to show here (crapsRollInPlay). */
+  played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
+  paid: Set<string>;
   inPlay: boolean;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
@@ -309,7 +311,7 @@ function runtime(tableId: string): TableRuntime {
   if (!rt || rt.epoch !== casinoDocEpoch()) {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
-      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: null, paidKey: '', inPlay: false,
+      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), paid: new Set(), inPlay: false,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -348,6 +350,11 @@ const computedShown = new Map<string, ComputedShown>();
 /** Rounds of a table's pockets kept (a rewrite reaches back no further
  *  than the session, TRIM_ROUNDS). */
 const SHOWN_ROUNDS = 64;
+/** 💰 Rolls whose felt before the result a craps table keeps, and settles
+ *  whose chip moves it remembers playing (a rewrite further back than that
+ *  shows its new felt without them). */
+const PLAYED_ROUNDS = 8;
+const PAID_KEYS = 32;
 
 /** The round and pocket of a spin key (`<round>:<pocket>`), or null; of a
  *  craps roll key (`<roll>:<d1><d2>`), the roll and its dice as d1d2. */
@@ -624,7 +631,8 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     // show, then show where things stand, animating nothing old.
     rt.primed = true;
     h.reset();
-    rt.played = null;
+    rt.played = new Map();
+    rt.paid = new Set();
     rt.thrownSeed = t?.seed ?? null;
     if (s?.phase === 'settled' && s.dice) {
       rt.landedRound = s.round;
@@ -708,8 +716,9 @@ function railSpotFor(h: CasinoTableVisualHandle, seats: Record<string, TableSeat
  * (the dice are down) plays the settle's chip moves first: losers into the
  * house, then the pay-out (crapsSettleMoves), from the felt as it played to
  * the felt as it stands, so every page shows the same. Once per settle
- * (`rec.key`), and never for one this page didn't see the roll before (it
- * walked up during the show).
+ * (`rec.key`: a rewrite or a new decision of the roll plays again, from the
+ * felt as it played), and never for one this page didn't see the roll
+ * before (it walked up during the show).
  */
 function layCrapsFelt(
   id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string, s: CrapsTableState,
@@ -722,9 +731,10 @@ function layCrapsFelt(
     (b: CrapsBet, pid) => crapsChipPlan(b, seats[pid]?.stand ?? null),
     me,
   );
-  const was = rt.played;
-  if (s.phase === 'settled' && s.dice && was && !was.settled && was.round === s.round && rt.paidKey !== rec.key) {
-    rt.paidKey = rec.key;
+  const was = rt.played.get(s.round);
+  if (s.phase === 'settled' && s.dice && was && !rt.paid.has(rec.key)) {
+    rt.paid.add(rec.key);
+    if (rt.paid.size > PAID_KEYS) rt.paid.delete(rt.paid.values().next().value as string);
     const moves = crapsSettleMoves({
       before: was.bets,
       after: bets,
@@ -740,7 +750,11 @@ function layCrapsFelt(
   }
   h.setFeltChips(stacks);
   h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
-  rt.played = { round: s.round, settled: s.phase === 'settled', bets, stacks, point: s.point };
+  if (s.phase !== 'settled') {
+    rt.played.delete(s.round);
+    rt.played.set(s.round, { bets, stacks, point: s.point });
+    if (rt.played.size > PLAYED_ROUNDS) rt.played.delete(rt.played.keys().next().value as number);
+  }
 }
 
 /** 💰 Is the roll on screen at craps table `tableId` closed with its result
@@ -769,15 +783,18 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, rt: TableR
   if (mine.length > 0) bets[me] = mine;
   else delete bets[me];
   const amounts = s.amounts ?? {};
-  const pushes = s.pushes ?? [];
+  const payouts = s.payouts ?? {};
   layCrapsFelt(id, h, rt, me, s, bets, {
     // (A rewrite of the roll, or a new decision of it, settles again.)
     key: `${s.round}:${s.rollKey}:${s.rollBy}`,
     ...(s.pointBefore !== undefined ? { pointBefore: s.pointBefore } : {}),
-    // The fold's verdict: what each bettor won or lost on the roll (only
-    // bettors with a decision are named).
-    agrees: (pid, r) => (Object.prototype.hasOwnProperty.call(amounts, pid) ? amounts[pid] === r.net : !r.decided),
-    paidNothing: (pid) => (amounts[pid] ?? 0) < 0 && !pushes.includes(pid),
+    // The fold's verdict: what it credited each bettor, and what each won
+    // or lost on the roll (only bettors with a decision are named).
+    agrees: (pid, r) => (payouts[pid] ?? 0) === r.credited
+      && (Object.prototype.hasOwnProperty.call(amounts, pid) ? amounts[pid] === r.net : !r.decided),
+    // (By what it handed back, not the net: a bet that rides can win while
+    // a bigger one is forfeited.)
+    paidNothing: (pid) => !((payouts[pid] ?? 0) > 0),
   });
 }
 
@@ -811,7 +828,8 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     rt.landed = new Map();
     rt.openShow = null;
     rt.reopened = null;
-    rt.played = null;
+    rt.played = new Map();
+    rt.paid = new Set();
     rt.dirty = true;
     h.reset();
   }
@@ -1253,9 +1271,13 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let hand: number[] = [];
   /** The rail as laid out right now (frozen while a pickup drag runs). */
   let railView: RailStack[] = [];
-  /** 💰 Craps: while the roll on screen is in play (crapsRollInPlay), the
-   *  most the rail shows: what I had when it closed. What the roll pays
-   *  joins the rail as its chips land there, not when the settle comes. */
+  /** 💰 Craps: the most the rail shows. It follows my balance frame by
+   *  frame (update()) while no roll is in play here (crapsRollInPlay), and
+   *  holds what I had at the last frame before one was: what the roll pays
+   *  joins the rail as its chips land there, not when the settle comes,
+   *  even a credit that lands between frames before any frame here saw the
+   *  roll close (the doc's change refreshes the rail before the next
+   *  frame). Anything else that adds to my balance shows a frame later. */
   let railCap: number | null = null;
   let pickup: { stack: number; nextAt: number; interval: number } | null = null;
   let cursor: FeltPoint | null = null;
@@ -3045,11 +3067,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     update(): void {
       syncEpoch();
       dropStaleHold();
-      if (game === 'craps') {
-        const inPlay = crapsRollInPlay(itemId);
-        if (inPlay && railCap === null) railCap = readChips(me);
-        else if (!inPlay && railCap !== null) {
-          railCap = null;
+      if (game === 'craps' && (!crapsRollInPlay(itemId) || railCap === null)) {
+        const balance = readChips(me);
+        if (balance !== railCap) {
+          railCap = balance;
           refreshRail();
         }
       }

@@ -115,7 +115,10 @@ function stakes(bets: readonly CrapsBet[] | undefined): Map<string, number> {
 }
 
 /** What left each spot of a felt between before and after: a come / don't
- *  come bet that travelled to its number didn't leave (its chips moved). */
+ *  come bet that travelled to its number didn't leave (its chips moved).
+ *  Only for a settle the record doesn't agree with. One it agrees with
+ *  leaves by the rules (leaving): a bet replaced on its number by one that
+ *  travelled there shows no change between the two felts. */
 function departed(before: Map<string, number>, after: Map<string, number>): Map<string, number> {
   const out = new Map<string, number>();
   for (const [k, n] of before) {
@@ -133,6 +136,14 @@ function departed(before: Map<string, number>, after: Map<string, number>): Map<
     if (gone > 0) out.set(k, gone);
     else out.delete(k);
   }
+  return out;
+}
+
+/** What leaves each spot by the rules: every bet with a decision comes off
+ *  whole (the winnings of one that stays up come from the house). */
+function leaving(settle: BettorSettle): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [k, sp] of settle.spots) if (sp.back + sp.lost > 0) out.set(k, sp.back + sp.lost);
   return out;
 }
 
@@ -164,7 +175,8 @@ export interface SettleVerdict {
 export interface SettleInput {
   /** Each bettor's felt as the roll played it (as shown before the result). */
   before: Record<string, CrapsBet[]>;
-  /** …and as it stands after (what rides on). */
+  /** …and as it stands after (what rides on: what left a bettor's felt
+   *  when their record disagrees with the rules). */
   after: Record<string, CrapsBet[]>;
   /** The before felt's stacks as drawn (layoutStacks, tagged pid / spot). */
   stacks: readonly FeltStack[];
@@ -199,7 +211,7 @@ export function crapsSettleMoves(i: SettleInput): SettleMoves {
     const allLost = !agrees && i.verdict.paidNothing(pid);
     if (!agrees && !allLost) continue;
     const had = stakes(i.before[pid]);
-    const gone = departed(had, stakes(i.after[pid]));
+    const gone = agrees ? leaving(settle) : departed(had, stakes(i.after[pid]));
     const mine = pid === i.me;
     let near: FeltPoint | null = null;
     let paysBack = false;

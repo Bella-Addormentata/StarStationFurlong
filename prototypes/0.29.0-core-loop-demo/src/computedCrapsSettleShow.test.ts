@@ -3,7 +3,9 @@
  * page shows the fold of the players' records), on two pages: both play the
  * same moves from the shared result, once a roll (losers into the house,
  * the winner paid out of it onto their rail), and the winner's rail shows
- * the payout only once its chips have landed there.
+ * the payout only once its chips have landed there, even when the credit
+ * reaches the page between its frames; a roll rewritten by a forfeit after
+ * the next one opened plays its new decision.
  *
  * Built on the kits computedCrapsTable.test.ts uses (computedPageKit,
  * computedCrapsUiKit): each page its own load of the casino modules, synced
@@ -11,11 +13,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { clockOf, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, rigRoll, switchOn, sync } from './computedPageKit';
+import { forfeitKey } from './computedFold';
+import {
+  byRank, clockOf, CRAPS_CTX as CTX, CRAPS_INC as INC, CRAPS_REF as REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, putIn, rigRoll,
+  rigSplit, signAs, standAt, switchOn, sync,
+} from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { atCraps, loadUIPage, stubDom } from './computedCrapsUiKit';
 import type { UIPage } from './computedCrapsUiKit';
 import type { RailStack, SettleMoves } from './casinoTable3d';
+import type { CrapsBet } from './games/craps';
 
 stubDom();
 
@@ -64,6 +71,7 @@ function go(pages: UIPage[], from: number, to: number, until?: () => boolean): n
 }
 
 const foldOf = (p: Page) => p.casino.computedFoldOf(TABLE)!;
+const bet = (type: CrapsBet['type'], amount: number): CrapsBet => ({ type, amount });
 const railTotal = (rail: readonly RailStack[]): number => rail.reduce((a, s) => a + s.denom * s.count, 0);
 
 /** A settle's moves with whose-screen-it-is taken out: what every page
@@ -120,5 +128,88 @@ describe('💰 the settle on screen at a computed craps table', () => {
     expect(b.dice.settles).toHaveLength(1);
     ta.unmount();
     tb.unmount();
+  });
+
+  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips', async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    const ta = atCraps(a, { stand: 3 });
+    const tb = atCraps(b, { stand: 1 });
+    go(pages, T0, T0 + STEP);
+    rigRoll(pages, 1, 7);
+    ta.pick('2', 2);
+    ta.click('pass');
+    tb.pick('2');
+    tb.click('dontpass');
+    // Both felts written, betting still open on both pages.
+    go(pages, T0 + 2 * STEP, T0 + 4 * STEP);
+    expect(crapsOf(a)?.phase).toBe('betting');
+    const railBefore = railTotal(a.dice.rail());
+    const chipsBefore = a.casino.readChips(a.pid);
+    // A's page keeps up its part of the table (its records) but draws no
+    // frame until its balance has the payout: the close and the result
+    // reach its rail through the doc's changes alone.
+    let T = T0 + 5 * STEP;
+    for (; T < T0 + 120_000 && a.casino.readChips(a.pid) === chipsBefore; T += STEP) {
+      sync(T, ...pages);
+      frameOf(b, T);
+      const now = clockOf(a, T);
+      a.croupier.noteTablesRunning(now);
+      a.table.tickComputedTables([REF], now);
+      sync(T, ...pages);
+    }
+    expect(a.casino.readChips(a.pid)).toBe(chipsBefore + 20);
+    expect(crapsOf(a)?.phase).toBe('settled');
+    expect(railTotal(a.dice.rail())).toBe(railBefore);
+    // The show plays when A's frames come back, the rail held through it…
+    const at = go(pages, T, T + 60_000, () => a.dice.settles.length > 0);
+    expect(a.dice.settles).toHaveLength(1);
+    expect(railTotal(a.dice.rail())).toBe(railBefore);
+    // …until A's chips have landed.
+    go(pages, at + STEP, at + 3 * STEP);
+    expect(railTotal(a.dice.rail())).toBe(railBefore + 20);
+    ta.unmount();
+    tb.unmount();
+  });
+
+  it('a roll rewritten after the next one opened (a forfeit): both pages play its new decision from the felt as it played, once', async () => {
+    const pages = await room(['A', 'B']);
+    // w first to forfeit roll 1: both seeds throw a 6 (the point, nothing
+    // moves), w's alone a 7 (a natural).
+    const [w, x] = byRank(pages, 'forfeit', 1, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigSplit(pages, 1, 6, w, 7);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const tw = atCraps(w, { stand: 3 });
+    const tx = atCraps(x, { stand: 1 });
+    const decided = go(pages, T0 + STEP, T0 + 60_000, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === 1 && v.decided !== null)));
+    expect(crapsOf(w)).toMatchObject({ phase: 'settled', round: 1, result: 6 });
+    const open = go(pages, decided + STEP, decided + 60_000, () => pages.every((p) => crapsOf(p)?.round === 2 && crapsOf(p)?.phase === 'betting'));
+    expect(open).toBeLessThan(decided + 60_000);
+    // (The point: nothing moved.)
+    for (const p of pages) expect(p.dice.settles).toEqual([]);
+    clockOf(w, open + 100);
+    const f = signAs(w, 'forfeit', { r: 1, x: foldOf(w).rounds[0].close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    const at = go(pages, open + STEP, open + 30_000, () => pages.every((p) => p.dice.settles.length > 0));
+    expect(at).toBeLessThan(open + 30_000);
+    // Roll 1 shown again on its new decision: w's pass line back with its
+    // winnings; x, forfeited, paid nothing, so x's goes to the house.
+    expect(crapsOf(x)).toMatchObject({ phase: 'settled', round: 1, result: 7, payouts: { [w.pid]: 20 } });
+    for (const p of pages) {
+      expect(p.dice.settles).toHaveLength(1);
+      const [m] = p.dice.settles;
+      expect(m.lost.map((s) => [s.pid, s.spot, s.chips])).toEqual([[x.pid, 'pass:', [5, 5]]]);
+      expect(m.back.map((b) => [b.s.pid, b.s.spot, b.s.chips])).toEqual([[w.pid, 'pass:', [5, 5]]]);
+      expect(m.paid.map((q) => q.chips)).toEqual([[5, 5]]);
+    }
+    expect(shared(w.dice.settles[0])).toEqual(shared(x.dice.settles[0]));
+    // Nothing plays twice, however long it shows.
+    go(pages, at + STEP, at + 10_000);
+    for (const p of pages) expect(p.dice.settles).toHaveLength(1);
+    tw.unmount();
+    tx.unmount();
   });
 });
