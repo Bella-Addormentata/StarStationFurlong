@@ -126,6 +126,7 @@ import { showHint } from './hud';
 import { isDeviceFocusActive } from './deviceFocus';
 import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { boardKindOf, forgetBoard } from './boardDoc';
+import { forgetChalkboard, isChalkboardKind } from './chalkDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
 // 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
 import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
@@ -2707,6 +2708,8 @@ class RoomEditController {
     deleteFurnitureItem(itemId);
     // 📌 A board's notes go with it (#315).
     if (boardKindOf(item.kind)) forgetBoard(itemId);
+    // 🖍 …and a chalkboard's marks with it.
+    if (isChalkboardKind(item.kind)) forgetChalkboard(itemId);
 
     showHint(`Removed ${itemId}${cascade.length ? ` +${cascade.length} mounted layer${cascade.length === 1 ? '' : 's'}` : ''} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
   }

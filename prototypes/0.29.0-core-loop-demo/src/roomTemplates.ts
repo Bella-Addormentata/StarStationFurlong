@@ -33,6 +33,7 @@ import {
 import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
 import { clearRobotConfig, readRobotConfig, writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { boardKindOf, forgetBoard } from "./boardDoc";
+import { forgetChalkboard, isChalkboardKind } from "./chalkDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { PLAYER_R } from "./player";
@@ -843,6 +844,11 @@ function forgetDroppedBoards(next: readonly FurnitureItem[]): void {
   const kept = new Map(next.filter((i) => boardKindOf(i.kind)).map((i) => [i.id, i.kind] as const));
   for (const [id, rec] of readAllFurniture()) {
     if (boardKindOf(rec.kind) && kept.get(id) !== rec.kind) forgetBoard(id);
+  }
+  // 🖍 A chalkboard the layout drops takes its marks with it, the same way.
+  const keptChalk = new Set(next.filter((i) => isChalkboardKind(i.kind)).map((i) => i.id));
+  for (const [id, rec] of readAllFurniture()) {
+    if (isChalkboardKind(rec.kind) && !keptChalk.has(id)) forgetChalkboard(id);
   }
 }
 

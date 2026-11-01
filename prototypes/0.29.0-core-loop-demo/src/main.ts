@@ -203,6 +203,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
 import { bindBoardDoc, boardKindOf, mergeBoardView, refreshBoards, retryBoardView, setBoardDeps } from "./boardDoc";
+import { bindChalkDoc, setChalkDeps } from "./chalkDoc";
 import {
   applyDeparturesPublish,
   bindDeparturesDoc,
@@ -2288,6 +2289,10 @@ async function joinRoomAtEpoch(
     // scene can still hold a board the layout removed, or its old kind.
     boardOfItem: (itemId) => boardKindOf(placedFurnitureIn(sync.doc, itemId)?.kind),
   });
+  // 🖍 The chalkboards' marks: same seam, and a trim waits for the host's
+  // state as a board's does.
+  bindChalkDoc(sync.doc);
+  setChalkDeps({ canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)) });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
   // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
