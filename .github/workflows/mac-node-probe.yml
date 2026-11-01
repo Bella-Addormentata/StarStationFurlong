@@ -85,6 +85,7 @@ jobs:
         shell: bash
         run: |
           app=$(find "$RELEASE_FRONTEND/src-tauri/target" -maxdepth 5 -type d -name '*.app' | head -1)
+          app=$(cd "$app" && pwd)   # absolute: the node runs from another folder below
           echo "app: $app"
           ls -la "$app/Contents/MacOS"
           codesign -dv "$app/Contents/MacOS/ssf-p2p-node" 2>&1 || true
@@ -99,7 +100,7 @@ jobs:
           kill "$pid" 2>/dev/null || true
           sleep 1
           head -c 400 fp.json 2>/dev/null; echo
-          head -80 node.log
+          echo "--- node.log"; head -80 node.log
           [ "$ok" = 1 ] || { echo "::error::the bundled node never answered /api/fingerprint"; exit 1; }
 
       - name: 📤 Keep the .dmg
