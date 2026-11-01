@@ -3543,3 +3543,70 @@ fn after_a_restart_its_own_reveal_held_over_goes_back_from_its_state_file() {
         }
     }
 }
+
+/// Stopping right after a tick (REPUT_MS not due), a table held over the
+/// house's own record still has it back and its last word: the step-down
+/// puts back what was taken away on every pass.
+#[test]
+fn a_step_down_right_after_a_tick_puts_its_own_record_back_and_lifts_the_commitment() {
+    for restart in [false, true] {
+        let mut room = Room::new(&format!("stop-soon-{restart}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        if restart {
+            room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+            room.house.settle_ms = 0;
+            room.tick(0);
+        }
+        // A tick that put back what it had to: the next put-back not due.
+        room.tick(REPUT_MS);
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        let house = locked(&mut room);
+        let mut sent = 0;
+        step_down(&house, vec![(ROOM.to_string(), room.doc.clone())], room.now + TICK_MS, |_, _, _| sent += 1);
+        assert!(sent > 0, "{restart}: the step-down sent its word");
+        assert!(clean(room.raw(&key), &h1), "{restart}: put back");
+        let words = room.records("h:2:");
+        let d = &words.first().expect("the step-down's word").1;
+        assert!(strs(d, "x").is_empty(), "{restart}: round 2's commitment stepped down");
+    }
+}
+
+/// Playing on, what was taken away goes back once every REPUT_MS at most:
+/// a peer deleting the house's reveal on every tick costs the room one
+/// write of it a second.
+#[test]
+fn its_own_record_deleted_again_goes_back_once_every_reput_ms() {
+    let mut room = Room::new("reput-pace", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let (key, h1) = room.records("h:1:").pop().unwrap();
+    room.delete(&key);
+    room.tick(REPUT_MS);
+    assert!(clean(room.raw(&key), &h1), "put back");
+    let mut back = 0;
+    for _ in 0..(2 * REPUT_MS / TICK_MS) {
+        room.delete(&key);
+        room.tick(TICK_MS);
+        back += usize::from(room.raw(&key).is_some());
+    }
+    assert_eq!(back, 2, "twice in {} ms", 2 * REPUT_MS);
+}

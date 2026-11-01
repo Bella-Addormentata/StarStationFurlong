@@ -1347,9 +1347,12 @@ impl House {
             }
         }
 
-        // Put back what was taken away, every REPUT_MS.
+        // Put back what was taken away, every REPUT_MS; stepping down, every
+        // pass (a table held over its own record waits on it, and the
+        // step-down's last word may come before REPUT_MS is due).
+        let stepping_down = self.stepping_down;
         let mem = self.rooms.get_mut(room).unwrap();
-        if mem.last_reput.is_none_or(|at| now.saturating_sub(at) >= REPUT_MS) {
+        if stepping_down || mem.last_reput.is_none_or(|at| now.saturating_sub(at) >= REPUT_MS) {
             mem.last_reput = Some(now);
             // (One a page may read otherwise is no copy: it goes too.)
             let same = |a: Option<(CVal, hb::Clarity)>, b: &CVal| a.is_some_and(|(a, c)| c == hb::Clarity::Clear && hb::rec_hash(&a) == hb::rec_hash(b));
