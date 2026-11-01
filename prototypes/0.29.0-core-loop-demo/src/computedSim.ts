@@ -723,6 +723,9 @@ export class Sim {
    *  table in the room; null in a roulette room, which then runs as it
    *  always did (no draw, import or check of craps's). */
   readonly craps: CrapsHarness | null;
+  /** Every checkpoint the room's docs have held (canon): one written again
+   *  is a restore (checkOwnTrims). */
+  private readonly sumsSeen = new Set<string>();
   readonly rand: Rng;
   /** The house's page: it switched the tables on, and drives them. */
   house!: SimPage;
@@ -997,11 +1000,14 @@ export class Sim {
       if (sp.p !== p) return;
       const partial = (p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
       behind = this.logArrivals(sp, tr, computed, partial, behind);
-      if (!was) return;
-      this.checkOwnTrims(sp, tr, computed, was);
-      this.checkOwnForfeits(sp, tr, computed, was);
-      this.checkOwnAbandons(sp, tr, computed, was);
-      if (this.craps) this.craps.ownWrite(sp, tr, computed, was);
+      if (was) {
+        if (!sp.cheats) this.checkOwnTrims(sp, tr, computed, was);
+        this.checkOwnForfeits(sp, tr, computed, was);
+        this.checkOwnAbandons(sp, tr, computed, was);
+        if (this.craps) this.craps.ownWrite(sp, tr, computed, was);
+      }
+      const top = tr.changed.get(computed as unknown as Y.AbstractType<Y.YEvent<Y.AbstractType<unknown>>>);
+      for (const k of top ?? []) if (k?.startsWith('sum:')) this.sumsSeen.add(canon(computed.get(k)) ?? '');
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
       if (tr.origin === NET || tr.origin === HOUSE_ORIGIN || sp.p !== p || sp.cheats) return;
@@ -1093,6 +1099,10 @@ export class Sim {
     for (const [t, w] of was) {
       const res = casino.computedFoldOf(t);
       if (!w.res || !res || w.inc !== casino.computedIncOf(t) || w.res.base.sid === res.base.sid) continue;
+      // (A restore puts back a checkpoint the room held before, over a
+      // peer's: it moves the nets back to the head's, as the scenario that
+      // forges one checks. No trim writes one again.)
+      if (this.sumsSeen.has(canon(computed.get(`sum:${t}:${w.inc}`)) ?? '')) continue;
       if (netsText(w.res.nets) !== netsText(res.nets)) this.violate(`${sp.name}'s trim of ${t} at ${this.elapsed} ms moved nets ${netsText(w.res.nets)} → ${netsText(res.nets)}`);
       // (The final checkpoint of an incarnation an end mark ended while its
       // switch still names it hands on no table and holds nothing: every
@@ -1486,7 +1496,7 @@ export class Sim {
         const { casino, croupier, table } = sp.p;
         const tables = this.tables.filter((t) => sp.inRoom.has(t));
         const wakes = croupier.tablesWakeCount();
-        if (tables.length || table.computedCompactionPending()) croupier.noteTablesRunning(now);
+        if (tables.length || table.computedCompactionPending() || casino.computedRecoveryPending()) croupier.noteTablesRunning(now);
         if (croupier.tablesWakeCount() !== wakes) {
           this.wasAway(sp);
           sp.restartAt = { at: now, T: this.T };
@@ -1936,7 +1946,9 @@ export class Sim {
     if (bytes > this.maxDocBytes) this.maxDocBytes = bytes;
     if (bytes >= 1_000_000) this.violate(`${sp.name}'s doc weighs ${bytes} B at ${this.elapsed} ms`);
     const { casino } = sp.p;
-    if (sp.partial || !casino.casinoWhole() || !casino.computedSettled()) return;
+    // (Nor while a table reads as lost: a session or checkpoint it counted
+    // gone, its count kept until the recovery duty brings it back.)
+    if (sp.partial || !casino.casinoWhole() || this.tables.some((t) => !casino.casinoWhole(t)) || !casino.computedSettled()) return;
     for (const v of this.ledgerProblems(sp)) this.violate(`${sp.name} at ${this.elapsed} ms: ${v}`);
     // An incarnation ended (switched off, removed): its last checkpoint holds
     // the nets this page last folded of it live, to the same round (an
@@ -1991,9 +2003,17 @@ export class Sim {
       if (at) incs.set(`${at.t}:${at.inc}`, at);
     }
     const keyOf = this.keyOf(sp);
+    // (While the doc holds no checkpoint, deleted or junk, a page on this
+    // build counts from the head it holds: casinoDoc heldBase.)
+    const held = new Map(sp.p.casino.computedRecoveryOn() ? sp.p.casino.computedRecoveries().map((r) => [`${r.t}:${r.inc}`, r.head]) : []);
+    // 🩹 An ended incarnation whose checkpoint was deleted leaves no sum:/ses:
+    // key, but casinoDoc still counts its held head's balances (the recoveries
+    // above), so fold it too — else the cold ledger omits those balances and
+    // the oracle reports a false chip/cage violation while recovery is owed.
+    if (sp.p.casino.computedRecoveryOn()) for (const r of sp.p.casino.computedRecoveries()) incs.set(`${r.t}:${r.inc}`, { t: r.t, inc: r.inc });
     for (const [key, { t, inc }] of [...incs].sort(([a], [b]) => (a < b ? -1 : 1))) {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
-      const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`));
+      const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`)) ?? fold.asCheckpointFor(ctx)(held.get(key) ?? undefined);
       const ses = map.get(`ses:${t}:${inc}:${fold.nextSid(ctx, cp)}`);
       const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
       // (A house table's fold asks casinoDoc which keys are houses, as the
@@ -2117,7 +2137,7 @@ export class Sim {
     const out: string[] = [];
     if (sp.partial || !casino.casinoWhole()) out.push('its doc holds part of an update');
     if (!casino.computedSettled()) out.push('a count waits on its checks');
-    const runs = this.tables.some((t) => sp.inRoom.has(t)) || table.computedCompactionPending();
+    const runs = this.tables.some((t) => sp.inRoom.has(t)) || table.computedCompactionPending() || casino.computedRecoveryPending();
     if (runs && !croupier.tablesAwake(now)) out.push('its tables read asleep');
     if (sp.timers.length > 0) out.push(`${sp.timers.length} timers wait`);
     return out;
@@ -2165,7 +2185,7 @@ export class Sim {
       if (sp.mode !== 'up') continue;
       const now = this.enter(sp);
       const { casino, table } = sp.p;
-      if (table.computedCompactionPending()) return false;
+      if (table.computedCompactionPending() || casino.computedRecoveryPending()) return false;
       for (const t of this.tables) {
         const res = casino.computedFoldOf(t);
         if (!res || !casino.isComputedTable(t)) continue;

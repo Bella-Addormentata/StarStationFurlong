@@ -53,6 +53,29 @@ export interface FeltStack {
   lift?: number;
   /** Roulette colour chips: the owner's colour (the value stays printed). */
   color?: string;
+  /** Whose chips these are and the bet they stand for (its spotKey), for the
+   *  settle's sweeps and payouts (crapsSettleShow). Drawing ignores them. */
+  pid?: string;
+  spot?: string;
+}
+
+/** 💰 A settled roll's chips on the move, as the crew moves them
+ *  (settleChips): the losing stacks swept into the house first, then each
+ *  winner paid out of it onto their rail, with the stakes that come down. */
+export interface SettleMoves {
+  /** Where the house takes chips in and pays them out: in front of the
+   *  stickman. */
+  house: FeltPoint;
+  /** Losing chips, from where they stood, into the house. */
+  lost: FeltStack[];
+  /** Stakes coming back (a win that comes down, a push), from where they
+   *  stood to `to` on their bettor's rail. `order`: the bettor's place in
+   *  the pay-out (one after another, as a dealer pays round the table);
+   *  `mine`: the rail is the viewer's. */
+  back: Array<{ s: FeltStack; to: FeltPoint; order: number; mine: boolean }>;
+  /** Winnings out of the house to `to` on each winner's rail, bottom chip
+   *  first. */
+  paid: Array<{ chips: number[]; to: FeltPoint; order: number; mine: boolean; dim: boolean; color?: string }>;
 }
 
 /** Where a player's chip rail runs: centred at (x, z), along one axis. */
@@ -105,6 +128,12 @@ export interface CasinoTableVisualHandle {
    *  your rail: the next felt update that drops chips of yours from a stack
    *  sends those chips across, the way a dealer pushes them back. */
   sweepToRail(to: FeltPoint): void;
+  /** 💰 Play a settled roll's chip moves (every client: from the shared
+   *  settled state, so everyone sees the same sweep and pay-out). Call it
+   *  before the felt update that drops the moved chips. */
+  settleChips(moves: SettleMoves): void;
+  /** Are chips still on their way to the viewer's own rail? */
+  payingMe(): boolean;
   /** ⚖️ The plaque beside the ⚙️: a green-circled F (FAIR) or a red-circled F (FRIENDLY). */
   setFairBadge(fair: boolean): void;
   // 🎲 craps
@@ -1409,6 +1438,128 @@ export function departedChips(before: readonly FeltStack[], after: readonly Felt
   return out;
 }
 
+// ── 💰 The settle's chip moves ──────────────────────────────────────────────
+
+/** A losing stack's slide into the house, and its drop out of sight there
+ *  (a stack sinking into the bank, or into a rail, drops below the felt or
+ *  the rail top, which hide it). */
+const SWEEP_IN_S = 0.55;
+const SINK_S = 0.16;
+/** When the pay-out starts: once the losers are in, or almost at once when
+ *  nothing lost. */
+const PAY_AFTER_LOSS_S = SWEEP_IN_S + 0.1;
+const PAY_NO_LOSS_S = 0.15;
+/** Each bettor paid a beat after the one before, as the crew pays round the
+ *  table (and no later than this many beats). */
+const PAY_STAGGER_S = 0.18;
+const PAY_STAGGER_MAX = 8;
+/** A payout rising out of the house, then sliding to its winner's rail; a
+ *  stake that comes down slides there with it. */
+const RISE_S = 0.18;
+const PAY_SLIDE_S = 0.7;
+const BACK_SLIDE_S = 0.6;
+/** How high a stack lifts over the felt on its way (it clears the stacks
+ *  it passes; a dealer slides chips low). */
+const SWEEP_ARC = 0.04;
+const PAY_ARC = 0.08;
+
+/** One leg of a moving stack: to (x, y, z) in `s` seconds, lifted `arc` at
+ *  its middle. y is the stack's bottom face. */
+interface ChipLeg {
+  x: number;
+  y: number;
+  z: number;
+  s: number;
+  arc: number;
+}
+
+/** A stack on the move (settleChips): it waits `wait` seconds where it
+ *  starts (out of sight while `hidden`: a payout still in the house), then
+ *  runs its legs and is gone. `mine`: bound for the viewer's own rail. */
+interface ChipRun {
+  chips: readonly number[];
+  dim: boolean;
+  color?: string;
+  at: { x: number; y: number; z: number };
+  legs: ChipLeg[];
+  wait: number;
+  hidden: boolean;
+  mine: boolean;
+  seed: number;
+  t: number;
+}
+
+const runLength = (r: ChipRun): number => r.wait + r.legs.reduce((a, l) => a + l.s, 0);
+
+/** Where a moving stack's bottom chip is now, or null while it is out of
+ *  sight (still in the house, or done). */
+export function chipRunAt(r: Pick<ChipRun, 'at' | 'legs' | 'wait' | 'hidden' | 't'>): { x: number; y: number; z: number } | null {
+  let t = r.t - r.wait;
+  if (t < 0) return r.hidden ? null : r.at;
+  let p = r.at;
+  for (const leg of r.legs) {
+    if (t < leg.s) {
+      const k = leg.s > 0 ? t / leg.s : 1;
+      const e = k * k * (3 - 2 * k);
+      return {
+        x: p.x + (leg.x - p.x) * e,
+        y: p.y + (leg.y - p.y) * e + Math.sin(Math.PI * k) * leg.arc,
+        z: p.z + (leg.z - p.z) * e,
+      };
+    }
+    t -= leg.s;
+    p = leg;
+  }
+  return null;
+}
+
+/** How deep a stack drops to sink out of sight. */
+const sinkDepth = (chips: readonly unknown[]): number => chips.length * CHIP_H + 0.004;
+
+/** The runs one settle plays (TableHandle.settleChips): the losers into the
+ *  house first; then, bettor by bettor, each payout rising out of the house
+ *  and sliding to its winner's rail, the stakes that come down sliding there
+ *  with it. Every run drops out of sight where it ends. */
+export function settleRuns(m: SettleMoves): ChipRun[] {
+  const fy = FELT_Y + 0.001;
+  const house = { x: m.house.x, y: fy, z: m.house.z };
+  const runs: ChipRun[] = [];
+  const seed = () => 401 + runs.length * 5;
+  for (const s of m.lost) {
+    runs.push({
+      chips: s.chips, dim: s.dim, color: s.color, at: { x: s.x, y: fy + (s.lift ?? 0) * CHIP_H, z: s.z },
+      legs: [{ ...house, s: SWEEP_IN_S, arc: SWEEP_ARC }, { ...house, y: fy - sinkDepth(s.chips), s: SINK_S, arc: 0 }],
+      wait: 0, hidden: false, mine: false, seed: seed(), t: 0,
+    });
+  }
+  const payAt = m.lost.length > 0 ? PAY_AFTER_LOSS_S : PAY_NO_LOSS_S;
+  const turn = (order: number) => payAt + Math.min(Math.max(0, order), PAY_STAGGER_MAX) * PAY_STAGGER_S;
+  for (const { s, to, order, mine } of m.back) {
+    runs.push({
+      chips: s.chips, dim: s.dim, color: s.color, at: { x: s.x, y: fy + (s.lift ?? 0) * CHIP_H, z: s.z },
+      legs: [
+        { x: to.x, y: RAIL_Y, z: to.z, s: BACK_SLIDE_S, arc: SWEEP_ARC },
+        { x: to.x, y: RAIL_Y - sinkDepth(s.chips), z: to.z, s: SINK_S, arc: 0 },
+      ],
+      // (Leaving as its payout leaves the house: they reach the rail together.)
+      wait: turn(order) + RISE_S + PAY_SLIDE_S - BACK_SLIDE_S, hidden: false, mine, seed: seed(), t: 0,
+    });
+  }
+  for (const { chips, to, order, mine, dim, color } of m.paid) {
+    if (chips.length === 0) continue;
+    runs.push({
+      chips, dim, color, at: { ...house, y: fy - sinkDepth(chips) },
+      legs: [
+        { ...house, s: RISE_S, arc: 0 },
+        { x: to.x, y: RAIL_Y, z: to.z, s: PAY_SLIDE_S, arc: PAY_ARC },
+        { x: to.x, y: RAIL_Y - sinkDepth(chips), z: to.z, s: SINK_S, arc: 0 },
+      ],
+      wait: turn(order), hidden: true, mine, seed: seed(), t: 0,
+    });
+  }
+  return runs;
+}
+
 /** Pitch between rail stacks (a chip and a sliver of rail). */
 export const RAIL_PITCH = CHIP_RADIUS * 2 + 0.006;
 
@@ -1452,6 +1603,8 @@ class TableHandle implements CasinoTableVisualHandle {
   private sweepArm: { to: FeltPoint; left: number } | null = null;
   /** Chips sliding back to the rail (t: seconds into the slide). */
   private sweeps: Array<{ s: FeltStack; to: FeltPoint; t: number }> = [];
+  /** 💰 A settle's stacks on the move (settleChips). */
+  private runs: ChipRun[] = [];
   private dirty = true;
   private highlightKey = '';
   private highlightIds: ReadonlySet<string> = new Set();
@@ -1521,6 +1674,18 @@ class TableHandle implements CasinoTableVisualHandle {
 
   sweepToRail(to: FeltPoint): void {
     this.sweepArm = { to, left: SWEEP_ARM_S };
+  }
+
+  settleChips(moves: SettleMoves): void {
+    // (The settle moves these chips: a take-down still waiting for its
+    // chips to leave would slide them a second time.)
+    this.sweepArm = null;
+    this.runs.push(...settleRuns(moves));
+    this.dirty = true;
+  }
+
+  payingMe(): boolean {
+    return this.runs.some((r) => r.mine);
   }
 
   setRailStacks(stacks: readonly RailStack[]): void {
@@ -1620,6 +1785,7 @@ class TableHandle implements CasinoTableVisualHandle {
     this.setTakeDown(null, false);
     this.sweepArm = null;
     this.sweeps = [];
+    this.runs = [];
   }
 
   diceRestAt(p: FeltPoint, values?: [number, number]): void {
@@ -1676,6 +1842,10 @@ class TableHandle implements CasinoTableVisualHandle {
       const y = y0 + (RAIL_Y - y0) * e + Math.sin(Math.PI * k) * 0.03;
       pools.stack(s.chips, x, y, z, false, 307 + i * 5, s.color);
     });
+    for (const r of this.runs) {
+      const p = chipRunAt(r);
+      if (p) pools.stack(r.chips, p.x, p.y, p.z, r.dim, r.seed, r.color);
+    }
     if (this.hand) {
       const chips = [...this.hand.chips].sort((a, b) => b - a);
       pools.stack(chips, this.hand.p.x, FELT_Y + 0.05, this.hand.p.z, false, 211, this.ownColor);
@@ -1696,6 +1866,11 @@ class TableHandle implements CasinoTableVisualHandle {
     if (this.sweeps.length > 0) {
       for (const sw of this.sweeps) sw.t += dt;
       this.sweeps = this.sweeps.filter((sw) => sw.t < SWEEP_S);
+      this.dirty = true;
+    }
+    if (this.runs.length > 0) {
+      for (const r of this.runs) r.t += dt;
+      this.runs = this.runs.filter((r) => r.t < runLength(r));
       this.dirty = true;
     }
     this.dice?.update(dt);

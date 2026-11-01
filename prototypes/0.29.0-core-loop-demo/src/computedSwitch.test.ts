@@ -1846,9 +1846,10 @@ describe("World's frame (world.ts updateCroupier)", () => {
     expect(body.slice(body.lastIndexOf('\n', tryAt) + 1, tryAt).trim()).toBe('');
   });
 
-  it('marks the frame while a removed computed table waits to be compacted, with no table left in the room too', () => {
-    expect(body).toContain('if (tables.length || computedCompactionPending()) noteTablesRunning();');
+  it('marks the frame while a removed computed table waits to be compacted or recovered, with no table left in the room too', () => {
+    expect(body).toContain('if (tables.length || computedCompactionPending() || computedRecoveryPending()) noteTablesRunning();');
     expect(world).toMatch(/import \{ autoSwitchComputed, computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
+    expect(world).toMatch(/import \{ computedRecoveryPending, [^}]*\} from "\.\/casinoDoc";/);
   });
 
   it("switches each owner-run table on by itself on the house's driving page (the table lease), before its beat", () => {

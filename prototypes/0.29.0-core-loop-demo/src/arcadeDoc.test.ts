@@ -697,22 +697,22 @@ describe('the screen view', () => {
   it('the default game → taken off (empty) → the owner\'s own: attract (blinking) → in play, from the records alone', () => {
     now = ARCADE_BLINK_MS * 10; // an even phase
     expect(arcadeScreenView(CAB)).toEqual({
-      mode: 'attract', title: 'THWAITE', line: 'PRESS START', lane: 'SOVEREIGN', blink: true, plays: 0,
+      mode: 'attract', title: 'THWAITE', line: 'PRESS START', lane: 'SOVEREIGN', blink: true, plays: 0, game: 'thwaite',
     });
     owner = true;
     takeOffCabinet(CAB);
     expect(arcadeScreenView(CAB)).toEqual({
-      mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: 0,
+      mode: 'empty', title: 'FURLONG ARCADE', line: 'THE OWNER PICKS A GAME', lane: '', blink: false, plays: 0, game: '',
     });
     putOnCabinet(CAB, PACMAN);
     expect(arcadeScreenView(CAB)).toEqual({
-      mode: 'attract', title: 'PACMAN', line: 'INSERT COIN', lane: 'CONVENIENCE', blink: true, plays: 0,
+      mode: 'attract', title: 'PACMAN', line: 'INSERT COIN', lane: 'CONVENIENCE', blink: true, plays: 0, game: '',
     });
     now += ARCADE_BLINK_MS;
     expect(arcadeScreenView(CAB).blink).toBe(false);
     insertCoin(CAB);
     expect(arcadeScreenView(CAB)).toEqual({
-      mode: 'inplay', title: 'PACMAN', line: 'P1 · Alice', lane: 'CONVENIENCE', blink: false, plays: 0,
+      mode: 'inplay', title: 'PACMAN', line: 'P1 · Alice', lane: 'CONVENIENCE', blink: false, plays: 0, game: '',
     });
     now += ARCADE_SEAT_LAPSE_MS;
     expect(arcadeScreenView(CAB).mode).toBe('attract'); // the seat lapsed

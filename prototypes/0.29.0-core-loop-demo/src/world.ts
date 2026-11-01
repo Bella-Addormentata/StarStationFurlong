@@ -25,7 +25,7 @@ import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS, type Seat } from "./seats";
 import { freeSeatFor, keepsSeat, seatClaimedBy } from "./seatOccupancy";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
+import { computedRecoveryPending, isComputedTable, readTableState, readCrapsTableState } from "./casinoDoc";
 import type { TableClosing } from "./casinoDoc";
 import { autoSwitchComputed, computedCompactionPending, tickComputedTables } from "./computedTable";
 import type { ComputedTableRef } from "./computedTable";
@@ -204,6 +204,9 @@ import { boardGate } from "./departuresDoc";
 import { boardKindOf, readBoardScreen } from "./boardDoc";
 import { lookBoardPhotos } from "./boardPhotos";
 import { createBoardUI } from "./boardUI";
+import type { ChalkboardHandle } from "./chalkboardBuild";
+import { createChalkboardUI } from "./chalkSession";
+import { disposeChalkboard } from "./chalkDoc";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
@@ -241,6 +244,7 @@ import { chessSeatOf, chessStandIndexFor } from "./games/chessTable";
 import { createCheckersTableLayer } from "./checkersSession";
 import { createChessTableLayer, paintGameTable } from "./chessSession";
 import { createArcadeCabinetUI as createNesCabinetUI } from "./arcadeNesCabinet";
+import { standbyPicture } from "./arcadeStandby";
 // 🕹️ Shared arcade games: every cabinet's game runs on every page in the
 // room from the host's button presses (arcadeNesSession.ts).
 import { arcadeFrame, closeArcadeCabinet, registerArcadeVisual } from "./arcadeNesSession";
@@ -562,6 +566,9 @@ export class World {
   /** ⛓️🥣 Faucet dish fixtures, keyed by item id — pushed the room's last
    *  faucet status at ~1 Hz (jar level, mojos in the dish, pending spend). */
   private faucetDishes: Map<string, FaucetDishHandle> = new Map();
+  /** 🖍 Chalkboards: driven every frame (timers and face), and handed to the
+   *  focused board's session. */
+  private chalkboards: Map<string, ChalkboardHandle> = new Map();
   /** ⛓️🥣 main.ts installs the node request path (NetworkProvider.requestFaucet)
    *  so the dish screen can ask for status / take / give. */
   public onFaucetRequest: ((op: FaucetOp, amount?: number) => FaucetRequestTicket) | null = null;
@@ -1963,6 +1970,7 @@ export class World {
       alligatorsVisuals: this.alligatorsVisuals,
       casinoTableVisuals: this.casinoTableVisuals,
       faucetDishes: this.faucetDishes,
+      chalkboards: this.chalkboards,
     };
   }
 
@@ -3458,6 +3466,8 @@ export class World {
     this.alligatorsVisuals.delete(itemId);
     this.casinoTableVisuals.delete(itemId);
     this.faucetDishes.delete(itemId);
+    this.chalkboards.delete(itemId);
+    disposeChalkboard(itemId);
     forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -4229,6 +4239,8 @@ export class World {
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
+    // 🖍 Chalkboards paint what changed on them (theirs or the room's marks).
+    for (const board of this.chalkboards.values()) board.update(deltaTime);
     // 🔮 #251: the map table's hologram turns and keeps to the shared clock.
     for (const holo of this.mapHolograms.values()) holo.update(deltaTime);
     // 🧹 #327: and the room's splat renderer draws only while one of them
@@ -6408,10 +6420,12 @@ export class World {
     // 💤 Every page running tables marks the frame, so one waking from a
     // sleep acts on none until its doc has caught up (croupier.ts). 🧮 So
     // too while a computed table removed from the room waits to be compacted
-    // (its incarnation ended, its sessions still in the doc): with no table
-    // left, unmarked frames would read as asleep a lapse on, and compaction
-    // runs only on an awake page.
-    if (tables.length || computedCompactionPending()) noteTablesRunning();
+    // (its incarnation ended, its sessions still in the doc), or while any
+    // recovery is still owed (computedRecoveryPending): with no table left,
+    // unmarked frames would read as asleep a lapse on, and both run only on
+    // an awake page — so a deleted ended checkpoint or session would never be
+    // put back or given up once the room's last table is gone.
+    if (tables.length || computedCompactionPending() || computedRecoveryPending()) noteTablesRunning();
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
@@ -6658,10 +6672,14 @@ export class World {
         openLink: wide ? () => linkNativeArcade(deviceId, seat) : undefined,
         keys: own.controls,
         notice: wide ? undefined : "MADE FOR THE DOUBLE-WIDE CABINET",
+        // Its own title, as the idle cabinet shows it (#333): drawn for the
+        // double-wide's 8:3 screen, so only there.
+        standby: wide ? { kind: "title", lines: own.lines, paint: own.paintTitle } : undefined,
         requestRelease: () => deviceFocus.release(),
       });
     }
-    if (view === "play" && builtInEntry(readCabinet(deviceId).game)) {
+    const lib = view === "play" ? builtInEntry(readCabinet(deviceId).game) : null;
+    if (lib) {
       return createNesCabinetUI({
         itemId: deviceId,
         visual: this.arcadeCabinetVisuals.get(deviceId),
@@ -6671,6 +6689,9 @@ export class World {
         onPlay: () => countBuiltInPlay(deviceId),
         seat: seat === 1 ? 1 : 0,
         seats,
+        // The game's own standby screen — title and menu — in the menu's
+        // place (#333); the game starts from it (arcadeNesSession).
+        standby: { kind: "picture", picture: () => standbyPicture(lib.id) },
         requestRelease: () => deviceFocus.release(),
       });
     }
@@ -7268,6 +7289,14 @@ export class World {
         // Dim the in-world screen while focused, as the terminal does (D0.4).
         onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "chalkboard") {
+      // 🖍 The chalkboard: no panel. The session aims the pointer at the
+      // board: chalk and eraser off the tray, press and hold to write.
+      const ui = createChalkboardUI({ itemId: deviceId, handle: this.chalkboards.get(deviceId) ?? null });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }

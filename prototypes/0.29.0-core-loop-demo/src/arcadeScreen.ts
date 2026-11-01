@@ -1,7 +1,8 @@
 /**
  * 🕹️ The arcade cabinet's screen: everything that paints the cabinet's
- * in-world CanvasTexture — the running game, the game menu, the credits
- * pages and the idle attract card.
+ * in-world CanvasTexture — the running game, its standby screen (#333: a
+ * picture of the game's own title and menu, with a band of what to press),
+ * the menu it falls back to, the credits pages and the idle attract card.
  *
  * The canvas is 512×480, exactly twice the NES's 256×240, so each NES pixel is
  * a 2×2 block — or, on the double-wide cabinet, 1024×384, its two tubes' 8:3,
@@ -54,10 +55,58 @@ export interface ArcadeMenuRow {
   detail?: string[];
 }
 
+/** The band along the bottom of a standby picture. */
+export interface StandbyBand {
+  /** The middle: PRESS START, or what is going on (LOADING…). */
+  centre: string;
+  /** Whether the middle shows now: PRESS START blinks. */
+  on: boolean;
+  /** Small words at its ends: the tally, the way to the credits. */
+  left?: string;
+  right?: string;
+}
+
+/** The band's height on the 512×480 screen: the bottom 17 NES rows. */
+const BAND_H = 34;
+
+/**
+ * Paint a game's standby picture (a bundled ROM's title screen, 256×240)
+ * over the whole `w`×`h` canvas, stretched as the game is, and its band
+ * along the bottom: dark enough to read, clear enough that the game's own
+ * bottom lines show through.
+ */
+export function paintStandby(
+  ctx: CanvasRenderingContext2D, w: number, h: number, picture: CanvasImageSource, band: StandbyBand,
+): void {
+  ctx.save();
+  ctx.setTransform(w / SCREEN_W, 0, 0, h / SCREEN_H, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(picture, 0, 0, SCREEN_W, SCREEN_H);
+  const top = SCREEN_H - BAND_H;
+  ctx.fillStyle = 'rgba(4,10,7,0.74)';
+  ctx.fillRect(0, top, SCREEN_W, BAND_H);
+  ctx.fillStyle = PHOSPHOR_DIM;
+  ctx.fillRect(0, top, SCREEN_W, 2);
+  const say = (s: string, x: number, size: number, color: string, align: CanvasTextAlign, max: number) => {
+    ctx.font = `bold ${size}px ${FONT}`;
+    ctx.fillStyle = color;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'middle';
+    ctx.fillText(s, x, top + BAND_H / 2 + 1, max);
+  };
+  if (band.on) say(band.centre, SCREEN_W / 2, 18, AMBER, 'center', SCREEN_W - 200);
+  if (band.left) say(band.left, 22, 12, PHOSPHOR_DIM, 'left', 90);
+  if (band.right) say(band.right, SCREEN_W - 22, 12, PHOSPHOR_DIM, 'right', 90);
+  ctx.restore();
+}
+
 export interface ArcadeScreenPainter {
   /** Paint one emulator frame. */
   drawFrame(frame: ArrayLike<number>): void;
-  /** The game menu: rows, the selected one, an optional status line. */
+  /** The game's standby picture and its band (paintStandby). */
+  drawStandby(picture: CanvasImageSource, band: StandbyBand): void;
+  /** The game menu: rows, the selected one, an optional status line. The
+   *  cabinet shows it where it has no standby picture (yet). */
   drawMenu(rows: ArcadeMenuRow[], selected: number, status: string | null, blink: boolean): void;
   /** One credits page per bundled game (page ≥ games ⇒ the closing page). */
   drawCredits(page: number): void;
@@ -120,6 +169,11 @@ export function createArcadeScreenPainter(
       s.ctx.putImageData(s.image, 0, 0);
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(s.canvas, 0, 0, SCREEN_W, SCREEN_H);
+    },
+
+    drawStandby(picture, band) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      paintStandby(ctx, canvas.width, canvas.height, picture, band);
     },
 
     drawMenu(rows, selected, status, blink) {

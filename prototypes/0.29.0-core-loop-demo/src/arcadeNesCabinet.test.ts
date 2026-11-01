@@ -18,6 +18,7 @@ import {
   menuFor,
   menuInput,
   menuRows,
+  standbyBand,
   type ArcadeView,
 } from './arcadeNesCabinet';
 import { ARCADE_GAMES } from './arcadeLibrary';
@@ -65,6 +66,40 @@ describe('menu model', () => {
     expect(menuInput({ screen: 'credits', page: 0 }, 'LEFT', MENU).view).toEqual({ screen: 'credits', page: CREDIT_PAGES - 1 });
     expect(menuInput({ screen: 'credits', page: CREDIT_PAGES - 1 }, 'RIGHT', MENU).view).toEqual({ screen: 'credits', page: 0 });
     expect(menuInput({ screen: 'credits', page: 2 }, 'B', MENU).view).toEqual(menu(CREDITS));
+  });
+});
+
+describe('the standby screen (#333)', () => {
+  it("its band says PRESS START (blinking) and how to reach the credits; a status stays lit", () => {
+    expect(standbyBand({ screen: 'menu', cursor: 0, status: null }, MENU, true))
+      .toEqual({ centre: 'PRESS START', on: true, right: 'SELECT CREDITS' });
+    expect(standbyBand({ screen: 'menu', cursor: 0, status: null }, MENU, false).on).toBe(false);
+    expect(standbyBand({ screen: 'menu', cursor: 0, status: 'COULD NOT LOAD THAT GAME' }, MENU, false))
+      .toMatchObject({ centre: 'COULD NOT LOAD THAT GAME', on: true });
+    // A cabinet's own game has no credits page.
+    expect(standbyBand({ screen: 'menu', cursor: 0, status: null }, menuFor({ id: 'x', title: 'X', blurb: '', controls: '' }), true).right)
+      .toBeUndefined();
+  });
+
+  it('Start or A plays, Select opens the credits, and the D-pad and B move nothing', () => {
+    for (const b of ['START', 'A'] as const) {
+      expect(menuInput(menu(0), b, MENU, true).action).toEqual({ kind: 'start', game: ARCADE_GAMES[1] });
+    }
+    expect(menuInput(menu(0), 'SELECT', MENU, true).view).toEqual({ screen: 'credits', page: 1 });
+    for (const b of ['UP', 'DOWN', 'LEFT', 'RIGHT', 'B'] as const) {
+      expect(menuInput(menu(0), b, MENU, true)).toEqual({ view: menu(0), action: { kind: 'none' } });
+    }
+    // Back from the credits to the standby screen, not to a credits row.
+    expect(menuInput({ screen: 'credits', page: 1 }, 'B', MENU, true).view).toEqual(menu(0));
+    // A cabinet's own game: no credits to open.
+    const own = menuFor({ id: 'x', title: 'X', blurb: '', controls: '' });
+    expect(menuInput(menu(0), 'SELECT', own, true).view).toEqual(menu(0));
+  });
+
+  it('says so to a screen reader', () => {
+    expect(describeView(menu(0), MENU, true))
+      .toBe(`${ARCADE_GAMES[1].title}, its title screen. Enter plays, Shift shows the credits. ${ARCADE_GAMES[1].blurb} ${ARCADE_GAMES[1].controls}`);
+    expect(describeView({ screen: 'menu', cursor: 0, status: 'PLAYER 1 LEFT' }, MENU, true)).toMatch(/^PLAYER 1 LEFT\. /);
   });
 });
 
@@ -197,6 +232,7 @@ function key(
 function recordingPainter() {
   return {
     drawFrame: vi.fn(),
+    drawStandby: vi.fn(),
     drawMenu: vi.fn(),
     drawCredits: vi.fn(),
     drawCard: vi.fn(),
@@ -351,6 +387,82 @@ describe('the focus UI', () => {
     const after = key('keydown', 'ArrowDown');
     win.dispatchEvent(after);
     expect(after.defaultPrevented).toBe(false);
+  });
+
+  it("shows the game's standby screen in the menu's place (#333), its name until the picture is here", async () => {
+    const painter = recordingPainter();
+    const setPictureLines = vi.fn();
+    const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn(), setPictureLines };
+    setArcadeRomFetcher(vi.fn(async () => thwaite));
+    registerArcadeVisual(ITEM, visual, { x: 0, z: 0 });
+    let picture: object | null = null;
+    const ui = createArcadeCabinetUI({
+      itemId: ITEM, visual, requestRelease: vi.fn(),
+      standby: { kind: 'picture', picture: () => picture as CanvasImageSource | null },
+    });
+    const host = fakeElement('div');
+    ui.mount(host as unknown as HTMLElement);
+    expect(painter.drawCard).toHaveBeenLastCalledWith(ARCADE_GAMES[0].title, 'PRESS START'); // nothing to show yet
+    expect(painter.drawMenu).not.toHaveBeenCalled();
+    expect(painter.drawStandby).not.toHaveBeenCalled();
+
+    picture = { width: 256, height: 240 };
+    tick(ui, 60); // the blinks repaint
+    expect(painter.drawStandby).toHaveBeenLastCalledWith(picture, expect.objectContaining({ centre: 'PRESS START', right: 'SELECT CREDITS' }));
+    expect(painter.drawMenu).not.toHaveBeenCalled();
+    expect(setPictureLines).toHaveBeenLastCalledWith(256, 240);
+    // PRESS START blinks.
+    const shown = new Set(painter.drawStandby.mock.calls.map((c) => (c[1] as { on: boolean }).on));
+    expect([...shown].sort()).toEqual([false, true]);
+    const strip = host.children.find((c) => c.id === 'arcade-strip')!;
+    expect(strip.children[0]!.textContent).toBe('ENTER PLAY · SHIFT CREDITS · ESC LEAVE');
+
+    // The picture is the game's own menu: the D-pad moves nothing here…
+    const draws = painter.drawStandby.mock.calls.length;
+    win.dispatchEvent(key('keydown', 'ArrowDown'));
+    win.dispatchEvent(key('keyup', 'ArrowDown'));
+    tick(ui);
+    expect(painter.drawStandby.mock.calls.length).toBeGreaterThanOrEqual(draws);
+    expect(painter.drawCredits).not.toHaveBeenCalled();
+    // …Shift (Select) opens the credits, Enter comes back.
+    win.dispatchEvent(key('keydown', 'ShiftLeft'));
+    win.dispatchEvent(key('keyup', 'ShiftLeft'));
+    tick(ui);
+    expect(painter.drawCredits).toHaveBeenLastCalledWith(0);
+    win.dispatchEvent(key('keydown', 'Enter'));
+    win.dispatchEvent(key('keyup', 'Enter'));
+    tick(ui);
+    expect(painter.drawStandby.mock.lastCall?.[1]).toMatchObject({ centre: 'PRESS START' });
+    expect(readArcade(ITEM)).toBeNull();
+
+    // Start plays the game from there.
+    win.dispatchEvent(key('keydown', 'Enter'));
+    await flush();
+    tick(ui, 30);
+    expect(readArcade(ITEM)?.game).toBe(ARCADE_GAMES[0].id);
+    expect(painter.drawFrame).toHaveBeenCalled();
+    ui.unmount();
+  });
+
+  it("a cabinet's own game draws its own title as its standby, in its picture's rows", () => {
+    const painter = recordingPainter();
+    const setPictureLines = vi.fn();
+    const visual: ArcadeCabinetVisualHandle = { painter, present: vi.fn(), showAttract: vi.fn(), setPictureLines };
+    const paintTitle = vi.fn();
+    const ui = createArcadeCabinetUI({
+      itemId: ITEM, visual, requestRelease: vi.fn(),
+      game: () => ({ id: 'own', title: 'OWN', blurb: '', controls: '' }),
+      link: { shared: () => null, takeError: () => null, host: vi.fn(), stop: vi.fn(), join: vi.fn(), setButtons: vi.fn(),
+        setLocalPad2: vi.fn(), setAudio: vi.fn(), setUiScreen: vi.fn(), release: vi.fn() },
+      standby: { kind: 'title', lines: [320, 120], paint: paintTitle },
+    });
+    ui.mount(fakeElement('div') as unknown as HTMLElement);
+    expect(painter.drawMenu).not.toHaveBeenCalled();
+    expect(setPictureLines).toHaveBeenLastCalledWith(320, 120);
+    const draw = painter.drawWith.mock.lastCall?.[0] as (ctx: unknown, w: number, h: number) => void;
+    draw('ctx', 1024, 384);
+    expect(paintTitle).toHaveBeenLastCalledWith('ctx', 'PRESS START', true, 1024, 384);
+    ui.unmount();
   });
 
   it("at a two-player cabinet's free stand you play player 2; hand it back and Enter takes it again", () => {

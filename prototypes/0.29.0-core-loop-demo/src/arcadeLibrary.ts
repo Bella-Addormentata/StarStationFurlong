@@ -36,7 +36,25 @@ export interface ArcadeGame {
   blurb: string;
   /** One line for the cabinet menu: which buttons. */
   controls: string;
+  /** The game's own standby screen — its title and menu — and how the
+   *  console gets there from power-on: run `frames` frames, holding START
+   *  for STANDBY_START_FRAMES from frame `start` (a notice page to get past).
+   *  Every copy of a shared game starts there (arcadeNesSession), so the
+   *  live game picks up from the picture the cabinet showed. */
+  standby: StandbyRecipe;
+  /** Served path of a picture of that screen (public/arcade/standby): what
+   *  the cabinet shows while nobody plays, without loading the game.
+   *  arcadeStandby.test.ts writes it, and checks it is that frame. */
+  standbyUrl: string;
 }
+
+export interface StandbyRecipe {
+  frames: number;
+  start?: number;
+}
+
+/** How long a standby recipe holds START. */
+export const STANDBY_START_FRAMES = 4;
 
 /** What a cabinet's menu needs of its game: a bundled ROM, or one of the
  *  cabinet's own games (arcadeNativeGames.ts). */
@@ -56,6 +74,9 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
     licenseUrl: '/arcade/licenses/GPL-3.0.txt',
     blurb: 'Missiles at night. Shoot them down, save the town.',
     controls: 'D-PAD AIM  B LEFT SILO  A RIGHT SILO',
+    // Past its licence notice to the title and its menu (1P, 2P, practice).
+    standby: { frames: 30, start: 10 },
+    standbyUrl: '/arcade/standby/thwaite.png',
   },
   {
     id: 'concentration-room',
@@ -70,6 +91,8 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
     licenseUrl: '/arcade/licenses/GPL-3.0.txt',
     blurb: 'Flip cards, find the pairs. Solo, 2P or vs CPU.',
     controls: 'D-PAD MOVE  A FLIP  START BEGIN',
+    standby: { frames: 12 },
+    standbyUrl: '/arcade/standby/concentration-room.png',
   },
   {
     id: 'nesert-golfing',
@@ -83,6 +106,9 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
     licenseUrl: '/arcade/licenses/CC-BY-4.0.txt',
     blurb: 'One endless desert course. One stroke at a time.',
     controls: 'SEE HELP ON THE TITLE SCREEN',
+    // The title draws at frame 43; its menu's arrows then cycle colour.
+    standby: { frames: 48 },
+    standbyUrl: '/arcade/standby/nesert-golfing.png',
   },
   {
     id: 'robotfindskitten',
@@ -96,6 +122,10 @@ export const ARCADE_GAMES: readonly ArcadeGame[] = [
     licenseUrl: '/arcade/licenses/zlib-robotfindskitten.txt',
     blurb: 'You are robot. Find kitten. A zen simulation.',
     controls: 'D-PAD MOVE  BUMP THINGS TO LOOK',
+    // Its intro page: the Start pressed there lays out the field, so the
+    // standby stops short of it, or every game would hide kitten in one place.
+    standby: { frames: 16 },
+    standbyUrl: '/arcade/standby/robotfindskitten.png',
   },
 ];
 

@@ -43,6 +43,27 @@ settings: one of the games above on the built-in emulator (it plays on the
 cabinet's screen and the room watches), or the owner's own game in EmulatorJS.
 Players don't pick games; they walk up and press play.
 
+## Standby pictures
+
+While nobody plays, a cabinet shows its game's own standby screen, its title
+and menu, from a picture of it, so the game needn't load until someone presses
+Start; the game then starts on that very screen. The sign above the screen
+takes the game's logo from the same picture. Each picture is one frame of the
+game above, made by running its ROM unmodified in jsnes (`src/arcadeStandby.test.ts`
+writes them and checks them), and is under that game's license:
+
+| Game | Picture |
+|---|---|
+| Thwaite | `standby/thwaite.png` (its title and menu, past the licence notice) |
+| Concentration Room | `standby/concentration-room.png` |
+| robotfindskitten | `standby/robotfindskitten.png` (its intro page) |
+| NESert Golfing | `standby/nesert-golfing.png` |
+
+To add a game, give it a `standby` recipe in `src/arcadeLibrary.ts` (how many
+frames from power-on, and when to press Start to get past a notice page) and
+run `ARCADE_STANDBY_WRITE=1 npx vitest run src/arcadeStandby.test.ts`. A sign
+for it (colours, the logo's place in the picture) goes in `src/arcadeSigns.ts`.
+
 ## EmulatorJS, for the owner's own game
 
 The owner's own game runs in [EmulatorJS](https://github.com/EmulatorJS/EmulatorJS)
