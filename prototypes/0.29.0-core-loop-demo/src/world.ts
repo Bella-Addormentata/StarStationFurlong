@@ -91,6 +91,8 @@ import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
   ARCADE_CABINET_KINDS,
+  arcadeSeatEye,
+  arcadeWidePanels,
   FURNITURE,
   FURNITURE_DEFS,
   DEFAULT_FOOTPRINT_OVERRIDES,
@@ -248,7 +250,9 @@ import {
   setNativeCabinetGameReader,
 } from "./arcadeNativeSession";
 // 🕹🕹 Which of the double-wide's four stations a click or a walk-up names.
-import { wideClick, wideStationFor, type WideClick } from "./arcadeStations";
+import { standCrowded, wideClick, wideStationFor, type WideClick } from "./arcadeStations";
+import { blocksSight } from "./sightline";
+import { foxSquish } from "./foxSquish";
 import { writeArcade, writeNativeArcade } from "./games/gamesDoc";
 // 🏒 #115: the air-hockey live layer — World feeds it built table handles +
 // frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
@@ -373,10 +377,6 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
-
-/** 🕹🕹 A double-wide cabinet stand counts as taken by somebody standing
- *  this close to it: under half the 0.4 m between its stands. */
-const NATIVE_STAND_TAKEN_M = 0.18;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -4668,12 +4668,38 @@ export class World {
   private updateRemoteAvatars(deltaTime: number): void {
     // Frame-rate-safe equivalent of the old fixed 0.28-per-frame lerp at 60fps.
     const factor = 1 - Math.pow(1 - 0.28, deltaTime * 60);
+    // 🦊👁 #345: while the camera flies in to a device or is focused on
+    // it, a fox standing across its line of sight is hidden (the players
+    // beside you at the double-wide cabinet, whose heads the camera would
+    // sit inside).
+    const views = deviceFocus.getViews();
+    // 🦊🦊 #345: every fox in the room, where it stood last frame, for each
+    // to squish to fit beside the others (foxSquish.ts). Ours counts while
+    // we stand in the room, seen or not (focused, first person), as it does
+    // on everyone else's screen.
+    const me = this.player.mesh;
+    const foxes = [
+      ...(this.isPlayerActive()
+        ? [{ rig: null as VoxelCharacter | null, x: me.position.x, y: me.position.y, z: me.position.z }]
+        : []),
+      ...[...this.remotePlayers.values()].map((a) => {
+        const p = a.rig.masterGroup.position;
+        return { rig: a.rig as VoxelCharacter | null, x: p.x, y: p.y, z: p.z };
+      }),
+    ];
+    const squishOf = (rig: VoxelCharacter | null, at: { x: number; y: number; z: number }, facing: number) =>
+      foxSquish(at, facing, foxes.filter((f) => f.rig !== rig));
+    const mine = squishOf(null, me.position, this.player.getDrawnFacing());
+    this.player.squishTo(mine.width, mine.shift);
     for (const avatar of this.remotePlayers.values()) {
       const pos = avatar.rig.masterGroup.position;
       avatar.lastX = pos.x;
       avatar.lastZ = pos.z;
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
+      avatar.rig.masterGroup.visible = !views.some((v) => blocksSight(v.eye, v.anchor, pos));
+      const squish = squishOf(avatar.rig, pos, avatar.rig.getFacing());
+      avatar.rig.squishTo(squish.width, squish.shift);
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.
@@ -6685,21 +6711,30 @@ export class World {
       const own = at(mine);
       return own && reachable(own) ? own : null;
     }
+    const others = this.getRemoteAvatarSnapshots();
     const all: StandSlot[] = [];
     const free: StandSlot[] = [];
     for (let n = 0; n < 4; n++) {
       const s = at(n);
       if (!s) continue;
       all.push(s);
-      if (seatStatus(deviceId, n) === "free" && reachable(s)) free.push(s);
+      if (seatStatus(deviceId, n) === "free" && !standCrowded(stands, s, others) && reachable(s)) free.push(s);
     }
-    return wideStationFor(all, free, this.player.getPosition(), click);
+    return wideStationFor(all, free, this.player.getPosition(), click, this.arcadeWidePanels(deviceId));
+  }
+
+  /** 🕹🕹🕹🕹 #345: the double-wide cabinet's four panels in the room (by
+   *  seat), for a click on its screens to pick the station below it. */
+  private arcadeWidePanels(deviceId: string): Array<{ x: number; z: number }> | undefined {
+    const item = FURNITURE.find((i) => i.id === deviceId);
+    return item ? arcadeWidePanels(item) : undefined;
   }
 
   /** 🕹🕹 The double-wide cabinet's own game: this page's stand if it plays
    *  there, else the station it walked up to or clicked (`click`) whose seat
-   *  is free and nobody stands on. Its stands are a stride apart, too close
-   *  for pickFreeStand's 0.7 m test: one player would shut out the next. */
+   *  is free and nobody stands on (standCrowded). Its stands close up to a
+   *  stride apart where the floor is short (#345), too close for
+   *  pickFreeStand's 0.7 m test: one player would shut out the next. */
   private pickNativeSeatStand(deviceId: string, click?: WideClick): StandSlot | null {
     const stands = standsForItem(deviceId);
     const at = (n: number) => stands.find((s) => s.id === `${deviceId}:s${n}`) ?? null;
@@ -6719,11 +6754,11 @@ export class World {
       all.push(s);
       if (
         st === "free" &&
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < NATIVE_STAND_TAKEN_M) &&
+        !standCrowded(stands, s, others) &&
         reachable(s)
       ) free.push(s);
     });
-    return wideStationFor(all, free, this.player.getPosition(), click);
+    return wideStationFor(all, free, this.player.getPosition(), click, this.arcadeWidePanels(deviceId));
   }
 
   /**
@@ -7289,8 +7324,12 @@ export class World {
           : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId, at)
             : null;
       const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : own ? null : 0;
+      // 🕹 #345: a player at a station looks at the screen from in front of
+      // their own controls, slightly left or right to its middle.
+      const item = FURNITURE.find((i) => i.id === deviceId);
+      const eye = stand && item && seat !== null ? arcadeSeatEye(item, seat) : null;
       const target: DeviceTarget = stand
-        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, ...(eye ? { eye } : {}) }
         : device;
       deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, seats === 2 ? 2 : 1));
       return;

@@ -1,10 +1,12 @@
 /**
  * 🕹🕹🕹🕹 The double-wide arcade cabinet's stations: which one a player
  * means when they click the cabinet. Each station (a stick, two buttons and
- * a coin door, lit in its player's colour) has a stand a pace back from it,
- * and the stand's index is the seat: station 1 is player 1 in the game.
- * Pure (World passes in the free stands, where the player is and where the
- * click met the cabinet), so it can be tested.
+ * a coin door, lit in its player's colour) has a stand a pace back, and the
+ * stand's index is the seat: station 1 is player 1 in the game. The stands
+ * are spread a metre apart, wider than the panels (#345), so a click on the
+ * screens is measured from the panels. Pure (World passes in the free
+ * stands, where the player is, where the click met the cabinet and where
+ * its panels are), so it can be tested.
  */
 
 import type { StandSlot } from './furniture';
@@ -32,6 +34,33 @@ export function wideClick(
   return { x: point.x, z: point.z, station: typeof station === 'number' ? station : null };
 }
 
+/** Anybody this close to a stand stands on it, however close the next
+ *  stand is (two pushed onto one walkable cell share a spot). */
+export const STAND_TAKEN_MIN_M = 0.18;
+
+/**
+ * 🕹🕹🕹🕹 #345: whether somebody (one of `others`) already stands on stand
+ * `s` of the cabinet's stands `all`: nearer it than half way to the next
+ * one, or than STAND_TAKEN_MIN_M. That is a fifth of a metre where the
+ * stands have closed up at the panels and half a metre where they are
+ * spread out, and it holds across a re-layout: when furniture moved away
+ * spreads the stands while a player plays on at their old closed-up spot
+ * (#347 review), the stand that now lands beside them counts as taken, so
+ * nobody else is walked onto them.
+ */
+export function standCrowded(
+  all: readonly StandSlot[],
+  s: StandSlot,
+  others: ReadonlyArray<{ x: number; z: number }>,
+): boolean {
+  const gap = all.reduce(
+    (min, o) => (o === s ? min : Math.min(min, Math.hypot(o.front.x - s.front.x, o.front.z - s.front.z))),
+    Infinity,
+  );
+  const r = Number.isFinite(gap) ? Math.max(STAND_TAKEN_MIN_M, gap / 2) : WIDE_STAND_AT_M;
+  return others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < r);
+}
+
 /** A stand's seat, from its id (`${itemId}:s${n}`). */
 const standSeat = (s: StandSlot): number => Number(s.id.slice(s.id.lastIndexOf(':s') + 2));
 
@@ -40,23 +69,28 @@ const standSeat = (s: StandSlot): number => Number(s.id.slice(s.id.lastIndexOf('
  * the one a player at `me` means: the station they clicked (its stick,
  * buttons or coin door), by its seat, wherever its stand had to be moved to
  * be walkable; else, clicking the screens, the station they have walked up
- * to (its stand within WIDE_STAND_AT_M of them); else the free one nearest
- * the click, or them. A station clicked or walked up to that is taken gives
- * the free one nearest the click. Null when none is free.
+ * to (its stand within WIDE_STAND_AT_M of them); else the free one whose
+ * panel is nearest the click (`panels`, by seat; without them, its stand),
+ * or whose stand is nearest them. A station clicked or walked up to that is
+ * taken gives the free one nearest the click. Null when none is free.
  */
 export function wideStationFor(
   all: readonly StandSlot[],
   free: readonly StandSlot[],
   me: { x: number; z: number },
   click?: WideClick,
+  panels?: ReadonlyArray<{ x: number; z: number }>,
 ): StandSlot | null {
-  const dist = (s: StandSlot, p: { x: number; z: number }) => Math.hypot(s.front.x - p.x, s.front.z - p.z);
-  const nearest = (of: readonly StandSlot[], p: { x: number; z: number }) =>
-    of.reduce<StandSlot | null>((best, s) => (best === null || dist(s, p) < dist(best, p) ? s : best), null);
+  type At = (s: StandSlot) => { x: number; z: number };
+  const stand: At = (s) => s.front;
+  const panel: At = (s) => panels?.[standSeat(s)] ?? s.front;
+  const dist = (a: { x: number; z: number }, p: { x: number; z: number }) => Math.hypot(a.x - p.x, a.z - p.z);
+  const nearest = (of: readonly StandSlot[], p: { x: number; z: number }, at: At) =>
+    of.reduce<StandSlot | null>((best, s) => (best === null || dist(at(s), p) < dist(at(best), p) ? s : best), null);
   if (click && click.station !== null) {
-    return free.find((s) => standSeat(s) === click.station) ?? nearest(free, click);
+    return free.find((s) => standSeat(s) === click.station) ?? nearest(free, click, panel);
   }
-  const here = nearest(all, me);
-  if (here && dist(here, me) < WIDE_STAND_AT_M && free.includes(here)) return here;
-  return nearest(free, click ?? me);
+  const here = nearest(all, me, stand);
+  if (here && dist(here.front, me) < WIDE_STAND_AT_M && free.includes(here)) return here;
+  return click ? nearest(free, click, panel) : nearest(free, me, stand);
 }

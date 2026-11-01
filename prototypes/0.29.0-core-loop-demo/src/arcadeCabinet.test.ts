@@ -28,7 +28,8 @@ function fakeCanvas() {
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
 const {
-  buildItemGroup, ARCADE_BUTTON_TRAVEL, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, ARCADE_STICK_THROW, FURNITURE_DEFS,
+  buildItemGroup, arcadeWidePanels, ARCADE_BUTTON_TRAVEL, ARCADE_CABINET_KINDS, ARCADE_GEAR_Y, ARCADE_STICK_THROW,
+  FURNITURE_DEFS,
 } = await import('./furniture');
 const { SEAT_COLOURS } = await import('./lanternRoadPaint');
 
@@ -247,7 +248,7 @@ describe('the double-wide cabinet as built', () => {
     expect(box.max.x - box.min.x).toBeGreaterThan(1.4); // across both of them
   });
 
-  it("has four stations, each in front of its own stand, in that player's ninja colour", () => {
+  it("has four stations, each at its own panel, in that player's ninja colour", () => {
     const parts = new Map<number, THREE.Mesh[]>();
     buildWide().traverse((obj) => {
       if (!(obj instanceof THREE.Mesh) || obj.userData.arcadeStation === undefined) return;
@@ -255,14 +256,15 @@ describe('the double-wide cabinet as built', () => {
       parts.set(n, [...(parts.get(n) ?? []), obj]);
     });
     expect([...parts.keys()].sort()).toEqual([0, 1, 2, 3]);
-    const stands = FURNITURE_DEFS['arcade-cabinet-wide'].stands!;
+    // #345: the panels a click on the screens is measured from.
+    const panels = arcadeWidePanels({ pos: { x: 0, z: 0 }, rot: 0 });
     for (const [n, meshes] of parts) {
       // A stick (shaft and ball), two buttons, a coin door and its light.
       expect(meshes.length).toBe(6);
       for (const mesh of meshes) {
         const x = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3()).x;
-        const nearest = stands.reduce((best, s, i) =>
-          Math.abs(s.stand.x - x) < Math.abs(stands[best]!.stand.x - x) ? i : best, 0);
+        const nearest = panels.reduce((best, p, i) =>
+          Math.abs(p.x - x) < Math.abs(panels[best]!.x - x) ? i : best, 0);
         expect(nearest).toBe(n);
       }
       // The ball, the buttons and the coin light glow in the ninja's colour.
@@ -358,10 +360,14 @@ describe('the sticks and buttons, moving with the players (setControls)', () => 
         setControls!([]);
         return out;
       };
-      // Whose controls a mesh at x is: the nearest stand's player.
-      const stands = def.stands ?? [{ stand: { x: 0, z: 0 } }];
+      // Whose controls a mesh at x is: the nearest panel's player (the
+      // double-wide's stands are spread wider than its panels, #345), or
+      // the nearest stand's.
+      const controlsX = kind === 'arcade-cabinet-wide'
+        ? arcadeWidePanels({ pos: { x: 0, z: 0 }, rot: 0 }).map((p) => p.x)
+        : (def.stands ?? [{ stand: { x: 0, z: 0 } }]).map((st) => st.stand.x);
       const owner = (x: number) =>
-        stands.reduce((best, st, n) => (Math.abs(st.stand.x - x) < Math.abs(stands[best]!.stand.x - x) ? n : best), 0);
+        controlsX.reduce((best, sx, n) => (Math.abs(sx - x) < Math.abs(controlsX[best]! - x) ? n : best), 0);
 
       for (let p = 0; p < players; p++) {
         const pad = (bits: number) => Array.from({ length: players }, (_, n) => (n === p ? bits : 0));
