@@ -292,9 +292,10 @@ fn house_inc(inc: &str) -> bool {
     (inc.starts_with('r') || inc.starts_with('d')) && inc.len() == 25 && hex_of(&inc[1..], 24)
 }
 
-/// A switch exactly as casinoDoc computedCfgInc reads it: {v: 1, inc}.
+/// A switch as casinoDoc computedCfgInc reads it: {v: 1, inc}, and no
+/// other entry (`Object.keys` lists an undefined one too).
 fn switch_inc(v: &CVal) -> Option<String> {
-    if !has_fields(v, &["v", "inc"], &[]) || v.get("v").and_then(CVal::as_int) != Some(1) {
+    if v.entries()?.len() != 2 || v.get("v").and_then(CVal::as_int) != Some(1) {
         return None;
     }
     let inc = str_of(v, "inc")?;
@@ -312,8 +313,41 @@ fn fair_after(a: &CVal, b: &CVal) -> bool {
     (s(a), hb::rec_hash(a).unwrap_or_default()) > (s(b), hb::rec_hash(b).unwrap_or_default())
 }
 
-/// A checkpoint as asCheckpointFor reads it, as far as the session id and
-/// the house need: its shape (the carry only as an object).
+/// computedCraps CARRY_POINTS (0: no point), MAX_RIDERS and MAX_SHOOTER_PID.
+const CARRY_POINTS: &[i64] = &[0, 4, 5, 6, 8, 9, 10];
+const MAX_RIDERS: usize = 31;
+const MAX_SHOOTER_PID: usize = 128;
+
+/// computedFold isCarry: a craps checkpoint's carry, held to every rule
+/// CrapsCarry states. The point one of CARRY_POINTS; at most MAX_RIDERS
+/// riders, each a player id with a canonical felt that has chips on it
+/// (every rider Object.keys lists: an undefined one has no felt); a shooter
+/// `h` and a last shooter `a` that are player ids of at most
+/// MAX_SHOOTER_PID UTF-16 units; `i` only as 1, and only with a shooter.
+fn is_carry(v: &CVal) -> bool {
+    if !has_fields(v, &["p", "w"], &["h", "a", "i"]) || !v.get("p").and_then(CVal::as_int).is_some_and(|p| CARRY_POINTS.contains(&p)) {
+        return false;
+    }
+    let Some(w) = v.get("w").and_then(CVal::entries) else { return false };
+    if w.len() > MAX_RIDERS || !w.iter().all(|(pid, f)| is_pid(pid) && f.as_arr().is_some_and(|f| !f.is_empty() && felt_ok(true, f))) {
+        return false;
+    }
+    let shooter = |k: &str| match v.get(k) {
+        None => true,
+        Some(x) => x.as_str().is_some_and(|x| is_pid(x) && x.encode_utf16().count() <= MAX_SHOOTER_PID),
+    };
+    let i_ok = match v.get("i") {
+        None => true,
+        Some(i) => i.as_int() == Some(1) && v.get("h").is_some(),
+    };
+    shooter("h") && shooter("a") && i_ok
+}
+
+/// A checkpoint as computedFold asCheckpointFor reads it: its shape; a
+/// house commitment `h` only on a live one at a house table; at craps the
+/// carry `s` (isCarry) on a live one and none on an ended one; every net
+/// Object.keys lists (an undefined one is no net). The house reads the
+/// checkpoints the pages read, and no other: one they throw out is no base.
 fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
     let craps = craps_inc(inc);
     let optional: &[&str] = if craps { &["e", "s", "h"] } else { &["e", "h"] };
@@ -333,21 +367,41 @@ fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
         return false;
     }
     if let Some(h) = v.get("h") {
-        if ended || !h.as_str().is_some_and(|h| hex_of(h, 64)) {
+        if ended || !house_inc(inc) || !h.as_str().is_some_and(|h| hex_of(h, 64)) {
             return false;
         }
     }
-    if craps && (ended != v.get("s").is_none() || v.get("s").is_some_and(|s| s.fields().is_none())) {
+    if craps && (ended != v.get("s").is_none() || v.get("s").is_some_and(|s| !is_carry(s))) {
         return false;
     }
     let net = |s: &str| {
         let d = s.strip_prefix('-').unwrap_or(s);
         !d.is_empty() && d.len() <= 40 && !d.starts_with('0') && d.bytes().all(|b| b.is_ascii_digit())
     };
-    match v.get("n").and_then(CVal::fields) {
+    match v.get("n").and_then(CVal::entries) {
         Some(n) => n.len() <= 4_096 && n.iter().all(|(pid, x)| is_pid(pid) && x.as_str().is_some_and(net)),
         None => false,
     }
+}
+
+/// computedFold asForfeit's `n`: 1–MAX_FROZEN player ids, strictly
+/// ascending as the pages compare strings, by UTF-16 code units (not by
+/// bytes: an astral pid sorts below one in U+E000–U+FFFF there).
+fn forfeit_ids(v: &CVal) -> Option<Vec<String>> {
+    let ids: Vec<String> = v.get("n")?.as_arr()?.iter().map(|p| p.as_str().filter(|p| is_pid(p)).map(str::to_string)).collect::<Option<_>>()?;
+    let ascending = ids.windows(2).all(|w| w[0].encode_utf16().cmp(w[1].encode_utf16()) == std::cmp::Ordering::Less);
+    (!ids.is_empty() && ids.len() <= MAX_FROZEN && ascending).then_some(ids)
+}
+
+/// computedFold asClose's `f`: 1–MAX_FROZEN entries, each a player id and
+/// the hash of the slip frozen (every entry Object.keys lists: an
+/// undefined one is no hash).
+fn close_frozen(v: &CVal) -> Option<Vec<(String, String)>> {
+    let fs = v.get("f")?.entries()?;
+    if fs.is_empty() || fs.len() > MAX_FROZEN {
+        return None;
+    }
+    fs.iter().map(|(p, x)| x.as_str().filter(|x| is_pid(p) && hex_of(x, 32)).map(|x| (p.clone(), x.to_string()))).collect()
 }
 
 /// A record's key parts (computedFold parseKey): kind, round, pid (s and x), hash.
@@ -1250,11 +1304,7 @@ impl House {
                     }
                     let q = str_of(&v, "q").filter(|q| *q == "g" || hex_of(q, 24) || hex_of(q, 32));
                     let ch = v.get("h").map(|x| x.as_str().filter(|x| hex_of(x, 64)));
-                    let f: Option<Vec<(String, String)>> = v.get("f").and_then(CVal::fields).and_then(|fs| {
-                        (!fs.is_empty() && fs.len() <= MAX_FROZEN)
-                            .then(|| fs.iter().map(|(p, x)| x.as_str().filter(|x| is_pid(p) && hex_of(x, 32)).map(|x| (p.clone(), x.to_string()))).collect())
-                            .flatten()
-                    });
+                    let f = close_frozen(&v);
                     let (Some(q), Some(f), Some(k)) = (q, f, k) else { continue };
                     if ch == Some(None) {
                         continue;
@@ -1264,11 +1314,7 @@ impl House {
                     closes.push((close, v));
                 }
                 'f' => {
-                    // computedFold asForfeit: n sorted, unique, 1–MAX_FROZEN player ids.
-                    let n: Option<Vec<String>> = v.get("n").and_then(CVal::as_arr).and_then(|n| {
-                        let ids: Option<Vec<String>> = n.iter().map(|p| p.as_str().filter(|p| is_pid(p)).map(str::to_string)).collect();
-                        ids.filter(|ids| !ids.is_empty() && ids.len() <= MAX_FROZEN && ids.windows(2).all(|w| w[0] < w[1]))
-                    });
+                    let n = forfeit_ids(&v);
                     if has_fields(&v, &["r", "x", "n", "k", "g"], &[]) && g_ok {
                         if let (Some(x), Some(n), Some(k)) = (str_of(&v, "x").filter(|x| hex_of(x, 32)), n, k) {
                             forfeits.push(Forfeit { hash: h.to_string(), r, x: x.to_string(), n, k, v });

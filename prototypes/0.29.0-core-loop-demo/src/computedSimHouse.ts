@@ -286,7 +286,7 @@ export class SimHouse {
     for (const [key, v] of casino.entries()) {
       if (!key.startsWith('cfg:computed:')) continue;
       const t = key.slice('cfg:computed:'.length);
-      if (!isPlain(v) || !hasFields(v, ['v', 'inc']) || v.v !== 1 || typeof v.inc !== 'string') continue;
+      if (!isPlain(v) || Object.keys(v).length !== 2 || v.v !== 1 || typeof v.inc !== 'string') continue;
       const inc = v.inc;
       if (!/^[ckrd][0-9a-f]{24}$/.test(inc) || !houseRules(inc) || casino.has(`gone:${t}:${inc}`)) continue;
       tables.push([t, inc]);

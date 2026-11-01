@@ -1747,3 +1747,290 @@ fn a_tick_that_panics_in_one_room_holds_back_no_other_room_nor_the_step_down() {
     assert_eq!(sent, [ROOM]);
     assert!(strs(&room.records("h:2:")[0].1, "x").is_empty());
 }
+
+// ── PR 6n: what the house reads is what the pages read ───────────────────────
+
+fn vectors() -> serde_json::Value {
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/computed-house-v1.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+/// A close as the house reads it (read_table's checks, the round aside:
+/// the key's): computedFold asClose.
+fn close_ok(v: &CVal) -> bool {
+    has_fields(v, &["r", "q", "f", "k", "g"], &["h"])
+        && is_round(v.get("r")).is_some()
+        && str_of(v, "q").is_some_and(|q| q == "g" || hex_of(q, 24) || hex_of(q, 32))
+        && str_of(v, "k").is_some_and(is_pub)
+        && str_of(v, "g").is_some_and(is_sig)
+        && v.get("h").is_none_or(|h| h.as_str().is_some_and(|h| hex_of(h, 64)))
+        && close_frozen(v).is_some()
+}
+
+/// test-vectors `checkpoints`, `forfeits` and `closes`: the house takes
+/// the ones the fold takes, and no other. A carry is held to isCarry (the
+/// point, the riders and their felts, the shooters' lengths in UTF-16
+/// units, `i`), a house commitment only at a house table, and a forfeit's
+/// ids ascend as JS compares strings.
+#[test]
+fn checkpoints_forfeits_and_closes_read_as_the_fold_reads_them() {
+    let v = vectors();
+    let cases = v["checkpoints"].as_array().unwrap();
+    assert!(cases.len() >= 70);
+    for case in cases {
+        let inc = case["inc"].as_str().unwrap();
+        let cp = CVal::from_json(&case["value"]);
+        assert_eq!(checkpoint_ok(&cp, inc), case["ok"].as_bool().unwrap(), "{inc}: {}", case["value"]);
+    }
+    let cases = v["forfeits"].as_array().unwrap();
+    assert!(cases.len() >= 20);
+    for case in cases {
+        let f = CVal::from_json(&case["value"]);
+        assert_eq!(forfeit_ids(&f).is_some(), case["ok"].as_bool().unwrap(), "{}", case["value"]["n"]);
+    }
+    let cases = v["closes"].as_array().unwrap();
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let c = CVal::from_json(&case["value"]);
+        assert_eq!(close_ok(&c), case["ok"].as_bool().unwrap(), "{}", case["value"]["f"]);
+    }
+}
+
+/// test-vectors `yjs`: values a peer can write that no JSON holds
+/// (undefined entries, own `__proto__` fields), each in the Yjs update a
+/// page wrote, read as a page receiving it reads it: the same canon and
+/// hash, and the same verdict from the reader.
+#[test]
+fn values_no_json_holds_read_as_a_page_receiving_them_reads_them() {
+    let v = vectors();
+    let cases = v["yjs"].as_array().unwrap();
+    assert!(cases.len() >= 18);
+    let (mut exact, mut junk) = (0, 0);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let bytes = hex::decode(case["update"].as_str().unwrap()).unwrap();
+            txn.apply_update(yrs::Update::decode_v1(&bytes).unwrap()).unwrap();
+        }
+        let txn = doc.transact();
+        let m = txn.get_map("m").unwrap();
+        let Some(Out::Any(any)) = m.get(&txn, "v") else { panic!("{name}: no value") };
+        let val = CVal::from_any(&any);
+        let kind = case["kind"].as_str().unwrap();
+        let ok = match kind {
+            "checkpoint" => Some(checkpoint_ok(&val, case["inc"].as_str().unwrap())),
+            "close" => Some(close_ok(&val)),
+            _ => None,
+        };
+        if case["proto"].as_bool().unwrap() || case["refused"].as_bool().unwrap() {
+            // A value the node can't read as the pages do: junk, so the
+            // house acts on no record a page doesn't count.
+            assert_eq!(hb::canon(&val), None, "{name}: canon");
+            assert_eq!(hb::rec_hash(&val), None, "{name}: hash");
+            assert_eq!(ok, (kind != "canon").then_some(false), "{name}: verdict");
+            junk += 1;
+        } else {
+            assert_eq!(hb::canon(&val).as_deref(), case["canon"].as_str(), "{name}: canon");
+            assert_eq!(hb::rec_hash(&val).as_deref(), case["hash"].as_str(), "{name}: hash");
+            assert_eq!(ok, case["ok"].as_bool(), "{name}: verdict");
+            exact += 1;
+        }
+    }
+    assert!(exact >= 5 && junk >= 12, "{exact} read exactly, {junk} as junk");
+}
+
+#[test]
+fn a_switch_holds_v_and_inc_and_nothing_else() {
+    let sw = |extra: Vec<(&str, CVal)>| {
+        let mut f = vec![("v", CVal::Int(1)), ("inc", s(INC))];
+        f.extend(extra);
+        obj(f)
+    };
+    assert_eq!(switch_inc(&sw(vec![])).as_deref(), Some(INC));
+    // computedCfgInc counts Object.keys, which lists an undefined entry.
+    assert_eq!(switch_inc(&sw(vec![("x", CVal::Undef)])), None);
+    assert_eq!(switch_inc(&sw(vec![("x", s("1"))])), None);
+    assert_eq!(switch_inc(&obj(vec![("v", CVal::Int(1)), ("inc", CVal::Undef), ("x", s(INC))])), None);
+    assert_eq!(switch_inc(&obj(vec![("v", CVal::Int(2)), ("inc", s(INC))])), None);
+}
+
+impl Room {
+    /// A trim as a page writes it: checkpoint `body` signed by `by`, the
+    /// live session deleted, the next one opened holding the records under
+    /// `copies` byte for byte (a v0.51 trim's round-u copies): the next
+    /// session's key.
+    fn trim(&self, by: &Who, body: CVal, copies: &[String]) -> String {
+        let old = self.ses_key();
+        let cp = signed("sum", by, body);
+        let sid = hb::next_sid(&ctx(), Some(&cp)).unwrap();
+        let next = format!("ses:{T}:{INC}:{sid}");
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let kept: Vec<(String, Any)> = match comp.get(&txn, &old) {
+            Some(Out::YMap(m)) => copies
+                .iter()
+                .map(|k| match m.get(&txn, k) {
+                    Some(Out::Any(a)) => (k.clone(), a),
+                    _ => panic!("no record {k} to copy"),
+                })
+                .collect(),
+            _ => panic!("no session {old}"),
+        };
+        comp.insert(&mut txn, format!("sum:{T}:{INC}"), to_any(&cp));
+        comp.remove(&mut txn, &old);
+        let ses = comp.insert(&mut txn, next.as_str(), MapPrelim::default());
+        for (k, a) in kept {
+            ses.insert(&mut txn, k.as_str(), a);
+        }
+        next
+    }
+
+    fn forfeit(&self, by: &Who, r: i64, x: &str, n: &[&str]) -> String {
+        let rec = signed("forfeit", by, obj(vec![("r", CVal::Int(r)), ("x", s(x)), ("n", CVal::Arr(n.iter().map(|p| s(p)).collect()))]));
+        self.put('f', &rec)
+    }
+
+    /// Everything in the room's computed map but `skip`: each top-level
+    /// key, and each record of the live session, with its canon.
+    fn snapshot(&self, skip: &[String]) -> Vec<(String, Option<String>)> {
+        let ses = self.ses_key();
+        let txn = self.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let mut out = Vec::new();
+        for (k, v) in comp.iter(&txn) {
+            match v {
+                Out::Any(a) => out.push((k.to_string(), hb::canon(&CVal::from_any(&a)))),
+                Out::YMap(m) if k == ses => {
+                    for (rk, rv) in m.iter(&txn) {
+                        if let (false, Out::Any(a)) = (skip.iter().any(|s| s == rk), rv) {
+                            out.push((format!("{k}/{rk}"), hb::canon(&CVal::from_any(&a))));
+                        }
+                    }
+                }
+                _ => out.push((k.to_string(), None)),
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
+/// How round 1 was decided before the trim after it.
+#[derive(Clone, Copy, Debug)]
+enum Decided {
+    /// The house revealed the close on its join.
+    House,
+    /// A Friendly close, by alice's forfeit of bob's seed.
+    Forfeit,
+    /// The close on the house's join, abandoned before the house saw it.
+    Abandon,
+}
+
+/// Round 1 decided as `how`, a trim after it (copying round 1's deciding
+/// record and counted reveals into the next session when `copy`, as a
+/// v0.51 trim does), then rounds 2 and 3 on the house: what the room's
+/// computed map holds after each tick, the copies aside.
+fn after_a_trim(how: Decided, copy: bool) -> Vec<Vec<(String, Option<String>)>> {
+    let mut room = Room::new(&format!("copies-{how:?}-{copy}"), true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (l, h, copies) = match how {
+        Decided::House => {
+            let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+            room.reveal(&alice, 1);
+            room.reveal(&bob, 1);
+            room.tick(200);
+            let reveal = room.records("h:1:");
+            assert_eq!(reveal.len(), 1, "round 1 revealed");
+            let next = str_of(&reveal[0].1, "c").map(str::to_string);
+            let mut copies: Vec<String> = room.records("x:1:").into_iter().map(|(k, _)| k).collect();
+            copies.push(reveal[0].0.clone());
+            (c, next, copies)
+        }
+        Decided::Forfeit => {
+            room.set_fair(1, 1);
+            room.tick(200);
+            let (a, b) = (room.slip(&alice, 1), room.slip(&bob, 1));
+            let c = room.close(&alice, 1, "g", &[("alice", &a), ("bob", &b)], None);
+            room.reveal(&alice, 1);
+            let f = room.forfeit(&alice, 1, &c, &["alice"]);
+            room.tick(200);
+            let mut copies: Vec<String> = room.records("x:1:").into_iter().map(|(k, _)| k).collect();
+            copies.push(f);
+            (c, None, copies)
+        }
+        Decided::Abandon => {
+            let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+            room.abandon(&bob, 1, &c);
+            room.tick(200);
+            assert!(room.records("h:").is_empty(), "round 1 void");
+            let copies: Vec<String> = room.records("z:1:").into_iter().map(|(k, _)| k).collect();
+            (c, None, copies)
+        }
+    };
+    assert!(!copies.is_empty());
+    let mut body = vec![
+        ("v", CVal::Int(1)),
+        ("b", s("g")),
+        ("u", CVal::Int(1)),
+        ("l", s(&l)),
+        ("n", obj(vec![("alice", s("-5")), ("bob", s("5"))])),
+    ];
+    if let Some(h) = &h {
+        body.push(("h", s(h)));
+    }
+    let skip = if copy { copies.clone() } else { Vec::new() };
+    room.trim(&alice, obj(body), &skip);
+    let sid = room.ses_key().rsplit(':').next().unwrap().to_string();
+
+    let mut seen = Vec::new();
+    room.tick(200);
+    seen.push(room.snapshot(&skip));
+    if matches!(how, Decided::Forfeit) {
+        // Fair again: the house joins round 2.
+        room.set_fair(0, 2);
+        room.tick(200);
+        seen.push(room.snapshot(&skip));
+    }
+    // Round 2 on the house: closed on its commitment (the checkpoint's, or
+    // its join's), every seed in, revealed.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    let c2 = room.close(&alice, 2, &sid, &[("alice", &a2), ("bob", &b2)], Some(&room.commit(2)));
+    room.reveal(&alice, 2);
+    room.reveal(&bob, 2);
+    for _ in 0..3 {
+        room.tick(200);
+        seen.push(room.snapshot(&skip));
+    }
+    assert_eq!(room.records("h:2:").len(), 1, "{how:?}: round 2 revealed");
+    // Friendly mid-way: round 3's commitment is stepped down.
+    let (a3, b3) = (room.slip(&alice, 3), room.slip(&bob, 3));
+    room.close(&bob, 3, &c2, &[("alice", &a3), ("bob", &b3)], Some(&room.commit(3)));
+    room.set_fair(1, 3);
+    for _ in 0..3 {
+        room.tick(500);
+        seen.push(room.snapshot(&skip));
+    }
+    seen
+}
+
+/// 🧷 PR 6a's round-u copies change nothing the house does: a v0.51 trim
+/// copies round u's deciding record (the house's reveal, a forfeit, an
+/// abandon) and its counted reveals into the next session, and the house
+/// (this build, and so v0.50's) writes exactly what it writes without them,
+/// tick for tick. Its walk starts past the checkpoint's round, and its own
+/// reveal of round u carries only what the checkpoint's `h` carries.
+#[test]
+fn round_u_copies_after_a_trim_leave_the_house_unchanged() {
+    for how in [Decided::House, Decided::Forfeit, Decided::Abandon] {
+        let with = after_a_trim(how, true);
+        let without = after_a_trim(how, false);
+        assert_eq!(with.len(), without.len());
+        for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+            assert_eq!(a, b, "{how:?}: tick {i}");
+        }
+        // And the house did write: a reveal of round 2 and more.
+        assert!(with.last().unwrap().iter().any(|(k, _)| k.contains("/h:2:")), "{how:?}");
+    }
+}

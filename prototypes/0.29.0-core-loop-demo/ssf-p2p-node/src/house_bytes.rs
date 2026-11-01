@@ -30,6 +30,14 @@ pub enum CVal {
 /// Number.MAX_SAFE_INTEGER.
 const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
 
+/// The field name a page's decoder doesn't keep as a field (see [`CVal::from_any`]).
+const PROTO: &str = "__proto__";
+
+/// Whether a string yrs decoded (unchecked) is UTF-8.
+fn utf8(s: &str) -> bool {
+    std::str::from_utf8(s.as_bytes()).is_ok()
+}
+
 fn number(f: f64) -> CVal {
     if f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_SAFE {
         CVal::Int(f as i64)
@@ -68,15 +76,29 @@ impl CVal {
     /// From a Yjs value (a record as the room's doc holds it). Yjs writes a
     /// JS number as an integer or a float, and either reads back as
     /// `Number`; a JS bigint is `BigInt`, which canon refuses.
+    ///
+    /// Where the house can't read a value exactly as every receiving page
+    /// does, it reads junk, so it acts on fewer records than the pages
+    /// count, never on more (fewer only stalls a round; more could reveal a
+    /// seed for a close no page counts):
+    /// - A map with a `__proto__` key. A page decodes a map into `{}` one
+    ///   field at a time (lib0 readAny), so the field is `o.__proto__ = v`
+    ///   there: an object sets the prototype, null clears it, anything else
+    ///   is dropped, and repeated keys apply in order. yrs keeps one entry
+    ///   per key, so the node can't replay that.
+    /// - A string or a key that isn't UTF-8. yrs reads strings unchecked; a
+    ///   page's decoder (lib0, fatal) refuses the whole update holding one.
     pub fn from_any(v: &yrs::Any) -> CVal {
         use yrs::Any;
         match v {
-            Any::String(s) => CVal::Str(s.to_string()),
+            Any::String(s) if utf8(s) => CVal::Str(s.to_string()),
             Any::Number(f) => number(*f),
             Any::Array(a) => CVal::Arr(a.iter().map(CVal::from_any).collect()),
-            Any::Map(m) => CVal::Obj(m.iter().map(|(k, v)| (k.clone(), CVal::from_any(v))).collect()),
+            Any::Map(m) if m.keys().all(|k| k.as_str() != PROTO && utf8(k)) => {
+                CVal::Obj(m.iter().map(|(k, v)| (k.clone(), CVal::from_any(v))).collect())
+            }
             Any::Undefined => CVal::Undef,
-            Any::Null | Any::Bool(_) | Any::BigInt(_) | Any::Buffer(_) => CVal::Junk,
+            Any::String(_) | Any::Map(_) | Any::Null | Any::Bool(_) | Any::BigInt(_) | Any::Buffer(_) => CVal::Junk,
         }
     }
 
@@ -113,6 +135,17 @@ impl CVal {
     pub fn fields(&self) -> Option<Vec<&(String, CVal)>> {
         match self {
             CVal::Obj(fields) => Some(fields.iter().filter(|(_, v)| *v != CVal::Undef).collect()),
+            _ => None,
+        }
+    }
+
+    /// The object's own fields, undefined ones included: what
+    /// `Object.keys` lists, for the readers that check every entry of a
+    /// field (a checkpoint's nets, a close's frozen slips, a carry's
+    /// riders), where an undefined entry makes the record junk.
+    pub fn entries(&self) -> Option<&[(String, CVal)]> {
+        match self {
+            CVal::Obj(fields) => Some(fields),
             _ => None,
         }
     }
