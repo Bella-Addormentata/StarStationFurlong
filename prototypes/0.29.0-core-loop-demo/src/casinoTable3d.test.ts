@@ -242,3 +242,95 @@ describe('the craps dice', () => {
     expect(diceOverlap(new THREE.Vector3(0, 0, 0), turned, new THREE.Vector3(DIE_SIZE * 1.1, 0, 0), q, half)).not.toBeNull();
   });
 });
+
+describe('💰 the settle’s chip moves on the table', () => {
+  beforeEach(() => {
+    vi.stubGlobal('document', { createElement: fakeCanvas });
+    vi.stubGlobal('window', {});
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const HOUSE = { x: -0.26, z: 0.36 };
+  const MY_RAIL = { x: -0.9, z: -0.48 };
+  const moves = () => ({
+    house: HOUSE,
+    lost: [{ x: 0.5, z: -0.2, chips: [25, 5], dim: true, pid: 'b', spot: 'field:' }],
+    back: [{ s: { x: -0.3, z: -0.32, chips: [5, 5], dim: false, pid: 'a', spot: 'pass:' }, to: MY_RAIL, order: 0, mine: true }],
+    paid: [{ chips: [5, 5], to: MY_RAIL, order: 0, mine: true, dim: false }],
+  });
+
+  it('sweeps the losers into the house first, then pays out of it: the payout rises there and lands on the rail with the stake', async () => {
+    const { chipRunAt, FELT_Y, settleRuns } = await import('./casinoTable3d');
+    const [lost, back, paid] = settleRuns(moves());
+    // The loser leaves at once and ends sunk under the house spot.
+    const at = (r: typeof lost, t: number) => chipRunAt({ ...r, t });
+    expect(at(lost, 0)).toEqual({ x: 0.5, y: FELT_Y + 0.001, z: -0.2 });
+    const lostEnd = lost.legs.at(-1)!;
+    expect([lostEnd.x, lostEnd.z]).toEqual([HOUSE.x, HOUSE.z]);
+    expect(lostEnd.y).toBeLessThan(FELT_Y - 2 * 0.0072);
+    // The payout is out of sight in the house until the losers are in…
+    const sweptIn = lost.legs[0].s;
+    expect(paid.hidden).toBe(true);
+    expect(paid.wait).toBeGreaterThan(sweptIn);
+    expect(at(paid, paid.wait - 0.01)).toBeNull();
+    // …then rises out of it, and slides to my rail.
+    const risen = at(paid, paid.wait + paid.legs[0].s);
+    expect(risen!.x).toBeCloseTo(HOUSE.x, 6);
+    expect(risen!.z).toBeCloseTo(HOUSE.z, 6);
+    expect(risen!.y).toBeCloseTo(FELT_Y + 0.001, 6);
+    const end = (r: typeof lost) => r.wait + r.legs.reduce((a, l) => a + l.s, 0);
+    // The stake waits on the felt, then reaches the rail as the payout does.
+    expect(at(back, 0)).toEqual({ x: -0.3, y: FELT_Y + 0.001, z: -0.32 });
+    expect(end(back)).toBeCloseTo(end(paid), 6);
+    const onRail = at(paid, end(paid) - paid.legs.at(-1)!.s);
+    expect([onRail!.x, onRail!.z]).toEqual([MY_RAIL.x, MY_RAIL.z]);
+    expect(at(paid, end(paid))).toBeNull();
+    // Nothing lost: the pay-out starts almost at once.
+    const [quick] = settleRuns({ ...moves(), lost: [], back: [] });
+    expect(quick.wait).toBeLessThan(sweptIn);
+  });
+
+  it('draws the moving chips, says when mine are on the way, and clears them on a reset', () => {
+    const group = buildItemGroup({ id: 'craps-settle', kind: 'craps-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    let handle: CasinoTableVisualHandle | null = null;
+    group.traverse((o) => {
+      if (o.userData.casinoTable) handle = o.userData.casinoTable as CasinoTableVisualHandle;
+    });
+    const h = handle as unknown as CasinoTableVisualHandle;
+    h.settleChips(moves());
+    h.update(0);
+    // The loser and the stake show at once; the payout is still in the house.
+    expect(chipsDrawn(group)).toBe(4);
+    expect(h.payingMe()).toBe(true);
+    for (let i = 0; i < 60; i++) h.update(1 / 60);
+    expect(chipsDrawn(group)).toBe(4);
+    for (let i = 0; i < 180; i++) h.update(1 / 60);
+    expect(chipsDrawn(group)).toBe(0);
+    expect(h.payingMe()).toBe(false);
+    h.settleChips(moves());
+    h.reset();
+    h.update(0);
+    expect(h.payingMe()).toBe(false);
+    expect(chipsDrawn(group)).toBe(0);
+  });
+
+  it('pays out of clear felt in front of the stickman: no betting box, the ⚙️, the FAIR plaque or the dice spot', async () => {
+    const { CHIP_RADIUS, CRAPS_DICE_SPOT, CRAPS_HOUSE_SPOT, CRAPS_LAYOUT } = await import('./games/casinoLayout');
+    const { fairPlaqueCentre, FAIR_PLAQUE_SIZE } = await import('./casinoTable3d');
+    const p = CRAPS_HOUSE_SPOT;
+    const r = CHIP_RADIUS;
+    const f = CRAPS_LAYOUT.felt;
+    expect(p.x - r > f.x0 && p.x + r < f.x1 && p.z - r > f.z0 && p.z + r < f.z1).toBe(true);
+    for (const rg of CRAPS_LAYOUT.regions) {
+      for (const b of rg.rects) expect(b.x0 < p.x + r && b.x1 > p.x - r && b.z0 < p.z + r && b.z1 > p.z - r, rg.id).toBe(false);
+    }
+    const g = CRAPS_LAYOUT.settings;
+    expect(Math.hypot(p.x - g.x, p.z - g.z)).toBeGreaterThan(g.r + r);
+    const c = fairPlaqueCentre(g, 'right');
+    expect(Math.abs(p.x - c.x)).toBeGreaterThan(FAIR_PLAQUE_SIZE.w / 2 + r);
+    expect(Math.hypot(p.x - CRAPS_DICE_SPOT.x, p.z - CRAPS_DICE_SPOT.z)).toBeGreaterThan(0.2);
+    // In front of the stickman: the +z side, by the middle.
+    expect(p.z).toBeGreaterThan(0.3);
+    expect(Math.abs(p.x)).toBeLessThan(0.35);
+  });
+});
