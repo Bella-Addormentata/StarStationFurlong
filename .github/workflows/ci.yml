@@ -18,7 +18,7 @@ name: "✅ PR Checks"
 #      crates under vendor/) — and a Windows `cargo check` of the same, since the
 #      torrent feature brings C code (aws-lc-sys) that only the release would
 #      otherwise compile on Windows.
-#   6. 🏦 The SSF wallet's own tests (`chia_wallet*`) on Windows and macOS, and a
+#   6. 🏦 The SSF wallet's own tests (`chia_wallet*`, `chia_at_rest`) on Windows and macOS, and a
 #      macOS `cargo check` of the release set: the wallet's identity file is
 #      written with hard links, directory syncs and owner-only modes that differ
 #      per OS, and its at-rest protection (DPAPI on Windows, the keychain on
@@ -116,11 +116,12 @@ jobs:
         shell: bash
         run: cargo check --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
-      # 🏦 The SSF wallet's tests on NTFS and the Windows API (the filter
-      # matches chia_wallet:: and chia_wallet_switch::).
-      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet
+      # 🏦 The SSF wallet's tests on NTFS and the Windows API (the filters
+      # match chia_wallet::, chia_wallet_switch:: and chia_at_rest::, whose
+      # DPAPI round trip runs only here).
+      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet chia_at_rest
         shell: bash
-        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml chia_wallet
+        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- chia_wallet chia_at_rest
 
   node-check-macos:
     name: 🦀 Node cargo check + wallet tests on macOS (release features)
@@ -141,5 +142,5 @@ jobs:
         run: cargo check --features chia-publish,torrent --tests --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
       # 🏦 The SSF wallet's tests on APFS and the macOS API.
-      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet
-        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml chia_wallet
+      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet chia_at_rest
+        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- chia_wallet chia_at_rest
