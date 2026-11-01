@@ -172,13 +172,35 @@ const withProto = (o: Record<string, unknown>, proto: unknown): Record<string, u
 
 type YjsKind = 'checkpoint' | 'close' | 'canon';
 interface YjsCase {
-  name: string; kind: YjsKind; inc: string; update: string; proto: boolean; refused: boolean;
+  name: string; kind: YjsKind; inc: string; update: string; proto: boolean; unclear: boolean; refused: boolean;
   ok: boolean | null; canon: string | null; hash: string | null;
 }
 
 /** Whether `v` holds an own `__proto__` field anywhere. */
 const holdsProto = (v: unknown): boolean => typeof v === 'object' && v !== null
   && ((!Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, '__proto__')) || Object.values(v).some(holdsProto));
+
+/** Whether `v` holds an own `__proto__` field anywhere that is no object
+ *  (null or a primitive): a page that meets it keeps no field, as the house
+ *  reads it, unless the update held another `__proto__` field before it, an
+ *  object, which the node, keeping one entry per key, can't see
+ *  (house_bytes.rs Clarity::Proto). */
+const holdsUnclear = (v: unknown): boolean => typeof v === 'object' && v !== null
+  && ((!Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, '__proto__')
+    && (() => { const p = (v as Record<string, unknown>)['__proto__']; return p === null || typeof p !== 'object'; })())
+    || Object.values(v).some(holdsUnclear));
+
+/** `update` with the only written `from` (a key's bytes) turned into `to`,
+ *  as long. */
+function rename(update: Uint8Array, from: string, to: string): Uint8Array {
+  const [a, b] = [new TextEncoder().encode(from), new TextEncoder().encode(to)];
+  if (a.length !== b.length) throw new Error(`${from} → ${to}: not as long`);
+  const hits = update.reduce<number[]>((at, _, i) => (a.every((x, j) => update[i + j] === x) ? [...at, i] : at), []);
+  if (hits.length !== 1) throw new Error(`${from}: ${hits.length} times in the update`);
+  const out = update.slice();
+  out.set(b, hits[0]);
+  return out;
+}
 
 /** `update` with the byte after the first `find` (a written string's
  *  bytes) set to 0xff, which no UTF-8 string holds. */
@@ -200,14 +222,17 @@ function spoil(update: Uint8Array, find: string): Uint8Array {
  *  canon and recHash. The writer's own page reads the value as written;
  *  every other page reads what lib0 decodes (a `__proto__` field set as
  *  `o.__proto__ = v`), or refuses the whole update (a string that isn't
- *  UTF-8). The house reads the first exactly as the pages do, and the
- *  other two as junk (house_bytes.rs CVal::from_any). */
+ *  UTF-8). The house reads each as a page that receives it does
+ *  (house_bytes.rs CVal::from_any), and knows which a page may read
+ *  otherwise (Clarity): one holding a `__proto__` field that is no object
+ *  (a field of that name before it, an object, as in the update renamed
+ *  into one, leaves a page junk) or one a page refuses. */
 function yjsCases(): YjsCase[] {
   const base = { v: 1, b: 'g', u: 12, l: H32, n: { alice: '-35' }, k: K, g: G };
   const pass = [{ type: 'pass', amount: 10 }];
   const carry = (w: unknown) => ({ ...base, s: { p: 6, w } });
   const close = (f: unknown) => ({ r: 3, q: 'g', f, k: K, g: G });
-  const cases: [string, YjsKind, string, unknown, string?][] = [
+  const cases: [string, YjsKind, string, unknown, string?, [string, string]?][] = [
     ['a checkpoint', 'checkpoint', CTX.inc, base],
     ['a net that is no UTF-8', 'checkpoint', CTX.inc, base, '-35'],
     ['a pid that is no UTF-8', 'checkpoint', CTX.inc, base, 'alice'],
@@ -228,13 +253,15 @@ function yjsCases(): YjsCase[] {
     ['a canon value named __proto__, a map', 'canon', '', withProto({ a: 1 }, { b: 2 })],
     ['a canon value named __proto__, a number', 'canon', '', withProto({ a: 1 }, 2)],
     ['an array entry undefined', 'canon', '', { a: [1, undefined] }],
+    ['a field named __proto__ twice, an array then a string', 'checkpoint', CTX.inc, withProto({ ...base, aaaaaaaaa: ['x'] }, 'x'), undefined, ['aaaaaaaaa', '__proto__']],
+    ['a net named __proto__ twice, an object then undefined', 'checkpoint', CTX.inc, { ...base, n: withProto({ alice: '-35', aaaaaaaaa: { x: '1' } }, undefined) }, undefined, ['aaaaaaaaa', '__proto__']],
   ];
-  return cases.map(([name, kind, inc, value, spoilAt]) => {
+  return cases.map(([name, kind, inc, value, spoilAt, twice]) => {
     const doc = new Y.Doc();
     doc.clientID = 1;
     doc.getMap('m').set('v', value);
     const written = Y.encodeStateAsUpdate(doc);
-    const update = spoilAt === undefined ? written : spoil(written, spoilAt);
+    const update = spoilAt !== undefined ? spoil(written, spoilAt) : twice ? rename(written, ...twice) : written;
     const page = new Y.Doc();
     let refused = false;
     try {
@@ -246,7 +273,8 @@ function yjsCases(): YjsCase[] {
     const ok = refused || kind === 'canon' ? null
       : kind === 'checkpoint' ? asCheckpointFor({ inc })(read) !== null : asClose(read) !== null;
     return {
-      name, kind, inc, update: bytesToHex(update), proto: holdsProto(value), refused,
+      name, kind, inc, update: bytesToHex(update), proto: holdsProto(value) || twice !== undefined,
+      unclear: holdsUnclear(value), refused,
       ok, canon: refused ? null : canon(read), hash: refused ? null : recHash(read),
     };
   });
@@ -336,7 +364,7 @@ function build(): Record<string, unknown> {
   });
 
   return {
-    note: 'Bytes the owner\'s node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank(\'close\'). houseRecords: the house\'s reveals and join, signed by node "one". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic). felts: a slip\'s felt `b` and whether the fold takes a slip holding it (asSlipFor; house.rs felt_ok). checkpoints: whether the fold takes each (asCheckpointFor at incarnation `inc`; house.rs checkpoint_ok). forfeits and closes: records good but for `n` (asForfeit; house.rs forfeit_ids) and `f` (asClose; house.rs close_frozen). yjs: values no JSON holds (undefined entries, own `__proto__` fields, strings that are no UTF-8), each as the Yjs update writing it to map `m` key `v`, whether it holds a `__proto__` field (`proto`) and whether a page refuses the update (`refused`), and what a page receiving it reads: its reader\'s verdict `ok` (null for kind canon or a refused update), canon and recHash. The house reads `proto` and `refused` values as junk, and the rest as the pages do.',
+    note: 'Bytes the owner\'s node computes as the pages do (src/computedHouseVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house.rs tests read it). canon: computedFold canon (null: junk) and recHash. sessionRecords: page-written slips and closes, their keys, signBytes (hex) and, for a close, dutyRank(\'close\'). houseRecords: the house\'s reveals and join, signed by node "one". roomRecords: computedHouse roomSignBytes. sids: nextSid. commits: slipCommit and houseCommitOf. houses: a node secret, its house key, seeds (houseSeedOf) and an ed25519 signature (deterministic). felts: a slip\'s felt `b` and whether the fold takes a slip holding it (asSlipFor; house.rs felt_ok). checkpoints: whether the fold takes each (asCheckpointFor at incarnation `inc`; house.rs checkpoint_ok). forfeits and closes: records good but for `n` (asForfeit; house.rs forfeit_ids) and `f` (asClose; house.rs close_frozen). yjs: values no JSON holds (undefined entries, own `__proto__` fields, strings that are no UTF-8), each as the Yjs update writing it to map `m` key `v`, whether it holds a `__proto__` field (`proto`), one that is no object (`unclear`: the house reads it as a page receiving that one field does, and knows a page may read junk), and whether a page refuses the update (`refused`), and what a page receiving it reads: its reader\'s verdict `ok` (null for kind canon or a refused update), canon and recHash. The house reads the rest as the pages do.',
     canon: canonCases(),
     sessionRecords,
     houseRecords,
@@ -391,8 +419,10 @@ describe('the house\'s bytes (test-vectors/computed-house-v1.json)', () => {
     // lists it); a `__proto__` field is set as `o.__proto__ = v`, so an
     // object there leaves a value that is no plain object, and anything else
     // leaves no field; a string that isn't UTF-8 refuses the whole update.
-    // house.rs CVal::from_any reads the first as the pages do and the other
-    // two as junk, so the house never takes a record a page refuses.
+    // house.rs CVal::from_any reads each as a page receiving it does, and
+    // hb::clarity marks the ones a page may read otherwise: a `__proto__`
+    // field that is no object (another before it, an object, leaves junk,
+    // and the node keeps only the last), or a refused update.
     const yjs = made.yjs as YjsCase[];
     const verdicts = Object.fromEntries(yjs.map((c) => [c.name, c.refused ? 'refused' : c.kind === 'canon' ? c.canon : c.ok]));
     expect(verdicts).toEqual({
@@ -416,8 +446,16 @@ describe('the house\'s bytes (test-vectors/computed-house-v1.json)', () => {
       'a canon value named __proto__, a map': null,
       'a canon value named __proto__, a number': '{"a":1}',
       'an array entry undefined': null,
+      'a field named __proto__ twice, an array then a string': false,
+      'a net named __proto__ twice, an object then undefined': false,
     });
     expect(yjs.filter((c) => c.proto).map((c) => c.name)).toEqual(yjs.filter((c) => c.name.includes('__proto__')).map((c) => c.name));
+    expect(yjs.filter((c) => c.unclear).map((c) => c.name)).toEqual([
+      'a net named __proto__, a string', 'a net named __proto__, null', 'a net named __proto__, undefined',
+      'a field named __proto__, a string', 'a frozen slip named __proto__, a string', 'a rider named __proto__, a string',
+      'a felt entry with a field named __proto__', 'a canon value named __proto__, a number',
+      'a field named __proto__ twice, an array then a string', 'a net named __proto__ twice, an object then undefined',
+    ]);
     // The pages compare pids by UTF-16 code units: an astral one sorts
     // below U+E000–U+FFFF, which byte (or code point) order puts it above.
     const forfeits = made.forfeits as { value: { n: unknown }; ok: boolean }[];

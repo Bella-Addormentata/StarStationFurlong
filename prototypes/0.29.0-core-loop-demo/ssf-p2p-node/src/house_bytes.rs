@@ -30,12 +30,80 @@ pub enum CVal {
 /// Number.MAX_SAFE_INTEGER.
 const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
 
-/// The field name a page's decoder doesn't keep as a field (see [`CVal::from_any`]).
+/// The field name a page's decoder never keeps as a field (see [`CVal::from_any`]).
 const PROTO: &str = "__proto__";
 
 /// Whether a string yrs decoded (unchecked) is UTF-8.
-fn utf8(s: &str) -> bool {
+pub fn utf8(s: &str) -> bool {
     std::str::from_utf8(s.as_bytes()).is_ok()
+}
+
+/// How sure a page's reading of a value is to be [`CVal::from_any`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Clarity {
+    /// Every page reads it so.
+    Clear,
+    /// A page reads it so, or as junk: a map holds a `__proto__` field that
+    /// is no object (it leaves no field), and the update that wrote it may
+    /// have held another `__proto__` field before it, an object, which
+    /// leaves a page no plain object. yrs keeps one entry per key (the
+    /// last), so the node can't tell.
+    Proto,
+    /// A page may hold something else entirely:
+    /// - a string or a key in it isn't UTF-8, and a page refuses the whole
+    ///   update that brought it, keeping whatever was under its key before;
+    /// - or a map as under `Proto` also holds a key that a typed array put
+    ///   before it as the prototype (a `__proto__` buffer, which the node
+    ///   can't see either) would keep from being a field: a canonical
+    ///   numeric one past the array's end is dropped, and one of its getters
+    ///   (`length`, …) or `BYTES_PER_ELEMENT` makes the strict-mode decoder
+    ///   throw, refusing the update. A later `__proto__: null` leaves a
+    ///   plain object without them.
+    Unknown,
+}
+
+/// The keys a typed array as a map's prototype keeps from being fields
+/// (see [`Clarity::Unknown`]): its getters, `BYTES_PER_ELEMENT`, and every
+/// key that may be a canonical numeric string (`-0`, `NaN`, `Infinity` and
+/// anything a digit begins, with or without a sign or a point; more than
+/// the spec's, never fewer).
+fn typed_array_key(k: &str) -> bool {
+    let b = k.as_bytes();
+    let numeric = match b {
+        [b'-', rest @ ..] => rest.first().is_some_and(|c| c.is_ascii_digit() || *c == b'.' || *c == b'I'),
+        [b'.', c, ..] => c.is_ascii_digit(),
+        [c, ..] => c.is_ascii_digit(),
+        [] => false,
+    };
+    numeric || matches!(k, "NaN" | "Infinity" | "length" | "byteLength" | "byteOffset" | "buffer" | "BYTES_PER_ELEMENT")
+}
+
+/// How sure a page's reading of `v` is to be [`CVal::from_any`]'s: the
+/// least sure of its parts. (Only of a value [`weight`] has weighed: it
+/// goes as deep as the value does, and reads every `__proto__` string in
+/// it too, which [`clarity_within`] bounds.)
+pub fn clarity(v: &yrs::Any) -> Clarity {
+    use yrs::Any;
+    match v {
+        Any::String(s) if !utf8(s) => Clarity::Unknown,
+        Any::Array(a) => a.iter().map(clarity).max().unwrap_or(Clarity::Clear),
+        Any::Map(m) => {
+            let own = match m.get(PROTO) {
+                None | Some(Any::Map(_) | Any::Array(_) | Any::Buffer(_)) => Clarity::Clear,
+                Some(_) if m.keys().any(|k| typed_array_key(k)) => Clarity::Unknown,
+                Some(_) => Clarity::Proto,
+            };
+            m.iter().map(|(k, v)| if utf8(k) { clarity(v) } else { Clarity::Unknown }).fold(own, Clarity::max)
+        }
+        _ => Clarity::Clear,
+    }
+}
+
+/// [`clarity`] of a value whose `__proto__` strings [`weigh`] found to
+/// be `scan` bytes, reading `most` of them at most: past it Unknown, unread
+/// (one may not be UTF-8, and a page refuses the update that brought it).
+pub fn clarity_within(v: &yrs::Any, scan: usize, most: usize) -> Clarity {
+    if scan > most { Clarity::Unknown } else { clarity(v) }
 }
 
 fn number(f: f64) -> CVal {
@@ -77,25 +145,23 @@ impl CVal {
     /// JS number as an integer or a float, and either reads back as
     /// `Number`; a JS bigint is `BigInt`, which canon refuses.
     ///
-    /// Where the house can't read a value exactly as every receiving page
-    /// does, it reads junk, so it acts on fewer records than the pages
-    /// count, never on more (fewer only stalls a round; more could reveal a
-    /// seed for a close no page counts):
-    /// - A map with a `__proto__` key. A page decodes a map into `{}` one
-    ///   field at a time (lib0 readAny), so the field is `o.__proto__ = v`
-    ///   there: an object sets the prototype, null clears it, anything else
-    ///   is dropped, and repeated keys apply in order. yrs keeps one entry
-    ///   per key, so the node can't replay that.
-    /// - A string or a key that isn't UTF-8. yrs reads strings unchecked; a
-    ///   page's decoder (lib0, fatal) refuses the whole update holding one.
+    /// A page decodes a map into `{}` one field at a time (lib0 readAny), so
+    /// a `__proto__` field is `o.__proto__ = v` there: an object (a map, an
+    /// array, a buffer) becomes the prototype, and the value is no plain
+    /// object, which every record reader refuses (computedFold isPlain;
+    /// junk here; the switch's reader is apart, `switch_of`); null or
+    /// anything else leaves no field, as here. A string or a key that isn't UTF-8 reads as
+    /// junk (a page's decoder, lib0 in fatal mode, refuses the whole update
+    /// holding one). Where a page may read the value otherwise than this,
+    /// [`clarity`] says so: a reader acts on it only when it's `Clear`.
     pub fn from_any(v: &yrs::Any) -> CVal {
         use yrs::Any;
         match v {
             Any::String(s) if utf8(s) => CVal::Str(s.to_string()),
             Any::Number(f) => number(*f),
             Any::Array(a) => CVal::Arr(a.iter().map(CVal::from_any).collect()),
-            Any::Map(m) if m.keys().all(|k| k.as_str() != PROTO && utf8(k)) => {
-                CVal::Obj(m.iter().map(|(k, v)| (k.clone(), CVal::from_any(v))).collect())
+            Any::Map(m) if m.keys().all(|k| utf8(k)) && !matches!(m.get(PROTO), Some(Any::Map(_) | Any::Array(_) | Any::Buffer(_))) => {
+                CVal::Obj(m.iter().filter(|(k, _)| k.as_str() != PROTO).map(|(k, v)| (k.clone(), CVal::from_any(v))).collect())
             }
             Any::Undefined => CVal::Undef,
             Any::String(_) | Any::Map(_) | Any::Null | Any::Bool(_) | Any::BigInt(_) | Any::Buffer(_) => CVal::Junk,
@@ -230,8 +296,17 @@ pub const MAX_DEPTH: usize = 16;
 /// `cap` however big it is (each member is counted as it is reached, before
 /// anything inside it).
 pub fn weight(v: &yrs::Any, cap: usize) -> Option<usize> {
+    weigh(v, cap).map(|(w, _)| w)
+}
+
+/// [`weight`], and what [`clarity`] reads past it: the bytes of the
+/// `__proto__` strings it weighs as numbers. A page drops each, so no cap
+/// counts one, but whether it is UTF-8 is still a page's question, and
+/// finding that out costs its bytes.
+pub fn weigh(v: &yrs::Any, cap: usize) -> Option<(usize, usize)> {
     use yrs::Any;
     let mut total: usize = 0;
+    let mut scan: usize = 0;
     let mut stack: Vec<(&Any, usize)> = vec![(v, 0)];
     while let Some((v, depth)) = stack.pop() {
         if depth > MAX_DEPTH {
@@ -250,6 +325,16 @@ pub fn weight(v: &yrs::Any, cap: usize) -> Option<usize> {
             Any::Map(m) => {
                 for (k, x) in m.iter() {
                     total = total.checked_add(k.len() + 4).filter(|t| *t <= cap)?;
+                    // A `__proto__` that is no object leaves a page no field
+                    // (CVal::from_any): weighed as a number, so padding one
+                    // never makes a record a page counts too heavy to read.
+                    if k.as_str() == PROTO && !matches!(x, Any::Map(_) | Any::Array(_) | Any::Buffer(_)) {
+                        total = total.checked_add(8).filter(|t| *t <= cap)?;
+                        if let Any::String(s) = x {
+                            scan = scan.saturating_add(s.len());
+                        }
+                        continue;
+                    }
                     stack.push((x, depth + 1));
                 }
                 2
@@ -258,7 +343,7 @@ pub fn weight(v: &yrs::Any, cap: usize) -> Option<usize> {
         };
         total = total.checked_add(own).filter(|t| *t <= cap)?;
     }
-    Some(total)
+    Some((total, scan))
 }
 
 pub fn canon(v: &CVal) -> Option<String> {
