@@ -45,11 +45,13 @@
 /// guard that refuses to keep the node alive where yrs would crash/OOM before
 /// a page's lib0 does (G2, G3) — a narrow, deliberate over-refusal of nesting
 /// and lengths no honest record carries. ContentJSON (ref 2) and XmlHook (type
-/// ref 5) are **not** refused: the walk parses them the page's way and accepts,
-/// since a page accepts a well-formed one; refusing would over-refuse, and the
-/// game emits neither (the yrs tail-desync they cause is a read-time divergence
-/// left to a later PR, never a crash). R2 (the `__proto__` + typed-array trap
-/// keys) is likewise deferred.
+/// ref 5) ARE refused (D1): yrs consumes a different number of bytes for each
+/// than the page does (ContentJSON reads `len + 1` var-strings on yrs vs `len`
+/// on the page; XmlHook reads no name on yrs vs a name on the page), so once
+/// one appears the walk can no longer be sure its cursor matches yrs's — and a
+/// byte the walk never reached, that yrs then decodes as a string, is the
+/// crash. The game emits neither, so refusing them drops no real update. R2
+/// (the `__proto__` + typed-array trap keys) is still deferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refuse {
     /// R1: a string that is not valid UTF-8, in any string position.
@@ -62,6 +64,11 @@ pub enum Refuse {
     /// R7: a block content ref with no reader (`info & 0x1f` not in 1..=9,
     /// and not GC 0 / Skip 10), or an `Any` tag with no reader.
     ContentRef(u8),
+    /// D1: a construct yrs consumes a different number of bytes for than the
+    /// page does (ContentJSON, XmlHook), so past it the walk cannot keep its
+    /// cursor aligned with yrs; refused so no byte the walk skipped ever
+    /// reaches the decoder as a string. The game emits neither.
+    Desync(&'static str),
     /// G1: a varuint past lib0's `Number.MAX_SAFE_INTEGER` cap.
     VarTooLarge,
     /// G2: a declared length past the bytes remaining.
@@ -265,21 +272,13 @@ fn verify_content(content_ref: u8, c: &mut Cur) -> Result<(), Refuse> {
             Ok(())
         }
         2 => {
-            // ContentJSON: readLen then that many var-strings (the page
-            // JSON.parses each, except the literal "undefined"). We read the
-            // same `len` strings and UTF-8-check each (R1), but do not
-            // JSON-parse — an invalid-JSON string the page refuses we accept
-            // (an under-refusal, the lesser evil; serde-vs-V8 JSON mismatch
-            // would otherwise risk over-refusal). yrs reads `len+1` and
-            // desyncs the tail, so this content never agrees between node and
-            // page; the game never emits it, and refusing would over-refuse a
-            // page that accepts a well-formed one, so we parse it the page's
-            // way and leave the desync to a later PR.
-            let len = c.var_u64()?;
-            for _ in 0..len {
-                c.var_str("ContentJSON")?;
-            }
-            Ok(())
+            // ContentJSON (D1): the page reads `len` var-strings; yrs reads
+            // `len + 1` and so leaves its cursor one var-string ahead of ours.
+            // We cannot UTF-8-check a byte we never walk, so a frame carrying a
+            // ContentJSON could pass this walk and still hand yrs an unchecked
+            // non-UTF-8 string — the crash. Refuse it. The game never emits a
+            // ContentJSON (it uses ContentAny), so this drops no real update.
+            Err(Refuse::Desync("ContentJSON"))
         }
         3 => {
             // ContentBinary: readBuf.
@@ -328,16 +327,16 @@ fn verify_content(content_ref: u8, c: &mut Cur) -> Result<(), Refuse> {
 /// `readContentType` = `typeRefs[readTypeRef()](decoder)`. `typeRefs` has 7
 /// entries (0..=6); a type ref >= 7 is an undefined reader → TypeError on the
 /// page (R4). yrs's `TypeRef::decode` additionally accepts 9 (SubDoc) and 15
-/// (Undefined) — forward divergences, refused. Type ref 5 (XmlHook) the page
-/// reads (a name key) and accepts, so we read the key and accept too (yrs
-/// reads no name and desyncs the tail, but refusing would over-refuse, and the
-/// game never emits XmlHook).
+/// (Undefined) — forward divergences, refused. 0/1/2/4/6 (YArray, YMap, YText,
+/// YXmlFragment, YXmlText) read no name on both sides; 3 (YXmlElement) reads a
+/// name on both. Type ref 5 (XmlHook) is refused (D1): the page reads a name
+/// key and yrs reads none, so the cursors part — and the game never emits it.
 fn verify_type_ref(c: &mut Cur) -> Result<(), Refuse> {
     let type_ref = c.var_u64()?;
     match type_ref {
-        0 | 1 | 2 | 4 => Ok(()),            // YArray, YMap, YText, YXmlFragment: read no name
-        3 => c.var_str("YXmlElement.name"), // readKey (R1)
-        5 => c.var_str("YXmlHook.name"),    // readKey (R1) — accepted, not refused
+        0 | 1 | 2 | 4 | 6 => Ok(()),        // YArray, YMap, YText, YXmlFragment, YXmlText: read no name
+        3 => c.var_str("YXmlElement.name"), // readKey (R1) — yrs reads the name too
+        5 => Err(Refuse::Desync("XmlHook")), // D1: page reads a name, yrs does not
         other => Err(Refuse::TypeRef(other)), // R4 (7, 8, 9, 15, …)
     }
 }
@@ -454,9 +453,9 @@ mod tests {
     /// The oracle `refused` is `Y.applyUpdate(new Doc, update)` throwing,
     /// recorded by the vitest that writes the file from the real yjs/lib0; the
     /// `parity` group holds only cases where the guard and the page must agree
-    /// exactly (the structural guards G2/G3, which refuse some page-accepted
-    /// nesting/lengths on purpose, live in their own groups and are checked
-    /// below without the page oracle).
+    /// exactly (the structural guards G2/G3 and the desync refusals D1, which
+    /// refuse some page-accepted nesting/lengths/constructs on purpose, live in
+    /// their own groups and are checked below without the page oracle).
     #[test]
     fn agrees_with_the_page_oracle() {
         let cases = vectors("test-vectors/ingest-parity-v1.json");
@@ -465,9 +464,10 @@ mod tests {
         for c in &cases {
             let bytes = hex::decode(&c.update).unwrap_or_else(|e| panic!("{}: {e}", c.name));
             let got = pages_refuse(&bytes).is_some();
-            if c.group == "depth" || c.group == "length" {
-                // Structural guard: the guard refuses, the page may accept.
-                assert!(got, "{} [{}]: structural guard must refuse", c.name, c.group);
+            if c.group == "depth" || c.group == "length" || c.group == "desync" {
+                // Structural / desync guard (G2/G3/D1): the guard refuses; the
+                // page may accept a well-formed one.
+                assert!(got, "{} [{}]: guard must refuse", c.name, c.group);
                 continue;
             }
             parity += 1;
@@ -477,19 +477,16 @@ mod tests {
     }
 
     /// For every vector the guard accepts, `Update::decode_v1` runs to
-    /// completion without crashing. `Ok` means the node merges it; a clean
-    /// `Err` means the node relays the frame and skips its own merge — which is
-    /// what it already does for page-valid content yrs can't decode. The one
-    /// such gap in these vectors is the deprecated `XmlHook` (type ref 5),
-    /// which Yjs reads (so a page accepts it, so the guard must accept it, so
-    /// the node relays it to peer pages that can decode it) but which yrs
-    /// 0.27.2 rejects. Refusing it would censor a page-valid update from the
-    /// mesh the node relays; accepting it and letting yrs skip its own merge is
-    /// the faithful relay behaviour. The assertion is that the call *returns*:
-    /// a crash vector wrongly accepted would reach `from_utf8_unchecked` and
-    /// abort this process at `decode_v1`, never returning `Ok` or `Err`. The
-    /// `clean` group — the content a real page actually emits — must decode
-    /// byte-for-byte on the node too, so those are held to `Ok`.
+    /// completion without crashing — the whole point, since the accept path is
+    /// what reaches the decoder. The guard accepts only constructs it walked
+    /// with the same byte count yrs will (so every string yrs builds was
+    /// UTF-8-checked); a construct whose counts could part — ContentJSON,
+    /// XmlHook — is refused (D1), not accepted, so no unwalked byte ever reaches
+    /// `from_utf8_unchecked`. The assertion is that the call *returns*: a crash
+    /// vector wrongly accepted would abort this process at `decode_v1`, never
+    /// returning `Ok` or `Err`. The `clean` group — well-formed updates a page
+    /// emits, including a `YXmlText` (type ref 6) — must additionally decode to
+    /// `Ok` on the node, so the accepted type refs are shown to be yrs-readable.
     #[test]
     fn accepts_never_crash_yrs() {
         let mut accepted = 0;
@@ -521,6 +518,19 @@ mod tests {
             let bytes = hex::decode(hex_s).unwrap();
             assert_eq!(pages_refuse(&bytes), Some(Refuse::NonUtf8 { at: "ContentString" }), "{hex_s}");
         }
+    }
+
+    /// Copilot's cursor-shift vector (PR #350 review): a ContentJSON whose
+    /// `len + 1` read on yrs leaves yrs decoding a lone `c2` as a ContentString
+    /// (the crash). The old walk — which parsed ContentJSON the page's way and
+    /// accepted — let it through; the guard now refuses at the ContentJSON
+    /// (D1), before the decoder, so the trailing bytes never reach yrs.
+    #[test]
+    fn refuses_the_contentjson_cursor_shift() {
+        let mut v = hex::decode("010201000201017201046e756c6c046e756c6c0401017401c2a9").unwrap();
+        v.extend(std::iter::repeat(0x61).take(101));
+        v.push(0x00);
+        assert_eq!(pages_refuse(&v), Some(Refuse::Desync("ContentJSON")));
     }
 
     /// Total and panic-free on arbitrary/truncated bytes, and never calls into

@@ -96,6 +96,11 @@ add('ytext: insert with a format', 'clean', built((d) => {
   t.insert(4, ' plain');
 }));
 add('ymap: unicode string', 'clean', built((d) => d.getMap('m').set('k', 'héllo 😀 ﬀ')));
+add('yxmltext: insert in a fragment (type ref 6)', 'clean', built((d) => {
+  const t = new Y.XmlText();
+  d.getXmlFragment('f').insert(0, [t]);
+  t.insert(0, 'hi');
+}));
 
 // utf8 — a non-UTF-8 byte in each string position (every page throws)
 {
@@ -138,20 +143,39 @@ add('parentSub: non-UTF-8', 'utf8', oneStruct((e) => {
 add('contentstring: valid UTF-8', 'utf8', built((d) => d.getText('t').insert(0, 'abc')));
 
 // typeref — ContentType (ref 7) with each type ref
-for (const [tr, label] of [[0, 'YArray'], [1, 'YMap'], [2, 'YText'], [4, 'YXmlFragment']] as const) {
+for (const [tr, label] of [[0, 'YArray'], [1, 'YMap'], [2, 'YText'], [4, 'YXmlFragment'], [6, 'YXmlText']] as const) {
   add(`typeref ${tr} (${label})`, 'typeref', rootItem(7, (e) => encoding.writeVarUint(e, tr)));
 }
 add('typeref 3 (YXmlElement, reads a name)', 'typeref', rootItem(7, (e) => {
   encoding.writeVarUint(e, 3);
   encoding.writeVarString(e, 'div');
 }));
-add('typeref 5 (XmlHook, reads a name — accepted)', 'typeref', rootItem(7, (e) => {
-  encoding.writeVarUint(e, 5);
-  encoding.writeVarString(e, 'hook');
-}));
 add('typeref 7 (no reader)', 'typeref', rootItem(7, (e) => encoding.writeVarUint(e, 7)));
 add('typeref 9 (SubDoc on yrs, no page reader)', 'typeref', rootItem(7, (e) => encoding.writeVarUint(e, 9)));
 add('typeref 15 (no page reader)', 'typeref', rootItem(7, (e) => encoding.writeVarUint(e, 15)));
+
+// desync — a construct yrs consumes a different byte count for than the page
+// does (ContentJSON reads len+1 var-strings on yrs vs len on the page; XmlHook
+// reads no name on yrs vs a name on the page). The guard refuses these
+// (Refuse::Desync) even though a page accepts a well-formed one, because past
+// one the walk can no longer keep its cursor aligned with yrs — so an unwalked
+// byte could reach the decoder as a string. Parity-exempt, like depth/length.
+add('typeref 5 (XmlHook) — refused, yrs reads no name', 'desync', rootItem(7, (e) => {
+  encoding.writeVarUint(e, 5);
+  encoding.writeVarString(e, 'hook');
+}));
+add('contentjson: one valid-JSON string — refused', 'desync', rootItem(2, (e) => {
+  encoding.writeVarUint(e, 1); // ContentJSON len
+  encoding.writeVarString(e, '"x"'); // one JSON string the page parses
+}));
+add('contentjson cursor-shift crash vector (per Copilot) — refused', 'desync', (() => {
+  const pre = Uint8Array.from(Buffer.from('010201000201017201046e756c6c046e756c6c0401017401c2a9', 'hex'));
+  const out = new Uint8Array(pre.length + 101 + 1);
+  out.set(pre, 0);
+  out.fill(0x61, pre.length, pre.length + 101);
+  out[pre.length + 101] = 0x00;
+  return out;
+})());
 
 // contentdoc — ContentDoc (ref 9): guid string then opts Any
 add('contentdoc: map opts', 'contentdoc', rootItem(9, (e) => {

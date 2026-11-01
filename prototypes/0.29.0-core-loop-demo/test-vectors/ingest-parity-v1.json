@@ -26,6 +26,12 @@
       "refused": false
     },
     {
+      "name": "yxmltext: insert in a fragment (type ref 6)",
+      "group": "clean",
+      "update": "0102010007010166060400010002686900",
+      "refused": false
+    },
+    {
       "name": "contentstring: non-UTF-8",
       "group": "utf8",
       "update": "01010100040101740361ff6300",
@@ -80,15 +86,15 @@
       "refused": false
     },
     {
-      "name": "typeref 3 (YXmlElement, reads a name)",
+      "name": "typeref 6 (YXmlText)",
       "group": "typeref",
-      "update": "01010100070104726f6f74030364697600",
+      "update": "01010100070104726f6f740600",
       "refused": false
     },
     {
-      "name": "typeref 5 (XmlHook, reads a name — accepted)",
+      "name": "typeref 3 (YXmlElement, reads a name)",
       "group": "typeref",
-      "update": "01010100070104726f6f740504686f6f6b00",
+      "update": "01010100070104726f6f74030364697600",
       "refused": false
     },
     {
@@ -108,6 +114,24 @@
       "group": "typeref",
       "update": "01010100070104726f6f740f00",
       "refused": true
+    },
+    {
+      "name": "typeref 5 (XmlHook) — refused, yrs reads no name",
+      "group": "desync",
+      "update": "01010100070104726f6f740504686f6f6b00",
+      "refused": false
+    },
+    {
+      "name": "contentjson: one valid-JSON string — refused",
+      "group": "desync",
+      "update": "01010100020104726f6f74010322782200",
+      "refused": false
+    },
+    {
+      "name": "contentjson cursor-shift crash vector (per Copilot) — refused",
+      "group": "desync",
+      "update": "010201000201017201046e756c6c046e756c6c0401017401c2a9616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616100",
+      "refused": false
     },
     {
       "name": "contentdoc: map opts",
