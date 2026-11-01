@@ -113,6 +113,22 @@ describe('the chalkboard on the wall', () => {
     handle.setHeld(null);
   });
 
+  it('lets a room-view click on the slate land on the board, not on a hidden tool', () => {
+    const { group, handle } = build();
+    // Straight at the slate's middle, where the tools wait while not held,
+    // and where one was last drawn with.
+    handle.setHeld('chalk');
+    handle.setHand({ point: { x: CHALK_MAX_X >> 1, y: CHALK_MAX_Y >> 1 }, inside: true }, false);
+    handle.setHeld(null);
+    for (const [x, y] of [[0, CHALKBOARD_Y], [0.3, CHALKBOARD_Y + 0.1]]) {
+      const ray = new THREE.Raycaster(new THREE.Vector3(x, y, 3), new THREE.Vector3(0, 0, -1));
+      const hit = ray.intersectObject(group, true)[0];
+      expect(hit?.object.userData.chalkboard).toBe(handle);
+      expect(hit?.object.userData.isDevice).toBe(true);
+    }
+    group.traverse((o) => expect(o.userData.skipDeviceHit).toBeUndefined());
+  });
+
   it('paints a face the size of the grid', () => {
     const { face } = build();
     expect(face.width).toBe(CHALK_GRID_W);

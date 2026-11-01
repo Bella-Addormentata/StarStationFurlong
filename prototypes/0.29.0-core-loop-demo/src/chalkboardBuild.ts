@@ -197,9 +197,11 @@ export function buildChalkboard(ctx: BuildCtx): void {
   heldEraser.add(heldFelt, heldBack);
   heldEraser.visible = false;
   ctx.attach(heldEraser);
-  // The held tools are never what a click lands on, and wait out of sight in
-  // front of the slate, never behind the wall.
-  for (const mesh of [heldStick, heldFelt, heldBack]) mesh.userData.skipDeviceHit = true;
+  // The held tools are never what a ray hits (a raycast ignores `visible`,
+  // so a hidden tool parked over the slate would take the room view's click
+  // on the board), and wait out of sight in front of the slate, never behind
+  // the wall.
+  for (const mesh of [heldStick, heldFelt, heldBack]) mesh.raycast = () => undefined;
   heldChalk.position.set(0, CHALKBOARD_Y, FACE_Z).addScaledVector(CHALK_LEAN, CHALK_STICK_L / 2);
   heldEraser.position.set(0, CHALKBOARD_Y, FACE_Z + 0.01);
 
