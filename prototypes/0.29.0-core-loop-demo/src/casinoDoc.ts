@@ -225,8 +225,8 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, gameOfInc, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
+import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, SigCheck } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
 } from './computedHouse';
@@ -2286,7 +2286,39 @@ function computedKeyParts(key: string): { t: string; inc: string; sid?: string }
 
 const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
 
+/** The top-level key an incarnation's owner-signed checkpoint is stored under
+ *  (`hs:<t>:<inc>`, PR 6a-2). Not a `computedKeyParts` key: v0.50 pages and
+ *  the node neither read nor write it, and a change to it never re-folds the
+ *  incarnation (an hs: is checked, not played). */
+const houseSumKey = (t: string, inc: string): string => `hs:${t}:${inc}`;
+
+/** The incarnation an `hs:<t>:<inc>` key is of, parsed from the right (an
+ *  incarnation holds no ':', a table id may), or null for any other key. */
+function houseSumKeyParts(key: string): { t: string; inc: string } | null {
+  if (!key.startsWith('hs:')) return null;
+  const rest = key.slice('hs:'.length);
+  const cut = rest.lastIndexOf(':');
+  const inc = rest.slice(cut + 1);
+  return cut > 0 && COMPUTED_INC.test(inc) ? { t: rest.slice(0, cut), inc } : null;
+}
+
 const checkpointCache = new WeakMap<object, { inc: string; cp: Checkpoint | null }>();
+const houseSumCache = new WeakMap<object, { inc: string; hs: HouseSum | null }>();
+
+/** The value stored at `hs:<t>:<inc>` read for its shape (asHouseSumFor, design
+ *  §6.1a steps 1–4; once per value), null for none or junk. The checker's key
+ *  authority (step 5) and the `'hsum'` signature (step 6) are applied by the
+ *  caller (authorityOkHouseSum, houseSumOk). */
+function houseSumAt(map: Y.Map<unknown>, t: string, inc: string): HouseSum | null {
+  const value = map.get(houseSumKey(t, inc));
+  if (typeof value !== 'object' || value === null) return null;
+  let hit = houseSumCache.get(value);
+  if (hit?.inc !== inc) {
+    hit = { inc, hs: asHouseSumFor({ inc })(value) };
+    houseSumCache.set(value, hit);
+  }
+  return hit.hs;
+}
 
 /** An incarnation's checkpoint as stored (its game's asCheckpoint, once per
  *  value: up to 4,096 nets to check); null for none, or junk. */
@@ -2928,6 +2960,18 @@ let roomWaiting = new Set<string>();
 let houseBeats = new Map<string, { n: number; at: number }>();
 /** The newest Fair setting by the deed holder this page has seen, per table. */
 let fairSeen = new Map<string, FairSettingRec>();
+/** The best valid owner-signed checkpoint (`hs:`) this page has counted, per
+ *  `<t>:<inc>` (compareHouseSum order; it only ever rises). D2 writes its own
+ *  into it, and a page that only reads one counts it here; D3 puts the best
+ *  back when the doc's goes, is junk or is worse. */
+let houseSumSeen = new Map<string, HouseSum>();
+/** B12 backoff per `<t>:<inc>`: the times this page's hs: put-back was
+ *  overwritten by a worse value, and until when it stands down (⚙ shows
+ *  PAGES DISAGREE). */
+let houseSumBackoff = new Map<string, { hits: number[]; until: number }>();
+const BACKOFF_COUNT = 3;
+const BACKOFF_WINDOW_MS = 60_000;
+const BACKOFF_MS = 600_000;
 /** The deed holder's key the houses were last read under (deedHolderKey):
  *  they read otherwise only as it changes (onComputedTransaction). */
 let houseDeedKey: string | null | undefined;
@@ -3004,6 +3048,9 @@ function recheckRoomRecords(): string[] {
       noteFairSetting(at.of);
     } else if (at?.kind === 'hbeat') {
       noteBeat(at.of);
+    } else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
     }
   }
   return pinned;
@@ -3047,11 +3094,20 @@ function houseChangedAll(dirty?: Set<ComputedInc>): void {
   }
   const map = computedMap;
   if (!map) return;
+  // A new deed holder's checks count afresh; an old holder's this page kept
+  // are no longer theirs to put back (B1: the deed changed hands).
+  for (const key of [...houseSumSeen.keys()]) {
+    if (!authorityOkHouseSum(houseSumSeen.get(key)!)) houseSumSeen.delete(key);
+  }
   for (const key of map.keys()) {
     const at = houseKeyParts(key);
     // (Each delegation counted now is pinned, and kept to put back.)
     if (at?.kind === 'hkey') houseOkOf(at.of);
     else if (at?.kind === 'hfair') noteFairSetting(at.of);
+    else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
+    }
   }
 }
 
@@ -3086,6 +3142,106 @@ function noteBeat(pub: string): void {
   const was = houseBeats.get(pub);
   if (was && was.n >= rec.n) return;
   if (roomRecOk('hbeat', '', rec, beatKey(pub)) === true) houseBeats.set(pub, { n: rec.n, at: txNow ?? Date.now() });
+}
+
+/** 🏛️ An owner-signed checkpoint's `'hsum'` signature (step 6), checked once
+ *  for its room, incarnation and recHash out of the recount's budget as a
+ *  room record's is (roomRecOk), on WebCrypto if it can go past the budget,
+ *  a slice for what can't: undefined while it waits (the key under `key`,
+ *  `hs:<t>:<inc>`, is read again by the slice, recheckRoomRecords). `hs:` is
+ *  signed in the fold domain (signBytes), not the room domain. */
+function houseSumOk(t: string, inc: string, rec: HouseSum, key: string): boolean | undefined {
+  const hash = recHash(rec);
+  if (hash === null) return false;
+  const id = JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]);
+  const known = houseVerdicts.get(id);
+  if (known !== undefined) return known;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const fid = fastId('room', id);
+  if (fastInFlight.has(fid)) {
+    roomWaiting.add(key);
+    return undefined;
+  }
+  if (verifySpent >= verifyBudgetMs) {
+    const fast = sendFast(fid, rec.k, () => signBytes('hsum', ctx, rec), rec.g, () => setHouseVerdict(id, true));
+    if (fast === false) {
+      setHouseVerdict(id, false);
+      return false;
+    }
+    roomWaiting.add(key);
+    if (fast === null) queueVerifySlice();
+    return undefined;
+  }
+  const from = verifyNow();
+  let ok: boolean;
+  try {
+    ok = (verifyWith ?? verifyIdentityStrict)(rec.k, signBytes('hsum', ctx, rec), rec.g) === true;
+  } catch {
+    ok = false;
+  }
+  verifySpent += Math.max(0, verifyNow() - from);
+  setHouseVerdict(id, ok);
+  return ok;
+}
+
+/** 🏛️ Whether `rec`'s key is one that may check a checkpoint (design §6.1a
+ *  step 5): the room's deed holder, or a house it delegated (houseOkOf). A
+ *  delegation whose check waits reads as not-yet (undefined → false): the
+ *  record is counted on a later pass, as the deed key or the delegation lands. */
+function authorityOkHouseSum(rec: HouseSum): boolean {
+  return rec.k === deedHolderKey() || houseOkOf(rec.k) === true;
+}
+
+/** 🏛️ Count the owner-signed checkpoint the doc holds for an incarnation: its
+ *  shape (houseSumAt), its checker's authority and the `'hsum'` signature. The
+ *  best valid one by order (compareHouseSum) is kept to put back (houseSumSeen,
+ *  D3). A worse valid one, or junk, is left for D3 to overwrite. */
+function noteHouseSum(t: string, inc: string): void {
+  const map = computedMap;
+  if (!map) return;
+  const hs = houseSumAt(map, t, inc);
+  if (!hs || !authorityOkHouseSum(hs)) return;
+  if (houseSumOk(t, inc, hs, houseSumKey(t, inc)) !== true) return;
+  const key = `${t}:${inc}`;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const seen = houseSumSeen.get(key);
+  if (!seen || compareHouseSum(ctx, hs, seen) > 0) houseSumSeen.set(key, hs);
+}
+
+/** 🏛️ The raw checkpoint the doc holds for an incarnation (computedTable's D2
+ *  reads it to vouch for its own `b` and whether an end is its own). */
+export function computedCheckpointOf(t: string, inc: string): Checkpoint | null {
+  return computedMap ? checkpointAt(computedMap, t, inc) : null;
+}
+
+/** 🏛️ The best valid owner-signed checkpoint this page has counted for an
+ *  incarnation (the ⚙ card's checkpoint label, C3; D3's put-back). */
+export function bestHouseSum(t: string, inc: string): HouseSum | null {
+  return houseSumSeen.get(`${t}:${inc}`) ?? null;
+}
+
+/** 🏛️ Whether this page has backed off putting an incarnation's `hs:` back
+ *  (B12: two pages disagreeing on the owner's key; the ⚙ card says so). */
+export function houseSumBackedOff(t: string, inc: string, now = Date.now()): boolean {
+  const bo = houseSumBackoff.get(`${t}:${inc}`);
+  return bo !== undefined && now < bo.until;
+}
+
+/** 🏛️ D2's write: the deed holder's page stores its signed checkpoint at
+ *  `hs:<t>:<inc>`. Its own signature is never re-checked, and it counts at once
+ *  as the best this page has (so D3 puts it back if a peer takes it away). */
+export function writeHouseSum(t: string, inc: string, rec: HouseSum): void {
+  ensureMap();
+  const map = computedMap!;
+  const hash = recHash(rec);
+  if (hash !== null) setHouseVerdict(JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]), true);
+  const key = `${t}:${inc}`;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const seen = houseSumSeen.get(key);
+  if (!seen || compareHouseSum(ctx, rec, seen) > 0) houseSumSeen.set(key, rec);
+  boundDoc!.transact(() => {
+    map.set(houseSumKey(t, inc), rec);
+  });
 }
 
 /** 🏠 Whether this page holds the room's deed (its key is the deed holder's,
@@ -3161,9 +3317,10 @@ export function writeFairSetting(tableId: string, rec: FairSettingRec): void {
 }
 
 /** 🏠 Put back what a delete or an older copy took away: each delegation this
- *  page counted by the deed holder as they are now, and each table's newest
- *  Fair setting. Returns how many. */
-export function putBackHouseRecords(): number {
+ *  page counted by the deed holder as they are now, each table's newest Fair
+ *  setting, and (D3) the best owner-signed checkpoint this page counted. Returns
+ *  how many. */
+export function putBackHouseRecords(now = Date.now()): number {
   if (!docAlive() || !computedMap) return 0;
   const map = computedMap;
   const back: [string, unknown][] = [];
@@ -3172,26 +3329,55 @@ export function putBackHouseRecords(): number {
     // (houseOkOf takes the new holder's of the same key, if the doc holds it).
     if (!houseOkOf(pub)) continue;
     const rec = houseDelegations.get(pub)!;
-    const now = asDelegation(map.get(delegationKey(pub)));
-    if (!now || recHash(now) !== recHash(rec)) back.push([delegationKey(pub), rec]);
+    const cur = asDelegation(map.get(delegationKey(pub)));
+    if (!cur || recHash(cur) !== recHash(rec)) back.push([delegationKey(pub), rec]);
   }
   for (const t of fairSeen.keys()) {
     const rec = fairOf(t);
     if (!rec) continue;
-    const now = asFairSetting(map.get(fairSettingKey(t)));
-    if (now && recHash(now) === recHash(rec)) continue;
+    const cur = asFairSetting(map.get(fairSettingKey(t)));
+    if (cur && recHash(cur) === recHash(rec)) continue;
     // A newer one by the deed holder that this page hasn't noted yet stands
     // (one whose check waits, until it is checked); anything else goes, a
     // forged one with a higher count included.
-    if (now && now.k === rec.k && fairAfter(now, rec)) {
-      const ok = roomRecOk('hfair', t, now, fairSettingKey(t));
+    if (cur && cur.k === rec.k && fairAfter(cur, rec)) {
+      const ok = roomRecOk('hfair', t, cur, fairSettingKey(t));
       if (ok === undefined) continue;
       if (ok) {
-        fairSeen.set(t, now);
+        fairSeen.set(t, cur);
         continue;
       }
     }
     back.push([fairSettingKey(t), rec]);
+  }
+  // 🏛️ D3: the owner-signed checkpoints. The best one this page counted goes
+  // back when the doc's is gone, junk, or worse by order (§6.1). A present
+  // worse value is an overwrite; three in a minute (B12) and this page stands
+  // down for ten (houseSumBackoff, houseSumBackedOff → ⚙ PAGES DISAGREE).
+  for (const key of houseSumSeen.keys()) {
+    const seen = houseSumSeen.get(key)!;
+    // A handover ended the checker's authority: not this page's to defend.
+    if (!authorityOkHouseSum(seen)) continue;
+    const bo = houseSumBackoff.get(key);
+    if (bo && now < bo.until) continue;
+    const cut = key.lastIndexOf(':');
+    const t = key.slice(0, cut);
+    const inc = key.slice(cut + 1);
+    const ctx: FoldCtx = { room: boundRoomId, t, inc };
+    const doc = houseSumAt(map, t, inc);
+    const docOk = doc !== null && authorityOkHouseSum(doc) && houseSumOk(t, inc, doc, houseSumKey(t, inc)) === true;
+    if (docOk && compareHouseSum(ctx, seen, doc!) <= 0) continue;
+    // A present value worse than ours (not a bare delete) counts toward B12.
+    if (doc !== null && recHash(doc) !== recHash(seen)) {
+      const hits = (bo?.hits ?? []).filter((at) => now - at < BACKOFF_WINDOW_MS);
+      hits.push(now);
+      if (hits.length >= BACKOFF_COUNT) {
+        houseSumBackoff.set(key, { hits, until: now + BACKOFF_MS });
+        continue;
+      }
+      houseSumBackoff.set(key, { hits, until: 0 });
+    }
+    back.push([houseSumKey(t, inc), seen]);
   }
   if (back.length === 0) return 0;
   boundDoc!.transact(() => {
@@ -3420,6 +3606,8 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
+  houseSumSeen = new Map();
+  houseSumBackoff = new Map();
   houseDeedKey = deedHolderKey();
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
@@ -3427,6 +3615,10 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
     const house = houseKeyParts(key);
     if (house?.kind === 'hkey') houseOkOf(house.of);
     else if (house?.kind === 'hfair') noteFairSetting(house.of);
+    else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
+    }
   }
   for (const c of computedIncs.values()) countComputed(c, map, casino, true);
   // (bindCasinoDoc's own notify repaints every listener from the fresh doc.)
@@ -3473,6 +3665,10 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
         if (!pinnedHouse(house.of) && houseOkOf(house.of) === true) pinned.push(house.of);
       } else if (house?.kind === 'hbeat') noteBeat(house.of);
       else if (house?.kind === 'hfair') noteFairSetting(house.of);
+      else if (key !== null) {
+        const hs = houseSumKeyParts(key);
+        if (hs) noteHouseSum(hs.t, hs.inc);
+      }
       const at = key === null ? null : computedKeyParts(key);
       if (!at) continue;
       const c = computedIncs.get(`${at.t}:${at.inc}`) ?? (map.has(key!) ? trackComputed(at.t, at.inc) : undefined);
