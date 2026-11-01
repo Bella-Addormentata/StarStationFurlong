@@ -6,7 +6,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
-import { FOX_HALF_WIDTH_M, SIGHT_CLEAR_M, blocksSight } from './sightline';
+import { FOX_HALF_WIDTH_M, FOX_HEIGHT_M, SIGHT_CLEAR_M, blocksSight } from './sightline';
 
 /** A canvas whose 2-D context draws nothing: the fox's face and the
  *  cabinet's screens paint through one. */
@@ -32,38 +32,59 @@ const { PLAYER_R, playerFitsAt } = await import('./obstacles');
 type Xz = { x: number; z: number };
 
 describe('blocksSight', () => {
-  const eye = { x: 0, z: 2 };
-  const anchor = { x: 0, z: 0 };
+  // A focus camera's eye and what it looks at: lower than a fox is tall.
+  const eye = { x: 0, y: 1.5, z: 2 };
+  const anchor = { x: 0, y: 1.3, z: 0 };
+  const fox = (x: number, z: number) => ({ x, y: 0, z });
   it('hides a fox on the line, or close enough for its body to reach across it', () => {
-    expect(blocksSight(eye, anchor, { x: 0, z: 1 })).toBe(true);
-    expect(blocksSight(eye, anchor, { x: SIGHT_CLEAR_M - 0.01, z: 1 })).toBe(true);
-    expect(blocksSight(eye, anchor, { x: -(SIGHT_CLEAR_M - 0.01), z: 0.5 })).toBe(true);
+    expect(blocksSight(eye, anchor, fox(0, 1))).toBe(true);
+    expect(blocksSight(eye, anchor, fox(SIGHT_CLEAR_M - 0.01, 1))).toBe(true);
+    expect(blocksSight(eye, anchor, fox(-(SIGHT_CLEAR_M - 0.01), 0.5))).toBe(true);
   });
   it('leaves a fox clear of the line in sight', () => {
-    expect(blocksSight(eye, anchor, { x: SIGHT_CLEAR_M + 0.01, z: 1 })).toBe(false);
-    expect(blocksSight(eye, anchor, { x: -1.5, z: 1.9 })).toBe(false);
+    expect(blocksSight(eye, anchor, fox(SIGHT_CLEAR_M + 0.01, 1))).toBe(false);
+    expect(blocksSight(eye, anchor, fox(-1.5, 1.9))).toBe(false);
   });
   it('measures behind the eye from the eye, and beyond what it looks at from that', () => {
     // At your shoulder, just behind the camera: its head is in your face.
-    expect(blocksSight(eye, anchor, { x: 0.3, z: 2.4 })).toBe(true);
-    expect(blocksSight(eye, anchor, { x: 0, z: 2 + SIGHT_CLEAR_M + 0.01 })).toBe(false);
+    expect(blocksSight(eye, anchor, fox(0.3, 2.4))).toBe(true);
+    expect(blocksSight(eye, anchor, fox(0, 2 + SIGHT_CLEAR_M + 0.01))).toBe(false);
     // Across the table, beyond its middle: an opponent stays in sight.
-    expect(blocksSight(eye, anchor, { x: 0, z: -1.5 })).toBe(false);
+    expect(blocksSight(eye, anchor, fox(0, -1.5))).toBe(false);
   });
   it('copes with an eye right over what it looks at', () => {
-    expect(blocksSight(anchor, anchor, { x: 0.2, z: 0 })).toBe(true);
-    expect(blocksSight(anchor, anchor, { x: 2, z: 0 })).toBe(false);
+    expect(blocksSight(anchor, anchor, fox(0.2, 0))).toBe(true);
+    expect(blocksSight(anchor, anchor, fox(2, 0))).toBe(false);
+  });
+  it('lets a camera high above look over foxes below its line, until it comes down to them (#347)', () => {
+    // The fly-in starts at the room view, far up over the player at the
+    // origin, looking down at them.
+    const high = { x: 10, y: 26, z: 10 };
+    const player = { x: 0, y: 0.6, z: 0 };
+    // Under the line most of the way up it: the camera looks over them.
+    expect(blocksSight(high, player, fox(7, 7))).toBe(false);
+    expect(blocksSight(high, player, fox(2.5, 2.5))).toBe(false);
+    // Right by the player, where the line comes down through a fox's head.
+    expect(blocksSight(high, player, fox(0.7, 0.7))).toBe(true);
+    // On a top bunk, higher up, the line reaches them further out.
+    expect(blocksSight(high, player, { x: 2.5, y: 2.5, z: 2.5 })).toBe(true);
+    // Level with the eye, a fox is only in the way if it is on the line.
+    expect(blocksSight({ x: 0, y: 1.5, z: 2 }, { x: 0, y: 1.5, z: 0 }, fox(0, 1))).toBe(true);
+    expect(blocksSight({ x: 0, y: 4, z: 2 }, { x: 0, y: 4, z: 0 }, fox(0, 1))).toBe(false);
   });
 });
 
 describe('the fox the rule is measured for', () => {
-  it('is no wider than FOX_HALF_WIDTH_M either side, and not much narrower', () => {
+  it('is no wider than FOX_HALF_WIDTH_M either side nor taller than FOX_HEIGHT_M, and not much less', () => {
     const rig = new VoxelCharacter(new THREE.Scene());
     rig.masterGroup.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(rig.masterGroup);
     const half = Math.max(-box.min.x, box.max.x);
     expect(half).toBeLessThanOrEqual(FOX_HALF_WIDTH_M);
     expect(half).toBeGreaterThan(FOX_HALF_WIDTH_M - 0.05);
+    expect(box.min.y).toBeGreaterThan(-0.05);
+    expect(box.max.y).toBeLessThanOrEqual(FOX_HEIGHT_M);
+    expect(box.max.y).toBeGreaterThan(FOX_HEIGHT_M - 0.1);
   });
 });
 
@@ -196,7 +217,7 @@ describe('nobody stands in your view of an arcade screen (#345)', () => {
         expect(stands.length).toBeGreaterThan(1);
         const [left, right] = screens[kind]!;
         for (const s of stands) {
-          if (blocksSight(eye, anchor, s.front)) continue;
+          if (blocksSight(eye, anchor, { ...s.front, y: 0 })) continue;
           expect(reaches(s.front, [eye, left!, right!]), `${s.id} at ${s.front.x}, ${s.front.z}`).toBe(false);
         }
       });
