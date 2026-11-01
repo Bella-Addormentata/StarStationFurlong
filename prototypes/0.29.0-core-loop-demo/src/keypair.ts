@@ -156,9 +156,9 @@ function identityR(sig: Uint8Array): boolean {
  * "signatures" verify any message), S < L, and the cofactored equation.
  * That last part means a signature whose R carries a torsion component
  * still passes; it does so on every page that runs this pinned noble
- * version (package.json), so pages agree. A later fast path (WebCrypto) must
- * make the same byte checks first: it accepts an identity R whose S fits the
- * real k, which noble and this refuse.
+ * version (package.json), so pages agree. The fast path (fastStrictCheck,
+ * WebCrypto) makes the same byte checks first, since WebCrypto accepts an
+ * identity R whose S fits the real k, which noble and this refuse.
  * Any throw is a false. verifyIdentity makes the same point checks but
  * forgives the spelling.
  */
@@ -174,6 +174,195 @@ export function verifyIdentityStrict(pubB64: string, bytes: Uint8Array, sigB64: 
     const sig = strictB64(sigB64, 64);
     if (!pub || !sig || identityR(sig)) return false;
     return ed.verify(sig, bytes, pub, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
+// ── 🏎 The fast path: WebCrypto under verifyIdentityStrict's byte checks ─────
+//
+// noble's verify is about 1.7 ms of the page's own time; WebCrypto's Ed25519
+// is about 0.05 to 0.3 ms and runs off the page's thread, but it doesn't say
+// what verifyIdentityStrict says for every signature: it uses the
+// cofactorless equation ([S]B = R + [k]A), so it refuses a signature whose R
+// or key carries a torsion component that noble's cofactored one forgives,
+// and some implementations accept an identity R whose S fits the real k, or
+// spellings and points strict decoding refuses. So fastStrictCheck makes
+// every check verifyIdentityStrict makes besides the equation itself (the one
+// spelling, no identity R, strict decoding of the key and of R, no
+// small-order key, S < L) and trusts only WebCrypto's yes: an equation that
+// holds without the cofactor holds with it, so a yes is noble's yes. Its no
+// says nothing, and the caller runs verifyIdentityStrict. Answers are the
+// same on every page, whichever path a page took.
+
+/** Off until enableFastStrictChecks (the app's boot); specs keep noble alone. */
+let fastState: 'off' | 'testing' | 'on' | 'broken' = 'off';
+/** Each key's WebCrypto handle (null: WebCrypto wouldn't take it), by base64url. */
+const fastKeys = new Map<string, Promise<CryptoKey | null>>();
+/** Keys whose strict decoding was made: true when it decodes and isn't of small order. */
+const strictPoints = new Map<string, boolean>();
+/** A WebCrypto answer that hasn't come in this long counts as no answer. */
+const FAST_TIMEOUT_MS = 2_000;
+
+function subtleOf(): SubtleCrypto | null {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  return c && c.subtle && typeof c.subtle.verify === 'function' ? c.subtle : null;
+}
+
+function fastKeyOf(subtle: SubtleCrypto, pubB64: string, pub: Uint8Array): Promise<CryptoKey | null> {
+  let key = fastKeys.get(pubB64);
+  if (!key) {
+    key = subtle.importKey('raw', pub as Uint8Array<ArrayBuffer>, { name: 'Ed25519' }, false, ['verify']).catch(() => null);
+    fastKeys.set(pubB64, key);
+    while (fastKeys.size > MAX_STRICT_PUBS) fastKeys.delete(fastKeys.keys().next().value as string);
+  }
+  return key;
+}
+
+/** WebCrypto's answer (true or false), or undefined for no answer: a throw,
+ *  a key it wouldn't import, or a wait past FAST_TIMEOUT_MS. */
+async function subtleVerify(subtle: SubtleCrypto, pubB64: string, pub: Uint8Array, bytes: Uint8Array, sig: Uint8Array): Promise<boolean | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), FAST_TIMEOUT_MS); });
+  try {
+    const run = (async () => {
+      const key = await fastKeyOf(subtle, pubB64, pub);
+      if (!key) return undefined;
+      return (await subtle.verify({ name: 'Ed25519' }, key, sig as Uint8Array<ArrayBuffer>, bytes as Uint8Array<ArrayBuffer>)) === true;
+    })().catch(() => undefined);
+    return await Promise.race([run, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The page's WebCrypto must say yes to a good signature and no to bad ones
+ *  before its yes counts: an implementation that says yes to everything
+ *  would otherwise let forgeries in. 'on' when it does; 'broken' when it has
+ *  no Ed25519 or gives a wrong answer (never asked again on this load);
+ *  'off' when an answer didn't come (a page too busy for 2 s, say): the next
+ *  enableFastStrictChecks tries again. */
+async function fastSelfTest(subtle: SubtleCrypto): Promise<'on' | 'off' | 'broken'> {
+  try {
+    const seed = new Uint8Array(32).fill(0x5c);
+    const pub = ed.getPublicKey(seed);
+    const pubB64 = b64urlEncode(pub);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const key = await Promise.race([
+      fastKeyOf(subtle, pubB64, pub),
+      new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), FAST_TIMEOUT_MS); }),
+    ]).finally(() => clearTimeout(timer));
+    if (key === 'late') return 'off';
+    if (!key) return 'broken'; // no Ed25519 here
+    const msg = new TextEncoder().encode('ssf-fast-verify-self-test-v1');
+    const sig = ed.sign(msg, seed);
+    const otherMsg = new TextEncoder().encode('ssf-fast-verify-self-test-v2');
+    const badSig = sig.slice();
+    badSig[40] ^= 1;
+    const answers = await Promise.all([
+      subtleVerify(subtle, pubB64, pub, msg, sig),
+      subtleVerify(subtle, pubB64, pub, otherMsg, sig),
+      subtleVerify(subtle, pubB64, pub, msg, badSig),
+    ]);
+    const [good, wrongMsg, wrongSig] = answers;
+    if (good === true && wrongMsg === false && wrongSig === false) return 'on';
+    return answers.includes(undefined) && good !== false && wrongMsg !== true && wrongSig !== true ? 'off' : 'broken';
+  } catch {
+    return 'broken';
+  }
+}
+
+/** The self-test running, if one is. */
+let fastTesting: Promise<boolean> | null = null;
+
+/** 🏎 Let fastStrictCheck use the page's WebCrypto once a self-test passes
+ *  (fastStrictChecksOn); a page without Ed25519 in WebCrypto stays on noble
+ *  alone. Resolves to whether the fast path is on. `false` turns it off
+ *  again (specs). */
+export function enableFastStrictChecks(on = true): Promise<boolean> {
+  if (!on) {
+    fastState = 'off';
+    fastTesting = null;
+    fastKeys.clear();
+    return Promise.resolve(false);
+  }
+  if (fastState === 'on') return Promise.resolve(true);
+  if (fastState === 'broken') return Promise.resolve(false);
+  if (fastState === 'testing' && fastTesting) return fastTesting;
+  const subtle = subtleOf();
+  if (!subtle) {
+    fastState = 'broken';
+    return Promise.resolve(false);
+  }
+  fastState = 'testing';
+  const testing: Promise<boolean> = fastSelfTest(subtle).then((got) => {
+    if (fastTesting !== testing) return fastState === 'on'; // turned off meanwhile
+    fastTesting = null;
+    fastState = got;
+    if (got !== 'on') fastKeys.clear();
+    return got === 'on';
+  });
+  fastTesting = testing;
+  return testing;
+}
+
+/** The fast path is on: fastStrictCheck can answer. */
+export function fastStrictChecksOn(): boolean {
+  return fastState === 'on';
+}
+
+/** Little-endian bytes as a number (a signature's S). */
+function leNumber(b: Uint8Array): bigint {
+  let n = 0n;
+  for (let i = b.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(b[i]);
+  return n;
+}
+
+/** Key `pubB64` (its 32 bytes `pub`) decodes strictly and isn't of small
+ *  order: noble's own checks of it (zip215: false), made once per key. */
+function strictPointOk(pubB64: string, pub: Uint8Array): boolean {
+  let ok = strictPoints.get(pubB64);
+  if (ok === undefined) {
+    try {
+      ok = !ed.Point.fromBytes(pub, false).isSmallOrder();
+    } catch {
+      ok = false;
+    }
+    strictPoints.set(pubB64, ok);
+    while (strictPoints.size > MAX_STRICT_PUBS) strictPoints.delete(strictPoints.keys().next().value as string);
+  }
+  return ok;
+}
+
+/**
+ * 🏎 verifyIdentityStrict's answer by WebCrypto, where it can be had:
+ * - `null`: the fast path is off (enableFastStrictChecks, its self-test);
+ * - `false`: the byte checks refuse it, as verifyIdentityStrict does (the
+ *   spelling, an identity R, a key or R that doesn't decode strictly, a key
+ *   of small order, S >= L), at once;
+ * - a Promise of `true`: verifyIdentityStrict says true; of `undefined`:
+ *   WebCrypto didn't say yes (a torsion component, a WebCrypto that can't,
+ *   a wait past 2 s), so only verifyIdentityStrict can say.
+ * The byte checks cost about 0.1 ms here (R's strict decoding; the key's is
+ * kept). `bytes` must not change until the answer is in.
+ */
+export function fastStrictCheck(pubB64: string, bytes: Uint8Array, sigB64: string): false | null | Promise<true | undefined> {
+  if (fastState !== 'on') return null;
+  const subtle = subtleOf();
+  if (!subtle) return null;
+  try {
+    if (typeof pubB64 !== 'string' || typeof sigB64 !== 'string') return false;
+    let pub = strictPubs.get(pubB64);
+    if (pub === undefined) {
+      pub = strictB64(pubB64, 32);
+      strictPubs.set(pubB64, pub);
+      while (strictPubs.size > MAX_STRICT_PUBS) strictPubs.delete(strictPubs.keys().next().value as string);
+    }
+    const sig = strictB64(sigB64, 64);
+    if (!pub || !sig || identityR(sig) || !strictPointOk(pubB64, pub)) return false;
+    ed.Point.fromBytes(sig.subarray(0, 32), false); // R decodes strictly (throws otherwise)
+    if (leNumber(sig.subarray(32, 64)) >= ed.CURVE.n) return false; // S < L
+    return subtleVerify(subtle, pubB64, pub, bytes, sig).then((ok) => (ok === true ? true : undefined));
   } catch {
     return false;
   }

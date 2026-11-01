@@ -233,7 +233,7 @@ import {
 import type { DelegationRec, FairSettingRec, RoomKind } from './computedHouse';
 import { legacyOwnerMarker } from './roomOwner';
 import { getPlayerId } from './identity';
-import { getIdentityPub, verifyIdentityStrict } from './keypair';
+import { fastStrictCheck, fastStrictChecksOn, getIdentityPub, verifyIdentityStrict } from './keypair';
 import { forgetRoomHeard, noteRoomHeard } from './roomHearing';
 
 let boundDoc: Y.Doc | null = null;
@@ -2441,6 +2441,66 @@ let verifySpent = 0;
 /** A slice is queued on this binding. */
 let verifyQueued = false;
 
+// 🏎 Past a recount's budget, a check goes to WebCrypto when the page's fast
+// path is on (keypair fastStrictCheck, enabled at the app's boot): its yes
+// lands in the verdicts and queues a slice that reads it, and its "can't
+// say" (a torsion component noble's equation forgives) leaves the check to
+// noble in a later recount (fastToNoble). A check in flight isn't made again
+// meanwhile. A yes from WebCrypto is noble's yes and a refusal by the byte
+// checks noble's refusal, so every page counts the same records whichever
+// path checked them. Sending costs about 0.1 ms a check (the byte checks),
+// at most COMPUTED_FAST_MS of each recount; the checks themselves run off
+// the page's thread.
+const COMPUTED_FAST_MS = 20;
+/** ms this recount has spent sending checks to WebCrypto. */
+let fastSpent = 0;
+/** The checks in flight on WebCrypto, by verdict id (fastId). */
+let fastInFlight = new Set<string>();
+/** The checks WebCrypto didn't say yes to: noble's (the latest FAST_TO_NOBLE_MAX). */
+let fastToNoble = new Set<string>();
+const FAST_TO_NOBLE_MAX = 4_096;
+
+/** A verdict's id across both kinds of check: a fold's record by its
+ *  incarnation and hash, a room record by its own id (roomRecOk). */
+function fastId(kind: 'fold' | 'room', id: string): string {
+  return `${kind}|${id}`;
+}
+
+/** Send check `id` (`pub`'s signature `sig` over `bytes()`) to WebCrypto:
+ *  'sent' while it is in flight (`onYes` sets the verdict when WebCrypto
+ *  says yes; either answer queues a slice), false when the byte checks
+ *  refuse it (a verdict: verifyIdentityStrict refuses it too), null when it
+ *  can't go (the fast path off or swapped out for a spec's check, this
+ *  recount's sending budget spent, or WebCrypto couldn't say before): noble
+ *  checks it, now or in a slice. */
+function sendFast(id: string, pub: string, bytes: () => Uint8Array, sig: string, onYes: () => void): 'sent' | false | null {
+  if (fastInFlight.has(id)) return 'sent';
+  if (verifyWith !== null || verifyBudgetMs <= 0 || fastSpent >= COMPUTED_FAST_MS || fastToNoble.has(id) || !fastStrictChecksOn()) return null;
+  const from = verifyNow();
+  let answer: ReturnType<typeof fastStrictCheck>;
+  try {
+    answer = fastStrictCheck(pub, bytes(), sig);
+  } catch {
+    answer = false;
+  }
+  fastSpent += Math.max(0, verifyNow() - from);
+  if (answer === null || answer === false) return answer;
+  const epoch = bindingEpoch;
+  fastInFlight.add(id);
+  void answer.then((yes) => {
+    if (bindingEpoch !== epoch) return; // a binding we've moved off (its sets are new)
+    fastInFlight.delete(id);
+    if (yes) {
+      onYes();
+    } else {
+      fastToNoble.add(id);
+      if (fastToNoble.size > FAST_TO_NOBLE_MAX) fastToNoble.delete(fastToNoble.keys().next().value as string);
+    }
+    queueVerifySlice();
+  });
+  return 'sent';
+}
+
 /** 🧪 Swap the signature check, the budget per recount or its clock (any
  *  left out, and all with no argument, go back to the real ones). A budget
  *  of 0 checks nothing and so queues nothing: the next call queues the slice
@@ -2452,6 +2512,7 @@ export function setComputedVerifyForTests(opts: {
 } = {}): void {
   verifyWith = opts.verify ?? null;
   verifyBudgetMs = opts.budgetMs ?? COMPUTED_VERIFY_MS;
+  fastToNoble = new Set();
   verifyNow = opts.now ?? defaultVerifyNow;
   if (roomWaiting.size > 0) queueVerifySlice();
   for (const c of computedIncs.values()) {
@@ -2469,14 +2530,22 @@ function verdictsOf(incKey: string): Map<string, boolean> {
 }
 
 /** The SigCheck of one incarnation's fold: a cached verdict, else a check
- *  while this recount's budget lasts, else "not checked yet" and a slice. */
+ *  while this recount's budget lasts, else "not checked yet": on WebCrypto
+ *  if it can go (sendFast), and a slice for what can't. */
 function computedCheck(incKey: string): SigCheck {
   return (hash, _kind, pub, bytes, sig) => {
     const verdicts = verdictsOf(incKey);
     const known = verdicts.get(hash);
     if (known !== undefined) return known;
+    const id = fastId('fold', `${incKey}:${hash}`);
+    if (fastInFlight.has(id)) return undefined;
     if (verifySpent >= verifyBudgetMs) {
-      queueVerifySlice();
+      const fast = sendFast(id, pub, bytes, sig, () => verdicts.set(hash, true));
+      if (fast === false) {
+        verdicts.set(hash, false);
+        return false;
+      }
+      if (fast === null) queueVerifySlice();
       return undefined;
     }
     const from = verifyNow();
@@ -2580,9 +2649,20 @@ function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }, key
   const id = JSON.stringify([kind, boundRoomId, t, hash]);
   const known = houseVerdicts.get(id);
   if (known !== undefined) return known;
-  if (verifySpent >= verifyBudgetMs) {
+  const fid = fastId('room', id);
+  if (fastInFlight.has(fid)) {
     roomWaiting.add(key);
-    queueVerifySlice();
+    return undefined;
+  }
+  if (verifySpent >= verifyBudgetMs) {
+    const room = boundRoomId;
+    const fast = sendFast(fid, rec.k, () => roomSignBytes(kind, room, t, rec), rec.g, () => setHouseVerdict(id, true));
+    if (fast === false) {
+      setHouseVerdict(id, false);
+      return false;
+    }
+    roomWaiting.add(key);
+    if (fast === null) queueVerifySlice();
     return undefined;
   }
   const from = verifyNow();
@@ -2593,9 +2673,14 @@ function roomRecOk(kind: RoomKind, t: string, rec: { k: string; g: string }, key
     ok = false;
   }
   verifySpent += Math.max(0, verifyNow() - from);
-  if (houseVerdicts.size >= HOUSE_VERDICTS_MAX) houseVerdicts.delete(houseVerdicts.keys().next().value as string);
-  houseVerdicts.set(id, ok);
+  setHouseVerdict(id, ok);
   return ok;
+}
+
+/** Keep a room record's verdict, the oldest going first past HOUSE_VERDICTS_MAX. */
+function setHouseVerdict(id: string, ok: boolean): void {
+  if (!houseVerdicts.has(id) && houseVerdicts.size >= HOUSE_VERDICTS_MAX) houseVerdicts.delete(houseVerdicts.keys().next().value as string);
+  houseVerdicts.set(id, ok);
 }
 
 /** Read again each room record whose check waited (roomWaiting), now the
@@ -3001,6 +3086,9 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   computedKeysMoved = false;
   verifyQueued = false;
   verifySpent = 0;
+  fastSpent = 0;
+  fastInFlight = new Set();
+  fastToNoble = new Set();
   throwSeen = new Map();
   housePinned = new Map();
   houseDelegations = new Map();
@@ -3041,6 +3129,7 @@ function onComputedTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y
 
 function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<unknown>): void {
   verifySpent = 0;
+  fastSpent = 0;
   const dirty = new Set<ComputedInc>();
   const whole = new Set<ComputedInc>();
   const changed = new Map<ComputedInc, Set<string>>();

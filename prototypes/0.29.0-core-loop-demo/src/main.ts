@@ -91,6 +91,7 @@ import {
   importRecoveryKey,
   ysyncSigner,
   hasStoredIdentity,
+  enableFastStrictChecks,
 } from "./keypair";
 import {
   bindTreasuryDoc,
@@ -2252,7 +2253,11 @@ async function joinRoomAtEpoch(
   bindGamesDoc(sync.doc);
 
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
-  // table state. Rebinds per join like games/furniture (T0 seam).
+  // table state. Rebinds per join like games/furniture (T0 seam). The
+  // computed tables' signature checks past a recount's budget go to
+  // WebCrypto once its self-test passes (keypair fastStrictCheck): a page
+  // joining a busy table checks its records about ten times sooner.
+  void enableFastStrictChecks();
   bindCasinoDoc(sync.doc, boot.roomId, () => sync.resync());
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
