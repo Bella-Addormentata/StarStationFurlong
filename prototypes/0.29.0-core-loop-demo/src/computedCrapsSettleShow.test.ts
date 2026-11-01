@@ -130,26 +130,26 @@ describe('💰 the settle on screen at a computed craps table', () => {
     tb.unmount();
   });
 
-  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips', async () => {
+  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips (even before my table’s first frame)', async () => {
     const pages = await room(['A', 'B']);
     const [a, b] = pages;
-    const ta = atCraps(a, { stand: 3 });
-    const tb = atCraps(b, { stand: 1 });
-    go(pages, T0, T0 + STEP);
+    standAt(a, 3);
+    standAt(b, 1);
     rigRoll(pages, 1, 7);
-    ta.pick('2', 2);
-    ta.click('pass');
-    tb.pick('2');
-    tb.click('dontpass');
+    expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('dontpass', 5)], T0)).toBe('ok');
     // Both felts written, betting still open on both pages.
-    go(pages, T0 + 2 * STEP, T0 + 4 * STEP);
+    go(pages, T0 + STEP, T0 + 3 * STEP);
     expect(crapsOf(a)?.phase).toBe('betting');
+    // A steps up to the table now: no frame of A's table yet.
+    const ta = atCraps(a, { stand: 3 });
     const railBefore = railTotal(a.dice.rail());
     const chipsBefore = a.casino.readChips(a.pid);
+    expect(railBefore).toBe(chipsBefore);
     // A's page keeps up its part of the table (its records) but draws no
     // frame until its balance has the payout: the close and the result
     // reach its rail through the doc's changes alone.
-    let T = T0 + 5 * STEP;
+    let T = T0 + 4 * STEP;
     for (; T < T0 + 120_000 && a.casino.readChips(a.pid) === chipsBefore; T += STEP) {
       sync(T, ...pages);
       frameOf(b, T);
@@ -169,7 +169,6 @@ describe('💰 the settle on screen at a computed craps table', () => {
     go(pages, at + STEP, at + 3 * STEP);
     expect(railTotal(a.dice.rail())).toBe(railBefore + 20);
     ta.unmount();
-    tb.unmount();
   });
 
   it('a roll rewritten after the next one opened (a forfeit): both pages play its new decision from the felt as it played, once', async () => {
@@ -209,6 +208,62 @@ describe('💰 the settle on screen at a computed craps table', () => {
     // Nothing plays twice, however long it shows.
     go(pages, at + STEP, at + 10_000);
     for (const p of pages) expect(p.dice.settles).toHaveLength(1);
+    tw.unmount();
+    tx.unmount();
+  });
+
+  it('a roll shown, then held again for a forfeit and shown on a new decision: the pages that saw it played play it again from its felt; one that walked up after its result plays none of it', async () => {
+    const pages = await room(['A', 'B']);
+    // w first to forfeit roll 2. Roll 1 a 6 (the point); roll 2 an 8 from
+    // both seeds (x's new field bet loses), a 7 from w's alone (seven out).
+    const [w, x] = byRank(pages, 'forfeit', 2, CTX) as UIPage[];
+    standAt(w, 3);
+    standAt(x, 1);
+    rigRoll(pages, 1, 6);
+    for (const p of pages) expect(crapsBet(p, [bet('pass', 10)], T0)).toBe('ok');
+    sync(T0, ...pages);
+    const d1 = go(pages, T0 + STEP, T0 + 60_000, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === 1 && v.decided !== null)));
+    rigSplit(pages, 2, 8, w, 7);
+    const tw = atCraps(w, { stand: 3 });
+    const tx = atCraps(x, { stand: 1 });
+    const T = go(pages, d1 + STEP, d1 + 60_000, () => pages.every((p) => crapsOf(p)?.round === 2 && crapsOf(p)?.phase === 'betting')) + STEP;
+    expect(crapsBet(x, [bet('pass', 10), bet('field', 5)], T)).toBe('ok');
+    const d2 = go(pages, T + STEP, T + 120_000, () => pages.every((p) => foldOf(p).rounds.some((v) => v.r === 2 && v.decided !== null)));
+    go(pages, d2 + STEP, d2 + 3 * STEP);
+    for (const p of pages) {
+      expect(crapsOf(p)).toMatchObject({ phase: 'settled', round: 2, result: 8 });
+      expect(p.dice.settles.map((m) => m.lost.map((s) => [s.pid, s.spot]))).toEqual([[[x.pid, 'field:']]]);
+    }
+    // A third page looks in now, roll 2's result on screen.
+    const c = await loadUIPage('C', 3);
+    clockOf(c, d2 + 3 * STEP);
+    const all = [...pages, c];
+    go(all, d2 + 4 * STEP, d2 + 4 * STEP);
+    expect(crapsOf(c)).toMatchObject({ phase: 'settled', round: 2, result: 8 });
+    // w's forfeit of roll 2 before its result's grace is out: held for the
+    // forfeit's show, then shown on the new dice.
+    const F = d2 + 5 * STEP;
+    clockOf(w, F);
+    const f = signAs(w, 'forfeit', { r: 2, x: foldOf(w).rounds.find((v) => v.r === 2)!.close, n: [w.pid] }, CTX);
+    putIn(w, [[forfeitKey(f)!, f]], TABLE);
+    go(all, F + STEP, F + STEP);
+    for (const p of all) expect(crapsOf(p)).toMatchObject({ phase: 'closing', round: 2 });
+    const shown = go(all, F + 2 * STEP, F + 30_000, () => all.every((p) => crapsOf(p)?.phase === 'settled'));
+    for (const p of all) expect(crapsOf(p)).toMatchObject({ phase: 'settled', round: 2, result: 7 });
+    go(all, shown + STEP, shown + 10_000);
+    // The seven out, from roll 2's felt as it played: everything to the house.
+    for (const p of pages) {
+      expect(p.dice.settles).toHaveLength(2);
+      // (Bettors in player order: w and x drawn by rank, either way round.)
+      const lost = p.dice.settles[1].lost.map((s) => [s.pid, s.spot, s.chips]);
+      expect(lost).toEqual(lost.slice().sort((m, n) => (m[0]! < n[0]! ? -1 : m[0]! > n[0]! ? 1 : 0)));
+      expect(lost).toEqual(expect.arrayContaining([[x.pid, 'field:', [5]], [x.pid, 'pass:', [5, 5]], [w.pid, 'pass:', [5, 5]]]));
+      expect(lost).toHaveLength(3);
+    }
+    expect(shared(w.dice.settles[1])).toEqual(shared(x.dice.settles[1]));
+    // C never saw roll 2 before a result of it: its hold lays no felt to
+    // play from.
+    expect(c.dice.settles).toEqual([]);
     tw.unmount();
     tx.unmount();
   });

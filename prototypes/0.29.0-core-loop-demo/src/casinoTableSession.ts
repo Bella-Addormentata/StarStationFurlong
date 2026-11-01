@@ -289,14 +289,18 @@ interface TableRuntime {
    *  here through a wake, which forgets the view's: a throw seen by then
    *  doesn't play once the roll closes again. */
   reopened: { r: number; at: number } | null;
-  /** 💰 Craps: the felt as last laid for each recent roll before its
-   *  result (each bettor's bets, the stacks drawn, the point in force), kept
-   *  through the result so a rewrite or a new decision of the roll, even one
-   *  shown again after the next roll opened, plays from it again; the
-   *  settles whose chip moves have played (paid, by SettleRecord key: the
-   *  same decision shown again plays nothing); and whether the roll on
-   *  screen is closed with its result still to show here (crapsRollInPlay). */
+  /** 💰 Craps: the felt as last laid for each recent roll before any
+   *  result of it showed here (each bettor's bets, the stacks drawn, the
+   *  point in force), kept through the result so a rewrite or a new
+   *  decision of the roll, even one shown again after the next roll opened,
+   *  plays from it again; the last roll this page has seen past a result
+   *  (decidedTo: a roll held again after its result, or shown again from
+   *  before this page looked, lays no felt as it played); the settles whose
+   *  chip moves have played (paid, by SettleRecord key: the same decision
+   *  shown again plays nothing); and whether the roll on screen is closed
+   *  with its result still to show here (crapsRollInPlay). */
   played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
+  decidedTo: number;
   paid: Set<string>;
   inPlay: boolean;
   /** Doc changed since the felt was last laid out. */
@@ -311,7 +315,8 @@ function runtime(tableId: string): TableRuntime {
   if (!rt || rt.epoch !== casinoDocEpoch()) {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
-      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), paid: new Set(), inPlay: false,
+      spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), decidedTo: 0, paid: new Set(),
+      inPlay: false,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -632,6 +637,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     rt.primed = true;
     h.reset();
     rt.played = new Map();
+    rt.decidedTo = 0;
     rt.paid = new Set();
     rt.thrownSeed = t?.seed ?? null;
     if (s?.phase === 'settled' && s.dice) {
@@ -693,6 +699,9 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
 interface SettleRecord extends SettleVerdict {
   key: string;
   pointBefore?: number | null;
+  /** The roll whose decision the record shows (a computed view carries
+   *  the last one through the next roll's betting). */
+  decided?: number;
 }
 
 /** Where a bettor's chips land on their rail: the chip part of the rail in
@@ -717,8 +726,9 @@ function railSpotFor(h: CasinoTableVisualHandle, seats: Record<string, TableSeat
  * house, then the pay-out (crapsSettleMoves), from the felt as it played to
  * the felt as it stands, so every page shows the same. Once per settle
  * (`rec.key`: a rewrite or a new decision of the roll plays again, from the
- * felt as it played), and never for one this page didn't see the roll
- * before (it walked up during the show).
+ * felt as it played), and never for one this page didn't see before a
+ * result of it (it walked up during the show, or the roll shows again from
+ * before this page looked).
  */
 function layCrapsFelt(
   id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me: string, s: CrapsTableState,
@@ -750,7 +760,10 @@ function layCrapsFelt(
   }
   h.setFeltChips(stacks);
   h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
-  if (s.phase !== 'settled') {
+  // (Every roll before the one on screen is past its result, and so is
+  // the one the record shows decided.)
+  rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, rec.decided ?? 0);
+  if (s.phase !== 'settled' && s.round > rt.decidedTo) {
     rt.played.delete(s.round);
     rt.played.set(s.round, { bets, stacks, point: s.point });
     if (rt.played.size > PLAYED_ROUNDS) rt.played.delete(rt.played.keys().next().value as number);
@@ -784,10 +797,12 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, rt: TableR
   else delete bets[me];
   const amounts = s.amounts ?? {};
   const payouts = s.payouts ?? {};
+  const decided = spinKeyParts(s.rollKey);
   layCrapsFelt(id, h, rt, me, s, bets, {
     // (A rewrite of the roll, or a new decision of it, settles again.)
     key: `${s.round}:${s.rollKey}:${s.rollBy}`,
     ...(s.pointBefore !== undefined ? { pointBefore: s.pointBefore } : {}),
+    ...(decided ? { decided: decided.round } : {}),
     // The fold's verdict: what it credited each bettor, and what each won
     // or lost on the roll (only bettors with a decision are named).
     agrees: (pid, r) => (payouts[pid] ?? 0) === r.credited
@@ -829,6 +844,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     rt.openShow = null;
     rt.reopened = null;
     rt.played = new Map();
+    rt.decidedTo = 0;
     rt.paid = new Set();
     rt.dirty = true;
     h.reset();
@@ -3022,6 +3038,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
       beatSeat();
       seatTimer = window.setInterval(beatSeat, SEAT_BEAT_MS);
+      // (From the start: a credit before the first frame waits too.)
+      railCap = game === 'craps' ? readChips(me) : null;
       unsubscribe = subscribeCasino(() => {
         syncWindow();
         noteComputed();

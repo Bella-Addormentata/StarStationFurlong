@@ -3,7 +3,8 @@
  * the stickman's real settle): once the dice are down, the losing chips go
  * to the house and the winners are paid out of it onto their rails, played
  * from the shared settled record and the felt as it played, once a roll; a
- * page that walks up during the show plays none of it. The table's pieces
+ * page that walks up during the show plays none of it, nor of a roll shown
+ * again from before it looked. The table's pieces
  * are a fake handle that keeps what it was asked to play.
  */
 
@@ -13,7 +14,7 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' }, addEventListener: () => undefined, removeEventListener: () => undefined });
 
 const {
-  bindCasinoDoc, buyInChips, readCrapsTableState, writeCrapsFairnessPref, writeMyCrapsBets, writeMySeat,
+  bindCasinoDoc, buyInChips, readCrapsTableState, writeCrapsFairnessPref, writeCrapsTableState, writeMyCrapsBets, writeMySeat,
 } = await import('./casinoDoc');
 const { casinoTablesFrame, crapsRollInPlay, railFor, railWithTakeDown } = await import('./casinoTableSession');
 const { closeCrapsBetting, openCrapsBetting, rollAndSettleCraps } = await import('./crapsCroupier');
@@ -153,6 +154,24 @@ describe('💰 the settle on screen at an owner-run craps table', () => {
     expect(settles[0].lost).toEqual([]);
     expect(settles[0].back).toEqual([]);
     expect(settles[0].paid).toEqual([{ chips: [5, 1, 1], to: railAt(B_STAND), order: 0, mine: false, dim: true }]);
+  });
+
+  it('a roll shown again from before this page looked (the next roll was open when it did) plays none of it, held or not', async () => {
+    const { h, settles } = fakeTable();
+    const frame = () => casinoTablesFrame(1 / 60, new Map([[table, h]]));
+    closedWith({ [me]: [bet('pass', 10)] });
+    rig([2, 4]);
+    await settle(table);
+    const s1 = readCrapsTableState(table)!;
+    openCrapsBetting(table, 2, s1.point, s1);
+    frame();
+    // Roll 1 shown again: held, then a result of it that pays my pass line.
+    writeCrapsTableState(table, { ...s1, phase: 'closing', point: null, dice: null, result: null, payouts: null, resultAt: 0 });
+    frame();
+    writeCrapsTableState(table, { ...s1, point: null, dice: [3, 4], result: 7, payouts: { [me]: 20 }, resultAt: s1.resultAt + 1 });
+    frame();
+    expect(readCrapsTableState(table)).toMatchObject({ phase: 'settled', round: 1, result: 7 });
+    expect(settles).toEqual([]);
   });
 
   it('a page that first sees the roll already settled (it walked up during the show) plays none of it', async () => {
