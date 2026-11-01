@@ -164,9 +164,15 @@
       "refused": true
     },
     {
-      "name": "client id >= 2^53",
+      "name": "client id = MAX_SAFE (terminal byte, accepted)",
       "group": "varint",
-      "update": "010180808080808080100000",
+      "update": "0101ffffffffffffff0f0004010174017800",
+      "refused": false
+    },
+    {
+      "name": "client id over MAX_SAFE (continuation byte)",
+      "group": "varint",
+      "update": "0101ffffffffffffffff0100040104726f6f74017800",
       "refused": true
     },
     {

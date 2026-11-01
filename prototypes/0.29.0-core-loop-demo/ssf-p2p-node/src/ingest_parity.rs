@@ -533,6 +533,37 @@ mod tests {
         assert_eq!(pages_refuse(&v), Some(Refuse::Desync("ContentJSON")));
     }
 
+    /// G1 is exercised by the EXACT refusal reason, not merely "refused". lib0
+    /// caps a varuint at `MAX_SAFE` only on a continuation byte, so both vectors
+    /// are otherwise complete: the client == MAX_SAFE one (terminal byte) is
+    /// accepted — the cap does not over-refuse the boundary — and the one past
+    /// the cap (a continuation byte carrying the value to 2^56-1) is refused as
+    /// `VarTooLarge`, not `Truncated`. Removing the G1 check in `var_u64` would
+    /// let the over-cap update's complete body walk clean and be accepted, which
+    /// `Some(VarTooLarge)` here would then catch.
+    #[test]
+    fn refuses_oversized_varuint() {
+        let cases = vectors("test-vectors/ingest-parity-v1.json");
+        let over = cases
+            .iter()
+            .find(|c| c.name == "client id over MAX_SAFE (continuation byte)")
+            .expect("over-cap varint vector present");
+        assert_eq!(
+            pages_refuse(&hex::decode(&over.update).unwrap()),
+            Some(Refuse::VarTooLarge),
+            "a client varuint past the cap must refuse as VarTooLarge, not Truncated",
+        );
+        let edge = cases
+            .iter()
+            .find(|c| c.name == "client id = MAX_SAFE (terminal byte, accepted)")
+            .expect("boundary varint vector present");
+        assert_eq!(
+            pages_refuse(&hex::decode(&edge.update).unwrap()),
+            None,
+            "client == MAX_SAFE (terminal byte) is accepted; the cap must not over-refuse",
+        );
+    }
+
     /// Total and panic-free on arbitrary/truncated bytes, and never calls into
     /// yrs. A deterministic xorshift fuzz — no clock, no rng dependency.
     #[test]

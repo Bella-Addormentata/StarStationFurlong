@@ -205,24 +205,42 @@ add('info high-bit: content ref 0x14 (no reader)', 'inforef', oneStruct((e) => {
   encoding.writeVarUint(e, 1); // some trailing byte
 }));
 
-// varint — a client id past MAX_SAFE
-add('client id >= 2^53', 'varint', (() => {
+// varint — the G1 cap. lib0's readVarUint checks `num > MAX_SAFE` ONLY after a
+// continuation byte, and returns at the terminating byte without the check — so
+// the cap turns on a continuation byte, not on the value alone. Both updates
+// below are otherwise COMPLETE (a valid one-struct body + empty DS), so the
+// client varint is the only thing in question: the guard must accept the
+// boundary one and refuse the over-cap one AS VarTooLarge (not Truncated), and
+// removing the G1 check would wrongly accept the over-cap one — the regression
+// the node-side test (refuses_oversized_varuint) asserts against.
+//
+// client = MAX_SAFE (2^53-1), minimal [0xff*7, 0x0f]: the terminating 0x0f
+// clears the high bit, so lib0 returns it without the cap check — a real page
+// accepts it, and so must the guard (boundary; no over-refusal). A genuine yjs
+// update whose only unusual byte is the clientID keeps it unmistakably valid.
+add('client id = MAX_SAFE (terminal byte, accepted)', 'varint', (() => {
+  const d = new Y.Doc();
+  d.clientID = Number.MAX_SAFE_INTEGER;
+  d.getText('t').insert(0, 'x');
+  return Y.encodeStateAsUpdate(d);
+})());
+// client one past the cap, [0xff*8, 0x01]: the 8th byte is a CONTINUATION byte
+// at which the running value is 2^56-1 > MAX_SAFE, exactly where lib0 throws —
+// so the page refuses, and the guard must refuse as VarTooLarge. The struct
+// body is present and valid, so a refusal here can only be the cap, never
+// truncation.
+add('client id over MAX_SAFE (continuation byte)', 'varint', (() => {
   const e = encoding.createEncoder();
   encoding.writeVarUint(e, 1); // numClients
   encoding.writeVarUint(e, 1); // numStructs
-  encoding.writeVarUint(e, Number.MAX_SAFE_INTEGER); // client — lib0 caps here
-  // push one more so the value exceeds MAX_SAFE on the node's u64 walk too:
-  // re-encode MAX_SAFE+... is not representable; use a raw over-long varint.
-  const head = encoding.toUint8Array(e);
-  // Hand-write client = 2^53 (one past MAX_SAFE): 8 groups of 7 bits.
-  const big: number[] = [];
-  let v = 2 ** 53;
-  while (v > 0) { let b = v % 128; v = Math.floor(v / 128); if (v > 0) b |= 0x80; big.push(b); }
-  const out = new Uint8Array(2 + big.length + 2);
-  out[0] = 1; out[1] = 1; out.set(big, 2); // numClients, numStructs, client
-  out[2 + big.length] = 0; out[2 + big.length + 1] = 0; // clock, DS clients
-  void head;
-  return out;
+  for (const b of [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]) encoding.writeUint8(e, b); // client, past the cap
+  encoding.writeVarUint(e, 0); // clock
+  encoding.writeUint8(e, 4 & 0x1f); // info: content ref 4 (ContentString), no origin/right/parentSub
+  encoding.writeVarUint(e, 1); // readParentInfo → hasParentYKey
+  encoding.writeVarString(e, 'root'); // parentYKey
+  encoding.writeVarString(e, 'x'); // ContentString body
+  encoding.writeVarUint(e, 0); // delete set: 0 clients
+  return encoding.toUint8Array(e);
 })());
 
 // depth — nested Any arrays past the node's cap (page accepts; guard refuses)
