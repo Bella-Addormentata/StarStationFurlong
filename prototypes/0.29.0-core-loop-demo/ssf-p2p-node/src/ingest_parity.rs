@@ -69,7 +69,9 @@ pub enum Refuse {
     /// cursor aligned with yrs; refused so no byte the walk skipped ever
     /// reaches the decoder as a string. The game emits neither.
     Desync(&'static str),
-    /// G1: a varuint past lib0's `Number.MAX_SAFE_INTEGER` cap.
+    /// G1: a varuint past lib0's `Number.MAX_SAFE_INTEGER` cap, or a signed
+    /// varint long enough (an 11th byte) that yrs's `read_var_i64` would shift
+    /// past the 64-bit width — a structural bound no honest page reaches.
     VarTooLarge,
     /// G2: a declared length past the bytes remaining.
     LengthOverflow,
@@ -220,10 +222,19 @@ fn verify_v1(c: &mut Cur) -> Result<(), Refuse> {
     Ok(())
 }
 
-/// One struct: GC (`info & 0x1f == 0`), Skip (`== 10`), or an Item.
+/// One struct. yrs dispatches on the **raw** info byte (`update.rs`
+/// `read_item`): only `0` is a GC and only `10` is a Skip; every other byte is
+/// an Item, whatever its low five bits. A page instead dispatches on
+/// `info & 0x1f` (`yjs encoding.js:130`, `BITS5 & info`), so a byte like `0x20`
+/// (low bits `0`, BIT6 set) is a GC to the page but an Item to yrs — the two
+/// walks part, and yrs reads the Item's parentSub/content bytes as a string a
+/// page never UTF-8-checked. No honest page emits such a byte (a GC is always
+/// `0`, a Skip always `10`, an Item's content ref always `1..=9`), so mirroring
+/// yrs's raw match refuses exactly those divergent bytes (R1/R7) and keeps the
+/// walk on the same bytes as the decoder that could crash.
 fn verify_struct(c: &mut Cur) -> Result<(), Refuse> {
     let info = c.u8()?;
-    match info & BITS5 {
+    match info {
         0 => {
             let _len = c.var_u64()?; // readLen (GC)
             Ok(())
@@ -232,8 +243,10 @@ fn verify_struct(c: &mut Cur) -> Result<(), Refuse> {
             let _len = c.var_u64()?; // Skip
             Ok(())
         }
-        content_ref => {
-            // Item. cantCopyParentInfo == no origin and no right origin.
+        info => {
+            // Item. Content ref is the low 5 bits; cantCopyParentInfo == no
+            // origin and no right origin.
+            let content_ref = info & BITS5;
             let cant_copy = info & (BIT7 | BIT8) == 0;
             if info & BIT8 != 0 {
                 c.var_u64()?; // origin: client
@@ -244,7 +257,18 @@ fn verify_struct(c: &mut Cur) -> Result<(), Refuse> {
                 c.var_u64()?; //              clock
             }
             if cant_copy {
-                let has_parent_ykey = c.var_u64()? == 1; // readParentInfo
+                // yrs reads parentInfo as a **u32** varint and tests `== 1`
+                // (`decoder.rs` `read_parent_info`). A value that wraps to 1 in
+                // u32 (e.g. 2^32+1) sends yrs down the root-name branch while a
+                // page — `readVarUint(...) === 1`, the full value — takes the
+                // parent-id branch; the two branches consume a different number
+                // of bytes, so the cursors part and yrs reads a later byte as an
+                // unchecked string. Mirror yrs exactly: test the low 32 bits. An
+                // honest page writes only 0 or 1 here (`writeParentInfo`), so
+                // this changes the walk only on bytes no page emits, and a value
+                // past MAX_SAFE is refused by `var_u64` before the cast (the
+                // page throws there too).
+                let has_parent_ykey = (c.var_u64()? as u32) == 1; // readParentInfo
                 if has_parent_ykey {
                     c.var_str("parentYKey")?; // root name (R1)
                 } else {
@@ -390,9 +414,21 @@ fn verify_any(c: &mut Cur, depth: u32) -> Result<(), Refuse> {
 }
 
 impl<'a> Cur<'a> {
-    /// lib0 `readVarInt`: zig-zag-ish sign in the first byte, 7 bits per byte
+    /// lib0 `readVarInt`: sign in bit 6 of the first byte, 7 bits per byte
     /// after, same `MAX_SAFE` cap (G1). We only need it to advance the cursor;
     /// the value is discarded.
+    ///
+    /// yrs reads the signed varint with a plain `i64 << len` (`varint.rs`
+    /// `read_var_i64`), where `len` climbs 6, 13, …, 69. The shift at 69 — the
+    /// 11th byte — is past the 64-bit width, which a debug `yrs` panics on (a
+    /// release `yrs` masks it to a wrong value); an overlong varint padded with
+    /// zero-payload continuation bytes slips the `MAX_SAFE` cap (the running
+    /// value stays small) and is the only way to reach it, since a genuine
+    /// magnitude that big trips the cap first. An honest signed varint is at
+    /// most 9 bytes (a magnitude <= MAX_SAFE), so a varint reaching an 11th
+    /// byte is one no page emits; refuse it — a structural bound like G2/G3 — so
+    /// yrs never shifts past the width. (yrs's other panic, `-i64::MIN`, needs a
+    /// magnitude >= 2^63 > MAX_SAFE, which the cap already refuses.)
     fn var_i64(&mut self) -> Result<(), Refuse> {
         let r = self.u8()?;
         let mut num: u64 = (r & 0x3f) as u64; // BITS6
@@ -400,8 +436,14 @@ impl<'a> Cur<'a> {
         if r & 0x80 == 0 {
             return Ok(());
         }
+        let mut bytes: u32 = 1;
         loop {
             let r = self.u8()?;
+            bytes += 1;
+            if bytes > 10 {
+                // An 11th byte is where yrs shifts by 69 (>= the 64-bit width).
+                return Err(Refuse::VarTooLarge);
+            }
             num = num.saturating_add(((r & 0x7f) as u64).saturating_mul(mult));
             if r & 0x80 == 0 {
                 return Ok(());
@@ -453,9 +495,11 @@ mod tests {
     /// The oracle `refused` is `Y.applyUpdate(new Doc, update)` throwing,
     /// recorded by the vitest that writes the file from the real yjs/lib0; the
     /// `parity` group holds only cases where the guard and the page must agree
-    /// exactly (the structural guards G2/G3 and the desync refusals D1, which
-    /// refuse some page-accepted nesting/lengths/constructs on purpose, live in
-    /// their own groups and are checked below without the page oracle).
+    /// exactly (the structural guards G2/G3, the desync refusals D1, and the
+    /// `divergence` cases where yrs and a page decode the same bytes along
+    /// different paths — all of which the guard refuses on purpose though a page
+    /// may accept — live in their own groups and are checked below without the
+    /// page oracle).
     #[test]
     fn agrees_with_the_page_oracle() {
         let cases = vectors("test-vectors/ingest-parity-v1.json");
@@ -464,7 +508,7 @@ mod tests {
         for c in &cases {
             let bytes = hex::decode(&c.update).unwrap_or_else(|e| panic!("{}: {e}", c.name));
             let got = pages_refuse(&bytes).is_some();
-            if c.group == "depth" || c.group == "length" || c.group == "desync" {
+            if c.group == "depth" || c.group == "length" || c.group == "desync" || c.group == "divergence" {
                 // Structural / desync guard (G2/G3/D1): the guard refuses; the
                 // page may accept a well-formed one.
                 assert!(got, "{} [{}]: guard must refuse", c.name, c.group);
@@ -531,6 +575,49 @@ mod tests {
         v.extend(std::iter::repeat(0x61).take(101));
         v.push(0x00);
         assert_eq!(pages_refuse(&v), Some(Refuse::Desync("ContentJSON")));
+    }
+
+    /// Copilot's raw-dispatch crash vector (PR #350 review): info byte 0x20 is a
+    /// GC to a page (`BITS5 & info == 0`) but an Item to yrs (raw `match info`),
+    /// and yrs reads the Item's parentSub as a string from a non-UTF-8 byte. The
+    /// old masked dispatch walked it as a GC and accepted; the guard now mirrors
+    /// yrs's raw match and refuses at the parentSub, before the decoder.
+    #[test]
+    fn refuses_the_raw_dispatch_crash_vector() {
+        let bytes = hex::decode("0101010020010001ff").unwrap();
+        assert_eq!(pages_refuse(&bytes), Some(Refuse::NonUtf8 { at: "parentSub" }));
+    }
+
+    /// Copilot's parentInfo u32-wrap crash vector: a parentInfo of 2^32+1, which
+    /// yrs reads as a u32 (`== 1` → root-name branch) while a page reads the
+    /// full value (`!== 1` → parent-id branch). Following yrs down the root-name
+    /// branch leaves yrs reading a trailing non-UTF-8 ContentString; the guard
+    /// now mirrors yrs's u32 test and refuses there. (A page walks the other
+    /// branch over different bytes and does not crash — a node-only hole.)
+    #[test]
+    fn refuses_the_parentinfo_u32_wrap_crash_vector() {
+        let bytes = hex::decode("01010100048180808010020108066162636465c3a900").unwrap();
+        assert_eq!(pages_refuse(&bytes), Some(Refuse::NonUtf8 { at: "ContentString" }));
+    }
+
+    /// An overlong signed varint — an `Any` integer padded to 11 bytes with
+    /// zero-payload continuation bytes. The payload stays 0 so the MAX_SAFE cap
+    /// never trips, but yrs's `read_var_i64` would shift by 69 on the 11th byte,
+    /// past the 64-bit width (a debug-build panic). The guard bounds the signed
+    /// varint at 10 bytes and refuses before that byte.
+    #[test]
+    fn refuses_an_overlong_signed_varint() {
+        let mut u = vec![1u8]; // numClients
+        u.extend_from_slice(&[1, 0, 0]); // numStructs, client, clock
+        u.push(8); // info: Item, ContentAny (ref 8), root parent
+        u.push(1); // readParentInfo == 1
+        u.extend_from_slice(&[1, b'r']); // parentYKey "r"
+        u.push(1); // ContentAny len
+        u.push(125); // Any: integer (readVarInt)
+        u.extend(std::iter::repeat(0x80).take(10)); // 10 continuation bytes, payload 0
+        u.push(0x00); // 11th byte — the guard refuses here, before yrs's shift
+        u.push(0); // delete set: 0 clients
+        assert_eq!(pages_refuse(&u), Some(Refuse::VarTooLarge));
     }
 
     /// G1 is exercised by the EXACT refusal reason, not merely "refused". lib0

@@ -139,6 +139,43 @@ add('parentSub: non-UTF-8', 'utf8', oneStruct((e) => {
   encoding.writeUint8(e, 0x28);
   encoding.writeVarString(e, 'v'); // the string content
 }));
+// parentYKey (the root name): a non-UTF-8 root name.
+add('parentYKey (root name): non-UTF-8', 'utf8', oneStruct((e) => {
+  encoding.writeUint8(e, 4); // content ref 4 (string), no origin/right/parentSub
+  encoding.writeVarUint(e, 1); // parentInfo → root name
+  encoding.writeVarUint(e, 2); // parentYKey length
+  encoding.writeUint8(e, 0xff);
+  encoding.writeUint8(e, 0x28);
+  encoding.writeVarString(e, 'v'); // ContentString body
+}));
+// ContentEmbed (ref 5): readJSON = a var-string the page's TextDecoder rejects.
+add('contentembed: non-UTF-8', 'utf8', rootItem(5, (e) => {
+  encoding.writeVarUint(e, 2);
+  encoding.writeUint8(e, 0xff);
+  encoding.writeUint8(e, 0x28);
+}));
+// ContentFormat (ref 6): a valid key then a non-UTF-8 value.
+add('contentformat value: non-UTF-8', 'utf8', rootItem(6, (e) => {
+  encoding.writeVarString(e, 'b'); // key
+  encoding.writeVarUint(e, 2);
+  encoding.writeUint8(e, 0xff);
+  encoding.writeUint8(e, 0x28);
+}));
+// ContentDoc (ref 9): a non-UTF-8 guid (refused before the opts Any).
+add('contentdoc guid: non-UTF-8', 'utf8', rootItem(9, (e) => {
+  encoding.writeVarUint(e, 2);
+  encoding.writeUint8(e, 0xff);
+  encoding.writeUint8(e, 0x28);
+  encoding.writeUint8(e, 118); // opts: Any object (never reached by the guard)
+  encoding.writeVarUint(e, 0);
+}));
+// ContentType → YXmlElement (type ref 3): a non-UTF-8 element name.
+add('yxmlelement name: non-UTF-8', 'utf8', rootItem(7, (e) => {
+  encoding.writeVarUint(e, 3); // type ref 3 (YXmlElement) reads a name
+  encoding.writeVarUint(e, 2);
+  encoding.writeUint8(e, 0xff);
+  encoding.writeUint8(e, 0x28);
+}));
 // A positive UTF-8 ContentString (accepts), as a parity anchor.
 add('contentstring: valid UTF-8', 'utf8', built((d) => d.getText('t').insert(0, 'abc')));
 
@@ -203,6 +240,22 @@ add('info high-bit: content ref 0x14 (no reader)', 'inforef', oneStruct((e) => {
   encoding.writeVarUint(e, 1);
   encoding.writeVarString(e, 'root');
   encoding.writeVarUint(e, 1); // some trailing byte
+}));
+
+// divergence — bytes a page and yrs decode differently (so no page can hold the
+// same bytes as yrs regardless), which the guard refuses to stay aligned with
+// the decoder that could crash. Parity-exempt, like depth/length/desync: a page
+// may accept these (it walks a different, safe path), the guard must refuse.
+// The node-side tests in ingest_parity.rs assert the exact refusal reason.
+add('raw dispatch: info 0x20 (GC to a page, Item to yrs) — refused', 'divergence',
+  Uint8Array.from(Buffer.from('0101010020010001ff', 'hex')));
+add('parentInfo 2^32+1 (==1 as u32 on yrs, !=1 on a page) — refused', 'divergence',
+  Uint8Array.from(Buffer.from('01010100048180808010020108066162636465c3a900', 'hex')));
+add('overlong signed varint (11 bytes, yrs shifts past the width) — refused', 'divergence', rootItem(8, (e) => {
+  encoding.writeVarUint(e, 1); // content any len
+  encoding.writeUint8(e, 125); // Any: integer (readVarInt)
+  for (let i = 0; i < 10; i++) encoding.writeUint8(e, 0x80); // 10 continuation bytes, payload 0
+  encoding.writeUint8(e, 0x00); // 11th byte — the guard refuses here
 }));
 
 // varint — the G1 cap. lib0's readVarUint checks `num > MAX_SAFE` ONLY after a

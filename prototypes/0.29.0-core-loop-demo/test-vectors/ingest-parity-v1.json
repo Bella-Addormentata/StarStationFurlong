@@ -56,6 +56,36 @@
       "refused": true
     },
     {
+      "name": "parentYKey (root name): non-UTF-8",
+      "group": "utf8",
+      "update": "01010100040102ff28017600",
+      "refused": true
+    },
+    {
+      "name": "contentembed: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100050104726f6f7402ff2800",
+      "refused": true
+    },
+    {
+      "name": "contentformat value: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100060104726f6f74016202ff2800",
+      "refused": true
+    },
+    {
+      "name": "contentdoc guid: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100090104726f6f7402ff28760000",
+      "refused": true
+    },
+    {
+      "name": "yxmlelement name: non-UTF-8",
+      "group": "utf8",
+      "update": "01010100070104726f6f740302ff2800",
+      "refused": true
+    },
+    {
       "name": "contentstring: valid UTF-8",
       "group": "utf8",
       "update": "01010100040101740361626300",
@@ -162,6 +192,24 @@
       "group": "inforef",
       "update": "01010100140104726f6f740100",
       "refused": true
+    },
+    {
+      "name": "raw dispatch: info 0x20 (GC to a page, Item to yrs) — refused",
+      "group": "divergence",
+      "update": "0101010020010001ff",
+      "refused": false
+    },
+    {
+      "name": "parentInfo 2^32+1 (==1 as u32 on yrs, !=1 on a page) — refused",
+      "group": "divergence",
+      "update": "01010100048180808010020108066162636465c3a900",
+      "refused": false
+    },
+    {
+      "name": "overlong signed varint (11 bytes, yrs shifts past the width) — refused",
+      "group": "divergence",
+      "update": "01010100080104726f6f74017d808080808080808080800000",
+      "refused": false
     },
     {
       "name": "client id = MAX_SAFE (terminal byte, accepted)",
