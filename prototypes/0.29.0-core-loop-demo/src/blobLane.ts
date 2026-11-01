@@ -74,6 +74,7 @@ export function setBlobLaneNode(n: BlobNode | null): void {
     polling.clear();
     lastPoll.clear();
     holdersHere.clear();
+    whereSent.clear();
   }
   node = ok;
   declareHosted();
@@ -428,6 +429,10 @@ export async function setHostCopies(on: boolean): Promise<string | null> {
  *  they are online now. */
 const holdersHere = new Map<string, { room: string; at: number; ids: string[] }>();
 let whereAsking = false;
+/** file → when an ask naming it last went out (the caller's `now`), and
+ *  for which room: one may wait its turn behind another ask, or past the
+ *  first WHERE_MAX files. */
+const whereSent = new Map<string, { room: string; at: number }>();
 /** An answer is asked again after this long (the node keeps its own for a minute). */
 const WHERE_POLL_MS = 30_000;
 /** The most files one ask names (the node takes 16). */
@@ -446,6 +451,7 @@ export async function refreshHolders(hashes: string[], now = performance.now()):
   const gen = generation;
   const asked = room;
   whereAsking = true;
+  for (const h of due) whereSent.set(h, { room: asked, at: now });
   try {
     const res = await fetch(url, { redirect: 'error' });
     const body = (res.ok ? await res.json() : null) as { holders?: unknown } | null;
@@ -462,6 +468,14 @@ export async function refreshHolders(hashes: string[], now = performance.now()):
   } catch { /* asked again on the next paint */ } finally {
     whereAsking = false;
   }
+}
+
+/** When an ask naming `hash` last went out for this room (the `now` it was
+ *  asked with), or null when none has: a wait for WHERE's answer counts
+ *  from here, not from when the file was first handed in. */
+export function whereAskedAt(hash: string): number | null {
+  const sent = whereSent.get(hash);
+  return sent && sent.room === room ? sent.at : null;
 }
 
 /** The room's nodes WHERE last said hold `hash` whole; null before it was
@@ -601,6 +615,7 @@ export function forgetBlobLane(): void {
   hosted = false;
   declared = '';
   holdersHere.clear();
+  whereSent.clear();
   whereAsking = false;
   heldHere = null;
   heldAsking = false;

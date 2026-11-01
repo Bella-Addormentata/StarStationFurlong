@@ -59,12 +59,14 @@ import { NOTE_FILL } from './boardFace';
 import {
   PHOTO_AUTO_FETCH_DAY,
   PHOTO_AUTO_FETCH_MAX,
+  closePanelPhotos,
   photoAutoFetch,
   photoFromShot,
   photoLook,
   photoPicture,
   photoTrouble,
   pressFetch,
+  showPanelPhotos,
 } from './boardPhotos';
 import { formatBytes } from './blobLane';
 import { getContact } from './contacts';
@@ -212,9 +214,17 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
   let posting = false;
   let photoSince = 0;
   let photoKey = '';
+  /** This panel, to the photo cache: the photos it shows get room ahead of
+   *  the faces', named all at once before any is looked at. */
+  const photoPanel = {};
+  const showingPhotos = (notes: readonly ShownNote[]): void =>
+    showPanelPhotos(photoPanel, notes.flatMap((n) => (n.attach ? [n.attach.hash] : [])));
   /** Every photo note's look now, which moves them along too. */
-  const photoLooks = (): string =>
-    readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author)).map((n) => `${n.id}:${photoLook(n.attach!)}`).join(',');
+  const photoLooks = (): string => {
+    const notes = readBoard(itemId, kind).shown.filter((n) => n.attach && !isHiddenAuthor(n.author));
+    showingPhotos(notes);
+    return notes.map((n) => `${n.id}:${photoLook(n.attach!)}`).join(',');
+  };
 
   const notesHtml = (): string => {
     const me = getIdentityPub();
@@ -222,6 +232,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     const moderator = canModerate();
     const now = Date.now();
     const notes = readBoard(itemId, kind).shown.filter((n) => !isHiddenAuthor(n.author));
+    showingPhotos(notes);
     if (notes.length === 0) {
       const why = !open && !owner
         ? 'The owner’s key hasn’t arrived yet, so notices can’t be checked.'
@@ -344,6 +355,11 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
     if (!panel || !here() || posting) return;
     const box = panel.querySelector<HTMLTextAreaElement>('[data-text]');
     if (!box) return;
+    // The note is what the player had at the press: words typed or a colour
+    // picked while the photo goes to the node stay for the next note
+    // (#340 review).
+    const text = box.value;
+    const tint = colour;
     const shot = chosen;
     let attach: BoardPhoto | undefined;
     if (shot) {
@@ -361,9 +377,9 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       }
       attach = got.photo;
     }
-    const result = postNote(itemId, kind, { text: box.value, colour, ...(attach ? { attach } : {}) });
+    const result = postNote(itemId, kind, { text, colour: tint, ...(attach ? { attach } : {}) });
     if (result.ok) {
-      box.value = '';
+      if (box.value === text) box.value = '';
       if (shot && chosen?.id === shot.id) chosen = null;
       status = 'Pinned.';
       updateCount();
@@ -573,6 +589,7 @@ export function createBoardUI(deps: BoardUIDeps): DeviceUI {
       for (const url of thumbUrls.values()) URL.revokeObjectURL(url);
       thumbUrls.clear();
       roll = null;
+      closePanelPhotos(photoPanel);
       deps.onEngagedChange?.(false);
       panel?.remove();
       panel = null;
