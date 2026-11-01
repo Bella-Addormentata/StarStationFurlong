@@ -1,7 +1,7 @@
 name: "✅ PR Checks"
 
 # PR-time compile gate — the checks we previously only ran by hand (or that the
-# release workflow only ran at tag time). Four lanes:
+# release workflow only ran at tag time). Six lanes:
 #   1. Frontend `tsc --noEmit` — the repo's long-standing "tsc clean" bar.
 #   2. Frontend `npm test` (vitest) — treasury contract unit tests + the shared
 #      TS<->Rust golden vectors under test-vectors/treasury/.
@@ -18,6 +18,12 @@ name: "✅ PR Checks"
 #      crates under vendor/) — and a Windows `cargo check` of the same, since the
 #      torrent feature brings C code (aws-lc-sys) that only the release would
 #      otherwise compile on Windows.
+#   6. 🏦 The SSF wallet's own tests (`chia_wallet*`) on Windows and macOS, and a
+#      macOS `cargo check` of the release set: the wallet's identity file is
+#      written with hard links, directory syncs and owner-only modes that differ
+#      per OS, and its at-rest protection (DPAPI on Windows, the keychain on
+#      macOS, #335 stage 1) is OS code no Linux run compiles. Without these a
+#      macOS path would first compile in the tag-time release.
 
 on:
   pull_request:
@@ -109,3 +115,31 @@ jobs:
       - name: 🔎 cargo check --features chia-publish,torrent
         shell: bash
         run: cargo check --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      # 🏦 The SSF wallet's tests on NTFS and the Windows API (the filter
+      # matches chia_wallet:: and chia_wallet_switch::).
+      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet
+        shell: bash
+        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml chia_wallet
+
+  node-check-macos:
+    name: 🦀 Node cargo check + wallet tests on macOS (release features)
+    runs-on: macos-latest # Apple Silicon, as the release's .dmg
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v5
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+
+      - name: 🔎 cargo check --features chia-publish,torrent --tests
+        run: cargo check --features chia-publish,torrent --tests --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      # 🏦 The SSF wallet's tests on APFS and the macOS API.
+      - name: 🧪 cargo test --features chia-publish,torrent chia_wallet
+        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml chia_wallet
