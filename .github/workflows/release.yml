@@ -373,12 +373,14 @@ jobs:
       #     the Tauri bundler expects external binaries (bundle.externalBin):
       #     src-tauri/binaries/ssf-p2p-node-<host-triple>[.exe]. The installer
       #     then places it next to the app executable, where the app's spawn
-      #     probe already looks first — no separate download needed.
-      #     ⛔ macOS: skipped — the v0.20.0 run showed the mac bundler failing
-      #     with externalBin while Windows/Linux built clean; mac keeps the
-      #     standalone-node flow until that failure is reproduced with logs.
+      #     probe already looks first — no separate download needed. On macOS
+      #     that is StarStationFurlong.app/Contents/MacOS/ssf-p2p-node. (Mac
+      #     was skipped from v0.21.0 after the v0.20.0 run's mac bundler
+      #     failure, which left the .dmg with no node: no torrents or files on
+      #     the TV, no other stations. A probe build on macos-latest on
+      #     2026-11-01 bundled it with this exact step and overlay, and the
+      #     bundled node started and answered /api/fingerprint.)
       - name: 🛰️ Build & stage bundled P2P node sidecar
-        if: matrix.platform != 'macos-latest'
         shell: bash
         run: |
           # One node binary (#231 D3): chain reads are in the default build and
@@ -400,22 +402,16 @@ jobs:
       # 5. Point the shared Tauri shell at the selected frontend's dist/.
       #    Written as a JSON overlay merged into tauri.conf.json via `--config`;
       #    the before-build hook becomes a no-op because step 4 already built it.
-      #    On macOS the overlay also strips bundle.externalBin (see step 4b note).
       - name: 🔀 Select release frontend for Tauri shell
         shell: bash
         run: |
           name="${RELEASE_FRONTEND##*/}"
-          if [ "${{ matrix.platform }}" = "macos-latest" ]; then
-            extra=', "bundle": { "externalBin": [] }'
-          else
-            extra=''
-          fi
           cat > "$RELEASE_FRONTEND/release-frontend.json" <<EOF
           {
             "build": {
               "beforeBuildCommand": "echo frontend prebuilt by workflow",
               "frontendDist": "../../${name}/dist"
-            }${extra}
+            }
           }
           EOF
           echo "Tauri config overlay:" && cat "$RELEASE_FRONTEND/release-frontend.json"
