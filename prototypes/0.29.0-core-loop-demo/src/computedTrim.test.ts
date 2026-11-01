@@ -503,6 +503,9 @@ describe('who trims, and when', () => {
     for (const over of [0, 1]) {
       const pages = await room(['A', 'B']);
       const [a, b] = pages;
+      // (As the build before closes: this one freezes no newcomer past
+      // MAX_TABLE_PIDS, so only a modified game gets a table this far.)
+      for (const p of pages) p.casino.setComputedRecoveryForTests(false);
       const { openAt } = playRound([a], T0);
       sync(openAt, a, b);
       // A checkpoint one short of the cap (or at it), A's net among them.
@@ -719,9 +722,10 @@ describe('races', () => {
     }
   });
 
-  it('a split where one side trimmed: what the other side played in the session the trim took away is void, and none of it comes back', async () => {
+  it.each([true, false])('a split where one side trimmed: what the other side played in the session the trim took away is void, and none of it comes back (recovery %s)', async (recovery) => {
     const pages = await room(['A', 'B']);
     const [a, b] = pages;
+    if (!recovery) for (const p of pages) p.casino.setComputedRecoveryForTests(false);
     // Apart: A plays round 1 and trims; B plays rounds 1 and 2, untrimmed, and bets on round 3.
     const ra = decideRound([a], T0, [[straight(3, 10)]]);
     const ta = run([a], ra.at + STEP, T0 + 200_000, { step: STEP, until: () => trimmedTo(a, 1) });
@@ -749,7 +753,15 @@ describe('races', () => {
       expect([...keysIn(p, 's'), ...keysIn(p, 'c'), ...keysIn(p, 'x')]).toEqual([]);
       expect(p.casino.readChips(b.pid)).toBe(1_000);
     }
-    for (const { r, c } of commits) expect(b.fair.seedFor(c, seedCtx(b, r))).toBeNull();
+    // Its seeds go for the rounds the checkpoint covers. Past it they stay
+    // while restores run (a session moved from may come back, and a close
+    // of it then freezes them): nothing B wrote goes back all the same.
+    // (The build before, and a page with restores off, let them all go.)
+    for (const { r, c } of commits) {
+      const seed = b.fair.seedFor(c, seedCtx(b, r));
+      if (recovery && r > cp.u) expect(seed).not.toBeNull();
+      else expect(seed).toBeNull();
+    }
   });
 
   it("a split where one side trimmed at the round the other side played as its own: that side's felt shows none of its round there, and its card no verdict on it", async () => {

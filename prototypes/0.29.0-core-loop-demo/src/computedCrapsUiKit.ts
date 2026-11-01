@@ -115,6 +115,9 @@ export const hintsIn = (body: FakeEl): string[] => body.children.filter((c) => c
 // ── The table's pieces ───────────────────────────────────────────────────────
 
 type CasinoTableVisualHandle = import('./casinoTable3d').CasinoTableVisualHandle;
+type SettleMoves = import('./casinoTable3d').SettleMoves;
+type FeltStack = import('./casinoTable3d').FeltStack;
+type RailStack = import('./casinoTable3d').RailStack;
 
 /** A craps table's pieces that log what the dice were asked to do (`throw
  *  <seed>`, `land <d1><d2>`, `cancel`), fly until given their faces and
@@ -135,6 +138,13 @@ export interface FakeDice {
   rest: () => FeltPoint | null;
   /** What the table's plaque was last set to: Fair or not (null: never). */
   fair: () => boolean | null;
+  /** 💰 Every settle's chip moves the pieces were asked to play, in order;
+   *  the felt's stacks and the rail's as last set. Chips bound for my rail
+   *  are on their way through the two updates after a settle that sends
+   *  some (payingMe). */
+  settles: SettleMoves[];
+  felt: () => readonly FeltStack[];
+  rail: () => readonly RailStack[];
 }
 
 export function fakeDice(): FakeDice {
@@ -144,6 +154,10 @@ export function fakeDice(): FakeDice {
   let resets = 0;
   let rest: FeltPoint | null = null;
   let fair: boolean | null = null;
+  let paying = 0;
+  let felt: readonly FeltStack[] = [];
+  let rail: readonly RailStack[] = [];
+  const settles: SettleMoves[] = [];
   const log: string[] = [];
   const aim: FakeDice['aim'] = { p: null, stack: false, dice: false };
   const h = new Proxy({} as Record<PropertyKey, unknown>, {
@@ -171,10 +185,23 @@ export function fakeDice(): FakeDice {
         };
         case 'update': return () => {
           if (state === 'settling' && --settle <= 0) state = 'rest';
+          if (paying > 0) paying -= 1;
+        };
+        case 'settleChips': return (m: SettleMoves) => {
+          settles.push(m);
+          if (m.back.some((b) => b.mine) || m.paid.some((b) => b.mine)) paying = 2;
+        };
+        case 'payingMe': return () => paying > 0;
+        case 'setFeltChips': return (stacks: readonly FeltStack[]) => {
+          felt = stacks;
+        };
+        case 'setRailStacks': return (stacks: readonly RailStack[]) => {
+          rail = stacks;
         };
         case 'reset': return () => {
           resets += 1;
           state = 'rest';
+          paying = 0;
         };
         case 'diceRestAt': return (at: FeltPoint) => {
           rest = at;
@@ -197,7 +224,10 @@ export function fakeDice(): FakeDice {
       }
     },
   }) as unknown as CasinoTableVisualHandle;
-  return { h, log, state: () => state, aim, hand: () => hand, resets: () => resets, rest: () => rest, fair: () => fair };
+  return {
+    h, log, state: () => state, aim, hand: () => hand, resets: () => resets, rest: () => rest, fair: () => fair,
+    settles, felt: () => felt, rail: () => rail,
+  };
 }
 
 // ── Pages with a table UI ────────────────────────────────────────────────────
