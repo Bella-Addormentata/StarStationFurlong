@@ -91,6 +91,7 @@ import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
   ARCADE_CABINET_KINDS,
+  arcadeSeatEye,
   arcadeWidePanels,
   FURNITURE,
   FURNITURE_DEFS,
@@ -7323,8 +7324,12 @@ export class World {
           : seats === 4 && !builtIn ? this.pickArcadeSeatStand(deviceId, at)
             : null;
       const seat = stand ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2)) : own ? null : 0;
+      // 🕹 #345: a player at a station looks at the screen from in front of
+      // their own controls, slightly left or right to its middle.
+      const item = FURNITURE.find((i) => i.id === deviceId);
+      const eye = stand && item && seat !== null ? arcadeSeatEye(item, seat) : null;
       const target: DeviceTarget = stand
-        ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, ...(eye ? { eye } : {}) }
         : device;
       deviceFocus.beginFocus(this.player, target, this.arcadeCabinetUI(deviceId, "play", seat, seats === 2 ? 2 : 1));
       return;

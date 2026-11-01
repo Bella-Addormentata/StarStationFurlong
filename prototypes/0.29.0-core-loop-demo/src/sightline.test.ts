@@ -25,7 +25,7 @@ function fakeCanvas() {
 }
 vi.stubGlobal('document', { createElement: fakeCanvas });
 vi.stubGlobal('window', { location: { search: '' } });
-const { ARCADE_WIDE_STAND_GAP, FURNITURE_DEFS, arcadeWidePanels, buildStandList } = await import('./furniture');
+const { ARCADE_WIDE_STAND_GAP, FURNITURE_DEFS, arcadeSeatEye, arcadeWidePanels, buildStandList } = await import('./furniture');
 const { VoxelCharacter } = await import('./voxelCharacter');
 const { PLAYER_R, playerFitsAt } = await import('./obstacles');
 const { standCrowded } = await import('./arcadeStations');
@@ -183,6 +183,32 @@ describe("the double-wide cabinet's four stands (#345)", () => {
     }
   });
 
+  it('each look at the screens from in front of their own controls, toward the middle (#345)', () => {
+    const item = { kind: 'arcade-cabinet-wide' as const, pos: { x: 0, z: 0 }, rot: 0 as const };
+    const def = FURNITURE_DEFS['arcade-cabinet-wide'].device!;
+    const panels = arcadeWidePanels(item);
+    panels.forEach((p, seat) => {
+      const eye = arcadeSeatEye(item, seat)!;
+      expect(eye.x).toBeCloseTo(p.x, 9);
+      expect(eye.y).toBeCloseTo(def.eye.y, 9);
+      expect(eye.z).toBeCloseTo(def.eye.z, 9);
+      // Turned only slightly toward the middle: under a third of a right angle.
+      const turn = Math.abs(Math.atan2(def.anchor.x - eye.x, eye.z - def.anchor.z));
+      expect(turn).toBeLessThan(Math.PI / 6);
+      expect(turn).toBeGreaterThan(0.1);
+    });
+    expect(arcadeSeatEye(item, 4)).toBeNull();
+    // The two-player cabinet's players at theirs too; a one-player cabinet has none.
+    const two = { kind: 'arcade-cabinet-2p' as const, pos: { x: 0, z: 0 }, rot: 0 as const };
+    expect(arcadeSeatEye(two, 0)!.x).toBeCloseTo(0.34, 9);
+    expect(arcadeSeatEye(two, 1)!.x).toBeCloseTo(-0.34, 9);
+    expect(arcadeSeatEye({ kind: 'arcade-cabinet', pos: { x: 0, z: 0 }, rot: 0 }, 0)).toBeNull();
+    // It turns with the cabinet: rot 1 turns local +x to world −z.
+    const turned = arcadeSeatEye({ ...item, pos: { x: 2, z: 3 }, rot: 1 }, 0)!;
+    const panel = arcadeWidePanels({ pos: { x: 2, z: 3 }, rot: 1 })[0]!;
+    expect(turned.z).toBeCloseTo(panel.z, 9);
+  });
+
   it('turn with the cabinet, and so do its panels', () => {
     const stands = wideStands(() => true, 1);
     const panels = arcadeWidePanels({ pos: { x: 0, z: 0 }, rot: 1 });
@@ -226,17 +252,22 @@ describe('nobody stands in your view of an arcade screen (#345)', () => {
       ['closed up', (x: number) => x > -0.7],
     ] as const;
     for (const [layout, open] of floors) {
-      it(`${kind}, ${layout}: every other player is hidden or out of the way`, () => {
+      it(`${kind}, ${layout}: from every station, every other player is hidden or out of the way`, () => {
         const def = FURNITURE_DEFS[kind];
-        const eye = def.device!.eye;
         const anchor = def.device!.anchor;
-        const stands = buildStandList([{ id: 'c', kind, pos: { x: 0, z: 0 }, rot: 0, movable: true }], open);
+        const item = { id: 'c', kind, pos: { x: 0, z: 0 }, rot: 0 as const, movable: true };
+        const stands = buildStandList([item], open);
         expect(stands.length).toBeGreaterThan(1);
         const [left, right] = screens[kind]!;
-        for (const s of stands) {
-          if (blocksSight(eye, anchor, { ...s.front, y: 0 })) continue;
-          expect(reaches(s.front, [eye, left!, right!]), `${s.id} at ${s.front.x}, ${s.front.z}`).toBe(false);
-        }
+        stands.forEach((me, seat) => {
+          // Each player looks from in front of their own controls.
+          const eye = arcadeSeatEye(item, seat)!;
+          expect(eye, me.id).not.toBeNull();
+          for (const s of stands) {
+            if (s === me || blocksSight(eye, anchor, { ...s.front, y: 0 })) continue;
+            expect(reaches(s.front, [eye, left!, right!]), `from ${me.id}: ${s.id} at ${s.front.x}, ${s.front.z}`).toBe(false);
+          }
+        });
       });
     }
   }

@@ -4075,6 +4075,28 @@ export function arcadeWidePanels(item: Pick<FurnitureItem, "pos" | "rot">): Arra
   });
 }
 
+/**
+ * 🕹 #345: where seat `seat` of an arcade cabinet with a station per player
+ * plays from (Dorkmo): the cabinet's eye moved across to stand in front of
+ * that player's own controls, still looking at the middle of the screen
+ * (the device's anchor), so each player looks slightly left or right to
+ * it. Null for a cabinet without stations, or a seat it has not got.
+ */
+export function arcadeSeatEye(
+  item: Pick<FurnitureItem, "kind" | "pos" | "rot">,
+  seat: number,
+): THREE.Vector3 | null {
+  const across =
+    item.kind === "arcade-cabinet-wide" ? ARCADE_WIDE_PANEL_X
+      : item.kind === "arcade-cabinet-2p" ? ARCADE_2P_PANEL_X
+        : null;
+  const x = across?.[seat];
+  const eye = FURNITURE_DEFS[item.kind].device?.eye;
+  if (x === undefined || !eye) return null;
+  const r = rotXZ(eye.x + x, eye.z, item.rot);
+  return new THREE.Vector3(item.pos.x + r.x, eye.y, item.pos.z + r.z);
+}
+
 // ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
 // A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
 // engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
@@ -9011,8 +9033,13 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
 // (0, −1.0) facing +z; the cabinet fills z ∈ [−0.36, +0.43]. The two-player
 // cabinet is the same upright, wider, with a bigger screen and a stick and
 // buttons for each player.
+/** 🕹🕹 The two-player cabinet's control panels across it (local x),
+ *  player 1's first: their sticks and buttons, and (#345) where each
+ *  player looks at the screen from. */
+const ARCADE_2P_PANEL_X: readonly number[] = [0.34, -0.34];
+
 function buildArcadeCabinet2P(ctx: BuildCtx) {
-  buildUprightCabinet(ctx, { width: 1.40, housingH: 0.96, screenW: 0.82, players: [0.34, -0.34], marquee: "SSF ARCADE · 2 PLAYER" });
+  buildUprightCabinet(ctx, { width: 1.40, housingH: 0.96, screenW: 0.82, players: [...ARCADE_2P_PANEL_X], marquee: "SSF ARCADE · 2 PLAYER" });
 }
 
 interface UprightSpec {
