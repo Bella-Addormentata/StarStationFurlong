@@ -34,14 +34,19 @@ export function wideClick(
   return { x: point.x, z: point.z, station: typeof station === 'number' ? station : null };
 }
 
+/** Anybody this close to a stand stands on it, however close the next
+ *  stand is (two pushed onto one walkable cell share a spot). */
+export const STAND_TAKEN_MIN_M = 0.18;
+
 /**
  * 🕹🕹🕹🕹 #345: whether somebody (one of `others`) already stands on stand
  * `s` of the cabinet's stands `all`: nearer it than half way to the next
- * one. That is a fifth of a metre where the stands have closed up at the
- * panels and half a metre where they are spread out, and it holds across a
- * re-layout: when furniture moved away spreads the stands while a player
- * plays on at their old closed-up spot (#347 review), the stand that now
- * lands beside them counts as taken, so nobody else is walked onto them.
+ * one, or than STAND_TAKEN_MIN_M. That is a fifth of a metre where the
+ * stands have closed up at the panels and half a metre where they are
+ * spread out, and it holds across a re-layout: when furniture moved away
+ * spreads the stands while a player plays on at their old closed-up spot
+ * (#347 review), the stand that now lands beside them counts as taken, so
+ * nobody else is walked onto them.
  */
 export function standCrowded(
   all: readonly StandSlot[],
@@ -52,7 +57,7 @@ export function standCrowded(
     (min, o) => (o === s ? min : Math.min(min, Math.hypot(o.front.x - s.front.x, o.front.z - s.front.z))),
     Infinity,
   );
-  const r = Number.isFinite(gap) ? gap / 2 : WIDE_STAND_AT_M;
+  const r = Number.isFinite(gap) ? Math.max(STAND_TAKEN_MIN_M, gap / 2) : WIDE_STAND_AT_M;
   return others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < r);
 }
 

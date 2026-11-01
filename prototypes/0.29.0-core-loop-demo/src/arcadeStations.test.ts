@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { StandSlot } from './furniture';
-import { WIDE_STAND_AT_M, standCrowded, wideClick, wideStationFor } from './arcadeStations';
+import { STAND_TAKEN_MIN_M, WIDE_STAND_AT_M, standCrowded, wideClick, wideStationFor } from './arcadeStations';
 
 /** The four stands a pace in front of a cabinet at the origin, 0.4 m apart. */
 const stands: StandSlot[] = [0, 1, 2, 3].map((n) => ({
@@ -122,5 +122,13 @@ describe('standCrowded (#345)', () => {
     const spread = stands.map((s, n) => ({ ...s, front: { x: (n - 1.5) * 1.0, z: 1.2 } }));
     expect(standCrowded(spread, spread[1]!, [{ x: -0.1, z: 1.4 }])).toBe(true);
     expect(standCrowded(spread, spread[1]!, [{ x: 0, z: 1.2 }])).toBe(false);
+  });
+
+  it('still counts somebody on a stand that shares its spot with the next one (#347 review)', () => {
+    // Two stands pushed onto one walkable cell: no gap between them.
+    const shared = stands.map((s, n) => (n === 1 ? { ...s, front: { ...stands[0]!.front } } : s));
+    expect(standCrowded(shared, shared[0]!, [shared[0]!.front])).toBe(true);
+    expect(standCrowded(shared, shared[1]!, [{ x: shared[1]!.front.x + STAND_TAKEN_MIN_M - 0.01, z: 1.05 }])).toBe(true);
+    expect(standCrowded(shared, shared[1]!, [{ x: shared[1]!.front.x + STAND_TAKEN_MIN_M + 0.01, z: 1.05 }])).toBe(false);
   });
 });
