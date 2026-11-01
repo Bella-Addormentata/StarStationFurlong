@@ -206,6 +206,7 @@ import { lookBoardPhotos } from "./boardPhotos";
 import { createBoardUI } from "./boardUI";
 import type { ChalkboardHandle } from "./chalkboardBuild";
 import { createChalkboardUI } from "./chalkSession";
+import { disposeChalkboard } from "./chalkDoc";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
@@ -3466,6 +3467,7 @@ export class World {
     this.casinoTableVisuals.delete(itemId);
     this.faucetDishes.delete(itemId);
     this.chalkboards.delete(itemId);
+    disposeChalkboard(itemId);
     forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);

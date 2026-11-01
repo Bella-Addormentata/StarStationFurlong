@@ -209,6 +209,32 @@ describe('planInvisible', () => {
     expect([...gone].sort()).toEqual([0, 2, 3, 4, 5]);
   });
 
+  it('never changes any cell of the picture by INVISIBLE_BELOW or more, however entries overlap', () => {
+    // Rounds of scribbles over one patch, each wiped once: many faint,
+    // overlapping leftovers, and haze along the edges of each pass that no
+    // later pass covers. Judged entry by entry, dropping them would change
+    // the picture visibly here.
+    let seed = 7;
+    const rand = (n: number): number => (seed = (seed * 1103515245 + 12345) % 2147483648) % n;
+    const raw: Array<{ tool: ChalkTool; strokes: ChalkPoint[][] }> = [];
+    for (let round = 0; round < 8; round++) {
+      for (let k = 0; k < 8; k++) raw.push({ tool: 'chalk', strokes: [hline(150 + rand(40), 420 + rand(40), 200 + rand(60), 5)] });
+      raw.push({ tool: 'eraser', strokes: [hline(100, 500, 215 + rand(20), 10), hline(500, 100, 245 + rand(20), 10)] });
+    }
+    raw.push({ tool: 'eraser', strokes: [hline(100, 500, 230, 10)] });
+    const entries = raw.map((e) => ({ tool: e.tool, points: decodeStrokes(strokeBytes(e.strokes))! }));
+    const gone = planInvisible(entries);
+    const all = new ChalkSurface();
+    const kept = new ChalkSurface();
+    entries.forEach((e, i) => {
+      all.applyPoints(e.tool, e.points);
+      if (!gone.has(i)) kept.applyPoints(e.tool, e.points);
+    });
+    let worst = 0;
+    for (let i = 0; i < all.d.length; i++) worst = Math.max(worst, Math.abs(all.d[i] - kept.d[i]));
+    expect(worst).toBeLessThan(INVISIBLE_BELOW);
+  });
+
   it('keeps chalk a wipe only dimmed', () => {
     const entries = [
       { tool: 'chalk' as const, strokes: [hline(200, 400, 230)] },

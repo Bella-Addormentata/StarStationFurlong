@@ -26,6 +26,7 @@ import {
   entryKey,
   entryToWire,
   finishChalkJobs,
+  disposeChalkboard,
   forgetChalkboard,
   planChalkTrim,
   pointsOf,
@@ -36,7 +37,7 @@ import {
   trimChalkboard,
   type ChalkEntry,
 } from './chalkDoc';
-import { ChalkSurface, StrokeWriter, type ChalkPoint, type ChalkTool } from './chalkRender';
+import { ChalkSurface, INVISIBLE_BELOW, StrokeWriter, type ChalkPoint, type ChalkTool } from './chalkRender';
 
 const BOARD = 'chalkboard-1-test';
 const T0 = 1_800_000_000_000;
@@ -126,10 +127,13 @@ describe('the record', () => {
     for (let i = 0; i < MAX_SHOWN_ENTRIES + 5; i++) {
       entries.push([entryKey(BOARD, `e${String(i).padStart(7, '0')}`), entryToWire('chalk', T0 + i, p)]);
     }
-    const { shown, junk } = readChalkEntries(entries, BOARD, T0 + 10_000);
+    const { shown, junk } = readChalkEntries(entries, BOARD, T0 + TRIM_SPARES_MS + 2);
     expect(shown).toHaveLength(MAX_SHOWN_ENTRIES);
     expect(shown[0].at).toBe(T0 + 5);
-    expect(junk).toHaveLength(5);
+    // Past the cap and older than TRIM_SPARES_MS: junk. A younger one may be
+    // its writer's open entry, so it waits, unshown.
+    expect(junk).toEqual(entries.slice(0, 3).map(([k]) => k));
+    expect(readChalkEntries(entries, BOARD, T0 + 10_000).junk).toEqual([]);
   });
 
   it('counts chalkboards among furniture', () => {
@@ -229,6 +233,22 @@ describe('the picture', () => {
     expect(same(chalkBoardFrame(BOARD, now), freshPaint(BOARD, now))).toBe(true);
   });
 
+  it('folds big settled entries into its base over frames, and still matches', () => {
+    let now = T0;
+    for (let i = 0; i < 16; i++) {
+      const pts: ChalkPoint[] = [];
+      for (let j = 0; j < 200; j++) pts.push({ x: 100 + ((j * 37 + i * 13) % 1000), y: 50 + ((j * 53 + i * 11) % 680) });
+      remote(`f${String(i).padStart(7, '0')}`, i % 3 === 2 ? 'eraser' : 'chalk', now, [pts]);
+      for (let k = 0; k < 4; k++) chalkBoardFrame(BOARD, (now += 16));
+    }
+    for (let k = 0; k < 600; k++) chalkBoardFrame(BOARD, (now += 50)); // settles; folds land
+    expect(same(chalkBoardFrame(BOARD, now), freshPaint(BOARD, now))).toBe(true);
+    // An entry folded into the base is gone (a trim elsewhere): a repaint.
+    marks.delete(entryKey(BOARD, 'f0000001'));
+    for (let k = 0; k < 600; k++) chalkBoardFrame(BOARD, (now += 50));
+    expect(same(chalkBoardFrame(BOARD, now), freshPaint(BOARD, now))).toBe(true);
+  });
+
   it('paints a heavy board over several frames rather than in one', () => {
     for (let i = 0; i < 40; i++) {
       const pts: ChalkPoint[] = [];
@@ -270,11 +290,29 @@ describe('trims', () => {
     const keys = readChalkBoard(BOARD, now).shown.map((e) => e.id);
     expect(keys).toContain('young000');
     expect(keys.some((k) => k.startsWith('w'))).toBe(false);
-    // Nothing anyone could see changed (beyond the faint settled haze).
+    // Nothing anyone could see changed: no cell moved by INVISIBLE_BELOW.
     const after = freshPaint(BOARD, now);
     let worst = 0;
-    for (let i = 0; i < after.d.length; i++) worst = Math.max(worst, before.d[i] - after.d[i]);
-    expect(worst).toBeLessThan(0.08);
+    for (let i = 0; i < after.d.length; i++) worst = Math.max(worst, Math.abs(before.d[i] - after.d[i]));
+    expect(worst).toBeLessThan(INVISIBLE_BELOW);
+  });
+
+  it('give up a stepped plan when an older entry lands under it meanwhile', () => {
+    fill(TRIM_AT_ENTRIES - 2, T0);
+    for (let k = 0; k < 6; k++) {
+      remote(`w${k}aaaaaa`, 'eraser', T0 + 10_000 + k, [line(0, 22, 1279, 22, 60), line(1279, 18, 0, 18, 60), line(0, 85, 1279, 85, 60)]);
+    }
+    let now = T0 + 10 * TRIM_SPARES_MS;
+    chalkPenDown(BOARD, 'chalk', { x: 10, y: 760 }, now);
+    chalkPenMove(BOARD, { x: 200, y: 760 }, (now += 16));
+    chalkPenClose(BOARD, (now += 16)); // the trim starts, in steps
+    chalkBoardFrame(BOARD, (now += 16));
+    // A late copy brings chalk from before the wipes, under them.
+    remote('late0000', 'chalk', T0 + 5_000, [line(10, 20, 1200, 20)]);
+    for (let k = 0; k < 400; k++) chalkBoardFrame(BOARD, (now += 16));
+    const ids = readChalkBoard(BOARD, now).shown.map((e) => e.id);
+    expect(ids.filter((k) => k.startsWith('w'))).toHaveLength(6); // the wipes still cover it
+    expect(ids).toContain('late0000');
   });
 
   it('take the oldest when nothing is invisible, down to the TRIM_TO marks', () => {
@@ -307,6 +345,30 @@ describe('trims', () => {
 });
 
 describe('a removed board', () => {
+  it('gets no marks from a pen that closes after it is gone', () => {
+    const layout = doc.getMap('furniture');
+    layout.set('sofa-1', { kind: 'sofa', x: 0, z: 0, rot: 0, movable: true });
+    layout.set(BOARD, { kind: 'chalkboard', x: 0, z: -5, rot: 0, movable: true });
+    let now = T0;
+    chalkPenDown(BOARD, 'chalk', { x: 10, y: 10 }, now);
+    chalkPenMove(BOARD, { x: 300, y: 40 }, (now += 16));
+    chalkBoardFrame(BOARD, (now += ENTRY_FLUSH_MS));
+    expect(marks.size).toBe(1); // on the wall: written
+    chalkPenMove(BOARD, { x: 500, y: 90 }, (now += 16));
+    const was = marks.get([...marks.keys()][0]);
+    layout.delete(BOARD); // someone took it down
+    chalkPenClose(BOARD, (now += 16)); // the forced step-back closes the pen
+    expect(marks.get([...marks.keys()][0])).toBe(was);
+  });
+
+  it('lets go of its picture here without touching the doc', () => {
+    remote('aaaaaaaa', 'chalk', T0, [line(0, 0, 100, 100)]);
+    const first = chalkBoardFrame(BOARD, T0 + 100);
+    disposeChalkboard(BOARD);
+    expect(marks.size).toBe(1);
+    expect(chalkBoardFrame(BOARD, T0 + 200)).not.toBe(first); // a fresh picture
+  });
+
   it('takes its marks with it, and only its own', () => {
     remote('aaaaaaaa', 'chalk', T0, [line(0, 0, 100, 100)]);
     marks.set(entryKey('other-board', 'bbbbbbbb'), entryToWire('chalk', T0, bytesOf([line(0, 0, 100, 100)])));

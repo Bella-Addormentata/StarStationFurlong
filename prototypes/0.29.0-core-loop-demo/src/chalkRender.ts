@@ -567,20 +567,28 @@ export function entryRect(e: PlanEntry): CellRect | null {
 
 const overlaps = (a: CellRect, b: CellRect): boolean => a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
 
-/** A chalk entry no reader could see (every cell it laid now shows less
- *  than this, after the erasing since) may go. */
-export const INVISIBLE_BELOW = 0.04;
+/** What a trim may change in any one cell of the picture, at most, when it
+ *  drops what was wiped: about 9 levels of 255 against the slate at worst,
+ *  under the slate's own mottle. */
+export const INVISIBLE_BELOW = 0.02;
+
+/** Segments painted (or cells compared, in rows) between yields. */
+const PLAN_SLICE = 48;
 
 /**
- * Which entries can be deleted without changing the picture, by index into
- * `entries` (oldest first):
- *  - chalk entries every later wipe has taken below INVISIBLE_BELOW (a
- *    backward pass multiplies each cell by the wipes after it, and an
- *    entry's whole lay is judged at once, not segment by segment), and then
+ * Which entries can be deleted without changing the picture you see, by
+ * index into `entries` (oldest first):
+ *  - chalk entries the wipes since have taken almost to nothing (a backward
+ *    pass multiplies each cell by the wipes after it). What they still show
+ *    is summed per cell over every entry taken, and an entry is taken only
+ *    while every cell it laid stays under INVISIBLE_BELOW;
  *  - eraser entries with no kept chalk under them that is older than they
  *    are (they would wipe nothing; younger chalk was never under them).
- * The settled haze those wipes left goes with them: a trim may leave a
- * cleaner board, never a dirtier one.
+ * Then the set is checked against the picture itself, the wipes' haze
+ * included: the board painted with and without it may differ by less than
+ * INVISIBLE_BELOW in every cell. Where it would differ more, what lies over
+ * those cells stays (and a wipe that stays keeps what it lifted), and the
+ * check runs again; after a few rounds nothing is taken.
  */
 export function planInvisible(entries: readonly PlanEntry[]): Set<number> {
   const steps = planInvisibleSteps(entries);
@@ -591,16 +599,19 @@ export function planInvisible(entries: readonly PlanEntry[]): Set<number> {
 }
 
 /** planInvisible in steps, for a caller that spreads it over frames: it
- *  yields after every entry, and returns the set. */
+ *  yields every PLAN_SLICE segments (or rows), and returns the set. */
 export function* planInvisibleSteps(entries: readonly PlanEntry[]): Generator<void, Set<number>, void> {
   const n = CHALK_GRID_W * CHALK_GRID_H;
   const keep = new Float32Array(n).fill(1);
   const dwell = new Float32Array(n);
+  const lost = new Float32Array(n);
   const grain = chalkGrain();
   const streak = eraserStreak();
   const cover = new Cover();
   const gone = new Set<number>();
   const touched: number[] = [];
+  const shownOf: number[] = [];
+  let work = 0;
   for (let e = entries.length - 1; e >= 0; e--) {
     const { tool, points } = entries[e];
     if (tool === 'eraser') {
@@ -613,11 +624,11 @@ export function* planInvisibleSteps(entries: readonly PlanEntry[]): Generator<vo
           const c = cover.idx[j];
           keep[c] *= expNeg(cover.z[j] * streak[c]);
         }
+        if (++work % PLAN_SLICE === 0) yield;
       }
-      yield;
       continue;
     }
-    // Chalk: gather the entry's whole lay, then its best remaining cell.
+    // Chalk: gather the entry's whole lay, then what it still shows.
     touched.length = 0;
     for (let i = 1; i < points.length; i++) {
       const b = points[i];
@@ -629,19 +640,27 @@ export function* planInvisibleSteps(entries: readonly PlanEntry[]): Generator<vo
         if (dwell[c] === 0) touched.push(c);
         dwell[c] += cover.z[j];
       }
+      if (++work % PLAN_SLICE === 0) yield;
     }
-    let best = 0;
-    for (const c of touched) {
+    let fits = true;
+    shownOf.length = touched.length;
+    for (let t = 0; t < touched.length; t++) {
+      const c = touched[t];
       const shown = keep[c] * (1 - expNeg(dwell[c] * grain[c]));
-      if (shown > best) best = shown;
+      shownOf[t] = shown;
+      if (lost[c] + shown >= INVISIBLE_BELOW) fits = false;
       dwell[c] = 0;
     }
-    if (best < INVISIBLE_BELOW) gone.add(e);
+    if (fits) {
+      for (let t = 0; t < touched.length; t++) lost[touched[t]] += shownOf[t];
+      gone.add(e);
+    }
     yield;
   }
   // Wipes with no kept, older chalk under them wipe nothing.
   const rects = entries.map(entryRect);
   for (let e = 0; e < entries.length; e++) {
+    if (e % PLAN_SLICE === PLAN_SLICE - 1) yield;
     if (entries[e].tool !== 'eraser') continue;
     const r = rects[e];
     if (!r) {
@@ -655,7 +674,90 @@ export function* planInvisibleSteps(entries: readonly PlanEntry[]): Generator<vo
     }
     if (!under) gone.add(e);
   }
-  return gone;
+  for (let round = 0; round < CHECK_ROUNDS && gone.size > 0; round++) {
+    const bad = yield* changedCellsSteps(entries, gone);
+    if (bad.length === 0) return gone;
+    keepAround(entries, rects, gone, bad);
+  }
+  return new Set<number>();
+}
+
+/** How many times the picture check may narrow the set before giving up. */
+const CHECK_ROUNDS = 4;
+/** Changed cells the check reports, at most. */
+const MAX_BAD_CELLS = 512;
+
+const rectHas = (r: CellRect, c: number): boolean => {
+  const x = c % CHALK_GRID_W;
+  const y = (c - x) / CHALK_GRID_W;
+  return x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+};
+
+/** Narrow `gone` around cells the trim would visibly change: what covers
+ *  them stays, a wipe that stays keeps the older marks it lifted (its haze
+ *  is made of them), and no dropped wipe may leave kept chalk under it. */
+function keepAround(entries: readonly PlanEntry[], rects: ReadonlyArray<CellRect | null>, gone: Set<number>, bad: readonly number[]): void {
+  const kept: number[] = [];
+  for (const e of gone) {
+    const r = rects[e];
+    if (!r || bad.some((c) => rectHas(r, c))) kept.push(e);
+  }
+  for (const e of kept) gone.delete(e);
+  for (const e of kept) {
+    const r = rects[e];
+    if (entries[e].tool !== 'eraser' || !r) continue;
+    for (const o of [...gone]) {
+      const ro = rects[o];
+      if (o < e && ro && overlaps(ro, r)) gone.delete(o);
+    }
+  }
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const e of [...gone]) {
+      const r = rects[e];
+      if (entries[e].tool !== 'eraser' || !r) continue;
+      for (let c = 0; c < e; c++) {
+        const rc = rects[c];
+        if (entries[c].tool === 'chalk' && !gone.has(c) && rc && overlaps(rc, r)) {
+          gone.delete(e);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+/** Paint every entry, and every entry but `drop`, and list the cells (up to
+ *  MAX_BAD_CELLS) where the two pictures differ by INVISIBLE_BELOW or more. */
+function* changedCellsSteps(entries: readonly PlanEntry[], drop: ReadonlySet<number>): Generator<void, number[], void> {
+  const all = new ChalkSurface();
+  const kept = new ChalkSurface();
+  let work = 0;
+  for (let e = 0; e < entries.length; e++) {
+    const { tool, points } = entries[e];
+    const both = !drop.has(e);
+    for (let i = 1; i < points.length; i++) {
+      if (points[i].start) continue;
+      const a = points[i - 1];
+      const b = points[i];
+      all.segment(tool, a.x, a.y, b.x, b.y);
+      if (both) kept.segment(tool, a.x, a.y, b.x, b.y);
+      if (++work % PLAN_SLICE === 0) yield;
+    }
+  }
+  const bad: number[] = [];
+  for (let y = 0; y < CHALK_GRID_H; y++) {
+    const row = y * CHALK_GRID_W;
+    for (let x = 0; x < CHALK_GRID_W; x++) {
+      if (Math.abs(all.d[row + x] - kept.d[row + x]) >= INVISIBLE_BELOW) {
+        bad.push(row + x);
+        if (bad.length >= MAX_BAD_CELLS) return bad;
+      }
+    }
+    if (y % PLAN_SLICE === PLAN_SLICE - 1) yield;
+  }
+  return bad;
 }
 
 // ── Colour ───────────────────────────────────────────────────────────────────

@@ -161,7 +161,8 @@ export interface ChalkRead {
   /** What a board paints, oldest first. */
   shown: ChalkEntry[];
   /** Keys under the board a trim may take now: bad records, and valid ones
-   *  past the shown cap. */
+   *  past the shown cap that are older than TRIM_SPARES_MS (a younger one
+   *  may still be its writer's open entry). */
   junk: string[];
 }
 
@@ -184,7 +185,7 @@ export function readChalkEntries(entries: Iterable<[string, unknown]>, itemId: s
   }
   valid.sort(compareEntries);
   const cut = Math.max(0, valid.length - MAX_SHOWN_ENTRIES);
-  for (let i = 0; i < cut; i++) junk.push(valid[i].key);
+  for (let i = 0; i < cut; i++) if (now - valid[i].at >= TRIM_SPARES_MS) junk.push(valid[i].key);
   return { shown: valid.slice(cut), junk };
 }
 
@@ -306,6 +307,13 @@ export function forgetChalkboard(itemId: string): number {
   return keys.length;
 }
 
+/** A board's picture and pen leave this copy (World drops the board's
+ *  furniture, however it went). The marks in the doc are untouched: the
+ *  room's layout says whether the board is gone (forgetChalkboard). */
+export function disposeChalkboard(itemId: string): void {
+  boards.delete(itemId);
+}
+
 /** Trim a board now, in one go, if it's past its marks and this copy may
  *  (see the header). The game trims in steps instead (scheduleTrim). */
 export function trimChalkboard(itemId: string, now = Date.now()): number {
@@ -322,8 +330,18 @@ function deleteKeys(keys: readonly string[]): number {
   return keys.length;
 }
 
+/** A chalkboard is on the wall in the bound doc's layout (or the layout is
+ *  unseeded, as offline). A pen closing after its board was taken down (the
+ *  forced step-back when someone else removes it) writes nothing. */
+function boardPlaced(itemId: string): boolean {
+  const layout = boundDoc!.getMap('furniture');
+  if (layout.size === 0) return true;
+  const rec = layout.get(itemId) as { kind?: unknown } | undefined;
+  return typeof rec?.kind === 'string' && isChalkboardKind(rec.kind);
+}
+
 function writeEntry(key: string, tool: ChalkTool, at: number, p: Uint8Array): void {
-  if (!docAlive()) return;
+  if (!docAlive() || !boardPlaced(itemOfKey(key))) return;
   marksMap!.set(key, entryToWire(tool, at, p));
 }
 
@@ -381,9 +399,23 @@ interface Board {
   job: Generator<void, void, void> | null;
   /** A trim plan in steps (trimJob). */
   trim: Generator<void, void, void> | null;
+  /** A big settled entry being folded into a copy of the base, in steps. */
+  fold: Fold | null;
+  /** The base's last copy, kept to fold into next time. */
+  spare: ChalkSurface | null;
   lastTrimAt: number;
   /** The newest stamp seen on the board (the Lamport floor for a new entry). */
   maxAt: number;
+}
+
+/** A fold in flight: `surface` is `from` (the base, when it began) plus the
+ *  entry so far. It lands only if the base and the first run still match. */
+interface Fold {
+  entry: ChalkEntry;
+  from: ChalkSurface;
+  baseLen: number;
+  surface: ChalkSurface;
+  job: Generator<void, void, void>;
 }
 
 const boards = new Map<string, Board>();
@@ -421,6 +453,8 @@ function boardOf(itemId: string): Board {
       pen: null,
       job: null,
       trim: null,
+      fold: null,
+      spare: null,
       lastTrimAt: -Infinity,
       maxAt: 0,
     };
@@ -584,25 +618,63 @@ function syncBoard(itemId: string, b: Board, now: number): void {
   }
 }
 
-/** Move settled runs into the base, a little at a time (never while a job
- *  runs: it paints from the base). */
+/** The first run is still `e`, whole, from byte 0. */
+const firstRunIs = (b: Board, e: ChalkEntry): boolean => {
+  const r = b.runs[0];
+  return !!r && r.from === 0 && r.key === e.key && r.to === e.p.length && samePrefix(e.p, r.p, r.to);
+};
+
+/** `e` is now in the base: its run and change time go. */
+function settle(b: Board, e: ChalkEntry): void {
+  b.baseKeys.push({ key: e.key, len: e.p.length, p: e.p });
+  b.runs.shift();
+  b.changedAt.delete(e.key);
+}
+
+/**
+ * Move settled runs into the base, a little at a time (never while a job
+ * runs: it paints from the base). A small entry folds in at once; a big one
+ * paints onto a copy of the base over as many frames as it takes, and lands
+ * only if nothing moved under it meanwhile.
+ */
 function foldSettled(itemId: string, b: Board, now: number): void {
-  if (b.job || b.runs.length <= KEEP_RUNS) return;
-  const first = b.runs[0];
-  if (first.from !== 0 || first.key === b.pen?.key || now - (b.changedAt.get(first.key) ?? now) < SETTLE_MS) return;
-  const { shown } = readChalkBoard(itemId, now);
+  if (b.job) {
+    b.fold = null;
+    return;
+  }
   const t0 = clock();
-  while (b.runs.length > KEEP_RUNS && clock() - t0 < FOLD_BUDGET_MS) {
+  let shown: ChalkEntry[] | null = null;
+  while (clock() - t0 < FOLD_BUDGET_MS) {
+    const f = b.fold;
+    if (f) {
+      if (!runSteps(f.job, FOLD_BUDGET_MS - (clock() - t0))) return;
+      b.fold = null;
+      if (f.from !== b.base || f.baseLen !== b.baseKeys.length || !firstRunIs(b, f.entry)) {
+        b.spare = f.surface;
+        continue;
+      }
+      b.spare = b.base;
+      b.base = f.surface;
+      settle(b, f.entry);
+      continue;
+    }
+    if (b.runs.length <= KEEP_RUNS) return;
     const r = b.runs[0];
     if (r.from !== 0 || r.key === b.pen?.key || now - (b.changedAt.get(r.key) ?? now) < SETTLE_MS) return;
     // The run must be its entry, whole, as the doc holds it now.
+    shown ??= readChalkBoard(itemId, now).shown;
     const e = shown[b.baseKeys.length];
-    if (!e || e.key !== r.key || e.p.length !== r.to || !samePrefix(e.p, r.p, r.to)) return;
-    const pts = pointsOf(e.p);
-    if (pts) b.base.applyPoints(e.tool, pts);
-    b.baseKeys.push({ key: e.key, len: e.p.length, p: e.p });
-    b.runs.shift();
-    b.changedAt.delete(e.key);
+    if (!e || !firstRunIs(b, e)) return;
+    if (segmentsFrom(e.p, 0) <= JOB_SLICE) {
+      const pts = pointsOf(e.p);
+      if (pts) b.base.applyPoints(e.tool, pts);
+      settle(b, e);
+      continue;
+    }
+    const surface = b.spare ?? new ChalkSurface();
+    b.spare = null;
+    surface.copyFrom(b.base);
+    b.fold = { entry: e, from: b.base, baseLen: b.baseKeys.length, surface, job: paintSteps(surface, e) };
   }
 }
 
@@ -685,18 +757,31 @@ function scheduleTrim(itemId: string, b: Board, now: number): void {
   b.lastTrimAt = now;
   const { shown, junk } = readChalkBoard(itemId, now);
   deleteKeys(junk);
-  if (overBudget(shown)) b.trim = trimJob(shown, now);
+  if (overBudget(shown)) b.trim = trimJob(itemId, shown, now);
 }
 
-function* trimJob(shown: readonly ChalkEntry[], now: number): Generator<void, void, void> {
+function* trimJob(itemId: string, shown: readonly ChalkEntry[], now: number): Generator<void, void, void> {
   const invisible = yield* planInvisibleSteps(planEntries(shown));
   const keys = planChalkTrim(shown, now, invisible);
-  if (!deps || !docAlive() || !deps.canTrim()) return;
+  if (keys.length === 0 || !deps || !docAlive() || !deps.canTrim()) return;
+  // The plan holds only if nothing landed under what it takes while it ran:
+  // an entry new or changed since, ordered before the newest it takes (an
+  // old entry arriving late), could be chalk a planned wipe still covers.
+  const was = new Map(shown.map((e) => [e.key, e] as const));
+  let newest: ChalkEntry | null = null;
+  for (const k of keys) {
+    const e = was.get(k);
+    if (e && (!newest || compareEntries(e, newest) > 0)) newest = e;
+  }
+  for (const e of readChalkBoard(itemId, now).shown) {
+    const before = was.get(e.key);
+    if (before && before.p === e.p) continue;
+    if (newest && compareEntries(e, newest) < 0) return; // the next trim plans again
+  }
   // Take only what is still as the plan saw it.
-  const was = new Map(shown.map((e) => [e.key, e.p] as const));
   const still = keys.filter((k) => {
     const raw = marksMap!.get(k) as { p?: unknown } | undefined;
-    return raw !== undefined && raw.p === was.get(k);
+    return raw !== undefined && raw.p === was.get(k)?.p;
   });
   deleteKeys(still);
 }

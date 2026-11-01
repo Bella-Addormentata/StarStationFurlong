@@ -94,6 +94,8 @@ export function createChalkboardUI(deps: ChalkboardUIDeps): DeviceUI {
   /** Follow the pointer: the tool in hand, the line while held, the cursor. */
   const follow = (e: PointerEvent): void => {
     if (!handle || !capture) return;
+    // One hand: while a line is held, only its own pointer moves the tool.
+    if (drawing !== null && e.pointerId !== drawing) return;
     const points = drawing !== null && typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
     for (const c of points.length > 0 ? points : [e]) {
       if (!aim(c)) continue;
@@ -121,6 +123,8 @@ export function createChalkboardUI(deps: ChalkboardUIDeps): DeviceUI {
   const onDown = (e: PointerEvent): void => {
     e.preventDefault();
     e.stopPropagation();
+    // A second finger while a line is held is ignored, not a new line.
+    if (drawing !== null) return;
     if (e.button !== 0 || !handle || !capture || !aim(e)) return;
     const press = pressAction(hand, handle.pick(ray));
     switch (press.act) {
