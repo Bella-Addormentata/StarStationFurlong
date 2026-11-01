@@ -418,17 +418,19 @@ impl<'a> Cur<'a> {
     /// after, same `MAX_SAFE` cap (G1). We only need it to advance the cursor;
     /// the value is discarded.
     ///
-    /// yrs reads the signed varint with a plain `i64 << len` (`varint.rs`
-    /// `read_var_i64`), where `len` climbs 6, 13, …, 69. The shift at 69 — the
-    /// 11th byte — is past the 64-bit width, which a debug `yrs` panics on (a
-    /// release `yrs` masks it to a wrong value); an overlong varint padded with
-    /// zero-payload continuation bytes slips the `MAX_SAFE` cap (the running
-    /// value stays small) and is the only way to reach it, since a genuine
-    /// magnitude that big trips the cap first. An honest signed varint is at
-    /// most 9 bytes (a magnitude <= MAX_SAFE), so a varint reaching an 11th
-    /// byte is one no page emits; refuse it — a structural bound like G2/G3 — so
-    /// yrs never shifts past the width. (yrs's other panic, `-i64::MIN`, needs a
-    /// magnitude >= 2^63 > MAX_SAFE, which the cap already refuses.)
+    /// yrs reads the signed varint with a plain `i64 << len` then a `-num`
+    /// negation (`varint.rs` `read_var_i64`), and an overflow-checked (debug)
+    /// yrs panics — a release yrs silently wraps — on two malformed shapes a
+    /// page accepts (lib0 checks `MAX_SAFE` only on a *continuation* byte, so a
+    /// huge value delivered on the terminating byte slips through):
+    ///   • an **overlong** varint, whose `len` climbs 6, 13, …, 69 — the shift
+    ///     at 69, on an 11th byte, is past the 64-bit width; and
+    ///   • a magnitude that lands exactly in bit 63 (e.g. `2 << 62` on the 10th
+    ///     byte), where yrs holds `i64::MIN` and `-i64::MIN` overflows.
+    /// An honest signed varint is at most 9 bytes and well under `MAX_SAFE`, so
+    /// both shapes are ones no page emits. Bound the width at 10 bytes and the
+    /// magnitude below bit 63 — structural refusals like G2/G3 — so yrs never
+    /// shifts past the width nor negates `i64::MIN`.
     fn var_i64(&mut self) -> Result<(), Refuse> {
         let r = self.u8()?;
         let mut num: u64 = (r & 0x3f) as u64; // BITS6
@@ -445,6 +447,12 @@ impl<'a> Cur<'a> {
                 return Err(Refuse::VarTooLarge);
             }
             num = num.saturating_add(((r & 0x7f) as u64).saturating_mul(mult));
+            if num >= 1u64 << 63 {
+                // A magnitude in bit 63 is yrs's `i64::MIN`, whose `-num` panics
+                // a debug yrs — and lib0 would not have capped it on this
+                // (possibly terminating) byte. No page emits a value this large.
+                return Err(Refuse::VarTooLarge);
+            }
             if r & 0x80 == 0 {
                 return Ok(());
             }
@@ -616,6 +624,27 @@ mod tests {
         u.push(125); // Any: integer (readVarInt)
         u.extend(std::iter::repeat(0x80).take(10)); // 10 continuation bytes, payload 0
         u.push(0x00); // 11th byte — the guard refuses here, before yrs's shift
+        u.push(0); // delete set: 0 clients
+        assert_eq!(pages_refuse(&u), Some(Refuse::VarTooLarge));
+    }
+
+    /// Copilot's second signed-varint vector: `c0` then eight `80` then `02` —
+    /// a 10-byte `Any` integer whose magnitude lands in bit 63 (`2 << 62` on the
+    /// terminating byte), so yrs holds `i64::MIN` and its `-num` overflows (a
+    /// debug-build panic). A page accepts it (lib0 skips the MAX_SAFE cap on the
+    /// terminating byte), so the guard bounds the magnitude below bit 63.
+    #[test]
+    fn refuses_the_i64_min_negation_varint() {
+        let mut u = vec![1u8]; // numClients
+        u.extend_from_slice(&[1, 0, 0]); // numStructs, client, clock
+        u.push(8); // info: Item, ContentAny (ref 8), root parent
+        u.push(1); // readParentInfo == 1
+        u.extend_from_slice(&[1, b'r']); // parentYKey "r"
+        u.push(1); // ContentAny len
+        u.push(125); // Any: integer (readVarInt)
+        u.push(0xc0); // sign bit + continuation, payload 0
+        u.extend(std::iter::repeat(0x80).take(8)); // eight zero-payload bytes
+        u.push(0x02); // terminal byte: 2 << 62 == i64::MIN on yrs
         u.push(0); // delete set: 0 clients
         assert_eq!(pages_refuse(&u), Some(Refuse::VarTooLarge));
     }

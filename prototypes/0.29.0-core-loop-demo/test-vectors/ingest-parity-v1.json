@@ -212,6 +212,12 @@
       "refused": false
     },
     {
+      "name": "signed varint i64::MIN negation (c0 80×8 02) — refused",
+      "group": "divergence",
+      "update": "01010100080104726f6f74017dc080808080808080800200",
+      "refused": false
+    },
+    {
       "name": "client id = MAX_SAFE (terminal byte, accepted)",
       "group": "varint",
       "update": "0101ffffffffffffff0f0004010174017800",

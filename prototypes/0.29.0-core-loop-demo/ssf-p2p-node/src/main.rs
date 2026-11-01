@@ -5389,8 +5389,8 @@ fn ysync_update_refused(payload: &[u8]) -> Option<ingest_parity::Refuse> {
     if sub != 1 && sub != 2 {
         return None; // SyncStep1 (state vector) or unknown subtype — not an update
     }
-    let (update, _) = read_length_and_buf(payload, n1 + n2).ok()?;
-    ingest_parity::pages_refuse(&update)
+    let (update, _) = read_length_and_slice(payload, n1 + n2).ok()?;
+    ingest_parity::pages_refuse(update)
 }
 
 /// 🛑 True (and logs + counts once) when a ysync `envelope` carries an update
@@ -5537,6 +5537,20 @@ fn read_length_and_buf(bytes: &[u8], mut cursor: usize) -> Result<(Vec<u8>, usiz
     }
     let buf = bytes[cursor..cursor + len].to_vec();
     Ok((buf, bytes_read + len))
+}
+
+/// Like [`read_length_and_buf`] but **borrows** the payload slice instead of
+/// copying it. The parity guard reads the update bytes read-only and returns
+/// before the borrow ends, so an ingress frame — including a mesh duplicate the
+/// dedup gate later drops — is no longer copied in full just to be checked.
+fn read_length_and_slice(bytes: &[u8], mut cursor: usize) -> Result<(&[u8], usize)> {
+    let (len, bytes_read) = read_var_uint(bytes, cursor)?;
+    cursor += bytes_read;
+    let len = len as usize;
+    if cursor + len > bytes.len() {
+        return Err(anyhow!("Unexpected EOF reading buffer payload with size {}", len));
+    }
+    Ok((&bytes[cursor..cursor + len], bytes_read + len))
 }
 
 async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {

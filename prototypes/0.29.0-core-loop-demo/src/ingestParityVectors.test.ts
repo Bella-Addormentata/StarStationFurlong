@@ -257,6 +257,13 @@ add('overlong signed varint (11 bytes, yrs shifts past the width) — refused', 
   for (let i = 0; i < 10; i++) encoding.writeUint8(e, 0x80); // 10 continuation bytes, payload 0
   encoding.writeUint8(e, 0x00); // 11th byte — the guard refuses here
 }));
+add('signed varint i64::MIN negation (c0 80×8 02) — refused', 'divergence', rootItem(8, (e) => {
+  encoding.writeVarUint(e, 1); // content any len
+  encoding.writeUint8(e, 125); // Any: integer (readVarInt)
+  encoding.writeUint8(e, 0xc0); // sign + continuation, payload 0
+  for (let i = 0; i < 8; i++) encoding.writeUint8(e, 0x80); // eight zero-payload bytes
+  encoding.writeUint8(e, 0x02); // terminal: 2 << 62 == i64::MIN on yrs
+}));
 
 // varint — the G1 cap. lib0's readVarUint checks `num > MAX_SAFE` ONLY after a
 // continuation byte, and returns at the terminating byte without the check — so
