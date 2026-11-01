@@ -70,6 +70,13 @@
 //! are made with the doc let go, so a room's own sync waits on the house no
 //! longer than a read, and another room's not at all (main.rs room_doc).
 //!
+//! Reading costs too, and a read holds the room's doc: a tick reads at most
+//! [`READ_PER_TICK`] of a room, by weight ([`hb::weight`]), the reads past it
+//! short as checks past the budget are, so however much junk a peer writes,
+//! a tick holds the doc and the house for about that much reading. A record
+//! heavier than any the pages take ([`MAX_RECORD_BYTES`], [`MAX_TOP_BYTES`])
+//! is junk, found out at the cost of the cap, not of its size.
+//!
 //! Stopping ([`step_down`]) steps every room down within a tick's budget
 //! first, each room's records sent as they are written, then the rooms
 //! that were short of it with every check they need: a flood in one room
@@ -137,6 +144,25 @@ pub const MAX_PASSES: usize = 4;
 const MAX_PASSES_STOPPING: usize = 64;
 /// Verdicts kept, the oldest going first.
 const MAX_VERDICTS: usize = 50_000;
+/// The most a session's record may weigh ([`hb::weight`]) and be read:
+/// past it, junk. The heaviest the pages take, a close freezing 31 slips
+/// under 256-character ids, weighs some 26 KB (tests pin it).
+pub const MAX_RECORD_BYTES: usize = 64 * 1024;
+/// The same for a switch, a Fair setting, a delegation and a heartbeat (a
+/// few hundred bytes each).
+pub const MAX_TOP_BYTES: usize = 4 * 1024;
+/// What a tick reads of a room, by weight ([`hb::weight`], and
+/// [`VISIT_BYTES`] a key): the casino's keys and switches, the Fair
+/// settings, each table's checkpoint and session, other houses'
+/// delegations. Past it, what is left to read is short and waits a tick, as
+/// checks past [`VERIFY_PER_TICK`] do: however big a peer's junk grows, a
+/// tick holds the room's doc and the house for about this much reading
+/// (some 20 ms), and the room's other tables have their turns. A checkpoint
+/// weighing more is never read (the house does nothing at its table); the
+/// pages trim a session at 96 KB.
+pub const READ_PER_TICK: usize = 4 * 1024 * 1024;
+/// What reading a key costs on top of its value's weight.
+pub const VISIT_BYTES: usize = 64;
 
 const CASINO_MAP: &str = "casino";
 const COMPUTED_MAP: &str = "casinoComputed";
@@ -443,6 +469,25 @@ struct TableRead {
 }
 
 impl TableRead {
+    /// A read that stopped before it began (this tick's reads spent): the
+    /// table does nothing with it.
+    fn short(ctx: Ctx, me: String) -> Self {
+        TableRead {
+            ctx,
+            base_u: 0,
+            cp_h: None,
+            ses_key: String::new(),
+            slips: HashMap::new(),
+            seeds: HashMap::new(),
+            closes: Vec::new(),
+            top: 0,
+            abandoned: HashSet::new(),
+            reveals: Vec::new(),
+            joins: Vec::new(),
+            me,
+        }
+    }
+
     fn closes_at(&self, r: i64) -> impl Iterator<Item = &Close> {
         self.closes.iter().filter(move |c| c.r == r)
     }
@@ -564,6 +609,10 @@ pub struct House {
     /// `deferred` was last cleared.
     budget: usize,
     deferred: bool,
+    /// What this tick may still read ([`READ_PER_TICK`]; unbounded in the
+    /// step-down's last word), and whether a read found it spent.
+    read_left: usize,
+    read_out: bool,
     /// The checks this pass asked for (key, bytes, signature by verdict),
     /// made with the doc let go, and whether a read of this pass was short
     /// (a table's, the room's own).
@@ -582,6 +631,17 @@ pub struct House {
     /// Called with the room before each signature check (tests).
     #[cfg(test)]
     on_check: Option<Box<dyn FnMut(&str) + Send>>,
+}
+
+/// A value [`House::read_charged`] read.
+enum Read {
+    Val(CVal),
+    /// None there, or not a value (a nested map, say).
+    Absent,
+    /// Heavier than the read allows: junk, or for a checkpoint, unread.
+    Heavy,
+    /// This tick's reads are spent.
+    Spent,
 }
 
 /// What [`House::tick`] did in a room.
@@ -619,6 +679,8 @@ impl House {
             verdict_order: VecDeque::new(),
             budget: VERIFY_PER_TICK,
             deferred: false,
+            read_left: READ_PER_TICK,
+            read_out: false,
             wanted: HashMap::new(),
             short: false,
             fresh: 0,
@@ -690,7 +752,12 @@ impl House {
         if k == self.key.public || self.rooms.get(room).and_then(|m| m.houses.get(k)).is_some_and(|o| o == owner_key) {
             return Some(true);
         }
-        let Some(v) = top_value(comp, txn, &format!("hk:{k}")) else { return Some(false) };
+        let key = format!("hk:{k}");
+        let v = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
+            Read::Val(v) => v,
+            Read::Spent => return None,
+            Read::Absent | Read::Heavy => return Some(false),
+        };
         let shape_ok = has_fields(&v, &["v", "h", "k", "g"], &[])
             && v.get("v").and_then(CVal::as_int) == Some(1)
             && str_of(&v, "h") == Some(k)
@@ -723,6 +790,46 @@ impl House {
         })?;
         mem.pins.insert(pid.to_string(), k.clone());
         Some(k)
+    }
+
+    /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
+    /// are spent, and then the read is short (`deferred`), as is every read
+    /// after it this tick.
+    fn charge(&mut self, n: usize) -> bool {
+        if self.read_left == usize::MAX {
+            return true;
+        }
+        if self.read_out || n > self.read_left {
+            self.read_left = 0;
+            self.read_out = true;
+            self.deferred = true;
+            return false;
+        }
+        self.read_left -= n;
+        true
+    }
+
+    /// The value under a key of `key_len` bytes, read and charged ([`charge`]:
+    /// the key, and the value's weight, or `cap` for one heavier, which is
+    /// what finding that out costs).
+    ///
+    /// [`charge`]: House::charge
+    fn read_charged(&mut self, key_len: usize, out: Option<Out>, cap: usize) -> Read {
+        let (weight, read) = match out {
+            Some(Out::Any(any)) => match hb::weight(&any, cap) {
+                Some(w) => (w, Some(any)),
+                None => (cap, None),
+            },
+            _ => (0, None),
+        };
+        if !self.charge(key_len.saturating_add(VISIT_BYTES).saturating_add(weight)) {
+            return Read::Spent;
+        }
+        match read {
+            Some(any) => Read::Val(CVal::from_any(&any)),
+            None if weight == 0 => Read::Absent,
+            None => Read::Heavy,
+        }
     }
 
     fn last_of(&self, ctx: &Ctx) -> Option<&Done> {
@@ -784,6 +891,8 @@ impl House {
 
     fn tick_with(&mut self, room: &str, doc: &Doc, now: u64, wall: u64, budget: usize, passes: usize) -> TickOut {
         self.budget = budget;
+        self.read_left = if budget == usize::MAX { usize::MAX } else { READ_PER_TICK };
+        self.read_out = false;
         self.fresh = 0;
         self.through.clear();
         self.wanted.clear();
@@ -879,13 +988,27 @@ impl House {
         let mut tables: Vec<(String, String)> = Vec::new();
         if let Some(casino) = &casino {
             for (key, out) in casino.iter(txn) {
-                let Some(t) = key.strip_prefix("cfg:computed:") else { continue };
-                let Out::Any(any) = out else { continue };
-                let Some(inc) = switch_inc(&CVal::from_any(&any)) else { continue };
+                let Some(t) = key.strip_prefix("cfg:computed:") else {
+                    if !self.charge(key.len() + VISIT_BYTES) {
+                        break;
+                    }
+                    continue;
+                };
+                let v = match self.read_charged(key.len(), Some(out), MAX_TOP_BYTES) {
+                    Read::Val(v) => v,
+                    Read::Spent => break,
+                    Read::Absent | Read::Heavy => continue,
+                };
+                let Some(inc) = switch_inc(&v) else { continue };
                 if house_inc(&inc) && !casino.contains_key(txn, &format!("gone:{t}:{inc}")) {
                     tables.push((t.to_string(), inc));
                 }
             }
+        }
+        // (The switches not all read: nothing in the room, the next tick.)
+        if self.read_out {
+            self.short = true;
+            return writes;
         }
         tables.sort();
 
@@ -894,7 +1017,12 @@ impl House {
         // the last one's settings go).
         self.rooms.get_mut(room).unwrap().fair.retain(|_, v| str_of(v, "k") == Some(owner_key.as_str()));
         for (t, _) in &tables {
-            let Some(v) = top_value(&comp, txn, &format!("hf:{t}")) else { continue };
+            let key = format!("hf:{t}");
+            let v = match self.read_charged(key.len(), comp.get(txn, &key), MAX_TOP_BYTES) {
+                Read::Val(v) => v,
+                Read::Spent => break,
+                Read::Absent | Read::Heavy => continue,
+            };
             if !has_fields(&v, &["v", "m", "s", "k", "g"], &[])
                 || v.get("v").and_then(CVal::as_int) != Some(1)
                 || !matches!(v.get("m").and_then(CVal::as_int), Some(0 | 1))
@@ -944,7 +1072,7 @@ impl House {
             // no pass of this tick reads it again once the budget is spent.)
             if self.deferred {
                 self.short = true;
-                if self.budget == 0 {
+                if self.budget == 0 || self.read_out {
                     self.through.insert(key, (!friendly, true));
                 }
             } else {
@@ -1010,7 +1138,7 @@ impl House {
                     // nothing on every page, and goes too.
                     let present = match comp.get(txn, ses) {
                         Some(Out::YMap(m)) => match m.get(txn, key) {
-                            Some(Out::Any(any)) => hb::rec_hash(&CVal::from_any(&any)) == hb::rec_hash(value),
+                            Some(Out::Any(any)) => CVal::from_any_within(&any, MAX_RECORD_BYTES).is_some_and(|v| hb::rec_hash(&v) == hb::rec_hash(value)),
                             _ => false,
                         },
                         _ => true,
@@ -1030,7 +1158,17 @@ impl House {
     /// delegations make the houses (house_of). A check put off on the way
     /// sets `deferred`: the read is short of it.
     fn read_table<T: ReadTxn>(&mut self, comp: &MapRef, txn: &T, ctx: Ctx, owner_key: &str) -> Option<TableRead> {
-        let cp = top_value(comp, txn, &format!("sum:{}:{}", ctx.t, ctx.inc)).filter(|v| checkpoint_ok(v, &ctx.inc));
+        // (This tick's reads spent, or a checkpoint heavier than a tick may
+        // read: short, the table does nothing.)
+        let cp_key = format!("sum:{}:{}", ctx.t, ctx.inc);
+        let cp = match self.read_charged(cp_key.len(), comp.get(txn, &cp_key), READ_PER_TICK.max(self.read_left)) {
+            Read::Val(v) => Some(v).filter(|v| checkpoint_ok(v, &ctx.inc)),
+            Read::Absent => None,
+            Read::Heavy | Read::Spent => {
+                self.deferred = true;
+                return Some(TableRead::short(ctx, self.key.public.clone()));
+            }
+        };
         if cp.as_ref().is_some_and(|v| v.get("e").is_some()) {
             return None;
         }
@@ -1061,9 +1199,18 @@ impl House {
         let mut forfeits: Vec<Forfeit> = Vec::new();
         let mut house_recs: Vec<(char, i64, String, CVal, String)> = Vec::new();
         for (key, out) in ses.iter(txn).take(MAX_SESSION_KEYS) {
-            let Some((kind, r, pid, h)) = parse_key(key) else { continue };
-            let Out::Any(any) = out else { continue };
-            let v = CVal::from_any(&any);
+            // (This tick's reads spent: the read is short, `deferred` set.)
+            let Some((kind, r, pid, h)) = parse_key(key) else {
+                if !self.charge(key.len() + VISIT_BYTES) {
+                    return Some(read);
+                }
+                continue;
+            };
+            let v = match self.read_charged(key.len(), Some(out), MAX_RECORD_BYTES) {
+                Read::Val(v) => v,
+                Read::Spent => return Some(read),
+                Read::Absent | Read::Heavy => continue,
+            };
             // The key must be the body's own (its round, pid and hash).
             if is_round(v.get("r")) != Some(r) || hb::rec_hash(&v).as_deref() != Some(h) {
                 continue;
@@ -1653,9 +1800,16 @@ fn grace_of(t0: u64, times: &mut [u64]) -> u64 {
     grace
 }
 
+/// Top-level record `key` (a delegation, a setting, a heartbeat): None as
+/// well when it weighs more than [`MAX_TOP_BYTES`], which none of them does.
 fn top_value<T: ReadTxn>(map: &MapRef, txn: &T, key: &str) -> Option<CVal> {
+    top_value_within(map, txn, key, MAX_TOP_BYTES)
+}
+
+/// Top-level record `key`, when it weighs at most `cap` ([`hb::weight`]).
+fn top_value_within<T: ReadTxn>(map: &MapRef, txn: &T, key: &str, cap: usize) -> Option<CVal> {
     match map.get(txn, key) {
-        Some(Out::Any(any)) => Some(CVal::from_any(&any)),
+        Some(Out::Any(any)) => CVal::from_any_within(&any, cap),
         _ => None,
     }
 }

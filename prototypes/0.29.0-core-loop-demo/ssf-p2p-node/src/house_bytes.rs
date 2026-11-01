@@ -59,6 +59,12 @@ impl CVal {
         }
     }
 
+    /// From a Yjs value, when it weighs at most `cap` ([`weight`]): None
+    /// for a heavier one, which costs no more than `cap` to find out.
+    pub fn from_any_within(v: &yrs::Any, cap: usize) -> Option<CVal> {
+        weight(v, cap).map(|_| CVal::from_any(v))
+    }
+
     /// From a Yjs value (a record as the room's doc holds it). Yjs writes a
     /// JS number as an integer or a float, and either reads back as
     /// `Number`; a JS bigint is `BigInt`, which canon refuses.
@@ -180,6 +186,48 @@ fn canon_into(out: &mut String, v: &CVal) -> bool {
 }
 
 /// computedFold canon: sorted-key JSON, or None for junk.
+/// Nesting a record of the doc may have and still be weighed: the pages'
+/// records go 3 deep (a slip's felt of bets), a checkpoint's carry 5.
+pub const MAX_DEPTH: usize = 16;
+
+/// About what Yjs value `v` weighs as JSON: a string its UTF-8 bytes and
+/// quotes, a number 8, an array or object its brackets, a comma for each
+/// member and an object's keys. Weighed only as far as `cap` and
+/// [`MAX_DEPTH`]: None past either, so finding a heavy one out costs about
+/// `cap` however big it is (each member is counted as it is reached, before
+/// anything inside it).
+pub fn weight(v: &yrs::Any, cap: usize) -> Option<usize> {
+    use yrs::Any;
+    let mut total: usize = 0;
+    let mut stack: Vec<(&Any, usize)> = vec![(v, 0)];
+    while let Some((v, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let own = match v {
+            Any::String(s) => s.len() + 2,
+            Any::Buffer(b) => b.len() + 2,
+            Any::Array(a) => {
+                for x in a.iter() {
+                    total = total.checked_add(1).filter(|t| *t <= cap)?;
+                    stack.push((x, depth + 1));
+                }
+                2
+            }
+            Any::Map(m) => {
+                for (k, x) in m.iter() {
+                    total = total.checked_add(k.len() + 4).filter(|t| *t <= cap)?;
+                    stack.push((x, depth + 1));
+                }
+                2
+            }
+            Any::Null | Any::Undefined | Any::Bool(_) | Any::Number(_) | Any::BigInt(_) => 8,
+        };
+        total = total.checked_add(own).filter(|t| *t <= cap)?;
+    }
+    Some(total)
+}
+
 pub fn canon(v: &CVal) -> Option<String> {
     let mut out = String::new();
     canon_into(&mut out, v).then_some(out)

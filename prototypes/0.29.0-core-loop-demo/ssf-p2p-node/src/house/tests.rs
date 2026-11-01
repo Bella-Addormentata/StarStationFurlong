@@ -125,7 +125,7 @@ impl Room {
     fn ses_key(&self) -> String {
         let txn = self.doc.transact();
         let comp = txn.get_map(COMPUTED_MAP).unwrap();
-        let cp = top_value(&comp, &txn, &format!("sum:{T}:{INC}"));
+        let cp = top_value_within(&comp, &txn, &format!("sum:{T}:{INC}"), usize::MAX);
         format!("ses:{T}:{INC}:{}", hb::next_sid(&ctx(), cp.as_ref()).unwrap())
     }
 
@@ -152,6 +152,12 @@ impl Room {
         let mut txn = self.doc.transact_mut();
         let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!("no session {ses}") };
         m.insert(&mut txn, key, to_any(v));
+    }
+
+    fn delete_top(&self, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.remove(&mut txn, key);
     }
 
     fn delete(&self, key: &str) {
@@ -231,7 +237,7 @@ impl Room {
 
     fn top(&self, key: &str) -> Option<CVal> {
         let txn = self.doc.transact();
-        top_value(&txn.get_map(COMPUTED_MAP).unwrap(), &txn, key)
+        top_value_within(&txn.get_map(COMPUTED_MAP).unwrap(), &txn, key, usize::MAX)
     }
 
     fn commit(&self, r: i64) -> String {
@@ -832,6 +838,229 @@ fn stepping_down_checks_all_it_must_in_its_last_word() {
     assert!(strs(d, "x").is_empty());
     // The delegation, its own join and the 600 slips.
     assert_eq!(room.house.verdicts.len(), 602);
+}
+
+/// A pid as long as the pages take one (256 UTF-16 units), of 3-byte
+/// characters, ending in `i`'s digits.
+fn long_pid(i: usize) -> String {
+    let tail = format!("{i}");
+    "€".repeat(256 - tail.len()) + &tail
+}
+
+#[test]
+fn the_heaviest_records_the_pages_take_weigh_well_under_what_a_read_allows() {
+    let w = |v: &CVal| hb::weight(&to_any(v), usize::MAX).unwrap();
+    let big = CVal::Int(MAX_SAFE);
+    let (hex32, hex64) = (s(&"f".repeat(32)), s(&"f".repeat(64)));
+    let (k, g) = (s(&"A".repeat(43)), s(&"A".repeat(86)));
+    let pids: Vec<String> = (0..MAX_FROZEN).map(long_pid).collect();
+    let bets = CVal::Arr(
+        (0..400).map(|_| obj(vec![("type", s("straight")), ("amount", CVal::Int(1_000_000_000)), ("pick", CVal::Int(36))])).collect(),
+    );
+    let slip = obj(vec![("r", big.clone()), ("p", s(&pids[0])), ("v", big.clone()), ("b", bets), ("c", hex64.clone()), ("k", k.clone()), ("g", g.clone())]);
+    assert!(felt_ok(false, slip.get("b").and_then(CVal::as_arr).unwrap()));
+    let close = obj(vec![
+        ("r", big.clone()),
+        ("q", hex32.clone()),
+        ("f", CVal::Obj(pids.iter().map(|p| (p.clone(), hex32.clone())).collect())),
+        ("h", hex64.clone()),
+        ("k", k.clone()),
+        ("g", g.clone()),
+    ]);
+    let forfeit = obj(vec![("r", big.clone()), ("x", hex32.clone()), ("n", CVal::Arr(pids.iter().map(|p| s(p)).collect())), ("k", k.clone()), ("g", g.clone())]);
+    let reveal = obj(vec![
+        ("r", big.clone()),
+        ("s", hex64.clone()),
+        ("x", CVal::Arr(vec![hex32.clone(); MAX_CLOSES_PER_ROUND])),
+        ("n", CVal::Arr(vec![hex32.clone(); MAX_HOUSE_COUNTED])),
+        ("c", hex64.clone()),
+        ("k", k.clone()),
+        ("g", g.clone()),
+    ]);
+    for (name, rec) in [("slip", &slip), ("close", &close), ("forfeit", &forfeit), ("house reveal", &reveal)] {
+        assert!(w(rec) * 2 <= MAX_RECORD_BYTES, "{name} weighs {}", w(rec));
+    }
+    // A delegation, a setting, a heartbeat and a switch, far under theirs.
+    let small = [
+        obj(vec![("v", CVal::Int(1)), ("h", k.clone()), ("k", k.clone()), ("g", g.clone())]),
+        obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", big.clone()), ("k", k.clone()), ("g", g.clone())]),
+        obj(vec![("v", CVal::Int(1)), ("n", big.clone()), ("k", k.clone()), ("g", g.clone())]),
+        obj(vec![("v", CVal::Int(1)), ("inc", s(INC))]),
+    ];
+    for rec in &small {
+        assert!(w(rec) * 8 <= MAX_TOP_BYTES);
+    }
+    // A checkpoint of as many bettors as the pages keep, each net 40 digits:
+    // one tick reads it.
+    let nets = CVal::Obj((0..4_096).map(|i| (long_pid(i), s(&"9".repeat(40)))).collect());
+    let cp = obj(vec![("v", CVal::Int(1)), ("b", hex32.clone()), ("u", big.clone()), ("l", hex32.clone()), ("n", nets), ("h", hex64.clone()), ("k", k), ("g", g)]);
+    assert!(checkpoint_ok(&with(&cp, "b", s(&"f".repeat(24))), INC));
+    assert!(w(&cp) < READ_PER_TICK, "a full checkpoint weighs {}", w(&cp));
+}
+
+#[test]
+fn weighing_a_value_stops_at_its_cap_and_its_depth() {
+    let any = |v: &CVal| to_any(v);
+    assert_eq!(hb::weight(&any(&s("abc")), 100), Some(5));
+    assert_eq!(hb::weight(&any(&obj(vec![("ab", CVal::Int(1))])), 100), Some(2 + 6 + 8));
+    assert_eq!(hb::weight(&any(&CVal::Arr(vec![CVal::Int(1), CVal::Int(2)])), 100), Some(2 + 2 * 9));
+    assert_eq!(hb::weight(&any(&s(&"x".repeat(98))), 100), Some(100));
+    assert_eq!(hb::weight(&any(&s(&"x".repeat(99))), 100), None);
+    // A long array: found heavy on its first members.
+    let long = Any::Array(Arc::from(vec![Any::Number(1.0); 1_000_000]));
+    assert_eq!(hb::weight(&long, 1_000), None);
+    // Nesting past MAX_DEPTH, however light.
+    let mut deep = Any::Number(1.0);
+    for _ in 0..hb::MAX_DEPTH {
+        deep = Any::Array(Arc::from(vec![deep]));
+    }
+    assert!(hb::weight(&deep, usize::MAX).is_some());
+    let deeper = Any::Array(Arc::from(vec![deep]));
+    assert_eq!(hb::weight(&deeper, usize::MAX), None);
+}
+
+/// `n` records under slip keys of round 1 in table `ses`'s session, each
+/// junk (its key not its hash) weighing about `bytes`.
+fn junk_in(room: &Room, ses: &str, n: usize, bytes: usize) {
+    let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+    let mut txn = room.doc.transact_mut();
+    let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+    let filler = "j".repeat(bytes);
+    for i in 0..n {
+        m.insert(&mut txn, format!("s:1:junk{i}:{i:032x}"), to_any(&obj(vec![("r", CVal::Int(1)), ("x", s(&filler))])));
+    }
+}
+
+/// A second house table, T2, switched on: its session's key.
+fn second_table(room: &Room) -> String {
+    const T2: &str = "roulette-2";
+    const INC2: &str = "r89abcdef0123456789abcdef";
+    let ctx2 = Ctx { room: ROOM.into(), t: T2.into(), inc: INC2.into() };
+    let ses2 = format!("ses:{T2}:{INC2}:{}", hb::next_sid(&ctx2, None).unwrap());
+    let mut txn = room.doc.transact_mut();
+    let casino = txn.get_or_insert_map(CASINO_MAP);
+    casino.insert(&mut txn, format!("cfg:computed:{T2}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC2))])));
+    let comp = txn.get_or_insert_map(COMPUTED_MAP);
+    comp.insert(&mut txn, ses2.as_str(), MapPrelim::default());
+    ses2
+}
+
+fn joins_in(room: &Room, ses: &str) -> usize {
+    let txn = room.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session") };
+    m.keys(&txn).filter(|k| k.starts_with("o:1:")).count()
+}
+
+#[test]
+fn a_record_heavier_than_any_the_pages_take_is_junk_and_costs_a_tick_no_more_than_its_cap() {
+    let mut room = Room::new("heavy-junk", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    // 50 MB under a slip key, and a million numbers under another.
+    room.put_raw(&format!("s:1:alice:{}", "e".repeat(32)), &obj(vec![("r", CVal::Int(1)), ("x", s(&"b".repeat(50 << 20)))]));
+    let numbers = Any::Map(Arc::new(HashMap::from([
+        ("r".to_string(), Any::Number(1.0)),
+        ("x".to_string(), Any::Array(Arc::from(vec![Any::Number(1.0); 1_000_000]))),
+    ])));
+    {
+        let ses = room.ses_key();
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+        m.insert(&mut txn, format!("s:1:bob:{}", "d".repeat(32)), numbers);
+    }
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    let out = room.tick(200);
+    assert!(!out.short, "the table read whole");
+    // (Each pass of the tick read them: two caps a pass, and the rest.)
+    let read = READ_PER_TICK - room.house.read_left;
+    assert!(read < MAX_PASSES * 3 * MAX_RECORD_BYTES, "read {read}");
+    // And the round revealed as ever.
+    let rev = &room.records("h:1:")[0].1;
+    assert_eq!(strs(rev, "x"), vec![c]);
+}
+
+#[test]
+fn junk_past_a_ticks_reads_waits_at_its_table_holding_the_room_no_longer_and_the_others_have_their_turns() {
+    let mut room = Room::new("junk-turns", true);
+    let ses2 = second_table(&room);
+    // ~6 MB of junk at the first table: more than a tick reads.
+    let ses = room.ses_key();
+    junk_in(&room, &ses, 100, 60_000);
+    let first = room.tick(0);
+    assert!(first.short);
+    assert!(room.house.read_out);
+    assert!(room.records("o:").is_empty(), "nothing at the junk table");
+    // The second table has its turn by the next tick, the junk going on.
+    if joins_in(&room, &ses2) == 0 {
+        assert!(room.tick(TICK_MS).short);
+    }
+    assert_eq!(joins_in(&room, &ses2), 1);
+    assert!(room.records("o:").is_empty());
+    // The step-down's last word reads it all.
+    assert!(!room.house.tick_unbounded(ROOM, &room.doc, room.now, 0).short);
+    // The junk gone (a trim): the first table joins again.
+    room.house.stepping_down = false;
+    for i in 0..100 {
+        room.delete(&format!("s:1:junk{i}:{i:032x}"));
+    }
+    let out = room.tick(TICK_MS);
+    assert!(!out.short);
+    assert_eq!(room.records("o:1:").len(), 1);
+}
+
+#[test]
+fn a_checkpoint_heavier_than_a_tick_reads_leaves_its_table_unread_not_on_another_session() {
+    let mut room = Room::new("heavy-checkpoint", true);
+    // As junk it would send the house to the first session ("g"), which a
+    // checkpoint the pages took had trimmed.
+    let first = format!("ses:{T}:{INC}:g");
+    room.put_top(&format!("sum:{T}:{INC}"), &obj(vec![("v", CVal::Int(1)), ("x", s(&"c".repeat(READ_PER_TICK)))]));
+    assert!(room.tick(0).short);
+    assert!(room.tick(TICK_MS).short);
+    assert_eq!(joins_in(&room, &first), 0);
+    // Nested past what is weighed, even in the step-down's last word.
+    let mut deep = Any::Number(1.0);
+    for _ in 0..hb::MAX_DEPTH + 1 {
+        deep = Any::Array(Arc::from(vec![deep]));
+    }
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.insert(&mut txn, format!("sum:{T}:{INC}"), Any::Map(Arc::new(HashMap::from([("x".to_string(), deep)]))));
+    }
+    assert!(room.house.tick_unbounded(ROOM, &room.doc, room.now, 0).short);
+    assert_eq!(joins_in(&room, &first), 0);
+    // Gone: the house joins there.
+    room.delete_top(&format!("sum:{T}:{INC}"));
+    assert!(!room.tick(TICK_MS).short);
+    assert_eq!(joins_in(&room, &first), 1);
+}
+
+#[test]
+fn junk_switches_past_a_ticks_reads_leave_the_room_short_until_they_go() {
+    let mut room = Room::new("junk-switches", true);
+    let n = READ_PER_TICK / 64;
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..n {
+            casino.insert(&mut txn, format!("cfg:computed:junk-{i}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC))])));
+        }
+    }
+    assert!(room.tick(0).short);
+    assert!(room.records("o:").is_empty());
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..n {
+            casino.remove(&mut txn, &format!("cfg:computed:junk-{i}"));
+        }
+    }
+    assert!(!room.tick(TICK_MS).short);
+    assert_eq!(room.records("o:1:").len(), 1);
 }
 
 #[test]
