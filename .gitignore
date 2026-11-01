@@ -37,6 +37,12 @@ contact.key
 # ⛓️ The node's Chia peer cache, written next to it too
 chia_peers.json
 **/chia_peers.json
+# 🏦 The SSF wallet's 24-word identity, a raw seed from before the words and
+# its archives, and their private temporary files: each holds a wallet's secret
+**/chia_identity.json
+**/chia_identity.seed
+**/chia_identity.seed.retired-*
+**/.chia_identity.*.tmp
 
 # Editor directories and files
 .vscode/*

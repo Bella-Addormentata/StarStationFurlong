@@ -55,8 +55,10 @@ export interface LocalFingerprint {
   /** 🏦 The SSF wallet switch (the node's chia_wallet_switch.rs): whether
    *  this build can hold a wallet, whether `SSF_CHIA_LANE` in the node's
    *  environment holds it off, and whether it is on, for the Bank's TURN ON
-   *  (bankWallet.ts). Absent from older nodes, which only `SSF_CHIA_LANE=1`
-   *  turns on. Kept only in the node's shape (`parseChiaWallet`). */
+   *  (bankWallet.ts); and whether its 24 words are backed up, for the Bank's
+   *  BACK UP (bankBackup.ts). Absent from older nodes, which only
+   *  `SSF_CHIA_LANE=1` turns on. Kept only in the node's shape
+   *  (`parseChiaWallet`). */
   chia_wallet?: ChiaWalletSwitch;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
@@ -102,16 +104,37 @@ export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
 export interface ChiaWalletSwitch {
   state: ChiaWalletState;
-  /** Ready: a seed from an earlier run is on disk, so turning on brings back
-   *  that wallet and its address. */
+  /** Ready: the 24-word identity from an earlier run (`chia_identity.json`)
+   *  is on disk, so turning on brings back that wallet and its address. */
   seed?: boolean;
+  /** Ready, with no 24-word identity: only a raw-seed wallet from before the
+   *  24 words is on disk. Turning on retires it and makes a new wallet, at a
+   *  new address (bankWallet.ts words CREATE so). */
+  legacy?: boolean;
   /** On: back on at the node's next start. */
   stays?: boolean;
   /** On: `SSF_CHIA_LANE=1` holds it on; the Bank cannot turn it off. */
   held?: boolean;
+  /** On: the loaded wallet is made from 24 words the node keeps. Ready:
+   *  turning on makes or loads a wallet from 24 words. The capability marker
+   *  for the Bank's BACK UP (bankBackup.ts) and CREATE's wording
+   *  (bankWallet.ts): older nodes never send it, and the Bank offers BACK UP
+   *  only when it is present. */
+  mnemonic?: boolean;
+  /** On, with `mnemonic`: the player marked this key's 24 words saved, so
+   *  the Bank does not show them again. */
+  backed_up?: boolean;
+  /** On: this run's load retired a raw-seed wallet and made a new one. */
+  reminted?: boolean;
   /** Why the last turn failed, in the node's words. */
   error?: string;
 }
+
+/** The switch's flags, every one a boolean the node sends only when true.
+ *  Nothing else is copied: the fingerprint never carries the words, and a
+ *  field of any other name from a node (or a stranger on its port) is
+ *  dropped here. */
+const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up', 'reminted'] as const;
 
 const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on']);
 
@@ -123,14 +146,14 @@ export function parseChiaWallet(v: unknown): ChiaWalletSwitch | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const r = v as Record<string, unknown>;
   if (typeof r.state !== 'string' || !WALLET_STATES.has(r.state)) return undefined;
-  for (const flag of ['seed', 'stays', 'held'] as const) {
+  for (const flag of WALLET_FLAGS) {
     if (r[flag] !== undefined && typeof r[flag] !== 'boolean') return undefined;
   }
   if (r.error !== undefined && typeof r.error !== 'string') return undefined;
   const w: ChiaWalletSwitch = { state: r.state as ChiaWalletState };
-  if (r.seed === true) w.seed = true;
-  if (r.stays === true) w.stays = true;
-  if (r.held === true) w.held = true;
+  for (const flag of WALLET_FLAGS) {
+    if (r[flag] === true) w[flag] = true;
+  }
   if (typeof r.error === 'string' && r.error) w.error = r.error;
   return w;
 }

@@ -57,7 +57,7 @@ mod chia_faucet;
 #[cfg(feature = "chia-read")]
 mod board_bundles;
 // Chain WRITES (`chia-publish`, runtime-gated by the SSF wallet switch,
-// chia_wallet_switch.rs): wallet seed,
+// chia_wallet_switch.rs): the wallet's 24-word identity,
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
 mod chia_wallet;
@@ -637,6 +637,14 @@ pub struct HubState {
     /// It goes from `None` to a key at most once per run, and never back.
     #[cfg(feature = "chia-publish")]
     pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
+    /// 🏦 What the Bank's BACK UP knows of the loaded key (chia_wallet_switch.rs):
+    /// its words' fingerprint, whether they are marked saved, whether this
+    /// run's load retired a raw seed, and whether the Bank showed the words
+    /// since the node started. Never the words or the entropy. Set with the
+    /// key (before it, so no view pairs a loaded key with no meta), and
+    /// `None` while the wallet is off.
+    #[cfg(feature = "chia-publish")]
+    pub wallet_meta: Mutex<Option<chia_wallet_switch::WalletMeta>>,
     /// 🏦 The switch's memory for the fingerprint: whether the Bank's switch is
     /// remembered on, and why the last turn (or the load at startup) failed.
     #[cfg(feature = "chia-publish")]
@@ -990,6 +998,47 @@ mod fingerprint_json_tests {
         assert_eq!(back.chia_address, None);
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_address.as_deref(), Some("txch1qq"));
+    }
+
+    /// 🏦 The SSF wallet switch rides with the 24-word flags the Bank reads
+    /// (in the order its parser lists them), and the fingerprint never
+    /// carries the words, the entropy or the key fingerprint.
+    #[test]
+    fn the_wallet_switch_rides_with_its_words_flags_and_never_the_words() {
+        use crate::chia_wallet_switch::{view, EnvSwitch, KeyFacts, SwitchMemo, WalletSwitch};
+        let memo = SwitchMemo { remembered: true, error: None };
+        let cases = [
+            (
+                view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }),
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true}"#,
+            ),
+            (
+                view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }),
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true}"#,
+            ),
+            (
+                view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }),
+                r#""chia_wallet":{"state":"ready","legacy":true,"mnemonic":true}"#,
+            ),
+            (
+                view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }),
+                r#""chia_wallet":{"state":"ready","seed":true,"mnemonic":true}"#,
+            ),
+        ];
+        for (switch, expect) in cases {
+            let mut some = fp();
+            some.chia_wallet = Some(switch.clone());
+            some.chia_address = Some("txch1qq".into());
+            let json = serde_json::to_string(&some).unwrap();
+            assert!(json.contains(expect), "{json}");
+            assert!(!json.contains("\"words\""), "never a words array: {json}");
+            assert!(!json.contains("entropy") && !json.contains("fingerprint\":") && !json.contains("\"key\""), "{json}");
+            let back: Fingerprint = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.chia_wallet, Some(switch));
+        }
+        // An older node's switch, with none of the flags, still parses.
+        let older: WalletSwitch = serde_json::from_str(r#"{"state":"on","stays":true}"#).unwrap();
+        assert!(!older.mnemonic && !older.backed_up && !older.reminted && !older.legacy);
     }
 
     /// 📖 The Phone Book listing rides the same way: absent while the node
@@ -1680,7 +1729,7 @@ async fn main() -> Result<()> {
 
     // 🏦 Whether the SSF wallet loads at this start (chia_wallet_switch.rs):
     // the environment first (`SSF_CHIA_LANE=1` on, any other value off), else
-    // the switch the SpacePhone's Bank remembered beside the seed. An
+    // the switch the SpacePhone's Bank remembered beside the wallet. An
     // unreadable switch file starts the wallet off and says why.
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
@@ -1707,10 +1756,12 @@ async fn main() -> Result<()> {
     println!("⛓️ Chain lane: {}", chia_chain::describe());
 
     // ⛓️ ChiaHub lane C1 SLICE 2 (chia-publish feature): load/mint the node's
-    // Chia BLS identity and print its testnet11 receive address to fund. ONLY
-    // when the SSF wallet starts on (above): a node whose wallet was never
-    // turned on never mints `chia_identity.seed` (D3, as amended by #335).
-    // The seed persists beside the iroh key (bare CWD-relative path, same
+    // 24-word Chia identity and print its testnet11 receive address to fund.
+    // ONLY when the SSF wallet starts on (above): a node whose wallet was
+    // never turned on never mints `chia_identity.json` (D3, as amended by
+    // #335), and a raw `chia_identity.seed` from before the words is retired
+    // only then (a node remembered on re-mints at this start, with no tap).
+    // The identity persists beside the iroh key (bare CWD-relative path, same
     // convention). The Bank's TURN ON runs the same steps later
     // (`turn_wallet`) when the wallet did not start on.
     // Slice 6 stash: the wallet key outlives this block so the heartbeat
@@ -1719,16 +1770,29 @@ async fn main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-publish")]
+    let mut startup_wallet_meta: Option<chia_wallet_switch::WalletMeta> = None;
+    #[cfg(feature = "chia-publish")]
+    if !chia_wallet_switch::dev_pages().is_empty() {
+        println!(
+            "🏦 SSF wallet: SSF_BANK_DEV_PAGES lets these browser pages show the 24 words: {}",
+            chia_wallet_switch::dev_pages().join(", ")
+        );
+    }
+    #[cfg(feature = "chia-publish")]
     if wallet_starts {
-        let seed_path = std::path::Path::new(chia_wallet_switch::SEED_FILE);
-        match chia_wallet::load_or_mint_bls_key(seed_path) {
-            Ok(chia_sk) => {
-                announce_wallet(&chia_sk);
+        match chia_wallet::load_or_mint_wallet(
+            std::path::Path::new(chia_wallet_switch::IDENTITY_FILE),
+            std::path::Path::new(chia_wallet_switch::LEGACY_SEED_FILE),
+        ) {
+            Ok(id) => {
+                let chia_sk = id.wallet.clone();
+                announce_wallet(&id);
+                startup_wallet_meta = Some(wallet_meta_of(&id));
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
                 // a restart, and the restored parking keeps its inputs, and a
-                // mojo still landing, from being taken again. Beside the seed,
-                // same CWD-relative convention; before any writer runs. A file
+                // mojo still landing, from being taken again. Beside the
+                // identity, same CWD-relative convention; before any writer runs. A file
                 // that exists but cannot be read SEALS the lease (round 19):
                 // the node then takes no spend until the operator fixes or
                 // removes it and restarts; the startup log says so.
@@ -1935,6 +1999,8 @@ async fn main() -> Result<()> {
         knocks: Mutex::new(chia_knock::KnockBook::load(std::path::Path::new(chia_knock::KNOCKS_FILE))),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
+        #[cfg(feature = "chia-publish")]
+        wallet_meta: Mutex::new(startup_wallet_meta),
         #[cfg(feature = "chia-publish")]
         wallet_switch: Mutex::new(wallet_memo),
         #[cfg(feature = "chia-publish")]
@@ -5585,36 +5651,73 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
     #[cfg(feature = "chia-publish")]
     {
         // One read of the key for both the switch's state and the address,
-        // and the key before the memo: `turn_wallet` writes the memo before
-        // the key, so no answer pairs a loaded key with the memo from before
-        // the turn (KEEP IT ON for a wallet that was just saved on).
+        // then the meta, then the memo: `turn_wallet` writes the memo, then
+        // the meta, then the key, so no answer pairs a loaded key with the
+        // memo from before the turn (KEEP IT ON for a wallet that was just
+        // saved on), or with no meta (On without `mnemonic`).
         let key = hub.chia_wallet.lock().unwrap().clone();
+        let meta = *hub.wallet_meta.lock().unwrap();
         let memo = hub.wallet_switch.lock().unwrap().clone();
         let loaded = key.is_some();
-        let seed = !loaded && std::path::Path::new(chia_wallet_switch::SEED_FILE).try_exists().unwrap_or(false);
-        let view = chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, seed);
+        let facts = match (loaded, meta) {
+            (true, Some(meta)) => chia_wallet_switch::KeyFacts {
+                mnemonic: true,
+                backed_up: meta.backed_up,
+                reminted: meta.reminted,
+                ..Default::default()
+            },
+            (true, None) => chia_wallet_switch::KeyFacts::default(),
+            // The files only while the wallet is off: TURN ON's wording.
+            (false, _) => {
+                let on_disk = |name: &str| std::path::Path::new(name).try_exists().unwrap_or(false);
+                chia_wallet_switch::KeyFacts {
+                    identity_on_disk: on_disk(chia_wallet_switch::IDENTITY_FILE),
+                    legacy_on_disk: on_disk(chia_wallet_switch::LEGACY_SEED_FILE),
+                    ..Default::default()
+                }
+            }
+        };
+        let view = chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, &facts);
         (view, key.as_ref().map(chia_wallet::testnet_address))
     }
     #[cfg(not(feature = "chia-publish"))]
     {
         let _ = hub;
         let memo = chia_wallet_switch::SwitchMemo::default();
-        (chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, false), None)
+        let facts = chia_wallet_switch::KeyFacts::default();
+        (chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, &facts), None)
     }
 }
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
-/// its receive address and, with the beacon on, the beacon's.
+/// what the load did, its key fingerprint and receive address and, with the
+/// beacon on, the beacon's address. Never the words.
 #[cfg(feature = "chia-publish")]
-fn announce_wallet(chia_sk: &chia_bls::SecretKey) {
-    chia_wallet::log_receive_address(chia_sk);
-    // #231 P6b/D7: the beacon role pays from a wallet of its own.
+fn announce_wallet(id: &chia_wallet::WalletIdentity) {
+    chia_wallet::log_receive_address(id);
+    // #231 P6b/D7: the beacon role pays from a wallet of its own, derived
+    // from the wallet key (so it changes with a re-mint).
     if chia_publish::beacon_enabled() {
         println!(
             "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund {} at a testnet11 faucet",
-            chia_wallet::testnet_address(&chia_publish::beacon_wallet_key(chia_sk))
+            chia_wallet::testnet_address(&chia_publish::beacon_wallet_key(&id.wallet))
         );
     }
+}
+
+/// 🏦 The Bank's facts of a wallet just loaded (blocking: it reads the saved
+/// flag): whether its words are marked saved, where an unreadable flag
+/// counts as not and says so, and whether this load retired a raw seed.
+#[cfg(feature = "chia-publish")]
+fn wallet_meta_of(id: &chia_wallet::WalletIdentity) -> chia_wallet_switch::WalletMeta {
+    let backed_up = match chia_wallet_switch::saved_for(std::path::Path::new(chia_wallet_switch::SAVED_FILE), id.fingerprint) {
+        Ok(saved) => saved,
+        Err(why) => {
+            eprintln!("🏦 SSF wallet: {why} — the Bank counts the 24 words as not backed up");
+            false
+        }
+    };
+    chia_wallet_switch::WalletMeta { fingerprint: id.fingerprint, backed_up, reminted: id.retired.is_some(), revealed: false }
 }
 
 /// Start the heartbeat publisher for the loaded wallet: at startup, or when
@@ -5644,9 +5747,10 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
 
 /// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
 ///
-/// On, when the wallet is not loaded: mint or load the seed, restore the
-/// wallet lease (under its gate, before anything can spend), remember the
-/// switch, and only then hand the key to the hub and start the publisher,
+/// On, when the wallet is not loaded: mint or load the 24-word identity
+/// (retiring a raw seed from before the words), restore the wallet lease
+/// (under its gate, before anything can spend), remember the switch, and
+/// only then hand the meta and the key to the hub and start the publisher,
 /// the startup order. On while loaded only remembers it. Off remembers it
 /// off: the wallet stays on until the node stops, since the publisher cannot
 /// stop mid-run. One turn at a time; a failure leaves the wallet as it was
@@ -5687,15 +5791,24 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     let loaded = hub.chia_wallet.lock().unwrap().is_some();
     if !loaded {
         let minted = tokio::task::spawn_blocking(|| {
-            chia_wallet::load_or_mint_bls_key(std::path::Path::new(chia_wallet_switch::SEED_FILE))
+            chia_wallet::load_or_mint_wallet(
+                std::path::Path::new(chia_wallet_switch::IDENTITY_FILE),
+                std::path::Path::new(chia_wallet_switch::LEGACY_SEED_FILE),
+            )
+            .map(|id| {
+                let meta = wallet_meta_of(&id);
+                (id, meta)
+            })
         })
         .await;
-        let chia_sk = match minted {
-            Ok(Ok(sk)) => sk,
+        let (id, meta) = match minted {
+            Ok(Ok(loaded)) => loaded,
             Ok(Err(e)) => return fail(format!("the wallet could not be loaded: {e:#}")),
             Err(e) => return fail(format!("the wallet could not be loaded ({e})")),
         };
-        announce_wallet(&chia_sk);
+        announce_wallet(&id);
+        let chia_sk = id.wallet.clone();
+        drop(id);
         // The lease's parking outlives the process (see startup): restored
         // before the key reaches anything that spends, under the lease's gate
         // so the watcher's reconcile does not run beside it.
@@ -5703,8 +5816,9 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             let _gate = chia_publish::WALLET_LEASE.lock().await;
             chia_publish::WALLET_LEASE.restore(std::path::Path::new(chia_wallet_switch::LEASE_FILE));
         }
-        // The memo before the key: the fingerprint reads the key, then the
-        // memo (wallet_switch_view), so every answer is one wallet state.
+        // The memo, then the meta, then the key: the fingerprint reads the
+        // key, then the meta, then the memo (wallet_switch_view), so every
+        // answer is one wallet state.
         let saved = match chia_wallet_switch::remember(switch_path, true, now) {
             Ok(()) => {
                 *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
@@ -5715,6 +5829,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
                 false
             }
         };
+        *hub.wallet_meta.lock().unwrap() = Some(meta);
         *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
         start_publisher(hub, iroh_endpoint, chia_sk);
         if saved {
@@ -5728,6 +5843,110 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
     println!("🏦 SSF wallet: kept on in the Bank — it is back on at the next start");
     Ok(())
+}
+
+/// 🏦 One words-route answer for a page `app_page` passed: the reveal of the
+/// loaded wallet's 24 words, or the player's "I saved them".
+///
+/// Neither takes the turn lock once the wallet is loaded: the key never
+/// changes in a run after that, so a double tap or a KEEP IT ON beside it
+/// gets no spurious "turning". The reveal reads the identity file again (the
+/// node keeps no copy of the words) and shows it only when it still makes
+/// the loaded key. Its body is built by hand in a buffer wiped when dropped.
+///
+/// What to answer is decided in chia_wallet_switch.rs (`words_step`,
+/// `words_match`, `after_failed_mark`); this only does the reads and writes
+/// those decisions call for.
+#[cfg(feature = "chia-publish")]
+async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'static str, zeroize::Zeroizing<String>) {
+    use chia_wallet_switch::{saved_answer, FailedMark, WordsStep, BACKUP_MISMATCH, BACKUP_UNREADABLE};
+    let plain = |(status, body): (&'static str, serde_json::Value)| (status, zeroize::Zeroizing::new(body.to_string()));
+    let refuse = |status: &'static str, error: &str| plain((status, serde_json::json!({ "ok": false, "error": error })));
+    // The key, then the meta: `turn_wallet` writes the meta before the key.
+    let key = hub.chia_wallet.lock().unwrap().clone();
+    let meta = *hub.wallet_meta.lock().unwrap();
+    let loaded = key.zip(meta);
+    // Not loaded: a turn holding the lock may be loading it right now.
+    let turning = loaded.is_none() && hub.wallet_turn.try_lock().is_err();
+    match chia_wallet_switch::words_step(ask, loaded, turning) {
+        WordsStep::Refuse(why) => plain(why.answer()),
+        WordsStep::SavedIdempotent => plain(saved_answer(&wallet_switch_view(hub).0, None)),
+        WordsStep::ReadFile { wallet: key, fingerprint } => {
+            let read = tokio::task::spawn_blocking(|| {
+                chia_wallet::reveal_words(std::path::Path::new(chia_wallet_switch::IDENTITY_FILE))
+            })
+            .await;
+            let rev = match read {
+                Ok(Ok(rev)) => rev,
+                // The reader's refusals are fixed sentences that never quote
+                // the file; the page still gets only the fixed answer.
+                Ok(Err(e)) => {
+                    eprintln!("🏦 SSF wallet: the Bank asked for the 24 words, but they could not be read: {e:#}");
+                    return refuse("500 Internal Server Error", BACKUP_UNREADABLE);
+                }
+                Err(e) => {
+                    eprintln!("🏦 SSF wallet: the Bank asked for the 24 words, but reading them stopped ({e})");
+                    return refuse("500 Internal Server Error", BACKUP_UNREADABLE);
+                }
+            };
+            if !chia_wallet_switch::words_match(rev.fingerprint, &rev.wallet, fingerprint, &key.public_key()) {
+                eprintln!(
+                    "🏦 SSF wallet: the Bank asked for the 24 words, but {} no longer makes the wallet in use (key fingerprint {} on disk, {} loaded); nothing is shown",
+                    chia_wallet_switch::IDENTITY_FILE,
+                    rev.fingerprint,
+                    fingerprint
+                );
+                return refuse("500 Internal Server Error", BACKUP_MISMATCH);
+            }
+            // Checked again after the read, under the meta's lock: an I SAVED
+            // that landed meanwhile (another tab's) wins.
+            let landed = chia_wallet_switch::reveal_lands(hub.wallet_meta.lock().unwrap().as_mut(), fingerprint);
+            if let Err(why) = landed {
+                return plain(why.answer());
+            }
+            println!("🏦 SSF wallet: the Bank showed the 24 words (key fingerprint {fingerprint})");
+            ("200 OK", chia_wallet::reveal_body(&rev, &chia_wallet::testnet_address(&key)))
+        }
+        WordsStep::WriteFlag { key: asked } => {
+            let mark = || {
+                if let Some(m) = hub.wallet_meta.lock().unwrap().as_mut() {
+                    if m.fingerprint == asked {
+                        m.backed_up = true;
+                    }
+                }
+                println!(
+                    "🏦 SSF wallet: the player marked the 24 words saved (key fingerprint {asked}); the Bank does not show them again"
+                );
+            };
+            let flag = std::path::Path::new(chia_wallet_switch::SAVED_FILE);
+            let now = chia_resolve::unix_now();
+            let saved = tokio::task::spawn_blocking(move || chia_wallet_switch::remember_saved(flag, asked, now)).await;
+            let failed = match saved {
+                Ok(Ok(())) => {
+                    mark();
+                    return plain(saved_answer(&wallet_switch_view(hub).0, None));
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+            };
+            // A failed save does not show the flag is missing (the replace
+            // can land and the directory sync after it fail): read it back.
+            let reread = tokio::task::spawn_blocking(move || chia_wallet_switch::saved_for(flag, asked))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            match chia_wallet_switch::after_failed_mark(&failed, reread) {
+                FailedMark::Landed { note } => {
+                    mark();
+                    eprintln!("🏦 SSF wallet: the saved mark was written but not confirmed on disk ({failed})");
+                    plain(saved_answer(&wallet_switch_view(hub).0, Some(&note)))
+                }
+                FailedMark::Lost { error } => {
+                    eprintln!("🏦 SSF wallet: the saved mark could not be written ({failed})");
+                    refuse("500 Internal Server Error", &error)
+                }
+            }
+        }
+    }
 }
 
 async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
@@ -5862,7 +6081,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
 
             if req.starts_with("GET /api/fingerprint") {
                 // 🏦 The switch's view first, outside the fingerprint's lock:
-                // it reads the wallet and the seed file on its own.
+                // it reads the wallet and the identity files on its own.
                 let (wallet_view, wallet_address) = wallet_switch_view(&hub_clone);
                 let fp_json = {
                     // 🐛 0.16.0 fix: refresh direct-addr hints from the LIVE endpoint
@@ -5945,10 +6164,53 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
-            } else if req.starts_with("POST /api/chia/wallet") {
+            } else if req.starts_with("POST ")
+                && chia_wallet_switch::is_words_target(req.split_whitespace().nth(1).unwrap_or(""))
+            {
+                // 🏦 The Bank's BACK UP (chia_wallet_switch.rs): show the 24
+                // words of the loaded wallet, or record that the player saved
+                // them. Only the desktop app's own page may ask (`app_page`:
+                // stricter than the switch's `local_page`), or a browser page
+                // whose exact origin SSF_BANK_DEV_PAGES names; the gate runs
+                // before anything reads the identity file. An answer the gate
+                // passed is readable by that one origin only; its refusal by
+                // whatever origin the API grants, so a dev page reads why.
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let origin = origin_header.as_deref();
+                let passed = chia_wallet_switch::app_page(origin, host_header.as_deref(), bound_port, chia_wallet_switch::dev_pages());
+                let allow_origin = chia_wallet_switch::words_allow_origin(passed, origin, origin_ok);
+                if !passed {
+                    let body = serde_json::json!({ "ok": false, "error": chia_wallet_switch::BACKUP_PAGE_ONLY }).to_string();
+                    let head = chia_wallet_switch::words_reply_head("403 Forbidden", allow_origin, body.len());
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                } else {
+                    let bad_ask = || serde_json::json!({ "ok": false, "error": chia_wallet_switch::BACKUP_BAD_ASK }).to_string();
+                    #[cfg(feature = "chia-publish")]
+                    let (status, body) = match chia_wallet_switch::words_asked(target) {
+                        Some(ask) => words_route(&hub_clone, ask).await,
+                        None => ("400 Bad Request", zeroize::Zeroizing::new(bad_ask())),
+                    };
+                    #[cfg(not(feature = "chia-publish"))]
+                    let (status, body) = match chia_wallet_switch::words_asked(target) {
+                        Some(_) => (
+                            "409 Conflict",
+                            serde_json::json!({ "ok": false, "error": chia_wallet_switch::UNBUILT_WORDS }).to_string(),
+                        ),
+                        None => ("400 Bad Request", bad_ask()),
+                    };
+                    // The head and the body apart: the reveal's body holds the
+                    // words and is wiped when dropped, so it is never copied
+                    // into a plain string with its head.
+                    let head = chia_wallet_switch::words_reply_head(status, allow_origin, body.len());
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                }
+            } else if req.starts_with("POST /api/chia/wallet?") || req.starts_with("POST /api/chia/wallet ") {
                 // 🏦 The Bank app's SSF wallet switch (chia_wallet_switch.rs):
-                // `on=1` turns the wallet on now (its seed minted the first
-                // time) and remembers it; `on=0` remembers it off for the next
+                // `on=1` turns the wallet on now (its 24-word identity minted
+                // the first time) and remembers it; `on=0` remembers it off for the next
                 // start. Only this machine's own game page may ask: an allowed
                 // loopback or desktop-app Origin, never a web origin or none,
                 // sent to a loopback Host on this port (no re-bound name).
@@ -5992,8 +6254,13 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else {
-                let response = "HTTP/1.1 404 No Found\r\n\
-                                Connection: close\r\n\r\n";
+                // With the API's CORS answer, so a page that asks an older
+                // node for a route it lacks reads the 404 (and can say the
+                // node is older) instead of a failed fetch.
+                let response = format!(
+                    "HTTP/1.1 404 No Found\r\n\
+                     {cors_origin}Connection: close\r\n\r\n"
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
