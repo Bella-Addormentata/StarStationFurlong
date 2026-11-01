@@ -3610,3 +3610,78 @@ fn its_own_record_deleted_again_goes_back_once_every_reput_ms() {
     }
     assert_eq!(back, 2, "twice in {} ms", 2 * REPUT_MS);
 }
+
+/// A copy of the setting the house plays by, padded so a page may read it
+/// otherwise, holds its table and goes back clean, as a newer one does:
+/// on every pass the doc holds it so, a pass another table's check put off
+/// before the table loop included.
+#[test]
+fn a_padded_copy_of_the_setting_it_holds_holds_its_table_and_goes_back_clean() {
+    for put_off in [false, true] {
+        let mut room = Room::new(&format!("padded-held-setting-{put_off}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.set_fair(0, 1);
+        room.tick(200);
+        let key = format!("hf:{T}");
+        let rec = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+        let tkey = (T.to_string(), INC.to_string());
+        assert!(room.house.rooms[ROOM].fair.contains_key(T), "held");
+        room.tick(REPUT_MS);
+        // A copy padded so a page may read it otherwise; and (put_off) a
+        // newer setting at another table, whose check puts the first pass
+        // off before any table is read.
+        room.put_top_padded(&key, &rec, Any::Undefined);
+        let passes = if put_off {
+            const T2: &str = "roulette-2";
+            second_table(&room);
+            let other = room_signed("hfair", T2, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+            room.put_top(&format!("hf:{T2}"), &other);
+            2
+        } else {
+            1
+        };
+        room.tick_passes(TICK_MS, passes);
+        assert!(clean(room.raw_top(&key), &rec), "{put_off}: back clean");
+        assert!(room.house.rooms[ROOM].tables[&tkey].held_since.is_some(), "{put_off}: the table waited");
+        room.tick(TICK_MS);
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{put_off}: and plays on");
+    }
+}
+
+/// Many slips and seeds for one player cost a read their count, not its
+/// square: each seed's commitment is hashed once a read (a seed a page may
+/// read otherwise too), and a seed of a player with no slip there not at
+/// all; deciding a Friendly close looks the seeds up.
+#[test]
+fn a_players_many_slips_and_seeds_are_hashed_once_each() {
+    let mut room = Room::new("seeds-squared", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    room.set_fair(1, 1);
+    room.tick(200);
+    assert_eq!(room.records("h:2:").len(), 1, "stepped down: Friendly");
+    // Round 2 closed, bob's seed in, alice's not: the fold waits on it.
+    let (a2, b2) = (room.slip(&alice, 2), room.slip(&bob, 2));
+    room.close(&alice, 2, &c, &[("alice", &a2), ("bob", &b2)], None);
+    room.reveal(&bob, 2);
+    const N: usize = 200;
+    for i in 0..N {
+        let b = CVal::Arr(vec![obj(vec![("type", s("red")), ("amount", CVal::Int(1 + i as i64))])]);
+        let c = format!("{i:064x}");
+        room.put('s', &signed("slip", &alice, obj(vec![("r", CVal::Int(2)), ("p", s("alice")), ("v", CVal::Int(1)), ("b", b), ("c", s(&c))])));
+        let seed = |p: &str, j: usize| obj(vec![("r", CVal::Int(2)), ("p", s(p)), ("s", s(&format!("{j:064x}")))]);
+        room.put('x', &seed("alice", i + N));
+        room.put_padded('x', &seed("alice", i + 2 * N), Any::String(Arc::from("x")));
+        room.put('x', &seed("carol", i));
+    }
+    room.tick(200);
+    room.tick(TICK_MS);
+    hb::COMMITS_HASHED.with(|n| n.set(0));
+    room.tick_passes(TICK_MS, 1);
+    let hashed = hb::COMMITS_HASHED.with(|n| n.get());
+    assert!(hashed <= 2 * N + 8, "{hashed} commitments hashed in a pass");
+}

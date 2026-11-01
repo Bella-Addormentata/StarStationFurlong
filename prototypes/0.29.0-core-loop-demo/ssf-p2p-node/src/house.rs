@@ -527,6 +527,10 @@ struct TableRead {
     slips: HashMap<String, Slip>,
     /// (round, pid) → the seeds revealed.
     seeds: HashMap<(i64, String), Vec<String>>,
+    /// (round, pid) → the commitments of slips there its seeds open: each
+    /// seed hashed once, and only for a round and player a slip here has
+    /// ([`TableRead::opens`]).
+    opened: HashMap<(i64, String), HashSet<String>>,
     /// Closes the pages' fold takes as eligible (computedFold compute, step
     /// 1), by round: signed by one of the slips they freeze, under a parent
     /// decided at the round before (the session, for the first), naming
@@ -558,6 +562,7 @@ impl TableRead {
             ses_key: String::new(),
             slips: HashMap::new(),
             seeds: HashMap::new(),
+            opened: HashMap::new(),
             closes: Vec::new(),
             top: 0,
             abandoned: HashSet::new(),
@@ -565,6 +570,11 @@ impl TableRead {
             joins: Vec::new(),
             me,
         }
+    }
+
+    /// Whether a seed here opens slip `s` (its round and player's).
+    fn opens(&self, s: &Slip) -> bool {
+        self.opened.get(&(s.r, s.pid.clone())).is_some_and(|cs| cs.contains(&s.c))
     }
 
     fn closes_at(&self, r: i64) -> impl Iterator<Item = &Close> {
@@ -1218,6 +1228,16 @@ impl House {
             {
                 continue;
             }
+            // The setting it plays by, as a copy a page may read otherwise:
+            // the table waits, and it goes back clean, on every pass the
+            // doc holds it so (whatever put off the pass that first took
+            // it: a check at another table, say).
+            if self.rooms[room].fair.get(t.as_str()).is_some_and(|was| hb::rec_hash(was) == hb::rec_hash(&v)) {
+                if clarity != hb::Clarity::Clear {
+                    unclear_at.insert(t.clone());
+                }
+                continue;
+            }
             if self.rooms[room].fair.get(t.as_str()).is_some_and(|was| !fair_after(&v, was)) {
                 continue;
             }
@@ -1470,6 +1490,7 @@ impl House {
             ses_key,
             slips: HashMap::new(),
             seeds: HashMap::new(),
+            opened: HashMap::new(),
             closes: Vec::new(),
             top: base_u,
             abandoned: HashSet::new(),
@@ -1610,6 +1631,18 @@ impl House {
             }
         }
 
+        // Which slips the seeds here open: each seed hashed once, and only
+        // for a round and player a slip here has (a peer's many slips and
+        // seeds for one player cost a read their count, not its square).
+        let wanted: HashSet<(i64, &str)> = read.slips.values().map(|s| (s.r, s.pid.as_str())).collect();
+        let mut opened: HashMap<(i64, String), HashSet<String>> = HashMap::new();
+        for ((r, pid), ss) in &read.seeds {
+            if wanted.contains(&(*r, pid.as_str())) {
+                opened.entry((*r, pid.clone())).or_default().extend(ss.iter().map(|x| hb::slip_commit(&read.ctx, *r, pid, x)));
+            }
+        }
+        read.opened = opened;
+
         // The houses' records count as each signed them: a peer's copy under
         // this house's key (a reveal of a high round, say) would stop it
         // joining and revealing; under another's, change what a round may
@@ -1677,8 +1710,10 @@ impl House {
             }
         }
         // A seed a page may not have: one opening a slip there.
+        // (Each hashed once, its slips looked up.)
+        let commits: HashSet<(i64, &str, &str)> = read.slips.values().map(|s| (s.r, s.pid.as_str(), s.c.as_str())).collect();
         for (r, pid, seed, key, v) in unclear_seeds {
-            if read.slips.values().any(|s| s.r == r && s.pid == pid && hb::slip_commit(&read.ctx, r, &pid, &seed) == s.c) {
+            if commits.contains(&(r, pid.as_str(), hb::slip_commit(&read.ctx, r, &pid, &seed).as_str())) {
                 self.heal(&ses_name, &key, v);
             }
         }
@@ -1841,7 +1876,7 @@ impl House {
                 _ => missing += 1,
             }
         }
-        let seeded = |p: &str, s: &Slip| read.seeds.get(&(c.r, p.to_string())).is_some_and(|ss| ss.iter().any(|x| hb::slip_commit(ctx, c.r, p, x) == s.c));
+        let seeded = |_: &str, s: &Slip| read.opens(s);
         let mut decided = None;
         if let Some(h) = &c.h {
             let mut cands: Vec<&Reveal> = read.reveals.iter().filter(|e| e.r == c.r && e.commit == *h && e.x.contains(&c.hash)).collect();
@@ -1922,10 +1957,7 @@ impl House {
             if mem.seed_seen.contains_key(hash) {
                 continue;
             }
-            let opens = read.seeds.get(&(slip.r, slip.pid.clone())).is_some_and(|ss| {
-                ss.iter().any(|s| hb::slip_commit(ctx, slip.r, &slip.pid, s) == slip.c)
-            });
-            if opens {
+            if read.opens(slip) {
                 mem.seed_seen.insert(hash.clone(), now);
             }
         }

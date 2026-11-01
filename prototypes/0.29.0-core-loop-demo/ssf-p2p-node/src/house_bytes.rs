@@ -46,6 +46,8 @@ thread_local! {
     pub static UTF8_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The keys `typed_array_key` has looked at on this thread (tests).
     pub static TYPED_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The commitments [`slip_commit`] has hashed on this thread (tests).
+    pub static COMMITS_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How sure a page's reading of a value is to be [`CVal::from_any`]'s.
@@ -499,6 +501,8 @@ pub fn duty_rank(duty: &str, ctx: &Ctx, round: i64, pub_key: &str) -> String {
 /// computedFold slipCommit: sha256 hex of diceFairness tableCommitMessage
 /// (`ssf-table-commit-v3|room|table|round|party|house|seed`, house '').
 pub fn slip_commit(ctx: &Ctx, r: i64, party: &str, seed: &str) -> String {
+    #[cfg(test)]
+    COMMITS_HASHED.with(|n| n.set(n.get() + 1));
     sha256_hex(&format!("ssf-table-commit-v3|{}|{}|{r}|{party}||{seed}", ctx.room, ctx.seed_table()))
 }
 
