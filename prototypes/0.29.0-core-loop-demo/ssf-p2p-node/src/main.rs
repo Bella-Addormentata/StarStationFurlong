@@ -5659,9 +5659,20 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         hub.wallet_switch.lock().unwrap().error = Some(why.clone());
         Err(why)
     };
+    // A save that failed: the memo takes what the file now holds, read back,
+    // and the words say so (chia_wallet_switch::after_failed_save).
+    let failed_save = |target: bool, e: std::io::Error, lead: &str| -> String {
+        let previous = hub.wallet_switch.lock().unwrap().remembered;
+        let (remembered, why) =
+            chia_wallet_switch::after_failed_save(target, &e.to_string(), chia_wallet_switch::remembered(switch_path), previous);
+        let why = format!("{lead}{why}");
+        eprintln!("🏦 SSF wallet: {why}");
+        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()) };
+        why
+    };
     if !on {
         if let Err(e) = chia_wallet_switch::remember(switch_path, false, now) {
-            return fail(format!("the switch could not be saved ({e}), so the wallet would come back at the next start"));
+            return Err(failed_save(false, e, ""));
         }
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
         println!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start");
@@ -5696,15 +5707,13 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
                 Ok(())
             }
             Err(e) => {
-                let why = format!("the wallet is on for this run, but the switch could not be saved ({e}), so it starts off next time");
-                eprintln!("🏦 SSF wallet: {why}");
-                *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: Some(why) };
+                failed_save(true, e, "the wallet is on for this run, but ");
                 Ok(())
             }
         };
     }
     if let Err(e) = chia_wallet_switch::remember(switch_path, true, now) {
-        return fail(format!("the switch could not be saved ({e}), so the wallet starts off next time"));
+        return Err(failed_save(true, e, ""));
     }
     *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
     println!("🏦 SSF wallet: kept on in the Bank — it is back on at the next start");

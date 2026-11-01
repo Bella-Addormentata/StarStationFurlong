@@ -5230,6 +5230,14 @@ function renderBankApp(): void {
     // itself, from where ↓ reaches the first button. Nothing acts on a phone
     // that is put away: a control left focused inside it still receives keys.
     view.addEventListener("keydown", (e) => {
+      // 🏦 A held Enter repeats its keydown, and each one activates the
+      // focused button: on the wallet switch that would CONFIRM what CREATE
+      // just armed, then TURN OFF what CONFIRM turned on. Only a fresh press
+      // counts there.
+      if (e.repeat && (e.key === "Enter" || e.key === " ") && (e.target as HTMLElement | null)?.id === BANK_WALLET_BUTTON_ID) {
+        e.preventDefault();
+        return;
+      }
       if (!treasuryViewOnScreen(view)) return;
       if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
       const stops = [...view.querySelectorAll<HTMLElement>("button:not([disabled])")].filter((el) => el.offsetParent !== null);

@@ -91,9 +91,11 @@ fn read_seed(path: &Path) -> Result<[u8; SEED_LEN]> {
 /// synced), which is then hard-linked to the seed's name. A link never
 /// replaces an existing file: when two minters race, the second finds the
 /// first one's seed and loads that, so nobody holds a key whose seed is gone
-/// (its address shown, funded, and orphaned at the next start). A filesystem
-/// without hard links gets the seed created in place, still never over an
-/// existing one.
+/// (its address shown, funded, and orphaned at the next start). A folder
+/// whose filesystem cannot hard-link (exFAT, FAT) gets no seed at all: writing
+/// the seed's own name directly would show a half-written seed to a racing
+/// minter, and a stop mid-write would leave a short one, so the mint fails
+/// closed and says to run the node from a folder on the system drive.
 fn mint_seed(path: &Path) -> Result<[u8; SEED_LEN]> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut fresh = [0u8; SEED_LEN];
@@ -113,19 +115,28 @@ fn mint_seed(path: &Path) -> Result<[u8; SEED_LEN]> {
         Ok(()) => {}
         // Another minter's seed got there first: it is the identity.
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return read_seed(path),
-        Err(_) => match write_new(path, &fresh) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => return read_seed(path),
-            Err(e) => return Err(e).with_context(|| format!("writing chia identity seed {}", path.display())),
-        },
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "installing chia identity seed {} (this folder's filesystem may not hard-link files, \
+                     as exFAT and FAT cannot; run the node from a folder on the system drive)",
+                    path.display()
+                )
+            })
+        }
     }
-    // The new name is directory metadata: sync it so a power loss right after
-    // cannot lose the seed of a wallet whose address was just shown. Windows
-    // has no directory handle to sync; NTFS journals the link.
-    #[cfg(unix)]
-    let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
     // Best-effort lock-down of the secret file (no-op on Windows).
     restrict_permissions(path);
+    // The new name is directory metadata: sync it so a power loss right after
+    // cannot lose the seed of a wallet whose address is about to be shown. A
+    // failed sync fails the mint, as in `chia_contact::write_private`: no
+    // address is shown for a seed that may not survive, and the next attempt
+    // loads the seed now on disk. Windows has no directory handle to sync;
+    // NTFS journals the link.
+    #[cfg(unix)]
+    std::fs::File::open(&dir).and_then(|d| d.sync_all()).with_context(|| {
+        format!("syncing chia identity dir {} (the seed is written; turning the wallet on again loads it)", dir.display())
+    })?;
     Ok(fresh)
 }
 

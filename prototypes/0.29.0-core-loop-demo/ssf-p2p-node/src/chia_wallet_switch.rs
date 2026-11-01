@@ -149,6 +149,34 @@ pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
     crate::chia_contact::write_private(path, &bytes)
 }
 
+/// What the switch holds after a save of `target` failed with `err`, and how
+/// to say so: read back from the file (`reread`), because a failed save does
+/// not show the old value is still there (the replace can land and the
+/// directory sync after it fail). Unreadable, the memo keeps `previous` and
+/// says it does not know.
+pub fn after_failed_save(target: bool, err: &str, reread: Result<bool, String>, previous: bool) -> (bool, String) {
+    match reread {
+        Ok(now) if now == target => (
+            now,
+            format!(
+                "the switch was written but not confirmed on disk ({err}), so the wallet should {} at the next start",
+                if target { "come back on" } else { "stay off" }
+            ),
+        ),
+        Ok(now) => (
+            now,
+            format!(
+                "the switch could not be saved ({err}), so the wallet {} at the next start",
+                if now { "comes back on" } else { "starts off" }
+            ),
+        ),
+        Err(read) => (
+            previous,
+            format!("the switch could not be saved ({err}) or read back ({read}), so whether the wallet is on at the next start is not known"),
+        ),
+    }
+}
+
 /// The switch's state as the Bank reads it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -367,6 +395,21 @@ mod tests {
             assert_eq!(left, vec![std::ffi::OsString::from(SWITCH_FILE)], "no temporary file left behind");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_reports_what_the_file_holds_not_what_was_asked() {
+        let (on, why) = after_failed_save(true, "dir sync failed", Ok(true), false);
+        assert!(on && why.contains("not confirmed") && why.contains("come back on"), "{why}");
+        let (on, why) = after_failed_save(true, "disk full", Ok(false), false);
+        assert!(!on && why.contains("starts off"), "{why}");
+        let (on, why) = after_failed_save(false, "disk full", Ok(true), true);
+        assert!(on && why.contains("comes back on"), "an off that did not land leaves it on: {why}");
+        let (on, why) = after_failed_save(false, "dir sync failed", Ok(false), true);
+        assert!(!on && why.contains("stay off"), "{why}");
+        let (on, why) = after_failed_save(true, "disk full", Err("unreadable".into()), true);
+        assert!(on && why.contains("not known"), "unreadable keeps the memo: {why}");
+        assert!(!after_failed_save(true, "x", Err("y".into()), false).0);
     }
 
     #[test]
