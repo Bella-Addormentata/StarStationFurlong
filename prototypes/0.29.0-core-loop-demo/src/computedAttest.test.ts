@@ -21,7 +21,7 @@ import {
   loadPage, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_TABLE as TABLE, run, signAs, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { red, testIdentity } from './computedTestKit';
+import { ComputedKit, red, testIdentity } from './computedTestKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -409,7 +409,7 @@ describe('🏛️🧮 F — the owner-signed checkpoint takes part in restores',
     expect(a.casino.houseDeedChanged()).toBe(true);
     expect(b.casino.houseDeedChanged()).toBe(true);
     // The new holder B signs a checkpoint of the same round-1 trim.
-    const A1b = signAs(b, 'hsum', { v: 1, b: P1.b, u: P1.u, l: P1.l, n: P1.n, a: 0 }, CTX);
+    const A1b = signAs(b, 'hsum', { v: 1, b: P1.b, u: P1.u, l: P1.l, n: P1.n, a: 0 }, CTX) as HouseSum;
     b.casino.writeHouseSum(TABLE, INC, A1b);
     // A peer deletes the checkpoint; a fresh page loads after the handover.
     const cheat = await withCheat(pages, Date.now());
@@ -426,4 +426,93 @@ describe('🏛️🧮 F — the owner-signed checkpoint takes part in restores',
     expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(A1b)));
     expect(recHash(recoveryOf(a).head)).not.toBe(recHash(recoveryOf(c).head));
   }, 40_000);
+});
+
+// ── 🏛️ C4 — the hs: forger, and the 'split' comparison ───────────────────────
+
+// The forgeries a cheat can write without the owner's key: a wrong-key one
+// (its own, claiming the deed holder's), a bad signature under the owner's
+// key, and a replay of an older, real owner checkpoint (worse by the order).
+// A higher-round owner checkpoint can't be forged (no owner key), so none of
+// these unseats the owner's best, nor takes part in a restore (houseSumTakes-
+// Part: wrong authority, or never counted; the replay loses the order). D3
+// puts the best back; B12's stand-down is pinned above.
+describe('🏛️🧮 the hs: forger — D3 keeps the owner’s checkpoint', () => {
+  it('a wrong-key hs: (a stranger claiming to be the owner) is overwritten with the owner’s', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    const at = playAndTrim(pages, T0, 1);
+    const A = hsOf(a)!;
+    const good = top(a).get(HS);
+    const stranger = testIdentity('stranger');
+    const body = { v: 1 as const, b: A.b, u: A.u, l: A.l, n: A.n, a: 0, k: stranger.pub };
+    const forged = { ...body, g: stranger.sign(a.fold.signBytes('hsum', CTX, body)) };
+    b.doc.transact(() => top(b).set(HS, forged));
+    sync(at, a, b);
+    expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(A); // the stranger never takes part
+    const back = run([a, b], at + STEP, at + 8_000, { step: STEP, until: () => [a, b].every((p) => recHash(top(p).get(HS)) === recHash(good)) });
+    expect(back).toBeLessThanOrEqual(at + 8_000);
+    expect(recHash(top(b).get(HS))).toBe(recHash(good));
+  }, 30_000);
+
+  it('a bad-signature hs: under the owner’s key is overwritten', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    const at = playAndTrim(pages, T0, 1);
+    const A = hsOf(a)!;
+    const good = top(a).get(HS);
+    const forged = { ...A, g: 'A'.repeat(86) }; // shape-valid, verification fails
+    b.doc.transact(() => top(b).set(HS, forged));
+    sync(at, a, b);
+    expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(A);
+    const back = run([a, b], at + STEP, at + 8_000, { step: STEP, until: () => [a, b].every((p) => recHash(top(p).get(HS)) === recHash(good)) });
+    expect(back).toBeLessThanOrEqual(at + 8_000);
+    expect(recHash(top(b).get(HS))).toBe(recHash(good));
+  }, 30_000);
+
+  it('a replay of an older owner checkpoint is overwritten by the best counted', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    const at1 = playAndTrim(pages, T0, 1);
+    const A1 = top(a).get(HS); // the round-1 checkpoint
+    const at2 = playAndTrim(pages, at1, 1);
+    const A2 = hsOf(a)!;
+    const A2val = top(a).get(HS);
+    expect(A2.u).toBe(2);
+    b.doc.transact(() => top(b).set(HS, JSON.parse(JSON.stringify(A1)))); // replay the older one
+    sync(at2, a, b);
+    expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(A2); // the newer stays the best
+    const back = run([a, b], at2 + STEP, at2 + 8_000, { step: STEP, until: () => [a, b].every((p) => recHash(top(p).get(HS)) === recHash(A2val)) });
+    expect(back).toBeLessThanOrEqual(at2 + 8_000);
+    expect(recHash(top(b).get(HS))).toBe(recHash(A2val));
+  }, 30_000);
+});
+
+describe('🏛️🧮 E — a checkpoint naming another close reads covered: split', () => {
+  it('a forged `l` for a round this page saw decided reads split, not a silent 0', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const { at } = decideRound(pages, T0 + STEP); // round 1 decided, every page folds its close
+    // A couple of frames so the fold the table last noted (st.lastRes, what
+    // the next move compares against) is the one that saw round 1 decided,
+    // not the close-before-reveals fold the run stopped on.
+    const settled = run(pages, at + STEP, at + 3 * STEP, { step: STEP });
+    const res1 = a.casino.computedFoldOf(TABLE)!;
+    const real = res1.rounds.find((v) => v.r === 1)!.close;
+    const forgedClose = real === L_HEX ? 'b'.repeat(32) : L_HEX; // any other shape-valid close
+    const kit = new ComputedKit(CTX);
+    const cp = kit.checkpoint(testIdentity('cheat'), res1.base.sid, 1, forgedClose, Object.fromEntries(res1.nets));
+    const sid = kit.sidAfter(cp);
+    // A cheat trims round 1 with a close this page never saw.
+    a.doc.transact(() => {
+      const m = top(a);
+      m.set(SUM, cp);
+      for (const k of [...m.keys()]) if (k.startsWith(`ses:${TABLE}:${INC}:`)) m.delete(k);
+      m.set(sesKey(sid), new Y.Map());
+    });
+    run([a], settled + STEP, settled + STEP, { step: STEP });
+    const v = a.table.computedCheckpointView(TABLE)!;
+    expect(v.round).toBe(1);
+    expect(v.covered).toBe('split');
+  }, 30_000);
 });
