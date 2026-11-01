@@ -5581,19 +5581,25 @@ fn header_value(req: &str, name: &str) -> Option<String> {
 }
 
 /// 🏦 The SSF wallet switch as the fingerprint shows it (chia_wallet_switch.rs).
-fn wallet_switch_view(hub: &HubState) -> chia_wallet_switch::WalletSwitch {
+fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Option<String>) {
     #[cfg(feature = "chia-publish")]
     {
-        let loaded = hub.chia_wallet.lock().unwrap().is_some();
+        // One read of the key for both the switch's state and the address,
+        // and the key before the memo: `turn_wallet` writes the memo before
+        // the key, so no answer pairs a loaded key with the memo from before
+        // the turn (KEEP IT ON for a wallet that was just saved on).
+        let key = hub.chia_wallet.lock().unwrap().clone();
         let memo = hub.wallet_switch.lock().unwrap().clone();
+        let loaded = key.is_some();
         let seed = !loaded && std::path::Path::new(chia_wallet_switch::SEED_FILE).try_exists().unwrap_or(false);
-        chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, seed)
+        let view = chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, seed);
+        (view, key.as_ref().map(chia_wallet::testnet_address))
     }
     #[cfg(not(feature = "chia-publish"))]
     {
         let _ = hub;
         let memo = chia_wallet_switch::SwitchMemo::default();
-        chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, false)
+        (chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, false), None)
     }
 }
 
@@ -5697,20 +5703,24 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             let _gate = chia_publish::WALLET_LEASE.lock().await;
             chia_publish::WALLET_LEASE.restore(std::path::Path::new(chia_wallet_switch::LEASE_FILE));
         }
-        let remembered = chia_wallet_switch::remember(switch_path, true, now);
-        *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
-        start_publisher(hub, iroh_endpoint, chia_sk);
-        return match remembered {
+        // The memo before the key: the fingerprint reads the key, then the
+        // memo (wallet_switch_view), so every answer is one wallet state.
+        let saved = match chia_wallet_switch::remember(switch_path, true, now) {
             Ok(()) => {
                 *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
-                println!("🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start");
-                Ok(())
+                true
             }
             Err(e) => {
                 failed_save(true, e, "the wallet is on for this run, but ");
-                Ok(())
+                false
             }
         };
+        *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
+        start_publisher(hub, iroh_endpoint, chia_sk);
+        if saved {
+            println!("🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start");
+        }
+        return Ok(());
     }
     if let Err(e) = chia_wallet_switch::remember(switch_path, true, now) {
         return Err(failed_save(true, e, ""));
@@ -5853,7 +5863,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
             if req.starts_with("GET /api/fingerprint") {
                 // 🏦 The switch's view first, outside the fingerprint's lock:
                 // it reads the wallet and the seed file on its own.
-                let wallet_view = wallet_switch_view(&hub_clone);
+                let (wallet_view, wallet_address) = wallet_switch_view(&hub_clone);
                 let fp_json = {
                     // 🐛 0.16.0 fix: refresh direct-addr hints from the LIVE endpoint
                     // view on every request. Portmapper mappings, QAD-observed and
@@ -5882,13 +5892,14 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                         fp.share_card = hub_clone.contact_key_durable && chia_contact::share_card_enabled();
                     }
                     fp.chia_wallet = Some(wallet_view);
+                    fp.chia_address = wallet_address;
                     // ⛓️🏦 The wallet's receive address, live too: a wallet is
                     // loaded at startup or when the Bank turns it on, and this
                     // is the one place the browser learns where its node is
                     // paid (never a pass, never a card).
+                    // (Set with the switch's view above, from the same read.)
                     #[cfg(feature = "chia-publish")]
                     {
-                        fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
                         // 📖 And the Phone Book listing state the publisher
                         // mirrored on its last tick, for the top bar's icon.
                         fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
@@ -5953,10 +5964,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                         let _ = on;
                         Err(chia_wallet_switch::UNBUILT_WORDS.to_string())
                     };
-                    match turned {
-                        Ok(()) => ("200 OK", serde_json::json!({ "ok": true, "wallet": wallet_switch_view(&hub_clone) })),
-                        Err(error) => ("409 Conflict", serde_json::json!({ "ok": false, "error": error, "wallet": wallet_switch_view(&hub_clone) })),
-                    }
+                    chia_wallet_switch::turn_answer(turned, &wallet_switch_view(&hub_clone).0)
                 } else {
                     ("400 Bad Request", serde_json::json!({ "ok": false, "error": "ask with on=1 or on=0" }))
                 };

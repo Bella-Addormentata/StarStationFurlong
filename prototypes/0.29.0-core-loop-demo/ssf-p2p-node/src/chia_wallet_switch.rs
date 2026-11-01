@@ -177,6 +177,16 @@ pub fn after_failed_save(target: bool, err: &str, reread: Result<bool, String>, 
     }
 }
 
+/// The route's answer to a turn: its status line and body, with the switch's
+/// view after the turn as `wallet` (the Bank reads `ok` and `error`; the view
+/// rides along for anything that wants the state without a second request).
+pub fn turn_answer(turned: Result<(), String>, wallet: &WalletSwitch) -> (&'static str, serde_json::Value) {
+    match turned {
+        Ok(()) => ("200 OK", serde_json::json!({ "ok": true, "wallet": wallet })),
+        Err(error) => ("409 Conflict", serde_json::json!({ "ok": false, "error": error, "wallet": wallet })),
+    }
+}
+
 /// The switch's state as the Bank reads it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -395,6 +405,20 @@ mod tests {
             assert_eq!(left, vec![std::ffi::OsString::from(SWITCH_FILE)], "no temporary file left behind");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_turn_answers_ok_or_the_refusal_with_the_switch_as_an_object() {
+        let on = WalletSwitch { state: WalletState::On, seed: false, stays: true, held: false, error: None };
+        let (status, body) = turn_answer(Ok(()), &on);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body.to_string(), r#"{"ok":true,"wallet":{"state":"on","stays":true}}"#);
+        let off = WalletSwitch { state: WalletState::Off, seed: false, stays: false, held: false, error: None };
+        let (status, body) = turn_answer(Err(OFF_WORDS.to_string()), &off);
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], OFF_WORDS);
+        assert_eq!(body["wallet"], serde_json::json!({ "state": "off" }));
     }
 
     #[test]
