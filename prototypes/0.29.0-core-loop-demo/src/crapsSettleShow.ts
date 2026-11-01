@@ -32,12 +32,14 @@ export interface SpotSettle {
 
 /** A bettor's roll, spot by spot (by spotKey). `credited`: everything the
  *  roll hands them (the owner-run record's payout); `net`: won less lost
- *  (a computed table's amount); `decided`: some spot of theirs had a
- *  decision (not every bet just stayed up). */
+ *  (a computed table's amount); `kept`: the stake still riding after it
+ *  (a bet that travelled counted where it went); `decided`: some spot of
+ *  theirs had a decision (not every bet just stayed up). */
 export interface BettorSettle {
   spots: Map<string, SpotSettle>;
   credited: number;
   net: number;
+  kept: number;
   decided: boolean;
 }
 
@@ -100,11 +102,15 @@ export function crapsBettorSettle(bets: readonly CrapsBet[], d1: number, d2: num
   }
   let credited = 0;
   let net = 0;
+  // (Every bet with a decision comes off whole, a paid bet that stays up
+  // and one with none ride on.)
+  let kept = bets.reduce((a, b) => a + b.amount, 0);
   for (const s of spots.values()) {
     credited += s.back + s.won;
     net += s.won - s.lost;
+    kept -= s.back + s.lost;
   }
-  return { spots, credited, net, decided };
+  return { spots, credited, net, kept, decided };
 }
 
 /** Stakes by spot. */
@@ -166,7 +172,8 @@ export const SETTLE_STACK_MAX = 20;
 /** What the table's shared settled record says a bettor got, against what
  *  the rules make of the felt as shown. */
 export interface SettleVerdict {
-  /** The record agrees with `s` (the felt as shown is the one it settled). */
+  /** The record agrees with `s` (the felt as shown is the one it settled).
+   *  (A felt after that doesn't keep what the rules keep never does.) */
   agrees(pid: string, s: BettorSettle): boolean;
   /** The record paid the bettor nothing back (a forfeit, a loss). */
   paidNothing(pid: string): boolean;
@@ -175,8 +182,9 @@ export interface SettleVerdict {
 export interface SettleInput {
   /** Each bettor's felt as the roll played it (as shown before the result). */
   before: Record<string, CrapsBet[]>;
-  /** …and as it stands after (what rides on: what left a bettor's felt
-   *  when their record disagrees with the rules). */
+  /** …and as it stands after (what rides on: it must ride on as the rules
+   *  say for the record to agree, and what left a bettor's felt is what
+   *  moves when it doesn't). */
   after: Record<string, CrapsBet[]>;
   /** The before felt's stacks as drawn (layoutStacks, tagged pid / spot). */
   stacks: readonly FeltStack[];
@@ -207,7 +215,10 @@ export function crapsSettleMoves(i: SettleInput): SettleMoves {
   let order = 0;
   for (const pid of pids) {
     const settle = crapsBettorSettle(i.before[pid], d1, d2, i.pointBefore);
-    const agrees = i.verdict.agrees(pid, settle);
+    // (A forfeit can take a bet the rules leave riding at no cost to the
+    // record's credit: what rides on has to match too.)
+    const rides = (i.after[pid] ?? []).reduce((a, b) => a + b.amount, 0);
+    const agrees = rides === settle.kept && i.verdict.agrees(pid, settle);
     const allLost = !agrees && i.verdict.paidNothing(pid);
     if (!agrees && !allLost) continue;
     const had = stakes(i.before[pid]);

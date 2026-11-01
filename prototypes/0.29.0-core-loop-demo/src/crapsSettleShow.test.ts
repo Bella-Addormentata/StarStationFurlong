@@ -73,6 +73,7 @@ describe('a bettor’s roll, spot by spot', () => {
           const ctx = `${JSON.stringify(felt)} @ ${point} rolled ${d1}${d2}`;
           expect(got.credited, ctx).toBe(credited);
           expect(got.net, ctx).toBe(credited + stays - stake);
+          expect(got.kept, ctx).toBe(stays);
           // Every chip of a spot comes back, goes to the house, or stays.
           for (const [k, sp] of got.spots) {
             const had = felt.filter((b) => key(b) === k).reduce((a, b) => a + b.amount, 0);
@@ -204,6 +205,18 @@ describe('the settle’s chip moves', () => {
       verdict: { agrees: () => false, paidNothing: (pid) => pid === 'a' },
     }));
     expect(m.lost.map((s) => [s.pid, s.spot])).toEqual([['a', 'pass:'], ['a', 'place:6']]);
+    expect(m.back).toEqual([]);
+    expect(m.paid).toEqual([]);
+  });
+
+  it('a bet the rules leave riding but the record took (a forfeit on a point set) goes to the house, though the credit agrees', () => {
+    const before = { a: [bet('pass', 10)], b: [bet('pass', 5)] };
+    // Both credited nothing (the point is set), but a's pass line is gone.
+    const after = { b: [bet('pass', 5)] };
+    const m = crapsSettleMoves(input(before, after, [2, 4], null, {
+      verdict: { agrees: (_pid, s) => s.credited === 0, paidNothing: () => true },
+    }));
+    expect(m.lost.map((s) => [s.pid, s.spot, s.chips])).toEqual([['a', 'pass:', [5, 5]]]);
     expect(m.back).toEqual([]);
     expect(m.paid).toEqual([]);
   });

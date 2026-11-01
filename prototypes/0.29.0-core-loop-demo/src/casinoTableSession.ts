@@ -297,12 +297,14 @@ interface TableRuntime {
    *  (decidedTo: a roll held again after its result, or shown again from
    *  before this page looked, lays no felt as it played); the settles whose
    *  chip moves have played (paid, by SettleRecord key: the same decision
-   *  shown again plays nothing); and whether the roll on screen is closed
-   *  with its result still to show here (crapsRollInPlay). */
+   *  shown again plays nothing); whether the roll on screen is closed with
+   *  its result still to show here (inPlay); and the most my rail shows
+   *  (railCap, crapsRailCap), kept here, focused or not. */
   played: Map<number, { bets: Record<string, CrapsBet[]>; stacks: FeltStack[]; point: number | null }>;
   decidedTo: number;
   paid: Set<string>;
   inPlay: boolean;
+  railCap: number | null;
   /** Doc changed since the felt was last laid out. */
   dirty: boolean;
 }
@@ -316,7 +318,7 @@ function runtime(tableId: string): TableRuntime {
     rt = {
       epoch: casinoDocEpoch(), primed: false, thrownSeed: null, landedRound: 0, spunRound: 0, computed: null, counted: false,
       spun: new Map(), flight: null, landed: new Map(), openShow: null, reopened: null, played: new Map(), decidedTo: 0, paid: new Set(),
-      inPlay: false,
+      inPlay: false, railCap: null,
       dirty: true,
     };
     runtimes.set(tableId, rt);
@@ -668,6 +670,7 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
     }
     h.diceLand(s.dice);
   }
+  noteDecided(rt, s);
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   const kind: TableKind = 'craps-table';
   if (!animating) {
@@ -693,15 +696,32 @@ function driveCraps(id: string, h: CasinoTableVisualHandle, rt: TableRuntime, me
   rt.inPlay = s.phase === 'closing' || animating || h.payingMe();
 }
 
+/** 💰 Note how far a craps table's rolls are past a result here, every
+ *  frame (dice in the air or not): every roll before the one on screen, the
+ *  one on screen once it shows its result, and the one a computed record
+ *  shows decided (`carried`). Only a roll after that lays a felt as it
+ *  played (layCrapsFelt). */
+function noteDecided(rt: TableRuntime, s: CrapsTableState, carried = 0): void {
+  rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, carried);
+}
+
+/** 💰 The most my rail at a craps table shows, kept every frame whether
+ *  the table is focused or not: my balance while no roll is in play here;
+ *  while one is, what I had at the last frame before (or when I first saw
+ *  it), lower if my balance dropped since. What the roll pays joins the
+ *  rail as its chips land there, even a credit that came between frames,
+ *  or before the table was focused. */
+function holdRail(rt: TableRuntime, me: string): void {
+  const balance = readChips(me);
+  rt.railCap = !rt.inPlay || rt.railCap === null ? balance : Math.min(rt.railCap, balance);
+}
+
 /** 💰 How a craps table's shared record settled a roll, for its chip moves:
  *  a key naming that settle (its moves play once), the point in force before
  *  it when the record says (else the felt's as last laid), and its verdict. */
 interface SettleRecord extends SettleVerdict {
   key: string;
   pointBefore?: number | null;
-  /** The roll whose decision the record shows (a computed view carries
-   *  the last one through the next roll's betting). */
-  decided?: number;
 }
 
 /** Where a bettor's chips land on their rail: the chip part of the rail in
@@ -760,9 +780,6 @@ function layCrapsFelt(
   }
   h.setFeltChips(stacks);
   h.setHighlight(s.phase === 'settled' && s.dice ? crapsWinners(s.dice[0], s.dice[1], pointWasOn(s)) : NO_HIGHLIGHT);
-  // (Every roll before the one on screen is past its result, and so is
-  // the one the record shows decided.)
-  rt.decidedTo = Math.max(rt.decidedTo, s.phase === 'settled' ? s.round : s.round - 1, rec.decided ?? 0);
   if (s.phase !== 'settled' && s.round > rt.decidedTo) {
     rt.played.delete(s.round);
     rt.played.set(s.round, { bets, stacks, point: s.point });
@@ -776,6 +793,17 @@ function layCrapsFelt(
  *  rail holds back what the roll pays meanwhile, so it grows as they land. */
 export function crapsRollInPlay(tableId: string): boolean {
   return runtimes.get(tableId)?.inPlay ?? false;
+}
+
+/** 💰 The most my rail at craps table `tableId` shows now (holdRail), or
+ *  null with no table running here; lowered at once to `balance` when that
+ *  is less (a bet down between frames shows at once, and nothing it held
+ *  back shows early). */
+export function crapsRailCap(tableId: string, balance: number): number | null {
+  const rt = runtimes.get(tableId);
+  if (!rt || rt.railCap === null) return null;
+  rt.railCap = Math.min(rt.railCap, balance);
+  return rt.railCap;
 }
 
 /** 🎲 A roll's dice, from the d1d2 a roll key carries. */
@@ -797,12 +825,10 @@ function layComputedCrapsFelt(id: string, h: CasinoTableVisualHandle, rt: TableR
   else delete bets[me];
   const amounts = s.amounts ?? {};
   const payouts = s.payouts ?? {};
-  const decided = spinKeyParts(s.rollKey);
   layCrapsFelt(id, h, rt, me, s, bets, {
     // (A rewrite of the roll, or a new decision of it, settles again.)
     key: `${s.round}:${s.rollKey}:${s.rollBy}`,
     ...(s.pointBefore !== undefined ? { pointBefore: s.pointBefore } : {}),
-    ...(decided ? { decided: decided.round } : {}),
     // The fold's verdict: what it credited each bettor, and what each won
     // or lost on the roll (only bettors with a decision are named).
     agrees: (pid, r) => (payouts[pid] ?? 0) === r.credited
@@ -1007,6 +1033,7 @@ function driveComputedCraps(id: string, h: CasinoTableVisualHandle, rt: TableRun
     h.diceCancel();
     rt.flight = null;
   }
+  noteDecided(rt, s, k?.round ?? 0);
   const animating = h.diceState() === 'flying' || h.diceState() === 'settling';
   if (!animating) {
     h.setPuck(s.point);
@@ -1164,8 +1191,10 @@ export function casinoTablesFrame(dt: number, visuals: ReadonlyMap<string, Casin
   for (const [id, h] of visuals) {
     if (!tableItem(id)) continue;
     const rt = runtime(id);
-    if (h.game === 'craps') driveCraps(id, h, rt, me);
-    else driveRoulette(id, h, rt, me);
+    if (h.game === 'craps') {
+      driveCraps(id, h, rt, me);
+      holdRail(rt, me);
+    } else driveRoulette(id, h, rt, me);
     h.update(dt);
   }
   for (const id of runtimes.keys()) if (!visuals.has(id)) runtimes.delete(id);
@@ -1287,14 +1316,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   let hand: number[] = [];
   /** The rail as laid out right now (frozen while a pickup drag runs). */
   let railView: RailStack[] = [];
-  /** 💰 Craps: the most the rail shows. It follows my balance frame by
-   *  frame (update()) while no roll is in play here (crapsRollInPlay), and
-   *  holds what I had at the last frame before one was: what the roll pays
-   *  joins the rail as its chips land there, not when the settle comes,
-   *  even a credit that lands between frames before any frame here saw the
-   *  roll close (the doc's change refreshes the rail before the next
-   *  frame). Anything else that adds to my balance shows a frame later. */
-  let railCap: number | null = null;
+  /** 💰 Craps: the most the rail showed when last laid out (crapsRailCap:
+   *  what the roll in play pays joins the rail as its chips land there).
+   *  update() lays it out again when that changes; anything else that adds
+   *  to my balance shows a frame later. */
+  let railCapShown: number | null = null;
   let pickup: { stack: number; nextAt: number; interval: number } | null = null;
   let cursor: FeltPoint | null = null;
   /** Dice in the shooter's hand: recent cursor samples for the fling. */
@@ -1594,7 +1620,8 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       hand = [];
       say('NOT ENOUGH CHIPS FOR THAT STAKE AGAIN — PICK UP FROM YOUR RAIL');
     }
-    const shown = railCap !== null ? Math.min(balance, railCap) : balance;
+    railCapShown = game === 'craps' ? crapsRailCap(itemId, balance) : null;
+    const shown = railCapShown !== null ? Math.min(balance, railCapShown) : balance;
     if (!pickup) railView = railSplit ? railStacks(railSplit.chips, railChipCounts(Math.max(0, shown - sumOf(hand)))) : [];
     h.setRailStacks(railView);
     h.setHand(cursor, hand);
@@ -3038,8 +3065,6 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
 
       beatSeat();
       seatTimer = window.setInterval(beatSeat, SEAT_BEAT_MS);
-      // (From the start: a credit before the first frame waits too.)
-      railCap = game === 'craps' ? readChips(me) : null;
       unsubscribe = subscribeCasino(() => {
         syncWindow();
         noteComputed();
@@ -3066,7 +3091,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       pickup = null;
       hand = [];
       cursor = null;
-      railCap = null;
+      railCapShown = null;
       h?.setRailStacks([]);
       h?.setHand(null, []);
       h?.setSettingsHot(false);
@@ -3085,13 +3110,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     update(): void {
       syncEpoch();
       dropStaleHold();
-      if (game === 'craps' && (!crapsRollInPlay(itemId) || railCap === null)) {
-        const balance = readChips(me);
-        if (balance !== railCap) {
-          railCap = balance;
-          refreshRail();
-        }
-      }
+      if (game === 'craps' && crapsRailCap(itemId, readChips(me)) !== railCapShown) refreshRail();
       // Holding over one stack keeps picking chips off it, a little faster each time.
       if (pickup && pickup.stack >= 0 && performance.now() >= pickup.nextAt) {
         takeFromStack(pickup.stack);

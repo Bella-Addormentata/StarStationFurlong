@@ -4,8 +4,9 @@
  * same moves from the shared result, once a roll (losers into the house,
  * the winner paid out of it onto their rail), and the winner's rail shows
  * the payout only once its chips have landed there, even when the credit
- * reaches the page between its frames; a roll rewritten by a forfeit after
- * the next one opened plays its new decision.
+ * reaches the page between its frames or before its player steps up to the
+ * table; a roll rewritten by a forfeit plays its new decision, on the pages
+ * that saw it before a result.
  *
  * Built on the kits computedCrapsTable.test.ts uses (computedPageKit,
  * computedCrapsUiKit): each page its own load of the casino modules, synced
@@ -130,7 +131,7 @@ describe('💰 the settle on screen at a computed craps table', () => {
     tb.unmount();
   });
 
-  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips (even before my table’s first frame)', async () => {
+  it('a credit that lands between my frames, before any frame here saw the roll close, still waits for its chips (even before my table’s first frame, and after chips I spent since)', async () => {
     const pages = await room(['A', 'B']);
     const [a, b] = pages;
     standAt(a, 3);
@@ -143,8 +144,12 @@ describe('💰 the settle on screen at a computed craps table', () => {
     expect(crapsOf(a)?.phase).toBe('betting');
     // A steps up to the table now: no frame of A's table yet.
     const ta = atCraps(a, { stand: 3 });
-    const railBefore = railTotal(a.dice.rail());
+    expect(railTotal(a.dice.rail())).toBe(a.casino.readChips(a.pid));
+    // …and spends 5 chips elsewhere (the slot machine): the rail shows them
+    // gone at once, and holds that.
+    expect(a.casino.spendChips(a.pid, 5)).toBe(true);
     const chipsBefore = a.casino.readChips(a.pid);
+    const railBefore = railTotal(a.dice.rail());
     expect(railBefore).toBe(chipsBefore);
     // A's page keeps up its part of the table (its records) but draws no
     // frame until its balance has the payout: the close and the result
@@ -168,6 +173,28 @@ describe('💰 the settle on screen at a computed craps table', () => {
     // …until A's chips have landed.
     go(pages, at + STEP, at + 3 * STEP);
     expect(railTotal(a.dice.rail())).toBe(railBefore + 20);
+    ta.unmount();
+  });
+
+  it('stepping up to the table after the credit, while the chips are on their way: the rail holds what I had until they land', async () => {
+    const pages = await room(['A', 'B']);
+    const [a, b] = pages;
+    standAt(a, 3);
+    standAt(b, 1);
+    rigRoll(pages, 1, 7);
+    expect(crapsBet(a, [bet('pass', 10)], T0)).toBe('ok');
+    expect(crapsBet(b, [bet('dontpass', 5)], T0)).toBe('ok');
+    go(pages, T0 + STEP, T0 + 3 * STEP);
+    const chipsBefore = a.casino.readChips(a.pid);
+    // A's page runs (its table's pieces with it) but nobody is at its table
+    // until the show is on, the payout already in A's balance.
+    const at = go(pages, T0 + 4 * STEP, T0 + 120_000, () => a.dice.settles.length > 0);
+    expect(at).toBeLessThan(T0 + 120_000);
+    expect(a.casino.readChips(a.pid)).toBe(chipsBefore + 20);
+    const ta = atCraps(a, { stand: 3 });
+    expect(railTotal(a.dice.rail())).toBe(chipsBefore);
+    go(pages, at + STEP, at + 3 * STEP);
+    expect(railTotal(a.dice.rail())).toBe(chipsBefore + 20);
     ta.unmount();
   });
 
