@@ -17,10 +17,11 @@ const node = (chia_wallet?: ChiaWalletSwitch, chia_address?: string): LocalFinge
 
 describe('bankWalletView', () => {
   it('offers CREATE, then CONFIRM with what turning on means, then shows it turning', () => {
-    const fresh = bankWalletView(node({ state: 'ready' }), IDLE);
+    const ready = node({ state: 'ready', mnemonic: true });
+    const fresh = bankWalletView(ready, IDLE);
     expect(fresh).toMatchObject({ showsAddress: false, warning: null, button: { act: 'arm', label: 'CREATE SSF WALLET', danger: false, busy: false } });
     expect(fresh.text).toContain('no SSF wallet yet');
-    const armed = bankWalletView(node({ state: 'ready' }), { ...IDLE, armed: true });
+    const armed = bankWalletView(ready, { ...IDLE, armed: true });
     expect(armed.button).toEqual({ act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false });
     expect(armed.warning).toContain('new testnet11 key');
     expect(armed.warning).toContain('Phone Book');
@@ -28,9 +29,22 @@ describe('bankWalletView', () => {
     expect(armed.warning).toContain('24 words');
     expect(armed.warning).toContain('write down');
     expect(armed.warning).not.toContain('retires');
-    const turning = bankWalletView(node({ state: 'ready' }), { ...IDLE, armed: true, turning: true });
+    const turning = bankWalletView(ready, { ...IDLE, armed: true, turning: true });
     expect(turning.button).toMatchObject({ label: 'TURNING ON…', busy: true });
     expect(turning.warning).toBeNull();
+  });
+
+  it('promises no 24 words on CREATE for a node older than them, and says to update first', () => {
+    const older = node({ state: 'ready' });
+    expect(bankWalletView(older, IDLE).button).toMatchObject({ act: 'arm', label: 'CREATE SSF WALLET' });
+    const armed = bankWalletView(older, { ...IDLE, armed: true });
+    expect(armed.button).toEqual({ act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false });
+    for (const said of ['older than', 'cannot write down', 'new address', 'Update Star Station first']) {
+      expect(armed.warning).toContain(said);
+    }
+    expect(armed.warning).not.toContain('shows you the words');
+    // TURN ON of the wallet an older node kept loads that wallet, as before.
+    expect(bankWalletView(node({ state: 'ready', seed: true }), { ...IDLE, armed: true }).warning).toContain('same address');
   });
 
   it('says TURN ON, not CREATE, when the node kept a wallet from before', () => {

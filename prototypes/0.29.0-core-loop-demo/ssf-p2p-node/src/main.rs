@@ -1018,11 +1018,11 @@ mod fingerprint_json_tests {
             ),
             (
                 view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"ready","legacy":true}"#,
+                r#""chia_wallet":{"state":"ready","legacy":true,"mnemonic":true}"#,
             ),
             (
                 view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"ready","seed":true}"#,
+                r#""chia_wallet":{"state":"ready","seed":true,"mnemonic":true}"#,
             ),
         ];
         for (switch, expect) in cases {
@@ -5898,10 +5898,11 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                 );
                 return refuse("500 Internal Server Error", BACKUP_MISMATCH);
             }
-            if let Some(m) = hub.wallet_meta.lock().unwrap().as_mut() {
-                if m.fingerprint == fingerprint {
-                    m.revealed = true;
-                }
+            // Checked again after the read, under the meta's lock: an I SAVED
+            // that landed meanwhile (another tab's) wins.
+            let landed = chia_wallet_switch::reveal_lands(hub.wallet_meta.lock().unwrap().as_mut(), fingerprint);
+            if let Err(why) = landed {
+                return plain(why.answer());
             }
             println!("🏦 SSF wallet: the Bank showed the 24 words (key fingerprint {fingerprint})");
             ("200 OK", chia_wallet::reveal_body(&rev, &chia_wallet::testnet_address(&key)))

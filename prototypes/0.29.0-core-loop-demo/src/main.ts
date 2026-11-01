@@ -5146,8 +5146,8 @@ async function saveBankBackup(): Promise<void> {
   setBankBackup(next);
   renderBankApp();
   const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", next.key);
-  const landed = bankBackup.saving;
-  setBankBackup(applySave(bankBackup, r, performance.now()));
+  const landed = bankBackup.saving && bankBackup.saveTicket === next.saveTicket;
+  setBankBackup(applySave(bankBackup, next.saveTicket, r, performance.now()));
   if (r.ok || r.refresh) await refreshLocalFingerprint();
   renderBankApp();
   // Saved: the panel is gone, so focus goes to the view itself.

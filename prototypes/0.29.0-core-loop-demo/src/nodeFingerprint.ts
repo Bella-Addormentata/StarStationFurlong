@@ -115,9 +115,11 @@ export interface ChiaWalletSwitch {
   stays?: boolean;
   /** On: `SSF_CHIA_LANE=1` holds it on; the Bank cannot turn it off. */
   held?: boolean;
-  /** On: the loaded wallet is made from 24 words the node keeps. The
-   *  capability marker for the Bank's BACK UP (bankBackup.ts): older nodes
-   *  never send it, and the Bank offers BACK UP only when it is present. */
+  /** On: the loaded wallet is made from 24 words the node keeps. Ready:
+   *  turning on makes or loads a wallet from 24 words. The capability marker
+   *  for the Bank's BACK UP (bankBackup.ts) and CREATE's wording
+   *  (bankWallet.ts): older nodes never send it, and the Bank offers BACK UP
+   *  only when it is present. */
   mnemonic?: boolean;
   /** On, with `mnemonic`: the player marked this key's 24 words saved, so
    *  the Bank does not show them again. */

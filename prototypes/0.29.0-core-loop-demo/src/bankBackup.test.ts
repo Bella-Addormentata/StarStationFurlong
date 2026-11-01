@@ -174,7 +174,7 @@ describe('bankBackupView', () => {
     expect(done.line).toContain('backed up');
     expect(done.line).toContain('does not show them again');
     // Done on the page's word too, until the fingerprint catches up.
-    const saved = applySave(saving, { ok: true, note: null }, 5000);
+    const saved = applySave(saving, saving.saveTicket, { ok: true, note: null }, 5000);
     expect(bankBackupView(LIVE, saved, 'app')).toMatchObject({ state: 'done', panel: null });
     expect(saved).toMatchObject({ open: false, words: null, key: null, savedFor: ADDR });
   });
@@ -287,17 +287,39 @@ describe('the panel\'s moves', () => {
     expect(armSave(opened(), 1)).toEqual(opened());
     const saving = startSave(armSave(shown(), 3000));
     expect(saving).toMatchObject({ saving: true, armed: false });
-    const failed = applySave(saving, { ok: false, error: 'could not record', refresh: false, saved: false, drop: false }, 4000);
+    const failed = applySave(saving, saving.saveTicket, { ok: false, error: 'could not record', refresh: false, saved: false, drop: false }, 4000);
     expect(failed).toMatchObject({ saving: false, words: WORDS, key: KEY, error: 'could not record' });
-    const dropped = applySave(saving, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4000);
+    const dropped = applySave(saving, saving.saveTicket, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4000);
     expect(dropped).toMatchObject({ saving: false, words: null, key: null, open: true, error: 'tap SHOW again' });
     expect(bankBackupView(LIVE, dropped, 'app')!.panel!.saved.disabled).toBe(true);
-    const noted = applySave(saving, { ok: true, note: 'saved, but not confirmed on disk' }, 4000);
+    const noted = applySave(saving, saving.saveTicket, { ok: true, note: 'saved, but not confirmed on disk' }, 4000);
     expect(bankBackupView(LIVE, noted, 'app')).toMatchObject({ state: 'done', error: 'saved, but not confirmed on disk' });
     // A save that lands after the panel closed changes nothing on the page.
     const closed = closeBackupPanel(saving, 3500);
-    expect(applySave(closed, { ok: true, note: null }, 4000)).toBe(closed);
+    expect(applySave(closed, saving.saveTicket, { ok: true, note: null }, 4000)).toBe(closed);
     expect(startSave(shown())).toEqual(shown()); // not armed: nothing goes out
+  });
+
+  it('a save answer lands only for its own save: not after LATER, a reopened Bank or another save', () => {
+    const first = startSave(armSave(shown(), 3000));
+    expect(first.saveTicket).toBe(first.gen);
+    // LATER, then BACK UP, SHOW and I SAVED again while the first answer is out.
+    const reopened = openBackupPanel(closeBackupPanel(first, 3500), LIVE, 3600);
+    const again = startReveal(reopened, 4200)!;
+    const shownAgain = applyReveal(again.ui, again.ticket, { ok: true, words: [...WORDS], key: KEY, address: ADDR }, true, 4300);
+    const second = startSave(armSave(shownAgain, 4900));
+    expect(second.saving).toBe(true);
+    expect(second.saveTicket).not.toBe(first.saveTicket);
+    // The first save's answer is dropped, whatever it says; the second's lands.
+    expect(applySave(second, first.saveTicket, { ok: true, note: null }, 5000)).toBe(second);
+    expect(applySave(second, first.saveTicket, { ok: false, error: 'x', refresh: false, saved: false, drop: true }, 5000)).toBe(second);
+    expect(applySave(second, second.saveTicket, { ok: true, note: null }, 5100)).toMatchObject({ open: false, saving: false, saveTicket: null, savedFor: ADDR });
+    // Opening the Bank again starts from nothing, and an old ticket never
+    // matches a save started after it (the generation only grows).
+    const fresh = resetBackupUi(first);
+    expect(fresh.saveTicket).toBeNull();
+    expect(applySave(fresh, first.saveTicket, { ok: true, note: null }, 5200)).toBe(fresh);
+    expect(applySave(first, null, { ok: true, note: null }, 5200)).toBe(first);
   });
 
   it('SHOW, HIDE, SHOW again: I SAVED waits for the reveal, and a 409 on a save never leaves SHOW stuck', () => {
@@ -315,9 +337,9 @@ describe('the panel\'s moves', () => {
     // A save already out when that reveal went (the overlap this guards
     // against) answers 409 "not shown / key changed": the new generation
     // frees SHOW, and the late reveal is dropped by its old ticket.
-    const overlap: BankBackupUi = { ...again.ui, saving: true };
+    const overlap: BankBackupUi = { ...again.ui, saving: true, saveTicket: 99 };
     expect(showLabel(overlap)).toEqual({ act: 'show', label: 'SHOWING…', busy: true });
-    const dropped = applySave(overlap, { ok: false, error: 'not shown; tap SHOW again', refresh: true, saved: false, drop: true }, 5000);
+    const dropped = applySave(overlap, 99, { ok: false, error: 'not shown; tap SHOW again', refresh: true, saved: false, drop: true }, 5000);
     expect(dropped).toMatchObject({ revealing: false, saving: false, words: null, key: null, open: true });
     const late = applyReveal(dropped, again.ticket, ok, true, 5100);
     expect(late).toBe(dropped);
@@ -353,10 +375,10 @@ describe('the panel\'s moves', () => {
     expect(startReveal(hidden, 4000)).toBeNull();
     expect(startReveal(saving, 4000)).toBeNull();
     // A save that failed for another reason keeps the key: SHOW and I SAVED are both free.
-    const failed = applySave(hidden, { ok: false, error: 'could not record', refresh: false, saved: false, drop: false }, 4500);
+    const failed = applySave(hidden, saving.saveTicket, { ok: false, error: 'could not record', refresh: false, saved: false, drop: false }, 4500);
     expect(bankBackupView(LIVE, failed, 'app')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: false });
     expect(startReveal(failed, 5000)).not.toBeNull();
-    const dropped = applySave(hidden, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4500);
+    const dropped = applySave(hidden, saving.saveTicket, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4500);
     expect(startReveal(dropped, 5000)).not.toBeNull();
   });
 
@@ -611,6 +633,12 @@ describe('the clipboard', () => {
     expect(afterWipe(afterCopy(held, 'held', 20_000), 10_000, 'stuck').copy).toBe('held');
     expect(afterWipe(address, 10_000, 'wiped')).toBe(address);
     expect(afterCopy(shown(), 'refused', 10_000)).toMatchObject({ copy: 'refused', copiedAt: 0 });
+    // A refused COPY after one that took: the earlier words are still on the
+    // clipboard, so that copy, its time and its wipe stand.
+    expect(afterCopy(held, 'refused', 15_000)).toMatchObject({ copy: 'held', copiedAt: 10_000 });
+    const stuckCopy = afterWipe(held, 10_000, 'stuck');
+    expect(afterCopy(stuckCopy, 'refused', 15_000)).toMatchObject({ copy: 'stuck', copiedAt: 10_000 });
+    expect(afterCopy(afterWipe(held, 10_000, 'wiped'), 'refused', 15_000).copy).toBe('refused');
   });
 });
 

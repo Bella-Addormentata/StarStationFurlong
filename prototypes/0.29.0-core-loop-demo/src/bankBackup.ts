@@ -91,6 +91,10 @@ export interface BankBackupUi {
   /** I SAVED became ⚠ CONFIRM. */
   armed: boolean;
   saving: boolean;
+  /** The save out, by a number from the generation sequence (which never
+   *  repeats, even across a reset): its answer lands only while it is this
+   *  one. HIDE, a hidden page and the expiry keep it; closing drops it. */
+  saveTicket: number | null;
   /** The address whose words this page recorded as saved, until the node's
    *  fingerprint says so too. */
   savedFor: string | null;
@@ -112,6 +116,7 @@ export const BACKUP_IDLE: Readonly<BankBackupUi> = {
   expired: false,
   armed: false,
   saving: false,
+  saveTicket: null,
   savedFor: null,
   copy: 'none',
   copiedAt: 0,
@@ -130,6 +135,7 @@ const CLOSED = {
   expired: false,
   armed: false,
   saving: false,
+  saveTicket: null,
   error: null,
 } as const;
 
@@ -341,22 +347,26 @@ export function armSave(ui: BankBackupUi, now: number): BankBackupUi {
   return { ...ui, armed: true, error: null, changedAt: now };
 }
 
-/** ⚠ CONFIRM: the request goes out; the words stay shown until it lands.
- *  Not while a reveal is out. */
+/** ⚠ CONFIRM: the request goes out with a ticket of its own; the words
+ *  stay shown until it lands. Not while a reveal is out (so the generation
+ *  it takes its ticket from moves under no reveal). */
 export function startSave(ui: BankBackupUi): BankBackupUi {
   if (!ui.open || !ui.armed || ui.saving || ui.revealing || ui.key === null) return ui;
-  return { ...ui, armed: false, saving: true, error: null };
+  const gen = ui.gen + 1;
+  return { ...ui, gen, armed: false, saving: true, saveTicket: gen, error: null };
 }
 
 /** The node's answer to I SAVED. Saved: the panel closes for good. Refused
  *  for this key (409): the words and the key go, SHOW again (a new
  *  generation, which drops any reveal still out, so SHOW is free). Anything
  *  else: the words stay, and I SAVED can be tapped again. */
-export function applySave(ui: BankBackupUi, r: SaveResult, now: number): BankBackupUi {
-  if (!ui.saving) return ui;
+export function applySave(ui: BankBackupUi, ticket: number | null, r: SaveResult, now: number): BankBackupUi {
+  // An answer for a save the panel dropped (LATER, the Bank reopened, another
+  // wallet) is not this save's, even when a newer save is out.
+  if (!ui.saving || ticket === null || ui.saveTicket !== ticket) return ui;
   if (r.ok) return { ...ui, ...CLOSED, gen: ui.gen + 1, savedFor: ui.address, error: r.note, changedAt: now };
-  if (r.drop) return { ...ui, saving: false, revealing: false, words: null, key: null, expired: false, error: r.error, changedAt: now, gen: ui.gen + 1 };
-  return { ...ui, saving: false, error: r.error, changedAt: now };
+  if (r.drop) return { ...ui, saving: false, saveTicket: null, revealing: false, words: null, key: null, expired: false, error: r.error, changedAt: now, gen: ui.gen + 1 };
+  return { ...ui, saving: false, saveTicket: null, error: r.error, changedAt: now };
 }
 
 /** How long until the shown words hide themselves, or null when none show. */
@@ -549,7 +559,10 @@ export async function wipeClipboard(copy: BackupCopy, clip: ClipboardLike | null
   }
 }
 
+/** COPY's outcome. A refused COPY after one that took leaves the earlier
+ *  words on the clipboard: that copy, its time and its wipe stand. */
 export function afterCopy(ui: BankBackupUi, result: 'held' | 'refused', now: number): BankBackupUi {
+  if (result === 'refused' && (ui.copy === 'held' || ui.copy === 'stuck')) return { ...ui, armed: false };
   return { ...ui, copy: result, copiedAt: result === 'held' ? now : ui.copiedAt, armed: false };
 }
 

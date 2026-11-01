@@ -247,7 +247,9 @@ pub struct WalletSwitch {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
     /// On: the wallet is made from 24 words the node keeps, so the Bank can
-    /// back them up. The capability marker: an older node never sends it.
+    /// back them up. Ready: turning on makes (or loads) a wallet from 24
+    /// words, so CREATE can promise them. The capability marker: an older
+    /// node never sends it, and its CREATE makes a raw seed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mnemonic: bool,
     /// On, with `mnemonic`: the player marked these words saved, so the Bank
@@ -306,7 +308,8 @@ pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts:
         legacy: ready && !facts.identity_on_disk && facts.legacy_on_disk,
         stays: on && (env == EnvSwitch::On || memo.remembered),
         held: on && env == EnvSwitch::On,
-        mnemonic: on && facts.mnemonic,
+        // Every wallet this build turns on comes from 24 words.
+        mnemonic: ready || (on && facts.mnemonic),
         backed_up: on && facts.mnemonic && facts.backed_up,
         reminted: on && facts.reminted,
         error: matches!(state, WalletState::Ready | WalletState::On).then(|| memo.error.clone()).flatten(),
@@ -606,6 +609,23 @@ pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bo
     }
 }
 
+/// 🏦 The reveal's last check, after the identity file was read, under the
+/// lock of `meta` (the hub's, for the loaded key): a save that landed while
+/// the file was read wins, so the words are not shown once they are marked
+/// saved. Otherwise the run counts them as shown, which I SAVED needs.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn reveal_lands(meta: Option<&mut WalletMeta>, fingerprint: u32) -> Result<(), WordsRefusal> {
+    match meta {
+        None => Err(WordsRefusal::NotOn),
+        Some(m) if m.fingerprint != fingerprint => Err(WordsRefusal::KeyChanged),
+        Some(m) if m.backed_up => Err(WordsRefusal::AlreadySaved),
+        Some(m) => {
+            m.revealed = true;
+            Ok(())
+        }
+    }
+}
+
 /// Whether the words read back for a reveal make the wallet in use: both
 /// the fingerprint and the wallet public key they make (`read_*`) equal the
 /// loaded key's (`loaded_*`). Anything else is not shown.
@@ -821,7 +841,7 @@ mod tests {
         let v = view(true, Off, false, &memo(true, Some("x")), &identity);
         assert_eq!(v, sw(WalletState::Off));
         let v = view(true, Unset, false, &memo(false, None), &identity);
-        assert_eq!(v, WalletSwitch { seed: true, ..sw(WalletState::Ready) });
+        assert_eq!(v, WalletSwitch { seed: true, mnemonic: true, ..sw(WalletState::Ready) });
         let v = view(true, Unset, false, &memo(false, Some("disk full")), &none);
         assert_eq!(v.error.as_deref(), Some("disk full"), "a failed turn says why");
         let v = view(true, Unset, true, &memo(true, None), &identity);
@@ -832,7 +852,7 @@ mod tests {
         assert!(v.stays && v.held, "held on by SSF_CHIA_LANE=1");
 
         let json = serde_json::to_string(&view(true, Unset, false, &memo(false, None), &none)).unwrap();
-        assert_eq!(json, r#"{"state":"ready"}"#, "flags ride only when set");
+        assert_eq!(json, r#"{"state":"ready","mnemonic":true}"#, "flags ride only when set; Ready says TURN ON makes 24 words");
         let json = serde_json::to_string(&view(true, On, true, &memo(false, Some("e")), &none)).unwrap();
         assert_eq!(json, r#"{"state":"on","stays":true,"held":true,"error":"e"}"#);
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"unbuilt"}"#).unwrap();
@@ -879,7 +899,8 @@ mod tests {
     }
 
     /// 🏦 The 24-word flags: `seed` and `legacy` only while Ready, the
-    /// words' own flags only while On, in the order the Bank's parser reads.
+    /// words' own flags only while On, and `mnemonic` in both (Ready: what
+    /// TURN ON makes; On: what is loaded), in the order the Bank's parser reads.
     #[test]
     fn the_words_flags_ride_only_in_the_state_they_describe() {
         use EnvSwitch::*;
@@ -888,9 +909,9 @@ mod tests {
         let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
 
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
-        assert_eq!(json(&view(true, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true}"#);
+        assert_eq!(json(&view(true, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true,"mnemonic":true}"#);
         let v = view(true, Unset, false, &memo(false), &all);
-        assert_eq!(json(&v), r#"{"state":"ready","seed":true}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
+        assert_eq!(json(&v), r#"{"state":"ready","seed":true,"mnemonic":true}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
         for state in [view(false, Unset, false, &memo(true), &all), view(true, Off, false, &memo(true), &all)] {
             assert_eq!(json(&state), format!(r#"{{"state":"{}"}}"#, if state.state == WalletState::Off { "off" } else { "unbuilt" }));
         }
@@ -1091,6 +1112,22 @@ mod tests {
         assert_eq!(step(meta(false, true)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 }, "shown again until saved");
         assert_eq!(step(meta(true, false)), WordsStep::Refuse(WordsRefusal::AlreadySaved), "saved: never shown again");
         assert_eq!(step(meta(true, true)), WordsStep::Refuse(WordsRefusal::AlreadySaved));
+    }
+
+    /// A save that lands while the reveal reads the file (another tab's I
+    /// SAVED) wins: the words are not shown after they are marked saved.
+    #[test]
+    fn a_reveal_lands_only_while_the_words_are_not_marked_saved() {
+        let mut m = meta(false, false);
+        assert_eq!(reveal_lands(Some(&mut m), 7), Ok(()));
+        assert!(m.revealed, "shown: I SAVED may follow");
+        let mut saved = meta(true, false);
+        assert_eq!(reveal_lands(Some(&mut saved), 7), Err(WordsRefusal::AlreadySaved));
+        assert!(!saved.revealed);
+        let mut other = meta(false, false);
+        assert_eq!(reveal_lands(Some(&mut other), 8), Err(WordsRefusal::KeyChanged));
+        assert!(!other.revealed);
+        assert_eq!(reveal_lands(None, 7), Err(WordsRefusal::NotOn));
     }
 
     #[test]

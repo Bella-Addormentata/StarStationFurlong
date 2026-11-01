@@ -58,6 +58,10 @@ const TURN_ON_WARNING =
   'Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address, and once the wallet holds a coin it lists itself in the Phone Book on the test chain. Tap CONFIRM.';
 const CREATE_WARNING =
   'Create an SSF wallet? Your node makes a new testnet11 key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin (one mojo from the faucet dish is enough) it lists itself in the Phone Book on the test chain. Tap CONFIRM.';
+/** CREATE on a node older than the 24 words (#352's), which never says
+ *  `mnemonic`: its wallet is a raw key, which the next update replaces. */
+const CREATE_OLDER_NODE_WARNING =
+  "Your station node is older than the Bank's 24-word backup: it makes a testnet11 key you cannot write down, and updating Star Station later replaces that wallet with a new one at a new address. Update Star Station first, or tap CONFIRM to create it anyway.";
 const CREATE_LEGACY_WARNING =
   "Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its testnet coins stay at its old address), makes a new testnet11 key from 24 words at a new address, and shows you the words to write down. Once the new wallet holds a coin it lists itself in the Phone Book on the test chain. Tap CONFIRM.";
 const REMINTED =
@@ -123,7 +127,8 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       if (ui.armed) {
         return {
           text: 'Your station node has no SSF wallet on yet, so there is no address to pay.',
-          warning: w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : CREATE_WARNING,
+          // Only a node that says `mnemonic` makes its wallet from 24 words.
+          warning: w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : w.mnemonic === true ? CREATE_WARNING : CREATE_OLDER_NODE_WARNING,
           notice: null,
           error,
           button: { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false },

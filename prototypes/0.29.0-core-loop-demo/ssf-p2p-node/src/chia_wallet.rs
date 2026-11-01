@@ -78,8 +78,8 @@ const FILE_MAX: usize = 4096;
 /// Names tried for one archive of a legacy seed (`-<unix>`, `-<unix>-2`, …).
 const RETIRE_ATTEMPTS: u32 = 16;
 
-/// A node's own temporary file younger than this is a write in flight; an
-/// older one with this process's id is from an earlier process that had it.
+/// A temporary file younger than this may be a write in flight, whoever's;
+/// an older one is from a write that stopped.
 const TMP_IN_FLIGHT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How many temporary names a mint tries before it gives up (see
 /// [`install_once_with`]).
@@ -597,10 +597,11 @@ fn same_file(candidate: &Path, legacy: &std::fs::Metadata, raw: Option<&[u8]>) -
 
 /// Remove the temporary files a stopped mint left beside `paths`
 /// (`.<name>.<pid>-<seq>.tmp`): one can hold the entropy, or a raw seed of
-/// an older build. A file of this process that is younger than a minute is
-/// a mint in flight (another thread's), and is left alone.
+/// an older build. A file younger than a minute may be a mint in flight,
+/// another thread's or another node's started from the same folder, whose
+/// process id says nothing about whether it stopped: it is left alone, and
+/// the next load after that minute removes it.
 fn sweep_stale_tmp(paths: &[&Path]) {
-    let me = std::process::id();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for p in paths {
         let d = parent_dir(p);
@@ -619,16 +620,15 @@ fn sweep_stale_tmp(paths: &[&Path]) {
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            let Some(tag) = prefixes.iter().find_map(|p| name.strip_prefix(p.as_str())).and_then(|r| r.strip_suffix(".tmp"))
-            else {
+            let ours = prefixes.iter().any(|p| name.strip_prefix(p.as_str()).is_some_and(|r| r.ends_with(".tmp")));
+            if !ours {
                 continue;
-            };
-            let ours = tag.split_once('-').and_then(|(pid, _)| pid.parse::<u32>().ok()) == Some(me);
-            if ours {
-                let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-                if !age.is_some_and(|a| a >= TMP_IN_FLIGHT) {
-                    continue;
-                }
+            }
+            // An age that cannot be read (a clock set back, no mtime) counts
+            // as in flight: kept, never removed under a writer.
+            let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+            if !age.is_some_and(|a| a >= TMP_IN_FLIGHT) {
+                continue;
             }
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => println!("🏦 SSF wallet: removed {name}, a temporary file a stopped write left behind"),
@@ -1223,7 +1223,9 @@ mod tests {
     }
 
     /// A stopped mint's temporary file can hold the entropy: the next load
-    /// removes every one that is not a write of this process in flight.
+    /// removes every one older than a minute, whichever process wrote it,
+    /// and keeps a younger one, which may be a write in flight (this
+    /// process's other thread, or another node started from the same folder).
     #[test]
     fn a_load_sweeps_the_temporary_files_a_stopped_mint_left() {
         let dir = fresh_dir("sweep");
@@ -1231,34 +1233,34 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         let me = std::process::id();
         let other = if me == 1 { 2 } else { me - 1 };
+        let two_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
         for stale in [
             format!(".chia_identity.json.{other}-0.tmp"),
             format!(".chia_identity.json.{other}-17.tmp"),
             format!(".chia_identity.seed.{other}-0.tmp"),
             ".chia_identity.json.junk.tmp".to_string(),
+            // This process's own, from a write that stopped (a thread that
+            // failed mid-mint), beside the identity and beside the raw seed.
+            format!(".chia_identity.json.{me}-7.tmp"),
+            format!(".chia_identity.seed.{me}-8.tmp"),
         ] {
-            std::fs::write(dir.join(stale), b"secret").unwrap();
-        }
-        let in_flight = format!(".chia_identity.json.{me}-999999.tmp");
-        std::fs::write(dir.join(&in_flight), b"in flight").unwrap();
-        // This process's own, from a write that stopped over a minute ago (a
-        // thread that failed mid-mint): stale too, beside the identity and
-        // beside the raw seed.
-        let two_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-        for own_stale in [format!(".chia_identity.json.{me}-7.tmp"), format!(".chia_identity.seed.{me}-8.tmp")] {
-            let path = dir.join(own_stale);
+            let path = dir.join(stale);
             std::fs::write(&path, b"secret").unwrap();
             std::fs::File::options().write(true).open(&path).unwrap().set_modified(two_minutes_ago).unwrap();
         }
+        let in_flight = format!(".chia_identity.json.{me}-999999.tmp");
+        std::fs::write(dir.join(&in_flight), b"in flight").unwrap();
+        let theirs_in_flight = format!(".chia_identity.json.{other}-3.tmp");
+        std::fs::write(dir.join(&theirs_in_flight), b"in flight").unwrap();
         // Not the wallet's: another file's temporary is not this sweep's.
-        std::fs::write(dir.join(format!(".chia_wallet.json.{other}-0.tmp")), b"{}").unwrap();
+        let not_ours = format!(".chia_wallet.json.{other}-0.tmp");
+        std::fs::write(dir.join(&not_ours), b"{}").unwrap();
+        std::fs::File::options().write(true).open(dir.join(&not_ours)).unwrap().set_modified(two_minutes_ago).unwrap();
         let id = load_or_mint_wallet(&identity, &legacy).unwrap();
         assert!(id.minted);
-        assert_eq!(
-            names(&dir),
-            vec![in_flight, format!(".chia_wallet.json.{other}-0.tmp"), "chia_identity.json".to_string()],
-            "every stale temporary is gone, and only this process's fresh one stays"
-        );
+        let mut expect = vec![in_flight, theirs_in_flight, not_ours, "chia_identity.json".to_string()];
+        expect.sort();
+        assert_eq!(names(&dir), expect, "every stale temporary is gone, and only the fresh ones stay");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
