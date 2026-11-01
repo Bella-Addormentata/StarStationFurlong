@@ -149,6 +149,7 @@ import {
   casinoDocEpoch,
   casinoRoomId,
   casinoWhole,
+  checkpointLabelOf,
   computedCheckpointOf,
   computedEndedIncs,
   computedFoldOf,
@@ -517,7 +518,7 @@ interface TableState {
    *  from what this page had folded of those rounds (`chips`); of that, by
    *  how many in the nets, and at craps whether the table it hands on
    *  differs (its riding bets, point or dice's hands). */
-  cpDiff: { sid: string; chips: number; nets: number; carry: boolean } | null;
+  cpDiff: { sid: string; chips: number; nets: number; carry: boolean; covered: 'unseen' | 'split' | 'same' } | null;
   /** 🩹 While the table counts a checkpoint that puts a restore in motion
    *  (noteResult): the head's session, the fold of it, and the keys of what
    *  this page had written into it; and the session the table last moved to
@@ -896,7 +897,7 @@ function endForged(st: TableState, res: FoldResult): void {
  *  wrote into `res`'s session since (endForged). */
 function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null, fromForged = false): void {
   const d = checkpointDiff(was, res);
-  st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n };
+  st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n, covered: d.covered };
   const u = res.base.u;
   for (const key of [...st.seen.keys()]) if ((parseKey(key)?.r ?? 0) <= u) st.seen.delete(key);
   for (const [id, e] of [...st.decided]) if (e.r < u) st.decided.delete(id);
@@ -1043,10 +1044,14 @@ function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
  *  (this page can't tell). At craps also what the checkpoint hands on
  *  against the table's state this page had after round u (`carry`:
  *  carryDiff). */
-function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry: bigint } {
+function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry: bigint; covered: 'unseen' | 'split' | 'same' } {
   const u = res.base.u;
   const at = was.rounds.find((v) => v.decided && v.r === u);
-  if (!at) return { nets: 0n, carry: 0n };
+  // 🏛️ (E) Whether this page can check the checkpoint: it saw round u decided
+  // (covered), and with the close the checkpoint names — else a silent 0 hid a
+  // page that never saw the round (unseen) or a fork (split, the forged `l`).
+  if (!at) return { nets: 0n, carry: 0n, covered: 'unseen' };
+  const covered = at.close === res.base.l ? 'same' : 'split';
   const expect = new Map(was.base.n);
   for (const v of was.rounds) {
     if (!v.decided || v.r > u) continue;
@@ -1057,7 +1062,7 @@ function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry
     const d = (res.base.n.get(pid) ?? 0n) - (expect.get(pid) ?? 0n);
     diff += d < 0n ? -d : d;
   }
-  return { nets: diff, carry: at.craps ? carryDiff(at.craps.sOut, res.base.state as CrapsCarry) : 0n };
+  return { nets: diff, carry: at.craps ? carryDiff(at.craps.sOut, res.base.state as CrapsCarry) : 0n, covered };
 }
 
 /** By how many chips two craps states' riding bets differ, spot by spot;
@@ -1926,6 +1931,12 @@ export interface ComputedRoundCheck {
   mineAdded?: boolean;
   checkpointNets?: number;
   checkpointCarry?: boolean;
+  /** 🏛️ (E) How this page stands to check the checkpoint the live session
+   *  opened from: 'unseen' (it never saw round u decided), 'split' (it saw
+   *  round u decided with another close — a fork or forged `l`), 'same' (same
+   *  close: the nets/carry lines mean something). Absent when no trim this
+   *  page folded set it. */
+  covered?: 'unseen' | 'split' | 'same';
 }
 
 /** At craps: the checkpoint's difference split (ComputedRoundCheck). */
@@ -1954,12 +1965,14 @@ function crapsCheck(st: TableState, sc: Scan, res: FoldResult, D: RoundView, me:
 
 function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRoundCheck | null {
   const D = lastDecided(res);
-  const diff = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff.chips : 0;
+  const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
+  const diff = cp?.chips ?? 0;
+  const coveredOf: { covered?: 'unseen' | 'split' | 'same' } = cp ? { covered: cp.covered } : {};
   if (!D) {
     // A trim took the round out of the session: what this page said of it,
     // if it is the round the checkpoint kept.
     const kept = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
-    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res) } : null;
+    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res), ...coveredOf } : null;
   }
   const sc = scanOf(st, res);
   const me = getPlayerId();
@@ -2015,6 +2028,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     checkpointDiff: diff,
     ...replacedOf(st),
     ...(D.craps ? crapsCheck(st, sc, res, D, me) : {}),
+    ...coveredOf,
   };
   st.checks.set(D.close, out);
   return out;
@@ -2041,6 +2055,30 @@ function checkOf(st: TableState, res: FoldResult, now: number): ComputedRoundChe
     st.check = { res, gen: clock.gen, out: roundCheck(st, res, now) };
   }
   return st.check.out;
+}
+
+/** 🏛️ The ⚙ card's checkpoint readout for computed table `t` (design §6.2
+ *  D + E), null for one this page doesn't track: the owner-check label (who
+ *  checked the checkpoint the live session opened from, L-0..L-7, display
+ *  only), that checkpoint's round, and how this page stands to check it
+ *  itself (`covered`: unseen / split / same, or null when no trim this page
+ *  folded set it). Shown on every page, round decided or not. */
+export interface ComputedCheckpointView {
+  label: string | null;
+  round: number;
+  covered: 'unseen' | 'split' | 'same' | null;
+}
+export function computedCheckpointView(t: string, now = Date.now()): ComputedCheckpointView | null {
+  lookAtClock(now);
+  const at = tableOf(t);
+  if (!at) return null;
+  const { st, res } = at;
+  const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
+  return {
+    label: checkpointLabelOf(st.t, st.inc, res.base.sid, res.base.u),
+    round: res.base.u,
+    covered: cp?.covered ?? null,
+  };
 }
 
 // ── ✍️ Writing ───────────────────────────────────────────────────────────────

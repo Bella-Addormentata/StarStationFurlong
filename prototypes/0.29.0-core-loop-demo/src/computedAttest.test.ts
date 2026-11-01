@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { asHouseSumFor, houseSumDigest, nextSid, recHash } from './computedFold';
 import type { HouseSum } from './computedFold';
 import {
-  openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_TABLE as TABLE, run, sync, trimByHand,
+  openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_TABLE as TABLE, run, signAs, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { red, testIdentity } from './computedTestKit';
@@ -184,5 +184,102 @@ describe('🏛️🧮 D3 — the best checkpoint is put back', () => {
     // flag is set) and the forged value stays — b no longer fights it.
     expect(b.casino.houseSumBackedOff(TABLE, INC, t)).toBe(true);
     expect(readShape(top(b).get(HS))!.k).toBe(stranger.pub);
+  });
+});
+
+/** Craft an owner-signed hs: with chosen fields. D2's own writer
+ *  (writeHouseSum) trusts it and marks it checked, and the label reader never
+ *  re-checks a signature — so a crafted `g` is enough to drive every label
+ *  row deterministically, apart from the live fold. */
+const L_HEX = 'a'.repeat(32); // a shape-valid close hash (isHex32) for crafted checkpoints
+function craftHs(owner: string, over: Partial<HouseSum> = {}): HouseSum {
+  return { v: 1, b: 'g', u: 1, l: L_HEX, n: { p: '10' }, a: 0, k: owner, g: 'sig', ...over } as HouseSum;
+}
+
+describe('🏛️🧮 D — the ⚙ checkpoint label (L-0..L-7 + the deed annotation)', () => {
+  it('L-0: no label while the room names no deed holder', async () => {
+    const pages = await openRoom(['A', 'B'], T0); // no owner set
+    expect(pages[0].casino.checkpointLabelOf(TABLE, INC, 'any-sid', 1)).toBeNull();
+  });
+
+  it('L-1: no label for the genesis base (round 0)', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    expect(a.casino.checkpointLabelOf(TABLE, INC, 'any-sid', 0)).toBeNull();
+  });
+
+  it('L-2: a signature the page is still checking reads CHECKING…', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    // A validly-signed owner hs: (so the fast path can't reject it out of
+    // hand), read with the verify budget spent: its 'hsum' check goes to the
+    // slow slice and reads as not-yet (undefined), nothing counted or cached.
+    const A = signAs(a, 'hsum', { v: 1, b: 'g', u: 1, l: L_HEX, n: { p: '10' }, a: 0 }, CTX);
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    a.doc.transact(() => top(a).set(HS, A));
+    expect(a.casino.bestHouseSum(TABLE, INC)).toBeNull();
+    expect(a.casino.checkpointLabelOf(TABLE, INC, 'any-sid', 1)).toBe('CHECKPOINT · ROUND 1 · CHECKING…');
+  });
+
+  it('L-3: a checkpoint the owner never signed reads NOT CHECKED BY THE OWNER', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    expect(a.casino.checkpointLabelOf(TABLE, INC, 'any-sid', 1)).toBe('CHECKPOINT · ROUND 1 · NOT CHECKED BY THE OWNER');
+  });
+
+  it('L-4: the owner signed this very checkpoint, from the genesis base', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    const A = craftHs(a.pub, { a: 0, u: 1 });
+    a.casino.writeHouseSum(TABLE, INC, A);
+    expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(A);
+    expect(a.casino.checkpointLabelOf(TABLE, INC, houseSumDigest(CTX, A), 1)).toBe('CHECKPOINT · ROUND 1 · CHECKED BY THE OWNER');
+  });
+
+  it('L-5: the owner signed it, but folded every round only from a+1', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    const A = craftHs(a.pub, { a: 2, u: 3 });
+    a.casino.writeHouseSum(TABLE, INC, A);
+    expect(a.casino.checkpointLabelOf(TABLE, INC, houseSumDigest(CTX, A), 3)).toBe('CHECKPOINT · ROUND 3 · CHECKED BY THE OWNER FROM ROUND 3');
+  });
+
+  it('L-6: a later checkpoint than the owner last checked reads NOT CHECKED SINCE', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    a.casino.writeHouseSum(TABLE, INC, craftHs(a.pub, { u: 1 }));
+    // The live fold is at round 2, a session A's digest doesn't name.
+    expect(a.casino.checkpointLabelOf(TABLE, INC, 'later-sid', 2)).toBe('CHECKPOINT · ROUND 2 · NOT CHECKED SINCE ROUND 1');
+  });
+
+  it('L-7: another checkpoint at the round the owner checked flies the flag', async () => {
+    const [a] = await ownerRoom(['A', 'B']);
+    a.casino.writeHouseSum(TABLE, INC, craftHs(a.pub, { u: 2 }));
+    // The same round the owner checked (2), but a different session: a fork.
+    expect(a.casino.checkpointLabelOf(TABLE, INC, 'other-sid', 2)).toBe("🚩 THIS ISN'T THE CHECKPOINT THE OWNER CHECKED AT ROUND 2");
+  });
+
+  it('B1: a handover seen during the visit is named on the new holder’s checkpoint', async () => {
+    const [a, b] = await ownerRoom(['A', 'B']);
+    expect(a.casino.houseDeedChanged()).toBe(false);
+    // The deed passes from A to B (an established key giving way). The next
+    // computed transaction — writeHouseSum's own map.set — counts the change.
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', b.pid));
+    const A = craftHs(b.pub, { a: 0, u: 1 }); // the new holder's own check
+    a.casino.writeHouseSum(TABLE, INC, A);
+    expect(a.casino.houseDeedChanged()).toBe(true);
+    expect(a.casino.checkpointLabelOf(TABLE, INC, houseSumDigest(CTX, A), 1))
+      .toBe('CHECKPOINT · ROUND 1 · CHECKED BY THE OWNER · THE DEED CHANGED HANDS WHILE YOU WERE HERE');
+  });
+});
+
+// The 'same' covered state is pinned here; 'unseen' (P1: the page never saw
+// round u decided) is pinned in computedView.test.ts. 'split' (P2: the
+// checkpoint names another close than the page folded — the forged `l`) arises
+// only under a forged close, and is exercised by the forger sim's P2 probe in
+// C4 (the honest-test policy, design §16).
+describe('🏛️🧮 E — the page’s own comparison (covered)', () => {
+  it('a page that folded the trim with the checkpoint’s close reads covered: same', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    playAndTrim(pages, T0, 1);
+    const v = pages[0].table.computedCheckpointView(TABLE)!;
+    expect(v.round).toBe(1);
+    expect(v.covered).toBe('same');
+    // Its own hs: labels the checkpoint CHECKED, and the comparison agrees.
+    expect(v.label).toBe('CHECKPOINT · ROUND 1 · CHECKED BY THE OWNER');
   });
 });

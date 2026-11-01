@@ -225,7 +225,7 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
+import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, SigCheck } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
@@ -2975,6 +2975,12 @@ const BACKOFF_MS = 600_000;
 /** The deed holder's key the houses were last read under (deedHolderKey):
  *  they read otherwise only as it changes (onComputedTransaction). */
 let houseDeedKey: string | null | undefined;
+/** B1: whether this page saw the room's deed change hands during its visit
+ *  (an established holder's key gave way to another's, or to none). The ⚙
+ *  card names it (checkpointLabelOf), and an owner-signed checkpoint by the
+ *  new holder takes no part in restores (§6.2 F, 6a-2 C3 F). The owner's key
+ *  merely arriving (undefined/null → a key) is no handover. */
+let deedChangedSeen = false;
 
 /** The room's deed holder's identity key, as this page pinned it: null when
  *  the room names no owner (or the legacy marker: nobody's), undefined while
@@ -3225,6 +3231,55 @@ export function bestHouseSum(t: string, inc: string): HouseSum | null {
 export function houseSumBackedOff(t: string, inc: string, now = Date.now()): boolean {
   const bo = houseSumBackoff.get(`${t}:${inc}`);
   return bo !== undefined && now < bo.until;
+}
+
+/** 🏛️ B1: whether this page saw the room's deed change hands during its visit
+ *  (an established holder's key gave way). The ⚙ card adds · THE DEED CHANGED
+ *  HANDS WHILE YOU WERE HERE to the label of a checkpoint signed by the new
+ *  holder, and an owner-signed checkpoint by that holder takes no part in
+ *  restores (§6.2 F). */
+export function houseDeedChanged(): boolean {
+  return deedChangedSeen;
+}
+
+/** 🏛️ Whether the doc holds a shape- and authority-valid owner-signed
+ *  checkpoint for an incarnation whose `'hsum'` signature this page hasn't
+ *  checked yet (the ⚙ card shows CHECKING… while it waits, label L-2). Reads
+ *  the verdict cache only: it never spends a recount's budget or queues a
+ *  slice, so a label read can't move the count forward. */
+export function houseSumPending(t: string, inc: string): boolean {
+  const map = computedMap;
+  if (!map) return false;
+  const hs = houseSumAt(map, t, inc);
+  if (!hs || !authorityOkHouseSum(hs)) return false;
+  const hash = recHash(hs);
+  if (hash === null) return false;
+  return !houseVerdicts.has(JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]));
+}
+
+/** 🏛️ The ⚙ card's checkpoint label for an incarnation (design §6.2 D):
+ *  display only. It sets the owner-signed checkpoint this page counted (A =
+ *  bestHouseSum) against the checkpoint the live fold opened from — the
+ *  session id it opens, `liveSid`, and its round `u`. The first row that
+ *  applies wins (L-0..L-7); null is no label. The checker reads OWNER when it
+ *  signed with the deed holder's own key, else a HOUSE it delegated (6b+).
+ *  B1: a deed handover seen during the visit is named on a checkpoint the new
+ *  holder signed. */
+export function checkpointLabelOf(t: string, inc: string, liveSid: string, u: number): string | null {
+  if (!deedHolderKey()) return null; // L-0: no deed holder (or a venture marker)
+  if (u === 0) return null; // L-1: the genesis base — no checkpoint to label
+  const head = `CHECKPOINT · ROUND ${u} · `;
+  const A = bestHouseSum(t, inc);
+  if (!A) return head + (houseSumPending(t, inc) ? 'CHECKING…' : 'NOT CHECKED BY THE OWNER'); // L-2 / L-3
+  const who = A.k === deedHolderKey() ? 'OWNER' : 'HOUSE';
+  const annot = deedChangedSeen ? ' · THE DEED CHANGED HANDS WHILE YOU WERE HERE' : '';
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  if (houseSumDigest(ctx, A) === liveSid) {
+    // L-4 / L-5: A checks the very checkpoint the fold opened from.
+    return head + (A.a === 0 ? `CHECKED BY THE ${who}` : `CHECKED BY THE ${who} FROM ROUND ${A.a + 1}`) + annot;
+  }
+  if (u > A.u) return `${head}NOT CHECKED SINCE ROUND ${A.u}${annot}`; // L-6
+  return `🚩 THIS ISN'T THE CHECKPOINT THE ${who} CHECKED AT ROUND ${A.u}${annot}`; // L-7
 }
 
 /** 🏛️ D2's write: the deed holder's page stores its signed checkpoint at
@@ -3609,6 +3664,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   houseSumSeen = new Map();
   houseSumBackoff = new Map();
   houseDeedKey = deedHolderKey();
+  deedChangedSeen = false;
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
@@ -3688,6 +3744,10 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // of forged ones past its 2,048).
   const deedKey = deedHolderKey();
   if (deedKey !== houseDeedKey) {
+    // B1: an established holder's key giving way (to another's or to none) is
+    // a handover; the owner's key merely arriving (undefined/null → a key) is
+    // not. Once seen, it stays for the visit (the ⚙ card names it).
+    if (typeof houseDeedKey === 'string') deedChangedSeen = true;
     houseDeedKey = deedKey;
     houseMoved = true;
   }
