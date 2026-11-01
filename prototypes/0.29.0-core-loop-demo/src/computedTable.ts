@@ -3696,10 +3696,12 @@ let recoveredAt: number | null = null;
  * state in and its doc whole (no build deletes a checkpoint or a session
  * with nothing in its place, nor writes one back, nor rewinds one):
  * - **Restore** (casinoDoc restoreComputedCheckpoint): this page's head,
- *   byte for byte, when the doc's checkpoint is gone or junk (at once, in
- *   turn), or rewound below it, or jumped past where any session reaches
- *   (RESTORE_WAIT_MS on, in turn). Turns go by dutyRank('restore') among the
- *   incarnation's keys (ComputedRecovery pubs), STAGGER_MS apart; a page
+ *   byte for byte — or 🏛️ the owner-signed checkpoint, when that is the
+ *   higher by round (casinoDoc restoreTargetOf) — when the doc's checkpoint
+ *   is gone or junk (at once, in turn), or rewound below it, or jumped past
+ *   where any session reaches, or live where the owner's checkpoint is an
+ *   end (RESTORE_WAIT_MS on, in turn). Turns go by dutyRank('restore') among
+ *   the incarnation's keys (ComputedRecovery pubs), STAGGER_MS apart; a page
  *   with none of them waits OUTSIDER_WAIT_MS more. Never over an end, nor
  *   over an extension of the head (no page can tell one from an honest
  *   trim). The page counts from its head meanwhile (casinoDoc heldBase).
@@ -3759,7 +3761,7 @@ function restoreStep(w: Recovering, r: ComputedRecovery, pub: string, now: numbe
   // a delete over it isn't counted: no page writes either, and the first in
   // turn puts the head back at once each time.)
   if (w.wrote !== null && w.wrote !== r.head) w.wrote = null;
-  if (w.wrote !== null && (r.trigger === 'rewind' || r.trigger === 'jump')) {
+  if (w.wrote !== null && (r.trigger === 'rewind' || r.trigger === 'jump' || r.trigger === 'end')) {
     w.wrote = null;
     if (w.overAt === null || w.overAt > now || now - w.overAt > CONTESTED_CALM_MS) w.overwrites = 0;
     w.overwrites += 1;

@@ -14,10 +14,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { asHouseSumFor, houseSumDigest, nextSid, recHash } from './computedFold';
+import * as Y from 'yjs';
+import { asCheckpoint, asHouseSumFor, houseSumDigest, nextSid, recHash } from './computedFold';
 import type { HouseSum } from './computedFold';
 import {
-  openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_TABLE as TABLE, run, signAs, sync, trimByHand,
+  loadPage, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_TABLE as TABLE, run, signAs, sync, trimByHand,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { red, testIdentity } from './computedTestKit';
@@ -27,6 +28,7 @@ vi.stubGlobal('window', { location: { search: '' } });
 const T0 = 2_000_000_000;
 const STEP = 200;
 const HS = `hs:${TABLE}:${INC}`;
+const SUM = `sum:${TABLE}:${INC}`;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
@@ -282,4 +284,146 @@ describe('🏛️🧮 E — the page’s own comparison (covered)', () => {
     // Its own hs: labels the checkpoint CHECKED, and the comparison agrees.
     expect(v.label).toBe('CHECKPOINT · ROUND 1 · CHECKED BY THE OWNER');
   });
+});
+
+// ── 🏛️ F — the owner's checkpoint takes part in restores (design §6.2 F) ──────
+
+/** An owner-signed checkpoint as the `sum:` value a restore of it writes
+ *  (B14.1 / casinoDoc cpValueOfHouseSum): its checkpoint fields with its own
+ *  k and g, the `a`/`d`/`o` of the hs: left off. */
+function cpOfHs(hs: HouseSum): object {
+  return {
+    v: hs.v, b: hs.b, u: hs.u, l: hs.l, n: hs.n,
+    ...(hs.e !== undefined ? { e: hs.e } : {}),
+    ...(hs.s !== undefined ? { s: hs.s } : {}),
+    ...(hs.h !== undefined ? { h: hs.h } : {}),
+    k: hs.k, g: hs.g,
+  };
+}
+
+/** A cheat page (recovery off, never framed): its writes are a peer's doc
+ *  writes, nothing more. Yjs client 99, so a write of its concurrent with a
+ *  page's wins. */
+async function withCheat(pages: Page[], T: number): Promise<Page> {
+  const cheat = await loadPage('X', 99);
+  cheat.casino.setComputedRecoveryForTests(false);
+  sync(T, cheat, ...pages);
+  return cheat;
+}
+
+/** Page p's recovery of the table (casinoDoc computedRecoveries). */
+const recoveryOf = (p: Page) => p.casino.computedRecoveries().find((x) => x.t === TABLE && x.inc === INC)!;
+const sesKey = (sid: string): string => `ses:${TABLE}:${INC}:${sid}`;
+
+describe('🏛️🧮 F — the owner-signed checkpoint takes part in restores', () => {
+  it('F1: a late page that counted no chain restores the owner’s checkpoint over an absent one', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    playAndTrim(pages, T0, 1);
+    const at = Date.now();
+    const A = hsOf(a)!; // the owner's checkpoint for the round-1 trim
+    expect(houseSumDigest(CTX, A)).toBe(liveSid(a)); // A checks the live session
+    // A peer deletes the checkpoint; a fresh page loads with it already gone,
+    // so it counts no chain of its own — only the owner's hs:.
+    const cheat = await withCheat(pages, at);
+    cheat.doc.transact(() => cheat.doc.getMap('casinoComputed').delete(SUM));
+    const c = await loadPage('C', 4);
+    sync(at, cheat, a, b, c);
+    expect(top(c).has(SUM)).toBe(false);
+    // No chain (it never counted a checkpoint), yet the owner's checkpoint
+    // puts the restore in motion: 'junk', its target the owner's own bytes.
+    expect(recoveryOf(c).trigger).toBe('junk');
+    expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(A)));
+    // It writes it back (an outsider: only the owner's key takes a turn).
+    const back = run([c], at + STEP, at + 45_000, { step: STEP, until: () => top(c).has(SUM) });
+    expect(back).toBeLessThanOrEqual(at + 45_000);
+    expect(recHash(top(c).get(SUM))).toBe(recHash(cpOfHs(A)));
+    expect(top(c).has(sesKey(houseSumDigest(CTX, A)))).toBe(true);
+    expect(recoveryOf(c).trigger).toBeNull();
+    // The owner's own page restores the same bytes on the round tie.
+    expect(recHash(recoveryOf(a).head)).toBe(recHash(cpOfHs(A)));
+  }, 60_000);
+
+  it('F2b: a forged rewind at or below the owner’s round is put back as the owner’s checkpoint', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    let at = playAndTrim(pages, T0, 1);
+    const first = top(a).get(SUM); // the round-1 checkpoint P1
+    const firstSid = nextSid(CTX, asCheckpoint(first)!);
+    at = playAndTrim(pages, at, 1); // round 2: the owner's hs: now covers round 2
+    const A = hsOf(a)!;
+    expect(A.u).toBe(2);
+    // A cheat rewinds the checkpoint to round 1 (a replay below the check).
+    const cheat = await withCheat(pages, at);
+    cheat.doc.transact(() => {
+      const m = cheat.doc.getMap('casinoComputed');
+      m.set(SUM, JSON.parse(JSON.stringify(first)));
+      if (!(m.get(sesKey(firstSid)) instanceof Y.Map)) m.set(sesKey(firstSid), new Y.Map());
+    });
+    const c = await loadPage('C', 4);
+    sync(at, cheat, a, b, c);
+    // The late page never takes the rewind as its head; the owner's round-2
+    // checkpoint puts the restore in motion.
+    expect(recoveryOf(c).trigger).toBe('rewind');
+    expect(c.casino.computedRestorePending(TABLE)).toBe(true);
+    expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(A)));
+    const back = run([c], at + STEP, at + 50_000, { step: STEP, until: () => recHash(top(c).get(SUM)) === recHash(cpOfHs(A)) });
+    expect(back).toBeLessThanOrEqual(at + 50_000);
+    expect(recHash(top(c).get(SUM))).toBe(recHash(cpOfHs(A)));
+    expect(top(c).has(sesKey(houseSumDigest(CTX, A)))).toBe(true);
+    expect(recoveryOf(c).trigger).toBeNull();
+  }, 70_000);
+
+  it('F4: an ended checkpoint turned live again is restored, ended, with no session opened', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    playAndTrim(pages, T0, 1); // a live round-1 checkpoint, the owner's hs: over it
+    // The owner's best checkpoint is an end (e:1) — a round higher, so it wins
+    // the order over the round-1 attest. A real signature (never re-checked on
+    // a sum:, but read as a valid one once restored). A cheat has left a live
+    // checkpoint in the doc: the ended table turned live again.
+    const end = signAs(a, 'hsum', { v: 1, b: 'g', u: 2, l: L_HEX, n: { p: '10' }, a: 0, e: 1 }, CTX) as HouseSum;
+    a.casino.writeHouseSum(TABLE, INC, end);
+    expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(end);
+    expect(recoveryOf(a).trigger).toBe('end');
+    expect(a.casino.computedRestorePending(TABLE)).toBe(true);
+    expect(recHash(recoveryOf(a).head)).toBe(recHash(cpOfHs(end)));
+    const from = Date.now();
+    const back = run([a], from + STEP, from + 20_000, { step: STEP, until: () => recHash(top(a).get(SUM)) === recHash(cpOfHs(end)) });
+    expect(back).toBeLessThanOrEqual(from + 20_000);
+    expect((top(a).get(SUM) as { e?: number }).e).toBe(1);
+    // An end opens no session: the restore writes none.
+    expect(top(a).has(sesKey(houseSumDigest(CTX, end)))).toBe(false);
+    expect(recoveryOf(a).trigger).toBeNull();
+  }, 40_000);
+
+  it('B1: a checkpoint by a holder whose handover this page watched takes no part; a fresh page trusts it', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    playAndTrim(pages, T0, 1);
+    const P1 = asCheckpoint(top(a).get(SUM))!;
+    const p1Value = top(a).get(SUM);
+    // The deed passes from A to B during the visit: A and B both watch it.
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', b.pid));
+    sync(Date.now(), a, b);
+    expect(a.casino.houseDeedChanged()).toBe(true);
+    expect(b.casino.houseDeedChanged()).toBe(true);
+    // The new holder B signs a checkpoint of the same round-1 trim.
+    const A1b = signAs(b, 'hsum', { v: 1, b: P1.b, u: P1.u, l: P1.l, n: P1.n, a: 0 }, CTX);
+    b.casino.writeHouseSum(TABLE, INC, A1b);
+    // A peer deletes the checkpoint; a fresh page loads after the handover.
+    const cheat = await withCheat(pages, Date.now());
+    cheat.doc.transact(() => cheat.doc.getMap('casinoComputed').delete(SUM));
+    const c = await loadPage('C', 4);
+    sync(Date.now(), cheat, a, b, c);
+    // A watched the handover: B's checkpoint takes no part, so A restores its
+    // own counted head (the raw trim), not B's checkpoint.
+    expect(recoveryOf(a).trigger).toBe('junk');
+    expect(recHash(recoveryOf(a).head)).toBe(recHash(p1Value));
+    // C loaded after the handover and trusts the deed holder it found: B's
+    // checkpoint takes part, and C's restore target is B's bytes.
+    expect(recoveryOf(c).trigger).toBe('junk');
+    expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(A1b)));
+    expect(recHash(recoveryOf(a).head)).not.toBe(recHash(recoveryOf(c).head));
+  }, 40_000);
 });

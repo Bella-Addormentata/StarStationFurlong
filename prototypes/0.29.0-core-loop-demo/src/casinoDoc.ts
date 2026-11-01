@@ -2210,7 +2210,7 @@ export const TAKEN_WAIT_MS = 45_000;
 const DOUBTED_KEPT = 1_024;
 
 /** What sets a checkpoint's restore going (recoveryTrigger). */
-export type RecoveryTrigger = 'junk' | 'rewind' | 'jump';
+export type RecoveryTrigger = 'junk' | 'rewind' | 'jump' | 'end';
 
 /** 🧪 Whether this page holds its base, and the recovery duties run
  *  (computedTable recoverDuty): off, it reads as v0.50 pages do, a deleted
@@ -2360,8 +2360,49 @@ function baseOf(tableId: string, inc: string): Checkpoint | null {
   return c ? heldBase(c, computedMap!) : checkpointAt(computedMap!, tableId, inc);
 }
 
-/** What puts a recovery in motion at incarnation `c`, read from the doc's
- *  checkpoint `cp` (null: none, or junk) against this page's head:
+/** 🏛️ The owner-signed checkpoint that takes part in incarnation `c`'s
+ *  restores (design §6.2 F): the best valid `hs:` this page counted
+ *  (bestHouseSum), by a checker whose authority stands — unless this page saw
+ *  the deed change hands during its visit (B1 fix 3: a holder it watched take
+ *  the deed could be a cheat writing `roomInfo.owner`; a page that loads after
+ *  trusts the deed holder it finds, as PR 5 does). The label still shows it. */
+function houseSumTakesPart(c: ComputedInc): HouseSum | null {
+  if (deedChangedSeen) return null;
+  const a = houseSumSeen.get(c.key);
+  return a !== undefined && authorityOkHouseSum(a) ? a : null;
+}
+
+/** 🏛️ An owner-signed checkpoint as the value a restore of it writes into
+ *  the checkpoint key (B14.1): its checkpoint fields {v,b,u,l,n,e?,s?,h?}
+ *  with its own `k` and `g` — byte-identical on every page that restores it
+ *  (no build verifies a checkpoint signature, so a value whose `g` is an
+ *  'hsum' signature reads like any other). One object per record, so a
+ *  restore in motion keeps its identity across counts (computedTable
+ *  restoreStep tracks its last write). */
+const houseSumAsCheckpoint = new WeakMap<HouseSum, object>();
+function cpValueOfHouseSum(a: HouseSum): object {
+  let v = houseSumAsCheckpoint.get(a);
+  if (!v) {
+    v = {
+      v: a.v,
+      b: a.b,
+      u: a.u,
+      l: a.l,
+      n: a.n,
+      ...(a.e !== undefined ? { e: a.e } : {}),
+      ...(a.s !== undefined ? { s: a.s } : {}),
+      ...(a.h !== undefined ? { h: a.h } : {}),
+      k: a.k,
+      g: a.g,
+    };
+    houseSumAsCheckpoint.set(a, v);
+  }
+  return v;
+}
+
+/** 🩹 What this page's own counted chain puts in motion at incarnation `c`
+ *  (6a-1, unchanged), read from the doc's checkpoint `cp` (null: none, or
+ *  junk) against this page's head:
  *  - 'junk': none, though this page counted one (put back at once, in turn);
  *  - 'rewind': a live one below the head (a replay, or the lower of two
  *    rival trims: no honest trim goes back);
@@ -2372,7 +2413,7 @@ function baseOf(tableId: string, inc: string): Checkpoint | null {
  *  Null for the head itself, for anything else, an end above all (no
  *  restore touches an `e: 1`) and an extension of the head no page can
  *  tell from an honest one. */
-function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+function chainTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
   const head = c.chain[c.chain.length - 1];
   if (!head) return null;
   if (cp === null) return 'junk';
@@ -2381,6 +2422,55 @@ function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger
   if (liveSidOf(c, cp) === head.sid) return null;
   if (c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return 'jump';
   return null;
+}
+
+/** 🏛️ What the owner-signed checkpoint A puts in motion at incarnation `c`
+ *  (design §6.2 F), when one takes part (houseSumTakesPart):
+ *  - 'junk' (F1): the doc holds none, or junk — even on a page that counted
+ *    none itself (a late page restores the owner's check);
+ *  - 'end' (F4): A is an end (`e: 1`) and the doc holds a live checkpoint
+ *    (the end turned live again: no honest page reopens an ended table);
+ *  - 'rewind' (F2b): a live checkpoint at or below A's round that A does not
+ *    check (another close, or a replay the owner saw past).
+ *  Null for an end in the doc (no restore touches an `e: 1`), for A's own
+ *  checkpoint, and for anything above A (an extension A can't refute). */
+function houseSumTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+  const A = houseSumTakesPart(c);
+  if (!A) return null;
+  if (cp === null) return 'junk';
+  if (cp.e === 1) return null;
+  if (A.e === 1) return 'end';
+  if (cp.u <= A.u && liveSidOf(c, cp) !== houseSumDigest(c.ctx, A)) return 'rewind';
+  return null;
+}
+
+/** What puts a recovery in motion at incarnation `c`, read from the doc's
+ *  checkpoint `cp` (null: none, or junk): this page's own chain first
+ *  (chainTrigger), then the owner-signed checkpoint (houseSumTrigger). With
+ *  no owner's checkpoint taking part this reads exactly as 6a-1 did. */
+function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+  return chainTrigger(c, cp) ?? houseSumTrigger(c, cp);
+}
+
+/** 🏛️ What a restore of incarnation `c` writes back (B14.2), for `trigger`:
+ *  for 'end' the owner's checkpoint A; else the higher by round of this
+ *  page's head and A, A on a tie (its bytes are the same on every page, the
+ *  head's value only on the pages that counted it). Null with neither. */
+function restoreTargetOf(
+  c: ComputedInc,
+  trigger: RecoveryTrigger | null,
+): { value: object; sid: string; u: number; end: boolean } | null {
+  const head = c.chain[c.chain.length - 1];
+  const A = houseSumTakesPart(c);
+  const ofA = (a: HouseSum) => ({
+    value: cpValueOfHouseSum(a),
+    sid: houseSumDigest(c.ctx, a),
+    u: a.u,
+    end: a.e === 1,
+  });
+  if (trigger === 'end') return A ? ofA(A) : null;
+  if (A && (!head || A.u >= head.cp.u)) return ofA(A);
+  return head ? { value: head.value, sid: head.sid, u: head.cp.u, end: head.cp.e === 1 } : null;
 }
 
 /** Whether `cp` is a jump over counted checkpoint `e`: on the session `e`
@@ -2425,7 +2515,15 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   const value = map.get(`sum:${c.t}:${c.inc}`);
   const cp = checkpointAt(map, c.t, c.inc);
   let trigger = recoveryTrigger(c, cp);
-  if (trigger === 'rewind' && cp !== null) {
+  // 🏛️ The chain's adjustments below (a jump giving way to the honest line, an
+  // unseen head giving way, a seen head's rewind refuted) read what this
+  // page's OWN chain says (chainTrigger): a rewind only the owner's checkpoint
+  // names (houseSumTrigger) drops no head and refutes no session — the page
+  // restores the owner's checkpoint over it (restoreTargetOf), and that is
+  // all. (An hs: that outruns the trim it checks would otherwise refute the
+  // session of this page's own head, and the trim, when it came, read as a
+  // jump.)
+  if (chainTrigger(c, cp) === 'rewind' && cp !== null) {
     const sid = liveSidOf(c, cp);
     const i = c.chain.findIndex((e) => e.cp.b === sid && e.cp.u - cp.u > MAX_SESSION_ROUNDS);
     if (i >= 0) {
@@ -2453,7 +2551,7 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   // UNSEEN (load-taken) head can't tell the honest head coming back from a
   // replay, so its rewind is NOT refuted here — it gives way to it (firmAt
   // within the window, giveWayComputed past it).
-  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
+  if (chainTrigger(c, cp) === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
     // Exempt a session the counted chain is built on: a rewind that replays a
     // checkpoint in the chain opens the chain's OWN next session, and refuting
     // it would reject a legitimate higher trim of that session as a jump (a
@@ -2466,7 +2564,9 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   if (cp === null || typeof value !== 'object' || value === null) return;
   const head = c.chain[c.chain.length - 1];
   const sid = liveSidOf(c, cp);
-  if (head && (head.sid === sid || trigger !== null)) return;
+  // (🏛️ A checkpoint the owner's checkpoint refutes is no head either, on a
+  // page that counted none yet: a late page restores the owner's over it.)
+  if ((head && head.sid === sid) || trigger !== null) return;
   const taken = now + TAKEN_WAIT_MS;
   // A checkpoint inherits the head's firmAt only when it EXTENDS the head
   // (built on the session the head opens): then it is as firm as the head it
@@ -2521,7 +2621,7 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
  */
 function noteDoubted(c: ComputedInc, was: FoldResult | null, res: FoldResult, map: Y.Map<unknown>): void {
   const trigger = recoveryTrigger(c, checkpointAt(map, c.t, c.inc));
-  const forged = trigger === 'rewind' || trigger === 'jump';
+  const forged = trigger !== null && trigger !== 'junk';
   const back = c.forged && !forged;
   c.forged = forged;
   if (!was || was.base.sid === res.base.sid) return;
@@ -3979,8 +4079,10 @@ export interface ComputedRecovery {
    *  it starts a restore's wait afresh. */
   trigger: RecoveryTrigger | null;
   calm: number;
-  /** The value a restore writes, this page's head as the doc held it; its
-   *  round. Null with none counted. */
+  /** The value a restore writes (restoreTargetOf): this page's head as the
+   *  doc held it, or 🏛️ the owner-signed checkpoint when that is the higher
+   *  by round (or the trigger is an end turned live); its round. Null with
+   *  neither. */
   head: object | null;
   headU: number;
   /** Live: its switch names it and nothing ended it. */
@@ -3993,10 +4095,11 @@ export interface ComputedRecovery {
   /** The base's round (0 for none). */
   u: number;
   /** The keys that take turns at it: every staked felt's this page counted
-   *  in the session its head opens (Counted pubs) and the head's; and,
-   *  unless the doc's checkpoint puts a restore in motion, the base's and
-   *  its open felts' signers as last counted (a forger, and the felts of
-   *  the session a forged checkpoint opens, take no turn). */
+   *  in the session its head opens (Counted pubs) and the head's; 🏛️ the
+   *  owner-signed checkpoint's checker when it takes part; and, unless the
+   *  doc's checkpoint puts a restore in motion, the base's and its open
+   *  felts' signers as last counted (a forger, and the felts of the session
+   *  a forged checkpoint opens, take no turn). */
   pubs: string[];
 }
 
@@ -4021,10 +4124,13 @@ export function computedRecoveries(): ComputedRecovery[] {
       if (base) pubs.add(base.k);
     }
     if (head) pubs.add(head.cp.k);
+    const A = houseSumTakesPart(c);
+    if (A) pubs.add(A.k);
+    const target = restoreTargetOf(c, trigger);
     out.push({
       t: c.t, inc: c.inc, ctx: c.ctx,
       trigger, calm: c.calm,
-      head: head?.value ?? null, headU: head?.cp.u ?? 0,
+      head: target?.value ?? null, headU: target?.u ?? 0,
       live: computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc && !casino.has(goneKey(c.t, c.inc)) && base?.e !== 1,
       sessionMissing: !(map.get(sessionKey(c.t, c.inc, sid)) instanceof Y.Map),
       lost: sessionLost(c, map, base),
@@ -4037,15 +4143,16 @@ export function computedRecoveries(): ComputedRecovery[] {
 
 /** 🩹 Whether table `tableId`'s switched-on incarnation (or incarnation
  *  `inc` of it) counts from a checkpoint that puts its restore in motion: a
- *  live one rewound below this page's head, or jumped past it
- *  (recoveryTrigger 'rewind', 'jump'). The page counts it as every build
- *  does while the head comes back; nothing builds on it meanwhile (no trim,
- *  no end: computedTable). */
+ *  live one rewound below this page's head or the owner's checkpoint, jumped
+ *  past the head, or 🏛️ live where the owner's checkpoint is an end
+ *  (recoveryTrigger 'rewind', 'jump', 'end'). The page counts it as every
+ *  build does while the head comes back; nothing builds on it meanwhile (no
+ *  trim, no end: computedTable). */
 export function computedRestorePending(tableId: string, inc: string | null = computedIncOf(tableId)): boolean {
   const c = inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`);
   if (!c || !computedMap || !recoveryOn) return false;
   const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
-  return trigger === 'rewind' || trigger === 'jump';
+  return trigger === 'rewind' || trigger === 'jump' || trigger === 'end';
 }
 
 /**
@@ -4085,6 +4192,12 @@ export function giveWayComputed(tableId: string, inc: string): boolean {
   // balances would stick even when every honest page still holds the head.
   if (trigger !== 'rewind') return false;
   if (cp === null || c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return false;
+  // 🏛️ Nor when the owner's checkpoint reaches the head: the restore writes
+  // that checkpoint (restoreTargetOf), not the unseen head, and the house's
+  // signed head is what the one-honest-page-vs-forger case was waiting for —
+  // the page defends it (the backoff, B12, is the only way it stands down).
+  const A = houseSumTakesPart(c);
+  if (A && A.u >= head.cp.u) return false;
   // Drop every trailing unseen entry (a load-taken head and what extends it,
   // never a seen one along the chain): the page stops defending the line it
   // took at load and adopts the doc's value on the next count.
@@ -4128,28 +4241,31 @@ export function computedRecoveryPending(): boolean {
 }
 
 /**
- * 🩹 Put back this page's head of incarnation `inc` of table `tableId` as
- * its checkpoint, byte for byte as the doc held it (every page that counted
- * it writes the same bytes, so whichever write the doc keeps is the same
- * checkpoint), in ONE transaction with an empty map for the session it
- * opens if the doc has none. Only while what the doc holds now still puts
- * the restore in motion (recoveryTrigger: an honest trim that came in
- * meanwhile moved the checkpoint on, and nothing is written), and `head` is
- * this page's head still; on a doc holding every update whole. False
- * (nothing written) otherwise. The only write of a checkpoint besides a
- * trim's and an end's: no page signs one again in place.
+ * 🩹 Put back the checkpoint of incarnation `inc` of table `tableId` — this
+ * page's head, byte for byte as the doc held it, or 🏛️ the owner-signed one
+ * (restoreTargetOf; every page that counted it writes the same bytes, so
+ * whichever write the doc keeps is the same checkpoint) — in ONE transaction
+ * with an empty map for the session it opens if the doc has none. Only
+ * while what the doc holds now still puts the restore in motion
+ * (recoveryTrigger: an honest trim that came in meanwhile moved the
+ * checkpoint on, and nothing is written), and `head` is still the value that
+ * restore writes; on a doc holding every update whole. False (nothing
+ * written) otherwise. The only write of a checkpoint besides a trim's and
+ * an end's: no page signs one again in place.
  */
 export function restoreComputedCheckpoint(tableId: string, inc: string, head: object): boolean {
   const map = computedMap;
   const c = computedIncs.get(`${tableId}:${inc}`);
-  const last = c?.chain[c.chain.length - 1];
-  if (!map || !c || !last || last.value !== head || !recoveryOn || docHoldsPart()) return false;
-  if (recoveryTrigger(c, checkpointAt(map, tableId, inc)) === null) return false;
+  if (!map || !c || !recoveryOn || docHoldsPart()) return false;
+  const trigger = recoveryTrigger(c, checkpointAt(map, tableId, inc));
+  if (trigger === null) return false;
+  const target = restoreTargetOf(c, trigger);
+  if (!target || target.value !== head) return false;
   boundDoc!.transact(() => {
-    map.set(`sum:${tableId}:${inc}`, head);
+    map.set(`sum:${tableId}:${inc}`, target.value);
     // (An end opens no session: compaction would only delete it again.)
-    const key = sessionKey(tableId, inc, last.sid);
-    if (last.cp.e !== 1 && !(map.get(key) instanceof Y.Map)) map.set(key, new Y.Map<unknown>());
+    const key = sessionKey(tableId, inc, target.sid);
+    if (!target.end && !(map.get(key) instanceof Y.Map)) map.set(key, new Y.Map<unknown>());
   });
   return true;
 }
