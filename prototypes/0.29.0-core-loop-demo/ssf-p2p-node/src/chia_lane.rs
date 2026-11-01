@@ -142,8 +142,9 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// Startup self-test + status line. Proves the lane's crypto machinery on a
 /// throwaway key and says what THIS build does with the chain: reads are on by
 /// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
-/// for `SSF_CHIA_LANE=1` and a build with the `chia-publish` feature.
-pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
+/// for the SSF wallet (`wallet_on`: the Bank's switch or `SSF_CHIA_LANE=1`,
+/// chia_wallet_switch.rs) and a build with the `chia-publish` feature.
+pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -174,10 +175,12 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
     };
     let publish = if !cfg!(feature = "chia-publish") {
         "not built"
-    } else if std::env::var("SSF_CHIA_LANE").ok().as_deref() == Some("1") {
-        "on (SSF_CHIA_LANE=1; testnet11, faucet TXCH)"
+    } else if wallet_on {
+        "on (the SSF wallet is on; testnet11, faucet TXCH)"
+    } else if crate::chia_wallet_switch::env_switch() == crate::chia_wallet_switch::EnvSwitch::Off {
+        "off (SSF_CHIA_LANE holds the SSF wallet off)"
     } else {
-        "off (set SSF_CHIA_LANE=1 to publish presence)"
+        "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
     };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",

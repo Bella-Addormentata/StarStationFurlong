@@ -286,6 +286,7 @@ import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tv
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
+import { BANK_WALLET_BUTTON_ID, bankWalletView, turnSsfWallet } from "./bankWallet";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
@@ -4984,6 +4985,49 @@ function harvestStationAtlas(): void {
  *  address; a refused clipboard leaves the address selectable instead. */
 let bankAddressCopied = false;
 
+/** 🏦 The SSF wallet switch on RECEIVE (#335 stage 1, bankWallet.ts):
+ *  CREATE armed and waiting for CONFIRM, a request to the node in flight, and
+ *  the last request's failure. Opening the Bank disarms it and clears the
+ *  failure; the node's own memory of the switch rides on its fingerprint. */
+let bankWalletArmed = false;
+let bankWalletTurning = false;
+let bankWalletError: string | null = null;
+/** When the switch last changed what it does (CREATE became CONFIRM, or a
+ *  turn finished). A tap that lands within BANK_WALLET_SETTLE_MS of that is
+ *  the second half of a double-click or a held Enter, not a decision. */
+let bankWalletChangedAt = 0;
+const BANK_WALLET_SETTLE_MS = 500;
+/** What the switch did at the last render, so a change from any cause (a
+ *  tap, a turn finishing, the node's own answer on a fingerprint round)
+ *  starts the settle time: a tap aimed at the old action never lands on
+ *  the new one. */
+let bankWalletShownAct: string | null = null;
+/** The origin the last fingerprint answered from: where the switch is sent.
+ *  Empty until the node has answered once. */
+let localNodeOrigin = "";
+/** Whether the node answered the last fingerprint probe. The Bank shows the
+ *  wallet, and sends the switch, only while it does: the fingerprint kept
+ *  from before is a stopped node's, and so is its origin. */
+let localNodeLive = false;
+
+/** Ask the node to turn its SSF wallet on or off, then read its fingerprint
+ *  again so the Bank shows what the node now holds, not what the page hoped. */
+async function turnBankWallet(on: boolean): Promise<void> {
+  if (bankWalletTurning) return;
+  bankWalletTurning = true;
+  bankWalletArmed = false;
+  bankWalletError = null;
+  renderBankApp();
+  const turned = await turnSsfWallet(localNodeOrigin, on);
+  bankWalletTurning = false;
+  bankWalletError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  bankWalletChangedAt = performance.now();
+  renderBankApp();
+  // A wallet just turned on has a balance to read.
+  if (turned.ok && on) requestBankBalance();
+}
+
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
  *  The reply lands in the dish's store, whose subscribers repaint the view;
  *  a request that cannot leave (no node, a failed stream) is filed there too,
@@ -5059,13 +5103,29 @@ function renderBankApp(): void {
       // page shows its Base address. The code carries the bare address (no URI
       // scheme: wallet apps read a bare address, schemes are parsed
       // inconsistently); the network warning is in the text beside it.
-      const addr = localFingerprint?.chia_address;
-      if (!addr) {
-        return `<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px; line-height:1.6;">
-          Your station node has no wallet loaded, so there is no address to pay yet. The publish build loads one when
-          started with <code>SSF_CHIA_LANE=1</code> (its address is also printed at startup); it shows here then.
-        </div>`;
+      //
+      // Above it, the SSF wallet switch (bankWallet.ts): what the node holds,
+      // and CREATE SSF WALLET → ⚠ CONFIRM to turn it on, or the switch that
+      // keeps it on or off at the node's next start. One button with one id
+      // whatever it says, so focus stays on it through CONFIRM and TURNING ON.
+      const btnStyle = (lit: boolean) =>
+        `flex-shrink:0; padding:6px 10px; background:rgba(212,168,75,${lit ? "0.25" : "0.10"}); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:#f0c060; font:800 9px 'Courier New', monospace; letter-spacing:1px; cursor:pointer;`;
+      const liveFp = localNodeLive ? localFingerprint : null;
+      const wv = bankWalletView(liveFp, { armed: bankWalletArmed, turning: bankWalletTurning, error: bankWalletError });
+      const b = wv.button;
+      if ((b?.act ?? null) !== bankWalletShownAct) {
+        bankWalletShownAct = b?.act ?? null;
+        bankWalletChangedAt = performance.now();
       }
+      const switchHtml = `
+        ${wv.text || b ? `<div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
+          <span style="flex:1; min-width:0; font-size:10px; color:rgba(212,168,75,${wv.showsAddress ? "0.7" : "0.5"}); line-height:1.6;">${esc(wv.text)}</span>
+          ${b ? `<button type="button" id="${BANK_WALLET_BUTTON_ID}" data-act="${b.act}"${b.busy ? ' aria-disabled="true" aria-busy="true"' : ""} style="${btnStyle(false)}${b.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${b.busy ? " cursor:progress; opacity:0.7;" : ""}">${esc(b.label)}</button>` : ""}
+        </div>` : ""}
+        ${wv.warning ? `<div style="font-size:9px; color:#ffb300; margin-top:4px; line-height:1.6;">${esc(wv.warning)}</div>` : ""}
+        ${wv.error ? `<div role="status" style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">${esc(wv.error)}</div>` : ""}`;
+      const addr = liveFp?.chia_address;
+      if (!addr || !wv.showsAddress) return switchHtml;
       const roomId = activeBootstrap?.roomId ?? null;
       const st = roomId ? latestFaucetStatus(roomId) : null;
       const err = roomId ? latestFaucetError(roomId) : null;
@@ -5081,9 +5141,7 @@ function renderBankApp(): void {
         : owned === null
           ? err ? "not read yet" : "reading the chain…"
           : `${formatMojos(owned)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
-      const btnStyle = (lit: boolean) =>
-        `flex-shrink:0; padding:6px 10px; background:rgba(212,168,75,${lit ? "0.25" : "0.10"}); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:#f0c060; font:800 9px 'Courier New', monospace; letter-spacing:1px; cursor:pointer;`;
-      return `
+      return `${switchHtml}
         <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: "QR code of this node's testnet11 address" })}</div>
         <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <code id="bank-address" style="flex:1; font-size:8.5px; color:#f0c060; word-break:break-all; user-select:all;">${esc(addr)}</code>
@@ -5132,8 +5190,8 @@ function renderBankApp(): void {
     }
     ${header("THE REGISTRY")}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
-      Chia account: kept by your station node (test network); its address and
-      balance are under RECEIVE. On-Registry share trading appears here when
+      Chia account: your SSF wallet, kept by your station node on this computer
+      (test network); turn it on, and see its address and balance, under RECEIVE. On-Registry share trading appears here when
       the node's account service lands. Shares today are room records — same
       rules, no coins at risk.
     </div>
@@ -5159,6 +5217,25 @@ function renderBankApp(): void {
     );
   });
   view.querySelector<HTMLButtonElement>("#bank-refresh-balance")?.addEventListener("click", () => requestBankBalance());
+  view.querySelector<HTMLButtonElement>(`#${BANK_WALLET_BUTTON_ID}`)?.addEventListener("click", (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    if (btn.getAttribute("aria-disabled") === "true") return;
+    const act = btn.dataset.act;
+    // CONFIRM, TURN OFF and KEEP IT ON take a fresh tap: the same button
+    // stands where CREATE was, so a double-click or a held Enter would
+    // otherwise confirm, or undo, what the player has not read.
+    if (act !== "arm" && ((e as MouseEvent).detail > 1 || performance.now() - bankWalletChangedAt < BANK_WALLET_SETTLE_MS)) return;
+    if (act === "arm") {
+      bankWalletArmed = true;
+      bankWalletError = null;
+      bankWalletChangedAt = performance.now();
+      renderBankApp();
+    } else if (act === "confirm" || act === "keep") {
+      void turnBankWallet(true);
+    } else if (act === "off") {
+      void turnBankWallet(false);
+    }
+  });
   if (!view.dataset.wired) {
     view.dataset.wired = "1";
     // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
@@ -5167,6 +5244,14 @@ function renderBankApp(): void {
     // itself, from where ↓ reaches the first button. Nothing acts on a phone
     // that is put away: a control left focused inside it still receives keys.
     view.addEventListener("keydown", (e) => {
+      // 🏦 A held Enter repeats its keydown, and each one activates the
+      // focused button: on the wallet switch that would CONFIRM what CREATE
+      // just armed, then TURN OFF what CONFIRM turned on. Only a fresh press
+      // counts there.
+      if (e.repeat && (e.key === "Enter" || e.key === " ") && (e.target as HTMLElement | null)?.id === BANK_WALLET_BUTTON_ID) {
+        e.preventDefault();
+        return;
+      }
       if (!treasuryViewOnScreen(view)) return;
       if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
       const stops = [...view.querySelectorAll<HTMLElement>("button:not([disabled])")].filter((el) => el.offsetParent !== null);
@@ -8245,6 +8330,10 @@ function setupSpacePhoneOverlay() {
       renderVenturesApp();
     }
     if (id === "bank") {
+      // 🏦 A CREATE armed on an earlier visit waits for no one: opening the
+      // app starts from the switch, and an old failure is not news.
+      bankWalletArmed = false;
+      if (!bankWalletTurning) bankWalletError = null;
       renderBankApp();
       // 🏦 RECEIVE's balance is the wallet half of the faucet status answer:
       // ask the node once on open (the store's subscribers repaint the view
@@ -9001,6 +9090,14 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     ? { origin: nodeOrigin, cap: fingerprint.blob_cap, irohId: fingerprint.iroh_node_id, torrent: fingerprint.torrent === true }
     : null);
   if (!fingerprint) {
+    // 🏦 The Bank, though, shows only a node that answers: no wallet, no
+    // switch, and nowhere to send one while it is away.
+    if (localNodeLive) {
+      localNodeLive = false;
+      localNodeOrigin = "";
+      bankWalletArmed = false;
+      if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
+    }
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
@@ -9010,7 +9107,20 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     renderPhoneBookIndicator(null);
     return localFingerprint;
   }
+  // 🏦 The Bank's RECEIVE reads the address and the wallet switch from the
+  // fingerprint: repaint it while open when either changed (a wallet turned
+  // on or off here, or by SSF_CHIA_LANE at the node's restart).
+  const bankSaw = JSON.stringify([localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  const wasLive = localNodeLive;
   localFingerprint = fingerprint;
+  localNodeOrigin = nodeOrigin;
+  localNodeLive = true;
+  if (
+    (!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
+    document.getElementById("phone-app-bank")?.classList.contains("active")
+  ) {
+    renderBankApp();
+  }
   // 🏠 The node's house key: what this page delegates, as the room's deed
   // holder, for the node to add a seed to its computed tables' rounds
   // (computedTable houseDuty). Kept while the node is away a round.
@@ -9508,7 +9618,7 @@ function setupNetworkDetailsPanel() {
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once SSF_CHIA_LANE=1 and its testnet wallet is funded; chain reads are on for every node, and public rooms never publish)."
+          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a testnet coin; chain reads are on for every node, and public rooms never publish)."
           : "Advanced Chia mesh mode OFF for this room.";
         setTimeout(() => {
           if (feedback) feedback.textContent = "";

@@ -9,7 +9,8 @@
 //!
 //! The principal returns to the wallet (spend-to-self, amount − fee), so only the
 //! fee leaves. Every SDK call is the source-verified 0.34 API (audit surfaces B/C/D).
-//! Behind the `chia-publish` feature; runtime-gated by SSF_CHIA_LANE=1 at the caller.
+//! Behind the `chia-publish` feature; runtime-gated by the SSF wallet switch at the
+//! caller (chia_wallet_switch.rs: the Bank's TURN ON, or `SSF_CHIA_LANE=1`).
 //!
 //! N8 (#231): a room that is public space (bundled seed or PUBLIC passage) is
 //! never published under, armed or not — see [`publishable_rooms`].

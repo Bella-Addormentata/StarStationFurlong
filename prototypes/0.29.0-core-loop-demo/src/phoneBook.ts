@@ -62,10 +62,16 @@ const NO_NODE: PhoneBookIndicator = {
   visible: false, state: null, colour: PHONE_BOOK_GREY, filled: false, title: '', opens: null,
   row: { value: 'NO NODE', colour: ROW_RED },
 };
-const NOT_PUBLISHED: PhoneBookIndicator = {
-  ...NO_NODE,
-  row: { value: 'OFF — this node does not publish presence (a read-only build, no wallet, or SSF_CHIA_FINDABLE=0)', colour: ROW_GREY },
-};
+const notPublished = (value: string): PhoneBookIndicator => ({ ...NO_NODE, row: { value, colour: ROW_GREY } });
+const NOT_PUBLISHED = notPublished('OFF — this node does not publish presence (a read-only build, no SSF wallet, or SSF_CHIA_FINDABLE=0)');
+/** 🏦 The SSF wallet switch says why, when it is the reason (bankWallet.ts). */
+const WALLET_NOT_ON = notPublished("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
+const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
+const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
+/** On, with no listing reported yet: the publisher's first round runs about a
+ *  minute after the wallet turns on, and a node that is not findable never
+ *  reports one. */
+const WALLET_ON_UNREPORTED = notPublished("Not in the Phone Book yet — the SSF wallet is on, and the node checks its listing within a minute or two (it never lists itself with SSF_CHIA_FINDABLE=0 or without a durable contact key)");
 
 /** The icon for a fingerprint round. Hidden, with the row saying why, when
  *  the node did not answer this round (`null`: a cached green must not
@@ -74,7 +80,15 @@ const NOT_PUBLISHED: PhoneBookIndicator = {
 export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): PhoneBookIndicator {
   if (!fp) return NO_NODE;
   const p = fp.chia_presence;
-  if (!p) return NOT_PUBLISHED;
+  if (!p) {
+    switch (fp.chia_wallet?.state) {
+      case 'ready': return WALLET_NOT_ON;
+      case 'off': return WALLET_HELD_OFF;
+      case 'unbuilt': return READ_ONLY_BUILD;
+      case 'on': return WALLET_ON_UNREPORTED;
+      default: return NOT_PUBLISHED;
+    }
+  }
   const error = trimError(p.error);
   const opens: PhoneBookIndicator['opens'] = /unfunded/i.test(error ?? '') ? 'bank' : 'setnet';
   const shown = (colour: string, filled: boolean, title: string): PhoneBookIndicator =>

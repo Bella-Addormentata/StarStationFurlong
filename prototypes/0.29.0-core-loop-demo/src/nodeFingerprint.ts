@@ -39,7 +39,7 @@ export interface LocalFingerprint {
    *  which `nodeSharesCard` (roomCap.ts) reads as sharing. */
   share_card?: boolean;
   /** ⛓️🏦 The node's testnet11 receive address (`txch1…`) while it has a
-   *  wallet loaded (the publish build with `SSF_CHIA_LANE=1`): where TXCH is
+   *  wallet loaded (the publish build with the SSF wallet on): where TXCH is
    *  sent to fund the node's chain writes. Shown by the Bank app with COPY
    *  and a QR code; absent from read-only nodes and older ones. Kept only
    *  when it has the shape of a testnet11 address (`isTestnetAddress`). */
@@ -52,6 +52,12 @@ export interface LocalFingerprint {
    *  `0`) and has ticked once; kept only in the node's shape
    *  (`parseChiaPresence`). */
   chia_presence?: ChiaPresence;
+  /** 🏦 The SSF wallet switch (the node's chia_wallet_switch.rs): whether
+   *  this build can hold a wallet, whether `SSF_CHIA_LANE` in the node's
+   *  environment holds it off, and whether it is on, for the Bank's TURN ON
+   *  (bankWallet.ts). Absent from older nodes, which only `SSF_CHIA_LANE=1`
+   *  turns on. Kept only in the node's shape (`parseChiaWallet`). */
+  chia_wallet?: ChiaWalletSwitch;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
@@ -87,6 +93,46 @@ export interface ChiaPresence {
   current: boolean;
   public_addrs: number;
   error?: string;
+}
+
+/** 🏦 The SSF wallet switch's state: `unbuilt` (a node built without
+ *  publishing), `off` (`SSF_CHIA_LANE` holds it off), `ready` (the Bank may
+ *  turn it on), `on` (the wallet is loaded). */
+export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
+
+export interface ChiaWalletSwitch {
+  state: ChiaWalletState;
+  /** Ready: a seed from an earlier run is on disk, so turning on brings back
+   *  that wallet and its address. */
+  seed?: boolean;
+  /** On: back on at the node's next start. */
+  stays?: boolean;
+  /** On: `SSF_CHIA_LANE=1` holds it on; the Bank cannot turn it off. */
+  held?: boolean;
+  /** Why the last turn failed, in the node's words. */
+  error?: string;
+}
+
+const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on']);
+
+/** The node's `chia_wallet` in its own shape, or undefined for anything
+ *  else: an unknown state, a flag that is not a boolean, or an error that is
+ *  not a string. The Bank then words the node as an older one, which offers
+ *  no switch rather than one the node might not have. */
+export function parseChiaWallet(v: unknown): ChiaWalletSwitch | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.state !== 'string' || !WALLET_STATES.has(r.state)) return undefined;
+  for (const flag of ['seed', 'stays', 'held'] as const) {
+    if (r[flag] !== undefined && typeof r[flag] !== 'boolean') return undefined;
+  }
+  if (r.error !== undefined && typeof r.error !== 'string') return undefined;
+  const w: ChiaWalletSwitch = { state: r.state as ChiaWalletState };
+  if (r.seed === true) w.seed = true;
+  if (r.stays === true) w.stays = true;
+  if (r.held === true) w.held = true;
+  if (typeof r.error === 'string' && r.error) w.error = r.error;
+  return w;
 }
 
 const PRESENCE_STATES: ReadonlySet<string> = new Set<ChiaPresenceState>(['listed', 'sent', 'outdated', 'unlisted']);
@@ -181,6 +227,8 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
   const presence = parseChiaPresence(r.chia_presence);
   if (presence) fp.chia_presence = presence;
+  const wallet = parseChiaWallet(r.chia_wallet);
+  if (wallet) fp.chia_wallet = wallet;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;

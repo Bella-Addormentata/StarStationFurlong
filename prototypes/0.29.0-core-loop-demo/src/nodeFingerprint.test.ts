@@ -3,7 +3,7 @@
  * hex, the same 32 bytes in base64, a port — or it is not the node.
  */
 import { describe, expect, it } from 'vitest';
-import { isTestnetAddress, parseChiaPresence, parseNodeFingerprint } from './nodeFingerprint';
+import { isTestnetAddress, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -36,6 +36,21 @@ describe('parseNodeFingerprint', () => {
       expect(isTestnetAddress(bad)).toBe(false);
       expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: bad })?.chia_address).toBeUndefined();
     }
+  });
+
+  it('keeps the node\'s SSF wallet switch only in the node\'s own shape (🏦 Bank app)', () => {
+    const fp = (chia_wallet: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_wallet })?.chia_wallet;
+    expect(fp({ state: 'ready' })).toEqual({ state: 'ready' });
+    expect(fp({ state: 'ready', seed: true })).toEqual({ state: 'ready', seed: true });
+    expect(fp({ state: 'on', stays: true, held: false, error: 'disk full' })).toEqual({ state: 'on', stays: true, error: 'disk full' });
+    for (const state of ['unbuilt', 'off', 'ready', 'on']) expect(parseChiaWallet({ state })?.state).toBe(state);
+    // An older node sends none, and nothing is invented for it.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_wallet).toBeUndefined();
+    // Anything off the node's shape is no readout: the Bank then offers no switch.
+    for (const bad of [null, 'on', 7, {}, { state: 'ON' }, { state: 'creating' }, { state: 'on', stays: 'yes' }, { state: 'ready', seed: 1 }, { state: 'on', error: 5 }]) {
+      expect(fp(bad)).toBeUndefined();
+    }
+    expect(fp({ state: 'ready', error: '' })).toEqual({ state: 'ready' });
   });
 
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {

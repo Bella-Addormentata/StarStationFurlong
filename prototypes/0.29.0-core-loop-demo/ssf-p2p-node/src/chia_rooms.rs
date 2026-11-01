@@ -17,7 +17,8 @@
 //! so an older browser build cannot talk a node into publishing under it.
 //!
 //! D3 (#231): reads are on by default, so ingest no longer waits for
-//! `SSF_CHIA_LANE=1`; that switch now gates publishing only.
+//! `SSF_CHIA_LANE=1`; that switch gates publishing only, and since #335 it is
+//! the SSF wallet switch in the SpacePhone's Bank (chia_wallet_switch.rs).
 //!
 //! KNOWN LIMIT — the private→public flip. This guard looks at a room's posture
 //! NOW. Records a member published while the room was private stay on chain
@@ -357,7 +358,7 @@ pub fn ingest_room_cap(
         } else if cap.posture_unknown() {
             "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
         } else if cap.chia_mode {
-            "armed — reads on, presence publishes while SSF_CHIA_LANE=1"
+            "armed — reads on, presence publishes while the SSF wallet is on"
         } else {
             "reads on, publishing off"
         };

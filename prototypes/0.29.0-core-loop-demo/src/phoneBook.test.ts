@@ -20,7 +20,14 @@ describe('phoneBookIndicator', () => {
     }
     const off = phoneBookIndicator(BASE);
     expect(off.visible).toBe(false);
-    expect(off.row.value).toBe('OFF — this node does not publish presence (a read-only build, no wallet, or SSF_CHIA_FINDABLE=0)');
+    expect(off.row.value).toBe('OFF — this node does not publish presence (a read-only build, no SSF wallet, or SSF_CHIA_FINDABLE=0)');
+    // 🏦 The SSF wallet switch names the reason when it is the reason, and never shows the icon for it.
+    const why = (state: 'ready' | 'off' | 'unbuilt' | 'on') => phoneBookIndicator({ ...BASE, chia_wallet: { state } });
+    expect(why('ready').row.value).toBe("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
+    expect(why('off').row.value).toBe("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
+    expect(why('unbuilt').row.value).toBe('OFF — this build of the node only reads the chain');
+    expect(why('on').row.value).toBe('Not in the Phone Book yet — the SSF wallet is on, and the node checks its listing within a minute or two (it never lists itself with SSF_CHIA_FINDABLE=0 or without a durable contact key)');
+    for (const s of ['ready', 'off', 'unbuilt', 'on'] as const) expect(why(s).visible).toBe(false);
     // The row carries the icon's own words and colour whenever there is an icon.
     const listedInd = phoneBookIndicator(withPresence({}));
     expect(listedInd.row).toEqual({ value: listedInd.title, colour: PHONE_BOOK_GREEN });

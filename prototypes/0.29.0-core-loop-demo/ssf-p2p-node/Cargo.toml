@@ -40,7 +40,8 @@ chacha20poly1305 = "0.10"
 #   `chia-read`    (in `default`) — hint lookups, parent-spend fetch, record decode:
 #                  the presence reader and the P1 watcher. Reads cost no mojos and
 #                  need no wallet, seed or account, so every node ships them.
-#   `chia-publish` (opt-in at build time; runtime toggle SSF_CHIA_LANE=1) — the
+#   `chia-publish` (opt-in at build time; at runtime the SSF wallet switch in
+#                  the SpacePhone's Bank, or SSF_CHIA_LANE=1/0, chia_wallet_switch.rs) — the
 #                  BLS wallet seed, spend-to-self publish and the craps fairness
 #                  hook. Release builds carry it so one binary ships (D3: the
 #                  separate `ssf-p2p-node-chia.exe` asset retires); dev builds
@@ -137,8 +138,9 @@ chia-read = [
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
 ]
 # Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
-# the craps fairness hook and the treasury codec tests. Runtime-gated by
-# SSF_CHIA_LANE=1 (the publish toggle; D4/P3 give it a UI later).
+# the craps fairness hook and the treasury codec tests. Runtime-gated by the
+# SSF wallet switch (the Bank's TURN ON, remembered in chia_wallet.json;
+# SSF_CHIA_LANE=1 holds it on, any other value off — chia_wallet_switch.rs).
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",

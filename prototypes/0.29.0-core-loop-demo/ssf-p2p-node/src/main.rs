@@ -16,6 +16,9 @@ use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl
 use iroh::endpoint::presets::Minimal;
 
 mod chia_lane;
+// 🏦 The SSF wallet switch (#335): the SpacePhone Bank turns the node's
+// wallet on; decisions here, the route and the hot start below.
+mod chia_wallet_switch;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
@@ -53,7 +56,8 @@ mod chia_faucet;
 // room's pass holders read (the ChiaHub seal and hint, reused).
 #[cfg(feature = "chia-read")]
 mod board_bundles;
-// Chain WRITES (`chia-publish`, runtime-gated by SSF_CHIA_LANE=1): wallet seed,
+// Chain WRITES (`chia-publish`, runtime-gated by the SSF wallet switch,
+// chia_wallet_switch.rs): wallet seed,
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
 mod chia_wallet;
@@ -304,7 +308,7 @@ pub struct Fingerprint {
     #[serde(default)]
     pub share_card: bool,
     /// ⛓️🏦 The node's testnet11 receive address (`txch1…`) while a wallet is
-    /// loaded (the publish build with `SSF_CHIA_LANE=1`), so the SpacePhone's
+    /// loaded (the publish build with the SSF wallet on), so the SpacePhone's
     /// Bank app can show where to send TXCH — COPY and a QR code — the way the
     /// faucet dish shows the jar's address. Read live per request from the
     /// wallet the hub holds; absent while no wallet is loaded. The fingerprint
@@ -322,6 +326,12 @@ pub struct Fingerprint {
     /// address: it never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_presence: Option<ChiaPresence>,
+    /// 🏦 The SSF wallet switch (chia_wallet_switch.rs): whether this build
+    /// can hold a wallet, whether `SSF_CHIA_LANE` holds it off, and whether
+    /// it is on, for the Bank app's TURN ON. Read live per request, in every
+    /// build; absent only from an older node. Loopback only, like the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_wallet: Option<chia_wallet_switch::WalletSwitch>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -605,13 +615,14 @@ pub struct HubState {
     #[cfg(feature = "chia-read")]
     pub knock_queue: Mutex<std::collections::VecDeque<chia_knock::KnockRequest>>,
     /// #231 P6b: the knock queue has a consumer — the heartbeat loop was
-    /// spawned (the publish build, `SSF_CHIA_LANE=1`, a wallet loaded) — and
+    /// spawned (the publish build with the SSF wallet on) — and
     /// the watcher runs (`SSF_CHIA_WATCH` not 0), which judges a sent knock
     /// and dials at its rendezvous (`chia_knock::knocks_available`, #272 review
     /// round 14). Without both a queued knock would never leave, or would
     /// spend a coin its sender never dials on, so rung 6 promises none and
-    /// says what a chain knock needs instead (round 11). Raised once at
-    /// startup, before any dial runs.
+    /// says what a chain knock needs instead (round 11). Raised when the
+    /// publisher starts: at startup before any dial runs, or later when the
+    /// player turns the SSF wallet on in the Bank (rung 6 reads it per dial).
     #[cfg(feature = "chia-read")]
     pub knock_publishing: std::sync::atomic::AtomicBool,
     /// #231 P6b: the knock book (`knocks.json`): knocks we sent (one per host
@@ -619,11 +630,21 @@ pub struct HubState {
     /// height both sides dial by.
     #[cfg(feature = "chia-read")]
     pub knocks: Mutex<chia_knock::KnockBook>,
-    /// ⛓️🥣 The wallet key `SSF_CHIA_LANE=1` loaded at startup (publish build),
-    /// so the faucet dish can TAKE (claim to our address) and GIVE (pay from our
-    /// coin) on the local browser's request. `None` while publishing is off.
+    /// ⛓️🥣 The wallet key (publish build), loaded at startup when the SSF
+    /// wallet switch is on or by the Bank's TURN ON later (`turn_wallet`), so
+    /// the faucet dish can TAKE (claim to our address) and GIVE (pay from our
+    /// coin) on the local browser's request. `None` while the wallet is off.
+    /// It goes from `None` to a key at most once per run, and never back.
     #[cfg(feature = "chia-publish")]
     pub chia_wallet: Mutex<Option<chia_bls::SecretKey>>,
+    /// 🏦 The switch's memory for the fingerprint: whether the Bank's switch is
+    /// remembered on, and why the last turn (or the load at startup) failed.
+    #[cfg(feature = "chia-publish")]
+    pub wallet_switch: Mutex<chia_wallet_switch::SwitchMemo>,
+    /// 🏦 One turn of the switch at a time: two taps or two tabs never mint
+    /// twice or start two publishers.
+    #[cfg(feature = "chia-publish")]
+    pub wallet_turn: tokio::sync::Mutex<()>,
     /// 📖 The Phone Book listing state the presence publisher mirrors here
     /// each tick for the loopback fingerprint (`None` until its first tick,
     /// or for good while the node does not publish presence).
@@ -876,6 +897,7 @@ pub fn compute_fingerprint(
         share_card: false,
         chia_address: None,
         chia_presence: None,
+        chia_wallet: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -946,6 +968,7 @@ mod fingerprint_json_tests {
             share_card: false,
             chia_address: None,
             chia_presence: None,
+            chia_wallet: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -1312,13 +1335,6 @@ mod chia_addr_filter_tests {
     }
 }
 
-/// The publish toggle (#231 D3): `SSF_CHIA_LANE=1` turns PUBLISHING on in a
-/// `chia-publish` build. Reads never consult it. P3/D4 give it a UI + default.
-#[cfg(feature = "chia-publish")]
-fn chia_publish_enabled() -> bool {
-    std::env::var("SSF_CHIA_LANE").ok().as_deref() == Some("1")
-}
-
 /// Outcome of one public-IPv4 echo round. CGNAT is split out from plain
 /// failure (R1) so the fingerprint can classify reachability honestly —
 /// "the echo answered but the WAN is CGNAT" is actionable ("needs relay"),
@@ -1662,10 +1678,29 @@ async fn main() -> Result<()> {
         .collect();
     println!("   Advertised direct-addr hints: {:?}", iroh_direct_addrs);
 
+    // 🏦 Whether the SSF wallet loads at this start (chia_wallet_switch.rs):
+    // the environment first (`SSF_CHIA_LANE=1` on, any other value off), else
+    // the switch the SpacePhone's Bank remembered beside the seed. An
+    // unreadable switch file starts the wallet off and says why.
+    #[cfg(feature = "chia-publish")]
+    let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
+    #[cfg(feature = "chia-publish")]
+    let wallet_starts = {
+        match chia_wallet_switch::remembered(std::path::Path::new(chia_wallet_switch::SWITCH_FILE)) {
+            Ok(on) => wallet_memo.remembered = on,
+            Err(why) => {
+                eprintln!("🏦 SSF wallet: {why} — the Bank's switch counts as off until it is turned again");
+                wallet_memo.error = Some(why);
+            }
+        }
+        chia_wallet_switch::starts_on(true, chia_wallet_switch::env_switch(), wallet_memo.remembered)
+    };
+    #[cfg(not(feature = "chia-publish"))]
+    let wallet_starts = false;
     // ⛓️ ChiaHub lane: crypto self-test + one status line saying what this build
     // does with the chain (reads on by default — #231 D3; publishing behind
-    // SSF_CHIA_LANE=1 in a chia-publish build).
-    chia_lane::startup_status(&secret_key, &iroh_direct_addrs);
+    // the SSF wallet in a chia-publish build).
+    chia_lane::startup_status(&secret_key, &iroh_direct_addrs, wallet_starts);
     // S‑0 step 2: which full-node peers the chain lane will use, and the trust
     // posture money paths take (pins, pin-only, or two agreeing public peers).
     #[cfg(feature = "chia-read")]
@@ -1673,27 +1708,22 @@ async fn main() -> Result<()> {
 
     // ⛓️ ChiaHub lane C1 SLICE 2 (chia-publish feature): load/mint the node's
     // Chia BLS identity and print its testnet11 receive address to fund. ONLY
-    // when publishing is switched on (SSF_CHIA_LANE=1): a read-only node never
-    // mints `chia_identity.seed` (D3). The seed persists beside the iroh key
-    // (bare CWD-relative path, same convention).
+    // when the SSF wallet starts on (above): a node whose wallet was never
+    // turned on never mints `chia_identity.seed` (D3, as amended by #335).
+    // The seed persists beside the iroh key (bare CWD-relative path, same
+    // convention). The Bank's TURN ON runs the same steps later
+    // (`turn_wallet`) when the wallet did not start on.
     // Slice 6 stash: the wallet key outlives this block so the heartbeat
     // publisher (spawned after HubState exists — it reads hub.chia_rooms)
     // can sign spends for ARMED rooms.
     #[cfg(feature = "chia-publish")]
     let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-publish")]
-    if chia_publish_enabled() {
-        let seed_path = std::path::Path::new("chia_identity.seed");
+    if wallet_starts {
+        let seed_path = std::path::Path::new(chia_wallet_switch::SEED_FILE);
         match chia_wallet::load_or_mint_bls_key(seed_path) {
             Ok(chia_sk) => {
-                chia_wallet::log_receive_address(&chia_sk);
-                // #231 P6b/D7: the beacon role pays from a wallet of its own.
-                if chia_publish::beacon_enabled() {
-                    println!(
-                        "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund {} at a testnet11 faucet",
-                        chia_wallet::testnet_address(&chia_publish::beacon_wallet_key(&chia_sk))
-                    );
-                }
+                announce_wallet(&chia_sk);
                 // The wallet lease's parking outlives the process (#245 review,
                 // round 17): a zero-fee spend can still sit in the mempool after
                 // a restart, and the restored parking keeps its inputs, and a
@@ -1702,7 +1732,7 @@ async fn main() -> Result<()> {
                 // that exists but cannot be read SEALS the lease (round 19):
                 // the node then takes no spend until the operator fixes or
                 // removes it and restarts; the startup log says so.
-                chia_publish::WALLET_LEASE.restore(std::path::Path::new("wallet_lease.json"));
+                chia_publish::WALLET_LEASE.restore(std::path::Path::new(chia_wallet_switch::LEASE_FILE));
                 chia_heartbeat_sk = Some(chia_sk.clone());
                 // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
                 // a coin to publish a presence record under a FIXED test room key, so
@@ -1747,7 +1777,10 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            Err(e) => eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}"),
+            Err(e) => {
+                eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}");
+                wallet_memo.error = Some(format!("the wallet could not be loaded at startup: {e:#}"));
+            }
         }
     }
 
@@ -1903,6 +1936,10 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
         #[cfg(feature = "chia-publish")]
+        wallet_switch: Mutex::new(wallet_memo),
+        #[cfg(feature = "chia-publish")]
+        wallet_turn: tokio::sync::Mutex::new(()),
+        #[cfg(feature = "chia-publish")]
         presence_status: Mutex::new(None),
         blobs,
         house: house.map(Mutex::new),
@@ -2002,29 +2039,11 @@ async fn main() -> Result<()> {
     // Every armed room (browser delivered its room key with chia_mode=true via
     // the Slice 3/3b toggle) that is not public space (N8) gets presence
     // published under its REAL room key — within a minute of arming, every
-    // ~30 min after, and on address change. Runtime toggle: SSF_CHIA_LANE=1.
+    // ~30 min after, and on address change. Started here when the wallet
+    // loaded at startup; the Bank's TURN ON starts it later (`turn_wallet`).
     #[cfg(feature = "chia-publish")]
-    if chia_publish_enabled() {
-        if let Some(chia_sk) = chia_heartbeat_sk.clone() {
-            // The knock queue has its consumer (#272 review round 11) — and
-            // rung 6 queues a knock only while the watcher runs too (round
-            // 14): the watcher judges a sent knock by the chain's word and
-            // dials at its rendezvous; without it the knock spends a coin and
-            // the host alone dials. `SSF_CHIA_WATCH=0` keeps knocks off.
-            if chia_knock::knocks_available(true, chia_watch::watch_enabled()) {
-                hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                println!(
-                    "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; presence publishes as before"
-                );
-            }
-            let hub_hb = hub.clone();
-            let iroh_hb = iroh_endpoint.clone();
-            let iroh_sk_hb = secret_key.clone();
-            tokio::spawn(async move {
-                chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, chia_sk).await;
-            });
-        }
+    if let Some(chia_sk) = chia_heartbeat_sk.clone() {
+        start_publisher(&hub, &iroh_endpoint, chia_sk);
     }
 
     // ⛓️ #231 P1: the WATCHER — beat-aligned reads of every readable room's hints
@@ -3088,7 +3107,7 @@ async fn dial_peer_inner(
             // on its confirmation height (`chia_knock`). Queued for the
             // publisher (one spend per tick, once per host per era) — only
             // while one runs, and the watcher with it: without the publish
-            // build, `SSF_CHIA_LANE=1` and a wallet the queue has no consumer,
+            // build and the SSF wallet on the queue has no consumer,
             // and without the watcher a sent knock is never judged or dialed
             // on, so no knock is queued or promised and the log says what one
             // needs (#272 review rounds 11 and 14); an unfunded wallet is the
@@ -3098,7 +3117,7 @@ async fn dial_peer_inner(
                 if let Some((ck, kx)) = keys {
                     if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
                         println!(
-                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with SSF_CHIA_LANE=1, a wallet loaded and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
                         );
                         report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing or the watcher off)")).await;
                         return;
@@ -5553,6 +5572,164 @@ fn read_length_and_slice(bytes: &[u8], mut cursor: usize) -> Result<(&[u8], usiz
     Ok((&bytes[cursor..cursor + len], bytes_read + len))
 }
 
+/// A request header's value (the first one by that name, case-blind).
+fn header_value(req: &str, name: &str) -> Option<String> {
+    req.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+    })
+}
+
+/// 🏦 The SSF wallet switch as the fingerprint shows it (chia_wallet_switch.rs).
+fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Option<String>) {
+    #[cfg(feature = "chia-publish")]
+    {
+        // One read of the key for both the switch's state and the address,
+        // and the key before the memo: `turn_wallet` writes the memo before
+        // the key, so no answer pairs a loaded key with the memo from before
+        // the turn (KEEP IT ON for a wallet that was just saved on).
+        let key = hub.chia_wallet.lock().unwrap().clone();
+        let memo = hub.wallet_switch.lock().unwrap().clone();
+        let loaded = key.is_some();
+        let seed = !loaded && std::path::Path::new(chia_wallet_switch::SEED_FILE).try_exists().unwrap_or(false);
+        let view = chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, seed);
+        (view, key.as_ref().map(chia_wallet::testnet_address))
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = hub;
+        let memo = chia_wallet_switch::SwitchMemo::default();
+        (chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, false), None)
+    }
+}
+
+/// The lines a loaded wallet prints, at startup or when the Bank turns it on:
+/// its receive address and, with the beacon on, the beacon's.
+#[cfg(feature = "chia-publish")]
+fn announce_wallet(chia_sk: &chia_bls::SecretKey) {
+    chia_wallet::log_receive_address(chia_sk);
+    // #231 P6b/D7: the beacon role pays from a wallet of its own.
+    if chia_publish::beacon_enabled() {
+        println!(
+            "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund {} at a testnet11 faucet",
+            chia_wallet::testnet_address(&chia_publish::beacon_wallet_key(chia_sk))
+        );
+    }
+}
+
+/// Start the heartbeat publisher for the loaded wallet: at startup, or when
+/// the Bank turns the wallet on. Once per run — the wallet goes from none to
+/// a key once, and both callers start it right after.
+#[cfg(feature = "chia-publish")]
+fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_bls::SecretKey) {
+    // The knock queue has its consumer (#272 review round 11) — and
+    // rung 6 queues a knock only while the watcher runs too (round
+    // 14): the watcher judges a sent knock by the chain's word and
+    // dials at its rendezvous; without it the knock spends a coin and
+    // the host alone dials. `SSF_CHIA_WATCH=0` keeps knocks off.
+    if chia_knock::knocks_available(true, chia_watch::watch_enabled()) {
+        hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        println!(
+            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; presence publishes as before"
+        );
+    }
+    let hub_hb = hub.clone();
+    let iroh_hb = iroh_endpoint.clone();
+    let iroh_sk_hb = hub.secret_key.clone();
+    tokio::spawn(async move {
+        chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, chia_sk).await;
+    });
+}
+
+/// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
+///
+/// On, when the wallet is not loaded: mint or load the seed, restore the
+/// wallet lease (under its gate, before anything can spend), remember the
+/// switch, and only then hand the key to the hub and start the publisher,
+/// the startup order. On while loaded only remembers it. Off remembers it
+/// off: the wallet stays on until the node stops, since the publisher cannot
+/// stop mid-run. One turn at a time; a failure leaves the wallet as it was
+/// and its words for the Bank.
+#[cfg(feature = "chia-publish")]
+async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) -> Result<(), String> {
+    let env = chia_wallet_switch::env_switch();
+    if let Some(why) = chia_wallet_switch::turn_refusal(true, env, on) {
+        return Err(why.to_string());
+    }
+    let _turn = hub.wallet_turn.lock().await;
+    let switch_path = std::path::Path::new(chia_wallet_switch::SWITCH_FILE);
+    let now = chia_resolve::unix_now();
+    let fail = |why: String| -> Result<(), String> {
+        eprintln!("🏦 SSF wallet: {why}");
+        hub.wallet_switch.lock().unwrap().error = Some(why.clone());
+        Err(why)
+    };
+    // A save that failed: the memo takes what the file now holds, read back,
+    // and the words say so (chia_wallet_switch::after_failed_save).
+    let failed_save = |target: bool, e: std::io::Error, lead: &str| -> String {
+        let previous = hub.wallet_switch.lock().unwrap().remembered;
+        let (remembered, why) =
+            chia_wallet_switch::after_failed_save(target, &e.to_string(), chia_wallet_switch::remembered(switch_path), previous);
+        let why = format!("{lead}{why}");
+        eprintln!("🏦 SSF wallet: {why}");
+        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()) };
+        why
+    };
+    if !on {
+        if let Err(e) = chia_wallet_switch::remember(switch_path, false, now) {
+            return Err(failed_save(false, e, ""));
+        }
+        *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
+        println!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start");
+        return Ok(());
+    }
+    let loaded = hub.chia_wallet.lock().unwrap().is_some();
+    if !loaded {
+        let minted = tokio::task::spawn_blocking(|| {
+            chia_wallet::load_or_mint_bls_key(std::path::Path::new(chia_wallet_switch::SEED_FILE))
+        })
+        .await;
+        let chia_sk = match minted {
+            Ok(Ok(sk)) => sk,
+            Ok(Err(e)) => return fail(format!("the wallet could not be loaded: {e:#}")),
+            Err(e) => return fail(format!("the wallet could not be loaded ({e})")),
+        };
+        announce_wallet(&chia_sk);
+        // The lease's parking outlives the process (see startup): restored
+        // before the key reaches anything that spends, under the lease's gate
+        // so the watcher's reconcile does not run beside it.
+        {
+            let _gate = chia_publish::WALLET_LEASE.lock().await;
+            chia_publish::WALLET_LEASE.restore(std::path::Path::new(chia_wallet_switch::LEASE_FILE));
+        }
+        // The memo before the key: the fingerprint reads the key, then the
+        // memo (wallet_switch_view), so every answer is one wallet state.
+        let saved = match chia_wallet_switch::remember(switch_path, true, now) {
+            Ok(()) => {
+                *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
+                true
+            }
+            Err(e) => {
+                failed_save(true, e, "the wallet is on for this run, but ");
+                false
+            }
+        };
+        *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
+        start_publisher(hub, iroh_endpoint, chia_sk);
+        if saved {
+            println!("🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start");
+        }
+        return Ok(());
+    }
+    if let Err(e) = chia_wallet_switch::remember(switch_path, true, now) {
+        return Err(failed_save(true, e, ""));
+    }
+    *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
+    println!("🏦 SSF wallet: kept on in the Bank — it is back on at the next start");
+    Ok(())
+}
+
 async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
     let mut port = 8080;
     let mut listener = None;
@@ -5684,6 +5861,9 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
             }
 
             if req.starts_with("GET /api/fingerprint") {
+                // 🏦 The switch's view first, outside the fingerprint's lock:
+                // it reads the wallet and the seed file on its own.
+                let (wallet_view, wallet_address) = wallet_switch_view(&hub_clone);
                 let fp_json = {
                     // 🐛 0.16.0 fix: refresh direct-addr hints from the LIVE endpoint
                     // view on every request. Portmapper mappings, QAD-observed and
@@ -5711,13 +5891,15 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     {
                         fp.share_card = hub_clone.contact_key_durable && chia_contact::share_card_enabled();
                     }
+                    fp.chia_wallet = Some(wallet_view);
+                    fp.chia_address = wallet_address;
                     // ⛓️🏦 The wallet's receive address, live too: a wallet is
-                    // loaded at startup or not at all, but the Bank app reads
-                    // the fingerprint, and this is the one place the browser
-                    // learns where its node is paid (never a pass, never a card).
+                    // loaded at startup or when the Bank turns it on, and this
+                    // is the one place the browser learns where its node is
+                    // paid (never a pass, never a card).
+                    // (Set with the switch's view above, from the same read.)
                     #[cfg(feature = "chia-publish")]
                     {
-                        fp.chia_address = hub_clone.chia_wallet.lock().unwrap().as_ref().map(chia_wallet::testnet_address);
                         // 📖 And the Phone Book listing state the publisher
                         // mirrored on its last tick, for the top bar's icon.
                         fp.chia_presence = hub_clone.presence_status.lock().unwrap().clone();
@@ -5754,6 +5936,39 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 } else {
                     ("403 Forbidden", "{\"ok\":false}".to_string())
                 };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/chia/wallet") {
+                // 🏦 The Bank app's SSF wallet switch (chia_wallet_switch.rs):
+                // `on=1` turns the wallet on now (its seed minted the first
+                // time) and remembers it; `on=0` remembers it off for the next
+                // start. Only this machine's own game page may ask: an allowed
+                // loopback or desktop-app Origin, never a web origin or none,
+                // sent to a loopback Host on this port (no re-bound name).
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let (status, body) = if !chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port) {
+                    ("403 Forbidden", serde_json::json!({ "ok": false, "error": "only this computer's own Star Station page can turn the SSF wallet" }))
+                } else if let Some(on) = chia_wallet_switch::turn_asked(target) {
+                    #[cfg(feature = "chia-publish")]
+                    let turned = turn_wallet(&hub_clone, &iroh_snapshot, on).await;
+                    #[cfg(not(feature = "chia-publish"))]
+                    let turned: Result<(), String> = {
+                        let _ = on;
+                        Err(chia_wallet_switch::UNBUILT_WORDS.to_string())
+                    };
+                    chia_wallet_switch::turn_answer(turned, &wallet_switch_view(&hub_clone).0)
+                } else {
+                    ("400 Bad Request", serde_json::json!({ "ok": false, "error": "ask with on=1 or on=0" }))
+                };
+                let body = body.to_string();
                 let response = format!(
                     "HTTP/1.1 {status}\r\n\
                      Content-Type: application/json\r\n\
