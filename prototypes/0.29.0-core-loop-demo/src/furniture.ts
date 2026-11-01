@@ -117,6 +117,7 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 import type { TvScreenView } from "./tvDoc";
 import type { BoardKind, BoardScreen } from "./boardDoc";
 import { BOARD_FACE_H, BOARD_FACE_SCALE, BOARD_FACE_W, boardFaceKey, paintBoardFace } from "./boardFace";
+import { CHALKBOARD_ANCHOR, CHALKBOARD_EYE, CHALKBOARD_W, buildChalkboard } from "./chalkboardBuild";
 import { photoPicture } from "./boardPhotos";
 // …and its own menu while stopped or paused (#258): the cells and the
 // highlight come in the view; the page of library titles is worked out here.
@@ -185,6 +186,8 @@ export type FurnitureKind =
   // notice case behind locked glass.
   | "corkboard"
   | "notice-case"
+  // 🖍 The chalkboard anyone writes on with the chalk on its tray.
+  | "chalkboard"
   | "map-table"
   | "storage-trunk"
   | "game-table"
@@ -5157,6 +5160,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: Math.PI,
       eye: { x: 0.55, y: 1.5, z: 2.1 },
       anchor: { x: 0.55, y: CB_Y, z: 0.05 },
+    },
+  },
+  // 🖍 The chalkboard (chalkboardBuild.ts): on the wall like the boards,
+  // never an obstacle. The focus camera stands square to it, a pace back,
+  // framing the slate and the tray its chalk and eraser lie on.
+  chalkboard: {
+    kind: "chalkboard",
+    build: buildChalkboard,
+    footprint: null,
+    wallMount: { halfW: CHALKBOARD_W / 2 },
+    functions: ["chalkboard"],
+    device: {
+      kind: "chalkboard",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: CHALKBOARD_EYE,
+      anchor: CHALKBOARD_ANCHOR,
     },
   },
   "notice-case": {

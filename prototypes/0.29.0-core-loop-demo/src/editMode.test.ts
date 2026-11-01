@@ -118,6 +118,7 @@ const WRITERS = [
   'writeCupolaWalls', // floorPlanDoc — planMap.set/delete inside a transact
   'clearRobotConfig', // robotDoc — setConfigIn inside a transact on the room doc
   'forgetBoard', // boardDoc — boardNotes.delete inside a transact (✕ REMOVE takes a board's notes with it)
+  'forgetChalkboard', // chalkDoc — chalkMarks.delete inside a transact (✕ REMOVE takes a chalkboard's marks with it)
   // Not imported: reached through `this.world`, whose type arrives as
   // `import type { World }` and whose VALUE arrives as enter()'s argument.
   // The derived import check below therefore cannot see it, correctly — a
@@ -3267,6 +3268,8 @@ opened no unit on it, so everything it does is credited to this one's gate`);
       './robotDoc': ['clearRobotConfig', 'readRobotConfig'],
       // boardKindOf is a pure lookup over a constant table; forgetBoard writes.
       './boardDoc': ['boardKindOf', 'forgetBoard'],
+      // isChalkboardKind compares a kind name; forgetChalkboard writes.
+      './chalkDoc': ['forgetChalkboard', 'isChalkboardKind'],
       // shipRoute transacts in ten places, but neither name editMode takes
       // is one of them: readShipRoute resolves a cached snapshot, and
       // routeRulesFlightNow (shipRoute.ts:1236) is a two-call read over one

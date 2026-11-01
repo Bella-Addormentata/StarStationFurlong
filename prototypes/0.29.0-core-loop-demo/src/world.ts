@@ -204,6 +204,8 @@ import { boardGate } from "./departuresDoc";
 import { boardKindOf, readBoardScreen } from "./boardDoc";
 import { lookBoardPhotos } from "./boardPhotos";
 import { createBoardUI } from "./boardUI";
+import type { ChalkboardHandle } from "./chalkboardBuild";
+import { createChalkboardUI } from "./chalkSession";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
@@ -562,6 +564,9 @@ export class World {
   /** ⛓️🥣 Faucet dish fixtures, keyed by item id — pushed the room's last
    *  faucet status at ~1 Hz (jar level, mojos in the dish, pending spend). */
   private faucetDishes: Map<string, FaucetDishHandle> = new Map();
+  /** 🖍 Chalkboards: driven every frame (timers and face), and handed to the
+   *  focused board's session. */
+  private chalkboards: Map<string, ChalkboardHandle> = new Map();
   /** ⛓️🥣 main.ts installs the node request path (NetworkProvider.requestFaucet)
    *  so the dish screen can ask for status / take / give. */
   public onFaucetRequest: ((op: FaucetOp, amount?: number) => FaucetRequestTicket) | null = null;
@@ -1963,6 +1968,7 @@ export class World {
       alligatorsVisuals: this.alligatorsVisuals,
       casinoTableVisuals: this.casinoTableVisuals,
       faucetDishes: this.faucetDishes,
+      chalkboards: this.chalkboards,
     };
   }
 
@@ -3458,6 +3464,7 @@ export class World {
     this.alligatorsVisuals.delete(itemId);
     this.casinoTableVisuals.delete(itemId);
     this.faucetDishes.delete(itemId);
+    this.chalkboards.delete(itemId);
     forgetCasinoTable(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -4229,6 +4236,8 @@ export class World {
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
+    // 🖍 Chalkboards paint what changed on them (theirs or the room's marks).
+    for (const board of this.chalkboards.values()) board.update(deltaTime);
     // 🔮 #251: the map table's hologram turns and keeps to the shared clock.
     for (const holo of this.mapHolograms.values()) holo.update(deltaTime);
     // 🧹 #327: and the room's splat renderer draws only while one of them
@@ -7268,6 +7277,14 @@ export class World {
         // Dim the in-world screen while focused, as the terminal does (D0.4).
         onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "chalkboard") {
+      // 🖍 The chalkboard: no panel. The session aims the pointer at the
+      // board: chalk and eraser off the tray, press and hold to write.
+      const ui = createChalkboardUI({ itemId: deviceId, handle: this.chalkboards.get(deviceId) ?? null });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
