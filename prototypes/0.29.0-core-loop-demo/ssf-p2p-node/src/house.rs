@@ -1260,6 +1260,9 @@ impl House {
                 if let Some(rec) = self.rooms[room].fair.get(&t) {
                     writes.push(Write::Top { key: format!("hf:{t}"), value: rec.clone() });
                     if !self.last_pass {
+                        // (Held from now, though the reread may come a
+                        // tick later: the cutoff's origin stays.)
+                        self.hold_began(room, &key, now);
                         self.reread = true;
                         continue;
                     }
@@ -1278,6 +1281,7 @@ impl House {
             writes.append(&mut self.heals);
             if self.unclear {
                 if healed && !self.last_pass {
+                    self.hold_began(room, &key, now);
                     self.reread = true;
                 } else {
                     self.held(room, &key, now);
@@ -1757,6 +1761,14 @@ impl House {
     fn held(&mut self, room: &str, key: &(String, String), now: u64) {
         self.through.insert(key.clone(), (false, false));
         self.held_now.insert(key.clone());
+        self.hold_began(room, key, now);
+    }
+
+    /// Table `key` waits from `now` on, if it did not already: a close the
+    /// house first sees once it reads the table again counts as there since
+    /// then ([`TableMem::held_since`]), whether that is the next pass or,
+    /// the tick's reading spent first, a later tick.
+    fn hold_began(&mut self, room: &str, key: &(String, String), now: u64) {
         let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
         mem.held_since.get_or_insert(now);
     }

@@ -44,6 +44,8 @@ pub fn utf8(s: &str) -> bool {
 thread_local! {
     /// The bytes [`utf8`] has read on this thread (tests).
     pub static UTF8_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The keys `typed_array_key` has looked at on this thread (tests).
+    pub static TYPED_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How sure a page's reading of a value is to be [`CVal::from_any`]'s.
@@ -81,6 +83,8 @@ pub enum Clarity {
 /// anything a digit begins, with or without a sign or a point; more than
 /// the spec's, never fewer).
 fn typed_array_key(k: &str) -> bool {
+    #[cfg(test)]
+    TYPED_KEYS_READ.with(|n| n.set(n.get() + 1));
     let b = k.as_bytes();
     let numeric = match b {
         [b'-', rest @ ..] => rest.first().is_some_and(|c| c.is_ascii_digit() || *c == b'.' || *c == b'I'),
@@ -376,7 +380,9 @@ pub fn weigh(v: &yrs::Any, cap: usize) -> Weighed {
                 2
             }
             Any::Map(m) => {
-                let typed = typed_array_map(m);
+                // (Whether a key is one a typed-array prototype drops, as
+                // the capped loop reaches it: no scan of every key first.)
+                let typed = m.contains_key(PROTO);
                 for (k, x) in m.iter() {
                     total = total.saturating_add(k.len() + 4);
                     // An undefined field no reader counts, and a field a

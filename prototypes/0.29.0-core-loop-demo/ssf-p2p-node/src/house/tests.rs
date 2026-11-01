@@ -3429,3 +3429,71 @@ fn a_switch_whose_inc_is_no_houses_length_is_read_no_further() {
         assert!(read < MAX_RECORD_BYTES, "{read} bytes read for UTF-8: the inc unread");
     }
 }
+
+/// A heal that asks for a reread begins the table's hold then, though the
+/// reread runs short of the tick's reading (a peer's junk) and the house
+/// reads the table only a tick or more later: a close first seen then
+/// counts as there since the heal, for the cutoff. (A record healed, and a
+/// setting, which waits a pass for its check.)
+#[test]
+fn a_heal_whose_reread_runs_short_still_marks_when_the_hold_began() {
+    for which in ["seed", "setting"] {
+        let mut room = Room::new(&format!("heal-short-{which}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        let ses = room.ses_key();
+        let tkey = (T.to_string(), INC.to_string());
+        let junk: Vec<String>;
+        if which == "seed" {
+            // ~3 MB: the first pass reads it, the reread no longer can.
+            junk_in(&room, &ses, 50, 60_000);
+            junk = (0..50).map(|i| format!("s:1:junk{i}:{i:032x}")).collect();
+            let seed = obj(vec![("r", CVal::Int(1)), ("p", s("bob")), ("s", s(&seed_of("bob", 1)))]);
+            room.put_padded('x', &seed, Any::Null);
+        } else {
+            // ~3 MB at another table, read the pass the setting heals,
+            // and ~1.5 MB at this one: more than the reread has left.
+            let ses2 = second_table(&room);
+            junk_in(&room, &ses2, 50, 60_000);
+            junk_in(&room, &ses, 25, 60_000);
+            junk = (0..25).map(|i| format!("s:1:junk{i}:{i:032x}")).collect();
+            let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(0)), ("s", CVal::Int(1))]));
+            room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+        }
+        let out = room.tick(200);
+        let healed_at = room.now;
+        assert!(out.short, "{which}: the reread ran short");
+        assert!(room.records("h:").is_empty());
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, Some(healed_at), "{which}: held from the heal on");
+        // Read again a while later: the hold over, the round revealed.
+        for k in &junk {
+            room.delete(k);
+        }
+        room.reveal(&bob, 1);
+        // (The other table's junk read each pass it waits: a tick or two.)
+        for _ in 0..3 {
+            room.tick(1_000);
+            if !room.records("h:1:").is_empty() {
+                break;
+            }
+        }
+        assert_eq!(room.records("h:1:").len(), 1, "{which}: revealed once read");
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{which}: the hold over");
+    }
+}
+
+/// Weighing a map with a `__proto__` field looks at each key only as far
+/// as the capped loop goes, however many keys it holds (undefined ones
+/// weigh little, so a peer's map may hold millions).
+#[test]
+fn weighing_a_map_with_a_proto_field_looks_at_its_keys_no_further_than_its_cap() {
+    let mut m: HashMap<String, Any> = (0..1_000_000).map(|i| (format!("u{i}"), Any::Undefined)).collect();
+    m.insert("__proto__".to_string(), Any::Null);
+    m.insert("r".to_string(), Any::Number(1.0));
+    let v = Any::Map(Arc::new(m));
+    hb::TYPED_KEYS_READ.with(|n| n.set(0));
+    assert!(matches!(hb::weigh(&v, MAX_RECORD_BYTES), hb::Weighed::Heavy | hb::Weighed::Unsure));
+    let looked = hb::TYPED_KEYS_READ.with(|n| n.get());
+    assert!(looked < MAX_RECORD_BYTES / 8, "{looked} keys looked at");
+}
