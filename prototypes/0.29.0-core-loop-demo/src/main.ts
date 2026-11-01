@@ -287,6 +287,14 @@ import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
 import { BANK_WALLET_BUTTON_ID, bankWalletView, turnSsfWallet } from "./bankWallet";
+import {
+  BACKUP_COPY_ID, BACKUP_GRID_ID, BACKUP_ID, BACKUP_IDLE, BACKUP_LATER_ID, BACKUP_SAVED_ID, BACKUP_SHOW_ID,
+  afterAddressCopy, afterCopy, afterWipe, applyReveal, applySave, armSave, backupGridHtml, backupPageKind,
+  bankBackupView, clipboardWipeDue, closeBackupPanel, copyWords, freshTap, heldKeyRepeat, hideWords,
+  markWordsSaved, openBackupPanel, opensAfterTurnOn, reconcileBackupUi, resetBackupUi, revealWords,
+  startReveal, startSave, wipeClipboard, wipeWanted, wordsExpireIn, CLIPBOARD_WIPE_MS,
+} from "./bankBackup";
+import type { BankBackupUi } from "./bankBackup";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
@@ -4993,10 +5001,10 @@ let bankWalletArmed = false;
 let bankWalletTurning = false;
 let bankWalletError: string | null = null;
 /** When the switch last changed what it does (CREATE became CONFIRM, or a
- *  turn finished). A tap that lands within BANK_WALLET_SETTLE_MS of that is
- *  the second half of a double-click or a held Enter, not a decision. */
+ *  turn finished). A tap that lands within BANK_SETTLE_MS of that is the
+ *  second half of a double-click or a held Enter, not a decision
+ *  (bankBackup.ts `freshTap`, the rule SHOW and ⚠ CONFIRM keep too). */
 let bankWalletChangedAt = 0;
-const BANK_WALLET_SETTLE_MS = 500;
 /** What the switch did at the last render, so a change from any cause (a
  *  tap, a turn finishing, the node's own answer on a fingerprint round)
  *  starts the settle time: a tap aimed at the old action never lands on
@@ -5014,6 +5022,7 @@ let localNodeLive = false;
  *  again so the Bank shows what the node now holds, not what the page hoped. */
 async function turnBankWallet(on: boolean): Promise<void> {
   if (bankWalletTurning) return;
+  const before = localNodeLive ? localFingerprint : null;
   bankWalletTurning = true;
   bankWalletArmed = false;
   bankWalletError = null;
@@ -5023,9 +5032,141 @@ async function turnBankWallet(on: boolean): Promise<void> {
   bankWalletError = turned.ok ? null : turned.error;
   await refreshLocalFingerprint();
   bankWalletChangedAt = performance.now();
+  // 🏦 A wallet that just came on from 24 words nobody has written down yet
+  // opens BACK UP, masked, with focus on SHOW: that also takes focus off the
+  // switch, which now reads TURN OFF. SHOW keeps the fresh-tap rule, so the
+  // CONFIRM's double-click or held Enter cannot reveal the words.
+  const after = localNodeLive ? localFingerprint : null;
+  const opens = turned.ok && on && bankViewOnScreen() && opensAfterTurnOn(before, after, bankBackupPage);
+  if (opens) setBankBackup(openBackupPanel(bankBackup, after, performance.now()));
   renderBankApp();
+  if (opens) document.getElementById(BACKUP_SHOW_ID)?.focus({ preventScroll: true });
   // A wallet just turned on has a balance to read.
   if (turned.ok && on) requestBankBalance();
+}
+
+/** 🏦 BACK UP on RECEIVE (bankBackup.ts): the panel, and the 24 words while
+ *  they show. The words live only in `bankBackup.words`, and leave it on
+ *  HIDE, LATER, a save, five minutes, a fingerprint that no longer matches,
+ *  and whenever the Bank is not on screen (`reconcileBackupUi`, run before
+ *  every render, at every fingerprint round, on the phone's and the view's
+ *  class changes and when the page is hidden). Opening the Bank resets it. */
+let bankBackup: BankBackupUi = { ...BACKUP_IDLE };
+/** Whether this page may be shown the words at all (the desktop app, or a
+ *  loopback dev page the node lists): elsewhere BACK UP says to open the app. */
+const bankBackupPage = backupPageKind(window.location);
+let bankBackupExpiryTimer = 0;
+let bankBackupClipTimer = 0;
+
+function bankViewOnScreen(): boolean {
+  const view = document.getElementById("phone-app-bank");
+  return Boolean(view && treasuryViewOnScreen(view));
+}
+
+/** Take the next backup state; true when it changed. Keeps the five-minute
+ *  timer in step with the words on show. */
+function setBankBackup(next: BankBackupUi): boolean {
+  if (next === bankBackup) return false;
+  bankBackup = next;
+  scheduleBankBackupExpiry();
+  return true;
+}
+
+/** A repaint when the shown words reach five minutes: the render's
+ *  reconcile hides them. A timer that fires a little early tries again. */
+function scheduleBankBackupExpiry(): void {
+  window.clearTimeout(bankBackupExpiryTimer);
+  bankBackupExpiryTimer = 0;
+  const left = wordsExpireIn(bankBackup, performance.now());
+  if (left === null) return;
+  bankBackupExpiryTimer = window.setTimeout(() => {
+    bankBackupExpiryTimer = 0;
+    renderBankApp();
+    if (!bankBackupExpiryTimer) scheduleBankBackupExpiry();
+  }, left + 20);
+}
+
+/** COPY's clipboard is emptied CLIPBOARD_WIPE_MS after the copy. Best
+ *  effort: a page without focus (or WebKit without a fresh gesture) may not
+ *  write the clipboard, and then the notice says so. */
+function scheduleBankClipboardWipe(): void {
+  window.clearTimeout(bankBackupClipTimer);
+  bankBackupClipTimer = 0;
+  if (bankBackup.copy !== "held") return;
+  const left = Math.max(0, bankBackup.copiedAt + CLIPBOARD_WIPE_MS - performance.now());
+  bankBackupClipTimer = window.setTimeout(() => {
+    bankBackupClipTimer = 0;
+    if (clipboardWipeDue(bankBackup, performance.now())) wipeBankClipboard();
+    else scheduleBankClipboardWipe();
+  }, left + 20);
+}
+
+/** Empty the clipboard if COPY left the words on it; on every panel tap,
+ *  when the Bank leaves the screen, and from the timer. A panel tap tries
+ *  again after a timer's or a hidden page's wipe was refused: a tap is the
+ *  fresh gesture, with focus, that the browser asks for. */
+function wipeBankClipboard(onTap = false): void {
+  if (!wipeWanted(bankBackup.copy, onTap)) return;
+  window.clearTimeout(bankBackupClipTimer);
+  bankBackupClipTimer = 0;
+  const copiedAt = bankBackup.copiedAt;
+  void wipeClipboard(bankBackup.copy, navigator.clipboard, onTap).then((copy) => {
+    if (setBankBackup(afterWipe(bankBackup, copiedAt, copy))) renderBankApp();
+  });
+}
+
+/** The Bank left the screen: the phone put away by any path, another view,
+ *  or the page hidden. The words go, and so does a reveal still in flight. */
+function bankBackupLeftScreen(): void {
+  wipeBankClipboard();
+  if (setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), false))) {
+    renderBankApp();
+  }
+}
+
+/** SHOW: ask the node for the words of the address the panel opened for.
+ *  The answer lands only in the same panel opening, with the Bank on screen. */
+async function revealBankBackup(): Promise<void> {
+  const started = startReveal(bankBackup, performance.now());
+  if (!started || !started.ui.address) return;
+  setBankBackup(started.ui);
+  renderBankApp();
+  const r = await revealWords(localNodeLive ? localNodeOrigin : "", started.ui.address);
+  setBankBackup(applyReveal(bankBackup, started.ticket, r, bankViewOnScreen(), performance.now()));
+  if (!r.ok && r.refresh) await refreshLocalFingerprint();
+  renderBankApp();
+}
+
+/** ⚠ CONFIRM: tell the node the words are written down. The fingerprint is
+ *  read again after a save, or whenever the answer says the wallet may have
+ *  changed, so the Bank says what the node now holds. */
+async function saveBankBackup(): Promise<void> {
+  const next = startSave(bankBackup);
+  if (next === bankBackup || next.key === null) return;
+  setBankBackup(next);
+  renderBankApp();
+  const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", next.key);
+  const landed = bankBackup.saving;
+  setBankBackup(applySave(bankBackup, r, performance.now()));
+  if (r.ok || r.refresh) await refreshLocalFingerprint();
+  renderBankApp();
+  // Saved: the panel is gone, so focus goes to the view itself.
+  const view = document.getElementById("phone-app-bank");
+  if (r.ok && landed && view && bankViewOnScreen() && (document.activeElement === document.body || view.contains(document.activeElement))) {
+    view.focus({ preventScroll: true });
+  }
+}
+
+/** COPY: the words onto the clipboard, with the wipe scheduled. */
+async function copyBankBackup(): Promise<void> {
+  if (!bankBackup.words) return;
+  const result = await copyWords(bankBackup.words, navigator.clipboard);
+  setBankBackup(afterCopy(bankBackup, result, performance.now()));
+  scheduleBankClipboardWipe();
+  // The words went while the write was out (HIDE, the phone put away):
+  // they do not stay on the clipboard either.
+  if (!bankBackup.words || !bankViewOnScreen()) wipeBankClipboard();
+  renderBankApp();
 }
 
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
@@ -5054,6 +5195,10 @@ function renderBankApp(): void {
   const active = document.activeElement as HTMLElement | null;
   const hadFocus = Boolean(active && view.contains(active));
   const focusedId = hadFocus && active !== view ? active!.id : "";
+  // 🏦 BACK UP's words follow the screen and the node before anything is
+  // drawn: a render of a Bank that is not on screen (a balance landing
+  // behind a put-away phone) draws the grid masked, never the words.
+  setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), treasuryViewOnScreen(view)));
   // Same black-inheritance fix as the VENTURES app (portfolio/property rows).
   view.style.color = "#e8d5a3";
   const esc = (s: string) =>
@@ -5123,9 +5268,55 @@ function renderBankApp(): void {
           ${b ? `<button type="button" id="${BANK_WALLET_BUTTON_ID}" data-act="${b.act}"${b.busy ? ' aria-disabled="true" aria-busy="true"' : ""} style="${btnStyle(false)}${b.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${b.busy ? " cursor:progress; opacity:0.7;" : ""}">${esc(b.label)}</button>` : ""}
         </div>` : ""}
         ${wv.warning ? `<div style="font-size:9px; color:#ffb300; margin-top:4px; line-height:1.6;">${esc(wv.warning)}</div>` : ""}
-        ${wv.error ? `<div role="status" style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">${esc(wv.error)}</div>` : ""}`;
+        ${wv.error ? `<div role="status" style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">${esc(wv.error)}</div>` : ""}
+        ${wv.notice ? `<div style="font-size:9px; color:rgba(255,179,0,0.85); margin-top:4px; line-height:1.6;">${esc(wv.notice)}</div>` : ""}`;
+      // 🏦 BACK UP (bankBackup.ts), under the switch: the nag with BACK UP
+      // above the QR, or the panel in place of the QR, the address and the
+      // balance, or the done line. Every control keeps one id whatever it
+      // says (SHOW/HIDE, I SAVED/⚠ CONFIRM/SAVING…), so focus stays on it;
+      // a busy one is aria-disabled (it keeps focus), and I SAVED before a
+      // reveal is really disabled, so ↑/↓ skips it. The words reach the
+      // markup only through `backupGridHtml`, as text.
+      const bv = bankBackupView(liveFp, bankBackup, bankBackupPage);
+      const ctl = (id: string, label: string, o: { act?: string; busy?: boolean; danger?: boolean; disabled?: boolean; lit?: boolean } = {}) =>
+        `<button type="button" id="${id}"${o.act ? ` data-act="${o.act}"` : ""}${o.busy ? ' aria-disabled="true" aria-busy="true"' : ""}${o.disabled ? " disabled" : ""} style="${btnStyle(Boolean(o.lit))}${o.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${o.busy ? " cursor:progress; opacity:0.7;" : ""}${o.disabled ? " cursor:default; opacity:0.4;" : ""}">${esc(label)}</button>`;
+      const line = (text: string, color: string, status = false) =>
+        `<div${status ? ' role="status"' : ""} style="font-size:9px; color:${color}; margin-top:4px; line-height:1.6;">${esc(text)}</div>`;
+      let backupHtml = "";
+      if (bv && !bv.panel) {
+        backupHtml = `
+        <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+          <span style="flex:1; min-width:0; font-size:9px; color:${bv.state === "done" ? "rgba(212,168,75,0.5)" : "#ffb300"}; line-height:1.6;">${esc(bv.line ?? "")}</span>
+          ${bv.open ? ctl(BACKUP_ID, "BACK UP") : ""}
+        </div>
+        ${bv.elsewhere ? line(bv.elsewhere, "rgba(212,168,75,0.7)") : ""}
+        ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}
+        ${bv.error ? line(bv.error, "#f0a060", true) : ""}`;
+      } else if (bv?.panel) {
+        const p = bv.panel;
+        backupHtml = `
+        <div id="bank-backup-panel" style="border:1px solid rgba(255,179,0,0.35); border-radius:8px; padding:8px 10px; margin-top:6px;">
+          <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:#ffb300;">${esc(p.title)}</div>
+          ${line(p.warning, "#ffb300")}
+          ${backupGridHtml(p.words)}
+          <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;">
+            ${ctl(BACKUP_SHOW_ID, p.show.label, { act: p.show.act, busy: p.show.busy })}
+            ${p.copy ? ctl(BACKUP_COPY_ID, "COPY", { lit: bankBackup.copy === "held" }) : ""}
+            ${ctl(BACKUP_SAVED_ID, p.saved.label, { act: p.saved.act, busy: p.saved.busy, danger: p.saved.danger, disabled: p.saved.disabled })}
+            ${ctl(BACKUP_LATER_ID, "LATER")}
+          </div>
+          ${p.armedWarning ? line(p.armedWarning, "#ff8a80") : ""}
+          ${p.expired ? line(p.expired, "rgba(212,168,75,0.7)") : ""}
+          ${p.keyLine ? line(p.keyLine, "rgba(212,168,75,0.7)") : ""}
+          ${p.funding ? `${line(p.funding.text, "rgba(212,168,75,0.7)")}<code style="display:block; margin-top:2px; font-size:8.5px; color:#f0c060; word-break:break-all;">${esc(p.funding.address)}</code>` : ""}
+          ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}
+          ${bv.error ? line(bv.error, "#f0a060", true) : ""}
+        </div>`;
+        // The panel stands in for the QR, the address and the balance.
+        return `${switchHtml}${backupHtml}`;
+      }
       const addr = liveFp?.chia_address;
-      if (!addr || !wv.showsAddress) return switchHtml;
+      if (!addr || !wv.showsAddress) return `${switchHtml}${backupHtml}`;
       const roomId = activeBootstrap?.roomId ?? null;
       const st = roomId ? latestFaucetStatus(roomId) : null;
       const err = roomId ? latestFaucetError(roomId) : null;
@@ -5141,7 +5332,7 @@ function renderBankApp(): void {
         : owned === null
           ? err ? "not read yet" : "reading the chain…"
           : `${formatMojos(owned)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
-      return `${switchHtml}
+      return `${switchHtml}${backupHtml}
         <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: "QR code of this node's testnet11 address" })}</div>
         <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <code id="bank-address" style="flex:1; font-size:8.5px; color:#f0c060; word-break:break-all; user-select:all;">${esc(addr)}</code>
@@ -5204,6 +5395,10 @@ function renderBankApp(): void {
     navigator.clipboard?.writeText(addr).then(
       () => {
         bankAddressCopied = true;
+        // 🏦 The address is on the clipboard now, over any words COPY left
+        // there: nothing for BACK UP's wipe to empty any more.
+        setBankBackup(afterAddressCopy(bankBackup));
+        scheduleBankClipboardWipe();
         renderBankApp();
         window.setTimeout(() => {
           bankAddressCopied = false;
@@ -5224,7 +5419,7 @@ function renderBankApp(): void {
     // CONFIRM, TURN OFF and KEEP IT ON take a fresh tap: the same button
     // stands where CREATE was, so a double-click or a held Enter would
     // otherwise confirm, or undo, what the player has not read.
-    if (act !== "arm" && ((e as MouseEvent).detail > 1 || performance.now() - bankWalletChangedAt < BANK_WALLET_SETTLE_MS)) return;
+    if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), bankWalletChangedAt)) return;
     if (act === "arm") {
       bankWalletArmed = true;
       bankWalletError = null;
@@ -5236,8 +5431,70 @@ function renderBankApp(): void {
       void turnBankWallet(false);
     }
   });
+  // 🏦 BACK UP (bankBackup.ts). Every tap in the panel first empties a
+  // clipboard COPY left the words on.
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_ID}`)?.addEventListener("click", () => {
+    if (!setBankBackup(openBackupPanel(bankBackup, localNodeLive ? localFingerprint : null, performance.now()))) return;
+    renderBankApp();
+    view.querySelector<HTMLElement>(`#${BACKUP_SHOW_ID}`)?.focus({ preventScroll: true });
+  });
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_SHOW_ID}`)?.addEventListener("click", (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    if (btn.getAttribute("aria-disabled") === "true") return;
+    wipeBankClipboard(true);
+    if (btn.dataset.act === "hide") {
+      // HIDE acts at once, always: hiding is never the risky way round.
+      setBankBackup(hideWords(bankBackup, performance.now()));
+      renderBankApp();
+      return;
+    }
+    // SHOW takes a fresh tap: it stands where HIDE, BACK UP's focus, or the
+    // switch's CONFIRM just were, so a double-click or a held Enter would
+    // otherwise put the words on screen (and on stream) unasked.
+    if (!freshTap((e as MouseEvent).detail, performance.now(), bankBackup.changedAt)) return;
+    void revealBankBackup();
+  });
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_COPY_ID}`)?.addEventListener("click", () => {
+    void copyBankBackup();
+  });
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_SAVED_ID}`)?.addEventListener("click", (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return;
+    wipeBankClipboard(true);
+    if (btn.dataset.act === "arm") {
+      setBankBackup(armSave(bankBackup, performance.now()));
+      renderBankApp();
+      return;
+    }
+    // ⚠ CONFIRM takes a fresh tap: it stands where I SAVED just was.
+    if (!freshTap((e as MouseEvent).detail, performance.now(), bankBackup.changedAt)) return;
+    void saveBankBackup();
+  });
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_LATER_ID}`)?.addEventListener("click", () => {
+    wipeBankClipboard(true);
+    setBankBackup(closeBackupPanel(bankBackup, performance.now()));
+    renderBankApp();
+    // Back to BACK UP, not the first button (the switch's TURN OFF).
+    (view.querySelector<HTMLElement>(`#${BACKUP_ID}`) ?? view).focus({ preventScroll: true });
+  });
+  // The grid is not selectable, and a copy from it is refused: COPY is the
+  // one deliberate way out.
+  view.querySelector<HTMLElement>(`#${BACKUP_GRID_ID}`)?.addEventListener("copy", (e) => e.preventDefault());
   if (!view.dataset.wired) {
     view.dataset.wired = "1";
+    // 🏦 BACK UP's words go whenever the Bank leaves the screen, by any path:
+    // Tab, the bezel, the auto-enter driver closing the phone, another view,
+    // or the page hidden. The phone is only slid offscreen and the view keeps
+    // its markup, so without this the words would stay in a DOM nobody sees.
+    const phone = document.getElementById("spacephone-container");
+    const watch = new MutationObserver(() => {
+      if (!treasuryViewOnScreen(view)) bankBackupLeftScreen();
+    });
+    watch.observe(view, { attributes: true, attributeFilter: ["class"] });
+    if (phone) watch.observe(phone, { attributes: true, attributeFilter: ["class"] });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") bankBackupLeftScreen();
+    });
     // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
     // the phone's toggle and preventDefaults every press), and a COPY only a
     // pointer can reach is decorative. Opening the app lands focus on the view
@@ -5246,9 +5503,10 @@ function renderBankApp(): void {
     view.addEventListener("keydown", (e) => {
       // 🏦 A held Enter repeats its keydown, and each one activates the
       // focused button: on the wallet switch that would CONFIRM what CREATE
-      // just armed, then TURN OFF what CONFIRM turned on. Only a fresh press
-      // counts there.
-      if (e.repeat && (e.key === "Enter" || e.key === " ") && (e.target as HTMLElement | null)?.id === BANK_WALLET_BUTTON_ID) {
+      // just armed, then TURN OFF what CONFIRM turned on; on BACK UP it would
+      // SHOW the words right after HIDE, or CONFIRM what I SAVED armed. Only
+      // a fresh press counts there (bankBackup.ts HELD_KEY_IDS).
+      if (heldKeyRepeat(e, (e.target as HTMLElement | null)?.id)) {
         e.preventDefault();
         return;
       }
@@ -5263,9 +5521,14 @@ function renderBankApp(): void {
     });
   }
   if (hadFocus) {
-    // The same control where it still exists, else the first one, else the view.
+    // The same control where it still exists and can take focus, else the
+    // first one, else the view. A BACK UP control that went or was disabled
+    // under it (the panel closed, or I SAVED waits for SHOW again) hands
+    // focus to SHOW, BACK UP or the view, never to the switch above it.
+    const backupGone = focusedId.startsWith(BACKUP_ID);
     const target =
-      (focusedId ? view.querySelector<HTMLElement>(`#${CSS.escape(focusedId)}`) : null) ??
+      (focusedId ? view.querySelector<HTMLElement>(`#${CSS.escape(focusedId)}:not([disabled])`) : null) ??
+      (backupGone ? view.querySelector<HTMLElement>(`#${BACKUP_SHOW_ID}, #${BACKUP_ID}`) ?? view : null) ??
       (focusedId ? view.querySelector<HTMLElement>("button:not([disabled])") : null) ??
       view;
     target.focus({ preventScroll: true });
@@ -8334,6 +8597,11 @@ function setupSpacePhoneOverlay() {
       // app starts from the switch, and an old failure is not news.
       bankWalletArmed = false;
       if (!bankWalletTurning) bankWalletError = null;
+      // 🏦 BACK UP starts from the nag too: a panel left open on an earlier
+      // visit is closed, its key forgotten, and a reveal still in flight is
+      // dropped when it lands. Only a clipboard that may hold the words is
+      // remembered, so its notice stays until it is dealt with.
+      setBankBackup(resetBackupUi(bankBackup));
       renderBankApp();
       // 🏦 RECEIVE's balance is the wallet half of the faucet status answer:
       // ask the node once on open (the store's subscribers repaint the view
@@ -9091,13 +9359,17 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     : null);
   if (!fingerprint) {
     // 🏦 The Bank, though, shows only a node that answers: no wallet, no
-    // switch, and nowhere to send one while it is away.
+    // switch, and nowhere to send one while it is away. BACK UP forgets the
+    // words and the key of a node that is gone (and is drawn again, on
+    // screen or not, so its markup forgets them too).
+    const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, null, performance.now(), bankViewOnScreen()));
+    const wasLive = localNodeLive;
     if (localNodeLive) {
       localNodeLive = false;
       localNodeOrigin = "";
       bankWalletArmed = false;
-      if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
     }
+    if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
@@ -9115,9 +9387,13 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   localFingerprint = fingerprint;
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
+  // 🏦 BACK UP closes on another address, a wallet no longer on or from
+  // words, or words marked saved (bankBackup.ts reconcileBackupUi).
+  const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen()));
   if (
-    (!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
-    document.getElementById("phone-app-bank")?.classList.contains("active")
+    backupMoved ||
+    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
+      document.getElementById("phone-app-bank")?.classList.contains("active"))
   ) {
     renderBankApp();
   }

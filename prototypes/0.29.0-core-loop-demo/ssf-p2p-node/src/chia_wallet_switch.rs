@@ -4,9 +4,11 @@
 //! Until this switch, a node held a Chia wallet only when it was started with
 //! `SSF_CHIA_LANE=1` in its environment, which a player of the desktop app
 //! never sees. The switch moved into the game: the Bank's TURN ON (CREATE the
-//! first time, when no seed is on disk) loads the wallet, minting its seed
-//! once, and the node remembers the choice in [`SWITCH_FILE`] beside the seed,
-//! so it is back on at the next start.
+//! first time, when no identity is on disk) loads the wallet, minting its
+//! 24-word identity ([`IDENTITY_FILE`]) once, and the node remembers the
+//! choice in [`SWITCH_FILE`] beside it, so it is back on at the next start.
+//! A raw seed from before the words ([`LEGACY_SEED_FILE`]) is retired when
+//! the wallet turns on, and a new wallet made from 24 words takes its place.
 //!
 //! The environment still decides first. `SSF_CHIA_LANE=1` holds the wallet on
 //! for that run (and is not remembered); any other non-empty value holds it
@@ -19,6 +21,13 @@
 //! at the next start, because the publisher cannot stop in the middle of a
 //! run, and spends it already sent are settled by the lease either way.
 //!
+//! 🏦 BACK UP: while the wallet is on and its words are not marked saved, the
+//! Bank shows the 24 words (`POST /api/chia/words`) and records the player's
+//! "I saved them" ([`SAVED_FILE`], `POST /api/chia/words/saved?key=`). Only
+//! the desktop app's own page may ask ([`app_page`]), or a browser page whose
+//! exact origin the operator lists in `SSF_BANK_DEV_PAGES` ([`dev_pages`]).
+//! Once saved, the page never shows them again.
+//!
 //! Everything a decision rests on is a pure function here, so the startup
 //! block, the loopback route and the fingerprint agree and are tested without
 //! touching the process environment.
@@ -28,14 +37,27 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The Bank's switch, remembered beside the seed in the node's data folder
-/// (its CWD, the same bare-path convention as `chia_identity.seed`).
+/// The Bank's switch, remembered beside the wallet's identity in the node's
+/// data folder (its CWD, the same bare-path convention as `iroh_node_id.key`).
 pub const SWITCH_FILE: &str = "chia_wallet.json";
 
-/// The wallet's seed (chia_wallet.rs mints it), whose presence the Bank shows
-/// as TURN ON rather than CREATE: that wallet, and its address, come back.
+/// The wallet's identity: 32 bytes of BIP39 entropy, its 24 words
+/// (chia_wallet.rs mints it once and never rewrites it). Its presence the
+/// Bank shows as TURN ON rather than CREATE: that wallet, and its address,
+/// come back.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub const SEED_FILE: &str = "chia_identity.seed";
+pub const IDENTITY_FILE: &str = "chia_identity.json";
+
+/// A raw 32-byte seed from before the 24 words. Nothing writes it any more:
+/// turning the wallet on archives it (`chia_identity.seed.retired-<unix>`)
+/// and makes a new wallet from 24 words.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const LEGACY_SEED_FILE: &str = "chia_identity.seed";
+
+/// The player's "I saved the 24 words", for one key fingerprint (never
+/// anything secret). Deleting it brings the Bank's BACK UP back.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const SAVED_FILE: &str = "chia_words_saved.json";
 
 /// The wallet lease's parking (chia_publish.rs), restored when the wallet
 /// loads, before anything can spend from it.
@@ -142,7 +164,7 @@ pub fn remembered(path: &Path) -> Result<bool, String> {
 }
 
 /// Remember the switch: written whole (a temporary file renamed over it),
-/// owner-only, like every file beside the seed.
+/// owner-only, like every file beside the identity.
 #[cfg(feature = "chia-publish")]
 pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&SwitchFile { on, at: now }).map_err(std::io::Error::other)?;
@@ -204,13 +226,19 @@ pub enum WalletState {
 /// 🏦 The SSF wallet switch in the loopback fingerprint (`chia_wallet`), for
 /// this machine's own Bank app: which state, and the facts its words need.
 /// Always compiled, like the fingerprint that carries it.
+/// Never carries the words, the entropy, the key fingerprint or an old
+/// address: only flags.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletSwitch {
     pub state: WalletState,
-    /// Ready: a seed from an earlier run is on disk, so turning on brings
-    /// back that wallet and its address rather than minting a new one.
+    /// Ready: the 24-word identity from an earlier run is on disk, so turning
+    /// on brings back that wallet and its address rather than minting a new one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub seed: bool,
+    /// Ready, with no identity: a raw seed from before the 24 words is on
+    /// disk, and turning on retires it for a new wallet at a new address.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy: bool,
     /// On: it is back on at the node's next start (the switch is remembered,
     /// or `SSF_CHIA_LANE=1` holds it on).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -218,6 +246,17 @@ pub struct WalletSwitch {
     /// On: `SSF_CHIA_LANE=1` holds it on, so the Bank cannot turn it off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
+    /// On: the wallet is made from 24 words the node keeps, so the Bank can
+    /// back them up. The capability marker: an older node never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mnemonic: bool,
+    /// On, with `mnemonic`: the player marked these words saved, so the Bank
+    /// stops asking and never shows them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backed_up: bool,
+    /// On: this run's load retired a raw-seed wallet, so the address is new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reminted: bool,
     /// Why the last turn failed, in the node's words (Ready or On only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -231,8 +270,25 @@ pub struct SwitchMemo {
     pub error: Option<String>,
 }
 
+/// What the node knows of the wallet's files and key for the fingerprint:
+/// the files on disk while it is not loaded, the hub's [`WalletMeta`] of the
+/// loaded key while it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyFacts {
+    /// `chia_identity.json` is on disk.
+    pub identity_on_disk: bool,
+    /// `chia_identity.seed` is on disk.
+    pub legacy_on_disk: bool,
+    /// The loaded wallet came from the 24-word identity.
+    pub mnemonic: bool,
+    /// The saved-flag file holds the loaded key's fingerprint.
+    pub backed_up: bool,
+    /// This run's load retired a raw seed.
+    pub reminted: bool,
+}
+
 /// The fingerprint's view, from the facts the node holds.
-pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, seed_on_disk: bool) -> WalletSwitch {
+pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts) -> WalletSwitch {
     let state = if !built {
         WalletState::Unbuilt
     } else if loaded {
@@ -242,11 +298,17 @@ pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, seed_o
     } else {
         WalletState::Ready
     };
+    let on = state == WalletState::On;
+    let ready = state == WalletState::Ready;
     WalletSwitch {
         state,
-        seed: state == WalletState::Ready && seed_on_disk,
-        stays: state == WalletState::On && (env == EnvSwitch::On || memo.remembered),
-        held: state == WalletState::On && env == EnvSwitch::On,
+        seed: ready && facts.identity_on_disk,
+        legacy: ready && !facts.identity_on_disk && facts.legacy_on_disk,
+        stays: on && (env == EnvSwitch::On || memo.remembered),
+        held: on && env == EnvSwitch::On,
+        mnemonic: on && facts.mnemonic,
+        backed_up: on && facts.mnemonic && facts.backed_up,
+        reminted: on && facts.reminted,
         error: matches!(state, WalletState::Ready | WalletState::On).then(|| memo.error.clone()).flatten(),
     }
 }
@@ -305,6 +367,303 @@ pub fn local_page(origin: Option<&str>, host: Option<&str>, port: u16) -> bool {
     page_ok && host_ok
 }
 
+/// 🏦 BACK UP: the Bank's two words routes, both `POST` with no body and no
+/// custom header (simple requests, no preflight), and deliberately outside
+/// `/api/chia/wallet`, so the switch's route never answers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordsAsk {
+    /// `POST /api/chia/words`: show the 24 words of the loaded wallet.
+    Reveal,
+    /// `POST /api/chia/words/saved?key=<fingerprint>`: the player saved the
+    /// words of that key.
+    Saved(u32),
+}
+
+/// Whether a request target belongs to the words routes (and is answered by
+/// them, with a 400 when it asks for nothing they know).
+pub fn is_words_target(target: &str) -> bool {
+    target == "/api/chia/words" || target.starts_with("/api/chia/words/") || target.starts_with("/api/chia/words?")
+}
+
+/// The words route's ask: the reveal with no query, or the saved mark with
+/// exactly one `key`, decimal digits only, that fits a u32.
+pub fn words_asked(target: &str) -> Option<WordsAsk> {
+    if target == "/api/chia/words" {
+        return Some(WordsAsk::Reveal);
+    }
+    let digits = target.strip_prefix("/api/chia/words/saved?key=")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().map(WordsAsk::Saved)
+}
+
+/// The exact origins of browser pages the operator lets show the 24 words
+/// (`SSF_BANK_DEV_PAGES`, comma-separated, such as `http://localhost:5173`
+/// for `tauri dev` or vite). Unset, only the desktop app's page may.
+pub fn dev_pages_of(raw: Option<&OsStr>) -> Vec<String> {
+    raw.and_then(OsStr::to_str)
+        .map(|s| {
+            s.split(',')
+                .map(|o| o.trim().trim_end_matches('/'))
+                .filter(|o| !o.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The process's `SSF_BANK_DEV_PAGES`, read once, like `SSF_CHIA_LANE`.
+pub fn dev_pages() -> &'static [String] {
+    static PAGES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PAGES.get_or_init(|| dev_pages_of(std::env::var_os("SSF_BANK_DEV_PAGES").as_deref()))
+}
+
+/// Whether a words request comes from the desktop app's own page: stricter
+/// than [`local_page`] (whose Host and port rules it keeps), it takes only
+/// `tauri://localhost`, `http(s)://tauri.localhost` with no port on Windows
+/// (WebView2), or an origin listed exactly (case-blind) in `dev_pages`. A
+/// loopback page on another port (another project's dev server, a notebook)
+/// never reads the words unless the operator names it.
+///
+/// Known gaps, accepted for testnet and closed by a native reveal in the
+/// desktop host before mainnet: another OS account on this computer shares
+/// loopback and can send these headers, and a script in the game page itself
+/// passes this check.
+pub fn app_page(origin: Option<&str>, host: Option<&str>, port: u16, dev_pages: &[String]) -> bool {
+    if !local_page(origin, host, port) {
+        return false;
+    }
+    let Some(origin) = origin.map(str::trim) else {
+        return false;
+    };
+    origin.eq_ignore_ascii_case("tauri://localhost")
+        || (cfg!(windows)
+            && (origin.eq_ignore_ascii_case("http://tauri.localhost") || origin.eq_ignore_ascii_case("https://tauri.localhost")))
+        || dev_pages.iter().any(|d| d.eq_ignore_ascii_case(origin))
+}
+
+/// The head of every words-route answer: never cached, never sniffed, and
+/// readable only by `allow_origin` (the origin [`app_page`] accepted, or for
+/// its refusal the one the API grants), never a wider rule.
+pub fn words_reply_head(status: &str, allow_origin: Option<&str>, len: usize) -> String {
+    let cors = match allow_origin {
+        Some(o) if !o.is_empty() && !o.bytes().any(|b| b.is_ascii_control()) => {
+            format!("Access-Control-Allow-Origin: {o}\r\n")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: application/json\r\n\
+         Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         {cors}Vary: Origin\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\r\n"
+    )
+}
+
+/// The words routes' refusals, in the Bank's words (a read-only build
+/// answers every ask that passes the gate with [`UNBUILT_WORDS`]).
+pub const BACKUP_PAGE_ONLY: &str = "only the Star Station app on this computer can show the 24 words \
+     (a browser page needs its origin in SSF_BANK_DEV_PAGES in the node's environment)";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_TURNING: &str = "the wallet is turning; tap SHOW again in a moment";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_NOT_ON: &str = "the SSF wallet is not on, so there are no words to show";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_SAVED: &str = "these words were marked saved, so the Bank does not show them again";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_MISMATCH: &str = "the words on disk do not make the wallet in use, so they are not shown";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_KEY_CHANGED: &str = "the wallet changed since these words were shown; tap SHOW again";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_NOT_SHOWN: &str = "tap SHOW first: your node has not shown these words since it started";
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const BACKUP_UNREADABLE: &str =
+    "your node could not read its 24 words from chia_identity.json, so nothing is shown; the node's log says why";
+pub const BACKUP_BAD_ASK: &str = "ask /api/chia/words or /api/chia/words/saved?key=<fingerprint>";
+
+/// The saved flag's contents: a key fingerprint, nothing secret.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SavedFile {
+    /// The key fingerprint whose words the player marked saved.
+    pub key: u32,
+    /// When, unix seconds (for the operator reading it).
+    #[serde(default)]
+    pub at: u64,
+}
+
+/// Whether the player marked the words of `key` saved: `Ok(false)` when
+/// there is no flag, or it names another key (a wallet made since), `Err`
+/// with the reason when it exists and cannot be read, which the caller
+/// counts as not saved and says so.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn saved_for(path: &Path, key: u32) -> Result<bool, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<SavedFile>(&bytes)
+            .map(|f| f.key == key)
+            .map_err(|e| format!("{} is not a saved flag the node can read ({e})", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{} cannot be read ({e})", path.display())),
+    }
+}
+
+/// Remember that the words of `key` are saved: written whole, owner-only,
+/// like the switch.
+#[cfg(feature = "chia-publish")]
+pub fn remember_saved(path: &Path, key: u32, now: u64) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(&SavedFile { key, at: now }).map_err(std::io::Error::other)?;
+    crate::chia_contact::write_private(path, &bytes)
+}
+
+/// 🏦 What the hub keeps beside the loaded wallet key for the Bank (never
+/// the words or the entropy): the fingerprint of its words, whether the
+/// player marked them saved, whether this run's load retired a raw seed,
+/// and whether the Bank showed the words since the node started.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletMeta {
+    pub fingerprint: u32,
+    pub backed_up: bool,
+    pub reminted: bool,
+    pub revealed: bool,
+}
+
+/// 🏦 Where one words ask goes, decided against the loaded wallet: an answer
+/// now, or the one piece of I/O the route does next. `K` is the loaded
+/// wallet key, carried through untouched, so the reveal holds the key its
+/// words are checked against.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordsStep<K> {
+    /// A 409 now ([`WordsRefusal::answer`]).
+    Refuse(WordsRefusal),
+    /// A saved mark already recorded: 200 with the switch's view
+    /// ([`saved_answer`]), nothing written.
+    SavedIdempotent,
+    /// The reveal: read the identity file again, and show its words only
+    /// when they make `wallet`, the loaded key, whose words' fingerprint is
+    /// `fingerprint` ([`words_match`]).
+    ReadFile { wallet: K, fingerprint: u32 },
+    /// The saved mark: write the flag for `key`, the loaded key's
+    /// fingerprint ([`after_failed_mark`] when the write fails).
+    WriteFlag { key: u32 },
+}
+
+/// The words asks refused before any I/O, each a 409.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordsRefusal {
+    /// No wallet, and a turn holds the lock (it may be loading one).
+    Turning,
+    /// No wallet.
+    NotOn,
+    /// A reveal once the words are marked saved: the page never shows them
+    /// again, and the answer says so with `saved: true`.
+    AlreadySaved,
+    /// A saved mark for another key than the loaded one.
+    KeyChanged,
+    /// A saved mark before this run showed the words.
+    NotShown,
+}
+
+impl WordsRefusal {
+    /// The refusal's status line and body.
+    #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+    pub fn answer(self) -> (&'static str, serde_json::Value) {
+        let refuse = |error: &str| ("409 Conflict", serde_json::json!({ "ok": false, "error": error }));
+        match self {
+            WordsRefusal::Turning => refuse(BACKUP_TURNING),
+            WordsRefusal::NotOn => refuse(BACKUP_NOT_ON),
+            WordsRefusal::AlreadySaved => ("409 Conflict", serde_json::json!({ "ok": false, "saved": true, "error": BACKUP_SAVED })),
+            WordsRefusal::KeyChanged => refuse(BACKUP_KEY_CHANGED),
+            WordsRefusal::NotShown => refuse(BACKUP_NOT_SHOWN),
+        }
+    }
+}
+
+/// 🏦 Where a words ask goes. `loaded` is the wallet key and its meta, or
+/// none while no wallet is loaded; `turning` (whether a turn holds the lock)
+/// counts only then. A reveal is refused once the words are marked saved and
+/// otherwise reads the file. A saved mark checks the key first (a wallet
+/// made since the words were shown wins, even over a flag already saved),
+/// then answers a mark already recorded as done, and writes the flag only
+/// for words this run showed.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bool) -> WordsStep<K> {
+    let Some((wallet, meta)) = loaded else {
+        return WordsStep::Refuse(if turning { WordsRefusal::Turning } else { WordsRefusal::NotOn });
+    };
+    match ask {
+        WordsAsk::Reveal if meta.backed_up => WordsStep::Refuse(WordsRefusal::AlreadySaved),
+        WordsAsk::Reveal => WordsStep::ReadFile { wallet, fingerprint: meta.fingerprint },
+        WordsAsk::Saved(key) if key != meta.fingerprint => WordsStep::Refuse(WordsRefusal::KeyChanged),
+        WordsAsk::Saved(_) if meta.backed_up => WordsStep::SavedIdempotent,
+        WordsAsk::Saved(_) if !meta.revealed => WordsStep::Refuse(WordsRefusal::NotShown),
+        WordsAsk::Saved(key) => WordsStep::WriteFlag { key },
+    }
+}
+
+/// Whether the words read back for a reveal make the wallet in use: both
+/// the fingerprint and the wallet public key they make (`read_*`) equal the
+/// loaded key's (`loaded_*`). Anything else is not shown.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn words_match<P: PartialEq>(read_fingerprint: u32, read_wallet: &P, loaded_fingerprint: u32, loaded_wallet: &P) -> bool {
+    read_fingerprint == loaded_fingerprint && read_wallet == loaded_wallet
+}
+
+/// The saved route's 200: `ok`, the switch's view after the mark (with
+/// `backed_up`), and `note` when the mark was written but not confirmed.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn saved_answer(wallet: &WalletSwitch, note: Option<&str>) -> (&'static str, serde_json::Value) {
+    let mut body = serde_json::json!({ "ok": true, "wallet": wallet });
+    if let Some(note) = note {
+        body["note"] = note.into();
+    }
+    ("200 OK", body)
+}
+
+/// What a saved mark whose write failed comes to, read back from the flag
+/// like [`after_failed_save`] for the switch: a failed save does not show the
+/// flag is missing (the replace can land and the directory sync after it
+/// fail).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FailedMark {
+    /// The flag holds the key: the words count as saved (the route marks
+    /// them backed up) and its 200 carries this note.
+    Landed { note: String },
+    /// It does not, or cannot be read back: a 500 with this error, and the
+    /// words stay not saved, so the player can tap I SAVED again.
+    Lost { error: String },
+}
+
+/// [`FailedMark`] of a flag write that failed with `err`, from the flag read
+/// back for the same key (`reread`, [`saved_for`]).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn after_failed_mark(err: &str, reread: Result<bool, String>) -> FailedMark {
+    match reread {
+        Ok(true) => FailedMark::Landed { note: format!("saved, but not confirmed on disk ({err})") },
+        Ok(false) | Err(_) => FailedMark::Lost {
+            error: format!("the Bank could not record it ({err}); your words are fine, tap I SAVED again"),
+        },
+    }
+}
+
+/// The origin a words answer is readable by: once [`app_page`] `passed`,
+/// that exact origin and never a wider rule; for its 403, the origin only
+/// when the API grants it (`granted`, every route's `cors_origin` rule), so
+/// a dev page not yet in `SSF_BANK_DEV_PAGES` reads why.
+pub fn words_allow_origin(passed: bool, origin: Option<&str>, granted: bool) -> Option<&str> {
+    if passed {
+        origin
+    } else {
+        origin.filter(|_| granted)
+    }
+}
+
 fn is_loopback_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
 }
@@ -337,6 +696,21 @@ fn loopback_host_port(s: &str) -> Option<(&str, Option<u16>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A switch in `state` with every flag clear.
+    fn sw(state: WalletState) -> WalletSwitch {
+        WalletSwitch {
+            state,
+            seed: false,
+            legacy: false,
+            stays: false,
+            held: false,
+            mnemonic: false,
+            backed_up: false,
+            reminted: false,
+            error: None,
+        }
+    }
 
     #[test]
     fn the_environment_classifies_as_it_did_and_unset_leaves_it_to_the_bank() {
@@ -409,11 +783,11 @@ mod tests {
 
     #[test]
     fn a_turn_answers_ok_or_the_refusal_with_the_switch_as_an_object() {
-        let on = WalletSwitch { state: WalletState::On, seed: false, stays: true, held: false, error: None };
+        let on = WalletSwitch { stays: true, ..sw(WalletState::On) };
         let (status, body) = turn_answer(Ok(()), &on);
         assert_eq!(status, "200 OK");
         assert_eq!(body.to_string(), r#"{"ok":true,"wallet":{"state":"on","stays":true}}"#);
-        let off = WalletSwitch { state: WalletState::Off, seed: false, stays: false, held: false, error: None };
+        let off = sw(WalletState::Off);
         let (status, body) = turn_answer(Err(OFF_WORDS.to_string()), &off);
         assert_eq!(status, "409 Conflict");
         assert_eq!(body["ok"], false);
@@ -440,24 +814,26 @@ mod tests {
     fn the_bank_reads_one_state_and_only_the_facts_that_state_needs() {
         use EnvSwitch::*;
         let memo = |remembered, error: Option<&str>| SwitchMemo { remembered, error: error.map(str::to_string) };
-        let v = view(false, On, false, &memo(true, Some("x")), true);
-        assert_eq!(v, WalletSwitch { state: WalletState::Unbuilt, seed: false, stays: false, held: false, error: None });
-        let v = view(true, Off, false, &memo(true, Some("x")), true);
-        assert_eq!(v, WalletSwitch { state: WalletState::Off, seed: false, stays: false, held: false, error: None });
-        let v = view(true, Unset, false, &memo(false, None), true);
-        assert_eq!(v, WalletSwitch { state: WalletState::Ready, seed: true, stays: false, held: false, error: None });
-        let v = view(true, Unset, false, &memo(false, Some("disk full")), false);
+        let identity = KeyFacts { identity_on_disk: true, ..KeyFacts::default() };
+        let none = KeyFacts::default();
+        let v = view(false, On, false, &memo(true, Some("x")), &identity);
+        assert_eq!(v, sw(WalletState::Unbuilt));
+        let v = view(true, Off, false, &memo(true, Some("x")), &identity);
+        assert_eq!(v, sw(WalletState::Off));
+        let v = view(true, Unset, false, &memo(false, None), &identity);
+        assert_eq!(v, WalletSwitch { seed: true, ..sw(WalletState::Ready) });
+        let v = view(true, Unset, false, &memo(false, Some("disk full")), &none);
         assert_eq!(v.error.as_deref(), Some("disk full"), "a failed turn says why");
-        let v = view(true, Unset, true, &memo(true, None), true);
-        assert_eq!(v, WalletSwitch { state: WalletState::On, seed: false, stays: true, held: false, error: None });
-        let v = view(true, Unset, true, &memo(false, None), true);
+        let v = view(true, Unset, true, &memo(true, None), &identity);
+        assert_eq!(v, WalletSwitch { stays: true, ..sw(WalletState::On) });
+        let v = view(true, Unset, true, &memo(false, None), &identity);
         assert!(!v.stays, "turned off in the Bank: on until the node stops");
-        let v = view(true, On, true, &memo(false, None), true);
+        let v = view(true, On, true, &memo(false, None), &identity);
         assert!(v.stays && v.held, "held on by SSF_CHIA_LANE=1");
 
-        let json = serde_json::to_string(&view(true, Unset, false, &memo(false, None), false)).unwrap();
+        let json = serde_json::to_string(&view(true, Unset, false, &memo(false, None), &none)).unwrap();
         assert_eq!(json, r#"{"state":"ready"}"#, "flags ride only when set");
-        let json = serde_json::to_string(&view(true, On, true, &memo(false, Some("e")), false)).unwrap();
+        let json = serde_json::to_string(&view(true, On, true, &memo(false, Some("e")), &none)).unwrap();
         assert_eq!(json, r#"{"state":"on","stays":true,"held":true,"error":"e"}"#);
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"unbuilt"}"#).unwrap();
         assert_eq!(back.state, WalletState::Unbuilt);
@@ -500,5 +876,311 @@ mod tests {
         assert!(!ok("http://localhost:5173", "127.0.0.1:80x"));
         assert!(!ok("http://localhost:5173", "[::1]"));
         assert!(local_page(Some("http://localhost:5173"), Some("127.0.0.1:8081"), 8081), "the API on its second port");
+    }
+
+    /// 🏦 The 24-word flags: `seed` and `legacy` only while Ready, the
+    /// words' own flags only while On, in the order the Bank's parser reads.
+    #[test]
+    fn the_words_flags_ride_only_in_the_state_they_describe() {
+        use EnvSwitch::*;
+        let memo = |remembered| SwitchMemo { remembered, error: None };
+        let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true };
+        let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
+
+        let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
+        assert_eq!(json(&view(true, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true}"#);
+        let v = view(true, Unset, false, &memo(false), &all);
+        assert_eq!(json(&v), r#"{"state":"ready","seed":true}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
+        for state in [view(false, Unset, false, &memo(true), &all), view(true, Off, false, &memo(true), &all)] {
+            assert_eq!(json(&state), format!(r#"{{"state":"{}"}}"#, if state.state == WalletState::Off { "off" } else { "unbuilt" }));
+        }
+
+        let reminted = KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() };
+        assert_eq!(json(&view(true, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true}"#);
+        let saved = KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() };
+        assert_eq!(json(&view(true, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true}"#);
+        let v = view(true, On, true, &memo(false), &all);
+        assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true}"#);
+        let v = view(true, Unset, true, &memo(true), &KeyFacts { backed_up: true, ..KeyFacts::default() });
+        assert!(!v.backed_up, "backed up means these words, which a wallet not made from them has not");
+        assert!(!view(true, Unset, true, &memo(true), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }).seed);
+
+        let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true}"#).unwrap();
+        assert!(back.mnemonic && !back.backed_up);
+        let back: WalletSwitch = serde_json::from_str(r#"{"state":"on"}"#).unwrap();
+        assert!(!back.mnemonic, "an older node never sends it");
+        assert!(!json(&v).contains("words"), "the fingerprint never carries the words, nor a flag named after them");
+    }
+
+    #[test]
+    fn the_words_routes_take_the_reveal_or_one_key_and_nothing_else() {
+        assert_eq!(words_asked("/api/chia/words"), Some(WordsAsk::Reveal));
+        assert_eq!(words_asked("/api/chia/words/saved?key=1234567890"), Some(WordsAsk::Saved(1234567890)));
+        assert_eq!(words_asked("/api/chia/words/saved?key=0"), Some(WordsAsk::Saved(0)));
+        assert_eq!(words_asked("/api/chia/words/saved?key=4294967295"), Some(WordsAsk::Saved(u32::MAX)));
+        for bad in [
+            "/api/chia/words/",
+            "/api/chia/words?",
+            "/api/chia/words?x",
+            "/api/chia/words?key=1",
+            "/api/chia/words/saved",
+            "/api/chia/words/saved?",
+            "/api/chia/words/saved?key=",
+            "/api/chia/words/saved?key=+1",
+            "/api/chia/words/saved?key=-1",
+            "/api/chia/words/saved?key=4294967296",
+            "/api/chia/words/saved?key=1&x=2",
+            "/api/chia/words/saved?x=2&key=1",
+            "/api/chia/words/saved?key=1&key=2",
+            "/api/chia/words/saved?key= 1",
+            "/api/chia/words/saved?key=0x1f",
+            "/api/chia/words/saved/?key=1",
+            "/api/chia/wordsx",
+        ] {
+            assert_eq!(words_asked(bad), None, "{bad}");
+        }
+        for ours in ["/api/chia/words", "/api/chia/words/", "/api/chia/words?x", "/api/chia/words/saved?key=1"] {
+            assert!(is_words_target(ours), "{ours}");
+        }
+        for not_ours in ["/api/chia/wordsx", "/api/chia/wallet?on=1", "/api/chia/word"] {
+            assert!(!is_words_target(not_ours), "{not_ours}");
+        }
+    }
+
+    #[test]
+    fn the_words_routes_are_not_under_the_switch_path() {
+        for target in ["/api/chia/words", "/api/chia/words/saved?key=1"] {
+            assert!(!target.starts_with("/api/chia/wallet"), "{target}");
+            assert_eq!(turn_asked(target), None, "{target}");
+        }
+        assert!(!is_words_target("/api/chia/wallet?on=1"));
+    }
+
+    #[test]
+    fn the_saved_flag_is_for_one_key_and_an_unreadable_one_is_reported() {
+        let dir = std::env::temp_dir().join(format!("ssf-words-saved-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SAVED_FILE);
+        assert_eq!(saved_for(&path, 7), Ok(false), "no flag: not saved");
+        std::fs::write(&path, br#"{"key":3781984839,"at":1730000000}"#).unwrap();
+        assert_eq!(saved_for(&path, 3781984839), Ok(true));
+        assert_eq!(saved_for(&path, 1532878573), Ok(false), "a flag for another key: a wallet made since");
+        std::fs::write(&path, br#"{"key":"#).unwrap();
+        let err = saved_for(&path, 3781984839).unwrap_err();
+        assert!(err.contains(SAVED_FILE), "{err}");
+        assert!(!saved_for(&path, 3781984839).unwrap_or(false), "the caller counts unreadable as not saved");
+        #[cfg(feature = "chia-publish")]
+        {
+            let switch = dir.join(SWITCH_FILE);
+            remember(&switch, true, 1).unwrap();
+            remember_saved(&path, 1532878573, 9).unwrap();
+            assert_eq!(saved_for(&path, 1532878573), Ok(true), "a torn flag is replaced whole");
+            assert_eq!(saved_for(&path, 3781984839), Ok(false));
+            assert_eq!(remembered(&switch), Ok(true), "the switch is untouched");
+            let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            left.sort();
+            assert_eq!(left, vec![std::ffi::OsString::from(SWITCH_FILE), std::ffi::OsString::from(SAVED_FILE)]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_operator_names_exact_dev_pages() {
+        assert!(dev_pages_of(None).is_empty());
+        assert!(dev_pages_of(Some(OsStr::new(""))).is_empty());
+        assert_eq!(dev_pages_of(Some(OsStr::new("http://localhost:5173"))), vec!["http://localhost:5173"]);
+        assert_eq!(
+            dev_pages_of(Some(OsStr::new(" http://localhost:5173/ , ,http://127.0.0.1:1420"))),
+            vec!["http://localhost:5173", "http://127.0.0.1:1420"]
+        );
+        assert_eq!(dev_pages_of(Some(OsStr::new("1"))), vec!["1"], "the old on-switch names no page, so no page passes");
+    }
+
+    #[test]
+    fn only_the_desktop_app_or_a_named_dev_page_may_read_the_words() {
+        let none: Vec<String> = vec![];
+        let dev = dev_pages_of(Some(OsStr::new("http://localhost:5173")));
+        let ok = |o: &str, h: &str, pages: &[String]| app_page(Some(o), Some(h), 8080, pages);
+        assert!(ok("tauri://localhost", "127.0.0.1:8080", &none), "the desktop app on macOS and Linux");
+        assert!(ok("TAURI://LOCALHOST", "localhost:8080", &none));
+        assert_eq!(ok("http://tauri.localhost", "127.0.0.1:8080", &none), cfg!(windows), "the desktop app on Windows only");
+        assert_eq!(ok("https://tauri.localhost", "127.0.0.1:8080", &none), cfg!(windows));
+        assert!(!ok("http://tauri.localhost:8000", "127.0.0.1:8080", &none));
+
+        assert!(!ok("http://localhost:5173", "127.0.0.1:8080", &none), "a loopback page needs the operator's word");
+        assert!(ok("http://localhost:5173", "127.0.0.1:8080", &dev), "the named dev page");
+        assert!(ok("HTTP://LOCALHOST:5173", "127.0.0.1:8080", &dev), "case-blind");
+        assert!(!ok("http://localhost:5174", "127.0.0.1:8080", &dev), "another port's page");
+        assert!(!ok("http://127.0.0.1:5173", "127.0.0.1:8080", &dev), "exactly the named origin");
+        assert!(!ok("http://localhost:8888", "127.0.0.1:8080", &dev), "a notebook on loopback");
+
+        for pages in [&none, &dev] {
+            assert!(!ok("https://example.com", "127.0.0.1:8080", pages), "a website");
+            assert!(!ok("null", "127.0.0.1:8080", pages), "a sandboxed or file page");
+            assert!(!app_page(None, Some("127.0.0.1:8080"), 8080, pages), "no Origin: a local process");
+            assert!(!app_page(Some("tauri://localhost"), None, 8080, pages), "no Host");
+            assert!(!ok("tauri://localhost", "rebound.example.com:8080", pages), "a re-bound Host");
+            assert!(!ok("tauri://localhost", "127.0.0.1:8081", pages), "another port's API");
+            assert!(!ok("http://localhost:5173", "rebound.example.com:8080", pages));
+        }
+        let web = dev_pages_of(Some(OsStr::new("https://example.com")));
+        assert!(!ok("https://example.com", "127.0.0.1:8080", &web), "a web origin never passes, listed or not");
+    }
+
+    #[test]
+    fn a_words_answer_is_never_cached_and_readable_only_by_the_page_that_asked() {
+        let head = words_reply_head("200 OK", Some("tauri://localhost"), 42);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        for line in [
+            "Content-Type: application/json\r\n",
+            "Cache-Control: no-store\r\n",
+            "X-Content-Type-Options: nosniff\r\n",
+            "Access-Control-Allow-Origin: tauri://localhost\r\n",
+            "Vary: Origin\r\n",
+            "Content-Length: 42\r\n",
+            "Connection: close\r\n",
+        ] {
+            assert!(head.contains(line), "{line:?} in {head}");
+        }
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(head.matches("Access-Control-Allow-Origin").count(), 1);
+        let head = words_reply_head("403 Forbidden", None, 7);
+        assert!(!head.contains("Access-Control-Allow-Origin"), "{head}");
+        assert!(head.contains("Cache-Control: no-store\r\n") && head.contains("Vary: Origin\r\n"));
+        let head = words_reply_head("403 Forbidden", Some("http://x\r\nSet-Cookie: a=b"), 7);
+        assert!(!head.contains("Set-Cookie"), "no header can be smuggled: {head}");
+    }
+
+    #[test]
+    fn the_backup_refusals_name_what_to_do() {
+        assert!(BACKUP_PAGE_ONLY.contains("SSF_BANK_DEV_PAGES") && BACKUP_PAGE_ONLY.contains("24 words"));
+        assert!(BACKUP_TURNING.contains("SHOW again") && BACKUP_KEY_CHANGED.contains("SHOW again"));
+        assert!(BACKUP_NOT_SHOWN.contains("tap SHOW first"));
+        for w in [BACKUP_PAGE_ONLY, BACKUP_TURNING, BACKUP_NOT_ON, BACKUP_SAVED, BACKUP_MISMATCH, BACKUP_KEY_CHANGED, BACKUP_NOT_SHOWN, BACKUP_UNREADABLE, BACKUP_BAD_ASK] {
+            assert!(!w.contains('"') && !w.contains('\\'), "plain words in a JSON string: {w}");
+        }
+    }
+
+    /// The loaded wallet's meta for the words-route table: key fingerprint 7.
+    fn meta(backed_up: bool, revealed: bool) -> WalletMeta {
+        WalletMeta { fingerprint: 7, backed_up, reminted: false, revealed }
+    }
+
+    #[test]
+    fn with_no_wallet_loaded_a_words_ask_is_turning_or_not_on() {
+        for ask in [WordsAsk::Reveal, WordsAsk::Saved(7)] {
+            assert_eq!(words_step::<()>(ask, None, true), WordsStep::Refuse(WordsRefusal::Turning), "{ask:?}");
+            assert_eq!(words_step::<()>(ask, None, false), WordsStep::Refuse(WordsRefusal::NotOn), "{ask:?}");
+        }
+        // A turn beside a loaded wallet (KEEP IT ON) is not "turning": the
+        // key never changes in a run once loaded.
+        assert_eq!(words_step(WordsAsk::Saved(7), Some(((), meta(true, false))), true), WordsStep::SavedIdempotent);
+        assert_eq!(words_step(WordsAsk::Reveal, Some(("key", meta(false, false))), true), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
+    }
+
+    #[test]
+    fn a_reveal_reads_the_file_until_the_words_are_marked_saved() {
+        let step = |m| words_step(WordsAsk::Reveal, Some(("key", m)), false);
+        assert_eq!(step(meta(false, false)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
+        assert_eq!(step(meta(false, true)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 }, "shown again until saved");
+        assert_eq!(step(meta(true, false)), WordsStep::Refuse(WordsRefusal::AlreadySaved), "saved: never shown again");
+        assert_eq!(step(meta(true, true)), WordsStep::Refuse(WordsRefusal::AlreadySaved));
+    }
+
+    #[test]
+    fn a_saved_mark_checks_the_key_then_saved_then_shown() {
+        use WordsStep::*;
+        // (asked key, backed_up, revealed) → step, in the route's order.
+        let table = [
+            ((8, true, true), Refuse(WordsRefusal::KeyChanged)),
+            ((8, true, false), Refuse(WordsRefusal::KeyChanged)),
+            ((8, false, true), Refuse(WordsRefusal::KeyChanged)),
+            ((8, false, false), Refuse(WordsRefusal::KeyChanged)),
+            ((7, true, false), SavedIdempotent),
+            ((7, true, true), SavedIdempotent),
+            ((7, false, false), Refuse(WordsRefusal::NotShown)),
+            ((7, false, true), WriteFlag { key: 7 }),
+        ];
+        for ((asked, backed_up, revealed), want) in table {
+            assert_eq!(
+                words_step(WordsAsk::Saved(asked), Some(((), meta(backed_up, revealed))), false),
+                want,
+                "key {asked}, backed_up {backed_up}, revealed {revealed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_words_refusal_is_a_409_and_only_the_saved_one_says_saved() {
+        let cases = [
+            (WordsRefusal::Turning, BACKUP_TURNING),
+            (WordsRefusal::NotOn, BACKUP_NOT_ON),
+            (WordsRefusal::AlreadySaved, BACKUP_SAVED),
+            (WordsRefusal::KeyChanged, BACKUP_KEY_CHANGED),
+            (WordsRefusal::NotShown, BACKUP_NOT_SHOWN),
+        ];
+        for (why, error) in cases {
+            let (status, body) = why.answer();
+            assert_eq!(status, "409 Conflict", "{why:?}");
+            if why == WordsRefusal::AlreadySaved {
+                assert_eq!(body, serde_json::json!({ "ok": false, "saved": true, "error": error }));
+            } else {
+                assert_eq!(body, serde_json::json!({ "ok": false, "error": error }), "{why:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_reveal_shows_only_words_that_make_the_loaded_key() {
+        assert!(words_match(7, &"pk", 7, &"pk"));
+        assert!(!words_match(8, &"pk", 7, &"pk"), "another fingerprint on disk");
+        assert!(!words_match(7, &"other", 7, &"pk"), "the same fingerprint, another wallet key");
+        assert!(!words_match(8, &"other", 7, &"pk"));
+    }
+
+    #[test]
+    fn a_saved_mark_answers_with_the_view_and_a_note_only_when_unconfirmed() {
+        let saved = WalletSwitch { stays: true, mnemonic: true, backed_up: true, ..sw(WalletState::On) };
+        let (status, body) = saved_answer(&saved, None);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, serde_json::json!({ "ok": true, "wallet": { "state": "on", "stays": true, "mnemonic": true, "backed_up": true } }));
+
+        // The write failed but the flag holds the key: a 200, the view with
+        // `backed_up`, and the note.
+        let FailedMark::Landed { note } = after_failed_mark("dir sync failed", Ok(true)) else {
+            panic!("a flag read back with the key is saved");
+        };
+        assert_eq!(note, "saved, but not confirmed on disk (dir sync failed)");
+        let (status, body) = saved_answer(&saved, Some(&note));
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["wallet"]["backed_up"], true);
+        assert_eq!(body["note"], note.as_str());
+        assert_eq!(body.as_object().unwrap().len(), 3);
+
+        // Not written, or unreadable: the 500, and the words stay not saved.
+        let lost = FailedMark::Lost { error: "the Bank could not record it (disk full); your words are fine, tap I SAVED again".into() };
+        assert_eq!(after_failed_mark("disk full", Ok(false)), lost, "the flag holds another key or none");
+        assert_eq!(after_failed_mark("disk full", Err("unreadable".into())), lost, "unreadable counts as not written");
+    }
+
+    #[test]
+    fn a_words_answer_is_readable_by_the_page_that_passed_or_the_granted_one_for_its_403() {
+        assert_eq!(words_allow_origin(true, Some("tauri://localhost"), true), Some("tauri://localhost"));
+        assert_eq!(
+            words_allow_origin(true, Some("http://localhost:5173"), false),
+            Some("http://localhost:5173"),
+            "the exact origin app_page passed, whatever the wider rule says"
+        );
+        assert_eq!(words_allow_origin(false, Some("http://localhost:5174"), true), Some("http://localhost:5174"), "a 403 a dev page can read");
+        assert_eq!(words_allow_origin(false, Some("https://example.com"), false), None, "a 403 a website cannot read");
+        assert_eq!(words_allow_origin(false, None, false), None);
+        assert_eq!(words_allow_origin(true, None, false), None);
     }
 }

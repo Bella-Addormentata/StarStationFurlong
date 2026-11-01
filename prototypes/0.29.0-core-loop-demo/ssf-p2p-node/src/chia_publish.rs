@@ -114,7 +114,7 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// is still empty and the dish may be asked again.
 ///
 /// The parking OUTLIVES the process (#245 review, round 17): every change is
-/// written to `wallet_lease.json` beside the wallet seed, and the next run
+/// written to `wallet_lease.json` beside the wallet's identity, and the next run
 /// takes it back before any writer selects a coin ([`WalletLease::restore`]).
 /// A zero-fee spend can sit in the mempool across a restart while the chain
 /// still lists its inputs unspent and the wallet empty; a lease that started
@@ -1851,9 +1851,14 @@ pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
 /// it again.
 pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 
-/// The beacon's own wallet key, derived from the main key so no second seed
-/// file is minted, funded SEPARATELY (its address is printed at startup): a
-/// clear-text node id must never share coin lineage with the sealed records.
+/// The beacon's own wallet key, funded SEPARATELY (its address is printed at
+/// startup): a clear-text node id must never share coin lineage with the
+/// sealed records (D7). It is blake3 of the WALLET key (m/12381/8444/2/0,
+/// chia_wallet.rs) then `from_seed`, so no second secret is kept, and
+/// deliberately off every m/12381/8444/2/* path, so Sage and the Chia wallet
+/// restoring the node's 24 words never see or co-spend beacon coins (only
+/// Star Station brings the beacon back from the words). Its address changes
+/// with every re-mint.
 pub fn beacon_wallet_key(chia_sk: &SecretKey) -> SecretKey {
     SecretKey::from_seed(&blake3::derive_key(CTX_BEACON_WALLET, &chia_sk.to_bytes()))
 }

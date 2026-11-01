@@ -1,10 +1,16 @@
 # Node-local runtime state — never commit.
 rooms/
 iroh_node_id.key
+# 🏦 The SSF wallet's 24-word identity (chia_wallet.rs), and a raw seed
+# from before the words with its archives: each one is a wallet's secret.
+chia_identity.json
 chia_identity.seed
+chia_identity.seed.retired-*
 wallet_lease.json
-# 🏦 The SSF wallet switch the Bank remembers (chia_wallet_switch.rs)
+# 🏦 The SSF wallet switch the Bank remembers, and the player's "I saved the
+# 24 words" (chia_wallet_switch.rs)
 chia_wallet.json
+chia_words_saved.json
 # Private temporary files (`.<name>.<pid>-<seq>.tmp`, chia_wallet.rs and
 # chia_contact.rs): a node stopped mid-write can leave one holding a secret.
 .*.tmp

@@ -53,6 +53,29 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ state: 'ready', error: '' })).toEqual({ state: 'ready' });
   });
 
+  it('keeps the 24-word flags when true, drops them when false, and carries nothing else (🏦 BACK UP)', () => {
+    const fp = (chia_wallet: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_wallet })?.chia_wallet;
+    expect(fp({ state: 'ready', legacy: true })).toEqual({ state: 'ready', legacy: true });
+    expect(fp({ state: 'on', stays: true, mnemonic: true, reminted: true })).toEqual({ state: 'on', stays: true, mnemonic: true, reminted: true });
+    expect(fp({ state: 'on', stays: true, mnemonic: true, backed_up: true })).toEqual({ state: 'on', stays: true, mnemonic: true, backed_up: true });
+    expect(fp({ state: 'on', seed: false, legacy: false, mnemonic: false, backed_up: false, reminted: false })).toEqual({ state: 'on' });
+    // A flag that is not a boolean is no readout at all, whatever it holds.
+    for (const flag of ['legacy', 'mnemonic', 'backed_up', 'reminted']) {
+      for (const bad of [['a'], 'true', 1, null, { a: 1 }]) expect(fp({ state: 'on', [flag]: bad })).toBeUndefined();
+    }
+    // Fields the node never sends (words of any name, a key number) do not survive the parse.
+    const sample = ['abandon', 'ability', 'able', 'about', 'above', 'absent'];
+    const parsed = parseNodeFingerprint({
+      hex: HEX, base64: B64, port: 4443,
+      chia_wallet: { state: 'on', mnemonic: true, words: sample, phrase: sample.join(' '), key: 3552866753, entropy: 'ab'.repeat(32) },
+      words: sample, mnemonic: sample.join(' '), phrase: sample.join(' '),
+    });
+    expect(parsed?.chia_wallet).toEqual({ state: 'on', mnemonic: true });
+    const json = JSON.stringify(parsed);
+    for (const w of sample) expect(json).not.toContain(w);
+    expect(json).not.toContain('3552866753');
+  });
+
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
     const listed = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: listed })?.chia_presence).toEqual(listed);

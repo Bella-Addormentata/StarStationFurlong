@@ -24,6 +24,10 @@ describe('bankWalletView', () => {
     expect(armed.button).toEqual({ act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false });
     expect(armed.warning).toContain('new testnet11 key');
     expect(armed.warning).toContain('Phone Book');
+    // The key is made from 24 words, and the Bank shows them to write down.
+    expect(armed.warning).toContain('24 words');
+    expect(armed.warning).toContain('write down');
+    expect(armed.warning).not.toContain('retires');
     const turning = bankWalletView(node({ state: 'ready' }), { ...IDLE, armed: true, turning: true });
     expect(turning.button).toMatchObject({ label: 'TURNING ON…', busy: true });
     expect(turning.warning).toBeNull();
@@ -34,6 +38,35 @@ describe('bankWalletView', () => {
     expect(v.button?.label).toBe('TURN ON SSF WALLET');
     expect(v.text).toContain('wallet from before');
     expect(bankWalletView(node({ state: 'ready', seed: true }), { ...IDLE, armed: true }).warning).toContain('same address');
+  });
+
+  it('says CREATE, not TURN ON, for a raw-seed wallet from before the 24 words, and what happens to it', () => {
+    const v = bankWalletView(node({ state: 'ready', legacy: true }), IDLE);
+    expect(v).toMatchObject({ showsAddress: false, warning: null, notice: null, button: { act: 'arm', label: 'CREATE SSF WALLET', danger: false, busy: false } });
+    expect(v.text).toContain('from before the 24 words');
+    expect(v.text).toContain('replaces it with a new one');
+    expect(v.text).not.toContain('same address');
+    const armed = bankWalletView(node({ state: 'ready', legacy: true }), { ...IDLE, armed: true });
+    expect(armed.button).toEqual({ act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false });
+    for (const said of ['not made from 24 words', 'retires it', 'old address', 'new address', 'new testnet11 key from 24 words', 'write down', 'Phone Book']) {
+      expect(armed.warning).toContain(said);
+    }
+    expect(armed.warning).not.toContain('same address');
+    // A node that has the 24-word identity loads it: the raw seed beside it changes nothing.
+    expect(bankWalletView(node({ state: 'ready', seed: true, legacy: true }), { ...IDLE, armed: true }).warning).toContain('same address');
+  });
+
+  it('says once, above the address, that a re-minted wallet is new and not yet listed', () => {
+    for (const w of [{ state: 'on', stays: true, mnemonic: true, reminted: true }, { state: 'on', mnemonic: true, reminted: true }, { state: 'on', stays: true, held: true, reminted: true }] as ChiaWalletSwitch[]) {
+      const v = bankWalletView(node(w, ADDR), IDLE);
+      expect(v.showsAddress).toBe(true);
+      expect(v.notice).toContain('new one made from 24 words, at a new address');
+      expect(v.notice).toContain('old address');
+      expect(v.notice).toContain('not listed in the Phone Book');
+    }
+    expect(bankWalletView(node({ state: 'on', stays: true, mnemonic: true }, ADDR), IDLE).notice).toBeNull();
+    // Only an on wallet with an address has one: a ready node is not re-minted yet.
+    expect(bankWalletView(node({ state: 'ready', reminted: true }), IDLE).notice).toBeNull();
   });
 
   it('shows the address once the wallet is on, with the switch that fits how it stays on', () => {

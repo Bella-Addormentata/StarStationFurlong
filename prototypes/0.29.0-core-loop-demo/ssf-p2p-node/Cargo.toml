@@ -42,7 +42,7 @@ chacha20poly1305 = "0.10"
 #                  need no wallet, seed or account, so every node ships them.
 #   `chia-publish` (opt-in at build time; at runtime the SSF wallet switch in
 #                  the SpacePhone's Bank, or SSF_CHIA_LANE=1/0, chia_wallet_switch.rs) — the
-#                  BLS wallet seed, spend-to-self publish and the craps fairness
+#                  BLS wallet (24 words), spend-to-self publish and the craps fairness
 #                  hook. Release builds carry it so one binary ships (D3: the
 #                  separate `ssf-p2p-node-chia.exe` asset retires); dev builds
 #                  may leave it out to skip the BLS12-381 + driver stack.
@@ -68,6 +68,13 @@ chia-bls = { version = "0.36", optional = true, features = ["serde"] }
 chia-protocol = { version = "0.36", optional = true, features = ["serde"] }
 chia-puzzle-types = { version = "0.36", optional = true }
 chia-sdk-utils = { version = "0.34", optional = true }
+# 🏦 The SSF wallet's 24 words (chia_wallet.rs): its identity is 32 bytes of
+# BIP39 entropy, and its keys come from the words the way Chia and Sage derive
+# them. Already in the graph under `chia-publish` (through chia-sdk-driver);
+# `zeroize` makes a `Mnemonic` wipe its word indices when dropped, and the
+# direct `zeroize` dep wipes the buffers the identity file passes through.
+bip39 = { version = "2.2.2", optional = true, features = ["zeroize"] }
+zeroize = { version = "1.5", optional = true }
 # Slice 4 (publish) + Slice 5 (resolve): spend construction and signing.
 chia-sdk-driver = { version = "0.34", optional = true }
 chia-sdk-types = { version = "0.34", optional = true }
@@ -137,13 +144,14 @@ chia-read = [
     "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",
 ]
-# Chain WRITES: the BLS wallet seed + `txch1…` address, spend-to-self publish,
+# Chain WRITES: the SSF wallet's 24-word identity + `txch1…` address, spend-to-self publish,
 # the craps fairness hook and the treasury codec tests. Runtime-gated by the
 # SSF wallet switch (the Bank's TURN ON, remembered in chia_wallet.json;
 # SSF_CHIA_LANE=1 holds it on, any other value off — chia_wallet_switch.rs).
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
+    "dep:bip39", "dep:zeroize",
 ]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]
