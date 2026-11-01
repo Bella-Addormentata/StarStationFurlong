@@ -41,7 +41,7 @@ function freshSinks(): FurnitureHandleSinks {
     arcadeCabinetVisuals: new Map(),
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
-    faucetDishes: new Map(),
+    faucetDishes: new Map(), chalkboards: new Map(),
   };
 }
 

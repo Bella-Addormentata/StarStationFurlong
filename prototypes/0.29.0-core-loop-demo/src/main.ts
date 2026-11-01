@@ -203,6 +203,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
 import { bindBoardDoc, boardKindOf, mergeBoardView, refreshBoards, retryBoardView, setBoardDeps } from "./boardDoc";
+import { bindChalkDoc, setChalkDeps } from "./chalkDoc";
 import {
   applyDeparturesPublish,
   bindDeparturesDoc,
@@ -2296,6 +2297,10 @@ async function joinRoomAtEpoch(
     // scene can still hold a board the layout removed, or its old kind.
     boardOfItem: (itemId) => boardKindOf(placedFurnitureIn(sync.doc, itemId)?.kind),
   });
+  // 🖍 The chalkboards' marks: same seam, and a trim waits for the host's
+  // state as a board's does.
+  bindChalkDoc(sync.doc);
+  setChalkDeps({ canTrim: () => yjsSync === sync && routeRoomReady(sync, roomHostedHere(boot.roomId)) });
 
   // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
   // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
@@ -5297,11 +5302,13 @@ function renderBankApp(): void {
         `<div${status ? ' role="status"' : ""} style="font-size:9px; color:${color}; margin-top:4px; line-height:1.6;">${esc(text)}</div>`;
       let backupHtml = "";
       if (bv && !bv.panel) {
+        // A `notice` view (no wallet to back up now) carries only the
+        // clipboard's notice.
         backupHtml = `
-        <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+        ${bv.line || bv.open ? `<div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <span style="flex:1; min-width:0; font-size:9px; color:${bv.state === "done" ? "rgba(212,168,75,0.5)" : "#ffb300"}; line-height:1.6;">${esc(bv.line ?? "")}</span>
           ${bv.open ? ctl(BACKUP_ID, "BACK UP") : ""}
-        </div>
+        </div>` : ""}
         ${bv.elsewhere ? line(bv.elsewhere, "rgba(212,168,75,0.7)") : ""}
         ${bv.atRest.map((t) => line(t, "rgba(212,168,75,0.6)")).join("")}
         ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}

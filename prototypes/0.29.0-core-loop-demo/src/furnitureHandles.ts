@@ -42,6 +42,7 @@ import type {
 } from './devices';
 import type { CasinoTableVisualHandle } from './casinoTable3d';
 import type { MapHologramHandle } from './mapHologram';
+import type { ChalkboardHandle } from './chalkboardBuild';
 
 /**
  * The per-item drive collections World owns, seen as the sinks the handle
@@ -89,6 +90,9 @@ export interface FurnitureHandleSinks {
   casinoTableVisuals: Map<string, CasinoTableVisualHandle>;
   /** ⛓️🥣 Faucet dish fixtures (jar level + the mojo in the dish), keyed by item id — driven at ~1 Hz. */
   faucetDishes: Map<string, FaucetDishHandle>;
+  /** 🖍 Chalkboards, keyed by item id — driven every frame (the board's
+   *  timers and face), and handed to the focused board's session. */
+  chalkboards: Map<string, ChalkboardHandle>;
 }
 
 /**
@@ -130,4 +134,5 @@ export function registerFurnitureHandles(
   if (d.alligators) sinks.alligatorsVisuals.set(itemId, d.alligators as AlligatorsVisualHandle);
   if (d.casinoTable) sinks.casinoTableVisuals.set(itemId, d.casinoTable as CasinoTableVisualHandle);
   if (d.faucetDish) sinks.faucetDishes.set(itemId, d.faucetDish as FaucetDishHandle);
+  if (d.chalkboard) sinks.chalkboards.set(itemId, d.chalkboard as ChalkboardHandle);
 }

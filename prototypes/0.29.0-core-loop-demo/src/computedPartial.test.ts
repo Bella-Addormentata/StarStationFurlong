@@ -318,7 +318,7 @@ describe('a session or checkpoint this page counted, gone with nothing naming it
     expect(fresh.casino.readChips(AMY.pid)).toBe(99); // nothing held, the chip she spent gone
   });
 
-  it('a checkpoint deleted (or turned to junk) keeps the table not whole', async () => {
+  it('a checkpoint deleted (or turned to junk): the page holds the one it counted, the table whole', async () => {
     const { x, p, close } = await frozenRound();
     put(x, kit.reveal(1, AMY.pid), kit.reveal(1, BOB.pid));
     const cp = kit.checkpoint(AMY, 'g', 1, close.hash, Object.fromEntries(x.casino.computedFoldOf(TABLE)!.nets));
@@ -330,8 +330,42 @@ describe('a session or checkpoint this page counted, gone with nothing naming it
     }
     p.doc.getMap('casinoComputed').set(`sum:${TABLE}:${INC}`, { ...cp, u: 1.5 });
     x.doc.getMap('casinoComputed').delete(`sum:${TABLE}:${INC}`);
+    // Each folds from the checkpoint it counted, and writes into the
+    // session it opens, until the recovery duty puts it back.
+    for (const page of [x, p]) {
+      expect(page.casino.casinoWhole(TABLE)).toBe(true);
+      expect(page.casino.computedSettled(TABLE)).toBe(true);
+      expect(page.casino.isComputedTable(TABLE)).toBe(true);
+      expect(page.casino.computedFoldOf(TABLE)!.base.u).toBe(1);
+      expect(page.casino.computedSessionForWrite(TABLE)).not.toBeNull();
+      expect(page.casino.readChips(AMY.pid)).toBe(100 + amyNet);
+    }
+    // A page that never counted it reads the doc as it is.
+    const fresh = await loadPage(3);
+    sync(x, fresh);
+    expect(fresh.casino.computedFoldOf(TABLE)?.base.u ?? 0).toBe(0);
+  });
+
+  it('a checkpoint deleted (or turned to junk) keeps the table not whole on a page of the build before (recovery off)', async () => {
+    const { x, p, close } = await frozenRound();
+    for (const page of [x, p]) page.casino.setComputedRecoveryForTests(false);
+    put(x, kit.reveal(1, AMY.pid), kit.reveal(1, BOB.pid));
+    const cp = kit.checkpoint(AMY, 'g', 1, close.hash, Object.fromEntries(x.casino.computedFoldOf(TABLE)!.nets));
+    trimTx(x, cp);
+    sync(x, p);
+    p.doc.getMap('casinoComputed').set(`sum:${TABLE}:${INC}`, { ...cp, u: 1.5 });
+    x.doc.getMap('casinoComputed').delete(`sum:${TABLE}:${INC}`);
     for (const page of [x, p]) {
       expect(page.casino.casinoWhole(TABLE)).toBe(false);
+      expect(page.casino.readChips(AMY.pid)).toBe(100 + amyNet);
+    }
+    sync(x, p);
+    for (const page of [x, p]) expect(page.casino.casinoWhole(TABLE)).toBe(false);
+    // The checkpoint back, it counts on.
+    x.doc.getMap('casinoComputed').set(`sum:${TABLE}:${INC}`, cp);
+    sync(x, p);
+    for (const page of [x, p]) {
+      expect(page.casino.casinoWhole(TABLE)).toBe(true);
       expect(page.casino.readChips(AMY.pid)).toBe(100 + amyNet);
     }
   });
@@ -350,11 +384,11 @@ describe('a session or checkpoint this page counted, gone with nothing naming it
     map.set(`sum:${OTHER}:${INC}`, { junk: true });
     sync(x, p);
     expect(x.casino.casinoWhole()).toBe(true);
-    for (const t of [GHOST, OTHER]) {
-      expect(x.casino.casinoWhole(t)).toBe(false);
-      expect(x.casino.computedSettled(t)).toBe(false);
-      expect(x.casino.isComputedTable(t)).toBe(false);
-    }
+    expect(x.casino.casinoWhole(GHOST)).toBe(false);
+    expect(x.casino.computedSettled(GHOST)).toBe(false);
+    // (The checkpoint it counted, held: the recovery duty puts it back.)
+    expect(x.casino.casinoWhole(OTHER)).toBe(true);
+    for (const t of [GHOST, OTHER]) expect(x.casino.isComputedTable(t)).toBe(false);
     expect(x.casino.casinoWhole(TABLE)).toBe(true);
     // A lost book freezes its table and no other, and so does this: PR 1's
     // spends, nowhere near either table, go on.

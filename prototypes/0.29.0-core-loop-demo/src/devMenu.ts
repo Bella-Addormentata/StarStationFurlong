@@ -100,6 +100,7 @@ import type { World } from './world';
 import type { Player } from './player';
 import { isFormFieldTarget } from './typingFocus';
 import { MAX_BOARDS_PER_ROOM, boardKindOf, countBoards } from './boardDoc';
+import { MAX_CHALKBOARDS_PER_ROOM, countChalkboards, isChalkboardKind } from './chalkDoc';
 
 // ── Palette: dashed AMBER — deliberately unlike any shipped UI ───────────────
 const DEV_AMBER = '#FFB300';
@@ -121,6 +122,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'departures-board': '🚏 DEPARTURES BOARD',
   'corkboard': '📌 CORKBOARD (WALL)',
   'notice-case': '🔒 NOTICE CASE (WALL, OWNER POSTS)',
+  'chalkboard': '🖍 CHALKBOARD (WALL)',
   'air-hockey-table': '🏒 AIR HOCKEY TABLE',
   'alligators-table': '🐊 INSATIABLE ALLIGATORS',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
@@ -547,6 +549,11 @@ function spawnFurniture(kind: FurnitureKind): void {
     showHint(`DEV: a room holds at most ${MAX_BOARDS_PER_ROOM} boards (corkboards and notice cases).`);
     return;
   }
+  // 🖍 …and at most MAX_CHALKBOARDS_PER_ROOM chalkboards.
+  if (isChalkboardKind(kind) && countChalkboards(FURNITURE) >= MAX_CHALKBOARDS_PER_ROOM) {
+    showHint(`DEV: a room holds at most ${MAX_CHALKBOARDS_PER_ROOM} chalkboards.`);
+    return;
+  }
   // 🚀 Exterior-wall fittings mount on the hull, not the floor: hull.ts
   // searches the walls' outer lattices AND stackable faces (🛰️ a DEV-spawned
   // engine lands on the nearest free wall spot or tank stack automatically).
@@ -704,6 +711,11 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
   // 📌 A room holds at most MAX_BOARDS_PER_ROOM corkboards and notice cases.
   if (boardKindOf(kind) && countBoards(FURNITURE) >= MAX_BOARDS_PER_ROOM) {
     showHint(`DEV: a room holds at most ${MAX_BOARDS_PER_ROOM} boards (corkboards and notice cases).`);
+    return;
+  }
+  // 🖍 …and at most MAX_CHALKBOARDS_PER_ROOM chalkboards.
+  if (isChalkboardKind(kind) && countChalkboards(FURNITURE) >= MAX_CHALKBOARDS_PER_ROOM) {
+    showHint(`DEV: a room holds at most ${MAX_CHALKBOARDS_PER_ROOM} chalkboards.`);
     return;
   }
   // 🚀 Exterior-wall fittings re-mount on the hull (same routing as spawn).

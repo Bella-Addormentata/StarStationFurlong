@@ -18,6 +18,7 @@ function fakeCanvas() {
       if (key === 'fillRect') return () => { fills++; };
       if (key === 'measureText') return () => ({ width: 40 });
       if (key === 'createLinearGradient') return () => ({ addColorStop: () => undefined });
+      if (key === 'getImageData') return () => ({ data: new Uint8ClampedArray(16) });
       return () => undefined;
     },
     set: (target, key, value) => { target[key] = value; return true; },
@@ -46,7 +47,7 @@ function sinks(): FurnitureHandleSinks {
     wallScreens: new Map(), holoSpinners: [], mapHolograms: new Map(), trunkLids: new Map(), gameTableTops: new Map(),
     cloneVats: new Map(), slotMachineVisuals: new Map(), coinPusherVisuals: new Map(),
     propAnims: new Map(), airHockeyVisuals: new Map(), tvScreens: new Map(), arcadeScreens: new Map(), arcadeCabinetVisuals: new Map(),
-    alligatorsVisuals: new Map(), casinoTableVisuals: new Map(), faucetDishes: new Map(),
+    alligatorsVisuals: new Map(), casinoTableVisuals: new Map(), faucetDishes: new Map(), chalkboards: new Map(),
   };
 }
 
@@ -62,7 +63,7 @@ function screenPlane(group: THREE.Group): THREE.Mesh | null {
 }
 
 const view = (mode: ArcadeScreenView['mode'], blink = false, title = 'PACMAN.ZIP'): ArcadeScreenView =>
-  ({ mode, title, line: mode === 'inplay' ? 'P1 · Alice' : 'INSERT COIN', lane: mode === 'empty' ? '' : 'SOVEREIGN', blink, plays: 3 });
+  ({ mode, title, line: mode === 'inplay' ? 'P1 · Alice' : 'INSERT COIN', lane: mode === 'empty' ? '' : 'SOVEREIGN', blink, plays: 3, game: '' });
 
 describe('the arcade cabinet as built', () => {
   it('keeps every mesh inside its 1×1 footprint', () => {
@@ -278,6 +279,26 @@ describe('the double-wide cabinet as built', () => {
     }
   });
 
+  it('lights its flanks with bars that stand proud of the walls, not flush with them (#333)', () => {
+    const meshes: THREE.Mesh[] = [];
+    buildWide().traverse((obj) => { if (obj instanceof THREE.Mesh) meshes.push(obj); });
+    const size = (mesh: THREE.Mesh) => new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3());
+    const bars = meshes.filter((mesh) => {
+      const v = size(mesh);
+      return Math.abs(v.x - 0.012) < 1e-6 && Math.abs(v.y - 0.9) < 1e-6;
+    });
+    expect(bars).toHaveLength(2);
+    const rest = meshes.filter((mesh) => !bars.includes(mesh)).map((mesh) => new THREE.Box3().setFromObject(mesh));
+    const wallR = Math.max(...rest.map((b) => b.max.x));
+    const wallL = Math.min(...rest.map((b) => b.min.x));
+    const [left, right] = bars.map((b) => new THREE.Box3().setFromObject(b)).sort((a, b) => a.min.x - b.min.x);
+    expect(right!.max.x - wallR).toBeGreaterThan(0.005);
+    expect(wallL - left!.min.x).toBeGreaterThan(0.005);
+    // …still fixed to the wall, not floating off it.
+    expect(right!.min.x).toBeLessThan(wallR);
+    expect(left!.max.x).toBeGreaterThan(wallL);
+  });
+
   it('counts every size as an arcade cabinet', () => {
     expect([...ARCADE_CABINET_KINDS].sort()).toEqual(['arcade-cabinet', 'arcade-cabinet-2p', 'arcade-cabinet-wide']);
   });
@@ -410,4 +431,98 @@ describe('the sticks and buttons, moving with the players (setControls)', () => 
       expect(ARCADE_STICK_THROW).toBeGreaterThan(0.2);
     });
   }
+});
+
+describe("each game's sign (#333)", () => {
+  it('dresses a bundled or own game in its own sign, and anything else in the plain one', async () => {
+    const { ARCADE_SIGNS, DEFAULT_SIGN, signFor } = await import('./arcadeSigns');
+    const { ARCADE_GAMES } = await import('./arcadeLibrary');
+    const { NATIVE_GAMES } = await import('./arcadeNativeGames');
+    for (const game of [...ARCADE_GAMES, ...NATIVE_GAMES]) {
+      expect(ARCADE_SIGNS[game.id], game.id).toBeDefined();
+      expect(signFor(game.id)).toBe(ARCADE_SIGNS[game.id]);
+    }
+    expect(signFor('')).toBe(DEFAULT_SIGN);
+    expect(signFor('pacman.zip')).toBe(DEFAULT_SIGN);
+  });
+
+  it('paints every sign, with its logo or its name', async () => {
+    const { ARCADE_SIGNS, DEFAULT_SIGN, paintSign } = await import('./arcadeSigns');
+    const canvas = fakeCanvas();
+    const g = canvas.getContext() as unknown as CanvasRenderingContext2D;
+    for (const sign of [DEFAULT_SIGN, ...Object.values(ARCADE_SIGNS)]) {
+      fills = 0;
+      expect(() => paintSign(g, 512, 104, 'A GAME', sign, null)).not.toThrow();
+      expect(() => paintSign(g, 1024, 86, 'A GAME', sign, {} as CanvasImageSource)).not.toThrow();
+      expect(fills).toBeGreaterThan(0);
+    }
+  });
+
+  it("repaints the marquee when the cabinet's game changes", () => {
+    const group = build();
+    const s = sinks();
+    group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, ID, obj); });
+    const handle = s.arcadeScreens.get(ID)!;
+    const marquee = (() => {
+      let found: THREE.CanvasTexture | null = null;
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh) || obj.userData.arcadeScreen || obj.userData.arcadeControl) return;
+        const map = (obj.material as THREE.MeshBasicMaterial).map;
+        if (map instanceof THREE.CanvasTexture) found = map;
+      });
+      return found!;
+    })();
+    handle.draw({ ...view('attract', true, 'THWAITE'), game: 'thwaite' });
+    const v = marquee.version;
+    handle.draw({ ...view('attract', false, 'THWAITE'), game: 'thwaite' });
+    expect(marquee.version).toBe(v); // a blink isn't a new sign
+    handle.draw({ ...view('attract', false, 'NESERT GOLFING'), game: 'nesert-golfing' });
+    expect(marquee.version).toBeGreaterThan(v);
+  });
+
+  it('a cabinet taken away stops waiting on its picture and logo', () => {
+    // A page with pictures that arrive when the test says so.
+    const pictures: { src: string; onload: (() => void) | null }[] = [];
+    class SlowImage {
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      decoding = '';
+      private url = '';
+      get src() { return this.url; }
+      set src(url: string) { this.url = url; pictures.push(this); }
+    }
+    vi.stubGlobal('Image', SlowImage);
+    try {
+      const textures = (group: THREE.Group) => {
+        const maps: THREE.Texture[] = [];
+        group.traverse((obj) => {
+          const map = obj instanceof THREE.Mesh ? (obj.material as THREE.MeshBasicMaterial).map : null;
+          if (map instanceof THREE.CanvasTexture && !maps.includes(map)) maps.push(map);
+        });
+        return maps;
+      };
+      const cabinet = () => {
+        const group = build();
+        const s = sinks();
+        group.traverse((obj) => { if (obj instanceof THREE.Mesh) registerFurnitureHandles(s, ID, obj); });
+        s.arcadeScreens.get(ID)!.draw({ ...view('attract', true, 'THWAITE'), game: 'thwaite' });
+        return textures(group);
+      };
+      const kept = cabinet();
+      const gone = cabinet();
+      for (const map of gone) map.dispose(); // as World.removeFurnitureVisuals does
+      const before = (maps: THREE.Texture[]) => maps.map((m) => m.version);
+      const [keptAt, goneAt] = [before(kept), before(gone)];
+
+      const thwaite = pictures.find((p) => p.src.endsWith('/thwaite.png'))!;
+      expect(thwaite).toBeDefined();
+      thwaite.onload!();
+      // The one still standing repaints its screen and its sign…
+      expect(kept.filter((m, i) => m.version > keptAt[i]!).length).toBeGreaterThanOrEqual(2);
+      // …the one taken away was no longer waiting.
+      expect(before(gone)).toEqual(goneAt);
+    } finally {
+      vi.stubGlobal('Image', undefined);
+    }
+  });
 });

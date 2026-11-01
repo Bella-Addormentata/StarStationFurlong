@@ -34,6 +34,7 @@ function freshSinks(): FurnitureHandleSinks {
     alligatorsVisuals: new Map(),
     casinoTableVisuals: new Map(),
     faucetDishes: new Map(),
+    chalkboards: new Map(),
   };
 }
 
@@ -67,6 +68,7 @@ describe('registerFurnitureHandles — filing', () => {
     const gators = handle('gators');
     const casino = handle('casino');
     const dish = handle('dish');
+    const chalk = handle('chalk');
     const holo = handle('holo');
     const ring = carrier({ holoSpin: 1.5 });
 
@@ -84,6 +86,7 @@ describe('registerFurnitureHandles — filing', () => {
     registerFurnitureHandles(sinks, ITEM, carrier({ alligators: gators }));
     registerFurnitureHandles(sinks, ITEM, carrier({ casinoTable: casino }));
     registerFurnitureHandles(sinks, ITEM, carrier({ faucetDish: dish }));
+    registerFurnitureHandles(sinks, ITEM, carrier({ chalkboard: chalk }));
 
     expect(sinks.wallScreens.get(ITEM)).toBe(screen);
     expect(sinks.holoSpinners).toHaveLength(1);
@@ -101,6 +104,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.alligatorsVisuals.get(ITEM)).toBe(gators);
     expect(sinks.casinoTableVisuals.get(ITEM)).toBe(casino);
     expect(sinks.faucetDishes.get(ITEM)).toBe(dish);
+    expect(sinks.chalkboards.get(ITEM)).toBe(chalk);
     // Exactly one entry per sink — nothing filed twice or into a neighbour.
     expect([
       sinks.wallScreens.size,
@@ -117,7 +121,8 @@ describe('registerFurnitureHandles — filing', () => {
       sinks.alligatorsVisuals.size,
       sinks.casinoTableVisuals.size,
       sinks.faucetDishes.size,
-    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+      sinks.chalkboards.size,
+    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
   });
 
   it('files every kind one carrier mesh carries', () => {
@@ -136,6 +141,7 @@ describe('registerFurnitureHandles — filing', () => {
       alligators: handle('g'),
       casinoTable: handle('c'),
       faucetDish: handle('d'),
+      chalkboard: handle('k'),
     });
     registerFurnitureHandles(sinks, ITEM, all);
     expect(sinks.wallScreens.get(ITEM)).toBe(all.userData.wallScreen);
@@ -152,6 +158,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.alligatorsVisuals.get(ITEM)).toBe(all.userData.alligators);
     expect(sinks.casinoTableVisuals.get(ITEM)).toBe(all.userData.casinoTable);
     expect(sinks.faucetDishes.get(ITEM)).toBe(all.userData.faucetDish);
+    expect(sinks.chalkboards.get(ITEM)).toBe(all.userData.chalkboard);
   });
 
   it('files nothing for a mesh without handles (unrelated userData included)', () => {
@@ -217,7 +224,7 @@ describe('registerFurnitureHandles — one list', () => {
    * key without a leading dot, e.g. "tagged userData.holoSpin", doesn't match.)
    */
   const HANDLE_READ =
-    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|tvScreen|arcadeScreen|arcadeCabinet|alligators|casinoTable|faucetDish)\b/;
+    /\.userData\.(wallScreen|holoSpin|trunkLid|gameTableTop|cloneVat|slotMachineVisual|coinPusherVisual|airHockey|tvScreen|arcadeScreen|arcadeCabinet|alligators|casinoTable|faucetDish|chalkboard)\b/;
 
   it('both registration paths call the helper and keep no private copy of the list (#117)', () => {
     for (const [name, text] of [['world.ts', world], ['devMenu.ts', devMenu]] as const) {

@@ -256,6 +256,29 @@ describe('reconcileBackupUi', () => {
     expect(wordsExpireIn(r, 2000 + WORDS_SHOWN_MS)).toBeNull();
   });
 
+  it('hides the words once five minutes pass on the wall clock, though the monotonic clock slept', () => {
+    const s = startReveal(opened(), 1500)!;
+    const ui = applyReveal(s.ui, s.ticket, { ok: true, words: [...WORDS], key: KEY, address: ADDR }, true, 2000, 1_000_000);
+    // An OS sleep: the monotonic clock barely moves, the wall clock passes five minutes.
+    expect(reconcileBackupUi(ui, LIVE, 2100, true, 1_000_000 + WORDS_SHOWN_MS - 1)).toBe(ui);
+    expect(wordsExpireIn(ui, 2100, 1_000_000 + WORDS_SHOWN_MS - 10)).toBe(10);
+    const woke = reconcileBackupUi(ui, LIVE, 2100, true, 1_000_000 + WORDS_SHOWN_MS);
+    expect(woke).toMatchObject({ words: null, expired: true, key: KEY, open: true });
+    // A wall clock set back does not keep them up: the monotonic deadline holds.
+    expect(reconcileBackupUi(ui, LIVE, 2000 + WORDS_SHOWN_MS, true, 0)).toMatchObject({ words: null, expired: true });
+    expect(wordsExpireIn(ui, 2000 + WORDS_SHOWN_MS - 5, 0)).toBe(5);
+  });
+
+  it('keeps saying the clipboard may hold the words after the wallet goes away', () => {
+    for (const copy of ['stuck', 'wiped'] as const) {
+      const v = bankBackupView(null, { ...BACKUP_IDLE, copy }, 'app');
+      expect(v).toMatchObject({ state: 'notice', line: null, open: false, panel: null });
+      expect(v!.copyNotice).toBe(bankBackupView(LIVE, { ...shown(), copy, open: false }, 'app')!.copyNotice);
+      expect(bankBackupView(node({ state: 'ready' }), { ...BACKUP_IDLE, copy }, 'elsewhere')?.state).toBe('notice');
+    }
+    for (const copy of ['none', 'held', 'refused'] as const) expect(bankBackupView(null, { ...BACKUP_IDLE, copy }, 'app')).toBeNull();
+  });
+
   it('lets the page\'s own "saved" stand only until the node agrees, for the same wallet', () => {
     const saved = { ...BACKUP_IDLE, savedFor: ADDR };
     expect(reconcileBackupUi(saved, LIVE, 1, true)).toBe(saved);

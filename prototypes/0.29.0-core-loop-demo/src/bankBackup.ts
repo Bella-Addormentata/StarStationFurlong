@@ -85,7 +85,14 @@ export interface BankBackupUi {
   key: number | null;
   /** The address the panel was opened for: a reveal must answer for it. */
   address: string | null;
+  /** When the words were shown, on the monotonic clock (`performance.now`)
+   *  and on the wall clock (`Date.now`). They hide at the earlier of the two
+   *  deadlines: the monotonic clock can stop through an OS sleep (words left
+   *  showing before an hour's sleep would still read as a minute old), and
+   *  the wall clock can be set back; neither can keep them up past five
+   *  minutes of the other. */
   shownAt: number;
+  shownWall: number;
   /** The words hid themselves after WORDS_SHOWN_MS. */
   expired: boolean;
   /** I SAVED became ⚠ CONFIRM. */
@@ -113,6 +120,7 @@ export const BACKUP_IDLE: Readonly<BankBackupUi> = {
   key: null,
   address: null,
   shownAt: 0,
+  shownWall: 0,
   expired: false,
   armed: false,
   saving: false,
@@ -132,6 +140,7 @@ const CLOSED = {
   key: null,
   address: null,
   shownAt: 0,
+  shownWall: 0,
   expired: false,
   armed: false,
   saving: false,
@@ -221,7 +230,8 @@ export interface BackupPanelView {
 }
 
 export interface BankBackupView {
-  state: 'nag' | 'panel' | 'done';
+  /** `notice`: no wallet to back up, but the clipboard notice still holds. */
+  state: 'nag' | 'panel' | 'done' | 'notice';
   /** The nag or the done line; none while the panel is open. */
   line: string | null;
   /** BACK UP is offered (the nag, on a page the node may show the words to). */
@@ -237,14 +247,18 @@ export interface BankBackupView {
 }
 
 /** What RECEIVE shows about the 24 words, or null when there is nothing to
- *  back up: no node, an older node, a wallet that is not on, one not made
- *  from words, or an address that did not read as testnet11. */
+ *  back up (no node, an older node, a wallet that is not on, one not made
+ *  from words, or an address that did not read as testnet11) and no
+ *  clipboard notice still stands. */
 export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: BankBackupUi, page: BackupPage): BankBackupView | null {
   const address = backupAddress(fp);
-  if (!address) return null;
   // Outside the panel only what still matters there: a clipboard that may
-  // hold the words, or that was emptied.
+  // hold the words, or that was emptied. That stays said with no wallet to
+  // back up too (the node stopped or went away after a COPY).
   const outside = ui.copy === 'stuck' || ui.copy === 'wiped' ? COPY_NOTICE[ui.copy] : null;
+  if (!address) {
+    return outside ? { state: 'notice', line: null, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest: [] } : null;
+  }
   const atRest = atRestLines(fp);
   if (backedUp(fp) || ui.savedFor === address) {
     return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest };
@@ -302,11 +316,18 @@ export function opensAfterTurnOn(before: LocalFingerprint | null | undefined, af
 /** Run before every render and at every fingerprint round, with the live
  *  fingerprint (null while the node is away) and whether the Bank is on
  *  screen. Drops the words (and a reveal in flight) when the Bank is not on
- *  screen; hides them after WORDS_SHOWN_MS; closes the panel, forgetting the
+ *  screen; hides them after WORDS_SHOWN_MS on either clock (`now`
+ *  monotonic, `wall` the wall clock); closes the panel, forgetting the
  *  key too, when the wallet it was opened for is gone: another address, not
  *  on, not from words, backed up, or no node. A change in anything else the
  *  fingerprint carries changes nothing here. */
-export function reconcileBackupUi(ui: BankBackupUi, fp: LocalFingerprint | null | undefined, now: number, onScreen: boolean): BankBackupUi {
+export function reconcileBackupUi(
+  ui: BankBackupUi,
+  fp: LocalFingerprint | null | undefined,
+  now: number,
+  onScreen: boolean,
+  wall: number = Date.now(),
+): BankBackupUi {
   let u = ui;
   const address = backupAddress(fp);
   const gone = !address || backedUp(fp) || (u.address !== null && u.address !== address);
@@ -319,7 +340,7 @@ export function reconcileBackupUi(ui: BankBackupUi, fp: LocalFingerprint | null 
   if (!onScreen && (u.words !== null || u.revealing || u.armed)) {
     u = { ...u, words: null, revealing: false, armed: false, gen: u.gen + 1 };
   }
-  if (u.words !== null && now - u.shownAt >= WORDS_SHOWN_MS) {
+  if (u.words !== null && (now - u.shownAt >= WORDS_SHOWN_MS || wall - u.shownWall >= WORDS_SHOWN_MS)) {
     u = { ...u, words: null, revealing: false, expired: true, changedAt: now, gen: u.gen + 1 };
   }
   return u;
@@ -360,11 +381,19 @@ export function startReveal(ui: BankBackupUi, now: number): { ui: BankBackupUi; 
 }
 
 /** The node's answer to SHOW, applied only to the generation it was asked
- *  in and only while the Bank is on screen; otherwise it is dropped. */
-export function applyReveal(ui: BankBackupUi, ticket: number, r: RevealResult, onScreen: boolean, now: number): BankBackupUi {
+ *  in and only while the Bank is on screen; otherwise it is dropped. `now`
+ *  is the monotonic clock, `wall` the wall clock ([`reconcileBackupUi`]). */
+export function applyReveal(
+  ui: BankBackupUi,
+  ticket: number,
+  r: RevealResult,
+  onScreen: boolean,
+  now: number,
+  wall: number = Date.now(),
+): BankBackupUi {
   if (ui.gen !== ticket || !ui.revealing) return ui;
   if (!onScreen) return { ...ui, revealing: false, gen: ui.gen + 1 };
-  if (r.ok) return { ...ui, revealing: false, words: r.words, key: r.key, shownAt: now, expired: false, error: null, changedAt: now };
+  if (r.ok) return { ...ui, revealing: false, words: r.words, key: r.key, shownAt: now, shownWall: wall, expired: false, error: null, changedAt: now };
   // The node has them marked saved already: nothing to show, ever.
   if (r.saved) return { ...ui, ...CLOSED, gen: ui.gen + 1, savedFor: ui.address, changedAt: now };
   return { ...ui, revealing: false, error: r.error, changedAt: now };
@@ -399,9 +428,11 @@ export function applySave(ui: BankBackupUi, ticket: number | null, r: SaveResult
   return { ...ui, saving: false, saveTicket: null, error: r.error, changedAt: now };
 }
 
-/** How long until the shown words hide themselves, or null when none show. */
-export function wordsExpireIn(ui: BankBackupUi, now: number): number | null {
-  return ui.words === null ? null : Math.max(0, ui.shownAt + WORDS_SHOWN_MS - now);
+/** How long until the shown words hide themselves, on whichever clock
+ *  comes first, or null when none show. */
+export function wordsExpireIn(ui: BankBackupUi, now: number, wall: number = Date.now()): number | null {
+  if (ui.words === null) return null;
+  return Math.max(0, Math.min(ui.shownAt + WORDS_SHOWN_MS - now, ui.shownWall + WORDS_SHOWN_MS - wall));
 }
 
 // ── Taps and keys ────────────────────────────────────────────────────────────
