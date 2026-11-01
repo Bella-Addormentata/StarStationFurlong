@@ -622,6 +622,10 @@ struct TableMem {
     refused: HashSet<i64>,
     /// Its own session records this run, to put back: (session key, key, value).
     written: Vec<(String, String, CVal)>,
+    /// Whether its reveals from before a start ([`Done::kept`]) went into
+    /// `written`: the first time it reads the table, or holds it
+    /// ([`House::own_from_before`]).
+    kept_in: bool,
     /// When it first read the table this run ([`SETTLE_MS`]).
     first_read: Option<u64>,
     /// When the ticks it last held the table (a value there a page may read
@@ -1769,8 +1773,27 @@ impl House {
     /// then ([`TableMem::held_since`]), whether that is the next pass or,
     /// the tick's reading spent first, a later tick.
     fn hold_began(&mut self, room: &str, key: &(String, String), now: u64) {
+        self.own_from_before(room, key);
         let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
         mem.held_since.get_or_insert(now);
+    }
+
+    /// After a start, its reveals at table `key` from before ([`Done::kept`])
+    /// go back as this run's do: once, the first time it reads the table or
+    /// holds it (held over its own record, a value a page may read
+    /// otherwise, the table waits on the put-back to read it again).
+    fn own_from_before(&mut self, room: &str, key: &(String, String)) {
+        let done = self.done.get(&(room.to_string(), key.0.clone(), key.1.clone()));
+        let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
+        if mem.kept_in {
+            return;
+        }
+        mem.kept_in = true;
+        for k in done.map_or(&[][..], |d| &d.kept[..]) {
+            if !mem.written.iter().any(|(_, key, _)| *key == k.key) {
+                mem.written.push((k.ses.clone(), k.key.clone(), k.rec.clone()));
+            }
+        }
     }
 
     /// Record `key` of session `ses`, good as the house reads it, a page may
@@ -1882,16 +1905,8 @@ impl House {
 
         let key = (ctx.t.clone(), ctx.inc.clone());
         let settle_ms = self.settle_ms;
-        let kept = self.last_of(ctx).map(|d| d.kept.clone()).unwrap_or_default();
+        self.own_from_before(room, &key);
         let mem = self.rooms.get_mut(room).unwrap().tables.entry(key.clone()).or_default();
-        if mem.first_read.is_none() {
-            // After a start: its reveals from before go back as this run's do.
-            for k in kept {
-                if !mem.written.iter().any(|(_, key, _)| *key == k.key) {
-                    mem.written.push((k.ses, k.key, k.rec));
-                }
-            }
-        }
         let settling = now.saturating_sub(*mem.first_read.get_or_insert(now)) < settle_ms;
         // (After a hold, a close first seen counts as there since it began,
         // for the cutoff.)

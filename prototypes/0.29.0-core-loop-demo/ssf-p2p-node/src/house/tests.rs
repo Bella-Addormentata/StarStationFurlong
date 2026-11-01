@@ -3497,3 +3497,49 @@ fn weighing_a_map_with_a_proto_field_looks_at_its_keys_no_further_than_its_cap()
     let looked = hb::TYPED_KEYS_READ.with(|n| n.get());
     assert!(looked < MAX_RECORD_BYTES / 8, "{looked} keys looked at");
 }
+
+/// After a restart, a value a page may read otherwise in place of the
+/// house's reveal holds the table, and the reveal goes back from the state
+/// file as it would have during the run: the table is read again, and a
+/// step-down then lifts round 2's commitment.
+#[test]
+fn after_a_restart_its_own_reveal_held_over_goes_back_from_its_state_file() {
+    for step_down in [false, true] {
+        let mut room = Room::new(&format!("restart-own-unknown-{step_down}"), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        room.tick(200);
+        let (key, h1) = room.records("h:1:").pop().unwrap();
+        let odd = padded(&h1, Any::Undefined);
+        let Any::Map(m) = odd else { unreachable!() };
+        let mut m = (*m).clone();
+        m.insert("7".into(), Any::Undefined);
+        let odd = Any::Map(Arc::new(m));
+        assert_eq!(hb::clarity(&odd), hb::Clarity::Unknown);
+        {
+            let ses = room.ses_key();
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            let Some(Out::YMap(m)) = comp.get(&txn, &ses) else { panic!() };
+            m.insert(&mut txn, key.as_str(), odd);
+        }
+        room.house = House::open(&NODE, Some(room.dir.join(STATE_FILE))).unwrap();
+        room.house.settle_ms = 0;
+        if step_down {
+            room.house.begin_step_down();
+        }
+        for _ in 0..3 {
+            room.tick(REPUT_MS);
+        }
+        assert!(clean(room.raw(&key), &h1), "{step_down}: put back from the state file");
+        let tkey = (T.to_string(), INC.to_string());
+        assert_eq!(room.house.rooms[ROOM].tables[&tkey].held_since, None, "{step_down}: read again");
+        if step_down {
+            let words = room.records("h:2:");
+            let d = &words.first().expect("the step-down's word").1;
+            assert!(strs(d, "x").is_empty(), "round 2's commitment stepped down");
+        }
+    }
+}
