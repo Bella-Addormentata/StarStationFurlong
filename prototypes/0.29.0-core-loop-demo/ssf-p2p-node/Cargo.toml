@@ -127,8 +127,9 @@ url = { version = "2", optional = true }
 
 # 🔒 Windows DPAPI locks the SSF wallet's file at rest once its 24 words are
 # saved (chia_at_rest.rs). Already in the lockfile through other crates.
+# It also reads how many names a file has, for the hard-link warning.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # The tests' mock full node builds a header block, whose BLS fields need the

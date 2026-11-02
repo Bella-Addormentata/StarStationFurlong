@@ -5789,7 +5789,7 @@ fn lock_if_due(meta: &mut chia_wallet_switch::WalletMeta, policy: chia_at_rest::
             meta.rewrapped = true;
         }
         chia_wallet::Wrapped::Already(at_rest) => meta.at_rest = at_rest,
-        chia_wallet::Wrapped::Skipped(_) => {}
+        chia_wallet::Wrapped::OtherWallet | chia_wallet::Wrapped::Skipped(_) => {}
     }
 }
 

@@ -182,9 +182,9 @@ export const AT_REST_UNTIL_SAVED =
 export const AT_REST_RETRY =
   'On disk, its key is still in the clear in chia_identity.json: your node locks the file to your Windows account at its next start.';
 export const AT_REST_CLEAR =
-  'On disk, its key is in the clear in chia_identity.json, readable only by your user account: anyone who gets that file has this wallet.';
+  'On disk, its key is in the clear in chia_identity.json: anyone who can read that file has this wallet.';
 export const AT_REST_REWRAPPED =
-  'Copies of your node\'s folder made before today (a synced or zipped folder, a backup) still hold the key in the clear: delete them.';
+  'Copies of your node\'s folder made before it locked this file (a synced or zipped folder, a backup) still hold the key in the clear: delete them.';
 
 /** The at-rest lines for an on 24-word wallet, from what its node says;
  *  none from an older node, which does not say. */

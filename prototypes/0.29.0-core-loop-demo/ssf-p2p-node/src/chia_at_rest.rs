@@ -195,7 +195,7 @@ pub fn policy_line(policy: Policy, store: Option<AtRest>) -> Option<String> {
             "🏦 SSF wallet: {POLICY_ENV}=none: the wallet's file stays in the clear on disk, even once its 24 words are saved"
         )),
         (Policy::Os, None) => Some(
-            "🏦 SSF wallet: this computer has no store the node locks the wallet's file with yet, so it stays in the clear (owner-only) on disk"
+            "🏦 SSF wallet: this computer has no store the node locks the wallet's file with yet, so it stays in the clear on disk"
                 .to_string(),
         ),
         (Policy::Os, Some(_)) => None,
@@ -334,6 +334,7 @@ mod tests {
         assert!(policy_line(Policy::Os, Some(AtRest::Dpapi)).is_none());
         assert!(policy_line(Policy::None, Some(AtRest::Dpapi)).unwrap().contains("=none"));
         assert!(policy_line(Policy::Os, None).unwrap().contains("in the clear"));
+        assert!(!policy_line(Policy::Os, None).unwrap().contains("owner-only"), "the node does not check that");
     }
 
     #[cfg(windows)]

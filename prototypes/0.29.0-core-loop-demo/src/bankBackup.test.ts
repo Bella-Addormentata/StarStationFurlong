@@ -735,6 +735,12 @@ describe('atRestLines (🔒 the wallet\'s file at rest)', () => {
     expect(atRestLines(on({ at_rest: 'none' }))).toEqual([AT_REST_CLEAR]);
     expect(atRestLines(on({ at_rest: 'none', backed_up: true }))).toEqual([AT_REST_CLEAR]);
     expect(atRestLines(on({ at_rest: 'dpapi', backed_up: true, rewrapped: true }))).toEqual([AT_REST_DPAPI, AT_REST_REWRAPPED]);
+    // No owner-only promise the node does not check (Windows does not keep
+    // one, and a Unix folder can ignore it), and copies made earlier the
+    // same day, before the lock, are not left out.
+    expect(AT_REST_CLEAR).not.toMatch(/only by your user account/);
+    expect(AT_REST_CLEAR).not.toMatch(/owner-only/);
+    expect(AT_REST_REWRAPPED).not.toMatch(/today/);
   });
 
   it('says nothing for an older node, a wallet that is not on, or one not made from words', () => {
