@@ -76,6 +76,20 @@ describe('parseNodeFingerprint', () => {
     expect(json).not.toContain('3552866753');
   });
 
+  it('keeps how the wallet\'s file is kept at rest, and drops a lock it cannot word (🔒)', () => {
+    const fp = (chia_wallet: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_wallet })?.chia_wallet;
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'dpapi' })).toEqual({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'dpapi' });
+    expect(fp({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'dpapi', rewrapped: true })).toEqual({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'dpapi', rewrapped: true });
+    // A newer node's lock this page cannot word: that field goes, the switch stays.
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'keychain' })).toEqual({ state: 'on', mnemonic: true });
+    // Not a string, or a flag that is not a boolean: no readout at all.
+    for (const bad of [1, true, null, ['dpapi'], { kind: 'dpapi' }]) {
+      expect(fp({ state: 'on', at_rest: bad })).toBeUndefined();
+      expect(fp({ state: 'on', at_rest_next: bad })).toBeUndefined();
+    }
+    expect(fp({ state: 'on', rewrapped: 'yes' })).toBeUndefined();
+  });
+
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
     const listed = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: listed })?.chia_presence).toEqual(listed);

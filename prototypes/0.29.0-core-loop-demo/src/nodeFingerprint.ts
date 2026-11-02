@@ -102,6 +102,10 @@ export interface ChiaPresence {
  *  turn it on), `on` (the wallet is loaded). */
 export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
+/** 🔒 How the wallet's file keeps its key on disk: `none` in the clear
+ *  (owner-only on Unix), `dpapi` locked to this Windows account. */
+export type ChiaWalletAtRest = 'none' | 'dpapi';
+
 export interface ChiaWalletSwitch {
   state: ChiaWalletState;
   /** Ready: the 24-word identity from an earlier run (`chia_identity.json`)
@@ -126,6 +130,16 @@ export interface ChiaWalletSwitch {
   backed_up?: boolean;
   /** On: this run's load retired a raw-seed wallet and made a new one. */
   reminted?: boolean;
+  /** On, with `mnemonic`: how the wallet's file keeps its key on disk. An
+   *  older node never sends it. */
+  at_rest?: ChiaWalletAtRest;
+  /** On, with the file in the clear: the lock it gets once its words are
+   *  saved. Absent where there is no lock to come (no store on this
+   *  computer, or `SSF_WALLET_AT_REST=none`). */
+  at_rest_next?: ChiaWalletAtRest;
+  /** On: this run locked the file, so folder copies made before still hold
+   *  the key in the clear. */
+  rewrapped?: boolean;
   /** Why the last turn failed, in the node's words. */
   error?: string;
 }
@@ -134,7 +148,12 @@ export interface ChiaWalletSwitch {
  *  Nothing else is copied: the fingerprint never carries the words, and a
  *  field of any other name from a node (or a stranger on its port) is
  *  dropped here. */
-const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up', 'reminted'] as const;
+const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up', 'reminted', 'rewrapped'] as const;
+
+/** The at-rest fields: a string, kept only when it is a lock this page can
+ *  word (a newer node's other lock is dropped, not the whole switch). */
+const WALLET_AT_REST = ['at_rest', 'at_rest_next'] as const;
+const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'dpapi']);
 
 const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on']);
 
@@ -149,10 +168,17 @@ export function parseChiaWallet(v: unknown): ChiaWalletSwitch | undefined {
   for (const flag of WALLET_FLAGS) {
     if (r[flag] !== undefined && typeof r[flag] !== 'boolean') return undefined;
   }
+  for (const field of WALLET_AT_REST) {
+    if (r[field] !== undefined && typeof r[field] !== 'string') return undefined;
+  }
   if (r.error !== undefined && typeof r.error !== 'string') return undefined;
   const w: ChiaWalletSwitch = { state: r.state as ChiaWalletState };
   for (const flag of WALLET_FLAGS) {
     if (r[flag] === true) w[flag] = true;
+  }
+  for (const field of WALLET_AT_REST) {
+    const kind = r[field];
+    if (typeof kind === 'string' && AT_REST_KINDS.has(kind)) w[field] = kind as ChiaWalletAtRest;
   }
   if (typeof r.error === 'string' && r.error) w.error = r.error;
   return w;

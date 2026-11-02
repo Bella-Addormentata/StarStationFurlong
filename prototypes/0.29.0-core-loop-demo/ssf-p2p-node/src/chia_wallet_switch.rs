@@ -28,6 +28,10 @@
 //! exact origin the operator lists in `SSF_BANK_DEV_PAGES` ([`dev_pages`]).
 //! Once saved, the page never shows them again.
 //!
+//! 🔒 Once saved, the node also locks the identity file with this computer's
+//! store where it has one (chia_at_rest.rs: Windows DPAPI), and the
+//! fingerprint says how the file keeps its key ([`AtRest`]).
+//!
 //! Everything a decision rests on is a pure function here, so the startup
 //! block, the loopback route and the fingerprint agree and are tested without
 //! touching the process environment.
@@ -42,7 +46,8 @@ use serde::{Deserialize, Serialize};
 pub const SWITCH_FILE: &str = "chia_wallet.json";
 
 /// The wallet's identity: 32 bytes of BIP39 entropy, its 24 words
-/// (chia_wallet.rs mints it once and never rewrites it). Its presence the
+/// (chia_wallet.rs mints it once; the only rewrite is the lock once its
+/// words are saved, chia_at_rest.rs, which keeps the same wallet). Its presence the
 /// Bank shows as TURN ON rather than CREATE: that wallet, and its address,
 /// come back.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
@@ -63,6 +68,17 @@ pub const SAVED_FILE: &str = "chia_words_saved.json";
 /// loads, before anything can spend from it.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub const LEASE_FILE: &str = "wallet_lease.json";
+
+/// 🔒 How the identity file keeps its key on disk (its `protect`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AtRest {
+    /// In the clear (owner-only on Unix).
+    #[default]
+    None,
+    /// Locked by Windows DPAPI to this Windows account on this PC.
+    Dpapi,
+}
 
 /// What the node's environment says about the wallet, read once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +275,19 @@ pub struct WalletSwitch {
     /// On: this run's load retired a raw-seed wallet, so the address is new.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reminted: bool,
+    /// On, with `mnemonic`: how the wallet's file keeps its key on disk.
+    /// An older node never sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_rest: Option<AtRest>,
+    /// On, with the file in the clear: the lock it gets once its words are
+    /// saved (the next start retries one that did not land). None when this
+    /// computer has no store or `SSF_WALLET_AT_REST=none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_rest_next: Option<AtRest>,
+    /// On: this run locked the file, so copies of the folder made before
+    /// still hold the key in the clear.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rewrapped: bool,
     /// Why the last turn failed, in the node's words (Ready or On only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -287,6 +316,12 @@ pub struct KeyFacts {
     pub backed_up: bool,
     /// This run's load retired a raw seed.
     pub reminted: bool,
+    /// How the loaded wallet's file keeps its key on disk.
+    pub at_rest: AtRest,
+    /// The lock a file in the clear gets once its words are saved.
+    pub at_rest_next: Option<AtRest>,
+    /// This run locked the loaded wallet's file.
+    pub rewrapped: bool,
 }
 
 /// The fingerprint's view, from the facts the node holds.
@@ -312,6 +347,9 @@ pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts:
         mnemonic: ready || (on && facts.mnemonic),
         backed_up: on && facts.mnemonic && facts.backed_up,
         reminted: on && facts.reminted,
+        at_rest: (on && facts.mnemonic).then_some(facts.at_rest),
+        at_rest_next: (on && facts.mnemonic && facts.at_rest == AtRest::None).then_some(facts.at_rest_next).flatten(),
+        rewrapped: on && facts.mnemonic && facts.rewrapped,
         error: matches!(state, WalletState::Ready | WalletState::On).then(|| memo.error.clone()).flatten(),
     }
 }
@@ -524,7 +562,8 @@ pub fn remember_saved(path: &Path, key: u32, now: u64) -> std::io::Result<()> {
 /// 🏦 What the hub keeps beside the loaded wallet key for the Bank (never
 /// the words or the entropy): the fingerprint of its words, whether the
 /// player marked them saved, whether this run's load retired a raw seed,
-/// and whether the Bank showed the words since the node started.
+/// whether the Bank showed the words since the node started, how the file
+/// keeps its key, and whether this run locked it.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletMeta {
@@ -532,6 +571,8 @@ pub struct WalletMeta {
     pub backed_up: bool,
     pub reminted: bool,
     pub revealed: bool,
+    pub at_rest: AtRest,
+    pub rewrapped: bool,
 }
 
 /// 🏦 Where one words ask goes, decided against the loaded wallet: an answer
@@ -728,6 +769,9 @@ mod tests {
             mnemonic: false,
             backed_up: false,
             reminted: false,
+            at_rest: None,
+            at_rest_next: None,
+            rewrapped: false,
             error: None,
         }
     }
@@ -905,7 +949,7 @@ mod tests {
     fn the_words_flags_ride_only_in_the_state_they_describe() {
         use EnvSwitch::*;
         let memo = |remembered| SwitchMemo { remembered, error: None };
-        let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true };
+        let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true, ..KeyFacts::default() };
         let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
 
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
@@ -917,11 +961,11 @@ mod tests {
         }
 
         let reminted = KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true}"#);
+        assert_eq!(json(&view(true, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#);
         let saved = KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true}"#);
+        assert_eq!(json(&view(true, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#);
         let v = view(true, On, true, &memo(false), &all);
-        assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true}"#);
+        assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true,"at_rest":"none"}"#);
         let v = view(true, Unset, true, &memo(true), &KeyFacts { backed_up: true, ..KeyFacts::default() });
         assert!(!v.backed_up, "backed up means these words, which a wallet not made from them has not");
         assert!(!view(true, Unset, true, &memo(true), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }).seed);
@@ -931,6 +975,34 @@ mod tests {
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"on"}"#).unwrap();
         assert!(!back.mnemonic, "an older node never sends it");
         assert!(!json(&v).contains("words"), "the fingerprint never carries the words, nor a flag named after them");
+    }
+
+    /// 🔒 How the file keeps its key rides only while On with the 24 words;
+    /// the lock to come only while it is still in the clear.
+    #[test]
+    fn the_at_rest_flags_ride_only_for_a_loaded_24_word_wallet() {
+        use EnvSwitch::*;
+        let memo = SwitchMemo { remembered: true, error: None };
+        let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
+        let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Dpapi), ..KeyFacts::default() };
+        assert_eq!(
+            json(&view(true, Unset, true, &memo, &clear)),
+            r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","at_rest_next":"dpapi"}"#
+        );
+        let locked = KeyFacts { mnemonic: true, backed_up: true, at_rest: AtRest::Dpapi, at_rest_next: Some(AtRest::Dpapi), rewrapped: true, ..KeyFacts::default() };
+        assert_eq!(
+            json(&view(true, Unset, true, &memo, &locked)),
+            r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true}"#,
+            "a locked file has no lock to come"
+        );
+        let linux = KeyFacts { mnemonic: true, ..KeyFacts::default() };
+        assert_eq!(json(&view(true, Unset, true, &memo, &linux)), r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none"}"#);
+        // Not loaded, or not from 24 words: nothing to say about its file.
+        for v in [view(true, Unset, false, &memo, &locked), view(true, Unset, true, &memo, &KeyFacts { mnemonic: false, ..locked })] {
+            assert!(v.at_rest.is_none() && v.at_rest_next.is_none() && !v.rewrapped, "{v:?}");
+        }
+        let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true}"#).unwrap();
+        assert_eq!(back.at_rest, None, "an older node never sends it");
     }
 
     #[test]
@@ -1090,7 +1162,7 @@ mod tests {
 
     /// The loaded wallet's meta for the words-route table: key fingerprint 7.
     fn meta(backed_up: bool, revealed: bool) -> WalletMeta {
-        WalletMeta { fingerprint: 7, backed_up, reminted: false, revealed }
+        WalletMeta { fingerprint: 7, backed_up, reminted: false, revealed, ..WalletMeta::default() }
     }
 
     #[test]

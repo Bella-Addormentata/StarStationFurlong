@@ -5310,6 +5310,7 @@ function renderBankApp(): void {
           ${bv.open ? ctl(BACKUP_ID, "BACK UP") : ""}
         </div>` : ""}
         ${bv.elsewhere ? line(bv.elsewhere, "rgba(212,168,75,0.7)") : ""}
+        ${bv.atRest.map((t) => line(t, "rgba(212,168,75,0.6)")).join("")}
         ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}
         ${bv.error ? line(bv.error, "#f0a060", true) : ""}`;
       } else if (bv?.panel) {

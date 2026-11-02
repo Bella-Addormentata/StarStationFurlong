@@ -38,6 +38,12 @@ import {
   wipeClipboard,
   wipeWanted,
   wordsExpireIn,
+  atRestLines,
+  AT_REST_CLEAR,
+  AT_REST_DPAPI,
+  AT_REST_REWRAPPED,
+  AT_REST_RETRY,
+  AT_REST_UNTIL_SAVED,
   type BankBackupUi,
   type RevealResult,
 } from './bankBackup';
@@ -717,5 +723,41 @@ describe('backupGridHtml', () => {
   it('escapes what it is given, though the reveal only lets a–z through', () => {
     const odd = [...WORDS.slice(0, 23), '<img src=x>'];
     expect(backupGridHtml(odd)).not.toContain('<img');
+  });
+});
+
+describe('atRestLines (🔒 the wallet\'s file at rest)', () => {
+  const on = (w: Partial<ChiaWalletSwitch>) => node({ ...ON, ...w }, ADDR);
+  it('says how the file keeps its key, from what the node says', () => {
+    expect(atRestLines(on({ at_rest: 'dpapi', backed_up: true }))).toEqual([AT_REST_DPAPI]);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'dpapi' }))).toEqual([AT_REST_UNTIL_SAVED]);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'dpapi', backed_up: true }))).toEqual([AT_REST_RETRY]);
+    expect(atRestLines(on({ at_rest: 'none' }))).toEqual([AT_REST_CLEAR]);
+    expect(atRestLines(on({ at_rest: 'none', backed_up: true }))).toEqual([AT_REST_CLEAR]);
+    expect(atRestLines(on({ at_rest: 'dpapi', backed_up: true, rewrapped: true }))).toEqual([AT_REST_DPAPI, AT_REST_REWRAPPED]);
+    // No owner-only promise the node does not check (Windows does not keep
+    // one, and a Unix folder can ignore it), and copies made earlier the
+    // same day, before the lock, are not left out.
+    expect(AT_REST_CLEAR).not.toMatch(/only by your user account/);
+    expect(AT_REST_CLEAR).not.toMatch(/owner-only/);
+    expect(AT_REST_REWRAPPED).not.toMatch(/today/);
+  });
+
+  it('says nothing for an older node, a wallet that is not on, or one not made from words', () => {
+    expect(atRestLines(LIVE)).toEqual([]);
+    expect(atRestLines(node({ state: 'ready', at_rest: 'none' } as ChiaWalletSwitch, ADDR))).toEqual([]);
+    expect(atRestLines(node({ state: 'on', at_rest: 'dpapi' }, ADDR))).toEqual([]);
+    expect(atRestLines(null)).toEqual([]);
+  });
+
+  it('rides with the nag and the done line, never in the panel', () => {
+    const fp = on({ at_rest: 'none', at_rest_next: 'dpapi' });
+    expect(bankBackupView(fp, BACKUP_IDLE, 'app')?.atRest).toEqual([AT_REST_UNTIL_SAVED]);
+    expect(bankBackupView(fp, BACKUP_IDLE, 'elsewhere')?.atRest).toEqual([AT_REST_UNTIL_SAVED]);
+    const saved = on({ at_rest: 'dpapi', backed_up: true });
+    expect(bankBackupView(saved, BACKUP_IDLE, 'app')).toMatchObject({ state: 'done', atRest: [AT_REST_DPAPI] });
+    const panel = bankBackupView(fp, openBackupPanel(BACKUP_IDLE, fp, 1000), 'app');
+    expect(panel?.state).toBe('panel');
+    expect(panel?.atRest).toEqual([]);
   });
 });
