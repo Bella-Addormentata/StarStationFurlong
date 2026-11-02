@@ -177,6 +177,7 @@ import {
   holdsDeed,
   houseOnline,
   houseSetUp,
+  houseSumBackedOff,
   isComputedTable,
   markComputedVerdict,
   notifyCasinoView,
@@ -531,6 +532,11 @@ interface TableState {
    *  Null when this page isn't the deed holder, or the last trim failed a
    *  vouch condition (a fresh chain starts from the next base's `u`). */
   attested: { sid: string; a: number } | null;
+  /** 🏛️ D2: a trim this page folded whose attestation the hearing gate held
+   *  off (attestDuty: the page hadn't heard the room for IDLE_MS, so its view
+   *  might be stale). noteResult retries it once the gate clears; a newer trim
+   *  supersedes it, and it clears when the attestation runs. */
+  pendingAttest: { was: FoldResult; res: FoldResult } | null;
   scan: Scan | null;
   view: ViewEntry | null;
   /** The phase listeners were last told of, for one fold result. */
@@ -696,7 +702,7 @@ function newTable(t: string, inc: string): TableState {
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
-    lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, scan: null, view: null, told: null, check: null, checks: new Map(),
+    lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
@@ -750,7 +756,12 @@ function lastDecided(res: FoldResult): RoundView | null {
  *  closes leave out after such a move: casinoDoc noteDoubted.) */
 function noteResult(st: TableState, res: FoldResult): void {
   const was = st.lastRes;
-  if (was === res) return;
+  // 🏛️ The gate reopening is no doc change, so an unchanged fold must still
+  // retry a trim the gate held off (noteResult runs every frame).
+  if (was === res) {
+    retryPendingAttest(st);
+    return;
+  }
   const moved = was !== null && was.base.sid !== res.base.sid;
   if (forgedStands(st)) {
     if (moved) {
@@ -768,6 +779,9 @@ function noteResult(st: TableState, res: FoldResult): void {
   // for a forgery a restore is undoing: forgedStands). It signs the checkpoint
   // only when every one of attestDuty's conditions holds.
   if (moved && !forgedStands(st)) attestDuty(st, was!, res);
+  // A changed-but-not-moved fold (a fresh bet, say): no new trim to attest, but
+  // the gate may have reopened for a held-off one.
+  else retryPendingAttest(st);
   const D = lastDecided(res);
   if (D) st.lastD = D;
   st.lastRes = res;
@@ -798,12 +812,18 @@ function noteResult(st: TableState, res: FoldResult): void {
 function attestDuty(st: TableState, was: FoldResult, res: FoldResult): void {
   if (!holdsDeed()) {
     st.attested = null;
+    st.pendingAttest = null;
     return;
   }
   const now = clock.last ?? Date.now();
   // A page that hasn't heard the room for a minute can't vouch (its view may
-  // be stale): wait, without forgetting the chain.
-  if (!heardThrough(now - IDLE_MS, now)) return;
+  // be stale): keep the trim to retry once hearing recovers (noteResult), and
+  // don't forget the chain. A newer trim replaces this pending one.
+  if (!heardThrough(now - IDLE_MS, now)) {
+    st.pendingAttest = { was, res };
+    return;
+  }
+  st.pendingAttest = null;
   const P = computedCheckpointOf(st.t, st.inc);
   if (!P) {
     st.attested = null;
@@ -862,6 +882,48 @@ function attestDuty(st: TableState, was: FoldResult, res: FoldResult): void {
   const rec: HouseSum = signed(st.ctx, 'hsum', body);
   writeHouseSum(st.t, st.inc, rec);
   st.attested = { sid: res.base.sid, a };
+}
+
+/** 🏛️ Retry a trim whose attestation the hearing gate held off (st.pendingAttest),
+ *  now that another fold has run. Cleared first so a stale one (the doc moved
+ *  past it, or a restore is in motion) doesn't retry forever: attestDuty re-keeps
+ *  it only while the gate is still shut and the checkpoint still current. */
+function retryPendingAttest(st: TableState): void {
+  if (!st.pendingAttest || forgedStands(st)) return;
+  const pending = st.pendingAttest;
+  st.pendingAttest = null;
+  attestDuty(st, pending.was, pending.res);
+}
+
+/** 🏛️ D2 for an end this page itself just wrote (switchComputedOff,
+ *  migrateComputed, compactDuty): the deed holder vouches for the end
+ *  checkpoint `cp` by an `hs:` over it, so F4 (houseSumTrigger 'end') can put
+ *  it back if the ended table is turned live again. No hearing gate: the page
+ *  acts on its own just-folded view, which these paths hold quiet (no round
+ *  under way) before the end, so it is current. It vouches only for a real
+ *  decided round the end kept (attestDuty's condition 2, 7, 6), never a bare
+ *  base; the hs:'s digest fields mirror `cp`, so it checks the very checkpoint
+ *  (nextSid leaves k and g out). `was` is the fold the end was taken from,
+ *  `prior` the page's last attestation (to carry its `a` on). */
+function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null): void {
+  if (!holdsDeed() || cp.e !== 1) return;
+  if (!was.rounds.some((v) => v.decided !== null && v.r === cp.u && v.close === cp.l)) return;
+  if (was.rounds.some((v) => v.decided !== null && v.r > cp.u)) return;
+  if (was.pending || !casinoWhole(t)) return;
+  const a = prior && prior.sid === cp.b ? prior.a : was.base.u;
+  const body = {
+    v: 1 as const,
+    b: cp.b,
+    u: cp.u,
+    l: cp.l,
+    n: cp.n,
+    e: 1 as const,
+    ...(cp.s !== undefined ? { s: cp.s } : {}),
+    ...(cp.h !== undefined ? { h: cp.h } : {}),
+    a,
+    k: getIdentityPub(),
+  };
+  writeHouseSum(t, inc, signed(ctx, 'hsum', body));
 }
 
 /** Whether the checkpoint table st counts puts a restore in motion. */
@@ -2067,6 +2129,10 @@ export interface ComputedCheckpointView {
   label: string | null;
   round: number;
   covered: 'unseen' | 'split' | 'same' | null;
+  /** 🏛️ Whether this page has stood down from putting the owner-signed
+   *  checkpoint back (B12: a run of worse overwrites it reads as a disagreement
+   *  over the owner's key). The ⚙ card shows PAGES DISAGREE while it holds. */
+  backedOff: boolean;
 }
 export function computedCheckpointView(t: string, now = Date.now()): ComputedCheckpointView | null {
   lookAtClock(now);
@@ -2078,6 +2144,7 @@ export function computedCheckpointView(t: string, now = Date.now()): ComputedChe
     label: checkpointLabelOf(st.t, st.inc, res.base.sid, res.base.u),
     round: res.base.u,
     covered: cp?.covered ?? null,
+    backedOff: houseSumBackedOff(st.t, st.inc, now),
   };
 }
 
@@ -3657,6 +3724,10 @@ function compactDuty(pub: string, now: number): void {
     }
     if (cp) endedByMe.add(nextSid(ctx, cp));
     finalizeComputed(e.t, e.inc, cp);
+    // 🏛️ D2: vouch for the end this page just wrote, so F4 can put it back if
+    // the ended table is turned live again (only a freshly written end: an end
+    // already in the doc was vouched for when it was written).
+    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, null);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
 }
@@ -3963,6 +4034,8 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   endedByMe.add(nextSid(st.ctx, cp));
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
+    // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
     writeComputedOn(t, computedIncFor(t, game));
     return true;
   });
@@ -4290,6 +4363,8 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
   endedByMe.add(nextSid(st.ctx, cp));
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
+    // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
     return true;

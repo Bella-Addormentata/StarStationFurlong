@@ -3307,7 +3307,18 @@ function noteHouseSum(t: string, inc: string): void {
   if (!map) return;
   const hs = houseSumAt(map, t, inc);
   if (!hs || !authorityOkHouseSum(hs)) return;
+  // 🏛️ The ⚙ card's checkpoint label reads whether a valid-looking owner-signed
+  // checkpoint is still being checked (CHECKING…, L-2) and this page's best one
+  // (bestHouseSum): a shape- and authority-valid hs: arriving, or its check
+  // landing, changes the label — so wake the card's listeners without a refold
+  // (the label reads the doc fresh: computedTable computedCheckpointView).
+  viewTouched.add(`computed:${t}`);
   if (houseSumOk(t, inc, hs, houseSumKey(t, inc)) !== true) return;
+  // Register the incarnation so recovery can put the owner's checkpoint back:
+  // computedRecoveries iterates the tracked incs, and this valid hs: may be the
+  // only key the incarnation has left (every sum:/ses: deleted before this page
+  // joined) — without this, F1 has nothing to find the incarnation by.
+  trackComputed(t, inc);
   const key = `${t}:${inc}`;
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   const seen = houseSumSeen.get(key);
@@ -3520,8 +3531,17 @@ export function putBackHouseRecords(now = Date.now()): number {
     const inc = key.slice(cut + 1);
     const ctx: FoldCtx = { room: boundRoomId, t, inc };
     const doc = houseSumAt(map, t, inc);
-    const docOk = doc !== null && authorityOkHouseSum(doc) && houseSumOk(t, inc, doc, houseSumKey(t, inc)) === true;
-    if (docOk && compareHouseSum(ctx, seen, doc!) <= 0) continue;
+    // The present value's authority and 'hsum' signature, read as the
+    // Fair-setting loop above reads a newer record's: true valid, false junk,
+    // undefined while its check is queued.
+    const docOk = doc !== null && authorityOkHouseSum(doc)
+      ? houseSumOk(t, inc, doc, houseSumKey(t, inc))
+      : false;
+    // A newer or better attestation this page hasn't finished checking yet:
+    // leave it for the recheck to count, as the Fair loop waits on `undefined`
+    // — don't overwrite it with our older best, nor count it a B12 overwrite.
+    if (docOk === undefined && compareHouseSum(ctx, doc!, seen) > 0) continue;
+    if (docOk === true && compareHouseSum(ctx, seen, doc!) <= 0) continue;
     // A present value worse than ours (not a bare delete) counts toward B12.
     if (doc !== null && recHash(doc) !== recHash(seen)) {
       const hits = (bo?.hits ?? []).filter((at) => now - at < BACKOFF_WINDOW_MS);

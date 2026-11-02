@@ -2697,6 +2697,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const color = cp.label.startsWith('🚩') ? '#FF8A80' : cp.label.includes('· CHECKED BY THE') ? '#7CF5B0' : '#F5C26B';
       out.push({ text: cp.label, color });
     }
+    // 🏛️ B12: this page has stood down from putting the owner's checkpoint back
+    // after a run of worse overwrites — a disagreement over the owner's key.
+    if (cp?.backedOff) {
+      out.push({ text: "🚩 PAGES DISAGREE OVER THE OWNER'S CHECKPOINT · PUTTING IT BACK IS PAUSED", color: '#FF8A80' });
+    }
     if (cp && cp.round > 0 && cp.covered === 'unseen') {
       out.push({ text: `THIS PAGE DIDN'T SEE ROUND ${cp.round} DECIDED · IT CAN'T CHECK THE CHECKPOINT`, color: '#F5C26B' });
     }
