@@ -148,10 +148,14 @@ fn node_data_dir() -> Option<std::path::PathBuf> {
 /// below. The node reads its Chia network from `SSF_CHIA_NETWORK`; the app
 /// removes it from the child's environment, so a variable in the player's
 /// environment can never move the bundled node to another chain. The node
-/// then runs on its default, testnet11.
+/// then runs on its default, testnet11. It removes `SSF_SHELL_CHANNEL` too,
+/// so a variable in the player's environment can never turn on the node's
+/// desktop-app channel (its stdin and stdout); only the app's own spawn may
+/// set it, once the app speaks that channel.
 fn node_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("SSF_CHIA_NETWORK");
+    cmd.env_remove("SSF_SHELL_CHANNEL");
     cmd
 }
 
@@ -323,16 +327,21 @@ mod tests {
     use super::*;
 
     /// Both sidecar spawns go through `node_command`, which removes
-    /// SSF_CHIA_NETWORK from the child's environment (a removed variable
-    /// shows in `get_envs` as `None`). Nothing is spawned and nothing is read
-    /// from this process's environment.
+    /// SSF_CHIA_NETWORK and SSF_SHELL_CHANNEL from the child's environment
+    /// (a removed variable shows in `get_envs` as `None`). Nothing is spawned
+    /// and nothing is read from this process's environment.
     #[test]
-    fn the_sidecar_never_inherits_the_chia_network() {
+    fn the_sidecar_never_inherits_the_chia_network_or_the_shell_channel() {
         for program in [std::ffi::OsStr::new("ssf-p2p-node"), std::ffi::OsStr::new("/opt/ssf/ssf-p2p-node")] {
             let cmd = node_command(program);
             assert_eq!(cmd.get_program(), program);
-            let envs: Vec<_> = cmd.get_envs().collect();
-            assert_eq!(envs, vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), None)], "removed, and nothing else changed");
+            let mut envs: Vec<_> = cmd.get_envs().collect();
+            envs.sort();
+            assert_eq!(
+                envs,
+                vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), None), (std::ffi::OsStr::new("SSF_SHELL_CHANNEL"), None)],
+                "both removed, and nothing else changed"
+            );
         }
     }
 }

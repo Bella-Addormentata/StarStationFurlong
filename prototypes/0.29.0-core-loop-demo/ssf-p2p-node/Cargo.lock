@@ -6319,6 +6319,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-mainline-address-lookup",
  "iroh-mdns-address-lookup",
+ "libc",
  "librqbit",
  "n0-future",
  "rand 0.8.6",

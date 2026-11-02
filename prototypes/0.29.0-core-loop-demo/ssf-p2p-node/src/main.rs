@@ -15,10 +15,32 @@ use wtransport::{Connection, Endpoint as WtEndpoint, Identity, ServerConfig};
 use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl, SecretKey};
 use iroh::endpoint::presets::Minimal;
 
+/// 🖥️ The crate's `println!`, ahead of every `mod` so it shadows std's in
+/// all of them (shell_channel.rs): with the desktop app's channel off it is
+/// std's `println!`, the same bytes to stdout; with it on, stdout carries
+/// only the channel's frames and every log line goes to stderr instead, so
+/// a log line can never tear a frame or reach the app. `eprintln!` is std's.
+/// The probe arm only lets a test see which `println!` a module gets.
+macro_rules! println {
+    (@ssf_shell_channel_probe) => {
+        true
+    };
+    ($($arg:tt)*) => {
+        if $crate::shell_channel::started() {
+            ::std::eprintln!($($arg)*)
+        } else {
+            ::std::println!($($arg)*)
+        }
+    };
+}
+
 mod chia_lane;
 // 🏦 The SSF wallet switch (#335): the SpacePhone Bank turns the node's
 // wallet on; decisions here, the route and the hot start below.
 mod chia_wallet_switch;
+// 🖥️ The desktop app's channel: the spawned node's stdin and stdout, off
+// unless the app turns it on; the 24 words go to the app over it.
+mod shell_channel;
 // ⛓️ The Chia network this node runs on (testnet11 by default): read once,
 // and handed to everything that differs between networks.
 mod chia_network;
@@ -1024,16 +1046,16 @@ mod fingerprint_json_tests {
     /// carries the words, the entropy or the key fingerprint.
     #[test]
     fn the_wallet_switch_rides_with_its_words_flags_and_never_the_words() {
-        use crate::chia_wallet_switch::{view, EnvSwitch, KeyFacts, SwitchMemo, WalletSwitch};
+        use crate::chia_wallet_switch::{view, Backup, EnvSwitch, KeyFacts, SwitchMemo, WalletSwitch};
         let memo = SwitchMemo { remembered: true, error: None };
         let cases = [
             (
-                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#,
+                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }, Backup::Page),
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none","backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#,
+                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }, Backup::Page),
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none","backup":"page"}"#,
             ),
             (
                 view(
@@ -1043,16 +1065,17 @@ mod fingerprint_json_tests {
                     true,
                     &memo,
                     &KeyFacts { mnemonic: true, backed_up: true, at_rest: crate::chia_wallet_switch::AtRest::Dpapi, rewrapped: true, ..KeyFacts::default() },
+                    Backup::Page,
                 ),
-                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true}"#,
+                r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true,"backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"ready","legacy":true,"mnemonic":true}"#,
+                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
+                r#""chia_wallet":{"state":"ready","legacy":true,"mnemonic":true,"backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }),
-                r#""chia_wallet":{"state":"ready","seed":true,"mnemonic":true}"#,
+                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
+                r#""chia_wallet":{"state":"ready","seed":true,"mnemonic":true,"backup":"page"}"#,
             ),
         ];
         for (switch, expect) in cases {
@@ -1148,12 +1171,35 @@ mod fingerprint_json_tests {
     /// address, which the page (#360) reads as the gated Bank.
     #[test]
     fn a_gated_wallet_rides_as_gated() {
-        use crate::chia_wallet_switch::{view, EnvSwitch, KeyFacts, SwitchMemo};
+        use crate::chia_wallet_switch::{backup_of, view, EnvSwitch, KeyFacts, SwitchMemo};
         let mut some = fp();
-        some.chia_wallet = Some(view(true, true, EnvSwitch::On, false, &SwitchMemo { remembered: true, error: None }, &KeyFacts::default()));
+        some.chia_wallet = Some(view(true, true, EnvSwitch::On, false, &SwitchMemo { remembered: true, error: None }, &KeyFacts::default(), backup_of(false, false)));
         let json = serde_json::to_string(&some).unwrap();
-        assert!(json.contains(r#""chia_wallet":{"state":"gated"}"#), "{json}");
+        assert!(json.contains(r#""chia_wallet":{"state":"gated","backup":"none"}"#), "{json}");
         assert!(!json.contains("chia_address"), "{json}");
+    }
+
+    /// 🖥️ The fingerprint's `chia_wallet.backup` names who shows the words:
+    /// `native` while the desktop app's channel is on (any network), `page`
+    /// on a test network without it, `none` on mainnet without it.
+    #[test]
+    fn the_fingerprint_says_who_backs_the_words_up() {
+        use crate::chia_wallet_switch::{backup_of, view, EnvSwitch, KeyFacts, SwitchMemo};
+        let cases = [
+            ((true, true, false), "native"),
+            ((false, true, true), "native"),
+            ((true, false, false), "page"),
+            ((false, false, true), "none"),
+        ];
+        for ((test_net, channel, gate), word) in cases {
+            let mut some = fp();
+            let facts = KeyFacts { mnemonic: true, ..KeyFacts::default() };
+            some.chia_wallet = Some(view(true, gate, EnvSwitch::Unset, !gate, &SwitchMemo::default(), &facts, backup_of(test_net, channel)));
+            let json = serde_json::to_string(&some).unwrap();
+            assert!(json.contains(&format!(r#","backup":"{word}"}}"#)), "{json}");
+            let back: Fingerprint = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.chia_wallet.unwrap().backup, backup_of(test_net, channel));
+        }
     }
 }
 
@@ -1524,7 +1570,13 @@ async fn main() -> Result<()> {
     // value this build does not accept stops the node here, with one line and
     // exit code 2, before it opens a file or binds a socket. A typo must never
     // move the node to another chain.
-    let chia_net = match chia_network::startup(chia_network::selected()) {
+    let chosen = chia_network::startup(chia_network::selected());
+    // 🖥️ The desktop app's channel (shell_channel.rs), decided once, right
+    // after the network and before anything prints: with it on, every
+    // `println!` from here goes to stderr. Before the wallet loads, which
+    // mints on mainnet only with it on.
+    shell_channel::init();
+    let chia_net = match chosen {
         Ok(line) => {
             println!("{line}");
             chia_network::net()
@@ -1868,7 +1920,10 @@ async fn main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     let mut startup_wallet_meta: Option<chia_wallet_switch::WalletMeta> = None;
     #[cfg(feature = "chia-publish")]
-    if !chia_wallet_switch::dev_pages().is_empty() && !chia_net.is_test() {
+    if !chia_wallet_switch::dev_pages().is_empty() && shell_channel::started() {
+        // The app's channel is on: no page shows the words, on any network.
+        println!("🏦 SSF wallet: SSF_BANK_DEV_PAGES is ignored while the desktop app's channel is on. The desktop app shows the 24 words.");
+    } else if !chia_wallet_switch::dev_pages().is_empty() && !chia_net.is_test() {
         // The page reveal is refused off a test network, dev pages or not.
         println!(
             "🏦 SSF wallet: SSF_BANK_DEV_PAGES is ignored on {}. Only the desktop app will show the 24 words here.",
@@ -2125,6 +2180,16 @@ async fn main() -> Result<()> {
             chia_resolve::unix_now(),
         )),
     });
+
+    // 🖥️ The desktop app's channel thread, once the hub exists: its ops
+    // read the wallet's key, meta and switch there (the startup wallet is
+    // already in it), and a request the app sent sooner waits in the pipe.
+    // Nothing starts while the channel is off.
+    {
+        let hub_shell = hub.clone();
+        let rt = tokio::runtime::Handle::current();
+        shell_channel::spawn(move |op| shell_answer(&hub_shell, &rt, op));
+    }
 
     // 💾 C4/B restore: load persisted room docs and serve them from boot.
     // A visitor can cold-join a room whose owner's machine rebooted, as long
@@ -5769,6 +5834,7 @@ fn header_value(req: &str, name: &str) -> Option<String> {
 fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Option<String>) {
     let net = chia_network::net();
     let gate = !net.wallet_allowed();
+    let backup = chia_wallet_switch::backup_of(net.is_test(), shell_channel::started());
     #[cfg(feature = "chia-publish")]
     {
         // One read of the key for both the switch's state and the address,
@@ -5801,7 +5867,7 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
                 }
             }
         };
-        let view = chia_wallet_switch::view(true, gate, chia_wallet_switch::env_switch(), loaded, &memo, &facts);
+        let view = chia_wallet_switch::view(true, gate, chia_wallet_switch::env_switch(), loaded, &memo, &facts, backup);
         (view, key.as_ref().map(|sk| chia_wallet::receive_address(net, sk)))
     }
     #[cfg(not(feature = "chia-publish"))]
@@ -5809,7 +5875,7 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
         let _ = hub;
         let memo = chia_wallet_switch::SwitchMemo::default();
         let facts = chia_wallet_switch::KeyFacts::default();
-        (chia_wallet_switch::view(false, gate, chia_wallet_switch::env_switch(), false, &memo, &facts), None)
+        (chia_wallet_switch::view(false, gate, chia_wallet_switch::env_switch(), false, &memo, &facts, backup), None)
     }
 }
 
@@ -5846,7 +5912,8 @@ fn wallet_meta_of(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) 
         fingerprint: id.fingerprint,
         backed_up,
         reminted: id.retired.is_some(),
-        revealed: false,
+        revealed_page: false,
+        revealed_shell: false,
         at_rest: id.at_rest,
         rewrapped: false,
     }
@@ -5855,7 +5922,9 @@ fn wallet_meta_of(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) 
 /// 🏦 Load the wallet (minting it once), then lock its file if its words are
 /// saved ([`lock_if_due`]): at startup and when the Bank turns it on.
 /// Blocking. A `SSF_WALLET_AT_REST` that is neither `os` nor `none` loads
-/// nothing, so a typo cannot quietly leave a file in the clear.
+/// nothing, so a typo cannot quietly leave a file in the clear. Off a test
+/// network a new wallet is minted only while the desktop app's channel is
+/// on ([`chia_wallet_switch::may_mint`]); an identity on disk still loads.
 #[cfg(feature = "chia-publish")]
 fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::WalletMeta)> {
     let net = chia_network::net();
@@ -5869,6 +5938,7 @@ fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::Wal
         net,
         &net.path(chia_wallet_switch::IDENTITY_FILE),
         &net.path(chia_wallet_switch::LEGACY_SEED_FILE),
+        chia_wallet_switch::may_mint(net.is_test(), shell_channel::started()),
     )?;
     let mut meta = wallet_meta_of(net, &id);
     lock_if_due(&mut meta, policy);
@@ -6049,8 +6119,12 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     Ok(())
 }
 
-/// 🏦 One words-route answer for a page `app_page` passed: the reveal of the
-/// loaded wallet's 24 words, or the player's "I saved them".
+/// 🏦 One words answer, for a page `app_page` passed (the HTTP route) or for
+/// the desktop app over its channel (shell_channel.rs): the reveal of the
+/// loaded wallet's 24 words, or the player's "I saved them". Both askers run
+/// this one body, so the reveal and the save (and the lock that follows a
+/// save) cannot drift apart; `asker` only decides NativeOnly and whose
+/// saved mark a reveal arms (chia_wallet_switch::Asker).
 ///
 /// Neither takes the turn lock once the wallet is loaded: the key never
 /// changes in a run after that, so a double tap or a KEEP IT ON beside it
@@ -6062,7 +6136,11 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
 /// `words_match`, `after_failed_mark`); this only does the reads and writes
 /// those decisions call for.
 #[cfg(feature = "chia-publish")]
-async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'static str, zeroize::Zeroizing<String>) {
+async fn words_answer(
+    hub: &SharedHub,
+    asker: chia_wallet_switch::Asker,
+    ask: chia_wallet_switch::WordsAsk,
+) -> (&'static str, zeroize::Zeroizing<String>) {
     use chia_wallet_switch::{saved_answer, FailedMark, WordsStep, BACKUP_MISMATCH, BACKUP_UNREADABLE};
     let plain = |(status, body): (&'static str, serde_json::Value)| (status, zeroize::Zeroizing::new(body.to_string()));
     let refuse = |status: &'static str, error: &str| plain((status, serde_json::json!({ "ok": false, "error": error })));
@@ -6073,7 +6151,12 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
     // Not loaded: a turn holding the lock may be loading it right now.
     let turning = loaded.is_none() && hub.wallet_turn.try_lock().is_err();
     let net = chia_network::net();
-    match chia_wallet_switch::words_step(ask, loaded, turning, net.is_test()) {
+    // Who asked, in the log (never the words).
+    let who = match asker {
+        chia_wallet_switch::Asker::Page { .. } => "the Bank",
+        chia_wallet_switch::Asker::Shell => "the desktop app",
+    };
+    match chia_wallet_switch::words_step(ask, loaded, turning, asker) {
         WordsStep::Refuse(why) => plain(why.answer()),
         WordsStep::SavedIdempotent => plain(saved_answer(&wallet_switch_view(hub).0, None)),
         WordsStep::ReadFile { wallet: key, fingerprint } => {
@@ -6084,17 +6167,17 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                 // The reader's refusals are fixed sentences that never quote
                 // the file; the page still gets only the fixed answer.
                 Ok(Err(e)) => {
-                    eprintln!("🏦 SSF wallet: the Bank asked for the 24 words, but they could not be read: {e:#}");
+                    eprintln!("🏦 SSF wallet: {who} asked for the 24 words, but they could not be read: {e:#}");
                     return refuse("500 Internal Server Error", BACKUP_UNREADABLE);
                 }
                 Err(e) => {
-                    eprintln!("🏦 SSF wallet: the Bank asked for the 24 words, but reading them stopped ({e})");
+                    eprintln!("🏦 SSF wallet: {who} asked for the 24 words, but reading them stopped ({e})");
                     return refuse("500 Internal Server Error", BACKUP_UNREADABLE);
                 }
             };
             if !chia_wallet_switch::words_match(rev.fingerprint, &rev.wallet, fingerprint, &key.public_key()) {
                 eprintln!(
-                    "🏦 SSF wallet: the Bank asked for the 24 words, but {} no longer makes the wallet in use (key fingerprint {} on disk, {} loaded); nothing is shown",
+                    "🏦 SSF wallet: {who} asked for the 24 words, but {} no longer makes the wallet in use (key fingerprint {} on disk, {} loaded); nothing is shown",
                     net.path(chia_wallet_switch::IDENTITY_FILE).display(),
                     rev.fingerprint,
                     fingerprint
@@ -6102,12 +6185,13 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                 return refuse("500 Internal Server Error", BACKUP_MISMATCH);
             }
             // Checked again after the read, under the meta's lock: an I SAVED
-            // that landed meanwhile (another tab's) wins.
-            let landed = chia_wallet_switch::reveal_lands(hub.wallet_meta.lock().unwrap().as_mut(), fingerprint);
+            // that landed meanwhile (another tab's, or the app's) wins. It
+            // arms this asker's saved mark only.
+            let landed = chia_wallet_switch::reveal_lands(hub.wallet_meta.lock().unwrap().as_mut(), fingerprint, asker);
             if let Err(why) = landed {
                 return plain(why.answer());
             }
-            println!("🏦 SSF wallet: the Bank showed the 24 words (key fingerprint {fingerprint})");
+            println!("🏦 SSF wallet: {who} showed the 24 words (key fingerprint {fingerprint})");
             ("200 OK", chia_wallet::reveal_body(&rev, &chia_wallet::receive_address(net, &key)))
         }
         WordsStep::WriteFlag { key: asked } => {
@@ -6117,9 +6201,14 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                         m.backed_up = true;
                     }
                 }
-                println!(
-                    "🏦 SSF wallet: the player marked the 24 words saved (key fingerprint {asked}); the Bank does not show them again"
-                );
+                match asker {
+                    chia_wallet_switch::Asker::Page { .. } => println!(
+                        "🏦 SSF wallet: the player marked the 24 words saved (key fingerprint {asked}); the Bank does not show them again"
+                    ),
+                    chia_wallet_switch::Asker::Shell => println!(
+                        "🏦 SSF wallet: the player marked the 24 words saved in the desktop app (key fingerprint {asked}); they are not shown again"
+                    ),
+                }
             };
             let flag = net.path(chia_wallet_switch::SAVED_FILE);
             let now = chia_resolve::unix_now();
@@ -6152,6 +6241,32 @@ async fn words_route(hub: &SharedHub, ask: chia_wallet_switch::WordsAsk) -> (&'s
                 }
             }
         }
+    }
+}
+
+/// 🖥️ One answer for the desktop app's channel (shell_channel.rs), on the
+/// channel's own thread: `hello` from the fingerprint's view of the wallet
+/// and the loaded key's address, `reveal` and `saved` from [`words_answer`]
+/// as [`chia_wallet_switch::Asker::Shell`], the HTTP route's own body. Only
+/// the body goes back (the HTTP status is the route's); a refusal is a fixed
+/// sentence. `rt` is the node's runtime, which runs the async body.
+fn shell_answer(hub: &SharedHub, rt: &tokio::runtime::Handle, op: shell_channel::Op) -> zeroize::Zeroizing<String> {
+    let ask = match op {
+        shell_channel::Op::Hello => {
+            let (view, address) = wallet_switch_view(hub);
+            return shell_channel::hello_body(chia_network::net(), &view, address.as_deref());
+        }
+        shell_channel::Op::Reveal => chia_wallet_switch::WordsAsk::Reveal,
+        shell_channel::Op::Saved(key) => chia_wallet_switch::WordsAsk::Saved(key),
+    };
+    #[cfg(feature = "chia-publish")]
+    {
+        rt.block_on(words_answer(hub, chia_wallet_switch::Asker::Shell, ask)).1
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    {
+        let _ = (rt, ask);
+        zeroize::Zeroizing::new(serde_json::json!({ "ok": false, "error": chia_wallet_switch::UNBUILT_WORDS }).to_string())
     }
 }
 
@@ -6384,11 +6499,14 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 let target = req.split_whitespace().nth(1).unwrap_or("");
                 let host_header = header_value(&req, "host");
                 let origin = origin_header.as_deref();
-                // ⛓️ Off a test network the page never shows the words: a
-                // 409 for every ask, before the page gate and before any file
-                // is read, whatever SSF_BANK_DEV_PAGES names.
+                // ⛓️ Off a test network the page never shows the words, and
+                // nor does it on any network while the desktop app's channel
+                // is on (the app shows them itself): a 409 for every ask,
+                // before the page gate and before any file is read, whatever
+                // SSF_BANK_DEV_PAGES names.
+                let page_allowed = chia_wallet_switch::page_allowed(chia_network::net().is_test(), shell_channel::started());
                 let gate = chia_wallet_switch::words_gate(
-                    chia_network::net().is_test(),
+                    page_allowed,
                     target,
                     origin,
                     host_header.as_deref(),
@@ -6411,7 +6529,7 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     let bad_ask = || serde_json::json!({ "ok": false, "error": chia_wallet_switch::BACKUP_BAD_ASK }).to_string();
                     #[cfg(feature = "chia-publish")]
                     let (status, body) = match chia_wallet_switch::words_asked(target) {
-                        Some(ask) => words_route(&hub_clone, ask).await,
+                        Some(ask) => words_answer(&hub_clone, chia_wallet_switch::Asker::Page { allowed: page_allowed }, ask).await,
                         None => ("400 Bad Request", zeroize::Zeroizing::new(bad_ask())),
                     };
                     #[cfg(not(feature = "chia-publish"))]

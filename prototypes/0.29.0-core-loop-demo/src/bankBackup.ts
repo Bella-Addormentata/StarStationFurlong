@@ -23,12 +23,21 @@
 // Known and accepted for testnet (a native reveal in the desktop host is the
 // mainnet fix for both): any script in the game page can ask for the words
 // while they are not marked saved, and another OS account's page on this
-// computer reaches the same loopback node. So BACK UP is offered only on a
-// test network (`ChiaNetwork.test`), and on any other network the two
-// requests are refused here before anything is sent.
+// computer reaches the same loopback node. So the page's BACK UP is offered
+// only on a test network (`ChiaNetwork.test`), and on any other network the
+// two requests are refused here before anything is sent.
+//
+// 🖥️ The native BACK UP: when the node says the desktop app's channel is on
+// (`chia_wallet.backup` is `native`) and the page runs inside the app
+// (nativeShell.ts `hasNativeShell`), BACK UP is one button, OPEN BACKUP
+// WINDOW. The app shows the words in a window of its own; the page never
+// asks the node for them, never marks them saved, and never holds one. That
+// works on any network the page knows. On a network that is not a test one,
+// with no native BACK UP, the Bank says to back up from the desktop app.
 
 import { BANK_WALLET_BUTTON_ID } from './bankWallet';
 import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
+import type { NativeBackupAnswer } from './nativeShell';
 import type { LocalFingerprint } from './nodeFingerprint';
 
 /** Control ids: stable across renders, so focus survives a repaint. SHOW
@@ -39,6 +48,8 @@ export const BACKUP_COPY_ID = 'bank-backup-copy';
 export const BACKUP_SAVED_ID = 'bank-backup-saved';
 export const BACKUP_LATER_ID = 'bank-backup-later';
 export const BACKUP_GRID_ID = 'bank-backup-grid';
+/** 🖥️ OPEN BACKUP WINDOW, the native BACK UP's one control. */
+export const BACKUP_WINDOW_ID = 'bank-backup-window';
 
 export const WORD_COUNT = 24;
 export const REVEAL_TIMEOUT_MS = 15_000;
@@ -113,6 +124,17 @@ export interface BankBackupUi {
   error: string | null;
   /** When a control last changed what it does: the fresh-tap rule's clock. */
   changedAt: number;
+  /** 🖥️ OPEN BACKUP WINDOW is out: the desktop app's window is open, and a
+   *  second tap does nothing until it answers. Kept through every reset and
+   *  close, so one call is out at a time whatever the Bank does meanwhile. */
+  windowOpen: boolean;
+  /** 🖥️ What the last OPEN BACKUP WINDOW came back with, as a line; until
+   *  the next tap, the Bank opening again, the wallet going (another
+   *  address, not on, backed up, no node), or BACK UP no longer native. */
+  windowLine: string | null;
+  /** 🖥️ The address OPEN BACKUP WINDOW was tapped for: its line is shown
+   *  only while the Bank's wallet is still this one. */
+  windowFor: string | null;
 }
 
 export const BACKUP_IDLE: Readonly<BankBackupUi> = {
@@ -133,6 +155,9 @@ export const BACKUP_IDLE: Readonly<BankBackupUi> = {
   copiedAt: 0,
   error: null,
   changedAt: 0,
+  windowOpen: false,
+  windowLine: null,
+  windowFor: null,
 };
 
 /** Everything a closed panel forgets. */
@@ -151,15 +176,34 @@ const CLOSED = {
   error: null,
 } as const;
 
-/** The address BACK UP is for: an on wallet made from 24 words (an older
- *  node never says `mnemonic`) on a test network, with an address on that
- *  network. Null otherwise: on mainnet the desktop app shows the words
- *  itself, never this page. */
-function backupAddress(fp: LocalFingerprint | null | undefined): string | null {
+/** 🖥️ Which BACK UP the Bank offers. `native`: the node says the desktop
+ *  app's channel is on and the page runs in the app (`shell`, from
+ *  nativeShell.ts `hasNativeShell`), so the app's window shows the words.
+ *  `page`: this page's reveal, on a test network (a `backup` of `page`,
+ *  `none`, an unknown one or none at all, or `native` with no app to ask).
+ *  `desktop`: any other network, where this page shows no words and says to
+ *  back up from the desktop app. */
+export type BackupMode = 'native' | 'page' | 'desktop';
+
+export function backupMode(fp: LocalFingerprint | null | undefined, shell: boolean): BackupMode {
+  if (shell && fp?.chia_wallet?.backup === 'native') return 'native';
+  return fp?.chia_net?.test ? 'page' : 'desktop';
+}
+
+/** An on wallet made from 24 words (an older node never says `mnemonic`),
+ *  with an address on its network, which the page knows. */
+function walletAddress(fp: LocalFingerprint | null | undefined): string | null {
   const w = fp?.chia_wallet;
-  const net = fp?.chia_net;
-  if (!fp || !w || w.state !== 'on' || w.mnemonic !== true || !net?.test || !isAddressOn(net, fp.chia_address)) return null;
+  if (!fp || !w || w.state !== 'on' || w.mnemonic !== true || !isAddressOn(fp.chia_net, fp.chia_address)) return null;
   return fp.chia_address;
+}
+
+/** The address BACK UP is for: the wallet's ([`walletAddress`]) in the
+ *  native mode, on any network the page knows, or on a test network in the
+ *  page mode. Null otherwise: off a test network only the desktop app shows
+ *  the words, never this page. */
+function backupAddress(fp: LocalFingerprint | null | undefined, mode: BackupMode): string | null {
+  return mode === 'desktop' ? null : walletAddress(fp);
 }
 
 const backedUp = (fp: LocalFingerprint | null | undefined): boolean => fp?.chia_wallet?.backed_up === true;
@@ -169,6 +213,22 @@ const backedUp = (fp: LocalFingerprint | null | undefined): boolean => fp?.chia_
 export const BACKUP_NAG =
   "⚠ Your SSF wallet's 24 words are not backed up. Without them, this wallet and its coins stay on this computer only: no other Chia wallet can open it.";
 export const BACKUP_ELSEWHERE = 'Open the Star Station app on this computer to back up the 24 words.';
+/** 🖥️ Instead of BACK UP off a test network, with no native BACK UP. */
+export const BACKUP_DESKTOP = 'Back up from the Star Station desktop app on this computer.';
+/** 🖥️ The native BACK UP's one control. */
+export const BACKUP_WINDOW_LABEL = 'OPEN BACKUP WINDOW';
+/** 🖥️ What each answer of the desktop app's backup window says. */
+export const BACKUP_WINDOW_LINES: Readonly<Record<NativeBackupAnswer, string>> = Object.freeze({
+  saved: 'Saved: your node has your 24 words marked as written down.',
+  closed: 'The backup window closed before CONFIRM, so your 24 words are not marked saved yet.',
+  no_channel: 'The desktop app did not start this station node, so it cannot show the 24 words. Stop the other station node and restart Star Station.',
+  other_network: 'Your station node runs on another Chia network than this app, so the app does not show its 24 words.',
+  not_on: 'Your SSF wallet is not on, so there are no 24 words to show.',
+  turning: 'Your SSF wallet is still turning on. Try again in a moment.',
+  already_saved: 'Your 24 words are already marked saved, so they are not shown again.',
+  busy: 'The backup window is open, or just closed. Try again in a few seconds.',
+  unavailable: 'The desktop app could not open the backup window. Restart Star Station, or update it.',
+});
 export const BACKUP_DONE =
   'Your 24 words are backed up. The Bank does not show them again: keep the paper safe, it is the only copy away from this computer.';
 export const BACKUP_TITLE = 'BACK UP — YOUR 24 WORDS';
@@ -242,8 +302,14 @@ export interface BankBackupView {
   line: string | null;
   /** BACK UP is offered (the nag, on a page the node may show the words to). */
   open: boolean;
-  /** Instead of BACK UP on any other page. */
+  /** Instead of BACK UP on any other page, or off a test network with no
+   *  native BACK UP. */
   elsewhere: string | null;
+  /** 🖥️ OPEN BACKUP WINDOW, in place of BACK UP, in the native mode: `busy`
+   *  while the window is out. Never with the panel, a word or COPY. */
+  window: { label: string; busy: boolean } | null;
+  /** 🖥️ What the last OPEN BACKUP WINDOW came back with. */
+  windowLine: string | null;
   panel: BackupPanelView | null;
   copyNotice: string | null;
   error: string | null;
@@ -254,26 +320,56 @@ export interface BankBackupView {
 
 /** What RECEIVE shows about the 24 words, or null when there is nothing to
  *  back up (no node, an older node, a wallet that is not on, one not made
- *  from words, a network that is not a test one, or an address that did not
- *  read as one of its network's) and no clipboard notice still stands. */
-export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: BankBackupUi, page: BackupPage): BankBackupView | null {
-  const address = backupAddress(fp);
+ *  from words, or an address that did not read as one of its network's)
+ *  and no clipboard notice still stands. `shell`: the page runs inside the
+ *  desktop app ([`backupMode`]). */
+export function bankBackupView(
+  fp: LocalFingerprint | null | undefined,
+  ui: BankBackupUi,
+  page: BackupPage,
+  shell = false,
+): BankBackupView | null {
+  const mode = backupMode(fp, shell);
+  const address = backupAddress(fp, mode);
   // Outside the panel only what still matters there: a clipboard that may
   // hold the words, or that was emptied. That stays said with no wallet to
   // back up too (the node stopped or went away after a COPY).
   const outside = ui.copy === 'stuck' || ui.copy === 'wiped' ? COPY_NOTICE[ui.copy] : null;
+  const none = { window: null, windowLine: null } as const;
   if (!address) {
-    return outside ? { state: 'notice', line: null, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest: [] } : null;
+    // Off a test network with no native BACK UP: the nag, and where to back
+    // up instead; no control that asks anyone for the words.
+    const desk = mode === 'desktop' ? walletAddress(fp) : null;
+    if (desk) {
+      const atRest = atRestLines(fp);
+      if (backedUp(fp)) return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest, ...none };
+      return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_DESKTOP, panel: null, copyNotice: outside, error: null, atRest, ...none };
+    }
+    return outside ? { state: 'notice', line: null, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest: [], ...none } : null;
   }
   const atRest = atRestLines(fp);
   if (backedUp(fp) || ui.savedFor === address) {
-    return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest };
+    return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest, ...none };
+  }
+  if (mode === 'native') {
+    return {
+      state: 'nag',
+      line: BACKUP_NAG,
+      open: false,
+      elsewhere: null,
+      window: { label: BACKUP_WINDOW_LABEL, busy: ui.windowOpen },
+      windowLine: ui.windowLine,
+      panel: null,
+      copyNotice: outside,
+      error: null,
+      atRest,
+    };
   }
   if (page === 'elsewhere') {
-    return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_ELSEWHERE, panel: null, copyNotice: null, error: null, atRest };
+    return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_ELSEWHERE, panel: null, copyNotice: null, error: null, atRest, ...none };
   }
   if (!ui.open || ui.address !== address) {
-    return { state: 'nag', line: BACKUP_NAG, open: true, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest };
+    return { state: 'nag', line: BACKUP_NAG, open: true, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest, ...none };
   }
   const shown = ui.words !== null && ui.words.length === WORD_COUNT;
   const revealed = ui.key !== null;
@@ -282,6 +378,7 @@ export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: Bank
     line: null,
     open: false,
     elsewhere: null,
+    ...none,
     panel: {
       title: BACKUP_TITLE,
       warning: BACKUP_WARNING,
@@ -308,11 +405,19 @@ export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: Bank
   };
 }
 
-/** Whether TURN ON should open the panel: the wallet was not on, now is,
- *  is made from words that are not backed up, and this page may show them. */
-export function opensAfterTurnOn(before: LocalFingerprint | null | undefined, after: LocalFingerprint | null | undefined, page: BackupPage): boolean {
-  if (page === 'elsewhere' || before?.chia_wallet?.state === 'on') return false;
-  return backupAddress(after) !== null && !backedUp(after);
+/** Whether TURN ON should open BACK UP (the panel, or in the native mode
+ *  the desktop app's window): the wallet was not on, now is, is made from
+ *  words that are not backed up, and this page may show them, or the app's
+ *  window may, on any network the page knows. */
+export function opensAfterTurnOn(
+  before: LocalFingerprint | null | undefined,
+  after: LocalFingerprint | null | undefined,
+  page: BackupPage,
+  shell = false,
+): boolean {
+  const mode = backupMode(after, shell);
+  if ((mode !== 'native' && page === 'elsewhere') || before?.chia_wallet?.state === 'on') return false;
+  return backupAddress(after, mode) !== null && !backedUp(after);
 }
 
 // ── How the state moves ──────────────────────────────────────────────────────
@@ -325,20 +430,32 @@ export function opensAfterTurnOn(before: LocalFingerprint | null | undefined, af
  *  screen; hides them after WORDS_SHOWN_MS on either clock (`now`
  *  monotonic, `wall` the wall clock); closes the panel, forgetting the
  *  key too, when the wallet it was opened for is gone: another address, not
- *  on, not from words, backed up, or no node. A change in anything else the
- *  fingerprint carries changes nothing here. */
+ *  on, not from words, backed up, or no node, and when BACK UP turned native
+ *  (`shell`, [`backupMode`]). The native answer's line goes with the wallet
+ *  it was tapped for too, and when BACK UP stops being native. A change
+ *  in anything else the fingerprint carries changes nothing here. */
 export function reconcileBackupUi(
   ui: BankBackupUi,
   fp: LocalFingerprint | null | undefined,
   now: number,
   onScreen: boolean,
   wall: number = Date.now(),
+  shell = false,
 ): BankBackupUi {
   let u = ui;
-  const address = backupAddress(fp);
+  const mode = backupMode(fp, shell);
+  const address = backupAddress(fp, mode);
   const gone = !address || backedUp(fp) || (u.address !== null && u.address !== address);
-  if (gone && (u.open || u.words !== null || u.key !== null || u.revealing || u.armed || u.saving || u.address !== null || u.expired)) {
+  if ((gone || mode === 'native') && (u.open || u.words !== null || u.key !== null || u.revealing || u.armed || u.saving || u.address !== null || u.expired)) {
     u = { ...u, ...CLOSED, gen: u.gen + 1 };
+  }
+  // The answer's line is for the wallet it was tapped for, in the native
+  // mode only: another wallet, or the page's own BACK UP, never shows it.
+  // A window still out loses its wallet too (it stays out, so a tap still
+  // asks for no other), and its answer is then dropped when it lands
+  // ([`applyBackupWindow`]), even if the same wallet came back meanwhile.
+  if ((u.windowLine !== null || u.windowFor !== null) && (gone || mode !== 'native' || u.windowFor !== address)) {
+    u = { ...u, windowLine: null, windowFor: null };
   }
   // The page's own "saved" stands in only until the node says so, and only
   // for the wallet it was said for.
@@ -352,9 +469,11 @@ export function reconcileBackupUi(
   return u;
 }
 
-/** BACK UP, or TURN ON that made words: the panel opens masked. */
-export function openBackupPanel(ui: BankBackupUi, fp: LocalFingerprint | null | undefined, now: number): BankBackupUi {
-  const address = backupAddress(fp);
+/** BACK UP, or TURN ON that made words: the panel opens masked. Only in
+ *  the page mode: never in the native one (`shell`, [`backupMode`]). */
+export function openBackupPanel(ui: BankBackupUi, fp: LocalFingerprint | null | undefined, now: number, shell = false): BankBackupUi {
+  const mode = backupMode(fp, shell);
+  const address = mode === 'page' ? backupAddress(fp, mode) : null;
   if (!address || backedUp(fp)) return ui;
   return { ...ui, ...CLOSED, open: true, address, gen: ui.gen + 1, changedAt: now };
 }
@@ -365,10 +484,22 @@ export function closeBackupPanel(ui: BankBackupUi, now: number): BankBackupUi {
 }
 
 /** Opening the Bank starts from the nag. Only a clipboard that may still
- *  hold the words is remembered. */
+ *  hold the words is remembered, and OPEN BACKUP WINDOW's state: a window
+ *  still out (it is still open, so a tap must not ask for another), and the
+ *  answer's line with the wallet it was tapped for, so an answer that
+ *  landed while the Bank was closed is still there to read. A line for a
+ *  wallet that is gone is dropped by [`reconcileBackupUi`]. */
 export function resetBackupUi(ui: BankBackupUi): BankBackupUi {
   const keep = ui.copy === 'held' || ui.copy === 'stuck';
-  return { ...BACKUP_IDLE, gen: ui.gen + 1, copy: keep ? ui.copy : 'none', copiedAt: keep ? ui.copiedAt : 0 };
+  return {
+    ...BACKUP_IDLE,
+    gen: ui.gen + 1,
+    copy: keep ? ui.copy : 'none',
+    copiedAt: keep ? ui.copiedAt : 0,
+    windowOpen: ui.windowOpen,
+    windowLine: ui.windowLine,
+    windowFor: ui.windowFor,
+  };
 }
 
 /** HIDE: the grid masks again; I SAVED stays offered (the key is kept). A
@@ -441,10 +572,75 @@ export function wordsExpireIn(ui: BankBackupUi, now: number, wall: number = Date
   return Math.max(0, Math.min(ui.shownAt + WORDS_SHOWN_MS - now, ui.shownWall + WORDS_SHOWN_MS - wall));
 }
 
+// ── 🖥️ The desktop app's backup window ───────────────────────────────────────
+
+/** OPEN BACKUP WINDOW: out, only in the native mode, for a wallet whose
+ *  words are not marked saved, and not while one is out already (single
+ *  flight). Returns the state it was given when it does not go. */
+export function startBackupWindow(
+  ui: BankBackupUi,
+  fp: LocalFingerprint | null | undefined,
+  shell: boolean,
+  now: number,
+): BankBackupUi {
+  const address = backupMode(fp, shell) === 'native' ? backupAddress(fp, 'native') : null;
+  if (ui.windowOpen || address === null || backedUp(fp)) return ui;
+  return { ...ui, windowOpen: true, windowLine: null, windowFor: address, changedAt: now };
+}
+
+/** The app's answer: its fixed line, and OPEN BACKUP WINDOW is free again.
+ *  The control changed what it shows, so the fresh-tap clock restarts. */
+export function applyBackupWindow(ui: BankBackupUi, answer: NativeBackupAnswer, now: number): BankBackupUi {
+  if (!ui.windowOpen) return ui;
+  // The wallet it was tapped for went away while the window was out
+  // ([`reconcileBackupUi`]): the answer is not this session's to show.
+  if (ui.windowFor === null) return { ...ui, windowOpen: false, windowLine: null, changedAt: now };
+  const line = Object.prototype.hasOwnProperty.call(BACKUP_WINDOW_LINES, answer) ? BACKUP_WINDOW_LINES[answer] : BACKUP_WINDOW_LINES.unavailable;
+  return { ...ui, windowOpen: false, windowLine: line, changedAt: now };
+}
+
+/** What OPEN BACKUP WINDOW needs from its page. `open` is nativeShell.ts
+ *  `openBackup` (no argument, a fixed answer); `refresh` reads the node's
+ *  fingerprint again; `set` takes the next state and repaints. */
+export interface BackupWindowDeps {
+  get(): BankBackupUi;
+  set(next: BankBackupUi): void;
+  fingerprint(): LocalFingerprint | null | undefined;
+  shell: boolean;
+  open(): Promise<NativeBackupAnswer>;
+  refresh(): Promise<unknown>;
+  now(): number;
+}
+
+/** OPEN BACKUP WINDOW, start to end: the app's window opens, and once it
+ *  closes its answer becomes a line and the fingerprint is read again, once,
+ *  so the Bank shows what the node now holds (marked saved, or not). Null
+ *  when it did not go (one is out, or not the native mode). Never throws,
+ *  and never asks the node for the words or marks them saved itself. */
+export async function runBackupWindow(d: BackupWindowDeps): Promise<NativeBackupAnswer | null> {
+  const before = d.get();
+  const started = startBackupWindow(before, d.fingerprint(), d.shell, d.now());
+  if (started === before) return null;
+  d.set(started);
+  let answer: NativeBackupAnswer;
+  try {
+    answer = await d.open();
+  } catch {
+    answer = 'unavailable';
+  }
+  d.set(applyBackupWindow(d.get(), answer, d.now()));
+  try {
+    await d.refresh();
+  } catch {
+    // The next fingerprint round reads it.
+  }
+  return answer;
+}
+
 // ── Taps and keys ────────────────────────────────────────────────────────────
 
-/** The fresh-tap rule for SHOW, ⚠ CONFIRM and the wallet switch's CONFIRM,
- *  TURN OFF and KEEP IT ON: not the second click of a double-click
+/** The fresh-tap rule for SHOW, ⚠ CONFIRM, OPEN BACKUP WINDOW and the
+ *  wallet switch's CONFIRM, TURN OFF and KEEP IT ON: not the second click of a double-click
  *  (`detail > 1`; a keyboard click has 0), and not within BANK_SETTLE_MS of
  *  the control changing what it does. */
 export function freshTap(detail: number, now: number, changedAt: number): boolean {
@@ -453,7 +649,7 @@ export function freshTap(detail: number, now: number, changedAt: number): boolea
 
 /** The controls a held Enter or Space must not repeat on: each keydown
  *  repeat would activate the button again. */
-export const HELD_KEY_IDS: ReadonlySet<string> = new Set([BANK_WALLET_BUTTON_ID, BACKUP_SHOW_ID, BACKUP_SAVED_ID]);
+export const HELD_KEY_IDS: ReadonlySet<string> = new Set([BANK_WALLET_BUTTON_ID, BACKUP_SHOW_ID, BACKUP_SAVED_ID, BACKUP_WINDOW_ID]);
 
 export function heldKeyRepeat(e: { repeat: boolean; key: string }, targetId: string | null | undefined): boolean {
   return e.repeat && (e.key === 'Enter' || e.key === ' ') && HELD_KEY_IDS.has(targetId ?? '');

@@ -231,15 +231,26 @@ impl fmt::Debug for Revealed {
 /// A file that is there and cannot be read is reported and never minted
 /// over; see [`read_identity`]'s refusals. The file must be `net`'s; on a
 /// network that is not a test network, `legacy` is never looked at.
-pub fn load_or_mint_wallet(net: ChiaNet, identity: &Path, legacy: &Path) -> Result<WalletIdentity> {
-    load_or_mint_wallet_with(net, identity, legacy, chia_at_rest::os_store())
+///
+/// With no identity on disk, a mint happens only when `may_mint`
+/// (chia_wallet_switch::may_mint: a test network, or the desktop app's
+/// channel on); otherwise the load refuses with [`MINT_NEEDS_APP`] and
+/// writes no file. An identity on disk loads either way.
+pub fn load_or_mint_wallet(net: ChiaNet, identity: &Path, legacy: &Path, may_mint: bool) -> Result<WalletIdentity> {
+    load_or_mint_wallet_with(net, identity, legacy, may_mint, chia_at_rest::os_store())
 }
+
+/// Why a load made no wallet where it may not mint one (Chia mainnet with
+/// no desktop app channel): no mainnet wallet should exist whose words
+/// nothing can show.
+pub const MINT_NEEDS_APP: &str = "On Chia mainnet a new SSF wallet is made only in the desktop app, which can show its 24 words.";
 
 /// [`load_or_mint_wallet`] with the store a locked file is opened by.
 pub(crate) fn load_or_mint_wallet_with(
     net: ChiaNet,
     identity: &Path,
     legacy: &Path,
+    may_mint: bool,
     store: Option<&dyn SecretStore>,
 ) -> Result<WalletIdentity> {
     // Raw seeds were only ever testnet11's.
@@ -265,6 +276,9 @@ pub(crate) fn load_or_mint_wallet_with(
         // cloud folder, a FAT stick) with the modes it picked up there.
         restrict_permissions(identity);
         (opened, false)
+    } else if !may_mint {
+        // Before anything is written: no identity, no temporary file.
+        return Err(anyhow!(MINT_NEEDS_APP));
     } else {
         mint_identity(net, identity, store)?
     };
@@ -1589,7 +1603,7 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, 3552866753)).unwrap();
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(!id.minted && id.retired.is_none());
         assert_eq!(id.fingerprint, 3552866753);
         assert_eq!(puzzle_hash_hex(&id.wallet), "17b698572086e2db991e247b52fb695f5867997930f3648f569c5affae49d556");
@@ -1602,7 +1616,7 @@ mod tests {
         assert_eq!(rev.wallet, id.wallet.public_key());
 
         std::fs::write(&identity, envelope(&"00".repeat(32), 1532878573)).unwrap();
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert_eq!(id.fingerprint, 1532878573);
         assert_eq!(receive_address(T11, &id.wallet), "txch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ys36pefh");
         assert_ne!(receive_address(T11, &id.wallet), receive_address(T11, &SecretKey::from_seed(&[0u8; 32])));
@@ -1615,9 +1629,9 @@ mod tests {
         let dir = fresh_dir("persist");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let first = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let first = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(first.minted && first.retired.is_none());
-        let again = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let again = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(!again.minted);
         assert_eq!(first.wallet.public_key(), again.wallet.public_key());
         assert_eq!(first.fingerprint, again.fingerprint);
@@ -1660,7 +1674,7 @@ mod tests {
                 let (identity, legacy, start) = (identity.clone(), legacy.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+                    let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
                     (id.wallet.public_key(), id.minted)
                 })
             })
@@ -1668,7 +1682,7 @@ mod tests {
             .into_iter()
             .map(|t| t.join().unwrap())
             .collect();
-        let on_disk = load_or_mint_wallet(T11, &identity, &legacy).unwrap().wallet.public_key();
+        let on_disk = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap().wallet.public_key();
         assert!(keys.iter().all(|(k, _)| *k == on_disk), "every minter holds the identity that stayed");
         assert_eq!(keys.iter().filter(|(_, minted)| *minted).count(), 1, "one minter installed it");
         assert_eq!(names(&dir), vec!["chia_identity.json"], "no temporary file left behind");
@@ -1691,7 +1705,7 @@ mod tests {
                 let (identity, legacy, start) = (identity.clone(), legacy.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    load_or_mint_wallet(T11, &identity, &legacy).unwrap().wallet.public_key()
+                    load_or_mint_wallet(T11, &identity, &legacy, true).unwrap().wallet.public_key()
                 })
             })
             .collect::<Vec<_>>()
@@ -1743,7 +1757,7 @@ mod tests {
             let identity = dir.join("chia_identity.json");
             let legacy = dir.join("chia_identity.seed");
             std::fs::write(&identity, text).unwrap();
-            let err = format!("{:#}", load_or_mint_wallet(T11, &identity, &legacy).unwrap_err());
+            let err = format!("{:#}", load_or_mint_wallet(T11, &identity, &legacy, true).unwrap_err());
             assert!(err.contains(says), "{why}: {err}");
             assert_eq!(std::fs::read_to_string(&identity).unwrap(), *text, "{why}: the file is left for recovery");
             assert_eq!(names(&dir), vec!["chia_identity.json"], "{why}: nothing minted beside it");
@@ -1774,7 +1788,7 @@ mod tests {
             let dir = fresh_dir("echo");
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, text).unwrap();
-            let e = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed")).unwrap_err();
+            let e = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed"), true).unwrap_err();
             // The path is the test's own (on Windows it can hold an 8.3 name
             // such as RUNNER~1): only what the file held must stay out.
             let path = identity.display().to_string();
@@ -1801,7 +1815,7 @@ mod tests {
         let raw = [9u8; 32];
         std::fs::write(&legacy, raw).unwrap();
         let old_key = SecretKey::from_seed(&raw);
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(id.minted);
         let retired = id.retired.clone().expect("the legacy seed is retired");
         assert!(!legacy.exists(), "the legacy name is gone");
@@ -1821,7 +1835,7 @@ mod tests {
             keys_from_entropy(&raw).wallet.public_key(),
             "fresh entropy, not the raw seed read as entropy"
         );
-        let again = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let again = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(!again.minted && again.retired.is_none(), "a second load retires nothing");
         assert_eq!(again.wallet.public_key(), id.wallet.public_key());
         assert_eq!(names(&dir), vec!["chia_identity.json".to_string(), archive_name]);
@@ -1836,9 +1850,9 @@ mod tests {
         let dir = fresh_dir("crash");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let first = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let first = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         std::fs::write(&legacy, [3u8; 32]).unwrap();
-        let next = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let next = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(!next.minted);
         assert_eq!(next.wallet.public_key(), first.wallet.public_key(), "the identity stays the wallet");
         assert!(next.retired.is_some() && !legacy.exists());
@@ -1851,7 +1865,7 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&legacy, [7u8; 5]).unwrap();
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         let retired = id.retired.expect("archived whatever its length");
         assert_eq!(retired.old_address, None, "nothing is derived from a file that is not a seed");
         assert_eq!(retired.old_beacon, None);
@@ -1931,7 +1945,7 @@ mod tests {
         let not_ours = format!(".chia_wallet.json.{other}-0.tmp");
         std::fs::write(dir.join(&not_ours), b"{}").unwrap();
         std::fs::File::options().write(true).open(dir.join(&not_ours)).unwrap().set_modified(two_minutes_ago).unwrap();
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert!(id.minted);
         let mut expect = vec![in_flight, theirs_in_flight, not_ours, "chia_identity.json".to_string()];
         expect.sort();
@@ -1985,11 +1999,11 @@ mod tests {
         let dir = fresh_dir("modes");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let minted = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let minted = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&identity), 0o600, "minted owner-only");
         std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let loaded = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let loaded = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         assert_eq!(loaded.fingerprint, minted.fingerprint);
         assert_eq!(mode(&identity), 0o600, "owner-only again after the load");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2001,7 +2015,7 @@ mod tests {
     fn reveal_reads_back_the_words_of_the_loaded_key() {
         let dir = fresh_dir("reveal");
         let identity = dir.join("chia_identity.json");
-        let id = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed")).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed"), true).unwrap();
         let rev = reveal_words(T11, &identity).unwrap();
         let words: Vec<&str> = rev.words().collect();
         assert_eq!(words.len(), 24);
@@ -2042,7 +2056,7 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, 3552866753)).unwrap();
         std::fs::write(&legacy, [6u8; 32]).unwrap();
-        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy, true).unwrap();
         let rev = reveal_words(T11, &identity).unwrap();
         let keys = keys_from_entropy(&entropy_of(HAMSTER_HEX));
         let secret_hex = hex::encode(id.wallet.to_bytes());
@@ -2108,7 +2122,7 @@ mod tests {
         let store = FakeStore::new();
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        let before = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let before = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!(before.at_rest, AtRest::None);
 
         let clear = std::fs::read(&identity).unwrap();
@@ -2124,7 +2138,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode(&identity), 0o600);
 
-        let after = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let after = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert!(!after.minted);
         assert_eq!(after.at_rest, AtRest::Dpapi);
         assert_eq!((after.fingerprint, after.wallet.public_key()), (before.fingerprint, before.wallet.public_key()));
@@ -2171,7 +2185,7 @@ mod tests {
             let dir = fresh_dir("locked-refuse");
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, &text).unwrap();
-            let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), store).unwrap_err());
+            let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, store).unwrap_err());
             assert!(err.contains(says), "{why}: {err}");
             if says != "refusing to overwrite" && says != "update Star Station" && says != "start the node again" {
                 assert!(err.contains("keep this file") && err.contains("move it aside"), "{why}: {err}");
@@ -2278,7 +2292,7 @@ mod tests {
             assert_eq!(left.len(), usize::from(expect_left), "{at:?}: {left:?}");
             assert!(left.iter().all(|n| !n.ends_with(".probe")), "{at:?}: no probe is left");
 
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
             assert!(!id.minted, "{at:?}");
             assert_eq!(id.fingerprint, fp, "{at:?}");
             assert_eq!(id.at_rest, if at == Step::Renamed { AtRest::Dpapi } else { AtRest::None }, "{at:?}");
@@ -2288,7 +2302,7 @@ mod tests {
             for n in &left {
                 std::fs::File::options().write(true).open(dir.join(n)).unwrap().set_modified(two_minutes_ago).unwrap();
             }
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
             assert_eq!((id.fingerprint, id.minted), (fp, false), "{at:?}");
             assert!(names(&dir).iter().all(|n| !n.contains(".rewrap-")), "{at:?}: the old leftover is removed");
 
@@ -2296,7 +2310,7 @@ mod tests {
                 matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { .. } | Wrapped::Already(AtRest::Dpapi)),
                 "{at:?}"
             );
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
             assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{at:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2316,7 +2330,7 @@ mod tests {
         let stop = |step: Step| step == Step::Rechecked;
         assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
         std::fs::remove_file(&identity).unwrap();
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -2324,13 +2338,13 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let junk = dir.join(".chia_identity.json.rewrap-1-0");
         std::fs::write(&junk, b"{\"v\":1").unwrap();
-        let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
         assert!(id.minted, "nothing that opens: a new wallet");
         assert!(junk.exists(), "a leftover that does not open is left as it is");
         // Once a minute old, beside an identity that opens, the torn
         // leftover is removed.
         age_two_minutes(&junk);
-        let again = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
+        let again = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
         assert_eq!((again.fingerprint, again.minted), (id.fingerprint, false));
         assert!(!junk.exists(), "the torn leftover is gone");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2396,7 +2410,7 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         let me = std::process::id();
         let other = if me == 1 { 2 } else { me - 1 };
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert!(id.minted);
         let fp = id.fingerprint;
         let clear = std::fs::read(&identity).unwrap();
@@ -2420,7 +2434,7 @@ mod tests {
         ];
         expect.sort();
         assert_eq!(names(&dir), expect);
-        let after = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let after = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((after.fingerprint, after.minted, after.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2434,7 +2448,7 @@ mod tests {
         let dir = fresh_dir("wrap-mint-tmp-stop");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         let fp = id.fingerprint;
         let clear = std::fs::read(&identity).unwrap();
         let tmp = dir.join(format!(".chia_identity.json.{}-0.tmp", std::process::id()));
@@ -2448,7 +2462,7 @@ mod tests {
         assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &at_rechecked), Wrapped::Skipped(_)));
         assert!(!tmp.exists(), "removed once the file is rechecked");
         assert_eq!(std::fs::read(&identity).unwrap(), clear, "the identity still holds the same clear bytes");
-        let again = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let again = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((again.fingerprint, again.minted, again.at_rest), (fp, false, AtRest::None));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2486,7 +2500,7 @@ mod tests {
                 if aged {
                     age_two_minutes(&leftover);
                 }
-                let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &legacy, store).unwrap_err());
+                let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &legacy, true, store).unwrap_err());
                 assert!(err.contains("missing") && err.contains(&left[0]), "{why}: {err}");
                 assert!(!err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
                 assert!(err.split(|c: char| !c.is_ascii_alphabetic()).all(|t| !words.contains(&t)), "{why}: {err}");
@@ -2494,7 +2508,7 @@ mod tests {
                 assert!(leftover.exists(), "{why}: the locked copy is kept");
             }
 
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&good)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&good)).unwrap();
             assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{why}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2519,11 +2533,11 @@ mod tests {
         let leftover = dir.join(&left[0]);
         age_two_minutes(&leftover);
         std::fs::write(&identity, b"{\"v\":1").unwrap();
-        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).is_err());
+        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).is_err());
         assert!(leftover.exists(), "the locked copy is kept beside a damaged identity");
         // The operator moves the damaged file aside, as the refusal says.
         std::fs::remove_file(&identity).unwrap();
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -2540,7 +2554,7 @@ mod tests {
         age_two_minutes(&leftover);
         let busy = FakeStore::new();
         *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
-        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, Some(&busy)).is_err());
+        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&busy)).is_err());
         assert!(leftover.exists(), "the locked copy is kept while the identity does not open");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2566,7 +2580,7 @@ mod tests {
         std::fs::write(&ours, encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).as_bytes()).unwrap();
         age_two_minutes(&theirs);
         age_two_minutes(&ours);
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted), (fp, false));
         assert!(theirs.exists(), "another wallet's locked copy is kept");
         assert!(!ours.exists(), "the same wallet's old copy is removed");
@@ -2641,7 +2655,7 @@ mod tests {
                         )
                     );
                     assert!(!e.contains(&HAMSTER_HEX[..16]) && !e.contains("testnet10") && !e.contains("Mainnet"), "never the file: {e}");
-                    assert!(load_or_mint_wallet(net, &identity, &dir.join("chia_identity.seed")).is_err(), "never minted over");
+                    assert!(load_or_mint_wallet(net, &identity, &dir.join("chia_identity.seed"), true).is_err(), "never minted over");
                     assert_eq!(std::fs::read_to_string(&identity).unwrap(), bytes, "left as it is");
                 }
             }
@@ -2669,7 +2683,7 @@ mod tests {
 
         let t11 = dir.join("t11");
         std::fs::create_dir_all(&t11).unwrap();
-        let id = load_or_mint_wallet(ChiaNet::Testnet11, &t11.join("chia_identity.json"), &t11.join("chia_identity.seed")).unwrap();
+        let id = load_or_mint_wallet(ChiaNet::Testnet11, &t11.join("chia_identity.json"), &t11.join("chia_identity.seed"), true).unwrap();
         assert!(id.minted);
         let text = std::fs::read_to_string(t11.join("chia_identity.json")).unwrap();
         assert!(text.starts_with(r#"{"v":1,"kind":"bip39-english","protect":"none","entropy":""#) && !text.contains("net"), "{}", text.len());
@@ -2679,17 +2693,59 @@ mod tests {
         let legacy = main.join("chia_identity.seed");
         std::fs::write(&legacy, [9u8; 32]).unwrap();
         let identity = main.join("chia_identity.json");
-        let id = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy, true).unwrap();
         assert!(id.minted && id.retired.is_none(), "a mainnet load never retires a raw seed");
         assert_eq!(std::fs::read(&legacy).unwrap(), [9u8; 32], "and leaves it as it is");
         let text = std::fs::read_to_string(&identity).unwrap();
         assert!(text.starts_with(r#"{"v":1,"kind":"bip39-english","net":"mainnet","protect":"none","entropy":""#), "{}", text.len());
-        let again = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy).unwrap();
+        let again = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy, true).unwrap();
         assert!(!again.minted);
         assert_eq!(again.wallet.public_key(), id.wallet.public_key());
-        assert!(load_or_mint_wallet(ChiaNet::Testnet11, &identity, &legacy).is_err(), "a mainnet wallet never opens on testnet11");
+        assert!(load_or_mint_wallet(ChiaNet::Testnet11, &identity, &legacy, true).is_err(), "a mainnet wallet never opens on testnet11");
         assert!(reveal_words(ChiaNet::Testnet11, &identity).is_err());
         assert_eq!(reveal_words(ChiaNet::Mainnet, &identity).unwrap().fingerprint, id.fingerprint);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🖥️ A mainnet node the desktop app did not start never mints: with no
+    /// identity on disk the load refuses, in one fixed sentence, and leaves
+    /// the folder as it was; an identity already there still loads. The rule
+    /// main.rs passes in is chia_wallet_switch::may_mint.
+    #[test]
+    fn a_load_that_may_not_mint_refuses_and_writes_nothing_but_still_loads_a_wallet_on_disk() {
+        let dir = fresh_dir("may-mint");
+        let main = dir.join("chia-mainnet");
+        std::fs::create_dir_all(&main).unwrap();
+        let identity = main.join("chia_identity.json");
+        let legacy = main.join("chia_identity.seed");
+        let may = crate::chia_wallet_switch::may_mint(ChiaNet::Mainnet.is_test(), false);
+        assert!(!may, "mainnet, no channel");
+        let err = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy, may).unwrap_err();
+        assert_eq!(format!("{err:#}"), "On Chia mainnet a new SSF wallet is made only in the desktop app, which can show its 24 words.");
+        assert_eq!(format!("{err:#}"), MINT_NEEDS_APP);
+        assert!(names(&main).is_empty(), "no file written: {:?}", names(&main));
+        assert!(load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, false, None).is_err());
+        assert!(names(&main).is_empty());
+
+        // An identity on disk (the fixed test vector's) still loads, with
+        // nothing minted and the file left byte for byte.
+        let entropy = entropy_of(HAMSTER_HEX);
+        let fp = keys_from_entropy(&entropy).fingerprint;
+        let bytes = encode_identity(ChiaNet::Mainnet, Body::Clear(&entropy), fp, 1730000000, 0);
+        std::fs::write(&identity, bytes.as_bytes()).unwrap();
+        let id = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy, may).unwrap();
+        assert!(!id.minted);
+        assert_eq!(id.fingerprint, fp);
+        assert_eq!(std::fs::read_to_string(&identity).unwrap(), bytes.as_str());
+        assert_eq!(names(&main), ["chia_identity.json"]);
+
+        // With the channel on, a mainnet load may mint, as a testnet one may.
+        assert!(crate::chia_wallet_switch::may_mint(ChiaNet::Mainnet.is_test(), true));
+        assert!(crate::chia_wallet_switch::may_mint(ChiaNet::Testnet11.is_test(), false));
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let id = load_or_mint_wallet(ChiaNet::Mainnet, &fresh.join("chia_identity.json"), &fresh.join("chia_identity.seed"), true).unwrap();
+        assert!(id.minted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2712,9 +2768,9 @@ mod tests {
         let text = std::fs::read_to_string(&identity).unwrap();
         assert!(text.contains(r#""net":"mainnet","protect":"dpapi""#), "{}", text.len());
         assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "net", "protect", "v", "wrapped_at"]);
-        let id = load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, true, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.at_rest), (fp, AtRest::Dpapi));
-        assert!(load_or_mint_wallet_with(ChiaNet::Testnet11, &identity, &legacy, Some(&store)).is_err());
+        assert!(load_or_mint_wallet_with(ChiaNet::Testnet11, &identity, &legacy, true, Some(&store)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

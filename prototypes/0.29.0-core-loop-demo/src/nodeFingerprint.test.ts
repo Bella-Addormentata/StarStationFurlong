@@ -94,6 +94,26 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ state: 'on', rewrapped: 'yes' })).toBeUndefined();
   });
 
+  it('keeps who can show the 24 words only as one of the three words, and drops anything else, never the switch (🖥️ backup)', () => {
+    const fp = (chia_wallet: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_wallet })?.chia_wallet;
+    for (const backup of ['native', 'page', 'none'] as const) {
+      expect(fp({ state: 'on', mnemonic: true, backup })).toEqual({ state: 'on', mnemonic: true, backup });
+      expect(parseChiaWallet({ state: 'ready', backup })).toEqual({ state: 'ready', backup });
+      // It rides in every state, gated too.
+      expect(fp({ state: 'gated', backup })).toEqual({ state: 'gated', backup });
+    }
+    // An older node sends none: the switch reads exactly as before the field.
+    expect(fp({ state: 'on', mnemonic: true })).toEqual({ state: 'on', mnemonic: true });
+    expect('backup' in (fp({ state: 'on', mnemonic: true }) ?? {})).toBe(false);
+    // Anything else is dropped as if absent: another word, another case, a
+    // padded word, or not a string. The switch stays.
+    for (const junk of ['NATIVE', 'Native', ' native', 'shell', 'app', '', 'native,page', 1, 0, true, false, null, ['native'], { kind: 'native' }]) {
+      const w = fp({ state: 'on', mnemonic: true, backup: junk });
+      expect(w).toEqual({ state: 'on', mnemonic: true });
+      expect(parseChiaWallet({ state: 'ready', backup: junk })).toEqual({ state: 'ready' });
+    }
+  });
+
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
     const listed = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_presence: listed })?.chia_presence).toEqual(listed);

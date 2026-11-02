@@ -28,6 +28,12 @@
 //! exact origin the operator lists in `SSF_BANK_DEV_PAGES` ([`dev_pages`]).
 //! Once saved, the page never shows them again.
 //!
+//! 🖥️ The desktop app can ask too, over the spawned node's own stdin and
+//! stdout (shell_channel.rs), with the same rules ([`Asker::Shell`]). While
+//! its channel is on, the page reveal and the page's saved mark are refused
+//! on every network ([`page_allowed`]), and a reveal arms only the saved mark
+//! of whoever asked for it.
+//!
 //! 🔒 Once saved, the node also locks the identity file with this computer's
 //! store where it has one (chia_at_rest.rs: Windows DPAPI), and the
 //! fingerprint says how the file keeps its key ([`AtRest`]).
@@ -36,7 +42,9 @@
 //! network where the SSF wallet is not allowed yet (mainnet), the wallet is
 //! `gated`: it never starts, no turn is taken, and the Bank says why. The
 //! page reveal of the 24 words is refused there for good ([`WordsRefusal::NativeOnly`]),
-//! before anything is read, whatever `SSF_BANK_DEV_PAGES` names.
+//! before anything is read, whatever `SSF_BANK_DEV_PAGES` names. A new
+//! wallet is made there only while the desktop app's channel is on
+//! ([`may_mint`]), so no wallet exists whose words nothing can show.
 //!
 //! Everything a decision rests on is a pure function here, so the startup
 //! block, the loopback route and the fingerprint agree and are tested without
@@ -315,6 +323,36 @@ pub struct WalletSwitch {
     /// Why the last turn failed, in the node's words (Ready or On only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Who can show the 24 words of this node's wallet ([`backup_of`]): a
+    /// hint for the page, never a secret. An older node never sends it.
+    #[serde(default)]
+    pub backup: Backup,
+}
+
+/// 🖥️ Who shows the 24 words, as the fingerprint says it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Backup {
+    /// The desktop app, over its channel: the page reveal is refused.
+    Native,
+    /// The page (the desktop app's own, or a named dev page), on a test
+    /// network with no channel.
+    Page,
+    /// Neither: a network that is not a test network, with no channel.
+    #[default]
+    None,
+}
+
+/// The fingerprint's [`Backup`]: `native` while the desktop app's channel is
+/// on, `page` on a test network without it, `none` otherwise.
+pub fn backup_of(test_net: bool, channel: bool) -> Backup {
+    if channel {
+        Backup::Native
+    } else if test_net {
+        Backup::Page
+    } else {
+        Backup::None
+    }
 }
 
 /// The node's memory of the switch between turns: whether the file says on,
@@ -349,8 +387,9 @@ pub struct KeyFacts {
 }
 
 /// The fingerprint's view, from the facts the node holds. `gate` reads as
-/// Gated, with no flags, ahead of everything but the build.
-pub fn view(built: bool, gate: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts) -> WalletSwitch {
+/// Gated, with no flags, ahead of everything but the build. `backup` rides
+/// in every state ([`backup_of`]).
+pub fn view(built: bool, gate: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts, backup: Backup) -> WalletSwitch {
     let state = if !built {
         WalletState::Unbuilt
     } else if gate {
@@ -378,6 +417,7 @@ pub fn view(built: bool, gate: bool, env: EnvSwitch, loaded: bool, memo: &Switch
         at_rest_next: (on && facts.mnemonic && facts.at_rest == AtRest::None).then_some(facts.at_rest_next).flatten(),
         rewrapped: on && facts.mnemonic && facts.rewrapped,
         error: matches!(state, WalletState::Ready | WalletState::On).then(|| memo.error.clone()).flatten(),
+        backup,
     }
 }
 
@@ -497,7 +537,9 @@ pub fn dev_pages() -> &'static [String] {
 /// Known gaps, accepted for testnet and closed by a native reveal in the
 /// desktop host before mainnet: another OS account on this computer shares
 /// loopback and can send these headers, and a script in the game page itself
-/// passes this check.
+/// passes this check. While the desktop app's channel is on, the words route
+/// refuses every page ask before this check ([`words_gate`]), so neither
+/// gap reaches the words then. The channel never runs this check.
 pub fn app_page(origin: Option<&str>, host: Option<&str>, port: u16, dev_pages: &[String]) -> bool {
     if !local_page(origin, host, port) {
         return false;
@@ -551,7 +593,8 @@ pub const BACKUP_NOT_SHOWN: &str = "tap SHOW first: your node has not shown thes
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub const BACKUP_UNREADABLE: &str =
     "your node could not read its 24 words from chia_identity.json, so nothing is shown; the node's log says why";
-/// Any words ask on a network that is not a test network.
+/// Any page's words ask on a network that is not a test network, or on any
+/// network while the desktop app's channel is on.
 pub const BACKUP_NATIVE_ONLY: &str = "On this network the desktop app will show the 24 words itself. This page cannot.";
 pub const BACKUP_BAD_ASK: &str = "ask /api/chia/words or /api/chia/words/saved?key=<fingerprint>";
 
@@ -591,17 +634,61 @@ pub fn remember_saved(path: &Path, key: u32, now: u64) -> std::io::Result<()> {
 /// 🏦 What the hub keeps beside the loaded wallet key for the Bank (never
 /// the words or the entropy): the fingerprint of its words, whether the
 /// player marked them saved, whether this run's load retired a raw seed,
-/// whether the Bank showed the words since the node started, how the file
-/// keeps its key, and whether this run locked it.
+/// whether the page and the desktop app each showed the words since the
+/// node started, how the file keeps its key, and whether this run locked it.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletMeta {
     pub fingerprint: u32,
     pub backed_up: bool,
     pub reminted: bool,
-    pub revealed: bool,
+    /// The page showed the words this run: the page's I SAVED may follow.
+    pub revealed_page: bool,
+    /// The desktop app showed them over its channel: its saved mark may
+    /// follow. Never armed by a page reveal, and never arms one.
+    pub revealed_shell: bool,
     pub at_rest: AtRest,
     pub rewrapped: bool,
+}
+
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+impl WalletMeta {
+    /// Whether `asker` itself showed the words this run.
+    pub fn revealed_to(&self, asker: Asker) -> bool {
+        match asker {
+            Asker::Page { .. } => self.revealed_page,
+            Asker::Shell => self.revealed_shell,
+        }
+    }
+}
+
+/// 🖥️ Who asks for the words: a page over the HTTP route, or the desktop
+/// app over its channel (shell_channel.rs).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asker {
+    /// A page; `allowed` is [`page_allowed`]: false refuses every ask with
+    /// [`WordsRefusal::NativeOnly`], first.
+    Page { allowed: bool },
+    /// The desktop app, over the pipes it spawned the node with. Never
+    /// NativeOnly; every other rule is the page's.
+    Shell,
+}
+
+/// Whether a page may ask for the words at all: only on a test network,
+/// and only while the desktop app's channel is off (then only the app
+/// shows them, on every network).
+pub fn page_allowed(test_net: bool, channel: bool) -> bool {
+    test_net && !channel
+}
+
+/// Whether a load may mint a new wallet when none is on disk: on a test
+/// network, or while the desktop app's channel is on (the app can then show
+/// its words). A mainnet node the app did not start loads an identity that
+/// exists and never makes one.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn may_mint(test_net: bool, channel: bool) -> bool {
+    test_net || channel
 }
 
 /// 🏦 Where one words ask goes, decided against the loaded wallet: an answer
@@ -629,9 +716,11 @@ pub enum WordsStep<K> {
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WordsRefusal {
-    /// The network is not a test network: only the desktop app may ever
-    /// show the words there, never a page. Checked first, before any file is
-    /// read, and `SSF_BANK_DEV_PAGES` does not lift it.
+    /// A page ask that is not allowed ([`page_allowed`]): the network is not
+    /// a test network, or the desktop app's channel is on, so only the app
+    /// shows the words, never a page. Checked first, before any file is
+    /// read, and `SSF_BANK_DEV_PAGES` does not lift it. Never for
+    /// [`Asker::Shell`].
     NativeOnly,
     /// No wallet, and a turn holds the lock (it may be loading one).
     Turning,
@@ -661,18 +750,20 @@ impl WordsRefusal {
     }
 }
 
-/// 🏦 Where a words ask goes. On a network that is not a test network
-/// (`test_net` false) every ask is [`WordsRefusal::NativeOnly`], first.
+/// 🏦 Where a words ask goes. A page that is not allowed
+/// ([`page_allowed`]: off a test network, or while the desktop app's
+/// channel is on) gets [`WordsRefusal::NativeOnly`] for every ask, first;
+/// the desktop app ([`Asker::Shell`]) never does.
 /// `loaded` is the wallet key and its meta, or
 /// none while no wallet is loaded; `turning` (whether a turn holds the lock)
 /// counts only then. A reveal is refused once the words are marked saved and
 /// otherwise reads the file. A saved mark checks the key first (a wallet
 /// made since the words were shown wins, even over a flag already saved),
 /// then answers a mark already recorded as done, and writes the flag only
-/// for words this run showed.
+/// for words this run showed to the same asker.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bool, test_net: bool) -> WordsStep<K> {
-    if !test_net {
+pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bool, asker: Asker) -> WordsStep<K> {
+    if asker == (Asker::Page { allowed: false }) {
         return WordsStep::Refuse(WordsRefusal::NativeOnly);
     }
     let Some((wallet, meta)) = loaded else {
@@ -683,19 +774,20 @@ pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bo
         WordsAsk::Reveal => WordsStep::ReadFile { wallet, fingerprint: meta.fingerprint },
         WordsAsk::Saved(key) if key != meta.fingerprint => WordsStep::Refuse(WordsRefusal::KeyChanged),
         WordsAsk::Saved(_) if meta.backed_up => WordsStep::SavedIdempotent,
-        WordsAsk::Saved(_) if !meta.revealed => WordsStep::Refuse(WordsRefusal::NotShown),
+        WordsAsk::Saved(_) if !meta.revealed_to(asker) => WordsStep::Refuse(WordsRefusal::NotShown),
         WordsAsk::Saved(key) => WordsStep::WriteFlag { key },
     }
 }
 
 /// 🏦 The words route's first rule, before the page gate ([`app_page`]):
-/// on a network that is not a test network, an ask is refused with
+/// when pages are not `allowed` ([`page_allowed`]: off a test network, or
+/// while the desktop app's channel is on), an ask is refused with
 /// [`WordsRefusal::NativeOnly`] whatever page sends it and whatever
 /// `SSF_BANK_DEV_PAGES` names. `None` lets the route go on as before (a
 /// target that asks for nothing is still the gate's, then a 400).
-pub fn native_only(test_net: bool, target: &str) -> Option<(&'static str, serde_json::Value)> {
+pub fn native_only(allowed: bool, target: &str) -> Option<(&'static str, serde_json::Value)> {
     let ask = words_asked(target)?;
-    match words_step::<()>(ask, None, false, test_net) {
+    match words_step::<()>(ask, None, false, Asker::Page { allowed }) {
         WordsStep::Refuse(WordsRefusal::NativeOnly) => Some(WordsRefusal::NativeOnly.answer()),
         _ => None,
     }
@@ -705,7 +797,8 @@ pub fn native_only(test_net: bool, target: &str) -> Option<(&'static str, serde_
 /// the identity file.
 #[derive(Debug, PartialEq)]
 pub enum WordsGate {
-    /// Off a test network: this answer, whatever page sent it.
+    /// Pages not allowed (off a test network, or the desktop app's channel
+    /// on): this answer, whatever page sent it.
     NativeOnly((&'static str, serde_json::Value)),
     /// The page gate ([`app_page`]) said no: a 403.
     Forbidden,
@@ -715,15 +808,16 @@ pub enum WordsGate {
 
 /// 🏦 The words route's opening decision, in its order: [`native_only`]
 /// first, so no origin and no `dev_pages` lifts it, then [`app_page`].
+/// `allowed` is [`page_allowed`].
 pub fn words_gate(
-    test_net: bool,
+    allowed: bool,
     target: &str,
     origin: Option<&str>,
     host: Option<&str>,
     port: u16,
     dev_pages: &[String],
 ) -> WordsGate {
-    if let Some(answer) = native_only(test_net, target) {
+    if let Some(answer) = native_only(allowed, target) {
         return WordsGate::NativeOnly(answer);
     }
     if app_page(origin, host, port, dev_pages) {
@@ -736,15 +830,19 @@ pub fn words_gate(
 /// 🏦 The reveal's last check, after the identity file was read, under the
 /// lock of `meta` (the hub's, for the loaded key): a save that landed while
 /// the file was read wins, so the words are not shown once they are marked
-/// saved. Otherwise the run counts them as shown, which I SAVED needs.
+/// saved. Otherwise the run counts them as shown to `asker`, and to it
+/// only, which its own I SAVED needs.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn reveal_lands(meta: Option<&mut WalletMeta>, fingerprint: u32) -> Result<(), WordsRefusal> {
+pub fn reveal_lands(meta: Option<&mut WalletMeta>, fingerprint: u32, asker: Asker) -> Result<(), WordsRefusal> {
     match meta {
         None => Err(WordsRefusal::NotOn),
         Some(m) if m.fingerprint != fingerprint => Err(WordsRefusal::KeyChanged),
         Some(m) if m.backed_up => Err(WordsRefusal::AlreadySaved),
         Some(m) => {
-            m.revealed = true;
+            match asker {
+                Asker::Page { .. } => m.revealed_page = true,
+                Asker::Shell => m.revealed_shell = true,
+            }
             Ok(())
         }
     }
@@ -841,7 +939,13 @@ fn loopback_host_port(s: &str) -> Option<(&str, Option<u16>)> {
 mod tests {
     use super::*;
 
-    /// A switch in `state` with every flag clear.
+    /// The view on a test network with the desktop app's channel off
+    /// (`backup: page`), where every test here but the gated ones runs.
+    fn view(built: bool, gate: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts) -> WalletSwitch {
+        super::view(built, gate, env, loaded, memo, facts, backup_of(true, false))
+    }
+
+    /// A switch in `state` with every flag clear, on a test network.
     fn sw(state: WalletState) -> WalletSwitch {
         WalletSwitch {
             state,
@@ -856,6 +960,7 @@ mod tests {
             at_rest_next: None,
             rewrapped: false,
             error: None,
+            backup: Backup::Page,
         }
     }
 
@@ -933,13 +1038,13 @@ mod tests {
         let on = WalletSwitch { stays: true, ..sw(WalletState::On) };
         let (status, body) = turn_answer(Ok(()), &on);
         assert_eq!(status, "200 OK");
-        assert_eq!(body.to_string(), r#"{"ok":true,"wallet":{"state":"on","stays":true}}"#);
+        assert_eq!(body.to_string(), r#"{"ok":true,"wallet":{"backup":"page","state":"on","stays":true}}"#);
         let off = sw(WalletState::Off);
         let (status, body) = turn_answer(Err(OFF_WORDS.to_string()), &off);
         assert_eq!(status, "409 Conflict");
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"], OFF_WORDS);
-        assert_eq!(body["wallet"], serde_json::json!({ "state": "off" }));
+        assert_eq!(body["wallet"], serde_json::json!({ "state": "off", "backup": "page" }));
     }
 
     #[test]
@@ -979,9 +1084,9 @@ mod tests {
         assert!(v.stays && v.held, "held on by SSF_CHIA_LANE=1");
 
         let json = serde_json::to_string(&view(true, false, Unset, false, &memo(false, None), &none)).unwrap();
-        assert_eq!(json, r#"{"state":"ready","mnemonic":true}"#, "flags ride only when set; Ready says TURN ON makes 24 words");
+        assert_eq!(json, r#"{"state":"ready","mnemonic":true,"backup":"page"}"#, "flags ride only when set; Ready says TURN ON makes 24 words");
         let json = serde_json::to_string(&view(true, false, On, true, &memo(false, Some("e")), &none)).unwrap();
-        assert_eq!(json, r#"{"state":"on","stays":true,"held":true,"error":"e"}"#);
+        assert_eq!(json, r#"{"state":"on","stays":true,"held":true,"error":"e","backup":"page"}"#);
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"unbuilt"}"#).unwrap();
         assert_eq!(back.state, WalletState::Unbuilt);
     }
@@ -1036,19 +1141,19 @@ mod tests {
         let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
 
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
-        assert_eq!(json(&view(true, false, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true,"mnemonic":true}"#);
+        assert_eq!(json(&view(true, false, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true,"mnemonic":true,"backup":"page"}"#);
         let v = view(true, false, Unset, false, &memo(false), &all);
-        assert_eq!(json(&v), r#"{"state":"ready","seed":true,"mnemonic":true}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
+        assert_eq!(json(&v), r#"{"state":"ready","seed":true,"mnemonic":true,"backup":"page"}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
         for state in [view(false, false, Unset, false, &memo(true), &all), view(true, false, Off, false, &memo(true), &all)] {
-            assert_eq!(json(&state), format!(r#"{{"state":"{}"}}"#, if state.state == WalletState::Off { "off" } else { "unbuilt" }));
+            assert_eq!(json(&state), format!(r#"{{"state":"{}","backup":"page"}}"#, if state.state == WalletState::Off { "off" } else { "unbuilt" }));
         }
 
         let reminted = KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#);
+        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none","backup":"page"}"#);
         let saved = KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#);
+        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none","backup":"page"}"#);
         let v = view(true, false, On, true, &memo(false), &all);
-        assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true,"at_rest":"none"}"#);
+        assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true,"at_rest":"none","backup":"page"}"#);
         let v = view(true, false, Unset, true, &memo(true), &KeyFacts { backed_up: true, ..KeyFacts::default() });
         assert!(!v.backed_up, "backed up means these words, which a wallet not made from them has not");
         assert!(!view(true, false, Unset, true, &memo(true), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }).seed);
@@ -1070,16 +1175,16 @@ mod tests {
         let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Dpapi), ..KeyFacts::default() };
         assert_eq!(
             json(&view(true, false, Unset, true, &memo, &clear)),
-            r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","at_rest_next":"dpapi"}"#
+            r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","at_rest_next":"dpapi","backup":"page"}"#
         );
         let locked = KeyFacts { mnemonic: true, backed_up: true, at_rest: AtRest::Dpapi, at_rest_next: Some(AtRest::Dpapi), rewrapped: true, ..KeyFacts::default() };
         assert_eq!(
             json(&view(true, false, Unset, true, &memo, &locked)),
-            r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true}"#,
+            r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true,"backup":"page"}"#,
             "a locked file has no lock to come"
         );
         let linux = KeyFacts { mnemonic: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, false, Unset, true, &memo, &linux)), r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none"}"#);
+        assert_eq!(json(&view(true, false, Unset, true, &memo, &linux)), r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","backup":"page"}"#);
         // Not loaded, or not from 24 words: nothing to say about its file.
         for v in [view(true, false, Unset, false, &memo, &locked), view(true, false, Unset, true, &memo, &KeyFacts { mnemonic: false, ..locked })] {
             assert!(v.at_rest.is_none() && v.at_rest_next.is_none() && !v.rewrapped, "{v:?}");
@@ -1243,52 +1348,78 @@ mod tests {
         }
     }
 
-    /// The loaded wallet's meta for the words-route table: key fingerprint 7.
-    fn meta(backed_up: bool, revealed: bool) -> WalletMeta {
-        WalletMeta { fingerprint: 7, backed_up, reminted: false, revealed, ..WalletMeta::default() }
+    /// The loaded wallet's meta for the words-route table: key fingerprint 7,
+    /// shown to the page (`page`) and to the desktop app (`shell`) or not.
+    fn meta(backed_up: bool, page: bool, shell: bool) -> WalletMeta {
+        WalletMeta { fingerprint: 7, backed_up, reminted: false, revealed_page: page, revealed_shell: shell, ..WalletMeta::default() }
     }
+
+    /// The meta with the words shown to `asker` alone, or to nobody.
+    fn shown_to(asker: Asker, backed_up: bool, revealed: bool) -> WalletMeta {
+        match asker {
+            Asker::Page { .. } => meta(backed_up, revealed, false),
+            Asker::Shell => meta(backed_up, false, revealed),
+        }
+    }
+
+    /// The askers every words rule but NativeOnly applies to alike.
+    const ASKERS: [Asker; 2] = [Asker::Page { allowed: true }, Asker::Shell];
+    const PAGE: Asker = Asker::Page { allowed: true };
 
     #[test]
     fn with_no_wallet_loaded_a_words_ask_is_turning_or_not_on() {
-        for ask in [WordsAsk::Reveal, WordsAsk::Saved(7)] {
-            assert_eq!(words_step::<()>(ask, None, true, true), WordsStep::Refuse(WordsRefusal::Turning), "{ask:?}");
-            assert_eq!(words_step::<()>(ask, None, false, true), WordsStep::Refuse(WordsRefusal::NotOn), "{ask:?}");
+        for asker in ASKERS {
+            for ask in [WordsAsk::Reveal, WordsAsk::Saved(7)] {
+                assert_eq!(words_step::<()>(ask, None, true, asker), WordsStep::Refuse(WordsRefusal::Turning), "{ask:?} {asker:?}");
+                assert_eq!(words_step::<()>(ask, None, false, asker), WordsStep::Refuse(WordsRefusal::NotOn), "{ask:?} {asker:?}");
+            }
+            // A turn beside a loaded wallet (KEEP IT ON) is not "turning": the
+            // key never changes in a run once loaded.
+            assert_eq!(words_step(WordsAsk::Saved(7), Some(((), meta(true, false, false))), true, asker), WordsStep::SavedIdempotent);
+            assert_eq!(words_step(WordsAsk::Reveal, Some(("key", meta(false, false, false))), true, asker), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
         }
-        // A turn beside a loaded wallet (KEEP IT ON) is not "turning": the
-        // key never changes in a run once loaded.
-        assert_eq!(words_step(WordsAsk::Saved(7), Some(((), meta(true, false))), true, true), WordsStep::SavedIdempotent);
-        assert_eq!(words_step(WordsAsk::Reveal, Some(("key", meta(false, false))), true, true), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
     }
 
     #[test]
     fn a_reveal_reads_the_file_until_the_words_are_marked_saved() {
-        let step = |m| words_step(WordsAsk::Reveal, Some(("key", m)), false, true);
-        assert_eq!(step(meta(false, false)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
-        assert_eq!(step(meta(false, true)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 }, "shown again until saved");
-        assert_eq!(step(meta(true, false)), WordsStep::Refuse(WordsRefusal::AlreadySaved), "saved: never shown again");
-        assert_eq!(step(meta(true, true)), WordsStep::Refuse(WordsRefusal::AlreadySaved));
+        for asker in ASKERS {
+            let step = |m| words_step(WordsAsk::Reveal, Some(("key", m)), false, asker);
+            for (page, shell) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(step(meta(false, page, shell)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 }, "shown again until saved: {asker:?}");
+                assert_eq!(step(meta(true, page, shell)), WordsStep::Refuse(WordsRefusal::AlreadySaved), "saved: never shown again, to either: {asker:?}");
+            }
+        }
     }
 
     /// A save that lands while the reveal reads the file (another tab's I
-    /// SAVED) wins: the words are not shown after they are marked saved.
+    /// SAVED) wins: the words are not shown after they are marked saved. A
+    /// reveal that lands arms its own asker's mark only.
     #[test]
     fn a_reveal_lands_only_while_the_words_are_not_marked_saved() {
-        let mut m = meta(false, false);
-        assert_eq!(reveal_lands(Some(&mut m), 7), Ok(()));
-        assert!(m.revealed, "shown: I SAVED may follow");
-        let mut saved = meta(true, false);
-        assert_eq!(reveal_lands(Some(&mut saved), 7), Err(WordsRefusal::AlreadySaved));
-        assert!(!saved.revealed);
-        let mut other = meta(false, false);
-        assert_eq!(reveal_lands(Some(&mut other), 8), Err(WordsRefusal::KeyChanged));
-        assert!(!other.revealed);
-        assert_eq!(reveal_lands(None, 7), Err(WordsRefusal::NotOn));
+        let mut m = meta(false, false, false);
+        assert_eq!(reveal_lands(Some(&mut m), 7, PAGE), Ok(()));
+        assert_eq!(m, meta(false, true, false), "shown to the page: the page's I SAVED may follow, not the app's");
+        let mut m = meta(false, false, false);
+        assert_eq!(reveal_lands(Some(&mut m), 7, Asker::Shell), Ok(()));
+        assert_eq!(m, meta(false, false, true), "shown in the app: the app's mark may follow, not the page's");
+        let mut m = meta(false, true, false);
+        assert_eq!(reveal_lands(Some(&mut m), 7, Asker::Shell), Ok(()));
+        assert_eq!(m, meta(false, true, true), "each keeps its own");
+        for asker in ASKERS {
+            let mut saved = meta(true, false, false);
+            assert_eq!(reveal_lands(Some(&mut saved), 7, asker), Err(WordsRefusal::AlreadySaved));
+            assert_eq!(saved, meta(true, false, false));
+            let mut other = meta(false, false, false);
+            assert_eq!(reveal_lands(Some(&mut other), 8, asker), Err(WordsRefusal::KeyChanged));
+            assert_eq!(other, meta(false, false, false));
+            assert_eq!(reveal_lands(None, 7, asker), Err(WordsRefusal::NotOn));
+        }
     }
 
     #[test]
     fn a_saved_mark_checks_the_key_then_saved_then_shown() {
         use WordsStep::*;
-        // (asked key, backed_up, revealed) → step, in the route's order.
+        // (asked key, backed_up, revealed to this asker) → step, in the route's order.
         let table = [
             ((8, true, true), Refuse(WordsRefusal::KeyChanged)),
             ((8, true, false), Refuse(WordsRefusal::KeyChanged)),
@@ -1299,13 +1430,108 @@ mod tests {
             ((7, false, false), Refuse(WordsRefusal::NotShown)),
             ((7, false, true), WriteFlag { key: 7 }),
         ];
-        for ((asked, backed_up, revealed), want) in table {
-            assert_eq!(
-                words_step(WordsAsk::Saved(asked), Some(((), meta(backed_up, revealed))), false, true),
-                want,
-                "key {asked}, backed_up {backed_up}, revealed {revealed}"
-            );
+        for asker in ASKERS {
+            for ((asked, backed_up, revealed), want) in table {
+                assert_eq!(
+                    words_step(WordsAsk::Saved(asked), Some(((), shown_to(asker, backed_up, revealed))), false, asker),
+                    want,
+                    "{asker:?}: key {asked}, backed_up {backed_up}, revealed {revealed}"
+                );
+            }
         }
+    }
+
+    /// 🖥️ A page reveal never arms the desktop app's saved mark, and the
+    /// app's reveal never arms the page's: a page script that can trigger a
+    /// testnet reveal cannot mark the words saved for the app.
+    #[test]
+    fn a_reveal_arms_only_the_saved_mark_of_whoever_asked() {
+        let mark = |m, asker| words_step(WordsAsk::Saved(7), Some(((), m)), false, asker);
+        assert_eq!(mark(meta(false, true, false), Asker::Shell), WordsStep::Refuse(WordsRefusal::NotShown), "a page reveal does not arm the app");
+        assert_eq!(mark(meta(false, false, true), PAGE), WordsStep::Refuse(WordsRefusal::NotShown), "the app's reveal does not arm the page");
+        assert_eq!(mark(meta(false, true, false), PAGE), WordsStep::WriteFlag { key: 7 });
+        assert_eq!(mark(meta(false, false, true), Asker::Shell), WordsStep::WriteFlag { key: 7 });
+        // The same through reveal_lands, as the route runs it.
+        let mut m = meta(false, false, false);
+        reveal_lands(Some(&mut m), 7, PAGE).unwrap();
+        assert_eq!(mark(m, Asker::Shell), WordsStep::Refuse(WordsRefusal::NotShown));
+        let mut m = meta(false, false, false);
+        reveal_lands(Some(&mut m), 7, Asker::Shell).unwrap();
+        assert_eq!(mark(m, PAGE), WordsStep::Refuse(WordsRefusal::NotShown));
+        assert_eq!(mark(m, Asker::Shell), WordsStep::WriteFlag { key: 7 });
+        // Once saved by either, neither is shown the words again.
+        for asker in ASKERS {
+            assert_eq!(words_step(WordsAsk::Reveal, Some(((), meta(true, true, true))), false, asker), WordsStep::Refuse(WordsRefusal::AlreadySaved));
+        }
+    }
+
+    /// 🖥️ The desktop app is never NativeOnly, on any network and with any
+    /// wallet; a page that is not allowed always is, first; an allowed page
+    /// and the app then take the same step.
+    #[test]
+    fn the_app_is_never_native_only_and_a_page_not_allowed_always_is() {
+        for ask in [WordsAsk::Reveal, WordsAsk::Saved(7), WordsAsk::Saved(8)] {
+            for turning in [false, true] {
+                let mut loads: Vec<Option<((), WalletMeta)>> = vec![None];
+                for backed_up in [false, true] {
+                    for page in [false, true] {
+                        for shell in [false, true] {
+                            loads.push(Some(((), meta(backed_up, page, shell))));
+                        }
+                    }
+                }
+                for loaded in loads {
+                    let app = words_step(ask, loaded, turning, Asker::Shell);
+                    assert_ne!(app, WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?} {loaded:?}");
+                    let blocked = words_step(ask, loaded, turning, Asker::Page { allowed: false });
+                    assert_eq!(blocked, WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?} {loaded:?}");
+                    // The same rules once each reads its own shown flag.
+                    let mirrored = loaded.map(|(k, m)| (k, WalletMeta { revealed_page: m.revealed_shell, revealed_shell: m.revealed_page, ..m }));
+                    assert_eq!(words_step(ask, mirrored, turning, PAGE), app, "{ask:?} {loaded:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_is_allowed_only_on_a_test_network_with_no_channel_and_a_mint_needs_one_or_the_other() {
+        assert!(page_allowed(true, false), "testnet, no app channel: the page reveal, as before");
+        assert!(!page_allowed(true, true), "the app's channel is on: only the app shows the words");
+        assert!(!page_allowed(false, false), "mainnet: never the page");
+        assert!(!page_allowed(false, true));
+        assert!(may_mint(true, false) && may_mint(true, true) && may_mint(false, true));
+        assert!(!may_mint(false, false), "a mainnet node the app did not start never mints");
+    }
+
+    /// 🖥️ The fingerprint's `backup`, in every state's JSON: `native` with the
+    /// channel, `page` on a test network without it, `none` otherwise.
+    #[test]
+    fn the_fingerprint_says_who_shows_the_words() {
+        assert_eq!(backup_of(true, true), Backup::Native);
+        assert_eq!(backup_of(false, true), Backup::Native);
+        assert_eq!(backup_of(true, false), Backup::Page);
+        assert_eq!(backup_of(false, false), Backup::None);
+        let memo = SwitchMemo::default();
+        let facts = KeyFacts { mnemonic: true, ..KeyFacts::default() };
+        for (backup, word) in [(Backup::Native, "native"), (Backup::Page, "page"), (Backup::None, "none")] {
+            for (built, gate, loaded) in [(true, false, true), (true, false, false), (true, true, false), (false, false, false)] {
+                let v = super::view(built, gate, EnvSwitch::Unset, loaded, &memo, &facts, backup);
+                let json = serde_json::to_string(&v).unwrap();
+                assert!(json.ends_with(&format!(r#","backup":"{word}"}}"#)), "{json}");
+                let back: WalletSwitch = serde_json::from_str(&json).unwrap();
+                assert_eq!(back, v);
+            }
+        }
+        let json = serde_json::to_string(&super::view(true, false, EnvSwitch::Unset, true, &memo, &facts, Backup::Native)).unwrap();
+        assert_eq!(json, r#"{"state":"on","mnemonic":true,"at_rest":"none","backup":"native"}"#);
+        assert!(serde_json::from_str::<WalletSwitch>(r#"{"state":"on","backup":"shell"}"#).is_err(), "only the three values");
+    }
+
+    /// The crate's `println!` (main.rs) is the one this out-of-line module
+    /// sees, as in every module of the crate.
+    #[test]
+    fn the_crate_println_reaches_this_module() {
+        assert!(std::hint::black_box(println!(@ssf_shell_channel_probe)));
     }
 
     #[test]
@@ -1342,7 +1568,7 @@ mod tests {
         let saved = WalletSwitch { stays: true, mnemonic: true, backed_up: true, ..sw(WalletState::On) };
         let (status, body) = saved_answer(&saved, None);
         assert_eq!(status, "200 OK");
-        assert_eq!(body, serde_json::json!({ "ok": true, "wallet": { "state": "on", "stays": true, "mnemonic": true, "backed_up": true } }));
+        assert_eq!(body, serde_json::json!({ "ok": true, "wallet": { "state": "on", "stays": true, "mnemonic": true, "backed_up": true, "backup": "page" } }));
 
         // The write failed but the flag holds the key: a 200, the view with
         // `backed_up`, and the note.
@@ -1416,33 +1642,37 @@ mod tests {
         let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true, ..KeyFacts::default() };
         for env in [Unset, On, Off] {
             for loaded in [false, true] {
-                let v = view(true, true, env, loaded, &memo, &all);
-                assert_eq!(v, sw(WalletState::Gated), "{env:?} loaded={loaded}");
-                assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"state":"gated"}"#);
+                let v = super::view(true, true, env, loaded, &memo, &all, Backup::None);
+                assert_eq!(v, WalletSwitch { backup: Backup::None, ..sw(WalletState::Gated) }, "{env:?} loaded={loaded}");
+                assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"state":"gated","backup":"none"}"#);
             }
         }
-        assert_eq!(view(false, true, On, false, &memo, &all), sw(WalletState::Unbuilt), "a read-only build is unbuilt on any network");
+        assert_eq!(super::view(false, true, On, false, &memo, &all, Backup::None), WalletSwitch { backup: Backup::None, ..sw(WalletState::Unbuilt) }, "a read-only build is unbuilt on any network");
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"gated"}"#).unwrap();
-        assert_eq!(back.state, WalletState::Gated);
+        assert_eq!((back.state, back.backup), (WalletState::Gated, Backup::None), "an older node sends no backup");
         let gated = no_wallet_words(true, EnvSwitch::Unset, "take a mojo");
         assert_eq!(gated, "this node runs on Chia mainnet, where Star Station makes no SSF wallet yet, so it cannot take a mojo");
         assert!(!gated.contains("BANK") && !gated.contains("SSF_CHIA_LANE"), "{gated}");
         assert_eq!(no_wallet_words(true, EnvSwitch::Off, "give"), no_wallet_words(true, EnvSwitch::Unset, "give"), "the network is the reason");
     }
 
-    /// 🏦 On a network that is not a test network, every words ask is
-    /// NativeOnly, ahead of every other rule: never ReadFile or WriteFlag,
-    /// the only steps that open a file, whatever wallet is loaded.
+    /// 🏦 On a network that is not a test network, or on a test network
+    /// while the desktop app's channel is on, every page ask is NativeOnly,
+    /// ahead of every other rule: never ReadFile or WriteFlag, the only steps
+    /// that open a file, whatever wallet is loaded.
     #[test]
     fn off_a_test_network_a_words_ask_is_native_only_before_any_file_is_read() {
-        for ask in [WordsAsk::Reveal, WordsAsk::Saved(7), WordsAsk::Saved(8)] {
-            for turning in [false, true] {
-                assert_eq!(words_step::<()>(ask, None, turning, false), WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?}");
-                for (backed_up, revealed) in [(false, false), (false, true), (true, false), (true, true)] {
-                    let step = words_step(ask, Some(("key", meta(backed_up, revealed))), turning, false);
-                    assert_eq!(step, WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?} {backed_up} {revealed}");
-                    let on_test = words_step(ask, Some(("key", meta(backed_up, revealed))), turning, true);
-                    assert_ne!(on_test, WordsStep::Refuse(WordsRefusal::NativeOnly), "a test network keeps its rules");
+        for (test_net, channel) in [(false, false), (false, true), (true, true)] {
+            let asker = Asker::Page { allowed: page_allowed(test_net, channel) };
+            for ask in [WordsAsk::Reveal, WordsAsk::Saved(7), WordsAsk::Saved(8)] {
+                for turning in [false, true] {
+                    assert_eq!(words_step::<()>(ask, None, turning, asker), WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?}");
+                    for (backed_up, page, shell) in [(false, false, false), (false, true, false), (false, false, true), (true, false, false), (true, true, true)] {
+                        let step = words_step(ask, Some(("key", meta(backed_up, page, shell))), turning, asker);
+                        assert_eq!(step, WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?} {backed_up} {page} {shell} test_net={test_net} channel={channel}");
+                        let on_test = words_step(ask, Some(("key", meta(backed_up, page, shell))), turning, Asker::Page { allowed: page_allowed(true, false) });
+                        assert_ne!(on_test, WordsStep::Refuse(WordsRefusal::NativeOnly), "a test network with no channel keeps its rules");
+                    }
                 }
             }
         }
@@ -1452,39 +1682,60 @@ mod tests {
     }
 
     /// The route asks [`native_only`] before [`app_page`]: it takes no
-    /// origin and no dev pages, so no page and no SSF_BANK_DEV_PAGES lifts it.
+    /// origin and no dev pages, so no page and no SSF_BANK_DEV_PAGES lifts it,
+    /// on mainnet and, while the desktop app's channel is on, on testnet too.
     #[test]
     fn the_route_refuses_the_words_off_a_test_network_before_the_page_gate() {
         for target in ["/api/chia/words", "/api/chia/words/saved?key=7"] {
             assert_eq!(native_only(false, target), Some(WordsRefusal::NativeOnly.answer()), "{target}");
-            assert_eq!(native_only(true, target), None, "a test network goes on to the page gate: {target}");
+            assert_eq!(native_only(true, target), None, "an allowed page goes on to the page gate: {target}");
         }
         for bad in ["/api/chia/words/", "/api/chia/words?x", "/api/chia/words/saved?key="] {
             assert_eq!(native_only(false, bad), None, "an ask for nothing is still the gate's, then a 400: {bad}");
         }
 
-        // The route's own decision, [`words_gate`], as main.rs matches it.
+        // The route's own decision, [`words_gate`], as main.rs matches it:
+        // mainnet with or without the channel, and testnet with it, refuse
+        // every origin; testnet without it keeps the page gate.
         let none: Vec<String> = vec![];
         let dev = dev_pages_of(Some(OsStr::new("http://localhost:5173")));
         let host = Some("127.0.0.1:8080");
-        let origins = [None, Some("tauri://localhost"), Some("http://localhost:5173"), Some("https://example.com")];
+        let origins = [
+            None,
+            Some("tauri://localhost"),
+            Some("http://tauri.localhost"),
+            Some("https://tauri.localhost"),
+            Some("http://localhost:5173"),
+            Some("http://127.0.0.1:4173"),
+            Some("https://example.com"),
+            Some("null"),
+        ];
+        let refused = [(false, false), (false, true), (true, true)];
         for pages in [&none, &dev] {
             for origin in origins {
-                for target in ["/api/chia/words", "/api/chia/words/saved?key=7"] {
-                    assert_eq!(
-                        words_gate(false, target, origin, host, 8080, pages),
-                        WordsGate::NativeOnly(WordsRefusal::NativeOnly.answer()),
-                        "{target} {origin:?} {pages:?}"
-                    );
-                    let page = if app_page(origin, host, 8080, pages) { WordsGate::Pass } else { WordsGate::Forbidden };
-                    assert_eq!(words_gate(true, target, origin, host, 8080, pages), page, "a test network keeps the page gate");
-                }
                 let page = if app_page(origin, host, 8080, pages) { WordsGate::Pass } else { WordsGate::Forbidden };
-                assert_eq!(words_gate(false, "/api/chia/words/", origin, host, 8080, pages), page, "an ask for nothing is the gate's");
+                for target in ["/api/chia/words", "/api/chia/words/saved?key=7"] {
+                    for (test_net, channel) in refused {
+                        assert_eq!(
+                            words_gate(page_allowed(test_net, channel), target, origin, host, 8080, pages),
+                            WordsGate::NativeOnly(WordsRefusal::NativeOnly.answer()),
+                            "{target} {origin:?} {pages:?} test_net={test_net} channel={channel}"
+                        );
+                    }
+                    assert_eq!(words_gate(page_allowed(true, false), target, origin, host, 8080, pages), page, "a test network with no channel keeps the page gate");
+                }
+                for (test_net, channel) in refused {
+                    assert_eq!(words_gate(page_allowed(test_net, channel), "/api/chia/words/", origin, host, 8080, pages), page, "an ask for nothing is the gate's");
+                }
             }
         }
         assert_eq!(words_gate(true, "/api/chia/words", Some("tauri://localhost"), host, 8080, &none), WordsGate::Pass);
         assert_eq!(words_gate(true, "/api/chia/words", Some("http://localhost:5173"), host, 8080, &dev), WordsGate::Pass);
         assert_eq!(words_gate(true, "/api/chia/words", Some("https://example.com"), host, 8080, &dev), WordsGate::Forbidden);
+        assert_eq!(
+            words_gate(page_allowed(true, true), "/api/chia/words", Some("tauri://localhost"), host, 8080, &none),
+            WordsGate::NativeOnly(WordsRefusal::NativeOnly.answer()),
+            "the desktop app's own page too, while its channel is on"
+        );
     }
 }
