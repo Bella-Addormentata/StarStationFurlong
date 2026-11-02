@@ -149,6 +149,8 @@ import {
   casinoDocEpoch,
   casinoRoomId,
   casinoWhole,
+  checkpointLabelOf,
+  computedCheckpointOf,
   computedEndedIncs,
   computedFoldOf,
   computedIncEnded,
@@ -175,6 +177,7 @@ import {
   holdsDeed,
   houseOnline,
   houseSetUp,
+  houseSumBackedOff,
   isComputedTable,
   markComputedVerdict,
   notifyCasinoView,
@@ -198,16 +201,17 @@ import {
   writeComputedOn,
   writeDelegation,
   writeFairSetting,
+  writeHouseSum,
   writeOwnerRunChosen,
 } from './casinoDoc';
 import type { ComputedRecovery, EndedComputed, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
-  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, MAX_TABLE_PIDS, parseKey,
+  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, MAX_TABLE_PIDS, nextSid, parseKey,
   recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
 } from './computedFold';
 import type {
-  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, Duty, FoldCtx, FoldResult, ForfeitRec, GameName, RecKind,
+  AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, Duty, FoldCtx, FoldResult, ForfeitRec, GameName, HouseSum, RecKind,
   RevealRec, RoundView, SignedKind, SlipInfo,
 } from './computedFold';
 import {
@@ -515,13 +519,24 @@ interface TableState {
    *  from what this page had folded of those rounds (`chips`); of that, by
    *  how many in the nets, and at craps whether the table it hands on
    *  differs (its riding bets, point or dice's hands). */
-  cpDiff: { sid: string; chips: number; nets: number; carry: boolean } | null;
+  cpDiff: { sid: string; chips: number; nets: number; carry: boolean; covered: 'unseen' | 'split' | 'same' } | null;
   /** 🩹 While the table counts a checkpoint that puts a restore in motion
    *  (noteResult): the head's session, the fold of it, and the keys of what
    *  this page had written into it; and the session the table last moved to
    *  meanwhile, with the keys this page held then (what it wrote since went
    *  into that session). */
   forged: { sid: string; res: FoldResult; mine: Set<string>; on: string; since: Set<string> } | null;
+  /** 🏛️ D2: the owner-signed checkpoint this page last wrote for this table —
+   *  the sid it opens (so the next trim of it carries the attestation's `a`
+   *  on), and that `a` (how far back the checker has folded every round in).
+   *  Null when this page isn't the deed holder, or the last trim failed a
+   *  vouch condition (a fresh chain starts from the next base's `u`). */
+  attested: { sid: string; a: number } | null;
+  /** 🏛️ D2: a trim this page folded whose attestation the hearing gate held
+   *  off (attestDuty: the page hadn't heard the room for IDLE_MS, so its view
+   *  might be stale). noteResult retries it once the gate clears; a newer trim
+   *  supersedes it, and it clears when the attestation runs. */
+  pendingAttest: { was: FoldResult; res: FoldResult } | null;
   scan: Scan | null;
   view: ViewEntry | null;
   /** The phase listeners were last told of, for one fold result. */
@@ -574,6 +589,11 @@ const clock = {
   epoch: -1, wakes: 0, last: null as number | null, wakeAt: 0, gen: 0, inAt: null as number | null, realFrom: 0,
 };
 const tables = new Map<string, TableState>();
+/** 🏛️ The sids of the final checkpoints this page itself wrote (switch-off or
+ *  compaction, finalizeComputed): D2 vouches for an end only when it is one of
+ *  these (its own; a cheat's forged `e:1` carrying this page's key is not).
+ *  Of the binding, so cleared when the doc rebinds (lookAtClock). */
+const endedByMe = new Set<string>();
 /** By `<tableId>:<inc>`: when this page first saw that incarnation ended
  *  with its sessions still in the doc (computedEndedIncs), on its clock. */
 const endedAt = new Map<string, number>();
@@ -596,6 +616,7 @@ function lookAtClock(now: number): void {
     // wrote, saw and kept was of that binding.
     clock.epoch = epoch;
     tables.clear();
+    endedByMe.clear();
     endedAt.clear();
     compactedAt = null;
     away.clear();
@@ -681,7 +702,7 @@ function newTable(t: string, inc: string): TableState {
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
     tickedAt: null, reputAt: null,
-    lastD: null, lastRes: null, cpDiff: null, forged: null, scan: null, view: null, told: null, check: null, checks: new Map(),
+    lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
@@ -735,7 +756,12 @@ function lastDecided(res: FoldResult): RoundView | null {
  *  closes leave out after such a move: casinoDoc noteDoubted.) */
 function noteResult(st: TableState, res: FoldResult): void {
   const was = st.lastRes;
-  if (was === res) return;
+  // 🏛️ The gate reopening is no doc change, so an unchanged fold must still
+  // retry a trim the gate held off (noteResult runs every frame).
+  if (was === res) {
+    retryPendingAttest(st);
+    return;
+  }
   const moved = was !== null && was.base.sid !== res.base.sid;
   if (forgedStands(st)) {
     if (moved) {
@@ -749,6 +775,13 @@ function noteResult(st: TableState, res: FoldResult): void {
   } else if (moved) {
     movedOn(st, was!, res);
   }
+  // 🏛️ D2: the deed holder's page vouches for the trim it just folded (never
+  // for a forgery a restore is undoing: forgedStands). It signs the checkpoint
+  // only when every one of attestDuty's conditions holds.
+  if (moved && !forgedStands(st)) attestDuty(st, was!, res);
+  // A changed-but-not-moved fold (a fresh bet, say): no new trim to attest, but
+  // the gate may have reopened for a held-off one.
+  else retryPendingAttest(st);
   const D = lastDecided(res);
   if (D) st.lastD = D;
   st.lastRes = res;
@@ -769,6 +802,128 @@ function noteResult(st: TableState, res: FoldResult): void {
       }
     }
   }
+}
+
+/** 🏛️ D2: the deed holder's page vouches for the checkpoint `res` folds from
+ *  (P = the doc's `sum:`, which this fold's session opens) by writing a signed
+ *  `hs:` over it — but only when it is sure of it, by every condition of design
+ *  §6.3. On any failure it writes nothing and forgets its chain (st.attested).
+ *  Not a hot path: once per trim this page folds, about a signature's worth. */
+function attestDuty(st: TableState, was: FoldResult, res: FoldResult): void {
+  if (!holdsDeed()) {
+    st.attested = null;
+    st.pendingAttest = null;
+    return;
+  }
+  const now = clock.last ?? Date.now();
+  // A page that hasn't heard the room for a minute can't vouch (its view may
+  // be stale): keep the trim to retry once hearing recovers (noteResult), and
+  // don't forget the chain. A newer trim replaces this pending one.
+  if (!heardThrough(now - IDLE_MS, now)) {
+    st.pendingAttest = { was, res };
+    return;
+  }
+  st.pendingAttest = null;
+  const P = computedCheckpointOf(st.t, st.inc);
+  if (!P) {
+    st.attested = null;
+    return;
+  }
+  // The doc's checkpoint raced ahead of what this fold read: wait for the fold
+  // of it, keeping the chain (nextSid leaves k and g out).
+  if (nextSid(st.ctx, P) !== res.base.sid) return;
+  const fail = (): void => {
+    st.attested = null;
+  };
+  // 1. P trims the session this page folded.
+  if (P.b !== was.base.sid) return fail();
+  // 2. `was` has round P.u decided, with the close P names (covered).
+  const at = was.rounds.find((v) => v.decided !== null && v.r === P.u && v.close === P.l);
+  if (!at) return fail();
+  // 3. The checkpoint's nets and craps carry are what this page folded.
+  const diff = checkpointDiff(was, res);
+  if (diff.nets !== 0n || diff.carry !== 0n) return fail();
+  // 4. At a house table, P's `h` is the commitment this page saw round u carry
+  //    (both absent counts as equal), and no step-down it saw past u lifted it.
+  if ((P.h ?? null) !== (at.house?.rec.c ?? null)) return fail();
+  if (was.rounds.some((v) => v.r > P.u && v.house !== undefined && v.house.rec.x.length === 0)) return fail();
+  // 5. P isn't an end, or it is this page's own (a switch-off or compaction it
+  //    wrote: endedByMe; never a cheat's `e:1` carrying this page's key).
+  if (res.base.ended && !endedByMe.has(res.base.sid)) return fail();
+  // 6. Round u's verdicts were all checked, and the doc was whole.
+  if (was.pending || !casinoWhole(st.t)) return fail();
+  // 7. (B10) `was` decided no round past P.u on its chain: an honest trim cuts
+  //    at the last decided round, so a later one is a premature cut or a race.
+  if (was.rounds.some((v) => v.decided !== null && v.r > P.u)) return fail();
+  // How round u was decided, when this page is sure: its own house reveal, the
+  // one decision no unseen record can beat (the copies-carried case is 6a-3).
+  let decided: { d: string; o: number | [number, number] } | undefined;
+  if (at.decided === 'house' && at.house) {
+    const o = st.game === 'craps' ? at.craps?.dice : at.pocket;
+    if (o !== null && o !== undefined) decided = { d: `h:${at.house.hash}`, o };
+  }
+  // `a`: how far back the checker has folded every round itself. Consecutive
+  // attestations chain (the new P trims the session the last one opened); else
+  // it starts at this base's u (a base of `g` gives 0).
+  const a = st.attested && st.attested.sid === P.b ? st.attested.a : was.base.u;
+  const body = {
+    v: 1 as const,
+    b: P.b,
+    u: P.u,
+    l: P.l,
+    n: P.n,
+    ...(P.e !== undefined ? { e: P.e } : {}),
+    ...(P.s !== undefined ? { s: P.s } : {}),
+    ...(P.h !== undefined ? { h: P.h } : {}),
+    ...(decided !== undefined ? { d: decided.d, o: decided.o } : {}),
+    a,
+    k: getIdentityPub(),
+  };
+  const rec: HouseSum = signed(st.ctx, 'hsum', body);
+  writeHouseSum(st.t, st.inc, rec);
+  st.attested = { sid: res.base.sid, a };
+}
+
+/** 🏛️ Retry a trim whose attestation the hearing gate held off (st.pendingAttest),
+ *  now that another fold has run. Cleared first so a stale one (the doc moved
+ *  past it, or a restore is in motion) doesn't retry forever: attestDuty re-keeps
+ *  it only while the gate is still shut and the checkpoint still current. */
+function retryPendingAttest(st: TableState): void {
+  if (!st.pendingAttest || forgedStands(st)) return;
+  const pending = st.pendingAttest;
+  st.pendingAttest = null;
+  attestDuty(st, pending.was, pending.res);
+}
+
+/** 🏛️ D2 for an end this page itself just wrote (switchComputedOff,
+ *  migrateComputed, compactDuty): the deed holder vouches for the end
+ *  checkpoint `cp` by an `hs:` over it, so F4 (houseSumTrigger 'end') can put
+ *  it back if the ended table is turned live again. No hearing gate: the page
+ *  acts on its own just-folded view, which these paths hold quiet (no round
+ *  under way) before the end, so it is current. It vouches only for a real
+ *  decided round the end kept (attestDuty's condition 2, 7, 6), never a bare
+ *  base; the hs:'s digest fields mirror `cp`, so it checks the very checkpoint
+ *  (nextSid leaves k and g out). `was` is the fold the end was taken from,
+ *  `prior` the page's last attestation (to carry its `a` on). */
+function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null): void {
+  if (!holdsDeed() || cp.e !== 1) return;
+  if (!was.rounds.some((v) => v.decided !== null && v.r === cp.u && v.close === cp.l)) return;
+  if (was.rounds.some((v) => v.decided !== null && v.r > cp.u)) return;
+  if (was.pending || !casinoWhole(t)) return;
+  const a = prior && prior.sid === cp.b ? prior.a : was.base.u;
+  const body = {
+    v: 1 as const,
+    b: cp.b,
+    u: cp.u,
+    l: cp.l,
+    n: cp.n,
+    e: 1 as const,
+    ...(cp.s !== undefined ? { s: cp.s } : {}),
+    ...(cp.h !== undefined ? { h: cp.h } : {}),
+    a,
+    k: getIdentityPub(),
+  };
+  writeHouseSum(t, inc, signed(ctx, 'hsum', body));
 }
 
 /** Whether the checkpoint table st counts puts a restore in motion. */
@@ -804,7 +959,7 @@ function endForged(st: TableState, res: FoldResult): void {
  *  wrote into `res`'s session since (endForged). */
 function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: ReadonlySet<string> | null = null, fromForged = false): void {
   const d = checkpointDiff(was, res);
-  st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n };
+  st.cpDiff = { sid: res.base.sid, chips: clampSafe(d.nets + d.carry), nets: clampSafe(d.nets), carry: d.carry > 0n, covered: d.covered };
   const u = res.base.u;
   for (const key of [...st.seen.keys()]) if ((parseKey(key)?.r ?? 0) <= u) st.seen.delete(key);
   for (const [id, e] of [...st.decided]) if (e.r < u) st.decided.delete(id);
@@ -951,10 +1106,14 @@ function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
  *  (this page can't tell). At craps also what the checkpoint hands on
  *  against the table's state this page had after round u (`carry`:
  *  carryDiff). */
-function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry: bigint } {
+function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry: bigint; covered: 'unseen' | 'split' | 'same' } {
   const u = res.base.u;
   const at = was.rounds.find((v) => v.decided && v.r === u);
-  if (!at) return { nets: 0n, carry: 0n };
+  // 🏛️ (E) Whether this page can check the checkpoint: it saw round u decided
+  // (covered), and with the close the checkpoint names — else a silent 0 hid a
+  // page that never saw the round (unseen) or a fork (split, the forged `l`).
+  if (!at) return { nets: 0n, carry: 0n, covered: 'unseen' };
+  const covered = at.close === res.base.l ? 'same' : 'split';
   const expect = new Map(was.base.n);
   for (const v of was.rounds) {
     if (!v.decided || v.r > u) continue;
@@ -965,7 +1124,7 @@ function checkpointDiff(was: FoldResult, res: FoldResult): { nets: bigint; carry
     const d = (res.base.n.get(pid) ?? 0n) - (expect.get(pid) ?? 0n);
     diff += d < 0n ? -d : d;
   }
-  return { nets: diff, carry: at.craps ? carryDiff(at.craps.sOut, res.base.state as CrapsCarry) : 0n };
+  return { nets: diff, carry: at.craps ? carryDiff(at.craps.sOut, res.base.state as CrapsCarry) : 0n, covered };
 }
 
 /** By how many chips two craps states' riding bets differ, spot by spot;
@@ -1834,6 +1993,12 @@ export interface ComputedRoundCheck {
   mineAdded?: boolean;
   checkpointNets?: number;
   checkpointCarry?: boolean;
+  /** 🏛️ (E) How this page stands to check the checkpoint the live session
+   *  opened from: 'unseen' (it never saw round u decided), 'split' (it saw
+   *  round u decided with another close — a fork or forged `l`), 'same' (same
+   *  close: the nets/carry lines mean something). Absent when no trim this
+   *  page folded set it. */
+  covered?: 'unseen' | 'split' | 'same';
 }
 
 /** At craps: the checkpoint's difference split (ComputedRoundCheck). */
@@ -1862,12 +2027,14 @@ function crapsCheck(st: TableState, sc: Scan, res: FoldResult, D: RoundView, me:
 
 function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRoundCheck | null {
   const D = lastDecided(res);
-  const diff = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff.chips : 0;
+  const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
+  const diff = cp?.chips ?? 0;
+  const coveredOf: { covered?: 'unseen' | 'split' | 'same' } = cp ? { covered: cp.covered } : {};
   if (!D) {
     // A trim took the round out of the session: what this page said of it,
     // if it is the round the checkpoint kept.
     const kept = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
-    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res) } : null;
+    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res), ...coveredOf } : null;
   }
   const sc = scanOf(st, res);
   const me = getPlayerId();
@@ -1923,6 +2090,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     checkpointDiff: diff,
     ...replacedOf(st),
     ...(D.craps ? crapsCheck(st, sc, res, D, me) : {}),
+    ...coveredOf,
   };
   st.checks.set(D.close, out);
   return out;
@@ -1949,6 +2117,35 @@ function checkOf(st: TableState, res: FoldResult, now: number): ComputedRoundChe
     st.check = { res, gen: clock.gen, out: roundCheck(st, res, now) };
   }
   return st.check.out;
+}
+
+/** 🏛️ The ⚙ card's checkpoint readout for computed table `t` (design §6.2
+ *  D + E), null for one this page doesn't track: the owner-check label (who
+ *  checked the checkpoint the live session opened from, L-0..L-7, display
+ *  only), that checkpoint's round, and how this page stands to check it
+ *  itself (`covered`: unseen / split / same, or null when no trim this page
+ *  folded set it). Shown on every page, round decided or not. */
+export interface ComputedCheckpointView {
+  label: string | null;
+  round: number;
+  covered: 'unseen' | 'split' | 'same' | null;
+  /** 🏛️ Whether this page has stood down from putting the owner-signed
+   *  checkpoint back (B12: a run of worse overwrites it reads as a disagreement
+   *  over the owner's key). The ⚙ card shows PAGES DISAGREE while it holds. */
+  backedOff: boolean;
+}
+export function computedCheckpointView(t: string, now = Date.now()): ComputedCheckpointView | null {
+  lookAtClock(now);
+  const at = tableOf(t);
+  if (!at) return null;
+  const { st, res } = at;
+  const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
+  return {
+    label: checkpointLabelOf(st.t, st.inc, res.base.sid, res.base.u),
+    round: res.base.u,
+    covered: cp?.covered ?? null,
+    backedOff: houseSumBackedOff(st.t, st.inc, now),
+  };
 }
 
 // ── ✍️ Writing ───────────────────────────────────────────────────────────────
@@ -3525,7 +3722,12 @@ function compactDuty(pub: string, now: number): void {
       const l = D ? D.close : e.res.base.l ?? NO_CLOSE;
       cp = signed(ctx, 'sum', { v: 1 as const, b: e.res.base.sid, u, l, n: netsOf(e.res), e: 1 as const, k: pub });
     }
+    if (cp) endedByMe.add(nextSid(ctx, cp));
     finalizeComputed(e.t, e.inc, cp);
+    // 🏛️ D2: vouch for the end this page just wrote, so F4 can put it back if
+    // the ended table is turned live again (only a freshly written end: an end
+    // already in the doc was vouched for when it was written).
+    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, null);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
 }
@@ -3565,10 +3767,12 @@ let recoveredAt: number | null = null;
  * state in and its doc whole (no build deletes a checkpoint or a session
  * with nothing in its place, nor writes one back, nor rewinds one):
  * - **Restore** (casinoDoc restoreComputedCheckpoint): this page's head,
- *   byte for byte, when the doc's checkpoint is gone or junk (at once, in
- *   turn), or rewound below it, or jumped past where any session reaches
- *   (RESTORE_WAIT_MS on, in turn). Turns go by dutyRank('restore') among the
- *   incarnation's keys (ComputedRecovery pubs), STAGGER_MS apart; a page
+ *   byte for byte — or 🏛️ the owner-signed checkpoint, when that is the
+ *   higher by round (casinoDoc restoreTargetOf) — when the doc's checkpoint
+ *   is gone or junk (at once, in turn), or rewound below it, or jumped past
+ *   where any session reaches, or live where the owner's checkpoint is an
+ *   end (RESTORE_WAIT_MS on, in turn). Turns go by dutyRank('restore') among
+ *   the incarnation's keys (ComputedRecovery pubs), STAGGER_MS apart; a page
  *   with none of them waits OUTSIDER_WAIT_MS more. Never over an end, nor
  *   over an extension of the head (no page can tell one from an honest
  *   trim). The page counts from its head meanwhile (casinoDoc heldBase).
@@ -3628,7 +3832,7 @@ function restoreStep(w: Recovering, r: ComputedRecovery, pub: string, now: numbe
   // a delete over it isn't counted: no page writes either, and the first in
   // turn puts the head back at once each time.)
   if (w.wrote !== null && w.wrote !== r.head) w.wrote = null;
-  if (w.wrote !== null && (r.trigger === 'rewind' || r.trigger === 'jump')) {
+  if (w.wrote !== null && (r.trigger === 'rewind' || r.trigger === 'jump' || r.trigger === 'end')) {
     w.wrote = null;
     if (w.overAt === null || w.overAt > now || now - w.overAt > CONTESTED_CALM_MS) w.overwrites = 0;
     w.overwrites += 1;
@@ -3743,7 +3947,7 @@ function houseDuty(now: number): void {
   if (houseDutyAt !== null && now >= houseDutyAt && now - houseDutyAt < REPUT_MS) return;
   houseDutyAt = now;
   if (!tablesAwake(now) || !casinoWhole()) return;
-  putBackHouseRecords();
+  putBackHouseRecords(now);
   // (Held, or its check waiting: it is read again REPUT_MS on.)
   if (localHouse === null || !holdsDeed() || delegationHeld(localHouse) !== false) return;
   const body = { v: 1 as const, h: localHouse, k: getIdentityPub() };
@@ -3827,8 +4031,11 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   const u = D ? D.r : Math.max(1, res.base.u);
   const l = D ? D.close : res.base.l ?? NO_CLOSE;
   const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  endedByMe.add(nextSid(st.ctx, cp));
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
+    // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
     writeComputedOn(t, computedIncFor(t, game));
     return true;
   });
@@ -4153,8 +4360,11 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
   const u = D ? D.r : Math.max(1, res.base.u);
   const l = D ? D.close : res.base.l ?? NO_CLOSE;
   const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  endedByMe.add(nextSid(st.ctx, cp));
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
+    // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
     return true;

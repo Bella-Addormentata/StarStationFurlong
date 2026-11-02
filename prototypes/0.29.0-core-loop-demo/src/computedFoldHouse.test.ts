@@ -19,10 +19,10 @@
 import { describe, expect, it } from 'vitest';
 import { basisOf, canonFelt, diceOf, EMPTY_CARRY } from './computedCraps';
 import {
-  asHouseCommit, asHouseReveal, dutyRank, houseCommitOf, houseRevealKey, houseRules, nextSid, pocketOf, seedTable, signBytes,
-  TableFold,
+  asHouseCommit, asHouseReveal, asHouseSumFor, compareHouseSum, dutyRank, houseCommitOf, houseRevealKey, houseRules,
+  houseSumDigest, nextSid, pocketOf, seedTable, signBytes, TableFold, U_MAX,
 } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, HouseCheck } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, HouseCheck, HouseSum } from './computedFold';
 import { houseSign } from './computedHouse';
 import {
   black, cachingCheck, ComputedKit, houseSnapshot, housesAre, red, straight, TEST_CTX, TestSession, testHouse, testIdentity,
@@ -642,5 +642,83 @@ describe('the output depends on the record set only (a house table)', () => {
     expect([...seen].some((x) => x.endsWith(':void:h'))).toBe(true);
     expect([...seen].some((x) => x.endsWith(':void:z'))).toBe(true);
     expect([...seen].some((x) => x.endsWith(':reveals:-'))).toBe(true);
+  });
+});
+
+describe('🏛️🧮 hs: — the owner-signed checkpoint check (PR 6a-2 C1)', () => {
+  const O = testIdentity('owner');
+  const readR = asHouseSumFor(HCTX);                // r… → roulette, house table
+  const PLAIN: FoldCtx = { room: 'room-test', t: 'roulette-plain', inc: 'c0123456789abcdef01234567' }; // non-house roulette
+  const readPlain = asHouseSumFor(PLAIN);
+  const dk = new ComputedKit(DCTX);                 // d… → craps, house table
+  const readD = asHouseSumFor(DCTX);
+
+  // A roulette checkpoint and an hs: that checks it (same b,u,l,n → same digest).
+  const cp = kit.checkpoint(A, SID, 5, 'a'.repeat(32), { [A.pid]: 100n });
+  const mk = (over: Record<string, unknown> = {}): HouseSum =>
+    kit.sign<HouseSum>('hsum', O, { v: 1, b: cp.b, u: cp.u, l: cp.l, n: cp.n, a: 0, ...over });
+
+  it('reads a valid hs:, and its digest is the sum:’s nextSid', () => {
+    const hs = mk();
+    expect(readR(hs)).not.toBeNull();
+    expect(houseSumDigest(HCTX, hs)).toBe(nextSid(HCTX, cp));
+  });
+
+  it('is junk on a bad shape: v, a-range, u>U_MAX, missing/extra field, checkpoint junk', () => {
+    expect(readR({ ...mk(), v: 2 })).toBeNull();
+    expect(readR({ ...mk(), a: -1 })).toBeNull();
+    expect(readR({ ...mk(), a: 6 })).toBeNull();            // a > u (5)
+    expect(readR({ ...mk(), u: U_MAX + 1 })).toBeNull();
+    const noA = { ...mk() } as Record<string, unknown>; delete noA.a;
+    expect(readR(noA)).toBeNull();
+    expect(readR({ ...mk(), zz: 1 })).toBeNull();           // unknown field
+    expect(readR({ ...mk(), l: 'zz' })).toBeNull();         // checkpoint field junk
+  });
+
+  it('checks d and o: d shape, o only with d, o the game’s shape', () => {
+    expect(readR(mk({ d: 'r', o: 17 }))).not.toBeNull();    // roulette pocket
+    expect(readR(mk({ d: 'f:' + 'a'.repeat(32) }))).not.toBeNull();
+    expect(readR(mk({ d: 'x' }))).toBeNull();               // bad d
+    expect(readR(mk({ o: 17 }))).toBeNull();                // o without d
+    expect(readR(mk({ d: 'r', o: 37 }))).toBeNull();        // pocket out of range
+    expect(readR(mk({ d: 'r', o: [1, 2] }))).toBeNull();    // array at roulette
+  });
+
+  it('rejects a house commitment h at a non-house roulette table', () => {
+    const withH = { ...mk(), h: 'b'.repeat(64) };
+    expect(readR(withH)).not.toBeNull();                    // r… house table allows h
+    expect(readPlain(withH)).toBeNull();                    // plain roulette: h is junk
+  });
+
+  it('craps: s is required live, o is a pair of dice', () => {
+    const dcp = dk.checkpoint(A, SID, 3, 'c'.repeat(32), { [A.pid]: 50n }, undefined, EMPTY_CARRY);
+    const mkD = (over: Record<string, unknown> = {}): HouseSum =>
+      dk.sign<HouseSum>('hsum', O, { v: 1, b: dcp.b, u: dcp.u, l: dcp.l, n: dcp.n, s: dcp.s, a: 0, ...over });
+    expect(readD(mkD())).not.toBeNull();
+    expect(houseSumDigest(DCTX, mkD())).toBe(nextSid(DCTX, dcp));
+    expect(readD(mkD({ d: 'r', o: [3, 4] }))).not.toBeNull(); // dice
+    expect(readD(mkD({ d: 'r', o: 5 }))).toBeNull();          // number at craps
+    const noS = { ...mkD() } as Record<string, unknown>; delete noS.s;
+    expect(readD(noS)).toBeNull();                           // live craps needs s
+  });
+
+  it('orders hs: by u, then digest, then a, then recHash', () => {
+    const lo = mk();                                 // u = 5
+    const hiCp = kit.checkpoint(A, SID, 6, 'a'.repeat(32), { [A.pid]: 100n });
+    const hi = kit.sign<HouseSum>('hsum', O, { v: 1, b: hiCp.b, u: hiCp.u, l: hiCp.l, n: hiCp.n, a: 0 });
+    expect(compareHouseSum(HCTX, hi, lo)).toBeGreaterThan(0); // higher u wins
+    expect(compareHouseSum(HCTX, lo, hi)).toBeLessThan(0);
+    const a0 = mk();
+    const a2 = mk({ a: 2 });
+    expect(compareHouseSum(HCTX, a0, a2)).toBeGreaterThan(0); // same digest → lower a wins
+    expect(compareHouseSum(HCTX, a0, a0)).toBe(0);
+  });
+
+  it('signBytes bind the room, table and incarnation', () => {
+    const body = { v: 1, b: cp.b, u: cp.u, l: cp.l, n: cp.n, a: 0 };
+    const base = signBytes('hsum', HCTX, body);
+    expect(base).not.toEqual(signBytes('hsum', { ...HCTX, t: 'other' }, body));
+    expect(base).not.toEqual(signBytes('hsum', { ...HCTX, inc: 'r9999999999999999999999999' }, body));
+    expect(base).not.toEqual(signBytes('hsum', { ...HCTX, room: 'other-room' }, body));
   });
 });

@@ -121,6 +121,9 @@ export const MAX_CHECKPOINT_PIDS = 4_096;
  *  (computedTable closeDuty), so the next checkpoint's nets stay under
  *  MAX_CHECKPOINT_PIDS and trims go on. */
 export const MAX_TABLE_PIDS = 4_000;
+/** The only bound on an `hs:`'s `u` — far past any real round (~25 s a round);
+ *  no restore uses an absolute round bound. */
+export const U_MAX = 2 ** 48;
 /** Slip hashes one house reveal may count (`n`): two closes' worth. */
 export const MAX_HOUSE_COUNTED = 2 * MAX_FROZEN + 2;
 
@@ -226,7 +229,32 @@ export interface Checkpoint {
   g: string;
 }
 
-export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum' | 'hreveal' | 'hcommit';
+/** The owner's (later a delegated house's) signed check of a checkpoint,
+ *  stored at the top-level key `hs:<t>:<inc>`. Its {v,b,u,l,n,e,s,h} are the
+ *  checked checkpoint's content, exactly as `sum:` holds it, so
+ *  `houseSumDigest(ctx, hs) === nextSid(ctx, sum)` is what "hs checks sum"
+ *  means. `a` records that the checker folded every round in (a, u] itself;
+ *  `d`/`o` say how round u was decided, when the checker is sure. The checker's
+ *  key authority (`k === deedHolderKey()` or `houseOkOf(k)`) and the `'hsum'`
+ *  signature are applied where hs: is counted (casinoDoc), as for a house
+ *  reveal; `asHouseSumFor` is the shape only (design §6.1a steps 1–4). */
+export interface HouseSum {
+  v: 1;
+  b: string;
+  u: number;
+  l: string;
+  n: Record<string, string>;
+  e?: 1;
+  s?: CrapsCarry;
+  h?: string;
+  d?: string;
+  o?: number | [number, number];
+  a: number;
+  k: string;
+  g: string;
+}
+
+export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum' | 'hreveal' | 'hcommit' | 'hsum';
 
 // ── Encoding ─────────────────────────────────────────────────────────────────
 
@@ -920,6 +948,62 @@ export function asCheckpointFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => Chec
     const cp = read(v);
     return cp && cp.h === undefined ? cp : null;
   };
+}
+
+const HOUSE_SUM_D = /^(r|[fzh]:[0-9a-f]{32})$/;
+
+/** A round-`u` outcome `o` an hs: may carry: roulette a pocket (0..36); craps a
+ *  pair of dice, each 1..6. */
+function isHouseSumOutcome(o: unknown, craps: boolean): boolean {
+  if (craps) {
+    return Array.isArray(o) && o.length === 2
+      && Number.isSafeInteger(o[0]) && (o[0] as number) >= 1 && (o[0] as number) <= 6
+      && Number.isSafeInteger(o[1]) && (o[1] as number) >= 1 && (o[1] as number) <= 6;
+  }
+  return Number.isSafeInteger(o) && (o as number) >= 0 && (o as number) <= 36;
+}
+
+/** The shape of a value stored at `hs:<t>:<inc>` for an incarnation (design
+ *  §6.1a, steps 1–4): the first failure makes it junk (null). The checker's key
+ *  authority (step 5: `k === deedHolderKey()` or `houseOkOf(k)`) and the
+ *  `'hsum'` signature (step 6) are applied where hs: is counted (casinoDoc), as
+ *  for a house reveal — this reader is the shape only. */
+export function asHouseSumFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => HouseSum | null {
+  const asCp = asCheckpointFor(ctx);
+  const craps = gameOfInc(ctx.inc) === 'craps';
+  return (v) => {
+    if (!isPlain(v) || !hasFields(v, ['v', 'b', 'u', 'l', 'n', 'a', 'k', 'g'], ['e', 's', 'h', 'd', 'o'])) return null;
+    if (v.v !== 1) return null;
+    // 2. `a` a safe integer with 0 ≤ a ≤ u; `u` a round ≤ U_MAX.
+    if (!isRound(v.u) || (v.u as number) > U_MAX) return null;
+    if (!Number.isSafeInteger(v.a) || (v.a as number) < 0 || (v.a as number) > (v.u as number)) return null;
+    // 3. The checkpoint fields pass the game's own checkpoint reader (`s` iff
+    //    live at craps; `h` only at a house table; ≤ MAX_CHECKPOINT_PIDS pids).
+    if (!asCp({ v: v.v, b: v.b, u: v.u, l: v.l, n: v.n, e: v.e, s: v.s, h: v.h, k: v.k, g: v.g })) return null;
+    // 4. `d` has the decided shape; `o` the game's, and only alongside `d`.
+    if (v.d !== undefined && !(typeof v.d === 'string' && HOUSE_SUM_D.test(v.d))) return null;
+    if (v.o !== undefined && (v.d === undefined || !isHouseSumOutcome(v.o, craps))) return null;
+    return v as unknown as HouseSum;
+  };
+}
+
+/** `digest(hs) = nextSid(ctx, hs)` over the checkpoint fields {b,u,l,n,e,s,h}
+ *  only, so hs: checks the `sum:` whose `nextSid` it equals. */
+export function houseSumDigest(ctx: FoldCtx, hs: Pick<HouseSum, 'b' | 'u' | 'l' | 'n' | 'e' | 's' | 'h'>): string {
+  return nextSid(ctx, hs);
+}
+
+/** The total order on hs: values (design §6.1), greater = the better check to
+ *  keep: higher `u`; then lower digest; then lower `a`; then lower recHash of
+ *  the whole value. Returns > 0 when `a` ranks above `b`, < 0 below, 0 equal. */
+export function compareHouseSum(ctx: FoldCtx, a: HouseSum, b: HouseSum): number {
+  if (a.u !== b.u) return a.u > b.u ? 1 : -1;
+  const da = houseSumDigest(ctx, a), db = houseSumDigest(ctx, b);
+  if (da !== db) return da < db ? 1 : -1;
+  if (a.a !== b.a) return a.a < b.a ? 1 : -1;
+  const ra = recHash(a) ?? '', rb = recHash(b) ?? '';
+  if (ra !== rb) return ra < rb ? 1 : -1;
+  return 0;
 }
 
 // ── The index ────────────────────────────────────────────────────────────────

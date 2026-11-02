@@ -225,8 +225,8 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, gameOfInc, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, GameName, SigCheck } from './computedFold';
+import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, SigCheck } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
 } from './computedHouse';
@@ -2210,7 +2210,7 @@ export const TAKEN_WAIT_MS = 45_000;
 const DOUBTED_KEPT = 1_024;
 
 /** What sets a checkpoint's restore going (recoveryTrigger). */
-export type RecoveryTrigger = 'junk' | 'rewind' | 'jump';
+export type RecoveryTrigger = 'junk' | 'rewind' | 'jump' | 'end';
 
 /** 🧪 Whether this page holds its base, and the recovery duties run
  *  (computedTable recoverDuty): off, it reads as v0.50 pages do, a deleted
@@ -2286,7 +2286,39 @@ function computedKeyParts(key: string): { t: string; inc: string; sid?: string }
 
 const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
 
+/** The top-level key an incarnation's owner-signed checkpoint is stored under
+ *  (`hs:<t>:<inc>`, PR 6a-2). Not a `computedKeyParts` key: v0.50 pages and
+ *  the node neither read nor write it, and a change to it never re-folds the
+ *  incarnation (an hs: is checked, not played). */
+const houseSumKey = (t: string, inc: string): string => `hs:${t}:${inc}`;
+
+/** The incarnation an `hs:<t>:<inc>` key is of, parsed from the right (an
+ *  incarnation holds no ':', a table id may), or null for any other key. */
+function houseSumKeyParts(key: string): { t: string; inc: string } | null {
+  if (!key.startsWith('hs:')) return null;
+  const rest = key.slice('hs:'.length);
+  const cut = rest.lastIndexOf(':');
+  const inc = rest.slice(cut + 1);
+  return cut > 0 && COMPUTED_INC.test(inc) ? { t: rest.slice(0, cut), inc } : null;
+}
+
 const checkpointCache = new WeakMap<object, { inc: string; cp: Checkpoint | null }>();
+const houseSumCache = new WeakMap<object, { inc: string; hs: HouseSum | null }>();
+
+/** The value stored at `hs:<t>:<inc>` read for its shape (asHouseSumFor, design
+ *  §6.1a steps 1–4; once per value), null for none or junk. The checker's key
+ *  authority (step 5) and the `'hsum'` signature (step 6) are applied by the
+ *  caller (authorityOkHouseSum, houseSumOk). */
+function houseSumAt(map: Y.Map<unknown>, t: string, inc: string): HouseSum | null {
+  const value = map.get(houseSumKey(t, inc));
+  if (typeof value !== 'object' || value === null) return null;
+  let hit = houseSumCache.get(value);
+  if (hit?.inc !== inc) {
+    hit = { inc, hs: asHouseSumFor({ inc })(value) };
+    houseSumCache.set(value, hit);
+  }
+  return hit.hs;
+}
 
 /** An incarnation's checkpoint as stored (its game's asCheckpoint, once per
  *  value: up to 4,096 nets to check); null for none, or junk. */
@@ -2328,8 +2360,49 @@ function baseOf(tableId: string, inc: string): Checkpoint | null {
   return c ? heldBase(c, computedMap!) : checkpointAt(computedMap!, tableId, inc);
 }
 
-/** What puts a recovery in motion at incarnation `c`, read from the doc's
- *  checkpoint `cp` (null: none, or junk) against this page's head:
+/** 🏛️ The owner-signed checkpoint that takes part in incarnation `c`'s
+ *  restores (design §6.2 F): the best valid `hs:` this page counted
+ *  (bestHouseSum), by a checker whose authority stands — unless this page saw
+ *  the deed change hands during its visit (B1 fix 3: a holder it watched take
+ *  the deed could be a cheat writing `roomInfo.owner`; a page that loads after
+ *  trusts the deed holder it finds, as PR 5 does). The label still shows it. */
+function houseSumTakesPart(c: ComputedInc): HouseSum | null {
+  if (deedChangedSeen) return null;
+  const a = houseSumSeen.get(c.key);
+  return a !== undefined && authorityOkHouseSum(a) ? a : null;
+}
+
+/** 🏛️ An owner-signed checkpoint as the value a restore of it writes into
+ *  the checkpoint key (B14.1): its checkpoint fields {v,b,u,l,n,e?,s?,h?}
+ *  with its own `k` and `g` — byte-identical on every page that restores it
+ *  (no build verifies a checkpoint signature, so a value whose `g` is an
+ *  'hsum' signature reads like any other). One object per record, so a
+ *  restore in motion keeps its identity across counts (computedTable
+ *  restoreStep tracks its last write). */
+const houseSumAsCheckpoint = new WeakMap<HouseSum, object>();
+function cpValueOfHouseSum(a: HouseSum): object {
+  let v = houseSumAsCheckpoint.get(a);
+  if (!v) {
+    v = {
+      v: a.v,
+      b: a.b,
+      u: a.u,
+      l: a.l,
+      n: a.n,
+      ...(a.e !== undefined ? { e: a.e } : {}),
+      ...(a.s !== undefined ? { s: a.s } : {}),
+      ...(a.h !== undefined ? { h: a.h } : {}),
+      k: a.k,
+      g: a.g,
+    };
+    houseSumAsCheckpoint.set(a, v);
+  }
+  return v;
+}
+
+/** 🩹 What this page's own counted chain puts in motion at incarnation `c`
+ *  (6a-1, unchanged), read from the doc's checkpoint `cp` (null: none, or
+ *  junk) against this page's head:
  *  - 'junk': none, though this page counted one (put back at once, in turn);
  *  - 'rewind': a live one below the head (a replay, or the lower of two
  *    rival trims: no honest trim goes back);
@@ -2340,7 +2413,7 @@ function baseOf(tableId: string, inc: string): Checkpoint | null {
  *  Null for the head itself, for anything else, an end above all (no
  *  restore touches an `e: 1`) and an extension of the head no page can
  *  tell from an honest one. */
-function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+function chainTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
   const head = c.chain[c.chain.length - 1];
   if (!head) return null;
   if (cp === null) return 'junk';
@@ -2349,6 +2422,55 @@ function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger
   if (liveSidOf(c, cp) === head.sid) return null;
   if (c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return 'jump';
   return null;
+}
+
+/** 🏛️ What the owner-signed checkpoint A puts in motion at incarnation `c`
+ *  (design §6.2 F), when one takes part (houseSumTakesPart):
+ *  - 'junk' (F1): the doc holds none, or junk — even on a page that counted
+ *    none itself (a late page restores the owner's check);
+ *  - 'end' (F4): A is an end (`e: 1`) and the doc holds a live checkpoint
+ *    (the end turned live again: no honest page reopens an ended table);
+ *  - 'rewind' (F2b): a live checkpoint at or below A's round that A does not
+ *    check (another close, or a replay the owner saw past).
+ *  Null for an end in the doc (no restore touches an `e: 1`), for A's own
+ *  checkpoint, and for anything above A (an extension A can't refute). */
+function houseSumTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+  const A = houseSumTakesPart(c);
+  if (!A) return null;
+  if (cp === null) return 'junk';
+  if (cp.e === 1) return null;
+  if (A.e === 1) return 'end';
+  if (cp.u <= A.u && liveSidOf(c, cp) !== houseSumDigest(c.ctx, A)) return 'rewind';
+  return null;
+}
+
+/** What puts a recovery in motion at incarnation `c`, read from the doc's
+ *  checkpoint `cp` (null: none, or junk): this page's own chain first
+ *  (chainTrigger), then the owner-signed checkpoint (houseSumTrigger). With
+ *  no owner's checkpoint taking part this reads exactly as 6a-1 did. */
+function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
+  return chainTrigger(c, cp) ?? houseSumTrigger(c, cp);
+}
+
+/** 🏛️ What a restore of incarnation `c` writes back (B14.2), for `trigger`:
+ *  for 'end' the owner's checkpoint A; else the higher by round of this
+ *  page's head and A, A on a tie (its bytes are the same on every page, the
+ *  head's value only on the pages that counted it). Null with neither. */
+function restoreTargetOf(
+  c: ComputedInc,
+  trigger: RecoveryTrigger | null,
+): { value: object; sid: string; u: number; end: boolean } | null {
+  const head = c.chain[c.chain.length - 1];
+  const A = houseSumTakesPart(c);
+  const ofA = (a: HouseSum) => ({
+    value: cpValueOfHouseSum(a),
+    sid: houseSumDigest(c.ctx, a),
+    u: a.u,
+    end: a.e === 1,
+  });
+  if (trigger === 'end') return A ? ofA(A) : null;
+  if (A && (!head || A.u >= head.cp.u)) return ofA(A);
+  return head ? { value: head.value, sid: head.sid, u: head.cp.u, end: head.cp.e === 1 } : null;
 }
 
 /** Whether `cp` is a jump over counted checkpoint `e`: on the session `e`
@@ -2393,7 +2515,15 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   const value = map.get(`sum:${c.t}:${c.inc}`);
   const cp = checkpointAt(map, c.t, c.inc);
   let trigger = recoveryTrigger(c, cp);
-  if (trigger === 'rewind' && cp !== null) {
+  // 🏛️ The chain's adjustments below (a jump giving way to the honest line, an
+  // unseen head giving way, a seen head's rewind refuted) read what this
+  // page's OWN chain says (chainTrigger): a rewind only the owner's checkpoint
+  // names (houseSumTrigger) drops no head and refutes no session — the page
+  // restores the owner's checkpoint over it (restoreTargetOf), and that is
+  // all. (An hs: that outruns the trim it checks would otherwise refute the
+  // session of this page's own head, and the trim, when it came, read as a
+  // jump.)
+  if (chainTrigger(c, cp) === 'rewind' && cp !== null) {
     const sid = liveSidOf(c, cp);
     const i = c.chain.findIndex((e) => e.cp.b === sid && e.cp.u - cp.u > MAX_SESSION_ROUNDS);
     if (i >= 0) {
@@ -2421,7 +2551,7 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   // UNSEEN (load-taken) head can't tell the honest head coming back from a
   // replay, so its rewind is NOT refuted here — it gives way to it (firmAt
   // within the window, giveWayComputed past it).
-  if (trigger === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
+  if (chainTrigger(c, cp) === 'rewind' && cp !== null && c.chain[c.chain.length - 1]?.seen) {
     // Exempt a session the counted chain is built on: a rewind that replays a
     // checkpoint in the chain opens the chain's OWN next session, and refuting
     // it would reject a legitimate higher trim of that session as a jump (a
@@ -2434,7 +2564,9 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
   if (cp === null || typeof value !== 'object' || value === null) return;
   const head = c.chain[c.chain.length - 1];
   const sid = liveSidOf(c, cp);
-  if (head && (head.sid === sid || trigger !== null)) return;
+  // (🏛️ A checkpoint the owner's checkpoint refutes is no head either, on a
+  // page that counted none yet: a late page restores the owner's over it.)
+  if ((head && head.sid === sid) || trigger !== null) return;
   const taken = now + TAKEN_WAIT_MS;
   // A checkpoint inherits the head's firmAt only when it EXTENDS the head
   // (built on the session the head opens): then it is as firm as the head it
@@ -2489,7 +2621,7 @@ function noteCounted(c: ComputedInc, map: Y.Map<unknown>, watched: string | null
  */
 function noteDoubted(c: ComputedInc, was: FoldResult | null, res: FoldResult, map: Y.Map<unknown>): void {
   const trigger = recoveryTrigger(c, checkpointAt(map, c.t, c.inc));
-  const forged = trigger === 'rewind' || trigger === 'jump';
+  const forged = trigger !== null && trigger !== 'junk';
   const back = c.forged && !forged;
   c.forged = forged;
   if (!was || was.base.sid === res.base.sid) return;
@@ -2928,9 +3060,27 @@ let roomWaiting = new Set<string>();
 let houseBeats = new Map<string, { n: number; at: number }>();
 /** The newest Fair setting by the deed holder this page has seen, per table. */
 let fairSeen = new Map<string, FairSettingRec>();
+/** The best valid owner-signed checkpoint (`hs:`) this page has counted, per
+ *  `<t>:<inc>` (compareHouseSum order; it only ever rises). D2 writes its own
+ *  into it, and a page that only reads one counts it here; D3 puts the best
+ *  back when the doc's goes, is junk or is worse. */
+let houseSumSeen = new Map<string, HouseSum>();
+/** B12 backoff per `<t>:<inc>`: the times this page's hs: put-back was
+ *  overwritten by a worse value, and until when it stands down (⚙ shows
+ *  PAGES DISAGREE). */
+let houseSumBackoff = new Map<string, { hits: number[]; until: number }>();
+const BACKOFF_COUNT = 3;
+const BACKOFF_WINDOW_MS = 60_000;
+const BACKOFF_MS = 600_000;
 /** The deed holder's key the houses were last read under (deedHolderKey):
  *  they read otherwise only as it changes (onComputedTransaction). */
 let houseDeedKey: string | null | undefined;
+/** B1: whether this page saw the room's deed change hands during its visit
+ *  (an established holder's key gave way to another's, or to none). The ⚙
+ *  card names it (checkpointLabelOf), and an owner-signed checkpoint by the
+ *  new holder takes no part in restores (§6.2 F, 6a-2 C3 F). The owner's key
+ *  merely arriving (undefined/null → a key) is no handover. */
+let deedChangedSeen = false;
 
 /** The room's deed holder's identity key, as this page pinned it: null when
  *  the room names no owner (or the legacy marker: nobody's), undefined while
@@ -3004,6 +3154,9 @@ function recheckRoomRecords(): string[] {
       noteFairSetting(at.of);
     } else if (at?.kind === 'hbeat') {
       noteBeat(at.of);
+    } else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
     }
   }
   return pinned;
@@ -3047,11 +3200,20 @@ function houseChangedAll(dirty?: Set<ComputedInc>): void {
   }
   const map = computedMap;
   if (!map) return;
+  // A new deed holder's checks count afresh; an old holder's this page kept
+  // are no longer theirs to put back (B1: the deed changed hands).
+  for (const key of [...houseSumSeen.keys()]) {
+    if (!authorityOkHouseSum(houseSumSeen.get(key)!)) houseSumSeen.delete(key);
+  }
   for (const key of map.keys()) {
     const at = houseKeyParts(key);
     // (Each delegation counted now is pinned, and kept to put back.)
     if (at?.kind === 'hkey') houseOkOf(at.of);
     else if (at?.kind === 'hfair') noteFairSetting(at.of);
+    else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
+    }
   }
 }
 
@@ -3086,6 +3248,166 @@ function noteBeat(pub: string): void {
   const was = houseBeats.get(pub);
   if (was && was.n >= rec.n) return;
   if (roomRecOk('hbeat', '', rec, beatKey(pub)) === true) houseBeats.set(pub, { n: rec.n, at: txNow ?? Date.now() });
+}
+
+/** 🏛️ An owner-signed checkpoint's `'hsum'` signature (step 6), checked once
+ *  for its room, incarnation and recHash out of the recount's budget as a
+ *  room record's is (roomRecOk), on WebCrypto if it can go past the budget,
+ *  a slice for what can't: undefined while it waits (the key under `key`,
+ *  `hs:<t>:<inc>`, is read again by the slice, recheckRoomRecords). `hs:` is
+ *  signed in the fold domain (signBytes), not the room domain. */
+function houseSumOk(t: string, inc: string, rec: HouseSum, key: string): boolean | undefined {
+  const hash = recHash(rec);
+  if (hash === null) return false;
+  const id = JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]);
+  const known = houseVerdicts.get(id);
+  if (known !== undefined) return known;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const fid = fastId('room', id);
+  if (fastInFlight.has(fid)) {
+    roomWaiting.add(key);
+    return undefined;
+  }
+  if (verifySpent >= verifyBudgetMs) {
+    const fast = sendFast(fid, rec.k, () => signBytes('hsum', ctx, rec), rec.g, () => setHouseVerdict(id, true));
+    if (fast === false) {
+      setHouseVerdict(id, false);
+      return false;
+    }
+    roomWaiting.add(key);
+    if (fast === null) queueVerifySlice();
+    return undefined;
+  }
+  const from = verifyNow();
+  let ok: boolean;
+  try {
+    ok = (verifyWith ?? verifyIdentityStrict)(rec.k, signBytes('hsum', ctx, rec), rec.g) === true;
+  } catch {
+    ok = false;
+  }
+  verifySpent += Math.max(0, verifyNow() - from);
+  setHouseVerdict(id, ok);
+  return ok;
+}
+
+/** 🏛️ Whether `rec`'s key is one that may check a checkpoint (design §6.1a
+ *  step 5): the room's deed holder, or a house it delegated (houseOkOf). A
+ *  delegation whose check waits reads as not-yet (undefined → false): the
+ *  record is counted on a later pass, as the deed key or the delegation lands. */
+function authorityOkHouseSum(rec: HouseSum): boolean {
+  return rec.k === deedHolderKey() || houseOkOf(rec.k) === true;
+}
+
+/** 🏛️ Count the owner-signed checkpoint the doc holds for an incarnation: its
+ *  shape (houseSumAt), its checker's authority and the `'hsum'` signature. The
+ *  best valid one by order (compareHouseSum) is kept to put back (houseSumSeen,
+ *  D3). A worse valid one, or junk, is left for D3 to overwrite. */
+function noteHouseSum(t: string, inc: string): void {
+  const map = computedMap;
+  if (!map) return;
+  const hs = houseSumAt(map, t, inc);
+  if (!hs || !authorityOkHouseSum(hs)) return;
+  // 🏛️ The ⚙ card's checkpoint label reads whether a valid-looking owner-signed
+  // checkpoint is still being checked (CHECKING…, L-2) and this page's best one
+  // (bestHouseSum): a shape- and authority-valid hs: arriving, or its check
+  // landing, changes the label — so wake the card's listeners without a refold
+  // (the label reads the doc fresh: computedTable computedCheckpointView).
+  viewTouched.add(`computed:${t}`);
+  if (houseSumOk(t, inc, hs, houseSumKey(t, inc)) !== true) return;
+  // Register the incarnation so recovery can put the owner's checkpoint back:
+  // computedRecoveries iterates the tracked incs, and this valid hs: may be the
+  // only key the incarnation has left (every sum:/ses: deleted before this page
+  // joined) — without this, F1 has nothing to find the incarnation by.
+  trackComputed(t, inc);
+  const key = `${t}:${inc}`;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const seen = houseSumSeen.get(key);
+  if (!seen || compareHouseSum(ctx, hs, seen) > 0) houseSumSeen.set(key, hs);
+}
+
+/** 🏛️ The raw checkpoint the doc holds for an incarnation (computedTable's D2
+ *  reads it to vouch for its own `b` and whether an end is its own). */
+export function computedCheckpointOf(t: string, inc: string): Checkpoint | null {
+  return computedMap ? checkpointAt(computedMap, t, inc) : null;
+}
+
+/** 🏛️ The best valid owner-signed checkpoint this page has counted for an
+ *  incarnation (the ⚙ card's checkpoint label, C3; D3's put-back). */
+export function bestHouseSum(t: string, inc: string): HouseSum | null {
+  return houseSumSeen.get(`${t}:${inc}`) ?? null;
+}
+
+/** 🏛️ Whether this page has backed off putting an incarnation's `hs:` back
+ *  (B12: two pages disagreeing on the owner's key; the ⚙ card says so). */
+export function houseSumBackedOff(t: string, inc: string, now = Date.now()): boolean {
+  const bo = houseSumBackoff.get(`${t}:${inc}`);
+  return bo !== undefined && now < bo.until;
+}
+
+/** 🏛️ B1: whether this page saw the room's deed change hands during its visit
+ *  (an established holder's key gave way). The ⚙ card adds · THE DEED CHANGED
+ *  HANDS WHILE YOU WERE HERE to the label of a checkpoint signed by the new
+ *  holder, and an owner-signed checkpoint by that holder takes no part in
+ *  restores (§6.2 F). */
+export function houseDeedChanged(): boolean {
+  return deedChangedSeen;
+}
+
+/** 🏛️ Whether the doc holds a shape- and authority-valid owner-signed
+ *  checkpoint for an incarnation whose `'hsum'` signature this page hasn't
+ *  checked yet (the ⚙ card shows CHECKING… while it waits, label L-2). Reads
+ *  the verdict cache only: it never spends a recount's budget or queues a
+ *  slice, so a label read can't move the count forward. */
+export function houseSumPending(t: string, inc: string): boolean {
+  const map = computedMap;
+  if (!map) return false;
+  const hs = houseSumAt(map, t, inc);
+  if (!hs || !authorityOkHouseSum(hs)) return false;
+  const hash = recHash(hs);
+  if (hash === null) return false;
+  return !houseVerdicts.has(JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]));
+}
+
+/** 🏛️ The ⚙ card's checkpoint label for an incarnation (design §6.2 D):
+ *  display only. It sets the owner-signed checkpoint this page counted (A =
+ *  bestHouseSum) against the checkpoint the live fold opened from — the
+ *  session id it opens, `liveSid`, and its round `u`. The first row that
+ *  applies wins (L-0..L-7); null is no label. The checker reads OWNER when it
+ *  signed with the deed holder's own key, else a HOUSE it delegated (6b+).
+ *  B1: a deed handover seen during the visit is named on a checkpoint the new
+ *  holder signed. */
+export function checkpointLabelOf(t: string, inc: string, liveSid: string, u: number): string | null {
+  if (!deedHolderKey()) return null; // L-0: no deed holder (or a venture marker)
+  if (u === 0) return null; // L-1: the genesis base — no checkpoint to label
+  const head = `CHECKPOINT · ROUND ${u} · `;
+  const A = bestHouseSum(t, inc);
+  if (!A) return head + (houseSumPending(t, inc) ? 'CHECKING…' : 'NOT CHECKED BY THE OWNER'); // L-2 / L-3
+  const who = A.k === deedHolderKey() ? 'OWNER' : 'HOUSE';
+  const annot = deedChangedSeen ? ' · THE DEED CHANGED HANDS WHILE YOU WERE HERE' : '';
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  if (houseSumDigest(ctx, A) === liveSid) {
+    // L-4 / L-5: A checks the very checkpoint the fold opened from.
+    return head + (A.a === 0 ? `CHECKED BY THE ${who}` : `CHECKED BY THE ${who} FROM ROUND ${A.a + 1}`) + annot;
+  }
+  if (u > A.u) return `${head}NOT CHECKED SINCE ROUND ${A.u}${annot}`; // L-6
+  return `🚩 THIS ISN'T THE CHECKPOINT THE ${who} CHECKED AT ROUND ${A.u}${annot}`; // L-7
+}
+
+/** 🏛️ D2's write: the deed holder's page stores its signed checkpoint at
+ *  `hs:<t>:<inc>`. Its own signature is never re-checked, and it counts at once
+ *  as the best this page has (so D3 puts it back if a peer takes it away). */
+export function writeHouseSum(t: string, inc: string, rec: HouseSum): void {
+  ensureMap();
+  const map = computedMap!;
+  const hash = recHash(rec);
+  if (hash !== null) setHouseVerdict(JSON.stringify(['hsum', boundRoomId, `${t}:${inc}`, hash]), true);
+  const key = `${t}:${inc}`;
+  const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  const seen = houseSumSeen.get(key);
+  if (!seen || compareHouseSum(ctx, rec, seen) > 0) houseSumSeen.set(key, rec);
+  boundDoc!.transact(() => {
+    map.set(houseSumKey(t, inc), rec);
+  });
 }
 
 /** 🏠 Whether this page holds the room's deed (its key is the deed holder's,
@@ -3161,9 +3483,10 @@ export function writeFairSetting(tableId: string, rec: FairSettingRec): void {
 }
 
 /** 🏠 Put back what a delete or an older copy took away: each delegation this
- *  page counted by the deed holder as they are now, and each table's newest
- *  Fair setting. Returns how many. */
-export function putBackHouseRecords(): number {
+ *  page counted by the deed holder as they are now, each table's newest Fair
+ *  setting, and (D3) the best owner-signed checkpoint this page counted. Returns
+ *  how many. */
+export function putBackHouseRecords(now = Date.now()): number {
   if (!docAlive() || !computedMap) return 0;
   const map = computedMap;
   const back: [string, unknown][] = [];
@@ -3172,26 +3495,64 @@ export function putBackHouseRecords(): number {
     // (houseOkOf takes the new holder's of the same key, if the doc holds it).
     if (!houseOkOf(pub)) continue;
     const rec = houseDelegations.get(pub)!;
-    const now = asDelegation(map.get(delegationKey(pub)));
-    if (!now || recHash(now) !== recHash(rec)) back.push([delegationKey(pub), rec]);
+    const cur = asDelegation(map.get(delegationKey(pub)));
+    if (!cur || recHash(cur) !== recHash(rec)) back.push([delegationKey(pub), rec]);
   }
   for (const t of fairSeen.keys()) {
     const rec = fairOf(t);
     if (!rec) continue;
-    const now = asFairSetting(map.get(fairSettingKey(t)));
-    if (now && recHash(now) === recHash(rec)) continue;
+    const cur = asFairSetting(map.get(fairSettingKey(t)));
+    if (cur && recHash(cur) === recHash(rec)) continue;
     // A newer one by the deed holder that this page hasn't noted yet stands
     // (one whose check waits, until it is checked); anything else goes, a
     // forged one with a higher count included.
-    if (now && now.k === rec.k && fairAfter(now, rec)) {
-      const ok = roomRecOk('hfair', t, now, fairSettingKey(t));
+    if (cur && cur.k === rec.k && fairAfter(cur, rec)) {
+      const ok = roomRecOk('hfair', t, cur, fairSettingKey(t));
       if (ok === undefined) continue;
       if (ok) {
-        fairSeen.set(t, now);
+        fairSeen.set(t, cur);
         continue;
       }
     }
     back.push([fairSettingKey(t), rec]);
+  }
+  // 🏛️ D3: the owner-signed checkpoints. The best one this page counted goes
+  // back when the doc's is gone, junk, or worse by order (§6.1). A present
+  // worse value is an overwrite; three in a minute (B12) and this page stands
+  // down for ten (houseSumBackoff, houseSumBackedOff → ⚙ PAGES DISAGREE).
+  for (const key of houseSumSeen.keys()) {
+    const seen = houseSumSeen.get(key)!;
+    // A handover ended the checker's authority: not this page's to defend.
+    if (!authorityOkHouseSum(seen)) continue;
+    const bo = houseSumBackoff.get(key);
+    if (bo && now < bo.until) continue;
+    const cut = key.lastIndexOf(':');
+    const t = key.slice(0, cut);
+    const inc = key.slice(cut + 1);
+    const ctx: FoldCtx = { room: boundRoomId, t, inc };
+    const doc = houseSumAt(map, t, inc);
+    // The present value's authority and 'hsum' signature, read as the
+    // Fair-setting loop above reads a newer record's: true valid, false junk,
+    // undefined while its check is queued.
+    const docOk = doc !== null && authorityOkHouseSum(doc)
+      ? houseSumOk(t, inc, doc, houseSumKey(t, inc))
+      : false;
+    // A newer or better attestation this page hasn't finished checking yet:
+    // leave it for the recheck to count, as the Fair loop waits on `undefined`
+    // — don't overwrite it with our older best, nor count it a B12 overwrite.
+    if (docOk === undefined && compareHouseSum(ctx, doc!, seen) > 0) continue;
+    if (docOk === true && compareHouseSum(ctx, seen, doc!) <= 0) continue;
+    // A present value worse than ours (not a bare delete) counts toward B12.
+    if (doc !== null && recHash(doc) !== recHash(seen)) {
+      const hits = (bo?.hits ?? []).filter((at) => now - at < BACKOFF_WINDOW_MS);
+      hits.push(now);
+      if (hits.length >= BACKOFF_COUNT) {
+        houseSumBackoff.set(key, { hits, until: now + BACKOFF_MS });
+        continue;
+      }
+      houseSumBackoff.set(key, { hits, until: 0 });
+    }
+    back.push([houseSumKey(t, inc), seen]);
   }
   if (back.length === 0) return 0;
   boundDoc!.transact(() => {
@@ -3420,13 +3781,20 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
+  houseSumSeen = new Map();
+  houseSumBackoff = new Map();
   houseDeedKey = deedHolderKey();
+  deedChangedSeen = false;
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
     const house = houseKeyParts(key);
     if (house?.kind === 'hkey') houseOkOf(house.of);
     else if (house?.kind === 'hfair') noteFairSetting(house.of);
+    else {
+      const hs = houseSumKeyParts(key);
+      if (hs) noteHouseSum(hs.t, hs.inc);
+    }
   }
   for (const c of computedIncs.values()) countComputed(c, map, casino, true);
   // (bindCasinoDoc's own notify repaints every listener from the fresh doc.)
@@ -3473,6 +3841,10 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
         if (!pinnedHouse(house.of) && houseOkOf(house.of) === true) pinned.push(house.of);
       } else if (house?.kind === 'hbeat') noteBeat(house.of);
       else if (house?.kind === 'hfair') noteFairSetting(house.of);
+      else if (key !== null) {
+        const hs = houseSumKeyParts(key);
+        if (hs) noteHouseSum(hs.t, hs.inc);
+      }
       const at = key === null ? null : computedKeyParts(key);
       if (!at) continue;
       const c = computedIncs.get(`${at.t}:${at.inc}`) ?? (map.has(key!) ? trackComputed(at.t, at.inc) : undefined);
@@ -3492,6 +3864,10 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // of forged ones past its 2,048).
   const deedKey = deedHolderKey();
   if (deedKey !== houseDeedKey) {
+    // B1: an established holder's key giving way (to another's or to none) is
+    // a handover; the owner's key merely arriving (undefined/null → a key) is
+    // not. Once seen, it stays for the visit (the ⚙ card names it).
+    if (typeof houseDeedKey === 'string') deedChangedSeen = true;
     houseDeedKey = deedKey;
     houseMoved = true;
   }
@@ -3723,8 +4099,10 @@ export interface ComputedRecovery {
    *  it starts a restore's wait afresh. */
   trigger: RecoveryTrigger | null;
   calm: number;
-  /** The value a restore writes, this page's head as the doc held it; its
-   *  round. Null with none counted. */
+  /** The value a restore writes (restoreTargetOf): this page's head as the
+   *  doc held it, or 🏛️ the owner-signed checkpoint when that is the higher
+   *  by round (or the trigger is an end turned live); its round. Null with
+   *  neither. */
   head: object | null;
   headU: number;
   /** Live: its switch names it and nothing ended it. */
@@ -3737,10 +4115,11 @@ export interface ComputedRecovery {
   /** The base's round (0 for none). */
   u: number;
   /** The keys that take turns at it: every staked felt's this page counted
-   *  in the session its head opens (Counted pubs) and the head's; and,
-   *  unless the doc's checkpoint puts a restore in motion, the base's and
-   *  its open felts' signers as last counted (a forger, and the felts of
-   *  the session a forged checkpoint opens, take no turn). */
+   *  in the session its head opens (Counted pubs) and the head's; 🏛️ the
+   *  owner-signed checkpoint's checker when it takes part; and, unless the
+   *  doc's checkpoint puts a restore in motion, the base's and its open
+   *  felts' signers as last counted (a forger, and the felts of the session
+   *  a forged checkpoint opens, take no turn). */
   pubs: string[];
 }
 
@@ -3765,10 +4144,13 @@ export function computedRecoveries(): ComputedRecovery[] {
       if (base) pubs.add(base.k);
     }
     if (head) pubs.add(head.cp.k);
+    const A = houseSumTakesPart(c);
+    if (A) pubs.add(A.k);
+    const target = restoreTargetOf(c, trigger);
     out.push({
       t: c.t, inc: c.inc, ctx: c.ctx,
       trigger, calm: c.calm,
-      head: head?.value ?? null, headU: head?.cp.u ?? 0,
+      head: target?.value ?? null, headU: target?.u ?? 0,
       live: computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc && !casino.has(goneKey(c.t, c.inc)) && base?.e !== 1,
       sessionMissing: !(map.get(sessionKey(c.t, c.inc, sid)) instanceof Y.Map),
       lost: sessionLost(c, map, base),
@@ -3781,15 +4163,16 @@ export function computedRecoveries(): ComputedRecovery[] {
 
 /** 🩹 Whether table `tableId`'s switched-on incarnation (or incarnation
  *  `inc` of it) counts from a checkpoint that puts its restore in motion: a
- *  live one rewound below this page's head, or jumped past it
- *  (recoveryTrigger 'rewind', 'jump'). The page counts it as every build
- *  does while the head comes back; nothing builds on it meanwhile (no trim,
- *  no end: computedTable). */
+ *  live one rewound below this page's head or the owner's checkpoint, jumped
+ *  past the head, or 🏛️ live where the owner's checkpoint is an end
+ *  (recoveryTrigger 'rewind', 'jump', 'end'). The page counts it as every
+ *  build does while the head comes back; nothing builds on it meanwhile (no
+ *  trim, no end: computedTable). */
 export function computedRestorePending(tableId: string, inc: string | null = computedIncOf(tableId)): boolean {
   const c = inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`);
   if (!c || !computedMap || !recoveryOn) return false;
   const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
-  return trigger === 'rewind' || trigger === 'jump';
+  return trigger === 'rewind' || trigger === 'jump' || trigger === 'end';
 }
 
 /**
@@ -3829,6 +4212,12 @@ export function giveWayComputed(tableId: string, inc: string): boolean {
   // balances would stick even when every honest page still holds the head.
   if (trigger !== 'rewind') return false;
   if (cp === null || c.refuted.includes(cp.b) || c.chain.some((e) => jumpsOver(cp, e))) return false;
+  // 🏛️ Nor when the owner's checkpoint reaches the head: the restore writes
+  // that checkpoint (restoreTargetOf), not the unseen head, and the house's
+  // signed head is what the one-honest-page-vs-forger case was waiting for —
+  // the page defends it (the backoff, B12, is the only way it stands down).
+  const A = houseSumTakesPart(c);
+  if (A && A.u >= head.cp.u) return false;
   // Drop every trailing unseen entry (a load-taken head and what extends it,
   // never a seen one along the chain): the page stops defending the line it
   // took at load and adopts the doc's value on the next count.
@@ -3872,28 +4261,31 @@ export function computedRecoveryPending(): boolean {
 }
 
 /**
- * 🩹 Put back this page's head of incarnation `inc` of table `tableId` as
- * its checkpoint, byte for byte as the doc held it (every page that counted
- * it writes the same bytes, so whichever write the doc keeps is the same
- * checkpoint), in ONE transaction with an empty map for the session it
- * opens if the doc has none. Only while what the doc holds now still puts
- * the restore in motion (recoveryTrigger: an honest trim that came in
- * meanwhile moved the checkpoint on, and nothing is written), and `head` is
- * this page's head still; on a doc holding every update whole. False
- * (nothing written) otherwise. The only write of a checkpoint besides a
- * trim's and an end's: no page signs one again in place.
+ * 🩹 Put back the checkpoint of incarnation `inc` of table `tableId` — this
+ * page's head, byte for byte as the doc held it, or 🏛️ the owner-signed one
+ * (restoreTargetOf; every page that counted it writes the same bytes, so
+ * whichever write the doc keeps is the same checkpoint) — in ONE transaction
+ * with an empty map for the session it opens if the doc has none. Only
+ * while what the doc holds now still puts the restore in motion
+ * (recoveryTrigger: an honest trim that came in meanwhile moved the
+ * checkpoint on, and nothing is written), and `head` is still the value that
+ * restore writes; on a doc holding every update whole. False (nothing
+ * written) otherwise. The only write of a checkpoint besides a trim's and
+ * an end's: no page signs one again in place.
  */
 export function restoreComputedCheckpoint(tableId: string, inc: string, head: object): boolean {
   const map = computedMap;
   const c = computedIncs.get(`${tableId}:${inc}`);
-  const last = c?.chain[c.chain.length - 1];
-  if (!map || !c || !last || last.value !== head || !recoveryOn || docHoldsPart()) return false;
-  if (recoveryTrigger(c, checkpointAt(map, tableId, inc)) === null) return false;
+  if (!map || !c || !recoveryOn || docHoldsPart()) return false;
+  const trigger = recoveryTrigger(c, checkpointAt(map, tableId, inc));
+  if (trigger === null) return false;
+  const target = restoreTargetOf(c, trigger);
+  if (!target || target.value !== head) return false;
   boundDoc!.transact(() => {
-    map.set(`sum:${tableId}:${inc}`, head);
+    map.set(`sum:${tableId}:${inc}`, target.value);
     // (An end opens no session: compaction would only delete it again.)
-    const key = sessionKey(tableId, inc, last.sid);
-    if (last.cp.e !== 1 && !(map.get(key) instanceof Y.Map)) map.set(key, new Y.Map<unknown>());
+    const key = sessionKey(tableId, inc, target.sid);
+    if (!target.end && !(map.get(key) instanceof Y.Map)) map.set(key, new Y.Map<unknown>());
   });
   return true;
 }

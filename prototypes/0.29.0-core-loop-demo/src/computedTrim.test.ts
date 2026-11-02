@@ -255,7 +255,9 @@ describe('a trim', () => {
       for (const [i, p] of pages.entries()) {
         expect(viewOf(p, T)).toEqual(shown[i]);
         expect(p.table.readComputedBets(TABLE, 1, T)).toEqual({});
-        expect(p.table.computedRoundCheck(TABLE, T)).toEqual(checks[i]);
+        // 🏛️ Post-trim the check gains `covered` (§6.2 E): every page saw
+        // round 1 decided with the close the checkpoint keeps.
+        expect(p.table.computedRoundCheck(TABLE, T)).toEqual({ ...checks[i], covered: 'same' });
       }
     }
     // The show over: round 2 takes bets, unarmed; the wheel keeps its key.
