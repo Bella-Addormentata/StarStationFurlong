@@ -74,7 +74,10 @@ chia-sdk-utils = { version = "0.34", optional = true }
 # `zeroize` makes a `Mnemonic` wipe its word indices when dropped, and the
 # direct `zeroize` dep wipes the buffers the identity file passes through.
 bip39 = { version = "2.2.2", optional = true, features = ["zeroize"] }
-zeroize = { version = "1.5", optional = true }
+# Every build: the desktop app's channel (shell_channel.rs) wipes its line
+# and frame buffers. Already in every build's graph (chacha20poly1305 above
+# brings it), so nothing new is built.
+zeroize = "1.5"
 # Slice 4 (publish) + Slice 5 (resolve): spend construction and signing.
 chia-sdk-driver = { version = "0.34", optional = true }
 chia-sdk-types = { version = "0.34", optional = true }
@@ -134,6 +137,12 @@ url = { version = "2", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
+# 🖥️ Linux: the desktop app's channel makes the node not dumpable while it
+# is on (shell_channel.rs), so no other process can reopen its pipes through
+# /proc. Already in the lockfile through other crates.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The tests' mock full node builds a header block, whose BLS fields need the
 # crate the publish feature makes optional.
@@ -161,7 +170,7 @@ chia-read = [
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
-    "dep:bip39", "dep:zeroize", "dep:windows-sys",
+    "dep:bip39", "dep:windows-sys",
 ]
 # ⛓️ Chia mainnet for development builds only (stage 2 of the mainnet
 # transition): lets `SSF_CHIA_NETWORK=mainnet` select it (chia_network.rs).
