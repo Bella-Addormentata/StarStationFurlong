@@ -68,8 +68,6 @@ const NOT_PUBLISHED = notPublished('OFF — this node does not publish presence 
 const WALLET_NOT_ON = notPublished("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
 const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
 const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
-/** ⛓️ The node runs on Chia mainnet, where it makes no SSF wallet yet. */
-const GATED = notPublished('OFF: this node runs on Chia mainnet, where Star Station makes no SSF wallet yet.');
 /** On, with no listing reported yet: the publisher's first round runs about a
  *  minute after the wallet turns on, and a node that is not findable never
  *  reports one. */
@@ -87,7 +85,6 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
       case 'ready': return WALLET_NOT_ON;
       case 'off': return WALLET_HELD_OFF;
       case 'unbuilt': return READ_ONLY_BUILD;
-      case 'gated': return GATED;
       case 'on': return WALLET_ON_UNREPORTED;
       default: return NOT_PUBLISHED;
     }

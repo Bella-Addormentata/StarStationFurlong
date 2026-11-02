@@ -109,10 +109,12 @@ describe('phoneBookIndicator', () => {
 describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
   const fp = (over: Partial<LocalFingerprint>): LocalFingerprint => ({ ...BASE, chia_net: net, ...over });
 
-  it('says a gated node is off because it runs on Chia mainnet, with no icon', () => {
-    const gated = phoneBookIndicator(fp({ chia_wallet: { state: 'gated' } }));
-    expect(gated.visible).toBe(false);
-    expect(gated.row).toEqual({ value: 'OFF: this node runs on Chia mainnet, where Star Station makes no SSF wallet yet.', colour: 'rgba(224, 226, 238, 0.6)' });
+  it('reads the switch alike on either network: mainnet makes SSF wallets now', () => {
+    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'ready' } })).row.value).toBe("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
+    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'on' } })).row.value).toContain('the SSF wallet is on');
+    for (const state of ['unbuilt', 'off', 'ready', 'on'] as const) {
+      expect(phoneBookIndicator(fp({ chia_wallet: { state } })).row.value).not.toContain('mainnet');
+    }
   });
 
   it('reads a listing the same way on either network', () => {
