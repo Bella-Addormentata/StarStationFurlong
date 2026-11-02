@@ -1843,8 +1843,9 @@ async fn main() -> Result<()> {
     // posture money paths take (pins, pin-only, or two agreeing public peers).
     #[cfg(feature = "chia-read")]
     println!("⛓️ Chain lane: {}", chia_chain::describe());
-    // A pin on another network's port is refused at the handshake: one
-    // warning line for each, before the first chain request finds out.
+    // A pin on a port other than the network's may be a full node of
+    // another network, which the handshake refuses: one warning line for
+    // each, before the first chain request finds out.
     #[cfg(feature = "chia-read")]
     for line in chia_chain::pin_warnings() {
         eprintln!("{line}");

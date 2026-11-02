@@ -1999,13 +1999,16 @@ fn pin_port(pin: &str) -> PinPort {
     }
 }
 
-/// One startup warning for each pin that names a port other than `net`'s:
-/// a full node there is most likely on another network, and the handshake
-/// refuses it. A pin whose port cannot be read gets its own line, since it
-/// never connects. In pin-only mode with no pin left on the network's port,
-/// no other peer is dialed, so each line says that chain writes will fail. A
-/// pin without a port takes the network's and never warns. Pure, so a test
-/// can run it for both networks.
+/// One startup warning for each pin that names a port other than `net`'s.
+/// The port alone does not decide the network: the handshake and the
+/// genesis check do, so a pin forwarded to another port can still serve
+/// `net`, and the line says only that a full node of another network there
+/// is refused. A pin whose port cannot be read gets its own line, since it
+/// never connects. In pin-only mode with no pin on the network's port, no
+/// other peer is dialed: each line then says chain writes will fail when
+/// every pin's port is unreadable, and that they work only if a pin on
+/// another port serves `net` otherwise. A pin without a port takes the
+/// network's and never warns. Pure, so a test can run it for both networks.
 pub fn pin_port_warnings(pins: &[String], pin_only: bool, net: &Network) -> Vec<String> {
     let flagged: Vec<(&String, PinPort)> = pins
         .iter()
@@ -2017,18 +2020,24 @@ pub fn pin_port_warnings(pins: &[String], pin_only: bool, net: &Network) -> Vec<
         })
         .collect();
     let stranded = pin_only && !pins.is_empty() && flagged.len() == pins.len();
+    let unreachable = stranded && flagged.iter().all(|(_, port)| matches!(port, PinPort::Unreadable));
     flagged
         .into_iter()
         .map(|(pin, port)| {
             let mut line = match port {
                 PinPort::Port(port) => format!(
-                    "⛓️ Chain lane: the pin {pin} names port {port}, but {} full nodes listen on {}. A full node on another network is refused at the handshake.",
+                    "⛓️ Chain lane: the pin {pin} names port {port}, not {}'s port {}. If a full node of another network answers there, the handshake refuses it.",
                     net.id, net.port
                 ),
                 _ => format!("⛓️ Chain lane: the pin {pin} names a port this node cannot read, so it never connects."),
             };
-            if stranded {
-                line.push_str(" SSF_CHIA_PIN_ONLY dials no other peer and no pin is on that port, so chain writes will fail.");
+            if unreachable {
+                line.push_str(" SSF_CHIA_PIN_ONLY dials no other peer, so chain writes will fail.");
+            } else if stranded {
+                line.push_str(&format!(
+                    " SSF_CHIA_PIN_ONLY dials no other peer, so chain writes work only if a pin on another port serves {}.",
+                    net.id
+                ));
             }
             line
         })
@@ -5350,8 +5359,11 @@ mod tests {
     }
 
     /// Pins on another port than the network's get one warning line each,
-    /// on either network, and pin-only mode with no pin on the right port
-    /// says chain writes will fail. A pin without a port never warns.
+    /// on either network. The line never claims such a pin is on another
+    /// network, since a forwarded port can serve this one. Pin-only mode with
+    /// no pin on the right port says chain writes work only if one of them
+    /// serves the network, and says they will fail only when no pin's port
+    /// can be read. A pin without a port never warns.
     #[test]
     fn a_pin_on_another_networks_port_is_warned_about() {
         let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -5368,19 +5380,21 @@ mod tests {
             assert_eq!(
                 lines[0],
                 format!(
-                    "⛓️ Chain lane: the pin 203.0.113.5:{other} names port {other}, but {} full nodes listen on {right}. A full node on another network is refused at the handshake.",
+                    "⛓️ Chain lane: the pin 203.0.113.5:{other} names port {other}, not {}'s port {right}. If a full node of another network answers there, the handshake refuses it.",
                     net.id
                 )
             );
             assert!(lines[1].contains(&format!("the pin localhost:{other} names")), "{}", lines[1]);
-            assert!(lines.iter().all(|l| !l.contains("will fail")), "a pin on the right port is left: {lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "a pin on the right port is left: {lines:?}");
 
             let stranded = pins(&[&format!("203.0.113.5:{other}"), &format!("[2001:db8::1]:{other}")]);
             let lines = pin_port_warnings(&stranded, true, &net);
             assert_eq!(lines.len(), 2);
-            assert!(lines.iter().all(|l| l.ends_with("so chain writes will fail.")), "{lines:?}");
+            let only_if = format!(" SSF_CHIA_PIN_ONLY dials no other peer, so chain writes work only if a pin on another port serves {}.", net.id);
+            assert!(lines.iter().all(|l| l.ends_with(&only_if)), "a forwarded port may still serve this network: {lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("will fail")), "{lines:?}");
             let lines = pin_port_warnings(&stranded, false, &net);
-            assert!(lines.iter().all(|l| !l.contains("will fail")), "public peers still answer: {lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "public peers still answer: {lines:?}");
             assert!(lines.iter().chain(pin_port_warnings(&stranded, true, &net).iter()).all(|l| !l.contains('\u{2014}')));
         }
         // A port that cannot be read never connects, so it is warned about
@@ -5391,10 +5405,7 @@ mod tests {
                 assert_eq!(pin_port_warnings(&pins(&[bad]), false, &net), vec![unreadable(bad)], "{bad} on {}", net.id);
                 assert_eq!(
                     pin_port_warnings(&pins(&[bad]), true, &net),
-                    vec![format!(
-                        "{} SSF_CHIA_PIN_ONLY dials no other peer and no pin is on that port, so chain writes will fail.",
-                        unreadable(bad)
-                    )],
+                    vec![format!("{} SSF_CHIA_PIN_ONLY dials no other peer, so chain writes will fail.", unreadable(bad))],
                     "{bad} on {}",
                     net.id
                 );
@@ -5405,9 +5416,16 @@ mod tests {
             assert_eq!(lines.len(), 2, "{lines:?}");
             assert!(lines[0].starts_with(&unreadable("203.0.113.5:84444")), "{}", lines[0]);
             assert!(lines[1].contains(&format!("names port {other}")), "{}", lines[1]);
-            assert!(lines.iter().all(|l| l.ends_with("so chain writes will fail.")), "no pin is on the right port: {lines:?}");
+            assert!(
+                lines.iter().all(|l| l.ends_with(&format!("so chain writes work only if a pin on another port serves {}.", net.id))),
+                "the readable pin on another port may still serve this network: {lines:?}"
+            );
+            let all_bad = pins(&["203.0.113.5:84444", "host:58444x"]);
+            let lines = pin_port_warnings(&all_bad, true, &net);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines.iter().all(|l| l.ends_with("so chain writes will fail.")), "no pin can connect: {lines:?}");
             let lines = pin_port_warnings(&mixed, false, &net);
-            assert!(lines.iter().all(|l| !l.contains("will fail")), "{lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "{lines:?}");
             let with_good = pins(&["host:58444x", &format!("203.0.113.6:{}", net.port)]);
             assert_eq!(pin_port_warnings(&with_good, true, &net), vec![unreadable("host:58444x")], "a pin on the right port is left");
         }
