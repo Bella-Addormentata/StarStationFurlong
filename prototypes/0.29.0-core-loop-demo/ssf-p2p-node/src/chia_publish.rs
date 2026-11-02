@@ -2302,6 +2302,11 @@ pub async fn heartbeat_loop(
     let knocks_path = knocks_file.as_path();
     loop {
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
+        // ⛓️ Chia off on this computer (chia_strict.rs): no read or write
+        // this tick.
+        if crate::chia_strict::strict() {
+            continue;
+        }
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
         let addrs: Vec<String> = iroh_ep
             .addr()
@@ -3704,6 +3709,52 @@ mod tests {
         assert!(other.holds_spend(p.spend));
         other.release(&[p.spend]);
         assert!(!other.holds_spend(p.spend) && other.spend_of(&id).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_spend_parked_before_chia_was_turned_off_stays_parked_until_the_next_normal_start() {
+        // ⛓️ Design §6: with Chia off (SSF_NO_CHIA_LANE) no wallet loads, so
+        // no lease is restored, and the lane is closed: a lookup made against
+        // it is refused before any peer is asked, which keeps the coin parked
+        // and leaves the lease file as the last run wrote it. The next start
+        // without the switch restores the parking and the chain settles it.
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_peer_lane::{Lane, PeerLane, Trust};
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-chia-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let ours = Coin::new(Bytes32::new([6u8; 32]), Bytes32::new([2u8; 32]), 7);
+        let id = ours.coin_id();
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        // A normal run parks a spend and stops before it settles.
+        let before = WalletLease::new();
+        before.restore(&path);
+        before.park_with_bundle_at([(id, 900)], Some(&bundle), Instant::now()).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        // Chia off: the parking, asked about against the closed lane past
+        // every grace, stays as it was, on disk too.
+        let off = WalletLease::new();
+        off.restore(&path);
+        let later = Instant::now() + RECONCILE_GRACE * 3;
+        assert_eq!(off.due_at(later).len(), 1, "the spend is due a lookup, so the lane is asked");
+        let closed = PeerLane::new(std::sync::Arc::new(Lane::closed(crate::chia_peer::Network::testnet11())), Trust::Agreed);
+        off.reconcile_at(&closed, later).await;
+        assert!(off.is_parked(&id) && off.outgoing_pending(), "still parked: a refused lookup decides nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), written, "the lease file is as the last normal run left it");
+        // The next normal start: restored, the chain lists the input spent.
+        let next = WalletLease::new();
+        next.restore(&path);
+        assert!(next.is_parked(&id));
+        let spent = Scripted::new(vec![CoinListing {
+            records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: true, spent_block_index: 1000 }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(1001),
+        }]);
+        next.reconcile_at(&spent, Instant::now() + RECONCILE_GRACE * 3).await;
+        assert!(!next.is_parked(&id) && next.is_settling(&id), "settled by the chain's word");
         let _ = std::fs::remove_file(&path);
     }
 

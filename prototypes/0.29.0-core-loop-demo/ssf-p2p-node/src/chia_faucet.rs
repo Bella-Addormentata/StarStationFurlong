@@ -437,6 +437,9 @@ impl FaucetReply {
 /// dish's words while no wallet is on), and the network the node runs on.
 pub struct FaucetContext<'a> {
     pub net: ChiaNet,
+    /// ⛓️ Chia is off on this computer (chia_strict.rs): every request is
+    /// answered off before a chain client is built.
+    pub chia_off: bool,
     pub rooms: &'a Mutex<HashMap<String, ChiaRoomCap>>,
     #[cfg(feature = "chia-publish")]
     pub wallet: Option<chia_bls::SecretKey>,
@@ -455,6 +458,9 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
         Ok(r) => r,
         Err(e) => return FaucetReply::fail("?", format!("malformed faucet request: {e}")),
     };
+    if ctx.chia_off {
+        return FaucetReply::fail(&req.op, crate::chia_strict::OFF_WORDS);
+    }
     let room_key = ctx.rooms.lock().unwrap().get(room).map(|cap| cap.room_key);
     let Some(room_key) = room_key else {
         return FaucetReply::fail(
@@ -1425,6 +1431,7 @@ mod tests {
         let ctx = FaucetContext {
             net: T11,
             rooms: &rooms,
+            chia_off: false,
             #[cfg(feature = "chia-publish")]
             wallet: None,
             #[cfg(feature = "chia-publish")]
@@ -1437,6 +1444,49 @@ mod tests {
         assert!(!reply.ok && reply.error.as_deref().unwrap_or("").contains("no key for this room"));
         let reply = rt.block_on(handle_request(&ctx, "home-abc", b"not json"));
         assert!(!reply.ok && reply.op == "?");
+    }
+
+    /// ⛓️ Chia off on this computer (chia_strict.rs): every op is answered
+    /// off on either network, with the room's key held and a wallet on,
+    /// before a chain client is built (the count of clients this thread built
+    /// stays where it was).
+    #[test]
+    fn chia_off_answers_the_dish_before_a_chain_client_is_built() {
+        use crate::chia_chain::CLIENTS_BUILT;
+        let cap = ChiaRoomCap {
+            room_key: [3; 32],
+            chia_mode: true,
+            share_card: true,
+            public_room: Some(false),
+            seq: 0,
+            restored: false,
+            pass_private: false,
+            prefetch: false,
+        };
+        let rooms = Mutex::new(HashMap::from([("home-abc".to_string(), cap)]));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for net in ChiaNet::ALL {
+            let ctx = FaucetContext {
+                net,
+                chia_off: true,
+                rooms: &rooms,
+                #[cfg(feature = "chia-publish")]
+                wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
+                #[cfg(feature = "chia-publish")]
+                env: crate::chia_wallet_switch::EnvSwitch::On,
+                #[cfg(feature = "chia-publish")]
+                turnable: true,
+            };
+            let built = CLIENTS_BUILT.with(|n| n.get());
+            for (payload, op) in [(&br#"{"op":"status"}"#[..], "status"), (br#"{"op":"claim"}"#, "claim"), (br#"{"op":"give","amount":5}"#, "give")] {
+                let reply = rt.block_on(handle_request(&ctx, "home-abc", payload));
+                assert!(!reply.ok, "{net:?} {op}");
+                assert_eq!(reply.op, op);
+                assert_eq!(reply.error.as_deref(), Some(crate::chia_strict::OFF_WORDS), "{net:?} {op}");
+                assert!(reply.status.is_none() && reply.spent_coin.is_none() && reply.after_snapshot.is_none() && reply.unanswered.is_none());
+            }
+            assert_eq!(CLIENTS_BUILT.with(|n| n.get()), built, "{net:?}: no chain client was built");
+        }
     }
 
     #[cfg(feature = "chia-publish")]
@@ -1533,6 +1583,7 @@ mod tests {
         let ctx = FaucetContext {
             net: ChiaNet::Mainnet,
             rooms: &rooms,
+            chia_off: false,
             #[cfg(feature = "chia-publish")]
             wallet: None,
             #[cfg(feature = "chia-publish")]
@@ -1598,6 +1649,7 @@ mod tests {
         let ctx = FaucetContext {
             net: ChiaNet::Mainnet,
             rooms: &rooms,
+            chia_off: false,
             wallet: Some(sk),
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             turnable: true,
@@ -1626,6 +1678,7 @@ mod tests {
         let ctx = FaucetContext {
             net: ChiaNet::Mainnet,
             rooms: &rooms,
+            chia_off: false,
             #[cfg(feature = "chia-publish")]
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
             #[cfg(feature = "chia-publish")]
@@ -1639,6 +1692,7 @@ mod tests {
         let none = FaucetContext {
             net: ChiaNet::Mainnet,
             rooms: &rooms,
+            chia_off: false,
             #[cfg(feature = "chia-publish")]
             wallet: None,
             #[cfg(feature = "chia-publish")]
@@ -1653,6 +1707,7 @@ mod tests {
         let ctx = FaucetContext {
             net: T11,
             rooms: &rooms,
+            chia_off: false,
             #[cfg(feature = "chia-publish")]
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
             #[cfg(feature = "chia-publish")]

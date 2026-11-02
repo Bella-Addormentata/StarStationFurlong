@@ -322,6 +322,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     );
     loop {
         tokio::time::sleep(Duration::from_secs(WATCH_TICK_SECS)).await;
+        // ⛓️ Chia off on this computer (chia_strict.rs): no read this tick.
+        if crate::chia_strict::strict() {
+            continue;
+        }
 
         // Rooms we may read: every cap that is not public space (N8/D6).
         let readable: Vec<(String, [u8; 32])> = hub

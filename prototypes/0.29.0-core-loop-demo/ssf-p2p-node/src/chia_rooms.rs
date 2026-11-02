@@ -353,15 +353,7 @@ pub fn ingest_room_cap(
         changed
     };
     if changed {
-        let posture = if cap.public_room == Some(true) {
-            "public space — N8: never published or read under this key"
-        } else if cap.posture_unknown() {
-            "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
-        } else if cap.chia_mode {
-            "armed — reads on, presence publishes while the SSF wallet is on"
-        } else {
-            "reads on, publishing off"
-        };
+        let posture = posture_words(&cap, crate::chia_strict::strict());
         println!(
             "⛓️ ChiaHub lane: room {room} key received · {posture}{} · epoch hint {}",
             if cap.share_card { "" } else { " · card sharing off for this room" },
@@ -369,6 +361,33 @@ pub fn ingest_room_cap(
         );
     }
     Some(cap)
+}
+
+/// What the log says a room key received is used for. While Chia is off on
+/// this computer (`chia_off`, chia_strict.rs) nothing is read or published,
+/// whatever the cap says.
+fn posture_words(cap: &ChiaRoomCap, chia_off: bool) -> &'static str {
+    if chia_off {
+        "Chia is off on this computer — never read or published under this key"
+    } else if cap.public_room == Some(true) {
+        "public space — N8: never published or read under this key"
+    } else if cap.posture_unknown() {
+        "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
+    } else if cap.chia_mode {
+        "armed — reads on, presence publishes while the SSF wallet is on"
+    } else {
+        "reads on, publishing off"
+    }
+}
+
+/// What the startup line says the caps restored from disk are for. While
+/// Chia is off on this computer (`chia_off`) they are kept but never read.
+pub fn restored_caps_words(chia_off: bool) -> &'static str {
+    if chia_off {
+        "restored, never read (Chia is off on this computer; cards wait for a live cap)"
+    } else {
+        "restored for reading (publishing and cards wait for a live cap)"
+    }
 }
 
 /// May this node hand its contact card to the peers it is connected to in
@@ -562,6 +581,39 @@ mod tests {
         assert_eq!(cap.public_room, Some(true));
         assert!(!cap.may_publish(), "N8: armed but public — never publish");
         assert!(!cap.may_read(), "D6: nothing lives under a public room's hint");
+    }
+
+    /// ⛓️ While Chia is off on this computer (`SSF_NO_CHIA_LANE`) the log
+    /// never says a room key turns reads on, whatever the cap says; with
+    /// Chia on, the words are as before.
+    #[test]
+    fn while_chia_is_off_a_room_key_is_never_logged_as_read() {
+        let key = [7u8; 32];
+        let caps = [
+            ",\"chiaMode\":true,\"publicRoom\":false",
+            ",\"chiaMode\":false,\"publicRoom\":false",
+            ",\"chiaMode\":true",
+            ",\"chiaMode\":true,\"publicRoom\":true",
+        ]
+        .map(|extra| parse_room_cap(&payload(key, extra)).unwrap());
+        for cap in &caps {
+            let off = posture_words(cap, true);
+            assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
+            assert!(!off.contains("reads on"), "{off}");
+        }
+        let on: Vec<&str> = caps.iter().map(|cap| posture_words(cap, false)).collect();
+        assert_eq!(
+            on,
+            [
+                "armed — reads on, presence publishes while the SSF wallet is on",
+                "reads on, publishing off",
+                "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private",
+                "public space — N8: never published or read under this key",
+            ]
+        );
+        let restored = restored_caps_words(true);
+        assert!(restored.contains(crate::chia_strict::OFF_WORDS) && !restored.contains("for reading"), "{restored}");
+        assert_eq!(restored_caps_words(false), "restored for reading (publishing and cards wait for a live cap)");
     }
 
     #[test]

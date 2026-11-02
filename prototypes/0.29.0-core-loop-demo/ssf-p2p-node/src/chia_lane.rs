@@ -146,8 +146,9 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// switch or `SSF_CHIA_LANE=1` turned it on, chia_wallet_switch.rs) and a
 /// build with the `chia-publish` feature. Off a test network (`net`), with no
 /// live desktop app channel, it says that only the desktop app makes a new
-/// wallet there.
-pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
+/// wallet there. While Chia is off (`strict`, chia_strict.rs) both are off,
+/// and the line says why.
+pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool, strict: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -171,6 +172,8 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
         .unwrap_or(false);
     let reads = if !cfg!(feature = "chia-read") {
         "not built"
+    } else if strict {
+        STRICT_STATUS
     } else if std::env::var("SSF_CHIA_WATCH").ok().as_deref() == Some("0") {
         "rung-6 only (watcher off: SSF_CHIA_WATCH=0)"
     } else {
@@ -180,12 +183,19 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
     // goes live once its thread has answered the app), so off a test
     // network a load here mints nothing and the line says who makes one.
     let mints = crate::chia_wallet_switch::may_mint(net.is_test(), false);
-    let publish = publish_status(cfg!(feature = "chia-publish"), wallet_on, mints, crate::chia_wallet_switch::env_switch());
+    let publish = if strict && cfg!(feature = "chia-publish") {
+        STRICT_STATUS
+    } else {
+        publish_status(cfg!(feature = "chia-publish"), wallet_on, mints, crate::chia_wallet_switch::env_switch())
+    };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
         if ok { "PASSED" } else { "FAILED" },
     );
 }
+
+/// The startup line's word on reads and on publishing while Chia is off.
+const STRICT_STATUS: &str = "off (Chia is off on this computer: SSF_NO_CHIA_LANE)";
 
 /// The startup line's word on publishing: whether this build can, whether
 /// the SSF wallet loaded, and what holds it off. `mints` is whether a load

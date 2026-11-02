@@ -15,6 +15,9 @@
 //! off, and the Bank cannot override that (`SSF_CHIA_LANE=0` is the
 //! operator's hard off switch); unset or empty leaves it to the Bank's switch.
 //! A node built without `chia-publish` holds no wallet whatever is set.
+//! `SSF_NO_CHIA_LANE` (chia_strict.rs: Chia off on this computer) wins over
+//! all of it: the wallet does not load, even with `SSF_CHIA_LANE=1`, and the
+//! Bank's TURN ON is refused ([`STRICT_WORDS`]).
 //!
 //! On is hot: the node loads the wallet, restores its lease and starts the
 //! publisher without a restart. Off is cold: it is remembered and takes effect
@@ -134,10 +137,12 @@ pub fn env_switch() -> EnvSwitch {
     *ENV.get_or_init(|| env_switch_of(std::env::var_os("SSF_CHIA_LANE").as_deref()))
 }
 
-/// Whether the wallet loads when the node starts: the environment first,
-/// then the switch the Bank remembered.
-pub fn starts_on(built: bool, env: EnvSwitch, remembered: bool) -> bool {
+/// Whether the wallet loads when the node starts: never while Chia is off
+/// (`strict`, chia_strict.rs), then the environment, then the switch the
+/// Bank remembered.
+pub fn starts_on(built: bool, strict: bool, env: EnvSwitch, remembered: bool) -> bool {
     built
+        && !strict
         && match env {
             EnvSwitch::On => true,
             EnvSwitch::Off => false,
@@ -153,13 +158,22 @@ pub const OFF_WORDS: &str =
 /// `SSF_CHIA_LANE=1` holds the wallet on.
 pub const HELD_WORDS: &str =
     "SSF_CHIA_LANE=1 in the node's environment holds the SSF wallet on; start the node without it to let the Bank turn it off";
+/// `SSF_NO_CHIA_LANE` holds Chia off on this computer, the wallet with it.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub const STRICT_WORDS: &str =
+    "Chia is off on this computer (SSF_NO_CHIA_LANE in the node's environment), so the Bank cannot turn the SSF wallet on";
 
 /// Why a turn the Bank asked for is refused, or `None` when it may go ahead.
 /// Turning off while the environment holds it off only clears the switch,
 /// and turning on while it is held on only remembers it: both are allowed.
-pub fn turn_refusal(built: bool, env: EnvSwitch, on: bool) -> Option<&'static str> {
+/// While Chia is off (`strict`) turning on is refused whatever
+/// `SSF_CHIA_LANE` says, and turning off only clears the switch.
+pub fn turn_refusal(built: bool, strict: bool, env: EnvSwitch, on: bool) -> Option<&'static str> {
     if !built {
         return Some(UNBUILT_WORDS);
+    }
+    if strict {
+        return on.then_some(STRICT_WORDS);
     }
     match (env, on) {
         (EnvSwitch::Off, true) => Some(OFF_WORDS),
@@ -986,24 +1000,43 @@ mod tests {
     #[test]
     fn the_wallet_starts_with_the_node_when_the_environment_or_the_switch_says_so() {
         use EnvSwitch::*;
-        assert!(starts_on(true, On, false), "SSF_CHIA_LANE=1 needs no switch");
-        assert!(starts_on(true, Unset, true), "the Bank's switch, remembered");
-        assert!(!starts_on(true, Unset, false), "never turned on");
-        assert!(!starts_on(true, Off, true), "SSF_CHIA_LANE=0 overrides the switch");
-        assert!(!starts_on(false, On, true), "a read-only build never loads a wallet");
+        assert!(starts_on(true, false, On, false), "SSF_CHIA_LANE=1 needs no switch");
+        assert!(starts_on(true, false, Unset, true), "the Bank's switch, remembered");
+        assert!(!starts_on(true, false, Unset, false), "never turned on");
+        assert!(!starts_on(true, false, Off, true), "SSF_CHIA_LANE=0 overrides the switch");
+        assert!(!starts_on(false, false, On, true), "a read-only build never loads a wallet");
     }
 
     #[test]
     fn a_turn_is_refused_only_against_the_build_or_the_environment() {
         use EnvSwitch::*;
-        assert_eq!(turn_refusal(true, Unset, true), None);
-        assert_eq!(turn_refusal(true, Unset, false), None);
-        assert_eq!(turn_refusal(true, Off, true), Some(OFF_WORDS));
-        assert_eq!(turn_refusal(true, Off, false), None, "clearing the switch under a hard off is harmless");
-        assert_eq!(turn_refusal(true, On, true), None, "remembering while held on is harmless");
-        assert_eq!(turn_refusal(true, On, false), Some(HELD_WORDS));
-        assert_eq!(turn_refusal(false, Unset, true), Some(UNBUILT_WORDS));
-        assert_eq!(turn_refusal(false, Unset, false), Some(UNBUILT_WORDS));
+        assert_eq!(turn_refusal(true, false, Unset, true), None);
+        assert_eq!(turn_refusal(true, false, Unset, false), None);
+        assert_eq!(turn_refusal(true, false, Off, true), Some(OFF_WORDS));
+        assert_eq!(turn_refusal(true, false, Off, false), None, "clearing the switch under a hard off is harmless");
+        assert_eq!(turn_refusal(true, false, On, true), None, "remembering while held on is harmless");
+        assert_eq!(turn_refusal(true, false, On, false), Some(HELD_WORDS));
+        assert_eq!(turn_refusal(false, false, Unset, true), Some(UNBUILT_WORDS));
+        assert_eq!(turn_refusal(false, false, Unset, false), Some(UNBUILT_WORDS));
+    }
+
+    /// ⛓️ Chia off (`SSF_NO_CHIA_LANE`, chia_strict.rs) wins over every other
+    /// switch: the wallet never starts, not with `SSF_CHIA_LANE=1` nor a
+    /// remembered switch, and the Bank's TURN ON is refused with its own
+    /// words. Turning off only clears the switch, as under a hard off.
+    #[test]
+    fn chia_off_keeps_the_wallet_off_whatever_else_is_set() {
+        use EnvSwitch::*;
+        for env in [Unset, On, Off] {
+            for remembered in [false, true] {
+                assert!(!starts_on(true, true, env, remembered), "{env:?}, remembered {remembered}");
+            }
+            assert_eq!(turn_refusal(true, true, env, true), Some(STRICT_WORDS), "{env:?}");
+            assert_eq!(turn_refusal(true, true, env, false), None, "{env:?}: clearing the switch is harmless");
+            assert_eq!(turn_refusal(false, true, env, true), Some(UNBUILT_WORDS), "a read-only build says only that");
+        }
+        assert!(STRICT_WORDS.starts_with(crate::chia_strict::OFF_WORDS));
+        assert!(STRICT_WORDS.contains("SSF_NO_CHIA_LANE"));
     }
 
     #[test]
@@ -1680,12 +1713,12 @@ mod tests {
     fn mainnet_starts_turns_and_reads_the_wallet_as_testnet11_does() {
         use crate::chia_network::ChiaNet;
         use EnvSwitch::*;
-        assert!(starts_on(true, On, false), "SSF_CHIA_LANE=1 starts it on any network");
-        assert!(starts_on(true, Unset, true), "and so does a remembered switch");
-        assert!(!starts_on(true, Off, true));
+        assert!(starts_on(true, false, On, false), "SSF_CHIA_LANE=1 starts it on any network");
+        assert!(starts_on(true, false, Unset, true), "and so does a remembered switch");
+        assert!(!starts_on(true, false, Off, true));
         for env in [Unset, On, Off] {
-            assert_eq!(turn_refusal(true, env, true), (env == Off).then_some(OFF_WORDS), "{env:?}");
-            assert_eq!(turn_refusal(false, env, true), Some(UNBUILT_WORDS), "{env:?}");
+            assert_eq!(turn_refusal(true, false, env, true), (env == Off).then_some(OFF_WORDS), "{env:?}");
+            assert_eq!(turn_refusal(false, false, env, true), Some(UNBUILT_WORDS), "{env:?}");
         }
         let memo = SwitchMemo { remembered: true, error: None };
         let on_disk = KeyFacts { identity_on_disk: true, ..KeyFacts::default() };

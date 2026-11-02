@@ -44,6 +44,9 @@ mod shell_channel;
 // ⛓️ The Chia network this node runs on (testnet11 by default): read once,
 // and handed to everything that differs between networks.
 mod chia_network;
+// ⛓️ Strict SSF_NO_CHIA_LANE: Chia off on this computer, read once. The
+// lane is built closed, and no Chia task or wallet starts.
+mod chia_strict;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
 mod blob_lane;
@@ -367,6 +370,12 @@ pub struct Fingerprint {
     /// address: it never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_network: Option<chia_network::NetworkView>,
+    /// ⛓️ Whether Chia is off on this computer (chia_strict.rs): `off`, and
+    /// while it is, what turned it off (`source`: `env` for
+    /// `SSF_NO_CHIA_LANE`). Read live per request, in every build; absent
+    /// only from an older node. Loopback only, like the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chia_lane: Option<chia_strict::LaneView>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
     /// `/blob` and `/api/blob/` route asks for it beside an allowed Origin.
     /// Only a page whose origin the API grants can read the answer, and it
@@ -946,6 +955,7 @@ pub fn compute_fingerprint(
         chia_network: Some(chia_network::view()),
         #[cfg(not(feature = "chia-read"))]
         chia_network: None,
+        chia_lane: None,
         blob_cap: None,
         torrent: false,
         house: None,
@@ -1018,6 +1028,7 @@ mod fingerprint_json_tests {
             chia_presence: None,
             chia_wallet: None,
             chia_network: None,
+            chia_lane: None,
             blob_cap: None,
             torrent: false,
             house: None,
@@ -1039,6 +1050,27 @@ mod fingerprint_json_tests {
         assert_eq!(back.chia_address, None);
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_address.as_deref(), Some("txch1qq"));
+    }
+
+    /// ⛓️ The page learns from the fingerprint whether Chia is off on this
+    /// computer, and why; an answer from an older node, without the field,
+    /// parses back with none.
+    #[test]
+    fn the_fingerprint_says_whether_chia_is_off_and_why() {
+        use crate::chia_strict::{off_source_of, view_of};
+        let mut off = fp();
+        off.chia_lane = Some(view_of(off_source_of(true)));
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains(r#""chia_lane":{"off":true,"source":"env"}"#), "{json}");
+        let mut on = fp();
+        on.chia_lane = Some(view_of(off_source_of(false)));
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains(r#""chia_lane":{"off":false}"#), "{json}");
+        let older = serde_json::to_string(&fp()).unwrap();
+        assert!(!older.contains("chia_lane"), "{older}");
+        assert_eq!(serde_json::from_str::<Fingerprint>(&older).unwrap().chia_lane, None);
+        let back: Fingerprint = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(back.chia_lane, off.chia_lane);
     }
 
     /// 🏦 The SSF wallet switch rides with the 24-word flags the Bank reads
@@ -1890,6 +1922,10 @@ async fn main() -> Result<()> {
     // while the desktop app's channel is live (`load_wallet`), which it
     // never is at this startup load: there a new wallet waits for the
     // Bank's CREATE, and one already on disk loads.
+    // ⛓️ Strict `SSF_NO_CHIA_LANE` (chia_strict.rs), Chia off on this
+    // computer, wins over all of it, read once: the lane is built closed and
+    // no Chia task, wallet or test hook starts (`chia_plan` below).
+    let chia_off = chia_strict::strict();
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
@@ -1901,8 +1937,26 @@ async fn main() -> Result<()> {
                 wallet_memo.error = Some(why);
             }
         }
-        chia_wallet_switch::starts_on(true, chia_wallet_switch::env_switch(), wallet_memo.remembered)
+        chia_wallet_switch::starts_on(true, chia_off, chia_wallet_switch::env_switch(), wallet_memo.remembered)
     };
+    #[cfg(feature = "chia-publish")]
+    if let Some(line) = chia_strict::wins_line(chia_off, chia_wallet_switch::env_switch() == chia_wallet_switch::EnvSwitch::On) {
+        println!("{line}");
+    }
+    // The Chia tasks this start runs: what the switches ask for, or none at
+    // all while Chia is off.
+    #[cfg(feature = "chia-read")]
+    let chia_plan = chia_strict::task_plan(
+        chia_off,
+        chia_strict::TaskPlan {
+            watcher: chia_watch::watch_enabled(),
+            #[cfg(feature = "chia-publish")]
+            wallet: wallet_starts,
+            #[cfg(not(feature = "chia-publish"))]
+            wallet: false,
+            resolve_hook: std::env::var("SSF_CHIA_RESOLVE_TEST").ok().as_deref() == Some("1"),
+        },
+    );
     // S‑0 step 2: which full-node peers the chain lane will use, and the trust
     // posture money paths take (pins, pin-only, or two agreeing public peers).
     #[cfg(feature = "chia-read")]
@@ -1958,7 +2012,7 @@ async fn main() -> Result<()> {
         Err(why) => eprintln!("🏦 SSF wallet: {why}"),
     }
     #[cfg(feature = "chia-publish")]
-    if wallet_starts {
+    if chia_plan.wallet {
         match load_wallet() {
             Ok((id, meta)) => {
                 let chia_sk = id.wallet.clone();
@@ -2043,14 +2097,15 @@ async fn main() -> Result<()> {
     let wallet_loaded = chia_heartbeat_sk.is_some();
     #[cfg(not(feature = "chia-publish"))]
     let wallet_loaded = false;
-    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded);
+    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded, chia_off);
 
     // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
     // testnet11 under the same fixed test room key the publish hook uses, and log
     // the recovered node_id + addrs — the READ side of mesh introduction. Read-only
-    // (no wallet needed); spawned so it never blocks startup.
+    // (no wallet needed); spawned so it never blocks startup. Never while
+    // Chia is off (`chia_plan`).
     #[cfg(feature = "chia-read")]
-    if std::env::var("SSF_CHIA_RESOLVE_TEST").ok().as_deref() == Some("1") {
+    if chia_plan.resolve_hook {
         let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
         tokio::spawn(async move {
             match chia_resolve::resolve_by_room_key(&test_room_key).await {
@@ -2117,9 +2172,10 @@ async fn main() -> Result<()> {
         let book = chia_contact::PeerBook::load(std::path::Path::new(chia_contact::PEERS_FILE));
         let caps: HashMap<String, chia_rooms::ChiaRoomCap> = chia_rooms::load_persisted_caps().into_iter().collect();
         println!(
-            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) restored for reading (publishing and cards wait for a live cap) · cards {}",
+            "⛓️ ChiaHub contact: key ready · {} peer card(s) in the address book · {} room cap(s) {} · cards {}",
             book.peers.len(),
             caps.len(),
+            chia_rooms::restored_caps_words(chia_off),
             if !durable {
                 "not shared (no durable contact key)"
             } else if chia_contact::share_card_enabled() {
@@ -2324,9 +2380,9 @@ async fn main() -> Result<()> {
     // ⛓️ #231 P1: the WATCHER — beat-aligned reads of every readable room's hints
     // and hold-dials toward the members they describe (the symmetric trigger:
     // the host dials the joiner back). On by default (D3: reads are free);
-    // SSF_CHIA_WATCH=0 turns it off.
+    // SSF_CHIA_WATCH=0 turns it off, and so does Chia off (`chia_plan`).
     #[cfg(feature = "chia-read")]
-    if chia_watch::watch_enabled() {
+    if chia_plan.watcher {
         let hub_w = hub.clone();
         let iroh_w = iroh_endpoint.clone();
         tokio::spawn(async move {
@@ -2665,6 +2721,7 @@ async fn handle_wt_connection_inner(
                                 let reply = if chia_rooms::cap_source_is_local(&remote_addr_inner) {
                                     let ctx = chia_faucet::FaucetContext {
                                         net: chia_network::net(),
+                                        chia_off: chia_strict::strict(),
                                         rooms: &hub_clone.chia_rooms,
                                         #[cfg(feature = "chia-publish")]
                                         wallet: hub_clone.chia_wallet.lock().unwrap().clone(),
@@ -3255,6 +3312,15 @@ async fn dial_peer_inner(
     // side's own hold (its watcher sees us a beat later) finds our pinhole warm.
     // The resolve is a ~19s block query, so it runs OFF the `rooms` lock and only
     // after the fast ladder gave up — the chain is an address book, never a pipe.
+    // ⛓️ While Chia is off on this computer (chia_strict.rs) rung 6 returns at
+    // once: no resolve, no knock, no beacon, the dial ending as it would in a
+    // build without the chain.
+    #[cfg(feature = "chia-read")]
+    if chia_strict::strict() {
+        println!("⛓️ ChiaHub rung-6: {target_str} unreachable by every direct path. Chia is off on this computer, so the chain is not asked.");
+        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some(&format!("no route after {} attempts", MAX_DIAL_ATTEMPTS))).await;
+        return;
+    }
     #[cfg(feature = "chia-read")]
     {
         // #231 P6a, FIRST: the target's PER-NODE presence, when its contact card
@@ -3461,9 +3527,13 @@ static BEACON_READ_AT: std::sync::LazyLock<Mutex<HashMap<String, std::time::Inst
 /// single-flight claim, as unvetted members of `room_id` (the welcome room,
 /// which every beacon serves: [`chia_publish::serves_welcome_room`]). Their
 /// addresses come from the DHT (the shipped posture for a bare node id); a
-/// beacon carries none.
+/// beacon carries none. Nothing at all while Chia is off on this computer
+/// (chia_strict.rs).
 #[cfg(feature = "chia-read")]
 async fn beacon_fallback(hub: &SharedHub, iroh_ep: &IrohEndpoint, room_id: &str, dial_tier: u8) {
+    if chia_strict::strict() {
+        return;
+    }
     {
         let mut last = BEACON_READ_AT.lock().unwrap();
         if last.get(room_id).is_some_and(|t| t.elapsed() < chia_watch::TARGET_COOLDOWN) {
@@ -6208,7 +6278,7 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
 async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) -> Result<(), String> {
     let net = chia_network::net();
     let env = chia_wallet_switch::env_switch();
-    if let Some(why) = chia_wallet_switch::turn_refusal(true, env, on) {
+    if let Some(why) = chia_wallet_switch::turn_refusal(true, chia_strict::strict(), env, on) {
         return Err(why.to_string());
     }
     let _turn = hub.wallet_turn.lock().await;
@@ -6605,6 +6675,8 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     // is the one place the browser learns where its node is
                     // paid (never a pass, never a card).
                     // (Set with the switch's view above, from the same read.)
+                    // ⛓️ Whether Chia is off on this computer, live too.
+                    fp.chia_lane = Some(chia_strict::view());
                     #[cfg(feature = "chia-publish")]
                     {
                         // 📖 And the Phone Book listing state the publisher
