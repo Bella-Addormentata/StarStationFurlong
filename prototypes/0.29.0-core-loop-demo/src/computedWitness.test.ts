@@ -498,7 +498,11 @@ describe('a witness', () => {
       sync(t, ...pages);
     }
     expect(writes).toBe(0);
-    for (const p of pages) for (const kind of ['s', 'c', 'x']) expect(keysIn(p, kind, 1)).toEqual([]);
+    // Its slips and closes go with the trim; the round-u reveals ride as copies (§6.1 b).
+    for (const p of pages) {
+      for (const kind of ['s', 'c']) expect(keysIn(p, kind, 1)).toEqual([]);
+      expect(keysIn(p, 'x', 1)).toHaveLength(2);
+    }
   });
 
   it('writes nothing on a doc holding part of an update; once whole, in its turn from then', async () => {

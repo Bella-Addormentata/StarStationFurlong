@@ -436,3 +436,65 @@ describe('the getters', () => {
     expect(o.table.computedRoundCheck('roulette-2', T0)).toBeNull();
   });
 });
+
+describe('🔁 the round-u view (the L7 fix)', () => {
+  /** The lowest pocket 0..36 not among `taken`. */
+  const free = (...taken: number[]): number => {
+    for (let p = 0; p <= 36; p++) if (!taken.includes(p)) return p;
+    throw new Error('no free pocket');
+  };
+
+  it('shows the trimmer’s forfeit pocket, not the reveals this page saw, when the trim carried the forfeit; the round still counts', async () => {
+    const o = await watch();
+    const pA = pocketFor(1, X, Y); // every reveal in — what this page saw
+    const pF = pocketFor(1, X); // the forfeit counts X only — what the trimmer saw
+    expect(pA).not.toBe(pF);
+    const pickX = free(pA, pF);
+    const pickY = free(pA, pF, pickX);
+    const xs = kit.slip(X, 1, [straight(pickX, 5)]);
+    const ys = kit.slip(Y, 1, [straight(pickY, 5)]);
+    putAt(o, T0, xs, ys);
+    putAt(o, T0 + 18_000, kit.close(X, 1, foldOf(o).parent, [xs, ys]), kit.reveal(1, X.pid), kit.reveal(1, Y.pid));
+    expect(view(o, T0 + 19_000)).toMatchObject({ phase: 'settled', round: 1, result: pA });
+    const close = foldOf(o).rounds[0].close;
+    // A stranger trims, deciding round 1 by a forfeit O never saw. Both bets
+    // lose on either pocket, so the forfeit's nets equal the reveals' — the old
+    // silent L7. The trim (now a v0.51 one, trimByHand) copies O's reveals; the
+    // forfeit copy arrives in the new session the way a real trim carries it.
+    vi.setSystemTime(T0 + 19_000);
+    trimByHand(o, G);
+    putAt(o, T0 + 19_500, kit.forfeit(X, 1, close, [X.pid]));
+    const v = view(o, T0 + 20_000);
+    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pF, unseen: 'forfeit' });
+    expect(v.result).not.toBe(pA);
+    // The round still counts as decided at u (C6): not UNDONE.
+    expect(o.table.computedDecidedTo(TABLE)).toBe(1);
+  });
+
+  it('the reverse case: this page saw a forfeit, the trim decided reveals — the felt shows the reveals it didn’t see', async () => {
+    const o = await watch();
+    const pA = pocketFor(1, X, Y); // the trimmer, every reveal in
+    const pF = pocketFor(1, X); // this page's forfeit, counting X only
+    expect(pA).not.toBe(pF);
+    const xs = kit.slip(X, 1, [straight(pA, 5)]); // wins on the reveals' pocket, loses on the forfeit's
+    const ys = kit.slip(Y, 1, [straight(free(pA, pF), 5)]);
+    putAt(o, T0, xs, ys);
+    // O is missing Y's reveal, so it decides round 1 by X's forfeit.
+    const closeRec = kit.close(X, 1, foldOf(o).parent, [xs, ys]);
+    putAt(o, T0 + 18_000, closeRec, kit.reveal(1, X.pid), kit.forfeit(X, 1, closeRec.hash, [X.pid]));
+    // O folded round 1 as a forfeit; read the felt (closing through the grace,
+    // then settled) so the page notes its own forfeit verdict before the trim.
+    expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'forfeit', pocket: pF });
+    expect(view(o, T0 + 29_000)).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    // The trimmer saw every reveal; its checkpoint carries the reveals' nets and
+    // copies the reveals. (trimByHand copies O's forfeit; we add Y's reveal and
+    // override the nets to the reveals', so only the reveals reproduce.)
+    const revealsNets = { [X.pid]: 5n * 35n, [Y.pid]: -5n };
+    vi.setSystemTime(T0 + 30_000);
+    trimByHand(o, G, revealsNets);
+    putAt(o, T0 + 30_500, kit.reveal(1, Y.pid));
+    const v = view(o, T0 + 31_000);
+    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pA, unseen: 'reveals' });
+    expect(o.table.computedDecidedTo(TABLE)).toBe(1);
+  });
+});

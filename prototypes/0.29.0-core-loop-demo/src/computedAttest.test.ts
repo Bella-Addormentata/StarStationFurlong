@@ -95,11 +95,38 @@ describe('🏛️🧮 D2 — the deed holder vouches for its trims', () => {
     expect(hs).not.toBeNull();
     expect(hs!.k).toBe(a.pub);
     expect(hs!.a).toBe(0); // the first trim folds from the base 'g' (u = 0)
-    expect(hs!.d).toBeUndefined(); // a friendly table: no house reveal to name
+    // 🔁 6a-3: the trim carried the reveals it counted, so D2 signs how the
+    // round landed (d = 'r' every reveal, o the pocket) — a recovering page
+    // can check it. (Before 6a-3, a Friendly round named no d/o.)
+    expect(hs!.d).toBe('r');
+    expect(hs!.o).toBeTypeOf('number');
+    expect(hs!.o).toBeGreaterThanOrEqual(0);
+    expect(hs!.o).toBeLessThanOrEqual(36);
     // "hs checks sum": its digest is the live session this fold opens.
     expect(houseSumDigest(CTX, hs!)).toBe(liveSid(a));
     // The page counts its own as the best it has.
     expect(a.casino.bestHouseSum(TABLE, INC)).toEqual(hs);
+  });
+
+  it('🔁 names no d/o when the trim carried no copies (a v0.50 trimmer): an owner that is the L7 victim never signs a pocket it only guessed', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    // One Friendly round, folded decided by the owner, then trimmed the way
+    // v0.50 did — carrying no round-u copies (copyDecider = false).
+    let at = decideRound(pages, T0 + STEP).at;
+    at = run(pages, at + STEP, at + STEP, { step: STEP });
+    trimByHand(a, testIdentity('v050-trimmer'), undefined, TABLE, undefined, false);
+    sync(at, ...pages);
+    run(pages, at + STEP, at + 60_000, { step: STEP, until: () => pages.every(betting) });
+    // It still vouches — the nets are its own — but with no copies its redecide
+    // candidate isn't `copied`, and a Friendly round has no house reveal to fall
+    // back on, so it omits d and o rather than name a pocket it can't be sure of.
+    const hs = hsOf(a);
+    expect(hs).not.toBeNull();
+    expect(hs!.d).toBeUndefined();
+    expect(hs!.o).toBeUndefined();
+    // Otherwise sound: it still checks the live session it opens.
+    expect(houseSumDigest(CTX, hs!)).toBe(liveSid(a));
   });
 
   it('chains a across consecutive trims (still 0 when the owner folded every round itself)', async () => {

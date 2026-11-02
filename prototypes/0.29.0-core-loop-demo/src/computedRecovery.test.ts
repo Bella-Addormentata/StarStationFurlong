@@ -953,7 +953,10 @@ describe('🩹 a forged checkpoint standing', () => {
     for (const p of pages) {
       expect(foldOf(p).base.sid, p.name).toBe(headSid);
       const live = computedOf(p).get(`ses:${TABLE}:${INC}:${headSid}`) as Y.Map<unknown>;
-      expect([...live.keys()].filter((k) => /^[a-z]:\d+:/.test(k)), p.name).toEqual([]);
+      // The head's session keeps the round-u reveal copies its own trim carried
+      // (§6.1 b); none of what the pages put down during the replay leaked in.
+      const u = foldOf(p).base.u;
+      expect([...live.keys()].filter((k) => /^[a-z]:\d+:/.test(k) && !k.startsWith(`x:${u}:`)), p.name).toEqual([]);
       expect(chipsOn(p, pages), p.name).toEqual(chips);
     }
   }, 60_000);

@@ -73,6 +73,7 @@ import {
   writeComputedSlip,
 } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import type { Decision } from './computedFold';
 import { noteComputedToss } from './computedRobot';
 import { crapsBackend } from './crapsBackend';
 import { crapsSettleMoves } from './crapsSettleShow';
@@ -2343,6 +2344,16 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return { line: `🎡 ROUND ${round()} — PLACE YOUR BETS${remain()}${readChips(me) <= 0 && !staked ? ' · VISIT THE CASHIER FOR CHIPS' : ''}`, color: GOLD_BRIGHT };
   };
 
+  /** 🔁 The felt's note when the round the checkpoint kept was decided a way
+   *  this page didn't see (the L7 fix, ComputedState.unseen): the trimmer's
+   *  decision, re-derived from the copies, which this page now shows. */
+  const unseenNote = (d: Decision | undefined): string =>
+    d === 'forfeit' ? "DECIDED BY A FORFEIT THIS PAGE DIDN'T SEE"
+      : d === 'house' ? "DECIDED BY THE HOUSE'S REVEAL THIS PAGE DIDN'T SEE"
+        : d === 'void' ? "DECIDED BY AN ABANDON THIS PAGE DIDN'T SEE"
+          : d === 'reveals' ? "DECIDED BY EVERY SEED THIS PAGE DIDN'T SEE"
+            : '';
+
   /** 🎲 A computed craps table's status line, in this order: rolls undone;
    *  my fling's time gone by (until the dice land); a change too late for
    *  the close, or new bets that missed it; the dice in the air (a flight
@@ -2409,6 +2420,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     }
     if (s.phase === 'settled' && s.dice) {
       const parts = [`● ${callOf(s.dice, s.pointBefore ?? null, s.point)}`];
+      if (unseenNote(s.unseen)) parts.push(unseenNote(s.unseen));
       const amount = s.amounts?.[me];
       if (s.pushes?.includes(me)) parts.push('PUSH');
       else if (amount !== undefined) parts.push(signedChips(amount));
@@ -2483,9 +2495,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           : fate === 'late' ? 'YOUR SEED CAME IN LATE — BETS FORFEITED'
             : fate === 'forfeited' ? 'YOUR SEED NEVER CAME — BETS FORFEITED'
               : '';
-      if (note) {
+      const extra = [unseenNote(s.unseen), note].filter(Boolean).join(' · ');
+      if (extra) {
         const won = (s.payouts?.[me] ?? 0) > 0;
-        return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''} · ${note}`, color: GOLD_BRIGHT };
+        return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''} · ${extra}`, color: GOLD_BRIGHT };
       }
     }
     return null;

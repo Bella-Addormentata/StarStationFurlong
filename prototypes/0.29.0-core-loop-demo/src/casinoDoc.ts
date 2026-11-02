@@ -226,7 +226,7 @@ import type {
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
 import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, SigCheck } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
 } from './computedHouse';
@@ -3998,6 +3998,17 @@ export function computedSettled(tableId?: string): boolean {
 export function computedFoldOf(tableId: string): FoldResult | null {
   const inc = computedIncOf(tableId);
   return inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.last ?? null;
+}
+
+/** 🔁 The round-u view (§6.2 C) of table `tableId`'s switched-on incarnation:
+ *  the candidate decisions for round u (the base's) that reproduce the counted
+ *  checkpoint's nets and craps carry, in the fold's order — the page shows the
+ *  first in place of its own when it differs (the L7 fix). Empty with no prior
+ *  evidence (a new page, or a split). Read-only; no count or spend reads it. */
+export function computedRedecide(tableId: string): RedecideCandidate[] {
+  const inc = computedIncOf(tableId);
+  const c = inc === null ? null : computedIncs.get(`${tableId}:${inc}`);
+  return c ? c.fold.redecide() : [];
 }
 
 /** When this page first saw record `key` in the live session of table

@@ -680,6 +680,13 @@ export interface RoundView {
   payouts: Map<string, bigint>;
   deltas: Map<string, bigint>;
   /** At craps: the roll as the game played it (absent at roulette). */ craps?: CrapsRoll;
+  /** The live-session keys a v0.51 trim copies into the next session for this
+   *  round (the L7 fix, §6.1 b), so a page that saw the round decided another
+   *  way can re-decide it there (the round-u view): the deciding record (a
+   *  forfeit, a house reveal, or an abandon) and the reveals this fold
+   *  counted. Set only on a decided round; a void by abandon carries just the
+   *  abandon, a void by a house reveal counting nobody just that reveal. */
+  deciderCopies?: string[];
 }
 
 /** One craps roll as the fold played it. At craps a RoundView's stakes,
@@ -775,6 +782,26 @@ export interface Play<S> {
   deltas: Map<string, bigint>;
   /** The carried state the next round plays from (unused while undecided). */ sOut: S;
   /** A craps roll's detail, for the round's view. */ craps?: CrapsRoll;
+}
+
+/** A way round u could have been decided, re-derived from the prior close and
+ *  its frozen slips plus the verified round-u records (the trim's copies and
+ *  this page's own) — the round-u view (§6.2 C). Only those reproducing the
+ *  checkpoint's nets (and craps carry) are returned, in the fold's own order.
+ *  Display only: no count or spend reads it. */
+export interface RedecideCandidate {
+  /** A full round-u view as this candidate decides it (its close is the
+   *  checkpoint's l): the page shows it in place of its own when it differs. */
+  view: RoundView;
+  /** The `hs:` `d` value this candidate stands for: 'r' (every reveal),
+   *  'f:'+hash, 'h:'+hash or 'z:'+hash. */ d: string;
+  /** The game's carried state after round u (for the C3 carry check; null at
+   *  roulette, which carries none). */ sOut: unknown;
+  /** Whether the trim carried this decision's records (its decider, and the
+   *  reveals it counted) into the live session — D1's copies, not only this
+   *  page's own memory. D2 signs d/o only for a copied candidate, so an owner
+   *  that is itself the L7 victim never signs a decider it merely inferred. */
+  copied: boolean;
 }
 
 /**
@@ -1106,6 +1133,52 @@ function countIn<K>(m: Map<K, number>, k: K, d: 1 | -1): void {
   else m.delete(k);
 }
 
+/** Union two hash→entry maps (this page's own round-u records and the live
+ *  session's copies); a copy and our own share a hash, so they count once. */
+function mergeByHash<E>(mine: Map<string, E>, live: Map<string, E> | undefined): Map<string, E> {
+  const out = new Map(mine);
+  if (live) for (const [h, e] of live) out.set(h, e);
+  return out;
+}
+/** The same for a pid → hash → entry map (round-u reveals). */
+function mergeByPid<E>(mine: Map<string, Map<string, E>>, live: Map<string, Map<string, E>> | undefined): Map<string, Map<string, E>> {
+  const out = new Map<string, Map<string, E>>();
+  for (const [pid, inner] of mine) out.set(pid, new Map(inner));
+  if (live) for (const [pid, inner] of live) {
+    const o = out.get(pid) ?? new Map<string, E>();
+    for (const [h, e] of inner) o.set(h, e);
+    out.set(pid, o);
+  }
+  return out;
+}
+
+/** What setBase keeps of the outgoing session's round-u evidence, for the
+ *  round-u view (§6.2 B): the close the new checkpoint names at round u, its
+ *  frozen slips, this page's own verified round-u records, the carried state
+ *  entering round u, and this page's nets after round u−1. Held until the
+ *  next setBase. Only kept when the new base trims the very session this fold
+ *  held (its `.b` is this fold's live session id) and this page had that
+ *  round's close — a new page keeps none (C5). */
+interface PriorEvidence {
+  session: string;
+  u: number;
+  l: string;
+  close: CloseEntry;
+  P: Map<string, SlipEntry>;
+  M: string[];
+  /** This page's own round-u records (pid → hash → reveal; hash → forfeit /
+   *  abandon of close l; hash → house reveal of round u), merged into the
+   *  live session's at redecide so a copy and our own count once. */
+  reveals: Map<string, Map<string, RevealEntry>>;
+  forfeits: Map<string, ForfeitEntry>;
+  abandons: Map<string, AbandonEntry>;
+  hReveals: Map<string, HouseRevealEntry>;
+  /** The game's carried state entering round u (null at roulette). */
+  sIn: unknown;
+  /** base.n + Σ deltas of the rounds this page decided before round u. */
+  netsBefore: Map<string, bigint>;
+}
+
 // ── The fold ─────────────────────────────────────────────────────────────────
 
 /**
@@ -1175,6 +1248,14 @@ export class TableFold {
   /** Set by ask() when a verdict comes back undefined. */
   private sawPending = false;
 
+  /** The carried state entering each decided round of the live chain, by
+   *  round, rebuilt each compute; setBase reads it to keep `sIn` for the
+   *  round-u view (PriorEvidence). */
+  private sInAt = new Map<number, unknown>();
+  /** The outgoing session's round-u evidence (§6.2 B), kept from one setBase
+   *  until the next, for the round-u view (redecide). null with none. */
+  private prior: PriorEvidence | null = null;
+
   /** `keyOf`, when given, pins each player's felt to one key: a slip
    *  version counts for `felts` (and so for `held` while betting) only if
    *  `k === keyOf(p)`. Without it, any verified version does — and a page
@@ -1205,13 +1286,54 @@ export class TableFold {
     // The sid hashes everything the base holds (all but k and g), so the
     // same sid is the same base: nothing to redo.
     if (sid === this.base.sid) return;
+    // 🔁 Keep the outgoing session's round-u evidence for the round-u view
+    // (§6.2 B), from the current (old) indexes, before clearIndex wipes them.
+    const prior = this.capturePrior(ok);
     this.clearIndex();
     const n = new Map<string, bigint>();
     if (ok) for (const pid of Object.keys(ok.n).sort()) n.set(pid, BigInt(ok.n[pid]));
     this.base = {
       sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok), h: ok?.h ?? null,
     };
+    this.prior = prior;
     this.dirty = true;
+  }
+
+  /** 🔁 The round-u evidence (§6.2 B) this page keeps when the new checkpoint
+   *  `ok` trims the session this fold held (its `.b` is this fold's live
+   *  session id): the close it names at round u, that close's frozen slips,
+   *  this page's own round-u records, the carry entering round u, and the
+   *  nets after round u−1. null when `ok` is no forward trim of this session,
+   *  or this page never folded round u decided with that close — a new page,
+   *  or a split, keeps none and the round-u view falls to C5. Reads the old
+   *  indexes, so setBase must call it before clearIndex. */
+  private capturePrior(ok: Checkpoint | null): PriorEvidence | null {
+    if (!ok || ok.b !== this.base.sid || this.last === null) return null;
+    const u = ok.u;
+    const l = ok.l ?? null;
+    if (l === null) return null;
+    const close = this.closesAt.get(u)?.get(l);
+    if (!close) return null;
+    if (!this.last.rounds.some((v) => v.decided !== null && v.r === u && v.close === l)) return null;
+    const info = this.closeInfo(close);
+    const netsBefore = new Map(this.base.n);
+    for (const v of this.last.rounds) {
+      if (v.decided === null || v.r >= u) continue;
+      for (const [pid, d] of v.deltas) netsBefore.set(pid, (netsBefore.get(pid) ?? 0n) + d);
+    }
+    const reveals = new Map<string, Map<string, RevealEntry>>();
+    const at = this.revealsAt.get(u);
+    if (at) for (const [pid, inner] of at) reveals.set(pid, new Map(inner));
+    return {
+      session: this.base.sid, u, l, close,
+      P: new Map(info.P), M: [...info.M],
+      reveals,
+      forfeits: new Map(this.forfeitsOf.get(l) ?? []),
+      abandons: new Map(this.abandonsOf.get(l) ?? []),
+      hReveals: new Map(this.hRevealsAt.get(u) ?? []),
+      sIn: this.sInAt.get(u) ?? this.base.state,
+      netsBefore,
+    };
   }
 
   /** The HouseCheck may answer differently now (a delegation was checked, or
@@ -1535,6 +1657,148 @@ export class TableFold {
     return null;
   }
 
+  /** The recHash of a reveal of (r, pid) that opens commitment `c`, matching
+   *  seedFor's choice (the first such in index order), for the round-u copies
+   *  (deciderCopies). null when none opens it on this page. */
+  private revealHashFor(r: number, pid: string, c: string): string | null {
+    const mine = this.revealsAt.get(r)?.get(pid);
+    if (mine) for (const x of mine.values()) if (x.commit === c) return x.hash;
+    return null;
+  }
+
+  /** The §6.1 b copy keys for a decided round `view`, whose close froze the
+   *  slips `P`: the deciding record and, for each counted pid, the reveal
+   *  this fold counted. A void carries only its decider (abandon, or a house
+   *  reveal that counted nobody); counted is empty there, so no reveals. */
+  private copiesFor(view: RoundView, P: Map<string, SlipEntry>): string[] {
+    const r = view.r;
+    const keys: string[] = [];
+    if (view.forfeit) keys.push(`f:${r}:${view.forfeit.hash}`);
+    if (view.house) keys.push(`h:${r}:${view.house.hash}`);
+    if (view.abandon) keys.push(`z:${r}:${view.abandon.hash}`);
+    for (const pid of view.counted) {
+      const s = P.get(pid);
+      if (!s) continue;
+      const rh = this.revealHashFor(r, pid, s.rec.c);
+      if (rh) keys.push(`x:${r}:${pid}:${rh}`);
+    }
+    return keys;
+  }
+
+  /** 🔁 The round-u view (§6.2 C): every way round u (this base's u) could
+   *  have been decided, re-derived from the prior close and its frozen slips
+   *  (kept across setBase, §6.2 B) plus the verified round-u records now in
+   *  the live session — the trim's copies and any a peer wrote — merged with
+   *  this page's own; kept only when it reproduces the checkpoint's nets and
+   *  craps carry (C3), returned in the fold's own order (house reveal;
+   *  forfeits by rank; every reveal; void by abandon — C4). The page shows the
+   *  first. Empty with no prior evidence (a new page, or a split): C5 applies.
+   *  Display only — no count or spend reads it. */
+  redecide(): RedecideCandidate[] {
+    const prior = this.prior;
+    if (!prior) return [];
+    const savedPending = this.sawPending;
+    const { u, l, close, P, M, sIn, netsBefore } = prior;
+    const present = [...P.keys()];
+    const fair = close.rec.h !== undefined;
+
+    // E: this page's own round-u records, merged with the live session's.
+    const reveals = mergeByPid(prior.reveals, this.revealsAt.get(u));
+    const forfeits = mergeByHash(prior.forfeits, this.forfeitsOf.get(l));
+    const abandons = mergeByHash(prior.abandons, this.abandonsOf.get(l));
+    const hReveals = mergeByHash(prior.hReveals, this.hRevealsAt.get(u));
+
+    // The seed each present pid's reveal gives, when one in E opens its slip.
+    const seeds = new Map<string, string>();
+    for (const [pid, s] of P) {
+      const inner = reveals.get(pid);
+      if (inner) for (const x of inner.values()) if (x.commit === s.rec.c) { seeds.set(pid, x.rec.s); break; }
+    }
+    const revealed = present.filter((pid) => seeds.has(pid));
+
+    // Whether a record is in the live session (a trim's copy, not only this
+    // page's own memory), for `copied`.
+    const liveForf = this.forfeitsOf.get(l);
+    const liveAband = this.abandonsOf.get(l);
+    const liveHRev = this.hRevealsAt.get(u);
+    const liveRev = this.revealsAt.get(u);
+    const revealCopied = (pid: string): boolean => {
+      const inner = liveRev?.get(pid), s = P.get(pid);
+      if (!inner || !s) return false;
+      for (const x of inner.values()) if (x.commit === s.rec.c) return true;
+      return false;
+    };
+
+    const cands: RedecideCandidate[] = [];
+    const add = (decided: Decision, d: string, counted: string[], extra: Partial<Outcome>): void => {
+      const out: Outcome = { present, missing: M, revealed, decided, counted, ...extra, seeds };
+      const play = this.game.play(this.ctx, u, out, P, M, sIn);
+      const view: RoundView = {
+        r: u, close: l, closeRec: close.rec, frozen: close.rec.f,
+        present, missing: M, revealed, decided, counted, ...extra,
+        pocket: play.pocket, stakes: play.stakes, payouts: play.payouts, deltas: play.deltas,
+        ...(play.craps ? { craps: play.craps } : {}),
+      };
+      const deciderCopied = extra.forfeit ? liveForf?.has(extra.forfeit.hash) === true
+        : extra.house ? liveHRev?.has(extra.house.hash) === true
+        : extra.abandon ? liveAband?.has(extra.abandon.hash) === true
+        : true;   // 'reveals' names no single decider record
+      cands.push({ view, d, sOut: play.sOut, copied: deciderCopied && counted.every(revealCopied) });
+    };
+
+    // (a) Fair: the house reveal deciding the close (none counted → void).
+    if (fair) {
+      const hr = this.viewHouseReveal(close, hReveals);
+      if (hr) {
+        const inN = new Set(hr.rec.n);
+        const need = present.filter((pid) => inN.has(P.get(pid)!.hash));
+        if (need.every((pid) => seeds.has(pid))) {
+          add(need.length > 0 ? 'house' : 'void', `h:${hr.hash}`, need.length > 0 ? need : [], { house: { hash: hr.hash, rec: hr.rec } });
+        }
+      }
+    } else {
+      // (a) Friendly: each forfeit meeting decide's conditions, by rank.
+      const fs = [...forfeits.values()]
+        .filter((f) => f.rec.r === u && f.rec.n.every((pid) => seeds.has(pid))
+          && f.rec.n.some((pid) => P.get(pid)?.rec.k === f.rec.k) && this.ask(f, 'forfeit') === true)
+        .sort(this.byRank);
+      for (const f of fs) add('forfeit', `f:${f.hash}`, [...f.rec.n], { forfeit: { hash: f.hash, rec: f.rec } });
+      // (b) Every frozen seed in, nothing missing.
+      if (M.length === 0 && revealed.length === present.length) add('reveals', 'r', present, {});
+    }
+    // (c) Void by abandon, by rank.
+    const zs = [...abandons.values()].filter((z) => z.rec.r === u && this.ask(z, 'abandon') === true).sort(this.byRank);
+    for (const z of zs) add('void', `z:${z.hash}`, [], { abandon: { hash: z.hash, rec: z.rec } });
+
+    this.sawPending = savedPending;
+    return cands.filter((c) => this.reproduces(c, netsBefore));
+  }
+
+  /** The house reveal that would decide the prior close, as decide picks it:
+   *  listing the close, its seed opening the close's `h`, a house's and
+   *  verified, lowest hash first. */
+  private viewHouseReveal(close: CloseEntry, hReveals: Map<string, HouseRevealEntry>): HouseRevealEntry | null {
+    const cands = [...hReveals.values()]
+      .filter((e) => e.commit === close.rec.h && e.rec.x.includes(close.hash))
+      .sort((a, b) => cmp(a.hash, b.hash));
+    for (const e of cands) if (this.houseRecOk(e) === true) return e;
+    return null;
+  }
+
+  /** C3: a candidate reproduces the checkpoint iff this page's nets after
+   *  round u−1 plus its deltas equal the checkpoint's nets (zeros dropped),
+   *  and — at craps — its carry after round u equals the checkpoint's (canon,
+   *  via the game's memo key; always equal at roulette, which carries none). */
+  private reproduces(c: RedecideCandidate, netsBefore: Map<string, bigint>): boolean {
+    const got = new Map(netsBefore);
+    for (const [pid, d] of c.view.deltas) got.set(pid, (got.get(pid) ?? 0n) + d);
+    const net = new Map<string, bigint>();
+    for (const [pid, v] of got) if (v !== 0n) net.set(pid, v);
+    if (net.size !== this.base.n.size) return false;
+    for (const [pid, v] of net) if (this.base.n.get(pid) !== v) return false;
+    return this.game.key(c.sOut) === this.game.key(this.base.state);
+  }
+
   /** The first of `cands` (sorted by rank) whose signature verifies, among
    *  the first MAX_FORFEITS_PER_CLOSE that might. A record whose verdict is
    *  false takes no place in the cap: otherwise copies of a real forfeit
@@ -1774,6 +2038,7 @@ export class TableFold {
 
   private compute(): FoldResult {
     this.sawPending = false;
+    this.sInAt.clear();
     const { sid, u } = this.base;
     // An ended incarnation plays no more rounds: a session map under the sid
     // its final checkpoint names is junk someone wrote after the end (no
@@ -1898,6 +2163,10 @@ export class TableFold {
         ...(play.craps ? { craps: play.craps } : {}),
         ...(rests.has(best.hash) ? { restsOn: rests.get(best.hash) } : {}),
       };
+      if (view.decided) {
+        this.sInAt.set(view.r, state);   // `state` is the carry entering this round
+        view.deciderCopies = this.copiesFor(view, infos.get(best.hash)!.P);
+      }
       rounds.push(view);
       if (!view.decided) { tip = view; break; }
       parent = best.hash;
