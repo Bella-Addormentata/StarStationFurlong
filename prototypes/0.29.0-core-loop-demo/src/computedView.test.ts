@@ -369,7 +369,9 @@ describe('the round check', () => {
     trimByHand(o, G, { ...nets, [X.pid]: (nets[X.pid] ?? 0n) + 7n, 'player-Q': -2n });
     expect(foldOf(o).rounds).toEqual([]);
     expect(foldOf(o).base.u).toBe(1);
-    expect(o.table.computedRoundCheck(TABLE, T0 + 19_000)).toEqual({ ...check, checkpointDiff: 9 });
+    // 🏛️ O folded the trim and saw round 1 close with the checkpoint's: it can
+    // check it (covered 'same'), and it is off by 9 chips (§6.2 E).
+    expect(o.table.computedRoundCheck(TABLE, T0 + 19_000)).toEqual({ ...check, checkpointDiff: 9, covered: 'same' });
     // The result stays on the felt through the trim.
     expect(view(o, T0 + 19_000)).toEqual(before);
     // The next round, decided in the new session, carries the flag on O; P,
@@ -381,8 +383,11 @@ describe('the round check', () => {
     putAt(o, T0 + 30_000, x2);
     putAt(o, T0 + 48_000, kit.close(X, 2, foldOf(o).parent, [x2]), kit.reveal(2, X.pid));
     sync(T0 + 48_000, o, p);
-    expect(o.table.computedRoundCheck(TABLE, T0 + 48_000)).toMatchObject({ round: 2, decided: 'reveals', checkpointDiff: 9 });
-    expect(p.table.computedRoundCheck(TABLE, T0 + 48_000)).toMatchObject({ round: 2, decided: 'reveals', checkpointDiff: 0 });
+    // O carries its 9-chip flag into the new session's rounds (covered 'same');
+    // P, which never saw round 1 decided, folded the trim 'unseen' — it can't
+    // check the checkpoint and reports a silent-no-longer 0 (§6.2 E, P1).
+    expect(o.table.computedRoundCheck(TABLE, T0 + 48_000)).toMatchObject({ round: 2, decided: 'reveals', checkpointDiff: 9, covered: 'same' });
+    expect(p.table.computedRoundCheck(TABLE, T0 + 48_000)).toMatchObject({ round: 2, decided: 'reveals', checkpointDiff: 0, covered: 'unseen' });
   });
 
   it('opened only after a trim, still reads the round on the felt, and flags a checkpoint 9 chips off', async () => {

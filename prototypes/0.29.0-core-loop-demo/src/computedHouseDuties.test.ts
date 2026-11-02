@@ -12,8 +12,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { asCheckpoint, asClose, nextSid, recHash } from './computedFold';
-import type { CloseRec, FoldCtx } from './computedFold';
+import { asCheckpoint, asClose, asHouseSumFor, nextSid, recHash } from './computedFold';
+import type { CloseRec, FoldCtx, HouseSum } from './computedFold';
 import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './computedHouse';
 import { houseSign } from './computedHouse';
 import {
@@ -49,6 +49,8 @@ const foldOf = (p: Page) => p.casino.computedFoldOf(TABLE)!;
 const top = (p: Page) => p.doc.getMap('casinoComputed');
 const recOf = <T>(p: Page, key: string): T => p.casino.computedSessionForWrite(TABLE)!.get(key) as T;
 const closesOf = (p: Page, r: number): CloseRec[] => keysIn(p, 'c', r).map((k) => asClose(recOf(p, k))!);
+const readHouseSum = asHouseSumFor({ inc: RINC });
+const hsOf = (p: Page): HouseSum | null => readHouseSum(top(p).get(`hs:${TABLE}:${RINC}`));
 
 /** A room whose deed page `a` holds, the house table switched on, the
  *  owner's node's key delegated (and synced) unless `delegate` is false. */
@@ -662,6 +664,46 @@ describe('a trim at a house table', () => {
     expect(cp.h).toBeUndefined();
     expect(keysIn(a, 'o', 2)).toEqual([join2.key]);
     expect(foldOf(a).joins.map((j) => j.hash)).toEqual([join2.hash]);
+  });
+
+  // 🏛️ Condition 4 (PR 6a-2 re-review): the owner's attestation compares the
+  // checkpoint's `h` with `was.required` — the commitment the trimmed session's
+  // open round must name, which accounts for a step-down — not the deciding
+  // reveal's own `c`. After a step-down the two differ: comparing against the
+  // reveal's `c` refused this honest trim (and would pass a forged one keeping
+  // the retired commitment).
+  it('vouches for its own trim that omits h after a step-down retired the commitment (condition 4 · was.required)', async () => {
+    const pages = await houseRoom(['A', 'B']);
+    const [a, b] = pages;
+    house(a, kit.houseJoin(H, 1));
+    a.table.writeComputedSlip(TABLE, [red(10)], T0);
+    b.table.writeComputedSlip(TABLE, [black(20)], T0);
+    sync(T0, ...pages);
+    const closedAt = run(pages, T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    const [close] = closesOf(a, 1);
+    const closeHash = hashIn(keysIn(a, 'c', 1)[0]);
+    run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });
+    // H decides round 1 — its reveal carries the round-2 commitment, houseCommit(H, 2)
+    // — then steps down there. The open round is left with no commitment
+    // (`required` null), though the round-1 reveal's own `c` still names it.
+    house(a, kit.houseReveal(H, 1, [closeHash], frozenOf(close)), kit.stepDown(H, 2));
+    sync(closedAt + 2_000, ...pages);
+    expect(foldOf(a)).toMatchObject({ open: 2, required: null });
+    expect(foldOf(a).rounds[0].decided).toBe('house');
+    // Idle: the owner trims round 1 a minute on, honestly omitting h.
+    const first = foldOf(a).base.sid;
+    let at = run(pages, closedAt + 2_000 + STEP, closedAt + 80_000, { step: 1_000, until: () => foldOf(a).base.sid !== first });
+    const cp = asCheckpoint(top(a).get(`sum:${TABLE}:${RINC}`))!;
+    expect(cp).toMatchObject({ u: 1 });
+    expect(cp.h).toBeUndefined(); // honest: `required` was null
+    // The owner folds the moved session and vouches for its honest trim. The
+    // old comparison (reveal's `c`, houseCommit(H, 2)) refused a trim omitting h.
+    at = run(pages, at + STEP, at + 10_000, { step: STEP, until: () => hsOf(a) !== null });
+    const hs = hsOf(a);
+    expect(hs).not.toBeNull();
+    expect(hs!.k).toBe(a.pub);
+    expect(hs!.h).toBeUndefined();
+    expect(hs!.u).toBe(1);
   });
 });
 

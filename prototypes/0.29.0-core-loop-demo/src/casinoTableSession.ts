@@ -65,7 +65,7 @@ import {
   SPIN_TAKEOVER_MS, tablesAwake,
 } from './croupier';
 import {
-  computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedContested, computedRollChange,
+  computedCheckpointView, computedCrapsClose, computedDecidedTo, computedFlungFor, computedMine, computedOldBuildDriving, computedContested, computedRollChange,
   computedHouseState, computedRoundCheck, computedSwitchState, computedTally, computedUndoneCount, computedUnknownRiders, CRAPS_SWITCH_OFF_REFUSED,
   CRAPS_SWITCH_ON_CONFIRM, CRAPS_SWITCH_ON_REFUSED, noteComputedFling, readComputedBets, readComputedCraps,
   readComputedCrapsBets, readComputedRoulette, readMyComputedBets, readMyComputedCrapsBets, SWITCH_OFF_REFUSED,
@@ -2622,6 +2622,9 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const computedCheckLines = (): { text: string; color: string }[] => {
     const out: { text: string; color: string }[] = [];
     const c = computedRoundCheck(itemId);
+    // 🏛️ The owner's check on this table's newest checkpoint (shown on every
+    // page), and how this page itself stands to check it (§6.2 D, E).
+    const cp = computedCheckpointView(itemId);
     // 🎲 At craps a roll, its call, and bets that ride on: a missing or
     // left-out slip leaves a rider's bets playing as they stood, and a late
     // seed costs only the chips added that roll.
@@ -2672,10 +2675,12 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       }
       if (c.dropped.length > 0) out.push({ text: '🚩 A FORFEIT DROPPED A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
       if (c.houseDropped.length > 0) out.push({ text: '🚩 THE HOUSE LEFT OUT A SEED THIS PAGE SAW IN TIME', color: '#FF8A80' });
-      // (At craps the nets apart from the table the checkpoint hands on.)
+      // (At craps the nets apart from the table the checkpoint hands on. A
+      // split close — the checkpoint names another close for round u — shows
+      // its own 🚩 below; the nets of two different decisions mean nothing.)
       const chips = craps ? c.checkpointNets ?? 0 : c.checkpointDiff;
-      if (chips > 0) out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${many(chips, 'CHIP', 'CHIPS')}`, color: '#FF8A80' });
-      if (craps && c.checkpointCarry) out.push({ text: "🚩 THE CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S", color: '#FF8A80' });
+      if (chips > 0 && c.covered !== 'split') out.push({ text: `🚩 THE CHECKPOINT DIFFERS FROM THIS PAGE BY ${many(chips, 'CHIP', 'CHIPS')}`, color: '#FF8A80' });
+      if (craps && c.checkpointCarry && c.covered !== 'split') out.push({ text: "🚩 THE CHECKPOINT'S POINT OR RIDING BETS DIFFER FROM THIS PAGE'S", color: '#FF8A80' });
       if (c.pinMismatch.length > 0) out.push({ text: "🚩 A FROZEN SLIP'S KEY ISN'T ITS PLAYER'S", color: '#FF8A80' });
       if (c.replaced !== undefined) {
         out.push({ text: `🚩 ${craps ? 'ROLL' : 'ROUND'} ${c.replaced} REPLACED AFTER ITS SEEDS WERE OUT`, color: '#FF8A80' });
@@ -2684,6 +2689,24 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
         out.push({ text: `🚩 ONE PLAYER'S SEED SETTLED ROLL ${c.round} WHILE ${many(c.unseeded!, 'OTHER', 'OTHERS')} HAD BETS RIDING`, color: '#FF8A80' });
       }
       if (craps && (c.illegal?.length ?? 0) > 0) out.push({ text: '🚩 A SLIP BROKE THE TABLE RULES — ITS CHANGES WERE IGNORED', color: '#FF8A80' });
+    }
+    // 🏛️ The owner's check label (L-0..L-7, every page) and this page's own
+    // ability to check the checkpoint (covered). A 🚩 reads red, a clean
+    // CHECKED BY THE OWNER green, the in-between states amber.
+    if (cp?.label) {
+      const color = cp.label.startsWith('🚩') ? '#FF8A80' : cp.label.includes('· CHECKED BY THE') ? '#7CF5B0' : '#F5C26B';
+      out.push({ text: cp.label, color });
+    }
+    // 🏛️ B12: this page has stood down from putting the owner's checkpoint back
+    // after a run of worse overwrites — a disagreement over the owner's key.
+    if (cp?.backedOff) {
+      out.push({ text: "🚩 PAGES DISAGREE OVER THE OWNER'S CHECKPOINT · PUTTING IT BACK IS PAUSED", color: '#FF8A80' });
+    }
+    if (cp && cp.round > 0 && cp.covered === 'unseen') {
+      out.push({ text: `THIS PAGE DIDN'T SEE ROUND ${cp.round} DECIDED · IT CAN'T CHECK THE CHECKPOINT`, color: '#F5C26B' });
+    }
+    if (cp && cp.round > 0 && cp.covered === 'split') {
+      out.push({ text: `🚩 THE CHECKPOINT NAMES ANOTHER CLOSE FOR ROUND ${cp.round} (A SPLIT, OR A FORGED CHECKPOINT)`, color: '#FF8A80' });
     }
     if (craps) {
       // (Named as this page knows them, escaped: a name is anyone's to set.)
