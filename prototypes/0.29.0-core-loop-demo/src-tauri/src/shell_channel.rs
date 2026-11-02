@@ -785,4 +785,17 @@ mod tests {
         assert_eq!(envs.get(std::ffi::OsStr::new(NETWORK_ENV)), Some(&net));
         assert_eq!(envs.len(), 2);
     }
+
+    /// On Linux the guard is the real prctl: once it says the pipes are
+    /// guarded, this process is not dumpable. (Making the test process not
+    /// dumpable is harmless.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pipes_are_guarded_only_by_a_prctl_that_held() {
+        assert!(pipes_guarded(), "prctl(PR_SET_DUMPABLE, 0) holds in a plain process");
+        // SAFETY: PR_GET_DUMPABLE takes plain integers and no pointer.
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+        assert_eq!(dumpable, 0, "not dumpable once guarded");
+        assert!(pipes_guarded(), "decided once");
+    }
 }

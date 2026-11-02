@@ -133,6 +133,14 @@ pub struct Flight {
     pub outcome: Outcome,
     /// When the last window closed without a save.
     pub closed_unsaved: Option<Instant>,
+    /// A saved request of this instance is out: the close waits for its
+    /// reply before it reads the outcome ([`Backup::settled`]).
+    pub saving: bool,
+    /// A saved request went out in this instance, whatever came back.
+    pub save_tried: bool,
+    /// This instance's window is gone and its outcome is read: no saved
+    /// request may start any more.
+    pub settled: bool,
 }
 
 /// `busy` while a window is out and for [`CLOSED_BUSY`] after one closed
@@ -147,11 +155,13 @@ pub fn flight_gate(f: &Flight, now: Instant) -> Option<OpenAnswer> {
 pub struct Backup {
     channel: Option<Arc<Channel>>,
     flight: Mutex<Flight>,
+    /// Signalled each time a saved request ends.
+    save_ended: tokio::sync::Notify,
 }
 
 impl Backup {
     pub fn new(channel: Option<Arc<Channel>>) -> Backup {
-        Backup { channel, flight: Mutex::new(Flight::default()) }
+        Backup { channel, flight: Mutex::new(Flight::default()), save_ended: tokio::sync::Notify::new() }
     }
 
     /// Start one `open_backup`: `no_channel` without a channel, `busy` while
@@ -183,12 +193,106 @@ impl Backup {
         self.flight.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A new window instance, opened for `address`: returns its number.
+    pub fn opened(&self, address: String) -> u64 {
+        let mut f = self.flight();
+        f.instance += 1;
+        f.key = None;
+        f.address = Some(address);
+        f.outcome = Outcome::Closed;
+        f.saving = false;
+        f.save_tried = false;
+        f.settled = false;
+        f.instance
+    }
+
+    /// ⚠ CONFIRM's saved request may go out: a window is open and not yet
+    /// settled, and this instance has a reveal's key. The guard it returns
+    /// keeps the close waiting until the request ends ([`SaveGuard::done`],
+    /// or its drop).
+    pub fn start_save(&self) -> Result<(SaveGuard<'_>, u32), &'static str> {
+        let mut f = self.flight();
+        if !f.out || f.settled {
+            return Err("refused");
+        }
+        let key = f.key.ok_or("not_shown")?;
+        f.saving = true;
+        f.save_tried = true;
+        Ok((SaveGuard { backup: self, instance: f.instance, ended: false }, key))
+    }
+
+    /// After the window is gone: wait until no saved request of this
+    /// instance is out, then read its outcome, and whether a saved request
+    /// went out at all. From here on no saved request may start.
+    pub async fn settled(&self) -> (Outcome, bool) {
+        loop {
+            // A Notified future hears every notify_waiters from its creation
+            // on, so a save that ends between the check and the await is not
+            // missed.
+            let ended = self.save_ended.notified();
+            {
+                let mut f = self.flight();
+                if !f.saving {
+                    f.settled = true;
+                    return (f.outcome, f.save_tried);
+                }
+            }
+            ended.await;
+        }
+    }
+
     /// Run `request` on a blocking thread, off the main thread and the
     /// async workers.
     async fn ask(&self, op: Op) -> Result<zeroize::Zeroizing<String>, Failed> {
         let channel = self.channel.clone().ok_or(Failed::Closed)?;
         tauri::async_runtime::spawn_blocking(move || channel.request(op)).await.unwrap_or(Err(Failed::Closed))
     }
+}
+
+/// One saved request that is out. It ends with [`SaveGuard::done`]; a guard
+/// dropped without it (the request's future dropped) ends it as not saved,
+/// so a close never waits forever.
+pub struct SaveGuard<'a> {
+    backup: &'a Backup,
+    instance: u64,
+    ended: bool,
+}
+
+impl SaveGuard<'_> {
+    /// The node's answer came: `saved` when it recorded the mark.
+    pub fn done(mut self, saved: bool) {
+        self.end(saved);
+    }
+
+    fn end(&mut self, saved: bool) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        {
+            let mut f = self.backup.flight();
+            if f.instance == self.instance {
+                f.saving = false;
+                if saved {
+                    f.outcome = Outcome::Saved;
+                }
+            }
+        }
+        self.backup.save_ended.notify_waiters();
+    }
+}
+
+impl Drop for SaveGuard<'_> {
+    fn drop(&mut self) {
+        self.end(false);
+    }
+}
+
+/// After a close with no saved mark although a saved request went out (it
+/// timed out, or its answer was lost): the hello says whether the node
+/// recorded it for this window's wallet all the same.
+pub fn saved_after_all(hello: Result<Hello, Failed>, address: &str, sticky_other: bool) -> bool {
+    hello.is_ok_and(|h| !sticky_other && h.is_net(SHELL_NET) && h.wallet == "on" && h.backed_up && h.address.as_deref() == Some(address))
 }
 
 // ── Who may call ───────────────────────────────────────────────────────────
@@ -350,10 +454,25 @@ pub fn serve<R: tauri::Runtime>(ctx: tauri::UriSchemeContext<'_, R>, request: ta
 
 // ── The window ─────────────────────────────────────────────────────────────
 
+/// Whether the backup window's webview is incognito: yes, except on Linux.
+///
+/// On WebKitGTK the app's custom schemes (`ssfreveal`, and Tauri's own
+/// `ipc` and `tauri`) are registered on a WebKit context, once per context:
+/// Tauri gives every webview the same default data directory, so the
+/// window joins the context the main window made, whose schemes are already
+/// registered, and Tauri hands wry none for it. An incognito webview then
+/// gets a new ephemeral context of its own with only those schemes, none,
+/// and its page cannot load ("The URL can't be shown"). Not incognito, it
+/// shares main's context and its handlers. That keeps nothing of the words:
+/// the page stores nothing, every answer of the scheme is `no-store`, and
+/// `ssfreveal` is an origin of its own, apart from the game page's.
+pub const INCOGNITO: bool = !cfg!(target_os = "linux");
+
 /// Build the backup window: owned by main (above it on every engine), not
-/// minimizable (so it is never lost behind the Bank), no storage kept, no
-/// devtools, screen capture kept out where the OS can, its own page only, no
-/// new windows. The clipboard is never enabled for it.
+/// minimizable (so it is never lost behind the Bank), incognito where the
+/// engine allows it ([`INCOGNITO`]), no devtools, screen capture kept out
+/// where the OS can, its own page only, no new windows. The clipboard is
+/// never enabled for it.
 fn build_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     let main = app.get_webview_window(MAIN).ok_or(tauri::Error::WindowNotFound)?;
     let url = Url::parse(INDEX_URL).map_err(tauri::Error::InvalidUrl)?;
@@ -361,7 +480,7 @@ fn build_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
         .title(TITLE)
         .inner_size(520.0, 760.0)
         .parent(&main)?
-        .incognito(true)
+        .incognito(INCOGNITO)
         .devtools(false)
         .content_protected(true)
         .minimizable(false)
@@ -418,13 +537,7 @@ async fn run_backup(app: &tauri::AppHandle, backup: &Backup, channel: Arc<Channe
         Ok(address) => address,
         Err(answer) => return answer,
     };
-    {
-        let mut f = backup.flight();
-        f.instance += 1;
-        f.key = None;
-        f.address = Some(address);
-        f.outcome = Outcome::Closed;
-    }
+    backup.opened(address.clone());
     let window = match build_window(app) {
         Ok(window) => window,
         Err(e) => {
@@ -442,10 +555,24 @@ async fn run_backup(app: &tauri::AppHandle, backup: &Backup, channel: Arc<Channe
         }
     });
     let _ = rx.await;
-    match backup.flight().outcome {
-        Outcome::Saved => OpenAnswer::Saved,
-        Outcome::AlreadySaved => OpenAnswer::AlreadySaved,
-        Outcome::Closed => OpenAnswer::Closed,
+    // A CONFIRM whose answer is still out when the window closes (the title
+    // bar's X while the page says "Telling your node…") is waited for, so the
+    // answer says what the node recorded.
+    match backup.settled().await {
+        (Outcome::Saved, _) => OpenAnswer::Saved,
+        (Outcome::AlreadySaved, _) => OpenAnswer::AlreadySaved,
+        (Outcome::Closed, false) => OpenAnswer::Closed,
+        (Outcome::Closed, true) => {
+            // The saved request failed or timed out; the node may have
+            // written the mark all the same.
+            let hello_channel = channel.clone();
+            let hello = tauri::async_runtime::spawn_blocking(move || hello_channel.hello()).await.unwrap_or(Err(Failed::Closed));
+            if saved_after_all(hello, &address, channel.other_network()) {
+                OpenAnswer::Saved
+            } else {
+                OpenAnswer::Closed
+            }
+        }
     }
 }
 
@@ -525,23 +652,15 @@ pub async fn backup_saved(app: tauri::AppHandle, webview: tauri::Webview) -> Res
         return Err("refused");
     }
     let backup = app.state::<Backup>();
-    let (instance, key) = {
-        let f = backup.flight();
-        if !f.out {
-            return Err("refused");
-        }
-        (f.instance, f.key.ok_or("not_shown")?)
+    let (guard, key) = backup.start_save()?;
+    let Ok(body) = backup.ask(Op::Saved(key)).await else {
+        guard.done(false);
+        return Err("no_channel");
     };
-    let body = backup.ask(Op::Saved(key)).await.map_err(|_| "no_channel")?;
     let ok = Answer::parse(&body).is_some_and(|a| a.ok);
+    guard.done(ok);
     if !ok {
         return Err("refused");
-    }
-    {
-        let mut f = backup.flight();
-        if f.instance == instance {
-            f.outcome = Outcome::Saved;
-        }
     }
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.close();
@@ -600,6 +719,13 @@ mod tests {
         for page in ["ssfreveal://localhost/index.html", "http://ssfreveal.localhost/", "http://localhost:8080/", "tauri://evil/", "tauri://localhost:9/", "http://tauri.localhost:1/"] {
             assert!(!caller_is_in(Caller::Main, "main", page, true), "{page}");
         }
+    }
+
+    /// Incognito everywhere but WebKitGTK, where an incognito window would
+    /// lose the app's scheme handlers ([`INCOGNITO`]).
+    #[test]
+    fn the_window_is_incognito_except_on_webkitgtk() {
+        assert_eq!(INCOGNITO, !cfg!(target_os = "linux"));
     }
 
     #[test]
@@ -722,6 +848,25 @@ mod tests {
         assert_eq!(js.matches("invoke(").count(), 1, "one call into the app, inside ask");
     }
 
+    /// The page keeps the Bank's rules (bankBackup.ts, main.ts): HIDE acts
+    /// before the fresh-click check SHOW needs, and SHOW puts an armed
+    /// CONFIRM back to I SAVED before it asks for the words.
+    #[test]
+    fn the_page_hides_at_once_and_show_disarms_confirm() {
+        let js = std::str::from_utf8(REVEAL_JS).unwrap();
+        let at = js.find("addEventListener('click'").expect("a click handler");
+        assert!(js[..at].ends_with("showButton."), "the first click handler is SHOW/HIDE's");
+        let handler = &js[at..];
+        let handler = &handler[..handler.find("\n  });").expect("the handler's end")];
+        let hides = handler.find("if (shown)").expect("a HIDE branch");
+        let checks = handler.find("fresh(event, 'show')").expect("SHOW's fresh-click check");
+        assert!(hides < checks, "HIDE is handled before SHOW's fresh-click check");
+        assert!(handler[hides..checks].contains("hide(") && handler[hides..checks].contains("return;"), "HIDE hides and returns");
+        let reveal = &js[js.find("function reveal()").expect("reveal()")..];
+        let reveal = &reveal[..reveal.find("ask('backup_reveal')").expect("its request")];
+        assert!(reveal.contains("if (armed) disarm();"), "SHOW disarms CONFIRM before it asks");
+    }
+
     #[test]
     fn the_hello_decides_what_open_backup_answers() {
         let other = if SHELL_NET == TESTNET11 { MAINNET } else { TESTNET11 };
@@ -774,6 +919,94 @@ mod tests {
         assert!(backup.begin(now + CLOSED_BUSY).is_ok(), "a save starts no busy time");
         backup.end(OpenAnswer::NotOn, now + CLOSED_BUSY);
         assert!(backup.begin(now + CLOSED_BUSY).is_ok());
+    }
+
+    /// A backup with a channel over pipes nobody answers (only the flight
+    /// is tested), and those pipes' other ends.
+    fn quiet_backup() -> (Backup, (std::io::PipeReader, std::io::PipeWriter)) {
+        let (req_read, req_write) = std::io::pipe().unwrap();
+        let (rep_read, rep_write) = std::io::pipe().unwrap();
+        (Backup::new(Some(Channel::start(req_write, rep_read))), (req_read, rep_write))
+    }
+
+    /// A window opened for txch1abc whose last reveal gave key 7.
+    fn shown_backup() -> (Arc<Backup>, (std::io::PipeReader, std::io::PipeWriter)) {
+        let (backup, pipes) = quiet_backup();
+        backup.begin(Instant::now()).unwrap();
+        backup.opened("txch1abc".into());
+        backup.flight().key = Some(7);
+        (Arc::new(backup), pipes)
+    }
+
+    /// Wait for [`Backup::settled`] on a thread of its own.
+    fn settle(backup: &Arc<Backup>) -> std::thread::JoinHandle<(Outcome, bool)> {
+        let backup = backup.clone();
+        std::thread::spawn(move || tauri::async_runtime::block_on(backup.settled()))
+    }
+
+    #[test]
+    fn a_close_waits_for_a_saved_request_that_is_out_and_answers_what_it_recorded() {
+        let (backup, _pipes) = shown_backup();
+        let (guard, key) = backup.start_save().unwrap();
+        assert_eq!(key, 7);
+        // The window closes while the node's answer is still out.
+        let closing = settle(&backup);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!closing.is_finished(), "the close waits for the saved answer");
+        guard.done(true);
+        assert_eq!(closing.join().unwrap(), (Outcome::Saved, true), "saved, not closed");
+        assert_eq!(backup.start_save().err(), Some("refused"), "no saved request once the close is settled");
+    }
+
+    #[test]
+    fn a_saved_request_that_fails_or_is_dropped_releases_the_close() {
+        let (backup, _pipes) = shown_backup();
+        let (guard, _) = backup.start_save().unwrap();
+        let closing = settle(&backup);
+        std::thread::sleep(Duration::from_millis(50));
+        guard.done(false);
+        assert_eq!(closing.join().unwrap(), (Outcome::Closed, true), "closed, with a saved request tried");
+
+        let (backup, _pipes) = shown_backup();
+        let (guard, _) = backup.start_save().unwrap();
+        let closing = settle(&backup);
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+        assert_eq!(closing.join().unwrap(), (Outcome::Closed, true), "a dropped request never holds the close");
+
+        let (backup, _pipes) = shown_backup();
+        assert_eq!(settle(&backup).join().unwrap(), (Outcome::Closed, false), "no saved request: closed at once");
+    }
+
+    #[test]
+    fn a_saved_request_needs_an_open_window_and_a_reveal() {
+        let (backup, _pipes) = quiet_backup();
+        assert_eq!(backup.start_save().err(), Some("refused"), "no window out");
+        backup.begin(Instant::now()).unwrap();
+        backup.opened("txch1abc".into());
+        assert_eq!(backup.start_save().err(), Some("not_shown"));
+        backup.flight().key = Some(7);
+        assert!(backup.start_save().is_ok());
+        // The next opening starts clean.
+        backup.flight().settled = true;
+        backup.opened("txch1abc".into());
+        let f = backup.flight();
+        assert_eq!((f.saving, f.save_tried, f.settled, f.key, f.outcome), (false, false, false, None, Outcome::Closed));
+    }
+
+    #[test]
+    fn a_failed_saved_request_counts_when_the_hello_says_the_mark_was_written() {
+        let other = if SHELL_NET == TESTNET11 { MAINNET } else { TESTNET11 };
+        let hello = |net: crate::shell_channel::Net, wallet: &str, backed_up: bool, address: &str| {
+            Ok(Hello { net_id: net.id.into(), genesis: net.genesis.into(), wallet: wallet.into(), backed_up, address: Some(address.into()) })
+        };
+        assert!(saved_after_all(hello(SHELL_NET, "on", true, "txch1abc"), "txch1abc", false));
+        assert!(!saved_after_all(hello(SHELL_NET, "on", false, "txch1abc"), "txch1abc", false), "not written");
+        assert!(!saved_after_all(hello(SHELL_NET, "on", true, "txch1other"), "txch1abc", false), "another wallet");
+        assert!(!saved_after_all(hello(SHELL_NET, "off", true, "txch1abc"), "txch1abc", false));
+        assert!(!saved_after_all(hello(other, "on", true, "txch1abc"), "txch1abc", false));
+        assert!(!saved_after_all(hello(SHELL_NET, "on", true, "txch1abc"), "txch1abc", true), "sticky other network");
+        assert!(!saved_after_all(Err(Failed::TimedOut), "txch1abc", false));
     }
 
     #[test]

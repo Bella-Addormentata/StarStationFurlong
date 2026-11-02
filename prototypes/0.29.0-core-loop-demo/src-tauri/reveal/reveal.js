@@ -6,12 +6,13 @@
 //   Station never asks for the words;
 // - SHOW needs a fresh click: not the second click of a double-click, not
 //   within half a second of the control changing, and a held Enter or Space
-//   never repeats it;
+//   never repeats it; HIDE acts at once, always;
 // - the words go into text nodes of a list that cannot be selected, and
 //   copying is cancelled;
 // - they hide on HIDE, after five minutes on either clock, when the window
 //   loses focus, when it is hidden and when it closes;
-// - I SAVED arms CONFIRM, which needs a fresh click of its own.
+// - I SAVED arms CONFIRM, which needs a fresh click of its own; SHOW puts
+//   CONFIRM back to I SAVED.
 // The words come from the app on every SHOW and are never stored. The page
 // calls the app's two backup commands and nothing else.
 'use strict';
@@ -132,6 +133,9 @@
 
   function reveal() {
     if (asking || saving) return;
+    // A CONFIRM armed while the words were masked does not come back armed
+    // with them (bankBackup.ts startReveal).
+    if (armed) disarm();
     asking = true;
     gen += 1;
     const ticket = gen;
@@ -161,7 +165,10 @@
             if (expired()) hide(EXPIRED);
           }, 1000);
           showButton.textContent = 'HIDE';
+          // Both controls settle again once the words land (bankBackup.ts
+          // applyReveal).
           changedAt.show = performance.now();
+          changedAt.saved = changedAt.show;
           say(SHOWING);
         },
         (code) => {
@@ -193,9 +200,13 @@
   }
 
   showButton.addEventListener('click', (event) => {
+    // HIDE acts at once, always: hiding is never the risky way round.
+    if (shown) {
+      hide('');
+      return;
+    }
     if (!fresh(event, 'show')) return;
-    if (shown) hide('');
-    else reveal();
+    reveal();
   });
 
   savedButton.addEventListener('click', (event) => {

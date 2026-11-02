@@ -151,12 +151,47 @@ fn channel_command(mut cmd: std::process::Command, guarded: bool) -> std::proces
     cmd
 }
 
+/// Linux: the node gets SIGTERM when the app dies, so it steps its house
+/// down and exits (ssf-p2p-node's house_stop_on_signal) even when the app
+/// is stopped by a signal, which never reaches the exit hook in main().
+/// Otherwise the orphan keeps UDP 4443, and the next launch finds "a node
+/// already running", with no channel, so the backup window stays off.
+///
+/// The signal follows the thread that spawns, not the process: the node is
+/// spawned from the main thread (acquire_p2p_node in main()), which lives
+/// for the whole run.
+#[cfg(target_os = "linux")]
+fn die_with_app(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let app = std::process::id() as libc::pid_t;
+    // SAFETY: the closure runs in the forked child before exec, and calls
+    // only prctl and getppid, both async-signal-safe; it allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            // A prctl that fails leaves the node as it was before (it may
+            // outlive a killed app); the spawn goes ahead.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong);
+            // The app died between the fork and the prctl: no signal would
+            // ever come, so the node does not start.
+            if libc::getppid() != app {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Spawn `cmd`, with the node's channel on when the app's ends of the
 /// pipes are guarded (`guarded`): then the node's stdin and stdout are the
 /// channel, and its stderr stays the app's. Otherwise it is spawned as
-/// before, with no channel.
+/// before, with no channel. On Linux the node goes when the app does
+/// ([`die_with_app`]).
 fn spawn_node(cmd: std::process::Command, guarded: bool) -> std::io::Result<(Child, Option<Arc<Channel>>)> {
-    let mut child = channel_command(cmd, guarded).spawn()?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut cmd = channel_command(cmd, guarded);
+    #[cfg(target_os = "linux")]
+    die_with_app(&mut cmd);
+    let mut child = cmd.spawn()?;
     let channel = match (guarded, child.stdin.take(), child.stdout.take()) {
         (true, Some(stdin), Some(stdout)) => Some(Channel::start(stdin, stdout)),
         _ => None,
@@ -198,7 +233,10 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
             }
         }
         // Bundled sidecar must not flash a console window on Windows
-        // (CREATE_NO_WINDOW) — its stdout stays on the app's console handle rules.
+        // (CREATE_NO_WINDOW). With the channel on, its stdin and stdout are
+        // the channel's pipes and its log goes to the inherited stderr
+        // (shell_channel::attach); without it, stdout and stderr follow the
+        // app's console handle rules.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -391,6 +429,35 @@ mod tests {
         };
         assert_eq!(channel_var(true), Some(Some(std::ffi::OsString::from("1"))));
         assert_eq!(channel_var(false), Some(None), "still removed");
+    }
+
+    /// A node spawned through `die_with_app` gets SIGTERM when the thread
+    /// that spawned it ends, as the app's main thread does when the app is
+    /// killed. Here a short-lived thread spawns a `sleep` and ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_node_gets_sigterm_when_the_app_goes() {
+        use std::os::unix::process::ExitStatusExt;
+        let spawner = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            die_with_app(&mut cmd);
+            cmd.spawn().unwrap()
+        });
+        let mut child = spawner.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGTERM), "the child got SIGTERM when its spawning thread ended");
     }
 
     /// A node the app did not start, or the embedded listener, gives the
