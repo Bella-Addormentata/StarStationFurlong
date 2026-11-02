@@ -1050,17 +1050,16 @@ mod fingerprint_json_tests {
         let memo = SwitchMemo { remembered: true, error: None };
         let cases = [
             (
-                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }, Backup::Page),
+                view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() }, Backup::Page),
                 r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none","backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }, Backup::Page),
+                view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() }, Backup::Page),
                 r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none","backup":"page"}"#,
             ),
             (
                 view(
                     true,
-                    false,
                     EnvSwitch::Unset,
                     true,
                     &memo,
@@ -1070,11 +1069,11 @@ mod fingerprint_json_tests {
                 r#""chia_wallet":{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true,"backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
+                view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
                 r#""chia_wallet":{"state":"ready","legacy":true,"mnemonic":true,"backup":"page"}"#,
             ),
             (
-                view(true, false, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
+                view(true, EnvSwitch::Unset, false, &SwitchMemo::default(), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }, Backup::Page),
                 r#""chia_wallet":{"state":"ready","seed":true,"mnemonic":true,"backup":"page"}"#,
             ),
         ];
@@ -1167,16 +1166,30 @@ mod fingerprint_json_tests {
         assert_eq!(NetworkView::of(ChiaNet::Mainnet, NetSource::Env).genesis, "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb");
     }
 
-    /// The switch's gated state rides as `gated`, with no flags and no
-    /// address, which the page (#360) reads as the gated Bank.
+    /// ⛓️ Mainnet makes an SSF wallet now: the switch rides there as it does
+    /// on testnet11 (Ready, then On with the address beside it), and only
+    /// `backup` differs: `native` with the desktop app's channel, `none`
+    /// without it, never `page`. No state of its own rides any more.
     #[test]
-    fn a_gated_wallet_rides_as_gated() {
+    fn a_mainnet_wallet_rides_as_ready_then_on_with_its_address() {
+        use crate::chia_network::{ChiaNet, NetSource, NetworkView};
         use crate::chia_wallet_switch::{backup_of, view, EnvSwitch, KeyFacts, SwitchMemo};
-        let mut some = fp();
-        some.chia_wallet = Some(view(true, true, EnvSwitch::On, false, &SwitchMemo { remembered: true, error: None }, &KeyFacts::default(), backup_of(false, false)));
-        let json = serde_json::to_string(&some).unwrap();
-        assert!(json.contains(r#""chia_wallet":{"state":"gated","backup":"none"}"#), "{json}");
-        assert!(!json.contains("chia_address"), "{json}");
+        let memo = SwitchMemo { remembered: true, error: None };
+        for (channel, word) in [(true, "native"), (false, "none")] {
+            let backup = backup_of(ChiaNet::Mainnet.is_test(), channel);
+            let mut some = fp();
+            some.chia_network = Some(NetworkView::of(ChiaNet::Mainnet, NetSource::Env));
+            some.chia_wallet = Some(view(true, EnvSwitch::Unset, false, &memo, &KeyFacts::default(), backup));
+            let json = serde_json::to_string(&some).unwrap();
+            assert!(json.contains(&format!(r#""chia_wallet":{{"state":"ready","mnemonic":true,"backup":"{word}"}}"#)), "{json}");
+            assert!(!json.contains("chia_address"), "{json}");
+            some.chia_address = Some("xch1qq".into());
+            some.chia_wallet = Some(view(true, EnvSwitch::Unset, true, &memo, &KeyFacts { mnemonic: true, ..KeyFacts::default() }, backup));
+            let json = serde_json::to_string(&some).unwrap();
+            assert!(json.contains(&format!(r#""chia_wallet":{{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","backup":"{word}"}}"#)), "{json}");
+            assert!(json.contains(r#""chia_address":"xch1qq""#), "{json}");
+            assert!(!json.contains("gated"), "{json}");
+        }
     }
 
     /// 🖥️ The fingerprint's `chia_wallet.backup` names who shows the words:
@@ -1186,15 +1199,15 @@ mod fingerprint_json_tests {
     fn the_fingerprint_says_who_backs_the_words_up() {
         use crate::chia_wallet_switch::{backup_of, view, EnvSwitch, KeyFacts, SwitchMemo};
         let cases = [
-            ((true, true, false), "native"),
-            ((false, true, true), "native"),
-            ((true, false, false), "page"),
-            ((false, false, true), "none"),
+            ((true, true), "native"),
+            ((false, true), "native"),
+            ((true, false), "page"),
+            ((false, false), "none"),
         ];
-        for ((test_net, channel, gate), word) in cases {
+        for ((test_net, channel), word) in cases {
             let mut some = fp();
             let facts = KeyFacts { mnemonic: true, ..KeyFacts::default() };
-            some.chia_wallet = Some(view(true, gate, EnvSwitch::Unset, !gate, &SwitchMemo::default(), &facts, backup_of(test_net, channel)));
+            some.chia_wallet = Some(view(true, EnvSwitch::Unset, true, &SwitchMemo::default(), &facts, backup_of(test_net, channel)));
             let json = serde_json::to_string(&some).unwrap();
             assert!(json.contains(&format!(r#","backup":"{word}"}}"#)), "{json}");
             let back: Fingerprint = serde_json::from_str(&json).unwrap();
@@ -1868,10 +1881,11 @@ async fn main() -> Result<()> {
     println!("   Advertised direct-addr hints: {:?}", iroh_direct_addrs);
 
     // 🏦 Whether the SSF wallet loads at this start (chia_wallet_switch.rs):
-    // a network that allows no SSF wallet holds it off; then the environment
-    // (`SSF_CHIA_LANE=1` on, any other value off), else the switch the
-    // SpacePhone's Bank remembered beside the wallet. An unreadable switch
-    // file starts the wallet off and says why.
+    // the environment (`SSF_CHIA_LANE=1` on, any other value off), else the
+    // switch the SpacePhone's Bank remembered beside the wallet, on every
+    // network. An unreadable switch file starts the wallet off and says why.
+    // Off a test network a load with no identity on disk mints one only
+    // while the desktop app's channel is on (`load_wallet`).
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
@@ -1883,7 +1897,7 @@ async fn main() -> Result<()> {
                 wallet_memo.error = Some(why);
             }
         }
-        chia_wallet_switch::starts_on(true, !chia_net.wallet_allowed(), chia_wallet_switch::env_switch(), wallet_memo.remembered)
+        chia_wallet_switch::starts_on(true, chia_wallet_switch::env_switch(), wallet_memo.remembered)
     };
     #[cfg(not(feature = "chia-publish"))]
     let wallet_starts = false;
@@ -1926,7 +1940,7 @@ async fn main() -> Result<()> {
     } else if !chia_wallet_switch::dev_pages().is_empty() && !chia_net.is_test() {
         // The page reveal is refused off a test network, dev pages or not.
         println!(
-            "🏦 SSF wallet: SSF_BANK_DEV_PAGES is ignored on {}. Only the desktop app will show the 24 words here.",
+            "🏦 SSF wallet: SSF_BANK_DEV_PAGES is ignored on {}. Only the desktop app shows the 24 words here.",
             chia_net.name()
         );
     } else if !chia_wallet_switch::dev_pages().is_empty() {
@@ -2634,6 +2648,8 @@ async fn handle_wt_connection_inner(
                                         rooms: &hub_clone.chia_rooms,
                                         #[cfg(feature = "chia-publish")]
                                         wallet: hub_clone.chia_wallet.lock().unwrap().clone(),
+                                        #[cfg(feature = "chia-publish")]
+                                        env: chia_wallet_switch::env_switch(),
                                     };
                                     chia_faucet::handle_request(&ctx, &envelope.room, &envelope.payload).await
                                 } else {
@@ -3358,17 +3374,9 @@ async fn dial_peer_inner(
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
                     if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
-                        if !chia_network::net().wallet_allowed() {
-                            // No Bank or environment can turn a wallet on here.
-                            println!(
-                                "⛓️ ChiaHub rung-6: {target_str} unreachable by every path. A knock through the chain would reach it, but a chain knock needs an SSF wallet, and on {} Star Station makes none yet (not queued)",
-                                chia_network::net().name()
-                            );
-                        } else {
-                            println!(
-                                "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
-                            );
-                        }
+                        println!(
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
+                        );
                         report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing or the watcher off)")).await;
                         return;
                     }
@@ -5880,7 +5888,6 @@ fn header_value(req: &str, name: &str) -> Option<String> {
 /// 🏦 The SSF wallet switch as the fingerprint shows it (chia_wallet_switch.rs).
 fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Option<String>) {
     let net = chia_network::net();
-    let gate = !net.wallet_allowed();
     let backup = chia_wallet_switch::backup_of(net.is_test(), shell_channel::started());
     #[cfg(feature = "chia-publish")]
     {
@@ -5914,7 +5921,7 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
                 }
             }
         };
-        let view = chia_wallet_switch::view(true, gate, chia_wallet_switch::env_switch(), loaded, &memo, &facts, backup);
+        let view = chia_wallet_switch::view(true, chia_wallet_switch::env_switch(), loaded, &memo, &facts, backup);
         (view, key.as_ref().map(|sk| chia_wallet::receive_address(net, sk)))
     }
     #[cfg(not(feature = "chia-publish"))]
@@ -5922,7 +5929,7 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
         let _ = hub;
         let memo = chia_wallet_switch::SwitchMemo::default();
         let facts = chia_wallet_switch::KeyFacts::default();
-        (chia_wallet_switch::view(false, gate, chia_wallet_switch::env_switch(), false, &memo, &facts, backup), None)
+        (chia_wallet_switch::view(false, chia_wallet_switch::env_switch(), false, &memo, &facts, backup), None)
     }
 }
 
@@ -5975,11 +5982,6 @@ fn wallet_meta_of(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) 
 #[cfg(feature = "chia-publish")]
 fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::WalletMeta)> {
     let net = chia_network::net();
-    // The caller's gate holds a wallet off where the network allows none;
-    // this is the last word, so no path can mint one there.
-    if !net.wallet_allowed() {
-        return Err(anyhow!(chia_wallet_switch::GATED_WORDS));
-    }
     let policy = chia_at_rest::policy().map_err(|why| anyhow!(why))?;
     let mut id = chia_wallet::load_or_mint_wallet(
         net,
@@ -6088,7 +6090,7 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
 async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) -> Result<(), String> {
     let net = chia_network::net();
     let env = chia_wallet_switch::env_switch();
-    if let Some(why) = chia_wallet_switch::turn_refusal(true, !net.wallet_allowed(), env, on) {
+    if let Some(why) = chia_wallet_switch::turn_refusal(true, env, on) {
         return Err(why.to_string());
     }
     let _turn = hub.wallet_turn.lock().await;

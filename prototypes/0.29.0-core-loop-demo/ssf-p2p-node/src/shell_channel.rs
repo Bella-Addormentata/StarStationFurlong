@@ -669,16 +669,30 @@ mod tests {
             }),
             "only public facts: no error, no key fingerprint, no flags beyond backed_up"
         );
-        let gated = WalletSwitch { state: WalletState::Gated, backed_up: false, ..wallet };
-        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &gated, None)).unwrap();
+        // Mainnet holds an SSF wallet now: the app's hello there names it as
+        // on testnet11, Ready before it is made and On with its address.
+        let ready = WalletSwitch { state: WalletState::Ready, backed_up: false, ..wallet.clone() };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &ready, None)).unwrap();
         assert_eq!(
             v,
             serde_json::json!({
                 "ok": true,
                 "net": { "id": "mainnet", "genesis": ChiaNet::Mainnet.genesis_hex() },
-                "wallet": "gated",
+                "wallet": "ready",
                 "backed_up": false,
                 "address": null,
+            })
+        );
+        let on = WalletSwitch { backed_up: false, ..wallet };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &on, Some("xch1abc"))).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "net": { "id": "mainnet", "genesis": ChiaNet::Mainnet.genesis_hex() },
+                "wallet": "on",
+                "backed_up": false,
+                "address": "xch1abc",
             })
         );
     }

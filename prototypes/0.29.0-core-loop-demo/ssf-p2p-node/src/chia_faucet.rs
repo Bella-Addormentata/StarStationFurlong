@@ -432,13 +432,16 @@ impl FaucetReply {
 }
 
 /// What a request needs from the node: the room caps (for the room key) and,
-/// in a publish build, the wallet key while the SSF wallet is on, and the
+/// in a publish build, the wallet key while the SSF wallet is on and what
+/// `SSF_CHIA_LANE` says (the dish's words while no wallet is on), and the
 /// network the node runs on.
 pub struct FaucetContext<'a> {
     pub net: ChiaNet,
     pub rooms: &'a Mutex<HashMap<String, ChiaRoomCap>>,
     #[cfg(feature = "chia-publish")]
     pub wallet: Option<chia_bls::SecretKey>,
+    #[cfg(feature = "chia-publish")]
+    pub env: crate::chia_wallet_switch::EnvSwitch,
 }
 
 /// Serve one `faucet` request from the LOCAL browser for `room`.
@@ -543,13 +546,8 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 st.note = part.note;
             }
             None => {
-                // Under the gate the environment changes nothing, so it is
-                // not read.
-                let gate = !ctx.net.wallet_allowed();
-                let env = if gate { crate::chia_wallet_switch::EnvSwitch::Unset } else { crate::chia_wallet_switch::env_switch() };
                 st.note = crate::chia_wallet_switch::no_wallet_words(
-                    gate,
-                    env,
+                    ctx.env,
                     if ctx.net.is_test() { "take or give" } else { "take a mojo" },
                 );
             }
@@ -722,13 +720,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| {
-            anyhow!(crate::chia_wallet_switch::no_wallet_words(
-                !ctx.net.wallet_allowed(),
-                crate::chia_wallet_switch::env_switch(),
-                "take a mojo"
-            ))
-        })?;
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, "take a mojo")))?;
     // One TAKE at a time, serialized with every other wallet writer: the
     // courtesy check, the coin pick and the push are one critical section, and
     // a gift still landing (its faucet coin parked until the chain or the
@@ -844,9 +836,10 @@ async fn give(
     if !ctx.net.is_test() {
         return Err(anyhow!(MAINNET_NO_GIVE));
     }
-    let sk = ctx.wallet.as_ref().ok_or_else(|| {
-        anyhow!(crate::chia_wallet_switch::no_wallet_words(!ctx.net.wallet_allowed(), crate::chia_wallet_switch::env_switch(), "give"))
-    })?;
+    let sk = ctx
+        .wallet
+        .as_ref()
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, "give")))?;
     if amount < params.gift {
         return Err(anyhow!("a gift below {} mojo(s) could never leave the jar", params.gift));
     }
@@ -1352,6 +1345,8 @@ mod tests {
             rooms: &rooms,
             #[cfg(feature = "chia-publish")]
             wallet: None,
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let reply = rt.block_on(handle_request(&ctx, "home-abc", br#"{"op":"status"}"#));
@@ -1436,21 +1431,26 @@ mod tests {
 
     /// The status a mainnet node serves, end to end through `status`: a
     /// full jar on the chain, and still no GIVE, with the network's note
-    /// after the reason this node holds no wallet. No wallet is held, as on a
-    /// gated node, so the wallet lease and the environment are never read.
+    /// after the reason this node holds no wallet. No wallet is held, so the
+    /// wallet lease is never read, and `SSF_CHIA_LANE` comes from the
+    /// context, never the environment. Mainnet makes an SSF wallet now, so
+    /// the dish points at the Bank there as on testnet11, for TAKE only.
     #[test]
     fn a_mainnet_status_offers_no_give_and_says_why() {
         let params = test_params();
         let coin = FaucetCoin { coin: Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000), confirmed_height: 100 };
         let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
         let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
-        let chain = crate::chia_chain::testing::Scripted::new(vec![page]).with_peak(200);
+        let jar = || crate::chia_chain::testing::Scripted::new(vec![page.clone()]).with_peak(200);
+        let chain = jar();
         let rooms = Mutex::new(HashMap::new());
         let ctx = FaucetContext {
             net: ChiaNet::Mainnet,
             rooms: &rooms,
             #[cfg(feature = "chia-publish")]
             wallet: None,
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
@@ -1460,19 +1460,27 @@ mod tests {
         assert!(!st.can_give && !st.can_claim, "{st:?}");
         assert!(st.note.ends_with(MAINNET_NO_GIVE), "{}", st.note);
         #[cfg(feature = "chia-publish")]
-        assert_eq!(
-            st.note,
-            "this node runs on Chia mainnet, where Star Station makes no SSF wallet yet, so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
-        );
+        {
+            assert_eq!(
+                st.note,
+                "this node's SSF wallet is not on yet: turn it on in the SpacePhone's 🏦 BANK to take a mojo. On mainnet the dish does not take gifts from this node."
+            );
+            // Held off by SSF_CHIA_LANE: that is the reason, and the Bank is not.
+            let off = FaucetContext { env: crate::chia_wallet_switch::EnvSwitch::Off, ..ctx };
+            let st = rt.block_on(status(&off, &jar(), &params)).unwrap();
+            assert_eq!(
+                st.note,
+                "this node's SSF wallet is switched off (SSF_CHIA_LANE in its environment), so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
+            );
+            assert!(!st.can_give && !st.can_claim, "{st:?}");
+        }
         #[cfg(not(feature = "chia-publish"))]
         assert_eq!(
             st.note,
             "this node was built without publishing; it can show the dish but not take or give. On mainnet the dish does not take gifts from this node."
         );
         assert!(st.snapshot > 0, "numbered as it completed");
-        for word in ["BANK", "SSF_CHIA_LANE"] {
-            assert!(!st.note.contains(word), "{}", st.note);
-        }
+        assert!(!st.note.contains("no SSF wallet"), "{}", st.note);
     }
 
     /// GIVE on mainnet is refused before the wallet or the chain is asked:
@@ -1487,9 +1495,21 @@ mod tests {
             rooms: &rooms,
             #[cfg(feature = "chia-publish")]
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 1)).unwrap_err();
         assert_eq!(err.to_string(), MAINNET_NO_GIVE);
+        // With no wallet on, too: the network is said first, never the Bank.
+        let none = FaucetContext {
+            net: ChiaNet::Mainnet,
+            rooms: &rooms,
+            #[cfg(feature = "chia-publish")]
+            wallet: None,
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
+        };
+        assert_eq!(rt.block_on(give(&none, &chain, &test_params(), 1)).unwrap_err().to_string(), MAINNET_NO_GIVE);
         // Testnet11 gets past the network check: a gift too small to leave
         // the jar is refused next, before the chain is asked, and with a
         // wallet held no switch is read from the environment.
@@ -1498,6 +1518,8 @@ mod tests {
             rooms: &rooms,
             #[cfg(feature = "chia-publish")]
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 0)).unwrap_err().to_string();
         #[cfg(feature = "chia-publish")]

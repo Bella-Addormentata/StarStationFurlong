@@ -3,8 +3,10 @@
 //!
 //! One value, [`ChiaNet`], decides what used to be hard-coded to testnet11:
 //! the address prefix, the AGG_SIG constants a spend is signed with, the
-//! folder the per-network state files live in, the node's texts and whether
-//! the SSF wallet may exist at all. It is read once from `SSF_CHIA_NETWORK`
+//! folder the per-network state files live in, the node's texts, and whether
+//! it is a test network: off one, only the desktop app shows the SSF wallet's
+//! 24 words and a new wallet is made only while its channel is on
+//! (chia_wallet_switch.rs). It is read once from `SSF_CHIA_NETWORK`
 //! ([`selected`]). Unset or empty means [`DEFAULT_NET`], and testnet11 keeps
 //! every file name, address, signature and text it had before.
 //!
@@ -16,8 +18,8 @@
 //! pure forms that take the network as an argument, so no test reads the
 //! environment.
 //!
-//! Always compiled: the wallet switch's gates (chia_wallet_switch.rs) take
-//! the network in every build, and the fingerprint carries it.
+//! Always compiled: the words rules (chia_wallet_switch.rs) take the
+//! network in every build, and the fingerprint carries it.
 // A read-only build uses only part of this (no wallet, no address, no words).
 #![cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 
@@ -135,16 +137,6 @@ impl ChiaNet {
         }
     }
 
-    /// Whether the node may make or load an SSF wallet on this network. Not
-    /// on mainnet until the desktop app shows the 24 words itself: the page
-    /// reveal was accepted for testnet only.
-    pub fn wallet_allowed(self) -> bool {
-        match self {
-            ChiaNet::Testnet11 => true,
-            ChiaNet::Mainnet => false,
-        }
-    }
-
     /// The network's consensus constants, which the AGG_SIG messages a spend
     /// signs are made from.
     #[cfg(feature = "chia-read")]
@@ -253,26 +245,17 @@ pub fn startup(selected: &Result<(ChiaNet, NetSource), String>) -> Result<String
 }
 
 /// The startup line that names the network and where it came from, and, off
-/// a test network, that its coins are real and whether this node may hold an
-/// SSF wallet there.
+/// a test network, that its coins are real.
 pub fn network_line(net: ChiaNet, source: NetSource) -> String {
     let from = match source {
         NetSource::Default => "the default",
         NetSource::Env => "set by SSF_CHIA_NETWORK",
     };
-    let mut notes = Vec::new();
-    if !net.is_test() {
-        notes.push(format!("Real {}.", net.ticker()));
-    }
-    if !net.wallet_allowed() {
-        notes.push("This node holds no SSF wallet here yet.".to_string());
-    }
     let line = format!("⛓️ Chia network: {} ({from})", net.id());
-    if notes.is_empty() {
+    if net.is_test() {
         return line;
     }
-    let notes = notes.join(" ");
-    format!("{line}. {notes}")
+    format!("{line}. Real {}.", net.ticker())
 }
 
 /// Make the folder that holds `net`'s own state files under `root`, readable
@@ -311,10 +294,8 @@ mod tests {
         assert_eq!(DEFAULT_NET, ChiaNet::Testnet11, "testnet11 is the default until stage 5");
         let t = ChiaNet::Testnet11;
         assert_eq!((t.id(), t.name(), t.prefix(), t.ticker(), t.is_test(), t.port()), ("testnet11", "testnet11", "txch", "TXCH", true, 58444));
-        assert!(t.wallet_allowed());
         let m = ChiaNet::Mainnet;
         assert_eq!((m.id(), m.name(), m.prefix(), m.ticker(), m.is_test(), m.port()), ("mainnet", "Chia mainnet", "xch", "XCH", false, 8444));
-        assert!(!m.wallet_allowed(), "no SSF wallet on mainnet until the desktop app shows the words itself");
         for net in ChiaNet::ALL {
             let g = net.genesis_hex();
             assert!(g.len() == 64 && g.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{g}");
@@ -411,16 +392,16 @@ mod tests {
         let line = |net, source| startup(&Ok((net, source))).unwrap();
         assert_eq!(line(ChiaNet::Testnet11, NetSource::Default), "⛓️ Chia network: testnet11 (the default)");
         assert_eq!(line(ChiaNet::Testnet11, NetSource::Env), "⛓️ Chia network: testnet11 (set by SSF_CHIA_NETWORK)");
-        assert_eq!(
-            line(ChiaNet::Mainnet, NetSource::Env),
-            "⛓️ Chia network: mainnet (set by SSF_CHIA_NETWORK). Real XCH. This node holds no SSF wallet here yet."
-        );
+        // Mainnet makes an SSF wallet now (the desktop app shows its words),
+        // so the line no longer says this node holds none there.
+        assert_eq!(line(ChiaNet::Mainnet, NetSource::Env), "⛓️ Chia network: mainnet (set by SSF_CHIA_NETWORK). Real XCH.");
+        assert_eq!(line(ChiaNet::Mainnet, NetSource::Default), "⛓️ Chia network: mainnet (the default). Real XCH.");
         for net in ChiaNet::ALL {
             for source in [NetSource::Default, NetSource::Env] {
                 let l = network_line(net, source);
                 assert!(!l.contains('\u{2014}') && !l.contains('\n'), "{l}");
                 assert_eq!(l.contains("Real"), !net.is_test(), "{l}");
-                assert_eq!(l.contains("no SSF wallet"), !net.wallet_allowed(), "{l}");
+                assert!(!l.contains("SSF wallet"), "{l}");
             }
         }
     }
