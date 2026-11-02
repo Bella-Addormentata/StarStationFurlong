@@ -108,9 +108,10 @@ export interface ChiaPresence {
 
 /** 🏦 The SSF wallet switch's state: `unbuilt` (a node built without
  *  publishing), `off` (`SSF_CHIA_LANE` holds it off), `ready` (the Bank may
- *  turn it on), `on` (the wallet is loaded), `gated` (the node runs on Chia
- *  mainnet, where it makes and loads no SSF wallet yet). */
-export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on' | 'gated';
+ *  turn it on), `on` (the wallet is loaded). The same four on every network:
+ *  mainnet makes SSF wallets now. An older mainnet node's `gated` (it made
+ *  none there) is not one of them, so it reads as an older node. */
+export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
 /** 🔒 How the wallet's file keeps its key on disk: `none` in the clear
  *  (owner-only on Unix), `dpapi` locked to this Windows account. */
@@ -179,7 +180,7 @@ const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'd
 
 const BACKUP_KINDS: ReadonlySet<string> = new Set<ChiaWalletBackup>(['native', 'page', 'none']);
 
-const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on', 'gated']);
+const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on']);
 
 /** The node's `chia_wallet` in its own shape, or undefined for anything
  *  else: an unknown state, a flag that is not a boolean, or an error that is

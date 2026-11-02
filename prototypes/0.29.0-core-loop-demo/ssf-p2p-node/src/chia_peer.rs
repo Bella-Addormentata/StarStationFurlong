@@ -125,7 +125,7 @@ impl Network {
     }
 
     /// Chia mainnet: real XCH. Selected only in a `chia-mainnet` build
-    /// (chia_network.rs), and a node there holds no SSF wallet yet.
+    /// (chia_network.rs).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn mainnet() -> Self {
         Self::of(ChiaNet::Mainnet)

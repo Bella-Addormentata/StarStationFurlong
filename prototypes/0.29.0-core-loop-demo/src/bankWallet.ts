@@ -17,11 +17,14 @@
 //
 // ⛓️ The texts follow the node's Chia network (chiaNetwork.ts): a network
 // line above the switch, amber on mainnet, and no address at all on a
-// network this page does not know. On mainnet the node makes no SSF wallet
-// yet (`gated`), and the Bank offers no switch for it.
+// network this page does not know. On mainnet the node makes a new SSF
+// wallet only when the desktop app started it (its `backup` is `native`),
+// so the app can show the 24 words; with any other `backup` the Bank offers
+// no CREATE there, and TURN ON of a wallet already on disk works as on
+// testnet11.
 
 import type { ChiaNetwork } from './chiaNetwork';
-import type { LocalFingerprint } from './nodeFingerprint';
+import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
 /** The page's own part: CREATE armed and waiting for CONFIRM, a request in
  *  flight, and the last request's failure in the page's or the node's words. */
@@ -67,8 +70,11 @@ export const TURN_TIMEOUT_MS = 45_000;
 
 const TURN_ON_WARNING = (net: ChiaNetwork): string =>
   `Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address, and once the wallet holds a coin it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
+/** Off a test network it promises no mojo from the faucet dish: no lobby
+ *  jar holds real XCH until the mainnet move itself, and the note under the
+ *  address names no faucet there either. */
 const CREATE_WARNING = (net: ChiaNetwork): string =>
-  `Create an SSF wallet? Your node makes a new ${net.name} key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin (one mojo from the faucet dish is enough) it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
+  `Create an SSF wallet? Your node makes a new ${net.name} key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin${net.test ? ' (one mojo from the faucet dish is enough)' : ''} it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
 /** CREATE on a node older than the 24 words (#352's), which never says
  *  `mnemonic`: its wallet is a raw key, which the next update replaces. */
 const CREATE_OLDER_NODE_WARNING = (net: ChiaNetwork): string =>
@@ -85,9 +91,25 @@ export function networkLine(net: ChiaNetwork): { text: string; warn: boolean } {
     : { text: `Network: ${net.name}. Its coins (${net.ticker}) are real money.`, warn: true };
 }
 
-/** The node runs on Chia mainnet (or another network that is not a test
- *  one), where it makes no SSF wallet yet. */
-export const GATED_TEXT = 'Star Station does not make SSF wallets on Chia mainnet yet. Your node only reads the chain here.';
+/** Whether nothing on this page can bring an SSF wallet on: off a test
+ *  network, with no desktop app channel to the node (`backup` is not
+ *  `native`) and no wallet on disk (`seed`), the node refuses to make a new
+ *  wallet whose words nothing here can show. The Bank then offers no CREATE
+ *  and the Phone Book's row names the desktop app, not the Bank. */
+export function mintsOnlyInApp(net: ChiaNetwork, w: ChiaWalletSwitch): boolean {
+  return !net.test && !w.seed && w.backup !== 'native';
+}
+
+/** Off a test network, with no desktop app channel to the node (`backup`
+ *  is not `native`): the node refuses to make a new wallet whose words
+ *  nothing here can show, so the Bank offers no CREATE. */
+export const createInAppText = (net: ChiaNetwork): string =>
+  `On ${net.name} your station node makes a new SSF wallet only when the Star Station desktop app started it, so the app can show its 24 words.`;
+/** A node with no switch this page reads, off a test network: one older
+ *  than mainnet's SSF wallet (it sent `gated`), or one this page cannot
+ *  read. */
+export const olderNodeText = (net: ChiaNetwork): string =>
+  `Your station node is older than this page and makes no SSF wallet on ${net.name}: update Star Station.`;
 /** The node names a network this page does not know. */
 export const UNKNOWN_NETWORK_TEXT = 'Your node runs on a Chia network this page does not know, so the Bank shows no address.';
 
@@ -105,6 +127,14 @@ export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
     };
 }
 
+/** THE REGISTRY's line on the Chia account, with the node's network: a
+ *  mainnet wallet holds real money, so it is never called a test one. No
+ *  network without a node, or on one this page does not know. */
+export function registryChiaLine(net: ChiaNetwork | null | undefined): string {
+  const where = !net ? '' : net.test ? ` (${net.name}, a test network)` : ` (${net.name}: real ${net.ticker})`;
+  return `Chia account: your SSF wallet, kept by your station node on this computer${where}; turn it on, and see its address and balance, under RECEIVE.`;
+}
+
 /** What the Bank's RECEIVE section shows about the wallet. */
 export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: BankWalletUi): BankWalletView {
   if (!fp) {
@@ -117,9 +147,6 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   // keeps none), no switch, and the reason.
   if (!net) return { network: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };
   const none = { network: networkLine(net), warning: null, notice: null, button: null } as const;
-  // Mainnet: the node makes and loads no SSF wallet, so there is nothing to
-  // turn and no address to pay.
-  if (w?.state === 'gated') return { ...none, text: GATED_TEXT, error: null, showsAddress: false };
   if (fp.chia_address) {
     if (!w) return { ...none, text: '', error: null, showsAddress: true };
     const notice = w.state === 'on' && w.reminted ? REMINTED(net) : null;
@@ -150,7 +177,10 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   if (!w) {
     return {
       ...none,
-      text: 'Your station node has no wallet loaded, and it is older than the Bank\'s wallet switch: update Star Station, or start the node with SSF_CHIA_LANE=1.',
+      // Every node before the switch ran on testnet11 only.
+      text: net.test
+        ? 'Your station node has no wallet loaded, and it is older than the Bank\'s wallet switch: update Star Station, or start the node with SSF_CHIA_LANE=1.'
+        : olderNodeText(net),
       error: null,
       showsAddress: false,
     };
@@ -168,6 +198,12 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       // A raw-seed wallet from before the 24 words is retired, not loaded:
       // that is a CREATE, with its own warning, never a TURN ON.
       const legacy = !w.seed && w.legacy === true;
+      // Off a test network the node mints only for the desktop app that
+      // started it, so a CREATE anywhere else would only be refused. A
+      // wallet already on disk loads (TURN ON) either way.
+      if (mintsOnlyInApp(net, w)) {
+        return { ...none, text: createInAppText(net), error, showsAddress: false };
+      }
       if (ui.turning) {
         return { network: none.network, warning: null, notice: null, text: 'Turning your SSF wallet on…', error: null, button: { act: 'confirm', label: 'TURNING ON…', danger: false, busy: true }, showsAddress: false };
       }

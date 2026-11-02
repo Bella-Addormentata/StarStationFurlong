@@ -36,10 +36,10 @@ import {
   type BackupWindowDeps,
   type BankBackupUi,
 } from './bankBackup';
-import { GATED_TEXT, bankWalletView } from './bankWallet';
+import { bankWalletView, olderNodeText } from './bankWallet';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import { NATIVE_BACKUP_ANSWERS, openBackup, type NativeBackupAnswer } from './nativeShell';
-import type { ChiaWalletBackup, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
+import { parseChiaWallet, type ChiaWalletBackup, type ChiaWalletSwitch, type LocalFingerprint } from './nodeFingerprint';
 
 const BODY = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
 const OTHER_BODY = 'zry9x8gf2tvdw0s3jn54khce6mua7lqp'.repeat(2).slice(0, 58);
@@ -510,10 +510,12 @@ describe('BACK UP on Chia mainnet', () => {
     });
     expect(bankBackupView({ ...fpOn(MAINNET, 'native'), chia_net: null }, BACKUP_IDLE, 'app', true)).toBeNull();
     expect(bankBackupView({ ...fpOn(MAINNET), chia_net: null }, BACKUP_IDLE, 'app', false)).toBeNull();
-    const gated: LocalFingerprint = { ...fpOn(MAINNET, 'none'), chia_address: undefined, chia_wallet: { state: 'gated', backup: 'none' } };
-    expect(bankBackupView(gated, BACKUP_IDLE, 'app', true)).toBeNull();
-    // GATED_TEXT stays for a node that still reports gated.
-    expect(bankWalletView(gated, { armed: false, turning: false, error: null }).text).toBe(GATED_TEXT);
-    expect(bankWalletView({ ...gated, chia_wallet: { state: 'gated', backup: 'native' } }, { armed: false, turning: false, error: null }).text).toBe(GATED_TEXT);
+    // A mainnet node older than mainnet's SSF wallet sent `gated`, which
+    // no node sends now: the parse drops that switch, so it reads as an
+    // older node, with no BACK UP and no switch, whatever its `backup`.
+    for (const backup of ['none', 'native'] as const) expect(parseChiaWallet({ state: 'gated', backup })).toBeUndefined();
+    const older: LocalFingerprint = { ...fpOn(MAINNET, 'none'), chia_address: undefined, chia_wallet: undefined };
+    expect(bankBackupView(older, BACKUP_IDLE, 'app', true)).toBeNull();
+    expect(bankWalletView(older, { armed: false, turning: false, error: null })).toMatchObject({ button: null, showsAddress: false, text: olderNodeText(MAINNET) });
   });
 });

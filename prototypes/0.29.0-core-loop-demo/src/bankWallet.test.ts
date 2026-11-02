@@ -3,7 +3,7 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { GATED_TEXT, UNKNOWN_NETWORK_TEXT, bankWalletView, receiveNote, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { UNKNOWN_NETWORK_TEXT, bankWalletView, createInAppText, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
@@ -148,7 +148,9 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
   });
 
   it('names the network in what turning on means', () => {
-    const armed = (w: ChiaWalletSwitch) => bankWalletView(on(w), { ...IDLE, armed: true }).warning ?? '';
+    // A node the desktop app started (`backup: native`): the one that may
+    // make a new wallet on mainnet. On testnet11 `backup` changes nothing here.
+    const armed = (w: ChiaWalletSwitch) => bankWalletView(on({ ...w, backup: 'native' }), { ...IDLE, armed: true }).warning ?? '';
     expect(armed({ state: 'ready', mnemonic: true })).toContain(`new ${net.name} key from 24 words`);
     expect(armed({ state: 'ready', mnemonic: true })).toContain(`Phone Book on ${net.chain}.`);
     expect(armed({ state: 'ready' })).toContain(`a ${net.name} key you cannot write down`);
@@ -162,12 +164,53 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
     expect(bankWalletView(on({ state: 'on', stays: true }, addr), IDLE)).toMatchObject({ showsAddress: true, button: { act: 'off' } });
   });
 
-  it('offers no switch on a gated node, and says why', () => {
-    for (const ui of [IDLE, { ...IDLE, armed: true }, { ...IDLE, error: 'x' }]) {
-      const v = bankWalletView(on({ state: 'gated' }), ui);
-      expect(v).toMatchObject({ button: null, showsAddress: false, warning: null, text: GATED_TEXT });
+  it('offers CREATE where the node may make a new wallet: on a test network, or for the desktop app that started it', () => {
+    for (const backup of ['native', 'page', 'none', undefined] as const) {
+      const w: ChiaWalletSwitch = { state: 'ready', mnemonic: true, ...(backup ? { backup } : {}) };
+      const mints = net.test || backup === 'native';
+      for (const ui of [IDLE, { ...IDLE, armed: true }]) {
+        const v = bankWalletView(on(w), ui);
+        if (mints) {
+          expect(v.button?.act).toBe(ui.armed ? 'confirm' : 'arm');
+        } else {
+          // Mainnet, the app's channel off: the node would refuse the mint.
+          expect(v).toMatchObject({ button: null, showsAddress: false, warning: null, text: createInAppText(net) });
+          expect(v.network?.warn).toBe(true);
+        }
+      }
+      // A wallet already on disk loads on any network, whoever started the node.
+      expect(bankWalletView(on({ state: 'ready', mnemonic: true, seed: true, ...(backup ? { backup } : {}) }), IDLE).button).toMatchObject({ act: 'arm', label: 'TURN ON SSF WALLET' });
     }
-    expect(GATED_TEXT).toBe('Star Station does not make SSF wallets on Chia mainnet yet. Your node only reads the chain here.');
+    expect(createInAppText(MAINNET)).toBe('On Chia mainnet your station node makes a new SSF wallet only when the Star Station desktop app started it, so the app can show its 24 words.');
+    // The node's own refusal of a turn still shows under the line.
+    if (!net.test) expect(bankWalletView(on({ state: 'ready', mnemonic: true, backup: 'none', error: 'x' }), IDLE).error).toBe('x');
+  });
+
+  it('promises a mojo from the faucet dish only on a test network', () => {
+    const warning = bankWalletView(on({ state: 'ready', mnemonic: true, backup: 'native' }), { ...IDLE, armed: true }).warning ?? '';
+    expect(warning.includes('faucet')).toBe(net.test);
+  });
+
+  it('reads an older mainnet node, which sent `gated`, as an older node with no switch', () => {
+    // The fingerprint parse drops `gated` (nodeFingerprint.ts), so the Bank
+    // sees no switch at all.
+    const v = bankWalletView(on(), IDLE);
+    expect(v).toMatchObject({ button: null, showsAddress: false, warning: null });
+    if (net.test) {
+      expect(v.text).toContain('SSF_CHIA_LANE=1');
+    } else {
+      expect(v.text).toBe(olderNodeText(net));
+      expect(v.text).toBe('Your station node is older than this page and makes no SSF wallet on Chia mainnet: update Star Station.');
+      expect(v.text).not.toContain('SSF_CHIA_LANE');
+    }
+  });
+
+  it('shows a mainnet wallet that is on, with its address, as on testnet11', () => {
+    for (const backup of ['native', 'none'] as const) {
+      const v = bankWalletView(on({ state: 'on', stays: true, mnemonic: true, backup }, addr), IDLE);
+      expect(v).toMatchObject({ showsAddress: true, button: { act: 'off', label: 'TURN OFF' } });
+      expect(v.text).toBe('SSF wallet on — it comes back on whenever your node starts.');
+    }
   });
 
   it('shows no address and no switch on a network the page does not know', () => {
@@ -191,6 +234,36 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       // Zero-fee spends may stall on mainnet: no promise that one coin lasts.
       expect(note.text).not.toContain('for good');
       expect(note.text).not.toContain('faucet');
+    }
+  });
+
+  it("names the wallet's network under THE REGISTRY, never a test one on mainnet", () => {
+    const line = registryChiaLine(net);
+    expect(line).toContain('under RECEIVE');
+    if (net.test) {
+      expect(line).toBe('Chia account: your SSF wallet, kept by your station node on this computer (testnet11, a test network); turn it on, and see its address and balance, under RECEIVE.');
+    } else {
+      expect(line).toBe('Chia account: your SSF wallet, kept by your station node on this computer (Chia mainnet: real XCH); turn it on, and see its address and balance, under RECEIVE.');
+      expect(line).not.toContain('test');
+    }
+  });
+
+  it('says the Bank can bring no wallet on only off a test network, with no app channel and none on disk', () => {
+    for (const backup of ['native', 'page', 'none', undefined] as const) {
+      for (const seed of [true, false]) {
+        const w: ChiaWalletSwitch = { state: 'ready', mnemonic: true, seed, ...(backup ? { backup } : {}) };
+        expect(mintsOnlyInApp(net, w)).toBe(!net.test && !seed && backup !== 'native');
+        // The Bank's own CREATE rule is this one.
+        if (!seed) expect(bankWalletView(on(w), IDLE).text === createInAppText(net)).toBe(mintsOnlyInApp(net, w));
+      }
+    }
+  });
+});
+
+describe('registryChiaLine', () => {
+  it('names no network without a node, or on one this page does not know', () => {
+    for (const none of [null, undefined]) {
+      expect(registryChiaLine(none)).toBe('Chia account: your SSF wallet, kept by your station node on this computer; turn it on, and see its address and balance, under RECEIVE.');
     }
   });
 });

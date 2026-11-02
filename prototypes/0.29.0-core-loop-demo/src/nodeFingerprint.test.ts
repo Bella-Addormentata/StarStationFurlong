@@ -45,9 +45,12 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ state: 'ready' })).toEqual({ state: 'ready' });
     expect(fp({ state: 'ready', seed: true })).toEqual({ state: 'ready', seed: true });
     expect(fp({ state: 'on', stays: true, held: false, error: 'disk full' })).toEqual({ state: 'on', stays: true, error: 'disk full' });
-    for (const state of ['unbuilt', 'off', 'ready', 'on', 'gated']) expect(parseChiaWallet({ state })?.state).toBe(state);
-    // ⛓️ A mainnet node makes no SSF wallet yet, and says so.
-    expect(fp({ state: 'gated' })).toEqual({ state: 'gated' });
+    for (const state of ['unbuilt', 'off', 'ready', 'on']) expect(parseChiaWallet({ state })?.state).toBe(state);
+    // ⛓️ Mainnet makes SSF wallets now, so `gated` (an older mainnet node's
+    // "none here") is no state of the switch: it reads as an older node,
+    // which the Bank offers no switch for.
+    expect(fp({ state: 'gated' })).toBeUndefined();
+    expect(fp({ state: 'gated', backup: 'none' })).toBeUndefined();
     // An older node sends none, and nothing is invented for it.
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_wallet).toBeUndefined();
     // Anything off the node's shape is no readout: the Bank then offers no switch.
@@ -99,8 +102,8 @@ describe('parseNodeFingerprint', () => {
     for (const backup of ['native', 'page', 'none'] as const) {
       expect(fp({ state: 'on', mnemonic: true, backup })).toEqual({ state: 'on', mnemonic: true, backup });
       expect(parseChiaWallet({ state: 'ready', backup })).toEqual({ state: 'ready', backup });
-      // It rides in every state, gated too.
-      expect(fp({ state: 'gated', backup })).toEqual({ state: 'gated', backup });
+      // It rides in every state.
+      for (const state of ['unbuilt', 'off'] as const) expect(fp({ state, backup })).toEqual({ state, backup });
     }
     // An older node sends none: the switch reads exactly as before the field.
     expect(fp({ state: 'on', mnemonic: true })).toEqual({ state: 'on', mnemonic: true });

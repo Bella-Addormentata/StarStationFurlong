@@ -14,6 +14,8 @@
  *
  * Nothing here is drawn per frame: the fingerprint poll drives it.
  */
+import { mintsOnlyInApp } from './bankWallet';
+import type { ChiaNetwork } from './chiaNetwork';
 import type { ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
 
 /** The two colours Dorkmo asked for: green for a current listing, grey for a
@@ -66,10 +68,13 @@ const notPublished = (value: string): PhoneBookIndicator => ({ ...NO_NODE, row: 
 const NOT_PUBLISHED = notPublished('OFF — this node does not publish presence (a read-only build, no SSF wallet, or SSF_CHIA_FINDABLE=0)');
 /** 🏦 The SSF wallet switch says why, when it is the reason (bankWallet.ts). */
 const WALLET_NOT_ON = notPublished("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
+/** Off a test network where the Bank can bring no wallet on (bankWallet.ts
+ *  `mintsOnlyInApp`): it offers no switch there, so the row names who
+ *  makes one instead. */
+const walletOnlyInApp = (net: ChiaNetwork): PhoneBookIndicator =>
+  notPublished(`OFF — this node holds no SSF wallet, and on ${net.name} only the Star Station desktop app that started it makes one`);
 const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
 const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
-/** ⛓️ The node runs on Chia mainnet, where it makes no SSF wallet yet. */
-const GATED = notPublished('OFF: this node runs on Chia mainnet, where Star Station makes no SSF wallet yet.');
 /** On, with no listing reported yet: the publisher's first round runs about a
  *  minute after the wallet turns on, and a node that is not findable never
  *  reports one. */
@@ -84,10 +89,9 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
   const p = fp.chia_presence;
   if (!p) {
     switch (fp.chia_wallet?.state) {
-      case 'ready': return WALLET_NOT_ON;
+      case 'ready': return fp.chia_net && mintsOnlyInApp(fp.chia_net, fp.chia_wallet) ? walletOnlyInApp(fp.chia_net) : WALLET_NOT_ON;
       case 'off': return WALLET_HELD_OFF;
       case 'unbuilt': return READ_ONLY_BUILD;
-      case 'gated': return GATED;
       case 'on': return WALLET_ON_UNREPORTED;
       default: return NOT_PUBLISHED;
     }

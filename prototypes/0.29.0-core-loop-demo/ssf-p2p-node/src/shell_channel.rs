@@ -18,6 +18,16 @@
 //! node started by hand in a terminal, never turns it on. Decided once at
 //! startup ([`init`]) and sticky for the run ([`started`]): a node started
 //! with the channel keeps refusing the page reveal after stdin closes.
+//! Whether the app can still be answered is a second answer, [`live`]: true
+//! only once the channel's thread has answered a request from the app, and
+//! false for good from the moment the channel closes (EOF, a read or write
+//! error, a line that is too long, a panic). A new wallet is made off a test
+//! network only while it is true (chia_wallet_switch::may_mint), so a node
+//! the app left running (a crash on Windows or macOS, where the node
+//! outlives the app) makes no wallet whose words nothing can show. Nor does
+//! a node at startup: its wallet loads before the thread starts, while the
+//! channel is not live yet, so off a test network only a wallet already on
+//! disk loads there, and a new one waits for the Bank's CREATE.
 //!
 //! While it is on, stdout carries only frames: the crate's `println!`
 //! (main.rs, before the first `mod`) writes to stderr instead.
@@ -35,11 +45,13 @@
 //! A line that is too long gets [`Refusal::TooLong`] and closes the channel:
 //! nothing more is answered, and the rest of stdin is read and dropped until
 //! EOF, so the app's writes never block on a full pipe. Bad JSON, another `v` or an unknown op get their own fixed refusal and the
-//! channel reads on. EOF ends the thread and nothing else. A refusal frame is
-//! a fixed sentence and never holds a word.
+//! channel reads on. EOF ends the thread, and the channel stops being
+//! [`live`]; the node runs on and the page reveal stays refused. A refusal
+//! frame is a fixed sentence and never holds a word.
 
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use zeroize::{Zeroize, Zeroizing};
@@ -59,6 +71,11 @@ static STARTED: OnceLock<bool> = OnceLock::new();
 /// Whether [`guard_pipes`] held, set once by [`init`] while the channel is on.
 static GUARDED: OnceLock<bool> = OnceLock::new();
 
+/// Whether the channel can still answer the app ([`live`]): set only by the
+/// channel's thread, once it has answered a request from the app, and
+/// cleared for good when the channel closes ([`serve_until_closed`]).
+static LIVE: AtomicBool = AtomicBool::new(false);
+
 /// Whether the channel is on, from the raw `SSF_SHELL_CHANNEL` and whether
 /// stdin and stdout are terminals. Exactly `1` and two pipes (or files): a
 /// terminal on either side is a person, not the app.
@@ -70,15 +87,33 @@ pub fn started_of(var: Option<&OsStr>, stdin_is_terminal: bool, stdout_is_termin
 /// network is chosen and before anything else prints or the wallet loads.
 /// Later calls return the first answer.
 pub fn init() -> bool {
-    let on = *STARTED.get_or_init(|| {
-        started_of(
-            std::env::var_os(CHANNEL_ENV).as_deref(),
-            std::io::stdin().is_terminal(),
-            std::io::stdout().is_terminal(),
-        )
-    });
+    init_with(
+        &STARTED,
+        &GUARDED,
+        || {
+            started_of(
+                std::env::var_os(CHANNEL_ENV).as_deref(),
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )
+        },
+        guard_pipes,
+    )
+}
+
+/// [`init`] over its two cells and its two decisions, so a test can run the
+/// channel-on branch with no environment and no `prctl`. It never touches
+/// [`LIVE`]: the startup load runs after it and before the channel's thread
+/// starts, so off a test network that load mints nothing.
+fn init_with(
+    started: &OnceLock<bool>,
+    guarded: &OnceLock<bool>,
+    decide: impl FnOnce() -> bool,
+    guard: impl FnOnce() -> bool,
+) -> bool {
+    let on = *started.get_or_init(decide);
     if on {
-        GUARDED.get_or_init(guard_pipes);
+        guarded.get_or_init(guard);
     }
     on
 }
@@ -111,6 +146,87 @@ pub fn serves(started: bool, guarded: bool) -> bool {
 /// then the same answer for the rest of the run.
 pub fn started() -> bool {
     STARTED.get().copied().unwrap_or(false)
+}
+
+/// Whether this run's channel thread will serve the app ([`serves`] over
+/// [`started`] and whether [`guard_pipes`] held): what [`spawn`] checks, and
+/// what tells the startup load's refusal to mint apart from a failed load
+/// (main.rs). False until [`init`] ran.
+pub fn serving() -> bool {
+    serves(started(), GUARDED.get().copied().unwrap_or(false))
+}
+
+/// Whether the desktop app's channel can answer the app right now: its
+/// thread is running ([`spawn`], so it [`serves`]), has answered a request
+/// from the app, and has not closed. Unlike [`started`] it does not stick:
+/// false before the thread's first answer (so at startup, while the wallet
+/// loads, and in every test), and false for good once stdin reaches EOF,
+/// cannot be read, a reply cannot be written, or a line is too long. This is
+/// what a mint asks (chia_wallet_switch::may_mint); the page reveal asks
+/// [`started`], which fails closed.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn live() -> bool {
+    LIVE.load(Ordering::SeqCst)
+}
+
+/// Clears its flag when dropped: at the end of [`serve_until_closed`],
+/// whether the loop returned or a panic unwound it.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The channel's loop: read a request line from `input`, answer it with
+/// `answer` (the node's ops) or a fixed refusal, write the reply line to
+/// `out`, until EOF, a read or write error, or a line that is too long.
+///
+/// `live` says whether a mint may count on the app to show the words. It
+/// turns true only after a reply to one of the app's ops was written, which
+/// shows the app is there and reads its end: an already-closed pipe, or one
+/// that carries only refused lines, never turns it on. It turns false for
+/// good when the channel closes, however that happens: at once on a line
+/// that is too long, before the refusal and the drain (which can last as
+/// long as the app keeps its end open), and on EOF, a read or write error or
+/// a panic in `answer` as the loop unwinds. Generic over the pipes and the
+/// flag so the tests run it over memory.
+fn serve_until_closed<R: Read, W: Write>(
+    mut input: R,
+    mut out: W,
+    mut answer: impl FnMut(Op) -> Zeroizing<String>,
+    live: &AtomicBool,
+) -> End {
+    let _dead_after = ClearOnDrop(live);
+    let mut line = Zeroizing::new(Vec::with_capacity(MAX_LINE));
+    loop {
+        match read_line(&mut input, &mut line) {
+            Ok(Line::Whole) => {}
+            Ok(Line::Eof) => return End::Eof,
+            Err(_) => return End::ReadFailed,
+            Ok(Line::TooLong) => {
+                // Closed from here on: nothing may count on the app while
+                // the rest of stdin is drained.
+                live.store(false, Ordering::SeqCst);
+                let _ = send(&mut out, 0, &Refusal::TooLong.body());
+                drain(&mut input);
+                return End::TooLong;
+            }
+        }
+        let parsed = parse(&line);
+        line.zeroize();
+        let (id, body, asked) = match parsed {
+            Parsed::Ask { id, op } => (id, answer(op), true),
+            Parsed::Refuse { id, why } => (id, why.body(), false),
+        };
+        if send(&mut out, id, &body).is_err() {
+            return End::WriteFailed;
+        }
+        if asked {
+            live.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// One request's op.
@@ -294,33 +410,11 @@ fn send<W: Write>(out: &mut W, id: u64, body: &str) -> std::io::Result<()> {
     out.flush()
 }
 
-/// The channel's loop: read a request line from `input`, answer it with
-/// `answer` (the node's ops) or a fixed refusal, write the reply line to
-/// `out`, until EOF, a read or write error, or a line that is too long.
-/// Generic over the pipes so the tests run it over memory.
-pub fn serve<R: Read, W: Write>(mut input: R, mut out: W, mut answer: impl FnMut(Op) -> Zeroizing<String>) -> End {
-    let mut line = Zeroizing::new(Vec::with_capacity(MAX_LINE));
-    loop {
-        match read_line(&mut input, &mut line) {
-            Ok(Line::Whole) => {}
-            Ok(Line::Eof) => return End::Eof,
-            Err(_) => return End::ReadFailed,
-            Ok(Line::TooLong) => {
-                let _ = send(&mut out, 0, &Refusal::TooLong.body());
-                drain(&mut input);
-                return End::TooLong;
-            }
-        }
-        let parsed = parse(&line);
-        line.zeroize();
-        let (id, body) = match parsed {
-            Parsed::Ask { id, op } => (id, answer(op)),
-            Parsed::Refuse { id, why } => (id, why.body()),
-        };
-        if send(&mut out, id, &body).is_err() {
-            return End::WriteFailed;
-        }
-    }
+/// [`serve_until_closed`] with a flag of its own, for the tests of the
+/// loop's answers.
+#[cfg(test)]
+fn serve<R: Read, W: Write>(input: R, out: W, answer: impl FnMut(Op) -> Zeroizing<String>) -> End {
+    serve_until_closed(input, out, answer, &AtomicBool::new(false))
 }
 
 /// The process's stdout for frames: each `write_all` takes the stdout lock,
@@ -351,13 +445,13 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
     if !started() {
         return;
     }
-    if !serves(true, GUARDED.get().copied().unwrap_or(false)) {
+    if !serving() {
         eprintln!("🖥️ Desktop app channel: the node could not stop other programs from opening its pipes, so the channel stays closed; the page still cannot show the 24 words");
         return;
     }
     let spawned = std::thread::Builder::new().name("ssf-shell-channel".into()).spawn(move || {
-        match serve(std::io::stdin().lock(), StdoutFrames, answer) {
-            End::Eof => eprintln!("🖥️ Desktop app channel: closed by the app; the node runs on, and the page still cannot show the 24 words"),
+        match serve_until_closed(std::io::stdin().lock(), StdoutFrames, answer, &LIVE) {
+            End::Eof => eprintln!("🖥️ Desktop app channel: closed by the app; the node runs on, makes no new wallet off a test network, and the page still cannot show the 24 words"),
             End::ReadFailed => eprintln!("🖥️ Desktop app channel: stdin could not be read, so the channel is closed"),
             End::TooLong => eprintln!("🖥️ Desktop app channel: a request line was longer than 1 KiB, so the channel is closed"),
             End::WriteFailed => eprintln!("🖥️ Desktop app channel: a reply could not be written, so the channel writes nothing more"),
@@ -365,6 +459,7 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
     });
     match spawned {
         Ok(_) => eprintln!("🖥️ Desktop app channel: on. The node's log goes to stderr, and only the desktop app shows the 24 words"),
+        // `live` stays false: only the thread sets it.
         Err(e) => eprintln!("🖥️ Desktop app channel: its thread could not start ({e}); the page still cannot show the 24 words"),
     }
 }
@@ -455,6 +550,195 @@ mod tests {
     #[test]
     fn the_channel_is_off_until_init_runs() {
         assert!(!started());
+        assert!(!live(), "and so no mint counts on it");
+    }
+
+    /// A reader over `bytes` that, on every read the loop makes, notes how
+    /// far it has read and whether `live` was set then: the tests see the
+    /// flag while the loop runs, not only after it ended. Once `bytes` run
+    /// out it answers `held` more 256-byte chunks of junk before EOF, as an
+    /// app that keeps its end open after a line that is too long would.
+    struct Watched<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        held: usize,
+        live: &'a AtomicBool,
+        seen: Vec<(usize, bool)>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(bytes: &'a [u8], held: usize, live: &'a AtomicBool) -> Self {
+            Watched { bytes, at: 0, held, live, seen: Vec::new() }
+        }
+    }
+
+    impl Read for Watched<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.seen.push((self.at, self.live.load(Ordering::SeqCst)));
+            if self.at < self.bytes.len() {
+                let n = buf.len().min(self.bytes.len() - self.at);
+                buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+                self.at += n;
+                return Ok(n);
+            }
+            if self.held == 0 {
+                return Ok(0);
+            }
+            self.held -= 1;
+            let n = buf.len().min(256);
+            buf[..n].fill(b'j');
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// A writer that notes whether `live` was set at each write (one per
+    /// frame: [`send`] writes a frame whole), and can fail like [`Broken`].
+    struct WatchedOut<'a> {
+        live: &'a AtomicBool,
+        broken: bool,
+        seen: Vec<bool>,
+        bytes: Vec<u8>,
+    }
+
+    impl<'a> WatchedOut<'a> {
+        fn new(live: &'a AtomicBool, broken: bool) -> Self {
+            WatchedOut { live, broken, seen: Vec::new(), bytes: Vec::new() }
+        }
+    }
+
+    impl Write for WatchedOut<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.push(self.live.load(Ordering::SeqCst));
+            if self.broken {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const HELLO: &[u8] = b"{\"v\":1,\"id\":1,\"op\":\"hello\"}\n";
+
+    /// Copilot's first finding on #368: the channel turned live at
+    /// [`init`], before the startup load and before its thread read stdin,
+    /// so a mainnet node whose app had already gone could mint at startup.
+    /// [`init`] decides the channel and guards the pipes, and that is all.
+    #[test]
+    fn init_with_the_channel_on_leaves_it_not_live() {
+        let (started, guarded) = (OnceLock::new(), OnceLock::new());
+        assert!(init_with(&started, &guarded, || true, || true));
+        assert_eq!((started.get(), guarded.get()), (Some(&true), Some(&true)));
+        assert!(!live(), "the startup load runs before the thread can answer, so off a test network it mints nothing");
+        // Later calls keep the first answer.
+        assert!(init_with(&started, &guarded, || false, || false));
+        let (off, unguarded) = (OnceLock::new(), OnceLock::new());
+        assert!(!init_with(&off, &unguarded, || false, || panic!("no guard while the channel is off")));
+        assert_eq!(unguarded.get(), None);
+    }
+
+    /// The channel is live only once a reply to one of the app's ops was
+    /// written. At startup the wallet loads before the thread runs, and an
+    /// app that already went away leaves a closed pipe: neither may count
+    /// on the app to show the words, so off a test network neither mints.
+    #[test]
+    fn the_channel_is_live_only_once_the_app_was_answered() {
+        use crate::chia_wallet_switch::may_mint;
+        // Before the thread runs: nothing has set the flag.
+        let flag = AtomicBool::new(false);
+        assert!(!may_mint(false, flag.load(Ordering::SeqCst)), "a startup load off a test network mints nothing");
+        // A pipe the app had already closed: EOF at the first read, never live.
+        let mut closed = Watched::new(b"", 0, &flag);
+        assert_eq!(serve_until_closed(&mut closed, Vec::new(), stub, &flag), End::Eof);
+        assert_eq!(closed.seen, vec![(0, false)]);
+        assert!(!flag.load(Ordering::SeqCst));
+        // Lines the loop refuses do not show an app that reads its end.
+        let refused = b"x\n{\"v\":2,\"id\":3,\"op\":\"hello\"}\n{\"v\":1,\"id\":4,\"op\":\"what\"}\n";
+        let mut only_refused = Watched::new(refused, 0, &flag);
+        assert_eq!(serve_until_closed(&mut only_refused, Vec::new(), stub, &flag), End::Eof);
+        assert!(only_refused.seen.iter().all(|&(_, live)| !live), "{:?}", only_refused.seen);
+        // A hello answered: live from the read after its reply, not before.
+        let mut asked = 0;
+        let mut answered = Watched::new(HELLO, 0, &flag);
+        let mut out = WatchedOut::new(&flag, false);
+        let end = serve_until_closed(&mut answered, &mut out, |op| {
+            asked += 1;
+            assert!(!flag.load(Ordering::SeqCst), "not live while the first answer is made");
+            stub(op)
+        }, &flag);
+        assert_eq!((end, asked), (End::Eof, 1));
+        assert_eq!(out.seen, vec![false], "not live while its reply is written either");
+        let (before, after): (Vec<_>, Vec<_>) = answered.seen.iter().partition(|&&(at, _)| at < HELLO.len());
+        assert!(before.iter().all(|&&(_, live)| !live), "{before:?}");
+        assert_eq!(after, vec![&(HELLO.len(), true)], "live once the reply was written");
+        assert!(!flag.load(Ordering::SeqCst), "and dead once the app closed its end");
+        // A reply that cannot be written shows no app: never live.
+        let flag = AtomicBool::new(false);
+        let mut unwritten = Watched::new(HELLO, 0, &flag);
+        let mut broken = WatchedOut::new(&flag, true);
+        assert_eq!(serve_until_closed(&mut unwritten, &mut broken, stub, &flag), End::WriteFailed);
+        assert_eq!(broken.seen, vec![false], "not live when the write is tried");
+        assert!(unwritten.seen.iter().all(|&(_, live)| !live) && !flag.load(Ordering::SeqCst));
+    }
+
+    /// A line that is too long closes the channel at once: `live` is false
+    /// before the refusal is written and for the whole drain, however long
+    /// the app keeps its end open, so a CREATE that arrives meanwhile mints
+    /// nothing off a test network.
+    #[test]
+    fn a_line_too_long_ends_live_before_the_drain() {
+        let mut bytes = HELLO.to_vec();
+        let long_at = bytes.len();
+        bytes.extend(std::iter::repeat_n(b'a', MAX_LINE + 1));
+        let flag = AtomicBool::new(false);
+        let mut held_open = Watched::new(&bytes, 8, &flag);
+        let mut out = WatchedOut::new(&flag, false);
+        assert_eq!(serve_until_closed(&mut held_open, &mut out, stub, &flag), End::TooLong);
+        // The hello's reply is written before the channel turns live, and the
+        // refusal after it turned dead again.
+        assert_eq!(out.seen, vec![false, false]);
+        let drain_from = bytes.len();
+        // Live while the long line comes in (the hello was answered)...
+        assert!(held_open.seen.iter().any(|&(at, live)| at > long_at && at < drain_from && live), "{:?}", held_open.seen);
+        // ...and dead on every read of the drain, junk included.
+        let drained: Vec<_> = held_open.seen.iter().filter(|&&(at, _)| at >= drain_from).collect();
+        assert_eq!(drained.len(), 9, "eight chunks of junk, then EOF");
+        assert!(drained.iter().all(|&&(_, live)| !live), "{drained:?}");
+        assert!(!flag.load(Ordering::SeqCst));
+        let text = String::from_utf8(out.bytes).unwrap();
+        assert!(text.ends_with(&format!("{}\n", refusal_line(0, Refusal::TooLong))), "{text}");
+    }
+
+    /// The channel's other ends clear the flag as well: a read error, and a
+    /// panic in an answer, which unwinds the thread.
+    #[test]
+    fn the_channel_stops_being_live_however_its_loop_ends() {
+        let flag = AtomicBool::new(true);
+        assert_eq!(serve_until_closed(Unreadable, Vec::new(), stub, &flag), End::ReadFailed);
+        assert!(!flag.load(Ordering::SeqCst), "a read error");
+        let two = [HELLO, HELLO].concat();
+        let flag = AtomicBool::new(false);
+        let mut calls = 0;
+        // Noted inside, checked outside: an assert in the answer would be
+        // caught along with the panic it is meant to precede.
+        let mut live_then = None;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_until_closed(&two[..], Vec::new(), |op| {
+                calls += 1;
+                if calls == 2 {
+                    live_then = Some(flag.load(Ordering::SeqCst));
+                    panic!("an answer that panics");
+                }
+                stub(op)
+            }, &flag)
+        }));
+        assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"an answer that panics"));
+        assert_eq!(calls, 2);
+        assert_eq!(live_then, Some(true), "live after the first answer");
+        assert!(!flag.load(Ordering::SeqCst), "a panic");
     }
 
     /// The crate's `println!` (main.rs, before the first `mod`) is the one
@@ -669,16 +953,30 @@ mod tests {
             }),
             "only public facts: no error, no key fingerprint, no flags beyond backed_up"
         );
-        let gated = WalletSwitch { state: WalletState::Gated, backed_up: false, ..wallet };
-        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &gated, None)).unwrap();
+        // Mainnet holds an SSF wallet now: the app's hello there names it as
+        // on testnet11, Ready before it is made and On with its address.
+        let ready = WalletSwitch { state: WalletState::Ready, backed_up: false, ..wallet.clone() };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &ready, None)).unwrap();
         assert_eq!(
             v,
             serde_json::json!({
                 "ok": true,
                 "net": { "id": "mainnet", "genesis": ChiaNet::Mainnet.genesis_hex() },
-                "wallet": "gated",
+                "wallet": "ready",
                 "backed_up": false,
                 "address": null,
+            })
+        );
+        let on = WalletSwitch { backed_up: false, ..wallet };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &on, Some("xch1abc"))).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "net": { "id": "mainnet", "genesis": ChiaNet::Mainnet.genesis_hex() },
+                "wallet": "on",
+                "backed_up": false,
+                "address": "xch1abc",
             })
         );
     }

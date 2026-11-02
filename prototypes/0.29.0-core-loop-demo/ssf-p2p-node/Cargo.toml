@@ -176,7 +176,10 @@ chia-publish = [
 # transition): lets `SSF_CHIA_NETWORK=mainnet` select it (chia_network.rs).
 # It changes nothing else: all the mainnet code is in every chia-read build.
 # Release builds leave it out (release.yml builds chia-publish,torrent), so
-# they refuse mainnet and stop. A mainnet node holds no SSF wallet yet.
+# they refuse mainnet and stop. A mainnet node holds an SSF wallet of real
+# XCH: only the desktop app's window shows its 24 words, and a new one is
+# made only while that app's channel is live (chia_wallet_switch::may_mint);
+# one already on disk loads without it.
 chia-mainnet = ["chia-read"]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]
