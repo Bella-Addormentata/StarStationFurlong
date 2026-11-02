@@ -4,10 +4,11 @@
  * node does not publish presence at all.
  */
 import { describe, expect, it } from 'vitest';
+import { MAINNET, TESTNET11 } from './chiaNetwork';
 import type { ChiaPresence, LocalFingerprint } from './nodeFingerprint';
 import { PHONE_BOOK_GREEN, PHONE_BOOK_GREY, phoneBookIconSvg, phoneBookIndicator } from './phoneBook';
 
-const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443 };
+const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
 const listed: ChiaPresence = { state: 'listed', era: 7, listed_era: 7, last_at: 1_700_000_000, confirmed: true, current: true, public_addrs: 2 };
 const withPresence = (p: Partial<ChiaPresence>): LocalFingerprint => ({ ...BASE, chia_presence: { ...listed, ...p } });
 
@@ -102,6 +103,21 @@ describe('phoneBookIndicator', () => {
     expect(ind.title.endsWith('…')).toBe(true);
     // An error of nothing but whitespace is no error.
     expect(phoneBookIndicator(withPresence({ state: 'unlisted', error: '  \n ' })).title).toBe('Not in the Phone Book yet: the first listing goes out shortly');
+  });
+});
+
+describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
+  const fp = (over: Partial<LocalFingerprint>): LocalFingerprint => ({ ...BASE, chia_net: net, ...over });
+
+  it('says a gated node is off because it runs on Chia mainnet, with no icon', () => {
+    const gated = phoneBookIndicator(fp({ chia_wallet: { state: 'gated' } }));
+    expect(gated.visible).toBe(false);
+    expect(gated.row).toEqual({ value: 'OFF: this node runs on Chia mainnet, where Star Station makes no SSF wallet yet.', colour: 'rgba(224, 226, 238, 0.6)' });
+  });
+
+  it('reads a listing the same way on either network', () => {
+    expect(phoneBookIndicator(fp({ chia_presence: listed })).title).toBe(phoneBookIndicator(withPresence({})).title);
+    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'ready' } })).row.value).toContain('not on yet');
   });
 });
 

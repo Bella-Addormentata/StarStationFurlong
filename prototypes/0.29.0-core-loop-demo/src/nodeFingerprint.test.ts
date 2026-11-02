@@ -3,7 +3,8 @@
  * hex, the same 32 bytes in base64, a port — or it is not the node.
  */
 import { describe, expect, it } from 'vitest';
-import { isTestnetAddress, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
+import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
+import { parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -11,29 +12,30 @@ const B64 = btoa(String.fromCharCode(...BYTES));
 
 describe('parseNodeFingerprint', () => {
   it('takes the node\'s own answer, normalising what is optional', () => {
-    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })).toEqual({ hex: HEX, base64: B64, port: 4443 });
+    // ⛓️ The network is always resolved: a node that sends none is on testnet11.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })).toEqual({ hex: HEX, base64: B64, port: 4443, chia_net: TESTNET11 });
     expect(parseNodeFingerprint({
       hex: HEX.toUpperCase(), base64: B64, port: 4443, iroh_node_id: 'abc', iroh_relay_urls: ['https://r', 7, ''],
       iroh_direct_addrs: 'nope', reachability: 'cgnat', iroh_port: 11204,
     })).toEqual({
-      hex: HEX, base64: B64, port: 4443, iroh_node_id: 'abc', iroh_relay_urls: ['https://r'], reachability: 'cgnat', iroh_port: 11204,
+      hex: HEX, base64: B64, port: 4443, chia_net: TESTNET11, iroh_node_id: 'abc', iroh_relay_urls: ['https://r'], reachability: 'cgnat', iroh_port: 11204,
     });
     // #231 P6b: the node's card-sharing flag rides when it is a boolean, and only then.
-    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: false })).toEqual({ hex: HEX, base64: B64, port: 4443, share_card: false });
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: false })).toEqual({ hex: HEX, base64: B64, port: 4443, chia_net: TESTNET11, share_card: false });
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, share_card: 'no' })?.share_card).toBeUndefined();
   });
 
   it('keeps the node\'s receive address only in the shape of a testnet11 address (🏦 Bank app RECEIVE)', () => {
     // 58 bech32 characters after `txch1`: 52 for the 32-byte puzzle hash, 6 of checksum.
     const addr = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
-    expect(isTestnetAddress(addr)).toBe(true);
+    expect(isAddressOn(TESTNET11, addr)).toBe(true);
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: addr })?.chia_address).toBe(addr);
     // A read-only node sends none; an older node sends none: nothing is invented.
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_address).toBeUndefined();
     // Not an address: a mainnet prefix (real XCH would go to it), a bech32 character
     // outside the set, a length that is not a standard puzzle's, or not a string.
     for (const bad of ['xch1' + addr.slice(5), addr.slice(0, -1) + 'b', addr.slice(0, -1), addr + 'q', addr.toUpperCase(), 42, null, '']) {
-      expect(isTestnetAddress(bad)).toBe(false);
+      expect(isAddressOn(TESTNET11, bad)).toBe(false);
       expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_address: bad })?.chia_address).toBeUndefined();
     }
   });
@@ -43,7 +45,9 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ state: 'ready' })).toEqual({ state: 'ready' });
     expect(fp({ state: 'ready', seed: true })).toEqual({ state: 'ready', seed: true });
     expect(fp({ state: 'on', stays: true, held: false, error: 'disk full' })).toEqual({ state: 'on', stays: true, error: 'disk full' });
-    for (const state of ['unbuilt', 'off', 'ready', 'on']) expect(parseChiaWallet({ state })?.state).toBe(state);
+    for (const state of ['unbuilt', 'off', 'ready', 'on', 'gated']) expect(parseChiaWallet({ state })?.state).toBe(state);
+    // ⛓️ A mainnet node makes no SSF wallet yet, and says so.
+    expect(fp({ state: 'gated' })).toEqual({ state: 'gated' });
     // An older node sends none, and nothing is invented for it.
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_wallet).toBeUndefined();
     // Anything off the node's shape is no readout: the Bank then offers no switch.
@@ -125,6 +129,50 @@ describe('parseNodeFingerprint', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 0 })).toBeNull();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 70000 })).toBeNull();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: '4443' })).toBeNull();
+  });
+});
+
+const BODY = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
+
+describe.each([TESTNET11, MAINNET])('the node\'s Chia network: $name', (net) => {
+  const other = net === TESTNET11 ? MAINNET : TESTNET11;
+  const report = { id: net.id, genesis: net.genesis, source: net.test ? 'default' : 'env' };
+  const parse = (extra: Record<string, unknown>) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, ...extra });
+
+  it('is the page\'s own row when the id and genesis match', () => {
+    expect(parse({ chia_network: report })?.chia_net).toBe(net);
+  });
+
+  it('keeps an address on its network, and drops the other network\'s', () => {
+    const addr = addressOn(net, BODY);
+    expect(parse({ chia_network: report, chia_address: addr })?.chia_address).toBe(addr);
+    expect(parse({ chia_network: report, chia_address: addressOn(other, BODY) })?.chia_address).toBeUndefined();
+  });
+
+  it('knows no network whose genesis is the other one\'s, and then keeps no address at all', () => {
+    const fp = parse({ chia_network: { id: net.id, genesis: other.genesis }, chia_address: addressOn(net, BODY), chia_wallet: { state: 'on' } });
+    expect(fp?.chia_net).toBeNull();
+    expect(fp?.chia_address).toBeUndefined();
+    // The rest of the fingerprint stands: the node is still the node.
+    expect(fp?.chia_wallet).toEqual({ state: 'on' });
+  });
+});
+
+describe('the node\'s Chia network, absent or unknown', () => {
+  const parse = (extra: Record<string, unknown>) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, ...extra });
+
+  it('is testnet11 when the node sends none: an xch address is dropped, a txch one kept', () => {
+    expect(parse({})?.chia_net).toBe(TESTNET11);
+    expect(parse({ chia_address: addressOn(MAINNET, BODY) })?.chia_address).toBeUndefined();
+    expect(parse({ chia_address: addressOn(TESTNET11, BODY) })?.chia_address).toBe(addressOn(TESTNET11, BODY));
+  });
+
+  it('is null for a network the page does not know, or a report not in the node\'s shape', () => {
+    for (const bad of [{ id: 'testnet10', genesis: TESTNET11.genesis }, { id: 'mainnet' }, 'mainnet', null, 7, []]) {
+      const fp = parse({ chia_network: bad, chia_address: addressOn(TESTNET11, BODY) });
+      expect(fp?.chia_net).toBeNull();
+      expect(fp?.chia_address).toBeUndefined();
+    }
   });
 });
 

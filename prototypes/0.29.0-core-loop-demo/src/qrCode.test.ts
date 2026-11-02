@@ -16,6 +16,7 @@ import {
   versionInformation,
   type QrMatrix,
 } from './qrCode';
+import { MAINNET, TESTNET11, addressOn } from './chiaNetwork';
 
 /** Alignment pattern centres per version 2–40 (annex E). */
 const ALIGN: number[][] = [
@@ -84,7 +85,20 @@ function payload(n: number, seed = 7): string {
   return s;
 }
 
-const ADDRESS = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
+const BODY = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
+const ADDRESS = addressOn(TESTNET11, BODY);
+
+describe.each([TESTNET11, MAINNET])('qrMatrix on $name', (net) => {
+  it('encodes an address of this network that an independent reader decodes back', () => {
+    const address = addressOn(net, BODY);
+    const m = qrMatrix(address);
+    // The smallest version that holds the address's bytes (63 for txch, 62 for xch).
+    expect(byteCapacity(m.version)).toBeGreaterThanOrEqual(address.length);
+    expect(byteCapacity(m.version - 1)).toBeLessThan(address.length);
+    expect(new TextDecoder().decode(decode(m))).toBe(address);
+    expect(qrSvg(address, { label: `QR code of this node's ${net.name} address` })).toContain(`aria-label="QR code of this node's ${net.name} address"`);
+  });
+});
 
 describe('qrMatrix', () => {
   it('encodes a testnet11 address that an independent reader decodes back', () => {

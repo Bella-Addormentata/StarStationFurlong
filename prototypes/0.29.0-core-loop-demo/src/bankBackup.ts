@@ -23,10 +23,13 @@
 // Known and accepted for testnet (a native reveal in the desktop host is the
 // mainnet fix for both): any script in the game page can ask for the words
 // while they are not marked saved, and another OS account's page on this
-// computer reaches the same loopback node.
+// computer reaches the same loopback node. So BACK UP is offered only on a
+// test network (`ChiaNetwork.test`), and on any other network the two
+// requests are refused here before anything is sent.
 
 import { BANK_WALLET_BUTTON_ID } from './bankWallet';
-import { isTestnetAddress, type LocalFingerprint } from './nodeFingerprint';
+import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
+import type { LocalFingerprint } from './nodeFingerprint';
 
 /** Control ids: stable across renders, so focus survives a repaint. SHOW
  *  turns into HIDE and I SAVED into ⚠ CONFIRM on the same control. */
@@ -149,10 +152,13 @@ const CLOSED = {
 } as const;
 
 /** The address BACK UP is for: an on wallet made from 24 words (an older
- *  node never says `mnemonic`) with a testnet11 address. Null otherwise. */
+ *  node never says `mnemonic`) on a test network, with an address on that
+ *  network. Null otherwise: on mainnet the desktop app shows the words
+ *  itself, never this page. */
 function backupAddress(fp: LocalFingerprint | null | undefined): string | null {
   const w = fp?.chia_wallet;
-  if (!fp || !w || w.state !== 'on' || w.mnemonic !== true || !isTestnetAddress(fp.chia_address)) return null;
+  const net = fp?.chia_net;
+  if (!fp || !w || w.state !== 'on' || w.mnemonic !== true || !net?.test || !isAddressOn(net, fp.chia_address)) return null;
   return fp.chia_address;
 }
 
@@ -248,8 +254,8 @@ export interface BankBackupView {
 
 /** What RECEIVE shows about the 24 words, or null when there is nothing to
  *  back up (no node, an older node, a wallet that is not on, one not made
- *  from words, or an address that did not read as testnet11) and no
- *  clipboard notice still stands. */
+ *  from words, a network that is not a test one, or an address that did not
+ *  read as one of its network's) and no clipboard notice still stands. */
 export function bankBackupView(fp: LocalFingerprint | null | undefined, ui: BankBackupUi, page: BackupPage): BankBackupView | null {
   const address = backupAddress(fp);
   // Outside the panel only what still matters there: a clipboard that may
@@ -474,6 +480,8 @@ const fail = (error: string, flags: Partial<Omit<BackupFailure, 'ok' | 'error'>>
   ({ ok: false, error, refresh: false, saved: false, drop: false, ...flags });
 
 const OLDER = "your station node is older than the Bank's BACK UP: update Star Station";
+/** Either request on a network that is not a test one: nothing is sent. */
+const NOT_TEST = 'your station node is not on a test network, so this page does not show the words';
 const MALFORMED = "your station node's answer was not 24 words, so nothing is shown";
 const CHANGED = 'the wallet changed under the Bank, so these words are not shown; look again';
 
@@ -522,14 +530,17 @@ async function ask(url: string, fetchImpl: typeof fetch, timeoutMs: number): Pro
 }
 
 /** SHOW: ask the node at `origin` for the 24 words of the wallet whose
- *  address is `expectAddress`. Never throws. A 200 is taken only whole: 24
- *  words, a u32 key fingerprint, and that same testnet11 address. */
+ *  address is `expectAddress`, on `net`. Never throws. A 200 is taken only
+ *  whole: 24 words, a u32 key fingerprint, and that same address on `net`.
+ *  Nothing is sent unless `net` is a test network. */
 export async function revealWords(
   origin: string,
   expectAddress: string,
+  net: ChiaNetwork | null | undefined,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = REVEAL_TIMEOUT_MS,
 ): Promise<RevealResult> {
+  if (!net?.test) return fail(NOT_TEST);
   if (!origin) return fail('your station node is not answering, so the words are not shown');
   const got = await ask(`${origin}/api/chia/words`, fetchImpl, timeoutMs);
   if (got === 'timeout') return fail('your station node did not answer in time, so the words are not shown; tap SHOW again');
@@ -539,7 +550,7 @@ export async function revealWords(
     const words = got.body.ok === true ? asWords(got.body.words) : null;
     const key = got.body.key;
     const address = got.body.address;
-    if (!words || !isU32(key) || !isTestnetAddress(address)) return fail(MALFORMED);
+    if (!words || !isU32(key) || !isAddressOn(net, address)) return fail(MALFORMED);
     if (address !== expectAddress) return fail(CHANGED, { refresh: true });
     return { ok: true, words, key, address };
   }
@@ -553,14 +564,16 @@ export async function revealWords(
 }
 
 /** I SAVED: tell the node at `origin` that the words of key fingerprint
- *  `key` are written down. Never throws. A key that is not a u32 is refused
- *  before anything is sent. */
+ *  `key` are written down. Never throws. A key that is not a u32, or a
+ *  `net` that is not a test network, is refused before anything is sent. */
 export async function markWordsSaved(
   origin: string,
   key: number,
+  net: ChiaNetwork | null | undefined,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = SAVE_TIMEOUT_MS,
 ): Promise<SaveResult> {
+  if (!net?.test) return fail(NOT_TEST, { drop: true });
   const notRecorded = (why: string, refresh = false) =>
     fail(`the Bank could not record it: ${why}. Your words are fine; tap I SAVED again`, { refresh });
   if (!isU32(key)) return fail('the Bank has no key fingerprint to record; tap SHOW again', { drop: true });

@@ -501,7 +501,7 @@ describe('NetworkProvider — the faucet request stream', () => {
     // The old session's node answers late. Without the transport binding the
     // drain, active again, would hand this to the new session (main.ts has
     // cleared the room's dish state at the leave; this would repopulate it).
-    stale.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1stale' } }));
+    stale.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1stale', network: 'testnet11' } }));
     stale.end();
     await settle();
     expect(replies).toHaveLength(0);
@@ -509,7 +509,8 @@ describe('NetworkProvider — the faucet request stream', () => {
     // The live session's own request stream still delivers.
     await provider.requestFaucet('status').sent;
     const fresh = live.opened[0];
-    const reply = faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1fresh' } });
+    // ⛓️ The node restarted on mainnet meanwhile: its status names the network, and rides through as sent.
+    const reply = faucetEnvelope({ op: 'status', ok: true, status: { address: 'xch1fresh', network: 'mainnet' } });
     fresh.reply(reply);
     fresh.end();
     await vi.waitFor(() => expect(replies).toHaveLength(1));
@@ -522,11 +523,13 @@ describe('NetworkProvider — the faucet request stream', () => {
     const forwarded = wt.nodeOpens();
     // What a room peer could inject through an older node: a status with its own address.
     forwarded.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'txch1attacker' } }));
+    // ⛓️ Nor one naming another network: a peer cannot move the dish to mainnet.
+    forwarded.reply(faucetEnvelope({ op: 'status', ok: true, status: { address: 'xch1attacker', network: 'mainnet' } }));
     forwarded.reply(faucetEnvelope({ target: 'x', status: 'dialing' }, 'bridge'));
     forwarded.end();
-    await vi.waitFor(() => expect(envelopes).toHaveLength(2));
-    // Both went down the generic path (where main.ts ignores `faucet`); none was a reply.
-    expect(envelopes.map((e) => e.kind)).toEqual(['faucet', 'bridge']);
+    await vi.waitFor(() => expect(envelopes).toHaveLength(3));
+    // All went down the generic path (where main.ts ignores `faucet`); none was a reply.
+    expect(envelopes.map((e) => e.kind)).toEqual(['faucet', 'faucet', 'bridge']);
     expect(replies).toHaveLength(0);
     await provider.disconnect();
   });

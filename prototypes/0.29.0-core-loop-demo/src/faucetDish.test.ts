@@ -18,8 +18,10 @@ import {
   setFaucetReply,
   type FaucetStatus,
 } from './faucetDish';
+import { MAINNET, TESTNET11 } from './chiaNetwork';
 
 const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
+  net: TESTNET11,
   address: 'txch1qqqq',
   puzzleHash: '00'.repeat(32),
   gift: 1,
@@ -42,11 +44,13 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   ...over,
 });
 
-/** A status as the node puts it on the wire: mojo totals are decimal strings. */
+/** A status as the node puts it on the wire: mojo totals are decimal strings,
+ *  and the network is its id (an unknown one for `net: null`). */
 const wire = (over: Partial<FaucetStatus> = {}): Record<string, unknown> => {
-  const st = status(over);
+  const { net, ...st } = status(over);
   return {
     ...st,
+    network: net === null ? 'simulator0' : net.id,
     totalMojos: st.totalMojos.toString(),
     walletMojos: st.walletMojos === null ? null : st.walletMojos.toString(),
     walletSpendableMojos: st.walletSpendableMojos === null ? null : st.walletSpendableMojos.toString(),
@@ -152,13 +156,52 @@ describe('faucet dish: what it shows', () => {
 
   it('formats mojos with TXCH from a billion up', () => {
     expect(blocksToMinutes(32)).toBe(10);
-    expect(formatMojos(1)).toBe('1 mojo');
-    expect(formatMojos(1005)).toBe('1,005 mojos');
-    expect(formatMojos(1_000_000_000)).toBe('1,000,000,000 mojos (0.001 TXCH)');
-    expect(formatMojos(2.5e12)).toBe('2,500,000,000,000 mojos (2.500 TXCH)');
-    expect(formatMojos(1005n)).toBe('1,005 mojos');
-    expect(formatMojos(18446744073709551615n)).toBe('18,446,744,073,709,551,615 mojos (18446744.073 TXCH)');
-    expect(formatMojos(-3n)).toBe('0 mojos');
+    expect(formatMojos(1, 'TXCH')).toBe('1 mojo');
+    expect(formatMojos(1005, 'TXCH')).toBe('1,005 mojos');
+    expect(formatMojos(1_000_000_000, 'TXCH')).toBe('1,000,000,000 mojos (0.001 TXCH)');
+    expect(formatMojos(2.5e12, 'TXCH')).toBe('2,500,000,000,000 mojos (2.500 TXCH)');
+    expect(formatMojos(1005n, 'TXCH')).toBe('1,005 mojos');
+    expect(formatMojos(18446744073709551615n, 'TXCH')).toBe('18,446,744,073,709,551,615 mojos (18446744.073 TXCH)');
+    expect(formatMojos(-3n, 'TXCH')).toBe('0 mojos');
+  });
+});
+
+describe.each([TESTNET11, MAINNET])('faucet dish on $name', (net) => {
+  it('reads the network from the status, and older nodes as testnet11', () => {
+    expect(asFaucetStatus(wire({ net }))?.net).toBe(net);
+    const older = wire() as Record<string, unknown>;
+    delete older.network;
+    expect(asFaucetStatus(older)?.net).toBe(TESTNET11);
+    // An id this page does not know is no network: no ticker, no address shown.
+    for (const bad of ['simulator0', 'Mainnet', null, 7]) expect(asFaucetStatus({ ...wire({ net }), network: bad })?.net).toBeNull();
+  });
+
+  it('formats mojos with the network\'s own ticker, and with none for an unknown network', () => {
+    expect(formatMojos(1_000_000_000, net.ticker)).toBe(`1,000,000,000 mojos (0.001 ${net.ticker})`);
+    expect(formatMojos(2.5e12, net.ticker)).toBe(`2,500,000,000,000 mojos (2.500 ${net.ticker})`);
+    expect(formatMojos(1005, net.ticker)).toBe('1,005 mojos');
+    expect(formatMojos(2.5e12, null)).toBe('2,500,000,000,000 mojos');
+  });
+
+  it('clears the room\'s dish when a status comes from another network', () => {
+    const other = net === TESTNET11 ? MAINNET : TESTNET11;
+    const room = `net-switch-${net.id}`;
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 40 }) });
+    markFaucetPending(room, 'claim', 7);
+    setFaucetReply(room, { op: 'status', ok: false, error: 'the gateway is down' });
+    expect(faucetPending(room)).toBe('claim');
+    // The node came back on the other network, numbering its snapshots afresh.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: other, snapshot: 3 }) });
+    expect(latestFaucetStatus(room)?.net).toBe(other);
+    expect(latestFaucetStatus(room)?.snapshot).toBe(3);
+    expect(faucetPending(room)).toBeNull();
+    expect(latestFaucetError(room)).toBeNull();
+    // The same network again files as before: an older snapshot is still dropped.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: other, snapshot: 2 }) });
+    expect(latestFaucetStatus(room)?.snapshot).toBe(3);
+    clearFaucetRoom(room);
   });
 });
 

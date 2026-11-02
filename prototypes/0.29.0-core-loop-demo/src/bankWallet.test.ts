@@ -3,10 +3,11 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { bankWalletView, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { GATED_TEXT, UNKNOWN_NETWORK_TEXT, bankWalletView, receiveNote, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
-const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443 };
+const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
 const ADDR = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
 const IDLE: BankWalletUi = { armed: false, turning: false, error: null };
 const node = (chia_wallet?: ChiaWalletSwitch, chia_address?: string): LocalFingerprint => ({
@@ -122,6 +123,75 @@ describe('bankWalletView', () => {
     expect(bankWalletView(node({ state: 'ready', error: 'disk full' }), { ...IDLE, error: 'no answer' }).error).toBe('no answer');
     expect(bankWalletView(node({ state: 'on', error: 'not saved' }, ADDR), IDLE).error).toBe('not saved');
     expect(bankWalletView(node({ state: 'off' }), { ...IDLE, error: 'x' }).error).toBeNull();
+  });
+});
+
+const BODY = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
+
+describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
+  const on = (chia_wallet?: ChiaWalletSwitch, chia_address?: string, chia_net: ChiaNetwork | null = net): LocalFingerprint => ({
+    ...node(chia_wallet, chia_address),
+    chia_net,
+  });
+  const addr = addressOn(net, BODY);
+
+  it('says which network the node is on, amber only where the coins are real money', () => {
+    for (const fp of [on({ state: 'ready', mnemonic: true }), on({ state: 'on', stays: true }, addr), on({ state: 'unbuilt' }), on()]) {
+      const v = bankWalletView(fp, IDLE);
+      expect(v.network?.warn).toBe(!net.test);
+      expect(v.network?.text).toContain(`Network: ${net.name}.`);
+      expect(v.network?.text).toContain(`(${net.ticker})`);
+    }
+    if (!net.test) expect(bankWalletView(on(), IDLE).network?.text).toBe('Network: Chia mainnet. Its coins (XCH) are real money.');
+    // No node: no network to name.
+    expect(bankWalletView(null, IDLE).network).toBeNull();
+  });
+
+  it('names the network in what turning on means', () => {
+    const armed = (w: ChiaWalletSwitch) => bankWalletView(on(w), { ...IDLE, armed: true }).warning ?? '';
+    expect(armed({ state: 'ready', mnemonic: true })).toContain(`new ${net.name} key from 24 words`);
+    expect(armed({ state: 'ready', mnemonic: true })).toContain(`Phone Book on ${net.chain}.`);
+    expect(armed({ state: 'ready' })).toContain(`a ${net.name} key you cannot write down`);
+    expect(armed({ state: 'ready', legacy: true })).toContain(`its ${net.coins} stay at its old address`);
+    expect(armed({ state: 'ready', seed: true })).toContain(`Phone Book on ${net.chain}.`);
+    expect(bankWalletView(on({ state: 'on', reminted: true }, addr), IDLE).notice).toContain(`old wallet's ${net.coins}`);
+    expect(bankWalletView(on({ state: 'on' }), IDLE).text).toContain(`did not read as a ${net.name} address`);
+  });
+
+  it('shows the address of an on wallet with its own prefix', () => {
+    expect(bankWalletView(on({ state: 'on', stays: true }, addr), IDLE)).toMatchObject({ showsAddress: true, button: { act: 'off' } });
+  });
+
+  it('offers no switch on a gated node, and says why', () => {
+    for (const ui of [IDLE, { ...IDLE, armed: true }, { ...IDLE, error: 'x' }]) {
+      const v = bankWalletView(on({ state: 'gated' }), ui);
+      expect(v).toMatchObject({ button: null, showsAddress: false, warning: null, text: GATED_TEXT });
+    }
+    expect(GATED_TEXT).toBe('Star Station does not make SSF wallets on Chia mainnet yet. Your node only reads the chain here.');
+  });
+
+  it('shows no address and no switch on a network the page does not know', () => {
+    for (const w of [{ state: 'on', stays: true }, { state: 'ready', mnemonic: true }, undefined] as (ChiaWalletSwitch | undefined)[]) {
+      const v = bankWalletView(on(w, addr, null), { ...IDLE, armed: true });
+      expect(v).toMatchObject({ button: null, showsAddress: false, warning: null, network: null, text: UNKNOWN_NETWORK_TEXT });
+    }
+    expect(UNKNOWN_NETWORK_TEXT).toBe('Your node runs on a Chia network this page does not know, so the Bank shows no address.');
+  });
+
+  it('writes the note under the address for this network, with no em-dash', () => {
+    const note = receiveNote(net);
+    expect(`${note.lead} ${note.text}`).not.toContain('—');
+    if (net.test) {
+      expect(note.lead).toBe('testnet11 only.');
+      expect(note.text).toContain('a testnet faucet gives TXCH for free');
+      expect(note.text).toContain('for good');
+    } else {
+      expect(note.lead).toBe('Real XCH.');
+      expect(note.text).toContain('real XCH');
+      // Zero-fee spends may stall on mainnet: no promise that one coin lasts.
+      expect(note.text).not.toContain('for good');
+      expect(note.text).not.toContain('faucet');
+    }
   });
 });
 
