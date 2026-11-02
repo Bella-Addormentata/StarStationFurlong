@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  BACKUP_APP_NO_WINDOW,
   BACKUP_DESKTOP,
   BACKUP_DONE,
   BACKUP_IDLE,
@@ -409,7 +410,7 @@ describe('BACK UP in the native mode', () => {
   });
 });
 
-describe('the page\'s BACK UP, unchanged without IPC or without backup "native"', () => {
+describe('the page\'s BACK UP on a dev page, unchanged without IPC or without backup "native"', () => {
   const ADDR = addressOn(TESTNET11, BODY);
 
   it.each([
@@ -434,12 +435,16 @@ describe('the page\'s BACK UP, unchanged without IPC or without backup "native"'
       }
       expect(reconcileBackupUi(ui, fp, 2500, true, 2500, shell)).toEqual(reconcileBackupUi(ui, old, 2500, true, 2500));
     }
-    const p = bankBackupView(fp, shown, 'app', shell)!;
+    const p = bankBackupView(fp, shown, 'dev', shell)!;
     expect(p.window).toBeNull();
     expect(p.panel?.words).toEqual(FAKE_WORDS);
     expect(p.panel?.copy).toBe(true);
+    // The desktop app's own page is never shown the words by the node, so
+    // there the Bank offers no SHOW and says why (bankBackup.test.ts).
+    expect(bankBackupView(fp, shown, 'app', shell)).toMatchObject({ open: false, panel: null, window: null, elsewhere: BACKUP_APP_NO_WINDOW });
     const ready = { ...fp, chia_address: undefined, chia_wallet: { state: 'ready', mnemonic: true } } as LocalFingerprint;
-    expect(opensAfterTurnOn(ready, fp, 'app', shell)).toBe(true);
+    expect(opensAfterTurnOn(ready, fp, 'dev', shell)).toBe(true);
+    expect(opensAfterTurnOn(ready, fp, 'app', shell)).toBe(false);
     expect(opensAfterTurnOn(ready, fp, 'elsewhere', shell)).toBe(false);
     // The page's reveal still goes to the node, as before.
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: true, words: FAKE_WORDS, key: FAKE_KEY, address: ADDR }), { status: 200 }));
@@ -453,7 +458,7 @@ describe('the page\'s BACK UP, unchanged without IPC or without backup "native"'
 });
 
 describe('BACK UP on Chia mainnet', () => {
-  it('only native, in the app, offers a button; anything else says to use the desktop app', () => {
+  it('only native, in the app, offers a button; anything else says to use the desktop app, or in the app why it cannot', () => {
     for (const backup of [undefined, 'page', 'none', 'native'] as const) {
       for (const shell of [true, false]) {
         const fp = fpOn(MAINNET, backup);
@@ -465,7 +470,9 @@ describe('BACK UP on Chia mainnet', () => {
             expect(v.window).toEqual({ label: 'OPEN BACKUP WINDOW', busy: false });
             expect(v.elsewhere).toBeNull();
           } else {
-            expect(v).toMatchObject({ state: 'nag', line: BACKUP_NAG, window: null, windowLine: null, elsewhere: 'Back up from the Star Station desktop app on this computer.' });
+            // In the app's own page the line says what brings the window back.
+            const elsewhere = page === 'app' ? BACKUP_APP_NO_WINDOW : 'Back up from the Star Station desktop app on this computer.';
+            expect(v).toMatchObject({ state: 'nag', line: BACKUP_NAG, window: null, windowLine: null, elsewhere });
             expect(BACKUP_DESKTOP).toBe('Back up from the Star Station desktop app on this computer.');
           }
         }

@@ -20,12 +20,13 @@
 // gets a new generation, and a reveal that answers for an older one is
 // dropped, so a late answer never puts the words back.
 //
-// Known and accepted for testnet (a native reveal in the desktop host is the
-// mainnet fix for both): any script in the game page can ask for the words
-// while they are not marked saved, and another OS account's page on this
-// computer reaches the same loopback node. So the page's BACK UP is offered
-// only on a test network (`ChiaNetwork.test`), and on any other network the
-// two requests are refused here before anything is sent.
+// Known and accepted for testnet: on a dev page the operator lists, any
+// script in that page can ask for the words while they are not marked saved,
+// and any program on this computer can send that page's origin. So the
+// page's BACK UP is offered only on a test network (`ChiaNetwork.test`), and
+// on any other network the two requests are refused here before anything is
+// sent. The node never shows the words to the desktop app's own page (#367),
+// so there the Bank offers no SHOW at all.
 //
 // 🖥️ The native BACK UP: when the node says the desktop app's channel is on
 // (`chia_wallet.backup` is `native`) and the page runs inside the app
@@ -33,7 +34,9 @@
 // WINDOW. The app shows the words in a window of its own; the page never
 // asks the node for them, never marks them saved, and never holds one. That
 // works on any network the page knows. On a network that is not a test one,
-// with no native BACK UP, the Bank says to back up from the desktop app.
+// with no native BACK UP, the Bank says to back up from the desktop app. In
+// the app's own page with no native BACK UP (its node was not started by the
+// app), it says to stop the other node and restart the app.
 
 import { BANK_WALLET_BUTTON_ID } from './bankWallet';
 import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
@@ -64,10 +67,12 @@ export const BANK_SETTLE_MS = 500;
 
 // ── Where the page runs ──────────────────────────────────────────────────────
 
-/** `app`: the Star Station desktop app's own page, the one page the node
- *  shows the words to. `dev`: a loopback http page, which the node shows
- *  them to only when its origin is listed in `SSF_BANK_DEV_PAGES` (its 403
- *  says so). `elsewhere`: any other page, which is told to open the app. */
+/** `app`: the Star Station desktop app's own page. The node never shows it
+ *  the words: there BACK UP is the app's window (the native mode), and
+ *  without that the Bank says why ([`BACKUP_APP_NO_WINDOW`]). `dev`: a
+ *  loopback http page, which the node shows them to only when its origin is
+ *  listed in `SSF_BANK_DEV_PAGES` (its 403 says so). `elsewhere`: any other
+ *  page, which is told to open the app. */
 export type BackupPage = 'app' | 'dev' | 'elsewhere';
 
 export function backupPageKind(loc: { protocol: string; hostname: string }): BackupPage {
@@ -229,6 +234,9 @@ export const BACKUP_WINDOW_LINES: Readonly<Record<NativeBackupAnswer, string>> =
   busy: 'The backup window is open, or just closed. Try again in a few seconds.',
   unavailable: 'The desktop app could not open the backup window. Restart Star Station, or update it.',
 });
+/** The desktop app's own page outside the native mode: its node runs
+ *  without the app's channel, and the node refuses this page's reveal. */
+export const BACKUP_APP_NO_WINDOW = BACKUP_WINDOW_LINES.no_channel;
 export const BACKUP_DONE =
   'Your 24 words are backed up. The Bank does not show them again: keep the paper safe, it is the only copy away from this computer.';
 export const BACKUP_TITLE = 'BACK UP — YOUR 24 WORDS';
@@ -302,8 +310,8 @@ export interface BankBackupView {
   line: string | null;
   /** BACK UP is offered (the nag, on a page the node may show the words to). */
   open: boolean;
-  /** Instead of BACK UP on any other page, or off a test network with no
-   *  native BACK UP. */
+  /** Instead of BACK UP on any other page, off a test network with no
+   *  native BACK UP, or in the app's own page with no native BACK UP. */
   elsewhere: string | null;
   /** 🖥️ OPEN BACKUP WINDOW, in place of BACK UP, in the native mode: `busy`
    *  while the window is out. Never with the panel, a word or COPY. */
@@ -343,7 +351,8 @@ export function bankBackupView(
     if (desk) {
       const atRest = atRestLines(fp);
       if (backedUp(fp)) return { state: 'done', line: BACKUP_DONE, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest, ...none };
-      return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_DESKTOP, panel: null, copyNotice: outside, error: null, atRest, ...none };
+      const elsewhere = page === 'app' ? BACKUP_APP_NO_WINDOW : BACKUP_DESKTOP;
+      return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere, panel: null, copyNotice: outside, error: null, atRest, ...none };
     }
     return outside ? { state: 'notice', line: null, open: false, elsewhere: null, panel: null, copyNotice: outside, error: null, atRest: [], ...none } : null;
   }
@@ -367,6 +376,12 @@ export function bankBackupView(
   }
   if (page === 'elsewhere') {
     return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_ELSEWHERE, panel: null, copyNotice: null, error: null, atRest, ...none };
+  }
+  // The app's own page, with no native BACK UP: the node refuses its reveal
+  // (only a page SSF_BANK_DEV_PAGES lists may ask), so no SHOW, and the line
+  // says what brings the app's window back.
+  if (page === 'app') {
+    return { state: 'nag', line: BACKUP_NAG, open: false, elsewhere: BACKUP_APP_NO_WINDOW, panel: null, copyNotice: outside, error: null, atRest, ...none };
   }
   if (!ui.open || ui.address !== address) {
     return { state: 'nag', line: BACKUP_NAG, open: true, elsewhere: null, panel: null, copyNotice: outside, error: ui.error, atRest, ...none };
@@ -407,8 +422,9 @@ export function bankBackupView(
 
 /** Whether TURN ON should open BACK UP (the panel, or in the native mode
  *  the desktop app's window): the wallet was not on, now is, is made from
- *  words that are not backed up, and this page may show them, or the app's
- *  window may, on any network the page knows. */
+ *  words that are not backed up, and this page may show them (a dev page,
+ *  on a test network), or the app's window may, on any network the page
+ *  knows. */
 export function opensAfterTurnOn(
   before: LocalFingerprint | null | undefined,
   after: LocalFingerprint | null | undefined,
@@ -416,7 +432,8 @@ export function opensAfterTurnOn(
   shell = false,
 ): boolean {
   const mode = backupMode(after, shell);
-  if ((mode !== 'native' && page === 'elsewhere') || before?.chia_wallet?.state === 'on') return false;
+  // Outside the native mode only a dev page has a panel to open.
+  if ((mode !== 'native' && page !== 'dev') || before?.chia_wallet?.state === 'on') return false;
   return backupAddress(after, mode) !== null && !backedUp(after);
 }
 
@@ -750,8 +767,8 @@ export async function revealWords(
     if (address !== expectAddress) return fail(CHANGED, { refresh: true });
     return { ok: true, words, key, address };
   }
-  // The node's refusal: not the app's page (403), not on, turning, already
-  // saved (409), or the words could not be read (500).
+  // The node's refusal: a page it does not take (403), not on, turning,
+  // already saved (409), or the words could not be read (500).
   const said = nodeSaid(got.body);
   return fail(said || `your station node answered ${got.status}, so the words are not shown`, {
     refresh: got.status === 409,

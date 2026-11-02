@@ -5,8 +5,10 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  BACKUP_APP_NO_WINDOW,
   BACKUP_GRID_ID,
   BACKUP_IDLE,
+  BACKUP_NAG,
   BACKUP_SAVED_ID,
   BACKUP_SHOW_ID,
   CLIPBOARD_WIPE_MS,
@@ -106,16 +108,29 @@ describe('bankBackupView', () => {
       node({ ...ON }), // on, but no address
       node({ ...ON }, 'xch1' + ADDR.slice(5)), // not a testnet11 address
     ]) {
-      expect(bankBackupView(fp, BACKUP_IDLE, 'app')).toBeNull();
+      expect(bankBackupView(fp, BACKUP_IDLE, 'dev')).toBeNull();
     }
   });
 
   it('nags with BACK UP, keeping the address in view, until the panel opens', () => {
-    const v = bankBackupView(LIVE, BACKUP_IDLE, 'app')!;
+    const v = bankBackupView(LIVE, BACKUP_IDLE, 'dev')!;
     expect(v).toMatchObject({ state: 'nag', open: true, elsewhere: null, panel: null, error: null });
     expect(v.line).toContain('not backed up');
     expect(v.line).toContain('no other Chia wallet can open it');
-    expect(bankBackupView(LIVE, BACKUP_IDLE, 'dev')).toMatchObject({ state: 'nag', open: true });
+  });
+
+  it('in the desktop app\'s own page, outside the native mode, offers no SHOW and says why', () => {
+    // The node never shows this page the words: BACK UP there is the app's
+    // window, which needs a node the app started.
+    for (const ui of [BACKUP_IDLE, opened(), shown()]) {
+      const v = bankBackupView(LIVE, ui, 'app')!;
+      expect(v).toMatchObject({ state: 'nag', line: BACKUP_NAG, open: false, window: null, panel: null, elsewhere: BACKUP_APP_NO_WINDOW });
+      for (const w of WORDS) expect(JSON.stringify(v)).not.toContain(w);
+    }
+    expect(BACKUP_APP_NO_WINDOW).toBe('The desktop app did not start this station node, so it cannot show the 24 words. Stop the other station node and restart Star Station.');
+    expect(opensAfterTurnOn(node({ state: 'ready' }), LIVE, 'app')).toBe(false);
+    // A wallet backed up still says so there.
+    expect(bankBackupView(node({ ...ON, backed_up: true }, ADDR), BACKUP_IDLE, 'app')).toMatchObject({ state: 'done', elsewhere: null });
   });
 
   it('on any other page says to open the app, and offers no BACK UP', () => {
@@ -125,7 +140,7 @@ describe('bankBackupView', () => {
   });
 
   it('opens masked, with I SAVED really disabled until a reveal', () => {
-    const v = bankBackupView(LIVE, opened(), 'app')!;
+    const v = bankBackupView(LIVE, opened(), 'dev')!;
     expect(v.state).toBe('panel');
     expect(v.line).toBeNull();
     const p = v.panel!;
@@ -142,12 +157,12 @@ describe('bankBackupView', () => {
 
   it('walks through revealing, shown, hidden, armed, saving and done', () => {
     const s = startReveal(opened(), 1500)!;
-    const revealing = bankBackupView(LIVE, s.ui, 'app')!.panel!;
+    const revealing = bankBackupView(LIVE, s.ui, 'dev')!.panel!;
     expect(revealing.show).toEqual({ act: 'show', label: 'SHOWING…', busy: true });
     expect(revealing.words).toBeNull();
 
     const ui = shown();
-    const p = bankBackupView(LIVE, ui, 'app')!.panel!;
+    const p = bankBackupView(LIVE, ui, 'dev')!.panel!;
     expect(p.words).toEqual(WORDS);
     expect(p.show).toEqual({ act: 'hide', label: 'HIDE', busy: false });
     expect(p.copy).toBe(true);
@@ -163,34 +178,34 @@ describe('bankBackupView', () => {
     const hidden = hideWords(ui, 3000);
     expect(hidden.words).toBeNull();
     expect(hidden.key).toBe(KEY);
-    const hp = bankBackupView(LIVE, hidden, 'app')!.panel!;
+    const hp = bankBackupView(LIVE, hidden, 'dev')!.panel!;
     expect(hp).toMatchObject({ words: null, copy: false, show: { act: 'show', label: 'SHOW' } });
     expect(hp.saved).toMatchObject({ label: 'I SAVED', disabled: false });
 
     const armed = armSave(hidden, 4000);
-    const ap = bankBackupView(LIVE, armed, 'app')!.panel!;
+    const ap = bankBackupView(LIVE, armed, 'dev')!.panel!;
     expect(ap.saved).toEqual({ act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false, disabled: false });
     expect(ap.armedWarning).toBe('Written all 24, in order? The Bank stops asking and will not show them again. Tap CONFIRM.');
 
     const saving = startSave(armed);
-    const sp = bankBackupView(LIVE, saving, 'app')!.panel!;
+    const sp = bankBackupView(LIVE, saving, 'dev')!.panel!;
     expect(sp.saved).toEqual({ act: 'confirm', label: 'SAVING…', danger: false, busy: true, disabled: false });
     expect(sp.armedWarning).toBeNull();
 
-    const done = bankBackupView(node({ ...ON, backed_up: true }, ADDR), BACKUP_IDLE, 'app')!;
+    const done = bankBackupView(node({ ...ON, backed_up: true }, ADDR), BACKUP_IDLE, 'dev')!;
     expect(done).toMatchObject({ state: 'done', open: false, panel: null });
     expect(done.line).toContain('backed up');
     expect(done.line).toContain('does not show them again');
     // Done on the page's word too, until the fingerprint catches up.
     const saved = applySave(saving, saving.saveTicket, { ok: true, note: null }, 5000);
-    expect(bankBackupView(LIVE, saved, 'app')).toMatchObject({ state: 'done', panel: null });
+    expect(bankBackupView(LIVE, saved, 'dev')).toMatchObject({ state: 'done', panel: null });
     expect(saved).toMatchObject({ open: false, words: null, key: null, savedFor: ADDR });
   });
 
   it('words what the clipboard holds, and the expiry', () => {
     const ui = shown();
     const notice = (copy: BankBackupUi['copy'], open = true) =>
-      bankBackupView(LIVE, { ...ui, copy, open }, 'app')!.copyNotice;
+      bankBackupView(LIVE, { ...ui, copy, open }, 'dev')!.copyNotice;
     expect(notice('none')).toBeNull();
     const held = notice('held')!;
     expect(held).toContain('COPIED');
@@ -207,8 +222,8 @@ describe('bankBackupView', () => {
     expect(notice('refused', false)).toBeNull();
 
     const expired = reconcileBackupUi(ui, LIVE, 2000 + WORDS_SHOWN_MS, true);
-    expect(bankBackupView(LIVE, expired, 'app')!.panel!.expired).toBe('Hidden after 5 minutes. Tap SHOW to see them again.');
-    expect(bankBackupView(LIVE, ui, 'app')!.panel!.expired).toBeNull();
+    expect(bankBackupView(LIVE, expired, 'dev')!.panel!.expired).toBe('Hidden after 5 minutes. Tap SHOW to see them again.');
+    expect(bankBackupView(LIVE, ui, 'dev')!.panel!.expired).toBeNull();
   });
 });
 
@@ -272,12 +287,12 @@ describe('reconcileBackupUi', () => {
 
   it('keeps saying the clipboard may hold the words after the wallet goes away', () => {
     for (const copy of ['stuck', 'wiped'] as const) {
-      const v = bankBackupView(null, { ...BACKUP_IDLE, copy }, 'app');
+      const v = bankBackupView(null, { ...BACKUP_IDLE, copy }, 'dev');
       expect(v).toMatchObject({ state: 'notice', line: null, open: false, panel: null });
-      expect(v!.copyNotice).toBe(bankBackupView(LIVE, { ...shown(), copy, open: false }, 'app')!.copyNotice);
+      expect(v!.copyNotice).toBe(bankBackupView(LIVE, { ...shown(), copy, open: false }, 'dev')!.copyNotice);
       expect(bankBackupView(node({ state: 'ready' }), { ...BACKUP_IDLE, copy }, 'elsewhere')?.state).toBe('notice');
     }
-    for (const copy of ['none', 'held', 'refused'] as const) expect(bankBackupView(null, { ...BACKUP_IDLE, copy }, 'app')).toBeNull();
+    for (const copy of ['none', 'held', 'refused'] as const) expect(bankBackupView(null, { ...BACKUP_IDLE, copy }, 'dev')).toBeNull();
   });
 
   it('lets the page\'s own "saved" stand only until the node agrees, for the same wallet', () => {
@@ -285,7 +300,7 @@ describe('reconcileBackupUi', () => {
     expect(reconcileBackupUi(saved, LIVE, 1, true)).toBe(saved);
     expect(reconcileBackupUi(saved, node({ ...ON, backed_up: true }, ADDR), 1, true).savedFor).toBeNull();
     expect(reconcileBackupUi(saved, node(ON, OTHER), 1, true).savedFor).toBeNull();
-    expect(bankBackupView(node(ON, OTHER), saved, 'app')!.state).toBe('nag');
+    expect(bankBackupView(node(ON, OTHER), saved, 'dev')!.state).toBe('nag');
   });
 });
 
@@ -311,7 +326,7 @@ describe('the panel\'s moves', () => {
     expect(refused).toMatchObject({ open: true, revealing: false, words: null, error: 'not this page', changedAt: 1700 });
     const saved = applyReveal(s.ui, s.ticket, { ok: false, error: 'saved', refresh: true, saved: true, drop: false }, true, 1700);
     expect(saved).toMatchObject({ open: false, savedFor: ADDR });
-    expect(bankBackupView(LIVE, saved, 'app')!.state).toBe('done');
+    expect(bankBackupView(LIVE, saved, 'dev')!.state).toBe('done');
   });
 
   it('I SAVED needs a reveal; a failed save keeps the words, a 409 drops them', () => {
@@ -322,9 +337,9 @@ describe('the panel\'s moves', () => {
     expect(failed).toMatchObject({ saving: false, words: WORDS, key: KEY, error: 'could not record' });
     const dropped = applySave(saving, saving.saveTicket, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4000);
     expect(dropped).toMatchObject({ saving: false, words: null, key: null, open: true, error: 'tap SHOW again' });
-    expect(bankBackupView(LIVE, dropped, 'app')!.panel!.saved.disabled).toBe(true);
+    expect(bankBackupView(LIVE, dropped, 'dev')!.panel!.saved.disabled).toBe(true);
     const noted = applySave(saving, saving.saveTicket, { ok: true, note: 'saved, but not confirmed on disk' }, 4000);
-    expect(bankBackupView(LIVE, noted, 'app')).toMatchObject({ state: 'done', error: 'saved, but not confirmed on disk' });
+    expect(bankBackupView(LIVE, noted, 'dev')).toMatchObject({ state: 'done', error: 'saved, but not confirmed on disk' });
     // A save that lands after the panel closed changes nothing on the page.
     const closed = closeBackupPanel(saving, 3500);
     expect(applySave(closed, saving.saveTicket, { ok: true, note: null }, 4000)).toBe(closed);
@@ -355,13 +370,13 @@ describe('the panel\'s moves', () => {
 
   it('SHOW, HIDE, SHOW again: I SAVED waits for the reveal, and a 409 on a save never leaves SHOW stuck', () => {
     const ok: RevealResult = { ok: true, words: [...WORDS], key: KEY, address: ADDR };
-    const showLabel = (ui: BankBackupUi) => bankBackupView(LIVE, ui, 'app')!.panel!.show;
+    const showLabel = (ui: BankBackupUi) => bankBackupView(LIVE, ui, 'dev')!.panel!.show;
     const hidden = hideWords(shown(), 3000);
     expect(hidden.key).toBe(KEY); // a key is kept: I SAVED is offered while masked
     const again = startReveal(hidden, 4000)!;
     // While the second reveal is out, I SAVED is really disabled and neither
     // its tap nor a ⚠ CONFIRM does anything.
-    expect(bankBackupView(LIVE, again.ui, 'app')!.panel!.saved).toEqual({ act: 'arm', label: 'I SAVED', danger: false, busy: false, disabled: true });
+    expect(bankBackupView(LIVE, again.ui, 'dev')!.panel!.saved).toEqual({ act: 'arm', label: 'I SAVED', danger: false, busy: false, disabled: true });
     expect(armSave(again.ui, 4600)).toBe(again.ui);
     const armedAnyway = { ...again.ui, armed: true };
     expect(startSave(armedAnyway)).toBe(armedAnyway);
@@ -380,7 +395,7 @@ describe('the panel\'s moves', () => {
     expect(applyReveal(third.ui, third.ticket, ok, true, 6000)).toMatchObject({ revealing: false, words: WORDS, key: KEY });
     // Without the overlap the second reveal simply lands, and I SAVED comes back.
     const landed = applyReveal(again.ui, again.ticket, ok, true, 4500);
-    expect(bankBackupView(LIVE, landed, 'app')!.panel!.saved).toMatchObject({ label: 'I SAVED', disabled: false });
+    expect(bankBackupView(LIVE, landed, 'dev')!.panel!.saved).toMatchObject({ label: 'I SAVED', disabled: false });
     expect(armSave(landed, 5000)).toMatchObject({ armed: true });
   });
 
@@ -390,7 +405,7 @@ describe('the panel\'s moves', () => {
     expect(h).toMatchObject({ revealing: false, words: null });
     expect(h.gen).toBeGreaterThan(s.ticket);
     expect(applyReveal(h, s.ticket, { ok: true, words: [...WORDS], key: KEY, address: ADDR }, true, 1700)).toBe(h);
-    expect(bankBackupView(LIVE, h, 'app')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: false });
+    expect(bankBackupView(LIVE, h, 'dev')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: false });
     expect(startReveal(h, 2200)).not.toBeNull();
   });
 
@@ -398,16 +413,16 @@ describe('the panel\'s moves', () => {
     const saving = startSave(armSave(shown(), 3000));
     expect(saving.saving).toBe(true);
     // The words still show during the save: HIDE is always offered.
-    expect(bankBackupView(LIVE, saving, 'app')!.panel!.show).toEqual({ act: 'hide', label: 'HIDE', busy: false });
+    expect(bankBackupView(LIVE, saving, 'dev')!.panel!.show).toEqual({ act: 'hide', label: 'HIDE', busy: false });
     const hidden = hideWords(saving, 3500);
     expect(hidden.saving).toBe(true);
     // Masked mid-save: SHOW stays put (busy, so it keeps focus) and a tap asks nothing.
-    expect(bankBackupView(LIVE, hidden, 'app')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: true });
+    expect(bankBackupView(LIVE, hidden, 'dev')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: true });
     expect(startReveal(hidden, 4000)).toBeNull();
     expect(startReveal(saving, 4000)).toBeNull();
     // A save that failed for another reason keeps the key: SHOW and I SAVED are both free.
     const failed = applySave(hidden, saving.saveTicket, { ok: false, error: 'could not record', refresh: false, saved: false, drop: false }, 4500);
-    expect(bankBackupView(LIVE, failed, 'app')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: false });
+    expect(bankBackupView(LIVE, failed, 'dev')!.panel!.show).toEqual({ act: 'show', label: 'SHOW', busy: false });
     expect(startReveal(failed, 5000)).not.toBeNull();
     const dropped = applySave(hidden, saving.saveTicket, { ok: false, error: 'tap SHOW again', refresh: true, saved: false, drop: true }, 4500);
     expect(startReveal(dropped, 5000)).not.toBeNull();
@@ -421,13 +436,13 @@ describe('the panel\'s moves', () => {
 
   it('opens after TURN ON only for a wallet that just came on, from words not backed up, on a page that can show them', () => {
     const ready = node({ state: 'ready' });
-    expect(opensAfterTurnOn(ready, LIVE, 'app')).toBe(true);
+    expect(opensAfterTurnOn(ready, LIVE, 'dev')).toBe(true);
     expect(opensAfterTurnOn(null, LIVE, 'dev')).toBe(true);
     expect(opensAfterTurnOn(ready, LIVE, 'elsewhere')).toBe(false);
-    expect(opensAfterTurnOn(LIVE, LIVE, 'app')).toBe(false); // KEEP IT ON: it was on already
-    expect(opensAfterTurnOn(ready, node({ ...ON, backed_up: true }, ADDR), 'app')).toBe(false);
-    expect(opensAfterTurnOn(ready, node({ state: 'on' }, ADDR), 'app')).toBe(false); // an older node
-    expect(opensAfterTurnOn(ready, ready, 'app')).toBe(false); // the turn failed
+    expect(opensAfterTurnOn(LIVE, LIVE, 'dev')).toBe(false); // KEEP IT ON: it was on already
+    expect(opensAfterTurnOn(ready, node({ ...ON, backed_up: true }, ADDR), 'dev')).toBe(false);
+    expect(opensAfterTurnOn(ready, node({ state: 'on' }, ADDR), 'dev')).toBe(false); // an older node
+    expect(opensAfterTurnOn(ready, ready, 'dev')).toBe(false); // the turn failed
   });
 });
 
@@ -603,13 +618,13 @@ describe.each([TESTNET11, MAINNET])('BACK UP on $name', (net) => {
   const live: LocalFingerprint = { ...node(ON, addr), chia_net: net };
 
   it('is offered only on a test network', () => {
-    const v = bankBackupView(live, BACKUP_IDLE, 'app');
+    const v = bankBackupView(live, BACKUP_IDLE, 'dev');
     if (net.test) expect(v).toMatchObject({ state: 'nag', open: true });
     // 🖥️ Off a test network the nag says where to back up instead, and
     // offers no control at all (bankBackupNative.test.ts).
     else expect(v).toMatchObject({ state: 'nag', open: false, window: null, panel: null, elsewhere: 'Back up from the Star Station desktop app on this computer.' });
     expect(openBackupPanel(BACKUP_IDLE, live, 1).open).toBe(net.test);
-    expect(opensAfterTurnOn(node({ state: 'ready', mnemonic: true }), live, 'app')).toBe(net.test);
+    expect(opensAfterTurnOn(node({ state: 'ready', mnemonic: true }), live, 'dev')).toBe(net.test);
   });
 
   it('never fetches the words, or marks them saved, off a test network', async () => {
@@ -635,7 +650,7 @@ describe.each([TESTNET11, MAINNET])('BACK UP on $name', (net) => {
     expect(await revealWords(ORIGIN, addr, null, never as unknown as typeof fetch)).toMatchObject({ ok: false });
     expect(await markWordsSaved(ORIGIN, KEY, null, never as unknown as typeof fetch)).toMatchObject({ ok: false });
     expect(never).not.toHaveBeenCalled();
-    expect(bankBackupView({ ...live, chia_net: null }, BACKUP_IDLE, 'app')).toBeNull();
+    expect(bankBackupView({ ...live, chia_net: null }, BACKUP_IDLE, 'dev')).toBeNull();
   });
 });
 
@@ -795,11 +810,11 @@ describe('atRestLines (🔒 the wallet\'s file at rest)', () => {
 
   it('rides with the nag and the done line, never in the panel', () => {
     const fp = on({ at_rest: 'none', at_rest_next: 'dpapi' });
-    expect(bankBackupView(fp, BACKUP_IDLE, 'app')?.atRest).toEqual([AT_REST_UNTIL_SAVED]);
+    expect(bankBackupView(fp, BACKUP_IDLE, 'dev')?.atRest).toEqual([AT_REST_UNTIL_SAVED]);
     expect(bankBackupView(fp, BACKUP_IDLE, 'elsewhere')?.atRest).toEqual([AT_REST_UNTIL_SAVED]);
     const saved = on({ at_rest: 'dpapi', backed_up: true });
-    expect(bankBackupView(saved, BACKUP_IDLE, 'app')).toMatchObject({ state: 'done', atRest: [AT_REST_DPAPI] });
-    const panel = bankBackupView(fp, openBackupPanel(BACKUP_IDLE, fp, 1000), 'app');
+    expect(bankBackupView(saved, BACKUP_IDLE, 'dev')).toMatchObject({ state: 'done', atRest: [AT_REST_DPAPI] });
+    const panel = bankBackupView(fp, openBackupPanel(BACKUP_IDLE, fp, 1000), 'dev');
     expect(panel?.state).toBe('panel');
     expect(panel?.atRest).toEqual([]);
   });
