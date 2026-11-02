@@ -2261,7 +2261,17 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     ...(D.craps ? crapsCheck(st, sc, res, D, me) : {}),
     ...coveredOf,
   };
-  st.checks.set(D.close, out);
+  // 🔁 L7 across a restore (§6.2 C): don't cache a forgery's check over this
+  // page's honest one while a restore is pending (forgedStands). A populated
+  // rewind — a replay whose session decides the checkpoint's close another way
+  // (full reveals over the trimmer's forfeit, say) — folds that close here, and
+  // caching it would clobber the honest check keyed by the same close; once the
+  // head is back, roundCheck reads this cache as `kept` and the ⚙ card would
+  // show the forgery's verdict while the felt (built from the preserved
+  // st.lastD) shows the honest one. The live card still returns `out` during
+  // the excursion; only the cache the restore reads back is protected (the twin
+  // of the st.lastD freeze in noteResult).
+  if (!forgedStands(st)) st.checks.set(D.close, out);
   return out;
 }
 
