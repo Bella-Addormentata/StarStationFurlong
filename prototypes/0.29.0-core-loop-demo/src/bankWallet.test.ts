@@ -3,7 +3,7 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { UNKNOWN_NETWORK_TEXT, bankWalletView, createInAppText, olderNodeText, receiveNote, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { UNKNOWN_NETWORK_TEXT, bankWalletView, createInAppText, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
 import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
@@ -234,6 +234,36 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
       // Zero-fee spends may stall on mainnet: no promise that one coin lasts.
       expect(note.text).not.toContain('for good');
       expect(note.text).not.toContain('faucet');
+    }
+  });
+
+  it("names the wallet's network under THE REGISTRY, never a test one on mainnet", () => {
+    const line = registryChiaLine(net);
+    expect(line).toContain('under RECEIVE');
+    if (net.test) {
+      expect(line).toBe('Chia account: your SSF wallet, kept by your station node on this computer (testnet11, a test network); turn it on, and see its address and balance, under RECEIVE.');
+    } else {
+      expect(line).toBe('Chia account: your SSF wallet, kept by your station node on this computer (Chia mainnet: real XCH); turn it on, and see its address and balance, under RECEIVE.');
+      expect(line).not.toContain('test');
+    }
+  });
+
+  it('says the Bank can bring no wallet on only off a test network, with no app channel and none on disk', () => {
+    for (const backup of ['native', 'page', 'none', undefined] as const) {
+      for (const seed of [true, false]) {
+        const w: ChiaWalletSwitch = { state: 'ready', mnemonic: true, seed, ...(backup ? { backup } : {}) };
+        expect(mintsOnlyInApp(net, w)).toBe(!net.test && !seed && backup !== 'native');
+        // The Bank's own CREATE rule is this one.
+        if (!seed) expect(bankWalletView(on(w), IDLE).text === createInAppText(net)).toBe(mintsOnlyInApp(net, w));
+      }
+    }
+  });
+});
+
+describe('registryChiaLine', () => {
+  it('names no network without a node, or on one this page does not know', () => {
+    for (const none of [null, undefined]) {
+      expect(registryChiaLine(none)).toBe('Chia account: your SSF wallet, kept by your station node on this computer; turn it on, and see its address and balance, under RECEIVE.');
     }
   });
 });

@@ -24,7 +24,7 @@
 // testnet11.
 
 import type { ChiaNetwork } from './chiaNetwork';
-import type { LocalFingerprint } from './nodeFingerprint';
+import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
 /** The page's own part: CREATE armed and waiting for CONFIRM, a request in
  *  flight, and the last request's failure in the page's or the node's words. */
@@ -91,6 +91,15 @@ export function networkLine(net: ChiaNetwork): { text: string; warn: boolean } {
     : { text: `Network: ${net.name}. Its coins (${net.ticker}) are real money.`, warn: true };
 }
 
+/** Whether nothing on this page can bring an SSF wallet on: off a test
+ *  network, with no desktop app channel to the node (`backup` is not
+ *  `native`) and no wallet on disk (`seed`), the node refuses to make a new
+ *  wallet whose words nothing here can show. The Bank then offers no CREATE
+ *  and the Phone Book's row names the desktop app, not the Bank. */
+export function mintsOnlyInApp(net: ChiaNetwork, w: ChiaWalletSwitch): boolean {
+  return !net.test && !w.seed && w.backup !== 'native';
+}
+
 /** Off a test network, with no desktop app channel to the node (`backup`
  *  is not `native`): the node refuses to make a new wallet whose words
  *  nothing here can show, so the Bank offers no CREATE. */
@@ -116,6 +125,14 @@ export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
       lead: `Real ${net.ticker}.`,
       text: `This address takes real ${net.ticker} on ${net.name}. Scan the code or paste the address in a Chia wallet set to mainnet. Your node spends from it to write to the chain, so send only a little.`,
     };
+}
+
+/** THE REGISTRY's line on the Chia account, with the node's network: a
+ *  mainnet wallet holds real money, so it is never called a test one. No
+ *  network without a node, or on one this page does not know. */
+export function registryChiaLine(net: ChiaNetwork | null | undefined): string {
+  const where = !net ? '' : net.test ? ` (${net.name}, a test network)` : ` (${net.name}: real ${net.ticker})`;
+  return `Chia account: your SSF wallet, kept by your station node on this computer${where}; turn it on, and see its address and balance, under RECEIVE.`;
 }
 
 /** What the Bank's RECEIVE section shows about the wallet. */
@@ -184,7 +201,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       // Off a test network the node mints only for the desktop app that
       // started it, so a CREATE anywhere else would only be refused. A
       // wallet already on disk loads (TURN ON) either way.
-      if (!net.test && !w.seed && w.backup !== 'native') {
+      if (mintsOnlyInApp(net, w)) {
         return { ...none, text: createInAppText(net), error, showsAddress: false };
       }
       if (ui.turning) {

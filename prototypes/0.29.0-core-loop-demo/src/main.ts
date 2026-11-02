@@ -287,7 +287,7 @@ import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tv
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { BANK_WALLET_BUTTON_ID, bankWalletView, receiveNote, turnSsfWallet } from "./bankWallet";
+import { BANK_WALLET_BUTTON_ID, bankWalletView, receiveNote, registryChiaLine, turnSsfWallet } from "./bankWallet";
 import {
   BACKUP_COPY_ID, BACKUP_GRID_ID, BACKUP_ID, BACKUP_IDLE, BACKUP_LATER_ID, BACKUP_SAVED_ID, BACKUP_SHOW_ID,
   BACKUP_WINDOW_ID,
@@ -5439,8 +5439,7 @@ function renderBankApp(): void {
     }
     ${header("THE REGISTRY")}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
-      Chia account: your SSF wallet, kept by your station node on this computer
-      (test network); turn it on, and see its address and balance, under RECEIVE. On-Registry share trading appears here when
+      ${esc(registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net))} On-Registry share trading appears here when
       the node's account service lands. Shares today are room records — same
       rules, no coins at risk.
     </div>
