@@ -78,6 +78,9 @@ zeroize = { version = "1.5", optional = true }
 # Slice 4 (publish) + Slice 5 (resolve): spend construction and signing.
 chia-sdk-driver = { version = "0.34", optional = true }
 chia-sdk-types = { version = "0.34", optional = true }
+# ⛓️ Only to name `ConsensusConstants` (chia_network.rs), which chia-sdk-types
+# hands out but does not re-export. Already in the graph through it.
+chia-consensus = { version = "0.36", optional = true }
 chia-sdk-signer = { version = "0.34", optional = true }
 # S-0 step 2 (#231 D1; plan §6/§14): the chain lane reaches Chia FULL-NODE PEERS
 # over the light-wallet protocol — TLS websockets to port 58444 — instead of
@@ -145,7 +148,7 @@ default = ["chia-read"]
 # Chain READS (#231 D3: on by default). Lookup-by-hint, parent-spend fetch and
 # record decode for the presence reader + P1 watcher. No wallet, no seed, no spends.
 chia-read = [
-    "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-types",
+    "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-types", "dep:chia-consensus",
     "dep:chia-ssl", "dep:chia-traits", "dep:tokio-tungstenite", "dep:tokio-rustls",
     "dep:rustls", "dep:rustls-pemfile", "dep:futures-util",
     "dep:clvmr", "dep:clvm-traits", "dep:clvm-utils",

@@ -352,9 +352,9 @@ fn unix_now() -> u64 {
 
 impl Lane {
     /// The node's lane: pins and pin-only mode from the environment, the store
-    /// beside the node's other files.
-    pub fn from_env(net: Network) -> Self {
-        Self::new(net, pins_from_env(), pin_only_from_env(), Some(PathBuf::from(STORE_FILE)))
+    /// at `store_path` (the network's own [`STORE_FILE`], `ChiaNet::path`).
+    pub fn from_env(net: Network, store_path: PathBuf) -> Self {
+        Self::new(net, pins_from_env(), pin_only_from_env(), Some(store_path))
     }
 
     pub fn new(net: Network, pins: Vec<String>, pin_only: bool, store_path: Option<PathBuf>) -> Self {

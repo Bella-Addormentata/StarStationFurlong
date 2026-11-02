@@ -310,7 +310,8 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // and the knock book's two clocks (confirmations we wait for, dial-backs due).
     let mut inbox_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
     let kx_secret = crate::chia_contact::kx_card_secret(&hub.secret_key);
-    let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
+    let knocks_file = crate::chia_network::net().path(crate::chia_knock::KNOCKS_FILE);
+    let knocks_path = knocks_file.as_path();
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
         sched.beat_blocks,

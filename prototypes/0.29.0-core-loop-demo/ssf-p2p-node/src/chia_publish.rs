@@ -28,7 +28,7 @@ use chia_puzzle_types::DeriveSynthetic;
 use crate::chia_chain::{ChainAccess, ChainError};
 use chia_sdk_driver::{SpendContext, StandardLayer};
 use chia_sdk_signer::{AggSigConstants, RequiredSignature};
-use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
+use chia_sdk_types::Conditions;
 use clvmr::Allocator;
 use serde::{Deserialize, Serialize};
 
@@ -1294,8 +1294,9 @@ pub async fn find_spendable_coin(
 
 /// Build the SIGNED SpendBundle: spend `coin` back to our own puzzle hash at
 /// `amount − fee`, carrying MEMOS = `( hint ciphertext )` (a proper 2-element
-/// CLVM list). Signed for TESTNET11 with the synthetic BLS key.
+/// CLVM list). Signed for `net` with the synthetic BLS key.
 pub fn build_publish_bundle(
+    net: crate::chia_network::ChiaNet,
     chia_sk: &SecretKey,
     coin: Coin,
     hint: Bytes32,
@@ -1320,17 +1321,18 @@ pub fn build_publish_bundle(
     StandardLayer::new(synthetic_pk)
         .spend(&mut ctx, coin, conditions)
         .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
-    sign_standard_spends(chia_sk, ctx.take())
+    sign_standard_spends(net, chia_sk, ctx.take())
 }
 
-/// Sign standard-puzzle coin spends with our SYNTHETIC key for testnet11
-/// (agg_sig_me additional data == the testnet11 genesis challenge) and bundle
-/// them. Shared by the presence publisher and the faucet dish's GIVE spend.
-pub fn sign_standard_spends(chia_sk: &SecretKey, coin_spends: Vec<CoinSpend>) -> Result<SpendBundle> {
+/// Sign standard-puzzle coin spends with our SYNTHETIC key for `net` (its
+/// consensus constants give the AGG_SIG additional data, so a spend signed
+/// for one network is not valid on another) and bundle them. Shared by the
+/// presence publisher and the faucet dish's GIVE spend.
+pub fn sign_standard_spends(net: crate::chia_network::ChiaNet, chia_sk: &SecretKey, coin_spends: Vec<CoinSpend>) -> Result<SpendBundle> {
     let synthetic_sk: SecretKey = chia_sk.derive_synthetic();
     let synthetic_pk: PublicKey = synthetic_sk.public_key();
     let mut allocator = Allocator::new();
-    let constants = AggSigConstants::from(&*TESTNET11_CONSTANTS);
+    let constants = AggSigConstants::from(net.constants());
     let required = RequiredSignature::from_coin_spends(&mut allocator, &coin_spends, &constants)
         .map_err(|e| anyhow!("required signatures: {e:?}"))?;
     let mut sigs: Vec<Signature> = Vec::new();
@@ -1798,7 +1800,7 @@ async fn publish_memo_with(
         None => None,
     };
     let body = body(input)?;
-    let bundle = build_publish_bundle(payer, coin.coin, hint, Bytes::new(body))?;
+    let bundle = build_publish_bundle(crate::chia_network::net(), payer, coin.coin, hint, Bytes::new(body))?;
     match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
         Ok(()) => Ok(MemoWrite { coin: input, acked: true, spend: WALLET_LEASE.spend_of(&input) }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
@@ -2234,7 +2236,8 @@ pub async fn heartbeat_loop(
     // #231 P6a: the per-node presence state. The mark is what was WRITTEN (on
     // disk, set on push success); the attempt instant paces retries after a
     // failure; the guard flag logs the end-of-era pause once.
-    let mark_path = std::path::Path::new(NODE_MARK_FILE);
+    let mark_file = crate::chia_network::net().path(NODE_MARK_FILE);
+    let mark_path = mark_file.as_path();
     let mut node_mark: Option<NodePublishMark> = NodePublishMark::load(mark_path);
     let self_id = iroh_sk.public().to_string();
     let mut node_attempt: Option<Instant> = None;
@@ -2276,7 +2279,8 @@ pub async fn heartbeat_loop(
     }
     // #231 P6b/D7: the beacon role, when opted into — its own payer, its own mark.
     let beacon_sk = beacon_enabled().then(|| beacon_wallet_key(&chia_sk));
-    let beacon_mark_path = std::path::Path::new(BEACON_MARK_FILE);
+    let beacon_mark_file = crate::chia_network::net().path(BEACON_MARK_FILE);
+    let beacon_mark_path = beacon_mark_file.as_path();
     let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
     let mut beacon_attempt: Option<Instant> = None;
     let mut welcome_warned = false;
@@ -2294,7 +2298,8 @@ pub async fn heartbeat_loop(
             }
         );
     }
-    let knocks_path = std::path::Path::new(crate::chia_knock::KNOCKS_FILE);
+    let knocks_file = crate::chia_network::net().path(crate::chia_knock::KNOCKS_FILE);
+    let knocks_path = knocks_file.as_path();
     loop {
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
         // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
@@ -2800,7 +2805,7 @@ fn short(node_id: &str) -> &str {
 }
 
 /// Full publish: seal the presence record, find our coin, spend-to-self with the
-/// `[hint, ciphertext]` memos, and push to testnet11. Returns the published hint.
+/// `[hint, ciphertext]` memos, and push to the node's network. Returns the published hint.
 ///
 /// `iroh_sk` signs the record (identity); `chia_sk` pays (spends the coin).
 /// `live_addrs` are the node's current direct addresses (F3 rule: live data).
@@ -2847,7 +2852,7 @@ pub async fn publish_presence(
 
     // 3. Build + sign the spend-to-self, then push to the mempool with the coin
     //    parked first (push_parked: a timed-out push may still have landed).
-    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, ciphertext)?;
+    let bundle = build_publish_bundle(crate::chia_network::net(), chia_sk, coin.coin, hint, ciphertext)?;
     push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
@@ -3884,5 +3889,40 @@ mod tests {
         let failed = PublishMark { ok: false, ..PublishMark { room_key: key, addrs_sig: "a".into(), at: t0, ok: false } };
         assert!(!publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
         assert!(publish_due(Some(&failed), &key, "a", t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "retry cadence after a failure");
+    }
+
+    /// ⛓️ A spend signed for one network is signed over that network's
+    /// AGG_SIG data: it verifies under its own constants and fails the
+    /// RequiredSignature check under the other's.
+    #[test]
+    fn a_spend_signed_for_one_network_fails_under_the_others_constants() {
+        use crate::chia_network::ChiaNet;
+        let sk = SecretKey::from_seed(&[11u8; 32]);
+        let coin = Coin::new(Bytes32::new([3u8; 32]), our_puzzle_hash(&sk), 1000);
+        let hint = Bytes32::new([4u8; 32]);
+        let verifies = |bundle: &SpendBundle, under: ChiaNet| {
+            let mut a = Allocator::new();
+            let constants = AggSigConstants::from(under.constants());
+            let required = RequiredSignature::from_coin_spends(&mut a, &bundle.coin_spends, &constants).unwrap();
+            assert!(!required.is_empty(), "a standard spend asks for a signature");
+            let pairs: Vec<(PublicKey, Vec<u8>)> = required
+                .iter()
+                .map(|r| match r {
+                    RequiredSignature::Bls(bls) => (bls.public_key, bls.message()),
+                    RequiredSignature::Secp(_) => panic!("no secp on a standard spend"),
+                })
+                .collect();
+            chia_bls::aggregate_verify(&bundle.aggregated_signature, pairs)
+        };
+        for signed in ChiaNet::ALL {
+            let bundle = build_publish_bundle(signed, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+            for under in ChiaNet::ALL {
+                assert_eq!(verifies(&bundle, under), signed == under, "signed for {signed:?}, checked under {under:?}");
+            }
+        }
+        let t11 = build_publish_bundle(ChiaNet::Testnet11, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+        let main = build_publish_bundle(ChiaNet::Mainnet, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+        assert_eq!(t11.coin_spends, main.coin_spends, "the same spend; only the signature differs");
+        assert_ne!(t11.aggregated_signature, main.aggregated_signature);
     }
 }

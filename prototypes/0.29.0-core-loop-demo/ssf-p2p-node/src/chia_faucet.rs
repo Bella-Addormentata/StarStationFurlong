@@ -21,8 +21,10 @@
 //! run under the wallet spend lease (`chia_publish::WALLET_LEASE`): GIVE so it
 //! never picks a coin another spend is consuming, CLAIM so the courtesy check,
 //! the coin pick and the push are one critical section and a gift still
-//! landing counts as a coin in the wallet. Testnet11 only until P8 (every gift
-//! and donation links addresses on a public chain).
+//! landing counts as a coin in the wallet. testnet11 by default; on mainnet
+//! only for development until P8 (every gift and donation links addresses on
+//! a public chain). On mainnet the node never GIVEs: a gift would send real
+//! XCH into a jar nobody holds a key for ([`MAINNET_NO_GIVE`]).
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;
@@ -37,6 +39,7 @@ use clvmr::serde::node_from_bytes;
 use clvmr::{Allocator, NodePtr};
 use serde::{Deserialize, Serialize};
 
+use crate::chia_network::ChiaNet;
 use crate::chia_rooms::ChiaRoomCap;
 
 /// `puzzles/faucet.clsp` compiled with clvm_tools `run` (clvm_tools_rs 0.4.0),
@@ -64,8 +67,9 @@ pub const MAX_FEE_MOJOS: u64 = 0;
 /// is one-way: a private room's address reveals nothing about its key.
 const CTX_ROOM_TAG: &str = "ssf-faucet-room-tag-v1";
 
-/// Testnet11 bech32m prefix for the address the dish shows (mainnet: `xch`).
-const ADDRESS_HRP: &str = "txch";
+/// GIVE's refusal on a network that is not a test network, and the
+/// status's note there.
+pub const MAINNET_NO_GIVE: &str = "On mainnet the dish does not take gifts from this node.";
 
 /// What is curried into the faucet puzzle for one room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,10 +103,11 @@ impl FaucetParams {
         .into()
     }
 
-    /// The `txch1…` form of [`Self::puzzle_hash`] — what the dish prints so a
-    /// donor can pay into it from any Chia wallet.
-    pub fn address(&self) -> String {
-        bech32m::encode(ADDRESS_HRP, &self.puzzle_hash())
+    /// The address form of [`Self::puzzle_hash`] on `net` (`txch1…` on
+    /// testnet11): what the dish prints so a donor can pay into it from any
+    /// Chia wallet. The puzzle hash is the same on every network.
+    pub fn address(&self, net: ChiaNet) -> String {
+        bech32m::encode(net.prefix(), &self.puzzle_hash())
     }
 
     /// The full curried puzzle (the spend's puzzle reveal).
@@ -204,6 +209,9 @@ pub struct FaucetStatus {
     pub partial: bool,
     /// Why claim/give are off, in the dish's words.
     pub note: String,
+    /// ⛓️ The Chia network the address and the coins are on: its id
+    /// (`testnet11`, `mainnet`).
+    pub network: ChiaNet,
     /// A spend FROM our wallet is still settling: the lease has a coin of ours
     /// parked by a push the chain and the mempool have not settled yet (see
     /// `chia_publish::WalletLease::outgoing_pending`). The browser keeps its
@@ -221,6 +229,17 @@ pub struct FaucetStatus {
     /// requests were sent in. The browser keeps the highest it has seen. 0
     /// from `summarize` alone (a snapshot `status` has not numbered).
     pub snapshot: u64,
+}
+
+/// The network's word on the dish, after the wallet's: off a test network
+/// GIVE is off whatever the wallet holds, and the note says so after any
+/// other reason.
+pub fn network_part(net: ChiaNet, can_give: bool, note: String) -> (bool, String) {
+    if net.is_test() {
+        return (can_give, note);
+    }
+    let note = if note.is_empty() { MAINNET_NO_GIVE.to_string() } else { format!("{note}. {MAINNET_NO_GIVE}") };
+    (false, note)
 }
 
 /// Status reads take turns, and each snapshot is numbered as it completes
@@ -267,8 +286,10 @@ mod opt_mojo_string {
 }
 
 /// Pure half of `status`: fold the coins at the address into the dish's view.
-/// `partial` says the listing was cut short (see [`unspent_at`]).
-pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial: bool) -> FaucetStatus {
+/// `partial` says the listing was cut short (see [`unspent_at`]). The address
+/// is on `net`; the network's word on GIVE is added by `status`
+/// ([`network_part`]).
+pub fn summarize(net: ChiaNet, params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial: bool) -> FaucetStatus {
     let claimable: Vec<&FaucetCoin> = coins.iter().filter(|c| c.claimable(params)).collect();
     let ready = claimable.iter().filter(|c| c.ready(params, peak)).count() as u32;
     let next_ready_in_blocks = claimable
@@ -277,7 +298,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         .map(|c| c.ready_at(params) - peak)
         .min();
     FaucetStatus {
-        address: params.address(),
+        address: params.address(net),
         puzzle_hash: hex::encode(params.puzzle_hash()),
         gift: params.gift,
         gap: params.gap,
@@ -293,6 +314,7 @@ pub fn summarize(params: &FaucetParams, peak: u32, coins: &[FaucetCoin], partial
         wallet_partial: false,
         partial,
         note: String::new(),
+        network: net,
         spending: false,
         landing: false,
         snapshot: 0,
@@ -410,8 +432,10 @@ impl FaucetReply {
 }
 
 /// What a request needs from the node: the room caps (for the room key) and,
-/// in a publish build, the wallet key while the SSF wallet is on.
+/// in a publish build, the wallet key while the SSF wallet is on, and the
+/// network the node runs on.
 pub struct FaucetContext<'a> {
+    pub net: ChiaNet,
     pub rooms: &'a Mutex<HashMap<String, ChiaRoomCap>>,
     #[cfg(feature = "chia-publish")]
     pub wallet: Option<chia_bls::SecretKey>,
@@ -489,7 +513,7 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
         .await
         .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let listing = unspent_at(client, params.puzzle_hash()).await?;
-    let mut st = summarize(params, peak, &listing.coins, listing.partial);
+    let mut st = summarize(ctx.net, params, peak, &listing.coins, listing.partial);
     #[cfg(feature = "chia-publish")]
     {
         match &ctx.wallet {
@@ -519,15 +543,19 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 st.note = part.note;
             }
             None => {
-                st.note = crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "take or give");
+                st.note = crate::chia_wallet_switch::no_wallet_words(
+                    !ctx.net.wallet_allowed(),
+                    crate::chia_wallet_switch::env_switch(),
+                    if ctx.net.is_test() { "take or give" } else { "take a mojo" },
+                );
             }
         }
     }
     #[cfg(not(feature = "chia-publish"))]
     {
-        let _ = ctx;
         st.note = "this node was built without publishing; it can show the dish but not take or give".into();
     }
+    (st.can_give, st.note) = network_part(ctx.net, st.can_give, std::mem::take(&mut st.note));
     st.snapshot = STATUS_SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     Ok(st)
 }
@@ -690,7 +718,13 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "take a mojo")))?;
+        .ok_or_else(|| {
+            anyhow!(crate::chia_wallet_switch::no_wallet_words(
+                !ctx.net.wallet_allowed(),
+                crate::chia_wallet_switch::env_switch(),
+                "take a mojo"
+            ))
+        })?;
     // One TAKE at a time, serialized with every other wallet writer: the
     // courtesy check, the coin pick and the push are one critical section, and
     // a gift still landing (its faucet coin parked until the chain or the
@@ -764,12 +798,12 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
             "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
             params.gift,
             hex::encode(target.coin.coin_id()),
-            params.address()
+            params.address(ctx.net)
         ),
         Some(why) => eprintln!(
             "⛓️🥣 faucet: claim of coin {} at {} pushed but unanswered ({why}); the coin stays parked until the chain or the mempool settles it",
             hex::encode(target.coin.coin_id()),
-            params.address()
+            params.address(ctx.net)
         ),
     }
     Ok(FaucetReply {
@@ -790,6 +824,8 @@ async fn claim(_ctx: &FaucetContext<'_>, _client: &impl ChainAccess, _params: &F
 
 /// GIVE: pay `amount` mojos from our wallet into the faucet address, from as
 /// many of our coins (largest first) as it takes, under the wallet spend lease.
+/// Refused first off a test network ([`MAINNET_NO_GIVE`]), before the wallet
+/// or the chain is asked anything.
 #[cfg(feature = "chia-publish")]
 async fn give(
     ctx: &FaucetContext<'_>,
@@ -801,10 +837,12 @@ async fn give(
     use chia_sdk_driver::{SpendContext, StandardLayer};
     use chia_sdk_types::Conditions;
 
-    let sk = ctx
-        .wallet
-        .as_ref()
-        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::env_switch(), "give")))?;
+    if !ctx.net.is_test() {
+        return Err(anyhow!(MAINNET_NO_GIVE));
+    }
+    let sk = ctx.wallet.as_ref().ok_or_else(|| {
+        anyhow!(crate::chia_wallet_switch::no_wallet_words(!ctx.net.wallet_allowed(), crate::chia_wallet_switch::env_switch(), "give"))
+    })?;
     if amount < params.gift {
         return Err(anyhow!("a gift below {} mojo(s) could never leave the jar", params.gift));
     }
@@ -850,7 +888,7 @@ async fn give(
             .spend(&mut ctx_spend, *coin, conditions)
             .map_err(|e| anyhow!("standard-layer spend: {e:?}"))?;
     }
-    let bundle = crate::chia_publish::sign_standard_spends(sk, ctx_spend.take())?;
+    let bundle = crate::chia_publish::sign_standard_spends(ctx.net, sk, ctx_spend.take())?;
     // Coins parked before the push leaves (round 9): see push_parked.
     let inputs = coins
         .iter()
@@ -859,12 +897,12 @@ async fn give(
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",
-            params.address(),
+            params.address(ctx.net),
             coins.len()
         ),
         Some(why) => eprintln!(
             "⛓️🥣 faucet: gift of {amount} mojo(s) into {} pushed but unanswered ({why}); its {} coin(s) stay parked until the chain or the mempool settles it",
-            params.address(),
+            params.address(ctx.net),
             coins.len()
         ),
     }
@@ -881,11 +919,14 @@ async fn give(
 
 #[cfg(not(feature = "chia-publish"))]
 async fn give(
-    _ctx: &FaucetContext<'_>,
+    ctx: &FaucetContext<'_>,
     _client: &impl ChainAccess,
     _params: &FaucetParams,
     _amount: u64,
 ) -> Result<FaucetReply> {
+    if !ctx.net.is_test() {
+        return Err(anyhow!(MAINNET_NO_GIVE));
+    }
     Err(anyhow!("this node was built without publishing; it cannot give"))
 }
 
@@ -985,6 +1026,9 @@ mod tests {
     use clvm_traits::FromClvm;
     use clvm_utils::tree_hash;
 
+    /// The network the existing tests run on.
+    const T11: ChiaNet = ChiaNet::Testnet11;
+
     /// The lobby's v1 parameters on a fixed room tag.
     fn test_params() -> FaucetParams {
         FaucetParams { room_tag: Bytes32::new([7u8; 32]), gift: GIFT_MOJOS, gap: GAP_BLOCKS, max_fee: MAX_FEE_MOJOS }
@@ -1062,7 +1106,7 @@ mod tests {
             hex::encode(params.puzzle_hash()),
             "ffd3a25bdaf219476e17d08cac6f3e223d685e9d0527e253d0da4d79d44c7249"
         );
-        assert_eq!(params.address(), "txch1llf6yk767gv5wmsh6zx2cme7yg7ksh5aq5n7y57smfxhn4zvwfyscfgx6a");
+        assert_eq!(params.address(T11), "txch1llf6yk767gv5wmsh6zx2cme7yg7ksh5aq5n7y57smfxhn4zvwfyscfgx6a");
         // The fee cap is curried too: a dish that allows one is another address.
         assert_eq!(
             hex::encode(fee_params().puzzle_hash()),
@@ -1151,17 +1195,17 @@ mod tests {
             confirmed_height: confirmed,
         };
         let coins = vec![coin(1000, 100), coin(5, 130), coin(0, 50)];
-        let st = summarize(&params, 140, &coins, false);
+        let st = summarize(T11, &params, 140, &coins, false);
         assert_eq!((st.coins, st.ready, st.total_mojos), (2, 1, 1005));
         assert_eq!(st.next_ready_in_blocks, Some(22));
-        assert_eq!(st.address, params.address());
+        assert_eq!(st.address, params.address(T11));
         assert!(!st.can_claim && !st.can_give && st.wallet_mojos.is_none() && !st.partial);
         assert!(st.wallet_spendable_mojos.is_none());
         // Everyone ready: no "next".
-        let st = summarize(&params, 200, &coins, true);
+        let st = summarize(T11, &params, 200, &coins, true);
         assert_eq!((st.ready, st.next_ready_in_blocks, st.partial), (2, None, true));
         // Empty jar.
-        let st = summarize(&params, 200, &[], false);
+        let st = summarize(T11, &params, 200, &[], false);
         assert_eq!((st.coins, st.ready, st.total_mojos), (0, 0, 0));
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains("\"nextReadyInBlocks\":null") && json.contains("\"canClaim\":false"));
@@ -1181,7 +1225,7 @@ mod tests {
             coin: Coin::new(Bytes32::new([n; 32]), ph, amount),
             confirmed_height: 1,
         };
-        let mut st = summarize(&params, 100, &[coin(1, u64::MAX), coin(2, u64::MAX)], false);
+        let mut st = summarize(T11, &params, 100, &[coin(1, u64::MAX), coin(2, u64::MAX)], false);
         assert_eq!(st.total_mojos, 2 * u128::from(u64::MAX));
         st.wallet_mojos = Some(9_007_199_254_740_993);
         st.wallet_spendable_mojos = Some(9_007_199_254_740_000);
@@ -1300,6 +1344,7 @@ mod tests {
     fn handle_request_without_a_room_key_fails_closed() {
         let rooms = Mutex::new(HashMap::new());
         let ctx = FaucetContext {
+            net: T11,
             rooms: &rooms,
             #[cfg(feature = "chia-publish")]
             wallet: None,
@@ -1320,7 +1365,7 @@ mod tests {
 
         let params = FaucetParams::for_room(&[3u8; 32]);
         let ph = params.puzzle_hash();
-        assert_eq!(params.address(), Address::new(ph, "txch".to_string()).encode().unwrap());
+        assert_eq!(params.address(T11), Address::new(ph, "txch".to_string()).encode().unwrap());
 
         let mut a = Allocator::new();
         let puzzle = params.puzzle_reveal(&mut a).unwrap();
@@ -1339,5 +1384,80 @@ mod tests {
         let required = chia_sdk_signer::RequiredSignature::from_coin_spends(&mut b, &bundle.coin_spends, &constants).unwrap();
         assert!(required.is_empty());
         assert_eq!(bundle.coin_spends[0].coin.puzzle_hash, ph);
+    }
+
+    /// ⛓️ The dish's address on each network: the same puzzle hash under the
+    /// network's own prefix, which the other network's decoder refuses.
+    #[test]
+    fn the_dish_address_takes_the_networks_prefix_over_one_puzzle_hash() {
+        let params = test_params();
+        let ph = params.puzzle_hash();
+        assert_eq!(params.address(ChiaNet::Testnet11), "txch1llf6yk767gv5wmsh6zx2cme7yg7ksh5aq5n7y57smfxhn4zvwfyscfgx6a");
+        for net in ChiaNet::ALL {
+            let addr = params.address(net);
+            assert!(addr.starts_with(&format!("{}1", net.prefix())), "{addr}");
+            assert_eq!(addr, bech32m::encode(net.prefix(), &ph), "one puzzle hash under each prefix");
+            #[cfg(feature = "chia-publish")]
+            {
+                use chia_sdk_utils::Address;
+                let decoded = Address::decode(&addr).unwrap();
+                assert_eq!(decoded.puzzle_hash, ph, "{net:?}");
+                let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+                assert!(Address::decode(&addr).unwrap().expect_prefix(other.prefix()).is_err(), "{net:?}");
+            }
+        }
+        assert_ne!(params.address(ChiaNet::Testnet11), params.address(ChiaNet::Mainnet));
+    }
+
+    #[test]
+    fn the_status_names_its_network_and_mainnet_never_offers_give() {
+        let params = test_params();
+        for net in ChiaNet::ALL {
+            let st = summarize(net, &params, 140, &[], false);
+            assert_eq!(st.network, net);
+            assert_eq!(st.address, params.address(net));
+            let json = serde_json::to_value(&st).unwrap();
+            assert_eq!(json["network"], net.id(), "the id the page reads");
+            assert_eq!(json["address"], params.address(net));
+            let back: FaucetStatus = serde_json::from_value(json).unwrap();
+            assert_eq!(back, st);
+        }
+        assert_eq!(network_part(ChiaNet::Testnet11, true, String::new()), (true, String::new()), "testnet11 is as it was");
+        assert_eq!(network_part(ChiaNet::Testnet11, false, "x".into()), (false, "x".to_string()));
+        assert_eq!(network_part(ChiaNet::Mainnet, true, String::new()), (false, MAINNET_NO_GIVE.to_string()));
+        let (give, note) = network_part(ChiaNet::Mainnet, true, "no mojo in the dish yet".into());
+        assert!(!give);
+        assert_eq!(note, "no mojo in the dish yet. On mainnet the dish does not take gifts from this node.");
+    }
+
+    /// GIVE on mainnet is refused before the wallet or the chain is asked:
+    /// the chain here answers nothing, so any read would fail otherwise.
+    #[test]
+    fn give_is_refused_on_mainnet_before_anything_is_read() {
+        let rooms = Mutex::new(HashMap::new());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let chain = crate::chia_chain::testing::Unanswering;
+        let ctx = FaucetContext {
+            net: ChiaNet::Mainnet,
+            rooms: &rooms,
+            #[cfg(feature = "chia-publish")]
+            wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
+        };
+        let err = rt.block_on(give(&ctx, &chain, &test_params(), 1)).unwrap_err();
+        assert_eq!(err.to_string(), MAINNET_NO_GIVE);
+        // Testnet11 gets past the network check: a gift too small to leave
+        // the jar is refused next, before the chain is asked, and with a
+        // wallet held no switch is read from the environment.
+        let ctx = FaucetContext {
+            net: T11,
+            rooms: &rooms,
+            #[cfg(feature = "chia-publish")]
+            wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
+        };
+        let err = rt.block_on(give(&ctx, &chain, &test_params(), 0)).unwrap_err().to_string();
+        #[cfg(feature = "chia-publish")]
+        assert_eq!(err, "a gift below 1 mojo(s) could never leave the jar");
+        #[cfg(not(feature = "chia-publish"))]
+        assert_eq!(err, "this node was built without publishing; it cannot give");
     }
 }

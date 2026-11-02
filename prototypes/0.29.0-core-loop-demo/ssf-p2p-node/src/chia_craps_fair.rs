@@ -98,6 +98,7 @@ pub fn derive_dice(seed_hex: &str, beacon_hex: &str, table: &str, round: u64) ->
 /// may still have landed, so the coin stays parked until the chain or the
 /// mempool settles it; an outright rejection frees it).
 async fn push_fair_record(
+    net: crate::chia_network::ChiaNet,
     client: &impl ChainAccess,
     chia_sk: &SecretKey,
     coin: crate::chia_faucet::FaucetCoin,
@@ -106,7 +107,7 @@ async fn push_fair_record(
     payload: &[u8],
 ) -> Result<()> {
     let hint = fair_hint(table, round);
-    let bundle = build_publish_bundle(chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;
+    let bundle = build_publish_bundle(net, chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;
     push_parked(client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(())
 }
@@ -120,7 +121,7 @@ async fn push_fair_record(
 /// go out first (#271 review, round 19). Peers behind the spend report the
 /// coin unspent, and the wait goes on; the next coin is picked afresh under the
 /// wallet lease by the caller. ~200 s bound.
-async fn wait_for_spend(client: &impl ChainAccess, spent: &Coin) -> Result<()> {
+async fn wait_for_spend(net: crate::chia_network::ChiaNet, client: &impl ChainAccess, spent: &Coin) -> Result<()> {
     for attempt in 0..40u32 {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let seen = client
@@ -135,7 +136,8 @@ async fn wait_for_spend(client: &impl ChainAccess, spent: &Coin) -> Result<()> {
         }
     }
     Err(anyhow!(
-        "timed out (~200 s) waiting for the spend to confirm — testnet slow or unfunded"
+        "timed out (~200 s) waiting for the spend to confirm — {} slow or unfunded",
+        net.name()
     ))
 }
 
@@ -206,6 +208,7 @@ pub async fn resolve_fair_records(table: &str, round: u64) -> Result<Vec<Vec<u8>
 /// re-derive + verify the dice — proving the on-chain fairness transcript loop.
 /// T1 uses a placeholder beacon; T2 swaps in a real testnet block header_hash.
 pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
+    let net = crate::chia_network::net();
     let client = crate::chia_chain::connect();
     let our_ph = our_puzzle_hash(chia_sk);
 
@@ -241,12 +244,15 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         WALLET_LEASE.reconcile(&client).await;
         let coin = find_spendable_coin(&client, our_ph)
             .await?
-            .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; fund it at a testnet11 faucet"))?;
-        push_fair_record(&client, chia_sk, coin.clone(), table, round, &commit_payload).await?;
+            .ok_or_else(|| {
+                let fund = if net.is_test() { format!("fund it at a {} faucet", net.name()) } else { format!("it takes real {}", net.ticker()) };
+                anyhow!("chia wallet unfunded — no unspent coin at {our_ph}; {fund}")
+            })?;
+        push_fair_record(net, &client, chia_sk, coin.clone(), table, round, &commit_payload).await?;
         coin
     };
     println!("   ✅ commit published; waiting for confirmation…");
-    wait_for_spend(&client, &coin_a.coin).await?;
+    wait_for_spend(net, &client, &coin_a.coin).await?;
 
     // 2. REVEAL (after the "betting window" — here, once the commit confirmed:
     //    the chain shows the commit's coin spent). The reveal's coin is
@@ -261,11 +267,11 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         let coin = find_spendable_coin(&client, our_ph)
             .await?
             .ok_or_else(|| anyhow!("no spendable coin for the reveal (the commit's change not confirmed yet?)"))?;
-        push_fair_record(&client, chia_sk, coin.clone(), table, round, &reveal_payload).await?;
+        push_fair_record(net, &client, chia_sk, coin.clone(), table, round, &reveal_payload).await?;
         coin
     };
     println!("   ✅ reveal published; waiting for confirmation…");
-    wait_for_spend(&client, &coin_b.coin).await?;
+    wait_for_spend(net, &client, &coin_b.coin).await?;
 
     // 3. RESOLVE both records from testnet11 and VERIFY the transcript.
     let payloads = resolve_fair_records(table, round).await?;
@@ -297,7 +303,7 @@ pub async fn craps_fair_selftest(chia_sk: &SecretKey) -> Result<()> {
         "   verify: commit-matches-seed={commit_ok} · dice from transcript = {rd1}+{rd2} (expected {d1}+{d2}) · dice-match={dice_ok}"
     );
     if commit_ok && dice_ok {
-        println!("🎲⛓️ craps-fair selftest PASSED — commit+reveal published and verified on testnet11");
+        println!("🎲⛓️ craps-fair selftest PASSED — commit+reveal published and verified on {}", net.name());
         Ok(())
     } else {
         Err(anyhow!(

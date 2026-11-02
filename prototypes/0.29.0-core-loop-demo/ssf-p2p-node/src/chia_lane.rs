@@ -176,7 +176,7 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String], wallet_on
     let publish = if !cfg!(feature = "chia-publish") {
         "not built"
     } else if wallet_on {
-        "on (the SSF wallet is on; testnet11, faucet TXCH)"
+        "on (the SSF wallet is on)"
     } else if crate::chia_wallet_switch::env_switch() == crate::chia_wallet_switch::EnvSwitch::Off {
         "off (SSF_CHIA_LANE holds the SSF wallet off)"
     } else {
