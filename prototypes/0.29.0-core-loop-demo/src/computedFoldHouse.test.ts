@@ -465,6 +465,26 @@ describe('🏛️🔁 redecide — the round-u view at a house table (the L7 fix
     // l7Check's houseVoid stays false for a round the house did reveal (R2 F2).
     expect(cands[0].view).toMatchObject({ decided: 'void', houseWaits: [B.pid] });
   });
+
+  it('an abandon-void keeps houseWaits [] once a late bettor seed arrives — the house still revealed (R4)', () => {
+    // As above, but bob's seed (rb) arrives in the next session after the trim.
+    // No seed is missing now, yet the house DID reveal and its outcome (both
+    // counted) doesn't reproduce the refund, so the abandon-void still wins.
+    const { a1, b1, join, close, ra, rb, hr } = fairRound1();
+    const z = kit.abandon(B, 1, close.hash);
+    const f = new TableFold(HCTX, sigs.check, undefined, undefined, onlyH);
+    f.reset([a1, b1, join, close, ra, hr, z].map((r): [string, unknown] => [r.key, r.rec]));
+    expect(f.result().rounds[0]).toMatchObject({ decided: 'void', houseWaits: [B.pid] });
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, {});
+    f.setBase(cp1);
+    f.reset([z, hr, ra, rb].map((r): [string, unknown] => [r.key, r.rec]));
+    const cands = f.redecide();
+    expect(cands.map((c) => c.d)).toEqual([`z:${z.hash}`]);
+    // houseWaits is [] (the house revealed, nobody's seed is missing), not
+    // undefined — so l7Check reads houseVoid false, not "the house never
+    // revealed its seed." Fails if the late seed drops houseWaits to undefined.
+    expect(cands[0].view).toMatchObject({ decided: 'void', houseWaits: [] });
+  });
 });
 
 // ── The chain ────────────────────────────────────────────────────────────────

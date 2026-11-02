@@ -109,8 +109,9 @@ export const MAX_SLIP_BETS = 400;
  *  A close already known to be invalid (its signature, or its signer's
  *  slip, failed) takes no place, so records nobody signed can't fill it. */
 export const MAX_CLOSES_PER_ROUND = 32;
-/** Forfeits, and separately abandons, per close the fold considers (by
- *  claimed rank, then hash); one whose signature failed takes no place. */
+/** Forfeits, abandons, and (in the round-u view) house reveals, per close the
+ *  fold considers (by claimed rank or hash); one whose signature failed takes
+ *  no place. Bounds the synchronous game/net work a peer's flood can force. */
 export const MAX_FORFEITS_PER_CLOSE = 32;
 /** Recent forward trims whose round-u evidence a fold keeps for the
  *  display-only round-u view (redecide), keyed by the base each is for, so a
@@ -1353,7 +1354,16 @@ export class TableFold {
     }
     const reveals = new Map<string, Map<string, RevealEntry>>();
     const at = this.revealsAt.get(u);
-    if (at) for (const [pid, inner] of at) reveals.set(pid, new Map(inner));
+    // Keep only each frozen slip's commitment-opening reveal (seedFor's choice),
+    // not every round-u reveal a peer may have written: the round-u view reads
+    // only these (its `seeds`), and MAX_PRIORS bounds the kept checkpoint count,
+    // not each one's reveal set, so a flood of reveals opening no frozen
+    // commitment would otherwise be retained here and recopied every rebuild.
+    if (at) for (const [pid, s] of info.P) {
+      const inner = at.get(pid);
+      if (!inner) continue;
+      for (const x of inner.values()) if (x.commit === s.rec.c) { reveals.set(pid, new Map([[x.hash, x]])); break; }
+    }
     return {
       forSid: nextSid(this.ctx, ok), u, l, close,
       P: new Map(info.P), M: [...info.M],
@@ -1827,7 +1837,12 @@ export class TableFold {
       if (hr) {
         const inN = new Set(hr.rec.n);
         const need = present.filter((pid) => inN.has(P.get(pid)!.hash));
-        if (!need.every((pid) => seeds.has(pid))) houseWaits = need.filter((pid) => !seeds.has(pid));
+        // The house did reveal: carry the still-missing seeds, or [] once a late
+        // seed has arrived and none remain — so l7Check reads houseVoid false
+        // ("the house revealed, waiting on nobody"), not undefined ("the house
+        // never revealed"), on an abandon-void that outlived a non-reproducing
+        // house reveal.
+        houseWaits = need.filter((pid) => !seeds.has(pid));
       }
     }
     const z = this.bestVerified([...abandons.values()].filter((x) => x.rec.r === u).sort(this.byRank), 'abandon');
@@ -1845,7 +1860,13 @@ export class TableFold {
   private viewHouseReveals(close: CloseEntry, hReveals: Map<string, HouseRevealEntry>): HouseRevealEntry[] {
     return [...hReveals.values()]
       .filter((e) => e.commit === close.rec.h && e.rec.x.includes(close.hash) && this.houseRecOk(e) === true)
-      .sort((a, b) => cmp(a.hash, b.hash));
+      .sort((a, b) => cmp(a.hash, b.hash))
+      // Bounded like the forfeit branch: a delegated house can sign many
+      // variants for one close, and the view plays each to test reproduction.
+      // The reproducing reveal is normally the lowest-hash; past the cap the
+      // view shows no reconstruction (C5) rather than running unbounded work —
+      // the checkpoint still stands on its nets and house signature.
+      .slice(0, MAX_FORFEITS_PER_CLOSE);
   }
 
   /** C3: a candidate reproduces the checkpoint iff this page's nets after

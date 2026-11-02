@@ -811,7 +811,18 @@ function noteResult(st: TableState, res: FoldResult): void {
   // the gate may have reopened for a held-off one.
   else retryPendingAttest(st);
   const D = lastDecided(res);
-  if (D) st.lastD = D;
+  // 🔁 L7 across a restore (§6.2 C): a forgery being undone (forgedStands → a
+  // restore is pending) must not overwrite this page's record of the last
+  // honest decided round. Were it to, a rewind/jump excursion whose decided
+  // round sits at a different round or close would clobber st.lastD, and once
+  // the honest checkpoint is back — its round u trimmed, so no decided round in
+  // the session — the round-u view would have neither a chain verdict nor a
+  // matching st.lastD, and the L7 reconciliation (the branch in build/
+  // roundCheck keyed on st.lastD) would be skipped. Freezing st.lastD through
+  // the excursion keeps the honest round-u verdict, so the restore is handled
+  // by that same tested branch with the real on-chain timing (no reconstructed
+  // view to perturb the betting/settled phase).
+  if (D && !forgedStands(st)) st.lastD = D;
   st.lastRes = res;
   noteReplaced(st, res, moved);
   noteChanged(st, res, moved);
