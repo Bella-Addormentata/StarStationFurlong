@@ -1442,4 +1442,55 @@ describe('🔁 redecide — the round-u view (the L7 fix)', () => {
     f.reset(live());
     expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
   });
+
+  it('keeps each kept base’s evidence when an intermediate rewind captures another checkpoint for the same round/close (R3)', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const live = (): [string, unknown][] => [forfeit, kit.reveal(1, A.pid)].map((r) => [r.key, r.rec]);
+    const f = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid)]);
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    // A cheat rewinds to genesis, replays the old session, and trims to ANOTHER
+    // checkpoint for the same round and close but with altered nets. Keyed by
+    // base, its capture must not displace cp1’s kept evidence (a single slot
+    // did, and the honest restore then lost the correction).
+    f.setBase(null);
+    f.reset(session0.map((r): [string, unknown] => [r.key, r.rec]));
+    f.result();
+    const cpAlt = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: 7n });
+    f.setBase(cpAlt);
+    f.reset([]);
+    expect(f.redecide()).toEqual([]); // nothing reproduces the altered nets (C5)
+    // The honest checkpoint restored: cp1’s evidence still serves, so the
+    // correction returns rather than the felt reverting to the pre-trim verdict.
+    f.setBase(cp1);
+    f.reset(live());
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+  });
+
+  it('adds one void candidate for a flood of valid abandons — the fold-order first, as decide picks it (R3 HIGH)', () => {
+    const xa = kit.slip(A, 1, [straight(pocketFor(1, A), 5)]);
+    const close = kit.close(A, 1, 'g', [xa]);
+    const session0 = [xa, close, kit.abandon(A, 1, close.hash)]; // this page saw A’s abandon void it
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, {}); // a void refunds: no nets
+    // The trim session carries valid abandons from three keys for the same close.
+    const flood = [kit.abandon(A, 1, close.hash), kit.abandon(B, 1, close.hash), kit.abandon(D, 1, close.hash)];
+    const voids = afterTrim(session0, cp1, flood).redecide().filter((c) => c.view.decided === 'void');
+    // One, not three: redecide weighs only the lowest-rank abandon (all void the
+    // round identically), so a flood can’t multiply the per-rebuild game/net work.
+    expect(voids).toHaveLength(1);
+    const byRank = (x: Built<unknown>, y: Built<unknown>): number => {
+      const rx = dutyRank('abandon', TEST_CTX, 1, (x.rec as AbandonRec).k);
+      const ry = dutyRank('abandon', TEST_CTX, 1, (y.rec as AbandonRec).k);
+      return rx < ry ? -1 : rx > ry ? 1 : x.hash < y.hash ? -1 : 1;
+    };
+    expect(voids[0].d).toBe(`z:${[...flood].sort(byRank)[0].hash}`);
+  });
 });

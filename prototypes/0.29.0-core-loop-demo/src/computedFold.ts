@@ -112,6 +112,11 @@ export const MAX_CLOSES_PER_ROUND = 32;
 /** Forfeits, and separately abandons, per close the fold considers (by
  *  claimed rank, then hash); one whose signature failed takes no place. */
 export const MAX_FORFEITS_PER_CLOSE = 32;
+/** Recent forward trims whose round-u evidence a fold keeps for the
+ *  display-only round-u view (redecide), keyed by the base each is for, so a
+ *  restore across a rewind/jump excursion still shows the L7 correction. A
+ *  flood of valid-shaped checkpoints can't grow the kept set past this. */
+export const MAX_PRIORS = 8;
 /** Rounds past the base a session may reach. */
 export const MAX_SESSION_ROUNDS = 500;
 /** Players a checkpoint may carry. */
@@ -1256,12 +1261,15 @@ export class TableFold {
    *  round, rebuilt each compute; setBase reads it to keep `sIn` for the
    *  round-u view (PriorEvidence). */
   private sInAt = new Map<number, unknown>();
-  /** The round-u evidence (§6.2 B) of the latest forward trim this page
-   *  folded, for the round-u view (redecide). Kept across a rewind/jump
-   *  excursion — its `forSid` gates use — so a restore of the honest checkpoint
-   *  shows the L7 correction again; replaced only when a newer forward trim is
-   *  captured. null with none. */
-  private prior: PriorEvidence | null = null;
+  /** The round-u evidence (§6.2 B) of recent forward trims this page folded,
+   *  keyed by the base sid each is for (`forSid`), for the round-u view
+   *  (redecide). Kept across a rewind/jump excursion so a restore of a
+   *  checkpoint it holds shows the L7 correction again — and keyed, not a
+   *  single slot, so an intermediate capture for another checkpoint (a cheat's
+   *  altered-nets rewind) can't displace the evidence a later restore needs.
+   *  Bounded to the most recent MAX_PRIORS; redecide reads only the entry for
+   *  the active base, so a dormant or flooded one is never used. */
+  private priors = new Map<string, PriorEvidence>();
 
   /** `keyOf`, when given, pins each player's felt to one key: a slip
    *  version counts for `felts` (and so for `held` while betting) only if
@@ -1302,13 +1310,22 @@ export class TableFold {
     this.base = {
       sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok), h: ok?.h ?? null,
     };
-    // 🔁 Keep a captured forward trim's evidence (§6.2 B). A rewind or jump
-    // capturePrior can't tag returns null; keep the last evidence rather than
-    // drop it, so a restore back to the checkpoint it belongs to shows the L7
-    // correction again instead of reverting to the stale pre-trim verdict.
-    // redecide uses it only while prior.forSid === this.base.sid, so it stays
-    // dormant on any other base.
-    if (captured) this.prior = captured;
+    // 🔁 Keep a captured forward trim's evidence (§6.2 B), keyed by the base it
+    // is for. A rewind or jump capturePrior can't tag returns null; the kept
+    // entries let a restore back to any recent checkpoint show the L7
+    // correction again instead of reverting to the stale pre-trim verdict, and
+    // keying by forSid means an intermediate capture for another checkpoint (a
+    // cheat's altered-nets rewind) doesn't displace the one a later restore
+    // needs. redecide reads only the active base's entry; the map is bounded to
+    // the most recent MAX_PRIORS, oldest evicted first, so a flood can't grow it.
+    if (captured) {
+      this.priors.delete(captured.forSid);
+      this.priors.set(captured.forSid, captured);
+      for (const k of this.priors.keys()) {
+        if (this.priors.size <= MAX_PRIORS) break;
+        this.priors.delete(k);
+      }
+    }
     this.dirty = true;
   }
 
@@ -1708,11 +1725,11 @@ export class TableFold {
    *  first. Empty with no prior evidence (a new page, or a split): C5 applies.
    *  Display only — no count or spend reads it. */
   redecide(): RedecideCandidate[] {
-    const prior = this.prior;
-    // Only while the active base is the session this evidence is for (§6.2 B): a
-    // rewind/jump excursion leaves it dormant, and a restore of the honest
-    // checkpoint makes it serve again.
-    if (!prior || prior.forSid !== this.base.sid) return [];
+    // The round-u evidence for the active base (§6.2 B), if this page kept it: a
+    // rewind/jump excursion leaves it dormant (no entry for that base), and a
+    // restore of a checkpoint it kept makes it serve again.
+    const prior = this.priors.get(this.base.sid);
+    if (!prior) return [];
     // Redecide is display-only: the checks below (ask / houseRecOk) may mark a
     // pending verification, but that must not reach the financial fold's
     // `pending`. These records sit below the base — the count never reads them
@@ -1782,19 +1799,28 @@ export class TableFold {
         }
       }
     } else {
-      // (a) Friendly: each forfeit meeting decide's conditions, by rank.
+      // (a) Friendly: each forfeit meeting decide's conditions, by rank, bounded
+      // to the MAX_FORFEITS_PER_CLOSE decide would weigh — a peer can't make the
+      // view run unbounded game/net work by writing more than the count reads.
       const fs = [...forfeits.values()]
         .filter((f) => f.rec.r === u && f.rec.n.every((pid) => seeds.has(pid))
           && f.rec.n.some((pid) => P.get(pid)?.rec.k === f.rec.k) && this.ask(f, 'forfeit') === true)
-        .sort(this.byRank);
+        .sort(this.byRank)
+        .slice(0, MAX_FORFEITS_PER_CLOSE);
       for (const f of fs) add('forfeit', `f:${f.hash}`, [...f.rec.n], { forfeit: { hash: f.hash, rec: f.rec } });
       // (b) Every frozen seed in, nothing missing.
       if (M.length === 0 && revealed.length === present.length) add('reveals', 'r', present, {});
     }
-    // (c) Void by abandon, by rank. At a Fair close whose lowest-hash valid
-    // house reveal is still waiting on a bettor's seed, carry that missing-seed
-    // info onto the void as decide() does (its houseWaits branch), so the card
-    // reads "the house is waiting", not "the house never revealed its seed".
+    // (c) Void by abandon — the lowest-rank valid one, exactly as decide()
+    // picks it (bestVerified, capped). Every abandon voids the round the same
+    // way (a refund, the nets unchanged), so only the fold-order-first can ever
+    // be chosen and reproduce the checkpoint; enumerating the rest would let a
+    // peer flood the post-trim session with valid abandons and run unbounded
+    // game/net work on every view rebuild, which the count path never does.
+    // At a Fair close whose lowest-hash valid house reveal is still waiting on a
+    // bettor's seed, carry that missing-seed info onto the void as decide()
+    // does (its houseWaits branch), so the card reads "the house is waiting",
+    // not "the house never revealed its seed".
     let houseWaits: string[] | undefined;
     if (fair) {
       const hr = this.viewHouseReveals(close, hReveals)[0];
@@ -1804,8 +1830,8 @@ export class TableFold {
         if (!need.every((pid) => seeds.has(pid))) houseWaits = need.filter((pid) => !seeds.has(pid));
       }
     }
-    const zs = [...abandons.values()].filter((z) => z.rec.r === u && this.ask(z, 'abandon') === true).sort(this.byRank);
-    for (const z of zs) add('void', `z:${z.hash}`, [], { abandon: { hash: z.hash, rec: z.rec }, ...(houseWaits ? { houseWaits } : {}) });
+    const z = this.bestVerified([...abandons.values()].filter((x) => x.rec.r === u).sort(this.byRank), 'abandon');
+    if (z) add('void', `z:${z.hash}`, [], { abandon: { hash: z.hash, rec: z.rec }, ...(houseWaits ? { houseWaits } : {}) });
 
     this.sawPending = savedPending;
     return cands.filter((c) => this.reproduces(c, netsBefore));

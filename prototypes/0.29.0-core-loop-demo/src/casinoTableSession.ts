@@ -2436,7 +2436,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const check = computedRoundCheck(itemId);
       const fate = check?.round === s.round ? check.mine : null;
       const rest = mine?.riding ? ' · THE REST PLAYED' : '';
-      const lost = (mine?.lost ?? 0) > 0;
+      // 🔁 Past a trim the shown round is off-chain, so computedMine is null;
+      // fall back to the rebuilt check's loss so the felt agrees with the ⚙
+      // card (which reads c.mineLost) on NEW BETS FORFEITED vs PLAYED WITHOUT IT.
+      const lost = (mine?.lost ?? (check?.round === s.round ? check.mineLost ?? 0 : 0)) > 0;
       if (mine?.tooLate) parts.push('TOO LATE — THE CLOSE HAD YOUR EARLIER BETS');
       else if (fate === 'left-out') {
         if (mine?.added) parts.push(`YOUR NEW BETS MISSED THE CLOSE — CHIPS BACK${rest}`);
@@ -2672,6 +2675,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           parts.push(`NO SEED IN TIME FROM ${named.join(', ')}${more}`);
         }
       }
+      // 🔁 A trim can show a round decided a way this page never saw: note it
+      // on the card as on the felt, for a played or a void result, with generic
+      // wording for a void since it needn't be an abandon (a house reveal can
+      // count nobody).
+      if (c.unseen) parts.push(unseenNote(c.unseen));
       if (c.missing.length > 0) {
         parts.push(`${many(c.missing.length, 'FROZEN SLIP', 'FROZEN SLIPS')} NEVER CAME (${craps ? 'NEW BETS NOT STAKED' : 'NOT STAKED'})`);
       }
