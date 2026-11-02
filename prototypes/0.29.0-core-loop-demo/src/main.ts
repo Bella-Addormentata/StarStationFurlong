@@ -290,12 +290,14 @@ import type { LocalFingerprint } from "./nodeFingerprint";
 import { BANK_WALLET_BUTTON_ID, bankWalletView, receiveNote, turnSsfWallet } from "./bankWallet";
 import {
   BACKUP_COPY_ID, BACKUP_GRID_ID, BACKUP_ID, BACKUP_IDLE, BACKUP_LATER_ID, BACKUP_SAVED_ID, BACKUP_SHOW_ID,
-  afterAddressCopy, afterCopy, afterWipe, applyReveal, applySave, armSave, backupGridHtml, backupPageKind,
+  BACKUP_WINDOW_ID,
+  afterAddressCopy, afterCopy, afterWipe, applyReveal, applySave, armSave, backupGridHtml, backupMode, backupPageKind,
   bankBackupView, clipboardWipeDue, closeBackupPanel, copyStays, copyWords, freshTap, heldKeyRepeat, hideWords,
-  markWordsSaved, openBackupPanel, opensAfterTurnOn, reconcileBackupUi, resetBackupUi, revealWords,
+  markWordsSaved, openBackupPanel, opensAfterTurnOn, reconcileBackupUi, resetBackupUi, revealWords, runBackupWindow,
   startReveal, startSave, wipeClipboard, wipeWanted, wordsExpireIn, CLIPBOARD_WIPE_MS,
 } from "./bankBackup";
 import type { BankBackupUi } from "./bankBackup";
+import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
@@ -5042,10 +5044,15 @@ async function turnBankWallet(on: boolean): Promise<void> {
   // switch, which now reads TURN OFF. SHOW keeps the fresh-tap rule, so the
   // CONFIRM's double-click or held Enter cannot reveal the words.
   const after = localNodeLive ? localFingerprint : null;
-  const opens = turned.ok && on && bankViewOnScreen() && opensAfterTurnOn(before, after, bankBackupPage);
-  if (opens) setBankBackup(openBackupPanel(bankBackup, after, performance.now()));
+  // 🖥️ In the native mode the desktop app's backup window opens instead,
+  // masked, with SHOW behind a fresh click of its own.
+  const shell = hasNativeShell();
+  const opens = turned.ok && on && bankViewOnScreen() && opensAfterTurnOn(before, after, bankBackupPage, shell);
+  const native = opens && backupMode(after, shell) === "native";
+  if (opens && !native) setBankBackup(openBackupPanel(bankBackup, after, performance.now(), shell));
   renderBankApp();
-  if (opens) document.getElementById(BACKUP_SHOW_ID)?.focus({ preventScroll: true });
+  if (opens && !native) document.getElementById(BACKUP_SHOW_ID)?.focus({ preventScroll: true });
+  if (native) void openBankBackupWindow();
   // A wallet just turned on has a balance to read.
   if (turned.ok && on) requestBankBalance();
 }
@@ -5124,7 +5131,7 @@ function wipeBankClipboard(onTap = false): void {
  *  or the page hidden. The words go, and so does a reveal still in flight. */
 function bankBackupLeftScreen(): void {
   wipeBankClipboard();
-  if (setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), false))) {
+  if (setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), false, Date.now(), hasNativeShell()))) {
     renderBankApp();
   }
 }
@@ -5187,6 +5194,25 @@ async function copyBankBackup(): Promise<void> {
   renderBankApp();
 }
 
+/** 🖥️ OPEN BACKUP WINDOW (bankBackup.ts `runBackupWindow`): the desktop
+ *  app shows the 24 words in a window of its own, and answers only how it
+ *  closed; the page sends the node nothing about the words. One at a time:
+ *  a tap while the window is out does nothing. */
+async function openBankBackupWindow(): Promise<void> {
+  await runBackupWindow({
+    get: () => bankBackup,
+    set: (next) => {
+      if (setBankBackup(next)) renderBankApp();
+    },
+    fingerprint: () => (localNodeLive ? localFingerprint : null),
+    shell: hasNativeShell(),
+    open: openBackup,
+    refresh: refreshLocalFingerprint,
+    now: () => performance.now(),
+  });
+  renderBankApp();
+}
+
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
  *  The reply lands in the dish's store, whose subscribers repaint the view;
  *  a request that cannot leave (no node, a failed stream) is filed there too,
@@ -5216,7 +5242,7 @@ function renderBankApp(): void {
   // 🏦 BACK UP's words follow the screen and the node before anything is
   // drawn: a render of a Bank that is not on screen (a balance landing
   // behind a put-away phone) draws the grid masked, never the words.
-  setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), treasuryViewOnScreen(view)));
+  setBankBackup(reconcileBackupUi(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), treasuryViewOnScreen(view), Date.now(), hasNativeShell()));
   // Same black-inheritance fix as the VENTURES app (portfolio/property rows).
   view.style.color = "#e8d5a3";
   const esc = (s: string) =>
@@ -5299,7 +5325,7 @@ function renderBankApp(): void {
       // a busy one is aria-disabled (it keeps focus), and I SAVED before a
       // reveal is really disabled, so ↑/↓ skips it. The words reach the
       // markup only through `backupGridHtml`, as text.
-      const bv = bankBackupView(liveFp, bankBackup, bankBackupPage);
+      const bv = bankBackupView(liveFp, bankBackup, bankBackupPage, hasNativeShell());
       const ctl = (id: string, label: string, o: { act?: string; busy?: boolean; danger?: boolean; disabled?: boolean; lit?: boolean } = {}) =>
         `<button type="button" id="${id}"${o.act ? ` data-act="${o.act}"` : ""}${o.busy ? ' aria-disabled="true" aria-busy="true"' : ""}${o.disabled ? " disabled" : ""} style="${btnStyle(Boolean(o.lit))}${o.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${o.busy ? " cursor:progress; opacity:0.7;" : ""}${o.disabled ? " cursor:default; opacity:0.4;" : ""}">${esc(label)}</button>`;
       const line = (text: string, color: string, status = false) =>
@@ -5308,11 +5334,15 @@ function renderBankApp(): void {
       if (bv && !bv.panel) {
         // A `notice` view (no wallet to back up now) carries only the
         // clipboard's notice.
+        // 🖥️ In the native mode OPEN BACKUP WINDOW stands where BACK UP
+        // does: no grid, SHOW, COPY or CONFIRM here, and no word ever.
         backupHtml = `
-        ${bv.line || bv.open ? `<div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+        ${bv.line || bv.open || bv.window ? `<div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <span style="flex:1; min-width:0; font-size:9px; color:${bv.state === "done" ? "rgba(212,168,75,0.5)" : "#ffb300"}; line-height:1.6;">${esc(bv.line ?? "")}</span>
           ${bv.open ? ctl(BACKUP_ID, "BACK UP") : ""}
+          ${bv.window ? ctl(BACKUP_WINDOW_ID, bv.window.label, { busy: bv.window.busy }) : ""}
         </div>` : ""}
+        ${bv.windowLine ? line(bv.windowLine, "rgba(212,168,75,0.7)", true) : ""}
         ${bv.elsewhere ? line(bv.elsewhere, "rgba(212,168,75,0.7)") : ""}
         ${bv.atRest.map((t) => line(t, "rgba(212,168,75,0.6)")).join("")}
         ${bv.copyNotice ? line(bv.copyNotice, "#f0a060", true) : ""}
@@ -5461,9 +5491,17 @@ function renderBankApp(): void {
   // 🏦 BACK UP (bankBackup.ts). Every tap in the panel first empties a
   // clipboard COPY left the words on.
   view.querySelector<HTMLButtonElement>(`#${BACKUP_ID}`)?.addEventListener("click", () => {
-    if (!setBankBackup(openBackupPanel(bankBackup, localNodeLive ? localFingerprint : null, performance.now()))) return;
+    if (!setBankBackup(openBackupPanel(bankBackup, localNodeLive ? localFingerprint : null, performance.now(), hasNativeShell()))) return;
     renderBankApp();
     view.querySelector<HTMLElement>(`#${BACKUP_SHOW_ID}`)?.focus({ preventScroll: true });
+  });
+  view.querySelector<HTMLButtonElement>(`#${BACKUP_WINDOW_ID}`)?.addEventListener("click", (e) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    if (btn.getAttribute("aria-disabled") === "true") return;
+    // A fresh tap: not a double-click's second click, and not within
+    // BANK_SETTLE_MS of the window's last answer landing.
+    if (!freshTap((e as MouseEvent).detail, performance.now(), bankBackup.changedAt)) return;
+    void openBankBackupWindow();
   });
   view.querySelector<HTMLButtonElement>(`#${BACKUP_SHOW_ID}`)?.addEventListener("click", (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
@@ -5555,7 +5593,7 @@ function renderBankApp(): void {
     const backupGone = focusedId.startsWith(BACKUP_ID);
     const target =
       (focusedId ? view.querySelector<HTMLElement>(`#${CSS.escape(focusedId)}:not([disabled])`) : null) ??
-      (backupGone ? view.querySelector<HTMLElement>(`#${BACKUP_SHOW_ID}, #${BACKUP_ID}`) ?? view : null) ??
+      (backupGone ? view.querySelector<HTMLElement>(`#${BACKUP_SHOW_ID}, #${BACKUP_ID}, #${BACKUP_WINDOW_ID}`) ?? view : null) ??
       (focusedId ? view.querySelector<HTMLElement>("button:not([disabled])") : null) ??
       view;
     target.focus({ preventScroll: true });
@@ -9389,7 +9427,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // switch, and nowhere to send one while it is away. BACK UP forgets the
     // words and the key of a node that is gone (and is drawn again, on
     // screen or not, so its markup forgets them too).
-    const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, null, performance.now(), bankViewOnScreen()));
+    const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, null, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
     const wasLive = localNodeLive;
     if (localNodeLive) {
       localNodeLive = false;
@@ -9416,7 +9454,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
   // words, or words marked saved (bankBackup.ts reconcileBackupUi).
-  const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen()));
+  const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
   if (
     backupMoved ||
     ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&

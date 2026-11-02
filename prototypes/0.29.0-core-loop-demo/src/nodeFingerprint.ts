@@ -116,6 +116,13 @@ export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on' | 'gated';
  *  (owner-only on Unix), `dpapi` locked to this Windows account. */
 export type ChiaWalletAtRest = 'none' | 'dpapi';
 
+/** 🖥️ Who can show the wallet's 24 words: `native` the desktop app, in a
+ *  window of its own (its channel to the node is on), `page` this page (a
+ *  test network, no channel), `none` nobody here (any other network with no
+ *  channel). A hint for which BACK UP to offer (bankBackup.ts); the node and
+ *  the app still decide. */
+export type ChiaWalletBackup = 'native' | 'page' | 'none';
+
 export interface ChiaWalletSwitch {
   state: ChiaWalletState;
   /** Ready: the 24-word identity from an earlier run (`chia_identity.json`)
@@ -152,6 +159,11 @@ export interface ChiaWalletSwitch {
   rewrapped?: boolean;
   /** Why the last turn failed, in the node's words. */
   error?: string;
+  /** 🖥️ In every state: who can show the 24 words. An older node never
+   *  sends it, and a value this page does not know is dropped: both read as
+   *  absent, which BACK UP treats exactly as before the field (the page
+   *  reveal on a test network, none elsewhere). */
+  backup?: ChiaWalletBackup;
 }
 
 /** The switch's flags, every one a boolean the node sends only when true.
@@ -164,6 +176,8 @@ const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up'
  *  word (a newer node's other lock is dropped, not the whole switch). */
 const WALLET_AT_REST = ['at_rest', 'at_rest_next'] as const;
 const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'dpapi']);
+
+const BACKUP_KINDS: ReadonlySet<string> = new Set<ChiaWalletBackup>(['native', 'page', 'none']);
 
 const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on', 'gated']);
 
@@ -191,6 +205,10 @@ export function parseChiaWallet(v: unknown): ChiaWalletSwitch | undefined {
     if (typeof kind === 'string' && AT_REST_KINDS.has(kind)) w[field] = kind as ChiaWalletAtRest;
   }
   if (typeof r.error === 'string' && r.error) w.error = r.error;
+  // Only the three words, exactly: anything else (another word, another
+  // case, not a string) is dropped, never the switch, so a newer node's
+  // value leaves the Bank as it was before the field.
+  if (typeof r.backup === 'string' && BACKUP_KINDS.has(r.backup)) w.backup = r.backup as ChiaWalletBackup;
   return w;
 }
 

@@ -605,7 +605,9 @@ describe.each([TESTNET11, MAINNET])('BACK UP on $name', (net) => {
   it('is offered only on a test network', () => {
     const v = bankBackupView(live, BACKUP_IDLE, 'app');
     if (net.test) expect(v).toMatchObject({ state: 'nag', open: true });
-    else expect(v).toBeNull();
+    // 🖥️ Off a test network the nag says where to back up instead, and
+    // offers no control at all (bankBackupNative.test.ts).
+    else expect(v).toMatchObject({ state: 'nag', open: false, window: null, panel: null, elsewhere: 'Back up from the Star Station desktop app on this computer.' });
     expect(openBackupPanel(BACKUP_IDLE, live, 1).open).toBe(net.test);
     expect(opensAfterTurnOn(node({ state: 'ready', mnemonic: true }), live, 'app')).toBe(net.test);
   });
