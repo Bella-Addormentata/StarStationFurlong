@@ -27,8 +27,9 @@
 //!   stdout lock by the channel thread only. A refusal of a line whose id
 //!   could not be read carries id 0.
 //!
-//! A line that is too long gets [`Refusal::TooLong`] and closes the channel;
-//! bad JSON, another `v` or an unknown op get their own fixed refusal and the
+//! A line that is too long gets [`Refusal::TooLong`] and closes the channel:
+//! nothing more is answered, and the rest of stdin is read and dropped until
+//! EOF, so the app's writes never block on a full pipe. Bad JSON, another `v` or an unknown op get their own fixed refusal and the
 //! channel reads on. EOF ends the thread and nothing else. A refusal frame is
 //! a fixed sentence and never holds a word.
 
@@ -235,6 +236,22 @@ fn read_line<R: Read>(input: &mut R, line: &mut Zeroizing<Vec<u8>>) -> std::io::
     }
 }
 
+/// Read and drop the rest of `input` until EOF or a read error, wiping
+/// each chunk: after a line that is too long the channel answers nothing
+/// more, but it keeps reading, so the app's writes to the node's stdin never
+/// block on a full pipe and its requests fail by its own timeout.
+fn drain<R: Read>(input: &mut R) {
+    let mut chunk = Zeroizing::new([0u8; 256]);
+    loop {
+        match input.read(&mut chunk[..]) {
+            Ok(0) => return,
+            Ok(_) => chunk.zeroize(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 /// Write one reply line whole, then flush.
 fn send<W: Write>(out: &mut W, id: u64, body: &str) -> std::io::Result<()> {
     let frame = frame(id, body);
@@ -255,6 +272,7 @@ pub fn serve<R: Read, W: Write>(mut input: R, mut out: W, mut answer: impl FnMut
             Err(_) => return End::ReadFailed,
             Ok(Line::TooLong) => {
                 let _ = send(&mut out, 0, &Refusal::TooLong.body());
+                drain(&mut input);
                 return End::TooLong;
             }
         }
@@ -473,8 +491,18 @@ mod tests {
         let input = format!("{long}\n{{\"v\":1,\"id\":2,\"op\":\"reveal\"}}\n");
         let (end, lines, asked) = run(input.as_bytes());
         assert_eq!(end, End::TooLong);
-        assert!(asked.is_empty(), "nothing after the long line is read");
+        assert!(asked.is_empty(), "nothing after the long line is answered");
         assert_eq!(lines, [refusal_line(0, Refusal::TooLong)]);
+
+        // The rest of stdin is still read to EOF, so the app's writes never
+        // block on a full pipe; none of it gets an answer.
+        let rest = "{\"v\":1,\"id\":3,\"op\":\"hello\"}\n".repeat(500);
+        let mut input = std::io::Cursor::new(format!("{long}\n{rest}").into_bytes());
+        let mut out = Vec::new();
+        let end = serve(&mut input, &mut out, stub);
+        assert_eq!(end, End::TooLong);
+        assert_eq!(input.position(), input.get_ref().len() as u64, "read to EOF");
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", refusal_line(0, Refusal::TooLong)));
 
         // A long line with no newline at all is cut at the cap too.
         let (end, lines, _) = run(&vec![b'{'; 10 * MAX_LINE]);

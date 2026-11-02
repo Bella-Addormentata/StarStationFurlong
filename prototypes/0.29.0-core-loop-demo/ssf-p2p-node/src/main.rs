@@ -6201,9 +6201,14 @@ async fn words_answer(
                         m.backed_up = true;
                     }
                 }
-                println!(
-                    "🏦 SSF wallet: the player marked the 24 words saved in {who} (key fingerprint {asked}); they are not shown again"
-                );
+                match asker {
+                    chia_wallet_switch::Asker::Page { .. } => println!(
+                        "🏦 SSF wallet: the player marked the 24 words saved (key fingerprint {asked}); the Bank does not show them again"
+                    ),
+                    chia_wallet_switch::Asker::Shell => println!(
+                        "🏦 SSF wallet: the player marked the 24 words saved in the desktop app (key fingerprint {asked}); they are not shown again"
+                    ),
+                }
             };
             let flag = net.path(chia_wallet_switch::SAVED_FILE);
             let now = chia_resolve::unix_now();
