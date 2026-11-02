@@ -17,6 +17,8 @@ import {
   BACKUP_WINDOW_LINES,
   applyBackupWindow,
   applyReveal,
+  applySave,
+  armSave,
   backupMode,
   bankBackupView,
   heldKeyRepeat,
@@ -29,6 +31,7 @@ import {
   runBackupWindow,
   startBackupWindow,
   startReveal,
+  startSave,
   type BackupWindowDeps,
   type BankBackupUi,
 } from './bankBackup';
@@ -150,6 +153,45 @@ describe('BACK UP in the native mode', () => {
     const json = JSON.stringify([v, after]);
     for (const w of FAKE_WORDS) expect(json).not.toContain(w);
     expect(json).not.toContain(String(FAKE_KEY));
+  });
+
+  it('drops a page reveal still out when BACK UP turns native: its words never land', () => {
+    const page = fpOn(TESTNET11, 'page');
+    const opened = openBackupPanel(BACKUP_IDLE, page, 1000, true);
+    const s = startReveal(opened, 1500)!;
+    expect(s.ui.revealing).toBe(true);
+    // The node restarted with the app's channel on while SHOW was out.
+    const native = fpOn(TESTNET11, 'native');
+    const after = reconcileBackupUi(s.ui, native, 1800, true, Date.now(), true);
+    expect(after).toMatchObject({ open: false, revealing: false, words: null, key: null, address: null });
+    expect(after.gen).not.toBe(s.ticket);
+    const landed = applyReveal(after, s.ticket, { ok: true, words: [...FAKE_WORDS], key: FAKE_KEY, address: addressOn(TESTNET11, BODY) }, true, 2000);
+    expect(landed).toBe(after);
+    expect(landed.words).toBeNull();
+    expect(landed.key).toBeNull();
+    const json = JSON.stringify([landed, bankBackupView(native, landed, 'app', true)]);
+    for (const w of FAKE_WORDS) expect(json).not.toContain(w);
+    expect(json).not.toContain(String(FAKE_KEY));
+  });
+
+  it('drops a page save still out when BACK UP turns native: the page records nothing saved', () => {
+    const page = fpOn(TESTNET11, 'page');
+    const s = startReveal(openBackupPanel(BACKUP_IDLE, page, 1000, true), 1500)!;
+    const shown = applyReveal(s.ui, s.ticket, { ok: true, words: [...FAKE_WORDS], key: FAKE_KEY, address: addressOn(TESTNET11, BODY) }, true, 2000);
+    const saving = startSave(armSave(shown, 2600));
+    expect(saving.saving).toBe(true);
+    const ticket = saving.saveTicket;
+    expect(ticket).not.toBeNull();
+    const native = fpOn(TESTNET11, 'native');
+    const after = reconcileBackupUi(saving, native, 2800, true, Date.now(), true);
+    expect(after).toMatchObject({ open: false, saving: false, saveTicket: null, words: null, key: null, address: null, savedFor: null });
+    const landed = applySave(after, ticket, { ok: true, note: null }, 3000);
+    expect(landed).toBe(after);
+    expect(landed.savedFor).toBeNull();
+    // Still the nag and its one button: the node, not the page, says saved.
+    expect(bankBackupView(native, landed, 'app', true)).toMatchObject({ state: 'nag', window: { label: BACKUP_WINDOW_LABEL, busy: false } });
+    const json = JSON.stringify(landed);
+    for (const w of FAKE_WORDS) expect(json).not.toContain(w);
   });
 
   it('calls invoke("open_backup") with no argument, and never fetches the words or the saved mark', async () => {
@@ -277,7 +319,54 @@ describe('BACK UP in the native mode', () => {
     expect(bankBackupView(saved, after, 'app', true)).toMatchObject({ state: 'done', line: BACKUP_DONE, window: null, windowLine: null, panel: null });
     // Another round on the same wallet keeps it.
     const closed = applyBackupWindow(startBackupWindow(BACKUP_IDLE, fp, true, 1), 'closed', 2);
+    expect(closed.windowFor).toBe(fp.chia_address);
     expect(reconcileBackupUi(closed, fp, 3, true, Date.now(), true)).toBe(closed);
+  });
+
+  it.each([TESTNET11, MAINNET])('on $name, drops the answer line for another address, a wallet not on, or no node', (net) => {
+    const fp = fpOn(net, 'native');
+    const closed = applyBackupWindow(startBackupWindow(BACKUP_IDLE, fp, true, 1), 'closed', 2);
+    expect(closed.windowLine).toBe(THE_LINES.closed);
+    const other = fpOn(net, 'native', {}, OTHER_BODY);
+    const off: LocalFingerprint = { ...fp, chia_address: undefined, chia_wallet: { state: 'off', backup: 'native' } };
+    for (const next of [other, off, null]) {
+      const after = reconcileBackupUi(closed, next, 3, true, Date.now(), true);
+      expect(after.windowLine).toBeNull();
+      expect(after.windowFor).toBeNull();
+      expect(after.windowOpen).toBe(false);
+      expect(bankBackupView(next, after, 'app', true)?.windowLine ?? null).toBeNull();
+    }
+    // Wallet B's nag offers its own OPEN BACKUP WINDOW, with no line of A's,
+    // and the line does not come back when wallet A does.
+    const b = reconcileBackupUi(closed, other, 3, true, Date.now(), true);
+    expect(bankBackupView(other, b, 'app', true)).toMatchObject({ state: 'nag', window: { label: BACKUP_WINDOW_LABEL, busy: false }, windowLine: null });
+    expect(bankBackupView(fp, reconcileBackupUi(b, fp, 4, true, Date.now(), true), 'app', true)?.windowLine).toBeNull();
+  });
+
+  it('drops the answer line when BACK UP stops being native, so it never comes back', () => {
+    const fp = fpOn(TESTNET11, 'native');
+    const closed = applyBackupWindow(startBackupWindow(BACKUP_IDLE, fp, true, 1), 'closed', 2);
+    // The node restarted without the app's channel: the page's BACK UP.
+    const page = fpOn(TESTNET11, 'page');
+    const flipped = reconcileBackupUi(closed, page, 3, true, Date.now(), true);
+    expect(flipped).toMatchObject({ windowLine: null, windowFor: null });
+    // And with the channel on again: no old line.
+    const back = reconcileBackupUi(flipped, fp, 4, true, Date.now(), true);
+    expect(bankBackupView(fp, back, 'app', true)?.windowLine).toBeNull();
+    // The same goes for the app no longer answering commands.
+    expect(reconcileBackupUi(closed, fp, 3, true, Date.now(), false).windowLine).toBeNull();
+  });
+
+  it('keeps the answer of a window still out across the Bank reopening, for the same wallet', () => {
+    const fp = fpOn(MAINNET, 'native');
+    const out = startBackupWindow(BACKUP_IDLE, fp, true, 1);
+    const reopened = resetBackupUi(out);
+    expect(reopened).toMatchObject({ windowOpen: true, windowFor: fp.chia_address });
+    const answered = applyBackupWindow(reopened, 'closed', 2);
+    expect(reconcileBackupUi(answered, fp, 3, true, Date.now(), true)).toBe(answered);
+    expect(bankBackupView(fp, answered, 'app', true)?.windowLine).toBe(THE_LINES.closed);
+    // A reopening with no window out forgets the line and its wallet.
+    expect(resetBackupUi(answered)).toMatchObject({ windowOpen: false, windowLine: null, windowFor: null });
   });
 
   it('turns TURN ON into the app\'s window, on any network the page knows', () => {
@@ -382,7 +471,14 @@ describe('BACK UP on Chia mainnet', () => {
   });
 
   it('shows nothing for another address, an unknown network, or a wallet that is not on', () => {
-    expect(bankBackupView(fpOn(MAINNET, 'native', {}, OTHER_BODY), BACKUP_IDLE, 'app', true)?.window).not.toBeNull();
+    // Another address is its own wallet: its own button, and no line of the
+    // last wallet's answer.
+    const closed = applyBackupWindow(startBackupWindow(BACKUP_IDLE, fpOn(MAINNET, 'native'), true, 1), 'closed', 2);
+    const other = fpOn(MAINNET, 'native', {}, OTHER_BODY);
+    expect(bankBackupView(other, reconcileBackupUi(closed, other, 3, true, Date.now(), true), 'app', true)).toMatchObject({
+      window: { label: BACKUP_WINDOW_LABEL, busy: false },
+      windowLine: null,
+    });
     expect(bankBackupView({ ...fpOn(MAINNET, 'native'), chia_net: null }, BACKUP_IDLE, 'app', true)).toBeNull();
     expect(bankBackupView({ ...fpOn(MAINNET), chia_net: null }, BACKUP_IDLE, 'app', false)).toBeNull();
     const gated: LocalFingerprint = { ...fpOn(MAINNET, 'none'), chia_address: undefined, chia_wallet: { state: 'gated', backup: 'none' } };

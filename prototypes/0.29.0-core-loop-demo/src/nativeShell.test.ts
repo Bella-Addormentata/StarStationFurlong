@@ -28,6 +28,29 @@ describe('hasNativeShell', () => {
     withInternals({ invoke: () => undefined });
     expect(hasNativeShell()).toBe(true);
   });
+
+  it('is false, and openBackup unavailable, when reading the hook throws', async () => {
+    // A page script or an extension can put a throwing getter on either
+    // the internals object or its invoke: the Bank's render must not break.
+    const throwingInternals = {};
+    Object.defineProperty(throwingInternals, '__TAURI_INTERNALS__', {
+      get() {
+        throw new Error('no internals');
+      },
+    });
+    const throwingInvoke = {};
+    Object.defineProperty(throwingInvoke, 'invoke', {
+      get() {
+        throw new Error('no invoke');
+      },
+    });
+    for (const win of [throwingInternals, { __TAURI_INTERNALS__: throwingInvoke }]) {
+      vi.stubGlobal('window', win);
+      expect(() => hasNativeShell()).not.toThrow();
+      expect(hasNativeShell()).toBe(false);
+      await expect(openBackup()).resolves.toBe('unavailable');
+    }
+  });
 });
 
 describe('openBackup', () => {

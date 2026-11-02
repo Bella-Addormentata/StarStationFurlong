@@ -129,8 +129,12 @@ export interface BankBackupUi {
    *  close, so one call is out at a time whatever the Bank does meanwhile. */
   windowOpen: boolean;
   /** 🖥️ What the last OPEN BACKUP WINDOW came back with, as a line; until
-   *  the next tap, the Bank opening again, or the wallet going. */
+   *  the next tap, the Bank opening again, the wallet going (another
+   *  address, not on, backed up, no node), or BACK UP no longer native. */
   windowLine: string | null;
+  /** 🖥️ The address OPEN BACKUP WINDOW was tapped for: its line is shown
+   *  only while the Bank's wallet is still this one. */
+  windowFor: string | null;
 }
 
 export const BACKUP_IDLE: Readonly<BankBackupUi> = {
@@ -153,6 +157,7 @@ export const BACKUP_IDLE: Readonly<BankBackupUi> = {
   changedAt: 0,
   windowOpen: false,
   windowLine: null,
+  windowFor: null,
 };
 
 /** Everything a closed panel forgets. */
@@ -427,8 +432,8 @@ export function opensAfterTurnOn(
  *  key too, when the wallet it was opened for is gone: another address, not
  *  on, not from words, backed up, or no node, and when BACK UP turned native
  *  (`shell`, [`backupMode`]). The native answer's line goes with the wallet
- *  too. A change in anything else the fingerprint carries changes nothing
- *  here. */
+ *  it was tapped for too, and when BACK UP stops being native. A change
+ *  in anything else the fingerprint carries changes nothing here. */
 export function reconcileBackupUi(
   ui: BankBackupUi,
   fp: LocalFingerprint | null | undefined,
@@ -444,7 +449,9 @@ export function reconcileBackupUi(
   if ((gone || mode === 'native') && (u.open || u.words !== null || u.key !== null || u.revealing || u.armed || u.saving || u.address !== null || u.expired)) {
     u = { ...u, ...CLOSED, gen: u.gen + 1 };
   }
-  if (gone && u.windowLine !== null) u = { ...u, windowLine: null };
+  // The answer's line is for the wallet it was tapped for, in the native
+  // mode only: another wallet, or the page's own BACK UP, never shows it.
+  if (u.windowLine !== null && (gone || mode !== 'native' || u.windowFor !== address)) u = { ...u, windowLine: null, windowFor: null };
   // The page's own "saved" stands in only until the node says so, and only
   // for the wallet it was said for.
   if (u.savedFor !== null && (backedUp(fp) || u.savedFor !== address)) u = { ...u, savedFor: null };
@@ -473,10 +480,18 @@ export function closeBackupPanel(ui: BankBackupUi, now: number): BankBackupUi {
 
 /** Opening the Bank starts from the nag. Only a clipboard that may still
  *  hold the words is remembered, and an OPEN BACKUP WINDOW still out (its
- *  window is still open, so a tap must not ask for another). */
+ *  window is still open, so a tap must not ask for another), with the
+ *  address it was tapped for, so its answer still shows. */
 export function resetBackupUi(ui: BankBackupUi): BankBackupUi {
   const keep = ui.copy === 'held' || ui.copy === 'stuck';
-  return { ...BACKUP_IDLE, gen: ui.gen + 1, copy: keep ? ui.copy : 'none', copiedAt: keep ? ui.copiedAt : 0, windowOpen: ui.windowOpen };
+  return {
+    ...BACKUP_IDLE,
+    gen: ui.gen + 1,
+    copy: keep ? ui.copy : 'none',
+    copiedAt: keep ? ui.copiedAt : 0,
+    windowOpen: ui.windowOpen,
+    windowFor: ui.windowOpen ? ui.windowFor : null,
+  };
 }
 
 /** HIDE: the grid masks again; I SAVED stays offered (the key is kept). A
@@ -560,8 +575,9 @@ export function startBackupWindow(
   shell: boolean,
   now: number,
 ): BankBackupUi {
-  if (ui.windowOpen || backupMode(fp, shell) !== 'native' || backupAddress(fp, 'native') === null || backedUp(fp)) return ui;
-  return { ...ui, windowOpen: true, windowLine: null, changedAt: now };
+  const address = backupMode(fp, shell) === 'native' ? backupAddress(fp, 'native') : null;
+  if (ui.windowOpen || address === null || backedUp(fp)) return ui;
+  return { ...ui, windowOpen: true, windowLine: null, windowFor: address, changedAt: now };
 }
 
 /** The app's answer: its fixed line, and OPEN BACKUP WINDOW is free again.
