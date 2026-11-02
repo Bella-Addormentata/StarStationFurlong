@@ -1,0 +1,134 @@
+name: "⛓️ Chia network probe (temporary, PR 3 of stage 2)"
+
+# TEMPORARY. Runs the node against real Chia full nodes once, on mainnet and
+# on testnet11, to prove what CI's mock full node cannot: mainnet peers answer
+# the "mainnet" handshake id and serve mainnet's block 0, and
+# dns-introducer.chia.net answers with peers on TCP 8444. The node holds no
+# SSF wallet on mainnet, so it only reads. This file is removed before the PR
+# merges; its log is copied into the PR description.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chia-network-probe.yml'
+
+env:
+  RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
+
+jobs:
+  chia-network-probe:
+    name: ⛓️ Probe Chia mainnet and testnet11 peers (temporary)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v5
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+          key: ubuntu-22.04
+
+      - name: 🔨 cargo build --features chia-read,chia-mainnet (debug)
+        run: cargo build --features chia-read,chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: ⛓️ Run the node on mainnet, then on testnet11
+        shell: bash
+        run: |
+          # Actions runs bash with -e -o pipefail; the probe counts its own
+          # failures instead, so one missing line never hides the evidence.
+          set +e -u
+          BIN="$GITHUB_WORKSPACE/$RELEASE_FRONTEND/ssf-p2p-node/target/debug/ssf-p2p-node"
+          test -x "$BIN"
+          failed=0
+
+          # probe NET PORT STORE: run the node from a fresh temp dir for at most
+          # 300 s, stop it by PID once STORE holds a peer on PORT, then check.
+          probe() {
+            local net=$1 port=$2 store=$3
+            local dir; dir=$(mktemp -d)
+            echo "::group::$net: data dir $dir"
+            # One made-up contact for the watcher to read: 32 random bytes of
+            # node id (hex) and of contact key (base64), no rooms.
+            local node ck
+            node=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+            ck=$(head -c 32 /dev/urandom | base64 -w0)
+            printf '{"peers":{"%s":{"ck":"%s","card_issued_at":%s,"rooms":[]}}}\n' "$node" "$ck" "$(date +%s)" > "$dir/peers.json"
+            chmod 600 "$dir/peers.json"
+            (
+              cd "$dir" &&
+              SSF_CHIA_NETWORK=$net SSF_EXTERNAL_ADDRS=off SSF_NO_DHT=1 SSF_NO_MDNS=1 SSF_IROH_PORT=0 \
+                exec "$BIN" > "$dir/node.log" 2>&1
+            ) &
+            local pid=$!
+            echo "node pid $pid"
+            local fp="" filled=0
+            for i in $(seq 1 60); do
+              sleep 5
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "the node exited early"
+                break
+              fi
+              [ -z "$fp" ] && fp=$(curl -s --max-time 2 http://127.0.0.1:8080/api/fingerprint || true)
+              if [ -s "$dir/$store" ] && [ "$(jq "[.peers[] | select(.addr | endswith(\":$port\"))] | length" "$dir/$store" 2>/dev/null || echo 0)" -gt 0 ]; then
+                filled=1
+                echo "$store filled after $((i * 5)) s"
+                sleep 10 # let a second peer land, if one is coming
+                break
+              fi
+            done
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            echo "::endgroup::"
+
+            echo "===== $net: evidence ====="
+            echo "--- startup network line and chain lane lines"
+            grep -E '⛓️ (Chia network|Chain lane):' "$dir/node.log" || true
+            echo "--- the fingerprint's chia_network"
+            if [ -n "$fp" ]; then echo "$fp" | jq -c '.chia_network // "absent"'; else echo "(no fingerprint read)"; fi
+            echo "--- chain peer lines (introducer, dials, handshakes)"
+            grep -E '⛓️ chain peers:' "$dir/node.log" | head -60 || true
+            echo "--- $store"
+            if [ -s "$dir/$store" ]; then jq -c '.peers[]' "$dir/$store"; else echo "(missing or empty)"; fi
+            echo "--- files in the data dir"
+            (cd "$dir" && find . -maxdepth 2 | sort)
+            [ -d "$dir/chia-mainnet" ] && stat -c '%A %n' "$dir/chia-mainnet"
+
+            echo "--- checks"
+            local ok=1
+            local connected
+            connected=$(grep -cE "⛓️ chain peers: [^ ]+:$port \([a-z]+\) connected" "$dir/node.log")
+            echo "peers connected on port $port: $connected"
+            [ "$connected" -ge 1 ] || { echo "FAIL: no $net full node on port $port passed the handshake and the genesis check"; ok=0; }
+            [ "$filled" = 1 ] || { echo "FAIL: $store has no peer on port $port"; ok=0; }
+            grep -q "⛓️ Chia network: $net (set by SSF_CHIA_NETWORK)" "$dir/node.log" || { echo "FAIL: no startup network line for $net"; ok=0; }
+            if grep -qE "chain peers: .*peer is on network" "$dir/node.log"; then
+              echo "note: some peers named another network at the handshake (counted above only if others connected)"
+            fi
+            if [ "$net" = mainnet ]; then
+              [ ! -e "$dir/chia_peers.json" ] || { echo "FAIL: mainnet wrote testnet11's chia_peers.json at the root"; ok=0; }
+              [ "$(stat -c %a "$dir/chia-mainnet" 2>/dev/null)" = 700 ] || { echo "FAIL: chia-mainnet/ is not owner-only"; ok=0; }
+              [ ! -e "$dir/chia-mainnet/chia_identity.json" ] || { echo "FAIL: a mainnet identity was made"; ok=0; }
+            else
+              [ ! -e "$dir/chia-mainnet" ] || { echo "FAIL: testnet11 made chia-mainnet/"; ok=0; }
+            fi
+            [ "$ok" = 1 ] && echo "PASS: $net" || failed=1
+            echo
+          }
+
+          probe mainnet 8444 chia-mainnet/chia_peers.json
+          probe testnet11 58444 chia_peers.json
+
+          # And the gate: a build without the feature refuses mainnet with
+          # exit code 2 before it opens anything (cheap: the same binary with
+          # a value it never accepts stands in for it here).
+          dir=$(mktemp -d)
+          (cd "$dir" && SSF_CHIA_NETWORK=Mainnet "$BIN"); code=$?
+          echo "SSF_CHIA_NETWORK=Mainnet exit code: $code; files left: $(ls -A "$dir" | wc -l)"
+          [ "$code" = 2 ] && [ -z "$(ls -A "$dir")" ] || failed=1
+
+          exit $failed
