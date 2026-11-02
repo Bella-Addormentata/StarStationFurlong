@@ -222,6 +222,17 @@ describe.each([
     expect(h).not.toContain(address);
     if (net.test) expect(h).toContain(`The node sent a jar address that is not on ${net.name}, so the dish shows no address.`);
   });
+
+  it(net.test ? 'draws every GIVE button disabled, though the node says GIVE is possible and the wallet is funded' : 'draws no GIVE button', () => {
+    const h = screen(status(net, address), net);
+    const gives = h.match(/id="faucet-give-\d+"/g) ?? [];
+    if (!net.test) {
+      expect(gives).toEqual([]);
+      return;
+    }
+    expect(gives.length).toBeGreaterThan(0);
+    for (const id of gives) expect(h).toContain(`${id} disabled`);
+  });
 });
 
 describe('the faucet dish screen when the empty jar takes no gifts', () => {
@@ -315,6 +326,16 @@ describe('the faucet dish screen when the fingerprint changes network while it i
     expect(s.sent.filter((op) => op === 'give')).toEqual([]);
     expect(s.writes).toEqual([]);
     expect(s.html()).not.toContain('faucet-give');
+    s.close();
+  });
+
+  it('sends no GIVE and copies nothing when the jar address is not on the test network', () => {
+    // The buttons are drawn disabled; the click-time check is the second guard.
+    const s = openScreen(status(TESTNET11, addressOn(MAINNET, BODY)));
+    s.click('#faucet-give-0');
+    s.click('#faucet-copy');
+    expect(s.sent.filter((op) => op === 'give')).toEqual([]);
+    expect(s.writes).toEqual([]);
     s.close();
   });
 

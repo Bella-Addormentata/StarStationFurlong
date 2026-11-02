@@ -4720,7 +4720,9 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // an address on that network.
     const payIn = !!st && slotOpen && isAddressOn(net, st.address);
     const canTake = !!st?.canClaim && pending === null;
-    const canGive = (mojos: number): boolean => slotOpen && !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
+    // GIVE pays the jar's address, so it needs the same address check as the
+    // pay-in line, the QR and COPY.
+    const canGive = (mojos: number): boolean => payIn && !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
     // A push the gateway never answered: the node keeps the spend's coins
     // parked and the action pending until the chain or the mempool settles it,
     // and the screen says so instead of reading a refusal (#245 review, round 14).
@@ -4804,12 +4806,16 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       );
     };
     panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
-    // GIVE and COPY check the network again at the click: the fingerprint may
-    // have moved off a test network since this draw.
-    const slotNow = (): boolean => dishNet(latestFaucetStatus(roomId)).net?.test === true;
+    // GIVE and COPY check the network and the jar's address again at the
+    // click: the fingerprint may have moved off a test network since this draw.
+    const payInNow = (): ReturnType<typeof latestFaucetStatus> => {
+      const cur = latestFaucetStatus(roomId);
+      const curNet = dishNet(cur).net;
+      return cur && curNet?.test === true && isAddressOn(curNet, cur.address) ? cur : null;
+    };
     FAUCET_GIVE_AMOUNTS.forEach((g, i) => {
       panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => {
-        if (!slotNow()) {
+        if (!payInNow()) {
           render();
           return;
         }
@@ -4817,9 +4823,8 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       });
     });
     panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
-      const cur = latestFaucetStatus(roomId);
-      const curNet = dishNet(cur).net;
-      if (!cur || curNet?.test !== true || !isAddressOn(curNet, cur.address)) {
+      const cur = payInNow();
+      if (!cur) {
         render();
         return;
       }
