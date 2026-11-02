@@ -142,10 +142,11 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// Startup self-test + status line. Proves the lane's crypto machinery on a
 /// throwaway key and says what THIS build does with the chain: reads are on by
 /// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
-/// for the SSF wallet (`wallet_on`: the Bank's switch or `SSF_CHIA_LANE=1`,
-/// chia_wallet_switch.rs) and a build with the `chia-publish` feature. Off a
-/// test network (`net`), with no desktop app channel, it says that only the
-/// desktop app makes a new wallet there.
+/// for the SSF wallet (`wallet_on`: it loaded at this start, after the Bank's
+/// switch or `SSF_CHIA_LANE=1` turned it on, chia_wallet_switch.rs) and a
+/// build with the `chia-publish` feature. Off a test network (`net`), with no
+/// live desktop app channel, it says that only the desktop app makes a new
+/// wallet there.
 pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -175,7 +176,7 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
     } else {
         "on (rung-6 resolve + beat watcher)"
     };
-    let mints = crate::chia_wallet_switch::may_mint(net.is_test(), crate::shell_channel::started());
+    let mints = crate::chia_wallet_switch::may_mint(net.is_test(), crate::shell_channel::live());
     let publish = publish_status(cfg!(feature = "chia-publish"), wallet_on, mints, crate::chia_wallet_switch::env_switch());
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
@@ -184,7 +185,7 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
 }
 
 /// The startup line's word on publishing: whether this build can, whether
-/// the SSF wallet is on, and what holds it off. `mints` is whether a load
+/// the SSF wallet loaded, and what holds it off. `mints` is whether a load
 /// may make a new wallet (chia_wallet_switch::may_mint): when it may not (off
 /// a test network with no desktop app channel), a headless node can only
 /// load one the desktop app made, and the line says so.

@@ -1587,7 +1587,7 @@ async fn main() -> Result<()> {
     // 🖥️ The desktop app's channel (shell_channel.rs), decided once, right
     // after the network and before anything prints: with it on, every
     // `println!` from here goes to stderr. Before the wallet loads, which
-    // mints on mainnet only with it on.
+    // mints on mainnet only while it is live (`shell_channel::live`).
     shell_channel::init();
     let chia_net = match chosen {
         Ok(line) => {
@@ -1885,7 +1885,7 @@ async fn main() -> Result<()> {
     // switch the SpacePhone's Bank remembered beside the wallet, on every
     // network. An unreadable switch file starts the wallet off and says why.
     // Off a test network a load with no identity on disk mints one only
-    // while the desktop app's channel is on (`load_wallet`).
+    // while the desktop app's channel is live (`load_wallet`).
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
@@ -1899,12 +1899,6 @@ async fn main() -> Result<()> {
         }
         chia_wallet_switch::starts_on(true, chia_wallet_switch::env_switch(), wallet_memo.remembered)
     };
-    #[cfg(not(feature = "chia-publish"))]
-    let wallet_starts = false;
-    // ⛓️ ChiaHub lane: crypto self-test + one status line saying what this build
-    // does with the chain (reads on by default — #231 D3; publishing behind
-    // the SSF wallet in a chia-publish build).
-    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_starts);
     // S‑0 step 2: which full-node peers the chain lane will use, and the trust
     // posture money paths take (pins, pin-only, or two agreeing public peers).
     #[cfg(feature = "chia-read")]
@@ -2026,6 +2020,17 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // ⛓️ ChiaHub lane: crypto self-test + one status line saying what this build
+    // does with the chain (reads on by default — #231 D3; publishing behind
+    // the SSF wallet in a chia-publish build). After the load, so publishing
+    // reads "on" only for a wallet that loaded: a mainnet node with no app
+    // channel and no identity on disk starts with the wallet switched on and
+    // still holds none.
+    #[cfg(feature = "chia-publish")]
+    let wallet_loaded = chia_heartbeat_sk.is_some();
+    #[cfg(not(feature = "chia-publish"))]
+    let wallet_loaded = false;
+    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded);
 
     // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
     // testnet11 under the same fixed test room key the publish hook uses, and log
@@ -2650,6 +2655,8 @@ async fn handle_wt_connection_inner(
                                         wallet: hub_clone.chia_wallet.lock().unwrap().clone(),
                                         #[cfg(feature = "chia-publish")]
                                         env: chia_wallet_switch::env_switch(),
+                                        #[cfg(feature = "chia-publish")]
+                                        turnable: bank_can_turn_on(chia_network::net()),
                                     };
                                     chia_faucet::handle_request(&ctx, &envelope.room, &envelope.payload).await
                                 } else {
@@ -5943,9 +5950,55 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
     // from the wallet key (so it changes with a re-mint).
     if chia_publish::beacon_enabled() {
         let addr = chia_wallet::receive_address(net, &chia_publish::beacon_wallet_key(&id.wallet));
-        let fund = if net.is_test() { format!("fund {addr} at a {} faucet", net.name()) } else { format!("{addr} takes real {}", net.ticker()) };
-        println!(
-            "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; {fund}"
+        let (line, warning) = beacon_lines(net, &addr);
+        println!("{line}");
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+    }
+}
+
+/// ⛓️ The beacon's startup line, and off a test network its warning
+/// (stage 2, question 6): the node id it writes in the clear comes from
+/// `iroh_node_id.key`, which every network shares, so a node that beacons on
+/// testnet11 too writes the same id on both chains and can be linked across
+/// them.
+#[cfg(feature = "chia-publish")]
+fn beacon_lines(net: chia_network::ChiaNet, addr: &str) -> (String, Option<String>) {
+    let fund = if net.is_test() { format!("fund {addr} at a {} faucet", net.name()) } else { format!("{addr} takes real {}", net.ticker()) };
+    let line = format!(
+        "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; {fund}"
+    );
+    let warning = (!net.is_test()).then(|| {
+        format!(
+            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
+            net.name(),
+            chia_network::ChiaNet::Testnet11.name(),
+            chia_network::ChiaNet::Testnet11.name(),
+        )
+    });
+    (line, warning)
+}
+
+#[cfg(all(test, feature = "chia-publish"))]
+mod beacon_line_tests {
+    use super::beacon_lines;
+    use crate::chia_network::ChiaNet;
+
+    /// Testnet11 keeps its one line. Mainnet adds the warning that the
+    /// beacon links this node's id across the two chains, now that a
+    /// mainnet node holds a wallet the beacon can pay from.
+    #[test]
+    fn the_mainnet_beacon_warns_that_it_links_the_node_id_across_chains() {
+        let (line, warning) = beacon_lines(ChiaNet::Testnet11, "txch1beacon");
+        assert!(line.ends_with("fund txch1beacon at a testnet11 faucet"), "{line}");
+        assert_eq!(warning, None);
+        let (line, warning) = beacon_lines(ChiaNet::Mainnet, "xch1beacon");
+        assert!(line.ends_with("xch1beacon takes real XCH"), "{line}");
+        let warning = warning.expect("mainnet warns");
+        assert_eq!(
+            warning,
+            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
         );
     }
 }
@@ -5973,12 +6026,24 @@ fn wallet_meta_of(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) 
     }
 }
 
+/// 🏦 Whether the Bank's TURN ON or CREATE can bring the wallet on now
+/// ([`chia_wallet_switch::bank_can_turn_on`]): a load may mint one, or an
+/// identity is on disk. One that cannot be looked at counts as there, so
+/// the Bank is offered and the load says why.
+#[cfg(feature = "chia-publish")]
+fn bank_can_turn_on(net: chia_network::ChiaNet) -> bool {
+    let on_disk = net.path(chia_wallet_switch::IDENTITY_FILE).try_exists().unwrap_or(true);
+    chia_wallet_switch::bank_can_turn_on(net.is_test(), shell_channel::live(), on_disk)
+}
+
 /// 🏦 Load the wallet (minting it once), then lock its file if its words are
 /// saved ([`lock_if_due`]): at startup and when the Bank turns it on.
 /// Blocking. A `SSF_WALLET_AT_REST` that is neither `os` nor `none` loads
 /// nothing, so a typo cannot quietly leave a file in the clear. Off a test
 /// network a new wallet is minted only while the desktop app's channel is
-/// on ([`chia_wallet_switch::may_mint`]); an identity on disk still loads.
+/// live ([`chia_wallet_switch::may_mint`] over [`shell_channel::live`], not
+/// the sticky `started`): a node the app left running mints nothing whose
+/// words no window can show. An identity on disk still loads.
 #[cfg(feature = "chia-publish")]
 fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::WalletMeta)> {
     let net = chia_network::net();
@@ -5987,7 +6052,7 @@ fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::Wal
         net,
         &net.path(chia_wallet_switch::IDENTITY_FILE),
         &net.path(chia_wallet_switch::LEGACY_SEED_FILE),
-        chia_wallet_switch::may_mint(net.is_test(), shell_channel::started()),
+        chia_wallet_switch::may_mint(net.is_test(), shell_channel::live()),
     )?;
     let mut meta = wallet_meta_of(net, &id);
     lock_if_due(&mut meta, policy);

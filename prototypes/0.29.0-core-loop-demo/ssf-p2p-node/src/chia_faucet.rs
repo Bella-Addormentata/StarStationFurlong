@@ -432,9 +432,9 @@ impl FaucetReply {
 }
 
 /// What a request needs from the node: the room caps (for the room key) and,
-/// in a publish build, the wallet key while the SSF wallet is on and what
-/// `SSF_CHIA_LANE` says (the dish's words while no wallet is on), and the
-/// network the node runs on.
+/// in a publish build, the wallet key while the SSF wallet is on, what
+/// `SSF_CHIA_LANE` says and whether the Bank can bring a wallet on (the
+/// dish's words while no wallet is on), and the network the node runs on.
 pub struct FaucetContext<'a> {
     pub net: ChiaNet,
     pub rooms: &'a Mutex<HashMap<String, ChiaRoomCap>>,
@@ -442,6 +442,11 @@ pub struct FaucetContext<'a> {
     pub wallet: Option<chia_bls::SecretKey>,
     #[cfg(feature = "chia-publish")]
     pub env: crate::chia_wallet_switch::EnvSwitch,
+    /// chia_wallet_switch::bank_can_turn_on: false off a test network with
+    /// no live desktop app channel and no wallet on disk, where the dish
+    /// names the desktop app instead of the Bank.
+    #[cfg(feature = "chia-publish")]
+    pub turnable: bool,
 }
 
 /// Serve one `faucet` request from the LOCAL browser for `room`.
@@ -540,7 +545,8 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 // listing never reached is still a spend in flight (round 16).
                 st.spending = crate::chia_publish::WALLET_LEASE.outgoing_pending();
                 st.landing = landing;
-                let part = wallet_part(&wallet, landing, st.spending, sealed.as_ref(), params.gift, st.ready > 0);
+                let dish = Dish { gift: params.gift, ready: st.ready > 0, empty: st.coins == 0, gives: ctx.net.is_test() };
+                let part = wallet_part(&wallet, landing, st.spending, sealed.as_ref(), dish);
                 st.can_give = part.can_give;
                 st.can_claim = part.can_claim;
                 st.note = part.note;
@@ -548,6 +554,8 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
             None => {
                 st.note = crate::chia_wallet_switch::no_wallet_words(
                     ctx.env,
+                    ctx.net,
+                    ctx.turnable,
                     if ctx.net.is_test() { "take or give" } else { "take a mojo" },
                 );
             }
@@ -665,15 +673,35 @@ struct WalletPart {
     note: String,
 }
 
+/// The dish as [`wallet_part`] reads it.
+#[cfg(feature = "chia-publish")]
+#[derive(Clone, Copy, Debug)]
+struct Dish {
+    /// The jar's gift: the least a GIVE may be.
+    gift: u64,
+    /// A coin is ready to take.
+    ready: bool,
+    /// The jar holds no claimable coin at all.
+    empty: bool,
+    /// This node may give to it: only on a test network ([`network_part`]
+    /// turns GIVE off elsewhere, and adds [`MAINNET_NO_GIVE`]).
+    gives: bool,
+}
+
+/// Off a test network the note never speaks of giving: the dish takes no
+/// gift there, and [`network_part`] says so after it. So the hints that
+/// are only about GIVE (split coins, a listing cut short, a spend still
+/// confirming) are left out, and an empty jar is called empty, not one that
+/// refills: no gift fills a mainnet jar from this node.
 #[cfg(feature = "chia-publish")]
 fn wallet_part(
     wallet: &WalletView,
     landing: bool,
     spending: bool,
     sealed: Option<&crate::chia_publish::LeaseError>,
-    gift: u64,
-    dish_ready: bool,
+    dish: Dish,
 ) -> WalletPart {
+    let Dish { gift, ready: dish_ready, empty: jar_empty, gives } = dish;
     let open = sealed.is_none();
     let spendable = wallet.spendable_mojos();
     let reach = give_reach(&wallet.spendable);
@@ -691,7 +719,7 @@ fn wallet_part(
         format!("this node takes no spend right now: {why}")
     } else if wallet.owned.is_empty() && landing {
         "your mojo from the dish is on its way (about a minute); the wallet shows it when the block lands".into()
-    } else if reach < spendable {
+    } else if gives && reach < spendable {
         // A giver's wallet (it holds coins), so the giving hint outranks the
         // note that the dish is for empty wallets.
         format!(
@@ -699,8 +727,12 @@ fn wallet_part(
         )
     } else if !wallet.owned.is_empty() && dish_ready {
         "the dish is for players with an empty wallet; yours already holds a coin".into()
+    } else if wallet.owned.is_empty() && !dish_ready && jar_empty && !gives {
+        "the jar is empty, so there is no mojo to take".into()
     } else if wallet.owned.is_empty() && !dish_ready {
         "no mojo in the dish yet; it refills on the block clock".into()
+    } else if !gives {
+        String::new()
     } else if wallet.partial {
         "your wallet holds more coins than the dish lists (cut short); giving uses the ones it read".into()
     } else if spending {
@@ -720,7 +752,7 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, "take a mojo")))?;
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, ctx.net, ctx.turnable, "take a mojo")))?;
     // One TAKE at a time, serialized with every other wallet writer: the
     // courtesy check, the coin pick and the push are one critical section, and
     // a gift still landing (its faucet coin parked until the chain or the
@@ -839,7 +871,7 @@ async fn give(
     let sk = ctx
         .wallet
         .as_ref()
-        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, "give")))?;
+        .ok_or_else(|| anyhow!(crate::chia_wallet_switch::no_wallet_words(ctx.env, ctx.net, ctx.turnable, "give")))?;
     if amount < params.gift {
         return Err(anyhow!("a gift below {} mojo(s) could never leave the jar", params.gift));
     }
@@ -1277,24 +1309,74 @@ mod tests {
         let funded = WalletView { owned: vec![coin(1, 5_000)], spendable: vec![coin(1, 5_000)], seen_at: HashMap::new(), partial: false };
         let empty = WalletView { owned: vec![], spendable: vec![], seen_at: HashMap::new(), partial: false };
         // Open: a funded wallet gives, an empty one takes.
-        let part = wallet_part(&funded, false, false, None, 1, true);
+        let part = wallet_part(&funded, false, false, None, T11_READY);
         assert!(part.can_give && !part.can_claim, "{part:?}");
-        let part = wallet_part(&empty, false, false, None, 1, true);
+        let part = wallet_part(&empty, false, false, None, T11_READY);
         assert!(part.can_claim && !part.can_give && part.note.is_empty(), "{part:?}");
         // Sealed: neither, whatever the balance, and the note carries the reason,
         // so a poll clearing an earlier refusal does not re-enable the buttons.
         let sealed = LeaseError::Sealed("wallet_lease.json is unreadable".into());
-        let part = wallet_part(&funded, false, false, Some(&sealed), 1, true);
+        let part = wallet_part(&funded, false, false, Some(&sealed), T11_READY);
         assert!(!part.can_give && !part.can_claim, "{part:?}");
         assert!(part.note.contains("takes no spend") && part.note.contains("wallet_lease.json is unreadable"), "{}", part.note);
-        let part = wallet_part(&empty, false, false, Some(&sealed), 1, true);
+        let part = wallet_part(&empty, false, false, Some(&sealed), T11_READY);
         assert!(!part.can_claim && part.note.contains("sealed"), "{part:?}");
         // A wallet dusted into more coins than one gift may spend: GIVE stays on
         // for what the largest coins reach, and the note says to consolidate.
         let dust: Vec<Coin> = (0..100u8).map(|n| coin(n, 1)).collect();
         let dusted = WalletView { owned: dust.clone(), spendable: dust, seen_at: HashMap::new(), partial: false };
-        let part = wallet_part(&dusted, false, false, None, 1, true);
+        let part = wallet_part(&dusted, false, false, None, T11_READY);
         assert!(part.can_give && part.note.contains("many small coins") && part.note.contains("(64 mojos)"), "{part:?}");
+    }
+
+    /// A ready testnet11 dish with a coin in it, for [`wallet_part`].
+    #[cfg(feature = "chia-publish")]
+    const T11_READY: Dish = Dish { gift: 1, ready: true, empty: false, gives: true };
+
+    /// Mainnet holds an SSF wallet now, so the wallet's part of the note
+    /// runs there: it keeps what is about TAKE and leaves out every hint
+    /// about giving (split coins, a listing cut short, a spend still
+    /// confirming), and calls an empty jar empty, so the note the dish
+    /// shows after [`network_part`] never both offers a gift and refuses
+    /// it. Testnet11 keeps each of those hints.
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn off_a_test_network_the_wallet_note_never_speaks_of_giving() {
+        let ph = Bytes32::new([5u8; 32]);
+        let coin = |n: u8, amount: u64| Coin::new(Bytes32::new([n; 32]), ph, amount);
+        let view = |coins: Vec<Coin>, partial: bool| WalletView { owned: coins.clone(), spendable: coins, seen_at: HashMap::new(), partial };
+        let funded = view(vec![coin(1, 5_000)], false);
+        let dusted = view((0..100u8).map(|n| coin(n, 1)).collect(), false);
+        let cut_short = view(vec![coin(1, 5_000)], true);
+        let empty = view(vec![], false);
+        let main = |ready: bool, jar_empty: bool| Dish { gift: 1, ready, empty: jar_empty, gives: false };
+        let t11 = |ready: bool, jar_empty: bool| Dish { gives: true, ..main(ready, jar_empty) };
+        // (wallet, spending, ready, jar empty, testnet11's note, mainnet's note)
+        let cases: [(&WalletView, bool, bool, bool, &str, &str); 7] = [
+            (&funded, true, false, true, "a spend from your wallet is still confirming (about a minute); giving waits for it", ""),
+            (&funded, false, false, true, "", ""),
+            (&dusted, false, false, false, "consolidate it to give more at once", ""),
+            (&dusted, false, true, false, "consolidate it to give more at once", "the dish is for players with an empty wallet; yours already holds a coin"),
+            (&cut_short, false, false, false, "giving uses the ones it read", ""),
+            (&empty, false, false, true, "no mojo in the dish yet; it refills on the block clock", "the jar is empty, so there is no mojo to take"),
+            (&empty, false, false, false, "no mojo in the dish yet; it refills on the block clock", "no mojo in the dish yet; it refills on the block clock"),
+        ];
+        for (wallet, spending, ready, jar_empty, on_t11, on_main) in cases {
+            let t = wallet_part(wallet, false, spending, None, t11(ready, jar_empty));
+            assert!(t.note.contains(on_t11), "testnet11 keeps its hint: {t:?}");
+            let m = wallet_part(wallet, false, spending, None, main(ready, jar_empty));
+            assert_eq!(m.note, on_main, "{m:?}");
+            assert_eq!(m.can_claim, t.can_claim, "TAKE reads alike on both networks");
+            let (give, note) = network_part(ChiaNet::Mainnet, m.can_give, m.note);
+            assert!(!give);
+            let before = note.strip_suffix(MAINNET_NO_GIVE).expect("the network's word comes last");
+            assert!(!before.to_lowercase().contains("giv"), "a mainnet note that speaks of giving: {note}");
+        }
+        // A sealed lease and a mojo landing are about every spend and TAKE:
+        // both networks say them.
+        let sealed = crate::chia_publish::LeaseError::Sealed("wallet_lease.json is unreadable".into());
+        assert!(wallet_part(&funded, false, false, Some(&sealed), main(true, false)).note.contains("takes no spend"));
+        assert!(wallet_part(&empty, true, false, None, main(false, true)).note.contains("your mojo from the dish is on its way"));
     }
 
     #[test]
@@ -1347,6 +1429,8 @@ mod tests {
             wallet: None,
             #[cfg(feature = "chia-publish")]
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let reply = rt.block_on(handle_request(&ctx, "home-abc", br#"{"op":"status"}"#));
@@ -1434,7 +1518,9 @@ mod tests {
     /// after the reason this node holds no wallet. No wallet is held, so the
     /// wallet lease is never read, and `SSF_CHIA_LANE` comes from the
     /// context, never the environment. Mainnet makes an SSF wallet now, so
-    /// the dish points at the Bank there as on testnet11, for TAKE only.
+    /// the dish points at the Bank there as on testnet11, for TAKE only,
+    /// unless the Bank cannot bring one on (no live desktop app channel and
+    /// no wallet on disk): then it names the desktop app.
     #[test]
     fn a_mainnet_status_offers_no_give_and_says_why() {
         let params = test_params();
@@ -1451,6 +1537,8 @@ mod tests {
             wallet: None,
             #[cfg(feature = "chia-publish")]
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
@@ -1473,6 +1561,15 @@ mod tests {
                 "this node's SSF wallet is switched off (SSF_CHIA_LANE in its environment), so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
             );
             assert!(!st.can_give && !st.can_claim, "{st:?}");
+            // No live desktop app channel and no wallet on disk: the Bank
+            // offers no switch there, so the dish names the desktop app.
+            let app_only = FaucetContext { env: crate::chia_wallet_switch::EnvSwitch::Unset, turnable: false, ..off };
+            let st = rt.block_on(status(&app_only, &jar(), &params)).unwrap();
+            assert_eq!(
+                st.note,
+                "this node holds no SSF wallet, and on Chia mainnet it makes a new one only when the Star Station desktop app started it, so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
+            );
+            assert!(!st.note.contains("BANK"), "{}", st.note);
         }
         #[cfg(not(feature = "chia-publish"))]
         assert_eq!(
@@ -1481,6 +1578,42 @@ mod tests {
         );
         assert!(st.snapshot > 0, "numbered as it completed");
         assert!(!st.note.contains("no SSF wallet"), "{}", st.note);
+    }
+
+    /// The status a mainnet node with its SSF wallet on serves, end to end
+    /// through `status`, with the jar empty (as every mainnet jar is until
+    /// someone pays one): no GIVE, and a note that never speaks of giving.
+    /// An empty wallet hears that the jar is empty, not that it refills; a
+    /// funded one hears only the network's word. Nothing is parked in the
+    /// wallet lease, so it reads no chain.
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn a_mainnet_status_with_a_wallet_on_never_speaks_of_giving() {
+        let params = test_params();
+        let sk = chia_bls::SecretKey::from_seed(&[6u8; 32]);
+        let listing = |records: Vec<crate::chia_chain::CoinRecord>| crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at: None };
+        let ours = Coin::new(Bytes32::new([2u8; 32]), crate::chia_publish::our_puzzle_hash(&sk), 5_000);
+        let funded = crate::chia_chain::CoinRecord { coin: ours, confirmed_block_index: 150, spent: false, spent_block_index: 0 };
+        let rooms = Mutex::new(HashMap::new());
+        let ctx = FaucetContext {
+            net: ChiaNet::Mainnet,
+            rooms: &rooms,
+            wallet: Some(sk),
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            turnable: true,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // The jar's listing first, then the wallet's.
+        let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![])]).with_peak(200);
+        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
+        assert_eq!((st.coins, st.wallet_mojos), (0, Some(0)), "{st:?}");
+        assert!(!st.can_give && !st.can_claim, "{st:?}");
+        assert_eq!(st.note, "the jar is empty, so there is no mojo to take. On mainnet the dish does not take gifts from this node.");
+        let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![funded])]).with_peak(200);
+        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
+        assert_eq!(st.wallet_mojos, Some(5_000), "{st:?}");
+        assert!(!st.can_give && !st.can_claim, "a funded wallet still gives nothing on mainnet: {st:?}");
+        assert_eq!(st.note, MAINNET_NO_GIVE);
     }
 
     /// GIVE on mainnet is refused before the wallet or the chain is asked:
@@ -1497,6 +1630,8 @@ mod tests {
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
             #[cfg(feature = "chia-publish")]
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 1)).unwrap_err();
         assert_eq!(err.to_string(), MAINNET_NO_GIVE);
@@ -1508,6 +1643,8 @@ mod tests {
             wallet: None,
             #[cfg(feature = "chia-publish")]
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
         };
         assert_eq!(rt.block_on(give(&none, &chain, &test_params(), 1)).unwrap_err().to_string(), MAINNET_NO_GIVE);
         // Testnet11 gets past the network check: a gift too small to leave
@@ -1520,6 +1657,8 @@ mod tests {
             wallet: Some(chia_bls::SecretKey::from_seed(&[5u8; 32])),
             #[cfg(feature = "chia-publish")]
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 0)).unwrap_err().to_string();
         #[cfg(feature = "chia-publish")]

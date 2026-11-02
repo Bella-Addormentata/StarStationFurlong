@@ -18,6 +18,12 @@
 //! node started by hand in a terminal, never turns it on. Decided once at
 //! startup ([`init`]) and sticky for the run ([`started`]): a node started
 //! with the channel keeps refusing the page reveal after stdin closes.
+//! Whether the app can still be answered is a second answer, [`live`]: true
+//! from [`init`] while the channel serves, and false for good once its
+//! thread ends. A new wallet is made off a test network only while it is
+//! true (chia_wallet_switch::may_mint), so a node the app left running (a
+//! crash on Windows or macOS, where the node outlives the app) makes no
+//! wallet whose words nothing can show.
 //!
 //! While it is on, stdout carries only frames: the crate's `println!`
 //! (main.rs, before the first `mod`) writes to stderr instead.
@@ -35,11 +41,13 @@
 //! A line that is too long gets [`Refusal::TooLong`] and closes the channel:
 //! nothing more is answered, and the rest of stdin is read and dropped until
 //! EOF, so the app's writes never block on a full pipe. Bad JSON, another `v` or an unknown op get their own fixed refusal and the
-//! channel reads on. EOF ends the thread and nothing else. A refusal frame is
-//! a fixed sentence and never holds a word.
+//! channel reads on. EOF ends the thread, and the channel stops being
+//! [`live`]; the node runs on and the page reveal stays refused. A refusal
+//! frame is a fixed sentence and never holds a word.
 
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use zeroize::{Zeroize, Zeroizing};
@@ -59,6 +67,11 @@ static STARTED: OnceLock<bool> = OnceLock::new();
 /// Whether [`guard_pipes`] held, set once by [`init`] while the channel is on.
 static GUARDED: OnceLock<bool> = OnceLock::new();
 
+/// Whether the channel can still answer the app ([`live`]): set by the first
+/// [`init`] when the channel [`serves`], and cleared for good when its
+/// thread ends or cannot start ([`serve_until_closed`], [`spawn`]).
+static LIVE: AtomicBool = AtomicBool::new(false);
+
 /// Whether the channel is on, from the raw `SSF_SHELL_CHANNEL` and whether
 /// stdin and stdout are terminals. Exactly `1` and two pipes (or files): a
 /// terminal on either side is a person, not the app.
@@ -70,7 +83,9 @@ pub fn started_of(var: Option<&OsStr>, stdin_is_terminal: bool, stdout_is_termin
 /// network is chosen and before anything else prints or the wallet loads.
 /// Later calls return the first answer.
 pub fn init() -> bool {
+    let mut first = false;
     let on = *STARTED.get_or_init(|| {
+        first = true;
         started_of(
             std::env::var_os(CHANNEL_ENV).as_deref(),
             std::io::stdin().is_terminal(),
@@ -79,6 +94,11 @@ pub fn init() -> bool {
     });
     if on {
         GUARDED.get_or_init(guard_pipes);
+    }
+    // Only the first call: a later one must not bring back a channel whose
+    // thread already ended.
+    if first && serves(on, GUARDED.get().copied().unwrap_or(false)) {
+        LIVE.store(true, Ordering::SeqCst);
     }
     on
 }
@@ -111,6 +131,41 @@ pub fn serves(started: bool, guarded: bool) -> bool {
 /// then the same answer for the rest of the run.
 pub fn started() -> bool {
     STARTED.get().copied().unwrap_or(false)
+}
+
+/// Whether the desktop app's channel can answer the app right now: it
+/// [`serves`] (on and guarded) and its thread has not ended. Unlike
+/// [`started`] it does not stick: false before [`init`] (so in every test),
+/// and false for good once stdin reaches EOF, cannot be read, or the
+/// channel closes. This is what a mint asks (chia_wallet_switch::may_mint);
+/// the page reveal asks [`started`], which fails closed.
+pub fn live() -> bool {
+    LIVE.load(Ordering::SeqCst)
+}
+
+/// Clears its flag when dropped: at the end of [`serve_until_closed`],
+/// whether the loop returned or a panic unwound it.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// [`serve`], then mark the channel dead in `live`, however the loop ended
+/// (EOF, a read or write error, a line that was too long, or a panic in
+/// `answer`): the app can no longer be answered, so nothing may count on it
+/// to show the words. Generic over the pipes and the flag so the tests run
+/// it over memory.
+fn serve_until_closed<R: Read, W: Write>(
+    input: R,
+    out: W,
+    answer: impl FnMut(Op) -> Zeroizing<String>,
+    live: &AtomicBool,
+) -> End {
+    let _dead_after = ClearOnDrop(live);
+    serve(input, out, answer)
 }
 
 /// One request's op.
@@ -356,8 +411,8 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
         return;
     }
     let spawned = std::thread::Builder::new().name("ssf-shell-channel".into()).spawn(move || {
-        match serve(std::io::stdin().lock(), StdoutFrames, answer) {
-            End::Eof => eprintln!("🖥️ Desktop app channel: closed by the app; the node runs on, and the page still cannot show the 24 words"),
+        match serve_until_closed(std::io::stdin().lock(), StdoutFrames, answer, &LIVE) {
+            End::Eof => eprintln!("🖥️ Desktop app channel: closed by the app; the node runs on, makes no new wallet off a test network, and the page still cannot show the 24 words"),
             End::ReadFailed => eprintln!("🖥️ Desktop app channel: stdin could not be read, so the channel is closed"),
             End::TooLong => eprintln!("🖥️ Desktop app channel: a request line was longer than 1 KiB, so the channel is closed"),
             End::WriteFailed => eprintln!("🖥️ Desktop app channel: a reply could not be written, so the channel writes nothing more"),
@@ -365,7 +420,10 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
     });
     match spawned {
         Ok(_) => eprintln!("🖥️ Desktop app channel: on. The node's log goes to stderr, and only the desktop app shows the 24 words"),
-        Err(e) => eprintln!("🖥️ Desktop app channel: its thread could not start ({e}); the page still cannot show the 24 words"),
+        Err(e) => {
+            LIVE.store(false, Ordering::SeqCst);
+            eprintln!("🖥️ Desktop app channel: its thread could not start ({e}); the page still cannot show the 24 words");
+        }
     }
 }
 
@@ -455,6 +513,42 @@ mod tests {
     #[test]
     fn the_channel_is_off_until_init_runs() {
         assert!(!started());
+        assert!(!live(), "and so no mint counts on it");
+    }
+
+    /// The channel is live while its loop serves and dead once the loop
+    /// ends, however it ends: a mint that asks after the app went away
+    /// (stdin at EOF) is refused off a test network, while the sticky
+    /// [`started`] keeps the page reveal refused.
+    #[test]
+    fn the_channel_stops_being_live_when_its_loop_ends() {
+        let hello = b"{\"v\":1,\"id\":1,\"op\":\"hello\"}\n";
+        let mut too_long = vec![b'a'; MAX_LINE + 1];
+        too_long.push(b'\n');
+        // EOF after an answer: live while it answers, dead after.
+        let flag = AtomicBool::new(true);
+        let end = serve_until_closed(&hello[..], Vec::new(), |op| {
+            assert!(flag.load(Ordering::SeqCst), "live while it answers");
+            stub(op)
+        }, &flag);
+        assert_eq!(end, End::Eof);
+        assert!(!flag.load(Ordering::SeqCst), "EOF: the app went away");
+        assert!(!crate::chia_wallet_switch::may_mint(false, flag.load(Ordering::SeqCst)), "no mainnet mint after it");
+        // Every other end, too.
+        let ended = |run: &dyn Fn(&AtomicBool) -> End| {
+            let flag = AtomicBool::new(true);
+            (run(&flag), flag.load(Ordering::SeqCst))
+        };
+        assert_eq!(ended(&|f| serve_until_closed(&too_long[..], Vec::new(), stub, f)), (End::TooLong, false));
+        assert_eq!(ended(&|f| serve_until_closed(Unreadable, Vec::new(), stub, f)), (End::ReadFailed, false));
+        assert_eq!(ended(&|f| serve_until_closed(&hello[..], Broken, stub, f)), (End::WriteFailed, false));
+        // A panic in an answer unwinds the thread: the flag clears all the same.
+        let flag = AtomicBool::new(true);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_until_closed(&hello[..], Vec::new(), |_| panic!("an answer that panics"), &flag)
+        }));
+        assert!(caught.is_err());
+        assert!(!flag.load(Ordering::SeqCst), "a panic");
     }
 
     /// The crate's `println!` (main.rs, before the first `mod`) is the one

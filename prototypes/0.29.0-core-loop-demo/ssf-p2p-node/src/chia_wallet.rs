@@ -234,7 +234,7 @@ impl fmt::Debug for Revealed {
 ///
 /// With no identity on disk, a mint happens only when `may_mint`
 /// (chia_wallet_switch::may_mint: a test network, or the desktop app's
-/// channel on); otherwise the load refuses with [`MINT_NEEDS_APP`] and
+/// channel live); otherwise the load refuses with [`MINT_NEEDS_APP`] and
 /// writes no file. An identity on disk loads either way.
 pub fn load_or_mint_wallet(net: ChiaNet, identity: &Path, legacy: &Path, may_mint: bool) -> Result<WalletIdentity> {
     load_or_mint_wallet_with(net, identity, legacy, may_mint, chia_at_rest::os_store())

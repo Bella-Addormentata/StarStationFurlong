@@ -45,8 +45,9 @@
 //! is refused there for good ([`WordsRefusal::NativeOnly`]), before anything
 //! is read, whatever `SSF_BANK_DEV_PAGES` names, so only the desktop app's
 //! own window shows them. A new wallet is made there only while the desktop
-//! app's channel is on ([`may_mint`]), so no wallet exists whose words
-//! nothing can show; a wallet already on disk loads either way.
+//! app's channel is live ([`may_mint`], shell_channel::live: a channel whose
+//! app went away counts as off), so no wallet exists whose words nothing can
+//! show; a wallet already on disk loads either way.
 //!
 //! Everything a decision rests on is a pure function here, so the startup
 //! block, the loopback route and the fingerprint agree and are tested without
@@ -164,13 +165,19 @@ pub fn turn_refusal(built: bool, env: EnvSwitch, on: bool) -> Option<&'static st
 }
 
 /// What the faucet dish says when the node holds no wallet, for `doing`
-/// ("take or give", "take a mojo", "give"): where the switch is, or what
-/// holds it off.
+/// ("take or give", "take a mojo", "give"): where the switch is, what holds
+/// it off, or, where the Bank cannot bring one on (`turnable` is
+/// [`bank_can_turn_on`]: false off a test network with no live desktop app
+/// channel and no wallet on disk), who makes one on `net`.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn no_wallet_words(env: EnvSwitch, doing: &str) -> String {
+pub fn no_wallet_words(env: EnvSwitch, net: crate::chia_network::ChiaNet, turnable: bool, doing: &str) -> String {
     match env {
         EnvSwitch::Off => format!(
             "this node's SSF wallet is switched off (SSF_CHIA_LANE in its environment), so it cannot {doing}"
+        ),
+        _ if !turnable => format!(
+            "this node holds no SSF wallet, and on {} it makes a new one only when the Star Station desktop app started it, so it cannot {doing}",
+            net.name()
         ),
         _ => format!("this node's SSF wallet is not on yet: turn it on in the SpacePhone's 🏦 BANK to {doing}"),
     }
@@ -671,12 +678,22 @@ pub fn page_allowed(test_net: bool, channel: bool) -> bool {
 }
 
 /// Whether a load may mint a new wallet when none is on disk: on a test
-/// network, or while the desktop app's channel is on (the app can then show
-/// its words). A mainnet node the app did not start loads an identity that
-/// exists and never makes one.
+/// network, or while the desktop app's channel is live (`channel` is
+/// shell_channel::live, never the sticky `started`: the app can show the
+/// words only while it still holds the channel). A mainnet node the app did
+/// not start, or one the app left running, loads an identity that exists
+/// and never makes one.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub fn may_mint(test_net: bool, channel: bool) -> bool {
     test_net || channel
+}
+
+/// Whether the Bank's TURN ON or CREATE can bring a wallet on: a load may
+/// mint one ([`may_mint`]), or an identity is on disk to load. Off a test
+/// network with no live desktop app channel and no identity, it cannot.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn bank_can_turn_on(test_net: bool, channel: bool, identity_on_disk: bool) -> bool {
+    may_mint(test_net, channel) || identity_on_disk
 }
 
 /// 🏦 Where one words ask goes, decided against the loaded wallet: an answer
@@ -987,12 +1004,40 @@ mod tests {
 
     #[test]
     fn the_dish_points_at_the_bank_unless_the_environment_holds_the_wallet_off() {
-        let ready = no_wallet_words(EnvSwitch::Unset, "take or give");
+        use crate::chia_network::ChiaNet;
+        let ready = no_wallet_words(EnvSwitch::Unset, ChiaNet::Testnet11, true, "take or give");
         assert!(ready.contains("🏦 BANK") && ready.ends_with("to take or give"), "{ready}");
         assert!(!ready.contains("SSF_CHIA_LANE"), "a player is not told about environment variables: {ready}");
-        let off = no_wallet_words(EnvSwitch::Off, "give");
+        let off = no_wallet_words(EnvSwitch::Off, ChiaNet::Testnet11, true, "give");
         assert!(off.contains("SSF_CHIA_LANE") && off.ends_with("cannot give"), "{off}");
         assert!(!off.contains("BANK"), "the Bank cannot help under a hard off: {off}");
+        assert_eq!(no_wallet_words(EnvSwitch::Off, ChiaNet::Mainnet, false, "give"), off, "a hard off is the reason first");
+    }
+
+    /// 🖥️ Off a test network with no live desktop app channel and no
+    /// wallet on disk, the Bank offers no switch (bankWallet.ts
+    /// createInAppText), so the dish does not send the player there: it
+    /// says who makes one. A wallet on disk, or the app's channel, brings
+    /// the Bank back.
+    #[test]
+    fn the_dish_names_the_desktop_app_where_the_bank_cannot_make_a_wallet() {
+        use crate::chia_network::ChiaNet;
+        assert!(!bank_can_turn_on(false, false, false), "mainnet, no channel, nothing on disk");
+        assert!(bank_can_turn_on(false, false, true), "a wallet on disk loads");
+        assert!(bank_can_turn_on(false, true, false), "the app's channel mints");
+        assert!(bank_can_turn_on(true, false, false), "a test network mints");
+        for env in [EnvSwitch::Unset, EnvSwitch::On] {
+            let none = no_wallet_words(env, ChiaNet::Mainnet, bank_can_turn_on(false, false, false), "take a mojo");
+            assert_eq!(
+                none,
+                "this node holds no SSF wallet, and on Chia mainnet it makes a new one only when the Star Station desktop app started it, so it cannot take a mojo"
+            );
+            assert!(!none.contains("BANK"), "{none}");
+            for turnable in [bank_can_turn_on(false, false, true), bank_can_turn_on(false, true, false)] {
+                let bank = no_wallet_words(env, ChiaNet::Mainnet, turnable, "take a mojo");
+                assert_eq!(bank, "this node's SSF wallet is not on yet: turn it on in the SpacePhone's 🏦 BANK to take a mojo");
+            }
+        }
     }
 
     #[test]
@@ -1640,7 +1685,7 @@ mod tests {
         // `gated` was mainnet's state until the desktop app showed the words
         // itself; no network has it now.
         assert!(serde_json::from_str::<WalletSwitch>(r#"{"state":"gated"}"#).is_err());
-        let unset = no_wallet_words(Unset, "take a mojo");
+        let unset = no_wallet_words(Unset, ChiaNet::Mainnet, true, "take a mojo");
         assert_eq!(unset, "this node's SSF wallet is not on yet: turn it on in the SpacePhone's 🏦 BANK to take a mojo");
         assert!(!unset.contains("mainnet"), "{unset}");
     }
