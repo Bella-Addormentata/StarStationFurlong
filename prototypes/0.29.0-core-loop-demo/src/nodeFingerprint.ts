@@ -20,6 +20,8 @@
  * make from here.
  */
 
+import { isAddressOn, parseChiaNetwork, TESTNET11, type ChiaNetwork } from './chiaNetwork';
+
 export interface LocalFingerprint {
   hex: string;
   base64: string;
@@ -38,11 +40,18 @@ export interface LocalFingerprint {
    *  contact key and `SSF_CHIA_SHARE_CARD` not `0`). Absent from older nodes,
    *  which `nodeSharesCard` (roomCap.ts) reads as sharing. */
   share_card?: boolean;
-  /** ⛓️🏦 The node's testnet11 receive address (`txch1…`) while it has a
-   *  wallet loaded (the publish build with the SSF wallet on): where TXCH is
-   *  sent to fund the node's chain writes. Shown by the Bank app with COPY
-   *  and a QR code; absent from read-only nodes and older ones. Kept only
-   *  when it has the shape of a testnet11 address (`isTestnetAddress`). */
+  /** ⛓️ The Chia network the node runs on, always resolved: the page's own
+   *  row (chiaNetwork.ts) when the node's `chia_network` id and genesis both
+   *  match one, testnet11 when the node sends none (every node before stage
+   *  2), and `null` when it names a network this page does not know. Then
+   *  the page shows no address and says why. */
+  chia_net: ChiaNetwork | null;
+  /** ⛓️🏦 The node's receive address (`txch1…` on testnet11) while it has a
+   *  wallet loaded (the publish build with the SSF wallet on): where coins
+   *  are sent to fund the node's chain writes. Shown by the Bank app with
+   *  COPY and a QR code; absent from read-only nodes and older ones. Kept
+   *  only when it has the shape of an address on `chia_net` (`isAddressOn`),
+   *  so never on an unknown network. */
   chia_address?: string;
   /** 📖 How the node's Phone Book listing stands (its per-node presence
    *  record on Chia, #231 P6a), for the top bar's icon (phoneBook.ts): green
@@ -99,8 +108,9 @@ export interface ChiaPresence {
 
 /** 🏦 The SSF wallet switch's state: `unbuilt` (a node built without
  *  publishing), `off` (`SSF_CHIA_LANE` holds it off), `ready` (the Bank may
- *  turn it on), `on` (the wallet is loaded). */
-export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
+ *  turn it on), `on` (the wallet is loaded), `gated` (the node runs on Chia
+ *  mainnet, where it makes and loads no SSF wallet yet). */
+export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on' | 'gated';
 
 /** 🔒 How the wallet's file keeps its key on disk: `none` in the clear
  *  (owner-only on Unix), `dpapi` locked to this Windows account. */
@@ -155,7 +165,7 @@ const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up'
 const WALLET_AT_REST = ['at_rest', 'at_rest_next'] as const;
 const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'dpapi']);
 
-const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on']);
+const WALLET_STATES: ReadonlySet<string> = new Set<ChiaWalletState>(['unbuilt', 'off', 'ready', 'on', 'gated']);
 
 /** The node's `chia_wallet` in its own shape, or undefined for anything
  *  else: an unknown state, a flag that is not a boolean, or an error that is
@@ -212,17 +222,6 @@ export function parseChiaPresence(v: unknown): ChiaPresence | undefined {
   return p;
 }
 
-/** A testnet11 standard-puzzle address: the `txch` prefix, the bech32m
- *  separator and 58 bech32 characters (52 for 32 bytes of puzzle hash, 6 of
- *  checksum). The character set is bech32's (no `1`, `b`, `i`, `o`); the
- *  checksum itself is the node's to verify, this is the shape check that
- *  keeps a stray string out of the Bank app's QR. */
-const TESTNET_ADDRESS = /^txch1[02-9ac-hj-np-z]{58}$/;
-
-export function isTestnetAddress(v: unknown): v is string {
-  return typeof v === 'string' && TESTNET_ADDRESS.test(v);
-}
-
 const HEX_32 = /^[0-9a-f]{64}$/i;
 const BASE64_32 = /^[A-Za-z0-9+/]{43}=$/;
 
@@ -262,7 +261,9 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
     if (bytes[i] !== parseInt(hex.slice(i * 2, i * 2 + 2), 16)) return null;
   }
   if (!isPort(r.port)) return null;
-  const fp: LocalFingerprint = { hex, base64: r.base64, port: r.port };
+  // An absent `chia_network` is testnet11; one this page does not know is null.
+  const net = parseChiaNetwork(r.chia_network);
+  const fp: LocalFingerprint = { hex, base64: r.base64, port: r.port, chia_net: net === undefined ? TESTNET11 : net };
   if (typeof r.iroh_node_id === 'string') fp.iroh_node_id = r.iroh_node_id;
   const relays = stringArray(r.iroh_relay_urls);
   if (relays) fp.iroh_relay_urls = relays;
@@ -273,7 +274,7 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
     fp.iroh_port = r.iroh_port;
   }
   if (typeof r.share_card === 'boolean') fp.share_card = r.share_card;
-  if (isTestnetAddress(r.chia_address)) fp.chia_address = r.chia_address;
+  if (isAddressOn(fp.chia_net, r.chia_address)) fp.chia_address = r.chia_address;
   const presence = parseChiaPresence(r.chia_presence);
   if (presence) fp.chia_presence = presence;
   const wallet = parseChiaWallet(r.chia_wallet);

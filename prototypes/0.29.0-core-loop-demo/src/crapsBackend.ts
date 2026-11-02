@@ -325,7 +325,7 @@ function chiaBridge(): ChiaGamingBridge | null {
 
 class ChiaCrapsBackend implements CrapsBackend {
   readonly kind = 'chia' as const;
-  readonly label = 'Chia (testnet · coming soon)';
+  readonly label = 'Chia (coming soon)';
 
   isAvailable(): boolean {
     return chiaBridge() !== null;

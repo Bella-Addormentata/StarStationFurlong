@@ -14,7 +14,13 @@
 // The node words its own refusals (a build that only reads, `SSF_CHIA_LANE`
 // holding the wallet off or on); the page only says what it saw itself (no
 // answer, a timeout, an older node).
+//
+// ⛓️ The texts follow the node's Chia network (chiaNetwork.ts): a network
+// line above the switch, amber on mainnet, and no address at all on a
+// network this page does not know. On mainnet the node makes no SSF wallet
+// yet (`gated`), and the Bank offers no switch for it.
 
+import type { ChiaNetwork } from './chiaNetwork';
 import type { LocalFingerprint } from './nodeFingerprint';
 
 /** The page's own part: CREATE armed and waiting for CONFIRM, a request in
@@ -29,6 +35,11 @@ export interface BankWalletUi {
 export type BankWalletAct = 'arm' | 'confirm' | 'off' | 'keep';
 
 export interface BankWalletView {
+  /** ⛓️ The network line, above everything else: which Chia network the
+   *  node runs on and what its coins are. `warn` draws it amber (mainnet:
+   *  real money). None without a node, or on a network the page does not
+   *  know (`text` says so instead). */
+  network: { text: string; warn: boolean } | null;
   /** The line above the address, or instead of it. */
   text: string;
   /** A warning under it: what turning on means, before CONFIRM. */
@@ -54,35 +65,70 @@ export const BANK_WALLET_BUTTON_ID = 'bank-wallet-switch';
  *  saves the switch, which is quick unless a chain read holds the gate. */
 export const TURN_TIMEOUT_MS = 45_000;
 
-const TURN_ON_WARNING =
-  'Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address, and once the wallet holds a coin it lists itself in the Phone Book on the test chain. Tap CONFIRM.';
-const CREATE_WARNING =
-  'Create an SSF wallet? Your node makes a new testnet11 key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin (one mojo from the faucet dish is enough) it lists itself in the Phone Book on the test chain. Tap CONFIRM.';
+const TURN_ON_WARNING = (net: ChiaNetwork): string =>
+  `Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address, and once the wallet holds a coin it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
+const CREATE_WARNING = (net: ChiaNetwork): string =>
+  `Create an SSF wallet? Your node makes a new ${net.name} key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin (one mojo from the faucet dish is enough) it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
 /** CREATE on a node older than the 24 words (#352's), which never says
  *  `mnemonic`: its wallet is a raw key, which the next update replaces. */
-const CREATE_OLDER_NODE_WARNING =
-  "Your station node is older than the Bank's 24-word backup: it makes a testnet11 key you cannot write down, and updating Star Station later replaces that wallet with a new one at a new address. Update Star Station first, or tap CONFIRM to create it anyway.";
-const CREATE_LEGACY_WARNING =
-  "Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its testnet coins stay at its old address), makes a new testnet11 key from 24 words at a new address, and shows you the words to write down. Once the new wallet holds a coin it lists itself in the Phone Book on the test chain. Tap CONFIRM.";
-const REMINTED =
-  "Your node replaced its old SSF wallet with a new one made from 24 words, at a new address. The old wallet's testnet coins stay at its old address. Until the new one holds a coin, your node is not listed in the Phone Book.";
+const CREATE_OLDER_NODE_WARNING = (net: ChiaNetwork): string =>
+  `Your station node is older than the Bank's 24-word backup: it makes a ${net.name} key you cannot write down, and updating Star Station later replaces that wallet with a new one at a new address. Update Star Station first, or tap CONFIRM to create it anyway.`;
+const CREATE_LEGACY_WARNING = (net: ChiaNetwork): string =>
+  `Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its ${net.coins} stay at its old address), makes a new ${net.name} key from 24 words at a new address, and shows you the words to write down. Once the new wallet holds a coin it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
+const REMINTED = (net: ChiaNetwork): string =>
+  `Your node replaced its old SSF wallet with a new one made from 24 words, at a new address. The old wallet's ${net.coins} stay at its old address. Until the new one holds a coin, your node is not listed in the Phone Book.`;
+
+/** ⛓️ The network line: what the node's coins are. */
+export function networkLine(net: ChiaNetwork): { text: string; warn: boolean } {
+  return net.test
+    ? { text: `Network: ${net.name}. Its coins (${net.ticker}) are free test coins.`, warn: false }
+    : { text: `Network: ${net.name}. Its coins (${net.ticker}) are real money.`, warn: true };
+}
+
+/** The node runs on Chia mainnet (or another network that is not a test
+ *  one), where it makes no SSF wallet yet. */
+export const GATED_TEXT = 'Star Station does not make SSF wallets on Chia mainnet yet. Your node only reads the chain here.';
+/** The node names a network this page does not know. */
+export const UNKNOWN_NETWORK_TEXT = 'Your node runs on a Chia network this page does not know, so the Bank shows no address.';
+
+/** ⛓️ The note under RECEIVE's address, one per network: what to pay it
+ *  with, and what one coin buys. `lead` is drawn bold. */
+export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
+  return net.test
+    ? {
+      lead: `${net.name} only.`,
+      text: `Scan the code or paste the address in a ${net.name} wallet (a testnet faucet gives ${net.ticker} for free). One coin pays this node's chain writes (presence, knocks, the dish) for good, since every write is a zero-fee spend to self. A mainnet wallet refuses a ${net.prefix} address, so real XCH cannot land here by mistake.`,
+    }
+    : {
+      lead: `Real ${net.ticker}.`,
+      text: `This address takes real ${net.ticker} on ${net.name}. Scan the code or paste the address in a Chia wallet set to mainnet. Your node spends from it to write to the chain, so send only a little.`,
+    };
+}
 
 /** What the Bank's RECEIVE section shows about the wallet. */
 export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: BankWalletUi): BankWalletView {
-  const none = { warning: null, notice: null, button: null } as const;
   if (!fp) {
-    return { ...none, text: 'Your station node is not answering, so there is no wallet to show.', error: null, showsAddress: false };
+    return { network: null, warning: null, notice: null, button: null, text: 'Your station node is not answering, so there is no wallet to show.', error: null, showsAddress: false };
   }
   const w = fp.chia_wallet;
   const error = ui.error ?? w?.error ?? null;
+  const net = fp.chia_net;
+  // A network this page does not know: no address (the fingerprint parse
+  // keeps none), no switch, and the reason.
+  if (!net) return { network: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };
+  const none = { network: networkLine(net), warning: null, notice: null, button: null } as const;
+  // Mainnet: the node makes and loads no SSF wallet, so there is nothing to
+  // turn and no address to pay.
+  if (w?.state === 'gated') return { ...none, text: GATED_TEXT, error: null, showsAddress: false };
   if (fp.chia_address) {
     if (!w) return { ...none, text: '', error: null, showsAddress: true };
-    const notice = w.state === 'on' && w.reminted ? REMINTED : null;
+    const notice = w.state === 'on' && w.reminted ? REMINTED(net) : null;
     if (w.held) {
       return { ...none, notice, text: "SSF wallet on — SSF_CHIA_LANE=1 in your node's environment holds it on.", error, showsAddress: true };
     }
     if (w.stays) {
       return {
+        network: none.network,
         warning: null,
         notice,
         text: 'SSF wallet on — it comes back on whenever your node starts.',
@@ -92,6 +138,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       };
     }
     return {
+      network: none.network,
       warning: null,
       notice,
       text: 'SSF wallet on until your node stops: it is turned off, so it does not come back at the next start.',
@@ -114,21 +161,22 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
     case 'off':
       return { ...none, text: "Your station node's SSF wallet is switched off by SSF_CHIA_LANE in its environment, so the Bank cannot turn it on.", error: null, showsAddress: false };
     case 'on':
-      // On, but the address did not read as a testnet11 one: nothing to pay.
-      return { ...none, text: "Your node's SSF wallet is on, but its address did not read as a testnet11 address, so it is not shown.", error, showsAddress: false };
+      // On, but the address did not read as one of this network's: nothing to pay.
+      return { ...none, text: `Your node's SSF wallet is on, but its address did not read as a ${net.name} address, so it is not shown.`, error, showsAddress: false };
     case 'ready': {
       const label = w.seed ? 'TURN ON SSF WALLET' : 'CREATE SSF WALLET';
       // A raw-seed wallet from before the 24 words is retired, not loaded:
       // that is a CREATE, with its own warning, never a TURN ON.
       const legacy = !w.seed && w.legacy === true;
       if (ui.turning) {
-        return { warning: null, notice: null, text: 'Turning your SSF wallet on…', error: null, button: { act: 'confirm', label: 'TURNING ON…', danger: false, busy: true }, showsAddress: false };
+        return { network: none.network, warning: null, notice: null, text: 'Turning your SSF wallet on…', error: null, button: { act: 'confirm', label: 'TURNING ON…', danger: false, busy: true }, showsAddress: false };
       }
       if (ui.armed) {
         return {
+          network: none.network,
           text: 'Your station node has no SSF wallet on yet, so there is no address to pay.',
           // Only a node that says `mnemonic` makes its wallet from 24 words.
-          warning: w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : w.mnemonic === true ? CREATE_WARNING : CREATE_OLDER_NODE_WARNING,
+          warning: (w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : w.mnemonic === true ? CREATE_WARNING : CREATE_OLDER_NODE_WARNING)(net),
           notice: null,
           error,
           button: { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false },
@@ -136,6 +184,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
         };
       }
       return {
+        network: none.network,
         warning: null,
         notice: null,
         text: w.seed

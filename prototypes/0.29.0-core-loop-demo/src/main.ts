@@ -287,7 +287,7 @@ import { forgetMediaConsent, setNodeMediaOrigin, setOwnMediaOrigins } from "./tv
 import { setBlobLaneNode, setBlobLaneRoom } from "./blobLane";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { BANK_WALLET_BUTTON_ID, bankWalletView, turnSsfWallet } from "./bankWallet";
+import { BANK_WALLET_BUTTON_ID, bankWalletView, receiveNote, turnSsfWallet } from "./bankWallet";
 import {
   BACKUP_COPY_ID, BACKUP_GRID_ID, BACKUP_ID, BACKUP_IDLE, BACKUP_LATER_ID, BACKUP_SAVED_ID, BACKUP_SHOW_ID,
   afterAddressCopy, afterCopy, afterWipe, applyReveal, applySave, armSave, backupGridHtml, backupPageKind,
@@ -4986,9 +4986,9 @@ function harvestStationAtlas(): void {
 }
 
 // ── 🏦 BANK app (#20, de-stubbed with #68) ───────────────────────────────────
-// Your ACCOUNT (identity card), RECEIVE (where TXCH is sent to your station
-// node's wallet: its address with COPY and a QR code, and the balance the
-// node reads), your PORTFOLIO (venture stakes), and the Registry status. The
+// Your ACCOUNT (identity card), RECEIVE (where coins are sent to your station
+// node's wallet on its Chia network: its address with COPY and a QR code,
+// and the balance the node reads), your PORTFOLIO (venture stakes), and the Registry status. The
 // address comes from the node's loopback fingerprint, only while it has a
 // wallet loaded; the balance is the wallet half of the faucet dish's status
 // answer, so the panel shows a number the node read and says when it has
@@ -5136,7 +5136,7 @@ async function revealBankBackup(): Promise<void> {
   if (!started || !started.ui.address) return;
   setBankBackup(started.ui);
   renderBankApp();
-  const r = await revealWords(localNodeLive ? localNodeOrigin : "", started.ui.address);
+  const r = await revealWords(localNodeLive ? localNodeOrigin : "", started.ui.address, localFingerprint?.chia_net);
   setBankBackup(applyReveal(bankBackup, started.ticket, r, bankViewOnScreen(), performance.now()));
   if (!r.ok && r.refresh) await refreshLocalFingerprint();
   renderBankApp();
@@ -5161,7 +5161,7 @@ async function saveBankBackup(): Promise<void> {
   const started = beginBankSave();
   if (!started) return;
   renderBankApp();
-  const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", started.key);
+  const r = await markWordsSaved(localNodeLive ? localNodeOrigin : "", started.key, localFingerprint?.chia_net);
   const landed = bankBackup.saving && bankBackup.saveTicket === started.ticket;
   setBankBackup(applySave(bankBackup, started.ticket, r, performance.now()));
   if (r.ok || r.refresh) await refreshLocalFingerprint();
@@ -5261,7 +5261,7 @@ function renderBankApp(): void {
     </div>
     ${header("RECEIVE")}
     ${(() => {
-      // 🏦 Deposits: the node's testnet11 receive address as a QR code and as
+      // 🏦 Deposits: the node's receive address on its network as a QR code and as
       // text, the way the faucet dish shows the jar's and XOPTrader's wallet
       // page shows its Base address. The code carries the bare address (no URI
       // scheme: wallet apps read a bare address, schemes are parsed
@@ -5280,7 +5280,11 @@ function renderBankApp(): void {
         bankWalletShownAct = b?.act ?? null;
         bankWalletChangedAt = performance.now();
       }
-      const switchHtml = `
+      // ⛓️ The network line above the switch, amber on mainnet (real money).
+      const networkHtml = wv.network
+        ? `<div id="bank-network" style="font-size:9.5px; margin-top:5px; line-height:1.6; color:${wv.network.warn ? "#ffb300" : "rgba(212,168,75,0.6)"};${wv.network.warn ? " font-weight:800;" : ""}">${esc(wv.network.text)}</div>`
+        : "";
+      const switchHtml = `${networkHtml}
         ${wv.text || b ? `<div style="display:flex; gap:8px; align-items:center; margin-top:5px;">
           <span style="flex:1; min-width:0; font-size:10px; color:rgba(212,168,75,${wv.showsAddress ? "0.7" : "0.5"}); line-height:1.6;">${esc(wv.text)}</span>
           ${b ? `<button type="button" id="${BANK_WALLET_BUTTON_ID}" data-act="${b.act}"${b.busy ? ' aria-disabled="true" aria-busy="true"' : ""} style="${btnStyle(false)}${b.danger ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}${b.busy ? " cursor:progress; opacity:0.7;" : ""}">${esc(b.label)}</button>` : ""}
@@ -5337,9 +5341,13 @@ function renderBankApp(): void {
         return `${switchHtml}${backupHtml}`;
       }
       const addr = liveFp?.chia_address;
-      if (!addr || !wv.showsAddress) return `${switchHtml}${backupHtml}`;
+      const net = liveFp?.chia_net;
+      if (!addr || !net || !wv.showsAddress) return `${switchHtml}${backupHtml}`;
       const roomId = activeBootstrap?.roomId ?? null;
-      const st = roomId ? latestFaucetStatus(roomId) : null;
+      // A status read on another network than the node's (a node restarted
+      // on another chain, not yet re-read) is no balance of this address.
+      const roomSt = roomId ? latestFaucetStatus(roomId) : null;
+      const st = roomSt && roomSt.net?.id === net.id ? roomSt : null;
       const err = roomId ? latestFaucetError(roomId) : null;
       const owned = st?.walletMojos ?? null;
       const spendable = st?.walletSpendableMojos ?? owned;
@@ -5352,9 +5360,10 @@ function renderBankApp(): void {
         ? "shown once you are in a room (your node answers over the room's link)"
         : owned === null
           ? err ? "not read yet" : "reading the chain…"
-          : `${formatMojos(owned)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
+          : `${formatMojos(owned, net.ticker)}${st?.walletPartial ? "+ (listing cut short; it holds more)" : ""}${confirming > 0n ? ` (${formatMojos(confirming, net.ticker)} still confirming)` : ""}${err ? " (as of the last successful read)" : ""}`;
+      const note = receiveNote(net);
       return `${switchHtml}${backupHtml}
-        <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: "QR code of this node's testnet11 address" })}</div>
+        <div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(addr, { module: 3, dark: "#040816", light: "#f0c060", label: `QR code of this node's ${net.name} address` })}</div>
         <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
           <code id="bank-address" style="flex:1; font-size:8.5px; color:#f0c060; word-break:break-all; user-select:all;">${esc(addr)}</code>
           <button type="button" id="bank-copy-address" aria-label="Copy the address" style="${btnStyle(bankAddressCopied)}">${bankAddressCopied ? "COPIED" : "COPY"}</button>
@@ -5365,10 +5374,7 @@ function renderBankApp(): void {
         </div>
         ${err ? `<div style="font-size:8.5px; color:#f0a060; margin-top:4px; line-height:1.6;">Your node's last answer: ${esc(err)}</div>` : ""}
         <div style="font-size:8.5px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
-          <span style="color:#f0c060; font-weight:800;">testnet11 only.</span> Scan the code or paste the address in a testnet11
-          wallet (a testnet faucet gives TXCH for free). One coin pays this node's chain writes — presence, knocks, the
-          dish — for good, since every write is a zero-fee spend to self. A mainnet wallet refuses a <code>txch</code>
-          address, so real XCH cannot land here by mistake.
+          <span style="color:${net.test ? "#f0c060" : "#ffb300"}; font-weight:800;">${esc(note.lead)}</span> ${esc(note.text)}
         </div>`;
     })()}
     ${header("PORTFOLIO")}
@@ -9403,7 +9409,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // 🏦 The Bank's RECEIVE reads the address and the wallet switch from the
   // fingerprint: repaint it while open when either changed (a wallet turned
   // on or off here, or by SSF_CHIA_LANE at the node's restart).
-  const bankSaw = JSON.stringify([localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
   localNodeOrigin = nodeOrigin;
@@ -9413,7 +9419,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen()));
   if (
     backupMoved ||
-    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
+    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
       document.getElementById("phone-app-bank")?.classList.contains("active"))
   ) {
     renderBankApp();
@@ -9915,7 +9921,7 @@ function setupNetworkDetailsPanel() {
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a testnet coin; chain reads are on for every node, and public rooms never publish)."
+          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish)."
           : "Advanced Chia mesh mode OFF for this room.";
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
@@ -11274,6 +11280,8 @@ async function init() {
     if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
   });
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
+  world.faucetChiaNet = () => localFingerprint?.chia_net;
   networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
     // Only the room open right now is filed: the store drops a reply for a

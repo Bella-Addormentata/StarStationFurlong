@@ -11,10 +11,20 @@
  *
  * Owner rule, kept: in the room the jar is a LEVEL, never a total — the exact
  * mojos appear only on the focused screen, like the cashier's chip count.
+ *
+ * ⛓️ Each status names the node's Chia network (`network`, absent from older
+ * nodes, which run on testnet11). The ticker and whether the dish takes gifts
+ * and shows the jar's address come from it (chiaNetwork.ts).
  */
 
+import { MOJOS_PER_COIN, networkOfId, type ChiaNetwork } from './chiaNetwork';
+
 export interface FaucetStatus {
-  /** `txch1…` address of this room's faucet (bech32m of puzzleHash). */
+  /** ⛓️ The Chia network the node read this on: testnet11 when the node
+   *  does not say, null when it names one this page does not know. */
+  net: ChiaNetwork | null;
+  /** Address of this room's faucet (bech32m of puzzleHash; `txch1…` on
+   *  testnet11). */
   address: string;
   puzzleHash: string;
   /** Mojos per claim and blocks between claims of one coin (puzzle constants). */
@@ -133,6 +143,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
   const spendable = optMojos(r.walletSpendableMojos);
   if (spendable === undefined) return null;
   return {
+    net: networkOfId(r.network),
     address: r.address,
     puzzleHash: r.puzzleHash,
     gift: r.gift as number,
@@ -191,19 +202,18 @@ export function blocksToMinutes(blocks: number): number {
   return Math.max(1, Math.round((blocks * SECONDS_PER_BLOCK) / 60));
 }
 
-const MOJOS_PER_TXCH = 1_000_000_000_000n;
-
-/** Mojos for the focused screen: thousands grouped; TXCH alongside from 1e9.
- *  Exact at any size (digit strings, no floating point). */
-export function formatMojos(mojos: bigint | number): string {
+/** Mojos for the focused screen: thousands grouped; the network's coin
+ *  (`ticker`: TXCH, XCH) alongside from 1e9, and none when the network is
+ *  not known (null). Exact at any size (digit strings, no floating point). */
+export function formatMojos(mojos: bigint | number, ticker: string | null): string {
   const n = typeof mojos === 'bigint' ? (mojos < 0n ? 0n : mojos) : BigInt(Math.max(0, Math.floor(mojos)));
   const grouped = n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   const unit = n === 1n ? 'mojo' : 'mojos';
-  if (n >= 1_000_000_000n) {
-    const whole = n / MOJOS_PER_TXCH;
-    const frac = (n % MOJOS_PER_TXCH).toString().padStart(12, '0');
+  if (ticker !== null && n >= 1_000_000_000n) {
+    const whole = n / MOJOS_PER_COIN;
+    const frac = (n % MOJOS_PER_COIN).toString().padStart(12, '0');
     const shown = whole >= 1n ? `${whole}.${frac.slice(0, 3)}` : `0.${frac.slice(0, 6).replace(/0+$/, '') || '0'}`;
-    return `${grouped} ${unit} (${shown} TXCH)`;
+    return `${grouped} ${unit} (${shown} ${ticker})`;
   }
   return `${grouped} ${unit}`;
 }
@@ -349,9 +359,21 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  then, but the action stands.
  *
  *  Only the open room's replies are filed (see openFaucetRoom); any other
- *  room's are dropped here, whatever the caller. */
+ *  room's are dropped here, whatever the caller.
+ *
+ *  ⛓️ A status on another Chia network than the one on file (the node was
+ *  restarted on another network) clears the room's dish first: the old
+ *  status, its snapshot numbering, its error and its pending action all
+ *  belong to the other chain. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (roomId !== openRoom) return;
+  const before = latest.get(roomId);
+  if (reply.status && before && netKey(before.net) !== netKey(reply.status.net)) {
+    latest.delete(roomId);
+    latestSnapshot.delete(roomId);
+    lastError.delete(roomId);
+    pending.delete(roomId);
+  }
   const p = pending.get(roomId);
   // This action's own reply: the one echoing its seq, under its op or under
   // '?' (refused before the op was read).
@@ -410,6 +432,9 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
   }
   notify();
 }
+
+/** A network's id for comparing statuses, `?` for one this page does not know. */
+const netKey = (net: ChiaNetwork | null): string => net?.id ?? '?';
 
 /** A request never reached the node (no connection, a failed stream): no spend
  *  was made, so the pending TAKE/GIVE it was for (`seq`) is dropped at once,

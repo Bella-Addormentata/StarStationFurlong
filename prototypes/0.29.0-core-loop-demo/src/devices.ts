@@ -265,7 +265,7 @@ import {
   type FaucetOp,
   type FaucetRequestTicket,
 } from './faucetDish';
-import { isTestnetAddress } from './nodeFingerprint';
+import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
 import { qrSvg } from './qrCode';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
@@ -4611,15 +4611,22 @@ export interface FaucetDishUIDeps {
   /** Send a status / take / give request to the local node (NetworkProvider):
    *  the ticket's `seq` is what the node echoes on the reply. */
   request: (op: FaucetOp, amount?: number) => FaucetRequestTicket;
+  /** The network the local node's fingerprint resolved (`chia_net`):
+   *  `undefined` while no fingerprint has been read, `null` for an id and
+   *  genesis pair this page does not know. A status's network is used only
+   *  when it is the same row; before the first status this one names the
+   *  network the slot is drawn for. */
+  chiaNet: () => ChiaNetwork | null | undefined;
 }
 
-/** Give buttons, in mojos. The lobby gift is one mojo, so 1,000 mojos is a
- *  thousand gifts; the largest button, 0.001 TXCH (a billion mojos), is still
- *  small change on testnet11. */
-export const FAUCET_GIVE_AMOUNTS: ReadonlyArray<{ mojos: number; label: string }> = [
-  { mojos: 1_000, label: '+1,000 MOJOS' },
-  { mojos: 1_000_000, label: '+1,000,000' },
-  { mojos: 1_000_000_000, label: '+0.001 TXCH' },
+/** Give buttons, in mojos, labelled with the network's ticker. The lobby
+ *  gift is one mojo, so 1,000 mojos is a thousand gifts; the largest button,
+ *  0.001 TXCH (a billion mojos), is still small change on testnet11. Only a
+ *  test network has them: on mainnet the dish takes no gifts. */
+export const FAUCET_GIVE_AMOUNTS: ReadonlyArray<{ mojos: number; label: (ticker: string) => string }> = [
+  { mojos: 1_000, label: () => '+1,000 MOJOS' },
+  { mojos: 1_000_000, label: () => '+1,000,000' },
+  { mojos: 1_000_000_000, label: (ticker) => `+0.001 ${ticker}` },
 ];
 
 /** While the screen is open, re-read the chain this often (reads are free). */
@@ -4631,6 +4638,15 @@ const FAUCET_SCREEN_POLL_MS = 20_000;
  * TAKE A MOJO (a keyless claim the node submits, only while our wallet is
  * empty) and GIVE (a fee-0 spend from our wallet into the jar). Everything
  * shown comes from the node's last `faucet` reply; nothing here touches keys.
+ *
+ * ⛓️ The slot (GIVE, the pay-in line, the QR code and the jar's address)
+ * shows only on a test network: the status's network when the fingerprint
+ * names the same one (or no fingerprint was read), the fingerprint's before
+ * the first status. Before a status the slot's buttons are disabled and no
+ * address shows. On mainnet the game never asks for real XCH: the slot says
+ * the dish takes no gifts. On a network this page does not know, or a status
+ * whose network is not the fingerprint's, it says why no address shows. The
+ * address, the QR code and COPY show only for an address on that network.
  */
 export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
@@ -4673,8 +4689,23 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // an earlier spend); the balance line shows what the wallet owns.
     const spendable = st?.walletSpendableMojos ?? wallet;
     const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
+    // ⛓️ The network: the ticker, and whether the slot shows at all. A status's
+    // network counts only when the fingerprint resolved the same row (or none
+    // was read); a genesis mismatch or a different id leaves it unknown. Before
+    // the first status the fingerprint's network is used, and while neither
+    // has been read the slot is not drawn.
+    const fpNet = deps.chiaNet();
+    const net: ChiaNetwork | null = st
+      ? (st.net && (fpNet === undefined || fpNet?.id === st.net.id) ? st.net : null)
+      : (fpNet ?? null);
+    const netKnown = st !== null || fpNet !== undefined;
+    const ticker = net?.ticker ?? null;
+    const slotOpen = net?.test === true;
+    // The jar's address is shown, put in a QR code or copied only when it is
+    // an address on that network.
+    const payIn = !!st && slotOpen && isAddressOn(net, st.address);
     const canTake = !!st?.canClaim && pending === null;
-    const canGive = (mojos: number): boolean => !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
+    const canGive = (mojos: number): boolean => slotOpen && !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
     // A push the gateway never answered: the node keeps the spend's coins
     // parked and the action pending until the chain or the mempool settles it,
     // and the screen says so instead of reading a refusal (#245 review, round 14).
@@ -4699,9 +4730,9 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="height:8px; border:1px solid rgba(212,168,75,0.35); border-radius:4px; overflow:hidden; margin-bottom:6px;">
           <div style="height:100%; width:${Math.round(level * 100)}%; background:${CH_GOLD};"></div>
         </div>
-        ${st ? row('IN THE JAR', st.partial ? `${formatMojos(st.totalMojos)}+ (listing cut short; the jar holds more)` : formatMojos(st.totalMojos)) : ''}
+        ${st ? row('IN THE JAR', st.partial ? `${formatMojos(st.totalMojos, ticker)}+ (listing cut short; the jar holds more)` : formatMojos(st.totalMojos, ticker)) : ''}
         ${st ? row('GIFT SLOTS (COINS)', st.partial ? `${st.coins}+ (listing cut short; the jar holds more)` : String(st.coins)) : ''}
-        ${st ? row('EACH GIFT', `${formatMojos(st.gift)} · one per coin every ${st.gap} blocks`) : ''}
+        ${st ? row('EACH GIFT', `${formatMojos(st.gift, ticker)} · one per coin every ${st.gap} blocks`) : ''}
         ${st ? row('CHAIN HEIGHT', String(st.peak)) : row('CHAIN', 'reading…')}
       </div>
       <div>
@@ -4709,25 +4740,32 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
         <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
           ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
-          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming)} still confirming a spend)` : ''}.` : ''}
+          ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet, ticker)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming, ticker)} still confirming a spend)` : ''}.` : ''}
         </div>
       </div>
-      <div>
+      ${!netKnown ? '' : slotOpen && net ? `<div>
         <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE SLOT — GIVE</div>
         <div style="display:flex; gap:8px;">
-          ${FAUCET_GIVE_AMOUNTS.map((g, i) => btn(`faucet-give-${i}`, g.label, !canGive(g.mojos))).join('')}
+          ${FAUCET_GIVE_AMOUNTS.map((g, i) => btn(`faucet-give-${i}`, g.label(net.ticker), !canGive(g.mojos))).join('')}
         </div>
-        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
-          Or pay into the jar from any Chia wallet (testnet11): scan the code or copy the address.
+        ${st && !payIn ? `<div id="faucet-bad-address" style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          The node sent a jar address that is not on ${escapeHtml(net.name)}, so the dish shows no address.
+        </div>` : `<div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          Or pay into the jar from any Chia wallet (${escapeHtml(net.name)}): scan the code or copy the address.
         </div>
-        ${st && isTestnetAddress(st.address) ? `<div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(st.address, { module: 2, dark: '#040816', light: CH_GOLD, label: 'QR code of the jar\'s testnet11 address' })}</div>` : ''}
+        ${st && payIn ? `<div style="display:flex; justify-content:center; margin-top:6px;">${qrSvg(st.address, { module: 2, dark: '#040816', light: CH_GOLD, label: `QR code of the jar's ${net.name} address` })}</div>` : ''}
         <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
-          <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st ? escapeHtml(st.address) : '…'}</code>
-          ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !st)}
+          <code id="faucet-address" style="flex:1; font-size:8.5px; color:${CH_GOLD}; word-break:break-all; user-select:all;">${st && payIn ? escapeHtml(st.address) : '…'}</code>
+          ${btn('faucet-copy', copied ? 'COPIED' : 'COPY', !payIn)}
+        </div>`}
+      </div>` : `<div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE SLOT</div>
+        <div id="faucet-no-slot" style="font-size:9px; color:${CH_DIM}; line-height:1.5;">
+          ${net ? `On ${escapeHtml(net.name)} the dish takes no gifts.` : 'Your node runs on a Chia network this page does not know, so the dish shows no address.'}
         </div>
-      </div>
+      </div>`}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF FAUCET DISH v1 · a keyless Chia coin per room · one gift per coin per ${st?.gap ?? 32} blocks · testnet11
+        SSF FAUCET DISH v1 · a keyless Chia coin per room · one gift per coin per ${st?.gap ?? 32} blocks${net ? ` · ${escapeHtml(net.name)}` : ''}
       </div>
     `;
     // A TAKE or GIVE is pending from the click until a status shows it landed
@@ -4755,7 +4793,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => send('give', g.mojos));
     });
     panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
-      if (!st) return;
+      if (!st || !slotOpen || !isAddressOn(net, st.address)) return;
       void navigator.clipboard?.writeText(st.address).then(() => {
         copied = true;
         render();

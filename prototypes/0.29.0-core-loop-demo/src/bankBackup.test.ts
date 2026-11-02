@@ -48,9 +48,10 @@ import {
   type RevealResult,
 } from './bankBackup';
 import { BANK_WALLET_BUTTON_ID } from './bankWallet';
+import { MAINNET, TESTNET11, addressOn } from './chiaNetwork';
 import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
-const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443 };
+const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
 const ADDR = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
 const OTHER = 'txch1' + 'zry9x8gf2tvdw0s3jn54khce6mua7lqp'.repeat(2).slice(0, 58);
 const node = (chia_wallet?: ChiaWalletSwitch, chia_address?: string): LocalFingerprint => ({
@@ -454,7 +455,7 @@ const answer = (status: number, body: unknown): Response =>
   new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
 const ORIGIN = 'http://127.0.0.1:8081';
 const good = { ok: true, words: WORDS, key: KEY, address: ADDR };
-const revealWith = (res: Response) => revealWords(ORIGIN, ADDR, (async () => res) as unknown as typeof fetch);
+const revealWith = (res: Response) => revealWords(ORIGIN, ADDR, TESTNET11, (async () => res) as unknown as typeof fetch);
 
 describe('revealWords', () => {
   afterEach(() => {
@@ -463,7 +464,7 @@ describe('revealWords', () => {
 
   it('POSTs a simple, uncached request to the node\'s own origin, refusing redirects', async () => {
     const fetchImpl = vi.fn(async () => answer(200, good));
-    expect(await revealWords(ORIGIN, ADDR, fetchImpl as unknown as typeof fetch)).toEqual({ ok: true, words: WORDS, key: KEY, address: ADDR });
+    expect(await revealWords(ORIGIN, ADDR, TESTNET11, fetchImpl as unknown as typeof fetch)).toEqual({ ok: true, words: WORDS, key: KEY, address: ADDR });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('http://127.0.0.1:8081/api/chia/words');
@@ -525,15 +526,15 @@ describe('revealWords', () => {
 
   it('never throws: no origin, an unreachable node, or no answer in time', async () => {
     const never = vi.fn();
-    expect(await revealWords('', ADDR, never as unknown as typeof fetch)).toMatchObject({ ok: false, error: 'your station node is not answering, so the words are not shown' });
+    expect(await revealWords('', ADDR, TESTNET11, never as unknown as typeof fetch)).toMatchObject({ ok: false, error: 'your station node is not answering, so the words are not shown' });
     expect(never).not.toHaveBeenCalled();
     const unreachable = async () => { throw new TypeError('Failed to fetch'); };
-    expect(await revealWords(ORIGIN, ADDR, unreachable as unknown as typeof fetch)).toMatchObject({ ok: false, error: 'your station node could not be reached, so the words are not shown' });
+    expect(await revealWords(ORIGIN, ADDR, TESTNET11, unreachable as unknown as typeof fetch)).toMatchObject({ ok: false, error: 'your station node could not be reached, so the words are not shown' });
     vi.useFakeTimers();
     const hangs = (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     });
-    const pending = revealWords(ORIGIN, ADDR, hangs as unknown as typeof fetch);
+    const pending = revealWords(ORIGIN, ADDR, TESTNET11, hangs as unknown as typeof fetch);
     await vi.advanceTimersByTimeAsync(15_000);
     expect(await pending).toMatchObject({ ok: false, error: 'your station node did not answer in time, so the words are not shown; tap SHOW again' });
     // Headers in time, the body not: still a timeout.
@@ -544,18 +545,18 @@ describe('revealWords', () => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       }),
     }) as unknown as Response;
-    const slow = revealWords(ORIGIN, ADDR, trickles as unknown as typeof fetch);
+    const slow = revealWords(ORIGIN, ADDR, TESTNET11, trickles as unknown as typeof fetch);
     await vi.advanceTimersByTimeAsync(15_000);
     expect((await slow as { error: string }).error).toContain('did not answer in time');
   });
 });
 
 describe('markWordsSaved', () => {
-  const saveWith = (res: Response) => markWordsSaved(ORIGIN, 1234567890, (async () => res) as unknown as typeof fetch);
+  const saveWith = (res: Response) => markWordsSaved(ORIGIN, 1234567890, TESTNET11, (async () => res) as unknown as typeof fetch);
 
   it('POSTs the key fingerprint, and nothing else', async () => {
     const fetchImpl = vi.fn(async () => answer(200, { ok: true, wallet: { state: 'on', mnemonic: true, backed_up: true } }));
-    expect(await markWordsSaved(ORIGIN, 1234567890, fetchImpl as unknown as typeof fetch)).toEqual({ ok: true, note: null });
+    expect(await markWordsSaved(ORIGIN, 1234567890, TESTNET11, fetchImpl as unknown as typeof fetch)).toEqual({ ok: true, note: null });
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('http://127.0.0.1:8081/api/chia/words/saved?key=1234567890');
     expect(init).toMatchObject({ method: 'POST', redirect: 'error', cache: 'no-store' });
@@ -568,7 +569,7 @@ describe('markWordsSaved', () => {
   it('refuses a key that is not a u32 before anything is sent', async () => {
     const never = vi.fn();
     for (const key of [-1, 1.5, 2 ** 32, Number.NaN, '7' as unknown as number]) {
-      expect(await markWordsSaved(ORIGIN, key, never as unknown as typeof fetch)).toMatchObject({ ok: false, drop: true });
+      expect(await markWordsSaved(ORIGIN, key, TESTNET11, never as unknown as typeof fetch)).toMatchObject({ ok: false, drop: true });
     }
     expect(never).not.toHaveBeenCalled();
   });
@@ -583,16 +584,56 @@ describe('markWordsSaved', () => {
     });
     expect(await saveWith(new Response('', { status: 404 }))).toMatchObject({ ok: false, error: "your station node is older than the Bank's BACK UP: update Star Station" });
     const unreachable = async () => { throw new TypeError('Failed to fetch'); };
-    expect(await markWordsSaved(ORIGIN, 7, unreachable as unknown as typeof fetch)).toMatchObject({
+    expect(await markWordsSaved(ORIGIN, 7, TESTNET11, unreachable as unknown as typeof fetch)).toMatchObject({
       ok: false, error: 'the Bank could not record it: your station node could not be reached. Your words are fine; tap I SAVED again', drop: false,
     });
     const hangs = (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     });
-    const late = await markWordsSaved(ORIGIN, 7, hangs as unknown as typeof fetch, 20);
+    const late = await markWordsSaved(ORIGIN, 7, TESTNET11, hangs as unknown as typeof fetch, 20);
     expect(late).toMatchObject({ ok: false, refresh: true, drop: false });
     expect((late as { error: string }).error).toContain('did not answer in time');
-    expect(await markWordsSaved('', 7, vi.fn() as unknown as typeof fetch)).toMatchObject({ ok: false, drop: false });
+    expect(await markWordsSaved('', 7, TESTNET11, vi.fn() as unknown as typeof fetch)).toMatchObject({ ok: false, drop: false });
+  });
+});
+
+describe.each([TESTNET11, MAINNET])('BACK UP on $name', (net) => {
+  const addr = addressOn(net, ADDR.slice(5));
+  const other = net === TESTNET11 ? MAINNET : TESTNET11;
+  const live: LocalFingerprint = { ...node(ON, addr), chia_net: net };
+
+  it('is offered only on a test network', () => {
+    const v = bankBackupView(live, BACKUP_IDLE, 'app');
+    if (net.test) expect(v).toMatchObject({ state: 'nag', open: true });
+    else expect(v).toBeNull();
+    expect(openBackupPanel(BACKUP_IDLE, live, 1).open).toBe(net.test);
+    expect(opensAfterTurnOn(node({ state: 'ready', mnemonic: true }), live, 'app')).toBe(net.test);
+  });
+
+  it('never fetches the words, or marks them saved, off a test network', async () => {
+    const fetchImpl = vi.fn(async () => answer(200, { ok: true, words: WORDS, key: KEY, address: addr }));
+    const r = await revealWords(ORIGIN, addr, net, fetchImpl as unknown as typeof fetch);
+    if (net.test) {
+      expect(r).toEqual({ ok: true, words: WORDS, key: KEY, address: addr });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } else {
+      expect(r).toMatchObject({ ok: false, error: 'your station node is not on a test network, so this page does not show the words' });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      const never = vi.fn();
+      expect(await markWordsSaved(ORIGIN, KEY, net, never as unknown as typeof fetch)).toMatchObject({ ok: false, drop: true });
+      expect(never).not.toHaveBeenCalled();
+    }
+  });
+
+  it('takes no words for the other network\'s address, and none on an unknown network', async () => {
+    const otherAddr = addressOn(other, ADDR.slice(5));
+    const said = await revealWords(ORIGIN, addr, net, (async () => answer(200, { ok: true, words: WORDS, key: KEY, address: otherAddr })) as unknown as typeof fetch);
+    expect(said.ok).toBe(false);
+    const never = vi.fn();
+    expect(await revealWords(ORIGIN, addr, null, never as unknown as typeof fetch)).toMatchObject({ ok: false });
+    expect(await markWordsSaved(ORIGIN, KEY, null, never as unknown as typeof fetch)).toMatchObject({ ok: false });
+    expect(never).not.toHaveBeenCalled();
+    expect(bankBackupView({ ...live, chia_net: null }, BACKUP_IDLE, 'app')).toBeNull();
   });
 });
 
