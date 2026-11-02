@@ -43,9 +43,13 @@ import {
   atRestLines,
   AT_REST_CLEAR,
   AT_REST_DPAPI,
+  AT_REST_KEYCHAIN,
   AT_REST_REWRAPPED,
+  AT_REST_REWRAPPED_KEYCHAIN,
   AT_REST_RETRY,
+  AT_REST_RETRY_KEYCHAIN,
   AT_REST_UNTIL_SAVED,
+  AT_REST_UNTIL_SAVED_KEYCHAIN,
   type BankBackupUi,
   type RevealResult,
 } from './bankBackup';
@@ -801,10 +805,65 @@ describe('atRestLines (🔒 the wallet\'s file at rest)', () => {
     expect(AT_REST_REWRAPPED).not.toMatch(/today/);
   });
 
+  it('says how a Mac\'s file keeps its key, with the login keychain (🍎)', () => {
+    expect(atRestLines(on({ at_rest: 'keychain', backed_up: true }))).toEqual([AT_REST_KEYCHAIN]);
+    expect(atRestLines(on({ at_rest: 'keychain', at_rest_next: 'keychain', backed_up: true }))).toEqual([AT_REST_KEYCHAIN]);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'keychain' }))).toEqual([AT_REST_UNTIL_SAVED_KEYCHAIN]);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'keychain', backed_up: true }))).toEqual([AT_REST_RETRY_KEYCHAIN]);
+    expect(atRestLines(on({ at_rest: 'keychain', backed_up: true, rewrapped: true }))).toEqual([AT_REST_KEYCHAIN, AT_REST_REWRAPPED_KEYCHAIN]);
+    // The Mac lines name the Mac, never Windows, and the Windows lines never the Mac.
+    for (const t of [AT_REST_KEYCHAIN, AT_REST_UNTIL_SAVED_KEYCHAIN, AT_REST_RETRY_KEYCHAIN]) {
+      expect(t).toMatch(/Mac login keychain/);
+      expect(t).not.toMatch(/Windows/);
+    }
+    for (const t of [AT_REST_DPAPI, AT_REST_UNTIL_SAVED, AT_REST_RETRY, AT_REST_REWRAPPED]) expect(t).not.toMatch(/Mac|keychain/);
+    expect(AT_REST_REWRAPPED_KEYCHAIN).toMatch(/Time Machine backup or snapshot/);
+    expect(AT_REST_RETRY_KEYCHAIN).toMatch(/while that keychain is unlocked\.$/);
+    // On disk, never a promise: programs run as this user can still open it,
+    // and the 24 words stay the backup.
+    for (const t of [AT_REST_KEYCHAIN, AT_REST_UNTIL_SAVED_KEYCHAIN, AT_REST_RETRY_KEYCHAIN, AT_REST_REWRAPPED_KEYCHAIN]) {
+      expect(t).not.toMatch(/safe|iCloud|encrypt/i);
+    }
+    expect(AT_REST_KEYCHAIN).toMatch(/^On disk, /);
+    expect(AT_REST_KEYCHAIN).toContain('Programs you run on this Mac account can still open it.');
+    expect(AT_REST_KEYCHAIN).toContain('Star Station Furlong wallet lock item');
+    expect(AT_REST_KEYCHAIN).toMatch(/the 24 words you saved are the backup\.$/);
+    // It rides with the done line as the Windows one does.
+    expect(bankBackupView(on({ at_rest: 'keychain', backed_up: true }), BACKUP_IDLE, 'dev')).toMatchObject({ state: 'done', atRest: [AT_REST_KEYCHAIN] });
+  });
+
+  it('shows the clear line only for a file the node says is in the clear', () => {
+    // A locked file, whichever lock, and whatever lock is to come.
+    for (const at_rest of ['dpapi', 'keychain'] as const) {
+      for (const at_rest_next of [undefined, 'dpapi', 'keychain'] as const) {
+        for (const backed_up of [undefined, true]) {
+          expect(atRestLines(on({ at_rest, at_rest_next, backed_up }))).not.toContain(AT_REST_CLEAR);
+        }
+      }
+    }
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'keychain' }))).not.toContain(AT_REST_CLEAR);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'keychain', backed_up: true }))).not.toContain(AT_REST_CLEAR);
+    // `none` with no lock to come (Linux, or SSF_WALLET_AT_REST=none): the clear line.
+    expect(atRestLines(on({ at_rest: 'none' }))).toEqual([AT_REST_CLEAR]);
+    expect(atRestLines(on({ at_rest: 'none', at_rest_next: 'none' }))).toEqual([AT_REST_CLEAR]);
+    // A kind this page does not know never reads as in the clear (the
+    // fingerprint parser drops it before it gets here).
+    const unknown = { ...ON, at_rest: 'tpm' } as unknown as ChiaWalletSwitch;
+    expect(atRestLines(node(unknown, ADDR))).toEqual([]);
+  });
+
+  it('says, on Windows as on a Mac, that programs run as you can still open it (🔒)', () => {
+    expect(AT_REST_DPAPI).toBe(
+      'On disk, its key is locked to your Windows account on this PC. Programs you run on this Windows account can still open it. Reinstalling Windows, an administrator resetting your password, or another PC loses that copy: the 24 words you saved are the backup.',
+    );
+    expect(AT_REST_DPAPI).not.toMatch(/safe|encrypt/i);
+  });
+
   it('says nothing for an older node, a wallet that is not on, or one not made from words', () => {
     expect(atRestLines(LIVE)).toEqual([]);
     expect(atRestLines(node({ state: 'ready', at_rest: 'none' } as ChiaWalletSwitch, ADDR))).toEqual([]);
     expect(atRestLines(node({ state: 'on', at_rest: 'dpapi' }, ADDR))).toEqual([]);
+    expect(atRestLines(node({ state: 'on', at_rest: 'keychain' }, ADDR))).toEqual([]);
     expect(atRestLines(null)).toEqual([]);
   });
 

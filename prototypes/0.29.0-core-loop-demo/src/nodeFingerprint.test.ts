@@ -87,8 +87,13 @@ describe('parseNodeFingerprint', () => {
     const fp = (chia_wallet: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_wallet })?.chia_wallet;
     expect(fp({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'dpapi' })).toEqual({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'dpapi' });
     expect(fp({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'dpapi', rewrapped: true })).toEqual({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'dpapi', rewrapped: true });
+    // 🍎 A Mac node's lock with the login keychain, as the lock a file has and as the one to come.
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'keychain' })).toEqual({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'keychain' });
+    expect(fp({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'keychain', at_rest_next: 'keychain', rewrapped: true })).toEqual({ state: 'on', mnemonic: true, backed_up: true, at_rest: 'keychain', at_rest_next: 'keychain', rewrapped: true });
     // A newer node's lock this page cannot word: that field goes, the switch stays.
-    expect(fp({ state: 'on', mnemonic: true, at_rest: 'keychain' })).toEqual({ state: 'on', mnemonic: true });
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'tpm' })).toEqual({ state: 'on', mnemonic: true });
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'none', at_rest_next: 'tpm' })).toEqual({ state: 'on', mnemonic: true, at_rest: 'none' });
+    expect(fp({ state: 'on', mnemonic: true, at_rest: 'Keychain' })).toEqual({ state: 'on', mnemonic: true });
     // Not a string, or a flag that is not a boolean: no readout at all.
     for (const bad of [1, true, null, ['dpapi'], { kind: 'dpapi' }]) {
       expect(fp({ state: 'on', at_rest: bad })).toBeUndefined();

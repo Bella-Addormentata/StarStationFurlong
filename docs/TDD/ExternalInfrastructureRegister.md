@@ -64,7 +64,7 @@ APP=$(sed -n 's/^ *RELEASE_FRONTEND: *//p' .github/workflows/release.yml | head 
 crate() { v=$(awk -v n="$1" '$0=="name = \""n"\""{getline; gsub(/"/,"",$3); print $3; exit}' "$APP/ssf-p2p-node/Cargo.lock"); echo ~/.cargo/registry/src/*/"$1-$v"; }
 # every URL, hostname, IPv4 or IPv6 literal in the node: a URL, any name.tld inside a string literal (whatever the TLD), a dotted quad, a bracketed IPv6 address,
 # a four-octet array ([0, 0, 0, 0]) or a quoted bare IPv6 address ("::1").
-# Expect: the two echo hosts of §2 (until that row moves to §7); the Chia introducers of §3 and §4, testnet11's and mainnet's (each constant in chia_peer.rs's `Network::of` and its pin test); tauri.localhost; file names (json.tmp, the test-vector paths);
+# Expect: the two echo hosts of §2 (until that row moves to §7); the Chia introducers of §3 and §4, testnet11's and mainnet's (each constant in chia_peer.rs's `Network::of` and its pin test); tauri.localhost; file names (json.tmp, the test-vector paths, the `*.keychain-db` keychain files the macOS wallet lock's tests name); the code-signing identifier `org.starstationfurlong.update-drill` its update drill gives a copy of the test binary (a name, never dialed);
 # two format-string fragments in chia_peer_lane.rs where `.len(` and `.join(` read as name.tld;
 # and the addresses the address-filter tests use as fixtures: loopback, private, link-local, shared-space (100.64/10), the RFC 5737
 # documentation ranges, and 8.8.8.8 standing in for "a public v4" (never dialed); for IPv6, the unspecified address the node binds, one doc comment, and the

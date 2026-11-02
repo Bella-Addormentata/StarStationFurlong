@@ -37,7 +37,7 @@
 //!
 //! 🔒 Once saved, the node also locks the identity file with this computer's
 //! store where it has one (chia_at_rest.rs: Windows DPAPI; on a Mac, a key
-//! in the user's login keychain once that store is on), and the fingerprint
+//! in the user's login keychain), and the fingerprint
 //! says how the file keeps its key ([`AtRest`]).
 //!
 //! ⛓️ The SSF wallet starts, turns and reads alike on every Chia network

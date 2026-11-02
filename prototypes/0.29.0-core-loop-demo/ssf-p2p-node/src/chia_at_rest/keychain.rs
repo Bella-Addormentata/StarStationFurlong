@@ -2,8 +2,7 @@
 //! `/usr/bin/security` reads and makes the wallet's keychain item, and a
 //! search in this process finds which keychain holds it and whether that
 //! keychain is unlocked, with keychain prompts turned off for the process.
-//! Built only on a Mac, and not switched on yet: [`super::os_store`] is
-//! still none there.
+//! Built only on a Mac, where [`super::os_store`] is [`LOGIN`].
 //!
 //! This process never asks for the item's data. Its search asks for
 //! attributes and references only, so no access check runs and nothing can
@@ -140,11 +139,9 @@ const POLL: Duration = Duration::from_millis(10);
 /// dropped, and nothing else turns them on, so no lock is needed.
 static UI_OFF: OnceLock<Result<KeychainUserInteractionLock, i32>> = OnceLock::new();
 
-/// The store a Mac node locks its wallet's file with: this user's own
-/// keychains, through `security`.
-// Nothing names it until the store is switched on in the next step
-// (os_store); until then it is only built and tested.
-#[allow(dead_code)]
+/// The store a Mac node locks its wallet's file with ([`super::os_store`]):
+/// this user's own keychains, through `security`. Naming it calls nothing:
+/// its first keychain call is `ready`, from a wrap or an open.
 pub(crate) static LOGIN: KeychainStore<SecurityTool> =
     KeychainStore::new(SecurityTool::new(Cow::Borrowed(SERVICE), Target::Login));
 
@@ -1098,6 +1095,21 @@ mod tests {
         let e = refused("an open at the login keychain", store.unwrap(&blob, FP));
         assert_eq!((e.refusal, e.code), (Refusal::NotNow, Code::Guard));
         assert_eq!(store.hands().counts(), (0, 0, 2), "no search, no run of security");
+    }
+
+    /// Test 8. A Mac node's store is the login keychain, and naming it
+    /// touches no keychain: [`LOGIN`] has made no search, no run of
+    /// `security` and no call the guard refused, so a start with no wallet,
+    /// or with a clear file not due a lock, makes no keychain call.
+    #[test]
+    fn os_store_is_the_keychain_without_a_keychain_call() {
+        if !tests_enabled("os_store_is_the_keychain_without_a_keychain_call") {
+            return;
+        }
+        let store = crate::chia_at_rest::os_store().expect("a Mac has the keychain store");
+        assert_eq!(store.protect(), crate::chia_at_rest::AtRest::Keychain);
+        assert!(std::ptr::addr_eq(store, &LOGIN), "it is the login keychain's store");
+        assert_eq!(LOGIN.hands().counts(), (0, 0, 0), "no search, no run of security, nothing guarded");
     }
 
     /// Test 1. Wrap, open, and a second wrap that reuses the item, each in under
