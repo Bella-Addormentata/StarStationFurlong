@@ -285,7 +285,11 @@ pub fn refusal_words(path: &Path, e: StoreError) -> String {
         Refusal::KeychainAsks => format!(
             "chia identity file {p} is locked with a key in this Mac user's login keychain, but macOS would ask before handing it \
              over{code}, and the node never lets it ask; this happens when the item's access was changed in Keychain Access: open \
-             the {kind} item for this wallet, put security back under Access Control, then start the node again; {KEEP}"
+             the {kind} item for this wallet, put security back under Access Control, then start the node again. If security is \
+             already there, the item's partition list was changed, which Keychain Access does not show: run security \
+             set-generic-password-partition-list -S apple-tool:,apple: -s {service} -a <the item's Account> in Terminal (it asks \
+             for the login keychain's password), then start the node again; {KEEP}",
+            service = keychain_lock::SERVICE
         ),
         Refusal::KeychainDenied => format!(
             "chia identity file {p} is locked with a key in this Mac user's login keychain, and macOS refused it to this \
@@ -546,6 +550,14 @@ mod tests {
         let asks = says(Refusal::KeychainAsks, Code::Exit(36));
         assert!(asks.contains("Keychain Access") && asks.contains("Access Control"), "{asks}");
         assert!(asks.contains("Star Station Furlong wallet lock item"), "{asks}");
+        // A partition list changed outside Keychain Access gives the same
+        // refusal, so the words also say how to set it back.
+        assert!(asks.contains("If security is already there, the item's partition list was changed"), "{asks}");
+        assert!(
+            asks.contains("security set-generic-password-partition-list -S apple-tool:,apple: -s StarStationFurlong.chia_identity -a"),
+            "{asks}"
+        );
+        assert!(asks.contains("asks for the login keychain's password"), "{asks}");
         let missing = says(Refusal::KeychainMissing, Code::OsStatus(-25300));
         assert!(missing.contains("Star Station Furlong wallet lock item was deleted"), "{missing}");
         // Not now: the code, and no advice to keep or move it.

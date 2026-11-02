@@ -9,6 +9,8 @@
 //! attributes and references only, so no access check runs and nothing can
 //! prompt. Only `security` reads or writes the key, so the item's one
 //! trusted program is Apple's tool, the same after any update of the node.
+//! Before a read it also reads the item's access (its ACL entries, never
+//! its data; [`security_may_read`]), which runs no access check either.
 //!
 //! Every run of `security`:
 //! - by its absolute path, with no shell, in the node's own environment;
@@ -18,7 +20,11 @@
 //! - stopped and reaped at [`SECURITY_DEADLINE`], so a prompt the node did
 //!   not expect never hangs it;
 //! - only against a keychain whose state was read as unlocked just before,
-//!   since `security` has prompts of its own that the node cannot turn off.
+//!   since `security` has prompts of its own that the node cannot turn off;
+//! - for a read, never for an item whose access, read just before, says
+//!   `security` would have to ask (refused as KeychainAsks). That check
+//!   only refuses on what it reads plainly: anything it cannot read lets
+//!   the read go ahead, with the deadline as the backstop.
 //!
 //! Tests never touch the login keychain: under `cfg(test)` the login target
 //! refuses with [`Code::Guard`] before any search or run. The tests that
@@ -35,11 +41,17 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFType, TCFType};
+use core_foundation::array::{CFArray, CFArrayRef};
+use core_foundation::base::{CFIndex, CFRange, CFType, TCFType, TCFTypeRef};
+use core_foundation::data::{CFData, CFDataRef};
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::propertylist::{create_with_data, kCFPropertyListImmutable, CFPropertyList};
+use core_foundation::string::{kCFStringEncodingUTF8, CFString, CFStringGetBytes, CFStringRef};
 use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+use security_framework::os::macos::access::SecAccess;
 use security_framework::os::macos::keychain::{KeychainUserInteractionLock, SecKeychain};
 use security_framework::os::macos::keychain_item::SecKeychainItem;
-use security_framework_sys::base::{SecKeychainItemRef, SecKeychainRef};
+use security_framework_sys::base::{SecAccessRef, SecKeychainItemRef, SecKeychainRef};
 use security_framework_sys::item::kSecValueRef;
 use zeroize::Zeroizing;
 
@@ -54,9 +66,9 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// The three calls that neither security-framework 3.7 nor its -sys crate
-// binds. All three are deprecated since macOS 10.10 but still exported, and
-// `security` itself stands on the same layer.
+// The calls that neither security-framework 3.7 nor its -sys crate binds
+// (grep finds none). All are deprecated since macOS 10.10 but still
+// exported, and `security` itself stands on the same layer.
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     /// The keychain's state bits; [`UNLOCKED`] is set while it is unlocked.
@@ -67,7 +79,54 @@ extern "C" {
     fn SecKeychainGetPath(keychain: SecKeychainRef, io_len: *mut u32, path: *mut c_char) -> i32;
     /// The keychain an item is in, retained for the caller.
     fn SecKeychainItemCopyKeychain(item: SecKeychainItemRef, keychain: *mut SecKeychainRef) -> i32;
+
+    // The item's access, for `security_may_read` (SecKeychainItem.h,
+    // SecAccess.h, SecACL.h, SecTrustedApplication.h). Deprecated since
+    // macOS 10.10 like the three above, and still exported. They read ACL
+    // entries, never data. Every object they hand back is retained for the
+    // caller (+1), and is owned here under the create rule (`owned`).
+    /// The item's access: all of its ACL entries.
+    fn SecKeychainItemCopyAccess(item: SecKeychainItemRef, access: *mut SecAccessRef) -> i32;
+    /// The entries of an access, as an array of `SecACLRef`.
+    fn SecAccessCopyACLList(access: SecAccessRef, acl_list: *mut CFArrayRef) -> i32;
+    /// An entry's authorization tags as strings (`"ACLAuthorizationDecrypt"`,
+    /// ...), or null.
+    fn SecACLCopyAuthorizations(acl: SecACLRef) -> CFArrayRef;
+    /// An entry's trusted apps (null: any app), its description, and its
+    /// prompt flags.
+    fn SecACLCopyContents(
+        acl: SecACLRef,
+        application_list: *mut CFArrayRef,
+        description: *mut CFStringRef,
+        prompt_selector: *mut SecKeychainPromptSelector,
+    ) -> i32;
+    /// A trusted app's path, with its NUL.
+    fn SecTrustedApplicationCopyData(app: SecTrustedApplicationRef, data: *mut CFDataRef) -> i32;
 }
+
+/// `SecACLRef` and `SecTrustedApplicationRef`, which the -sys crate does
+/// not declare, as it declares the others.
+enum OpaqueSecAcl {}
+type SecACLRef = *mut OpaqueSecAcl;
+enum OpaqueSecTrustedApplication {}
+type SecTrustedApplicationRef = *mut OpaqueSecTrustedApplication;
+/// `SecKeychainPromptSelector` (SecACL.h): `uint16_t` flags.
+type SecKeychainPromptSelector = u16;
+/// `kSecKeychainPromptRequirePassphase` (sic): ask for the keychain's password.
+const PROMPT_REQUIRE_PASSPHRASE: SecKeychainPromptSelector = 0x0001;
+
+/// The authorization tags the check looks for, by their values in
+/// SecAccess.cpp (`kSecACLAuthorizationDecrypt` and the others): compared
+/// as strings, so no more symbols are linked.
+const AUTH_DECRYPT: &str = "ACLAuthorizationDecrypt";
+const AUTH_ANY: &str = "ACLAuthorizationAny";
+const AUTH_PARTITION: &str = "ACLAuthorizationPartitionID";
+/// A trusted app's data for Apple's tool: its path.
+const SECURITY_PATH: &[u8] = b"/usr/bin/security";
+/// The partitions that count as Apple's tool. securityd gives `security`
+/// `apple-tool:` and other Apple code `apple:` (clientid.cpp); either one
+/// keeps the check from refusing.
+const APPLE_PARTITIONS: [&str; 2] = ["apple-tool:", "apple:"];
 
 /// `kSecUnlockStateStatus`: the keychain is unlocked.
 const UNLOCKED: u32 = 1;
@@ -178,6 +237,25 @@ impl SecurityTool {
         }
     }
 
+    /// The item at this spot, found in this process by the search `locate`
+    /// makes (attributes and references, never data) in that keychain only.
+    /// `None` when it cannot be found or placed: `security`'s own exit then
+    /// says what is wrong.
+    fn item_at(&self, spot: &Spot, account: &str) -> Option<SecKeychainItem> {
+        let keychain = SecKeychain::open(&spot.path).ok()?;
+        let found = ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(&self.service)
+            .account(account)
+            .keychains(std::slice::from_ref(&keychain))
+            .load_attributes(true)
+            .load_refs(true)
+            .limit(Limit::Max(1))
+            .search()
+            .ok()?;
+        item_of(found.first()?).ok()
+    }
+
     /// One run of `security`, with the store's deadline.
     fn run(&self, args: &[&OsStr], input: Option<&[u8]>, output: Option<&mut [u8]>) -> Result<Ran, StoreError> {
         #[cfg(test)]
@@ -253,9 +331,14 @@ impl KeychainHands for SecurityTool {
 
     /// `security find-generic-password -s <service> -a <account> -w <path>`,
     /// its stdout read into a buffer of [`READ_MAX`] bytes that is wiped.
+    /// First the item's access is read here: an item that `security` could
+    /// only read after a prompt is refused before any run.
     fn read(&self, spot: &Spot, account: &str) -> Result<Zeroizing<[u8; 32]>, StoreError> {
         self.guard()?;
         self.still_unlocked(spot)?;
+        if self.item_at(spot, account).map(|item| security_may_read(&item)) == Some(AccessVerdict::Asks) {
+            return Err(StoreError { refusal: Refusal::KeychainAsks, code: Code::None });
+        }
         let mut printed = Zeroizing::new([0u8; READ_MAX]);
         let ran = self.run(&find_args(&self.service, account, &spot.path), None, Some(&mut printed[..]))?;
         match ran.exit {
@@ -331,22 +414,27 @@ fn spot_of(keychain: &SecKeychain) -> Result<Spot, StoreError> {
     Ok(Spot { path: path_of(keychain)?, unlocked: unlocked_now(keychain) })
 }
 
-/// The keychain that holds one search result. The result is a dictionary
-/// of attributes with the item's reference under `kSecValueRef`, which is
-/// kept only if it is a keychain item.
-fn keychain_of(result: &SearchResult) -> Result<SecKeychain, StoreError> {
-    let item = match result {
+/// The item of one search result. The result is a dictionary of attributes
+/// with the item's reference under `kSecValueRef`, which is kept only if it
+/// is a keychain item.
+fn item_of(result: &SearchResult) -> Result<SecKeychainItem, StoreError> {
+    match result {
         SearchResult::Dict(dict) => {
             // SAFETY: a constant of the Security framework.
             let key = unsafe { kSecValueRef }.cast::<c_void>();
             let value = dict.find(key).map(|value| *value).filter(|value| !value.is_null()).ok_or_else(not_now)?;
             // SAFETY: a live value the dictionary holds; the get rule retains it.
             let value = unsafe { CFType::wrap_under_get_rule(value) };
-            value.downcast_into::<SecKeychainItem>().ok_or_else(not_now)?
+            value.downcast_into::<SecKeychainItem>().ok_or_else(not_now)
         }
-        SearchResult::Ref(Reference::KeychainItem(item)) => item.clone(),
-        _ => return Err(not_now()),
-    };
+        SearchResult::Ref(Reference::KeychainItem(item)) => Ok(item.clone()),
+        _ => Err(not_now()),
+    }
+}
+
+/// The keychain that holds one search result.
+fn keychain_of(result: &SearchResult) -> Result<SecKeychain, StoreError> {
+    let item = item_of(result)?;
     let mut keychain: SecKeychainRef = ptr::null_mut();
     // SAFETY: a live item reference and a valid out pointer.
     let code = unsafe { SecKeychainItemCopyKeychain(item.as_concrete_TypeRef(), &mut keychain) };
@@ -358,6 +446,248 @@ fn keychain_of(result: &SearchResult) -> Result<SecKeychain, StoreError> {
     }
     // SAFETY: the copy is retained for us (the create rule) and released once.
     Ok(unsafe { SecKeychain::wrap_under_create_rule(keychain) })
+}
+
+/// What an item's access says about a read by `security`, read in this
+/// process just before it would run. Only `Asks` changes anything: the read
+/// is refused with no run. `Unknown` reads on, as `Allows` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessVerdict {
+    /// Read plainly: `security` may decrypt it with no prompt.
+    Allows,
+    /// Read plainly: `security` would have to ask first.
+    Asks,
+    /// Not read, or not plain enough to say either.
+    Unknown,
+}
+
+/// What one decrypt entry says about `security`.
+enum Door {
+    /// It lets `security` in with no prompt.
+    Open,
+    /// It sends `security` to its prompt.
+    Shut,
+    /// It does not say plainly.
+    Unsure,
+}
+
+/// One entry's contents: its trusted apps (`None`: any app), its
+/// description, and its prompt flags.
+struct Contents {
+    apps: Option<CFArray>,
+    description: Option<CFString>,
+    prompt: SecKeychainPromptSelector,
+}
+
+/// A reference a call handed back retained (+1), owned from here on under
+/// the create rule so it is released exactly once; `None` for a null.
+///
+/// # Safety
+///
+/// `raw` is null, or a live reference of type `T` that the caller owns.
+unsafe fn owned<T: TCFType>(raw: T::Ref) -> Option<T> {
+    // SAFETY: as the caller promises.
+    (!raw.as_void_ptr().is_null()).then(|| unsafe { T::wrap_under_create_rule(raw) })
+}
+
+/// Whether `security` could read this item with no prompt, from its access
+/// alone. This refuses only on what it reads plainly: any call that fails,
+/// and anything it does not know, is [`AccessVerdict::Unknown`], and the
+/// read then goes ahead as before.
+///
+/// - Decrypt entries (tag Decrypt or Any): an entry lets `security` in when
+///   it trusts any app, or lists `/usr/bin/security`, and does not ask for
+///   the keychain's password. Some entry doing so allows; every entry read
+///   and none listing it (nor any app) asks.
+/// - Partition entries (tag PartitionID): a partition list that holds
+///   neither `apple-tool:` nor `apple:` asks. No partition entry at all is a
+///   keychain of the old format, which has no partition check.
+///
+/// It asks if either part asks; it allows only if a decrypt entry allows
+/// and no partition entry is in doubt.
+fn security_may_read(item: &SecKeychainItem) -> AccessVerdict {
+    let Some(acls) = acl_list(item) else {
+        return AccessVerdict::Unknown;
+    };
+    let (mut open, mut shut, mut unsure) = (false, false, false);
+    let (mut partition_shut, mut partition_unsure) = (false, false);
+    for acl in acls.iter() {
+        let acl: SecACLRef = (*acl).cast_mut().cast();
+        let Some(tags) = tags_of(acl) else {
+            // An entry whose tags are not read could be of either kind.
+            (unsure, partition_unsure) = (true, true);
+            continue;
+        };
+        let has = |tag: &str| tags.iter().any(|t| t == tag);
+        // A partition entry has no app list (ACL.cpp reads it in its
+        // integrity form), so it is never read as a decrypt entry.
+        if has(AUTH_PARTITION) {
+            match contents_of(acl).as_ref().and_then(partition_lets_in) {
+                Some(true) => {}
+                Some(false) => partition_shut = true,
+                None => partition_unsure = true,
+            }
+        } else if has(AUTH_DECRYPT) || has(AUTH_ANY) {
+            match contents_of(acl).as_ref().map_or(Door::Unsure, door_of) {
+                Door::Open => open = true,
+                Door::Shut => shut = true,
+                Door::Unsure => unsure = true,
+            }
+        }
+    }
+    if partition_shut || (shut && !open && !unsure) {
+        AccessVerdict::Asks
+    } else if open && !partition_unsure {
+        AccessVerdict::Allows
+    } else {
+        AccessVerdict::Unknown
+    }
+}
+
+/// The item's ACL entries, each a `SecACLRef` the array holds.
+fn acl_list(item: &SecKeychainItem) -> Option<CFArray> {
+    let mut access: SecAccessRef = ptr::null_mut();
+    // SAFETY: a live item reference and a valid out pointer.
+    let code = unsafe { SecKeychainItemCopyAccess(item.as_concrete_TypeRef(), &mut access) };
+    // SAFETY: null or a +1 access, owned before the status is looked at.
+    let access = unsafe { owned::<SecAccess>(access) };
+    let access = access.filter(|_| code == 0)?;
+    let mut list: CFArrayRef = ptr::null();
+    // SAFETY: a live access and a valid out pointer.
+    let code = unsafe { SecAccessCopyACLList(access.as_concrete_TypeRef(), &mut list) };
+    // SAFETY: null or a +1 array.
+    unsafe { owned::<CFArray>(list) }.filter(|_| code == 0)
+}
+
+/// A string element of an array or dictionary; `None` for a null, for
+/// anything but a string, and for a string that is not all text.
+fn string_of(raw: *const c_void) -> Option<String> {
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: a live value its array or dictionary holds; the get rule retains it.
+    let value = unsafe { CFType::wrap_under_get_rule(raw) };
+    text_of(&value.downcast_into::<CFString>()?)
+}
+
+/// A string's text; `None` unless all of it converts to UTF-8. A partition
+/// list may hold any UTF-16 (a binary property list's strings are not
+/// checked), and core-foundation's own conversion asserts on an unpaired
+/// surrogate, so CF first counts, with no buffer, how much it would
+/// convert: its UTF-8 converter stops at such a surrogate.
+fn text_of(s: &CFString) -> Option<String> {
+    let whole = CFRange { location: 0, length: s.char_len() };
+    let mut needed: CFIndex = 0;
+    // SAFETY: a live string, its whole range, no loss byte (stop at what
+    // does not convert), and a null buffer of length 0, so CF only counts.
+    let counted = unsafe {
+        CFStringGetBytes(s.as_concrete_TypeRef(), whole, kCFStringEncodingUTF8, 0, 0, ptr::null_mut(), 0, &mut needed)
+    };
+    (counted == whole.length).then(|| s.to_string())
+}
+
+/// An entry's authorization tags, by their string values.
+fn tags_of(acl: SecACLRef) -> Option<Vec<String>> {
+    if acl.is_null() {
+        return None;
+    }
+    // SAFETY: a live entry its list holds; null or a +1 array comes back.
+    let tags = unsafe { owned::<CFArray>(SecACLCopyAuthorizations(acl)) }?;
+    tags.iter().map(|tag| string_of(*tag)).collect()
+}
+
+/// An entry's contents.
+fn contents_of(acl: SecACLRef) -> Option<Contents> {
+    let (mut apps, mut description, mut prompt): (CFArrayRef, CFStringRef, SecKeychainPromptSelector) =
+        (ptr::null(), ptr::null(), 0);
+    // SAFETY: a live entry and three valid out pointers.
+    let code = unsafe { SecACLCopyContents(acl, &mut apps, &mut description, &mut prompt) };
+    // SAFETY: each is null or a +1 reference of its type, owned before the
+    // status is looked at so that nothing leaks on a failure.
+    let (apps, description) = unsafe { (owned::<CFArray>(apps), owned::<CFString>(description)) };
+    (code == 0).then_some(Contents { apps, description, prompt })
+}
+
+/// What a decrypt entry says about `security`. An app list is "these apps,
+/// or else the prompt" (ACL.cpp `makeSubject`), so one without `security`
+/// sends it to the prompt. One that has it (or any app) but also asks for
+/// the keychain's password is not read as either: its listed apps may still
+/// pass without asking.
+fn door_of(contents: &Contents) -> Door {
+    let listed = match &contents.apps {
+        None => true,
+        Some(apps) => match lists_security(apps) {
+            Some(listed) => listed,
+            None => return Door::Unsure,
+        },
+    };
+    match (listed, contents.prompt & PROMPT_REQUIRE_PASSPHRASE != 0) {
+        (false, _) => Door::Shut,
+        (true, false) => Door::Open,
+        (true, true) => Door::Unsure,
+    }
+}
+
+/// Whether an app list names Apple's tool; `None` when it does not, and an
+/// app could not be read as a path. An app's data is a path only when it
+/// starts with `/` (keychain_utilities.c draws the same line). Other data,
+/// `group://...` or `csreq://`, names an app by a code requirement, which
+/// securityd checks against the caller's signature (codesigdb.cpp), so
+/// `security` may pass it: such an app is not read either way.
+fn lists_security(apps: &CFArray) -> Option<bool> {
+    let mut unread = false;
+    for app in apps.iter() {
+        let data = app_path(*app);
+        match data.as_ref().map(|data| trailing_nuls_off(data.bytes())) {
+            Some(SECURITY_PATH) => return Some(true),
+            Some([b'/', ..]) => {}
+            Some(_) | None => unread = true,
+        }
+    }
+    (!unread).then_some(false)
+}
+
+/// A trusted app's data: its path (or the description of its code
+/// requirement), with its NUL.
+fn app_path(app: *const c_void) -> Option<CFData> {
+    if app.is_null() {
+        return None;
+    }
+    let mut data: CFDataRef = ptr::null();
+    // SAFETY: a live trusted app its list holds, and a valid out pointer.
+    let code = unsafe { SecTrustedApplicationCopyData(app.cast_mut().cast(), &mut data) };
+    // SAFETY: null or a +1 data.
+    unsafe { owned::<CFData>(data) }.filter(|_| code == 0)
+}
+
+/// The bytes without the NULs at their end.
+fn trailing_nuls_off(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |last| last + 1);
+    &bytes[..end]
+}
+
+/// Whether a partition entry lets Apple's tool in; `None` when its
+/// description does not read as a partition list.
+fn partition_lets_in(contents: &Contents) -> Option<bool> {
+    let ids = partition_ids(&text_of(contents.description.as_ref()?)?)?;
+    Some(ids.iter().any(|id| APPLE_PARTITIONS.contains(&id.as_str())))
+}
+
+/// The partition IDs in a partition entry's description: the hex of a
+/// property list `{Partitions = [...]}`, as securityd keeps it
+/// (`PartitionAclSubject`) and as `security set-generic-password-partition-list`
+/// writes it (keychain_find.c, `cfToHex` of `CFPropertyListCreateXMLData`).
+fn partition_ids(hex_list: &str) -> Option<Vec<String>> {
+    let bytes = hex::decode(hex_list).ok()?;
+    let (list, _) = create_with_data(CFData::from_buffer(&bytes), kCFPropertyListImmutable).ok()?;
+    // SAFETY: a parsed list comes back non-null and retained (+1).
+    let list = unsafe { CFPropertyList::wrap_under_create_rule(list) };
+    let dict = list.downcast_into::<CFDictionary>()?;
+    let key = CFString::from_static_string("Partitions");
+    let ids = dict.find(key.as_CFTypeRef()).map(|value| *value).filter(|value| !value.is_null())?;
+    // SAFETY: a live value the dictionary holds; the get rule retains it.
+    let ids = unsafe { CFType::wrap_under_get_rule(ids) }.downcast_into::<CFArray>()?;
+    ids.iter().map(|id| string_of(*id)).collect()
 }
 
 /// How one run of `security` ended.
@@ -999,6 +1329,190 @@ mod tests {
             "an in-process read gave OSStatus {status}; only security may read the key"
         );
         assert!(took < 2 * SECOND, "the refusal took {took:?}");
+    }
+
+    /// What the access check says of the item at `account` in this
+    /// temporary keychain, found as a read finds it; `None` when the search
+    /// finds no item.
+    fn verdict(tk: &TempKeychain, account: &str) -> Option<AccessVerdict> {
+        let (tool, account) = (tk.tool(), account.to_string());
+        let spot = Spot { path: tk.path().to_path_buf(), unlocked: Some(true) };
+        within("the access check", move || {
+            ok("prompts off", prompts_off());
+            tool.item_at(&spot, &account).map(|item| security_may_read(&item))
+        })
+    }
+
+    /// An item that `security add-generic-password` makes with `flags`
+    /// (`-A`, `-T ""`) and otherwise the production add line, sent on its
+    /// stdin through `-q -i`, so its data is on no process's arguments.
+    /// Gives back its key.
+    fn add_with(tk: &TempKeychain, account: &str, flags: &str) -> Zeroizing<[u8; 32]> {
+        const ADD: &str = "add-generic-password";
+        let key = random_key();
+        let line = ok("the add line", add_line(tk.service(), account, &label(FP), &comment(FP), &key, tk.path()));
+        let rest = line.strip_prefix(ADD).expect("the add line starts with its command");
+        // Room reserved up front, so no moved buffer is left with the key in it.
+        let mut flagged = Zeroizing::new(String::with_capacity(line.len() + flags.len() + 1));
+        let reserved = flagged.capacity();
+        flagged.push_str(ADD);
+        flagged.push(' ');
+        flagged.push_str(flags);
+        flagged.push_str(rest);
+        assert_eq!(flagged.capacity(), reserved, "the line never moved");
+        let ran =
+            ok("security runs", run(&ADD_FLAGS.map(OsStr::new), Some(flagged.as_bytes()), None, SECURITY_DEADLINE));
+        assert_eq!(ran.exit, 0, "security adds an item with {flags}");
+        key
+    }
+
+    /// A read through the tool at the spot `locate` finds, on a thread of
+    /// its own, and how long the read took.
+    fn read_in(tool: &Arc<SecurityTool>, account: &str) -> (Result<Zeroizing<[u8; 32]>, StoreError>, Duration) {
+        let (tool, account) = (Arc::clone(tool), account.to_string());
+        within("a read", move || {
+            let spots = ok("the item is found", tool.ready().and_then(|()| tool.locate(&account)));
+            let spot = spots.first().expect("a keychain holds the item");
+            let start = Instant::now();
+            let read = tool.read(spot, &account);
+            (read, start.elapsed())
+        })
+    }
+
+    /// The access check reads the node's own item plainly as one `security`
+    /// may read: its decrypt entry lists `/usr/bin/security`, and its
+    /// partition is Apple's tool's. `Unknown` would mean the check reads
+    /// nothing on this Mac, so it fails the test. The open still works.
+    #[test]
+    fn access_check_allows_the_nodes_own_item() {
+        if !tests_enabled("access_check_allows_the_nodes_own_item") {
+            return;
+        }
+        let tk = TempKeychain::new();
+        let store: Store = Arc::new(tk.store());
+        let blob = ok("the wrap", wrap_in(&store, FP).0);
+        assert_eq!(verdict(&tk, &account(FP)), Some(AccessVerdict::Allows), "the production add's item");
+        assert_opens(&store, &blob, FP, "the node's own item, after the check");
+        assert_eq!(store.hands().counts().1, 2, "one add, then one read");
+    }
+
+    /// An any-app item (`-A`): its decrypt entry trusts every app, so the
+    /// check allows it, and `security` reads its key.
+    #[test]
+    fn access_check_allows_an_any_app_item() {
+        if !tests_enabled("access_check_allows_an_any_app_item") {
+            return;
+        }
+        let tk = TempKeychain::new();
+        let acct = account(FP);
+        let key = add_with(&tk, &acct, "-A");
+        assert_eq!(verdict(&tk, &acct), Some(AccessVerdict::Allows), "an any-app item");
+        let tool = Arc::new(tk.tool());
+        let (read, took) = read_in(&tool, &acct);
+        let back = ok("a read of the any-app item", read);
+        assert!(*back == *key, "security gives back the any-app item's key");
+        assert!(took < 2 * SECOND, "the read took {took:?}");
+        assert_eq!(tool.counts().1, 1, "one run of security");
+    }
+
+    /// An item that trusts no app (`-T ""`, an empty list in keychain_add.c):
+    /// every app, `security` too, would meet the prompt, so a read is
+    /// refused as KeychainAsks at once, with no run of `security`.
+    #[test]
+    fn an_item_that_trusts_no_app_is_refused_without_a_spawn() {
+        if !tests_enabled("an_item_that_trusts_no_app_is_refused_without_a_spawn") {
+            return;
+        }
+        let tk = TempKeychain::new();
+        let acct = account(FP);
+        add_with(&tk, &acct, "-T \"\"");
+        assert_eq!(verdict(&tk, &acct), Some(AccessVerdict::Asks), "an item that trusts no app");
+        let tool = Arc::new(tk.tool());
+        let spawns = tool.counts().1;
+        let (read, took) = read_in(&tool, &acct);
+        let e = refused("a read of an item that trusts no app", read);
+        assert_eq!((e.refusal, e.code), (Refusal::KeychainAsks, Code::None));
+        assert!(took < 2 * SECOND, "the refusal took {took:?}");
+        assert_eq!(tool.counts().1, spawns, "no run of security");
+        assert_eq!(tk.item_count(), 1, "the item is left as it is");
+    }
+
+    /// The node's own item, its partition list then set to another team's
+    /// only: `security` would have to ask for the keychain's password to
+    /// add its own partition, so an open is refused as KeychainAsks within
+    /// 2 s, with no run of `security`.
+    #[test]
+    fn an_item_outside_apples_partition_is_refused_without_a_spawn() {
+        if !tests_enabled("an_item_outside_apples_partition_is_refused_without_a_spawn") {
+            return;
+        }
+        let tk = TempKeychain::new();
+        let store: Store = Arc::new(tk.store());
+        let blob = ok("the wrap", wrap_in(&store, FP).0);
+        let shown = tk.path().to_str().expect("a temporary path in UTF-8");
+        assert!(!shown.contains(['"', '\\', '\n']), "a temporary path that security reads back as it is");
+        // Through `-q -i` like an add, so the keychain's password is on no
+        // process's arguments.
+        let line = Zeroizing::new(format!(
+            "set-generic-password-partition-list -S teamid:SSFTEST123 -s \"{}\" -a \"{}\" -k \"{}\" \"{shown}\"\n",
+            tk.service(),
+            account(FP),
+            tk.password.as_str()
+        ));
+        let ran = ok("security runs", run(&ADD_FLAGS.map(OsStr::new), Some(line.as_bytes()), None, SECURITY_DEADLINE));
+        assert_eq!(ran.exit, 0, "set-generic-password-partition-list exited {}", ran.exit);
+        assert_eq!(verdict(&tk, &account(FP)), Some(AccessVerdict::Asks), "an item outside Apple's partition");
+
+        let spawns = store.hands().counts().1;
+        let (opened, took) = open_in(&store, &blob, FP);
+        let e = refused("an open of the item outside Apple's partition", opened);
+        assert_eq!((e.refusal, e.code), (Refusal::KeychainAsks, Code::None));
+        assert!(took < 2 * SECOND, "the refusal took {took:?}");
+        assert_eq!(store.hands().counts().1, spawns, "no run of security");
+    }
+
+    /// A partition list parses from its hex in either case, as an XML
+    /// property list made the way `security` makes one, or as a binary one;
+    /// anything else is no list, and so is a list with an ID that is not
+    /// all text (an unpaired surrogate), with no panic. No keychain is
+    /// touched.
+    #[test]
+    fn partition_lists_parse_from_their_hex() {
+        if !tests_enabled("partition_lists_parse_from_their_hex") {
+            return;
+        }
+        use core_foundation::base::kCFAllocatorDefault;
+        use core_foundation::propertylist::{
+            create_data, kCFPropertyListBinaryFormat_v1_0, kCFPropertyListXMLFormat_v1_0, CFPropertyListFormat,
+        };
+        use core_foundation::string::{CFStringCreateWithCharacters, UniChar};
+        let hex_in = |ids: &[CFString], format: CFPropertyListFormat| {
+            let pair = (CFString::from_static_string("Partitions").as_CFType(), CFArray::from_CFTypes(ids).as_CFType());
+            let dict = CFDictionary::from_CFType_pairs(&[pair]);
+            let list = create_data(dict.as_CFTypeRef(), format).expect("a property list");
+            hex::encode(list.bytes())
+        };
+        let strings = |ids: &[&str]| ids.iter().map(|id| CFString::new(id)).collect::<Vec<_>>();
+        let hex_of = |ids: &[&str]| hex_in(&strings(ids), kCFPropertyListXMLFormat_v1_0);
+        let ids = |ids: &[&str]| Some(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+        let binary = hex_in(&strings(&["apple-tool:", "teamid:\u{c4}"]), kCFPropertyListBinaryFormat_v1_0);
+        assert_eq!(partition_ids(&binary), ids(&["apple-tool:", "teamid:\u{c4}"]), "a binary list, one ID in UTF-16");
+        let lone: [UniChar; 1] = [0xD800];
+        // SAFETY: one UTF-16 unit, copied into a new string that comes back
+        // retained (+1); CF does not check it, as a binary list's parse does not.
+        let odd = unsafe {
+            CFString::wrap_under_create_rule(CFStringCreateWithCharacters(kCFAllocatorDefault, lone.as_ptr(), 1))
+        };
+        let odd = hex_in(&[odd, CFString::new("apple-tool:")], kCFPropertyListBinaryFormat_v1_0);
+        assert_eq!(partition_ids(&odd), None, "a list with an unpaired surrogate");
+        let tool = hex_of(&["apple-tool:"]);
+        assert_eq!(partition_ids(&tool), ids(&["apple-tool:"]));
+        assert_eq!(partition_ids(&tool.to_uppercase()), ids(&["apple-tool:"]), "upper-case hex");
+        assert_eq!(partition_ids(&hex_of(&["teamid:SSFTEST123", "apple:"])), ids(&["teamid:SSFTEST123", "apple:"]));
+        assert_eq!(partition_ids(&hex_of(&[])), ids(&[]));
+        assert_eq!(partition_ids(&tool[..tool.len() / 4 * 2]), None, "a list cut short");
+        assert_eq!(partition_ids("not hex"), None);
+        assert_eq!(partition_ids(&hex::encode(b"plain words")), None);
     }
 
     /// The `CDHash=` line of `codesign -d`, if the file is signed.
