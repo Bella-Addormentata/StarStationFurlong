@@ -6490,12 +6490,14 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
             {
                 // 🏦 The Bank's BACK UP (chia_wallet_switch.rs): show the 24
                 // words of the loaded wallet, or record that the player saved
-                // them. Only the desktop app's own page may ask (`app_page`:
-                // stricter than the switch's `local_page`), or a browser page
-                // whose exact origin SSF_BANK_DEV_PAGES names; the gate runs
-                // before anything reads the identity file. An answer the gate
-                // passed is readable by that one origin only; its refusal by
-                // whatever origin the API grants, so a dev page reads why.
+                // them. Only a browser page whose exact origin
+                // SSF_BANK_DEV_PAGES names may ask (`app_page`: stricter than
+                // the switch's `local_page`); the desktop app's own page may
+                // not, as the app shows the words in its own window. The
+                // gate runs before anything reads the identity file. An
+                // answer the gate passed is readable by that one origin only;
+                // its refusal by whatever origin the API grants, so a dev
+                // page reads why.
                 let target = req.split_whitespace().nth(1).unwrap_or("");
                 let host_header = header_value(&req, "host");
                 let origin = origin_header.as_deref();

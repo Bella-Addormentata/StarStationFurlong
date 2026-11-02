@@ -24,9 +24,10 @@
 //! 🏦 BACK UP: while the wallet is on and its words are not marked saved, the
 //! Bank shows the 24 words (`POST /api/chia/words`) and records the player's
 //! "I saved them" ([`SAVED_FILE`], `POST /api/chia/words/saved?key=`). Only
-//! the desktop app's own page may ask ([`app_page`]), or a browser page whose
-//! exact origin the operator lists in `SSF_BANK_DEV_PAGES` ([`dev_pages`]).
-//! Once saved, the page never shows them again.
+//! a browser page whose exact origin the operator lists in
+//! `SSF_BANK_DEV_PAGES` ([`dev_pages`]) may ask ([`app_page`]); the desktop
+//! app's own page may not, because the app shows the words in its own
+//! window. Once saved, the page never shows them again.
 //!
 //! 🖥️ The desktop app can ask too, over the spawned node's own stdin and
 //! stdout (shell_channel.rs), with the same rules ([`Asker::Shell`]). While
@@ -527,19 +528,23 @@ pub fn dev_pages() -> &'static [String] {
     PAGES.get_or_init(|| dev_pages_of(std::env::var_os("SSF_BANK_DEV_PAGES").as_deref()))
 }
 
-/// Whether a words request comes from the desktop app's own page: stricter
-/// than [`local_page`] (whose Host and port rules it keeps), it takes only
-/// `tauri://localhost`, `http(s)://tauri.localhost` with no port on Windows
-/// (WebView2), or an origin listed exactly (case-blind) in `dev_pages`. A
-/// loopback page on another port (another project's dev server, a notebook)
-/// never reads the words unless the operator names it.
+/// Whether a words request comes from a page the operator named: stricter
+/// than [`local_page`] (whose Host and port rules it keeps), it takes only an
+/// origin listed exactly (case-blind) in `dev_pages` (`SSF_BANK_DEV_PAGES`).
+/// A loopback page on another port (another project's dev server, a
+/// notebook) never reads the words unless the operator names it.
 ///
-/// Known gaps, accepted for testnet and closed by a native reveal in the
-/// desktop host before mainnet: another OS account on this computer shares
-/// loopback and can send these headers, and a script in the game page itself
-/// passes this check. While the desktop app's channel is on, the words route
-/// refuses every page ask before this check ([`words_gate`]), so neither
-/// gap reaches the words then. The channel never runs this check.
+/// The desktop app's own page (`tauri://localhost`, or
+/// `http(s)://tauri.localhost` on Windows) is not taken: the app shows the
+/// words in its own backup window, over its channel to the node it started,
+/// and never through this route. Any program on this computer can send
+/// those two origins, so taking them would let it read the words.
+///
+/// Known gap, accepted for testnet, and only where the operator lists a
+/// page: any program on this computer, of any OS account, can send that
+/// page's origin too. A page off a test network, or any page while the
+/// desktop app's channel is on, is refused before this check
+/// ([`words_gate`]). The channel never runs it.
 pub fn app_page(origin: Option<&str>, host: Option<&str>, port: u16, dev_pages: &[String]) -> bool {
     if !local_page(origin, host, port) {
         return false;
@@ -547,10 +552,7 @@ pub fn app_page(origin: Option<&str>, host: Option<&str>, port: u16, dev_pages: 
     let Some(origin) = origin.map(str::trim) else {
         return false;
     };
-    origin.eq_ignore_ascii_case("tauri://localhost")
-        || (cfg!(windows)
-            && (origin.eq_ignore_ascii_case("http://tauri.localhost") || origin.eq_ignore_ascii_case("https://tauri.localhost")))
-        || dev_pages.iter().any(|d| d.eq_ignore_ascii_case(origin))
+    dev_pages.iter().any(|d| d.eq_ignore_ascii_case(origin))
 }
 
 /// The head of every words-route answer: never cached, never sniffed, and
@@ -576,8 +578,8 @@ pub fn words_reply_head(status: &str, allow_origin: Option<&str>, len: usize) ->
 
 /// The words routes' refusals, in the Bank's words (a read-only build
 /// answers every ask that passes the gate with [`UNBUILT_WORDS`]).
-pub const BACKUP_PAGE_ONLY: &str = "only the Star Station app on this computer can show the 24 words \
-     (a browser page needs its origin in SSF_BANK_DEV_PAGES in the node's environment)";
+pub const BACKUP_PAGE_ONLY: &str = "only the Star Station desktop app's backup window can show the 24 words, \
+     from a node the app started itself (a browser page needs its origin in SSF_BANK_DEV_PAGES in the node's environment)";
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub const BACKUP_TURNING: &str = "the wallet is turning; tap SHOW again in a moment";
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
@@ -1284,15 +1286,23 @@ mod tests {
     }
 
     #[test]
-    fn only_the_desktop_app_or_a_named_dev_page_may_read_the_words() {
+    fn only_a_named_dev_page_may_read_the_words() {
         let none: Vec<String> = vec![];
         let dev = dev_pages_of(Some(OsStr::new("http://localhost:5173")));
         let ok = |o: &str, h: &str, pages: &[String]| app_page(Some(o), Some(h), 8080, pages);
-        assert!(ok("tauri://localhost", "127.0.0.1:8080", &none), "the desktop app on macOS and Linux");
-        assert!(ok("TAURI://LOCALHOST", "localhost:8080", &none));
-        assert_eq!(ok("http://tauri.localhost", "127.0.0.1:8080", &none), cfg!(windows), "the desktop app on Windows only");
-        assert_eq!(ok("https://tauri.localhost", "127.0.0.1:8080", &none), cfg!(windows));
-        assert!(!ok("http://tauri.localhost:8000", "127.0.0.1:8080", &none));
+        // The desktop app's own page is refused on every OS: the app shows
+        // the words in its backup window, and any program can send these.
+        for pages in [&none, &dev] {
+            for app in ["tauri://localhost", "TAURI://LOCALHOST", "http://tauri.localhost", "https://tauri.localhost", "http://tauri.localhost:8000"] {
+                for host in ["127.0.0.1:8080", "localhost:8080"] {
+                    assert!(!ok(app, host, pages), "{app} {host} {pages:?}");
+                }
+            }
+        }
+        // An operator who names the app's origin is taken at their word, as
+        // for any listed page that local_page accepts.
+        let named = dev_pages_of(Some(OsStr::new("tauri://localhost")));
+        assert!(ok("tauri://localhost", "127.0.0.1:8080", &named));
 
         assert!(!ok("http://localhost:5173", "127.0.0.1:8080", &none), "a loopback page needs the operator's word");
         assert!(ok("http://localhost:5173", "127.0.0.1:8080", &dev), "the named dev page");
@@ -1305,10 +1315,9 @@ mod tests {
             assert!(!ok("https://example.com", "127.0.0.1:8080", pages), "a website");
             assert!(!ok("null", "127.0.0.1:8080", pages), "a sandboxed or file page");
             assert!(!app_page(None, Some("127.0.0.1:8080"), 8080, pages), "no Origin: a local process");
-            assert!(!app_page(Some("tauri://localhost"), None, 8080, pages), "no Host");
-            assert!(!ok("tauri://localhost", "rebound.example.com:8080", pages), "a re-bound Host");
-            assert!(!ok("tauri://localhost", "127.0.0.1:8081", pages), "another port's API");
-            assert!(!ok("http://localhost:5173", "rebound.example.com:8080", pages));
+            assert!(!app_page(Some("http://localhost:5173"), None, 8080, pages), "no Host");
+            assert!(!ok("http://localhost:5173", "rebound.example.com:8080", pages), "a re-bound Host");
+            assert!(!ok("http://localhost:5173", "127.0.0.1:8081", pages), "another port's API");
         }
         let web = dev_pages_of(Some(OsStr::new("https://example.com")));
         assert!(!ok("https://example.com", "127.0.0.1:8080", &web), "a web origin never passes, listed or not");
@@ -1729,7 +1738,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(words_gate(true, "/api/chia/words", Some("tauri://localhost"), host, 8080, &none), WordsGate::Pass);
+        assert_eq!(words_gate(true, "/api/chia/words", Some("tauri://localhost"), host, 8080, &none), WordsGate::Forbidden, "the app's page, with no channel");
+        assert_eq!(words_gate(true, "/api/chia/words", Some("http://tauri.localhost"), host, 8080, &dev), WordsGate::Forbidden);
+        assert_eq!(words_gate(true, "/api/chia/words", Some("https://tauri.localhost"), host, 8080, &dev), WordsGate::Forbidden);
         assert_eq!(words_gate(true, "/api/chia/words", Some("http://localhost:5173"), host, 8080, &dev), WordsGate::Pass);
         assert_eq!(words_gate(true, "/api/chia/words", Some("https://example.com"), host, 8080, &dev), WordsGate::Forbidden);
         assert_eq!(
