@@ -19,10 +19,10 @@
 //! entropy or the words, only the derived wallet key.
 //!
 //! 🔒 Once the words are marked saved, [`wrap_at_rest`] locks the file with
-//! this computer's store (chia_at_rest.rs: Windows DPAPI): the entropy is
-//! replaced by a `blob` only this account can open, in one guarded rename
-//! that never leaves the wallet without a whole file. Minting always writes
-//! the clear form first.
+//! this computer's store (chia_at_rest.rs: Windows DPAPI, and the Mac login
+//! keychain once it is switched on): the entropy is replaced by a `blob`
+//! only this account can open, in one guarded rename that never leaves the
+//! wallet without a whole file. Minting always writes the clear form first.
 //!
 //! A node from before the words kept a raw 32-byte seed in
 //! `chia_identity.seed`. No words reproduce its key, so turning such a wallet
@@ -78,20 +78,25 @@ use crate::chia_at_rest::{self, AtRest, Policy, SecretStore};
 use crate::chia_network::ChiaNet;
 
 /// The identity file's format, its one `kind`, and the `protect` values this
-/// node reads: `none` (the entropy in the clear) and `dpapi` (a `blob` in
-/// place of the entropy). Any other `protect`, or a field this node does not
-/// know, is a newer Star Station's file: refused, never minted over.
+/// node reads: `none` (the entropy in the clear), and `dpapi` and `keychain`
+/// (a `blob` in place of the entropy, in the same fields). A locked file
+/// opens only with a store of its own `protect`; on any other computer it is
+/// refused as locked by a store it does not have. Any other `protect`, or a
+/// field this node does not know, is a newer Star Station's file: refused,
+/// never minted over.
 const IDENTITY_V: u64 = 1;
 const IDENTITY_KIND: &str = "bip39-english";
 const PROTECT_NONE: &str = "none";
 const PROTECT_DPAPI: &str = "dpapi";
+const PROTECT_KEYCHAIN: &str = "keychain";
 
 /// Every field a v1 file can carry. `net` is optional: absent means testnet11.
 const KNOWN_FIELDS: [&str; 9] = ["v", "kind", "net", "protect", "entropy", "blob", "fingerprint", "at", "wrapped_at"];
 
 /// The longest `blob` a reader takes, in base64 characters. DPAPI's for 32
-/// bytes is a few hundred; this keeps the file well under [`FILE_MAX`].
-const BLOB_MAX: usize = 2048;
+/// bytes is a few hundred, the keychain's 116; this keeps the file well
+/// under [`FILE_MAX`].
+pub(crate) const BLOB_MAX: usize = 2048;
 
 /// Bytes of BIP39 entropy in the identity: 24 words.
 const ENTROPY_LEN: usize = 32;
@@ -440,6 +445,7 @@ fn read_identity(net: ChiaNet, path: &Path, store: Option<&dyn SecretStore>) -> 
     let protect = match protect {
         PROTECT_NONE => AtRest::None,
         PROTECT_DPAPI => AtRest::Dpapi,
+        PROTECT_KEYCHAIN => AtRest::Keychain,
         _ => return Err(newer()),
     };
     // A file locked by a store this computer does not have: say whose,
@@ -449,7 +455,7 @@ fn read_identity(net: ChiaNet, path: &Path, store: Option<&dyn SecretStore>) -> 
         locked => match store.filter(|s| s.protect() == locked) {
             Some(s) => Some(s),
             None => {
-                let e = chia_at_rest::StoreError { refusal: chia_at_rest::Refusal::Foreign(locked), code: 0 };
+                let e = chia_at_rest::StoreError { refusal: chia_at_rest::Refusal::Foreign(locked), code: chia_at_rest::Code::None };
                 return Err(anyhow!("{}", chia_at_rest::refusal_words(path, e)));
             }
         },
@@ -510,14 +516,15 @@ fn identity_net_is(field: Option<&str>, net: ChiaNet) -> bool {
 pub(crate) enum Body<'a> {
     /// The entropy itself (`protect:"none"`).
     Clear(&'a [u8; ENTROPY_LEN]),
-    /// A store's blob of it (`protect:"dpapi"`).
+    /// A store's blob of it (`protect:"dpapi"` or `"keychain"`).
     Locked(AtRest, &'a [u8]),
 }
 
 /// The identity file's bytes: the one encode site. Always one of these exact
 /// shapes, with nothing that needs escaping:
 /// `{"v":1,"kind":"bip39-english","protect":"none","entropy":"<64 hex>","fingerprint":N,"at":T}`, or
-/// `{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"<base64>","fingerprint":N,"at":T,"wrapped_at":W}`.
+/// `{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"<base64>","fingerprint":N,"at":T,"wrapped_at":W}`,
+/// where a keychain lock has `"protect":"keychain"` and the same fields.
 /// On testnet11 that is all. Any other network adds its id after `kind`:
 /// `{"v":1,"kind":"bip39-english","net":"mainnet","protect":…`.
 fn encode_identity(net: ChiaNet, body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -> Zeroizing<String> {
@@ -541,6 +548,7 @@ fn encode_identity(net: ChiaNet, body: Body<'_>, fingerprint: u32, at: u64, wrap
         Body::Locked(protect, blob) => {
             let protect = match protect {
                 AtRest::Dpapi => PROTECT_DPAPI,
+                AtRest::Keychain => PROTECT_KEYCHAIN,
                 AtRest::None => unreachable!("a clear body is Body::Clear"),
             };
             head(&mut out);
@@ -979,12 +987,12 @@ pub(crate) fn wrap_at_rest_with(
     // 2. Lock, and open again.
     let blob = match store.wrap(&opened.entropy, fingerprint) {
         Ok(blob) => blob,
-        Err(e) => return Wrapped::Skipped(format!("the store refused to lock it (code {:#x})", e.code)),
+        Err(e) => return Wrapped::Skipped(format!("the store refused to lock it ({})", chia_at_rest::short_words(e))),
     };
     match store.unwrap(&blob, fingerprint) {
         Ok(back) if back.as_slice() == &opened.entropy[..] => {}
         Ok(_) => return Wrapped::Skipped("the store gave back other bytes than it locked".into()),
-        Err(e) => return Wrapped::Skipped(format!("the store could not open what it locked (code {:#x})", e.code)),
+        Err(e) => return Wrapped::Skipped(format!("the store could not open what it locked ({})", chia_at_rest::short_words(e))),
     }
     let bytes = encode_identity(net, Body::Locked(store.protect(), &blob), fingerprint, opened.at, unix_now());
     if bytes.len() > FILE_MAX || base64::engine::general_purpose::STANDARD.encode(&blob).len() > BLOB_MAX {
@@ -1073,14 +1081,11 @@ pub(crate) fn wrap_at_rest_with(
 }
 
 /// The line a lock prints: what it did, and what it did not reach.
-pub fn log_wrapped(identity: &Path, outcome: &Wrapped) {
+/// `protect` is the store that locked it.
+pub fn log_wrapped(identity: &Path, outcome: &Wrapped, protect: AtRest) {
     match outcome {
         Wrapped::Done { linked } => {
-            println!(
-                "🔒 SSF wallet: locked {} to this Windows account, since its 24 words are saved; copies of it made before this lock \
-                 (a synced or zipped folder, a backup) still hold the key in the clear: delete them",
-                identity.display()
-            );
+            println!("{}", locked_line(identity, protect));
             if *linked {
                 eprintln!(
                     "🔒 SSF wallet: another name still points at the old {} (a hard link), and it keeps the key in the clear: delete it",
@@ -1101,6 +1106,21 @@ pub fn log_wrapped(identity: &Path, outcome: &Wrapped) {
     }
 }
 
+/// The line of a lock that landed: with which store, and the copies made
+/// before it that it did not reach.
+fn locked_line(identity: &Path, protect: AtRest) -> String {
+    let copies = match protect {
+        AtRest::Keychain => "a synced or zipped folder, a Time Machine backup or snapshot",
+        AtRest::Dpapi | AtRest::None => "a synced or zipped folder, a backup",
+    };
+    format!(
+        "🔒 SSF wallet: locked {} {}, since its 24 words are saved; copies of it made before this lock ({copies}) \
+         still hold the key in the clear: delete them",
+        identity.display(),
+        chia_at_rest::lock_words(protect)
+    )
+}
+
 /// Leftovers of a lock that stopped (`.<name>.rewrap-*` and their probes),
 /// looked at before every load.
 ///
@@ -1108,12 +1128,12 @@ pub fn log_wrapped(identity: &Path, outcome: &Wrapped) {
 /// some filesystem lost, or an identity moved aside mid-lock), the newest
 /// such file is put back as the identity, with the same never-replace link
 /// as a mint, and nothing is minted over it. A locked copy that does not
-/// open now (another Windows account, a store that fails, a folder from
-/// another computer), or one that cannot be put back, stops the mint with
-/// an error: it may be the only file that holds the wallet. Only a torn
-/// leftover lets a new wallet be minted. Nothing is removed here: leftovers
-/// go once the identity has opened ([`remove_rewrap_leftovers`]). Only a
-/// copy of `net`'s wallet is put back.
+/// open now (another account, a locked keychain, a store that fails, a
+/// folder from another computer), or one that cannot be put back, stops
+/// the mint with an error: it may be the only file that holds the wallet.
+/// Only a torn leftover lets a new wallet be minted. Nothing is removed
+/// here: leftovers go once the identity has opened
+/// ([`remove_rewrap_leftovers`]). Only a copy of `net`'s wallet is put back.
 fn recover_rewrap(net: ChiaNet, identity: &Path, store: Option<&dyn SecretStore>) -> Result<()> {
     let mut leftovers = rewrap_leftovers(identity);
     // A `try_exists` error is reported by the loader's own check.
@@ -1155,8 +1175,8 @@ fn recover_rewrap(net: ChiaNet, identity: &Path, store: Option<&dyn SecretStore>
     Err(match read_identity(net, leftover, store) {
         Err(e) => anyhow!(
             "chia identity file {id} is missing, and a stopped lock left a locked copy of a wallet beside it, {shown}, \
-             that does not open now ({e}); no new wallet is minted over it: start the node from the Windows account \
-             that locked it, or move {shown} aside to start a new wallet"
+             that does not open now ({e}); no new wallet is minted over it: start the node as the user, on the computer, \
+             that locked it, with its store unlocked, or move {shown} aside to start a new wallet"
         ),
         // A second name of a lock's file, or a store that opened it only on
         // a second try: still not put back by itself.
@@ -1385,6 +1405,7 @@ pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
         let kept = match id.at_rest {
             AtRest::None => "",
             AtRest::Dpapi => " (its file locked to this Windows account)",
+            AtRest::Keychain => " (its file locked with this Mac user's login keychain)",
         };
         println!("🏦 SSF wallet: loaded the wallet made from 24 words, key fingerprint {}{kept}", id.fingerprint);
     }
@@ -1744,7 +1765,7 @@ mod tests {
         ];
         let newer: Vec<(&str, String)> = vec![
             ("v2", good.replace(r#""v":1"#, r#""v":2"#)),
-            ("the keychain, which this node does not open yet", good.replace(r#""protect":"none""#, r#""protect":"keychain""#)),
+            ("a store this node does not know", good.replace(r#""protect":"none""#, r#""protect":"tpm""#)),
             ("another kind", good.replace("bip39-english", "bip39-japanese")),
             ("a field this node does not know", good.replace(r#""at":"#, r#""salt":"x","at":"#)),
         ];
@@ -2097,6 +2118,74 @@ mod tests {
         names(dir).into_iter().filter(|n| n.contains(".rewrap-")).collect()
     }
 
+    use crate::chia_at_rest::keychain_lock::fake::FakeHands;
+    use crate::chia_at_rest::keychain_lock::{self, KeychainHands, KeychainStore};
+
+    /// 🔒 The stores the file's tests run over: the DPAPI fake, and the
+    /// keychain store with fake hands (keychain_lock.rs), so every rule of
+    /// the file holds for both.
+    enum TestStore {
+        Dpapi(FakeStore),
+        Keychain(KeychainStore<FakeHands>),
+    }
+
+    impl TestStore {
+        fn both() -> [TestStore; 2] {
+            [TestStore::Dpapi(FakeStore::new()), TestStore::Keychain(KeychainStore::new(FakeHands::new()))]
+        }
+
+        /// Keys the store made so far: one per DPAPI wrap, and one per
+        /// keychain item (its adds), however many locks use it.
+        fn made(&self) -> u32 {
+            match self {
+                TestStore::Dpapi(s) => s.wraps.load(std::sync::atomic::Ordering::Relaxed),
+                TestStore::Keychain(s) => s.hands().counts().2,
+            }
+        }
+
+        /// The file's `protect` field for this store.
+        fn protect_field(&self) -> &'static str {
+            match self.protect() {
+                AtRest::Dpapi => r#""protect":"dpapi""#,
+                AtRest::Keychain => r#""protect":"keychain""#,
+                AtRest::None => unreachable!("a test store locks"),
+            }
+        }
+    }
+
+    impl SecretStore for TestStore {
+        fn protect(&self) -> AtRest {
+            match self {
+                TestStore::Dpapi(s) => s.protect(),
+                TestStore::Keychain(s) => s.protect(),
+            }
+        }
+
+        fn wrap(&self, entropy: &[u8; 32], fingerprint: u32) -> Result<Vec<u8>, chia_at_rest::StoreError> {
+            match self {
+                TestStore::Dpapi(s) => s.wrap(entropy, fingerprint),
+                TestStore::Keychain(s) => s.wrap(entropy, fingerprint),
+            }
+        }
+
+        fn unwrap(&self, blob: &[u8], fingerprint: u32) -> Result<Zeroizing<Vec<u8>>, chia_at_rest::StoreError> {
+            match self {
+                TestStore::Dpapi(s) => s.unwrap(blob, fingerprint),
+                TestStore::Keychain(s) => s.unwrap(blob, fingerprint),
+            }
+        }
+    }
+
+    /// A keychain store whose one (unlocked) keychain holds `kek` for the
+    /// wallet `fp`, or nothing.
+    fn keychain_holding(kek: Option<&[u8; 32]>, fp: u32) -> KeychainStore<FakeHands> {
+        let store = KeychainStore::new(FakeHands::new());
+        if let Some(kek) = kek {
+            store.hands().put_kek(0, &keychain_lock::account(fp), kek);
+        }
+        store
+    }
+
     /// The locked file's exact bytes, and the clear one's.
     #[test]
     fn the_locked_envelope_has_one_exact_shape() {
@@ -2108,114 +2197,246 @@ mod tests {
             encode_identity(T11, Body::Clear(&entropy_of(HAMSTER_HEX)), 7, 100, 200).as_str(),
             format!(r#"{{"v":1,"kind":"bip39-english","protect":"none","entropy":"{HAMSTER_HEX}","fingerprint":7,"at":100}}"#)
         );
+        // The keychain's: the same fields, on testnet11 and on mainnet.
+        assert_eq!(
+            encode_identity(T11, Body::Locked(AtRest::Keychain, &[0, 1, 2, 3, 4]), 7, 100, 200).as_str(),
+            r#"{"v":1,"kind":"bip39-english","protect":"keychain","blob":"AAECAwQ=","fingerprint":7,"at":100,"wrapped_at":200}"#
+        );
+        assert_eq!(
+            encode_identity(ChiaNet::Mainnet, Body::Locked(AtRest::Keychain, &[0, 1, 2, 3, 4]), 7, 100, 200).as_str(),
+            r#"{"v":1,"kind":"bip39-english","net":"mainnet","protect":"keychain","blob":"AAECAwQ=","fingerprint":7,"at":100,"wrapped_at":200}"#
+        );
+        // A real keychain blob is 85 bytes, 116 base64 characters.
+        let blob = keychain_lock::seal(&[7; 32], &[9; 24], &[1; 32], 42).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+        assert_eq!((blob.len(), b64.len()), (85, 116));
+        let file = encode_identity(T11, Body::Locked(AtRest::Keychain, &blob), u32::MAX, 1_730_000_000, 1_730_000_001);
+        assert_eq!(
+            file.as_str(),
+            format!(
+                r#"{{"v":1,"kind":"bip39-english","protect":"keychain","blob":"{b64}","fingerprint":4294967295,"at":1730000000,"wrapped_at":1730000001}}"#
+            )
+        );
+        assert!(file.len() < 300, "{} bytes", file.len());
         // The longest blob the reader takes still fits the file.
         let longest = vec![0u8; BLOB_MAX / 4 * 3];
         assert!(base64::engine::general_purpose::STANDARD.encode(&longest).len() <= BLOB_MAX);
         assert!(encode_identity(T11, Body::Locked(AtRest::Dpapi, &longest), u32::MAX, u64::MAX, u64::MAX).len() < FILE_MAX);
     }
 
+    /// 🔒 A saved wallet is locked in place by either store: the same seven
+    /// fields with its own `protect`, the same keys, and a reveal that
+    /// writes nothing.
     #[test]
     fn a_saved_wallet_is_locked_in_place_and_opens_to_the_same_wallet() {
-        let dir = fresh_dir("wrap");
-        let identity = dir.join("chia_identity.json");
-        let legacy = dir.join("chia_identity.seed");
-        let store = FakeStore::new();
-        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
-        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        let before = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-        assert_eq!(before.at_rest, AtRest::None);
+        for store in TestStore::both() {
+            let protect = store.protect();
+            let dir = fresh_dir(&format!("wrap-{protect:?}"));
+            let identity = dir.join("chia_identity.json");
+            let legacy = dir.join("chia_identity.seed");
+            let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+            let before = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+            assert_eq!(before.at_rest, AtRest::None);
 
-        let clear = std::fs::read(&identity).unwrap();
-        reveal_words_with(T11, &identity, Some(&store)).unwrap();
-        assert_eq!(std::fs::read(&identity).unwrap(), clear, "a reveal never writes");
+            let clear = std::fs::read(&identity).unwrap();
+            reveal_words_with(T11, &identity, Some(&store)).unwrap();
+            assert_eq!(std::fs::read(&identity).unwrap(), clear, "{protect:?}: a reveal never writes");
 
-        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
-        let text = std::fs::read_to_string(&identity).unwrap();
-        assert!(!text.contains(&HAMSTER_HEX[..16]) && !text.contains("entropy"), "the entropy is gone from the file: {text}");
-        assert!(text.contains(r#""protect":"dpapi""#) && text.contains(&format!(r#""fingerprint":{fp},"at":1730000000,"wrapped_at":"#)));
-        assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "protect", "v", "wrapped_at"]);
-        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"], "no leftovers beside it");
-        #[cfg(unix)]
-        assert_eq!(mode(&identity), 0o600);
+            assert_eq!(
+                wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop),
+                Wrapped::Done { linked: false },
+                "{protect:?}"
+            );
+            let text = std::fs::read_to_string(&identity).unwrap();
+            assert!(!text.contains(&HAMSTER_HEX[..16]) && !text.contains("entropy"), "the entropy is gone from the file: {text}");
+            assert!(text.contains(store.protect_field()) && text.contains(&format!(r#""fingerprint":{fp},"at":1730000000,"wrapped_at":"#)));
+            assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "protect", "v", "wrapped_at"]);
+            assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"], "{protect:?}: no leftovers beside it");
+            #[cfg(unix)]
+            assert_eq!(mode(&identity), 0o600);
 
-        let after = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-        assert!(!after.minted);
-        assert_eq!(after.at_rest, AtRest::Dpapi);
-        assert_eq!((after.fingerprint, after.wallet.public_key()), (before.fingerprint, before.wallet.public_key()));
-        let rev = reveal_words_with(T11, &identity, Some(&store)).unwrap();
-        assert_eq!(rev.words().collect::<Vec<_>>().join(" "), HAMSTER);
+            let after = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+            assert!(!after.minted);
+            assert_eq!(after.at_rest, protect);
+            assert_eq!((after.fingerprint, after.wallet.public_key()), (before.fingerprint, before.wallet.public_key()));
+            let locked = std::fs::read(&identity).unwrap();
+            let rev = reveal_words_with(T11, &identity, Some(&store)).unwrap();
+            assert!(rev.words().collect::<Vec<_>>().join(" ") == HAMSTER, "{protect:?}: the reveal gives the file's words");
+            assert_eq!(std::fs::read(&identity).unwrap(), locked, "{protect:?}: a reveal never writes");
 
-        let locked = std::fs::read(&identity).unwrap();
-        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Already(AtRest::Dpapi));
-        assert_eq!(std::fs::read(&identity).unwrap(), locked);
-        assert_eq!(store.wraps.load(std::sync::atomic::Ordering::Relaxed), 1, "locked once");
-        let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Already(protect));
+            assert_eq!(std::fs::read(&identity).unwrap(), locked);
+            assert_eq!(store.made(), 1, "{protect:?}: locked once");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// What a refusal tells the owner to do with the file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Advice {
+        /// The reader's own sentence: damaged, or a newer node's.
+        Fixed,
+        /// Not now: start the node again, nothing about keeping or moving.
+        Retry,
+        /// Keep it: it opens after an unlock, or as the account that made it.
+        Keep,
+        /// Keep it, and move it aside to start over: it never opens here.
+        Move,
     }
 
     /// A locked file this node cannot open, or one that is damaged, is
-    /// refused with a sentence that says what to keep, and left alone.
+    /// refused with a sentence that says what to keep, and left alone. Only
+    /// a file that never opens for this account says to move it aside.
     #[test]
     fn a_locked_file_that_does_not_open_is_refused_and_left_alone() {
-        use crate::chia_at_rest::{Refusal, StoreError};
+        use crate::chia_at_rest::keychain_lock::{exit_error, status_error};
+        use crate::chia_at_rest::{Code, Refusal, StoreError};
+        use Advice::*;
+        let entropy = entropy_of(HAMSTER_HEX);
+        let fp = keys_from_entropy(&entropy).fingerprint;
         let store = FakeStore::new();
-        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
-        let blob = store.wrap(&entropy_of(HAMSTER_HEX), fp).unwrap();
+        let blob = store.wrap(&entropy, fp).unwrap();
         let locked = encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).to_string();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
-        let short = base64::engine::general_purpose::STANDARD.encode(store.wrap(&[1u8; 32], fp).unwrap()[..20].to_vec());
+        let short = base64::engine::general_purpose::STANDARD.encode(&store.wrap(&[1u8; 32], fp).unwrap()[..20]);
         let no_store: Option<&dyn SecretStore> = None;
         let lost = FakeStore::new();
-        *lost.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::DpapiLost, code: 0x8009_000B });
+        *lost.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::DpapiLost, code: Code::Dpapi(0x8009_000B) });
         let busy = FakeStore::new();
-        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
-        let cases: Vec<(&str, String, Option<&dyn SecretStore>, &str)> = vec![
-            ("no store here", locked.clone(), no_store, "locked to a Windows account on the computer that made it"),
-            ("another account's", locked.clone(), Some(&lost), "another Windows account or PC"),
-            ("not now", locked.clone(), Some(&busy), "start the node again"),
-            ("entropy beside the blob", locked.replace(r#""blob":"#, &format!(r#""entropy":"{HAMSTER_HEX}","blob":"#)), Some(&store), "refusing to overwrite"),
-            ("no blob", locked.replace(&format!(r#""blob":"{b64}","#), ""), Some(&store), "refusing to overwrite"),
-            ("not base64", locked.replace(&b64, "%%%%"), Some(&store), "refusing to overwrite"),
-            ("an oversized blob", locked.replace(&b64, &"A".repeat(BLOB_MAX + 4)), Some(&store), "refusing to overwrite"),
-            ("opens to 20 bytes", locked.replace(&b64, &short), Some(&store), "refusing to overwrite"),
-            ("another fingerprint", locked.replace(&format!(r#""fingerprint":{fp}"#), &format!(r#""fingerprint":{}"#, fp ^ 1)), Some(&store), "refusing to overwrite"),
-            ("a field this node does not know", locked.replace(r#""at":"#, r#""salt":"x","at":"#), Some(&store), "update Star Station"),
-            ("a clear file that says it was locked", envelope(HAMSTER_HEX, fp).replace(r#""at":"#, r#""wrapped_at":1,"at":"#), Some(&store), "refusing to overwrite"),
+        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: Code::Dpapi(5) });
+
+        // The same wallet locked with the keychain: its item holds `kek`.
+        let kek = [7u8; 32];
+        let kblob = keychain_lock::seal(&kek, &[9; 24], &entropy, fp).unwrap();
+        let kb64 = base64::engine::general_purpose::STANDARD.encode(&kblob);
+        let klocked = encode_identity(T11, Body::Locked(AtRest::Keychain, &kblob), fp, 1730000000, 1730000001).to_string();
+        let mut flipped = kblob.clone();
+        flipped[40] ^= 0x01;
+        let flipped = base64::engine::general_purpose::STANDARD.encode(&flipped);
+        let cut = base64::engine::general_purpose::STANDARD.encode(&kblob[..84]);
+        let kgood = keychain_holding(Some(&kek), fp);
+        let kmissing = keychain_holding(None, fp);
+        let kreplaced = keychain_holding(Some(&[8u8; 32]), fp);
+        let kforeign = keychain_holding(None, fp);
+        kforeign.hands().put(0, &keychain_lock::account(fp), b"made by someone else\n");
+        let klocked_now = keychain_holding(Some(&kek), fp);
+        klocked_now.hands().set_unlocked(0, Some(false));
+        let kasks = keychain_holding(Some(&kek), fp);
+        *kasks.hands().read_fails.lock().unwrap() = Some(exit_error(36, Some(true)));
+        let knone = keychain_holding(Some(&kek), fp);
+        *knone.hands().ready_fails.lock().unwrap() = Some(status_error(-25307, None));
+        let kslow = keychain_holding(Some(&kek), fp);
+        *kslow.hands().read_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: Code::TimedOut });
+
+        /// Why, the file, the store, what the refusal says, and its advice.
+        type Case<'a> = (&'a str, String, Option<&'a dyn SecretStore>, &'a str, Advice);
+        let cases: Vec<Case> = vec![
+            ("no store here", locked.clone(), no_store, "locked to a Windows account on the computer that made it", Move),
+            ("another account's", locked.clone(), Some(&lost), "another Windows account or PC", Move),
+            ("not now", locked.clone(), Some(&busy), "start the node again", Retry),
+            ("a DPAPI file at the keychain", locked.clone(), Some(&kgood), "locked to a Windows account on the computer that made it", Move),
+            ("entropy beside the blob", locked.replace(r#""blob":"#, &format!(r#""entropy":"{HAMSTER_HEX}","blob":"#)), Some(&store), "refusing to overwrite", Fixed),
+            ("no blob", locked.replace(&format!(r#""blob":"{b64}","#), ""), Some(&store), "refusing to overwrite", Fixed),
+            ("not base64", locked.replace(&b64, "%%%%"), Some(&store), "refusing to overwrite", Fixed),
+            ("an oversized blob", locked.replace(&b64, &"A".repeat(BLOB_MAX + 4)), Some(&store), "refusing to overwrite", Fixed),
+            ("opens to 20 bytes", locked.replace(&b64, &short), Some(&store), "refusing to overwrite", Fixed),
+            ("another fingerprint", locked.replace(&format!(r#""fingerprint":{fp}"#), &format!(r#""fingerprint":{}"#, fp ^ 1)), Some(&store), "refusing to overwrite", Fixed),
+            ("a field this node does not know", locked.replace(r#""at":"#, r#""salt":"x","at":"#), Some(&store), "update Star Station", Fixed),
+            ("a clear file that says it was locked", envelope(HAMSTER_HEX, fp).replace(r#""at":"#, r#""wrapped_at":1,"at":"#), Some(&store), "refusing to overwrite", Fixed),
+            // 🍎 Locked with the keychain.
+            ("a keychain file, no store here", klocked.clone(), no_store, "login keychain of the Mac user that made it", Move),
+            ("a keychain file at DPAPI", klocked.clone(), Some(&store), "login keychain of the Mac user that made it", Move),
+            ("its item is missing", klocked.clone(), Some(&kmissing), "keychains do not hold (OSStatus -25300)", Move),
+            ("its item was made again", klocked.clone(), Some(&kreplaced), "another key than the one this Mac user's keychain now holds", Move),
+            ("an item the node did not make", klocked.clone(), Some(&kforeign), "not one this node made", Keep),
+            ("a flipped byte", klocked.replace(&kb64, &flipped), Some(&kgood), "its locked key is damaged", Keep),
+            ("a cut blob", klocked.replace(&kb64, &cut), Some(&kgood), "its locked key is damaged", Keep),
+            ("the keychain is locked", klocked.clone(), Some(&klocked_now), "run security unlock-keychain in this session", Keep),
+            ("the item would ask", klocked.clone(), Some(&kasks), "would ask before handing it over (security exit 36)", Keep),
+            ("no keychain in this session", klocked.clone(), Some(&knone), "this session has none the node can use (OSStatus -25307)", Keep),
+            ("the keychain does not answer", klocked.clone(), Some(&kslow), "right now (security did not answer within 10 s)", Retry),
+            ("a keychain blob beside entropy", klocked.replace(r#""blob":"#, &format!(r#""entropy":"{HAMSTER_HEX}","blob":"#)), Some(&kgood), "refusing to overwrite", Fixed),
+            ("a keychain file of another fingerprint", klocked.replace(&format!(r#""fingerprint":{fp}"#), &format!(r#""fingerprint":{}"#, fp ^ 1)), Some(&kgood), "keychains do not hold", Move),
+            ("a keychain file with a field this node does not know", klocked.replace(r#""at":"#, r#""salt":"x","at":"#), Some(&kgood), "update Star Station", Fixed),
         ];
-        for (why, text, store, says) in cases {
+        for (why, text, store, says, advice) in cases {
             let dir = fresh_dir("locked-refuse");
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, &text).unwrap();
             let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, store).unwrap_err());
             assert!(err.contains(says), "{why}: {err}");
-            if says != "refusing to overwrite" && says != "update Star Station" && says != "start the node again" {
-                assert!(err.contains("keep this file") && err.contains("move it aside"), "{why}: {err}");
+            let (keep, moves) = (err.contains("keep this file"), err.contains("move it aside"));
+            match advice {
+                Fixed => assert!(!keep, "{why}: {err}"),
+                Retry => assert!(!keep && !moves, "{why}: {err}"),
+                Keep => assert!(keep && !moves, "{why}: {err}"),
+                Move => assert!(keep && moves, "{why}: {err}"),
             }
-            assert!(!err.contains(&b64[..12]) && !err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
+            for shown in [&b64, &kb64] {
+                assert!(!err.contains(&shown[..12]), "{why}: {err}");
+            }
+            assert!(!err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
             assert_eq!(std::fs::read_to_string(&identity).unwrap(), text, "{why}: the file is left as it is");
             assert_eq!(names(&dir), ["chia_identity.json"], "{why}: nothing minted beside it");
             assert!(reveal_words_with(T11, &identity, store).is_err(), "{why}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+        assert_eq!(kgood.hands().counts().2, 0, "a refused file adds no keychain item");
+        // The good keychain opens its own file.
+        let dir = fresh_dir("locked-opens");
+        let identity = dir.join("chia_identity.json");
+        std::fs::write(&identity, &klocked).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&kgood)).unwrap();
+        assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Keychain));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every way a lock does not land leaves the file byte for byte as it
     /// was, and nothing beside it.
     #[test]
     fn a_lock_that_cannot_land_changes_nothing() {
-        use crate::chia_at_rest::{Refusal, StoreError};
+        use crate::chia_at_rest::keychain_lock::fake::login;
+        use crate::chia_at_rest::keychain_lock::{exit_error, status_error};
+        use crate::chia_at_rest::{Code, Refusal, StoreError};
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         let refuses = FakeStore::new();
-        *refuses.wrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
+        *refuses.wrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: Code::Dpapi(5) });
         let lies = FakeStore::new();
         *lies.unwrap_lies.lock().unwrap() = true;
-        let good = FakeStore::new();
         let no_store: Option<&dyn SecretStore> = None;
-        let cases: Vec<(&str, u32, Policy, Option<&dyn SecretStore>, &str)> = vec![
+        // 🍎 The keychain: locked, none in this session, an item the node
+        // did not make, and an item that would ask once it was made.
+        let locked = KeychainStore::new(FakeHands::with(&[(login(), Some(false))]));
+        let none_here = KeychainStore::new(FakeHands::with(&[]));
+        let foreign = keychain_holding(None, fp);
+        foreign.hands().put(0, &keychain_lock::account(fp), b"made by someone else\n");
+        let asks = keychain_holding(None, fp);
+        *asks.hands().read_fails.lock().unwrap() = Some(exit_error(36, Some(true)));
+        let unread = keychain_holding(None, fp);
+        *unread.hands().locate_fails.lock().unwrap() = Some(status_error(-25293, Some(true)));
+        /// Why, the fingerprint in use, the policy, the store, and the skip's words.
+        type Case<'a> = (&'a str, u32, Policy, Option<&'a dyn SecretStore>, &'a str);
+        let mut cases: Vec<Case> = vec![
             ("no store", fp, Policy::Os, no_store, "no store"),
-            ("policy none", fp, Policy::None, Some(&good), "=none"),
-            ("the store refuses", fp, Policy::Os, Some(&refuses), "refused to lock"),
+            ("the store refuses", fp, Policy::Os, Some(&refuses), "refused to lock it (code 0x5)"),
             ("the store gives back other bytes", fp, Policy::Os, Some(&lies), "other bytes"),
+            (
+                "the keychain is locked",
+                fp,
+                Policy::Os,
+                Some(&locked),
+                "refused to lock it (this Mac user's login keychain is locked for this session, and the node never asks for its password)",
+            ),
+            ("no keychain here", fp, Policy::Os, Some(&none_here), "no login keychain (OSStatus -25307); a node run as a service can set SSF_WALLET_AT_REST=none"),
+            ("an item the node did not make", fp, Policy::Os, Some(&foreign), "that the node did not make; it is left as it is"),
+            ("the new item would ask", fp, Policy::Os, Some(&asks), "could not open what it locked (macOS would ask before handing over the key"),
+            ("the search is refused", fp, Policy::Os, Some(&unread), "refused to lock it (macOS refused the key (OSStatus -25293))"),
         ];
+        let both = TestStore::both();
+        for store in &both {
+            cases.push(("policy none", fp, Policy::None, Some(store), "=none"));
+        }
         for (why, key, policy, store, says) in cases {
             let dir = fresh_dir("wrap-skip");
             let identity = dir.join("chia_identity.json");
@@ -2229,90 +2450,107 @@ mod tests {
             assert_eq!(names(&dir), ["chia_identity.json"], "{why}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+        assert_eq!(locked.hands().counts(), (1, 0, 0), "no run of security against a locked keychain");
+        assert_eq!(foreign.hands().counts().2, 0, "no add over an item the node did not make");
+        assert_eq!(
+            foreign.hands().item(0, &keychain_lock::account(fp)).as_deref(),
+            Some(&b"made by someone else\n"[..]),
+            "and it is left as it is"
+        );
 
-        // A clear file of another wallet.
-        let dir = fresh_dir("wrap-other");
-        let identity = dir.join("chia_identity.json");
-        let text = envelope(HAMSTER_HEX, fp);
-        std::fs::write(&identity, &text).unwrap();
-        assert_eq!(wrap_at_rest_with(T11, &identity, fp ^ 1, Policy::Os, Some(&good), &no_stop), Wrapped::OtherWallet);
-        assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
-        assert_eq!(names(&dir), ["chia_identity.json"]);
-        let _ = std::fs::remove_dir_all(&dir);
+        for good in &both {
+            let protect = good.protect();
+            // A clear file of another wallet.
+            let dir = fresh_dir("wrap-other");
+            let identity = dir.join("chia_identity.json");
+            let text = envelope(HAMSTER_HEX, fp);
+            std::fs::write(&identity, &text).unwrap();
+            assert_eq!(wrap_at_rest_with(T11, &identity, fp ^ 1, Policy::Os, Some(good), &no_stop), Wrapped::OtherWallet);
+            assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
+            assert_eq!(names(&dir), ["chia_identity.json"]);
+            let _ = std::fs::remove_dir_all(&dir);
 
-        // Another node holds the lock file.
-        let dir = fresh_dir("wrap-busy");
-        let identity = dir.join("chia_identity.json");
-        let text = envelope(HAMSTER_HEX, fp);
-        std::fs::write(&identity, &text).unwrap();
-        let other = open_lock(&identity).unwrap();
-        other.lock().unwrap();
-        match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &no_stop) {
-            Wrapped::Skipped(reason) => assert!(reason.contains("another node"), "{reason}"),
-            other => panic!("{other:?}"),
-        }
-        drop(other);
-        assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
-        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
-
-        // The file changes between the read and the rename (another node's
-        // write): the lock gives up, and the new bytes stay.
-        let changed = text.replace("1730000000", "1730000099");
-        let rewrite = |step: Step| {
-            if step == Step::Probed {
-                std::fs::write(&identity, &changed).unwrap();
+            // Another node holds the lock file.
+            let dir = fresh_dir("wrap-busy");
+            let identity = dir.join("chia_identity.json");
+            let text = envelope(HAMSTER_HEX, fp);
+            std::fs::write(&identity, &text).unwrap();
+            let other = open_lock(&identity).unwrap();
+            other.lock().unwrap();
+            match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(good), &no_stop) {
+                Wrapped::Skipped(reason) => assert!(reason.contains("another node"), "{protect:?}: {reason}"),
+                other => panic!("{protect:?}: {other:?}"),
             }
-            false
-        };
-        match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &rewrite) {
-            Wrapped::Skipped(reason) => assert!(reason.contains("changed"), "{reason}"),
-            other => panic!("{other:?}"),
+            drop(other);
+            assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
+            assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
+
+            // The file changes between the read and the rename (another node's
+            // write): the lock gives up, and the new bytes stay.
+            let changed = text.replace("1730000000", "1730000099");
+            let rewrite = |step: Step| {
+                if step == Step::Probed {
+                    std::fs::write(&identity, &changed).unwrap();
+                }
+                false
+            };
+            match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(good), &rewrite) {
+                Wrapped::Skipped(reason) => assert!(reason.contains("changed"), "{protect:?}: {reason}"),
+                other => panic!("{protect:?}: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&identity).unwrap(), changed);
+            assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        assert_eq!(std::fs::read_to_string(&identity).unwrap(), changed);
-        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A lock stopped at any step, as a crash would stop it, loses nothing:
     /// the next load opens the same wallet and mints nothing, a leftover is
-    /// kept for a minute and then removed, and the next lock lands.
+    /// kept for a minute and then removed, and the next lock lands. The
+    /// keychain makes one item for the wallet across all the retries.
     #[test]
     fn a_lock_stopped_at_any_step_loses_nothing() {
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
-        let store = FakeStore::new();
-        for at in [Step::Read, Step::Sealed, Step::Written, Step::Probed, Step::Locked, Step::Rechecked, Step::Renamed] {
-            let dir = fresh_dir("wrap-stop");
-            let identity = dir.join("chia_identity.json");
-            let legacy = dir.join("chia_identity.seed");
-            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-            let stop = |step: Step| step == at;
-            assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)), "{at:?}");
-            let left: Vec<String> = names(&dir).into_iter().filter(|n| n.contains(".rewrap-")).collect();
-            let expect_left = matches!(at, Step::Written | Step::Probed | Step::Locked | Step::Rechecked);
-            assert_eq!(left.len(), usize::from(expect_left), "{at:?}: {left:?}");
-            assert!(left.iter().all(|n| !n.ends_with(".probe")), "{at:?}: no probe is left");
+        for store in TestStore::both() {
+            let protect = store.protect();
+            for at in [Step::Read, Step::Sealed, Step::Written, Step::Probed, Step::Locked, Step::Rechecked, Step::Renamed] {
+                let dir = fresh_dir("wrap-stop");
+                let identity = dir.join("chia_identity.json");
+                let legacy = dir.join("chia_identity.seed");
+                std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+                let stop = |step: Step| step == at;
+                let stopped = wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop);
+                assert!(matches!(stopped, Wrapped::Skipped(_)), "{protect:?} {at:?}");
+                let left: Vec<String> = names(&dir).into_iter().filter(|n| n.contains(".rewrap-")).collect();
+                let expect_left = matches!(at, Step::Written | Step::Probed | Step::Locked | Step::Rechecked);
+                assert_eq!(left.len(), usize::from(expect_left), "{protect:?} {at:?}: {left:?}");
+                assert!(left.iter().all(|n| !n.ends_with(".probe")), "{protect:?} {at:?}: no probe is left");
 
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-            assert!(!id.minted, "{at:?}");
-            assert_eq!(id.fingerprint, fp, "{at:?}");
-            assert_eq!(id.at_rest, if at == Step::Renamed { AtRest::Dpapi } else { AtRest::None }, "{at:?}");
-            // A fresh leftover may be another node's lock in flight: kept.
-            assert_eq!(names(&dir).iter().filter(|n| n.contains(".rewrap-")).count(), left.len(), "{at:?}");
-            let two_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-            for n in &left {
-                std::fs::File::options().write(true).open(dir.join(n)).unwrap().set_modified(two_minutes_ago).unwrap();
+                let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+                assert!(!id.minted, "{protect:?} {at:?}");
+                assert_eq!(id.fingerprint, fp, "{protect:?} {at:?}");
+                assert_eq!(id.at_rest, if at == Step::Renamed { protect } else { AtRest::None }, "{protect:?} {at:?}");
+                // A fresh leftover may be another node's lock in flight: kept.
+                assert_eq!(names(&dir).iter().filter(|n| n.contains(".rewrap-")).count(), left.len(), "{protect:?} {at:?}");
+                for n in &left {
+                    age_two_minutes(&dir.join(n));
+                }
+                let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+                assert_eq!((id.fingerprint, id.minted), (fp, false), "{protect:?} {at:?}");
+                assert!(names(&dir).iter().all(|n| !n.contains(".rewrap-")), "{protect:?} {at:?}: the old leftover is removed");
+
+                let next = wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop);
+                assert!(
+                    matches!(next, Wrapped::Done { .. }) || next == Wrapped::Already(protect),
+                    "{protect:?} {at:?}: {next:?}"
+                );
+                let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+                assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, protect), "{protect:?} {at:?}");
+                if protect == AtRest::Keychain {
+                    assert_eq!(store.made(), 1, "{at:?}: one keychain item across the retries");
+                }
+                let _ = std::fs::remove_dir_all(&dir);
             }
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-            assert_eq!((id.fingerprint, id.minted), (fp, false), "{at:?}");
-            assert!(names(&dir).iter().all(|n| !n.contains(".rewrap-")), "{at:?}: the old leftover is removed");
-
-            assert!(
-                matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { .. } | Wrapped::Already(AtRest::Dpapi)),
-                "{at:?}"
-            );
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-            assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{at:?}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -2322,32 +2560,34 @@ mod tests {
     #[test]
     fn a_missing_identity_comes_back_from_a_stopped_locks_file() {
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
-        let store = FakeStore::new();
-        let dir = fresh_dir("wrap-recover");
-        let identity = dir.join("chia_identity.json");
-        let legacy = dir.join("chia_identity.seed");
-        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        let stop = |step: Step| step == Step::Rechecked;
-        assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
-        std::fs::remove_file(&identity).unwrap();
-        let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
-        assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
-        let _ = std::fs::remove_dir_all(&dir);
+        for store in TestStore::both() {
+            let protect = store.protect();
+            let dir = fresh_dir("wrap-recover");
+            let identity = dir.join("chia_identity.json");
+            let legacy = dir.join("chia_identity.seed");
+            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+            let stop = |step: Step| step == Step::Rechecked;
+            assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
+            std::fs::remove_file(&identity).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&store)).unwrap();
+            assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, protect));
+            let _ = std::fs::remove_dir_all(&dir);
 
-        let dir = fresh_dir("wrap-recover-junk");
-        let identity = dir.join("chia_identity.json");
-        let junk = dir.join(".chia_identity.json.rewrap-1-0");
-        std::fs::write(&junk, b"{\"v\":1").unwrap();
-        let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
-        assert!(id.minted, "nothing that opens: a new wallet");
-        assert!(junk.exists(), "a leftover that does not open is left as it is");
-        // Once a minute old, beside an identity that opens, the torn
-        // leftover is removed.
-        age_two_minutes(&junk);
-        let again = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
-        assert_eq!((again.fingerprint, again.minted), (id.fingerprint, false));
-        assert!(!junk.exists(), "the torn leftover is gone");
-        let _ = std::fs::remove_dir_all(&dir);
+            let dir = fresh_dir("wrap-recover-junk");
+            let identity = dir.join("chia_identity.json");
+            let junk = dir.join(".chia_identity.json.rewrap-1-0");
+            std::fs::write(&junk, b"{\"v\":1").unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
+            assert!(id.minted, "{protect:?}: nothing that opens: a new wallet");
+            assert!(junk.exists(), "{protect:?}: a leftover that does not open is left as it is");
+            // Once a minute old, beside an identity that opens, the torn
+            // leftover is removed.
+            age_two_minutes(&junk);
+            let again = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), true, Some(&store)).unwrap();
+            assert_eq!((again.fingerprint, again.minted), (id.fingerprint, false));
+            assert!(!junk.exists(), "{protect:?}: the torn leftover is gone");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A hard link someone made to the clear file (Unix or NTFS) keeps the
@@ -2468,50 +2708,88 @@ mod tests {
     }
 
     /// With the identity gone and a stopped lock's copy beside it that does
-    /// not open now (a store that fails, another Windows account, a folder
-    /// from another computer), the load refuses and mints nothing, however
-    /// old the copy is, and keeps it; once the store opens it, it comes back.
+    /// not open now (a store that fails, another Windows account, a locked
+    /// keychain, a folder from another computer), the load refuses and mints
+    /// nothing, however old the copy is, and keeps it; once the store opens
+    /// it, it comes back.
     #[test]
     fn a_missing_identity_beside_a_locked_copy_that_does_not_open_mints_nothing() {
-        use crate::chia_at_rest::{Refusal, StoreError};
+        use crate::chia_at_rest::{Code, Refusal, StoreError};
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         let good = FakeStore::new();
         let busy = FakeStore::new();
-        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
+        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: Code::Dpapi(5) });
         let lost = FakeStore::new();
-        *lost.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::DpapiLost, code: 0x8009_000B });
+        *lost.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::DpapiLost, code: Code::Dpapi(0x8009_000B) });
         let no_store: Option<&dyn SecretStore> = None;
-        let cases: Vec<(&str, Option<&dyn SecretStore>)> =
-            vec![("not now", Some(&busy)), ("another account's", Some(&lost)), ("no store here", no_store)];
+        // 🍎 The keychain whose item every lock here reuses, the same item in
+        // a keychain that is locked now, and a keychain without it.
+        let kek = [7u8; 32];
+        let kgood = keychain_holding(Some(&kek), fp);
+        let klocked = keychain_holding(Some(&kek), fp);
+        klocked.hands().set_unlocked(0, Some(false));
+        let kmissing = keychain_holding(None, fp);
+        let windows = "locked to a Windows account on the computer that made it";
+        let mac = "locked with the login keychain of the Mac user that made it";
+        type Cases<'a> = Vec<(&'a str, Option<&'a dyn SecretStore>, &'a str)>;
+        let groups: Vec<(&dyn SecretStore, Cases)> = vec![
+            (
+                &good,
+                vec![
+                    ("not now", Some(&busy), "could not be opened right now (code 0x5)"),
+                    ("another account's", Some(&lost), "another Windows account or PC"),
+                    ("no store here", no_store, windows),
+                    ("the keychain store", Some(&kgood), windows),
+                ],
+            ),
+            (
+                &kgood,
+                vec![
+                    ("the keychain is locked", Some(&klocked), "run security unlock-keychain in this session"),
+                    ("its item is missing", Some(&kmissing), "keychains do not hold"),
+                    ("no store here", no_store, mac),
+                    ("the DPAPI store", Some(&good), mac),
+                ],
+            ),
+        ];
         let words: Vec<&str> = HAMSTER.split_whitespace().collect();
-        for (why, store) in cases {
-            let dir = fresh_dir("wrap-recover-refused");
-            let identity = dir.join("chia_identity.json");
-            let legacy = dir.join("chia_identity.seed");
-            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-            let stop = |step: Step| step == Step::Rechecked;
-            assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &stop), Wrapped::Skipped(_)), "{why}");
-            std::fs::remove_file(&identity).unwrap();
-            let left = rewrap_names(&dir);
-            assert_eq!(left.len(), 1, "{why}: {left:?}");
-            let leftover = dir.join(&left[0]);
+        for (good, cases) in groups {
+            let protect = good.protect();
+            for (why, store, says) in cases {
+                let dir = fresh_dir("wrap-recover-refused");
+                let identity = dir.join("chia_identity.json");
+                let legacy = dir.join("chia_identity.seed");
+                std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+                let stop = |step: Step| step == Step::Rechecked;
+                let stopped = wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(good), &stop);
+                assert!(matches!(stopped, Wrapped::Skipped(_)), "{protect:?} {why}");
+                std::fs::remove_file(&identity).unwrap();
+                let left = rewrap_names(&dir);
+                assert_eq!(left.len(), 1, "{protect:?} {why}: {left:?}");
+                let leftover = dir.join(&left[0]);
 
-            for aged in [false, true] {
-                if aged {
-                    age_two_minutes(&leftover);
+                for aged in [false, true] {
+                    if aged {
+                        age_two_minutes(&leftover);
+                    }
+                    let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &legacy, true, store).unwrap_err());
+                    assert!(err.contains("missing") && err.contains(&left[0]), "{protect:?} {why}: {err}");
+                    assert!(err.contains(says), "{protect:?} {why}: {err}");
+                    assert!(err.contains("start the node as the user, on the computer, that locked it, with its store unlocked"), "{err}");
+                    assert!(!err.contains("Windows account that locked it"), "the advice fits every store: {err}");
+                    assert!(!err.contains(&HAMSTER_HEX[..12]), "{protect:?} {why}: {err}");
+                    assert!(err.split(|c: char| !c.is_ascii_alphabetic()).all(|t| !words.contains(&t)), "{protect:?} {why}: {err}");
+                    assert!(!identity.exists(), "{protect:?} {why}: no new wallet is minted");
+                    assert!(leftover.exists(), "{protect:?} {why}: the locked copy is kept");
                 }
-                let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &legacy, true, store).unwrap_err());
-                assert!(err.contains("missing") && err.contains(&left[0]), "{why}: {err}");
-                assert!(!err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
-                assert!(err.split(|c: char| !c.is_ascii_alphabetic()).all(|t| !words.contains(&t)), "{why}: {err}");
-                assert!(!identity.exists(), "{why}: no new wallet is minted");
-                assert!(leftover.exists(), "{why}: the locked copy is kept");
-            }
 
-            let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&good)).unwrap();
-            assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{why}");
-            let _ = std::fs::remove_dir_all(&dir);
+                let id = load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(good)).unwrap();
+                assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, protect), "{protect:?} {why}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
+        assert_eq!(kgood.hands().counts().2, 0, "every lock reused the keychain's one item");
+        assert_eq!(klocked.hands().counts().1, 0, "no run of security against a locked keychain");
     }
 
     /// An identity that is refused (damaged, or locked and not opening now)
@@ -2519,7 +2797,7 @@ mod tests {
     /// one intact file of the wallet. Moved aside, the copy comes back.
     #[test]
     fn a_damaged_identity_keeps_the_locked_copy_beside_it() {
-        use crate::chia_at_rest::{Refusal, StoreError};
+        use crate::chia_at_rest::{Code, Refusal, StoreError};
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         let store = FakeStore::new();
         let dir = fresh_dir("wrap-damaged-keep");
@@ -2553,7 +2831,7 @@ mod tests {
             .unwrap();
         age_two_minutes(&leftover);
         let busy = FakeStore::new();
-        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
+        *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: Code::Dpapi(5) });
         assert!(load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&busy)).is_err());
         assert!(leftover.exists(), "the locked copy is kept while the identity does not open");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2750,28 +3028,171 @@ mod tests {
     }
 
     /// A lock keeps the file's network: a locked mainnet file still says
-    /// `"net":"mainnet"` and opens only there.
+    /// `"net":"mainnet"` and opens only there, with either store.
     #[test]
     fn a_locked_file_keeps_its_network() {
-        let dir = fresh_dir("net-wrap");
+        for store in TestStore::both() {
+            let protect = store.protect();
+            let dir = fresh_dir("net-wrap");
+            let identity = dir.join("chia_identity.json");
+            let legacy = dir.join("chia_identity.seed");
+            let entropy = entropy_of(HAMSTER_HEX);
+            let fp = keys_from_entropy(&entropy).fingerprint;
+            std::fs::write(&identity, encode_identity(ChiaNet::Mainnet, Body::Clear(&entropy), fp, 1730000000, 0).as_bytes()).unwrap();
+            assert_eq!(wrap_at_rest_with(ChiaNet::Testnet11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Skipped(format!(
+                "chia identity file {} is not a wallet for testnet11, the Chia network this node runs on; it is left as it is",
+                identity.display()
+            )));
+            assert_eq!(wrap_at_rest_with(ChiaNet::Mainnet, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+            let text = std::fs::read_to_string(&identity).unwrap();
+            assert!(text.contains(&format!(r#""net":"mainnet",{}"#, store.protect_field())), "{protect:?}: {}", text.len());
+            assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "net", "protect", "v", "wrapped_at"]);
+            let id = load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, true, Some(&store)).unwrap();
+            assert_eq!((id.fingerprint, id.at_rest), (fp, protect));
+            assert!(load_or_mint_wallet_with(ChiaNet::Testnet11, &identity, &legacy, true, Some(&store)).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The line of a lock that landed names its store; the Windows one is
+    /// as it was.
+    #[test]
+    fn a_lock_says_which_store_locked_the_file() {
+        let p = Path::new("/ssf/chia_identity.json");
+        assert_eq!(
+            locked_line(p, AtRest::Dpapi),
+            "🔒 SSF wallet: locked /ssf/chia_identity.json to this Windows account, since its 24 words are saved; copies of it made \
+             before this lock (a synced or zipped folder, a backup) still hold the key in the clear: delete them"
+        );
+        assert_eq!(
+            locked_line(p, AtRest::Keychain),
+            "🔒 SSF wallet: locked /ssf/chia_identity.json with this Mac user's login keychain, since its 24 words are saved; \
+             copies of it made before this lock (a synced or zipped folder, a Time Machine backup or snapshot) still hold the \
+             key in the clear: delete them"
+        );
+    }
+
+    /// Runs `f` on a thread of its own and waits at most 30 s, so a store
+    /// that would prompt fails the test instead of hanging it.
+    fn on_a_thread<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what} took over 30 s: a prompt would have shown"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what} failed on its thread"),
+        }
+    }
+
+    /// 🍎 One wallet through the keychain store end to end, with any hands:
+    /// a clear file is locked, opens and reveals with `at_rest` Keychain;
+    /// then a clear copy is stopped at every step of a lock, loses nothing,
+    /// and locks again with the one item `items` counts. A store whose
+    /// keychains do not hold the item (`elsewhere`) refuses the locked file
+    /// as missing, leaves it as it is, and mints nothing. Every call that
+    /// reaches the store runs on a thread with a deadline.
+    fn a_wallet_locks_with<H: KeychainHands + Send + 'static>(
+        tag: &str,
+        store: std::sync::Arc<KeychainStore<H>>,
+        elsewhere: std::sync::Arc<KeychainStore<H>>,
+        items: &dyn Fn() -> usize,
+    ) {
+        use std::sync::Arc;
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let lock = |store: &Arc<KeychainStore<H>>, identity: &Path, at: Option<Step>| {
+            let (store, identity) = (Arc::clone(store), identity.to_path_buf());
+            on_a_thread("a lock", move || {
+                wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&*store), &|step| Some(step) == at)
+            })
+        };
+        let load = |store: &Arc<KeychainStore<H>>, identity: &Path| {
+            let (store, identity) = (Arc::clone(store), identity.to_path_buf());
+            on_a_thread("a load", move || {
+                let legacy = parent_dir(&identity).join("chia_identity.seed");
+                load_or_mint_wallet_with(T11, &identity, &legacy, true, Some(&*store))
+                    .map(|id| (id.fingerprint, id.minted, id.at_rest))
+                    .map_err(|e| format!("{e:#}"))
+            })
+        };
+        let reveal = |store: &Arc<KeychainStore<H>>, identity: &Path| {
+            let (store, identity) = (Arc::clone(store), identity.to_path_buf());
+            on_a_thread("a reveal", move || {
+                reveal_words_with(T11, &identity, Some(&*store))
+                    .map(|rev| (rev.fingerprint, rev.words().collect::<Vec<_>>().join(" ") == HAMSTER))
+                    .map_err(|e| format!("{e:#}"))
+            })
+        };
+
+        // A clear file, locked whole.
+        let dir = fresh_dir(&format!("{tag}-done"));
         let identity = dir.join("chia_identity.json");
-        let legacy = dir.join("chia_identity.seed");
-        let store = FakeStore::new();
-        let entropy = entropy_of(HAMSTER_HEX);
-        let fp = keys_from_entropy(&entropy).fingerprint;
-        std::fs::write(&identity, encode_identity(ChiaNet::Mainnet, Body::Clear(&entropy), fp, 1730000000, 0).as_bytes()).unwrap();
-        assert_eq!(wrap_at_rest_with(ChiaNet::Testnet11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Skipped(format!(
-            "chia identity file {} is not a wallet for testnet11, the Chia network this node runs on; it is left as it is",
-            identity.display()
-        )));
-        assert_eq!(wrap_at_rest_with(ChiaNet::Mainnet, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
-        let text = std::fs::read_to_string(&identity).unwrap();
-        assert!(text.contains(r#""net":"mainnet","protect":"dpapi""#), "{}", text.len());
-        assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "net", "protect", "v", "wrapped_at"]);
-        let id = load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, true, Some(&store)).unwrap();
-        assert_eq!((id.fingerprint, id.at_rest), (fp, AtRest::Dpapi));
-        assert!(load_or_mint_wallet_with(ChiaNet::Testnet11, &identity, &legacy, true, Some(&store)).is_err());
+        std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+        assert_eq!(lock(&store, &identity, None), Wrapped::Done { linked: false });
+        let locked = std::fs::read(&identity).unwrap();
+        assert!(std::str::from_utf8(&locked).unwrap().contains(r#""protect":"keychain""#), "{} bytes", locked.len());
+        assert_eq!(load(&store, &identity), Ok((fp, false, AtRest::Keychain)));
+        assert_eq!(reveal(&store, &identity), Ok((fp, true)), "the reveal gives the file's words");
+        assert_eq!(std::fs::read(&identity).unwrap(), locked, "a load and a reveal write nothing");
+        assert_eq!(items(), 1, "one item for the wallet");
+
+        // A clear copy, stopped at every step: nothing lost, still one item.
+        for at in [Step::Read, Step::Sealed, Step::Written, Step::Probed, Step::Locked, Step::Rechecked, Step::Renamed] {
+            let dir = fresh_dir(&format!("{tag}-stop"));
+            let identity = dir.join("chia_identity.json");
+            std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
+            assert!(matches!(lock(&store, &identity, Some(at)), Wrapped::Skipped(_)), "{at:?}");
+            let renamed = if at == Step::Renamed { AtRest::Keychain } else { AtRest::None };
+            assert_eq!(load(&store, &identity), Ok((fp, false, renamed)), "{at:?}");
+            for n in rewrap_names(&dir) {
+                age_two_minutes(&dir.join(n));
+            }
+            assert_eq!(load(&store, &identity), Ok((fp, false, renamed)), "{at:?}");
+            assert!(rewrap_names(&dir).is_empty(), "{at:?}: the old leftover is removed");
+            let next = lock(&store, &identity, None);
+            assert!(matches!(next, Wrapped::Done { .. } | Wrapped::Already(AtRest::Keychain)), "{at:?}: {next:?}");
+            assert_eq!(load(&store, &identity), Ok((fp, false, AtRest::Keychain)), "{at:?}");
+            assert_eq!(items(), 1, "{at:?}: still one item");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Keychains that do not hold the item: missing, and nothing changes.
+        let err = load(&elsewhere, &identity).unwrap_err();
+        assert!(err.contains("keychains do not hold") && err.contains("keep this file"), "{err}");
+        assert!(reveal(&elsewhere, &identity).is_err());
+        assert_eq!(std::fs::read(&identity).unwrap(), locked, "the file is left as it is");
+        assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"], "nothing minted beside it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end-to-end keychain run with fake hands, on every OS.
+    #[test]
+    fn a_wallet_locks_with_a_keychain_store() {
+        let store = std::sync::Arc::new(KeychainStore::new(FakeHands::new()));
+        let elsewhere = std::sync::Arc::new(KeychainStore::new(FakeHands::new()));
+        let counted = std::sync::Arc::clone(&store);
+        a_wallet_locks_with("keychain-fake", store, elsewhere, &|| counted.hands().item_count());
+        assert_eq!(counted.hands().counts().2, 1, "one add in all");
+    }
+
+    /// 🍎 The same run with real keychains, through `/usr/bin/security`: a
+    /// temporary keychain of the test's own, and a second one searched for
+    /// the same service, which does not hold the item. It runs only with
+    /// SSF_KEYCHAIN_TESTS=1 (the macOS CI job), and never touches the login
+    /// keychain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_wallet_locks_with_a_real_keychain() {
+        use crate::chia_at_rest::keychain::{tests_enabled, SecurityTool, TempKeychain};
+        if !tests_enabled("a_wallet_locks_with_a_real_keychain") {
+            return;
+        }
+        let (tk, other) = (TempKeychain::new(), TempKeychain::new());
+        let store = std::sync::Arc::new(tk.store());
+        let elsewhere = KeychainStore::new(SecurityTool::at(other.path().to_path_buf(), tk.service().to_string()));
+        a_wallet_locks_with("keychain-real", std::sync::Arc::clone(&store), std::sync::Arc::new(elsewhere), &|| tk.item_count());
+        assert_eq!(store.hands().counts().2, 0, "the guard refused nothing");
     }
 
     #[test]

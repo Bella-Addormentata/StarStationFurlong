@@ -6124,13 +6124,15 @@ fn lock_if_due(meta: &mut chia_wallet_switch::WalletMeta, policy: chia_at_rest::
     if !chia_at_rest::should_wrap(meta.backed_up, meta.at_rest, policy, store) {
         return;
     }
+    // should_wrap said yes, so there is a store.
+    let protect = store.unwrap_or_default();
     let net = chia_network::net();
     let identity = net.path(chia_wallet_switch::IDENTITY_FILE);
     let outcome = chia_wallet::wrap_at_rest(net, &identity, meta.fingerprint, policy);
-    chia_wallet::log_wrapped(&identity, &outcome);
+    chia_wallet::log_wrapped(&identity, &outcome, protect);
     match outcome {
         chia_wallet::Wrapped::Done { .. } => {
-            meta.at_rest = store.unwrap_or_default();
+            meta.at_rest = protect;
             meta.rewrapped = true;
         }
         chia_wallet::Wrapped::Already(at_rest) => meta.at_rest = at_rest,

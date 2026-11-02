@@ -137,6 +137,15 @@ url = { version = "2", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
+# 🔒 macOS: the login keychain keeps the key that opens the SSF wallet's file
+# (chia_at_rest/keychain.rs). Apple's own /usr/bin/security makes and reads
+# the item; these crates only search for it, read a keychain's lock state and
+# turn keychain prompts off. Already in the lockfile through the TLS crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", optional = true, default-features = false }
+security-framework-sys = { version = "2.17", optional = true, default-features = false }
+core-foundation = { version = "0.10", optional = true }
+
 # 🖥️ Linux: the desktop app's channel makes the node not dumpable while it
 # is on (shell_channel.rs), so no other process can reopen its pipes through
 # /proc. Already in the lockfile through other crates.
@@ -171,6 +180,7 @@ chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
     "dep:bip39", "dep:windows-sys",
+    "dep:security-framework", "dep:security-framework-sys", "dep:core-foundation",
 ]
 # ⛓️ Chia mainnet for development builds only (stage 2 of the mainnet
 # transition): lets `SSF_CHIA_NETWORK=mainnet` select it (chia_network.rs).
