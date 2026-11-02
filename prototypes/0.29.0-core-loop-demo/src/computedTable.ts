@@ -917,8 +917,9 @@ function retryPendingAttest(st: TableState): void {
  *  fields mirror `cp`, so it checks the very checkpoint (nextSid leaves k and g
  *  out). `was` is the fold the end was taken from, `prior` the page's last
  *  attestation (its base coverage, and to carry its `a` on), `now` this page's
- *  clock (the hearing gate). */
-function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null, now: number): void {
+ *  clock (the hearing gate), `played` the highest round it ever saw decided on
+ *  `was` (B10, as the trim attestation's condition 7). */
+function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null, now: number, played: number): void {
   if (!holdsDeed() || cp.e !== 1) return;
   // An end this page can't back with recent room hearing isn't vouched for: an
   // isolated page must not sign a stale end that F4 would restore over the
@@ -933,7 +934,11 @@ function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Ch
   const atBase = prior !== null && prior.sid === cp.b
     && cp.u === was.base.u && cp.l === (was.base.l ?? NO_CLOSE);
   if (!atBase && !was.rounds.some((v) => v.decided !== null && v.r === cp.u && v.close === cp.l)) return;
-  if (was.rounds.some((v) => v.decided !== null && v.r > cp.u)) return;
+  // 🏛️ (B10 on the end path) no round past cp.u was decided — not on `was`'s
+  // chain now, nor one this page saw decided whose records a peer has since
+  // deleted (played → st.decidedTo). Holds even when atBase: an end below a
+  // settled round would drop its payouts, and F4 would then restore that end.
+  if (played > cp.u || was.rounds.some((v) => v.decided !== null && v.r > cp.u)) return;
   if (was.pending || !casinoWhole(t)) return;
   const a = prior && prior.sid === cp.b ? prior.a : was.base.u;
   const body = {
@@ -3751,8 +3756,12 @@ function compactDuty(pub: string, now: number): void {
     finalizeComputed(e.t, e.inc, cp);
     // 🏛️ D2: vouch for the end this page just wrote, so F4 can put it back if
     // the ended table is turned live again (only a freshly written end: an end
-    // already in the doc was vouched for when it was written).
-    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, null, now);
+    // already in the doc was vouched for when it was written). The table's
+    // state carries the base a prior trim attestation covered (so a trim then
+    // an immediate end is still vouched for) and the highest round it saw
+    // decided (B10, so an end dropping a settled round is refused).
+    const est = tables.get(e.t);
+    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, est?.attested ?? null, now, est ? playedTo(est, e.res) : e.res.base.u);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
 }
@@ -4060,7 +4069,7 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
-    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now);
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now, playedTo(st, res));
     writeComputedOn(t, computedIncFor(t, game));
     return true;
   });
@@ -4389,7 +4398,7 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
-    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now);
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now, playedTo(st, res));
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
     return true;

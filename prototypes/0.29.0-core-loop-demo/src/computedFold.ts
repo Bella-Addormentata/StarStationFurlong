@@ -988,9 +988,17 @@ export function asHouseSumFor(ctx: Pick<FoldCtx, 'inc'>): (v: unknown) => HouseS
 }
 
 /** `digest(hs) = nextSid(ctx, hs)` over the checkpoint fields {b,u,l,n,e,s,h}
- *  only, so hs: checks the `sum:` whose `nextSid` it equals. */
+ *  only, so hs: checks the `sum:` whose `nextSid` it equals. Memoised by the
+ *  record object (and its t:inc): nextSid sorts and hashes up to 4,096 nets,
+ *  and the recovery and put-back duties read the same unchanged attestation
+ *  every frame. A stored record is immutable, so a change replaces the object
+ *  and the cache invalidates by identity (as checkpointCache does for `sum:`). */
+const houseSumDigestCache = new WeakMap<object, { key: string; sid: string }>();
 export function houseSumDigest(ctx: FoldCtx, hs: Pick<HouseSum, 'b' | 'u' | 'l' | 'n' | 'e' | 's' | 'h'>): string {
-  return nextSid(ctx, hs);
+  const key = `${ctx.t}\u0000${ctx.inc}`;
+  let hit = houseSumDigestCache.get(hs);
+  if (hit?.key !== key) houseSumDigestCache.set(hs, hit = { key, sid: nextSid(ctx, hs) });
+  return hit.sid;
 }
 
 /** The total order on hs: values (design §6.1), greater = the better check to

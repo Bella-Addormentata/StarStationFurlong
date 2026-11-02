@@ -779,3 +779,66 @@ describe('🏛️🧮 a trim below a round whose records a peer deleted is not v
     expect(hsOf(a)).toBeNull(); // refused — no owner signature over the dropping trim
   }, 60_000);
 });
+
+// ── 🏛️ Re-review follow-ups (PR 6a-2, round 3) ───────────────────────────────
+
+describe('🏛️🧮 an end below a round a peer deleted is not vouched (B10 on the end path)', () => {
+  it('switching off at round 1 after round 2 was decided writes the end sum: but no owner hs:', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const r1 = decideRound(pages, T0 + STEP);
+    let at = run(pages, r1.at + STEP, r1.at + 60_000, { step: STEP, until: () => pages.every(betting) });
+    const r2 = decideRound(pages, at + STEP);                 // round 2 decided
+    at = run(pages, r2.at + STEP, r2.at + STEP, { step: STEP }); // a folds it (decidedTo = 2)
+    expect(foldOf(a).rounds.some((v) => v.r === 2 && v.decided !== null)).toBe(true);
+    // A peer deletes round 2's closes; the fold drops to round 1, but the owner
+    // remembers it saw round 2 decided (st.decidedTo → playedTo).
+    const ses = a.casino.computedSessionForWrite(TABLE)!;
+    a.doc.transact(() => {
+      for (const k of [...ses.keys()]) if (k.startsWith('c:2:')) ses.delete(k);
+    });
+    at = run([a], at + STEP, at + STEP, { step: STEP });
+    expect(foldOf(a).rounds.some((v) => v.r === 2)).toBe(false);
+    // Switching off finalises an end at round 1 — but attestEnd refuses to vouch
+    // for it (played 2 > u 1): it would drop round 2's settled payouts, and F4
+    // would then restore that end over the room's higher checkpoints.
+    expect(a.table.switchComputedOff(TABLE, at)).toBe('ok');
+    expect((top(a).get(SUM) as { e?: number }).e).toBe(1); // the end is written
+    expect(hsOf(a)).toBeNull();                              // but not vouched for
+  }, 60_000);
+});
+
+describe('🏛️🧮 an owner-signed end outranks a counted head when the checkpoint is gone (F4 over an absent sum:)', () => {
+  it('the restore puts the owner’s end back, not the live head this page counted, when the doc holds no sum:', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const at = playAndTrim(pages, T0, 2); // a real round-2 live checkpoint P2
+    const P2val = top(a).get(SUM);        // the round-2 head a page counts
+    // A peer deletes the owner's hs:, so a fresh page C counts the round-2 head
+    // as its own chain but no owner checkpoint.
+    const cheat = await withCheat(pages, at);
+    cheat.doc.transact(() => cheat.doc.getMap('casinoComputed').delete(HS));
+    const c = await loadPage('C', 4);
+    sync(at, cheat, c);
+    // C grounds the round-2 head (past TAKEN_WAIT_MS) so a later contention is
+    // its own chain's, not a load give-way.
+    const t = run([c], at + STEP, at + 46_000, { step: STEP });
+    expect(recoveryOf(c).trigger).toBeNull();
+    // The owner signs an end at round 1, and a peer DELETES the doc's sum: — the
+    // checkpoint is absent, not a live rewind — leaving only C's forged round-2
+    // head and the owner's end.
+    const end1 = signAs(a, 'hsum', { v: 1, b: 'g', u: 1, l: L_HEX, n: { p: '10' }, e: 1, a: 0 }, CTX) as HouseSum;
+    cheat.doc.transact(() => {
+      const m = cheat.doc.getMap('casinoComputed');
+      m.delete(SUM);
+      m.set(HS, end1);
+    });
+    sync(t, cheat, c);
+    // With the sum: gone the chain alone would restore the forged round-2 head;
+    // the owner's end outranks it even absent a doc checkpoint, so C restores
+    // the end.
+    expect(recoveryOf(c).trigger).toBe('end');
+    expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(end1)));
+    expect(recHash(recoveryOf(c).head)).not.toBe(recHash(P2val));
+  }, 60_000);
+});

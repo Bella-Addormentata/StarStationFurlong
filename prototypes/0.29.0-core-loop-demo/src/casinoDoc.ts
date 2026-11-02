@@ -2426,20 +2426,27 @@ function chainTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | 
 
 /** 🏛️ What the owner-signed checkpoint A puts in motion at incarnation `c`
  *  (design §6.2 F), when one takes part (houseSumTakesPart):
- *  - 'junk' (F1): the doc holds none, or junk — even on a page that counted
- *    none itself (a late page restores the owner's check);
- *  - 'end' (F4): A is an end (`e: 1`) and the doc holds a live checkpoint
- *    (the end turned live again: no honest page reopens an ended table);
+ *  - 'end' (F4): A is an end (`e: 1`), whatever the doc holds short of its own
+ *    end — a live checkpoint (the end turned live again), or none/junk. No
+ *    honest page reopens an ended table, so a live head over A is forged;
+ *  - 'junk' (F1): A is live and the doc holds none, or junk — even on a page
+ *    that counted none itself (a late page restores the owner's check);
  *  - 'rewind' (F2b): a live checkpoint at or below A's round that A does not
  *    check (another close, or a replay the owner saw past).
  *  Null for an end in the doc (no restore touches an `e: 1`), for A's own
- *  checkpoint, and for anything above A (an extension A can't refute). */
+ *  checkpoint, and for anything above a live A (an extension A can't refute). */
 function houseSumTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
   const A = houseSumTakesPart(c);
   if (!A) return null;
-  if (cp === null) return 'junk';
-  if (cp.e === 1) return null;
+  // An end already in the doc is final: no restore touches it (checked before
+  // A so the doc's own end wins over the owner's counted one).
+  if (cp !== null && cp.e === 1) return null;
+  // 🏛️ An owner-signed end outranks any live head, so F4 restores it even when
+  // the doc's checkpoint is absent or junk — not only when a live checkpoint
+  // sits over it. Else a forged live head this page counted is restored in its
+  // place, again each time a peer deletes the `sum:`.
   if (A.e === 1) return 'end';
+  if (cp === null) return 'junk';
   if (cp.u <= A.u && liveSidOf(c, cp) !== houseSumDigest(c.ctx, A)) return 'rewind';
   return null;
 }
