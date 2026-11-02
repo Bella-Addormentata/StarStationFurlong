@@ -1,0 +1,851 @@
+//! 🖥️ The backup window: the app shows the SSF wallet's 24 words in a
+//! window of its own (native-reveal design, section 4, "Shell: the reveal
+//! window").
+//!
+//! The game page calls one command, [`open_backup`], and gets back one of
+//! eight fixed answers, never a word. The words go from the node, over the
+//! app's own pipe (shell_channel.rs), to the `reveal` window only: its page
+//! comes from the `ssfreveal` scheme, built into the binary, which answers
+//! that window's webview and no other. Two walls guard each command: the
+//! capabilities (capabilities/*.json) give `open_backup` to `main` only and
+//! the two reveal commands to `reveal` only, and each handler checks the
+//! caller's label and page itself ([`caller_is`]).
+//!
+//! The app keeps no copy of the words: each SHOW asks the node again, and
+//! the answer goes straight back to the window in a buffer wiped when it is
+//! dropped. The key fingerprint of the window's last reveal is kept, for
+//! I SAVED, and never goes to JavaScript.
+
+use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use tauri::{Manager, Url};
+
+use crate::shell_channel::{Answer, Channel, Failed, Hello, Op, Words, SHELL_NET};
+
+/// The scheme the window's page is served from.
+pub const SCHEME: &str = "ssfreveal";
+/// The backup window's label (its webview's too).
+pub const LABEL: &str = "reveal";
+/// The game page's window label (tauri.conf.json names none, so it is the
+/// default, "main").
+pub const MAIN: &str = "main";
+/// The backup window's title.
+pub const TITLE: &str = "Back up your 24 words";
+/// The page the window opens on.
+pub const INDEX_URL: &str = "ssfreveal://localhost/index.html";
+/// After the window closes without the words being marked saved,
+/// `open_backup` answers `busy` this long.
+pub const CLOSED_BUSY: Duration = Duration::from_secs(10);
+
+/// Every answer of the scheme carries this policy: scripts and styles from
+/// the scheme itself only, IPC to the app, and nothing else.
+pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src ipc: http://ipc.localhost; frame-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+const INDEX_HTML: &[u8] = include_bytes!("../reveal/index.html");
+const REVEAL_JS: &[u8] = include_bytes!("../reveal/reveal.js");
+const REVEAL_CSS: &[u8] = include_bytes!("../reveal/reveal.css");
+
+/// What the index shows for an address it does not have.
+const NO_ADDRESS: &str = "(no address)";
+
+/// The line the page shows where the window cannot keep screen capture out.
+const CAPTURE_NOTE: &str = "<p class=\"warn\" id=\"capture\">On Linux this window is not protected from screen capture: close screen sharing and recording apps first.</p>";
+
+// ── What open_backup answers ────────────────────────────────────────────────
+
+/// `open_backup`'s fixed answers (src/nativeShell.ts's list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenAnswer {
+    /// The window closed after the words were marked saved.
+    Saved,
+    /// The window closed without that.
+    Closed,
+    /// The app did not start the node, or has no channel to it.
+    NoChannel,
+    /// The node runs on another network than the app.
+    OtherNetwork,
+    /// The wallet is not on.
+    NotOn,
+    /// The wallet is on but not ready to show its address yet.
+    Turning,
+    /// The words are marked saved already.
+    AlreadySaved,
+    /// A window is out, or one just closed without a save.
+    Busy,
+}
+
+impl OpenAnswer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenAnswer::Saved => "saved",
+            OpenAnswer::Closed => "closed",
+            OpenAnswer::NoChannel => "no_channel",
+            OpenAnswer::OtherNetwork => "other_network",
+            OpenAnswer::NotOn => "not_on",
+            OpenAnswer::Turning => "turning",
+            OpenAnswer::AlreadySaved => "already_saved",
+            OpenAnswer::Busy => "busy",
+        }
+    }
+}
+
+/// The hello `open_backup` sends first, read: the address the window shows,
+/// or the answer that keeps the window shut. `sticky_other` is true once any
+/// hello in this run named another network.
+pub fn hello_gate(hello: Result<Hello, Failed>, sticky_other: bool) -> Result<String, OpenAnswer> {
+    let hello = hello.map_err(|_| OpenAnswer::NoChannel)?;
+    if sticky_other || !hello.is_net(SHELL_NET) {
+        return Err(OpenAnswer::OtherNetwork);
+    }
+    if hello.wallet != "on" {
+        return Err(OpenAnswer::NotOn);
+    }
+    if hello.backed_up {
+        return Err(OpenAnswer::AlreadySaved);
+    }
+    // A loaded wallet always has its address; without one it is mid-turn.
+    hello.address.ok_or(OpenAnswer::Turning)
+}
+
+/// What the window's last opening ended with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Outcome {
+    #[default]
+    Closed,
+    Saved,
+    AlreadySaved,
+}
+
+/// The one backup window's flight: at most one `open_backup` at a time.
+#[derive(Debug, Default)]
+pub struct Flight {
+    /// An `open_backup` is out (asking the node, or its window is open).
+    pub out: bool,
+    /// The window's instance, bumped at every opening.
+    pub instance: u64,
+    /// The key fingerprint of this instance's last reveal.
+    pub key: Option<u32>,
+    /// The address this instance was opened for (from the hello).
+    pub address: Option<String>,
+    pub outcome: Outcome,
+    /// When the last window closed without a save.
+    pub closed_unsaved: Option<Instant>,
+}
+
+/// `busy` while a window is out and for [`CLOSED_BUSY`] after one closed
+/// without a save; otherwise None (the call may go ahead).
+pub fn flight_gate(f: &Flight, now: Instant) -> Option<OpenAnswer> {
+    let cooling = f.closed_unsaved.is_some_and(|at| now.saturating_duration_since(at) < CLOSED_BUSY);
+    (f.out || cooling).then_some(OpenAnswer::Busy)
+}
+
+/// The app's backup state: the node's channel (none when the app did not
+/// start the node, or started it without the channel) and the flight.
+pub struct Backup {
+    channel: Option<Arc<Channel>>,
+    flight: Mutex<Flight>,
+}
+
+impl Backup {
+    pub fn new(channel: Option<Arc<Channel>>) -> Backup {
+        Backup { channel, flight: Mutex::new(Flight::default()) }
+    }
+
+    /// Start one `open_backup`: `no_channel` without a channel, `busy` while
+    /// [`flight_gate`] says so, otherwise the channel, with the flight now
+    /// out (the caller ends it with [`Backup::end`]).
+    pub fn begin(&self, now: Instant) -> Result<Arc<Channel>, OpenAnswer> {
+        let channel = self.channel.clone().ok_or(OpenAnswer::NoChannel)?;
+        let mut f = self.flight();
+        if let Some(busy) = flight_gate(&f, now) {
+            return Err(busy);
+        }
+        f.out = true;
+        Ok(channel)
+    }
+
+    /// End the flight [`Backup::begin`] started, with its answer: the key and
+    /// the address go, and a close without a save starts the busy time.
+    pub fn end(&self, answer: OpenAnswer, now: Instant) {
+        let mut f = self.flight();
+        f.out = false;
+        f.key = None;
+        f.address = None;
+        if answer == OpenAnswer::Closed {
+            f.closed_unsaved = Some(now);
+        }
+    }
+
+    fn flight(&self) -> std::sync::MutexGuard<'_, Flight> {
+        self.flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `request` on a blocking thread, off the main thread and the
+    /// async workers.
+    async fn ask(&self, op: Op) -> Result<zeroize::Zeroizing<String>, Failed> {
+        let channel = self.channel.clone().ok_or(Failed::Closed)?;
+        tauri::async_runtime::spawn_blocking(move || channel.request(op)).await.unwrap_or(Err(Failed::Closed))
+    }
+}
+
+// ── Who may call ───────────────────────────────────────────────────────────
+
+/// The two callers the commands answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caller {
+    /// The game page's window, on the app's own origin.
+    Main,
+    /// The backup window, on the `ssfreveal` scheme's page.
+    Reveal,
+}
+
+/// Whether a webview labelled `label` showing `url` is `who`.
+pub fn caller_is(who: Caller, label: &str, url: &str) -> bool {
+    caller_is_in(who, label, url, cfg!(dev))
+}
+
+/// [`caller_is`], with whether this is a development build (whose game page
+/// is the Vite dev server's) spelled out for the tests.
+fn caller_is_in(who: Caller, label: &str, url: &str, dev: bool) -> bool {
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    match who {
+        Caller::Reveal => label == LABEL && navigation_allowed(&url),
+        Caller::Main => label == MAIN && main_origin(&url, dev),
+    }
+}
+
+fn plain_host(url: &Url) -> bool {
+    url.port().is_none() && url.username().is_empty() && url.password().is_none()
+}
+
+/// The scheme's own origin, in both its forms: `ssfreveal://localhost`, or
+/// `http(s)://ssfreveal.localhost` where the engine cannot load a custom
+/// scheme (WebView2).
+pub fn reveal_origin(url: &Url) -> bool {
+    let host = url.host_str();
+    plain_host(url)
+        && match url.scheme() {
+            "ssfreveal" => host == Some("localhost"),
+            "http" | "https" => host == Some("ssfreveal.localhost"),
+            _ => false,
+        }
+}
+
+/// The only page the backup window may show: the scheme's index.
+pub fn navigation_allowed(url: &Url) -> bool {
+    reveal_origin(url) && matches!(url.path(), "/" | "/index.html") && url.query().is_none() && url.fragment().is_none()
+}
+
+/// The app's own page: `tauri://localhost`, `http(s)://tauri.localhost`, or
+/// in a development build the Vite dev server (tauri.conf.json's devUrl).
+fn main_origin(url: &Url, dev: bool) -> bool {
+    let host = url.host_str();
+    match url.scheme() {
+        "tauri" => plain_host(url) && host == Some("localhost"),
+        "http" | "https" if host == Some("tauri.localhost") => plain_host(url),
+        "http" => dev && host == Some("localhost") && url.port() == Some(5173) && url.username().is_empty(),
+        _ => false,
+    }
+}
+
+// ── The scheme ─────────────────────────────────────────────────────────────
+
+/// What the index shows besides the words: all public.
+#[derive(Clone, Debug, Default)]
+pub struct PageFacts {
+    /// The network's name.
+    pub network: String,
+    /// The wallet's receive address, from the hello that opened the window.
+    pub address: Option<String>,
+    /// Add the line that the window is not protected from screen capture.
+    pub capture_note: bool,
+}
+
+/// Escape text for an HTML text node or attribute.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// One answer of the scheme: its status, headers and body.
+pub type SchemeAnswer = (u16, Vec<(&'static str, String)>, Cow<'static, [u8]>);
+
+/// One answer of the `ssfreveal` scheme, for the webview labelled `label`:
+/// 403 for any other webview, the three built-in files by GET, 404 for any
+/// other path. Every answer carries [`CSP`].
+pub fn scheme_answer(label: &str, method: &str, path: &str, facts: &PageFacts) -> SchemeAnswer {
+    let mut headers = vec![
+        ("Content-Security-Policy", CSP.to_string()),
+        ("X-Content-Type-Options", "nosniff".to_string()),
+        ("Cache-Control", "no-store".to_string()),
+        ("Referrer-Policy", "no-referrer".to_string()),
+    ];
+    let text = |headers: &mut Vec<(&'static str, String)>| headers.push(("Content-Type", "text/plain; charset=utf-8".to_string()));
+    if label != LABEL {
+        text(&mut headers);
+        return (403, headers, Cow::Borrowed(b"forbidden"));
+    }
+    if method != "GET" {
+        text(&mut headers);
+        return (405, headers, Cow::Borrowed(b"method not allowed"));
+    }
+    let (kind, body): (&str, Cow<'static, [u8]>) = match path {
+        "/" | "/index.html" => {
+            let address = facts.address.as_deref().unwrap_or(NO_ADDRESS);
+            let page = String::from_utf8_lossy(INDEX_HTML)
+                .replace("{{NETWORK}}", &escape(&facts.network))
+                .replace("{{ADDRESS}}", &escape(address))
+                .replace("{{CAPTURE}}", if facts.capture_note { CAPTURE_NOTE } else { "" });
+            ("text/html; charset=utf-8", Cow::Owned(page.into_bytes()))
+        }
+        "/reveal.js" => ("text/javascript; charset=utf-8", Cow::Borrowed(REVEAL_JS)),
+        "/reveal.css" => ("text/css; charset=utf-8", Cow::Borrowed(REVEAL_CSS)),
+        _ => {
+            text(&mut headers);
+            return (404, headers, Cow::Borrowed(b"not found"));
+        }
+    };
+    headers.push(("Content-Type", kind.to_string()));
+    (200, headers, body)
+}
+
+/// The scheme's handler: [`scheme_answer`] with this run's facts.
+pub fn serve<R: tauri::Runtime>(ctx: tauri::UriSchemeContext<'_, R>, request: tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Cow<'static, [u8]>> {
+    let label = ctx.webview_label();
+    let facts = if label == LABEL {
+        PageFacts {
+            network: SHELL_NET.name.to_string(),
+            address: ctx.app_handle().try_state::<Backup>().and_then(|b| b.flight().address.clone()),
+            capture_note: cfg!(target_os = "linux"),
+        }
+    } else {
+        PageFacts::default()
+    };
+    let (status, headers, body) = scheme_answer(label, request.method().as_str(), request.uri().path(), &facts);
+    let mut response = tauri::http::Response::builder().status(status);
+    for (name, value) in headers {
+        response = response.header(name, value);
+    }
+    response.body(body).unwrap_or_else(|_| {
+        let mut r = tauri::http::Response::new(Cow::Borrowed(&b"internal error"[..]));
+        *r.status_mut() = tauri::http::StatusCode::INTERNAL_SERVER_ERROR;
+        r
+    })
+}
+
+// ── The window ─────────────────────────────────────────────────────────────
+
+/// Build the backup window: owned by main (above it on every engine), not
+/// minimizable (so it is never lost behind the Bank), no storage kept, no
+/// devtools, screen capture kept out where the OS can, its own page only, no
+/// new windows. The clipboard is never enabled for it.
+fn build_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    let main = app.get_webview_window(MAIN).ok_or(tauri::Error::WindowNotFound)?;
+    let url = Url::parse(INDEX_URL).map_err(tauri::Error::InvalidUrl)?;
+    tauri::WebviewWindowBuilder::new(app, LABEL, tauri::WebviewUrl::CustomProtocol(url))
+        .title(TITLE)
+        .inner_size(520.0, 760.0)
+        .parent(&main)?
+        .incognito(true)
+        .devtools(false)
+        .content_protected(true)
+        .minimizable(false)
+        .resizable(false)
+        .focused(true)
+        .on_navigation(navigation_allowed)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+        .build()
+}
+
+fn focus_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.set_focus();
+    }
+}
+
+/// The webview's label and page, for [`caller_is`].
+fn who(webview: &tauri::Webview) -> (String, String) {
+    (webview.label().to_string(), webview.url().map(|u| u.to_string()).unwrap_or_default())
+}
+
+// ── The commands ───────────────────────────────────────────────────────────
+
+/// BACK UP in the game page: ask the node (hello), then open the backup
+/// window and answer when it closes. Main only. One at a time: a second call
+/// focuses the window and answers `busy`, as does any call for
+/// [`CLOSED_BUSY`] after a close without a save.
+#[tauri::command]
+pub async fn open_backup(app: tauri::AppHandle, webview: tauri::Webview) -> &'static str {
+    let (label, url) = who(&webview);
+    if !caller_is(Caller::Main, &label, &url) {
+        // The capability already refuses it; this answer says nothing.
+        return OpenAnswer::NoChannel.as_str();
+    }
+    let backup = app.state::<Backup>();
+    let channel = match backup.begin(Instant::now()) {
+        Ok(channel) => channel,
+        Err(answer) => {
+            if answer == OpenAnswer::Busy {
+                focus_window(&app);
+            }
+            return answer.as_str();
+        }
+    };
+    let answer = run_backup(&app, &backup, channel).await;
+    backup.end(answer, Instant::now());
+    answer.as_str()
+}
+
+async fn run_backup(app: &tauri::AppHandle, backup: &Backup, channel: Arc<Channel>) -> OpenAnswer {
+    let hello_channel = channel.clone();
+    let hello = tauri::async_runtime::spawn_blocking(move || hello_channel.hello()).await.unwrap_or(Err(Failed::Closed));
+    let address = match hello_gate(hello, channel.other_network()) {
+        Ok(address) => address,
+        Err(answer) => return answer,
+    };
+    {
+        let mut f = backup.flight();
+        f.instance += 1;
+        f.key = None;
+        f.address = Some(address);
+        f.outcome = Outcome::Closed;
+    }
+    let window = match build_window(app) {
+        Ok(window) => window,
+        Err(e) => {
+            eprintln!("🖥️ The backup window could not open: {e}");
+            return OpenAnswer::Closed;
+        }
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let tx = Mutex::new(Some(tx));
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Destroyed = event {
+            if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = tx.send(());
+            }
+        }
+    });
+    let _ = rx.await;
+    match backup.flight().outcome {
+        Outcome::Saved => OpenAnswer::Saved,
+        Outcome::AlreadySaved => OpenAnswer::AlreadySaved,
+        Outcome::Closed => OpenAnswer::Closed,
+    }
+}
+
+/// What SHOW gets: the words and the address they are for.
+#[derive(Serialize, Debug)]
+pub struct RevealView {
+    pub words: Words,
+    pub address: String,
+}
+
+/// The node's reveal answer, checked: 24 well-formed words, a key, and the
+/// address the window was opened for. Otherwise a fixed refusal.
+pub fn reveal_outcome(answer: Answer, expect_address: Option<&str>) -> Result<(RevealView, u32), &'static str> {
+    if !answer.ok {
+        return Err(if answer.saved { "already_saved" } else { "refused" });
+    }
+    let (Some(words), Some(key), Some(address)) = (answer.words, answer.key, answer.address) else {
+        return Err("refused");
+    };
+    if !words.well_formed() {
+        return Err("refused");
+    }
+    if expect_address != Some(address.as_str()) {
+        return Err("changed");
+    }
+    Ok((RevealView { words, address }, key))
+}
+
+/// SHOW in the backup window: ask the node for the words, every time (the
+/// app keeps no copy), and record the answer's key for this window.
+#[tauri::command]
+pub async fn backup_reveal(app: tauri::AppHandle, webview: tauri::Webview) -> Result<RevealView, &'static str> {
+    let (label, url) = who(&webview);
+    if !caller_is(Caller::Reveal, &label, &url) {
+        return Err("refused");
+    }
+    let backup = app.state::<Backup>();
+    if backup.channel.is_none() {
+        return Err("no_channel");
+    }
+    let (instance, address) = {
+        let f = backup.flight();
+        if !f.out {
+            return Err("refused");
+        }
+        (f.instance, f.address.clone())
+    };
+    let body = backup.ask(Op::Reveal).await.map_err(|_| "no_channel")?;
+    let answer = Answer::parse(&body).ok_or("refused")?;
+    drop(body);
+    let outcome = reveal_outcome(answer, address.as_deref());
+    let mut f = backup.flight();
+    if f.instance != instance || !f.out {
+        return Err("refused");
+    }
+    match outcome {
+        Ok((view, key)) => {
+            f.key = Some(key);
+            Ok(view)
+        }
+        Err(code) => {
+            if code == "already_saved" {
+                f.outcome = Outcome::AlreadySaved;
+            }
+            Err(code)
+        }
+    }
+}
+
+/// ⚠ CONFIRM in the backup window: tell the node the words of this window's
+/// last reveal are saved, then close the window, so `open_backup` answers
+/// `saved`. No argument: the key is the app's own.
+#[tauri::command]
+pub async fn backup_saved(app: tauri::AppHandle, webview: tauri::Webview) -> Result<(), &'static str> {
+    let (label, url) = who(&webview);
+    if !caller_is(Caller::Reveal, &label, &url) {
+        return Err("refused");
+    }
+    let backup = app.state::<Backup>();
+    let (instance, key) = {
+        let f = backup.flight();
+        if !f.out {
+            return Err("refused");
+        }
+        (f.instance, f.key.ok_or("not_shown")?)
+    };
+    let body = backup.ask(Op::Saved(key)).await.map_err(|_| "no_channel")?;
+    let ok = Answer::parse(&body).is_some_and(|a| a.ok);
+    if !ok {
+        return Err("refused");
+    }
+    {
+        let mut f = backup.flight();
+        if f.instance == instance {
+            f.outcome = Outcome::Saved;
+        }
+    }
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.close();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell_channel::{MAINNET, TESTNET11};
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_reveal_commands_answer_only_the_reveal_window_on_its_scheme() {
+        for page in ["ssfreveal://localhost/index.html", "ssfreveal://localhost/", "http://ssfreveal.localhost/index.html", "https://ssfreveal.localhost/"] {
+            assert!(caller_is(Caller::Reveal, "reveal", page), "{page}");
+            assert!(!caller_is(Caller::Reveal, "main", page), "main on {page}");
+            assert!(!caller_is(Caller::Reveal, "Reveal", page));
+            assert!(!caller_is(Caller::Reveal, "reveal2", page));
+        }
+        for page in [
+            "tauri://localhost/",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/index.html",
+            "http://localhost:5173/",
+            "ssfreveal://localhost/reveal.js",
+            "ssfreveal://localhost/index.html?x=1",
+            "ssfreveal://localhost/index.html#x",
+            "ssfreveal://other/index.html",
+            "ssfreveal://localhost:1/index.html",
+            "ssfreveal://user@localhost/index.html",
+            "http://ssfreveal.localhost:8080/",
+            "http://ssfreveal.localhost.example/",
+            "ftp://ssfreveal.localhost/",
+            "about:blank",
+            "",
+            "not a url",
+        ] {
+            assert!(!caller_is(Caller::Reveal, "reveal", page), "{page}");
+        }
+    }
+
+    #[test]
+    fn open_backup_answers_only_main_on_the_apps_own_page() {
+        for page in ["tauri://localhost/", "tauri://localhost/index.html", "http://tauri.localhost/", "https://tauri.localhost/"] {
+            assert!(caller_is_in(Caller::Main, "main", page, false), "{page}");
+            assert!(caller_is_in(Caller::Main, "main", page, true), "{page}");
+            assert!(!caller_is_in(Caller::Main, "reveal", page, true), "reveal on {page}");
+        }
+        assert!(caller_is_in(Caller::Main, "main", "http://localhost:5173/", true), "the dev server, in a dev build");
+        assert!(!caller_is_in(Caller::Main, "main", "http://localhost:5173/", false), "not in a release build");
+        for page in ["ssfreveal://localhost/index.html", "http://ssfreveal.localhost/", "http://localhost:8080/", "tauri://evil/", "tauri://localhost:9/", "http://tauri.localhost:1/"] {
+            assert!(!caller_is_in(Caller::Main, "main", page, true), "{page}");
+        }
+    }
+
+    #[test]
+    fn the_window_navigates_only_to_its_index() {
+        assert!(navigation_allowed(&url("ssfreveal://localhost/index.html")));
+        assert!(navigation_allowed(&url("http://ssfreveal.localhost/index.html")));
+        assert!(!navigation_allowed(&url("ssfreveal://localhost/reveal.css")));
+        assert!(!navigation_allowed(&url("tauri://localhost/")));
+        assert!(!navigation_allowed(&url("about:blank")));
+    }
+
+    fn facts() -> PageFacts {
+        PageFacts { network: "testnet11".into(), address: Some("txch1abc".into()), capture_note: true }
+    }
+
+    fn header<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn the_scheme_answers_only_the_reveal_webview_and_always_with_the_csp() {
+        for label in ["main", "", "Reveal", "reveal ", "other"] {
+            for path in ["/", "/index.html", "/reveal.js", "/reveal.css", "/nope"] {
+                let (status, headers, body) = scheme_answer(label, "GET", path, &facts());
+                assert_eq!(status, 403, "{label:?} {path}");
+                assert_eq!(header(&headers, "Content-Security-Policy"), Some(CSP));
+                assert!(!String::from_utf8_lossy(&body).contains("txch1abc"));
+            }
+        }
+        let cases = [("GET", "/", 200), ("GET", "/index.html", 200), ("GET", "/reveal.js", 200), ("GET", "/reveal.css", 200), ("GET", "/x", 404), ("GET", "/../index.html", 404), ("POST", "/", 405)];
+        for (method, path, want) in cases {
+            let (status, headers, _) = scheme_answer("reveal", method, path, &facts());
+            assert_eq!(status, want, "{method} {path}");
+            assert_eq!(header(&headers, "Content-Security-Policy"), Some(CSP), "{method} {path}");
+            assert_eq!(header(&headers, "X-Content-Type-Options"), Some("nosniff"));
+            assert!(header(&headers, "Content-Type").is_some());
+        }
+        let (_, headers, _) = scheme_answer("reveal", "GET", "/reveal.js", &facts());
+        assert_eq!(header(&headers, "Content-Type"), Some("text/javascript; charset=utf-8"));
+    }
+
+    #[test]
+    fn the_csp_is_the_designs() {
+        assert_eq!(
+            CSP,
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src ipc: http://ipc.localhost; frame-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+        );
+    }
+
+    #[test]
+    fn the_index_shows_the_network_the_address_and_the_warnings_escaped() {
+        let page = |f: &PageFacts| String::from_utf8(scheme_answer("reveal", "GET", "/", f).2.into_owned()).unwrap();
+        let shown = page(&facts());
+        assert!(shown.contains("<strong id=\"net\">testnet11</strong>"));
+        assert!(shown.contains(">txch1abc<"));
+        assert!(shown.contains("Star Station never asks you to type your 24 words."));
+        assert!(shown.contains("not protected from screen capture"));
+        assert!(!shown.contains("{{"), "every placeholder filled");
+
+        let without = page(&PageFacts { capture_note: false, ..facts() });
+        assert!(!without.contains("screen capture"));
+
+        let hostile = page(&PageFacts { network: "<b>x</b>".into(), address: Some("\"><script>x</script>&'".into()), capture_note: false });
+        assert!(hostile.contains("&lt;b&gt;x&lt;/b&gt;"));
+        assert!(hostile.contains("&quot;&gt;&lt;script&gt;x&lt;/script&gt;&amp;&#39;"));
+        assert!(!hostile.contains("<script>x"));
+        assert!(page(&PageFacts { address: None, ..facts() }).contains("(no address)"));
+    }
+
+    /// The built-in page: no inline script, no event-handler attribute, no
+    /// web URL, nothing that reaches the clipboard or Tauri's events.
+    #[test]
+    fn the_built_in_assets_hold_no_inline_script_url_clipboard_or_event() {
+        let html = std::str::from_utf8(INDEX_HTML).unwrap();
+        let js = std::str::from_utf8(REVEAL_JS).unwrap();
+        let css = std::str::from_utf8(REVEAL_CSS).unwrap();
+        for (name, text) in [("index.html", html), ("reveal.js", js), ("reveal.css", css)] {
+            let lower = text.to_ascii_lowercase();
+            for banned in ["http://", "https://", "clipboard", "writetext", "emit", "javascript:", "data:", "eval(", "new function", "innerhtml", "outerhtml", "insertadjacenthtml", "document.write", "localstorage", "sessionstorage", "indexeddb", "fetch(", "xmlhttprequest", "window.open", "@import", "url("] {
+                assert!(!lower.contains(banned), "{name} holds {banned:?}");
+            }
+        }
+        let lower = html.to_ascii_lowercase();
+        // Every script element is an empty one that loads reveal.js.
+        let mut rest = lower.as_str();
+        let mut scripts = 0;
+        while let Some(at) = rest.find("<script") {
+            let tail = &rest[at..];
+            let close = tail.find("</script>").expect("a closed script element");
+            let element = &tail[..close];
+            let open_end = element.find('>').unwrap();
+            assert_eq!(&element[..open_end + 1], "<script src=\"reveal.js\" defer>", "only the built-in script");
+            assert!(element[open_end + 1..].trim().is_empty(), "no inline script");
+            scripts += 1;
+            rest = &tail[close..];
+        }
+        assert_eq!(scripts, 1);
+        assert!(!lower.contains("<style"), "no inline style element");
+        assert!(!lower.contains(" style="), "no inline style attribute");
+        // No on…= attribute anywhere in a tag.
+        let mut in_tag = false;
+        let bytes = lower.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'<' => in_tag = true,
+                b'>' => in_tag = false,
+                b'o' if in_tag && i > 0 && bytes[i - 1].is_ascii_whitespace() && bytes.get(i + 1) == Some(&b'n') => {
+                    let name: String = lower[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+                    let after = lower[i + name.len()..].trim_start();
+                    assert!(!after.starts_with('='), "an event-handler attribute {name:?}");
+                }
+                _ => {}
+            }
+        }
+        assert!(html.contains("<link rel=\"stylesheet\" href=\"reveal.css\">"));
+        // The page's script asks only the two reveal commands.
+        let mut asked: Vec<&str> = js.match_indices("ask('").map(|(at, _)| &js[at + 5..at + 5 + js[at + 5..].find('\'').unwrap()]).collect();
+        asked.sort();
+        assert_eq!(asked, ["backup_reveal", "backup_saved"]);
+        assert_eq!(js.matches("invoke(").count(), 1, "one call into the app, inside ask");
+    }
+
+    #[test]
+    fn the_hello_decides_what_open_backup_answers() {
+        let other = if SHELL_NET == TESTNET11 { MAINNET } else { TESTNET11 };
+        let hello = |net: crate::shell_channel::Net, wallet: &str, backed_up: bool, address: Option<&str>| Hello {
+            net_id: net.id.into(),
+            genesis: net.genesis.into(),
+            wallet: wallet.into(),
+            backed_up,
+            address: address.map(str::to_string),
+        };
+        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, Some("txch1abc"))), false), Ok("txch1abc".to_string()));
+        assert_eq!(hello_gate(Ok(hello(other, "on", false, Some("xch1abc"))), false), Err(OpenAnswer::OtherNetwork));
+        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, Some("txch1abc"))), true), Err(OpenAnswer::OtherNetwork), "sticky for the run");
+        assert_eq!(hello_gate(Ok(Hello::default()), false), Err(OpenAnswer::OtherNetwork), "a hello that could not be read");
+        for state in ["ready", "off", "gated", "unbuilt"] {
+            assert_eq!(hello_gate(Ok(hello(SHELL_NET, state, false, None)), false), Err(OpenAnswer::NotOn), "{state}");
+        }
+        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", true, Some("txch1abc"))), false), Err(OpenAnswer::AlreadySaved));
+        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, None)), false), Err(OpenAnswer::Turning));
+        assert_eq!(hello_gate(Err(Failed::TimedOut), false), Err(OpenAnswer::NoChannel));
+        assert_eq!(hello_gate(Err(Failed::Closed), false), Err(OpenAnswer::NoChannel));
+    }
+
+    #[test]
+    fn open_backup_is_single_flight_and_busy_after_a_close_without_a_save() {
+        let now = Instant::now();
+        assert_eq!(flight_gate(&Flight::default(), now), None);
+        assert_eq!(flight_gate(&Flight { out: true, ..Flight::default() }, now), Some(OpenAnswer::Busy));
+        let closed = Flight { closed_unsaved: Some(now), ..Flight::default() };
+        assert_eq!(flight_gate(&closed, now + Duration::from_secs(9)), Some(OpenAnswer::Busy));
+        assert_eq!(flight_gate(&closed, now + CLOSED_BUSY), None);
+    }
+
+    #[test]
+    fn begin_answers_no_channel_without_a_channel_and_busy_while_out() {
+        let none = Backup::new(None);
+        assert_eq!(none.begin(Instant::now()).err(), Some(OpenAnswer::NoChannel));
+
+        // A channel over pipes nobody answers: only the flight is tested.
+        let (_req_read, req_write) = std::io::pipe().unwrap();
+        let (rep_read, _rep_write) = std::io::pipe().unwrap();
+        let backup = Backup::new(Some(Channel::start(req_write, rep_read)));
+        let now = Instant::now();
+        assert!(backup.begin(now).is_ok());
+        assert_eq!(backup.begin(now).err(), Some(OpenAnswer::Busy), "single flight");
+        backup.end(OpenAnswer::Closed, now);
+        assert_eq!(backup.begin(now + Duration::from_secs(5)).err(), Some(OpenAnswer::Busy), "busy after a close without a save");
+        assert!(backup.begin(now + CLOSED_BUSY).is_ok());
+        backup.end(OpenAnswer::Saved, now + CLOSED_BUSY);
+        assert!(backup.begin(now + CLOSED_BUSY).is_ok(), "a save starts no busy time");
+        backup.end(OpenAnswer::NotOn, now + CLOSED_BUSY);
+        assert!(backup.begin(now + CLOSED_BUSY).is_ok());
+    }
+
+    #[test]
+    fn the_eight_answers_are_the_pages() {
+        let all = [
+            OpenAnswer::Saved,
+            OpenAnswer::Closed,
+            OpenAnswer::NoChannel,
+            OpenAnswer::OtherNetwork,
+            OpenAnswer::NotOn,
+            OpenAnswer::Turning,
+            OpenAnswer::AlreadySaved,
+            OpenAnswer::Busy,
+        ];
+        let names: Vec<&str> = all.iter().map(|a| a.as_str()).collect();
+        assert_eq!(names, ["saved", "closed", "no_channel", "other_network", "not_on", "turning", "already_saved", "busy"]);
+    }
+
+    fn answer(json: &str) -> Answer {
+        Answer::parse(json).unwrap()
+    }
+
+    #[test]
+    fn a_reveal_shows_only_the_wallet_the_window_opened_for() {
+        let words = "[\"abandon\",\"ability\",\"able\",\"about\",\"above\",\"absent\",\"absorb\",\"abstract\",\"absurd\",\"abuse\",\"access\",\"accident\",\"account\",\"accuse\",\"achieve\",\"acid\",\"acoustic\",\"acquire\",\"across\",\"act\",\"action\",\"actor\",\"actress\",\"actual\"]";
+        let ok = format!("{{\"ok\":true,\"words\":{words},\"key\":7,\"address\":\"txch1abc\"}}");
+        let (view, key) = reveal_outcome(answer(&ok), Some("txch1abc")).unwrap();
+        assert_eq!((view.words.len(), key, view.address.as_str()), (24, 7, "txch1abc"));
+        assert_eq!(format!("{view:?}"), "RevealView { words: [24 words], address: \"txch1abc\" }");
+        assert_eq!(reveal_outcome(answer(&ok), Some("txch1other")).unwrap_err(), "changed");
+        assert_eq!(reveal_outcome(answer(&ok), None).unwrap_err(), "changed");
+        assert_eq!(reveal_outcome(answer(r#"{"ok":false,"saved":true,"error":"x"}"#), Some("txch1abc")).unwrap_err(), "already_saved");
+        assert_eq!(reveal_outcome(answer(r#"{"ok":false,"error":"x"}"#), Some("txch1abc")).unwrap_err(), "refused");
+        assert_eq!(reveal_outcome(answer(r#"{"ok":true,"words":["abandon"],"key":7,"address":"txch1abc"}"#), Some("txch1abc")).unwrap_err(), "refused");
+        let no_key = format!("{{\"ok\":true,\"words\":{words},\"address\":\"txch1abc\"}}");
+        assert_eq!(reveal_outcome(answer(&no_key), Some("txch1abc")).unwrap_err(), "refused");
+    }
+
+    /// The capability files: `main` holds only `allow-open-backup`, `reveal`
+    /// only the two reveal permissions; no core permission and no remote URL
+    /// in either.
+    #[test]
+    fn the_capabilities_give_each_window_only_its_own_commands() {
+        use tauri::utils::acl::capability::Capability;
+        let main: Capability = serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
+        let reveal: Capability = serde_json::from_str(include_str!("../capabilities/reveal.json")).unwrap();
+        let ids = |c: &Capability| -> Vec<String> {
+            c.permissions
+                .iter()
+                .map(|p| match p {
+                    tauri::utils::acl::capability::PermissionEntry::PermissionRef(id) => id.get().to_string(),
+                    tauri::utils::acl::capability::PermissionEntry::ExtendedPermission { identifier, .. } => identifier.get().to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(main.windows, ["main"]);
+        assert!(main.webviews.is_empty());
+        assert_eq!(ids(&main), ["allow-open-backup"]);
+        assert_eq!(reveal.windows, ["reveal"]);
+        assert_eq!(reveal.webviews, ["reveal"]);
+        let mut r = ids(&reveal);
+        r.sort();
+        assert_eq!(r, ["allow-backup-reveal", "allow-backup-saved"]);
+        for c in [&main, &reveal] {
+            assert!(c.remote.is_none(), "no remote URL");
+            assert!(c.local);
+            assert!(ids(c).iter().all(|p| !p.starts_with("core:") && !p.contains(':')));
+        }
+        for text in [include_str!("../capabilities/main.json"), include_str!("../capabilities/reveal.json")] {
+            for banned in ["core:", "http", "remote"] {
+                assert!(!text.contains(banned), "{banned}");
+            }
+        }
+    }
+}

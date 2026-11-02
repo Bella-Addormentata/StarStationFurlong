@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Back up your 24 words</title>
+<link rel="stylesheet" href="reveal.css">
+<script src="reveal.js" defer></script>
+</head>
+<body>
+<main>
+<h1>Back up your 24 words</h1>
+<p class="facts">Network: <strong id="net">{{NETWORK}}</strong></p>
+<p class="facts">Wallet address: <code id="address">{{ADDRESS}}</code></p>
+<p class="hint">It should be the address the Bank shows.</p>
+<p class="warn" id="phishing">Star Station never asks you to type your 24 words.</p>
+{{CAPTURE}}
+<p class="hint">Write them on paper, in order. No photo, no file, no copy: paper only.</p>
+<ol id="words" class="words masked" aria-label="Your 24 words"></ol>
+<p id="status" class="status" role="status"></p>
+<div class="controls">
+<button id="show" type="button">SHOW</button>
+<button id="saved" type="button" disabled>I SAVED</button>
+</div>
+</main>
+</body>
+</html>

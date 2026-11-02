@@ -3418,6 +3418,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
@@ -3425,6 +3426,7 @@ dependencies = [
  "tokio",
  "wtransport",
  "yrs",
+ "zeroize",
 ]
 
 [[package]]

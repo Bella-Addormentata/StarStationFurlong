@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-backup-saved"
+description = "Enables the backup_saved command without any pre-configured scope."
+commands.allow = ["backup_saved"]
+
+[[permission]]
+identifier = "deny-backup-saved"
+description = "Denies the backup_saved command without any pre-configured scope."
+commands.deny = ["backup_saved"]
