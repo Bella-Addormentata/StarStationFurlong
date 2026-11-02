@@ -197,3 +197,8 @@ jobs:
 
       - name: 🧪 cargo test (src-tauri)
         run: cargo test --manifest-path ${{ env.RELEASE_FRONTEND }}/src-tauri/Cargo.toml
+
+      # The development-only mainnet build of the app (its network constant,
+      # the node's SSF_CHIA_NETWORK=mainnet); release builds leave it out.
+      - name: 🧪 cargo test --features chia-mainnet (src-tauri)
+        run: cargo test --features chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/src-tauri/Cargo.toml
