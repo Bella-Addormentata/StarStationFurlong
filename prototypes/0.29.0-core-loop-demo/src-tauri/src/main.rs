@@ -1,37 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod reveal;
+mod shell_channel;
 mod wt_listener;
 
-use std::collections::HashMap;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::{Arc, Mutex};
-use tauri::State;
-use wt_listener::{compute_fingerprint, start_wt_server, run_wt_listener, start_http_api_server, Fingerprint, HubState, SharedHub};
-
-#[tauri::command]
-fn get_fingerprint(hub: State<'_, SharedHub>) -> Result<Fingerprint, String> {
-    let fp = hub.fingerprint.lock().unwrap();
-    Ok(fp.clone())
-}
-
-#[tauri::command]
-async fn rotate_fingerprint(hub: State<'_, SharedHub>) -> Result<Fingerprint, String> {
-    println!("🔄 Command -> Requesting Certificate Rotation...");
-    let next_id = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])
-        .map_err(|e| format!("Failed to generate self-signed cert: {:?}", e))?;
-    
-    let fp = compute_fingerprint(&next_id, hub.port)
-        .map_err(|e| format!("Failed to digest fingerprint: {:?}", e))?;
-
-    // In a real Tauri context, the Endpoint would be reloadable. Let's register it.
-    {
-        let mut inner_fp = hub.fingerprint.lock().unwrap();
-        *inner_fp = fp.clone();
-    }
-    
-    println!("✅ Certificate rotated smoothly. New Hash: {}", fp.hex);
-    Ok(fp)
-}
+use tauri::Manager;
+use shell_channel::{node_command, Channel};
+use wt_listener::{start_wt_server, run_wt_listener, start_http_api_server};
 
 /// 🏠 Ask the node we spawned to step its house down before it is stopped
 /// (ssf-p2p-node house.rs): the tables it runs go on Friendly with no void.
@@ -100,12 +77,34 @@ fn ask_house_step_down(port: u16, deadline: std::time::Instant) -> bool {
 
 /// How we ended up with (or without) a sovereign P2P node this launch.
 enum NodeMode {
-    /// UDP 4443 is already bound — an external ssf-p2p-node (or prior spawn) is serving.
+    /// UDP 4443 is already bound — an external ssf-p2p-node (or prior spawn)
+    /// is serving. The app did not start it, so it has no channel to it.
     AlreadyRunning,
-    /// We spawned the standalone node binary; child must be killed on app exit.
-    Spawned(Child),
-    /// No node binary found anywhere — embedded iroh-less listener is the fallback.
+    /// We spawned the standalone node binary; child must be killed on app
+    /// exit. `channel` is the node's stdin and stdout, when the app could
+    /// guard its ends of the pipes (shell_channel.rs); none otherwise.
+    Spawned { child: Child, channel: Option<Arc<Channel>> },
+    /// No node binary found anywhere — embedded iroh-less listener is the
+    /// fallback, with its own hub and no channel.
     Unavailable,
+}
+
+impl NodeMode {
+    /// The channel the backup window may use: only a node this app spawned
+    /// with the channel on. A node already running, or the embedded
+    /// listener, has none, and `open_backup` answers `no_channel`.
+    fn channel(&self) -> Option<Arc<Channel>> {
+        match self {
+            NodeMode::Spawned { channel, .. } => channel.clone(),
+            NodeMode::AlreadyRunning | NodeMode::Unavailable => None,
+        }
+    }
+}
+
+/// The spawned node, kept for the exit hook.
+struct SpawnedNode {
+    child: Child,
+    channel: Option<Arc<Channel>>,
 }
 
 /// Candidate locations for the standalone node binary, in preference order:
@@ -144,19 +143,60 @@ fn node_data_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// The command that starts the node sidecar at `program`, for both spawns
-/// below. The node reads its Chia network from `SSF_CHIA_NETWORK`; the app
-/// removes it from the child's environment, so a variable in the player's
-/// environment can never move the bundled node to another chain. The node
-/// then runs on its default, testnet11. It removes `SSF_SHELL_CHANNEL` too,
-/// so a variable in the player's environment can never turn on the node's
-/// desktop-app channel (its stdin and stdout); only the app's own spawn may
-/// set it, once the app speaks that channel.
-fn node_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.env_remove("SSF_CHIA_NETWORK");
-    cmd.env_remove("SSF_SHELL_CHANNEL");
+/// `cmd` with the node's channel turned on, only when `guarded`.
+fn channel_command(mut cmd: std::process::Command, guarded: bool) -> std::process::Command {
+    if guarded {
+        shell_channel::attach(&mut cmd);
+    }
     cmd
+}
+
+/// Linux: the node gets SIGTERM when the app dies, so it steps its house
+/// down and exits (ssf-p2p-node's house_stop_on_signal) even when the app
+/// is stopped by a signal, which never reaches the exit hook in main().
+/// Otherwise the orphan keeps UDP 4443, and the next launch finds "a node
+/// already running", with no channel, so the backup window stays off.
+///
+/// The signal follows the thread that spawns, not the process: the node is
+/// spawned from the main thread (acquire_p2p_node in main()), which lives
+/// for the whole run.
+#[cfg(target_os = "linux")]
+fn die_with_app(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let app = std::process::id() as libc::pid_t;
+    // SAFETY: the closure runs in the forked child before exec, and calls
+    // only prctl and getppid, both async-signal-safe; it allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            // A prctl that fails leaves the node as it was before (it may
+            // outlive a killed app); the spawn goes ahead.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong);
+            // The app died between the fork and the prctl: no signal would
+            // ever come, so the node does not start.
+            if libc::getppid() != app {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Spawn `cmd`, with the node's channel on when the app's ends of the
+/// pipes are guarded (`guarded`): then the node's stdin and stdout are the
+/// channel, and its stderr stays the app's. Otherwise it is spawned as
+/// before, with no channel. On Linux the node goes when the app does
+/// ([`die_with_app`]).
+fn spawn_node(cmd: std::process::Command, guarded: bool) -> std::io::Result<(Child, Option<Arc<Channel>>)> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut cmd = channel_command(cmd, guarded);
+    #[cfg(target_os = "linux")]
+    die_with_app(&mut cmd);
+    let mut child = cmd.spawn()?;
+    let channel = match (guarded, child.stdin.take(), child.stdout.take()) {
+        (true, Some(stdin), Some(stdout)) => Some(Channel::start(stdin, stdout)),
+        _ => None,
+    };
+    Ok((child, channel))
 }
 
 /// Prefer the real sovereign node (iroh + DHT + WebTransport) over the embedded
@@ -171,6 +211,9 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
         }
         Ok(sock) => drop(sock), // release the probe socket before the child binds it
     }
+
+    // Linux: not dumpable before the first spawn, or no channel.
+    let guarded = shell_channel::pipes_guarded();
 
     for candidate in node_binary_candidates() {
         if !candidate.is_file() {
@@ -190,58 +233,67 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
             }
         }
         // Bundled sidecar must not flash a console window on Windows
-        // (CREATE_NO_WINDOW) — its stdout stays on the app's console handle rules.
+        // (CREATE_NO_WINDOW). With the channel on, its stdin and stdout are
+        // the channel's pipes and its log goes to the inherited stderr
+        // (shell_channel::attach); without it, stdout and stderr follow the
+        // app's console handle rules.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        match cmd.spawn() {
-            Ok(child) => {
+        match spawn_node(cmd, guarded) {
+            Ok((child, channel)) => {
                 println!("🛰️ Spawned sovereign P2P node: {} (pid {})", candidate.display(), child.id());
-                return NodeMode::Spawned(child);
+                return NodeMode::Spawned { child, channel };
             }
             Err(e) => eprintln!("⚠️ Failed to spawn {}: {e}", candidate.display()),
         }
     }
 
     // Last resort: whatever `ssf-p2p-node` resolves to on PATH.
-    match node_command("ssf-p2p-node").spawn() {
-        Ok(child) => {
+    match spawn_node(node_command("ssf-p2p-node"), guarded) {
+        Ok((child, channel)) => {
             println!("🛰️ Spawned sovereign P2P node from PATH (pid {})", child.id());
-            NodeMode::Spawned(child)
+            NodeMode::Spawned { child, channel }
         }
         Err(_) => NodeMode::Unavailable,
     }
 }
 
-/// Minimal hub so the vestigial `get_fingerprint`/`rotate_fingerprint` commands stay
-/// callable when the external node owns the real state. The frontend reads the real
-/// fingerprint over HTTP (127.0.0.1:8080/8081), not through these commands.
-fn external_placeholder_hub(port: u16) -> SharedHub {
-    Arc::new(HubState {
-        rooms: Mutex::new(HashMap::new()),
-        fingerprint: Mutex::new(Fingerprint {
-            hex: "(external ssf-p2p-node — query http://127.0.0.1:8080/api/fingerprint)".into(),
-            base64: String::new(),
-            port,
-        }),
-        port,
-    })
+/// The hello the app sends once the node is spawned: a node on another
+/// network turns the backup window off for the run. Only the verdict is
+/// logged, never what the node wrote.
+fn hello_at_spawn(channel: Arc<Channel>) {
+    let spawned = std::thread::Builder::new().name("ssf-shell-hello".into()).spawn(move || match channel.hello() {
+        Ok(_) if channel.other_network() => eprintln!(
+            "🖥️ Desktop app channel: the node runs on another Chia network than this app ({}), so the backup window stays off",
+            shell_channel::SHELL_NET.name
+        ),
+        Ok(_) => println!("🖥️ Desktop app channel: on"),
+        Err(e) => eprintln!("🖥️ Desktop app channel: the node did not answer its hello ({e:?}); the app asks again when the backup window opens"),
+    });
+    if let Err(e) = spawned {
+        eprintln!("🖥️ Desktop app channel: the hello could not start ({e})");
+    }
 }
 
 fn main() {
     let listen_port = 4443;
 
-    // Handle to a spawned node child so the exit hook can reap it. Tauri's run()
+    // The spawned node, so the exit hook can reap it. Tauri's run()
     // terminates via std::process::exit, so Drop guards in main() would never fire.
-    let node_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let node: Arc<Mutex<Option<SpawnedNode>>> = Arc::new(Mutex::new(None));
 
-    let hub_for_commands: SharedHub = match acquire_p2p_node(listen_port) {
-        NodeMode::AlreadyRunning => external_placeholder_hub(listen_port),
-        NodeMode::Spawned(child) => {
-            *node_child.lock().unwrap() = Some(child);
-            external_placeholder_hub(listen_port)
+    let mode = acquire_p2p_node(listen_port);
+    let channel = mode.channel();
+    match mode {
+        NodeMode::AlreadyRunning => {}
+        NodeMode::Spawned { child, channel } => {
+            if let Some(channel) = &channel {
+                hello_at_spawn(channel.clone());
+            }
+            *node.lock().unwrap() = Some(SpawnedNode { child, channel });
         }
         NodeMode::Unavailable => {
             println!("⚠️ No ssf-p2p-node binary found — falling back to embedded WebTransport listener.");
@@ -261,26 +313,25 @@ fn main() {
                 }
             };
 
+            // The embedded listener keeps its own hub.
             let hub_http = hub.clone();
-            let hub_run = hub.clone();
             std::thread::spawn(move || {
                 rt.spawn(async move {
                     start_http_api_server(hub_http).await;
                 });
-                if let Err(e) = rt.block_on(run_wt_listener(hub_run, endpoint)) {
+                if let Err(e) = rt.block_on(run_wt_listener(hub, endpoint)) {
                     eprintln!("⚠️ WebTransport server error: {:?}", e);
                 }
             });
-
-            hub
         }
-    };
+    }
 
     // Boot Tauri v2 App Shell (Sovereign backbone)
-    let node_child_on_exit = node_child.clone();
+    let node_on_exit = node.clone();
     tauri::Builder::default()
-        .manage(hub_for_commands)
-        .invoke_handler(tauri::generate_handler![get_fingerprint, rotate_fingerprint])
+        .manage(reveal::Backup::new(channel))
+        .register_uri_scheme_protocol(reveal::SCHEME, reveal::serve)
+        .invoke_handler(tauri::generate_handler![reveal::open_backup, reveal::backup_reveal, reveal::backup_saved])
         .setup(|app| {
             // 🕹 The window is built here, not by tauri.conf.json ("create":
             // false), for the arcade cabinet's emulator frame. That frame is an
@@ -296,7 +347,12 @@ fn main() {
                 .first()
                 .cloned()
                 .ok_or("tauri.conf.json names no window")?;
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+            // The window's label is the config's, which names none: "main",
+            // the label capabilities/main.json and open_backup expect. It
+            // opens no new window: a page script or a target=_blank link
+            // gets nothing.
+            let main = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+                .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
                 .on_web_resource_request(|request, response| {
                     if request.uri().path().starts_with("/emulatorjs/") {
                         response.headers_mut().insert(
@@ -306,13 +362,27 @@ fn main() {
                     }
                 })
                 .build()?;
+            // The backup window goes with the game page's window: it is
+            // owned by it, and is never left open on its own.
+            let handle = app.handle().clone();
+            main.on_window_event(move |event| {
+                if let tauri::WindowEvent::Destroyed = event {
+                    if let Some(window) = handle.get_webview_window(reveal::LABEL) {
+                        let _ = window.close();
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app, event| {
             if let tauri::RunEvent::Exit = event {
-                if let Some(mut child) = node_child_on_exit.lock().unwrap().take() {
+                if let Some(SpawnedNode { mut child, channel }) = node_on_exit.lock().unwrap().take() {
+                    // The channel's stdin first: the node sees EOF.
+                    if let Some(channel) = channel {
+                        channel.close_stdin();
+                    }
                     println!("🛑 Stopping spawned ssf-p2p-node (pid {})", child.id());
                     house_step_down();
                     let _ = child.kill();
@@ -328,10 +398,12 @@ mod tests {
 
     /// Both sidecar spawns go through `node_command`, which removes
     /// SSF_CHIA_NETWORK and SSF_SHELL_CHANNEL from the child's environment
-    /// (a removed variable shows in `get_envs` as `None`). Nothing is spawned
-    /// and nothing is read from this process's environment.
+    /// (a removed variable shows in `get_envs` as `None`); a `chia-mainnet`
+    /// build then sets the network to mainnet. Nothing is spawned and
+    /// nothing is read from this process's environment.
     #[test]
     fn the_sidecar_never_inherits_the_chia_network_or_the_shell_channel() {
+        let net = if cfg!(feature = "chia-mainnet") { Some(std::ffi::OsStr::new("mainnet")) } else { None };
         for program in [std::ffi::OsStr::new("ssf-p2p-node"), std::ffi::OsStr::new("/opt/ssf/ssf-p2p-node")] {
             let cmd = node_command(program);
             assert_eq!(cmd.get_program(), program);
@@ -339,9 +411,65 @@ mod tests {
             envs.sort();
             assert_eq!(
                 envs,
-                vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), None), (std::ffi::OsStr::new("SSF_SHELL_CHANNEL"), None)],
-                "both removed, and nothing else changed"
+                vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), net), (std::ffi::OsStr::new("SSF_SHELL_CHANNEL"), None)],
+                "both removed (mainnet set back under chia-mainnet), and nothing else changed"
             );
+        }
+    }
+
+    /// The channel's variable is set only when the app's ends of the pipes
+    /// are guarded (on Linux, when prctl held); otherwise the node is
+    /// spawned as before, with the variable removed.
+    #[test]
+    fn the_channel_is_turned_on_only_when_the_pipes_are_guarded() {
+        let channel_var = |guarded| {
+            let cmd = channel_command(node_command("ssf-p2p-node"), guarded);
+            let envs: std::collections::BTreeMap<_, _> = cmd.get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
+            envs.get(std::ffi::OsStr::new("SSF_SHELL_CHANNEL")).cloned()
+        };
+        assert_eq!(channel_var(true), Some(Some(std::ffi::OsString::from("1"))));
+        assert_eq!(channel_var(false), Some(None), "still removed");
+    }
+
+    /// A node spawned through `die_with_app` gets SIGTERM when the thread
+    /// that spawned it ends, as the app's main thread does when the app is
+    /// killed. Here a short-lived thread spawns a `sleep` and ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_node_gets_sigterm_when_the_app_goes() {
+        use std::os::unix::process::ExitStatusExt;
+        let spawner = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            die_with_app(&mut cmd);
+            cmd.spawn().unwrap()
+        });
+        let mut child = spawner.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGTERM), "the child got SIGTERM when its spawning thread ended");
+    }
+
+    /// A node the app did not start, or the embedded listener, gives the
+    /// backup window no channel, so open_backup answers `no_channel`.
+    #[test]
+    fn a_node_the_app_did_not_start_has_no_channel() {
+        for mode in [NodeMode::AlreadyRunning, NodeMode::Unavailable] {
+            assert!(mode.channel().is_none());
+        }
+        for mode in [NodeMode::AlreadyRunning, NodeMode::Unavailable] {
+            let backup = reveal::Backup::new(mode.channel());
+            assert_eq!(backup.begin(std::time::Instant::now()).err(), Some(reveal::OpenAnswer::NoChannel));
         }
     }
 }

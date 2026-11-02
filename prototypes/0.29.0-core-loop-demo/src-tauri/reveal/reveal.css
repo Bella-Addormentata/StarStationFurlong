@@ -1,0 +1,61 @@
+/* The backup window's page (src-tauri/reveal). Nothing here loads anything. */
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #131a30;
+  --text: #e6ecff;
+  --muted: #9aa6c8;
+  --warn: #ffcf5a;
+  --danger: #ff6b6b;
+  --accent: #5ad1ff;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { padding: 18px 22px 22px; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+p { margin: 6px 0; }
+.facts code, .facts strong { word-break: break-all; }
+.hint { color: var(--muted); }
+.warn { color: var(--warn); font-weight: 600; }
+.words {
+  list-style: decimal inside;
+  margin: 14px 0;
+  padding: 12px 14px;
+  background: var(--panel);
+  border-radius: 8px;
+  columns: 3;
+  column-gap: 14px;
+  font: 16px/1.9 ui-monospace, "Cascadia Mono", Menlo, monospace;
+  min-height: 15em;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  cursor: default;
+}
+.words li { break-inside: avoid; white-space: nowrap; }
+.words.masked li { color: var(--muted); letter-spacing: 2px; }
+.status { min-height: 2.9em; color: var(--muted); }
+.status.bad { color: var(--danger); }
+.controls { display: flex; gap: 12px; }
+button {
+  flex: 1;
+  padding: 10px 12px;
+  font: 600 15px system-ui, sans-serif;
+  color: var(--bg);
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+button[disabled] { opacity: 0.45; cursor: default; }
+button.danger { background: var(--danger); }
+/* Paper only, by hand: a printout (or a print to file) holds nothing. */
+@media print {
+  html, body { background: none; }
+  main { display: none !important; }
+}

@@ -5,14 +5,23 @@ edition = "2021"
 publish = false
 description = "StarStation Furlong - Tauri Client & Node Host"
 
+[features]
+# Development only, until stage 5 of the mainnet transition: the app's network
+# is Chia mainnet. It sets SSF_CHIA_NETWORK=mainnet on the node it spawns (a
+# node built with its own `chia-mainnet`), and the node's hello must say
+# mainnet. Release builds leave it out.
+chia-mainnet = []
+
 [dependencies]
-# Tauri v2 shell (sovereign backbone)
-tauri = { version = "2.0.0-rc", features = [] }
-tauri-build = { version = "2.0.0-rc", optional = true }
+# Tauri v2 shell (sovereign backbone). Pinned exactly: the IPC origin and ACL
+# rules the backup window leans on (reveal.rs, capabilities/) are this
+# version's; a bump must recheck them.
+tauri = { version = "=2.11.5", features = [] }
+tauri-build = { version = "=2.6.3", optional = true }
 
 # Sovereign real-time stack (v006 Â§12.1 pins)
 wtransport = { version = "0.6", features = ["quinn"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
 yrs = { version = "0.27", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +30,12 @@ base64 = "0.22"
 hex = "0.4"
 blake3 = "1"
 ed25519-dalek = "=2.2.0" # exact match to yrs dependencies
+# The 24 words pass through the app in buffers wiped when dropped.
+zeroize = "1"
+
+# prctl(PR_SET_DUMPABLE, 0) before the node is spawned (shell_channel.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
-tauri-build = { version = "2.0.0-rc" }
+tauri-build = { version = "=2.6.3" }

@@ -1,0 +1,7 @@
+{
+  "identifier": "main",
+  "description": "The game page's window: it may ask the app to open the backup window, and nothing else.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["allow-open-backup"]
+}

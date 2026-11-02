@@ -1,0 +1,8 @@
+{
+  "identifier": "reveal",
+  "description": "The backup window: it may ask for the 24 words and mark them saved, and nothing else.",
+  "local": true,
+  "windows": ["reveal"],
+  "webviews": ["reveal"],
+  "permissions": ["allow-backup-reveal", "allow-backup-saved"]
+}

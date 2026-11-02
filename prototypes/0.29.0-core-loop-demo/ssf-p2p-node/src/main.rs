@@ -4591,11 +4591,40 @@ async fn stop_signal() -> &'static str {
 /// same (a second signal stops it at once).
 const HOUSE_STOP_MS: u64 = 5_000;
 
-/// On the first stop signal, step the house down and stop; on a second, or
-/// past [`HOUSE_STOP_MS`], stop at once. A step-down that fails still stops
-/// the node: the signal's handler took the place of the default one.
+/// A stop signal this soon after the first is the same stop, not a second
+/// one. On Linux the desktop app asks for SIGTERM when it dies
+/// (PR_SET_PDEATHSIG), and the kernel sends it again each time the node
+/// passes from one of the dying app's threads to the next, all within a
+/// few milliseconds; without this the second copy would cut the step-down
+/// short. A player's second Ctrl-C after this still stops at once.
+const STOP_AGAIN_AFTER_MS: u64 = 1_000;
+// The window ends well inside the step-down's own time.
+const _: () = assert!(STOP_AGAIN_AFTER_MS < HOUSE_STOP_MS - 500);
+
+/// Whether a stop signal `since_first` after the first one counts as a
+/// second stop.
+fn counts_as_again(since_first: std::time::Duration) -> bool {
+    since_first >= std::time::Duration::from_millis(STOP_AGAIN_AFTER_MS)
+}
+
+/// The next stop signal that [`counts_as_again`], by name. Earlier ones
+/// are dropped: the handler stays installed, so they do not stop the node.
+async fn stop_signal_again(first: std::time::Instant) -> &'static str {
+    loop {
+        let why = stop_signal().await;
+        if counts_as_again(first.elapsed()) {
+            return why;
+        }
+    }
+}
+
+/// On the first stop signal, step the house down and stop; on a second
+/// ([`STOP_AGAIN_AFTER_MS`] or more later), or past [`HOUSE_STOP_MS`], stop
+/// at once. A step-down that fails still stops the node: the signal's
+/// handler took the place of the default one.
 async fn house_stop_on_signal(hub: SharedHub) {
     let why = stop_signal().await;
+    let first = std::time::Instant::now();
     println!("🏠 {why}: stepping the house down");
     let stepping = tokio::spawn(async move { house_step_down(&hub, HOUSE_STOP_MS - 500).await });
     tokio::select! {
@@ -4603,12 +4632,30 @@ async fn house_stop_on_signal(hub: SharedHub) {
             Ok(wrote) => println!("🏠 House stepped down ({wrote} record(s)) — stopping"),
             Err(e) => eprintln!("🏠 house: its step-down failed ({e}) — stopping"),
         },
-        again = stop_signal() => println!("🏠 {again} again — stopping now"),
+        again = stop_signal_again(first) => println!("🏠 {again} again — stopping now"),
         _ = tokio::time::sleep(std::time::Duration::from_millis(HOUSE_STOP_MS)) => {
             eprintln!("🏠 house: its step-down took over {HOUSE_STOP_MS} ms — stopping");
         }
     }
     std::process::exit(if why == "SIGTERM" { 143 } else { 130 });
+}
+
+#[cfg(test)]
+mod stop_again_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The desktop app's death signal comes again within milliseconds as
+    /// the dying app's threads exit: those copies are the first stop, and
+    /// only a signal a second or more later stops the node at once.
+    #[test]
+    fn a_repeat_within_a_second_is_the_same_stop() {
+        assert!(!counts_as_again(Duration::ZERO));
+        assert!(!counts_as_again(Duration::from_millis(3)));
+        assert!(!counts_as_again(Duration::from_millis(STOP_AGAIN_AFTER_MS - 1)));
+        assert!(counts_as_again(Duration::from_millis(STOP_AGAIN_AFTER_MS)));
+        assert!(counts_as_again(Duration::from_millis(HOUSE_STOP_MS)));
+    }
 }
 
 async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {

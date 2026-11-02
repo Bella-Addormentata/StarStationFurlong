@@ -29,7 +29,9 @@ name: "✅ PR Checks"
 #      macOS path would first compile in the tag-time release.
 #   7. 🖥️ `cargo test` on the desktop shell (src-tauri) on Linux, with the
 #      WebKit/GTK libraries the release's Linux build installs: the sidecar
-#      spawn's own test (it must clear SSF_CHIA_NETWORK).
+#      spawn's own test (it must clear SSF_CHIA_NETWORK), and the backup
+#      window's channel, scheme and caller tests, with and without the
+#      development-only `chia-mainnet` feature.
 
 on:
   pull_request:
@@ -197,3 +199,8 @@ jobs:
 
       - name: 🧪 cargo test (src-tauri)
         run: cargo test --manifest-path ${{ env.RELEASE_FRONTEND }}/src-tauri/Cargo.toml
+
+      # The development-only mainnet build of the app (its network constant,
+      # the node's SSF_CHIA_NETWORK=mainnet); release builds leave it out.
+      - name: 🧪 cargo test --features chia-mainnet (src-tauri)
+        run: cargo test --features chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/src-tauri/Cargo.toml
