@@ -74,7 +74,10 @@ chia-sdk-utils = { version = "0.34", optional = true }
 # `zeroize` makes a `Mnemonic` wipe its word indices when dropped, and the
 # direct `zeroize` dep wipes the buffers the identity file passes through.
 bip39 = { version = "2.2.2", optional = true, features = ["zeroize"] }
-zeroize = { version = "1.5", optional = true }
+# Every build: the desktop app's channel (shell_channel.rs) wipes its line
+# and frame buffers. Already in every build's graph (chacha20poly1305 above
+# brings it), so nothing new is built.
+zeroize = "1.5"
 # Slice 4 (publish) + Slice 5 (resolve): spend construction and signing.
 chia-sdk-driver = { version = "0.34", optional = true }
 chia-sdk-types = { version = "0.34", optional = true }
@@ -161,7 +164,7 @@ chia-read = [
 chia-publish = [
     "chia-read",
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
-    "dep:bip39", "dep:zeroize", "dep:windows-sys",
+    "dep:bip39", "dep:windows-sys",
 ]
 # ⛓️ Chia mainnet for development builds only (stage 2 of the mainnet
 # transition): lets `SSF_CHIA_NETWORK=mainnet` select it (chia_network.rs).
