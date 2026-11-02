@@ -145,6 +145,9 @@ jobs:
   node-check-macos:
     name: 🦀 Node cargo check + wallet tests on macOS (release features)
     runs-on: macos-latest # Apple Silicon, as the release's .dmg
+    # A backstop: a keychain prompt would wait for ever, and the keychain
+    # tests already stop each call long before this.
+    timeout-minutes: 30
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v5
@@ -160,8 +163,14 @@ jobs:
       - name: 🔎 cargo check --features chia-publish,torrent --tests
         run: cargo check --features chia-publish,torrent --tests --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
-      # 🏦 The SSF wallet's tests on APFS and the macOS API.
+      # 🏦 The SSF wallet's tests on APFS and the macOS API. With
+      # SSF_KEYCHAIN_TESTS=1 the keychain tests run against temporary
+      # keychains (never the login keychain), including the update drill: a
+      # re-signed copy of the test binary reads the key through security with
+      # no prompt, and is refused the two control items.
       - name: 🧪 cargo test --features chia-publish,torrent chia_wallet chia_at_rest
+        env:
+          SSF_KEYCHAIN_TESTS: '1'
         run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- chia_wallet chia_at_rest
 
   tauri-shell-test:

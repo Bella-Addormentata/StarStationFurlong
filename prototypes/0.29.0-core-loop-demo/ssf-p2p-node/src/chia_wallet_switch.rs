@@ -36,8 +36,9 @@
 //! of whoever asked for it.
 //!
 //! 🔒 Once saved, the node also locks the identity file with this computer's
-//! store where it has one (chia_at_rest.rs: Windows DPAPI), and the
-//! fingerprint says how the file keeps its key ([`AtRest`]).
+//! store where it has one (chia_at_rest.rs: Windows DPAPI; on a Mac, a key
+//! in the user's login keychain once that store is on), and the fingerprint
+//! says how the file keeps its key ([`AtRest`]).
 //!
 //! ⛓️ The SSF wallet starts, turns and reads alike on every Chia network
 //! (chia_network.rs). What differs off a test network (mainnet) is who may
@@ -98,6 +99,9 @@ pub enum AtRest {
     None,
     /// Locked by Windows DPAPI to this Windows account on this PC.
     Dpapi,
+    /// Locked with a key in this Mac user's login keychain
+    /// (chia_at_rest/keychain_lock.rs).
+    Keychain,
 }
 
 /// What the node's environment says about the wallet, read once.
@@ -1224,6 +1228,29 @@ mod tests {
         }
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true}"#).unwrap();
         assert_eq!(back.at_rest, None, "an older node never sends it");
+    }
+
+    /// 🔒 A Mac's lock rides as `keychain`, both as the lock a file has and
+    /// as the lock it gets once its words are saved, and reads back the same.
+    #[test]
+    fn the_keychain_lock_rides_as_keychain() {
+        use EnvSwitch::*;
+        let memo = SwitchMemo { remembered: true, error: None };
+        let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
+        let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Keychain), ..KeyFacts::default() };
+        assert_eq!(
+            json(&view(true, Unset, true, &memo, &clear)),
+            r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","at_rest_next":"keychain","backup":"page"}"#
+        );
+        let locked = KeyFacts { mnemonic: true, backed_up: true, at_rest: AtRest::Keychain, at_rest_next: Some(AtRest::Keychain), rewrapped: true, ..KeyFacts::default() };
+        assert_eq!(
+            json(&view(true, Unset, true, &memo, &locked)),
+            r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"keychain","rewrapped":true,"backup":"page"}"#,
+            "a locked file has no lock to come"
+        );
+        let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true,"at_rest":"keychain","at_rest_next":"keychain"}"#).unwrap();
+        assert_eq!((back.at_rest, back.at_rest_next), (Some(AtRest::Keychain), Some(AtRest::Keychain)));
+        assert_eq!(serde_json::to_string(&AtRest::Keychain).unwrap(), r#""keychain""#);
     }
 
     #[test]

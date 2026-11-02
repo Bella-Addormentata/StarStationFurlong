@@ -12,7 +12,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{classify_dpapi, dpapi_entropy, AtRest, SecretStore, StoreError};
+use super::{classify_dpapi, dpapi_entropy, AtRest, Code, SecretStore, StoreError};
 
 pub struct Dpapi;
 
@@ -59,7 +59,7 @@ impl Drop for Output {
 fn last_error() -> StoreError {
     // SAFETY: no arguments; reads the calling thread's last error.
     let code = unsafe { GetLastError() };
-    StoreError { refusal: classify_dpapi(code), code: code as i64 }
+    StoreError { refusal: classify_dpapi(code), code: Code::Dpapi(code) }
 }
 
 impl SecretStore for Dpapi {
