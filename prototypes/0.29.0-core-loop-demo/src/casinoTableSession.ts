@@ -2350,7 +2350,7 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
   const unseenNote = (d: Decision | undefined): string =>
     d === 'forfeit' ? "DECIDED BY A FORFEIT THIS PAGE DIDN'T SEE"
       : d === 'house' ? "DECIDED BY THE HOUSE'S REVEAL THIS PAGE DIDN'T SEE"
-        : d === 'void' ? "DECIDED BY AN ABANDON THIS PAGE DIDN'T SEE"
+        : d === 'void' ? "A RESULT THIS PAGE DIDN'T SEE"
           : d === 'reveals' ? "DECIDED BY EVERY SEED THIS PAGE DIDN'T SEE"
             : '';
 
@@ -2416,7 +2416,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return wait ?? { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
     }
     if (s.phase === 'settled' && s.voided) {
-      return { line: '⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+      // 🔁 A trim can void a round this page saw decided (the L7 fix): note it,
+      // in wording that fits an abandon or a house reveal that counted nobody.
+      const note = unseenNote(s.unseen);
+      return { line: `⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL${note ? ` · ${note}` : ''}`, color: GOLD_BRIGHT };
     }
     if (s.phase === 'settled' && s.dice) {
       const parts = [`● ${callOf(s.dice, s.pointBefore ?? null, s.point)}`];
@@ -2486,7 +2489,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (mine?.frozen && !mine.revealed) return { line: '✋ NO MORE BETS — STAY UNTIL THE SPIN', color: PINK };
       return houseWait() ?? { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
     }
-    if (s.phase === 'settled' && s.voided) return { line: '⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED', color: GOLD_BRIGHT };
+    if (s.phase === 'settled' && s.voided) {
+      // 🔁 A trim can void a round this page saw decided (the L7 fix): note it.
+      const note = unseenNote(s.unseen);
+      return { line: `⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED${note ? ` · ${note}` : ''}`, color: GOLD_BRIGHT };
+    }
     if (s.phase === 'settled' && s.result !== null) {
       const check = computedRoundCheck(itemId);
       const fate = check?.round === s.round ? check.mine : null;

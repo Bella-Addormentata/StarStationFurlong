@@ -758,13 +758,15 @@ function decisionSig(v: RoundView): string {
  *  the copies and this page's own evidence (§6.2 C). */
 function chosenRoundU(st: TableState, res: FoldResult): RedecideCandidate | null {
   if (res.base.u === 0) return null;
-  const cands = computedRedecide(st.t);
-  // Prefer the decision the trim actually copied into this session (at most
-  // one surviving candidate is fully copied — the trimmer's own) over a
-  // memory-only one; otherwise the fold's own order (C4). On equal nets either
-  // way this is what keeps every page on the trimmer's decision rather than
-  // the one it happens to remember, which fold order could rank first.
-  return cands.find((c) => c.copied) ?? cands[0] ?? null;
+  // The first surviving candidate in the fold's own order (§6.2 C4): house
+  // reveal; forfeit by rank; every reveal; void by abandon. Fold order is fixed
+  // by the records themselves, never by which candidate the live session
+  // happens to carry — so a validly-signed record replayed into the session
+  // can't move the pick. On equal nets more than one candidate reproduces the
+  // checkpoint; fold order picks among them and the chips are right either way
+  // (C4, §6.4). The owner's signed d/o is bound to its own decision separately
+  // (attestDuty), so a replay can't make it vouch for a pocket it didn't fold.
+  return computedRedecide(st.t)[0] ?? null;
 }
 
 /** Keep what the fold said that a trim takes away: the last decided round
@@ -893,17 +895,20 @@ function attestDuty(st: TableState, was: FoldResult, res: FoldResult, carriedPla
   //    is a premature cut, a race, or a forger dropping a settled round.
   if (played > P.u || was.rounds.some((v) => v.decided !== null && v.r > P.u)) return fail();
   // How round u was decided, when this page is sure (§6.3 D2 "d and o"). The
-  // round-u view (§6.2 C) runs first: when the trim carried copies (D1) and its
-  // chosen candidate survived C3, the deed holder signs that candidate's decider
-  // and pocket — the L7 fix, so a recovering page learns the pocket the trimmer
-  // decided even when it isn't this page's own. A void signs the decider with no
-  // pocket. With no copies (a v0.50 trimmer, or a candidate from this page's own
-  // memory alone), it falls back to its own house reveal, the one decision no
-  // unseen record can beat; otherwise it omits both, so an owner that is itself
-  // the L7 victim never signs the wrong pocket.
+  // round-u view (§6.2 C) runs first; the deed holder signs its chosen
+  // candidate's decider and pocket only when that candidate is this page's own
+  // decided round (`at`) and the trim carried its copies (D1). Bound to the fold
+  // this page authenticated — not to which records the live session now holds —
+  // so a validly-signed record replayed into the session can't make it vouch
+  // for a pocket it didn't fold. When the fold-order pick differs from its own
+  // decision (it is itself the L7 victim, or a peer's equal-nets decider sorts
+  // first), it signs no d/o; a recovering page then shows no pocket (C5) rather
+  // than a possibly-substituted one. A void signs the decider with no pocket.
+  // With no copies (a v0.50 trimmer), it falls back to its own house reveal, the
+  // one decision no unseen record can beat; otherwise it omits both.
   let decided: { d: string; o?: number | [number, number] } | undefined;
   const chosen = chosenRoundU(st, res);
-  if (chosen && chosen.copied) {
+  if (chosen && chosen.copied && chosen.d === decisionSig(at)) {
     if (chosen.view.decided === 'void') decided = { d: chosen.d };
     else {
       const o = st.game === 'craps' ? chosen.view.craps?.dice : chosen.view.pocket;

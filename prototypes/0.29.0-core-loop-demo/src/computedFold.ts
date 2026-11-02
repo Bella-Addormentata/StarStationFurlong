@@ -1160,7 +1160,11 @@ function mergeByPid<E>(mine: Map<string, Map<string, E>>, live: Map<string, Map<
  *  held (its `.b` is this fold's live session id) and this page had that
  *  round's close — a new page keeps none (C5). */
 interface PriorEvidence {
-  session: string;
+  /** The base sid this evidence is for — the session the trim it was captured
+   *  for opened (nextSid of that checkpoint). redecide uses it only while the
+   *  active base is this sid, so it lies dormant through a rewind/jump excursion
+   *  and serves again when the honest checkpoint is restored (§6.2 B). */
+  forSid: string;
   u: number;
   l: string;
   close: CloseEntry;
@@ -1252,8 +1256,11 @@ export class TableFold {
    *  round, rebuilt each compute; setBase reads it to keep `sIn` for the
    *  round-u view (PriorEvidence). */
   private sInAt = new Map<number, unknown>();
-  /** The outgoing session's round-u evidence (§6.2 B), kept from one setBase
-   *  until the next, for the round-u view (redecide). null with none. */
+  /** The round-u evidence (§6.2 B) of the latest forward trim this page
+   *  folded, for the round-u view (redecide). Kept across a rewind/jump
+   *  excursion — its `forSid` gates use — so a restore of the honest checkpoint
+   *  shows the L7 correction again; replaced only when a newer forward trim is
+   *  captured. null with none. */
   private prior: PriorEvidence | null = null;
 
   /** `keyOf`, when given, pins each player's felt to one key: a slip
@@ -1288,14 +1295,20 @@ export class TableFold {
     if (sid === this.base.sid) return;
     // 🔁 Keep the outgoing session's round-u evidence for the round-u view
     // (§6.2 B), from the current (old) indexes, before clearIndex wipes them.
-    const prior = this.capturePrior(ok);
+    const captured = this.capturePrior(ok);
     this.clearIndex();
     const n = new Map<string, bigint>();
     if (ok) for (const pid of Object.keys(ok.n).sort()) n.set(pid, BigInt(ok.n[pid]));
     this.base = {
       sid, u: ok ? ok.u : 0, l: ok ? ok.l : null, n, ended: ok?.e === 1, state: this.game.start(ok), h: ok?.h ?? null,
     };
-    this.prior = prior;
+    // 🔁 Keep a captured forward trim's evidence (§6.2 B). A rewind or jump
+    // capturePrior can't tag returns null; keep the last evidence rather than
+    // drop it, so a restore back to the checkpoint it belongs to shows the L7
+    // correction again instead of reverting to the stale pre-trim verdict.
+    // redecide uses it only while prior.forSid === this.base.sid, so it stays
+    // dormant on any other base.
+    if (captured) this.prior = captured;
     this.dirty = true;
   }
 
@@ -1325,7 +1338,7 @@ export class TableFold {
     const at = this.revealsAt.get(u);
     if (at) for (const [pid, inner] of at) reveals.set(pid, new Map(inner));
     return {
-      session: this.base.sid, u, l, close,
+      forSid: nextSid(this.ctx, ok), u, l, close,
       P: new Map(info.P), M: [...info.M],
       reveals,
       forfeits: new Map(this.forfeitsOf.get(l) ?? []),
@@ -1696,7 +1709,10 @@ export class TableFold {
    *  Display only — no count or spend reads it. */
   redecide(): RedecideCandidate[] {
     const prior = this.prior;
-    if (!prior) return [];
+    // Only while the active base is the session this evidence is for (§6.2 B): a
+    // rewind/jump excursion leaves it dormant, and a restore of the honest
+    // checkpoint makes it serve again.
+    if (!prior || prior.forSid !== this.base.sid) return [];
     // Redecide is display-only: the checks below (ask / houseRecOk) may mark a
     // pending verification, but that must not reach the financial fold's
     // `pending`. These records sit below the base — the count never reads them
@@ -1775,9 +1791,21 @@ export class TableFold {
       // (b) Every frozen seed in, nothing missing.
       if (M.length === 0 && revealed.length === present.length) add('reveals', 'r', present, {});
     }
-    // (c) Void by abandon, by rank.
+    // (c) Void by abandon, by rank. At a Fair close whose lowest-hash valid
+    // house reveal is still waiting on a bettor's seed, carry that missing-seed
+    // info onto the void as decide() does (its houseWaits branch), so the card
+    // reads "the house is waiting", not "the house never revealed its seed".
+    let houseWaits: string[] | undefined;
+    if (fair) {
+      const hr = this.viewHouseReveals(close, hReveals)[0];
+      if (hr) {
+        const inN = new Set(hr.rec.n);
+        const need = present.filter((pid) => inN.has(P.get(pid)!.hash));
+        if (!need.every((pid) => seeds.has(pid))) houseWaits = need.filter((pid) => !seeds.has(pid));
+      }
+    }
     const zs = [...abandons.values()].filter((z) => z.rec.r === u && this.ask(z, 'abandon') === true).sort(this.byRank);
-    for (const z of zs) add('void', `z:${z.hash}`, [], { abandon: { hash: z.hash, rec: z.rec } });
+    for (const z of zs) add('void', `z:${z.hash}`, [], { abandon: { hash: z.hash, rec: z.rec }, ...(houseWaits ? { houseWaits } : {}) });
 
     this.sawPending = savedPending;
     return cands.filter((c) => this.reproduces(c, netsBefore));

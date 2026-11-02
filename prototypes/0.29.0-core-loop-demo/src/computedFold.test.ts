@@ -1412,4 +1412,34 @@ describe('🔁 redecide — the round-u view (the L7 fix)', () => {
     expect(cands[0]).toMatchObject({ copied: false });
     expect(cands[0].view).toMatchObject({ decided: 'reveals', pocket: pA });
   });
+
+  it('keeps the round-u evidence across a checkpoint rewind, so a restore shows the correction again (R2 Finding 5)', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const live = (): [string, unknown][] => [forfeit, kit.reveal(1, A.pid)].map((r) => [r.key, r.rec]);
+    const f = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid)]);
+    // The L7 correction is live: the forfeit the trim carried, reproduced.
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    // A cheat rewinds the checkpoint to the genesis base — a valid-shaped
+    // excursion the capture can't tag. The evidence is kept but dormant: its
+    // forSid no longer matches the active base, so redecide falls silent.
+    f.setBase(null);
+    f.reset([]);
+    expect(f.redecide()).toEqual([]);
+    // The honest checkpoint is restored and its session reloaded: the kept
+    // evidence serves again and the correction returns, rather than the felt
+    // reverting to the stale pre-trim verdict (it would, had the excursion
+    // dropped the evidence — capturePrior can't recapture it from the rewind).
+    f.setBase(cp1);
+    f.reset(live());
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+  });
 });

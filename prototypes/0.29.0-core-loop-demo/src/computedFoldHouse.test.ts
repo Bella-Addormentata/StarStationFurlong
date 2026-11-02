@@ -440,6 +440,33 @@ describe('a house table\'s checkpoint', () => {
   });
 });
 
+// ── Redecide at a house table ─────────────────────────────────────────────────
+
+describe('🏛️🔁 redecide — the round-u view at a house table (the L7 fix)', () => {
+  it('an abandon-void keeps the waiting house reveal\'s missing seed (R2 Finding 2)', () => {
+    // This page saw the Fair round void: the house reveal counts alice and bob,
+    // but bob's seed never came, so the abandon won while the house still waited.
+    const { a1, b1, join, close, ra, hr } = fairRound1(); // rb (bob's seed) withheld
+    const z = kit.abandon(B, 1, close.hash);
+    const session0: Built<unknown>[] = [a1, b1, join, close, ra, hr, z];
+    const entries = session0.map((r): [string, unknown] => [r.key, r.rec]);
+    const f = new TableFold(HCTX, sigs.check, undefined, undefined, onlyH);
+    f.reset(entries);
+    // decide() flags this void as "the house is waiting on bob", not a no-show.
+    expect(f.result().rounds[0]).toMatchObject({ decided: 'void', houseWaits: [B.pid] });
+    // Trim to the void — a refund, so the nets are unchanged — then reload the
+    // copies the trim carried (the abandon, the house reveal, alice's seed).
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, {});
+    f.setBase(cp1);
+    f.reset([z, hr, ra].map((r): [string, unknown] => [r.key, r.rec]));
+    const cands = f.redecide();
+    expect(cands.map((c) => c.d)).toEqual([`z:${z.hash}`]);
+    // The redecide void must carry the same missing-seed info as decide(), so
+    // l7Check's houseVoid stays false for a round the house did reveal (R2 F2).
+    expect(cands[0].view).toMatchObject({ decided: 'void', houseWaits: [B.pid] });
+  });
+});
+
 // ── The chain ────────────────────────────────────────────────────────────────
 
 describe('choosing the chain at a house table', () => {

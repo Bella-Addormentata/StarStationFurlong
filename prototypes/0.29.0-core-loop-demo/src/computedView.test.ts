@@ -503,7 +503,7 @@ describe('🔁 the round-u view (the L7 fix)', () => {
     expect(o.table.computedDecidedTo(TABLE)).toBe(1);
   });
 
-  it('equal nets either way, the reverse: this page folded a forfeit but the trim decided reveals — both reproduce, so fold order ranks the forfeit first, yet the copied reveals win (F3)', async () => {
+  it('equal nets either way, the reverse: this page folded a forfeit and the trim carried the reveals — both reproduce, so fold order keeps this page’s own forfeit (C4; chips right either way)', async () => {
     const o = await watch();
     const pA = pocketFor(1, X, Y); // every reveal in — the trimmer’s pocket
     const pF = pocketFor(1, X); // X’s forfeit counts X only — this page’s pocket
@@ -518,26 +518,144 @@ describe('🔁 the round-u view (the L7 fix)', () => {
     putAt(o, T0 + 18_000, closeRec, kit.reveal(1, X.pid), kit.forfeit(X, 1, closeRec.hash, [X.pid]));
     expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'forfeit', pocket: pF });
     expect(view(o, T0 + 29_000)).toMatchObject({ phase: 'settled', round: 1, result: pF });
-    // A stranger trims. Both bets lose on either pocket, so the reveals’ nets
-    // equal the forfeit’s (O’s own, used as the checkpoint’s) — the silent L7,
-    // reversed. This is a v0.51 trim that decided by the reveals: it carried no
-    // copy of O’s forfeit (copyDecider false), and the reveals it counted
-    // arrive as copies the way a real trim carries them. So the forfeit is this
-    // page’s memory only (copied false), the reveals are copied, and both
-    // reproduce — fold order ranks the forfeit first, but the copied reveals
-    // must win.
+    // A v0.51 trim that decided by the reveals: it carried no copy of O’s
+    // forfeit (copyDecider false), and the reveals it counted arrive as copies.
+    // Both bets lose on either pocket, so the reveals’ nets equal the forfeit’s
+    // (O’s own, used as the checkpoint’s) — the silent L7, reversed. So the
+    // forfeit is this page’s memory only (copied false) and the reveals are
+    // copied, and both reproduce the checkpoint. Fold order (§6.2 C4) ranks the
+    // forfeit first whichever the live session carries, so O keeps showing its
+    // own forfeit — the chips are right either way (§6.4), and a replayed
+    // record can’t move the pick (the R2 replay surface closed).
     vi.setSystemTime(T0 + 30_000);
     trimByHand(o, G, undefined, TABLE, undefined, false);
     expect(foldOf(o).rounds).toEqual([]);
     expect(foldOf(o).base.u).toBe(1);
     putAt(o, T0 + 30_500, kit.reveal(1, X.pid), kit.reveal(1, Y.pid));
     const v = view(o, T0 + 31_000);
-    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pA, unseen: 'reveals' });
-    expect(v.result).not.toBe(pF);
-    // The ⚙ card agrees with the felt (F5): the reveals, both counted, unseen.
-    expect(o.table.computedRoundCheck(TABLE, T0 + 31_000)).toMatchObject({
-      round: 1, decided: 'reveals', counted: 2, of: 2, unseen: 'reveals',
-    });
+    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    expect(v.unseen).toBeUndefined();
+    expect(v.result).not.toBe(pA);
+    // The ⚙ card keeps this page’s own forfeit, counting X only — no unseen note.
+    const card = o.table.computedRoundCheck(TABLE, T0 + 31_000)!;
+    expect(card).toMatchObject({ round: 1, decided: 'forfeit', counted: 1, of: 2 });
+    expect(card.unseen).toBeUndefined();
     expect(o.table.computedDecidedTo(TABLE)).toBe(1);
+  });
+
+  it('void vs void: the trim carried a different abandon, so the felt shows that void unseen — "A RESULT THIS PAGE DIDN’T SEE" (R2 Finding 4)', async () => {
+    const o = await watch();
+    // Both abandons void the round — a refund either way — so their nets are
+    // equal (zero). Rank the two writers' abandons: the lower-ranked one the
+    // trim carries; the higher-ranked one is the only void this page sees.
+    const rank = (id: TestIdentity): string => dutyRank('abandon', CTX, 1, id.pub);
+    const [low, high] = rank(X) < rank(Y) ? [X, Y] : [Y, X];
+    const xs = kit.slip(X, 1, [red(10)]);
+    const ys = kit.slip(Y, 1, [red(10)]);
+    putAt(o, T0, xs, ys);
+    const closeRec = kit.close(X, 1, foldOf(o).parent, [xs, ys]);
+    const zHigh = kit.abandon(high, 1, closeRec.hash); // this page's void
+    putAt(o, T0 + 18_000, closeRec, zHigh);
+    expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'void', abandon: { hash: zHigh.hash } });
+    // Read the felt settled, so the page notes its own void verdict before the trim.
+    expect(view(o, T0 + 19_000)).toMatchObject({ phase: 'settled', round: 1, voided: true });
+    // A v0.51 trim carries this page's decider (the high abandon) and the void's
+    // nets (a refund — zero). A lower-ranked abandon this page never saw arrives
+    // in the new session the way a real trim carries a copy.
+    vi.setSystemTime(T0 + 19_500);
+    trimByHand(o, G);
+    putAt(o, T0 + 20_000, kit.abandon(low, 1, closeRec.hash));
+    const v = view(o, T0 + 20_500);
+    // Both voids reproduce the zero-net checkpoint; fold order ranks the low
+    // abandon first (§6.2 C4), so the felt shows that void — one this page
+    // didn't see (unseen='void'), which the status line notes generically
+    // ("A RESULT THIS PAGE DIDN'T SEE"), since a void needn't be an abandon.
+    expect(v).toMatchObject({ phase: 'settled', round: 1, voided: true, unseen: 'void' });
+    expect(o.table.computedDecidedTo(TABLE)).toBe(1);
+  });
+});
+
+// The felt's round-u view is display-only and follows fold order; the owner's
+// hs: d/o is a signature, so it must rest on the round the owner itself folded,
+// never on which records the live session happens to carry (a replay can forge
+// that). These pin the attestation side of the L7 fix (R2 HIGH): the deed
+// holder signs a pocket only when the fold-order pick is its own decision.
+describe('🏛️🔁 the owner signs only the round it folded (the L7 fix, R2 HIGH)', () => {
+  /** The lowest pocket 0..36 not among `taken`. */
+  const free = (...taken: number[]): number => {
+    for (let p = 0; p <= 36; p++) if (!taken.includes(p)) return p;
+    throw new Error('no free pocket');
+  };
+  /** Make O the room’s deed holder, so it attests its trims (D2). */
+  const ownO = (o: Page): void => { o.doc.transact(() => o.doc.getMap('roomInfo').set('owner', o.pid)); };
+
+  it('folded the reveals, a copied forfeit of equal nets sorts first: it signs no pocket it didn’t fold', async () => {
+    const o = await watch();
+    ownO(o);
+    const pA = pocketFor(1, X, Y); // reveals — what O folded
+    const pF = pocketFor(1, X); // the forfeit counting X only
+    expect(pA).not.toBe(pF);
+    const pickX = free(pA, pF);
+    const pickY = free(pA, pF, pickX);
+    const xs = kit.slip(X, 1, [straight(pickX, 5)]); // loses on either pocket
+    const ys = kit.slip(Y, 1, [straight(pickY, 5)]); // loses on either pocket
+    putAt(o, T0, xs, ys);
+    const closeRec = kit.close(X, 1, foldOf(o).parent, [xs, ys]);
+    putAt(o, T0 + 18_000, closeRec, kit.reveal(1, X.pid), kit.reveal(1, Y.pid));
+    expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'reveals', pocket: pA });
+    expect(view(o, T0 + 22_000)).toMatchObject({ phase: 'settled', round: 1, result: pA });
+    // A v0.51 trim carries the reveals O counted. A stranger replays X’s forfeit
+    // into the new session: it counts X only, reproduces the same nets (both
+    // bets lose either way), so it survives C3 and fold order even ranks it
+    // before the reveals. The forfeit is now `copied` (it sits in the live
+    // session), but O never folded it.
+    vi.setSystemTime(T0 + 30_000);
+    trimByHand(o, G); // copies O’s reveals
+    putAt(o, T0 + 30_500, kit.forfeit(X, 1, closeRec.hash, [X.pid]));
+    const v = view(o, T0 + 31_000); // drives the attest pass (the fold moved)
+    // The felt shows the fold-order pick (the forfeit, unseen) — cosmetic on
+    // equal nets — but the owner must not vouch for it: its hs: carries no d/o,
+    // because the chosen candidate isn’t its own decision (bound to `at`).
+    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pF, unseen: 'forfeit' });
+    const hs = o.casino.bestHouseSum(TABLE, CTX.inc);
+    expect(hs).not.toBeNull();
+    expect(hs!.d).toBeUndefined();
+    expect(hs!.o).toBeUndefined();
+  });
+
+  it('folded the forfeit, the trim carried the reveals: it signs no reveals pocket it never folded, and a replayed forfeit can’t change that', async () => {
+    const o = await watch();
+    ownO(o);
+    const pA = pocketFor(1, X, Y); // the reveals the trim carried
+    const pF = pocketFor(1, X); // X’s forfeit counting X only — what O folded
+    expect(pA).not.toBe(pF);
+    const pickX = free(pA, pF);
+    const pickY = free(pA, pF, pickX);
+    const xs = kit.slip(X, 1, [straight(pickX, 5)]); // loses on either pocket
+    const ys = kit.slip(Y, 1, [straight(pickY, 5)]); // loses on either pocket
+    putAt(o, T0, xs, ys);
+    const closeRec = kit.close(X, 1, foldOf(o).parent, [xs, ys]);
+    // O misses Y’s reveal, so it folds round 1 by X’s forfeit (pF).
+    putAt(o, T0 + 18_000, closeRec, kit.reveal(1, X.pid), kit.forfeit(X, 1, closeRec.hash, [X.pid]));
+    expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'forfeit', pocket: pF });
+    expect(view(o, T0 + 29_000)).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    // A v0.51 trim decided by the reveals (copyDecider false); the reveals it
+    // counted arrive as copies. Only the reveals are `copied`; O’s forfeit is
+    // its own memory. Under the old `copied`-first pick the owner would sign the
+    // reveals’ pocket — one it never folded. Fold order picks the forfeit (its
+    // own), so it signs its own pocket or none, never the reveals’.
+    vi.setSystemTime(T0 + 30_000);
+    trimByHand(o, G, undefined, TABLE, undefined, false);
+    putAt(o, T0 + 30_500, kit.reveal(1, X.pid), kit.reveal(1, Y.pid));
+    expect(view(o, T0 + 31_000)).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    const hs = o.casino.bestHouseSum(TABLE, CTX.inc);
+    expect(hs).not.toBeNull();
+    expect(hs!.o).not.toBe(pA); // never the reveals pocket it didn’t fold
+    // Now a stranger replays O’s own forfeit into the session (the R2 scenario):
+    // both decider and reveals are `copied`. The felt still shows the forfeit
+    // (fold order, stable), and the owner still never vouches for the reveals.
+    putAt(o, T0 + 31_010, kit.forfeit(X, 1, closeRec.hash, [X.pid]));
+    expect(view(o, T0 + 31_050)).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    expect(o.casino.bestHouseSum(TABLE, CTX.inc)!.o).not.toBe(pA);
   });
 });
