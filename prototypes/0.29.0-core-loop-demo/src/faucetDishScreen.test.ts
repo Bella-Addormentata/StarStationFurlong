@@ -223,3 +223,105 @@ describe.each([
     if (net.test) expect(h).toContain(`The node sent a jar address that is not on ${net.name}, so the dish shows no address.`);
   });
 });
+
+describe('the faucet dish screen when the empty jar takes no gifts', () => {
+  it.each([['Chia mainnet', MAINNET], ['a network the page does not know', null]] as const)('does not ask for a gift when the jar is empty on %s', (_label, net) => {
+    const st = { ...status(net, addressOn(net ?? TESTNET11, BODY)), coins: 0, ready: 0, totalMojos: 0n };
+    const h = screen(st, net);
+    expect(h).toContain('THE JAR IS EMPTY');
+    expect(h).not.toContain('DROP SOMETHING IN THE SLOT');
+  });
+
+  it('still asks for a gift on a test network', () => {
+    const st = { ...status(TESTNET11, addressOn(TESTNET11, BODY)), coins: 0, ready: 0, totalMojos: 0n };
+    expect(screen(st, TESTNET11)).toContain('THE JAR IS EMPTY — DROP SOMETHING IN THE SLOT');
+  });
+});
+
+describe('the faucet dish screen when the fingerprint changes network while it is open', () => {
+  /** Mount the screen and keep it open: the fingerprint's network can be
+   *  changed between draws, buttons' click handlers are kept by selector,
+   *  and the requests the screen sends are recorded. */
+  function openScreen(st: FaucetStatus) {
+    clearFaucetRoom(ROOM);
+    openFaucetRoom(ROOM);
+    setFaucetReply(ROOM, { op: 'status', ok: true, status: st });
+    let fpNet: ChiaNetwork | null | undefined = st.net;
+    const clicks = new Map<string, () => void>();
+    const sent: string[] = [];
+    const writes: string[] = [];
+    const panel = {
+      innerHTML: '',
+      id: '',
+      style: { cssText: '' },
+      addEventListener() {},
+      querySelector: (sel: string) => ({ addEventListener: (_e: string, fn: () => void) => clicks.set(sel, fn) }),
+      remove() {},
+    };
+    vi.stubGlobal('document', { createElement: () => panel });
+    vi.stubGlobal('navigator', { clipboard: { writeText: (t: string) => { writes.push(t); return new Promise<void>(() => {}); } } });
+    const ui = createFaucetDishUI({
+      roomId: () => ROOM,
+      request: (op: string) => {
+        sent.push(op);
+        return { seq: sent.length, sent: new Promise<void>(() => {}) };
+      },
+      chiaNet: () => fpNet,
+    });
+    ui.mount({ appendChild() {} } as unknown as HTMLElement);
+    return {
+      ui,
+      html: () => panel.innerHTML,
+      setNet: (n: ChiaNetwork | null | undefined) => { fpNet = n; },
+      click: (sel: string) => clicks.get(sel)?.(),
+      sent,
+      writes,
+      close: () => { ui.unmount(); clearFaucetRoom(ROOM); },
+    };
+  }
+
+  it.each([['Chia mainnet', MAINNET], ['a network the page does not know', null]] as const)('redraws with no GIVE, QR code or address once the fingerprint says %s', (_label, to) => {
+    const address = addressOn(TESTNET11, BODY);
+    const s = openScreen(status(TESTNET11, address));
+    expect(s.html()).toContain('faucet-give-0');
+    expect(s.html()).toContain(address);
+    s.setNet(to);
+    s.ui.update(0.016);
+    expect(s.html()).not.toContain('faucet-give');
+    expect(s.html()).not.toContain('<svg');
+    expect(s.html()).not.toContain(address);
+    expect(s.html()).toContain('id="faucet-no-slot"');
+    s.close();
+  });
+
+  it('does not redraw while the network stays the same', () => {
+    const s = openScreen(status(TESTNET11, addressOn(TESTNET11, BODY)));
+    const before = s.html();
+    s.click('#faucet-take'); // a TAKE marks the room pending; no redraw follows from update()
+    const pendingDraw = s.html();
+    s.ui.update(0.016);
+    expect(s.html()).toBe(pendingDraw);
+    expect(before).toContain('faucet-give-0');
+    s.close();
+  });
+
+  it('sends no GIVE and copies nothing when the network moved off a test one before the click', () => {
+    const address = addressOn(TESTNET11, BODY);
+    const s = openScreen(status(TESTNET11, address));
+    s.setNet(MAINNET);
+    // The click lands before the next frame's update() redraws the screen.
+    s.click('#faucet-give-0');
+    s.click('#faucet-copy');
+    expect(s.sent.filter((op) => op === 'give')).toEqual([]);
+    expect(s.writes).toEqual([]);
+    expect(s.html()).not.toContain('faucet-give');
+    s.close();
+  });
+
+  it('still sends a GIVE on the same test network', () => {
+    const s = openScreen(status(TESTNET11, addressOn(TESTNET11, BODY)));
+    s.click('#faucet-give-0');
+    expect(s.sent).toContain('give');
+    s.close();
+  });
+});

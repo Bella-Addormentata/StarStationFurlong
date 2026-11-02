@@ -4664,6 +4664,28 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     sent.catch((e: unknown) => failFaucetRequest(roomId, 'status', seq, e));
   };
 
+  /** ⛓️ The network the screen is for, with `st` on file. A status's network
+   *  counts only when the fingerprint resolved the same row (or none was
+   *  read); a genesis mismatch or a different id leaves it unknown. Before
+   *  the first status the fingerprint's network is used, and while neither
+   *  has been read the slot is not drawn (`known` false). Read again at
+   *  every draw and every GIVE or COPY, since the fingerprint can change
+   *  while the screen is open. */
+  const dishNet = (st: ReturnType<typeof latestFaucetStatus>): { net: ChiaNetwork | null; known: boolean } => {
+    const fpNet = deps.chiaNet();
+    const net = st
+      ? (st.net && (fpNet === undefined || fpNet?.id === st.net.id) ? st.net : null)
+      : (fpNet ?? null);
+    return { net, known: st !== null || fpNet !== undefined };
+  };
+  /** The fingerprint's network as the last draw saw it, so `update` redraws
+   *  when it changes without a new status. */
+  const fpNetKey = (): string => {
+    const fpNet = deps.chiaNet();
+    return fpNet === undefined ? '-' : fpNet === null ? '?' : fpNet.id;
+  };
+  let drawnFor = '';
+
   const render = (): void => {
     if (!panel) return;
     const roomId = deps.roomId();
@@ -4689,16 +4711,9 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // an earlier spend); the balance line shows what the wallet owns.
     const spendable = st?.walletSpendableMojos ?? wallet;
     const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
-    // ⛓️ The network: the ticker, and whether the slot shows at all. A status's
-    // network counts only when the fingerprint resolved the same row (or none
-    // was read); a genesis mismatch or a different id leaves it unknown. Before
-    // the first status the fingerprint's network is used, and while neither
-    // has been read the slot is not drawn.
-    const fpNet = deps.chiaNet();
-    const net: ChiaNetwork | null = st
-      ? (st.net && (fpNet === undefined || fpNet?.id === st.net.id) ? st.net : null)
-      : (fpNet ?? null);
-    const netKnown = st !== null || fpNet !== undefined;
+    // ⛓️ The network: the ticker, and whether the slot shows at all.
+    drawnFor = fpNetKey();
+    const { net, known: netKnown } = dishNet(st);
     const ticker = net?.ticker ?? null;
     const slotOpen = net?.test === true;
     // The jar's address is shown, put in a QR code or copied only when it is
@@ -4722,7 +4737,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🥣 FAUCET DISH</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
-      <div style="font-size:11px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">${dishLine(st)}</div>
+      <div style="font-size:11px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">${st && st.coins <= 0 && !slotOpen ? 'THE JAR IS EMPTY' : dishLine(st)}</div>
       ${pendingLine ? `<div style="font-size:9.5px; color:${CH_PINK};">${pendingLine}</div>` : ''}
       ${err ? `<div style="font-size:9.5px; color:#FF8A80;">⚠ ${escapeHtml(err)}</div>` : ''}
       <div style="border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
@@ -4789,12 +4804,26 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       );
     };
     panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
+    // GIVE and COPY check the network again at the click: the fingerprint may
+    // have moved off a test network since this draw.
+    const slotNow = (): boolean => dishNet(latestFaucetStatus(roomId)).net?.test === true;
     FAUCET_GIVE_AMOUNTS.forEach((g, i) => {
-      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => send('give', g.mojos));
+      panel?.querySelector<HTMLButtonElement>(`#faucet-give-${i}`)?.addEventListener('click', () => {
+        if (!slotNow()) {
+          render();
+          return;
+        }
+        send('give', g.mojos);
+      });
     });
     panel.querySelector<HTMLButtonElement>('#faucet-copy')?.addEventListener('click', () => {
-      if (!st || !slotOpen || !isAddressOn(net, st.address)) return;
-      void navigator.clipboard?.writeText(st.address).then(() => {
+      const cur = latestFaucetStatus(roomId);
+      const curNet = dishNet(cur).net;
+      if (!cur || curNet?.test !== true || !isAddressOn(curNet, cur.address)) {
+        render();
+        return;
+      }
+      void navigator.clipboard?.writeText(cur.address).then(() => {
         copied = true;
         render();
         window.setTimeout(() => { copied = false; render(); }, 1_500);
@@ -4830,7 +4859,12 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       panel?.remove();
       panel = null;
     },
-    update(): void { /* observer-driven; nothing per-frame */ },
+    // Observer-driven, except for the node's network: a fingerprint that
+    // moves to another network redraws the screen at once, so no GIVE, QR
+    // code or address of the old network stays up.
+    update(): void {
+      if (panel && fpNetKey() !== drawnFor) render();
+    },
   };
 }
 
