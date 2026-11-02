@@ -2,9 +2,14 @@
 //! (docs: native-reveal design, decisions 2 to 5).
 //!
 //! The desktop app asks the node for the 24 words, and tells it they are
-//! saved, over the pipes it spawned the node with. Nothing else on the
-//! computer can open those pipes, so holding them is the authentication: no
-//! token in the environment, argv or a nameable socket.
+//! saved, over the pipes it spawned the node with. No other OS user can
+//! open those pipes, so holding them is the authentication: no token in the
+//! environment, argv or a nameable socket. A program of the player's own OS
+//! user is the design's "same-user malware", which can read the identity
+//! file itself; on Linux the node still makes itself not dumpable while the
+//! channel is on ([`guard_pipes`]), so such a program cannot reopen the
+//! node's ends of the pipes through `/proc/<pid>/fd`, and the channel stays
+//! shut if that fails.
 //!
 //! The channel is on only when the app asks: `SSF_SHELL_CHANNEL` is exactly
 //! `1` and neither stdin nor stdout is a terminal ([`started_of`]). The
@@ -51,6 +56,9 @@ pub const FRAME_TAG: &str = "ssf-shell/1";
 /// The run's answer to [`started_of`], set once by [`init`].
 static STARTED: OnceLock<bool> = OnceLock::new();
 
+/// Whether [`guard_pipes`] held, set once by [`init`] while the channel is on.
+static GUARDED: OnceLock<bool> = OnceLock::new();
+
 /// Whether the channel is on, from the raw `SSF_SHELL_CHANNEL` and whether
 /// stdin and stdout are terminals. Exactly `1` and two pipes (or files): a
 /// terminal on either side is a person, not the app.
@@ -62,13 +70,40 @@ pub fn started_of(var: Option<&OsStr>, stdin_is_terminal: bool, stdout_is_termin
 /// network is chosen and before anything else prints or the wallet loads.
 /// Later calls return the first answer.
 pub fn init() -> bool {
-    *STARTED.get_or_init(|| {
+    let on = *STARTED.get_or_init(|| {
         started_of(
             std::env::var_os(CHANNEL_ENV).as_deref(),
             std::io::stdin().is_terminal(),
             std::io::stdout().is_terminal(),
         )
-    })
+    });
+    if on {
+        GUARDED.get_or_init(guard_pipes);
+    }
+    on
+}
+
+/// Linux: make the node not dumpable (`prctl(PR_SET_DUMPABLE, 0)`, as
+/// ssh-agent does), so `/proc/<pid>/fd` and ptrace refuse every process
+/// without `CAP_SYS_PTRACE`, the player's own included: none of them can
+/// reopen the node's stdin or stdout and ask for the words. True when it
+/// held. Elsewhere there is no `/proc` to close, and it is true.
+#[cfg(target_os = "linux")]
+fn guard_pipes() -> bool {
+    // SAFETY: PR_SET_DUMPABLE takes plain integers and no pointer.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn guard_pipes() -> bool {
+    true
+}
+
+/// Whether the channel's thread may serve: the channel is on and
+/// [`guard_pipes`] held. A channel that is on but unguarded answers
+/// nothing, and still keeps the page from showing the words (fails closed).
+pub fn serves(started: bool, guarded: bool) -> bool {
+    started && guarded
 }
 
 /// Whether the desktop app's channel is on for this run. False until
@@ -316,6 +351,10 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
     if !started() {
         return;
     }
+    if !serves(true, GUARDED.get().copied().unwrap_or(false)) {
+        eprintln!("🖥️ Desktop app channel: the node could not stop other programs from opening its pipes, so the channel stays closed; the page still cannot show the 24 words");
+        return;
+    }
     let spawned = std::thread::Builder::new().name("ssf-shell-channel".into()).spawn(move || {
         match serve(std::io::stdin().lock(), StdoutFrames, answer) {
             End::Eof => eprintln!("🖥️ Desktop app channel: closed by the app; the node runs on, and the page still cannot show the 24 words"),
@@ -398,6 +437,17 @@ mod tests {
         for off in ["", "0", "true", " 1", "1 ", "01", "yes", "on"] {
             assert!(!started_of(Some(OsStr::new(off)), false, false), "{off:?} is not exactly 1");
         }
+    }
+
+    /// The thread serves only a channel that is on and whose pipes are
+    /// guarded; an unguarded one answers nothing (and the page stays
+    /// refused, since [`started`] alone decides that).
+    #[test]
+    fn the_channel_serves_only_when_its_pipes_are_guarded() {
+        assert!(serves(true, true));
+        assert!(!serves(true, false), "on but unguarded: fails closed");
+        assert!(!serves(false, true));
+        assert!(!serves(false, false));
     }
 
     /// The tests never run [`init`], so the channel reads as off in every

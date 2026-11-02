@@ -137,6 +137,12 @@ url = { version = "2", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
+# 🖥️ Linux: the desktop app's channel makes the node not dumpable while it
+# is on (shell_channel.rs), so no other process can reopen its pipes through
+# /proc. Already in the lockfile through other crates.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The tests' mock full node builds a header block, whose BLS fields need the
 # crate the publish feature makes optional.
