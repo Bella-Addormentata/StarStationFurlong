@@ -20,6 +20,7 @@ import {
   acceptNodeCard,
   bridgeMemberHints,
   cardsForPass,
+  chiaMeshOffered,
   collectMemberHints,
   mergeMemberHints,
   nodeSharesCard,
@@ -9448,8 +9449,11 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   // fingerprint: repaint it while open when either changed (a wallet turned
   // on or off here, or by SSF_CHIA_LANE at the node's restart).
   const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
+  // 🛑 The Chia Mesh switch follows the node's network (test networks only).
+  if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();
   localNodeOrigin = nodeOrigin;
   localNodeLive = true;
   // 🏦 BACK UP closes on another address, a wallet no longer on or from
@@ -9793,6 +9797,10 @@ function refreshChiaModeToggle() {
     "chia-mode-toggle",
   ) as HTMLInputElement | null;
   const state = document.getElementById("chia-mode-state");
+  // 🛑 Shown on a test network only (roomCap.ts chiaMeshOffered): off one
+  // the node writes no v1 room record, so the switch would arm nothing.
+  const row = document.getElementById("chia-mode-row");
+  if (row) row.style.display = chiaMeshOffered(localFingerprint?.chia_net) ? "" : "none";
   if (!toggle) return;
   const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
   const on = roomId ? readChiaMode(roomId) : false;

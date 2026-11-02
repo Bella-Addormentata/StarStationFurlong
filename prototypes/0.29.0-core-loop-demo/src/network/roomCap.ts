@@ -1,6 +1,7 @@
 import * as ed from '@noble/ed25519';
 import { blake3 } from '@noble/hashes/blake3';
 import { sha512 } from '@noble/hashes/sha512';
+import type { ChiaNetwork } from '../chiaNetwork.ts';
 import type { ContactCard, RoomBootstrap, RoomMemberHint } from './protocol.ts';
 
 // @noble's synchronous verify needs the hash wired once (keypair.ts does the
@@ -523,4 +524,15 @@ export function readChiaMode(roomId: string): boolean {
  *  reader, persisted when the browser allows. */
 export function setChiaMode(roomId: string, on: boolean): void {
   writeFlag(chiaModeKey(roomId), on);
+}
+
+/** 🛑 Does the page show the Chia Mesh switch for the local node's network
+ *  (the fingerprint's `chia_net`)? Only on a test network (stage 4 design
+ *  §4.5 (2)): the switch arms the room's v1 record, whose hint is per room
+ *  per day and whose body carries every live address, and the node writes
+ *  none off a test network. Before any fingerprint is read (`undefined`) it
+ *  shows as it always did; on a network this page does not know (`null`) it
+ *  does not. */
+export function chiaMeshOffered(net: ChiaNetwork | null | undefined): boolean {
+  return net === undefined || net?.test === true;
 }

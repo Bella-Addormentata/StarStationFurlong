@@ -95,6 +95,23 @@ describe('phoneBookIndicator', () => {
     expect(phoneBookIndicator(withPresence({ state: 'outdated', current: false, error: 'chia wallet UNFUNDED' })).opens).toBe('bank');
   });
 
+  it("reads true in every state beside mainnet's refusal to pay for a write", () => {
+    // The node's text off a test network (chia_publish.rs money_memo_refusal).
+    // A listing an older build wrote there can still be listed, sent or
+    // outdated, so the text says what stops, never whether this node is listed.
+    const refused = 'on Chia mainnet the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet';
+    const on = (p: Partial<ChiaPresence>) => phoneBookIndicator({ ...BASE, chia_net: MAINNET, chia_presence: { ...listed, ...p, error: refused } });
+    expect(on({}).title).toBe(`Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 7) · ${refused}`);
+    expect(on({ state: 'sent', confirmed: false }).title).toBe(`Listing sent to the Phone Book, awaiting confirmation from the chain · ${refused}`);
+    expect(on({ state: 'outdated', era: 8, listed_era: 7, current: false }).title)
+      .toBe(`Phone Book listing outdated: it is from edition 7 and this is edition 8 · ${refused}`);
+    expect(on({ state: 'unlisted', listed_era: 0, last_at: 0, confirmed: false, current: false }).title).toBe(`Not in the Phone Book yet: ${refused}`);
+    for (const state of ['listed', 'sent', 'outdated', 'unlisted'] as const) {
+      // Nothing to fund: the tap goes to the network row, not the Bank.
+      expect(on({ state }).opens).toBe('setnet');
+    }
+  });
+
   it('keeps the tooltip to one line: whitespace flattened, a long error cut', () => {
     const long = 'x'.repeat(400);
     const ind = phoneBookIndicator(withPresence({ state: 'unlisted', error: `  spend\n failed:  ${long}` }));

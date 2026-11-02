@@ -35,6 +35,8 @@ macro_rules! println {
 }
 
 mod chia_lane;
+// 🔒 Owner-only files, and the node's iroh key kept in one: in every build.
+mod private_file;
 // 🏦 The SSF wallet switch (#335): the SpacePhone Bank turns the node's
 // wallet on; decisions here, the route and the hot start below.
 mod chia_wallet_switch;
@@ -1282,18 +1284,11 @@ fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// 🔒 The node's iroh key, kept as `contact.key` is (stage 4 design §4.5):
+/// written 0600 and tightened on load, in every build
+/// (private_file::load_or_create_node_key).
 fn load_or_create_secret_key() -> Result<SecretKey> {
-    let key_path = std::path::Path::new("iroh_node_id.key");
-    if key_path.exists() {
-        let bytes = std::fs::read(key_path)?;
-        if bytes.len() == 32 {
-            let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("Invalid key format"))?;
-            return Ok(SecretKey::from_bytes(&arr));
-        }
-    }
-    let sk = SecretKey::generate();
-    std::fs::write(key_path, sk.to_bytes())?;
-    Ok(sk)
+    private_file::load_or_create_node_key(std::path::Path::new(private_file::NODE_KEY_FILE))
 }
 
 /// Default public-IPv4 echo services for `SSF_EXTERNAL_ADDRS=auto` — queried
@@ -1979,8 +1974,9 @@ async fn main() -> Result<()> {
                 // the publish->resolve loop can be validated without a browser having
                 // delivered a real room key. Spawned so it never blocks node startup;
                 // logs the hint on success or the reason on failure (e.g. unfunded).
+                // A test network only (`test_hook_on`).
                 let mut publish_test_task: Option<tokio::task::JoinHandle<()>> = None;
-                if std::env::var("SSF_CHIA_PUBLISH_TEST").ok().as_deref() == Some("1") {
+                if test_hook_on(chia_net, "SSF_CHIA_PUBLISH_TEST") {
                     let iroh_sk = secret_key.clone();
                     let addrs = iroh_direct_addrs.clone();
                     let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
@@ -2001,7 +1997,8 @@ async fn main() -> Result<()> {
                 // testnet11, then resolve + re-derive + verify the dice. Reuses the
                 // presence spend-to-self primitive with a PUBLIC (plaintext) payload.
                 // Spawned so it never blocks startup; logs each step + PASS/FAIL.
-                if std::env::var("SSF_CHIA_CRAPS_FAIR_TEST").ok().as_deref() == Some("1") {
+                // A test network only (`test_hook_on`).
+                if test_hook_on(chia_net, "SSF_CHIA_CRAPS_FAIR_TEST") {
                     let chia_sk_fair = chia_sk.clone();
                     tokio::spawn(async move {
                         // Both test hooks spend from the SAME wallet — run
@@ -3148,6 +3145,54 @@ async fn report_dial_status(
     }
 }
 
+/// 🛑 Why rung 6 queues no knock on `net` while `knock_publishing` is off:
+/// the log line's reason and the page's dial detail. Off a test network the
+/// SSF wallet pays for no knock (stage 4 design §4.5 (1),
+/// `chia_publish::money_memo_refusal`), whatever the build, the wallet or
+/// the watcher say, so that is the reason there; on a test network a knock
+/// needs the publish build, the wallet on and the watcher on.
+#[cfg(feature = "chia-read")]
+fn no_knock_reason(net: chia_network::ChiaNet) -> (String, String) {
+    if net.is_test() {
+        (
+            "a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0)".to_string(),
+            "no route; this node cannot knock (publishing or the watcher off)".to_string(),
+        )
+    } else {
+        (
+            format!("on {} the SSF wallet pays for no knock yet", net.name()),
+            format!("no route; on {} this node writes no knock yet", net.name()),
+        )
+    }
+}
+
+#[cfg(all(test, feature = "chia-read"))]
+mod no_knock_reason_tests {
+    use super::no_knock_reason;
+    use crate::chia_network::ChiaNet;
+
+    /// Stage 4 design §4.5 (1), on both networks: testnet11 keeps the build,
+    /// wallet and watcher reason; off a test network the reason is the
+    /// refusal to pay, the one switch-free cause there, and the publish
+    /// build refuses on the same networks (`money_memo_refusal`).
+    #[test]
+    fn rung_6_names_the_real_reason_no_knock_is_queued() {
+        for net in ChiaNet::ALL {
+            let (why, detail) = no_knock_reason(net);
+            if net.is_test() {
+                assert!(why.contains("SSF wallet on") && why.contains("SSF_CHIA_WATCH"), "{why}");
+                assert_eq!(detail, "no route; this node cannot knock (publishing or the watcher off)");
+            } else {
+                assert_eq!(why, "on Chia mainnet the SSF wallet pays for no knock yet");
+                assert_eq!(detail, "no route; on Chia mainnet this node writes no knock yet");
+                assert!(!why.contains("Bank") && !why.contains("SSF_CHIA_WATCH"), "{why}");
+            }
+            #[cfg(feature = "chia-publish")]
+            assert_eq!(net.is_test(), crate::chia_publish::money_memo_refusal(net).is_none(), "{net:?}");
+        }
+    }
+}
+
 /// Bind the connection to `room_id` (so its inbound ticks fan out — issue #60
 /// symptom 4), report dialing/connected/failed to the browser, rebuild the
 /// EndpointAddr from the hints each attempt, and re-check remote_peers before
@@ -3390,16 +3435,19 @@ async fn dial_peer_inner(
             // build and the SSF wallet on the queue has no consumer,
             // and without the watcher a sent knock is never judged or dialed
             // on, so no knock is queued or promised and the log says what one
-            // needs (#272 review rounds 11 and 14); an unfunded wallet is the
-            // publisher's to report.
+            // needs (#272 review rounds 11 and 14); off a test network the
+            // wallet pays for none, and the log says that instead
+            // (`no_knock_reason`). An unfunded wallet is the publisher's to
+            // report.
             Some(cap) if cap.may_use_cards() => {
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
                     if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
+                        let (why, detail) = no_knock_reason(chia_network::net());
                         println!(
-                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
+                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: {why} (not queued)"
                         );
-                        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing or the watcher off)")).await;
+                        report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some(&detail)).await;
                         return;
                     }
                     let req = chia_knock::KnockRequest {
@@ -5955,6 +6003,62 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
     }
 }
 
+/// 🛑 Whether an env test hook whose variable `var` holds `raw` runs on
+/// `net`, and the line said when it is set and refused. The hooks run on a
+/// test network only (stage 4 design §4.5 (3)): the publish hook writes this
+/// node's addresses under a room key anyone can compute from a constant in
+/// the source, and the craps hook writes plaintext. Like the hooks, `1`
+/// alone sets one.
+#[cfg(feature = "chia-publish")]
+fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool, Option<String>) {
+    match raw {
+        Some("1") if net.is_test() => (true, None),
+        Some("1") => (false, Some(format!("⛓️ ChiaHub: {var}=1 is ignored on {}. The test hooks run on a test network only.", net.name()))),
+        _ => (false, None),
+    }
+}
+
+/// [`test_hook`] for the environment's `var`: says the refusal, if any, and
+/// returns whether the hook runs.
+#[cfg(feature = "chia-publish")]
+fn test_hook_on(net: chia_network::ChiaNet, var: &str) -> bool {
+    let (runs, refused) = test_hook(net, var, std::env::var(var).ok().as_deref());
+    if let Some(line) = refused {
+        eprintln!("{line}");
+    }
+    runs
+}
+
+#[cfg(all(test, feature = "chia-publish"))]
+mod test_hook_tests {
+    use super::test_hook;
+    use crate::chia_network::ChiaNet;
+
+    /// Stage 4 design §4.5 (3), on both networks: a hook set to `1` runs on
+    /// a test network and is refused, with one line, off one; any other
+    /// value runs nothing anywhere and says nothing. No environment is read.
+    #[test]
+    fn the_env_test_hooks_run_on_a_test_network_only() {
+        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST"] {
+            for net in ChiaNet::ALL {
+                for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+                    assert_eq!(test_hook(net, var, raw), (false, None), "{var}={raw:?} on {net:?}");
+                }
+                let (runs, line) = test_hook(net, var, Some("1"));
+                assert_eq!(runs, net.is_test(), "{var} on {net:?}");
+                if net.is_test() {
+                    assert_eq!(line, None);
+                } else {
+                    assert_eq!(
+                        line.as_deref(),
+                        Some(format!("⛓️ ChiaHub: {var}=1 is ignored on Chia mainnet. The test hooks run on a test network only.").as_str())
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address and, with the
 /// beacon on, the beacon's address. Never the words.
@@ -5980,13 +6084,21 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
 /// them.
 #[cfg(feature = "chia-publish")]
 fn beacon_lines(net: chia_network::ChiaNet, addr: &str) -> (String, Option<String>) {
-    let fund = if net.is_test() { format!("fund {addr} at a {} faucet", net.name()) } else { format!("{addr} takes real {}", net.ticker()) };
-    let line = format!(
-        "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; {fund}"
-    );
+    // 🛑 Off a test network the beacon writes nothing yet (stage 4 design
+    // §4.5 (1)), so the line says only that, and asks for no XCH there.
+    let line = if net.is_test() {
+        format!(
+            "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund {addr} at a {} faucet",
+            net.name()
+        )
+    } else {
+        format!("⛓️ ChiaHub beacon (D7, opt-in): on, but on {} it writes nothing yet, so leave {addr} unfunded", net.name())
+    };
+    // The warning holds for when the beacon writes there (stage 4 design
+    // §13, PR 10): the switch is set now, and kept across the upgrade.
     let warning = (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
+            "⛓️ ChiaHub beacon: once it writes on {}, it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
             net.name(),
             chia_network::ChiaNet::Testnet11.name(),
             chia_network::ChiaNet::Testnet11.name(),
@@ -6006,14 +6118,21 @@ mod beacon_line_tests {
     #[test]
     fn the_mainnet_beacon_warns_that_it_links_the_node_id_across_chains() {
         let (line, warning) = beacon_lines(ChiaNet::Testnet11, "txch1beacon");
-        assert!(line.ends_with("fund txch1beacon at a testnet11 faucet"), "{line}");
+        assert_eq!(
+            line,
+            "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund txch1beacon at a testnet11 faucet"
+        );
         assert_eq!(warning, None);
+        // Stage 4 design §4.5 (1): the beacon writes nothing on mainnet
+        // yet, so its line says so once, and asks for no real XCH there.
+        // The warning is for when it writes there (PR 10), and says so.
         let (line, warning) = beacon_lines(ChiaNet::Mainnet, "xch1beacon");
-        assert!(line.ends_with("xch1beacon takes real XCH"), "{line}");
+        assert_eq!(line, "⛓️ ChiaHub beacon (D7, opt-in): on, but on Chia mainnet it writes nothing yet, so leave xch1beacon unfunded");
+        assert!(!line.contains("real XCH") && !line.contains("paid from"), "{line}");
         let warning = warning.expect("mainnet warns");
         assert_eq!(
             warning,
-            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
+            "⛓️ ChiaHub beacon: once it writes on Chia mainnet, it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
         );
     }
 }
@@ -6179,12 +6298,15 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
     // 14): the watcher judges a sent knock by the chain's word and
     // dials at its rendezvous; without it the knock spends a coin and
     // the host alone dials. `SSF_CHIA_WATCH=0` keeps knocks off.
+    //
+    // 🛑 Off a test network the SSF wallet pays for no knock (stage 4 design
+    // §4.5 (1)), so rung 6 queues none there; the heartbeat says why once.
+    let net = chia_network::net();
     if chia_knock::knocks_available(true, chia_watch::watch_enabled()) {
-        hub.knock_publishing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let pays = chia_publish::money_memo_refusal(net).is_none();
+        hub.knock_publishing.store(pays, std::sync::atomic::Ordering::Relaxed);
     } else {
-        println!(
-            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; presence publishes as before"
-        );
+        println!("{}", watcher_off_knock_line(net));
     }
     let hub_hb = hub.clone();
     let iroh_hb = iroh_endpoint.clone();
@@ -6192,6 +6314,37 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
     tokio::spawn(async move {
         chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, chia_sk).await;
     });
+}
+
+/// The line said when the watcher is off, so no knock is written. Presence
+/// publishes as before on a test network only: off one the SSF wallet pays
+/// for no listing either (stage 4 design §4.5 (1)), and the heartbeat says so.
+#[cfg(feature = "chia-publish")]
+fn watcher_off_knock_line(net: chia_network::ChiaNet) -> String {
+    let presence = if net.is_test() { "; presence publishes as before" } else { "" };
+    format!(
+        "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous{presence}"
+    )
+}
+
+#[cfg(all(test, feature = "chia-publish"))]
+mod watcher_off_line_tests {
+    use super::watcher_off_knock_line;
+    use crate::chia_network::ChiaNet;
+
+    /// testnet11 keeps its line whole; off a test network it promises no
+    /// presence, which the SSF wallet pays for no more there.
+    #[test]
+    fn the_watcher_off_line_promises_presence_on_a_test_network_only() {
+        assert_eq!(
+            watcher_off_knock_line(ChiaNet::Testnet11),
+            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous; presence publishes as before"
+        );
+        assert_eq!(
+            watcher_off_knock_line(ChiaNet::Mainnet),
+            "⛓️ ChiaHub knock: the watcher is off (SSF_CHIA_WATCH=0), so this node writes no knock — a knock needs the watcher to confirm it and to dial at its rendezvous"
+        );
+    }
 }
 
 /// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
