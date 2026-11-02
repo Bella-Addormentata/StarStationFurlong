@@ -100,7 +100,7 @@ impl Network {
         Self {
             id: "testnet11".to_string(),
             genesis: chia_sdk_types::TESTNET11_CONSTANTS.genesis_challenge,
-            port: 58444,
+            port: crate::chia_network::ChiaNet::Testnet11.port(),
             introducers: vec!["dns-introducer-testnet11.chia.net".to_string()],
         }
     }

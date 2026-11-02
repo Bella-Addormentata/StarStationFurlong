@@ -9,8 +9,8 @@
 //! They make 24 English words, and the keys come from the words the way Chia
 //! and Sage derive them: the empty-passphrase BIP39 seed, Chia's KeyGen for
 //! the master key, then m/12381/8444/2/0 unhardened for the WALLET key. The
-//! wallet key is the one every spend site is handed, so the node's `txch1…`
-//! address is the first address `chia keys show` and Sage give for the same
+//! wallet key is the one every spend site is handed, so the node's address
+//! (`txch1…` on testnet11) is the first address `chia keys show` and Sage give for the same
 //! words, and the key fingerprint the Bank shows is the number they print.
 //!
 //! The words are never written anywhere and never printed: the Bank shows
@@ -29,6 +29,14 @@
 //! on mints fresh entropy, and the raw seed is archived as
 //! `chia_identity.seed.retired-<unix>` (its testnet coins stay at its old
 //! address, which the log names).
+//!
+//! ⛓️ Each Chia network has its own identity (chia_network.rs): testnet11's
+//! at the data root, where it always was, and mainnet's under
+//! `chia-mainnet/`. The file names its network in an optional `net` field.
+//! A testnet11 mint never writes it, so its files stay byte for byte as they
+//! were; a mainnet mint writes `"net":"mainnet"`, which an older node refuses
+//! as a field it does not know. Raw seeds from before the words were only
+//! ever testnet11's, so a mainnet load never looks for one.
 //!
 //! Runtime is gated at the CALLER (main.rs, by chia_wallet_switch.rs): a build
 //! that HAS the feature keeps no identity file until the player turns the SSF
@@ -67,9 +75,7 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::chia_at_rest::{self, AtRest, Policy, SecretStore};
-
-/// Testnet11 human-readable prefix (mainnet would be `"xch"`).
-const TESTNET_PREFIX: &str = "txch";
+use crate::chia_network::ChiaNet;
 
 /// The identity file's format, its one `kind`, and the `protect` values this
 /// node reads: `none` (the entropy in the clear) and `dpapi` (a `blob` in
@@ -80,8 +86,8 @@ const IDENTITY_KIND: &str = "bip39-english";
 const PROTECT_NONE: &str = "none";
 const PROTECT_DPAPI: &str = "dpapi";
 
-/// Every field a v1 file can carry.
-const KNOWN_FIELDS: [&str; 8] = ["v", "kind", "protect", "entropy", "blob", "fingerprint", "at", "wrapped_at"];
+/// Every field a v1 file can carry. `net` is optional: absent means testnet11.
+const KNOWN_FIELDS: [&str; 9] = ["v", "kind", "net", "protect", "entropy", "blob", "fingerprint", "at", "wrapped_at"];
 
 /// The longest `blob` a reader takes, in base64 characters. DPAPI's for 32
 /// bytes is a few hundred; this keeps the file well under [`FILE_MAX`].
@@ -223,28 +229,35 @@ impl fmt::Debug for Revealed {
 /// when they are torn or hold that same wallet.
 ///
 /// A file that is there and cannot be read is reported and never minted
-/// over; see [`read_identity`]'s refusals.
-pub fn load_or_mint_wallet(identity: &Path, legacy: &Path) -> Result<WalletIdentity> {
-    load_or_mint_wallet_with(identity, legacy, chia_at_rest::os_store())
+/// over; see [`read_identity`]'s refusals. The file must be `net`'s; on a
+/// network that is not a test network, `legacy` is never looked at.
+pub fn load_or_mint_wallet(net: ChiaNet, identity: &Path, legacy: &Path) -> Result<WalletIdentity> {
+    load_or_mint_wallet_with(net, identity, legacy, chia_at_rest::os_store())
 }
 
 /// [`load_or_mint_wallet`] with the store a locked file is opened by.
 pub(crate) fn load_or_mint_wallet_with(
+    net: ChiaNet,
     identity: &Path,
     legacy: &Path,
     store: Option<&dyn SecretStore>,
 ) -> Result<WalletIdentity> {
-    sweep_stale_tmp(&[identity, legacy]);
+    // Raw seeds were only ever testnet11's.
+    let legacy = net.is_test().then_some(legacy);
+    match legacy {
+        Some(legacy) => sweep_stale_tmp(&[identity, legacy]),
+        None => sweep_stale_tmp(&[identity]),
+    }
     // No lock is taken here: a lock replaces the identity in one rename, so
     // a load reads either whole file, and both open to the same wallet.
-    recover_rewrap(identity, store)?;
+    recover_rewrap(net, identity, store)?;
     // `try_exists`, not `exists`: an identity that is there but cannot be
     // looked at (a permission error) is reported, never minted over.
     let present = identity
         .try_exists()
         .with_context(|| format!("looking for chia identity file {}", identity.display()))?;
     let (opened, minted) = if present {
-        let opened = read_identity(identity, store)?;
+        let opened = read_identity(net, identity, store)?;
         // Only now that it opened: a leftover beside a file that is refused
         // may be the one intact copy of the wallet.
         remove_rewrap_leftovers(identity, opened.keys.fingerprint);
@@ -253,17 +266,19 @@ pub(crate) fn load_or_mint_wallet_with(
         restrict_permissions(identity);
         (opened, false)
     } else {
-        mint_identity(identity, store)?
+        mint_identity(net, identity, store)?
     };
     let Opened { keys, protect: at_rest, .. } = opened;
     // Only now, with the identity durable (installed and its directory
     // synced, or already there), is the raw seed archived.
-    let retired = retire_legacy_seed(legacy, unix_now()).unwrap_or_else(|e| {
-        eprintln!(
-            "🏦 SSF wallet: could not retire the old {} ({e:#}); it is left as it is and is not this wallet",
-            legacy.display()
-        );
-        None
+    let retired = legacy.and_then(|legacy| {
+        retire_legacy_seed(legacy, unix_now()).unwrap_or_else(|e| {
+            eprintln!(
+                "🏦 SSF wallet: could not retire the old {} ({e:#}); it is left as it is and is not this wallet",
+                legacy.display()
+            );
+            None
+        })
     });
     Ok(WalletIdentity { wallet: keys.wallet, fingerprint: keys.fingerprint, minted, retired, at_rest })
 }
@@ -271,14 +286,14 @@ pub(crate) fn load_or_mint_wallet_with(
 /// For the Bank's reveal only: the 24 words of the identity on disk, read
 /// again (the node keeps no copy), with the fingerprint and wallet key they
 /// make so the caller can check they are the wallet in use.
-pub fn reveal_words(identity: &Path) -> Result<Revealed> {
-    reveal_words_with(identity, chia_at_rest::os_store())
+pub fn reveal_words(net: ChiaNet, identity: &Path) -> Result<Revealed> {
+    reveal_words_with(net, identity, chia_at_rest::os_store())
 }
 
 /// [`reveal_words`] with the store a locked file is opened by. It only
 /// reads: nothing is written, locked or minted.
-pub(crate) fn reveal_words_with(identity: &Path, store: Option<&dyn SecretStore>) -> Result<Revealed> {
-    let Opened { entropy, keys, .. } = read_identity(identity, store)?;
+pub(crate) fn reveal_words_with(net: ChiaNet, identity: &Path, store: Option<&dyn SecretStore>) -> Result<Revealed> {
+    let Opened { entropy, keys, .. } = read_identity(net, identity, store)?;
     let mnemonic = Mnemonic::from_entropy(&entropy[..])
         .map_err(|_| anyhow!("the identity's entropy does not make words"))?;
     if mnemonic.word_count() != 24 {
@@ -322,6 +337,9 @@ struct IdentityHeader<'a> {
     v: u64,
     #[serde(borrow, default)]
     kind: Option<&'a str>,
+    /// The network the file is for: absent on testnet11's.
+    #[serde(borrow, default)]
+    net: Option<&'a str>,
     #[serde(borrow, default)]
     protect: Option<&'a str>,
 }
@@ -366,7 +384,12 @@ pub(crate) struct Opened {
 /// the entropy), and `{e:#}` prints a whole chain. A store's refusal names
 /// only its class and number (chia_at_rest::refusal_words). A refused file
 /// is left as it is, and nothing is minted over it.
-fn read_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<Opened> {
+///
+/// The file must be `net`'s: testnet11 takes `net` absent or `"testnet11"`,
+/// any other network only its own id. A file for another network is refused
+/// with a fixed sentence that names the network the node runs on, never what
+/// the file says.
+fn read_identity(net: ChiaNet, path: &Path, store: Option<&dyn SecretStore>) -> Result<Opened> {
     let damaged = || {
         anyhow!(
             "chia identity file {} is damaged — refusing to overwrite a corrupt identity file; move it aside to re-mint",
@@ -392,6 +415,13 @@ fn read_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<Opened>
     };
     if kind != IDENTITY_KIND {
         return Err(newer());
+    }
+    if !identity_net_is(header.net, net) {
+        return Err(anyhow!(
+            "chia identity file {} is not a wallet for {}, the Chia network this node runs on; it is left as it is",
+            path.display(),
+            net.name()
+        ));
     }
     let protect = match protect {
         PROTECT_NONE => AtRest::None,
@@ -453,6 +483,15 @@ fn read_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<Opened>
     Ok(Opened { entropy, keys, protect, at: body.at.unwrap_or(0), raw: buf })
 }
 
+/// Whether an identity file's `net` (absent, or its value) is `net`'s.
+fn identity_net_is(field: Option<&str>, net: ChiaNet) -> bool {
+    match (field, net) {
+        (None, ChiaNet::Testnet11) => true,
+        (None, _) => false,
+        (Some(id), net) => id == net.id(),
+    }
+}
+
 /// What an identity file keeps of its entropy.
 pub(crate) enum Body<'a> {
     /// The entropy itself (`protect:"none"`).
@@ -465,13 +504,24 @@ pub(crate) enum Body<'a> {
 /// shapes, with nothing that needs escaping:
 /// `{"v":1,"kind":"bip39-english","protect":"none","entropy":"<64 hex>","fingerprint":N,"at":T}`, or
 /// `{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"<base64>","fingerprint":N,"at":T,"wrapped_at":W}`.
-fn encode_identity(body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -> Zeroizing<String> {
+/// On testnet11 that is all. Any other network adds its id after `kind`:
+/// `{"v":1,"kind":"bip39-english","net":"mainnet","protect":…`.
+fn encode_identity(net: ChiaNet, body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(256 + BLOB_MAX));
+    let head = |out: &mut String| {
+        out.push_str(r#"{"v":1,"kind":"bip39-english","#);
+        if net != ChiaNet::Testnet11 {
+            out.push_str(r#""net":""#);
+            out.push_str(net.id());
+            out.push_str(r#"","#);
+        }
+    };
     match body {
         Body::Clear(entropy) => {
             let mut digits = Zeroizing::new([0u8; 2 * ENTROPY_LEN]);
             hex::encode_to_slice(&entropy[..], &mut digits[..]).expect("64 hex digits for 32 bytes");
-            out.push_str(r#"{"v":1,"kind":"bip39-english","protect":"none","entropy":""#);
+            head(&mut out);
+            out.push_str(r#""protect":"none","entropy":""#);
             out.push_str(std::str::from_utf8(&digits[..]).expect("hex digits are ASCII"));
         }
         Body::Locked(protect, blob) => {
@@ -479,7 +529,8 @@ fn encode_identity(body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -
                 AtRest::Dpapi => PROTECT_DPAPI,
                 AtRest::None => unreachable!("a clear body is Body::Clear"),
             };
-            out.push_str(r#"{"v":1,"kind":"bip39-english","protect":""#);
+            head(&mut out);
+            out.push_str(r#""protect":""#);
             out.push_str(protect);
             out.push_str(r#"","blob":""#);
             out.push_str(&base64::engine::general_purpose::STANDARD.encode(blob));
@@ -499,19 +550,19 @@ fn encode_identity(body: Body<'_>, fingerprint: u32, at: u64, wrapped_at: u64) -
 
 /// First load: fresh entropy from the OS CSPRNG (the same `OsRng` the lane's
 /// `seal` nonce uses), installed once ([`install_once`]). The loser of a race
-/// loads the winner's identity.
-fn mint_identity(path: &Path, store: Option<&dyn SecretStore>) -> Result<(Opened, bool)> {
+/// loads the winner's identity. The file is `net`'s.
+fn mint_identity(net: ChiaNet, path: &Path, store: Option<&dyn SecretStore>) -> Result<(Opened, bool)> {
     let mut entropy = Zeroizing::new([0u8; ENTROPY_LEN]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..]);
     let keys = keys_from_entropy(&entropy);
     let at = unix_now();
-    let bytes = encode_identity(Body::Clear(&entropy), keys.fingerprint, at, 0);
+    let bytes = encode_identity(net, Body::Clear(&entropy), keys.fingerprint, at, 0);
     match install_once(path, bytes.as_bytes())? {
         Installed::Ours => {
             let raw = Zeroizing::new(bytes.as_bytes().to_vec());
             Ok((Opened { entropy, keys, protect: AtRest::None, at, raw }, true))
         }
-        Installed::Theirs => Ok((read_identity(path, store)?, false)),
+        Installed::Theirs => Ok((read_identity(net, path, store)?, false)),
     }
 }
 
@@ -707,10 +758,12 @@ pub(crate) fn retire_legacy_seed(legacy: &Path, now: u64) -> Result<Option<Retir
     #[cfg(unix)]
     let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
     let old = raw.as_deref().filter(|r| r.len() == ENTROPY_LEN).map(|r| SecretKey::from_seed(r));
+    // A raw seed was only ever a testnet11 wallet.
+    let t11 = ChiaNet::Testnet11;
     Ok(Some(RetiredSeed {
         archived_as,
-        old_address: old.as_ref().map(testnet_address),
-        old_beacon: old.as_ref().map(|sk| testnet_address(&crate::chia_publish::beacon_wallet_key(sk))),
+        old_address: old.as_ref().map(|sk| receive_address(t11, sk)),
+        old_beacon: old.as_ref().map(|sk| receive_address(t11, &crate::chia_publish::beacon_wallet_key(sk))),
     }))
 }
 
@@ -851,9 +904,10 @@ pub(crate) enum Step {
 /// 🔒 Lock the identity file with this computer's store (chia_at_rest.rs),
 /// once its words are marked saved: the caller decides that
 /// (`chia_at_rest::should_wrap`). The same wallet, the same fingerprint and
-/// address; only how the file keeps the entropy changes.
-pub fn wrap_at_rest(identity: &Path, fingerprint: u32, policy: Policy) -> Wrapped {
-    wrap_at_rest_with(identity, fingerprint, policy, chia_at_rest::os_store(), &|_| false)
+/// address; only how the file keeps the entropy changes. The file must be
+/// `net`'s, and the locked file names the same network.
+pub fn wrap_at_rest(net: ChiaNet, identity: &Path, fingerprint: u32, policy: Policy) -> Wrapped {
+    wrap_at_rest_with(net, identity, fingerprint, policy, chia_at_rest::os_store(), &|_| false)
 }
 
 /// [`wrap_at_rest`] with its store, and `stop`, which a test uses to end the
@@ -880,6 +934,7 @@ pub fn wrap_at_rest(identity: &Path, fingerprint: u32, policy: Policy) -> Wrappe
 /// No store item is ever deleted and nothing ever unlocks a file. Until the
 /// rename, the entropy is whole in the identity; after it, in the locked file.
 pub(crate) fn wrap_at_rest_with(
+    net: ChiaNet,
     identity: &Path,
     fingerprint: u32,
     policy: Policy,
@@ -894,7 +949,7 @@ pub(crate) fn wrap_at_rest_with(
         return Wrapped::Skipped(format!("{}=none", chia_at_rest::POLICY_ENV));
     }
     // 1. Read.
-    let opened = match read_identity(identity, Some(store)) {
+    let opened = match read_identity(net, identity, Some(store)) {
         Ok(opened) => opened,
         Err(e) => return Wrapped::Skipped(format!("{e:#}")),
     };
@@ -917,7 +972,7 @@ pub(crate) fn wrap_at_rest_with(
         Ok(_) => return Wrapped::Skipped("the store gave back other bytes than it locked".into()),
         Err(e) => return Wrapped::Skipped(format!("the store could not open what it locked (code {:#x})", e.code)),
     }
-    let bytes = encode_identity(Body::Locked(store.protect(), &blob), fingerprint, opened.at, unix_now());
+    let bytes = encode_identity(net, Body::Locked(store.protect(), &blob), fingerprint, opened.at, unix_now());
     if bytes.len() > FILE_MAX || base64::engine::general_purpose::STANDARD.encode(&blob).len() > BLOB_MAX {
         return Wrapped::Skipped("the store's locked bytes are too long for the file".into());
     }
@@ -1043,8 +1098,9 @@ pub fn log_wrapped(identity: &Path, outcome: &Wrapped) {
 /// another computer), or one that cannot be put back, stops the mint with
 /// an error: it may be the only file that holds the wallet. Only a torn
 /// leftover lets a new wallet be minted. Nothing is removed here: leftovers
-/// go once the identity has opened ([`remove_rewrap_leftovers`]).
-fn recover_rewrap(identity: &Path, store: Option<&dyn SecretStore>) -> Result<()> {
+/// go once the identity has opened ([`remove_rewrap_leftovers`]). Only a
+/// copy of `net`'s wallet is put back.
+fn recover_rewrap(net: ChiaNet, identity: &Path, store: Option<&dyn SecretStore>) -> Result<()> {
     let mut leftovers = rewrap_leftovers(identity);
     // A `try_exists` error is reported by the loader's own check.
     if leftovers.is_empty() || !matches!(identity.try_exists(), Ok(false)) {
@@ -1055,7 +1111,7 @@ fn recover_rewrap(identity: &Path, store: Option<&dyn SecretStore>) -> Result<()
     let newest = leftovers
         .iter()
         .filter(|(p, _)| p.extension().is_none_or(|x| x != "probe"))
-        .find(|(p, _)| read_identity(p, store).is_ok());
+        .find(|(p, _)| read_identity(net, p, store).is_ok());
     if let Some((found, _)) = newest {
         return match std::fs::hard_link(found, identity) {
             Ok(()) => {
@@ -1082,7 +1138,7 @@ fn recover_rewrap(identity: &Path, store: Option<&dyn SecretStore>) -> Result<()
         return Ok(());
     };
     let shown = leftover.display();
-    Err(match read_identity(leftover, store) {
+    Err(match read_identity(net, leftover, store) {
         Err(e) => anyhow!(
             "chia identity file {id} is missing, and a stopped lock left a locked copy of a wallet beside it, {shown}, \
              that does not open now ({e}); no new wallet is minted over it: start the node from the Windows account \
@@ -1245,38 +1301,42 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// The `txch1…` standard-puzzle receive address for this key on testnet11.
+/// The standard-puzzle receive address for this key on `net` (`txch1…` on
+/// testnet11, `xch1…` on mainnet). The puzzle hash is the same on every
+/// network; only the prefix differs.
 ///
 /// Path: secret key -> public key -> synthetic public key
-/// (DEFAULT_HIDDEN_PUZZLE_HASH) -> standard puzzle tree hash -> bech32m("txch").
+/// (DEFAULT_HIDDEN_PUZZLE_HASH) -> standard puzzle tree hash -> bech32m(prefix).
 ///
 /// Handed the wallet key (m/12381/8444/2/0, [`load_or_mint_wallet`]), this is
 /// Chia's index-0 address for the node's 24 words: the first address
 /// `chia keys show` and Sage list for them. The node watches only this one.
-pub fn testnet_address(sk: &SecretKey) -> String {
+pub fn receive_address(net: ChiaNet, sk: &SecretKey) -> String {
     let pk: PublicKey = sk.public_key();
     let synthetic_pk: PublicKey = pk.derive_synthetic();
     // curry_tree_hash returns clvm_utils::TreeHash; From<TreeHash> for Bytes32.
     let puzzle_hash: Bytes32 = StandardArgs::curry_tree_hash(synthetic_pk).into();
-    Address::new(puzzle_hash, TESTNET_PREFIX.to_string())
+    Address::new(puzzle_hash, net.prefix().to_string())
         .encode()
         .expect("bech32m encode never fails for a 32-byte puzzle hash")
 }
 
-/// Reverse: `txch1…` -> standard puzzle hash (rejects a wrong/mainnet prefix).
-/// Unused until the resolve slice consumes it; keep it as verified public API.
+/// Reverse: an address on `net` -> standard puzzle hash (rejects any other
+/// network's prefix). Unused until the resolve slice consumes it; keep it as
+/// verified public API.
 #[allow(dead_code)]
-pub fn testnet_address_to_puzzle_hash(address: &str) -> Result<Bytes32> {
+pub fn address_to_puzzle_hash(net: ChiaNet, address: &str) -> Result<Bytes32> {
+    let prefix = net.prefix();
     Address::decode(address)
         .map_err(|e| anyhow!("not a valid bech32m address: {e:?}"))?
-        .expect_prefix(TESTNET_PREFIX)
-        .map_err(|e| anyhow!("address is not a testnet ({TESTNET_PREFIX}) address: {e:?}"))
+        .expect_prefix(prefix)
+        .map_err(|e| anyhow!("address is not a {} ({prefix}) address: {e:?}", net.name()))
 }
 
 /// Printed when the wallet loads (at startup, or when the Bank turns it on):
-/// what the load did, the key fingerprint, and the receive address, so the
-/// operator can fund it at a testnet11 faucet. TXCH only. Never the words.
-pub fn log_receive_address(id: &WalletIdentity) {
+/// what the load did, the key fingerprint, and the receive address on `net`,
+/// with how it is funded there. Never the words.
+pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
     if let Some(r) = &id.retired {
         let kept = r.archived_as.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match &r.old_address {
@@ -1287,7 +1347,7 @@ pub fn log_receive_address(id: &WalletIdentity) {
                     .map(|b| format!("; its beacon wallet, if the beacon ran, was {b}"))
                     .unwrap_or_default();
                 println!(
-                    "🏦 SSF wallet: retired the old raw-seed wallet {old} (kept as {kept}; its testnet coins stay at that address{beacon})"
+                    "🏦 SSF wallet: retired the old raw-seed wallet {old} (kept as {kept}; its coins stay at that address{beacon})"
                 );
             }
             None => println!(
@@ -1295,10 +1355,16 @@ pub fn log_receive_address(id: &WalletIdentity) {
             ),
         }
     }
-    if id.minted {
+    if id.minted && net.is_test() {
         println!(
             "🏦 SSF wallet: made a new wallet from 24 words, key fingerprint {} — back the words up in the SpacePhone's 🏦 BANK \
              (the node never prints them)",
+            id.fingerprint
+        );
+    } else if id.minted {
+        // The page never shows the words off a test network.
+        println!(
+            "🏦 SSF wallet: made a new wallet from 24 words, key fingerprint {}. Only the desktop app shows its words; the node never prints them.",
             id.fingerprint
         );
     } else {
@@ -1308,12 +1374,20 @@ pub fn log_receive_address(id: &WalletIdentity) {
         };
         println!("🏦 SSF wallet: loaded the wallet made from 24 words, key fingerprint {}{kept}", id.fingerprint);
     }
-    let addr = testnet_address(&id.wallet);
-    println!(
-        "⛓️ ChiaHub lane: testnet11 receive address {addr}\n   \
-         Fund it at a testnet11 faucet (TXCH — no real XCH needed); \
-         once it holds a coin, the lane can publish/resolve presence."
-    );
+    println!("{}", receive_line(net, &receive_address(net, &id.wallet)));
+}
+
+/// The receive address's line, and how it is funded on `net`.
+fn receive_line(net: ChiaNet, addr: &str) -> String {
+    let fund = if net.is_test() {
+        format!("Fund it at a {} faucet. {} is free.", net.name(), net.ticker())
+    } else {
+        format!("This address takes real {}.", net.ticker())
+    };
+    format!(
+        "⛓️ ChiaHub lane: {} receive address {addr}\n   {fund} Once it holds a coin, the lane can publish/resolve presence.",
+        net.name()
+    )
 }
 
 /// Tighten the identity file to owner-only on Unix; a no-op elsewhere
@@ -1332,6 +1406,10 @@ fn restrict_permissions(_path: &Path) {}
 mod tests {
     use super::*;
     use chia_bls::master_to_wallet_hardened;
+
+    /// The network the existing tests run on: testnet11, whose files and
+    /// addresses are what they were before the network became a setting.
+    const T11: ChiaNet = ChiaNet::Testnet11;
 
     const ABOUT_12: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1430,16 +1508,16 @@ mod tests {
             "82ae65efe846b15a92c51b7ad6c32589fd79d38263d3cbefbeeba08be8e90d8bc335a1e2fcc66a10b8c817c06232285a"
         );
         assert_eq!(puzzle_hash_hex(&k.wallet), "792931431ba2976e36e3abc0b35c811948536bcf77f39a8d99ec2a15af0e84bc");
-        assert_eq!(testnet_address(&k.wallet), "txch10y5nzscm52tkudhr40qtxhypr9y9x670wlee4rveas4pttcwsj7qnxh9ya");
+        assert_eq!(receive_address(T11, &k.wallet), "txch10y5nzscm52tkudhr40qtxhypr9y9x670wlee4rveas4pttcwsj7qnxh9ya");
 
         let k = keys_from_mnemonic(&Mnemonic::parse_normalized(&art_24()).unwrap());
         assert_eq!(k.fingerprint, 1532878573);
         assert_eq!(puzzle_hash_hex(&k.wallet), "d207c1e11fc3b0cd7472e8c7e53c8d2b81709516346c7baa9fbb9070ffccfe89");
-        assert_eq!(testnet_address(&k.wallet), "txch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ys36pefh");
+        assert_eq!(receive_address(T11, &k.wallet), "txch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ys36pefh");
 
         let k = keys_from_entropy(&entropy_of(HAMSTER_HEX));
         assert_eq!(k.fingerprint, 3552866753, "byte-reversed entropy would give 3701174480");
-        assert_eq!(testnet_address(&k.wallet), "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk");
+        assert_eq!(receive_address(T11, &k.wallet), "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk");
     }
 
     /// A wallet that watches the address from the master public key alone
@@ -1473,9 +1551,9 @@ mod tests {
         ] {
             let m = Mnemonic::parse_normalized(&words).unwrap();
             let master = master_of(&m);
-            assert_eq!(testnet_address(&master), pathless, "the path-less address of these words");
-            assert_eq!(testnet_address(&master_to_wallet_hardened(&master, 0)), hardened);
-            let ours = testnet_address(&keys_from_mnemonic(&m).wallet);
+            assert_eq!(receive_address(T11, &master), pathless, "the path-less address of these words");
+            assert_eq!(receive_address(T11, &master_to_wallet_hardened(&master, 0)), hardened);
+            let ours = receive_address(T11, &keys_from_mnemonic(&m).wallet);
             assert_ne!(ours, pathless);
             assert_ne!(ours, hardened);
         }
@@ -1489,14 +1567,14 @@ mod tests {
         let m = Mnemonic::from_entropy(&[0u8; 32]).unwrap();
         let master = master_of(&m);
         let wallet = keys_from_mnemonic(&m).wallet;
-        let beacon = testnet_address(&crate::chia_publish::beacon_wallet_key(&wallet));
+        let beacon = receive_address(T11, &crate::chia_publish::beacon_wallet_key(&wallet));
         assert_eq!(beacon, "txch1jmfqazsfj4fh6vldzjnwas0wudfv8fy5d6w7tcd5v3deddmhm9yqravp4u", "the value this rule gave when it was pinned");
         for idx in 0..4 {
-            assert_ne!(beacon, testnet_address(&master_to_wallet_unhardened(&master, idx)), "index {idx}");
-            assert_ne!(beacon, testnet_address(&master_to_wallet_hardened(&master, idx)), "hardened index {idx}");
+            assert_ne!(beacon, receive_address(T11, &master_to_wallet_unhardened(&master, idx)), "index {idx}");
+            assert_ne!(beacon, receive_address(T11, &master_to_wallet_hardened(&master, idx)), "hardened index {idx}");
         }
         assert_ne!(beacon, "txch10wnvld5a9j7evr0la4ss4megqwzdqs66fjweapvzgv8smaw5q5hsxfkaqe", "index 1");
-        assert_ne!(beacon, testnet_address(&master));
+        assert_ne!(beacon, receive_address(T11, &master));
     }
 
     // --- Through the file --------------------------------------------------
@@ -1511,23 +1589,23 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, 3552866753)).unwrap();
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(!id.minted && id.retired.is_none());
         assert_eq!(id.fingerprint, 3552866753);
         assert_eq!(puzzle_hash_hex(&id.wallet), "17b698572086e2db991e247b52fb695f5867997930f3648f569c5affae49d556");
-        assert_eq!(testnet_address(&id.wallet), "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk");
+        assert_eq!(receive_address(T11, &id.wallet), "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk");
         let raw = entropy_of(HAMSTER_HEX);
-        assert_ne!(testnet_address(&id.wallet), testnet_address(&SecretKey::from_seed(&raw)), "not the entropy as a seed");
-        let rev = reveal_words(&identity).unwrap();
+        assert_ne!(receive_address(T11, &id.wallet), receive_address(T11, &SecretKey::from_seed(&raw)), "not the entropy as a seed");
+        let rev = reveal_words(T11, &identity).unwrap();
         assert_eq!(rev.words().collect::<Vec<_>>(), HAMSTER.split_whitespace().collect::<Vec<_>>());
         assert_eq!(rev.fingerprint, 3552866753);
         assert_eq!(rev.wallet, id.wallet.public_key());
 
         std::fs::write(&identity, envelope(&"00".repeat(32), 1532878573)).unwrap();
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert_eq!(id.fingerprint, 1532878573);
-        assert_eq!(testnet_address(&id.wallet), "txch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ys36pefh");
-        assert_ne!(testnet_address(&id.wallet), testnet_address(&SecretKey::from_seed(&[0u8; 32])));
+        assert_eq!(receive_address(T11, &id.wallet), "txch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ys36pefh");
+        assert_ne!(receive_address(T11, &id.wallet), receive_address(T11, &SecretKey::from_seed(&[0u8; 32])));
         assert_eq!(names(&dir), vec!["chia_identity.json"], "a load writes nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1537,16 +1615,16 @@ mod tests {
         let dir = fresh_dir("persist");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let first = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let first = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(first.minted && first.retired.is_none());
-        let again = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let again = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(!again.minted);
         assert_eq!(first.wallet.public_key(), again.wallet.public_key());
         assert_eq!(first.fingerprint, again.fingerprint);
-        let addr = testnet_address(&first.wallet);
-        assert_eq!(addr, testnet_address(&again.wallet));
+        let addr = receive_address(T11, &first.wallet);
+        assert_eq!(addr, receive_address(T11, &again.wallet));
         assert!(addr.starts_with("txch1"), "expected txch1… address, got {addr}");
-        let ph = testnet_address_to_puzzle_hash(&addr).unwrap();
+        let ph = address_to_puzzle_hash(T11, &addr).unwrap();
         let expected: Bytes32 = StandardArgs::curry_tree_hash(first.wallet.public_key().derive_synthetic()).into();
         assert_eq!(ph, expected);
 
@@ -1582,7 +1660,7 @@ mod tests {
                 let (identity, legacy, start) = (identity.clone(), legacy.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+                    let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
                     (id.wallet.public_key(), id.minted)
                 })
             })
@@ -1590,7 +1668,7 @@ mod tests {
             .into_iter()
             .map(|t| t.join().unwrap())
             .collect();
-        let on_disk = load_or_mint_wallet(&identity, &legacy).unwrap().wallet.public_key();
+        let on_disk = load_or_mint_wallet(T11, &identity, &legacy).unwrap().wallet.public_key();
         assert!(keys.iter().all(|(k, _)| *k == on_disk), "every minter holds the identity that stayed");
         assert_eq!(keys.iter().filter(|(_, minted)| *minted).count(), 1, "one minter installed it");
         assert_eq!(names(&dir), vec!["chia_identity.json"], "no temporary file left behind");
@@ -1613,7 +1691,7 @@ mod tests {
                 let (identity, legacy, start) = (identity.clone(), legacy.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    load_or_mint_wallet(&identity, &legacy).unwrap().wallet.public_key()
+                    load_or_mint_wallet(T11, &identity, &legacy).unwrap().wallet.public_key()
                 })
             })
             .collect::<Vec<_>>()
@@ -1665,11 +1743,11 @@ mod tests {
             let identity = dir.join("chia_identity.json");
             let legacy = dir.join("chia_identity.seed");
             std::fs::write(&identity, text).unwrap();
-            let err = format!("{:#}", load_or_mint_wallet(&identity, &legacy).unwrap_err());
+            let err = format!("{:#}", load_or_mint_wallet(T11, &identity, &legacy).unwrap_err());
             assert!(err.contains(says), "{why}: {err}");
             assert_eq!(std::fs::read_to_string(&identity).unwrap(), *text, "{why}: the file is left for recovery");
             assert_eq!(names(&dir), vec!["chia_identity.json"], "{why}: nothing minted beside it");
-            assert!(reveal_words(&identity).is_err(), "{why}: nothing revealed");
+            assert!(reveal_words(T11, &identity).is_err(), "{why}: nothing revealed");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -1696,7 +1774,7 @@ mod tests {
             let dir = fresh_dir("echo");
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, text).unwrap();
-            let e = load_or_mint_wallet(&identity, &dir.join("chia_identity.seed")).unwrap_err();
+            let e = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed")).unwrap_err();
             // The path is the test's own (on Windows it can hold an 8.3 name
             // such as RUNNER~1): only what the file held must stay out.
             let path = identity.display().to_string();
@@ -1723,7 +1801,7 @@ mod tests {
         let raw = [9u8; 32];
         std::fs::write(&legacy, raw).unwrap();
         let old_key = SecretKey::from_seed(&raw);
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(id.minted);
         let retired = id.retired.clone().expect("the legacy seed is retired");
         assert!(!legacy.exists(), "the legacy name is gone");
@@ -1732,18 +1810,18 @@ mod tests {
         assert_eq!(mode(&retired.archived_as), 0o600, "the archive is owner-only, however the old file was made");
         let archive_name = retired.archived_as.file_name().unwrap().to_string_lossy().into_owned();
         assert!(archive_name.starts_with("chia_identity.seed.retired-"), "{archive_name}");
-        assert_eq!(retired.old_address.as_deref(), Some(testnet_address(&old_key).as_str()), "the path-less address");
+        assert_eq!(retired.old_address.as_deref(), Some(receive_address(T11, &old_key).as_str()), "the path-less address");
         assert_eq!(
             retired.old_beacon.as_deref(),
-            Some(testnet_address(&crate::chia_publish::beacon_wallet_key(&old_key)).as_str())
+            Some(receive_address(T11, &crate::chia_publish::beacon_wallet_key(&old_key)).as_str())
         );
-        assert_ne!(testnet_address(&id.wallet), testnet_address(&old_key), "a new wallet at a new address");
+        assert_ne!(receive_address(T11, &id.wallet), receive_address(T11, &old_key), "a new wallet at a new address");
         assert_ne!(
             id.wallet.public_key(),
             keys_from_entropy(&raw).wallet.public_key(),
             "fresh entropy, not the raw seed read as entropy"
         );
-        let again = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let again = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(!again.minted && again.retired.is_none(), "a second load retires nothing");
         assert_eq!(again.wallet.public_key(), id.wallet.public_key());
         assert_eq!(names(&dir), vec!["chia_identity.json".to_string(), archive_name]);
@@ -1758,9 +1836,9 @@ mod tests {
         let dir = fresh_dir("crash");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let first = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let first = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         std::fs::write(&legacy, [3u8; 32]).unwrap();
-        let next = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let next = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(!next.minted);
         assert_eq!(next.wallet.public_key(), first.wallet.public_key(), "the identity stays the wallet");
         assert!(next.retired.is_some() && !legacy.exists());
@@ -1773,7 +1851,7 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&legacy, [7u8; 5]).unwrap();
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         let retired = id.retired.expect("archived whatever its length");
         assert_eq!(retired.old_address, None, "nothing is derived from a file that is not a seed");
         assert_eq!(retired.old_beacon, None);
@@ -1853,7 +1931,7 @@ mod tests {
         let not_ours = format!(".chia_wallet.json.{other}-0.tmp");
         std::fs::write(dir.join(&not_ours), b"{}").unwrap();
         std::fs::File::options().write(true).open(dir.join(&not_ours)).unwrap().set_modified(two_minutes_ago).unwrap();
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert!(id.minted);
         let mut expect = vec![in_flight, theirs_in_flight, not_ours, "chia_identity.json".to_string()];
         expect.sort();
@@ -1907,11 +1985,11 @@ mod tests {
         let dir = fresh_dir("modes");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let minted = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let minted = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&identity), 0o600, "minted owner-only");
         std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let loaded = load_or_mint_wallet(&identity, &legacy).unwrap();
+        let loaded = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
         assert_eq!(loaded.fingerprint, minted.fingerprint);
         assert_eq!(mode(&identity), 0o600, "owner-only again after the load");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1923,8 +2001,8 @@ mod tests {
     fn reveal_reads_back_the_words_of_the_loaded_key() {
         let dir = fresh_dir("reveal");
         let identity = dir.join("chia_identity.json");
-        let id = load_or_mint_wallet(&identity, &dir.join("chia_identity.seed")).unwrap();
-        let rev = reveal_words(&identity).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &dir.join("chia_identity.seed")).unwrap();
+        let rev = reveal_words(T11, &identity).unwrap();
         let words: Vec<&str> = rev.words().collect();
         assert_eq!(words.len(), 24);
         assert_eq!(rev.fingerprint, id.fingerprint);
@@ -1934,7 +2012,7 @@ mod tests {
         let k = keys_from_mnemonic(&typed);
         assert_eq!(k.fingerprint, id.fingerprint);
         assert_eq!(k.wallet.public_key(), id.wallet.public_key());
-        assert!(reveal_words(&dir.join("missing.json")).is_err());
+        assert!(reveal_words(T11, &dir.join("missing.json")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1943,7 +2021,7 @@ mod tests {
         let dir = fresh_dir("body");
         let identity = dir.join("chia_identity.json");
         std::fs::write(&identity, envelope(HAMSTER_HEX, 3552866753)).unwrap();
-        let rev = reveal_words(&identity).unwrap();
+        let rev = reveal_words(T11, &identity).unwrap();
         let addr = "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk";
         let body = reveal_body(&rev, addr);
         let quoted: Vec<String> = HAMSTER.split_whitespace().map(|w| format!("\"{w}\"")).collect();
@@ -1964,8 +2042,8 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, 3552866753)).unwrap();
         std::fs::write(&legacy, [6u8; 32]).unwrap();
-        let id = load_or_mint_wallet(&identity, &legacy).unwrap();
-        let rev = reveal_words(&identity).unwrap();
+        let id = load_or_mint_wallet(T11, &identity, &legacy).unwrap();
+        let rev = reveal_words(T11, &identity).unwrap();
         let keys = keys_from_entropy(&entropy_of(HAMSTER_HEX));
         let secret_hex = hex::encode(id.wallet.to_bytes());
         let old_hex = hex::encode([6u8; 32]);
@@ -2009,17 +2087,17 @@ mod tests {
     #[test]
     fn the_locked_envelope_has_one_exact_shape() {
         assert_eq!(
-            encode_identity(Body::Locked(AtRest::Dpapi, &[0, 1, 2, 3, 4]), 7, 100, 200).as_str(),
+            encode_identity(T11, Body::Locked(AtRest::Dpapi, &[0, 1, 2, 3, 4]), 7, 100, 200).as_str(),
             r#"{"v":1,"kind":"bip39-english","protect":"dpapi","blob":"AAECAwQ=","fingerprint":7,"at":100,"wrapped_at":200}"#
         );
         assert_eq!(
-            encode_identity(Body::Clear(&entropy_of(HAMSTER_HEX)), 7, 100, 200).as_str(),
+            encode_identity(T11, Body::Clear(&entropy_of(HAMSTER_HEX)), 7, 100, 200).as_str(),
             format!(r#"{{"v":1,"kind":"bip39-english","protect":"none","entropy":"{HAMSTER_HEX}","fingerprint":7,"at":100}}"#)
         );
         // The longest blob the reader takes still fits the file.
         let longest = vec![0u8; BLOB_MAX / 4 * 3];
         assert!(base64::engine::general_purpose::STANDARD.encode(&longest).len() <= BLOB_MAX);
-        assert!(encode_identity(Body::Locked(AtRest::Dpapi, &longest), u32::MAX, u64::MAX, u64::MAX).len() < FILE_MAX);
+        assert!(encode_identity(T11, Body::Locked(AtRest::Dpapi, &longest), u32::MAX, u64::MAX, u64::MAX).len() < FILE_MAX);
     }
 
     #[test]
@@ -2030,14 +2108,14 @@ mod tests {
         let store = FakeStore::new();
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        let before = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let before = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!(before.at_rest, AtRest::None);
 
         let clear = std::fs::read(&identity).unwrap();
-        reveal_words_with(&identity, Some(&store)).unwrap();
+        reveal_words_with(T11, &identity, Some(&store)).unwrap();
         assert_eq!(std::fs::read(&identity).unwrap(), clear, "a reveal never writes");
 
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
         let text = std::fs::read_to_string(&identity).unwrap();
         assert!(!text.contains(&HAMSTER_HEX[..16]) && !text.contains("entropy"), "the entropy is gone from the file: {text}");
         assert!(text.contains(r#""protect":"dpapi""#) && text.contains(&format!(r#""fingerprint":{fp},"at":1730000000,"wrapped_at":"#)));
@@ -2046,15 +2124,15 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode(&identity), 0o600);
 
-        let after = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let after = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert!(!after.minted);
         assert_eq!(after.at_rest, AtRest::Dpapi);
         assert_eq!((after.fingerprint, after.wallet.public_key()), (before.fingerprint, before.wallet.public_key()));
-        let rev = reveal_words_with(&identity, Some(&store)).unwrap();
+        let rev = reveal_words_with(T11, &identity, Some(&store)).unwrap();
         assert_eq!(rev.words().collect::<Vec<_>>().join(" "), HAMSTER);
 
         let locked = std::fs::read(&identity).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Already(AtRest::Dpapi));
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Already(AtRest::Dpapi));
         assert_eq!(std::fs::read(&identity).unwrap(), locked);
         assert_eq!(store.wraps.load(std::sync::atomic::Ordering::Relaxed), 1, "locked once");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2068,7 +2146,7 @@ mod tests {
         let store = FakeStore::new();
         let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
         let blob = store.wrap(&entropy_of(HAMSTER_HEX), fp).unwrap();
-        let locked = encode_identity(Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).to_string();
+        let locked = encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).to_string();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
         let short = base64::engine::general_purpose::STANDARD.encode(store.wrap(&[1u8; 32], fp).unwrap()[..20].to_vec());
         let no_store: Option<&dyn SecretStore> = None;
@@ -2093,7 +2171,7 @@ mod tests {
             let dir = fresh_dir("locked-refuse");
             let identity = dir.join("chia_identity.json");
             std::fs::write(&identity, &text).unwrap();
-            let err = format!("{:#}", load_or_mint_wallet_with(&identity, &dir.join("chia_identity.seed"), store).unwrap_err());
+            let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), store).unwrap_err());
             assert!(err.contains(says), "{why}: {err}");
             if says != "refusing to overwrite" && says != "update Star Station" && says != "start the node again" {
                 assert!(err.contains("keep this file") && err.contains("move it aside"), "{why}: {err}");
@@ -2101,7 +2179,7 @@ mod tests {
             assert!(!err.contains(&b64[..12]) && !err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
             assert_eq!(std::fs::read_to_string(&identity).unwrap(), text, "{why}: the file is left as it is");
             assert_eq!(names(&dir), ["chia_identity.json"], "{why}: nothing minted beside it");
-            assert!(reveal_words_with(&identity, store).is_err(), "{why}");
+            assert!(reveal_words_with(T11, &identity, store).is_err(), "{why}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -2129,7 +2207,7 @@ mod tests {
             let identity = dir.join("chia_identity.json");
             let text = envelope(HAMSTER_HEX, fp);
             std::fs::write(&identity, &text).unwrap();
-            match wrap_at_rest_with(&identity, key, policy, store, &no_stop) {
+            match wrap_at_rest_with(T11, &identity, key, policy, store, &no_stop) {
                 Wrapped::Skipped(reason) => assert!(reason.contains(says), "{why}: {reason}"),
                 other => panic!("{why}: {other:?}"),
             }
@@ -2143,7 +2221,7 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let text = envelope(HAMSTER_HEX, fp);
         std::fs::write(&identity, &text).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp ^ 1, Policy::Os, Some(&good), &no_stop), Wrapped::OtherWallet);
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp ^ 1, Policy::Os, Some(&good), &no_stop), Wrapped::OtherWallet);
         assert_eq!(std::fs::read_to_string(&identity).unwrap(), text);
         assert_eq!(names(&dir), ["chia_identity.json"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2155,7 +2233,7 @@ mod tests {
         std::fs::write(&identity, &text).unwrap();
         let other = open_lock(&identity).unwrap();
         other.lock().unwrap();
-        match wrap_at_rest_with(&identity, fp, Policy::Os, Some(&good), &no_stop) {
+        match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &no_stop) {
             Wrapped::Skipped(reason) => assert!(reason.contains("another node"), "{reason}"),
             other => panic!("{other:?}"),
         }
@@ -2172,7 +2250,7 @@ mod tests {
             }
             false
         };
-        match wrap_at_rest_with(&identity, fp, Policy::Os, Some(&good), &rewrite) {
+        match wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &rewrite) {
             Wrapped::Skipped(reason) => assert!(reason.contains("changed"), "{reason}"),
             other => panic!("{other:?}"),
         }
@@ -2194,13 +2272,13 @@ mod tests {
             let legacy = dir.join("chia_identity.seed");
             std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
             let stop = |step: Step| step == at;
-            assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)), "{at:?}");
+            assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)), "{at:?}");
             let left: Vec<String> = names(&dir).into_iter().filter(|n| n.contains(".rewrap-")).collect();
             let expect_left = matches!(at, Step::Written | Step::Probed | Step::Locked | Step::Rechecked);
             assert_eq!(left.len(), usize::from(expect_left), "{at:?}: {left:?}");
             assert!(left.iter().all(|n| !n.ends_with(".probe")), "{at:?}: no probe is left");
 
-            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
             assert!(!id.minted, "{at:?}");
             assert_eq!(id.fingerprint, fp, "{at:?}");
             assert_eq!(id.at_rest, if at == Step::Renamed { AtRest::Dpapi } else { AtRest::None }, "{at:?}");
@@ -2210,15 +2288,15 @@ mod tests {
             for n in &left {
                 std::fs::File::options().write(true).open(dir.join(n)).unwrap().set_modified(two_minutes_ago).unwrap();
             }
-            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
             assert_eq!((id.fingerprint, id.minted), (fp, false), "{at:?}");
             assert!(names(&dir).iter().all(|n| !n.contains(".rewrap-")), "{at:?}: the old leftover is removed");
 
             assert!(
-                matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { .. } | Wrapped::Already(AtRest::Dpapi)),
+                matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { .. } | Wrapped::Already(AtRest::Dpapi)),
                 "{at:?}"
             );
-            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
             assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{at:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2236,9 +2314,9 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
         let stop = |step: Step| step == Step::Rechecked;
-        assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
+        assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
         std::fs::remove_file(&identity).unwrap();
-        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -2246,13 +2324,13 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let junk = dir.join(".chia_identity.json.rewrap-1-0");
         std::fs::write(&junk, b"{\"v\":1").unwrap();
-        let id = load_or_mint_wallet_with(&identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
         assert!(id.minted, "nothing that opens: a new wallet");
         assert!(junk.exists(), "a leftover that does not open is left as it is");
         // Once a minute old, beside an identity that opens, the torn
         // leftover is removed.
         age_two_minutes(&junk);
-        let again = load_or_mint_wallet_with(&identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
+        let again = load_or_mint_wallet_with(T11, &identity, &dir.join("chia_identity.seed"), Some(&store)).unwrap();
         assert_eq!((again.fingerprint, again.minted), (id.fingerprint, false));
         assert!(!junk.exists(), "the torn leftover is gone");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2268,7 +2346,7 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
         std::fs::hard_link(&identity, dir.join("backup.json")).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: true });
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: true });
         assert!(std::fs::read_to_string(dir.join("backup.json")).unwrap().contains(HAMSTER_HEX));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2296,9 +2374,9 @@ mod tests {
         let dir = fresh_dir("wrap-other-locked");
         let identity = dir.join("chia_identity.json");
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
         let locked = std::fs::read(&identity).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp ^ 1, Policy::Os, Some(&store), &no_stop), Wrapped::OtherWallet);
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp ^ 1, Policy::Os, Some(&store), &no_stop), Wrapped::OtherWallet);
         assert_eq!(std::fs::read(&identity).unwrap(), locked, "the file is left as it is");
         assert_eq!(names(&dir), [".chia_identity.json.lock", "chia_identity.json"]);
         assert_eq!(store.wraps.load(std::sync::atomic::Ordering::Relaxed), 1, "locked once");
@@ -2318,7 +2396,7 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         let me = std::process::id();
         let other = if me == 1 { 2 } else { me - 1 };
-        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert!(id.minted);
         let fp = id.fingerprint;
         let clear = std::fs::read(&identity).unwrap();
@@ -2330,7 +2408,7 @@ mod tests {
         std::fs::write(&in_flight, b"in flight").unwrap();
         std::fs::copy(&identity, dir.join("backup.json")).unwrap();
 
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
         assert!(!linked_tmp.exists() && !copied_tmp.exists(), "the clear temporaries are gone");
         assert_eq!(std::fs::read(&in_flight).unwrap(), b"in flight", "a write in flight is not the lock's");
         assert_eq!(std::fs::read(dir.join("backup.json")).unwrap(), clear, "a backup under another name is not the lock's");
@@ -2342,7 +2420,7 @@ mod tests {
         ];
         expect.sort();
         assert_eq!(names(&dir), expect);
-        let after = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let after = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!((after.fingerprint, after.minted, after.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2356,21 +2434,21 @@ mod tests {
         let dir = fresh_dir("wrap-mint-tmp-stop");
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
-        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         let fp = id.fingerprint;
         let clear = std::fs::read(&identity).unwrap();
         let tmp = dir.join(format!(".chia_identity.json.{}-0.tmp", std::process::id()));
         std::fs::copy(&identity, &tmp).unwrap();
 
         let at_locked = |step: Step| step == Step::Locked;
-        assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &at_locked), Wrapped::Skipped(_)));
+        assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &at_locked), Wrapped::Skipped(_)));
         assert_eq!(std::fs::read(&tmp).unwrap(), clear, "nothing is removed before the recheck");
 
         let at_rechecked = |step: Step| step == Step::Rechecked;
-        assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &at_rechecked), Wrapped::Skipped(_)));
+        assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &at_rechecked), Wrapped::Skipped(_)));
         assert!(!tmp.exists(), "removed once the file is rechecked");
         assert_eq!(std::fs::read(&identity).unwrap(), clear, "the identity still holds the same clear bytes");
-        let again = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let again = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!((again.fingerprint, again.minted, again.at_rest), (fp, false, AtRest::None));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2398,7 +2476,7 @@ mod tests {
             let legacy = dir.join("chia_identity.seed");
             std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
             let stop = |step: Step| step == Step::Rechecked;
-            assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&good), &stop), Wrapped::Skipped(_)), "{why}");
+            assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&good), &stop), Wrapped::Skipped(_)), "{why}");
             std::fs::remove_file(&identity).unwrap();
             let left = rewrap_names(&dir);
             assert_eq!(left.len(), 1, "{why}: {left:?}");
@@ -2408,7 +2486,7 @@ mod tests {
                 if aged {
                     age_two_minutes(&leftover);
                 }
-                let err = format!("{:#}", load_or_mint_wallet_with(&identity, &legacy, store).unwrap_err());
+                let err = format!("{:#}", load_or_mint_wallet_with(T11, &identity, &legacy, store).unwrap_err());
                 assert!(err.contains("missing") && err.contains(&left[0]), "{why}: {err}");
                 assert!(!err.contains(&HAMSTER_HEX[..12]), "{why}: {err}");
                 assert!(err.split(|c: char| !c.is_ascii_alphabetic()).all(|t| !words.contains(&t)), "{why}: {err}");
@@ -2416,7 +2494,7 @@ mod tests {
                 assert!(leftover.exists(), "{why}: the locked copy is kept");
             }
 
-            let id = load_or_mint_wallet_with(&identity, &legacy, Some(&good)).unwrap();
+            let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&good)).unwrap();
             assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi), "{why}");
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2435,17 +2513,17 @@ mod tests {
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
         let stop = |step: Step| step == Step::Rechecked;
-        assert!(matches!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
+        assert!(matches!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &stop), Wrapped::Skipped(_)));
         let left = rewrap_names(&dir);
         assert_eq!(left.len(), 1, "{left:?}");
         let leftover = dir.join(&left[0]);
         age_two_minutes(&leftover);
         std::fs::write(&identity, b"{\"v\":1").unwrap();
-        assert!(load_or_mint_wallet_with(&identity, &legacy, Some(&store)).is_err());
+        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).is_err());
         assert!(leftover.exists(), "the locked copy is kept beside a damaged identity");
         // The operator moves the damaged file aside, as the refusal says.
         std::fs::remove_file(&identity).unwrap();
-        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted, id.at_rest), (fp, false, AtRest::Dpapi));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -2454,15 +2532,15 @@ mod tests {
         let identity = dir.join("chia_identity.json");
         let legacy = dir.join("chia_identity.seed");
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
-        assert_eq!(wrap_at_rest_with(&identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        assert_eq!(wrap_at_rest_with(T11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
         let blob = store.wrap(&entropy_of(HAMSTER_HEX), fp).unwrap();
         let leftover = dir.join(".chia_identity.json.rewrap-9-0");
-        std::fs::write(&leftover, encode_identity(Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).as_bytes())
+        std::fs::write(&leftover, encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).as_bytes())
             .unwrap();
         age_two_minutes(&leftover);
         let busy = FakeStore::new();
         *busy.unwrap_fails.lock().unwrap() = Some(StoreError { refusal: Refusal::NotNow, code: 5 });
-        assert!(load_or_mint_wallet_with(&identity, &legacy, Some(&busy)).is_err());
+        assert!(load_or_mint_wallet_with(T11, &identity, &legacy, Some(&busy)).is_err());
         assert!(leftover.exists(), "the locked copy is kept while the identity does not open");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2481,17 +2559,174 @@ mod tests {
         std::fs::write(&identity, envelope(HAMSTER_HEX, fp)).unwrap();
         let theirs = dir.join(".chia_identity.json.rewrap-9-0");
         let blob = store.wrap(&[0u8; 32], other_fp).unwrap();
-        std::fs::write(&theirs, encode_identity(Body::Locked(AtRest::Dpapi, &blob), other_fp, 1730000000, 1730000001).as_bytes())
+        std::fs::write(&theirs, encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), other_fp, 1730000000, 1730000001).as_bytes())
             .unwrap();
         let ours = dir.join(".chia_identity.json.rewrap-9-1");
         let blob = store.wrap(&entropy_of(HAMSTER_HEX), fp).unwrap();
-        std::fs::write(&ours, encode_identity(Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).as_bytes()).unwrap();
+        std::fs::write(&ours, encode_identity(T11, Body::Locked(AtRest::Dpapi, &blob), fp, 1730000000, 1730000001).as_bytes()).unwrap();
         age_two_minutes(&theirs);
         age_two_minutes(&ours);
-        let id = load_or_mint_wallet_with(&identity, &legacy, Some(&store)).unwrap();
+        let id = load_or_mint_wallet_with(T11, &identity, &legacy, Some(&store)).unwrap();
         assert_eq!((id.fingerprint, id.minted), (fp, false));
         assert!(theirs.exists(), "another wallet's locked copy is kept");
         assert!(!ours.exists(), "the same wallet's old copy is removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Networks ------------------------------------------------------------
+
+    /// ⛓️ An address on each network: the same puzzle hash under the
+    /// network's own prefix, a round trip, and the other prefix refused. The
+    /// txch vectors above stay as they were.
+    #[test]
+    fn each_network_has_its_own_prefix_over_the_same_puzzle_hash() {
+        let k = keys_from_entropy(&entropy_of(HAMSTER_HEX));
+        assert_eq!(receive_address(ChiaNet::Testnet11, &k.wallet), "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk");
+        let ph = puzzle_hash_hex(&k.wallet);
+        for net in ChiaNet::ALL {
+            let addr = receive_address(net, &k.wallet);
+            assert!(addr.starts_with(&format!("{}1", net.prefix())), "{addr}");
+            let back = address_to_puzzle_hash(net, &addr).unwrap();
+            assert_eq!(hex::encode(back.to_bytes()), ph, "{net:?}: one wallet, one puzzle hash");
+            for other in ChiaNet::ALL.into_iter().filter(|o| *o != net) {
+                let err = address_to_puzzle_hash(other, &addr).unwrap_err().to_string();
+                assert!(err.contains(other.prefix()) && err.contains(other.name()), "{err}");
+            }
+        }
+        assert_ne!(receive_address(ChiaNet::Testnet11, &k.wallet), receive_address(ChiaNet::Mainnet, &k.wallet));
+        assert!(receive_address(ChiaNet::Mainnet, &k.wallet).starts_with("xch1"));
+    }
+
+    /// The identity file's `net`: testnet11 takes it absent or "testnet11",
+    /// mainnet only "mainnet". A refusal is a fixed sentence that never
+    /// quotes the file, and the file is left as it is.
+    #[test]
+    fn an_identity_opens_only_on_its_own_network() {
+        let dir = fresh_dir("net-field");
+        let identity = dir.join("chia_identity.json");
+        let fp = keys_from_entropy(&entropy_of(HAMSTER_HEX)).fingerprint;
+        let with_net = |net: Option<&str>| match net {
+            None => envelope(HAMSTER_HEX, fp),
+            Some(n) => format!(
+                r#"{{"v":1,"kind":"bip39-english","net":"{n}","protect":"none","entropy":"{HAMSTER_HEX}","fingerprint":{fp},"at":1730000000}}"#
+            ),
+        };
+        let cases = [
+            (None, ChiaNet::Testnet11, true),
+            (Some("testnet11"), ChiaNet::Testnet11, true),
+            (Some("mainnet"), ChiaNet::Testnet11, false),
+            (Some("testnet10"), ChiaNet::Testnet11, false),
+            (None, ChiaNet::Mainnet, false),
+            (Some("testnet11"), ChiaNet::Mainnet, false),
+            (Some("mainnet"), ChiaNet::Mainnet, true),
+            (Some("Mainnet"), ChiaNet::Mainnet, false),
+        ];
+        for (field, net, opens) in cases {
+            let bytes = with_net(field);
+            std::fs::write(&identity, &bytes).unwrap();
+            match read_identity(net, &identity, None) {
+                Ok(opened) => {
+                    assert!(opens, "{field:?} on {net:?} opened");
+                    assert_eq!(opened.keys.fingerprint, fp);
+                }
+                Err(e) => {
+                    assert!(!opens, "{field:?} on {net:?}: {e:#}");
+                    let e = format!("{e:#}");
+                    assert_eq!(
+                        e,
+                        format!(
+                            "chia identity file {} is not a wallet for {}, the Chia network this node runs on; it is left as it is",
+                            identity.display(),
+                            net.name()
+                        )
+                    );
+                    assert!(!e.contains(&HAMSTER_HEX[..16]) && !e.contains("testnet10") && !e.contains("Mainnet"), "never the file: {e}");
+                    assert!(load_or_mint_wallet(net, &identity, &dir.join("chia_identity.seed")).is_err(), "never minted over");
+                    assert_eq!(std::fs::read_to_string(&identity).unwrap(), bytes, "left as it is");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A testnet11 mint writes no `net`, byte for byte the shape it always
+    /// had; a mainnet mint writes `"net":"mainnet"` and never looks at a
+    /// raw seed beside it.
+    #[test]
+    fn a_mint_names_its_network_only_off_testnet11() {
+        let dir = fresh_dir("net-mint");
+        let entropy = entropy_of(HAMSTER_HEX);
+        let fp = keys_from_entropy(&entropy).fingerprint;
+        assert_eq!(encode_identity(ChiaNet::Testnet11, Body::Clear(&entropy), fp, 1730000000, 0).as_str(), envelope(HAMSTER_HEX, fp));
+        assert_eq!(
+            encode_identity(ChiaNet::Mainnet, Body::Clear(&entropy), fp, 1730000000, 0).as_str(),
+            format!(r#"{{"v":1,"kind":"bip39-english","net":"mainnet","protect":"none","entropy":"{HAMSTER_HEX}","fingerprint":{fp},"at":1730000000}}"#)
+        );
+        assert_eq!(
+            encode_identity(ChiaNet::Mainnet, Body::Locked(AtRest::Dpapi, &[0, 1, 2]), 7, 100, 200).as_str(),
+            r#"{"v":1,"kind":"bip39-english","net":"mainnet","protect":"dpapi","blob":"AAEC","fingerprint":7,"at":100,"wrapped_at":200}"#
+        );
+
+        let t11 = dir.join("t11");
+        std::fs::create_dir_all(&t11).unwrap();
+        let id = load_or_mint_wallet(ChiaNet::Testnet11, &t11.join("chia_identity.json"), &t11.join("chia_identity.seed")).unwrap();
+        assert!(id.minted);
+        let text = std::fs::read_to_string(t11.join("chia_identity.json")).unwrap();
+        assert!(text.starts_with(r#"{"v":1,"kind":"bip39-english","protect":"none","entropy":""#) && !text.contains("net"), "{}", text.len());
+
+        let main = dir.join("chia-mainnet");
+        std::fs::create_dir_all(&main).unwrap();
+        let legacy = main.join("chia_identity.seed");
+        std::fs::write(&legacy, [9u8; 32]).unwrap();
+        let identity = main.join("chia_identity.json");
+        let id = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy).unwrap();
+        assert!(id.minted && id.retired.is_none(), "a mainnet load never retires a raw seed");
+        assert_eq!(std::fs::read(&legacy).unwrap(), [9u8; 32], "and leaves it as it is");
+        let text = std::fs::read_to_string(&identity).unwrap();
+        assert!(text.starts_with(r#"{"v":1,"kind":"bip39-english","net":"mainnet","protect":"none","entropy":""#), "{}", text.len());
+        let again = load_or_mint_wallet(ChiaNet::Mainnet, &identity, &legacy).unwrap();
+        assert!(!again.minted);
+        assert_eq!(again.wallet.public_key(), id.wallet.public_key());
+        assert!(load_or_mint_wallet(ChiaNet::Testnet11, &identity, &legacy).is_err(), "a mainnet wallet never opens on testnet11");
+        assert!(reveal_words(ChiaNet::Testnet11, &identity).is_err());
+        assert_eq!(reveal_words(ChiaNet::Mainnet, &identity).unwrap().fingerprint, id.fingerprint);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock keeps the file's network: a locked mainnet file still says
+    /// `"net":"mainnet"` and opens only there.
+    #[test]
+    fn a_locked_file_keeps_its_network() {
+        let dir = fresh_dir("net-wrap");
+        let identity = dir.join("chia_identity.json");
+        let legacy = dir.join("chia_identity.seed");
+        let store = FakeStore::new();
+        let entropy = entropy_of(HAMSTER_HEX);
+        let fp = keys_from_entropy(&entropy).fingerprint;
+        std::fs::write(&identity, encode_identity(ChiaNet::Mainnet, Body::Clear(&entropy), fp, 1730000000, 0).as_bytes()).unwrap();
+        assert_eq!(wrap_at_rest_with(ChiaNet::Testnet11, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Skipped(format!(
+            "chia identity file {} is not a wallet for testnet11, the Chia network this node runs on; it is left as it is",
+            identity.display()
+        )));
+        assert_eq!(wrap_at_rest_with(ChiaNet::Mainnet, &identity, fp, Policy::Os, Some(&store), &no_stop), Wrapped::Done { linked: false });
+        let text = std::fs::read_to_string(&identity).unwrap();
+        assert!(text.contains(r#""net":"mainnet","protect":"dpapi""#), "{}", text.len());
+        assert_eq!(fields_of(&identity), ["at", "blob", "fingerprint", "kind", "net", "protect", "v", "wrapped_at"]);
+        let id = load_or_mint_wallet_with(ChiaNet::Mainnet, &identity, &legacy, Some(&store)).unwrap();
+        assert_eq!((id.fingerprint, id.at_rest), (fp, AtRest::Dpapi));
+        assert!(load_or_mint_wallet_with(ChiaNet::Testnet11, &identity, &legacy, Some(&store)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_receive_line_says_how_each_network_is_funded() {
+        let a = "txch1z7mfs4eqsm3dhxg7y3a497mftavx0xtexrekfr6kn3d0ltjf64tqevsfhk";
+        assert_eq!(
+            receive_line(ChiaNet::Testnet11, a),
+            format!("⛓️ ChiaHub lane: testnet11 receive address {a}\n   Fund it at a testnet11 faucet. TXCH is free. Once it holds a coin, the lane can publish/resolve presence.")
+        );
+        let line = receive_line(ChiaNet::Mainnet, "xch1q");
+        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. Once it holds a coin, the lane can publish/resolve presence.");
+        assert!(!line.contains("faucet"), "{line}");
     }
 }

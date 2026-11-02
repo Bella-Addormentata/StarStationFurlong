@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use chia_protocol::{Bytes32, Coin, Program, SpendBundle};
@@ -199,21 +200,41 @@ pub type Chain = PeerLane;
 /// The process's one lane: its pins and mode come from the environment
 /// (`SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY`), its known-good peers from
 /// `chia_peers.json`. Connections open on the first request and are shared by
-/// every handle.
-static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| Arc::new(Lane::from_env(Network::testnet11())));
+/// every handle. It binds what [`lane_binding`] names.
+static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| {
+    let (net, store) = lane_binding();
+    Arc::new(Lane::from_env(net, store))
+});
+
+/// The network the process's lane binds and where its peer store lives:
+/// testnet11, the one network this build runs on, and testnet11's peer store
+/// (`chia_peers.json` at the data root). Pure, so a test can pin it.
+fn lane_binding() -> (Network, PathBuf) {
+    (Network::testnet11(), crate::chia_network::ChiaNet::Testnet11.path(crate::chia_peer_lane::STORE_FILE))
+}
 
 /// Chain access for MONEY paths (plan §14 (5)): two peers must agree, or the
 /// pin decides in pin-only mode. The publisher's wallet and lease, the faucet
 /// and the craps fairness lane construct this. No I/O happens here.
 pub fn connect() -> Chain {
-    PeerLane::new(LANE.clone(), Trust::Agreed)
+    money_on(LANE.clone())
 }
 
 /// Chain access for the PRESENCE lane (plan §14 (5)): the first reachable
 /// peer. The resolver and the watcher construct this: their records are
 /// signed and sealed, so the chain is only their carrier.
 pub fn connect_carrier() -> Chain {
-    PeerLane::new(LANE.clone(), Trust::Carrier)
+    carrier_on(LANE.clone())
+}
+
+/// The money handle on `lane`: [`connect`] on the process's lane.
+fn money_on(lane: Arc<Lane>) -> Chain {
+    PeerLane::new(lane, Trust::Agreed)
+}
+
+/// The carrier handle on `lane`: [`connect_carrier`] on the process's lane.
+fn carrier_on(lane: Arc<Lane>) -> Chain {
+    PeerLane::new(lane, Trust::Carrier)
 }
 
 /// One line for the startup log: which peers, which posture.
@@ -393,10 +414,25 @@ mod tests {
         assert!(err.to_string().contains("unanswered"), "{err}");
     }
 
+    /// Against a lane of its own, so no test reads `SSF_CHIA_PEERS` or
+    /// `SSF_CHIA_PIN_ONLY` through the process's lane. The handles are the
+    /// helpers [`connect`] and [`connect_carrier`] call.
     #[test]
     fn the_two_handles_carry_their_trust_without_opening_anything() {
-        assert_eq!(connect().trust(), Trust::Agreed);
-        assert_eq!(connect_carrier().trust(), Trust::Carrier);
-        assert!(describe().contains("testnet11"));
+        let lane = Arc::new(Lane::new(Network::testnet11(), vec![], false, None));
+        assert_eq!(money_on(lane.clone()).trust(), Trust::Agreed);
+        assert_eq!(carrier_on(lane.clone()).trust(), Trust::Carrier);
+        assert!(lane.describe().contains("testnet11"));
+    }
+
+    /// The process's lane binds testnet11 and keeps its peer store where it
+    /// always was. Read from the pure binding, so nothing is read from the
+    /// environment.
+    #[test]
+    fn the_process_lane_binds_testnet11_and_its_old_peer_store() {
+        let (net, store) = lane_binding();
+        assert_eq!(net.id, "testnet11");
+        assert_eq!(net.genesis, Network::testnet11().genesis);
+        assert_eq!(store, std::path::Path::new("chia_peers.json"));
     }
 }

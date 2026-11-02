@@ -32,6 +32,12 @@
 //! store where it has one (chia_at_rest.rs: Windows DPAPI), and the
 //! fingerprint says how the file keeps its key ([`AtRest`]).
 //!
+//! ⛓️ Every gate here also takes the Chia network (chia_network.rs). On a
+//! network where the SSF wallet is not allowed yet (mainnet), the wallet is
+//! `gated`: it never starts, no turn is taken, and the Bank says why. The
+//! page reveal of the 24 words is refused there for good ([`WordsRefusal::NativeOnly`]),
+//! before anything is read, whatever `SSF_BANK_DEV_PAGES` names.
+//!
 //! Everything a decision rests on is a pure function here, so the startup
 //! block, the loopback route and the fingerprint agree and are tested without
 //! touching the process environment.
@@ -43,6 +49,9 @@ use serde::{Deserialize, Serialize};
 
 /// The Bank's switch, remembered beside the wallet's identity in the node's
 /// data folder (its CWD, the same bare-path convention as `iroh_node_id.key`).
+/// This file and the four below are per network: each is opened at
+/// `ChiaNet::path(name)`, so a testnet "remembered on" never starts a wallet
+/// on another network.
 pub const SWITCH_FILE: &str = "chia_wallet.json";
 
 /// The wallet's identity: 32 bytes of BIP39 entropy, its 24 words
@@ -110,9 +119,12 @@ pub fn env_switch() -> EnvSwitch {
     *ENV.get_or_init(|| env_switch_of(std::env::var_os("SSF_CHIA_LANE").as_deref()))
 }
 
-/// Whether the wallet loads when the node starts.
-pub fn starts_on(built: bool, env: EnvSwitch, remembered: bool) -> bool {
+/// Whether the wallet loads when the node starts. `gate` (the network allows
+/// no SSF wallet, `!ChiaNet::wallet_allowed()`) holds it off whatever the
+/// environment or the remembered switch says.
+pub fn starts_on(built: bool, gate: bool, env: EnvSwitch, remembered: bool) -> bool {
     built
+        && !gate
         && match env {
             EnvSwitch::On => true,
             EnvSwitch::Off => false,
@@ -128,13 +140,19 @@ pub const OFF_WORDS: &str =
 /// `SSF_CHIA_LANE=1` holds the wallet on.
 pub const HELD_WORDS: &str =
     "SSF_CHIA_LANE=1 in the node's environment holds the SSF wallet on; start the node without it to let the Bank turn it off";
+/// The network allows no SSF wallet yet.
+pub const GATED_WORDS: &str = "This node runs on Chia mainnet, where Star Station makes no SSF wallet yet.";
 
 /// Why a turn the Bank asked for is refused, or `None` when it may go ahead.
 /// Turning off while the environment holds it off only clears the switch,
 /// and turning on while it is held on only remembers it: both are allowed.
-pub fn turn_refusal(built: bool, env: EnvSwitch, on: bool) -> Option<&'static str> {
+/// Under `gate` every turn is refused, on or off: there is no wallet to turn.
+pub fn turn_refusal(built: bool, gate: bool, env: EnvSwitch, on: bool) -> Option<&'static str> {
     if !built {
         return Some(UNBUILT_WORDS);
+    }
+    if gate {
+        return Some(GATED_WORDS);
     }
     match (env, on) {
         (EnvSwitch::Off, true) => Some(OFF_WORDS),
@@ -145,9 +163,12 @@ pub fn turn_refusal(built: bool, env: EnvSwitch, on: bool) -> Option<&'static st
 
 /// What the faucet dish says when the node holds no wallet, for `doing`
 /// ("take or give", "take a mojo", "give"): where the switch is, or what
-/// holds it off.
+/// holds it off (the network, under `gate`).
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn no_wallet_words(env: EnvSwitch, doing: &str) -> String {
+pub fn no_wallet_words(gate: bool, env: EnvSwitch, doing: &str) -> String {
+    if gate {
+        return format!("this node runs on Chia mainnet, where Star Station makes no SSF wallet yet, so it cannot {doing}");
+    }
     match env {
         EnvSwitch::Off => format!(
             "this node's SSF wallet is switched off (SSF_CHIA_LANE in its environment), so it cannot {doing}"
@@ -233,6 +254,9 @@ pub enum WalletState {
     Unbuilt,
     /// `SSF_CHIA_LANE` holds it off.
     Off,
+    /// The network allows no SSF wallet yet (mainnet): none is made or
+    /// loaded, whatever the environment says.
+    Gated,
     /// Not on, and the Bank may turn it on.
     Ready,
     /// The wallet is loaded.
@@ -324,10 +348,13 @@ pub struct KeyFacts {
     pub rewrapped: bool,
 }
 
-/// The fingerprint's view, from the facts the node holds.
-pub fn view(built: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts) -> WalletSwitch {
+/// The fingerprint's view, from the facts the node holds. `gate` reads as
+/// Gated, with no flags, ahead of everything but the build.
+pub fn view(built: bool, gate: bool, env: EnvSwitch, loaded: bool, memo: &SwitchMemo, facts: &KeyFacts) -> WalletSwitch {
     let state = if !built {
         WalletState::Unbuilt
+    } else if gate {
+        WalletState::Gated
     } else if loaded {
         WalletState::On
     } else if env == EnvSwitch::Off {
@@ -524,6 +551,8 @@ pub const BACKUP_NOT_SHOWN: &str = "tap SHOW first: your node has not shown thes
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub const BACKUP_UNREADABLE: &str =
     "your node could not read its 24 words from chia_identity.json, so nothing is shown; the node's log says why";
+/// Any words ask on a network that is not a test network.
+pub const BACKUP_NATIVE_ONLY: &str = "On this network the desktop app will show the 24 words itself. This page cannot.";
 pub const BACKUP_BAD_ASK: &str = "ask /api/chia/words or /api/chia/words/saved?key=<fingerprint>";
 
 /// The saved flag's contents: a key fingerprint, nothing secret.
@@ -600,6 +629,10 @@ pub enum WordsStep<K> {
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WordsRefusal {
+    /// The network is not a test network: only the desktop app may ever
+    /// show the words there, never a page. Checked first, before any file is
+    /// read, and `SSF_BANK_DEV_PAGES` does not lift it.
+    NativeOnly,
     /// No wallet, and a turn holds the lock (it may be loading one).
     Turning,
     /// No wallet.
@@ -615,10 +648,10 @@ pub enum WordsRefusal {
 
 impl WordsRefusal {
     /// The refusal's status line and body.
-    #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
     pub fn answer(self) -> (&'static str, serde_json::Value) {
         let refuse = |error: &str| ("409 Conflict", serde_json::json!({ "ok": false, "error": error }));
         match self {
+            WordsRefusal::NativeOnly => refuse(BACKUP_NATIVE_ONLY),
             WordsRefusal::Turning => refuse(BACKUP_TURNING),
             WordsRefusal::NotOn => refuse(BACKUP_NOT_ON),
             WordsRefusal::AlreadySaved => ("409 Conflict", serde_json::json!({ "ok": false, "saved": true, "error": BACKUP_SAVED })),
@@ -628,7 +661,9 @@ impl WordsRefusal {
     }
 }
 
-/// 🏦 Where a words ask goes. `loaded` is the wallet key and its meta, or
+/// 🏦 Where a words ask goes. On a network that is not a test network
+/// (`test_net` false) every ask is [`WordsRefusal::NativeOnly`], first.
+/// `loaded` is the wallet key and its meta, or
 /// none while no wallet is loaded; `turning` (whether a turn holds the lock)
 /// counts only then. A reveal is refused once the words are marked saved and
 /// otherwise reads the file. A saved mark checks the key first (a wallet
@@ -636,7 +671,10 @@ impl WordsRefusal {
 /// then answers a mark already recorded as done, and writes the flag only
 /// for words this run showed.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bool) -> WordsStep<K> {
+pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bool, test_net: bool) -> WordsStep<K> {
+    if !test_net {
+        return WordsStep::Refuse(WordsRefusal::NativeOnly);
+    }
     let Some((wallet, meta)) = loaded else {
         return WordsStep::Refuse(if turning { WordsRefusal::Turning } else { WordsRefusal::NotOn });
     };
@@ -647,6 +685,51 @@ pub fn words_step<K>(ask: WordsAsk, loaded: Option<(K, WalletMeta)>, turning: bo
         WordsAsk::Saved(_) if meta.backed_up => WordsStep::SavedIdempotent,
         WordsAsk::Saved(_) if !meta.revealed => WordsStep::Refuse(WordsRefusal::NotShown),
         WordsAsk::Saved(key) => WordsStep::WriteFlag { key },
+    }
+}
+
+/// 🏦 The words route's first rule, before the page gate ([`app_page`]):
+/// on a network that is not a test network, an ask is refused with
+/// [`WordsRefusal::NativeOnly`] whatever page sends it and whatever
+/// `SSF_BANK_DEV_PAGES` names. `None` lets the route go on as before (a
+/// target that asks for nothing is still the gate's, then a 400).
+pub fn native_only(test_net: bool, target: &str) -> Option<(&'static str, serde_json::Value)> {
+    let ask = words_asked(target)?;
+    match words_step::<()>(ask, None, false, test_net) {
+        WordsStep::Refuse(WordsRefusal::NativeOnly) => Some(WordsRefusal::NativeOnly.answer()),
+        _ => None,
+    }
+}
+
+/// What the words route does with a request, decided before anything reads
+/// the identity file.
+#[derive(Debug, PartialEq)]
+pub enum WordsGate {
+    /// Off a test network: this answer, whatever page sent it.
+    NativeOnly((&'static str, serde_json::Value)),
+    /// The page gate ([`app_page`]) said no: a 403.
+    Forbidden,
+    /// The request goes on to be read.
+    Pass,
+}
+
+/// 🏦 The words route's opening decision, in its order: [`native_only`]
+/// first, so no origin and no `dev_pages` lifts it, then [`app_page`].
+pub fn words_gate(
+    test_net: bool,
+    target: &str,
+    origin: Option<&str>,
+    host: Option<&str>,
+    port: u16,
+    dev_pages: &[String],
+) -> WordsGate {
+    if let Some(answer) = native_only(test_net, target) {
+        return WordsGate::NativeOnly(answer);
+    }
+    if app_page(origin, host, port, dev_pages) {
+        WordsGate::Pass
+    } else {
+        WordsGate::Forbidden
     }
 }
 
@@ -789,32 +872,32 @@ mod tests {
     #[test]
     fn the_wallet_starts_with_the_node_when_the_environment_or_the_switch_says_so() {
         use EnvSwitch::*;
-        assert!(starts_on(true, On, false), "SSF_CHIA_LANE=1 needs no switch");
-        assert!(starts_on(true, Unset, true), "the Bank's switch, remembered");
-        assert!(!starts_on(true, Unset, false), "never turned on");
-        assert!(!starts_on(true, Off, true), "SSF_CHIA_LANE=0 overrides the switch");
-        assert!(!starts_on(false, On, true), "a read-only build never loads a wallet");
+        assert!(starts_on(true, false, On, false), "SSF_CHIA_LANE=1 needs no switch");
+        assert!(starts_on(true, false, Unset, true), "the Bank's switch, remembered");
+        assert!(!starts_on(true, false, Unset, false), "never turned on");
+        assert!(!starts_on(true, false, Off, true), "SSF_CHIA_LANE=0 overrides the switch");
+        assert!(!starts_on(false, false, On, true), "a read-only build never loads a wallet");
     }
 
     #[test]
     fn a_turn_is_refused_only_against_the_build_or_the_environment() {
         use EnvSwitch::*;
-        assert_eq!(turn_refusal(true, Unset, true), None);
-        assert_eq!(turn_refusal(true, Unset, false), None);
-        assert_eq!(turn_refusal(true, Off, true), Some(OFF_WORDS));
-        assert_eq!(turn_refusal(true, Off, false), None, "clearing the switch under a hard off is harmless");
-        assert_eq!(turn_refusal(true, On, true), None, "remembering while held on is harmless");
-        assert_eq!(turn_refusal(true, On, false), Some(HELD_WORDS));
-        assert_eq!(turn_refusal(false, Unset, true), Some(UNBUILT_WORDS));
-        assert_eq!(turn_refusal(false, Unset, false), Some(UNBUILT_WORDS));
+        assert_eq!(turn_refusal(true, false, Unset, true), None);
+        assert_eq!(turn_refusal(true, false, Unset, false), None);
+        assert_eq!(turn_refusal(true, false, Off, true), Some(OFF_WORDS));
+        assert_eq!(turn_refusal(true, false, Off, false), None, "clearing the switch under a hard off is harmless");
+        assert_eq!(turn_refusal(true, false, On, true), None, "remembering while held on is harmless");
+        assert_eq!(turn_refusal(true, false, On, false), Some(HELD_WORDS));
+        assert_eq!(turn_refusal(false, false, Unset, true), Some(UNBUILT_WORDS));
+        assert_eq!(turn_refusal(false, false, Unset, false), Some(UNBUILT_WORDS));
     }
 
     #[test]
     fn the_dish_points_at_the_bank_unless_the_environment_holds_the_wallet_off() {
-        let ready = no_wallet_words(EnvSwitch::Unset, "take or give");
+        let ready = no_wallet_words(false, EnvSwitch::Unset, "take or give");
         assert!(ready.contains("🏦 BANK") && ready.ends_with("to take or give"), "{ready}");
         assert!(!ready.contains("SSF_CHIA_LANE"), "a player is not told about environment variables: {ready}");
-        let off = no_wallet_words(EnvSwitch::Off, "give");
+        let off = no_wallet_words(false, EnvSwitch::Off, "give");
         assert!(off.contains("SSF_CHIA_LANE") && off.ends_with("cannot give"), "{off}");
         assert!(!off.contains("BANK"), "the Bank cannot help under a hard off: {off}");
     }
@@ -880,24 +963,24 @@ mod tests {
         let memo = |remembered, error: Option<&str>| SwitchMemo { remembered, error: error.map(str::to_string) };
         let identity = KeyFacts { identity_on_disk: true, ..KeyFacts::default() };
         let none = KeyFacts::default();
-        let v = view(false, On, false, &memo(true, Some("x")), &identity);
+        let v = view(false, false, On, false, &memo(true, Some("x")), &identity);
         assert_eq!(v, sw(WalletState::Unbuilt));
-        let v = view(true, Off, false, &memo(true, Some("x")), &identity);
+        let v = view(true, false, Off, false, &memo(true, Some("x")), &identity);
         assert_eq!(v, sw(WalletState::Off));
-        let v = view(true, Unset, false, &memo(false, None), &identity);
+        let v = view(true, false, Unset, false, &memo(false, None), &identity);
         assert_eq!(v, WalletSwitch { seed: true, mnemonic: true, ..sw(WalletState::Ready) });
-        let v = view(true, Unset, false, &memo(false, Some("disk full")), &none);
+        let v = view(true, false, Unset, false, &memo(false, Some("disk full")), &none);
         assert_eq!(v.error.as_deref(), Some("disk full"), "a failed turn says why");
-        let v = view(true, Unset, true, &memo(true, None), &identity);
+        let v = view(true, false, Unset, true, &memo(true, None), &identity);
         assert_eq!(v, WalletSwitch { stays: true, ..sw(WalletState::On) });
-        let v = view(true, Unset, true, &memo(false, None), &identity);
+        let v = view(true, false, Unset, true, &memo(false, None), &identity);
         assert!(!v.stays, "turned off in the Bank: on until the node stops");
-        let v = view(true, On, true, &memo(false, None), &identity);
+        let v = view(true, false, On, true, &memo(false, None), &identity);
         assert!(v.stays && v.held, "held on by SSF_CHIA_LANE=1");
 
-        let json = serde_json::to_string(&view(true, Unset, false, &memo(false, None), &none)).unwrap();
+        let json = serde_json::to_string(&view(true, false, Unset, false, &memo(false, None), &none)).unwrap();
         assert_eq!(json, r#"{"state":"ready","mnemonic":true}"#, "flags ride only when set; Ready says TURN ON makes 24 words");
-        let json = serde_json::to_string(&view(true, On, true, &memo(false, Some("e")), &none)).unwrap();
+        let json = serde_json::to_string(&view(true, false, On, true, &memo(false, Some("e")), &none)).unwrap();
         assert_eq!(json, r#"{"state":"on","stays":true,"held":true,"error":"e"}"#);
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"unbuilt"}"#).unwrap();
         assert_eq!(back.state, WalletState::Unbuilt);
@@ -953,22 +1036,22 @@ mod tests {
         let legacy = KeyFacts { legacy_on_disk: true, ..KeyFacts::default() };
 
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
-        assert_eq!(json(&view(true, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true,"mnemonic":true}"#);
-        let v = view(true, Unset, false, &memo(false), &all);
+        assert_eq!(json(&view(true, false, Unset, false, &memo(false), &legacy)), r#"{"state":"ready","legacy":true,"mnemonic":true}"#);
+        let v = view(true, false, Unset, false, &memo(false), &all);
         assert_eq!(json(&v), r#"{"state":"ready","seed":true,"mnemonic":true}"#, "an identity on disk wins: turning on loads it, and retires the raw seed");
-        for state in [view(false, Unset, false, &memo(true), &all), view(true, Off, false, &memo(true), &all)] {
+        for state in [view(false, false, Unset, false, &memo(true), &all), view(true, false, Off, false, &memo(true), &all)] {
             assert_eq!(json(&state), format!(r#"{{"state":"{}"}}"#, if state.state == WalletState::Off { "off" } else { "unbuilt" }));
         }
 
         let reminted = KeyFacts { mnemonic: true, reminted: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#);
+        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &reminted)), r#"{"state":"on","stays":true,"mnemonic":true,"reminted":true,"at_rest":"none"}"#);
         let saved = KeyFacts { mnemonic: true, backed_up: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#);
-        let v = view(true, On, true, &memo(false), &all);
+        assert_eq!(json(&view(true, false, Unset, true, &memo(true), &saved)), r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"none"}"#);
+        let v = view(true, false, On, true, &memo(false), &all);
         assert_eq!(json(&v), r#"{"state":"on","stays":true,"held":true,"mnemonic":true,"backed_up":true,"reminted":true,"at_rest":"none"}"#);
-        let v = view(true, Unset, true, &memo(true), &KeyFacts { backed_up: true, ..KeyFacts::default() });
+        let v = view(true, false, Unset, true, &memo(true), &KeyFacts { backed_up: true, ..KeyFacts::default() });
         assert!(!v.backed_up, "backed up means these words, which a wallet not made from them has not");
-        assert!(!view(true, Unset, true, &memo(true), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }).seed);
+        assert!(!view(true, false, Unset, true, &memo(true), &KeyFacts { identity_on_disk: true, legacy_on_disk: true, ..KeyFacts::default() }).seed);
 
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true}"#).unwrap();
         assert!(back.mnemonic && !back.backed_up);
@@ -986,19 +1069,19 @@ mod tests {
         let json = |v: &WalletSwitch| serde_json::to_string(v).unwrap();
         let clear = KeyFacts { mnemonic: true, at_rest_next: Some(AtRest::Dpapi), ..KeyFacts::default() };
         assert_eq!(
-            json(&view(true, Unset, true, &memo, &clear)),
+            json(&view(true, false, Unset, true, &memo, &clear)),
             r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none","at_rest_next":"dpapi"}"#
         );
         let locked = KeyFacts { mnemonic: true, backed_up: true, at_rest: AtRest::Dpapi, at_rest_next: Some(AtRest::Dpapi), rewrapped: true, ..KeyFacts::default() };
         assert_eq!(
-            json(&view(true, Unset, true, &memo, &locked)),
+            json(&view(true, false, Unset, true, &memo, &locked)),
             r#"{"state":"on","stays":true,"mnemonic":true,"backed_up":true,"at_rest":"dpapi","rewrapped":true}"#,
             "a locked file has no lock to come"
         );
         let linux = KeyFacts { mnemonic: true, ..KeyFacts::default() };
-        assert_eq!(json(&view(true, Unset, true, &memo, &linux)), r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none"}"#);
+        assert_eq!(json(&view(true, false, Unset, true, &memo, &linux)), r#"{"state":"on","stays":true,"mnemonic":true,"at_rest":"none"}"#);
         // Not loaded, or not from 24 words: nothing to say about its file.
-        for v in [view(true, Unset, false, &memo, &locked), view(true, Unset, true, &memo, &KeyFacts { mnemonic: false, ..locked })] {
+        for v in [view(true, false, Unset, false, &memo, &locked), view(true, false, Unset, true, &memo, &KeyFacts { mnemonic: false, ..locked })] {
             assert!(v.at_rest.is_none() && v.at_rest_next.is_none() && !v.rewrapped, "{v:?}");
         }
         let back: WalletSwitch = serde_json::from_str(r#"{"state":"on","mnemonic":true}"#).unwrap();
@@ -1155,7 +1238,7 @@ mod tests {
         assert!(BACKUP_PAGE_ONLY.contains("SSF_BANK_DEV_PAGES") && BACKUP_PAGE_ONLY.contains("24 words"));
         assert!(BACKUP_TURNING.contains("SHOW again") && BACKUP_KEY_CHANGED.contains("SHOW again"));
         assert!(BACKUP_NOT_SHOWN.contains("tap SHOW first"));
-        for w in [BACKUP_PAGE_ONLY, BACKUP_TURNING, BACKUP_NOT_ON, BACKUP_SAVED, BACKUP_MISMATCH, BACKUP_KEY_CHANGED, BACKUP_NOT_SHOWN, BACKUP_UNREADABLE, BACKUP_BAD_ASK] {
+        for w in [BACKUP_PAGE_ONLY, BACKUP_TURNING, BACKUP_NOT_ON, BACKUP_SAVED, BACKUP_MISMATCH, BACKUP_KEY_CHANGED, BACKUP_NOT_SHOWN, BACKUP_UNREADABLE, BACKUP_BAD_ASK, BACKUP_NATIVE_ONLY, GATED_WORDS] {
             assert!(!w.contains('"') && !w.contains('\\'), "plain words in a JSON string: {w}");
         }
     }
@@ -1168,18 +1251,18 @@ mod tests {
     #[test]
     fn with_no_wallet_loaded_a_words_ask_is_turning_or_not_on() {
         for ask in [WordsAsk::Reveal, WordsAsk::Saved(7)] {
-            assert_eq!(words_step::<()>(ask, None, true), WordsStep::Refuse(WordsRefusal::Turning), "{ask:?}");
-            assert_eq!(words_step::<()>(ask, None, false), WordsStep::Refuse(WordsRefusal::NotOn), "{ask:?}");
+            assert_eq!(words_step::<()>(ask, None, true, true), WordsStep::Refuse(WordsRefusal::Turning), "{ask:?}");
+            assert_eq!(words_step::<()>(ask, None, false, true), WordsStep::Refuse(WordsRefusal::NotOn), "{ask:?}");
         }
         // A turn beside a loaded wallet (KEEP IT ON) is not "turning": the
         // key never changes in a run once loaded.
-        assert_eq!(words_step(WordsAsk::Saved(7), Some(((), meta(true, false))), true), WordsStep::SavedIdempotent);
-        assert_eq!(words_step(WordsAsk::Reveal, Some(("key", meta(false, false))), true), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
+        assert_eq!(words_step(WordsAsk::Saved(7), Some(((), meta(true, false))), true, true), WordsStep::SavedIdempotent);
+        assert_eq!(words_step(WordsAsk::Reveal, Some(("key", meta(false, false))), true, true), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
     }
 
     #[test]
     fn a_reveal_reads_the_file_until_the_words_are_marked_saved() {
-        let step = |m| words_step(WordsAsk::Reveal, Some(("key", m)), false);
+        let step = |m| words_step(WordsAsk::Reveal, Some(("key", m)), false, true);
         assert_eq!(step(meta(false, false)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 });
         assert_eq!(step(meta(false, true)), WordsStep::ReadFile { wallet: "key", fingerprint: 7 }, "shown again until saved");
         assert_eq!(step(meta(true, false)), WordsStep::Refuse(WordsRefusal::AlreadySaved), "saved: never shown again");
@@ -1218,7 +1301,7 @@ mod tests {
         ];
         for ((asked, backed_up, revealed), want) in table {
             assert_eq!(
-                words_step(WordsAsk::Saved(asked), Some(((), meta(backed_up, revealed))), false),
+                words_step(WordsAsk::Saved(asked), Some(((), meta(backed_up, revealed))), false, true),
                 want,
                 "key {asked}, backed_up {backed_up}, revealed {revealed}"
             );
@@ -1228,6 +1311,7 @@ mod tests {
     #[test]
     fn a_words_refusal_is_a_409_and_only_the_saved_one_says_saved() {
         let cases = [
+            (WordsRefusal::NativeOnly, BACKUP_NATIVE_ONLY),
             (WordsRefusal::Turning, BACKUP_TURNING),
             (WordsRefusal::NotOn, BACKUP_NOT_ON),
             (WordsRefusal::AlreadySaved, BACKUP_SAVED),
@@ -1291,5 +1375,116 @@ mod tests {
         assert_eq!(words_allow_origin(false, Some("https://example.com"), false), None, "a 403 a website cannot read");
         assert_eq!(words_allow_origin(false, None, false), None);
         assert_eq!(words_allow_origin(true, None, false), None);
+    }
+
+    /// ⛓️ The gate is the network's (`!ChiaNet::wallet_allowed()`): mainnet
+    /// starts no wallet whatever SSF_CHIA_LANE or the remembered switch says.
+    #[test]
+    fn a_gated_network_never_starts_a_wallet() {
+        use crate::chia_network::ChiaNet;
+        use EnvSwitch::*;
+        for net in ChiaNet::ALL {
+            let gate = !net.wallet_allowed();
+            for env in [Unset, On, Off] {
+                for remembered in [false, true] {
+                    let ungated = starts_on(true, false, env, remembered);
+                    assert_eq!(starts_on(true, gate, env, remembered), ungated && net.wallet_allowed(), "{net:?} {env:?} {remembered}");
+                }
+            }
+        }
+        assert!(!starts_on(true, true, On, true), "SSF_CHIA_LANE=1 does not lift the gate");
+        assert!(!starts_on(true, true, Unset, true), "a remembered switch does not lift it");
+        assert!(starts_on(true, !ChiaNet::Testnet11.wallet_allowed(), On, false), "testnet11 is not gated");
+    }
+
+    #[test]
+    fn a_gated_network_refuses_every_turn() {
+        use EnvSwitch::*;
+        for env in [Unset, On, Off] {
+            for on in [true, false] {
+                assert_eq!(turn_refusal(true, true, env, on), Some(GATED_WORDS), "{env:?} on={on}");
+                assert_eq!(turn_refusal(false, true, env, on), Some(UNBUILT_WORDS), "the build is said first");
+            }
+        }
+        assert_eq!(GATED_WORDS, "This node runs on Chia mainnet, where Star Station makes no SSF wallet yet.");
+    }
+
+    #[test]
+    fn a_gated_network_reads_as_gated_with_no_flags() {
+        use EnvSwitch::*;
+        let memo = SwitchMemo { remembered: true, error: Some("x".into()) };
+        let all = KeyFacts { identity_on_disk: true, legacy_on_disk: true, mnemonic: true, backed_up: true, reminted: true, ..KeyFacts::default() };
+        for env in [Unset, On, Off] {
+            for loaded in [false, true] {
+                let v = view(true, true, env, loaded, &memo, &all);
+                assert_eq!(v, sw(WalletState::Gated), "{env:?} loaded={loaded}");
+                assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"state":"gated"}"#);
+            }
+        }
+        assert_eq!(view(false, true, On, false, &memo, &all), sw(WalletState::Unbuilt), "a read-only build is unbuilt on any network");
+        let back: WalletSwitch = serde_json::from_str(r#"{"state":"gated"}"#).unwrap();
+        assert_eq!(back.state, WalletState::Gated);
+        let gated = no_wallet_words(true, EnvSwitch::Unset, "take a mojo");
+        assert_eq!(gated, "this node runs on Chia mainnet, where Star Station makes no SSF wallet yet, so it cannot take a mojo");
+        assert!(!gated.contains("BANK") && !gated.contains("SSF_CHIA_LANE"), "{gated}");
+        assert_eq!(no_wallet_words(true, EnvSwitch::Off, "give"), no_wallet_words(true, EnvSwitch::Unset, "give"), "the network is the reason");
+    }
+
+    /// 🏦 On a network that is not a test network, every words ask is
+    /// NativeOnly, ahead of every other rule: never ReadFile or WriteFlag,
+    /// the only steps that open a file, whatever wallet is loaded.
+    #[test]
+    fn off_a_test_network_a_words_ask_is_native_only_before_any_file_is_read() {
+        for ask in [WordsAsk::Reveal, WordsAsk::Saved(7), WordsAsk::Saved(8)] {
+            for turning in [false, true] {
+                assert_eq!(words_step::<()>(ask, None, turning, false), WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?}");
+                for (backed_up, revealed) in [(false, false), (false, true), (true, false), (true, true)] {
+                    let step = words_step(ask, Some(("key", meta(backed_up, revealed))), turning, false);
+                    assert_eq!(step, WordsStep::Refuse(WordsRefusal::NativeOnly), "{ask:?} {backed_up} {revealed}");
+                    let on_test = words_step(ask, Some(("key", meta(backed_up, revealed))), turning, true);
+                    assert_ne!(on_test, WordsStep::Refuse(WordsRefusal::NativeOnly), "a test network keeps its rules");
+                }
+            }
+        }
+        let (status, body) = WordsRefusal::NativeOnly.answer();
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(body, serde_json::json!({ "ok": false, "error": "On this network the desktop app will show the 24 words itself. This page cannot." }));
+    }
+
+    /// The route asks [`native_only`] before [`app_page`]: it takes no
+    /// origin and no dev pages, so no page and no SSF_BANK_DEV_PAGES lifts it.
+    #[test]
+    fn the_route_refuses_the_words_off_a_test_network_before_the_page_gate() {
+        for target in ["/api/chia/words", "/api/chia/words/saved?key=7"] {
+            assert_eq!(native_only(false, target), Some(WordsRefusal::NativeOnly.answer()), "{target}");
+            assert_eq!(native_only(true, target), None, "a test network goes on to the page gate: {target}");
+        }
+        for bad in ["/api/chia/words/", "/api/chia/words?x", "/api/chia/words/saved?key="] {
+            assert_eq!(native_only(false, bad), None, "an ask for nothing is still the gate's, then a 400: {bad}");
+        }
+
+        // The route's own decision, [`words_gate`], as main.rs matches it.
+        let none: Vec<String> = vec![];
+        let dev = dev_pages_of(Some(OsStr::new("http://localhost:5173")));
+        let host = Some("127.0.0.1:8080");
+        let origins = [None, Some("tauri://localhost"), Some("http://localhost:5173"), Some("https://example.com")];
+        for pages in [&none, &dev] {
+            for origin in origins {
+                for target in ["/api/chia/words", "/api/chia/words/saved?key=7"] {
+                    assert_eq!(
+                        words_gate(false, target, origin, host, 8080, pages),
+                        WordsGate::NativeOnly(WordsRefusal::NativeOnly.answer()),
+                        "{target} {origin:?} {pages:?}"
+                    );
+                    let page = if app_page(origin, host, 8080, pages) { WordsGate::Pass } else { WordsGate::Forbidden };
+                    assert_eq!(words_gate(true, target, origin, host, 8080, pages), page, "a test network keeps the page gate");
+                }
+                let page = if app_page(origin, host, 8080, pages) { WordsGate::Pass } else { WordsGate::Forbidden };
+                assert_eq!(words_gate(false, "/api/chia/words/", origin, host, 8080, pages), page, "an ask for nothing is the gate's");
+            }
+        }
+        assert_eq!(words_gate(true, "/api/chia/words", Some("tauri://localhost"), host, 8080, &none), WordsGate::Pass);
+        assert_eq!(words_gate(true, "/api/chia/words", Some("http://localhost:5173"), host, 8080, &dev), WordsGate::Pass);
+        assert_eq!(words_gate(true, "/api/chia/words", Some("https://example.com"), host, 8080, &dev), WordsGate::Forbidden);
     }
 }
