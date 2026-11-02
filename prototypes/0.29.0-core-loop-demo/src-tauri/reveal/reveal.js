@@ -10,7 +10,8 @@
 // - the words go into text nodes of a list that cannot be selected, and
 //   copying is cancelled;
 // - they hide on HIDE, after five minutes on either clock, when the window
-//   loses focus, when it is hidden and when it closes;
+//   loses focus, when it is hidden, when it closes and before a print, and
+//   the print shortcut is cancelled (reveal.css prints nothing of the page);
 // - I SAVED arms CONFIRM, which needs a fresh click of its own; SHOW puts
 //   CONFIRM back to I SAVED.
 // The words come from the app on every SHOW and are never stored. The page
@@ -223,10 +224,18 @@
     confirmSaved();
   });
 
-  // A held Enter or Space must not press SHOW or CONFIRM again.
+  // A held Enter or Space must not press SHOW or CONFIRM again, and the
+  // print shortcut does not print this page (paper only means the player's
+  // own hand, not a printer or a print-to-file).
   document.addEventListener(
     'keydown',
     (event) => {
+      if ((event.ctrlKey || event.metaKey) && typeof event.key === 'string' && event.key.toLowerCase() === 'p') {
+        event.preventDefault();
+        event.stopPropagation();
+        hide();
+        return;
+      }
       const held = event.repeat && (event.key === 'Enter' || event.key === ' ');
       if (held && (event.target === showButton || event.target === savedButton)) event.preventDefault();
     },
@@ -241,6 +250,9 @@
   });
   window.addEventListener('pagehide', () => hide());
   window.addEventListener('beforeunload', () => hide());
+  // A print that starts anyway finds the words masked; reveal.css also
+  // leaves the page out of any printout.
+  window.addEventListener('beforeprint', () => hide());
 
   // Paper only: no copy, no cut, no drag, no selection, no context menu.
   for (const name of ['copy', 'cut', 'dragstart', 'contextmenu']) {

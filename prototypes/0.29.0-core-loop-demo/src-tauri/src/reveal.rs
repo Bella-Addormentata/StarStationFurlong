@@ -796,7 +796,8 @@ mod tests {
     }
 
     /// The built-in page: no inline script, no event-handler attribute, no
-    /// web URL, nothing that reaches the clipboard or Tauri's events.
+    /// web URL, nothing that reaches the clipboard or Tauri's events, and
+    /// nothing that reaches a printer.
     #[test]
     fn the_built_in_assets_hold_no_inline_script_url_clipboard_or_event() {
         let html = std::str::from_utf8(INDEX_HTML).unwrap();
@@ -804,7 +805,7 @@ mod tests {
         let css = std::str::from_utf8(REVEAL_CSS).unwrap();
         for (name, text) in [("index.html", html), ("reveal.js", js), ("reveal.css", css)] {
             let lower = text.to_ascii_lowercase();
-            for banned in ["http://", "https://", "clipboard", "writetext", "emit", "javascript:", "data:", "eval(", "new function", "innerhtml", "outerhtml", "insertadjacenthtml", "document.write", "localstorage", "sessionstorage", "indexeddb", "fetch(", "xmlhttprequest", "window.open", "@import", "url("] {
+            for banned in ["http://", "https://", "clipboard", "writetext", "emit", "javascript:", "data:", "eval(", "new function", "innerhtml", "outerhtml", "insertadjacenthtml", "document.write", "localstorage", "sessionstorage", "indexeddb", "fetch(", "xmlhttprequest", "window.open", "print(", "@import", "url("] {
                 assert!(!lower.contains(banned), "{name} holds {banned:?}");
             }
         }
@@ -846,6 +847,22 @@ mod tests {
         asked.sort();
         assert_eq!(asked, ["backup_reveal", "backup_saved"]);
         assert_eq!(js.matches("invoke(").count(), 1, "one call into the app, inside ask");
+        // Nothing of the page reaches a printer or a print-to-file: the
+        // stylesheet prints no page, a print that starts anyway finds the
+        // words masked, and the print shortcut is cancelled before it acts.
+        let print = css.find("@media print").expect("a print rule");
+        let rule = &css[print..];
+        let rule = &rule[..rule.find("\n}").expect("the print rule's end")];
+        assert!(rule.contains("main { display: none !important; }"), "the print rule leaves the page out");
+        assert!(js.contains("window.addEventListener('beforeprint', () => hide());"), "a print hides the words first");
+        let keys = js.find("document.addEventListener(\n    'keydown',").expect("the keydown listener");
+        let keys = &js[keys..];
+        let keys = &keys[..keys.find("\n    true,\n  );").expect("a capturing keydown listener")];
+        let shortcut = keys.find("event.key.toLowerCase() === 'p'").expect("the print shortcut is caught");
+        assert!(keys[..shortcut].contains("(event.ctrlKey || event.metaKey)"), "with Ctrl or Cmd");
+        let after = &keys[shortcut..];
+        let stop = after.find("event.preventDefault();").expect("the print shortcut is cancelled");
+        assert!(stop < after.find("return;").expect("and goes no further"));
     }
 
     /// The page keeps the Bank's rules (bankBackup.ts, main.ts): HIDE acts

@@ -54,3 +54,8 @@ button {
 }
 button[disabled] { opacity: 0.45; cursor: default; }
 button.danger { background: var(--danger); }
+/* Paper only, by hand: a printout (or a print to file) holds nothing. */
+@media print {
+  html, body { background: none; }
+  main { display: none !important; }
+}
