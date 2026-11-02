@@ -422,6 +422,11 @@ impl Lane {
         }
     }
 
+    /// The startup warnings for this lane's pins ([`pin_port_warnings`]).
+    pub fn pin_port_warnings(&self) -> Vec<String> {
+        pin_port_warnings(&self.pins, self.pin_only, &self.net)
+    }
+
     async fn tls(&self) -> Result<Arc<rustls::ClientConfig>, ChainError> {
         self.tls
             .get_or_try_init(|| async {
@@ -1960,6 +1965,83 @@ fn admitted(state: &LaneState, addr: SocketAddr) -> bool {
 #[cfg(not(test))]
 fn admitted(_: &LaneState, addr: SocketAddr) -> bool {
     public(addr)
+}
+
+/// What a pin says about its port, read the way [`resolve_pin`] reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum PinPort {
+    /// A bare IP or host name: it takes the network's port.
+    None,
+    /// `ip:port`, `[v6]:port` or `host:port`.
+    Port(u16),
+    /// Text after the last `:` that is not a port number, such as
+    /// `host:84444` or `host:8444x`. [`resolve_pin`] adds the
+    /// network's port after it, and that name never resolves.
+    Unreadable,
+}
+
+fn pin_port(pin: &str) -> PinPort {
+    if let Ok(addr) = pin.parse::<SocketAddr>() {
+        return PinPort::Port(addr.port());
+    }
+    if pin.parse::<IpAddr>().is_ok() {
+        return PinPort::None;
+    }
+    match pin.rsplit_once(':') {
+        Some((host, p)) if !host.contains(':') => match p.parse::<u16>() {
+            Ok(port) => PinPort::Port(port),
+            Err(_) => PinPort::Unreadable,
+        },
+        // `[v6]:port` that did not read as an address above: [`resolve_pin`]
+        // adds a second port after it, so it never resolves either.
+        Some((host, _)) if host.starts_with('[') && host.ends_with(']') => PinPort::Unreadable,
+        _ => PinPort::None,
+    }
+}
+
+/// One startup warning for each pin that names a port other than `net`'s.
+/// The port alone does not decide the network: the handshake and the
+/// genesis check do, so a pin forwarded to another port can still serve
+/// `net`, and the line says only that a full node of another network there
+/// is refused. A pin whose port cannot be read gets its own line, since it
+/// never connects. In pin-only mode with no pin on the network's port, no
+/// other peer is dialed: each line then says chain writes will fail when
+/// every pin's port is unreadable, and that they work only if a pin on
+/// another port serves `net` otherwise. A pin without a port takes the
+/// network's and never warns. Pure, so a test can run it for both networks.
+pub fn pin_port_warnings(pins: &[String], pin_only: bool, net: &Network) -> Vec<String> {
+    let flagged: Vec<(&String, PinPort)> = pins
+        .iter()
+        .map(|pin| (pin, pin_port(pin)))
+        .filter(|(_, port)| match port {
+            PinPort::None => false,
+            PinPort::Port(p) => *p != net.port,
+            PinPort::Unreadable => true,
+        })
+        .collect();
+    let stranded = pin_only && !pins.is_empty() && flagged.len() == pins.len();
+    let unreachable = stranded && flagged.iter().all(|(_, port)| matches!(port, PinPort::Unreadable));
+    flagged
+        .into_iter()
+        .map(|(pin, port)| {
+            let mut line = match port {
+                PinPort::Port(port) => format!(
+                    "⛓️ Chain lane: the pin {pin} names port {port}, not {}'s port {}. If a full node of another network answers there, the handshake refuses it.",
+                    net.id, net.port
+                ),
+                _ => format!("⛓️ Chain lane: the pin {pin} names a port this node cannot read, so it never connects."),
+            };
+            if unreachable {
+                line.push_str(" SSF_CHIA_PIN_ONLY dials no other peer, so chain writes will fail.");
+            } else if stranded {
+                line.push_str(&format!(
+                    " SSF_CHIA_PIN_ONLY dials no other peer, so chain writes work only if a pin on another port serves {}.",
+                    net.id
+                ));
+            }
+            line
+        })
+        .collect()
 }
 
 /// A pin as typed: `ip:port`, a bare IP (the network's port), or a host name
@@ -5274,6 +5356,90 @@ mod tests {
         assert_eq!(resolve_pin("[2001:db8::1]:8444", 58444).await, vec!["[2001:db8::1]:8444".parse().unwrap()]);
         let local = resolve_pin("localhost:1234", 58444).await;
         assert!(local.iter().all(|a| a.port() == 1234 && a.ip().is_loopback()), "{local:?}");
+    }
+
+    /// Pins on another port than the network's get one warning line each,
+    /// on either network. The line never claims such a pin is on another
+    /// network, since a forwarded port can serve this one. Pin-only mode with
+    /// no pin on the right port says chain writes work only if one of them
+    /// serves the network, and says they will fail only when no pin's port
+    /// can be read. A pin without a port never warns.
+    #[test]
+    fn a_pin_on_another_networks_port_is_warned_about() {
+        let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (net, other) in [(Network::testnet11(), 8444u16), (Network::mainnet(), 58444u16)] {
+            let right = net.port;
+            assert!(pin_port_warnings(&[], true, &net).is_empty(), "no pins, nothing to say");
+            let ok = pins(&["203.0.113.5", "localhost", &format!("203.0.113.6:{right}"), &format!("[2001:db8::1]:{right}")]);
+            assert!(pin_port_warnings(&ok, false, &net).is_empty(), "{}", net.id);
+            assert!(pin_port_warnings(&ok, true, &net).is_empty(), "{}", net.id);
+
+            let mixed = pins(&[&format!("203.0.113.5:{other}"), "203.0.113.6", &format!("localhost:{other}")]);
+            let lines = pin_port_warnings(&mixed, true, &net);
+            assert_eq!(lines.len(), 2, "one line per wrong pin: {lines:?}");
+            assert_eq!(
+                lines[0],
+                format!(
+                    "⛓️ Chain lane: the pin 203.0.113.5:{other} names port {other}, not {}'s port {right}. If a full node of another network answers there, the handshake refuses it.",
+                    net.id
+                )
+            );
+            assert!(lines[1].contains(&format!("the pin localhost:{other} names")), "{}", lines[1]);
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "a pin on the right port is left: {lines:?}");
+
+            let stranded = pins(&[&format!("203.0.113.5:{other}"), &format!("[2001:db8::1]:{other}")]);
+            let lines = pin_port_warnings(&stranded, true, &net);
+            assert_eq!(lines.len(), 2);
+            let only_if = format!(" SSF_CHIA_PIN_ONLY dials no other peer, so chain writes work only if a pin on another port serves {}.", net.id);
+            assert!(lines.iter().all(|l| l.ends_with(&only_if)), "a forwarded port may still serve this network: {lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("will fail")), "{lines:?}");
+            let lines = pin_port_warnings(&stranded, false, &net);
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "public peers still answer: {lines:?}");
+            assert!(lines.iter().chain(pin_port_warnings(&stranded, true, &net).iter()).all(|l| !l.contains('\u{2014}')));
+        }
+        // A port that cannot be read never connects, so it is warned about
+        // and does not count as a pin on the network's port.
+        for net in [Network::testnet11(), Network::mainnet()] {
+            let unreadable = |pin: &str| format!("⛓️ Chain lane: the pin {pin} names a port this node cannot read, so it never connects.");
+            for bad in ["203.0.113.5:84444", "host:58444x", "[2001:db8::1]:84444"] {
+                assert_eq!(pin_port_warnings(&pins(&[bad]), false, &net), vec![unreadable(bad)], "{bad} on {}", net.id);
+                assert_eq!(
+                    pin_port_warnings(&pins(&[bad]), true, &net),
+                    vec![format!("{} SSF_CHIA_PIN_ONLY dials no other peer, so chain writes will fail.", unreadable(bad))],
+                    "{bad} on {}",
+                    net.id
+                );
+            }
+            let other = if net.port == 8444 { 58444 } else { 8444 };
+            let mixed = pins(&["203.0.113.5:84444", &format!("203.0.113.6:{other}")]);
+            let lines = pin_port_warnings(&mixed, true, &net);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].starts_with(&unreadable("203.0.113.5:84444")), "{}", lines[0]);
+            assert!(lines[1].contains(&format!("names port {other}")), "{}", lines[1]);
+            assert!(
+                lines.iter().all(|l| l.ends_with(&format!("so chain writes work only if a pin on another port serves {}.", net.id))),
+                "the readable pin on another port may still serve this network: {lines:?}"
+            );
+            let all_bad = pins(&["203.0.113.5:84444", "host:58444x"]);
+            let lines = pin_port_warnings(&all_bad, true, &net);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines.iter().all(|l| l.ends_with("so chain writes will fail.")), "no pin can connect: {lines:?}");
+            let lines = pin_port_warnings(&mixed, false, &net);
+            assert!(lines.iter().all(|l| !l.contains("SSF_CHIA_PIN_ONLY")), "{lines:?}");
+            let with_good = pins(&["host:58444x", &format!("203.0.113.6:{}", net.port)]);
+            assert_eq!(pin_port_warnings(&with_good, true, &net), vec![unreadable("host:58444x")], "a pin on the right port is left");
+        }
+        assert_eq!(pin_port("203.0.113.5:84444"), PinPort::Unreadable);
+        assert_eq!(pin_port("host:58444x"), PinPort::Unreadable);
+        assert_eq!(pin_port("localhost"), PinPort::None);
+        assert_eq!(pin_port("2001:db8::1"), PinPort::None);
+        assert_eq!(pin_port("[2001:db8::1]:8444"), PinPort::Port(8444));
+        assert_eq!(pin_port("localhost:1234"), PinPort::Port(1234));
+
+        // The lane says the same of its own pins.
+        let lane = Lane::new(Network::mainnet(), pins(&["203.0.113.5:58444"]), true, None);
+        assert_eq!(lane.pin_port_warnings(), pin_port_warnings(&pins(&["203.0.113.5:58444"]), true, &Network::mainnet()));
+        assert_eq!(lane.pin_port_warnings().len(), 1);
     }
 
     #[test]

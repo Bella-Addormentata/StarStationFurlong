@@ -41,6 +41,7 @@ use chia_protocol::{
     RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader,
 };
 use chia_traits::Streamable;
+use crate::chia_network::ChiaNet;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -96,13 +97,38 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn testnet11() -> Self {
-        Self {
-            id: "testnet11".to_string(),
-            genesis: chia_sdk_types::TESTNET11_CONSTANTS.genesis_challenge,
-            port: crate::chia_network::ChiaNet::Testnet11.port(),
-            introducers: vec!["dns-introducer-testnet11.chia.net".to_string()],
+    /// The peer network of `net`. The handshake id is the name Chia's own
+    /// full nodes give their network (`selected_network` in their config):
+    /// a peer that names another is refused at the handshake, and one whose
+    /// block 0 descends from another genesis challenge after it. Each network
+    /// has one introducer, the one the Chia project runs (the External
+    /// Infrastructure Register: §3 for testnet11, §4 for mainnet).
+    pub fn of(net: ChiaNet) -> Self {
+        match net {
+            ChiaNet::Testnet11 => Self {
+                id: "testnet11".to_string(),
+                genesis: chia_sdk_types::TESTNET11_CONSTANTS.genesis_challenge,
+                port: 58444,
+                introducers: vec!["dns-introducer-testnet11.chia.net".to_string()],
+            },
+            ChiaNet::Mainnet => Self {
+                id: "mainnet".to_string(),
+                genesis: chia_sdk_types::MAINNET_CONSTANTS.genesis_challenge,
+                port: 8444,
+                introducers: vec!["dns-introducer.chia.net".to_string()],
+            },
         }
+    }
+
+    pub fn testnet11() -> Self {
+        Self::of(ChiaNet::Testnet11)
+    }
+
+    /// Chia mainnet: real XCH. Selected only in a `chia-mainnet` build
+    /// (chia_network.rs), and a node there holds no SSF wallet yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mainnet() -> Self {
+        Self::of(ChiaNet::Mainnet)
     }
 }
 
@@ -1198,6 +1224,40 @@ mod tests {
         assert!(err.to_string().contains("not a full node"), "{err:#}");
     }
 
+    /// A mock full node on one of the two real networks: its handshake id
+    /// and its block 0, as a real full node of that network would answer.
+    async fn full_node_of(net: &Network) -> mock::MockNode {
+        spawn(&net.id, NodeType::FullNode, net.genesis, None, silent()).await
+    }
+
+    /// A testnet11 full node is refused by a lane bound to mainnet, and a
+    /// mainnet full node by a lane bound to testnet11, at the handshake; a
+    /// peer that names the right network but serves the other chain's block 0
+    /// is refused after it, at the genesis binding. The right pairs connect.
+    #[tokio::test]
+    async fn a_full_node_of_the_other_real_network_is_refused() {
+        let (testnet, mainnet) = (Network::testnet11(), Network::mainnet());
+        for (node_net, lane_net) in [(&testnet, &mainnet), (&mainnet, &testnet)] {
+            let node = full_node_of(node_net).await;
+            let err = PeerConn::connect(node.addr, Source::Introducer, lane_net, tls()).await.err().unwrap();
+            assert_eq!(
+                err.to_string(),
+                format!("peer is on network {:?}, not {}", node_net.id, lane_net.id),
+                "refused at the handshake"
+            );
+            assert_eq!(node.seen.lock().unwrap().clone(), vec![ProtocolMessageTypes::Handshake], "block 0 was never asked for");
+            // The handshake alone is advisory: the other chain's block 0
+            // under the right name is refused too.
+            let liar = spawn(&lane_net.id, NodeType::FullNode, node_net.genesis, None, silent()).await;
+            let err = PeerConn::connect(liar.addr, Source::Introducer, lane_net, tls()).await.err().unwrap();
+            assert!(err.to_string().contains("genesis challenge"), "{err:#}");
+            // The right pair connects.
+            let own = full_node_of(lane_net).await;
+            let conn = PeerConn::connect(own.addr, Source::Introducer, lane_net, tls()).await.unwrap();
+            assert!(conn.alive(), "{}", lane_net.id);
+        }
+    }
+
     #[tokio::test]
     async fn answers_find_their_requests_by_id() {
         let handler: Handler = Arc::new(|m| {
@@ -1300,5 +1360,35 @@ mod tests {
         assert_eq!(net.port, 58444);
         assert_eq!(net.genesis.to_string(), "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615");
         assert_eq!(net.introducers, vec!["dns-introducer-testnet11.chia.net"]);
+    }
+
+    /// The one literal test of mainnet's peer network: the handshake id
+    /// Chia's mainnet full nodes send, the genesis challenge of
+    /// MAINNET_CONSTANTS, port 8444 and Chia's own introducer, the only one.
+    #[test]
+    fn mainnet_is_chias_own_main_network() {
+        let net = Network::mainnet();
+        assert_eq!(net.id, "mainnet");
+        assert_eq!(net.port, 8444);
+        assert_eq!(net.genesis, chia_sdk_types::MAINNET_CONSTANTS.genesis_challenge);
+        assert_eq!(net.genesis.to_string(), "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb");
+        assert_eq!(net.introducers, vec!["dns-introducer.chia.net"], "Chia's own introducer and no third-party seeder");
+        assert_ne!(net, Network::testnet11());
+    }
+
+    /// Each peer network agrees with its `ChiaNet`: the id, the port and
+    /// the genesis the rest of the node uses.
+    #[test]
+    fn each_peer_network_matches_its_chia_net() {
+        for chia_net in ChiaNet::ALL {
+            let net = Network::of(chia_net);
+            assert_eq!(net.id, chia_net.id(), "{chia_net:?}");
+            assert_eq!(net.port, chia_net.port(), "{chia_net:?}");
+            assert_eq!(net.genesis, chia_net.constants().genesis_challenge, "{chia_net:?}");
+            assert_eq!(net.genesis.to_string(), chia_net.genesis_hex(), "{chia_net:?}");
+            assert_eq!(net.introducers.len(), 1, "{chia_net:?}");
+        }
+        assert_eq!(Network::of(ChiaNet::Testnet11), Network::testnet11());
+        assert_eq!(Network::of(ChiaNet::Mainnet), Network::mainnet());
     }
 }

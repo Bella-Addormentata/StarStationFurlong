@@ -543,9 +543,13 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 st.note = part.note;
             }
             None => {
+                // Under the gate the environment changes nothing, so it is
+                // not read.
+                let gate = !ctx.net.wallet_allowed();
+                let env = if gate { crate::chia_wallet_switch::EnvSwitch::Unset } else { crate::chia_wallet_switch::env_switch() };
                 st.note = crate::chia_wallet_switch::no_wallet_words(
-                    !ctx.net.wallet_allowed(),
-                    crate::chia_wallet_switch::env_switch(),
+                    gate,
+                    env,
                     if ctx.net.is_test() { "take or give" } else { "take a mojo" },
                 );
             }
@@ -1428,6 +1432,47 @@ mod tests {
         let (give, note) = network_part(ChiaNet::Mainnet, true, "no mojo in the dish yet".into());
         assert!(!give);
         assert_eq!(note, "no mojo in the dish yet. On mainnet the dish does not take gifts from this node.");
+    }
+
+    /// The status a mainnet node serves, end to end through `status`: a
+    /// full jar on the chain, and still no GIVE, with the network's note
+    /// after the reason this node holds no wallet. No wallet is held, as on a
+    /// gated node, so the wallet lease and the environment are never read.
+    #[test]
+    fn a_mainnet_status_offers_no_give_and_says_why() {
+        let params = test_params();
+        let coin = FaucetCoin { coin: Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000), confirmed_height: 100 };
+        let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
+        let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
+        let chain = crate::chia_chain::testing::Scripted::new(vec![page]).with_peak(200);
+        let rooms = Mutex::new(HashMap::new());
+        let ctx = FaucetContext {
+            net: ChiaNet::Mainnet,
+            rooms: &rooms,
+            #[cfg(feature = "chia-publish")]
+            wallet: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
+        assert_eq!((st.network, st.coins, st.ready, st.total_mojos), (ChiaNet::Mainnet, 1, 1, 1000), "the jar is read");
+        assert_eq!(st.address, params.address(ChiaNet::Mainnet));
+        assert!(st.address.starts_with("xch1"), "{}", st.address);
+        assert!(!st.can_give && !st.can_claim, "{st:?}");
+        assert!(st.note.ends_with(MAINNET_NO_GIVE), "{}", st.note);
+        #[cfg(feature = "chia-publish")]
+        assert_eq!(
+            st.note,
+            "this node runs on Chia mainnet, where Star Station makes no SSF wallet yet, so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
+        );
+        #[cfg(not(feature = "chia-publish"))]
+        assert_eq!(
+            st.note,
+            "this node was built without publishing; it can show the dish but not take or give. On mainnet the dish does not take gifts from this node."
+        );
+        assert!(st.snapshot > 0, "numbered as it completed");
+        for word in ["BANK", "SSF_CHIA_LANE"] {
+            assert!(!st.note.contains(word), "{}", st.note);
+        }
     }
 
     /// GIVE on mainnet is refused before the wallet or the chain is asked:

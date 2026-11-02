@@ -1520,8 +1520,27 @@ async fn query_ip_echo(host: &str) -> Result<std::net::Ipv4Addr> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ⛓️ The Chia network (chia_network.rs), read once and checked first: a
+    // value this build does not accept stops the node here, with one line and
+    // exit code 2, before it opens a file or binds a socket. A typo must never
+    // move the node to another chain.
+    let chia_net = match chia_network::startup(chia_network::selected()) {
+        Ok(line) => {
+            println!("{line}");
+            chia_network::net()
+        }
+        Err(line) => {
+            eprintln!("{line}");
+            std::process::exit(chia_network::EXIT_REFUSED);
+        }
+    };
     println!("🪐 StarStation Furlong — Standalone P2P Swarm Node");
     println!("📡 Initializing real-time networks...");
+    // Mainnet's own state files live in chia-mainnet/, made owner-only here
+    // (testnet11's stay at the data root and need nothing).
+    if let Err(e) = chia_network::make_state_dir(chia_net, std::path::Path::new(".")) {
+        eprintln!("⛓️ Chia network: could not make {}/ ({e}); this network's state files cannot be saved", chia_network::MAINNET_DIR);
+    }
 
     // 🧲 The torrent feature brings a second rustls crypto backend into the
     // build (librqbit's reqwest uses aws-lc-rs), and with two compiled in
@@ -1796,14 +1815,6 @@ async fn main() -> Result<()> {
         .collect();
     println!("   Advertised direct-addr hints: {:?}", iroh_direct_addrs);
 
-    // ⛓️ The Chia network (chia_network.rs), read once. A value this build
-    // cannot run on is said here, and the node stays on testnet11.
-    if let Some(line) = chia_network::refused_line(chia_network::selected()) {
-        eprintln!("{line}");
-    }
-    #[cfg_attr(not(feature = "chia-publish"), allow(unused_variables))]
-    let chia_net = chia_network::net();
-
     // 🏦 Whether the SSF wallet loads at this start (chia_wallet_switch.rs):
     // a network that allows no SSF wallet holds it off; then the environment
     // (`SSF_CHIA_LANE=1` on, any other value off), else the switch the
@@ -1827,11 +1838,18 @@ async fn main() -> Result<()> {
     // ⛓️ ChiaHub lane: crypto self-test + one status line saying what this build
     // does with the chain (reads on by default — #231 D3; publishing behind
     // the SSF wallet in a chia-publish build).
-    chia_lane::startup_status(&secret_key, &iroh_direct_addrs, wallet_starts);
+    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_starts);
     // S‑0 step 2: which full-node peers the chain lane will use, and the trust
     // posture money paths take (pins, pin-only, or two agreeing public peers).
     #[cfg(feature = "chia-read")]
     println!("⛓️ Chain lane: {}", chia_chain::describe());
+    // A pin on a port other than the network's may be a full node of
+    // another network, which the handshake refuses: one warning line for
+    // each, before the first chain request finds out.
+    #[cfg(feature = "chia-read")]
+    for line in chia_chain::pin_warnings() {
+        eprintln!("{line}");
+    }
 
     // ⛓️ ChiaHub lane C1 SLICE 2 (chia-publish feature): load/mint the node's
     // 24-word Chia identity and print its receive address to fund.
@@ -1850,7 +1868,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "chia-publish")]
     let mut startup_wallet_meta: Option<chia_wallet_switch::WalletMeta> = None;
     #[cfg(feature = "chia-publish")]
-    if !chia_wallet_switch::dev_pages().is_empty() {
+    if !chia_wallet_switch::dev_pages().is_empty() && !chia_net.is_test() {
+        // The page reveal is refused off a test network, dev pages or not.
+        println!(
+            "🏦 SSF wallet: SSF_BANK_DEV_PAGES is ignored on {}. Only the desktop app will show the 24 words here.",
+            chia_net.name()
+        );
+    } else if !chia_wallet_switch::dev_pages().is_empty() {
         println!(
             "🏦 SSF wallet: SSF_BANK_DEV_PAGES lets these browser pages show the 24 words: {}",
             chia_wallet_switch::dev_pages().join(", ")
@@ -3269,9 +3293,17 @@ async fn dial_peer_inner(
                 let keys = hub.peers.lock().unwrap().card_keys_of(&target_str);
                 if let Some((ck, kx)) = keys {
                     if !hub.knock_publishing.load(std::sync::atomic::Ordering::Relaxed) {
-                        println!(
-                            "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
-                        );
+                        if !chia_network::net().wallet_allowed() {
+                            // No Bank or environment can turn a wallet on here.
+                            println!(
+                                "⛓️ ChiaHub rung-6: {target_str} unreachable by every path. A knock through the chain would reach it, but a chain knock needs an SSF wallet, and on {} Star Station makes none yet (not queued)",
+                                chia_network::net().name()
+                            );
+                        } else {
+                            println!(
+                                "⛓️ ChiaHub rung-6: {target_str} unreachable by every path — a knock through the chain would reach it, but this node cannot write one: a chain knock needs the publish build with the SSF wallet on (the SpacePhone's Bank, or SSF_CHIA_LANE=1 on a headless node) and the watcher on (SSF_CHIA_WATCH not 0) (not queued)"
+                            );
+                        }
                         report_dial_status(&hub, &send, &room_id, &target_str, "failed", Some("no route; this node cannot knock (publishing or the watcher off)")).await;
                         return;
                     }

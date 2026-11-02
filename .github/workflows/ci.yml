@@ -1,7 +1,7 @@
 name: "✅ PR Checks"
 
 # PR-time compile gate — the checks we previously only ran by hand (or that the
-# release workflow only ran at tag time). Six lanes:
+# release workflow only ran at tag time). Seven lanes:
 #   1. Frontend `tsc --noEmit` — the repo's long-standing "tsc clean" bar.
 #   2. Frontend `npm test` (vitest) — treasury contract unit tests + the shared
 #      TS<->Rust golden vectors under test-vectors/treasury/.
@@ -17,13 +17,19 @@ name: "✅ PR Checks"
 #      set, with the TV's torrent lane (torrent_lane.rs + the forked librqbit
 #      crates under vendor/) — and a Windows `cargo check` of the same, since the
 #      torrent feature brings C code (aws-lc-sys) that only the release would
-#      otherwise compile on Windows.
+#      otherwise compile on Windows. Beside it, ⛓️ the dev-only `chia-mainnet`
+#      feature: its tests run with SSF_CHIA_NETWORK=mainnet set, which proves
+#      no test reads the network from the environment, and the release set
+#      is checked with it added.
 #   6. 🏦 The SSF wallet's own tests (`chia_wallet*`, `chia_at_rest`) on Windows and macOS, and a
 #      macOS `cargo check` of the release set: the wallet's identity file is
 #      written with hard links, directory syncs and owner-only modes that differ
 #      per OS, and its at-rest protection (DPAPI on Windows, the keychain on
 #      macOS, #335 stage 1) is OS code no Linux run compiles. Without these a
 #      macOS path would first compile in the tag-time release.
+#   7. 🖥️ `cargo test` on the desktop shell (src-tauri) on Linux, with the
+#      WebKit/GTK libraries the release's Linux build installs: the sidecar
+#      spawn's own test (it must clear SSF_CHIA_NETWORK).
 
 on:
   pull_request:
@@ -97,6 +103,17 @@ jobs:
       - name: 🧪 cargo test --features chia-publish,torrent (the release set)
         run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
+      # ⛓️ Chia mainnet, a development build only (release.yml never names the
+      # feature): it compiles and passes, and with the variable set here every
+      # test still passes, so none reads the network from the environment.
+      - name: 🧪 SSF_CHIA_NETWORK=mainnet cargo test --features chia-publish,chia-mainnet
+        env:
+          SSF_CHIA_NETWORK: mainnet
+        run: cargo test --features chia-publish,chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: 🔎 cargo check --features chia-publish,torrent,chia-mainnet
+        run: cargo check --features chia-publish,torrent,chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
   node-check-windows:
     name: 🦀 Node cargo check on Windows (release features)
     runs-on: windows-latest # MSVC, as the release builds
@@ -144,3 +161,39 @@ jobs:
       # 🏦 The SSF wallet's tests on APFS and the macOS API.
       - name: 🧪 cargo test --features chia-publish,torrent chia_wallet chia_at_rest
         run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- chia_wallet chia_at_rest
+
+  tauri-shell-test:
+    name: 🖥️ Desktop shell cargo test (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v5
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/src-tauri -> target'
+          key: ubuntu-22.04
+
+      # The same list release.yml installs for the Linux app build.
+      - name: 🔧 Install the WebKit/GTK build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      # Stand-ins, so the shell compiles without the frontend or the node:
+      # tauri::generate_context! refuses a missing frontendDist (../dist), and
+      # tauri-build refuses a missing bundle.externalBin sidecar
+      # (binaries/ssf-p2p-node-<host triple>). Neither is run by the tests.
+      - name: 📁 Empty dist/ and a placeholder sidecar
+        shell: bash
+        run: |
+          mkdir -p "$RELEASE_FRONTEND/dist" "$RELEASE_FRONTEND/src-tauri/binaries"
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          touch "$RELEASE_FRONTEND/src-tauri/binaries/ssf-p2p-node-$triple"
+
+      - name: 🧪 cargo test (src-tauri)
+        run: cargo test --manifest-path ${{ env.RELEASE_FRONTEND }}/src-tauri/Cargo.toml
