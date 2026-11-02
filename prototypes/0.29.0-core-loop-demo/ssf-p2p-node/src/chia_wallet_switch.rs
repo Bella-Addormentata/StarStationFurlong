@@ -336,8 +336,9 @@ pub struct WalletSwitch {
 pub enum Backup {
     /// The desktop app, over its channel: the page reveal is refused.
     Native,
-    /// The page (the desktop app's own, or a named dev page), on a test
-    /// network with no channel.
+    /// A page whose origin `SSF_BANK_DEV_PAGES` names, on a test network
+    /// with no channel. The desktop app's own page is never shown the words
+    /// ([`app_page`]); the Bank there says why.
     Page,
     /// Neither: a network that is not a test network, with no channel.
     #[default]
@@ -509,7 +510,8 @@ pub fn words_asked(target: &str) -> Option<WordsAsk> {
 
 /// The exact origins of browser pages the operator lets show the 24 words
 /// (`SSF_BANK_DEV_PAGES`, comma-separated, such as `http://localhost:5173`
-/// for `tauri dev` or vite). Unset, only the desktop app's page may.
+/// for `tauri dev` or vite). Unset, no page may: the desktop app shows the
+/// words in its own window, never through a page.
 pub fn dev_pages_of(raw: Option<&OsStr>) -> Vec<String> {
     raw.and_then(OsStr::to_str)
         .map(|s| {
@@ -578,8 +580,8 @@ pub fn words_reply_head(status: &str, allow_origin: Option<&str>, len: usize) ->
 
 /// The words routes' refusals, in the Bank's words (a read-only build
 /// answers every ask that passes the gate with [`UNBUILT_WORDS`]).
-pub const BACKUP_PAGE_ONLY: &str = "only the Star Station desktop app's backup window can show the 24 words, \
-     from a node the app started itself (a browser page needs its origin in SSF_BANK_DEV_PAGES in the node's environment)";
+pub const BACKUP_PAGE_ONLY: &str = "this page cannot be shown the 24 words: the Star Station desktop app shows them \
+     in its own window (a browser page needs its origin in SSF_BANK_DEV_PAGES in the node's environment)";
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 pub const BACKUP_TURNING: &str = "the wallet is turning; tap SHOW again in a moment";
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]

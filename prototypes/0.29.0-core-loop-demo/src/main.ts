@@ -5064,8 +5064,9 @@ async function turnBankWallet(on: boolean): Promise<void> {
  *  every render, at every fingerprint round, on the phone's and the view's
  *  class changes and when the page is hidden). Opening the Bank resets it. */
 let bankBackup: BankBackupUi = { ...BACKUP_IDLE };
-/** Whether this page may be shown the words at all (the desktop app, or a
- *  loopback dev page the node lists): elsewhere BACK UP says to open the app. */
+/** Where this page runs (bankBackup.ts `backupPageKind`): the desktop app's
+ *  own page backs up through the app's window, a loopback dev page the node
+ *  lists may be shown the words, and elsewhere BACK UP says to open the app. */
 const bankBackupPage = backupPageKind(window.location);
 let bankBackupExpiryTimer = 0;
 let bankBackupClipTimer = 0;
