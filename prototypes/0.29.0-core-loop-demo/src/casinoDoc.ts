@@ -2446,10 +2446,16 @@ function houseSumTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger
 
 /** What puts a recovery in motion at incarnation `c`, read from the doc's
  *  checkpoint `cp` (null: none, or junk): this page's own chain first
- *  (chainTrigger), then the owner-signed checkpoint (houseSumTrigger). With
- *  no owner's checkpoint taking part this reads exactly as 6a-1 did. */
+ *  (chainTrigger), then the owner-signed checkpoint (houseSumTrigger) — except
+ *  an owner-signed end, which outranks the chain (F4). With no owner's
+ *  checkpoint taking part this reads exactly as 6a-1 did. */
 function recoveryTrigger(c: ComputedInc, cp: Checkpoint | null): RecoveryTrigger | null {
-  return chainTrigger(c, cp) ?? houseSumTrigger(c, cp);
+  const house = houseSumTrigger(c, cp);
+  // 🏛️ An owner-signed end outranks this page's own chain recovery: no honest
+  // page plays past an end, so a live head above it (a chain 'rewind' or 'jump')
+  // is a forged extension the owner's end undoes (F4).
+  if (house === 'end') return 'end';
+  return chainTrigger(c, cp) ?? house;
 }
 
 /** 🏛️ What a restore of incarnation `c` writes back (B14.2), for `trigger`:
@@ -3520,6 +3526,7 @@ export function putBackHouseRecords(now = Date.now()): number {
   // back when the doc's is gone, junk, or worse by order (§6.1). A present
   // worse value is an overwrite; three in a minute (B12) and this page stands
   // down for ten (houseSumBackoff, houseSumBackedOff → ⚙ PAGES DISAGREE).
+  let woke = false;
   for (const key of houseSumSeen.keys()) {
     const seen = houseSumSeen.get(key)!;
     // A handover ended the checker's authority: not this page's to defend.
@@ -3548,13 +3555,24 @@ export function putBackHouseRecords(now = Date.now()): number {
       hits.push(now);
       if (hits.length >= BACKOFF_COUNT) {
         houseSumBackoff.set(key, { hits, until: now + BACKOFF_MS });
+        // 🏛️ Wake the ⚙ card to show PAGES DISAGREE now: entering backoff writes
+        // no put-back, so without this the card holds its green label until an
+        // unrelated casino update. The touch is flushed below (woke) when no
+        // put-back transaction carries it.
+        viewTouched.add(`computed:${t}`);
+        woke = true;
         continue;
       }
       houseSumBackoff.set(key, { hits, until: 0 });
     }
     back.push([houseSumKey(t, inc), seen]);
   }
-  if (back.length === 0) return 0;
+  // 🏛️ Backoff touched the view but may have nothing to put back: with no
+  // transaction to fire the afterTransaction flush, tell the card now.
+  if (back.length === 0) {
+    if (woke) notify(takeTouched(new Set()));
+    return 0;
+  }
   boundDoc!.transact(() => {
     for (const [key, value] of back) map.set(key, value);
   });

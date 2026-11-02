@@ -994,10 +994,16 @@ export function houseSumDigest(ctx: FoldCtx, hs: Pick<HouseSum, 'b' | 'u' | 'l' 
 }
 
 /** The total order on hs: values (design §6.1), greater = the better check to
- *  keep: higher `u`; then lower digest; then lower `a`; then lower recHash of
- *  the whole value. Returns > 0 when `a` ranks above `b`, < 0 below, 0 equal. */
+ *  keep: higher `u`; then an end (e:1) over a live attestation at that round
+ *  (F4); then lower digest; then lower `a`; then lower recHash of the whole
+ *  value. Returns > 0 when `a` ranks above `b`, < 0 below, 0 equal. */
 export function compareHouseSum(ctx: FoldCtx, a: HouseSum, b: HouseSum): number {
   if (a.u !== b.u) return a.u > b.u ? 1 : -1;
+  // 🏛️ At the same round an end (e:1) outranks a live attestation, so a racing
+  // live trim can't bury the owner's signed end — F4 needs the end kept
+  // (houseSumSeen, D3 put-back).
+  const ae = a.e === 1, be = b.e === 1;
+  if (ae !== be) return ae ? 1 : -1;
   const da = houseSumDigest(ctx, a), db = houseSumDigest(ctx, b);
   if (da !== db) return da < db ? 1 : -1;
   if (a.a !== b.a) return a.a < b.a ? 1 : -1;

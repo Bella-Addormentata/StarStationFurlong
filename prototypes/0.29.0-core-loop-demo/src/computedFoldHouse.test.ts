@@ -714,6 +714,23 @@ describe('🏛️🧮 hs: — the owner-signed checkpoint check (PR 6a-2 C1)', (
     expect(compareHouseSum(HCTX, a0, a0)).toBe(0);
   });
 
+  it('ranks an end (e:1) above a live attestation at the same round (F4)', () => {
+    // Pick a round whose live/end digests fall so the live would win the plain
+    // digest tie-break — so this pins the end rule, not digest luck.
+    let live: HouseSum | undefined, end: HouseSum | undefined;
+    for (let k = 0; k < 64 && !live; k++) {
+      const c = kit.checkpoint(A, SID, 5, k.toString(16).padStart(2, '0') + 'a'.repeat(30), { [A.pid]: 100n });
+      const lv = kit.sign<HouseSum>('hsum', O, { v: 1, b: c.b, u: c.u, l: c.l, n: c.n, a: 0 });
+      const en = kit.sign<HouseSum>('hsum', O, { v: 1, b: c.b, u: c.u, l: c.l, n: c.n, e: 1, a: 0 });
+      if (houseSumDigest(HCTX, lv) < houseSumDigest(HCTX, en)) { live = lv; end = en; }
+    }
+    expect(live && end).toBeTruthy(); // a discriminating pair was found
+    // The live's digest is lower, so the old order (u, then digest) kept the
+    // live; the end now outranks it, so F4's signed end isn't buried.
+    expect(compareHouseSum(HCTX, end!, live!)).toBeGreaterThan(0);
+    expect(compareHouseSum(HCTX, live!, end!)).toBeLessThan(0);
+  });
+
   it('signBytes bind the room, table and incarnation', () => {
     const body = { v: 1, b: cp.b, u: cp.u, l: cp.l, n: cp.n, a: 0 };
     const base = signBytes('hsum', HCTX, body);

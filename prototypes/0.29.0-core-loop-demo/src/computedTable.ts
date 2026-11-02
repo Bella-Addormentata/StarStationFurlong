@@ -536,7 +536,7 @@ interface TableState {
    *  off (attestDuty: the page hadn't heard the room for IDLE_MS, so its view
    *  might be stale). noteResult retries it once the gate clears; a newer trim
    *  supersedes it, and it clears when the attestation runs. */
-  pendingAttest: { was: FoldResult; res: FoldResult } | null;
+  pendingAttest: { was: FoldResult; res: FoldResult; played: number } | null;
   scan: Scan | null;
   view: ViewEntry | null;
   /** The phase listeners were last told of, for one fold result. */
@@ -809,18 +809,23 @@ function noteResult(st: TableState, res: FoldResult): void {
  *  `hs:` over it — but only when it is sure of it, by every condition of design
  *  §6.3. On any failure it writes nothing and forgets its chain (st.attested).
  *  Not a hot path: once per trim this page folds, about a signature's worth. */
-function attestDuty(st: TableState, was: FoldResult, res: FoldResult): void {
+function attestDuty(st: TableState, was: FoldResult, res: FoldResult, carriedPlayed = 0): void {
   if (!holdsDeed()) {
     st.attested = null;
     st.pendingAttest = null;
     return;
   }
   const now = clock.last ?? Date.now();
+  // The highest round this page ever saw decided on the session `was` folds,
+  // kept even after a peer deleted the round's records (playedTo → st.decidedTo).
+  // A trim below it drops a settled round (condition 7); carried across a
+  // hearing-gate retry so a session change can't erase the evidence.
+  const played = Math.max(playedTo(st, was), carriedPlayed);
   // A page that hasn't heard the room for a minute can't vouch (its view may
   // be stale): keep the trim to retry once hearing recovers (noteResult), and
   // don't forget the chain. A newer trim replaces this pending one.
   if (!heardThrough(now - IDLE_MS, now)) {
-    st.pendingAttest = { was, res };
+    st.pendingAttest = { was, res, played };
     return;
   }
   st.pendingAttest = null;
@@ -843,18 +848,24 @@ function attestDuty(st: TableState, was: FoldResult, res: FoldResult): void {
   // 3. The checkpoint's nets and craps carry are what this page folded.
   const diff = checkpointDiff(was, res);
   if (diff.nets !== 0n || diff.carry !== 0n) return fail();
-  // 4. At a house table, P's `h` is the commitment this page saw round u carry
-  //    (both absent counts as equal), and no step-down it saw past u lifted it.
-  if ((P.h ?? null) !== (at.house?.rec.c ?? null)) return fail();
+  // 4. At a house table, P's `h` is `was.required` — the commitment the trimmed
+  //    session's first round must name, which accounts for a step-down that
+  //    lifted it (both absent counts as equal). Not the deciding reveal's own
+  //    commitment (at.house.rec.c): after a step-down that would reject an
+  //    honest trim omitting `h` and pass a forged one keeping the retired
+  //    commitment. No step-down it saw past u lifted it either.
+  if ((P.h ?? null) !== (was.required ?? null)) return fail();
   if (was.rounds.some((v) => v.r > P.u && v.house !== undefined && v.house.rec.x.length === 0)) return fail();
   // 5. P isn't an end, or it is this page's own (a switch-off or compaction it
   //    wrote: endedByMe; never a cheat's `e:1` carrying this page's key).
   if (res.base.ended && !endedByMe.has(res.base.sid)) return fail();
   // 6. Round u's verdicts were all checked, and the doc was whole.
   if (was.pending || !casinoWhole(st.t)) return fail();
-  // 7. (B10) `was` decided no round past P.u on its chain: an honest trim cuts
-  //    at the last decided round, so a later one is a premature cut or a race.
-  if (was.rounds.some((v) => v.decided !== null && v.r > P.u)) return fail();
+  // 7. (B10) no round past P.u was decided — not on `was`'s chain now, nor one
+  //    this page ever saw decided whose records a peer has since deleted
+  //    (played): an honest trim cuts at the last decided round, so a later one
+  //    is a premature cut, a race, or a forger dropping a settled round.
+  if (played > P.u || was.rounds.some((v) => v.decided !== null && v.r > P.u)) return fail();
   // How round u was decided, when this page is sure: its own house reveal, the
   // one decision no unseen record can beat (the copies-carried case is 6a-3).
   let decided: { d: string; o: number | [number, number] } | undefined;
@@ -892,22 +903,36 @@ function retryPendingAttest(st: TableState): void {
   if (!st.pendingAttest || forgedStands(st)) return;
   const pending = st.pendingAttest;
   st.pendingAttest = null;
-  attestDuty(st, pending.was, pending.res);
+  attestDuty(st, pending.was, pending.res, pending.played);
 }
 
 /** 🏛️ D2 for an end this page itself just wrote (switchComputedOff,
  *  migrateComputed, compactDuty): the deed holder vouches for the end
  *  checkpoint `cp` by an `hs:` over it, so F4 (houseSumTrigger 'end') can put
- *  it back if the ended table is turned live again. No hearing gate: the page
- *  acts on its own just-folded view, which these paths hold quiet (no round
- *  under way) before the end, so it is current. It vouches only for a real
- *  decided round the end kept (attestDuty's condition 2, 7, 6), never a bare
- *  base; the hs:'s digest fields mirror `cp`, so it checks the very checkpoint
- *  (nextSid leaves k and g out). `was` is the fold the end was taken from,
- *  `prior` the page's last attestation (to carry its `a` on). */
-function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null): void {
+ *  it back if the ended table is turned live again. Gated on room hearing like
+ *  a trim (an isolated page's local quiet is not the room's: its end may be
+ *  stale). It vouches for a real decided round the end kept (attestDuty's
+ *  condition 2, 7, 6), or a base a prior attestation already vouched for (a
+ *  trim then an immediate end, so `was.rounds` is empty); the hs:'s digest
+ *  fields mirror `cp`, so it checks the very checkpoint (nextSid leaves k and g
+ *  out). `was` is the fold the end was taken from, `prior` the page's last
+ *  attestation (its base coverage, and to carry its `a` on), `now` this page's
+ *  clock (the hearing gate). */
+function attestEnd(ctx: FoldCtx, t: string, inc: string, was: FoldResult, cp: Checkpoint, prior: { sid: string; a: number } | null, now: number): void {
   if (!holdsDeed() || cp.e !== 1) return;
-  if (!was.rounds.some((v) => v.decided !== null && v.r === cp.u && v.close === cp.l)) return;
+  // An end this page can't back with recent room hearing isn't vouched for: an
+  // isolated page must not sign a stale end that F4 would restore over the
+  // room's higher live head. No retry — the table is ending; a legit end from a
+  // briefly-deaf owner simply goes undefended, the safe direction (as pre-6a-2).
+  if (!heardThrough(now - IDLE_MS, now)) return;
+  // The end keeps a real round this page folded, or — a trim this page just
+  // signed then ended with no round played, so was.rounds is empty — a prior
+  // attestation already vouched for the base the end sits on (its digest opened
+  // this session, and the end's u/l are that base's). An unverified base is
+  // still refused.
+  const atBase = prior !== null && prior.sid === cp.b
+    && cp.u === was.base.u && cp.l === (was.base.l ?? NO_CLOSE);
+  if (!atBase && !was.rounds.some((v) => v.decided !== null && v.r === cp.u && v.close === cp.l)) return;
   if (was.rounds.some((v) => v.decided !== null && v.r > cp.u)) return;
   if (was.pending || !casinoWhole(t)) return;
   const a = prior && prior.sid === cp.b ? prior.a : was.base.u;
@@ -3727,7 +3752,7 @@ function compactDuty(pub: string, now: number): void {
     // 🏛️ D2: vouch for the end this page just wrote, so F4 can put it back if
     // the ended table is turned live again (only a freshly written end: an end
     // already in the doc was vouched for when it was written).
-    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, null);
+    if (cp) attestEnd(ctx, e.t, e.inc, e.res, cp, null, now);
   }
   for (const key of [...endedAt.keys()]) if (!listed.has(key)) endedAt.delete(key);
 }
@@ -4035,7 +4060,7 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
-    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now);
     writeComputedOn(t, computedIncFor(t, game));
     return true;
   });
@@ -4364,7 +4389,7 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
-    attestEnd(st.ctx, t, st.inc, res, cp, st.attested);
+    attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now);
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
     return true;

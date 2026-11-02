@@ -640,3 +640,142 @@ describe('🏛️🧮 a trim held off by the hearing gate is vouched for once it
     expect(houseSumDigest(CTX, hsOf(a)!)).toBe(liveSid(a));
   }, 60_000);
 });
+
+// ── 🏛️ Re-review follow-ups (PR 6a-2, round 2): ends and trims defended ───────
+
+describe('🏛️🧮 an end taken straight after a trim is vouched for (F4 over the trimmed base)', () => {
+  it('a trim then an immediate switch-off writes an owner-signed end on the trimmed base', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const at = playAndTrim(pages, T0, 1); // a round-1 trim, the owner's live hs: over it
+    expect(hsOf(a)!.e).toBeUndefined(); // the trim attestation is live
+    // No round played since the trim, so the end sits on the trimmed base and
+    // its `was.rounds` is empty — yet the base the trim attestation already
+    // signed covers it, so the end is vouched for (F4 has an end to defend).
+    expect(a.table.switchComputedOff(TABLE, at)).toBe('ok');
+    const end = hsOf(a)!;
+    expect(end.e).toBe(1);
+    expect(end.k).toBe(a.pub);
+    const sum = asCheckpoint(top(a).get(SUM))!;
+    expect(sum.e).toBe(1);
+    expect(houseSumDigest(CTX, end)).toBe(nextSid(CTX, sum)); // the hs: checks the end sum:
+  }, 40_000);
+});
+
+describe('🏛️🧮 an isolated owner’s end is not vouched for (attestEnd’s hearing gate)', () => {
+  it('switching off while the room has gone unheard writes the end sum: but no owner hs:', async () => {
+    // Hearing wired as main.ts wires it, so attestEnd's IDLE_MS gate is real.
+    const a = await loadPage('A', 1, { hears: true });
+    const b = await loadPage('B', 2, { hears: true });
+    const pages = [a, b];
+    for (const p of pages) { clockOf(p, T0); p.casino.buyInChips(p.pid, 1_000); }
+    switchOn(a);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+    sync(T0, a, b);
+    const { at } = decideRound(pages, T0 + STEP); // round 1 decided (a hears b here)
+    // The owner then hears nothing for over a minute (frames, no notes): its
+    // hearing has lapsed past IDLE_MS (60s).
+    let T = at + STEP;
+    for (; T <= at + 61_000; T += STEP) frame(T, a);
+    // Switching off still finalises the end sum:, but the gate blocks the hs::
+    // an isolated page must not sign an end F4 could restore over a higher head.
+    expect(a.table.switchComputedOff(TABLE, T)).toBe('ok');
+    expect((top(a).get(SUM) as { e?: number }).e).toBe(1); // the end is written
+    expect(hsOf(a)).toBeNull();                              // but not vouched for
+  }, 70_000);
+});
+
+describe('🏛️🧮 entering B12 backoff wakes the ⚙ card', () => {
+  it('a third worse overwrite tips into backoff and tells the computed-view listeners', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a, b] = pages;
+    playAndTrim(pages, T0, 1);
+    sync(Date.now(), a, b);
+    const hs = hsOf(b)!;
+    const stranger = testIdentity('stranger');
+    const forge = (): void => {
+      const body = { v: 1 as const, b: hs.b, u: hs.u, l: hs.l, n: hs.n, a: hs.a, k: stranger.pub };
+      const g = stranger.sign(b.fold.signBytes('hsum', CTX, body));
+      b.doc.transact(() => top(b).set(HS, { ...body, g }));
+    };
+    let told = 0;
+    b.casino.subscribeCasinoKey(`computed:${TABLE}`, () => { told += 1; });
+    let t = Date.now();
+    // Two overwrites: each is put back, not yet backed off.
+    for (let i = 0; i < 2; i++) { forge(); t += 1_200; run([b], t, t, { step: STEP }); }
+    expect(b.casino.houseSumBackedOff(TABLE, INC, t)).toBe(false);
+    const before = told;
+    // The third tips into backoff: no put-back is written, so only the explicit
+    // view-touch tells the card (PAGES DISAGREE must appear at once).
+    forge(); t += 1_200;
+    const end = run([b], t, t + 3_000, { step: STEP, until: () => told > before });
+    expect(b.casino.houseSumBackedOff(TABLE, INC, end)).toBe(true);
+    expect(told).toBeGreaterThan(before);
+  });
+});
+
+describe('🏛️🧮 an owner-signed end outranks this page’s chain recovery (F4 over a rewind)', () => {
+  it('a counted head above the end does not bury it: the restore puts the owner’s end back', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const at = playAndTrim(pages, T0, 2); // a real round-2 live checkpoint P2
+    const P2val = top(a).get(SUM);        // the round-2 head a page counts
+    // A peer deletes the owner's hs:, so a fresh page C counts the round-2 head
+    // as its own chain but no owner checkpoint.
+    const cheat = await withCheat(pages, at);
+    cheat.doc.transact(() => cheat.doc.getMap('casinoComputed').delete(HS));
+    const c = await loadPage('C', 4);
+    sync(at, cheat, c);
+    // C holds the round-2 head long enough to ground it (past TAKEN_WAIT_MS), so
+    // a later rewind below it is its own chain's 'rewind', not a load give-way.
+    let t = run([c], at + STEP, at + 46_000, { step: STEP });
+    expect(recoveryOf(c).trigger).toBeNull(); // nothing to restore yet
+    // The owner now signs an end at round 1 (the incarnation ended there; the
+    // round-2 head above it is thus a forged extension), and a peer rewinds the
+    // doc to round 1 — in one step, so C sees both at once.
+    const end1 = signAs(a, 'hsum', { v: 1, b: 'g', u: 1, l: L_HEX, n: { p: '10' }, e: 1, a: 0 }, CTX) as HouseSum;
+    const kit = new ComputedKit(CTX);
+    const low = kit.checkpoint(testIdentity('rewinder'), 'g', 1, L_HEX, { p: 10n });
+    const lowSid = kit.sidAfter(low);
+    cheat.doc.transact(() => {
+      const m = cheat.doc.getMap('casinoComputed');
+      m.set(SUM, low);
+      for (const k of [...m.keys()]) if (k.startsWith(`ses:${TABLE}:${INC}:`)) m.delete(k);
+      m.set(sesKey(lowSid), new Y.Map());
+      m.set(HS, end1);
+    });
+    sync(t, cheat, c);
+    // The chain alone would 'rewind' back up to the forged round-2 head; the
+    // owner's end outranks it, so C restores the end, not the head it counted.
+    expect(recoveryOf(c).trigger).toBe('end');
+    expect(recHash(recoveryOf(c).head)).toBe(recHash(cpOfHs(end1)));
+    expect(recHash(recoveryOf(c).head)).not.toBe(recHash(P2val));
+  }, 60_000);
+});
+
+describe('🏛️🧮 a trim below a round whose records a peer deleted is not vouched (B10 · playedTo)', () => {
+  it('the owner refuses to sign a round-1 trim after it saw round 2 decided', async () => {
+    const pages = await ownerRoom(['A', 'B']);
+    const [a] = pages;
+    const r1 = decideRound(pages, T0 + STEP);       // round 1 decided (live, no trim)
+    let at = run(pages, r1.at + STEP, r1.at + 60_000, { step: STEP, until: () => pages.every(betting) });
+    const r2 = decideRound(pages, at + STEP);       // round 2 decided (live, no trim)
+    at = run(pages, r2.at + STEP, r2.at + STEP, { step: STEP }); // a folds both: it saw round 2
+    expect(foldOf(a).rounds.some((v) => v.r === 2 && v.decided !== null)).toBe(true);
+    expect(hsOf(a)).toBeNull();                      // no trim yet, so no hs:
+    // A peer deletes round 2's close records (c:2:*), so the chain this page now
+    // folds stops at round 1 — but the page remembers it saw round 2 decided
+    // (st.decidedTo → playedTo, kept because noteChain only ever raises it).
+    const ses = a.casino.computedSessionForWrite(TABLE)!;
+    a.doc.transact(() => {
+      for (const k of [...ses.keys()]) if (k.startsWith('c:2:')) ses.delete(k);
+    });
+    at = run([a], at + STEP, at + STEP, { step: STEP });
+    expect(foldOf(a).rounds.some((v) => v.r === 2)).toBe(false); // round 2 gone from the fold
+    // A round-1 trim now looks honest in the fold, but it would drop round 2's
+    // settled payouts: the owner must refuse to vouch for it (played > P.u).
+    trimByHand(a, testIdentity('dropper'));
+    run([a], at + STEP, at + 60_000, { step: STEP, until: () => betting(a) });
+    expect(hsOf(a)).toBeNull(); // refused — no owner signature over the dropping trim
+  }, 60_000);
+});
