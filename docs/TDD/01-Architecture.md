@@ -295,6 +295,7 @@ To appeal to hardcore security communities and bypass global internet censorship
 ### Key Next Steps & Architecture Questions
 1. Do we want to develop the initial tech proof-of-concept (POC) as a pure web mock-up so we can easily test visual assets?
 2. Which aspects of the smart ledger are considered immediate launches—should currency and assets run on Testnet before committing to mainnet pools?
+   * **Answered (2026‑11‑02):** yes. The node runs on Chia testnet11 by default, and mainnet comes only through the stages of the mainnet transition plan ([#335](https://github.com/Bella-Addormentata/StarStationFurlong/issues/335) stage 2 onward, behind [#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) P8's privacy gate). Until then mainnet runs only in a development build (the `chia-mainnet` cargo feature and `SSF_CHIA_NETWORK=mainnet`), where the node holds no SSF wallet; see the [External Infrastructure Register](ExternalInfrastructureRegister.md) §4.
 3. Should we structure our early developer codebase explicitly in standard ECMAScript so that the same files run inside both a web runner and a Tauri wrapper shell?
 
 ---

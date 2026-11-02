@@ -143,8 +143,10 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// throwaway key and says what THIS build does with the chain: reads are on by
 /// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
 /// for the SSF wallet (`wallet_on`: the Bank's switch or `SSF_CHIA_LANE=1`,
-/// chia_wallet_switch.rs) and a build with the `chia-publish` feature.
-pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
+/// chia_wallet_switch.rs) and a build with the `chia-publish` feature. On a
+/// network that allows no SSF wallet (`net`) it says so, and points nobody at
+/// the Bank or the environment.
+pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -173,19 +175,32 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String], wallet_on
     } else {
         "on (rung-6 resolve + beat watcher)"
     };
-    let publish = if !cfg!(feature = "chia-publish") {
-        "not built"
-    } else if wallet_on {
-        "on (the SSF wallet is on)"
-    } else if crate::chia_wallet_switch::env_switch() == crate::chia_wallet_switch::EnvSwitch::Off {
-        "off (SSF_CHIA_LANE holds the SSF wallet off)"
-    } else {
-        "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
-    };
+    let gate = !net.wallet_allowed();
+    // Under the gate the environment changes nothing, so it is not read.
+    let env = if gate { crate::chia_wallet_switch::EnvSwitch::Unset } else { crate::chia_wallet_switch::env_switch() };
+    let publish = publish_status(cfg!(feature = "chia-publish"), wallet_on, gate, env);
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
         if ok { "PASSED" } else { "FAILED" },
     );
+}
+
+/// The startup line's word on publishing: whether this build can, whether
+/// the SSF wallet is on, and what holds it off. `gate` (the network allows no
+/// SSF wallet, `!ChiaNet::wallet_allowed()`) comes before the environment and
+/// the Bank, since neither can turn a wallet on there.
+pub fn publish_status(built: bool, wallet_on: bool, gate: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
+    if !built {
+        "not built"
+    } else if wallet_on {
+        "on (the SSF wallet is on)"
+    } else if gate {
+        "off (this network allows no SSF wallet yet)"
+    } else if env == crate::chia_wallet_switch::EnvSwitch::Off {
+        "off (SSF_CHIA_LANE holds the SSF wallet off)"
+    } else {
+        "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
+    }
 }
 
 // ── #231 P6a: RECORD v2 — the per-node presence record ──────────────────────
@@ -906,6 +921,36 @@ mod p6b_tests {
         assert_ne!(derive_beacon_hint(7), derive_beacon_hint(8));
         assert_eq!(room_lane_id("lobby"), room_lane_id("lobby"));
         assert_ne!(room_lane_id("lobby"), room_lane_id("lobbz"));
+    }
+
+    /// The startup line's word on publishing, for each network: testnet11
+    /// keeps every text it had, and a network that allows no SSF wallet never
+    /// sends the operator to the Bank or to SSF_CHIA_LANE, whatever the
+    /// environment says.
+    #[test]
+    fn the_publish_status_never_sends_a_gated_operator_to_the_bank() {
+        use crate::chia_network::ChiaNet;
+        use crate::chia_wallet_switch::EnvSwitch::{Off, On, Unset};
+        assert_eq!(publish_status(false, false, false, Unset), "not built");
+        assert_eq!(publish_status(true, true, false, On), "on (the SSF wallet is on)");
+        assert_eq!(publish_status(true, false, false, Off), "off (SSF_CHIA_LANE holds the SSF wallet off)");
+        assert_eq!(
+            publish_status(true, false, false, Unset),
+            "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
+        );
+        for net in ChiaNet::ALL {
+            let gate = !net.wallet_allowed();
+            for env in [Unset, On, Off] {
+                let line = publish_status(true, false, gate, env);
+                if gate {
+                    assert_eq!(line, "off (this network allows no SSF wallet yet)", "{net:?} {env:?}");
+                    for word in ["Bank", "SSF_CHIA_LANE", "SSF_BANK_DEV_PAGES"] {
+                        assert!(!line.contains(word), "{line}");
+                    }
+                }
+            }
+            assert_eq!(publish_status(false, false, gate, Unset), "not built", "a read-only build says only that");
+        }
     }
 }
 

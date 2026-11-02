@@ -144,6 +144,17 @@ fn node_data_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
+/// The command that starts the node sidecar at `program`, for both spawns
+/// below. The node reads its Chia network from `SSF_CHIA_NETWORK`; the app
+/// removes it from the child's environment, so a variable in the player's
+/// environment can never move the bundled node to another chain. The node
+/// then runs on its default, testnet11.
+fn node_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_remove("SSF_CHIA_NETWORK");
+    cmd
+}
+
 /// Prefer the real sovereign node (iroh + DHT + WebTransport) over the embedded
 /// iroh-less listener. See REVIEW-20260708 §7.5: two packaged apps running only
 /// the embedded listener silently form separate same-key rooms and never bridge.
@@ -161,7 +172,7 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
         if !candidate.is_file() {
             continue;
         }
-        let mut cmd = Command::new(&candidate);
+        let mut cmd = node_command(&candidate);
         // Run the node from a per-user data dir so iroh_node_id.key persists
         // in a writable location; fall back to the binary's own directory.
         match node_data_dir() {
@@ -191,7 +202,7 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
     }
 
     // Last resort: whatever `ssf-p2p-node` resolves to on PATH.
-    match Command::new("ssf-p2p-node").spawn() {
+    match node_command("ssf-p2p-node").spawn() {
         Ok(child) => {
             println!("🛰️ Spawned sovereign P2P node from PATH (pid {})", child.id());
             NodeMode::Spawned(child)
@@ -305,4 +316,23 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both sidecar spawns go through `node_command`, which removes
+    /// SSF_CHIA_NETWORK from the child's environment (a removed variable
+    /// shows in `get_envs` as `None`). Nothing is spawned and nothing is read
+    /// from this process's environment.
+    #[test]
+    fn the_sidecar_never_inherits_the_chia_network() {
+        for program in [std::ffi::OsStr::new("ssf-p2p-node"), std::ffi::OsStr::new("/opt/ssf/ssf-p2p-node")] {
+            let cmd = node_command(program);
+            assert_eq!(cmd.get_program(), program);
+            let envs: Vec<_> = cmd.get_envs().collect();
+            assert_eq!(envs, vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), None)], "removed, and nothing else changed");
+        }
+    }
 }

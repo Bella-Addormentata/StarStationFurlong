@@ -163,6 +163,12 @@ chia-publish = [
     "dep:chia-bls", "dep:chia-sdk-utils", "dep:chia-sdk-driver", "dep:chia-sdk-signer",
     "dep:bip39", "dep:zeroize", "dep:windows-sys",
 ]
+# ⛓️ Chia mainnet for development builds only (stage 2 of the mainnet
+# transition): lets `SSF_CHIA_NETWORK=mainnet` select it (chia_network.rs).
+# It changes nothing else: all the mainnet code is in every chia-read build.
+# Release builds leave it out (release.yml builds chia-publish,torrent), so
+# they refuse mainnet and stop. A mainnet node holds no SSF wallet yet.
+chia-mainnet = ["chia-read"]
 # Back-compat alias: `--features chia-lane` keeps meaning "the whole lane".
 chia-lane = ["chia-publish"]
 # 🧲 The TV's TORRENT tile (torrent_lane.rs, media plan §6): librqbit with the

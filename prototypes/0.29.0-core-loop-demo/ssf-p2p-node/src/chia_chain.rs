@@ -200,17 +200,18 @@ pub type Chain = PeerLane;
 /// The process's one lane: its pins and mode come from the environment
 /// (`SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY`), its known-good peers from
 /// `chia_peers.json`. Connections open on the first request and are shared by
-/// every handle. It binds what [`lane_binding`] names.
+/// every handle. It binds what [`lane_binding`] names for the node's network.
 static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| {
-    let (net, store) = lane_binding();
+    let (net, store) = lane_binding(crate::chia_network::net());
     Arc::new(Lane::from_env(net, store))
 });
 
-/// The network the process's lane binds and where its peer store lives:
-/// testnet11, the one network this build runs on, and testnet11's peer store
-/// (`chia_peers.json` at the data root). Pure, so a test can pin it.
-fn lane_binding() -> (Network, PathBuf) {
-    (Network::testnet11(), crate::chia_network::ChiaNet::Testnet11.path(crate::chia_peer_lane::STORE_FILE))
+/// The peer network a lane on `net` binds and where its peer store lives:
+/// `chia_peers.json` at the data root on testnet11, where it always was, and
+/// in `chia-mainnet/` on mainnet, so the two networks never share peers.
+/// Pure, so a test can pin it for both.
+fn lane_binding(net: crate::chia_network::ChiaNet) -> (Network, PathBuf) {
+    (Network::of(net), net.path(crate::chia_peer_lane::STORE_FILE))
 }
 
 /// Chain access for MONEY paths (plan §14 (5)): two peers must agree, or the
@@ -240,6 +241,12 @@ fn carrier_on(lane: Arc<Lane>) -> Chain {
 /// One line for the startup log: which peers, which posture.
 pub fn describe() -> String {
     LANE.describe()
+}
+
+/// The startup warnings for pins on another port than the network's
+/// ([`crate::chia_peer_lane::pin_port_warnings`]).
+pub fn pin_warnings() -> Vec<String> {
+    LANE.pin_port_warnings()
 }
 
 /// Chains for tests: no socket is ever opened. [`testing::Unanswering`] answers
@@ -309,15 +316,23 @@ pub(crate) mod testing {
 
     /// A chain that answers listings from a script: the pages in order,
     /// whatever the key or cursor asked for, then nothing. It keeps whether
-    /// each listing asked for spent coins. Everything else is unanswered.
+    /// each listing asked for spent coins. The peak is answered only when
+    /// one was given ([`Scripted::with_peak`]). Everything else is
+    /// unanswered.
     pub(crate) struct Scripted {
         pages: std::sync::Mutex<std::collections::VecDeque<CoinListing>>,
         pub(crate) asked_spent: std::sync::Mutex<Vec<bool>>,
+        peak: Option<u32>,
     }
 
     impl Scripted {
         pub(crate) fn new(pages: Vec<CoinListing>) -> Self {
-            Self { pages: std::sync::Mutex::new(pages.into()), asked_spent: std::sync::Mutex::new(Vec::new()) }
+            Self { pages: std::sync::Mutex::new(pages.into()), asked_spent: std::sync::Mutex::new(Vec::new()), peak: None }
+        }
+
+        /// The same chain, answering `peak` as its peak height.
+        pub(crate) fn with_peak(self, peak: u32) -> Self {
+            Self { peak: Some(peak), ..self }
         }
 
         fn page(&self, include_spent: bool) -> Result<CoinListing, ChainError> {
@@ -367,7 +382,8 @@ pub(crate) mod testing {
         }
 
         fn peak_height(&self) -> impl Future<Output = Result<u32, ChainError>> + Send {
-            async { Err(silence()) }
+            let peak = self.peak.ok_or_else(silence);
+            async move { peak }
         }
 
         fn spend_live(&self, _bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send {
@@ -425,14 +441,24 @@ mod tests {
         assert!(lane.describe().contains("testnet11"));
     }
 
-    /// The process's lane binds testnet11 and keeps its peer store where it
-    /// always was. Read from the pure binding, so nothing is read from the
+    /// The process's lane binds its network: on testnet11 the peer store
+    /// stays where it always was, and on mainnet it lives in mainnet's own
+    /// folder. Read from the pure binding, so nothing is read from the
     /// environment.
     #[test]
-    fn the_process_lane_binds_testnet11_and_its_old_peer_store() {
-        let (net, store) = lane_binding();
+    fn the_process_lane_binds_its_network_and_that_networks_peer_store() {
+        use crate::chia_network::ChiaNet;
+        let (net, store) = lane_binding(ChiaNet::Testnet11);
+        assert_eq!(net, Network::testnet11());
         assert_eq!(net.id, "testnet11");
-        assert_eq!(net.genesis, Network::testnet11().genesis);
         assert_eq!(store, std::path::Path::new("chia_peers.json"));
+        let (net, store) = lane_binding(ChiaNet::Mainnet);
+        assert_eq!(net, Network::mainnet());
+        assert_eq!((net.id.as_str(), net.port), ("mainnet", 8444));
+        assert_eq!(store, std::path::Path::new("chia-mainnet").join("chia_peers.json"));
+        for chia_net in ChiaNet::ALL {
+            let lane = Lane::new(lane_binding(chia_net).0, vec![], false, None);
+            assert!(lane.describe().starts_with(chia_net.id()), "{}", lane.describe());
+        }
     }
 }

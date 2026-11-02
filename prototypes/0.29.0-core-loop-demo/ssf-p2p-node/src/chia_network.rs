@@ -8,10 +8,13 @@
 //! ([`selected`]). Unset or empty means [`DEFAULT_NET`], and testnet11 keeps
 //! every file name, address, signature and text it had before.
 //!
-//! This build cannot select mainnet: [`net_of`] refuses it while the build
-//! has no mainnet, and the peer lane still binds testnet11 (chia_chain.rs).
-//! All the mainnet code compiles and is tested anyway, through the pure forms
-//! that take the network as an argument, so no test reads the environment.
+//! Mainnet can be selected only in a build with the `chia-mainnet` feature,
+//! a development build: [`net_of`] refuses it otherwise, and release builds
+//! leave the feature out. A value the build does not accept stops the node
+//! at startup ([`startup`]), so a typo never moves it to another chain. All
+//! the mainnet code compiles and is tested in every build anyway, through the
+//! pure forms that take the network as an argument, so no test reads the
+//! environment.
 //!
 //! Always compiled: the wallet switch's gates (chia_wallet_switch.rs) take
 //! the network in every build, and the fingerprint carries it.
@@ -19,7 +22,7 @@
 #![cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +36,13 @@ pub const DEFAULT_NET: ChiaNet = ChiaNet::Testnet11;
 /// files. testnet11's stay at the root, where they always were.
 pub const MAINNET_DIR: &str = "chia-mainnet";
 
-/// Whether this build may select mainnet. False until the `chia-mainnet`
-/// feature exists; [`net_of`] takes it as an argument, so its tests cover
-/// both answers.
-const MAINNET_BUILT: bool = false;
+/// Whether this build may select mainnet: only with the `chia-mainnet`
+/// feature, which release builds leave out. [`net_of`] takes it as an
+/// argument, so its tests cover both answers in every build.
+const MAINNET_BUILT: bool = cfg!(feature = "chia-mainnet");
+
+/// The exit code of a node stopped by a refused `SSF_CHIA_NETWORK`.
+pub const EXIT_REFUSED: i32 = 2;
 
 /// A Chia network this node knows.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,9 +120,18 @@ impl ChiaNet {
     /// node's data root: the bare name on testnet11 (the paths it always
     /// had), `chia-mainnet/<name>` on mainnet.
     pub fn path(self, name: &str) -> PathBuf {
+        match self.dir() {
+            None => PathBuf::from(name),
+            Some(dir) => PathBuf::from(dir).join(name),
+        }
+    }
+
+    /// The folder under the data root that holds the network's own state
+    /// files: none on testnet11, `chia-mainnet` on mainnet.
+    pub fn dir(self) -> Option<&'static str> {
         match self {
-            ChiaNet::Testnet11 => PathBuf::from(name),
-            ChiaNet::Mainnet => PathBuf::from(MAINNET_DIR).join(name),
+            ChiaNet::Testnet11 => None,
+            ChiaNet::Mainnet => Some(MAINNET_DIR),
         }
     }
 
@@ -182,7 +197,7 @@ pub fn net_of(
     remembered: Option<ChiaNet>,
     mainnet_built: bool,
 ) -> Result<(ChiaNet, NetSource), String> {
-    let unbuilt = || "This build has no mainnet.".to_string();
+    let unbuilt = || "This build has no mainnet. Build it with --features chia-mainnet.".to_string();
     let (net, source) = match raw {
         Some(v) if !v.is_empty() => {
             let net = ChiaNet::ALL.into_iter().find(|n| v == OsStr::new(n.id())).ok_or_else(|| {
@@ -210,14 +225,15 @@ pub fn selected() -> &'static Result<(ChiaNet, NetSource), String> {
     SELECTED.get_or_init(|| net_of(std::env::var_os(NET_ENV).as_deref(), None, MAINNET_BUILT))
 }
 
-/// The network the node runs on. A refused `SSF_CHIA_NETWORK` leaves it on
-/// [`DEFAULT_NET`] in this build, where testnet11 is the only network it can
-/// run on (startup says so once, [`refused_line`]).
+/// The network the node runs on. A refused `SSF_CHIA_NETWORK` never gets
+/// this far: main() stops the node first ([`startup`]), so the default here
+/// is only what a caller sees if it asks before that check.
 pub fn net() -> ChiaNet {
     selected().as_ref().map(|(net, _)| *net).unwrap_or(DEFAULT_NET)
 }
 
-/// The fingerprint's view of [`net`].
+/// The fingerprint's view of [`net`]. Like [`net`], it never sees a refused
+/// value in a running node.
 #[cfg(feature = "chia-read")]
 pub fn view() -> NetworkView {
     match selected() {
@@ -226,12 +242,61 @@ pub fn view() -> NetworkView {
     }
 }
 
-/// The startup line for a refused `SSF_CHIA_NETWORK`, or none.
-pub fn refused_line(selected: &Result<(ChiaNet, NetSource), String>) -> Option<String> {
-    selected
-        .as_ref()
-        .err()
-        .map(|why| format!("⛓️ Chia network: {why} This node stays on {}.", DEFAULT_NET.name()))
+/// What startup does with the network: `Ok` with the line it prints, or
+/// `Err` with the one line it prints before it stops with [`EXIT_REFUSED`].
+/// main() calls this first, before it opens a file or binds a socket.
+pub fn startup(selected: &Result<(ChiaNet, NetSource), String>) -> Result<String, String> {
+    match selected {
+        Ok((net, source)) => Ok(network_line(*net, *source)),
+        Err(why) => Err(format!("⛓️ Chia network: {why}")),
+    }
+}
+
+/// The startup line that names the network and where it came from, and, off
+/// a test network, that its coins are real and whether this node may hold an
+/// SSF wallet there.
+pub fn network_line(net: ChiaNet, source: NetSource) -> String {
+    let from = match source {
+        NetSource::Default => "the default",
+        NetSource::Env => "set by SSF_CHIA_NETWORK",
+    };
+    let mut notes = Vec::new();
+    if !net.is_test() {
+        notes.push(format!("Real {}.", net.ticker()));
+    }
+    if !net.wallet_allowed() {
+        notes.push("This node holds no SSF wallet here yet.".to_string());
+    }
+    let line = format!("⛓️ Chia network: {} ({from})", net.id());
+    if notes.is_empty() {
+        return line;
+    }
+    let notes = notes.join(" ");
+    format!("{line}. {notes}")
+}
+
+/// Make the folder that holds `net`'s own state files under `root`, readable
+/// by its owner only: 0700 on Unix; elsewhere the platform's default, as the
+/// node's private files already are (chia_contact.rs `write_private`). A
+/// folder that is already there is tightened again. Nothing on testnet11,
+/// whose files stay at the root. Returns the folder it made or kept.
+pub fn make_state_dir(net: ChiaNet, root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let Some(name) = net.dir() else { return Ok(None) };
+    let dir = root.join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir)?;
+    Ok(Some(dir))
 }
 
 #[cfg(test)]
@@ -282,7 +347,11 @@ mod tests {
             }
         }
         assert_eq!(of(Some("mainnet"), true), Ok((ChiaNet::Mainnet, NetSource::Env)));
-        assert_eq!(of(Some("mainnet"), false), Err("This build has no mainnet.".to_string()), "this build cannot select mainnet");
+        assert_eq!(
+            of(Some("mainnet"), false),
+            Err("This build has no mainnet. Build it with --features chia-mainnet.".to_string()),
+            "a build without the feature cannot select mainnet"
+        );
         // The in-game choice, which nothing makes yet: the environment wins,
         // and mainnet still needs the build.
         assert_eq!(net_of(None, Some(ChiaNet::Mainnet), true), Ok((ChiaNet::Mainnet, NetSource::Default)));
@@ -297,12 +366,91 @@ mod tests {
         assert!(net_of(Some(OsStr::from_bytes(b"main\xffnet")), None, true).is_err());
     }
 
+    /// What this build accepts: mainnet only with the `chia-mainnet`
+    /// feature. The table above covers both answers in every build; these
+    /// two pin what `selected` passes.
+    #[cfg(feature = "chia-mainnet")]
     #[test]
-    fn a_refused_value_is_said_once_and_the_node_stays_on_the_default() {
-        assert_eq!(refused_line(&Ok((ChiaNet::Testnet11, NetSource::Env))), None);
-        let line = refused_line(&net_of(Some(OsStr::new("mainnet")), None, false)).unwrap();
-        assert_eq!(line, "⛓️ Chia network: This build has no mainnet. This node stays on testnet11.");
-        assert!(!line.contains('\u{2014}'), "no em-dashes: {line}");
+    fn a_mainnet_build_selects_mainnet_by_its_exact_name() {
+        let of = |raw: &str| net_of(Some(OsStr::new(raw)), None, MAINNET_BUILT);
+        const { assert!(MAINNET_BUILT) };
+        assert_eq!(of("mainnet"), Ok((ChiaNet::Mainnet, NetSource::Env)));
+        assert_eq!(of("testnet11"), Ok((ChiaNet::Testnet11, NetSource::Env)));
+        assert_eq!(net_of(None, None, MAINNET_BUILT), Ok((ChiaNet::Testnet11, NetSource::Default)), "the default stays testnet11");
+        for bad in ["Mainnet", " mainnet", "testnet", "xch"] {
+            assert!(of(bad).unwrap_err().contains("is not a network this node knows"), "{bad}");
+        }
+    }
+
+    #[cfg(not(feature = "chia-mainnet"))]
+    #[test]
+    fn a_build_without_the_feature_refuses_mainnet() {
+        const { assert!(!MAINNET_BUILT, "release builds (chia-publish,torrent) and default builds have no mainnet") };
+        assert_eq!(
+            net_of(Some(OsStr::new("mainnet")), None, MAINNET_BUILT),
+            Err("This build has no mainnet. Build it with --features chia-mainnet.".to_string())
+        );
+        assert_eq!(net_of(Some(OsStr::new("testnet11")), None, MAINNET_BUILT), Ok((ChiaNet::Testnet11, NetSource::Env)));
+    }
+
+    #[test]
+    fn a_refused_value_stops_the_node_with_one_line() {
+        let line = startup(&net_of(Some(OsStr::new("mainnet")), None, false)).unwrap_err();
+        assert_eq!(line, "⛓️ Chia network: This build has no mainnet. Build it with --features chia-mainnet.");
+        let line = startup(&net_of(Some(OsStr::new("Mainnet")), None, true)).unwrap_err();
+        assert_eq!(
+            line,
+            "⛓️ Chia network: SSF_CHIA_NETWORK=Mainnet is not a network this node knows. Use testnet11 or mainnet, or leave it unset for testnet11."
+        );
+        assert!(!line.contains('\n') && !line.contains('\u{2014}'), "one line, no em-dashes: {line}");
+        assert_eq!(EXIT_REFUSED, 2);
+    }
+
+    #[test]
+    fn startup_names_the_network_and_where_it_came_from() {
+        let line = |net, source| startup(&Ok((net, source))).unwrap();
+        assert_eq!(line(ChiaNet::Testnet11, NetSource::Default), "⛓️ Chia network: testnet11 (the default)");
+        assert_eq!(line(ChiaNet::Testnet11, NetSource::Env), "⛓️ Chia network: testnet11 (set by SSF_CHIA_NETWORK)");
+        assert_eq!(
+            line(ChiaNet::Mainnet, NetSource::Env),
+            "⛓️ Chia network: mainnet (set by SSF_CHIA_NETWORK). Real XCH. This node holds no SSF wallet here yet."
+        );
+        for net in ChiaNet::ALL {
+            for source in [NetSource::Default, NetSource::Env] {
+                let l = network_line(net, source);
+                assert!(!l.contains('\u{2014}') && !l.contains('\n'), "{l}");
+                assert_eq!(l.contains("Real"), !net.is_test(), "{l}");
+                assert_eq!(l.contains("no SSF wallet"), !net.wallet_allowed(), "{l}");
+            }
+        }
+    }
+
+    #[test]
+    fn mainnets_folder_is_made_owner_only_and_testnet11_makes_none() {
+        let root = std::env::temp_dir().join(format!("ssf-net-dir-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(make_state_dir(ChiaNet::Testnet11, &root).unwrap(), None);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "testnet11 makes nothing");
+        let dir = make_state_dir(ChiaNet::Mainnet, &root).unwrap().unwrap();
+        assert_eq!(dir, root.join(MAINNET_DIR));
+        assert!(dir.is_dir());
+        assert_eq!(root.join(ChiaNet::Mainnet.path("chia_peers.json")).parent(), Some(dir.as_path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700, "owner-only from the moment it exists");
+            // A folder left broader by an earlier tool or run is tightened.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(make_state_dir(ChiaNet::Mainnet, &root).unwrap(), Some(dir.clone()));
+            assert_eq!(mode(&dir), 0o700);
+        }
+        // A file where the folder should be is an error, never a quiet success.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(MAINNET_DIR), b"not a folder").unwrap();
+        assert!(make_state_dir(ChiaNet::Mainnet, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -322,6 +470,7 @@ mod tests {
             assert_eq!(ChiaNet::Mainnet.path(name), Path::new("chia-mainnet").join(name));
             assert_eq!(ChiaNet::Mainnet.path(name).parent(), Some(Path::new(MAINNET_DIR)));
         }
+        assert_eq!((ChiaNet::Testnet11.dir(), ChiaNet::Mainnet.dir()), (None, Some(MAINNET_DIR)));
     }
 
     #[test]
