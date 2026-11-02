@@ -365,8 +365,30 @@ describe('BACK UP in the native mode', () => {
     const answered = applyBackupWindow(reopened, 'closed', 2);
     expect(reconcileBackupUi(answered, fp, 3, true, Date.now(), true)).toBe(answered);
     expect(bankBackupView(fp, answered, 'app', true)?.windowLine).toBe(THE_LINES.closed);
-    // A reopening with no window out forgets the line and its wallet.
-    expect(resetBackupUi(answered)).toMatchObject({ windowOpen: false, windowLine: null, windowFor: null });
+    // An answer that landed while the Bank was closed is still there when
+    // it opens again, for the same wallet, and goes with that wallet.
+    const again = resetBackupUi(answered);
+    expect(again).toMatchObject({ windowOpen: false, windowLine: THE_LINES.closed, windowFor: fp.chia_address });
+    expect(bankBackupView(fp, reconcileBackupUi(again, fp, 4, true, Date.now(), true), 'app', true)?.windowLine).toBe(THE_LINES.closed);
+    expect(reconcileBackupUi(again, null, 4, true, Date.now(), true)).toMatchObject({ windowLine: null, windowFor: null });
+  });
+
+  it('drops the answer of a window whose wallet went away while it was out, even if the wallet came back', () => {
+    for (const net of [TESTNET11, MAINNET]) {
+      const fp = fpOn(net, 'native');
+      const off = { ...fp, chia_address: undefined, chia_wallet: { ...fp.chia_wallet!, state: 'off' } } as LocalFingerprint;
+      for (const away of [null, off, fpOn(net, 'page'), fpOn(net, 'native', {}, OTHER_BODY)]) {
+        const out = startBackupWindow(BACKUP_IDLE, fp, true, 1);
+        const left = reconcileBackupUi(out, away, 2, true, Date.now(), true);
+        expect(left).toMatchObject({ windowOpen: true, windowFor: null });
+        // One window at a time still: no second one goes while it is out.
+        expect(startBackupWindow(left, fp, true, 3)).toBe(left);
+        const back = reconcileBackupUi(left, fp, 3, true, Date.now(), true);
+        const answered = applyBackupWindow(back, 'closed', 4);
+        expect(answered).toMatchObject({ windowOpen: false, windowLine: null, windowFor: null });
+        expect(bankBackupView(fp, answered, 'app', true)?.windowLine).toBeNull();
+      }
+    }
   });
 
   it('turns TURN ON into the app\'s window, on any network the page knows', () => {

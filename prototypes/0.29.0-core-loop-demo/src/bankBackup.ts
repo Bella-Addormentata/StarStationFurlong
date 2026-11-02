@@ -451,7 +451,12 @@ export function reconcileBackupUi(
   }
   // The answer's line is for the wallet it was tapped for, in the native
   // mode only: another wallet, or the page's own BACK UP, never shows it.
-  if (u.windowLine !== null && (gone || mode !== 'native' || u.windowFor !== address)) u = { ...u, windowLine: null, windowFor: null };
+  // A window still out loses its wallet too (it stays out, so a tap still
+  // asks for no other), and its answer is then dropped when it lands
+  // ([`applyBackupWindow`]), even if the same wallet came back meanwhile.
+  if ((u.windowLine !== null || u.windowFor !== null) && (gone || mode !== 'native' || u.windowFor !== address)) {
+    u = { ...u, windowLine: null, windowFor: null };
+  }
   // The page's own "saved" stands in only until the node says so, and only
   // for the wallet it was said for.
   if (u.savedFor !== null && (backedUp(fp) || u.savedFor !== address)) u = { ...u, savedFor: null };
@@ -479,9 +484,11 @@ export function closeBackupPanel(ui: BankBackupUi, now: number): BankBackupUi {
 }
 
 /** Opening the Bank starts from the nag. Only a clipboard that may still
- *  hold the words is remembered, and an OPEN BACKUP WINDOW still out (its
- *  window is still open, so a tap must not ask for another), with the
- *  address it was tapped for, so its answer still shows. */
+ *  hold the words is remembered, and OPEN BACKUP WINDOW's state: a window
+ *  still out (it is still open, so a tap must not ask for another), and the
+ *  answer's line with the wallet it was tapped for, so an answer that
+ *  landed while the Bank was closed is still there to read. A line for a
+ *  wallet that is gone is dropped by [`reconcileBackupUi`]. */
 export function resetBackupUi(ui: BankBackupUi): BankBackupUi {
   const keep = ui.copy === 'held' || ui.copy === 'stuck';
   return {
@@ -490,7 +497,8 @@ export function resetBackupUi(ui: BankBackupUi): BankBackupUi {
     copy: keep ? ui.copy : 'none',
     copiedAt: keep ? ui.copiedAt : 0,
     windowOpen: ui.windowOpen,
-    windowFor: ui.windowOpen ? ui.windowFor : null,
+    windowLine: ui.windowLine,
+    windowFor: ui.windowFor,
   };
 }
 
@@ -584,6 +592,9 @@ export function startBackupWindow(
  *  The control changed what it shows, so the fresh-tap clock restarts. */
 export function applyBackupWindow(ui: BankBackupUi, answer: NativeBackupAnswer, now: number): BankBackupUi {
   if (!ui.windowOpen) return ui;
+  // The wallet it was tapped for went away while the window was out
+  // ([`reconcileBackupUi`]): the answer is not this session's to show.
+  if (ui.windowFor === null) return { ...ui, windowOpen: false, windowLine: null, changedAt: now };
   const line = Object.prototype.hasOwnProperty.call(BACKUP_WINDOW_LINES, answer) ? BACKUP_WINDOW_LINES[answer] : BACKUP_WINDOW_LINES.unavailable;
   return { ...ui, windowOpen: false, windowLine: line, changedAt: now };
 }
