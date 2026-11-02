@@ -114,8 +114,9 @@ export interface ChiaPresence {
 export type ChiaWalletState = 'unbuilt' | 'off' | 'ready' | 'on';
 
 /** 🔒 How the wallet's file keeps its key on disk: `none` in the clear
- *  (owner-only on Unix), `dpapi` locked to this Windows account. */
-export type ChiaWalletAtRest = 'none' | 'dpapi';
+ *  (owner-only on Unix), `dpapi` locked to this Windows account, `keychain`
+ *  locked with a key in this Mac user's login keychain. */
+export type ChiaWalletAtRest = 'none' | 'dpapi' | 'keychain';
 
 /** 🖥️ Who can show the wallet's 24 words: `native` the desktop app, in a
  *  window of its own (its channel to the node is on), `page` this page (a
@@ -176,7 +177,7 @@ const WALLET_FLAGS = ['seed', 'legacy', 'stays', 'held', 'mnemonic', 'backed_up'
 /** The at-rest fields: a string, kept only when it is a lock this page can
  *  word (a newer node's other lock is dropped, not the whole switch). */
 const WALLET_AT_REST = ['at_rest', 'at_rest_next'] as const;
-const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'dpapi']);
+const AT_REST_KINDS: ReadonlySet<string> = new Set<ChiaWalletAtRest>(['none', 'dpapi', 'keychain']);
 
 const BACKUP_KINDS: ReadonlySet<string> = new Set<ChiaWalletBackup>(['native', 'page', 'none']);
 

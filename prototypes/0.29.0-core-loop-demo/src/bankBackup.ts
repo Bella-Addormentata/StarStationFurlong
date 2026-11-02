@@ -41,7 +41,7 @@
 import { BANK_WALLET_BUTTON_ID } from './bankWallet';
 import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
 import type { NativeBackupAnswer } from './nativeShell';
-import type { LocalFingerprint } from './nodeFingerprint';
+import type { ChiaWalletAtRest, LocalFingerprint } from './nodeFingerprint';
 
 /** Control ids: stable across renders, so focus survives a repaint. SHOW
  *  turns into HIDE and I SAVED into ⚠ CONFIRM on the same control. */
@@ -250,7 +250,7 @@ export const BACKUP_ARMED = 'Written all 24, in order? The Bank stops asking and
 export const BACKUP_EXPIRED = 'Hidden after 5 minutes. Tap SHOW to see them again.';
 /** 🔒 How the wallet's file keeps its key on disk, under BACK UP's line. */
 export const AT_REST_DPAPI =
-  'On disk, its key is locked to your Windows account on this PC. Reinstalling Windows, an administrator resetting your password, or another PC loses that copy: the 24 words you saved are the backup.';
+  'On disk, its key is locked to your Windows account on this PC. Programs you run on this Windows account can still open it. Reinstalling Windows, an administrator resetting your password, or another PC loses that copy: the 24 words you saved are the backup.';
 export const AT_REST_UNTIL_SAVED =
   'On disk, its key is in the clear in chia_identity.json until you save the 24 words; then your node locks the file to your Windows account.';
 export const AT_REST_RETRY =
@@ -259,17 +259,35 @@ export const AT_REST_CLEAR =
   'On disk, its key is in the clear in chia_identity.json: anyone who can read that file has this wallet.';
 export const AT_REST_REWRAPPED =
   'Copies of your node\'s folder made before it locked this file (a synced or zipped folder, a backup) still hold the key in the clear: delete them.';
+/** 🍎 The same lines for a Mac, where the login keychain keeps the key. */
+export const AT_REST_KEYCHAIN =
+  'On disk, its key is locked with your Mac login keychain, for your user account on this Mac: a copy of your node\'s folder alone does not hold this wallet. Programs you run on this Mac account can still open it. Another Mac or account, a reset login keychain, or deleting its Star Station Furlong wallet lock item loses that copy: the 24 words you saved are the backup.';
+export const AT_REST_UNTIL_SAVED_KEYCHAIN =
+  'On disk, its key is in the clear in chia_identity.json until you save the 24 words; then your node locks the file with your Mac login keychain.';
+export const AT_REST_RETRY_KEYCHAIN =
+  'On disk, its key is still in the clear in chia_identity.json: your node locks the file with your Mac login keychain at its next start while that keychain is unlocked.';
+export const AT_REST_REWRAPPED_KEYCHAIN =
+  'Copies of your node\'s folder made before it locked this file (a synced or zipped folder, a Time Machine backup or snapshot) still hold the key in the clear: delete them.';
+
+/** Each lock's lines, by the kind its node names. */
+const AT_REST_LOCKS: Readonly<Record<Exclude<ChiaWalletAtRest, 'none'>, { locked: string; untilSaved: string; retry: string; rewrapped: string }>> = {
+  dpapi: { locked: AT_REST_DPAPI, untilSaved: AT_REST_UNTIL_SAVED, retry: AT_REST_RETRY, rewrapped: AT_REST_REWRAPPED },
+  keychain: { locked: AT_REST_KEYCHAIN, untilSaved: AT_REST_UNTIL_SAVED_KEYCHAIN, retry: AT_REST_RETRY_KEYCHAIN, rewrapped: AT_REST_REWRAPPED_KEYCHAIN },
+};
+const lockOf = (kind: ChiaWalletAtRest | undefined) => (kind === undefined || kind === 'none' ? undefined : AT_REST_LOCKS[kind]);
 
 /** The at-rest lines for an on 24-word wallet, from what its node says;
- *  none from an older node, which does not say. */
+ *  none from an older node, which does not say. In the clear only for a
+ *  file the node says is `none` with no lock to come. */
 export function atRestLines(fp: LocalFingerprint | null | undefined): string[] {
   const w = fp?.chia_wallet;
   if (!w || w.state !== 'on' || w.mnemonic !== true || w.at_rest === undefined) return [];
   const lines: string[] = [];
-  if (w.at_rest === 'dpapi') lines.push(AT_REST_DPAPI);
-  else if (w.at_rest_next === 'dpapi') lines.push(w.backed_up === true ? AT_REST_RETRY : AT_REST_UNTIL_SAVED);
-  else lines.push(AT_REST_CLEAR);
-  if (w.rewrapped === true) lines.push(AT_REST_REWRAPPED);
+  const lock = lockOf(w.at_rest);
+  const next = lockOf(w.at_rest_next);
+  if (lock) lines.push(lock.locked);
+  else if (w.at_rest === 'none') lines.push(next ? (w.backed_up === true ? next.retry : next.untilSaved) : AT_REST_CLEAR);
+  if (w.rewrapped === true) lines.push(lock?.rewrapped ?? AT_REST_REWRAPPED);
   return lines;
 }
 

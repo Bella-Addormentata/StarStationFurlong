@@ -86,7 +86,7 @@ mod board_bundles;
 // spend-to-self publish, craps fairness.
 #[cfg(feature = "chia-publish")]
 mod chia_wallet;
-// 🔒 The wallet's file locked at rest once its words are saved (Windows DPAPI).
+// 🔒 The wallet's file locked at rest once its words are saved (Windows DPAPI, Mac keychain).
 #[cfg(feature = "chia-publish")]
 mod chia_at_rest;
 #[cfg(feature = "chia-publish")]

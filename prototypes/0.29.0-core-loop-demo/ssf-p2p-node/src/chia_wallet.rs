@@ -20,7 +20,7 @@
 //!
 //! 🔒 Once the words are marked saved, [`wrap_at_rest`] locks the file with
 //! this computer's store (chia_at_rest.rs: Windows DPAPI, and the Mac login
-//! keychain once it is switched on): the entropy is replaced by a `blob`
+//! keychain): the entropy is replaced by a `blob`
 //! only this account can open, in one guarded rename that never leaves the
 //! wallet without a whole file. Minting always writes the clear form first.
 //!

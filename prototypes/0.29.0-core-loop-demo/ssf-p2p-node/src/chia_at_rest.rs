@@ -16,17 +16,21 @@
 //!
 //! The wrap waits for the saved mark so that no wallet whose words were never
 //! written down depends on a store it can lose (a Windows reinstall, an admin
-//! password reset). Minting still writes `protect: "none"` (chia_wallet.rs).
+//! password reset, a reset login keychain). Minting still writes
+//! `protect: "none"` (chia_wallet.rs).
 //!
 //! On a Mac the store is the user's login keychain (`protect: "keychain"`,
-//! keychain_lock.rs): the file keeps the entropy sealed with a random key,
-//! and one keychain item per wallet keeps that key. Apple's own
-//! `/usr/bin/security` makes and reads the item, so an update of the node
-//! never brings a prompt, and the node never shows one: a locked keychain is
-//! a refusal that keeps the file. The store is built and tested here, but it
-//! is not switched on yet: [`os_store`] is still none on a Mac, so this node
-//! reads a keychain file as one locked by a store it does not have, and
-//! never mints over it.
+//! keychain_lock.rs and keychain.rs): the file keeps the entropy sealed with
+//! a random key, and one keychain item per wallet keeps that key, so a copy
+//! of the folder alone no longer holds the wallet. Apple's own
+//! `/usr/bin/security` makes and reads the item: macOS ties an item a
+//! program makes itself to that build of it, so an item the unsigned node
+//! made would be refused to its next update. An update never brings a
+//! prompt, and the node never shows one: a locked keychain (a node started
+//! over ssh sees it locked) is a refusal that keeps the file, and a lock
+//! that cannot land is tried again at the next start. As with DPAPI, a
+//! program running as the same Mac user can ask `security` for the key just
+//! as the node does.
 //!
 //! Linux keeps `protect: "none"`: owner-only (0600), which the Bank says.
 //!
@@ -188,15 +192,20 @@ pub trait SecretStore: Sync {
     fn unwrap(&self, blob: &[u8], fingerprint: u32) -> Result<Zeroizing<Vec<u8>>, StoreError>;
 }
 
-/// This computer's store, when it has one the node uses: DPAPI on Windows.
-/// None on a Mac until the keychain store is switched on, and none on Linux.
-/// It makes no system call, so asking costs nothing at startup.
+/// This computer's store, when it has one the node uses: DPAPI on Windows,
+/// the login keychain on a Mac, and none on Linux. It makes no system call
+/// (the keychain's first is its `ready`, once a locked file is opened or a
+/// lock is due), so asking costs nothing at startup.
 pub fn os_store() -> Option<&'static dyn SecretStore> {
     #[cfg(windows)]
     {
         Some(&dpapi::Dpapi)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Some(&keychain::LOGIN)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }
@@ -349,7 +358,8 @@ pub fn short_words(e: StoreError) -> String {
 pub fn policy_line(policy: Policy, store: Option<AtRest>) -> Option<String> {
     match (policy, store) {
         (Policy::None, _) => Some(format!(
-            "🏦 SSF wallet: {POLICY_ENV}=none: the wallet's file stays in the clear on disk, even once its 24 words are saved"
+            "🏦 SSF wallet: {POLICY_ENV}=none: the node does not lock the wallet's file, even once its 24 words are saved, \
+             so a file in the clear stays in the clear on disk; a file already locked stays locked"
         )),
         (Policy::Os, None) => Some(
             "🏦 SSF wallet: this computer has no store the node locks the wallet's file with yet, so it stays in the clear on disk"
@@ -497,6 +507,8 @@ mod tests {
     fn the_startup_line_speaks_only_when_the_file_stays_in_the_clear() {
         assert!(policy_line(Policy::Os, Some(AtRest::Dpapi)).is_none());
         assert!(policy_line(Policy::None, Some(AtRest::Dpapi)).unwrap().contains("=none"));
+        let none = policy_line(Policy::None, None).unwrap();
+        assert!(none.contains("does not lock") && none.contains("already locked stays locked"), "{none}");
         assert!(policy_line(Policy::Os, None).unwrap().contains("in the clear"));
         assert!(!policy_line(Policy::Os, None).unwrap().contains("owner-only"), "the node does not check that");
     }
@@ -594,7 +606,8 @@ mod tests {
     fn the_keychain_is_a_store_like_dpapi_for_the_policy() {
         let store = Some(AtRest::Keychain);
         assert!(policy_line(Policy::Os, store).is_none(), "nothing to say at startup");
-        assert!(policy_line(Policy::None, store).unwrap().contains("=none"));
+        let none = policy_line(Policy::None, store).unwrap();
+        assert!(none.contains("=none") && none.contains("already locked stays locked"), "{none}");
         assert!(should_wrap(true, AtRest::None, Policy::Os, store));
         assert!(!should_wrap(false, AtRest::None, Policy::Os, store), "words not saved");
         assert!(!should_wrap(true, AtRest::Keychain, Policy::Os, store), "already locked");
@@ -605,6 +618,25 @@ mod tests {
         assert_eq!(next_lock(Err(BAD_POLICY), store), None);
         assert_eq!(lock_words(AtRest::Keychain), "with this Mac user's login keychain");
         assert_eq!(lock_words(AtRest::Dpapi), "to this Windows account");
+    }
+
+    /// Each computer's store: DPAPI on Windows, the login keychain on a
+    /// Mac, none on Linux, which alone says at startup that the file stays
+    /// in the clear. Asking calls no store (keychain.rs's test 8 counts it).
+    #[test]
+    fn each_computer_has_its_own_store() {
+        let here = if cfg!(windows) {
+            Some(AtRest::Dpapi)
+        } else if cfg!(target_os = "macos") {
+            Some(AtRest::Keychain)
+        } else {
+            None
+        };
+        let store = os_store().map(|s| s.protect());
+        assert_eq!(store, here);
+        assert_eq!(next_lock(Ok(Policy::Os), store), here);
+        assert_eq!(policy_line(Policy::Os, store).is_some(), here.is_none());
+        assert_eq!(should_wrap(true, AtRest::None, Policy::Os, store), here.is_some());
     }
 
     #[cfg(windows)]
