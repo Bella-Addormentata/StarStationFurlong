@@ -1697,6 +1697,13 @@ export class TableFold {
   redecide(): RedecideCandidate[] {
     const prior = this.prior;
     if (!prior) return [];
+    // Redecide is display-only: the checks below (ask / houseRecOk) may mark a
+    // pending verification, but that must not reach the financial fold's
+    // `pending`. These records sit below the base — the count never reads them
+    // — so a pending one here would otherwise hold a settled checkpoint's spend
+    // on evidence that doesn't bear on the nets. We restore sawPending before
+    // returning; the round-u card refreshes on the next fold generation, by
+    // which point the verification has resolved.
     const savedPending = this.sawPending;
     const { u, l, close, P, M, sIn, netsBefore } = prior;
     const present = [...P.keys()];
@@ -1746,10 +1753,12 @@ export class TableFold {
       cands.push({ view, d, sOut: play.sOut, copied: deciderCopied && counted.every(revealCopied) });
     };
 
-    // (a) Fair: the house reveal deciding the close (none counted → void).
+    // (a) Fair: each house reveal that could decide the close, lowest hash
+    // first — all of them, not only decide's first pick, so a peer's (the one a
+    // trim copied) is weighed too; reproduces keeps those matching the
+    // checkpoint (none counted → void). Mirrors the forfeit enumeration below.
     if (fair) {
-      const hr = this.viewHouseReveal(close, hReveals);
-      if (hr) {
+      for (const hr of this.viewHouseReveals(close, hReveals)) {
         const inN = new Set(hr.rec.n);
         const need = present.filter((pid) => inN.has(P.get(pid)!.hash));
         if (need.every((pid) => seeds.has(pid))) {
@@ -1774,15 +1783,15 @@ export class TableFold {
     return cands.filter((c) => this.reproduces(c, netsBefore));
   }
 
-  /** The house reveal that would decide the prior close, as decide picks it:
-   *  listing the close, its seed opening the close's `h`, a house's and
-   *  verified, lowest hash first. */
-  private viewHouseReveal(close: CloseEntry, hReveals: Map<string, HouseRevealEntry>): HouseRevealEntry | null {
-    const cands = [...hReveals.values()]
-      .filter((e) => e.commit === close.rec.h && e.rec.x.includes(close.hash))
+  /** The house reveals that could decide the prior close, as decide weighs
+   *  them: listing the close, their seed opening the close's `h`, a house's and
+   *  verified, lowest hash first. Decide takes the first; redecide enumerates
+   *  all, so a peer's (the one a trim copied) is weighed too and reproduces
+   *  keeps those matching the checkpoint. */
+  private viewHouseReveals(close: CloseEntry, hReveals: Map<string, HouseRevealEntry>): HouseRevealEntry[] {
+    return [...hReveals.values()]
+      .filter((e) => e.commit === close.rec.h && e.rec.x.includes(close.hash) && this.houseRecOk(e) === true)
       .sort((a, b) => cmp(a.hash, b.hash));
-    for (const e of cands) if (this.houseRecOk(e) === true) return e;
-    return null;
   }
 
   /** C3: a candidate reproduces the checkpoint iff this page's nets after

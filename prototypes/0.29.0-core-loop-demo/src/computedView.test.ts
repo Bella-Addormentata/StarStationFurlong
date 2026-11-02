@@ -467,6 +467,11 @@ describe('🔁 the round-u view (the L7 fix)', () => {
     const v = view(o, T0 + 20_000);
     expect(v).toMatchObject({ phase: 'settled', round: 1, result: pF, unseen: 'forfeit' });
     expect(v.result).not.toBe(pA);
+    // The ⚙ card agrees with the felt (F5): the trimmer's forfeit, counting X
+    // only, noted unseen — not this page's stale reveals verdict.
+    expect(o.table.computedRoundCheck(TABLE, T0 + 20_000)).toMatchObject({
+      round: 1, decided: 'forfeit', counted: 1, of: 2, unseen: 'forfeit', dropped: [],
+    });
     // The round still counts as decided at u (C6): not UNDONE.
     expect(o.table.computedDecidedTo(TABLE)).toBe(1);
   });
@@ -495,6 +500,44 @@ describe('🔁 the round-u view (the L7 fix)', () => {
     putAt(o, T0 + 30_500, kit.reveal(1, Y.pid));
     const v = view(o, T0 + 31_000);
     expect(v).toMatchObject({ phase: 'settled', round: 1, result: pA, unseen: 'reveals' });
+    expect(o.table.computedDecidedTo(TABLE)).toBe(1);
+  });
+
+  it('equal nets either way, the reverse: this page folded a forfeit but the trim decided reveals — both reproduce, so fold order ranks the forfeit first, yet the copied reveals win (F3)', async () => {
+    const o = await watch();
+    const pA = pocketFor(1, X, Y); // every reveal in — the trimmer’s pocket
+    const pF = pocketFor(1, X); // X’s forfeit counts X only — this page’s pocket
+    expect(pA).not.toBe(pF);
+    const pickX = free(pA, pF);
+    const pickY = free(pA, pF, pickX);
+    const xs = kit.slip(X, 1, [straight(pickX, 5)]); // loses on either pocket
+    const ys = kit.slip(Y, 1, [straight(pickY, 5)]); // loses on either pocket
+    putAt(o, T0, xs, ys);
+    // O is missing Y’s reveal in time, so it folds round 1 by X’s forfeit (pF).
+    const closeRec = kit.close(X, 1, foldOf(o).parent, [xs, ys]);
+    putAt(o, T0 + 18_000, closeRec, kit.reveal(1, X.pid), kit.forfeit(X, 1, closeRec.hash, [X.pid]));
+    expect(foldOf(o).rounds[0]).toMatchObject({ r: 1, decided: 'forfeit', pocket: pF });
+    expect(view(o, T0 + 29_000)).toMatchObject({ phase: 'settled', round: 1, result: pF });
+    // A stranger trims. Both bets lose on either pocket, so the reveals’ nets
+    // equal the forfeit’s (O’s own, used as the checkpoint’s) — the silent L7,
+    // reversed. This is a v0.51 trim that decided by the reveals: it carried no
+    // copy of O’s forfeit (copyDecider false), and the reveals it counted
+    // arrive as copies the way a real trim carries them. So the forfeit is this
+    // page’s memory only (copied false), the reveals are copied, and both
+    // reproduce — fold order ranks the forfeit first, but the copied reveals
+    // must win.
+    vi.setSystemTime(T0 + 30_000);
+    trimByHand(o, G, undefined, TABLE, undefined, false);
+    expect(foldOf(o).rounds).toEqual([]);
+    expect(foldOf(o).base.u).toBe(1);
+    putAt(o, T0 + 30_500, kit.reveal(1, X.pid), kit.reveal(1, Y.pid));
+    const v = view(o, T0 + 31_000);
+    expect(v).toMatchObject({ phase: 'settled', round: 1, result: pA, unseen: 'reveals' });
+    expect(v.result).not.toBe(pF);
+    // The ⚙ card agrees with the felt (F5): the reveals, both counted, unseen.
+    expect(o.table.computedRoundCheck(TABLE, T0 + 31_000)).toMatchObject({
+      round: 1, decided: 'reveals', counted: 2, of: 2, unseen: 'reveals',
+    });
     expect(o.table.computedDecidedTo(TABLE)).toBe(1);
   });
 });
