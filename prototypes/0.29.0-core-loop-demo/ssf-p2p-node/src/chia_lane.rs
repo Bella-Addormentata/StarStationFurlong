@@ -176,7 +176,10 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
     } else {
         "on (rung-6 resolve + beat watcher)"
     };
-    let mints = crate::chia_wallet_switch::may_mint(net.is_test(), crate::shell_channel::live());
+    // Printed at startup, before the desktop app's channel can be live (it
+    // goes live once its thread has answered the app), so off a test
+    // network a load here mints nothing and the line says who makes one.
+    let mints = crate::chia_wallet_switch::may_mint(net.is_test(), false);
     let publish = publish_status(cfg!(feature = "chia-publish"), wallet_on, mints, crate::chia_wallet_switch::env_switch());
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",

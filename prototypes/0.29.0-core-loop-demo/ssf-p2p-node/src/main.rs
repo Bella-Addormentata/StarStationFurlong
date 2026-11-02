@@ -1586,8 +1586,10 @@ async fn main() -> Result<()> {
     let chosen = chia_network::startup(chia_network::selected());
     // 🖥️ The desktop app's channel (shell_channel.rs), decided once, right
     // after the network and before anything prints: with it on, every
-    // `println!` from here goes to stderr. Before the wallet loads, which
-    // mints on mainnet only while it is live (`shell_channel::live`).
+    // `println!` from here goes to stderr. Before the wallet loads; a mint
+    // on mainnet asks whether the channel is live (`shell_channel::live`),
+    // which it is not yet here: it goes live once its thread, started
+    // after the hub exists, has answered the app.
     shell_channel::init();
     let chia_net = match chosen {
         Ok(line) => {
@@ -1885,7 +1887,9 @@ async fn main() -> Result<()> {
     // switch the SpacePhone's Bank remembered beside the wallet, on every
     // network. An unreadable switch file starts the wallet off and says why.
     // Off a test network a load with no identity on disk mints one only
-    // while the desktop app's channel is live (`load_wallet`).
+    // while the desktop app's channel is live (`load_wallet`), which it
+    // never is at this startup load: there a new wallet waits for the
+    // Bank's CREATE, and one already on disk loads.
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
@@ -2015,17 +2019,26 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}");
-                wallet_memo.error = Some(format!("the wallet could not be loaded at startup: {e:#}"));
+                let why = format!("{e:#}");
+                match startup_load_error(&why, shell_channel::serving()) {
+                    Some(memo) => {
+                        eprintln!("⛓️ ChiaHub lane: could not load chia identity: {why}");
+                        wallet_memo.error = Some(memo);
+                    }
+                    None => println!(
+                        "🏦 SSF wallet: none on disk yet on {}; CREATE SSF WALLET in the Bank makes one, and this app's window shows its 24 words",
+                        chia_net.name()
+                    ),
+                }
             }
         }
     }
     // ⛓️ ChiaHub lane: crypto self-test + one status line saying what this build
     // does with the chain (reads on by default — #231 D3; publishing behind
     // the SSF wallet in a chia-publish build). After the load, so publishing
-    // reads "on" only for a wallet that loaded: a mainnet node with no app
-    // channel and no identity on disk starts with the wallet switched on and
-    // still holds none.
+    // reads "on" only for a wallet that loaded: a mainnet node with no
+    // identity on disk can start with the wallet switched on and still hold
+    // none, since the startup load mints nothing there.
     #[cfg(feature = "chia-publish")]
     let wallet_loaded = chia_heartbeat_sk.is_some();
     #[cfg(not(feature = "chia-publish"))]
@@ -2203,7 +2216,9 @@ async fn main() -> Result<()> {
     // 🖥️ The desktop app's channel thread, once the hub exists: its ops
     // read the wallet's key, meta and switch there (the startup wallet is
     // already in it), and a request the app sent sooner waits in the pipe.
-    // Nothing starts while the channel is off.
+    // The channel goes live (a mainnet mint may count on it) once the
+    // thread has answered the app's first request, usually the hello the
+    // app sends at spawn. Nothing starts while the channel is off.
     {
         let hub_shell = hub.clone();
         let rt = tokio::runtime::Handle::current();
@@ -6036,14 +6051,50 @@ fn bank_can_turn_on(net: chia_network::ChiaNet) -> bool {
     chia_wallet_switch::bank_can_turn_on(net.is_test(), shell_channel::live(), on_disk)
 }
 
+/// 🏦 What the Bank is told when the startup load fails: the load's error,
+/// except on the desktop app's own node (its channel will serve) when the
+/// load only refused to mint off a test network. The startup load never
+/// mints there, since the channel is not live until its thread has answered
+/// the app; a new wallet comes from the Bank's CREATE, so the Bank shows
+/// CREATE and no error. A headless node keeps the refusal, which says only
+/// the desktop app makes one.
+#[cfg(feature = "chia-publish")]
+fn startup_load_error(error: &str, app_channel_serves: bool) -> Option<String> {
+    if app_channel_serves && error == chia_wallet::MINT_NEEDS_APP {
+        return None;
+    }
+    Some(format!("the wallet could not be loaded at startup: {error}"))
+}
+
+#[cfg(all(test, feature = "chia-publish"))]
+mod startup_load_error_tests {
+    use super::startup_load_error;
+    use crate::chia_wallet::MINT_NEEDS_APP;
+
+    /// On the app's own mainnet node the startup load's refusal to mint is
+    /// no error: the Bank's CREATE makes the wallet once the channel is
+    /// live. Elsewhere, and for every other error, the Bank is told.
+    #[test]
+    fn the_apps_own_node_with_no_wallet_on_disk_shows_create_not_an_error() {
+        assert_eq!(startup_load_error(MINT_NEEDS_APP, true), None);
+        assert_eq!(
+            startup_load_error(MINT_NEEDS_APP, false).as_deref(),
+            Some("the wallet could not be loaded at startup: On Chia mainnet a new SSF wallet is made only in the desktop app, which can show its 24 words.")
+        );
+        assert_eq!(startup_load_error("disk full", true).as_deref(), Some("the wallet could not be loaded at startup: disk full"));
+    }
+}
+
 /// 🏦 Load the wallet (minting it once), then lock its file if its words are
 /// saved ([`lock_if_due`]): at startup and when the Bank turns it on.
 /// Blocking. A `SSF_WALLET_AT_REST` that is neither `os` nor `none` loads
 /// nothing, so a typo cannot quietly leave a file in the clear. Off a test
 /// network a new wallet is minted only while the desktop app's channel is
 /// live ([`chia_wallet_switch::may_mint`] over [`shell_channel::live`], not
-/// the sticky `started`): a node the app left running mints nothing whose
-/// words no window can show. An identity on disk still loads.
+/// the sticky `started`): only once the channel's thread has answered the
+/// app, so never at startup, and never after the channel closed. A node the
+/// app left running mints nothing whose words no window can show. An
+/// identity on disk still loads.
 #[cfg(feature = "chia-publish")]
 fn load_wallet() -> Result<(chia_wallet::WalletIdentity, chia_wallet_switch::WalletMeta)> {
     let net = chia_network::net();
