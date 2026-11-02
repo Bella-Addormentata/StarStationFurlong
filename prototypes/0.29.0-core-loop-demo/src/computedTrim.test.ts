@@ -275,6 +275,34 @@ describe('a trim', () => {
     expect(next).toBeGreaterThanOrEqual(at + a.table.SHOW_MS + a.table.BET_WINDOW_MS);
     expect(foldOf(a).rounds[0]).toMatchObject({ r: 2, decided: 'reveals' });
   });
+
+  it('🔁 carries round D’s copies into the next session (§6.1 b), and a fold never reads them (invisible to v0.50)', async () => {
+    const pages = await room(['A', 'B', 'O']);
+    const [a, b] = pages;
+    weigh(a, a.table.TRIM_BYTES);
+    const { at } = decideRound([a, b], T0); // round 1, decided by reveals
+    sync(at, ...pages);
+    const first = byRank([a, b], 'trim', 1)[0];
+    const D = foldOf(first).rounds[0];
+    expect(D).toMatchObject({ r: 1, decided: 'reveals' });
+    // reveals → the reveal of each counted pid (§6.1 b, no decider record).
+    const want = [...(D.deciderCopies ?? [])].sort();
+    expect(want).toHaveLength(2);
+    expect(want.every((k) => k.startsWith('x:1:'))).toBe(true);
+    const netsBefore = new Map(foldOf(first).nets);
+    // A real production trim (trimDuty → writeCheckpointAndTrim), not by hand.
+    run(pages, at + STEP, at + 8_000, { step: STEP, until: () => trimmedTo(first, 1) });
+    // The copies rode along, byte for byte, into the new session.
+    expect(keysIn(first, 'x', 1).sort()).toEqual(want);
+    for (const k of want) expect(recOf(first, k)).toBeDefined();
+    // Invisible to a v0.50 walk: the checkpoint names u = 1 with the same nets
+    // that drove the count, and the fold opens round 2 — the round-1 copies sit
+    // below the new base, so no count or spend ever reads them.
+    expect(cpOf(first)!.u).toBe(1);
+    expect(foldOf(first).base.u).toBe(1);
+    expect(foldOf(first).open).toBe(2);
+    expect(foldOf(first).nets).toEqual(netsBefore);
+  });
 });
 
 describe('who trims, and when', () => {
@@ -707,7 +735,8 @@ describe('races', () => {
     const kept = winner === a ? 2 : 3;
     for (const p of pages) {
       expect(keysIn(p, 's').filter((k) => k.includes(`:${loser.pid}:`))).toEqual([]);
-      expect(keysIn(p, 'x')).toEqual([]);
+      // 🔁 The winner's round-u reveal copies ride its trim (§6.1 b); the loser's don't.
+      expect(keysIn(p, 'x').filter((k) => !k.includes(`:${winner.pid}:`))).toEqual([]);
       expect(keysIn(p, 's', kept)).toEqual(keysIn(winner, 's', kept));
     }
     const lostSeed = loser === a ? seeds.a : seeds.b;
@@ -752,7 +781,10 @@ describe('races', () => {
     // Both run on: nothing B wrote comes back, its seeds go.
     run(pages, T + STEP, T + 10_000, { step: STEP });
     for (const p of pages) {
-      expect([...keysIn(p, 's'), ...keysIn(p, 'c'), ...keysIn(p, 'x')]).toEqual([]);
+      // 🔁 Nothing B wrote comes back; A's own round-1 reveal copy rides its trim (§6.1 b).
+      expect(keysIn(p, 's')).toEqual([]);
+      expect(keysIn(p, 'c')).toEqual([]);
+      expect(keysIn(p, 'x').filter((k) => !k.startsWith(`x:1:${a.pid}:`))).toEqual([]);
       expect(p.casino.readChips(b.pid)).toBe(1_000);
     }
     // Its seeds go for the rounds the checkpoint covers. Past it they stay
@@ -875,7 +907,8 @@ describe('races', () => {
     const trimmed = run([w], closed + 2 * STEP, closed + 120_000, { step: STEP, until: () => trimmedTo(w, 1) });
     expectAt(trimmed, openAt + 2 * STEP + w.table.IDLE_MS);
     expect(keysIn(w, 's', 2).map((k) => k.split(':')[2])).toEqual([closer.pid]);
-    expect(keysIn(w, 'x')).toEqual([]);
+    // 🔁 W's round-2 reveal is gone (deleted above); only round-1 copies ride the trim (§6.1 b).
+    expect(keysIn(w, 'x', 2)).toEqual([]);
     expect(foldOf(w).held.get(other.pid)).toBeUndefined();
     // A page that never saw the seed joins and bets; the other wakes, and
     // once it has waited out the wake and the show it restarted, its felt

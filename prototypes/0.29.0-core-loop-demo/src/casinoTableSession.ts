@@ -73,6 +73,7 @@ import {
   writeComputedSlip,
 } from './computedTable';
 import type { ComputedCrapsState, ComputedRouletteState, ComputedSlipWrite } from './computedTable';
+import type { Decision } from './computedFold';
 import { noteComputedToss } from './computedRobot';
 import { crapsBackend } from './crapsBackend';
 import { crapsSettleMoves } from './crapsSettleShow';
@@ -2343,6 +2344,16 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
     return { line: `🎡 ROUND ${round()} — PLACE YOUR BETS${remain()}${readChips(me) <= 0 && !staked ? ' · VISIT THE CASHIER FOR CHIPS' : ''}`, color: GOLD_BRIGHT };
   };
 
+  /** 🔁 The felt's note when the round the checkpoint kept was decided a way
+   *  this page didn't see (the L7 fix, ComputedState.unseen): the trimmer's
+   *  decision, re-derived from the copies, which this page now shows. */
+  const unseenNote = (d: Decision | undefined): string =>
+    d === 'forfeit' ? "DECIDED BY A FORFEIT THIS PAGE DIDN'T SEE"
+      : d === 'house' ? "DECIDED BY THE HOUSE'S REVEAL THIS PAGE DIDN'T SEE"
+        : d === 'void' ? "A RESULT THIS PAGE DIDN'T SEE"
+          : d === 'reveals' ? "DECIDED BY EVERY SEED THIS PAGE DIDN'T SEE"
+            : '';
+
   /** 🎲 A computed craps table's status line, in this order: rolls undone;
    *  my fling's time gone by (until the dice land); a change too late for
    *  the close, or new bets that missed it; the dice in the air (a flight
@@ -2405,10 +2416,14 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       return wait ?? { line: '✋ NO MORE BETS — THE STICKMAN THROWS', color: PINK };
     }
     if (s.phase === 'settled' && s.voided) {
-      return { line: '⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL', color: GOLD_BRIGHT };
+      // 🔁 A trim can void a round this page saw decided (the L7 fix): note it,
+      // in wording that fits an abandon or a house reveal that counted nobody.
+      const note = unseenNote(s.unseen);
+      return { line: `⚠ ROLL VOID — NOBODY COULD FINISH IT · BETS STAND FOR THE NEXT ROLL${note ? ` · ${note}` : ''}`, color: GOLD_BRIGHT };
     }
     if (s.phase === 'settled' && s.dice) {
       const parts = [`● ${callOf(s.dice, s.pointBefore ?? null, s.point)}`];
+      if (unseenNote(s.unseen)) parts.push(unseenNote(s.unseen));
       const amount = s.amounts?.[me];
       if (s.pushes?.includes(me)) parts.push('PUSH');
       else if (amount !== undefined) parts.push(signedChips(amount));
@@ -2421,7 +2436,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       const check = computedRoundCheck(itemId);
       const fate = check?.round === s.round ? check.mine : null;
       const rest = mine?.riding ? ' · THE REST PLAYED' : '';
-      const lost = (mine?.lost ?? 0) > 0;
+      // 🔁 Past a trim the shown round is off-chain, so computedMine is null;
+      // fall back to the rebuilt check's loss so the felt agrees with the ⚙
+      // card (which reads c.mineLost) on NEW BETS FORFEITED vs PLAYED WITHOUT IT.
+      const lost = (mine?.lost ?? (check?.round === s.round ? check.mineLost ?? 0 : 0)) > 0;
       if (mine?.tooLate) parts.push('TOO LATE — THE CLOSE HAD YOUR EARLIER BETS');
       else if (fate === 'left-out') {
         if (mine?.added) parts.push(`YOUR NEW BETS MISSED THE CLOSE — CHIPS BACK${rest}`);
@@ -2474,7 +2492,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
       if (mine?.frozen && !mine.revealed) return { line: '✋ NO MORE BETS — STAY UNTIL THE SPIN', color: PINK };
       return houseWait() ?? { line: '✋ NO MORE BETS — WAITING FOR SEEDS', color: PINK };
     }
-    if (s.phase === 'settled' && s.voided) return { line: '⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED', color: GOLD_BRIGHT };
+    if (s.phase === 'settled' && s.voided) {
+      // 🔁 A trim can void a round this page saw decided (the L7 fix): note it.
+      const note = unseenNote(s.unseen);
+      return { line: `⚠ SPIN VOID — NOBODY COULD FINISH IT · STAKES RETURNED${note ? ` · ${note}` : ''}`, color: GOLD_BRIGHT };
+    }
     if (s.phase === 'settled' && s.result !== null) {
       const check = computedRoundCheck(itemId);
       const fate = check?.round === s.round ? check.mine : null;
@@ -2483,9 +2505,10 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           : fate === 'late' ? 'YOUR SEED CAME IN LATE — BETS FORFEITED'
             : fate === 'forfeited' ? 'YOUR SEED NEVER CAME — BETS FORFEITED'
               : '';
-      if (note) {
+      const extra = [unseenNote(s.unseen), note].filter(Boolean).join(' · ');
+      if (extra) {
         const won = (s.payouts?.[me] ?? 0) > 0;
-        return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''} · ${note}`, color: GOLD_BRIGHT };
+        return { line: `● ${s.result} ${pocketColor(s.result).toUpperCase()}${won ? ' — YOU WIN' : ''} · ${extra}`, color: GOLD_BRIGHT };
       }
     }
     return null;
@@ -2652,6 +2675,11 @@ export function createCasinoTableUI(deps: CasinoTableUIDeps): DeviceUI {
           parts.push(`NO SEED IN TIME FROM ${named.join(', ')}${more}`);
         }
       }
+      // 🔁 A trim can show a round decided a way this page never saw: note it
+      // on the card as on the felt, for a played or a void result, with generic
+      // wording for a void since it needn't be an abandon (a house reveal can
+      // count nobody).
+      if (c.unseen) parts.push(unseenNote(c.unseen));
       if (c.missing.length > 0) {
         parts.push(`${many(c.missing.length, 'FROZEN SLIP', 'FROZEN SLIPS')} NEVER CAME (${craps ? 'NEW BETS NOT STAKED' : 'NOT STAKED'})`);
       }

@@ -20,7 +20,7 @@ import {
   MAX_FROZEN, MAX_SESSION_ROUNDS, MAX_SLIP_BETS, nextSid, parseKey, pocketOf, recHash, revealKey, seedTable, slipCommit,
   slipKey, TableFold,
 } from './computedFold';
-import type { AbandonRec, CloseRec, FoldResult, ForfeitRec, SlipRec } from './computedFold';
+import type { AbandonRec, Checkpoint, CloseRec, FoldResult, ForfeitRec, SlipRec } from './computedFold';
 import {
   black, cachingCheck, ComputedKit, fakeIdentity, red, snapshot, straight, TEST_CTX, TestSession, testIdentity,
   trustAll,
@@ -1263,5 +1263,234 @@ describe('rawBytes: what the live session weighs, junk included', () => {
       if (rand() < 0.5) expect(f.result().rawBytes, `step ${step}`).toBe(coldWeight());
     }
     expect(f.result().rawBytes).toBe(coldWeight());
+  });
+});
+
+// ── 🔁 The round-u view: redecide (the L7 fix, §6.2 C) ───────────────────────
+
+describe('🔁 redecide — the round-u view (the L7 fix)', () => {
+  const seedOf = (id: ReturnType<typeof testIdentity>, r: number) => kit.seed(id.pid, r);
+  /** The pocket a round counting `ids`' default seeds lands on. */
+  const pocketFor = (r: number, ...ids: ReturnType<typeof testIdentity>[]) =>
+    pocketOf(TEST_CTX, r, [...ids].sort((a, b) => (a.pid < b.pid ? -1 : 1)).map((id) => seedOf(id, r)));
+  /** The lowest pocket 0..36 not among `taken`. */
+  const free = (...taken: number[]): number => {
+    for (let p = 0; p <= 36; p++) if (!taken.includes(p)) return p;
+    throw new Error('no free pocket');
+  };
+
+  /** Fold `session0` (this page's own view of round 1 under base 'g'), then
+   *  trim to `cp1` — capturing round 1's evidence — and load the live session
+   *  the trim opened (`live`, holding the copies). Ready for redecide(). */
+  function afterTrim(session0: Built<unknown>[], cp1: Checkpoint, live: Built<unknown>[]): TableFold {
+    const f = new TableFold(TEST_CTX, sigs.check);
+    f.reset(session0.map((r): [string, unknown] => [r.key, r.rec]));
+    f.result();
+    f.setBase(cp1);
+    f.reset(live.map((r): [string, unknown] => [r.key, r.rec]));
+    return f;
+  }
+
+  it('chooses a forfeit the trim carried over the reveals this page saw; equal nets keep both, the forfeit first and copied', () => {
+    const pA = pocketFor(1, A, B); // every reveal in
+    const pF = pocketFor(1, A); // the forfeit counts A only
+    expect(pA).not.toBe(pF);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    // Both bets lose on either pocket, so the forfeit's nets equal the reveals'.
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const cands = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid)]).redecide();
+    expect(cands.map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    expect(cands[0]).toMatchObject({ copied: true });
+    expect(cands[0].view).toMatchObject({ decided: 'forfeit', pocket: pF });
+    expect(cands[1]).toMatchObject({ d: 'r', copied: false });
+    expect(cands[1].view).toMatchObject({ decided: 'reveals', pocket: pA });
+  });
+
+  it('the reverse case: this page saw a forfeit, the trim decided reveals — the reveals reproduce and win', () => {
+    const pA = pocketFor(1, A, B); // the trimmer, every reveal in
+    const pF = pocketFor(1, A); // this page's forfeit, counting A only
+    expect(pA).not.toBe(pF);
+    const xa = kit.slip(A, 1, [straight(pA, 5)]); // wins on the reveals' pocket, loses on the forfeit's
+    const xb = kit.slip(B, 1, [straight(free(pA, pF), 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    // This page saw a forfeit (missing B); the trimmer saw every reveal.
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), forfeit];
+    const revealsNets = { [A.pid]: 5n * 35n, [B.pid]: -5n }; // A wins its straight on pA, B loses
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, revealsNets);
+    const cands = afterTrim(session0, cp1, [kit.reveal(1, A.pid), kit.reveal(1, B.pid)]).redecide();
+    // The forfeit's nets ({A:-5,B:-5}) don't match the checkpoint, so only the
+    // reveals survive — the page drops its forfeit verdict and shows the reveals.
+    expect(cands.map((c) => c.d)).toEqual(['r']);
+    expect(cands[0]).toMatchObject({ copied: true });
+    expect(cands[0].view).toMatchObject({ decided: 'reveals', pocket: pA });
+  });
+
+  it('a stranger’s abandon (R3) changes nothing: the forfeit reproduces and comes first, the void is dropped by the nets', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    // A stranger D abandons the same close (a valid record the trim could copy).
+    const stranger = kit.abandon(D, 1, close.hash);
+    const cands = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid), stranger]).redecide();
+    expect(cands.map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']); // no void: it refunds, so its nets differ
+    expect(cands.some((c) => c.view.decided === 'void')).toBe(false);
+  });
+
+  it('ignores fakes silently: a bad-signature forfeit, a junk reveal, a copy for another close, and one for another round', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const fake = fakeIdentity('stranger');
+    const fakes = [
+      kit.forfeit(fake, 1, close.hash, [A.pid]), // bad signature (and a key no slip names)
+      kit.reveal(1, A.pid, 'de'.repeat(32)), // a seed that opens no frozen commitment
+      kit.forfeit(A, 1, 'ab'.repeat(16), [A.pid]), // names another close
+      kit.reveal(2, A.pid), // another round than u
+    ];
+    const cands = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid), ...fakes]).redecide();
+    expect(cands.map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    expect(cands[0]).toMatchObject({ copied: true });
+    expect(cands[0].view).toMatchObject({ decided: 'forfeit', pocket: pF });
+  });
+
+  it('the nets decide which candidate survives: only the one reproducing the checkpoint, and none when nothing does', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    expect(pA).not.toBe(pF);
+    const xa = kit.slip(A, 1, [straight(pA, 5)]); // wins on pA, loses on pF
+    const xb = kit.slip(B, 1, [straight(free(pA, pF), 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const live = [forfeit, kit.reveal(1, A.pid)];
+    // The forfeit's nets ({A:-5,B:-5}) — the reveals' ({A:+175,B:-5}) don't match.
+    const forfeitCp = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const only = afterTrim(session0, forfeitCp, live).redecide();
+    expect(only.map((c) => c.d)).toEqual([`f:${forfeit.hash}`]);
+    expect(only[0].view).toMatchObject({ pocket: pF });
+    // A checkpoint neither candidate reproduces: redecide finds nothing (C5).
+    const wrongCp = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: 1n });
+    expect(afterTrim(session0, wrongCp, live).redecide()).toEqual([]);
+  });
+
+  it('a v0.50 trim carries no copies: the forfeit can’t be rebuilt, the page keeps its reveals, and nothing is copied', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    // The trimmer decided a forfeit (equal nets) but, being v0.50, copied nothing.
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const cands = afterTrim(session0, cp1, []).redecide();
+    // Only the reveals this page saw survive, from its own memory — copied false,
+    // so D2 will sign no d/o (L7 stays for a v0.50 trim, but no false pocket).
+    expect(cands.map((c) => c.d)).toEqual(['r']);
+    expect(cands[0]).toMatchObject({ copied: false });
+    expect(cands[0].view).toMatchObject({ decided: 'reveals', pocket: pA });
+  });
+
+  it('keeps the round-u evidence across a checkpoint rewind, so a restore shows the correction again (R2 Finding 5)', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const live = (): [string, unknown][] => [forfeit, kit.reveal(1, A.pid)].map((r) => [r.key, r.rec]);
+    const f = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid)]);
+    // The L7 correction is live: the forfeit the trim carried, reproduced.
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    // A cheat rewinds the checkpoint to the genesis base — a valid-shaped
+    // excursion the capture can't tag. The evidence is kept but dormant: its
+    // forSid no longer matches the active base, so redecide falls silent.
+    f.setBase(null);
+    f.reset([]);
+    expect(f.redecide()).toEqual([]);
+    // The honest checkpoint is restored and its session reloaded: the kept
+    // evidence serves again and the correction returns, rather than the felt
+    // reverting to the stale pre-trim verdict (it would, had the excursion
+    // dropped the evidence — capturePrior can't recapture it from the rewind).
+    f.setBase(cp1);
+    f.reset(live());
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+  });
+
+  it('keeps each kept base’s evidence when an intermediate rewind captures another checkpoint for the same round/close (R3)', () => {
+    const pA = pocketFor(1, A, B);
+    const pF = pocketFor(1, A);
+    const pickA = free(pA, pF);
+    const pickB = free(pA, pF, pickA);
+    const xa = kit.slip(A, 1, [straight(pickA, 5)]);
+    const xb = kit.slip(B, 1, [straight(pickB, 5)]);
+    const close = kit.close(A, 1, 'g', [xa, xb]);
+    const session0 = [xa, xb, close, kit.reveal(1, A.pid), kit.reveal(1, B.pid)];
+    const forfeit = kit.forfeit(A, 1, close.hash, [A.pid]);
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: -5n, [B.pid]: -5n });
+    const live = (): [string, unknown][] => [forfeit, kit.reveal(1, A.pid)].map((r) => [r.key, r.rec]);
+    const f = afterTrim(session0, cp1, [forfeit, kit.reveal(1, A.pid)]);
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+    // A cheat rewinds to genesis, replays the old session, and trims to ANOTHER
+    // checkpoint for the same round and close but with altered nets. Keyed by
+    // base, its capture must not displace cp1’s kept evidence (a single slot
+    // did, and the honest restore then lost the correction).
+    f.setBase(null);
+    f.reset(session0.map((r): [string, unknown] => [r.key, r.rec]));
+    f.result();
+    const cpAlt = kit.checkpoint(C, 'g', 1, close.hash, { [A.pid]: 7n });
+    f.setBase(cpAlt);
+    f.reset([]);
+    expect(f.redecide()).toEqual([]); // nothing reproduces the altered nets (C5)
+    // The honest checkpoint restored: cp1’s evidence still serves, so the
+    // correction returns rather than the felt reverting to the pre-trim verdict.
+    f.setBase(cp1);
+    f.reset(live());
+    expect(f.redecide().map((c) => c.d)).toEqual([`f:${forfeit.hash}`, 'r']);
+  });
+
+  it('adds one void candidate for a flood of valid abandons — the fold-order first, as decide picks it (R3 HIGH)', () => {
+    const xa = kit.slip(A, 1, [straight(pocketFor(1, A), 5)]);
+    const close = kit.close(A, 1, 'g', [xa]);
+    const session0 = [xa, close, kit.abandon(A, 1, close.hash)]; // this page saw A’s abandon void it
+    const cp1 = kit.checkpoint(C, 'g', 1, close.hash, {}); // a void refunds: no nets
+    // The trim session carries valid abandons from three keys for the same close.
+    const flood = [kit.abandon(A, 1, close.hash), kit.abandon(B, 1, close.hash), kit.abandon(D, 1, close.hash)];
+    const voids = afterTrim(session0, cp1, flood).redecide().filter((c) => c.view.decided === 'void');
+    // One, not three: redecide weighs only the lowest-rank abandon (all void the
+    // round identically), so a flood can’t multiply the per-rebuild game/net work.
+    expect(voids).toHaveLength(1);
+    const byRank = (x: Built<unknown>, y: Built<unknown>): number => {
+      const rx = dutyRank('abandon', TEST_CTX, 1, (x.rec as AbandonRec).k);
+      const ry = dutyRank('abandon', TEST_CTX, 1, (y.rec as AbandonRec).k);
+      return rx < ry ? -1 : rx > ry ? 1 : x.hash < y.hash ? -1 : 1;
+    };
+    expect(voids[0].d).toBe(`z:${[...flood].sort(byRank)[0].hash}`);
   });
 });

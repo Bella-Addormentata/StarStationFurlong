@@ -153,6 +153,7 @@ import {
   computedCheckpointOf,
   computedEndedIncs,
   computedFoldOf,
+  computedRedecide,
   computedIncEnded,
   computedIncFor,
   computedIncOf,
@@ -212,7 +213,7 @@ import {
 } from './computedFold';
 import type {
   AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, Duty, FoldCtx, FoldResult, ForfeitRec, GameName, HouseSum, RecKind,
-  RevealRec, RoundView, SignedKind, SlipInfo,
+  RedecideCandidate, RevealRec, RoundView, SignedKind, SlipInfo,
 } from './computedFold';
 import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
@@ -741,6 +742,33 @@ function lastDecided(res: FoldResult): RoundView | null {
   return null;
 }
 
+/** 🔁 A decided round's decider as a signature, matching a RedecideCandidate's
+ *  `d`: 'r' for every reveal, else the deciding record's kind and hash. Tells
+ *  this page's own decision of round u from the trimmer's (the L7 fix). */
+function decisionSig(v: RoundView): string {
+  if (v.decided === 'forfeit' && v.forfeit) return `f:${v.forfeit.hash}`;
+  if (v.decided === 'house' && v.house) return `h:${v.house.hash}`;
+  if (v.decided === 'void') return v.abandon ? `z:${v.abandon.hash}` : v.house ? `h:${v.house.hash}` : 'z:';
+  return 'r';
+}
+
+/** 🔁 The round-u view's chosen candidate (redecide's first survivor in fold
+ *  order), or null with no prior evidence or nothing reproducing the
+ *  checkpoint: how the trimmer decided round u = res.base.u, re-derived from
+ *  the copies and this page's own evidence (§6.2 C). */
+function chosenRoundU(st: TableState, res: FoldResult): RedecideCandidate | null {
+  if (res.base.u === 0) return null;
+  // The first surviving candidate in the fold's own order (§6.2 C4): house
+  // reveal; forfeit by rank; every reveal; void by abandon. Fold order is fixed
+  // by the records themselves, never by which candidate the live session
+  // happens to carry — so a validly-signed record replayed into the session
+  // can't move the pick. On equal nets more than one candidate reproduces the
+  // checkpoint; fold order picks among them and the chips are right either way
+  // (C4, §6.4). The owner's signed d/o is bound to its own decision separately
+  // (attestDuty), so a replay can't make it vouch for a pocket it didn't fold.
+  return computedRedecide(st.t)[0] ?? null;
+}
+
 /** Keep what the fold said that a trim takes away: the last decided round
  *  (the felt shows it through the trim), and, when the session moves on, by
  *  how much the checkpoint differs from what this page had folded; what
@@ -783,7 +811,18 @@ function noteResult(st: TableState, res: FoldResult): void {
   // the gate may have reopened for a held-off one.
   else retryPendingAttest(st);
   const D = lastDecided(res);
-  if (D) st.lastD = D;
+  // 🔁 L7 across a restore (§6.2 C): a forgery being undone (forgedStands → a
+  // restore is pending) must not overwrite this page's record of the last
+  // honest decided round. Were it to, a rewind/jump excursion whose decided
+  // round sits at a different round or close would clobber st.lastD, and once
+  // the honest checkpoint is back — its round u trimmed, so no decided round in
+  // the session — the round-u view would have neither a chain verdict nor a
+  // matching st.lastD, and the L7 reconciliation (the branch in build/
+  // roundCheck keyed on st.lastD) would be skipped. Freezing st.lastD through
+  // the excursion keeps the honest round-u verdict, so the restore is handled
+  // by that same tested branch with the real on-chain timing (no reconstructed
+  // view to perturb the betting/settled phase).
+  if (D && !forgedStands(st)) st.lastD = D;
   st.lastRes = res;
   noteReplaced(st, res, moved);
   noteChanged(st, res, moved);
@@ -866,10 +905,27 @@ function attestDuty(st: TableState, was: FoldResult, res: FoldResult, carriedPla
   //    (played): an honest trim cuts at the last decided round, so a later one
   //    is a premature cut, a race, or a forger dropping a settled round.
   if (played > P.u || was.rounds.some((v) => v.decided !== null && v.r > P.u)) return fail();
-  // How round u was decided, when this page is sure: its own house reveal, the
-  // one decision no unseen record can beat (the copies-carried case is 6a-3).
-  let decided: { d: string; o: number | [number, number] } | undefined;
-  if (at.decided === 'house' && at.house) {
+  // How round u was decided, when this page is sure (§6.3 D2 "d and o"). The
+  // round-u view (§6.2 C) runs first; the deed holder signs its chosen
+  // candidate's decider and pocket only when that candidate is this page's own
+  // decided round (`at`) and the trim carried its copies (D1). Bound to the fold
+  // this page authenticated — not to which records the live session now holds —
+  // so a validly-signed record replayed into the session can't make it vouch
+  // for a pocket it didn't fold. When the fold-order pick differs from its own
+  // decision (it is itself the L7 victim, or a peer's equal-nets decider sorts
+  // first), it signs no d/o; a recovering page then shows no pocket (C5) rather
+  // than a possibly-substituted one. A void signs the decider with no pocket.
+  // With no copies (a v0.50 trimmer), it falls back to its own house reveal, the
+  // one decision no unseen record can beat; otherwise it omits both.
+  let decided: { d: string; o?: number | [number, number] } | undefined;
+  const chosen = chosenRoundU(st, res);
+  if (chosen && chosen.copied && chosen.d === decisionSig(at)) {
+    if (chosen.view.decided === 'void') decided = { d: chosen.d };
+    else {
+      const o = st.game === 'craps' ? chosen.view.craps?.dice : chosen.view.pocket;
+      decided = o !== null && o !== undefined ? { d: chosen.d, o } : { d: chosen.d };
+    }
+  } else if (at.decided === 'house' && at.house) {
     const o = st.game === 'craps' ? at.craps?.dice : at.pocket;
     if (o !== null && o !== undefined) decided = { d: `h:${at.house.hash}`, o };
   }
@@ -886,7 +942,7 @@ function attestDuty(st: TableState, was: FoldResult, res: FoldResult, carriedPla
     ...(P.e !== undefined ? { e: P.e } : {}),
     ...(P.s !== undefined ? { s: P.s } : {}),
     ...(P.h !== undefined ? { h: P.h } : {}),
-    ...(decided !== undefined ? { d: decided.d, o: decided.o } : {}),
+    ...(decided !== undefined ? { d: decided.d, ...(decided.o !== undefined ? { o: decided.o } : {}) } : {}),
     a,
     k: getIdentityPub(),
   };
@@ -1447,6 +1503,11 @@ function seedCtx(st: TableState, r: number, me: string): TableSeedContext {
 export interface ComputedRouletteState extends RouletteTableState {
   inc: string;
   spinKey: string;
+  /** 🔁 The L7 fix: when the shown round was re-decided from the trim's copies
+   *  (the round-u view), the decider the trimmer used, which this page saw
+   *  decided another way — the felt notes it was decided this way though this
+   *  page didn't see it. Absent when this page's own view stands. */
+  unseen?: Decision;
 }
 
 /**
@@ -1536,18 +1597,28 @@ function build(st: TableState, res: FoldResult, now: number): ViewEntry {
   const chain = lastDecided(res);
   // (Past a trim, the round the checkpoint kept, if this page saw it: not
   // one it saw decided at that round on the other side of a split, which
-  // the checkpoint dropped. The close is all the checkpoint names of it, so
-  // a page that hears a forfeit beat the reveals it saw only with the trim
-  // still shows the reveals' result, its card flagging the checkpoint.)
-  const D = chain ?? (st.lastD && st.lastD.r === res.base.u && st.lastD.close === res.base.l ? st.lastD : null);
+  // the checkpoint dropped. The close is all the checkpoint names of it.)
+  let D = chain ?? (st.lastD && st.lastD.r === res.base.u && st.lastD.close === res.base.l ? st.lastD : null);
   const onChain = chain !== null;
+  // 🔁 The L7 fix (§6.2 C): a page that saw the round the checkpoint kept
+  // decided one way (every reveal, say) but whose trimmer decided it another
+  // (a forfeit it never saw) used to keep showing its own result. Now the
+  // round-u view re-derives the trimmer's decision from the copies and, when
+  // it differs, shows it — the felt notes the round was decided a way this
+  // page didn't see (unseen). Only while this page's own view of round u
+  // stands (not once the chain moved past it).
+  let unseen: Decision | undefined;
+  if (!onChain && D && D.r === res.base.u) {
+    const chosen = chosenRoundU(st, res);
+    if (chosen && chosen.d !== decisionSig(D)) { D = chosen.view; unseen = chosen.view.decided ?? undefined; }
+  }
   // The ⚙ card's verdict on D while its records are in the session: a trim
   // that takes them away leaves it (roundCheck), the card opened or not.
   if (onChain) checkOf(st, res, now);
   const show = D ? showStart(st, sc, D, onChain, now) : 0;
   // A forfeit's result waits out every page's grace.
   const held = D !== null && D.decided === 'forfeit' && now < show;
-  if (st.game === 'craps') return buildCraps(st, res, sc, D, onChain, show, held, now);
+  if (st.game === 'craps') return buildCraps(st, res, sc, D, onChain, show, held, now, unseen);
   let phase: RouletteTableState['phase'];
   let round: number;
   let holding: RoundView | null = null;
@@ -1593,10 +1664,11 @@ function build(st: TableState, res: FoldResult, now: number): ViewEntry {
     payouts: settled ? payoutsOf(D!) : null,
     ...(deadline !== undefined ? { phaseDeadline: deadline } : {}),
     ...(settled && D!.decided === 'void' ? { voided: true } : {}),
+    ...(settled && unseen ? { unseen } : {}),
     inc: st.inc,
     spinKey: D && D.pocket !== null && !held ? `${D.r}:${D.pocket}` : '',
   };
-  const key = `${phase}|${round}|${deadline ?? ''}|${view.spinKey}`;
+  const key = `${phase}|${round}|${deadline ?? ''}|${view.spinKey}|${view.unseen ?? ''}`;
   return { res, gen: clock.gen, builtAt: now, validUntil, view, key, firstKey: key, D, onChain, holding };
 }
 
@@ -1722,6 +1794,10 @@ export interface ComputedCrapsState extends CrapsTableState {
   /** How many players have bets riding on the table as it shows: into the
    *  roll on screen while one is held, else into the next. */
   riders: number;
+  /** 🔁 The L7 fix: when the shown roll was re-decided from the trim's copies
+   *  (the round-u view), the decider the trimmer used, which this page saw
+   *  decided another way. Absent when this page's own view stands. */
+  unseen?: Decision;
 }
 
 /** The view of a craps incarnation (build, after its common part: the last
@@ -1732,6 +1808,7 @@ export interface ComputedCrapsState extends CrapsTableState {
  *  again. */
 function buildCraps(
   st: TableState, res: FoldResult, sc: Scan, D: RoundView | null, onChain: boolean, show: number, held: boolean, now: number,
+  unseen?: Decision,
 ): ViewEntry {
   const me = getPlayerId();
   const carry = res.carry as CrapsCarry;
@@ -1842,6 +1919,7 @@ function buildCraps(
     payouts: settled ? payoutsOf(D!) : null,
     ...(settled && roll?.sevenOut ? { sevenOut: true } : {}),
     ...(settled && D!.decided === 'void' ? { voided: true } : {}),
+    ...(settled && unseen ? { unseen } : {}),
     ...(deadline !== undefined ? { phaseDeadline: deadline } : {}),
     ...(phase === 'betting' && holder !== undefined ? { shooter: holder } : shooter !== undefined ? { shooter } : {}),
     inc: st.inc,
@@ -1862,7 +1940,7 @@ function buildCraps(
     } : {}),
     riders: Object.keys((holding === D && roll ? roll.sIn : carry).w).length,
   };
-  const key = `${phase}|${round}|${deadline ?? ''}|${view.rollKey}|${view.shooter ?? ''}|${stallUntil ?? ''}`;
+  const key = `${phase}|${round}|${deadline ?? ''}|${view.rollKey}|${view.shooter ?? ''}|${stallUntil ?? ''}|${view.unseen ?? ''}`;
   return { res, gen: clock.gen, builtAt: now, validUntil, view, key, firstKey: key, D, onChain, holding, ...(betEnd !== undefined ? { betEnd } : {}) };
 }
 
@@ -2029,6 +2107,11 @@ export interface ComputedRoundCheck {
    *  close: the nets/carry lines mean something). Absent when no trim this
    *  page folded set it. */
   covered?: 'unseen' | 'split' | 'same';
+  /** 🔁 Set when a trim decided this round a way this page never saw (the L7
+   *  fix): the trimmer's decision (matching the felt). The other fields then
+   *  describe that decision — the one the copies carry — not this page's own
+   *  remembered verdict, and the card notes the round decided unseen. */
+  unseen?: Decision;
 }
 
 /** At craps: the checkpoint's difference split (ComputedRoundCheck). */
@@ -2055,6 +2138,53 @@ function crapsCheck(st: TableState, sc: Scan, res: FoldResult, D: RoundView, me:
   };
 }
 
+/** 🔁 The ⚙ card for round u after a trim decided it a way this page never
+ *  saw (L7): the cached verdict `base` — this page's own observations of the
+ *  close (checkpointDiff, pinMismatch, replaced) kept — with the decision
+ *  facts rebuilt from the chosen round-u view `v` (the trimmer's, matching the
+ *  felt), the timing flags this page can't claim against an unseen record
+ *  dropped, and the round noted unseen. */
+function l7Check(base: ComputedRoundCheck, v: RoundView): ComputedRoundCheck {
+  const me = getPlayerId();
+  const F = v.forfeit?.rec;
+  const mine: MySlipFate | null = v.present.includes(me)
+    ? v.decided === 'void' || v.counted.includes(me) ? 'frozen' : v.revealed.includes(me) ? 'late' : 'forfeited'
+    : base.mine; // left-out is the close's doing, not the decision's
+  return {
+    ...base,
+    decided: v.decided!,
+    counted: v.counted.length,
+    of: Object.keys(v.frozen).length,
+    missing: v.missing,
+    forfeitBy: F ? v.present.find((pid) => keyFor(pid) === F.k) ?? null : null,
+    mine,
+    dropped: [],
+    houseDropped: [],
+    fair: v.closeRec.h !== undefined,
+    houseVoid: v.decided === 'void' && v.closeRec.h !== undefined && v.house === undefined && v.houseWaits === undefined,
+    houseWaited: v.decided === 'void' ? v.houseWaits ?? [] : [],
+    unseen: v.decided ?? undefined,
+    ...l7Craps(v, me),
+  };
+}
+
+/** 🔁 The craps fields of an L7 round-u card, from the chosen view `v`: the
+ *  roll as the trimmer's decision had it, all derivable from the view. This
+ *  page's `mineAdded` stays as `base` had it (whether it put chips on during
+ *  the roll is its own doing, frozen by the close, not the decision's); only
+ *  `mineLost` follows the decided roll. */
+function l7Craps(v: RoundView, me: string): Partial<ComputedRoundCheck> {
+  if (!v.craps) return {};
+  const roll = v.craps;
+  return {
+    illegal: [...roll.fates].filter(([, f]) => f === 'illegal').map(([pid]) => pid).sort(),
+    uncounted: v.decided === 'forfeit' || v.decided === 'house' ? v.present.filter((pid) => pid !== me && !v.counted.includes(pid)) : [],
+    roll: { dice: roll.dice, pointBefore: roll.pointBefore, pointAfter: roll.pointAfter, sevenOut: roll.sevenOut },
+    unseeded: [...roll.fates.values()].filter((f) => f === 'rider').length,
+    mineLost: clampSafe(roll.lost.get(me) ?? 0n),
+  };
+}
+
 function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRoundCheck | null {
   const D = lastDecided(res);
   const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
@@ -2064,7 +2194,16 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     // A trim took the round out of the session: what this page said of it,
     // if it is the round the checkpoint kept.
     const kept = res.base.l !== null ? st.checks.get(res.base.l) : undefined;
-    return kept?.round === res.base.u ? { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res), ...coveredOf } : null;
+    if (kept?.round !== res.base.u) return null;
+    const base: ComputedRoundCheck = { ...kept, checkpointDiff: diff, ...replacedOf(st), ...cpPartsOf(st, res), ...coveredOf };
+    // 🔁 L7: the trim may have decided round u a way this page never saw. When
+    // the round-u view's chosen candidate differs from this page's own verdict
+    // (st.lastD, as the felt compares it), show the trimmer's decision here too
+    // — matching the felt — rather than the stale cached verdict.
+    const own = st.lastD && st.lastD.r === res.base.u && st.lastD.close === res.base.l ? st.lastD : null;
+    if (!own) return base;
+    const chosen = chosenRoundU(st, res);
+    return chosen && chosen.d !== decisionSig(own) ? l7Check(base, chosen.view) : base;
   }
   const sc = scanOf(st, res);
   const me = getPlayerId();
@@ -2122,7 +2261,17 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
     ...(D.craps ? crapsCheck(st, sc, res, D, me) : {}),
     ...coveredOf,
   };
-  st.checks.set(D.close, out);
+  // 🔁 L7 across a restore (§6.2 C): don't cache a forgery's check over this
+  // page's honest one while a restore is pending (forgedStands). A populated
+  // rewind — a replay whose session decides the checkpoint's close another way
+  // (full reveals over the trimmer's forfeit, say) — folds that close here, and
+  // caching it would clobber the honest check keyed by the same close; once the
+  // head is back, roundCheck reads this cache as `kept` and the ⚙ card would
+  // show the forgery's verdict while the felt (built from the preserved
+  // st.lastD) shows the honest one. The live card still returns `out` during
+  // the excursion; only the cache the restore reads back is protected (the twin
+  // of the st.lastD freeze in noteResult).
+  if (!forgedStands(st)) st.checks.set(D.close, out);
   return out;
 }
 
@@ -3645,6 +3794,15 @@ function trimDuty(st: TableState, pub: string, now: number): void {
   for (const j of res.joins) {
     const v = sc.ses?.get(`o:${res.open}:${j.hash}`);
     if (v !== undefined) copies.push([`o:${res.open}:${j.hash}`, v]);
+  }
+  // 🔁 The L7 fix (§6.1 b): also copy round D's deciding record and the
+  // reveals it counted, byte for byte, so a page that saw round D decided
+  // another way can re-decide it from this evidence in the next session (the
+  // round-u view). Invisible to a v0.50 fold, which walks from u+1 and never
+  // reads a round-D record.
+  for (const key of D.deciderCopies ?? []) {
+    const v = sc.ses?.get(key);
+    if (v !== undefined) copies.push([key, v]);
   }
   // Refused if the checkpoint moved on meanwhile (another page's trim). What
   // it covers is let go of, seeds and all, as the page next reads the table

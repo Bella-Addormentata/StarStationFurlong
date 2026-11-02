@@ -256,7 +256,7 @@ export function byRank(pages: Page[], duty: 'close' | 'forfeit' | 'abandon' | 't
  *  unless given; at a craps name with the table's state after it, or
  *  `carry`), the old session gone, the open round's felts copied into the
  *  new one, all in one transaction. The new session's id. */
-export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigint>, t = PAGE_TABLE, given?: CrapsCarry): string {
+export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigint>, t = PAGE_TABLE, given?: CrapsCarry, copyDecider = true): string {
   const res = p.casino.computedFoldOf(t)!;
   const inc = p.casino.computedIncOf(t)!;
   const kit = new ComputedKit({ room: PAGE_ROOM, t, inc });
@@ -267,6 +267,14 @@ export function trimByHand(p: Page, id: TestIdentity, nets?: Record<string, bigi
   const old = p.casino.computedSessionForWrite(t)!;
   const copies = [...res.felts.values()].map((s): [string, unknown] => [s.key, old.get(s.key)]);
   for (const j of res.joins) copies.push([`o:${res.open}:${j.hash}`, old.get(`o:${res.open}:${j.hash}`)]);
+  // 🔁 The L7 copies (§6.1 b): round D's deciding record and the reveals it
+  // counted, as commit 3's trimDuty copies them (computedTable.ts).
+  // `copyDecider = false` simulates a v0.50 trim that carried no copies.
+  if (copyDecider)
+    for (const key of D.deciderCopies ?? []) {
+      const v = old.get(key);
+      if (v !== undefined) copies.push([key, v]);
+    }
   p.doc.transact(() => {
     const m = p.doc.getMap('casinoComputed');
     m.set(`sum:${t}:${inc}`, cp);

@@ -1292,12 +1292,15 @@ describe('the re-put', () => {
     sync(opened, a, b);
     expect(foldOf(a).base.u).toBe(1);
     expect(a.casino.readChips(a.pid)).toBe(chips);
-    // Round 1's slip, close and seed aren't in the new session, and stay out.
+    // Round 1's slip and close aren't in the new session, and stay out; its reveal
+    // rides the trim as a round-u copy (§6.1 b), but the seed cache is still let go.
     let T = opened + STEP;
     for (; T <= opened + 3_000; T += STEP) run([a, b], T, T);
     expect(keysIn(a, 's', 1)).toEqual([]);
     expect(keysIn(a, 'c', 1)).toEqual([]);
-    expect(keysIn(a, 'x', 1)).toEqual([]);
+    const x1 = keysIn(a, 'x', 1);
+    expect(x1).toHaveLength(1);
+    expect(x1[0].startsWith(`x:1:${a.pid}:`)).toBe(true);
     expect(a.fair.seedFor(c1, ctx1)).toBeNull();
     // A round-2 slip deleted from the new session goes back.
     expect(a.table.writeComputedSlip(TABLE, [red(15)], T)).toBe('ok');
