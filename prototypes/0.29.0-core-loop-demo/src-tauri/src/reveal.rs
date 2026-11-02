@@ -882,6 +882,11 @@ mod tests {
         let reveal = &js[js.find("function reveal()").expect("reveal()")..];
         let reveal = &reveal[..reveal.find("ask('backup_reveal')").expect("its request")];
         assert!(reveal.contains("if (armed) disarm();"), "SHOW disarms CONFIRM before it asks");
+        // A request that is out (CONFIRM's included) disables SHOW, never
+        // HIDE: the button is enabled whenever the words are on screen.
+        let sync = &js[js.find("function sync()").expect("sync()")..];
+        let sync = &sync[..sync.find("\n  }").expect("its end")];
+        assert!(sync.contains("showButton.disabled = !shown && (asking || saving);"), "{sync}");
     }
 
     #[test]

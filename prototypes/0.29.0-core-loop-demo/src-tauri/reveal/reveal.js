@@ -74,8 +74,10 @@
     status.classList.toggle('bad', Boolean(bad));
   }
 
+  /** SHOW waits for any request that is out; HIDE never does, so words on
+   *  screen can always be hidden, a slow CONFIRM included. */
   function sync() {
-    showButton.disabled = asking || saving;
+    showButton.disabled = !shown && (asking || saving);
     savedButton.disabled = !revealed || asking || saving;
   }
 
