@@ -398,11 +398,14 @@ impl Feed {
                     if st.announcing && st.queued == 0 && st.reading {
                         continue;
                     }
-                    // (Nor has one that is up to date, unless its fold is pending: a pass with no
-                    // changes checks more of its signatures.)
+                    // (Nor has one that is up to date, unless its version moved with no change to send,
+                    // as when a record a page may read otherwise came and went while an earlier table
+                    // kept the push from visiting this one: an empty Warm says the worker has the table
+                    // as it stands now; or unless its fold is pending: a pass with no changes checks
+                    // more of its signatures.)
                     let more_to_check = slot.pending_streak < *max_pending
                         && slot.answer.as_ref().is_some_and(|a| a.summary.pending && a.version == slot.sent_version);
-                    if !st.announcing && st.queued == 0 && slot.given == *inputs && !more_to_check {
+                    if !st.announcing && st.queued == 0 && slot.given == *inputs && st.version == slot.sent_version && !more_to_check {
                         continue;
                     }
                     let Some(taken) = mirror.take(&ctx.t, &ctx.inc, FRAME_BYTES) else { continue };

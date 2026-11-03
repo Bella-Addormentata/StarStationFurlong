@@ -930,6 +930,27 @@ fn a_table_is_not_caught_up_while_it_waits_to_be_told_the_houses_and_pins_of_the
 }
 
 #[test]
+fn a_table_whose_version_moved_without_a_change_is_acknowledged_when_the_pipe_clears() {
+    let mut rig = Rig::new(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })));
+    rig.session(&live0(), &recs(1));
+    let t2 = live_of("t2", None);
+    rig.session(&t2, &recs(1));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.until("both caught up", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+    // The pipe is full: the first table's change is refused, and the second is not even visited ...
+    rig.sup.clog(QUEUE_BYTES);
+    rig.put(&live0(), &rk(1, 5), val(5));
+    rig.put(&t2, &rk(1, 6), proto());
+    rig.tick();
+    // ... while a record a page may read otherwise comes and goes there: the table is held and let go of,
+    // with nothing to send, and its version has moved on.
+    rig.remove(&t2, &rk(1, 6));
+    rig.tick();
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("both caught up again", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+}
+
+#[test]
 fn a_fold_that_is_pending_is_asked_again_with_no_changes_until_it_is_finished() {
     let script = Script::default();
     script.pending_for.store(3, Ordering::SeqCst);
