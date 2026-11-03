@@ -201,20 +201,31 @@ pub type Chain = PeerLane;
 /// (`SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY`), its known-good peers from
 /// `chia_peers.json`. Connections open on the first request and are shared by
 /// every handle. It binds what [`lane_binding`] names for the node's network.
-/// ⛓️ While Chia is off on this computer (`SSF_NO_CHIA_LANE`, chia_strict.rs)
-/// it is built closed ([`lane_for`]): no pins, no store, every request refused.
-static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| Arc::new(lane_for(crate::chia_network::net(), crate::chia_strict::strict())));
+/// ⛓️ While Chia is off on this computer (`SSF_NO_CHIA_LANE`, or the Chia
+/// switch in the SpacePhone's Network settings, chia_strict.rs) it is built
+/// closed ([`lane_for`]): no pins, no store, every request refused. Whether
+/// Chia is off is asked when the lane is first touched (the startup line);
+/// an in-game off made later closes it ([`close_lane`]).
+static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| Arc::new(lane_for(crate::chia_network::net(), crate::chia_strict::off_source())));
 
-/// The process's lane on `net`: closed when `strict`, which reads nothing
-/// from the environment and names no peer store; otherwise from the
-/// environment, with the network's store, as before.
-fn lane_for(net: crate::chia_network::ChiaNet, strict: bool) -> Lane {
+/// The process's lane on `net`: closed while `off` names what holds Chia
+/// off, which reads nothing from the environment and names no peer store;
+/// otherwise from the environment, with the network's store, as before.
+fn lane_for(net: crate::chia_network::ChiaNet, off: Option<crate::chia_strict::OffSource>) -> Lane {
     let (peers, store) = lane_binding(net);
-    if strict {
-        Lane::closed(peers)
-    } else {
-        Lane::from_env(peers, store)
+    match off {
+        Some(source) => Lane::closed(peers, crate::chia_strict::source_words(source)),
+        None => Lane::from_env(peers, store),
     }
+}
+
+/// ⛓️ Close the process's lane, for Chia turned off in the SpacePhone's
+/// Network settings (chia_strict.rs, the `/api/chia/lane` route): once this
+/// returns, every connection the lane dialled is closed and every request
+/// after is refused ([`Lane::close`]). The in-game off holds Chia off before
+/// it calls this, so a lane first touched here is built closed.
+pub async fn close_lane() {
+    LANE.close().await
 }
 
 /// The peer network a lane on `net` binds and where its peer store lives:
@@ -502,20 +513,25 @@ mod tests {
         }
     }
 
-    /// ⛓️ While Chia is off (`SSF_NO_CHIA_LANE`) the process's lane is built
-    /// closed on either network: no pin, no peer store, and its startup line
-    /// says so (the lane's own tests show a closed lane refuses every
-    /// request). The strict branch reads nothing from the environment.
+    /// ⛓️ While Chia is off (`SSF_NO_CHIA_LANE`, or the in-game switch) the
+    /// process's lane is built closed on either network: no pin, no peer
+    /// store, and its startup line says so and why (the lane's own tests
+    /// show a closed lane refuses every request). The closed branch reads
+    /// nothing from the environment.
     #[test]
     fn the_process_lane_is_built_closed_while_chia_is_off() {
         use crate::chia_network::ChiaNet;
+        use crate::chia_strict::{source_words, OffSource};
         for chia_net in ChiaNet::ALL {
-            let lane = lane_for(chia_net, true);
-            assert!(lane.is_closed(), "{chia_net:?}");
-            assert_eq!(lane.store_path(), None, "no chia_peers.json on {chia_net:?}");
-            assert_eq!(lane.pin_count(), 0, "SSF_CHIA_PEERS is not read");
-            assert!(lane.pin_port_warnings().is_empty());
-            assert!(lane.describe().starts_with("off. Chia is off on this computer"), "{}", lane.describe());
+            for source in [OffSource::Env, OffSource::Setting] {
+                let lane = lane_for(chia_net, Some(source));
+                assert!(lane.is_closed(), "{chia_net:?}");
+                assert_eq!(lane.store_path(), None, "no chia_peers.json on {chia_net:?}");
+                assert_eq!(lane.pin_count(), 0, "SSF_CHIA_PEERS is not read");
+                assert!(lane.pin_port_warnings().is_empty());
+                let line = lane.describe();
+                assert!(line.starts_with(&format!("off. Chia is off on this computer ({}): ", source_words(source))), "{line}");
+            }
         }
     }
 }

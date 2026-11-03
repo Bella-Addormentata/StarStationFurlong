@@ -107,8 +107,10 @@ jobs:
       # with SSF_NO_CHIA_LANE=1 beside SSF_CHIA_LANE=1, a remembered wallet
       # switch and one pin on loopback dials nothing and writes no Chia file
       # for three watcher ticks, and a control run without the switch dials
-      # the pin. It takes about four minutes, so it runs once, in the set
-      # players get, and not in the chia-publish or mainnet steps.
+      # the pin; there the page's in-game off closes its connections, and a
+      # third start reads the switch's file and builds the lane closed. It
+      # takes about four minutes, so it runs once, in the set players get,
+      # and not in the chia-publish or mainnet steps.
       - name: 🧪 cargo test --features chia-publish,torrent (the release set)
         run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
