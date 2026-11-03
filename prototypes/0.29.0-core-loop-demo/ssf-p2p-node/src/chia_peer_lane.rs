@@ -409,7 +409,8 @@ impl Lane {
     /// already under way admits no connection after this and asks nothing
     /// more (a name lookup or gossip request already out runs its course, but
     /// none follows it), queues nothing it learnt, and the peer store is not
-    /// written again. The in-game Chia switch is its caller; the env switch
+    /// written again. A dial waiting for the lane's first certificate does
+    /// not leave. The in-game Chia switch is its caller; the env switch
     /// builds the lane closed instead.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn close(&self) {
@@ -455,7 +456,7 @@ impl Lane {
     pub fn describe(&self) -> String {
         if self.is_closed() {
             format!(
-                "off. {} (SSF_NO_CHIA_LANE): no {} full node is asked, and nothing is read or written",
+                "off. {} (SSF_NO_CHIA_LANE): no {} full node is asked, and the peer store is neither read nor written",
                 crate::chia_strict::OFF_WORDS,
                 self.net.id
             )
@@ -1138,6 +1139,11 @@ impl Lane {
                 return Vec::new();
             }
         };
+        // Closed while the lane's first certificate was minted: no dial
+        // leaves. Nothing awaits between here and the dials' first poll.
+        if self.is_closed() {
+            return Vec::new();
+        }
         let net = self.net.clone();
         let dials = batch.into_iter().map(|cand| {
             let tls = tls.clone();
@@ -5623,6 +5629,7 @@ mod tests {
             assert!(lane.pin_port_warnings().is_empty());
             assert!(lane.describe().starts_with("off. Chia is off on this computer (SSF_NO_CHIA_LANE)"), "{}", lane.describe());
             assert!(lane.describe().contains(&net.id), "{}", lane.describe());
+            assert!(lane.describe().ends_with("the peer store is neither read nor written"), "{}", lane.describe());
         }
         let lane = Arc::new(Lane::closed(Network { introducers: vec!["localhost".to_string()], ..net() }));
         for trust in [Trust::Carrier, Trust::Agreed] {
@@ -5649,6 +5656,42 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0, "no connection reached the pin or the queued peer");
         assert!(!store.exists(), "no chia_peers.json");
+        assert_eq!(lane.live_count().await, 0);
+        keeper.abort();
+    }
+
+    /// A dial waiting for the lane's first certificate when the lane closes
+    /// (here the certificate is held back by a gate) does not leave once the
+    /// certificate is there.
+    #[tokio::test]
+    async fn a_dial_waiting_for_the_first_certificate_when_the_lane_closes_does_not_leave() {
+        let (hole, accepted, keeper) = black_hole().await;
+        let lane = Arc::new(Lane::new(net(), vec![], false, None).with_candidates(vec![(hole, Source::Introducer)]));
+        let (cert_tx, cert_rx) = tokio::sync::oneshot::channel::<Arc<rustls::ClientConfig>>();
+        let gate = {
+            let lane = lane.clone();
+            tokio::spawn(async move {
+                let _ = lane.tls.get_or_try_init(|| async { cert_rx.await.map_err(|_| anyhow!("gate")) }).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let dial = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.dial().await })
+        };
+        let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+            while !lane.state.lock().await.candidates.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waiting.is_ok() && !dial.is_finished(), "the dial took its batch and waits for the certificate");
+        lane.close().await;
+        let _ = cert_tx.send(TLS.clone());
+        gate.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0, "no dial left after the close");
+        tokio::time::timeout(Duration::from_secs(5), dial).await.expect("the dial ends").unwrap();
         assert_eq!(lane.live_count().await, 0);
         keeper.abort();
     }

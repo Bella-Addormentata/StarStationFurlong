@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 /// What a closed lane answers, and the start of every refusal that follows
 /// from it. A plain sentence: the player may read it.
+#[cfg_attr(not(feature = "chia-read"), allow(dead_code))]
 pub const OFF_WORDS: &str = "Chia is off on this computer";
 
 /// Classify a raw `SSF_NO_CHIA_LANE` value: `true` turns the lane off.

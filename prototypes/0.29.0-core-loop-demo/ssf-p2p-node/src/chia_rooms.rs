@@ -390,6 +390,20 @@ pub fn restored_caps_words(chia_off: bool) -> &'static str {
     }
 }
 
+/// What the log says a contact card filed in the address book is for: a
+/// pass's member cards (`many`) or one card. While Chia is off on this
+/// computer (`chia_off`) nothing is looked up by key, so the line does not
+/// promise it.
+pub fn card_filed_words(chia_off: bool, many: bool) -> &'static str {
+    if chia_off {
+        "Chia is off on this computer, so no presence is looked up by key"
+    } else if many {
+        "their presence is now findable by key"
+    } else {
+        "its presence is now findable by key"
+    }
+}
+
 /// May this node hand its contact card to the peers it is connected to in
 /// `room`, and file the cards they hand it? Only a room KNOWN to be private
 /// (N8: never a bundled or PUBLIC room, never one whose posture the browser
@@ -614,6 +628,20 @@ mod tests {
         let restored = restored_caps_words(true);
         assert!(restored.contains(crate::chia_strict::OFF_WORDS) && !restored.contains("for reading"), "{restored}");
         assert_eq!(restored_caps_words(false), "restored for reading (publishing and cards wait for a live cap)");
+    }
+
+    /// ⛓️ While Chia is off on this computer the log never says a filed card
+    /// makes a presence findable by key: nothing looks one up. With Chia on,
+    /// the words are as before.
+    #[test]
+    fn while_chia_is_off_a_filed_card_is_never_logged_as_findable() {
+        for many in [true, false] {
+            let off = card_filed_words(true, many);
+            assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
+            assert!(!off.contains("findable"), "{off}");
+        }
+        assert_eq!(card_filed_words(false, true), "their presence is now findable by key");
+        assert_eq!(card_filed_words(false, false), "its presence is now findable by key");
     }
 
     #[test]

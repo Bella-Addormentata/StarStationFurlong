@@ -224,12 +224,36 @@ pub fn remembered(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// What the switch file says at startup ([`remembered`]), or `Ok(false)`
+/// unread while Chia is off on this computer (`strict`): the wallet does not
+/// start whatever the file says ([`starts_on`]), and the Bank's view of a
+/// wallet that is not loaded never shows it.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn remembered_at_start(path: &Path, strict: bool) -> Result<bool, String> {
+    if strict {
+        return Ok(false);
+    }
+    remembered(path)
+}
+
 /// Remember the switch: written whole (a temporary file renamed over it),
 /// owner-only, like every file beside the identity.
 #[cfg(feature = "chia-publish")]
 pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&SwitchFile { on, at: now }).map_err(std::io::Error::other)?;
     crate::chia_contact::write_private(path, &bytes)
+}
+
+/// Remember the switch off, for the Bank's TURN OFF: `Ok(true)` when the
+/// file was written. While Chia is off on this computer (`strict`) a missing
+/// file already reads as off ([`remembered`]), so none is created; one an
+/// earlier run left is still saved off, for the next start with Chia on.
+#[cfg(feature = "chia-publish")]
+pub fn remember_off(path: &Path, strict: bool, now: u64) -> std::io::Result<bool> {
+    if strict && !path.try_exists().unwrap_or(true) {
+        return Ok(false);
+    }
+    remember(path, false, now).map(|()| true)
 }
 
 /// What the switch holds after a save of `target` failed with `err`, and how
@@ -1099,6 +1123,34 @@ mod tests {
             assert_eq!(remembered(&path), Ok(false));
             let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
             assert_eq!(left, vec![std::ffi::OsString::from(SWITCH_FILE)], "no temporary file left behind");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⛓️ While Chia is off on this computer the switch file is not read at
+    /// startup (an unreadable one is not reported either), and TURN OFF
+    /// creates none where there was none; one an earlier run left is still
+    /// saved off. With Chia on, both are as before.
+    #[test]
+    fn while_chia_is_off_the_switch_file_is_not_read_at_start_and_turning_off_creates_none() {
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-switch-off-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SWITCH_FILE);
+        std::fs::write(&path, b"{\"on\":tr").unwrap();
+        assert_eq!(remembered_at_start(&path, true), Ok(false), "not read while Chia is off");
+        assert!(remembered_at_start(&path, false).is_err(), "read, and reported, with Chia on");
+        std::fs::write(&path, br#"{"on":true}"#).unwrap();
+        assert_eq!(remembered_at_start(&path, false), Ok(true));
+        #[cfg(feature = "chia-publish")]
+        {
+            assert!(remember_off(&path, true, 9).unwrap(), "a file an earlier run left is saved off");
+            assert_eq!(remembered(&path), Ok(false));
+            std::fs::remove_file(&path).unwrap();
+            assert!(!remember_off(&path, true, 10).unwrap(), "nothing to clear");
+            assert!(!path.exists(), "no chia_wallet.json created while Chia is off");
+            assert!(remember_off(&path, false, 11).unwrap());
+            assert_eq!(remembered(&path), Ok(false), "with Chia on, TURN OFF writes the switch as before");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

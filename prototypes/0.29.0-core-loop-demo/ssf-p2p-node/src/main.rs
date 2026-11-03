@@ -1923,14 +1923,15 @@ async fn main() -> Result<()> {
     // never is at this startup load: there a new wallet waits for the
     // Bank's CREATE, and one already on disk loads.
     // ⛓️ Strict `SSF_NO_CHIA_LANE` (chia_strict.rs), Chia off on this
-    // computer, wins over all of it, read once: the lane is built closed and
-    // no Chia task, wallet or test hook starts (`chia_plan` below).
+    // computer, wins over all of it, read once: the lane is built closed,
+    // no Chia task, wallet or test hook starts (`chia_plan` below), and the
+    // switch file is not read (`remembered_at_start`).
     let chia_off = chia_strict::strict();
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
     let wallet_starts = {
-        match chia_wallet_switch::remembered(&chia_net.path(chia_wallet_switch::SWITCH_FILE)) {
+        match chia_wallet_switch::remembered_at_start(&chia_net.path(chia_wallet_switch::SWITCH_FILE), chia_off) {
             Ok(on) => wallet_memo.remembered = on,
             Err(why) => {
                 eprintln!("🏦 SSF wallet: {why} — the Bank's switch counts as off until it is turned again");
@@ -2249,7 +2250,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-read")]
         knock_publishing: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "chia-read")]
-        knocks: Mutex::new(chia_knock::KnockBook::load(&chia_network::net().path(chia_knock::KNOCKS_FILE))),
+        knocks: Mutex::new(chia_knock::KnockBook::at_start(&chia_network::net().path(chia_knock::KNOCKS_FILE), chia_off)),
         #[cfg(feature = "chia-publish")]
         chia_wallet: Mutex::new(chia_heartbeat_sk.clone()),
         #[cfg(feature = "chia-publish")]
@@ -2687,7 +2688,11 @@ async fn handle_wt_connection_inner(
                                             chia_resolve::unix_now(),
                                         );
                                         if filed > 0 {
-                                            println!("📇 {filed} member card(s) from room {}'s pass filed — their presence is now findable by key", envelope.room);
+                                            println!(
+                                                "📇 {filed} member card(s) from room {}'s pass filed — {}",
+                                                envelope.room,
+                                                chia_rooms::card_filed_words(chia_strict::strict(), true)
+                                            );
                                         }
                                         // And ours to the tabs, so the browser can carry it
                                         // in this room's passes (P6b): a live private cap
@@ -3079,9 +3084,10 @@ fn note_inbound_verified(hub: &SharedHub, remote_id: PublicKey, path: &(iroh::en
     let first_this_era = hub.inbound_verified.lock().unwrap().note(sa.is_ipv6(), height, now);
     if first_this_era {
         println!(
-            "📡 inbound verified: an unsolicited direct {} connection from {} reached us — this era's presence record will say so",
+            "📡 inbound verified: an unsolicited direct {} connection from {} reached us — {}",
             if sa.is_ipv6() { "IPv6" } else { "IPv4" },
-            sa.ip()
+            sa.ip(),
+            chia_contact::inbound_verified_words(chia_strict::strict())
         );
     }
 }
@@ -5137,8 +5143,9 @@ async fn dispatch_control(hub: &SharedHub, room_id: &str, remote_id: PublicKey, 
                         };
                         if changed {
                             println!(
-                                "📇 contact card from {} filed for room {room_id} — its presence is now findable by key",
-                                remote_id.to_string().chars().take(16).collect::<String>()
+                                "📇 contact card from {} filed for room {room_id} — {}",
+                                remote_id.to_string().chars().take(16).collect::<String>(),
+                                chia_rooms::card_filed_words(chia_strict::strict(), false)
                             );
                         }
                     }
@@ -6302,11 +6309,17 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         why
     };
     if !on {
-        if let Err(e) = chia_wallet_switch::remember(switch_path, false, now) {
+        // While Chia is off no switch file is created (`remember_off`).
+        let strict = chia_strict::strict();
+        if let Err(e) = chia_wallet_switch::remember_off(switch_path, strict, now) {
             return Err(failed_save(false, e, ""));
         }
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
-        println!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start");
+        if strict {
+            println!("🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start");
+        } else {
+            println!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start");
+        }
         return Ok(());
     }
     let loaded = hub.chia_wallet.lock().unwrap().is_some();

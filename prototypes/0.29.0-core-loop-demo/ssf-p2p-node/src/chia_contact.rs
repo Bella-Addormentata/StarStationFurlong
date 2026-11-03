@@ -496,6 +496,17 @@ impl InboundVerified {
     }
 }
 
+/// What the log says a first unsolicited inbound of an era is for. While
+/// Chia is off on this computer (`chia_off`) no presence record is written,
+/// so the line states the reachability fact alone.
+pub fn inbound_verified_words(chia_off: bool) -> &'static str {
+    if chia_off {
+        "Chia is off on this computer, so no presence record is written"
+    } else {
+        "this era's presence record will say so"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +854,16 @@ mod tests {
         assert_eq!(by_time.flags_for(true, 0, t + ERA_SECS - 1), FLAG_INBOUND_VERIFIED);
         assert_eq!(by_time.flags_for(true, 0, t + ERA_SECS), 0);
         assert_eq!(by_time.flags_for(true, h, t + 10), FLAG_INBOUND_VERIFIED, "a mark without a height still counts by time");
+    }
+
+    /// ⛓️ While Chia is off on this computer the inbound line never promises
+    /// a presence record: no publisher runs. With Chia on, the words are as
+    /// before.
+    #[test]
+    fn while_chia_is_off_an_inbound_mark_promises_no_presence_record() {
+        let off = inbound_verified_words(true);
+        assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
+        assert!(!off.contains("will say so"), "{off}");
+        assert_eq!(inbound_verified_words(false), "this era's presence record will say so");
     }
 }
