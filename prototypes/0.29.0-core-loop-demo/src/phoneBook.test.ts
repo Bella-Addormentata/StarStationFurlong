@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11 } from './chiaNetwork';
-import type { ChiaPresence, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaPresence, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 import { PHONE_BOOK_GREEN, PHONE_BOOK_GREY, phoneBookIconSvg, phoneBookIndicator } from './phoneBook';
 
 const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
@@ -126,35 +126,43 @@ describe('phoneBookIndicator', () => {
 describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
   const fp = (over: Partial<LocalFingerprint>): LocalFingerprint => ({ ...BASE, chia_net: net, ...over });
 
-  it('reads the switch alike on either network: mainnet makes SSF wallets now', () => {
+  it('sends the player to the Bank only where the SSF wallet pays for a listing', () => {
     const bank = "OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)";
-    // The desktop app's node, or a wallet on disk: the Bank can turn it on.
-    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'ready', backup: 'native' } })).row.value).toBe(bank);
-    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'ready', seed: true } })).row.value).toBe(bank);
-    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'on' } })).row.value).toContain('the SSF wallet is on');
-    for (const state of ['unbuilt', 'off', 'on'] as const) {
-      expect(phoneBookIndicator(fp({ chia_wallet: { state } })).row.value).not.toContain('mainnet');
-    }
-  });
-
-  it('names the desktop app, not the Bank, where the Bank can bring no wallet on', () => {
-    // Off a test network with no app channel and no wallet on disk, the Bank
-    // offers no switch (bankWallet.ts createInAppText); on a test network
-    // the Bank always can.
-    for (const backup of ['page', 'none', undefined] as const) {
-      const row = phoneBookIndicator(fp({ chia_wallet: { state: 'ready', ...(backup ? { backup } : {}) } })).row.value;
-      if (net.test) {
-        expect(row).toBe("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
-      } else {
-        expect(row).toBe('OFF — this node holds no SSF wallet, and on Chia mainnet only the Star Station desktop app that started it makes one');
+    const noWrite = 'OFF — on Chia mainnet the SSF wallet pays for no Phone Book write yet, so this node writes no listing there';
+    // No chia_presence yet: the wallet is off, not made, or on before the
+    // heartbeat's first round, so the node's own refusal has not come.
+    const ready: ChiaWalletSwitch[] = [
+      { state: 'ready', backup: 'native' },
+      { state: 'ready', seed: true },
+      ...(['page', 'none', undefined] as const).map((backup): ChiaWalletSwitch => ({ state: 'ready', ...(backup ? { backup } : {}) })),
+    ];
+    for (const chia_wallet of ready) {
+      const row = phoneBookIndicator(fp({ chia_wallet })).row.value;
+      if (net.test) expect(row).toBe(bank);
+      else {
+        expect(row).toBe(noWrite);
         expect(row).not.toContain('BANK');
       }
     }
+    const on = phoneBookIndicator(fp({ chia_wallet: { state: 'on' } })).row.value;
+    const none = phoneBookIndicator(fp({})).row.value;
+    if (net.test) {
+      expect(on).toContain('the SSF wallet is on');
+      expect(none).toContain('does not publish presence');
+    } else {
+      expect(on).toBe(noWrite);
+      expect(none).toBe(noWrite);
+    }
+    // What holds the node off says so on either network.
+    for (const state of ['unbuilt', 'off'] as const) {
+      expect(phoneBookIndicator(fp({ chia_wallet: { state } })).row.value).not.toContain('mainnet');
+    }
+    // A network this page does not know keeps the old rows.
+    expect(phoneBookIndicator({ ...BASE, chia_net: null, chia_wallet: { state: 'ready' } }).row.value).toBe(bank);
   });
 
   it('reads a listing the same way on either network', () => {
     expect(phoneBookIndicator(fp({ chia_presence: listed })).title).toBe(phoneBookIndicator(withPresence({})).title);
-    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'ready', backup: 'native' } })).row.value).toContain('not on yet');
   });
 });
 
