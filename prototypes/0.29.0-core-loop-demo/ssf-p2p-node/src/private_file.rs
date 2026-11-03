@@ -1,7 +1,7 @@
 //! 🔒 Files readable by their owner only, and the node's iroh key kept in
 //! one of them. Built in every feature set: a build without the chain lane
-//! (`--no-default-features`) holds the iroh key too, and keeps it 0600 as
-//! every other build does (stage 4 design §4.5). `chia_contact` writes its
+//! (`--no-default-features`) holds the iroh key too, and keeps it 0600 on
+//! Unix as every other build does (stage 4 design §4.5). `chia_contact` writes its
 //! own secrets through the same two functions.
 
 use std::path::Path;

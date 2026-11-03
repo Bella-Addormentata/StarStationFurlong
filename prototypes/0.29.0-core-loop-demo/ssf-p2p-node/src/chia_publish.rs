@@ -1325,6 +1325,17 @@ pub fn money_memo_line(net: crate::chia_network::ChiaNet) -> Option<String> {
     })
 }
 
+/// What the log says follows a listing the chain voided or a beacon it
+/// forgot: written again where the SSF wallet pays for it, nothing off a
+/// test network ([`money_memo_refusal`]), where the mark an older build left
+/// is still judged.
+fn write_again_words(net: crate::chia_network::ChiaNet) -> String {
+    match money_memo_refusal(net) {
+        None => "writing it again".to_string(),
+        Some(_) => format!("nothing is written again on {} (the SSF wallet pays for no chain write there)", net.name()),
+    }
+}
+
 /// A memo spend refused off a test network: its text is
 /// [`money_memo_refusal`]'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2479,7 +2490,7 @@ pub async fn heartbeat_loop(
                     match presence_step(&m, presence_standing(&peak_client, &m).await, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
-                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; writing it again");
+                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; {}", write_again_words(net));
                             let void = m.voided();
                             if let Err(e) = void.save(mark_path) {
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
@@ -2749,7 +2760,7 @@ pub async fn heartbeat_loop(
                     match beacon_step(&m, beacon_standing(&peak_client, &m).await, era, peak) {
                         BeaconStep::Keep => {}
                         BeaconStep::Forget(why) => {
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; writing it again");
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; {}", write_again_words(net));
                             beacon_mark = None;
                             let _ = std::fs::remove_file(beacon_mark_path);
                         }
@@ -4097,6 +4108,22 @@ mod tests {
         let why = money_memo_refusal(ChiaNet::Mainnet).unwrap();
         assert!(why.chars().count() <= 160 && !why.contains('\u{2014}'), "{why}");
         assert!(!why.contains("not listed") && !why.contains("Phone Book yet"), "{why}");
+    }
+
+    /// A voided listing or a forgotten beacon is written again on a test
+    /// network only: off one the line says nothing follows, since the SSF
+    /// wallet pays for no chain write there.
+    #[test]
+    fn a_voided_write_is_written_again_on_a_test_network_only() {
+        use crate::chia_network::ChiaNet;
+        assert_eq!(write_again_words(ChiaNet::Testnet11), "writing it again");
+        assert_eq!(
+            write_again_words(ChiaNet::Mainnet),
+            "nothing is written again on Chia mainnet (the SSF wallet pays for no chain write there)"
+        );
+        for net in ChiaNet::ALL {
+            assert_eq!(write_again_words(net) == "writing it again", money_memo_refusal(net).is_none(), "{net:?}");
+        }
     }
 
     #[test]

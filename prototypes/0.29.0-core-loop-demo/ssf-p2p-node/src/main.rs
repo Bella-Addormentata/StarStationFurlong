@@ -1285,7 +1285,7 @@ fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
 }
 
 /// 🔒 The node's iroh key, kept as `contact.key` is (stage 4 design §4.5):
-/// written 0600 and tightened on load, in every build
+/// written 0600 and tightened on load on Unix, in every feature set
 /// (private_file::load_or_create_node_key).
 fn load_or_create_secret_key() -> Result<SecretKey> {
     private_file::load_or_create_node_key(std::path::Path::new(private_file::NODE_KEY_FILE))
@@ -6347,6 +6347,44 @@ mod watcher_off_line_tests {
     }
 }
 
+/// 🏦 The line said once the Bank's TURN ON has loaded the wallet and
+/// remembered it. Publishing starts within a minute on a test network only:
+/// off one the SSF wallet pays for no chain write (stage 4 design §4.5 (1),
+/// `chia_publish::money_memo_refusal`), so the node only reads the chain.
+#[cfg(feature = "chia-publish")]
+fn bank_on_line(net: chia_network::ChiaNet) -> String {
+    if chia_publish::money_memo_refusal(net).is_none() {
+        "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start".to_string()
+    } else {
+        format!(
+            "🏦 SSF wallet: turned on in the Bank — on {} it pays for no chain write yet, so this node only reads the chain; it is back on at the next start",
+            net.name()
+        )
+    }
+}
+
+#[cfg(all(test, feature = "chia-publish"))]
+mod bank_on_line_tests {
+    use super::bank_on_line;
+    use crate::chia_network::ChiaNet;
+
+    /// testnet11 keeps its line whole; off a test network the Bank's TURN ON
+    /// promises no publishing, which the SSF wallet pays for no more there.
+    #[test]
+    fn the_bank_promises_publishing_on_a_test_network_only() {
+        assert_eq!(
+            bank_on_line(ChiaNet::Testnet11),
+            "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start"
+        );
+        let line = bank_on_line(ChiaNet::Mainnet);
+        assert_eq!(
+            line,
+            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write yet, so this node only reads the chain; it is back on at the next start"
+        );
+        assert!(!line.contains("publishing"), "{line}");
+    }
+}
+
 /// 🏦 Turn the SSF wallet on or off for the Bank app (chia_wallet_switch.rs).
 ///
 /// On, when the wallet is not loaded: mint or load the 24-word identity
@@ -6427,7 +6465,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         *hub.chia_wallet.lock().unwrap() = Some(chia_sk.clone());
         start_publisher(hub, iroh_endpoint, chia_sk);
         if saved {
-            println!("🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start");
+            println!("{}", bank_on_line(net));
         }
         return Ok(());
     }
