@@ -143,7 +143,14 @@ impl Read for Tee<'_> {
 
 /// A summary the feed can read (the first vector's).
 fn canned() -> String {
-    cases().remove(0).summary
+    cases().into_iter().map(|c| c.summary).find(|s| !s.contains("\"pending\":true")).expect("a vector whose fold is finished")
+}
+
+/// The same, with the fold not finished (the signatures one call may check are used up).
+fn canned_pending() -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&canned()).unwrap();
+    v["pending"] = serde_json::Value::Bool(true);
+    v.to_string()
 }
 
 /// Answers every frame with a summary, except as told.
@@ -157,6 +164,8 @@ struct Script {
     text: Arc<Mutex<Option<String>>>,
     /// While set, the worker holds its answers back.
     gate: Arc<AtomicBool>,
+    /// How many more answers say the fold is pending (signatures left unchecked).
+    pending_for: Arc<AtomicUsize>,
 }
 
 struct Stand {
@@ -177,6 +186,10 @@ impl Stand {
         }
         if self.script.dirty_at.lock().unwrap().contains(&self.asked) {
             return Err("it is dirty".into());
+        }
+        if self.script.pending_for.load(Ordering::SeqCst) > 0 {
+            self.script.pending_for.fetch_sub(1, Ordering::SeqCst);
+            return Ok(canned_pending());
         }
         Ok(self.script.text.lock().unwrap().clone().unwrap_or_else(canned))
     }
@@ -254,7 +267,16 @@ impl Rig {
     }
 
     fn caught_up(&mut self) -> bool {
-        self.feed.caught_up(T, INC, &self.mirror, &self.sup)
+        self.caught_up_of(T)
+    }
+
+    /// As `caught_up`, with the fold unfinished (pending) allowed.
+    fn up_to_date_of(&self, t: &str) -> bool {
+        self.feed.up_to_date(t, INC, &self.mirror, &self.sup)
+    }
+
+    fn caught_up_of(&self, t: &str) -> bool {
+        self.feed.caught_up(t, INC, &self.mirror, &self.sup)
     }
 
     /// What the worker has been sent, in order: once its thread has read all that was posted (the
@@ -600,24 +622,24 @@ fn a_worker_too_busy_is_given_the_frame_again_later() {
 
 #[test]
 fn when_the_fold_duties_are_off_the_feed_lets_everything_go() {
-    let mut rig = stand_rig(&Script::default());
+    let script = Script::default();
+    let mut rig = stand_rig(&script);
     rig.session(&live0(), &recs(1));
     rig.until("caught up", |r| r.caught_up());
-    // A worker that cannot start, three times: the supervisor turns the duties off.
+    // The worker's second request ends it, and no worker starts again: the supervisor turns the duties off.
+    script.crash_at.lock().unwrap().push(2);
     rig.refuse.store(true, Ordering::SeqCst);
-    let crash = Script::default();
-    crash.crash_at.lock().unwrap().push(1);
     let mut secs = 0;
     for _ in 0..12 {
         rig.put(&live0(), &rk(1, 50 + secs), val(1));
         secs += 1;
         rig.now += std::time::Duration::from_secs(70);
         rig.tick();
+        // (The crash is the worker's own: its thread may not have got there yet.)
+        thread::sleep(std::time::Duration::from_millis(5));
         if rig.sup.off().is_some() {
             break;
         }
-        // (The worker that is up is killed by the next failure; one that is not just fails to start.)
-        rig.sup.post(rig.now, &Req::Forget { ctx: Ctx { room: ROOM.into(), t: "none".into(), inc: INC.into() } });
     }
     for _ in 0..3 {
         rig.tick();
@@ -883,6 +905,123 @@ fn a_forget_that_waits_goes_before_the_table_is_sent_again() {
     assert_eq!(kinds, ["cold", "forget", "cold"]);
 }
 
+#[test]
+fn a_table_is_not_caught_up_while_it_waits_to_be_told_the_houses_and_pins_of_the_room_now() {
+    let mut rig = Rig::new(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })));
+    rig.inputs = Inputs::new(vec!["h1".into()], vec![]);
+    rig.session(&live0(), &recs(1));
+    rig.session(&live_of("t2", None), &recs(1));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.until("both caught up", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+    // The room's pins change while the worker's pipe is full: the first table's frame is refused,
+    // and the second is not even tried. Neither has an answer folded with the keys of the room now.
+    rig.sup.clog(QUEUE_BYTES);
+    rig.inputs = Inputs::new(vec!["h1".into()], vec![("alice".into(), "ka".into())]);
+    for _ in 0..4 {
+        rig.tick();
+    }
+    assert!(rig.feed.counts().busy >= 1);
+    assert!(!rig.caught_up_of(T) && !rig.caught_up_of("t2"), "answers folded with the old keys");
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("both told", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+    let reqs = rig.reqs();
+    let told: Vec<&Warm> = warms(&reqs).into_iter().filter(|w| w.pins.len() == 1).collect();
+    assert_eq!(told.len(), 2, "each table was told the pin");
+}
+
+#[test]
+fn a_fold_that_is_pending_is_asked_again_with_no_changes_until_it_is_finished() {
+    let script = Script::default();
+    script.pending_for.store(3, Ordering::SeqCst);
+    let mut rig = stand_rig(&script);
+    rig.session(&live0(), &recs(2));
+    rig.until("finished", |r| {
+        if r.caught_up() {
+            assert!(!r.feed.fold(T, INC).unwrap().summary.pending, "an unfinished fold is not the table as it stands");
+            return true;
+        }
+        false
+    });
+    let reqs = rig.reqs();
+    assert_eq!(colds(&reqs).len(), 1);
+    let again = warms(&reqs);
+    assert_eq!(again.len(), 3, "a pass for each answer that said pending");
+    assert!(again.iter().all(|w| w.changes.is_empty()));
+    // And then it is left alone.
+    for _ in 0..10 {
+        rig.tick();
+    }
+    assert_eq!(rig.reqs().len(), 4);
+}
+
+#[test]
+fn a_fold_that_stays_pending_is_asked_for_a_bounded_number_of_passes() {
+    let script = Script::default();
+    script.pending_for.store(usize::MAX, Ordering::SeqCst);
+    let mut rig = stand_rig(&script);
+    rig.session(&live0(), &recs(2));
+    let passes = MAX_PENDING_PASSES as u64;
+    rig.until("the passes are spent", |r| r.feed.counts().results == passes);
+    for _ in 0..20 {
+        rig.tick();
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm, c.results), (1, passes - 1, passes), "no more asked for");
+    assert!(!rig.caught_up());
+    // A change is still sent, and an answer that finishes starts the count over.
+    script.pending_for.store(0, Ordering::SeqCst);
+    rig.put(&live0(), &rk(1, 9), val(9));
+    rig.until("finished", |r| r.caught_up());
+    assert_eq!(rig.feed.counts().warm, passes);
+}
+
+#[test]
+fn a_table_given_up_on_that_is_let_go_of_and_wanted_again_is_sent_afresh() {
+    let script = Script::default();
+    *script.text.lock().unwrap() = Some("this is not a summary".into());
+    script.gate.store(true, Ordering::SeqCst);
+    let mut rig = stand_rig(&script);
+    rig.session(&live0(), &recs(1));
+    rig.until("the Cold is out", |r| r.feed.counts().cold == 1);
+    // The bad result: given up on, and the Forget waits for a full pipe.
+    rig.sup.clog(QUEUE_BYTES);
+    script.gate.store(false, Ordering::SeqCst);
+    rig.until("the bad result", |r| r.feed.counts().bad_results == 1);
+    // The mirror lets the table go and takes it up again: its generation is back where the one given up on was.
+    *script.text.lock().unwrap() = None;
+    rig.mirror.want(&[]);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.want(&[(T, INC)]);
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("sent afresh", |r| r.caught_up());
+    let reqs = rig.reqs();
+    let kinds: Vec<&str> = reqs.iter().map(|r| match r {
+        Req::Cold(_) => "cold",
+        Req::Warm(_) => "warm",
+        Req::Forget { .. } => "forget",
+    }).collect();
+    assert_eq!(kinds, ["cold", "forget", "cold"]);
+}
+
+#[test]
+fn a_table_let_go_of_and_wanted_again_between_two_pushes_is_not_the_one_given_up_on() {
+    let script = Script::default();
+    *script.text.lock().unwrap() = Some("this is not a summary".into());
+    let mut rig = stand_rig(&script);
+    rig.session(&live0(), &recs(1));
+    rig.until("the bad result", |r| r.feed.counts().bad_results == 1);
+    rig.until("the worker was told", |r| r.feed.counts().forgets == 1);
+    *script.text.lock().unwrap() = None;
+    // (As when the worker was down and nothing was pushed: the feed never sees the table gone.)
+    rig.mirror.want(&[]);
+    rig.want(&[(T, INC)]);
+    rig.until("sent afresh", |r| r.caught_up());
+    assert_eq!(rig.feed.counts().cold, 2);
+}
+
 // ── The fold itself, through all of it ───────────────────────────────────────
 
 /// The vectors' tables, written into a doc as the pages write them (the
@@ -905,6 +1044,8 @@ fn every_vector_table_comes_back_from_the_doc_as_the_pages_fold_it() {
             Box::new(EngineFolder::new(Box::new(move || check_for(&case))).expect("the engine starts"))
         }));
         rig.inputs = Inputs::new(c.houses.clone(), c.pins.clone());
+        // (A vector whose hold keeps signatures unchecked for good is pending for good: one answer is all it has.)
+        rig.feed.max_pending = 1;
         rig.mirror.want(&[(c.ctx.t.clone(), c.ctx.inc.clone())]);
         if let Some(b) = &c.cp {
             rig.put_top(&format!("sum:{}:{}", c.ctx.t, c.ctx.inc), b);
@@ -920,7 +1061,7 @@ fn every_vector_table_comes_back_from_the_doc_as_the_pages_fold_it() {
             }
             // Each batch is seen and answered before the next is written.
             let (t, inc) = (c.ctx.t.clone(), c.ctx.inc.clone());
-            rig.until(&format!("{}: a batch answered", c.name), |r| r.feed.caught_up(&t, &inc, &r.mirror, &r.sup));
+            rig.until(&format!("{}: a batch answered", c.name), |r| r.feed.up_to_date(&t, &inc, &r.mirror, &r.sup));
         }
         let fold = rig.feed.fold(&c.ctx.t, &c.ctx.inc).unwrap_or_else(|| panic!("{}: no answer", c.name));
         let mut want: FoldSummary = serde_json::from_str(&c.summary).unwrap();

@@ -375,6 +375,29 @@ fn a_new_checkpoint_starts_the_table_over() {
 }
 
 #[test]
+fn a_table_let_go_of_and_wanted_again_is_another_whatever_its_generation() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    let (born, generation) = (f.state().born, f.state().generation);
+    // Starting over (a read afresh, a new checkpoint) is the same table.
+    assert!(f.m.restart(T, INC));
+    f.drain();
+    assert_eq!(f.state().born, born);
+    assert_eq!(f.state().generation, generation + 1);
+    // Let go of and wanted again, with nothing between: another, with its generation back at the start.
+    let other = ("t2".to_string(), INC.to_string());
+    f.m.want(&[other.clone()]);
+    assert!(f.m.state(T, INC).is_none());
+    let second = f.m.state("t2", INC).unwrap().born;
+    assert!(second > born);
+    f.m.want(&[(T.into(), INC.into())]);
+    f.drain();
+    let again = f.state();
+    assert!(again.born > second, "a count over the mirror, not over the table");
+    assert!(again.generation <= generation, "its generation started over");
+}
+
+#[test]
 fn a_checkpoint_written_again_as_it_was_starts_nothing() {
     let base = cp(2);
     let live = live_of(T, Some(&base));

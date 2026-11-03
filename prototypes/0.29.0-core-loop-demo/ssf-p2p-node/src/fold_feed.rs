@@ -58,6 +58,11 @@ pub const FRAME_BYTES: usize = 4 << 20;
 /// The most of an answer's text the node parses. A fold summary of a table
 /// that honest players made is some tens of KiB.
 pub const MAX_RESULT_BYTES: usize = 4 << 20;
+/// How many answers in a row that say the fold is PENDING (it checked as many signatures as one
+/// call may, and more are left) the feed asks again for, with no changes, before it leaves the
+/// table as it stands: at [`MAX_NEW_CHECKS`](crate::house_fold::MAX_NEW_CHECKS) a pass, some
+/// 260,000 signatures, far more than a session the mirror keeps can hold.
+pub const MAX_PENDING_PASSES: u32 = 256;
 
 /// What the worker needs of the room for every table in it: the keys of the
 /// houses, and the key pinned for each player, as (pid, key). Sorted here, so
@@ -143,6 +148,10 @@ struct Slot {
     gave_up: Option<u64>,
     /// A `Forget` the worker was too busy for.
     forget_pending: bool,
+    /// Which taking up of the table by the mirror this slot follows ([`State::born`]).
+    born: u64,
+    /// Answers in a row that said the fold is pending.
+    pending_streak: u32,
 }
 
 impl Slot {
@@ -158,6 +167,8 @@ impl Slot {
             dirty_streak: 0,
             gave_up: None,
             forget_pending: false,
+            born: 0,
+            pending_streak: 0,
         }
     }
 
@@ -173,6 +184,11 @@ pub struct Feed {
     room: String,
     slots: BTreeMap<(String, String), Slot>,
     counts: Counts,
+    /// The houses and pins as of the last [`push`](Feed::push): what an answer has to have been
+    /// folded with to be of the room as it stands.
+    inputs: Option<Inputs>,
+    /// [`MAX_PENDING_PASSES`] (a test asks for fewer).
+    max_pending: u32,
 }
 
 fn key(ctx: &Ctx) -> (String, String) {
@@ -181,7 +197,7 @@ fn key(ctx: &Ctx) -> (String, String) {
 
 impl Feed {
     pub fn new(room: &str) -> Feed {
-        Feed { room: room.to_string(), slots: BTreeMap::new(), counts: Counts::default() }
+        Feed { room: room.to_string(), slots: BTreeMap::new(), counts: Counts::default(), inputs: None, max_pending: MAX_PENDING_PASSES }
     }
 
     pub fn counts(&self) -> Counts {
@@ -224,6 +240,14 @@ impl Feed {
                 };
                 match parsed {
                     Ok(summary) => {
+                        if summary.pending {
+                            slot.pending_streak = slot.pending_streak.saturating_add(1);
+                            if slot.pending_streak == self.max_pending {
+                                eprintln!("🧮 fold: {} of {} still has signatures unchecked after {} passes; leaving it as it stands", ctx.t, ctx.room, self.max_pending);
+                            }
+                        } else {
+                            slot.pending_streak = 0;
+                        }
                         slot.answer = Some(Answer { version: *version, generation: slot.generation, summary });
                         slot.dirty_streak = 0;
                         slot.retry_at = None;
@@ -264,13 +288,22 @@ impl Feed {
 
     /// The latest answer is for the table as it stands: it answers the last
     /// frame sent, that frame left nothing behind, nothing has been taken or
-    /// has changed since, and the mirror has read all the doc holds.
+    /// has changed since, the mirror has read all the doc holds, the table was
+    /// folded with the houses and pins the room has now, and the fold is
+    /// finished (no signature left unchecked).
     pub fn caught_up<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>) -> bool {
+        let finished = self.slots.get(&(t.to_string(), inc.to_string())).and_then(|s| s.answer.as_ref()).is_some_and(|a| !a.summary.pending);
+        finished && self.up_to_date(t, inc, mirror, sup)
+    }
+
+    /// As [`caught_up`](Feed::caught_up), but the fold may be unfinished (pending).
+    fn up_to_date<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>) -> bool {
         let Some(slot) = self.slots.get(&(t.to_string(), inc.to_string())) else { return false };
         let Some(answer) = &slot.answer else { return false };
         let Some(st) = mirror.state(t, inc) else { return false };
         let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
         slot.open
+            && self.inputs.as_ref() == Some(&slot.given)
             && answer.version == slot.sent_version
             && slot.unsent.is_none()
             && !sup.owes(&ctx)
@@ -284,6 +317,7 @@ impl Feed {
     /// Let go of the worker's tables and forget the answers (the fold duties are off).
     fn drop_all(&mut self) {
         self.slots.clear();
+        self.inputs = None;
     }
 
     /// Send what has changed, one frame at most for each table. Nothing is
@@ -293,10 +327,11 @@ impl Feed {
             self.drop_all();
             return;
         }
+        self.inputs = Some(inputs.clone());
         if matches!(sup.state(), State::Backoff(until) if now < until) {
             return;
         }
-        let Feed { room, slots, counts } = self;
+        let Feed { room, slots, counts, max_pending, .. } = self;
         let tables: Vec<Ctx> = mirror.tables().cloned().collect();
         let wanted: BTreeSet<(String, String)> = tables.iter().map(key).collect();
 
@@ -316,6 +351,22 @@ impl Feed {
         for ctx in tables {
             let slot = slots.entry(key(&ctx)).or_insert_with(Slot::new);
             let Some(st) = mirror.state(&ctx.t, &ctx.inc) else { continue };
+
+            // Another table than the one this slot followed (let go of and taken up again since
+            // the last push, as while the worker was down): nothing kept of the old one is of
+            // this. The worker's, if it holds one, is let go of; this one starts with a `Cold`.
+            if slot.born != st.born {
+                slot.born = st.born;
+                slot.unsent = None;
+                slot.answer = None;
+                slot.gave_up = None;
+                slot.retry_at = None;
+                slot.dirty_streak = 0;
+                slot.pending_streak = 0;
+                if slot.open || slot.forget_pending {
+                    forget(counts, now, sup, &ctx, slot);
+                }
+            }
 
             // Not a table to follow: the worker is not to hold it.
             if !st.serving() || slot.gave_up == Some(st.generation) {
@@ -347,7 +398,11 @@ impl Feed {
                     if st.announcing && st.queued == 0 && st.reading {
                         continue;
                     }
-                    if !st.announcing && st.queued == 0 && slot.given == *inputs {
+                    // (Nor has one that is up to date, unless its fold is pending: a pass with no
+                    // changes checks more of its signatures.)
+                    let more_to_check = slot.pending_streak < *max_pending
+                        && slot.answer.as_ref().is_some_and(|a| a.summary.pending && a.version == slot.sent_version);
+                    if !st.announcing && st.queued == 0 && slot.given == *inputs && !more_to_check {
                         continue;
                     }
                     let Some(taken) = mirror.take(&ctx.t, &ctx.inc, FRAME_BYTES) else { continue };
@@ -384,6 +439,7 @@ fn send<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, s
             slot.sent_version = frame.version;
             slot.given = frame.given;
             if was_cold {
+                slot.pending_streak = 0;
                 counts.cold += 1;
             } else {
                 counts.warm += 1;
