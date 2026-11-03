@@ -302,6 +302,7 @@ import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import type { ChiaLaneTurn } from "./chiaLane";
+import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -1107,6 +1108,73 @@ function renderChiaLaneRow(): void {
     btn.removeAttribute("aria-disabled");
     btn.removeAttribute("aria-busy");
   }
+}
+
+/** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
+ *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
+ *  the address override, the two room switches and the override's text box.
+ *  A disabled control cannot take focus, so it is no stop: a step onto it
+ *  would leave focus where it was. */
+const NETWORK_VIEW_STOPS =
+  'button:not([disabled]), summary, input[type="checkbox"]:not([disabled]), input[type="text"]:not([disabled])';
+
+/** ⛓️ The Network view by keyboard, the Bank's rule. Tab cannot do the
+ *  traversal (the app reserves it as the phone's toggle and preventDefaults
+ *  every press), so ↑/↓ move between the view's visible controls, wrapping,
+ *  and from the view itself ↓ reaches the first. Opening the view lands
+ *  focus on it. Enter and Space keep their own meaning: a button's click
+ *  (the CHIA switch's held-key guard stays on the switch), a checkbox's
+ *  toggle, the drawer opening. A hidden control is skipped: the CHIA switch
+ *  while it offers nothing, the collapse chevron, the Chia Mesh row off a
+ *  test network, the override while its drawer is closed. Nothing moves on
+ *  a phone that is put away (a control left focused inside it still
+ *  receives keys), with a modifier held (Shift+↑ selects in the text box),
+ *  or on a select or a slider, whose arrows turn their own values. */
+function networkViewKeydown(view: HTMLElement, e: KeyboardEvent): void {
+  if (!treasuryViewOnScreen(view)) return;
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  const target = e.target as HTMLElement | null;
+  if (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === "range")) return;
+  const stops = [...view.querySelectorAll<HTMLElement>(NETWORK_VIEW_STOPS)].filter(networkStopShown);
+  if (stops.length === 0) return;
+  e.preventDefault();
+  const here = stops.indexOf(target as HTMLElement);
+  const step = e.key === "ArrowDown" ? 1 : -1;
+  stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+}
+
+/** ⛓️ Whether a control of the Network view is shown, so it can take
+ *  focus. A browser that hides a closed drawer's contents with
+ *  `content-visibility: hidden` (Chromium does, as the HTML rendering rules
+ *  now say) still lays them out, so they have an offsetParent although
+ *  they cannot take focus; checkVisibility says they are not shown. A
+ *  browser without checkVisibility hides them with `display: none`, and
+ *  offsetParent says so. */
+function networkStopShown(el: HTMLElement): boolean {
+  return typeof el.checkVisibility === "function" ? el.checkVisibility() : el.offsetParent !== null;
+}
+
+/** ⛓️ At a helm with the flight stick taken, the stick reads the arrows and
+ *  Space in the window's capture phase, before the view's traversal could:
+ *  the view is marked `data-stick-aside` while it is on screen, so a key
+ *  pressed in it is the view's, and a flight key it was given goes no
+ *  further to the world (tvUI.ts wireTvStick). The mark follows the view's
+ *  class and the phone's, since the phone closes by many paths. */
+function wireNetworkViewStick(view: HTMLElement): void {
+  const sync = () => {
+    if (treasuryViewOnScreen(view)) view.dataset.stickAside = "1";
+    else delete view.dataset.stickAside;
+  };
+  const observer = new MutationObserver(sync);
+  observer.observe(view, { attributes: true, attributeFilter: ["class"] });
+  const phone = document.getElementById("spacephone-container");
+  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ["class"] });
+  sync();
+  view.addEventListener("keydown", (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (treasuryViewOnScreen(view) && isFlightKey(e.code)) e.stopPropagation();
+  });
 }
 
 /** ⛓️ Ask the node to turn Chia off (`off`, `keep`) or back on for its next
@@ -8784,6 +8852,14 @@ function setupSpacePhoneOverlay() {
       chiaLaneArmed = false;
       if (!chiaLaneTurning) chiaLaneError = null;
       renderChiaLaneRow();
+      // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
+      // and every other control without a pointer (Tab is the app's phone
+      // toggle, not a tab stop).
+      const nv = document.getElementById("phone-app-settings-network");
+      if (nv) {
+        nv.setAttribute("tabindex", "-1");
+        nv.focus({ preventScroll: true });
+      }
     }
     // 📡 #258: the IR blaster, the remote of every set in the room. Repaints
     // itself on tv-map changes while active.
@@ -10067,6 +10143,14 @@ function setupNetworkDetailsPanel() {
     laneBtn.addEventListener("keydown", (e) => {
       if (laneKeyRepeat(e)) e.preventDefault();
     });
+  }
+  // The view's own ↑/↓ traversal (networkViewKeydown), and its stand-aside
+  // from the flight stick at a helm (wireNetworkViewStick), wired once: the
+  // view is in the page from the start, and the panel is moved into it.
+  const netView = document.getElementById("phone-app-settings-network");
+  if (netView) {
+    netView.addEventListener("keydown", (e) => networkViewKeydown(netView, e));
+    wireNetworkViewStick(netView);
   }
 
   // ChiaHub Slice 3b: the "advanced Chia mesh mode" switch. Writes the per-room

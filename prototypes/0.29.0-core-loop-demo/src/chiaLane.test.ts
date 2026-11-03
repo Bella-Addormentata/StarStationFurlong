@@ -6,6 +6,8 @@
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CHIA_LANE_BUTTON_ID, LANE_ARMED_WARNING, LANE_DAMAGED_NOTE, LANE_ENV_DAMAGED_NOTE, LANE_ENV_NOTE, LANE_ENV_OLDER_NOTE,
@@ -14,6 +16,7 @@ import {
   chiaLaneRow, chiaOffWhy, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane, type ChiaLaneUi,
 } from './chiaLane';
 import { TESTNET11 } from './chiaNetwork';
+import { isFlightKey } from './freeFlightStick';
 import type { ChiaLane, LocalFingerprint } from './nodeFingerprint';
 
 const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
@@ -389,5 +392,287 @@ describe('main.ts wires the CHIA row', () => {
     expect(turn).toContain('await refreshLocalFingerprint();');
     expect(main).toContain('world.faucetChiaLane = () => localFingerprint?.chia_lane;');
     expect(CHIA_LANE_BUTTON_ID).toBe('chia-lane-switch');
+  });
+});
+
+
+/** A stand-in for one element of the Network view: enough of the DOM for
+ *  networkViewKeydown and wireNetworkViewStick to read (its tag, attributes,
+ *  whether it is shown, focus, its data attributes and keydown listeners),
+ *  with a selector match for the forms its stop list uses. */
+class StandIn {
+  readonly classes = new Set<string>();
+  readonly classList = { contains: (c: string): boolean => this.classes.has(c) };
+  readonly dataset: Record<string, string> = {};
+  readonly keydowns: Array<(e: unknown) => void> = [];
+  /** Laid out, or not (display:none, [hidden]). */
+  laidOut = true;
+  /** Laid out but skipped, as Chromium skips a closed drawer's contents
+   *  (`content-visibility: hidden`): it has an offsetParent, but is not
+   *  shown and cannot take focus. */
+  skipped = false;
+  /** An engine's checkVisibility; left out to stand for one without it. */
+  checkVisibility: (() => boolean) | undefined = () => this.laidOut && !this.skipped;
+  constructor(readonly tagName: string, readonly attrs: Record<string, string> = {}) {}
+  get offsetParent(): object | null {
+    return this.laidOut ? {} : null;
+  }
+  get type(): string {
+    return this.attrs.type ?? '';
+  }
+  /** As an engine does, a control that is not shown refuses focus. */
+  focus(): void {
+    if (this.laidOut && !this.skipped) focused = this;
+  }
+  addEventListener(type: string, listener: (e: unknown) => void): void {
+    if (type === 'keydown') this.keydowns.push(listener);
+  }
+  matches(selector: string): boolean {
+    return selector.split(',').some((one) => {
+      const m = /^([a-z]+)((?:\[[a-z]+="[^"]*"\])*)((?::not\(\[[a-z]+\]\))*)$/.exec(one.trim());
+      if (!m) throw new Error(`the stand-in reads no selector like ${one}`);
+      if (m[1] !== this.tagName.toLowerCase()) return false;
+      for (const [, k, v] of m[2].matchAll(/\[([a-z]+)="([^"]*)"\]/g)) if (this.attrs[k] !== v) return false;
+      for (const [, k] of m[3].matchAll(/:not\(\[([a-z]+)\]\)/g)) if (k in this.attrs) return false;
+      return true;
+    });
+  }
+}
+class StandInInput extends StandIn {}
+class StandInSelect extends StandIn {}
+let focused: StandIn | null = null;
+
+/** A stand-in for MutationObserver: what each one watches, and a way to
+ *  tell the watchers of an element that its class changed. */
+class StandInObserver {
+  static readonly all: StandInObserver[] = [];
+  readonly watched: Array<{ target: unknown; options: unknown }> = [];
+  constructor(readonly callback: () => void) {
+    StandInObserver.all.push(this);
+  }
+  observe(target: unknown, options: unknown): void {
+    this.watched.push({ target, options });
+  }
+  static classChanged(el: StandIn): void {
+    for (const o of StandInObserver.all) if (o.watched.some((w) => w.target === el)) o.callback();
+  }
+}
+
+describe('main.ts walks the Network view by keyboard', () => {
+  const main = readFileSync(fileURLToPath(new URL('./main.ts', import.meta.url)), 'utf8');
+
+  it('lands focus on the view as it opens, once the CHIA row is drawn', () => {
+    const at = main.indexOf('if (id === "setnet") {');
+    expect(at).toBeGreaterThan(0);
+    const open = main.slice(at, main.indexOf('\n    }\n', at));
+    const drawn = open.indexOf('renderChiaLaneRow();');
+    expect(drawn).toBeGreaterThan(0);
+    expect(open).toContain('const nv = document.getElementById("phone-app-settings-network");');
+    expect(open.indexOf('nv.setAttribute("tabindex", "-1");')).toBeGreaterThan(drawn);
+    expect(open.indexOf('nv.focus({ preventScroll: true });')).toBeGreaterThan(drawn);
+  });
+
+  it('wires the view\'s keys and its stand-aside from the flight stick once, beside the CHIA switch\'s', () => {
+    const setup = main.indexOf('function setupNetworkDetailsPanel() {');
+    const at = main.indexOf(`document.getElementById(CHIA_LANE_BUTTON_ID) as HTMLButtonElement | null;\n  if (laneBtn)`);
+    expect(setup).toBeGreaterThan(0);
+    expect(at).toBeGreaterThan(setup);
+    // The same function, which runs its body once.
+    expect(main.slice(setup, at)).not.toContain('\n}\n');
+    expect(main.slice(setup, at)).toContain('if (networkPanelInitialized) return;\n  networkPanelInitialized = true;');
+    const wiring = main.slice(at, main.indexOf('// ChiaHub Slice 3b', at));
+    expect(wiring).toContain('const netView = document.getElementById("phone-app-settings-network");');
+    expect(wiring).toContain(
+      'if (netView) {\n    netView.addEventListener("keydown", (e) => networkViewKeydown(netView, e));\n    wireNetworkViewStick(netView);\n  }',
+    );
+    expect(main).toContain('import { isFlightKey } from "./freeFlightStick";');
+  });
+
+  // The handlers themselves, taken out of main.ts by the compiler and run
+  // against stand-ins for the view's controls: vitest has no DOM here, and
+  // main.ts cannot be imported (it starts the game).
+  const wanted = ['NETWORK_VIEW_STOPS', 'treasuryViewOnScreen', 'networkViewKeydown', 'networkStopShown', 'wireNetworkViewStick'];
+  const handler = (() => {
+    const file = ts.createSourceFile('main.ts', main, ts.ScriptTarget.Latest, true);
+    const parts = file.statements.filter((s) => {
+      if (ts.isFunctionDeclaration(s)) return wanted.includes(s.name?.text ?? '');
+      if (!ts.isVariableStatement(s)) return false;
+      const name = s.declarationList.declarations[0]?.name;
+      return name !== undefined && ts.isIdentifier(name) && wanted.includes(name.text);
+    });
+    const js = ts.transpileModule(parts.map((s) => s.getText(file)).join('\n'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const phone = new StandIn('div');
+    const realm = vm.createContext({
+      document: { getElementById: (id: string) => (id === 'spacephone-container' ? phone : null) },
+      HTMLInputElement: StandInInput,
+      HTMLSelectElement: StandInSelect,
+      MutationObserver: StandInObserver,
+      isFlightKey,
+    });
+    type Handlers = { networkViewKeydown: (view: unknown, e: unknown) => void; wireNetworkViewStick: (view: unknown) => void };
+    const handlers = parts.length === wanted.length
+      ? (vm.runInContext(`${js}\n({ networkViewKeydown, wireNetworkViewStick });`, realm) as Handlers)
+      : null;
+    return { found: parts.length, keydown: handlers?.networkViewKeydown, wireStick: handlers?.wireNetworkViewStick, phone };
+  })();
+
+  /** The view as index.html lays it out, in document order, on screen. */
+  const networkView = () => {
+    const button = (id: string) => new StandIn('BUTTON', { id });
+    const c = {
+      retry: button('network-retry-node-btn'),
+      chevron: button('network-details-toggle'),
+      chia: button('chia-lane-switch'),
+      mesh: new StandInInput('INPUT', { type: 'checkbox', id: 'chia-mode-toggle' }),
+      share: new StandInInput('INPUT', { type: 'checkbox', id: 'share-card-toggle' }),
+      drawer: new StandIn('SUMMARY'),
+      address: new StandInInput('INPUT', { type: 'text', id: 'network-bootstrap-address' }),
+      override: button('network-bootstrap-link-btn'),
+      selfTest: button('network-test-reach-btn'),
+    };
+    // The chevron is display:none in the phone. The drawer starts closed,
+    // and Chromium skips its contents: laid out, not shown.
+    c.chevron.laidOut = false;
+    for (const el of [c.address, c.override, c.selfTest]) el.skipped = true;
+    const all: StandIn[] = Object.values(c);
+    const view = Object.assign(new StandIn('DIV', { id: 'phone-app-settings-network' }), {
+      querySelectorAll: (selector: string) => all.filter((el) => el.matches(selector)),
+    });
+    view.classes.add('active');
+    handler.phone.classes.add('active');
+    focused = null;
+    return { view, c, drawerContents: [c.address, c.override, c.selfTest], all };
+  };
+
+  /** One keydown on `target`: where focus went, and whether its default was kept. */
+  const press = (view: StandIn, target: StandIn, key: string, held: Partial<KeyboardEvent> = {}) => {
+    focused = target;
+    let prevented = false;
+    handler.keydown!(view, {
+      key, target, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...held,
+      preventDefault: () => { prevented = true; },
+    });
+    return { to: focused, prevented };
+  };
+
+  it('moves between the view\'s controls on ↑ and ↓, wrapping, and skips the hidden ones', () => {
+    expect(handler.found).toBe(wanted.length);
+    const { view, c, drawerContents } = networkView();
+    // From the view itself, ↓ reaches the first control.
+    expect(press(view, view, 'ArrowDown')).toEqual({ to: c.retry, prevented: true });
+    // Past the chevron, which the phone hides.
+    expect(press(view, c.retry, 'ArrowDown').to).toBe(c.chia);
+    expect(press(view, c.chia, 'ArrowDown').to).toBe(c.mesh);
+    expect(press(view, c.mesh, 'ArrowDown').to).toBe(c.share);
+    expect(press(view, c.share, 'ArrowDown').to).toBe(c.drawer);
+    // The closed drawer's text box and buttons are laid out but not shown,
+    // so they cannot take focus: round to the top.
+    expect(drawerContents.every((el) => el.offsetParent !== null)).toBe(true);
+    expect(press(view, c.drawer, 'ArrowDown').to).toBe(c.retry);
+    expect(press(view, c.retry, 'ArrowUp').to).toBe(c.drawer);
+    expect(press(view, c.chia, 'ArrowUp').to).toBe(c.retry);
+    // The drawer open: its text box and buttons are stops, and ↑/↓ leave the box.
+    for (const el of drawerContents) el.skipped = false;
+    expect(press(view, c.drawer, 'ArrowDown').to).toBe(c.address);
+    expect(press(view, c.address, 'ArrowDown')).toEqual({ to: c.override, prevented: true });
+    expect(press(view, c.address, 'ArrowUp')).toEqual({ to: c.drawer, prevented: true });
+    expect(press(view, c.selfTest, 'ArrowDown').to).toBe(c.retry);
+    // The CHIA switch hidden (it offers nothing), and a room switch disabled
+    // (no room yet), cannot take focus: neither is a stop.
+    c.chia.laidOut = false;
+    c.share.attrs.disabled = '';
+    expect(press(view, c.retry, 'ArrowDown').to).toBe(c.mesh);
+    expect(press(view, c.mesh, 'ArrowDown').to).toBe(c.drawer);
+  });
+
+  it('skips a closed drawer\'s controls in an engine without checkVisibility, which lays them out not at all', () => {
+    expect(handler.found).toBe(wanted.length);
+    const { view, c, drawerContents, all } = networkView();
+    for (const el of all) el.checkVisibility = undefined;
+    for (const el of drawerContents) {
+      el.skipped = false;
+      el.laidOut = false;
+    }
+    expect(press(view, c.share, 'ArrowDown').to).toBe(c.drawer);
+    expect(press(view, c.drawer, 'ArrowDown').to).toBe(c.retry);
+    for (const el of drawerContents) el.laidOut = true;
+    expect(press(view, c.drawer, 'ArrowDown').to).toBe(c.address);
+  });
+
+  it('moves nothing while the view is not on screen', () => {
+    expect(handler.found).toBe(wanted.length);
+    const { view, c } = networkView();
+    // The phone put away (Tab only slides it offscreen; the view keeps its class).
+    handler.phone.classes.delete('active');
+    expect(press(view, c.retry, 'ArrowDown')).toEqual({ to: c.retry, prevented: false });
+    expect(press(view, view, 'ArrowDown')).toEqual({ to: view, prevented: false });
+    // The phone up on another view.
+    handler.phone.classes.add('active');
+    view.classes.delete('active');
+    expect(press(view, c.retry, 'ArrowDown')).toEqual({ to: c.retry, prevented: false });
+  });
+
+  it('leaves every other key, a held modifier and a select\'s arrows to the control', () => {
+    expect(handler.found).toBe(wanted.length);
+    const { view, c } = networkView();
+    // Enter and Space keep their own meaning: the click, the checkbox's toggle.
+    expect(press(view, c.chia, 'Enter')).toEqual({ to: c.chia, prevented: false });
+    expect(press(view, c.mesh, ' ')).toEqual({ to: c.mesh, prevented: false });
+    expect(press(view, c.retry, 'ArrowLeft')).toEqual({ to: c.retry, prevented: false });
+    for (const held of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }, { metaKey: true }]) {
+      expect(press(view, c.mesh, 'ArrowDown', held)).toEqual({ to: c.mesh, prevented: false });
+    }
+    const select = new StandInSelect('SELECT');
+    expect(press(view, select, 'ArrowDown')).toEqual({ to: select, prevented: false });
+  });
+
+  it('stands the helm\'s flight stick aside only while the view is on screen, and keeps the flight keys it is given from the world', () => {
+    expect(handler.found).toBe(wanted.length);
+    const { view, c } = networkView();
+    StandInObserver.all.length = 0;
+    handler.wireStick!(view);
+    // The view's class and the phone's are watched, since the phone closes by many paths.
+    const watched = StandInObserver.all.flatMap((o) => o.watched);
+    expect(watched).toEqual([
+      { target: view, options: { attributes: true, attributeFilter: ['class'] } },
+      { target: handler.phone, options: { attributes: true, attributeFilter: ['class'] } },
+    ]);
+    // On screen as it is wired: marked, so the stick lets a key pressed in it through.
+    expect(view.dataset.stickAside).toBe('1');
+
+    /** One keydown that reaches the view: whether it bubbles on to the world. */
+    const reaches = (code: string, held: Partial<KeyboardEvent> = {}) => {
+      let stopped = false;
+      for (const listener of view.keydowns) {
+        listener({ code, target: c.chia, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...held, stopPropagation: () => { stopped = true; } });
+      }
+      return !stopped;
+    };
+    // ↑/↓ and Space are the view's (its traversal, a button's press), and
+    // WASD typed in it walks nobody: none goes on to input.ts or the camera rig.
+    for (const code of ['ArrowUp', 'ArrowDown', 'Space', 'KeyW', 'KeyS', 'ArrowLeft']) expect(reaches(code)).toBe(false);
+    // Tab and Escape are the phone's, and a shortcut with a modifier is not the view's.
+    for (const code of ['Tab', 'Escape', 'Enter']) expect(reaches(code)).toBe(true);
+    for (const held of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }]) expect(reaches('KeyW', held)).toBe(true);
+
+    // The phone put away: the mark goes, and a key on a control left focused
+    // in it is the stick's again, so nothing here holds it back.
+    handler.phone.classes.delete('active');
+    StandInObserver.classChanged(handler.phone);
+    expect(view.dataset.stickAside).toBeUndefined();
+    expect(reaches('ArrowDown')).toBe(true);
+    handler.phone.classes.add('active');
+    StandInObserver.classChanged(handler.phone);
+    expect(view.dataset.stickAside).toBe('1');
+    // The phone up on another view: the same.
+    view.classes.delete('active');
+    StandInObserver.classChanged(view);
+    expect(view.dataset.stickAside).toBeUndefined();
+    expect(reaches('KeyW')).toBe(true);
+    view.classes.add('active');
+    StandInObserver.classChanged(view);
+    expect(view.dataset.stickAside).toBe('1');
   });
 });
