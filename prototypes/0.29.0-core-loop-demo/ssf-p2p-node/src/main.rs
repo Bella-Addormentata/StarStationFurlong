@@ -117,6 +117,10 @@ mod fold_supervisor;
 mod fold_wire;
 #[cfg(feature = "house-fold")]
 mod fold_worker;
+// What the node keeps of a room's computed tables for the fold (PR 6b-1c-i):
+// the checkpoint, the live session and its records, followed as changes.
+#[cfg(feature = "house-fold")]
+mod house_mirror;
 
 // 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
 // the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on

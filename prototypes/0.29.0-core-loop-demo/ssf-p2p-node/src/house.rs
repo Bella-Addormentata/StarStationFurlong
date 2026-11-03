@@ -172,7 +172,7 @@ pub const VISIT_BYTES: usize = 64;
 pub const MAX_KEY_BYTES: usize = 1_024;
 
 const CASINO_MAP: &str = "casino";
-const COMPUTED_MAP: &str = "casinoComputed";
+pub(crate) const COMPUTED_MAP: &str = "casinoComputed";
 
 // ── Shapes (computedFold / computedHouse guards, as far as the house reads) ──
 
@@ -373,7 +373,7 @@ fn is_carry(v: &CVal) -> bool {
 /// carry `s` (isCarry) on a live one and none on an ended one; every net
 /// Object.keys lists (an undefined one is no net). The house reads the
 /// checkpoints the pages read, and no other: one they throw out is no base.
-fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
+pub(crate) fn checkpoint_ok(v: &CVal, inc: &str) -> bool {
     let craps = craps_inc(inc);
     let optional: &[&str] = if craps { &["e", "s", "h"] } else { &["e", "h"] };
     if !has_fields(v, &["v", "b", "u", "l", "n", "k", "g"], optional) || v.get("v").and_then(CVal::as_int) != Some(1) {
@@ -430,7 +430,7 @@ fn close_frozen(v: &CVal) -> Option<Vec<(String, String)>> {
 }
 
 /// A record's key parts (computedFold parseKey): kind, round, pid (s and x), hash.
-fn parse_key(key: &str) -> Option<(char, i64, Option<&str>, &str)> {
+pub(crate) fn parse_key(key: &str) -> Option<(char, i64, Option<&str>, &str)> {
     let kind = key.chars().next()?;
     if !"scxfzho".contains(kind) || key.as_bytes().get(1) != Some(&b':') {
         return None;
@@ -780,7 +780,7 @@ pub struct House {
 }
 
 /// A value [`House::read_charged`] read.
-enum Read {
+pub(crate) enum Read {
     Val(CVal),
     /// A value a page may read otherwise ([`hb::Clarity`]): as read, or
     /// as junk (`Proto`); or as anything (`Unknown`, never read: `Junk`).
@@ -793,6 +793,42 @@ enum Read {
     Heavy,
     /// This tick's reads are spent.
     Spent,
+}
+
+/// The value under a key of `key_len` bytes, read and charged to `charge`
+/// (which says whether the read may go on): the key, and the value's weight,
+/// or `cap` for one heavier, which is what finding that out costs; and the
+/// `__proto__` strings that [`hb::clarity`] reads, which no weight counts,
+/// unless they come to more than a tick reads: those it never reads, and the
+/// value is Unknown. One past `cap` with padding a page reads past in it
+/// ([`hb::Weighed::Unsure`]) is Unknown too, read no further. The house reads
+/// with its tick's budget ([`House::charge`]) and the fold's mirror with its
+/// own (house_mirror.rs), the same reading either way.
+pub(crate) fn read_costed(charge: impl FnOnce(usize) -> bool, key_len: usize, out: Option<Out>, cap: usize) -> Read {
+    let (weight, read) = match out {
+        Some(Out::Any(any)) => {
+            let weighed = hb::weigh(&any, cap);
+            let weight = match weighed {
+                hb::Weighed::Light { w, scan } => w.saturating_add(if scan > READ_PER_TICK { 0 } else { scan }),
+                hb::Weighed::Heavy | hb::Weighed::Unsure => cap,
+            };
+            (weight, Some((any, weighed)))
+        }
+        _ => (0, None),
+    };
+    if !charge(key_len.saturating_add(VISIT_BYTES).saturating_add(weight)) {
+        return Read::Spent;
+    }
+    match read {
+        Some((any, hb::Weighed::Light { scan, .. })) => match hb::clarity_within(&any, scan, READ_PER_TICK) {
+            hb::Clarity::Clear => Read::Val(CVal::from_any(&any)),
+            hb::Clarity::Unknown => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
+            c => Read::Unclear(CVal::from_any(&any), c),
+        },
+        Some((_, hb::Weighed::Unsure)) => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
+        Some((_, hb::Weighed::Heavy)) => Read::Heavy,
+        None => Read::Absent,
+    }
 }
 
 /// What [`House::tick`] did in a room.
@@ -990,39 +1026,11 @@ impl House {
     }
 
     /// The value under a key of `key_len` bytes, read and charged ([`charge`]:
-    /// the key, and the value's weight, or `cap` for one heavier, which is
-    /// what finding that out costs; and the `__proto__` strings that
-    /// [`hb::clarity`] reads, which no weight counts, unless they come to
-    /// more than a tick reads: those it never reads, and the value is
-    /// Unknown). One past `cap` with padding a page reads past in it
-    /// ([`hb::Weighed::Unsure`]) is Unknown too, read no further.
+    /// see [`read_costed`], which it is).
     ///
     /// [`charge`]: House::charge
     fn read_charged(&mut self, key_len: usize, out: Option<Out>, cap: usize) -> Read {
-        let (weight, read) = match out {
-            Some(Out::Any(any)) => {
-                let weighed = hb::weigh(&any, cap);
-                let weight = match weighed {
-                    hb::Weighed::Light { w, scan } => w.saturating_add(if scan > READ_PER_TICK { 0 } else { scan }),
-                    hb::Weighed::Heavy | hb::Weighed::Unsure => cap,
-                };
-                (weight, Some((any, weighed)))
-            }
-            _ => (0, None),
-        };
-        if !self.charge(key_len.saturating_add(VISIT_BYTES).saturating_add(weight)) {
-            return Read::Spent;
-        }
-        match read {
-            Some((any, hb::Weighed::Light { scan, .. })) => match hb::clarity_within(&any, scan, READ_PER_TICK) {
-                hb::Clarity::Clear => Read::Val(CVal::from_any(&any)),
-                hb::Clarity::Unknown => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
-                c => Read::Unclear(CVal::from_any(&any), c),
-            },
-            Some((_, hb::Weighed::Unsure)) => Read::Unclear(CVal::Junk, hb::Clarity::Unknown),
-            Some((_, hb::Weighed::Heavy)) => Read::Heavy,
-            None => Read::Absent,
-        }
+        read_costed(|n| self.charge(n), key_len, out, cap)
     }
 
     fn last_of(&self, ctx: &Ctx) -> Option<&Done> {
