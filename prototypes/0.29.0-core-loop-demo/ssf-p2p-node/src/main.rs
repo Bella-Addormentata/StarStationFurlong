@@ -393,8 +393,9 @@ pub struct Fingerprint {
     /// ⛓️ Whether Chia is off on this computer (chia_strict.rs): `off`; while
     /// it is, what turned it off (`source`: `env` for `SSF_NO_CHIA_LANE`,
     /// `setting` for the Chia switch in the SpacePhone's Network settings);
-    /// what that switch's file says now (`setting`: `on` or `off`); and
-    /// `damaged` when the file cannot be read. Read live per request, in
+    /// what that switch's file says now (`setting`: `on` or `off`);
+    /// `damaged` when the file cannot be read; and `stuck` when it is a
+    /// folder, which the switch cannot remove. Read live per request, in
     /// every build; absent only from an older node. Loopback only, like the
     /// address.
     #[serde(default, skip_serializing_if = "Option::is_none")]

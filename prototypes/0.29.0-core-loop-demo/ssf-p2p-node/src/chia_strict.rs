@@ -108,10 +108,16 @@ pub enum Saved {
     /// The file is there but cannot be read, or is not a switch the node can
     /// read: counts as off. The reason, in the node's words.
     Damaged(String),
+    /// A folder by the file's name: counts as off, like a damaged file, and
+    /// the in-game on cannot remove it (it removes a file, never a folder),
+    /// so only its removal by hand brings Chia back. The reason, in the
+    /// node's words.
+    Folder(String),
 }
 
 impl Saved {
-    /// Whether this holds Chia off: off, or a damaged file (fails closed).
+    /// Whether this holds Chia off: off, a damaged file or a folder (fails
+    /// closed).
     pub fn off(&self) -> bool {
         !matches!(self, Saved::On)
     }
@@ -126,6 +132,9 @@ pub fn saved_of(path: &Path) -> Saved {
             Err(e) => Saved::Damaged(format!("{} is not a Chia switch the node can read ({e})", path.display())),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::On,
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) => {
+            Saved::Folder(format!("{} is a folder, not a Chia switch the node can read", path.display()))
+        }
         Err(e) => Saved::Damaged(format!("{} cannot be read ({e})", path.display())),
     }
 }
@@ -199,10 +208,15 @@ pub enum Setting {
 ///   - `source`, only while it is: `env` for `SSF_NO_CHIA_LANE` (which wins
 ///     when both hold it off), `setting` for the in-game switch;
 ///   - `setting`: what the switch's file says now, which the next start
-///     reads: `off` with `off` false never happens, and `on` while `off` is
-///     true with the source `setting` is "off now, on at the next start";
+///     reads: `off` with `off` false shows only for the moment an in-game
+///     off has saved the switch and not yet held Chia off, and `on` while
+///     `off` is true with the source `setting` is "off now, on at the next
+///     start";
 ///   - `damaged`, only when true: the file is there but cannot be read, so
-///     it counts as off.
+///     it counts as off;
+///   - `stuck`, only when true (with `damaged`): it is a folder, which the
+///     in-game on cannot remove, so only its removal by hand brings Chia
+///     back.
 ///
 /// The node cannot know whether `SSF_NO_CHIA_LANE` is set at its next start,
 /// so it says what the switch says and leaves the next start to the page's
@@ -217,6 +231,8 @@ pub struct LaneView {
     pub setting: Setting,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub damaged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stuck: bool,
 }
 
 /// The view of `source` ([`off_source_of`]) and of the file as it reads now.
@@ -225,7 +241,8 @@ pub fn view_of(source: Option<OffSource>, saved: &Saved) -> LaneView {
         off: source.is_some(),
         source,
         setting: if saved.off() { Setting::Off } else { Setting::On },
-        damaged: matches!(saved, Saved::Damaged(_)),
+        damaged: matches!(saved, Saved::Damaged(_) | Saved::Folder(_)),
+        stuck: matches!(saved, Saved::Folder(_)),
     }
 }
 
@@ -289,19 +306,23 @@ pub fn lane_plan(env: bool, on: bool, off_now: bool) -> LanePlan {
 }
 
 /// The words for an off whose save failed with `err`, from the file read
-/// back (`reread`): a failed save does not show what the file now holds
-/// (the rename can land and the directory sync after it fail). Chia is off
-/// for this run either way.
-pub fn after_failed_off(err: &str, reread: &Saved) -> String {
+/// back (`reread`), with `env` (`SSF_NO_CHIA_LANE`): a failed save does not
+/// show what the file now holds (the rename can land and the directory sync
+/// after it fail). Chia is off for this run either way. With no switch
+/// saved, the next start brings Chia back only without `SSF_NO_CHIA_LANE`,
+/// so under it the words say so.
+pub fn after_failed_off(err: &str, reread: &Saved, env: bool) -> String {
     match reread {
         Saved::Off => format!("Chia is off now; the switch was written but not confirmed on disk ({err}), so Chia should stay off at the next start"),
-        Saved::Damaged(why) => format!("Chia is off now, but the switch could not be saved ({err}), and {why}, which counts as off, so Chia stays off at the next start"),
+        Saved::Damaged(why) | Saved::Folder(why) => format!("Chia is off now, but the switch could not be saved ({err}), and {why}, which counts as off, so Chia stays off at the next start"),
+        Saved::On if env => format!("SSF_NO_CHIA_LANE in the node's environment holds Chia off now, but the switch could not be saved ({err}), so Chia comes back on at a start without SSF_NO_CHIA_LANE"),
         Saved::On => format!("Chia is off now, but the switch could not be saved ({err}), so Chia comes back on at the next start"),
     }
 }
 
 /// The words for an on whose removal failed with `err`, from the file read
-/// back (`reread`), with `off_now` whether Chia is off for this run.
+/// back (`reread`), with `off_now` whether Chia is off for this run. A
+/// folder is named, since only its removal by hand brings Chia back.
 pub fn after_failed_on(err: &str, reread: &Saved, off_now: bool) -> String {
     match reread {
         Saved::On => format!(
@@ -309,6 +330,9 @@ pub fn after_failed_on(err: &str, reread: &Saved, off_now: bool) -> String {
             if off_now { "; it stays off until then" } else { "" }
         ),
         Saved::Off | Saved::Damaged(_) => format!("the switch could not be turned back on ({err}), so Chia stays off at the next start"),
+        Saved::Folder(why) => format!(
+            "the switch could not be turned back on ({err}): {why}, which the switch cannot remove, so Chia stays off at the next start until the folder is removed by hand"
+        ),
     }
 }
 
@@ -465,7 +489,7 @@ impl LaneSwitch {
                 match saved {
                     Ok(()) => LaneTurn::taken(turned_note(false, self.env, true), view, turned_line(false, self.env, true), !off_now),
                     Err(e) => {
-                        let why = after_failed_off(&e.to_string(), &reread);
+                        let why = after_failed_off(&e.to_string(), &reread, self.env);
                         LaneTurn::refused(&why, view, Some(format!("⛓️ Chia: {why}")), !off_now)
                     }
                 }
@@ -506,6 +530,14 @@ pub fn startup_line_of(env: bool, saved: &Saved) -> Option<(String, bool)> {
         )),
         (Saved::Damaged(why), true) => Some((
             format!("⛓️ Chia: {why}, so it counts as off, and Chia stays off at a start without SSF_NO_CHIA_LANE until the file is removed or Chia is turned back on in the SpacePhone's Network settings."),
+            true,
+        )),
+        (Saved::Folder(why), false) => Some((
+            format!("⛓️ Chia: {why}, so Chia counts as off on this computer. No Chia full node is asked and no SSF wallet loads; the Chia switch in the SpacePhone's Network settings cannot remove a folder, so Chia is back at the next start once the folder is removed by hand."),
+            true,
+        )),
+        (Saved::Folder(why), true) => Some((
+            format!("⛓️ Chia: {why}, so it counts as off, and Chia stays off at a start without SSF_NO_CHIA_LANE until the folder is removed by hand: the Chia switch in the SpacePhone's Network settings cannot remove a folder."),
             true,
         )),
     }
@@ -669,12 +701,28 @@ mod tests {
                 assert!(why.contains(LANE_FILE) && why.contains("is not a Chia switch the node can read"), "{why}");
             }
         }
-        // Something there that cannot be read at all: a folder by that name.
+        // Something there that cannot be read at all: a folder by that name,
+        // which counts as off and which the on cannot remove.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir_all(&path).unwrap();
         match saved_of(&path) {
-            Saved::Damaged(why) => assert!(why.contains("cannot be read"), "{why}"),
-            other => panic!("a folder is damaged, not {other:?}"),
+            Saved::Folder(why) => assert!(why.contains(LANE_FILE) && why.contains("is a folder, not a Chia switch the node can read"), "{why}"),
+            other => panic!("a folder is a folder, not {other:?}"),
+        }
+        assert!(saved_of(&path).off());
+        assert!(forget(&path).is_err(), "the on removes a file, never a folder");
+        // A link to a folder cannot be read either, but it is the link the on
+        // removes: damaged, not a folder.
+        #[cfg(unix)]
+        {
+            let link = dir.0.join("link-to-a-folder.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            match saved_of(&link) {
+                Saved::Damaged(why) => assert!(why.contains("cannot be read"), "{why}"),
+                other => panic!("a link to a folder is damaged, not {other:?}"),
+            }
+            forget(&link).unwrap();
+            assert!(!link.exists() && path.is_dir(), "the link is removed, the folder kept");
         }
     }
 
@@ -728,8 +776,13 @@ mod tests {
             json(Some(OffSource::Setting), &Saved::Damaged("x".into())),
             r#"{"off":true,"source":"setting","setting":"off","damaged":true}"#
         );
+        assert_eq!(
+            json(Some(OffSource::Env), &Saved::Folder("x".into())),
+            r#"{"off":true,"source":"env","setting":"off","damaged":true,"stuck":true}"#,
+            "a folder the on cannot remove"
+        );
         let older: LaneView = serde_json::from_str(r#"{"off":true,"source":"env"}"#).unwrap();
-        assert_eq!(older, LaneView { off: true, source: Some(OffSource::Env), setting: Setting::On, damaged: false });
+        assert_eq!(older, LaneView { off: true, source: Some(OffSource::Env), setting: Setting::On, damaged: false, stuck: false });
         let older: LaneView = serde_json::from_str(r#"{"off":false}"#).unwrap();
         assert_eq!(older, view_of(None, &Saved::On));
     }
@@ -808,18 +861,36 @@ mod tests {
     /// asked; Chia is off now in every case of the off.
     #[test]
     fn a_failed_save_says_what_the_file_holds_not_what_was_asked() {
-        let off = after_failed_off("dir sync failed", &Saved::Off);
+        let off = after_failed_off("dir sync failed", &Saved::Off, false);
         assert!(off.starts_with("Chia is off now") && off.contains("should stay off at the next start"), "{off}");
-        let on = after_failed_off("disk full", &Saved::On);
+        let on = after_failed_off("disk full", &Saved::On, false);
         assert_eq!(on, "Chia is off now, but the switch could not be saved (disk full), so Chia comes back on at the next start");
-        let damaged = after_failed_off("disk full", &Saved::Damaged("chia_lane_off.json cannot be read (x)".into()));
+        let damaged = after_failed_off("disk full", &Saved::Damaged("chia_lane_off.json cannot be read (x)".into()), false);
         assert!(damaged.contains("chia_lane_off.json cannot be read (x), which counts as off, so Chia stays off at the next start"), "{damaged}");
+        let folder = after_failed_off("is a directory", &Saved::Folder("chia_lane_off.json is a folder".into()), false);
+        assert!(folder.contains("chia_lane_off.json is a folder, which counts as off, so Chia stays off at the next start"), "{folder}");
+        // Under SSF_NO_CHIA_LANE, with no switch saved, a next start that
+        // still has the variable keeps Chia off: only one without it brings
+        // Chia back.
+        let env = after_failed_off("disk full", &Saved::On, true);
+        assert_eq!(
+            env,
+            "SSF_NO_CHIA_LANE in the node's environment holds Chia off now, but the switch could not be saved (disk full), so Chia comes back on at a start without SSF_NO_CHIA_LANE"
+        );
+        assert!(!env.contains("comes back on at the next start"), "{env}");
+        // A switch that reads off holds at every next start, with the variable or without.
+        assert_eq!(after_failed_off("dir sync failed", &Saved::Off, true), off);
+        assert_eq!(after_failed_off("disk full", &Saved::Damaged("chia_lane_off.json cannot be read (x)".into()), true), damaged);
         let back = after_failed_on("dir sync failed", &Saved::On, true);
         assert_eq!(back, "the switch was turned back on but not confirmed on disk (dir sync failed), so Chia should come back on at the next start; it stays off until then");
         assert!(!after_failed_on("x", &Saved::On, false).contains("until then"));
         for reread in [Saved::Off, Saved::Damaged("y".into())] {
             assert_eq!(after_failed_on("busy", &reread, true), "the switch could not be turned back on (busy), so Chia stays off at the next start");
         }
+        assert_eq!(
+            after_failed_on("is a directory", &Saved::Folder("chia_lane_off.json is a folder".into()), true),
+            "the switch could not be turned back on (is a directory): chia_lane_off.json is a folder, which the switch cannot remove, so Chia stays off at the next start until the folder is removed by hand"
+        );
     }
 
     /// A switch of its own: the file as it reads at the start decides the
@@ -840,7 +911,7 @@ mod tests {
         let off = LaneSwitch::read(false, path.clone());
         assert_eq!(off.source_at_start(), Some(OffSource::Setting));
         assert!(off.strict());
-        assert_eq!(off.view(), LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: false });
+        assert_eq!(off.view(), LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: false, stuck: false });
         let (line, err) = off.startup_line().unwrap();
         assert!(!err && line.contains("turned off in the SpacePhone's Network settings (chia_lane_off.json)"), "{line}");
         let (line, err) = LaneSwitch::read(true, path.clone()).startup_line().unwrap();
@@ -854,7 +925,23 @@ mod tests {
         assert!(err && line.contains("is not a Chia switch the node can read") && line.contains("so Chia counts as off"), "{line}");
         let (line, err) = LaneSwitch::read(true, path.clone()).startup_line().unwrap();
         assert!(err && line.contains("so it counts as off"), "{line}");
-        for (line, _) in [off.startup_line().unwrap(), damaged.startup_line().unwrap()] {
+
+        // A folder by the file's name: off, and the line never promises that
+        // the switch removes it, since it cannot.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let folder = LaneSwitch::read(false, path.clone());
+        assert_eq!(folder.source_at_start(), Some(OffSource::Setting), "a folder counts as off");
+        assert_eq!(folder.view(), LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: true, stuck: true });
+        let (line, err) = folder.startup_line().unwrap();
+        assert!(err && line.contains("is a folder, not a Chia switch the node can read") && line.contains("so Chia counts as off"), "{line}");
+        assert!(line.contains("cannot remove a folder") && line.contains("once the folder is removed by hand"), "{line}");
+        let (env_line, err) = LaneSwitch::read(true, path.clone()).startup_line().unwrap();
+        assert!(err && env_line.contains("until the folder is removed by hand") && env_line.contains("cannot remove a folder"), "{env_line}");
+        for line in [&line, &env_line] {
+            assert!(!line.contains("removes the file") && !line.contains("or Chia is turned back on"), "no promise the on cannot keep: {line}");
+        }
+        for (line, _) in [off.startup_line().unwrap(), damaged.startup_line().unwrap(), folder.startup_line().unwrap()] {
             assert!(!line.contains("SSF_NO_CHIA_LANE wins") && !line.contains("Chain lane: off"), "never the env's lines: {line}");
         }
     }
@@ -882,7 +969,7 @@ mod tests {
         assert_eq!(off.status, "200 OK");
         assert!(off.turned_off && !off.failed);
         assert_eq!(off.line.as_deref(), Some(turned_line(false, false, true)));
-        let lane = LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: false };
+        let lane = LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: false, stuck: false };
         assert_eq!(off.body, serde_json::json!({ "ok": true, "lane": lane, "note": turned_note(false, false, true) }));
         let file: LaneFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(file, LaneFile { off: true, at: 1_762_150_000 });
@@ -902,7 +989,7 @@ mod tests {
         assert_eq!(on.status, "200 OK");
         assert!(!path.exists(), "the file is removed");
         assert!(switch.strict(), "Chia stays off until the node stops");
-        let lane = LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::On, damaged: false };
+        let lane = LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::On, damaged: false, stuck: false };
         assert_eq!(on.body, serde_json::json!({ "ok": true, "lane": lane, "note": turned_note(true, false, true) }));
         assert!(turned_note(true, false, true).contains("next start"));
         assert_eq!(on.line.as_deref(), Some(turned_line(true, false, true)));
@@ -970,6 +1057,21 @@ mod tests {
         assert_eq!(off.body["lane"], serde_json::json!({ "off": true, "source": "setting", "setting": "on" }));
         assert_eq!(off.line, Some(format!("⛓️ Chia: {error}")));
 
+        // The same failure under SSF_NO_CHIA_LANE: the environment held Chia
+        // off already, and the words name the start that brings it back.
+        let env = LaneSwitch::read(true, missing.clone());
+        let off = env.turn(false, 1, || async {}).await;
+        assert_eq!(off.status, "409 Conflict");
+        assert!(off.failed && !off.turned_off, "the environment held Chia off already");
+        let error = off.body["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("SSF_NO_CHIA_LANE in the node's environment holds Chia off now, but the switch could not be saved (")
+                && error.ends_with("so Chia comes back on at a start without SSF_NO_CHIA_LANE"),
+            "{error}"
+        );
+        assert_eq!(off.body["lane"], serde_json::json!({ "off": true, "source": "env", "setting": "on" }));
+        assert_eq!(off.line, Some(format!("⛓️ Chia: {error}")));
+
         // A folder where the file should be: damaged at the start (off), and
         // the on cannot remove it.
         let path = dir.file();
@@ -980,8 +1082,9 @@ mod tests {
         assert_eq!(on.status, "409 Conflict");
         assert!(on.failed);
         let error = on.body["error"].as_str().unwrap();
-        assert!(error.starts_with("the switch could not be turned back on (") && error.ends_with("so Chia stays off at the next start"), "{error}");
-        assert_eq!(on.body["lane"], serde_json::json!({ "off": true, "source": "setting", "setting": "off", "damaged": true }));
+        assert!(error.starts_with("the switch could not be turned back on (") && error.ends_with("so Chia stays off at the next start until the folder is removed by hand"), "{error}");
+        assert!(error.contains(&format!("{} is a folder", path.display())), "the folder is named: {error}");
+        assert_eq!(on.body["lane"], serde_json::json!({ "off": true, "source": "setting", "setting": "off", "damaged": true, "stuck": true }));
     }
 
     /// One turn at a time: an on asked while an off is closing the lane
