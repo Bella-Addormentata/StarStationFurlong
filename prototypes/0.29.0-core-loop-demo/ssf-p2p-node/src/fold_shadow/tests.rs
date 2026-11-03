@@ -1651,7 +1651,7 @@ fn an_answer_is_believed_only_where_the_pins_and_the_delegations_stand_as_they_s
         }
         let shown = rs.confirmed[&key];
         let mut tally = Tally::default();
-        rs.compare(&mut tally, &covered, shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64, false, &pinned);
+        rs.compare(&mut tally, &covered, &BTreeSet::new(), shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64, false, &pinned);
         let expected = if pins_moved || delegations_moved { Tally { inputs: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
         assert_eq!(tally, expected, "pins moved {pins_moved}, delegations moved {delegations_moved}");
     }
@@ -2817,10 +2817,18 @@ fn the_player_whose_net_differs_is_named_before_the_nets_of_all_the_others() {
 fn a_line_names_the_room_as_well_as_the_table() {
     assert_eq!(tag("room-a", "craps-1", "inc"), "room-a craps-1 inc");
     assert_ne!(tag("room-a", "craps-1", "inc"), tag("room-b", "craps-1", "inc"));
+    // A name is cut at 64 BYTES (the log clips by bytes): 32 two-byte characters, not 64.
     let long = "é".repeat(100);
-    assert_eq!(tag(&long, "t", "i"), format!("{}… t i", "é".repeat(64)));
+    assert_eq!(tag(&long, "t", "i"), format!("{}… t i", "é".repeat(32)));
+    // ... and at a character, whatever byte the cut falls on.
+    let odd = format!("a{}", "é".repeat(100));
+    assert_eq!(tag(&odd, "t", "i"), format!("a{}… t i", "é".repeat(31)));
     assert_eq!(brief("short", 64), "short");
     assert_eq!(brief(&"a".repeat(64), 64), "a".repeat(64), "of the most is whole");
+    assert_eq!(brief_bytes(&"a".repeat(64), 64), "a".repeat(64), "of the most is whole");
+    // The room, the table and the incarnation always fit a line, so the incarnation is never cut off by a name.
+    let worst = tag(&"é".repeat(500), &"é".repeat(500), "inc-1");
+    assert!(worst.len() < LOG_LINE_BYTES / 2 && worst.ends_with(" inc-1"), "{worst}");
 }
 
 /// The worker holds `places` tables, and a table it does not hold yet waits for a place, and takes it when one is let go of:
@@ -2967,9 +2975,10 @@ fn the_first_look_is_no_handover_and_another_watch_is() {
     assert_eq!(b.handover_tables(), 0);
 }
 
-/// A trim the fold had no answer for, or one the node cannot read, ends the session too: the doubt does not outlast it.
+/// A trim the node cannot read is a trim of a session it cannot name: the doubt of a handover does not end with it (round 9;
+/// it did, in round 8). One that names the session in doubt does, whatever the node made of it.
 #[test]
-fn the_doubt_of_a_handover_ends_with_a_trim_whatever_the_node_made_of_it() {
+fn the_doubt_of_a_handover_is_not_ended_by_a_trim_the_node_cannot_read() {
     // A trim of a checkpoint the node cannot read as a page does (held), the table's first trim.
     let mut b = Bench::new("house craps 3");
     let mut pins = b.watch_pins();
@@ -2983,7 +2992,9 @@ fn the_doubt_of_a_handover_ends_with_a_trim_whatever_the_node_made_of_it() {
     assert_eq!(b.handover_tables(), 1);
     b.put_checkpoint(&with_cp(&plain, "__proto__", Some(s("y"))));
     b.until("counted", |b| b.shadow.tally.unreadable > 0);
-    assert_eq!(b.handover_tables(), 0, "the unreadable trim ended the session");
+    assert_eq!(b.handover_tables(), 1, "the unreadable trim is of a session the node cannot name: the doubt stays");
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 1);
 }
 
 /// A table that comes in the tick the deed changed hands is held in doubt too: its history before the node looked is not
@@ -3233,4 +3244,358 @@ fn what_is_remembered_of_a_room_goes_when_the_fold_duties_go_off() {
     b.view = Some(view);
     b.ticks(3);
     assert!(b.shadow.rooms.is_empty() && b.shadow.remembered.is_empty());
+}
+
+// ── Review round 9 ───────────────────────────────────────────────────────────
+
+impl Bench {
+    /// The sessions of the vector's table that are in doubt of a handover.
+    fn doubted_sessions(&self) -> Vec<String> {
+        let key = (self.case.ctx.t.clone(), self.case.ctx.inc.clone());
+        self.shadow.rooms[self.room()].handover.get(&key).map(|set| set.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// The id of the live session of the vector's table, as the mirror has it.
+    fn live_sid(&self) -> String {
+        let rs = &self.shadow.rooms[self.room()];
+        session_of(rs.mirror.state(&self.case.ctx.t, &self.case.ctx.inc).unwrap().live.expect("a live session")).to_string()
+    }
+
+    /// The names of `n` tables of no records, that sort before the vector's, and the view that follows them and then the
+    /// vector's table: the cap (`MAX_SHADOW_TABLES`) has no place for the vector's.
+    fn crowd_out_the_table(&mut self, n: usize) -> Vec<TableKey> {
+        let inc = self.case.ctx.inc.clone();
+        let crowd: Vec<TableKey> = (0..n).map(|i| (format!("0-{i:02}"), inc.clone())).collect();
+        for (t, _) in &crowd {
+            self.empty_table(t);
+        }
+        let mut tables = crowd.clone();
+        tables.push((self.case.ctx.t.clone(), inc));
+        self.view.as_mut().unwrap().tables = tables;
+        crowd
+    }
+}
+
+/// The delegations that churned before the room's shadow was let go of (the plan went) are churned for the one that replaces
+/// it: the sessions in the room are no more known to have been folded with the houses the plan names for the room being
+/// let go of. What the delegations did meanwhile is not known (nothing watches them).
+#[test]
+fn the_churn_of_the_delegations_is_kept_when_the_room_is_let_go_of_and_followed_again() {
+    for churned in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        let mut pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "churned={churned}: shown whole");
+        if churned {
+            b.delegate("house-x");
+            b.withdraw("house-x");
+            b.ticks(3);
+            assert!(b.shadow.rooms[b.room()].mirror.delegations().churned);
+            assert_eq!(b.confirmed_count(), 0, "churned: nothing is shown whole");
+        }
+        let view = b.view.take().unwrap();
+        b.until("the room is gone", |b| b.shadow.rooms.is_empty());
+        assert_eq!(b.shadow.remembered[b.room()].churned, churned);
+        b.view = Some(view);
+        b.sync_pins(&mut pins);
+        b.until("answered again", |b| b.caught_up());
+        b.ticks(5);
+        let rs = &b.shadow.rooms[b.room()];
+        assert_eq!(rs.mirror.delegations().churned, churned, "churned={churned}: the new shadow knows what the last did");
+        assert_eq!(b.confirmed_count(), (!churned) as usize, "churned={churned}: and shows nothing whole where they churned");
+    }
+}
+
+/// A table the cap has no place for, but the plan names, keeps what is known of it: the checkpoints it was compared with
+/// (a page that puts one back must not have it counted again) and the doubt of a handover. A table the plan stops naming
+/// does not.
+#[test]
+fn a_table_the_cap_puts_out_keeps_its_history_while_the_plan_names_it() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let key = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let first = b.page_trim(&b.answer());
+    b.put_checkpoint(&first);
+    b.until("compared", |b| counted(b.shadow.tally) > 0);
+    b.ticks(3);
+    assert_eq!(b.shadow.tally.agree, 1);
+    assert_eq!(b.shadow.rooms[b.room()].compared[&key].len(), 1);
+    // Fourteen other tables the plan names come before it: the cap (14) has no place for it, and it is let go of.
+    let view_before = b.view.clone().unwrap();
+    let crowd = b.crowd_out_the_table(MAX_SHADOW_TABLES);
+    b.until("the crowd is answered", |b| b.shadow.counts().results > MAX_SHADOW_TABLES as u64);
+    b.ticks(10);
+    assert_eq!(b.shadow.report().tables_over, 1, "the cap put the vector's table out");
+    assert!(b.shadow.rooms[b.room()].mirror.state(&key.0, &key.1).is_none() || b.shadow.rooms[b.room()].feed.fold(&key.0, &key.1).is_none());
+    assert_eq!(b.shadow.rooms[b.room()].compared[&key].len(), 1, "what it was compared with is kept: the plan names it");
+    // The deed changes hands meanwhile: a session the node cannot name is in doubt.
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()], "the table the cap put out is in doubt too");
+    // The plan goes back to the one table: it is followed again, and what it was compared with is not forgotten.
+    b.view.as_mut().unwrap().tables = view_before.tables.clone();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.ticks(10);
+    b.until("answered again", |b| b.caught_up());
+    assert_eq!(b.shadow.rooms[b.room()].compared[&key].len(), 1);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()], "and so is the doubt, until a trim ends its session");
+    // The checkpoint standing is put back after another: it is not counted again.
+    b.shadow.tally = Tally::default();
+    b.put_checkpoint(&first);
+    b.ticks(10);
+    assert_eq!(b.shadow.tally, Tally::default(), "the checkpoint it was compared with is not compared again");
+    // A table the plan stops naming forgets it (and the others, which it never followed, have nothing).
+    let _ = crowd;
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(5);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("let go of", |b| b.tables_held() == 0);
+    b.ticks(3);
+    assert!(!b.shadow.rooms[b.room()].compared.contains_key(&key) && !b.shadow.rooms[b.room()].handover.contains_key(&key));
+}
+
+/// A table the cap put out when the deed changed hands, followed again, has its next trim held in doubt (the doubt was not
+/// cleared by anything else).
+#[test]
+fn the_doubt_of_a_table_the_cap_put_out_ends_with_the_trim_that_ends_its_session() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let view_before = b.view.clone().unwrap();
+    b.crowd_out_the_table(MAX_SHADOW_TABLES);
+    b.until("the crowd is answered", |b| b.shadow.counts().results > MAX_SHADOW_TABLES as u64);
+    b.ticks(10);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()]);
+    b.view.as_mut().unwrap().tables = view_before.tables.clone();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.ticks(10);
+    b.until("answered", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.tick();
+    // (The crowd's tables, which the plan stopped naming, were given up on: that is counted too.)
+    assert_eq!(b.shadow.tally, Tally { handover: 1, expired: MAX_SHADOW_TABLES as u64, ..Tally::default() });
+    assert_eq!(b.handover_tables(), 0, "the session is over, and the doubt with it");
+}
+
+/// The session in doubt is the one that was live when the deed changed hands: its trim (the checkpoint names it) ends the
+/// doubt; a handover is not "any trim" (round 8 cleared it with whichever came first).
+#[test]
+fn the_doubt_of_a_handover_is_of_the_session_that_was_live_and_ends_with_its_trim() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let sid = b.live_sid();
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    assert_eq!(b.doubted_sessions(), vec![sid.clone()], "the session that was live");
+    // A checkpoint that trims a session other than the one in doubt (a page that trims a session the node held in doubt
+    // of nothing) does not end it, but the base moving takes the session in doubt out of the room: it is over.
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.tick();
+    assert_eq!(b.shadow.tally, Tally { handover: 1, ..Tally::default() }, "its own trim is held in doubt");
+    assert_eq!(b.doubted_sessions(), Vec::<String>::new());
+}
+
+/// `doubted` and `close_doubt`: the sessions a trim ends.
+#[test]
+fn a_trim_ends_the_session_it_names_and_an_unnamed_one_only_if_it_closes_the_session_the_fold_holds() {
+    let key: TableKey = ("t".to_string(), "i".to_string());
+    let mut h = BTreeMap::new();
+    doubt(&mut h, &key, Some("s1"));
+    doubt(&mut h, &key, None);
+    assert_eq!(h[&key].iter().cloned().collect::<Vec<_>>(), vec!["*".to_string(), "s1".to_string()]);
+    // A checkpoint of another session that does not close the fold's (a past or parent one, or one not readable) ends none.
+    assert!(!doubted(h.get(&key), Some("s9"), false));
+    assert!(!doubted(h.get(&key), None, false));
+    close_doubt(&mut h, &key, Some("s9"), false, false);
+    assert_eq!(h[&key].len(), 2);
+    // The one it names is ended.
+    assert!(doubted(h.get(&key), Some("s1"), false));
+    close_doubt(&mut h, &key, Some("s1"), false, false);
+    assert_eq!(h[&key].iter().cloned().collect::<Vec<_>>(), vec!["*".to_string()]);
+    // An unnamed one is ended by a checkpoint that closes the session the fold holds.
+    assert!(doubted(h.get(&key), Some("s9"), true));
+    assert!(doubted(h.get(&key), None, true));
+    close_doubt(&mut h, &key, Some("s9"), true, false);
+    assert!(h.is_empty(), "nothing in doubt: the table has no entry");
+    // ... and if the deed changed hands in that very tick, the session after is in doubt, not named.
+    doubt(&mut h, &key, Some("s1"));
+    close_doubt(&mut h, &key, Some("s1"), true, true);
+    assert_eq!(h[&key].iter().cloned().collect::<Vec<_>>(), vec!["*".to_string()]);
+    // A table with no doubt has none made by a trim.
+    close_doubt(&mut h, &("u".to_string(), "i".to_string()), Some("s1"), true, true);
+    assert_eq!(h.len(), 1);
+    assert_eq!(session_of("ses:a:b:c:0123"), "0123");
+    assert_eq!(session_of("plain"), "plain");
+}
+
+/// The deed changing hands in the very tick a trim the node cannot read is read in: the trim may have come before it, and
+/// the session after it is in doubt, though the node can name none (it has no live session of a table held over a base it
+/// cannot read).
+#[test]
+fn a_handover_in_the_tick_an_unreadable_trim_is_read_in_leaves_the_session_after_it_in_doubt() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let plain = b.page_trim(&b.answer());
+    b.put_checkpoint(&plain);
+    b.until("compared", |b| counted(b.shadow.tally) > 0);
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.put_checkpoint(&held(&with_cp(&plain, "u", Some(CVal::Int(99)))));
+    b.tick();
+    assert_eq!(b.shadow.tally.unreadable, 1, "{:?}", b.shadow.tally);
+    assert!(b.doubted_sessions().contains(&ANY_SESSION.to_string()), "{:?}", b.doubted_sessions());
+}
+
+/// A trim the fold has no answer for still ends the session it names: the doubt of a handover in that session goes with it.
+#[test]
+fn a_trim_the_fold_has_no_answer_for_ends_the_doubt_of_the_session_it_names() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    // The worker is sent nothing: the table is read, and has no answer.
+    b.shadow.sup.clog(QUEUE_BYTES);
+    b.ticks(5);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    let sid = b.live_sid();
+    assert_eq!(b.doubted_sessions(), vec![sid], "the session that was live");
+    let sum: FoldSummary = serde_json::from_str(&b.case.summary).unwrap();
+    b.put_checkpoint(&b.page_trim(&sum));
+    b.ticks(5);
+    assert_eq!(b.shadow.tally, Tally { unanswered: 1, ..Tally::default() });
+    assert_eq!(b.handover_tables(), 0, "the session is over, and the doubt with it");
+}
+
+/// A doubt does not outlast its session: when the table's base moves to a checkpoint of another one, the session that was
+/// live is not, and no checkpoint will name it.
+#[test]
+fn the_doubt_of_a_session_goes_when_the_table_moves_to_another_session() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    assert_eq!(b.doubted_sessions().len(), 1);
+    let elsewhere = with_cp(&b.page_trim(&b.answer()), "b", Some(s("0123456789abcdef01234567")));
+    b.put_checkpoint(&elsewhere);
+    b.ticks(5);
+    assert_eq!(b.shadow.tally, Tally { parent: 1, ..Tally::default() }, "(a trim of another session)");
+    assert_eq!(b.handover_tables(), 0);
+}
+
+/// A trim that is not of the session the fold holds (a past one, or one of another session) does not end the doubt of a
+/// session the node could not name.
+#[test]
+fn a_trim_of_another_session_does_not_end_the_doubt_of_a_session_the_node_could_not_name() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let view_before = b.view.clone().unwrap();
+    b.crowd_out_the_table(MAX_SHADOW_TABLES);
+    b.until("the crowd is answered", |b| b.shadow.counts().results > MAX_SHADOW_TABLES as u64);
+    b.ticks(10);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()]);
+    b.view.as_mut().unwrap().tables = view_before.tables.clone();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.ticks(10);
+    b.until("answered", |b| b.caught_up());
+    b.ticks(5);
+    let elsewhere = with_cp(&b.page_trim(&b.answer()), "b", Some(s("0123456789abcdef01234567")));
+    b.put_checkpoint(&elsewhere);
+    b.ticks(5);
+    assert_eq!(b.shadow.tally.parent, 1, "{:?}", b.shadow.tally);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()], "it is not the session the node could not name that was trimmed");
+}
+
+/// The checkpoints a table was compared with are kept while its room is let go of (the plan went) and followed again: a
+/// page that puts one back is not counted a second time.
+#[test]
+fn what_a_table_was_compared_with_is_kept_while_its_room_is_let_go_of() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let (a, other) = (b.page_trim(&sum), b.wrong_trim(&sum));
+    b.put_checkpoint(&a);
+    b.until("compared", |b| counted(b.shadow.tally) >= 1);
+    b.put_checkpoint(&other);
+    b.until("the other counted", |b| counted(b.shadow.tally) >= 2);
+    b.ticks(5);
+    let counted_before = counted(b.shadow.tally);
+    assert_eq!(counted_before, 2);
+    // The room is let go of, and followed afresh with the second checkpoint in the doc: the table's first.
+    let view = b.view.take();
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.remembered[b.room()].compared.values().map(VecDeque::len).sum::<usize>(), 2);
+    b.view = view;
+    b.until("answered", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(counted(b.shadow.tally), counted_before, "(a first checkpoint is no trim)");
+    // ... and the first is put back: it has been counted.
+    b.put_checkpoint(&a);
+    b.ticks(30);
+    assert_eq!(counted(b.shadow.tally), counted_before, "and not counted again");
+}
+
+/// A trim the fold has no answer for does not end the doubt of a session the node could not name: it is not known to be
+/// the session the fold holds.
+#[test]
+fn a_trim_the_fold_has_no_answer_for_does_not_end_the_doubt_of_a_session_the_node_could_not_name() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let view_before = b.view.clone().unwrap();
+    b.crowd_out_the_table(MAX_SHADOW_TABLES);
+    b.until("the crowd is answered", |b| b.shadow.counts().results > MAX_SHADOW_TABLES as u64);
+    b.ticks(10);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()]);
+    // The plan goes back to the one table, and the worker is sent nothing: the table is read, and has no answer.
+    b.view.as_mut().unwrap().tables = view_before.tables.clone();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    b.shadow.sup.clog(QUEUE_BYTES);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.ticks(10);
+    let key = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    assert!(b.shadow.rooms[b.room()].mirror.state(&key.0, &key.1).is_some(), "(read)");
+    assert!(b.shadow.rooms[b.room()].feed.fold(&key.0, &key.1).is_none(), "(and unanswered)");
+    let sum: FoldSummary = serde_json::from_str(&b.case.summary).unwrap();
+    b.put_checkpoint(&b.page_trim(&sum));
+    b.ticks(5);
+    assert_eq!(b.shadow.tally.unanswered, 1, "{:?}", b.shadow.tally);
+    assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()], "it is not known to be the session the node could not name");
 }

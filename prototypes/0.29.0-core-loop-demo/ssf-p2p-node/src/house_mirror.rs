@@ -78,9 +78,11 @@
 //! removed or replaced in a live session is a history a page that never saw it does not share. The mirror says so,
 //! and decides nothing of it: [`Delegations`] (changes, `churned` for good, and `hidden`, the updates that may have
 //! hidden one beside the keys they show), a session whose trim is read as `unread_at_trim` (records made and deleted in
-//! it, or removed or replaced in it, or the session itself removed in such an update), and the signers of the slips a
-//! session held ([`RoomMirror::take_ended_signers`], told once the session has ended), which the shadow reads against
-//! the pins it was given.
+//! it, or removed or replaced in it, or the session itself removed in such an update, or replaced or removed in an
+//! update of its own, which is no page's trim), and the signers of the slips a session held
+//! ([`RoomMirror::take_ended_signers`], told once the session has ended; a name or key longer than a page pins,
+//! [`MAX_SIGNER_BYTES`], is not kept and says so as too many do), which the shadow reads against the pins it was given.
+//! What the observer compares inside the doc's commit is bounded ([`rewritten_alike`]).
 //!
 //! WHAT THE CALLER CAN RELY ON, after a drain that ran short of nothing (a
 //! table that [`RoomMirror::current`]): the changes taken since the table's
@@ -126,6 +128,10 @@ pub const ALIKE_SUM_BYTES: usize = 256 * 1024;
 /// signed what a session held ([`RoomMirror::take_ended_signers`]): an honest table has a few, and a session of more
 /// is not told, so that nothing counted of it is believed.
 pub const MAX_SIGNERS: usize = 512;
+/// The most bytes of a player's name, or of a signing key, that the mirror keeps of a slip: a page pins at most 128
+/// UTF-16 units of either (3 bytes each, at most), so a longer one is no pin's, and a table of slips with keys of 64 KiB
+/// would hold [`MAX_SIGNERS`] of them for each of its sessions.
+pub const MAX_SIGNER_BYTES: usize = 384;
 /// The changes of a table waiting to be taken (their keys and weights) stop
 /// being read at this; the caller's `take` makes room.
 pub const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
@@ -290,6 +296,15 @@ fn rewritten_alike(change: &EntryChange, cap: usize) -> bool {
     }
 }
 
+/// Whether the transaction changed a watched checkpoint (`sum:`) of the computed map: a page's trim, which writes the
+/// checkpoint in the transaction that deletes the session it trims.
+fn trims_in(names: &HashSet<String>, txn: &TransactionMut, events: &Events) -> bool {
+    events.iter().any(|event| {
+        let Event::Map(map) = event else { return false };
+        map.path().is_empty() && map.keys(txn).iter().any(|(key, _)| key.starts_with("sum:") && names.contains(&**key))
+    })
+}
+
 /// The observer's callback. It runs inside the doc's commit: a lookup for
 /// each key that changed, and a key kept only if it is watched.
 fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Events) {
@@ -300,6 +315,8 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
     let mut gap = None;
     // (And once, when a delegation is first written: was something made and deleted in this transaction?)
     let mut lost = None;
+    // (And once, when a watched session is replaced or removed: did the same transaction change a watched checkpoint?)
+    let mut trimmed = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         let path = map.path();
@@ -348,7 +365,17 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                         // noted: the one a page's trim makes is not yet, and what the same update made and deleted was
                         // in the session it trims, whose removal is noted here, and which the base changing, in the
                         // drain, takes with it.)
-                        if key.starts_with("ses:") && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                        //
+                        // And a session map replaced or removed in a transaction of its own: no trim of the session (a
+                        // page's trim writes the checkpoint in the transaction that deletes the session it trims), and
+                        // so the session the pages read from here on is another, made by the one who replaced it, in
+                        // whatever updates, and the records it held are the pages' to count and not the node's to know.
+                        // (A removal in a trim is the base changing, which takes the doubt with it, in the drain: and one
+                        // noted here would outlast it, for the drain that reads it comes after the one that noted it.)
+                        if key.starts_with("ses:")
+                            && (*lost.get_or_insert_with(|| made_and_deleted(txn))
+                                || (!matches!(change, EntryChange::Inserted(_)) && !*trimmed.get_or_insert_with(|| trims_in(names, txn, events))))
+                        {
                             dirt.suspect.insert(key.to_string());
                         }
                         // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
@@ -380,11 +407,11 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 // share: the page's next trim of the session is not held against what the node read. A record written
                 // again as it stands is nothing.)
                 for (_, change) in map.keys(txn).iter() {
+                    // (A comparison inside the commit of the doc is bounded: a value that weighs more than a record may,
+                    // or that a page may read otherwise, is not compared and is another.)
                     let moved = match change {
-                        EntryChange::Removed(_) => true,
-                        EntryChange::Updated(Out::Any(old), Out::Any(new)) => old != new,
-                        EntryChange::Updated(..) => true,
                         EntryChange::Inserted(_) => false,
+                        _ => !rewritten_alike(change, MAX_RECORD_BYTES),
                     };
                     if moved {
                         dirt.suspect.insert(name.to_string());
@@ -746,6 +773,12 @@ impl Table {
     fn note_signer(&mut self, key: &str, value: &CVal) {
         let Some(('s', _, Some(pid), _)) = parse_key(key) else { return };
         let Some(k) = value.get("k").and_then(CVal::as_str) else { return };
+        // (A name or a key longer than any a page pins ([`MAX_SIGNER_BYTES`]) is no pin's and is not copied: the pair
+        // is not told, as when there are too many, so that nothing counted of the session is believed.)
+        if pid.len() > MAX_SIGNER_BYTES || k.len() > MAX_SIGNER_BYTES {
+            self.signers_over = true;
+            return;
+        }
         let pair = (pid.to_string(), k.to_string());
         if self.signers.len() >= MAX_SIGNERS && !self.signers.contains(&pair) {
             self.signers_over = true;
@@ -1366,6 +1399,13 @@ impl RoomMirror {
     /// What the observer has seen of the room's delegations since it began.
     pub fn delegations(&self) -> Delegations {
         lock(&self.shared).delegations
+    }
+
+    /// The room's delegations are known to have churned before this mirror began (the shadow had a mirror of the room,
+    /// and let it go, and was left no way to tell what the delegations did meanwhile): they count as churned for good,
+    /// as if this mirror had seen it.
+    pub fn inherit_churn(&mut self) {
+        lock(&self.shared).delegations.churned = true;
     }
 
     /// The table's checkpoint is waiting to be read: the table is new, or a change to `sum:` has

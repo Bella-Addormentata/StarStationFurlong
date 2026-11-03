@@ -2898,3 +2898,112 @@ fn the_signers_of_sessions_ended_between_asks_are_kept_to_the_most_together() {
     assert!(over, "the two together are more than it keeps");
     assert_eq!(told.len(), MAX_SIGNERS);
 }
+
+// ── Review round 9 ───────────────────────────────────────────────────────────
+
+/// The live session replaced, or removed, in an update of its own (no trim: a page's trim writes the checkpoint in the update
+/// that deletes the session it trims) is another session than the one the pages read: the node cannot know what was made
+/// and deleted in it, and the next trim is not held against what it read. A trim that removes the session is the base
+/// changing, and the doubt goes with the session it leaves.
+#[test]
+fn the_live_session_replaced_or_removed_in_an_update_of_its_own_makes_the_next_trim_unread() {
+    for (how, unread) in [("removed", true), ("replaced", true), ("replaced with records", true), ("replaced beside another table's checkpoint", true), ("a record added", false), ("trimmed", false)] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+        f.drain();
+        f.skim();
+        match how {
+            "removed" | "replaced" | "replaced with records" | "replaced beside another table's checkpoint" => {
+                let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = f.doc.transact_mut();
+                if how.starts_with("replaced beside") {
+                    // (A checkpoint of a table the mirror does not watch is no trim of this one.)
+                    comp.insert(&mut txn, sum_of("a-table-that-is-not-watched").as_str(), to_any(&cp(2)));
+                }
+                if how == "removed" {
+                    comp.remove(&mut txn, live0().as_str());
+                } else {
+                    let m = comp.insert(&mut txn, live0().as_str(), MapPrelim::default());
+                    if how == "replaced with records" {
+                        m.insert(&mut txn, rk(1, 7).as_str(), to_any(&rv(1, 70)));
+                    }
+                }
+            }
+            "a record added" => f.put(&live0(), &rk(1, 3), &rv(1, 30)),
+            _ => {}
+        }
+        // (The node reads the change before the trim, and the session is read afresh if it was replaced.)
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves.
+        f.skim();
+        let base2 = cp(3);
+        f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// A value the observer compares inside the commit is bounded: a record written again as it stands moves nothing, but one
+/// that weighs more than a record may is not compared, and is another.
+#[test]
+fn a_record_written_again_is_the_same_only_if_it_is_small_enough_to_be_compared() {
+    let big = |n: usize| norm(obj(vec![("pad", s(&"x".repeat(n)))]));
+    for (how, size, unread) in [("small", 100, false), ("big", 70_000, true)] {
+        let key = rk(1, 1);
+        let record = big(size);
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &[(rk(1, 1), record.clone()), (rk(1, 2), rv(1, 20))]));
+        f.drain();
+        f.skim();
+        f.put(&live0(), &key, &record);
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+    }
+}
+
+/// The players and keys of the slips the mirror keeps are bounded by what a page pins: a longer one is no pin's and is not
+/// kept, and the session says so as one with too many does.
+#[test]
+fn a_signer_longer_than_a_page_pins_is_not_kept_and_the_session_says_so() {
+    // (A name of 128 characters of three bytes is the longest a page pins; 129 are 387 bytes.)
+    for (pid_chars, key_len, over) in [(128, MAX_SIGNER_BYTES, false), (129, 5, true), (5, MAX_SIGNER_BYTES + 1, true), (5, 60_000, true)] {
+        let (pid, key) = ("€".repeat(pid_chars), "k".repeat(key_len));
+        let pid_len = pid.len();
+        let mut f = Fix::seeded(Limits::default(), |f| {
+            let mut all = records(&[(1, 10)]);
+            all.push(slip(1, &pid, 1, &key));
+            all.push(slip(1, "pid-b", 2, "key-b"));
+            f.session(&live0(), &all);
+        });
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        let (told, said_over) = f.m.take_ended_signers(T, INC);
+        assert_eq!(said_over, over, "{pid_len}/{key_len}");
+        let mut want: BTreeSet<(String, String)> = [pair("pid-b", "key-b")].into_iter().collect();
+        if !over {
+            want.insert(pair(&pid, &key));
+        }
+        assert_eq!(told, want, "{pid_len}/{key_len}: a pair that is no pin's is not kept");
+    }
+}
+
+/// A room's mirror that is told the delegations churned before it began says so, and the delegations are churned for good.
+#[test]
+fn a_mirror_can_be_told_that_the_delegations_churned_before_it_began() {
+    let f = Fix::empty();
+    assert!(!f.m.delegations().churned);
+    let mut f = f;
+    f.m.inherit_churn();
+    assert!(f.m.delegations().churned);
+    assert_eq!(f.m.delegations().changes, 0, "(it changed nothing it saw)");
+}

@@ -34,6 +34,13 @@
 //! pinned for its player (a page counts the slip when it is the key it signs
 //! with), or a checkpoint was written over by another before the node read it.
 //! Those are skipped, and counted by why.
+//!
+//! WHAT IS KEPT WHILE A TABLE IS PUT OUT. The worker holds [`MAX_SHADOW_TABLES`], and a room's shadow goes when its plan
+//! does. What is known of a table outlives both while the plan names it: the checkpoints it was compared with (one is
+//! compared once, whatever else happens), the doubt of a handover (`RoomShadow::handover`: for each table the sessions
+//! in doubt, named by id, or `*` for one the node could not name; a compared trim ends the session it names, and `*`
+//! when it ends the session the fold holds; a trim the node cannot read, or that is of another session, ends no
+//! unnamed one) and whether the delegations had churned. What happened while a room had no plan is not known.
 
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
@@ -362,9 +369,24 @@ fn brief(s: &str, n: usize) -> String {
     }
 }
 
-/// Which table a line is about: the room, the table and its incarnation (two rooms can have the same table).
+/// The first `n` BYTES of `s` (cut at a character), and a … if there were more: the log clips by bytes, so a name that
+/// is cut by characters first (`é` is two bytes) could still take the line from what comes after it.
+fn brief_bytes(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut cut = n;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
+}
+
+/// Which table a line is about: the room, the table and its incarnation (two rooms can have the same table). The room
+/// and the table are each cut at 64 bytes, so the incarnation (which is what a reader needs most) always reaches the
+/// line, whatever the names are made of.
 fn tag(room: &str, t: &str, inc: &str) -> String {
-    format!("{} {} {}", brief(room, 64), brief(t, 64), inc)
+    format!("{} {} {}", brief_bytes(room, 64), brief_bytes(t, 64), inc)
 }
 
 /// `line`, cut to [`LOG_LINE_BYTES`] at a character.
@@ -455,12 +477,15 @@ struct RoomShadow {
     looked: bool,
     /// How many updates to the delegations may have hidden one (`Delegations::hidden`), as of the last tick.
     hidden_seen: u64,
-    /// The tables whose session had the deed change hands in it, or may have, or a delegation come and go unseen: the
-    /// pages may have folded its rounds with another holder's houses, or with a house the node never knew, and the
-    /// node counted one's. A table is in until the comparison of the checkpoint of its next trim, which it is
-    /// skipped at (`Skip::Handover`) and leaves (a new session starts; unless it happened again in that very tick,
-    /// which may be after the trim).
-    handover: BTreeSet<TableKey>,
+    /// The tables with a session that had the deed change hands in it, or may have, or a delegation come and go unseen:
+    /// the pages may have folded its rounds with another holder's houses, or with a house the node never knew, and the
+    /// node counted one's. For each, which sessions: the one that was live when it was noted (its id), or [`ANY_SESSION`]
+    /// where there was none the node could name (the table is not held yet, or the cap has no place for it) or the
+    /// session after a trim read in the very tick it happened in (which may be after the trim). A session leaves when a
+    /// checkpoint that ends it is compared (`Skip::Handover` at that one): the one the checkpoint names (`b`), and an
+    /// unnamed one when the checkpoint ends the session the fold holds. A checkpoint that does not, or that cannot be
+    /// read, is not that trim, and the doubt stays.
+    handover: BTreeMap<TableKey, BTreeSet<String>>,
     /// Tables the plan stopped naming that the mirror still holds (the pages count them ended: removed, or their
     /// switch gone or naming another incarnation), and when each was first seen outside the view: kept for the final
     /// checkpoint a page writes when it compacts them, for [`GONE_GRACE`].
@@ -496,7 +521,14 @@ thread_local! {
 struct Remembered {
     deeds: Option<(PinWatch, u64)>,
     looked: bool,
-    handover: BTreeSet<TableKey>,
+    handover: BTreeMap<TableKey, BTreeSet<String>>,
+    /// The checkpoints each table was compared with: a checkpoint is compared once, however the room's shadow comes and
+    /// goes.
+    compared: BTreeMap<TableKey, VecDeque<[u8; 32]>>,
+    /// The delegations had churned in the room (`Delegations::churned`), for good: the mirror that replaces this one
+    /// has not seen it, and the sessions that are in the room still may have been folded with those delegations.
+    /// (What they did while the room was let go of cannot be known.)
+    churned: bool,
 }
 
 impl RoomShadow {
@@ -505,11 +537,15 @@ impl RoomShadow {
         self.deeds = before.deeds;
         self.looked = before.looked;
         self.handover = before.handover;
+        self.compared = before.compared;
+        if before.churned {
+            self.mirror.inherit_churn();
+        }
     }
 
-    /// What this shadow knows of the deed, for the one that replaces it.
+    /// What this shadow knows of the deed and of the checkpoints it has compared, for the one that replaces it.
     fn forget(self) -> Remembered {
-        Remembered { deeds: self.deeds, looked: self.looked, handover: self.handover }
+        Remembered { churned: self.mirror.delegations().churned, deeds: self.deeds, looked: self.looked, handover: self.handover, compared: self.compared }
     }
 
     fn attach(doc: &Doc, room: &str, limits: Limits) -> RoomShadow {
@@ -525,7 +561,7 @@ impl RoomShadow {
             deeds: None,
             looked: false,
             hidden_seen: 0,
-            handover: BTreeSet::new(),
+            handover: BTreeMap::new(),
             gone: BTreeMap::new(),
             leaving: false,
             said: Vec::new(),
@@ -615,11 +651,12 @@ impl RoomShadow {
     }
 
     /// The doc read, the worker's answers taken, the tables compared where a
-    /// page's trim came. `keep`: the tables of this room that the view does not follow
+    /// page's trim came. `planned`: every table the plan names, those the cap has no place for included (the view
+    /// follows the rest). `keep`: the tables of this room that the view does not follow
     /// (it left the plan, or the cap has no place for it) and that are kept while their last
     /// checkpoint is not read. Nothing is sent to the worker but the word to let go of what
     /// the mirror lets go of; [`RoomShadow::send`] sends the rest.
-    fn follow<L: Launch>(&mut self, now: Instant, doc: &Doc, view: &FoldView, keep: &BTreeSet<TableKey>, events: &[Event], sup: &mut Supervisor<L>, tally: &mut Tally) {
+    fn follow<L: Launch>(&mut self, now: Instant, doc: &Doc, view: &FoldView, planned: &BTreeSet<TableKey>, keep: &BTreeSet<TableKey>, events: &[Event], sup: &mut Supervisor<L>, tally: &mut Tally) {
         self.feed.absorb(now, events);
         let inputs = Inputs::new(view.houses.clone(), view.pins.clone());
         // What the answers in hand cover, and were made with, before this tick's drain brings what a page wrote since.
@@ -653,7 +690,12 @@ impl RoomShadow {
         read.sort();
         read.dedup();
         if handed {
-            self.handover.extend(read.iter().cloned());
+            // (The session each is in, as the mirror has it now: a table the mirror does not hold, or one the cap has no
+            // place for, is in a session the node cannot name.)
+            for key in read.iter().chain(planned.iter()) {
+                let live = self.mirror.state(&key.0, &key.1).and_then(|st| st.live).map(session_of);
+                doubt(&mut self.handover, key, live);
+            }
         }
         self.mirror.want(&read);
         // (A room with no table has nothing to read: its doc is not taken for it.)
@@ -663,7 +705,7 @@ impl RoomShadow {
         }
         // The pins and the delegations as the doc the drain read shows them: what moved since a table was shown whole takes it back.
         let pins = view.watch.as_ref().map_or(view.pins_epoch, PinWatch::epoch);
-        self.compare(tally, &covered, pins, self.mirror.delegations().changes, handed, &view.pins);
+        self.compare(tally, &covered, planned, pins, self.mirror.delegations().changes, handed, &view.pins);
         // (After the comparison: a final checkpoint that came with the drain is compared before its table is given up on.)
         self.expire(now, view, tally);
         // The view's tables, and those that left it and are kept.
@@ -710,13 +752,16 @@ impl RoomShadow {
     /// (`State::unread_at_trim`); otherwise it could be the fold's lateness, or
     /// its lack of an input. A trim read when the fold has no answer from before
     /// it is counted as a comparison not made.
-    fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, pins: u64, delegations: u64, handed: bool, pinned: &[(String, String)]) {
+    fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, planned: &BTreeSet<TableKey>, pins: u64, delegations: u64, handed: bool, pinned: &[(String, String)]) {
         let RoomShadow { mirror, feed, compared, confirmed, said, handover, .. } = self;
         let room = mirror.room().to_string();
         let keys: Vec<TableKey> = mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
-        compared.retain(|k, _| keys.contains(k));
+        // (What was compared, and what is in doubt, is kept for the tables the plan names, those the cap has no place for
+        // included: one that is put out for others and comes back is not another, and its checkpoint is not compared a
+        // second time, nor its doubt forgotten. What was shown is for the tables followed now.)
+        compared.retain(|k, _| keys.contains(k) || planned.contains(k));
         confirmed.retain(|k, _| keys.contains(k));
-        handover.retain(|k| keys.contains(k));
+        handover.retain(|k, _| keys.contains(k) || planned.contains(k));
         for key in keys {
             let (t, inc) = (&key.0, &key.1);
             // (What a line says of which table: the room too, since two rooms can hold the same table.)
@@ -734,6 +779,18 @@ impl RoomShadow {
             // table does now, so that they are not told of a later trim).
             let (signers, signers_over) = mirror.take_ended_signers(t, inc);
             let Some(st) = mirror.state(t, inc) else { continue };
+            // (A session in doubt that is not the one live now, nor the one the checkpoint standing is about to be compared
+            // for, is over: its trim was read, or written over before it could be. A table whose base the node cannot
+            // read has no session to name, and keeps what it has.)
+            if let Some(live) = st.live.map(session_of) {
+                let ending = st.base.and_then(|cp| cp.get("b").and_then(CVal::as_str));
+                if let Some(set) = handover.get_mut(&key) {
+                    set.retain(|s| s == ANY_SESSION || s == live || Some(s.as_str()) == ending);
+                    if set.is_empty() {
+                        handover.remove(&key);
+                    }
+                }
+            }
             let Some(cp) = st.base else {
                 // A checkpoint this node cannot read as a page does (one heavier than a drain reads, or one a page may read
                 // otherwise) holds the table and the mirror keeps none: a trim that brought one is counted, once, as a
@@ -742,9 +799,10 @@ impl RoomShadow {
                     let id = held_identity(st.born, st.trims);
                     if !seen(compared, &key, &id) {
                         remember(compared, &key, id);
-                        // (A trim: the session it ended is over, and the handover noted in it with it.)
-                        if !handed {
-                            handover.remove(&key);
+                        // (A trim, but of which session the node cannot tell: the doubt of a handover stays, and the session
+                        // after it is in doubt too if the deed changed hands in this very tick.)
+                        if handed {
+                            doubt(handover, &key, None);
                         }
                         tally.note(&Verdict::Skip(Skip::Unreadable));
                         say(said, false, format!("{}: skipped (unreadable: the checkpoint cannot be read as a page reads it)", at()));
@@ -764,22 +822,25 @@ impl RoomShadow {
             if seen(compared, &key, &id) {
                 continue;
             }
-            // A trim not seen before: the session it ends is over, and the next is a new one, in which the deed changing
-            // hands is noted afresh. (Unless the deed changed hands in this very tick, which may have been after the
-            // trim: the next trim is doubted too.)
-            let handed_over = handover.contains(&key);
-            if !handed {
-                handover.remove(&key);
-            }
+            // A trim not seen before. The session it names (`b`) is over, and the doubt of a handover noted in it with it;
+            // the next is a new one, in which the deed changing hands is noted afresh (unless it changed hands in this
+            // very tick, which may have been after the trim: the next trim is doubted too). A trim that names another
+            // session, or that cannot be read, is not the end of the session in doubt.
+            let b = cp.get("b").and_then(CVal::as_str);
             let u = cp.get("u").and_then(CVal::as_int).unwrap_or(-1);
             let Some(fold) = feed.fold(t, inc).filter(|f| f.generation < st.generation) else {
                 remember(compared, &key, id);
+                close_doubt(handover, &key, b, false, handed);
                 tally.note(&Verdict::Skip(Skip::Unanswered));
                 say(said, false, format!("{} u={u}: skipped (unanswered)", at()));
                 continue;
             };
             remember(compared, &key, id);
             let mut verdict = compare(fold.summary, cp, inc);
+            // (Whether the checkpoint ends the session the fold holds: a past one, or one of another session, does not.)
+            let closes = !matches!(verdict, Verdict::Skip(Skip::Past | Skip::Parent | Skip::Unreadable));
+            let handed_over = doubted(handover.get(&key), b, closes);
+            close_doubt(handover, &key, b, closes, handed);
             if matches!(verdict, Verdict::Agree | Verdict::Mismatch(_)) {
                 let shown = Shown { born: st.born, frame: fold.frame, pins, delegations };
                 if handed_over {
@@ -812,6 +873,44 @@ fn unreconciled(signers: &BTreeSet<(String, String)>, pinned: &[(String, String)
     }
     let pins: std::collections::HashMap<&str, &str> = pinned.iter().map(|(p, k)| (p.as_str(), k.as_str())).collect();
     signers.iter().any(|(pid, key)| pins.get(pid.as_str()) != Some(&key.as_str()))
+}
+
+/// A session of a table in doubt that the node cannot name (see `RoomShadow::handover`).
+const ANY_SESSION: &str = "*";
+
+/// The id of a session from its name (`ses:<table>:<incarnation>:<id>`).
+fn session_of(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Note that the session `sid` of the table (or one the node cannot name) may have been folded by the pages with other
+/// houses than the node counted.
+fn doubt(handover: &mut BTreeMap<TableKey, BTreeSet<String>>, key: &TableKey, sid: Option<&str>) {
+    handover.entry(key.clone()).or_default().insert(sid.unwrap_or(ANY_SESSION).to_string());
+}
+
+/// Whether a checkpoint that names the session `b` ends a session in doubt (`sessions`): the one it names, or, if it
+/// `closes` the session the fold holds, one the node could not name.
+fn doubted(sessions: Option<&BTreeSet<String>>, b: Option<&str>, closes: bool) -> bool {
+    sessions.is_some_and(|set| b.is_some_and(|b| set.contains(b)) || (closes && set.contains(ANY_SESSION)))
+}
+
+/// A trim has been compared: the sessions it ends are no longer in doubt (see [`doubted`]). If the deed changed hands in
+/// the tick it was read in (`handed`), the session after it is in doubt, not named.
+fn close_doubt(handover: &mut BTreeMap<TableKey, BTreeSet<String>>, key: &TableKey, b: Option<&str>, closes: bool, handed: bool) {
+    let Some(set) = handover.get_mut(key) else { return };
+    if let Some(b) = b {
+        set.remove(b);
+    }
+    if closes {
+        set.remove(ANY_SESSION);
+    }
+    if handed {
+        set.insert(ANY_SESSION.to_string());
+    }
+    if set.is_empty() {
+        handover.remove(key);
+    }
 }
 
 /// Whether the table `key` has been compared with (or passed over, or first read with) the checkpoint `id`.
@@ -971,6 +1070,9 @@ impl<L: Launch> FoldShadow<L> {
         // them, which the pages count as ended, and the checkpoint of their compaction may yet come) keep their places
         // in the worker.
         let mut keep: BTreeMap<String, BTreeSet<TableKey>> = BTreeMap::new();
+        // (Every table the plans name, before the cap leaves some of them out: what is known of a table is not lost for
+        // the time that others have its place.)
+        let planned: BTreeMap<String, BTreeSet<TableKey>> = rooms.iter().filter_map(|(room, _, view)| view.as_ref().map(|v| (room.clone(), v.tables.iter().cloned().collect()))).collect();
         for (room, _, view) in &rooms {
             if let (Some(view), Some(rs)) = (view, self.rooms.get_mut(room)) {
                 rs.note_gone(view, now);
@@ -1024,7 +1126,7 @@ impl<L: Launch> FoldShadow<L> {
                         }
                         rs
                     });
-                    rs.follow(clock(), &doc, &view, keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
+                    rs.follow(clock(), &doc, &view, planned.get(&room).unwrap_or(&none), keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
                     for (mismatch, line) in std::mem::take(&mut rs.said) {
                         self.log.push(mismatch, line);
                     }
