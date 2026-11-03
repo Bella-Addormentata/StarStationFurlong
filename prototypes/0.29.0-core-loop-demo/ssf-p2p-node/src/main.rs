@@ -46,8 +46,10 @@ mod shell_channel;
 // ⛓️ The Chia network this node runs on (testnet11 by default): read once,
 // and handed to everything that differs between networks.
 mod chia_network;
-// ⛓️ Strict SSF_NO_CHIA_LANE: Chia off on this computer, read once. The
-// lane is built closed, and no Chia task or wallet starts.
+// ⛓️ Chia off on this computer: SSF_NO_CHIA_LANE, read once, or the Chia
+// switch in the SpacePhone's Network settings (chia_lane_off.json). Off at
+// the start, the lane is built closed and no Chia task or wallet starts;
+// turned off in the game, the lane is closed at once.
 mod chia_strict;
 // 📦 The blob lane (media plan §4 step 1): a member's file as a verified
 // BLAKE3 blob, fetched on the local page's FETCH and played from this node.
@@ -391,10 +393,14 @@ pub struct Fingerprint {
     /// address: it never rides in a pass or a card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_network: Option<chia_network::NetworkView>,
-    /// ⛓️ Whether Chia is off on this computer (chia_strict.rs): `off`, and
-    /// while it is, what turned it off (`source`: `env` for
-    /// `SSF_NO_CHIA_LANE`). Read live per request, in every build; absent
-    /// only from an older node. Loopback only, like the address.
+    /// ⛓️ Whether Chia is off on this computer (chia_strict.rs): `off`; while
+    /// it is, what turned it off (`source`: `env` for `SSF_NO_CHIA_LANE`,
+    /// `setting` for the Chia switch in the SpacePhone's Network settings);
+    /// what that switch's file says now (`setting`: `on` or `off`);
+    /// `damaged` when the file cannot be read; and `stuck` when it is a
+    /// folder, which the switch cannot remove. Read live per request, in
+    /// every build; absent only from an older node. Loopback only, like the
+    /// address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chia_lane: Option<chia_strict::LaneView>,
     /// 📦 This launch's blob-lane capability token (blob_lane.rs): every
@@ -1074,19 +1080,23 @@ mod fingerprint_json_tests {
     }
 
     /// ⛓️ The page learns from the fingerprint whether Chia is off on this
-    /// computer, and why; an answer from an older node, without the field,
-    /// parses back with none.
+    /// computer, why, and what the in-game switch says; an answer from an
+    /// older node, without the field, parses back with none.
     #[test]
     fn the_fingerprint_says_whether_chia_is_off_and_why() {
-        use crate::chia_strict::{off_source_of, view_of};
+        use crate::chia_strict::{off_source_of, view_of, Saved};
         let mut off = fp();
-        off.chia_lane = Some(view_of(off_source_of(true)));
+        off.chia_lane = Some(view_of(off_source_of(true, false), &Saved::On));
         let json = serde_json::to_string(&off).unwrap();
-        assert!(json.contains(r#""chia_lane":{"off":true,"source":"env"}"#), "{json}");
+        assert!(json.contains(r#""chia_lane":{"off":true,"source":"env","setting":"on"}"#), "{json}");
         let mut on = fp();
-        on.chia_lane = Some(view_of(off_source_of(false)));
+        on.chia_lane = Some(view_of(off_source_of(false, false), &Saved::On));
         let json = serde_json::to_string(&on).unwrap();
-        assert!(json.contains(r#""chia_lane":{"off":false}"#), "{json}");
+        assert!(json.contains(r#""chia_lane":{"off":false,"setting":"on"}"#), "{json}");
+        let mut setting = fp();
+        setting.chia_lane = Some(view_of(off_source_of(false, true), &Saved::Off));
+        let json = serde_json::to_string(&setting).unwrap();
+        assert!(json.contains(r#""chia_lane":{"off":true,"source":"setting","setting":"off"}"#), "{json}");
         let older = serde_json::to_string(&fp()).unwrap();
         assert!(!older.contains("chia_lane"), "{older}");
         assert_eq!(serde_json::from_str::<Fingerprint>(&older).unwrap().chia_lane, None);
@@ -1665,6 +1675,15 @@ async fn node_main() -> Result<()> {
     if let Err(e) = chia_network::make_state_dir(chia_net, std::path::Path::new(".")) {
         eprintln!("⛓️ Chia network: could not make {}/ ({e}); this network's state files cannot be saved", chia_network::MAINNET_DIR);
     }
+    // ⛓️ Chia off on this computer (chia_strict.rs): SSF_NO_CHIA_LANE and
+    // the in-game switch's file at the data root, read here, before
+    // anything else asks, and said when the file holds Chia off or cannot
+    // be read.
+    match chia_strict::startup_line() {
+        Some((line, false)) => println!("{line}"),
+        Some((line, true)) => eprintln!("{line}"),
+        None => {}
+    }
 
     // 🧲 The torrent feature brings a second rustls crypto backend into the
     // build (librqbit's reqwest uses aws-lc-rs), and with two compiled in
@@ -1947,11 +1966,15 @@ async fn node_main() -> Result<()> {
     // while the desktop app's channel is live (`load_wallet`), which it
     // never is at this startup load: there a new wallet waits for the
     // Bank's CREATE, and one already on disk loads.
-    // ⛓️ Strict `SSF_NO_CHIA_LANE` (chia_strict.rs), Chia off on this
-    // computer, wins over all of it, read once: the lane is built closed,
-    // no Chia task, wallet or test hook starts (`chia_plan` below), and the
-    // switch file is not read (`remembered_at_start`).
-    let chia_off = chia_strict::strict();
+    // ⛓️ Chia off on this computer at the start (chia_strict.rs:
+    // `SSF_NO_CHIA_LANE`, or the in-game switch's file) wins over all of it,
+    // read on purpose as it was at the start: the lane is built closed, no
+    // Chia task, wallet or test hook starts (`chia_plan` below), and the
+    // switch file is not read (`remembered_at_start`). An in-game off later
+    // in the run closes the lane and stops the tasks at their next tick.
+    let chia_off_source = chia_strict::source_at_start();
+    #[cfg_attr(not(feature = "chia-read"), allow(unused_variables))]
+    let chia_off = chia_off_source.is_some();
     #[cfg(feature = "chia-publish")]
     let mut wallet_memo = chia_wallet_switch::SwitchMemo::default();
     #[cfg(feature = "chia-publish")]
@@ -1966,7 +1989,7 @@ async fn node_main() -> Result<()> {
         chia_wallet_switch::starts_on(true, chia_off, chia_wallet_switch::env_switch(), wallet_memo.remembered)
     };
     #[cfg(feature = "chia-publish")]
-    if let Some(line) = chia_strict::wins_line(chia_off, chia_wallet_switch::env_switch() == chia_wallet_switch::EnvSwitch::On) {
+    if let Some(line) = chia_strict::wins_line(chia_off_source, chia_wallet_switch::env_switch() == chia_wallet_switch::EnvSwitch::On) {
         println!("{line}");
     }
     // The Chia tasks this start runs: what the switches ask for, or none at
@@ -2027,14 +2050,18 @@ async fn node_main() -> Result<()> {
             chia_wallet_switch::dev_pages().join(", ")
         );
     }
-    // 🔒 How the wallet's file is kept at rest (chia_at_rest.rs), said once.
+    // 🔒 How the wallet's file is kept at rest (chia_at_rest.rs), said once,
+    // and not while Chia is off at the start, when no wallet loads. A bad
+    // SSF_WALLET_AT_REST is said either way: it still applies at a start
+    // with Chia on.
     #[cfg(feature = "chia-publish")]
     match chia_at_rest::policy() {
-        Ok(policy) => {
+        Ok(policy) if !chia_off => {
             if let Some(line) = chia_at_rest::policy_line(policy, chia_at_rest::os_store().map(|s| s.protect())) {
                 println!("{line}");
             }
         }
+        Ok(_) => {}
         Err(why) => eprintln!("🏦 SSF wallet: {why}"),
     }
     #[cfg(feature = "chia-publish")]
@@ -2125,7 +2152,7 @@ async fn node_main() -> Result<()> {
     let wallet_loaded = chia_heartbeat_sk.is_some();
     #[cfg(not(feature = "chia-publish"))]
     let wallet_loaded = false;
-    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded, chia_off);
+    chia_lane::startup_status(chia_net, &secret_key, &iroh_direct_addrs, wallet_loaded, chia_off_source);
 
     // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
     // testnet11 under the same fixed test room key the publish hook uses, and log
@@ -6506,10 +6533,18 @@ mod bank_on_line_tests {
 async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) -> Result<(), String> {
     let net = chia_network::net();
     let env = chia_wallet_switch::env_switch();
-    if let Some(why) = chia_wallet_switch::turn_refusal(true, chia_strict::strict(), env, on) {
+    let refusal = || chia_wallet_switch::turn_refusal(true, chia_strict::off_source(), env, on);
+    if let Some(why) = refusal() {
         return Err(why.to_string());
     }
     let _turn = hub.wallet_turn.lock().await;
+    // ⛓️ Asked again under the lock: Chia turned off in the game while this
+    // turn waited for it refuses a TURN ON here, before anything loads.
+    // The in-game off takes the lock once before it closes the lane
+    // (`turn_lane`), so no turn that began before it is still running then.
+    if let Some(why) = refusal() {
+        return Err(why.to_string());
+    }
     let switch_file = net.path(chia_wallet_switch::SWITCH_FILE);
     let switch_path = switch_file.as_path();
     let now = chia_resolve::unix_now();
@@ -6544,10 +6579,10 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             return Err(failed_save(false, e, ""));
         }
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
-        // The words follow starts_on at the next start without
-        // SSF_NO_CHIA_LANE: SSF_CHIA_LANE=1 turns the wallet on there
-        // whatever the switch says. A wallet stays on until the node stops
-        // only where one is loaded.
+        // The words follow starts_on at the next start with Chia on:
+        // SSF_CHIA_LANE=1 turns the wallet on there whatever the switch
+        // says. A wallet stays on until the node stops only where one is
+        // loaded (while Chia is off, one loaded before an in-game off).
         let loaded = hub.chia_wallet.lock().unwrap().is_some();
         println!("{}", chia_wallet_switch::turned_off_line(strict, env, loaded));
         return Ok(());
@@ -6597,6 +6632,38 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: true, error: None };
     println!("🏦 SSF wallet: kept on in the Bank — it is back on at the next start");
     Ok(())
+}
+
+/// ⛓️ Turn Chia off or back on for the SpacePhone's Network settings
+/// (chia_strict.rs, the process's switch), and say so. Off saves
+/// `chia_lane_off.json`, holds Chia off for this run, waits for a wallet
+/// turn under way to end (a TURN ON waiting for its lock then refuses,
+/// `turn_wallet`), closes the process's lane and answers once it is closed:
+/// every connection to a Chia full node is closed, and every request after
+/// is refused. On removes the file; Chia comes back at the next start. A
+/// wallet loaded before the off stays loaded until the node stops and
+/// publishes nothing, and the log says so.
+async fn turn_lane(hub: &SharedHub, on: bool) -> (&'static str, serde_json::Value) {
+    let turned = chia_strict::process()
+        .turn(on, chia_strict::unix_now(), || async move {
+            #[cfg(feature = "chia-publish")]
+            drop(hub.wallet_turn.lock().await);
+            #[cfg(feature = "chia-read")]
+            chia_chain::close_lane().await;
+        })
+        .await;
+    match &turned.line {
+        Some(line) if turned.failed => eprintln!("{line}"),
+        Some(line) => println!("{line}"),
+        None => {}
+    }
+    #[cfg(feature = "chia-publish")]
+    if turned.turned_off && hub.chia_wallet.lock().unwrap().is_some() {
+        println!("{}", chia_wallet_switch::HOT_OFF_WALLET_WORDS);
+    }
+    #[cfg(not(feature = "chia-publish"))]
+    let _ = hub;
+    (turned.status, turned.body)
 }
 
 /// 🏦 One words answer, for a page `app_page` passed (the HTTP route) or for
@@ -6725,16 +6792,18 @@ async fn words_answer(
 }
 
 /// 🖥️ One answer for the desktop app's channel (shell_channel.rs), on the
-/// channel's own thread: `hello` from the fingerprint's view of the wallet
-/// and the loaded key's address, `reveal` and `saved` from [`words_answer`]
-/// as [`chia_wallet_switch::Asker::Shell`], the HTTP route's own body. Only
-/// the body goes back (the HTTP status is the route's); a refusal is a fixed
-/// sentence. `rt` is the node's runtime, which runs the async body.
+/// channel's own thread: `hello` from the fingerprint's view of the wallet,
+/// the loaded key's address and whether Chia is off now (the same live read
+/// as the fingerprint's `chia_lane`), `reveal` and `saved` from
+/// [`words_answer`] as [`chia_wallet_switch::Asker::Shell`], the HTTP route's
+/// own body. Only the body goes back (the HTTP status is the route's); a
+/// refusal is a fixed sentence. `rt` is the node's runtime, which runs the
+/// async body.
 fn shell_answer(hub: &SharedHub, rt: &tokio::runtime::Handle, op: shell_channel::Op) -> zeroize::Zeroizing<String> {
     let ask = match op {
         shell_channel::Op::Hello => {
             let (view, address) = wallet_switch_view(hub);
-            return shell_channel::hello_body(chia_network::net(), &view, address.as_deref());
+            return shell_channel::hello_body(chia_network::net(), &view, address.as_deref(), chia_strict::strict());
         }
         shell_channel::Op::Reveal => chia_wallet_switch::WordsAsk::Reveal,
         shell_channel::Op::Saved(key) => chia_wallet_switch::WordsAsk::Saved(key),
@@ -7053,6 +7122,30 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     chia_wallet_switch::turn_answer(turned, &wallet_switch_view(&hub_clone).0)
                 } else {
                     ("400 Bad Request", serde_json::json!({ "ok": false, "error": "ask with on=1 or on=0" }))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n\
+                     Content-Type: application/json\r\n\
+                     {cors_origin}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else if req.starts_with("POST /api/chia/lane?") || req.starts_with("POST /api/chia/lane ") {
+                // ⛓️ The SpacePhone's Chia switch (chia_strict.rs): `on=0`
+                // turns Chia off on this computer now and at every start
+                // until it is turned back on, answering once the lane is
+                // closed; `on=1` brings it back at the next start (refused
+                // while SSF_NO_CHIA_LANE holds it off). Behind the wallet
+                // switch's gate: only this machine's own game page may ask.
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let host_header = header_value(&req, "host");
+                let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
+                let (status, body) = match chia_strict::lane_gate(local, target) {
+                    Ok(on) => turn_lane(&hub_clone, on).await,
+                    Err(refused) => refused,
                 };
                 let body = body.to_string();
                 let response = format!(

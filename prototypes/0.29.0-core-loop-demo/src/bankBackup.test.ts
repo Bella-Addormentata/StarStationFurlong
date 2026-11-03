@@ -159,6 +159,27 @@ describe('bankBackupView', () => {
     expect(p.funding).toBeNull();
   });
 
+  it('⛓️ while Chia is off still backs up the 24 words, but shows no funding line and no address', () => {
+    // A wallet loaded before an in-run off: the node writes nothing with it,
+    // and RECEIVE says the Bank shows no address (bankWallet.ts).
+    for (const chia_lane of [
+      { off: true, source: 'setting', setting: 'off' },
+      { off: true, source: 'setting', setting: 'on' },
+      { off: true, source: 'env', setting: 'on' },
+    ] as const) {
+      const off: LocalFingerprint = { ...LIVE, chia_lane };
+      expect(bankBackupView(off, BACKUP_IDLE, 'dev')).toMatchObject({ state: 'nag', line: BACKUP_NAG, open: true });
+      const p = bankBackupView(off, shown(), 'dev')!.panel!;
+      expect(p.words).toEqual(WORDS);
+      expect(p.keyLine).toContain(`Key fingerprint ${KEY}`);
+      expect(p.funding).toBeNull();
+      expect(JSON.stringify(p)).not.toContain(ADDR);
+    }
+    // Chia on: the funding line and the address, as before.
+    expect(bankBackupView({ ...LIVE, chia_lane: { off: false, setting: 'on' } }, shown(), 'dev')!.panel!.funding).toEqual(bankBackupView(LIVE, shown(), 'dev')!.panel!.funding);
+    expect(bankBackupView(LIVE, shown(), 'dev')!.panel!.funding?.address).toBe(ADDR);
+  });
+
   it('walks through revealing, shown, hidden, armed, saving and done', () => {
     const s = startReveal(opened(), 1500)!;
     const revealing = bankBackupView(LIVE, s.ui, 'dev')!.panel!;

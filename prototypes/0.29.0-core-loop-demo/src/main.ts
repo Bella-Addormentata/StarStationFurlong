@@ -300,6 +300,9 @@ import {
 import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
+import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
+import type { ChiaLaneTurn } from "./chiaLane";
+import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -1044,6 +1047,152 @@ function renderPhoneBookIndicator(fp: LocalFingerprint | null): void {
   btn.setAttribute("aria-label", ind.title);
   btn.dataset.state = ind.state ?? "";
   btn.dataset.opens = ind.opens ?? "";
+}
+
+/** ⛓️ The CHIA row's switch (chiaLane.ts): TURN CHIA OFF armed and waiting
+ *  for CONFIRM, a turn in flight, and the last turn's failure. Opening the
+ *  Network view disarms it and clears the failure; the node's own memory of
+ *  the switch rides on its fingerprint. */
+let chiaLaneArmed = false;
+let chiaLaneTurning: ChiaLaneTurn | null = null;
+let chiaLaneError: string | null = null;
+/** When the switch last changed what it does: a tap within BANK_SETTLE_MS
+ *  of that is the second half of a double-click or a held Enter, not a
+ *  decision (bankBackup.ts `freshTap`, the Bank switch's rule). */
+let chiaLaneChangedAt = 0;
+/** What the switch did at the last render, so a change from any cause (a
+ *  tap, a turn finishing, a fingerprint round) starts the settle time. */
+let chiaLaneShownAct: string | null = null;
+
+/** ⛓️ The CHIA row of the Network rows, from the node that answered the last
+ *  probe (none while it does not: a stopped node's switch is not shown).
+ *  Written with textContent, hidden and attributes only, never innerHTML, so
+ *  focus stays on the one button whatever it says. */
+function renderChiaLaneRow(): void {
+  const row = chiaLaneRow(localNodeLive ? localFingerprint : null, { armed: chiaLaneArmed, turning: chiaLaneTurning, error: chiaLaneError });
+  setNetworkRow("network-chia-lane", row.value, row.colour);
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("chia-lane-note", row.note);
+  line("chia-lane-warning", row.warning);
+  line("chia-lane-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== chiaLaneShownAct) {
+    chiaLaneShownAct = b?.act ?? null;
+    chiaLaneChangedAt = performance.now();
+  }
+  const btn = document.getElementById(CHIA_LANE_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went (a turn left nothing to offer) hands focus to its
+    // view, not to the page behind the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
+/** ⛓️ The Network view's controls that ↑/↓ step through: its buttons (the
+ *  CHIA switch, RETRY, the override's two), the drawer's summary that opens
+ *  the address override, the two room switches and the override's text box.
+ *  A disabled control cannot take focus, so it is no stop: a step onto it
+ *  would leave focus where it was. */
+const NETWORK_VIEW_STOPS =
+  'button:not([disabled]), summary, input[type="checkbox"]:not([disabled]), input[type="text"]:not([disabled])';
+
+/** ⛓️ The Network view by keyboard, the Bank's rule. Tab cannot do the
+ *  traversal (the app reserves it as the phone's toggle and preventDefaults
+ *  every press), so ↑/↓ move between the view's visible controls, wrapping,
+ *  and from the view itself ↓ reaches the first. Opening the view lands
+ *  focus on it. Enter and Space keep their own meaning: a button's click
+ *  (the CHIA switch's held-key guard stays on the switch), a checkbox's
+ *  toggle, the drawer opening. A hidden control is skipped: the CHIA switch
+ *  while it offers nothing, the collapse chevron, the Chia Mesh row off a
+ *  test network, the override while its drawer is closed. Nothing moves on
+ *  a phone that is put away (a control left focused inside it still
+ *  receives keys), with a modifier held (Shift+↑ selects in the text box),
+ *  or on a select or a slider, whose arrows turn their own values. */
+function networkViewKeydown(view: HTMLElement, e: KeyboardEvent): void {
+  if (!treasuryViewOnScreen(view)) return;
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  const target = e.target as HTMLElement | null;
+  if (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === "range")) return;
+  const stops = [...view.querySelectorAll<HTMLElement>(NETWORK_VIEW_STOPS)].filter(networkStopShown);
+  if (stops.length === 0) return;
+  e.preventDefault();
+  const here = stops.indexOf(target as HTMLElement);
+  const step = e.key === "ArrowDown" ? 1 : -1;
+  stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+}
+
+/** ⛓️ Whether a control of the Network view is shown, so it can take
+ *  focus. A browser that hides a closed drawer's contents with
+ *  `content-visibility: hidden` (Chromium does, as the HTML rendering rules
+ *  now say) still lays them out, so they have an offsetParent although
+ *  they cannot take focus; checkVisibility says they are not shown. A
+ *  browser without checkVisibility hides them with `display: none`, and
+ *  offsetParent says so. */
+function networkStopShown(el: HTMLElement): boolean {
+  return typeof el.checkVisibility === "function" ? el.checkVisibility() : el.offsetParent !== null;
+}
+
+/** ⛓️ At a helm with the flight stick taken, the stick reads the arrows and
+ *  Space in the window's capture phase, before the view's traversal could:
+ *  the view is marked `data-stick-aside` while it is on screen, so a key
+ *  pressed in it is the view's, and a flight key it was given goes no
+ *  further to the world (tvUI.ts wireTvStick). The mark follows the view's
+ *  class and the phone's, since the phone closes by many paths. */
+function wireNetworkViewStick(view: HTMLElement): void {
+  const sync = () => {
+    if (treasuryViewOnScreen(view)) view.dataset.stickAside = "1";
+    else delete view.dataset.stickAside;
+  };
+  const observer = new MutationObserver(sync);
+  observer.observe(view, { attributes: true, attributeFilter: ["class"] });
+  const phone = document.getElementById("spacephone-container");
+  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ["class"] });
+  sync();
+  view.addEventListener("keydown", (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (treasuryViewOnScreen(view) && isFlightKey(e.code)) e.stopPropagation();
+  });
+}
+
+/** ⛓️ Ask the node to turn Chia off (`off`, `keep`) or back on for its next
+ *  start (`on`), then read its fingerprint again so the CHIA row, the Bank,
+ *  the Phone Book row and the dish show what the node now holds, not what
+ *  the page hoped. */
+async function turnChiaLaneSwitch(turn: ChiaLaneTurn): Promise<void> {
+  if (chiaLaneTurning) return;
+  chiaLaneTurning = turn;
+  chiaLaneArmed = false;
+  chiaLaneError = null;
+  renderChiaLaneRow();
+  const turned = await turnChiaLane(localNodeOrigin, turn === "on");
+  chiaLaneTurning = null;
+  chiaLaneError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  chiaLaneChangedAt = performance.now();
+  renderChiaLaneRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -5226,6 +5375,8 @@ async function openBankBackupWindow(): Promise<void> {
 function requestBankBalance(): void {
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
+  // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
+  if (localFingerprint.chia_lane?.off) return;
   const { seq, sent } = networkProvider.requestFaucet("status");
   sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
 }
@@ -5440,7 +5591,7 @@ function renderBankApp(): void {
     }
     ${header("THE REGISTRY")}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
-      ${esc(registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net))} On-Registry share trading appears here when
+      ${esc(registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net, (localNodeLive ? localFingerprint : null)?.chia_lane))} On-Registry share trading appears here when
       the node's account service lands. Shares today are room records — same
       rules, no coins at risk.
     </div>
@@ -8694,6 +8845,22 @@ function setupSpacePhoneOverlay() {
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
+    if (id === "setnet") {
+      // ⛓️ A TURN CHIA OFF armed on an earlier visit waits for no one:
+      // opening the view starts from the switch, and an old failure is not
+      // news (the Bank's rule).
+      chiaLaneArmed = false;
+      if (!chiaLaneTurning) chiaLaneError = null;
+      renderChiaLaneRow();
+      // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
+      // and every other control without a pointer (Tab is the app's phone
+      // toggle, not a tab stop).
+      const nv = document.getElementById("phone-app-settings-network");
+      if (nv) {
+        nv.setAttribute("tabindex", "-1");
+        nv.focus({ preventScroll: true });
+      }
+    }
     // 📡 #258: the IR blaster, the remote of every set in the room. Repaints
     // itself on tv-map changes while active.
     if (id === "tv") {
@@ -9434,6 +9601,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       localNodeLive = false;
       localNodeOrigin = "";
       bankWalletArmed = false;
+      chiaLaneArmed = false;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -9443,12 +9611,15 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // 📖 Not the listing icon, though: a cached green would outlive the node,
     // old tooltip and all, so it is withdrawn until the node answers again.
     renderPhoneBookIndicator(null);
+    // ⛓️ Nor the Chia switch: there is no node to send it to.
+    renderChiaLaneRow();
     return localFingerprint;
   }
-  // 🏦 The Bank's RECEIVE reads the address and the wallet switch from the
-  // fingerprint: repaint it while open when either changed (a wallet turned
-  // on or off here, or by SSF_CHIA_LANE at the node's restart).
-  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
+  // Chia is off from the fingerprint: repaint it while open when any changed
+  // (a wallet turned on or off here, or by SSF_CHIA_LANE at the node's
+  // restart; Chia turned off in the Network rows).
+  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null]);
   const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
@@ -9461,7 +9632,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
   if (
     backupMoved ||
-    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
+    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null])) &&
       document.getElementById("phone-app-bank")?.classList.contains("active"))
   ) {
     renderBankApp();
@@ -9473,6 +9644,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
+  renderChiaLaneRow();
   refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
@@ -9947,6 +10119,40 @@ function setupNetworkDetailsPanel() {
     });
   }
 
+  // ⛓️ The CHIA row's switch (chiaLane.ts): TURN CHIA OFF arms CONFIRM, and
+  // every act but that one takes a fresh tap, since the same button stands
+  // where the last one was: a double-click or a held Enter would otherwise
+  // confirm, or undo, what the player has not read.
+  const laneBtn = document.getElementById(CHIA_LANE_BUTTON_ID) as HTMLButtonElement | null;
+  if (laneBtn) {
+    laneBtn.addEventListener("click", (e) => {
+      if (laneBtn.getAttribute("aria-disabled") === "true") return;
+      const act = laneBtn.dataset.act;
+      if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), chiaLaneChangedAt)) return;
+      if (act === "arm") {
+        chiaLaneArmed = true;
+        chiaLaneError = null;
+        chiaLaneChangedAt = performance.now();
+        renderChiaLaneRow();
+        return;
+      }
+      const turn = laneTurnOf(act);
+      if (turn) void turnChiaLaneSwitch(turn);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    laneBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
+    });
+  }
+  // The view's own ↑/↓ traversal (networkViewKeydown), and its stand-aside
+  // from the flight stick at a helm (wireNetworkViewStick), wired once: the
+  // view is in the page from the start, and the panel is moved into it.
+  const netView = document.getElementById("phone-app-settings-network");
+  if (netView) {
+    netView.addEventListener("keydown", (e) => networkViewKeydown(netView, e));
+    wireNetworkViewStick(netView);
+  }
+
   // ChiaHub Slice 3b: the "advanced Chia mesh mode" switch. Writes the per-room
   // flag and re-sends the room cap so the node picks it up live (no reconnect).
   const chiaToggle = document.getElementById(
@@ -9966,9 +10172,8 @@ function setupNetworkDetailsPanel() {
       // Apply live — re-send this room's cap to the local node with the new flag.
       void networkProvider.resendRoomCap(on);
       if (feedback) {
-        feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish)."
-          : "Advanced Chia mesh mode OFF for this room.";
+        // ⛓️ chiaLane.ts words it, and says so while Chia is off.
+        feedback.textContent = meshFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
         }, 5000);
@@ -9996,9 +10201,8 @@ function setupNetworkDetailsPanel() {
       if (roomId) setShareCard(roomId, on);
       void networkProvider.refreshRoomCap();
       if (feedback) {
-        feedback.textContent = on
-          ? "Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards)."
-          : "Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.";
+        // ⛓️ chiaLane.ts words it, and says so while Chia is off.
+        feedback.textContent = shareCardFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
         }, 5000);
@@ -11328,6 +11532,8 @@ async function init() {
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
   // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
   world.faucetChiaNet = () => localFingerprint?.chia_net;
+  // ⛓️ And says Chia is off while the fingerprint does.
+  world.faucetChiaLane = () => localFingerprint?.chia_lane;
   networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
     // Only the room open right now is filed: the store drops a reply for a

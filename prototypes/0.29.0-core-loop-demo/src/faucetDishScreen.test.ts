@@ -7,13 +7,18 @@
  * counts only when the fingerprint's resolved network is the same row, and
  * before the first status the fingerprint's network draws the slot.
  *
+ * ⛓️ While Chia is off on this computer the screen says so and why, with no
+ * jar figures, no TAKE, no slot and no address, and redraws as soon as the
+ * fingerprint says Chia went off.
+ *
  * The screen draws into one panel's innerHTML, so a stand-in document whose
  * elements keep their markup is all it needs here.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, networkOfId, type ChiaNetwork } from './chiaNetwork';
 import { createFaucetDishUI } from './devices';
-import { clearFaucetRoom, openFaucetRoom, setFaucetReply, type FaucetStatus } from './faucetDish';
+import { clearFaucetRoom, markFaucetPending, openFaucetRoom, setFaucetReply, type FaucetStatus } from './faucetDish';
+import type { ChiaLane } from './nodeFingerprint';
 
 const ROOM = 'dish-screen-room';
 const BODY = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
@@ -45,9 +50,10 @@ const status = (net: ChiaNetwork | null, address: string): FaucetStatus => ({
 interface FakePanel { innerHTML: string; id: string; style: { cssText: string } }
 
 /** Mount the screen with `st` on file (or none) and the fingerprint's
- *  resolved network `fpNet` (`undefined`: no fingerprint read), and return
- *  its markup. */
-function screen(st: FaucetStatus | null, fpNet?: ChiaNetwork | null): string {
+ *  resolved network `fpNet` (`undefined`: no fingerprint read), and its lane
+ *  when one is given (none: the screen has no lane to read), and return its
+ *  markup. */
+function screen(st: FaucetStatus | null, fpNet?: ChiaNetwork | null, lane?: ChiaLane): string {
   clearFaucetRoom(ROOM);
   openFaucetRoom(ROOM);
   if (st) setFaucetReply(ROOM, { op: 'status', ok: true, status: st });
@@ -58,7 +64,12 @@ function screen(st: FaucetStatus | null, fpNet?: ChiaNetwork | null): string {
       return panel;
     },
   });
-  const ui = createFaucetDishUI({ roomId: () => ROOM, request: () => ({ seq: 1, sent: new Promise<void>(() => {}) }), chiaNet: () => fpNet });
+  const ui = createFaucetDishUI({
+    roomId: () => ROOM,
+    request: () => ({ seq: 1, sent: new Promise<void>(() => {}) }),
+    chiaNet: () => fpNet,
+    ...(lane ? { chiaLane: () => lane } : {}),
+  });
   ui.mount({ appendChild() {} } as unknown as HTMLElement);
   const html = (panel as FakePanel | null)?.innerHTML ?? '';
   ui.unmount();
@@ -279,6 +290,7 @@ describe('the faucet dish screen when the fingerprint changes network while it i
     openFaucetRoom(ROOM);
     setFaucetReply(ROOM, { op: 'status', ok: true, status: st });
     let fpNet: ChiaNetwork | null | undefined = st.net;
+    let lane: ChiaLane | undefined;
     const clicks = new Map<string, () => void>();
     const sent: string[] = [];
     const writes: string[] = [];
@@ -299,12 +311,14 @@ describe('the faucet dish screen when the fingerprint changes network while it i
         return { seq: sent.length, sent: new Promise<void>(() => {}) };
       },
       chiaNet: () => fpNet,
+      chiaLane: () => lane,
     });
     ui.mount({ appendChild() {} } as unknown as HTMLElement);
     return {
       ui,
       html: () => panel.innerHTML,
       setNet: (n: ChiaNetwork | null | undefined) => { fpNet = n; },
+      setLane: (l: ChiaLane | undefined) => { lane = l; },
       click: (sel: string) => clicks.get(sel)?.(),
       sent,
       writes,
@@ -384,6 +398,143 @@ describe('the faucet dish screen when the fingerprint changes network while it i
     const s = openScreen(status(TESTNET11, addressOn(TESTNET11, BODY)));
     s.click('#faucet-give-0');
     expect(s.sent).toContain('give');
+    s.close();
+  });
+});
+
+const OFF_LANES: [string, ChiaLane, string][] = [
+  ['the environment', { off: true, source: 'env', setting: 'on' }, "Chia is off on this computer (SSF_NO_CHIA_LANE in your node's environment), so the dish reads nothing from the chain, and takes and gives nothing."],
+  ['the switch', { off: true, source: 'setting', setting: 'off' }, "Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK), so the dish reads nothing from the chain, and takes and gives nothing. Turning it back on there brings Chia back at your node's next start."],
+  ['the switch, on for the next start', { off: true, source: 'setting', setting: 'on' }, "Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is on for your node's next start), so the dish reads nothing from the chain, and takes and gives nothing."],
+  // A folder the switch cannot remove: no promise that turning it back on there brings Chia back.
+  ['a folder the switch cannot remove', { off: true, source: 'setting', setting: 'off', damaged: true, stuck: true }, "Chia is off on this computer (its saved switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK could not be read, and a switch that cannot be read counts as off), so the dish reads nothing from the chain, and takes and gives nothing."],
+];
+
+describe.each([TESTNET11, MAINNET])('⛓️ the faucet dish screen on $name while Chia is off', (net) => {
+  const address = addressOn(net, BODY);
+
+  it.each(OFF_LANES)('says so when %s holds it off, with no status on file: no TAKE, no slot, no "reading the chain"', (_label, lane, why) => {
+    const h = screen(null, net, lane);
+    expect(h).toContain('CHIA IS OFF');
+    expect(h).toContain('id="faucet-chia-off"');
+    // The whole line, with nothing after it (no back-on sentence a lane does not have).
+    expect(h).toContain(`${why}\n`);
+    expect(h).not.toContain('READING THE CHAIN');
+    expect(h).not.toContain('reading…');
+    for (const gone of ['faucet-take', 'faucet-give', 'faucet-copy', 'faucet-address', 'faucet-no-take', 'faucet-no-slot', 'THE JAR', 'THE SLOT', '<svg']) {
+      expect(h).not.toContain(gone);
+    }
+    expect(h).toContain(`· ${net.name}`);
+  });
+
+  it.each(OFF_LANES)('shows nothing of the status on file from before %s turned it off', (_label, lane, why) => {
+    const h = screen(status(net, address), net, lane);
+    expect(h).toContain('CHIA IS OFF');
+    expect(h).toContain(`${why}\n`);
+    for (const gone of [address, 'IN THE JAR', 'GIFT SLOTS', 'CHAIN HEIGHT', 'Your wallet', 'TAKE A MOJO', '1 MOJO IN THE DISH', 'faucet-give', 'faucet-take', '<svg', '⚠']) {
+      expect(h).not.toContain(gone);
+    }
+  });
+
+  it('reads Chia as on with a lane that says on, or with none', () => {
+    const st = status(net, address);
+    expect(screen(st, net, { off: false, setting: 'on' })).toBe(screen(st, net));
+    expect(screen(st, net, { off: false })).toBe(screen(st, net));
+    expect(screen(st, net)).not.toContain('CHIA IS OFF');
+  });
+});
+
+describe('⛓️ the faucet dish screen when Chia goes off while it is open', () => {
+  function openOn() {
+    clearFaucetRoom(ROOM);
+    openFaucetRoom(ROOM);
+    setFaucetReply(ROOM, { op: 'status', ok: true, status: status(TESTNET11, addressOn(TESTNET11, BODY)) });
+    let lane: ChiaLane | undefined = { off: false, setting: 'on' };
+    const clicks = new Map<string, () => void>();
+    const sent: string[] = [];
+    const writes: string[] = [];
+    const panel = {
+      innerHTML: '',
+      id: '',
+      style: { cssText: '' },
+      addEventListener() {},
+      querySelector: (sel: string) => ({ addEventListener: (_e: string, fn: () => void) => clicks.set(sel, fn) }),
+      remove() {},
+    };
+    vi.stubGlobal('document', { createElement: () => panel });
+    vi.stubGlobal('navigator', { clipboard: { writeText: (t: string) => { writes.push(t); return new Promise<void>(() => {}); } } });
+    const ui = createFaucetDishUI({
+      roomId: () => ROOM,
+      request: (op: string) => {
+        sent.push(op);
+        return { seq: sent.length, sent: new Promise<void>(() => {}) };
+      },
+      chiaNet: () => TESTNET11,
+      chiaLane: () => lane,
+    });
+    ui.mount({ appendChild() {} } as unknown as HTMLElement);
+    return {
+      ui,
+      html: () => panel.innerHTML,
+      setLane: (l: ChiaLane | undefined) => { lane = l; },
+      click: (sel: string) => clicks.get(sel)?.(),
+      sent,
+      writes,
+      close: () => { ui.unmount(); clearFaucetRoom(ROOM); },
+    };
+  }
+
+  it('redraws at once when the fingerprint says Chia went off, and again when the reason changes', () => {
+    const s = openOn();
+    expect(s.html()).toContain('TAKE A MOJO');
+    s.setLane({ off: true, source: 'setting', setting: 'off' });
+    s.ui.update(0.016);
+    expect(s.html()).toContain('CHIA IS OFF');
+    expect(s.html()).not.toContain('TAKE A MOJO');
+    expect(s.html()).not.toContain('faucet-give');
+    const offDraw = s.html();
+    s.ui.update(0.016);
+    expect(s.html()).toBe(offDraw);
+    // On for the next start: off still, other words.
+    s.setLane({ off: true, source: 'setting', setting: 'on' });
+    s.ui.update(0.016);
+    expect(s.html()).toContain('for the rest of this run');
+    s.close();
+  });
+
+  it('sends no TAKE or GIVE and copies nothing when Chia went off before the click', () => {
+    const s = openOn();
+    const polls = s.sent.length;
+    s.setLane({ off: true, source: 'env', setting: 'on' });
+    // The click lands before the next frame's update() redraws the screen.
+    s.click('#faucet-take');
+    s.click('#faucet-give-0');
+    s.click('#faucet-copy');
+    expect(s.sent.slice(polls)).toEqual([]);
+    expect(s.writes).toEqual([]);
+    // Redrawn at once.
+    expect(s.html()).toContain('CHIA IS OFF');
+    s.close();
+  });
+
+  it('keeps a TAKE or GIVE sent before the off, and says the dish cannot see it land', () => {
+    const s = openOn();
+    markFaucetPending(ROOM, 'claim', 99);
+    s.setLane({ off: true, source: 'setting', setting: 'off' });
+    s.ui.update(0.016);
+    expect(s.html()).toContain('TAKING… sent before Chia went off: the mojo may still land on the chain, but the dish cannot see it while Chia is off.');
+    markFaucetPending(ROOM, 'give', 100);
+    expect(s.html()).toContain('GIVING… sent before Chia went off: your gift may still land on the chain, but the dish cannot see it while Chia is off.');
+    s.close();
+  });
+
+  it('does not repeat the node\'s refusal: the why line says it', () => {
+    const s = openOn();
+    s.setLane({ off: true, source: 'env', setting: 'on' });
+    s.ui.update(0.016);
+    setFaucetReply(ROOM, { op: 'status', ok: false, error: 'Chia is off on this computer' });
+    expect(s.html()).toContain('CHIA IS OFF');
+    expect(s.html()).not.toContain('⚠');
     s.close();
   });
 });

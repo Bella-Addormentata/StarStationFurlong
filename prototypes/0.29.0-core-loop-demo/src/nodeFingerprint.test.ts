@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
-import { parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
+import { parseChiaLane, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -120,6 +120,44 @@ describe('parseNodeFingerprint', () => {
       expect(w).toEqual({ state: 'on', mnemonic: true });
       expect(parseChiaWallet({ state: 'ready', backup: junk })).toEqual({ state: 'ready' });
     }
+  });
+
+  it('keeps whether Chia is off, and why, only in the node\'s own shape (⛓️ the CHIA row)', () => {
+    const fp = (chia_lane: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_lane })?.chia_lane;
+    // Every shape the node sends (chia_strict.rs LaneView).
+    expect(fp({ off: false, setting: 'on' })).toEqual({ off: false, setting: 'on' });
+    expect(fp({ off: true, source: 'env', setting: 'on' })).toEqual({ off: true, source: 'env', setting: 'on' });
+    expect(fp({ off: true, source: 'env', setting: 'off' })).toEqual({ off: true, source: 'env', setting: 'off' });
+    expect(fp({ off: true, source: 'setting', setting: 'off' })).toEqual({ off: true, source: 'setting', setting: 'off' });
+    expect(fp({ off: true, source: 'setting', setting: 'on' })).toEqual({ off: true, source: 'setting', setting: 'on' });
+    expect(fp({ off: true, source: 'setting', setting: 'off', damaged: true })).toEqual({ off: true, source: 'setting', setting: 'off', damaged: true });
+    expect(fp({ off: true, source: 'env', setting: 'off', damaged: true, stuck: true })).toEqual({ off: true, source: 'env', setting: 'off', damaged: true, stuck: true });
+    // A node with the lane but not the switch sends no setting, and none is invented.
+    expect(fp({ off: false })).toEqual({ off: false });
+    expect(fp({ off: true, source: 'env' })).toEqual({ off: true, source: 'env' });
+    // An older node sends no lane at all.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_lane).toBeUndefined();
+    // A source is kept only while off, and only as a word the page knows:
+    // an unknown one is dropped, never the off.
+    expect(fp({ off: false, source: 'env', setting: 'on' })).toEqual({ off: false, setting: 'on' });
+    for (const junk of ['ENV', 'Setting', 'app', '', 1, true, null, ['env']]) {
+      expect(fp({ off: true, source: junk, setting: 'off' })).toEqual({ off: true, setting: 'off' });
+    }
+    // The setting only as on or off; damaged and stuck only as true.
+    for (const junk of ['ON', 'yes', '', 0, true, null, ['off']]) {
+      expect(fp({ off: true, source: 'env', setting: junk })).toEqual({ off: true, source: 'env' });
+    }
+    for (const junk of [false, 'true', 1, null]) {
+      expect(fp({ off: true, source: 'setting', setting: 'off', damaged: junk })).toEqual({ off: true, source: 'setting', setting: 'off' });
+      expect(fp({ off: true, source: 'setting', setting: 'off', damaged: true, stuck: junk })).toEqual({ off: true, source: 'setting', setting: 'off', damaged: true });
+    }
+    // An off that is not a boolean, or no object at all: no lane.
+    for (const bad of [null, undefined, 'off', 1, true, [], {}, { off: 'true' }, { off: 1 }, { off: null }, { source: 'env' }]) {
+      expect(fp(bad)).toBeUndefined();
+      expect(parseChiaLane(bad)).toBeUndefined();
+    }
+    // Nothing else is copied.
+    expect(fp({ off: true, source: 'setting', setting: 'off', at: 1_700_000_000, path: '/home/x/chia_lane_off.json' })).toEqual({ off: true, source: 'setting', setting: 'off' });
   });
 
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {

@@ -2318,9 +2318,11 @@ pub async fn heartbeat_loop(
     chia_sk: SecretKey,
 ) {
     // ⛓️ Chia off on this computer (chia_strict.rs) is asked first: no
-    // wallet loads then, so this loop is never started, and were it started
-    // it would say and read nothing, not even the money line below (which
-    // says the node still reads the chain).
+    // wallet loads then and the Bank's TURN ON is refused, so this loop is
+    // started only by a turn that was under way when Chia was turned off in
+    // the game, and then it says and reads nothing, not even the money line
+    // below (which says the node still reads the chain). Each tick asks
+    // again, for a wallet loaded before an in-game off.
     if crate::chia_strict::strict() {
         return;
     }
@@ -3848,7 +3850,7 @@ mod tests {
         off.restore(&path);
         let later = Instant::now() + RECONCILE_GRACE * 3;
         assert_eq!(off.due_at(later).len(), 1, "the spend is due a lookup, so the lane is asked");
-        let closed = PeerLane::new(std::sync::Arc::new(Lane::closed(crate::chia_peer::Network::testnet11())), Trust::Agreed);
+        let closed = PeerLane::new(std::sync::Arc::new(Lane::closed(crate::chia_peer::Network::testnet11(), "SSF_NO_CHIA_LANE")), Trust::Agreed);
         off.reconcile_at(T11, &closed, later).await;
         assert!(off.is_parked(&id) && off.outgoing_pending(), "still parked: a refused lookup decides nothing");
         assert_eq!(std::fs::read(&path).unwrap(), written, "the lease file is as the last normal run left it");
