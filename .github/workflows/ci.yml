@@ -116,6 +116,16 @@ jobs:
       - name: 🔎 cargo check --features chia-publish,torrent,chia-mainnet
         run: cargo check --features chia-publish,torrent,chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
+      # 🧮 The node's copy of the pages' fold: their TypeScript run in QuickJS
+      # (rquickjs, a C dependency) behind a feature no release names yet (PR
+      # 6b-1). Its tests fold test-vectors/fold-engine-v1.json and want the
+      # pages' own bytes; the engine's limits and memory are tested too.
+      - name: 🧪 cargo test --features house-fold house_fold (the QuickJS fold)
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold
+
+      - name: 🔎 cargo check --features chia-publish,torrent,house-fold
+        run: cargo check --features chia-publish,torrent,house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
   node-check-windows:
     name: 🦀 Node cargo check on Windows (release features)
     runs-on: windows-latest # MSVC, as the release builds
@@ -141,6 +151,13 @@ jobs:
       - name: 🧪 cargo test --features chia-publish,torrent chia_wallet chia_at_rest
         shell: bash
         run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- chia_wallet chia_at_rest
+
+      # 🧮 The QuickJS fold (rquickjs builds a C library with MSVC here): its
+      # tests run the interrupt, the stack and memory limits and the pages'
+      # vectors on the Windows build too, before any release carries it.
+      - name: 🧪 cargo test --features house-fold house_fold
+        shell: bash
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold
 
   node-check-macos:
     name: 🦀 Node cargo check + wallet tests on macOS (release features)

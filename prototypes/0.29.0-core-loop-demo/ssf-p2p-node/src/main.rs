@@ -105,6 +105,10 @@ mod treasury_codec;
 // computed-table fold computes, and the owner's node's house job.
 mod house;
 mod house_bytes;
+// 🧮 The pages' fold run by the node in QuickJS (PR 6b-1): behind a cargo
+// feature while it runs in shadow only.
+#[cfg(feature = "house-fold")]
+mod house_fold;
 
 // 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
 // the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on

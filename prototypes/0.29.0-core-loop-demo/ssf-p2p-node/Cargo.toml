@@ -124,6 +124,14 @@ sha2 = "0.10"
 # Pinned to the exact version iroh-base already locks, so no second copy of
 # the curve lands in the binary (Windows-GNU export-ordinal budget, see above).
 curve25519-dalek = { version = "=5.0.0-rc.0", default-features = false }
+# 🧮 `house-fold` feature only (house_fold.rs): QuickJS-ng, in which the pages'
+# own TypeScript fold (src/computedFold.ts, bundled to fold/fold.min.js) runs
+# natively, so the node can fold a computed table as every page does. The
+# bundled C builds with the C compiler of the toolchain (MSVC needs VS 2022
+# 17.5 or later); no bindgen, no libclang. NEVER enable its `rust-alloc` or
+# `allocator` features (they turn the memory limit into a no-op), nor
+# `parallel` (the engine lives on one thread, in a worker process).
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
 # 🧲 `torrent` feature only (torrent_lane.rs). rust-tls keeps OpenSSL out
 # (its SHA-1 is ring's); its reqwest brings aws-lc-rs, so main.rs names ring
 # as rustls' process default. `url` turns the blocklist path into the file://
@@ -196,6 +204,9 @@ chia-lane = ["chia-publish"]
 # 🧲 The TV's TORRENT tile (torrent_lane.rs, media plan §6): librqbit with the
 # forked client-only DHT (vendor/librqbit-dht). Never in a strict build.
 torrent = ["dep:librqbit", "dep:rustls", "dep:url"]
+# 🧮 The pages' fold on the node (house_fold.rs; PR 6b of "Computed casino
+# tables"). Off by default: a build without it is the PR 5 house, exactly.
+house-fold = ["dep:rquickjs"]
 
 # Two librqbit 9.0.1 crates, forked for the `torrent` feature (unused without
 # it); each one's SSF-FORK.md says what changed. The DHT carries the media
