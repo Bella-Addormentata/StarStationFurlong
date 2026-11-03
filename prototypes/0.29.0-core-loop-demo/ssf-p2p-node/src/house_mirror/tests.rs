@@ -10,17 +10,17 @@ const ROOM: &str = "room";
 const T: &str = "t1";
 const INC: &str = "r0123456789abcdef01234567";
 
-fn obj(fields: Vec<(&str, CVal)>) -> CVal {
+pub(crate) fn obj(fields: Vec<(&str, CVal)>) -> CVal {
     CVal::Obj(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
-fn s(v: &str) -> CVal {
+pub(crate) fn s(v: &str) -> CVal {
     CVal::Str(v.into())
 }
 
 /// Fields in order: a doc keeps them in a hash map's, so what is read back
 /// has no order of its own.
-fn norm(v: CVal) -> CVal {
+pub(crate) fn norm(v: CVal) -> CVal {
     match v {
         CVal::Obj(fields) => {
             let mut fields: Vec<(String, CVal)> = fields.into_iter().map(|(k, x)| (k, norm(x))).collect();
@@ -38,34 +38,34 @@ fn norm_taken(mut t: Taken) -> Taken {
     t
 }
 
-fn ctx(t: &str) -> Ctx {
+pub(crate) fn ctx(t: &str) -> Ctx {
     Ctx { room: ROOM.into(), t: t.into(), inc: INC.into() }
 }
 
 /// A checkpoint the pages take (for a house table); `u` tells them apart.
-fn cp(u: i64) -> CVal {
+pub(crate) fn cp(u: i64) -> CVal {
     norm(obj(vec![("v", CVal::Int(1)), ("b", s("g")), ("u", CVal::Int(u)), ("l", s(&"a".repeat(32))), ("n", obj(vec![])), ("k", s(&"K".repeat(43))), ("g", s(&"G".repeat(86)))]))
 }
 
-fn sum_of(t: &str) -> String {
+pub(crate) fn sum_of(t: &str) -> String {
     format!("sum:{t}:{INC}")
 }
 
 /// The live session of `t` over this base.
-fn live_of(t: &str, base: Option<&CVal>) -> String {
+pub(crate) fn live_of(t: &str, base: Option<&CVal>) -> String {
     format!("ses:{t}:{INC}:{}", hb::next_sid(&ctx(t), base).unwrap())
 }
 
-fn live0() -> String {
+pub(crate) fn live0() -> String {
     live_of(T, None)
 }
 
 /// A record key of round `r`, number `i`: the shape of a close's.
-fn rk(r: i64, i: u32) -> String {
+pub(crate) fn rk(r: i64, i: u32) -> String {
     format!("c:{r}:{i:032x}")
 }
 
-fn rv(r: i64, i: i64) -> CVal {
+pub(crate) fn rv(r: i64, i: i64) -> CVal {
     norm(obj(vec![("r", CVal::Int(r)), ("i", CVal::Int(i))]))
 }
 

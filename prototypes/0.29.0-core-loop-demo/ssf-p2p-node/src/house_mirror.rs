@@ -834,6 +834,9 @@ pub struct State<'a> {
     /// Changes waiting to be taken, and their weight.
     pub queued: usize,
     pub queued_bytes: usize,
+    /// The table started over and nothing has been taken since: the next
+    /// [`RoomMirror::take`] says so (`Taken::reset`).
+    pub announcing: bool,
     /// Goes up when the table starts over.
     pub generation: u64,
     /// Goes up with every change to the base, a record or the hold.
@@ -973,9 +976,22 @@ impl RoomMirror {
             reading: tb.cold.is_some() || tb.need_session,
             queued: tb.queue.len(),
             queued_bytes: tb.queue_bytes,
+            announcing: tb.announce,
             generation: tb.generation,
             version: tb.version,
         })
+    }
+
+    /// Start a table over, to be sent again from scratch (the worker lost it):
+    /// it is read afresh from the doc, and the next [`take`](RoomMirror::take)
+    /// says `reset`. False for a table that is not mirrored.
+    pub fn restart(&mut self, t: &str, inc: &str) -> bool {
+        let Some(tb) = self.tables.get_mut(&(t.to_string(), inc.to_string())) else { return false };
+        if tb.based && tb.live.is_some() {
+            tb.reset();
+            self.resets += 1;
+        }
+        true
     }
 
     /// The mirror has read everything of the table that the doc has changed
@@ -1026,4 +1042,4 @@ impl Dirt {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

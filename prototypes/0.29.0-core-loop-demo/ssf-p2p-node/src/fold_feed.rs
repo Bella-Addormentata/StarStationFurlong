@@ -1,0 +1,419 @@
+//! 🧮🍽️ What the mirror takes from the room, sent to the fold worker (PR
+//! 6b-1c-ii of "Computed casino tables").
+//!
+//! The mirror (house_mirror.rs) follows a room's computed tables as changes;
+//! the supervisor (fold_supervisor.rs) runs the worker that folds them. A
+//! [`Feed`], one for each room, is the step between: each tick it takes what
+//! the worker has answered ([`Feed::absorb`], from the events of one
+//! [`Supervisor::poll`]) and then sends what has changed ([`Feed::push`]). It
+//! never blocks and writes nothing to any doc: the fold's answers are kept for
+//! the node to compare with the pages' checkpoints (6b-1c-iii), nothing more.
+//!
+//! A TABLE'S FRAMES. A table the mirror serves is started with a `Cold` (the
+//! base, the room's houses and pins, the first records), then kept up with
+//! `Warm`s (the records that changed). A big read goes in several frames of
+//! about [`FRAME_BYTES`], one a tick. At most ONE frame of a table is out at a
+//! time: while the worker owes an answer for it ([`Supervisor::owes`]) its
+//! next changes wait in the mirror and go together after. So an answer is
+//! always for the last frame sent, and its `version` (the mirror's number for
+//! the table when the frame was taken) says whether the table has moved on
+//! since.
+//!
+//! WHEN THE WORKER LOSES A TABLE. An answer that says the table is dirty, a
+//! crash that names it, a result the node cannot use: the table is no longer
+//! the worker's, and the mirror starts it over ([`RoomMirror::restart`]: read
+//! afresh from the doc, the next frame a `Cold`). A table that comes back
+//! dirty is not tried again at once: 1 s, 2 s, 4 s, up to a minute, and the
+//! count starts over with an answer. A result bigger than [`MAX_RESULT_BYTES`]
+//! or that is not a fold summary is the worker's fault, not the table's luck:
+//! the node gives up on the table's records as they stand (it forgets it and
+//! sends nothing more until the mirror starts the table over for another
+//! reason), and counts it. A frame a frame cannot hold is the same. While the
+//! worker is down (its backoff after a crash) nothing is taken from the
+//! mirror; when the fold duties are off ([`Supervisor::off`]) the feed lets
+//! everything go.
+//!
+//! WHAT IT KEEPS is each table's latest answer ([`Feed::fold`]) and whether
+//! it is the table as it stands now ([`Feed::caught_up`]): the worker has
+//! answered the last frame sent, nothing waits to be sent, and the mirror has
+//! read everything the doc holds and changed nothing since the frame was taken.
+
+#![cfg(feature = "house-fold")]
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+
+use crate::fold_supervisor::{backoff, Event, Launch, Post, State, Supervisor};
+use crate::fold_wire::{Cold, Req, Resp, Warm};
+use crate::house_bytes::{CVal, Ctx};
+use crate::house_fold::FoldSummary;
+use crate::house_mirror::RoomMirror;
+
+/// About how much of a table's changes go in one frame (by the mirror's
+/// weights: a little over the record that crosses it). A frame is at most
+/// [`MAX_FRAME`](crate::fold_wire::MAX_FRAME), and the supervisor queues
+/// [`QUEUE_BYTES`](crate::fold_supervisor::QUEUE_BYTES) of them.
+pub const FRAME_BYTES: usize = 4 << 20;
+/// The most of an answer's text the node parses. A fold summary of a table
+/// that honest players made is some tens of KiB.
+pub const MAX_RESULT_BYTES: usize = 4 << 20;
+
+/// What the worker needs of the room for every table in it: the keys of the
+/// houses, and the key pinned for each player, as (pid, key). Sorted here, so
+/// a list that comes in another order is not a change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inputs {
+    pub houses: Vec<String>,
+    pub pins: Vec<(String, String)>,
+}
+
+impl Inputs {
+    pub fn new(mut houses: Vec<String>, mut pins: Vec<(String, String)>) -> Inputs {
+        houses.sort();
+        houses.dedup();
+        pins.sort();
+        pins.dedup();
+        Inputs { houses, pins }
+    }
+}
+
+/// What the feed has done, for `/api/fingerprint` and the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// `Cold` frames posted: a table's start, and each start over.
+    pub cold: u64,
+    pub warm: u64,
+    pub forgets: u64,
+    pub results: u64,
+    /// Answers that said a table is dirty.
+    pub dirty: u64,
+    /// Tables lost to a crashed worker.
+    pub lost: u64,
+    /// Posts the worker was too busy for (kept, tried again).
+    pub busy: u64,
+    /// Frames a frame cannot hold.
+    pub too_big: u64,
+    /// Results the node could not use.
+    pub bad_results: u64,
+}
+
+/// A table's latest answer.
+#[derive(Debug)]
+pub struct Fold<'a> {
+    pub summary: &'a FoldSummary,
+    /// The mirror's version of the table when the frame it answers was taken.
+    pub version: u64,
+    /// The mirror's generation (starts over) then.
+    pub generation: u64,
+}
+
+struct Answer {
+    version: u64,
+    generation: u64,
+    summary: FoldSummary,
+}
+
+/// A frame taken from the mirror and not yet handed to the worker.
+struct Unsent {
+    req: Req,
+    version: u64,
+    generation: u64,
+    /// The houses and pins it carries.
+    given: Inputs,
+}
+
+struct Slot {
+    /// The worker holds the table: a frame was posted and the table has not
+    /// been lost since.
+    open: bool,
+    /// What the last posted frame was.
+    generation: u64,
+    sent_version: u64,
+    /// The houses and pins as last posted.
+    given: Inputs,
+    unsent: Option<Unsent>,
+    answer: Option<Answer>,
+    /// Not before this (a table that came back dirty).
+    retry_at: Option<Instant>,
+    /// Answers in a row that said dirty.
+    dirty_streak: u32,
+    /// The generation the node gave up on.
+    gave_up: Option<u64>,
+    /// A `Forget` the worker was too busy for.
+    forget_pending: bool,
+}
+
+impl Slot {
+    fn new() -> Slot {
+        Slot {
+            open: false,
+            generation: 0,
+            sent_version: 0,
+            given: Inputs::default(),
+            unsent: None,
+            answer: None,
+            retry_at: None,
+            dirty_streak: 0,
+            gave_up: None,
+            forget_pending: false,
+        }
+    }
+
+    /// The worker no longer holds the table.
+    fn lose(&mut self) {
+        self.open = false;
+        self.unsent = None;
+        self.answer = None;
+    }
+}
+
+pub struct Feed {
+    room: String,
+    slots: BTreeMap<(String, String), Slot>,
+    counts: Counts,
+}
+
+fn key(ctx: &Ctx) -> (String, String) {
+    (ctx.t.clone(), ctx.inc.clone())
+}
+
+impl Feed {
+    pub fn new(room: &str) -> Feed {
+        Feed { room: room.to_string(), slots: BTreeMap::new(), counts: Counts::default() }
+    }
+
+    pub fn counts(&self) -> Counts {
+        self.counts
+    }
+
+    /// Take what the worker said. `events` are all of one poll's, whatever
+    /// room they are about: this room's are used, and a crash loses this
+    /// room's tables the worker held.
+    pub fn absorb(&mut self, now: Instant, events: &[Event]) {
+        for event in events {
+            match event {
+                Event::Answer(resp) if resp.ctx().room == self.room => self.answered(now, resp),
+                Event::Answer(_) => {}
+                Event::Crashed { tables, .. } => {
+                    for ctx in tables.iter().filter(|c| c.room == self.room) {
+                        if let Some(slot) = self.slots.get_mut(&key(ctx)) {
+                            slot.lose();
+                            self.counts.lost += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn answered(&mut self, now: Instant, resp: &Resp) {
+        // (A table let go since: nothing is waiting for the answer.)
+        let Some(slot) = self.slots.get_mut(&key(resp.ctx())) else { return };
+        // (Or one forgotten since: the answer to a frame it was sent before.)
+        if !slot.open {
+            return;
+        }
+        match resp {
+            Resp::Result { ctx, version, text } => {
+                let parsed = if text.len() > MAX_RESULT_BYTES {
+                    Err(format!("a result of {} bytes", text.len()))
+                } else {
+                    serde_json::from_str::<FoldSummary>(text).map_err(|e| format!("a result that is no summary: {e}"))
+                };
+                match parsed {
+                    Ok(summary) => {
+                        slot.answer = Some(Answer { version: *version, generation: slot.generation, summary });
+                        slot.dirty_streak = 0;
+                        slot.retry_at = None;
+                        self.counts.results += 1;
+                    }
+                    Err(why) => {
+                        eprintln!("🧮 fold: {} of {}: {why}; giving up on it as it stands", ctx.t, ctx.room);
+                        slot.gave_up = Some(slot.generation);
+                        slot.lose();
+                        slot.forget_pending = true;
+                        self.counts.bad_results += 1;
+                    }
+                }
+            }
+            Resp::Dirty { ctx, reason, .. } => {
+                eprintln!("🧮 fold: {} of {} is dirty: {reason}", ctx.t, ctx.room);
+                slot.lose();
+                slot.dirty_streak = slot.dirty_streak.saturating_add(1);
+                slot.retry_at = Some(now + backoff(slot.dirty_streak));
+                self.counts.dirty += 1;
+            }
+        }
+    }
+
+    /// The table's latest answer, if the worker has given one.
+    pub fn fold(&self, t: &str, inc: &str) -> Option<Fold<'_>> {
+        let a = self.slots.get(&(t.to_string(), inc.to_string()))?.answer.as_ref()?;
+        Some(Fold { summary: &a.summary, version: a.version, generation: a.generation })
+    }
+
+    /// The latest answer is for the table as it stands: it answers the last
+    /// frame sent, that frame left nothing behind, nothing has been taken or
+    /// has changed since, and the mirror has read all the doc holds.
+    pub fn caught_up<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>) -> bool {
+        let Some(slot) = self.slots.get(&(t.to_string(), inc.to_string())) else { return false };
+        let Some(answer) = &slot.answer else { return false };
+        let Some(st) = mirror.state(t, inc) else { return false };
+        let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
+        slot.open
+            && answer.version == slot.sent_version
+            && slot.unsent.is_none()
+            && !sup.owes(&ctx)
+            && st.serving()
+            && !st.announcing
+            && st.queued == 0
+            && st.version == slot.sent_version
+            && mirror.current(t, inc)
+    }
+
+    /// Let go of the worker's tables and forget the answers (the fold duties are off).
+    fn drop_all(&mut self) {
+        self.slots.clear();
+    }
+
+    /// Send what has changed, one frame at most for each table. Nothing is
+    /// sent while the worker is down.
+    pub fn push<L: Launch>(&mut self, now: Instant, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs) {
+        if sup.off().is_some() {
+            self.drop_all();
+            return;
+        }
+        if matches!(sup.state(), State::Backoff(until) if now < until) {
+            return;
+        }
+        let Feed { room, slots, counts } = self;
+        let tables: Vec<Ctx> = mirror.tables().cloned().collect();
+        let wanted: BTreeSet<(String, String)> = tables.iter().map(key).collect();
+
+        // Tables the mirror lets go.
+        let gone: Vec<(String, String)> = slots.keys().filter(|k| !wanted.contains(*k)).cloned().collect();
+        for k in gone {
+            let Some(slot) = slots.get_mut(&k) else { continue };
+            if slot.open || slot.forget_pending {
+                forget(counts, now, sup, &Ctx { room: room.clone(), t: k.0.clone(), inc: k.1.clone() }, slot);
+            }
+            // (One the worker was too busy to be told of is kept, and told on a later tick.)
+            if !slot.open && !slot.forget_pending {
+                slots.remove(&k);
+            }
+        }
+
+        for ctx in tables {
+            let slot = slots.entry(key(&ctx)).or_insert_with(Slot::new);
+            let Some(st) = mirror.state(&ctx.t, &ctx.inc) else { continue };
+
+            // Not a table to follow: the worker is not to hold it.
+            if !st.serving() || slot.gave_up == Some(st.generation) {
+                slot.unsent = None;
+                if slot.open || slot.forget_pending {
+                    forget(counts, now, sup, &ctx, slot);
+                }
+                continue;
+            }
+            if sup.owes(&ctx) || slot.retry_at.is_some_and(|t| now < t) {
+                continue;
+            }
+            if slot.forget_pending {
+                forget(counts, now, sup, &ctx, slot);
+                continue;
+            }
+
+            let frame = match slot.unsent.take() {
+                // A frame taken before that the worker was too busy for.
+                Some(u) => u,
+                None => {
+                    // Lost to the worker: read afresh, and send from the start.
+                    if !slot.open && !st.announcing {
+                        mirror.restart(&ctx.t, &ctx.inc);
+                        continue;
+                    }
+                    // (A table that started over has nothing to say until its first
+                    // records are read, unless the session is truly empty.)
+                    if st.announcing && st.queued == 0 && st.reading {
+                        continue;
+                    }
+                    if !st.announcing && st.queued == 0 && slot.given == *inputs {
+                        continue;
+                    }
+                    let Some(taken) = mirror.take(&ctx.t, &ctx.inc, FRAME_BYTES) else { continue };
+                    let (version, generation) = (taken.version, taken.generation);
+                    let req = if taken.reset {
+                        // (A record that came and went before the first take is no record to start with.)
+                        let records: Vec<(String, CVal)> = taken.changes.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+                        Req::Cold(Cold { ctx: ctx.clone(), version, base: taken.base, houses: inputs.houses.clone(), pins: inputs.pins.clone(), records })
+                    } else {
+                        Req::Warm(Warm { ctx: ctx.clone(), version, houses: inputs.houses.clone(), pins: inputs.pins.clone(), changes: taken.changes })
+                    };
+                    Unsent { req, version, generation, given: inputs.clone() }
+                }
+            };
+            if let Sent::Stop = send(counts, now, sup, slot, &ctx, frame) {
+                // The rest would be refused too, or the worker is gone.
+                return;
+            }
+        }
+    }
+}
+
+enum Sent {
+    Next,
+    Stop,
+}
+
+fn send<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, slot: &mut Slot, ctx: &Ctx, frame: Unsent) -> Sent {
+    let was_cold = matches!(frame.req, Req::Cold(_));
+    match sup.post(now, &frame.req) {
+        Post::Posted => {
+            slot.open = true;
+            slot.generation = frame.generation;
+            slot.sent_version = frame.version;
+            slot.given = frame.given;
+            if was_cold {
+                counts.cold += 1;
+            } else {
+                counts.warm += 1;
+            }
+            Sent::Next
+        }
+        Post::Busy => {
+            counts.busy += 1;
+            slot.unsent = Some(frame);
+            Sent::Stop
+        }
+        // The worker would not start: the supervisor says so (a crash event for the tables it
+        // held, none for this), and this table is read afresh when there is one.
+        Post::Down => {
+            slot.lose();
+            Sent::Stop
+        }
+        Post::TooBig(why) => {
+            eprintln!("🧮 fold: {} of {}: a frame the worker cannot be sent ({why}); giving up on it as it stands", ctx.t, ctx.room);
+            slot.gave_up = Some(frame.generation);
+            slot.lose();
+            counts.too_big += 1;
+            Sent::Next
+        }
+    }
+}
+
+/// Tell the worker to let go of a table. One it is too busy to be told of
+/// stays as it was (open, or owing the word: [`Slot::forget_pending`]), and is
+/// told on a later tick.
+fn forget<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, ctx: &Ctx, slot: &mut Slot) {
+    if !matches!(sup.post(now, &Req::Forget { ctx: ctx.clone() }), Post::Busy) {
+        slot.open = false;
+        slot.forget_pending = false;
+        counts.forgets += 1;
+    }
+    slot.answer = None;
+    slot.unsent = None;
+}
+
+#[cfg(test)]
+mod tests;
