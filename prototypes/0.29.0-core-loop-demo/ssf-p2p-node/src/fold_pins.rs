@@ -33,11 +33,13 @@
 //! - an entry carries a `__proto__` field (AMBIGUOUS: a page reads the key
 //!   with a property access, which can come from the prototype the field sets,
 //!   and the node reads the field itself);
-//! - a player's entry changed in an update in which something was made and deleted (CONTESTED, as a key replaced is:
-//!   the update may have written a key and written it over, or written another key and put the first back, and the
-//!   node sees only the last, while a page that saw the middle one on its own, or bound while it stood, pinned that.
-//!   The update does not say what was deleted, so any such update doubts every player it changes, whether the node
-//!   had a pin for them or not and whatever the entry holds after, and some that are harmless do too);
+//! - the map changed in an update in which something was made and deleted, or an update touched it and left no key to
+//!   read (CONTESTED, as a key replaced is: the update may have written a key and written it over, or written another
+//!   key and put the first back, or made a player and deleted him, and the node sees only the last, while a page that
+//!   saw the middle one on its own, or bound while it stood, pinned that. The update does not say what was deleted or
+//!   where, and the players it does show do not say that it deleted none of them: so any such update doubts the map,
+//!   whichever players it changes, whether the node had a pin for them or not and whatever the entries hold after,
+//!   and some that are harmless do too);
 //! - a pinned player's key is gone (the entry removed, or its key dropped or made one the pages do not pin: CONTESTED:
 //!   a page that binds after has no pin for the player, as one that bound before has the old one).
 //!
@@ -51,7 +53,9 @@
 //! the handovers too ([`PinWatch::deeds`]), a handover hidden in one update (the holder written, written over and put
 //! back, so that the doc names the same holder as before) included: the epoch moves with it and the count says why, so
 //! that the shadow can hold every session it follows in doubt until it is trimmed, for pages may have counted another
-//! holder's houses while it ran.
+//! holder's houses while it ran. An update to the room's info in which something was made and deleted counts as one
+//! whatever key it shows (the holder may have come and gone in it, and the doc cannot say it did not), and so does one
+//! that leaves the info no key to read, which is how a block made and deleted in it shows.
 //!
 //! WHAT IT CANNOT SEE. A page that bound before the node began to watch may
 //! have pinned a key the map no longer holds (replaced, or the player gone,
@@ -211,17 +215,13 @@ fn note_deed(shared: &Mutex<PinState>, txn: &TransactionMut, event: &MapEvent) {
     let keys = event.keys(txn);
     // (A holder written, written over and put back in one update, as when the node was away and the updates were
     // merged on the way, is the same holder in the doc, and a page that saw the middle one counted that one's houses.
-    // The transaction says that something was made and deleted in it, and not what: a write of the holder's key in
-    // such a one is a handover, and so is a change to the map that leaves no key to read, which is how a record made
-    // and deleted in a map shows (a block deleted that the doc held shows as a key removed or replaced, so an event
-    // with no key is always one: `made_and_deleted` need not be asked). Asked once, and only for a holder written.)
-    let mut lost = None;
-    let mut hidden = |txn: &TransactionMut| *lost.get_or_insert_with(|| made_and_deleted(txn));
-    if keys.is_empty() {
-        st.deeds += 1;
-        st.epoch += 1;
-        return;
-    }
+    // Nor does the doc show a holder made and deleted in one update: the pages that saw it had one, and then none. The
+    // transaction says that something was made and deleted in it, and not what or where: any change to the room's info
+    // in such a one is a handover, whichever keys it names, and so is a change to the map that leaves no key to read,
+    // which is how a record made and deleted in a map shows (a block deleted that the doc held shows as a key removed
+    // or replaced, so an event with no key is always one: `made_and_deleted` need not be asked). Counted once for the
+    // event, whatever it holds.)
+    let mut handover = keys.is_empty() || made_and_deleted(txn);
     for (key, change) in keys.iter() {
         if &**key != "owner" {
             continue;
@@ -230,11 +230,14 @@ fn note_deed(shared: &Mutex<PinState>, txn: &TransactionMut, event: &MapEvent) {
             EntryChange::Inserted(new) | EntryChange::Updated(_, new) => deed_of(Some(new.clone())),
             EntryChange::Removed(_) => None,
         };
-        if st.owner != now || hidden(txn) {
+        if st.owner != now {
             st.owner = now;
-            st.deeds += 1;
-            st.epoch += 1;
+            handover = true;
         }
+    }
+    if handover {
+        st.deeds += 1;
+        st.epoch += 1;
     }
 }
 
@@ -247,22 +250,27 @@ fn lock(m: &Mutex<PinState>) -> MutexGuard<'_, PinState> {
 /// each key that changed.
 fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
     let mut st = lock(shared);
-    // (Asked once, and only when a player is first pinned.)
+    // (Asked once, and only for an event of the players map.)
     let mut lost = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         if !map.path().is_empty() {
             continue;
         }
-        for (pid, change) in map.keys(txn).iter() {
-            // A player's key written and written over in one update (the node was away and the updates were merged on
-            // the way) shows only the last, and a page that saw the middle one on its own pinned that, or one that
-            // bound while it stood. Nor does the change say it: an insert, an update to a key that matches the pin or
-            // to none at all, and a removal can all hide one. The transaction says that something was made and deleted
-            // in it, and not what: every player of a pinnable name it changes is doubted, as a key replaced is.
-            if pid_pinnable(pid) && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
-                st.contest();
-            }
+        let keys = map.keys(txn);
+        // A player's key written and written over in one update (the node was away and the updates were merged on
+        // the way) shows only the last, and a page that saw the middle one on its own pinned that, or one that
+        // bound while it stood. A player made and deleted in one update shows nothing at all, and a page that saw it
+        // pinned its key: the map's event has no key to read then (a block made and deleted shows as no change in
+        // the map, and an event of the map with no change in it is always one), or has the keys of whatever else the
+        // update changed beside it. The change does not say it, whatever it shows: an insert, an update to a key
+        // that matches the pin or to none at all, a removal, a player no page pins, can all sit beside one. The
+        // transaction says that something was made and deleted in it, and not what or where: the map is doubted, as
+        // a key replaced is, whichever players the event names.
+        if keys.is_empty() || *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+            st.contest();
+        }
+        for (pid, change) in keys.iter() {
             match change {
                 EntryChange::Inserted(new) => st.learn(pid, Key::None, key_of(new)),
                 EntryChange::Updated(old, new) => st.learn(pid, key_of(old), key_of(new)),

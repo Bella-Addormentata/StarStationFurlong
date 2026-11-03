@@ -782,9 +782,10 @@ fn a_player_with_no_key_who_goes_in_an_update_of_made_and_deleted_is_doubted() {
     assert!(p.view().1);
 }
 
-/// A merged update that brings or changes a player no page would pin is nothing: an id past what a page keeps.
+/// A merged update that brings or changes a player no page would pin (an id past what a page keeps) is doubted too: the
+/// update cannot be told to have deleted nothing a page pins, and the map's event names only what the doc shows.
 #[test]
-fn a_player_no_page_pins_is_not_doubted_for_an_update_of_made_and_deleted() {
+fn a_player_no_page_pins_is_doubted_for_an_update_of_made_and_deleted_all_the_same() {
     let doc = Doc::new();
     let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
     let peer = Doc::with_client_id(9);
@@ -795,7 +796,15 @@ fn a_player_no_page_pins_is_not_doubted_for_an_update_of_made_and_deleted() {
     put(&peer, "", "B");
     apply_update(&doc, &everything(&peer));
     assert!(pins_of(&mut p).is_empty(), "{:?}", pins_of(&mut p));
-    assert!(p.view().1, "nothing a page pins is in doubt");
+    assert!(!p.view().1, "a player a page pins may have been made and deleted beside them");
+    // The same two in updates that made and deleted nothing: nothing is in doubt.
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put(&doc, &long, "A");
+    put(&doc, &long, "B");
+    put(&doc, "", "A");
+    assert!(pins_of(&mut p).is_empty());
+    assert!(p.view().1, "(updates one by one say what they changed)");
 }
 
 /// A pinnable player with no key at all is doubted by such an update: a merged update may have hidden a key between.
@@ -950,4 +959,57 @@ fn a_change_to_the_room_info_that_leaves_no_key_is_a_handover_when_something_was
     let epoch = watch.epoch();
     apply_update(&doc, &peer.transact().encode_diff_v1(&before));
     assert_eq!((watch.deeds(), watch.epoch()), (1, epoch + 1), "(and what the views of the pins say moves with it)");
+}
+
+// ── Review round 8 ───────────────────────────────────────────────────────────
+
+/// An update that made a player and deleted it leaves the players map no key to read, and no pin; a page that saw the
+/// player pinned its key. The map's event has no key at all, which only such an update gives, and the pins are in doubt.
+#[test]
+fn an_update_that_leaves_the_players_map_no_key_to_read_contests_the_pins() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    put(&peer, "eve", "A");
+    remove(&peer, "eve");
+    apply_update(&doc, &everything(&peer));
+    assert!(pins_of(&mut p).is_empty(), "{:?}", pins_of(&mut p));
+    assert!(!p.view().1, "a player may have come and gone in it");
+    // And it stays so.
+    put(&doc, "bob", &key("bob"));
+    assert!(!p.view().1);
+}
+
+/// The room's info changed in an update in which something was made and deleted, and the keys it shows are not the
+/// holder's: the holder may have come and gone in it, as in one that shows no key. A change of another key of the info
+/// by itself is nothing.
+#[test]
+fn a_change_to_another_key_of_the_room_info_in_an_update_of_made_and_deleted_may_have_hidden_a_handover() {
+    let doc = Doc::new();
+    let peer = Doc::with_client_id(9);
+    set_owner(&peer, "alice");
+    apply_update(&doc, &everything(&peer));
+    let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    apply_update(&peer, &everything(&doc));
+    // One key of the info written twice in the update: the first was made and deleted, and what it was is not said.
+    let before = doc.transact().state_vector();
+    for v in [1, 2] {
+        let info = owner_map(&peer);
+        let mut txn = peer.transact_mut();
+        info.insert(&mut txn, "name", v);
+    }
+    let epoch = watch.epoch();
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(p.deed(), Some("alice".to_string()));
+    assert_eq!((watch.deeds(), watch.epoch()), (1, epoch + 1), "the holder may have changed hands in it");
+    // The same key written once, or in updates one at a time, is nothing.
+    let before = doc.transact().state_vector();
+    {
+        let info = owner_map(&peer);
+        let mut txn = peer.transact_mut();
+        info.insert(&mut txn, "name", 3);
+    }
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(watch.deeds(), 1, "a plain rewrite of another key");
 }

@@ -72,6 +72,16 @@
 //! is in the queue until taken, and a table that must be sent again is read
 //! again from the doc.
 //!
+//! WHAT IT CANNOT SEE, AND TELLS. A page's history is not all in the doc: an update that made a block and deleted it
+//! (a record written and written over, a session made and trimmed, a delegation made and withdrawn) arrives with no
+//! trace of it but that something was made and deleted in it ([`made_and_deleted`]), not what or where, and a record
+//! removed or replaced in a live session is a history a page that never saw it does not share. The mirror says so,
+//! and decides nothing of it: [`Delegations`] (changes, `churned` for good, and `hidden`, the updates that may have
+//! hidden one beside the keys they show), a session whose trim is read as `unread_at_trim` (records made and deleted in
+//! it, or removed or replaced in it, or the session itself removed in such an update), and the signers of the slips a
+//! session held ([`RoomMirror::take_ended_signers`], told once the session has ended), which the shadow reads against
+//! the pins it was given.
+//!
 //! WHAT THE CALLER CAN RELY ON, after a drain that ran short of nothing (a
 //! table that [`RoomMirror::current`]): the changes taken since the table's
 //! last reset (the first take after it says so, with the base), applied to an
@@ -112,6 +122,10 @@ pub const MAX_DIRTY_KEYS: usize = 2_048;
 /// The most a checkpoint weighs ([`hb::weigh`]) for the observer to tell it written again as it stands from another:
 /// the observer runs in the commit of the doc, so what it compares is bounded, and a heavier one is another.
 pub const ALIKE_SUM_BYTES: usize = 256 * 1024;
+/// The most (player, signing key) pairs of a session's slips the mirror keeps for a table, to tell the shadow which keys
+/// signed what a session held ([`RoomMirror::take_ended_signers`]): an honest table has a few, and a session of more
+/// is not told, so that nothing counted of it is believed.
+pub const MAX_SIGNERS: usize = 512;
 /// The changes of a table waiting to be taken (their keys and weights) stop
 /// being read at this; the caller's `take` makes room.
 pub const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
@@ -229,11 +243,18 @@ struct Watch {
 /// What the observer has seen of the room's delegations (`hk:<house>`), whether or not a table is watched.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Delegations {
-    /// Moves with every change to one.
+    /// Moves with every change to one (and with every update to the map in which something was made and deleted:
+    /// [`Delegations::hidden`]).
     pub changes: u64,
     /// One was replaced or removed: a page that had seen it may count a house this node's plan, which learns a
-    /// delegation when a record names the house, cannot know of.
+    /// delegation when a record names the house, cannot know of. (Also one made and deleted that the doc shows no
+    /// trace of, in an update to the map that changed nothing the node could read.)
     pub churned: bool,
+    /// How many updates to the map may have hidden a delegation made and deleted in them: one in which something was
+    /// made and deleted (the transaction does not say what or where, and the keys it shows do not say that none was a
+    /// delegation), or that left no key to read. A page that saw the delegation counted the house it names, in the
+    /// sessions that were in the room then, and the node never will.
+    pub hidden: u64,
 }
 
 fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
@@ -284,7 +305,23 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
         let path = map.path();
         match path.len() {
             0 => {
-                for (key, change) in map.keys(txn).iter() {
+                let keys = map.keys(txn);
+                // (An update that made a delegation and deleted it, or wrote one and wrote it over, shows no key of it,
+                // or shows the last. The map's event has no key to read when that is all it holds (a block made and
+                // deleted shows as no change in the map, and an event of the map with no change in it is always one):
+                // a delegation may have come and gone, and a page that saw it counted the house it names for as long
+                // as the deed holder holds the deed. Nor do the keys it does show say that the update hid none: it
+                // says that something was made and deleted in it, and not what or where, and so it is doubted for the
+                // sessions in the room, as one that left no key is, but not for good. Counted once for the event.)
+                if keys.is_empty() {
+                    delegations.changes += 1;
+                    delegations.hidden += 1;
+                    delegations.churned = true;
+                } else if *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                    delegations.changes += 1;
+                    delegations.hidden += 1;
+                }
+                for (key, change) in keys.iter() {
                     // (A delegation written again as it stands, as two pages of the deed holder do when both run its duty
                     // at once, changes nothing: no house comes or goes, and every page reads it alike. One a page may read
                     // otherwise is churn all the same. And so is one that is the same as it was only in the doc this node
@@ -305,10 +342,13 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
                         // (A session made in an update that also made and deleted a record in it: the session is read
-                        // afresh and has no trace of that record. Only a session already watched is noted: the one a
-                        // page's trim makes is not yet, and what the same update made and deleted was in the session it
-                        // trims, which is noted as a record.)
-                        if key.starts_with("ses:") && !matches!(change, EntryChange::Removed(_)) && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                        // afresh and has no trace of that record. And one removed in such an update: a session made
+                        // under its name in it and deleted too leaves no trace but the removal of the one the node
+                        // held, and a page that saw the one made counted its records. Only a session already watched is
+                        // noted: the one a page's trim makes is not yet, and what the same update made and deleted was
+                        // in the session it trims, whose removal is noted here, and which the base changing, in the
+                        // drain, takes with it.)
+                        if key.starts_with("ses:") && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
                             dirt.suspect.insert(key.to_string());
                         }
                         // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
@@ -334,6 +374,22 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 // deleted in it, and not what or where: the session is doubted.)
                 if *lost.get_or_insert_with(|| made_and_deleted(txn)) {
                     dirt.suspect.insert(name.to_string());
+                }
+                // (A record removed, or replaced by another value under the same key: the keys are the records' hashes,
+                // so no page does either, and one a page that has not seen it counts is a history the node does not
+                // share: the page's next trim of the session is not held against what the node read. A record written
+                // again as it stands is nothing.)
+                for (_, change) in map.keys(txn).iter() {
+                    let moved = match change {
+                        EntryChange::Removed(_) => true,
+                        EntryChange::Updated(Out::Any(old), Out::Any(new)) => old != new,
+                        EntryChange::Updated(..) => true,
+                        EntryChange::Inserted(_) => false,
+                    };
+                    if moved {
+                        dirt.suspect.insert(name.to_string());
+                        break;
+                    }
                 }
                 let slot = dirt.recs.entry(name.to_string()).or_insert_with(|| Recs::Keys(BTreeSet::new()));
                 let mut many = false;
@@ -543,6 +599,15 @@ struct Table {
     trims: u64,
     /// Checkpoints written over before the table read them, not yet told to the caller ([`RoomMirror::take_superseded`]).
     superseded: u64,
+    /// The (player, signing key) of every slip the live session has held since the table last started over, whether it
+    /// still holds it or not, and whether there were more than [`MAX_SIGNERS`] (`signers_over`: the rest are not kept).
+    signers: BTreeSet<(String, String)>,
+    signers_over: bool,
+    /// The same, of the sessions the table started over from since the caller last asked
+    /// ([`RoomMirror::take_ended_signers`]): the session a page's trim ended is gone from the mirror when the checkpoint
+    /// is read.
+    ended_signers: BTreeSet<(String, String)>,
+    ended_over: bool,
 }
 
 fn cval_bytes(v: &CVal) -> usize {
@@ -584,6 +649,10 @@ impl Table {
             suspect: false,
             trims: 0,
             superseded: 0,
+            signers: BTreeSet::new(),
+            signers_over: false,
+            ended_signers: BTreeSet::new(),
+            ended_over: false,
         }
     }
 
@@ -617,6 +686,12 @@ impl Table {
 
     /// The table starts over: nothing of the session is known.
     fn reset(&mut self) {
+        // (Who signed what the session held is told of the session that ended, once the caller asks.)
+        let over = std::mem::take(&mut self.signers_over);
+        for pair in std::mem::take(&mut self.signers) {
+            self.keep_ended(pair);
+        }
+        self.ended_over |= over;
         self.generation += 1;
         self.version += 1;
         self.keys.clear();
@@ -657,8 +732,33 @@ impl Table {
         self.present = true;
     }
 
+    /// A pair of an ended session's signers, kept if there is room.
+    fn keep_ended(&mut self, pair: (String, String)) {
+        if self.ended_signers.len() >= MAX_SIGNERS && !self.ended_signers.contains(&pair) {
+            self.ended_over = true;
+        } else {
+            self.ended_signers.insert(pair);
+        }
+    }
+
+    /// Note who signed a slip the session holds: the key of the slip (`s:<round>:<player>:<hash>`) names the player, and
+    /// its value the key it was signed with (`k`), which the fold counts only if it is the key pinned for the player.
+    fn note_signer(&mut self, key: &str, value: &CVal) {
+        let Some(('s', _, Some(pid), _)) = parse_key(key) else { return };
+        let Some(k) = value.get("k").and_then(CVal::as_str) else { return };
+        let pair = (pid.to_string(), k.to_string());
+        if self.signers.len() >= MAX_SIGNERS && !self.signers.contains(&pair) {
+            self.signers_over = true;
+        } else {
+            self.signers.insert(pair);
+        }
+    }
+
     fn put(&mut self, key: &str, value: Option<CVal>) {
         let size = key.len() + value.as_ref().map_or(0, cval_bytes);
+        if let Some(v) = &value {
+            self.note_signer(key, v);
+        }
         match &value {
             Some(_) => {
                 self.keys.insert(key.to_string(), size);
@@ -1249,6 +1349,18 @@ impl RoomMirror {
     /// table that cannot be held against what the node had worked out, for the node never read it.
     pub fn take_superseded(&mut self, t: &str, inc: &str) -> u64 {
         self.tables.get_mut(&(t.to_string(), inc.to_string())).map_or(0, |tb| std::mem::take(&mut tb.superseded))
+    }
+
+    /// Who signed the slips of the session or sessions the table ended since this was last asked (its trims, or any
+    /// other start over of it), as `(player, key)`, and whether there were more than the mirror keeps
+    /// ([`MAX_SIGNERS`]: then the pairs are not all of them). A page counts a slip for the felt only if it is signed
+    /// with the key pinned for the player (its own player's, the key it signs with), so a pair whose key is not the pin
+    /// the node holds for the player is a slip the pages may count differently from the node.
+    pub fn take_ended_signers(&mut self, t: &str, inc: &str) -> (BTreeSet<(String, String)>, bool) {
+        match self.tables.get_mut(&(t.to_string(), inc.to_string())) {
+            Some(tb) => (std::mem::take(&mut tb.ended_signers), std::mem::take(&mut tb.ended_over)),
+            None => (BTreeSet::new(), false),
+        }
     }
 
     /// What the observer has seen of the room's delegations since it began.

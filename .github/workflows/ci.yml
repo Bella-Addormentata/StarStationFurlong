@@ -172,10 +172,11 @@ jobs:
       # tests run the interrupt, the stack and memory limits and the pages'
       # vectors on the Windows build too, before any release carries it. And
       # its child process: the pipes, the kill and the real `--fold-worker`
-      # binary are Windows' own to prove.
+      # binary are Windows' own to prove. And the watch of the players (fold_pins) and the house's own tests, the plan
+      # the shadow follows among them: a filter names the modules it runs, and `cargo check --tests` only compiles them.
       - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
         shell: bash
-        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins house::tests::
 
   node-check-macos:
     name: 🦀 Node cargo check + wallet tests on macOS (release features)
@@ -200,9 +201,9 @@ jobs:
 
       # 🧮 The fold's child process on macOS (the release's .dmg carries the
       # node): the pipes, the kill and the reaper, the real `--fold-worker`
-      # binary, and the feed and shadow over them.
+      # binary, and the feed and shadow over them, the watch of the players (fold_pins) and the house's own tests.
       - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
-        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins house::tests::
 
       # 🏦 The SSF wallet's tests on APFS and the macOS API. With
       # SSF_KEYCHAIN_TESTS=1 the keychain tests run against temporary

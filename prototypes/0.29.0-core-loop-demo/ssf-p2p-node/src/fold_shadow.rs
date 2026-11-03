@@ -28,9 +28,12 @@
 //! it trimmed it), or the houses and pins it was given were not shown to be
 //! everything the room held while the session was in it, or the deed changed
 //! hands while the session was in the room (the houses every page counts are
-//! the holder's, and a page may have folded with another holder's), or a
-//! checkpoint was written over by another before the node read it. Those are
-//! skipped, and counted by why.
+//! the holder's, and a page may have folded with another holder's) or a
+//! delegation may have come and gone in it where the node saw nothing of it,
+//! or a slip it held was signed with a key other than the one the node has
+//! pinned for its player (a page counts the slip when it is the key it signs
+//! with), or a checkpoint was written over by another before the node read it.
+//! Those are skipped, and counted by why.
 
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
@@ -93,11 +96,17 @@ pub enum Skip {
     /// the step-down. (Every checkpoint of a round with a house the fold has stepped down for, and no other: that the fold
     /// has cleared it by mistake is not told from it. The difference is not a disagreement.)
     StepDown,
-    /// The deed changed hands (or may have: a handover hidden in an update that put the same holder back) while the
-    /// session was in the room, and the houses every page counts are those of whoever holds the deed: a page may have
-    /// folded the session's rounds with the houses of another holder than the one the node counted. Held in doubt until
-    /// the table is trimmed once more.
+    /// The deed changed hands (or may have: a handover hidden in an update that put the same holder back), or a
+    /// delegation may have come and gone where the node did not see it, while the session was in the room, and the
+    /// houses every page counts are those of whoever holds the deed, and the ones that holder delegated: a page may
+    /// have folded the session's rounds with the houses of another holder than the one the node counted, or with a
+    /// house the node never knew. Held in doubt until the table is trimmed once more.
     Handover,
+    /// A slip of the session the checkpoint trims was signed with a key that is not the one the node has pinned for
+    /// its player (or the player has none): the node's fold does not count it, and the page whose player it is
+    /// counts it if it is the key it signs with (a page's own player has its own key, whatever the players map says),
+    /// so the page that trimmed may have counted what the node did not.
+    Signer,
 }
 
 impl Skip {
@@ -116,6 +125,7 @@ impl Skip {
             Skip::Superseded => "superseded",
             Skip::StepDown => "stepdown",
             Skip::Handover => "handover",
+            Skip::Signer => "signer",
         }
     }
 }
@@ -266,12 +276,13 @@ pub struct Tally {
     pub superseded: u64,
     pub step_down: u64,
     pub handover: u64,
+    pub signer: u64,
 }
 
 impl Tally {
     /// Every comparison not made.
     pub fn skipped(&self) -> u64 {
-        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired + self.superseded + self.step_down + self.handover
+        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired + self.superseded + self.step_down + self.handover + self.signer
     }
 }
 
@@ -293,6 +304,7 @@ impl Tally {
             Verdict::Skip(Skip::Superseded) => self.superseded += 1,
             Verdict::Skip(Skip::StepDown) => self.step_down += 1,
             Verdict::Skip(Skip::Handover) => self.handover += 1,
+            Verdict::Skip(Skip::Signer) => self.signer += 1,
         }
     }
 }
@@ -441,10 +453,13 @@ struct RoomShadow {
     /// and whether there was a last tick.
     deeds: Option<(PinWatch, u64)>,
     looked: bool,
-    /// The tables whose session had the deed change hands in it, or may have: the pages may have folded its rounds
-    /// with another holder's houses, and the node counted one's. A table is in until the comparison of the checkpoint
-    /// of its next trim, which it is skipped at (`Skip::Handover`) and leaves (a new session starts; unless the deed
-    /// changed hands again in that very tick, which may be after the trim).
+    /// How many updates to the delegations may have hidden one (`Delegations::hidden`), as of the last tick.
+    hidden_seen: u64,
+    /// The tables whose session had the deed change hands in it, or may have, or a delegation come and go unseen: the
+    /// pages may have folded its rounds with another holder's houses, or with a house the node never knew, and the
+    /// node counted one's. A table is in until the comparison of the checkpoint of its next trim, which it is
+    /// skipped at (`Skip::Handover`) and leaves (a new session starts; unless it happened again in that very tick,
+    /// which may be after the trim).
     handover: BTreeSet<TableKey>,
     /// Tables the plan stopped naming that the mirror still holds (the pages count them ended: removed, or their
     /// switch gone or naming another incarnation), and when each was first seen outside the view: kept for the final
@@ -473,7 +488,30 @@ thread_local! {
     static ATTACHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// What a room's shadow knew of the deed when the room was let go of (the plan went: the house is no house there for a
+/// time, or the deed is held by one whose delegation the house has not got). The watch of the room's players goes on
+/// meanwhile, and the room's shadow, when the plan is back, is a new one: this is what it starts from, so that a deed
+/// that changed hands while the room was let go of, and changed back, is a handover to it, and the sessions that were
+/// in doubt still are.
+struct Remembered {
+    deeds: Option<(PinWatch, u64)>,
+    looked: bool,
+    handover: BTreeSet<TableKey>,
+}
+
 impl RoomShadow {
+    /// Start from what a shadow of the room before this one knew of the deed.
+    fn remember(&mut self, before: Remembered) {
+        self.deeds = before.deeds;
+        self.looked = before.looked;
+        self.handover = before.handover;
+    }
+
+    /// What this shadow knows of the deed, for the one that replaces it.
+    fn forget(self) -> Remembered {
+        Remembered { deeds: self.deeds, looked: self.looked, handover: self.handover }
+    }
+
     fn attach(doc: &Doc, room: &str, limits: Limits) -> RoomShadow {
         #[cfg(test)]
         ATTACHED.with(|n| n.set(n.get() + 1));
@@ -486,6 +524,7 @@ impl RoomShadow {
             seen_delegations: 0,
             deeds: None,
             looked: false,
+            hidden_seen: 0,
             handover: BTreeSet::new(),
             gone: BTreeMap::new(),
             leaving: false,
@@ -593,10 +632,13 @@ impl RoomShadow {
         // moved, and the view settles again when the holder is back: the count is what says that a handover came and
         // went between two ticks, as an A, B, A does, and the answers made for the session in it are not to be
         // believed again for that.)
+        // (Or a delegation made and deleted where the node saw nothing of it: the houses a page counted then are not the
+        // ones the node's plan will ever name.)
         let deeds = view.watch.as_ref().map(|w| (w.clone(), w.deeds()));
-        let handed = self.looked && deeds != self.deeds;
+        let handed = self.looked && (deeds != self.deeds || delegations.hidden != self.hidden_seen);
         self.looked = true;
         self.deeds = deeds;
+        self.hidden_seen = delegations.hidden;
         if view.settled && !delegations.churned && !moved && !handed {
             self.confirm(view, &inputs, sup, view.pins_epoch, delegations.changes);
         } else {
@@ -621,7 +663,7 @@ impl RoomShadow {
         }
         // The pins and the delegations as the doc the drain read shows them: what moved since a table was shown whole takes it back.
         let pins = view.watch.as_ref().map_or(view.pins_epoch, PinWatch::epoch);
-        self.compare(tally, &covered, pins, self.mirror.delegations().changes, handed);
+        self.compare(tally, &covered, pins, self.mirror.delegations().changes, handed, &view.pins);
         // (After the comparison: a final checkpoint that came with the drain is compared before its table is given up on.)
         self.expire(now, view, tally);
         // The view's tables, and those that left it and are kept.
@@ -668,7 +710,7 @@ impl RoomShadow {
     /// (`State::unread_at_trim`); otherwise it could be the fold's lateness, or
     /// its lack of an input. A trim read when the fold has no answer from before
     /// it is counted as a comparison not made.
-    fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, pins: u64, delegations: u64, handed: bool) {
+    fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, pins: u64, delegations: u64, handed: bool, pinned: &[(String, String)]) {
         let RoomShadow { mirror, feed, compared, confirmed, said, handover, .. } = self;
         let room = mirror.room().to_string();
         let keys: Vec<TableKey> = mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
@@ -688,6 +730,9 @@ impl RoomShadow {
             if lost > 0 {
                 say(said, false, format!("{}: skipped (superseded: {lost} checkpoint(s) written over before the node read them)", at()));
             }
+            // Who signed the slips of the session or sessions the table left since the last look (taken whatever the
+            // table does now, so that they are not told of a later trim).
+            let (signers, signers_over) = mirror.take_ended_signers(t, inc);
             let Some(st) = mirror.state(t, inc) else { continue };
             let Some(cp) = st.base else {
                 // A checkpoint this node cannot read as a page does (one heavier than a drain reads, or one a page may read
@@ -741,6 +786,8 @@ impl RoomShadow {
                     verdict = Verdict::Skip(Skip::Handover);
                 } else if confirmed.get(&key) != Some(&shown) {
                     verdict = Verdict::Skip(Skip::Inputs);
+                } else if signers_over || unreconciled(&signers, pinned) {
+                    verdict = Verdict::Skip(Skip::Signer);
                 } else if st.unread_at_trim || !covered.contains(&key) {
                     verdict = Verdict::Skip(Skip::Stale);
                 }
@@ -753,6 +800,18 @@ impl RoomShadow {
             }
         }
     }
+}
+
+/// Whether a slip in `signers` (`(player, key)`) was signed with a key other than the one pinned for its player, or its
+/// player has no pin: the fold counts a slip for the felt only under the player's pin, so such a slip is one it left out,
+/// and the page whose player it is counts it when the key is the one it signs with (a page pins its own player's key
+/// without looking at the players map), and a page that trimmed may have been that page.
+fn unreconciled(signers: &BTreeSet<(String, String)>, pinned: &[(String, String)]) -> bool {
+    if signers.is_empty() {
+        return false;
+    }
+    let pins: std::collections::HashMap<&str, &str> = pinned.iter().map(|(p, k)| (p.as_str(), k.as_str())).collect();
+    signers.iter().any(|(pid, key)| pins.get(pid.as_str()) != Some(&key.as_str()))
 }
 
 /// Whether the table `key` has been compared with (or passed over, or first read with) the checkpoint `id`.
@@ -782,6 +841,9 @@ pub struct FoldShadow<L: Launch> {
     rooms: BTreeMap<String, RoomShadow>,
     /// The players of each room the house has a plan for, watched from the first plan on.
     pins: BTreeMap<String, PlayerPins>,
+    /// What the shadow of a room that was let go of knew of the deed, for the one that comes with the plan back (the
+    /// watch of the players, above, goes on while the room is served).
+    remembered: BTreeMap<String, Remembered>,
     /// The most players read of a players map when its watch starts ([`PIN_WALK_KEYS`]; less in the tests).
     pin_walk: usize,
     /// How long that read may hold the doc ([`PIN_WALK_TIME`]; no limit in the tests).
@@ -807,6 +869,7 @@ impl<L: Launch> FoldShadow<L> {
             sup: Supervisor::new(launch, now),
             rooms: BTreeMap::new(),
             pins: BTreeMap::new(),
+            remembered: BTreeMap::new(),
             pin_walk: PIN_WALK_KEYS,
             pin_walk_time: None,
             limits: Limits::default(),
@@ -844,6 +907,7 @@ impl<L: Launch> FoldShadow<L> {
     pub fn tick_plans_with(&mut self, clock: Clock<'_>, plans: Vec<(String, Doc, Option<HousePlan>)>) {
         if self.is_off() {
             self.pins.clear();
+            self.remembered.clear();
             self.tick_with(clock, Vec::new());
             return;
         }
@@ -896,6 +960,7 @@ impl<L: Launch> FoldShadow<L> {
             for (_, rs) in std::mem::take(&mut self.rooms) {
                 self.gone = self.gone.plus(rs.feed.counts());
             }
+            self.remembered.clear();
             self.followed = 0;
             return;
         }
@@ -951,7 +1016,14 @@ impl<L: Launch> FoldShadow<L> {
                 // (A room the house has a plan for is watched from its first plan, with a table or none: what its mirror
                 // sees of the delegations is read against every table that comes.)
                 Some(view) => {
-                    let rs = self.rooms.entry(room.clone()).or_insert_with(|| RoomShadow::attach(&doc, &room, self.limits));
+                    let (limits, remembered) = (self.limits, &mut self.remembered);
+                    let rs = self.rooms.entry(room.clone()).or_insert_with(|| {
+                        let mut rs = RoomShadow::attach(&doc, &room, limits);
+                        if let Some(before) = remembered.remove(&room) {
+                            rs.remember(before);
+                        }
+                        rs
+                    });
                     rs.follow(clock(), &doc, &view, keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
                     for (mismatch, line) in std::mem::take(&mut rs.said) {
                         self.log.push(mismatch, line);
@@ -985,8 +1057,12 @@ impl<L: Launch> FoldShadow<L> {
         for room in done {
             if let Some(rs) = self.rooms.remove(&room) {
                 self.gone = self.gone.plus(rs.feed.counts());
+                self.remembered.insert(room, rs.forget());
             }
         }
+        // (A room the node does not serve any more is not coming back with a plan of its own: what is remembered of it
+        // goes, as its watch of the players does.)
+        self.remembered.retain(|room, _| listed.contains(room));
     }
 
     pub fn tally(&self) -> Tally {

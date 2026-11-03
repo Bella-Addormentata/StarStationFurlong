@@ -335,11 +335,11 @@ fn each_verdict_is_counted_under_its_own_name() {
     let mut t = Tally::default();
     t.note(&Verdict::Agree);
     t.note(&Verdict::Mismatch("x".into()));
-    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover] {
+    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover, Skip::Signer] {
         t.note(&Verdict::Skip(why));
     }
-    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1, step_down: 1, handover: 1 });
-    assert_eq!(t.skipped(), 13);
+    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1, step_down: 1, handover: 1, signer: 1 });
+    assert_eq!(t.skipped(), 14);
     t.note(&Verdict::Skip(Skip::Pending));
     assert_eq!(t.pending, 2);
 }
@@ -347,11 +347,12 @@ fn each_verdict_is_counted_under_its_own_name() {
 /// Each kind of skip is said under a name of its own, since the log is all there is to tell them by.
 #[test]
 fn each_kind_of_skip_has_a_name_of_its_own() {
-    let all = [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover];
+    let all = [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover, Skip::Signer];
     let names: BTreeSet<&str> = all.iter().map(|s| s.name()).collect();
     assert_eq!(names.len(), all.len(), "{names:?}");
     assert_eq!(Skip::StepDown.name(), "stepdown");
     assert_eq!(Skip::Handover.name(), "handover");
+    assert_eq!(Skip::Signer.name(), "signer");
 }
 
 #[test]
@@ -455,6 +456,13 @@ impl Bench {
         bench.write_session();
         bench.set_owner(OWNER);
         bench.add_player(OWNER, OWNER_KEY);
+        // (The players of the vector are in the room too, under the keys that signed their slips: a watch of the room's
+        // players pins what the vector's own pins say.)
+        for (pid, key) in &bench.case.pins {
+            if pid != OWNER {
+                bench.add_player(pid, key);
+            }
+        }
         bench
     }
 
@@ -512,6 +520,16 @@ impl Bench {
         let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
         let mut txn = self.doc.transact_mut();
         comp.insert(&mut txn, live.as_str(), MapPrelim::default());
+    }
+
+    /// A record no fold counts comes into the live session: the node's answer is a new one (a frame later), and nothing
+    /// in the session was removed or replaced.
+    fn add_a_record(&self) {
+        let live = self.live(None);
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &live) else { panic!("no live session") };
+        m.insert(&mut txn, format!("x:9:nobody:{}", "7".repeat(32)).as_str(), to_any(&obj(vec![("p", s("nobody"))])));
     }
 
     /// A record leaves the live session (a page's compaction, say): the node's answer is not the table as the doc holds it.
@@ -731,11 +749,11 @@ fn when_the_fold_duties_are_off_for_good_nothing_is_followed_and_the_report_says
 #[test]
 fn the_report_adds_up_what_the_shadow_found_and_what_the_feeds_did() {
     let mut b = Bench::new("house roulette 3");
-    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13, step_down: 14, handover: 15 };
+    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13, step_down: 14, handover: 15, signer: 16 };
     b.shadow.gone = Counts { cold: 10, warm: 20, forgets: 30, results: 40, dirty: 11, lost: 12, busy: 50, too_big: 13, bad_results: 14 };
     let r = b.shadow.report();
     assert_eq!((r.shadow_agreed, r.shadow_mismatches), (1, 2));
-    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15, "every kind of skip");
+    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16, "every kind of skip");
     assert_eq!((r.cold_folds, r.dirty, r.lost), (10, 11, 12));
     assert_eq!(r.bad_results, 14 + 13, "a result and a frame nobody could use");
 }
@@ -1430,6 +1448,10 @@ fn when_the_fold_duties_are_off_no_room_is_asked_what_it_holds() {
 fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_room() {
     let b = Bench::new("house roulette 3");
     let (doc, houses) = (b.doc.clone(), b.case.houses.clone());
+    // (The players of the vector are in the room, besides its owner.)
+    let mut everyone: Vec<(String, String)> = vec![("alice".to_string(), "A".to_string()), (OWNER.to_string(), OWNER_KEY.to_string())];
+    everyone.extend(b.case.pins.iter().filter(|(p, _)| p != OWNER).cloned());
+    everyone.sort();
     let shadow = Mutex::new(b.shadow);
     let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
     let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
@@ -1442,7 +1464,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
         let mut txn = doc.transact_mut();
         players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("A"))])));
     }
-    assert_eq!(shadow.lock().unwrap().pins.get_mut("with").unwrap().view(), (vec![("alice".to_string(), "A".to_string()), (OWNER.to_string(), OWNER_KEY.to_string())], true));
+    assert_eq!(shadow.lock().unwrap().pins.get_mut("with").unwrap().view(), (everyone, true));
     {
         let mut txn = doc.transact_mut();
         players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("B"))])));
@@ -1618,7 +1640,8 @@ fn an_answer_is_believed_only_where_the_pins_and_the_delegations_stand_as_they_s
         let room = b.room().to_string();
         let key = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
         b.put_checkpoint(&wrong);
-        let inputs = Inputs::new(b.view.as_ref().unwrap().houses.clone(), b.view.as_ref().unwrap().pins.clone());
+        let pinned = b.view.as_ref().unwrap().pins.clone();
+        let inputs = Inputs::new(b.view.as_ref().unwrap().houses.clone(), pinned.clone());
         let FoldShadow { sup, rooms, .. } = &mut b.shadow;
         let rs = rooms.get_mut(&room).unwrap();
         let covered = rs.covered(&inputs, sup);
@@ -1628,7 +1651,7 @@ fn an_answer_is_believed_only_where_the_pins_and_the_delegations_stand_as_they_s
         }
         let shown = rs.confirmed[&key];
         let mut tally = Tally::default();
-        rs.compare(&mut tally, &covered, shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64, false);
+        rs.compare(&mut tally, &covered, shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64, false, &pinned);
         let expected = if pins_moved || delegations_moved { Tally { inputs: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
         assert_eq!(tally, expected, "pins moved {pins_moved}, delegations moved {delegations_moved}");
     }
@@ -2002,6 +2025,8 @@ fn a_table_the_cap_puts_out_is_kept_for_a_checkpoint_a_page_has_written() {
 fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_at() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    // (The players of the vector are in the room, besides its owner.)
+    let others = b.case.pins.iter().filter(|(p, _)| p != OWNER).count();
     let mut shadow = b.shadow;
     let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true };
     let first = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
@@ -2016,7 +2041,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     assert!(watch.epoch() > first.pins_epoch);
     let second = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     assert_eq!(second.watch, first.watch, "(the same watch: the room's)");
-    assert_eq!((second.pins_epoch, second.pins.len()), (watch.epoch(), 2), "the owner and the player who came");
+    assert_eq!((second.pins_epoch, second.pins.len()), (watch.epoch(), 2 + others), "the owner, the players of the vector and the player who came");
     assert!(second.settled);
 }
 
@@ -2295,14 +2320,15 @@ fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
         for i in 0..200 {
             b.add_player(&format!("p{i:03}"), &format!("key-{i}"));
         }
+        let others = b.case.pins.iter().filter(|(p, _)| p != OWNER).count();
         let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
         let mut shadow = b.shadow;
         shadow.pin_walk_time = timed.then_some(Duration::ZERO);
         let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
         let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
         assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
-        // (The 200 players and the owner.)
-        assert_eq!(view.pins.len() == 201, !timed, "timed={timed}");
+        // (The 200 players, the owner and the players of the vector.)
+        assert_eq!(view.pins.len() == 201 + others, !timed, "timed={timed}");
     }
 }
 
@@ -2414,9 +2440,9 @@ fn a_table_the_plan_stopped_naming_is_not_shown_whole_again_by_an_answer_made_af
             b.view.as_mut().unwrap().tables.clear();
         }
         b.ticks(3);
-        // A record leaves the session after: the node's answer is a new one.
+        // A record comes into the session after: the node's answer is a new one.
         let frame = b.shadow.rooms[b.room()].feed.fold(&table.0, &table.1).unwrap().frame;
-        b.remove_a_record();
+        b.add_a_record();
         b.until("answered afresh", |b| b.shadow.rooms[b.room()].feed.fold(&table.0, &table.1).is_some_and(|f| f.frame > frame) && b.caught_up());
         b.ticks(3);
         let stamped = b.shadow.rooms[b.room()].confirmed.get(&table).map(|s| s.frame).expect("what was shown before is kept");
@@ -2995,4 +3021,216 @@ fn the_doubt_of_a_handover_goes_with_the_table_when_it_is_let_go_of() {
     b.until("the table is let go of", |b| b.tables_held() == 0);
     b.ticks(3);
     assert_eq!(b.handover_tables(), 0);
+}
+
+// ── Review round 8 ───────────────────────────────────────────────────────────
+
+impl Bench {
+    /// The players who signed a slip of the vector's session.
+    fn slip_players(&self) -> BTreeSet<String> {
+        self.case.warm.iter().flatten().filter_map(|(k, v)| v.as_ref().and_then(|_| crate::house::parse_key(k))).filter(|p| p.0 == 's').filter_map(|p| p.2.map(str::to_string)).collect()
+    }
+
+    /// A slip no fold counts for the vector's table (a round that is never open), signed by `pid` with `key`, comes into
+    /// the live session.
+    fn add_a_slip(&self, pid: &str, key: &str, n: u32) {
+        let live = self.live(None);
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &live) else { panic!("no live session") };
+        m.insert(&mut txn, format!("s:9999:{pid}:{n:032x}").as_str(), to_any(&obj(vec![("p", s(pid)), ("k", s(key))])));
+    }
+
+    /// The bench's view takes the player's pin from them (`None`), or gives them another key.
+    fn repin(&mut self, pid: &str, key: Option<&str>) {
+        let view = self.view.as_mut().unwrap();
+        view.pins.retain(|(p, _)| p != pid);
+        if let Some(key) = key {
+            view.pins.push((pid.to_string(), key.to_string()));
+        }
+    }
+}
+
+/// A slip of the session signed with a key that is not the one the node has pinned for its player (or whose player the node
+/// has no pin for) is one the node's fold does not count and the page whose slip it is may have: the trim is skipped. A
+/// trim of a session whose slips are all under their pins is compared as it was.
+#[test]
+fn a_trim_of_a_session_with_a_slip_signed_under_another_key_than_the_pin_is_skipped_as_signer() {
+    for how in ["pinned alike", "another key", "no pin"] {
+        let mut b = Bench::new("house craps 3");
+        let signers = b.slip_players();
+        assert!(!signers.is_empty(), "(the vector's session holds slips)");
+        let mut pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "{how}: shown whole");
+        let signer = signers.iter().next().unwrap().clone();
+        match how {
+            "another key" => b.repin(&signer, Some("another-key")),
+            "no pin" => b.repin(&signer, None),
+            _ => {}
+        }
+        b.sync_pins(&mut pins);
+        let cp = b.page_trim(&b.answer());
+        b.put_checkpoint(&cp);
+        b.tick();
+        let expected = if matches!(how, "another key" | "no pin") { Tally { signer: 1, ..Tally::default() } } else { Tally { agree: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "{how}");
+        if expected.signer == 1 {
+            let r = b.shadow.report();
+            assert!(r.recent_skips.iter().any(|l| l.starts_with(&tag_of(&b)) && l.contains("signer")), "{:?}", r.recent_skips);
+            assert_eq!(r.shadow_mismatches, 0);
+        }
+    }
+}
+
+/// A session of more signers than the mirror keeps is never believed, whatever the pins: the shadow cannot say that none was
+/// unreconciled.
+#[test]
+fn a_session_of_more_signers_than_the_mirror_keeps_is_skipped_as_signer() {
+    for many in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        let n = if many { crate::house_mirror::MAX_SIGNERS as u32 + 8 } else { 6 };
+        for i in 0..n {
+            let (pid, key) = (format!("pidx-{i}"), format!("keyx-{i}"));
+            b.add_a_slip(&pid, &key, i + 100);
+            b.repin(&pid, Some(&key));
+        }
+        let mut pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "many={many}: shown whole");
+        b.sync_pins(&mut pins);
+        let cp = b.page_trim(&b.answer());
+        b.put_checkpoint(&cp);
+        b.tick();
+        let expected = if many { Tally { signer: 1, ..Tally::default() } } else { Tally { agree: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "many={many}");
+    }
+}
+
+/// `unreconciled`: every (player, key) pair of the slips must be the pin of the player.
+#[test]
+fn a_set_of_signers_is_reconciled_only_when_every_pair_is_a_pin() {
+    let pins = vec![("a".to_string(), "ka".to_string()), ("b".to_string(), "kb".to_string())];
+    let set = |pairs: &[(&str, &str)]| -> BTreeSet<(String, String)> { pairs.iter().map(|(p, k)| (p.to_string(), k.to_string())).collect() };
+    assert!(!unreconciled(&set(&[]), &pins), "no slips");
+    assert!(!unreconciled(&set(&[]), &[]), "no slips, no pins");
+    assert!(!unreconciled(&set(&[("a", "ka")]), &pins));
+    assert!(!unreconciled(&set(&[("a", "ka"), ("b", "kb")]), &pins));
+    assert!(unreconciled(&set(&[("a", "kb")]), &pins), "another player's key");
+    assert!(unreconciled(&set(&[("a", "ka"), ("b", "other")]), &pins), "one pair of two");
+    assert!(unreconciled(&set(&[("a", "ka"), ("a", "other")]), &pins), "a player with a second key");
+    assert!(unreconciled(&set(&[("c", "kc")]), &pins), "no pin");
+    assert!(unreconciled(&set(&[("a", "ka")]), &[]), "no pins at all");
+}
+
+/// A delegation may have come and gone where the node saw nothing of it: the houses a page counted then are not the ones
+/// the node's plan names. With a key beside it that the update shows, the tables in the room are held in doubt until their
+/// next trim and the view is shown whole again; with none, the delegations are in doubt for good.
+#[test]
+fn a_delegation_that_may_have_come_and_gone_unseen_is_a_handover_to_the_tables_in_the_room() {
+    for how in ["a key beside it", "no key at all", "an update that hides nothing"] {
+        let mut b = Bench::new("house craps 3");
+        let _pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!((b.confirmed_count(), b.handover_tables()), (1, 0), "{how}");
+        {
+            let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+            let mut txn = b.doc.transact_mut();
+            match how {
+                "a key beside it" => {
+                    comp.insert(&mut txn, "other", 1);
+                    comp.insert(&mut txn, "other", 2);
+                }
+                "no key at all" => {
+                    comp.insert(&mut txn, "scratch", 1);
+                    comp.remove(&mut txn, "scratch");
+                }
+                _ => {
+                    comp.insert(&mut txn, "other", 1);
+                }
+            }
+        }
+        b.ticks(5);
+        let doubted = how != "an update that hides nothing";
+        assert_eq!(b.handover_tables(), doubted as usize, "{how}");
+        assert_eq!(b.confirmed_count(), (how != "no key at all") as usize, "{how}: shown whole again unless the delegations are in doubt for good");
+        let wrong = b.wrong_trim(&b.answer());
+        b.put_checkpoint(&wrong);
+        b.tick();
+        let expected = if doubted { Tally { handover: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "{how}");
+        assert_eq!(b.handover_tables(), 0, "{how}: the session is over, and the doubt with it");
+    }
+}
+
+/// A room let go of (the plan went) and followed again is a new shadow, and starts from what the last knew of the deed: a
+/// deed that changed hands while it was gone is a handover to it, and the sessions that were in doubt still are.
+#[test]
+fn what_a_room_knew_of_the_deed_is_kept_while_the_room_is_let_go_of() {
+    for how in ["the deed changed hands while it was gone", "the deed changed hands before", "nothing changed"] {
+        let mut b = Bench::new("house craps 3");
+        let mut pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        if how == "the deed changed hands before" {
+            b.flip_the_deed();
+            b.sync_pins(&mut pins);
+            b.ticks(3);
+            assert_eq!(b.handover_tables(), 1, "{how}");
+        }
+        // The plan goes: the room is let go of.
+        let view = b.view.take().unwrap();
+        b.until("the room is gone", |b| b.shadow.rooms.is_empty());
+        if how == "the deed changed hands while it was gone" {
+            b.flip_the_deed();
+        }
+        // And is back.
+        b.view = Some(view);
+        b.sync_pins(&mut pins);
+        b.ticks(5);
+        let doubted = how != "nothing changed";
+        assert_eq!(b.handover_tables(), doubted as usize, "{how}");
+    }
+}
+
+/// A room the node does not serve any more is not coming back with a plan of its own: what is remembered of it goes.
+#[test]
+fn what_is_remembered_of_a_room_is_forgotten_when_the_node_no_longer_serves_it() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let view = b.view.take().unwrap();
+    b.until("the room is gone", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.remembered.len(), 1, "(for as long as the room is listed)");
+    b.listed = false;
+    b.ticks(2);
+    assert!(b.shadow.remembered.is_empty());
+    // Back, with the deed changed in between: a first look.
+    b.flip_the_deed();
+    b.listed = true;
+    b.view = Some(view);
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0, "a first look is no handover");
+}
+
+/// ... and when the fold duties go off for good, nothing is followed, and nothing is remembered of what was.
+#[test]
+fn what_is_remembered_of_a_room_goes_when_the_fold_duties_go_off() {
+    let mut b = Bench::new("house craps 3");
+    let _pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    let view = b.view.take().unwrap();
+    b.until("the room is gone", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.remembered.len(), 1);
+    b.shadow.sup.go_off();
+    b.tick();
+    assert!(b.shadow.remembered.is_empty());
+    b.view = Some(view);
+    b.ticks(3);
+    assert!(b.shadow.rooms.is_empty() && b.shadow.remembered.is_empty());
 }

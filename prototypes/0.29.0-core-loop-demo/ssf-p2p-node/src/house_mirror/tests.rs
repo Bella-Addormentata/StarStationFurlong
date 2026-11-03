@@ -1944,14 +1944,14 @@ fn the_delegations_of_a_room_are_counted_and_a_replacement_or_a_removal_is_churn
     let f = Fix { doc, m };
     assert_eq!(f.m.delegations(), Delegations::default());
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
     f.put_top("sum:other:inc", &cp(2));
     f.put_top("hkx", &s("not a delegation"));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "nothing but `hk:` keys");
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "nothing but `hk:` keys");
     f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(2))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 });
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(3))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "replaced");
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "replaced");
     // One that is removed.
     let doc = Doc::new();
     let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
@@ -1959,7 +1959,7 @@ fn the_delegations_of_a_room_are_counted_and_a_replacement_or_a_removal_is_churn
     f.put_top("hk:house-a", &s("a"));
     assert!(!f.m.delegations().churned);
     f.remove_top("hk:house-a");
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "removed");
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 0 }, "removed");
 }
 
 // ── Review round 4 ───────────────────────────────────────────────────────────
@@ -1977,15 +1977,15 @@ fn a_delegation_written_again_as_it_stands_is_no_churn() {
     let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
     let f = Fix { doc, m };
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "the same record, twice more");
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "the same record, twice more");
     // A record of another delegation is another change all the same, and one that differs from the last is churn.
     f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(1))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 });
     f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(2))]));
-    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "a record that differs");
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "a record that differs");
     // A removal is churn however the record read; and what is written after it is a new record.
     let doc = Doc::new();
     let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
@@ -1993,7 +1993,7 @@ fn a_delegation_written_again_as_it_stands_is_no_churn() {
     f.put_top("hk:house-a", &s("a"));
     f.remove_top("hk:house-a");
     f.put_top("hk:house-a", &s("a"));
-    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "removed, and written again");
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "removed, and written again");
     // A record a page may read otherwise (a `__proto__` field) written again as it stands is churn all the same: what
     // a page reads of it is not what the node reads.
     let doc = Doc::new();
@@ -2001,9 +2001,9 @@ fn a_delegation_written_again_as_it_stands_is_no_churn() {
     let f = Fix { doc, m };
     let ambiguous = || Any::Map(Arc::new(std::collections::HashMap::from([("v".to_string(), Any::Number(1.0)), ("__proto__".to_string(), Any::String(Arc::from("x")))])));
     f.put_any("hk:house-p", ambiguous());
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
     f.put_any("hk:house-p", ambiguous());
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "the same record, and one a page may read otherwise");
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 0 }, "the same record, and one a page may read otherwise");
 }
 
 /// The records a page wrote and the trim that deleted them can come to the node in one update: all of it is integrated,
@@ -2123,7 +2123,7 @@ fn a_delegation_heavier_than_the_house_reads_is_churn_when_written_again() {
         let rec = || obj(vec![("x", s(&"y".repeat(weight)))]);
         f.put_top("hk:house-a", &rec());
         f.put_top("hk:house-a", &rec());
-        assert_eq!(f.m.delegations(), Delegations { changes: if churn { 2 } else { 1 }, churned: churn }, "weight {weight}");
+        assert_eq!(f.m.delegations(), Delegations { changes: if churn { 2 } else { 1 }, churned: churn, hidden: 0 }, "weight {weight}");
     }
 }
 
@@ -2354,7 +2354,8 @@ fn a_delegation_written_and_written_over_in_one_update_is_churn_though_it_shows_
     page.put_top("hk:house-a", &s("b"));
     let f = Fix::empty();
     apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: true });
+    // (And one of another name may have come and gone in it too, which the keys do not say: `hidden`.)
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 1 });
 }
 
 /// One written once is not, nor is one in an update that deletes only what the doc already had.
@@ -2364,7 +2365,7 @@ fn a_delegation_written_once_is_no_churn_even_in_an_update_that_deletes_what_the
     page.put_top("hk:house-a", &s("a"));
     let f = Fix::empty();
     apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
     // A key the doc held goes, and another delegation comes, in one update.
     page.put_top("elsewhere", &s("x"));
     let held = f.doc.transact().state_vector();
@@ -2373,7 +2374,7 @@ fn a_delegation_written_once_is_no_churn_even_in_an_update_that_deletes_what_the
     page.remove_top("elsewhere");
     page.put_top("hk:house-b", &s("b"));
     apply_to(&f.doc, &page.diff_since(&before));
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false }, "the block deleted was one the doc held");
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 }, "the block deleted was one the doc held");
 }
 
 /// An update in which something else was made and deleted doubts a delegation it brings once too: what was deleted cannot
@@ -2386,7 +2387,7 @@ fn a_delegation_brought_with_something_else_made_and_deleted_is_churn_too() {
     page.put_top("hk:house-a", &s("a"));
     let f = Fix::empty();
     apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: true });
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 1 });
 }
 
 impl Page {
@@ -2475,7 +2476,7 @@ fn trimmed_after(how: &str) -> Fix {
 
 #[test]
 fn a_record_made_and_deleted_in_one_update_makes_the_next_trim_of_its_session_unread() {
-    for (how, unread) in [("merged", true), ("merged undrained", true), ("new session", true), ("separate", false), ("never", false), ("elsewhere", false)] {
+    for (how, unread) in [("merged", true), ("merged undrained", true), ("new session", true), ("separate", true), ("never", false), ("elsewhere", false)] {
         let mut f = trimmed_after(how);
         assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
         // The doubt is of the session the trim leaves: it is not carried to the next.
@@ -2632,13 +2633,13 @@ fn a_delegation_put_back_as_it_was_in_an_update_that_changed_it_between_is_churn
     page.put_top("hk:house-a", &s("a"));
     let f = Fix::empty();
     apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
     // The same record written again by itself, even twice, is nothing (above); with another between, it is.
     let held = f.doc.transact().state_vector();
     page.put_top("hk:house-a", &s("b"));
     page.put_top("hk:house-a", &s("a"));
     apply_to(&f.doc, &page.diff_since(&held));
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "a, b, a: the doc holds a before and after");
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 1 }, "a, b, a: the doc holds a before and after");
 }
 
 /// And an identical rewrite in an update where something else was made and deleted is doubted too (what was deleted cannot be
@@ -2653,12 +2654,247 @@ fn an_identical_rewrite_is_churn_only_in_an_update_in_which_something_was_made_a
     let held = f.doc.transact().state_vector();
     page.put_top("hk:house-a", &s("a"));
     apply_to(&f.doc, &page.diff_since(&held));
-    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "a plain rewrite");
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "a plain rewrite");
     // The record again, with something else made and deleted in the same update.
     let held = f.doc.transact().state_vector();
     page.put_top("other", &s("1"));
     page.put_top("other", &s("2"));
     page.put_top("hk:house-a", &s("a"));
     apply_to(&f.doc, &page.diff_since(&held));
-    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true });
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 1 });
+}
+
+// ── Review round 8 ───────────────────────────────────────────────────────────
+
+/// An update in which something was made and deleted may have hidden a delegation made and deleted in it, whatever keys it
+/// shows: a key that is no delegation beside it does not say that none came and went. One that shows no key says it
+/// all the same. (`hidden` counts the updates, `churned` is for good, and the first is not for the second.)
+#[test]
+fn an_update_that_made_and_deleted_something_beside_the_keys_it_shows_may_have_hidden_a_delegation() {
+    // A key written twice shows as one insert, and the first was made and deleted: not a delegation, and not said to be none.
+    let page = Page::new(7);
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 1 }, "doubted, not churned");
+    // The same key once is nothing.
+    let page = Page::new(8);
+    page.put_top("other", &s("1"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations::default(), "no delegation, nothing made and deleted");
+    // A later update that deletes only what the doc held is nothing either.
+    let held = f.doc.transact().state_vector();
+    page.put_top("other", &s("2"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations::default(), "the block deleted was one the doc held");
+}
+
+/// And one in which the room's map changed in no key at all (a block made and deleted in it) hides a delegation for good.
+#[test]
+fn an_update_that_left_the_room_map_no_key_to_read_is_churn_and_hidden() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    page.remove_top("hk:house-a");
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    let d = f.m.delegations();
+    assert!(d.churned && d.hidden >= 1 && d.changes >= 1, "{d:?}");
+}
+
+/// The mirror notes what was hidden once per update, not once per key.
+#[test]
+fn what_an_update_hides_is_counted_once_for_the_update() {
+    let page = Page::new(7);
+    for i in 0..5 {
+        page.put_top(&format!("k{i}"), &s("1"));
+        page.put_top(&format!("k{i}"), &s("2"));
+    }
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 1 });
+}
+
+/// A record in the live session that goes, or is replaced by another under the same key (the keys are the hashes of the
+/// records, so no page does either), is a history a page that never saw it does not share with the node: the trim of
+/// the session is not held against what the node read. A record written again as it stands is nothing, nor is a new one.
+#[test]
+fn a_record_that_is_removed_or_replaced_in_the_live_session_makes_the_next_trim_unread() {
+    for (how, unread) in [("removed", true), ("replaced", true), ("replaced by a shared type", true), ("written again as it stands", false), ("added", false)] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+        f.drain();
+        f.skim();
+        match how {
+            "removed" => f.remove(&live0(), &rk(1, 1)),
+            "replaced" => f.put(&live0(), &rk(1, 1), &rv(1, 99)),
+            "replaced by a shared type" => f.put_nested(&live0(), &rk(1, 1)),
+            "written again as it stands" => f.put(&live0(), &rk(1, 1), &rv(1, 10)),
+            _ => f.put(&live0(), &rk(1, 3), &rv(1, 30)),
+        }
+        // (The node reads the change before the trim: it was sent it all, and the doubt is not of what it did not read.)
+        f.drain();
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves.
+        f.skim();
+        let base2 = cp(3);
+        f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// A removal of the live session in an update in which something was made and deleted (a session made in it under the
+/// same name, with records, and deleted too, leaves no trace but the removal of the one the node held) is doubted as one
+/// that was made in it is. (The checkpoint of the trim, written in the same update, is doubted too, as an update in
+/// which something was made and deleted lagging behind the node; a removal that comes alone starts the table over.)
+#[test]
+fn a_trim_that_removed_the_live_session_in_an_update_that_made_and_deleted_something_is_unread() {
+    for hidden in [true, false] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+        f.drain();
+        f.skim();
+        let base = cp(2);
+        let next = live_of(T, Some(&base));
+        {
+            let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = f.doc.transact_mut();
+            comp.insert(&mut txn, sum_of(T).as_str(), to_any(&base));
+            if hidden {
+                // A session made under the name in this update, with a record, and deleted in it.
+                let m = comp.insert(&mut txn, live0().as_str(), MapPrelim::default());
+                m.insert(&mut txn, rk(1, 5).as_str(), to_any(&rv(1, 50)));
+            }
+            comp.remove(&mut txn, live0().as_str());
+            comp.insert(&mut txn, next.as_str(), MapPrelim::default());
+        }
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, hidden), "hidden={hidden}");
+    }
+}
+
+/// A slip a page counts for the felt: `s:<round>:<player>:<hash>`, signed with the key `k`.
+fn slip(r: i64, pid: &str, n: u32, key: &str) -> (String, CVal) {
+    (format!("s:{r}:{pid}:{n:032x}"), norm(obj(vec![("p", s(pid)), ("k", s(key))])))
+}
+
+fn pair(pid: &str, key: &str) -> (String, String) {
+    (pid.to_string(), key.to_string())
+}
+
+/// The keys that signed the slips a session held are told once it has ended (a trim), for the shadow to see whether the
+/// players were pinned to them; the live session's are not told, and are told once.
+#[test]
+fn the_signers_of_the_slips_of_a_session_are_told_when_it_ends_and_once() {
+    let mut f = Fix::seeded(Limits::default(), |f| {
+        let mut all = records(&[(1, 10)]);
+        all.push(slip(1, "pid-a", 1, "key-a"));
+        all.push(slip(1, "pid-b", 2, "key-b"));
+        f.session(&live0(), &all);
+    });
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "(the session is live)");
+    // A slip that comes later, and one that comes and goes, count; a record that is no slip, and a slip with no key, do not.
+    let (k, v) = slip(1, "pid-c", 3, "key-c");
+    f.put(&live0(), &k, &v);
+    let (k2, v2) = slip(1, "pid-d", 4, "key-d");
+    f.put(&live0(), &k2, &v2);
+    f.drain();
+    f.skim();
+    f.remove(&live0(), &k2);
+    f.put(&live0(), &format!("x:1:pid-e:{:032x}", 5), &norm(obj(vec![("p", s("pid-e")), ("k", s("key-e"))])));
+    f.put(&live0(), &format!("s:1:pid-f:{:032x}", 6), &norm(obj(vec![("p", s("pid-f"))])));
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "(it still is)");
+    let base = cp(2);
+    f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+    f.drain();
+    let told = f.m.take_ended_signers(T, INC);
+    let want: BTreeSet<_> = [pair("pid-a", "key-a"), pair("pid-b", "key-b"), pair("pid-c", "key-c"), pair("pid-d", "key-d")].into_iter().collect();
+    assert_eq!(told, (want, false));
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "told once");
+    // The next session's are its own.
+    f.skim();
+    let (k, v) = slip(2, "pid-a", 7, "key-a2");
+    f.put(&live_of(T, Some(&base)), &k, &v);
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false));
+    let base2 = cp(3);
+    f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.m.take_ended_signers(T, INC), ([pair("pid-a", "key-a2")].into_iter().collect(), false));
+}
+
+/// Two sessions ended between the asks are told together; a table the mirror does not follow tells nothing.
+#[test]
+fn the_signers_of_two_sessions_ended_between_asks_are_told_together() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &[slip(1, "pid-a", 1, "key-a")]));
+    f.drain();
+    f.skim();
+    let base = cp(2);
+    let second = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &second, &[slip(1, "pid-b", 2, "key-b")]);
+    f.drain();
+    f.skim();
+    let base2 = cp(3);
+    f.page_trim(&second, &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    let want: BTreeSet<_> = [pair("pid-a", "key-a"), pair("pid-b", "key-b")].into_iter().collect();
+    assert_eq!(f.m.take_ended_signers(T, INC), (want, false));
+    assert_eq!(f.m.take_ended_signers("no-such-table", INC), (BTreeSet::new(), false));
+}
+
+/// A session of more signers than the mirror keeps is told as that, and no one is believed of it.
+#[test]
+fn a_session_with_more_signers_than_the_mirror_keeps_says_so() {
+    let n = MAX_SIGNERS as u32 + 3;
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &(0..n).map(|i| slip(1, &format!("pid-{i}"), i, "key")).collect::<Vec<_>>()));
+    while f.drain().short {}
+    f.skim();
+    let base = cp(2);
+    f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+    f.drain();
+    let (told, over) = f.m.take_ended_signers(T, INC);
+    assert!(over, "more than the mirror keeps");
+    assert_eq!(told.len(), MAX_SIGNERS, "(and the most it keeps)");
+    // The next session starts clean.
+    f.skim();
+    let (k, v) = slip(2, "pid-x", 9, "key-x");
+    f.put(&live_of(T, Some(&base)), &k, &v);
+    f.drain();
+    f.skim();
+    let base2 = cp(3);
+    f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.m.take_ended_signers(T, INC), ([pair("pid-x", "key-x")].into_iter().collect(), false), "the count is not carried");
+}
+
+/// The sessions ended between two asks share the room the mirror keeps: more signers together than it keeps are told as that.
+#[test]
+fn the_signers_of_sessions_ended_between_asks_are_kept_to_the_most_together() {
+    let half = MAX_SIGNERS as u32 / 2 + 10;
+    let first: Vec<_> = (0..half).map(|i| slip(1, &format!("pid-a{i}"), i, "key")).collect();
+    let second: Vec<_> = (0..half).map(|i| slip(1, &format!("pid-b{i}"), i, "key")).collect();
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &first));
+    while f.drain().short {}
+    f.skim();
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &second);
+    while f.drain().short {}
+    f.skim();
+    // (Each session on its own is under what the mirror keeps.)
+    let base2 = cp(3);
+    f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+    while f.drain().short {}
+    let (told, over) = f.m.take_ended_signers(T, INC);
+    assert!(over, "the two together are more than it keeps");
+    assert_eq!(told.len(), MAX_SIGNERS);
 }

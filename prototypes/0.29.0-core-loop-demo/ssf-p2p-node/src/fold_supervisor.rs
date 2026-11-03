@@ -497,6 +497,12 @@ impl<L: Launch> Supervisor<L> {
         (self.state == State::Off).then_some("crashes")
     }
 
+    /// The fold duties go off, as too many failures make them (a test of what the shadow does then).
+    #[cfg(test)]
+    pub(crate) fn go_off(&mut self) {
+        self.state = State::Off;
+    }
+
     /// Workers started so far, and failures so far.
     pub fn counts(&self) -> (u64, u64) {
         (self.started, self.failures)
