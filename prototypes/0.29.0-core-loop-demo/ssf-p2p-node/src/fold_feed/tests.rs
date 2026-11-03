@@ -687,9 +687,63 @@ fn a_frame_that_cannot_be_sent_gives_up_on_the_table_until_it_starts_over_for_an
         rig.tick();
     }
     assert_eq!((rig.feed.counts().too_big, rig.feed.counts().cold, rig.mirror.resets()), (1, 0, resets), "not tried again");
+    assert_eq!(rig.feed.counts().forgets, 0);
+    assert!(rig.reqs().is_empty(), "the worker never held the table: it is told nothing");
     assert!(rig.feed.fold(T, INC).is_none());
     // A new checkpoint starts the table over; the pin is gone by then.
     rig.inputs = Inputs::default();
+    let base = cp(3);
+    rig.session(&live_of(T, Some(&base)), &recs(1));
+    rig.put_top(&sum_of(T), &base);
+    rig.until("tried again", |r| r.feed.fold(T, INC).is_some());
+}
+
+#[test]
+fn a_frame_that_cannot_be_sent_to_a_table_the_worker_holds_has_the_worker_let_it_go() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(1));
+    rig.until("caught up", |r| r.caught_up());
+    // The table is held; then a pin comes that no frame holds.
+    rig.inputs = Inputs::new(vec![], vec![("p".into(), "k".repeat(MAX_FRAME + 1))]);
+    rig.until("too big", |r| r.feed.counts().too_big == 1);
+    assert!(rig.feed.fold(T, INC).is_none() && !rig.caught_up(), "what the worker held is let go of here at once");
+    rig.until("let go", |r| r.feed.counts().forgets == 1);
+    let reqs = rig.reqs();
+    assert_eq!((colds(&reqs).len(), warms(&reqs).len(), forgets(&reqs)), (1, 0, 1), "a Cold, then the word, not a context left behind");
+    assert!(rig.feed.fold(T, INC).is_none() && !rig.caught_up());
+    for _ in 0..20 {
+        rig.tick();
+    }
+    assert_eq!((rig.feed.counts().too_big, rig.feed.counts().forgets, rig.feed.counts().cold), (1, 1, 1), "not tried again");
+    // A new checkpoint starts the table over (and the pin is gone): sent from the start.
+    rig.inputs = Inputs::default();
+    let base = cp(3);
+    rig.session(&live_of(T, Some(&base)), &recs(1));
+    rig.put_top(&sum_of(T), &base);
+    rig.until("tried again", |r| r.feed.fold(T, INC).is_some());
+    assert_eq!(colds(&rig.reqs()).len(), 2);
+}
+
+#[test]
+fn a_result_too_big_for_a_frame_gives_up_on_the_table_and_is_not_asked_for_again() {
+    let script = Script::default();
+    // (A summary the worker cannot put in a frame; it drops the table itself and says it is dirty.)
+    *script.text.lock().unwrap() = Some("x".repeat(MAX_FRAME + 1));
+    let mut rig = stand_rig(&script);
+    rig.session(&live0(), &recs(2));
+    rig.until("said dirty", |r| r.feed.counts().dirty == 1);
+    assert_eq!((rig.feed.counts().bad_results, rig.feed.counts().cold), (1, 1));
+    assert!(rig.feed.fold(T, INC).is_none());
+    // Well past any wait for a table that went dirty: no second Cold, and no Forget (the worker has none to drop).
+    for _ in 0..10 {
+        rig.now += std::time::Duration::from_secs(120);
+        rig.tick();
+    }
+    assert_eq!((rig.feed.counts().cold, rig.feed.counts().dirty, rig.feed.counts().forgets), (1, 1, 0), "not asked for again");
+    assert_eq!(rig.reqs().len(), 1);
+    // A table that is dirty for another reason is asked for again (the waits are the ones for dirty tables).
+    // And this one starts over for another reason (a new checkpoint): it is tried again.
+    *script.text.lock().unwrap() = None;
     let base = cp(3);
     rig.session(&live_of(T, Some(&base)), &recs(1));
     rig.put_top(&sum_of(T), &base);
@@ -722,11 +776,75 @@ fn a_forget_the_worker_is_too_busy_for_is_sent_later() {
         rig.tick();
     }
     assert_eq!(rig.feed.counts().forgets, 0);
-    assert!(rig.feed.slots.contains_key(&(T.to_string(), INC.to_string())), "kept until the worker is told");
+    let slot = &rig.feed.slots[&(T.to_string(), INC.to_string())];
+    assert!(!slot.open && slot.forget_pending, "let go of here at once, the word kept until the worker is told");
+    assert!(rig.feed.fold(T, INC).is_none() && !rig.caught_up());
     rig.sup.unclog(QUEUE_BYTES);
     rig.tick();
     assert_eq!(rig.feed.counts().forgets, 1);
     assert!(rig.feed.slots.is_empty());
+}
+
+#[test]
+fn a_table_let_go_of_while_the_worker_is_busy_is_not_built_on_when_it_comes_back() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    // The pipe is full: a change is taken and kept for later ...
+    rig.sup.clog(QUEUE_BYTES);
+    rig.put(&live0(), &rk(1, 5), val(5));
+    rig.until("the frame is kept", |r| r.feed.counts().busy >= 1);
+    // ... then a record a page may read otherwise holds the table, and the Forget has to wait ...
+    rig.put(&live0(), &rk(1, 8), proto());
+    for _ in 0..3 {
+        rig.tick();
+    }
+    assert_eq!(rig.feed.counts().forgets, 0);
+    // ... and the table is served again before the worker could be told.
+    rig.remove(&live0(), &rk(1, 8));
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("sent again", |r| colds(&r.reqs()).len() == 2 && r.caught_up());
+    let reqs = rig.reqs();
+    let kinds: Vec<&str> = reqs.iter().map(|r| match r {
+        Req::Cold(_) => "cold",
+        Req::Warm(_) => "warm",
+        Req::Forget { .. } => "forget",
+    }).collect();
+    assert_eq!(kinds, ["cold", "forget", "cold"], "told first, then sent from the start, never a Warm on what the worker may have missed");
+    assert_eq!(colds(&reqs)[1].records.len(), 3, "every record, the one whose frame was kept too");
+}
+
+#[test]
+fn a_frame_kept_for_a_table_is_not_sent_after_the_table_was_let_go_of_and_comes_back() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    // The pipe is full: a change is taken and kept for later.
+    rig.sup.clog(QUEUE_BYTES);
+    rig.put(&live0(), &rk(1, 5), val(5));
+    rig.until("the frame is kept", |r| r.feed.counts().busy >= 1);
+    // The mirror lets the table go (the Forget waits for the pipe) and takes it up again.
+    rig.mirror.want(&[]);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.want(&[(T, INC)]);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("sent again", |r| colds(&r.reqs()).len() == 2 && r.caught_up());
+    let reqs = rig.reqs();
+    let kinds: Vec<&str> = reqs.iter().map(|r| match r {
+        Req::Cold(_) => "cold",
+        Req::Warm(_) => "warm",
+        Req::Forget { .. } => "forget",
+    }).collect();
+    assert_eq!(kinds, ["cold", "forget", "cold"], "no frame from before the Forget goes after it");
+    assert_eq!(colds(&reqs)[1].records.len(), 3);
 }
 
 #[test]

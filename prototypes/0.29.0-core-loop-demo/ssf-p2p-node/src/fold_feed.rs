@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use crate::fold_supervisor::{backoff, Event, Launch, Post, State, Supervisor};
-use crate::fold_wire::{Cold, Req, Resp, Warm};
+use crate::fold_wire::{is_result_too_big, Cold, Req, Resp, Warm};
 use crate::house_bytes::{CVal, Ctx};
 use crate::house_fold::FoldSummary;
 use crate::house_mirror::RoomMirror;
@@ -94,7 +94,8 @@ pub struct Counts {
     pub busy: u64,
     /// Frames a frame cannot hold.
     pub too_big: u64,
-    /// Results the node could not use.
+    /// Results the node could not use (past what it parses, no summary, or past what the
+    /// worker could put in a frame).
     pub bad_results: u64,
 }
 
@@ -240,8 +241,16 @@ impl Feed {
             Resp::Dirty { ctx, reason, .. } => {
                 eprintln!("🧮 fold: {} of {} is dirty: {reason}", ctx.t, ctx.room);
                 slot.lose();
-                slot.dirty_streak = slot.dirty_streak.saturating_add(1);
-                slot.retry_at = Some(now + backoff(slot.dirty_streak));
+                if is_result_too_big(reason) {
+                    // The worker has dropped the table (the word is its own), and a fold of the
+                    // same records is as big again: give up on it as it stands, as for a result
+                    // the node cannot take.
+                    slot.gave_up = Some(slot.generation);
+                    self.counts.bad_results += 1;
+                } else {
+                    slot.dirty_streak = slot.dirty_streak.saturating_add(1);
+                    slot.retry_at = Some(now + backoff(slot.dirty_streak));
+                }
                 self.counts.dirty += 1;
             }
         }
@@ -395,24 +404,27 @@ fn send<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, s
         Post::TooBig(why) => {
             eprintln!("🧮 fold: {} of {}: a frame the worker cannot be sent ({why}); giving up on it as it stands", ctx.t, ctx.room);
             slot.gave_up = Some(frame.generation);
+            // (A table the worker held still holds it, as of the frames before this one.)
+            let held = slot.open;
             slot.lose();
+            slot.forget_pending |= held;
             counts.too_big += 1;
             Sent::Next
         }
     }
 }
 
-/// Tell the worker to let go of a table. One it is too busy to be told of
-/// stays as it was (open, or owing the word: [`Slot::forget_pending`]), and is
-/// told on a later tick.
+/// Tell the worker to let go of a table. The slot lets go of it here and now (what
+/// it held is no longer to be built on: a later frame is a `Cold`); one the worker is
+/// too busy to be told of owes the word ([`Slot::forget_pending`]), told on a later tick.
 fn forget<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, ctx: &Ctx, slot: &mut Slot) {
-    if !matches!(sup.post(now, &Req::Forget { ctx: ctx.clone() }), Post::Busy) {
-        slot.open = false;
-        slot.forget_pending = false;
-        counts.forgets += 1;
-    }
+    slot.open = false;
     slot.answer = None;
     slot.unsent = None;
+    slot.forget_pending = matches!(sup.post(now, &Req::Forget { ctx: ctx.clone() }), Post::Busy);
+    if !slot.forget_pending {
+        counts.forgets += 1;
+    }
 }
 
 #[cfg(test)]

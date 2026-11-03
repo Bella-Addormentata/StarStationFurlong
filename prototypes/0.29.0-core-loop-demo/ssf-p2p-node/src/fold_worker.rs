@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use crate::fold_wire::{decode_req, encode_resp, read_frame, write_frame, Cold, Req, Resp, Warm, WireError};
+use crate::fold_wire::{decode_req, encode_resp, read_frame, result_too_big, write_frame, Cold, Req, Resp, Warm, WireError};
 use crate::house_bytes::Ctx;
 use crate::house_fold::{strict_check, CheckFn, FoldEngine, FoldError};
 
@@ -238,7 +238,7 @@ pub fn serve<R: Read, W: Write, F: Folder>(r: &mut R, w: &mut W, f: &mut F) -> i
                     if let Err(p) = catch_unwind(AssertUnwindSafe(|| f.forget(&ctx))) {
                         panic_recovery(f, panic_text(p))?;
                     }
-                    let reason = format!("result of {n} bytes is too big for a frame");
+                    let reason = result_too_big(n);
                     encode_resp(&Resp::Dirty { ctx, version: resp.version(), reason })?
                 }
                 Err(e) => return Err(e.into()),
