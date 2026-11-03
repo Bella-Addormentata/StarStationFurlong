@@ -1038,7 +1038,8 @@ struct ReaderHalf<S = Stream> {
 }
 
 /// Ready once `closed` reads true: a lane's close signal ([`Readers`]).
-/// Never ready with none, or once the signal's sender is gone.
+/// Never ready with none, or once the signal's sender is gone with `closed`
+/// still false.
 async fn close_signal(closed: Option<watch::Receiver<bool>>) {
     if let Some(mut closed) = closed {
         if closed.wait_for(|closed| *closed).await.is_ok() {
