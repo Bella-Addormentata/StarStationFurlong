@@ -1796,8 +1796,10 @@ pub fn presence_status(
 /// the write left behind ([`MemoWrite`]): an unanswered push is a write all
 /// the same — its input is parked and the bundle may be in a mempool — so the
 /// caller files it as pending and lets the chain's word settle it
-/// ([`presence_step`]), as the knock and beacon writers do.
+/// ([`presence_step`]), as the knock and beacon writers do. The hint and the
+/// seal are `net`'s ([`presence_memo`]).
 pub async fn publish_node_presence(
+    net: crate::chia_network::ChiaNet,
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
     ck: &[u8; 32],
@@ -1805,6 +1807,25 @@ pub async fn publish_node_presence(
     entries: &[AddrEntry],
     now: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
+    let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now)?;
+    let write = publish_memo(chia_sk, hint, sealed, "presence").await?;
+    Ok((hint, write))
+}
+
+/// What a presence write files for `era` on `net`: the hint, `ck`'s listing
+/// hint on `net`, and the memo, the record encoded, signed (iroh key) and
+/// sealed under `ck` on `net`. Both are `net`'s (stage 4 design §3.5:
+/// mainnet's carry the network tag). It touches no chain, so chia_resolve's
+/// tests file what it gives in a mock chain and read it back on each
+/// network.
+pub fn presence_memo(
+    net: crate::chia_network::ChiaNet,
+    iroh_sk: &iroh::SecretKey,
+    ck: &[u8; 32],
+    era: u64,
+    entries: &[AddrEntry],
+    now: u64,
+) -> Result<(Bytes32, Vec<u8>)> {
     let record = PresenceV2 {
         era,
         node_id: iroh_sk.public(),
@@ -1814,10 +1835,8 @@ pub async fn publish_node_presence(
         addrs: entries.to_vec(),
     };
     let plain = chia_lane::encode_presence_v2(&record, iroh_sk)?;
-    let sealed = chia_lane::seal_v2(ck, KIND_PRESENCE, era, &plain)?;
-    let hint = Bytes32::new(chia_lane::derive_ck_hint(ck, era));
-    let write = publish_memo(chia_sk, hint, sealed, "presence").await?;
-    Ok((hint, write))
+    let sealed = chia_lane::seal_v2(net, ck, KIND_PRESENCE, era, &plain)?;
+    Ok((Bytes32::new(chia_lane::derive_ck_hint(net, ck, era)), sealed))
 }
 
 /// What an era-bound write left behind: the INPUT coin its spend consumed and
@@ -2250,8 +2269,9 @@ pub fn knock_leave(
 /// after the lease and coin lookups (#272 review round 5): its answer is the
 /// room's word at spend time, and [`Withdrawn`] writes nothing. Returns the
 /// hint and the write ([`MemoWrite`]: the input coin the knock is found again
-/// by).
+/// by). The hint and the seal are `net`'s ([`knock_hint`], [`knock_memo`]).
 pub async fn publish_knock(
+    net: crate::chia_network::ChiaNet,
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
     gate: &tokio::sync::Mutex<()>,
@@ -2261,25 +2281,19 @@ pub async fn publish_knock(
     era: u64,
     now: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
-    let lane = chia_lane::derive_lane_token(room_key);
-    let hint = Bytes32::new(chia_lane::derive_inbox_hint(&req.ck_host, &lane, era));
-    let lane_id = chia_lane::room_lane_id(&req.room);
-    let from = iroh_sk.public();
+    let hint = knock_hint(net, req, room_key, era);
     // Built and sealed once the input coin is known: its id is the parent of
     // the coin the knock rides on, and the sealing binds it (so the host opens
     // the knock under that coin alone — a copy under another never decodes,
     // #272 review round 3) and the lane token (so only a holder of the room
     // key can have written it, round 5).
-    let kx_host = req.kx_host;
     let write = publish_memo_with(
         chia_sk,
         hint,
         Some(gate),
         move |input| {
             let ck_from = leave()?;
-            let knock = KnockV2 { era, from, ck_from, issued_at: now, expires_at: now + 2 * ERA_SECS, rooms: vec![lane_id] };
-            let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
-            chia_lane::seal_to_kx(&kx_host, KIND_KNOCK, era, &input.to_bytes(), &lane, &plain)
+            knock_memo(net, iroh_sk, req, room_key, era, input, ck_from, now)
         },
         "knock",
     )
@@ -2287,15 +2301,57 @@ pub async fn publish_knock(
     Ok((hint, write))
 }
 
+/// The hint a knock for `req` is filed under in `era` on `net`: the host's
+/// inbox hint for the lane of `room_key`, on `net` (stage 4 design §3.5:
+/// mainnet's carries the network tag).
+pub fn knock_hint(net: crate::chia_network::ChiaNet, req: &KnockRequest, room_key: &[u8; 32], era: u64) -> Bytes32 {
+    let lane = chia_lane::derive_lane_token(room_key);
+    Bytes32::new(chia_lane::derive_inbox_hint(net, &req.ck_host, &lane, era))
+}
+
+/// The memo a knock for `req` carries on `net` once its input coin `input`
+/// is known: the knock naming the room's lane id and `ck_from`, signed (iroh
+/// key), and sealed to the host's card key on `net` with `input` as the
+/// carrier's parent and the room's lane token (stage 4 design §3.5). It
+/// touches no chain, so chia_resolve's tests file what it gives under
+/// [`knock_hint`] in a mock chain and read it back on each network.
+#[allow(clippy::too_many_arguments)]
+pub fn knock_memo(
+    net: crate::chia_network::ChiaNet,
+    iroh_sk: &iroh::SecretKey,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    input: Bytes32,
+    ck_from: Option<[u8; 32]>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let lane = chia_lane::derive_lane_token(room_key);
+    let rooms = vec![chia_lane::room_lane_id(&req.room)];
+    let knock = KnockV2 { era, from: iroh_sk.public(), ck_from, issued_at: now, expires_at: now + 2 * ERA_SECS, rooms };
+    let plain = chia_lane::encode_knock_v2(&knock, iroh_sk)?;
+    chia_lane::seal_to_kx(net, &req.kx_host, KIND_KNOCK, era, &input.to_bytes(), &lane, &plain)
+}
+
 /// Write this era's beacon from the beacon wallet: the node id in the clear
-/// under the era's public hint, nothing else. Returns the hint and the write
-/// ([`MemoWrite`]: the input coin the beacon is found again by).
-pub async fn publish_beacon(iroh_sk: &iroh::SecretKey, beacon_sk: &SecretKey, era: u64, now: u64) -> Result<(Bytes32, MemoWrite)> {
+/// under the era's public hint on `net`, nothing else ([`beacon_memo`]).
+/// Returns the hint and the write ([`MemoWrite`]: the input coin the beacon
+/// is found again by).
+pub async fn publish_beacon(net: crate::chia_network::ChiaNet, iroh_sk: &iroh::SecretKey, beacon_sk: &SecretKey, era: u64, now: u64) -> Result<(Bytes32, MemoWrite)> {
+    let (hint, plain) = beacon_memo(net, iroh_sk, era, now)?;
+    let write = publish_memo(beacon_sk, hint, plain, "beacon").await?;
+    Ok((hint, write))
+}
+
+/// What a beacon write files for `era` on `net`: the hint, the era's public
+/// beacon hint on `net` (stage 4 design §3.5: mainnet's carries the network
+/// tag), and the memo, the beacon signed (iroh key) and in the clear. It
+/// touches no chain, so chia_resolve's tests file what it gives in a mock
+/// chain and read it back on each network.
+pub fn beacon_memo(net: crate::chia_network::ChiaNet, iroh_sk: &iroh::SecretKey, era: u64, now: u64) -> Result<(Bytes32, Vec<u8>)> {
     let beacon = BeaconV2 { era, node_id: iroh_sk.public(), issued_at: now, expires_at: now + 2 * ERA_SECS };
     let plain = chia_lane::encode_beacon_v2(&beacon, iroh_sk)?;
-    let hint = Bytes32::new(chia_lane::derive_beacon_hint(era));
-    let write = publish_memo(beacon_sk, hint, plain.to_vec(), "beacon").await?;
-    Ok((hint, write))
+    Ok((Bytes32::new(chia_lane::derive_beacon_hint(net, era)), plain.to_vec()))
 }
 
 /// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
@@ -2547,7 +2603,9 @@ pub async fn heartbeat_loop(
                     }
                 }
             }
-            let hint_now = era_now.map(|era| hex::encode(chia_lane::derive_ck_hint(&hub.contact_key, era)));
+            // The hint this era's listing is filed under on this network
+            // (§3.5), for the mark and the Phone Book's row alike.
+            let hint_now = era_now.map(|era| hex::encode(chia_lane::derive_ck_hint(net, &hub.contact_key, era)));
             let inbound = hub.inbound_verified.lock().unwrap().clone();
             let entries = public_addr_entries(&addrs, &inbound, peak, now_unix);
             let sig = addrs_signature(&entries);
@@ -2573,7 +2631,7 @@ pub async fn heartbeat_loop(
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     node_attempt = Some(Instant::now());
-                    match publish_node_presence(&iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await {
+                    match publish_node_presence(net, &iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await {
                         Ok((hint, write)) => {
                             let writes = match &node_mark {
                                 Some(m) if m.era == era && mark_is_ours(m, era_hint, &self_id) => m.writes + 1,
@@ -2692,7 +2750,7 @@ pub async fn heartbeat_loop(
                         knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key)
                     }
                 };
-                match publish_knock(&iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
+                match publish_knock(net, &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
                     Ok((hint, write)) => {
                         let hint_hex = hex::encode(hint.to_bytes());
                         println!(
@@ -2827,7 +2885,7 @@ pub async fn heartbeat_loop(
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("beacon") {
                     beacon_attempt = Some(Instant::now());
-                    match publish_beacon(&iroh_sk, beacon_sk, era, now_unix).await {
+                    match publish_beacon(net, &iroh_sk, beacon_sk, era, now_unix).await {
                         Ok((hint, write)) => {
                             let mark = BeaconMark {
                                 era,

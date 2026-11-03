@@ -19,6 +19,8 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 
+use crate::chia_network::ChiaNet;
+
 /// A member's presence record — the plaintext that gets signed, sealed, and
 /// (in C1) published as coin-spend memos. Addresses come from the LIVE
 /// endpoint view (v0.17.0 F3 rule: hints are live data, not constants).
@@ -231,7 +233,14 @@ pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia
 // was written in; the chain is the clock:
 //
 //     era  = confirmation height / ERA_BLOCKS           (seven days of blocks)
-//     hint = blake3::derive_key("ssf-chia-ck-hint-v1", ck ‖ era_le)
+//     hint = blake3::derive_key("ssf-chia-ck-hint-v1", ck ‖ era_le)        testnet11
+//     hint = blake3::derive_key("ssf-chia-ck-hint-v1", ck ‖ era_le ‖ G)    mainnet
+//
+// G is mainnet's genesis challenge, the network tag of stage 4 design §3.5
+// ([`network_tag`]): without it the same contact key would give the same hint
+// bytes on both chains once their era numbers meet, and anyone could match a
+// node's listings across them. testnet11 has no tag, so its bytes are the ones
+// it always had.
 //
 // Readers scan the current era and the one before. A record is VALID only if
 // the block that confirmed it lies inside the era it is filed under, so a hint
@@ -239,8 +248,9 @@ pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia
 // worthless. Kind and era are SIGNED into every record (a presence record
 // cannot be re-filed as a knock, nor under another era), the layout is FIXED
 // at [`RECORD_V2_LEN`] bytes (one size class: no length leaks what a record
-// holds), and the sealed blob binds kind ‖ era as associated data. Nothing on
-// chain is keyed by a room.
+// holds), and the sealed blob binds kind ‖ era, and G on mainnet, as
+// associated data, so a blob does not open on the other network either.
+// Nothing on chain is keyed by a room.
 //
 // Three kinds share the header. The presence codec is P6a's; the knock (joiner
 // → host inbox, sealed to the host's card key) and the opt-in beacon (D7) are
@@ -288,57 +298,105 @@ pub fn era_of(height: u32) -> u64 {
     (height / ERA_BLOCKS) as u64
 }
 
-/// Lookup hint for a contact key in an era.
-pub fn derive_ck_hint(ck: &[u8; 32], era: u64) -> [u8; 32] {
-    let mut material = [0u8; 40];
-    material[..32].copy_from_slice(ck);
-    material[32..].copy_from_slice(&era.to_le_bytes());
+/// ⛓️ What a network adds to the lane's hints and associated data, and to
+/// the dish's room tag (`chia_faucet::FaucetParams::for_room`): the network
+/// tag of stage 4 design §3.5. testnet11 adds nothing, so every hint, AAD,
+/// sealed record and dish address there stays byte for byte what it was
+/// before the tag (`network_tag_tests` pins them to vectors origin/main's
+/// own code produced). Mainnet adds its genesis challenge G
+/// ([`ChiaNet::genesis`]), appended last, so the same contact key in the
+/// same era gives unrelated hints on the two chains, and a keyless observer
+/// cannot match a node's listings across them once their era numbers meet
+/// (§2, the "testnet11 and mainnet" row; §7 item 13).
+///
+/// A match on each network, never on `is_test`: a network added later has
+/// to choose its own tag here, where a test-network rule could hand it
+/// testnet11's bytes and join the two.
+///
+/// Mainnet's bytes change with no migration: mainnet has no reader of the
+/// lane yet, no lobby coin, and no SSF write (the SSF wallet pays for no
+/// memo spend off a test network, `chia_publish::money_memo_refusal`, #371),
+/// so nothing filed under the untagged bytes is left behind (§3.5, "Why
+/// now"; §14 item 7).
+pub fn network_tag(net: ChiaNet) -> Option<[u8; 32]> {
+    match net {
+        ChiaNet::Testnet11 => None,
+        ChiaNet::Mainnet => Some(ChiaNet::Mainnet.genesis()),
+    }
+}
+
+/// Append `net`'s tag ([`network_tag`]) to a hint's material or to an AAD.
+/// Every field before it is fixed width (a 32-byte key, lane token or
+/// parent, a 1-byte kind, an 8-byte era) and the tag is 32 bytes, appended
+/// last, so within one network the bytes fix every field, and across the
+/// two networks a material differs in length: no two inputs share bytes.
+fn push_network_tag(net: ChiaNet, material: &mut Vec<u8>) {
+    if let Some(g) = network_tag(net) {
+        material.extend_from_slice(&g);
+    }
+}
+
+/// Lookup hint for a contact key in an era on `net`: ck ‖ era_le, and the
+/// network's tag on mainnet (§3.5), under `ssf-chia-ck-hint-v1`.
+pub fn derive_ck_hint(net: ChiaNet, ck: &[u8; 32], era: u64) -> [u8; 32] {
+    let mut material = Vec::with_capacity(32 + 8 + 32);
+    material.extend_from_slice(ck);
+    material.extend_from_slice(&era.to_le_bytes());
+    push_network_tag(net, &mut material);
     blake3::derive_key(CTX_CK_HINT, &material)
 }
 
 /// The sealing key for a contact key: whoever holds `ck` reads the records
-/// under it, nobody else.
+/// under it, nobody else. The same on every network: the network is bound
+/// by the associated data instead ([`v2_aad`]).
 pub fn derive_ck_enc_key(ck: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(CTX_CK_ENC, ck)
 }
 
-fn v2_aad(kind: u8, era: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(V2_AAD_PREFIX.len() + 9);
+/// The associated data of a v2 blob on `net`: the record prefix, kind ‖ era,
+/// and the network's tag on mainnet (§3.5), so a blob sealed on one network
+/// does not open on the other. [`kx_aad`] extends it, so both seals bind the
+/// network.
+fn v2_aad(net: ChiaNet, kind: u8, era: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(V2_AAD_PREFIX.len() + 9 + 32);
     aad.extend_from_slice(V2_AAD_PREFIX);
     aad.push(kind);
     aad.extend_from_slice(&era.to_le_bytes());
+    push_network_tag(net, &mut aad);
     aad
 }
 
-/// The associated data of a blob sealed to a key: kind ‖ era, then the PARENT
-/// of the coin that carries it — the writer's input coin, known before the
-/// spend is built. A blob copied under another coin (anyone who saw it on
-/// chain can re-issue the same hint and memo) has another parent and does not
-/// open, so a knock cannot be replayed into a second clock or a second inbox
-/// entry (#272 review round 3). And `lane`, the room's SECRET lane token
+/// The associated data of a blob sealed to a key: [`v2_aad`] (kind ‖ era, and
+/// the network's tag on mainnet), then the PARENT of the coin that carries
+/// it — the writer's input coin, known before the spend is built. A blob
+/// copied under another coin (anyone who saw it on chain can re-issue the
+/// same hint and memo) has another parent and does not open, so a knock
+/// cannot be replayed into a second clock or a second inbox entry (#272
+/// review round 3). And `lane`, the room's SECRET lane token
 /// ([`derive_lane_token`], from the room key): the hint is public on chain and
 /// the host's card key rides in every room's pass, so without it anyone holding
 /// the host's card from another room could seal fresh knocks of its own under
 /// an observed hint; with it a knock opens only for a writer who held the room
 /// key (#272 review round 5).
 #[cfg(feature = "chia-read")]
-fn kx_aad(kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32]) -> Vec<u8> {
-    let mut aad = v2_aad(kind, era);
+fn kx_aad(net: ChiaNet, kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32]) -> Vec<u8> {
+    let mut aad = v2_aad(net, kind, era);
     aad.extend_from_slice(carrier_parent);
     aad.extend_from_slice(lane);
     aad
 }
 
-/// Seal a v2 plaintext under `ck` for `kind` in `era`:
-/// `[24B XNonce ‖ XChaCha20-Poly1305 ciphertext]`, kind ‖ era as associated data.
+/// Seal a v2 plaintext under `ck` for `kind` in `era` on `net`:
+/// `[24B XNonce ‖ XChaCha20-Poly1305 ciphertext]`, [`v2_aad`] (kind ‖ era, and
+/// the network's tag on mainnet) as associated data.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read-only build never seals
-pub fn seal_v2(ck: &[u8; 32], kind: u8, era: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn seal_v2(net: ChiaNet, ck: &[u8; 32], kind: u8, era: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     let key = derive_ck_enc_key(ck);
     let cipher = XChaCha20Poly1305::new((&key).into());
     let mut nonce = [0u8; 24];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let aad = v2_aad(kind, era);
+    let aad = v2_aad(net, kind, era);
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
         .map_err(|e| anyhow!("seal_v2 failed: {e:?}"))?;
@@ -348,19 +406,20 @@ pub fn seal_v2(ck: &[u8; 32], kind: u8, era: u64, plaintext: &[u8]) -> Result<Ve
     Ok(out)
 }
 
-/// Open a v2 blob sealed under `ck` for `kind` in `era`. Fails on a wrong key,
-/// a tampered blob, or a blob sealed for another kind or era.
-pub fn open_v2(ck: &[u8; 32], kind: u8, era: u64, sealed: &[u8]) -> Result<Vec<u8>> {
+/// Open a v2 blob sealed under `ck` for `kind` in `era` on `net`. Fails on a
+/// wrong key, a tampered blob, or a blob sealed for another kind, era or
+/// network.
+pub fn open_v2(net: ChiaNet, ck: &[u8; 32], kind: u8, era: u64, sealed: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     if sealed.len() < 24 {
         return Err(anyhow!("sealed v2 blob too short"));
     }
     let key = derive_ck_enc_key(ck);
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let aad = v2_aad(kind, era);
+    let aad = v2_aad(net, kind, era);
     cipher
         .decrypt(XNonce::from_slice(&sealed[..24]), Payload { msg: &sealed[24..], aad: &aad })
-        .map_err(|e| anyhow!("open_v2 failed (wrong contact key, kind or era?): {e:?}"))
+        .map_err(|e| anyhow!("open_v2 failed (wrong contact key, kind, era or network?): {e:?}"))
 }
 
 /// One dialable address in a presence record: public only, with its flags byte.
@@ -513,7 +572,8 @@ pub fn decode_presence_v2(bytes: &[u8], expected_era: u64) -> Result<PresenceV2>
 //
 // KNOCK — a joiner J that exhausted every dial to a host H whose contact card
 // it holds writes ONE record into H's inbox: filed under
-// `blake3("ssf-chia-inbox-hint-v1", ck_H ‖ lane ‖ era)`, where the LANE is
+// `blake3("ssf-chia-inbox-hint-v1", ck_H ‖ lane ‖ era)`, with G appended on
+// mainnet (the network tag, [`network_tag`]), where the LANE is
 // derived from the room key J and H share ([`derive_lane_token`]), so a knock
 // takes both H's card and membership of one of H's rooms; a leaked pass floods
 // that one lane, and H keeps reading its other rooms' lanes (the third
@@ -530,11 +590,14 @@ pub fn decode_presence_v2(bytes: &[u8], expected_era: u64) -> Result<PresenceV2>
 // clock they share without talking (`chia_knock::rendezvous_due`).
 //
 // BEACON — an opt-in public entry point (D7) writes one record per era, in
-// the CLEAR, under `blake3("ssf-chia-beacon-hint-v1", era)`: its node id and
-// nothing else (no address, no key), while its own inbound bit is set. A
-// newcomer with nobody to dial reads the newest beacons and dials them by node
-// id for the welcome room. Beacons spend from a wallet key of their own, so a
-// clear node id never shares coin lineage with a sealed record.
+// the CLEAR, under `blake3("ssf-chia-beacon-hint-v1", era)`, with G appended
+// on mainnet: its node id and nothing else (no address, no key), while its
+// own inbound bit is set. A newcomer with nobody to dial reads the newest
+// beacons and dials them by node id for the welcome room. Beacons spend from
+// a wallet key of their own, so a clear node id never shares coin lineage
+// with a sealed record. The tag gives each network its own beacon hint; the
+// node id in the clear is the same on any chain a node beacons on (stage 4
+// design §7 item 13).
 
 const CTX_INBOX_LANE: &str = "ssf-chia-inbox-lane-v1";
 const CTX_INBOX_HINT: &str = "ssf-chia-inbox-hint-v1";
@@ -552,19 +615,26 @@ pub fn derive_lane_token(room_key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(CTX_INBOX_LANE, room_key)
 }
 
-/// A host's inbox hint for one lane in one era.
-pub fn derive_inbox_hint(ck_host: &[u8; 32], lane: &[u8; 32], era: u64) -> [u8; 32] {
-    let mut material = [0u8; 72];
-    material[..32].copy_from_slice(ck_host);
-    material[32..64].copy_from_slice(lane);
-    material[64..].copy_from_slice(&era.to_le_bytes());
+/// A host's inbox hint for one lane in one era on `net`: ck_host ‖ lane ‖
+/// era_le, and the network's tag on mainnet (§3.5), under
+/// `ssf-chia-inbox-hint-v1`.
+pub fn derive_inbox_hint(net: ChiaNet, ck_host: &[u8; 32], lane: &[u8; 32], era: u64) -> [u8; 32] {
+    let mut material = Vec::with_capacity(32 + 32 + 8 + 32);
+    material.extend_from_slice(ck_host);
+    material.extend_from_slice(lane);
+    material.extend_from_slice(&era.to_le_bytes());
+    push_network_tag(net, &mut material);
     blake3::derive_key(CTX_INBOX_HINT, &material)
 }
 
-/// The public beacon hint of an era: derivable by anyone, so it is only ever
-/// read additively behind a pass's own hints.
-pub fn derive_beacon_hint(era: u64) -> [u8; 32] {
-    blake3::derive_key(CTX_BEACON_HINT, &era.to_le_bytes())
+/// The public beacon hint of an era on `net`: era_le, and the network's tag
+/// on mainnet (§3.5), under `ssf-chia-beacon-hint-v1`. Derivable by anyone,
+/// so it is only ever read additively behind a pass's own hints.
+pub fn derive_beacon_hint(net: ChiaNet, era: u64) -> [u8; 32] {
+    let mut material = Vec::with_capacity(8 + 32);
+    material.extend_from_slice(&era.to_le_bytes());
+    push_network_tag(net, &mut material);
+    blake3::derive_key(CTX_BEACON_HINT, &material)
 }
 
 /// How a knock names a room without writing its id: a keyed hash, truncated.
@@ -735,16 +805,24 @@ pub const KX_SEAL_OVERHEAD: usize = 32 + 24 + 16;
 /// Seal `plaintext` to the holder of the X25519 secret behind `recipient_pk`
 /// (a host's card key): an ephemeral X25519 key agrees a shared secret, the
 /// XChaCha20-Poly1305 key is derived from it together with both public keys,
-/// and kind ‖ era ‖ `carrier_parent` ‖ `lane` bind as associated data
-/// ([`kx_aad`]: the parent of the coin the blob will ride on, so a copy under
-/// another coin never opens, and the room's secret lane token, so only a holder
-/// of the room key can have written it). Blob: `[32B ephemeral pk ‖ 24B nonce ‖
+/// and kind ‖ era (with `net`'s tag on mainnet) ‖ `carrier_parent` ‖ `lane`
+/// bind as associated data ([`kx_aad`]: the parent of the coin the blob will
+/// ride on, so a copy under another coin never opens, and the room's secret
+/// lane token, so only a holder of the room key can have written it). Blob: `[32B ephemeral pk ‖ 24B nonce ‖
 /// ciphertext]`. Every holder of the host's contact key can find the hint this
 /// lands under; only the host opens it, only under the coin it was written by,
-/// and only for the room whose lane it was sealed with.
+/// only for the room whose lane it was sealed with, and only on its network.
 #[cfg(feature = "chia-read")]
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn seal_to_kx(
+    net: ChiaNet,
+    recipient_pk: &[u8; 32],
+    kind: u8,
+    era: u64,
+    carrier_parent: &[u8; 32],
+    lane: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     let mut e_sk = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e_sk);
@@ -753,7 +831,7 @@ pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &
     let cipher = XChaCha20Poly1305::new((&key).into());
     let mut nonce = [0u8; 24];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let aad = kx_aad(kind, era, carrier_parent, lane);
+    let aad = kx_aad(net, kind, era, carrier_parent, lane);
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: &aad })
         .map_err(|e| anyhow!("seal_to_kx failed: {e:?}"))?;
@@ -765,13 +843,21 @@ pub fn seal_to_kx(recipient_pk: &[u8; 32], kind: u8, era: u64, carrier_parent: &
 }
 
 /// Open a blob [`seal_to_kx`] made for the holder of `recipient_sk`, for
-/// `kind` in `era`, read from a coin whose parent is `carrier_parent`, for the
-/// room whose secret lane token is `lane`. Fails on another recipient, a
-/// tampered blob, or a blob sealed for another kind, era, carrier (a copy under
-/// a new coin, #272 review round 3) or lane (a writer without the room key,
-/// round 5).
+/// `kind` in `era` on `net`, read from a coin whose parent is `carrier_parent`,
+/// for the room whose secret lane token is `lane`. Fails on another recipient,
+/// a tampered blob, or a blob sealed for another kind, era, carrier (a copy
+/// under a new coin, #272 review round 3), lane (a writer without the room key,
+/// round 5) or network (§3.5).
 #[cfg(feature = "chia-read")]
-pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent: &[u8; 32], lane: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+pub fn open_with_kx(
+    net: ChiaNet,
+    recipient_sk: &[u8; 32],
+    kind: u8,
+    era: u64,
+    carrier_parent: &[u8; 32],
+    lane: &[u8; 32],
+    sealed: &[u8],
+) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Payload;
     if sealed.len() < KX_SEAL_OVERHEAD {
         return Err(anyhow!("sealed-to-key blob too short"));
@@ -780,10 +866,10 @@ pub fn open_with_kx(recipient_sk: &[u8; 32], kind: u8, era: u64, carrier_parent:
     let recipient_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(*recipient_sk).to_bytes();
     let key = kx_seal_key(&kx_shared(recipient_sk, &e_pk)?, &e_pk, &recipient_pk);
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let aad = kx_aad(kind, era, carrier_parent, lane);
+    let aad = kx_aad(net, kind, era, carrier_parent, lane);
     cipher
         .decrypt(XNonce::from_slice(&sealed[32..56]), Payload { msg: &sealed[56..], aad: &aad })
-        .map_err(|e| anyhow!("open_with_kx failed (not sealed to this key, kind, era, carrier coin or room lane?): {e:?}"))
+        .map_err(|e| anyhow!("open_with_kx failed (not sealed to this key, kind, era, carrier coin, room lane or network?): {e:?}"))
 }
 
 /// X25519: our secret × their public point. An all-zero result (their point
@@ -889,6 +975,9 @@ mod p6b_tests {
         assert!(encode_beacon_v2(&b, &iroh::SecretKey::generate()).is_err());
     }
 
+    /// On each network: the knock's seal opens for its recipient alone, under
+    /// its own kind, era, carrier coin, lane and network (the network's
+    /// half is `network_tag_tests::a_blob_sealed_on_one_network_opens_on_that_network_alone`).
     #[test]
     #[cfg(feature = "chia-read")]
     fn sealed_to_key_opens_for_the_recipient_alone() {
@@ -897,31 +986,35 @@ mod p6b_tests {
         let plain = [0x42u8; RECORD_V2_LEN];
         let carrier = [5u8; 32]; // the writer's input coin: the parent of the coin the blob rides on
         let lane = derive_lane_token(&[3u8; 32]); // the room's secret lane token
-        let blob = seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap();
-        assert_eq!(blob.len(), RECORD_V2_LEN + KX_SEAL_OVERHEAD);
-        assert_eq!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob).unwrap(), plain.to_vec());
-        assert!(open_with_kx(&[12u8; 32], KIND_KNOCK, 7, &carrier, &lane, &blob).is_err(), "another key");
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 8, &carrier, &lane, &blob).is_err(), "another era");
-        assert!(open_with_kx(&host_sk, KIND_BEACON, 7, &carrier, &lane, &blob).is_err(), "another kind");
-        let mut tampered = blob.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &tampered).is_err());
-        let mut readdressed = blob.clone();
-        readdressed[0] ^= 1;
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &readdressed).is_err(), "the ephemeral key is bound in");
-        assert!(
-            open_with_kx(&host_sk, KIND_KNOCK, 7, &[6u8; 32], &lane, &blob).is_err(),
-            "another carrier: the same blob copied under a coin with another parent does not open (#272 review round 3)"
-        );
-        assert!(
-            open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &derive_lane_token(&[4u8; 32]), &blob).is_err(),
-            "another room's lane: a blob sealed without this room's key does not open (#272 review round 5)"
-        );
-        assert_ne!(seal_to_kx(&host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap(), blob, "fresh key and nonce every time");
-        assert!(open_with_kx(&host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob[..KX_SEAL_OVERHEAD - 1]).is_err(), "too short");
-        assert!(seal_to_kx(&[0u8; 32], KIND_KNOCK, 7, &carrier, &lane, &plain).is_err(), "a low-order recipient point is refused");
+        for net in ChiaNet::ALL {
+            let blob = seal_to_kx(net, &host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap();
+            assert_eq!(blob.len(), RECORD_V2_LEN + KX_SEAL_OVERHEAD, "{net:?}: the tag is bound, never carried");
+            assert_eq!(open_with_kx(net, &host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob).unwrap(), plain.to_vec(), "{net:?}");
+            assert!(open_with_kx(net, &[12u8; 32], KIND_KNOCK, 7, &carrier, &lane, &blob).is_err(), "{net:?}: another key");
+            assert!(open_with_kx(net, &host_sk, KIND_KNOCK, 8, &carrier, &lane, &blob).is_err(), "{net:?}: another era");
+            assert!(open_with_kx(net, &host_sk, KIND_BEACON, 7, &carrier, &lane, &blob).is_err(), "{net:?}: another kind");
+            let mut tampered = blob.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(open_with_kx(net, &host_sk, KIND_KNOCK, 7, &carrier, &lane, &tampered).is_err(), "{net:?}");
+            let mut readdressed = blob.clone();
+            readdressed[0] ^= 1;
+            assert!(open_with_kx(net, &host_sk, KIND_KNOCK, 7, &carrier, &lane, &readdressed).is_err(), "{net:?}: the ephemeral key is bound in");
+            assert!(
+                open_with_kx(net, &host_sk, KIND_KNOCK, 7, &[6u8; 32], &lane, &blob).is_err(),
+                "{net:?}: another carrier: the same blob copied under a coin with another parent does not open (#272 review round 3)"
+            );
+            assert!(
+                open_with_kx(net, &host_sk, KIND_KNOCK, 7, &carrier, &derive_lane_token(&[4u8; 32]), &blob).is_err(),
+                "{net:?}: another room's lane: a blob sealed without this room's key does not open (#272 review round 5)"
+            );
+            assert_ne!(seal_to_kx(net, &host_pk, KIND_KNOCK, 7, &carrier, &lane, &plain).unwrap(), blob, "{net:?}: fresh key and nonce every time");
+            assert!(open_with_kx(net, &host_sk, KIND_KNOCK, 7, &carrier, &lane, &blob[..KX_SEAL_OVERHEAD - 1]).is_err(), "{net:?}: too short");
+            assert!(seal_to_kx(net, &[0u8; 32], KIND_KNOCK, 7, &carrier, &lane, &plain).is_err(), "{net:?}: a low-order recipient point is refused");
+        }
     }
 
+    /// On each network: an inbox hint is its host's, its room's and its era's
+    /// own, and never a presence hint of the same network.
     #[test]
     fn inbox_lane_and_hints_separate_rooms_hosts_and_eras() {
         let ck_a = [1u8; 32];
@@ -930,13 +1023,15 @@ mod p6b_tests {
         let lane_y = derive_lane_token(&[4u8; 32]);
         assert_ne!(lane_x, lane_y);
         assert_ne!(lane_x, [3u8; 32], "a lane is not the room key");
-        let h = derive_inbox_hint(&ck_a, &lane_x, 7);
-        assert_ne!(h, derive_inbox_hint(&ck_b, &lane_x, 7), "another host");
-        assert_ne!(h, derive_inbox_hint(&ck_a, &lane_y, 7), "another room");
-        assert_ne!(h, derive_inbox_hint(&ck_a, &lane_x, 8), "another era");
-        assert_ne!(h, derive_ck_hint(&ck_a, 7), "never the presence hint");
-        assert_eq!(h, derive_inbox_hint(&ck_a, &lane_x, 7), "deterministic");
-        assert_ne!(derive_beacon_hint(7), derive_beacon_hint(8));
+        for net in ChiaNet::ALL {
+            let h = derive_inbox_hint(net, &ck_a, &lane_x, 7);
+            assert_ne!(h, derive_inbox_hint(net, &ck_b, &lane_x, 7), "{net:?}: another host");
+            assert_ne!(h, derive_inbox_hint(net, &ck_a, &lane_y, 7), "{net:?}: another room");
+            assert_ne!(h, derive_inbox_hint(net, &ck_a, &lane_x, 8), "{net:?}: another era");
+            assert_ne!(h, derive_ck_hint(net, &ck_a, 7), "{net:?}: never the presence hint");
+            assert_eq!(h, derive_inbox_hint(net, &ck_a, &lane_x, 7), "{net:?}: deterministic");
+            assert_ne!(derive_beacon_hint(net, 7), derive_beacon_hint(net, 8), "{net:?}");
+        }
         assert_eq!(room_lane_id("lobby"), room_lane_id("lobby"));
         assert_ne!(room_lane_id("lobby"), room_lane_id("lobbz"));
     }
@@ -1085,9 +1180,14 @@ mod tests {
         let plain = encode_presence_v2(&record, &secret).unwrap();
         assert_eq!(plain.len(), RECORD_V2_LEN);
         assert_eq!(OFF_RESERVED, 251, "layout: 8 slots of 20 bytes after the 91-byte header");
-        let sealed = seal_v2(&ck, KIND_PRESENCE, 42, &plain).unwrap();
-        assert_eq!(sealed.len(), 24 + RECORD_V2_LEN + 16, "one size class on chain: nonce + body + tag");
-        let opened = open_v2(&ck, KIND_PRESENCE, 42, &sealed).unwrap();
+        for net in ChiaNet::ALL {
+            let sealed = seal_v2(net, &ck, KIND_PRESENCE, 42, &plain).unwrap();
+            assert_eq!(sealed.len(), 24 + RECORD_V2_LEN + 16, "{net:?}: one size class on chain: nonce + body + tag");
+            let opened = open_v2(net, &ck, KIND_PRESENCE, 42, &sealed).unwrap();
+            assert_eq!(opened, plain.to_vec(), "{net:?}");
+        }
+        let sealed = seal_v2(ChiaNet::Testnet11, &ck, KIND_PRESENCE, 42, &plain).unwrap();
+        let opened = open_v2(ChiaNet::Testnet11, &ck, KIND_PRESENCE, 42, &sealed).unwrap();
         let decoded = decode_presence_v2(&opened, 42).unwrap();
         assert_eq!(decoded, record);
         assert!(decoded.addrs[0].addr.is_ipv6(), "canonical order puts IPv6 first");
@@ -1108,10 +1208,14 @@ mod tests {
         let secret = iroh::SecretKey::generate();
         let ck = [5u8; 32];
         let plain = encode_presence_v2(&v2_record(&secret, 42), &secret).unwrap();
-        let sealed = seal_v2(&ck, KIND_PRESENCE, 42, &plain).unwrap();
-        assert!(open_v2(&ck, KIND_PRESENCE, 43, &sealed).is_err(), "replayed under the next era's hint: refused");
-        assert!(open_v2(&ck, KIND_KNOCK, 42, &sealed).is_err(), "re-filed as a knock: refused");
-        assert!(open_v2(&[6u8; 32], KIND_PRESENCE, 42, &sealed).is_err(), "another contact key: refused");
+        for net in ChiaNet::ALL {
+            let sealed = seal_v2(net, &ck, KIND_PRESENCE, 42, &plain).unwrap();
+            assert!(open_v2(net, &ck, KIND_PRESENCE, 43, &sealed).is_err(), "{net:?}: replayed under the next era's hint: refused");
+            assert!(open_v2(net, &ck, KIND_KNOCK, 42, &sealed).is_err(), "{net:?}: re-filed as a knock: refused");
+            assert!(open_v2(net, &[6u8; 32], KIND_PRESENCE, 42, &sealed).is_err(), "{net:?}: another contact key: refused");
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            assert!(open_v2(other, &ck, KIND_PRESENCE, 42, &sealed).is_err(), "{net:?}: read on {other:?}: refused");
+        }
         assert!(decode_presence_v2(&plain, 43).is_err(), "the plaintext era is checked too");
         let mut forged = plain;
         forged[OFF_ERA] ^= 1;
@@ -1157,10 +1261,12 @@ mod tests {
         assert_eq!(era_of(10 * ERA_BLOCKS + 5), 10);
         let ck_a = [1u8; 32];
         let ck_b = [2u8; 32];
-        assert_ne!(derive_ck_hint(&ck_a, 100), derive_ck_hint(&ck_a, 101));
-        assert_ne!(derive_ck_hint(&ck_a, 100), derive_ck_hint(&ck_b, 100));
-        assert_eq!(derive_ck_hint(&ck_a, 100), derive_ck_hint(&ck_a, 100));
-        assert_ne!(derive_ck_hint(&ck_a, 100), derive_hint(&ck_a, 100), "v2 hints never collide with v1 room hints");
+        for net in ChiaNet::ALL {
+            assert_ne!(derive_ck_hint(net, &ck_a, 100), derive_ck_hint(net, &ck_a, 101), "{net:?}");
+            assert_ne!(derive_ck_hint(net, &ck_a, 100), derive_ck_hint(net, &ck_b, 100), "{net:?}");
+            assert_eq!(derive_ck_hint(net, &ck_a, 100), derive_ck_hint(net, &ck_a, 100), "{net:?}");
+            assert_ne!(derive_ck_hint(net, &ck_a, 100), derive_hint(&ck_a, 100), "{net:?}: v2 hints never collide with v1 room hints");
+        }
         assert_ne!(derive_ck_enc_key(&ck_a), derive_enc_key(&ck_a), "nor the sealing keys");
     }
 
@@ -1176,5 +1282,332 @@ mod tests {
         sort_addr_entries(&mut entries);
         let shown: Vec<String> = entries.iter().map(|e| e.addr.to_string()).collect();
         assert_eq!(shown, vec!["[2001:db8::1]:9", "[2001:db8::2]:1", "198.51.100.9:1", "198.51.100.9:2"]);
+    }
+}
+
+/// ⛓️ The network tag (stage 4 design §3.5; §12, "Network tag"): testnet11's
+/// hints, associated data and sealed records are the bytes origin/main made,
+/// mainnet's carry its genesis challenge, and a blob sealed on one network
+/// opens on that network alone. Pure: every test names its network or runs
+/// over `ChiaNet::ALL`, and none reads the environment.
+#[cfg(test)]
+mod network_tag_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The fixed public test inputs the vectors are taken at, nobody's keys:
+    /// a contact key, a host's contact key, a room key (whose lane token the
+    /// inbox hint and the knock's seal take), the parent of a carrier coin,
+    /// and two eras: 0, and 2,917, whose little-endian bytes differ from its
+    /// big-endian ones, so an era written in the other order fails a row.
+    const CK: [u8; 32] = [0x11; 32];
+    const CK_HOST: [u8; 32] = [0x22; 32];
+    const ROOM_KEY: [u8; 32] = [0x33; 32];
+    const PARENT: [u8; 32] = [0x44; 32];
+    const ERAS: [u64; 2] = [0, 2_917];
+    const KINDS: [u8; 3] = [KIND_PRESENCE, KIND_KNOCK, KIND_BEACON];
+    /// Mainnet's genesis challenge, as chia_network.rs pins it against the
+    /// consensus constants: G, written out so the AAD rows below are
+    /// literals end to end.
+    const MAINNET_G_HEX: &str = "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb";
+
+    fn lane() -> [u8; 32] {
+        derive_lane_token(&ROOM_KEY)
+    }
+
+    /// One network's hints at [`ERAS`]: the listing hint of `CK`, the inbox
+    /// hint of `CK_HOST` for `ROOM_KEY`'s lane, and the beacon hint.
+    struct Hints {
+        net: ChiaNet,
+        ck: [&'static str; 2],
+        inbox: [&'static str; 2],
+        beacon: [&'static str; 2],
+    }
+
+    /// testnet11's row was printed by origin/main's own code (247bc685, the
+    /// tree before the tag) from the inputs above, by a test that was then
+    /// removed, and copied here: it pins that the tag changed no testnet11
+    /// hint. Mainnet's row was printed by this file's code once the tag came
+    /// in, from the same inputs, and pins mainnet's bytes from here on; that
+    /// they are G appended to testnet11's material is checked from the parts
+    /// in `every_material_and_aad_is_the_designs_with_g_appended_on_mainnet_alone`.
+    const HINTS: [Hints; 2] = [
+        Hints {
+            net: ChiaNet::Testnet11,
+            ck: [
+                "b9fa257280923f7d663097ff3319a04237eb76e0a413bc9e125f9edaef2d756b",
+                "cca80e5c8202aa539beff719941e7bcd72f5ea12ba0613dc8bc1bdf0ff5e1e37",
+            ],
+            inbox: [
+                "3a3d6c8a97d2d7b9d4d5a7759d05704d890df8be1dfd39b2d6ce41289d800dc7",
+                "ff81776361adc62a5526c9b3060c8b30ce5b08152d44ad37d744d1292154ee83",
+            ],
+            beacon: [
+                "97052f887e08732ed000b3d153b6f4d66693c832c03de85849bf6f62fe1f05e0",
+                "488ca45f8625d6e4c8cf7799c7c38db52809f56049be004ca49ffac6e0796f11",
+            ],
+        },
+        Hints {
+            net: ChiaNet::Mainnet,
+            ck: [
+                "c683258f0dd065b86c73877be9636687dd32453657b676afdf94220e1aaa434e",
+                "07910dcce4eade3b761983c151a2b558cb9981c7fdb82146d86e3db5362cce0a",
+            ],
+            inbox: [
+                "bbf0a46d2063df8aa9e23e8e04705be0cbfc641b9d3c71c72fa55a25e6e8a51a",
+                "d167c1a12dda25f87350c64b573bc6b1423afa4fd4a175c0981bb2759b7c63e6",
+            ],
+            beacon: [
+                "d72c8f91b0fc04621042d80493d8956df57479742bf95f331f6f433dd682ee51",
+                "6ca76f688aaf2b8d8e630ca14e1ac95c375376ad7323e25141ce91ed1fcc613e",
+            ],
+        },
+    ];
+
+    /// testnet11's `v2_aad` for each kind (presence, knock, beacon) at each of
+    /// [`ERAS`], printed by origin/main's own code (247bc685) as `HINTS`'s
+    /// testnet11 row was: the record prefix, the kind and the era, no tag.
+    const TESTNET11_V2_AAD: [[&str; 3]; 2] = [
+        [
+            "7373662d636869612d7265636f72642d7632010000000000000000",
+            "7373662d636869612d7265636f72642d7632020000000000000000",
+            "7373662d636869612d7265636f72642d7632030000000000000000",
+        ],
+        [
+            "7373662d636869612d7265636f72642d763201650b000000000000",
+            "7373662d636869612d7265636f72642d763202650b000000000000",
+            "7373662d636869612d7265636f72642d763203650b000000000000",
+        ],
+    ];
+
+    /// testnet11's `kx_aad` for `KIND_KNOCK` at each of [`ERAS`], with
+    /// `PARENT` and `ROOM_KEY`'s lane, printed by origin/main's own code
+    /// (247bc685): its `v2_aad`, then the parent, then the lane. The other two
+    /// kinds' rows that run printed differ only in the kind byte, which
+    /// `TESTNET11_V2_AAD` pins, and are checked through it below.
+    #[cfg(feature = "chia-read")]
+    const TESTNET11_KX_AAD_KNOCK: [&str; 2] = [
+        "7373662d636869612d7265636f72642d763202000000000000000044444444444444444444444444444444444444444444444444444444444444448ed62acafecb71900f604a7d4a9e33cfabbe0e895442851c1e4ee61881c47c0d",
+        "7373662d636869612d7265636f72642d763202650b00000000000044444444444444444444444444444444444444444444444444444444444444448ed62acafecb71900f604a7d4a9e33cfabbe0e895442851c1e4ee61881c47c0d",
+    ];
+
+    /// A record origin/main's own code sealed (247bc685): `[0x66; 32]` sealed
+    /// under `CK` for `KIND_PRESENCE` in era 2,917, nonce and all, by the same
+    /// removed test. A testnet11 reader with the tag still opens it, which is
+    /// what "the sealed records stay byte for byte" means for a reader: every
+    /// testnet11 record already on chain still reads.
+    const TESTNET11_SEALED_V2: &str = "58a1eadea7e1b1650b579f75046964b3b94722db4d3d4c109dee5a7493f2292ad9f63135b206939c40fdd4fc499988a802f1a8604e9c9fb581c05c0f0ba9660e631b59b1c0564c80";
+    /// The X25519 secret the knock below was sealed to (its public key is the
+    /// host card key `mul_base_clamped([0x77; 32])`): test bytes, nobody's.
+    #[cfg(feature = "chia-read")]
+    const KX_HOST_SK: [u8; 32] = [0x77; 32];
+    /// A knock origin/main's own code sealed (247bc685): `[0x66; 32]` sealed to
+    /// `KX_HOST_SK`'s public key for `KIND_KNOCK` in era 2,917, carried under
+    /// `PARENT`, for `ROOM_KEY`'s lane, ephemeral key and nonce and all.
+    #[cfg(feature = "chia-read")]
+    const TESTNET11_SEALED_KX: &str = "d92a8c1975c0677fe84316f63c722e0c4dcfc91201a8349bfd3bad513aaa1131035a1f98969c870475d0c5269517a110ba031de53f747cb431f151813ba7c1d25fa4c6a6b899d0b19d9675aa54a73a5f5fc4e2e804250aa8b520c08b4215f9aa9947db06e2a980bc";
+    const SEALED_PLAIN: [u8; 32] = [0x66; 32];
+
+    /// The tag is a match on each network: nothing on testnet11, mainnet's
+    /// genesis challenge on mainnet. The match here is exhaustive too, so a
+    /// network added later fails to compile this test until its tag is
+    /// chosen and pinned.
+    #[test]
+    fn the_network_tag_is_nothing_on_testnet11_and_the_genesis_on_mainnet() {
+        for net in ChiaNet::ALL {
+            match net {
+                ChiaNet::Testnet11 => assert_eq!(network_tag(net), None),
+                ChiaNet::Mainnet => {
+                    assert_eq!(network_tag(net), Some(net.genesis()));
+                    assert_eq!(hex::encode(network_tag(net).unwrap()), MAINNET_G_HEX);
+                }
+            }
+        }
+        assert_ne!(network_tag(ChiaNet::Mainnet), Some(ChiaNet::Testnet11.genesis()), "never the other network's genesis");
+    }
+
+    /// §12 Network tag: testnet11's hints are origin/main's bytes, and
+    /// mainnet's are its own pinned bytes (see [`HINTS`] for where each row
+    /// came from).
+    #[test]
+    fn each_networks_hints_match_the_pinned_vectors() {
+        assert_eq!(HINTS.map(|h| h.net), ChiaNet::ALL, "one row per network");
+        assert_eq!(hex::encode(lane()), "8ed62acafecb71900f604a7d4a9e33cfabbe0e895442851c1e4ee61881c47c0d", "the lane token, as origin/main made it");
+        for h in &HINTS {
+            for (i, era) in ERAS.into_iter().enumerate() {
+                assert_eq!(hex::encode(derive_ck_hint(h.net, &CK, era)), h.ck[i], "{:?}: listing hint, era {era}", h.net);
+                assert_eq!(hex::encode(derive_inbox_hint(h.net, &CK_HOST, &lane(), era)), h.inbox[i], "{:?}: inbox hint, era {era}", h.net);
+                assert_eq!(hex::encode(derive_beacon_hint(h.net, era)), h.beacon[i], "{:?}: beacon hint, era {era}", h.net);
+            }
+        }
+    }
+
+    /// §12 Network tag: testnet11's associated data is origin/main's bytes
+    /// for every kind and era, and mainnet's is those bytes with G appended
+    /// (the kx AAD: testnet11's `v2_aad`, then G, then the parent and the
+    /// lane), all from literals.
+    #[test]
+    fn each_networks_aads_match_the_pinned_vectors() {
+        for (i, era) in ERAS.into_iter().enumerate() {
+            for (k, kind) in KINDS.into_iter().enumerate() {
+                let t11 = TESTNET11_V2_AAD[i][k];
+                assert_eq!(hex::encode(v2_aad(ChiaNet::Testnet11, kind, era)), t11, "testnet11: kind {kind}, era {era}");
+                assert_eq!(hex::encode(v2_aad(ChiaNet::Mainnet, kind, era)), format!("{t11}{MAINNET_G_HEX}"), "mainnet: kind {kind}, era {era}");
+                #[cfg(feature = "chia-read")]
+                {
+                    let tail = format!("{}{}", hex::encode(PARENT), hex::encode(lane()));
+                    if kind == KIND_KNOCK {
+                        assert_eq!(format!("{t11}{tail}"), TESTNET11_KX_AAD_KNOCK[i], "the pinned knock row is the v2 row, the parent and the lane");
+                    }
+                    assert_eq!(hex::encode(kx_aad(ChiaNet::Testnet11, kind, era, &PARENT, &lane())), format!("{t11}{tail}"), "testnet11 kx: kind {kind}, era {era}");
+                    assert_eq!(
+                        hex::encode(kx_aad(ChiaNet::Mainnet, kind, era, &PARENT, &lane())),
+                        format!("{t11}{MAINNET_G_HEX}{tail}"),
+                        "mainnet kx: kind {kind}, era {era}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// §3.5 recomputed from its parts, with blake3's incremental hasher and
+    /// the contexts as the design and the code name them, not this file's
+    /// constants or buffers: each hint's material is its fixed-width fields,
+    /// with G appended on mainnet alone, and the v2 AAD is the prefix, the
+    /// kind and the era, G appended on mainnet alone. The tag here is a
+    /// match of this test's own, so a slip in `network_tag` or in one
+    /// derivation's call to it fails here as well as against the vectors.
+    #[test]
+    fn every_material_and_aad_is_the_designs_with_g_appended_on_mainnet_alone() {
+        let derive = |context: &str, parts: &[&[u8]]| -> [u8; 32] {
+            let mut h = blake3::Hasher::new_derive_key(context);
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize().into()
+        };
+        let g = ChiaNet::Mainnet.genesis();
+        for net in ChiaNet::ALL {
+            let tag: &[u8] = match net {
+                ChiaNet::Testnet11 => &[],
+                ChiaNet::Mainnet => &g,
+            };
+            for era in [0u64, 1, 2_917, 1 << 40, u64::MAX] {
+                let e = era.to_le_bytes();
+                for ck in [CK, [0x12; 32], [0u8; 32]] {
+                    assert_eq!(derive_ck_hint(net, &ck, era), derive("ssf-chia-ck-hint-v1", &[&ck, &e, tag]), "{net:?}: listing hint, era {era}");
+                }
+                for room in [ROOM_KEY, [0x34; 32]] {
+                    let lane = derive_lane_token(&room);
+                    assert_eq!(
+                        derive_inbox_hint(net, &CK_HOST, &lane, era),
+                        derive("ssf-chia-inbox-hint-v1", &[&CK_HOST, &lane, &e, tag]),
+                        "{net:?}: inbox hint, era {era}"
+                    );
+                }
+                assert_eq!(derive_beacon_hint(net, era), derive("ssf-chia-beacon-hint-v1", &[&e, tag]), "{net:?}: beacon hint, era {era}");
+                for kind in KINDS {
+                    let want = [b"ssf-chia-record-v2".as_slice(), &[kind], &e, tag].concat();
+                    assert_eq!(v2_aad(net, kind, era), want, "{net:?}: v2 AAD, kind {kind}, era {era}");
+                    #[cfg(feature = "chia-read")]
+                    assert_eq!(kx_aad(net, kind, era, &PARENT, &lane()), [want.as_slice(), &PARENT, &lane()].concat(), "{net:?}: kx AAD, kind {kind}, era {era}");
+                }
+            }
+        }
+    }
+
+    /// §12 Network tag, "mainnet different": over a small grid of contact
+    /// keys, hosts, rooms and eras, no hint of either network is any other
+    /// hint of either network, nor a v1 room hint of the same bytes. So
+    /// mainnet differs from testnet11 for every derivation and input here,
+    /// and on each network the hints still differ per contact key, host,
+    /// room and era, an inbox hint is never a listing hint, and v2 hints
+    /// never collide with v1's. The associated data differs per network
+    /// for every kind and era too.
+    #[test]
+    fn no_hint_of_one_network_is_a_hint_of_the_other_or_of_its_own_other_inputs() {
+        let eras = [0u64, 1, 2_917, u64::MAX];
+        let cks = [CK, [0x12; 32], [0u8; 32]];
+        let mut seen: HashMap<[u8; 32], String> = HashMap::new();
+        let mut add = |hint: [u8; 32], name: String| {
+            if let Some(before) = seen.insert(hint, name.clone()) {
+                panic!("{name} and {before} share a hint");
+            }
+        };
+        for net in ChiaNet::ALL {
+            for era in eras {
+                for ck in cks {
+                    add(derive_ck_hint(net, &ck, era), format!("{net:?} listing(ck {:02x}, era {era})", ck[0]));
+                }
+                for host in [CK_HOST, CK] {
+                    for room in [ROOM_KEY, [0x34; 32]] {
+                        let name = format!("{net:?} inbox(host {:02x}, room {:02x}, era {era})", host[0], room[0]);
+                        add(derive_inbox_hint(net, &host, &derive_lane_token(&room), era), name);
+                    }
+                }
+                add(derive_beacon_hint(net, era), format!("{net:?} beacon(era {era})"));
+            }
+        }
+        for era in eras {
+            for ck in cks {
+                add(derive_hint(&ck, era), format!("v1 room hint(key {:02x}, epoch {era})", ck[0]));
+            }
+        }
+        assert_eq!(seen.len(), 2 * eras.len() * (3 + 4 + 1) + eras.len() * 3, "every hint of the grid is its own");
+        for era in eras {
+            for kind in KINDS {
+                assert_ne!(v2_aad(ChiaNet::Testnet11, kind, era), v2_aad(ChiaNet::Mainnet, kind, era), "kind {kind}, era {era}");
+                #[cfg(feature = "chia-read")]
+                assert_ne!(
+                    kx_aad(ChiaNet::Testnet11, kind, era, &PARENT, &lane()),
+                    kx_aad(ChiaNet::Mainnet, kind, era, &PARENT, &lane()),
+                    "kind {kind}, era {era}"
+                );
+            }
+        }
+    }
+
+    /// Records origin/main sealed still open on testnet11 with the tag in
+    /// place, and do not open on mainnet: a testnet11 reader loses nothing
+    /// already on chain, and mainnet reads none of it.
+    #[test]
+    fn testnet11_blobs_sealed_by_origin_main_still_open_on_testnet11_alone() {
+        let sealed = hex::decode(TESTNET11_SEALED_V2).unwrap();
+        assert_eq!(open_v2(ChiaNet::Testnet11, &CK, KIND_PRESENCE, 2_917, &sealed).unwrap(), SEALED_PLAIN.to_vec());
+        assert!(open_v2(ChiaNet::Mainnet, &CK, KIND_PRESENCE, 2_917, &sealed).is_err(), "mainnet's AAD carries G");
+        #[cfg(feature = "chia-read")]
+        {
+            let sealed = hex::decode(TESTNET11_SEALED_KX).unwrap();
+            let open = |net| open_with_kx(net, &KX_HOST_SK, KIND_KNOCK, 2_917, &PARENT, &lane(), &sealed);
+            assert_eq!(open(ChiaNet::Testnet11).unwrap(), SEALED_PLAIN.to_vec());
+            assert!(open(ChiaNet::Mainnet).is_err(), "mainnet's kx AAD carries G");
+        }
+    }
+
+    /// §3.5, "That covers both seals": a blob sealed under a contact key, or
+    /// sealed to a card key, on one network opens on that network and is
+    /// refused on the other, for every kind and era; within one network it
+    /// still round-trips.
+    #[test]
+    fn a_blob_sealed_on_one_network_opens_on_that_network_alone() {
+        #[cfg(feature = "chia-read")]
+        let host_pk = curve25519_dalek::MontgomeryPoint::mul_base_clamped(KX_HOST_SK).to_bytes();
+        for net in ChiaNet::ALL {
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            for era in ERAS {
+                for kind in KINDS {
+                    let blob = seal_v2(net, &CK, kind, era, &SEALED_PLAIN).unwrap();
+                    assert_eq!(open_v2(net, &CK, kind, era, &blob).unwrap(), SEALED_PLAIN.to_vec(), "{net:?}: kind {kind}, era {era}");
+                    assert!(open_v2(other, &CK, kind, era, &blob).is_err(), "sealed on {net:?}, read on {other:?}: kind {kind}, era {era}");
+                    #[cfg(feature = "chia-read")]
+                    {
+                        let blob = seal_to_kx(net, &host_pk, kind, era, &PARENT, &lane(), &SEALED_PLAIN).unwrap();
+                        let open = |on| open_with_kx(on, &KX_HOST_SK, kind, era, &PARENT, &lane(), &blob);
+                        assert_eq!(open(net).unwrap(), SEALED_PLAIN.to_vec(), "{net:?}: kx, kind {kind}, era {era}");
+                        assert!(open(other).is_err(), "kx sealed on {net:?}, read on {other:?}: kind {kind}, era {era}");
+                    }
+                }
+            }
+        }
     }
 }

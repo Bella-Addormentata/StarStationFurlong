@@ -3445,7 +3445,9 @@ async fn dial_peer_inner(
         let mut held_by_ck: Option<Vec<SocketAddr>> = None;
         let target_ck = hub.peers.lock().unwrap().ck_of(&target_str);
         if let Some(ck) = target_ck {
-            match chia_resolve::resolve_presence_by_ck(&ck, &target_str).await {
+            // The node's own network: its hints and seals are that network's
+            // (stage 4 design §3.5).
+            match chia_resolve::resolve_presence_by_ck(chia_network::net(), &ck, &target_str).await {
                 Ok(Some(rec)) => {
                     let addrs = chia_public_dial_addrs(&rec.addrs);
                     if addrs.is_empty() {
@@ -3662,7 +3664,8 @@ async fn beacon_fallback(hub: &SharedHub, iroh_ep: &IrohEndpoint, room_id: &str,
     let client = chia_chain::connect_carrier();
     let now = chia_resolve::unix_now();
     let Some(peak) = chia_resolve::peak_height(&client).await else { return };
-    let beacons = match chia_resolve::read_beacons(&client, peak, now).await {
+    // The node's own network's beacon hints (stage 4 design §3.5).
+    let beacons = match chia_resolve::read_beacons(chia_network::net(), &client, peak, now).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("⛓️ ChiaHub beacons: read failed: {e:#}");

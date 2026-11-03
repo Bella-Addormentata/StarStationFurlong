@@ -45,6 +45,7 @@ use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
+use crate::chia_network::ChiaNet;
 
 /// Record v2 (P6a) refuses a signed `issued_at` more than two hours ahead of
 /// the reader's clock (the third follow-up on #231); the era, not the clock,
@@ -363,8 +364,11 @@ pub async fn read_hint_items<T: Send>(
 /// `era`. `None` when it is not for us, tampered, filed under the wrong era,
 /// CONFIRMED OUTSIDE ITS ERA (the pre-fill/replay rule: a record is valid only
 /// if the block that confirmed it lies in the era it is signed for), expired,
-/// or signed more than [`MAX_FUTURE_SKEW_V2_SECS`] ahead of our clock.
+/// or signed more than [`MAX_FUTURE_SKEW_V2_SECS`] ahead of our clock. The
+/// seal is `net`'s (stage 4 design §3.5): a record sealed on the other
+/// network does not open.
 pub fn decode_v2_presence(
+    net: ChiaNet,
     ck: &[u8; 32],
     ciphertext: &[u8],
     era: u64,
@@ -374,7 +378,7 @@ pub fn decode_v2_presence(
     if chia_lane::era_of(confirmed_height) != era {
         return None;
     }
-    let plain = chia_lane::open_v2(ck, chia_lane::KIND_PRESENCE, era, ciphertext).ok()?;
+    let plain = chia_lane::open_v2(net, ck, chia_lane::KIND_PRESENCE, era, ciphertext).ok()?;
     let record = chia_lane::decode_presence_v2(&plain, era).ok()?;
     if record.expires_at < now {
         return None;
@@ -399,8 +403,9 @@ pub fn scan_eras(peak: u32) -> Vec<u64> {
 /// was, minus any parked page cursor ([`HintCursor::roll_back`]), so nothing
 /// it examined counts as seen and the next beat re-reads it; what the other
 /// hint found is returned all the same. Only when every
-/// hint failed is the error returned.
+/// hint failed is the error returned. The hints and the seal are `net`'s.
 pub async fn read_ck(
+    net: ChiaNet,
     client: &impl ChainAccess,
     ck: &[u8; 32],
     peak: u32,
@@ -411,10 +416,10 @@ pub async fn read_ck(
     let mut first_error: Option<anyhow::Error> = None;
     let mut any_ok = false;
     for era in scan_eras(peak) {
-        let hint = chia_lane::derive_ck_hint(ck, era);
+        let hint = chia_lane::derive_ck_hint(net, ck, era);
         let cursor = cursors.entry(hint).or_default();
         let before = cursor.clone();
-        let opener = |ct: &[u8], _parent: Bytes32, height: u32| decode_v2_presence(ck, ct, era, height, now);
+        let opener = |ct: &[u8], _parent: Bytes32, height: u32| decode_v2_presence(net, ck, ct, era, height, now);
         match read_hint_with(client, Bytes32::new(hint), cursor, &opener).await {
             Ok(records) => {
                 any_ok = true;
@@ -443,9 +448,10 @@ pub async fn read_ck(
     }
 }
 
-/// The hints a v2 reader of `ck` has in play at `peak` (for cursor pruning).
-pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
-    scan_eras(peak).into_iter().map(|era| chia_lane::derive_ck_hint(ck, era)).collect()
+/// The hints a v2 reader of `ck` has in play at `peak` on `net` (for cursor
+/// pruning).
+pub fn live_ck_hints(net: ChiaNet, ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
+    scan_eras(peak).into_iter().map(|era| chia_lane::derive_ck_hint(net, ck, era)).collect()
 }
 
 // ── #231 P6b: the inbox (knocks sealed to us) and the public beacons ────────
@@ -456,8 +462,10 @@ pub fn live_ck_hints(ck: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
 /// round 3) and WITH the room's secret lane token (`lane`: a writer without the
 /// room key cannot seal one, round 5), signed by its knocker, filed in its own era, not expired, not
 /// from the far future, and naming `lane_id` (the room the hint was read for)
-/// among its rooms. `None` for anything else.
+/// among its rooms, and sealed on `net` (stage 4 design §3.5). `None` for
+/// anything else.
 pub fn decode_knock_for(
+    net: ChiaNet,
     kx_secret: &[u8; 32],
     ciphertext: &[u8],
     carrier_parent: &[u8; 32],
@@ -470,7 +478,7 @@ pub fn decode_knock_for(
     if chia_lane::era_of(confirmed_height) != era {
         return None;
     }
-    let plain = chia_lane::open_with_kx(kx_secret, chia_lane::KIND_KNOCK, era, carrier_parent, lane, ciphertext).ok()?;
+    let plain = chia_lane::open_with_kx(net, kx_secret, chia_lane::KIND_KNOCK, era, carrier_parent, lane, ciphertext).ok()?;
     let knock = chia_lane::decode_knock_v2(&plain, era).ok()?;
     if knock.expires_at < now || knock.issued_at > now.saturating_add(MAX_FUTURE_SKEW_V2_SECS) {
         return None;
@@ -479,9 +487,10 @@ pub fn decode_knock_for(
 }
 
 /// One incremental read of our INBOX for `room`'s lane: both scan eras' hints
-/// under our contact key and the room's lane token, cursors kept by the caller
-/// per hint, the same transactional failure rule as [`read_ck`].
+/// under our contact key and the room's lane token on `net`, cursors kept by
+/// the caller per hint, the same transactional failure rule as [`read_ck`].
 pub async fn read_inbox(
+    net: ChiaNet,
     client: &impl ChainAccess,
     kx_secret: &[u8; 32],
     own_ck: &[u8; 32],
@@ -497,10 +506,10 @@ pub async fn read_inbox(
     let mut first_error: Option<anyhow::Error> = None;
     let mut any_ok = false;
     for era in scan_eras(peak) {
-        let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
+        let hint = chia_lane::derive_inbox_hint(net, own_ck, &lane, era);
         let cursor = cursors.entry(hint).or_default();
         let before = cursor.clone();
-        let opener = |ct: &[u8], parent: Bytes32, height: u32| decode_knock_for(kx_secret, ct, &parent.to_bytes(), &lane, era, height, now, &lane_id);
+        let opener = |ct: &[u8], parent: Bytes32, height: u32| decode_knock_for(net, kx_secret, ct, &parent.to_bytes(), &lane, era, height, now, &lane_id);
         match read_hint_items(client, Bytes32::new(hint), cursor, &opener).await {
             Ok(items) => {
                 any_ok = true;
@@ -524,10 +533,10 @@ pub async fn read_inbox(
     }
 }
 
-/// The inbox hints of `room` in play at `peak` (for cursor pruning).
-pub fn live_inbox_hints(own_ck: &[u8; 32], room_key: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
+/// The inbox hints of `room` in play at `peak` on `net` (for cursor pruning).
+pub fn live_inbox_hints(net: ChiaNet, own_ck: &[u8; 32], room_key: &[u8; 32], peak: u32) -> Vec<[u8; 32]> {
     let lane = chia_lane::derive_lane_token(room_key);
-    scan_eras(peak).into_iter().map(|era| chia_lane::derive_inbox_hint(own_ck, &lane, era)).collect()
+    scan_eras(peak).into_iter().map(|era| chia_lane::derive_inbox_hint(net, own_ck, &lane, era)).collect()
 }
 
 /// Beacons a reader keeps: the newest by signed time, one per node.
@@ -560,13 +569,14 @@ pub fn rank_beacons(mut found: Vec<FoundItem<chia_lane::BeaconV2>>) -> Vec<Found
 /// ONE-SHOT: the newest [`BEACONS_KEPT`] beacons of this era and the last —
 /// the public entry points a newcomer with nobody to dial may try (D7). The
 /// hint is derivable by anyone and may be flooded or pre-filled: the one-shot
-/// budget bounds the read and the newest-first order keeps what matters.
-pub async fn read_beacons(client: &impl ChainAccess, peak: u32, now: u64) -> Result<Vec<FoundItem<chia_lane::BeaconV2>>> {
+/// budget bounds the read and the newest-first order keeps what matters. The
+/// hints are `net`'s (stage 4 design §3.5).
+pub async fn read_beacons(net: ChiaNet, client: &impl ChainAccess, peak: u32, now: u64) -> Result<Vec<FoundItem<chia_lane::BeaconV2>>> {
     let mut all = Vec::new();
     let mut cursors: std::collections::HashMap<[u8; 32], HintCursor> = std::collections::HashMap::new();
     for round in 1..=ONE_SHOT_MAX_ROUNDS {
         for era in scan_eras(peak) {
-            let hint = chia_lane::derive_beacon_hint(era);
+            let hint = chia_lane::derive_beacon_hint(net, era);
             let cursor = cursors.entry(hint).or_default();
             let opener = |ct: &[u8], _parent: Bytes32, height: u32| decode_beacon_for(ct, era, height, now);
             all.extend(read_hint_items(client, Bytes32::new(hint), cursor, &opener).await?);
@@ -800,15 +810,16 @@ pub fn parse_hex32(hex_id: &str) -> Option<Bytes32> {
 /// budget. Records under the hint signed by any OTHER node are discarded
 /// before ranking: a contact key is shared with every member of the rooms
 /// that received the card, so it locates the hint but never vouches for the
-/// signer; only the node's own signature does.
-pub async fn resolve_presence_by_ck(ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
+/// signer; only the node's own signature does. The hints and the seal are
+/// `net`'s, the network the node runs on.
+pub async fn resolve_presence_by_ck(net: ChiaNet, ck: &[u8; 32], node_id: &str) -> Result<Option<ChiaPresenceRecord>> {
     let now = unix_now();
     let client = crate::chia_chain::connect_carrier();
     let peak = peak_height(&client).await.ok_or_else(|| anyhow!("chain peak unavailable"))?;
     let mut all = Vec::new();
     let mut cursors = std::collections::HashMap::new();
     for round in 1..=ONE_SHOT_MAX_ROUNDS {
-        all.extend(read_ck(&client, ck, peak, now, &mut cursors).await?);
+        all.extend(read_ck(net, &client, ck, peak, now, &mut cursors).await?);
         if !cursors.values().any(|c| c.has_more()) {
             break;
         }
@@ -997,11 +1008,18 @@ mod tests {
         };
         let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
         let input = [5u8; 32];
-        let sealed = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height, now, &lane), Some(knock), "under its own coin: the knock");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &[6u8; 32], &lane_token, era, height, now, &lane), None, "the same blob under a copier's coin: nothing");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height + chia_lane::ERA_BLOCKS, now, &lane), None, "outside its era");
-        assert_eq!(decode_knock_for(&host_sk, &sealed, &input, &lane_token, era, height, now, &chia_lane::room_lane_id("s")), None, "another room");
+        for net in ChiaNet::ALL {
+            let sealed = chia_lane::seal_to_kx(net, &host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
+            assert_eq!(decode_knock_for(net, &host_sk, &sealed, &input, &lane_token, era, height, now, &lane), Some(knock.clone()), "{net:?}: under its own coin: the knock");
+            assert_eq!(decode_knock_for(net, &host_sk, &sealed, &[6u8; 32], &lane_token, era, height, now, &lane), None, "{net:?}: the same blob under a copier's coin: nothing");
+            assert_eq!(decode_knock_for(net, &host_sk, &sealed, &input, &lane_token, era, height + chia_lane::ERA_BLOCKS, now, &lane), None, "{net:?}: outside its era");
+            assert_eq!(decode_knock_for(net, &host_sk, &sealed, &input, &lane_token, era, height, now, &chia_lane::room_lane_id("s")), None, "{net:?}: another room");
+            // Stage 4 design §3.5: the network's tag is in the seal's
+            // associated data, so the knock read on the other network is
+            // nothing too.
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            assert_eq!(decode_knock_for(other, &host_sk, &sealed, &input, &lane_token, era, height, now, &lane), None, "{net:?}: read on {other:?}");
+        }
     }
 
     #[test]
@@ -1029,16 +1047,18 @@ mod tests {
         };
         let plain = chia_lane::encode_knock_v2(&knock, &knocker).unwrap();
         let input = [5u8; 32];
-        for stranger in [chia_lane::derive_lane_token(&[10u8; 32]), [0u8; 32]] {
-            let forged = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &stranger, &plain).unwrap();
-            assert_eq!(
-                decode_knock_for(&host_sk, &forged, &input, &lane_token, era, height, now, &lane_id),
-                None,
-                "sealed with another room's lane, or none: not a knock on this room, under the right hint or not"
-            );
+        for net in ChiaNet::ALL {
+            for stranger in [chia_lane::derive_lane_token(&[10u8; 32]), [0u8; 32]] {
+                let forged = chia_lane::seal_to_kx(net, &host_pk, chia_lane::KIND_KNOCK, era, &input, &stranger, &plain).unwrap();
+                assert_eq!(
+                    decode_knock_for(net, &host_sk, &forged, &input, &lane_token, era, height, now, &lane_id),
+                    None,
+                    "{net:?}: sealed with another room's lane, or none: not a knock on this room, under the right hint or not"
+                );
+            }
+            let genuine = chia_lane::seal_to_kx(net, &host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
+            assert_eq!(decode_knock_for(net, &host_sk, &genuine, &input, &lane_token, era, height, now, &lane_id), Some(knock.clone()), "{net:?}");
         }
-        let genuine = chia_lane::seal_to_kx(&host_pk, chia_lane::KIND_KNOCK, era, &input, &lane_token, &plain).unwrap();
-        assert_eq!(decode_knock_for(&host_sk, &genuine, &input, &lane_token, era, height, now, &lane_id), Some(knock));
     }
 
     fn sealed_record(room_key: &[u8; 32], sk: &iroh::SecretKey, issued_at: u64, expires_at: u64) -> Vec<u8> {
@@ -1198,21 +1218,26 @@ mod tests {
             expires_at: now + 3600,
             addrs: vec![AddrEntry { addr: "198.51.100.7:4444".parse().unwrap(), flags: 1 }],
         };
-        let sealed = seal_v2(&ck, KIND_PRESENCE, era, &encode_presence_v2(&rec, &sk).unwrap()).unwrap();
         let inside = 12 * ERA_BLOCKS + 10;
-        let got = decode_v2_presence(&ck, &sealed, era, inside, now).expect("confirmed inside its era");
-        assert_eq!(got.v, 2);
-        assert_eq!(got.node_id, sk.public().to_string());
-        assert_eq!(got.addrs, vec!["198.51.100.7:4444".to_string()]);
-        assert_eq!(got.addr_flags, vec![1]);
-        assert!(decode_v2_presence(&ck, &sealed, era, 13 * ERA_BLOCKS, now).is_none(), "confirmed in the next era: a pre-fill or a late replay, refused");
-        assert!(decode_v2_presence(&ck, &sealed, era, 12 * ERA_BLOCKS - 1, now).is_none(), "confirmed before its era: refused");
-        assert!(decode_v2_presence(&ck, &sealed, era + 1, 13 * ERA_BLOCKS, now).is_none(), "read under the next era's hint: the seal refuses");
-        assert!(decode_v2_presence(&[9u8; 32], &sealed, era, inside, now).is_none(), "another contact key");
-        assert!(decode_v2_presence(&ck, &sealed, era, inside, now + 3601).is_none(), "expired");
-        let future = PresenceV2 { issued_at: now + MAX_FUTURE_SKEW_V2_SECS + 1, expires_at: now + 10 * 3600, ..rec.clone() };
-        let sealed = seal_v2(&ck, KIND_PRESENCE, era, &encode_presence_v2(&future, &sk).unwrap()).unwrap();
-        assert!(decode_v2_presence(&ck, &sealed, era, inside, now).is_none(), "two hours ahead is too far");
+        for net in ChiaNet::ALL {
+            let sealed = seal_v2(net, &ck, KIND_PRESENCE, era, &encode_presence_v2(&rec, &sk).unwrap()).unwrap();
+            let got = decode_v2_presence(net, &ck, &sealed, era, inside, now).expect("confirmed inside its era");
+            assert_eq!(got.v, 2);
+            assert_eq!(got.node_id, sk.public().to_string());
+            assert_eq!(got.addrs, vec!["198.51.100.7:4444".to_string()]);
+            assert_eq!(got.addr_flags, vec![1]);
+            assert!(decode_v2_presence(net, &ck, &sealed, era, 13 * ERA_BLOCKS, now).is_none(), "{net:?}: confirmed in the next era: a pre-fill or a late replay, refused");
+            assert!(decode_v2_presence(net, &ck, &sealed, era, 12 * ERA_BLOCKS - 1, now).is_none(), "{net:?}: confirmed before its era: refused");
+            assert!(decode_v2_presence(net, &ck, &sealed, era + 1, 13 * ERA_BLOCKS, now).is_none(), "{net:?}: read under the next era's hint: the seal refuses");
+            assert!(decode_v2_presence(net, &[9u8; 32], &sealed, era, inside, now).is_none(), "{net:?}: another contact key");
+            assert!(decode_v2_presence(net, &ck, &sealed, era, inside, now + 3601).is_none(), "{net:?}: expired");
+            // Stage 4 design §3.5: sealed on one network, refused on the other.
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            assert!(decode_v2_presence(other, &ck, &sealed, era, inside, now).is_none(), "{net:?}: read on {other:?}");
+            let future = PresenceV2 { issued_at: now + MAX_FUTURE_SKEW_V2_SECS + 1, expires_at: now + 10 * 3600, ..rec.clone() };
+            let sealed = seal_v2(net, &ck, KIND_PRESENCE, era, &encode_presence_v2(&future, &sk).unwrap()).unwrap();
+            assert!(decode_v2_presence(net, &ck, &sealed, era, inside, now).is_none(), "{net:?}: two hours ahead is too far");
+        }
     }
 
     #[test]
@@ -1223,10 +1248,12 @@ mod tests {
         assert_eq!(scan_eras(ERA_BLOCKS), vec![1, 0]);
         assert_eq!(scan_eras(5 * ERA_BLOCKS + 7), vec![5, 4]);
         let ck = [3u8; 32];
-        let hints = live_ck_hints(&ck, 5 * ERA_BLOCKS);
-        assert_eq!(hints.len(), 2);
-        assert_eq!(hints[0], chia_lane::derive_ck_hint(&ck, 5));
-        assert_eq!(hints[1], chia_lane::derive_ck_hint(&ck, 4));
+        for net in ChiaNet::ALL {
+            let hints = live_ck_hints(net, &ck, 5 * ERA_BLOCKS);
+            assert_eq!(hints.len(), 2);
+            assert_eq!(hints[0], chia_lane::derive_ck_hint(net, &ck, 5), "{net:?}");
+            assert_eq!(hints[1], chia_lane::derive_ck_hint(net, &ck, 4), "{net:?}");
+        }
     }
 
     #[test]
@@ -1344,33 +1371,243 @@ mod tests {
         // every beat and never read again until it rotated out.
         use crate::chia_chain::CoinListing;
         let empty = || CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: Some(10 * chia_lane::ERA_BLOCKS) };
-        let chain = CursorRefusing { pages: std::sync::Mutex::new(vec![empty(), empty(), empty(), empty()].into()), fresh_listings: std::sync::Mutex::new(0) };
-        let (kx_secret, own_ck, room_key) = ([11u8; 32], [12u8; 32], [13u8; 32]);
-        let peak = 10 * chia_lane::ERA_BLOCKS + 5;
+        // On each network: the hints are its own (stage 4 design §3.5).
+        for net in ChiaNet::ALL {
+            let chain = CursorRefusing { pages: std::sync::Mutex::new(vec![empty(), empty(), empty(), empty()].into()), fresh_listings: std::sync::Mutex::new(0) };
+            let (kx_secret, own_ck, room_key) = ([11u8; 32], [12u8; 32], [13u8; 32]);
+            let peak = 10 * chia_lane::ERA_BLOCKS + 5;
+            let lane = chia_lane::derive_lane_token(&room_key);
+            let parked = chia_lane::derive_inbox_hint(net, &own_ck, &lane, chia_lane::era_of(peak));
+            let mut cursors = std::collections::HashMap::new();
+            cursors.insert(
+                parked,
+                HintCursor {
+                    last_height: peak - 100,
+                    pending: Some(PendingPage { start_height: Some(peak - 200), next_cursor: "stale".into(), max_height: peak - 100, examined_all: true }),
+                    ..Default::default()
+                },
+            );
+            // Beat 1: the parked hint's cursor is refused (the other era's hint reads fine).
+            assert!(read_inbox(net, &chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
+            let after = &cursors[&parked];
+            assert_eq!(after.pending, None, "the refused cursor is not kept");
+            assert!(after.backlog, "there is still something to read");
+            assert_eq!(after.last_height, peak - 100, "nothing examined moved");
+            assert_eq!(*chain.fresh_listings.lock().unwrap(), 1, "the other era listed fresh");
+            // Beat 2: a fresh listing for the hint, accepted, instead of the same refusal.
+            assert!(read_inbox(net, &chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
+            assert_eq!(*chain.fresh_listings.lock().unwrap(), 3, "both eras listed fresh");
+            let after = &cursors[&parked];
+            assert_eq!(after.pending, None);
+            assert!(!after.backlog, "the listing ran to its end");
+        }
+    }
+
+    // ── The network tag at the readers and writers (stage 4 design §3.5) ──
+
+    /// A chain that holds memos filed under hints: a listing of a hint
+    /// answers every coin filed under it on one page, whatever its start
+    /// height or cursor; the parent spend of each such coin makes it with
+    /// `[hint, memo]` as its memos; and each hint a listing asked for is
+    /// kept, in order. Everything else is unanswered.
+    #[derive(Default)]
+    struct MemoChain {
+        filed: std::collections::HashMap<Bytes32, Vec<crate::chia_chain::CoinRecord>>,
+        spends: std::collections::HashMap<Bytes32, PuzzleAndSolution>,
+        asked: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    impl MemoChain {
+        /// File `memo` under `hint` in a coin confirmed at `height`, made by
+        /// the spend of the coin `parent` (the writer's input coin, which a
+        /// knock's seal binds). The parent's puzzle is `1`, which returns its
+        /// solution: one CREATE_COIN (opcode 51) whose memos are `[hint, memo]`.
+        fn file(&mut self, hint: Bytes32, memo: Vec<u8>, parent: [u8; 32], height: u32) {
+            let parent = Bytes32::new(parent);
+            let puzzle_hash = Bytes32::new([0x5a; 32]);
+            let mut a = Allocator::new();
+            let conditions = ((51u8, (puzzle_hash, (1u64, ((hint, (Bytes::new(memo), ())), ())))), ());
+            let solution = conditions.to_clvm(&mut a).unwrap();
+            let solution = chia_protocol::Program::from(clvmr::serde::node_to_bytes(&a, solution).unwrap());
+            self.spends.insert(parent, PuzzleAndSolution { puzzle_reveal: chia_protocol::Program::from(vec![1u8]), solution });
+            let coin = chia_protocol::Coin::new(parent, puzzle_hash, 1);
+            let record = crate::chia_chain::CoinRecord { coin, confirmed_block_index: height, spent: false, spent_block_index: 0 };
+            self.filed.entry(hint).or_default().push(record);
+        }
+
+        /// The hints listed since the last call, in the order asked.
+        fn asked(&self) -> Vec<[u8; 32]> {
+            std::mem::take(&mut *self.asked.lock().unwrap())
+        }
+    }
+
+    impl crate::chia_chain::ChainAccess for MemoChain {
+        fn coin_records_by_hint(
+            &self,
+            hint: Bytes32,
+            _start_height: Option<u32>,
+            _include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            self.asked.lock().unwrap().push(hint.to_bytes());
+            let records = self.filed.get(&hint).cloned().unwrap_or_default();
+            async move { Ok(crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at: None }) }
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn coin_records_by_names(
+            &self,
+            _names: Vec<Bytes32>,
+            _include_spent: bool,
+            _cursor: Option<String>,
+        ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn puzzle_and_solution(
+            &self,
+            coin_id: Bytes32,
+            _height: u32,
+        ) -> impl std::future::Future<Output = Result<Option<PuzzleAndSolution>, crate::chia_chain::ChainError>> + Send {
+            let spend = self.spends.get(&coin_id).cloned();
+            async move { Ok(spend) }
+        }
+
+        fn peak_height(&self) -> impl std::future::Future<Output = Result<u32, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn spend_live(&self, _bundle: chia_protocol::SpendBundle) -> impl std::future::Future<Output = Result<bool, crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+
+        fn push_tx(&self, _bundle: chia_protocol::SpendBundle) -> impl std::future::Future<Output = Result<(), crate::chia_chain::ChainError>> + Send {
+            async { Err(unanswered()) }
+        }
+    }
+
+    /// Stage 4 design §3.5 at the readers: on each network, `read_ck`,
+    /// `read_inbox` and `read_beacons` ask the chain for that network's hints
+    /// of both scan eras and for no other, and the hints the watcher keeps
+    /// cursors for (`live_ck_hints`, `live_inbox_hints`) are the ones those
+    /// reads ask for, so it never prunes a cursor a read still uses. The
+    /// readers take the network as an argument and never read the
+    /// environment, so CI's mainnet step cannot see one that drops it; this
+    /// test does.
+    #[tokio::test]
+    async fn each_reader_asks_the_chain_for_its_own_networks_hints_alone() {
+        let (ck, kx_secret, room_key) = ([21u8; 32], [22u8; 32], [23u8; 32]);
         let lane = chia_lane::derive_lane_token(&room_key);
-        let parked = chia_lane::derive_inbox_hint(&own_ck, &lane, chia_lane::era_of(peak));
-        let mut cursors = std::collections::HashMap::new();
-        cursors.insert(
-            parked,
-            HintCursor {
-                last_height: peak - 100,
-                pending: Some(PendingPage { start_height: Some(peak - 200), next_cursor: "stale".into(), max_height: peak - 100, examined_all: true }),
-                ..Default::default()
-            },
-        );
-        // Beat 1: the parked hint's cursor is refused (the other era's hint reads fine).
-        assert!(read_inbox(&chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
-        let after = &cursors[&parked];
-        assert_eq!(after.pending, None, "the refused cursor is not kept");
-        assert!(after.backlog, "there is still something to read");
-        assert_eq!(after.last_height, peak - 100, "nothing examined moved");
-        assert_eq!(*chain.fresh_listings.lock().unwrap(), 1, "the other era listed fresh");
-        // Beat 2: a fresh listing for the hint, accepted, instead of the same refusal.
-        assert!(read_inbox(&chain, &kx_secret, &own_ck, &room_key, "r", peak, 1_000, &mut cursors).await.unwrap().is_empty());
-        assert_eq!(*chain.fresh_listings.lock().unwrap(), 3, "both eras listed fresh");
-        let after = &cursors[&parked];
-        assert_eq!(after.pending, None);
-        assert!(!after.backlog, "the listing ran to its end");
+        let peak = 12 * chia_lane::ERA_BLOCKS + 50;
+        let eras = scan_eras(peak);
+        assert_eq!(eras, vec![12, 11]);
+        let chain = MemoChain::default();
+        for net in ChiaNet::ALL {
+            assert!(read_ck(net, &chain, &ck, peak, 1_000, &mut std::collections::HashMap::new()).await.unwrap().is_empty());
+            let want: Vec<[u8; 32]> = eras.iter().map(|e| chia_lane::derive_ck_hint(net, &ck, *e)).collect();
+            assert_eq!(chain.asked(), want, "{net:?}: read_ck");
+            assert_eq!(live_ck_hints(net, &ck, peak), want, "{net:?}: the contact-key cursors kept");
+
+            let read = read_inbox(net, &chain, &kx_secret, &ck, &room_key, "r", peak, 1_000, &mut std::collections::HashMap::new()).await.unwrap();
+            assert!(read.is_empty());
+            let want: Vec<[u8; 32]> = eras.iter().map(|e| chia_lane::derive_inbox_hint(net, &ck, &lane, *e)).collect();
+            assert_eq!(chain.asked(), want, "{net:?}: read_inbox");
+            assert_eq!(live_inbox_hints(net, &ck, &room_key, peak), want, "{net:?}: the inbox cursors kept");
+
+            assert!(read_beacons(net, &chain, peak, 1_000).await.unwrap().is_empty());
+            let want: Vec<[u8; 32]> = eras.iter().map(|e| chia_lane::derive_beacon_hint(net, *e)).collect();
+            assert_eq!(chain.asked(), want, "{net:?}: read_beacons, one round");
+        }
+    }
+
+    /// Stage 4 design §3.5 end to end at the readers: with each network's
+    /// listing, knock and beacon filed in one chain under that network's
+    /// hints and sealed on that network, each by a node of its own, a read on
+    /// a network returns that network's node alone. A reader that took the
+    /// other network's hint finds only the other network's records, which
+    /// its seal refuses (the beacon, in the clear, would name the other
+    /// node), and one that opened with the other network's seal refuses its
+    /// own: either way it fails here.
+    #[tokio::test]
+    async fn a_record_filed_on_one_network_is_read_on_that_network_alone() {
+        use crate::chia_lane::{AddrEntry, BeaconV2, KnockV2, PresenceV2, ERA_BLOCKS, KIND_KNOCK, KIND_PRESENCE};
+        let (ck, kx_secret, room_key) = ([21u8; 32], [22u8; 32], [23u8; 32]);
+        let kx_public = curve25519_dalek::MontgomeryPoint::mul_base_clamped(kx_secret).to_bytes();
+        let lane = chia_lane::derive_lane_token(&room_key);
+        let (now, era) = (1_791_700_000u64, 12u64);
+        let (height, peak) = (12 * ERA_BLOCKS + 10, 12 * ERA_BLOCKS + 50);
+        let nodes = ChiaNet::ALL.map(|_| iroh::SecretKey::generate());
+        let mut chain = MemoChain::default();
+        for (i, (net, sk)) in (0u8..).zip(ChiaNet::ALL.into_iter().zip(&nodes)) {
+            let addrs = vec![AddrEntry { addr: "198.51.100.7:4444".parse().unwrap(), flags: 1 }];
+            let listing = PresenceV2 { era, node_id: sk.public(), kx_pk: [1u8; 32], issued_at: now - 60, expires_at: now + 3600, addrs };
+            let sealed = chia_lane::seal_v2(net, &ck, KIND_PRESENCE, era, &chia_lane::encode_presence_v2(&listing, sk).unwrap()).unwrap();
+            chain.file(Bytes32::new(chia_lane::derive_ck_hint(net, &ck, era)), sealed, [0x30 + i; 32], height);
+            let knock = KnockV2 { era, from: sk.public(), ck_from: None, issued_at: now - 60, expires_at: now + 3600, rooms: vec![chia_lane::room_lane_id("r")] };
+            let input = [0x40 + i; 32];
+            let sealed = chia_lane::seal_to_kx(net, &kx_public, KIND_KNOCK, era, &input, &lane, &chia_lane::encode_knock_v2(&knock, sk).unwrap()).unwrap();
+            chain.file(Bytes32::new(chia_lane::derive_inbox_hint(net, &ck, &lane, era)), sealed, input, height);
+            let beacon = BeaconV2 { era, node_id: sk.public(), issued_at: now - 60, expires_at: now + 3600 };
+            let plain = chia_lane::encode_beacon_v2(&beacon, sk).unwrap().to_vec();
+            chain.file(Bytes32::new(chia_lane::derive_beacon_hint(net, era)), plain, [0x50 + i; 32], height);
+        }
+        for (net, sk) in ChiaNet::ALL.into_iter().zip(&nodes) {
+            let listings = read_ck(net, &chain, &ck, peak, now, &mut std::collections::HashMap::new()).await.unwrap();
+            assert_eq!(listings.iter().map(|f| f.record.node_id.clone()).collect::<Vec<_>>(), vec![sk.public().to_string()], "{net:?}: the listing");
+            let knocks = read_inbox(net, &chain, &kx_secret, &ck, &room_key, "r", peak, now, &mut std::collections::HashMap::new()).await.unwrap();
+            assert_eq!(knocks.iter().map(|f| f.item.from).collect::<Vec<_>>(), vec![sk.public()], "{net:?}: the knock");
+            let beacons = read_beacons(net, &chain, peak, now).await.unwrap();
+            assert_eq!(beacons.iter().map(|f| f.item.node_id).collect::<Vec<_>>(), vec![sk.public()], "{net:?}: the beacon");
+        }
+    }
+
+    /// Stage 4 design §3.5 from writer to reader: what the presence, knock
+    /// and beacon writers file on a network (their steps that touch no
+    /// chain: `chia_publish::presence_memo`, `knock_hint` with `knock_memo`,
+    /// and `beacon_memo`), filed under the hint each gives, is read back on
+    /// that network as its writer's and on the other network not at all. A
+    /// writer that filed under the other network's hint, or sealed on the
+    /// other network, fails here; the writers take the network as an
+    /// argument, so CI's mainnet step cannot see that.
+    #[cfg(feature = "chia-publish")]
+    #[tokio::test]
+    async fn what_each_writer_files_on_a_network_is_read_on_that_network_alone() {
+        use crate::chia_lane::{AddrEntry, ERA_BLOCKS};
+        let (ck, kx_secret, room_key) = ([21u8; 32], [22u8; 32], [23u8; 32]);
+        let kx_host = curve25519_dalek::MontgomeryPoint::mul_base_clamped(kx_secret).to_bytes();
+        let req = crate::chia_knock::KnockRequest { room: "r".into(), host: "host".into(), ck_host: ck, kx_host, attempts: 0 };
+        let (now, era) = (1_791_700_000u64, 12u64);
+        let (height, peak) = (12 * ERA_BLOCKS + 10, 12 * ERA_BLOCKS + 50);
+        let entries = [AddrEntry { addr: "198.51.100.7:4444".parse().unwrap(), flags: 1 }];
+        for net in ChiaNet::ALL {
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            let sk = iroh::SecretKey::generate();
+            let mut chain = MemoChain::default();
+            let (hint, memo) = crate::chia_publish::presence_memo(net, &sk, &ck, era, &entries, now).unwrap();
+            chain.file(hint, memo, [0x30; 32], height);
+            let input = Bytes32::new([0x40; 32]);
+            let memo = crate::chia_publish::knock_memo(net, &sk, &req, &room_key, era, input, None, now).unwrap();
+            chain.file(crate::chia_publish::knock_hint(net, &req, &room_key, era), memo, input.to_bytes(), height);
+            let (hint, memo) = crate::chia_publish::beacon_memo(net, &sk, era, now).unwrap();
+            chain.file(hint, memo, [0x50; 32], height);
+            for (on, want) in [(net, vec![sk.public()]), (other, vec![])] {
+                let listings = read_ck(on, &chain, &ck, peak, now, &mut std::collections::HashMap::new()).await.unwrap();
+                let names: Vec<String> = want.iter().map(|k| k.to_string()).collect();
+                assert_eq!(listings.iter().map(|f| f.record.node_id.clone()).collect::<Vec<_>>(), names, "written on {net:?}, read on {on:?}: the listing");
+                let knocks = read_inbox(on, &chain, &kx_secret, &ck, &room_key, "r", peak, now, &mut std::collections::HashMap::new()).await.unwrap();
+                assert_eq!(knocks.iter().map(|f| f.item.from).collect::<Vec<_>>(), want, "written on {net:?}, read on {on:?}: the knock");
+                let beacons = read_beacons(on, &chain, peak, now).await.unwrap();
+                assert_eq!(beacons.iter().map(|f| f.item.node_id).collect::<Vec<_>>(), want, "written on {net:?}, read on {on:?}: the beacon");
+            }
+        }
     }
 
     #[tokio::test]

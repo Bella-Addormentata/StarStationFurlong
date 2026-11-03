@@ -6,7 +6,10 @@
 //! - [`MoneyKey`] is the wallet key, m/12381/8444/2/0 unhardened. The Bank,
 //!   GIVE, testnet TAKE and a future TRANSFER spend from it.
 //! - [`BurnerRoot`] is R, 32 bytes made only from a `MoneyKey` and the
-//!   network, kept in memory only and wiped when dropped.
+//!   network, kept in memory only and wiped when dropped. It keeps its
+//!   network beside it (public, not wiped), since P(e) is derived under that
+//!   network's listing hint, which carries the network tag on mainnet
+//!   (§3.5).
 //! - [`BurnerKey`] is one slot's key: P(e), the listing's for an era, or
 //!   K(h), one knock's. Only a root's derivations make one: no trait turns
 //!   a `MoneyKey` (or any other `SecretKey`) into one, and no line of this
@@ -75,15 +78,6 @@ const SLOT_MSG_LEN: usize = LABEL_SLOT.len() + 1 + 8;
 /// (`chia_lane::ERA_BLOCKS`) is seven of these.
 pub const SLOT_BLOCKS: u64 = 4_608;
 
-/// G of §3.2: the network's genesis challenge as 32 bytes, in the order its
-/// hex reads (`ChiaNet::genesis_hex`, which chia_network.rs's tests pin to
-/// the consensus constants' own `genesis_challenge`).
-fn genesis(net: ChiaNet) -> [u8; 32] {
-    let mut g = [0u8; 32];
-    hex::decode_to_slice(net.genesis_hex(), &mut g).expect("a genesis challenge is 64 hex digits (chia_network.rs tests)");
-    g
-}
-
 /// The wallet key, m/12381/8444/2/0 unhardened (§3.4): the key the money
 /// spends take (the Bank, GIVE, testnet TAKE, a future TRANSFER), and the W
 /// a [`BurnerRoot`] is made from. It does not turn into a [`BurnerKey`] or
@@ -119,8 +113,10 @@ impl fmt::Debug for MoneyKey {
 /// every burner key and slot of that network is derived. It lives in memory
 /// only, has no accessor of its bytes, and is wiped when dropped. It is
 /// neither `Clone` nor `Copy`: no caller needs a second copy, and each copy
-/// would be one more to wipe.
-pub struct BurnerRoot([u8; 32]);
+/// would be one more to wipe. The second field is the network R was made
+/// for, kept so that [`presence`](Self::presence) derives the listing hint
+/// on that network (§3.5); it is public and `Copy`, so it is not wiped.
+pub struct BurnerRoot([u8; 32], ChiaNet);
 
 impl BurnerRoot {
     /// The root of `money`'s burners on `net`. Each network has its own words
@@ -128,16 +124,19 @@ impl BurnerRoot {
     /// on two networks still give two roots.
     pub fn of(money: &MoneyKey, net: ChiaNet) -> BurnerRoot {
         // §3.2: R = blake3::derive_key("ssf-chia-burner-root-v1", W.to_bytes() ‖ G).
-        // W.to_bytes() is chia_bls's 32-byte big-endian scalar. The material
-        // holds the wallet key, so it and the copy of W are wiped. R comes
-        // back from `derive_key` as a plain [u8; 32], not a `Hash`, and is
-        // moved straight into the root, whose drop wipes it: no copy of R is
-        // held here outside the root.
+        // W.to_bytes() is chia_bls's 32-byte big-endian scalar. G is the
+        // network's genesis challenge (`ChiaNet::genesis`) on every network:
+        // the root mixes it in on testnet11 too, unlike the network tag of
+        // §3.5, which only mainnet appends. The material holds the wallet
+        // key, so it and the copy of W are wiped. R comes back from
+        // `derive_key` as a plain [u8; 32], not a `Hash`, and is moved
+        // straight into the root, whose drop wipes it: no copy of R is held
+        // here outside the root. The network goes in beside it as it is.
         let w = Zeroizing::new(money.0.to_bytes());
         let mut material = Zeroizing::new([0u8; 64]);
         material[..32].copy_from_slice(&w[..]);
-        material[32..].copy_from_slice(&genesis(net));
-        BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]))
+        material[32..].copy_from_slice(&net.genesis());
+        BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]), net)
     }
 
     /// key(k, e, h) of §3.2: the burner key of kind `kind` for era `era`
@@ -165,18 +164,25 @@ impl BurnerRoot {
     }
 
     /// P(e) of §3.2: the listing's key for `era`, under the hint of contact
-    /// key `ck` for that era. All the listing writes of an era share it, a
-    /// new era brings a new key, and so does a new contact key (§3.1, Slots).
+    /// key `ck` for that era on the root's network. All the listing writes of
+    /// an era share it, a new era brings a new key, and so does a new contact
+    /// key (§3.1, Slots).
     pub fn presence(&self, ck: &[u8; 32], era: u64) -> BurnerKey {
-        // §3.2: P(e) = key(1, e, derive_ck_hint(ck, e)).
-        self.key(KIND_PRESENCE, era, &chia_lane::derive_ck_hint(ck, era))
+        // §3.2: P(e) = key(1, e, derive_ck_hint(ck, e)). The hint is the one
+        // the listing is written under on this root's network: on mainnet it
+        // carries the network tag (§3.5), so mainnet's P(e) moved with it
+        // when the tag came in; testnet11's did not.
+        self.key(KIND_PRESENCE, era, &chia_lane::derive_ck_hint(self.1, ck, era))
     }
 
     /// K(h) of §3.2: the key of one knock. `inbox_hint` is the hint the
-    /// knock is written under in `era`, `chia_lane::derive_inbox_hint(ck_host,
-    /// lane, era)`, so it is one key per host per era (§3.1, Slots).
+    /// knock is written under in `era`, `chia_lane::derive_inbox_hint(net,
+    /// ck_host, lane, era)` on the root's network, so it is one key per host
+    /// per era (§3.1, Slots).
     pub fn knock(&self, inbox_hint: &[u8; 32], era: u64) -> BurnerKey {
         // §3.2: K(h) = key(2, e, h) with h = derive_inbox_hint(ck_host, lane, e).
+        // The caller gives h, already on its network (§3.5), so this line
+        // takes no network of its own.
         self.key(KIND_KNOCK, era, inbox_hint)
     }
 
@@ -307,9 +313,10 @@ mod tests {
         MoneyKey::new(keys_from_mnemonic(&zero_words()).wallet)
     }
 
-    /// The knock vector's inbox hint: the host's for the room's lane in the era.
-    fn inbox_hint(ck_host: &[u8; 32], room_key: &[u8; 32], era: u64) -> [u8; 32] {
-        derive_inbox_hint(ck_host, &derive_lane_token(room_key), era)
+    /// The knock vector's inbox hint: the host's for the room's lane in the
+    /// era, on `net` (§3.5: mainnet's carries the network tag).
+    fn inbox_hint(net: ChiaNet, ck_host: &[u8; 32], room_key: &[u8; 32], era: u64) -> [u8; 32] {
+        derive_inbox_hint(net, ck_host, &derive_lane_token(room_key), era)
     }
 
     fn pk_hex(pk: &PublicKey) -> String {
@@ -347,6 +354,16 @@ mod tests {
     /// literals are not an independent implementation's vectors;
     /// `the_derivation_is_the_designs_lines_recomputed_from_their_parts`
     /// checks the lines themselves.
+    ///
+    /// The network tag (stage 4 design §3.5, PR 6) moved mainnet's P and K
+    /// rows and nothing else: P(e) is derived under the listing hint and K(h)
+    /// is taken under the inbox hint, and on mainnet both hints now carry G.
+    /// Mainnet's P and K rows were printed again by this module's code once
+    /// the tag came in; its R and slot rows, and every testnet11 row, are the
+    /// literals this module was written with. That only the hints moved them
+    /// is `mainnets_keys_moved_only_because_its_hints_carry_the_network_tag`,
+    /// which still gives the rows written before the tag from the untagged
+    /// hints.
     const PINNED: [Pinned; 2] = [
         Pinned {
             net: ChiaNet::Testnet11,
@@ -375,22 +392,46 @@ mod tests {
             presence: [
                 (
                     0,
-                    "b689fd04bffab3b6075333fa25deea09c35513be012e473cc3bf503027b57b8cdcef3ceb9b44dc3ca796585d48fd2538",
-                    "9ea5b8d2c121dce8f5821f8471882d8a2353d8d29418fd84ca1265608c5485da",
+                    "b1f441cf2ae60c161254ad150a6bd68d158426e25396ca2e3f3f4b78a40ed4beb098e9c5320901f3cc0a90885a493615",
+                    "0a6d148ba2fa55cecf0cd1a124d7a5fb1f6f00687b88911fe6237d8d897c1e14",
                 ),
                 (
                     123,
-                    "922191345e4d74ecd765c3a5afd9ffd5157e5a1ecbdbab75a231f5bce72b99d71176fa3c7abb8ea59aec024f82be74b8",
-                    "275c95f3b55920e26e99dab5b7860706d6e0a9410842c172065ae37215e168c0",
+                    "84b0fe3ec28ae7db571cf8a26bea412e810d1c5ba437fd00238f2d3181251029bd8e44ac30173facf5a7ccbaa23623e3",
+                    "7fec215c16e131ee5f174aed91763e02eacce94da771ea7a709184b1934cc568",
                 ),
             ],
             knock: (
-                "b13c599e4d0e320020570676c64ec3566f00ddaa6e632ec975990ee6eb459eeb705b564c84c4885c7c64c8efd943f2fa",
-                "78cda1c3990cfde94eae79f40694acb27da1ecc539d4dad7e905a0f1034f8897",
+                "a94c0a50fe28625bdf2696c825759d685956e525d77b8b46b1be355d888e876ce75a9acd7f859cf08107e7b103ca39e4",
+                "5b8e98594807ed4a9d43fd7a1d140c67dec1ee5faac819212f1b3547b567ddaf",
             ),
             slots: [(0, [2724, 2043, 571]), (123, [1011, 2818, 686])],
         },
     ];
+
+    /// Mainnet's P(e) for [`ERAS`], as (era, public key, puzzle hash), as this
+    /// module pinned them before the network tag: what its code gave when
+    /// every network's hints were derived without one.
+    const MAINNET_P_BEFORE_THE_TAG: [(u64, &str, &str); 2] = [
+        (
+            0,
+            "b689fd04bffab3b6075333fa25deea09c35513be012e473cc3bf503027b57b8cdcef3ceb9b44dc3ca796585d48fd2538",
+            "9ea5b8d2c121dce8f5821f8471882d8a2353d8d29418fd84ca1265608c5485da",
+        ),
+        (
+            123,
+            "922191345e4d74ecd765c3a5afd9ffd5157e5a1ecbdbab75a231f5bce72b99d71176fa3c7abb8ea59aec024f82be74b8",
+            "275c95f3b55920e26e99dab5b7860706d6e0a9410842c172065ae37215e168c0",
+        ),
+    ];
+
+    /// Mainnet's K(h) for [`KNOCK_ERA`], as (public key, puzzle hash), as this
+    /// module pinned it before the network tag, like
+    /// [`MAINNET_P_BEFORE_THE_TAG`].
+    const MAINNET_K_BEFORE_THE_TAG: (&str, &str) = (
+        "b13c599e4d0e320020570676c64ec3566f00ddaa6e632ec975990ee6eb459eeb705b564c84c4885c7c64c8efd943f2fa",
+        "78cda1c3990cfde94eae79f40694acb27da1ecc539d4dad7e905a0f1034f8897",
+    );
 
     // --- Derivation (design §12) ---------------------------------------------
 
@@ -409,7 +450,7 @@ mod tests {
                 assert_eq!(pk_hex(&key.public_key()), *pk, "{:?}: P({era})'s public key", p.net);
                 assert_eq!(ph_hex(key.puzzle_hash()), *ph, "{:?}: P({era})'s puzzle hash", p.net);
             }
-            let key = root.knock(&inbox_hint(&CK_HOST, &ROOM_KEY, KNOCK_ERA), KNOCK_ERA);
+            let key = root.knock(&inbox_hint(p.net, &CK_HOST, &ROOM_KEY, KNOCK_ERA), KNOCK_ERA);
             assert_eq!(pk_hex(&key.public_key()), p.knock.0, "{:?}: K(h)'s public key", p.net);
             assert_eq!(ph_hex(key.puzzle_hash()), p.knock.1, "{:?}: K(h)'s puzzle hash", p.net);
             for (i, (era, slots)) in p.slots.iter().enumerate() {
@@ -418,6 +459,36 @@ mod tests {
                 assert_eq!(got, *slots, "{:?}: slot(1..=3, {era})", p.net);
             }
         }
+    }
+
+    /// §3.5 moved mainnet's P(e) and K(h) through their hints alone: fed the
+    /// hints as they were derived before the tag (the material without G,
+    /// recomputed here from the design's contexts), mainnet's root still
+    /// gives the keys this module pinned before the tag, so R, key(k, e, h)
+    /// and the knock's derivation did not change. testnet11's hints never had
+    /// a tag, so its rows in [`PINNED`] are the ones written before it.
+    #[test]
+    fn mainnets_keys_moved_only_because_its_hints_carry_the_network_tag() {
+        let root = BurnerRoot::of(&zero_money(), ChiaNet::Mainnet);
+        let untagged = |context: &str, parts: &[&[u8]]| -> [u8; 32] {
+            let mut h = blake3::Hasher::new_derive_key(context);
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize().into()
+        };
+        for (i, (era, pk, ph)) in MAINNET_P_BEFORE_THE_TAG.iter().enumerate() {
+            assert_eq!(*era, ERAS[i]);
+            let hint = untagged("ssf-chia-ck-hint-v1", &[&CK, &era.to_le_bytes()]);
+            assert_ne!(hint, chia_lane::derive_ck_hint(ChiaNet::Mainnet, &CK, *era), "mainnet's listing hint carries the tag");
+            let key = root.key(KIND_PRESENCE, *era, &hint);
+            assert_eq!((pk_hex(&key.public_key()).as_str(), ph_hex(key.puzzle_hash()).as_str()), (*pk, *ph), "P({era}) at the untagged hint");
+            assert_ne!(pk_hex(&root.presence(&CK, *era).public_key()).as_str(), *pk, "P({era}) moved with the hint");
+        }
+        let hint = untagged("ssf-chia-inbox-hint-v1", &[&CK_HOST, &derive_lane_token(&ROOM_KEY), &KNOCK_ERA.to_le_bytes()]);
+        assert_ne!(hint, inbox_hint(ChiaNet::Mainnet, &CK_HOST, &ROOM_KEY, KNOCK_ERA), "mainnet's inbox hint carries the tag");
+        let key = root.knock(&hint, KNOCK_ERA);
+        assert_eq!((pk_hex(&key.public_key()).as_str(), ph_hex(key.puzzle_hash()).as_str()), MAINNET_K_BEFORE_THE_TAG, "K(h) at the untagged hint");
     }
 
     /// §3.2 line by line: R, key(k, e, h) and slot(k, e) recomputed from
@@ -438,7 +509,7 @@ mod tests {
                 blake3::Hasher::new_derive_key("ssf-chia-burner-root-v1").update(&wallet.to_bytes()).update(&g).finalize().into();
             assert!(root.0 == r, "{net:?}: R is not derive_key(\"ssf-chia-burner-root-v1\", W ‖ G)");
             for era in [0u64, 1, 123, 1 << 40, u64::MAX] {
-                let hints = [(KIND_PRESENCE, chia_lane::derive_ck_hint(&CK, era)), (KIND_KNOCK, inbox_hint(&CK_HOST, &ROOM_KEY, era))];
+                let hints = [(KIND_PRESENCE, chia_lane::derive_ck_hint(net, &CK, era)), (KIND_KNOCK, inbox_hint(net, &CK_HOST, &ROOM_KEY, era))];
                 for (kind, hint) in hints {
                     let seed: [u8; 32] = blake3::Hasher::new_keyed(&r)
                         .update(b"ssf-chia-burner-v1")
@@ -493,11 +564,11 @@ mod tests {
                 for ck in [CK, [0x12; 32]] {
                     seen.push((format!("{net:?} P(ck {:02x}, era {era})", ck[0]), pk_hex(&root.presence(&ck, era).public_key())));
                     // The same hint under the other kind.
-                    let h = chia_lane::derive_ck_hint(&ck, era);
+                    let h = chia_lane::derive_ck_hint(*net, &ck, era);
                     seen.push((format!("{net:?} K(ck hint {:02x}, era {era})", ck[0]), pk_hex(&root.knock(&h, era).public_key())));
                 }
                 for room in [ROOM_KEY, [0x34; 32]] {
-                    let h = inbox_hint(&CK_HOST, &room, era);
+                    let h = inbox_hint(*net, &CK_HOST, &room, era);
                     seen.push((format!("{net:?} K(room {:02x}, era {era})", room[0]), pk_hex(&root.knock(&h, era).public_key())));
                     // The same hint under the other kind, through the private key(k, e, h).
                     seen.push((format!("{net:?} key(1, room {:02x}, era {era})", room[0]), pk_hex(&root.key(KIND_PRESENCE, era, &h).public_key())));
@@ -562,7 +633,7 @@ mod tests {
             for era in [0u64, 1, 123, 10_000] {
                 burners.push((format!("{net:?} P({era})"), root.presence(&CK, era)));
                 for room in [ROOM_KEY, [0x34; 32]] {
-                    burners.push((format!("{net:?} K(room {:02x}, {era})", room[0]), root.knock(&inbox_hint(&CK_HOST, &room, era), era)));
+                    burners.push((format!("{net:?} K(room {:02x}, {era})", room[0]), root.knock(&inbox_hint(net, &CK_HOST, &room, era), era)));
                 }
             }
             for (name, key) in &burners {
@@ -591,7 +662,7 @@ mod tests {
         for net in ChiaNet::ALL {
             let root = BurnerRoot::of(&money, net);
             for era in [0u64, 1, 123] {
-                for key in [root.presence(&CK, era), root.knock(&inbox_hint(&CK_HOST, &ROOM_KEY, era), era)] {
+                for key in [root.presence(&CK, era), root.knock(&inbox_hint(net, &CK_HOST, &ROOM_KEY, era), era)] {
                     assert_ne!(key.public_key(), beacon.public_key(), "{net:?}, era {era}");
                     assert_ne!(key.puzzle_hash(), chia_publish::our_puzzle_hash(&beacon), "{net:?}, era {era}");
                 }
@@ -614,7 +685,7 @@ mod tests {
                     assert_eq!(before.slot(kind, era), after.slot(kind, era), "{net:?}: slot({kind}, {era})");
                 }
                 assert_eq!(before.presence(&CK, era).public_key(), after.presence(&CK, era).public_key(), "{net:?}: P({era})");
-                let h = inbox_hint(&CK_HOST, &ROOM_KEY, era);
+                let h = inbox_hint(net, &CK_HOST, &ROOM_KEY, era);
                 assert_eq!(before.knock(&h, era).public_key(), after.knock(&h, era).public_key(), "{net:?}: K(h, {era})");
             }
         }
@@ -893,9 +964,9 @@ mod tests {
             ("impl MoneyKey, fn secret_key", "pub(crate) fn secret_key(&self) -> &SecretKey {"),
             ("impl MoneyKey, fn secret_key", "&self.0"),
             ("impl fmt::Debug for MoneyKey, fn fmt", "f.write_str(\"MoneyKey(..)\")"),
-            ("", "pub struct BurnerRoot([u8; 32]);"),
+            ("", "pub struct BurnerRoot([u8; 32], ChiaNet);"),
             ("impl BurnerRoot, fn of", "let w = Zeroizing::new(money.0.to_bytes());"),
-            ("impl BurnerRoot, fn of", "BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]))"),
+            ("impl BurnerRoot, fn of", "BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]), net)"),
             ("impl BurnerRoot, fn key", "let seed = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));"),
             ("impl BurnerRoot, fn key", "BurnerKey(SecretKey::from_seed(seed.as_bytes()))"),
             ("impl BurnerRoot, fn slot", "let out = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));"),
@@ -1006,7 +1077,7 @@ mod tests {
             assert_eq!(format!("{root:?}"), "BurnerRoot(..)");
             assert_eq!(format!("{root:#?}"), "BurnerRoot(..)");
             assert_redacted(&format!("{root:?}"), &root.0, "BurnerRoot");
-            for key in [root.presence(&CK, 0), root.knock(&inbox_hint(&CK_HOST, &ROOM_KEY, 0), 0)] {
+            for key in [root.presence(&CK, 0), root.knock(&inbox_hint(net, &CK_HOST, &ROOM_KEY, 0), 0)] {
                 let dbg = format!("{key:?}");
                 assert_eq!(dbg, format!("BurnerKey {{ fingerprint: {}, .. }}", key.public_key().get_fingerprint()));
                 assert_redacted(&dbg, &key.0.to_bytes(), "BurnerKey");
