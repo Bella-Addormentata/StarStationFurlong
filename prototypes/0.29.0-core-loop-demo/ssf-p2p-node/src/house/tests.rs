@@ -2169,6 +2169,131 @@ fn round_u_copies_after_a_trim_leave_the_house_unchanged() {
     }
 }
 
+// ── The first round past a checkpoint ───────────────────────────────────────
+
+/// Round 1 closed on the first house's join and revealed, carrying round 2's
+/// commitment on; then, with `step_down`, the first house stops and lifts it
+/// with a step-down at round 2. Returns the close it decided, the keys of
+/// round 1's reveals (what a v0.51 trim copies) and round 2's commitment.
+fn revealed_carrying(room: &mut Room, step_down: bool) -> (String, Vec<String>, String) {
+    let (alice, bob) = (who("alice"), who("bob"));
+    let (c, _, _) = room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    let reveal = room.records("h:1:");
+    assert_eq!(reveal.len(), 1, "round 1 revealed");
+    let next = str_of(&reveal[0].1, "c").expect("carrying round 2's commitment on").to_string();
+    assert_eq!(next, room.commit(2));
+    let mut copies: Vec<String> = room.records("x:1:").into_iter().map(|(k, _)| k).collect();
+    copies.push(reveal[0].0.clone());
+    if step_down {
+        room.house.begin_step_down();
+        room.tick(200);
+        let down = room.records("h:2:");
+        assert_eq!(down.len(), 1, "round 2's commitment stepped down");
+        assert!(strs(&down[0].1, "x").is_empty());
+    }
+    (c, copies, next)
+}
+
+/// A page's trim after round 1 (alice's), the checkpoint naming `h` as the
+/// commitment round 2 must carry, if any, and `copies` of round 1's records
+/// in the next session: its key.
+fn trimmed_after_round_1(room: &Room, c: &str, h: Option<&str>, copies: &[String]) -> String {
+    let mut body = vec![
+        ("v", CVal::Int(1)),
+        ("b", s("g")),
+        ("u", CVal::Int(1)),
+        ("l", s(c)),
+        ("n", obj(vec![("alice", s("-5")), ("bob", s("5"))])),
+    ];
+    if let Some(h) = h {
+        body.push(("h", s(h)));
+    }
+    room.trim(&who("alice"), obj(body), copies)
+}
+
+/// A tick of `house` at `room`'s doc, `after` ms on.
+fn tick_house(room: &mut Room, house: &mut House, after: u64) -> TickOut {
+    room.now += after;
+    house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now)
+}
+
+/// 🧷 PR 6a-3's finding #5: a v0.51 trim copies round u's house reveal into
+/// the next session but not the step-down at round u + 1 that lifted the
+/// commitment it carried, and the checkpoint rightly names no `h`. A second
+/// house arriving after the trim joins round u + 1: the pages ask it for no
+/// commitment, and the checkpoint's `h` is what they ask by, not the copy.
+#[test]
+fn a_second_house_joins_the_round_after_a_trim_dropped_the_firsts_step_down() {
+    let mut room = Room::new("trim-step-down-join", true);
+    let (c, copies, _) = revealed_carrying(&mut room, true);
+    trimmed_after_round_1(&room, &c, None, &copies);
+    assert!(room.records("h:").iter().all(|(k, _)| k.starts_with("h:1:")), "the step-down went with the old session");
+    let mut b_house = second_house(&room);
+    tick_house(&mut room, &mut b_house, 200);
+    let joins = room.records("o:2:");
+    assert_eq!(joins.len(), 1, "round 2 is open to it");
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_house.public()));
+    assert_eq!(str_of(&joins[0].1, "c"), Some(b_house.commit(&ctx(), 2).as_str()));
+}
+
+/// Where the checkpoint's `h` does name a commitment, a second house joins
+/// nothing at that round: with the first's reveal copied (v0.51) and with
+/// nothing copied (v0.50's trim), where the copy is not there to say so.
+#[test]
+fn a_second_house_joins_nothing_where_the_checkpoint_names_a_commitment() {
+    for copy in [true, false] {
+        let mut room = Room::new(&format!("trim-carry-{copy}"), true);
+        let (c, copies, next) = revealed_carrying(&mut room, false);
+        trimmed_after_round_1(&room, &c, Some(&next), if copy { &copies } else { &[] });
+        let mut b_house = second_house(&room);
+        for _ in 0..3 {
+            tick_house(&mut room, &mut b_house, 200);
+        }
+        assert!(room.records("o:").is_empty(), "copy {copy}: the checkpoint carries round 2's commitment on");
+    }
+}
+
+/// And once the house whose commitment the checkpoint names steps it down
+/// (a step-down at round 2 in the new session), the second joins.
+#[test]
+fn a_second_house_joins_once_the_first_lifts_the_checkpoints_commitment() {
+    let mut room = Room::new("trim-then-step-down", true);
+    let (c, copies, next) = revealed_carrying(&mut room, false);
+    trimmed_after_round_1(&room, &c, Some(&next), &copies);
+    let mut b_house = second_house(&room);
+    tick_house(&mut room, &mut b_house, 200);
+    assert!(room.records("o:2:").is_empty(), "held by the first's commitment");
+    room.house.begin_step_down();
+    room.tick(200);
+    assert_eq!(room.records("h:2:").len(), 1, "stepped down in the next session");
+    tick_house(&mut room, &mut b_house, 200);
+    let joins = room.records("o:2:");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(str_of(&joins[0].1, "k"), Some(b_house.public()));
+}
+
+/// The first house itself joins no round whose seed its step-down opened,
+/// the step-down dropped by a trim or not, with its state file or without
+/// one (a node moved to a new data directory with its key): the checkpoint
+/// has no `h`, but the seed is public all the same. The copied reveal's
+/// commitment is what keeps it out when its memory is gone.
+#[test]
+fn the_first_house_never_joins_a_round_whose_seed_its_step_down_published() {
+    let mut room = Room::new("trim-spent", true);
+    let (c, copies, _) = revealed_carrying(&mut room, true);
+    trimmed_after_round_1(&room, &c, None, &copies);
+    room.tick(200);
+    assert!(room.records("o:2:").is_empty(), "with its state file");
+    let mut again = House::open(&NODE, None).unwrap();
+    again.settle_ms = 0;
+    assert_eq!(again.public(), room.house.public(), "the same house");
+    tick_house(&mut room, &mut again, 200);
+    assert!(room.records("o:2:").is_empty(), "without it");
+}
+
 // ── Values a page may read otherwise (hb::Clarity) ──────────────────────────
 
 /// `v` as the doc holds it with a `__proto__` field `pad` as well: a peer's

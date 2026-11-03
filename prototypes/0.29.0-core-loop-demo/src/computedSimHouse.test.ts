@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { nextSid, recHash } from './computedFold';
-import type { CloseRec, FoldCtx, SlipRec } from './computedFold';
+import type { Checkpoint, CloseRec, FoldCtx, SlipRec } from './computedFold';
 import { beatKey, delegationKey, fairSettingKey, roomSignBytes } from './computedHouse';
 import type { RoomKind } from './computedHouse';
 import { SETTLE_MS, SimHouse } from './computedSimHouse';
@@ -66,8 +66,29 @@ class TwinRoom {
     return this.doc.getMap('casinoComputed');
   }
 
+  /** The live session: the one the table's checkpoint opened, the genesis
+   *  one before any. */
   ses(t = T, inc = INC): Y.Map<unknown> {
-    return this.top().get(`ses:${t}:${inc}:${nextSid({ room: ROOM, t, inc }, null)}`) as Y.Map<unknown>;
+    const cp = (this.top().get(`sum:${t}:${inc}`) as Checkpoint | undefined) ?? null;
+    return this.top().get(`ses:${t}:${inc}:${nextSid({ room: ROOM, t, inc }, cp)}`) as Y.Map<unknown>;
+  }
+
+  /** A page's trim of table T (alice's): a checkpoint closing the live
+   *  session at round `u` on close `l`, naming `h` as the commitment the next
+   *  round must carry if any, and the session it opens holding `copies` of
+   *  the old one's records (what a v0.51 page copies; none, v0.50's). */
+  trim(u: number, l: string, h: string | undefined, copies: string[]): void {
+    const prev = (this.top().get(`sum:${T}:${INC}`) as Checkpoint | undefined) ?? null;
+    const cp = kit.checkpoint(alice, kit.sidAfter(prev), u, l, { alice: -5n, bob: 5n }, undefined, undefined, h);
+    const old = this.ses();
+    const kept = copies.map((k) => [k, old.get(k)] as const);
+    this.doc.transact(() => {
+      const next = new Y.Map<unknown>();
+      this.top().set(`sum:${T}:${INC}`, cp);
+      this.top().delete(`ses:${T}:${INC}:${kit.sidAfter(prev)}`);
+      this.top().set(`ses:${T}:${INC}:${kit.sidAfter(cp)}`, next);
+      for (const [k, v] of kept) next.set(k, v);
+    });
   }
 
   put(...recs: Built<unknown>[]): void {
@@ -79,6 +100,19 @@ class TwinRoom {
   tick(after: number): void {
     this.now += after;
     for (const h of [this.house, ...this.others]) h.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+  }
+
+  /** A tick of `house` alone, `after` ms on. */
+  tickOne(house: SimHouse, after: number): void {
+    this.now += after;
+    house.tick(ROOM, this.doc, this.now, 1_700_000_000_000 + this.now);
+  }
+
+  /** A house just added ticks past its settle, and once more. */
+  settle(): void {
+    this.tick(0);
+    this.tick(SETTLE_MS);
+    this.tick(200);
   }
 
   /** The live session's records under a key prefix (`h:1:`, `o:`). */
@@ -474,5 +508,91 @@ describe('the simulations\' house, as house.rs', () => {
     room.doc.transact(() => room.ses().set(key, { r: 1, s: 'junk' }));
     room.tick(1_000);
     expect(room.entries('h:1:')).toEqual([[key, rec]]);
+  });
+
+  // ── The first round past a checkpoint ──
+
+  /** Round 1 closed on the first house's join and revealed, carrying round
+   *  2's commitment on; then, with `stepDown`, the first house stops and
+   *  lifts it with a step-down at round 2. The close it decided, the keys of
+   *  round 1's reveals (what a v0.51 trim copies) and round 2's commitment. */
+  function revealedCarrying(room: TwinRoom, stepDown: boolean): { c: Built<CloseRec>; copies: string[]; next: string } {
+    const { c } = room.closedOnTheJoin();
+    room.put(kit.reveal(1, 'alice'), kit.reveal(1, 'bob'));
+    room.tick(200);
+    const reveal = room.entries('h:1:');
+    expect(reveal).toHaveLength(1);
+    const next = reveal[0][1].c as string;
+    expect(next).toBe(kit.houseCommit(H, 2));
+    const copies = [...room.entries('x:1:').map(([k]) => k), reveal[0][0]];
+    if (stepDown) {
+      room.house.steppingDown = true;
+      room.tick(200);
+      expect(room.recs('h:2:').map((v) => v.x)).toEqual([[]]);
+    }
+    return { c, copies, next };
+  }
+
+  it('a second house joins the round after a trim dropped the first\'s step-down', () => {
+    // A v0.51 trim copies round u's house reveal into the next session but
+    // not the step-down at round u + 1 that lifted the commitment it carried,
+    // and the checkpoint rightly names no `h`: the copy must not hold the
+    // second house out of round u + 1 (the pages ask it for no commitment).
+    const room = new TwinRoom().start();
+    const { c, copies } = revealedCarrying(room, true);
+    room.trim(1, c.hash, undefined, copies);
+    expect(room.entries('h:').every(([k]) => k.startsWith('h:1:'))).toBe(true);
+    const other = room.secondHouse();
+    room.settle();
+    // Round 2 is the second's alone: the first's seed is public.
+    const joins = room.entries('o:2:');
+    expect(joins.map(([, v]) => v.k)).toEqual([other.pub]);
+    expect(joins[0][1].c).toBe(kit.houseCommit(H2, 2));
+  });
+
+  it('a second house joins nothing where the checkpoint names a commitment', () => {
+    // With the first's reveal copied (v0.51) and with nothing copied (v0.50),
+    // where the copy is not there to say so.
+    for (const copy of [true, false]) {
+      const room = new TwinRoom().start();
+      const { c, copies, next } = revealedCarrying(room, false);
+      room.trim(1, c.hash, next, copy ? copies : []);
+      room.secondHouse();
+      room.settle();
+      room.tick(200);
+      expect(room.entries('o:'), `copy ${copy}`).toEqual([]);
+    }
+  });
+
+  it('a second house joins once the first lifts the checkpoint\'s commitment', () => {
+    const room = new TwinRoom().start();
+    const { c, copies, next } = revealedCarrying(room, false);
+    room.trim(1, c.hash, next, copies);
+    const other = room.secondHouse();
+    room.settle();
+    expect(room.entries('o:2:')).toEqual([]);
+    room.house.steppingDown = true;
+    room.tick(200);
+    expect(room.recs('h:2:')).toHaveLength(1);
+    room.tick(200);
+    expect(room.entries('o:2:').map(([, v]) => v.k)).toEqual([other.pub]);
+  });
+
+  it('the first house never joins a round whose seed its step-down published', () => {
+    // The step-down dropped by a trim or not, with its memory or without it
+    // (a node moved to a new data directory with its key): the checkpoint has
+    // no `h`, but the seed is public all the same. The copied reveal's
+    // commitment is what keeps it out when its memory is gone.
+    const room = new TwinRoom().start();
+    const { c, copies } = revealedCarrying(room, true);
+    room.trim(1, c.hash, undefined, copies);
+    room.tick(200);
+    expect(room.entries('o:2:'), 'with its memory').toEqual([]);
+    const again = new SimHouse(H.secret);
+    expect(again.pub).toBe(room.house.pub);
+    room.tickOne(again, 0);
+    room.tickOne(again, SETTLE_MS);
+    room.tickOne(again, 200);
+    expect(room.entries('o:2:'), 'without it').toEqual([]);
   });
 });
