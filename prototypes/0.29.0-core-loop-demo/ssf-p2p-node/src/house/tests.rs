@@ -3825,6 +3825,39 @@ fn the_fold_follows_the_house_tables_of_a_room_this_house_is_a_house_of() {
     assert_eq!(plan.tables, vec![(T.to_string(), INC.to_string())]);
     assert_eq!(plan.houses, vec![room.house.public().to_string()]);
     assert!(plan.complete);
+    assert_eq!(plan.owner, "owner", "the deed holder the houses stand under, as roomInfo names them");
+}
+
+/// What `roomInfo.owner` names as the deed holder: a string that names someone (a room that is nobody's says
+/// "Local-Clone", an unset one is nothing).
+#[test]
+fn the_deed_holder_is_a_string_that_names_someone() {
+    use yrs::{Any, Out};
+    let string = |v: &str| Some(Out::Any(Any::String(v.into())));
+    assert_eq!(deed_of(string("alice")), Some("alice".to_string()));
+    assert_eq!(deed_of(string("")), None, "empty");
+    assert_eq!(deed_of(string("Local-Clone")), None, "nobody's room");
+    assert_eq!(deed_of(Some(Out::Any(Any::Number(1.0)))), None, "not a string");
+    assert_eq!(deed_of(None), None, "unset");
+}
+
+/// The plan is of the deed holder the pass read: a pass after the deed changed hands names the new one.
+#[test]
+fn the_plan_names_the_deed_holder_the_pass_read() {
+    let mut room = Room::new("fold-view-owner", true);
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room).expect("a plan").owner, "owner");
+    // The deed goes to another player of the room, who has a key pinned and has not delegated this house: no plan.
+    let alice = who("alice");
+    {
+        let mut txn = room.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s(&alice.public))])));
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None, "(the house is delegated by the last holder, not this one)");
 }
 
 #[test]

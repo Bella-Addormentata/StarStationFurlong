@@ -496,3 +496,100 @@ fn a_players_map_that_takes_longer_than_the_walk_time_is_unsettled() {
     // The node's own watch carries the time.
     assert_eq!(PIN_WALK_TIME, Duration::from_millis(20));
 }
+
+// ── Review round 5 ───────────────────────────────────────────────────────────
+
+/// The walk's time is the doc's held for the read: a write being committed holds the read up, and the wait is not
+/// counted. (A map of 200 is read in a moment; held up for far longer than the walk may take, it is still read whole.)
+#[test]
+fn the_walk_time_is_the_time_the_doc_is_read_for_and_not_the_wait_for_the_doc() {
+    let doc = Doc::new();
+    for i in 0..200 {
+        put(&doc, &format!("p{i:03}"), &key(&format!("{i}")));
+    }
+    let shared = Arc::new(Mutex::new(PinState::default()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = {
+        let doc = doc.clone();
+        std::thread::spawn(move || {
+            let txn = doc.transact_mut();
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(txn);
+        })
+    };
+    rx.recv().unwrap();
+    let began = Instant::now();
+    let walked = walk(&doc, &shared, PIN_WALK_KEYS, Some(Duration::from_millis(100)));
+    assert!(began.elapsed() > Duration::from_millis(200), "(the read did wait for the write: {:?})", began.elapsed());
+    writer.join().unwrap();
+    assert!(walked, "a wait for the doc is not a slow read of it");
+    assert_eq!(lock(&shared).pins.len(), 200);
+}
+
+fn owner_map(doc: &Doc) -> yrs::MapRef {
+    doc.get_or_insert_map("roomInfo")
+}
+
+fn set_owner(doc: &Doc, v: &str) {
+    let info = owner_map(doc);
+    let mut txn = doc.transact_mut();
+    info.insert(&mut txn, "owner", v);
+}
+
+/// The deed holder is watched with the pins: read when the watch starts, and noted when it changes, and a change moves
+/// the epoch (the houses every page counts are the holder's).
+#[test]
+fn the_deed_holder_is_watched_and_a_change_of_holder_moves_the_epoch() {
+    let doc = Doc::new();
+    set_owner(&doc, "alice");
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    assert_eq!(p.deed(), Some("alice".to_string()), "read when the watch starts");
+    let epoch = p.view_at().2;
+    assert_eq!(epoch, 0, "(and that moves nothing)");
+    // The same holder written again is no change.
+    set_owner(&doc, "alice");
+    assert_eq!(p.view_at().2, epoch);
+    // The deed changes hands.
+    set_owner(&doc, "bob");
+    let (_, settled, now, deed) = p.view_full();
+    assert_eq!((deed, now), (Some("bob".to_string()), epoch + 1));
+    assert!(settled, "(the pins are not doubted by it)");
+    // A holder no house can stand under: none, an empty name, or the placeholder of a clone made on the spot.
+    for (value, name) in [("", "empty"), ("Local-Clone", "a local clone")] {
+        set_owner(&doc, "carol");
+        let before = p.view_at().2;
+        set_owner(&doc, value);
+        assert_eq!(p.deed(), None, "{name}");
+        assert_eq!(p.view_at().2, before + 1, "{name}");
+    }
+    {
+        let info = owner_map(&doc);
+        set_owner(&doc, "dave");
+        let before = p.view_at().2;
+        let mut txn = doc.transact_mut();
+        info.remove(&mut txn, "owner");
+        drop(txn);
+        assert_eq!(p.deed(), None, "removed");
+        assert_eq!(p.view_at().2, before + 1);
+    }
+    // Another key of the room's info is no concern.
+    let before = p.view_at().2;
+    {
+        let info = owner_map(&doc);
+        let mut txn = doc.transact_mut();
+        info.insert(&mut txn, "name", "the room");
+    }
+    assert_eq!(p.view_at().2, before);
+}
+
+/// A room with no deed holder named yet, and one that gets it.
+#[test]
+fn a_room_that_names_no_deed_holder_at_first_is_told_when_it_does() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    assert_eq!(p.deed(), None);
+    set_owner(&doc, "alice");
+    assert_eq!(p.deed(), Some("alice".to_string()));
+    assert_eq!(p.view_at().2, 1);
+}

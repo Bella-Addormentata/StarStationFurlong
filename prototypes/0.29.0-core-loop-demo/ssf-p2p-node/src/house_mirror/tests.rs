@@ -2085,3 +2085,245 @@ fn a_drain_that_has_taken_its_time_stops_and_the_next_goes_on() {
     assert_eq!(Limits::live().drain_time, Some(DRAIN_TIME));
     assert_eq!(Limits::default().drain_time, None);
 }
+
+// ── Review round 5 ───────────────────────────────────────────────────────────
+
+/// A value is told written again as it stands only within a weight (the observer runs in the doc's commit): a heavier
+/// one is not compared, and is another; nor is one a page may read otherwise.
+#[test]
+fn a_value_is_told_written_again_only_within_a_weight() {
+    let v = |n: usize| Any::String(Arc::from("x".repeat(n)));
+    let again = |n: usize, cap: usize| rewritten_alike(&EntryChange::Updated(Out::Any(v(n)), Out::Any(v(n))), cap);
+    assert!(again(100, 1_000));
+    assert!(!again(2_000, 1_000), "heavier than the cap: another");
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(v(10)), Out::Any(v(11))), 1_000), "a different value");
+    assert!(!rewritten_alike(&EntryChange::Inserted(Out::Any(v(10))), 1_000), "an insert");
+    assert!(!rewritten_alike(&EntryChange::Removed(Out::Any(v(10))), 1_000), "a removal");
+    let proto = || Any::Map(Arc::new(std::collections::HashMap::from([("v".to_string(), Any::Number(1.0)), ("__proto__".to_string(), Any::String(Arc::from("x")))])));
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(proto()), Out::Any(proto())), 1_000), "one a page may read otherwise");
+    // A map of nested members, the same, within the weight.
+    let nested = || Any::Map(Arc::new(std::collections::HashMap::from([("a".to_string(), Any::Array(vec![Any::Number(1.0), Any::String(Arc::from("y"))].into()))])));
+    assert!(rewritten_alike(&EntryChange::Updated(Out::Any(nested()), Out::Any(nested())), 1_000));
+    // Too deep to weigh: another.
+    let mut deep = Any::Number(1.0);
+    for _ in 0..(hb::MAX_DEPTH + 4) {
+        deep = Any::Array(vec![deep].into());
+    }
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(deep.clone()), Out::Any(deep)), 1_000_000), "deeper than a record goes");
+}
+
+/// A delegation too heavy to be compared in the commit is not compared: written again as it stands, it is churn. One
+/// within the weight is no churn (the test above of round 4).
+#[test]
+fn a_delegation_heavier_than_the_house_reads_is_churn_when_written_again() {
+    for (weight, churn) in [(MAX_TOP_BYTES - 200, false), (MAX_TOP_BYTES + 200, true)] {
+        let doc = Doc::new();
+        let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+        let f = Fix { doc, m };
+        let rec = || obj(vec![("x", s(&"y".repeat(weight)))]);
+        f.put_top("hk:house-a", &rec());
+        f.put_top("hk:house-a", &rec());
+        assert_eq!(f.m.delegations(), Delegations { changes: if churn { 2 } else { 1 }, churned: churn }, "weight {weight}");
+    }
+}
+
+fn heavy(tag: i64) -> CVal {
+    obj(vec![("v", CVal::Int(1)), ("n", CVal::Int(tag)), ("x", s(&"c".repeat(READ_PER_TICK)))])
+}
+
+/// A checkpoint the node cannot read cannot be told from another it cannot read: one written since the last look is
+/// another, so the trim counts, and a look at the same one again does not count it twice.
+#[test]
+fn a_checkpoint_the_node_cannot_read_replaced_by_another_it_cannot_read_is_a_trim() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &heavy(1));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 0), "(the first base is no trim)");
+    f.drain();
+    f.drain();
+    assert_eq!(f.state().trims, 0, "nothing written, nothing changed");
+    let (generation, version) = (f.state().generation, f.state().version);
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 1), "another it cannot read");
+    assert!(f.state().generation > generation && f.state().version > version, "the table started over on it");
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!(f.state().trims, 2, "(the node cannot tell the same one written again)");
+    f.drain();
+    assert_eq!(f.state().trims, 2, "and once");
+    // The same of a checkpoint a page may read otherwise.
+    let proto = |u: i64| {
+        let CVal::Obj(fields) = cp(u) else { unreachable!() };
+        let mut map: std::collections::HashMap<String, Any> = fields.iter().map(|(k, v)| (k.clone(), to_any(v))).collect();
+        map.insert("__proto__".into(), Any::String(Arc::from("x")));
+        Any::Map(Arc::new(map))
+    };
+    f.put_any(&sum_of(T), proto(5));
+    f.drain();
+    assert_eq!(f.state().trims, 3);
+    f.put_any(&sum_of(T), proto(6));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 4));
+    // And a checkpoint it can read after one it cannot is a trim, as before.
+    f.put_top(&sum_of(T), &cp(7));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (None, 5));
+}
+
+/// A second checkpoint the node cannot read, where the first was the table's first: that is the first trim.
+#[test]
+fn the_first_trim_after_a_first_checkpoint_the_node_cannot_read_is_counted() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &heavy(1));
+    f.drain();
+    assert_eq!(f.state().trims, 0);
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+}
+
+/// Checkpoints a page wrote and another page wrote over before the table was read: the table read the last, and
+/// says how many it did not (each was a trim the node had nothing to hold anything against).
+#[test]
+fn checkpoints_written_over_before_the_table_read_them_are_counted_once_each() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.session(&live_of(T, Some(&cp(1))), &[]);
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (0, 0), "(the first base)");
+    // Three written, one drain: the last is read; the two before it were written over.
+    for u in [2, 3, 4] {
+        f.put_top(&sum_of(T), &cp(u));
+    }
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    assert_eq!(f.m.take_superseded(T, INC), 2);
+    assert_eq!(f.m.take_superseded(T, INC), 0, "told once");
+    // One written between looks, each time: none.
+    f.put_top(&sum_of(T), &cp(5));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(6));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0);
+    // Two in two transactions with nothing read between, though they are the very same checkpoint: one write.
+    f.put_top(&sum_of(T), &cp(7));
+    f.put_top(&sum_of(T), &cp(7));
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (4, 0), "a checkpoint written again as it stands is written over by nothing");
+    // A table not mirrored has none to tell.
+    assert_eq!(f.m.take_superseded("elsewhere", INC), 0);
+}
+
+/// A removal is no checkpoint; one that ends the run leaves the checkpoint before it unread.
+#[test]
+fn a_removal_is_no_checkpoint_written_over_and_one_that_comes_last_leaves_the_checkpoint_before_it_unread() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.drain();
+    // A checkpoint, its removal, another: the first was written over; the removal is nothing.
+    f.put_top(&sum_of(T), &cp(2));
+    f.remove_top(&sum_of(T));
+    f.put_top(&sum_of(T), &cp(3));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 1);
+    // A checkpoint and its removal: the checkpoint was never read.
+    f.put_top(&sum_of(T), &cp(4));
+    f.remove_top(&sum_of(T));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 1);
+    assert!(f.state().base.is_none(), "(and the base is none)");
+    // A removal alone: nothing was written over.
+    f.put_top(&sum_of(T), &cp(5));
+    f.drain();
+    f.remove_top(&sum_of(T));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0);
+}
+
+/// The count is the mirror's own: the first read of a table counts nothing, whatever was written before it; and what a
+/// table counted before it was let go of is not told of when it comes back.
+#[test]
+fn the_checkpoints_written_before_the_first_look_and_those_of_a_table_let_go_of_are_not_counted() {
+    let mut f = Fix::seeded(Limits::default(), |f| {
+        f.put_top(&sum_of(T), &cp(1));
+        f.put_top(&sum_of(T), &cp(2));
+    });
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (0, 0));
+    f.put_top(&sum_of(T), &cp(3));
+    f.put_top(&sum_of(T), &cp(4));
+    f.m.want(&[]);
+    f.m.want(&[(T.into(), INC.into())]);
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0, "(it is a table taken up afresh)");
+}
+
+/// A checkpoint of `players` nets of long ids: it weighs about `players * 200` bytes, and a page reads it.
+fn cp_weighing(u: i64, players: usize) -> CVal {
+    let CVal::Obj(mut fields) = cp(u) else { unreachable!() };
+    let nets: Vec<(String, CVal)> = (0..players).map(|i| (format!("{i:0>200}"), s("1"))).collect();
+    for f in fields.iter_mut() {
+        if f.0 == "n" {
+            f.1 = CVal::Obj(nets.clone());
+        }
+    }
+    norm(CVal::Obj(fields))
+}
+
+/// A checkpoint written again as it stands is the same checkpoint: no trim, and written over by nothing, whatever its
+/// weight up to what the house tells apart (the delegation's weight is no bound for it); past that weight a page's
+/// put-back cannot be told from another checkpoint, and counts as one.
+#[test]
+fn a_checkpoint_written_again_as_it_stands_is_the_same_one_up_to_a_weight() {
+    for (players, alike) in [(40usize, true), (1_600, false)] {
+        let mut f = Fix::empty();
+        f.put_top(&sum_of(T), &cp(1));
+        f.session(&live_of(T, Some(&cp(1))), &[]);
+        f.drain();
+        let big = cp_weighing(2, players);
+        let weight = hb::weight(&to_any(&big), usize::MAX).expect("it weighs");
+        assert!(if alike { weight > MAX_TOP_BYTES && weight < ALIKE_SUM_BYTES } else { weight > ALIKE_SUM_BYTES && weight < READ_PER_TICK }, "players {players}: weighs {weight}");
+        f.put_top(&sum_of(T), &big);
+        f.drain();
+        assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (1, 0), "players {players}");
+        assert!(f.state().base.is_some(), "(a base the node reads)");
+        // Written again, as it stands, between two looks: the same base.
+        f.put_top(&sum_of(T), &big);
+        f.drain();
+        assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (1, 0), "players {players}: written again between looks");
+        // ... and twice, with nothing read between.
+        f.put_top(&sum_of(T), &cp_weighing(3, players));
+        f.put_top(&sum_of(T), &cp_weighing(3, players));
+        f.drain();
+        assert_eq!(f.state().trims, 2, "players {players}");
+        assert_eq!(f.m.take_superseded(T, INC), u64::from(!alike), "players {players}: the second of two alike is {}", if alike { "no checkpoint of its own" } else { "another, past the weight" });
+    }
+}
+
+/// The writes of checkpoints are added over drains that do not reach the table, and forgotten with the table.
+#[test]
+fn the_checkpoints_written_across_short_drains_are_counted_all_and_those_of_a_table_let_go_of_are_not_kept() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.session(&live_of(T, Some(&cp(1))), &[]);
+    f.drain();
+    f.m.limits.drain_paths = 0;
+    f.put_top(&sum_of(T), &cp(2));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(3));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(4));
+    f.drain();
+    assert_eq!(f.state().trims, 0, "(nothing was read)");
+    f.m.limits.drain_paths = DRAIN_PATHS;
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    assert_eq!(f.m.take_superseded(T, INC), 2, "three written over three drains that read nothing, the last read");
+    // The writes of a table let go of are not kept.
+    f.put_top(&sum_of(T), &cp(5));
+    f.put_top(&sum_of(T), &cp(6));
+    f.m.want(&[]);
+    f.drain();
+    assert!(f.m.pending.writes.is_empty(), "{:?}", f.m.pending.writes);
+}

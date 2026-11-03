@@ -294,11 +294,11 @@ fn each_verdict_is_counted_under_its_own_name() {
     let mut t = Tally::default();
     t.note(&Verdict::Agree);
     t.note(&Verdict::Mismatch("x".into()));
-    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired] {
+    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded] {
         t.note(&Verdict::Skip(why));
     }
-    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1 });
-    assert_eq!(t.skipped(), 10);
+    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1 });
+    assert_eq!(t.skipped(), 11);
     t.note(&Verdict::Skip(Skip::Pending));
     assert_eq!(t.pending, 2);
 }
@@ -357,6 +357,9 @@ use std::thread;
 use std::time::Duration;
 use yrs::{Map, MapPrelim};
 
+/// The deed holder of the benches' rooms (`roomInfo.owner`), whose houses the plans stand for.
+const OWNER: &str = "owner";
+
 /// One vector's table in a doc, followed by a `FoldShadow` whose worker is the
 /// real engine in a thread.
 struct Bench {
@@ -397,7 +400,15 @@ impl Bench {
             listed: true,
         };
         bench.write_session();
+        bench.set_owner(OWNER);
         bench
+    }
+
+    /// The deed of the room is held by `pid` (the room's `roomInfo.owner`).
+    fn set_owner(&self, pid: &str) {
+        let info = self.doc.get_or_insert_map("roomInfo");
+        let mut txn = self.doc.transact_mut();
+        info.insert(&mut txn, "owner", pid);
     }
 
     fn room(&self) -> &str {
@@ -629,6 +640,10 @@ fn a_view_with_other_tables_follows_them_and_lets_the_old_ones_go() {
     let mut b = Bench::new("house roulette 3");
     b.until("the first answer", |b| b.caught_up());
     b.view.as_mut().unwrap().tables = vec![("elsewhere".to_string(), b.case.ctx.inc.clone())];
+    // (The old table is kept for its grace, as any the plan stops naming; then it is let go of.)
+    b.ticks(5);
+    assert_eq!(b.forgets(), 0);
+    b.now += GONE_GRACE + Duration::from_secs(1);
     b.until("the table is forgotten", |b| b.forgets() == 1);
     let rs = &b.shadow.rooms[b.room()];
     assert!(rs.feed.fold(&b.case.ctx.t, &b.case.ctx.inc).is_none());
@@ -660,11 +675,11 @@ fn when_the_fold_duties_are_off_for_good_nothing_is_followed_and_the_report_says
 #[test]
 fn the_report_adds_up_what_the_shadow_found_and_what_the_feeds_did() {
     let mut b = Bench::new("house roulette 3");
-    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12 };
+    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13 };
     b.shadow.gone = Counts { cold: 10, warm: 20, forgets: 30, results: 40, dirty: 11, lost: 12, busy: 50, too_big: 13, bad_results: 14 };
     let r = b.shadow.report();
     assert_eq!((r.shadow_agreed, r.shadow_mismatches), (1, 2));
-    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12, "every kind of skip");
+    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13, "every kind of skip");
     assert_eq!((r.cold_folds, r.dirty, r.lost), (10, 11, 12));
     assert_eq!(r.bad_results, 14 + 13, "a result and a frame nobody could use");
 }
@@ -790,7 +805,7 @@ fn the_checkpoint_that_ended_a_table_is_compared_before_the_table_is_let_go_of()
     b.view.as_mut().unwrap().tables.clear();
     b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.forgets(), 1);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "once");
 }
@@ -881,15 +896,19 @@ fn a_difference_is_not_counted_while_the_rooms_players_are_not_all_pinned_yet() 
     assert_eq!(b.shadow.report().shadow_mismatches, 0);
 }
 
+/// A room the house has a plan for is watched from the plan on, with a table to follow or none (what the mirror sees of
+/// its delegations is the room's history, whatever tables come): nothing is read of it, and the worker is told nothing.
 #[test]
-fn a_room_with_no_table_to_follow_is_not_attached_to() {
+fn a_room_with_a_plan_and_no_table_to_follow_is_watched_and_nothing_is_read_or_sent() {
     let mut b = Bench::new("house roulette 3");
     b.view.as_mut().unwrap().tables.clear();
     b.ticks(10);
-    assert!(b.shadow.rooms.is_empty(), "no mirror on a room with nothing in it to fold");
-    assert_eq!(ATTACHED.with(|n| n.get()), 0, "not even for a tick");
+    assert_eq!(b.shadow.rooms.len(), 1, "the room is watched");
+    assert_eq!(ATTACHED.with(|n| n.get()), 1);
     let r = b.shadow.report();
-    assert_eq!((r.rooms, r.tables, r.tables_over, r.cold_folds), (0, 0, 0, 0));
+    assert_eq!((r.rooms, r.tables, r.tables_over, r.cold_folds), (1, 0, 0, 0));
+    assert_eq!(b.shadow.counts(), Counts::default(), "and the worker is told nothing");
+    assert_eq!(b.shadow.rooms[b.room()].mirror.resets(), 0, "and no table is read");
 }
 
 #[test]
@@ -1304,6 +1323,9 @@ fn a_forget_the_worker_could_not_take_holds_back_the_new_tables_of_every_room() 
         }
     }
     assert_eq!(b.shadow.counts().results, 2);
+    // The plan stops naming the long table (the pages count it ended), and its grace passes: it is to be let go of.
+    b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0"])))]);
+    b.now += GONE_GRACE + Duration::from_secs(1);
     // The pipe has room for a small frame and not for the long table's word.
     b.shadow.sup.clog(QUEUE_BYTES - 2_000);
     let cold = b.shadow.counts().cold;
@@ -1353,7 +1375,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
     let b = Bench::new("house roulette 3");
     let (doc, houses) = (b.doc.clone(), b.case.houses.clone());
     let shadow = Mutex::new(b.shadow);
-    let plan = HousePlan { tables: vec![], houses, complete: true };
+    let plan = HousePlan { owner: OWNER.to_string(), tables: vec![], houses, complete: true };
     let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
     // A room with a plan and no table is watched; one with no plan is not.
     tick_shadow(&shadow, docs(&["with", "without"]), Instant::now(), |r| (r == "with").then(|| plan.clone())).unwrap();
@@ -1388,7 +1410,7 @@ fn a_view_is_settled_only_with_a_plan_that_is_complete_and_pins_that_are() {
     let wrong = b.wrong_trim(&b.answer());
     let shadow = Mutex::new(b.shadow);
     let go = |complete: bool| {
-        let plan = HousePlan { tables: tables.clone(), houses: houses.clone(), complete };
+        let plan = HousePlan { owner: OWNER.to_string(), tables: tables.clone(), houses: houses.clone(), complete };
         tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
     };
     let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
@@ -1473,6 +1495,11 @@ impl Bench {
         let casino = self.doc.get_or_insert_map(crate::house::CASINO_MAP);
         let mut txn = self.doc.transact_mut();
         casino.insert(&mut txn, format!("gone:{t}:{}", self.case.ctx.inc), to_any(&CVal::Int(1)));
+    }
+
+    /// The tables the room's mirror holds.
+    fn tables_held(&self) -> usize {
+        self.shadow.rooms.get(self.room()).map_or(0, |rs| rs.mirror.tables().count())
     }
 
     fn confirmed_count(&self) -> usize {
@@ -1656,7 +1683,7 @@ fn a_table_a_page_removed_is_kept_for_the_final_checkpoint_its_compaction_writes
     b.put_checkpoint(&ended);
     b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.forgets(), 1, "right after, though the grace was not over");
 }
 
@@ -1674,7 +1701,7 @@ fn a_table_a_page_removed_is_let_go_of_when_the_grace_is_over_and_no_final_check
     b.ticks(5);
     assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "just short of the grace");
     b.now += Duration::from_secs(2);
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.forgets(), 1);
     assert_eq!(b.shadow.tally, Tally { expired: 1, ..Tally::default() }, "and the comparison not made is counted, once");
     assert_eq!(b.shadow.report().shadow_skipped, 1);
@@ -1729,7 +1756,7 @@ fn the_grace_of_a_removed_table_counts_from_the_tick_it_left_the_plan() {
     b.ticks(5);
     assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "short of the grace after it left");
     b.now += Duration::from_secs(30);
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.forgets(), 1);
 }
 
@@ -1750,7 +1777,7 @@ fn a_trim_is_held_against_the_node_through_its_own_watch_of_the_players() {
         let live = format!("ses:{}:{}:{}", tables[0].0, tables[0].1, crate::house_bytes::next_sid(&b.case.ctx, Some(&wrong)).unwrap());
         let shadow = Mutex::new(b.shadow);
         let go = || {
-            let plan = HousePlan { tables: tables.clone(), houses: houses.clone(), complete: true };
+            let plan = HousePlan { owner: OWNER.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true };
             tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
         };
         let confirmed = || shadow.lock().unwrap().rooms.get(&room).map_or(0, |rs| rs.confirmed.len());
@@ -1786,14 +1813,84 @@ fn a_trim_is_held_against_the_node_through_its_own_watch_of_the_players() {
     }
 }
 
-/// A table that leaves the plan with no mark of a removal is let go of at once, as before.
+/// A table that leaves the plan with no mark of a removal is kept as a removed one is: the plan names the tables whose
+/// switch names a live incarnation, so one it stopped naming is one the pages count ended (its switch went), and a page
+/// compacts it in its turn.
 #[test]
-fn a_table_that_left_the_plan_with_no_mark_of_a_removal_is_let_go_of_at_once() {
+fn a_table_that_left_the_plan_with_no_mark_of_a_removal_is_kept_for_the_final_checkpoint_all_the_same() {
     let mut b = Bench::new("house roulette 3");
     b.until("the first answer", |b| b.caught_up());
+    let (t, inc) = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let sum = b.answer();
+    let u = last_decided(&sum).expect("a decided round");
+    let ended = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
     b.view.as_mut().unwrap().tables.clear();
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    for _ in 0..4 {
+        b.now += Duration::from_secs(10);
+        b.ticks(5);
+    }
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "still held, 40 seconds on");
+    assert_eq!(b.forgets(), 0);
+    // The compaction's checkpoint comes, and is compared.
+    b.put_checkpoint(&ended);
+    b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.forgets(), 1);
+}
+
+/// A table that is replaced by another incarnation of it (the plan names the new one, and the old has no mark of a
+/// removal) is kept for its final checkpoint, and the new is followed.
+#[test]
+fn a_table_replaced_by_another_incarnation_is_kept_for_the_final_checkpoint_of_the_old() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    let (t, inc) = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let sum = b.answer();
+    let u = last_decided(&sum).expect("a decided round");
+    let ended = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+    // The switch names another incarnation of the same table.
+    let again = format!("{inc}-2");
+    b.view.as_mut().unwrap().tables = vec![(t.clone(), again.clone())];
+    b.ticks(10);
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "the old incarnation is kept");
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &again).is_some(), "and the new one followed");
+    assert_eq!(b.forgets(), 0);
+    // A page compacts the old one.
+    b.put_checkpoint(&ended);
+    b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+    b.until("the old one is let go", |b| b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_none());
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &again).is_some(), "the new one is not");
+}
+
+/// A table that was out of the plan for a while and is back in it is followed as any other: nothing is kept of the
+/// time it was out, and if it goes again its grace counts from then.
+#[test]
+fn a_table_back_in_the_plan_is_followed_afresh_and_its_grace_starts_over_if_it_goes_again() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    let (t, inc) = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let table = (t.clone(), inc.clone());
+    let view = b.view.clone().unwrap();
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    assert!(b.shadow.rooms[b.room()].gone.contains_key(&table));
+    b.now += GONE_GRACE - Duration::from_secs(10);
+    b.view = Some(view.clone());
+    b.ticks(3);
+    assert!(b.shadow.rooms[b.room()].gone.is_empty(), "back: nothing is kept of the time it was out");
+    // It goes again, a long time after it first went: the grace is of this time.
+    b.now += GONE_GRACE;
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    b.now += Duration::from_secs(30);
+    b.ticks(5);
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "30 s into its grace");
+    assert_eq!(b.shadow.tally, Tally::default());
+    b.now += GONE_GRACE;
+    b.until("let go", |b| b.tables_held() == 0);
+    assert_eq!(b.shadow.tally, Tally { expired: 1, ..Tally::default() });
 }
 
 /// The cap has no place for a table whose checkpoint a page has written and the mirror has not read: it is kept for
@@ -1850,7 +1947,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
     let mut shadow = b.shadow;
-    let plan = || HousePlan { tables: vec![], houses: houses.clone(), complete: true };
+    let plan = || HousePlan { owner: OWNER.to_string(), tables: vec![], houses: houses.clone(), complete: true };
     let first = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     let watch = first.watch.clone().expect("the watch of the players");
     assert_eq!(watch.epoch(), first.pins_epoch);
@@ -2013,7 +2110,7 @@ fn a_table_given_up_on_for_want_of_a_final_checkpoint_is_told_in_the_log() {
     b.ticks(3);
     assert!(b.shadow.report().recent_skips.is_empty(), "(not yet)");
     b.now += GONE_GRACE + Duration::from_secs(1);
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     let r = b.shadow.report();
     assert_eq!(r.recent_skips.len(), 1, "{:?}", r.recent_skips);
     assert!(r.recent_skips[0].contains("expired"), "{:?}", r.recent_skips);
@@ -2037,7 +2134,7 @@ fn a_table_whose_final_checkpoint_came_in_time_is_not_expired() {
     b.ticks(3);
     assert_eq!(b.shadow.tally, Tally::default());
     b.put_checkpoint(&ended);
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "compared and not expired");
     // The grace past the removal, for a table already let go of, counts nothing more.
     b.now += GONE_GRACE * 2;
@@ -2119,7 +2216,7 @@ fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
         let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
         let mut shadow = b.shadow;
         shadow.pin_walk_time = timed.then_some(Duration::ZERO);
-        let plan = HousePlan { tables: vec![], houses, complete: true };
+        let plan = HousePlan { owner: OWNER.to_string(), tables: vec![], houses, complete: true };
         let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
         assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
         assert_eq!(view.pins.len() == 200, !timed, "timed={timed}");
@@ -2143,7 +2240,7 @@ fn a_final_checkpoint_first_read_as_the_grace_ends_is_compared_and_not_expired()
     // The grace is over as the checkpoint is written: the next drain is the first to read it.
     b.now += GONE_GRACE + Duration::from_secs(1);
     b.put_checkpoint(&ended);
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "compared, and not given up on");
     assert_eq!(b.forgets(), 1);
 }
@@ -2173,7 +2270,7 @@ fn a_table_whose_grace_is_over_with_its_final_checkpoint_written_and_unread_is_k
     assert!(rs.gone.contains_key(&(t.clone(), inc.clone())), "and the removal is remembered");
     // The drain reads it, and it is compared.
     b.now = later;
-    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.until("let go", |b| b.tables_held() == 0);
     assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
 }
 
@@ -2206,4 +2303,324 @@ fn a_table_held_for_a_record_a_page_may_read_otherwise_is_no_unreadable_checkpoi
     let st = b.shadow.rooms[b.room()].mirror.state(&t, &inc).unwrap();
     assert!(st.base.is_none() && st.trims >= 2 && st.hold == Some(crate::house_mirror::Hold::Unclear), "the table is held for a record: {:?} trims {}", st.hold, st.trims);
     assert_eq!(b.shadow.tally, before, "and nothing is counted of a checkpoint that is none");
+}
+
+// ── Review round 5 ───────────────────────────────────────────────────────────
+
+/// Every comparison counted, made or not.
+fn counted(t: Tally) -> u64 {
+    t.agree + t.mismatch + t.skipped()
+}
+
+/// A late record of a table the plan stopped naming is folded without the houses the plan has no word of: the
+/// answer made after it is not shown whole, so a trim of the table is not held against the node.
+#[test]
+fn a_table_the_plan_stopped_naming_is_not_shown_whole_again_by_an_answer_made_after_it_left() {
+    for named in [true, false] {
+        let mut b = Bench::new("house craps 3");
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "named={named}: shown whole");
+        let table = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+        if !named {
+            b.view.as_mut().unwrap().tables.clear();
+        }
+        b.ticks(3);
+        // A record leaves the session after: the node's answer is a new one.
+        let frame = b.shadow.rooms[b.room()].feed.fold(&table.0, &table.1).unwrap().frame;
+        b.remove_a_record();
+        b.until("answered afresh", |b| b.shadow.rooms[b.room()].feed.fold(&table.0, &table.1).is_some_and(|f| f.frame > frame) && b.caught_up());
+        b.ticks(3);
+        let stamped = b.shadow.rooms[b.room()].confirmed.get(&table).map(|s| s.frame).expect("what was shown before is kept");
+        let now = b.shadow.rooms[b.room()].feed.fold(&table.0, &table.1).unwrap().frame;
+        assert_eq!(stamped == now, named, "named={named}: shown whole by the answer made after (stamp {stamped}, answer {now})");
+        // A page's trim that the answer made after the late record left does not agree with.
+        let wrong = b.wrong_trim(&b.answer());
+        b.put_checkpoint(&wrong);
+        b.until("counted", |b| counted(b.shadow.tally) > 0);
+        let expected = if named { Tally { mismatch: 1, ..Tally::default() } } else { Tally { inputs: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "named={named}");
+    }
+}
+
+/// ... but what was shown of it before it left holds against an answer that is that very one.
+#[test]
+fn what_was_shown_whole_of_a_table_before_the_plan_stopped_naming_it_holds_for_its_final_checkpoint() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    let table = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(5);
+    assert!(b.shadow.rooms[b.room()].confirmed.contains_key(&table), "kept");
+    b.put_checkpoint(&wrong);
+    b.until("counted", |b| counted(b.shadow.tally) > 0);
+    assert_eq!(b.shadow.tally, Tally { mismatch: 1, ..Tally::default() }, "a difference found in an answer shown whole is the node's");
+}
+
+/// The checkpoints a table has been compared with are remembered over a rewind and the restore of what it rewound.
+#[test]
+fn a_checkpoint_put_back_after_another_is_not_compared_again() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let (a, other) = (b.page_trim(&sum), b.wrong_trim(&sum));
+    b.put_checkpoint(&a);
+    b.until("compared", |b| counted(b.shadow.tally) >= 1);
+    b.ticks(5);
+    let after_a = counted(b.shadow.tally);
+    assert_eq!(after_a, 1);
+    // A page rewinds the table to another checkpoint, and it is counted too.
+    b.put_checkpoint(&other);
+    b.until("the other counted", |b| counted(b.shadow.tally) >= 2);
+    b.ticks(5);
+    let after_other = counted(b.shadow.tally);
+    assert_eq!(after_other, 2);
+    // ... and the first is put back: it has been counted.
+    b.put_checkpoint(&a);
+    b.ticks(30);
+    let st = b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap().trims;
+    assert_eq!(st, 3, "(the mirror did see it as a change)");
+    assert_eq!(counted(b.shadow.tally), after_other, "and not counted again");
+    // The history is bounded: the oldest is forgotten first.
+    let rs = &b.shadow.rooms[b.room()];
+    assert_eq!(rs.compared.values().map(VecDeque::len).sum::<usize>(), 2);
+    let key = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let mut compared = BTreeMap::new();
+    for i in 0..(COMPARED_HISTORY + 4) {
+        remember(&mut compared, &key, [i as u8; 32]);
+    }
+    assert_eq!(compared[&key].len(), COMPARED_HISTORY);
+    assert!(!seen(&compared, &key, &[0u8; 32]) && seen(&compared, &key, &[(COMPARED_HISTORY + 3) as u8; 32]));
+    remember(&mut compared, &key, [(COMPARED_HISTORY + 3) as u8; 32]);
+    assert_eq!(compared[&key].len(), COMPARED_HISTORY, "one remembered again takes no second place");
+    assert!(seen(&compared, &key, &[4u8; 32]), "and puts none out");
+}
+
+/// The checkpoint a table is first followed with is no trim: if the table starts over without one (its session is
+/// replaced while the worker cannot be told), the answer from before is not held against it and nothing is counted.
+#[test]
+fn the_checkpoint_a_table_was_first_followed_with_is_not_counted_when_the_table_starts_over_without_a_trim() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let cp = b.page_trim(&b.answer());
+    b.put_checkpoint(&cp);
+    b.until("compared", |b| b.shadow.tally.agree > 0);
+    // The room is let go of, and followed afresh with the checkpoint in the doc: the table's first.
+    let view = b.view.take();
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.view = view;
+    b.shadow.tally = Tally::default();
+    b.until("answered", |b| b.caught_up());
+    let st = b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap().trims;
+    assert_eq!(st, 0, "the first checkpoint the table is read with");
+    // The session is replaced while the worker cannot be told: the table starts over, and the answer in hand is the old.
+    b.shadow.sup.clog(QUEUE_BYTES);
+    {
+        let live = b.live(Some(&cp));
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        comp.insert(&mut txn, live.as_str(), MapPrelim::default());
+    }
+    b.ticks(15);
+    let rs = &b.shadow.rooms[b.room()];
+    let st = rs.mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap();
+    assert!(rs.feed.fold(&b.case.ctx.t, &b.case.ctx.inc).is_some_and(|f| f.generation < st.generation), "(the answer in hand is from before the start over)");
+    assert_eq!(b.shadow.tally, Tally::default(), "nothing is counted of the checkpoint it began with");
+}
+
+/// ... and it is remembered: a page that puts it back after another checkpoint does not have it counted.
+#[test]
+fn the_checkpoint_a_table_was_first_followed_with_is_not_counted_when_a_page_puts_it_back_after_another() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let first = b.page_trim(&sum);
+    b.put_checkpoint(&first);
+    b.until("compared", |b| counted(b.shadow.tally) > 0);
+    // The room is let go of, and followed afresh with the checkpoint in the doc: the table's first.
+    let view = b.view.take();
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    b.view = view;
+    b.shadow.tally = Tally::default();
+    b.until("answered", |b| b.caught_up());
+    assert_eq!(b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap().trims, 0, "the first checkpoint the table is read with");
+    // Another comes: a trim, and counted.
+    let other = b.wrong_trim(&sum);
+    b.put_checkpoint(&other);
+    b.until("the other counted", |b| counted(b.shadow.tally) >= 1);
+    b.ticks(5);
+    let after_other = counted(b.shadow.tally);
+    assert_eq!(after_other, 1);
+    // The first is put back: it is no trim to be counted.
+    b.put_checkpoint(&first);
+    b.ticks(30);
+    assert_eq!(b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap().trims, 2, "(the mirror did see it as a change)");
+    assert_eq!(counted(b.shadow.tally), after_other, "and not counted");
+}
+
+/// A room with no table has nothing to read: its doc is not taken, so that a write held open on it (a commit being
+/// made) holds the shadow up for no reason.
+#[test]
+fn a_room_with_no_table_to_follow_does_not_wait_for_its_doc() {
+    let mut b = Bench::new("house roulette 3");
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    assert_eq!(b.shadow.rooms.len(), 1, "the room is watched");
+    let doc = b.doc.clone();
+    let (held, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    // A write open on the doc until the tick is over (or five seconds, when it waits for it).
+    let holder = thread::spawn(move || {
+        let txn = doc.transact_mut();
+        held.send(()).unwrap();
+        let waited_for = release_rx.recv_timeout(Duration::from_secs(5)).is_err();
+        drop(txn);
+        waited_for
+    });
+    held_rx.recv().unwrap();
+    b.tick();
+    release.send(()).unwrap();
+    assert!(!holder.join().unwrap(), "the tick of a room with no table waited for its doc");
+}
+
+/// What the mirror saw of a room's delegations is the room's history for as long as the house has a plan for it: a
+/// table that comes after the last one went is read against it.
+#[test]
+fn a_delegation_replaced_before_the_last_table_went_is_still_churn_when_another_comes() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    b.delegate_by("house-a", "owner");
+    b.ticks(2);
+    b.delegate_by("house-a", "someone else");
+    b.ticks(2);
+    assert!(b.shadow.rooms[b.room()].mirror.delegations().churned);
+    assert_eq!(b.confirmed_count(), 0, "nothing is shown whole in a room whose delegations were replaced");
+    // The table ends and goes (the grace passes).
+    let view = b.view.clone().unwrap();
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("the table is let go of", |b| b.tables_held() == 0);
+    assert_eq!(b.shadow.rooms.len(), 1, "(the room stays, with no table)");
+    assert!(b.shadow.rooms[b.room()].mirror.delegations().churned, "and so does what its mirror saw");
+    // Another table comes: it is read against that.
+    b.view = Some(view);
+    b.until("answered", |b| b.caught_up());
+    b.ticks(5);
+    assert!(b.shadow.rooms[b.room()].mirror.delegations().churned);
+    assert_eq!(b.confirmed_count(), 0, "still nothing shown whole");
+}
+
+/// A delegation replaced in a room that has a plan and no table yet is seen all the same.
+#[test]
+fn a_delegation_replaced_in_a_room_with_a_plan_and_no_table_yet_is_seen() {
+    let mut b = Bench::new("house craps 3");
+    let view = b.view.clone().unwrap();
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    b.delegate_by("house-a", "owner");
+    b.delegate_by("house-a", "someone else");
+    b.ticks(3);
+    assert!(b.shadow.rooms[b.room()].mirror.delegations().churned);
+    b.view = Some(view);
+    b.until("answered", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(b.confirmed_count(), 0);
+}
+
+/// A view is settled only while the doc names the deed holder the plan was made under.
+#[test]
+fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_under() {
+    let b = Bench::new("house craps 3");
+    let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    let plan = |owner: &str| HousePlan { owner: owner.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let mut shadow = b.shadow;
+    assert!(shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the holder the doc names");
+    assert!(!shadow.view_of(&room, &doc, plan("someone else"), PIN_WALK_KEYS).settled, "a plan made under another");
+    // The deed changes hands after the plan was made (the race of a house pass and the shadow's own).
+    let info = doc.get_or_insert_map("roomInfo");
+    {
+        let mut txn = doc.transact_mut();
+        info.insert(&mut txn, "owner", "heir");
+    }
+    assert!(!shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the old plan, the new holder");
+    assert!(shadow.view_of(&room, &doc, plan("heir"), PIN_WALK_KEYS).settled, "and the plan of the new holder");
+    // A room with no holder named has no houses to be settled about.
+    {
+        let mut txn = doc.transact_mut();
+        info.remove(&mut txn, "owner");
+    }
+    assert!(!shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled);
+}
+
+/// The deed changed hands between the view and the drain: the answer shown whole is taken back by the epoch.
+#[test]
+fn a_difference_is_not_counted_when_the_deed_changed_hands_after_the_answer_was_shown_whole() {
+    for changed in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        let _pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "changed={changed}: shown whole");
+        let wrong = b.wrong_trim(&b.answer());
+        if changed {
+            b.set_owner("heir");
+        }
+        b.put_checkpoint(&wrong);
+        b.tick();
+        let expected = if changed { Tally { inputs: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "changed={changed}");
+    }
+}
+
+/// The second checkpoint the node cannot read, where the first was the table's first, is the first trim and is counted.
+#[test]
+fn the_trim_after_a_first_checkpoint_the_node_cannot_read_is_counted_as_unreadable() {
+    let mut b = Bench::new("house craps 3");
+    let sum = finished(&b.case.summary);
+    let plain = b.page_trim(&sum);
+    b.put_checkpoint(&held(&plain));
+    b.ticks(30);
+    assert_eq!(b.shadow.tally, Tally::default(), "(the first is no trim)");
+    // A page's next trim is one the node cannot read either, and not the same.
+    b.put_checkpoint(&with_cp(&plain, "__proto__", Some(s("y"))));
+    b.until("counted", |b| b.shadow.tally.unreadable > 0);
+    b.ticks(30);
+    assert_eq!(b.shadow.tally, Tally { unreadable: 1, ..Tally::default() }, "once, however long it is held");
+    // And the next, again.
+    b.put_checkpoint(&with_cp(&plain, "__proto__", Some(s("z"))));
+    b.until("counted again", |b| b.shadow.tally.unreadable > 1);
+    b.ticks(30);
+    assert_eq!(b.shadow.tally, Tally { unreadable: 2, ..Tally::default() });
+}
+
+/// Checkpoints written one after another before a drain reaches the table: the table reads the last, and the node says
+/// how many it never had.
+#[test]
+fn a_checkpoint_written_over_before_the_node_read_it_is_counted_as_superseded() {
+    for same in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(3);
+        let sum = b.answer();
+        let (plain, other) = (b.page_trim(&sum), b.wrong_trim(&sum));
+        // Two pages' trims, in two transactions, before the node looks.
+        b.put_checkpoint(&plain);
+        b.put_checkpoint(if same { &plain } else { &other });
+        b.ticks(30);
+        let t = b.shadow.tally;
+        assert_eq!(t.superseded, if same { 0 } else { 1 }, "same={same}: {t:?}");
+        assert_eq!(counted(t), if same { 1 } else { 2 }, "same={same}: the last is compared (or passed over), and the one before counted as not made");
+        if !same {
+            let r = b.shadow.report();
+            assert!(r.recent_skips.iter().any(|l| l.contains("superseded") && l.contains(&b.case.ctx.t)), "{:?}", r.recent_skips);
+            assert_eq!(r.shadow_skipped, t.skipped());
+        }
+    }
 }

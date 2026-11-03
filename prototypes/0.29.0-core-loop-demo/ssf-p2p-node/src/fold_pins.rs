@@ -36,6 +36,12 @@
 //!
 //! These last for as long as the node watches the room.
 //!
+//! THE DEED HOLDER is watched with them. The houses a page counts are the ones the deed holder delegated
+//! (`roomInfo.owner`; a delegation is signed by their key), so when the deed changes hands the houses every page counts
+//! change with it, and a plan made under the last holder is not the room's houses. The watch notes the holder
+//! ([`PlayerPins::deed`]) and moves the epoch when it changes, so that a plan is believed only while the doc still
+//! names the holder it was made under, and an answer shown whole is taken back by a deed that changed after.
+//!
 //! WHAT IT CANNOT SEE. A page that bound before the node began to watch may
 //! have pinned a key the map no longer holds (replaced, or the player gone,
 //! before the first look): that history is not in the doc, so the pins are
@@ -51,8 +57,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use yrs::types::map::MapEvent;
 use yrs::types::{DeepObservable, EntryChange, Event, Events};
-use yrs::{Any, Doc, Map, Out, ReadTxn, Subscription, Transact, TransactionMut};
+use yrs::{Any, Doc, Map, Observable, Out, ReadTxn, Subscription, Transact, TransactionMut};
+
+use crate::house::deed_of;
 
 /// The most keys the fold pins in a room: the pages' own MAX_PINNED_KEYS
 /// (past it new players go unpinned there too). The players map is any
@@ -128,9 +137,11 @@ struct PinState {
     version: u64,
     contested: bool,
     capped: bool,
-    /// Moves with anything that changes what [`PlayerPins::view`] says: a pin, or the pins no longer being the
-    /// whole story.
+    /// Moves with anything that changes what [`PlayerPins::view`] says: a pin, the pins no longer being the
+    /// whole story, or the deed changing hands.
     epoch: u64,
+    /// The deed holder `roomInfo` names now (None: no one a house can stand under).
+    owner: Option<String>,
 }
 
 impl PinState {
@@ -177,6 +188,24 @@ impl PinState {
     }
 }
 
+/// The observer of `roomInfo`: the deed holder, when it changes. (A holder written again as it stands is no change.)
+fn note_deed(shared: &Mutex<PinState>, txn: &TransactionMut, event: &MapEvent) {
+    let mut st = lock(shared);
+    for (key, change) in event.keys(txn).iter() {
+        if &**key != "owner" {
+            continue;
+        }
+        let now = match change {
+            EntryChange::Inserted(new) | EntryChange::Updated(_, new) => deed_of(Some(new.clone())),
+            EntryChange::Removed(_) => None,
+        };
+        if st.owner != now {
+            st.owner = now;
+            st.epoch += 1;
+        }
+    }
+}
+
 fn lock(m: &Mutex<PinState>) -> MutexGuard<'_, PinState> {
     // (A callback that panicked left it as it was: nothing in it is half-written.)
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -206,10 +235,14 @@ fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
 /// The players already in the map, read once: false if the map held more than
 /// `limit` of them, or the read took longer than `time`.
 fn walk(doc: &Doc, shared: &Mutex<PinState>, limit: usize, time: Option<Duration>) -> bool {
-    let started = Instant::now();
     let txn = doc.transact();
-    let Some(players) = txn.get_map("players") else { return true };
+    // (The time is the doc's held for the read, not the wait for the lock that comes before it: a write that is
+    // being committed holds that up, and a map that is quick to read is not made slow by it.)
+    let started = Instant::now();
     let mut st = lock(shared);
+    // (The doc as the read sees it is at least as new as any change the observer has noted: no epoch moves for this.)
+    st.owner = txn.get_map("roomInfo").and_then(|m| deed_of(m.get(&txn, "owner")));
+    let Some(players) = txn.get_map("players") else { return true };
     let mut visited = 0;
     for (pid, value) in players.iter(&txn) {
         if visited >= limit {
@@ -251,6 +284,7 @@ impl PinWatch {
 pub struct PlayerPins {
     shared: Arc<Mutex<PinState>>,
     _sub: Subscription,
+    _deed_sub: Subscription,
     walked: bool,
     cache: Option<(u64, Vec<(String, String)>)>,
 }
@@ -269,9 +303,12 @@ impl PlayerPins {
         let shared = Arc::new(Mutex::new(PinState::default()));
         let cb = shared.clone();
         let sub = players.observe_deep(move |txn, events| note(&cb, txn, events));
-        // (The observer first: a change from now on is noted whatever the walk sees of it.)
+        let info = doc.get_or_insert_map("roomInfo");
+        let cb = shared.clone();
+        let deed_sub = info.observe(move |txn, event| note_deed(&cb, txn, event));
+        // (The observers first: a change from now on is noted whatever the walk sees of it.)
         let walked = walk(doc, &shared, walk_limit, walk_time);
-        PlayerPins { shared, _sub: sub, walked, cache: None }
+        PlayerPins { shared, _sub: sub, _deed_sub: deed_sub, walked, cache: None }
     }
 
     /// A handle to ask later whether the pins have moved since a view.
@@ -289,6 +326,17 @@ impl PlayerPins {
 
     /// [`PlayerPins::view`], and the epoch it was made at (read in the same look).
     pub fn view_at(&mut self) -> (Vec<(String, String)>, bool, u64) {
+        let (pins, settled, epoch, _) = self.view_full();
+        (pins, settled, epoch)
+    }
+
+    /// The deed holder the doc names now (None: no one a house can stand under).
+    pub fn deed(&self) -> Option<String> {
+        lock(&self.shared).owner.clone()
+    }
+
+    /// [`PlayerPins::view_at`], and the deed holder as of the same look.
+    pub fn view_full(&mut self) -> (Vec<(String, String)>, bool, u64, Option<String>) {
         let st = lock(&self.shared);
         let settled = self.walked && !st.contested && !st.capped;
         if self.cache.as_ref().map(|c| c.0) != Some(st.version) {
@@ -296,7 +344,7 @@ impl PlayerPins {
             pins.sort();
             self.cache = Some((st.version, pins));
         }
-        (self.cache.as_ref().map(|c| c.1.clone()).unwrap_or_default(), settled, st.epoch)
+        (self.cache.as_ref().map(|c| c.1.clone()).unwrap_or_default(), settled, st.epoch, st.owner.clone())
     }
 }
 

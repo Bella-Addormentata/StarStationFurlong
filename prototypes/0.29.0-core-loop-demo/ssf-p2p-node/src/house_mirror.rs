@@ -89,7 +89,7 @@ use std::time::{Duration, Instant};
 use yrs::types::{DeepObservable, EntryChange, Event, Events, PathSegment};
 use yrs::{Doc, Map, MapRef, Out, ReadTxn, Subscription, TransactionMut};
 
-use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, READ_PER_TICK, VISIT_BYTES};
+use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, MAX_TOP_BYTES, READ_PER_TICK, VISIT_BYTES};
 use crate::house_bytes::{self as hb, CVal, Ctx};
 
 /// What a drain reads of a room, charged as the house's tick charges its own
@@ -105,6 +105,9 @@ pub const DRAIN_TIME: Duration = Duration::from_millis(20);
 /// drains. Past it the session is read afresh. (Honest sessions change a
 /// few dozen keys a tick.)
 pub const MAX_DIRTY_KEYS: usize = 2_048;
+/// The most a checkpoint weighs ([`hb::weigh`]) for the observer to tell it written again as it stands from another:
+/// the observer runs in the commit of the doc, so what it compares is bounded, and a heavier one is another.
+pub const ALIKE_SUM_BYTES: usize = 256 * 1024;
 /// The changes of a table waiting to be taken (their keys and weights) stop
 /// being read at this; the caller's `take` makes room.
 pub const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
@@ -158,6 +161,10 @@ struct Dirt {
     /// has not been sent: what it deleted is more than this node has read, and may be more than it will), or in
     /// which something was made and deleted (records and the trim that deleted them, sent together).
     lagged: BTreeSet<String>,
+    /// How many times each watched checkpoint (`sum:` name) was written (a value set that was not the one standing,
+    /// as [`rewritten_alike`] tells) since the table last read it: all but the one the drain reads were written over
+    /// before it could.
+    writes: BTreeMap<String, u64>,
 }
 
 enum Recs {
@@ -179,6 +186,10 @@ impl Dirt {
     fn merge(&mut self, other: Dirt, limit: usize) {
         self.tops.extend(other.tops);
         self.lagged.extend(other.lagged);
+        for (name, n) in other.writes {
+            let at = self.writes.entry(name).or_insert(0);
+            *at = at.saturating_add(n);
+        }
         for (name, recs) in other.recs {
             match (self.recs.get_mut(&name), recs) {
                 (None, recs) => {
@@ -235,8 +246,17 @@ fn made_and_deleted(txn: &TransactionMut) -> bool {
 
 /// Whether a change to a key is the value written again as it stands, which every page reads alike (a value of the
 /// doc's plain kind, [`hb::Clarity::Clear`]): the same record under the same key moves nothing.
-fn rewritten_alike(change: &EntryChange) -> bool {
-    matches!(change, EntryChange::Updated(Out::Any(old), Out::Any(new)) if old == new && hb::clarity(new) == hb::Clarity::Clear)
+///
+/// This runs in the doc's commit, on values a peer wrote: the new one is weighed first ([`hb::weigh`], up to `cap`), and
+/// a value that weighs more, or that a page may read otherwise, is not compared at all and is another. (Two values of
+/// one weight are compared at the cost of that weight: lengths first, then members, so the old one costs no more than
+/// the new.)
+fn rewritten_alike(change: &EntryChange, cap: usize) -> bool {
+    let EntryChange::Updated(Out::Any(old), Out::Any(new)) = change else { return false };
+    match hb::weigh(new, cap) {
+        hb::Weighed::Light { scan, .. } => hb::clarity_within(new, scan, cap) == hb::Clarity::Clear && old == new,
+        hb::Weighed::Heavy | hb::Weighed::Unsure => false,
+    }
 }
 
 /// The observer's callback. It runs inside the doc's commit: a lookup for
@@ -256,7 +276,7 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                     // (A delegation written again as it stands, as two pages of the deed holder do when both run its duty
                     // at once, changes nothing: no house comes or goes, and every page reads it alike. One a page may read
                     // otherwise is churn all the same.)
-                    if key.starts_with("hk:") && !rewritten_alike(change) {
+                    if key.starts_with("hk:") && !rewritten_alike(change, MAX_TOP_BYTES) {
                         delegations.changes += 1;
                         if !matches!(change, EntryChange::Inserted(_)) {
                             delegations.churned = true;
@@ -264,6 +284,12 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                     }
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
+                        // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
+                        // of one is no other.)
+                        if key.starts_with("sum:") && !matches!(change, EntryChange::Removed(_)) && !rewritten_alike(change, ALIKE_SUM_BYTES) {
+                            let at = dirt.writes.entry(key.to_string()).or_insert(0);
+                            *at = at.saturating_add(1);
+                        }
                         if key.starts_with("sum:") && *gap.get_or_insert_with(|| txn.store().pending_update().is_some() || txn.store().pending_ds().is_some() || made_and_deleted(txn)) {
                             dirt.lagged.insert(key.to_string());
                         }
@@ -383,7 +409,9 @@ enum Base {
 /// Whether two readings of `sum:` are the same checkpoint. A checkpoint is
 /// written again as it was (a peer's page puts it back) and a doc keeps a
 /// map's fields in no order, so two readings of one are compared by their
-/// canonical bytes, not field by field in the order they came.
+/// canonical bytes, not field by field in the order they came. (Two the node
+/// cannot read tell nothing of themselves, so they pass for the same here:
+/// [`Table::step`] takes one written since the last look for another.)
 fn same_base(a: &Base, b: &Base) -> bool {
     match (a, b) {
         (Base::Absent, Base::Absent) | (Base::Held, Base::Held) => true,
@@ -462,6 +490,8 @@ struct Table {
     unread_at_trim: bool,
     /// How many times the base has changed since it was first read.
     trims: u64,
+    /// Checkpoints written over before the table read them, not yet told to the caller ([`RoomMirror::take_superseded`]).
+    superseded: u64,
 }
 
 fn cval_bytes(v: &CVal) -> usize {
@@ -501,6 +531,7 @@ impl Table {
             version: 0,
             unread_at_trim: false,
             trims: 0,
+            superseded: 0,
         }
     }
 
@@ -550,8 +581,9 @@ impl Table {
         self.announce = true;
     }
 
-    fn set_base(&mut self, new: Base) {
-        if self.based && same_base(&new, &self.base) {
+    /// `changed`: the base is not the one the table has (a first reading is a change).
+    fn set_base(&mut self, new: Base, changed: bool) {
+        if !changed {
             return;
         }
         self.based = true;
@@ -764,6 +796,7 @@ impl Table {
                 return false;
             }
             let out = comp.and_then(|c| c.get(txn, &self.sum_name));
+            let present = out.is_some();
             // (As the house reads it: a checkpoint is read up to what a tick may read.)
             let new = match read_costed(|n| b.charge(n), self.sum_name.len(), out, READ_PER_TICK) {
                 Read::Spent => return false,
@@ -781,14 +814,23 @@ impl Table {
                 Read::Unclear(..) | Read::Heavy => Base::Held,
             };
             pending.tops.remove(&self.sum_name);
+            let sets = pending.writes.remove(&self.sum_name).unwrap_or(0);
             self.read_base = false;
             // (The session the base leaves: what a page wrote to it before it trimmed it, and
             // this table has not read, is not in what the worker was sent.)
             let was_based = self.based;
-            let changed = !(was_based && same_base(&new, &self.base));
+            // (A checkpoint the node cannot read cannot be told from another it cannot read: one written since the last
+            // look is another.)
+            let same = was_based && same_base(&new, &self.base) && !(new == Base::Held && sets > 0);
+            let changed = !same;
+            // (Of the checkpoints written since the last look, the one standing is the one read; the others were written
+            // over before the node could.)
+            if was_based {
+                self.superseded = self.superseded.saturating_add(sets.saturating_sub(u64::from(present)));
+            }
             let lagged = pending.lagged.remove(&self.sum_name);
             let unread = changed && (lagged || self.session_unread(pending, comp, txn));
-            self.set_base(new);
+            self.set_base(new, changed);
             if changed {
                 self.unread_at_trim = unread;
                 if was_based {
@@ -1095,6 +1137,7 @@ impl RoomMirror {
         self.pending.tops.retain(|n| names.contains(n));
         self.pending.recs.retain(|n, _| names.contains(n));
         self.pending.lagged.retain(|n| names.contains(n));
+        self.pending.writes.retain(|n, _| names.contains(n));
     }
 
     pub fn state(&self, t: &str, inc: &str) -> Option<State<'_>> {
@@ -1119,6 +1162,13 @@ impl RoomMirror {
             unread_at_trim: tb.unread_at_trim,
             trims: tb.trims,
         })
+    }
+
+    /// How many checkpoints of the table were written over, since this was last asked, before the table read them (a
+    /// page wrote another while a drain had not got to the table, or one that was held for a time): each was a trim of the
+    /// table that cannot be held against what the node had worked out, for the node never read it.
+    pub fn take_superseded(&mut self, t: &str, inc: &str) -> u64 {
+        self.tables.get_mut(&(t.to_string(), inc.to_string())).map_or(0, |tb| std::mem::take(&mut tb.superseded))
     }
 
     /// What the observer has seen of the room's delegations since it began.

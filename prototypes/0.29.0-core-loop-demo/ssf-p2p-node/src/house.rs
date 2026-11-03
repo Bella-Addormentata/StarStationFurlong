@@ -695,6 +695,8 @@ struct RoomMem {
 /// the deed holder's key they stand under.
 #[derive(Clone, Debug, PartialEq)]
 struct FoldPlan {
+    /// The deed holder, as the room's `roomInfo` named them when the pass read it ([`deed_of`]), and the key they stand under.
+    owner: String,
     owner_key: String,
     tables: Vec<(String, String)>,
     /// The tick that found it read everything it wanted of the room without
@@ -714,6 +716,10 @@ struct FoldPlan {
 /// decides by.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HousePlan {
+    /// The deed holder the houses stand under, as `roomInfo` named them when the pass read it: the pages count a house
+    /// by the delegations of whoever holds the deed, so a plan is a plan of one holder's houses, and the shadow, which
+    /// watches the deed itself (fold_pins.rs), holds it against a trim only while the doc names them still.
+    pub owner: String,
     pub tables: Vec<(String, String)>,
     pub houses: Vec<String>,
     /// The houses are every one the room's records name: the pass that found
@@ -1071,7 +1077,7 @@ impl House {
         houses.push(self.key.public.clone());
         houses.sort();
         houses.dedup();
-        Some(HousePlan { tables: plan.tables.clone(), houses, complete: plan.complete })
+        Some(HousePlan { owner: plan.owner.clone(), tables: plan.tables.clone(), houses, complete: plan.complete })
     }
 
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
@@ -1229,10 +1235,7 @@ impl House {
         let pub_key = self.key.public.clone();
 
         // The deed holder and their key, pinned on first sight.
-        let owner = txn.get_map("roomInfo").and_then(|m| match m.get(txn, "owner") {
-            Some(Out::Any(Any::String(s))) if !s.is_empty() && &*s != "Local-Clone" => Some(s.to_string()),
-            _ => None,
-        });
+        let owner = txn.get_map("roomInfo").and_then(|m| deed_of(m.get(txn, "owner")));
         let Some(owner) = owner else { return writes };
         self.rooms.entry(room.to_string()).or_default();
         let Some(owner_key) = self.pin_of(room, txn, &owner) else { return writes };
@@ -1308,7 +1311,7 @@ impl House {
             return writes;
         }
         tables.sort();
-        self.rooms.get_mut(room).unwrap().fold = Some(FoldPlan { owner_key: owner_key.clone(), tables: tables.clone(), complete: false });
+        self.rooms.get_mut(room).unwrap().fold = Some(FoldPlan { owner: owner.clone(), owner_key: owner_key.clone(), tables: tables.clone(), complete: false });
 
         // The owner's Fair setting of each of them, the one standing over
         // every other seen (fair_after; a new deed holder's count afresh:
@@ -2317,6 +2320,15 @@ fn grace_of(t0: u64, times: &mut [u64]) -> u64 {
         grace = GRACE_MAX_MS.min(grace.max(d + GRACE_PAD_MS));
     }
     grace
+}
+
+/// The deed holder a room's `roomInfo` map names under `owner`: a non-empty string that is not the placeholder of a
+/// clone made on the spot (a room with no deed holder has no house).
+pub(crate) fn deed_of(out: Option<Out>) -> Option<String> {
+    match out {
+        Some(Out::Any(Any::String(s))) if !s.is_empty() && &*s != "Local-Clone" => Some(s.to_string()),
+        _ => None,
+    }
 }
 
 /// Top-level record `key` (a delegation, a setting, a heartbeat): None as

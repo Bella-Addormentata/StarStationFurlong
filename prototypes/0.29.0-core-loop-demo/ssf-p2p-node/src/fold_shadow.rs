@@ -26,7 +26,8 @@
 //! the answer in hand was not the table as the node had last read it when the
 //! trim came (or the node had not read all a page wrote to the session before
 //! it trimmed it), or the houses and pins it was given were not shown to be
-//! everything the room held while the session was in it. Those are skipped,
+//! everything the room held while the session was in it, or a checkpoint was
+//! written over by another before the node read it. Those are skipped,
 //! and counted by why.
 
 #![cfg(feature = "house-fold")]
@@ -35,12 +36,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use yrs::{Doc, Map, ReadTxn, Transact};
+use yrs::{Doc, Transact};
 
 use crate::fold_feed::{Counts, Feed, Inputs};
 use crate::fold_pins::{PinWatch, PlayerPins, PIN_WALK_KEYS, PIN_WALK_TIME};
 use crate::fold_supervisor::{Event, Launch, Supervisor};
-use crate::house::{checkpoint_ok, HousePlan, CASINO_MAP};
+use crate::house::{checkpoint_ok, HousePlan};
 use crate::house_bytes::{self as hb, CVal};
 use crate::house_fold::{rules_id, FoldSummary, FOLD_TABLES};
 use crate::house_mirror::{Hold, Limits, RoomMirror};
@@ -77,11 +78,14 @@ pub enum Skip {
     /// answer had not come. (The checkpoint a table is first read with is no
     /// trim, and is not counted.)
     Unanswered,
-    /// A table a page's removal ended was let go of because the final checkpoint
-    /// a page writes when it compacts it had not come in [`GONE_GRACE`] (no page
-    /// was awake to compact it, or the pages took longer than that): what the
-    /// fold worked out of the table is held against nothing.
+    /// A table the plan stopped naming (a page's removal ended it, or its switch went or names another incarnation) was
+    /// let go of because the final checkpoint a page writes when it compacts it had not come in [`GONE_GRACE`] (no page
+    /// was awake to compact it, or the pages took longer than that): what the fold worked out of the table is held
+    /// against nothing.
     Expired,
+    /// A checkpoint was written over by another before the node read it (a drain that had not got to the table, or took
+    /// its time): the node never had it to compare, and says so, for each.
+    Superseded,
 }
 
 impl Skip {
@@ -97,6 +101,7 @@ impl Skip {
             Skip::Inputs => "inputs",
             Skip::Unanswered => "unanswered",
             Skip::Expired => "expired",
+            Skip::Superseded => "superseded",
         }
     }
 }
@@ -227,12 +232,13 @@ pub struct Tally {
     pub inputs: u64,
     pub unanswered: u64,
     pub expired: u64,
+    pub superseded: u64,
 }
 
 impl Tally {
     /// Every comparison not made.
     pub fn skipped(&self) -> u64 {
-        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired
+        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired + self.superseded
     }
 }
 
@@ -251,6 +257,7 @@ impl Tally {
             Verdict::Skip(Skip::Inputs) => self.inputs += 1,
             Verdict::Skip(Skip::Unanswered) => self.unanswered += 1,
             Verdict::Skip(Skip::Expired) => self.expired += 1,
+            Verdict::Skip(Skip::Superseded) => self.superseded += 1,
         }
     }
 }
@@ -277,13 +284,21 @@ pub struct FoldView {
     pub watch: Option<PinWatch>,
 }
 
-/// How long a table that a page's removal took out of the plan is kept for the final checkpoint a page writes when it
-/// compacts the removed table: a page does it 10 s after it sees the end, in its turn, or 60 s after if none of the
-/// slips in the table's sessions are its own (`COMPACT_MS`, `COMPACT_FALLBACK_MS` of computedTable.ts), a page can see
-/// the end later than the node, and a page that wakes starts the wait again. So twice the fallback: past it the table is
-/// let go of, checkpoint or none, and the comparison not made is counted ([`Skip::Expired`]). (No page may be awake to
-/// compact it at all, so there is no waiting for ever: the table would hold a place of the worker's 14 for good.)
+/// How long a table that the plan stopped naming is kept for the final checkpoint a page writes when it compacts it. The
+/// plan names the tables whose switch names a live incarnation, so one it stopped naming is one the pages count ended
+/// (`computedEndedIncs`): removed (`gone:`), its switch gone, or its switch naming another incarnation; and a page
+/// compacts each of them, in its turn, 10 s after it sees the end, or 60 s after if none of the slips in the table's
+/// sessions are its own (`COMPACT_MS`, `COMPACT_FALLBACK_MS` of computedTable.ts). A page can see the end later than the
+/// node, and a page that wakes starts the wait again. So twice the fallback: past it the table is let go of, checkpoint or
+/// none, and the comparison not made is counted ([`Skip::Expired`]). (No page may be awake to compact it at all, so there
+/// is no waiting for ever: the table would hold a place of the worker's 14 for good.)
 pub const GONE_GRACE: Duration = Duration::from_secs(120);
+
+/// How many checkpoints each table remembers having been compared with, or passed over and counted: a checkpoint is
+/// compared once, whatever else the table goes through, and a page that puts back an older one (a rewind, and the
+/// restore of what it rewound) must not have either counted again. The oldest is forgotten first. (A peer that writes
+/// more distinct checkpoints than that in turn can have one counted again; each such write is a count of its own.)
+pub const COMPARED_HISTORY: usize = 16;
 
 /// How many lines of what the comparisons found the shadow keeps for `/api/fingerprint`: the last mismatches and the
 /// last comparisons not made, each their own, so that a run of one cannot push out the other. (The node of the desktop
@@ -360,10 +375,10 @@ struct Shown {
 struct RoomShadow {
     mirror: RoomMirror,
     feed: Feed,
-    /// The checkpoint (its canonical bytes' hash) each table was last
-    /// compared with, or passed over: a checkpoint is compared once, whatever
-    /// else starts the table over.
-    compared: BTreeMap<TableKey, [u8; 32]>,
+    /// The checkpoints (their canonical bytes' hash) each table was last compared with, or passed over, or was first
+    /// read with, the last [`COMPARED_HISTORY`] of them: a checkpoint is compared once, whatever else starts the table
+    /// over, or puts back one before it.
+    compared: BTreeMap<TableKey, VecDeque<[u8; 32]>>,
     /// For each table, the answer that was shown to have been made with every house and pin the room held
     /// while the session was still in it: at a tick when the view was settled, no trim had been noted yet
     /// (so the pass behind the view saw the session), and the answer was of the last frame sent, with the
@@ -374,8 +389,9 @@ struct RoomShadow {
     inputs: Inputs,
     /// How many delegations had changed, as of the last tick.
     seen_delegations: u64,
-    /// Tables a page's removal ended (`gone:`) that the view no longer follows, and when each was first seen
-    /// outside the view: kept for the final checkpoint a page writes when it compacts them, for [`GONE_GRACE`].
+    /// Tables the plan stopped naming that the mirror still holds (the pages count them ended: removed, or their
+    /// switch gone or naming another incarnation), and when each was first seen outside the view: kept for the final
+    /// checkpoint a page writes when it compacts them, for [`GONE_GRACE`].
     gone: BTreeMap<TableKey, Instant>,
     /// The room is no longer followed: its tables are being let go of.
     leaving: bool,
@@ -418,7 +434,8 @@ impl RoomShadow {
     }
 
     /// Whether the table `k`, which the view does not follow, is kept: its last checkpoint is not read yet, or
-    /// a page's removal ended it and the checkpoint a page writes when it compacts it may yet come.
+    /// the plan stopped naming it (the pages count it ended) and the checkpoint a page writes when it compacts it may
+    /// yet come.
     fn kept(&self, k: &TableKey, now: Instant) -> bool {
         if self.mirror.base_unread(&k.0, &k.1) {
             return true;
@@ -427,19 +444,18 @@ impl RoomShadow {
         self.mirror.state(&k.0, &k.1).is_some_and(|st| !st.ended) && now.saturating_duration_since(*since) < GONE_GRACE
     }
 
-    /// Note the tables the mirror holds that the view does not follow and that a page's removal ended (`gone:`), when
-    /// they are first seen so: the final checkpoint of one comes some time on, when a page compacts it. Before the tick
-    /// counts the places it has, so that a table kept has its place from the tick it leaves the view.
-    fn note_gone(&mut self, doc: &Doc, view: &FoldView, now: Instant) {
-        let outside: Vec<TableKey> = self.mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).filter(|k| !view.tables.contains(k) && !self.gone.contains_key(k)).collect();
-        if outside.is_empty() {
-            return;
-        }
-        let txn = doc.transact();
-        let Some(casino) = txn.get_map(CASINO_MAP) else { return };
-        for k in outside {
-            if casino.contains_key(&txn, &format!("gone:{}:{}", k.0, k.1)) {
-                self.gone.insert(k, now);
+    /// Note the tables the mirror holds that the view does not follow, when they are first seen so: the plan names the
+    /// tables whose switch names a live incarnation, so one it does not is one the pages count ended (a removal, a switch
+    /// that went, a switch that names another incarnation: a replacement), and the final checkpoint of any of them comes
+    /// some time on, when a page compacts it. Before the tick counts the places it has, so that a table kept has its
+    /// place from the tick it leaves the view. (One that is back in the plan is followed again, and nothing is kept
+    /// of it: it is first seen outside afresh if it goes again.)
+    fn note_gone(&mut self, view: &FoldView, now: Instant) {
+        self.gone.retain(|k, _| !view.tables.contains(k));
+        for c in self.mirror.tables() {
+            let k = (c.t.clone(), c.inc.clone());
+            if !view.tables.contains(&k) {
+                self.gone.entry(k).or_insert(now);
             }
         }
     }
@@ -460,7 +476,13 @@ impl RoomShadow {
     /// Note the tables whose answer was made with the houses and pins of a settled view, while
     /// the session was still in the room: before the drain, where no trim of the table has
     /// been noted.
-    fn confirm<L: Launch>(&mut self, inputs: &Inputs, sup: &Supervisor<L>, pins: u64, delegations: u64) {
+    ///
+    /// Only a table the plan names was read by the pass behind the view, which found the houses its records name. A
+    /// table the plan stopped naming is read by no pass, so a late record of a house the plan has no word of is folded
+    /// without it and nothing says so: nothing new is shown of such a table. What was shown of it before stays as it
+    /// was (it holds against an answer of the same frame, made with the same houses and pins, and while the pins and
+    /// the delegations stand where they stood), and any other answer is held against nothing.
+    fn confirm<L: Launch>(&mut self, view: &FoldView, inputs: &Inputs, sup: &Supervisor<L>, pins: u64, delegations: u64) {
         let tables: Vec<TableKey> = self.mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
         for key in tables {
             // (A trim noted may have come before the pass behind the view, which then saw the room without the session.)
@@ -469,12 +491,14 @@ impl RoomShadow {
             }
             let Some(frame) = self.feed.answers(&key.0, &key.1, sup, inputs) else { continue };
             let Some(st) = self.mirror.state(&key.0, &key.1) else { continue };
-            self.confirmed.insert(key, Shown { born: st.born, frame, pins, delegations });
+            if view.tables.contains(&key) {
+                self.confirmed.insert(key, Shown { born: st.born, frame, pins, delegations });
+            }
         }
     }
 
-    /// A table a page's removal ended that the view does not follow and that was kept for the final checkpoint a page
-    /// writes when it compacts it, whose [`GONE_GRACE`] is over and whose checkpoint did not come: given up on, and
+    /// A table the plan stopped naming that was kept for the final checkpoint a page writes when it compacts it, whose
+    /// [`GONE_GRACE`] is over and whose checkpoint did not come: given up on, and
     /// the comparison not made counted, once. (A checkpoint a page has written and the mirror has not read keeps its
     /// table whatever the time: `kept`.)
     fn expire(&mut self, now: Instant, view: &FoldView, tally: &mut Tally) {
@@ -506,7 +530,7 @@ impl RoomShadow {
         let moved = delegations.changes != self.seen_delegations;
         self.seen_delegations = delegations.changes;
         if view.settled && !delegations.churned && !moved {
-            self.confirm(&inputs, sup, view.pins_epoch, delegations.changes);
+            self.confirm(view, &inputs, sup, view.pins_epoch, delegations.changes);
         } else {
             // (What was shown before may be taken back: a key replaced, or a house not known, can bear on a session that was
             // followed all along. A settled tick shows it again, if it can be shown.)
@@ -519,7 +543,8 @@ impl RoomShadow {
         read.sort();
         read.dedup();
         self.mirror.want(&read);
-        {
+        // (A room with no table has nothing to read: its doc is not taken for it.)
+        if !read.is_empty() {
             let txn = doc.transact();
             self.mirror.drain(&txn);
         }
@@ -538,8 +563,9 @@ impl RoomShadow {
         self.gone.retain(|k, _| want.contains(k));
         self.feed.release(now, &self.mirror, sup);
         self.inputs = inputs;
-        // (A room with no table left goes once the worker has been told of the last.)
-        self.leaving = want.is_empty();
+        // (A room the house has a plan for stays, with its tables or none: what its mirror has seen of the delegations
+        // is the room's history for as long as the plan lasts, and a table that comes later is compared with it.)
+        self.leaving = false;
     }
 
     /// Let go of every table (the room is no longer followed).
@@ -577,6 +603,15 @@ impl RoomShadow {
         confirmed.retain(|k, _| keys.contains(k));
         for key in keys {
             let (t, inc) = (&key.0, &key.1);
+            // Checkpoints a page wrote and another page wrote over before the mirror read the table: the node never had
+            // them, and each is counted as a comparison not made.
+            let lost = mirror.take_superseded(t, inc);
+            for _ in 0..lost {
+                tally.note(&Verdict::Skip(Skip::Superseded));
+            }
+            if lost > 0 {
+                say(said, false, format!("{t} {inc}: skipped (superseded: {lost} checkpoint(s) written over before the node read them)"));
+            }
             let Some(st) = mirror.state(t, inc) else { continue };
             let Some(cp) = st.base else {
                 // A checkpoint this node cannot read as a page does (one heavier than a drain reads, or one a page may read
@@ -584,8 +619,8 @@ impl RoomShadow {
                 // comparison not made. (The first checkpoint a table is read with is no trim.)
                 if st.hold == Some(Hold::Base) && st.trims > 0 {
                     let id = held_identity(st.born, st.trims);
-                    if compared.get(&key) != Some(&id) {
-                        compared.insert(key.clone(), id);
+                    if !seen(compared, &key, &id) {
+                        remember(compared, &key, id);
                         tally.note(&Verdict::Skip(Skip::Unreadable));
                         say(said, false, format!("{t} {inc}: skipped (unreadable: the checkpoint cannot be read as a page reads it)"));
                     }
@@ -593,20 +628,25 @@ impl RoomShadow {
                 continue;
             };
             let id = identity(cp);
-            if compared.get(&key) == Some(&id) {
+            // The checkpoint a table is first read with is no trim: nothing was held against it, and however the table
+            // starts over after (its session replaced, the worker lost it), no answer from before is its answer. It is
+            // not compared, nor counted; it is remembered, so that a page that puts it back later does not have it
+            // counted either.
+            if st.trims == 0 {
+                remember(compared, &key, id);
+                continue;
+            }
+            if seen(compared, &key, &id) {
                 continue;
             }
             let u = cp.get("u").and_then(CVal::as_int).unwrap_or(-1);
             let Some(fold) = feed.fold(t, inc).filter(|f| f.generation < st.generation) else {
-                // (The checkpoint a table is first read with is no trim: nothing was to be held against it.)
-                if st.trims > 0 {
-                    compared.insert(key.clone(), id);
-                    tally.note(&Verdict::Skip(Skip::Unanswered));
-                    say(said, false, format!("{t} {inc} u={u}: skipped (unanswered)"));
-                }
+                remember(compared, &key, id);
+                tally.note(&Verdict::Skip(Skip::Unanswered));
+                say(said, false, format!("{t} {inc} u={u}: skipped (unanswered)"));
                 continue;
             };
-            compared.insert(key.clone(), id);
+            remember(compared, &key, id);
             let mut verdict = compare(fold.summary, cp, inc);
             if matches!(verdict, Verdict::Agree | Verdict::Mismatch(_)) {
                 let shown = Shown { born: st.born, frame: fold.frame, pins, delegations };
@@ -625,6 +665,23 @@ impl RoomShadow {
             }
         }
     }
+}
+
+/// Whether the table `key` has been compared with (or passed over, or first read with) the checkpoint `id`.
+fn seen(compared: &BTreeMap<TableKey, VecDeque<[u8; 32]>>, key: &TableKey, id: &[u8; 32]) -> bool {
+    compared.get(key).is_some_and(|ring| ring.contains(id))
+}
+
+/// Remember that the table `key` has been compared with the checkpoint `id`, the last [`COMPARED_HISTORY`] of them.
+fn remember(compared: &mut BTreeMap<TableKey, VecDeque<[u8; 32]>>, key: &TableKey, id: [u8; 32]) {
+    let ring = compared.entry(key.clone()).or_default();
+    if ring.contains(&id) {
+        return;
+    }
+    if ring.len() >= COMPARED_HISTORY {
+        ring.pop_front();
+    }
+    ring.push_back(id);
 }
 
 /// The node's fold in shadow, over all the rooms it serves: one worker
@@ -719,8 +776,12 @@ impl<L: Launch> FoldShadow<L> {
         let walk_time = self.pin_walk_time;
         let watched = self.pins.entry(room.to_string()).or_insert_with(|| PlayerPins::attach_timed(doc, walk, walk_time));
         let watch = watched.watch();
-        let (pins, pins_settled, pins_epoch) = watched.view_at();
-        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled, pins_epoch, watch: Some(watch) }
+        let (pins, pins_settled, pins_epoch, deed) = watched.view_full();
+        // (The houses of a plan are the ones its deed holder delegated: they are the room's houses only while the doc
+        // names that holder. A holder who changed since the pass read the room, or since the epoch was read, shows
+        // nothing whole; one who changes after moves the epoch.)
+        let held = deed.as_deref() == Some(plan.owner.as_str());
+        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch) }
     }
 
     /// One tick, with every room the node serves: its doc, and what to follow there (None:
@@ -748,12 +809,13 @@ impl<L: Launch> FoldShadow<L> {
         let events = self.sup.poll(clock());
         let now = clock();
         rooms.sort_by(|a, b| a.0.cmp(&b.0));
-        // The tables kept after the view lets them go (their last checkpoint not read yet, or a page's removal
-        // ended them and the checkpoint of its compaction may yet come) keep their places in the worker.
+        // The tables kept after the view lets them go (their last checkpoint not read yet, or the plan stopped naming
+        // them, which the pages count as ended, and the checkpoint of their compaction may yet come) keep their places
+        // in the worker.
         let mut keep: BTreeMap<String, BTreeSet<TableKey>> = BTreeMap::new();
-        for (room, doc, view) in &rooms {
+        for (room, _, view) in &rooms {
             if let (Some(view), Some(rs)) = (view, self.rooms.get_mut(room)) {
-                rs.note_gone(doc, view, now);
+                rs.note_gone(view, now);
                 keep.insert(room.clone(), rs.outgoing(view, now));
             }
         }
@@ -794,8 +856,8 @@ impl<L: Launch> FoldShadow<L> {
         for (room, doc, view) in rooms {
             listed.insert(room.clone());
             match view {
-                // (A room with no table, and none followed, has nothing to read.)
-                Some(view) if view.tables.is_empty() && !self.rooms.contains_key(&room) => {}
+                // (A room the house has a plan for is watched from its first plan, with a table or none: what its mirror
+                // sees of the delegations is read against every table that comes.)
                 Some(view) => {
                     let rs = self.rooms.entry(room.clone()).or_insert_with(|| RoomShadow::attach(&doc, &room, self.limits));
                     rs.follow(clock(), &doc, &view, keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
