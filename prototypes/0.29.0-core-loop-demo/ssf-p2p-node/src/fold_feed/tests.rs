@@ -959,8 +959,11 @@ fn a_fold_that_stays_pending_is_asked_for_a_bounded_number_of_passes() {
     let script = Script::default();
     script.pending_for.store(usize::MAX, Ordering::SeqCst);
     let mut rig = stand_rig(&script);
+    assert_eq!(rig.feed.max_pending, MAX_PENDING_PASSES, "the default");
+    // (Fewer than the default: a pass is a round trip to a thread, and a loaded machine makes it slow.)
+    rig.feed.max_pending = 24;
     rig.session(&live0(), &recs(2));
-    let passes = MAX_PENDING_PASSES as u64;
+    let passes = 24u64;
     rig.until("the passes are spent", |r| r.feed.counts().results == passes);
     for _ in 0..20 {
         rig.tick();
@@ -974,6 +977,89 @@ fn a_fold_that_stays_pending_is_asked_for_a_bounded_number_of_passes() {
     rig.put(&live0(), &rk(1, 9), val(9));
     rig.until("finished", |r| r.caught_up());
     assert_eq!(rig.feed.counts().warm, passes);
+}
+
+#[test]
+fn an_answer_that_finishes_the_fold_starts_the_count_of_passes_over() {
+    let script = Script::default();
+    // Two answers that say pending, then a finished one: with three passes allowed in a row.
+    script.pending_for.store(2, Ordering::SeqCst);
+    let mut rig = stand_rig(&script);
+    rig.feed.max_pending = 3;
+    rig.session(&live0(), &recs(2));
+    rig.until("finished", |r| r.caught_up());
+    // The same again for a change: the two before did not count against it.
+    script.pending_for.store(2, Ordering::SeqCst);
+    rig.put(&live0(), &rk(1, 9), val(9));
+    rig.until("finished again", |r| r.caught_up());
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm), (1, 5), "1 + 1 passes, the change, 1 more pass");
+}
+
+#[test]
+fn a_table_that_starts_over_has_its_passes_counted_from_the_start() {
+    let script = Script::default();
+    script.pending_for.store(usize::MAX, Ordering::SeqCst);
+    let mut rig = stand_rig(&script);
+    rig.feed.max_pending = 3;
+    rig.session(&live0(), &recs(2));
+    rig.until("the passes are spent", |r| r.feed.counts().results == 3);
+    for _ in 0..10 {
+        rig.tick();
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm), (1, 2));
+    // A new checkpoint starts the table over: a Cold, and the passes again.
+    let base = cp(3);
+    rig.session(&live_of(T, Some(&base)), &recs(2));
+    rig.put_top(&sum_of(T), &base);
+    rig.until("the passes are spent again", |r| r.feed.counts().results == 6);
+    for _ in 0..10 {
+        rig.tick();
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm), (2, 4), "the second Cold got its passes");
+}
+
+#[test]
+fn a_table_let_go_of_and_taken_up_again_between_two_pushes_is_forgotten_at_the_worker_and_sent_afresh() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    // (The feed never sees the table gone.)
+    rig.mirror.want(&[]);
+    rig.want(&[(T, INC)]);
+    rig.tick();
+    assert!(rig.feed.fold(T, INC).is_none() || !rig.caught_up(), "the old table's answer is not the new one's");
+    rig.until("sent afresh", |r| colds(&r.reqs()).len() == 2 && r.caught_up());
+    let reqs = rig.reqs();
+    let kinds: Vec<&str> = reqs.iter().map(|r| match r {
+        Req::Cold(_) => "cold",
+        Req::Warm(_) => "warm",
+        Req::Forget { .. } => "forget",
+    }).collect();
+    assert_eq!(kinds, ["cold", "forget", "cold"], "the old table is let go of at the worker first");
+}
+
+#[test]
+fn a_frame_kept_for_a_table_before_the_worker_held_it_is_not_sent_for_the_one_that_comes_after() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(1));
+    rig.until("caught up", |r| r.caught_up());
+    // A second table, sent when the pipe is full: its first Cold is taken and kept.
+    rig.sup.clog(QUEUE_BYTES);
+    rig.session(&live_of("t2", None), &recs(2));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.until("the first Cold is kept", |r| r.feed.counts().busy >= 1);
+    // The mirror lets that table go and takes it up again between two pushes.
+    rig.want(&[(T, INC)]);
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("sent", |r| r.caught_up_of("t2"));
+    let reqs = rig.reqs();
+    assert_eq!(colds(&reqs).iter().filter(|c| c.ctx.t == "t2").count(), 1, "one Cold, taken from the table as it is");
 }
 
 #[test]
