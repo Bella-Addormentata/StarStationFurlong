@@ -3007,3 +3007,170 @@ fn a_mirror_can_be_told_that_the_delegations_churned_before_it_began() {
     assert!(f.m.delegations().churned);
     assert_eq!(f.m.delegations().changes, 0, "(it changed nothing it saw)");
 }
+
+// ── Round 10 ─────────────────────────────────────────────────────────────────
+
+/// A value no page takes for a checkpoint (plain, light, and none) is no checkpoint written over: only what a page may
+/// take for one, or the node cannot tell, is told of as lost. What stands, if it is no checkpoint, is none of the
+/// ones written.
+#[test]
+fn a_value_no_page_takes_for_a_checkpoint_is_no_checkpoint_written_over() {
+    let junk = || norm(obj(vec![("v", CVal::Int(1)), ("pad", s("x"))]));
+    let proto = |u: i64| {
+        let Any::Map(m) = to_any(&cp(u)) else { panic!("a map") };
+        let mut m = (*m).clone();
+        m.insert("__proto__".into(), Any::String(Arc::from("x")));
+        Any::Map(Arc::new(m))
+    };
+    // (A map with a `__proto__` field and a key a typed array keeps from being a field: a page may read it as anything.)
+    let anything = |u: i64| {
+        let Any::Map(m) = to_any(&cp(u)) else { panic!("a map") };
+        let mut m = (*m).clone();
+        m.insert("__proto__".into(), Any::String(Arc::from("x")));
+        m.insert("length".into(), Any::Number(1.0));
+        Any::Map(Arc::new(m))
+    };
+    // (A checkpoint with a house commitment: the pages take it only for the table of a house incarnation.)
+    let house_cp = |u: i64| {
+        let CVal::Obj(mut fields) = cp(u) else { panic!("an object") };
+        fields.push(("h".to_string(), s(&"d".repeat(64))));
+        norm(CVal::Obj(fields))
+    };
+    let nested = |f: &Fix| {
+        let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = f.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), MapPrelim::default());
+    };
+    // (what is written between two looks, in order; the checkpoints lost; the base at the end is a checkpoint)
+    for (how, lost, stands) in [
+        ("a checkpoint", 0, true),
+        ("junk", 0, false),
+        ("junk, a checkpoint, junk, a checkpoint", 1, true),
+        ("a checkpoint, junk", 1, false),
+        ("junk, junk, a checkpoint, junk", 1, false),
+        ("a nested map, a checkpoint", 0, true),
+        ("a checkpoint a page may read otherwise, another", 1, true),
+        ("a value a page may read as anything, another", 1, true),
+        ("a checkpoint too heavy to read, another", 1, true),
+        ("a checkpoint, a checkpoint too heavy to read", 1, false),
+        ("a house checkpoint, a house checkpoint", 1, true),
+    ] {
+        let mut f = Fix::empty();
+        f.put_top(&sum_of(T), &cp(1));
+        f.session(&live_of(T, Some(&cp(1))), &[]);
+        f.drain();
+        f.skim();
+        assert_eq!(f.m.take_superseded(T, INC), 0, "{how}: (the first base)");
+        let mut u = 2;
+        for step in how.split(", ") {
+            match step {
+                "a checkpoint" | "another" => {
+                    f.put_top(&sum_of(T), &cp(u));
+                    u += 1;
+                }
+                "a house checkpoint" => {
+                    f.put_top(&sum_of(T), &house_cp(u));
+                    u += 1;
+                }
+                "junk" => f.put_top(&sum_of(T), &junk()),
+                "a nested map" => nested(&f),
+                "a checkpoint a page may read otherwise" => {
+                    f.put_any(&sum_of(T), proto(u));
+                    u += 1;
+                }
+                "a value a page may read as anything" => {
+                    f.put_any(&sum_of(T), anything(u));
+                    u += 1;
+                }
+                "a checkpoint too heavy to read" => {
+                    f.put_top(&sum_of(T), &heavy(u));
+                    u += 1;
+                }
+                other => panic!("{other}"),
+            }
+        }
+        f.drain();
+        assert_eq!(f.m.take_superseded(T, INC), lost, "{how}");
+        assert_eq!(matches!(f.state().base, Some(_)), stands, "{how}");
+    }
+}
+
+/// A page's trim writes the checkpoint of its own table in the transaction that deletes the session it trims. The
+/// checkpoint of another table changing in the same transaction is that table's trim and not this one's: a session
+/// replaced or removed beside it is replaced or removed on its own, and the history it held is the pages' to count.
+#[test]
+fn a_session_replaced_beside_another_tables_trim_is_a_session_replaced_on_its_own() {
+    const B: &str = "table-b";
+    let b_live = |base: Option<&CVal>| live_of(B, base);
+    let b_trim = |f: &Fix, a_edit: &dyn Fn(&yrs::MapRef, &mut yrs::TransactionMut)| {
+        let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = f.doc.transact_mut();
+        let base = cp(5);
+        comp.insert(&mut txn, sum_of(B).as_str(), to_any(&base));
+        comp.remove(&mut txn, b_live(Some(&cp(4))).as_str());
+        comp.insert(&mut txn, b_live(Some(&base)).as_str(), MapPrelim::default());
+        a_edit(&comp, &mut txn);
+    };
+    for (how, unread) in [
+        ("another table's trim beside A's session replaced", true),
+        ("another table's trim beside A's session removed", true),
+        ("A's checkpoint written again as it stands beside A's session replaced", true),
+        ("A's own trim", false),
+        ("A's own trim beside another table's", false),
+    ] {
+        let a_base = cp(2);
+        let mut f = Fix::seeded(Limits::default(), |f| {
+            f.put_top(&sum_of(T), &a_base);
+            f.session(&live_of(T, Some(&a_base)), &records(&[(1, 10)]));
+            f.put_top(&sum_of(B), &cp(4));
+            f.session(&b_live(Some(&cp(4))), &records(&[(1, 10)]));
+        });
+        f.m.want(&[(T.into(), INC.into()), (B.into(), INC.into())]);
+        while f.drain().short {}
+        f.skim();
+        let _ = f.m.take(B, INC, usize::MAX);
+        let a_live = live_of(T, Some(&a_base));
+        match how {
+            "another table's trim beside A's session replaced" => b_trim(&f, &|comp, txn| {
+                comp.insert(txn, a_live.as_str(), MapPrelim::default());
+            }),
+            "another table's trim beside A's session removed" => b_trim(&f, &|comp, txn| {
+                comp.remove(txn, a_live.as_str());
+            }),
+            "A's checkpoint written again as it stands beside A's session replaced" => {
+                let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = f.doc.transact_mut();
+                comp.insert(&mut txn, sum_of(T).as_str(), to_any(&a_base));
+                comp.insert(&mut txn, a_live.as_str(), MapPrelim::default());
+            }
+            "A's own trim" => {
+                let base = cp(3);
+                f.page_trim(&a_live, &base, &live_of(T, Some(&base)), &[]);
+            }
+            _ => b_trim(&f, &|comp, txn| {
+                let base = cp(3);
+                comp.insert(txn, sum_of(T).as_str(), to_any(&base));
+                comp.remove(txn, a_live.as_str());
+                comp.insert(txn, live_of(T, Some(&base)).as_str(), MapPrelim::default());
+            }),
+        }
+        while f.drain().short {}
+        f.skim();
+        // A's next trim: the session it trims is the one the pages read.
+        let (cur, next_base) = match how {
+            "A's own trim" | "A's own trim beside another table's" => (live_of(T, Some(&cp(3))), cp(4)),
+            _ => (a_live.clone(), cp(3)),
+        };
+        if how == "A's own trim" || how == "A's own trim beside another table's" {
+            assert_eq!(f.state().trims, 1, "{how}: the trim");
+            assert!(!f.state().unread_at_trim, "{how}: a trim is no doubt");
+            f.page_trim(&cur, &next_base, &live_of(T, Some(&next_base)), &[]);
+            f.drain();
+            assert_eq!((f.state().trims, f.state().unread_at_trim), (2, unread), "{how}: the next trim");
+        } else {
+            f.page_trim(&cur, &next_base, &live_of(T, Some(&next_base)), &[]);
+            f.drain();
+            assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        }
+    }
+}

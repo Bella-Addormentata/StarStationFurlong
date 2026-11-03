@@ -4164,3 +4164,187 @@ fn another_houses_record_does_not_leave_this_houses_plan_incomplete() {
     room.tick(200);
     assert!(fold_plan_of(&mut room).unwrap().complete, "(the other house's record is none of this house's own)");
 }
+
+// ── Round 10: what the plan's houses are, and when they are all there ────────
+
+/// The deed goes to `holder`, a player of the room.
+fn give_the_deed(room: &Room, holder: &str) {
+    let mut txn = room.doc.transact_mut();
+    let info = txn.get_or_insert_map("roomInfo");
+    info.insert(&mut txn, "owner", Any::String(Arc::from(holder)));
+}
+
+/// A peer (another client than the house's own) writes `value` under `key` in the session `ses`.
+fn peer_writes(doc: &Doc, ses: &str, key: &str, value: Any) {
+    let peer = Doc::with_client_id(78);
+    let sv = {
+        let txn = doc.transact();
+        let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+        txn.state_vector()
+    };
+    {
+        let comp = peer.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = peer.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, value);
+    }
+    let update = peer.transact().encode_state_as_update_v1(&sv);
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+}
+
+/// Houses pinned before a stretch in which the room had no plan (the deed holder was one that had not delegated this
+/// house) are the plan's still, as the pages pin them; but nothing watched their delegations meanwhile, and a page that
+/// binds now counts only those the doc holds: the plan says so.
+#[test]
+fn a_plan_that_comes_back_with_a_house_pinned_before_a_gap_says_so() {
+    let mut room = Room::new("fold-view-gap", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    let b_pub = b_house.public().to_string();
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert!(plan.houses.contains(&b_pub), "(the other house is pinned)");
+    assert!(!plan.gapped, "no gap yet");
+    // The deed goes to a player who has not delegated this house: no plan for a tick. The other house's delegation is
+    // withdrawn meanwhile, and the deed comes back.
+    give_the_deed(&room, "alice");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.remove(&mut txn, format!("hk:{b_pub}").as_str());
+    }
+    give_the_deed(&room, "owner");
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan again");
+    assert!(plan.houses.contains(&b_pub), "(it stays pinned, as the pages pin it)");
+    assert!(plan.gapped, "and nothing watched its delegation in between");
+    // The deed goes to another holder who delegates this house too: the houses are theirs, and none is pinned for them.
+    let carol = who("carol");
+    give_the_deed(&room, "carol");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None, "(carol has not delegated it yet)");
+    room.delegate(&carol);
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("carol's plan");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()], "(none of the pinned houses is carol's)");
+    assert!(!plan.gapped, "a gap in which nothing of this deed holder's was pinned is no gap of theirs");
+}
+
+/// A gap with no other house pinned has nothing stale in it; and a plan that never went has a mirror that watched.
+#[test]
+fn a_gap_with_no_other_house_pinned_and_a_plan_that_never_went_are_no_gap() {
+    // No other house.
+    let mut room = Room::new("fold-view-gap-alone", true);
+    room.tick(1_000);
+    give_the_deed(&room, "alice");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+    give_the_deed(&room, "owner");
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan again");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
+    assert!(!plan.gapped, "(it pinned none to be stale)");
+    // A house pinned after the gap is no stale one.
+    let owner_key = room.house.rooms[ROOM].fold.as_ref().expect("a plan").owner_key.clone();
+    let later = who("a-house-pinned-later").public;
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(later.clone(), owner_key);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert!(plan.houses.contains(&later), "(pinned now)");
+    assert!(!plan.gapped, "(and after the gap)");
+    // A plan that stays: the delegation withdrawn is the mirror's to see, as it is for as long as the plan stands.
+    let mut room = Room::new("fold-view-no-gap", true);
+    let b_house = second_house(&room);
+    b_house.public();
+    let mut b_house = b_house;
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).unwrap().houses.len() > 1);
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.remove(&mut txn, format!("hk:{}", b_house.public()).as_str());
+    }
+    room.tick(1_000);
+    room.tick(1_000);
+    assert!(!fold_plan_of(&mut room).unwrap().gapped, "(the plan was there the whole time)");
+}
+
+/// Passes of a tick read the doc one after the other, with the doc let go between them for the checks. A table that went
+/// through in a pass is not read again in the next, so a record a peer sent to it in between (naming a house the pass
+/// has not learned) is not seen: the plan is not complete. What this node wrote itself is not what a peer sent.
+#[test]
+fn a_plan_is_not_complete_when_a_peer_sent_to_a_table_that_had_gone_through_between_the_passes() {
+    for (how, complete) in [("nothing", true), ("a peer", false), ("this node", true), ("a peer, with no table gone through", true)] {
+        let mut room = Room::new(&format!("fold-view-between-{}", how.replace([' ', ','], "-")), true);
+        let (alice, bob) = (who("alice"), who("bob"));
+        room.closed_on_the_join(&alice, &bob);
+        // (A second table with nothing to check goes through in the first pass; the first has checks to wait for. In the
+        // last case there is only the first: nothing went through before the checks, and the next pass reads it all.)
+        let ses2 = if how.contains("no table") { room.ses_key() } else { second_table(&room) };
+        room.reveal(&alice, 1);
+        room.reveal(&bob, 1);
+        let (doc, fired) = (room.doc.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let how_now = how;
+        room.house.on_check = Some(Box::new(move |_| {
+            if fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let value = Any::Number(1.0);
+            match how_now {
+                "a peer" | "a peer, with no table gone through" => peer_writes(&doc, &ses2, "x:1:padding", value),
+                "this node" => {
+                    let comp = doc.get_or_insert_map(COMPUTED_MAP);
+                    let mut txn = doc.transact_mut();
+                    let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
+                    m.insert(&mut txn, "x:1:padding", value);
+                }
+                _ => {}
+            }
+        }));
+        let out = room.tick(200);
+        assert!(!out.short, "{how}: read to its end");
+        let plan = fold_plan_of(&mut room).expect("a plan");
+        assert_eq!(plan.complete, complete, "{how}");
+        // (And the next tick, with nothing between its passes, is complete: what a peer sent is read now.)
+        room.tick(200);
+        assert!(fold_plan_of(&mut room).expect("a plan").complete, "{how}: the next tick");
+    }
+}
+
+/// What a tick's passes saw of the doc between them: a peer's update is a reason only to a table that had gone through
+/// before it, and a look is compared with the pass before, not with the first.
+#[test]
+fn the_looks_of_a_ticks_passes_move_only_a_table_that_had_gone_through_before_what_a_peer_sent() {
+    let seen = |n: u32| -> Seen { Arc::new(vec![(7, n)]) };
+    let mut looks = Looks::default();
+    looks.look(false, seen(1));
+    assert!(!looks.moved, "(the first pass has none before it)");
+    looks.look(false, seen(2));
+    assert!(!looks.moved, "a peer sent before any table went through: none was passed over");
+    looks.look(true, seen(2));
+    assert!(!looks.moved, "and nothing since, with a table through");
+    looks.look(true, seen(3));
+    assert!(looks.moved, "a peer sent after a table went through");
+    let mut looks = Looks::default();
+    looks.look(true, seen(1));
+    looks.look(true, seen(1));
+    assert!(!looks.moved, "nothing sent");
+    // The node's own writes are no look: the clients without it are what is compared.
+    let doc = Doc::with_client_id(5);
+    let map = doc.get_or_insert_map("m");
+    map.insert(&mut doc.transact_mut(), "a", 1);
+    let before = seen_of(&doc.transact(), 5);
+    map.insert(&mut doc.transact_mut(), "b", 2);
+    assert_eq!(*before, *seen_of(&doc.transact(), 5), "the node's own write is not a peer's");
+    assert!(before.is_empty());
+    let peer = Doc::with_client_id(6);
+    peer.get_or_insert_map("m").insert(&mut peer.transact_mut(), "c", 3);
+    let update = peer.transact().encode_state_as_update_v1(&doc.transact().state_vector());
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+    assert_ne!(*before, *seen_of(&doc.transact(), 5), "a peer's is");
+}

@@ -689,6 +689,12 @@ struct RoomMem {
     /// before, not complete: it says nothing of the room, which is no word that
     /// the tables have gone.
     fold: Option<FoldPlan>,
+    /// Some tick ended with the room having no plan while other houses were pinned in it: the deed holder was one
+    /// that had not delegated this house (or its delegation was not verified), and nothing watched what the
+    /// delegations did meanwhile. The houses pinned here stay pinned (as the pages pin them), and a page that binds
+    /// afterwards counts only those whose delegation the doc holds then, so the houses of a plan that comes after
+    /// ([`HousePlan::gapped`]) may be more than the ones a page counts. For the run.
+    gapped: bool,
 }
 
 /// The house tables a pass found in a room it is delegated a house of, and
@@ -732,6 +738,10 @@ pub struct HousePlan {
     /// whose houses are not all known can leave out a close a page counts, so
     /// it is not held against a checkpoint.
     pub complete: bool,
+    /// The room had a stretch with no plan while other houses were pinned in it (`RoomMem::gapped`): a delegation
+    /// may have been withdrawn in it, which nothing watched, and the houses here, which are pinned for the run, may be
+    /// more than a page that binds now counts. The shadow takes the room's delegations as churned.
+    pub gapped: bool,
 }
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
@@ -820,6 +830,10 @@ pub struct House {
     /// check past the budget), whether it counts as running Fair, and
     /// whether it was short: a later pass reads only the others.
     through: HashMap<(String, String), (bool, bool)>,
+    /// What the tick's passes saw of the doc between them ([`Looks`]).
+    looks: Looks,
+    /// The clients' id of this node's doc (its own writes are not what a peer sent).
+    own_client: u64,
     /// The tables held this tick: one whose own record the put-back writes
     /// again is read again ([`House::plan`]).
     held_now: HashSet<(String, String)>,
@@ -886,6 +900,38 @@ pub(crate) fn read_costed(charge: impl FnOnce(usize) -> bool, key_len: usize, ou
     }
 }
 
+/// The clients of a doc and how far each has written, as the doc held them, without the node's own writes (what peers
+/// have sent): equal at two looks if and only if a peer sent nothing between them.
+type Seen = Arc<Vec<(u64, u32)>>;
+
+fn seen_of<T: ReadTxn>(txn: &T, own: u64) -> Seen {
+    let mut seen: Vec<(u64, u32)> = txn.state_vector().iter().map(|(client, clock)| (client.get(), *clock)).filter(|(client, _)| *client != own).collect();
+    seen.sort_unstable();
+    Arc::new(seen)
+}
+
+/// What a tick's passes saw of the doc between them. The doc is let go between passes (the checks are made without it),
+/// and a table that went through in a pass is not read again in the next: if a peer sent anything since the pass before,
+/// the table is not as it was read, and a record of a house the pass would have learned may be in it. (The looks add up: a
+/// peer that sent between two passes did so after every table that went through before them. A table that goes through in
+/// a pass was read after what a peer sent before it.)
+#[derive(Default)]
+struct Looks {
+    last: Option<Seen>,
+    /// Some table that went through was passed over after a peer sent to the doc: the tick's plan is not complete.
+    moved: bool,
+}
+
+impl Looks {
+    /// A pass begins and sees `seen`; `passed_over`: some table went through in a pass before this one.
+    fn look(&mut self, passed_over: bool, seen: Seen) {
+        if passed_over && self.last.as_ref().is_some_and(|then| **then != *seen) {
+            self.moved = true;
+        }
+        self.last = Some(seen);
+    }
+}
+
 /// What [`House::tick`] did in a room.
 #[derive(Default, Debug, PartialEq)]
 pub struct TickOut {
@@ -934,6 +980,8 @@ impl House {
             short: false,
             fresh: 0,
             through: HashMap::new(),
+            looks: Looks::default(),
+            own_client: 0,
             held_now: HashSet::new(),
             stepping_down: false,
             settle_ms: SETTLE_MS,
@@ -1087,7 +1135,9 @@ impl House {
         houses.push(self.key.public.clone());
         houses.sort();
         houses.dedup();
-        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete })
+        // (Only a plan that names a house besides this one has any pinned to be stale.)
+        let gapped = mem.gapped && houses.len() > 1;
+        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete, gapped })
     }
 
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
@@ -1178,6 +1228,8 @@ impl House {
         self.read_out = false;
         self.fresh = 0;
         self.through.clear();
+        self.looks = Looks::default();
+        self.own_client = doc.client_id().get();
         self.held_now.clear();
         self.wanted.clear();
         let mut out = TickOut::default();
@@ -1213,11 +1265,18 @@ impl House {
         // (And this house's own delegation: the record the doc holds under its key is the one it holds, as every page
         // reads it, for the house goes on as the delegate it verified while the record is other, and the pages may not
         // count it, which `unclear_houses` does not say: it holds the other houses, which a table names.)
+        // (And a peer sent nothing, between the passes, to a table that went through in an earlier one and was not read
+        // again: a record of a house it names that the pass never learned would leave the plan's houses short.)
         let houses_clear = self.unclear_houses.is_empty() && !self.own_off;
+        let moved_between = self.looks.moved;
         if let Some(mem) = self.rooms.get_mut(room) {
             let waiting = mem.fold.as_ref().is_some_and(|p| p.tables.iter().any(|k| mem.tables.get(k).is_some_and(|m| m.held_since.is_some())));
             if let Some(plan) = mem.fold.as_mut() {
-                plan.complete = !out.short && houses_clear && !waiting;
+                plan.complete = !out.short && houses_clear && !waiting && !moved_between;
+            }
+            // (A tick that ended with no plan, in a room that has houses pinned: nothing watches their delegations now.)
+            if mem.fold.is_none() && !mem.houses.is_empty() {
+                mem.gapped = true;
             }
         }
         while self.verdicts.len() > MAX_VERDICTS {
@@ -1388,6 +1447,10 @@ impl House {
         }
 
         let mut fair_tables = 0;
+        // (What the doc holds as this pass reads it. It is let go between passes, and a table that went through in an
+        // earlier one is not read again: if a peer sent anything since, it is not as it was read. The looks add up: a peer
+        // that sent between two passes did so after every table that went through before them.)
+        self.looks.look(!self.through.is_empty(), seen_of(txn, self.own_client));
         if !tables.is_empty() {
             let turn = self.rooms[room].turn % tables.len();
             tables.rotate_left(turn);

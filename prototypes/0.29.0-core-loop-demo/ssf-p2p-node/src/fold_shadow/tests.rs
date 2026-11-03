@@ -446,7 +446,7 @@ impl Bench {
         let bench = Bench {
             shadow: FoldShadow::new(launch, now),
             doc: Doc::new(),
-            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None }),
+            view: Some(FoldView { tables: vec![(case.ctx.t.clone(), case.ctx.inc.clone())], houses: case.houses.clone(), pins: case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false }),
             case,
             now,
             log,
@@ -695,7 +695,7 @@ fn a_room_that_is_no_longer_followed_has_its_tables_forgotten_and_goes() {
     assert_eq!(b.forgets(), 1, "the worker was told");
     assert_eq!(b.shadow.counts().cold, before.cold, "what the room did stays counted");
     // It is followed afresh when there is something again.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false });
     b.until("followed again", |b| b.caught_up());
     assert_eq!(b.shadow.counts().cold, before.cold + 1);
 }
@@ -807,7 +807,7 @@ fn a_room_followed_again_before_it_was_let_go_of_is_kept() {
     b.view = None;
     b.ticks(3);
     // The house finds the room and its table again while the worker still has to be told.
-    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None });
+    b.view = Some(FoldView { tables: vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())], houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false });
     b.shadow.sup.unclog(QUEUE_BYTES);
     for _ in 0..6 {
         b.tick();
@@ -1023,7 +1023,7 @@ fn the_tables_a_worker_can_hold_are_shared_between_the_rooms_in_room_order() {
                 comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
             }
         }
-        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None };
+        let view = FoldView { tables, houses: b.case.houses.clone(), pins: b.case.pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
         docs.push((room.to_string(), doc, Some(view)));
     }
     for _ in 0..200 {
@@ -1321,7 +1321,7 @@ fn every_table_to_go_is_let_go_of_in_every_room_before_a_new_one_is_asked_for() 
         }
     };
     let names = |p: &str, from: usize, to: usize| -> Vec<String> { (from..to).map(|i| format!("{p}{i}")).collect() };
-    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None };
+    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
     // Room a has 7 tables and room b 7: the worker is full.
     let (a1, b1) = (names("a", 0, 7), names("b", 0, 7));
     make(&docs[0].1, "room-a", &names("a", 0, 10));
@@ -1388,7 +1388,7 @@ fn a_forget_the_worker_could_not_take_holds_back_the_new_tables_of_every_room() 
     };
     make(&docs[0].1, "room-a", &[long.clone()]);
     make(&docs[1].1, "room-b", &["b0".to_string(), "b1".to_string()]);
-    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None };
+    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true, pins_epoch: 0, watch: None, gapped: false };
     for _ in 0..300 {
         b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[&long]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0"])))]);
         thread::sleep(Duration::from_millis(2));
@@ -1453,7 +1453,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
     everyone.extend(b.case.pins.iter().filter(|(p, _)| p != OWNER).cloned());
     everyone.sort();
     let shadow = Mutex::new(b.shadow);
-    let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
+    let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false };
     let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
     // A room with a plan and no table is watched; one with no plan is not.
     tick_shadow(&shadow, docs(&["with", "without"]), Instant::now(), |r| (r == "with").then(|| plan.clone())).unwrap();
@@ -1488,7 +1488,7 @@ fn a_view_is_settled_only_with_a_plan_that_is_complete_and_pins_that_are() {
     let wrong = b.wrong_trim(&b.answer());
     let shadow = Mutex::new(b.shadow);
     let go = |complete: bool| {
-        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete, gapped: false };
         tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
     };
     let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
@@ -1856,7 +1856,7 @@ fn a_trim_is_held_against_the_node_through_its_own_watch_of_the_players() {
         let live = format!("ses:{}:{}:{}", tables[0].0, tables[0].1, crate::house_bytes::next_sid(&b.case.ctx, Some(&wrong)).unwrap());
         let shadow = Mutex::new(b.shadow);
         let go = || {
-            let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true };
+            let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped: false };
             tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
         };
         let confirmed = || shadow.lock().unwrap().rooms.get(&room).map_or(0, |rs| rs.confirmed.len());
@@ -2028,7 +2028,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     // (The players of the vector are in the room, besides its owner.)
     let others = b.case.pins.iter().filter(|(p, _)| p != OWNER).count();
     let mut shadow = b.shadow;
-    let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
     let first = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     let watch = first.watch.clone().expect("the watch of the players");
     assert_eq!(watch.epoch(), first.pins_epoch);
@@ -2324,7 +2324,7 @@ fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
         let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
         let mut shadow = b.shadow;
         shadow.pin_walk_time = timed.then_some(Duration::ZERO);
-        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true, gapped: false };
         let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
         assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
         // (The 200 players, the owner and the players of the vector.)
@@ -2653,7 +2653,7 @@ fn a_delegation_replaced_in_a_room_with_a_plan_and_no_table_yet_is_seen() {
 fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_under() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
-    let plan = |owner: &str| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let plan = |owner: &str| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
     let mut shadow = b.shadow;
     assert!(shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the holder the doc names");
     assert!(!shadow.view_of(&room, &doc, plan("someone else"), PIN_WALK_KEYS).settled, "a plan made under another");
@@ -2685,7 +2685,7 @@ fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_
 fn a_view_is_settled_only_while_the_watch_pins_the_key_the_plan_was_made_with_for_the_deed_holder() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
-    let plan = |owner: &str, key: &str| HousePlan { owner: owner.to_string(), owner_key: key.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let plan = |owner: &str, key: &str| HousePlan { owner: owner.to_string(), owner_key: key.to_string(), tables: vec![], houses: houses.clone(), complete: true, gapped: false };
     let mut shadow = b.shadow;
     assert!(shadow.view_of(&room, &doc, plan(OWNER, OWNER_KEY), PIN_WALK_KEYS).settled, "the key the watch has pinned for the holder");
     assert!(!shadow.view_of(&room, &doc, plan(OWNER, "the key before"), PIN_WALK_KEYS).settled, "a plan made under another key of the holder");
@@ -3598,4 +3598,53 @@ fn a_trim_the_fold_has_no_answer_for_does_not_end_the_doubt_of_a_session_the_nod
     b.ticks(5);
     assert_eq!(b.shadow.tally.unanswered, 1, "{:?}", b.shadow.tally);
     assert_eq!(b.doubted_sessions(), vec![ANY_SESSION.to_string()], "it is not known to be the session the node could not name");
+}
+
+/// Houses pinned before a stretch in which the room had no plan (the plan says `gapped`) are taken as delegations that
+/// churned: nothing is shown whole from them, as for a delegation seen to be withdrawn.
+#[test]
+fn the_houses_of_a_plan_that_came_back_after_a_gap_are_not_shown_whole() {
+    for gapped in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        let _pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.view.as_mut().unwrap().gapped = gapped;
+        b.ticks(5);
+        let rs = &b.shadow.rooms[b.room()];
+        assert_eq!(rs.mirror.delegations().churned, gapped, "gapped={gapped}");
+        assert_eq!(b.confirmed_count(), (!gapped) as usize, "gapped={gapped}");
+    }
+}
+
+/// The plan the house hands the shadow carries the gap to the room's shadow: a plan that says it came back after one is
+/// not shown whole, however complete it is.
+#[test]
+fn a_plan_that_says_it_came_back_after_a_gap_is_not_shown_whole() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    let tables = vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())];
+    let shadow = Mutex::new(b.shadow);
+    let go = |gapped: bool| {
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true, gapped };
+        tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
+    };
+    let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
+    for _ in 0..40 {
+        go(false);
+        thread::sleep(Duration::from_millis(5));
+        if confirmed() == 1 {
+            break;
+        }
+    }
+    assert_eq!(confirmed(), 1, "a complete plan: shown whole");
+    go(true);
+    assert_eq!(confirmed(), 0, "one that came back after a gap takes it back");
+    assert!(shadow.lock().unwrap().rooms[&room].mirror.delegations().churned);
+    for _ in 0..5 {
+        go(false);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(confirmed(), 0, "and the delegations stay churned for good");
 }

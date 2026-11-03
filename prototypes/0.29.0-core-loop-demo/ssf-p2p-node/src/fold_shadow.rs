@@ -40,7 +40,10 @@
 //! compared once, whatever else happens), the doubt of a handover (`RoomShadow::handover`: for each table the sessions
 //! in doubt, named by id, or `*` for one the node could not name; a compared trim ends the session it names, and `*`
 //! when it ends the session the fold holds; a trim the node cannot read, or that is of another session, ends no
-//! unnamed one) and whether the delegations had churned. What happened while a room had no plan is not known.
+//! unnamed one) and whether the delegations had churned. What happened while a room had no plan is not known, and
+//! the house says when it matters: a plan that comes back after a stretch with no plan, in a room where other houses
+//! were pinned (`HousePlan::gapped`), has houses that nothing watched in between (they stay pinned, as the pages pin
+//! them, and a page that binds now counts only those the doc holds), so the room's delegations are churned for good.
 
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
@@ -336,6 +339,9 @@ pub struct FoldView {
     /// (None: they never move, as in a view made by hand).
     pub pins_epoch: u64,
     pub watch: Option<PinWatch>,
+    /// The houses of the plan are pinned ones that nothing watched for a stretch in which the room had no plan
+    /// ([`HousePlan::gapped`]): the room's delegations are taken as churned, for good.
+    pub gapped: bool,
 }
 
 /// How long a table that the plan stopped naming is kept for the final checkpoint a page writes when it compacts it. The
@@ -658,6 +664,11 @@ impl RoomShadow {
     /// the mirror lets go of; [`RoomShadow::send`] sends the rest.
     fn follow<L: Launch>(&mut self, now: Instant, doc: &Doc, view: &FoldView, planned: &BTreeSet<TableKey>, keep: &BTreeSet<TableKey>, events: &[Event], sup: &mut Supervisor<L>, tally: &mut Tally) {
         self.feed.absorb(now, events);
+        // (Houses pinned before a stretch in which the room had no plan: what the delegations did in it, nothing saw, and
+        // a page that binds now counts the houses whose delegation the doc holds now.)
+        if view.gapped {
+            self.mirror.inherit_churn();
+        }
         let inputs = Inputs::new(view.houses.clone(), view.pins.clone());
         // What the answers in hand cover, and were made with, before this tick's drain brings what a page wrote since.
         let covered = self.covered(&inputs, sup);
@@ -1037,7 +1048,7 @@ impl<L: Launch> FoldShadow<L> {
         // (And the key the watch has pinned for that holder is the key the pass pinned: the houses are the ones that
         // key delegated.)
         let held = deed.as_deref() == Some(plan.owner.as_str()) && pins.iter().any(|(pid, key)| *pid == plan.owner && *key == plan.owner_key);
-        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch) }
+        FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch), gapped: plan.gapped }
     }
 
     /// One tick, with every room the node serves: its doc, and what to follow there (None:

@@ -82,7 +82,9 @@
 //! update of its own, which is no page's trim), and the signers of the slips a session held
 //! ([`RoomMirror::take_ended_signers`], told once the session has ended; a name or key longer than a page pins,
 //! [`MAX_SIGNER_BYTES`], is not kept and says so as too many do), which the shadow reads against the pins it was given.
-//! What the observer compares inside the doc's commit is bounded ([`rewritten_alike`]).
+//! What the observer compares inside the doc's commit is bounded ([`rewritten_alike`]). A trim is the change of the
+//! checkpoint of the session's own table ([`sum_of`]), not of another's; and a checkpoint written over before the node
+//! read it is counted only if a page could take what was written for one ([`may_be_checkpoint`]).
 //!
 //! WHAT THE CALLER CAN RELY ON, after a drain that ran short of nothing (a
 //! table that [`RoomMirror::current`]): the changes taken since the table's
@@ -242,6 +244,9 @@ impl Dirt {
 #[derive(Default)]
 struct Watch {
     names: HashSet<String>,
+    /// The incarnation of each watched checkpoint's table, by the checkpoint's name (`sum:`): what a value there must
+    /// say to be one.
+    sums: HashMap<String, String>,
     dirt: Dirt,
     delegations: Delegations,
 }
@@ -296,27 +301,57 @@ fn rewritten_alike(change: &EntryChange, cap: usize) -> bool {
     }
 }
 
-/// Whether the transaction changed a watched checkpoint (`sum:`) of the computed map: a page's trim, which writes the
-/// checkpoint in the transaction that deletes the session it trims.
-fn trims_in(names: &HashSet<String>, txn: &TransactionMut, events: &Events) -> bool {
-    events.iter().any(|event| {
-        let Event::Map(map) = event else { return false };
-        map.path().is_empty() && map.keys(txn).iter().any(|(key, _)| key.starts_with("sum:") && names.contains(&**key))
-    })
+/// The watched checkpoints (`sum:`) of the computed map that the transaction set to another value (one written again as
+/// it stands is not one, nor is a key that is not watched): a page's trim of a session writes the checkpoint of the
+/// session's own table, in the transaction that deletes the session it trims ([`sum_of`]).
+fn sums_set_in(names: &HashSet<String>, txn: &TransactionMut, events: &Events) -> HashSet<String> {
+    let mut sums = HashSet::new();
+    for event in events.iter() {
+        let Event::Map(map) = event else { continue };
+        if !map.path().is_empty() {
+            continue;
+        }
+        for (key, change) in map.keys(txn).iter() {
+            if key.starts_with("sum:") && names.contains(&**key) && !rewritten_alike(change, ALIKE_SUM_BYTES) {
+                sums.insert(key.to_string());
+            }
+        }
+    }
+    sums
+}
+
+/// The name of the checkpoint of the table a live session (`ses:<table>:<session>`, the table being `<t>:<inc>`) belongs
+/// to: the one its trim writes.
+fn sum_of(ses: &str) -> Option<String> {
+    let (table, _) = ses.strip_prefix("ses:")?.rsplit_once(':')?;
+    Some(format!("sum:{table}"))
+}
+
+/// Whether a value written under a watched checkpoint's name (`sum:`) could be taken by a page for a checkpoint of the
+/// table of incarnation `inc`: one that is plain and light and none ([`checkpoint_ok`]) is junk on every page, a base
+/// of nothing, and nothing is lost when it is written over. One a page may read otherwise, or that weighs more than
+/// is read here, may be one. (This runs in the doc's commit: the value is weighed first, up to [`ALIKE_SUM_BYTES`].)
+fn may_be_checkpoint(change: &EntryChange, inc: &str) -> bool {
+    let (EntryChange::Inserted(new) | EntryChange::Updated(_, new)) = change else { return true };
+    let Out::Any(new) = new else { return false };
+    match hb::weigh(new, ALIKE_SUM_BYTES) {
+        hb::Weighed::Light { scan, .. } => hb::clarity_within(new, scan, ALIKE_SUM_BYTES) != hb::Clarity::Clear || checkpoint_ok(&CVal::from_any(new), inc),
+        hb::Weighed::Heavy | hb::Weighed::Unsure => true,
+    }
 }
 
 /// The observer's callback. It runs inside the doc's commit: a lookup for
 /// each key that changed, and a key kept only if it is watched.
 fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Events) {
     let mut w = lock(shared);
-    let Watch { names, dirt, delegations } = &mut *w;
+    let Watch { names, sums, dirt, delegations } = &mut *w;
     // (After this transaction, did the doc lack something it was sent, or was something made and deleted in it? Asked
     // once, when a checkpoint changes.)
     let mut gap = None;
     // (And once, when a delegation is first written: was something made and deleted in this transaction?)
     let mut lost = None;
-    // (And once, when a watched session is replaced or removed: did the same transaction change a watched checkpoint?)
-    let mut trimmed = None;
+    // (And once, when a watched session is replaced or removed: which watched checkpoints did the same transaction set?)
+    let mut trimmed: Option<HashSet<String>> = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         let path = map.path();
@@ -374,13 +409,19 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                         // noted here would outlast it, for the drain that reads it comes after the one that noted it.)
                         if key.starts_with("ses:")
                             && (*lost.get_or_insert_with(|| made_and_deleted(txn))
-                                || (!matches!(change, EntryChange::Inserted(_)) && !*trimmed.get_or_insert_with(|| trims_in(names, txn, events))))
+                                || (!matches!(change, EntryChange::Inserted(_))
+                                    && !sum_of(key).is_some_and(|sum| trimmed.get_or_insert_with(|| sums_set_in(names, txn, events)).contains(&sum))))
                         {
                             dirt.suspect.insert(key.to_string());
                         }
                         // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
                         // of one is no other.)
-                        if key.starts_with("sum:") && !matches!(change, EntryChange::Removed(_)) && !rewritten_alike(change, ALIKE_SUM_BYTES) {
+                        // (And one that no page takes for a checkpoint is no loss when it is written over.)
+                        if key.starts_with("sum:")
+                            && !matches!(change, EntryChange::Removed(_))
+                            && !rewritten_alike(change, ALIKE_SUM_BYTES)
+                            && sums.get(&**key).is_none_or(|inc| may_be_checkpoint(change, inc))
+                        {
                             let at = dirt.writes.entry(key.to_string()).or_insert(0);
                             *at = at.saturating_add(1);
                         }
@@ -996,7 +1037,6 @@ impl Table {
                 return false;
             }
             let out = comp.and_then(|c| c.get(txn, &self.sum_name));
-            let present = out.is_some();
             // (As the house reads it: a checkpoint is read up to what a tick may read.)
             let new = match read_costed(|n| b.charge(n), self.sum_name.len(), out, READ_PER_TICK) {
                 Read::Spent => return false,
@@ -1023,10 +1063,12 @@ impl Table {
             // look is another.)
             let same = was_based && same_base(&new, &self.base) && !(new == Base::Held && sets > 0);
             let changed = !same;
-            // (Of the checkpoints written since the last look, the one standing is the one read; the others were written
-            // over before the node could.)
+            // (Of the checkpoints written since the last look, the one standing is the one read, if what stands is one
+            // (a page may take it for a checkpoint): the others were written over before the node could. What stands,
+            // if it is none, is none of them: all that were written were written over.)
             if was_based {
-                self.superseded = self.superseded.saturating_add(sets.saturating_sub(u64::from(present)));
+                let standing = u64::from(matches!(new, Base::Cp(_) | Base::Held));
+                self.superseded = self.superseded.saturating_add(sets.saturating_sub(standing));
             }
             let lagged = pending.lagged.remove(&self.sum_name);
             let unread = changed && (lagged || self.session_unread(pending, comp, txn));
@@ -1340,7 +1382,10 @@ impl RoomMirror {
     /// The names the observer watches: each table's `sum:`, and its live session.
     fn sync_watch(&mut self) {
         let names: HashSet<String> = self.tables.values().flat_map(|t| [Some(t.sum_name.clone()), t.live.clone()]).flatten().collect();
-        lock(&self.shared).names = names;
+        let sums: HashMap<String, String> = self.tables.values().map(|t| (t.sum_name.clone(), t.ctx.inc.clone())).collect();
+        let mut w = lock(&self.shared);
+        w.names = names;
+        w.sums = sums;
     }
 
     /// Forget dirt that names nothing watched any more.
@@ -1401,9 +1446,10 @@ impl RoomMirror {
         lock(&self.shared).delegations
     }
 
-    /// The room's delegations are known to have churned before this mirror began (the shadow had a mirror of the room,
-    /// and let it go, and was left no way to tell what the delegations did meanwhile): they count as churned for good,
-    /// as if this mirror had seen it.
+    /// The room's delegations are known to have churned, or may have, where this mirror did not see them (the shadow had
+    /// a mirror of the room and let it go, or the house pinned the houses it counts in a stretch in which the room had
+    /// no plan, and nothing watched what the delegations did meanwhile): they count as churned for good, as if this
+    /// mirror had seen it.
     pub fn inherit_churn(&mut self) {
         lock(&self.shared).delegations.churned = true;
     }
