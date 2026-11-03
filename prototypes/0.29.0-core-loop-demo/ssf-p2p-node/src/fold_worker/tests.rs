@@ -3,7 +3,7 @@
 //! nothing else.
 
 use super::*;
-use crate::fold_wire::{encode_req, encode_resp, MAX_CTX_FIELD, MAX_FRAME};
+use crate::fold_wire::{encode_req, encode_resp, is_result_too_big, MAX_CTX_FIELD, MAX_FRAME};
 use crate::house_fold::tests::{cases, check_for, Case};
 use crate::house_fold::FOLD_TABLES;
 use std::io::Cursor;
@@ -309,7 +309,7 @@ fn a_result_too_big_for_a_frame_is_dirty_not_a_dead_worker() {
     let got = run(&mut f, &[cold_of("huge", 1), cold_of("a", 2)]);
     assert_eq!(f.forgotten, vec!["huge"], "and the table is dropped: Dirty means no context is held");
     match &got[0] {
-        Resp::Dirty { version: 1, reason, .. } => assert!(reason.contains("too big for a frame"), "{reason}"),
+        Resp::Dirty { version: 1, reason, .. } => assert!(is_result_too_big(reason), "the node knows it for what it is: {reason}"),
         other => panic!("{other:?}"),
     }
     assert!(matches!(&got[1], Resp::Result { version: 2, .. }));

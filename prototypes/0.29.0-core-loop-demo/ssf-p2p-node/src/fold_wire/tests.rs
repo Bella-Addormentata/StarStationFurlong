@@ -514,3 +514,13 @@ fn an_id_past_the_limit_is_refused_before_it_is_read() {
         }
     }
 }
+
+#[test]
+fn the_worker_reason_for_a_result_too_big_is_known_to_the_node_and_nothing_else_is() {
+    for n in [0usize, 1, MAX_FRAME, usize::MAX] {
+        assert!(is_result_too_big(&result_too_big(n)), "{n}");
+    }
+    for other in ["", "it is dirty", "result of 5 bytes", "is too big for a frame", "a result of 9 bytes is too big for a frame", "result of x is too big for a frame, really"] {
+        assert!(!is_result_too_big(other), "{other:?}");
+    }
+}

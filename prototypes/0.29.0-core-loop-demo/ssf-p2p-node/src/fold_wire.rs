@@ -43,6 +43,21 @@ pub const MAX_FRAME: usize = 32 << 20;
 /// the request that named it was (a table's ids come back in every answer).
 pub const MAX_CTX_FIELD: usize = 4 << 10;
 
+/// What the worker says (a `Dirty`'s reason) of a result it cannot fit in a frame: asking again
+/// for the same table gets the same answer, so the node gives up on the table as it stands
+/// ([`is_result_too_big`]) and does not ask again until it starts over.
+const RESULT_TOO_BIG: &str = "is too big for a frame";
+
+/// The reason a worker gives for a result of `n` bytes that is past what a frame holds.
+pub fn result_too_big(n: usize) -> String {
+    format!("result of {n} bytes {RESULT_TOO_BIG}")
+}
+
+/// Whether a `Dirty`'s reason is [`result_too_big`]'s.
+pub fn is_result_too_big(reason: &str) -> bool {
+    reason.starts_with("result of ") && reason.ends_with(RESULT_TOO_BIG)
+}
+
 /// How deep a value may nest. The node's [`CVal`]s never pass `MAX_DEPTH`.
 const WIRE_DEPTH: usize = MAX_DEPTH + 4;
 

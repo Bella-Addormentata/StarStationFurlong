@@ -366,6 +366,9 @@ struct Table {
     stale: bool,
     /// Not yet said (by a `take`) that the table started over.
     announce: bool,
+    /// Which taking up of the table this is (the mirror's count): one let go of and taken up
+    /// again is another table, whatever its generation.
+    born: u64,
     generation: u64,
     version: u64,
 }
@@ -380,7 +383,7 @@ fn cval_bytes(v: &CVal) -> usize {
 }
 
 impl Table {
-    fn new(ctx: Ctx) -> Table {
+    fn new(ctx: Ctx, born: u64) -> Table {
         let sum_name = format!("sum:{}:{}", ctx.t, ctx.inc);
         Table {
             ctx,
@@ -402,6 +405,7 @@ impl Table {
             extra: 0,
             stale: false,
             announce: true,
+            born,
             generation: 0,
             version: 0,
         }
@@ -834,6 +838,12 @@ pub struct State<'a> {
     /// Changes waiting to be taken, and their weight.
     pub queued: usize,
     pub queued_bytes: usize,
+    /// The table started over and nothing has been taken since: the next
+    /// [`RoomMirror::take`] says so (`Taken::reset`).
+    pub announcing: bool,
+    /// Which taking up of the table this is: a table let go of by [`RoomMirror::want`] and
+    /// wanted again is another (its generation and version start over).
+    pub born: u64,
     /// Goes up when the table starts over.
     pub generation: u64,
     /// Goes up with every change to the base, a record or the hold.
@@ -873,6 +883,8 @@ pub struct RoomMirror {
     limits: Limits,
     turn: usize,
     resets: u64,
+    /// Tables taken up since the start ([`State::born`]).
+    births: u64,
 }
 
 impl RoomMirror {
@@ -888,7 +900,7 @@ impl RoomMirror {
         let cb = shared.clone();
         let dirty = limits.dirty_keys;
         let sub = comp.observe_deep(move |txn, events| note(&cb, dirty, txn, events));
-        RoomMirror { room: room.to_string(), shared, _sub: sub, tables: BTreeMap::new(), pending: Dirt::default(), limits, turn: 0, resets: 0 }
+        RoomMirror { room: room.to_string(), shared, _sub: sub, tables: BTreeMap::new(), pending: Dirt::default(), limits, turn: 0, resets: 0, births: 0 }
     }
 
     /// Mirror these tables, `(t, inc)`, and no others. The ones dropped are
@@ -898,8 +910,11 @@ impl RoomMirror {
         let gone: Vec<Ctx> = self.tables.iter().filter(|(k, _)| !keep.contains(k)).map(|(_, t)| t.ctx.clone()).collect();
         self.tables.retain(|k, _| keep.contains(k));
         for (t, inc) in tables {
-            let room = &self.room;
-            self.tables.entry((t.clone(), inc.clone())).or_insert_with(|| Table::new(Ctx { room: room.clone(), t: t.clone(), inc: inc.clone() }));
+            let (room, births) = (&self.room, &mut self.births);
+            self.tables.entry((t.clone(), inc.clone())).or_insert_with(|| {
+                *births += 1;
+                Table::new(Ctx { room: room.clone(), t: t.clone(), inc: inc.clone() }, *births)
+            });
         }
         self.sync_watch();
         self.sweep();
@@ -973,9 +988,23 @@ impl RoomMirror {
             reading: tb.cold.is_some() || tb.need_session,
             queued: tb.queue.len(),
             queued_bytes: tb.queue_bytes,
+            announcing: tb.announce,
+            born: tb.born,
             generation: tb.generation,
             version: tb.version,
         })
+    }
+
+    /// Start a table over, to be sent again from scratch (the worker lost it):
+    /// it is read afresh from the doc, and the next [`take`](RoomMirror::take)
+    /// says `reset`. False for a table that is not mirrored.
+    pub fn restart(&mut self, t: &str, inc: &str) -> bool {
+        let Some(tb) = self.tables.get_mut(&(t.to_string(), inc.to_string())) else { return false };
+        if tb.based && tb.live.is_some() {
+            tb.reset();
+            self.resets += 1;
+        }
+        true
     }
 
     /// The mirror has read everything of the table that the doc has changed
@@ -1026,4 +1055,4 @@ impl Dirt {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -124,6 +124,9 @@ mod fold_worker;
 // the checkpoint, the live session and its records, followed as changes.
 #[cfg(feature = "house-fold")]
 mod house_mirror;
+// The mirror's changes sent to the fold worker, and its answers kept (PR 6b-1c-ii).
+#[cfg(feature = "house-fold")]
+mod fold_feed;
 
 // 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
 // the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on

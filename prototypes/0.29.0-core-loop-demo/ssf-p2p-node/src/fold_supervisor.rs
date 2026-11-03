@@ -481,6 +481,22 @@ impl<L: Launch> Supervisor<L> {
         self.owed.len()
     }
 
+    /// A test's way of filling the worker's pipe: `bytes` count as waiting to be written, so frames are
+    /// refused as busy until [`unclog`](Supervisor::unclog) takes them back.
+    #[cfg(test)]
+    pub(crate) fn clog(&self, bytes: usize) {
+        if let Some(link) = &self.link {
+            link.queued.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unclog(&self, bytes: usize) {
+        if let Some(link) = &self.link {
+            link.queued.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
     /// Send a frame to the worker, starting one if there is none and the wait
     /// after the last failure is over. Never blocks.
     pub fn post(&mut self, now: Instant, req: &Req) -> Post {
