@@ -249,9 +249,12 @@ pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
 /// file already reads as off ([`remembered`]), so none is created. An
 /// existing `chia_wallet.json` is still saved off under `SSF_NO_CHIA_LANE`,
 /// and that is deliberate: the player's off then holds at the next start
-/// without `SSF_NO_CHIA_LANE`. If that save fails, the Bank's route reads
-/// the file back to say what it now holds ([`after_failed_save`]). So with
-/// Chia off, a TURN OFF still writes this Chia file, and may read it.
+/// without `SSF_NO_CHIA_LANE`, unless `SSF_CHIA_LANE=1` is in the node's
+/// environment there, which turns the wallet on whatever the switch says
+/// ([`starts_on`], [`turned_off_line`]). If that save fails, the Bank's
+/// route reads the file back to say what it now holds
+/// ([`after_failed_save`]). So with Chia off, a TURN OFF still writes this
+/// Chia file, and may read it.
 #[cfg(feature = "chia-publish")]
 pub fn remember_off(path: &Path, strict: bool, now: u64) -> std::io::Result<bool> {
     if strict && !path.try_exists().unwrap_or(true) {
@@ -264,9 +267,24 @@ pub fn remember_off(path: &Path, strict: bool, now: u64) -> std::io::Result<bool
 /// to say so: read back from the file (`reread`), because a failed save does
 /// not show the old value is still there (the replace can land and the
 /// directory sync after it fail). Unreadable, the memo keeps `previous` and
-/// says it does not know.
-pub fn after_failed_save(target: bool, err: &str, reread: Result<bool, String>, previous: bool) -> (bool, String) {
+/// says it does not know. While Chia is off on this computer (`strict`) with
+/// `SSF_CHIA_LANE=1` (`env`), an off written but not confirmed is said of
+/// the switch, not the wallet: the environment still turns the wallet on at
+/// a start without `SSF_NO_CHIA_LANE`, whatever the switch says
+/// ([`starts_on`], [`STILL_ON_WORDS`]).
+pub fn after_failed_save(
+    target: bool,
+    err: &str,
+    reread: Result<bool, String>,
+    previous: bool,
+    strict: bool,
+    env: EnvSwitch,
+) -> (bool, String) {
     match reread {
+        Ok(false) if !target && strict && env == EnvSwitch::On => (
+            false,
+            format!("the switch was written but not confirmed on disk ({err}), so it should read off at the next start, but {STILL_ON_WORDS}"),
+        ),
         Ok(now) if now == target => (
             now,
             format!(
@@ -285,6 +303,37 @@ pub fn after_failed_save(target: bool, err: &str, reread: Result<bool, String>, 
             previous,
             format!("the switch could not be saved ({err}) or read back ({read}), so whether the wallet is on at the next start is not known"),
         ),
+    }
+}
+
+/// What `SSF_CHIA_LANE=1` does at the next start without `SSF_NO_CHIA_LANE`,
+/// whatever the Bank's switch says ([`starts_on`]): said where a TURN OFF
+/// would otherwise read as an off at that start ([`turned_off_line`],
+/// [`after_failed_save`]), so remembering the switch off is never said as
+/// overriding the environment.
+pub const STILL_ON_WORDS: &str =
+    "SSF_CHIA_LANE=1 in the node's environment still turns the wallet on at a start without SSF_NO_CHIA_LANE";
+
+/// The line the node prints once the Bank's TURN OFF is saved
+/// ([`remember_off`]), while Chia is off on this computer (`strict`) or not,
+/// with `SSF_CHIA_LANE` read as `env`. Off is cold: a wallet loaded this run
+/// stays on until the node stops; while Chia is off none is loaded. Whether
+/// the wallet comes back at the next start without `SSF_NO_CHIA_LANE` is
+/// [`starts_on`] with the switch off, and `SSF_CHIA_LANE=1` turns it on
+/// there whatever the switch says ([`STILL_ON_WORDS`]). Without Chia off,
+/// `SSF_CHIA_LANE=1` refuses the turn before this ([`turn_refusal`]); its
+/// line is here so that every pair says what that start does.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
+pub fn turned_off_line(strict: bool, env: EnvSwitch) -> String {
+    match (strict, env) {
+        (true, EnvSwitch::On) => format!(
+            "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on; the Bank's switch is off, but {STILL_ON_WORDS}"
+        ),
+        (true, _) => "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start".to_string(),
+        (false, EnvSwitch::On) => {
+            format!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops; the Bank's switch is off, but {STILL_ON_WORDS}")
+        }
+        (false, _) => "🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start".to_string(),
     }
 }
 
@@ -1175,17 +1224,86 @@ mod tests {
 
     #[test]
     fn a_failed_save_reports_what_the_file_holds_not_what_was_asked() {
-        let (on, why) = after_failed_save(true, "dir sync failed", Ok(true), false);
+        use EnvSwitch::*;
+        let (on, why) = after_failed_save(true, "dir sync failed", Ok(true), false, false, Unset);
         assert!(on && why.contains("not confirmed") && why.contains("come back on"), "{why}");
-        let (on, why) = after_failed_save(true, "disk full", Ok(false), false);
+        let (on, why) = after_failed_save(true, "disk full", Ok(false), false, false, Unset);
         assert!(!on && why.contains("starts off"), "{why}");
-        let (on, why) = after_failed_save(false, "disk full", Ok(true), true);
+        let (on, why) = after_failed_save(false, "disk full", Ok(true), true, false, Unset);
         assert!(on && why.contains("comes back on"), "an off that did not land leaves it on: {why}");
-        let (on, why) = after_failed_save(false, "dir sync failed", Ok(false), true);
+        let (on, why) = after_failed_save(false, "dir sync failed", Ok(false), true, false, Unset);
         assert!(!on && why.contains("stay off"), "{why}");
-        let (on, why) = after_failed_save(true, "disk full", Err("unreadable".into()), true);
+        let (on, why) = after_failed_save(true, "disk full", Err("unreadable".into()), true, false, Unset);
         assert!(on && why.contains("not known"), "unreadable keeps the memo: {why}");
-        assert!(!after_failed_save(true, "x", Err("y".into()), false).0);
+        assert!(!after_failed_save(true, "x", Err("y".into()), false, false, Unset).0);
+    }
+
+    /// ⛓️ A TURN OFF under `SSF_NO_CHIA_LANE` with `SSF_CHIA_LANE=1` saved
+    /// but not confirmed (#372 review, round 4): the words say the switch
+    /// should read off, never that the wallet stays off, since the next
+    /// start without `SSF_NO_CHIA_LANE` turns it on ([`starts_on`]). Every
+    /// other environment, and a save that did not land, keep their words.
+    #[test]
+    fn a_failed_off_under_chia_off_never_promises_an_off_the_environment_overrides() {
+        use EnvSwitch::*;
+        assert!(starts_on(true, false, On, false), "the next start without SSF_NO_CHIA_LANE loads the wallet");
+        let (on, why) = after_failed_save(false, "dir sync failed", Ok(false), false, true, On);
+        assert!(!on, "{why}");
+        assert_eq!(
+            why,
+            "the switch was written but not confirmed on disk (dir sync failed), so it should read off at the next start, but SSF_CHIA_LANE=1 in the node's environment still turns the wallet on at a start without SSF_NO_CHIA_LANE"
+        );
+        assert!(!why.contains("stay off") && !why.contains("starts off"), "{why}");
+        for env in [Unset, Off] {
+            assert_eq!(
+                after_failed_save(false, "dir sync failed", Ok(false), false, true, env),
+                after_failed_save(false, "dir sync failed", Ok(false), false, false, Unset),
+                "{env:?}: the switch, or SSF_CHIA_LANE, keeps the wallet off"
+            );
+        }
+        for (reread, previous) in [(Ok(true), true), (Err("unreadable".to_string()), true)] {
+            assert_eq!(
+                after_failed_save(false, "disk full", reread.clone(), previous, true, On),
+                after_failed_save(false, "disk full", reread, previous, false, Unset),
+                "an off that did not land, or a switch that cannot be read, promises no off"
+            );
+        }
+    }
+
+    /// The line a TURN OFF prints (#372 review, round 4) says what the next
+    /// start without `SSF_NO_CHIA_LANE` does, as [`starts_on`] decides it
+    /// with the switch off and `SSF_CHIA_LANE` as this run read it, for
+    /// every pair of Chia off and the environment: it never promises an off
+    /// that start ignores. While Chia is off it says the wallet is not on;
+    /// otherwise, that it stays on until the node stops. Only Chia off with
+    /// `SSF_CHIA_LANE=1` changed its words; Chia on with `SSF_CHIA_LANE=1`
+    /// refuses the turn, so its line is never printed.
+    #[test]
+    fn the_turn_off_line_says_what_the_next_start_does() {
+        use EnvSwitch::*;
+        for strict in [false, true] {
+            for env in [Unset, On, Off] {
+                let line = turned_off_line(strict, env);
+                let back = starts_on(true, false, env, false);
+                assert_eq!(line.contains("does not come back at the next start"), !back, "strict {strict}, {env:?}: {line}");
+                assert_eq!(line.contains(STILL_ON_WORDS), back, "strict {strict}, {env:?}: {line}");
+                assert_eq!(line.contains("Chia is off on this computer, so it is not on"), strict, "{line}");
+                assert_eq!(line.contains("it stays on until the node stops"), !strict, "{line}");
+                assert!(!starts_on(true, true, env, false), "a start that keeps SSF_NO_CHIA_LANE never loads it");
+            }
+        }
+        let plain = "🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start";
+        let chia_off = "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start";
+        assert_eq!(turned_off_line(false, Unset), plain);
+        assert_eq!(turned_off_line(false, Off), plain);
+        assert_eq!(turned_off_line(true, Unset), chia_off);
+        assert_eq!(turned_off_line(true, Off), chia_off);
+        assert_eq!(
+            turned_off_line(true, On),
+            "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on; the Bank's switch is off, but SSF_CHIA_LANE=1 in the node's environment still turns the wallet on at a start without SSF_NO_CHIA_LANE"
+        );
+        assert_eq!(turn_refusal(true, true, On, false), None, "the TURN OFF that line answers is taken");
+        assert_eq!(turn_refusal(true, false, On, false), Some(HELD_WORDS), "the turn whose line is never printed");
     }
 
     #[test]

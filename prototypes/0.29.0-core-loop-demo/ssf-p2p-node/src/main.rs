@@ -6493,7 +6493,14 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
     let failed_save = |target: bool, e: std::io::Error, lead: &str| -> String {
         let previous = hub.wallet_switch.lock().unwrap().remembered;
         let (remembered, why) =
-            chia_wallet_switch::after_failed_save(target, &e.to_string(), chia_wallet_switch::remembered(switch_path), previous);
+            chia_wallet_switch::after_failed_save(
+                target,
+                &e.to_string(),
+                chia_wallet_switch::remembered(switch_path),
+                previous,
+                chia_strict::strict(),
+                env,
+            );
         let why = format!("{lead}{why}");
         eprintln!("🏦 SSF wallet: {why}");
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered, error: Some(why.clone()) };
@@ -6507,11 +6514,10 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
             return Err(failed_save(false, e, ""));
         }
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
-        if strict {
-            println!("🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start");
-        } else {
-            println!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start");
-        }
+        // The words follow starts_on at the next start without
+        // SSF_NO_CHIA_LANE: SSF_CHIA_LANE=1 turns the wallet on there
+        // whatever the switch says.
+        println!("{}", chia_wallet_switch::turned_off_line(strict, env));
         return Ok(());
     }
     let loaded = hub.chia_wallet.lock().unwrap().is_some();
