@@ -6544,4 +6544,150 @@ mod tests {
         drop(conn);
         tokio::time::timeout(Duration::from_secs(5), relay_p).await.expect("the socket goes with the last handle on it").unwrap();
     }
+
+    /// Where a round of [`the_close_promises_hold_with_workers_in_parallel`]
+    /// closes the lane, by the round's number.
+    #[derive(Clone, Copy, Debug)]
+    enum CloseAt {
+        /// At once, the work just spawned.
+        Spawned,
+        /// After a few yields of the test's own task.
+        Yielded,
+        /// After a sleep of a few milliseconds.
+        Slept,
+        /// Once a dial has an outcome.
+        Dialled,
+        /// Once a presence read has been answered.
+        Answered,
+    }
+
+    impl CloseAt {
+        fn of(round: usize) -> Self {
+            [Self::Spawned, Self::Yielded, Self::Slept, Self::Dialled, Self::Answered][round % 5]
+        }
+    }
+
+    /// The close() promises hold with workers in parallel (#372 review). The
+    /// regressions above run on the test's single-threaded runtime, each
+    /// holding one order of steps still; this runs on four workers, so the
+    /// lane's tasks run at once and their order is the scheduler's. Each of
+    /// twenty rounds builds a lane that knows two full nodes, spawns every
+    /// operation at both trust levels, a presence read, a refill, a dial
+    /// batch whose one dial a node holds at the Chia handshake and a
+    /// carrier's stand-in, and closes the lane at a point the round chooses
+    /// ([`CloseAt`]). Just before close(), the test takes hold of every
+    /// connection a dial has reached, as a request holds one, and takes one
+    /// out of the pool, if there is one, with no close of the lane's under
+    /// way for it; in odd rounds it drops the dial batch where it stands, its
+    /// dial's reader aborted with it. Once close() returns, within its bound
+    /// (read in the task that called it): the lane counts no reader, so every
+    /// reader its dials started is gone, its done watch closed before its
+    /// count ([`Readers`]); every connection a dial reached that is still
+    /// held, by the test or anyone, reads closed, its done watch closed; and
+    /// the pool is empty. Then every task ends within its bound, no dial has
+    /// an outcome after close() returned, and the count and the pool are
+    /// still empty. A pass shows the promises held in the orders these rounds
+    /// happened to run; it is not one of the deterministic regressions, which
+    /// stay as they are. Each round is bounded, so a hang fails the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_close_promises_hold_with_workers_in_parallel() {
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let mute = crate::chia_peer::mock::spawn_mute().await;
+        for round in 0..20 {
+            let at = CloseAt::of(round);
+            let ended = tokio::time::timeout(Duration::from_secs(30), async {
+                let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+                let mut requests = spawn_every_op(&PeerLane::new(lane.clone(), Trust::Carrier));
+                requests.extend(spawn_every_op(&PeerLane::new(lane.clone(), Trust::Agreed)));
+                let (answered_tx, mut answered) = tokio::sync::mpsc::unbounded_channel::<()>();
+                let mut work: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
+                let presence = PeerLane::new(lane.clone(), Trust::Carrier);
+                work.push((
+                    "presence read",
+                    tokio::spawn(async move {
+                        if presence.peak_height().await.is_ok() {
+                            let _ = answered_tx.send(());
+                        }
+                    }),
+                ));
+                let refill = lane.clone();
+                work.push(("refill", tokio::spawn(async move { refill.refill(Trust::Agreed).await })));
+                let batch = {
+                    let (lane, dials) = (lane.clone(), vec![Candidate::new(mute.addr, Source::Gossip)]);
+                    tokio::spawn(async move { lane.dial_batch(dials, RETRY_AFTER).await })
+                };
+                let (stand_in, first) = (lane.clone(), a.addr);
+                work.push((
+                    "stand-in",
+                    tokio::spawn(async move {
+                        let _ = stand_in.stand_in(first).await;
+                    }),
+                ));
+                match at {
+                    CloseAt::Spawned => {}
+                    CloseAt::Yielded => {
+                        for _ in 0..=round % 7 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    CloseAt::Slept => tokio::time::sleep(Duration::from_millis(1 + (round % 4) as u64)).await,
+                    CloseAt::Dialled => {
+                        let mut dialled = lane.dialled.subscribe();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), dialled.wait_for(|d| !d.is_empty())).await;
+                    }
+                    CloseAt::Answered => {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), answered.recv()).await;
+                    }
+                }
+                // Every connection a dial has reached so far, held by the test
+                // across close() as a request holds one, and one taken out of
+                // the pool with no close of the lane's under way for it (as any
+                // way the lane might drop one): each reader stops all the same.
+                let reached = |lane: &Lane| -> Vec<Arc<PeerConn>> {
+                    lane.dialled.borrow().iter().filter_map(|(_, outcome)| outcome.as_ref().ok()?.upgrade()).collect()
+                };
+                let outside = reached(&lane);
+                let taken = lane.state.lock().await.conns.pop();
+                // In odd rounds the dial batch is dropped where it stands (its
+                // caller gave up on it), its dial's reader aborted with it.
+                let dropped = round % 2 == 1;
+                if dropped {
+                    batch.abort();
+                }
+                let closed = tokio::time::timeout(Duration::from_secs(10), lane.close()).await;
+                let counted = lane.readers.running();
+                let dials = lane.dialled.borrow().len();
+                let held: Vec<Arc<PeerConn>> = outside.into_iter().chain(taken).chain(reached(&lane)).collect();
+                assert!(closed.is_ok(), "round {round} ({at:?}): close() returns within its bound");
+                assert_eq!(counted, 0, "round {round} ({at:?}): the lane counts no reader once close() returns");
+                for conn in &held {
+                    assert!(!conn.alive(), "round {round} ({at:?}): {} reads closed once close() returns", conn.addr());
+                    assert!(
+                        conn.reader_done_for_test().has_changed().is_err(),
+                        "round {round} ({at:?}): the reader of {} is gone once close() returns",
+                        conn.addr()
+                    );
+                }
+                drop(held);
+                assert!(lane.state.lock().await.conns.is_empty(), "round {round} ({at:?}): the pool is empty once close() returns");
+                for (what, task) in requests {
+                    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap_or_else(|_| panic!("round {round} ({at:?}): {what} ends")).unwrap();
+                }
+                for (what, task) in work {
+                    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap_or_else(|_| panic!("round {round} ({at:?}): the {what} ends")).unwrap();
+                }
+                match tokio::time::timeout(Duration::from_secs(10), batch).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => assert!(dropped && e.is_cancelled(), "round {round} ({at:?}): the dial batch: {e}"),
+                    Err(_) => panic!("round {round} ({at:?}): the dial batch ends"),
+                }
+                assert_eq!(lane.dialled.borrow().len(), dials, "round {round} ({at:?}): no dial has an outcome after close() returned");
+                assert_eq!(lane.readers.running(), 0, "round {round} ({at:?}): still no reader once every task has ended");
+                assert_eq!(lane.live_count().await, 0, "round {round} ({at:?}): the pool is still empty");
+            })
+            .await;
+            assert!(ended.is_ok(), "round {round} ({at:?}) ends within its bound");
+        }
+    }
 }
