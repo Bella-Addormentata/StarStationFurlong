@@ -468,8 +468,8 @@ pub struct PeerConn {
     gate: Mutex<RateGate>,
     reader: JoinHandle<()>,
     /// Ends (its sender, held by the reader task, dropped) once the reader
-    /// task is gone, and its half of the socket with it
-    /// ([`Self::reader_gone`]).
+    /// task is gone, and its half of the socket with it, dropped first
+    /// ([`ReaderHalf`], [`Self::reader_gone`]).
     reader_done: watch::Receiver<()>,
     /// Set once [`Self::close`] has closed the connection: a later call, or
     /// one made while it runs, waits for that close and writes nothing of
@@ -578,7 +578,7 @@ impl PeerConn {
         let (done_tx, reader_done) = watch::channel(());
         // Nothing awaits from here to the connection's construction: once the
         // reader runs, the connection that stops it exists.
-        let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, peak_at.clone(), alive.clone(), done_tx));
+        let reader = tokio::spawn(read_loop(ReaderHalf { stream, _done: done_tx }, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
             sources: Mutex::new(sources),
@@ -774,6 +774,19 @@ impl PeerConn {
         *self.peak_at.lock().unwrap() = Some(Instant::now().checked_sub(by).unwrap_or_else(Instant::now));
     }
 
+    /// Hold the sink, as a write stuck on a peer that stopped reading does:
+    /// a close waits for it, up to [`CLOSE_TIMEOUT`] (tests).
+    #[cfg(test)]
+    pub(crate) async fn hold_sink(&self) -> tokio::sync::MutexGuard<'_, Sink> {
+        self.sink.lock().await
+    }
+
+    /// Whether [`Self::close`] has run to its end, the reader gone (tests).
+    #[cfg(test)]
+    pub(crate) fn closed_for_test(&self) -> bool {
+        self.closed.initialized()
+    }
+
     /// Send a message that expects no answer.
     pub async fn send<B>(&self, body: B) -> Result<()>
     where
@@ -922,25 +935,38 @@ impl PeerConn {
     /// the same.
     async fn reader_gone(&self) {
         let mut done = self.reader_done.clone();
-        // Never sent on: it returns once the reader task drops the sender.
+        // Never sent on: it returns once the reader task drops the sender,
+        // after the stream ([`ReaderHalf`]).
         let _ = tokio::time::timeout(CLOSE_TIMEOUT, done.changed()).await;
     }
+}
+
+/// The reader's half of the socket, and the sender whose drop says the
+/// reader is gone ([`PeerConn::reader_gone`]). Fields drop in the order they
+/// are declared, so the stream goes before `_done` however the reader task
+/// ends: aborted before its first turn, aborted while it waits, or at the
+/// stream's end. Parameters would not do: a future drops them in one order
+/// unpolled and in the other once it has run. Keep `stream` first, and never
+/// move it out.
+struct ReaderHalf<S = Stream> {
+    stream: S,
+    _done: watch::Sender<()>,
 }
 
 /// The reader: answers go to their requests by id; the handshake and the peak
 /// announcements, which carry no id, go to their slots; everything else the
 /// node does not subscribe to yet (coin-state and mempool updates) is
 /// dropped. When the socket ends, every waiting request learns it.
-async fn read_loop(
-    mut stream: Stream,
+async fn read_loop<S>(
+    mut half: ReaderHalf<S>,
     pending: Arc<Mutex<Pending>>,
     peak: watch::Sender<Option<Peak>>,
     peak_at: Arc<Mutex<Option<Instant>>>,
     alive: Arc<AtomicBool>,
-    // Dropped with the task, however it ends ([`PeerConn::reader_gone`]).
-    _done: watch::Sender<()>,
-) {
-    while let Some(frame) = stream.next().await {
+) where
+    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    while let Some(frame) = half.stream.next().await {
         let frame = match frame {
             Ok(frame) => frame,
             Err(_) => break,
@@ -1499,6 +1525,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(*node.seen.lock().unwrap(), vec![ProtocolMessageTypes::Handshake], "nothing sent after the handshake");
+    }
+
+    /// The reader's half of the socket goes before the reader reads as gone
+    /// (#372 review). [`PeerConn::reader_gone`] returns once the
+    /// reader's sender drops, and a closer that returns then drops the last
+    /// handle on the connection: a stream dropped after the sender would
+    /// keep its half of the socket past close() on a runtime with other
+    /// workers. A probe stream records, as it drops, whether the sender is
+    /// still there, however the reader ends: never polled (aborted before its
+    /// first turn), dropped while it waits, or at the stream's end.
+    #[tokio::test]
+    async fn the_readers_half_of_the_socket_goes_before_the_reader_reads_gone() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct Probe {
+            ends: bool,
+            done: watch::Receiver<()>,
+            sender_left: Arc<Mutex<Option<bool>>>,
+        }
+        impl futures_util::Stream for Probe {
+            type Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                if self.ends {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.sender_left.lock().unwrap() = Some(self.done.has_changed().is_ok());
+            }
+        }
+
+        #[derive(Debug, PartialEq)]
+        enum How {
+            NeverPolled,
+            DroppedWhileWaiting,
+            StreamEnded,
+        }
+        for how in [How::NeverPolled, How::DroppedWhileWaiting, How::StreamEnded] {
+            let (done_tx, done_rx) = watch::channel(());
+            let sender_left = Arc::new(Mutex::new(None));
+            let probe = Probe { ends: how == How::StreamEnded, done: done_rx, sender_left: sender_left.clone() };
+            let (peak_tx, _peak_rx) = watch::channel(None);
+            let reader = read_loop(
+                ReaderHalf { stream: probe, _done: done_tx },
+                Arc::new(Mutex::new(Pending::default())),
+                peak_tx,
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(true)),
+            );
+            match how {
+                How::NeverPolled => drop(reader),
+                How::DroppedWhileWaiting => assert!(futures_util::FutureExt::now_or_never(reader).is_none(), "the probe holds the reader"),
+                How::StreamEnded => reader.await,
+            }
+            assert_eq!(*sender_left.lock().unwrap(), Some(true), "{how:?}: the stream goes while the reader still reads as running");
+        }
     }
 
     #[test]

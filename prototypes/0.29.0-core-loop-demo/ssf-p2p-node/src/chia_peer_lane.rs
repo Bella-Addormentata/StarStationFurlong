@@ -304,9 +304,12 @@ struct LaneState {
     /// Connections asked for gossip: `None`, it answered (not asked again);
     /// `Some(at)`, the request failed (asked again after `at`).
     gossiped: HashMap<SocketAddr, Option<Instant>>,
-    /// The closes under way off the lock, of connections let go
-    /// ([`close_later`]): [`Lane::close`] waits for them.
-    closing: Vec<tokio::task::JoinHandle<()>>,
+    /// How many closes are under way off the lock ([`close_later`]): of
+    /// connections let go, and of those the pool held when the lane closed.
+    /// [`Lane::close`] waits for none to be left, so every call waits for
+    /// them all, one made while another runs or after one was cancelled
+    /// included.
+    closing: tokio::sync::watch::Sender<usize>,
     /// Why the last agreed choice found no pair in step, when it found pairs
     /// at all ([`Lane::choose_in_step`]): the request's final error says so.
     out_of_step: Option<String>,
@@ -436,10 +439,11 @@ impl Lane {
     ///     refused once it has the pool, before it takes a connection
     ///     ([`Self::choose_now`], [`Self::stand_in`]);
     ///   - every connection the lane dialled is closed, its reader gone
-    ///     ([`PeerConn::close`]): those the pool held; those a dial batch had
-    ///     reached, closed as the batch is taken in and waited for before the
-    ///     batch ends ([`Self::dial_batch`]); and those let go before, whose
-    ///     closes off the lock are waited for ([`close_later`]). Each reads
+    ///     ([`PeerConn::close`]): those the pool held and those let go
+    ///     before, each closed off the lock in a task of its own that is
+    ///     waited for ([`close_later`]); and those a dial batch had reached,
+    ///     closed as the batch is taken in and waited for before the batch
+    ///     ends ([`Self::dial_batch`]). Each reads
     ///     dead, so no frame is written to one, apart from one a request was
     ///     already writing when the lane closed, and a request waiting on
     ///     one, for its sink or for an answer, is told it closed (a websocket
@@ -458,7 +462,11 @@ impl Lane {
     /// A discovery under way asks nothing more, queues nothing it learnt,
     /// and the peer store is not written again. A dial still waiting for the
     /// lane's first certificate is not waited for, and does not leave once
-    /// the certificate is there ([`Self::dial_batch`]). It is for the
+    /// the certificate is there ([`Self::dial_batch`]). Every call gives the
+    /// same promise: one made while another closes the lane, or after one
+    /// was cancelled, returns only once the closes the first started have
+    /// ended, since they run as tasks of their own that no caller holds, and
+    /// are counted until they end ([`LaneState::closing`]). It is for the
     /// in-game Chia switch, which is not wired yet (PR 4 of stage 4); the env
     /// switch builds the lane closed instead.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -466,22 +474,27 @@ impl Lane {
         // The flag first: a request that has the pool next is refused there,
         // and the network work under way is abandoned.
         self.closed.send_replace(true);
-        let (held, letting_go) = {
+        let mut closing = {
             let mut state = self.state.lock().await;
             state.candidates.clear();
             state.gossiped.clear();
-            (state.conns.drain(..).collect::<Vec<Arc<PeerConn>>>(), std::mem::take(&mut state.closing))
+            let held: Vec<Arc<PeerConn>> = state.conns.drain(..).collect();
+            for peer in held {
+                close_later(&mut state, peer);
+            }
+            state.closing.subscribe()
         };
         // Off the pool lock, which a dial batch holding its guard may still
-        // need to take its connections in: each close is bounded
-        // (CLOSE_TIMEOUT).
-        futures_util::future::join(join_all(held.iter().map(|peer| peer.close())), join_all(letting_go)).await;
-        drop(held);
-        // Every dial batch, lookup and gossip request under way holds the
-        // read side until it has ended, and each ends at the close signal, a
-        // batch once the connections it reached are closed: the write side
-        // is had once none is left. One that starts later sees the flag.
+        // need to take its connections in. Every dial batch, lookup and
+        // gossip request under way holds the read side until it has ended,
+        // and each ends at the close signal, a batch once the connections it
+        // reached are closed: the write side is had once none is left. One
+        // that starts later sees the flag.
         drop(self.in_flight.write().await);
+        // Then every close off the lock, the pool's included, each bounded
+        // (CLOSE_TIMEOUT): none is left once the count is back to zero, its
+        // handle on the connection gone first ([`Closing`]).
+        let _ = closing.wait_for(|under_way| *under_way == 0).await;
     }
 
     /// Seed addresses to try, each with its source (tests).
@@ -2102,11 +2115,41 @@ fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
 }
 
 /// Close a connection off the lane's lock: the websocket close is bounded,
-/// but no caller waits on a peer that stopped reading. The close is kept with
-/// the pool until it has run, so [`Lane::close`] waits for it.
+/// but no caller waits on a peer that stopped reading. The close is a task
+/// of its own, counted in [`LaneState::closing`] until it ends
+/// ([`Closing`]), so [`Lane::close`] waits for it, and no caller that gives
+/// up can stop it or lose it.
 fn close_later(state: &mut LaneState, peer: Arc<PeerConn>) {
-    state.closing.retain(|close| !close.is_finished());
-    state.closing.push(tokio::spawn(async move { peer.close().await }));
+    tokio::spawn(Closing::start(&state.closing, peer).run());
+}
+
+/// One close off the lock ([`close_later`]), counted from its start until it
+/// is dropped, however its task ends: its handle on the connection goes
+/// first, then the count, so a [`Lane::close`] that finds none left finds no
+/// handle of theirs either.
+struct Closing {
+    peer: Option<Arc<PeerConn>>,
+    under_way: tokio::sync::watch::Sender<usize>,
+}
+
+impl Closing {
+    fn start(under_way: &tokio::sync::watch::Sender<usize>, peer: Arc<PeerConn>) -> Self {
+        under_way.send_modify(|n| *n += 1);
+        Self { peer: Some(peer), under_way: under_way.clone() }
+    }
+
+    async fn run(self) {
+        if let Some(peer) = &self.peer {
+            peer.close().await;
+        }
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        drop(self.peer.take());
+        self.under_way.send_modify(|n| *n -= 1);
+    }
 }
 
 /// Queue candidates not yet known. An address already queued or connected is
@@ -6255,5 +6298,65 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), relay_a).await.expect("the batch's node sees the socket close").unwrap();
         let state = lane.state.lock().await;
         assert!(state.conns.is_empty() && state.candidates.is_empty(), "nothing taken in");
+    }
+
+    /// Every close() gives the same promise (#372 review): a call
+    /// made while another closes the lane, or after one was cancelled,
+    /// returns only once every close the first started has ended, none of
+    /// the lane's handles on the connection left. Here the pooled
+    /// connection's close waits for the sink, which the test holds as a write
+    /// stuck on a peer that stopped reading would. The second close() does
+    /// not return while that close waits; let go, it returns with the
+    /// connection closed, its reader gone, and only the test's own handle on
+    /// it (read in the task that called it, as it returns).
+    #[tokio::test]
+    async fn a_second_close_waits_for_the_closes_the_first_started() {
+        for cancel_first in [false, true] {
+            let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+            let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+            assert!(lane.dial().await);
+            let conn = {
+                let pooled = lane.live_conns().await;
+                assert_eq!(pooled.len(), 1, "one peer pooled");
+                pooled[0].clone()
+            };
+            let stuck = conn.hold_sink().await;
+            let first = {
+                let lane = lane.clone();
+                tokio::spawn(async move { lane.close().await })
+            };
+            let started = tokio::time::timeout(Duration::from_secs(5), async {
+                while conn.alive() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "the first close() has the connection closing");
+            let first = if cancel_first {
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled(), "the first close() was cancelled");
+                None
+            } else {
+                Some(first)
+            };
+            let second = {
+                let (lane, conn) = (lane.clone(), Arc::downgrade(&conn));
+                tokio::spawn(async move {
+                    lane.close().await;
+                    let conn = conn.upgrade().expect("the test holds the connection");
+                    (conn.closed_for_test(), Arc::strong_count(&conn))
+                })
+            };
+            let_tasks_run().await;
+            assert!(!second.is_finished(), "cancel_first {cancel_first}: the second close() waits for the close the first started");
+            drop(stuck);
+            let (closed, handles) = tokio::time::timeout(Duration::from_secs(5), second).await.expect("the second close() returns").unwrap();
+            assert!(closed, "cancel_first {cancel_first}: the connection is closed, its reader gone, once the second close() returns");
+            assert_eq!(handles, 2, "cancel_first {cancel_first}: no handle of the lane's is left on it, only the test's and the one read");
+            if let Some(first) = first {
+                tokio::time::timeout(Duration::from_secs(5), first).await.expect("the first close() returns").unwrap();
+            }
+            assert_eq!(lane.live_count().await, 0);
+        }
     }
 }
