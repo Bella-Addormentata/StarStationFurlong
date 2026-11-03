@@ -82,8 +82,26 @@ describe.each([TESTNET11, MAINNET])('the faucet dish screen on $name', (net) => 
     expect(h).toContain(`(2.500 ${net.ticker})`);
     expect(h).toContain(`Your wallet: 5,000,000,000,000 mojos (5.000 ${net.ticker})`);
     expect(h).toContain(`· ${net.name}`);
-    // TAKE is the node's to allow, on either network.
-    expect(h).toContain('TAKE A MOJO');
+  });
+
+  // 🛑 Stage 4 design §4.5 (4): TAKE pays into the SSF wallet, which the
+  // node refuses off a test network. The node here still says TAKE is
+  // possible, as an older node would: the page offers none on mainnet.
+  it(net.test ? 'offers TAKE A MOJO when the node allows it' : 'offers no TAKE, and says the dish gives no mojo to the wallet', () => {
+    const h = html();
+    if (net.test) {
+      expect(h).toContain('TAKE A MOJO');
+      expect(h).toContain('id="faucet-take"');
+      expect(h).not.toMatch(/id="faucet-take" disabled/);
+      expect(h).not.toContain('faucet-no-take');
+    } else {
+      expect(h).not.toContain('faucet-take');
+      expect(h).not.toContain('TAKE A MOJO');
+      expect(h).not.toContain('NOTHING TO TAKE YET');
+      expect(h).toContain('id="faucet-no-take"');
+      expect(h).toContain('On Chia mainnet the dish gives no mojo to your wallet.');
+      expect(h).not.toContain('For players whose wallet is empty');
+    }
   });
 
   it(net.test ? 'takes gifts, and shows the pay-in line, the QR code and the address' : 'has no GIVE, no pay-in line and no QR code', () => {
@@ -113,6 +131,8 @@ describe('the faucet dish screen off a known network', () => {
   it('shows no address, no QR code and no GIVE on a network the page does not know, and says why', () => {
     const h = screen(status(null, addressOn(TESTNET11, BODY)));
     expect(h).toContain('Your node runs on a Chia network this page does not know, so the dish shows no address.');
+    expect(h).not.toContain('faucet-take');
+    expect(h).toContain('The dish gives no mojo on a Chia network this page does not know.');
     expect(h).not.toContain(BODY);
     expect(h).not.toContain('<svg');
     expect(h).not.toContain('faucet-give');
@@ -131,6 +151,7 @@ describe('the faucet dish screen off a known network', () => {
   it('offers no slot and names no network before the first status or fingerprint', () => {
     const h = screen(null);
     expect(h).toContain('READING THE CHAIN…');
+    expect(h).toMatch(/id="faucet-take" disabled/);
     expect(h).not.toContain('faucet-give');
     expect(h).not.toContain('pay into');
     expect(h).not.toContain('faucet-no-slot');
@@ -336,6 +357,26 @@ describe('the faucet dish screen when the fingerprint changes network while it i
     s.click('#faucet-copy');
     expect(s.sent.filter((op) => op === 'give')).toEqual([]);
     expect(s.writes).toEqual([]);
+    s.close();
+  });
+
+  it('sends no TAKE when the network moved off a test one before the click', () => {
+    const s = openScreen(status(TESTNET11, addressOn(TESTNET11, BODY)));
+    expect(s.html()).toContain('TAKE A MOJO');
+    s.setNet(MAINNET);
+    // The click lands before the next frame's update() redraws the screen.
+    s.click('#faucet-take');
+    expect(s.sent.filter((op) => op === 'claim')).toEqual([]);
+    // Redrawn at once: the status's testnet11 is not the fingerprint's network.
+    expect(s.html()).not.toContain('faucet-take');
+    expect(s.html()).toContain('id="faucet-no-take"');
+    s.close();
+  });
+
+  it('still sends a TAKE on the same test network', () => {
+    const s = openScreen(status(TESTNET11, addressOn(TESTNET11, BODY)));
+    s.click('#faucet-take');
+    expect(s.sent).toContain('claim');
     s.close();
   });
 

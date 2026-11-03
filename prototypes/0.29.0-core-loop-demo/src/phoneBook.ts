@@ -14,7 +14,6 @@
  *
  * Nothing here is drawn per frame: the fingerprint poll drives it.
  */
-import { mintsOnlyInApp } from './bankWallet';
 import type { ChiaNetwork } from './chiaNetwork';
 import type { ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
 
@@ -68,11 +67,12 @@ const notPublished = (value: string): PhoneBookIndicator => ({ ...NO_NODE, row: 
 const NOT_PUBLISHED = notPublished('OFF — this node does not publish presence (a read-only build, no SSF wallet, or SSF_CHIA_FINDABLE=0)');
 /** 🏦 The SSF wallet switch says why, when it is the reason (bankWallet.ts). */
 const WALLET_NOT_ON = notPublished("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
-/** Off a test network where the Bank can bring no wallet on (bankWallet.ts
- *  `mintsOnlyInApp`): it offers no switch there, so the row names who
- *  makes one instead. */
-const walletOnlyInApp = (net: ChiaNetwork): PhoneBookIndicator =>
-  notPublished(`OFF — this node holds no SSF wallet, and on ${net.name} only the Star Station desktop app that started it makes one`);
+/** 🛑 Off a test network the SSF wallet pays for no chain write (stage 4
+ *  design §4.5 (1), chia_publish.rs `money_memo_refusal`), so turning it on
+ *  in the Bank, or making one, lists nothing there: the row says so instead
+ *  of sending the player to the Bank. */
+const moneyPaysNoWrite = (net: ChiaNetwork): PhoneBookIndicator =>
+  notPublished(`OFF — on ${net.name} the SSF wallet pays for no Phone Book write yet, so this node writes no listing there`);
 const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
 const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
 /** On, with no listing reported yet: the publisher's first round runs about a
@@ -88,10 +88,14 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
   if (!fp) return NO_NODE;
   const p = fp.chia_presence;
   if (!p) {
-    switch (fp.chia_wallet?.state) {
-      case 'ready': return fp.chia_net && mintsOnlyInApp(fp.chia_net, fp.chia_wallet) ? walletOnlyInApp(fp.chia_net) : WALLET_NOT_ON;
-      case 'off': return WALLET_HELD_OFF;
-      case 'unbuilt': return READ_ONLY_BUILD;
+    const state = fp.chia_wallet?.state;
+    if (state === 'off') return WALLET_HELD_OFF;
+    if (state === 'unbuilt') return READ_ONLY_BUILD;
+    // Before the heartbeat's first round, or with no wallet on at all, the
+    // node reports no listing, so its refusal has not reached this page yet.
+    if (fp.chia_net && !fp.chia_net.test) return moneyPaysNoWrite(fp.chia_net);
+    switch (state) {
+      case 'ready': return WALLET_NOT_ON;
       case 'on': return WALLET_ON_UNREPORTED;
       default: return NOT_PUBLISHED;
     }

@@ -24,7 +24,10 @@
 //! landing counts as a coin in the wallet. testnet11 by default; on mainnet
 //! only for development until P8 (every gift and donation links addresses on
 //! a public chain). On mainnet the node never GIVEs: a gift would send real
-//! XCH into a jar nobody holds a key for ([`MAINNET_NO_GIVE`]).
+//! XCH into a jar nobody holds a key for ([`MAINNET_NO_GIVE`]). Nor does it
+//! TAKE there (stage 4 design §4.5): a mojo into the SSF wallet marks it as a
+//! player's ([`MAINNET_NO_TAKE`]), and nobody claims from a room's own dish,
+//! which would group its takers by room ([`MAINNET_NO_ROOM_DISH`]).
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;
@@ -71,6 +74,31 @@ const CTX_ROOM_TAG: &str = "ssf-faucet-room-tag-v1";
 /// status's note there.
 pub const MAINNET_NO_GIVE: &str = "On mainnet the dish does not take gifts from this node.";
 
+/// 🛑 TAKE A MOJO's refusal off a test network (stage 4 design §4.5 (4)): a
+/// claim into the SSF wallet would mark that wallet as a Star Station
+/// player's for ever, since every SSF dish is known by its mod hash, and a
+/// mojo there funds nothing now that no listing is paid from it.
+pub const MAINNET_NO_TAKE: &str = "On mainnet the dish gives no mojo to this node's wallet.";
+
+/// 🛑 The refusal of every claim at a room's own dish off a test network,
+/// whoever it would pay (stage 4 design §4.5 (5)): that dish is one fixed
+/// address per room, so its takers would be grouped by room for ever. Only
+/// the lobby dish can be claimed from there.
+pub const MAINNET_NO_ROOM_DISH: &str = "On mainnet nobody takes from a room's own dish, since that would tie its takers to the room.";
+
+/// Why no claim may be made at this dish on `net`, whoever it pays: off a
+/// test network, any dish but the lobby's ([`MAINNET_NO_ROOM_DISH`]).
+pub fn dish_claim_refusal(net: ChiaNet, params: &FaucetParams) -> Option<&'static str> {
+    (!net.is_test() && !params.is_lobby()).then_some(MAINNET_NO_ROOM_DISH)
+}
+
+/// Why TAKE A MOJO into the SSF wallet is refused at this dish on `net`:
+/// the dish's own refusal first ([`dish_claim_refusal`]), then, off a test
+/// network, the wallet's ([`MAINNET_NO_TAKE`]). `None` on a test network.
+pub fn take_refusal(net: ChiaNet, params: &FaucetParams) -> Option<&'static str> {
+    dish_claim_refusal(net, params).or((!net.is_test()).then_some(MAINNET_NO_TAKE))
+}
+
 /// What is curried into the faucet puzzle for one room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaucetParams {
@@ -90,6 +118,16 @@ impl FaucetParams {
             gap: GAP_BLOCKS,
             max_fee: MAX_FEE_MOJOS,
         }
+    }
+
+    /// The lobby dish: the one whose room key ships in every build (the
+    /// welcome room, `chia_rooms::BUNDLED_ROOM_KEYS_B64`). Every other dish
+    /// is a room's own.
+    pub fn is_lobby(&self) -> bool {
+        crate::chia_rooms::BUNDLED_ROOM_KEYS_B64
+            .iter()
+            .filter_map(|b64| crate::chia_rooms::decode_room_key(b64))
+            .any(|key| Self::for_room(&key) == *self)
     }
 
     /// Puzzle hash = address of this room's faucet (tree hash of the curried
@@ -231,15 +269,17 @@ pub struct FaucetStatus {
     pub snapshot: u64,
 }
 
-/// The network's word on the dish, after the wallet's: off a test network
-/// GIVE is off whatever the wallet holds, and the note says so after any
-/// other reason.
-pub fn network_part(net: ChiaNet, can_give: bool, note: String) -> (bool, String) {
-    if net.is_test() {
-        return (can_give, note);
+/// The network's word on the dish, after the wallet's: GIVE, TAKE and the
+/// note. A test network keeps the wallet's. Off one neither GIVE nor TAKE
+/// is offered, whatever the wallet holds, and the note is the network's
+/// alone: why no mojo is taken at this dish ([`take_refusal`]), then that it
+/// takes no gift ([`MAINNET_NO_GIVE`]). Every other hint is about TAKE or
+/// GIVE, so none of them is said there (stage 4 design §4.5 (4) and (5)).
+pub fn network_part(net: ChiaNet, params: &FaucetParams, can_give: bool, can_claim: bool, note: String) -> (bool, bool, String) {
+    match take_refusal(net, params) {
+        None => (can_give, can_claim, note),
+        Some(take) => (false, false, format!("{take} {MAINNET_NO_GIVE}")),
     }
-    let note = if note.is_empty() { MAINNET_NO_GIVE.to_string() } else { format!("{note}. {MAINNET_NO_GIVE}") };
-    (false, note)
 }
 
 /// Status reads take turns, and each snapshot is numbered as it completes
@@ -571,7 +611,7 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
     {
         st.note = "this node was built without publishing; it can show the dish but not take or give".into();
     }
-    (st.can_give, st.note) = network_part(ctx.net, st.can_give, std::mem::take(&mut st.note));
+    (st.can_give, st.can_claim, st.note) = network_part(ctx.net, params, st.can_give, st.can_claim, std::mem::take(&mut st.note));
     st.snapshot = STATUS_SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     Ok(st)
 }
@@ -749,12 +789,36 @@ fn wallet_part(
     WalletPart { can_give, can_claim, note }
 }
 
-/// CLAIM: spend the readiest faucet coin, GIFT to our own address, keyless.
+/// The coin a claim spends: one picked at random among the coins ready now
+/// (claimable and past their gap) that the lease does not hold (`taken`),
+/// on every network (stage 4 design §5.2). The largest coin first, as
+/// before, sent every node claiming on the same day to one coin, so all
+/// but one lost the race; a random pick spreads them over every ready
+/// coin. `None` when no coin is ready.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build only shows the dish
+pub fn pick_ready_coin<'a, R: rand::Rng + ?Sized>(
+    coins: &'a [FaucetCoin],
+    params: &FaucetParams,
+    peak: u32,
+    taken: impl Fn(&Bytes32) -> bool,
+    rng: &mut R,
+) -> Option<&'a FaucetCoin> {
+    use rand::seq::SliceRandom;
+    let ready: Vec<&FaucetCoin> = coins.iter().filter(|c| c.ready(params, peak) && !taken(&c.coin.coin_id())).collect();
+    ready.choose(rng).copied()
+}
+
+/// CLAIM: spend a ready faucet coin picked at random ([`pick_ready_coin`]),
+/// GIFT to our own address, keyless. Refused first off a test network
+/// ([`take_refusal`]), before the wallet or the chain is asked anything.
 #[cfg(feature = "chia-publish")]
 async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetReply> {
     use chia_protocol::{CoinSpend, Program, SpendBundle};
     use clvmr::serde::node_to_bytes;
 
+    if let Some(why) = take_refusal(ctx.net, params) {
+        return Err(anyhow!(why));
+    }
     let sk = ctx
         .wallet
         .as_ref()
@@ -792,12 +856,8 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
         .ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
     let faucet_ph = params.puzzle_hash();
     let coins = unspent_at(client, faucet_ph).await?.coins;
-    let Some(target) = coins
-        .iter()
-        .filter(|c| c.ready(params, peak))
-        .filter(|c| !crate::chia_publish::WALLET_LEASE.is_taken(&c.coin.coin_id()))
-        .max_by_key(|c| (c.coin.amount, std::cmp::Reverse(c.confirmed_height)))
-    else {
+    let taken = |id: &Bytes32| crate::chia_publish::WALLET_LEASE.is_taken(id);
+    let Some(target) = pick_ready_coin(&coins, params, peak, taken, &mut rand::rngs::OsRng) else {
         return Err(anyhow!("no mojo in the dish right now; it refills on the block clock"));
     };
     let recipient = crate::chia_publish::our_puzzle_hash(sk);
@@ -852,7 +912,10 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
 }
 
 #[cfg(not(feature = "chia-publish"))]
-async fn claim(_ctx: &FaucetContext<'_>, _client: &impl ChainAccess, _params: &FaucetParams) -> Result<FaucetReply> {
+async fn claim(ctx: &FaucetContext<'_>, _client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetReply> {
+    if let Some(why) = take_refusal(ctx.net, params) {
+        return Err(anyhow!(why));
+    }
     Err(anyhow!("this node was built without publishing; it cannot take a mojo"))
 }
 
@@ -1067,6 +1130,13 @@ mod tests {
     /// The lobby's v1 parameters on a fixed room tag.
     fn test_params() -> FaucetParams {
         FaucetParams { room_tag: Bytes32::new([7u8; 32]), gift: GIFT_MOJOS, gap: GAP_BLOCKS, max_fee: MAX_FEE_MOJOS }
+    }
+
+    /// The lobby dish itself: the welcome room's, whose key ships in every
+    /// build.
+    fn lobby_params() -> FaucetParams {
+        let key = crate::chia_rooms::decode_room_key(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64[0]).unwrap();
+        FaucetParams::for_room(&key)
     }
 
     /// A private-room dish that allows a fee, to exercise the fee arithmetic.
@@ -1342,9 +1412,10 @@ mod tests {
     /// Mainnet holds an SSF wallet now, so the wallet's part of the note
     /// runs there: it keeps what is about TAKE and leaves out every hint
     /// about giving (split coins, a listing cut short, a spend still
-    /// confirming), and calls an empty jar empty, so the note the dish
-    /// shows after [`network_part`] never both offers a gift and refuses
-    /// it. Testnet11 keeps each of those hints.
+    /// confirming), and calls an empty jar empty. Testnet11 keeps each of
+    /// those hints. Since stage 4's §4.5 the dish takes no mojo there
+    /// either, so [`network_part`] turns TAKE off and its word replaces the
+    /// wallet's: the note never offers what the dish refuses.
     #[cfg(feature = "chia-publish")]
     #[test]
     fn off_a_test_network_the_wallet_note_never_speaks_of_giving() {
@@ -1372,11 +1443,15 @@ mod tests {
             assert!(t.note.contains(on_t11), "testnet11 keeps its hint: {t:?}");
             let m = wallet_part(wallet, false, spending, None, main(ready, jar_empty));
             assert_eq!(m.note, on_main, "{m:?}");
-            assert_eq!(m.can_claim, t.can_claim, "TAKE reads alike on both networks");
-            let (give, note) = network_part(ChiaNet::Mainnet, m.can_give, m.note);
-            assert!(!give);
-            let before = note.strip_suffix(MAINNET_NO_GIVE).expect("the network's word comes last");
-            assert!(!before.to_lowercase().contains("giv"), "a mainnet note that speaks of giving: {note}");
+            assert_eq!(m.can_claim, t.can_claim, "the wallet's part reads TAKE alike on both networks");
+            // Stage 4 design §4.5 (4) and (5): the network's part then turns
+            // TAKE off too, and its word replaces the wallet's, at the
+            // lobby's dish and at a room's own.
+            for params in [lobby_params(), test_params()] {
+                let (give, take, note) = network_part(ChiaNet::Mainnet, &params, m.can_give, m.can_claim, m.note.clone());
+                assert!(!give && !take, "{note}");
+                assert_eq!(note, format!("{} {MAINNET_NO_GIVE}", take_refusal(ChiaNet::Mainnet, &params).unwrap()));
+            }
         }
         // A sealed lease and a mojo landing are about every spend and TAKE:
         // both networks say them.
@@ -1555,30 +1630,141 @@ mod tests {
             let back: FaucetStatus = serde_json::from_value(json).unwrap();
             assert_eq!(back, st);
         }
-        assert_eq!(network_part(ChiaNet::Testnet11, true, String::new()), (true, String::new()), "testnet11 is as it was");
-        assert_eq!(network_part(ChiaNet::Testnet11, false, "x".into()), (false, "x".to_string()));
-        assert_eq!(network_part(ChiaNet::Mainnet, true, String::new()), (false, MAINNET_NO_GIVE.to_string()));
-        let (give, note) = network_part(ChiaNet::Mainnet, true, "no mojo in the dish yet".into());
-        assert!(!give);
-        assert_eq!(note, "no mojo in the dish yet. On mainnet the dish does not take gifts from this node.");
+        // Testnet11 is as it was, at the lobby's dish and at a room's own.
+        for dish in [lobby_params(), params] {
+            assert_eq!(network_part(ChiaNet::Testnet11, &dish, true, true, String::new()), (true, true, String::new()));
+            assert_eq!(network_part(ChiaNet::Testnet11, &dish, false, true, "x".into()), (false, true, "x".to_string()));
+            assert_eq!(network_part(ChiaNet::Testnet11, &dish, true, false, "y".into()), (true, false, "y".to_string()));
+        }
+        // Mainnet offers neither, and says why in its own words, the
+        // wallet's left out (stage 4 design §4.5 (4) and (5)).
+        let (give, take, note) = network_part(ChiaNet::Mainnet, &lobby_params(), true, true, "no mojo in the dish yet".into());
+        assert!(!give && !take);
+        assert_eq!(note, "On mainnet the dish gives no mojo to this node's wallet. On mainnet the dish does not take gifts from this node.");
+        let (give, take, note) = network_part(ChiaNet::Mainnet, &params, true, true, String::new());
+        assert!(!give && !take);
+        assert_eq!(
+            note,
+            "On mainnet nobody takes from a room's own dish, since that would tie its takers to the room. On mainnet the dish does not take gifts from this node."
+        );
+    }
+
+    /// 🛑 Stage 4 design §4.5 (4) and (5), on both networks: TAKE into the
+    /// SSF wallet is refused off a test network, and a claim at a room's own
+    /// dish is refused there whoever it pays; only the lobby's dish is the
+    /// lobby. A test network refuses neither.
+    #[test]
+    fn off_a_test_network_take_and_every_room_dish_claim_are_refused() {
+        let lobby = lobby_params();
+        let room = test_params();
+        assert!(lobby.is_lobby());
+        assert!(!room.is_lobby() && !FaucetParams::for_room(&[3u8; 32]).is_lobby());
+        for net in ChiaNet::ALL {
+            if net.is_test() {
+                for dish in [&lobby, &room] {
+                    assert_eq!(take_refusal(net, dish), None, "{net:?}");
+                    assert_eq!(dish_claim_refusal(net, dish), None, "{net:?}");
+                }
+            } else {
+                assert_eq!(dish_claim_refusal(net, &lobby), None, "the lobby's dish is not a room's own");
+                assert_eq!(take_refusal(net, &lobby), Some(MAINNET_NO_TAKE));
+                assert_eq!(dish_claim_refusal(net, &room), Some(MAINNET_NO_ROOM_DISH), "whoever the claim pays");
+                assert_eq!(take_refusal(net, &room), Some(MAINNET_NO_ROOM_DISH), "the dish's refusal comes first");
+            }
+        }
+        for text in [MAINNET_NO_TAKE, MAINNET_NO_ROOM_DISH] {
+            assert!(!text.contains('\u{2014}') && text.ends_with('.'), "{text}");
+        }
+    }
+
+    /// TAKE on mainnet is refused before the wallet or the chain is asked,
+    /// as GIVE is: the chain here answers nothing, so any read would fail
+    /// otherwise, and with no wallet on the network is said first, never
+    /// the Bank. Testnet11 gets past the network check.
+    #[test]
+    fn take_is_refused_on_mainnet_before_anything_is_read() {
+        let rooms = Mutex::new(HashMap::new());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let chain = crate::chia_chain::testing::Unanswering;
+        let ctx = |net: ChiaNet, _held: bool| FaucetContext {
+            net,
+            chia_off: false,
+            rooms: &rooms,
+            #[cfg(feature = "chia-publish")]
+            wallet: _held.then(|| chia_bls::SecretKey::from_seed(&[5u8; 32])),
+            #[cfg(feature = "chia-publish")]
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            #[cfg(feature = "chia-publish")]
+            turnable: true,
+        };
+        for held in [true, false] {
+            let take = |dish: &FaucetParams| rt.block_on(claim(&ctx(ChiaNet::Mainnet, held), &chain, dish)).unwrap_err().to_string();
+            assert_eq!(take(&lobby_params()), MAINNET_NO_TAKE, "held {held}");
+            assert_eq!(take(&test_params()), MAINNET_NO_ROOM_DISH, "held {held}");
+        }
+        // Testnet11, with no wallet on: past the network check, the wallet's
+        // word comes next, and no lease or chain is asked.
+        let err = rt.block_on(claim(&ctx(T11, false), &chain, &test_params())).unwrap_err().to_string();
+        #[cfg(feature = "chia-publish")]
+        assert_eq!(err, crate::chia_wallet_switch::no_wallet_words(crate::chia_wallet_switch::EnvSwitch::Unset, T11, true, "take a mojo"));
+        #[cfg(not(feature = "chia-publish"))]
+        assert_eq!(err, "this node was built without publishing; it cannot take a mojo");
+    }
+
+    /// Stage 4 design §5.2, on every network: a claim picks a ready coin at
+    /// random among those the lease does not hold, never the largest first,
+    /// and never a coin that is not ready (inside its gap, or dust below the
+    /// gift) or that the lease holds.
+    #[test]
+    fn a_claim_picks_a_random_ready_coin_the_lease_does_not_hold() {
+        use rand::SeedableRng;
+        let params = test_params();
+        let ph = params.puzzle_hash();
+        let coin = |n: u8, amount: u64, height: u32| FaucetCoin { coin: Coin::new(Bytes32::new([n; 32]), ph, amount), confirmed_height: height };
+        let peak = 200;
+        let coins = vec![
+            coin(1, 1_000_000, 100), // ready, the largest
+            coin(2, 10, 120),        // ready
+            coin(3, 1, 150),         // ready, exactly one gift
+            coin(4, 5_000_000, 190), // inside its gap until 222
+            coin(5, 0, 100),         // dust: below the gift
+            coin(6, 7_000, 110),     // ready, but the lease holds it
+        ];
+        let held = coins[5].coin.coin_id();
+        let taken = |id: &Bytes32| *id == held;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x55f0_d15b);
+        let mut seen: HashMap<u8, u32> = HashMap::new();
+        for _ in 0..600 {
+            let pick = pick_ready_coin(&coins, &params, peak, taken, &mut rng).expect("three coins are ready");
+            *seen.entry(pick.coin.parent_coin_info.as_ref()[0]).or_default() += 1;
+        }
+        let mut picked: Vec<u8> = seen.keys().copied().collect();
+        picked.sort_unstable();
+        assert_eq!(picked, vec![1, 2, 3], "every ready coin the lease does not hold, and no other: {seen:?}");
+        assert!(seen.values().all(|n| *n >= 100), "spread over all three, not the largest first: {seen:?}");
+        // Nothing ready: none, whatever the jar holds.
+        assert!(pick_ready_coin(&coins, &params, 120, |_| false, &mut rng).is_none(), "below every gap");
+        assert!(pick_ready_coin(&coins, &params, peak, |_| true, &mut rng).is_none(), "the lease holds them all");
+        assert!(pick_ready_coin(&[], &params, peak, |_| false, &mut rng).is_none());
+        // The coin past its gap joins the pick once it is ready.
+        let later: Vec<u8> = (0..200)
+            .filter_map(|_| pick_ready_coin(&coins, &params, 222, taken, &mut rng))
+            .map(|c| c.coin.parent_coin_info.as_ref()[0])
+            .collect();
+        assert!(later.contains(&4), "{later:?}");
     }
 
     /// The status a mainnet node serves, end to end through `status`: a
-    /// full jar on the chain, and still no GIVE, with the network's note
-    /// after the reason this node holds no wallet. No wallet is held, so the
+    /// full jar on the chain, and still neither GIVE nor TAKE, with the
+    /// network's note alone (stage 4 design §4.5 (4) and (5)): the dish
+    /// takes no mojo into the SSF wallet there, so whatever holds the wallet
+    /// off (the Bank, SSF_CHIA_LANE, a node only the desktop app can mint
+    /// for) is not the reason and is not said. No wallet is held, so the
     /// wallet lease is never read, and `SSF_CHIA_LANE` comes from the
-    /// context, never the environment. Mainnet makes an SSF wallet now, so
-    /// the dish points at the Bank there as on testnet11, for TAKE only,
-    /// unless the Bank cannot bring one on (no live desktop app channel and
-    /// no wallet on disk): then it names the desktop app.
+    /// context, never the environment. A room's own dish says that nobody
+    /// takes from it there.
     #[test]
-    fn a_mainnet_status_offers_no_give_and_says_why() {
-        let params = test_params();
-        let coin = FaucetCoin { coin: Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000), confirmed_height: 100 };
-        let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
-        let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
-        let jar = || crate::chia_chain::testing::Scripted::new(vec![page.clone()]).with_peak(200);
-        let chain = jar();
+    fn a_mainnet_status_offers_no_take_or_give_and_says_why() {
         let rooms = Mutex::new(HashMap::new());
         let ctx = FaucetContext {
             net: ChiaNet::Mainnet,
@@ -1592,55 +1778,45 @@ mod tests {
             turnable: true,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
-        assert_eq!((st.network, st.coins, st.ready, st.total_mojos), (ChiaNet::Mainnet, 1, 1, 1000), "the jar is read");
-        assert_eq!(st.address, params.address(ChiaNet::Mainnet));
-        assert!(st.address.starts_with("xch1"), "{}", st.address);
-        assert!(!st.can_give && !st.can_claim, "{st:?}");
-        assert!(st.note.ends_with(MAINNET_NO_GIVE), "{}", st.note);
-        #[cfg(feature = "chia-publish")]
-        {
-            assert_eq!(
-                st.note,
-                "this node's SSF wallet is not on yet: turn it on in the SpacePhone's 🏦 BANK to take a mojo. On mainnet the dish does not take gifts from this node."
-            );
-            // Held off by SSF_CHIA_LANE: that is the reason, and the Bank is not.
-            let off = FaucetContext { env: crate::chia_wallet_switch::EnvSwitch::Off, ..ctx };
-            let st = rt.block_on(status(&off, &jar(), &params)).unwrap();
-            assert_eq!(
-                st.note,
-                "this node's SSF wallet is switched off (SSF_CHIA_LANE in its environment), so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
-            );
+        let lobby_note = "On mainnet the dish gives no mojo to this node's wallet. On mainnet the dish does not take gifts from this node.";
+        let room_note = "On mainnet nobody takes from a room's own dish, since that would tie its takers to the room. On mainnet the dish does not take gifts from this node.";
+        for (params, note) in [(lobby_params(), lobby_note), (test_params(), room_note)] {
+            let coin = FaucetCoin { coin: Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000), confirmed_height: 100 };
+            let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
+            let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
+            let jar = || crate::chia_chain::testing::Scripted::new(vec![page.clone()]).with_peak(200);
+            let st = rt.block_on(status(&ctx, &jar(), &params)).unwrap();
+            assert_eq!((st.network, st.coins, st.ready, st.total_mojos), (ChiaNet::Mainnet, 1, 1, 1000), "the jar is read");
+            assert_eq!(st.address, params.address(ChiaNet::Mainnet));
+            assert!(st.address.starts_with("xch1"), "{}", st.address);
             assert!(!st.can_give && !st.can_claim, "{st:?}");
-            // No live desktop app channel and no wallet on disk: the Bank
-            // offers no switch there, so the dish names the desktop app.
-            let app_only = FaucetContext { env: crate::chia_wallet_switch::EnvSwitch::Unset, turnable: false, ..off };
-            let st = rt.block_on(status(&app_only, &jar(), &params)).unwrap();
-            assert_eq!(
-                st.note,
-                "this node holds no SSF wallet, and on Chia mainnet it makes a new one only when the Star Station desktop app started it, so it cannot take a mojo. On mainnet the dish does not take gifts from this node."
-            );
-            assert!(!st.note.contains("BANK"), "{}", st.note);
+            assert_eq!(st.note, note);
+            assert!(st.snapshot > 0, "numbered as it completed");
+            #[cfg(feature = "chia-publish")]
+            {
+                // Held off by SSF_CHIA_LANE, or a node the Bank can bring no
+                // wallet on: the same note, since neither is why.
+                use crate::chia_wallet_switch::EnvSwitch;
+                for (env, turnable) in [(EnvSwitch::Off, true), (EnvSwitch::Unset, false)] {
+                    let held_off = FaucetContext { net: ChiaNet::Mainnet, chia_off: false, rooms: &rooms, wallet: None, env, turnable };
+                    let st = rt.block_on(status(&held_off, &jar(), &params)).unwrap();
+                    assert!(!st.can_give && !st.can_claim, "{st:?}");
+                    assert_eq!(st.note, note);
+                }
+            }
         }
-        #[cfg(not(feature = "chia-publish"))]
-        assert_eq!(
-            st.note,
-            "this node was built without publishing; it can show the dish but not take or give. On mainnet the dish does not take gifts from this node."
-        );
-        assert!(st.snapshot > 0, "numbered as it completed");
-        assert!(!st.note.contains("no SSF wallet"), "{}", st.note);
     }
 
     /// The status a mainnet node with its SSF wallet on serves, end to end
-    /// through `status`, with the jar empty (as every mainnet jar is until
-    /// someone pays one): no GIVE, and a note that never speaks of giving.
-    /// An empty wallet hears that the jar is empty, not that it refills; a
-    /// funded one hears only the network's word. Nothing is parked in the
-    /// wallet lease, so it reads no chain.
+    /// through `status`, at the lobby's dish: an empty jar (as every mainnet
+    /// jar is until someone pays one) and then a funded wallet. Neither TAKE
+    /// nor GIVE, and the network's note alone, whatever the wallet holds;
+    /// the balance is read all the same. Nothing is parked in the wallet
+    /// lease, so it reads no chain.
     #[cfg(feature = "chia-publish")]
     #[test]
-    fn a_mainnet_status_with_a_wallet_on_never_speaks_of_giving() {
-        let params = test_params();
+    fn a_mainnet_status_with_a_wallet_on_offers_no_take_or_give() {
+        let params = lobby_params();
         let sk = chia_bls::SecretKey::from_seed(&[6u8; 32]);
         let listing = |records: Vec<crate::chia_chain::CoinRecord>| crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at: None };
         let ours = Coin::new(Bytes32::new([2u8; 32]), crate::chia_publish::our_puzzle_hash(&sk), 5_000);
@@ -1655,17 +1831,18 @@ mod tests {
             turnable: true,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let note = format!("{MAINNET_NO_TAKE} {MAINNET_NO_GIVE}");
         // The jar's listing first, then the wallet's.
         let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![])]).with_peak(200);
         let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
         assert_eq!((st.coins, st.wallet_mojos), (0, Some(0)), "{st:?}");
-        assert!(!st.can_give && !st.can_claim, "{st:?}");
-        assert_eq!(st.note, "the jar is empty, so there is no mojo to take. On mainnet the dish does not take gifts from this node.");
+        assert!(!st.can_give && !st.can_claim, "an empty wallet takes nothing on mainnet: {st:?}");
+        assert_eq!(st.note, note);
         let chain = crate::chia_chain::testing::Scripted::new(vec![listing(vec![]), listing(vec![funded])]).with_peak(200);
         let st = rt.block_on(status(&ctx, &chain, &params)).unwrap();
         assert_eq!(st.wallet_mojos, Some(5_000), "{st:?}");
         assert!(!st.can_give && !st.can_claim, "a funded wallet still gives nothing on mainnet: {st:?}");
-        assert_eq!(st.note, MAINNET_NO_GIVE);
+        assert_eq!(st.note, note);
     }
 
     /// GIVE on mainnet is refused before the wallet or the chain is asked:

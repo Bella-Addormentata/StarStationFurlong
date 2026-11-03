@@ -345,18 +345,25 @@ pub(crate) mod testing {
 
     /// A chain that answers listings from a script: the pages in order,
     /// whatever the key or cursor asked for, then nothing. It keeps whether
-    /// each listing asked for spent coins. The peak is answered only when
-    /// one was given ([`Scripted::with_peak`]). Everything else is
-    /// unanswered.
+    /// each listing asked for spent coins, and how many bundles were handed
+    /// to it (`sent`: a liveness question or a push, both unanswered). The
+    /// peak is answered only when one was given ([`Scripted::with_peak`]).
+    /// Everything else is unanswered.
     pub(crate) struct Scripted {
         pages: std::sync::Mutex<std::collections::VecDeque<CoinListing>>,
         pub(crate) asked_spent: std::sync::Mutex<Vec<bool>>,
+        pub(crate) sent: std::sync::atomic::AtomicUsize,
         peak: Option<u32>,
     }
 
     impl Scripted {
         pub(crate) fn new(pages: Vec<CoinListing>) -> Self {
-            Self { pages: std::sync::Mutex::new(pages.into()), asked_spent: std::sync::Mutex::new(Vec::new()), peak: None }
+            Self {
+                pages: std::sync::Mutex::new(pages.into()),
+                asked_spent: std::sync::Mutex::new(Vec::new()),
+                sent: std::sync::atomic::AtomicUsize::new(0),
+                peak: None,
+            }
         }
 
         /// The same chain, answering `peak` as its peak height.
@@ -416,10 +423,12 @@ pub(crate) mod testing {
         }
 
         fn spend_live(&self, _bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async { Err(silence()) }
         }
 
         fn push_tx(&self, _bundle: SpendBundle) -> impl Future<Output = Result<(), ChainError>> + Send {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async { Err(silence()) }
         }
     }

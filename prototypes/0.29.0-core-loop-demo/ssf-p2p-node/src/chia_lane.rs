@@ -144,10 +144,12 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
 /// for the SSF wallet (`wallet_on`: it loaded at this start, after the Bank's
 /// switch or `SSF_CHIA_LANE=1` turned it on, chia_wallet_switch.rs) and a
-/// build with the `chia-publish` feature. Off a test network (`net`), with no
-/// live desktop app channel, it says that only the desktop app makes a new
-/// wallet there. While Chia is off (`strict`, chia_strict.rs) both are off,
-/// and the line says why.
+/// build with the `chia-publish` feature. Off a test network (`net`) the SSF
+/// wallet pays for no chain write (stage 4 design §4.5 (1),
+/// `chia_publish::money_memo_refusal`), so publishing is off there whatever
+/// the wallet does, and the line says so. While Chia is off (`strict`,
+/// chia_strict.rs) reads and publishing are both off, and the line says why
+/// on every network.
 pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool, strict: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -179,14 +181,10 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
     } else {
         "on (rung-6 resolve + beat watcher)"
     };
-    // Printed at startup, before the desktop app's channel can be live (it
-    // goes live once its thread has answered the app), so off a test
-    // network a load here mints nothing and the line says who makes one.
-    let mints = crate::chia_wallet_switch::may_mint(net.is_test(), false);
     let publish = if strict && cfg!(feature = "chia-publish") {
         STRICT_STATUS
     } else {
-        publish_status(cfg!(feature = "chia-publish"), wallet_on, mints, crate::chia_wallet_switch::env_switch())
+        publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch())
     };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
@@ -198,21 +196,21 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
 const STRICT_STATUS: &str = "off (Chia is off on this computer: SSF_NO_CHIA_LANE)";
 
 /// The startup line's word on publishing: whether this build can, whether
-/// the SSF wallet loaded, and what holds it off. `mints` is whether a load
-/// may make a new wallet (chia_wallet_switch::may_mint): when it may not (off
-/// a test network with no desktop app channel), a headless node can only
-/// load one the desktop app made, and the line says so.
-pub fn publish_status(built: bool, wallet_on: bool, mints: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
+/// the SSF wallet pays for a chain write on this network (`pays`: on a test
+/// network only, the rule of `chia_publish::money_memo_refusal`), whether it
+/// loaded, and what holds it off. Where it pays for none, turning it on in
+/// the Bank publishes nothing either, so the line sends no one there.
+pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
     if !built {
         "not built"
-    } else if wallet_on {
+    } else if wallet_on && pays {
         "on (the SSF wallet is on)"
     } else if env == crate::chia_wallet_switch::EnvSwitch::Off {
         "off (SSF_CHIA_LANE holds the SSF wallet off)"
-    } else if mints {
-        "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
+    } else if !pays {
+        "off (on this network the SSF wallet pays for no chain write yet, so the lane only reads the chain)"
     } else {
-        "off until the SSF wallet is turned on in the SpacePhone's Bank (on this network only the desktop app makes a new one; a headless node: SSF_CHIA_LANE=1 loads one already in its folder)"
+        "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
     }
 }
 
@@ -937,41 +935,32 @@ mod p6b_tests {
     }
 
     /// The startup line's word on publishing, for each network: testnet11
-    /// keeps every text it had, and mainnet, which makes an SSF wallet now,
-    /// says the same unless a load there may not mint (no desktop app
-    /// channel), when it says that only the desktop app makes a new one.
+    /// keeps every text it had; off a test network the SSF wallet pays for
+    /// no chain write (stage 4 design §4.5 (1)), so publishing is off there,
+    /// wallet on or not, and the line sends no one to the Bank for it.
     #[test]
-    fn the_publish_status_says_where_a_wallet_comes_from_on_each_network() {
-        use crate::chia_network::ChiaNet;
-        use crate::chia_wallet_switch::may_mint;
+    fn the_publish_status_says_publishing_is_on_only_where_the_ssf_wallet_pays() {
+        use crate::chia_network::ChiaNet::{self, Mainnet, Testnet11};
         use crate::chia_wallet_switch::EnvSwitch::{Off, On, Unset};
-        assert_eq!(publish_status(false, false, true, Unset), "not built");
-        assert_eq!(publish_status(true, true, true, On), "on (the SSF wallet is on)");
-        assert_eq!(publish_status(true, false, true, Off), "off (SSF_CHIA_LANE holds the SSF wallet off)");
-        assert_eq!(
-            publish_status(true, false, true, Unset),
-            "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
-        );
-        for net in ChiaNet::ALL {
-            for channel in [false, true] {
-                let mints = may_mint(net.is_test(), channel);
-                assert_eq!(mints, net.is_test() || channel, "{net:?} channel={channel}");
-                for env in [Unset, On, Off] {
-                    assert_eq!(publish_status(true, true, mints, env), "on (the SSF wallet is on)", "a wallet on is on, on any network");
-                    let line = publish_status(true, false, mints, env);
-                    assert!(!line.contains("allows no SSF wallet"), "{line}");
-                    if env == Off {
-                        assert_eq!(line, "off (SSF_CHIA_LANE holds the SSF wallet off)");
-                    } else if !mints {
-                        assert_eq!(
-                            line,
-                            "off until the SSF wallet is turned on in the SpacePhone's Bank (on this network only the desktop app makes a new one; a headless node: SSF_CHIA_LANE=1 loads one already in its folder)",
-                            "{net:?} {env:?}"
-                        );
-                    }
-                }
-                assert_eq!(publish_status(false, false, mints, Unset), "not built", "a read-only build says only that");
+        const ON: &str = "on (the SSF wallet is on)";
+        const HELD_OFF: &str = "off (SSF_CHIA_LANE holds the SSF wallet off)";
+        const BANK: &str = "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)";
+        const PAYS_NONE: &str = "off (on this network the SSF wallet pays for no chain write yet, so the lane only reads the chain)";
+        for env in [Unset, On, Off] {
+            assert_eq!(publish_status(true, Testnet11.is_test(), true, env), ON, "{env:?}");
+            assert_eq!(publish_status(true, Testnet11.is_test(), false, env), if env == Off { HELD_OFF } else { BANK }, "{env:?}");
+            for wallet_on in [false, true] {
+                let line = publish_status(true, Mainnet.is_test(), wallet_on, env);
+                assert_eq!(line, if env == Off { HELD_OFF } else { PAYS_NONE }, "{env:?} wallet_on={wallet_on}");
+                assert!(!line.contains("Bank"), "{line}");
             }
+        }
+        for net in ChiaNet::ALL {
+            for wallet_on in [false, true] {
+                assert_eq!(publish_status(false, net.is_test(), wallet_on, Unset), "not built", "a read-only build says only that");
+            }
+            #[cfg(feature = "chia-publish")]
+            assert_eq!(net.is_test(), crate::chia_publish::money_memo_refusal(net).is_none(), "{net:?}");
         }
     }
 }
