@@ -45,6 +45,7 @@ use chia_protocol::Bytes32;
 
 use crate::chia_knock::{DialBack, InboxKnock};
 use crate::chia_lane::{self, ChiaPresenceRecord};
+use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{self, FoundRecord, HintCursor, LeaseWord, WriteStanding};
 
 /// Blocks per beat: reads align to peak heights that are multiples of this.
@@ -310,7 +311,14 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
     // and the knock book's two clocks (confirmations we wait for, dial-backs due).
     let mut inbox_cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
     let kx_secret = crate::chia_contact::kx_card_secret(&hub.secret_key);
-    let knocks_file = crate::chia_network::net().path(crate::chia_knock::KNOCKS_FILE);
+    // The network the node runs on: its own state files, and the network
+    // whose contact-key and inbox hints the v2 reads below take and whose v2
+    // seals they open (stage 4 design §3.5). The v1 room reads take none: a
+    // v1 hint is the room key's and the day's alone, the same bytes on every
+    // chain, since §3.5 tags only the v2 hints, the AADs and the dish, and no
+    // node writes a v1 record off a test network (§4.5 (2)).
+    let net = crate::chia_network::net();
+    let knocks_file = net.path(crate::chia_knock::KNOCKS_FILE);
     let knocks_path = knocks_file.as_path();
     println!(
         "⛓️ ChiaHub watcher on: reads every {} blocks per room (×{} while connected), hold {}s × {}s, {} holds/room",
@@ -487,7 +495,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         if peak > 0 {
             let own_ck = hub.contact_key;
             if sched.due(SELF_SCHED_KEY, peak, false) {
-                match chia_resolve::read_ck(&client, &own_ck, peak, now_unix, &mut self_cursors).await {
+                match chia_resolve::read_ck(net, &client, &own_ck, peak, now_unix, &mut self_cursors).await {
                     Ok(found) => {
                         if let Some(newest) = found
                             .iter()
@@ -511,9 +519,9 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     Err(err) => eprintln!("⛓️ ChiaHub watcher: read of our own presence failed: {err:#}"),
                 }
             }
-            let mut live_ck_hints: HashSet<[u8; 32]> = chia_resolve::live_ck_hints(&own_ck, peak).into_iter().collect();
+            let mut live_ck_hints: HashSet<[u8; 32]> = chia_resolve::live_ck_hints(net, &own_ck, peak).into_iter().collect();
             for ck in by_ck.keys() {
-                live_ck_hints.extend(chia_resolve::live_ck_hints(ck, peak));
+                live_ck_hints.extend(chia_resolve::live_ck_hints(net, ck, peak));
             }
             // Bounded and fair: at most MAX_CK_READS_PER_TICK keys per tick, the
             // longest-waiting first. A key passed over keeps its turn (its beat
@@ -532,7 +540,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                     continue;
                 }
                 reads += 1;
-                match chia_resolve::read_ck(&client, &ck, peak, now_unix, &mut ck_cursors).await {
+                match chia_resolve::read_ck(net, &client, &ck, peak, now_unix, &mut ck_cursors).await {
                     Ok(found) => {
                         for f in chia_resolve::rank_and_dedupe(found) {
                             // Routed by signer; a record signed by nobody who
@@ -573,11 +581,11 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // is never read again to correct it (#272 review round 3).
             let mut live_inbox: HashSet<[u8; 32]> = HashSet::new();
             for (room, room_key) in &inbox_rooms {
-                live_inbox.extend(chia_resolve::live_inbox_hints(&own_ck, room_key, peak));
+                live_inbox.extend(chia_resolve::live_inbox_hints(net, &own_ck, room_key, peak));
                 if !sched.due(&inbox_sched_key(room), peak, false) {
                     continue;
                 }
-                match chia_resolve::read_inbox(&agreed, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
+                match chia_resolve::read_inbox(net, &agreed, &kx_secret, &own_ck, room_key, room, peak, now_unix, &mut inbox_cursors).await {
                     Ok(found) => {
                         for f in found {
                             let from = f.item.from.to_string();
@@ -813,7 +821,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
                                             // any height: the hint's cursor must examine that id
                                             // again, and the room's inbox read come forward (round 8).
                                             if let Some((_, room_key)) = inbox_rooms.iter().find(|(r, _)| *r == k.room) {
-                                                forget_inbox_coin(&mut inbox_cursors, &mut sched, &own_ck, room_key, &k.room, k.era, coin.to_bytes());
+                                                forget_inbox_coin(net, &mut inbox_cursors, &mut sched, &own_ck, room_key, &k.room, k.era, coin.to_bytes());
                                             }
                                             changed = true;
                                         }
@@ -1059,8 +1067,10 @@ const SELF_SCHED_KEY: &str = "self";
 /// that id as examined, so the listing would skip it: for good below the height
 /// examined, until the next cycle clears the set above it. The id is forgotten
 /// and the room's inbox read falls due at the next tick instead of the next
-/// beat.
+/// beat. The hint is `net`'s (stage 4 design §3.5), the one it was read under.
+#[allow(clippy::too_many_arguments)]
 fn forget_inbox_coin(
+    net: ChiaNet,
     cursors: &mut HashMap<[u8; 32], HintCursor>,
     sched: &mut BeatSchedule,
     own_ck: &[u8; 32],
@@ -1070,7 +1080,7 @@ fn forget_inbox_coin(
     coin: [u8; 32],
 ) {
     let lane = chia_lane::derive_lane_token(room_key);
-    let hint = chia_lane::derive_inbox_hint(own_ck, &lane, era);
+    let hint = chia_lane::derive_inbox_hint(net, own_ck, &lane, era);
     if let Some(cursor) = cursors.get_mut(&hint) {
         cursor.seen.remove(&coin);
     }
@@ -1183,20 +1193,23 @@ mod tests {
         // same coin id, which the hint's cursor had marked examined.
         let (own_ck, room_key) = ([1u8; 32], [2u8; 32]);
         let lane = chia_lane::derive_lane_token(&room_key);
-        let hint = chia_lane::derive_inbox_hint(&own_ck, &lane, 3);
-        let other = chia_lane::derive_inbox_hint(&own_ck, &lane, 2);
-        let coin = [9u8; 32];
-        let mut cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
-        cursors.entry(hint).or_default().seen.extend([coin, [8u8; 32]]);
-        cursors.entry(other).or_default().seen.insert(coin);
-        let mut sched = BeatSchedule::new(32);
-        assert!(sched.due(&inbox_sched_key("r"), 1_000, false));
-        assert!(!sched.due(&inbox_sched_key("r"), 1_001, false), "read this beat already");
-        forget_inbox_coin(&mut cursors, &mut sched, &own_ck, &room_key, "r", 3, coin);
-        assert!(!cursors[&hint].seen.contains(&coin), "the coin is examined again");
-        assert!(cursors[&hint].seen.contains(&[8u8; 32]), "the others stay examined");
-        assert!(cursors[&other].seen.contains(&coin), "another era's hint is another cursor");
-        assert!(sched.due(&inbox_sched_key("r"), 1_001, false), "the room's inbox read falls due at once");
+        // On each network: the hint forgotten is that network's own (§3.5).
+        for net in ChiaNet::ALL {
+            let hint = chia_lane::derive_inbox_hint(net, &own_ck, &lane, 3);
+            let other = chia_lane::derive_inbox_hint(net, &own_ck, &lane, 2);
+            let coin = [9u8; 32];
+            let mut cursors: HashMap<[u8; 32], HintCursor> = HashMap::new();
+            cursors.entry(hint).or_default().seen.extend([coin, [8u8; 32]]);
+            cursors.entry(other).or_default().seen.insert(coin);
+            let mut sched = BeatSchedule::new(32);
+            assert!(sched.due(&inbox_sched_key("r"), 1_000, false));
+            assert!(!sched.due(&inbox_sched_key("r"), 1_001, false), "read this beat already");
+            forget_inbox_coin(net, &mut cursors, &mut sched, &own_ck, &room_key, "r", 3, coin);
+            assert!(!cursors[&hint].seen.contains(&coin), "{net:?}: the coin is examined again");
+            assert!(cursors[&hint].seen.contains(&[8u8; 32]), "{net:?}: the others stay examined");
+            assert!(cursors[&other].seen.contains(&coin), "{net:?}: another era's hint is another cursor");
+            assert!(sched.due(&inbox_sched_key("r"), 1_001, false), "{net:?}: the room's inbox read falls due at once");
+        }
     }
 
     #[test]

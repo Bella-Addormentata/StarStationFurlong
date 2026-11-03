@@ -110,6 +110,17 @@ impl ChiaNet {
         }
     }
 
+    /// The network's genesis challenge as 32 bytes, in the order its hex
+    /// reads ([`genesis_hex`](Self::genesis_hex)): G of the stage 4 design,
+    /// which the burner root mixes in on every network (§3.2) and the lane's
+    /// network tag appends on mainnet (§3.5, `chia_lane::network_tag`). It is
+    /// public, so holding or appending it hides nothing and needs no wipe.
+    pub fn genesis(self) -> [u8; 32] {
+        let mut g = [0u8; 32];
+        hex::decode_to_slice(self.genesis_hex(), &mut g).expect("a genesis challenge is 64 hex digits (each_network_is_pinned)");
+        g
+    }
+
     /// The port the network's full nodes listen on.
     pub fn port(self) -> u16 {
         match self {
@@ -299,6 +310,7 @@ mod tests {
         for net in ChiaNet::ALL {
             let g = net.genesis_hex();
             assert!(g.len() == 64 && g.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{g}");
+            assert_eq!(hex::encode(net.genesis()), g, "{net:?}: the bytes read as the hex does");
         }
         assert_ne!(t.genesis_hex(), m.genesis_hex());
     }
@@ -308,6 +320,7 @@ mod tests {
     fn the_genesis_is_the_constants_own() {
         for net in ChiaNet::ALL {
             assert_eq!(hex::encode(net.constants().genesis_challenge), net.genesis_hex(), "{net:?}");
+            assert_eq!(net.genesis(), net.constants().genesis_challenge.to_bytes(), "{net:?}: G is the challenge's own bytes");
         }
     }
 

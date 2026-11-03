@@ -1,9 +1,11 @@
 //! ⛓️🥣 The faucet coin — the node side of the faucet dish (issue #231,
 //! onboarding phase beside P8; design note ssf-p2p/faucet-dish-design.md).
 //!
-//! The "volunteer wallet" is a set of coins at ONE puzzle hash per room, locked
-//! by `puzzles/faucet.clsp`. Nobody holds a key for it: the puzzle alone decides
-//! how coins leave — exactly one GIFT per coin per GAP blocks, to whoever submits
+//! The "volunteer wallet" is a set of coins at ONE puzzle hash per room and
+//! network (the room tag carries the network on mainnet, stage 4 design
+//! §3.5: [`FaucetParams::for_room`]), locked by `puzzles/faucet.clsp`.
+//! Nobody holds a key for it: the puzzle alone decides how coins leave —
+//! exactly one GIFT per coin per GAP blocks, to whoever submits
 //! the spend, the rest back to the same puzzle hash, and (for the lobby) no fee
 //! at all: the claimer picks the fee and the claimer is anyone, so a fee cap
 //! would be a per-window burn allowance. Chialisp cannot act on its own and
@@ -67,8 +69,12 @@ pub const GAP_BLOCKS: u32 = 32;
 pub const MAX_FEE_MOJOS: u64 = 0;
 
 /// Domain-separated derivation of the per-room tag curried into the puzzle. It
-/// is one-way: a private room's address reveals nothing about its key.
-const CTX_ROOM_TAG: &str = "ssf-faucet-room-tag-v1";
+/// is one-way: a private room's address reveals nothing about its key. v1 is
+/// testnet11's tag, of the room key alone, so every testnet11 dish keeps the
+/// address it always had; v2 is mainnet's, of the room key and the network's
+/// tag ([`FaucetParams::for_room`], stage 4 design §3.5).
+const CTX_ROOM_TAG_V1: &str = "ssf-faucet-room-tag-v1";
+const CTX_ROOM_TAG_V2: &str = "ssf-faucet-room-tag-v2";
 
 /// GIVE's refusal on a network that is not a test network, and the
 /// status's note there.
@@ -87,9 +93,9 @@ pub const MAINNET_NO_TAKE: &str = "On mainnet the dish gives no mojo to this nod
 pub const MAINNET_NO_ROOM_DISH: &str = "On mainnet nobody takes from a room's own dish, since that would tie its takers to the room.";
 
 /// Why no claim may be made at this dish on `net`, whoever it pays: off a
-/// test network, any dish but the lobby's ([`MAINNET_NO_ROOM_DISH`]).
+/// test network, any dish but `net`'s own lobby dish ([`MAINNET_NO_ROOM_DISH`]).
 pub fn dish_claim_refusal(net: ChiaNet, params: &FaucetParams) -> Option<&'static str> {
-    (!net.is_test() && !params.is_lobby()).then_some(MAINNET_NO_ROOM_DISH)
+    (!net.is_test() && !params.is_lobby(net)).then_some(MAINNET_NO_ROOM_DISH)
 }
 
 /// Why TAKE A MOJO into the SSF wallet is refused at this dish on `net`:
@@ -109,25 +115,27 @@ pub struct FaucetParams {
 }
 
 impl FaucetParams {
-    /// The room's faucet, v1 parameters. The welcome lobby's key ships in every
-    /// build, so its address is the same for everyone — public by design.
-    pub fn for_room(room_key: &[u8; 32]) -> Self {
+    /// The room's faucet on `net`, v1 parameters. The welcome lobby's key
+    /// ships in every build, so its address on a network is the same for
+    /// everyone — public by design — and each network has its own.
+    pub fn for_room(net: ChiaNet, room_key: &[u8; 32]) -> Self {
         Self {
-            room_tag: blake3::derive_key(CTX_ROOM_TAG, room_key).into(),
+            room_tag: room_tag(net, room_key).into(),
             gift: GIFT_MOJOS,
             gap: GAP_BLOCKS,
             max_fee: MAX_FEE_MOJOS,
         }
     }
 
-    /// The lobby dish: the one whose room key ships in every build (the
-    /// welcome room, `chia_rooms::BUNDLED_ROOM_KEYS_B64`). Every other dish
-    /// is a room's own.
-    pub fn is_lobby(&self) -> bool {
+    /// The lobby dish of `net`: the one whose room key ships in every build
+    /// (the welcome room, `chia_rooms::BUNDLED_ROOM_KEYS_B64`), at that
+    /// network's address. Every other dish is a room's own, and so is the
+    /// other network's lobby dish: its tag is the other network's.
+    pub fn is_lobby(&self, net: ChiaNet) -> bool {
         crate::chia_rooms::BUNDLED_ROOM_KEYS_B64
             .iter()
             .filter_map(|b64| crate::chia_rooms::decode_room_key(b64))
-            .any(|key| Self::for_room(&key) == *self)
+            .any(|key| Self::for_room(net, &key) == *self)
     }
 
     /// Puzzle hash = address of this room's faucet (tree hash of the curried
@@ -143,7 +151,9 @@ impl FaucetParams {
 
     /// The address form of [`Self::puzzle_hash`] on `net` (`txch1…` on
     /// testnet11): what the dish prints so a donor can pay into it from any
-    /// Chia wallet. The puzzle hash is the same on every network.
+    /// Chia wallet. The prefix is the only part of the address `net` gives
+    /// here; a room's puzzle hash already differs by network, through the
+    /// tag [`Self::for_room`] curries in (stage 4 design §3.5).
     pub fn address(&self, net: ChiaNet) -> String {
         bech32m::encode(net.prefix(), &self.puzzle_hash())
     }
@@ -157,6 +167,28 @@ impl FaucetParams {
         }
         .to_clvm(a)
         .map_err(|e| anyhow!("curry faucet puzzle: {e:?}"))
+    }
+}
+
+/// The tag a room's dish curries in on `net` (stage 4 design §3.5). On
+/// testnet11 it is `derive_key("ssf-faucet-room-tag-v1", room_key)`, as it
+/// always was, so every testnet11 dish keeps its address. On mainnet it is
+/// `derive_key("ssf-faucet-room-tag-v2", room_key ‖ G)`, G the network tag
+/// (`chia_lane::network_tag`, mainnet's genesis challenge), so the lobby
+/// dish of mainnet is not testnet11's: the dish's address is no longer the
+/// same on every network, and a claim on one chain says nothing of the
+/// other. Both fields are 32 bytes. The mod hash and the puzzle do not
+/// change. Mainnet has no lobby coin yet (it waits for this tag, §13), so
+/// no coin is left at the untagged address and no migration is owed.
+fn room_tag(net: ChiaNet, room_key: &[u8; 32]) -> [u8; 32] {
+    match crate::chia_lane::network_tag(net) {
+        None => blake3::derive_key(CTX_ROOM_TAG_V1, room_key),
+        Some(g) => {
+            let mut material = [0u8; 64];
+            material[..32].copy_from_slice(room_key);
+            material[32..].copy_from_slice(&g);
+            blake3::derive_key(CTX_ROOM_TAG_V2, &material)
+        }
     }
 }
 
@@ -508,7 +540,7 @@ pub async fn handle_request(ctx: &FaucetContext<'_>, room: &str, payload: &[u8])
             "the node has no key for this room yet (the browser sends it when it connects); try again in a moment",
         );
     };
-    let params = FaucetParams::for_room(&room_key);
+    let params = FaucetParams::for_room(ctx.net, &room_key);
     let client = crate::chia_chain::connect();
     let result = match req.op.as_str() {
         "status" => status(ctx, &client, &params).await.map(|s| FaucetReply {
@@ -1132,11 +1164,16 @@ mod tests {
         FaucetParams { room_tag: Bytes32::new([7u8; 32]), gift: GIFT_MOJOS, gap: GAP_BLOCKS, max_fee: MAX_FEE_MOJOS }
     }
 
-    /// The lobby dish itself: the welcome room's, whose key ships in every
-    /// build.
-    fn lobby_params() -> FaucetParams {
-        let key = crate::chia_rooms::decode_room_key(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64[0]).unwrap();
-        FaucetParams::for_room(&key)
+    /// The lobby dish itself on `net`: the welcome room's, whose key ships in
+    /// every build.
+    fn lobby_params(net: ChiaNet) -> FaucetParams {
+        FaucetParams::for_room(net, &lobby_key())
+    }
+
+    /// The welcome room's key, the one `chia_rooms::BUNDLED_ROOM_KEYS_B64`
+    /// ships.
+    fn lobby_key() -> [u8; 32] {
+        crate::chia_rooms::decode_room_key(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64[0]).unwrap()
     }
 
     /// A private-room dish that allows a fee, to exercise the fee arithmetic.
@@ -1191,6 +1228,9 @@ mod tests {
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "spent coins asked for, so the spend can be seen");
     }
 
+    /// The mod hash is the one origin/main's code gave before the network
+    /// tag (247bc685): the tag goes into the curried room tag alone, never
+    /// into the module (stage 4 design §3.5).
     #[test]
     fn mod_hash_is_pinned() {
         let mut a = Allocator::new();
@@ -1447,7 +1487,7 @@ mod tests {
             // Stage 4 design §4.5 (4) and (5): the network's part then turns
             // TAKE off too, and its word replaces the wallet's, at the
             // lobby's dish and at a room's own.
-            for params in [lobby_params(), test_params()] {
+            for params in [lobby_params(ChiaNet::Mainnet), test_params()] {
                 let (give, take, note) = network_part(ChiaNet::Mainnet, &params, m.can_give, m.can_claim, m.note.clone());
                 assert!(!give && !take, "{note}");
                 assert_eq!(note, format!("{} {MAINNET_NO_GIVE}", take_refusal(ChiaNet::Mainnet, &params).unwrap()));
@@ -1571,7 +1611,7 @@ mod tests {
         use chia_sdk_utils::Address;
         use clvmr::serde::node_to_bytes;
 
-        let params = FaucetParams::for_room(&[3u8; 32]);
+        let params = FaucetParams::for_room(T11, &[3u8; 32]);
         let ph = params.puzzle_hash();
         assert_eq!(params.address(T11), Address::new(ph, "txch".to_string()).encode().unwrap());
 
@@ -1631,14 +1671,14 @@ mod tests {
             assert_eq!(back, st);
         }
         // Testnet11 is as it was, at the lobby's dish and at a room's own.
-        for dish in [lobby_params(), params] {
+        for dish in [lobby_params(T11), params] {
             assert_eq!(network_part(ChiaNet::Testnet11, &dish, true, true, String::new()), (true, true, String::new()));
             assert_eq!(network_part(ChiaNet::Testnet11, &dish, false, true, "x".into()), (false, true, "x".to_string()));
             assert_eq!(network_part(ChiaNet::Testnet11, &dish, true, false, "y".into()), (true, false, "y".to_string()));
         }
         // Mainnet offers neither, and says why in its own words, the
         // wallet's left out (stage 4 design §4.5 (4) and (5)).
-        let (give, take, note) = network_part(ChiaNet::Mainnet, &lobby_params(), true, true, "no mojo in the dish yet".into());
+        let (give, take, note) = network_part(ChiaNet::Mainnet, &lobby_params(ChiaNet::Mainnet), true, true, "no mojo in the dish yet".into());
         assert!(!give && !take);
         assert_eq!(note, "On mainnet the dish gives no mojo to this node's wallet. On mainnet the dish does not take gifts from this node.");
         let (give, take, note) = network_part(ChiaNet::Mainnet, &params, true, true, String::new());
@@ -1651,15 +1691,15 @@ mod tests {
 
     /// 🛑 Stage 4 design §4.5 (4) and (5), on both networks: TAKE into the
     /// SSF wallet is refused off a test network, and a claim at a room's own
-    /// dish is refused there whoever it pays; only the lobby's dish is the
-    /// lobby. A test network refuses neither.
+    /// dish is refused there whoever it pays; only the network's own lobby
+    /// dish is the lobby. A test network refuses neither.
     #[test]
     fn off_a_test_network_take_and_every_room_dish_claim_are_refused() {
-        let lobby = lobby_params();
         let room = test_params();
-        assert!(lobby.is_lobby());
-        assert!(!room.is_lobby() && !FaucetParams::for_room(&[3u8; 32]).is_lobby());
         for net in ChiaNet::ALL {
+            let lobby = lobby_params(net);
+            assert!(lobby.is_lobby(net), "{net:?}");
+            assert!(!room.is_lobby(net) && !FaucetParams::for_room(net, &[3u8; 32]).is_lobby(net), "{net:?}");
             if net.is_test() {
                 for dish in [&lobby, &room] {
                     assert_eq!(take_refusal(net, dish), None, "{net:?}");
@@ -1670,6 +1710,10 @@ mod tests {
                 assert_eq!(take_refusal(net, &lobby), Some(MAINNET_NO_TAKE));
                 assert_eq!(dish_claim_refusal(net, &room), Some(MAINNET_NO_ROOM_DISH), "whoever the claim pays");
                 assert_eq!(take_refusal(net, &room), Some(MAINNET_NO_ROOM_DISH), "the dish's refusal comes first");
+                // testnet11's lobby dish is another address here (§3.5), so
+                // it is no lobby of this network's: a room's own, refused.
+                let other = lobby_params(ChiaNet::Testnet11);
+                assert_eq!(dish_claim_refusal(net, &other), Some(MAINNET_NO_ROOM_DISH), "another network's lobby");
             }
         }
         for text in [MAINNET_NO_TAKE, MAINNET_NO_ROOM_DISH] {
@@ -1699,7 +1743,7 @@ mod tests {
         };
         for held in [true, false] {
             let take = |dish: &FaucetParams| rt.block_on(claim(&ctx(ChiaNet::Mainnet, held), &chain, dish)).unwrap_err().to_string();
-            assert_eq!(take(&lobby_params()), MAINNET_NO_TAKE, "held {held}");
+            assert_eq!(take(&lobby_params(ChiaNet::Mainnet)), MAINNET_NO_TAKE, "held {held}");
             assert_eq!(take(&test_params()), MAINNET_NO_ROOM_DISH, "held {held}");
         }
         // Testnet11, with no wallet on: past the network check, the wallet's
@@ -1780,7 +1824,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let lobby_note = "On mainnet the dish gives no mojo to this node's wallet. On mainnet the dish does not take gifts from this node.";
         let room_note = "On mainnet nobody takes from a room's own dish, since that would tie its takers to the room. On mainnet the dish does not take gifts from this node.";
-        for (params, note) in [(lobby_params(), lobby_note), (test_params(), room_note)] {
+        for (params, note) in [(lobby_params(ChiaNet::Mainnet), lobby_note), (test_params(), room_note)] {
             let coin = FaucetCoin { coin: Coin::new(Bytes32::new([1u8; 32]), params.puzzle_hash(), 1000), confirmed_height: 100 };
             let record = crate::chia_chain::CoinRecord { coin: coin.coin, confirmed_block_index: 100, spent: false, spent_block_index: 0 };
             let page = crate::chia_chain::CoinListing { records: vec![record], truncated: false, next_cursor: None, judged_at: None };
@@ -1816,7 +1860,7 @@ mod tests {
     #[cfg(feature = "chia-publish")]
     #[test]
     fn a_mainnet_status_with_a_wallet_on_offers_no_take_or_give() {
-        let params = lobby_params();
+        let params = lobby_params(ChiaNet::Mainnet);
         let sk = chia_bls::SecretKey::from_seed(&[6u8; 32]);
         let listing = |records: Vec<crate::chia_chain::CoinRecord>| crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at: None };
         let ours = Coin::new(Bytes32::new([2u8; 32]), crate::chia_publish::our_puzzle_hash(&sk), 5_000);
@@ -1897,5 +1941,124 @@ mod tests {
         assert_eq!(err, "a gift below 1 mojo(s) could never leave the jar");
         #[cfg(not(feature = "chia-publish"))]
         assert_eq!(err, "this node was built without publishing; it cannot give");
+    }
+
+    // ── The network tag (stage 4 design §3.5; §12, "Network tag") ──────────
+
+    /// The room key the dish vectors take besides the lobby's: test bytes,
+    /// nobody's room.
+    const ROOM_KEY: [u8; 32] = [0x33; 32];
+
+    /// One dish on one network: the room tag curried in, the puzzle hash,
+    /// and the address on that network.
+    struct PinnedDish {
+        net: ChiaNet,
+        lobby: bool,
+        tag: &'static str,
+        puzzle_hash: &'static str,
+        address: &'static str,
+    }
+
+    /// The lobby's dish and `ROOM_KEY`'s on each network. The testnet11 rows
+    /// were printed by origin/main's own code (247bc685, the tree before the
+    /// tag) by a test that was then removed, and copied here: they pin that
+    /// the tag moved no testnet11 dish. The mainnet rows were printed by
+    /// this file's code once the tag came in, and pin mainnet's dishes from
+    /// here on; `mainnets_room_tag_is_the_v2_derivation_of_the_room_key_and_g`
+    /// checks them against §3.5's line.
+    const DISHES: [PinnedDish; 4] = [
+        PinnedDish {
+            net: ChiaNet::Testnet11,
+            lobby: true,
+            tag: "86db52c8cdda21832d9dfea1ebafca76e4778c32c9abc3c408cc47fe2d927f9b",
+            puzzle_hash: "beff638c986f5ccf22f30373c7967c5255f27d51d549a1938f53554922a4395f",
+            address: "txch1hmlk8rycdawv7ghnqdeu09nu2f2lyl2364y6ryu02d25jg4y890sxaqv8j",
+        },
+        PinnedDish {
+            net: ChiaNet::Testnet11,
+            lobby: false,
+            tag: "bce8be46af5b3612eba7df170cd7999c559ffa75b180ac9ada9e836f67470290",
+            puzzle_hash: "1164da9001df700fdc8e78edb17946f7a523a8b5e6a4eb7bd5cc08062b2fc3b8",
+            address: "txch1z9jd4yqpmacqlhyw0rkmz72x77jj8294u6jwk774esyqv2e0cwuq2hy7hv",
+        },
+        PinnedDish {
+            net: ChiaNet::Mainnet,
+            lobby: true,
+            tag: "50a1ca66900b25316c5a7ac9f932e4821ae043fc5016201102868fca5720bdc5",
+            puzzle_hash: "cd0f2f4d727b9bbda146932688936f00539d45d7f985da56ae740cd07646c4d6",
+            address: "xch1e58j7ntj0wdmmg2xjvng3ym0qpfe63whlxza544wwsxdqajxcntqwuzmp6",
+        },
+        PinnedDish {
+            net: ChiaNet::Mainnet,
+            lobby: false,
+            tag: "c8c23fbf59e0dba22f286c9a68c1d5e27fcfeaa817429350403bc002069361ac",
+            puzzle_hash: "f8b189fe85743d2533a6fbb86769213c1b923d4a7869d74dcf3886e5c0025caa",
+            address: "xch1lzccnl59ws7j2vaxlwuxw6fp8sdey0220p5awnw08zrwtsqztj4qc8xd0e",
+        },
+    ];
+
+    /// §12 Network tag: testnet11's lobby dish and a room's are where
+    /// origin/main put them, and mainnet's are their own (see [`DISHES`] for
+    /// where each row came from).
+    #[test]
+    fn each_networks_dishes_match_the_pinned_vectors() {
+        assert_eq!(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64.len(), 1, "one welcome room, whose dish is the lobby's");
+        for d in &DISHES {
+            let key = if d.lobby { lobby_key() } else { ROOM_KEY };
+            let params = FaucetParams::for_room(d.net, &key);
+            assert_eq!(hex::encode(params.room_tag), d.tag, "{:?} lobby={}: tag", d.net, d.lobby);
+            assert_eq!(hex::encode(params.puzzle_hash()), d.puzzle_hash, "{:?} lobby={}: puzzle hash", d.net, d.lobby);
+            assert_eq!(params.address(d.net), d.address, "{:?} lobby={}: address", d.net, d.lobby);
+            assert_eq!((params.gift, params.gap, params.max_fee), (GIFT_MOJOS, GAP_BLOCKS, MAX_FEE_MOJOS), "only the tag is the network's");
+        }
+    }
+
+    /// §3.5's line recomputed with blake3's incremental hasher and the
+    /// contexts as the design writes them: on testnet11 the tag is
+    /// `derive_key("ssf-faucet-room-tag-v1", room_key)`, on mainnet
+    /// `derive_key("ssf-faucet-room-tag-v2", room_key ‖ G)`, for the lobby and
+    /// a few other rooms. Mainnet's tag, and so its puzzle hash, differs from
+    /// testnet11's for every one of them, no two dishes of the grid share an
+    /// address, and the module is the same one: the curried reveal still
+    /// hashes to the puzzle hash.
+    #[test]
+    fn mainnets_room_tag_is_the_v2_derivation_of_the_room_key_and_g() {
+        let g = ChiaNet::Mainnet.genesis();
+        let mut seen: HashMap<Bytes32, String> = HashMap::new();
+        for room in [lobby_key(), ROOM_KEY, [0u8; 32], [0xff; 32]] {
+            let t11 = FaucetParams::for_room(ChiaNet::Testnet11, &room);
+            let main = FaucetParams::for_room(ChiaNet::Mainnet, &room);
+            let v1: [u8; 32] = blake3::Hasher::new_derive_key("ssf-faucet-room-tag-v1").update(&room).finalize().into();
+            let v2: [u8; 32] = blake3::Hasher::new_derive_key("ssf-faucet-room-tag-v2").update(&room).update(&g).finalize().into();
+            assert_eq!(t11.room_tag, Bytes32::new(v1), "testnet11, room {:02x}", room[0]);
+            assert_eq!(main.room_tag, Bytes32::new(v2), "mainnet, room {:02x}", room[0]);
+            assert_ne!(main.room_tag, t11.room_tag, "room {:02x}", room[0]);
+            for (net, params) in [(ChiaNet::Testnet11, t11), (ChiaNet::Mainnet, main)] {
+                let name = format!("{net:?} room {:02x}", room[0]);
+                if let Some(before) = seen.insert(params.puzzle_hash(), name.clone()) {
+                    panic!("{name} and {before} share a dish");
+                }
+                let mut a = Allocator::new();
+                let reveal = params.puzzle_reveal(&mut a).unwrap();
+                assert_eq!(Bytes32::from(tree_hash(&a, reveal)), params.puzzle_hash(), "{name}");
+            }
+        }
+        assert_eq!(hex::encode(FAUCET_MOD_HASH), "2e17deb872ddcbdfde5af2eb1f2471407e556ae2ba3d5d3afad6fd5f5e30816e", "the module is unchanged");
+    }
+
+    /// The lobby on each network is that network's own lobby dish; the other
+    /// network's lobby dish, a room's dish and a fixed-tag dish are not, so
+    /// mainnet's claim rule (`dish_claim_refusal`) admits mainnet's lobby
+    /// dish alone.
+    #[test]
+    fn the_lobby_is_the_lobby_of_its_own_network_alone() {
+        for net in ChiaNet::ALL {
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            assert!(lobby_params(net).is_lobby(net), "{net:?}");
+            assert!(!lobby_params(other).is_lobby(net), "{net:?}: {other:?}'s lobby dish");
+            assert!(!FaucetParams::for_room(net, &ROOM_KEY).is_lobby(net), "{net:?}: a room's own dish");
+            assert!(!test_params().is_lobby(net), "{net:?}: a fixed tag");
+            assert_ne!(lobby_params(net), lobby_params(other), "{net:?}: one lobby dish per network");
+        }
     }
 }
