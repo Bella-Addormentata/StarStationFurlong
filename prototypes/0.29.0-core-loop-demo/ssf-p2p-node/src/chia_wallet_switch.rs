@@ -246,8 +246,12 @@ pub fn remember(path: &Path, on: bool, now: u64) -> std::io::Result<()> {
 
 /// Remember the switch off, for the Bank's TURN OFF: `Ok(true)` when the
 /// file was written. While Chia is off on this computer (`strict`) a missing
-/// file already reads as off ([`remembered`]), so none is created; one an
-/// earlier run left is still saved off, for the next start with Chia on.
+/// file already reads as off ([`remembered`]), so none is created. An
+/// existing `chia_wallet.json` is still saved off under `SSF_NO_CHIA_LANE`,
+/// and that is deliberate: the player's off then holds at the next start
+/// without `SSF_NO_CHIA_LANE`. If that save fails, the Bank's route reads
+/// the file back to say what it now holds ([`after_failed_save`]). So with
+/// Chia off, a TURN OFF still writes this Chia file, and may read it.
 #[cfg(feature = "chia-publish")]
 pub fn remember_off(path: &Path, strict: bool, now: u64) -> std::io::Result<bool> {
     if strict && !path.try_exists().unwrap_or(true) {

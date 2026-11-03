@@ -6500,7 +6500,8 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         why
     };
     if !on {
-        // While Chia is off no switch file is created (`remember_off`).
+        // While Chia is off no switch file is created, but one an earlier
+        // run left is saved off, on purpose (`remember_off`).
         let strict = chia_strict::strict();
         if let Err(e) = chia_wallet_switch::remember_off(switch_path, strict, now) {
             return Err(failed_save(false, e, ""));
