@@ -10,12 +10,14 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "build:fold": "node scripts/build-fold-bundle.mjs",
     "fetch:emulatorjs": "node scripts/fetch-emulatorjs.mjs",
     "pack:emulatorjs-source": "node scripts/pack-emulatorjs-source.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/three": "^0.167.2",
+    "esbuild": "0.25.12",
     "jsqr": "^1.4.0",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
