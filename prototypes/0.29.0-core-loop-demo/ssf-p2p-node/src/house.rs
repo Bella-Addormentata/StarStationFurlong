@@ -171,7 +171,7 @@ pub const VISIT_BYTES: usize = 64;
 /// a longer one is no record's, and nothing reads its bytes.
 pub const MAX_KEY_BYTES: usize = 1_024;
 
-const CASINO_MAP: &str = "casino";
+pub(crate) const CASINO_MAP: &str = "casino";
 pub(crate) const COMPUTED_MAP: &str = "casinoComputed";
 
 // ── Shapes (computedFold / computedHouse guards, as far as the house reads) ──

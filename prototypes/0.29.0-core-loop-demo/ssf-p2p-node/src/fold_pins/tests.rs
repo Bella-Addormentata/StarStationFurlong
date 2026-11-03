@@ -118,15 +118,15 @@ fn a_player_first_seen_as_a_replacement_is_pinned_to_the_key_replaced_and_unsett
     assert!(!p.view().1);
     // The state's own rule, with no first seen: the replaced key is the pin.
     let mut st = PinState::default();
-    st.learn("carol", Some("A"), Some("B"));
+    st.learn("carol", Key::Pin("A"), Key::Pin("B"));
     assert_eq!(st.pins.get("carol").map(String::as_str), Some("A"));
     assert!(st.contested);
     let mut st = PinState::default();
-    st.learn("carol", Some("A"), Some("A"));
+    st.learn("carol", Key::Pin("A"), Key::Pin("A"));
     assert!(!st.contested, "the same key again");
     let mut st = PinState::default();
-    st.learn("carol", None, Some("B"));
-    st.learn("carol", None, Some("B"));
+    st.learn("carol", Key::None, Key::Pin("B"));
+    st.learn("carol", Key::None, Key::Pin("B"));
     assert!(!st.contested);
 }
 
@@ -336,4 +336,133 @@ fn a_callback_that_panicked_leaves_the_pins_as_they_were() {
     assert!(r.is_err());
     put(&doc, "bob", "B");
     assert_eq!(p.view().0.len(), 2, "the poisoned lock is used as it stands");
+}
+
+// ── Review round 3 ───────────────────────────────────────────────────────────
+
+/// An entry with a `__proto__` field, as a peer can write one: a page reads `v.keyB64` with a property
+/// access, which a prototype the field sets can answer, and the node reads the entry's own fields.
+fn entry_with_proto(key: &str) -> Any {
+    let mut m = HashMap::new();
+    m.insert("keyB64".to_string(), Any::String(key.into()));
+    m.insert("__proto__".to_string(), Any::Map(Arc::new(HashMap::new())));
+    Any::Map(Arc::new(m))
+}
+
+/// What a page makes of such an entry cannot be told from the doc, so the pins are not the whole story.
+#[test]
+fn an_entry_with_a_proto_field_leaves_the_pins_unsettled_whenever_the_node_sees_it() {
+    // Coming after the watch ...
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put_any(&doc, "alice", entry_with_proto("A"));
+    let (pins, settled) = p.view();
+    assert!(!settled);
+    assert!(pins.is_empty(), "(and no key is pinned from it)");
+    put(&doc, "bob", "B");
+    assert!(!p.view().1, "and it stays so");
+    // ... there before ...
+    let doc = Doc::new();
+    put_any(&doc, "alice", entry_with_proto("A"));
+    assert!(!PlayerPins::attach(&doc, PIN_WALK_KEYS).view().1);
+    // ... a clean entry replaced by one ...
+    let doc = Doc::new();
+    put(&doc, "alice", "A");
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    assert!(p.view().1);
+    put_any(&doc, "alice", entry_with_proto("A"));
+    assert!(!p.view().1);
+    // ... and one that has it replaced by a clean one.
+    let doc = Doc::new();
+    put_any(&doc, "alice", entry_with_proto("A"));
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put(&doc, "alice", "A");
+    assert!(!p.view().1);
+}
+
+/// The ambiguity is a player's: a name the pages do not pin is nothing to doubt, and an entry with other
+/// extra fields is a plain entry.
+#[test]
+fn only_a_proto_field_of_a_player_the_pages_pin_is_doubted() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put_any(&doc, "", entry_with_proto("A"));
+    put_any(&doc, &"x".repeat(129), entry_with_proto("A"));
+    assert!(p.view().1, "a name of no pin");
+    let mut m = HashMap::new();
+    m.insert("keyB64".to_string(), Any::String("B".into()));
+    m.insert("name".to_string(), Any::String("n".into()));
+    m.insert("_proto_".to_string(), Any::Null);
+    put_any(&doc, "bob", Any::Map(Arc::new(m)));
+    let (pins, settled) = p.view();
+    assert!(settled);
+    assert_eq!(pins, vec![("bob".to_string(), "B".to_string())]);
+}
+
+/// A player who went before the watch had read the map was seen by the pages, and pinned as they pinned
+/// him: the key of the entry that goes is his pin. (The window is small: the watch is on before the walk;
+/// but a player removed in it, or one past a walk that fell short, is learned from the removal.)
+#[test]
+fn a_player_removed_before_the_walk_reached_him_is_pinned_to_the_key_he_had() {
+    let doc = Doc::new();
+    put(&doc, "alice", "A");
+    let mut p = PlayerPins::attach(&doc, 0);
+    remove(&doc, "alice");
+    assert_eq!(pins_of(&mut p), BTreeMap::from([("alice".to_string(), "A".to_string())]));
+    // The state's own rule: the key of the entry that goes is the pin when there is none, and moves nothing when there is.
+    let mut st = PinState::default();
+    st.learn("bob", Key::Pin("B"), Key::None);
+    assert_eq!(st.pins.get("bob").map(String::as_str), Some("B"));
+    assert!(!st.contested);
+    let (version, epoch) = (st.version, st.epoch);
+    st.learn("bob", Key::Pin("B"), Key::None);
+    st.learn("bob", Key::None, Key::None);
+    assert_eq!((st.version, st.epoch), (version, epoch), "learned once");
+    // An entry that goes with no key a page would pin is nothing.
+    st.learn("carol", Key::None, Key::None);
+    assert!(!st.pins.contains_key("carol"));
+}
+
+/// The epoch moves with what a view says, and with nothing else: a table shown whole while the pins stood
+/// at one epoch is not shown whole at another.
+#[test]
+fn the_epoch_moves_with_a_pin_and_with_the_pins_ceasing_to_be_the_whole_story_and_with_nothing_else() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    let e0 = watch.epoch();
+    assert_eq!(p.view_at().2, e0);
+    put(&doc, "alice", "A");
+    let e1 = watch.epoch();
+    assert!(e1 > e0, "a pin");
+    assert_eq!(p.view_at().2, e1, "(the epoch of the view is the one the pins were read at)");
+    put(&doc, "alice", "A");
+    put(&doc, "bob", "");
+    remove(&doc, "alice");
+    assert_eq!(watch.epoch(), e1, "the same key, a key no page pins, a player who goes: nothing the view says");
+    put(&doc, "alice", "B");
+    let e2 = watch.epoch();
+    assert!(e2 > e1, "a key replaced");
+    put(&doc, "alice", "C");
+    assert_eq!(watch.epoch(), e2, "(unsettled already)");
+    // An entry that makes the pins doubtful, and the cap.
+    let doc = Doc::new();
+    let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    let e0 = watch.epoch();
+    put_any(&doc, "alice", entry_with_proto("A"));
+    assert!(watch.epoch() > e0, "an entry that cannot be read as the pages read it");
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    for i in 0..MAX_FOLD_PINS {
+        put(&doc, &format!("p{i:05}"), "k");
+    }
+    let before = watch.epoch();
+    put(&doc, "one-too-many", "k");
+    assert!(watch.epoch() > before, "the cap reached");
+    let at_cap = watch.epoch();
+    put(&doc, "another", "k");
+    assert_eq!(watch.epoch(), at_cap);
+    let _ = p.view();
 }

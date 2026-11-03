@@ -1712,3 +1712,250 @@ fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
         assert!(compared > 10, "seed {seed}: {compared}");
     }
 }
+
+// ── Review round 3 ───────────────────────────────────────────────────────────
+
+/// A doc built as a page builds its own, with a client id of its own, and the updates that carry its work to another.
+struct Page {
+    doc: Doc,
+}
+
+impl Page {
+    fn new(client: u64) -> Page {
+        Page { doc: Doc::with_client_id(client) }
+    }
+
+    /// Everything the page has done since `since`, as an update.
+    fn diff_since(&self, since: &yrs::StateVector) -> Vec<u8> {
+        self.doc.transact().encode_diff_v1(since)
+    }
+
+    fn state(&self) -> yrs::StateVector {
+        self.doc.transact().state_vector()
+    }
+
+    fn apply(&self, update: &[u8]) {
+        use yrs::updates::decoder::Decode;
+        self.doc.transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+    }
+
+    fn session(&self, name: &str, records: &[(String, CVal)]) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let m = comp.insert(&mut txn, name, MapPrelim::default());
+        for (k, v) in records {
+            m.insert(&mut txn, k.as_str(), to_any(v));
+        }
+    }
+
+    fn put(&self, ses: &str, key: &str, v: &CVal) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, to_any(v));
+    }
+
+    fn trim(&self, old: &str, base: &CVal, next: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), to_any(base));
+        comp.remove(&mut txn, old);
+        comp.insert(&mut txn, next, MapPrelim::default());
+    }
+}
+
+/// The page that wrote a record the node never got trims the session that holds it: the node is told to
+/// delete what it was not sent, and what the page counted is more than it has read (and more than it will).
+#[test]
+fn a_trim_that_deletes_records_the_node_was_never_sent_says_it_is_unread() {
+    for gap in [true, false] {
+        let first = Page::new(1);
+        first.session(&live0(), &records(&[(1, 10)]));
+        let sent = first.diff_since(&yrs::StateVector::default());
+        let mut f = Fix::empty();
+        let second = Page::new(2);
+        second.apply(&sent);
+        {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&sent).unwrap()).unwrap();
+        }
+        f.drain();
+        f.take();
+        // The first page writes a close; the second reads it and trims the session.
+        let before = first.state();
+        first.put(&live0(), &rk(1, 2), &rv(1, 20));
+        let close = first.diff_since(&before);
+        second.apply(&close);
+        if !gap {
+            // (This time the node is sent it, and reads it, before the trim.)
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&close).unwrap()).unwrap();
+            f.drain();
+            f.take();
+        }
+        let before = second.state();
+        let base = cp(2);
+        second.trim(&live0(), &base, &live_of(T, Some(&base)));
+        let trim = second.diff_since(&before);
+        {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+        }
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (false, gap), "gap={gap}: the doc waits for what the trim deleted exactly when it was not sent it, and for no update");
+        f.drain();
+        assert_eq!(f.state().generation, 1 + 1, "gap={gap}: (the base moved)");
+        assert_eq!(f.state().unread_at_trim, gap, "gap={gap}");
+        assert_eq!(f.state().trims, 1);
+        // What was lacking comes, and the next trim is not marked by the last. (While the doc still lacks it, every trim is.)
+        if gap {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&close).unwrap()).unwrap();
+            assert!(f.doc.transact().store().pending_ds().is_none(), "the delete set is applied when the blocks it names come");
+        }
+        f.drain();
+        f.take();
+        let next = live_of(T, Some(&base));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!(f.state().trims, 2);
+        assert!(!f.state().unread_at_trim, "gap={gap}: the lag of the first trim is not the second's");
+    }
+}
+
+/// The doc can lack more than what a trim deletes: an update it was sent and cannot apply yet, for
+/// want of what its page had (here a record into a session of another table that the node was not sent).
+#[test]
+fn a_trim_that_comes_while_the_doc_waits_for_an_update_says_it_is_unread() {
+    let maker = Page::new(6);
+    maker.session("ses:other:x:y", &[]);
+    let other = maker.diff_since(&yrs::StateVector::default());
+    let writer = Page::new(5);
+    writer.apply(&other);
+    let before = writer.state();
+    writer.put("ses:other:x:y", &rk(1, 1), &rv(1, 10));
+    let orphan = writer.diff_since(&before);
+    // The table's own page work, which needs nothing the node lacks.
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let session = first.diff_since(&yrs::StateVector::default());
+    let trimmer = Page::new(3);
+    trimmer.apply(&session);
+    let before = trimmer.state();
+    let base = cp(2);
+    trimmer.trim(&live0(), &base, &live_of(T, Some(&base)));
+    let trim = trimmer.diff_since(&before);
+    for waits in [true, false] {
+        use yrs::updates::decoder::Decode;
+        let mut f = Fix::empty();
+        {
+            let mut txn = f.doc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(&session).unwrap()).unwrap();
+            if waits {
+                txn.apply_update(yrs::Update::decode_v1(&orphan).unwrap()).unwrap();
+            }
+        }
+        f.drain();
+        f.take();
+        f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (waits, false), "waits={waits}: the doc waits for an update, and not for anything the trim deleted");
+        f.drain();
+        assert_eq!(f.state().unread_at_trim, waits, "waits={waits}");
+    }
+}
+
+/// A lag noted for a table that is no longer mirrored is forgotten: the table, mirrored again, is read afresh.
+#[test]
+fn the_lag_noted_for_a_table_no_longer_mirrored_is_not_held_against_it_when_it_comes_back() {
+    use yrs::updates::decoder::Decode;
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let session = first.diff_since(&yrs::StateVector::default());
+    let second = Page::new(2);
+    second.apply(&session);
+    let before = first.state();
+    first.put(&live0(), &rk(1, 2), &rv(1, 20));
+    second.apply(&first.diff_since(&before));
+    let before = second.state();
+    let base = cp(2);
+    second.trim(&live0(), &base, &live_of(T, Some(&base)));
+    let trim = second.diff_since(&before);
+    let mut f = Fix::empty();
+    f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&session).unwrap()).unwrap();
+    f.drain();
+    f.take();
+    // The trim comes (and the doc lacks what it deleted): the lag is noted, and the table is let go of before it is read.
+    f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+    f.m.want(&[]);
+    f.drain();
+    f.m.want(&[(T.into(), INC.into())]);
+    f.drain();
+    assert!(f.state().settled);
+    assert!(!f.state().unread_at_trim, "the table is read afresh, from a base that is its first");
+}
+
+/// A checkpoint that comes first to a table, or again as it was, is no trim; each one that changes the base is.
+#[test]
+fn the_trims_of_a_table_are_counted_from_the_second_base() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    assert_eq!(f.state().trims, 0);
+    f.drain();
+    f.take();
+    assert_eq!(f.state().trims, 0, "(a table's first read is no trim)");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    f.put_top(&sum_of(T), &base);
+    f.drain();
+    assert_eq!(f.state().trims, 1, "the same base again");
+    let base2 = cp(3);
+    f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.state().trims, 2);
+    // A table first read with a checkpoint has had none.
+    let base = cp(2);
+    let g = Fix::seeded(Limits::default(), |f| {
+        f.put_top(&sum_of(T), &base);
+        f.session(&live_of(T, Some(&base)), &records(&[(1, 10)]));
+    });
+    let mut g = g;
+    g.drain();
+    assert_eq!(g.state().trims, 0);
+}
+
+/// The room's delegations (`hk:`) are counted as they change, whether or not a table is watched, and one
+/// that is replaced or removed is churn: a page that had seen the first may count a house the node never learned of.
+#[test]
+fn the_delegations_of_a_room_are_counted_and_a_replacement_or_a_removal_is_churn() {
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    assert_eq!(f.m.delegations(), Delegations::default());
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    f.put_top("sum:other:inc", &cp(2));
+    f.put_top("hkx", &s("not a delegation"));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "nothing but `hk:` keys");
+    f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(2))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(3))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "replaced");
+    // One that is removed.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &s("a"));
+    assert!(!f.m.delegations().churned);
+    f.remove_top("hk:house-a");
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "removed");
+}

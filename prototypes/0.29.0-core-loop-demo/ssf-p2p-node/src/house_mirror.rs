@@ -85,7 +85,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use yrs::types::{DeepObservable, Event, Events, PathSegment};
+use yrs::types::{DeepObservable, EntryChange, Event, Events, PathSegment};
 use yrs::{Doc, Map, MapRef, Out, ReadTxn, Subscription, TransactionMut};
 
 use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, READ_PER_TICK, VISIT_BYTES};
@@ -138,6 +138,10 @@ struct Dirt {
     tops: BTreeSet<String>,
     /// Changed record keys of a watched live session.
     recs: BTreeMap<String, Recs>,
+    /// Checkpoints (`sum:` names) that changed in a transaction after which the doc held updates it could
+    /// not apply yet, for want of something another peer wrote (a page's trim that deleted records this node
+    /// has not been sent: what it deleted is more than this node has read, and may be more than it will).
+    lagged: BTreeSet<String>,
 }
 
 enum Recs {
@@ -158,6 +162,7 @@ impl Dirt {
 
     fn merge(&mut self, other: Dirt, limit: usize) {
         self.tops.extend(other.tops);
+        self.lagged.extend(other.lagged);
         for (name, recs) in other.recs {
             match (self.recs.get_mut(&name), recs) {
                 (None, recs) => {
@@ -181,6 +186,17 @@ impl Dirt {
 struct Watch {
     names: HashSet<String>,
     dirt: Dirt,
+    delegations: Delegations,
+}
+
+/// What the observer has seen of the room's delegations (`hk:<house>`), whether or not a table is watched.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delegations {
+    /// Moves with every change to one.
+    pub changes: u64,
+    /// One was replaced or removed: a page that had seen it may count a house this node's plan, which learns a
+    /// delegation when a record names the house, cannot know of.
+    pub churned: bool,
 }
 
 fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
@@ -192,18 +208,26 @@ fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
 /// each key that changed, and a key kept only if it is watched.
 fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Events) {
     let mut w = lock(shared);
-    if w.names.is_empty() {
-        return;
-    }
-    let Watch { names, dirt } = &mut *w;
+    let Watch { names, dirt, delegations } = &mut *w;
+    // (After this transaction, does the doc hold updates it could not apply yet? Asked once, when a checkpoint changes.)
+    let mut gap = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         let path = map.path();
         match path.len() {
             0 => {
-                for (key, _) in map.keys(txn).iter() {
+                for (key, change) in map.keys(txn).iter() {
+                    if key.starts_with("hk:") {
+                        delegations.changes += 1;
+                        if !matches!(change, EntryChange::Inserted(_)) {
+                            delegations.churned = true;
+                        }
+                    }
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
+                        if key.starts_with("sum:") && *gap.get_or_insert_with(|| txn.store().pending_update().is_some() || txn.store().pending_ds().is_some()) {
+                            dirt.lagged.insert(key.to_string());
+                        }
                     }
                 }
             }
@@ -381,8 +405,11 @@ struct Table {
     generation: u64,
     version: u64,
     /// The base last changed (a page's trim, a new incarnation) while the live session it left
-    /// still had changes to be read or listed.
+    /// still had changes to be read or listed, or while the doc lacked updates a page had (see
+    /// [`Dirt::lagged`]).
     unread_at_trim: bool,
+    /// How many times the base has changed since it was first read.
+    trims: u64,
 }
 
 fn cval_bytes(v: &CVal) -> usize {
@@ -421,6 +448,7 @@ impl Table {
             generation: 0,
             version: 0,
             unread_at_trim: false,
+            trims: 0,
         }
     }
 
@@ -704,11 +732,16 @@ impl Table {
             self.read_base = false;
             // (The session the base leaves: what a page wrote to it before it trimmed it, and
             // this table has not read, is not in what the worker was sent.)
-            let changed = !(self.based && same_base(&new, &self.base));
-            let unread = changed && self.session_unread(pending, comp, txn);
+            let was_based = self.based;
+            let changed = !(was_based && same_base(&new, &self.base));
+            let lagged = pending.lagged.remove(&self.sum_name);
+            let unread = changed && (lagged || self.session_unread(pending, comp, txn));
             self.set_base(new);
             if changed {
                 self.unread_at_trim = unread;
+                if was_based {
+                    self.trims += 1;
+                }
             }
         }
         let Some(live) = self.live.clone() else { return true };
@@ -884,6 +917,8 @@ pub struct State<'a> {
     /// had changes this mirror had not read: what the worker was sent of that session is not all
     /// of it, so an answer made before the trim is of less than the checkpoint's page saw.
     pub unread_at_trim: bool,
+    /// How many times the base has changed since it was first read (a page's trims).
+    pub trims: u64,
 }
 
 impl State<'_> {
@@ -1007,6 +1042,7 @@ impl RoomMirror {
         let names = lock(&self.shared).names.clone();
         self.pending.tops.retain(|n| names.contains(n));
         self.pending.recs.retain(|n, _| names.contains(n));
+        self.pending.lagged.retain(|n| names.contains(n));
     }
 
     pub fn state(&self, t: &str, inc: &str) -> Option<State<'_>> {
@@ -1029,7 +1065,13 @@ impl RoomMirror {
             generation: tb.generation,
             version: tb.version,
             unread_at_trim: tb.unread_at_trim,
+            trims: tb.trims,
         })
+    }
+
+    /// What the observer has seen of the room's delegations since it began.
+    pub fn delegations(&self) -> Delegations {
+        lock(&self.shared).delegations
     }
 
     /// The table's checkpoint is waiting to be read: the table is new, or a change to `sum:` has

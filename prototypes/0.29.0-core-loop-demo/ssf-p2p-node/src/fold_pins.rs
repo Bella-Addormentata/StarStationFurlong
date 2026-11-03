@@ -28,9 +28,20 @@
 //! - the players are more than [`MAX_FOLD_PINS`] (CAPPED: which of them each
 //!   page pinned depends on the order it saw them in);
 //! - the map held more than [`PIN_WALK_KEYS`] entries when the observer
-//!   started (not WALKED: the players past them are unknown).
+//!   started (not WALKED: the players past them are unknown);
+//! - an entry carries a `__proto__` field (AMBIGUOUS: a page reads the key
+//!   with a property access, which can come from the prototype the field sets,
+//!   and the node reads the field itself).
 //!
 //! These last for as long as the node watches the room.
+//!
+//! WHAT IT CANNOT SEE. A page that bound before the node began to watch may
+//! have pinned a key the map no longer holds (replaced, or the player gone,
+//! before the first look): that history is not in the doc, so the pins are
+//! "as a page that bound at the first look pinned them", which is all a node
+//! that came later can say. Two pages that bound at different times differ in
+//! the same way; a difference the node counts on that ground is a case for
+//! the log line, not for the gate on its own.
 
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
@@ -65,14 +76,40 @@ pub fn key_pinnable(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_PIN_KEY_UNITS * 3 && s.encode_utf16().count() <= MAX_PIN_KEY_UNITS
 }
 
-/// The key a players entry holds, if the pages would pin it.
-fn key_of(v: &Out) -> Option<&str> {
-    match v {
-        Out::Any(Any::Map(entry)) => match entry.get("keyB64") {
-            Some(Any::String(k)) if key_pinnable(k) => Some(k),
+/// What a players entry says of its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key<'a> {
+    /// No key the pages would pin.
+    None,
+    /// The key the pages pin.
+    Pin(&'a str),
+    /// The entry has a `__proto__` field: a page may read a key from it or not.
+    Ambiguous,
+}
+
+impl<'a> Key<'a> {
+    fn pin(self) -> Option<&'a str> {
+        match self {
+            Key::Pin(k) => Some(k),
             _ => None,
-        },
-        _ => None,
+        }
+    }
+}
+
+/// The key a players entry holds, if the pages would pin it.
+fn key_of(v: &Out) -> Key<'_> {
+    match v {
+        Out::Any(Any::Map(entry)) => {
+            // (casinoDoc entryKey reads `v.keyB64`: from the object, or from the prototype a `__proto__` field of the entry sets.)
+            if entry.contains_key("__proto__") {
+                return Key::Ambiguous;
+            }
+            match entry.get("keyB64") {
+                Some(Any::String(k)) if key_pinnable(k) => Key::Pin(k),
+                _ => Key::None,
+            }
+        }
+        _ => Key::None,
     }
 }
 
@@ -83,31 +120,49 @@ struct PinState {
     version: u64,
     contested: bool,
     capped: bool,
+    /// Moves with anything that changes what [`PlayerPins::view`] says: a pin, or the pins no longer being the
+    /// whole story.
+    epoch: u64,
 }
 
 impl PinState {
-    /// A player's entry went from `old` to `new` (a key the pages would pin, or none).
-    fn learn(&mut self, pid: &str, old: Option<&str>, new: Option<&str>) {
+    fn contest(&mut self) {
+        if !self.contested {
+            self.contested = true;
+            self.epoch += 1;
+        }
+    }
+
+    /// A player's entry went from `old` to `new`.
+    fn learn(&mut self, pid: &str, old: Key, new: Key) {
         if !pid_pinnable(pid) {
             return;
         }
+        if old == Key::Ambiguous || new == Key::Ambiguous {
+            self.contest();
+        }
+        let (old, new) = (old.pin(), new.pin());
         match self.pins.get(pid) {
             Some(pinned) => {
                 if new.is_some_and(|n| n != pinned) {
-                    self.contested = true;
+                    self.contest();
                 }
             }
             None => {
                 // (A page that saw the old one pinned it; one that saw only the new one pinned that.)
                 let Some(first) = old.or(new) else { return };
                 if self.pins.len() >= MAX_FOLD_PINS {
-                    self.capped = true;
+                    if !self.capped {
+                        self.capped = true;
+                        self.epoch += 1;
+                    }
                     return;
                 }
                 self.pins.insert(pid.to_string(), first.to_string());
                 self.version += 1;
+                self.epoch += 1;
                 if old.is_some() && new.is_some_and(|n| Some(n) != old) {
-                    self.contested = true;
+                    self.contest();
                 }
             }
         }
@@ -130,10 +185,11 @@ fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
         }
         for (pid, change) in map.keys(txn).iter() {
             match change {
-                EntryChange::Inserted(new) => st.learn(pid, None, key_of(new)),
+                EntryChange::Inserted(new) => st.learn(pid, Key::None, key_of(new)),
                 EntryChange::Updated(old, new) => st.learn(pid, key_of(old), key_of(new)),
-                // (A page keeps the pin of a player who goes.)
-                EntryChange::Removed(_) => {}
+                // (A page keeps the pin of a player who goes. One who goes before this watch has read the map
+                // was seen by the pages, and is pinned as they pinned it.)
+                EntryChange::Removed(old) => st.learn(pid, key_of(old), Key::None),
             }
         }
     }
@@ -151,9 +207,32 @@ fn walk(doc: &Doc, shared: &Mutex<PinState>, limit: usize) -> bool {
             return false;
         }
         visited += 1;
-        st.learn(pid, None, key_of(&value));
+        st.learn(pid, Key::None, key_of(&value));
     }
     true
+}
+
+/// A look at whether a room's pins have moved, for whoever holds the view they made.
+#[derive(Clone)]
+pub struct PinWatch(Arc<Mutex<PinState>>);
+
+impl std::fmt::Debug for PinWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PinWatch(epoch {})", self.epoch())
+    }
+}
+
+impl PartialEq for PinWatch {
+    fn eq(&self, other: &PinWatch) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl PinWatch {
+    /// Moves with anything that changes what the pins say or whether they are the whole story.
+    pub fn epoch(&self) -> u64 {
+        lock(&self.0).epoch
+    }
 }
 
 /// One room's players, watched.
@@ -177,10 +256,21 @@ impl PlayerPins {
         PlayerPins { shared, _sub: sub, walked, cache: None }
     }
 
-    /// The pins, `(pid, key)` sorted, and whether they are the whole story
-    /// (no key was replaced, none went unpinned for want of room, the map
-    /// was read to its end).
+    /// A handle to ask later whether the pins have moved since a view.
+    pub fn watch(&self) -> PinWatch {
+        PinWatch(self.shared.clone())
+    }
+
+    /// The pins, `(pid, key)` sorted, and whether they are the whole story (no
+    /// key was replaced, none went unpinned for want of room, the map was
+    /// read to its end).
     pub fn view(&mut self) -> (Vec<(String, String)>, bool) {
+        let (pins, settled, _) = self.view_at();
+        (pins, settled)
+    }
+
+    /// [`PlayerPins::view`], and the epoch it was made at (read in the same look).
+    pub fn view_at(&mut self) -> (Vec<(String, String)>, bool, u64) {
         let st = lock(&self.shared);
         let settled = self.walked && !st.contested && !st.capped;
         if self.cache.as_ref().map(|c| c.0) != Some(st.version) {
@@ -188,7 +278,7 @@ impl PlayerPins {
             pins.sort();
             self.cache = Some((st.version, pins));
         }
-        (self.cache.as_ref().map(|c| c.1.clone()).unwrap_or_default(), settled)
+        (self.cache.as_ref().map(|c| c.1.clone()).unwrap_or_default(), settled, st.epoch)
     }
 }
 
