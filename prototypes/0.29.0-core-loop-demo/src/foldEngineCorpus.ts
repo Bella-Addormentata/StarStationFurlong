@@ -37,6 +37,10 @@ export interface FoldCase {
   cp: Checkpoint | null;
   /** The keys that are the room's houses. */
   houses: string[];
+  /** The key pinned for each player, [pid, key] (trust on first use, as the
+   *  pages pin: casinoDoc computedPinOf). A slip counts for a felt only if it
+   *  is signed by its player's pin; a player with none has no felt. */
+  pins: [string, string][];
   /** `fake`: a player's "signature" is sha512 of the signed bytes (a record
    *  signed with fakeIdentity checks out); `real`: ed25519, strict. The
    *  house's records are always real. */
@@ -115,6 +119,15 @@ interface Draft {
   cp: Checkpoint | null;
   records: [string, unknown][];
   hold: Set<string>;
+  pins: [string, string][];
+}
+
+/** The pins of a session's players: each one's key, but now and then (from its
+ *  own random stream, so the sessions stay as they were) a player the host has
+ *  not pinned yet. */
+function pinsOf(ids: ReadonlyMap<string, TestIdentity>, seed: number): [string, string][] {
+  const rand = rng(7000 + seed);
+  return [...ids].filter(() => rand() >= 0.12).map(([p, id]): [string, string] => [p, id.pub]);
 }
 
 /** A roulette session at `ctx` (c… or r…): the golden style. */
@@ -243,7 +256,7 @@ function roulette(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number):
   if (chance(0.3)) records.push([`s:1:alice:${'0'.repeat(32)}`, { r: 1 }]);
   if (chance(0.2)) records.push([`h:1:${'3'.repeat(32)}`, { house: 1 }]);
   if (chance(0.2)) records.push(['note', 'hello']);
-  return { cp, records, hold };
+  return { cp, records, hold, pins: pinsOf(ids, 1000 + n) };
 }
 
 /** A craps session at `ctx` (k… or d…): riders, points, carried state. */
@@ -386,7 +399,7 @@ function craps(n: number, ctx: FoldCtx, maxRounds: number, maxNames: number): Dr
     carry = carryNow();
   }
   if (chance(0.2)) records.push(['note', 'hello']);
-  return { cp, records, hold };
+  return { cp, records, hold, pins: pinsOf(ids, 2000 + n) };
 }
 
 /** The fold of what a generator has made so far, for the carry the next round plays from. */
@@ -409,6 +422,7 @@ function caseOf(name: string, ctx: FoldCtx, d: Draft, seed: number): FoldCase {
     ctx,
     cp: d.cp,
     houses: [HOUSE.pub],
+    pins: d.pins,
     sigs: 'fake',
     hold: [...d.hold].sort(),
     records: d.records,
@@ -433,7 +447,7 @@ function realSigned(): FoldCase {
   const forged = { ...a1.rec, g: b1.rec.g, v: 2 };
   records.push([`s:1:alice:${recHash(forged)!}`, forged]);
   records.push([kit.houseJoin(ROGUE, 1).key, kit.houseJoin(ROGUE, 1).rec]);
-  return { name: 'real signatures, one round decided by the house', ctx, cp: null, houses: [HOUSE.pub], sigs: 'real', hold: [], records, warm: warmOf(records, rng(1)) };
+  return { name: 'real signatures, one round decided by the house', ctx, cp: null, houses: [HOUSE.pub], pins: [['alice', alice.pub], ['bob', bob.pub]], sigs: 'real', hold: [], records, warm: warmOf(records, rng(1)) };
 }
 
 /** Values a Yjs doc can hold that a record must not: the fold's guards judge them. */
@@ -468,10 +482,31 @@ function oddities(): FoldCase {
     records.push([s.key, s.rec]);
     records.push([kit.reveal(1, name).key, kit.reveal(1, name).rec]);
   }
+  const pins: [string, string][] = [['alice', alice.pub], ...odd.map((name, i): [string, string] => [name, fakeIdentity(`corpus-odd-${i}`, name).pub])];
   const f = Object.fromEntries(odd.map((name, i) => [name, recHash(kit.slip(fakeIdentity(`corpus-odd-${i}`, name), 1, [{ type: 'black', amount: 1 + i }]).rec)!]));
   const c2 = kit.close(alice, 1, kit.sidAfter(null), { alice: s1.hash, ...f });
   records.push([c2.key, c2.rec]);
-  return { name: 'values only a node is handed', ctx, cp: null, houses: [HOUSE.pub], sigs: 'fake', hold: [], records, warm: warmOf(records, rng(2)) };
+  return { name: 'values only a node is handed', ctx, cp: null, houses: [HOUSE.pub], pins, sigs: 'fake', hold: [], records, warm: warmOf(records, rng(2)) };
+}
+
+/** Pins at work: alice and bob have bet, mallory writes a higher version of alice's felt under HER OWN key, and carol, whose key
+ *  the host has not pinned, has bet too. The felt is alice's pinned version, not mallory's 999; carol holds nothing. */
+function rogue(letter: 'c' | 'r'): FoldCase {
+  const ctx = ctxOf(letter);
+  const kit = new ComputedKit(ctx);
+  const [alice, bob, carol, mallory] = [
+    fakeIdentity(`corpus-rogue-${letter}-alice`, 'alice'), fakeIdentity(`corpus-rogue-${letter}-bob`, 'bob'),
+    fakeIdentity(`corpus-rogue-${letter}-carol`, 'carol'), fakeIdentity(`corpus-rogue-${letter}-mallory`, 'mallory'),
+  ];
+  const a1 = kit.slip(alice, 1, [{ type: 'red', amount: 10 }]);
+  const b1 = kit.slip(bob, 1, [{ type: 'black', amount: 7 }]);
+  const c1 = kit.slip(carol, 1, [{ type: 'odd', amount: 3 }]);
+  const forged = kit.slip(mallory, 1, [{ type: 'red', amount: 999 }], { v: 2, p: 'alice' });
+  const records: [string, unknown][] = [a1, b1, c1, forged].map((b) => [b.key, b.rec]);
+  return {
+    name: `a rogue key writes a felt under another player's name (${letter})`, ctx, cp: null, houses: [HOUSE.pub],
+    pins: [['alice', alice.pub], ['bob', bob.pub]], sigs: 'fake', hold: [], records, warm: warmOf(records, rng(4)),
+  };
 }
 
 /** A table whose incarnation has ended (the checkpoint says so): the session counts nothing, the nets are the checkpoint's. */
@@ -485,7 +520,7 @@ function ended(letter: 'c' | 'k'): FoldCase {
   const close = kit.close(alice, 4, sid, [slip as unknown as Built<SlipRec>]);
   const records: [string, unknown][] = [[slip.key, slip.rec], [close.key, close.rec], [kit.reveal(4, 'alice').key, kit.reveal(4, 'alice').rec]];
   return {
-    name: `ended ${letter}`, ctx, cp, houses: [HOUSE.pub], sigs: 'fake', hold: [], records, warm: warmOf(records, rng(3)),
+    name: `ended ${letter}`, ctx, cp, houses: [HOUSE.pub], pins: [['alice', alice.pub]], sigs: 'fake', hold: [], records, warm: warmOf(records, rng(3)),
   };
 }
 
@@ -499,6 +534,6 @@ export function corpus(opts: { roulette?: number; house?: number; craps?: number
     const letter = n % 2 ? 'd' : 'k';
     out.push(caseOf(`${letter === 'd' ? 'house craps' : 'craps'} ${n}`, ctxOf(letter), craps(n, ctxOf(letter), rounds, names), 200 + n));
   }
-  out.push(realSigned(), oddities(), ended('c'), ended('k'));
+  out.push(realSigned(), oddities(), rogue('c'), rogue('r'), ended('c'), ended('k'));
   return out;
 }

@@ -16,6 +16,7 @@ struct Case {
     ctx: Ctx,
     cp: Option<CVal>,
     houses: Vec<String>,
+    pins: Vec<(String, String)>,
     real: bool,
     hold: Vec<String>,
     records: Vec<(String, CVal)>,
@@ -41,6 +42,7 @@ fn cases() -> Vec<Case> {
             ctx: Ctx { room: c["ctx"]["room"].as_str().unwrap().into(), t: c["ctx"]["t"].as_str().unwrap().into(), inc: c["ctx"]["inc"].as_str().unwrap().into() },
             cp: if c["cp"].is_null() { None } else { Some(CVal::from_json(&c["cp"])) },
             houses: strs(&c["houses"]),
+            pins: c["pins"].as_array().unwrap().iter().map(|p| (p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string())).collect(),
             real: c["sigs"] == "real",
             hold: strs(&c["hold"]),
             records: c["records"].as_array().unwrap().iter().map(|e| (e[0].as_str().unwrap().to_string(), CVal::from_json(&e[1]))).collect(),
@@ -72,7 +74,7 @@ fn check_for(c: &Case) -> CheckFn {
 }
 
 fn open(e: &mut FoldEngine, c: &Case) {
-    e.open(&c.ctx, c.cp.as_ref(), &c.houses).unwrap_or_else(|err| panic!("{}: open: {err}", c.name));
+    e.open(&c.ctx, c.cp.as_ref(), &c.houses, &c.pins).unwrap_or_else(|err| panic!("{}: open: {err}", c.name));
 }
 
 fn sha_hex(text: &str) -> String {
@@ -90,7 +92,7 @@ fn eval_str(e: &mut FoldEngine, ctx: &Ctx, src: &str) -> Result<String, FoldErro
 /// An engine with one empty table open.
 fn engine_with(ctx: &Ctx) -> FoldEngine {
     let mut e = FoldEngine::new(Box::new(|_, _, _, _, _| Some(true))).unwrap();
-    e.open(ctx, None, &[]).unwrap();
+    e.open(ctx, None, &[], &[]).unwrap();
     e
 }
 
@@ -144,7 +146,7 @@ fn the_order_of_a_records_fields_changes_nothing() {
     for c in &cases() {
         let mut e = FoldEngine::new(check_for(c)).unwrap();
         let cp = c.cp.as_ref().map(reversed);
-        e.open(&c.ctx, cp.as_ref(), &c.houses).unwrap();
+        e.open(&c.ctx, cp.as_ref(), &c.houses, &c.pins).unwrap();
         let flipped: Vec<(String, CVal)> = c.records.iter().map(|(k, v)| (k.clone(), reversed(v))).collect();
         e.reset(&c.ctx, &flipped).unwrap();
         assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}: summary", c.name);
@@ -163,11 +165,11 @@ fn a_session_replaced_folds_as_a_new_one() {
     e.result_text(&a.ctx).unwrap();
     // The same table, another session (the engine's check is a's; b is fake-signed too).
     let mut e2 = FoldEngine::new(check_for(b)).unwrap();
-    e2.open(&a.ctx, b.cp.as_ref(), &b.houses).unwrap();
+    e2.open(&a.ctx, b.cp.as_ref(), &b.houses, &b.pins).unwrap();
     e2.reset(&a.ctx, &a.records).unwrap();
     e2.reset(&a.ctx, &b.records).unwrap();
     let mut e3 = FoldEngine::new(check_for(b)).unwrap();
-    e3.open(&a.ctx, b.cp.as_ref(), &b.houses).unwrap();
+    e3.open(&a.ctx, b.cp.as_ref(), &b.houses, &b.pins).unwrap();
     e3.reset(&a.ctx, &b.records).unwrap();
     assert_eq!(e2.result_text(&a.ctx).unwrap(), e3.result_text(&a.ctx).unwrap());
 }
@@ -188,12 +190,13 @@ fn a_checkpoint_replaced_or_removed_clears_the_session_and_folds_as_a_fresh_tabl
             }
             // The engine holds src's table, populated and folded.
             let mut e = FoldEngine::new(check_for(dst)).unwrap();
-            e.open(&src.ctx, src.cp.as_ref(), &src.houses).unwrap();
+            e.open(&src.ctx, src.cp.as_ref(), &src.houses, &src.pins).unwrap();
             e.reset(&src.ctx, &src.records).unwrap();
             let before = e.result(&src.ctx).unwrap();
             assert!(!e.slots[&key_of(&src.ctx)].cold, "{} → {}: folded", src.name, dst.name);
             // The checkpoint changes (or goes): the fold drops the old session; the same checkpoint again is no change.
             e.set_base(&src.ctx, dst.cp.as_ref()).unwrap_or_else(|err| panic!("{} → {}: set_base: {err}", src.name, dst.name));
+            e.set_pins(&src.ctx, &dst.pins).unwrap();
             assert!(e.slots[&key_of(&src.ctx)].cold, "{} → {}: cold again", src.name, dst.name);
             let after = e.result(&src.ctx).unwrap();
             if src.cp == dst.cp {
@@ -218,7 +221,7 @@ fn a_house_key_removed_and_restored_is_decided_as_a_fresh_engine_decides() {
     let all = cases();
     let fresh = |c: &Case, houses: &[String]| -> String {
         let mut e = FoldEngine::new(check_for(c)).unwrap();
-        e.open(&c.ctx, c.cp.as_ref(), houses).unwrap();
+        e.open(&c.ctx, c.cp.as_ref(), houses, &c.pins).unwrap();
         e.reset(&c.ctx, &c.records).unwrap();
         e.result_text(&c.ctx).unwrap()
     };
@@ -243,6 +246,53 @@ fn a_house_key_removed_and_restored_is_decided_as_a_fresh_engine_decides() {
         assert_eq!(e.result_text(&c.ctx).unwrap(), fresh(c, &["not-a-house-key".to_string()]), "{}: another key", c.name);
     }
     assert!(changed >= 2, "only {changed} sessions depend on the house: the test has no teeth");
+}
+
+fn held_of(summary: &FoldSummary) -> Vec<(String, String)> {
+    summary.held.clone()
+}
+
+#[test]
+fn a_players_pinned_key_decides_whose_version_is_the_felt() {
+    let all = cases();
+    let rogues: Vec<&Case> = all.iter().filter(|c| c.name.starts_with("a rogue key")).collect();
+    assert_eq!(rogues.len(), 2);
+    for c in rogues {
+        let pin_of = |pid: &str| c.pins.iter().find(|(p, _)| p == pid).map(|(_, k)| k.clone()).unwrap();
+        // The key that signed the rogue version of alice's felt.
+        let rogue_key = c
+            .records
+            .iter()
+            .filter_map(|(_, v)| Some((v.get("p")?.as_str()?.to_string(), v.get("k")?.as_str()?.to_string())))
+            .find(|(p, k)| p == "alice" && *k != pin_of("alice"))
+            .map(|(_, k)| k)
+            .expect("a rogue version");
+        let fresh = |pins: &[(String, String)]| -> FoldSummary {
+            let mut e = FoldEngine::new(check_for(c)).unwrap();
+            e.open(&c.ctx, c.cp.as_ref(), &c.houses, pins).unwrap();
+            e.reset(&c.ctx, &c.records).unwrap();
+            e.result(&c.ctx).unwrap()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        let mut e = FoldEngine::new(check_for(c)).unwrap();
+        open(&mut e, c);
+        e.reset(&c.ctx, &c.records).unwrap();
+        // Alice's own version is her felt (10), not the 999 written under her name by another key; carol has no pin and no felt.
+        assert_eq!(held_of(&e.result(&c.ctx).unwrap()), vec![pair("alice", "10"), pair("bob", "7")], "{}", c.name);
+        // The rogue key pinned for alice: its version is.
+        let rogue_pins = vec![pair("alice", &rogue_key), pair("bob", &pin_of("bob"))];
+        e.set_pins(&c.ctx, &rogue_pins).unwrap();
+        let now = e.result(&c.ctx).unwrap();
+        assert_eq!(held_of(&now), vec![pair("alice", "999"), pair("bob", "7")], "{}", c.name);
+        assert_eq!(now, fresh(&rogue_pins), "{}: a pin that arrived later reads as one given at the start", c.name);
+        // The pins back, and none at all.
+        e.set_pins(&c.ctx, &c.pins).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}", c.name);
+        e.set_pins(&c.ctx, &[]).unwrap();
+        let none = e.result(&c.ctx).unwrap();
+        assert!(held_of(&none).is_empty(), "{}", c.name);
+        assert_eq!(none, fresh(&[]), "{}", c.name);
+    }
 }
 
 #[test]
@@ -383,7 +433,7 @@ fn a_loop_that_never_ends_is_interrupted_and_the_table_is_dirty() {
     assert_eq!(e.result_text(&ctx).unwrap_err(), FoldError::NoTable);
     assert_eq!(e.apply(&ctx, &[]).unwrap_err(), FoldError::NoTable);
     // Opened again, it folds; and the deadline of the call that failed does not leak into this one.
-    e.open(&ctx, None, &[]).unwrap();
+    e.open(&ctx, None, &[], &[]).unwrap();
     assert_eq!(e.result(&ctx).unwrap().rounds.len(), 0);
 }
 
@@ -411,7 +461,7 @@ fn memory_past_the_limit_is_an_error_and_the_table_is_dirty() {
     assert!(!e.is_open(&ctx));
     // The garbage went with the context: the engine works again at the limit it has.
     assert!(e.rt.memory_usage().malloc_size < (4 << 20), "{} bytes still held", e.rt.memory_usage().malloc_size);
-    e.open(&ctx, None, &[]).unwrap();
+    e.open(&ctx, None, &[], &[]).unwrap();
     assert_eq!(e.result(&ctx).unwrap().bytes, 0);
 }
 
@@ -451,7 +501,7 @@ fn a_fold_that_errs_is_dropped_and_the_others_go_on() {
     let other = ctx_n(7);
     let mut e = FoldEngine::new(check_for(a)).unwrap();
     open(&mut e, a);
-    e.open(&other, None, &[]).unwrap();
+    e.open(&other, None, &[], &[]).unwrap();
     e.reset(&a.ctx, &a.records).unwrap();
     assert!(e.call(&key_of(&a.ctx), Duration::from_millis(50), |js| js.eval::<(), _>("for (;;) {}")).is_err());
     assert!(!e.is_open(&a.ctx));
@@ -467,8 +517,8 @@ fn a_fold_that_errs_is_dropped_and_the_others_go_on() {
 fn tables_in_an_engine_do_not_see_each_other() {
     let (c0, c1) = (ctx_n(0), ctx_n(1));
     let mut e = FoldEngine::new(Box::new(|_, _, _, _, _| Some(true))).unwrap();
-    e.open(&c0, None, &[]).unwrap();
-    e.open(&c1, None, &[]).unwrap();
+    e.open(&c0, None, &[], &[]).unwrap();
+    e.open(&c1, None, &[], &[]).unwrap();
     e.call(&key_of(&c0), WARM_BUDGET, |js| js.eval::<(), _>("globalThis.mine = 1")).unwrap();
     assert_eq!(eval_str(&mut e, &c1, "typeof globalThis.mine").unwrap(), "undefined");
     assert_eq!(eval_str(&mut e, &c0, "typeof globalThis.mine").unwrap(), "number");
@@ -478,19 +528,19 @@ fn tables_in_an_engine_do_not_see_each_other() {
 fn only_sixteen_tables_are_kept_the_least_recently_used_goes() {
     let mut e = FoldEngine::new(Box::new(|_, _, _, _, _| Some(true))).unwrap();
     for n in 0..FOLD_TABLES {
-        e.open(&ctx_n(n), None, &[]).unwrap();
+        e.open(&ctx_n(n), None, &[], &[]).unwrap();
     }
     assert_eq!(e.slots.len(), FOLD_TABLES);
     // Table 0 is the oldest; touching it makes table 1 the oldest.
     e.result_text(&ctx_n(0)).unwrap();
-    e.open(&ctx_n(FOLD_TABLES), None, &[]).unwrap();
+    e.open(&ctx_n(FOLD_TABLES), None, &[], &[]).unwrap();
     assert_eq!(e.slots.len(), FOLD_TABLES);
     assert!(e.is_open(&ctx_n(0)));
     assert!(!e.is_open(&ctx_n(1)), "the least recently used table is the one that goes");
     assert!(e.is_open(&ctx_n(FOLD_TABLES)));
     assert_eq!(e.result_text(&ctx_n(1)).unwrap_err(), FoldError::NoTable);
     // Opening a table that is open again keeps the count (it is replaced, nothing else is evicted).
-    e.open(&ctx_n(2), None, &[]).unwrap();
+    e.open(&ctx_n(2), None, &[], &[]).unwrap();
     assert_eq!(e.slots.len(), FOLD_TABLES);
     assert!(e.is_open(&ctx_n(0)) && e.is_open(&ctx_n(FOLD_TABLES)));
 }
@@ -518,7 +568,7 @@ fn a_table_replaced_near_the_limit_gives_its_memory_back_first() {
     e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = [new Array(1000000).fill(1), new Array(1000000).fill(2)]")).unwrap();
     e.rt.set_memory_limit(e.rt.memory_usage().malloc_size as usize + (200 << 10));
     // No call to the collector here: opening the table again must free the old one itself.
-    e.open(&ctx, None, &[]).unwrap();
+    e.open(&ctx, None, &[], &[]).unwrap();
     assert!(e.rt.memory_usage().malloc_size < (4 << 20), "{} bytes held", e.rt.memory_usage().malloc_size);
     assert_eq!(e.result(&ctx).unwrap().rounds.len(), 0);
 }
@@ -559,7 +609,7 @@ fn memory_is_given_back_when_tables_are_forgotten() {
     let idle = e.rt.memory_usage().malloc_size;
     for round in 0..3 {
         for n in 0..FOLD_TABLES {
-            e.open(&ctx_n(n), None, &[]).unwrap();
+            e.open(&ctx_n(n), None, &[], &[]).unwrap();
         }
         // The first table is as freeable as the others (see `_primer`): a big one, forgotten.
         e.call(&key_of(&ctx_n(0)), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = new Array(500000).fill(1)")).unwrap();
@@ -572,7 +622,7 @@ fn memory_is_given_back_when_tables_are_forgotten() {
         assert!(now < idle + (1 << 20), "round {round}: {now} bytes held after the tables went, {idle} before");
     }
     // 48 contexts have come and gone under one 64 MiB limit.
-    e.open(&ctx_n(0), None, &[]).unwrap();
+    e.open(&ctx_n(0), None, &[], &[]).unwrap();
     assert!(e.result(&ctx_n(0)).is_ok());
 }
 

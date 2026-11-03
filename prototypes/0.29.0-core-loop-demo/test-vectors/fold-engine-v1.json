@@ -12,6 +12,16 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "erin",
+     "2v991oZDizi0rPy08sScamueKEQ4TUR48tsTna40XY0"
+    ],
+    [
+     "constructor",
+     "A_0Udgm3YBVRv5dUAHyklGwZBJ4Kec6w0o74dcStDUw"
+    ]
+   ],
    "sigs": "fake",
    "hold": [
     "b9689b86decf75516f32781cc2adf47a"
@@ -592,6 +602,16 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "p:q",
+     "iHrOjM9ARroSoaKExiG6sRbOe_K1EbaZd2F11yD2VN0"
+    ],
+    [
+     "alice",
+     "RJpMAB_p8wnX3JVF9DlDHGsaHN3nGIuQSvb30mpjPz8"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -1343,6 +1363,20 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "a‍b",
+     "n6Rvw-JTJD8TL1fhojr6p7hCoh-huQAtuOvfEgVvdjg"
+    ],
+    [
+     "bob",
+     "6273Zo4elM-k2k9OK7VVVv9M-Vys9LvZQXSRUWAnFWM"
+    ],
+    [
+     "toString",
+     "BMYMt4ob97M7_-cD2O8dkKU0t2cOMEoSbWTFE-VB1AI"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -2139,6 +2173,12 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "alice",
+     "NjMQEOtMNZyxy3mIGlbZl4WRfiLf3ORzSthAPkHq-_c"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -2278,7 +2318,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"fb2268faf2eedb9c72b735f698de523d\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":1,\"open\":1,\"parent\":\"g\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"45\"],[\"dave\",\"50\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1240,\"rawBytes\":1240}",
-   "digest": "96507871cbd2d9fd2b3ca6cd2fd238868abf8d947c2e0e2254e0cef9d58f58e7"
+   "digest": "8a15867b3dd9d09b455f049eb428ad60367eea48fda2e7ae092fd153fe214c3e"
   },
   {
    "name": "roulette 4",
@@ -2303,6 +2343,20 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "p:q",
+     "TrqNg0jE_ZUCnoWBdSL3WOf6-SIcDRmxcHlhWeUGQ4E"
+    ],
+    [
+     "toString",
+     "6kTwgRT94q2m7FbX7EugGtfM90RdeT-A_LBXDKsS5N4"
+    ],
+    [
+     "bob",
+     "dbt60_32DJhHpddWJcqbyzloAOxZ41hANQ0oJ_R7BnY"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -3380,6 +3434,16 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "toString",
+     "pWJYFv2sZR2Ald_tOpqDuz4Ew1pqkGw9kttFFKPO1cE"
+    ],
+    [
+     "a‍b",
+     "eW5IkNUD5iNgAJQvLObeIi67ZNxKFywO1izDPbZMNRA"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -3816,6 +3880,20 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "constructor",
+     "7q_mr3WUUzV6I2XNMjed0yJJZ1LIVnlpguMAj_obubU"
+    ],
+    [
+     "bob",
+     "ASTiuUCrFJqzik-VUpff4lbEVVKC93vr0b0B9UIqpbY"
+    ],
+    [
+     "a‍b",
+     "cgqkLPCss4BwCcKHkX8g2cvgRAcWIG4ZHtgsealgYDw"
+    ]
    ],
    "sigs": "fake",
    "hold": [
@@ -4656,6 +4734,16 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "alice",
+     "MSndpkAhLJ2OKx12tSuucJZGc_UHbCucrxMjPSNDZjo"
+    ],
+    [
+     "bob",
+     "VmE9OVUrLEODHaw3jrppHvPyTYhb7nwGllL51vbLaOQ"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -5313,6 +5401,20 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "bob",
+     "dyi2INELQf-quK3ZU1oo_FIaE13D1TJuMtHQzSuUWXU"
+    ],
+    [
+     "alice",
+     "1IhZaxUeaAGiQDOBSbR1mNgUSoSv-XVT5sOCnCatjRk"
+    ],
+    [
+     "😀a",
+     "EKTfLLVsJ8k6NIbkkbU6x3FAhmQQrVYbrsozJ4GfDwQ"
+    ]
+   ],
    "sigs": "fake",
    "hold": [
     "943f26867298ea0010a7d198d5b75fc2"
@@ -5888,6 +5990,20 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "toString",
+     "kWWrPAVKPLEjyzsV39CESiZ2qXqBNHuW_kyALTbxuBA"
+    ],
+    [
+     "dave",
+     "8im_uJjHc-wiQXu42tQYskxTTkaPDY5r9xLQmHLr67Y"
+    ],
+    [
+     "erin",
+     "xgp3XP__FwWghOzZZrU4KtjT-2UhVd2ixBPWJA4ea0s"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -6276,6 +6392,16 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "a‍b",
+     "cicDSeaz3JfUIG62-RF-VSPHcgu1Xkee6k_G0qPHfSE"
+    ],
+    [
+     "erin",
+     "cfhMMNjrnsPK4hc0r8d63QVmsSPTTaAwro7xpRIengQ"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -6749,6 +6875,16 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "JBuggjYc356_jYX0zPYujuFrWavBsDl_lMNLgfEfxeQ"
+    ],
+    [
+     "a‍b",
+     "aqJJYciox8eacvTuY-OBPokssTYdm7guznjOlQyJ87E"
+    ]
    ],
    "sigs": "fake",
    "hold": [
@@ -7276,6 +7412,20 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "😀a",
+     "f4LWe6tSpwx5NKl7gTFmceXg_UJlvqhpGLsAz_Sk-wI"
+    ],
+    [
+     "constructor",
+     "pV3pGpG_Y1Kp_TcTkKbmta90ia4HDlgPtVJlTT0ySek"
+    ],
+    [
+     "erin",
+     "xgWPmtWKsx5Drcd_l0Cv7Q_zIj9nYyGRlS0HG55R3Xs"
+    ]
    ],
    "sigs": "fake",
    "hold": [
@@ -8934,7 +9084,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"b024f802e09e908929aa0c6a3c9e2472\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"constructor\",\"erin\"],\"pocket\":null,\"deltas\":[[\"alice\",\"-58\"],[\"constructor\",\"0\"],[\"erin\",\"-38\"]],\"copies\":[\"x:1:alice:b9667af7526668dbe6236411c886977f\",\"x:1:constructor:11aea198611b6f9bac9b180e7c7c6181\",\"x:1:erin:eb26d2be2a77b2d7f4fde9fb303c7699\"],\"dice\":[1,6]},{\"r\":2,\"close\":\"24058f18ccb8a952a64dcfbfb5583ee0\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"constructor\",\"😀a\"],\"pocket\":null,\"deltas\":[[\"alice\",\"0\"],[\"constructor\",\"0\"],[\"😀a\",\"-35\"]],\"copies\":[\"x:2:alice:da8b709f656216fb91e8e10352aa7ac7\",\"x:2:constructor:89869c2d85483f97f6ce0818c9177c13\",\"x:2:😀a:c2777c9b12bad20af38c75b638f02c23\"],\"dice\":[5,2]}],\"tip\":null,\"open\":3,\"parent\":\"24058f18ccb8a952a64dcfbfb5583ee0\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"-58\"],[\"erin\",\"-38\"],[\"😀a\",\"-35\"]],\"held\":[[\"erin\",\"9\"]],\"carry\":{\"p\":0,\"w\":{}},\"pending\":false,\"records\":49,\"bytes\":14207,\"rawBytes\":14207}",
-   "digest": "4566fcada36ed13fb6d6ff91aafb98bb206140341e9b2192b53a4df7b727a73e"
+   "digest": "bfbd20e7d6407dc56a42971f9ba010d7e8f0bdd6b0dbeef199ac125fe4fc0fb7"
   },
   {
    "name": "house craps 1",
@@ -8975,6 +9125,16 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "constructor",
+     "QsIDPSIGqfcqUvyTfqKwJc85k1qkbVrHo3tEq7H0XME"
+    ],
+    [
+     "a‍b",
+     "nvm63I9lzZtNAzxLZzssFRbXjAnlPU4wGHwXv9wMNrA"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -9396,6 +9556,20 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "😀a",
+     "zxBhO9JxUOBM0abP_JF9F1OSMpgrwDyMn5tDw-utz4E"
+    ],
+    [
+     "carol",
+     "bdpS8TwhpDZOyP5_isUe6BjJIM8PErfSGL7j_b4gGus"
+    ],
+    [
+     "！b",
+     "5YvXPlC9Gxms3QWos3Q0w2dQamUFYgFjQE7mo2RIWLU"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -9743,6 +9917,20 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "😀a",
+     "3xt8H2f0WOrkGUkcnBzevvNJR5BSttMkFdNtyJWtpQ0"
+    ],
+    [
+     "erin",
+     "nUaRxDhisKeqASet5dvNsPAYC4i389w2lIYkQlwktYY"
+    ],
+    [
+     "alice",
+     "KS1C-GMwHUgpu8YQ4UCzX4S7tQDMyeCmXysnhKMFdb4"
+    ]
    ],
    "sigs": "fake",
    "hold": [
@@ -11072,6 +11260,20 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "constructor",
+     "setBSQBIjbR1YdbxET-ZFh7w82mLZSoDRuX6vDEcwqc"
+    ],
+    [
+     "dave",
+     "Jz5gI9AWvsETyxC8lwim3iW-sGgd62bJtbolhxa0v5s"
+    ],
+    [
+     "toString",
+     "xCFy9J6V5UvTRRIcNha-vdRXVtK0Oai4wuH78I4PVJU"
+    ]
+   ],
    "sigs": "fake",
    "hold": [],
    "records": [
@@ -11191,6 +11393,16 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "constructor",
+     "mWEFFWV-v1MmmVgjWPv7-st5dFUIHqVwQ6G4FKmd8e0"
+    ],
+    [
+     "alice",
+     "H_Y-gT9-dMqaq4JldFQG2_vCULY95EU9PMfLlABF_8c"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -11677,6 +11889,20 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "p:q",
+     "Lohm7MdQEGN32aoqP3MHIpZaBH0a3KJTjS3jsRskHDg"
+    ],
+    [
+     "！b",
+     "APkL5pEvGCK6B1Fpk3sDMIJwdoZceLxL_6BdW4-GaoM"
+    ],
+    [
+     "toString",
+     "RLWwy1Qd9geVIGbofq9E8li5pn1voIcnsIddTktJx0c"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -12253,6 +12479,24 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "p:q",
+     "lAIb7YCFqRb-AiqUdWnvjcoi8oqqxniCvOpnOa49WnQ"
+    ],
+    [
+     "alice",
+     "zuMnVHrL1Qqskvf93QySDx00HuNDVLQdjGxWbEKBWlA"
+    ],
+    [
+     "bob",
+     "tkQJ9y85RKfV8VqOvLDfIZGlNhrqaoWEiQxFyUP6-dg"
+    ],
+    [
+     "x y",
+     "0wruzPUPpjTrc2EwCARk6e39F8KHyHcQtbefO_FGx9I"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -13912,6 +14156,16 @@
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
    ],
+   "pins": [
+    [
+     "alice",
+     "piFfhgdR66mrGfaCVc0PABTdYvgTpaXUiIfG51134CE"
+    ],
+    [
+     "bob",
+     "NfO-Ojxyi-jI2rnKdPcSRJG0BfbNXymPvCRGTWVX7L4"
+    ]
+   ],
    "sigs": "real",
    "hold": [],
    "records": [
@@ -14213,6 +14467,44 @@
    "cp": null,
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "1GNOY2gob-0UW7SkNjp3eouBQmG_2epoug3CTYpVrZo"
+    ],
+    [
+     "😀",
+     "xJ4OGqOJ7vYW7-IW60JGqjbFf-dhJ9ub7dMriGnjnsw"
+    ],
+    [
+     "！",
+     "MebCXDPifD9NSTWjENWH2wPyPhridgbgyaSiKOczSfU"
+    ],
+    [
+     "a‍b",
+     "JojaQaIM-2DBWUTODcSQYMbaokHFMiLv_-tan5aVs-8"
+    ],
+    [
+     "x y",
+     "ZWYagUF6E6x4DtRC2raTBX1YnmSGGk0T3v7S1_azhbU"
+    ],
+    [
+     "�",
+     "8qwOlu3PBg6INM_6pJ-PXaMVehjNdGffx0lP6bBPzcw"
+    ],
+    [
+     "é",
+     "5Q74TVqsbjCXI1GaN7K9x5S7Q3qF-wZx6RPw9RiB3Cc"
+    ],
+    [
+     "\u0000",
+     "QKHSjleZCi2CNgFwoE0JnBlmZpwKbuqdSgXw0GUQZgQ"
+    ],
+    [
+     "\"\\/",
+     "lad2DrX93v7SscfsZef9EQsUSac8fZc6GqfY4rLlxsI"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -15151,6 +15443,390 @@
    "digest": "180ebd6c86a3116a0e45c42186857e3bf16bae328859cce66a873907bf364a5b"
   },
   {
+   "name": "a rogue key writes a felt under another player's name (c)",
+   "ctx": {
+    "room": "room-fold-corpus",
+    "t": "roulette-1",
+    "inc": "c0123456789abcdef01234567"
+   },
+   "cp": null,
+   "houses": [
+    "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "yskUTL-XPLapIiCcR0SnVdKg4BEON8gY_bS1Dmq0aH4"
+    ],
+    [
+     "bob",
+     "5xFVYXA-4hlZe8cGHqrL0m7NzlugK_yai2MbF_SNXnA"
+    ]
+   ],
+   "sigs": "fake",
+   "hold": [],
+   "records": [
+    [
+     "s:1:alice:3810d79a6d4f3e9b1223262921daf7df",
+     {
+      "r": 1,
+      "p": "alice",
+      "v": 1,
+      "b": [
+       {
+        "type": "red",
+        "amount": 10
+       }
+      ],
+      "c": "0a8e72d5ee562b171a6e2ba394f4819bdf19fdc916fa3c632a7dacfb13910f9d",
+      "k": "yskUTL-XPLapIiCcR0SnVdKg4BEON8gY_bS1Dmq0aH4",
+      "g": "S1Wc99qx1jc6Fn9THrrNmc81YO8kEdPAfaxO_CXjAmyYjdz36A-rVYUkYX4PWzsyQB5vWeWtsIhMLPa7ovEfBw"
+     }
+    ],
+    [
+     "s:1:bob:81862913ab10e4e98ca4d889b1cc8fb3",
+     {
+      "r": 1,
+      "p": "bob",
+      "v": 1,
+      "b": [
+       {
+        "type": "black",
+        "amount": 7
+       }
+      ],
+      "c": "b05aba99114fc70aa8c7337222dce4b677e50fd3996610c7d87826f621bc1910",
+      "k": "5xFVYXA-4hlZe8cGHqrL0m7NzlugK_yai2MbF_SNXnA",
+      "g": "DbK532zCDBeTACNiNXAypMV5AlBt3CFWaIG_1GoG-gVmrkaK0CpLWl5VWgfHHYtMzn8TkLHje8nJWsfvZ9qH_A"
+     }
+    ],
+    [
+     "s:1:carol:bba46b206b5367f93754d0fbc8f06df0",
+     {
+      "r": 1,
+      "p": "carol",
+      "v": 1,
+      "b": [
+       {
+        "type": "odd",
+        "amount": 3
+       }
+      ],
+      "c": "ca93ce856bb2f0faa7e6c4c7f722945df28d7d783f45986a3ba02399d9aed7a6",
+      "k": "BUmlWwK5dhg7VFC5ZNjxlC4K-lQKr_72fVkGnd1RBRg",
+      "g": "EMd7i4N7vjp6-Vr2lT2Riq7_iAg2jS1ODnFOyG9XM54ef0CZZGimQMbGtAlupkhslBFKQOnX-i1tE3LuBTUNCg"
+     }
+    ],
+    [
+     "s:1:alice:bb2ffe8052ea062047f10f8c54e27706",
+     {
+      "r": 1,
+      "p": "alice",
+      "v": 2,
+      "b": [
+       {
+        "type": "red",
+        "amount": 999
+       }
+      ],
+      "c": "0a8e72d5ee562b171a6e2ba394f4819bdf19fdc916fa3c632a7dacfb13910f9d",
+      "k": "WScyppen84R8MEdGDx0Er2IbJK1tq5oXEOmGP_-WcNU",
+      "g": "cCTC6EG-vS8VSoIyQwE1JVSGkm7aRPU8L8N351Hhrvb9FsempaKsJ3WuyISawGz2Y9H4V3BmlqVY0F90QDHqQg"
+     }
+    ]
+   ],
+   "warm": [
+    [
+     [
+      "s:1:bob:81862913ab10e4e98ca4d889b1cc8fb3",
+      {
+       "r": 1,
+       "p": "bob",
+       "v": 1,
+       "b": [
+        {
+         "type": "black",
+         "amount": 7
+        }
+       ],
+       "c": "b05aba99114fc70aa8c7337222dce4b677e50fd3996610c7d87826f621bc1910",
+       "k": "5xFVYXA-4hlZe8cGHqrL0m7NzlugK_yai2MbF_SNXnA",
+       "g": "DbK532zCDBeTACNiNXAypMV5AlBt3CFWaIG_1GoG-gVmrkaK0CpLWl5VWgfHHYtMzn8TkLHje8nJWsfvZ9qH_A"
+      }
+     ],
+     [
+      "s:1:bob:81862913ab10e4e98ca4d889b1cc8fb3"
+     ],
+     [
+      "s:1:bob:81862913ab10e4e98ca4d889b1cc8fb3",
+      {
+       "r": 1,
+       "p": "bob",
+       "v": 1,
+       "b": [
+        {
+         "type": "black",
+         "amount": 7
+        }
+       ],
+       "c": "b05aba99114fc70aa8c7337222dce4b677e50fd3996610c7d87826f621bc1910",
+       "k": "5xFVYXA-4hlZe8cGHqrL0m7NzlugK_yai2MbF_SNXnA",
+       "g": "DbK532zCDBeTACNiNXAypMV5AlBt3CFWaIG_1GoG-gVmrkaK0CpLWl5VWgfHHYtMzn8TkLHje8nJWsfvZ9qH_A"
+      }
+     ]
+    ],
+    [
+     [
+      "s:1:carol:bba46b206b5367f93754d0fbc8f06df0",
+      {
+       "r": 1,
+       "p": "carol",
+       "v": 1,
+       "b": [
+        {
+         "type": "odd",
+         "amount": 3
+        }
+       ],
+       "c": "ca93ce856bb2f0faa7e6c4c7f722945df28d7d783f45986a3ba02399d9aed7a6",
+       "k": "BUmlWwK5dhg7VFC5ZNjxlC4K-lQKr_72fVkGnd1RBRg",
+       "g": "EMd7i4N7vjp6-Vr2lT2Riq7_iAg2jS1ODnFOyG9XM54ef0CZZGimQMbGtAlupkhslBFKQOnX-i1tE3LuBTUNCg"
+      }
+     ]
+    ],
+    [
+     [
+      "s:1:alice:3810d79a6d4f3e9b1223262921daf7df",
+      {
+       "r": 1,
+       "p": "alice",
+       "v": 1,
+       "b": [
+        {
+         "type": "red",
+         "amount": 10
+        }
+       ],
+       "c": "0a8e72d5ee562b171a6e2ba394f4819bdf19fdc916fa3c632a7dacfb13910f9d",
+       "k": "yskUTL-XPLapIiCcR0SnVdKg4BEON8gY_bS1Dmq0aH4",
+       "g": "S1Wc99qx1jc6Fn9THrrNmc81YO8kEdPAfaxO_CXjAmyYjdz36A-rVYUkYX4PWzsyQB5vWeWtsIhMLPa7ovEfBw"
+      }
+     ],
+     [
+      "s:1:alice:bb2ffe8052ea062047f10f8c54e27706",
+      {
+       "r": 1,
+       "p": "alice",
+       "v": 2,
+       "b": [
+        {
+         "type": "red",
+         "amount": 999
+        }
+       ],
+       "c": "0a8e72d5ee562b171a6e2ba394f4819bdf19fdc916fa3c632a7dacfb13910f9d",
+       "k": "WScyppen84R8MEdGDx0Er2IbJK1tq5oXEOmGP_-WcNU",
+       "g": "cCTC6EG-vS8VSoIyQwE1JVSGkm7aRPU8L8N351Hhrvb9FsempaKsJ3WuyISawGz2Y9H4V3BmlqVY0F90QDHqQg"
+      }
+     ]
+    ]
+   ],
+   "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"10\"],[\"bob\",\"7\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1253,\"rawBytes\":1253}",
+   "digest": "fa4dcfdf8662898561276f989112b3cd56435ff30db03d5c74211beab2d492fa"
+  },
+  {
+   "name": "a rogue key writes a felt under another player's name (r)",
+   "ctx": {
+    "room": "room-fold-corpus",
+    "t": "roulette-1",
+    "inc": "r0123456789abcdef01234567"
+   },
+   "cp": null,
+   "houses": [
+    "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "q5r6VlMCTSA6RfGIHAyKqLoF6rJyompaFutPCy9_4iQ"
+    ],
+    [
+     "bob",
+     "AVCQwxxrybwa4YqnJs32mmffSWgisT0ykkIIHnkVhQE"
+    ]
+   ],
+   "sigs": "fake",
+   "hold": [],
+   "records": [
+    [
+     "s:1:alice:68bddf1c7ca49ad383e9a342267846a0",
+     {
+      "r": 1,
+      "p": "alice",
+      "v": 1,
+      "b": [
+       {
+        "type": "red",
+        "amount": 10
+       }
+      ],
+      "c": "02b8c95d9a5435c51a7cdb90beb36903dd66b48dc949c20db0041ce4b4040eee",
+      "k": "q5r6VlMCTSA6RfGIHAyKqLoF6rJyompaFutPCy9_4iQ",
+      "g": "ZCdlYnz4oHgsA0MTEQmYfFd3uJ8iZTG9prUW8eL0p-YRS8i8Bh18_t146hahE7WwiSYlHxYEt7VfQ-CtvlhWZg"
+     }
+    ],
+    [
+     "s:1:bob:5f5c89f2776adb747a0fe10e639491bb",
+     {
+      "r": 1,
+      "p": "bob",
+      "v": 1,
+      "b": [
+       {
+        "type": "black",
+        "amount": 7
+       }
+      ],
+      "c": "fcd2eb09cffbc6868adb4714694455d4f9f665fc89661c1b009d5c5183846855",
+      "k": "AVCQwxxrybwa4YqnJs32mmffSWgisT0ykkIIHnkVhQE",
+      "g": "nUxCrGXUTnliHu8FPSMZjcBg3iy-7y-yjP-UB7blHKwIegoNE0j2QJ_Kj0Jh271XRQy32Q_EdYzdofSOiJicYQ"
+     }
+    ],
+    [
+     "s:1:carol:15df90fbc90d955c1520f064f12017a0",
+     {
+      "r": 1,
+      "p": "carol",
+      "v": 1,
+      "b": [
+       {
+        "type": "odd",
+        "amount": 3
+       }
+      ],
+      "c": "ea16f21a4f4fbbbf33db376eb3b2f109b20b4e04be318d1c92c4318ba2a9fd5d",
+      "k": "Urk1UWavdftN6kY46oxiM6ossQACMrtG8vjePcvuq4w",
+      "g": "aazv3xhthEqdPJQRUwZoTFuU_7bgtOjl6fdZoDGIIMPDRMNw20VTZhpKaOmm_mM5A-v0Pc8TppIHMEox8DK1GA"
+     }
+    ],
+    [
+     "s:1:alice:1b232f53212952455e8b55d56fca18b5",
+     {
+      "r": 1,
+      "p": "alice",
+      "v": 2,
+      "b": [
+       {
+        "type": "red",
+        "amount": 999
+       }
+      ],
+      "c": "02b8c95d9a5435c51a7cdb90beb36903dd66b48dc949c20db0041ce4b4040eee",
+      "k": "KJ2MBXbs4qHVDA3oWvThDdZp3Uehn3WyE9Kd8bw-eco",
+      "g": "Ethj0H8RDVA3jR2pTYvA5_j5h05JQSYTxb2xozyqruo-A-o2HYMkOAQtfMJvXSwqUBLZPMlNNtcXowbGZ3VFHw"
+     }
+    ]
+   ],
+   "warm": [
+    [
+     [
+      "s:1:bob:5f5c89f2776adb747a0fe10e639491bb",
+      {
+       "r": 1,
+       "p": "bob",
+       "v": 1,
+       "b": [
+        {
+         "type": "black",
+         "amount": 7
+        }
+       ],
+       "c": "fcd2eb09cffbc6868adb4714694455d4f9f665fc89661c1b009d5c5183846855",
+       "k": "AVCQwxxrybwa4YqnJs32mmffSWgisT0ykkIIHnkVhQE",
+       "g": "nUxCrGXUTnliHu8FPSMZjcBg3iy-7y-yjP-UB7blHKwIegoNE0j2QJ_Kj0Jh271XRQy32Q_EdYzdofSOiJicYQ"
+      }
+     ],
+     [
+      "s:1:bob:5f5c89f2776adb747a0fe10e639491bb"
+     ],
+     [
+      "s:1:bob:5f5c89f2776adb747a0fe10e639491bb",
+      {
+       "r": 1,
+       "p": "bob",
+       "v": 1,
+       "b": [
+        {
+         "type": "black",
+         "amount": 7
+        }
+       ],
+       "c": "fcd2eb09cffbc6868adb4714694455d4f9f665fc89661c1b009d5c5183846855",
+       "k": "AVCQwxxrybwa4YqnJs32mmffSWgisT0ykkIIHnkVhQE",
+       "g": "nUxCrGXUTnliHu8FPSMZjcBg3iy-7y-yjP-UB7blHKwIegoNE0j2QJ_Kj0Jh271XRQy32Q_EdYzdofSOiJicYQ"
+      }
+     ]
+    ],
+    [
+     [
+      "s:1:carol:15df90fbc90d955c1520f064f12017a0",
+      {
+       "r": 1,
+       "p": "carol",
+       "v": 1,
+       "b": [
+        {
+         "type": "odd",
+         "amount": 3
+        }
+       ],
+       "c": "ea16f21a4f4fbbbf33db376eb3b2f109b20b4e04be318d1c92c4318ba2a9fd5d",
+       "k": "Urk1UWavdftN6kY46oxiM6ossQACMrtG8vjePcvuq4w",
+       "g": "aazv3xhthEqdPJQRUwZoTFuU_7bgtOjl6fdZoDGIIMPDRMNw20VTZhpKaOmm_mM5A-v0Pc8TppIHMEox8DK1GA"
+      }
+     ]
+    ],
+    [
+     [
+      "s:1:alice:68bddf1c7ca49ad383e9a342267846a0",
+      {
+       "r": 1,
+       "p": "alice",
+       "v": 1,
+       "b": [
+        {
+         "type": "red",
+         "amount": 10
+        }
+       ],
+       "c": "02b8c95d9a5435c51a7cdb90beb36903dd66b48dc949c20db0041ce4b4040eee",
+       "k": "q5r6VlMCTSA6RfGIHAyKqLoF6rJyompaFutPCy9_4iQ",
+       "g": "ZCdlYnz4oHgsA0MTEQmYfFd3uJ8iZTG9prUW8eL0p-YRS8i8Bh18_t146hahE7WwiSYlHxYEt7VfQ-CtvlhWZg"
+      }
+     ],
+     [
+      "s:1:alice:1b232f53212952455e8b55d56fca18b5",
+      {
+       "r": 1,
+       "p": "alice",
+       "v": 2,
+       "b": [
+        {
+         "type": "red",
+         "amount": 999
+        }
+       ],
+       "c": "02b8c95d9a5435c51a7cdb90beb36903dd66b48dc949c20db0041ce4b4040eee",
+       "k": "KJ2MBXbs4qHVDA3oWvThDdZp3Uehn3WyE9Kd8bw-eco",
+       "g": "Ethj0H8RDVA3jR2pTYvA5_j5h05JQSYTxb2xozyqruo-A-o2HYMkOAQtfMJvXSwqUBLZPMlNNtcXowbGZ3VFHw"
+      }
+     ]
+    ]
+   ],
+   "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"10\"],[\"bob\",\"7\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1253,\"rawBytes\":1253}",
+   "digest": "5c09acd27e8daa110eed1f6e04bd0da39713ec22870918057b8f62586a39329a"
+  },
+  {
    "name": "ended c",
    "ctx": {
     "room": "room-fold-corpus",
@@ -15172,6 +15848,12 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "xYROkUpkJ5ck5g1DkCXr7H2aI1qYtKPMgbAPpD2BxyI"
+    ]
    ],
    "sigs": "fake",
    "hold": [],
@@ -15283,6 +15965,12 @@
    },
    "houses": [
     "MRxX52vgAud7HbnsMfm7RrXI6J9Yw5UtFJlWvC1z-t8"
+   ],
+   "pins": [
+    [
+     "alice",
+     "xYROkUpkJ5ck5g1DkCXr7H2aI1qYtKPMgbAPpD2BxyI"
+    ]
    ],
    "sigs": "fake",
    "hold": [],

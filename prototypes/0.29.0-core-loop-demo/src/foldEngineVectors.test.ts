@@ -52,7 +52,7 @@ function foldHere(c: FoldCase): Folded {
   (globalThis as Record<string, unknown>).__ssf_check = (hash: string, kind: string, pub: string, bytes: () => Uint8Array, sig: string) =>
     check(hash, kind, pub, bytes(), sig);
   try {
-    entry.open(c.ctx, c.cp, c.houses, 'host');
+    entry.open(c.ctx, c.cp, c.houses, c.pins, 'host');
     entry.reset(c.records);
     const summary = entry.result();
     return { summary, digest: sha(entry.digest()) };
@@ -67,7 +67,7 @@ function foldWarm(c: FoldCase): Folded {
   (globalThis as Record<string, unknown>).__ssf_check = (hash: string, kind: string, pub: string, bytes: () => Uint8Array, sig: string) =>
     check(hash, kind, pub, bytes(), sig);
   try {
-    entry.open(c.ctx, c.cp, c.houses, 'host');
+    entry.open(c.ctx, c.cp, c.houses, c.pins, 'host');
     for (const batch of c.warm) {
       entry.apply(batch.map((e) => [e[0], e.length === 1 ? undefined : e[1]] as const));
       entry.result();
@@ -101,7 +101,7 @@ function realmWithBundle(): { fold: (c: FoldCase) => Folded } {
   vm.runInContext(
     `globalThis.__fold = (text) => {
        const c = JSON.parse(text);
-       SSFFold.open(c.ctx, c.cp, c.houses, 'host');
+       SSFFold.open(c.ctx, c.cp, c.houses, c.pins, 'host');
        SSFFold.reset(c.records);
        const summary = SSFFold.result();
        return JSON.stringify({ summary, digest: __hostDigestOf(SSFFold.digest()) });
@@ -183,6 +183,32 @@ describe('the fold the node runs is the pages\'', () => {
     }
     for (const k of ['reveals', 'forfeit', 'house', 'void', 'undecided', 'tip', 'required', 'joins', 'pending', 'ended', 'point', 'held', 'dice']) {
       expect(seen[k] ?? 0, `no case reaches ${k}: ${JSON.stringify(seen)}`).toBeGreaterThan(0);
+    }
+  });
+
+  it("a player's pinned key decides whose version is the felt, and a pin that arrives later is read", () => {
+    const c = cases.find((x) => x.name.startsWith('a rogue key') && x.ctx.inc[0] === 'c')!;
+    const heldOf = (summary: string): [string, string][] => (JSON.parse(summary) as { held: [string, string][] }).held;
+    const check = checkFor(c);
+    (globalThis as Record<string, unknown>).__ssf_check = (hash: string, kind: string, pub: string, bytes: () => Uint8Array, sig: string) => check(hash, kind, pub, bytes(), sig);
+    try {
+      const pinOf = (pid: string): string => c.pins.find((q) => q[0] === pid)![1];
+      const rogueKey = (c.records.map((r) => r[1] as { p: string; k: string }).find((r) => r.p === 'alice' && r.k !== pinOf('alice')))!.k;
+      // The pins the case carries: alice's own version holds 10, bob's 7; carol (no pin) and mallory hold nothing.
+      entry.open(c.ctx, c.cp, c.houses, c.pins, 'host');
+      entry.reset(c.records);
+      expect(heldOf(entry.result())).toEqual([['alice', '10'], ['bob', '7']]);
+      // The rogue key pinned for alice (a page that saw it first): its version is the felt.
+      entry.setPins([['alice', rogueKey], ['bob', pinOf('bob')]]);
+      expect(heldOf(entry.result())).toEqual([['alice', '999'], ['bob', '7']]);
+      // And the pins back: the same answer as the first.
+      entry.setPins(c.pins);
+      expect(heldOf(entry.result())).toEqual([['alice', '10'], ['bob', '7']]);
+      // No pin at all: no felt at all.
+      entry.setPins([]);
+      expect(heldOf(entry.result())).toEqual([]);
+    } finally {
+      delete (globalThis as Record<string, unknown>).__ssf_check;
     }
   });
 

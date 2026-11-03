@@ -19,7 +19,9 @@
  *                                                (not checked yet); `bytes` is a function
  *                                                that makes the signed bytes, called only
  *                                                when the host has no verdict for `hash`
- * and nothing else: no clock, no randomness, no network, no keys.
+ * and nothing else: no clock, no randomness, no network, no keys. (The keys
+ * pinned for the players, and the room's houses, are data the host passes to
+ * open/setPins/setHouses: the fold never reads a doc.)
  *
  * WHAT IT RETURNS is plain JSON text (result): never a Map, a Set or a
  * bigint, and nothing keyed by a player's name as a JS property (a name may
@@ -53,6 +55,8 @@ export type CheckMode = 'host' | 'all';
 
 let fold: TableFold | null = null;
 let houses = new Set<string>();
+/** pid → the key pinned for that player (the host's: trust on first use). */
+let pinned = new Map<string, string>();
 let last: FoldResult | null = null;
 
 function checkOf(mode: CheckMode): SigCheck {
@@ -64,13 +68,23 @@ function checkOf(mode: CheckMode): SigCheck {
   };
 }
 
+/** A player's pinned key, as the pages pin it (casinoDoc computedPinOf): a
+ *  slip counts for the felt, and so for `held`, only if it is signed by the
+ *  key pinned for its player; with none pinned the player has no felt. Closes,
+ *  decisions and nets don't read it. */
+const keyOf = (pid: string): string | undefined => pinned.get(pid);
+
 /** Start folding a table: its incarnation's name (and so its rules), the
- *  checkpoint its live session follows (or null), and the keys that are the
- *  room's houses. Forgets the table folded before. */
-export function open(ctx: FoldCtx, cp: Checkpoint | null, houseKeys: readonly string[], mode: CheckMode = 'host'): void {
+ *  checkpoint its live session follows (or null), the keys that are the
+ *  room's houses and the keys pinned for its players, as [pid, key].
+ *  Forgets the table folded before. */
+export function open(
+  ctx: FoldCtx, cp: Checkpoint | null, houseKeys: readonly string[], pins: readonly (readonly [string, string])[], mode: CheckMode = 'host',
+): void {
   houses = new Set(houseKeys);
+  pinned = new Map(pins);
   const houseOk: HouseCheck = (pub) => houses.has(pub);
-  fold = new TableFold(ctx, checkOf(mode), undefined, foldGameOf(ctx), houseOk);
+  fold = new TableFold(ctx, checkOf(mode), keyOf, foldGameOf(ctx), houseOk);
   fold.setBase(cp);
   last = null;
 }
@@ -89,6 +103,13 @@ export function setBase(cp: Checkpoint | null): void {
 export function setHouses(houseKeys: readonly string[]): void {
   houses = new Set(houseKeys);
   live().houseChanged();
+}
+
+/** The keys pinned for the players changed (one showed up, or the host's
+ *  table was replaced): [pid, key], all of them. */
+export function setPins(pins: readonly (readonly [string, string])[]): void {
+  pinned = new Map(pins);
+  live().keysChanged();
 }
 
 /** Replace the whole live session: every record of it, as [key, value]. */

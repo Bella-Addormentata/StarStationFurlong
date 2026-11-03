@@ -301,10 +301,13 @@ impl FoldEngine {
     }
 
     /// Start folding a table: its checkpoint (the value `sum:` holds, or
-    /// none) and the keys that are the room's houses. A table already open is
-    /// forgotten and folded afresh. Evicts the least recently used table when
-    /// `FOLD_TABLES` are open.
-    pub fn open(&mut self, ctx: &Ctx, cp: Option<&CVal>, houses: &[String]) -> Result<(), FoldError> {
+    /// none), the keys that are the room's houses and the key pinned for each
+    /// player, as (pid, key) (trust on first use, as the pages pin: a slip
+    /// counts for a felt, and so for `held`, only if it is signed by its
+    /// player's pin, and a player with none has no felt). A table already open
+    /// is forgotten and folded afresh. Evicts the least recently used table
+    /// when `FOLD_TABLES` are open.
+    pub fn open(&mut self, ctx: &Ctx, cp: Option<&CVal>, houses: &[String], pins: &[(String, String)]) -> Result<(), FoldError> {
         let key = key_of(ctx);
         self.remove_slot(&key);
         if self.slots.len() >= FOLD_TABLES {
@@ -346,7 +349,7 @@ impl FoldEngine {
             for (i, h) in houses.iter().enumerate() {
                 keys.set(i, h.as_str())?;
             }
-            entry(js, "open")?.call::<_, ()>((table, cp, keys, "host"))
+            entry(js, "open")?.call::<_, ()>((table, cp, keys, string_pairs(js, pins)?, "host"))
         })
     }
 
@@ -372,6 +375,11 @@ impl FoldEngine {
             }
             entry(js, "setHouses")?.call::<_, ()>((keys,))
         })
+    }
+
+    /// The keys pinned for the players changed (one showed up): all of them, as (pid, key).
+    pub fn set_pins(&mut self, ctx: &Ctx, pins: &[(String, String)]) -> Result<(), FoldError> {
+        self.call(&key_of(ctx), WARM_BUDGET, |js| entry(js, "setPins")?.call::<_, ()>((string_pairs(js, pins)?,)))
     }
 
     /// Replace the whole live session with these records.
@@ -500,6 +508,18 @@ fn classify(message: &str) -> FoldError {
 fn entry<'js>(js: &JsCtx<'js>, name: &str) -> rquickjs::Result<Function<'js>> {
     let ssf: Object = js.globals().get("SSFFold")?;
     ssf.get(name)
+}
+
+/// [[a, b], …] of strings.
+fn string_pairs<'js>(js: &JsCtx<'js>, items: &[(String, String)]) -> rquickjs::Result<Array<'js>> {
+    let list = Array::new(js.clone())?;
+    for (i, (a, b)) in items.iter().enumerate() {
+        let pair = Array::new(js.clone())?;
+        pair.set(0, a.as_str())?;
+        pair.set(1, b.as_str())?;
+        list.set(i, pair)?;
+    }
+    Ok(list)
 }
 
 /// [[key, value], …] for the fold: a `None` value is `undefined` (a deletion).
