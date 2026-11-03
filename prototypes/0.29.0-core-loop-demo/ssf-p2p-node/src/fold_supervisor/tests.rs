@@ -624,6 +624,60 @@ fn answers_the_node_has_not_taken_wait_in_the_pipe_and_not_in_the_node() {
 }
 
 #[test]
+fn one_poll_hands_over_half_the_allowance_however_fast_the_reader_refills() {
+    // Taking an answer lets the reader read another: a poll that kept going while answers keep
+    // coming would hold every answer the worker is owed.
+    let t0 = Instant::now();
+    let one = one_answer();
+    let (mut s, mut m) = holding(t0, 10 * one);
+    for v in 1..=10 {
+        assert_eq!(s.post(t0, &warm("a", v)), Post::Posted);
+        m.next_req();
+        m.reply(&result("a", v));
+    }
+    until("ten answers to be held", || waiting(&s) >= 10 * one);
+    let first = s.poll(t0);
+    assert_eq!(first.len(), 5, "half of ten, the fifth reaching it: {first:?}");
+    assert_eq!(first[0], Event::Answer(result("a", 1)));
+    let rest = events(&mut s, t0, 5);
+    assert_eq!(rest.first(), Some(&Event::Answer(result("a", 6))));
+    assert_eq!(rest.last(), Some(&Event::Answer(result("a", 10))));
+}
+
+#[test]
+fn answers_left_for_the_next_poll_are_not_lost_to_a_process_seen_gone() {
+    let t0 = Instant::now();
+    let one = one_answer();
+    let (mut s, mut m) = holding(t0, 10 * one);
+    for v in 1..=10 {
+        assert_eq!(s.post(t0, &warm("a", v)), Post::Posted);
+        m.next_req();
+    }
+    // The process is found gone while its output has said nothing yet: the moment it is given
+    // runs from here.
+    m.exit();
+    assert!(s.poll(t0).is_empty());
+    for v in 1..=10 {
+        m.reply(&result("a", v));
+    }
+    until("the ten answers to be held", || waiting(&s) >= 10 * one);
+    // Long after: a poll hands over a share of the answers and leaves the failure to a later one,
+    // so what it has not handed over is not thrown away with the link.
+    let late = t0 + secs(10);
+    let first = s.poll(late);
+    assert_eq!(first.len(), 5, "{first:?}");
+    assert!(first.iter().all(|e| matches!(e, Event::Answer(_))), "no failure yet: {first:?}");
+    let mut rest = vec![];
+    while !rest.iter().any(|e| matches!(e, Event::Crashed { .. })) {
+        rest.extend(s.poll(late));
+        assert!(rest.len() < 100);
+    }
+    let answers = rest.iter().filter(|e| matches!(e, Event::Answer(_))).count();
+    assert_eq!(answers, 5, "the other five come before the failure: {rest:?}");
+    assert_eq!(crashed(rest.last().unwrap()).0, "the worker exited");
+}
+
+#[test]
 fn a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung() {
     // The reader waits for the node; the wait is not the worker's silence.
     let t0 = Instant::now();

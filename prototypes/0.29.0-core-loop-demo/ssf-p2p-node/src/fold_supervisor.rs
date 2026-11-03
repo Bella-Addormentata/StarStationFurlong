@@ -30,7 +30,8 @@
 //! WHAT A FAULTY WORKER CAN COST THE NODE is bounded in each direction:
 //! [`QUEUE_BYTES`] of frames waiting for it, [`MAX_OWED`] answers owed, and
 //! [`ANSWER_BYTES`] of answers read and not yet taken (the reader thread waits,
-//! and so does the worker, on its pipe). An answer nobody asked for ends the link.
+//! and so does the worker, on its pipe), and one poll hands over at most half
+//! of that and one answer more. An answer nobody asked for ends the link.
 //!
 //! All time comes in as an argument (`now`), so the rules are tested in
 //! virtual time.
@@ -70,7 +71,9 @@ pub const MAX_OWED: usize = 256;
 /// The reader thread stops reading past that (the worker then waits to write, on a full pipe)
 /// until the node takes some, unless nothing waits (so one big answer always comes). A faulty
 /// worker thus costs the node, ahead of its polling, at most this and the answer in the reader's
-/// hands, whatever it is owed; one answer is never more than a frame.
+/// hands, whatever it is owed; one answer is never more than a frame. A single poll hands over
+/// at most half of it (and the answer that reaches it), so taking answers as fast as the reader
+/// brings them does not hold them all at once either.
 pub const ANSWER_BYTES: usize = 32 << 20;
 /// How long a worker's process may be gone before the supervisor stops waiting for its output
 /// to say so: the reader thread sees the pipe end the moment the process does, and what the
@@ -180,6 +183,13 @@ impl Inbox {
 
     fn waiting(&self) -> usize {
         *self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The bytes of answers one poll hands over before it stops (half the allowance): taking an
+    /// answer lets the reader read another, so without this a poll that keeps up with the reader
+    /// could be handed everything a worker is owed.
+    fn per_poll(&self) -> usize {
+        (self.limit / 2).max(1)
     }
 }
 
@@ -520,12 +530,19 @@ impl<L: Launch> Supervisor<L> {
     /// silent too long. Never blocks.
     pub fn poll(&mut self, now: Instant) -> Vec<Event> {
         let mut events = std::mem::take(&mut self.unsaid);
+        let mut handed = 0usize;
         loop {
             let Some(link) = self.link.as_ref() else { return events };
+            if handed >= link.inbox.per_poll() {
+                // That is enough for one poll (the caller holds what it is handed): the rest, and
+                // whatever the worker's process or silence says, wait for the next.
+                return events;
+            }
             match link.rx.try_recv() {
                 Ok(Incoming::Resp(resp, bytes)) => {
                     // Out of the queue, whatever it turns out to be: the reader may go on.
                     link.inbox.taken(bytes);
+                    handed = handed.saturating_add(bytes);
                     let in_step = self.owed.front().is_some_and(|o| &o.ctx == resp.ctx() && o.version == resp.version());
                     if !in_step {
                         self.fail_into(now, "the worker answered out of step".into(), &mut events);
