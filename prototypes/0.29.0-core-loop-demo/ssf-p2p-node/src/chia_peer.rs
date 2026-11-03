@@ -1722,6 +1722,86 @@ mod tests {
         }
     }
 
+    /// [`PeerConn::close`] and [`Readers`] with workers in parallel (#372
+    /// review). The tests above run on the test's single-threaded runtime;
+    /// this runs on four workers, so the closes, the requests and the reader
+    /// run at once and their order is the scheduler's. Each of twenty rounds
+    /// dials a full node with its reader counted, puts four requests on the
+    /// connection and closes it from three tasks at once, the readers' close
+    /// signal sent before the closes, beside them or after them, by the
+    /// round. Each close returns within its bound with the connection dead
+    /// and closed and its reader gone, its done watch closed (read in the
+    /// task that called it); every request ends; and the count is back to
+    /// zero once [`Readers::gone`] returns. A pass shows the promises held in
+    /// the orders these rounds happened to run; it is not one of the
+    /// deterministic regressions, which stay as they are. Each round is
+    /// bounded, so a hang fails the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_close_promises_hold_with_workers_in_parallel() {
+        let handler: Handler = Arc::new(|m| match m.msg_type {
+            ProtocolMessageTypes::RequestPuzzleState => {
+                let request = RequestPuzzleState::from_bytes(&m.data).unwrap();
+                vec![reply(&RespondPuzzleState::new(request.puzzle_hashes, 9, request.header_hash, true, Vec::<CoinState>::new()))]
+            }
+            _ => vec![],
+        });
+        let node = spawn("mocknet", NodeType::FullNode, genesis(), None, handler).await;
+        let (net, tls) = (net(), tls());
+        for round in 0..20u8 {
+            let signal_at = round % 3;
+            let ended = tokio::time::timeout(Duration::from_secs(30), async {
+                let (signal, closed) = watch::channel(false);
+                let readers = Readers::new(closed);
+                let conn = PeerConn::connect_until(node.addr, Source::Gossip, &net, tls.clone(), std::future::pending::<()>(), Some(&readers))
+                    .await
+                    .expect("never stopped")
+                    .expect("the dial connects");
+                let requests: Vec<JoinHandle<()>> = (0..4u8)
+                    .map(|i| {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let filters = chia_protocol::CoinStateFilters::new(true, true, true, 0);
+                            let ask = RequestPuzzleState::new(vec![], None, Bytes32::new([round.wrapping_mul(4).wrapping_add(i); 32]), filters, false);
+                            let _ = conn.request::<RespondPuzzleState, _>(ask).await;
+                        })
+                    })
+                    .collect();
+                if signal_at == 0 {
+                    signal.send_replace(true);
+                }
+                let closes: Vec<JoinHandle<(bool, bool, bool, bool)>> = (0..3)
+                    .map(|_| {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let returned = tokio::time::timeout(Duration::from_secs(10), conn.close()).await.is_ok();
+                            (returned, conn.alive(), conn.closed_for_test(), conn.reader_done_for_test().has_changed().is_err())
+                        })
+                    })
+                    .collect();
+                if signal_at == 1 {
+                    signal.send_replace(true);
+                }
+                for close in closes {
+                    let (returned, alive, closed, gone) =
+                        tokio::time::timeout(Duration::from_secs(15), close).await.expect("the close task ends").unwrap();
+                    assert!(returned, "round {round}, signal {signal_at}: close() returns within its bound");
+                    assert!(!alive && closed, "round {round}, signal {signal_at}: the connection is dead and closed once close() returns");
+                    assert!(gone, "round {round}, signal {signal_at}: the reader is gone once close() returns");
+                }
+                if signal_at == 2 {
+                    signal.send_replace(true);
+                }
+                for request in requests {
+                    tokio::time::timeout(Duration::from_secs(15), request).await.expect("the request ends").unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(5), readers.gone()).await.expect("the count is back to zero");
+                assert_eq!(readers.running(), 0, "round {round}, signal {signal_at}: no reader counted");
+            })
+            .await;
+            assert!(ended.is_ok(), "round {round} ends within its bound");
+        }
+    }
+
     #[test]
     fn the_rate_gate_delays_the_request_past_the_limit_until_the_oldest_leaves_the_window() {
         let mut gate = RateGate::new();
