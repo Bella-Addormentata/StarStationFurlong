@@ -490,10 +490,11 @@ impl Drop for PeerConn {
 }
 
 impl PeerConn {
-    /// [`Self::connect_until`] with nothing to stop it (tests).
+    /// [`Self::connect_until`] with nothing to stop it and no lane's count
+    /// for its reader (tests).
     #[cfg(test)]
     pub async fn connect(addr: SocketAddr, sources: impl Into<Sources>, net: &Network, tls: Arc<rustls::ClientConfig>) -> Result<Arc<Self>> {
-        Self::connect_until(addr, sources, net, tls, std::future::pending())
+        Self::connect_until(addr, sources, net, tls, std::future::pending(), None)
             .await
             .unwrap_or_else(|| Err(anyhow!("a dial nothing stops was abandoned")))
     }
@@ -511,18 +512,28 @@ impl PeerConn {
     /// dial refused or abandoned after it stops the reader and waits for it
     /// to go, its half of the socket with it, before the socket is dropped
     /// ([`Self::reader_gone`]).
+    ///
+    /// `readers`, a lane's ([`Readers`]), counts the reader from just before
+    /// it starts until its half of the socket is gone, and stops it at the
+    /// lane's close signal, whoever holds the connection by then. So a dial
+    /// dropped where it stands (its caller gave up on it), which waits for
+    /// nothing, leaves its reader to that count: aborted with the
+    /// connection, the reader goes at its next turn, counted until then.
+    /// With none (the tests' [`Self::connect`]) the reader is counted
+    /// nowhere and stopped only by the connection.
     pub async fn connect_until(
         addr: SocketAddr,
         sources: impl Into<Sources>,
         net: &Network,
         tls: Arc<rustls::ClientConfig>,
         stop: impl Future<Output = ()>,
+        readers: Option<&Readers>,
     ) -> Option<Result<Arc<Self>>> {
         tokio::pin!(stop);
         let opened = tokio::select! {
             biased;
             () = &mut stop => return None,
-            opened = Self::open(addr, sources.into(), tls) => opened,
+            opened = Self::open(addr, sources.into(), tls, readers) => opened,
         };
         let (conn, handshake) = match opened {
             Ok(opened) => opened,
@@ -545,9 +556,15 @@ impl PeerConn {
     }
 
     /// TCP, TLS and the websocket upgrade, each within [`CONNECT_TIMEOUT`];
-    /// then the reader is started, and the connection is ready for the
-    /// handshake ([`Self::bind`]), whose answer comes on the receiver.
-    async fn open(addr: SocketAddr, sources: Sources, tls: Arc<rustls::ClientConfig>) -> Result<(Arc<Self>, oneshot::Receiver<Handshake>)> {
+    /// then the reader is started, counted in `readers` when there are any,
+    /// and the connection is ready for the handshake ([`Self::bind`]), whose
+    /// answer comes on the receiver.
+    async fn open(
+        addr: SocketAddr,
+        sources: Sources,
+        tls: Arc<rustls::ClientConfig>,
+        readers: Option<&Readers>,
+    ) -> Result<(Arc<Self>, oneshot::Receiver<Handshake>)> {
         let addr = canonical(addr);
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -577,8 +594,11 @@ impl PeerConn {
         let peak_at = Arc::new(Mutex::new(None));
         let (done_tx, reader_done) = watch::channel(());
         // Nothing awaits from here to the connection's construction: once the
-        // reader runs, the connection that stops it exists.
-        let reader = tokio::spawn(read_loop(ReaderHalf { stream, _done: done_tx }, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
+        // reader runs, the connection that stops it exists, and a lane that
+        // counts its readers has counted it since before it was spawned.
+        let half = ReaderHalf { stream, _done: done_tx, _counted: readers.map(Readers::count) };
+        let closed = readers.map(|readers| readers.closed.clone());
+        let reader = tokio::spawn(read_loop(half, closed, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
             sources: Mutex::new(sources),
@@ -787,6 +807,14 @@ impl PeerConn {
         self.closed.initialized()
     }
 
+    /// The reader's done watch ([`Self::reader_done`]), which reads closed
+    /// once the reader task is gone, so it can be read after the connection
+    /// is (tests).
+    #[cfg(test)]
+    pub(crate) fn reader_done_for_test(&self) -> watch::Receiver<()> {
+        self.reader_done.clone()
+    }
+
     /// Send a message that expects no answer.
     pub async fn send<B>(&self, body: B) -> Result<()>
     where
@@ -941,24 +969,95 @@ impl PeerConn {
     }
 }
 
-/// The reader's half of the socket, and the sender whose drop says the
-/// reader is gone ([`PeerConn::reader_gone`]). Fields drop in the order they
-/// are declared, so the stream goes before `_done` however the reader task
-/// ends: aborted before its first turn, aborted while it waits, or at the
-/// stream's end. Parameters would not do: a future drops them in one order
-/// unpolled and in the other once it has run. Keep `stream` first, and never
-/// move it out.
+/// The readers of the connections a lane dials ([`PeerConn::connect_until`]):
+/// how many there are, each counted from just before it starts until its
+/// half of the socket is gone, and the lane's close signal, at which each
+/// stops by itself, whoever holds its connection. A lane that waits for
+/// none to be left ([`Self::gone`]) after its close signal waits for every
+/// reader it started, the readers of connections it no longer holds
+/// included, and for nothing more than each one's next turn: an aborted
+/// reader is dropped there, and a signalled one ends there.
+pub struct Readers {
+    running: watch::Sender<usize>,
+    closed: watch::Receiver<bool>,
+}
+
+impl Readers {
+    /// Readers that stop once `closed` reads true. A reader whose signal's
+    /// sender is gone (its lane dropped, not closed) runs on as one with no
+    /// lane does.
+    pub fn new(closed: watch::Receiver<bool>) -> Self {
+        Self { running: watch::Sender::new(0), closed }
+    }
+
+    /// Until no reader counted here is left, the half of the socket of each
+    /// gone before its count ([`ReaderHalf`]).
+    pub async fn gone(&self) {
+        let mut running = self.running.subscribe();
+        // Never closed: `self` holds the sender.
+        let _ = running.wait_for(|running| *running == 0).await;
+    }
+
+    /// How many readers are counted (tests).
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        *self.running.borrow()
+    }
+
+    /// Count one reader, before it is spawned ([`PeerConn::open`]).
+    fn count(&self) -> Counted {
+        self.running.send_modify(|running| *running += 1);
+        Counted(self.running.clone())
+    }
+}
+
+/// One reader in a lane's count ([`Readers`]), from just before it is
+/// spawned until it is dropped, last of its [`ReaderHalf`].
+struct Counted(watch::Sender<usize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
+    }
+}
+
+/// The reader's half of the socket, the sender whose drop says the reader
+/// is gone ([`PeerConn::reader_gone`]), and the reader's place in its lane's
+/// count, if it has one ([`Readers`]). Fields drop in the order they are
+/// declared, so the stream goes before `_done`, and `_done` before
+/// `_counted`, however the reader task ends: aborted before its first turn,
+/// aborted while it waits, at its lane's close signal, or at the stream's
+/// end. A lane that finds no reader counted thus finds every one's half of
+/// the socket gone, and its done sender with it. Parameters would not do: a
+/// future drops them in one order unpolled and in the other once it has run.
+/// Keep `stream` first and `_counted` last, and never move either out.
 struct ReaderHalf<S = Stream> {
     stream: S,
     _done: watch::Sender<()>,
+    _counted: Option<Counted>,
+}
+
+/// Ready once `closed` reads true: a lane's close signal ([`Readers`]).
+/// Never ready with none, or once the signal's sender is gone.
+async fn close_signal(closed: Option<watch::Receiver<bool>>) {
+    if let Some(mut closed) = closed {
+        if closed.wait_for(|closed| *closed).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 /// The reader: answers go to their requests by id; the handshake and the peak
 /// announcements, which carry no id, go to their slots; everything else the
 /// node does not subscribe to yet (coin-state and mempool updates) is
-/// dropped. When the socket ends, every waiting request learns it.
+/// dropped. When the socket ends, or `closed` comes (its lane's close
+/// signal, [`close_signal`]), every waiting request learns it and the
+/// connection reads dead: the signal ends the loop as the stream's end does,
+/// whoever holds the connection, and before a frame ready beside it.
 async fn read_loop<S>(
     mut half: ReaderHalf<S>,
+    closed: Option<watch::Receiver<bool>>,
     pending: Arc<Mutex<Pending>>,
     peak: watch::Sender<Option<Peak>>,
     peak_at: Arc<Mutex<Option<Instant>>>,
@@ -966,7 +1065,15 @@ async fn read_loop<S>(
 ) where
     S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(frame) = half.stream.next().await {
+    let stop = close_signal(closed);
+    tokio::pin!(stop);
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = &mut stop => break,
+            frame = half.stream.next() => frame,
+        };
+        let Some(frame) = frame else { break };
         let frame = match frame {
             Ok(frame) => frame,
             Err(_) => break,
@@ -1502,9 +1609,16 @@ mod tests {
         let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let net = net();
-        let dial = PeerConn::connect_until(node.addr, Source::Gossip, &net, tls(), async {
-            let _ = stop_rx.await;
-        });
+        let dial = PeerConn::connect_until(
+            node.addr,
+            Source::Gossip,
+            &net,
+            tls(),
+            async {
+                let _ = stop_rx.await;
+            },
+            None,
+        );
         let stop = async {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !node.seen.lock().unwrap().contains(&ProtocolMessageTypes::Handshake) {
@@ -1528,13 +1642,18 @@ mod tests {
     }
 
     /// The reader's half of the socket goes before the reader reads as gone
-    /// (#372 review). [`PeerConn::reader_gone`] returns once the
-    /// reader's sender drops, and a closer that returns then drops the last
-    /// handle on the connection: a stream dropped after the sender would
-    /// keep its half of the socket past close() on a runtime with other
-    /// workers. A probe stream records, as it drops, whether the sender is
-    /// still there, however the reader ends: never polled (aborted before its
-    /// first turn), dropped while it waits, or at the stream's end.
+    /// (#372 review), and before its lane counts it gone (round 4).
+    /// [`PeerConn::reader_gone`] returns once the reader's sender drops, and
+    /// a closer that returns then drops the last handle on the connection:
+    /// a stream dropped after the sender would keep its half of the socket
+    /// past close() on a runtime with other workers. The lane's close()
+    /// returns once its count of readers is down to zero ([`Readers`]), so
+    /// the count goes last. A probe stream records, as it drops, whether the
+    /// sender is still there and the reader still counted, however the
+    /// reader ends: never polled (aborted before its first turn), dropped
+    /// while it waits, at its lane's close signal, or at the stream's end.
+    /// At the signal and at the end, a request waiting on the connection
+    /// learns it and the connection reads dead.
     #[tokio::test]
     async fn the_readers_half_of_the_socket_goes_before_the_reader_reads_gone() {
         use std::pin::Pin;
@@ -1543,7 +1662,8 @@ mod tests {
         struct Probe {
             ends: bool,
             done: watch::Receiver<()>,
-            sender_left: Arc<Mutex<Option<bool>>>,
+            counted: watch::Receiver<usize>,
+            left: Arc<Mutex<Option<(bool, usize)>>>,
         }
         impl futures_util::Stream for Probe {
             type Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
@@ -1557,7 +1677,7 @@ mod tests {
         }
         impl Drop for Probe {
             fn drop(&mut self) {
-                *self.sender_left.lock().unwrap() = Some(self.done.has_changed().is_ok());
+                *self.left.lock().unwrap() = Some((self.done.has_changed().is_ok(), *self.counted.borrow()));
             }
         }
 
@@ -1565,26 +1685,39 @@ mod tests {
         enum How {
             NeverPolled,
             DroppedWhileWaiting,
+            Signalled,
             StreamEnded,
         }
-        for how in [How::NeverPolled, How::DroppedWhileWaiting, How::StreamEnded] {
+        for how in [How::NeverPolled, How::DroppedWhileWaiting, How::Signalled, How::StreamEnded] {
             let (done_tx, done_rx) = watch::channel(());
-            let sender_left = Arc::new(Mutex::new(None));
-            let probe = Probe { ends: how == How::StreamEnded, done: done_rx, sender_left: sender_left.clone() };
+            let (closed_tx, closed_rx) = watch::channel(false);
+            let readers = Readers::new(closed_rx);
+            let left = Arc::new(Mutex::new(None));
+            let probe = Probe { ends: how == How::StreamEnded, done: done_rx, counted: readers.running.subscribe(), left: left.clone() };
             let (peak_tx, _peak_rx) = watch::channel(None);
-            let reader = read_loop(
-                ReaderHalf { stream: probe, _done: done_tx },
-                Arc::new(Mutex::new(Pending::default())),
-                peak_tx,
-                Arc::new(Mutex::new(None)),
-                Arc::new(AtomicBool::new(true)),
-            );
+            let (asked_tx, mut asked_rx) = oneshot::channel();
+            let pending = Arc::new(Mutex::new(Pending { waiting: HashMap::from([(1, asked_tx)]), handshake: None }));
+            let alive = Arc::new(AtomicBool::new(true));
+            let half = ReaderHalf { stream: probe, _done: done_tx, _counted: Some(readers.count()) };
+            let reader = read_loop(half, Some(readers.closed.clone()), pending, peak_tx, Arc::new(Mutex::new(None)), alive.clone());
+            assert_eq!(readers.running(), 1, "{how:?}: counted from before the reader runs");
             match how {
                 How::NeverPolled => drop(reader),
                 How::DroppedWhileWaiting => assert!(futures_util::FutureExt::now_or_never(reader).is_none(), "the probe holds the reader"),
+                How::Signalled => {
+                    let mut reader = Box::pin(reader);
+                    assert!(futures_util::FutureExt::now_or_never(&mut reader).is_none(), "the probe holds the reader");
+                    closed_tx.send_replace(true);
+                    reader.await;
+                }
                 How::StreamEnded => reader.await,
             }
-            assert_eq!(*sender_left.lock().unwrap(), Some(true), "{how:?}: the stream goes while the reader still reads as running");
+            assert_eq!(*left.lock().unwrap(), Some((true, 1)), "{how:?}: the stream goes while the reader still reads as running, and counted");
+            assert_eq!(readers.running(), 0, "{how:?}: once it is gone, its lane counts it gone");
+            if matches!(how, How::Signalled | How::StreamEnded) {
+                assert!(!alive.load(Ordering::Relaxed), "{how:?}: the connection reads dead");
+                assert!(asked_rx.try_recv().is_err_and(|e| e == oneshot::error::TryRecvError::Closed), "{how:?}: the waiting request learns it");
+            }
         }
     }
 
