@@ -595,6 +595,22 @@ impl TableRead {
         self.reveals.iter().any(|e| e.r == r && e.x.is_empty() && e.commit == h)
     }
 
+    /// Whether some house's commitment is still outstanding at round `r`:
+    /// the one a close of `r` must name, as the pages' fold takes it. After
+    /// a reveal of round `r - 1` that carried one, it is that one, unless a
+    /// step-down at `r` opened it. At the first round past a checkpoint it
+    /// is the checkpoint's `h` and no reveal in the session: a trim copies
+    /// round u's house reveal into the next session, but not a step-down at
+    /// u + 1 that lifted the commitment the reveal carried, and then writes
+    /// no `h`, so the copy would make a lifted commitment look outstanding
+    /// (and one that a v0.50 trim did not copy, a missing one).
+    fn outstanding(&self, r: i64) -> bool {
+        if r == self.base_u + 1 {
+            return self.cp_h.as_deref().is_some_and(|c| !self.stepped_down(r, c));
+        }
+        self.reveals.iter().any(|h| h.r == r - 1 && h.c.as_deref().is_some_and(|c| !self.stepped_down(r, c)))
+    }
+
     /// Round r's joins that count (not stepped down), lowest hash first: the
     /// pages' close names the first (computedTable, `res.joins[0]`).
     fn joins_at(&self, r: i64) -> Vec<&Join> {
@@ -2089,8 +2105,12 @@ impl House {
         // Nor when another of the owner's houses has: it joined the round,
         // or its reveal of the round before carried a commitment no
         // step-down has lifted (one house to a round: two would let a bettor
-        // see both outcomes).
-        if !read.joins_at(r).is_empty() || read.reveals.iter().any(|h| h.r == r - 1 && h.c.as_deref().is_some_and(|c| !read.stepped_down(r, c))) {
+        // see both outcomes). Past a checkpoint, that is the checkpoint's
+        // say ([`TableRead::outstanding`]). (Its own commitment, though, is
+        // `carried` whatever the checkpoint says: a step-down a trim dropped
+        // still opened the seed, and a house with no memory of it must not
+        // join that round on the commitment again.)
+        if !read.joins_at(r).is_empty() || read.outstanding(r) {
             return;
         }
         let mem = &self.rooms[room].tables[&key];

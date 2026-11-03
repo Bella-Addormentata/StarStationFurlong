@@ -690,8 +690,12 @@ export class SimHouse {
     if (settling || r <= done || revealedNow !== null || carried(r) || joined(r)) return;
     // Nor when another of the owner's houses has: it joined the round, or its
     // reveal of the round before carried a commitment no step-down has lifted
-    // (one house to a round: two would let a bettor see both outcomes).
-    if (joinsAt(read, r).length > 0 || read.reveals.some((h) => h.r === r - 1 && h.c !== undefined && !steppedDown(read, r, h.c))) return;
+    // (one house to a round: two would let a bettor see both outcomes). Past a
+    // checkpoint, that is the checkpoint's say (outstanding). (Its own
+    // commitment, though, is `carried` whatever the checkpoint says: a
+    // step-down a trim dropped still opened the seed, and a house with no
+    // memory of it must not join that round on the commitment again.)
+    if (joinsAt(read, r).length > 0 || outstanding(read, r)) return;
     if (mem.written.some(([, k]) => k.startsWith(`o:${r}:`))) return;
     const before = this.commit(ctx, r - 1);
     const toReveal = r - 1 > done && !mem.refused.has(r - 1)
@@ -711,6 +715,20 @@ export class SimHouse {
 /** computedFold steppedDown: a house's step-down at round r opened `h`. */
 function steppedDown(read: TableRead, r: number, h: string): boolean {
   return read.reveals.some((e) => e.r === r && e.x.length === 0 && e.commit === h);
+}
+
+/** Whether some house's commitment is still outstanding at round r: the one
+ *  a close of r must name, as the pages' fold takes it. After a reveal of
+ *  round r - 1 that carried one, it is that one, unless a step-down at r
+ *  opened it. At the first round past a checkpoint it is the checkpoint's `h`
+ *  and no reveal in the session: a trim copies round u's house reveal into the
+ *  next session, but not a step-down at u + 1 that lifted the commitment the
+ *  reveal carried, and then writes no `h`, so the copy would make a lifted
+ *  commitment look outstanding (and one that a v0.50 trim did not copy, a
+ *  missing one). */
+function outstanding(read: TableRead, r: number): boolean {
+  if (r === read.baseU + 1) return read.cpH !== undefined && !steppedDown(read, r, read.cpH);
+  return read.reveals.some((h) => h.r === r - 1 && h.c !== undefined && !steppedDown(read, r, h.c));
 }
 
 /** Round r's joins that count (not stepped down), lowest hash first: the
