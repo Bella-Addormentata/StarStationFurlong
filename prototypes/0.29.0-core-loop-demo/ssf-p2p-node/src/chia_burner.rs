@@ -26,6 +26,17 @@
 //! Nothing here is written to disk (§3.3, "No new secret on disk"): the node
 //! keeps only the wallet key, and R and the burner keys are computed when
 //! needed.
+//!
+//! What the derivations pass through is wiped as well: in [`BurnerRoot::of`]
+//! the copy of W and the material W ‖ G (R itself goes straight into the
+//! root, whose drop wipes it), and each keyed hash of R, which is a burner
+//! key's whole seed in [`BurnerRoot::key`] or a slot's bytes in
+//! [`BurnerRoot::slot`]. blake3's `zeroize` feature (Cargo.toml) makes its
+//! `Hash` wipeable, so each keyed hash is held in `Zeroizing` itself and read
+//! by reference, not copied out of a `Hash` that would be left behind. Out of
+//! this file's reach: the state blake3 keeps on its own stack while it
+//! hashes, the copies a move leaves, and a burner's `SecretKey`, which
+//! chia-bls does not wipe.
 #![cfg(feature = "chia-publish")]
 // Nothing in the node calls this module yet: PR 9 (`claim-and-write`, the
 // bundle builder) and PR 10 (`burner-writers`) are its callers (design §13).
@@ -118,7 +129,10 @@ impl BurnerRoot {
     pub fn of(money: &MoneyKey, net: ChiaNet) -> BurnerRoot {
         // §3.2: R = blake3::derive_key("ssf-chia-burner-root-v1", W.to_bytes() ‖ G).
         // W.to_bytes() is chia_bls's 32-byte big-endian scalar. The material
-        // holds the wallet key, so it and the copy of W are wiped.
+        // holds the wallet key, so it and the copy of W are wiped. R comes
+        // back from `derive_key` as a plain [u8; 32], not a `Hash`, and is
+        // moved straight into the root, whose drop wipes it: no copy of R is
+        // held here outside the root.
         let w = Zeroizing::new(money.0.to_bytes());
         let mut material = Zeroizing::new([0u8; 64]);
         material[..32].copy_from_slice(&w[..]);
@@ -142,9 +156,12 @@ impl BurnerRoot {
         msg[n + 9..].copy_from_slice(hint);
         // The 32-byte keyed hash is the seed. `from_seed` (Chia's KeyGen,
         // EIP-2333) asserts a seed of at least 32 bytes, so 32 is enough; it
-        // is the secret key's whole entropy, so it is wiped.
-        let seed = Zeroizing::new(*blake3::keyed_hash(&self.0, &msg).as_bytes());
-        BurnerKey(SecretKey::from_seed(&seed[..]))
+        // is the secret key's whole entropy, so it is wiped. The `Hash`
+        // blake3 returns is itself held in `Zeroizing` (blake3's `zeroize`
+        // feature) and its bytes are read by reference, so no unwiped copy
+        // of the seed is left in this frame.
+        let seed = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));
+        BurnerKey(SecretKey::from_seed(seed.as_bytes()))
     }
 
     /// P(e) of §3.2: the listing's key for `era`, under the hint of contact
@@ -176,14 +193,18 @@ impl BurnerRoot {
         msg[..n].copy_from_slice(LABEL_SLOT);
         msg[n] = kind;
         msg[n + 1..].copy_from_slice(&era.to_le_bytes());
-        let out = Zeroizing::new(*blake3::keyed_hash(&self.0, &msg).as_bytes());
+        // The keyed hash gives the slot away, so it is wiped as the seed is
+        // in `key`: the `Hash` itself is held in `Zeroizing` and read by
+        // reference, and its first 8 bytes are copied into a buffer that is
+        // wiped too.
+        let out = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));
         // u64(..) reads the first 8 bytes little-endian: the design names no
         // byte order, and every integer in the lane's bytes is little-endian
         // (the era in the hints and in this module's own messages). 2^64 is
         // not a multiple of 4,608, so the low slots are favoured, by about
         // one part in 4·10^15: nothing a reader could measure.
         let mut first = Zeroizing::new([0u8; 8]);
-        first.copy_from_slice(&out[..8]);
+        first.copy_from_slice(&out.as_bytes()[..8]);
         u64::from_le_bytes(*first) % SLOT_BLOCKS
     }
 }
@@ -791,62 +812,23 @@ mod tests {
         assert!(implements!(SecretKey: Into<SecretKey>));
     }
 
-    /// §3.4 and §12 Types, the half no trait bound can see. The fields of
-    /// `MoneyKey`, `BurnerRoot` and `BurnerKey` are private, so outside this
-    /// file safe code can build one only through the functions here, and
-    /// cannot read its secret. This test reads this file's own text before
-    /// its tests, with comments dropped, and pins each line that could
-    /// build a key or let a secret out, with the impl and fn it sits in: a
-    /// line that names `SecretKey`; names a key type before `(` or `)` (a
-    /// tuple struct's name is also its constructor, as in `BurnerKey(sk)` or
-    /// `.map(BurnerKey)`); builds through `Self` or a `0:` field; reads a
-    /// `.0` field; or uses `unsafe` (a `transmute` builds anything). So the
-    /// three fields stay private, a `BurnerKey` is built only in
-    /// `BurnerRoot::key`, a root only in `BurnerRoot::of` and a `MoneyKey`
-    /// only in `MoneyKey::new`, and a secret is read only by those two
-    /// derivations, `MoneyKey::secret_key`, the burner's public key, puzzle
-    /// hash and signer, the redacted Debug and the wipe. A new constructor,
-    /// accessor or field visibility changes the list and fails here until it
-    /// is pinned on purpose. The beacon's
-    /// `BurnerKey` (§3.4, PR 10) will be such a line: B is
-    /// `beacon_wallet_key(W)` (§3.2), a derivation from the `MoneyKey`, not
-    /// a constructor from any `SecretKey`. The scan reads text, not the
-    /// parsed program: it pins what is written here, for a reviewer to check
-    /// against the design, and would not see a name a macro pastes together.
-    #[test]
-    fn every_line_that_builds_a_key_or_reads_its_secret_is_pinned() {
-        const PINNED_LINES: [(&str, &str); 20] = [
-            ("", "use chia_bls::{PublicKey, SecretKey};"),
-            ("", "pub struct MoneyKey(SecretKey);"),
-            ("impl MoneyKey, fn new", "pub(crate) fn new(wallet: SecretKey) -> MoneyKey {"),
-            ("impl MoneyKey, fn new", "MoneyKey(wallet)"),
-            ("impl MoneyKey, fn secret_key", "pub(crate) fn secret_key(&self) -> &SecretKey {"),
-            ("impl MoneyKey, fn secret_key", "&self.0"),
-            ("impl fmt::Debug for MoneyKey, fn fmt", "f.write_str(\"MoneyKey(..)\")"),
-            ("", "pub struct BurnerRoot([u8; 32]);"),
-            ("impl BurnerRoot, fn of", "let w = Zeroizing::new(money.0.to_bytes());"),
-            ("impl BurnerRoot, fn of", "BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]))"),
-            ("impl BurnerRoot, fn key", "let seed = Zeroizing::new(*blake3::keyed_hash(&self.0, &msg).as_bytes());"),
-            ("impl BurnerRoot, fn key", "BurnerKey(SecretKey::from_seed(&seed[..]))"),
-            ("impl BurnerRoot, fn slot", "let out = Zeroizing::new(*blake3::keyed_hash(&self.0, &msg).as_bytes());"),
-            ("impl Drop for BurnerRoot, fn drop", "self.0.zeroize();"),
-            ("impl fmt::Debug for BurnerRoot, fn fmt", "f.write_str(\"BurnerRoot(..)\")"),
-            ("", "pub struct BurnerKey(SecretKey);"),
-            ("impl BurnerKey, fn public_key", "self.0.public_key()"),
-            ("impl BurnerKey, fn puzzle_hash", "chia_publish::our_puzzle_hash(&self.0)"),
-            ("impl BurnerKey, fn sign_spends", "chia_publish::sign_standard_spends(net, &self.0, coin_spends)"),
-            (
-                "impl fmt::Debug for BurnerKey, fn fmt",
-                "f.debug_struct(\"BurnerKey\").field(\"fingerprint\", &self.0.public_key().get_fingerprint()).finish_non_exhaustive()",
-            ),
-        ];
+    /// Where this file's test module starts, which the pin scan stops at. In
+    /// the file, this literal's `\n` is a backslash and an `n`, not a line
+    /// break, so the literal does not match itself.
+    const TESTS_START: &str = "\n#[cfg(test)]\nmod tests {";
+
+    /// The lines of `file`, this file's text, that
+    /// `every_line_that_builds_a_key_or_reads_its_secret_is_pinned` pins,
+    /// each with the impl and fn it sits in, in file order. The line ends
+    /// are made LF before anything is matched: Git for Windows with
+    /// `core.autocrlf=true` checks this file out with CRLF ends (the repo
+    /// has no `.gitattributes`), `include_str!` keeps them, and
+    /// `TESTS_START` and the pinned lines are LF text, so every comparison
+    /// here sees LF text on either checkout.
+    fn lines_that_build_a_key_or_read_its_secret(file: &str) -> Vec<(String, String)> {
         const MARKS: [&str; 12] =
             ["SecretKey", "MoneyKey(", "MoneyKey)", "BurnerRoot(", "BurnerRoot)", "BurnerKey(", "BurnerKey)", "Self(", "Self {", "0:", ".0", "unsafe"];
-        // The test module starts where this text does. In the file, this
-        // literal's `\n` is a backslash and an `n`, not a line break, so the
-        // literal does not match itself.
-        const TESTS_START: &str = "\n#[cfg(test)]\nmod tests {";
-        let file = include_str!("chia_burner.rs");
+        let file = file.replace("\r\n", "\n");
         assert_eq!(file.matches(TESTS_START).count(), 1, "one test module, after the code it scans");
         let (code, _) = file.split_once(TESTS_START).unwrap();
 
@@ -874,6 +856,61 @@ mod tests {
                 found.push((place, text.to_string()));
             }
         }
+        found
+    }
+
+    /// §3.4 and §12 Types, the half no trait bound can see. The fields of
+    /// `MoneyKey`, `BurnerRoot` and `BurnerKey` are private, so outside this
+    /// file safe code can build one only through the functions here, and
+    /// cannot read its secret. This test reads this file's own text before
+    /// its tests, with its line ends made LF and its comments dropped
+    /// (`lines_that_build_a_key_or_read_its_secret`), and pins each line
+    /// that could build a key or let a secret out, with the impl and fn it
+    /// sits in: a line that names `SecretKey`; names a key type before `(`
+    /// or `)` (a tuple struct's name is also its constructor, as in
+    /// `BurnerKey(sk)` or `.map(BurnerKey)`); builds through `Self` or a
+    /// `0:` field; reads a `.0` field; or uses `unsafe` (a `transmute`
+    /// builds anything). So the three fields stay private, a `BurnerKey` is
+    /// built only in
+    /// `BurnerRoot::key`, a root only in `BurnerRoot::of` and a `MoneyKey`
+    /// only in `MoneyKey::new`, and a secret is read only by those two
+    /// derivations, `MoneyKey::secret_key`, the burner's public key, puzzle
+    /// hash and signer, the redacted Debug and the wipe. A new constructor,
+    /// accessor or field visibility changes the list and fails here until it
+    /// is pinned on purpose. The beacon's
+    /// `BurnerKey` (§3.4, PR 10) will be such a line: B is
+    /// `beacon_wallet_key(W)` (§3.2), a derivation from the `MoneyKey`, not
+    /// a constructor from any `SecretKey`. The scan reads text, not the
+    /// parsed program: it pins what is written here, for a reviewer to check
+    /// against the design, and would not see a name a macro pastes together.
+    #[test]
+    fn every_line_that_builds_a_key_or_reads_its_secret_is_pinned() {
+        const PINNED_LINES: [(&str, &str); 20] = [
+            ("", "use chia_bls::{PublicKey, SecretKey};"),
+            ("", "pub struct MoneyKey(SecretKey);"),
+            ("impl MoneyKey, fn new", "pub(crate) fn new(wallet: SecretKey) -> MoneyKey {"),
+            ("impl MoneyKey, fn new", "MoneyKey(wallet)"),
+            ("impl MoneyKey, fn secret_key", "pub(crate) fn secret_key(&self) -> &SecretKey {"),
+            ("impl MoneyKey, fn secret_key", "&self.0"),
+            ("impl fmt::Debug for MoneyKey, fn fmt", "f.write_str(\"MoneyKey(..)\")"),
+            ("", "pub struct BurnerRoot([u8; 32]);"),
+            ("impl BurnerRoot, fn of", "let w = Zeroizing::new(money.0.to_bytes());"),
+            ("impl BurnerRoot, fn of", "BurnerRoot(blake3::derive_key(CTX_ROOT, &material[..]))"),
+            ("impl BurnerRoot, fn key", "let seed = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));"),
+            ("impl BurnerRoot, fn key", "BurnerKey(SecretKey::from_seed(seed.as_bytes()))"),
+            ("impl BurnerRoot, fn slot", "let out = Zeroizing::new(blake3::keyed_hash(&self.0, &msg));"),
+            ("impl Drop for BurnerRoot, fn drop", "self.0.zeroize();"),
+            ("impl fmt::Debug for BurnerRoot, fn fmt", "f.write_str(\"BurnerRoot(..)\")"),
+            ("", "pub struct BurnerKey(SecretKey);"),
+            ("impl BurnerKey, fn public_key", "self.0.public_key()"),
+            ("impl BurnerKey, fn puzzle_hash", "chia_publish::our_puzzle_hash(&self.0)"),
+            ("impl BurnerKey, fn sign_spends", "chia_publish::sign_standard_spends(net, &self.0, coin_spends)"),
+            (
+                "impl fmt::Debug for BurnerKey, fn fmt",
+                "f.debug_struct(\"BurnerKey\").field(\"fingerprint\", &self.0.public_key().get_fingerprint()).finish_non_exhaustive()",
+            ),
+        ];
+        let found = lines_that_build_a_key_or_read_its_secret(include_str!("chia_burner.rs"));
         let found: Vec<(&str, &str)> = found.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
         let new: Vec<_> = found.iter().filter(|l| !PINNED_LINES.contains(l)).collect();
         let gone: Vec<_> = PINNED_LINES.iter().filter(|l| !found.contains(l)).collect();
@@ -883,6 +920,25 @@ mod tests {
              that no money key becomes a BurnerKey and no burner secret leaves one (§3.4)\nnew: {new:#?}\ngone: {gone:#?}"
         );
         assert_eq!(found, PINNED_LINES.to_vec(), "the pinned lines, in another order or another number");
+    }
+
+    /// The pin scan on a Windows checkout: this file's text with CRLF line
+    /// ends, as Git for Windows with `core.autocrlf=true` writes it, gives
+    /// the same lines as with LF ends, so the pin test above passes on
+    /// either checkout. The CRLF text is made here from the file's own
+    /// text, so this runs on every platform. The control: the CRLF text
+    /// does not hold `TESTS_START` as it stands, so matching it unchanged
+    /// would find no test module.
+    #[test]
+    fn the_pinned_lines_are_the_same_with_crlf_line_ends() {
+        let file = include_str!("chia_burner.rs");
+        let lf = file.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(crlf.contains("\r\n") && !crlf.contains(TESTS_START), "the control: the CRLF text does not hold the LF marker");
+        let from_lf = lines_that_build_a_key_or_read_its_secret(&lf);
+        assert!(!from_lf.is_empty(), "the scan finds the pinned lines");
+        assert_eq!(lines_that_build_a_key_or_read_its_secret(file), from_lf, "the checkout's own text and its LF form");
+        assert_eq!(lines_that_build_a_key_or_read_its_secret(&crlf), from_lf, "CRLF line ends change the pinned lines");
     }
 
     /// §12 Types: a burner signs a spend of its own coin, for each network,

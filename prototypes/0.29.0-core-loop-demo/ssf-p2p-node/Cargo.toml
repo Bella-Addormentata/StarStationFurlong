@@ -30,7 +30,11 @@ anyhow = "1"
 base64 = "0.22"
 hex = "0.4"
 yrs = { version = "0.27", features = ["sync"] }
-blake3 = "1"
+# `zeroize` makes blake3's `Hash` wipeable, so the burner keys (chia_burner.rs)
+# hold each keyed hash of their root, a key's seed or a slot's bytes, in
+# `Zeroizing` itself. It adds only `zeroize` (already in every build, see
+# below) to blake3 and its arrayvec.
+blake3 = { version = "1", features = ["zeroize"] }
 rand = "0.8"
 # ChiaHub lane (REVIEW-20260710-ChiaHub.md): room-key-sealed presence records.
 # Pure-Rust AEAD — no linker-surface risk. Chain IO deps land in C1 after B-7.
