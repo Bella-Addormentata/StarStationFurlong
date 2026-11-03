@@ -457,6 +457,10 @@ pub struct HouseFoldReport {
     pub worker_failures: u64,
     /// Rooms followed now.
     pub rooms: u64,
+    /// House tables followed now, and ones left out because the worker holds
+    /// only so many (they are followed as others end).
+    pub tables: u64,
+    pub tables_over: u64,
     /// Why the fold is off (`crashes`: the worker failed too often; `env`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off: Option<String>,
@@ -4503,6 +4507,9 @@ fn house_now() -> u64 {
 /// and send what it wrote.
 async fn house_loop(hub: SharedHub) {
     HOUSE_SEQ.store(rand::random::<u32>() >> 1, std::sync::atomic::Ordering::Relaxed);
+    // Whether a pass of the fold in shadow is still running (one at a time, and none holds up the house).
+    #[cfg(feature = "house-fold")]
+    let shadow_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
         let mut sent = house_sends().lock().await;
@@ -4523,6 +4530,10 @@ async fn house_loop(hub: SharedHub) {
             send_house_update(&hub, &room_id, update.clone(), false).await;
             sent.push_back((now, room_id, update));
         }
+        // (The sends are done and the lock on them let go before the fold in shadow has its turn.)
+        drop(sent);
+        #[cfg(feature = "house-fold")]
+        spawn_fold_shadow(&hub, &shadow_busy);
     }
 }
 
@@ -4727,14 +4738,11 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut out = Vec::new();
-    let docs = served_docs(&hub.rooms);
-    for (room_id, doc) in &docs {
-        if let Some(update) = house::tick_room(house, room_id, doc, now, wall, false).update {
-            out.push((room_id.clone(), update));
+    for (room_id, doc) in served_docs(&hub.rooms) {
+        if let Some(update) = house::tick_room(house, &room_id, &doc, now, wall, false).update {
+            out.push((room_id, update));
         }
     }
-    #[cfg(feature = "house-fold")]
-    fold_shadow_tick(hub, house, docs, now);
     out
 }
 
@@ -4766,19 +4774,44 @@ mod house_fold_switch_tests {
     }
 }
 
-/// 🧮 One tick of the fold in shadow over the served rooms, after the house's
-/// own: what the house found to follow in each room, then the shadow's pass.
-/// It reads the docs and writes none; a panic in it costs the shadow its tick
-/// and nothing else.
+/// 🧮 One pass of the fold in shadow over the served rooms: what the house
+/// found to follow in each room (the plan its last tick made), then the
+/// shadow's pass. It reads the docs and writes none; a panic in it costs the
+/// shadow its pass and nothing else. It runs after the house's tick has sent
+/// what it wrote, and not inside it, so what it reads (megabytes a room) and
+/// the worker it may start never hold up a reveal or the step-down.
 #[cfg(feature = "house-fold")]
-fn fold_shadow_tick(hub: &SharedHub, house: &Mutex<house::House>, docs: Vec<(String, yrs::Doc)>, now: u64) {
-    let Some(shadow) = hub.fold_shadow.as_ref() else { return };
+fn fold_shadow_pass(hub: &SharedHub) {
+    let (Some(shadow), Some(house)) = (hub.fold_shadow.as_ref(), hub.house.as_ref()) else { return };
+    let now = house_now();
     // (The house, then the doc, as its own tick takes them.)
-    let report = fold_shadow::tick_shadow(shadow, docs, std::time::Instant::now(), |room_id, doc| house::lock(house).fold_view(room_id, doc, now));
+    let report = fold_shadow::tick_shadow(shadow, served_docs(&hub.rooms), std::time::Instant::now(), |room_id, doc| house::lock(house).fold_view(room_id, doc, now));
     match report {
         Some(report) => hub.fingerprint.lock().unwrap().house_fold = Some(report),
-        None => eprintln!("🧮 fold-shadow: its tick failed; the house goes on"),
+        None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),
     }
+}
+
+/// Starts a pass of the fold in shadow on the blocking pool and goes on: none
+/// when the last is still running.
+#[cfg(feature = "house-fold")]
+fn spawn_fold_shadow(hub: &SharedHub, busy: &Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    if hub.fold_shadow.is_none() || busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // (Cleared when the pass ends however it ends.)
+    struct Done(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let (hub, done) = (hub.clone(), Done(busy.clone()));
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        fold_shadow_pass(&hub);
+    });
 }
 
 /// Step the house down in every served room now (house.rs step_down), and

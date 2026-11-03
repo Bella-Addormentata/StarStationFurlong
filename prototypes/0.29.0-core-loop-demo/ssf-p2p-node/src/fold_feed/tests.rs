@@ -333,6 +333,10 @@ impl Rig {
         self.feed.caught_up(t, INC, &self.mirror, &self.sup)
     }
 
+    fn covers(&self, inputs: &Inputs) -> bool {
+        self.feed.covers(T, INC, &self.mirror, &self.sup, inputs)
+    }
+
     /// What the worker has been sent, in order: once its thread has read all that was posted (the
     /// log is the worker's, filled as it reads).
     fn reqs(&self) -> Vec<Req> {
@@ -981,6 +985,32 @@ fn a_table_is_not_caught_up_while_it_waits_to_be_told_the_houses_and_pins_of_the
     let reqs = rig.reqs();
     let told: Vec<&Warm> = warms(&reqs).into_iter().filter(|w| w.pins.len() == 1).collect();
     assert_eq!(told.len(), 2, "each table was told the pin");
+}
+
+#[test]
+fn an_answer_covers_the_table_as_the_node_last_sent_it_and_with_the_inputs_it_was_folded_with() {
+    let mut rig = Rig::new(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })));
+    let inputs = Inputs::new(vec!["h1".into()], vec![]);
+    rig.inputs = inputs.clone();
+    rig.session(&live0(), &recs(1));
+    rig.want(&[(T, INC)]);
+    assert!(!rig.covers(&inputs), "no answer yet");
+    rig.until("caught up", |r| r.caught_up());
+    assert!(rig.covers(&inputs));
+    // Another house, or another player's key, is another table to the fold.
+    assert!(!rig.covers(&Inputs::new(vec!["h2".into()], vec![])));
+    assert!(!rig.covers(&Inputs::new(vec!["h1".into()], vec![("alice".into(), "ka".into())])));
+    // A record the node has not read yet (no tick has drained it) is not one the answer lacks: it covers
+    // the table as the node last read it.
+    rig.put(&live0(), &rk(1, 5), val(5));
+    assert!(rig.covers(&inputs));
+    // Read, and the worker's pipe is full: the node has the change and the worker does not.
+    rig.sup.clog(QUEUE_BYTES);
+    rig.tick();
+    assert!(!rig.covers(&inputs), "the change is waiting to be sent");
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("told", |r| r.caught_up());
+    assert!(rig.covers(&inputs));
 }
 
 #[test]

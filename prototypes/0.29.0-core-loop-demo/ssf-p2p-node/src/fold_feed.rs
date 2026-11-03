@@ -315,12 +315,27 @@ impl Feed {
 
     /// As [`caught_up`](Feed::caught_up), but the fold may be unfinished (pending).
     fn up_to_date<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>) -> bool {
+        self.inputs.as_ref().is_some_and(|inputs| self.covers(t, inc, mirror, sup, inputs)) && mirror.current(t, inc)
+    }
+
+    /// The latest answer covers everything the mirror had read as of its last
+    /// drain, under `inputs` (the houses and pins asked of the room): it
+    /// answers the last frame sent, that frame left nothing behind, nothing
+    /// waits to be taken, and the table was folded with `inputs`. It does not
+    /// ask whether the doc has changed since the drain (`current`), nor that
+    /// the fold is finished: the shadow asks this before a drain that may
+    /// bring a page's trim, to know whether the answer in hand is the table as
+    /// the node last read it.
+    pub fn covers<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>, inputs: &Inputs) -> bool {
         let Some(slot) = self.slots.get(&(t.to_string(), inc.to_string())) else { return false };
         let Some(answer) = &slot.answer else { return false };
         let Some(st) = mirror.state(t, inc) else { return false };
         let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
+        // (The two versions say it all in every state the tests can make, and the clauses between them
+        // follow from them there: they are kept for the states the tests cannot, where a wrong "covered"
+        // would count a lateness of the fold as the fold's disagreement.)
         slot.open
-            && self.inputs.as_ref() == Some(&slot.given)
+            && slot.given == *inputs
             && answer.version == slot.sent_version
             && slot.unsent.is_none()
             && !sup.owes(&ctx)
@@ -328,7 +343,6 @@ impl Feed {
             && !st.announcing
             && st.queued == 0
             && st.version == slot.sent_version
-            && mirror.current(t, inc)
     }
 
     /// The feed holds no table, and owes the worker no word.
