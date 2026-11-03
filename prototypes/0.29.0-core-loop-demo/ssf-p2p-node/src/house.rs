@@ -797,6 +797,11 @@ pub struct House {
     /// and whether it goes back (each table naming one waits; it goes back
     /// once).
     unclear_houses: HashMap<String, bool>,
+    /// Whether this pass found the delegation under this house's own key (`hk:<this house>`) in the doc other than
+    /// the one the house holds: gone, another record, or one a page may read otherwise. The house goes on as the
+    /// delegate it verified, and puts the record back when it is due (REPUT_MS), but until it has, the pages may not
+    /// count this house as the plan does.
+    own_off: bool,
     /// A table held this pass with its values put back: the next pass reads
     /// it again, and it plays on in the same tick. (In the tick's last pass
     /// it is held: the next tick reads it.)
@@ -922,6 +927,7 @@ impl House {
             heals: Vec::new(),
             healing: false,
             unclear_houses: HashMap::new(),
+            own_off: false,
             reread: false,
             last_pass: false,
             wanted: HashMap::new(),
@@ -1204,7 +1210,10 @@ impl House {
         // out of the plan's houses one the table names: the live house's decisions are as they were.
         // A delegation a page may read otherwise holds the table that names it, so `waiting` says as
         // much as `houses_clear` does; both are kept, for the rule stands apart from how it is kept.)
-        let houses_clear = self.unclear_houses.is_empty();
+        // (And this house's own delegation: the record the doc holds under its key is the one it holds, as every page
+        // reads it, for the house goes on as the delegate it verified while the record is other, and the pages may not
+        // count it, which `unclear_houses` does not say: it holds the other houses, which a table names.)
+        let houses_clear = self.unclear_houses.is_empty() && !self.own_off;
         if let Some(mem) = self.rooms.get_mut(room) {
             let waiting = mem.fold.as_ref().is_some_and(|p| p.tables.iter().any(|k| mem.tables.get(k).is_some_and(|m| m.held_since.is_some())));
             if let Some(plan) = mem.fold.as_mut() {
@@ -1233,6 +1242,7 @@ impl House {
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
         self.unclear_houses.clear();
+        self.own_off = false;
         // (The fold follows only what a pass that got this far found; a pass cut short keeps the last one's, not complete.)
         let prev = self.rooms.get_mut(room).and_then(|mem| mem.fold.take());
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
@@ -1277,6 +1287,9 @@ impl House {
             return writes;
         };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
+        // (The record in the doc is the one held, and as a page reads it, or the pages may not count this house: the
+        // plan is not complete until the put-back has written it again and a pass has read it so.)
+        self.own_off = !(deleg_clear && deleg_now.as_ref().is_some_and(|v| hb::rec_hash(v) == hb::rec_hash(&delegation)));
 
         // Every house the deed holder delegated (another of their nodes is a
         // house of the room as this one is, and its records hold the line,

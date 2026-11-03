@@ -2620,3 +2620,45 @@ fn drains_with_no_time_at_all_still_read_a_big_session_to_its_end() {
     assert!(f.m.current(T, INC), "it goes on to the end: {drains} drains");
     assert_eq!(model.recs, model_of(&all));
 }
+
+// ── Review round 7 ───────────────────────────────────────────────────────────
+
+/// A delegation that is the same as it was in the doc the node is left with, after an update that put another between (a
+/// value replaced by a delegation, and put back), is no identical rewrite to a page that had the other on its own: the
+/// update says that something was made and deleted in it, and the rewrite is churn.
+#[test]
+fn a_delegation_put_back_as_it_was_in_an_update_that_changed_it_between_is_churn() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    // The same record written again by itself, even twice, is nothing (above); with another between, it is.
+    let held = f.doc.transact().state_vector();
+    page.put_top("hk:house-a", &s("b"));
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "a, b, a: the doc holds a before and after");
+}
+
+/// And an identical rewrite in an update where something else was made and deleted is doubted too (what was deleted cannot be
+/// told), while one in an update that deletes only what the doc held is not.
+#[test]
+fn an_identical_rewrite_is_churn_only_in_an_update_in_which_something_was_made_and_deleted() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    // The record again, deleting the block the doc held.
+    let held = f.doc.transact().state_vector();
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "a plain rewrite");
+    // The record again, with something else made and deleted in the same update.
+    let held = f.doc.transact().state_vector();
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true });
+}

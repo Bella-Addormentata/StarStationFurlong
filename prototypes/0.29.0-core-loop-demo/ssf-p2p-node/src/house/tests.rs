@@ -4110,3 +4110,57 @@ fn a_pass_that_found_no_delegation_leaves_no_plan() {
     room.tick(200);
     assert_eq!(fold_plan_of(&mut room), None);
 }
+
+// ── Review round 7: this house's own delegation ──────────────────────────────
+
+/// The house goes on as the delegate it verified when the record under its key is taken away, written over, or made one a
+/// page may read otherwise, and puts the record back when it is due (REPUT_MS); but until it has, the pages may not count
+/// this house as the plan does, so the plan is not complete, and is again once a pass has read the record put back.
+#[test]
+fn a_plan_is_not_complete_while_the_record_of_this_houses_own_delegation_is_not_the_one_it_holds() {
+    type Spoil = fn(&Room, &str, &CVal);
+    let cases: Vec<(&str, Spoil)> = vec![
+        ("taken away", |room, key, _| {
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            comp.remove(&mut txn, key);
+        }),
+        ("written over", |room, key, _| room.put_top(key, &obj(vec![("v", CVal::Int(2))]))),
+        ("a page may read it otherwise", |room, key, deleg| room.put_top_padded(key, deleg, Any::Undefined)),
+    ];
+    for (name, spoil) in cases {
+        let mut room = Room::new(&format!("fold-plan-own-{}", name.len()), true);
+        room.tick(0);
+        room.tick(200);
+        assert!(fold_plan_of(&mut room).unwrap().complete, "{name}: a plain pass");
+        let own = format!("hk:{}", room.house.public());
+        let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &own, usize::MAX).unwrap();
+        spoil(&room, &own, &deleg);
+        // (Not yet due to be put back.)
+        room.tick(200);
+        assert!(!clean(room.raw_top(&own), &deleg), "{name}: the record is still not the one held");
+        assert!(!fold_plan_of(&mut room).unwrap().complete, "{name}: the pages may not count the house");
+        assert_eq!(fold_plan_of(&mut room).unwrap().houses, vec![room.house.public().to_string()], "(the house is in the plan all the same)");
+        // The pass that puts it back read the other.
+        room.tick(REPUT_MS);
+        assert!(clean(room.raw_top(&own), &deleg), "{name}: put back");
+        assert!(!fold_plan_of(&mut room).unwrap().complete, "{name}: the pass that put it back read the other");
+        // And the next reads what every page does.
+        room.tick(200);
+        assert!(fold_plan_of(&mut room).unwrap().complete, "{name}: read as held: complete");
+    }
+}
+
+/// A delegation of another house that is other than the one the plan counts is no matter of this house's own: this
+/// house's record is read for this house only.
+#[test]
+fn another_houses_record_does_not_leave_this_houses_plan_incomplete() {
+    let mut room = Room::new("fold-plan-own-other", true);
+    let b_house = second_house(&room);
+    room.tick(0);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete);
+    room.put_top(&format!("hk:{}", b_house.public()), &obj(vec![("v", CVal::Int(2))]));
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "(the other house's record is none of this house's own)");
+}

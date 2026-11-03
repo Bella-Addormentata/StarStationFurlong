@@ -130,20 +130,62 @@ fn a_player_first_seen_as_a_replacement_is_pinned_to_the_key_replaced_and_unsett
     assert!(!st.contested);
 }
 
+/// A page that bound before keeps the pin of a player who goes, and one that binds after has none: the node keeps the pin
+/// and cannot say which the pages used, and a key that comes back is compared with it.
 #[test]
-fn a_player_who_goes_keeps_the_pin_and_the_key_of_one_who_comes_back_is_compared_with_it() {
+fn a_player_who_goes_keeps_the_pin_and_leaves_the_pins_unsettled_and_the_key_of_one_who_comes_back_is_compared_with_it() {
     let doc = Doc::new();
     let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
     put(&doc, "alice", "A");
+    assert!(p.view().1);
     remove(&doc, "alice");
     assert_eq!(pins_of(&mut p)["alice"], "A", "(a page keeps the pin of a player who goes)");
-    assert!(p.view().1);
+    assert!(!p.view().1, "(and a page that binds after has none)");
+    // It stays so, whatever she does after.
     put(&doc, "alice", "A");
-    assert!(p.view().1, "the same key again");
-    remove(&doc, "alice");
-    put(&doc, "alice", "Z");
+    assert!(!p.view().1);
     assert_eq!(pins_of(&mut p)["alice"], "A");
-    assert!(!p.view().1, "a different key after she went");
+}
+
+/// The same when the entry stays and no longer gives a key the pages pin: dropped, emptied, too long for a page, or the
+/// whole entry made another kind of value. And a player no page pins (a key none reads, an id past what a page keeps) who
+/// goes is nothing.
+#[test]
+fn a_pinned_player_whose_entry_stops_supplying_the_key_leaves_the_pins_unsettled() {
+    let keyless = || Any::Map(Arc::new(HashMap::from([("name".to_string(), Any::String("x".into()))])));
+    let too_long = "k".repeat(MAX_PIN_KEY_UNITS + 1);
+    let cases: Vec<(&str, Any)> = vec![
+        ("the key dropped", keyless()),
+        ("the key emptied", entry("")),
+        ("the key too long", entry(&too_long)),
+        ("the entry not a map", Any::String("gone".into())),
+        ("the entry null", Any::Null),
+    ];
+    for (name, after) in cases {
+        let doc = Doc::new();
+        let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+        put(&doc, "alice", "A");
+        assert!(p.view().1, "{name}");
+        put_any(&doc, "alice", after);
+        assert_eq!(pins_of(&mut p)["alice"], "A", "{name}: the pin is kept");
+        assert!(!p.view().1, "{name}");
+    }
+    // A player the pages never pinned who goes: nothing. (A key none reads; an id past what a page keeps.)
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put(&doc, "bob", "");
+    put(&doc, &"x".repeat(MAX_PIN_PID_UNITS + 1), "A");
+    remove(&doc, "bob");
+    remove(&doc, &"x".repeat(MAX_PIN_PID_UNITS + 1));
+    assert!(pins_of(&mut p).is_empty());
+    assert!(p.view().1, "nothing a page pins is in doubt");
+    // The rule of the state, on its own: a key kept, a key gone, a key replaced.
+    let mut st = PinState::default();
+    st.learn("carol", Key::None, Key::Pin("C"));
+    st.learn("carol", Key::Pin("C"), Key::Pin("C"));
+    assert!(!st.contested, "the same key again");
+    st.learn("carol", Key::Pin("C"), Key::None);
+    assert!(st.contested, "the key gone");
 }
 
 #[test]
@@ -413,14 +455,16 @@ fn a_player_removed_before_the_walk_reached_him_is_pinned_to_the_key_he_had() {
     let mut st = PinState::default();
     st.learn("bob", Key::Pin("B"), Key::None);
     assert_eq!(st.pins.get("bob").map(String::as_str), Some("B"));
-    assert!(!st.contested);
+    assert!(st.contested, "(a page that binds after pinned none: the pages differ)");
     let (version, epoch) = (st.version, st.epoch);
     st.learn("bob", Key::Pin("B"), Key::None);
     st.learn("bob", Key::None, Key::None);
     assert_eq!((st.version, st.epoch), (version, epoch), "learned once");
     // An entry that goes with no key a page would pin is nothing.
+    let mut st = PinState::default();
     st.learn("carol", Key::None, Key::None);
     assert!(!st.pins.contains_key("carol"));
+    assert!(!st.contested);
 }
 
 /// The epoch moves with what a view says, and with nothing else: a table shown whole while the pins stood
@@ -438,13 +482,24 @@ fn the_epoch_moves_with_a_pin_and_with_the_pins_ceasing_to_be_the_whole_story_an
     assert_eq!(p.view_at().2, e1, "(the epoch of the view is the one the pins were read at)");
     put(&doc, "alice", "A");
     put(&doc, "bob", "");
-    remove(&doc, "alice");
-    assert_eq!(watch.epoch(), e1, "the same key, a key no page pins, a player who goes: nothing the view says");
+    assert_eq!(watch.epoch(), e1, "the same key, a key no page pins: nothing the view says");
     put(&doc, "alice", "B");
     let e2 = watch.epoch();
     assert!(e2 > e1, "a key replaced");
     put(&doc, "alice", "C");
     assert_eq!(watch.epoch(), e2, "(unsettled already)");
+    // A player who goes: the pages that bind after have no pin for him.
+    let doc2 = Doc::new();
+    let p2 = PlayerPins::attach(&doc2, PIN_WALK_KEYS);
+    let watch2 = p2.watch();
+    put(&doc2, "alice", "A");
+    let f1 = watch2.epoch();
+    remove(&doc2, "alice");
+    let f2 = watch2.epoch();
+    assert!(f2 > f1, "a pinned player who goes");
+    put(&doc2, "alice", "A");
+    remove(&doc2, "alice");
+    assert_eq!(watch2.epoch(), f2, "(unsettled already)");
     // An entry that makes the pins doubtful, and the cap.
     let doc = Doc::new();
     let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
@@ -635,9 +690,18 @@ fn a_player_first_pinned_from_an_update_in_which_nothing_was_made_and_deleted_is
     apply_update(&doc, &everything(&peer));
     assert_eq!(pins_of(&mut p)["eve"], "A");
     assert!(p.view().1);
-    // An update that deletes what the doc already had (a player who goes) and brings a new one.
+    // An update that deletes what the doc already had (a record elsewhere written over) and brings a new player.
+    let other = peer.get_or_insert_map("elsewhere");
+    {
+        let mut txn = peer.transact_mut();
+        other.insert(&mut txn, "k", 1);
+    }
+    apply_update(&doc, &everything(&peer));
     let before = doc.transact().state_vector();
-    remove(&peer, "eve");
+    {
+        let mut txn = peer.transact_mut();
+        other.insert(&mut txn, "k", 2);
+    }
     put(&peer, "bob", &key("bob"));
     let update = peer.transact().encode_diff_v1(&before);
     apply_update(&doc, &update);
@@ -645,38 +709,107 @@ fn a_player_first_pinned_from_an_update_in_which_nothing_was_made_and_deleted_is
     assert!(p.view().1, "the block deleted was one the doc had: nothing was made and deleted in the update");
 }
 
-/// A player the watch has pinned already, written again in such an update, is the key it pinned (a page keeps the pin of a
-/// player who goes): the doubt is of a player first pinned.
+/// A player the watch has pinned already, written again in such an update with the key it has, is doubted too: the
+/// update may have put another key between, which a page that bound while it stood pinned, and the node sees the key it
+/// has either way. (Round 7: it was a player first pinned that was doubted.)
 #[test]
-fn a_player_pinned_already_is_not_doubted_when_an_update_of_made_and_deleted_brings_the_same_key_back() {
-    // (The peer's client id is the greater, so that its blocks are the ones standing over the ones the node removed.)
-    let doc = Doc::with_client_id(1);
+fn a_player_pinned_already_is_doubted_when_an_update_of_made_and_deleted_brings_the_same_key_back() {
+    let doc = Doc::new();
     let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
-    put(&doc, "eve", "A");
-    remove(&doc, "eve");
     let peer = Doc::with_client_id(9);
     put(&peer, "eve", "A");
-    put(&peer, "eve", "A");
     apply_update(&doc, &everything(&peer));
-    assert_eq!(pins_of(&mut p)["eve"], "A");
+    assert!(p.view().1, "(first seen plainly)");
+    // The peer, with all the node has, writes another key and puts the first back: the node is sent the two together.
+    apply_update(&peer, &everything(&doc));
+    let before = doc.transact().state_vector();
+    put(&peer, "eve", "B");
+    put(&peer, "eve", "A");
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(pins_of(&mut p)["eve"], "A", "the key it holds and the key it pinned");
+    assert!(!p.view().1, "and a page that bound while B stood pinned B");
+}
+
+/// Whatever the entry holds after: a key that is not the pin, none, or the entry gone.
+#[test]
+fn a_pinned_player_changed_in_an_update_of_made_and_deleted_is_doubted_whatever_the_entry_holds_after() {
+    let keyless = || Any::Map(Arc::new(HashMap::from([("other".to_string(), Any::Number(1.0))])));
+    // After the key stays (pinned A), what a merged update leaves of 'eve' as seen by the node: another key kept (an
+    // update, not a replacement of a pin the node saw: the same case as a key replaced), none, the entry removed.
+    let cases: Vec<(&str, Option<Any>)> = vec![("the same key", Some(entry("A"))), ("another key", Some(entry("Z"))), ("no key", Some(keyless())), ("removed", None)];
+    for (name, after) in cases {
+        let doc = Doc::new();
+        let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+        let peer = Doc::with_client_id(9);
+        put(&peer, "eve", "A");
+        apply_update(&doc, &everything(&peer));
+        assert!(p.view().1, "{name}");
+        // The pins are contested by 'another key', 'no key' and 'removed' on their own: the case is what the rule adds
+        // (and what the state says of the key is not asked: the transaction is).
+        let before = doc.transact().state_vector();
+        put(&peer, "eve", "B");
+        match after {
+            Some(v) => put_any(&peer, "eve", v),
+            None => remove(&peer, "eve"),
+        }
+        apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+        assert!(!p.view().1, "{name}");
+    }
+}
+
+/// A player whose entry has no key, removed in an update where something was made and deleted: a key may have been
+/// written between, which a page that saw it pinned, and a removal leaves the node nothing of it.
+#[test]
+fn a_player_with_no_key_who_goes_in_an_update_of_made_and_deleted_is_doubted() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    let keyless = || Any::Map(Arc::new(HashMap::from([("other".to_string(), Any::Number(1.0))])));
+    put_any(&peer, "eve", keyless());
+    apply_update(&doc, &everything(&peer));
+    assert!(p.view().1, "(a player with no key is nothing)");
+    let before = doc.transact().state_vector();
+    put(&peer, "eve", "A");
+    remove(&peer, "eve");
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert!(pins_of(&mut p).is_empty());
+    assert!(!p.view().1, "a page that saw the key pinned it");
+    // A removal of the same player in a plain update is nothing.
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put_any(&doc, "eve", keyless());
+    remove(&doc, "eve");
     assert!(p.view().1);
 }
 
-/// Neither is a player no page would pin: no key a page reads, or an id past what a page keeps.
+/// A merged update that brings or changes a player no page would pin is nothing: an id past what a page keeps.
 #[test]
 fn a_player_no_page_pins_is_not_doubted_for_an_update_of_made_and_deleted() {
     let doc = Doc::new();
     let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
     let peer = Doc::with_client_id(9);
-    let keyless = || Any::Map(Arc::new(HashMap::from([("other".to_string(), Any::Number(1.0))])));
-    put_any(&peer, "no-key", keyless());
-    put_any(&peer, "no-key", keyless());
     let long = "x".repeat(MAX_PIN_PID_UNITS + 1);
     put(&peer, &long, "A");
     put(&peer, &long, "B");
+    put(&peer, "", "A");
+    put(&peer, "", "B");
     apply_update(&doc, &everything(&peer));
     assert!(pins_of(&mut p).is_empty(), "{:?}", pins_of(&mut p));
     assert!(p.view().1, "nothing a page pins is in doubt");
+}
+
+/// A pinnable player with no key at all is doubted by such an update: a merged update may have hidden a key between.
+#[test]
+fn a_player_with_no_key_in_an_update_of_made_and_deleted_is_doubted() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    let keyless = || Any::Map(Arc::new(HashMap::from([("other".to_string(), Any::Number(1.0))])));
+    put(&peer, "eve", "A");
+    put_any(&peer, "eve", keyless());
+    apply_update(&doc, &everything(&peer));
+    assert!(pins_of(&mut p).is_empty());
+    assert!(!p.view().1, "a page that saw the key between pinned it");
 }
 
 /// An update in which something else was made and deleted doubts a player it brings once, because it cannot be told
@@ -696,4 +829,125 @@ fn a_player_brought_by_an_update_in_which_something_else_was_made_and_deleted_is
     apply_update(&doc, &everything(&peer));
     assert_eq!(pins_of(&mut p)["eve"], "A");
     assert!(!p.view().1);
+}
+
+// ── Review round 7 ───────────────────────────────────────────────────────────
+
+fn remove_owner(doc: &Doc) {
+    let info = owner_map(doc);
+    let mut txn = doc.transact_mut();
+    info.remove(&mut txn, "owner");
+}
+
+/// The deed changing hands is counted, as the epoch moves with it: every change of holder, and nothing else (the holder
+/// written again as it stands, another key of the room's info, the walk that reads the holder when the watch starts).
+#[test]
+fn the_handovers_of_the_deed_are_counted() {
+    let doc = Doc::new();
+    set_owner(&doc, "alice");
+    let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    assert_eq!(watch.deeds(), 0, "(the holder read when the watch starts is no handover)");
+    set_owner(&doc, "alice");
+    assert_eq!(watch.deeds(), 0, "the same holder again");
+    set_owner(&doc, "bob");
+    assert_eq!(watch.deeds(), 1);
+    set_owner(&doc, "alice");
+    assert_eq!(watch.deeds(), 2, "and back: two handovers");
+    remove_owner(&doc);
+    assert_eq!(watch.deeds(), 3, "no holder");
+    {
+        let info = owner_map(&doc);
+        let mut txn = doc.transact_mut();
+        info.insert(&mut txn, "name", "the room");
+    }
+    assert_eq!(watch.deeds(), 3, "another key of the room's info");
+    put(&doc, "alice", "A");
+    assert_eq!(watch.deeds(), 3, "a player");
+}
+
+/// The same holder in the doc after an update that gave the deed to another and gave it back: the doc does not say it
+/// changed hands, and a page that saw the middle holder counted that one's houses. The epoch and the count move, though
+/// the holder is the one the watch had.
+#[test]
+fn a_handover_hidden_in_one_update_is_counted_though_the_doc_names_the_same_holder() {
+    let doc = Doc::new();
+    let peer = Doc::with_client_id(9);
+    set_owner(&peer, "alice");
+    apply_update(&doc, &everything(&peer));
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    let (deeds, epoch) = (watch.deeds(), watch.epoch());
+    apply_update(&peer, &everything(&doc));
+    let before = doc.transact().state_vector();
+    set_owner(&peer, "bob");
+    set_owner(&peer, "alice");
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(p.deed(), Some("alice".to_string()), "(the holder the doc names)");
+    assert_eq!((watch.deeds(), watch.epoch()), (deeds + 1, epoch + 1));
+    // The same, seen as two updates: two handovers, as the doc shows them.
+    set_owner(&doc, "bob");
+    set_owner(&doc, "alice");
+    assert_eq!(watch.deeds(), deeds + 3);
+    let _ = p.view();
+}
+
+/// An update that writes the holder once, and made and deleted something elsewhere, is doubted too (it cannot be told
+/// what was deleted); one that deletes only what the node had is a plain rewrite, and no handover.
+#[test]
+fn a_holder_written_in_an_update_is_doubted_only_when_something_in_it_was_made_and_deleted() {
+    let doc = Doc::new();
+    let peer = Doc::with_client_id(9);
+    set_owner(&peer, "alice");
+    apply_update(&doc, &everything(&peer));
+    let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    // The holder written again, deleting the block the node had.
+    let before = doc.transact().state_vector();
+    apply_update(&peer, &everything(&doc));
+    set_owner(&peer, "alice");
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(watch.deeds(), 0, "a plain rewrite");
+    // And with something made and deleted beside it.
+    let before = doc.transact().state_vector();
+    let other = peer.get_or_insert_map("elsewhere");
+    {
+        let mut txn = peer.transact_mut();
+        other.insert(&mut txn, "k", 1);
+    }
+    {
+        let mut txn = peer.transact_mut();
+        other.insert(&mut txn, "k", 2);
+    }
+    set_owner(&peer, "alice");
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!(watch.deeds(), 1, "(it cannot be told that nothing came and went in the holder's key)");
+}
+
+/// A record made and deleted in the room's info leaves no key to read: if the holder was it, the doc names no holder
+/// before or after and a page that saw one counted that one's houses.
+#[test]
+fn a_change_to_the_room_info_that_leaves_no_key_is_a_handover_when_something_was_made_and_deleted() {
+    let doc = Doc::new();
+    let peer = Doc::with_client_id(9);
+    set_owner(&peer, "alice");
+    set_owner(&peer, "alice");
+    apply_update(&doc, &everything(&peer));
+    let p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let watch = p.watch();
+    apply_update(&peer, &everything(&doc));
+    let before = doc.transact().state_vector();
+    for _ in 0..2 {
+        let info = owner_map(&peer);
+        let mut txn = peer.transact_mut();
+        info.insert(&mut txn, "scratch", 1);
+    }
+    {
+        let info = owner_map(&peer);
+        let mut txn = peer.transact_mut();
+        info.remove(&mut txn, "scratch");
+    }
+    let epoch = watch.epoch();
+    apply_update(&doc, &peer.transact().encode_diff_v1(&before));
+    assert_eq!((watch.deeds(), watch.epoch()), (1, epoch + 1), "(and what the views of the pins say moves with it)");
 }

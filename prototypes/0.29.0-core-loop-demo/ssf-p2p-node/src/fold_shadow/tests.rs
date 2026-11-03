@@ -335,11 +335,11 @@ fn each_verdict_is_counted_under_its_own_name() {
     let mut t = Tally::default();
     t.note(&Verdict::Agree);
     t.note(&Verdict::Mismatch("x".into()));
-    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown] {
+    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover] {
         t.note(&Verdict::Skip(why));
     }
-    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1, step_down: 1 });
-    assert_eq!(t.skipped(), 12);
+    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1, step_down: 1, handover: 1 });
+    assert_eq!(t.skipped(), 13);
     t.note(&Verdict::Skip(Skip::Pending));
     assert_eq!(t.pending, 2);
 }
@@ -347,10 +347,11 @@ fn each_verdict_is_counted_under_its_own_name() {
 /// Each kind of skip is said under a name of its own, since the log is all there is to tell them by.
 #[test]
 fn each_kind_of_skip_has_a_name_of_its_own() {
-    let all = [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown];
+    let all = [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown, Skip::Handover];
     let names: BTreeSet<&str> = all.iter().map(|s| s.name()).collect();
     assert_eq!(names.len(), all.len(), "{names:?}");
     assert_eq!(Skip::StepDown.name(), "stepdown");
+    assert_eq!(Skip::Handover.name(), "handover");
 }
 
 #[test]
@@ -730,11 +731,11 @@ fn when_the_fold_duties_are_off_for_good_nothing_is_followed_and_the_report_says
 #[test]
 fn the_report_adds_up_what_the_shadow_found_and_what_the_feeds_did() {
     let mut b = Bench::new("house roulette 3");
-    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13, step_down: 14 };
+    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13, step_down: 14, handover: 15 };
     b.shadow.gone = Counts { cold: 10, warm: 20, forgets: 30, results: 40, dirty: 11, lost: 12, busy: 50, too_big: 13, bad_results: 14 };
     let r = b.shadow.report();
     assert_eq!((r.shadow_agreed, r.shadow_mismatches), (1, 2));
-    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14, "every kind of skip");
+    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15, "every kind of skip");
     assert_eq!((r.cold_folds, r.dirty, r.lost), (10, 11, 12));
     assert_eq!(r.bad_results, 14 + 13, "a result and a frame nobody could use");
 }
@@ -1627,7 +1628,7 @@ fn an_answer_is_believed_only_where_the_pins_and_the_delegations_stand_as_they_s
         }
         let shown = rs.confirmed[&key];
         let mut tally = Tally::default();
-        rs.compare(&mut tally, &covered, shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64);
+        rs.compare(&mut tally, &covered, shown.pins + pins_moved as u64, shown.delegations + delegations_moved as u64, false);
         let expected = if pins_moved || delegations_moved { Tally { inputs: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
         assert_eq!(tally, expected, "pins moved {pins_moved}, delegations moved {delegations_moved}");
     }
@@ -2689,7 +2690,8 @@ fn a_table_kept_for_its_final_checkpoint_is_still_among_the_tables_the_report_co
     assert_eq!(b.shadow.report().tables, 0, "and the place is given back");
 }
 
-/// The deed changed hands between the view and the drain: the answer shown whole is taken back by the epoch.
+/// The deed changed hands between the view and the drain: the answer shown whole is taken back, and the session is held in
+/// doubt for the handover (round 7: it was told by the epoch alone, which the holder coming back settles again).
 #[test]
 fn a_difference_is_not_counted_when_the_deed_changed_hands_after_the_answer_was_shown_whole() {
     for changed in [false, true] {
@@ -2704,7 +2706,7 @@ fn a_difference_is_not_counted_when_the_deed_changed_hands_after_the_answer_was_
         }
         b.put_checkpoint(&wrong);
         b.tick();
-        let expected = if changed { Tally { inputs: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
+        let expected = if changed { Tally { handover: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
         assert_eq!(b.shadow.tally, expected, "changed={changed}");
     }
 }
@@ -2818,4 +2820,179 @@ fn a_table_the_worker_has_no_place_for_waits_for_one_and_takes_it_when_one_is_le
     b.until("the tables that waited are started", |b| b.shadow.counts().cold >= 6);
     assert_eq!(b.shadow.counts().lost, 0, "{:?}", b.shadow.counts());
     assert!(b.shadow.holds() <= 4);
+}
+
+// ── Review round 7 ───────────────────────────────────────────────────────────
+
+impl Bench {
+    /// The tables of the room the pages may have folded with another holder's houses.
+    fn handover_tables(&self) -> usize {
+        self.shadow.rooms[self.room()].handover.len()
+    }
+
+    /// The deed goes to `heir` and comes back, with no tick between.
+    fn flip_the_deed(&self) {
+        self.set_owner("heir");
+        self.set_owner(OWNER);
+    }
+}
+
+/// The deed changed hands and came back between two ticks: the holder is the one the answer was made under, and the view
+/// settles again, but a page may have folded the session with the houses of the other holder. A difference is not counted
+/// for the session, however the ticks go after.
+#[test]
+fn a_difference_is_not_counted_when_the_deed_changed_hands_and_came_back_between_two_ticks() {
+    for flips in [false, true] {
+        let mut b = Bench::new("house craps 3");
+        let mut pins = b.watch_pins();
+        b.until("the first answer", |b| b.caught_up());
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "flips={flips}: shown whole");
+        if flips {
+            b.flip_the_deed();
+        }
+        // (The view of the next tick: the holder the plan names, the epoch moved.)
+        b.sync_pins(&mut pins);
+        b.ticks(5);
+        assert_eq!(b.confirmed_count(), 1, "flips={flips}: and shown whole again");
+        assert_eq!(b.handover_tables(), flips as usize, "flips={flips}");
+        let wrong = b.wrong_trim(&b.answer());
+        b.put_checkpoint(&wrong);
+        b.tick();
+        let expected = if flips { Tally { handover: 1, ..Tally::default() } } else { Tally { mismatch: 1, ..Tally::default() } };
+        assert_eq!(b.shadow.tally, expected, "flips={flips}");
+        assert_eq!(b.handover_tables(), 0, "flips={flips}: the session is over, and the doubt with it");
+        if flips {
+            let r = b.shadow.report();
+            assert!(r.recent_skips.iter().any(|l| l.starts_with(&tag_of(&b)) && l.contains("handover")), "{:?}", r.recent_skips);
+            assert!(r.recent_mismatches.is_empty());
+        }
+    }
+}
+
+/// A handover seen, one holder and then the other, is held the same.
+#[test]
+fn a_difference_is_not_counted_when_the_deed_changed_hands_and_the_ticks_saw_each_holder() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    for holder in ["heir", OWNER] {
+        b.set_owner(holder);
+        b.sync_pins(&mut pins);
+        b.ticks(3);
+    }
+    assert_eq!(b.handover_tables(), 1);
+    b.ticks(5);
+    assert_eq!(b.confirmed_count(), 1, "(the holder is back and the view settled)");
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.tick();
+    assert_eq!(b.shadow.tally, Tally { handover: 1, ..Tally::default() });
+}
+
+/// The deed changing hands in the very tick a trim is read may have come after the trim: the trim is skipped, and so is
+/// the next, which the doubt is kept for.
+#[test]
+fn a_handover_in_the_tick_a_trim_is_read_in_is_held_against_the_next_trim_too() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.put_checkpoint(&wrong);
+    b.tick();
+    assert_eq!(b.shadow.tally, Tally { handover: 1, ..Tally::default() });
+    assert_eq!(b.handover_tables(), 1, "(it may have come after the trim: the session after it is doubted too)");
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 1);
+}
+
+/// The watch of the first tick is no handover, however many the deed had before: there was no tick to compare with. And a
+/// watch that is another watch is: the count it has is no count to hold against the last.
+#[test]
+fn the_first_look_is_no_handover_and_another_watch_is() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0, "(nothing was followed before the deed changed hands)");
+    // Another watch of the same room, with the same count of handovers: it is another watch.
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0);
+    let mut other = PlayerPins::attach(&b.doc, PIN_WALK_KEYS);
+    b.sync_pins(&mut other);
+    assert_eq!(other.watch().deeds(), pins.watch().deeds());
+    b.ticks(3);
+    assert_eq!(b.handover_tables(), 1);
+    let _ = pins.view();
+    // A view with no watch (made by hand) says nothing of the deed.
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.flip_the_deed();
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0);
+}
+
+/// A trim the fold had no answer for, or one the node cannot read, ends the session too: the doubt does not outlast it.
+#[test]
+fn the_doubt_of_a_handover_ends_with_a_trim_whatever_the_node_made_of_it() {
+    // A trim of a checkpoint the node cannot read as a page does (held), the table's first trim.
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    let sum = finished(&b.case.summary);
+    let plain = b.page_trim(&sum);
+    b.put_checkpoint(&held(&plain));
+    b.ticks(30);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 1);
+    b.put_checkpoint(&with_cp(&plain, "__proto__", Some(s("y"))));
+    b.until("counted", |b| b.shadow.tally.unreadable > 0);
+    assert_eq!(b.handover_tables(), 0, "the unreadable trim ended the session");
+}
+
+/// A table that comes in the tick the deed changed hands is held in doubt too: its history before the node looked is not
+/// known, and the pages may have folded it with the other holder's houses.
+#[test]
+fn a_table_the_shadow_starts_to_read_in_the_tick_the_deed_changes_hands_is_held_in_doubt() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(b.handover_tables(), 0);
+    b.empty_table("a-second-table");
+    let inc = b.case.ctx.inc.clone();
+    b.view.as_mut().unwrap().tables.push(("a-second-table".to_string(), inc));
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.tick();
+    assert_eq!(b.handover_tables(), 2, "the table that was followed and the one that is new");
+}
+
+/// A table let go of takes its doubt with it: the flag is not kept for a table the room no longer has.
+#[test]
+fn the_doubt_of_a_handover_goes_with_the_table_when_it_is_let_go_of() {
+    let mut b = Bench::new("house craps 3");
+    let mut pins = b.watch_pins();
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    b.flip_the_deed();
+    b.sync_pins(&mut pins);
+    b.ticks(3);
+    assert_eq!(b.handover_tables(), 1);
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(5);
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("the table is let go of", |b| b.tables_held() == 0);
+    b.ticks(3);
+    assert_eq!(b.handover_tables(), 0);
 }

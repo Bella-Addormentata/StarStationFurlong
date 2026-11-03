@@ -287,8 +287,12 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 for (key, change) in map.keys(txn).iter() {
                     // (A delegation written again as it stands, as two pages of the deed holder do when both run its duty
                     // at once, changes nothing: no house comes or goes, and every page reads it alike. One a page may read
-                    // otherwise is churn all the same.)
-                    if key.starts_with("hk:") && !rewritten_alike(change, MAX_TOP_BYTES) {
+                    // otherwise is churn all the same. And so is one that is the same as it was only in the doc this node
+                    // is left with: written, written over and put back in one update, as when the node was away and the
+                    // updates were merged, it was another on the way, and a page that had that one on its own counted the
+                    // house it names. The transaction says that something was made and deleted in it, and not what: an
+                    // identical rewrite in such a one is doubted.)
+                    if key.starts_with("hk:") && !(rewritten_alike(change, MAX_TOP_BYTES) && !*lost.get_or_insert_with(|| made_and_deleted(txn))) {
                         delegations.changes += 1;
                         // (A delegation that is written and written over in one update, as when the node was away and
                         // the updates were merged, leaves only the last as an insert: a page that had the first
