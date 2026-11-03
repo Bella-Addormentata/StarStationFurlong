@@ -946,7 +946,7 @@ fn the_keys_of_a_session_are_counted_only_when_something_odd_changed_and_at_what
 #[test]
 fn a_held_table_whose_queue_fills_still_reads_the_record_that_holds_it() {
     let all: Vec<(u32, i64)> = (2..40).map(|i| (i, i as i64)).collect();
-    let limits = Limits { pending_bytes: MAX_RECORD_BYTES + 600, ..Limits::default() };
+    let limits = Limits { pending_bytes: MAX_QUEUED_RECORD + 600, ..Limits::default() };
     let mut f = Fix::seeded(limits, |f| {
         f.session(&live0(), &records(&all));
         // Two records a page may read otherwise, read first.
@@ -986,9 +986,112 @@ fn a_held_table_whose_queue_fills_still_reads_the_record_that_holds_it() {
 }
 
 #[test]
+fn a_replacement_that_keeps_the_count_is_not_a_flood() {
+    let limits = Limits { session_keys: 8, ..Limits::default() };
+    let all: Vec<(u32, i64)> = (1..=8).map(|i| (i, 1)).collect();
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    f.drain();
+    f.take();
+    // Key 8 goes and key 0 comes: read in key order, the session is nine for a moment, and never was.
+    f.remove(&live0(), &rk(1, 8));
+    f.put(&live0(), &rk(1, 0), &rv(1, 0));
+    f.drain();
+    assert_eq!(f.state().hold, None);
+    assert_eq!(f.take().changes, vec![(rk(1, 0), Some(rv(1, 0))), (rk(1, 8), None)]);
+    // The count still holds a session that is over.
+    f.put(&live0(), &rk(1, 9), &rv(1, 9));
+    f.drain();
+    assert_eq!(f.state().hold, Some(Hold::Flooded));
+}
+
+#[test]
+fn a_session_removed_after_a_record_changed_leaves_nothing_to_read() {
+    for how in 0..2 {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(0, 1), (1, 1)])));
+        f.drain();
+        f.take();
+        f.put(&live0(), &rk(1, 5), &rv(1, 5));
+        if how == 0 {
+            f.remove_top(&live0());
+        } else {
+            f.put_any(&live0(), Any::String(Arc::from("not a map")));
+        }
+        f.drain();
+        assert!(f.m.current(T, INC), "{how}: nothing waits");
+        assert!(!f.state().present, "{how}");
+        // It comes back.
+        f.session(&live0(), &records(&[(7, 7)]));
+        f.drain();
+        assert_eq!(f.take().changes, vec![(rk(1, 7), Some(rv(1, 7)))], "{how}");
+    }
+}
+
+/// A record of the most the pages weigh, that is held at three times that: 20,000 empty buffers.
+fn buffers() -> Any {
+    Any::Array(Arc::from((0..20_000).map(|_| Any::Buffer(Arc::from(Vec::<u8>::new()))).collect::<Vec<Any>>()))
+}
+
+#[test]
+fn the_queue_stays_within_its_cap_whatever_a_record_is_held_at() {
+    let limits = Limits { pending_bytes: 300_000, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| {
+        f.session(&live0(), &[]);
+        for i in 0..6 {
+            f.put_value(&live0(), &rk(1, i), buffers());
+        }
+    });
+    let mut model = Model::default();
+    let mut peak = 0;
+    for _ in 0..100 {
+        f.drain();
+        peak = peak.max(f.state().queued_bytes);
+        model.take(&mut f.m, T);
+        if f.m.current(T, INC) {
+            break;
+        }
+    }
+    assert!(f.m.current(T, INC));
+    assert!(peak > 150_000 && peak <= limits.pending_bytes, "{peak}");
+    assert_eq!(model.recs.len(), 6);
+    assert_eq!(model.recs, doc_records(&f, &live0()));
+}
+
+#[test]
+fn a_cap_smaller_than_a_record_still_lets_one_through() {
+    let limits = Limits { pending_bytes: 100, ..Limits::default() };
+    let all: Vec<(u32, i64)> = (0..5).map(|i| (i, i as i64)).collect();
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    assert_eq!(model.recs, model_of(&all));
+}
+
+#[test]
+fn a_session_that_grows_while_its_dirty_keys_are_never_all_read_is_held() {
+    // One path a drain: the changed keys are read one a drain, and one more comes with each, so the
+    // list is never empty, never long enough to start over, and the count never reached.
+    let limits = Limits { session_keys: 8, dirty_keys: 4, drain_paths: 1, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &[]));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    f.puts(&live0(), &records(&[(0, 1), (1, 1), (2, 1)]));
+    let mut held_at = None;
+    for i in 3..60u32 {
+        f.puts(&live0(), &records(&[(i, 1)]));
+        f.drain();
+        if f.state().hold == Some(Hold::Flooded) {
+            held_at = Some(i);
+            break;
+        }
+    }
+    let at = held_at.expect("held before long");
+    assert!(at <= 8 + 4 + 4, "held at {at}");
+}
+
+#[test]
 fn reads_wait_while_the_changes_are_not_taken() {
     let all: Vec<(u32, i64)> = (0..30).map(|i| (i, i as i64)).collect();
-    let limits = Limits { pending_bytes: MAX_RECORD_BYTES + 600, ..Limits::default() };
+    let limits = Limits { pending_bytes: MAX_QUEUED_RECORD + 600, ..Limits::default() };
     let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
     let d = f.drain();
     assert!(!d.short, "waiting is not spending");
@@ -1123,7 +1226,7 @@ fn applying_what_is_taken_gives_the_doc_whatever_the_budgets() {
             drain_bytes: 300 + rng.next(6_000) as usize,
             drain_paths: 1 + rng.next(30) as usize,
             dirty_keys: 2 + rng.next(12) as usize,
-            pending_bytes: MAX_RECORD_BYTES + 400 + rng.next(4_000) as usize,
+            pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 64,
         };
         let mut f = Fix::with(limits);
@@ -1204,7 +1307,7 @@ fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
             drain_bytes: 300 + rng.next(6_000) as usize,
             drain_paths: 1 + rng.next(30) as usize,
             dirty_keys: 2 + rng.next(12) as usize,
-            pending_bytes: MAX_RECORD_BYTES + 400 + rng.next(4_000) as usize,
+            pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 24,
         };
         let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24 };

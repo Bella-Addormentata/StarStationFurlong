@@ -59,7 +59,9 @@
 //! has them counted afresh (charged a visit a key), as do records added to a
 //! session known to hold such keys. The changes waiting to be taken stop at
 //! [`MAX_PENDING_BYTES`]: past that, reads wait until the caller has taken
-//! some, so a stalled worker makes the node wait, not grow; except for a
+//! some (a record is reckoned at [`MAX_QUEUED_RECORD`] before it is read, so
+//! the queue never passes its cap), so a stalled worker makes the node wait,
+//! not grow; except for a
 //! table that is held, from which nothing is taken: its queue is given up
 //! then, nothing more is queued, and it starts over (a reset) when nothing
 //! holds it. Of a record the mirror keeps its key and its weight; its value
@@ -101,6 +103,11 @@ pub const MAX_DIRTY_KEYS: usize = 2_048;
 /// The changes of a table waiting to be taken (their keys and weights) stop
 /// being read at this; the caller's `take` makes room.
 pub const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+/// The most a record weighs in the queue, key and value as the mirror holds
+/// them: a record the house reads weighs at most [`MAX_RECORD_BYTES`] as the
+/// pages weigh it, and what a page reads as junk is held at 9 bytes where it
+/// weighs 3 (a buffer in an array), so three times that, and a key.
+pub const MAX_QUEUED_RECORD: usize = 3 * MAX_RECORD_BYTES + MAX_KEY_BYTES;
 
 /// The limits, apart so tests can make them small.
 #[derive(Clone, Copy, Debug)]
@@ -475,7 +482,7 @@ impl Table {
     }
 
     /// A record's key and what it reads as.
-    fn record(&mut self, key: &str, read: Read, session_keys: usize) {
+    fn record(&mut self, key: &str, read: Read, limits: &Limits) {
         match read {
             Read::Val(v) => {
                 self.unclear.remove(key);
@@ -502,13 +509,16 @@ impl Table {
             Read::Spent => {}
         }
         let kept = self.keys.len() + self.unclear.len();
-        if kept > session_keys {
+        // (Keys are read in key order, not in the order the doc changed them:
+        // one swapped for another reads as both, and the session is over the
+        // most for a moment that it never was. So past the most is for the
+        // count to say; past what such a moment can come to, it is certain.)
+        if kept > limits.session_keys.saturating_add(limits.dirty_keys) {
             self.flood();
             return;
         }
-        // (Keys the mirror does not keep are in the session too: past the
-        // most with them, the count says.)
-        if kept.saturating_add(self.extra) > session_keys {
+        // (Keys the mirror does not keep are in the session too.)
+        if kept.saturating_add(self.extra) > limits.session_keys {
             self.recount = true;
         }
         if self.stale && self.unclear.is_empty() {
@@ -518,7 +528,8 @@ impl Table {
     }
 
     fn room_for_a_record(&self, limits: &Limits) -> bool {
-        self.queue_bytes.saturating_add(MAX_RECORD_BYTES) <= limits.pending_bytes
+        // (An empty queue has room for one, whatever the cap: one smaller than a record would wait for ever.)
+        self.queue.is_empty() || self.queue_bytes.saturating_add(MAX_QUEUED_RECORD) <= limits.pending_bytes
     }
 
     /// Whether another record may be read. A full queue waits for the caller
@@ -564,7 +575,7 @@ impl Table {
                 self.extra += 1;
             }
         }
-        self.record(key, read, limits.session_keys);
+        self.record(key, read, limits);
         true
     }
 
@@ -674,6 +685,11 @@ impl Table {
             Some(Out::YMap(m)) => Some(m),
             _ => None,
         };
+        // (No session: what changed in it is nothing to read. It is read
+        // when there is one, which is a change of its own.)
+        if ses.is_none() {
+            pending.recs.remove(&live);
+        }
         if self.need_session {
             if !b.path() {
                 return false;
@@ -716,12 +732,6 @@ impl Table {
         if self.flooded {
             return true;
         }
-        if self.recount && !self.count_keys(&ses, txn, b, limits) {
-            return false;
-        }
-        if self.flooded {
-            return true;
-        }
 
         // The rest of the cold read.
         while let Some(key) = self.cold.as_ref().and_then(|c| c.keys.get(c.next).cloned()) {
@@ -739,6 +749,10 @@ impl Table {
             }
         }
         self.cold = None;
+        // (With everything read: the keys kept are as the doc has them.)
+        if self.recount && !self.count_keys(&ses, txn, b, limits) {
+            return false;
+        }
         true
     }
 }
