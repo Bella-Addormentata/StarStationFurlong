@@ -417,8 +417,10 @@ impl Lane {
     ///     refused once it has the pool, before it takes a connection
     ///     ([`Self::choose_now`], [`Self::stand_in`]);
     ///   - the connections the pool held are closed: each reads dead, so no
-    ///     request starts on one, and a request waiting on one for an answer
-    ///     is told it closed (a websocket close is given up after
+    ///     frame is written to one, apart from one a request was already
+    ///     writing when the lane closed ([`PeerConn::close`]), and a request
+    ///     waiting on one, for its sink or for an answer, is told it closed
+    ///     (a websocket close is given up after
     ///     [`crate::chia_peer::CLOSE_TIMEOUT`] on a peer that stopped
     ///     reading); nothing queued is dialled;
     ///   - no dial, name lookup or gossip request of the lane's is running:
@@ -432,8 +434,9 @@ impl Lane {
     /// A discovery under way asks nothing more, queues nothing it learnt,
     /// and the peer store is not written again. A dial still waiting for the
     /// lane's first certificate is not waited for, and does not leave once
-    /// the certificate is there ([`Self::connect_all`]). The in-game Chia
-    /// switch is its caller; the env switch builds the lane closed instead.
+    /// the certificate is there ([`Self::connect_all`]). It is for the
+    /// in-game Chia switch, which is not wired yet (PR 4 of stage 4); the env
+    /// switch builds the lane closed instead.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn close(&self) {
         // The flag first: a request that has the pool next is refused there.

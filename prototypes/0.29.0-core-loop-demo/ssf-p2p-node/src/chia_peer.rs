@@ -777,17 +777,24 @@ impl PeerConn {
     }
 
     /// Write one frame, within [`SEND_TIMEOUT`]. A write that fails or times
-    /// out marks the connection dead: the socket is not coming back.
+    /// out marks the connection dead: the socket is not coming back. A
+    /// connection that reads dead once the sink is taken gets no frame, so
+    /// nothing starts on one [`Self::close`] has begun closing, its websocket
+    /// close given up or not.
     async fn send_message(&self, message: Message) -> Result<()> {
         let bytes = message.to_bytes().context("encoding")?;
         let sent = tokio::time::timeout(SEND_TIMEOUT, async {
             let mut sink = self.sink.lock().await;
-            sink.send(WsMessage::Binary(bytes)).await
+            if !self.alive() {
+                return None;
+            }
+            Some(sink.send(WsMessage::Binary(bytes)).await)
         })
         .await;
         match sent {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
+            Ok(None) => Err(anyhow!("connection to {} is closed", self.addr)),
+            Ok(Some(Ok(()))) => Ok(()),
+            Ok(Some(Err(e))) => {
                 self.alive.store(false, Ordering::Relaxed);
                 Err(anyhow!("send to {}: {e}", self.addr))
             }
@@ -801,7 +808,8 @@ impl PeerConn {
     /// Close the connection: it reads dead at once, every waiting request
     /// learns it, the reader stops, and the websocket close frame is attempted
     /// for at most [`CLOSE_TIMEOUT`] before the socket is simply dropped. A
-    /// peer that stopped reading cannot hold the caller here.
+    /// peer that stopped reading cannot hold the caller here, and a request
+    /// still waiting for the sink then writes nothing ([`Self::send_message`]).
     pub async fn close(&self) {
         self.alive.store(false, Ordering::Relaxed);
         {
@@ -1275,6 +1283,45 @@ mod tests {
         assert_eq!(b.unwrap().header_hash, Bytes32::new([2u8; 32]));
         // No peak was configured, so none is announced.
         assert_eq!(conn.wait_peak(Duration::from_millis(200)).await, None);
+    }
+
+    /// A request that found the connection alive, then waited for the sink
+    /// while the connection closed, writes nothing: not even when the close
+    /// gave its websocket close up after [`CLOSE_TIMEOUT`] (the test holds
+    /// the sink past it, as a write stuck on a peer that stopped reading
+    /// does). The request is told the connection is closed, at once, and
+    /// the peer never reads it.
+    #[tokio::test]
+    async fn a_request_waiting_for_the_sink_when_the_connection_closes_writes_nothing() {
+        let node = spawn("mocknet", NodeType::FullNode, genesis(), None, silent()).await;
+        let conn = PeerConn::connect(node.addr, Source::Gossip, &net(), tls()).await.unwrap();
+        let stuck = conn.sink.lock().await;
+        let filters = chia_protocol::CoinStateFilters::new(true, true, true, 0);
+        let asking = tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                conn.request::<RespondPuzzleState, _>(RequestPuzzleState::new(vec![], None, Bytes32::new([1u8; 32]), filters, false))
+                    .await
+            }
+        });
+        // Its id waits for an answer once it is past the alive check.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while conn.pending.lock().unwrap().waiting.is_empty() {
+            assert!(Instant::now() < deadline, "the request reaches the sink");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        conn.close().await;
+        assert!(!conn.alive());
+        assert!(!asking.is_finished(), "the close returned while the request still waits for the sink");
+        drop(stuck);
+        let err = asking.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("is closed"), "{err}");
+        // Time for a frame that went out to reach the peer.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !node.seen.lock().unwrap().contains(&ProtocolMessageTypes::RequestPuzzleState),
+            "the peer reads no request written after the close"
+        );
     }
 
     #[test]
