@@ -88,14 +88,23 @@ export const LANE_SETTING_OFF_NOTE =
   'Turned off here: your node reads and writes nothing on the Chia chain, on any Chia network, and Chia stays off at every start until it is turned back on here. Turned back on, it comes on at your node\'s next start.';
 export const LANE_DAMAGED_NOTE =
   'The saved switch could not be read, and a switch that cannot be read counts as off: your node reads and writes nothing on the Chia chain, on any Chia network. Turned back on, the saved switch is removed and Chia comes on at your node\'s next start.';
+/** A folder where the switch's file goes: the node cannot remove it, so
+ *  there is no TURN CHIA BACK ON (the node's startup line names the path). */
+export const LANE_STUCK_NOTE =
+  'The saved switch could not be read, and a switch that cannot be read counts as off: your node reads and writes nothing on the Chia chain, on any Chia network. A folder stands where your node keeps the switch, and the switch here cannot remove a folder: once it is removed by hand (your node\'s log names it), Chia comes on at your node\'s next start.';
+/** Off for this run, the switch on for the next start: after TURN CHIA BACK
+ *  ON, and after an off whose save failed with no switch left on disk, so
+ *  it says what the switch is, never what was done to it. */
 export const LANE_UNTIL_RESTART_NOTE =
-  'Turned back on: Chia stays off until your node stops, and comes on at its next start (unless SSF_NO_CHIA_LANE is in its environment then).';
+  'The switch here is on for your node\'s next start: Chia stays off until your node stops, and comes on at its next start (unless SSF_NO_CHIA_LANE is in its environment then).';
 export const LANE_ENV_NOTE =
   'SSF_NO_CHIA_LANE in your node\'s environment holds Chia off on this computer, and the switch here cannot change that. Turned off here too, Chia stays off once that is gone.';
 export const LANE_ENV_SAVED_NOTE =
   'SSF_NO_CHIA_LANE in your node\'s environment holds Chia off on this computer, and the switch here is off too, so Chia stays off once that is gone. To turn the switch back on, start your node without SSF_NO_CHIA_LANE.';
 export const LANE_ENV_DAMAGED_NOTE =
   'SSF_NO_CHIA_LANE in your node\'s environment holds Chia off on this computer, and the saved switch here could not be read, which counts as off, so Chia stays off once that is gone. To turn the switch back on, start your node without SSF_NO_CHIA_LANE.';
+export const LANE_ENV_STUCK_NOTE =
+  'SSF_NO_CHIA_LANE in your node\'s environment holds Chia off on this computer, and the saved switch here could not be read, which counts as off, so Chia stays off once that is gone. A folder stands where your node keeps the switch, and the switch here cannot remove a folder: once it is removed by hand (your node\'s log names it), Chia comes on at a start without SSF_NO_CHIA_LANE.';
 /** A node with the lane but not the switch, held off by the environment. */
 export const LANE_ENV_OLDER_NOTE = 'SSF_NO_CHIA_LANE in your node\'s environment holds Chia off on this computer. ' + LANE_OLDER_NODE;
 export const LANE_OFF_UNKNOWN_NOTE = 'Chia is off on this computer.';
@@ -105,7 +114,7 @@ export const LANE_OFF_UNKNOWN_NOTE = 'Chia is off on this computer.';
 export function chiaOffWhy(lane: ChiaLane): string {
   if (lane.source === 'env') return "Chia is off on this computer (SSF_NO_CHIA_LANE in your node's environment)";
   if (lane.source === 'setting') {
-    if (lane.setting === 'on') return `Chia is off on this computer for the rest of this run (its switch in ${LANE_WHERE} is back on for your node's next start)`;
+    if (lane.setting === 'on') return `Chia is off on this computer for the rest of this run (its switch in ${LANE_WHERE} is on for your node's next start)`;
     if (lane.damaged) return `Chia is off on this computer (its saved switch in ${LANE_WHERE} could not be read, and a switch that cannot be read counts as off)`;
     return `Chia is off on this computer (turned off in ${LANE_WHERE})`;
   }
@@ -114,11 +123,37 @@ export function chiaOffWhy(lane: ChiaLane): string {
 
 /** The sentence after `chiaOffWhy` that says how Chia comes back, when the
  *  switch is what holds it off for the next start too; empty otherwise (the
- *  environment's off, or a switch already back on, which the clause says). */
+ *  environment's off, a switch already on for the next start, which the
+ *  clause says, or a folder the switch cannot remove, which the CHIA row
+ *  says). */
 export function chiaBackOn(lane: ChiaLane): string {
-  return lane.source === 'setting' && lane.setting !== 'on'
+  return lane.source === 'setting' && lane.setting !== 'on' && !lane.stuck
     ? "Turning it back on there brings Chia back at your node's next start."
     : '';
+}
+
+/** `text`, then the back-on sentence when there is one. */
+const withBackOn = (text: string, lane: ChiaLane): string => {
+  const back = chiaBackOn(lane);
+  return back ? `${text} ${back}` : text;
+};
+
+/** The Network rows' feedback when the Chia Mesh row is ticked on or off,
+ *  with the node's lane (`lane`): while Chia is off the node reads and
+ *  publishes nothing on the chain, whatever the room asks. */
+export function meshFeedback(on: boolean, lane: ChiaLane | null | undefined): string {
+  if (!on) return 'Advanced Chia mesh mode OFF for this room.';
+  if (lane?.off) return withBackOn(`Advanced Chia mesh mode ON for this room, but ${chiaOffWhy(lane)}, so your node reads and publishes nothing on the chain until Chia is back on.`, lane);
+  return "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish).";
+}
+
+/** The Network rows' feedback when the Share Card row is ticked on or off,
+ *  with the node's lane (`lane`): while Chia is off the node publishes
+ *  nothing members can find it by on the chain, and reads no knocks. */
+export function shareCardFeedback(on: boolean, lane: ChiaLane | null | undefined): string {
+  if (!on) return 'Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.';
+  if (lane?.off) return withBackOn(`Contact card shared in this room, but ${chiaOffWhy(lane)}, so your node publishes nothing members can find it by on the chain, and reads no knocks, until Chia is back on.`, lane);
+  return 'Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards).';
 }
 
 /** The turn an act sends, or none (`arm` only shows CONFIRM). */
@@ -171,10 +206,12 @@ export function chiaLaneRow(fp: LocalFingerprint | null | undefined, ui: ChiaLan
     case 'env':
       // The node refuses an on while the environment holds Chia off, so a
       // switch saved off has no button here.
-      if (lane.setting === 'off') return row('OFF', LANE_OFF_COLOUR, lane.damaged ? LANE_ENV_DAMAGED_NOTE : LANE_ENV_SAVED_NOTE, busy);
+      if (lane.setting === 'off') return row('OFF', LANE_OFF_COLOUR, lane.stuck ? LANE_ENV_STUCK_NOTE : lane.damaged ? LANE_ENV_DAMAGED_NOTE : LANE_ENV_SAVED_NOTE, busy);
       return row('OFF', LANE_OFF_COLOUR, LANE_ENV_NOTE, button('keep', 'TURN CHIA OFF HERE TOO'));
     case 'setting':
       if (lane.setting === 'on') return row('OFF until your node restarts', LANE_OFF_COLOUR, LANE_UNTIL_RESTART_NOTE, button('keep', 'KEEP CHIA OFF'));
+      // A folder the node cannot remove: an on would only fail, so none.
+      if (lane.stuck) return row('OFF', LANE_OFF_COLOUR, LANE_STUCK_NOTE, busy);
       return row('OFF', LANE_OFF_COLOUR, lane.damaged ? LANE_DAMAGED_NOTE : LANE_SETTING_OFF_NOTE, button('on', 'TURN CHIA BACK ON'));
     default:
       return row('OFF', LANE_OFF_COLOUR, LANE_OFF_UNKNOWN_NOTE, busy);

@@ -9,9 +9,9 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CHIA_LANE_BUTTON_ID, LANE_ARMED_WARNING, LANE_DAMAGED_NOTE, LANE_ENV_DAMAGED_NOTE, LANE_ENV_NOTE, LANE_ENV_OLDER_NOTE,
-  LANE_ENV_SAVED_NOTE, LANE_NO_NODE_COLOUR, LANE_OFF_COLOUR, LANE_OFF_UNKNOWN_NOTE, LANE_OLDER_NODE, LANE_ON_COLOUR,
-  LANE_ON_NOTE, LANE_SAVING_NOTE, LANE_SETTING_OFF_NOTE, LANE_UNKNOWN_COLOUR, LANE_UNTIL_RESTART_NOTE, chiaBackOn,
-  chiaLaneRow, chiaOffWhy, laneKeyRepeat, laneTurnOf, turnChiaLane, type ChiaLaneUi,
+  LANE_ENV_SAVED_NOTE, LANE_ENV_STUCK_NOTE, LANE_NO_NODE_COLOUR, LANE_OFF_COLOUR, LANE_OFF_UNKNOWN_NOTE, LANE_OLDER_NODE, LANE_ON_COLOUR,
+  LANE_ON_NOTE, LANE_SAVING_NOTE, LANE_SETTING_OFF_NOTE, LANE_STUCK_NOTE, LANE_UNKNOWN_COLOUR, LANE_UNTIL_RESTART_NOTE, chiaBackOn,
+  chiaLaneRow, chiaOffWhy, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane, type ChiaLaneUi,
 } from './chiaLane';
 import { TESTNET11 } from './chiaNetwork';
 import type { ChiaLane, LocalFingerprint } from './nodeFingerprint';
@@ -27,6 +27,9 @@ const UNTIL_RESTART: ChiaLane = { off: true, source: 'setting', setting: 'on' };
 const ENV: ChiaLane = { off: true, source: 'env', setting: 'on' };
 const ENV_SAVED: ChiaLane = { off: true, source: 'env', setting: 'off' };
 const ENV_DAMAGED: ChiaLane = { off: true, source: 'env', setting: 'off', damaged: true };
+// A folder where the switch's file goes, which the node cannot remove.
+const STUCK: ChiaLane = { off: true, source: 'setting', setting: 'off', damaged: true, stuck: true };
+const ENV_STUCK: ChiaLane = { off: true, source: 'env', setting: 'off', damaged: true, stuck: true };
 
 describe('chiaLaneRow', () => {
   it('says NO NODE, with no switch, while the node does not answer', () => {
@@ -88,13 +91,44 @@ describe('chiaLaneRow', () => {
     expect(LANE_DAMAGED_NOTE).toContain('counts as off');
   });
 
+  it('offers no TURN CHIA BACK ON for a folder the node cannot remove, and says how Chia comes back', () => {
+    expect(chiaLaneRow(node(STUCK), IDLE)).toEqual({ value: 'OFF', colour: LANE_OFF_COLOUR, note: LANE_STUCK_NOTE, warning: null, error: null, button: null });
+    expect(chiaLaneRow(node(STUCK), { ...IDLE, armed: true }).button).toBeNull();
+    expect(chiaLaneRow(node(ENV_STUCK), IDLE)).toEqual({ value: 'OFF', colour: LANE_OFF_COLOUR, note: LANE_ENV_STUCK_NOTE, warning: null, error: null, button: null });
+    for (const note of [LANE_STUCK_NOTE, LANE_ENV_STUCK_NOTE]) {
+      expect(note).toContain('counts as off');
+      expect(note).toContain('the switch here cannot remove a folder');
+      expect(note).toContain('once it is removed by hand');
+      // Never the promise an on cannot keep.
+      expect(note).not.toContain('Turned back on');
+      expect(note).not.toContain('is removed and');
+      expect(note).not.toContain('To turn the switch back on');
+    }
+    expect(LANE_STUCK_NOTE).toContain("Chia comes on at your node's next start");
+    expect(LANE_ENV_STUCK_NOTE).toContain('Chia comes on at a start without SSF_NO_CHIA_LANE');
+  });
+
   it('says off now, on at the next start, and offers to keep it off', () => {
     expect(chiaLaneRow(node(UNTIL_RESTART), IDLE)).toEqual({
       value: 'OFF until your node restarts', colour: LANE_OFF_COLOUR, note: LANE_UNTIL_RESTART_NOTE, warning: null, error: null,
       button: { act: 'keep', label: 'KEEP CHIA OFF', danger: false, busy: false },
     });
-    expect(LANE_UNTIL_RESTART_NOTE).toBe('Turned back on: Chia stays off until your node stops, and comes on at its next start (unless SSF_NO_CHIA_LANE is in its environment then).');
+    expect(LANE_UNTIL_RESTART_NOTE).toBe("The switch here is on for your node's next start: Chia stays off until your node stops, and comes on at its next start (unless SSF_NO_CHIA_LANE is in its environment then).");
     expect(chiaLaneRow(node(UNTIL_RESTART), { armed: false, turning: 'keep', error: null }).button).toEqual({ act: 'confirm', label: 'KEEPING CHIA OFF…', danger: false, busy: true });
+  });
+
+  it('says what the switch is after an off whose save failed, never that it was turned back on', () => {
+    // The node's 409 lane when the save failed and no switch is on disk
+    // (chia_strict.rs after_failed_off): the same lane as after an on.
+    const error = 'Chia is off now, but the switch could not be saved (No space left on device (os error 28)), so Chia comes back on at the next start';
+    const failed = chiaLaneRow(node(UNTIL_RESTART), { ...IDLE, error });
+    expect(failed).toMatchObject({ value: 'OFF until your node restarts', note: LANE_UNTIL_RESTART_NOTE, error, button: { act: 'keep', label: 'KEEP CHIA OFF' } });
+    // The Network view opened again clears the error; the note still says only what the switch is.
+    const later = chiaLaneRow(node(UNTIL_RESTART), IDLE);
+    for (const words of [failed.note ?? '', later.note ?? '', chiaOffWhy(UNTIL_RESTART)]) {
+      expect(words).not.toMatch(/turned back on|back on for/i);
+      expect(words).toContain("on for your node's next start");
+    }
   });
 
   it('says the environment holds Chia off, which the switch cannot change, and offers to save it off too', () => {
@@ -121,7 +155,7 @@ describe('chiaLaneRow', () => {
 
   it('shows the last failure in every state, and never a button the state does not have', () => {
     const error = 'Chia is off now, but the switch could not be saved (disk full), so Chia comes back on at the next start';
-    for (const fp of [null, node(), node({ off: false }), node(ON), node(SETTING_OFF), node(DAMAGED), node(UNTIL_RESTART), node(ENV), node(ENV_SAVED)]) {
+    for (const fp of [null, node(), node({ off: false }), node(ON), node(SETTING_OFF), node(DAMAGED), node(STUCK), node(UNTIL_RESTART), node(ENV), node(ENV_SAVED), node(ENV_STUCK)]) {
       expect(chiaLaneRow(fp, { ...IDLE, error }).error).toBe(error);
       expect(chiaLaneRow(fp, IDLE).error).toBeNull();
     }
@@ -133,11 +167,13 @@ describe('chiaLaneRow', () => {
     expect(acts(ENV)).toEqual(['keep', 'keep']);
     expect(acts(ENV_SAVED)).toEqual([null, null]);
     expect(acts(ENV_DAMAGED)).toEqual([null, null]);
+    expect(acts(STUCK)).toEqual([null, null]);
+    expect(acts(ENV_STUCK)).toEqual([null, null]);
     expect(acts(undefined)).toEqual([null, null]);
   });
 
   it('words every state for the player: no file names, no field names', () => {
-    const lanes: (ChiaLane | undefined)[] = [undefined, { off: false }, { off: true, source: 'env' }, ON, SETTING_OFF, DAMAGED, UNTIL_RESTART, ENV, ENV_SAVED, ENV_DAMAGED];
+    const lanes: (ChiaLane | undefined)[] = [undefined, { off: false }, { off: true, source: 'env' }, ON, SETTING_OFF, DAMAGED, STUCK, UNTIL_RESTART, ENV, ENV_SAVED, ENV_DAMAGED, ENV_STUCK];
     for (const lane of lanes) {
       for (const ui of [IDLE, { ...IDLE, armed: true }]) {
         const r = chiaLaneRow(node(lane), ui);
@@ -154,7 +190,8 @@ describe('chiaOffWhy and chiaBackOn', () => {
     expect(chiaOffWhy(ENV_SAVED)).toBe(chiaOffWhy(ENV));
     expect(chiaOffWhy(SETTING_OFF)).toBe("Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK)");
     expect(chiaOffWhy(DAMAGED)).toBe("Chia is off on this computer (its saved switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK could not be read, and a switch that cannot be read counts as off)");
-    expect(chiaOffWhy(UNTIL_RESTART)).toBe("Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is back on for your node's next start)");
+    expect(chiaOffWhy(UNTIL_RESTART)).toBe("Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is on for your node's next start)");
+    expect(chiaOffWhy(STUCK)).toBe(chiaOffWhy(DAMAGED));
     expect(chiaOffWhy({ off: true })).toBe('Chia is off on this computer');
     const back = "Turning it back on there brings Chia back at your node's next start.";
     expect(chiaBackOn(SETTING_OFF)).toBe(back);
@@ -162,6 +199,48 @@ describe('chiaOffWhy and chiaBackOn', () => {
     // A node with the switch always says what it says; one without it never names the switch as the source.
     expect(chiaBackOn({ off: true, source: 'setting' })).toBe(back);
     for (const lane of [UNTIL_RESTART, ENV, ENV_SAVED, { off: true } as ChiaLane]) expect(chiaBackOn(lane)).toBe('');
+    // A folder the switch cannot remove: turning it back on there brings nothing back.
+    for (const lane of [STUCK, ENV_STUCK]) expect(chiaBackOn(lane)).toBe('');
+  });
+});
+
+describe('the Chia Mesh and Share Card feedback', () => {
+  const MESH_ON = "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish).";
+  const MESH_OFF = 'Advanced Chia mesh mode OFF for this room.';
+  const CARD_ON = 'Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards).';
+  const CARD_OFF = 'Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.';
+  const OFF_LANES = [ENV, ENV_SAVED, SETTING_OFF, DAMAGED, STUCK, UNTIL_RESTART, { off: true } as ChiaLane];
+
+  it('say what they said before while Chia is on, or with no lane', () => {
+    for (const lane of [undefined, null, ON, { off: false } as ChiaLane]) {
+      expect(meshFeedback(true, lane)).toBe(MESH_ON);
+      expect(meshFeedback(false, lane)).toBe(MESH_OFF);
+      expect(shareCardFeedback(true, lane)).toBe(CARD_ON);
+      expect(shareCardFeedback(false, lane)).toBe(CARD_OFF);
+    }
+  });
+
+  it('say Chia is off, and why, when ticked on while it is', () => {
+    for (const lane of OFF_LANES) {
+      const mesh = meshFeedback(true, lane);
+      const card = shareCardFeedback(true, lane);
+      for (const words of [mesh, card]) {
+        expect(words).toContain(chiaOffWhy(lane));
+        expect(words).not.toContain('chain reads are on');
+        expect(words).not.toContain('knock when every live route fails');
+        const back = chiaBackOn(lane);
+        if (back) expect(words.endsWith(` ${back}`)).toBe(true);
+        else expect(words.endsWith('until Chia is back on.')).toBe(true);
+      }
+      expect(mesh).toBe(`Advanced Chia mesh mode ON for this room, but ${chiaOffWhy(lane)}, so your node reads and publishes nothing on the chain until Chia is back on.${chiaBackOn(lane) ? ` ${chiaBackOn(lane)}` : ''}`);
+      expect(card).toContain('reads no knocks');
+      // Ticked off, the words are true either way.
+      expect(meshFeedback(false, lane)).toBe(MESH_OFF);
+      expect(shareCardFeedback(false, lane)).toBe(CARD_OFF);
+    }
+    expect(shareCardFeedback(true, SETTING_OFF)).toBe(
+      "Contact card shared in this room, but Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK), so your node publishes nothing members can find it by on the chain, and reads no knocks, until Chia is back on. Turning it back on there brings Chia back at your node's next start.",
+    );
   });
 });
 
@@ -287,6 +366,20 @@ describe('main.ts wires the CHIA row', () => {
     expect(open).toContain('if (!chiaLaneTurning) chiaLaneError = null;');
     expect(open).toContain('renderChiaLaneRow();');
     expect(body('async function refreshLocalFingerprint(')).toContain('bankWalletArmed = false;\n      chiaLaneArmed = false;');
+  });
+
+  it('words the Chia Mesh and Share Card feedback with the lane', () => {
+    const at = main.indexOf('// ChiaHub Slice 3b: the "advanced Chia mesh mode" switch.');
+    expect(at).toBeGreaterThan(0);
+    const toggles = main.slice(at, main.indexOf('// ?seed= deep-link import', at));
+    expect(toggles).toContain('feedback.textContent = meshFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);');
+    expect(toggles).toContain('feedback.textContent = shareCardFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);');
+    expect(toggles).not.toContain('chain reads are on for every node');
+    expect(toggles).not.toContain('knock when every live route fails');
+  });
+
+  it('hands THE REGISTRY line the lane', () => {
+    expect(main).toContain('registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net, (localNodeLive ? localFingerprint : null)?.chia_lane)');
   });
 
   it('reads the fingerprint again after a turn, and hands the dish the lane', () => {

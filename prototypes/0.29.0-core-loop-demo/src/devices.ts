@@ -4703,7 +4703,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     const fpNet = deps.chiaNet();
     const net = fpNet === undefined ? '-' : fpNet === null ? '?' : fpNet.id;
     const lane = laneOff();
-    return lane ? `${net}|off:${lane.source ?? '?'}:${lane.setting ?? '-'}:${lane.damaged ? 'damaged' : ''}` : net;
+    return lane ? `${net}|off:${lane.source ?? '?'}:${lane.setting ?? '-'}:${lane.damaged ? 'damaged' : ''}:${lane.stuck ? 'stuck' : ''}` : net;
   };
   let drawnFor = '';
 

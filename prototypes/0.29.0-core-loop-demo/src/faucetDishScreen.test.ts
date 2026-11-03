@@ -405,7 +405,9 @@ describe('the faucet dish screen when the fingerprint changes network while it i
 const OFF_LANES: [string, ChiaLane, string][] = [
   ['the environment', { off: true, source: 'env', setting: 'on' }, "Chia is off on this computer (SSF_NO_CHIA_LANE in your node's environment), so the dish reads nothing from the chain, and takes and gives nothing."],
   ['the switch', { off: true, source: 'setting', setting: 'off' }, "Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK), so the dish reads nothing from the chain, and takes and gives nothing. Turning it back on there brings Chia back at your node's next start."],
-  ['the switch, back on for the next start', { off: true, source: 'setting', setting: 'on' }, "Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is back on for your node's next start), so the dish reads nothing from the chain, and takes and gives nothing."],
+  ['the switch, on for the next start', { off: true, source: 'setting', setting: 'on' }, "Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is on for your node's next start), so the dish reads nothing from the chain, and takes and gives nothing."],
+  // A folder the switch cannot remove: no promise that turning it back on there brings Chia back.
+  ['a folder the switch cannot remove', { off: true, source: 'setting', setting: 'off', damaged: true, stuck: true }, "Chia is off on this computer (its saved switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK could not be read, and a switch that cannot be read counts as off), so the dish reads nothing from the chain, and takes and gives nothing."],
 ];
 
 describe.each([TESTNET11, MAINNET])('⛓️ the faucet dish screen on $name while Chia is off', (net) => {
@@ -415,7 +417,8 @@ describe.each([TESTNET11, MAINNET])('⛓️ the faucet dish screen on $name whil
     const h = screen(null, net, lane);
     expect(h).toContain('CHIA IS OFF');
     expect(h).toContain('id="faucet-chia-off"');
-    expect(h).toContain(why);
+    // The whole line, with nothing after it (no back-on sentence a lane does not have).
+    expect(h).toContain(`${why}\n`);
     expect(h).not.toContain('READING THE CHAIN');
     expect(h).not.toContain('reading…');
     for (const gone of ['faucet-take', 'faucet-give', 'faucet-copy', 'faucet-address', 'faucet-no-take', 'faucet-no-slot', 'THE JAR', 'THE SLOT', '<svg']) {
@@ -427,7 +430,7 @@ describe.each([TESTNET11, MAINNET])('⛓️ the faucet dish screen on $name whil
   it.each(OFF_LANES)('shows nothing of the status on file from before %s turned it off', (_label, lane, why) => {
     const h = screen(status(net, address), net, lane);
     expect(h).toContain('CHIA IS OFF');
-    expect(h).toContain(why);
+    expect(h).toContain(`${why}\n`);
     for (const gone of [address, 'IN THE JAR', 'GIFT SLOTS', 'CHAIN HEIGHT', 'Your wallet', 'TAKE A MOJO', '1 MOJO IN THE DISH', 'faucet-give', 'faucet-take', '<svg', '⚠']) {
       expect(h).not.toContain(gone);
     }
@@ -492,7 +495,7 @@ describe('⛓️ the faucet dish screen when Chia goes off while it is open', ()
     const offDraw = s.html();
     s.ui.update(0.016);
     expect(s.html()).toBe(offDraw);
-    // Turned back on for the next start: off still, other words.
+    // On for the next start: off still, other words.
     s.setLane({ off: true, source: 'setting', setting: 'on' });
     s.ui.update(0.016);
     expect(s.html()).toContain('for the rest of this run');

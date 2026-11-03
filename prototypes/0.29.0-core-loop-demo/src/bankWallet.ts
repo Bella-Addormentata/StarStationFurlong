@@ -136,19 +136,27 @@ export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
 
 /** THE REGISTRY's line on the Chia account, with the node's network: a
  *  mainnet wallet holds real money, so it is never called a test one. No
- *  network without a node, or on one this page does not know. */
-export function registryChiaLine(net: ChiaNetwork | null | undefined): string {
+ *  network without a node, or on one this page does not know. ⛓️ While
+ *  Chia is off on this computer (`lane`) RECEIVE turns no wallet on and
+ *  shows no address or balance, so the line says why instead of sending
+ *  the player there. */
+export function registryChiaLine(net: ChiaNetwork | null | undefined, lane?: ChiaLane | null): string {
   const where = !net ? '' : net.test ? ` (${net.name}, a test network)` : ` (${net.name}: real ${net.ticker})`;
+  if (lane?.off) {
+    return `Chia account: your SSF wallet, kept by your station node on this computer${where}; ${chiaOffWhy(lane)}, so the Bank turns no wallet on and shows no address or balance under RECEIVE.`;
+  }
   return `Chia account: your SSF wallet, kept by your station node on this computer${where}; turn it on, and see its address and balance, under RECEIVE.`;
 }
 
 /** ⛓️ RECEIVE's line while Chia is off: why, and what that leaves of the
- *  wallet. `loaded`: the node holds a wallet from before an in-run off. */
-export function chiaOffBankText(lane: ChiaLane, loaded: boolean): string {
+ *  wallet. `loaded`: the node holds a wallet from before an in-run off.
+ *  `kept`: it loads none, but keeps one from before on disk (the 24-word
+ *  file, or a raw-seed one), which stays there. */
+export function chiaOffBankText(lane: ChiaLane, loaded: boolean, kept = false): string {
   const why = chiaOffWhy(lane);
   const text = loaded
     ? `${why}: your node keeps its SSF wallet loaded until it stops, but writes nothing to the chain with it, so the Bank shows no address or balance.`
-    : `${why}, so your node holds no SSF wallet and the Bank shows no address.`;
+    : `${why}, so your node loads no SSF wallet and the Bank shows no address.${kept ? ' The SSF wallet it kept from before stays on this computer.' : ''}`;
   const back = chiaBackOn(lane);
   return back ? `${text} ${back}` : text;
 }
@@ -165,7 +173,8 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   // wallet on (it refuses), and one it still holds writes nothing.
   if (fp.chia_lane?.off) {
     const loaded = w?.state === 'on' || fp.chia_address !== undefined;
-    return { network: net ? networkLine(net) : null, warning: null, notice: null, button: null, text: chiaOffBankText(fp.chia_lane, loaded), error: ui.error ?? null, showsAddress: false };
+    const kept = w?.seed === true || w?.legacy === true;
+    return { network: net ? networkLine(net) : null, warning: null, notice: null, button: null, text: chiaOffBankText(fp.chia_lane, loaded, kept), error: ui.error ?? null, showsAddress: false };
   }
   // A network this page does not know: no address (the fingerprint parse
   // keeps none), no switch, and the reason.

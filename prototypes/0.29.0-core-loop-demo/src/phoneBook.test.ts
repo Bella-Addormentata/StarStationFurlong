@@ -170,7 +170,7 @@ describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
       [{ off: true, source: 'env', setting: 'on' }, "OFF — Chia is off on this computer (SSF_NO_CHIA_LANE in your node's environment), so this node neither reads nor writes the Phone Book"],
       [{ off: true, source: 'setting', setting: 'off' }, "OFF — Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK), so this node neither reads nor writes the Phone Book"],
       [{ off: true, source: 'setting', setting: 'off', damaged: true }, "OFF — Chia is off on this computer (its saved switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK could not be read, and a switch that cannot be read counts as off), so this node neither reads nor writes the Phone Book"],
-      [{ off: true, source: 'setting', setting: 'on' }, "OFF — Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is back on for your node's next start), so this node neither reads nor writes the Phone Book"],
+      [{ off: true, source: 'setting', setting: 'on' }, "OFF — Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is on for your node's next start), so this node neither reads nor writes the Phone Book"],
       [{ off: true }, 'OFF — Chia is off on this computer, so this node neither reads nor writes the Phone Book'],
     ];
     const presences: (ChiaPresence | undefined)[] = [listed, { ...listed, state: 'sent', confirmed: false }, { ...listed, state: 'outdated', current: false }, { ...listed, error: 'unfunded: the wallet holds no coin' }, undefined];

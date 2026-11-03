@@ -131,6 +131,7 @@ describe('parseNodeFingerprint', () => {
     expect(fp({ off: true, source: 'setting', setting: 'off' })).toEqual({ off: true, source: 'setting', setting: 'off' });
     expect(fp({ off: true, source: 'setting', setting: 'on' })).toEqual({ off: true, source: 'setting', setting: 'on' });
     expect(fp({ off: true, source: 'setting', setting: 'off', damaged: true })).toEqual({ off: true, source: 'setting', setting: 'off', damaged: true });
+    expect(fp({ off: true, source: 'env', setting: 'off', damaged: true, stuck: true })).toEqual({ off: true, source: 'env', setting: 'off', damaged: true, stuck: true });
     // A node with the lane but not the switch sends no setting, and none is invented.
     expect(fp({ off: false })).toEqual({ off: false });
     expect(fp({ off: true, source: 'env' })).toEqual({ off: true, source: 'env' });
@@ -142,12 +143,13 @@ describe('parseNodeFingerprint', () => {
     for (const junk of ['ENV', 'Setting', 'app', '', 1, true, null, ['env']]) {
       expect(fp({ off: true, source: junk, setting: 'off' })).toEqual({ off: true, setting: 'off' });
     }
-    // The setting only as on or off; damaged only as true.
+    // The setting only as on or off; damaged and stuck only as true.
     for (const junk of ['ON', 'yes', '', 0, true, null, ['off']]) {
       expect(fp({ off: true, source: 'env', setting: junk })).toEqual({ off: true, source: 'env' });
     }
     for (const junk of [false, 'true', 1, null]) {
       expect(fp({ off: true, source: 'setting', setting: 'off', damaged: junk })).toEqual({ off: true, source: 'setting', setting: 'off' });
+      expect(fp({ off: true, source: 'setting', setting: 'off', damaged: true, stuck: junk })).toEqual({ off: true, source: 'setting', setting: 'off', damaged: true });
     }
     // An off that is not a boolean, or no object at all: no lane.
     for (const bad of [null, undefined, 'off', 1, true, [], {}, { off: 'true' }, { off: 1 }, { off: null }, { source: 'env' }]) {

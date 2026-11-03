@@ -300,7 +300,7 @@ import {
 import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
-import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, turnChiaLane } from "./chiaLane";
+import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
@@ -5523,7 +5523,7 @@ function renderBankApp(): void {
     }
     ${header("THE REGISTRY")}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
-      ${esc(registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net))} On-Registry share trading appears here when
+      ${esc(registryChiaLine((localNodeLive ? localFingerprint : null)?.chia_net, (localNodeLive ? localFingerprint : null)?.chia_lane))} On-Registry share trading appears here when
       the node's account service lands. Shares today are room records — same
       rules, no coins at risk.
     </div>
@@ -10088,9 +10088,8 @@ function setupNetworkDetailsPanel() {
       // Apply live — re-send this room's cap to the local node with the new flag.
       void networkProvider.resendRoomCap(on);
       if (feedback) {
-        feedback.textContent = on
-          ? "Advanced Chia mesh mode ON for this room (experimental — the node publishes once its SSF wallet is on in the SpacePhone's 🏦 BANK and holds a coin; chain reads are on for every node, and public rooms never publish)."
-          : "Advanced Chia mesh mode OFF for this room.";
+        // ⛓️ chiaLane.ts words it, and says so while Chia is off.
+        feedback.textContent = meshFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
         }, 5000);
@@ -10118,9 +10117,8 @@ function setupNetworkDetailsPanel() {
       if (roomId) setShareCard(roomId, on);
       void networkProvider.refreshRoomCap();
       if (feedback) {
-        feedback.textContent = on
-          ? "Contact card shared in this room: its members can find this station by key and knock when every live route fails (private rooms only; public rooms never carry cards)."
-          : "Contact card not shared in this room: members get no key for this station, and the node reads no knocks for it.";
+        // ⛓️ chiaLane.ts words it, and says so while Chia is off.
+        feedback.textContent = shareCardFeedback(on, localNodeLive ? localFingerprint?.chia_lane : undefined);
         setTimeout(() => {
           if (feedback) feedback.textContent = "";
         }, 5000);

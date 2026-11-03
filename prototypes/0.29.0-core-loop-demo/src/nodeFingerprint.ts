@@ -246,6 +246,10 @@ export interface ChiaLane {
   setting?: ChiaLaneSetting;
   /** The switch's file is there but cannot be read, so it counts as off. */
   damaged?: true;
+  /** With `damaged`: a folder stands where the switch's file goes, which
+   *  the node cannot remove, so turning the switch back on here cannot work:
+   *  only removing the folder by hand brings Chia back. */
+  stuck?: true;
 }
 
 const LANE_SOURCES: ReadonlySet<string> = new Set<ChiaLaneSource>(['env', 'setting']);
@@ -254,8 +258,9 @@ const LANE_SETTINGS: ReadonlySet<string> = new Set<ChiaLaneSetting>(['on', 'off'
 /** The node's `chia_lane` in its own shape, or undefined when `off` is not
  *  a boolean (or it is not an object at all). A source is kept only while
  *  off and only as a word this page knows; `setting` only as `on` or `off`;
- *  `damaged` only as true. An unknown word is dropped, never `off`: a page
- *  that cannot say why still says Chia is off. Nothing else is copied. */
+ *  `damaged` and `stuck` only as true. An unknown word is dropped, never
+ *  `off`: a page that cannot say why still says Chia is off. Nothing else is
+ *  copied. */
 export function parseChiaLane(v: unknown): ChiaLane | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const r = v as Record<string, unknown>;
@@ -264,6 +269,7 @@ export function parseChiaLane(v: unknown): ChiaLane | undefined {
   if (r.off && typeof r.source === 'string' && LANE_SOURCES.has(r.source)) lane.source = r.source as ChiaLaneSource;
   if (typeof r.setting === 'string' && LANE_SETTINGS.has(r.setting)) lane.setting = r.setting as ChiaLaneSetting;
   if (r.damaged === true) lane.damaged = true;
+  if (r.stuck === true) lane.stuck = true;
   return lane;
 }
 
