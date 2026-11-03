@@ -23,7 +23,14 @@
 //! with no computed table never has one. Starting the process is the one step
 //! `post` takes itself and waits for (a spawn of the node's own, already loaded
 //! file: a few milliseconds, once for each start); killing a worker is only a
-//! signal, and reaping it happens on a thread of its own.
+//! signal, and reaping it happens on a thread of its own. A thread that will
+//! not start (the system is out of them) is a worker that would not start, like
+//! a file that is gone: the worker is killed and the failure counted.
+//!
+//! WHAT A FAULTY WORKER CAN COST THE NODE is bounded in each direction:
+//! [`QUEUE_BYTES`] of frames waiting for it, [`MAX_OWED`] answers owed, and
+//! [`ANSWER_BYTES`] of answers read and not yet taken (the reader thread waits,
+//! and so does the worker, on its pipe). An answer nobody asked for ends the link.
 //!
 //! All time comes in as an argument (`now`), so the rules are tested in
 //! virtual time.
@@ -34,9 +41,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,9 +63,15 @@ pub const CRASH_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// ([`Post::Busy`]) past that, unless nothing waits (so one big frame always goes).
 pub const QUEUE_BYTES: usize = 16 << 20;
 /// Answers the worker may owe at once; a frame is refused ([`Post::Busy`]) past that. With
-/// [`QUEUE_BYTES`] this bounds what a slow worker costs the node, and the answers it may send
-/// ahead of the node's reading them.
+/// [`QUEUE_BYTES`] this bounds what a slow worker costs the node, and how many answers it may send
+/// ahead of the node's reading them (their bytes are bounded by [`ANSWER_BYTES`]).
 pub const MAX_OWED: usize = 256;
+/// Bytes of answers that may wait, read from the worker and not yet taken by [`Supervisor::poll`].
+/// The reader thread stops reading past that (the worker then waits to write, on a full pipe)
+/// until the node takes some, unless nothing waits (so one big answer always comes). A faulty
+/// worker thus costs the node, ahead of its polling, at most this and the answer in the reader's
+/// hands, whatever it is owed; one answer is never more than a frame.
+pub const ANSWER_BYTES: usize = 32 << 20;
 /// How long a worker's process may be gone before the supervisor stops waiting for its output
 /// to say so: the reader thread sees the pipe end the moment the process does, and what the
 /// worker wrote first reaches the node ahead of that, so this is only a backstop.
@@ -113,10 +126,65 @@ pub fn backoff(n: u32) -> Duration {
 
 /// Something the reader or writer thread of a link has seen.
 enum Incoming {
-    Resp(Resp),
+    /// An answer, and the bytes of the frame it came in (what the [`Inbox`] counts it as).
+    Resp(Resp, usize),
     /// The pipe ended or broke, or the worker sent what is not a frame.
     Closed(String),
 }
+
+/// The bytes of answers read and waiting for the node: the reader thread asks leave to hand one
+/// over ([`Inbox::admit`]) and waits while too many wait; `poll` says when it took one
+/// ([`Inbox::taken`]); a link that is dropped lets the reader go ([`Inbox::close`]).
+struct Inbox {
+    held: Mutex<usize>,
+    room: Condvar,
+    closed: AtomicBool,
+    limit: usize,
+}
+
+impl Inbox {
+    fn new(limit: usize) -> Inbox {
+        Inbox { held: Mutex::new(0), room: Condvar::new(), closed: AtomicBool::new(false), limit }
+    }
+
+    /// Wait until an answer of `n` bytes may join those waiting (or none waits), and count it.
+    /// `false`: the link was closed first.
+    fn admit(&self, n: usize) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if *held == 0 || held.saturating_add(n) <= self.limit {
+                *held = held.saturating_add(n);
+                return true;
+            }
+            held = self.room.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// An answer of `n` bytes left the queue.
+    fn taken(&self, n: usize) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = held.saturating_sub(n);
+        self.room.notify_all();
+    }
+
+    /// The link is gone: nothing waits for room any more.
+    fn close(&self) {
+        // Set under the lock the waiter holds while it checks, so it cannot miss the wake.
+        let _held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        self.closed.store(true, Ordering::SeqCst);
+        self.room.notify_all();
+    }
+
+    fn waiting(&self) -> usize {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Starts a thread of a link: its name and what it runs. Replaced in tests, to make one fail.
+type Spawn<'a> = &'a mut dyn FnMut(&'static str, Box<dyn FnOnce() + Send>) -> io::Result<()>;
 
 /// A running worker: a thread that writes frames to it, a thread that reads
 /// frames from it, and the means to kill it and to ask whether it is gone.
@@ -129,24 +197,34 @@ pub struct Link {
     /// Answers the worker owes: counted up before a frame that wants one is handed over, down
     /// as each answer is read. An answer past that is nobody's, and ends the link.
     unanswered: Arc<AtomicUsize>,
+    /// The bytes of answers read and not yet taken.
+    inbox: Arc<Inbox>,
     kill: Box<dyn FnMut() + Send>,
     exited: Box<dyn FnMut() -> bool + Send>,
 }
 
 impl Link {
     /// A link over a worker's input and output. `kill` must make both end (the
-    /// threads then end too); `exited` says whether the worker is gone.
-    pub fn new(mut to_worker: Box<dyn Write + Send>, mut from_worker: Box<dyn Read + Send>, kill: Box<dyn FnMut() + Send>, exited: Box<dyn FnMut() -> bool + Send>) -> Link {
+    /// threads then end too); `exited` says whether the worker is gone. `Err`: a thread of the
+    /// link would not start (the system is out of them); the worker is killed and nothing is left.
+    pub fn new(to_worker: Box<dyn Write + Send>, from_worker: Box<dyn Read + Send>, kill: Box<dyn FnMut() + Send>, exited: Box<dyn FnMut() -> bool + Send>) -> io::Result<Link> {
+        let mut spawn = |name: &'static str, run: Box<dyn FnOnce() + Send>| thread::Builder::new().name(name.into()).spawn(run).map(|_| ());
+        Link::build(to_worker, from_worker, kill, exited, ANSWER_BYTES, &mut spawn)
+    }
+
+    fn build(mut to_worker: Box<dyn Write + Send>, mut from_worker: Box<dyn Read + Send>, mut kill: Box<dyn FnMut() + Send>, exited: Box<dyn FnMut() -> bool + Send>, answer_bytes: usize, spawn: Spawn<'_>) -> io::Result<Link> {
         let (tx, frames) = channel::<Vec<u8>>();
         let (tell, rx) = channel::<Incoming>();
         let queued = Arc::new(AtomicUsize::new(0));
         let unanswered = Arc::new(AtomicUsize::new(0));
+        let inbox = Arc::new(Inbox::new(answer_bytes));
         let reader_unanswered = unanswered.clone();
+        let reader_inbox = inbox.clone();
         let writer_queued = queued.clone();
         let writer_tell = tell.clone();
-        thread::Builder::new()
-            .name("fold-writer".into())
-            .spawn(move || {
+        let writer = spawn(
+            "fold-writer",
+            Box::new(move || {
                 while let Ok(frame) = frames.recv() {
                     let n = frame.len();
                     let sent = write_frame(&mut to_worker, &frame);
@@ -156,22 +234,35 @@ impl Link {
                         return;
                     }
                 }
-            })
-            .expect("the fold writer thread starts");
-        thread::Builder::new()
-            .name("fold-reader".into())
-            .spawn(move || loop {
+            }),
+        );
+        if let Err(e) = writer {
+            // A worker nobody watches is not left running.
+            kill();
+            return Err(e);
+        }
+        let reader = spawn(
+            "fold-reader",
+            Box::new(move || loop {
                 let said = match read_frame(&mut from_worker) {
-                    Ok(Some(body)) => match decode_resp(&body) {
-                        // A worker cannot queue answers in the node's memory faster than it was
-                        // asked: one it was not asked for ends the link.
-                        Ok(resp) if reader_unanswered.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_err() => {
-                            drop(resp);
-                            Incoming::Closed("the worker sent an answer nobody asked for".into())
+                    Ok(Some(body)) => {
+                        let n = body.len();
+                        match decode_resp(&body) {
+                            // A worker cannot queue answers in the node's memory faster than it was
+                            // asked: one it was not asked for ends the link.
+                            Ok(_) if reader_unanswered.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owed| owed.checked_sub(1)).is_err() => Incoming::Closed("the worker sent an answer nobody asked for".into()),
+                            Ok(resp) => {
+                                drop(body);
+                                // Nor faster than the node takes them, in bytes: this thread waits
+                                // here (and so the worker, on its full pipe) while enough wait.
+                                if !reader_inbox.admit(n) {
+                                    return;
+                                }
+                                Incoming::Resp(resp, n)
+                            }
+                            Err(e) => Incoming::Closed(format!("the worker sent a frame that is not an answer: {e}")),
                         }
-                        Ok(resp) => Incoming::Resp(resp),
-                        Err(e) => Incoming::Closed(format!("the worker sent a frame that is not an answer: {e}")),
-                    },
+                    }
                     Ok(None) => Incoming::Closed("the worker closed its output".into()),
                     Err(e) => Incoming::Closed(format!("read from the worker: {e}")),
                 };
@@ -179,16 +270,29 @@ impl Link {
                 if tell.send(said).is_err() || last {
                     return;
                 }
-            })
-            .expect("the fold reader thread starts");
-        Link { tx: Some(tx), rx, queued, unanswered, kill, exited }
+            }),
+        );
+        if let Err(e) = reader {
+            // `tx` goes with this return: the writer thread ends, and the worker's input with it.
+            kill();
+            return Err(e);
+        }
+        Ok(Link { tx: Some(tx), rx, queued, unanswered, inbox, kill, exited })
+    }
+
+    /// Bytes of answers read and not yet taken (tests).
+    #[cfg(test)]
+    fn answer_bytes_waiting(&self) -> usize {
+        self.inbox.waiting()
     }
 }
 
 impl Drop for Link {
     fn drop(&mut self) {
-        // The writer thread ends when the sender goes; the worker, by the kill.
+        // The writer thread ends when the sender goes, the reader when it is let go, the worker
+        // by the kill.
         self.tx = None;
+        self.inbox.close();
         (self.kill)();
     }
 }
@@ -224,15 +328,27 @@ impl Default for ChildLaunch {
     }
 }
 
+/// Workers that were killed and whose reaper thread would not start (the system is out of
+/// threads): each launch looks at them again, so a killed worker is not left a zombie until the
+/// node ends.
+static UNREAPED: Mutex<Vec<Arc<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+/// Drop, from `list`, the workers that have been waited for (a process that has exited is reaped
+/// by looking); keep the ones still running.
+fn sweep(list: &mut Vec<Arc<Mutex<Child>>>) {
+    list.retain(|c| c.lock().map(|mut c| matches!(c.try_wait(), Ok(None))).unwrap_or(false));
+}
+
 impl Launch for ChildLaunch {
     fn launch(&mut self) -> io::Result<Link> {
+        sweep(&mut UNREAPED.lock().unwrap_or_else(PoisonError::into_inner));
         let mut child = (self.command)()?.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| io::Error::other("no pipe to the worker"))?;
         let stdout = child.stdout.take().ok_or_else(|| io::Error::other("no pipe from the worker"))?;
         let child: Arc<Mutex<Child>> = Arc::new(Mutex::new(child));
         let for_kill = child.clone();
         let for_exit = child;
-        Ok(Link::new(
+        Link::new(
             Box::new(stdin),
             Box::new(stdout),
             Box::new(move || {
@@ -243,14 +359,17 @@ impl Launch for ChildLaunch {
                 // the kernel) must not hold the reveal path. Its input is closed with the link, so a
                 // worker that outlives the kill leaves by itself when it next reads.
                 let reap = for_kill.clone();
-                let _ = thread::Builder::new().name("fold-reaper".into()).spawn(move || {
+                let reaper = thread::Builder::new().name("fold-reaper".into()).spawn(move || {
                     if let Ok(mut c) = reap.lock() {
                         let _ = c.wait();
                     }
                 });
+                if reaper.is_err() {
+                    UNREAPED.lock().unwrap_or_else(PoisonError::into_inner).push(for_kill.clone());
+                }
             }),
             Box::new(move || for_exit.lock().map(|mut c| !matches!(c.try_wait(), Ok(None))).unwrap_or(true)),
-        ))
+        )
     }
 }
 
@@ -404,7 +523,9 @@ impl<L: Launch> Supervisor<L> {
         loop {
             let Some(link) = self.link.as_ref() else { return events };
             match link.rx.try_recv() {
-                Ok(Incoming::Resp(resp)) => {
+                Ok(Incoming::Resp(resp, bytes)) => {
+                    // Out of the queue, whatever it turns out to be: the reader may go on.
+                    link.inbox.taken(bytes);
                     let in_step = self.owed.front().is_some_and(|o| &o.ctx == resp.ctx() && o.version == resp.version());
                     if !in_step {
                         self.fail_into(now, "the worker answered out of step".into(), &mut events);

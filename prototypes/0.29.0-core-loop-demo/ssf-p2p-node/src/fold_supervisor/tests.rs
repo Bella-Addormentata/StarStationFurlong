@@ -7,7 +7,6 @@ use super::*;
 use crate::fold_wire::{encode_resp, Cold, Warm};
 use crate::house_bytes::CVal;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 fn secs(s: u64) -> Duration {
@@ -127,6 +126,11 @@ impl Manual {
 use crate::fold_wire::decode_req;
 
 fn manual_link(gated: bool) -> (Link, Manual) {
+    manual_link_holding(gated, ANSWER_BYTES)
+}
+
+/// A hand-played worker whose link holds `answer_bytes` of answers for the node at most.
+fn manual_link_holding(gated: bool, answer_bytes: usize) -> (Link, Manual) {
     let (req_tx, req_rx) = channel::<Vec<u8>>();
     let (gate_tx, gate_rx) = sync_channel::<Vec<u8>>(0);
     let (resp_tx, resp_rx) = channel::<Vec<u8>>();
@@ -134,16 +138,24 @@ fn manual_link(gated: bool) -> (Link, Manual) {
     let gone = Arc::new(AtomicBool::new(false));
     let (k, g) = (kills.clone(), gone.clone());
     let writer: Box<dyn Write + Send> = if gated { Box::new(Gated(gate_tx)) } else { Box::new(Free(req_tx)) };
-    let link = Link::new(
+    let link = Link::build(
         writer,
         Box::new(ChanReader::new(resp_rx)),
         Box::new(move || {
             k.fetch_add(1, Ordering::SeqCst);
         }),
         Box::new(move || g.load(Ordering::SeqCst)),
-    );
+        answer_bytes,
+        &mut real_threads,
+    )
+    .unwrap();
     let requests = ChanReader::new(if gated { gate_rx } else { req_rx });
     (link, Manual { requests, replies: Some(resp_tx), kills, gone })
+}
+
+/// Threads that start.
+fn real_threads(name: &'static str, run: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    thread::Builder::new().name(name.into()).spawn(run).map(|_| ())
 }
 
 /// A reader that waits for a flag before it reads anything.
@@ -176,7 +188,8 @@ fn manual_link_with_slow_reader() -> (Link, Manual, Arc<AtomicBool>) {
             k.fetch_add(1, Ordering::SeqCst);
         }),
         Box::new(move || g.load(Ordering::SeqCst)),
-    );
+    )
+    .unwrap();
     (link, Manual { requests: ChanReader::new(req_rx), replies: Some(resp_tx), kills, gone }, go)
 }
 
@@ -557,6 +570,110 @@ fn too_many_frames_waiting_for_answers_is_busy() {
     assert_eq!(s.post(t0, &warm("a", 10_000)), Post::Posted);
 }
 
+// ── What a faulty worker can cost, in answer bytes ─────────────────────────
+
+/// The bytes of one `result` answer's frame, as the link counts them.
+fn one_answer() -> usize {
+    encode_resp(&result("a", 1)).unwrap().len() - 4
+}
+
+/// A supervisor over one worker whose link holds `answer_bytes` of answers at most.
+fn holding(t0: Instant, answer_bytes: usize) -> (Supervisor<Plan>, Manual) {
+    let (link, m) = manual_link_holding(false, answer_bytes);
+    let (p, _) = plan(vec![Ok(link)]);
+    (Supervisor::new(p, t0), m)
+}
+
+fn waiting(s: &Supervisor<Plan>) -> usize {
+    s.link.as_ref().expect("a link").answer_bytes_waiting()
+}
+
+/// Real time until `f` holds (the reader thread works on its own).
+fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + secs(30);
+    while !f() {
+        assert!(std::time::Instant::now() < deadline, "waited 30 s for {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn answers_the_node_has_not_taken_wait_in_the_pipe_and_not_in_the_node() {
+    // 256 small frames may owe 256 big answers: the bytes are bounded on their own.
+    let t0 = Instant::now();
+    let one = one_answer();
+    let (mut s, mut m) = holding(t0, 2 * one + one / 2);
+    for v in 1..=3 {
+        assert_eq!(s.post(t0, &warm("a", v)), Post::Posted);
+        m.next_req();
+    }
+    for v in 1..=3 {
+        m.reply(&result("a", v));
+    }
+    until("two answers to be held", || waiting(&s) >= 2 * one);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(waiting(&s), 2 * one, "the third is not read while two wait");
+    // The node takes them, and the third comes after, in its place.
+    let got = events(&mut s, t0, 3);
+    assert_eq!(got, vec![Event::Answer(result("a", 1)), Event::Answer(result("a", 2)), Event::Answer(result("a", 3))]);
+    until("the queue to empty", || {
+        s.poll(t0);
+        waiting(&s) == 0
+    });
+    assert_eq!(s.owed(), 0);
+}
+
+#[test]
+fn a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung() {
+    // The reader waits for the node; the wait is not the worker's silence.
+    let t0 = Instant::now();
+    let one = one_answer();
+    let (mut s, mut m) = holding(t0, one);
+    for v in 1..=2 {
+        s.post(t0, &warm("a", v));
+        m.next_req();
+        m.reply(&result("a", v));
+    }
+    until("one answer to be held", || waiting(&s) >= one);
+    // A long time passes on the node's clock before it looks: the first is taken, the second is
+    // still behind the reader. Nothing is a failure.
+    let late = t0 + secs(60);
+    // (The reader, let go by the first being taken, brings the second after it.)
+    let got = events(&mut s, late, 2);
+    assert_eq!(got, vec![Event::Answer(result("a", 1)), Event::Answer(result("a", 2))]);
+    assert_eq!(s.counts().1, 0, "no failure");
+    assert!(s.is_up());
+}
+
+#[test]
+fn an_answer_bigger_than_the_whole_allowance_still_comes_when_none_waits() {
+    let t0 = Instant::now();
+    let (mut s, mut m) = holding(t0, one_answer() / 2);
+    s.post(t0, &warm("a", 1));
+    m.next_req();
+    m.reply(&result("a", 1));
+    assert_eq!(events(&mut s, t0, 1), vec![Event::Answer(result("a", 1))]);
+}
+
+#[test]
+fn dropping_a_link_lets_a_reader_that_waits_for_room_go() {
+    let t0 = Instant::now();
+    let one = one_answer();
+    let (mut s, mut m) = holding(t0, one);
+    for v in 1..=2 {
+        s.post(t0, &warm("a", v));
+        m.next_req();
+        m.reply(&result("a", v));
+    }
+    until("one answer to be held", || waiting(&s) >= one);
+    std::thread::sleep(Duration::from_millis(50));
+    let inbox = s.link.as_ref().unwrap().inbox.clone();
+    // The link, the reader (waiting to hand the second over) and this clone hold it.
+    assert_eq!(Arc::strong_count(&inbox), 3);
+    drop(s);
+    until("the reader thread to end", || Arc::strong_count(&inbox) == 1);
+}
+
 #[test]
 fn bytes_that_are_not_a_frame_are_a_failure() {
     for junk in [vec![3, 0, 0, 0, 9, 9, 9], vec![0, 0, 0, 0], vec![0xff; 8], b"hello\n".to_vec()] {
@@ -792,4 +909,122 @@ fn a_child_that_never_answers_is_killed_and_reaped_at_the_timeout() {
     assert_eq!(crashed(&got[0]).0, "no answer in 10 s");
     assert!(began.elapsed() < secs(10), "killing and reaping it does not wait for it");
     assert!(!s.is_up());
+}
+
+// ── Threads that will not start ─────────────────────────────────────────────
+
+/// A pipe into the worker that says when it is let go.
+struct Watched(Arc<AtomicBool>);
+
+impl Write for Watched {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A link whose thread named `refused` (and the ones after it) will not start; the worker's
+/// kills and whether its input was let go are told back.
+fn link_where_no_thread_starts_for(refused: &'static str) -> (io::Result<Link>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    let (_resp_tx, resp_rx) = channel::<Vec<u8>>();
+    let kills = Arc::new(AtomicUsize::new(0));
+    let input_gone = Arc::new(AtomicBool::new(false));
+    let k = kills.clone();
+    let mut spawn = |name: &'static str, run: Box<dyn FnOnce() + Send>| -> io::Result<()> {
+        if name == refused {
+            // The closure is dropped, as a failed spawn drops it.
+            return Err(io::Error::other("resource temporarily unavailable"));
+        }
+        real_threads(name, run)
+    };
+    let link = Link::build(Box::new(Watched(input_gone.clone())), Box::new(ChanReader::new(resp_rx)), Box::new(move || {
+        k.fetch_add(1, Ordering::SeqCst);
+    }), Box::new(|| false), ANSWER_BYTES, &mut spawn);
+    (link, kills, input_gone)
+}
+
+#[test]
+fn a_writer_thread_that_will_not_start_is_an_error_and_the_worker_is_killed() {
+    let (link, kills, input_gone) = link_where_no_thread_starts_for("fold-writer");
+    let e = link.err().expect("an error, not a panic");
+    assert!(e.to_string().contains("resource temporarily unavailable"), "{e}");
+    assert_eq!(kills.load(Ordering::SeqCst), 1, "a worker nobody watches is not left running");
+    assert!(input_gone.load(Ordering::SeqCst), "and its input is let go");
+}
+
+#[test]
+fn a_reader_thread_that_will_not_start_is_an_error_and_leaves_nothing_behind() {
+    let (link, kills, input_gone) = link_where_no_thread_starts_for("fold-reader");
+    let e = link.err().expect("an error, not a panic");
+    assert!(e.to_string().contains("resource temporarily unavailable"), "{e}");
+    assert_eq!(kills.load(Ordering::SeqCst), 1);
+    until("the writer thread to end and let the worker's input go", || input_gone.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_link_that_cannot_be_built_is_a_worker_that_would_not_start() {
+    let t0 = Instant::now();
+    let (link, kills, _) = link_where_no_thread_starts_for("fold-reader");
+    let (p, launched) = plan(vec![link]);
+    let mut s = Supervisor::new(p, t0);
+    assert_eq!(s.post(t0, &cold("a", 1)), Post::Down);
+    let (why, tables, restart) = {
+        let e = s.poll(t0).remove(0);
+        let (w, t, r) = crashed(&e);
+        (w.to_string(), t.to_vec(), r)
+    };
+    assert!(why.contains("would not start") && why.contains("resource temporarily unavailable"), "{why}");
+    assert!(tables.is_empty());
+    assert_eq!(restart, Some(secs(1)));
+    assert_eq!(launched.load(Ordering::SeqCst), 1);
+    assert_eq!(kills.load(Ordering::SeqCst), 1);
+}
+
+// ── Killed workers whose reaper thread would not start ──────────────────────
+
+fn quick_child() -> Child {
+    #[cfg(unix)]
+    let mut c = Command::new("true");
+    #[cfg(windows)]
+    let mut c = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "exit", "0"]);
+        c
+    };
+    c.spawn().expect("a child that exits at once")
+}
+
+#[test]
+fn the_sweep_lets_go_of_workers_that_have_exited() {
+    let mut list = vec![Arc::new(Mutex::new(quick_child())), Arc::new(Mutex::new(quick_child()))];
+    until("both to have exited and been waited for", || {
+        sweep(&mut list);
+        list.is_empty()
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn the_sweep_keeps_a_worker_that_is_still_running() {
+    let mut running = Command::new("sleep").arg("600").spawn().expect("sleep");
+    let pid = running.id();
+    let mut list = vec![Arc::new(Mutex::new(quick_child()))];
+    let running = Arc::new(Mutex::new(running));
+    list.push(running.clone());
+    until("the one that exited to be let go", || {
+        sweep(&mut list);
+        list.len() == 1
+    });
+    assert_eq!(list[0].lock().unwrap().id(), pid, "the one still running stays");
+    let mut c = running.lock().unwrap();
+    let _ = c.kill();
+    let _ = c.wait();
 }
