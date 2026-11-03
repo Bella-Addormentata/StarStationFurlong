@@ -198,14 +198,6 @@ fn is_pid(s: &str) -> bool {
     n > 0 && n <= 256 && s != "__proto__"
 }
 
-/// A player id the pages pin a key for (casinoDoc pinPlayerKeys): not empty,
-/// at most 128 UTF-16 units. (`is_pid` is the fold's wider rule for the ids
-/// inside records.)
-fn pid_pinnable(s: &str) -> bool {
-    // (A string of more than 3 bytes a unit cannot be short enough: no need to count it.)
-    !s.is_empty() && s.len() <= MAX_PIN_PID_UNITS * 3 && s.encode_utf16().count() <= MAX_PIN_PID_UNITS
-}
-
 fn is_round(v: Option<&CVal>) -> Option<i64> {
     v.and_then(CVal::as_int).filter(|r| *r >= 1)
 }
@@ -691,20 +683,9 @@ struct RoomMem {
     /// one on from the last after a tick a read was short.
     turn: usize,
     /// What the last pass found for the node's fold in shadow
-    /// ([`House::fold_view`]): None while the room has no verified
+    /// ([`House::fold_plan`]): None while the room has no verified
     /// delegation of this house, or the pass could not read every switch.
     fold: Option<FoldPlan>,
-    /// The players' keys as the node's fold in shadow pins them (the first
-    /// key seen for each, as the pages pin): kept apart from `pins`, which
-    /// the house's own decisions rest on, so that following a room in shadow
-    /// cannot change what the house accepts.
-    fold_pins: HashMap<String, String>,
-    /// Where the next scan of the players map for `fold_pins` starts (in
-    /// the map's own order), and whether a scan has reached the end of it.
-    fold_scan_at: usize,
-    fold_swept: bool,
-    /// When the room's players were last scanned for the fold.
-    last_pin_scan: Option<u64>,
 }
 
 /// The house tables a pass found in a room it is delegated a house of, and
@@ -714,40 +695,31 @@ struct FoldPlan {
     owner_key: String,
     tables: Vec<(String, String)>,
     /// The tick that found it read everything it wanted of the room without
-    /// waiting on a check or running out of reads (`TickOut::short` unset):
-    /// the houses it verified are then every one the room's records name.
+    /// waiting on a check or running out of reads (`TickOut::short` unset),
+    /// and held no table of it over a value a page may read otherwise, nor
+    /// found a house's delegation so: the houses it verified are then every
+    /// one the room's records name.
     complete: bool,
 }
 
-/// What the node's fold in shadow needs of a room (fold_shadow.rs): the house
-/// tables to follow `(t, inc)`, the keys of the houses the fold counts
-/// (this one, and every other the deed holder delegated that this house has
-/// verified), and the key pinned for each player `(pid, key)`.
+/// What the house found in a room for the node's fold in shadow
+/// (fold_shadow.rs): the house tables to follow `(t, inc)`, and the keys of
+/// the houses the fold counts (this one, and every other the deed holder
+/// delegated that this house has verified). The players' keys are not here:
+/// the shadow watches the players itself (fold_pins.rs), so that following a
+/// room reads no doc under the house's lock and writes nothing the house
+/// decides by.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FoldView {
+pub struct HousePlan {
     pub tables: Vec<(String, String)>,
     pub houses: Vec<String>,
-    pub pins: Vec<(String, String)>,
-    /// The houses and pins are everything the room holds: the pass that found
-    /// the tables read the whole room, and the players map has been scanned
-    /// to its end. A fold of a room whose inputs are not settled can leave
-    /// out a close or a record that a page counts, so it is not held against
-    /// a checkpoint.
-    pub settled: bool,
+    /// The houses are every one the room's records name: the pass that found
+    /// the tables read the whole room, and held no table (nor found a
+    /// delegation) over a value a page may read otherwise. A fold of a room
+    /// whose houses are not all known can leave out a close a page counts, so
+    /// it is not held against a checkpoint.
+    pub complete: bool,
 }
-
-/// The most keys the fold pins in a room: the pages' own MAX_PINNED_KEYS
-/// (past it new players go unpinned there too). The players map is any
-/// peer's to fill, and a pin rides in every frame to the worker.
-pub const MAX_FOLD_PINS: usize = 4_096;
-/// The longest player id the pages pin (casinoDoc pinPlayerKeys: UTF-16
-/// units), and the longest key.
-const MAX_PIN_PID_UNITS: usize = 128;
-const MAX_PIN_KEY_LEN: usize = 128;
-/// How often the players map is read for new pins, and how many of its
-/// entries a read visits (the next read goes on from there, round the map).
-const PIN_SCAN_MS: u64 = 1_000;
-const PIN_SCAN_KEYS: usize = 2_048;
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
 /// round it revealed or stepped down; the last round it decided and the
@@ -1076,55 +1048,16 @@ impl House {
     /// What the node's fold in shadow follows in `room`: None unless the last
     /// pass found this house delegated and read every switch. The tables may
     /// be none (the last one has ended: the shadow reads what it left and
-    /// lets it go). The players are pinned here for the fold alone (the
-    /// first key seen for each, as the pages pin; `pins`, which the house's
-    /// decisions rest on, is not touched), the players map read at most once
-    /// a second and [`PIN_SCAN_KEYS`] entries at a time, round the map.
-    pub fn fold_view(&mut self, room: &str, doc: &Doc, now: u64) -> Option<FoldView> {
-        let plan = self.rooms.get(room)?.fold.clone()?;
-        if self.rooms[room].last_pin_scan.is_none_or(|at| now.saturating_sub(at) >= PIN_SCAN_MS) {
-            let mem = self.rooms.get_mut(room)?;
-            mem.last_pin_scan = Some(now);
-            if mem.fold_pins.len() < MAX_FOLD_PINS {
-                let txn = doc.transact();
-                if let Some(players) = txn.get_map("players") {
-                    let mut visited = 0;
-                    let mut fresh: Vec<String> = Vec::new();
-                    for pid in players.keys(&txn).skip(mem.fold_scan_at).take(PIN_SCAN_KEYS) {
-                        visited += 1;
-                        if !mem.fold_pins.contains_key(pid) && pid_pinnable(pid) {
-                            fresh.push(pid.to_string());
-                        }
-                    }
-                    // (A scan that ran out of entries has been round the map; the next starts over.)
-                    mem.fold_swept |= visited < PIN_SCAN_KEYS;
-                    mem.fold_scan_at = if visited < PIN_SCAN_KEYS { 0 } else { mem.fold_scan_at + visited };
-                    for pid in fresh {
-                        if mem.fold_pins.len() >= MAX_FOLD_PINS {
-                            break;
-                        }
-                        if let Some(Out::Any(Any::Map(entry))) = players.get(&txn, &pid) {
-                            if let Some(Any::String(k)) = entry.get("keyB64") {
-                                if !k.is_empty() && k.encode_utf16().count() <= MAX_PIN_KEY_LEN {
-                                    mem.fold_pins.insert(pid, k.to_string());
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    mem.fold_swept = true;
-                }
-            }
-        }
+    /// lets it go). Copied from what the pass found: no doc is read here, so
+    /// the house's lock is held for a copy only.
+    pub fn fold_plan(&self, room: &str) -> Option<HousePlan> {
         let mem = self.rooms.get(room)?;
+        let plan = mem.fold.as_ref()?;
         let mut houses: Vec<String> = mem.houses.iter().filter(|(_, owner)| **owner == plan.owner_key).map(|(k, _)| k.clone()).collect();
         houses.push(self.key.public.clone());
         houses.sort();
         houses.dedup();
-        let mut pins: Vec<(String, String)> = mem.fold_pins.iter().map(|(p, k)| (p.clone(), k.clone())).collect();
-        pins.sort();
-        let settled = plan.complete && (mem.fold_swept || mem.fold_pins.len() >= MAX_FOLD_PINS);
-        Some(FoldView { tables: plan.tables, houses, pins, settled })
+        Some(HousePlan { tables: plan.tables.clone(), houses, complete: plan.complete })
     }
 
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
@@ -1242,9 +1175,17 @@ impl House {
         }
         self.through.clear();
         self.held_now.clear();
-        // (The plan the last pass made is complete when the tick got to read the room to its end.)
-        if let Some(plan) = self.rooms.get_mut(room).and_then(|m| m.fold.as_mut()) {
-            plan.complete = !out.short;
+        // (The plan the last pass made is complete when the tick got to read the room to its end,
+        // and left no table of it waiting on a value a page may read otherwise, which would leave
+        // out of the plan's houses one the table names: the live house's decisions are as they were.
+        // A delegation a page may read otherwise holds the table that names it, so `waiting` says as
+        // much as `houses_clear` does; both are kept, for the rule stands apart from how it is kept.)
+        let houses_clear = self.unclear_houses.is_empty();
+        if let Some(mem) = self.rooms.get_mut(room) {
+            let waiting = mem.fold.as_ref().is_some_and(|p| p.tables.iter().any(|k| mem.tables.get(k).is_some_and(|m| m.held_since.is_some())));
+            if let Some(plan) = mem.fold.as_mut() {
+                plan.complete = !out.short && houses_clear && !waiting;
+            }
         }
         while self.verdicts.len() > MAX_VERDICTS {
             if let Some(old) = self.verdict_order.pop_front() {

@@ -3813,40 +3813,29 @@ fn a_players_many_slips_and_seeds_are_hashed_once_each() {
 
 // ── What the node's fold in shadow follows ───────────────────────────────────
 
-fn fold_view_of(room: &mut Room) -> Option<FoldView> {
-    room.house.fold_view(ROOM, &room.doc, room.now)
-}
-
-fn add_players(room: &Room, names: &[String]) {
-    let mut txn = room.doc.transact_mut();
-    let players = txn.get_or_insert_map("players");
-    for p in names {
-        players.insert(&mut txn, p.as_str(), to_any(&obj(vec![("keyB64", s(&who(p).public))])));
-    }
+fn fold_plan_of(room: &mut Room) -> Option<HousePlan> {
+    room.house.fold_plan(ROOM)
 }
 
 #[test]
 fn the_fold_follows_the_house_tables_of_a_room_this_house_is_a_house_of() {
     let mut room = Room::new("fold-view", true);
     room.tick(1_000);
-    let view = fold_view_of(&mut room).expect("a view");
-    assert_eq!(view.tables, vec![(T.to_string(), INC.to_string())]);
-    assert_eq!(view.houses, vec![room.house.public().to_string()]);
-    // Every player's key as the room's players map first had it, by pid.
-    let mut want: Vec<(String, String)> = ["owner", "alice", "bob", "carol", "mallory"].iter().map(|p| (p.to_string(), who(p).public)).collect();
-    want.sort();
-    assert_eq!(view.pins, want);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert_eq!(plan.tables, vec![(T.to_string(), INC.to_string())]);
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
+    assert!(plan.complete);
 }
 
 #[test]
 fn the_fold_follows_nothing_in_a_room_this_house_is_not_delegated_in() {
     let mut room = Room::new("fold-view-undelegated", false);
     room.tick(1_000);
-    assert_eq!(fold_view_of(&mut room), None);
+    assert_eq!(fold_plan_of(&mut room), None);
     // The owner delegates it: followed from the next pass.
     room.delegate(&room.owner);
     room.tick(1_000);
-    assert!(fold_view_of(&mut room).is_some());
+    assert!(fold_plan_of(&mut room).is_some());
 }
 
 #[test]
@@ -3858,8 +3847,8 @@ fn a_room_with_no_house_table_is_followed_with_no_tables_to_let_the_shadow_forge
         casino.remove(&mut txn, &format!("cfg:computed:{T}"));
     }
     room.tick(1_000);
-    let view = fold_view_of(&mut room).expect("a view, with no table in it");
-    assert!(view.tables.is_empty());
+    let plan = fold_plan_of(&mut room).expect("a plan, with no table in it");
+    assert!(plan.tables.is_empty());
     // A table the room has marked gone is no table either.
     {
         let mut txn = room.doc.transact_mut();
@@ -3868,15 +3857,15 @@ fn a_room_with_no_house_table_is_followed_with_no_tables_to_let_the_shadow_forge
         casino.insert(&mut txn, format!("gone:{T}:{INC}"), Any::Bool(true));
     }
     room.tick(1_000);
-    let view = fold_view_of(&mut room).expect("a view, with no table in it");
-    assert!(view.tables.is_empty());
+    let plan = fold_plan_of(&mut room).expect("a plan, with no table in it");
+    assert!(plan.tables.is_empty());
 }
 
 #[test]
-fn a_view_is_not_kept_from_a_pass_that_ended_before_the_room_had_a_house() {
+fn a_plan_is_not_kept_from_a_pass_that_ended_before_the_room_had_a_house() {
     let mut room = Room::new("fold-view-stale", true);
     room.tick(1_000);
-    assert!(fold_view_of(&mut room).is_some());
+    assert!(fold_plan_of(&mut room).is_some());
     // The deed holder changes: the next pass cannot pin the new one's key in the players map, so it ends at once.
     {
         let mut txn = room.doc.transact_mut();
@@ -3884,7 +3873,7 @@ fn a_view_is_not_kept_from_a_pass_that_ended_before_the_room_had_a_house() {
         info.insert(&mut txn, "owner", Any::String(Arc::from("nobody-here")));
     }
     room.tick(1_000);
-    assert_eq!(fold_view_of(&mut room), None);
+    assert_eq!(fold_plan_of(&mut room), None);
 }
 
 #[test]
@@ -3893,12 +3882,12 @@ fn another_house_of_the_owners_is_counted_once_this_house_has_read_its_record() 
     let mut b_house = second_house(&room);
     // The other house joins round 1 first; this one reads its join.
     b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
-    let before = fold_view_of(&mut room);
+    let before = fold_plan_of(&mut room);
     assert_eq!(before, None, "this house has not ticked yet");
     room.tick(1_000);
     room.tick(1_000);
     assert_eq!(room.records("o:1:").len(), 1, "the other house's join is the table's");
-    let view = fold_view_of(&mut room).expect("a view");
+    let view = fold_plan_of(&mut room).expect("a plan");
     let mut want = vec![room.house.public().to_string(), b_house.public().to_string()];
     want.sort();
     assert_eq!(view.houses, want);
@@ -3916,8 +3905,8 @@ fn a_house_delegated_by_someone_who_is_not_the_deed_holder_is_not_counted() {
     b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
     room.tick(1_000);
     room.tick(1_000);
-    let view = fold_view_of(&mut room).expect("a view");
-    assert_eq!(view.houses, vec![room.house.public().to_string()]);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
 }
 
 #[test]
@@ -3931,177 +3920,77 @@ fn a_house_a_former_deed_holder_delegated_is_not_counted_and_one_listed_twice_is
     room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), "a-former-deed-holder".into());
     // ... and this house's own key among the list too.
     room.house.rooms.get_mut(ROOM).unwrap().houses.insert(own.clone(), owner_key.clone());
-    assert_eq!(fold_view_of(&mut room).unwrap().houses, vec![own.clone()]);
+    assert_eq!(fold_plan_of(&mut room).unwrap().houses, vec![own.clone()]);
     // Under the current deed holder it counts.
     room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), owner_key);
     let mut want = vec![own, other];
     want.sort();
-    assert_eq!(fold_view_of(&mut room).unwrap().houses, want);
+    assert_eq!(fold_plan_of(&mut room).unwrap().houses, want);
 }
 
+/// The plan is complete when the pass behind it read the room to its end: a
+/// short tick's plan is not.
 #[test]
-fn a_players_pin_is_the_first_key_seen_and_new_players_are_pinned_a_second_later() {
-    let mut room = Room::new("fold-view-pins", true);
-    room.tick(1_000);
-    let first = fold_view_of(&mut room).unwrap().pins;
-    // Alice's key changes in the players map; a new player arrives.
-    {
-        let mut txn = room.doc.transact_mut();
-        let players = txn.get_or_insert_map("players");
-        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s(&who("mallory").public))])));
-    }
-    add_players(&room, &["dave".to_string()]);
-    // (Not before a second has passed: the players map is not read every tick.)
-    room.tick(300);
-    assert_eq!(fold_view_of(&mut room).unwrap().pins, first);
-    room.tick(1_000);
-    let later = fold_view_of(&mut room).unwrap().pins;
-    assert_eq!(later.len(), first.len() + 1);
-    assert!(later.contains(&("dave".to_string(), who("dave").public)));
-    assert!(later.contains(&("alice".to_string(), who("alice").public)), "alice keeps the key first seen");
-}
-
-#[test]
-fn the_pins_for_the_fold_are_capped_whoever_fills_the_players_map() {
-    let mut room = Room::new("fold-view-cap", true);
-    let flood: Vec<String> = (0..MAX_FOLD_PINS + 200).map(|i| format!("p{i:05}")).collect();
-    add_players(&room, &flood);
-    // (And entries nobody can pin among them, so that a scan does not end at the cap to the entry.)
-    {
-        let mut txn = room.doc.transact_mut();
-        let players = txn.get_or_insert_map("players");
-        for i in 0..500 {
-            players.insert(&mut txn, format!("junk{i:03}"), to_any(&obj(vec![("name", s("no key here"))])));
-        }
-    }
-    room.tick(1_000);
-    // (A scan reads PIN_SCAN_KEYS entries a second: round the map in a few.)
-    let mut view = fold_view_of(&mut room).unwrap();
-    assert!(view.pins.len() <= PIN_SCAN_KEYS, "a scan is bounded: {} pins", view.pins.len());
-    for _ in 0..10 {
-        room.tick(1_000);
-        view = fold_view_of(&mut room).unwrap();
-    }
-    assert_eq!(view.pins.len(), MAX_FOLD_PINS);
-    // Nothing more is read, the map being swept or not: the rest are never pinned.
-    for _ in 0..3 {
-        room.tick(1_000);
-        assert_eq!(fold_view_of(&mut room).unwrap().pins.len(), MAX_FOLD_PINS);
-    }
-    assert!(view.settled, "at the cap there is nothing more to wait for");
-}
-
-/// A player the shadow pins is not one the house decides by: `pins`, which
-/// a table's verdicts rest on, is its own.
-#[test]
-fn pinning_a_player_for_the_fold_pins_nobody_for_the_house() {
-    let mut room = Room::new("fold-view-apart", true);
-    room.tick(1_000);
-    let before = room.house.rooms[ROOM].pins.clone();
-    add_players(&room, &["erin".to_string()]);
-    room.tick(1_000);
-    let view = fold_view_of(&mut room).unwrap();
-    assert!(view.pins.contains(&("erin".to_string(), who("erin").public)));
-    assert_eq!(room.house.rooms[ROOM].pins, before, "the house's pins are as they were");
-    assert!(!room.house.rooms[ROOM].pins.contains_key("erin"));
-}
-
-/// The pages pin a pid of at most 128 UTF-16 units and a key of the same
-/// (casinoDoc pinPlayerKeys): the fold's pins are those and no more, however
-/// the units are made up.
-#[test]
-fn the_fold_pins_only_what_the_pages_pin_by_the_length_of_name_and_key() {
-    let mut room = Room::new("fold-view-limits", true);
-    let key = who("limits").public;
-    let astral = "\u{1F98A}"; // two UTF-16 units, four bytes
-    let names = [
-        ("a".repeat(128), true),
-        ("a".repeat(129), false),
-        (astral.repeat(64), true),
-        (astral.repeat(65), false),
-        ("\u{E9}".repeat(128), true), // two bytes, one unit
-        ("x".repeat(100_000), false),
-        (String::new(), false),
-    ];
-    {
-        let mut txn = room.doc.transact_mut();
-        let players = txn.get_or_insert_map("players");
-        for (n, _) in &names {
-            players.insert(&mut txn, n.as_str(), to_any(&obj(vec![("keyB64", s(&key))])));
-        }
-        // Keys of 128 units and one more, and an empty one.
-        for (n, k) in [("k128", "k".repeat(128)), ("k129", "k".repeat(129)), ("kempty", String::new()), ("kastral", astral.repeat(64)), ("kastral65", astral.repeat(65))] {
-            players.insert(&mut txn, n, to_any(&obj(vec![("keyB64", s(&k))])));
-        }
-        // No key at all, and a key that is not a string.
-        players.insert(&mut txn, "nokey", to_any(&obj(vec![("name", s("x"))])));
-        players.insert(&mut txn, "intkey", to_any(&obj(vec![("keyB64", CVal::Int(7))])));
-    }
-    room.tick(1_000);
-    let pins: std::collections::BTreeMap<String, String> = fold_view_of(&mut room).unwrap().pins.into_iter().collect();
-    for (n, ok) in &names {
-        assert_eq!(pins.contains_key(n), *ok, "a name of {} units, {} bytes", n.encode_utf16().count(), n.len());
-    }
-    assert!(pins.contains_key("k128"));
-    assert!(pins.contains_key("kastral"));
-    for n in ["k129", "kempty", "kastral65", "nokey", "intkey"] {
-        assert!(!pins.contains_key(n), "{n} is not pinned");
-    }
-}
-
-/// The scan goes round a players map larger than a scan, from where the last
-/// stopped: players after a crowd of entries nobody can pin are pinned in a
-/// few seconds, not never; and the view is not settled before it has been
-/// round.
-#[test]
-fn the_fold_scan_goes_round_a_map_larger_than_a_scan_and_is_settled_after() {
-    let mut room = Room::new("fold-view-rotate", true);
-    // (Nobody can pin the junk, and more of it than a scan reads; the players are more than a scan reads too,
-    // so a scan that started over each time would pin the same part of them every time.)
-    const PLAYERS: usize = 1_500;
-    let players: Vec<String> = (0..PLAYERS).map(|i| format!("player{i:05}")).collect();
-    {
-        let mut txn = room.doc.transact_mut();
-        let map = txn.get_or_insert_map("players");
-        for i in 0..PIN_SCAN_KEYS + 100 {
-            map.insert(&mut txn, format!("junk{i:05}"), to_any(&obj(vec![("name", s("no key here"))])));
-        }
-    }
-    add_players(&room, &players);
-    room.tick(1_000);
-    let first = fold_view_of(&mut room).unwrap();
-    assert!(!first.settled, "a scan that has not been round the map has not seen the players");
-    assert!(first.pins.len() < PLAYERS, "not all of them in one scan");
-    let mut view = first;
-    for _ in 0..3 {
-        room.tick(1_000);
-        view = fold_view_of(&mut room).unwrap();
-    }
-    assert!(view.settled);
-    // The five of the room's own, and every player with a key, whichever side of the first scan they are on.
-    assert_eq!(view.pins.len(), PLAYERS + 5);
-    // The scan starts over after a sweep: a player who comes later is pinned too.
-    add_players(&room, &["late".to_string()]);
-    for _ in 0..3 {
-        room.tick(1_000);
-        view = fold_view_of(&mut room).unwrap();
-    }
-    assert!(view.pins.contains(&("late".to_string(), who("late").public)));
-}
-
-/// The view is settled when the pass behind it read the room to its end and
-/// the scan has been round the players: a short tick's plan is not complete.
-#[test]
-fn a_view_is_not_settled_from_a_pass_that_was_short() {
+fn a_plan_is_not_complete_from_a_pass_that_was_short() {
     let pad = |n: usize| Any::String(Arc::from("x".repeat(n)));
     let stray = |i: u8| obj(vec![("r", CVal::Int(1)), ("p", s("carol")), ("s", s(&format!("{i:064x}")))]);
     let mut room = Room::new("fold-view-short", true);
     room.tick(0);
     room.tick(200);
-    assert!(fold_view_of(&mut room).unwrap().settled, "a plain pass");
+    assert!(fold_plan_of(&mut room).unwrap().complete, "a plain pass");
     for i in 0..5 {
         room.put_padded('x', &stray(i), pad(READ_PER_TICK / 4));
     }
     assert!(room.tick(200).short);
-    assert!(!fold_view_of(&mut room).unwrap().settled, "a short pass");
+    assert!(!fold_plan_of(&mut room).unwrap().complete, "a short pass");
+}
+
+/// A pass that left a table waiting on a value a page may read otherwise (a
+/// house's delegation here) did not resolve what the table names, so its
+/// plan is not complete; the live house's decisions are what they were.
+#[test]
+fn a_plan_is_not_complete_while_a_table_waits_on_a_value_a_page_may_read_otherwise() {
+    let mut room = Room::new("fold-view-unclear", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let key = format!("hk:{}", b_house.public());
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    let b_pub = b_house.public().to_string();
+    for i in 0..5 {
+        let body = obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(&b_pub)), ("g", s(&"A".repeat(86)))]);
+        room.put_raw(&key_of('o', &body), &body);
+    }
+    room.tick(0);
+    let waiting = fold_plan_of(&mut room).unwrap();
+    assert!(!waiting.complete, "the table waits on the delegation");
+    assert!(clean(room.raw_top(&key), &deleg), "(and it went back clean)");
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    assert!(fold_plan_of(&mut room).unwrap().complete, "read clean: complete");
+}
+
+/// A Fair setting a page may read otherwise holds its table for a pass (it
+/// goes back clean first), and the plan, whose houses a table that waited
+/// did not name, is not complete until it plays on.
+#[test]
+fn a_plan_is_not_complete_while_a_table_waits_on_a_fair_setting_a_page_may_read_otherwise() {
+    let mut room = Room::new("fold-plan-fair", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "a plain pass");
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))]));
+    room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+    // (A pass for its check, then the last: the table is held, for the cutoff.)
+    room.tick_passes(200, 2);
+    let mem = &room.house.rooms[ROOM].tables[&(T.to_string(), INC.to_string())];
+    assert!(mem.held_since.is_some());
+    assert!(!fold_plan_of(&mut room).unwrap().complete, "the table waits on the setting");
+    room.tick(200);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "read clean: complete");
 }

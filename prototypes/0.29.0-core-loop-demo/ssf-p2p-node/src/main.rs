@@ -127,7 +127,10 @@ mod house_mirror;
 // The mirror's changes sent to the fold worker, and its answers kept (PR 6b-1c-ii).
 #[cfg(feature = "house-fold")]
 mod fold_feed;
-// The node's fold held against the pages' checkpoints, in shadow (PR 6b-1c-iii).
+// The node's fold held against the pages' checkpoints, in shadow (PR 6b-1c-iii), and the
+// players' keys as the pages pin them, which it folds with.
+#[cfg(feature = "house-fold")]
+mod fold_pins;
 #[cfg(feature = "house-fold")]
 mod fold_shadow;
 
@@ -4783,9 +4786,8 @@ mod house_fold_switch_tests {
 #[cfg(feature = "house-fold")]
 fn fold_shadow_pass(hub: &SharedHub) {
     let (Some(shadow), Some(house)) = (hub.fold_shadow.as_ref(), hub.house.as_ref()) else { return };
-    let now = house_now();
     // (The house, then the doc, as its own tick takes them.)
-    let report = fold_shadow::tick_shadow(shadow, served_docs(&hub.rooms), std::time::Instant::now(), |room_id, doc| house::lock(house).fold_view(room_id, doc, now));
+    let report = fold_shadow::tick_shadow(shadow, served_docs(&hub.rooms), std::time::Instant::now(), |room_id| house::lock(house).fold_plan(room_id));
     match report {
         Some(report) => hub.fingerprint.lock().unwrap().house_fold = Some(report),
         None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),

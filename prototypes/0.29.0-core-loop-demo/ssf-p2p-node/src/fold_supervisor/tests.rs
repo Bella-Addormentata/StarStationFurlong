@@ -700,6 +700,26 @@ fn a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung() {
 }
 
 #[test]
+fn an_answer_counted_as_waiting_is_already_in_the_queue() {
+    // (Counted and queued in two steps, a poll between them found the count up and the queue
+    // empty, and, ten seconds on, called the worker silent: a flake of the test above.)
+    for round in 0..300 {
+        let t0 = Instant::now();
+        let (mut s, mut m) = holding(t0, one_answer());
+        s.post(t0, &warm("a", 1));
+        m.next_req();
+        m.reply(&result("a", 1));
+        let link = s.link.as_ref().expect("a link");
+        let deadline = std::time::Instant::now() + secs(30);
+        while link.answer_bytes_waiting() == 0 {
+            assert!(std::time::Instant::now() < deadline, "waited 30 s for an answer to be held");
+            std::hint::spin_loop();
+        }
+        assert!(link.rx.try_recv().is_ok(), "round {round}: an answer counted as waiting is not in the queue");
+    }
+}
+
+#[test]
 fn an_answer_bigger_than_the_whole_allowance_still_comes_when_none_waits() {
     let t0 = Instant::now();
     let (mut s, mut m) = holding(t0, one_answer() / 2);

@@ -135,6 +135,14 @@ enum Incoming {
     Closed(String),
 }
 
+/// What [`Inbox::admit`] came to.
+enum Admit {
+    /// The link was closed first; nothing was counted or queued.
+    Closed,
+    /// Counted, and `put` ran: whether it queued the answer.
+    Put(bool),
+}
+
 /// The bytes of answers read and waiting for the node: the reader thread asks leave to hand one
 /// over ([`Inbox::admit`]) and waits while too many wait; `poll` says when it took one
 /// ([`Inbox::taken`]); a link that is dropped lets the reader go ([`Inbox::close`]).
@@ -150,17 +158,21 @@ impl Inbox {
         Inbox { held: Mutex::new(0), room: Condvar::new(), closed: AtomicBool::new(false), limit }
     }
 
-    /// Wait until an answer of `n` bytes may join those waiting (or none waits), and count it.
-    /// `false`: the link was closed first.
-    fn admit(&self, n: usize) -> bool {
+    /// Wait until an answer of `n` bytes may join those waiting (or none waits), count it, and
+    /// `put` it in the queue, all under the lock: an answer counted as waiting is already in the
+    /// queue, so a poll that finds the count up never finds the queue empty and calls the worker
+    /// silent (found as a flake of `a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung`:
+    /// counted, not yet queued, and the poll ten seconds on). `Admit::Closed`: the link was
+    /// closed first; `Admit::Put(false)`: `put` found the queue gone.
+    fn admit(&self, n: usize, put: impl FnOnce() -> bool) -> Admit {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if self.closed.load(Ordering::SeqCst) {
-                return false;
+                return Admit::Closed;
             }
             if *held == 0 || held.saturating_add(n) <= self.limit {
                 *held = held.saturating_add(n);
-                return true;
+                return Admit::Put(put());
             }
             held = self.room.wait(held).unwrap_or_else(PoisonError::into_inner);
         }
@@ -265,10 +277,10 @@ impl Link {
                                 drop(body);
                                 // Nor faster than the node takes them, in bytes: this thread waits
                                 // here (and so the worker, on its full pipe) while enough wait.
-                                if !reader_inbox.admit(n) {
-                                    return;
+                                match reader_inbox.admit(n, || tell.send(Incoming::Resp(resp, n)).is_ok()) {
+                                    Admit::Put(true) => continue,
+                                    Admit::Put(false) | Admit::Closed => return,
                                 }
-                                Incoming::Resp(resp, n)
                             }
                             Err(e) => Incoming::Closed(format!("the worker sent a frame that is not an answer: {e}")),
                         }

@@ -374,6 +374,133 @@ fn a_new_checkpoint_starts_the_table_over() {
     assert_eq!((f.state().version, d.bytes), (v, 0));
 }
 
+impl Fix {
+    /// A page's trim (writeCheckpointAndTrim): in one transaction the checkpoint, the session it
+    /// trims gone, and the next session.
+    fn page_trim(&self, old: &str, base: &CVal, next: &str, copies: &[(String, CVal)]) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), to_any(base));
+        comp.remove(&mut txn, old);
+        let m = comp.insert(&mut txn, next, MapPrelim::default());
+        for (k, v) in copies {
+            m.insert(&mut txn, k.as_str(), to_any(v));
+        }
+    }
+}
+
+/// A trim that finds the mirror up to date with the session it trims leaves nothing unread: the
+/// session being gone is the trim, not a change to read.
+#[test]
+fn a_trim_of_a_session_read_to_its_end_leaves_nothing_unread() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+    assert!(!f.state().unread_at_trim, "(a table not read yet)");
+    f.drain();
+    f.take();
+    assert!(!f.state().unread_at_trim, "(the first base is no trim)");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[(rk(1, 3), rv(1, 30))]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(!f.state().unread_at_trim);
+}
+
+/// What a page wrote to the session, and the mirror had noted and not read, when the trim came:
+/// the worker was never sent it, though the checkpoint's page counted it.
+#[test]
+fn a_trim_that_comes_with_records_of_the_old_session_still_unread_says_so() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    // A close written, then the trim (the one drain finds both).
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    let v = f.state().version;
+    f.drain();
+    assert_eq!(f.state().generation, 1 + 1, "(the base moved)");
+    assert!(f.state().unread_at_trim);
+    assert!(f.state().version > v);
+    // The next trim, with the session read up, says it was not.
+    f.take();
+    f.drain();
+    f.take();
+    let base2 = cp(3);
+    let next2 = live_of(T, Some(&base2));
+    f.page_trim(&next, &base2, &next2, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next2.as_str()));
+    assert!(!f.state().unread_at_trim);
+}
+
+/// The notes are the mirror's own: a record changed before an earlier drain that ran short of
+/// the table is still unread at the trim.
+#[test]
+fn a_trim_that_comes_while_the_old_session_is_still_being_read_says_so() {
+    let many: Vec<(String, CVal)> = (0..40).map(|i| (rk(1, i), rv(1, i as i64))).collect();
+    let mut f = Fix::seeded(small(3_000, 4), |f| f.session(&live0(), &many));
+    f.drain();
+    assert!(f.state().reading, "the cold read is not finished");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(f.state().unread_at_trim);
+}
+
+/// A session map put there again (not removed by the trim) is a change nobody read.
+#[test]
+fn a_trim_that_leaves_the_old_session_replaced_says_so() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    f.session(&live0(), &records(&[(1, 10), (2, 20)]));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.put_top(&sum_of(T), &base);
+    f.session(&next, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(f.state().unread_at_trim);
+}
+
+/// A checkpoint written again as it was changes no base: the flag stays as the last change left it.
+#[test]
+fn a_checkpoint_put_back_as_it_was_leaves_the_flag_as_it_was() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert!(f.state().unread_at_trim);
+    f.put_top(&sum_of(T), &base);
+    f.drain();
+    assert!(f.state().unread_at_trim);
+}
+
+#[test]
+fn a_checkpoint_waiting_to_be_read_is_said_to_be() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    assert!(f.m.base_unread(T, INC), "a table not read yet");
+    f.drain();
+    assert!(!f.m.base_unread(T, INC));
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    assert!(!f.m.base_unread(T, INC), "(records are no checkpoint)");
+    let base = cp(2);
+    f.put_top(&sum_of(T), &base);
+    assert!(f.m.base_unread(T, INC), "noted, not yet merged by a drain");
+    // Short of the table: still unread after a drain that did not reach it.
+    f.drain();
+    assert!(!f.m.base_unread(T, INC));
+    assert!(!f.m.base_unread("no-such-table", INC));
+}
+
 #[test]
 fn a_table_let_go_of_and_wanted_again_is_another_whatever_its_generation() {
     let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));

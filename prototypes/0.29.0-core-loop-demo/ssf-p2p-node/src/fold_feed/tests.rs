@@ -1013,6 +1013,166 @@ fn an_answer_covers_the_table_as_the_node_last_sent_it_and_with_the_inputs_it_wa
     assert!(rig.covers(&inputs));
 }
 
+/// A cold read that is not finished: what the worker was sent is a start of the session, and the
+/// answer to it is not the table.
+#[test]
+fn an_answer_does_not_cover_a_table_whose_session_is_still_being_read() {
+    let mut rig = Rig::with_limits(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })), Limits { drain_paths: 6, ..Limits::default() });
+    rig.session(&live0(), &recs(40));
+    rig.want(&[(T, INC)]);
+    rig.tick();
+    assert!(rig.mirror.state(T, INC).unwrap().reading, "a drain of six paths does not read forty records");
+    // The worker answers the first frame; the node takes the answer and has not drained since.
+    for _ in 0..500 {
+        thread::sleep(std::time::Duration::from_millis(2));
+        let events = rig.sup.poll(rig.now);
+        rig.feed.absorb(rig.now, &events);
+        if rig.feed.fold(T, INC).is_some() {
+            break;
+        }
+    }
+    assert!(rig.feed.fold(T, INC).is_some());
+    let st = rig.mirror.state(T, INC).unwrap();
+    assert!(st.reading && st.serving() && !st.announcing && st.queued == 0, "nothing else says it is not the table");
+    assert!(!rig.covers(&rig.inputs.clone()), "the session is not all read");
+    // Read to its end, sent and answered: it is.
+    rig.until("caught up", |r| r.caught_up());
+    assert!(!rig.mirror.state(T, INC).unwrap().reading);
+    assert!(rig.covers(&rig.inputs.clone()));
+}
+
+/// An answer is of one frame of the table's slot, and says which; a frame that changes only the inputs is another.
+#[test]
+fn an_answer_says_which_frame_it_is_of() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    let first = rig.feed.fold(T, INC).unwrap().frame;
+    assert_eq!(first, 1);
+    assert_eq!(rig.feed.answers(T, INC, &rig.sup, &rig.inputs), Some(first));
+    // A record: the second frame.
+    rig.put(&live0(), &rk(1, 9), val(9));
+    rig.until("caught up", |r| r.caught_up());
+    let second = rig.feed.fold(T, INC).unwrap().frame;
+    assert_eq!(second, 2);
+    assert_eq!(rig.feed.answers(T, INC, &rig.sup, &rig.inputs), Some(second));
+    // The inputs change, the table does not: a frame with no change in it, the third.
+    rig.inputs = Inputs::new(vec!["h9".into()], vec![]);
+    assert_eq!(rig.feed.answers(T, INC, &rig.sup, &rig.inputs), None, "the answer was made with other inputs");
+    rig.until("caught up", |r| r.caught_up());
+    assert_eq!(rig.feed.fold(T, INC).unwrap().frame, 3);
+    assert_eq!(rig.feed.answers(T, INC, &rig.sup, &rig.inputs), Some(3));
+    // A frame out, or one waiting: no answer is of the last.
+    rig.put(&live0(), &rk(1, 10), val(10));
+    rig.sup.clog(QUEUE_BYTES);
+    rig.tick();
+    assert_eq!(rig.feed.answers(T, INC, &rig.sup, &rig.inputs), None, "the changes wait");
+    rig.sup.unclog(QUEUE_BYTES);
+    // A table let go of and taken up again starts its frames afresh.
+    rig.until("caught up", |r| r.caught_up());
+    assert_eq!(rig.feed.fold(T, INC).unwrap().frame, 4);
+    assert_eq!(rig.feed.answers("nowhere", INC, &rig.sup, &rig.inputs), None);
+}
+
+/// The word to let go of a table, said apart from the changes to the others.
+#[test]
+fn release_tells_the_worker_of_the_tables_the_mirror_let_go_and_sends_nothing_else() {
+    let mut rig = stand_rig(&Script::default());
+    let t2 = live_of("t2", None);
+    rig.session(&live0(), &recs(2));
+    rig.session(&t2, &recs(2));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.until("both caught up", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+    let before = rig.feed.counts();
+    // One table goes; a record of the other is waiting to be sent.
+    rig.want(&[("t2", INC)]);
+    rig.put(&t2, &rk(1, 9), val(9));
+    {
+        let txn = rig.doc.transact();
+        rig.mirror.drain(&txn);
+    }
+    rig.feed.release(rig.now, &rig.mirror, &mut rig.sup);
+    let c = rig.feed.counts();
+    assert_eq!((c.forgets, c.warm, c.cold), (before.forgets + 1, before.warm, before.cold), "the word, and no change");
+    assert!(!rig.feed.owes_forget());
+    assert_eq!(forgets(&rig.reqs()), 1);
+    // Said once; and the push after has only the change to send.
+    rig.feed.release(rig.now, &rig.mirror, &mut rig.sup);
+    assert_eq!(rig.feed.counts().forgets, before.forgets + 1);
+    rig.tick();
+    assert_eq!(rig.feed.counts().warm, before.warm + 1);
+    assert_eq!(rig.feed.counts().forgets, before.forgets + 1);
+}
+
+#[test]
+fn a_word_the_worker_cannot_take_is_owed_and_said_when_it_can() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    assert!(!rig.feed.owes_forget());
+    rig.sup.clog(QUEUE_BYTES);
+    rig.want(&[]);
+    rig.feed.release(rig.now, &rig.mirror, &mut rig.sup);
+    assert!(rig.feed.owes_forget(), "refused: owed");
+    assert!(!rig.feed.is_idle());
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.feed.release(rig.now, &rig.mirror, &mut rig.sup);
+    assert!(!rig.feed.owes_forget());
+    assert!(rig.feed.is_idle());
+    assert_eq!(forgets(&rig.reqs()), 1);
+}
+
+/// A table the worker does not hold yet waits for the word that lets go of others; those it holds go on.
+#[test]
+fn a_table_the_worker_does_not_hold_waits_when_new_ones_are_not_allowed_and_the_others_go_on() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    let t2 = live_of("t2", None);
+    rig.session(&t2, &recs(2));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.put(&live0(), &rk(1, 9), val(9));
+    for _ in 0..3 {
+        {
+            let txn = rig.doc.transact();
+            rig.mirror.drain(&txn);
+        }
+        rig.feed.push_with(rig.now, &mut rig.mirror, &mut rig.sup, &rig.inputs, false);
+    }
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm), (1, 1), "the table the worker holds is kept up; the new one is not started");
+    assert!(rig.feed.fold("t2", INC).is_none());
+    // Allowed, it is started.
+    {
+        let txn = rig.doc.transact();
+        rig.mirror.drain(&txn);
+    }
+    rig.feed.push_with(rig.now, &mut rig.mirror, &mut rig.sup, &rig.inputs, true);
+    assert_eq!(rig.feed.counts().cold, 2);
+    rig.until("both caught up", |r| r.caught_up_of(T) && r.caught_up_of("t2"));
+}
+
+/// A first frame the worker was too busy for is held back too, with the new ones.
+#[test]
+fn a_first_frame_taken_and_not_sent_waits_when_new_ones_are_not_allowed() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("the worker is started", |r| r.caught_up());
+    let t2 = live_of("t2", None);
+    rig.session(&t2, &recs(2));
+    rig.want(&[(T, INC), ("t2", INC)]);
+    rig.sup.clog(QUEUE_BYTES);
+    rig.tick();
+    assert_eq!(rig.feed.counts().busy, 1, "the Cold was taken and refused");
+    rig.sup.unclog(QUEUE_BYTES);
+    for _ in 0..3 {
+        rig.feed.push_with(rig.now, &mut rig.mirror, &mut rig.sup, &rig.inputs, false);
+    }
+    assert_eq!(rig.feed.counts().cold, 1, "only the first table's");
+    rig.feed.push_with(rig.now, &mut rig.mirror, &mut rig.sup, &rig.inputs, true);
+    assert_eq!(rig.feed.counts().cold, 2);
+}
+
 #[test]
 fn a_table_whose_version_moved_without_a_change_is_acknowledged_when_the_pipe_clears() {
     let mut rig = Rig::new(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })));

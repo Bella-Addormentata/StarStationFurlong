@@ -147,6 +147,15 @@ enum Recs {
 }
 
 impl Dirt {
+    /// Record keys of the session `live` are noted.
+    fn has_recs(&self, live: &str) -> bool {
+        match self.recs.get(live) {
+            Some(Recs::Many) => true,
+            Some(Recs::Keys(keys)) => !keys.is_empty(),
+            None => false,
+        }
+    }
+
     fn merge(&mut self, other: Dirt, limit: usize) {
         self.tops.extend(other.tops);
         for (name, recs) in other.recs {
@@ -371,6 +380,9 @@ struct Table {
     born: u64,
     generation: u64,
     version: u64,
+    /// The base last changed (a page's trim, a new incarnation) while the live session it left
+    /// still had changes to be read or listed.
+    unread_at_trim: bool,
 }
 
 fn cval_bytes(v: &CVal) -> usize {
@@ -408,11 +420,24 @@ impl Table {
             born,
             generation: 0,
             version: 0,
+            unread_at_trim: false,
         }
     }
 
     fn ended(&self) -> bool {
         matches!(&self.base, Base::Cp(cp) if cp.get("e").is_some())
+    }
+
+    /// The live session has changes the table has not read: records changed in it (noted, not
+    /// read), or it is still being listed or read, or its map was made or replaced and is in the
+    /// doc now. (A page's trim deletes the session it trims in the transaction that writes the
+    /// checkpoint: a session map gone is not a change to read.)
+    fn session_unread<T: ReadTxn>(&self, pending: &Dirt, comp: Option<&MapRef>, txn: &T) -> bool {
+        if self.need_session || self.cold.is_some() {
+            return true;
+        }
+        let Some(live) = &self.live else { return false };
+        pending.has_recs(live) || (pending.tops.contains(live) && comp.is_some_and(|c| matches!(c.get(txn, live), Some(Out::YMap(_)))))
     }
 
     fn hold(&self) -> Option<Hold> {
@@ -677,7 +702,14 @@ impl Table {
             };
             pending.tops.remove(&self.sum_name);
             self.read_base = false;
+            // (The session the base leaves: what a page wrote to it before it trimmed it, and
+            // this table has not read, is not in what the worker was sent.)
+            let changed = !(self.based && same_base(&new, &self.base));
+            let unread = changed && self.session_unread(pending, comp, txn);
             self.set_base(new);
+            if changed {
+                self.unread_at_trim = unread;
+            }
         }
         let Some(live) = self.live.clone() else { return true };
 
@@ -848,6 +880,10 @@ pub struct State<'a> {
     pub generation: u64,
     /// Goes up with every change to the base, a record or the hold.
     pub version: u64,
+    /// The base last changed (a page's trim, a new incarnation) while the session it left still
+    /// had changes this mirror had not read: what the worker was sent of that session is not all
+    /// of it, so an answer made before the trim is of less than the checkpoint's page saw.
+    pub unread_at_trim: bool,
 }
 
 impl State<'_> {
@@ -992,7 +1028,15 @@ impl RoomMirror {
             born: tb.born,
             generation: tb.generation,
             version: tb.version,
+            unread_at_trim: tb.unread_at_trim,
         })
+    }
+
+    /// The table's checkpoint is waiting to be read: the table is new, or a change to `sum:` has
+    /// been noted that no drain has read.
+    pub fn base_unread(&self, t: &str, inc: &str) -> bool {
+        let Some(tb) = self.tables.get(&(t.to_string(), inc.to_string())) else { return false };
+        tb.read_base || self.pending.tops.contains(&tb.sum_name) || lock(&self.shared).dirt.tops.contains(&tb.sum_name)
     }
 
     /// Start a table over, to be sent again from scratch (the worker lost it):

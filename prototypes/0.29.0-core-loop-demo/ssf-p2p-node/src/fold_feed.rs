@@ -129,11 +129,16 @@ pub struct Fold<'a> {
     pub version: u64,
     /// The mirror's generation (starts over) then.
     pub generation: u64,
+    /// Which frame of the table's slot it answers (the count of frames posted when it came): two
+    /// answers of one table are of one frame only if they are the same answer, and an answer
+    /// made with other houses and pins than a later one's is of another frame.
+    pub frame: u64,
 }
 
 struct Answer {
     version: u64,
     generation: u64,
+    frame: u64,
     summary: FoldSummary,
 }
 
@@ -153,6 +158,8 @@ struct Slot {
     /// What the last posted frame was.
     generation: u64,
     sent_version: u64,
+    /// Frames posted to the worker for this slot.
+    frames: u64,
     /// The houses and pins as last posted.
     given: Inputs,
     unsent: Option<Unsent>,
@@ -177,6 +184,7 @@ impl Slot {
             open: false,
             generation: 0,
             sent_version: 0,
+            frames: 0,
             given: Inputs::default(),
             unsent: None,
             answer: None,
@@ -265,7 +273,7 @@ impl Feed {
                         } else {
                             slot.pending_streak = 0;
                         }
-                        slot.answer = Some(Answer { version: *version, generation: slot.generation, summary });
+                        slot.answer = Some(Answer { version: *version, generation: slot.generation, frame: slot.frames, summary });
                         slot.dirty_streak = 0;
                         slot.retry_at = None;
                         self.counts.results += 1;
@@ -300,7 +308,7 @@ impl Feed {
     /// The table's latest answer, if the worker has given one.
     pub fn fold(&self, t: &str, inc: &str) -> Option<Fold<'_>> {
         let a = self.slots.get(&(t.to_string(), inc.to_string()))?.answer.as_ref()?;
-        Some(Fold { summary: &a.summary, version: a.version, generation: a.generation })
+        Some(Fold { summary: &a.summary, version: a.version, generation: a.generation, frame: a.frame })
     }
 
     /// The latest answer is for the table as it stands: it answers the last
@@ -318,31 +326,32 @@ impl Feed {
         self.inputs.as_ref().is_some_and(|inputs| self.covers(t, inc, mirror, sup, inputs)) && mirror.current(t, inc)
     }
 
+    /// The latest answer is of the last frame sent, and that frame carried `inputs` and left
+    /// nothing behind: nothing waits to be sent and the worker owes nothing. The frame it
+    /// answers (a number [`Fold::frame`] gives), if so.
+    pub fn answers<L: Launch>(&self, t: &str, inc: &str, sup: &Supervisor<L>, inputs: &Inputs) -> Option<u64> {
+        let slot = self.slots.get(&(t.to_string(), inc.to_string()))?;
+        let answer = slot.answer.as_ref()?;
+        let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
+        (slot.open && slot.given == *inputs && answer.version == slot.sent_version && slot.unsent.is_none() && !sup.owes(&ctx)).then_some(answer.frame)
+    }
+
     /// The latest answer covers everything the mirror had read as of its last
     /// drain, under `inputs` (the houses and pins asked of the room): it
-    /// answers the last frame sent, that frame left nothing behind, nothing
-    /// waits to be taken, and the table was folded with `inputs`. It does not
+    /// answers the last frame sent ([`answers`](Feed::answers)), the mirror
+    /// has nothing waiting to be taken and is not still reading the session,
+    /// and the table has not changed since that frame was taken. It does not
     /// ask whether the doc has changed since the drain (`current`), nor that
     /// the fold is finished: the shadow asks this before a drain that may
     /// bring a page's trim, to know whether the answer in hand is the table as
     /// the node last read it.
     pub fn covers<L: Launch>(&self, t: &str, inc: &str, mirror: &RoomMirror, sup: &Supervisor<L>, inputs: &Inputs) -> bool {
         let Some(slot) = self.slots.get(&(t.to_string(), inc.to_string())) else { return false };
-        let Some(answer) = &slot.answer else { return false };
         let Some(st) = mirror.state(t, inc) else { return false };
-        let ctx = Ctx { room: self.room.clone(), t: t.to_string(), inc: inc.to_string() };
         // (The two versions say it all in every state the tests can make, and the clauses between them
         // follow from them there: they are kept for the states the tests cannot, where a wrong "covered"
         // would count a lateness of the fold as the fold's disagreement.)
-        slot.open
-            && slot.given == *inputs
-            && answer.version == slot.sent_version
-            && slot.unsent.is_none()
-            && !sup.owes(&ctx)
-            && st.serving()
-            && !st.announcing
-            && st.queued == 0
-            && st.version == slot.sent_version
+        self.answers(t, inc, sup, inputs).is_some() && st.serving() && !st.announcing && !st.reading && st.queued == 0 && st.version == slot.sent_version
     }
 
     /// The feed holds no table, and owes the worker no word.
@@ -356,22 +365,20 @@ impl Feed {
         self.inputs = None;
     }
 
-    /// Send what has changed, one frame at most for each table. Nothing is
-    /// sent while the worker is down.
-    pub fn push<L: Launch>(&mut self, now: Instant, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs) {
+    /// Tell the worker of the tables the mirror no longer holds, and of any word it is still owed
+    /// ([`Feed::push`] does this too, first). A node that serves several rooms calls this for all
+    /// of them before any room sends a table that is new, so that the worker, which holds so
+    /// many, has let go of what it is to let go of before it is asked to take more.
+    pub fn release<L: Launch>(&mut self, now: Instant, mirror: &RoomMirror, sup: &mut Supervisor<L>) {
         if sup.off().is_some() {
             self.drop_all();
             return;
         }
-        self.inputs = Some(inputs.clone());
         if matches!(sup.state(), State::Backoff(until) if now < until) {
             return;
         }
-        let Feed { room, slots, counts, max_pending, .. } = self;
-        let tables: Vec<Ctx> = mirror.tables().cloned().collect();
-        let wanted: BTreeSet<(String, String)> = tables.iter().map(key).collect();
-
-        // Tables the mirror lets go.
+        let Feed { room, slots, counts, .. } = self;
+        let wanted: BTreeSet<(String, String)> = mirror.tables().map(key).collect();
         let gone: Vec<(String, String)> = slots.keys().filter(|k| !wanted.contains(*k)).cloned().collect();
         for k in gone {
             let Some(slot) = slots.get_mut(&k) else { continue };
@@ -383,6 +390,33 @@ impl Feed {
                 slots.remove(&k);
             }
         }
+    }
+
+    /// The worker has not yet been told to let go of a table of this room.
+    pub fn owes_forget(&self) -> bool {
+        self.slots.values().any(|s| s.forget_pending)
+    }
+
+    /// Send what has changed, one frame at most for each table. Nothing is
+    /// sent while the worker is down.
+    pub fn push<L: Launch>(&mut self, now: Instant, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs) {
+        self.push_with(now, mirror, sup, inputs, true);
+    }
+
+    /// As [`push`](Feed::push), and with `allow_new` false a table the worker does not hold yet
+    /// is not started (its first frame waits): the changes to the tables it holds go on.
+    pub fn push_with<L: Launch>(&mut self, now: Instant, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs, allow_new: bool) {
+        if sup.off().is_some() {
+            self.drop_all();
+            return;
+        }
+        self.inputs = Some(inputs.clone());
+        if matches!(sup.state(), State::Backoff(until) if now < until) {
+            return;
+        }
+        self.release(now, mirror, sup);
+        let Feed { slots, counts, max_pending, .. } = self;
+        let tables: Vec<Ctx> = mirror.tables().cloned().collect();
 
         for ctx in tables {
             let slot = slots.entry(key(&ctx)).or_insert_with(Slot::new);
@@ -417,6 +451,10 @@ impl Feed {
             }
             if slot.forget_pending {
                 forget(counts, now, sup, &ctx, slot);
+                continue;
+            }
+            // A table the worker does not hold yet waits for the word that lets go of the ones it is to drop.
+            if !allow_new && !slot.open && (slot.unsent.is_some() || st.announcing) {
                 continue;
             }
 
@@ -474,6 +512,7 @@ fn send<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, s
     match sup.post(now, &frame.req) {
         Post::Posted => {
             slot.open = true;
+            slot.frames += 1;
             slot.generation = frame.generation;
             slot.sent_version = frame.version;
             slot.given = frame.given;

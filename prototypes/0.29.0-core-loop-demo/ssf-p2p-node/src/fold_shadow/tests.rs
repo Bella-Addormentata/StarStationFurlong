@@ -757,7 +757,7 @@ fn the_houses_own_tick_and_the_shadow_follow_a_delegated_room_together() {
     for _ in 0..3_000 {
         // The house's tick (it joins round 1 with a record of its own), then the shadow's.
         room.tick(200);
-        report = tick_shadow(&shadow, vec![(ROOM.to_string(), room.doc.clone())], Instant::now(), |r, doc| room.house.fold_view(r, doc, room.now));
+        report = tick_shadow(&shadow, vec![(ROOM.to_string(), room.doc.clone())], Instant::now(), |r| room.house.fold_plan(r));
         let answered = {
             let sh = shadow.lock().unwrap();
             sh.rooms.get(ROOM).is_some_and(|rs| rs.feed.fold(T, INC).is_some())
@@ -807,11 +807,13 @@ fn nothing_is_remembered_of_the_checkpoint_of_a_table_that_has_gone_from_a_room_
     let cp = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
     b.put_checkpoint(&cp);
     let table = (b.case.ctx.t.clone(), inc.clone());
+    assert!(b.shadow.rooms[b.room()].confirmed.contains_key(&table), "(shown whole while it was followed)");
     b.view.as_mut().unwrap().tables.retain(|t| *t != table);
     b.until("compared", |b| b.shadow.tally.agree > 0);
     assert_eq!(b.shadow.rooms[b.room()].compared.len(), 1);
     b.until("the table is let go of", |b| b.forgets() == 1);
     assert!(b.shadow.rooms[b.room()].compared.is_empty(), "the room goes on with its other table, and remembers nothing of the one gone");
+    assert!(!b.shadow.rooms[b.room()].confirmed.contains_key(&table), "nor of what was shown of it");
 }
 
 #[test]
@@ -946,9 +948,477 @@ fn the_tables_a_worker_can_hold_are_shared_between_the_rooms_in_room_order() {
 fn a_tick_that_panics_costs_the_shadow_its_tick_and_nothing_else() {
     let b = Bench::new("house roulette 3");
     let shadow = Mutex::new(FoldShadow::new(ThreadLaunch::new(engine_maker(&b.case)), Instant::now()));
-    let got = tick_shadow(&shadow, vec![(b.room().to_string(), b.doc.clone())], Instant::now(), |_, _| panic!("the house's view went wrong"));
+    let got = tick_shadow(&shadow, vec![(b.room().to_string(), b.doc.clone())], Instant::now(), |_| panic!("the house's plan went wrong"));
     assert!(got.is_none());
     // The shadow goes on (its lock was not held while the view was found).
-    let got = tick_shadow(&shadow, vec![], Instant::now(), |_, _| None);
+    let got = tick_shadow(&shadow, vec![], Instant::now(), |_| None);
     assert_eq!(got.map(|r| r.rooms), Some(0));
+}
+
+// ── Review round 2 ───────────────────────────────────────────────────────────
+
+use crate::house_mirror::Limits;
+
+impl Bench {
+    /// A page's checkpoint for table `t` of the room, as a trim (no session of the old one is left in the doc).
+    fn put_checkpoint_for(&self, t: &str, cp: &CVal) {
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, format!("sum:{t}:{}", self.case.ctx.inc), to_any(cp));
+    }
+
+    /// The table `t` of the room with the records of the vector in its live session (they are the vector's, signed for
+    /// another table: the fold counts none of them, and the mirror reads every one).
+    fn big_table(&self, t: &str) {
+        let mut c = self.case.ctx.clone();
+        c.t = t.to_string();
+        let live = format!("ses:{}:{}:{}", c.t, c.inc, crate::house_bytes::next_sid(&c, None).unwrap());
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let m = comp.insert(&mut txn, live.as_str(), MapPrelim::default());
+        for batch in &self.case.warm {
+            for (k, v) in batch {
+                if let Some(v) = v {
+                    m.insert(&mut txn, k.as_str(), to_any(v));
+                }
+            }
+        }
+    }
+
+    /// Every record of the table `t` written again: changes for the mirror to read (and nothing for the fold to count).
+    fn dirty(&self, t: &str) {
+        let mut c = self.case.ctx.clone();
+        c.t = t.to_string();
+        let live = format!("ses:{}:{}:{}", c.t, c.inc, crate::house_bytes::next_sid(&c, None).unwrap());
+        let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &live) else { panic!("no session {live}") };
+        for batch in &self.case.warm {
+            for (k, v) in batch {
+                if let Some(v) = v {
+                    m.insert(&mut txn, k.as_str(), to_any(v));
+                }
+            }
+        }
+    }
+
+    /// A wrong page's trim of the vector: the nets one off.
+    fn wrong_trim(&self, sum: &FoldSummary) -> CVal {
+        let u = last_decided(sum).unwrap();
+        let mut n = nets_through(sum, u);
+        let x: i128 = n[0].1.parse().unwrap();
+        n[0].1 = (x + 1).to_string();
+        page_cp(sum, u, n, true, true)
+    }
+}
+
+/// Inputs not shown to be everything the room held while the session was in it, from the first tick.
+#[test]
+fn a_difference_is_not_counted_when_no_tick_showed_the_inputs_whole() {
+    let mut b = Bench::new("house craps 3");
+    b.view.as_mut().unwrap().settled = false;
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.until("passed over", |b| b.shadow.tally.inputs > 0);
+    assert_eq!(b.shadow.tally, Tally { inputs: 1, ..Tally::default() });
+    assert_eq!(b.shadow.report().shadow_mismatches, 0);
+}
+
+/// An earlier pass that missed a house, and a trim that removes its records: the pass after the
+/// trim finds nothing unresolved, and says so, but the session it is asked about is gone.
+#[test]
+fn a_view_settled_only_after_the_trim_shows_nothing_of_the_session_the_trim_removed() {
+    let mut b = Bench::new("house craps 3");
+    b.view.as_mut().unwrap().settled = false;
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.view.as_mut().unwrap().settled = true;
+    b.until("passed over", |b| b.shadow.tally.inputs > 0);
+    assert_eq!(b.shadow.tally, Tally { inputs: 1, ..Tally::default() });
+}
+
+/// What a settled view showed before is taken back by one that is not (a key replaced, a house not known).
+#[test]
+fn an_answer_shown_complete_is_taken_back_when_a_later_tick_is_unsettled() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    assert!(!b.shadow.rooms[b.room()].confirmed.is_empty(), "shown whole while the session was in the room");
+    b.view.as_mut().unwrap().settled = false;
+    b.tick();
+    assert!(b.shadow.rooms[b.room()].confirmed.is_empty());
+    let wrong = b.wrong_trim(&b.answer());
+    b.put_checkpoint(&wrong);
+    b.until("passed over", |b| b.shadow.tally.inputs > 0);
+    assert_eq!(b.shadow.tally, Tally { inputs: 1, ..Tally::default() });
+}
+
+/// What was shown of an earlier answer is not shown of a later one: the inputs changed in a frame
+/// whose answer no settled tick has seen yet when the trim comes.
+#[test]
+fn an_answer_to_a_later_frame_is_not_the_one_that_was_shown_whole() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let sum = b.answer();
+    let wrong = b.wrong_trim(&sum);
+    // A player's key is pinned: a frame with new inputs (no change to a record), and its answer is the same fold.
+    let warm = b.shadow.counts().warm;
+    b.view.as_mut().unwrap().pins.push(("zed".to_string(), "Z".repeat(43)));
+    b.until("the new inputs sent", |b| b.shadow.counts().warm > warm);
+    thread::sleep(Duration::from_millis(400));
+    // The trim comes before the tick that takes the answer: the same tick reads it.
+    b.put_checkpoint(&wrong);
+    b.tick();
+    assert_eq!(b.shadow.tally, Tally { inputs: 1, ..Tally::default() });
+    assert_eq!(b.shadow.report().shadow_mismatches, 0);
+}
+
+/// What was shown of an earlier taking up of a table is not shown of this one: a table let go of and
+/// taken again has its answers numbered afresh, and the number may come round to the same.
+#[test]
+fn an_answer_shown_whole_for_an_earlier_taking_up_of_the_table_is_not_the_one_compared() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    let room = b.room().to_string();
+    let key = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let (born, frame) = *b.shadow.rooms[&room].confirmed.get(&key).expect("shown whole by now");
+    // (The same frame of the answer, as of the table's first taking up.)
+    b.shadow.rooms.get_mut(&room).unwrap().confirmed.insert(key, (born.wrapping_add(1), frame));
+    b.put_checkpoint(&wrong);
+    b.tick();
+    assert_eq!(b.shadow.tally, Tally { inputs: 1, ..Tally::default() });
+    assert_eq!(b.shadow.report().shadow_mismatches, 0);
+}
+
+/// A page wrote to the session, and trimmed it, between two of the node's drains: the one drain
+/// reads the base and drops the session unread.
+#[test]
+fn a_difference_is_stale_when_the_page_wrote_to_the_session_the_node_had_not_read_before_it_trimmed_it() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let wrong = b.wrong_trim(&b.answer());
+    // A competing close, say: a record changes, and the trim follows.
+    b.remove_a_record();
+    b.put_checkpoint(&wrong);
+    b.until("passed over", |b| b.shadow.tally.stale > 0);
+    assert_eq!(b.shadow.tally, Tally { stale: 1, ..Tally::default() });
+    assert_eq!(b.shadow.report().shadow_mismatches, 0);
+}
+
+/// With a drain that runs short of the table whose checkpoint ended it, the table is kept until
+/// the drain gets to it: its checkpoint is compared, not forgotten.
+#[test]
+fn a_table_that_ended_is_kept_until_a_short_drain_has_read_its_last_checkpoint() {
+    for extra in [0, 1] {
+        let mut b = Bench::new("house roulette 3");
+        b.shadow.limits = Limits { drain_paths: 3, ..Limits::default() };
+        let inc = b.case.ctx.inc.clone();
+        let table = (b.case.ctx.t.clone(), inc.clone());
+        // (A table that sorts first and has more to read than a drain gives: the drains take turns.)
+        b.big_table("0-big");
+        b.view.as_mut().unwrap().tables.push(("0-big".to_string(), inc.clone()));
+        b.until("both answered", |b| b.caught_up() && b.shadow.rooms[b.room()].feed.fold("0-big", &inc).is_some());
+        let sum = b.answer();
+        let u = last_decided(&sum).expect("a decided round");
+        let cp = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+        assert!(checkpoint_ok(&cp, &inc));
+        for _ in 0..extra {
+            b.dirty("0-big");
+            b.tick();
+        }
+        b.put_checkpoint(&cp);
+        b.view.as_mut().unwrap().tables.retain(|t| *t != table);
+        for _ in 0..30 {
+            b.dirty("0-big");
+            b.tick();
+            thread::sleep(Duration::from_millis(2));
+            if b.shadow.tally.agree > 0 {
+                break;
+            }
+        }
+        assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "extra={extra}: compared, once");
+        b.until("let go", |b| b.shadow.rooms[b.room()].mirror.state(&table.0, &table.1).is_none());
+        assert_eq!(b.forgets(), 1, "extra={extra}: and then the worker was told");
+    }
+}
+
+/// The tables kept for their last checkpoint have their places in the worker: the view's are the
+/// fewer by as many, so the worker never holds more than it has room for.
+#[test]
+fn the_places_of_the_tables_kept_for_a_last_checkpoint_are_not_given_to_others() {
+    let mut b = Bench::new("house roulette 3");
+    b.shadow.limits = Limits { drain_paths: 1, ..Limits::default() };
+    let inc = b.case.ctx.inc.clone();
+    let names: Vec<String> = (0..MAX_SHADOW_TABLES + 1).map(|i| format!("t{i:02}")).collect();
+    for t in &names {
+        b.empty_table(t);
+    }
+    b.view.as_mut().unwrap().tables = names.iter().take(MAX_SHADOW_TABLES).map(|t| (t.clone(), inc.clone())).collect();
+    b.until("all answered", |b| b.shadow.counts().results >= MAX_SHADOW_TABLES as u64);
+    b.ticks(10);
+    assert_eq!(b.shadow.report().tables, MAX_SHADOW_TABLES as u64);
+    // t00 ends (a page's final checkpoint) as t14 comes to the view.
+    let sum: FoldSummary = serde_json::from_str(&b.case.summary).unwrap();
+    let u = last_decided(&sum).expect("a decided round");
+    let cp = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+    b.put_checkpoint_for("t00", &cp);
+    b.view.as_mut().unwrap().tables = names.iter().skip(1).map(|t| (t.clone(), inc.clone())).collect();
+    let mut most = 0;
+    let mut compared = false;
+    for _ in 0..400 {
+        b.tick();
+        most = most.max(b.shadow.rooms[b.room()].mirror.tables().count());
+        let sh = &b.shadow;
+        compared |= sh.tally.skipped() + sh.tally.agree + sh.tally.mismatch > 0;
+        thread::sleep(Duration::from_millis(1));
+        if compared && b.shadow.rooms[b.room()].mirror.state("t14", &inc).is_some() {
+            break;
+        }
+    }
+    assert!(most <= MAX_SHADOW_TABLES, "{most} tables held at once");
+    assert!(compared, "the checkpoint of the table that ended was compared (or passed over and counted)");
+    assert!(b.shadow.rooms[b.room()].mirror.state("t14", &inc).is_some(), "and the new table came when the old one was let go");
+}
+
+/// A table of the view whose checkpoint has not been read yet is followed, and is not also one that
+/// is kept after the view lets it go: it takes one place, not two.
+#[test]
+fn a_followed_table_whose_trim_is_not_read_yet_takes_one_place_in_the_worker() {
+    let mut b = Bench::new("house roulette 3");
+    let inc = b.case.ctx.inc.clone();
+    let names: Vec<String> = (0..MAX_SHADOW_TABLES).map(|i| format!("t{i:02}")).collect();
+    for t in &names {
+        b.empty_table(t);
+    }
+    b.view.as_mut().unwrap().tables = names.iter().map(|t| (t.clone(), inc.clone())).collect();
+    b.until("all answered", |b| b.shadow.counts().results >= MAX_SHADOW_TABLES as u64);
+    b.ticks(5);
+    assert_eq!(b.shadow.report().tables, MAX_SHADOW_TABLES as u64);
+    // A page trims t00, which the view still follows: the trim is noted, and read at the tick's drain.
+    let sum: FoldSummary = serde_json::from_str(&b.case.summary).unwrap();
+    let u = last_decided(&sum).expect("a decided round");
+    b.put_checkpoint_for("t00", &page_cp(&sum, u, nets_through(&sum, u), false, false));
+    b.tick();
+    let r = b.shadow.report();
+    assert_eq!((r.tables, r.tables_over), (MAX_SHADOW_TABLES as u64, 0), "every table of the view is still followed");
+}
+
+/// The worker holds so many tables: those to go are told of, in every room, before any room asks for a new one.
+#[test]
+fn every_table_to_go_is_let_go_of_in_every_room_before_a_new_one_is_asked_for() {
+    let mut b = Bench::new("house roulette 3");
+    let (inc, houses, pins, ctx) = (b.case.ctx.inc.clone(), b.case.houses.clone(), b.case.pins.clone(), b.case.ctx.clone());
+    let docs: Vec<(String, Doc)> = ["room-a", "room-b"].iter().map(|r| (r.to_string(), Doc::new())).collect();
+    let make = |doc: &Doc, room: &str, names: &[String]| {
+        let mut c = ctx.clone();
+        c.room = room.to_string();
+        let comp = doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = doc.transact_mut();
+        for t in names {
+            c.t = t.clone();
+            comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
+        }
+    };
+    let names = |p: &str, from: usize, to: usize| -> Vec<String> { (from..to).map(|i| format!("{p}{i}")).collect() };
+    let view = |ts: &[String]| FoldView { tables: ts.iter().map(|t| (t.clone(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true };
+    // Room a has 7 tables and room b 7: the worker is full.
+    let (a1, b1) = (names("a", 0, 7), names("b", 0, 7));
+    make(&docs[0].1, "room-a", &names("a", 0, 10));
+    make(&docs[1].1, "room-b", &names("b", 0, 7));
+    for _ in 0..300 {
+        b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&a1))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&b1)))]);
+        thread::sleep(Duration::from_millis(2));
+        if b.shadow.counts().results >= 14 {
+            break;
+        }
+    }
+    assert_eq!(b.shadow.counts().results, 14);
+    let posted = |b: &Bench| (b.shadow.counts().cold + b.shadow.counts().warm + b.shadow.counts().forgets) as usize;
+    let before = posted(&b);
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(1));
+        if b.log.lock().unwrap().len() >= before {
+            break;
+        }
+    }
+    let seen = b.log.lock().unwrap().len();
+    // Room a, which is told of first, takes three more; room b gives up three.
+    let (a2, b2) = (names("a", 0, 10), names("b", 0, 4));
+    for _ in 0..4 {
+        b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&a2))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&b2)))]);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let after = posted(&b);
+    for _ in 0..100 {
+        if b.log.lock().unwrap().len() >= after {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let log = b.log.lock().unwrap();
+    let new: Vec<&Req> = log.iter().skip(seen).collect();
+    let last_forget = new.iter().rposition(|r| matches!(r, Req::Forget { .. })).expect("room b's three were forgotten");
+    let first_cold = new.iter().position(|r| matches!(r, Req::Cold(_))).expect("room a's three were asked for");
+    assert!(last_forget < first_cold, "the forgets come first: {:?}", new.iter().map(|r| match r {
+        Req::Cold(c) => format!("cold {}", c.ctx.t),
+        Req::Warm(w) => format!("warm {}", w.ctx.t),
+        Req::Forget { ctx } => format!("forget {}", ctx.t),
+    }).collect::<Vec<_>>());
+    assert_eq!(new.iter().filter(|r| matches!(r, Req::Forget { .. })).count(), 3);
+    assert_eq!(new.iter().filter(|r| matches!(r, Req::Cold(_))).count(), 3);
+}
+
+/// A word to let go that the worker was too busy to take holds the new tables back, in every room.
+#[test]
+fn a_forget_the_worker_could_not_take_holds_back_the_new_tables_of_every_room() {
+    let mut b = Bench::new("house roulette 3");
+    let (inc, houses, pins, ctx) = (b.case.ctx.inc.clone(), b.case.houses.clone(), b.case.pins.clone(), b.case.ctx.clone());
+    let long = "x".repeat(3_000);
+    let docs: Vec<(String, Doc)> = ["room-a", "room-b"].iter().map(|r| (r.to_string(), Doc::new())).collect();
+    let make = |doc: &Doc, room: &str, names: &[String]| {
+        let mut c = ctx.clone();
+        c.room = room.to_string();
+        let comp = doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = doc.transact_mut();
+        for t in names {
+            c.t = t.clone();
+            comp.insert(&mut txn, format!("ses:{t}:{inc}:{}", crate::house_bytes::next_sid(&c, None).unwrap()), MapPrelim::default());
+        }
+    };
+    make(&docs[0].1, "room-a", &[long.clone()]);
+    make(&docs[1].1, "room-b", &["b0".to_string(), "b1".to_string()]);
+    let view = |ts: &[&str]| FoldView { tables: ts.iter().map(|t| (t.to_string(), inc.clone())).collect(), houses: houses.clone(), pins: pins.clone(), settled: true };
+    for _ in 0..300 {
+        b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[&long]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0"])))]);
+        thread::sleep(Duration::from_millis(2));
+        if b.shadow.counts().results >= 2 {
+            break;
+        }
+    }
+    assert_eq!(b.shadow.counts().results, 2);
+    // The pipe has room for a small frame and not for the long table's word.
+    b.shadow.sup.clog(QUEUE_BYTES - 2_000);
+    let cold = b.shadow.counts().cold;
+    for _ in 0..6 {
+        b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0", "b1"])))]);
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(b.shadow.rooms["room-a"].feed.owes_forget(), "the word for the long table was refused");
+    assert_eq!(b.shadow.counts().cold, cold, "and room b's new table waits for it");
+    // The pipe clears: the word first, then the table.
+    b.shadow.sup.unclog(QUEUE_BYTES - 2_000);
+    for _ in 0..300 {
+        b.shadow.tick(b.now, vec![(docs[0].0.clone(), docs[0].1.clone(), Some(view(&[]))), (docs[1].0.clone(), docs[1].1.clone(), Some(view(&["b0", "b1"])))]);
+        thread::sleep(Duration::from_millis(2));
+        if b.shadow.counts().cold == cold + 1 {
+            break;
+        }
+    }
+    assert_eq!(b.shadow.counts().cold, cold + 1);
+    assert!(!b.shadow.rooms.get("room-a").is_some_and(|rs| rs.feed.owes_forget()));
+    assert_eq!(b.forgets(), 1);
+}
+
+/// With the fold duties off for good, no room is asked about and no player is read.
+#[test]
+fn when_the_fold_duties_are_off_no_room_is_asked_what_it_holds() {
+    let mut b = Bench::new("house roulette 3");
+    b.refuse.store(true, Ordering::SeqCst);
+    for _ in 0..8 {
+        b.now += Duration::from_secs(70);
+        b.tick();
+        if b.shadow.sup.off().is_some() {
+            break;
+        }
+    }
+    assert!(b.shadow.is_off());
+    let (doc, room) = (b.doc.clone(), b.room().to_string());
+    let shadow = Mutex::new(b.shadow);
+    let got = tick_shadow(&shadow, vec![(room, doc)], Instant::now(), |_| panic!("the house is asked about a room while the duties are off"));
+    let report = got.expect("a report, and no panic");
+    assert_eq!((report.off.as_deref(), report.rooms), (Some("crashes"), 0));
+}
+
+/// The shadow watches the players of the rooms the house has a plan for, from the first plan, and lets them go with the room.
+#[test]
+fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_room() {
+    let b = Bench::new("house roulette 3");
+    let (doc, houses) = (b.doc.clone(), b.case.houses.clone());
+    let shadow = Mutex::new(b.shadow);
+    let plan = HousePlan { tables: vec![], houses, complete: true };
+    let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
+    // A room with a plan and no table is watched; one with no plan is not.
+    tick_shadow(&shadow, docs(&["with", "without"]), Instant::now(), |r| (r == "with").then(|| plan.clone())).unwrap();
+    assert_eq!(shadow.lock().unwrap().pins.keys().cloned().collect::<Vec<_>>(), vec!["with".to_string()]);
+    // A player who comes is pinned as the transaction showed it, and a key replaced makes the view unsettled for good.
+    let players = doc.get_or_insert_map("players");
+    {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("A"))])));
+    }
+    assert_eq!(shadow.lock().unwrap().pins.get_mut("with").unwrap().view(), (vec![("alice".to_string(), "A".to_string())], true));
+    {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("B"))])));
+    }
+    assert!(!shadow.lock().unwrap().pins.get_mut("with").unwrap().view().1);
+    // The room goes (the node no longer serves it): its watch goes with it.
+    tick_shadow(&shadow, docs(&["without"]), Instant::now(), |_| None).unwrap();
+    assert!(shadow.lock().unwrap().pins.is_empty());
+}
+
+/// The pins a view carries are the shadow's own watch of the players, and it is settled only with a
+/// plan that is complete and pins that are.
+#[test]
+fn a_view_is_settled_only_with_a_plan_that_is_complete_and_pins_that_are() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(5);
+    let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    let tables = vec![(b.case.ctx.t.clone(), b.case.ctx.inc.clone())];
+    // (The bench's own ticks stand for the house; from here the shadow is asked as the node asks it.)
+    let wrong = b.wrong_trim(&b.answer());
+    let shadow = Mutex::new(b.shadow);
+    let go = |complete: bool| {
+        let plan = HousePlan { tables: tables.clone(), houses: houses.clone(), complete };
+        tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
+    };
+    let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
+    for _ in 0..40 {
+        go(true);
+        thread::sleep(Duration::from_millis(5));
+        if confirmed() == 1 {
+            break;
+        }
+    }
+    assert_eq!(confirmed(), 1, "a complete plan and no player to doubt: shown whole");
+    go(false);
+    assert_eq!(confirmed(), 0, "an incomplete plan takes it back");
+    for _ in 0..40 {
+        go(true);
+        thread::sleep(Duration::from_millis(5));
+        if confirmed() == 1 {
+            break;
+        }
+    }
+    assert_eq!(confirmed(), 1, "and a complete one shows it again");
+    // A key replaced: the pins are not settled, and the view stays unsettled with a complete plan.
+    let players = doc.get_or_insert_map("players");
+    for key in ["A", "B"] {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s(key))])));
+    }
+    go(true);
+    assert_eq!(confirmed(), 0, "pins unsettled");
+    go(true);
+    assert_eq!(confirmed(), 0, "and they stay so");
+    let _ = wrong;
 }
