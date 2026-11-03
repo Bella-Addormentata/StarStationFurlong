@@ -2,8 +2,10 @@
 // scheme). It shows the SSF wallet's 24 words on request, for the player to
 // write on paper, and tells the node when they are saved. It copies the
 // Bank's rules (src/bankBackup.ts):
-// - it opens masked, with the network, the address and the line that Star
-//   Station never asks for the words;
+// - it opens masked, with the network, the address (kept but hidden while
+//   Chia is off on this computer, as the Bank shows none then, and hidden
+//   as soon as a reveal says Chia was turned off since the window opened)
+//   and the line that Star Station never asks for the words;
 // - SHOW needs a fresh click: not the second click of a double-click, not
 //   within half a second of the control changing, and a held Enter or Space
 //   never repeats it; HIDE acts at once, always;
@@ -32,6 +34,8 @@
   const savedButton = document.getElementById('saved');
   const status = document.getElementById('status');
   const addressShown = document.getElementById('address').textContent;
+  const addressLine = document.getElementById('address-line');
+  const addressHint = document.getElementById('address-hint');
 
   const LINES = {
     no_channel: 'The app lost its link to your node. Close this window and open it again from the Bank.',
@@ -45,6 +49,9 @@
   const ARMED = 'Written all 24, in order? Your node stops asking and will not show them again. Tap CONFIRM.';
   const EXPIRED = 'The words hid themselves after five minutes. Tap SHOW to see them again.';
   const SAVED = 'Saved. Your node will not show these words again. This window closes now.';
+  /** The hint while Chia is off on this computer (reveal.rs
+   *  ADDRESS_LINES_CHIA_OFF). */
+  const CHIA_OFF_HINT = 'Chia is off on this computer, so the Bank shows no address to check this window against.';
 
   let shown = false;
   let shownAt = 0;
@@ -130,6 +137,15 @@
     return document.visibilityState === 'visible' && document.hasFocus();
   }
 
+  /** Chia was turned off in the game since the window opened: the Bank
+   *  shows no address now, so the address line hides (kept, as every reveal
+   *  is checked against it) and the hint says why. Chia does not come back
+   *  on before the node stops, so neither does the line. */
+  function chiaTurnedOff() {
+    addressLine.hidden = true;
+    addressHint.textContent = CHIA_OFF_HINT;
+  }
+
   function wellFormed(words) {
     return Array.isArray(words) && words.length === WORD_COUNT && words.every((w) => typeof w === 'string' && /^[a-z]{3,8}$/.test(w));
   }
@@ -147,6 +163,7 @@
     ask('backup_reveal')
       .then(
         (answer) => {
+          if (answer && answer.chia_off === true) chiaTurnedOff();
           if (ticket !== gen || !onScreen()) {
             say('');
             return;

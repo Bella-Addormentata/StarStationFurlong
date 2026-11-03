@@ -51,6 +51,17 @@ const REVEAL_CSS: &[u8] = include_bytes!("../reveal/reveal.css");
 /// What the index shows for an address it does not have.
 const NO_ADDRESS: &str = "(no address)";
 
+/// The index's address lines with Chia on: the wallet's address, and that it
+/// should be the one the Bank shows. `{{ADDRESS}}` takes the address, escaped.
+/// The ids are reveal.js's, which hides the line and swaps the hint when a
+/// reveal says Chia was turned off since the window opened.
+const ADDRESS_LINES: &str = "<p class=\"facts\" id=\"address-line\">Wallet address: <code id=\"address\">{{ADDRESS}}</code></p>\n<p class=\"hint\" id=\"address-hint\">It should be the address the Bank shows.</p>";
+
+/// The index's address lines while Chia is off on this computer: the Bank
+/// shows no address then, so the address line is kept but hidden (reveal.js
+/// checks every reveal against it) and the hint says why there is none.
+const ADDRESS_LINES_CHIA_OFF: &str = "<p class=\"facts\" id=\"address-line\" hidden>Wallet address: <code id=\"address\">{{ADDRESS}}</code></p>\n<p class=\"hint\" id=\"address-hint\">Chia is off on this computer, so the Bank shows no address to check this window against.</p>";
+
 /// The line the page shows where the window cannot keep screen capture out.
 const CAPTURE_NOTE: &str = "<p class=\"warn\" id=\"capture\">On Linux this window is not protected from screen capture: close screen sharing and recording apps first.</p>";
 
@@ -92,10 +103,11 @@ impl OpenAnswer {
     }
 }
 
-/// The hello `open_backup` sends first, read: the address the window shows,
-/// or the answer that keeps the window shut. `sticky_other` is true once any
-/// hello in this run named another network.
-pub fn hello_gate(hello: Result<Hello, Failed>, sticky_other: bool) -> Result<String, OpenAnswer> {
+/// The hello `open_backup` sends first, read: the address the window shows
+/// and whether Chia is off on this computer (the window then hides the
+/// address, as the Bank does), or the answer that keeps the window shut.
+/// `sticky_other` is true once any hello in this run named another network.
+pub fn hello_gate(hello: Result<Hello, Failed>, sticky_other: bool) -> Result<(String, bool), OpenAnswer> {
     let hello = hello.map_err(|_| OpenAnswer::NoChannel)?;
     if sticky_other || !hello.is_net(SHELL_NET) {
         return Err(OpenAnswer::OtherNetwork);
@@ -107,7 +119,8 @@ pub fn hello_gate(hello: Result<Hello, Failed>, sticky_other: bool) -> Result<St
         return Err(OpenAnswer::AlreadySaved);
     }
     // A loaded wallet always has its address; without one it is mid-turn.
-    hello.address.ok_or(OpenAnswer::Turning)
+    let address = hello.address.ok_or(OpenAnswer::Turning)?;
+    Ok((address, hello.chia_off))
 }
 
 /// What the window's last opening ended with.
@@ -130,6 +143,10 @@ pub struct Flight {
     pub key: Option<u32>,
     /// The address this instance was opened for (from the hello).
     pub address: Option<String>,
+    /// Chia was off on this computer at this instance's hello, or at a
+    /// hello beside one of its reveals since: its page hides the address,
+    /// as the Bank does.
+    pub chia_off: bool,
     pub outcome: Outcome,
     /// When the last window closed without a save.
     pub closed_unsaved: Option<Instant>,
@@ -184,6 +201,7 @@ impl Backup {
         f.out = false;
         f.key = None;
         f.address = None;
+        f.chia_off = false;
         if answer == OpenAnswer::Closed {
             f.closed_unsaved = Some(now);
         }
@@ -193,12 +211,14 @@ impl Backup {
         self.flight.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A new window instance, opened for `address`: returns its number.
-    pub fn opened(&self, address: String) -> u64 {
+    /// A new window instance, opened for `address`, with Chia off on this
+    /// computer or not (`chia_off`, from the same hello): returns its number.
+    pub fn opened(&self, address: String, chia_off: bool) -> u64 {
         let mut f = self.flight();
         f.instance += 1;
         f.key = None;
         f.address = Some(address);
+        f.chia_off = chia_off;
         f.outcome = Outcome::Closed;
         f.saving = false;
         f.save_tried = false;
@@ -246,6 +266,39 @@ impl Backup {
     async fn ask(&self, op: Op) -> Result<zeroize::Zeroizing<String>, Failed> {
         let channel = self.channel.clone().ok_or(Failed::Closed)?;
         tauri::async_runtime::spawn_blocking(move || channel.request(op)).await.unwrap_or(Err(Failed::Closed))
+    }
+
+    /// The node's hello, the same way.
+    async fn hello(&self) -> Result<Hello, Failed> {
+        let channel = self.channel.clone().ok_or(Failed::Closed)?;
+        tauri::async_runtime::spawn_blocking(move || channel.hello()).await.unwrap_or(Err(Failed::Closed))
+    }
+
+    /// A reveal's checked answer ([`reveal_outcome`]) lands for window
+    /// `instance`, with the `hello` asked beside it. The flight takes
+    /// whether Chia is off now ([`chia_off_after`]), so a reload of the page
+    /// serves the same lines; the reveal's view says so too, for the page to
+    /// hide the address, and its key is kept for I SAVED. `refused` once
+    /// that window is no longer the one out.
+    pub fn land_reveal(&self, instance: u64, outcome: Result<(RevealView, u32), &'static str>, hello: Result<Hello, Failed>) -> Result<RevealView, &'static str> {
+        let mut f = self.flight();
+        if f.instance != instance || !f.out {
+            return Err("refused");
+        }
+        f.chia_off = chia_off_after(hello, f.chia_off);
+        match outcome {
+            Ok((mut view, key)) => {
+                f.key = Some(key);
+                view.chia_off = f.chia_off;
+                Ok(view)
+            }
+            Err(code) => {
+                if code == "already_saved" {
+                    f.outcome = Outcome::AlreadySaved;
+                }
+                Err(code)
+            }
+        }
     }
 }
 
@@ -366,6 +419,9 @@ pub struct PageFacts {
     pub network: String,
     /// The wallet's receive address, from the hello that opened the window.
     pub address: Option<String>,
+    /// Chia is off on this computer, from the same hello: the address line
+    /// is hidden, as the Bank shows no address.
+    pub chia_off: bool,
     /// Add the line that the window is not protected from screen capture.
     pub capture_note: bool,
 }
@@ -411,9 +467,10 @@ pub fn scheme_answer(label: &str, method: &str, path: &str, facts: &PageFacts) -
     let (kind, body): (&str, Cow<'static, [u8]>) = match path {
         "/" | "/index.html" => {
             let address = facts.address.as_deref().unwrap_or(NO_ADDRESS);
+            let lines = if facts.chia_off { ADDRESS_LINES_CHIA_OFF } else { ADDRESS_LINES };
             let page = String::from_utf8_lossy(INDEX_HTML)
                 .replace("{{NETWORK}}", &escape(&facts.network))
-                .replace("{{ADDRESS}}", &escape(address))
+                .replace("{{ADDRESS_LINES}}", &lines.replace("{{ADDRESS}}", &escape(address)))
                 .replace("{{CAPTURE}}", if facts.capture_note { CAPTURE_NOTE } else { "" });
             ("text/html; charset=utf-8", Cow::Owned(page.into_bytes()))
         }
@@ -428,18 +485,23 @@ pub fn scheme_answer(label: &str, method: &str, path: &str, facts: &PageFacts) -
     (200, headers, body)
 }
 
+/// The backup window's facts, from this run's flight: the address and
+/// whether Chia is off, both from the hello that opened the window (none
+/// before the app's state is set up).
+fn window_facts(backup: Option<&Backup>) -> PageFacts {
+    let (address, chia_off) = backup
+        .map(|b| {
+            let f = b.flight();
+            (f.address.clone(), f.chia_off)
+        })
+        .unwrap_or_default();
+    PageFacts { network: SHELL_NET.name.to_string(), address, chia_off, capture_note: cfg!(target_os = "linux") }
+}
+
 /// The scheme's handler: [`scheme_answer`] with this run's facts.
 pub fn serve<R: tauri::Runtime>(ctx: tauri::UriSchemeContext<'_, R>, request: tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Cow<'static, [u8]>> {
     let label = ctx.webview_label();
-    let facts = if label == LABEL {
-        PageFacts {
-            network: SHELL_NET.name.to_string(),
-            address: ctx.app_handle().try_state::<Backup>().and_then(|b| b.flight().address.clone()),
-            capture_note: cfg!(target_os = "linux"),
-        }
-    } else {
-        PageFacts::default()
-    };
+    let facts = if label == LABEL { window_facts(ctx.app_handle().try_state::<Backup>().as_deref()) } else { PageFacts::default() };
     let (status, headers, body) = scheme_answer(label, request.method().as_str(), request.uri().path(), &facts);
     let mut response = tauri::http::Response::builder().status(status);
     for (name, value) in headers {
@@ -533,11 +595,11 @@ pub async fn open_backup(app: tauri::AppHandle, webview: tauri::Webview) -> &'st
 async fn run_backup(app: &tauri::AppHandle, backup: &Backup, channel: Arc<Channel>) -> OpenAnswer {
     let hello_channel = channel.clone();
     let hello = tauri::async_runtime::spawn_blocking(move || hello_channel.hello()).await.unwrap_or(Err(Failed::Closed));
-    let address = match hello_gate(hello, channel.other_network()) {
-        Ok(address) => address,
+    let (address, chia_off) = match hello_gate(hello, channel.other_network()) {
+        Ok(opening) => opening,
         Err(answer) => return answer,
     };
-    backup.opened(address.clone());
+    backup.opened(address.clone(), chia_off);
     let window = match build_window(app) {
         Ok(window) => window,
         Err(e) => {
@@ -576,11 +638,23 @@ async fn run_backup(app: &tauri::AppHandle, backup: &Backup, channel: Arc<Channe
     }
 }
 
-/// What SHOW gets: the words and the address they are for.
+/// What SHOW gets: the words, the address they are for, and whether Chia
+/// is off on this computer now (the page then hides the address, as the
+/// Bank does).
 #[derive(Serialize, Debug)]
 pub struct RevealView {
     pub words: Words,
     pub address: String,
+    /// Set by [`Backup::land_reveal`], from the flight.
+    pub chia_off: bool,
+}
+
+/// Whether Chia is off now, for a window whose flight says `was`: a hello
+/// for the app's network says so, and Chia never comes back on before the
+/// node stops, so an off stays off. A hello that failed, or that could not
+/// be read, keeps what the window has.
+pub fn chia_off_after(hello: Result<Hello, Failed>, was: bool) -> bool {
+    was || hello.is_ok_and(|h| h.is_net(SHELL_NET) && h.chia_off)
 }
 
 /// The node's reveal answer, checked: 24 well-formed words, a key, and the
@@ -598,11 +672,12 @@ pub fn reveal_outcome(answer: Answer, expect_address: Option<&str>) -> Result<(R
     if expect_address != Some(address.as_str()) {
         return Err("changed");
     }
-    Ok((RevealView { words, address }, key))
+    Ok((RevealView { words, address, chia_off: false }, key))
 }
 
 /// SHOW in the backup window: ask the node for the words, every time (the
-/// app keeps no copy), and record the answer's key for this window.
+/// app keeps no copy), and whether Chia is off now, and record the answer's
+/// key for this window.
 #[tauri::command]
 pub async fn backup_reveal(app: tauri::AppHandle, webview: tauri::Webview) -> Result<RevealView, &'static str> {
     let (label, url) = who(&webview);
@@ -624,22 +699,10 @@ pub async fn backup_reveal(app: tauri::AppHandle, webview: tauri::Webview) -> Re
     let answer = Answer::parse(&body).ok_or("refused")?;
     drop(body);
     let outcome = reveal_outcome(answer, address.as_deref());
-    let mut f = backup.flight();
-    if f.instance != instance || !f.out {
-        return Err("refused");
-    }
-    match outcome {
-        Ok((view, key)) => {
-            f.key = Some(key);
-            Ok(view)
-        }
-        Err(code) => {
-            if code == "already_saved" {
-                f.outcome = Outcome::AlreadySaved;
-            }
-            Err(code)
-        }
-    }
+    // Chia can be turned off in the game while the window is open (it is
+    // not modal): a hello beside every reveal says whether it is off now.
+    let hello = backup.hello().await;
+    backup.land_reveal(instance, outcome, hello)
 }
 
 /// ⚠ CONFIRM in the backup window: tell the node the words of this window's
@@ -738,7 +801,7 @@ mod tests {
     }
 
     fn facts() -> PageFacts {
-        PageFacts { network: "testnet11".into(), address: Some("txch1abc".into()), capture_note: true }
+        PageFacts { network: "testnet11".into(), address: Some("txch1abc".into()), chia_off: false, capture_note: true }
     }
 
     fn header<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
@@ -788,11 +851,64 @@ mod tests {
         let without = page(&PageFacts { capture_note: false, ..facts() });
         assert!(!without.contains("screen capture"));
 
-        let hostile = page(&PageFacts { network: "<b>x</b>".into(), address: Some("\"><script>x</script>&'".into()), capture_note: false });
+        let hostile = page(&PageFacts { network: "<b>x</b>".into(), address: Some("\"><script>x</script>&'".into()), chia_off: false, capture_note: false });
         assert!(hostile.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(hostile.contains("&quot;&gt;&lt;script&gt;x&lt;/script&gt;&amp;&#39;"));
         assert!(!hostile.contains("<script>x"));
         assert!(page(&PageFacts { address: None, ..facts() }).contains("(no address)"));
+    }
+
+    fn index(f: &PageFacts) -> String {
+        String::from_utf8(scheme_answer("reveal", "GET", "/", f).2.into_owned()).unwrap()
+    }
+
+    /// ⛓️ With Chia on, the address and the hint to check it against the
+    /// Bank's, as before; with Chia off on this computer the Bank shows no
+    /// address, so the window keeps its address element (reveal.js checks
+    /// every reveal's address against it) but hidden, and says why there is
+    /// nothing to check it against.
+    #[test]
+    fn while_chia_is_off_the_index_keeps_the_address_hidden_and_says_the_bank_shows_none() {
+        let on = index(&facts());
+        assert!(
+            on.contains("<p class=\"facts\" id=\"address-line\">Wallet address: <code id=\"address\">txch1abc</code></p>\n<p class=\"hint\" id=\"address-hint\">It should be the address the Bank shows.</p>\n"),
+            "{on}"
+        );
+        assert!(!on.contains(" hidden>") && !on.contains("Chia is off"));
+
+        let off = index(&PageFacts { chia_off: true, ..facts() });
+        assert!(off.contains("<p class=\"facts\" id=\"address-line\" hidden>Wallet address: <code id=\"address\">txch1abc</code></p>\n"), "{off}");
+        assert!(!off.contains("It should be the address the Bank shows"));
+        assert!(off.contains("<p class=\"hint\" id=\"address-hint\">Chia is off on this computer, so the Bank shows no address to check this window against.</p>"));
+        assert!(!off.contains("{{"), "every placeholder filled");
+        for page in [&on, &off] {
+            for id in ["address", "address-line", "address-hint"] {
+                assert_eq!(page.matches(&format!("id=\"{id}\"")).count(), 1, "one {id} element, for reveal.js");
+            }
+            // The CSP's rules hold for the filled page too.
+            let lower = page.to_ascii_lowercase();
+            assert!(!lower.contains(" style=") && !lower.contains("<style"));
+            assert_eq!(lower.matches("<script").count(), 1);
+        }
+
+        // The address is escaped, and the missing one shown, with Chia off too.
+        let hostile = index(&PageFacts { address: Some("\"><script>x</script>&'".into()), chia_off: true, ..facts() });
+        assert!(hostile.contains("<code id=\"address\">&quot;&gt;&lt;script&gt;x&lt;/script&gt;&amp;&#39;</code>"));
+        assert!(!hostile.contains("<script>x"));
+        assert!(index(&PageFacts { address: None, chia_off: true, ..facts() }).contains("<code id=\"address\">(no address)</code>"));
+
+        // Nothing in the stylesheet gives the address line a display of its
+        // own, so its hidden attribute hides it.
+        let css = std::str::from_utf8(REVEAL_CSS).unwrap();
+        for rule in css.split('}') {
+            let Some((selector, body)) = rule.rsplit_once('{') else { continue };
+            if body.contains("display") {
+                for part in selector.split(',').map(str::trim) {
+                    let names_the_line = part.split(|c: char| c.is_whitespace() || c == '>').any(|s| s == "p" || s.starts_with("p.") || s.starts_with("p[") || s.contains(".facts") || s.contains("[hidden]"));
+                    assert!(!names_the_line, "{part:?} sets a display");
+                }
+            }
+        }
     }
 
     /// The built-in page: no inline script, no event-handler attribute, no
@@ -898,8 +1014,16 @@ mod tests {
             wallet: wallet.into(),
             backed_up,
             address: address.map(str::to_string),
+            chia_off: false,
         };
-        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, Some("txch1abc"))), false), Ok("txch1abc".to_string()));
+        assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, Some("txch1abc"))), false), Ok(("txch1abc".to_string(), false)));
+        // ⛓️ A wallet loaded before an in-game off: the window opens, and
+        // learns that Chia is off; an answer that keeps it shut stays one.
+        let off = Hello { chia_off: true, ..hello(SHELL_NET, "on", false, Some("txch1abc")) };
+        assert_eq!(hello_gate(Ok(off.clone()), false), Ok(("txch1abc".to_string(), true)));
+        assert_eq!(hello_gate(Ok(Hello { backed_up: true, ..off.clone() }), false), Err(OpenAnswer::AlreadySaved));
+        assert_eq!(hello_gate(Ok(Hello { address: None, ..off.clone() }), false), Err(OpenAnswer::Turning));
+        assert_eq!(hello_gate(Ok(Hello { wallet: "off".into(), address: None, ..off }), false), Err(OpenAnswer::NotOn));
         assert_eq!(hello_gate(Ok(hello(other, "on", false, Some("xch1abc"))), false), Err(OpenAnswer::OtherNetwork));
         assert_eq!(hello_gate(Ok(hello(SHELL_NET, "on", false, Some("txch1abc"))), true), Err(OpenAnswer::OtherNetwork), "sticky for the run");
         assert_eq!(hello_gate(Ok(Hello::default()), false), Err(OpenAnswer::OtherNetwork), "a hello that could not be read");
@@ -951,11 +1075,125 @@ mod tests {
         (Backup::new(Some(Channel::start(req_write, rep_read))), (req_read, rep_write))
     }
 
+    /// ⛓️ Whether Chia is off goes from the hello that opened a window, by
+    /// the flight, to the page the window is served; the next opening takes
+    /// its own hello's, and the flight's end drops it with the address.
+    #[test]
+    fn the_flight_carries_chia_off_from_the_opening_hello_to_the_page() {
+        let (backup, _pipes) = quiet_backup();
+        backup.begin(Instant::now()).unwrap();
+        let hello = Hello {
+            net_id: SHELL_NET.id.into(),
+            genesis: SHELL_NET.genesis.into(),
+            wallet: "on".into(),
+            backed_up: false,
+            address: Some("txch1abc".into()),
+            chia_off: true,
+        };
+        let (address, chia_off) = hello_gate(Ok(hello), false).unwrap();
+        backup.opened(address, chia_off);
+        let facts = window_facts(Some(&backup));
+        assert_eq!((facts.address.as_deref(), facts.chia_off), (Some("txch1abc"), true));
+        assert!(index(&facts).contains("<p class=\"facts\" id=\"address-line\" hidden>Wallet address: <code id=\"address\">txch1abc</code></p>"));
+
+        backup.opened("txch1abc".into(), false);
+        assert!(!window_facts(Some(&backup)).chia_off, "each opening takes its own hello's");
+        backup.opened("txch1abc".into(), true);
+        backup.end(OpenAnswer::Closed, Instant::now());
+        let facts = window_facts(Some(&backup));
+        assert_eq!((facts.address.as_deref(), facts.chia_off), (None, false), "the end drops it with the address");
+        let none = window_facts(None);
+        assert_eq!((none.address.as_deref(), none.chia_off), (None, false));
+    }
+
+    /// ⛓️ Chia turned off in the game while a window opened with Chia on is
+    /// up: the hello beside the next reveal says so, the reveal's view and
+    /// the flight take it (the page hides the address, and a reload serves
+    /// the Chia-off lines), and it stays off, as Chia does until the node
+    /// stops. A hello that failed, or named another network, changes
+    /// nothing; a refusal still takes it for the page; and an answer for a
+    /// window no longer out is refused and changes nothing either.
+    #[test]
+    fn a_reveal_that_finds_chia_turned_off_hides_the_address_of_a_window_opened_with_chia_on() {
+        let other = if SHELL_NET == TESTNET11 { MAINNET } else { TESTNET11 };
+        let words = "[\"abandon\",\"ability\",\"able\",\"about\",\"above\",\"absent\",\"absorb\",\"abstract\",\"absurd\",\"abuse\",\"access\",\"accident\",\"account\",\"accuse\",\"achieve\",\"acid\",\"acoustic\",\"acquire\",\"across\",\"act\",\"action\",\"actor\",\"actress\",\"actual\"]";
+        let ok = format!("{{\"ok\":true,\"words\":{words},\"key\":7,\"address\":\"txch1abc\"}}");
+        let reveal = || reveal_outcome(answer(&ok), Some("txch1abc"));
+        let hello = |net: crate::shell_channel::Net, chia_off: bool| {
+            Ok(Hello { net_id: net.id.into(), genesis: net.genesis.into(), wallet: "on".into(), backed_up: false, address: Some("txch1abc".into()), chia_off })
+        };
+        let (backup, _pipes) = quiet_backup();
+        backup.begin(Instant::now()).unwrap();
+        let instance = backup.opened("txch1abc".into(), false);
+        assert!(!index(&window_facts(Some(&backup))).contains(" hidden>"), "opened with Chia on: the address shows");
+
+        let view = backup.land_reveal(instance, reveal(), hello(SHELL_NET, false)).unwrap();
+        assert!(!view.chia_off && !backup.flight().chia_off, "Chia still on");
+        // Off for a hello that failed, or one for another network: nothing changes.
+        assert!(!backup.land_reveal(instance, reveal(), Err(Failed::TimedOut)).unwrap().chia_off);
+        assert!(!backup.land_reveal(instance, reveal(), hello(other, true)).unwrap().chia_off);
+
+        // Turned off in the game: the next reveal says so.
+        let view = backup.land_reveal(instance, reveal(), hello(SHELL_NET, true)).unwrap();
+        assert!(view.chia_off);
+        assert_eq!((view.address.as_str(), backup.flight().key), ("txch1abc", Some(7)), "the words still show, for the same wallet");
+        assert_eq!(serde_json::to_value(&view).unwrap()["chia_off"], serde_json::json!(true), "the page is told");
+        let facts = window_facts(Some(&backup));
+        assert_eq!((facts.address.as_deref(), facts.chia_off), (Some("txch1abc"), true));
+        assert!(index(&facts).contains("<p class=\"facts\" id=\"address-line\" hidden>"), "a reload serves the Chia-off lines");
+
+        // It stays off: a later hello that says on, or none, changes nothing.
+        assert!(backup.land_reveal(instance, reveal(), hello(SHELL_NET, false)).unwrap().chia_off);
+        assert!(backup.land_reveal(instance, reveal(), Err(Failed::Closed)).unwrap().chia_off);
+
+        // A refusal takes it for the page too, and still records already_saved.
+        let (backup, _pipes) = quiet_backup();
+        backup.begin(Instant::now()).unwrap();
+        let instance = backup.opened("txch1abc".into(), false);
+        let saved = reveal_outcome(answer(r#"{"ok":false,"saved":true,"error":"x"}"#), Some("txch1abc"));
+        assert_eq!(backup.land_reveal(instance, saved, hello(SHELL_NET, true)).unwrap_err(), "already_saved");
+        let f = backup.flight();
+        assert_eq!((f.chia_off, f.outcome), (true, Outcome::AlreadySaved));
+        drop(f);
+
+        // An answer for a window that is no longer out changes nothing.
+        let (backup, _pipes) = quiet_backup();
+        backup.begin(Instant::now()).unwrap();
+        let instance = backup.opened("txch1abc".into(), false);
+        backup.opened("txch1abc".into(), false);
+        assert_eq!(backup.land_reveal(instance, reveal(), hello(SHELL_NET, true)).unwrap_err(), "refused");
+        let f = backup.flight();
+        assert_eq!((f.chia_off, f.key), (false, None));
+    }
+
+    /// ⛓️ The page's half: a reveal answer that says Chia is off hides the
+    /// address line and swaps the hint for the Chia-off lines' own, before
+    /// anything else is decided (an answer dropped for a hidden window still
+    /// says it), and never shows the line again.
+    #[test]
+    fn the_page_hides_the_address_when_a_reveal_says_chia_is_off() {
+        let js = std::str::from_utf8(REVEAL_JS).unwrap();
+        let needle = "const CHIA_OFF_HINT = '";
+        let hint = js.find(needle).map(|at| &js[at + needle.len()..]).expect("the Chia-off hint");
+        let hint = &hint[..hint.find("';").unwrap()];
+        assert!(ADDRESS_LINES_CHIA_OFF.contains(&format!("<p class=\"hint\" id=\"address-hint\">{hint}</p>")), "{hint:?} is the index's");
+        assert!(js.contains("const addressLine = document.getElementById('address-line');"));
+        assert!(js.contains("const addressHint = document.getElementById('address-hint');"));
+        let off = &js[js.find("function chiaTurnedOff() {").expect("chiaTurnedOff()")..];
+        let off = &off[..off.find("\n  }").unwrap()];
+        assert!(off.contains("addressLine.hidden = true;") && off.contains("addressHint.textContent = CHIA_OFF_HINT;"), "{off}");
+        assert!(!js.contains("addressLine.hidden = false") && !js.contains("removeAttribute('hidden')"), "the line never comes back");
+        let landed = &js[js.find("(answer) => {").expect("the reveal's answer")..];
+        let first = landed.find("if (answer && answer.chia_off === true) chiaTurnedOff();").expect("the answer's chia_off is read");
+        assert!(first < landed.find("if (ticket !== gen").unwrap(), "before the answer can be dropped");
+        assert!(first < landed.find("answer.address !== addressShown").unwrap(), "before the address check");
+    }
+
     /// A window opened for txch1abc whose last reveal gave key 7.
     fn shown_backup() -> (Arc<Backup>, (std::io::PipeReader, std::io::PipeWriter)) {
         let (backup, pipes) = quiet_backup();
         backup.begin(Instant::now()).unwrap();
-        backup.opened("txch1abc".into());
+        backup.opened("txch1abc".into(), false);
         backup.flight().key = Some(7);
         (Arc::new(backup), pipes)
     }
@@ -1005,13 +1243,13 @@ mod tests {
         let (backup, _pipes) = quiet_backup();
         assert_eq!(backup.start_save().err(), Some("refused"), "no window out");
         backup.begin(Instant::now()).unwrap();
-        backup.opened("txch1abc".into());
+        backup.opened("txch1abc".into(), false);
         assert_eq!(backup.start_save().err(), Some("not_shown"));
         backup.flight().key = Some(7);
         assert!(backup.start_save().is_ok());
         // The next opening starts clean.
         backup.flight().settled = true;
-        backup.opened("txch1abc".into());
+        backup.opened("txch1abc".into(), false);
         let f = backup.flight();
         assert_eq!((f.saving, f.save_tried, f.settled, f.key, f.outcome), (false, false, false, None, Outcome::Closed));
     }
@@ -1020,7 +1258,7 @@ mod tests {
     fn a_failed_saved_request_counts_when_the_hello_says_the_mark_was_written() {
         let other = if SHELL_NET == TESTNET11 { MAINNET } else { TESTNET11 };
         let hello = |net: crate::shell_channel::Net, wallet: &str, backed_up: bool, address: &str| {
-            Ok(Hello { net_id: net.id.into(), genesis: net.genesis.into(), wallet: wallet.into(), backed_up, address: Some(address.into()) })
+            Ok(Hello { net_id: net.id.into(), genesis: net.genesis.into(), wallet: wallet.into(), backed_up, address: Some(address.into()), chia_off: false })
         };
         assert!(saved_after_all(hello(SHELL_NET, "on", true, "txch1abc"), "txch1abc", false));
         assert!(!saved_after_all(hello(SHELL_NET, "on", false, "txch1abc"), "txch1abc", false), "not written");
@@ -1057,7 +1295,7 @@ mod tests {
         let ok = format!("{{\"ok\":true,\"words\":{words},\"key\":7,\"address\":\"txch1abc\"}}");
         let (view, key) = reveal_outcome(answer(&ok), Some("txch1abc")).unwrap();
         assert_eq!((view.words.len(), key, view.address.as_str()), (24, 7, "txch1abc"));
-        assert_eq!(format!("{view:?}"), "RevealView { words: [24 words], address: \"txch1abc\" }");
+        assert_eq!(format!("{view:?}"), "RevealView { words: [24 words], address: \"txch1abc\", chia_off: false }");
         assert_eq!(reveal_outcome(answer(&ok), Some("txch1other")).unwrap_err(), "changed");
         assert_eq!(reveal_outcome(answer(&ok), None).unwrap_err(), "changed");
         assert_eq!(reveal_outcome(answer(r#"{"ok":false,"saved":true,"error":"x"}"#), Some("txch1abc")).unwrap_err(), "already_saved");

@@ -395,7 +395,8 @@ fn deliver(line: &[u8], shared: &Shared) {
 }
 
 /// The node's hello: its network, its wallet's state, whether its words are
-/// marked saved, and its receive address. All public.
+/// marked saved, its receive address, and whether Chia is off on that
+/// computer now. All public.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hello {
     pub net_id: String,
@@ -404,6 +405,11 @@ pub struct Hello {
     pub wallet: String,
     pub backed_up: bool,
     pub address: Option<String>,
+    /// Chia is off on the node's computer: a wallet loaded before an in-game
+    /// off stays on, but the Bank shows no address. A hello without it reads
+    /// as Chia on: the app and its node ship together, and a node that sends
+    /// none has no in-game off.
+    pub chia_off: bool,
 }
 
 impl Hello {
@@ -420,6 +426,7 @@ impl Hello {
             wallet: v.get("wallet")?.as_str()?.to_string(),
             backed_up: v.get("backed_up")?.as_bool()?,
             address: v.get("address").and_then(|a| a.as_str()).map(str::to_string),
+            chia_off: v.get("chia_off").and_then(serde_json::Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -731,8 +738,27 @@ mod tests {
             wallet: "ready".into(),
             backed_up: true,
             address: None,
+            chia_off: false,
         };
-        assert_eq!(h, want);
+        assert_eq!(h, want, "a hello with no chia_off reads as Chia on");
+    }
+
+    /// ⛓️ A wallet loaded before an in-game off stays on with its address,
+    /// and the hello says Chia is off beside it.
+    #[test]
+    fn hello_reads_whether_chia_is_off() {
+        let with = |chia_off: serde_json::Value| {
+            let mut v: serde_json::Value = serde_json::from_str(&hello_json(TESTNET11, "on", false, Some("txch1abc"))).unwrap();
+            v["chia_off"] = chia_off;
+            Hello::parse(&v.to_string()).unwrap()
+        };
+        let off = with(serde_json::json!(true));
+        assert!(off.chia_off);
+        assert_eq!((off.wallet.as_str(), off.address.as_deref()), ("on", Some("txch1abc")));
+        assert!(!with(serde_json::json!(false)).chia_off);
+        assert!(!with(serde_json::json!("yes")).chia_off, "only a JSON true says Chia is off");
+        assert!(!with(serde_json::Value::Null).chia_off);
+        assert!(!Hello::parse(&hello_json(TESTNET11, "on", false, Some("txch1abc"))).unwrap().chia_off, "none sent: Chia on");
     }
 
     #[test]

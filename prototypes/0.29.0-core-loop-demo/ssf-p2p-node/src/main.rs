@@ -6789,16 +6789,18 @@ async fn words_answer(
 }
 
 /// 🖥️ One answer for the desktop app's channel (shell_channel.rs), on the
-/// channel's own thread: `hello` from the fingerprint's view of the wallet
-/// and the loaded key's address, `reveal` and `saved` from [`words_answer`]
-/// as [`chia_wallet_switch::Asker::Shell`], the HTTP route's own body. Only
-/// the body goes back (the HTTP status is the route's); a refusal is a fixed
-/// sentence. `rt` is the node's runtime, which runs the async body.
+/// channel's own thread: `hello` from the fingerprint's view of the wallet,
+/// the loaded key's address and whether Chia is off now (the same live read
+/// as the fingerprint's `chia_lane`), `reveal` and `saved` from
+/// [`words_answer`] as [`chia_wallet_switch::Asker::Shell`], the HTTP route's
+/// own body. Only the body goes back (the HTTP status is the route's); a
+/// refusal is a fixed sentence. `rt` is the node's runtime, which runs the
+/// async body.
 fn shell_answer(hub: &SharedHub, rt: &tokio::runtime::Handle, op: shell_channel::Op) -> zeroize::Zeroizing<String> {
     let ask = match op {
         shell_channel::Op::Hello => {
             let (view, address) = wallet_switch_view(hub);
-            return shell_channel::hello_body(chia_network::net(), &view, address.as_deref());
+            return shell_channel::hello_body(chia_network::net(), &view, address.as_deref(), chia_strict::strict());
         }
         shell_channel::Op::Reveal => chia_wallet_switch::WordsAsk::Reveal,
         shell_channel::Op::Saved(key) => chia_wallet_switch::WordsAsk::Saved(key),
