@@ -423,6 +423,44 @@ fn only_sixteen_tables_are_kept_the_least_recently_used_goes() {
 }
 
 #[test]
+fn encoded_strings_are_charged_to_the_memory_limit() {
+    let ctx = ctx_n(0);
+    let mut e = engine_with(&ctx);
+    e.rt.set_memory_limit(24 << 20);
+    // Keep what TextEncoder gives (1 MiB each): copied into QuickJS's memory, so the limit sees it.
+    let err = e
+        .call(&key_of(&ctx), COLD_BUDGET, |js| {
+            js.eval::<(), _>("const keep = []; const s = 'x'.repeat(1 << 20); for (let i = 0; i < 200; i++) keep.push(new TextEncoder().encode(s + i));")
+        })
+        .unwrap_err();
+    assert!(matches!(err, FoldError::OutOfMemory | FoldError::Exception(_)), "{err:?}");
+    assert!(!e.is_open(&ctx));
+}
+
+#[test]
+fn a_table_replaced_near_the_limit_gives_its_memory_back_first() {
+    let ctx = ctx_n(0);
+    let mut e = engine_with(&ctx);
+    // The table holds ~32 MB; the limit leaves less than a new context needs on top of it.
+    e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = [new Array(1000000).fill(1), new Array(1000000).fill(2)]")).unwrap();
+    e.rt.set_memory_limit(e.rt.memory_usage().malloc_size as usize + (200 << 10));
+    // No call to the collector here: opening the table again must free the old one itself.
+    e.open(&ctx, None, &[]).unwrap();
+    assert!(e.rt.memory_usage().malloc_size < (4 << 20), "{} bytes held", e.rt.memory_usage().malloc_size);
+    assert_eq!(e.result(&ctx).unwrap().rounds.len(), 0);
+}
+
+#[test]
+fn a_result_that_will_not_parse_gives_its_memory_back() {
+    let ctx = ctx_n(0);
+    let mut e = engine_with(&ctx);
+    e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = [new Array(1000000).fill(1)]; globalThis.SSFFold = { result: () => '{' }")).unwrap();
+    assert!(matches!(e.result(&ctx), Err(FoldError::BadResult(_))));
+    assert!(!e.is_open(&ctx));
+    assert!(e.rt.memory_usage().malloc_size < (4 << 20), "{} bytes held", e.rt.memory_usage().malloc_size);
+}
+
+#[test]
 fn a_table_forgotten_takes_its_verdicts_with_it() {
     let all = cases();
     let c = all.iter().find(|c| c.hold.is_empty() && !c.real && c.records.len() >= 10).unwrap();

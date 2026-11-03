@@ -176,9 +176,12 @@ fn js_utf8(s: &rquickjs::String) -> rquickjs::Result<Vec<u8>> {
     Ok(wtf8_to_utf8(raw))
 }
 
-/// `__ssf_utf8(string)`: TextEncoder.encode.
+/// `__ssf_utf8(string)`: TextEncoder.encode. A COPY into QuickJS's own
+/// memory (`TypedArray::new` would hand it the Rust `Vec` as an external
+/// buffer, which the memory limit does not count: a fold that keeps encoded
+/// strings could outgrow 64 MiB with no out-of-memory).
 fn host_utf8<'js>(ctx: JsCtx<'js>, s: rquickjs::String<'js>) -> rquickjs::Result<TypedArray<'js, u8>> {
-    TypedArray::new(ctx, js_utf8(&s)?)
+    TypedArray::new_copy(ctx, js_utf8(&s)?.as_slice())
 }
 
 /// `__ssf_sha256(Uint8Array | string)`: the SHA-256 of the bytes (a string's UTF-8).
@@ -310,7 +313,15 @@ impl FoldEngine {
                 self.remove_slot(&k);
             }
         }
-        let context = Context::full(&self.rt).map_err(|e| FoldError::Exception(e.to_string()))?;
+        // Near the limit a context that was dropped may still be charged (its
+        // cycles go with the collector): collect once and try again.
+        let context = match Context::full(&self.rt) {
+            Ok(c) => c,
+            Err(_) => {
+                self.rt.run_gc();
+                Context::full(&self.rt).map_err(|e| FoldError::Exception(e.to_string()))?
+            }
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.tick += 1;
@@ -454,19 +465,21 @@ impl FoldEngine {
         self.deadline.store(0, Ordering::Relaxed);
         HOST.with(|h| *h.borrow_mut() = None);
         if out.is_err() {
-            // The table's context goes; its memory goes with it only once the
-            // collector has run (a cycle is not freed by the drop), and the
-            // next context must not meet a runtime still full of it.
             self.remove_slot(key);
-            self.rt.run_gc();
         }
         out
     }
 
-    /// Drop a table's context and the verdicts kept for it.
+    /// Drop a table's context and the verdicts kept for it, and collect: a
+    /// context is a cycle (its host functions hold it), which only the
+    /// collector frees, and the next one must not meet a runtime still charged
+    /// for this. (A table's replacement, an eviction, a forgotten table, a
+    /// failed call and a result that would not parse all come through here.)
     fn remove_slot(&mut self, key: &TableKey) {
         if let Some(slot) = self.slots.remove(key) {
             self.host.borrow_mut().verdicts.retain(|(id, _), _| *id != slot.id);
+            drop(slot);
+            self.rt.run_gc();
         }
     }
 }
