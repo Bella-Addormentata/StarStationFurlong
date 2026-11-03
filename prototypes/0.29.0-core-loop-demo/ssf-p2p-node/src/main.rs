@@ -98,6 +98,10 @@ mod chia_wallet;
 mod chia_at_rest;
 #[cfg(feature = "chia-publish")]
 mod chia_publish;
+// Stage 4 (design §3): the burner keys, off every wallet path, that will pay
+// for the lane's writes. Nothing calls them yet; PRs 9 and 10 do.
+#[cfg(feature = "chia-publish")]
+mod chia_burner;
 #[cfg(feature = "chia-publish")]
 mod chia_craps_fair;
 // Treasury PR B: canonical contracts codec, golden-vector-matched against the
