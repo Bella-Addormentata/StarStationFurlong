@@ -353,15 +353,7 @@ pub fn ingest_room_cap(
         changed
     };
     if changed {
-        let posture = if cap.public_room == Some(true) {
-            "public space — N8: never published or read under this key"
-        } else if cap.posture_unknown() {
-            "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
-        } else if cap.chia_mode {
-            "armed — reads on, presence publishes while the SSF wallet is on"
-        } else {
-            "reads on, publishing off"
-        };
+        let posture = posture_words(&cap, crate::chia_network::net());
         println!(
             "⛓️ ChiaHub lane: room {room} key received · {posture}{} · epoch hint {}",
             if cap.share_card { "" } else { " · card sharing off for this room" },
@@ -369,6 +361,28 @@ pub fn ingest_room_cap(
         );
     }
     Some(cap)
+}
+
+/// What the log says a room key received is used for. Off a test network
+/// (`net`) no v1 room record is written, armed or not (stage 4 design §4.5
+/// (2), `chia_publish::publishable_rooms`), so the line promises none there:
+/// the browser may still send a flag it stored on a test network.
+fn posture_words(cap: &ChiaRoomCap, net: crate::chia_network::ChiaNet) -> &'static str {
+    if cap.public_room == Some(true) {
+        "public space — N8: never published or read under this key"
+    } else if !net.is_test() {
+        if cap.chia_mode {
+            "armed, but no room record is written on this network — reads on"
+        } else {
+            "reads on, publishing off"
+        }
+    } else if cap.posture_unknown() {
+        "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private"
+    } else if cap.chia_mode {
+        "armed — reads on, presence publishes while the SSF wallet is on"
+    } else {
+        "reads on, publishing off"
+    }
 }
 
 /// May this node hand its contact card to the peers it is connected to in
@@ -562,6 +576,45 @@ mod tests {
         assert_eq!(cap.public_room, Some(true));
         assert!(!cap.may_publish(), "N8: armed but public — never publish");
         assert!(!cap.may_read(), "D6: nothing lives under a public room's hint");
+    }
+
+    /// The log's word on a room key, per network: testnet11 keeps every
+    /// line; off a test network no line promises a room record or presence,
+    /// since none is written there, whatever the browser's stored flag says.
+    #[test]
+    fn a_room_key_promises_publishing_on_a_test_network_only() {
+        use crate::chia_network::ChiaNet;
+        let key = [7u8; 32];
+        let caps = [
+            ",\"chiaMode\":true,\"publicRoom\":false",
+            ",\"chiaMode\":false,\"publicRoom\":false",
+            ",\"chiaMode\":true",
+            ",\"chiaMode\":true,\"publicRoom\":true",
+        ]
+        .map(|extra| parse_room_cap(&payload(key, extra)).unwrap());
+        let words = |net| caps.iter().map(|cap| posture_words(cap, net)).collect::<Vec<_>>();
+        assert_eq!(
+            words(ChiaNet::Testnet11),
+            [
+                "armed — reads on, presence publishes while the SSF wallet is on",
+                "reads on, publishing off",
+                "posture unknown (browser predates N8) — reads on, publishing refused until the browser says private",
+                "public space — N8: never published or read under this key",
+            ]
+        );
+        let mainnet = words(ChiaNet::Mainnet);
+        assert_eq!(
+            mainnet,
+            [
+                "armed, but no room record is written on this network — reads on",
+                "reads on, publishing off",
+                "armed, but no room record is written on this network — reads on",
+                "public space — N8: never published or read under this key",
+            ]
+        );
+        for line in mainnet {
+            assert!(!line.contains("publishes") && !line.contains("until the browser says private"), "{line}");
+        }
     }
 
     #[test]

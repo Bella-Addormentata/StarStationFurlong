@@ -4636,8 +4636,9 @@ const FAUCET_SCREEN_POLL_MS = 20_000;
  * The faucet dish's focused UI: the JAR (exact mojos, coins, the address to
  * pay into from any wallet), the DISH (is a mojo ready, when the next one is),
  * TAKE A MOJO (a keyless claim the node submits, only while our wallet is
- * empty) and GIVE (a fee-0 spend from our wallet into the jar). Everything
- * shown comes from the node's last `faucet` reply; nothing here touches keys.
+ * empty, and on a test network only) and GIVE (a fee-0 spend from our wallet
+ * into the jar). Everything shown comes from the node's last `faucet` reply;
+ * nothing here touches keys.
  *
  * ⛓️ The slot (GIVE, the pay-in line, the QR code and the jar's address)
  * shows only on a test network: the status's network when the fingerprint
@@ -4719,7 +4720,11 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // The jar's address is shown, put in a QR code or copied only when it is
     // an address on that network.
     const payIn = !!st && slotOpen && isAddressOn(net, st.address);
-    const canTake = !!st?.canClaim && pending === null;
+    // 🛑 TAKE A MOJO pays into the SSF wallet, which the node refuses off a
+    // test network (stage 4 design §4.5 (4)): the button shows on a test
+    // network, and before the network is read, as it always did.
+    const takeOpen = !netKnown || slotOpen;
+    const canTake = takeOpen && !!st?.canClaim && pending === null;
     // GIVE pays the jar's address, so it needs the same address check as the
     // pay-in line, the QR and COPY.
     const canGive = (mojos: number): boolean => payIn && !!st?.canGive && spendable !== null && spendable >= BigInt(mojos) && pending === null;
@@ -4754,9 +4759,11 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       </div>
       <div>
         <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">THE DISH</div>
-        <div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>
-        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
-          ${st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
+        ${takeOpen ? `<div style="display:flex; gap:8px;">${btn('faucet-take', st && st.ready > 0 ? 'TAKE A MOJO' : 'NOTHING TO TAKE YET', !canTake)}</div>` : ''}
+        <div ${takeOpen ? '' : 'id="faucet-no-take" '}style="font-size:9px; color:${CH_DIM}; margin-top:${takeOpen ? 5 : 0}px; line-height:1.5;">
+          ${!takeOpen
+            ? (net ? `On ${escapeHtml(net.name)} the dish gives no mojo to your wallet.` : 'The dish gives no mojo on a Chia network this page does not know.')
+            : st?.note ? escapeHtml(st.note) : 'For players whose wallet is empty: the node claims it for you, keyless and with no fee.'}
           ${wallet !== null ? `<br>Your wallet: ${formatMojos(wallet, ticker)}${st?.walletPartial ? '+ (listing cut short; it holds more)' : ''}${confirming > 0n ? ` (${formatMojos(confirming, ticker)} still confirming a spend)` : ''}.` : ''}
         </div>
       </div>
@@ -4805,7 +4812,15 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
         (e: unknown) => failFaucetRequest(roomId, op, seq, e),
       );
     };
-    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => send('claim'));
+    // TAKE checks the network again at the click, as GIVE does: the
+    // fingerprint may have moved off a test network since this draw.
+    panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => {
+      if (dishNet(latestFaucetStatus(roomId)).net?.test !== true) {
+        render();
+        return;
+      }
+      send('claim');
+    });
     // GIVE and COPY check the network and the jar's address again at the
     // click: the fingerprint may have moved off a test network since this draw.
     const payInNow = (): ReturnType<typeof latestFaucetStatus> => {

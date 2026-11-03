@@ -53,69 +53,10 @@ const CTX_KX_CARD: &str = "ssf-chia-kx-card-v1";
 const CTX_KX_ERA: &str = "ssf-chia-kx-era-v1";
 const CARD_SIGN_PREFIX: &str = "ssf-contact-card:v1\n";
 
-/// Write a secret file readable by its owner only (0600 on Unix; elsewhere the
-/// platform's default, as `iroh_node_id.key` already does), atomically: the
-/// bytes go to a fresh 0600 temporary beside the destination, are synced, the
-/// temporary is renamed over the destination and the directory is synced too
-/// (on Unix), so the new name survives a power loss. A crash or short write thus
-/// leaves the previous file intact — a half-written `contact.key` would
-/// otherwise be read as damaged at the next start and silently replaced, making
-/// every card handed out stale — and a destination left broader by an earlier
-/// tool or run is replaced by the fresh 0600 file.
-pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => Path::new(".").to_path_buf(),
-    };
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
-    let tmp = dir.join(format!(
-        ".{name}.{}-{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let written = (|| -> std::io::Result<()> {
-        let mut f = opts.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        // The rename is directory metadata: until the directory is synced, a
-        // power loss can still lose the new name (a freshly minted
-        // `contact.key` would then rotate the identity at the next start).
-        // Windows has no directory handle to sync; NTFS journals the rename.
-        #[cfg(unix)]
-        std::fs::File::open(&dir)?.sync_all()?;
-        Ok(())
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
-}
-
-/// Reset an EXISTING secret file to 0600 without rewriting it (Unix; a no-op
-/// elsewhere). The contact key is written once and then only read, so a copy
-/// left broader than 0600 would otherwise stay readable for the life of the
-/// node — `write_private` never gets a chance to tighten it.
-pub fn tighten_private(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
+// The owner-only file writers live where every build has them: the node key
+// is kept the same way in a build without the chain lane (stage 4 design
+// §4.5).
+pub use crate::private_file::{tighten_private, write_private};
 
 /// Load the contact key, or mint one. A file of the wrong size is replaced
 /// (and said so): a half-written key would otherwise make every card we hand

@@ -843,11 +843,12 @@ impl WalletLease {
     /// compare-and-release besides, so a verdict can never remove a marker
     /// parked after it was formed.
     pub async fn reconcile(&self, client: &impl ChainAccess) {
-        self.reconcile_at(client, Instant::now()).await
+        self.reconcile_at(crate::chia_network::net(), client, Instant::now()).await
     }
 
-    /// [`WalletLease::reconcile`] at a given instant (the tests' clock).
-    async fn reconcile_at(&self, client: &impl ChainAccess, now: Instant) {
+    /// [`WalletLease::reconcile`] on `net` at a given instant (the tests'
+    /// network and clock).
+    async fn reconcile_at(&self, net: crate::chia_network::ChiaNet, client: &impl ChainAccess, now: Instant) {
         let due = self.due_at(now);
         let settling: Vec<(u64, Settling)> = self.settling.lock().unwrap().iter().map(|(spend, s)| (*spend, s.clone())).collect();
         if due.is_empty() && settling.is_empty() {
@@ -901,9 +902,16 @@ impl WalletLease {
         // full (see `mempool_probes`): its bundle goes to the peers again, and
         // their acks say whether it is live (in a mempool, or taken back) or
         // dead (refused everywhere, so it will never land).
+        //
+        // 🛑 Off a test network no saved bundle goes out again (stage 4
+        // design §4.5): every spend a lease there can hold is one this build
+        // no longer sends, parked by an older build: a memo spend the SSF
+        // wallet paid (§4.5 (1)) or a TAKE into it (§4.5 (4), (5)). Its coins
+        // stay parked until the chain lists one spent or gone, as for any
+        // spend the peers are not asked about.
         let mut in_mempool: HashMap<u64, Option<bool>> = HashMap::new();
         let after = self.probe_cursor.load(std::sync::atomic::Ordering::Relaxed);
-        let probes = mempool_probes(&due, &spent_on_chain, after);
+        let probes = if net.is_test() { mempool_probes(&due, &spent_on_chain, after) } else { Vec::new() };
         if let Some((last, _)) = probes.last() {
             self.probe_cursor.store(*last, std::sync::atomic::Ordering::Relaxed);
         }
@@ -951,8 +959,9 @@ impl WalletLease {
                 SettlingStep::Keep => {}
                 SettlingStep::Repark => {
                     println!(
-                        "⛓️ wallet lease: the block that spent spend #{spend}'s coins at height {} is gone (a reorganization); parked again, to be pushed again",
-                        s.spent_at
+                        "⛓️ wallet lease: the block that spent spend #{spend}'s coins at height {} is gone (a reorganization); parked again, {}",
+                        s.spent_at,
+                        if net.is_test() { "to be pushed again" } else { "for the chain to settle (no spend is sent again here)" }
                     );
                     reparked.push(*spend);
                 }
@@ -1292,9 +1301,78 @@ pub async fn find_spendable_coin(
     Ok(coins.into_iter().next())
 }
 
+/// 🛑 Why the SSF wallet pays for no spend that carries a memo on `net`, or
+/// `None` on a test network (stage 4 design §4.5 (1)). A memo spend paid by
+/// the wallet makes the money coin the parent of the record, so whoever
+/// paid RECEIVE is tied to every listing, knock and beacon it pays for. Off
+/// a test network that waits for burner keys funded by the lobby dish; until
+/// they land, a mainnet node writes nothing. The text is the player's: the
+/// Phone Book row says it after its state, whichever it is (a listing an
+/// older build wrote can still be listed, sent or outdated), so it says
+/// what this node no longer writes, never whether it is listed.
+pub fn money_memo_refusal(net: crate::chia_network::ChiaNet) -> Option<String> {
+    (!net.is_test()).then(|| format!("on {} the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet", net.name()))
+}
+
+/// The log line for [`money_memo_refusal`], said once per process
+/// ([`refuse_money_memo`]).
+pub fn money_memo_line(net: crate::chia_network::ChiaNet) -> Option<String> {
+    (!net.is_test()).then(|| {
+        format!(
+            "⛓️ ChiaHub: on {} the SSF wallet pays for no chain write, so this node writes no listing, knock, beacon or room record there until burner keys land. It still reads the chain.",
+            net.name()
+        )
+    })
+}
+
+/// What the log says follows a listing the chain voided or a beacon it
+/// forgot: written again where the SSF wallet pays for it, nothing off a
+/// test network ([`money_memo_refusal`]), where the mark an older build left
+/// is still judged.
+fn write_again_words(net: crate::chia_network::ChiaNet) -> String {
+    match money_memo_refusal(net) {
+        None => "writing it again".to_string(),
+        Some(_) => format!("nothing is written again on {} (the SSF wallet pays for no chain write there)", net.name()),
+    }
+}
+
+/// A memo spend refused off a test network: its text is
+/// [`money_memo_refusal`]'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoneyMemoRefused(pub String);
+
+impl std::fmt::Display for MoneyMemoRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MoneyMemoRefused {}
+
+/// [`money_memo_refusal`] at a write: `Err` off a test network, and the
+/// first refusal in the process logs [`money_memo_line`]. Every spend that
+/// carries a memo is built by [`build_publish_bundle`], which asks this
+/// first, so none leaves the SSF wallet's keys off a test network: presence
+/// and knocks (the money key), the beacon (its key comes from the money
+/// key), v1 room records and both env test hooks. The heartbeat asks it once
+/// at its start, so a mainnet node plans no write that would be refused,
+/// looks up no coin for one, and says why on the Phone Book row.
+pub fn refuse_money_memo(net: crate::chia_network::ChiaNet) -> Result<(), MoneyMemoRefused> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(why) = money_memo_refusal(net) else { return Ok(()) };
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(line) = money_memo_line(net) {
+            println!("{line}");
+        }
+    }
+    Err(MoneyMemoRefused(why))
+}
+
 /// Build the SIGNED SpendBundle: spend `coin` back to our own puzzle hash at
 /// `amount − fee`, carrying MEMOS = `( hint ciphertext )` (a proper 2-element
-/// CLVM list). Signed for `net` with the synthetic BLS key.
+/// CLVM list). Signed for `net` with the synthetic BLS key. The one builder
+/// of a memo spend, so off a test network it refuses
+/// ([`refuse_money_memo`]) before it signs anything.
 pub fn build_publish_bundle(
     net: crate::chia_network::ChiaNet,
     chia_sk: &SecretKey,
@@ -1302,6 +1380,7 @@ pub fn build_publish_bundle(
     hint: Bytes32,
     ciphertext: Bytes,
 ) -> Result<SpendBundle> {
+    refuse_money_memo(net)?;
     let synthetic_sk: SecretKey = chia_sk.derive_synthetic();
     let synthetic_pk: PublicKey = synthetic_sk.public_key();
     let our_ph: Bytes32 = StandardArgs::curry_tree_hash(synthetic_pk).into();
@@ -1383,9 +1462,17 @@ pub struct PublishMark {
 /// now (armed AND known private) and which are armed but refused — their key is
 /// public space (bundled seed or PUBLIC passage), or the browser predates N8 and
 /// never said which, and silence fails closed.
-pub fn publishable_rooms(caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 32])>, Vec<String>) {
+///
+/// Off a test network nothing at all (stage 4 design §4.5 (2)): a v1 record's
+/// hint is per room per day and its body carries every live address, so
+/// it is written on a test network only, and the page shows the Chia Mesh
+/// switch that arms it there only.
+pub fn publishable_rooms(net: crate::chia_network::ChiaNet, caps: &[(String, ChiaRoomCap)]) -> (Vec<(String, [u8; 32])>, Vec<String>) {
     let mut armed = Vec::new();
     let mut refused = Vec::new();
+    if !net.is_test() {
+        return (armed, refused);
+    }
     for (room, cap) in caps {
         if cap.restored {
             continue; // read-only until the browser sends a live cap (posture may be stale)
@@ -2230,6 +2317,14 @@ pub async fn heartbeat_loop(
     iroh_sk: iroh::SecretKey,
     chia_sk: SecretKey,
 ) {
+    let net = crate::chia_network::net();
+    // 🛑 Off a test network the SSF wallet pays for no memo spend (stage 4
+    // design §4.5 (1)): asked once here, which logs it once, so the loop
+    // writes no listing, knock or beacon, looks up no coin for one, and the
+    // Phone Book row says why. It still reads the agreed peak, which dates
+    // the row's edition, and judges a write an older build left; the
+    // watcher is not told to read this node's own listing for it.
+    let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
     let mut refused_logged: HashSet<String> = HashSet::new();
@@ -2261,7 +2356,8 @@ pub async fn heartbeat_loop(
     }
     // Tell the watcher to read our own key every beat for as long as we may
     // write it, rooms and peers or not: that read is what confirms a write.
-    hub.presence_publishing.store(findable, std::sync::atomic::Ordering::Relaxed);
+    // Off a test network this node writes none (`money_refused`).
+    hub.presence_publishing.store(findable && money_refused.is_none(), std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = &node_mark {
         println!(
             "⛓️ ChiaHub presence: last written in era {} (write {}, hint {}, {})",
@@ -2394,7 +2490,7 @@ pub async fn heartbeat_loop(
                     match presence_step(&m, presence_standing(&peak_client, &m).await, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
-                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; writing it again");
+                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; {}", write_again_words(net));
                             let void = m.voided();
                             if let Err(e) = void.save(mark_path) {
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
@@ -2457,7 +2553,9 @@ pub async fn heartbeat_loop(
                 let retry_ok = node_attempt
                     .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
                     .unwrap_or(true);
-                let due = node_publish_due(node_mark.as_ref(), era, &sig, now_unix, era_hint, &self_id, spend_held) && retry_ok;
+                let due = money_refused.is_none()
+                    && node_publish_due(node_mark.as_ref(), era, &sig, now_unix, era_hint, &self_id, spend_held)
+                    && retry_ok;
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     node_attempt = Some(Instant::now());
@@ -2524,8 +2622,9 @@ pub async fn heartbeat_loop(
                 && era_now.is_some_and(|era| {
                     node_mark.as_ref().is_some_and(|m| m.era == era && !m.confirmed && now_unix.saturating_sub(m.last_at) >= PRESENCE_CONFIRM_TIMEOUT_SECS)
                 });
-            let why_not = node_last_error
+            let why_not = money_refused
                 .as_deref()
+                .or(node_last_error.as_deref())
                 .or(budget_spent.then_some("this era's write budget is spent; the next listing goes out with the new era"))
                 .or(spend_live.then_some("the wallet still holds the listing's spend, so it is not written again; the chain settles it"));
             let status = presence_status(node_mark.as_ref(), hint_now.as_deref(), &self_id, era_now, &sig, entries.len(), why_not);
@@ -2543,7 +2642,7 @@ pub async fn heartbeat_loop(
         // meanwhile (a link by any path cancels the knock). Era-bound like
         // presence: no write without a peak, inside the era's guard blocks, or
         // on a peak the presence lookups above let age out.
-        if knock_waiting && peak > 0 && !era_guard(peak) && !peak_aged("knock") {
+        if knock_waiting && money_refused.is_none() && peak > 0 && !era_guard(peak) && !peak_aged("knock") {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -2661,7 +2760,7 @@ pub async fn heartbeat_loop(
                     match beacon_step(&m, beacon_standing(&peak_client, &m).await, era, peak) {
                         BeaconStep::Keep => {}
                         BeaconStep::Forget(why) => {
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; writing it again");
+                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; {}", write_again_words(net));
                             beacon_mark = None;
                             let _ = std::fs::remove_file(beacon_mark_path);
                         }
@@ -2710,7 +2809,7 @@ pub async fn heartbeat_loop(
                     );
                     welcome_warned = true;
                 }
-                let due = reachable && serves_welcome && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id);
+                let due = money_refused.is_none() && reachable && serves_welcome && retry_ok && beacon_due(beacon_mark.as_ref(), era, &self_id);
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("beacon") {
                     beacon_attempt = Some(Instant::now());
@@ -2758,7 +2857,7 @@ pub async fn heartbeat_loop(
             .iter()
             .map(|(room, cap)| (room.clone(), cap.clone()))
             .collect();
-        let (armed, refused) = publishable_rooms(&caps);
+        let (armed, refused) = publishable_rooms(net, &caps);
         refused_logged.retain(|room| refused.contains(room));
         for room in &refused {
             if refused_logged.insert(room.clone()) {
@@ -2860,6 +2959,9 @@ pub async fn publish_presence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The network the lease tests reconcile on, unless they name another.
+    const T11: crate::chia_network::ChiaNet = crate::chia_network::ChiaNet::Testnet11;
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
         ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false, prefetch: false }
@@ -3681,7 +3783,7 @@ mod tests {
         assert!(lease.holds_spend(n) && !lease.holds_spend(n + 1));
         // Included: released as spent, settling — still held.
         let t1 = t0 + RECONCILE_GRACE;
-        lease.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         assert!(lease.is_settling(&id) && lease.holds_spend(n));
         assert_eq!(lease.spend_of(&id), None, "settling is not parked");
         // Across a restart, by the same number.
@@ -3689,14 +3791,14 @@ mod tests {
         again.restore(&path);
         assert!(again.holds_spend(n), "the number outlives the restart with the settling record");
         // The block gone: parked again under its number — held.
-        again.reconcile_at(&listing(None, Some(1000)), t1).await;
+        again.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
         assert!(again.is_parked(&id) && again.holds_spend(n));
         assert_eq!(again.spend_of(&id), Some(n));
         // Landed anew and settled SETTLED_DEPTH deep: forgotten — held no more.
         let t2 = t1 + RECONCILE_GRACE;
-        again.reconcile_at(&listing(Some(1005), Some(1006)), t2).await;
+        again.reconcile_at(T11, &listing(Some(1005), Some(1006)), t2).await;
         assert!(again.holds_spend(n));
-        again.reconcile_at(&listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
+        again.reconcile_at(T11, &listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
         assert!(!again.holds_spend(n) && !again.is_taken(&id));
         // A spend released on the peers' refusal is held no more either.
         let other = WalletLease::new();
@@ -3742,7 +3844,7 @@ mod tests {
         // spending — but kept SETTLING with its bundle, in the file, and its
         // coin is no writer's to take.
         let t1 = t0 + RECONCILE_GRACE;
-        lease.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         assert!(!lease.is_parked(&id) && lease.is_settling(&id) && lease.is_taken(&id));
         assert_eq!(lease.lease_word(&id), LeaseWord::Spent);
         assert!(!lease.outgoing_pending(), "settling is not spending: the wallet's next coin is the one the spend created");
@@ -3759,16 +3861,16 @@ mod tests {
         // Peers behind the spend list the input unspent, an undated listing
         // lists it so, a listing finds it spent but not deep enough, a listing
         // cut short leaves it out: nothing is decided by any of them.
-        again.reconcile_at(&listing(None, Some(999)), t1).await;
-        again.reconcile_at(&listing(None, None), t1).await;
-        again.reconcile_at(&listing(Some(1000), Some(1000 + SETTLED_DEPTH - 1)), t1).await;
-        again.reconcile_at(&empty(true, Some(5000)), t1).await;
+        again.reconcile_at(T11, &listing(None, Some(999)), t1).await;
+        again.reconcile_at(T11, &listing(None, None), t1).await;
+        again.reconcile_at(T11, &listing(Some(1000), Some(1000 + SETTLED_DEPTH - 1)), t1).await;
+        again.reconcile_at(T11, &empty(true, Some(5000)), t1).await;
         assert!(again.is_settling(&id) && !again.is_parked(&id));
         // Unspent on a listing judged at the spend: the block is gone. The
         // spend is parked again under its own number, with its bundle, due
         // after a fresh grace for the liveness probe to push it again; the
         // coin stays no writer's to take.
-        again.reconcile_at(&listing(None, Some(1000)), t1).await;
+        again.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
         assert!(again.is_parked(&id) && !again.is_settling(&id) && again.is_taken(&id));
         assert_eq!(again.lease_word(&id), LeaseWord::Parked);
         assert!(again.outgoing_pending());
@@ -3781,16 +3883,16 @@ mod tests {
         assert_eq!((file.parked[0].spend, file.bundles[0].spend), (parking.spend, parking.spend));
         // Landed again, in another block: settling anew from that height …
         let t2 = t1 + RECONCILE_GRACE;
-        again.reconcile_at(&listing(Some(1005), Some(1006)), t2).await;
+        again.reconcile_at(T11, &listing(Some(1005), Some(1006)), t2).await;
         assert!(again.is_settling(&id) && !again.is_parked(&id));
         assert_eq!(on_disk().settling[0].spent_at, 1005);
         // … moved to yet another block by a reorganization no tick saw the
         // input unspent in between (round 11): the record follows, in the file
         // too, and a listing deep enough from the OLD height settles nothing …
-        again.reconcile_at(&listing(Some(1020), Some(1021)), t2).await;
+        again.reconcile_at(T11, &listing(Some(1020), Some(1021)), t2).await;
         assert!(again.is_settling(&id) && !again.is_parked(&id));
         assert_eq!(on_disk().settling[0].spent_at, 1020, "re-clocked to the block that holds it now");
-        again.reconcile_at(&listing(Some(1020), Some(1005 + SETTLED_DEPTH)), t2).await;
+        again.reconcile_at(T11, &listing(Some(1020), Some(1005 + SETTLED_DEPTH)), t2).await;
         assert!(again.is_settling(&id), "deep from the first inclusion, shallow from the block that holds it: still settling");
         // … across a restart …
         let third = WalletLease::new();
@@ -3798,7 +3900,7 @@ mod tests {
         assert!(third.is_settling(&id) && !third.is_parked(&id));
         assert_eq!(third.lease_word(&id), LeaseWord::Spent);
         // … and found spent SETTLED_DEPTH deep from there, at the listing's own height: final.
-        third.reconcile_at(&listing(Some(1020), Some(1020 + SETTLED_DEPTH)), t2).await;
+        third.reconcile_at(T11, &listing(Some(1020), Some(1020 + SETTLED_DEPTH)), t2).await;
         assert!(!third.is_settling(&id) && !third.is_parked(&id) && !third.is_taken(&id));
         assert_eq!(third.lease_word(&id), LeaseWord::Spent, "this run remembers the settlement");
         assert!(on_disk().settling.is_empty());
@@ -3807,17 +3909,17 @@ mod tests {
         // nothing left to settle or to push: forgotten.
         let other = WalletLease::new();
         other.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
-        other.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        other.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         assert!(other.is_settling(&id));
-        other.reconcile_at(&empty(false, Some(899)), t1).await;
+        other.reconcile_at(T11, &empty(false, Some(899)), t1).await;
         assert!(other.is_settling(&id), "absent below its confirmation: peers behind it");
-        other.reconcile_at(&empty(false, Some(950)), t1).await;
+        other.reconcile_at(T11, &empty(false, Some(950)), t1).await;
         assert!(!other.is_settling(&id) && !other.is_parked(&id));
         // A spend released as spent WITHOUT a bundle (parked by an older node)
         // has nothing to push again: forgotten at the release, as before.
         let bare = WalletLease::new();
         bare.park_at([(id, 900)], t0).unwrap();
-        bare.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        bare.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         assert!(!bare.is_settling(&id) && !bare.is_parked(&id));
         assert_eq!(bare.lease_word(&id), LeaseWord::Spent);
         // A coin a LATER spend took meanwhile keeps that spend's marker when
@@ -3825,15 +3927,80 @@ mod tests {
         // spend none of whose coins is free again is forgotten, bundle and all.
         let raced = WalletLease::new();
         let old = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
-        raced.reconcile_at(&listing(Some(1000), Some(1001)), t1).await;
+        raced.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         let newer = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t1).unwrap();
         assert!(raced.is_parked(&id) && raced.is_settling(&id));
-        raced.reconcile_at(&listing(None, Some(1000)), t1).await;
+        raced.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
         assert!(raced.is_parked(&id) && !raced.is_settling(&id));
         let due = raced.due_at(t1 + RECONCILE_GRACE);
         assert_eq!(due.iter().map(|d| d.spend).collect::<Vec<u64>>(), vec![newer.spend], "the newer marker stands");
         assert!(old.spend < newer.spend && !raced.snapshot().bundles.iter().any(|b| b.spend == old.spend), "no bundle parks no coin");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🛑 Stage 4 design §4.5 (1): off a test network no saved bundle goes
+    /// out again. A mainnet node that an older build left with a memo spend
+    /// parked (a listing, knock or beacon the SSF wallet paid for) restarts
+    /// on this one: reconciliation asks the chain and never hands the bundle
+    /// to a peer, neither as the liveness question nor once its block is gone
+    /// and the spend is parked again. The coin stays parked until the chain
+    /// lists it spent. A test network asks the peers as before.
+    #[tokio::test]
+    async fn off_a_test_network_the_lease_sends_no_saved_bundle_again() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_network::ChiaNet;
+        use std::sync::atomic::Ordering::Relaxed;
+        let sk = SecretKey::from_seed(&[12u8; 32]);
+        let ours = Coin::new(Bytes32::new([6u8; 32]), our_puzzle_hash(&sk), 1000);
+        let id = ours.coin_id();
+        // The memo spend as an older build pushed it: built here on
+        // testnet11, since mainnet's builder refuses it now, and signed for
+        // each network.
+        let memo = build_publish_bundle(ChiaNet::Testnet11, &sk, ours, Bytes32::new([4u8; 32]), Bytes::new(vec![1, 2, 3])).unwrap();
+        let listing = |spent: Option<u32>, judged_at: u32| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at: Some(judged_at),
+            }])
+        };
+        for net in ChiaNet::ALL {
+            let bundle = sign_standard_spends(net, &sk, memo.coin_spends.clone()).unwrap();
+            let asks = usize::from(net.is_test());
+            let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-resend-{net:?}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("wallet_lease.json");
+            let _ = std::fs::remove_file(&path);
+            // The older build parked the spend with its bundle, and stopped.
+            let before = WalletLease::new();
+            before.restore(&path);
+            before.park_with_bundle([(id, 900)], &bundle).unwrap();
+            // This build takes the parking back; past the grace the chain
+            // lists the input unspent.
+            let lease = WalletLease::new();
+            lease.restore(&path);
+            let t1 = Instant::now() + RECONCILE_GRACE;
+            let chain = listing(None, 1000);
+            lease.reconcile_at(net, &chain, t1).await;
+            assert_eq!(chain.sent.load(Relaxed), asks, "{net:?}: the liveness question");
+            assert!(lease.is_parked(&id), "{net:?}: asked and unanswered, or not asked, the coin stays parked");
+            // Included, then its block gone: parked again, and still sent
+            // again on a test network only.
+            lease.reconcile_at(net, &listing(Some(1000), 1001), t1).await;
+            assert!(lease.is_settling(&id), "{net:?}");
+            lease.reconcile_at(net, &listing(None, 1000), t1).await;
+            assert!(lease.is_parked(&id), "{net:?}: parked again");
+            let t2 = t1 + RECONCILE_GRACE;
+            let chain = listing(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(chain.sent.load(Relaxed), asks, "{net:?}: the spend parked again");
+            assert!(lease.is_parked(&id), "{net:?}");
+            // The chain's word still settles it.
+            lease.reconcile_at(net, &listing(Some(1005), 1006), t2).await;
+            assert!(!lease.is_parked(&id) && lease.is_settling(&id), "{net:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -3867,13 +4034,96 @@ mod tests {
             ("unknown-armed".to_string(), cap(5, true, None)),
             ("unknown-off".to_string(), cap(6, false, None)),
         ];
-        let (armed, refused) = publishable_rooms(&caps);
+        let (armed, refused) = publishable_rooms(crate::chia_network::ChiaNet::Testnet11, &caps);
         assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])]);
         assert_eq!(
             refused,
             vec!["public-armed".to_string(), "unknown-armed".to_string()],
             "armed rooms that are public, or whose posture an old browser never sent, are named so the operator learns why nothing publishes"
         );
+    }
+
+    /// 🛑 Stage 4 design §4.5 (2): off a test network no room publishes a v1
+    /// record, armed and known private or not; a test network keeps N8's
+    /// answer.
+    #[test]
+    fn off_a_test_network_no_room_publishes_a_v1_record() {
+        use crate::chia_network::ChiaNet;
+        let caps = vec![
+            ("private-armed".to_string(), cap(1, true, Some(false))),
+            ("public-armed".to_string(), cap(3, true, Some(true))),
+        ];
+        for net in ChiaNet::ALL {
+            let (armed, refused) = publishable_rooms(net, &caps);
+            if net.is_test() {
+                assert_eq!(armed, vec![("private-armed".to_string(), [1u8; 32])], "{net:?}");
+                assert_eq!(refused, vec!["public-armed".to_string()], "{net:?}");
+            } else {
+                assert!(armed.is_empty() && refused.is_empty(), "{net:?}: {armed:?} {refused:?}");
+            }
+        }
+    }
+
+    /// 🛑 Stage 4 design §4.5 (1): the one builder of a memo spend refuses
+    /// off a test network, before it signs, whichever wallet key pays (the
+    /// money key, or the beacon key made from it); a test network builds
+    /// the spend as before. The refusal says why in the player's words, and
+    /// the log line names every write that stops.
+    #[test]
+    fn off_a_test_network_the_ssf_wallet_pays_for_no_memo_spend() {
+        use crate::chia_network::ChiaNet;
+        let money = SecretKey::from_seed(&[12u8; 32]);
+        let beacon = beacon_wallet_key(&money);
+        let hint = Bytes32::new([4u8; 32]);
+        for net in ChiaNet::ALL {
+            for sk in [&money, &beacon] {
+                let coin = Coin::new(Bytes32::new([3u8; 32]), our_puzzle_hash(sk), 1000);
+                let built = build_publish_bundle(net, sk, coin, hint, Bytes::new(vec![1, 2, 3]));
+                if net.is_test() {
+                    let bundle = built.unwrap();
+                    assert_eq!(bundle.coin_spends.len(), 1, "{net:?}");
+                    assert_eq!(money_memo_refusal(net), None);
+                    assert_eq!(money_memo_line(net), None);
+                    assert!(refuse_money_memo(net).is_ok());
+                } else {
+                    let err = built.unwrap_err();
+                    let refused = err.downcast_ref::<MoneyMemoRefused>().expect("refused by the rule, not by a failed build");
+                    // Since review: a listing an older build wrote can still
+                    // be listed, sent or outdated, and the row says this
+                    // after each, so it says what stops, not "not listed".
+                    assert_eq!(refused.0, "on Chia mainnet the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet");
+                    assert_eq!(err.to_string(), refused.0);
+                    assert_eq!(refuse_money_memo(net), Err(refused.clone()), "asked again, the same answer");
+                }
+            }
+        }
+        assert_eq!(
+            money_memo_line(ChiaNet::Mainnet).unwrap(),
+            "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write, so this node writes no listing, knock, beacon or room record there until burner keys land. It still reads the chain."
+        );
+        // The Phone Book row repeats it whole: the page cuts a node's text
+        // past 160 characters (phoneBook.ts ERROR_MAX). It follows every
+        // state's words (phoneBook.test.ts), "Not in the Phone Book yet:"
+        // among them, so it neither repeats nor denies a listing.
+        let why = money_memo_refusal(ChiaNet::Mainnet).unwrap();
+        assert!(why.chars().count() <= 160 && !why.contains('\u{2014}'), "{why}");
+        assert!(!why.contains("not listed") && !why.contains("Phone Book yet"), "{why}");
+    }
+
+    /// A voided listing or a forgotten beacon is written again on a test
+    /// network only: off one the line says nothing follows, since the SSF
+    /// wallet pays for no chain write there.
+    #[test]
+    fn a_voided_write_is_written_again_on_a_test_network_only() {
+        use crate::chia_network::ChiaNet;
+        assert_eq!(write_again_words(ChiaNet::Testnet11), "writing it again");
+        assert_eq!(
+            write_again_words(ChiaNet::Mainnet),
+            "nothing is written again on Chia mainnet (the SSF wallet pays for no chain write there)"
+        );
+        for net in ChiaNet::ALL {
+            assert_eq!(write_again_words(net) == "writing it again", money_memo_refusal(net).is_none(), "{net:?}");
+        }
     }
 
     #[test]
@@ -3914,14 +4164,19 @@ mod tests {
                 .collect();
             chia_bls::aggregate_verify(&bundle.aggregated_signature, pairs)
         };
+        // The memo spend is built on testnet11 only (mainnet refuses it,
+        // `off_a_test_network_the_ssf_wallet_pays_for_no_memo_spend`), so its
+        // coin spends are signed for each network by the shared signer, the
+        // part that takes the network.
+        let t11 = build_publish_bundle(ChiaNet::Testnet11, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
         for signed in ChiaNet::ALL {
-            let bundle = build_publish_bundle(signed, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+            let bundle = sign_standard_spends(signed, &sk, t11.coin_spends.clone()).unwrap();
             for under in ChiaNet::ALL {
                 assert_eq!(verifies(&bundle, under), signed == under, "signed for {signed:?}, checked under {under:?}");
             }
         }
-        let t11 = build_publish_bundle(ChiaNet::Testnet11, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
-        let main = build_publish_bundle(ChiaNet::Mainnet, &sk, coin, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+        assert_eq!(sign_standard_spends(ChiaNet::Testnet11, &sk, t11.coin_spends.clone()).unwrap(), t11, "the builder signs as the signer does");
+        let main = sign_standard_spends(ChiaNet::Mainnet, &sk, t11.coin_spends.clone()).unwrap();
         assert_eq!(t11.coin_spends, main.coin_spends, "the same spend; only the signature differs");
         assert_ne!(t11.aggregated_signature, main.aggregated_signature);
     }

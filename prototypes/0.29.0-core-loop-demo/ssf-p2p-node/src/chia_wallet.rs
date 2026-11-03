@@ -1412,17 +1412,17 @@ pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
     println!("{}", receive_line(net, &receive_address(net, &id.wallet)));
 }
 
-/// The receive address's line, and how it is funded on `net`.
+/// The receive address's line, and how it is funded on `net`. Off a test
+/// network the lane pays for no write from this wallet (stage 4 design
+/// §4.5 (1), `chia_publish::money_memo_refusal`), so the line promises none
+/// there: funding it would buy no listing.
 fn receive_line(net: ChiaNet, addr: &str) -> String {
     let fund = if net.is_test() {
-        format!("Fund it at a {} faucet. {} is free.", net.name(), net.ticker())
+        format!("Fund it at a {} faucet. {} is free. Once it holds a coin, the lane can publish/resolve presence.", net.name(), net.ticker())
     } else {
-        format!("This address takes real {}.", net.ticker())
+        format!("This address takes real {}. On {} the lane writes nothing from it and only reads the chain.", net.ticker(), net.name())
     };
-    format!(
-        "⛓️ ChiaHub lane: {} receive address {addr}\n   {fund} Once it holds a coin, the lane can publish/resolve presence.",
-        net.name()
-    )
+    format!("⛓️ ChiaHub lane: {} receive address {addr}\n   {fund}", net.name())
 }
 
 /// Tighten the identity file to owner-only on Unix; a no-op elsewhere
@@ -3202,8 +3202,11 @@ mod tests {
             receive_line(ChiaNet::Testnet11, a),
             format!("⛓️ ChiaHub lane: testnet11 receive address {a}\n   Fund it at a testnet11 faucet. TXCH is free. Once it holds a coin, the lane can publish/resolve presence.")
         );
+        // Stage 4 design §4.5 (1): off a test network the SSF wallet pays
+        // for no write, so the mainnet line no longer says a coin there lets
+        // the lane publish.
         let line = receive_line(ChiaNet::Mainnet, "xch1q");
-        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. Once it holds a coin, the lane can publish/resolve presence.");
-        assert!(!line.contains("faucet"), "{line}");
+        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. On Chia mainnet the lane writes nothing from it and only reads the chain.");
+        assert!(!line.contains("faucet") && !line.contains("publish"), "{line}");
     }
 }

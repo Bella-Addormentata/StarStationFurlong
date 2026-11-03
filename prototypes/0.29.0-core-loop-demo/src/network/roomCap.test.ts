@@ -9,6 +9,7 @@ import {
   bridgeMemberHints,
   buildRoomCapPayload,
   cardsForPass,
+  chiaMeshOffered,
   collectMemberHints,
   contactCardSignBytes,
   forgetSessionFlags,
@@ -34,6 +35,7 @@ import {
   type PostureSources,
   verifyContactCard,
 } from './roomCap';
+import { MAINNET, TESTNET11 } from '../chiaNetwork';
 
 const card = (nodeId: string, issuedAt = 100) => ({ nodeId, ck: 'Y2s=', kxPk: 'ab', issuedAt, sig: 'ff' });
 
@@ -503,5 +505,29 @@ describe('room cap payload (N8 / D3)', () => {
     expect(roomIsPublicSpace(false, true)).toBe(true);
     expect(roomIsPublicSpace(false, undefined)).toBe(true);
     expect(roomIsPublicSpace(false, false)).toBe(false);
+  });
+});
+
+describe('the Chia Mesh switch off a test network (stage 4 design §4.5 (2))', () => {
+  // The switch arms the room's v1 record, which the node writes on a test
+  // network only: the page shows it there, and before any fingerprint is
+  // read, as it always did.
+  it('shows on a test network and before the network is read, and nowhere else', () => {
+    expect(chiaMeshOffered(TESTNET11)).toBe(true);
+    expect(chiaMeshOffered(undefined)).toBe(true);
+    expect(chiaMeshOffered(MAINNET)).toBe(false);
+    expect(chiaMeshOffered(null)).toBe(false);
+  });
+
+  it('is the row main.ts hides, by the fingerprint\'s network, and redrawn when that changes', () => {
+    const main = readFileSync(fileURLToPath(new URL('../main.ts', import.meta.url)), 'utf8');
+    const at = main.indexOf('function refreshChiaModeToggle()');
+    expect(at).toBeGreaterThan(0);
+    const body = main.slice(at, main.indexOf('\n}\n', at));
+    expect(body).toContain('getElementById("chia-mode-row")');
+    expect(body).toContain('chiaMeshOffered(localFingerprint?.chia_net)');
+    expect(main).toContain('if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();');
+    const html = readFileSync(fileURLToPath(new URL('../../index.html', import.meta.url)), 'utf8');
+    expect(html).toContain('id="chia-mode-row"');
   });
 });
