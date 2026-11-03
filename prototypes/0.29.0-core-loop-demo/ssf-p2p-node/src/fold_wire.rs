@@ -149,22 +149,39 @@ const V_JUNK: u8 = 5;
 
 // ── Encoding ────────────────────────────────────────────────────────────────
 
-struct Out(Vec<u8>);
+/// A frame being written. It never grows past the frame limit: once a write would pass it the
+/// frame is over, nothing more is copied, and the size it would have had is still counted, so
+/// the caller is told how big it was. (A batch of records is not copied twice in the node's
+/// memory just to be refused.)
+struct Out {
+    b: Vec<u8>,
+    /// The size the frame would have, copied or not.
+    total: usize,
+}
+
+/// The byte count and the most a body may be.
+const FRAME_CAP: usize = 4 + MAX_FRAME;
 
 impl Out {
+    fn bytes(&mut self, x: &[u8]) {
+        self.total = self.total.saturating_add(x.len());
+        if self.total <= FRAME_CAP {
+            self.b.extend_from_slice(x);
+        }
+    }
     fn u8(&mut self, v: u8) {
-        self.0.push(v);
+        self.bytes(&[v]);
     }
     fn u32(&mut self, v: usize) {
         // A length past u32 is past MAX_FRAME, which `finish` refuses.
-        self.0.extend_from_slice(&(v.min(u32::MAX as usize) as u32).to_le_bytes());
+        self.bytes(&(v.min(u32::MAX as usize) as u32).to_le_bytes());
     }
     fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
+        self.bytes(&v.to_le_bytes());
     }
     fn str(&mut self, s: &str) {
         self.u32(s.len());
-        self.0.extend_from_slice(s.as_bytes());
+        self.bytes(s.as_bytes());
     }
     fn ctx(&mut self, c: &Ctx) {
         self.str(&c.room);
@@ -195,7 +212,7 @@ impl Out {
             }
             CVal::Int(n) => {
                 self.u8(V_INT);
-                self.0.extend_from_slice(&n.to_le_bytes());
+                self.bytes(&n.to_le_bytes());
             }
             CVal::Arr(a) => {
                 self.u8(V_ARR);
@@ -219,11 +236,11 @@ impl Out {
     }
     /// The whole frame: the byte count, then the body.
     fn finish(self) -> Result<Vec<u8>, WireError> {
-        let body = self.0.len() - 4;
+        let body = self.total - 4;
         if body == 0 || body > MAX_FRAME {
             return Err(WireError::BadSize(body));
         }
-        let mut b = self.0;
+        let mut b = self.b;
         b[..4].copy_from_slice(&(body as u32).to_le_bytes());
         Ok(b)
     }
@@ -231,7 +248,7 @@ impl Out {
 
 fn out() -> Out {
     // Room for the byte count, filled in by `finish`.
-    Out(vec![0; 4])
+    Out { b: vec![0; 4], total: 4 }
 }
 
 /// A request as a whole frame, the byte count included.

@@ -304,7 +304,9 @@ fn a_worker_that_cannot_start_over_after_a_panic_ends() {
 
 #[test]
 fn a_result_too_big_for_a_frame_is_dirty_not_a_dead_worker() {
-    let got = run(&mut Stub::new(), &[cold_of("huge", 1), cold_of("a", 2)]);
+    let mut f = Stub::new();
+    let got = run(&mut f, &[cold_of("huge", 1), cold_of("a", 2)]);
+    assert_eq!(f.forgotten, vec!["huge"], "and the table is dropped: Dirty means no context is held");
     match &got[0] {
         Resp::Dirty { version: 1, reason, .. } => assert!(reason.contains("too big for a frame"), "{reason}"),
         other => panic!("{other:?}"),
@@ -359,6 +361,28 @@ fn the_worker_argument_is_the_second_word_of_the_command() {
     // The test harness is started with other words, so it is not a worker.
     assert!(!is_worker_invocation());
     assert_eq!(WORKER_ARG, "--fold-worker");
+}
+
+#[test]
+fn what_was_given_for_a_table_the_engine_let_go_is_let_go_too() {
+    let all = cases();
+    let c = &all[0];
+    let mut f = engine_for(c);
+    for n in 0..FOLD_TABLES + 9 {
+        let mut ctx = c.ctx.clone();
+        ctx.t = format!("table-{n}");
+        let r = f.cold(&Cold { ctx, version: n as u64, base: c.cp.clone(), houses: c.houses.clone(), pins: c.pins.clone(), records: vec![] });
+        assert!(r.is_ok());
+        assert!(f.given.len() <= FOLD_TABLES, "{} remembered after {} tables", f.given.len(), n + 1);
+    }
+    assert_eq!(f.given.len(), FOLD_TABLES);
+    // And a table that failed to open, having put another out, is not remembered either.
+    let mut bad = c.ctx.clone();
+    bad.t = "bad".into();
+    bad.inc = "z-not-an-incarnation".into();
+    let _ = f.cold(&Cold { ctx: bad.clone(), version: 1, base: None, houses: vec![], pins: vec![], records: vec![] });
+    assert!(f.given.len() <= FOLD_TABLES);
+    assert!(!f.given.contains_key(&key(&bad)) || f.engine.is_open(&bad));
 }
 
 #[test]

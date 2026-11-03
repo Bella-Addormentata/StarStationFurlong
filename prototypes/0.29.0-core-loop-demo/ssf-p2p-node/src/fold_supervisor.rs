@@ -20,7 +20,10 @@
 //! started at all (the file gone) fails the same way.
 //!
 //! The worker starts when the first frame is posted, not with the node: a node
-//! with no computed table never has one.
+//! with no computed table never has one. Starting the process is the one step
+//! `post` takes itself and waits for (a spawn of the node's own, already loaded
+//! file: a few milliseconds, once for each start); killing a worker is only a
+//! signal, and reaping it happens on a thread of its own.
 //!
 //! All time comes in as an argument (`now`), so the rules are tested in
 //! virtual time.
@@ -52,6 +55,14 @@ pub const CRASH_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Bytes of frames that may wait for the worker to read them; a frame is refused
 /// ([`Post::Busy`]) past that, unless nothing waits (so one big frame always goes).
 pub const QUEUE_BYTES: usize = 16 << 20;
+/// Answers the worker may owe at once; a frame is refused ([`Post::Busy`]) past that. With
+/// [`QUEUE_BYTES`] this bounds what a slow worker costs the node, and the answers it may send
+/// ahead of the node's reading them.
+pub const MAX_OWED: usize = 256;
+/// How long a worker's process may be gone before the supervisor stops waiting for its output
+/// to say so: the reader thread sees the pipe end the moment the process does, and what the
+/// worker wrote first reaches the node ahead of that, so this is only a backstop.
+pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 // ── When to start again ─────────────────────────────────────────────────────
 
@@ -115,6 +126,9 @@ pub struct Link {
     rx: Receiver<Incoming>,
     /// Bytes handed to the writer thread and not yet written.
     queued: Arc<AtomicUsize>,
+    /// Answers the worker owes: counted up before a frame that wants one is handed over, down
+    /// as each answer is read. An answer past that is nobody's, and ends the link.
+    unanswered: Arc<AtomicUsize>,
     kill: Box<dyn FnMut() + Send>,
     exited: Box<dyn FnMut() -> bool + Send>,
 }
@@ -126,6 +140,8 @@ impl Link {
         let (tx, frames) = channel::<Vec<u8>>();
         let (tell, rx) = channel::<Incoming>();
         let queued = Arc::new(AtomicUsize::new(0));
+        let unanswered = Arc::new(AtomicUsize::new(0));
+        let reader_unanswered = unanswered.clone();
         let writer_queued = queued.clone();
         let writer_tell = tell.clone();
         thread::Builder::new()
@@ -147,6 +163,12 @@ impl Link {
             .spawn(move || loop {
                 let said = match read_frame(&mut from_worker) {
                     Ok(Some(body)) => match decode_resp(&body) {
+                        // A worker cannot queue answers in the node's memory faster than it was
+                        // asked: one it was not asked for ends the link.
+                        Ok(resp) if reader_unanswered.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_err() => {
+                            drop(resp);
+                            Incoming::Closed("the worker sent an answer nobody asked for".into())
+                        }
                         Ok(resp) => Incoming::Resp(resp),
                         Err(e) => Incoming::Closed(format!("the worker sent a frame that is not an answer: {e}")),
                     },
@@ -159,7 +181,7 @@ impl Link {
                 }
             })
             .expect("the fold reader thread starts");
-        Link { tx: Some(tx), rx, queued, kill, exited }
+        Link { tx: Some(tx), rx, queued, unanswered, kill, exited }
     }
 }
 
@@ -216,9 +238,16 @@ impl Launch for ChildLaunch {
             Box::new(move || {
                 if let Ok(mut c) = for_kill.lock() {
                     let _ = c.kill();
-                    // Reaped here, so a worker never lingers as a zombie.
-                    let _ = c.wait();
                 }
+                // Reaped off the node's tick: waiting for a process that will not die (stuck in
+                // the kernel) must not hold the reveal path. Its input is closed with the link, so a
+                // worker that outlives the kill leaves by itself when it next reads.
+                let reap = for_kill.clone();
+                let _ = thread::Builder::new().name("fold-reaper".into()).spawn(move || {
+                    if let Ok(mut c) = reap.lock() {
+                        let _ = c.wait();
+                    }
+                });
             }),
             Box::new(move || for_exit.lock().map(|mut c| !matches!(c.try_wait(), Ok(None))).unwrap_or(true)),
         ))
@@ -284,11 +313,13 @@ pub struct Supervisor<L: Launch> {
     failures: u64,
     /// Failures found while posting, said by the next poll.
     unsaid: Vec<Event>,
+    /// When the worker's process was first seen gone, while its output has not yet said so.
+    exit_seen: Option<Instant>,
 }
 
 impl<L: Launch> Supervisor<L> {
     pub fn new(launch: L, now: Instant) -> Supervisor<L> {
-        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new() }
+        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new(), exit_seen: None }
     }
 
     pub fn state(&self) -> State {
@@ -332,11 +363,19 @@ impl<L: Launch> Supervisor<L> {
             return Post::Down;
         }
         let link = self.link.as_ref().expect("a link after start");
+        let wants_answer = !matches!(req, Req::Forget { .. });
+        if wants_answer && self.owed.len() >= MAX_OWED {
+            return Post::Busy;
+        }
         let waiting = link.queued.load(Ordering::Relaxed);
         if waiting > 0 && waiting + frame.len() > QUEUE_BYTES {
             return Post::Busy;
         }
         link.queued.fetch_add(frame.len(), Ordering::Relaxed);
+        if wants_answer {
+            // Before the frame goes: an answer can be read before this thread runs again.
+            link.unanswered.fetch_add(1, Ordering::SeqCst);
+        }
         let sent = link.tx.as_ref().is_some_and(|tx| tx.send(frame).is_ok());
         if !sent {
             self.fail(now, "the worker's writer has ended".into());
@@ -383,11 +422,17 @@ impl<L: Launch> Supervisor<L> {
                 Err(_) => break,
             }
         }
-        // Answers first: a worker that said its last and then went is not blamed for what it said.
+        // A process that is gone closes its output, and the reader tells us in order, after
+        // every answer it wrote: that is how a failure is normally found. A process seen gone
+        // whose output has not yet said so (the reader is behind) is given a moment to, so what
+        // it wrote last is not thrown away with it.
         let gone = self.link.as_mut().is_some_and(|l| (l.exited)());
         if gone {
-            self.fail_into(now, "the worker exited".into(), &mut events);
-            return events;
+            let since = *self.exit_seen.get_or_insert(now);
+            if now.saturating_duration_since(since) >= EXIT_GRACE {
+                self.fail_into(now, "the worker exited".into(), &mut events);
+                return events;
+            }
         }
         if let Some(head) = self.owed.front() {
             // The wait counts from when the frame could first be read: not before
@@ -433,6 +478,7 @@ impl<L: Launch> Supervisor<L> {
     fn fail_into(&mut self, now: Instant, reason: String, events: &mut Vec<Event>) {
         // Dropping the link kills the worker and ends its threads.
         self.link = None;
+        self.exit_seen = None;
         self.owed.clear();
         let mut tables: Vec<Ctx> = self.held.drain().collect();
         tables.sort_by(|a, b| (&a.room, &a.t, &a.inc).cmp(&(&b.room, &b.t, &b.inc)));

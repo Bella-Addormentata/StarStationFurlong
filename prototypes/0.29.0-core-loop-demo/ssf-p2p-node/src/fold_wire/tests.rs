@@ -438,3 +438,28 @@ fn nothing_a_peer_sends_panics_the_decoder() {
     // Some mutations (a changed digit of a version, a changed letter) still decode; most do not.
     assert!(decoded < 20_000);
 }
+
+#[test]
+fn a_frame_being_refused_is_not_copied_past_the_limit() {
+    // Three 20 MiB strings in one request: the second passes the limit, and neither it nor the
+    // third is copied; the size it would have had is still told.
+    let chunk = "x".repeat(20 << 20);
+    let mut o = out();
+    o.u8(REQ_WARM);
+    for _ in 0..3 {
+        o.str(&chunk);
+    }
+    assert!(o.b.len() <= FRAME_CAP, "{} bytes held", o.b.len());
+    assert!(o.b.capacity() < 2 * FRAME_CAP, "and no more than a doubling was asked of the allocator");
+    assert_eq!(o.total, 4 + 1 + 3 * (4 + (20 << 20)));
+    assert!(matches!(o.finish(), Err(WireError::BadSize(n)) if n == 1 + 3 * (4 + (20 << 20))));
+    // A frame of exactly the limit is sent whole.
+    let mut o = out();
+    o.bytes(&vec![7u8; MAX_FRAME]);
+    assert_eq!(o.finish().unwrap().len(), 4 + MAX_FRAME);
+    // One byte more is not.
+    let mut o = out();
+    o.bytes(&vec![7u8; MAX_FRAME + 1]);
+    assert_eq!(o.b.len(), 4, "not even that byte's chunk is copied");
+    assert!(matches!(o.finish(), Err(WireError::BadSize(n)) if n == MAX_FRAME + 1));
+}

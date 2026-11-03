@@ -146,6 +146,40 @@ fn manual_link(gated: bool) -> (Link, Manual) {
     (link, Manual { requests, replies: Some(resp_tx), kills, gone })
 }
 
+/// A reader that waits for a flag before it reads anything.
+struct Slow {
+    inner: ChanReader,
+    go: Arc<AtomicBool>,
+}
+
+impl Read for Slow {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while !self.go.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.inner.read(out)
+    }
+}
+
+/// A worker whose output the node's reader thread does not read until the flag is set.
+fn manual_link_with_slow_reader() -> (Link, Manual, Arc<AtomicBool>) {
+    let (req_tx, req_rx) = channel::<Vec<u8>>();
+    let (resp_tx, resp_rx) = channel::<Vec<u8>>();
+    let kills = Arc::new(AtomicUsize::new(0));
+    let gone = Arc::new(AtomicBool::new(false));
+    let go = Arc::new(AtomicBool::new(false));
+    let (k, g) = (kills.clone(), gone.clone());
+    let link = Link::new(
+        Box::new(Free(req_tx)),
+        Box::new(Slow { inner: ChanReader::new(resp_rx), go: go.clone() }),
+        Box::new(move || {
+            k.fetch_add(1, Ordering::SeqCst);
+        }),
+        Box::new(move || g.load(Ordering::SeqCst)),
+    );
+    (link, Manual { requests: ChanReader::new(req_rx), replies: Some(resp_tx), kills, gone }, go)
+}
+
 /// Workers handed out one by one; a launch past the plan fails.
 struct Plan {
     next: VecDeque<io::Result<Link>>,
@@ -361,16 +395,41 @@ fn a_worker_that_hangs_up_is_a_crash_naming_every_table_it_held() {
 }
 
 #[test]
-fn a_process_that_is_gone_is_a_crash() {
+fn a_process_that_is_gone_is_a_crash_once_its_output_has_had_its_moment_to_say_so() {
     let t0 = Instant::now();
     let (mut s, m, _) = with_one_worker(t0);
     s.post(t0, &cold("a", 1));
     m.exit();
-    let got = s.poll(t0);
+    assert!(s.poll(t0).is_empty(), "seen gone; its output is given a moment");
+    assert!(s.poll(t0 + Duration::from_millis(1_999)).is_empty());
+    let got = s.poll(t0 + secs(2));
     let (why, tables, _) = crashed(&got[0]);
     assert!(why.contains("exited"), "{why}");
     assert_eq!(tables, &[ctx("a")]);
     assert_eq!(m.kills(), 1);
+}
+
+#[test]
+fn an_answer_written_before_the_process_went_is_taken_even_if_the_reader_is_behind() {
+    let t0 = Instant::now();
+    let (link, mut m, hold) = manual_link_with_slow_reader();
+    let (p, _) = plan(vec![Ok(link)]);
+    let mut s = Supervisor::new(p, t0);
+    s.post(t0, &cold("a", 1));
+    m.next_req();
+    // The worker answers and exits; the reader thread has not yet looked at the pipe.
+    m.reply(&result("a", 1));
+    m.exit();
+    m.hang_up();
+    assert!(s.poll(t0).is_empty());
+    assert!(s.poll(t0 + Duration::from_millis(500)).is_empty(), "gone, but not yet failed");
+    // Now the reader catches up: the answer first, then the pipe's end.
+    hold.store(true, Ordering::SeqCst);
+    let got = events(&mut s, t0 + Duration::from_millis(500), 2);
+    assert_eq!(got[0], Event::Answer(result("a", 1)));
+    let (why, tables, _) = crashed(&got[1]);
+    assert!(why.contains("closed"), "{why}");
+    assert_eq!(tables, &[ctx("a")]);
 }
 
 #[test]
@@ -460,7 +519,42 @@ fn an_answer_for_something_not_owed_in_that_place_is_a_failure() {
     s.post(t0, &Req::Forget { ctx: ctx("a") });
     m.next_req();
     m.reply(&result("a", 1));
-    assert_eq!(crashed(&events(&mut s, t0, 1)[0]).0, "the worker answered out of step");
+    assert_eq!(crashed(&events(&mut s, t0, 1)[0]).0, "the worker sent an answer nobody asked for");
+}
+
+#[test]
+fn a_flood_of_answers_is_stopped_at_the_reader_not_queued_in_the_node() {
+    let t0 = Instant::now();
+    let (mut s, mut m, _) = with_one_worker(t0);
+    s.post(t0, &cold("a", 1));
+    m.next_req();
+    // One answer was asked for; the worker sends a thousand.
+    for _ in 0..1_000 {
+        // The node's reader stops reading at the second, so later sends may find nobody there.
+        let _ = m.replies.as_ref().unwrap().send(encode_resp(&result("a", 1)).unwrap());
+    }
+    let got = events(&mut s, t0, 2);
+    assert_eq!(got[0], Event::Answer(result("a", 1)));
+    assert_eq!(crashed(&got[1]).0, "the worker sent an answer nobody asked for");
+    assert_eq!(m.kills(), 1);
+    assert!(s.poll(t0).is_empty(), "the rest were never read into the node");
+}
+
+#[test]
+fn too_many_frames_waiting_for_answers_is_busy() {
+    let t0 = Instant::now();
+    let (mut s, mut m, _) = with_one_worker(t0);
+    for i in 0..MAX_OWED {
+        assert_eq!(s.post(t0, &warm("a", i as u64)), Post::Posted, "frame {i}");
+    }
+    assert_eq!(s.owed(), MAX_OWED);
+    assert_eq!(s.post(t0, &warm("a", 9_999)), Post::Busy);
+    assert_eq!(s.post(t0, &Req::Forget { ctx: ctx("a") }), Post::Posted, "a Forget wants no answer, so it is not held back");
+    // The worker answers one: room for one more.
+    m.next_req();
+    m.reply(&result("a", 0));
+    assert_eq!(events(&mut s, t0, 1), vec![Event::Answer(result("a", 0))]);
+    assert_eq!(s.post(t0, &warm("a", 10_000)), Post::Posted);
 }
 
 #[test]

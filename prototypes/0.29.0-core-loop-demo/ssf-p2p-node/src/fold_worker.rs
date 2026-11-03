@@ -89,6 +89,13 @@ impl EngineFolder {
         self.given.remove(&key(ctx));
         e.to_string()
     }
+
+    /// Forget what was given for tables the engine no longer holds: it lets the least recently
+    /// used go to make room, and says nothing.
+    fn prune(&mut self) {
+        let engine = &self.engine;
+        self.given.retain(|k, _| engine.is_open(&Ctx { room: k.0.clone(), t: k.1.clone(), inc: k.2.clone() }));
+    }
 }
 
 impl Folder for EngineFolder {
@@ -98,13 +105,16 @@ impl Folder for EngineFolder {
             e.reset(&c.ctx, &c.records)?;
             e.result_text(&c.ctx)
         };
-        match run(&mut self.engine) {
+        let done = match run(&mut self.engine) {
             Ok(text) => {
                 self.given.insert(key(&c.ctx), (c.houses.clone(), c.pins.clone()));
                 Ok(text)
             }
             Err(e) => Err(self.fail(&c.ctx, e)),
-        }
+        };
+        // Opening a table may have put another out, whether or not this one folded.
+        self.prune();
+        done
     }
 
     fn warm(&mut self, w: &Warm) -> Result<String, String> {
@@ -201,11 +211,16 @@ pub fn serve<R: Read, W: Write, F: Folder>(r: &mut R, w: &mut W, f: &mut F) -> i
         if let Some(resp) = answer(f, req)? {
             let frame = match encode_resp(&resp) {
                 Ok(frame) => frame,
-                // A result past what a frame holds: the table is dirty, and the
-                // node asks again from scratch (or gives up on the table).
+                // A result past what a frame holds: the table is dirty, so it is dropped here
+                // too (Dirty means no context is held until a new Cold), and the node asks
+                // again from scratch, or gives up on the table.
                 Err(WireError::BadSize(n)) => {
+                    let ctx = resp.ctx().clone();
+                    if let Err(p) = catch_unwind(AssertUnwindSafe(|| f.forget(&ctx))) {
+                        panic_recovery(f, panic_text(p))?;
+                    }
                     let reason = format!("result of {n} bytes is too big for a frame");
-                    encode_resp(&Resp::Dirty { ctx: resp.ctx().clone(), version: resp.version(), reason })?
+                    encode_resp(&Resp::Dirty { ctx, version: resp.version(), reason })?
                 }
                 Err(e) => return Err(e.into()),
             };
