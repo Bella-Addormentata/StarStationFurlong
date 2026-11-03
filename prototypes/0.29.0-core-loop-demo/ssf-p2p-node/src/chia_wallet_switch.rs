@@ -316,24 +316,31 @@ pub const STILL_ON_WORDS: &str =
 
 /// The line the node prints once the Bank's TURN OFF is saved
 /// ([`remember_off`]), while Chia is off on this computer (`strict`) or not,
-/// with `SSF_CHIA_LANE` read as `env`. Off is cold: a wallet loaded this run
-/// stays on until the node stops; while Chia is off none is loaded. Whether
-/// the wallet comes back at the next start without `SSF_NO_CHIA_LANE` is
-/// [`starts_on`] with the switch off, and `SSF_CHIA_LANE=1` turns it on
-/// there whatever the switch says ([`STILL_ON_WORDS`]). Without Chia off,
-/// `SSF_CHIA_LANE=1` refuses the turn before this ([`turn_refusal`]); its
-/// line is here so that every pair says what that start does.
+/// with `SSF_CHIA_LANE` read as `env`, and `loaded` whether a wallet is
+/// loaded this run. Off is cold: a wallet loaded this run stays on until the
+/// node stops; while Chia is off none is loaded, nor while the turn never
+/// brought one on this run (`SSF_CHIA_LANE` holding it off, or the Bank's
+/// switch off at the start). Whether the wallet comes on at the next start
+/// without `SSF_NO_CHIA_LANE` is [`starts_on`] with the switch off, and
+/// `SSF_CHIA_LANE=1` turns it on there whatever the switch says
+/// ([`STILL_ON_WORDS`]). Without Chia off, `SSF_CHIA_LANE=1` refuses the turn
+/// before this ([`turn_refusal`]); its line is here so that every case says
+/// what that start does.
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))]
-pub fn turned_off_line(strict: bool, env: EnvSwitch) -> String {
-    match (strict, env) {
-        (true, EnvSwitch::On) => format!(
-            "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on; the Bank's switch is off, but {STILL_ON_WORDS}"
-        ),
-        (true, _) => "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start".to_string(),
-        (false, EnvSwitch::On) => {
-            format!("🏦 SSF wallet: turned off in the Bank — it stays on until the node stops; the Bank's switch is off, but {STILL_ON_WORDS}")
-        }
-        (false, _) => "🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start".to_string(),
+pub fn turned_off_line(strict: bool, env: EnvSwitch, loaded: bool) -> String {
+    let now = if strict {
+        "Chia is off on this computer, so it is not on"
+    } else if loaded {
+        "it stays on until the node stops"
+    } else {
+        "it is not on"
+    };
+    if starts_on(true, false, env, false) {
+        format!("🏦 SSF wallet: turned off in the Bank — {now}; the Bank's switch is off, but {STILL_ON_WORDS}")
+    } else if loaded {
+        format!("🏦 SSF wallet: turned off in the Bank — {now} and does not come back at the next start")
+    } else {
+        format!("🏦 SSF wallet: turned off in the Bank — {now}, and it does not come back at the next start")
     }
 }
 
@@ -1272,34 +1279,48 @@ mod tests {
 
     /// The line a TURN OFF prints (#372 review, round 4) says what the next
     /// start without `SSF_NO_CHIA_LANE` does, as [`starts_on`] decides it
-    /// with the switch off and `SSF_CHIA_LANE` as this run read it, for
-    /// every pair of Chia off and the environment: it never promises an off
-    /// that start ignores. While Chia is off it says the wallet is not on;
-    /// otherwise, that it stays on until the node stops. Only Chia off with
-    /// `SSF_CHIA_LANE=1` changed its words; Chia on with `SSF_CHIA_LANE=1`
-    /// refuses the turn, so its line is never printed.
+    /// with the switch off and `SSF_CHIA_LANE` as this run read it, and what
+    /// the wallet is now, for every case of Chia off, the environment and a
+    /// wallet loaded or not: it never promises an off that start ignores,
+    /// nor a wallet on that is not. While Chia is off it says the wallet is
+    /// not on; otherwise, that it stays on until the node stops only when one
+    /// is loaded. Chia on with `SSF_CHIA_LANE=1` refuses the turn, so its
+    /// line is never printed.
     #[test]
     fn the_turn_off_line_says_what_the_next_start_does() {
         use EnvSwitch::*;
         for strict in [false, true] {
             for env in [Unset, On, Off] {
-                let line = turned_off_line(strict, env);
-                let back = starts_on(true, false, env, false);
-                assert_eq!(line.contains("does not come back at the next start"), !back, "strict {strict}, {env:?}: {line}");
-                assert_eq!(line.contains(STILL_ON_WORDS), back, "strict {strict}, {env:?}: {line}");
-                assert_eq!(line.contains("Chia is off on this computer, so it is not on"), strict, "{line}");
-                assert_eq!(line.contains("it stays on until the node stops"), !strict, "{line}");
-                assert!(!starts_on(true, true, env, false), "a start that keeps SSF_NO_CHIA_LANE never loads it");
+                for loaded in [false, true] {
+                    let line = turned_off_line(strict, env, loaded);
+                    let back = starts_on(true, false, env, false);
+                    let case = format!("strict {strict}, {env:?}, loaded {loaded}: {line}");
+                    assert_eq!(line.contains("does not come back at the next start"), !back, "{case}");
+                    assert_eq!(line.contains(STILL_ON_WORDS), back, "{case}");
+                    assert_eq!(line.contains("Chia is off on this computer, so it is not on"), strict, "{case}");
+                    assert_eq!(line.contains("it stays on until the node stops"), !strict && loaded, "{case}");
+                    assert_eq!(line.contains("— it is not on"), !strict && !loaded, "{case}");
+                    assert!(!starts_on(true, true, env, false), "a start that keeps SSF_NO_CHIA_LANE never loads it");
+                }
             }
         }
         let plain = "🏦 SSF wallet: turned off in the Bank — it stays on until the node stops and does not come back at the next start";
         let chia_off = "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on, and it does not come back at the next start";
-        assert_eq!(turned_off_line(false, Unset), plain);
-        assert_eq!(turned_off_line(false, Off), plain);
-        assert_eq!(turned_off_line(true, Unset), chia_off);
-        assert_eq!(turned_off_line(true, Off), chia_off);
+        assert_eq!(turned_off_line(false, Unset, true), plain);
         assert_eq!(
-            turned_off_line(true, On),
+            turned_off_line(false, Off, false),
+            "🏦 SSF wallet: turned off in the Bank — it is not on, and it does not come back at the next start",
+            "SSF_CHIA_LANE=0 loads no wallet, so none stays on"
+        );
+        assert_eq!(
+            turned_off_line(false, Unset, false),
+            "🏦 SSF wallet: turned off in the Bank — it is not on, and it does not come back at the next start",
+            "a wallet the switch kept off at the start is not on"
+        );
+        assert_eq!(turned_off_line(true, Unset, false), chia_off);
+        assert_eq!(turned_off_line(true, Off, false), chia_off);
+        assert_eq!(
+            turned_off_line(true, On, false),
             "🏦 SSF wallet: turned off in the Bank — Chia is off on this computer, so it is not on; the Bank's switch is off, but SSF_CHIA_LANE=1 in the node's environment still turns the wallet on at a start without SSF_NO_CHIA_LANE"
         );
         assert_eq!(turn_refusal(true, true, On, false), None, "the TURN OFF that line answers is taken");

@@ -6516,8 +6516,10 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         *hub.wallet_switch.lock().unwrap() = chia_wallet_switch::SwitchMemo { remembered: false, error: None };
         // The words follow starts_on at the next start without
         // SSF_NO_CHIA_LANE: SSF_CHIA_LANE=1 turns the wallet on there
-        // whatever the switch says.
-        println!("{}", chia_wallet_switch::turned_off_line(strict, env));
+        // whatever the switch says. A wallet stays on until the node stops
+        // only where one is loaded.
+        let loaded = hub.chia_wallet.lock().unwrap().is_some();
+        println!("{}", chia_wallet_switch::turned_off_line(strict, env, loaded));
         return Ok(());
     }
     let loaded = hub.chia_wallet.lock().unwrap().is_some();
