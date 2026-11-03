@@ -172,6 +172,79 @@ fn a_session_replaced_folds_as_a_new_one() {
     assert_eq!(e2.result_text(&a.ctx).unwrap(), e3.result_text(&a.ctx).unwrap());
 }
 
+/// The cases that share a table (room, id and incarnation), so a session of one can be folded as another's.
+fn same_table(a: &Case, b: &Case) -> bool {
+    a.ctx == b.ctx
+}
+
+#[test]
+fn a_checkpoint_replaced_or_removed_clears_the_session_and_folds_as_a_fresh_table() {
+    let all = cases();
+    let (mut changed, mut kept, mut to_cp, mut to_none) = (0, 0, 0, 0);
+    for (i, src) in all.iter().enumerate() {
+        for (j, dst) in all.iter().enumerate() {
+            if i == j || !same_table(src, dst) {
+                continue;
+            }
+            // The engine holds src's table, populated and folded.
+            let mut e = FoldEngine::new(check_for(dst)).unwrap();
+            e.open(&src.ctx, src.cp.as_ref(), &src.houses).unwrap();
+            e.reset(&src.ctx, &src.records).unwrap();
+            let before = e.result(&src.ctx).unwrap();
+            assert!(!e.slots[&key_of(&src.ctx)].cold, "{} → {}: folded", src.name, dst.name);
+            // The checkpoint changes (or goes): the fold drops the old session; the same checkpoint again is no change.
+            e.set_base(&src.ctx, dst.cp.as_ref()).unwrap_or_else(|err| panic!("{} → {}: set_base: {err}", src.name, dst.name));
+            assert!(e.slots[&key_of(&src.ctx)].cold, "{} → {}: cold again", src.name, dst.name);
+            let after = e.result(&src.ctx).unwrap();
+            if src.cp == dst.cp {
+                assert_eq!((after.records, after.rounds.len()), (before.records, before.rounds.len()), "{} → {}: same base, same session", src.name, dst.name);
+                kept += 1;
+            } else {
+                assert_eq!((after.records, after.rounds.len()), (0, 0), "{} → {}: the old session is gone", src.name, dst.name);
+                changed += 1;
+            }
+            // And what is loaded after it folds as a fresh engine folds it.
+            e.reset(&src.ctx, &dst.records).unwrap();
+            assert_eq!(e.result_text(&src.ctx).unwrap(), dst.summary, "{} → {}: summary", src.name, dst.name);
+            assert_eq!(sha_hex(&e.digest(&src.ctx).unwrap()), dst.digest, "{} → {}: digest", src.name, dst.name);
+            if dst.cp.is_some() { to_cp += 1 } else { to_none += 1 }
+        }
+    }
+    assert!(changed >= 20 && kept >= 10 && to_cp > 0 && to_none > 0, "{changed} changed, {kept} kept, {to_cp} to a checkpoint, {to_none} to none");
+}
+
+#[test]
+fn a_house_key_removed_and_restored_is_decided_as_a_fresh_engine_decides() {
+    let all = cases();
+    let fresh = |c: &Case, houses: &[String]| -> String {
+        let mut e = FoldEngine::new(check_for(c)).unwrap();
+        e.open(&c.ctx, c.cp.as_ref(), houses).unwrap();
+        e.reset(&c.ctx, &c.records).unwrap();
+        e.result_text(&c.ctx).unwrap()
+    };
+    let mut changed = 0;
+    for c in &all {
+        let mut e = FoldEngine::new(check_for(c)).unwrap();
+        open(&mut e, c);
+        e.reset(&c.ctx, &c.records).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}", c.name);
+        // The house goes: what its reveals decided is undecided, as a fresh fold without the key sees it.
+        e.set_houses(&c.ctx, &[]).unwrap_or_else(|err| panic!("{}: set_houses: {err}", c.name));
+        let without = e.result_text(&c.ctx).unwrap();
+        assert_eq!(without, fresh(c, &[]), "{}: without the house", c.name);
+        if without != c.summary {
+            changed += 1;
+        }
+        // And it comes back: the first answer again.
+        e.set_houses(&c.ctx, &c.houses).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), c.summary, "{}: the house restored", c.name);
+        // Another key is no house.
+        e.set_houses(&c.ctx, &["not-a-house-key".to_string()]).unwrap();
+        assert_eq!(e.result_text(&c.ctx).unwrap(), fresh(c, &["not-a-house-key".to_string()]), "{}: another key", c.name);
+    }
+    assert!(changed >= 2, "only {changed} sessions depend on the house: the test has no teeth");
+}
+
 #[test]
 fn rule_ids_agree_with_the_bundle() {
     let ctx = ctx_n(0);
