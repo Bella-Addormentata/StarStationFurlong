@@ -148,7 +148,7 @@ use futures_util::future::join_all;
 use rand::seq::SliceRandom;
 
 use crate::chia_chain::{ChainAccess, ChainError, CoinListing, CoinRecord, PuzzleAndSolution};
-use crate::chia_peer::{canonical, group_of, Group, Network, Peak, PeerConn, Source, Sources, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
+use crate::chia_peer::{canonical, group_of, Group, Network, Peak, PeerConn, Readers, Source, Sources, CONNECT_TIMEOUT, PEAK_STALE, PEAK_WAIT};
 
 /// Known-good public peers, kept across runs (beside the node's other files).
 pub const STORE_FILE: &str = "chia_peers.json";
@@ -261,7 +261,36 @@ pub struct Lane {
     /// time: two requests short of a peer do not dial the same addresses
     /// twice, and the second chooses from what the first brought in.
     discovery: tokio::sync::Mutex<()>,
+    /// ⛓️ Chia is off on this computer (chia_strict.rs): every request is
+    /// refused before it dials, resolves or reads anything ([`Lane::closed`],
+    /// [`Lane::close`]). Never cleared: a lane once closed stays closed. A
+    /// watch, so the network work under way ([`Lane::while_open`],
+    /// [`Lane::dial_batch`]) learns of the close the moment it happens, and
+    /// so does every reader of the lane's connections ([`Lane::readers`]).
+    closed: tokio::sync::watch::Sender<bool>,
+    /// Every reader the lane's dials start, counted from just before it
+    /// starts until its half of the socket is gone, each stopping at the
+    /// close signal by itself, whoever holds its connection ([`Readers`]):
+    /// [`Lane::close`] waits for none to be left.
+    readers: Readers,
+    /// Held for reading by each name lookup and gossip request under way
+    /// ([`Lane::while_open`]), and by each dial batch from its first dial to
+    /// the end of its admission ([`Lane::dial_batch`]): one guard each, never
+    /// one inside another, since tokio's lock is write-preferring and a
+    /// second read guard asked for while [`Lane::close`] waits for the write
+    /// side would never come. close() takes it for writing, so it returns
+    /// only once none is left running.
+    in_flight: tokio::sync::RwLock<()>,
+    /// Every dial's outcome as it comes (tests).
+    #[cfg(test)]
+    dialled: tokio::sync::watch::Sender<Vec<Dialled>>,
 }
+
+/// One dial's outcome as [`Lane::dialled`] records it (tests): the address,
+/// and the connection by a weak handle, so the record keeps none of them
+/// open, or why the dial failed.
+#[cfg(test)]
+type Dialled = (SocketAddr, Result<std::sync::Weak<PeerConn>, String>);
 
 #[derive(Default)]
 struct LaneState {
@@ -281,6 +310,12 @@ struct LaneState {
     /// Connections asked for gossip: `None`, it answered (not asked again);
     /// `Some(at)`, the request failed (asked again after `at`).
     gossiped: HashMap<SocketAddr, Option<Instant>>,
+    /// How many closes are under way off the lock ([`close_later`]): of
+    /// connections let go, and of those the pool held when the lane closed.
+    /// [`Lane::close`] waits for none to be left, so every call waits for
+    /// them all, one made while another runs or after one was cancelled
+    /// included.
+    closing: tokio::sync::watch::Sender<usize>,
     /// Why the last agreed choice found no pair in step, when it found pairs
     /// at all ([`Lane::choose_in_step`]): the request's final error says so.
     out_of_step: Option<String>,
@@ -359,6 +394,8 @@ impl Lane {
 
     pub fn new(net: Network, pins: Vec<String>, pin_only: bool, store_path: Option<PathBuf>) -> Self {
         let pin_only = pin_only && !pins.is_empty();
+        let closed = tokio::sync::watch::Sender::new(false);
+        let readers = Readers::new(closed.subscribe());
         Self {
             net,
             pins,
@@ -367,7 +404,119 @@ impl Lane {
             tls: tokio::sync::OnceCell::new(),
             state: tokio::sync::Mutex::new(LaneState::default()),
             discovery: tokio::sync::Mutex::new(()),
+            closed,
+            readers,
+            in_flight: tokio::sync::RwLock::new(()),
+            #[cfg(test)]
+            dialled: tokio::sync::watch::Sender::new(Vec::new()),
         }
+    }
+
+    /// ⛓️ The lane while Chia is off on this computer (`SSF_NO_CHIA_LANE`,
+    /// chia_strict.rs): closed from the start, with no pins and no store
+    /// path, so it never resolves a pin, never reads or writes
+    /// `chia_peers.json`, and refuses every request before it does anything
+    /// else ([`Self::peers_for`]).
+    pub fn closed(net: Network) -> Self {
+        let lane = Self::new(net, vec![], false, None);
+        lane.closed.send_replace(true);
+        lane
+    }
+
+    /// Whether Chia is off for this lane ([`Self::closed`], [`Self::close`]).
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// The peer store this lane reads and writes, if any (tests).
+    #[cfg(test)]
+    pub fn store_path(&self) -> Option<&Path> {
+        self.store_path.as_deref()
+    }
+
+    /// How many pins this lane holds (tests).
+    #[cfg(test)]
+    pub fn pin_count(&self) -> usize {
+        self.pins.len()
+    }
+
+    /// Close the lane while it runs, for Chia turned off at once. Once this
+    /// returns, no connection the lane dialled is open, and no dial, name
+    /// lookup or gossip request of the lane's is running:
+    ///   - every request is refused as on a [`Self::closed`] lane, one that
+    ///     was waiting for the pool when the lane closed included: it is
+    ///     refused once it has the pool, before it takes a connection
+    ///     ([`Self::choose_now`], [`Self::stand_in`]);
+    ///   - every connection the lane dialled is closed or dropped, its
+    ///     reader gone: those the pool held and those let go before, each
+    ///     closed off the lock in a task of its own that is waited for
+    ///     ([`close_later`], [`PeerConn::close`]); those a dial batch had
+    ///     reached, closed as the batch is taken in and waited for before
+    ///     the batch ends ([`Self::dial_batch`]); and those of a batch
+    ///     dropped before it ended (its caller gave up on it), dropped with
+    ///     it, never taken in. Whoever holds a connection, its reader stops
+    ///     at the close by itself, or was aborted with the connection, and
+    ///     this waits until every reader the lane started is gone, each at
+    ///     its task's next turn, its half of the socket first ([`Readers`]).
+    ///     Each connection reads dead, so no frame is written to one, apart
+    ///     from one a request was already writing when the lane closed, and
+    ///     a request waiting on one, for its sink or for an answer, is told
+    ///     it closed (a websocket close is given up after
+    ///     [`crate::chia_peer::CLOSE_TIMEOUT`] on a peer that stopped
+    ///     reading). Its socket goes with the last handle on it, at once
+    ///     unless a request still holds one; nothing queued is dialled;
+    ///   - no dial, name lookup or gossip request of the lane's is running:
+    ///     each one out has been abandoned ([`Self::while_open`],
+    ///     [`Self::dial_batch`]). A dial abandoned sends nothing more, neither
+    ///     its Chia handshake nor its binding header request: its socket is
+    ///     dropped, its reader, if it had one yet, stopped and waited for
+    ///     first ([`PeerConn::connect_until`]). A name the system resolver was
+    ///     already looking up may still be looked up there, its answer unread.
+    ///
+    /// A discovery under way asks nothing more, queues nothing it learnt,
+    /// and the peer store is not written again. A dial still waiting for the
+    /// lane's first certificate is not waited for, and does not leave once
+    /// the certificate is there ([`Self::dial_batch`]). Every call gives the
+    /// same promise: one made while another closes the lane, or after one
+    /// was cancelled, returns only once the closes the first started have
+    /// ended, since they run as tasks of their own that no caller holds, and
+    /// are counted until they end ([`LaneState::closing`]), and once every
+    /// reader is gone, counted the same way ([`Readers`]). It is for the
+    /// in-game Chia switch, which is not wired yet (PR 4 of stage 4); the env
+    /// switch builds the lane closed instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn close(&self) {
+        // The flag first: a request that has the pool next is refused there,
+        // and the network work under way is abandoned.
+        self.closed.send_replace(true);
+        let mut closing = {
+            let mut state = self.state.lock().await;
+            state.candidates.clear();
+            state.gossiped.clear();
+            let held: Vec<Arc<PeerConn>> = state.conns.drain(..).collect();
+            for peer in held {
+                close_later(&mut state, peer);
+            }
+            state.closing.subscribe()
+        };
+        // Off the pool lock, which a dial batch holding its guard may still
+        // need to take its connections in. Every dial batch, lookup and
+        // gossip request under way holds the read side until it has ended,
+        // and each ends at the close signal, a batch once the connections it
+        // reached are closed: the write side is had once none is left. One
+        // that starts later sees the flag.
+        drop(self.in_flight.write().await);
+        // Then every close off the lock, the pool's included, each bounded
+        // (CLOSE_TIMEOUT): none is left once the count is back to zero, its
+        // handle on the connection gone first ([`Closing`]).
+        let _ = closing.wait_for(|under_way| *under_way == 0).await;
+        // Last, every reader the lane started, whoever holds its connection,
+        // a request or nobody (a dial batch dropped before it took its
+        // connections in): each stopped at the flag by itself, or was
+        // aborted with its connection, and goes at its next turn, its half of
+        // the socket first ([`Readers`]). Neither the pool nor the in-flight
+        // guard is held here, and a reader takes neither.
+        self.readers.gone().await;
     }
 
     /// Seed addresses to try, each with its source (tests).
@@ -401,7 +550,13 @@ impl Lane {
 
     /// One line for the startup log.
     pub fn describe(&self) -> String {
-        if self.pins.is_empty() {
+        if self.is_closed() {
+            format!(
+                "off. {} (SSF_NO_CHIA_LANE): no {} full node is asked, and the peer store is neither read nor written",
+                crate::chia_strict::OFF_WORDS,
+                self.net.id
+            )
+        } else if self.pins.is_empty() {
             format!(
                 "{} full nodes via {} and peer gossip; money paths need two agreeing peers",
                 self.net.id,
@@ -455,11 +610,21 @@ impl Lane {
     /// one requester at a time, so two requests short of a peer do not dial
     /// the same addresses twice; the second chooses from what the first
     /// brought in.
+    ///
+    /// ⛓️ A closed lane refuses here, before anything else (chia_strict.rs):
+    /// every request reaches the network only through this, so no pin is
+    /// resolved, no store read, no introducer asked and no peer dialled. The
+    /// refusal is [`ChainError::Refused`], since no peer was asked: a fresh
+    /// push refused so spent nothing, and a spend already parked stays parked
+    /// (its lookups fail).
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
+        self.refuse_if_closed()?;
         let pinned = !self.pins.is_empty();
         // One pass more than there are dial rounds: the peers the LAST round
         // reached are judged like any other before the request gives up.
         for round in 0..=MAX_ROUNDS {
+            // Closed while this request was out discovering: no further round.
+            self.refuse_if_closed()?;
             // Pins are dialled BEFORE any public peer is accepted, and again
             // whenever their cooldown has passed while one is missing. A live
             // pin does not stand in for a down one: the missing pin may be the
@@ -510,6 +675,7 @@ impl Lane {
             }
         }
         let state = self.state.lock().await;
+        self.refuse_if_closed()?;
         let connected = state.conns.len();
         Err(unanswered(match (trust, state.out_of_step.as_deref()) {
             (Trust::Carrier, _) => "no full-node peer reachable".to_string(),
@@ -527,13 +693,52 @@ impl Lane {
         self.pins_short(&state) && state.pin_retry_after.is_none_or(|at| Instant::now() >= at)
     }
 
+    /// [`ChainError::Refused`] with [`crate::chia_strict::OFF_WORDS`] while
+    /// the lane is closed.
+    fn refuse_if_closed(&self) -> Result<(), ChainError> {
+        if self.is_closed() {
+            Err(ChainError::Refused(crate::chia_strict::OFF_WORDS.to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Run `work`, network work the lane starts (a name lookup, a gossip
+    /// request), unless the lane closes first: `None` when it is closed
+    /// already or closes meanwhile, `work` then dropped where it stands. The
+    /// read side of [`Lane::in_flight`] is held throughout and the flag read
+    /// under it, so [`Self::close`] either waits for this or this sees the
+    /// flag. Never called under another guard of it, nor from a dial batch,
+    /// which holds one of its own ([`Self::dial_batch`]).
+    async fn while_open<F: Future>(&self, work: F) -> Option<F::Output> {
+        let _running = self.in_flight.read().await;
+        tokio::select! {
+            biased;
+            () = self.closing() => None,
+            out = work => Some(out),
+        }
+    }
+
+    /// Ready once the lane is closed: at once on a lane closed already.
+    fn closing(&self) -> impl Future<Output = ()> + Send + '_ {
+        let mut closed = self.closed.subscribe();
+        async move {
+            let _ = closed.wait_for(|closed| *closed).await;
+        }
+    }
+
     /// A choice from the pool as it stands: dead connections reaped,
     /// outliers let go before an agreed verdict, then [`Self::choose_in_step`].
     /// `Err` when every pin is down on a money path (§14 (1): a pin that does
     /// not answer makes money paths non-final; it is never quietly replaced
-    /// by public peers), or when the pins stand out of step.
+    /// by public peers), or when the pins stand out of step, or the lane is
+    /// closed.
     async fn choose_now(&self, trust: Trust) -> Result<Option<Vec<Arc<PeerConn>>>, ChainError> {
         let mut guard = self.state.lock().await;
+        // Closed while this waited for the pool: close() sets the flag before
+        // it queues for the pool, so a request queued ahead of it has the
+        // pool first, and is refused here before it takes a connection.
+        self.refuse_if_closed()?;
         let state = &mut *guard;
         self.reap(state);
         if trust == Trust::Agreed {
@@ -643,17 +848,18 @@ impl Lane {
     /// for `after`, back in the queue for a later dial, closed off the lock.
     fn let_go(&self, state: &mut LaneState, peer: &Arc<PeerConn>, after: Duration, why: &str) {
         if !unpool(state, peer) {
-            close_later(peer.clone());
+            close_later(state, peer.clone());
             return;
         }
         eprintln!("⛓️ chain peers: {} ({}) let go: {why}", peer.addr(), peer.source().label());
         requeue(state, peer, after);
-        close_later(peer.clone());
+        close_later(state, peer.clone());
     }
 
     /// Connections that died on their own (the peer closed, the reader
-    /// failed) leave the pool and return to the queue, to be dialled again
-    /// after [`RECONNECT_AFTER`].
+    /// failed, a write failed) leave the pool and return to the queue, to be
+    /// dialled again after [`RECONNECT_AFTER`]. Each is closed too: one whose
+    /// write failed still has its reader.
     fn reap(&self, state: &mut LaneState) {
         let now = Instant::now();
         state.cooling.retain(|_, until| now < *until);
@@ -662,6 +868,7 @@ impl Lane {
         for peer in dead {
             state.gossiped.remove(&peer.addr());
             requeue(state, &peer, RECONNECT_AFTER);
+            close_later(state, peer);
         }
     }
 
@@ -699,12 +906,18 @@ impl Lane {
     /// for the bookkeeping between the network waits (resolving, dialling),
     /// never across one.
     async fn dial_pins(&self) {
+        if self.is_closed() {
+            return;
+        }
         // Outside pin-only mode one place is kept for the public peer the
         // agreement needs, however many addresses the pins resolve to.
         let pin_cap = if self.pin_only { MAX_CONNS } else { MAX_CONNS - 1 };
         let mut named: Vec<Vec<SocketAddr>> = Vec::with_capacity(self.pins.len());
         for pin in &self.pins {
-            named.push(resolve_pin(pin, self.net.port).await);
+            // Closed while the pins resolve: no further name is looked up,
+            // and the lookup out is abandoned.
+            let Some(addrs) = self.while_open(resolve_pin(pin, self.net.port)).await else { return };
+            named.push(addrs);
         }
         let mut targets: VecDeque<Candidate> = {
             let mut guard = self.state.lock().await;
@@ -750,6 +963,9 @@ impl Lane {
         // batch that fails is followed by the next, so a reachable address
         // listed behind unreachable ones is still reached in this call.
         loop {
+            if self.is_closed() {
+                return;
+            }
             let batch: Vec<Candidate> = {
                 let mut guard = self.state.lock().await;
                 let state = &mut *guard;
@@ -768,9 +984,7 @@ impl Lane {
                 }
                 batch
             };
-            let reached = self.connect_all(batch).await;
-            let mut guard = self.state.lock().await;
-            self.admit(&mut guard, reached, PIN_RETRY_AFTER);
+            self.dial_batch(batch, PIN_RETRY_AFTER).await;
         }
         // Still short (an address failed, or a pin did not resolve): the next
         // try waits for the cooldown, a live pin or not.
@@ -791,9 +1005,17 @@ impl Lane {
     /// gossip requests run with the pool unlocked; what they bring is merged
     /// in afterwards.
     async fn refill(&self, trust: Trust) {
+        if self.is_closed() {
+            return;
+        }
         let (introduce, unasked) = {
             let mut guard = self.state.lock().await;
             let state = &mut *guard;
+            // Closed while this waited for the pool: the store is not read and
+            // the emptied queue stays empty.
+            if self.is_closed() {
+                return;
+            }
             if !state.store_loaded {
                 state.store_loaded = true;
                 state.known = self.store_path.as_deref().map(load_store).unwrap_or_default();
@@ -843,7 +1065,11 @@ impl Lane {
         let found = if introduce {
             let mut found = Vec::new();
             for name in &self.net.introducers {
-                match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(format!("{name}:{}", self.net.port))).await {
+                // Closed meanwhile: no further introducer, and no peer, is
+                // asked, and the lookup out is abandoned.
+                let lookup = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(format!("{name}:{}", self.net.port)));
+                let Some(looked_up) = self.while_open(lookup).await else { return };
+                match looked_up {
                     Ok(Ok(addrs)) => found.extend(addrs),
                     Ok(Err(e)) => eprintln!("⛓️ chain peers: introducer {name}: {e}"),
                     Err(_) => eprintln!("⛓️ chain peers: introducer {name}: lookup timed out"),
@@ -857,7 +1083,10 @@ impl Lane {
         };
         let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<SocketAddr>>)> = Vec::with_capacity(unasked.len());
         for conn in unasked {
-            let answer = match conn.request::<RespondPeers, _>(RequestPeers::new()).await {
+            // Closed meanwhile: no further peer is asked, and the request out
+            // is abandoned.
+            let Some(answered) = self.while_open(conn.request::<RespondPeers, _>(RequestPeers::new())).await else { return };
+            let answer = match answered {
                 Ok(answer) => {
                     let mut addrs: Vec<SocketAddr> = answer
                         .peer_list
@@ -878,6 +1107,11 @@ impl Lane {
         }
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
+        // Closed while the answers came in: nothing they name is queued, and
+        // the introducer's next turn is left as it was.
+        if self.is_closed() {
+            return;
+        }
         if let Some(found) = found {
             let n = found.len();
             state.introduce_after = Some(Instant::now() + if n == 0 { INTRODUCE_RETRY } else { INTRODUCE_EVERY });
@@ -908,9 +1142,12 @@ impl Lane {
     /// dialable candidates are introducer peers the cap keeps out, lets one
     /// connected introducer peer go for the first of them
     /// ([`Self::rotation`]). `false` when there was nothing to dial.
-    /// The batch is chosen under the pool lock, dialled with it released
-    /// ([`Self::connect_all`]) and taken in under it again ([`Self::admit`]).
+    /// The batch is chosen under the pool lock, then dialled with it released
+    /// and taken in under it again ([`Self::dial_batch`]).
     async fn dial(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
         let batch: Vec<Candidate> = {
             let mut guard = self.state.lock().await;
             let state = &mut *guard;
@@ -1008,28 +1245,85 @@ impl Lane {
             }
             batch
         };
-        let reached = self.connect_all(batch).await;
-        let mut guard = self.state.lock().await;
-        self.admit(&mut guard, reached, RETRY_AFTER);
+        self.dial_batch(batch, RETRY_AFTER).await;
         true
     }
 
-    /// Dial a batch in parallel with the pool unlocked: each candidate with
-    /// its connection, or why it failed, for [`Self::admit`].
-    async fn connect_all(&self, batch: Vec<Candidate>) -> Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)> {
+    /// Dial a batch and take it in ([`Self::admit`]): one piece of network
+    /// work from its first dial to the end of its admission, under ONE read
+    /// guard of [`Lane::in_flight`], so [`Self::close`] returns only once
+    /// every connection the batch reached is in the pool (which close()
+    /// empties and closes) or closed here and waited for, unless the batch
+    /// is dropped first (below). Every dial the lane makes goes through here
+    /// (pins, [`Self::dial_pins`]; the queue, [`Self::dial`]); a closed lane
+    /// makes none. The guard is taken with neither the pool locked nor
+    /// another guard held, and nothing under it takes another: no lookup or
+    /// gossip request runs inside a batch, and no batch inside one. close()
+    /// lets the pool go before it waits for the write side, so a batch
+    /// holding its guard can still take the pool.
+    ///
+    /// A batch dropped before it ends (its caller gave up on it while it
+    /// waited for its dials, for the pool or for its closes) lets the guard
+    /// go with it, and drops every connection it held, never taken in.
+    /// Nothing here waits for those: the lane counts each reader from just
+    /// before it starts until its half of the socket is gone ([`Readers`]),
+    /// the reader of each dropped connection is aborted with it, and
+    /// close() waits for that count, so a dropped batch leaves no reader
+    /// past close() either.
+    ///
+    /// The lane's first certificate is waited for before the guard, so a
+    /// dial still waiting for it is not waited for by close(), and the flag
+    /// is read under the guard, so such a dial does not leave once the
+    /// certificate is there: close() either waits for this batch or this
+    /// sees the flag.
+    async fn dial_batch(&self, batch: Vec<Candidate>, cool_for: Duration) {
+        if batch.is_empty() || self.is_closed() {
+            return;
+        }
         let tls = match self.tls().await {
             Ok(tls) => tls,
             Err(e) => {
                 eprintln!("⛓️ chain peers: {e}");
-                return Vec::new();
+                return;
             }
         };
-        let net = self.net.clone();
+        let running = self.in_flight.read().await;
+        if self.is_closed() {
+            return;
+        }
+        let reached = self.connect_all(tls, batch).await;
+        let unpooled = {
+            let mut state = self.state.lock().await;
+            self.admit(&mut state, reached, cool_for)
+        };
+        // Off the pool lock, each bounded (CLOSE_TIMEOUT); the last handles
+        // on them go before the guard does.
+        join_all(unpooled.iter().map(|peer| peer.close())).await;
+        drop(unpooled);
+        drop(running);
+    }
+
+    /// The dials of a batch, in parallel with the pool unlocked: each
+    /// candidate with its connection, or why it failed. Only
+    /// [`Self::dial_batch`] calls this, under its guard, so no dial takes a
+    /// guard of its own: each is raced against the close signal alone, and
+    /// starts its reader in the lane's count ([`Readers`]). A
+    /// dial out when the lane closes is abandoned wherever it stands (TCP,
+    /// TLS, the websocket upgrade, the Chia handshake or the binding header
+    /// request), nothing of it left once its outcome is in
+    /// ([`PeerConn::connect_until`]), its outcome the off reason
+    /// ([`crate::chia_strict::OFF_WORDS`]).
+    async fn connect_all(&self, tls: Arc<rustls::ClientConfig>, batch: Vec<Candidate>) -> Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)> {
         let dials = batch.into_iter().map(|cand| {
             let tls = tls.clone();
-            let net = net.clone();
             async move {
-                let result = PeerConn::connect(cand.addr, cand.sources, &net, tls).await;
+                let result = PeerConn::connect_until(cand.addr, cand.sources, &self.net, tls, self.closing(), Some(&self.readers))
+                    .await
+                    .unwrap_or_else(|| Err(anyhow::Error::msg(crate::chia_strict::OFF_WORDS)));
+                #[cfg(test)]
+                self.dialled.send_modify(|dialled| {
+                    dialled.push((cand.addr, result.as_ref().map(Arc::downgrade).map_err(|e| format!("{e:#}"))));
+                });
                 (cand, result)
             }
         });
@@ -1046,8 +1340,16 @@ impl Lane {
     /// connection kept), and none past [`MAX_CONNS`] (the pool
     /// may have filled meanwhile); a failed address cools for `cool_for`,
     /// leaves the store and, unless it is a pin or has failed too often, waits
-    /// in the queue for another try ([`Self::aside`]).
-    fn admit(&self, state: &mut LaneState, reached: Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)>, cool_for: Duration) {
+    /// in the queue for another try ([`Self::aside`]). What it lets go of an
+    /// open lane is closed off the lock ([`close_later`]). A lane closed
+    /// while the batch was out keeps none of it: every connection the batch
+    /// reached is handed back, for [`Self::dial_batch`] to close and wait for
+    /// before its guard goes.
+    #[must_use]
+    fn admit(&self, state: &mut LaneState, reached: Vec<(Candidate, anyhow::Result<Arc<PeerConn>>)>, cool_for: Duration) -> Vec<Arc<PeerConn>> {
+        if self.is_closed() {
+            return reached.into_iter().filter_map(|(_, result)| result.ok()).collect();
+        }
         let now = Instant::now();
         for (cand, result) in reached {
             match result {
@@ -1056,7 +1358,7 @@ impl Lane {
                         // One connection per address, whoever dialled it twice;
                         // the sources that named this dial hold for the one kept.
                         push_candidates(state, cand.sources.iter().map(|s| Candidate::new(cand.addr, s)).collect());
-                        close_later(conn);
+                        close_later(state, conn);
                         continue;
                     }
                     if let Some(twin) = state.conns.iter().find(|c| c.identity() == conn.identity()).cloned() {
@@ -1068,7 +1370,7 @@ impl Lane {
                                 cand.addr
                             );
                             if unpool(state, &twin) {
-                                close_later(twin.clone());
+                                close_later(state, twin.clone());
                             }
                             self.aside(state, Candidate { addr: twin.addr(), sources: twin.sources(), failures: 0 }, now + cool_for);
                         } else {
@@ -1088,7 +1390,7 @@ impl Lane {
                             // no pair, for as long as the introducer stays unasked
                             // (#271 review, round 23).
                             push_candidates(state, cand.sources.iter().map(|s| Candidate::new(twin.addr(), s)).collect());
-                            close_later(conn);
+                            close_later(state, conn);
                             self.aside(state, cand, now + cool_for);
                             continue;
                         }
@@ -1097,7 +1399,7 @@ impl Lane {
                         eprintln!("⛓️ chain peers: {} ({}) connected", cand.addr, cand.source().label());
                         state.conns.push(conn);
                     } else {
-                        close_later(conn);
+                        close_later(state, conn);
                     }
                 }
                 Err(e) => {
@@ -1106,6 +1408,7 @@ impl Lane {
                 }
             }
         }
+        Vec::new()
     }
 
     /// A dial that came to nothing (the address failed, or reached a node
@@ -1168,8 +1471,13 @@ impl Lane {
         }
     }
 
+    /// Write the store; never once the lane is closed (a verdict that was in
+    /// flight when it closed remembers nothing).
     fn save_store(&self, state: &LaneState) {
         let Some(path) = self.store_path.as_deref() else { return };
+        if self.is_closed() {
+            return;
+        }
         let file = StoreFile { v: 1, peers: state.known.clone() };
         if let Err(e) = write_store(path, &file) {
             eprintln!("⛓️ chain peers: could not save {}: {e}", path.display());
@@ -1224,13 +1532,13 @@ impl Lane {
             if !unpool(&mut state, peer) {
                 // Gone from the pool already: a verdict on that connection says
                 // nothing about whoever holds its address now.
-                close_later(peer.clone());
+                close_later(&mut state, peer.clone());
                 continue;
             }
             eprintln!("⛓️ chain peers: {} ({}) let go: {why}", peer.addr(), peer.source().label());
             state.cooling.insert(peer.addr(), until);
             self.forget(&mut state, peer.addr());
-            close_later(peer.clone());
+            close_later(&mut state, peer.clone());
         }
     }
 
@@ -1242,15 +1550,27 @@ impl Lane {
         if unpool(&mut state, peer) {
             requeue(&mut state, peer, RECONNECT_AFTER);
         }
-        close_later(peer.clone());
+        close_later(&mut state, peer.clone());
     }
 
-    /// The connections still alive; one found dead here (the carrier looking
-    /// for a stand-in, say) returns to the queue like any dropped peer.
+    /// The connections still alive (tests); one found dead here returns to
+    /// the queue like any dropped peer.
+    #[cfg(test)]
     async fn live_conns(&self) -> Vec<Arc<PeerConn>> {
         let mut state = self.state.lock().await;
         self.reap(&mut state);
         state.conns.clone()
+    }
+
+    /// A live connection other than `first` for a carrier whose first peer
+    /// went silent; one found dead here returns to the queue like any
+    /// dropped peer. Refused once the lane is closed, checked with the pool
+    /// in hand as in [`Self::choose_now`].
+    async fn stand_in(&self, first: SocketAddr) -> Result<Option<Arc<PeerConn>>, ChainError> {
+        let mut state = self.state.lock().await;
+        self.refuse_if_closed()?;
+        self.reap(&mut state);
+        Ok(state.conns.iter().find(|c| c.addr() != first).cloned())
     }
 
     /// Run `op` on the peers `trust` names and judge the answers: the carrier
@@ -1293,8 +1613,7 @@ impl Lane {
                     Err(ChainError::Refused(why)) => return Err(ChainError::Refused(why)),
                     Err(ChainError::Unanswered(e)) => {
                         self.drop_conn(&first).await;
-                        let next = self.live_conns().await.into_iter().find(|c| c.addr() != first.addr());
-                        match next {
+                        match self.stand_in(first.addr()).await? {
                             Some(next) => {
                                 let v = op(next.clone()).await?;
                                 (next, v)
@@ -1829,9 +2148,41 @@ fn requeue(state: &mut LaneState, peer: &PeerConn, after: Duration) {
 }
 
 /// Close a connection off the lane's lock: the websocket close is bounded,
-/// but no caller waits on a peer that stopped reading.
-fn close_later(peer: Arc<PeerConn>) {
-    tokio::spawn(async move { peer.close().await });
+/// but no caller waits on a peer that stopped reading. The close is a task
+/// of its own, counted in [`LaneState::closing`] until it ends
+/// ([`Closing`]), so [`Lane::close`] waits for it, and no caller that gives
+/// up can stop it or lose it.
+fn close_later(state: &mut LaneState, peer: Arc<PeerConn>) {
+    tokio::spawn(Closing::start(&state.closing, peer).run());
+}
+
+/// One close off the lock ([`close_later`]), counted from its start until it
+/// is dropped, however its task ends: its handle on the connection goes
+/// first, then the count, so a [`Lane::close`] that finds none left finds no
+/// handle of theirs either.
+struct Closing {
+    peer: Option<Arc<PeerConn>>,
+    under_way: tokio::sync::watch::Sender<usize>,
+}
+
+impl Closing {
+    fn start(under_way: &tokio::sync::watch::Sender<usize>, peer: Arc<PeerConn>) -> Self {
+        under_way.send_modify(|n| *n += 1);
+        Self { peer: Some(peer), under_way: under_way.clone() }
+    }
+
+    async fn run(self) {
+        if let Some(peer) = &self.peer {
+            peer.close().await;
+        }
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        drop(self.peer.take());
+        self.under_way.send_modify(|n| *n -= 1);
+    }
 }
 
 /// Queue candidates not yet known. An address already queued or connected is
@@ -2396,7 +2747,7 @@ fn as_of(states: Vec<CoinState>, height: u32) -> Vec<CoinState> {
 /// that answers coin requests but not the header request after them would
 /// otherwise stay pooled and be chosen again and again. A carrier's lone
 /// answer has nobody to ask.
-async fn confirmed(answers: &[(Arc<PeerConn>, Page)], settled: Settled) -> Result<Option<CoinListing>, ChainError> {
+async fn confirmed(lane: &Lane, answers: &[(Arc<PeerConn>, Page)], settled: Settled) -> Result<Option<CoinListing>, ChainError> {
     let Settled { listing, at, unverified, knowledge_at, unverified_knowledge } = settled;
     let mut checks: Vec<(usize, u32, Bytes32)> = unverified.into_iter().map(|i| (i, at.0, at.1)).collect();
     for i in unverified_knowledge {
@@ -2416,7 +2767,7 @@ async fn confirmed(answers: &[(Arc<PeerConn>, Page)], settled: Settled) -> Resul
             }
             Err(e) => {
                 eprintln!("⛓️ chain peers: {} gave no answer to a header request ({e:#}); the connection is let go", peer.addr());
-                close_later(peer.clone());
+                close_later(&mut *lane.state.lock().await, peer.clone());
                 return Err(ChainError::Unanswered(e));
             }
         }
@@ -2443,19 +2794,24 @@ fn in_step(pages: &[Page]) -> Result<(), ChainError> {
 /// Settle the peers' listing pages ([`settle_pages`]), their views in step
 /// ([`in_step`]), and have the peers ahead show the header at the height
 /// judged ([`confirmed`]).
-async fn settle_listing(answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool, min_height: Option<u32>) -> Result<Option<CoinListing>, ChainError> {
+async fn settle_listing(
+    lane: &Lane,
+    answers: Vec<(Arc<PeerConn>, Page)>,
+    include_spent: bool,
+    min_height: Option<u32>,
+) -> Result<Option<CoinListing>, ChainError> {
     let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
     in_step(&pages)?;
     let Some(settled) = settle_pages(&pages, include_spent, min_height) else { return Ok(None) };
-    confirmed(&answers, settled).await
+    confirmed(lane, &answers, settled).await
 }
 
 /// [`settle_listing`] for coin-state lookups ([`settle_states`]).
-async fn settle_names(answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool) -> Result<Option<CoinListing>, ChainError> {
+async fn settle_names(lane: &Lane, answers: Vec<(Arc<PeerConn>, Page)>, include_spent: bool) -> Result<Option<CoinListing>, ChainError> {
     let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
     in_step(&pages)?;
     let Some(settled) = settle_states(&pages, include_spent) else { return Ok(None) };
-    confirmed(&answers, settled).await
+    confirmed(lane, &answers, settled).await
 }
 
 /// One peer's listing under `keys` (puzzle hashes, read as hints too when
@@ -2707,14 +3063,14 @@ impl ChainAccess for PeerLane {
     ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
         let net = self.lane.net.clone();
         async move {
-            self.lane
-                .ask_by(
-                    "coins by hint",
-                    self.trust,
-                    move |peer| listing_on(peer, net.clone(), vec![hint], true, start_height, cursor.clone()),
-                    move |answers| settle_listing(answers, include_spent, start_height),
-                )
-                .await
+            let lane = &*self.lane;
+            lane.ask_by(
+                "coins by hint",
+                self.trust,
+                move |peer| listing_on(peer, net.clone(), vec![hint], true, start_height, cursor.clone()),
+                move |answers| settle_listing(lane, answers, include_spent, start_height),
+            )
+            .await
         }
     }
 
@@ -2726,14 +3082,14 @@ impl ChainAccess for PeerLane {
     ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
         let net = self.lane.net.clone();
         async move {
-            self.lane
-                .ask_by(
-                    "coins by puzzle hash",
-                    self.trust,
-                    move |peer| listing_on(peer, net.clone(), vec![puzzle_hash], false, None, cursor.clone()),
-                    move |answers| settle_listing(answers, include_spent, None),
-                )
-                .await
+            let lane = &*self.lane;
+            lane.ask_by(
+                "coins by puzzle hash",
+                self.trust,
+                move |peer| listing_on(peer, net.clone(), vec![puzzle_hash], false, None, cursor.clone()),
+                move |answers| settle_listing(lane, answers, include_spent, None),
+            )
+            .await
         }
     }
 
@@ -2745,14 +3101,14 @@ impl ChainAccess for PeerLane {
     ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
         let net = self.lane.net.clone();
         async move {
-            self.lane
-                .ask_by(
-                    "coins by id",
-                    self.trust,
-                    move |peer| states_on(peer, net.clone(), names.clone()),
-                    move |answers| settle_names(answers, include_spent),
-                )
-                .await
+            let lane = &*self.lane;
+            lane.ask_by(
+                "coins by id",
+                self.trust,
+                move |peer| states_on(peer, net.clone(), names.clone()),
+                move |answers| settle_names(lane, answers, include_spent),
+            )
+            .await
         }
     }
 
@@ -5454,5 +5810,738 @@ mod tests {
         let none = Lane::new(Network::testnet11(), vec![], true, None);
         assert!(!none.pin_only);
         let _ = Mutex::new(());
+    }
+
+    /// Every operation of the seam on `chain`, each with its error (`None`
+    /// when it was answered).
+    async fn every_op(chain: &PeerLane) -> Vec<(&'static str, Option<ChainError>)> {
+        let id = Bytes32::new([9u8; 32]);
+        vec![
+            ("coins by hint", chain.coin_records_by_hint(id, None, true, None).await.err()),
+            ("coins by puzzle hash", chain.coin_records_by_puzzle_hash(id, true, None).await.err()),
+            ("coins by id", chain.coin_records_by_names(vec![id], true, None).await.err()),
+            ("puzzle and solution", chain.puzzle_and_solution(id, 7).await.err()),
+            ("peak", chain.peak_height().await.err()),
+            ("spend live", chain.spend_live(bundle()).await.err()),
+            ("push", chain.push_tx(bundle()).await.err()),
+        ]
+    }
+
+    /// Each answer is the closed lane's refusal, word for word.
+    fn all_off(answers: Vec<(&'static str, Option<ChainError>)>) {
+        for (what, err) in answers {
+            match err {
+                Some(ChainError::Refused(why)) => assert_eq!(why, crate::chia_strict::OFF_WORDS, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    /// ⛓️ Chia off (`SSF_NO_CHIA_LANE`): a closed lane has no pins and no
+    /// store path on either network, and refuses every operation at both
+    /// trust levels before it reads the store or asks the introducer (here a
+    /// name this machine answers itself, so a lane that did ask would ask no
+    /// outside host).
+    #[tokio::test]
+    async fn a_closed_lane_refuses_everything_and_touches_no_file() {
+        for net in [Network::testnet11(), Network::mainnet()] {
+            let lane = Lane::closed(net.clone());
+            assert!(lane.is_closed());
+            assert!(lane.pins.is_empty() && !lane.pin_only && lane.store_path.is_none(), "no pin, no chia_peers.json");
+            assert!(lane.pin_port_warnings().is_empty());
+            assert!(lane.describe().starts_with("off. Chia is off on this computer (SSF_NO_CHIA_LANE)"), "{}", lane.describe());
+            assert!(lane.describe().contains(&net.id), "{}", lane.describe());
+            assert!(lane.describe().ends_with("the peer store is neither read nor written"), "{}", lane.describe());
+        }
+        let lane = Arc::new(Lane::closed(Network { introducers: vec!["localhost".to_string()], ..net() }));
+        for trust in [Trust::Carrier, Trust::Agreed] {
+            all_off(every_op(&PeerLane::new(lane.clone(), trust)).await);
+        }
+        let state = lane.state.lock().await;
+        assert!(!state.store_loaded && state.known.is_empty(), "the store was never read");
+        assert!(state.introduce_after.is_none(), "the introducer was never asked");
+        assert!(state.conns.is_empty() && state.candidates.is_empty() && state.pin_target.is_none(), "nothing dialled");
+    }
+
+    /// A lane closed before its first request, though it holds a pin, a
+    /// queued peer and a store path, dials nothing and writes no store.
+    #[tokio::test]
+    async fn a_lane_closed_before_its_first_request_dials_nothing_and_writes_no_store() {
+        let (hole, accepted, keeper) = black_hole().await;
+        let store = temp_store("closed-early");
+        let _ = std::fs::remove_file(&store);
+        let lane = lane(vec![(hole, Source::Introducer)], vec![hole.to_string()], false, Some(store.clone()));
+        lane.close().await;
+        for trust in [Trust::Carrier, Trust::Agreed] {
+            all_off(every_op(&PeerLane::new(lane.clone(), trust)).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0, "no connection reached the pin or the queued peer");
+        assert!(!store.exists(), "no chia_peers.json");
+        assert_eq!(lane.live_count().await, 0);
+        keeper.abort();
+    }
+
+    /// A dial waiting for the lane's first certificate when the lane closes
+    /// (here the certificate is held back by a gate) does not leave once the
+    /// certificate is there.
+    #[tokio::test]
+    async fn a_dial_waiting_for_the_first_certificate_when_the_lane_closes_does_not_leave() {
+        let (hole, accepted, keeper) = black_hole().await;
+        let lane = Arc::new(Lane::new(net(), vec![], false, None).with_candidates(vec![(hole, Source::Introducer)]));
+        let (cert_tx, cert_rx) = tokio::sync::oneshot::channel::<Arc<rustls::ClientConfig>>();
+        let gate = {
+            let lane = lane.clone();
+            tokio::spawn(async move {
+                let _ = lane.tls.get_or_try_init(|| async { cert_rx.await.map_err(|_| anyhow!("gate")) }).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let dial = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.dial().await })
+        };
+        let waiting = tokio::time::timeout(Duration::from_secs(5), async {
+            while !lane.state.lock().await.candidates.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waiting.is_ok() && !dial.is_finished(), "the dial took its batch and waits for the certificate");
+        lane.close().await;
+        let _ = cert_tx.send(TLS.clone());
+        gate.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0, "no dial left after the close");
+        tokio::time::timeout(Duration::from_secs(5), dial).await.expect("the dial ends").unwrap();
+        assert_eq!(lane.live_count().await, 0);
+        keeper.abort();
+    }
+
+    /// Closing a lane that is in use (Chia turned off at once) lets its live
+    /// connections go, refuses every request after it, asks its peers
+    /// nothing more and leaves the store as it was.
+    #[tokio::test]
+    async fn closing_a_running_lane_lets_its_connections_go_and_asks_nothing_more() {
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("closed-running");
+        let _ = std::fs::remove_file(&store);
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, Some(store.clone()));
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100, "two peers agree");
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.len(), 2);
+        let stored = std::fs::read(&store).expect("the agreed pair is remembered");
+        lane.close().await;
+        assert!(lane.is_closed());
+        assert_eq!(lane.live_count().await, 0, "the pool is empty at once");
+        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+            while conns.iter().any(|c| c.alive()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "both connections closed");
+        let asked = |n: &MockNode| n.seen.lock().unwrap().len();
+        let before = (asked(&a), asked(&b));
+        for trust in [Trust::Carrier, Trust::Agreed] {
+            all_off(every_op(&PeerLane::new(lane.clone(), trust)).await);
+        }
+        assert_eq!((asked(&a), asked(&b)), before, "nothing more asked of either peer");
+        assert_eq!(std::fs::read(&store).unwrap(), stored, "the store is not written again");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// A refill waiting for the pool when the lane closes (close() has set
+    /// the flag and waits behind it) reads no store and queues nothing.
+    #[tokio::test]
+    async fn a_refill_waiting_for_the_pool_when_the_lane_closes_reads_no_store() {
+        let store = temp_store("closed-waiting");
+        let lane = lane(vec![], vec![], false, Some(store.clone()));
+        let held = lane.state.lock().await;
+        let refill = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.refill(Trust::Agreed).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let close = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.close().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(lane.is_closed() && !refill.is_finished(), "the refill waits for the pool, the close behind it");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), refill).await.expect("the refill ends").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), close).await.expect("the close ends").unwrap();
+        let state = lane.state.lock().await;
+        assert!(!state.store_loaded, "the store was not read after the close");
+        assert!(state.candidates.is_empty() && state.gossiped.is_empty());
+    }
+
+    /// A refill already out when the lane closes (here: the introducer
+    /// answered and the one peer holds its gossip answer back) takes in
+    /// nothing either answer named: the queue the close emptied stays empty
+    /// and the introducer's next turn is left as it was. The introducer is a
+    /// name this machine answers itself.
+    #[tokio::test]
+    async fn a_refill_out_when_the_lane_closes_queues_nothing_it_learnt() {
+        let (asked_tx, mut asked_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let base = node(vec![], (1, None), vec![]);
+        let silent: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                let _ = asked_tx.send(());
+                return vec![];
+            }
+            base(m)
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), silent).await;
+        let lane = Arc::new(
+            Lane::new(Network { introducers: vec!["localhost".to_string()], ..net() }, vec![], false, None)
+                .with_candidates(vec![(a.addr, Source::Introducer)])
+                .with_tls(TLS.clone()),
+        );
+        assert!(lane.dial().await);
+        assert_eq!(lane.live_count().await, 1, "the peer is connected, not yet asked for gossip");
+        let refill = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.refill(Trust::Agreed).await })
+        };
+        let out = tokio::time::timeout(Duration::from_secs(5), asked_rx.recv()).await;
+        assert!(out.is_ok(), "the refill asked the introducer and waits on the peer's gossip");
+        lane.close().await;
+        tokio::time::timeout(Duration::from_secs(5), refill).await.expect("the refill ends once the lane closes").unwrap();
+        let state = lane.state.lock().await;
+        assert!(state.candidates.is_empty(), "nothing the introducer named is queued");
+        assert!(state.introduce_after.is_none(), "the introducer's answer is not taken in");
+        assert!(state.conns.is_empty() && state.gossiped.is_empty(), "nor the failed gossip request");
+    }
+
+    /// [`every_op`] with each operation on a task of its own, so that each
+    /// can be left waiting for the pool.
+    fn spawn_every_op(chain: &PeerLane) -> Vec<(&'static str, tokio::task::JoinHandle<Option<ChainError>>)> {
+        let id = Bytes32::new([9u8; 32]);
+        ["coins by hint", "coins by puzzle hash", "coins by id", "puzzle and solution", "peak", "spend live", "push"]
+            .into_iter()
+            .map(|what| {
+                let chain = chain.clone();
+                let task = tokio::spawn(async move {
+                    match what {
+                        "coins by hint" => chain.coin_records_by_hint(id, None, true, None).await.err(),
+                        "coins by puzzle hash" => chain.coin_records_by_puzzle_hash(id, true, None).await.err(),
+                        "coins by id" => chain.coin_records_by_names(vec![id], true, None).await.err(),
+                        "puzzle and solution" => chain.puzzle_and_solution(id, 7).await.err(),
+                        "peak" => chain.peak_height().await.err(),
+                        "spend live" => chain.spend_live(bundle()).await.err(),
+                        _ => chain.push_tx(bundle()).await.err(),
+                    }
+                });
+                (what, task)
+            })
+            .collect()
+    }
+
+    /// Let every task spawned so far run until it waits (the test runtime
+    /// is single-threaded: a task yielding lets the others run first).
+    async fn let_tasks_run() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A request already waiting for the pool when the lane closes is
+    /// refused once it has the pool, before it takes a connection. close()
+    /// sets the flag and then queues for the pool behind the request
+    /// (tokio's mutex is FIFO), so the request has the pool first. Every
+    /// operation at both trust levels waits so, and a carrier's stand-in
+    /// for a silent peer: each gets the off reason, neither peer is asked
+    /// anything, and the connections the pool held read closed once close()
+    /// returns.
+    #[tokio::test]
+    async fn a_request_waiting_for_the_pool_when_the_lane_closes_takes_no_connection() {
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100, "two peers agree");
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.len(), 2);
+        let asked = |n: &MockNode| n.seen.lock().unwrap().len();
+        let before = (asked(&a), asked(&b));
+        let held = lane.state.lock().await;
+        let mut waiting = spawn_every_op(&PeerLane::new(lane.clone(), Trust::Carrier));
+        waiting.extend(spawn_every_op(&PeerLane::new(lane.clone(), Trust::Agreed)));
+        let stand_in = {
+            let (lane, first) = (lane.clone(), a.addr);
+            tokio::spawn(async move { lane.stand_in(first).await.err() })
+        };
+        let_tasks_run().await;
+        let close = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.close().await })
+        };
+        let_tasks_run().await;
+        assert!(lane.is_closed(), "the close has set the flag");
+        assert!(
+            waiting.iter().all(|(_, task)| !task.is_finished()) && !stand_in.is_finished() && !close.is_finished(),
+            "every request waits for the pool, the close behind them"
+        );
+        drop(held);
+        let mut answers = Vec::new();
+        for (what, task) in waiting {
+            answers.push((what, tokio::time::timeout(Duration::from_secs(5), task).await.expect("answered").unwrap()));
+        }
+        answers.push(("stand-in", tokio::time::timeout(Duration::from_secs(5), stand_in).await.expect("answered").unwrap()));
+        all_off(answers);
+        tokio::time::timeout(Duration::from_secs(5), close).await.expect("the close ends").unwrap();
+        assert!(conns.iter().all(|c| !c.alive()), "the connections the pool held read closed once close() returns");
+        assert_eq!((asked(&a), asked(&b)), before, "neither peer was asked anything");
+    }
+
+    /// A dial out when the lane closes is abandoned, and close() returns
+    /// only once it has ended. Here the dial's peer is a relay that takes
+    /// its TLS hello and holds the handshake there. close() returns with the
+    /// handshake still held, the dial ends with the off reason, and its
+    /// socket is closed: let on to a real full node afterwards, the relay
+    /// has nothing more from it, so no Chia handshake or header request
+    /// reaches the node.
+    #[tokio::test]
+    async fn closing_the_lane_abandons_a_dial_in_flight_and_waits_for_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let node = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hello_tx, hello_rx) = tokio::sync::oneshot::channel::<()>();
+        let (on_tx, on_rx) = tokio::sync::oneshot::channel::<()>();
+        let upstream = node.addr;
+        let relay = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let (mut from_client, mut to_client) = client.into_split();
+            // The dial's first TLS record, its ClientHello, read whole.
+            let mut head = [0u8; 5];
+            from_client.read_exact(&mut head).await.unwrap();
+            let mut hello = vec![0u8; usize::from(u16::from_be_bytes([head[3], head[4]]))];
+            from_client.read_exact(&mut hello).await.unwrap();
+            let _ = hello_tx.send(());
+            // The handshake is held here until the test lets it on.
+            let _ = on_rx.await;
+            let (mut from_node, mut to_node) = tokio::net::TcpStream::connect(upstream).await.unwrap().into_split();
+            to_node.write_all(&head).await.unwrap();
+            to_node.write_all(&hello).await.unwrap();
+            let back = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut from_node, &mut to_client).await;
+            });
+            // Whatever the dial writes after its hello goes on to the node,
+            // counted, until its socket closes.
+            let mut more = 0;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = from_client.read(&mut buf).await {
+                more += n;
+                if to_node.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+            back.abort();
+            more
+        });
+        let lane = lane(vec![], vec![], false, None);
+        let dial = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.dial_batch(vec![Candidate::new(addr, Source::Introducer)], RETRY_AFTER).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), hello_rx).await.expect("the dial sent its hello").unwrap();
+        assert!(!dial.is_finished(), "the dial waits on the held handshake");
+        tokio::time::timeout(Duration::from_secs(5), lane.close()).await.expect("close() returns while the handshake is held");
+        assert!(dial.is_finished(), "close() returned once the dial had ended");
+        dial.await.unwrap();
+        let reached = lane.dialled.borrow().clone();
+        assert_eq!(reached.len(), 1);
+        match &reached[0].1 {
+            Err(e) => assert_eq!(e, crate::chia_strict::OFF_WORDS),
+            Ok(_) => panic!("the dial connected to {}", reached[0].0),
+        }
+        let _ = on_tx.send(());
+        let more = tokio::time::timeout(Duration::from_secs(5), relay).await.expect("the dial's socket is closed").unwrap();
+        assert_eq!(more, 0, "nothing written after the hello");
+        assert!(node.seen.lock().unwrap().is_empty(), "no Chia message reached the node");
+    }
+
+    /// A loopback relay to `upstream`, for one dialler: everything passes
+    /// both ways, and once the dialler's socket closes the relay ends, with
+    /// how many bytes the dialler wrote.
+    async fn relay_to(upstream: SocketAddr) -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+        let (addr, _, relay) = counted_relay_to(upstream).await;
+        (addr, relay)
+    }
+
+    /// [`relay_to`], with how many bytes the dialler has written so far, as
+    /// the relay reads them.
+    async fn counted_relay_to(upstream: SocketAddr) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<usize>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let so_far = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = so_far.clone();
+        let relay = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let (mut from_client, mut to_client) = client.into_split();
+            let (mut from_node, mut to_node) = tokio::net::TcpStream::connect(upstream).await.unwrap().into_split();
+            let back = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut from_node, &mut to_client).await;
+            });
+            let (mut written, mut on) = (0, true);
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = from_client.read(&mut buf).await {
+                written += n;
+                counted.store(written, SeqCst);
+                on = on && to_node.write_all(&buf[..n]).await.is_ok();
+            }
+            back.abort();
+            written
+        });
+        (addr, so_far, relay)
+    }
+
+    /// Until the lane's record of its dials ([`Lane::dialled`]) holds an
+    /// outcome for `addr`, and that outcome.
+    async fn outcome_of(lane: &Lane, addr: SocketAddr) -> Result<std::sync::Weak<PeerConn>, String> {
+        let mut dialled = lane.dialled.subscribe();
+        let seen = tokio::time::timeout(Duration::from_secs(5), dialled.wait_for(|d| d.iter().any(|(a, _)| *a == addr)))
+            .await
+            .expect("the dial comes to an outcome")
+            .unwrap();
+        seen.iter().find(|(a, _)| *a == addr).map(|(_, outcome)| outcome.clone()).unwrap()
+    }
+
+    /// Until `node` has read a frame of `kind`.
+    async fn node_reads(node: &MockNode, kind: chia_protocol::ProtocolMessageTypes) {
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            while !node.seen.lock().unwrap().contains(&kind) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(read.is_ok(), "the node reads {kind:?}");
+    }
+
+    /// A dial batch is one piece of work from its first dial to the end of
+    /// its admission (#372 review, round 3): close() returns only once every
+    /// connection the batch reached is closed, though the batch's other dial
+    /// was still out, so the connection had not been taken in yet. Here one
+    /// dial reaches a full node and the other a node that holds the Chia
+    /// handshake, each through a relay that sees the dialler's socket.
+    /// close() comes while that handshake is held. Once it returns (read in
+    /// the task that called it, before any other task runs: the test's own
+    /// body is polled only after the tasks queued), the connection the batch
+    /// reached reads closed and nothing of it is left (its reader gone, its
+    /// socket dropped), and the held dial ended with the off reason. The
+    /// node sees the socket close, asked nothing more; the held dial's
+    /// socket is closed too, nothing sent after its handshake.
+    #[tokio::test]
+    async fn closing_the_lane_closes_what_a_dial_batch_reached_before_it_returns() {
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let (via_a, relay_a) = relay_to(a.addr).await;
+        let b = crate::chia_peer::mock::spawn_mute().await;
+        let (via_b, relay_b) = relay_to(b.addr).await;
+        let lane = lane(vec![], vec![], false, None);
+        let batch = {
+            let lane = lane.clone();
+            let dials = vec![Candidate::new(via_a, Source::Introducer), Candidate::new(via_b, Source::Gossip)];
+            tokio::spawn(async move { lane.dial_batch(dials, RETRY_AFTER).await })
+        };
+        let reached = outcome_of(&lane, via_a).await.expect("the first dial connects");
+        node_reads(&b, chia_protocol::ProtocolMessageTypes::Handshake).await;
+        assert!(!batch.is_finished(), "the batch waits on the held handshake, its connection not taken in");
+        let asked = a.seen.lock().unwrap().clone();
+        assert!(reached.upgrade().is_some_and(|conn| conn.alive()), "the connection is live while the batch is out");
+        let closing = {
+            let (lane, reached) = (lane.clone(), reached.clone());
+            tokio::spawn(async move {
+                lane.close().await;
+                let held = lane.dialled.borrow().iter().find(|(addr, _)| *addr == via_b).map(|(_, outcome)| outcome.clone());
+                (reached.upgrade().map(|conn| conn.alive()), held)
+            })
+        };
+        let (left, held) = tokio::time::timeout(Duration::from_secs(5), closing).await.expect("close() returns while the handshake is held").unwrap();
+        assert_ne!(left, Some(true), "the connection the batch reached reads closed once close() returns");
+        assert_eq!(left, None, "and nothing of it is left: its reader gone, its socket dropped");
+        match held {
+            Some(Err(e)) => assert_eq!(e, crate::chia_strict::OFF_WORDS),
+            Some(Ok(_)) => panic!("the held dial connected"),
+            None => panic!("close() returned with the held dial still out"),
+        }
+        assert!(batch.is_finished(), "close() returned once the batch had ended");
+        batch.await.unwrap();
+        let wrote = tokio::time::timeout(Duration::from_secs(5), relay_a).await.expect("the node sees the socket close").unwrap();
+        assert!(wrote > 0, "the dial reached the node through the relay");
+        assert_eq!(*a.seen.lock().unwrap(), asked, "nothing more asked of the node");
+        tokio::time::timeout(Duration::from_secs(5), relay_b).await.expect("the held dial's socket is closed").unwrap();
+        assert_eq!(*b.seen.lock().unwrap(), vec![chia_protocol::ProtocolMessageTypes::Handshake], "nothing sent after the handshake");
+        assert_eq!(lane.live_count().await, 0);
+    }
+
+    /// A dial batch holding its guard when the lane closes cannot hold
+    /// close() up for good: close() lets the pool go before it waits for the
+    /// write side, and nothing inside a batch asks for a guard of its own
+    /// (tokio's lock is write-preferring, so one asked for there would never
+    /// come). Here the batch has reached its node and waits for the pool,
+    /// which the test holds, with a gossip request out under a guard of its
+    /// own beside it; close() sets the flag and queues for the pool behind
+    /// the batch. Let go, the pool goes to the batch first, and close()
+    /// returns within the bound, every connection closed once it does (read
+    /// in the task that called it): the batch's and the pooled one asked for
+    /// gossip.
+    #[tokio::test]
+    async fn a_dial_batch_holding_its_guard_when_the_lane_closes_cannot_hold_close_up() {
+        let (asked_tx, mut asked_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let base = node(vec![], (1, None), vec![]);
+        let silent: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                let _ = asked_tx.send(());
+                return vec![];
+            }
+            base(m)
+        });
+        let p = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), silent).await;
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let (via_a, relay_a) = relay_to(a.addr).await;
+        let lane = lane(vec![(p.addr, Source::Introducer)], vec![], false, None);
+        assert!(lane.dial().await);
+        let pooled = lane.live_conns().await;
+        assert_eq!(pooled.len(), 1, "one peer pooled, not yet asked for gossip");
+        let refill = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.refill(Trust::Agreed).await })
+        };
+        let out = tokio::time::timeout(Duration::from_secs(5), asked_rx.recv()).await;
+        assert!(out.is_ok(), "the refill waits on the pooled peer's gossip");
+        let held = lane.state.lock().await;
+        let batch = {
+            let lane = lane.clone();
+            tokio::spawn(async move { lane.dial_batch(vec![Candidate::new(via_a, Source::Gossip)], RETRY_AFTER).await })
+        };
+        let reached = outcome_of(&lane, via_a).await.expect("the batch's dial connects");
+        let_tasks_run().await;
+        let close = {
+            let (lane, reached, pooled) = (lane.clone(), reached.clone(), pooled[0].clone());
+            tokio::spawn(async move {
+                lane.close().await;
+                (reached.upgrade().map(|conn| conn.alive()), pooled.alive())
+            })
+        };
+        let_tasks_run().await;
+        assert!(lane.is_closed(), "the close has set the flag");
+        assert!(!batch.is_finished() && !close.is_finished(), "the batch waits for the pool, the close behind it");
+        drop(held);
+        let (left, pooled_alive) = tokio::time::timeout(Duration::from_secs(5), close).await.expect("close() returns").unwrap();
+        assert_ne!(left, Some(true), "the batch's connection reads closed once close() returns");
+        assert_eq!(left, None, "and nothing of it is left");
+        assert!(!pooled_alive, "the pooled connection reads closed");
+        assert!(batch.is_finished() && refill.is_finished(), "neither the batch nor the gossip request outlives close()");
+        batch.await.unwrap();
+        refill.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relay_a).await.expect("the batch's node sees the socket close").unwrap();
+        let state = lane.state.lock().await;
+        assert!(state.conns.is_empty() && state.candidates.is_empty(), "nothing taken in");
+    }
+
+    /// Every close() gives the same promise (#372 review): a call
+    /// made while another closes the lane, or after one was cancelled,
+    /// returns only once every close the first started has ended, none of
+    /// the lane's handles on the connection left. Here the pooled
+    /// connection's close waits for the sink, which the test holds as a write
+    /// stuck on a peer that stopped reading would. The second close() does
+    /// not return while that close waits; let go, it returns with the
+    /// connection closed, its reader gone, and only the test's own handle on
+    /// it (read in the task that called it, as it returns).
+    #[tokio::test]
+    async fn a_second_close_waits_for_the_closes_the_first_started() {
+        for cancel_first in [false, true] {
+            let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+            let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+            assert!(lane.dial().await);
+            let conn = {
+                let pooled = lane.live_conns().await;
+                assert_eq!(pooled.len(), 1, "one peer pooled");
+                pooled[0].clone()
+            };
+            let stuck = conn.hold_sink().await;
+            let first = {
+                let lane = lane.clone();
+                tokio::spawn(async move { lane.close().await })
+            };
+            let started = tokio::time::timeout(Duration::from_secs(5), async {
+                while conn.alive() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "the first close() has the connection closing");
+            let first = if cancel_first {
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled(), "the first close() was cancelled");
+                None
+            } else {
+                Some(first)
+            };
+            let second = {
+                let (lane, conn) = (lane.clone(), Arc::downgrade(&conn));
+                tokio::spawn(async move {
+                    lane.close().await;
+                    let conn = conn.upgrade().expect("the test holds the connection");
+                    (conn.closed_for_test(), Arc::strong_count(&conn))
+                })
+            };
+            let_tasks_run().await;
+            assert!(!second.is_finished(), "cancel_first {cancel_first}: the second close() waits for the close the first started");
+            drop(stuck);
+            let (closed, handles) = tokio::time::timeout(Duration::from_secs(5), second).await.expect("the second close() returns").unwrap();
+            assert!(closed, "cancel_first {cancel_first}: the connection is closed, its reader gone, once the second close() returns");
+            assert_eq!(handles, 2, "cancel_first {cancel_first}: no handle of the lane's is left on it, only the test's and the one read");
+            if let Some(first) = first {
+                tokio::time::timeout(Duration::from_secs(5), first).await.expect("the first close() returns").unwrap();
+            }
+            assert_eq!(lane.live_count().await, 0);
+        }
+    }
+
+    /// Where [`a_dial_batch_dropped_before_admission_leaves_no_reader_past_close`]
+    /// drops the batch.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum DroppedAt {
+        /// Its one dial connected, it waits for the pool, which the test holds.
+        Pool,
+        /// One dial connected, the other is held at the Chia handshake, so
+        /// the batch still waits in its dials.
+        Handshake,
+    }
+
+    /// A dial batch dropped before its connections are taken in (its caller
+    /// gave up on it) leaves no reader past close() (#372 review, round 4).
+    /// Dropped, a connection only has its reader aborted, and the batch's
+    /// guard goes with it, so close() found nothing to wait for and could
+    /// return before the runtime dropped the aborted reader task, which
+    /// still held its half of the socket. The batch runs in the test's own
+    /// task, so it is dropped where it stands: waiting for the pool, or
+    /// waiting in its dials on a second dial the node holds at the Chia
+    /// handshake. close() follows at once, with no turn for any other task
+    /// between, and runs unconstrained by the runtime's budget, so only a
+    /// wait of its own lets the aborted readers go. Once it returns (read
+    /// before any other task runs) the reader of the connection the batch
+    /// reached is gone (its done watch reads closed) and the lane counts no
+    /// reader; each node then sees its socket close, with nothing written
+    /// after close() returned.
+    #[tokio::test]
+    async fn a_dial_batch_dropped_before_admission_leaves_no_reader_past_close() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for at in [DroppedAt::Pool, DroppedAt::Handshake] {
+            let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+            let (via_a, wrote_a, relay_a) = counted_relay_to(a.addr).await;
+            let b = crate::chia_peer::mock::spawn_mute().await;
+            let lane = lane(vec![], vec![], false, None);
+            let mut dials = vec![Candidate::new(via_a, Source::Introducer)];
+            let held = if at == DroppedAt::Handshake {
+                let (via_b, wrote_b, relay_b) = counted_relay_to(b.addr).await;
+                dials.push(Candidate::new(via_b, Source::Gossip));
+                Some((wrote_b, relay_b))
+            } else {
+                None
+            };
+            let pool = (at == DroppedAt::Pool).then(|| lane.state.try_lock().expect("a fresh lane's pool"));
+            let mut batch = Box::pin(lane.dial_batch(dials, RETRY_AFTER));
+            let reached = tokio::select! {
+                () = &mut batch => panic!("{at:?}: the batch ended"),
+                reached = outcome_of(&lane, via_a) => reached.expect("the first dial connects"),
+            };
+            match at {
+                DroppedAt::Pool => {
+                    assert!(futures_util::FutureExt::now_or_never(&mut batch).is_none(), "the batch waits for the pool");
+                }
+                DroppedAt::Handshake => tokio::select! {
+                    () = &mut batch => panic!("the batch ended"),
+                    () = node_reads(&b, chia_protocol::ProtocolMessageTypes::Handshake) => {}
+                },
+            }
+            let done = {
+                let conn = reached.upgrade().expect("the batch holds the connection it reached");
+                assert!(conn.alive(), "{at:?}: the connection is live while the batch is out");
+                conn.reader_done_for_test()
+            };
+            let asked = a.seen.lock().unwrap().clone();
+            drop(batch);
+            assert!(reached.upgrade().is_none(), "{at:?}: the dropped batch held the last handle on the connection");
+            drop(pool);
+            let closed = tokio::time::timeout(Duration::from_secs(5), tokio::task::unconstrained(lane.close())).await;
+            let (gone, counted, wrote) = (done.has_changed().is_err(), lane.readers.running(), wrote_a.load(SeqCst));
+            assert!(closed.is_ok(), "{at:?}: close() returns");
+            assert!(gone, "{at:?}: the reader of the connection the batch reached is gone once close() returns");
+            assert_eq!(counted, 0, "{at:?}: the lane counts no reader once close() returns");
+            let total = tokio::time::timeout(Duration::from_secs(5), relay_a).await.expect("the node sees the socket close").unwrap();
+            assert_eq!(total, wrote, "{at:?}: nothing written after close() returned");
+            assert_eq!(*a.seen.lock().unwrap(), asked, "{at:?}: nothing more asked of the node");
+            if let Some((wrote_b, relay_b)) = held {
+                let wrote = wrote_b.load(SeqCst);
+                let total = tokio::time::timeout(Duration::from_secs(5), relay_b).await.expect("the held dial's socket is closed").unwrap();
+                assert_eq!(total, wrote, "nothing written by the held dial after close() returned");
+                assert_eq!(*b.seen.lock().unwrap(), vec![chia_protocol::ProtocolMessageTypes::Handshake], "nothing sent after the handshake");
+            }
+            let state = lane.state.lock().await;
+            assert!(state.conns.is_empty(), "{at:?}: nothing taken in");
+        }
+    }
+
+    /// A reader of the lane's stops at the close by itself, whoever holds
+    /// its connection (#372 review, round 4): close() waits for every reader
+    /// the lane started, so a connection held outside the pool, with no
+    /// close of the lane's under way for it, can neither hold close() up for
+    /// good nor outlive it. Here the lane dialled a node, and the connection
+    /// left the pool with no close (taken out by the test, as any way the
+    /// lane might drop one), held by the test and by a request waiting for an
+    /// answer the node never gives. close() returns within the bound, and
+    /// once it does (read in the task that called it) the reader is gone and
+    /// the lane counts none; the connection reads closed, the request is
+    /// told so, and the socket goes once the last handle on it does.
+    #[tokio::test]
+    async fn a_reader_of_the_lane_held_outside_the_pool_stops_at_close() {
+        let (asked_tx, mut asked_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let base = node(vec![], (1, None), vec![]);
+        let silent: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                let _ = asked_tx.send(());
+                return vec![];
+            }
+            base(m)
+        });
+        let p = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), silent).await;
+        let (via_p, relay_p) = relay_to(p.addr).await;
+        let lane = lane(vec![(via_p, Source::Introducer)], vec![], false, None);
+        assert!(lane.dial().await);
+        let conn = {
+            let mut state = lane.state.lock().await;
+            assert_eq!(state.conns.len(), 1, "one peer pooled");
+            state.conns.remove(0)
+        };
+        let done = conn.reader_done_for_test();
+        let asking = {
+            let conn = conn.clone();
+            tokio::spawn(async move { conn.request::<RespondPeers, _>(RequestPeers::new()).await })
+        };
+        let out = tokio::time::timeout(Duration::from_secs(5), asked_rx.recv()).await;
+        assert!(out.is_ok(), "the node reads the request, and answers nothing");
+        assert_eq!(lane.readers.running(), 1, "the lane counts the reader it started");
+        let closing = {
+            let lane = lane.clone();
+            tokio::spawn(async move {
+                lane.close().await;
+                (done.has_changed().is_err(), lane.readers.running())
+            })
+        };
+        let (gone, counted) = tokio::time::timeout(Duration::from_secs(5), closing).await.expect("close() returns").unwrap();
+        assert!(gone, "the reader of the connection held outside the pool is gone once close() returns");
+        assert_eq!(counted, 0, "and the lane counts none");
+        assert!(!conn.alive(), "the connection reads closed");
+        let err = tokio::time::timeout(Duration::from_secs(5), asking).await.expect("the request ends").unwrap().unwrap_err().to_string();
+        assert!(err.contains("closed while waiting"), "the waiting request is told: {err}");
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(5), relay_p).await.expect("the socket goes with the last handle on it").unwrap();
     }
 }

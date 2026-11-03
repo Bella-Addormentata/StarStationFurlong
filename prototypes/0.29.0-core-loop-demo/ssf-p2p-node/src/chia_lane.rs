@@ -147,8 +147,10 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// build with the `chia-publish` feature. Off a test network (`net`) the SSF
 /// wallet pays for no chain write (stage 4 design §4.5 (1),
 /// `chia_publish::money_memo_refusal`), so publishing is off there whatever
-/// the wallet does, and the line says so.
-pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool) {
+/// the wallet does, and the line says so. While Chia is off (`strict`,
+/// chia_strict.rs) reads and publishing are both off, and the line says why
+/// on every network.
+pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool, strict: bool) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -172,17 +174,26 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
         .unwrap_or(false);
     let reads = if !cfg!(feature = "chia-read") {
         "not built"
+    } else if strict {
+        STRICT_STATUS
     } else if std::env::var("SSF_CHIA_WATCH").ok().as_deref() == Some("0") {
         "rung-6 only (watcher off: SSF_CHIA_WATCH=0)"
     } else {
         "on (rung-6 resolve + beat watcher)"
     };
-    let publish = publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch());
+    let publish = if strict && cfg!(feature = "chia-publish") {
+        STRICT_STATUS
+    } else {
+        publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch())
+    };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
         if ok { "PASSED" } else { "FAILED" },
     );
 }
+
+/// The startup line's word on reads and on publishing while Chia is off.
+const STRICT_STATUS: &str = "off (Chia is off on this computer: SSF_NO_CHIA_LANE)";
 
 /// The startup line's word on publishing: whether this build can, whether
 /// the SSF wallet pays for a chain write on this network (`pays`: on a test

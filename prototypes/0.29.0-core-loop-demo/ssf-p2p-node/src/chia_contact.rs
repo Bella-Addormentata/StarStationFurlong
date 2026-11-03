@@ -437,6 +437,22 @@ impl InboundVerified {
     }
 }
 
+/// What the log says a first unsolicited inbound of an era is for. While
+/// Chia is off on this computer (`chia_off`) no presence record is written,
+/// on every network, so the line states the reachability fact alone. Off a
+/// test network (`net`) the SSF wallet pays for no presence record either
+/// (stage 4 design §4.5 (1), `chia_publish::money_memo_refusal`), so the
+/// line promises none there.
+pub fn inbound_verified_words(chia_off: bool, net: crate::chia_network::ChiaNet) -> &'static str {
+    if chia_off {
+        "Chia is off on this computer, so no presence record is written"
+    } else if !net.is_test() {
+        "no presence record is written on this network yet"
+    } else {
+        "this era's presence record will say so"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +800,23 @@ mod tests {
         assert_eq!(by_time.flags_for(true, 0, t + ERA_SECS - 1), FLAG_INBOUND_VERIFIED);
         assert_eq!(by_time.flags_for(true, 0, t + ERA_SECS), 0);
         assert_eq!(by_time.flags_for(true, h, t + 10), FLAG_INBOUND_VERIFIED, "a mark without a height still counts by time");
+    }
+
+    /// ⛓️ While Chia is off on this computer the inbound line never promises
+    /// a presence record, on any network: no publisher runs. With Chia on,
+    /// testnet11's words are as before, and off a test network, where the
+    /// SSF wallet pays for no presence record, the line promises none.
+    #[test]
+    fn while_chia_is_off_an_inbound_mark_promises_no_presence_record() {
+        use crate::chia_network::ChiaNet;
+        for net in ChiaNet::ALL {
+            let off = inbound_verified_words(true, net);
+            assert!(off.starts_with(crate::chia_strict::OFF_WORDS), "{off}");
+            assert!(!off.contains("will say so"), "{off}");
+        }
+        assert_eq!(inbound_verified_words(false, ChiaNet::Testnet11), "this era's presence record will say so");
+        let mainnet = inbound_verified_words(false, ChiaNet::Mainnet);
+        assert_eq!(mainnet, "no presence record is written on this network yet");
+        assert!(!mainnet.contains("will say so"), "{mainnet}");
     }
 }

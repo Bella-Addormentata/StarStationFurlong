@@ -288,6 +288,18 @@ impl KnockBook {
         }
     }
 
+    /// The book a node starts with: `knocks.json` ([`Self::load`]), or an
+    /// empty book while Chia is off on this computer (`chia_off`), when the
+    /// file is neither read nor tightened: only the watcher and the publisher
+    /// use the book, and neither runs.
+    pub fn at_start(path: &Path, chia_off: bool) -> KnockBook {
+        if chia_off {
+            KnockBook::default()
+        } else {
+            KnockBook::load(path)
+        }
+    }
+
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         crate::chia_contact::write_private(path, &bytes)
@@ -892,6 +904,31 @@ mod tests {
         assert_eq!(KnockBook::load(&path), book);
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(KnockBook::load(&path), KnockBook::default(), "an unreadable file starts empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⛓️ While Chia is off on this computer the node starts with an empty
+    /// book and leaves `knocks.json` as it is, mode included.
+    #[test]
+    fn while_chia_is_off_the_knock_book_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("ssf-knocks-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(KNOCKS_FILE);
+        let mut book = KnockBook::default();
+        book.record_sent(sent("H", 3, "c1", 100));
+        book.save(&path).unwrap();
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(KnockBook::at_start(&path, true), KnockBook::default(), "an empty book while Chia is off");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o644, "the file is not tightened while Chia is off");
+        assert_eq!(KnockBook::at_start(&path, false), book, "with Chia on, the book is read");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "…and tightened, as before");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

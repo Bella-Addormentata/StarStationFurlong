@@ -201,10 +201,21 @@ pub type Chain = PeerLane;
 /// (`SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY`), its known-good peers from
 /// `chia_peers.json`. Connections open on the first request and are shared by
 /// every handle. It binds what [`lane_binding`] names for the node's network.
-static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| {
-    let (net, store) = lane_binding(crate::chia_network::net());
-    Arc::new(Lane::from_env(net, store))
-});
+/// ⛓️ While Chia is off on this computer (`SSF_NO_CHIA_LANE`, chia_strict.rs)
+/// it is built closed ([`lane_for`]): no pins, no store, every request refused.
+static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| Arc::new(lane_for(crate::chia_network::net(), crate::chia_strict::strict())));
+
+/// The process's lane on `net`: closed when `strict`, which reads nothing
+/// from the environment and names no peer store; otherwise from the
+/// environment, with the network's store, as before.
+fn lane_for(net: crate::chia_network::ChiaNet, strict: bool) -> Lane {
+    let (peers, store) = lane_binding(net);
+    if strict {
+        Lane::closed(peers)
+    } else {
+        Lane::from_env(peers, store)
+    }
+}
 
 /// The peer network a lane on `net` binds and where its peer store lives:
 /// `chia_peers.json` at the data root on testnet11, where it always was, and
@@ -212,6 +223,20 @@ static LANE: LazyLock<Arc<Lane>> = LazyLock::new(|| {
 /// Pure, so a test can pin it for both.
 fn lane_binding(net: crate::chia_network::ChiaNet) -> (Network, PathBuf) {
     (Network::of(net), net.path(crate::chia_peer_lane::STORE_FILE))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: how many chain clients this thread built ([`connect`],
+    /// [`connect_carrier`], through [`money_on`] and [`carrier_on`]), so a
+    /// test can show a path answered without one. Per thread, so tests
+    /// running beside it do not count.
+    pub(crate) static CLIENTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_client() {
+    CLIENTS_BUILT.with(|n| n.set(n.get() + 1));
 }
 
 /// Chain access for MONEY paths (plan §14 (5)): two peers must agree, or the
@@ -230,11 +255,15 @@ pub fn connect_carrier() -> Chain {
 
 /// The money handle on `lane`: [`connect`] on the process's lane.
 fn money_on(lane: Arc<Lane>) -> Chain {
+    #[cfg(test)]
+    count_client();
     PeerLane::new(lane, Trust::Agreed)
 }
 
 /// The carrier handle on `lane`: [`connect_carrier`] on the process's lane.
 fn carrier_on(lane: Arc<Lane>) -> Chain {
+    #[cfg(test)]
+    count_client();
     PeerLane::new(lane, Trust::Carrier)
 }
 
@@ -445,8 +474,10 @@ mod tests {
     #[test]
     fn the_two_handles_carry_their_trust_without_opening_anything() {
         let lane = Arc::new(Lane::new(Network::testnet11(), vec![], false, None));
+        let built = CLIENTS_BUILT.with(|n| n.get());
         assert_eq!(money_on(lane.clone()).trust(), Trust::Agreed);
         assert_eq!(carrier_on(lane.clone()).trust(), Trust::Carrier);
+        assert_eq!(CLIENTS_BUILT.with(|n| n.get()), built + 2, "each handle is counted on its thread");
         assert!(lane.describe().contains("testnet11"));
     }
 
@@ -468,6 +499,23 @@ mod tests {
         for chia_net in ChiaNet::ALL {
             let lane = Lane::new(lane_binding(chia_net).0, vec![], false, None);
             assert!(lane.describe().starts_with(chia_net.id()), "{}", lane.describe());
+        }
+    }
+
+    /// ⛓️ While Chia is off (`SSF_NO_CHIA_LANE`) the process's lane is built
+    /// closed on either network: no pin, no peer store, and its startup line
+    /// says so (the lane's own tests show a closed lane refuses every
+    /// request). The strict branch reads nothing from the environment.
+    #[test]
+    fn the_process_lane_is_built_closed_while_chia_is_off() {
+        use crate::chia_network::ChiaNet;
+        for chia_net in ChiaNet::ALL {
+            let lane = lane_for(chia_net, true);
+            assert!(lane.is_closed(), "{chia_net:?}");
+            assert_eq!(lane.store_path(), None, "no chia_peers.json on {chia_net:?}");
+            assert_eq!(lane.pin_count(), 0, "SSF_CHIA_PEERS is not read");
+            assert!(lane.pin_port_warnings().is_empty());
+            assert!(lane.describe().starts_with("off. Chia is off on this computer"), "{}", lane.describe());
         }
     }
 }

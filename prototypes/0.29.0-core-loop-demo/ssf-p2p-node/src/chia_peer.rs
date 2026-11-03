@@ -30,6 +30,7 @@
 //! literal) and no part of the stack picks a crypto provider on its own.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -466,6 +467,14 @@ pub struct PeerConn {
     alive: Arc<AtomicBool>,
     gate: Mutex<RateGate>,
     reader: JoinHandle<()>,
+    /// Ends (its sender, held by the reader task, dropped) once the reader
+    /// task is gone, and its half of the socket with it, dropped first
+    /// ([`ReaderHalf`], [`Self::reader_gone`]).
+    reader_done: watch::Receiver<()>,
+    /// Set once [`Self::close`] has closed the connection: a later call, or
+    /// one made while it runs, waits for that close and writes nothing of
+    /// its own.
+    closed: tokio::sync::OnceCell<()>,
 }
 
 impl std::fmt::Debug for PeerConn {
@@ -481,10 +490,81 @@ impl Drop for PeerConn {
 }
 
 impl PeerConn {
-    /// Open, handshake and bind one connection (see the module notes). `Err`
-    /// names what the peer failed: unreachable, not a full node, another
-    /// network, or block 0 not descending from the configured genesis.
+    /// [`Self::connect_until`] with nothing to stop it and no lane's count
+    /// for its reader (tests).
+    #[cfg(test)]
     pub async fn connect(addr: SocketAddr, sources: impl Into<Sources>, net: &Network, tls: Arc<rustls::ClientConfig>) -> Result<Arc<Self>> {
+        Self::connect_until(addr, sources, net, tls, std::future::pending(), None)
+            .await
+            .unwrap_or_else(|| Err(anyhow!("a dial nothing stops was abandoned")))
+    }
+
+    /// Open, handshake and bind one connection (see the module notes), unless
+    /// `stop` comes first. `Some(Err)` names what the peer failed:
+    /// unreachable, not a full node, another network, or block 0 not
+    /// descending from the configured genesis. `None`: `stop` came first,
+    /// and the dial was abandoned where it stood, sending nothing more,
+    /// neither its Chia handshake nor its binding header request.
+    ///
+    /// Whatever the outcome short of a connection, nothing of the dial is
+    /// left once this returns. Up to the websocket upgrade there is only the
+    /// socket, dropped with the dial; from there on a reader task runs, so a
+    /// dial refused or abandoned after it stops the reader and waits for it
+    /// to go, its half of the socket with it, before the socket is dropped
+    /// ([`Self::reader_gone`]).
+    ///
+    /// `readers`, a lane's ([`Readers`]), counts the reader from just before
+    /// it starts until its half of the socket is gone, and stops it at the
+    /// lane's close signal, whoever holds the connection by then. So a dial
+    /// dropped where it stands (its caller gave up on it), which waits for
+    /// nothing, leaves its reader to that count: aborted with the
+    /// connection, the reader goes at its next turn, counted until then.
+    /// With none (the tests' [`Self::connect`]) the reader is counted
+    /// nowhere and stopped only by the connection.
+    pub async fn connect_until(
+        addr: SocketAddr,
+        sources: impl Into<Sources>,
+        net: &Network,
+        tls: Arc<rustls::ClientConfig>,
+        stop: impl Future<Output = ()>,
+        readers: Option<&Readers>,
+    ) -> Option<Result<Arc<Self>>> {
+        tokio::pin!(stop);
+        let opened = tokio::select! {
+            biased;
+            () = &mut stop => return None,
+            opened = Self::open(addr, sources.into(), tls, readers) => opened,
+        };
+        let (conn, handshake) = match opened {
+            Ok(opened) => opened,
+            Err(e) => return Some(Err(e)),
+        };
+        let bound = tokio::select! {
+            biased;
+            () = &mut stop => None,
+            bound = conn.bind(net, handshake) => Some(bound),
+        };
+        let outcome = match bound {
+            Some(Ok(())) => return Some(Ok(conn)),
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        };
+        conn.stop_reading();
+        conn.reader_gone().await;
+        drop(conn);
+        outcome
+    }
+
+    /// TCP, TLS and the websocket upgrade, each within [`CONNECT_TIMEOUT`];
+    /// then the reader is started, counted in `readers` when there are any,
+    /// and the connection is ready for the handshake ([`Self::bind`]), whose
+    /// answer comes on the receiver.
+    async fn open(
+        addr: SocketAddr,
+        sources: Sources,
+        tls: Arc<rustls::ClientConfig>,
+        readers: Option<&Readers>,
+    ) -> Result<(Arc<Self>, oneshot::Receiver<Handshake>)> {
         let addr = canonical(addr);
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -512,10 +592,16 @@ impl PeerConn {
         let pending = Arc::new(Mutex::new(Pending { waiting: HashMap::new(), handshake: Some(handshake_tx) }));
         let alive = Arc::new(AtomicBool::new(true));
         let peak_at = Arc::new(Mutex::new(None));
-        let reader = tokio::spawn(read_loop(stream, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
+        let (done_tx, reader_done) = watch::channel(());
+        // Nothing awaits from here to the connection's construction: once the
+        // reader runs, the connection that stops it exists, and a lane that
+        // counts its readers has counted it since before it was spawned.
+        let half = ReaderHalf { stream, _done: done_tx, _counted: readers.map(Readers::count) };
+        let closed = readers.map(|readers| readers.closed.clone());
+        let reader = tokio::spawn(read_loop(half, closed, pending.clone(), peak_tx, peak_at.clone(), alive.clone()));
         let conn = Arc::new(Self {
             addr,
-            sources: Mutex::new(sources.into()),
+            sources: Mutex::new(sources),
             group: group_of(addr),
             identity,
             sink: tokio::sync::Mutex::new(sink),
@@ -528,8 +614,16 @@ impl PeerConn {
             alive,
             gate: Mutex::new(RateGate::new()),
             reader,
+            reader_done,
+            closed: tokio::sync::OnceCell::new(),
         });
-        conn.send(Handshake::new(
+        Ok((conn, handshake_rx))
+    }
+
+    /// The Chia handshake, and the network binding of plan §14 (4), on a
+    /// connection [`Self::open`] just opened.
+    async fn bind(&self, net: &Network, handshake_rx: oneshot::Receiver<Handshake>) -> Result<()> {
+        self.send(Handshake::new(
             net.id.clone(),
             PROTOCOL_VERSION.to_string(),
             "0.0.0".to_string(),
@@ -550,7 +644,7 @@ impl PeerConn {
             bail!("peer is on network {:?}, not {}", handshake.network_id, net.id);
         }
         // §14 (4): the chain itself, not the handshake string, says which network this is.
-        let header = conn
+        let header = self
             .request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(0))
             .await
             .context("requesting block header 0")?;
@@ -569,7 +663,7 @@ impl PeerConn {
             }
             Err(_) => bail!("peer would not serve block header 0"),
         }
-        Ok(conn)
+        Ok(())
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -700,6 +794,27 @@ impl PeerConn {
         *self.peak_at.lock().unwrap() = Some(Instant::now().checked_sub(by).unwrap_or_else(Instant::now));
     }
 
+    /// Hold the sink, as a write stuck on a peer that stopped reading does:
+    /// a close waits for it, up to [`CLOSE_TIMEOUT`] (tests).
+    #[cfg(test)]
+    pub(crate) async fn hold_sink(&self) -> tokio::sync::MutexGuard<'_, Sink> {
+        self.sink.lock().await
+    }
+
+    /// Whether [`Self::close`] has run to its end, the reader gone (tests).
+    #[cfg(test)]
+    pub(crate) fn closed_for_test(&self) -> bool {
+        self.closed.initialized()
+    }
+
+    /// The reader's done watch ([`Self::reader_done`]), which reads closed
+    /// once the reader task is gone, so it can be read after the connection
+    /// is (tests).
+    #[cfg(test)]
+    pub(crate) fn reader_done_for_test(&self) -> watch::Receiver<()> {
+        self.reader_done.clone()
+    }
+
     /// Send a message that expects no answer.
     pub async fn send<B>(&self, body: B) -> Result<()>
     where
@@ -777,17 +892,24 @@ impl PeerConn {
     }
 
     /// Write one frame, within [`SEND_TIMEOUT`]. A write that fails or times
-    /// out marks the connection dead: the socket is not coming back.
+    /// out marks the connection dead: the socket is not coming back. A
+    /// connection that reads dead once the sink is taken gets no frame, so
+    /// nothing starts on one [`Self::close`] has begun closing, its websocket
+    /// close given up or not.
     async fn send_message(&self, message: Message) -> Result<()> {
         let bytes = message.to_bytes().context("encoding")?;
         let sent = tokio::time::timeout(SEND_TIMEOUT, async {
             let mut sink = self.sink.lock().await;
-            sink.send(WsMessage::Binary(bytes)).await
+            if !self.alive() {
+                return None;
+            }
+            Some(sink.send(WsMessage::Binary(bytes)).await)
         })
         .await;
         match sent {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
+            Ok(None) => Err(anyhow!("connection to {} is closed", self.addr)),
+            Ok(Some(Ok(()))) => Ok(()),
+            Ok(Some(Err(e))) => {
                 self.alive.store(false, Ordering::Relaxed);
                 Err(anyhow!("send to {}: {e}", self.addr))
             }
@@ -799,10 +921,33 @@ impl PeerConn {
     }
 
     /// Close the connection: it reads dead at once, every waiting request
-    /// learns it, the reader stops, and the websocket close frame is attempted
-    /// for at most [`CLOSE_TIMEOUT`] before the socket is simply dropped. A
-    /// peer that stopped reading cannot hold the caller here.
+    /// learns it, the reader is stopped, and the websocket close frame is
+    /// attempted for at most [`CLOSE_TIMEOUT`] before it is given up. This
+    /// returns once the reader has gone too, its half of the socket with it
+    /// ([`Self::reader_gone`]); the socket itself goes with the last handle on
+    /// the connection. A peer that stopped reading cannot hold the caller
+    /// here, and a request still waiting for the sink then writes nothing
+    /// ([`Self::send_message`]). A connection is closed once: a call made
+    /// while another closes it, or after, waits for that close and writes
+    /// nothing of its own, so no close frame follows a write the first close
+    /// gave up waiting for.
     pub async fn close(&self) {
+        self.closed
+            .get_or_init(|| async {
+                self.stop_reading();
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+                    let mut sink = self.sink.lock().await;
+                    let _ = sink.close().await;
+                })
+                .await;
+                self.reader_gone().await;
+            })
+            .await;
+    }
+
+    /// The first, synchronous part of a close: the connection reads dead,
+    /// every waiting request learns it, and the reader is aborted.
+    fn stop_reading(&self) {
         self.alive.store(false, Ordering::Relaxed);
         {
             let mut pending = self.pending.lock().unwrap();
@@ -810,26 +955,126 @@ impl PeerConn {
             pending.handshake = None;
         }
         self.reader.abort();
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
-            let mut sink = self.sink.lock().await;
-            let _ = sink.close().await;
-        })
-        .await;
     }
+
+    /// Until the reader task is gone, and its half of the socket with it:
+    /// aborted ([`Self::stop_reading`]), it goes at its next turn, without
+    /// reading, or answering a ping, again. Bounded by [`CLOSE_TIMEOUT`] all
+    /// the same.
+    async fn reader_gone(&self) {
+        let mut done = self.reader_done.clone();
+        // Never sent on: it returns once the reader task drops the sender,
+        // after the stream ([`ReaderHalf`]).
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, done.changed()).await;
+    }
+}
+
+/// The readers of the connections a lane dials ([`PeerConn::connect_until`]):
+/// how many there are, each counted from just before it starts until its
+/// half of the socket is gone, and the lane's close signal, at which each
+/// stops by itself, whoever holds its connection. A lane that waits for
+/// none to be left ([`Self::gone`]) after its close signal waits for every
+/// reader it started, the readers of connections it no longer holds
+/// included, and for nothing more than each one's next turn: an aborted
+/// reader is dropped there, and a signalled one ends there.
+pub struct Readers {
+    running: watch::Sender<usize>,
+    closed: watch::Receiver<bool>,
+}
+
+impl Readers {
+    /// Readers that stop once `closed` reads true. A reader whose signal's
+    /// sender is gone (its lane dropped, not closed) runs on as one with no
+    /// lane does.
+    pub fn new(closed: watch::Receiver<bool>) -> Self {
+        Self { running: watch::Sender::new(0), closed }
+    }
+
+    /// Until no reader counted here is left, the half of the socket of each
+    /// gone before its count ([`ReaderHalf`]).
+    pub async fn gone(&self) {
+        let mut running = self.running.subscribe();
+        // Never closed: `self` holds the sender.
+        let _ = running.wait_for(|running| *running == 0).await;
+    }
+
+    /// How many readers are counted (tests).
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        *self.running.borrow()
+    }
+
+    /// Count one reader, before it is spawned ([`PeerConn::open`]).
+    fn count(&self) -> Counted {
+        self.running.send_modify(|running| *running += 1);
+        Counted(self.running.clone())
+    }
+}
+
+/// One reader in a lane's count ([`Readers`]), from just before it is
+/// spawned until it is dropped, last of its [`ReaderHalf`].
+struct Counted(watch::Sender<usize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
+    }
+}
+
+/// The reader's half of the socket, the sender whose drop says the reader
+/// is gone ([`PeerConn::reader_gone`]), and the reader's place in its lane's
+/// count, if it has one ([`Readers`]). Fields drop in the order they are
+/// declared, so the stream goes before `_done`, and `_done` before
+/// `_counted`, however the reader task ends: aborted before its first turn,
+/// aborted while it waits, at its lane's close signal, or at the stream's
+/// end. A lane that finds no reader counted thus finds every one's half of
+/// the socket gone, and its done sender with it. Parameters would not do: a
+/// future drops them in one order unpolled and in the other once it has run.
+/// Keep `stream` first and `_counted` last, and never move either out.
+struct ReaderHalf<S = Stream> {
+    stream: S,
+    _done: watch::Sender<()>,
+    _counted: Option<Counted>,
+}
+
+/// Ready once `closed` reads true: a lane's close signal ([`Readers`]).
+/// Never ready with none, or once the signal's sender is gone with `closed`
+/// still false.
+async fn close_signal(closed: Option<watch::Receiver<bool>>) {
+    if let Some(mut closed) = closed {
+        if closed.wait_for(|closed| *closed).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 /// The reader: answers go to their requests by id; the handshake and the peak
 /// announcements, which carry no id, go to their slots; everything else the
 /// node does not subscribe to yet (coin-state and mempool updates) is
-/// dropped. When the socket ends, every waiting request learns it.
-async fn read_loop(
-    mut stream: Stream,
+/// dropped. When the socket ends, or `closed` comes (its lane's close
+/// signal, [`close_signal`]), every waiting request learns it and the
+/// connection reads dead: the signal ends the loop as the stream's end does,
+/// whoever holds the connection, and before a frame ready beside it.
+async fn read_loop<S>(
+    mut half: ReaderHalf<S>,
+    closed: Option<watch::Receiver<bool>>,
     pending: Arc<Mutex<Pending>>,
     peak: watch::Sender<Option<Peak>>,
     peak_at: Arc<Mutex<Option<Instant>>>,
     alive: Arc<AtomicBool>,
-) {
-    while let Some(frame) = stream.next().await {
+) where
+    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let stop = close_signal(closed);
+    tokio::pin!(stop);
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = &mut stop => break,
+            frame = half.stream.next() => frame,
+        };
+        let Some(frame) = frame else { break };
         let frame = match frame {
             Ok(frame) => frame,
             Err(_) => break,
@@ -1057,18 +1302,7 @@ pub(crate) mod mock {
     ) -> MockNode {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (chain, key) = pem_identity(&cert).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(chia_ca_roots()), provider.clone())
-            .build()
-            .unwrap();
-        let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_client_cert_verifier(clients)
-            .with_single_cert(chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let acceptor = acceptor(&cert);
         let peak = Arc::new(Mutex::new(peak));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let network_id = network_id.to_string();
@@ -1126,6 +1360,53 @@ pub(crate) mod mock {
             }
         });
         MockNode { addr, cert, peak, seen, task }
+    }
+
+    /// The TLS server a full node runs: `cert` presented, a client
+    /// certificate the Chia CA signed demanded.
+    fn acceptor(cert: &chia_ssl::ChiaCertificate) -> tokio_rustls::TlsAcceptor {
+        let (chain, key) = pem_identity(cert).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(chia_ca_roots()), provider.clone())
+            .build()
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(clients)
+            .with_single_cert(chain, key)
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// A node that takes the TLS handshake and the websocket upgrade as a
+    /// full node does, then reads every frame and answers none: a dial of it
+    /// waits on the Chia handshake, its reader running. `seen` is what it
+    /// read; each connection's task ends when its socket does.
+    pub(crate) async fn spawn_mute() -> MockNode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cert = Arc::new(chia_ssl::ChiaCertificate::generate().unwrap());
+        let acceptor = acceptor(&cert);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_shared = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { break };
+                let acceptor = acceptor.clone();
+                let seen = seen_shared.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
+                    while let Some(Ok(frame)) = ws.next().await {
+                        let WsMessage::Binary(bytes) = frame else { continue };
+                        let Ok(message) = Message::from_bytes(&bytes) else { continue };
+                        seen.lock().unwrap().push(message.msg_type);
+                    }
+                });
+            }
+        });
+        MockNode { addr, cert, peak: Arc::new(Mutex::new(None)), seen, task }
     }
 }
 
@@ -1275,6 +1556,170 @@ mod tests {
         assert_eq!(b.unwrap().header_hash, Bytes32::new([2u8; 32]));
         // No peak was configured, so none is announced.
         assert_eq!(conn.wait_peak(Duration::from_millis(200)).await, None);
+    }
+
+    /// A request that found the connection alive, then waited for the sink
+    /// while the connection closed, writes nothing: not even when the close
+    /// gave its websocket close up after [`CLOSE_TIMEOUT`] (the test holds
+    /// the sink past it, as a write stuck on a peer that stopped reading
+    /// does). The request is told the connection is closed, at once, and
+    /// the peer never reads it.
+    #[tokio::test]
+    async fn a_request_waiting_for_the_sink_when_the_connection_closes_writes_nothing() {
+        let node = spawn("mocknet", NodeType::FullNode, genesis(), None, silent()).await;
+        let conn = PeerConn::connect(node.addr, Source::Gossip, &net(), tls()).await.unwrap();
+        let stuck = conn.sink.lock().await;
+        let filters = chia_protocol::CoinStateFilters::new(true, true, true, 0);
+        let asking = tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                conn.request::<RespondPuzzleState, _>(RequestPuzzleState::new(vec![], None, Bytes32::new([1u8; 32]), filters, false))
+                    .await
+            }
+        });
+        // Its id waits for an answer once it is past the alive check.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while conn.pending.lock().unwrap().waiting.is_empty() {
+            assert!(Instant::now() < deadline, "the request reaches the sink");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        conn.close().await;
+        assert!(!conn.alive());
+        assert!(!asking.is_finished(), "the close returned while the request still waits for the sink");
+        drop(stuck);
+        let err = asking.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("is closed"), "{err}");
+        // Time for a frame that went out to reach the peer.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !node.seen.lock().unwrap().contains(&ProtocolMessageTypes::RequestPuzzleState),
+            "the peer reads no request written after the close"
+        );
+    }
+
+    /// A dial abandoned once its reader runs (here the node holds the Chia
+    /// handshake) leaves nothing running: by the time `connect_until`
+    /// returns, the reader task is gone and the socket dropped, so the node
+    /// reads the socket's end, with nothing sent after the handshake. The
+    /// runtime's live tasks count the reader (the test runtime is
+    /// single-threaded: nothing else runs between the dial's end and the
+    /// count).
+    #[tokio::test]
+    async fn a_dial_abandoned_during_the_handshake_leaves_nothing_running() {
+        let node = mock::spawn_mute().await;
+        let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let net = net();
+        let dial = PeerConn::connect_until(
+            node.addr,
+            Source::Gossip,
+            &net,
+            tls(),
+            async {
+                let _ = stop_rx.await;
+            },
+            None,
+        );
+        let stop = async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !node.seen.lock().unwrap().contains(&ProtocolMessageTypes::Handshake) {
+                assert!(Instant::now() < deadline, "the dial sends its handshake");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The node's listener and its side of the connection, and the reader.
+            let running = tasks();
+            let _ = stop_tx.send(());
+            running
+        };
+        let (outcome, running) = tokio::join!(dial, stop);
+        assert!(outcome.is_none(), "the dial was abandoned");
+        assert_eq!(tasks(), running - 1, "the reader is gone once connect_until returns");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tasks() > running - 2 {
+            assert!(Instant::now() < deadline, "the node reads the socket's end");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(*node.seen.lock().unwrap(), vec![ProtocolMessageTypes::Handshake], "nothing sent after the handshake");
+    }
+
+    /// The reader's half of the socket goes before the reader reads as gone
+    /// (#372 review), and before its lane counts it gone (round 4).
+    /// [`PeerConn::reader_gone`] returns once the reader's sender drops, and
+    /// a closer that returns then drops the last handle on the connection:
+    /// a stream dropped after the sender would keep its half of the socket
+    /// past close() on a runtime with other workers. The lane's close()
+    /// returns once its count of readers is down to zero ([`Readers`]), so
+    /// the count goes last. A probe stream records, as it drops, whether the
+    /// sender is still there and the reader still counted, however the
+    /// reader ends: never polled (aborted before its first turn), dropped
+    /// while it waits, at its lane's close signal, or at the stream's end.
+    /// At the signal and at the end, a request waiting on the connection
+    /// learns it and the connection reads dead.
+    #[tokio::test]
+    async fn the_readers_half_of_the_socket_goes_before_the_reader_reads_gone() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct Probe {
+            ends: bool,
+            done: watch::Receiver<()>,
+            counted: watch::Receiver<usize>,
+            left: Arc<Mutex<Option<(bool, usize)>>>,
+        }
+        impl futures_util::Stream for Probe {
+            type Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                if self.ends {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.left.lock().unwrap() = Some((self.done.has_changed().is_ok(), *self.counted.borrow()));
+            }
+        }
+
+        #[derive(Debug, PartialEq)]
+        enum How {
+            NeverPolled,
+            DroppedWhileWaiting,
+            Signalled,
+            StreamEnded,
+        }
+        for how in [How::NeverPolled, How::DroppedWhileWaiting, How::Signalled, How::StreamEnded] {
+            let (done_tx, done_rx) = watch::channel(());
+            let (closed_tx, closed_rx) = watch::channel(false);
+            let readers = Readers::new(closed_rx);
+            let left = Arc::new(Mutex::new(None));
+            let probe = Probe { ends: how == How::StreamEnded, done: done_rx, counted: readers.running.subscribe(), left: left.clone() };
+            let (peak_tx, _peak_rx) = watch::channel(None);
+            let (asked_tx, mut asked_rx) = oneshot::channel();
+            let pending = Arc::new(Mutex::new(Pending { waiting: HashMap::from([(1, asked_tx)]), handshake: None }));
+            let alive = Arc::new(AtomicBool::new(true));
+            let half = ReaderHalf { stream: probe, _done: done_tx, _counted: Some(readers.count()) };
+            let reader = read_loop(half, Some(readers.closed.clone()), pending, peak_tx, Arc::new(Mutex::new(None)), alive.clone());
+            assert_eq!(readers.running(), 1, "{how:?}: counted from before the reader runs");
+            match how {
+                How::NeverPolled => drop(reader),
+                How::DroppedWhileWaiting => assert!(futures_util::FutureExt::now_or_never(reader).is_none(), "the probe holds the reader"),
+                How::Signalled => {
+                    let mut reader = Box::pin(reader);
+                    assert!(futures_util::FutureExt::now_or_never(&mut reader).is_none(), "the probe holds the reader");
+                    closed_tx.send_replace(true);
+                    reader.await;
+                }
+                How::StreamEnded => reader.await,
+            }
+            assert_eq!(*left.lock().unwrap(), Some((true, 1)), "{how:?}: the stream goes while the reader still reads as running, and counted");
+            assert_eq!(readers.running(), 0, "{how:?}: once it is gone, its lane counts it gone");
+            if matches!(how, How::Signalled | How::StreamEnded) {
+                assert!(!alive.load(Ordering::Relaxed), "{how:?}: the connection reads dead");
+                assert!(asked_rx.try_recv().is_err_and(|e| e == oneshot::error::TryRecvError::Closed), "{how:?}: the waiting request learns it");
+            }
+        }
     }
 
     #[test]
