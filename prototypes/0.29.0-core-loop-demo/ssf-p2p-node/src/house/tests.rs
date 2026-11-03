@@ -8,9 +8,9 @@ use iroh::SecretKey;
 use yrs::updates::decoder::Decode;
 use yrs::{MapPrelim, WriteTxn};
 
-const ROOM: &str = "room-house";
-const T: &str = "roulette-1";
-const INC: &str = "r0123456789abcdef01234567";
+pub(crate) const ROOM: &str = "room-house";
+pub(crate) const T: &str = "roulette-1";
+pub(crate) const INC: &str = "r0123456789abcdef01234567";
 const NODE: [u8; 32] = [7u8; 32];
 
 struct Who {
@@ -66,11 +66,11 @@ fn seed_of(pid: &str, r: i64) -> String {
     hex::encode(hb::sha256(format!("seed|{pid}|{r}").as_bytes()))
 }
 
-struct Room {
-    doc: Doc,
+pub(crate) struct Room {
+    pub(crate) doc: Doc,
     owner: Who,
-    house: House,
-    now: u64,
+    pub(crate) house: House,
+    pub(crate) now: u64,
     dir: PathBuf,
 }
 
@@ -83,7 +83,7 @@ fn scratch(name: &str) -> PathBuf {
 
 impl Room {
     /// The owner's room, its table switched on, the house delegated or not.
-    fn new(name: &str, delegate: bool) -> Self {
+    pub(crate) fn new(name: &str, delegate: bool) -> Self {
         let dir = scratch(name);
         let mut house = House::open(&NODE, Some(dir.join(STATE_FILE))).unwrap();
         // (The settle after a start has a test of its own.)
@@ -212,7 +212,7 @@ impl Room {
         self.put_top(&format!("hf:{T}"), &rec);
     }
 
-    fn tick(&mut self, after: u64) -> TickOut {
+    pub(crate) fn tick(&mut self, after: u64) -> TickOut {
         self.now += after;
         self.house.tick(ROOM, &self.doc, self.now, 1_700_000_000_000 + self.now)
     }
@@ -224,7 +224,7 @@ impl Room {
     }
 
     /// The live session's records of a kind, by key.
-    fn records(&self, prefix: &str) -> Vec<(String, CVal)> {
+    pub(crate) fn records(&self, prefix: &str) -> Vec<(String, CVal)> {
         let ses = self.ses_key();
         let txn = self.doc.transact();
         let comp = txn.get_map(COMPUTED_MAP).unwrap();
@@ -3809,4 +3809,163 @@ fn a_players_many_slips_and_seeds_are_hashed_once_each() {
     room.tick_passes(TICK_MS, 1);
     let hashed = hb::COMMITS_HASHED.with(|n| n.get());
     assert!(hashed <= 2 * N + 8, "{hashed} commitments hashed in a pass");
+}
+
+// ── What the node's fold in shadow follows ───────────────────────────────────
+
+fn fold_view_of(room: &mut Room) -> Option<FoldView> {
+    room.house.fold_view(ROOM, &room.doc, room.now)
+}
+
+fn add_players(room: &Room, names: &[String]) {
+    let mut txn = room.doc.transact_mut();
+    let players = txn.get_or_insert_map("players");
+    for p in names {
+        players.insert(&mut txn, p.as_str(), to_any(&obj(vec![("keyB64", s(&who(p).public))])));
+    }
+}
+
+#[test]
+fn the_fold_follows_the_house_tables_of_a_room_this_house_is_a_house_of() {
+    let mut room = Room::new("fold-view", true);
+    room.tick(1_000);
+    let view = fold_view_of(&mut room).expect("a view");
+    assert_eq!(view.tables, vec![(T.to_string(), INC.to_string())]);
+    assert_eq!(view.houses, vec![room.house.public().to_string()]);
+    // Every player's key as the room's players map first had it, by pid.
+    let mut want: Vec<(String, String)> = ["owner", "alice", "bob", "carol", "mallory"].iter().map(|p| (p.to_string(), who(p).public)).collect();
+    want.sort();
+    assert_eq!(view.pins, want);
+}
+
+#[test]
+fn the_fold_follows_nothing_in_a_room_this_house_is_not_delegated_in() {
+    let mut room = Room::new("fold-view-undelegated", false);
+    room.tick(1_000);
+    assert_eq!(fold_view_of(&mut room), None);
+    // The owner delegates it: followed from the next pass.
+    room.delegate(&room.owner);
+    room.tick(1_000);
+    assert!(fold_view_of(&mut room).is_some());
+}
+
+#[test]
+fn a_room_with_no_house_table_has_nothing_to_follow() {
+    let mut room = Room::new("fold-view-none", true);
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_view_of(&mut room), None);
+    // A table the room has marked gone is no table either.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC))])));
+        casino.insert(&mut txn, format!("gone:{T}:{INC}"), Any::Bool(true));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_view_of(&mut room), None);
+}
+
+#[test]
+fn a_view_is_not_kept_from_a_pass_that_ended_before_the_room_had_a_house() {
+    let mut room = Room::new("fold-view-stale", true);
+    room.tick(1_000);
+    assert!(fold_view_of(&mut room).is_some());
+    // The deed holder changes: the next pass cannot pin the new one's key in the players map, so it ends at once.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("nobody-here")));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_view_of(&mut room), None);
+}
+
+#[test]
+fn another_house_of_the_owners_is_counted_once_this_house_has_read_its_record() {
+    let mut room = Room::new("fold-view-two", true);
+    let mut b_house = second_house(&room);
+    // The other house joins round 1 first; this one reads its join.
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let before = fold_view_of(&mut room);
+    assert_eq!(before, None, "this house has not ticked yet");
+    room.tick(1_000);
+    room.tick(1_000);
+    assert_eq!(room.records("o:1:").len(), 1, "the other house's join is the table's");
+    let view = fold_view_of(&mut room).expect("a view");
+    let mut want = vec![room.house.public().to_string(), b_house.public().to_string()];
+    want.sort();
+    assert_eq!(view.houses, want);
+}
+
+#[test]
+fn a_house_delegated_by_someone_who_is_not_the_deed_holder_is_not_counted() {
+    let mut room = Room::new("fold-view-forged", true);
+    let mallory = who("mallory");
+    let mut b_house = House::open(&[9u8; 32], None).unwrap();
+    b_house.settle_ms = 0;
+    // Mallory delegates it, not the owner.
+    let rec = room_signed("hkey", "", &mallory, obj(vec![("v", CVal::Int(1)), ("h", s(b_house.public()))]));
+    room.put_top(&format!("hk:{}", b_house.public()), &rec);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    let view = fold_view_of(&mut room).expect("a view");
+    assert_eq!(view.houses, vec![room.house.public().to_string()]);
+}
+
+#[test]
+fn a_house_a_former_deed_holder_delegated_is_not_counted_and_one_listed_twice_is_counted_once() {
+    let mut room = Room::new("fold-view-former", true);
+    room.tick(1_000);
+    let own = room.house.public().to_string();
+    let owner_key = room.house.rooms[ROOM].fold.as_ref().expect("a plan").owner_key.clone();
+    let other = who("former-house").public;
+    // One verified under a deed holder who is gone (the entry stays until the house is asked about it again) ...
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), "a-former-deed-holder".into());
+    // ... and this house's own key among the list too.
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(own.clone(), owner_key.clone());
+    assert_eq!(fold_view_of(&mut room).unwrap().houses, vec![own.clone()]);
+    // Under the current deed holder it counts.
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), owner_key);
+    let mut want = vec![own, other];
+    want.sort();
+    assert_eq!(fold_view_of(&mut room).unwrap().houses, want);
+}
+
+#[test]
+fn a_players_pin_is_the_first_key_seen_and_new_players_are_pinned_a_second_later() {
+    let mut room = Room::new("fold-view-pins", true);
+    room.tick(1_000);
+    let first = fold_view_of(&mut room).unwrap().pins;
+    // Alice's key changes in the players map; a new player arrives.
+    {
+        let mut txn = room.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s(&who("mallory").public))])));
+    }
+    add_players(&room, &["dave".to_string()]);
+    // (Not before a second has passed: the players map is not read every tick.)
+    room.tick(300);
+    assert_eq!(fold_view_of(&mut room).unwrap().pins, first);
+    room.tick(1_000);
+    let later = fold_view_of(&mut room).unwrap().pins;
+    assert_eq!(later.len(), first.len() + 1);
+    assert!(later.contains(&("dave".to_string(), who("dave").public)));
+    assert!(later.contains(&("alice".to_string(), who("alice").public)), "alice keeps the key first seen");
+}
+
+#[test]
+fn the_pins_for_the_fold_are_capped_whoever_fills_the_players_map() {
+    let mut room = Room::new("fold-view-cap", true);
+    let flood: Vec<String> = (0..MAX_FOLD_PINS + 200).map(|i| format!("p{i:05}")).collect();
+    add_players(&room, &flood);
+    room.tick(1_000);
+    let view = fold_view_of(&mut room).unwrap();
+    assert_eq!(view.pins.len(), MAX_FOLD_PINS);
+    assert!(view.pins.iter().any(|(p, _)| p == "owner"), "the deed holder's pin is there");
 }

@@ -104,6 +104,23 @@ pub struct Counts {
     pub bad_results: u64,
 }
 
+impl Counts {
+    /// The sum of two feeds' counts (a room let go keeps its count in the total).
+    pub fn plus(self, o: Counts) -> Counts {
+        Counts {
+            cold: self.cold + o.cold,
+            warm: self.warm + o.warm,
+            forgets: self.forgets + o.forgets,
+            results: self.results + o.results,
+            dirty: self.dirty + o.dirty,
+            lost: self.lost + o.lost,
+            busy: self.busy + o.busy,
+            too_big: self.too_big + o.too_big,
+            bad_results: self.bad_results + o.bad_results,
+        }
+    }
+}
+
 /// A table's latest answer.
 #[derive(Debug)]
 pub struct Fold<'a> {
@@ -314,6 +331,11 @@ impl Feed {
             && mirror.current(t, inc)
     }
 
+    /// The feed holds no table, and owes the worker no word.
+    pub fn is_idle(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Let go of the worker's tables and forget the answers (the fold duties are off).
     fn drop_all(&mut self) {
         self.slots.clear();
@@ -487,4 +509,4 @@ fn forget<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>,
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

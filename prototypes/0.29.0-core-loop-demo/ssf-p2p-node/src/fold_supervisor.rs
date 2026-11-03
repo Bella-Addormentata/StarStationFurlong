@@ -307,6 +307,10 @@ impl Drop for Link {
     }
 }
 
+/// Windows' process creation flag for a console program that gets no window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// How workers are started.
 pub trait Launch {
     fn launch(&mut self) -> io::Result<Link>;
@@ -352,7 +356,15 @@ fn sweep(list: &mut Vec<Arc<Mutex<Child>>>) {
 impl Launch for ChildLaunch {
     fn launch(&mut self) -> io::Result<Link> {
         sweep(&mut UNREAPED.lock().unwrap_or_else(PoisonError::into_inner));
-        let mut child = (self.command)()?.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let mut command = (self.command)()?;
+        // The desktop app starts the node with no console (CREATE_NO_WINDOW): a console program the
+        // node starts would open a window of its own on Windows unless it is told not to.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| io::Error::other("no pipe to the worker"))?;
         let stdout = child.stdout.take().ok_or_else(|| io::Error::other("no pipe from the worker"))?;
         let child: Arc<Mutex<Child>> = Arc::new(Mutex::new(child));

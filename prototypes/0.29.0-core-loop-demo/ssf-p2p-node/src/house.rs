@@ -682,7 +682,38 @@ struct RoomMem {
     /// Which table a tick reads first (in name order, from this one on):
     /// one on from the last after a tick a read was short.
     turn: usize,
+    /// What the last pass found for the node's fold in shadow
+    /// ([`House::fold_view`]): None while the room has no verified
+    /// delegation of this house, or the pass could not read every switch.
+    fold: Option<FoldPlan>,
+    /// When the room's players were last pinned for the fold.
+    last_pin_scan: Option<u64>,
 }
+
+/// The house tables a pass found in a room it is delegated a house of, and
+/// the deed holder's key they stand under.
+#[derive(Clone, Debug, PartialEq)]
+struct FoldPlan {
+    owner_key: String,
+    tables: Vec<(String, String)>,
+}
+
+/// What the node's fold in shadow needs of a room (fold_shadow.rs): the house
+/// tables to follow `(t, inc)`, the keys of the houses the fold counts
+/// (this one, and every other the deed holder delegated that this house has
+/// verified), and the key pinned for each player `(pid, key)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldView {
+    pub tables: Vec<(String, String)>,
+    pub houses: Vec<String>,
+    pub pins: Vec<(String, String)>,
+}
+
+/// The most keys the house pins in a room for the fold: the players map is
+/// any peer's to fill, and a pin rides in every frame to the worker.
+pub const MAX_FOLD_PINS: usize = 1_024;
+/// How often the players map is read for new pins.
+const PIN_SCAN_MS: u64 = 1_000;
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
 /// round it revealed or stepped down; the last round it decided and the
@@ -1008,6 +1039,35 @@ impl House {
         Some(k)
     }
 
+    /// What the node's fold in shadow follows in `room`: None unless the last
+    /// pass found this house delegated and read every switch, and found a
+    /// house table. The players are pinned here (the first key seen for each,
+    /// as the pages pin; the pass pins only the deed holder), at most
+    /// [`MAX_FOLD_PINS`] of them and not more often than [`PIN_SCAN_MS`]: the
+    /// doc is read only then.
+    pub fn fold_view(&mut self, room: &str, doc: &Doc, now: u64) -> Option<FoldView> {
+        let plan = self.rooms.get(room)?.fold.clone().filter(|p| !p.tables.is_empty())?;
+        if self.rooms[room].last_pin_scan.is_none_or(|at| now.saturating_sub(at) >= PIN_SCAN_MS) {
+            self.rooms.get_mut(room)?.last_pin_scan = Some(now);
+            let txn = doc.transact();
+            let pids: Vec<String> = txn.get_map("players").map(|m| m.keys(&txn).take(MAX_FOLD_PINS * 2).map(|k| k.to_string()).collect()).unwrap_or_default();
+            for pid in pids {
+                if self.rooms.get(room).is_none_or(|m| m.pins.len() >= MAX_FOLD_PINS) {
+                    break;
+                }
+                self.pin_of(room, &txn, &pid);
+            }
+        }
+        let mem = self.rooms.get(room)?;
+        let mut houses: Vec<String> = mem.houses.iter().filter(|(_, owner)| **owner == plan.owner_key).map(|(k, _)| k.clone()).collect();
+        houses.push(self.key.public.clone());
+        houses.sort();
+        houses.dedup();
+        let mut pins: Vec<(String, String)> = mem.pins.iter().map(|(p, k)| (p.clone(), k.clone())).collect();
+        pins.sort();
+        Some(FoldView { tables: plan.tables, houses, pins })
+    }
+
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
     /// are spent, and then the read is short (`deferred`), as is every read
     /// after it this tick.
@@ -1145,6 +1205,10 @@ impl House {
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
         self.unclear_houses.clear();
+        // (The fold follows only what a pass that got this far found.)
+        if let Some(mem) = self.rooms.get_mut(room) {
+            mem.fold = None;
+        }
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
@@ -1223,6 +1287,7 @@ impl House {
             return writes;
         }
         tables.sort();
+        self.rooms.get_mut(room).unwrap().fold = Some(FoldPlan { owner_key: owner_key.clone(), tables: tables.clone() });
 
         // The owner's Fair setting of each of them, the one standing over
         // every other seen (fair_after; a new deed holder's count afresh:
@@ -2371,4 +2436,4 @@ fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

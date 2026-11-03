@@ -62,7 +62,7 @@ impl Write for ChanWriter {
 }
 
 /// Makes a folder; called on the worker's own thread (the engine's runtime cannot move between threads).
-type Maker = Arc<dyn Fn() -> Box<dyn Folder> + Send + Sync>;
+pub(crate) type Maker = Arc<dyn Fn() -> Box<dyn Folder> + Send + Sync>;
 
 impl Folder for Box<dyn Folder> {
     fn cold(&mut self, c: &Cold) -> Result<String, String> {
@@ -80,13 +80,67 @@ impl Folder for Box<dyn Folder> {
 }
 
 /// Starts workers that are threads serving a folder made by `make`.
-struct ThreadLaunch {
+pub(crate) struct ThreadLaunch {
     make: Maker,
-    launches: Arc<AtomicUsize>,
+    pub(crate) launches: Arc<AtomicUsize>,
     /// Every request a worker was sent, in order, across workers.
-    log: Arc<Mutex<Vec<Req>>>,
+    pub(crate) log: Arc<Mutex<Vec<Req>>>,
     /// Launches that fail, from the first.
-    refuse: Arc<AtomicBool>,
+    pub(crate) refuse: Arc<AtomicBool>,
+}
+
+impl ThreadLaunch {
+    pub(crate) fn new(make: Maker) -> ThreadLaunch {
+        ThreadLaunch { make, launches: Arc::new(AtomicUsize::new(0)), log: Arc::new(Mutex::new(Vec::new())), refuse: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+/// A worker's folder that is the fold engine, checking signatures as `case` does.
+pub(crate) fn engine_maker(case: &Case) -> Maker {
+    let case = case.clone();
+    Arc::new(move || {
+        let case = case.clone();
+        Box::new(EngineFolder::new(Box::new(move || check_for(&case))).expect("the engine starts"))
+    })
+}
+
+/// A folder that is `inner` until its `n`th request, which ends the worker (a panic nobody recovers from).
+pub(crate) fn dying_at(inner: Maker, n: usize) -> Maker {
+    Arc::new(move || Box::new(Dying { inner: inner(), asked: 0, n, alive: true }))
+}
+
+struct Dying {
+    inner: Box<dyn Folder>,
+    asked: usize,
+    n: usize,
+    alive: bool,
+}
+
+impl Dying {
+    fn ask(&mut self) {
+        self.asked += 1;
+        if self.asked == self.n {
+            self.alive = false;
+            panic!("the worker falls over");
+        }
+    }
+}
+
+impl Folder for Dying {
+    fn cold(&mut self, c: &Cold) -> Result<String, String> {
+        self.ask();
+        self.inner.cold(c)
+    }
+    fn warm(&mut self, w: &Warm) -> Result<String, String> {
+        self.ask();
+        self.inner.warm(w)
+    }
+    fn forget(&mut self, ctx: &Ctx) {
+        self.inner.forget(ctx)
+    }
+    fn recover(&mut self) -> bool {
+        self.alive && self.inner.recover()
+    }
 }
 
 impl Launch for ThreadLaunch {
