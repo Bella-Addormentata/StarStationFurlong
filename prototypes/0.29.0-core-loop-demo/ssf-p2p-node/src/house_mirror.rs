@@ -351,6 +351,10 @@ struct Table {
     /// or too heavy), or the keys may be more than the most: its keys are to
     /// be counted afresh, as a cold read counts them, for the most.
     recount: bool,
+    /// The count owed was made ahead of the reading by the drain before: this
+    /// drain reads, whatever the count cost the one before. (Meaningful only
+    /// while a count is owed.)
+    probed: bool,
     /// The keys of the live session that are not records the mirror keeps, as
     /// last counted (a count only grows by a change that sets `recount`, so
     /// the keys kept and these are never fewer than the session's, until a
@@ -394,6 +398,7 @@ impl Table {
             queue_bytes: 0,
             cold: None,
             recount: false,
+            probed: false,
             extra: 0,
             stale: false,
             announce: true,
@@ -580,23 +585,30 @@ impl Table {
     }
 
     /// Count the live session's keys afresh, up to the most and one: more than
-    /// the most holds it, as a cold read's list does. False when the budget
-    /// is spent first.
-    fn count_keys<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, b: &mut Budget, limits: &Limits) -> bool {
+    /// the most holds the table, as a cold read's list does (and the count
+    /// is owed no more). None when the budget is spent first; else the count
+    /// (the most and one at the most), for [`Table::settle_count`] once what
+    /// there is to read has been read.
+    fn count_keys<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, b: &mut Budget, limits: &Limits) -> Option<usize> {
         if !b.path() {
-            return false;
+            return None;
         }
         let n = ses.keys(txn).take(limits.session_keys.saturating_add(1)).count();
         if !b.charge(n.saturating_mul(VISIT_BYTES)) {
-            return false;
+            return None;
         }
-        self.recount = false;
         if n > limits.session_keys {
             self.flood();
-        } else {
-            self.extra = n.saturating_sub(self.keys.len() + self.unclear.len());
         }
-        true
+        Some(n)
+    }
+
+    /// The keys of the session were `n` in the doc this drain reads, and the
+    /// table has read everything of it that changed: what it keeps is as the
+    /// doc has it, and the rest of the keys are the ones it does not keep.
+    fn settle_count(&mut self, n: usize) {
+        self.recount = false;
+        self.extra = n.saturating_sub(self.keys.len() + self.unclear.len());
     }
 
     /// List the live session's keys (cold). False when the budget is spent.
@@ -707,6 +719,30 @@ impl Table {
         }
         let Some(ses) = ses.filter(|_| self.present && !self.flooded) else { return true };
 
+        // A count owed from a drain that ran out before it is made first:
+        // changes that come as fast as a drain reads them would else keep it
+        // for ever from finding the session over the most. (If the end is
+        // reached this drain, it settles on this count, not another. And one
+        // drain in two: a count that takes the whole drain would else leave
+        // nothing to read with. And not while the queue waits to be taken:
+        // nothing is read then, so there is nothing to starve.)
+        let mut counted = None;
+        if !self.recount {
+            self.probed = false;
+        } else if self.room_for_a_record(limits) && !std::mem::take(&mut self.probed) {
+            match self.count_keys(&ses, txn, b, limits) {
+                None => return false,
+                Some(_) if self.flooded => {
+                    pending.recs.remove(&live);
+                    return true;
+                }
+                n => {
+                    counted = n;
+                    self.probed = true;
+                }
+            }
+        }
+
         // The records that changed.
         let generation = self.generation;
         if let Some(Recs::Keys(set)) = pending.recs.get_mut(&live) {
@@ -750,8 +786,19 @@ impl Table {
         }
         self.cold = None;
         // (With everything read: the keys kept are as the doc has them.)
-        if self.recount && !self.count_keys(&ses, txn, b, limits) {
-            return false;
+        if self.recount {
+            let n = match counted {
+                Some(n) => Some(n),
+                None => self.count_keys(&ses, txn, b, limits),
+            };
+            match n {
+                None => return false,
+                Some(n) => {
+                    if !self.flooded {
+                        self.settle_count(n);
+                    }
+                }
+            }
         }
         true
     }

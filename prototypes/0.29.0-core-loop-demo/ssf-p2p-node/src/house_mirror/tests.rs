@@ -922,6 +922,150 @@ fn a_count_the_drain_cannot_pay_waits_for_the_next() {
 }
 
 #[test]
+fn a_count_that_is_owed_is_made_before_the_changes_that_keep_coming() {
+    // One path a drain, and a key that is no record comes before each: the
+    // drain's one path is spent on the key, and the count, owed since the
+    // drain before, would never be reached at the end of it.
+    let limits = Limits { session_keys: 8, drain_paths: 1, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&[(0, 1), (1, 1)])));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    let mut held_at = None;
+    for i in 0..40u32 {
+        f.put(&live0(), &format!("junk{i}"), &rv(1, i as i64));
+        f.drain();
+        if f.state().hold == Some(Hold::Flooded) {
+            held_at = Some(i);
+            break;
+        }
+    }
+    // Two records and a key that is none before each drain: the ninth key is the one found, at a
+    // drain that counts (one in two, the others read).
+    assert!(matches!(held_at, Some(6..=7)), "{held_at:?}");
+    assert!(f.m.current(T, INC), "nothing is left waiting to be read of a table that is held");
+    assert!(f.m.take(T, INC, usize::MAX).is_none());
+}
+
+#[test]
+fn a_count_that_is_owed_is_made_before_the_changes_that_spend_the_bytes() {
+    // The key that is no record is read first (it costs a path only), and
+    // the records changed again each drain spend the bytes before the end.
+    let limits = Limits { session_keys: 8, drain_bytes: 600, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&[(0, 1), (1, 1), (2, 1), (3, 1)])));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    let mut held_at = None;
+    for i in 0..40u32 {
+        f.put(&live0(), &format!("a{i}"), &rv(1, i as i64));
+        f.puts(&live0(), &records(&[(0, 10 + i as i64), (1, 10 + i as i64), (2, 10 + i as i64), (3, 10 + i as i64)]));
+        let d = f.drain();
+        if f.state().hold == Some(Hold::Flooded) {
+            held_at = Some(i);
+            break;
+        }
+        assert!(d.short, "{i}: the bytes are spent before the end");
+    }
+    // Four records and a key that is none before each drain: the fifth is the ninth key.
+    assert!(matches!(held_at, Some(4..=5)), "{held_at:?}");
+    assert!(f.m.current(T, INC), "nothing is left waiting to be read of a table that is held");
+}
+
+#[test]
+fn a_count_made_ahead_settles_on_what_the_drain_then_reads() {
+    // Seven records and a key that is no record: eight keys, the most. A
+    // count is owed (the drain before could not pay it), and in the next one
+    // three records are removed and one made: the count made ahead (six
+    // keys) is of a session the mirror has not read down to yet.
+    let limits = Limits { session_keys: 8, drain_bytes: 600, ..Limits::default() };
+    let seven: Vec<(u32, i64)> = (0..7).map(|i| (i, 1)).collect();
+    let mut f = Fix::seeded(limits, |f| {
+        f.session(&live0(), &records(&seven));
+        f.put(&live0(), "a0", &rv(1, 0));
+    });
+    let mut model = Model::default();
+    f.settle(&mut model);
+    f.put(&live0(), "a0", &rv(1, 1));
+    f.puts(&live0(), &records(&[(0, 5), (1, 5), (2, 5), (3, 5)]));
+    let d = f.drain();
+    assert!(d.short && !f.m.current(T, INC), "a count is owed");
+    f.remove(&live0(), &rk(1, 4));
+    f.remove(&live0(), &rk(1, 5));
+    f.remove(&live0(), &rk(1, 6));
+    f.put(&live0(), &rk(1, 7), &rv(1, 7));
+    f.settle(&mut model);
+    assert_eq!(f.state().hold, None, "six keys");
+    // Five records and a key that is none: three more are nine.
+    f.puts(&live0(), &records(&[(8, 1), (9, 1), (10, 1)]));
+    for _ in 0..3 {
+        f.drain();
+    }
+    assert_eq!(f.state().hold, Some(Hold::Flooded));
+}
+
+fn table_of(f: &Fix) -> &Table {
+    f.m.tables.values().next().expect("one table")
+}
+
+#[test]
+fn a_count_made_ahead_is_all_the_count_the_drain_makes() {
+    // The drain that makes the count owed ahead of the reading, and gets to the end, pays the count once.
+    let all: Vec<(u32, i64)> = (0..20).map(|i| (i, 1)).collect();
+    let owed = |junk: bool, f: &mut Fix, model: &mut Model, round: i64| -> usize {
+        if junk {
+            f.put(&live0(), "a0", &rv(1, round));
+        }
+        let rewrites: Vec<(u32, i64)> = (0..10).map(|i| (i, 10 + round)).collect();
+        f.puts(&live0(), &records(&rewrites));
+        f.m.limits.drain_bytes = 400;
+        let d = f.drain();
+        assert!(d.short);
+        f.m.limits.drain_bytes = DRAIN_BYTES;
+        let d = f.drain();
+        assert!(!d.short && f.m.current(T, INC), "junk {junk}, round {round}");
+        model.take(&mut f.m, T);
+        d.bytes
+    };
+    let mut with = Fix::seeded(Limits::default(), |f| {
+        f.session(&live0(), &records(&all));
+        f.put(&live0(), "a0", &rv(1, 0));
+    });
+    let mut without = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&all)));
+    let (mut m1, mut m2) = (Model::default(), Model::default());
+    with.settle(&mut m1);
+    without.settle(&mut m2);
+    // Twice: a count made ahead says nothing of the next one owed.
+    for round in 1..=2 {
+        let a = owed(true, &mut with, &mut m1, round);
+        let b = owed(false, &mut without, &mut m2, round);
+        assert_eq!(a, b + 21 * VISIT_BYTES, "round {round}: the keys counted once, 20 records and the one that is none");
+        // A count made ahead does not outlive the count.
+        with.drain();
+        assert!(!table_of(&with).probed, "round {round}");
+    }
+}
+
+#[test]
+fn the_keys_of_a_session_that_are_no_records_are_what_a_count_finds_besides_those_kept() {
+    // Fifty records, ten a page may read otherwise (the table is held, but its keys are the session's all the same), and one key that is no record.
+    let mut f = Fix::seeded(Limits { session_keys: 100, ..Limits::default() }, |f| {
+        let all: Vec<(u32, i64)> = (0..50).map(|i| (i, 1)).collect();
+        f.session(&live0(), &records(&all));
+        for i in 100..110 {
+            f.put_value(&live0(), &rk(1, i), proto_value(1));
+        }
+        f.put(&live0(), "a0", &rv(1, 0));
+    });
+    f.drain();
+    assert_eq!(f.state().hold, Some(Hold::Unclear));
+    assert_eq!(table_of(&f).extra, 1, "listed");
+    // The key that is none changes: the keys are counted.
+    f.put(&live0(), "a0", &rv(1, 1));
+    f.drain();
+    assert_eq!(table_of(&f).extra, 1, "counted: 61 keys, 60 of them kept");
+    assert!(f.m.current(T, INC));
+}
+
+#[test]
 fn the_keys_of_a_session_are_counted_only_when_something_odd_changed_and_at_what_they_weigh() {
     let limits = Limits { session_keys: 100, ..Limits::default() };
     let all: Vec<(u32, i64)> = (0..50).map(|i| (i, 1)).collect();
@@ -1115,6 +1259,29 @@ fn reads_wait_while_the_changes_are_not_taken() {
     }
     assert_eq!(model.recs, model_of(&all));
     assert!(peak <= 900, "{peak}");
+}
+
+#[test]
+fn a_count_that_is_owed_waits_with_the_reads_while_the_changes_are_not_taken() {
+    let limits = Limits { session_keys: 100, pending_bytes: MAX_QUEUED_RECORD + 600, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&[(0, 1)])));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    // A key that is no record is read first (it sorts before the records), then records fill the queue.
+    f.put(&live0(), "a0", &rv(1, 0));
+    let more: Vec<(u32, i64)> = (1..30).map(|i| (i, i as i64)).collect();
+    f.puts(&live0(), &records(&more));
+    let d = f.drain();
+    assert!(!d.short, "waiting is not spending");
+    assert!(f.state().queued > 0 && f.state().queued < 29);
+    assert!(!f.m.current(T, INC), "a count is owed");
+    // Nothing is read, and no count is made, until some is taken.
+    let again = f.drain();
+    assert_eq!(again.bytes, 0);
+    assert_eq!(again.paths, 0);
+    // And once it is, the count is made, and the table is as the doc has it.
+    f.settle(&mut model);
+    assert_eq!(f.state().hold, None);
 }
 
 #[test]
