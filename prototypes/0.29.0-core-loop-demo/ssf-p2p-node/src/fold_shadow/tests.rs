@@ -294,11 +294,11 @@ fn each_verdict_is_counted_under_its_own_name() {
     let mut t = Tally::default();
     t.note(&Verdict::Agree);
     t.note(&Verdict::Mismatch("x".into()));
-    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered] {
+    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired] {
         t.note(&Verdict::Skip(why));
     }
-    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1 });
-    assert_eq!(t.skipped(), 9);
+    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1 });
+    assert_eq!(t.skipped(), 10);
     t.note(&Verdict::Skip(Skip::Pending));
     assert_eq!(t.pending, 2);
 }
@@ -660,11 +660,11 @@ fn when_the_fold_duties_are_off_for_good_nothing_is_followed_and_the_report_says
 #[test]
 fn the_report_adds_up_what_the_shadow_found_and_what_the_feeds_did() {
     let mut b = Bench::new("house roulette 3");
-    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11 };
+    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12 };
     b.shadow.gone = Counts { cold: 10, warm: 20, forgets: 30, results: 40, dirty: 11, lost: 12, busy: 50, too_big: 13, bad_results: 14 };
     let r = b.shadow.report();
     assert_eq!((r.shadow_agreed, r.shadow_mismatches), (1, 2));
-    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11, "every kind of skip");
+    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12, "every kind of skip");
     assert_eq!((r.cold_folds, r.dirty, r.lost), (10, 11, 12));
     assert_eq!(r.bad_results, 14 + 13, "a result and a frame nobody could use");
 }
@@ -1450,11 +1450,16 @@ impl Bench {
         players.insert(&mut txn, pid, to_any(&obj(vec![("keyB64", s(key))])));
     }
 
-    /// The deed holder delegates to `house` (or does it again: the same key written again is a replacement).
+    /// The deed holder delegates to `house` (or does it again as it stands: that changes nothing).
     fn delegate(&self, house: &str) {
+        self.delegate_by(house, "owner");
+    }
+
+    /// The record of a delegation written as `by` has it: another value is another record.
+    fn delegate_by(&self, house: &str, by: &str) {
         let comp = self.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
         let mut txn = self.doc.transact_mut();
-        comp.insert(&mut txn, format!("hk:{house}"), to_any(&obj(vec![("by", s("owner"))])));
+        comp.insert(&mut txn, format!("hk:{house}"), to_any(&obj(vec![("by", s(by))])));
     }
 
     fn withdraw(&self, house: &str) {
@@ -1588,7 +1593,7 @@ fn a_delegation_replaced_or_withdrawn_leaves_nothing_shown_whole() {
         b.ticks(3);
         assert_eq!(b.confirmed_count(), 1, "{how}: (a delegation that came is no churn)");
         if how == "replaced" {
-            b.delegate("house-x");
+            b.delegate_by("house-x", "owner-2");
         } else {
             b.withdraw("house-x");
         }
@@ -1671,7 +1676,8 @@ fn a_table_a_page_removed_is_let_go_of_when_the_grace_is_over_and_no_final_check
     b.now += Duration::from_secs(2);
     b.until("let go", |b| b.shadow.rooms.is_empty());
     assert_eq!(b.forgets(), 1);
-    assert_eq!(b.shadow.tally, Tally::default());
+    assert_eq!(b.shadow.tally, Tally { expired: 1, ..Tally::default() }, "and the comparison not made is counted, once");
+    assert_eq!(b.shadow.report().shadow_skipped, 1);
 }
 
 /// The place of a table kept for its final checkpoint is not given to another.
@@ -1719,9 +1725,9 @@ fn the_grace_of_a_removed_table_counts_from_the_tick_it_left_the_plan() {
     assert_eq!(b.shadow.report().tables, 1, "(still in the plan)");
     b.view.as_mut().unwrap().tables.clear();
     b.ticks(3);
-    b.now += Duration::from_secs(40);
+    b.now += GONE_GRACE - Duration::from_secs(20);
     b.ticks(5);
-    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "40 seconds after it left");
+    assert!(b.shadow.rooms[b.room()].mirror.state(&t, &inc).is_some(), "short of the grace after it left");
     b.now += Duration::from_secs(30);
     b.until("let go", |b| b.shadow.rooms.is_empty());
     assert_eq!(b.forgets(), 1);
@@ -1859,4 +1865,345 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     assert_eq!(second.watch, first.watch, "(the same watch: the room's)");
     assert_eq!((second.pins_epoch, second.pins.len()), (watch.epoch(), 1));
     assert!(second.settled);
+}
+
+// ── Review round 4 ───────────────────────────────────────────────────────────
+
+/// A worker's folder that waits for `go` before it folds anything: a worker that is slow, or hung.
+fn gated(inner: crate::fold_feed::tests::Maker, go: Arc<std::sync::atomic::AtomicBool>) -> crate::fold_feed::tests::Maker {
+    use crate::fold_worker::Folder;
+    struct Gate {
+        inner: Box<dyn Folder>,
+        go: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Gate {
+        fn wait(&self) {
+            while !self.go.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    impl Folder for Gate {
+        fn cold(&mut self, c: &crate::fold_wire::Cold) -> Result<String, String> {
+            self.wait();
+            self.inner.cold(c)
+        }
+        fn warm(&mut self, w: &crate::fold_wire::Warm) -> Result<String, String> {
+            self.wait();
+            self.inner.warm(w)
+        }
+        fn forget(&mut self, ctx: &crate::house_bytes::Ctx) {
+            self.inner.forget(ctx)
+        }
+        fn recover(&mut self) -> bool {
+            self.inner.recover()
+        }
+    }
+    Arc::new(move || Box::new(Gate { inner: inner(), go: go.clone() }))
+}
+
+/// A checkpoint a page may read as it is and as it is not (a `__proto__` field), which the mirror keeps no copy of.
+fn held(cp: &CVal) -> CVal {
+    with_cp(cp, "__proto__", Some(s("x")))
+}
+
+/// A page's trim the node cannot read as a page does holds the table with no checkpoint to compare: counted, once, as a
+/// comparison not made, said in the log (the first checkpoint a table is read with is no trim).
+#[test]
+fn a_trim_the_node_cannot_read_as_a_page_does_is_counted_once_as_unreadable() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let plain = b.page_trim(&b.answer());
+    assert!(checkpoint_ok(&plain, &b.case.ctx.inc), "(it is a checkpoint but for the field)");
+    b.put_checkpoint(&held(&plain));
+    b.until("counted", |b| b.shadow.tally.unreadable > 0);
+    b.ticks(30);
+    assert_eq!(b.shadow.tally, Tally { unreadable: 1, ..Tally::default() }, "once, however long it is held");
+    let st = b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap();
+    assert!(st.base.is_none() && st.hold == Some(crate::house_mirror::Hold::Base) && st.trims == 1);
+    let r = b.shadow.report();
+    assert_eq!((r.shadow_skipped, r.shadow_mismatches, r.shadow_agreed), (1, 0, 0));
+    assert_eq!(r.recent_skips.len(), 1);
+    assert!(r.recent_skips[0].contains("unreadable") && r.recent_skips[0].contains(&b.case.ctx.t), "{:?}", r.recent_skips);
+}
+
+/// ... and the checkpoint a table is first read with is no trim, held or not.
+#[test]
+fn the_first_checkpoint_a_table_is_read_with_is_no_trim_when_the_node_cannot_read_it_either() {
+    let mut b = Bench::new("house craps 3");
+    let sum = finished(&b.case.summary);
+    let cp = held(&b.page_trim(&sum));
+    b.put_checkpoint(&cp);
+    b.ticks(30);
+    let st = b.shadow.rooms[b.room()].mirror.state(&b.case.ctx.t, &b.case.ctx.inc).unwrap();
+    assert_eq!((st.hold, st.trims), (Some(crate::house_mirror::Hold::Base), 0));
+    assert_eq!(b.shadow.tally, Tally::default());
+    assert!(b.shadow.report().recent_skips.is_empty());
+}
+
+/// What the comparisons say is kept for `/api/fingerprint`, the mismatches and the comparisons not made each in a ring
+/// of their own, an agreement not at all.
+#[test]
+fn what_the_comparisons_say_is_kept_for_the_report() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    let sum = b.answer();
+    let u = last_decided(&sum).unwrap();
+    let mut n = nets_through(&sum, u);
+    let x: i128 = n[0].1.parse().unwrap();
+    n[0].1 = (x + 1).to_string();
+    b.put_checkpoint(&page_cp(&sum, u, n, true, true));
+    b.until("compared", |b| b.shadow.tally.mismatch > 0);
+    let r = b.shadow.report();
+    assert_eq!(r.recent_mismatches.len(), 1);
+    assert!(r.recent_mismatches[0].contains("MISMATCH") && r.recent_mismatches[0].contains(&b.case.ctx.t), "{:?}", r.recent_mismatches);
+    assert!(r.recent_skips.is_empty());
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["recentMismatches"].as_array().map(Vec::len), Some(1));
+    assert!(json.get("recentSkips").is_none(), "an empty list is left out");
+    // An agreement is not kept.
+    let mut a = Bench::new("house craps 3");
+    a.until("the first answer", |b| b.caught_up());
+    let cp = a.page_trim(&a.answer());
+    a.put_checkpoint(&cp);
+    a.until("compared", |b| b.shadow.tally.agree > 0);
+    let r = a.shadow.report();
+    assert!(r.recent_mismatches.is_empty() && r.recent_skips.is_empty());
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json.get("recentMismatches").is_none() && json.get("recentSkips").is_none());
+}
+
+/// The ring keeps the last lines of each kind, and a line is cut at a character, with a mark that it was.
+#[test]
+fn the_log_keeps_the_last_lines_of_each_kind_and_clips_a_long_one() {
+    let mut log = Log::default();
+    for i in 0..(LOG_LINES + 8) {
+        log.push(true, format!("mismatch {i}"));
+    }
+    log.push(false, "one skip".into());
+    assert_eq!(log.mismatches.len(), LOG_LINES, "the ring is full and no more");
+    assert_eq!(log.mismatches.front().map(String::as_str), Some("mismatch 8"), "the oldest went");
+    assert_eq!(log.mismatches.back().map(String::as_str), Some(format!("mismatch {}", LOG_LINES + 7).as_str()));
+    assert_eq!(log.skips.len(), 1, "a run of mismatches does not push out the skips");
+    for i in 0..(LOG_LINES + 1) {
+        log.push(false, format!("skip {i}"));
+    }
+    assert_eq!(log.mismatches.len(), LOG_LINES, "nor the skips the mismatches");
+    // A line over the most is cut, at a character, and marked.
+    let long = format!("{}{}", "a".repeat(LOG_LINE_BYTES - 1), "é".repeat(50));
+    let cut = clip(long.clone());
+    assert!(cut.ends_with('…') && cut.len() <= LOG_LINE_BYTES + '…'.len_utf8(), "{} bytes", cut.len());
+    assert!(long.starts_with(cut.trim_end_matches('…')), "what is left is the line's start");
+    assert_eq!(clip("short".into()), "short");
+    let exact = "b".repeat(LOG_LINE_BYTES);
+    assert_eq!(clip(exact.clone()), exact, "a line of the most is whole");
+    let mut log = Log::default();
+    log.push(true, "x".repeat(10 * LOG_LINE_BYTES));
+    assert!(log.mismatches[0].len() <= LOG_LINE_BYTES + 3);
+}
+
+/// A table let go of for want of a final checkpoint says so in the log, once.
+#[test]
+fn a_table_given_up_on_for_want_of_a_final_checkpoint_is_told_in_the_log() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.mark_gone(&b.case.ctx.t.clone());
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    assert!(b.shadow.report().recent_skips.is_empty(), "(not yet)");
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    let r = b.shadow.report();
+    assert_eq!(r.recent_skips.len(), 1, "{:?}", r.recent_skips);
+    assert!(r.recent_skips[0].contains("expired"), "{:?}", r.recent_skips);
+    assert_eq!(b.shadow.tally.expired, 1);
+}
+
+/// A table whose final checkpoint came in time is not given up on: compared, and not counted expired.
+#[test]
+fn a_table_whose_final_checkpoint_came_in_time_is_not_expired() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let u = last_decided(&sum).expect("a decided round");
+    let ended = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+    b.mark_gone(&b.case.ctx.t.clone());
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    // Past the fallback of a page's compaction, and short of the grace.
+    b.now += Duration::from_secs(70);
+    b.ticks(3);
+    assert_eq!(b.shadow.tally, Tally::default());
+    b.put_checkpoint(&ended);
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "compared and not expired");
+    // The grace past the removal, for a table already let go of, counts nothing more.
+    b.now += GONE_GRACE * 2;
+    b.ticks(3);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+}
+
+/// The worker is sent a request at the time it is sent, not at the time the pass began or the time the tick took: a
+/// pass can take longer than the worker's wait for an answer (a lock waited for, a plan, the drains), and the silence
+/// is judged from the post.
+#[test]
+fn a_request_is_posted_at_the_time_it_is_sent_and_not_the_time_the_pass_began() {
+    let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut b = Bench::with_worker("house roulette 3", |m| gated(m, go.clone()));
+    let t0 = b.now;
+    // A pass whose clock moves on 30 seconds with every reading: what it asks of the worker it asks at the end of it.
+    let readings = std::cell::Cell::new(0u64);
+    let last = std::cell::Cell::new(t0);
+    let clock = || {
+        readings.set(readings.get() + 1);
+        let at = t0 + Duration::from_secs(30 * (readings.get() - 1));
+        last.set(at);
+        at
+    };
+    let rooms = |b: &Bench| vec![(b.room().to_string(), b.doc.clone(), b.view.clone())];
+    let r = rooms(&b);
+    b.shadow.tick_with(&clock, r);
+    assert!(b.shadow.counts().cold >= 1, "the table was posted");
+    let posted = last.get();
+    assert!(posted >= t0 + Duration::from_secs(60), "(the last reading is the post's, well after the first two)");
+    // Five seconds after the post, the worker has not answered: no more than five seconds of silence.
+    let r = rooms(&b);
+    b.shadow.tick_with(&|| posted + Duration::from_secs(5), r);
+    assert!(b.shadow.sup.is_up(), "five seconds of silence is no failure");
+    assert_eq!(b.shadow.sup.counts().1, 0);
+    // Past the wait for an answer it is.
+    let r = rooms(&b);
+    b.shadow.tick_with(&|| posted + Duration::from_secs(11), r);
+    assert_eq!(b.shadow.sup.counts().1, 1, "and eleven are");
+    go.store(true, Ordering::SeqCst);
+}
+
+/// The node's own shadow holds what it reads of a doc to the times the house can wait for; the tests' does not.
+#[test]
+fn the_nodes_own_shadow_holds_its_reads_of_a_doc_to_a_time() {
+    use crate::fold_pins::PIN_WALK_TIME;
+    use crate::house_mirror::DRAIN_TIME;
+    let b = Bench::new("house roulette 3");
+    assert_eq!((b.shadow.limits.drain_time, b.shadow.pin_walk_time), (None, None));
+    let live = FoldShadow::live(ThreadLaunch::new(Arc::new(|| panic!("no worker is wanted"))), Instant::now());
+    assert_eq!((live.limits.drain_time, live.pin_walk_time), (Some(DRAIN_TIME), Some(PIN_WALK_TIME)));
+    assert_eq!(live.limits.drain_bytes, Limits::default().drain_bytes);
+}
+
+/// A drain with no time at all does one action and stops, and the shadow still gets to the end of its work: the
+/// table is answered and a page's trim compared.
+#[test]
+fn a_shadow_whose_drains_have_no_time_still_reads_a_table_and_compares_its_trim() {
+    let mut b = Bench::new("house craps 3");
+    b.shadow.limits = Limits { drain_time: Some(Duration::ZERO), ..Limits::default() };
+    b.shadow.pin_walk_time = Some(Duration::ZERO);
+    // (The rooms are attached after the limits are set.)
+    b.until("the first answer", |b| b.caught_up());
+    let cp = b.page_trim(&b.answer());
+    b.put_checkpoint(&cp);
+    b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+}
+
+/// The shadow's own watch of a room's players is held to the walk time it is given: a map not read to its end in the
+/// time leaves the pins unsettled, and so the view.
+#[test]
+fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
+    for timed in [false, true] {
+        let b = Bench::new("house roulette 3");
+        for i in 0..200 {
+            b.add_player(&format!("p{i:03}"), &format!("key-{i}"));
+        }
+        let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+        let mut shadow = b.shadow;
+        shadow.pin_walk_time = timed.then_some(Duration::ZERO);
+        let plan = HousePlan { tables: vec![], houses, complete: true };
+        let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
+        assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
+        assert_eq!(view.pins.len() == 200, !timed, "timed={timed}");
+    }
+}
+
+/// The final checkpoint of a removed table that is first read in the tick its grace ends is compared, and the table is
+/// not counted expired: the comparison comes before the giving up.
+#[test]
+fn a_final_checkpoint_first_read_as_the_grace_ends_is_compared_and_not_expired() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let u = last_decided(&sum).expect("a decided round");
+    let ended = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+    let t = b.case.ctx.t.clone();
+    b.mark_gone(&t);
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    // The grace is over as the checkpoint is written: the next drain is the first to read it.
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.put_checkpoint(&ended);
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() }, "compared, and not given up on");
+    assert_eq!(b.forgets(), 1);
+}
+
+/// A table whose grace is over and whose final checkpoint is written and not read (the drain was short) is kept for
+/// it: given up on only when there is nothing left to read.
+#[test]
+fn a_table_whose_grace_is_over_with_its_final_checkpoint_written_and_unread_is_kept() {
+    let mut b = Bench::new("house roulette 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let sum = b.answer();
+    let u = last_decided(&sum).expect("a decided round");
+    let ended = with_cp(&page_cp(&sum, u, nets_through(&sum, u), false, false), "e", Some(CVal::Int(1)));
+    let (t, inc, room) = (b.case.ctx.t.clone(), b.case.ctx.inc.clone(), b.room().to_string());
+    b.mark_gone(&t);
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(3);
+    b.put_checkpoint(&ended);
+    assert!(b.shadow.rooms[&room].mirror.base_unread(&t, &inc), "(written, not read)");
+    let later = b.now + GONE_GRACE + Duration::from_secs(1);
+    let view = b.view.clone().unwrap();
+    let rs = b.shadow.rooms.get_mut(&room).unwrap();
+    let mut tally = Tally::default();
+    rs.expire(later, &view, &mut tally);
+    assert_eq!(tally, Tally::default(), "nothing is given up on");
+    assert!(rs.gone.contains_key(&(t.clone(), inc.clone())), "and the removal is remembered");
+    // The drain reads it, and it is compared.
+    b.now = later;
+    b.until("let go", |b| b.shadow.rooms.is_empty());
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+}
+
+/// A table with no checkpoint and held for another reason (a record a page may read otherwise) is no unreadable
+/// checkpoint, though its base changed before: the skip is for the checkpoint the node cannot read.
+#[test]
+fn a_table_held_for_a_record_a_page_may_read_otherwise_is_no_unreadable_checkpoint() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let cp = b.page_trim(&b.answer());
+    b.put_checkpoint(&cp);
+    b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
+    let before = b.shadow.tally;
+    b.ticks(5);
+    // A page's junk where the checkpoint was: no checkpoint again, the table's first session read afresh, and a record
+    // in it that a page may read otherwise.
+    let (t, inc) = (b.case.ctx.t.clone(), b.case.ctx.inc.clone());
+    let first = b.live(None);
+    let key = b.case.warm.iter().flatten().find(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).expect("a record");
+    {
+        let comp = b.doc.get_or_insert_map(crate::house::COMPUTED_MAP);
+        let mut txn = b.doc.transact_mut();
+        comp.insert(&mut txn, format!("sum:{t}:{inc}"), to_any(&CVal::Int(5)));
+        let Some(yrs::Out::YMap(m)) = comp.get(&txn, &first) else { panic!("no first session") };
+        let proto = yrs::Any::Map(Arc::new(std::collections::HashMap::from([("r".to_string(), yrs::Any::Number(1.0)), ("__proto__".to_string(), yrs::Any::String(Arc::from("x")))])));
+        m.insert(&mut txn, key.as_str(), proto);
+    }
+    b.ticks(20);
+    let st = b.shadow.rooms[b.room()].mirror.state(&t, &inc).unwrap();
+    assert!(st.base.is_none() && st.trims >= 2 && st.hold == Some(crate::house_mirror::Hold::Unclear), "the table is held for a record: {:?} trims {}", st.hold, st.trims);
+    assert_eq!(b.shadow.tally, before, "and nothing is counted of a checkpoint that is none");
 }

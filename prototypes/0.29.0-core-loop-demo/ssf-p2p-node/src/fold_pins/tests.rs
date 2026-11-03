@@ -466,3 +466,33 @@ fn the_epoch_moves_with_a_pin_and_with_the_pins_ceasing_to_be_the_whole_story_an
     assert_eq!(watch.epoch(), at_cap);
     let _ = p.view();
 }
+
+/// The read of the players already in the map is held to a time as well as a count, when the node says so: a map that
+/// takes longer is not WALKED, as one past the count is, and what the pages pinned of the rest is unknown.
+#[test]
+fn a_players_map_that_takes_longer_than_the_walk_time_is_unsettled() {
+    let doc = Doc::new();
+    for i in 0..200 {
+        put(&doc, &format!("p{i:03}"), &key(&format!("{i}")));
+    }
+    let mut p = PlayerPins::attach_timed(&doc, PIN_WALK_KEYS, None);
+    assert_eq!((p.view().0.len(), p.view().1), (200, true), "no time limit: all of it");
+    let mut p = PlayerPins::attach_timed(&doc, PIN_WALK_KEYS, Some(Duration::from_secs(60)));
+    assert_eq!((p.view().0.len(), p.view().1), (200, true), "a limit it does not reach");
+    let mut p = PlayerPins::attach_timed(&doc, PIN_WALK_KEYS, Some(Duration::ZERO));
+    let (pins, settled) = p.view();
+    assert!(!settled, "no time at all: the walk stops where it first looks at the clock");
+    assert!(pins.len() < 200 && pins.len() >= WALK_CLOCK_EVERY - 1, "{}", pins.len());
+    // It stays unsettled, whatever comes after.
+    put(&doc, "late", "late");
+    assert!(!p.view().1);
+    // A map shorter than the clock's look is read whole, whatever the time: the cost is bounded by the look.
+    let small = Doc::new();
+    for i in 0..(WALK_CLOCK_EVERY - 1) {
+        put(&small, &format!("p{i:03}"), &key(&format!("{i}")));
+    }
+    let mut p = PlayerPins::attach_timed(&small, PIN_WALK_KEYS, Some(Duration::ZERO));
+    assert_eq!((p.view().0.len(), p.view().1), (WALK_CLOCK_EVERY - 1, true));
+    // The node's own watch carries the time.
+    assert_eq!(PIN_WALK_TIME, Duration::from_millis(20));
+}

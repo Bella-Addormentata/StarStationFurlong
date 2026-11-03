@@ -15,9 +15,9 @@
 //! change that replaces a key carries the old one (`EntryChange::Updated`):
 //! a player first seen as replaced is pinned to the old key, as a page that
 //! saw it before pinned it. The players already in the map when the observer
-//! starts are read once, up to [`PIN_WALK_KEYS`] entries, in one pass: not a
-//! scan that goes on from where the last stopped, for a map is walked from
-//! its start whatever the cursor.
+//! starts are read once, up to [`PIN_WALK_KEYS`] entries and [`PIN_WALK_TIME`]
+//! (the doc is held while it goes on), in one pass: not a scan that goes on from
+//! where the last stopped, for a map is walked from its start whatever the cursor.
 //!
 //! WHEN IT CANNOT KNOW. What the pages pinned depends on which transactions
 //! each of them saw, so some histories have no one answer, and then the pins
@@ -28,7 +28,8 @@
 //! - the players are more than [`MAX_FOLD_PINS`] (CAPPED: which of them each
 //!   page pinned depends on the order it saw them in);
 //! - the map held more than [`PIN_WALK_KEYS`] entries when the observer
-//!   started (not WALKED: the players past them are unknown);
+//!   started, or took longer than [`PIN_WALK_TIME`] to read (not WALKED: the
+//!   players past them are unknown);
 //! - an entry carries a `__proto__` field (AMBIGUOUS: a page reads the key
 //!   with a property access, which can come from the prototype the field sets,
 //!   and the node reads the field itself).
@@ -48,6 +49,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use yrs::types::{DeepObservable, EntryChange, Event, Events};
 use yrs::{Any, Doc, Map, Out, ReadTxn, Subscription, Transact, TransactionMut};
@@ -63,6 +65,12 @@ const MAX_PIN_KEY_UNITS: usize = 128;
 /// The most entries read of a players map that already holds some when the
 /// node starts to watch it.
 pub const PIN_WALK_KEYS: usize = 65_536;
+/// How long the node's own watch ([`PlayerPins::attach_timed`]) may hold the doc for that first read: the house's
+/// tick waits for the doc's write lock behind a read held here, with the house's own lock held. A map not read to its
+/// end in this time is not WALKED, as one past [`PIN_WALK_KEYS`] is.
+pub const PIN_WALK_TIME: Duration = Duration::from_millis(20);
+/// How many entries the walk reads between looks at the clock.
+const WALK_CLOCK_EVERY: usize = 64;
 
 /// A player id the pages pin a key for: not empty, at most 128 UTF-16 units.
 pub fn pid_pinnable(s: &str) -> bool {
@@ -196,14 +204,18 @@ fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
 }
 
 /// The players already in the map, read once: false if the map held more than
-/// `limit` of them.
-fn walk(doc: &Doc, shared: &Mutex<PinState>, limit: usize) -> bool {
+/// `limit` of them, or the read took longer than `time`.
+fn walk(doc: &Doc, shared: &Mutex<PinState>, limit: usize, time: Option<Duration>) -> bool {
+    let started = Instant::now();
     let txn = doc.transact();
     let Some(players) = txn.get_map("players") else { return true };
     let mut st = lock(shared);
     let mut visited = 0;
     for (pid, value) in players.iter(&txn) {
         if visited >= limit {
+            return false;
+        }
+        if visited % WALK_CLOCK_EVERY == WALK_CLOCK_EVERY - 1 && time.is_some_and(|t| started.elapsed() >= t) {
             return false;
         }
         visited += 1;
@@ -247,12 +259,18 @@ impl PlayerPins {
     /// Watch `doc`'s `players` map, and read what it holds up to `walk_limit`
     /// entries. Call it with no transaction open on `doc`.
     pub fn attach(doc: &Doc, walk_limit: usize) -> PlayerPins {
+        PlayerPins::attach_timed(doc, walk_limit, None)
+    }
+
+    /// [`PlayerPins::attach`], with the read of the players already in the map held to `walk_time` (None: no limit
+    /// of time): past it the map is not WALKED, as if it held more than `walk_limit`.
+    pub fn attach_timed(doc: &Doc, walk_limit: usize, walk_time: Option<Duration>) -> PlayerPins {
         let players = doc.get_or_insert_map("players");
         let shared = Arc::new(Mutex::new(PinState::default()));
         let cb = shared.clone();
         let sub = players.observe_deep(move |txn, events| note(&cb, txn, events));
         // (The observer first: a change from now on is noted whatever the walk sees of it.)
-        let walked = walk(doc, &shared, walk_limit);
+        let walked = walk(doc, &shared, walk_limit, walk_time);
         PlayerPins { shared, _sub: sub, walked, cache: None }
     }
 

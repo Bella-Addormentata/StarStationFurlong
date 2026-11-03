@@ -84,6 +84,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use yrs::types::{DeepObservable, EntryChange, Event, Events, PathSegment};
 use yrs::{Doc, Map, MapRef, Out, ReadTxn, Subscription, TransactionMut};
@@ -96,6 +97,10 @@ use crate::house_bytes::{self as hb, CVal, Ctx};
 pub const DRAIN_BYTES: usize = READ_PER_TICK;
 /// The changed paths (and cold-read keys) a drain looks at, whatever they weigh.
 pub const DRAIN_PATHS: usize = 4_096;
+/// How long a drain may hold the doc for the node's own pass ([`Limits::live`]): what is left waits for the next.
+/// The weights above bound what a drain reads; this bounds the time it takes, whatever the doc's size makes of it, for
+/// the house's tick waits for the doc's write lock behind a read held here, with the house's own lock held.
+pub const DRAIN_TIME: Duration = Duration::from_millis(20);
 /// The changed record keys of one live session the mirror lists between two
 /// drains. Past it the session is read afresh. (Honest sessions change a
 /// few dozen keys a tick.)
@@ -117,11 +122,21 @@ pub struct Limits {
     pub dirty_keys: usize,
     pub pending_bytes: usize,
     pub session_keys: usize,
+    /// A drain stops, as if it had spent its budget, once it has done something and this has passed
+    /// (None: no limit of time, as in the tests, where a slow machine must not change what a drain does).
+    pub drain_time: Option<Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { drain_bytes: DRAIN_BYTES, drain_paths: DRAIN_PATHS, dirty_keys: MAX_DIRTY_KEYS, pending_bytes: MAX_PENDING_BYTES, session_keys: MAX_SESSION_KEYS }
+        Limits { drain_bytes: DRAIN_BYTES, drain_paths: DRAIN_PATHS, dirty_keys: MAX_DIRTY_KEYS, pending_bytes: MAX_PENDING_BYTES, session_keys: MAX_SESSION_KEYS, drain_time: None }
+    }
+}
+
+impl Limits {
+    /// The limits of the node itself: the defaults, and a drain that takes no longer than [`DRAIN_TIME`].
+    pub fn live() -> Limits {
+        Limits { drain_time: Some(DRAIN_TIME), ..Limits::default() }
     }
 }
 
@@ -140,7 +155,8 @@ struct Dirt {
     recs: BTreeMap<String, Recs>,
     /// Checkpoints (`sum:` names) that changed in a transaction after which the doc held updates it could
     /// not apply yet, for want of something another peer wrote (a page's trim that deleted records this node
-    /// has not been sent: what it deleted is more than this node has read, and may be more than it will).
+    /// has not been sent: what it deleted is more than this node has read, and may be more than it will), or in
+    /// which something was made and deleted (records and the trim that deleted them, sent together).
     lagged: BTreeSet<String>,
 }
 
@@ -204,12 +220,32 @@ fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether this transaction deleted a block it also made: something that came to the doc and went in one
+/// transaction, so that nothing was ever there for the node to read. A page's records of a live session and its trim,
+/// which deletes them, can come in one update (the node was away, or the updates were merged on the way): all of it is
+/// integrated, nothing is left waiting, and the records, made in a map that is deleted by the same update, leave no
+/// event of their own. What the node never read of the session before the trim is told only by this.
+fn made_and_deleted(txn: &TransactionMut) -> bool {
+    let before = txn.before_state();
+    txn.delete_set().iter().any(|(client, ranges)| {
+        let seen = before.get(client);
+        ranges.iter().any(|r| r.end > seen)
+    })
+}
+
+/// Whether a change to a key is the value written again as it stands, which every page reads alike (a value of the
+/// doc's plain kind, [`hb::Clarity::Clear`]): the same record under the same key moves nothing.
+fn rewritten_alike(change: &EntryChange) -> bool {
+    matches!(change, EntryChange::Updated(Out::Any(old), Out::Any(new)) if old == new && hb::clarity(new) == hb::Clarity::Clear)
+}
+
 /// The observer's callback. It runs inside the doc's commit: a lookup for
 /// each key that changed, and a key kept only if it is watched.
 fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Events) {
     let mut w = lock(shared);
     let Watch { names, dirt, delegations } = &mut *w;
-    // (After this transaction, does the doc hold updates it could not apply yet? Asked once, when a checkpoint changes.)
+    // (After this transaction, did the doc lack something it was sent, or was something made and deleted in it? Asked
+    // once, when a checkpoint changes.)
     let mut gap = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
@@ -217,7 +253,10 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
         match path.len() {
             0 => {
                 for (key, change) in map.keys(txn).iter() {
-                    if key.starts_with("hk:") {
+                    // (A delegation written again as it stands, as two pages of the deed holder do when both run its duty
+                    // at once, changes nothing: no house comes or goes, and every page reads it alike. One a page may read
+                    // otherwise is churn all the same.)
+                    if key.starts_with("hk:") && !rewritten_alike(change) {
                         delegations.changes += 1;
                         if !matches!(change, EntryChange::Inserted(_)) {
                             delegations.churned = true;
@@ -225,7 +264,7 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                     }
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
-                        if key.starts_with("sum:") && *gap.get_or_insert_with(|| txn.store().pending_update().is_some() || txn.store().pending_ds().is_some()) {
+                        if key.starts_with("sum:") && *gap.get_or_insert_with(|| txn.store().pending_update().is_some() || txn.store().pending_ds().is_some() || made_and_deleted(txn)) {
                             dirt.lagged.insert(key.to_string());
                         }
                     }
@@ -267,6 +306,8 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
 struct Budget {
     bytes: usize,
     paths: usize,
+    /// When the drain must stop (once it has done something).
+    deadline: Option<Instant>,
     /// Nothing charged yet: the one case an action bigger than the whole
     /// budget is admitted (and then costs what is left).
     fresh: bool,
@@ -276,8 +317,19 @@ struct Budget {
 }
 
 impl Budget {
-    fn new(bytes: usize, paths: usize) -> Budget {
-        Budget { bytes, paths, fresh: true, spent: false, used_bytes: 0, used_paths: 0 }
+    fn new(bytes: usize, paths: usize, time: Option<Duration>) -> Budget {
+        Budget { bytes, paths, deadline: time.map(|t| Instant::now() + t), fresh: true, spent: false, used_bytes: 0, used_paths: 0 }
+    }
+
+    /// The time is up: the drain has begun an action before this one, and its deadline has passed. (Asked where an
+    /// action begins, not within it, and not before the first: a drain slow to start is not one that never gets
+    /// anywhere, and an action is read to its end.)
+    fn late(&mut self) -> bool {
+        let late = self.used_paths > 0 && self.deadline.is_some_and(|d| Instant::now() >= d);
+        if late {
+            self.spent = true;
+        }
+        late
     }
 
     fn charge(&mut self, n: usize) -> bool {
@@ -302,7 +354,7 @@ impl Budget {
     }
 
     fn path(&mut self) -> bool {
-        if self.spent {
+        if self.spent || self.late() {
             return false;
         }
         if self.paths == 0 {
@@ -1002,7 +1054,7 @@ impl RoomMirror {
         let noted = std::mem::take(&mut lock(&self.shared).dirt);
         self.pending.merge(noted, self.limits.dirty_keys);
         let comp = txn.get_map(COMPUTED_MAP);
-        let mut budget = Budget::new(self.limits.drain_bytes, self.limits.drain_paths);
+        let mut budget = Budget::new(self.limits.drain_bytes, self.limits.drain_paths, self.limits.drain_time);
         let keys: Vec<(String, String)> = self.tables.keys().cloned().collect();
         let mut short = false;
         let mut resets = 0;

@@ -683,8 +683,11 @@ struct RoomMem {
     /// one on from the last after a tick a read was short.
     turn: usize,
     /// What the last pass found for the node's fold in shadow
-    /// ([`House::fold_plan`]): None while the room has no verified
-    /// delegation of this house, or the pass could not read every switch.
+    /// ([`House::fold_plan`]): None while the room has no verified delegation of
+    /// this house. A pass that could not finish reading (its reads spent before
+    /// every switch was seen, or a check put off) keeps the plan of the one
+    /// before, not complete: it says nothing of the room, which is no word that
+    /// the tables have gone.
     fold: Option<FoldPlan>,
 }
 
@@ -1045,11 +1048,22 @@ impl House {
         Some(k)
     }
 
+    /// A pass that could not read the room to say what it holds keeps the plan the last one found, not complete
+    /// ([`House::fold_plan`]). (The end of the tick sets `complete` for every plan from whether the tick was short, and a
+    /// tick that kept a plan was; saying it here as well is for whoever reads this alone.)
+    fn keep_plan(&mut self, room: &str, prev: Option<FoldPlan>) {
+        if let (Some(prev), Some(mem)) = (prev, self.rooms.get_mut(room)) {
+            mem.fold = Some(FoldPlan { complete: false, ..prev });
+        }
+    }
+
     /// What the node's fold in shadow follows in `room`: None unless the last
-    /// pass found this house delegated and read every switch. The tables may
-    /// be none (the last one has ended: the shadow reads what it left and
-    /// lets it go). Copied from what the pass found: no doc is read here, so
-    /// the house's lock is held for a copy only.
+    /// pass found this house delegated (a pass that could not read the room to
+    /// the end left the plan before it, which is not complete, so that tables
+    /// the shadow is reading are not let go of on a pass that could not say).
+    /// The tables may be none (the last one has ended: the shadow reads what it
+    /// left and lets it go). Copied from what the pass found: no doc is read
+    /// here, so the house's lock is held for a copy only.
     pub fn fold_plan(&self, room: &str) -> Option<HousePlan> {
         let mem = self.rooms.get(room)?;
         let plan = mem.fold.as_ref()?;
@@ -1209,10 +1223,8 @@ impl House {
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
         self.unclear_houses.clear();
-        // (The fold follows only what a pass that got this far found.)
-        if let Some(mem) = self.rooms.get_mut(room) {
-            mem.fold = None;
-        }
+        // (The fold follows only what a pass that got this far found; a pass cut short keeps the last one's, not complete.)
+        let prev = self.rooms.get_mut(room).and_then(|mem| mem.fold.take());
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
@@ -1251,6 +1263,10 @@ impl House {
         // (Its check put off: the next pass.)
         let Some(delegation) = delegation else {
             self.short |= self.deferred;
+            // (A check put off is no word that there is no delegation.)
+            if self.deferred {
+                self.keep_plan(room, prev);
+            }
             return writes;
         };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
@@ -1288,6 +1304,7 @@ impl House {
         // (The switches not all read: nothing in the room, the next tick.)
         if self.read_out {
             self.short = true;
+            self.keep_plan(room, prev);
             return writes;
         }
         tables.sort();

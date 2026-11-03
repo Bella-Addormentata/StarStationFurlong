@@ -1545,6 +1545,7 @@ fn applying_what_is_taken_gives_the_doc_whatever_the_budgets() {
             dirty_keys: 2 + rng.next(12) as usize,
             pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 64,
+            drain_time: None,
         };
         let mut f = Fix::with(limits);
         let mut model = Model::default();
@@ -1626,8 +1627,9 @@ fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
             dirty_keys: 2 + rng.next(12) as usize,
             pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 24,
+            drain_time: None,
         };
-        let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24 };
+        let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24, drain_time: None };
         let mut f = Fix::with(limits);
         let mut model = Model::default();
         let live = live0();
@@ -1958,4 +1960,128 @@ fn the_delegations_of_a_room_are_counted_and_a_replacement_or_a_removal_is_churn
     assert!(!f.m.delegations().churned);
     f.remove_top("hk:house-a");
     assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "removed");
+}
+
+// ── Review round 4 ───────────────────────────────────────────────────────────
+
+fn apply_to(doc: &Doc, update: &[u8]) {
+    use yrs::updates::decoder::Decode;
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+}
+
+/// A delegation written again as it stands is no change: no house comes or goes, and every page reads it alike
+/// (two pages of the deed holder write the same record when both run its duty at once). One written otherwise is churn.
+#[test]
+fn a_delegation_written_again_as_it_stands_is_no_churn() {
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false }, "the same record, twice more");
+    // A record of another delegation is another change all the same, and one that differs from the last is churn.
+    f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(2))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "a record that differs");
+    // A removal is churn however the record read; and what is written after it is a new record.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &s("a"));
+    f.remove_top("hk:house-a");
+    f.put_top("hk:house-a", &s("a"));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true }, "removed, and written again");
+    // A record a page may read otherwise (a `__proto__` field) written again as it stands is churn all the same: what
+    // a page reads of it is not what the node reads.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    let ambiguous = || Any::Map(Arc::new(std::collections::HashMap::from([("v".to_string(), Any::Number(1.0)), ("__proto__".to_string(), Any::String(Arc::from("x")))])));
+    f.put_any("hk:house-p", ambiguous());
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    f.put_any("hk:house-p", ambiguous());
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true }, "the same record, and one a page may read otherwise");
+}
+
+/// The records a page wrote and the trim that deleted them can come to the node in one update: all of it is integrated,
+/// nothing waits, and the records, made in a session the same update deletes, leave no event. The trim is of a session
+/// read only as far as the node was sent, and says so.
+#[test]
+fn a_trim_that_comes_in_one_update_with_the_records_it_deletes_says_it_is_unread() {
+    for together in [true, false] {
+        let first = Page::new(1);
+        first.session(&live0(), &records(&[(1, 10)]));
+        let mut f = Fix::empty();
+        apply_to(&f.doc, &first.diff_since(&yrs::StateVector::default()));
+        f.drain();
+        f.take();
+        let before = first.state();
+        first.put(&live0(), &rk(1, 2), &rv(1, 20));
+        let mid = first.state();
+        let close = first.diff_since(&before);
+        let base = cp(2);
+        first.trim(&live0(), &base, &live_of(T, Some(&base)));
+        let trim = first.diff_since(&mid);
+        if together {
+            apply_to(&f.doc, &first.diff_since(&before));
+        } else {
+            apply_to(&f.doc, &close);
+            f.drain();
+            f.take();
+            apply_to(&f.doc, &trim);
+        }
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (false, false), "together={together}: nothing waits: the doc was sent all of it");
+        f.drain();
+        assert_eq!(f.state().trims, 1, "together={together}");
+        assert_eq!(f.state().unread_at_trim, together, "together={together}");
+        // The next trim is not marked by the last.
+        f.take();
+        let next = live_of(T, Some(&base));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!(f.state().trims, 2);
+        assert!(!f.state().unread_at_trim, "together={together}: the lag of the first trim is not the second's");
+    }
+}
+
+/// A drain that has taken its time stops, with what it was reading left for the next: the whole of it is read,
+/// each record once, by drains each of which has done something.
+#[test]
+fn a_drain_that_has_taken_its_time_stops_and_the_next_goes_on() {
+    let all: Vec<(u32, i64)> = (0..40).map(|i| (i, i as i64)).collect();
+    // (No time at all: each drain does its first action and then no more.)
+    let limits = Limits { drain_time: Some(Duration::ZERO), ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    let mut shorts = 0;
+    let mut drains = 0;
+    for _ in 0..500 {
+        let d = f.drain();
+        drains += 1;
+        shorts += d.short as usize;
+        assert!(d.paths > 0 || f.m.current(T, INC), "every drain that has work does some");
+        model.take(&mut f.m, T);
+        if f.m.current(T, INC) {
+            break;
+        }
+    }
+    assert!(f.m.current(T, INC), "it goes on to the end: {drains} drains");
+    assert!(shorts >= 2, "the time stopped it: {shorts}");
+    assert_eq!(model.recs, model_of(&all));
+    assert_eq!(model.taken, 40, "each record once");
+    // The same table with no limit of time is read in one drain.
+    let mut g = Fix::seeded(Limits::default(), |g| g.session(&live0(), &records(&all)));
+    assert!(!g.drain().short);
+    assert!(g.m.current(T, INC));
+    // The node's own limits carry the time.
+    assert_eq!(Limits::live().drain_time, Some(DRAIN_TIME));
+    assert_eq!(Limits::default().drain_time, None);
 }

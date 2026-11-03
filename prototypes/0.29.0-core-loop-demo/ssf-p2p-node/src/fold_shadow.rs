@@ -32,18 +32,18 @@
 #![cfg(feature = "house-fold")]
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use yrs::{Doc, Map, ReadTxn, Transact};
 
 use crate::fold_feed::{Counts, Feed, Inputs};
-use crate::fold_pins::{PinWatch, PlayerPins, PIN_WALK_KEYS};
+use crate::fold_pins::{PinWatch, PlayerPins, PIN_WALK_KEYS, PIN_WALK_TIME};
 use crate::fold_supervisor::{Event, Launch, Supervisor};
 use crate::house::{checkpoint_ok, HousePlan, CASINO_MAP};
 use crate::house_bytes::{self as hb, CVal};
 use crate::house_fold::{rules_id, FoldSummary, FOLD_TABLES};
-use crate::house_mirror::{Limits, RoomMirror};
+use crate::house_mirror::{Hold, Limits, RoomMirror};
 use crate::HouseFoldReport;
 
 /// Why a comparison was not made.
@@ -77,6 +77,11 @@ pub enum Skip {
     /// answer had not come. (The checkpoint a table is first read with is no
     /// trim, and is not counted.)
     Unanswered,
+    /// A table a page's removal ended was let go of because the final checkpoint
+    /// a page writes when it compacts it had not come in [`GONE_GRACE`] (no page
+    /// was awake to compact it, or the pages took longer than that): what the
+    /// fold worked out of the table is held against nothing.
+    Expired,
 }
 
 impl Skip {
@@ -91,6 +96,7 @@ impl Skip {
             Skip::Stale => "stale",
             Skip::Inputs => "inputs",
             Skip::Unanswered => "unanswered",
+            Skip::Expired => "expired",
         }
     }
 }
@@ -220,12 +226,13 @@ pub struct Tally {
     pub stale: u64,
     pub inputs: u64,
     pub unanswered: u64,
+    pub expired: u64,
 }
 
 impl Tally {
     /// Every comparison not made.
     pub fn skipped(&self) -> u64 {
-        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered
+        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired
     }
 }
 
@@ -243,6 +250,7 @@ impl Tally {
             Verdict::Skip(Skip::Stale) => self.stale += 1,
             Verdict::Skip(Skip::Inputs) => self.inputs += 1,
             Verdict::Skip(Skip::Unanswered) => self.unanswered += 1,
+            Verdict::Skip(Skip::Expired) => self.expired += 1,
         }
     }
 }
@@ -269,10 +277,59 @@ pub struct FoldView {
     pub watch: Option<PinWatch>,
 }
 
-/// How long a table that a page's removal took out of the plan is kept for the final checkpoint
-/// a page writes when it compacts the removed table (some seconds after the removal, when a page is
-/// in the room): past it the table is let go of, checkpoint or none.
-pub const GONE_GRACE: Duration = Duration::from_secs(60);
+/// How long a table that a page's removal took out of the plan is kept for the final checkpoint a page writes when it
+/// compacts the removed table: a page does it 10 s after it sees the end, in its turn, or 60 s after if none of the
+/// slips in the table's sessions are its own (`COMPACT_MS`, `COMPACT_FALLBACK_MS` of computedTable.ts), a page can see
+/// the end later than the node, and a page that wakes starts the wait again. So twice the fallback: past it the table is
+/// let go of, checkpoint or none, and the comparison not made is counted ([`Skip::Expired`]). (No page may be awake to
+/// compact it at all, so there is no waiting for ever: the table would hold a place of the worker's 14 for good.)
+pub const GONE_GRACE: Duration = Duration::from_secs(120);
+
+/// How many lines of what the comparisons found the shadow keeps for `/api/fingerprint`: the last mismatches and the
+/// last comparisons not made, each their own, so that a run of one cannot push out the other. (The node of the desktop
+/// app has no console to print to.)
+pub const LOG_LINES: usize = 32;
+/// The most bytes of one such line: a mismatch names the nets of up to 4,096 players.
+pub const LOG_LINE_BYTES: usize = 512;
+
+/// `line`, cut to [`LOG_LINE_BYTES`] at a character.
+fn clip(mut line: String) -> String {
+    if line.len() > LOG_LINE_BYTES {
+        let mut cut = LOG_LINE_BYTES;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+        line.push('…');
+    }
+    line
+}
+
+/// What the comparisons said, kept (see [`LOG_LINES`]) as well as printed.
+#[derive(Default)]
+struct Log {
+    mismatches: VecDeque<String>,
+    skips: VecDeque<String>,
+}
+
+impl Log {
+    fn push(&mut self, mismatch: bool, line: String) {
+        let ring = if mismatch { &mut self.mismatches } else { &mut self.skips };
+        if ring.len() >= LOG_LINES {
+            ring.pop_front();
+        }
+        ring.push_back(clip(line));
+    }
+}
+
+/// What a room's comparisons said since the shadow last took it: `(a mismatch, the line)`.
+type Said = Vec<(bool, String)>;
+
+/// Print `line` and keep it to be taken into the shadow's log (an agreement is printed only).
+fn say(said: &mut Said, mismatch: bool, line: String) {
+    eprintln!("🧮 fold-shadow {line}");
+    said.push((mismatch, line));
+}
 
 /// The most tables the shadow follows at once, over all rooms: the worker's
 /// engine holds FOLD_TABLES and lets the least recently used go, so more
@@ -284,6 +341,9 @@ pub const GONE_GRACE: Duration = Duration::from_secs(60);
 pub const MAX_SHADOW_TABLES: usize = FOLD_TABLES - 2;
 
 type TableKey = (String, String);
+
+/// What time it is, asked afresh where it matters (see [`tick_shadow_with`]); the tests give it a time of their own.
+pub type Clock<'a> = &'a dyn Fn() -> Instant;
 
 /// What was shown of a table's answer: the answer (which taking up of the table, which frame of it), and where
 /// the pins and the delegations stood then. The answer is believed at a trim only if they stand there still.
@@ -319,11 +379,19 @@ struct RoomShadow {
     gone: BTreeMap<TableKey, Instant>,
     /// The room is no longer followed: its tables are being let go of.
     leaving: bool,
+    /// What its comparisons said, for the shadow's log.
+    said: Said,
 }
 
 /// A checkpoint's identity: the hash of its canonical bytes.
 fn identity(cp: &CVal) -> [u8; 32] {
     hb::sha256(hb::canon(cp).unwrap_or_default().as_bytes())
+}
+
+/// The identity of the checkpoint a table is held over (one the mirror keeps no copy of): which taking up of the table
+/// it is, and how many times its base has changed.
+fn held_identity(born: u64, trims: u64) -> [u8; 32] {
+    hb::sha256(format!("held:{born}:{trims}").as_bytes())
 }
 
 #[cfg(test)]
@@ -345,6 +413,7 @@ impl RoomShadow {
             seen_delegations: 0,
             gone: BTreeMap::new(),
             leaving: false,
+            said: Vec::new(),
         }
     }
 
@@ -404,6 +473,24 @@ impl RoomShadow {
         }
     }
 
+    /// A table a page's removal ended that the view does not follow and that was kept for the final checkpoint a page
+    /// writes when it compacts it, whose [`GONE_GRACE`] is over and whose checkpoint did not come: given up on, and
+    /// the comparison not made counted, once. (A checkpoint a page has written and the mirror has not read keeps its
+    /// table whatever the time: `kept`.)
+    fn expire(&mut self, now: Instant, view: &FoldView, tally: &mut Tally) {
+        let due: Vec<TableKey> = self.gone.iter().filter(|(k, since)| !view.tables.contains(*k) && now.saturating_duration_since(**since) >= GONE_GRACE).map(|(k, _)| k.clone()).collect();
+        for k in due {
+            if self.mirror.base_unread(&k.0, &k.1) {
+                continue;
+            }
+            self.gone.remove(&k);
+            if self.mirror.state(&k.0, &k.1).is_some_and(|st| !st.ended) {
+                tally.note(&Verdict::Skip(Skip::Expired));
+                say(&mut self.said, false, format!("{} {}: skipped (expired: no final checkpoint in {} s)", k.0, k.1, GONE_GRACE.as_secs()));
+            }
+        }
+    }
+
     /// The doc read, the worker's answers taken, the tables compared where a
     /// page's trim came. `keep`: the tables of this room that the view does not follow
     /// (it left the plan, or the cap has no place for it) and that are kept while their last
@@ -439,6 +526,8 @@ impl RoomShadow {
         // The pins and the delegations as the doc the drain read shows them: what moved since a table was shown whole takes it back.
         let pins = view.watch.as_ref().map_or(view.pins_epoch, PinWatch::epoch);
         self.compare(tally, &covered, pins, self.mirror.delegations().changes);
+        // (After the comparison: a final checkpoint that came with the drain is compared before its table is given up on.)
+        self.expire(now, view, tally);
         // The view's tables, and those that left it and are kept.
         let mut want: Vec<TableKey> = view.tables.clone();
         let outside: Vec<TableKey> = self.mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).chain(keep.iter().cloned()).collect();
@@ -482,14 +571,27 @@ impl RoomShadow {
     /// its lack of an input. A trim read when the fold has no answer from before
     /// it is counted as a comparison not made.
     fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, pins: u64, delegations: u64) {
-        let RoomShadow { mirror, feed, compared, confirmed, .. } = self;
+        let RoomShadow { mirror, feed, compared, confirmed, said, .. } = self;
         let keys: Vec<TableKey> = mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
         compared.retain(|k, _| keys.contains(k));
         confirmed.retain(|k, _| keys.contains(k));
         for key in keys {
             let (t, inc) = (&key.0, &key.1);
             let Some(st) = mirror.state(t, inc) else { continue };
-            let Some(cp) = st.base else { continue };
+            let Some(cp) = st.base else {
+                // A checkpoint this node cannot read as a page does (one heavier than a drain reads, or one a page may read
+                // otherwise) holds the table and the mirror keeps none: a trim that brought one is counted, once, as a
+                // comparison not made. (The first checkpoint a table is read with is no trim.)
+                if st.hold == Some(Hold::Base) && st.trims > 0 {
+                    let id = held_identity(st.born, st.trims);
+                    if compared.get(&key) != Some(&id) {
+                        compared.insert(key.clone(), id);
+                        tally.note(&Verdict::Skip(Skip::Unreadable));
+                        say(said, false, format!("{t} {inc}: skipped (unreadable: the checkpoint cannot be read as a page reads it)"));
+                    }
+                }
+                continue;
+            };
             let id = identity(cp);
             if compared.get(&key) == Some(&id) {
                 continue;
@@ -500,7 +602,7 @@ impl RoomShadow {
                 if st.trims > 0 {
                     compared.insert(key.clone(), id);
                     tally.note(&Verdict::Skip(Skip::Unanswered));
-                    eprintln!("🧮 fold-shadow {t} {inc} u={u}: skipped (unanswered)");
+                    say(said, false, format!("{t} {inc} u={u}: skipped (unanswered)"));
                 }
                 continue;
             };
@@ -517,9 +619,9 @@ impl RoomShadow {
             tally.note(&verdict);
             match &verdict {
                 Verdict::Agree => eprintln!("🧮 fold-shadow {t} {inc} u={u}: agrees with the checkpoint"),
-                Verdict::Mismatch(why) => eprintln!("🧮 fold-shadow {t} {inc} u={u}: MISMATCH — {why}"),
+                Verdict::Mismatch(why) => say(said, true, format!("{t} {inc} u={u}: MISMATCH — {why}")),
                 Verdict::Skip(Skip::Past) => {}
-                Verdict::Skip(why) => eprintln!("🧮 fold-shadow {t} {inc} u={u}: skipped ({})", why.name()),
+                Verdict::Skip(why) => say(said, false, format!("{t} {inc} u={u}: skipped ({})", why.name())),
             }
         }
     }
@@ -537,9 +639,13 @@ pub struct FoldShadow<L: Launch> {
     pins: BTreeMap<String, PlayerPins>,
     /// The most players read of a players map when its watch starts ([`PIN_WALK_KEYS`]; less in the tests).
     pin_walk: usize,
+    /// How long that read may hold the doc ([`PIN_WALK_TIME`]; no limit in the tests).
+    pin_walk_time: Option<Duration>,
     /// What each room's mirror reads in a drain (the defaults; less in the tests).
     limits: Limits,
     tally: Tally,
+    /// The last of what the comparisons said (the mismatches and the comparisons not made).
+    log: Log,
     /// What the rooms let go of did.
     gone: Counts,
     /// Tables followed now, and tables the rooms have that are not followed
@@ -555,12 +661,23 @@ impl<L: Launch> FoldShadow<L> {
             rooms: BTreeMap::new(),
             pins: BTreeMap::new(),
             pin_walk: PIN_WALK_KEYS,
+            pin_walk_time: None,
             limits: Limits::default(),
             tally: Tally::default(),
+            log: Log::default(),
             gone: Counts::default(),
             followed: 0,
             over: 0,
         }
+    }
+
+    /// The node's own: [`FoldShadow::new`], with what it reads of a doc held to the times the house can wait
+    /// for ([`DRAIN_TIME`](crate::house_mirror::DRAIN_TIME), [`PIN_WALK_TIME`]).
+    pub fn live(launch: L, now: Instant) -> FoldShadow<L> {
+        let mut shadow = FoldShadow::new(launch, now);
+        shadow.limits = Limits::live();
+        shadow.pin_walk_time = Some(PIN_WALK_TIME);
+        shadow
     }
 
     /// The fold duties are off for good: nothing is followed or read.
@@ -572,9 +689,14 @@ impl<L: Launch> FoldShadow<L> {
     /// follow (None: nothing, or it is no house there). The players of the rooms with a plan are
     /// watched here, under the shadow's own lock and not the house's.
     pub fn tick_plans(&mut self, now: Instant, plans: Vec<(String, Doc, Option<HousePlan>)>) {
+        self.tick_plans_with(&|| now, plans)
+    }
+
+    /// [`FoldShadow::tick_plans`], at the time `clock` says each time it is asked (see [`Clock`]).
+    pub fn tick_plans_with(&mut self, clock: Clock<'_>, plans: Vec<(String, Doc, Option<HousePlan>)>) {
         if self.is_off() {
             self.pins.clear();
-            self.tick(now, Vec::new());
+            self.tick_with(clock, Vec::new());
             return;
         }
         let listed: BTreeSet<&String> = plans.iter().map(|p| &p.0).collect();
@@ -587,14 +709,15 @@ impl<L: Launch> FoldShadow<L> {
                 (room, doc, view)
             })
             .collect();
-        self.tick(now, rooms);
+        self.tick_with(clock, rooms);
     }
 
     /// The view of a room with a plan: the plan's tables and houses, the pins as the shadow's own watch of the
     /// players has them, the epoch they stand at, and the watch to ask where they stand later (the watch of a
     /// room starts with its first plan).
     fn view_of(&mut self, room: &str, doc: &Doc, plan: HousePlan, walk: usize) -> FoldView {
-        let watched = self.pins.entry(room.to_string()).or_insert_with(|| PlayerPins::attach(doc, walk));
+        let walk_time = self.pin_walk_time;
+        let watched = self.pins.entry(room.to_string()).or_insert_with(|| PlayerPins::attach_timed(doc, walk, walk_time));
         let watch = watched.watch();
         let (pins, pins_settled, pins_epoch) = watched.view_at();
         FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled, pins_epoch, watch: Some(watch) }
@@ -607,7 +730,13 @@ impl<L: Launch> FoldShadow<L> {
     /// ones to go (of every room) before it is asked to take one that is new: first each room's
     /// answers are taken, its tables compared and the word to let go of tables sent; then each
     /// room's changes. A word the worker was too busy to take holds the new tables back.
-    pub fn tick(&mut self, now: Instant, mut rooms: Vec<(String, Doc, Option<FoldView>)>) {
+    pub fn tick(&mut self, now: Instant, rooms: Vec<(String, Doc, Option<FoldView>)>) {
+        self.tick_with(&|| now, rooms)
+    }
+
+    /// [`FoldShadow::tick`], at the time `clock` says each time it is asked (see [`Clock`]): the worker is polled
+    /// at the time of the poll, and what is asked of it is posted at the time it is.
+    pub fn tick_with(&mut self, clock: Clock<'_>, mut rooms: Vec<(String, Doc, Option<FoldView>)>) {
         if self.sup.off().is_some() {
             // The fold duties are off for good: nothing is followed (the worker is gone).
             for (_, rs) in std::mem::take(&mut self.rooms) {
@@ -616,7 +745,8 @@ impl<L: Launch> FoldShadow<L> {
             self.followed = 0;
             return;
         }
-        let events = self.sup.poll(now);
+        let events = self.sup.poll(clock());
+        let now = clock();
         rooms.sort_by(|a, b| a.0.cmp(&b.0));
         // The tables kept after the view lets them go (their last checkpoint not read yet, or a page's removal
         // ended them and the checkpoint of its compaction may yet come) keep their places in the worker.
@@ -668,23 +798,26 @@ impl<L: Launch> FoldShadow<L> {
                 Some(view) if view.tables.is_empty() && !self.rooms.contains_key(&room) => {}
                 Some(view) => {
                     let rs = self.rooms.entry(room.clone()).or_insert_with(|| RoomShadow::attach(&doc, &room, self.limits));
-                    rs.follow(now, &doc, &view, keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
+                    rs.follow(clock(), &doc, &view, keep.get(&room).unwrap_or(&none), &events, &mut self.sup, &mut self.tally);
+                    for (mismatch, line) in std::mem::take(&mut rs.said) {
+                        self.log.push(mismatch, line);
+                    }
                 }
                 None => {
                     if let Some(rs) = self.rooms.get_mut(&room) {
-                        rs.leave(now, &events, &mut self.sup);
+                        rs.leave(clock(), &events, &mut self.sup);
                     }
                 }
             }
         }
         for (room, rs) in self.rooms.iter_mut() {
             if !listed.contains(room) {
-                rs.leave(now, &events, &mut self.sup);
+                rs.leave(clock(), &events, &mut self.sup);
             }
         }
         let allow_new = !self.rooms.values().any(|rs| rs.feed.owes_forget());
         for rs in self.rooms.values_mut() {
-            rs.send(now, &mut self.sup, allow_new);
+            rs.send(clock(), &mut self.sup, allow_new);
         }
         // A room let go of goes once the worker has been told of every table.
         let done: Vec<String> = self.rooms.iter().filter(|(_, rs)| rs.leaving && rs.feed.is_idle()).map(|(r, _)| r.clone()).collect();
@@ -726,6 +859,8 @@ impl<L: Launch> FoldShadow<L> {
             tables: self.followed,
             tables_over: self.over,
             off: self.sup.off().map(str::to_string),
+            recent_mismatches: self.log.mismatches.iter().cloned().collect(),
+            recent_skips: self.log.skips.iter().cloned().collect(),
         }
     }
 }
@@ -736,18 +871,20 @@ impl<L: Launch> FoldShadow<L> {
 /// and reads the rest under its own. Its report, or None if it panicked (a
 /// panic costs the shadow its tick and nothing else). With the fold duties off
 /// for good nothing is asked of any room.
-pub fn tick_shadow<L: Launch>(
-    shadow: &std::sync::Mutex<FoldShadow<L>>,
-    docs: Vec<(String, Doc)>,
-    now: Instant,
-    mut plan_of: impl FnMut(&str) -> Option<HousePlan>,
-) -> Option<HouseFoldReport> {
+pub fn tick_shadow<L: Launch>(shadow: &std::sync::Mutex<FoldShadow<L>>, docs: Vec<(String, Doc)>, now: Instant, plan_of: impl FnMut(&str) -> Option<HousePlan>) -> Option<HouseFoldReport> {
+    tick_shadow_with(shadow, docs, &|| now, plan_of)
+}
+
+/// [`tick_shadow`], at the time `clock` says each time it is asked: a pass can take longer than the worker's wait for an
+/// answer (a lock waited for, a plan, the watch of a room's players, the drains), so the time it began is no time to
+/// post a request by or to judge a silence by.
+pub fn tick_shadow_with<L: Launch>(shadow: &std::sync::Mutex<FoldShadow<L>>, docs: Vec<(String, Doc)>, clock: Clock<'_>, mut plan_of: impl FnMut(&str) -> Option<HousePlan>) -> Option<HouseFoldReport> {
     let lock = || shadow.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         {
             let mut off = lock();
             if off.is_off() {
-                off.tick_plans(now, Vec::new());
+                off.tick_plans_with(clock, Vec::new());
                 return off.report();
             }
         }
@@ -759,7 +896,7 @@ pub fn tick_shadow<L: Launch>(
             })
             .collect();
         let mut shadow = lock();
-        shadow.tick_plans(now, plans);
+        shadow.tick_plans_with(clock, plans);
         shadow.report()
     }))
     .ok()

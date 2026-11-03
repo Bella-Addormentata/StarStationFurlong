@@ -1088,7 +1088,7 @@ fn the_sweep_lets_go_of_workers_that_have_exited() {
 #[cfg(unix)]
 #[test]
 fn the_sweep_keeps_a_worker_that_is_still_running() {
-    let mut running = Command::new("sleep").arg("600").spawn().expect("sleep");
+    let running = Command::new("sleep").arg("600").spawn().expect("sleep");
     let pid = running.id();
     let mut list = vec![Arc::new(Mutex::new(quick_child()))];
     let running = Arc::new(Mutex::new(running));
@@ -1101,4 +1101,70 @@ fn the_sweep_keeps_a_worker_that_is_still_running() {
     let mut c = running.lock().unwrap();
     let _ = c.kill();
     let _ = c.wait();
+}
+
+// ── An answer on its way ────────────────────────────────────────────────────
+
+/// An answer the reader has counted off what the worker owes and has not queued yet is the worker's word: neither the
+/// silence of the worker nor the exit of its process is found while it is on its way, and both are found when it is not.
+/// (The reader's step between the count and the queue is held here by taking the count down by hand: a thread cannot be
+/// stopped between two lines of its own.)
+#[test]
+fn no_silence_and_no_exit_is_found_while_an_answer_is_on_its_way() {
+    for exit in [false, true] {
+        let t0 = Instant::now();
+        let (mut s, m) = holding(t0, ANSWER_BYTES);
+        assert_eq!(s.post(t0, &warm("a", 1)), Post::Posted);
+        // The reader has read the answer to the one frame owed, and has not queued it.
+        s.link.as_ref().expect("a link").unanswered.fetch_sub(1, Ordering::SeqCst);
+        if exit {
+            m.exit();
+        }
+        // (Times past the timeout, and past the grace of an exit.)
+        for step in 0..5 {
+            assert!(s.poll(t0 + secs(60 + step * 20)).is_empty(), "exit={exit}: the answer is on its way (step {step})");
+        }
+        assert!(s.is_up(), "exit={exit}");
+        assert_eq!(s.counts().1, 0, "exit={exit}: no failure");
+        // It is queued, or it never was: the count is what the worker owes again, and the silence is found.
+        s.link.as_ref().unwrap().unanswered.fetch_add(1, Ordering::SeqCst);
+        let got = s.poll(t0 + secs(200));
+        assert_eq!(got.len(), 1, "exit={exit}: {got:?}");
+        // (The exit of the process is held for its grace; the silence is long enough to be found first.)
+        assert_eq!(crashed(&got[0]).0, "no answer in 10 s", "exit={exit}");
+    }
+}
+
+/// ... and the exit of a process whose answers are all in is found as before, in its time.
+#[test]
+fn an_exit_with_nothing_on_its_way_is_found_after_its_grace() {
+    let t0 = Instant::now();
+    let (mut s, m) = holding(t0, ANSWER_BYTES);
+    s.post(t0, &warm("a", 1));
+    m.exit();
+    assert!(s.poll(t0 + secs(1)).is_empty(), "the exit is seen");
+    let got = s.poll(t0 + secs(1) + EXIT_GRACE);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(crashed(&got[0]).0, "the worker exited");
+}
+
+/// The answers a poll finds queued are handed over whatever the count says: the check of one on its way is made after them.
+#[test]
+fn an_answer_in_the_queue_is_handed_over_before_the_check_of_one_on_its_way() {
+    let t0 = Instant::now();
+    let (mut s, mut m) = holding(t0, ANSWER_BYTES);
+    for v in 1..=2 {
+        s.post(t0, &warm("a", v));
+        m.next_req();
+    }
+    m.reply(&result("a", 1));
+    until("the first answer queued", || s.link.as_ref().is_some_and(|l| l.answer_bytes_waiting() > 0));
+    // The second is owed and not answered: the first is handed over at once, however late the node looks, and the wait
+    // for the second counts from there.
+    let late = t0 + secs(60);
+    assert_eq!(s.poll(late), vec![Event::Answer(result("a", 1))]);
+    assert!(s.poll(late + secs(9)).is_empty());
+    let got = s.poll(late + secs(11));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(crashed(&got[0]).0, "no answer in 10 s", "the second, owed, is silence");
 }

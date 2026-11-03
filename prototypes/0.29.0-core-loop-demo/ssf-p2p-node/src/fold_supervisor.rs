@@ -600,6 +600,15 @@ impl<L: Launch> Supervisor<L> {
                 Err(_) => break,
             }
         }
+        // An answer the reader has read and the queue does not hold yet (it is between the pipe and the queue, in
+        // `Inbox::admit`) is the worker's word, not its silence, and is found by the next poll: no failure of silence
+        // or of an exit is found while one is on its way. (The reader counts an answer off `unanswered` when it has
+        // read it whole, before it counts and queues it: so, the queue found empty, answers this side is still
+        // owed that the worker no longer owes are answers in flight. The queue alone cannot say: a poll between the
+        // reader's count and its queueing found it empty, and, a slow node's ten seconds on, called the worker silent.)
+        if self.link.as_ref().is_some_and(|l| l.unanswered.load(Ordering::SeqCst) < self.owed.len()) {
+            return events;
+        }
         // A process that is gone closes its output, and the reader tells us in order, after
         // every answer it wrote: that is how a failure is normally found. A process seen gone
         // whose output has not yet said so (the reader is behind) is given a moment to, so what

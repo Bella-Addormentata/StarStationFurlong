@@ -3994,3 +3994,85 @@ fn a_plan_is_not_complete_while_a_table_waits_on_a_fair_setting_a_page_may_read_
     room.tick(200);
     assert!(fold_plan_of(&mut room).unwrap().complete, "read clean: complete");
 }
+
+// ── Review round 4: a pass that could not say ────────────────────────────────
+
+/// A pass that spent its reads before it had seen every switch says nothing of the room, and is no word that the tables
+/// have gone: the plan of the pass before is kept, not complete, so that the shadow does not let go of tables it is
+/// reading (and so cannot compare their trims) because a room had a busy tick.
+#[test]
+fn a_pass_that_could_not_read_every_switch_keeps_the_last_plan_not_complete() {
+    let mut room = Room::new("fold-plan-kept-switches", true);
+    room.tick(1_000);
+    let before = fold_plan_of(&mut room).expect("a plan");
+    assert!(before.complete && before.tables == vec![(T.to_string(), INC.to_string())]);
+    // The casino map grows past what a tick reads.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..60_000 {
+            casino.insert(&mut txn, format!("zz:{i:08}"), Any::Bool(true));
+        }
+    }
+    room.tick(200);
+    assert!(room.house.read_out, "(the pass spent its reads)");
+    let kept = fold_plan_of(&mut room).expect("the plan of the pass before");
+    assert!(!kept.complete, "but not complete");
+    assert_eq!((kept.tables, kept.houses), (before.tables.clone(), before.houses.clone()));
+    // The map is as it was: the next pass reads it all, and the plan is complete again.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..60_000 {
+            casino.remove(&mut txn, &format!("zz:{i:08}"));
+        }
+    }
+    room.tick(200);
+    let again = fold_plan_of(&mut room).expect("a plan");
+    assert!(again.complete && again.tables == before.tables);
+}
+
+/// ... and so does a pass whose check of the delegation was put off (the budget of checks, the doc let go for them): a
+/// delegation not checked yet is not one that is not there.
+#[test]
+fn a_pass_whose_check_of_the_delegation_was_put_off_keeps_the_last_plan_not_complete() {
+    let mut room = Room::new("fold-plan-kept-check", true);
+    room.tick(1_000);
+    let before = fold_plan_of(&mut room).expect("a plan");
+    // A new deed holder, who delegates: their record is checked once, and not in the pass that finds it.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.delegate(&who("alice"));
+    room.tick_passes(200, 1);
+    let kept = fold_plan_of(&mut room).expect("the plan of the pass before");
+    assert!(!kept.complete);
+    assert_eq!(kept.tables, before.tables);
+    // The next tick has the check, and the plan is the new deed holder's.
+    room.tick(200);
+    let now = fold_plan_of(&mut room).expect("a plan");
+    assert!(now.complete);
+    assert_eq!(room.house.rooms[ROOM].fold.as_ref().map(|f| f.owner_key.clone()), Some(who("alice").public.clone()));
+}
+
+/// A delegation that is not there is a word: a deed holder who has not delegated this house leaves no plan, as a
+/// pass whose check was not put off shows (the plan is not kept for anything but a pass that could not say).
+#[test]
+fn a_pass_that_found_no_delegation_leaves_no_plan() {
+    let mut room = Room::new("fold-plan-gone", true);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).is_some());
+    // A new deed holder, who has not delegated this house; the old one's delegation names the old one's key.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.tick(200);
+    assert!(!room.house.deferred, "(nothing was put off: the record is not one to check)");
+    assert_eq!(fold_plan_of(&mut room), None);
+    room.tick(200);
+    assert_eq!(fold_plan_of(&mut room), None);
+}

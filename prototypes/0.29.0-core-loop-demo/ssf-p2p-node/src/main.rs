@@ -467,6 +467,14 @@ pub struct HouseFoldReport {
     /// Why the fold is off (`crashes`: the worker failed too often; `env`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off: Option<String>,
+    /// The last mismatches the comparisons found, and the last comparisons not made, each with the table, the
+    /// checkpoint's round and why (a mismatch: the field and both values), the newest last. Kept here because the
+    /// desktop app starts the node with no console, so a line printed to stderr reaches nobody there. At most 32 lines
+    /// of 512 bytes each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_mismatches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_skips: Vec<String>,
 }
 
 /// 📖 The node's Phone Book listing as the browser sees it (`Fingerprint::
@@ -2312,7 +2320,7 @@ async fn node_main() -> Result<()> {
         fingerprint.house_fold = Some(HouseFoldReport { off: Some("env".to_string()), ..HouseFoldReport::default() });
         None
     } else {
-        Some(Mutex::new(fold_shadow::FoldShadow::new(fold_supervisor::ChildLaunch::new(), std::time::Instant::now())))
+        Some(Mutex::new(fold_shadow::FoldShadow::live(fold_supervisor::ChildLaunch::new(), std::time::Instant::now())))
     };
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
@@ -4786,8 +4794,9 @@ mod house_fold_switch_tests {
 #[cfg(feature = "house-fold")]
 fn fold_shadow_pass(hub: &SharedHub) {
     let (Some(shadow), Some(house)) = (hub.fold_shadow.as_ref(), hub.house.as_ref()) else { return };
-    // (The house, then the doc, as its own tick takes them.)
-    let report = fold_shadow::tick_shadow(shadow, served_docs(&hub.rooms), std::time::Instant::now(), |room_id| house::lock(house).fold_plan(room_id));
+    // (The house, then the doc, as its own tick takes them. The time is asked as it is wanted: the pass may wait for a lock
+    // or a doc, and a request posted by the time it began would be called unanswered the sooner.)
+    let report = fold_shadow::tick_shadow_with(shadow, served_docs(&hub.rooms), &std::time::Instant::now, |room_id| house::lock(house).fold_plan(room_id));
     match report {
         Some(report) => hub.fingerprint.lock().unwrap().house_fold = Some(report),
         None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),
