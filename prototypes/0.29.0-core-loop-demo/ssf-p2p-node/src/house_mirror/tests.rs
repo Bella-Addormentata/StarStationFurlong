@@ -153,6 +153,14 @@ impl Fix {
         m.insert(&mut txn, key, v);
     }
 
+    /// A shared type under a key of the session, where a record is a plain value.
+    fn put_nested(&self, ses: &str, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, MapPrelim::default());
+    }
+
     fn puts(&self, ses: &str, records: &[(String, CVal)]) {
         let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
         let mut txn = self.doc.transact_mut();
@@ -793,6 +801,190 @@ fn a_session_that_grows_past_the_most_is_held() {
     assert!(f.state().queued == 0 && f.m.take(T, INC, usize::MAX).is_none());
 }
 
+/// Keys that are in a session without being records the mirror keeps.
+#[derive(Clone, Copy, Debug)]
+enum Odd {
+    /// A key no record goes under.
+    Junk,
+    /// A key longer than any record's.
+    Overlong,
+    /// A record's key, with a shared type under it.
+    Nested,
+    /// A record's key, with a value heavier than any the pages take.
+    Heavy,
+}
+
+fn add_odd(f: &Fix, kind: Odd, batch: u32, n: u32) {
+    for i in 0..n {
+        let tag = batch * 100 + i;
+        match kind {
+            Odd::Junk => f.put(&live0(), &format!("junk{tag}"), &rv(1, tag as i64)),
+            Odd::Overlong => f.put(&live0(), &format!("{}{tag}", "k".repeat(MAX_KEY_BYTES + 1)), &rv(1, tag as i64)),
+            Odd::Nested => f.put_nested(&live0(), &rk(2, tag)),
+            Odd::Heavy => f.put_value(&live0(), &rk(2, tag), Any::String(Arc::from("h".repeat(MAX_RECORD_BYTES + 1).as_str()))),
+        }
+    }
+}
+
+#[test]
+fn a_session_that_grows_by_keys_that_are_no_records_is_held_as_a_cold_read_would_hold_it() {
+    for kind in [Odd::Junk, Odd::Overlong, Odd::Nested, Odd::Heavy] {
+        let limits = Limits { session_keys: 8, dirty_keys: 4, ..Limits::default() };
+        let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&[(0, 1), (1, 1)])));
+        f.drain();
+        f.take();
+        // Three keys a drain, under what the mirror lists of a session's changes: 5, 8 keys…
+        for batch in 0..2 {
+            add_odd(&f, kind, batch, 3);
+            f.drain();
+            assert_eq!(f.state().hold, None, "{kind:?} {batch}: eight is the most");
+            assert!(f.m.current(T, INC), "{kind:?} {batch}");
+        }
+        // …and 11.
+        add_odd(&f, kind, 2, 3);
+        let d = f.drain();
+        assert_eq!(f.state().hold, Some(Hold::Flooded), "{kind:?}: more than the most");
+        if matches!(kind, Odd::Junk) {
+            // (Junk costs nothing to pass over: the count is all of it, the most and one keys.)
+            assert_eq!(d.bytes, 9 * VISIT_BYTES);
+        }
+        assert!(f.m.take(T, INC, usize::MAX).is_none());
+        // A mirror that starts now finds the same.
+        let mut fresh = RoomMirror::attach_with(&f.doc, ROOM, limits);
+        fresh.want(&[(T.into(), INC.into())]);
+        {
+            let txn = f.doc.transact();
+            fresh.drain(&txn);
+        }
+        assert_eq!(fresh.state(T, INC).unwrap().hold, Some(Hold::Flooded), "{kind:?}: from the doc");
+    }
+}
+
+#[test]
+fn records_added_to_a_session_that_holds_other_keys_count_with_them() {
+    let limits = Limits { session_keys: 8, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| {
+        let mut all = records(&[(0, 1), (1, 1)]);
+        all.extend((0..6).map(|i| (format!("junk{i}"), rv(1, i))));
+        f.session(&live0(), &all);
+    });
+    f.drain();
+    assert_eq!(f.state().hold, None, "eight keys is the most");
+    f.take();
+    // A record is a key, and the session is nine.
+    f.put(&live0(), &rk(1, 2), &rv(1, 2));
+    f.drain();
+    assert_eq!(f.state().hold, Some(Hold::Flooded));
+    // Not so when keys that were no records have gone meanwhile.
+    f.session(&live0(), &records(&[(0, 1), (1, 1)]));
+    f.drain();
+    assert_eq!(f.state().hold, None);
+    f.take();
+    f.puts(&live0(), &records(&[(2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]));
+    add_odd(&f, Odd::Junk, 0, 1);
+    f.remove(&live0(), "junk0");
+    f.put(&live0(), &rk(1, 8), &rv(1, 8));
+    f.drain();
+    assert_eq!(f.state().hold, Some(Hold::Flooded), "nine records");
+}
+
+#[test]
+fn values_that_are_no_records_count_among_the_keys_of_a_session_a_cold_read_found() {
+    let limits = Limits { session_keys: 8, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| {
+        f.session(&live0(), &records(&[(0, 1), (1, 1), (2, 1)]));
+        add_odd(f, Odd::Heavy, 0, 2);
+        add_odd(f, Odd::Nested, 1, 3);
+    });
+    f.drain();
+    assert_eq!(f.state().hold, None, "eight keys is the most");
+    f.take();
+    f.put(&live0(), &rk(1, 3), &rv(1, 3));
+    f.drain();
+    assert_eq!(f.state().hold, Some(Hold::Flooded), "nine keys");
+}
+
+#[test]
+fn a_count_the_drain_cannot_pay_waits_for_the_next() {
+    let limits = Limits { session_keys: 100, drain_bytes: 1_000, ..Limits::default() };
+    let all: Vec<(u32, i64)> = (0..40).map(|i| (i, 1)).collect();
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    f.settle(&mut model);
+    f.put(&live0(), "junk", &rv(1, 1));
+    f.put(&live0(), &rk(1, 50), &rv(1, 50));
+    // The record's read leaves less than the count of 41 keys costs.
+    let d = f.drain();
+    assert!(d.short);
+    assert!(!f.m.current(T, INC), "a count is owed");
+    let d = f.drain();
+    assert!(!d.short && f.m.current(T, INC));
+}
+
+#[test]
+fn the_keys_of_a_session_are_counted_only_when_something_odd_changed_and_at_what_they_weigh() {
+    let limits = Limits { session_keys: 100, ..Limits::default() };
+    let all: Vec<(u32, i64)> = (0..50).map(|i| (i, 1)).collect();
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    f.drain();
+    f.take();
+    // Records that come and go cost their reads, not a count of the session.
+    f.put(&live0(), &rk(1, 60), &rv(1, 60));
+    f.remove(&live0(), &rk(1, 0));
+    let d = f.drain();
+    assert!(d.bytes < 50 * VISIT_BYTES, "{}", d.bytes);
+    // A key that is no record: the keys are counted, 51 here, at a visit each.
+    f.put(&live0(), "junk", &rv(1, 1));
+    let d = f.drain();
+    assert!(d.bytes >= 51 * VISIT_BYTES && d.bytes < 52 * VISIT_BYTES + 200, "{}", d.bytes);
+    // And not again until something odd changes again.
+    f.put(&live0(), &rk(1, 61), &rv(1, 61));
+    let d = f.drain();
+    assert!(d.bytes < 50 * VISIT_BYTES, "{}", d.bytes);
+}
+
+#[test]
+fn a_held_table_whose_queue_fills_still_reads_the_record_that_holds_it() {
+    let all: Vec<(u32, i64)> = (2..40).map(|i| (i, i as i64)).collect();
+    let limits = Limits { pending_bytes: MAX_RECORD_BYTES + 600, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| {
+        f.session(&live0(), &records(&all));
+        // Two records a page may read otherwise, read first.
+        f.put_value(&live0(), &rk(1, 0), proto_value(1));
+        f.put_value(&live0(), &rk(1, 1), proto_value(1));
+    });
+    for _ in 0..10 {
+        f.drain();
+    }
+    assert_eq!(f.state().hold, Some(Hold::Unclear));
+    assert!(f.m.current(T, INC), "all of it read");
+    // Nobody can take from a held table: what was queued is given up, and no more is kept.
+    assert_eq!((f.state().queued, f.state().queued_bytes), (0, 0));
+    // One of the two goes: still held.
+    f.remove(&live0(), &rk(1, 0));
+    for _ in 0..10 {
+        f.drain();
+    }
+    assert_eq!(f.state().hold, Some(Hold::Unclear));
+    assert_eq!((f.state().queued, f.state().queued_bytes), (0, 0));
+    // The other is corrected, among twenty records rewritten: the table is followed again,
+    // from the start, and the rewrites that follow it are not read twice.
+    let rewritten: Vec<(u32, i64)> = (2..22).map(|i| (i, 500 + i as i64)).collect();
+    f.puts(&live0(), &records(&rewritten));
+    f.put(&live0(), &rk(1, 1), &rv(1, 1));
+    let d = f.drain();
+    assert_eq!(f.state().hold, None);
+    assert!(d.bytes < 400, "{}", d.bytes);
+    let mut model = Model::default();
+    f.settle(&mut model);
+    assert_eq!(f.state().hold, None);
+    let mut want = model_of(&all);
+    want.extend(model_of(&rewritten));
+    want.insert(rk(1, 1), rv(1, 1));
+    assert_eq!(model.recs, want);
+    assert!(model.resets >= 1, "the worker is told to start over");
+}
+
 #[test]
 fn reads_wait_while_the_changes_are_not_taken() {
     let all: Vec<(u32, i64)> = (0..30).map(|i| (i, i as i64)).collect();
@@ -999,5 +1191,104 @@ fn applying_what_is_taken_gives_the_doc_whatever_the_budgets() {
         assert_eq!(st.live, Some(live.as_str()), "seed {seed}");
         assert_eq!(model.base, base, "seed {seed}");
         assert_eq!(model.recs, doc_records(&f, &live), "seed {seed}");
+    }
+}
+
+/// What is not followed, the same whichever way the session came to be as the doc has it: a mirror that has watched
+/// the changes agrees with one that starts on the doc, except that a session found flooded stays so until replaced.
+#[test]
+fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
+    for seed in 1..=24u64 {
+        let mut rng = Rng(seed * 104_729);
+        let limits = Limits {
+            drain_bytes: 300 + rng.next(6_000) as usize,
+            drain_paths: 1 + rng.next(30) as usize,
+            dirty_keys: 2 + rng.next(12) as usize,
+            pending_bytes: MAX_RECORD_BYTES + 400 + rng.next(4_000) as usize,
+            session_keys: 24,
+        };
+        let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24 };
+        let mut f = Fix::with(limits);
+        let mut model = Model::default();
+        let live = live0();
+        let mut compared = 0;
+        for step in 0..500 {
+            match rng.next(16) {
+                0..=2 => {
+                    if f.has_session(&live) {
+                        f.put(&live, &rk(1, rng.next(12) as u32), &rv(1, rng.next(1_000) as i64));
+                    }
+                }
+                3 | 4 => {
+                    if f.has_session(&live) {
+                        f.remove(&live, &rk(1, rng.next(12) as u32));
+                    }
+                }
+                5 => {
+                    if f.has_session(&live) {
+                        f.put(&live, &format!("junk{}", rng.next(20)), &rv(1, 1));
+                    }
+                }
+                6 => {
+                    if f.has_session(&live) {
+                        f.remove(&live, &format!("junk{}", rng.next(20)));
+                    }
+                }
+                7 => {
+                    if f.has_session(&live) {
+                        f.put_value(&live, &rk(1, rng.next(12) as u32), proto_value(1));
+                    }
+                }
+                8 => {
+                    if f.has_session(&live) {
+                        f.put_nested(&live, &rk(2, rng.next(12) as u32));
+                    }
+                }
+                9 => {
+                    if f.has_session(&live) {
+                        let heavy = Any::String(Arc::from("x".repeat(MAX_RECORD_BYTES + 1)));
+                        f.put_value(&live, &rk(3, rng.next(12) as u32), heavy);
+                    }
+                }
+                10 => {
+                    if f.has_session(&live) {
+                        f.put(&live, &format!("{}{}", "k".repeat(MAX_KEY_BYTES + 1), rng.next(8)), &rv(1, 1));
+                    }
+                }
+                11 => {
+                    let recs: Vec<(u32, i64)> = (0..rng.next(8) as u32).map(|i| (i, rng.next(100) as i64)).collect();
+                    f.session(&live, &records(&recs));
+                }
+                12..=14 => {
+                    f.drain();
+                    model.take(&mut f.m, T);
+                }
+                _ => {
+                    // Read all of it, and set it against a mirror that starts here.
+                    f.settle(&mut model);
+                    let mut fresh = RoomMirror::attach_with(&f.doc, ROOM, big);
+                    fresh.want(&[(T.into(), INC.into())]);
+                    for _ in 0..20 {
+                        let txn = f.doc.transact();
+                        fresh.drain(&txn);
+                    }
+                    assert!(fresh.current(T, INC), "seed {seed} step {step}");
+                    let mut other = Model::default();
+                    other.take(&mut fresh, T);
+                    let (mine, theirs) = (f.state().hold, fresh.state(T, INC).unwrap().hold);
+                    if theirs == Some(Hold::Flooded) {
+                        assert_eq!(mine, theirs, "seed {seed} step {step}: a session over the most is held, however it grew");
+                    } else if mine != Some(Hold::Flooded) {
+                        assert_eq!(mine, theirs, "seed {seed} step {step}");
+                        if mine.is_none() {
+                            assert_eq!(model.recs, other.recs, "seed {seed} step {step}");
+                            assert_eq!(model.recs, doc_records(&f, &live), "seed {seed} step {step}");
+                        }
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 10, "seed {seed}: {compared}");
     }
 }

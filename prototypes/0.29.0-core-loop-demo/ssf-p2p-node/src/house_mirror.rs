@@ -53,11 +53,18 @@
 //! the most keys) is admitted when it comes first, and then costs the drain.
 //! What a table holds is bounded too: a session of more than
 //! [`MAX_SESSION_KEYS`] keys is FLOODED (held: no honest session is, it is
-//! trimmed at 20 rounds or 96 KB), and the changes waiting to be taken stop
-//! at [`MAX_PENDING_BYTES`]: past that, reads wait until the caller has taken
-//! some, so a stalled worker makes the node wait, not grow. Of a record the
-//! mirror keeps its key and its weight; its value is in the queue until
-//! taken, and a table that must be sent again is read again from the doc.
+//! trimmed at 20 rounds or 96 KB), whatever the keys are and however it came
+//! to have them: a cold read counts them as it lists them, and a change to a
+//! key that is no record, or to a value under a record's key that is none,
+//! has them counted afresh (charged a visit a key), as do records added to a
+//! session known to hold such keys. The changes waiting to be taken stop at
+//! [`MAX_PENDING_BYTES`]: past that, reads wait until the caller has taken
+//! some, so a stalled worker makes the node wait, not grow; except for a
+//! table that is held, from which nothing is taken: its queue is given up
+//! then, nothing more is queued, and it starts over (a reset) when nothing
+//! holds it. Of a record the mirror keeps its key and its weight; its value
+//! is in the queue until taken, and a table that must be sent again is read
+//! again from the doc.
 //!
 //! WHAT THE CALLER CAN RELY ON, after a drain that ran short of nothing (a
 //! table that [`RoomMirror::current`]): the changes taken since the table's
@@ -112,6 +119,10 @@ impl Default for Limits {
 }
 
 // ── What the observer notes ──────────────────────────────────────────────────
+
+/// What stands in the changed keys for those too long to be copied: a key no
+/// record goes under.
+const ODD_KEY: &str = "\u{0}";
 
 /// What changed since the last drain took it, by watched name.
 #[derive(Default)]
@@ -190,11 +201,12 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 let mut many = false;
                 if let Recs::Keys(set) = slot {
                     for (key, _) in map.keys(txn).iter() {
-                        // (A key longer than any record's is no record's.)
-                        if key.len() > MAX_KEY_BYTES {
-                            continue;
-                        }
-                        if set.len() >= limit && !set.contains(&**key) {
+                        // (A key longer than any record's is no record's, and
+                        // is not copied: that one changed is noted, as a key
+                        // that is no record's, so that the session's keys are
+                        // counted.)
+                        let key: &str = if key.len() > MAX_KEY_BYTES { ODD_KEY } else { key };
+                        if set.len() >= limit && !set.contains(key) {
                             many = true;
                             break;
                         }
@@ -327,6 +339,20 @@ struct Table {
     queue: BTreeMap<String, (Option<CVal>, usize)>,
     queue_bytes: usize,
     cold: Option<Cold>,
+    /// Something in the live session that is no record changed (a key no
+    /// record goes under, a value under a record's key that reads as nothing
+    /// or too heavy), or the keys may be more than the most: its keys are to
+    /// be counted afresh, as a cold read counts them, for the most.
+    recount: bool,
+    /// The keys of the live session that are not records the mirror keeps, as
+    /// last counted (a count only grows by a change that sets `recount`, so
+    /// the keys kept and these are never fewer than the session's, until a
+    /// count says).
+    extra: usize,
+    /// The table was held and its queue full: nothing can be taken from a
+    /// held table, so the queue was given up and no more kept. The table
+    /// starts over when nothing holds it.
+    stale: bool,
     /// Not yet said (by a `take`) that the table started over.
     announce: bool,
     generation: u64,
@@ -360,6 +386,9 @@ impl Table {
             queue: BTreeMap::new(),
             queue_bytes: 0,
             cold: None,
+            recount: false,
+            extra: 0,
+            stale: false,
             announce: true,
             generation: 0,
             version: 0,
@@ -393,6 +422,9 @@ impl Table {
         self.cold = None;
         self.present = false;
         self.flooded = false;
+        self.recount = false;
+        self.extra = 0;
+        self.stale = false;
         self.need_session = self.live.is_some();
         self.announce = true;
     }
@@ -430,11 +462,16 @@ impl Table {
                 self.keys.remove(key);
             }
         }
+        self.version += 1;
+        // (The table starts over before anything is taken: what is queued
+        // would be read again.)
+        if self.stale {
+            return;
+        }
         if let Some((_, old)) = self.queue.insert(key.to_string(), (value, size)) {
             self.queue_bytes -= old;
         }
         self.queue_bytes += size;
-        self.version += 1;
     }
 
     /// A record's key and what it reads as.
@@ -464,8 +501,19 @@ impl Table {
             }
             Read::Spent => {}
         }
-        if self.keys.len() + self.unclear.len() > session_keys {
+        let kept = self.keys.len() + self.unclear.len();
+        if kept > session_keys {
             self.flood();
+            return;
+        }
+        // (Keys the mirror does not keep are in the session too: past the
+        // most with them, the count says.)
+        if kept.saturating_add(self.extra) > session_keys {
+            self.recount = true;
+        }
+        if self.stale && self.unclear.is_empty() {
+            // (Nothing holds the table now, and what it was sent was given up.)
+            self.reset();
         }
     }
 
@@ -473,18 +521,70 @@ impl Table {
         self.queue_bytes.saturating_add(MAX_RECORD_BYTES) <= limits.pending_bytes
     }
 
-    /// Read one record of the live session, as the house reads one.
-    /// False when the drain's budget is spent first.
-    fn read_record<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, key: &str, b: &mut Budget, limits: &Limits) -> bool {
-        // (A key no record goes under: nothing to read, and nothing to tell.)
-        if key.len() > MAX_KEY_BYTES || !hb::utf8(key) || parse_key(key).is_none() {
+    /// Whether another record may be read. A full queue waits for the caller
+    /// to take; but nothing is taken from a table that is held, and the record
+    /// that holds it may be waiting to be read: the queue is given up then,
+    /// and the table starts over once it is followed again.
+    fn may_read(&mut self, limits: &Limits) -> bool {
+        if self.stale || self.room_for_a_record(limits) {
             return true;
         }
-        let read = read_costed(|n| b.charge(n), key.len(), ses.get(txn, key), MAX_RECORD_BYTES);
+        if self.hold().is_none() {
+            return false;
+        }
+        self.queue.clear();
+        self.queue_bytes = 0;
+        self.stale = true;
+        self.version += 1;
+        true
+    }
+
+    /// Read one record of the live session, as the house reads one.
+    /// False when the drain's budget is spent first.
+    /// `changed`: the key is one the doc changed (not one listed by a cold
+    /// read, whose keys are counted as they are listed).
+    fn read_record<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, key: &str, changed: bool, b: &mut Budget, limits: &Limits) -> bool {
+        // (A key no record goes under: nothing to read, and nothing to tell,
+        // but it is a key of the session.)
+        if key.len() > MAX_KEY_BYTES || !hb::utf8(key) || parse_key(key).is_none() {
+            self.recount |= changed;
+            return true;
+        }
+        let out = ses.get(txn, key);
+        let there = out.is_some();
+        let read = read_costed(|n| b.charge(n), key.len(), out, MAX_RECORD_BYTES);
         if matches!(read, Read::Spent) {
             return false;
         }
+        // (A value that is no record is a key of the session as well.)
+        if there && matches!(read, Read::Absent | Read::Heavy) {
+            if changed {
+                self.recount = true;
+            } else {
+                self.extra += 1;
+            }
+        }
         self.record(key, read, limits.session_keys);
+        true
+    }
+
+    /// Count the live session's keys afresh, up to the most and one: more than
+    /// the most holds it, as a cold read's list does. False when the budget
+    /// is spent first.
+    fn count_keys<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, b: &mut Budget, limits: &Limits) -> bool {
+        if !b.path() {
+            return false;
+        }
+        let n = ses.keys(txn).take(limits.session_keys.saturating_add(1)).count();
+        if !b.charge(n.saturating_mul(VISIT_BYTES)) {
+            return false;
+        }
+        self.recount = false;
+        if n > limits.session_keys {
+            self.flood();
+        } else {
+            self.extra = n.saturating_sub(self.keys.len() + self.unclear.len());
+        }
         true
     }
 
@@ -516,6 +616,7 @@ impl Table {
             return true;
         }
         names.sort();
+        self.extra = seen - names.len();
         self.cold = Some(Cold { keys: names, next: 0 });
         self.present = true;
         self.need_session = false;
@@ -591,17 +692,20 @@ impl Table {
         let Some(ses) = ses.filter(|_| self.present && !self.flooded) else { return true };
 
         // The records that changed.
+        let generation = self.generation;
         if let Some(Recs::Keys(set)) = pending.recs.get_mut(&live) {
             while let Some(key) = set.pop_first() {
-                if !self.room_for_a_record(limits) {
+                if !self.may_read(limits) {
                     set.insert(key);
                     return true;
                 }
-                if !b.path() || !self.read_record(&ses, txn, &key, b, limits) {
+                if !b.path() || !self.read_record(&ses, txn, &key, true, b, limits) {
                     set.insert(key);
                     return false;
                 }
-                if self.flooded {
+                // (Flooded, or started over: the rest of what changed was of
+                // the session before, and the session is listed afresh.)
+                if self.flooded || self.generation != generation {
                     break;
                 }
             }
@@ -612,13 +716,19 @@ impl Table {
         if self.flooded {
             return true;
         }
+        if self.recount && !self.count_keys(&ses, txn, b, limits) {
+            return false;
+        }
+        if self.flooded {
+            return true;
+        }
 
         // The rest of the cold read.
         while let Some(key) = self.cold.as_ref().and_then(|c| c.keys.get(c.next).cloned()) {
-            if !self.room_for_a_record(limits) {
+            if !self.may_read(limits) {
                 return true;
             }
-            if !b.path() || !self.read_record(&ses, txn, &key, b, limits) {
+            if !b.path() || !self.read_record(&ses, txn, &key, false, b, limits) {
                 return false;
             }
             if self.flooded {
@@ -811,7 +921,7 @@ impl RoomMirror {
     /// (as of the last drain): nothing of it is waiting to be read.
     pub fn current(&self, t: &str, inc: &str) -> bool {
         let Some(tb) = self.tables.get(&(t.to_string(), inc.to_string())) else { return false };
-        if !tb.based || tb.read_base || tb.need_session || tb.cold.is_some() || self.pending.tops.contains(&tb.sum_name) {
+        if !tb.based || tb.read_base || tb.need_session || tb.cold.is_some() || tb.recount || self.pending.tops.contains(&tb.sum_name) {
             return false;
         }
         match &tb.live {
