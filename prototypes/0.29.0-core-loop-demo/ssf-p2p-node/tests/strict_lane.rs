@@ -18,10 +18,13 @@
 //! Windows and macOS steps that build the release set run the wallet's tests
 //! alone, by name, so they build this file and do not run it.
 //!
-//! The node is given nothing to reach but the listener: the pin alone
+//! The node is pointed at nothing but the listener: the pin alone
 //! (`SSF_CHIA_PIN_ONLY=1`, so no introducer and no public peer), no Mainline
-//! DHT, no mDNS, no public-address echo, no relay and a random iroh port. The
-//! test's own `SSF_*` variables are not passed on, so a developer's or CI's
+//! DHT, no mDNS, no public-address echo, no relay and a random iroh port.
+//! iroh's port mapper stays on, since no `SSF_*` variable turns it off: when
+//! the endpoint binds, it asks the local network's gateway for a mapping
+//! (UPnP, NAT-PMP or PCP), and that never reaches the listener. The test's
+//! own `SSF_*` variables are not passed on, so a developer's or CI's
 //! `SSF_CHIA_NETWORK`, or any other, cannot change what is tested.
 #![cfg(all(feature = "chia-publish", feature = "torrent"))]
 
@@ -38,8 +41,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BIN: &str = env!("CARGO_BIN_EXE_ssf-p2p-node");
 
 /// How often the beat watcher wakes, in seconds (`WATCH_TICK_SECS` in
-/// src/chia_watch.rs). Its first read, and with it the control run's first
-/// dial of the pin, comes one tick after the start.
+/// src/chia_watch.rs). Its first read comes one tick after the start, and so
+/// does the publisher's first read of the peak (`HEARTBEAT_TICK_SECS` in
+/// src/chia_publish.rs, also 60 s); in the control run either may make the
+/// first dial of the pin.
 const WATCH_TICK_SECS: u64 = 60;
 
 /// How long the strict run lasts: three watcher ticks, and a margin for the
@@ -62,15 +67,23 @@ const SWITCH_FILE: &str = "chia_wallet.json";
 /// What the remembered switch says: on, turned on at a fixed time.
 const SWITCH: &[u8] = br#"{"on": true, "at": 1762150000}"#;
 
+/// The SSF wallet (`IDENTITY_FILE` in src/chia_wallet_switch.rs).
+const IDENTITY_FILE: &str = "chia_identity.json";
+
 /// The Chia files a node keeps in its directory on testnet11, by the names
 /// their modules give them. None may appear while Chia is off.
 const CHIA_FILES: &[&str] = &[
-    // The peer store (`STORE_FILE`, src/chia_peer_lane.rs).
+    // The peer store (`STORE_FILE`, src/chia_peer_lane.rs). It is written only
+    // for a public peer that answered (`note_good` skips pins) or when a
+    // stored peer is forgotten. With a mute pin, pin-only and no store on
+    // disk, neither run can write it, so its absence is checked here but this
+    // setup cannot prove it; the unit tests in src/chia_peer_lane.rs cover the
+    // closed lane's store.
     "chia_peers.json",
     // The SSF wallet, its legacy seed file, whether its words were saved and
     // its lease (`IDENTITY_FILE`, `LEGACY_SEED_FILE`, `SAVED_FILE`,
     // `LEASE_FILE`, src/chia_wallet_switch.rs).
-    "chia_identity.json",
+    IDENTITY_FILE,
     "chia_identity.seed",
     "chia_words_saved.json",
     "wallet_lease.json",
@@ -320,7 +333,10 @@ fn strict_run() {
 
 /// The same run without `SSF_NO_CHIA_LANE`: the watcher starts and the pin
 /// is dialled within [`CONTROL_BOUND`]. The run ends [`CONTROL_AFTER`] past
-/// the first connection. Nothing of the wallet it mints is read.
+/// the first connection. The wallet it mints, [`IDENTITY_FILE`], shows that
+/// the node keeps its Chia files in the scratch directory, so the strict
+/// run's missing files mean something. The file is looked for and never
+/// read.
 fn control_run() {
     let scratch = Scratch::new("control");
     let pin = Pin::start();
@@ -346,4 +362,5 @@ fn control_run() {
     for line in [WINS, LANE_OFF] {
         assert!(!log.contains(line), "control: the log has {line:?}");
     }
+    assert!(scratch.cwd().join(IDENTITY_FILE).exists(), "control: no {IDENTITY_FILE} in the node's directory, so the strict run's missing files prove nothing");
 }
