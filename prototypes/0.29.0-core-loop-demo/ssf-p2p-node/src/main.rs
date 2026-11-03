@@ -109,6 +109,14 @@ mod house_bytes;
 // feature while it runs in shadow only.
 #[cfg(feature = "house-fold")]
 mod house_fold;
+// The fold's child process (PR 6b-1b): the frames, the worker that holds the
+// engine (`ssf-p2p-node --fold-worker`) and the node's watch over it.
+#[cfg(feature = "house-fold")]
+mod fold_supervisor;
+#[cfg(feature = "house-fold")]
+mod fold_wire;
+#[cfg(feature = "house-fold")]
+mod fold_worker;
 
 // 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
 // the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on
@@ -1576,8 +1584,19 @@ async fn query_ip_echo(host: &str) -> Result<std::net::Ipv4Addr> {
         .map_err(|e| anyhow!("{host}: echo body is not an IPv4 address: {e}"))
 }
 
+fn main() -> Result<()> {
+    // 🧮 Started as `ssf-p2p-node --fold-worker`, this process is the fold's
+    // child (fold_worker.rs): nothing else of the node starts, nothing is
+    // printed (stdout carries its frames) and no file or socket is opened.
+    #[cfg(feature = "house-fold")]
+    if fold_worker::is_worker_invocation() {
+        std::process::exit(fold_worker::run_stdio());
+    }
+    node_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn node_main() -> Result<()> {
     // ⛓️ The Chia network (chia_network.rs), read once and checked first: a
     // value this build does not accept stops the node here, with one line and
     // exit code 2, before it opens a file or binds a socket. A typo must never

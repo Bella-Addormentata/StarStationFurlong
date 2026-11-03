@@ -11,25 +11,26 @@ use std::cell::Cell;
 
 const VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/fold-engine-v1.json");
 
-struct Case {
-    name: String,
-    ctx: Ctx,
-    cp: Option<CVal>,
-    houses: Vec<String>,
-    pins: Vec<(String, String)>,
-    real: bool,
-    hold: Vec<String>,
-    records: Vec<(String, CVal)>,
-    warm: Vec<Vec<(String, Option<CVal>)>>,
-    summary: String,
-    digest: String,
+#[derive(Clone)]
+pub(crate) struct Case {
+    pub(crate) name: String,
+    pub(crate) ctx: Ctx,
+    pub(crate) cp: Option<CVal>,
+    pub(crate) houses: Vec<String>,
+    pub(crate) pins: Vec<(String, String)>,
+    pub(crate) real: bool,
+    pub(crate) hold: Vec<String>,
+    pub(crate) records: Vec<(String, CVal)>,
+    pub(crate) warm: Vec<Vec<(String, Option<CVal>)>>,
+    pub(crate) summary: String,
+    pub(crate) digest: String,
 }
 
 fn strs(v: &Value) -> Vec<String> {
     v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
 }
 
-fn cases() -> Vec<Case> {
+pub(crate) fn cases() -> Vec<Case> {
     let raw = std::fs::read_to_string(VECTORS).unwrap_or_else(|e| panic!("cannot read {VECTORS}: {e}"));
     let file: Value = serde_json::from_str(&raw).expect("vector file is valid JSON");
     assert_eq!(file["version"], 1);
@@ -59,7 +60,7 @@ fn cases() -> Vec<Case> {
 }
 
 /// What the TypeScript test says of each signature of a case (foldEngineVectors.test.ts checkFor).
-fn check_for(c: &Case) -> CheckFn {
+pub(crate) fn check_for(c: &Case) -> CheckFn {
     let hold = c.hold.clone();
     let real = c.real;
     Box::new(move |hash, kind, pub_key, bytes, sig| {
