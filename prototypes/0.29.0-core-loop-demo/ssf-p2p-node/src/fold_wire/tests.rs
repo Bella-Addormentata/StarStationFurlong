@@ -463,3 +463,54 @@ fn a_frame_being_refused_is_not_copied_past_the_limit() {
     assert_eq!(o.b.len(), 4, "not even that byte's chunk is copied");
     assert!(matches!(o.finish(), Err(WireError::BadSize(n)) if n == MAX_FRAME + 1));
 }
+
+// ── Ids ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_room_table_or_incarnation_id_past_the_limit_is_not_sent() {
+    let long = "r".repeat(MAX_CTX_FIELD + 1);
+    for field in 0..3 {
+        let mut c = ctx();
+        match field {
+            0 => c.room = long.clone(),
+            1 => c.t = long.clone(),
+            _ => c.inc = long.clone(),
+        }
+        assert_eq!(encode_req(&Req::Forget { ctx: c.clone() }), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "request, field {field}");
+        let cold = Req::Cold(Cold { ctx: c.clone(), version: 1, base: None, houses: vec![], pins: vec![], records: vec![] });
+        assert_eq!(encode_req(&cold), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "cold, field {field}");
+        let resp = Resp::Dirty { ctx: c, version: 1, reason: s("x") };
+        assert_eq!(encode_resp(&resp), Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "answer, field {field}");
+    }
+}
+
+#[test]
+fn ids_of_exactly_the_limit_go_and_come_back() {
+    let c = Ctx { room: "r".repeat(MAX_CTX_FIELD), t: "t".repeat(MAX_CTX_FIELD), inc: "é".repeat(MAX_CTX_FIELD / 2) };
+    let req = Req::Forget { ctx: c.clone() };
+    assert_eq!(decode_req(body(&encode_req(&req).unwrap())).unwrap(), req);
+    let resp = Resp::Dirty { ctx: c, version: 7, reason: s("why") };
+    assert_eq!(decode_resp(body(&encode_resp(&resp).unwrap())).unwrap(), resp);
+}
+
+#[test]
+fn an_id_past_the_limit_is_refused_before_it_is_read() {
+    // Only the length is there: it is refused as too long, not waited for as cut short.
+    let claim = (MAX_CTX_FIELD as u32 + 1).to_le_bytes();
+    let id = |n: usize| {
+        let mut v = (n as u32).to_le_bytes().to_vec();
+        v.extend(vec![b'x'; n]);
+        v
+    };
+    for (tag, decode) in [(REQ_FORGET, 0), (RESP_DIRTY, 1)] {
+        for field in 0..3 {
+            let mut f = vec![tag];
+            for _ in 0..field {
+                f.extend(id(4));
+            }
+            f.extend(claim);
+            let got = if decode == 0 { decode_req(&f).map(|_| ()) } else { decode_resp(&f).map(|_| ()) };
+            assert_eq!(got, Err(WireError::BadSize(MAX_CTX_FIELD + 1)), "tag {tag:#04x}, field {field}");
+        }
+    }
+}

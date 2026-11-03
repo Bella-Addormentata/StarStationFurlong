@@ -159,6 +159,25 @@ impl Folder for EngineFolder {
     }
 }
 
+/// The longest reason a table is dirty that is sent back. It is for the log; a long one would
+/// push an answer past the frame it must always fit (with the ids of at most
+/// [`MAX_CTX_FIELD`](crate::fold_wire::MAX_CTX_FIELD) bytes each, a `Dirty` is a few KiB).
+pub const MAX_REASON: usize = 1 << 10;
+
+/// `reason`, cut to [`MAX_REASON`] bytes at a character, with a mark where it was cut.
+fn short_reason(mut reason: String) -> String {
+    if reason.len() <= MAX_REASON {
+        return reason;
+    }
+    let mut end = MAX_REASON;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason.truncate(end);
+    reason.push('…');
+    reason
+}
+
 /// The text of a panic's payload.
 fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
@@ -184,9 +203,9 @@ fn answer<F: Folder>(f: &mut F, req: Req) -> io::Result<Option<Resp>> {
     };
     Ok(Some(match run {
         Ok(Ok(text)) => Resp::Result { ctx, version, text },
-        Ok(Err(reason)) => Resp::Dirty { ctx, version, reason },
+        Ok(Err(reason)) => Resp::Dirty { ctx, version, reason: short_reason(reason) },
         Err(p) => {
-            let reason = format!("panic: {}", panic_text(p));
+            let reason = short_reason(format!("panic: {}", panic_text(p)));
             panic_recovery(f, reason.clone())?;
             Resp::Dirty { ctx, version, reason }
         }

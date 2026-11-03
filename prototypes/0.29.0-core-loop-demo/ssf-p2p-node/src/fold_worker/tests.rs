@@ -3,7 +3,7 @@
 //! nothing else.
 
 use super::*;
-use crate::fold_wire::{encode_req, MAX_FRAME};
+use crate::fold_wire::{encode_req, encode_resp, MAX_CTX_FIELD, MAX_FRAME};
 use crate::house_fold::tests::{cases, check_for, Case};
 use crate::house_fold::FOLD_TABLES;
 use std::io::Cursor;
@@ -207,6 +207,7 @@ impl Folder for Stub {
             "boom" => panic!("the fold fell over"),
             "huge" => Ok("x".repeat(MAX_FRAME)),
             "sick" => Err("sick".into()),
+            "wordy" => Err("€".repeat(2_000)),
             _ => Ok(format!("ok:{}", self.asked)),
         }
     }
@@ -312,6 +313,27 @@ fn a_result_too_big_for_a_frame_is_dirty_not_a_dead_worker() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(&got[1], Resp::Result { version: 2, .. }));
+}
+
+#[test]
+fn a_long_reason_is_cut_at_a_character_so_a_dirty_answer_stays_small() {
+    let got = run(&mut Stub::new(), &[cold_of("wordy", 1)]);
+    match &got[0] {
+        Resp::Dirty { reason, .. } => {
+            // 1,024 bytes would end inside a euro sign: back to the one before, and the mark.
+            assert_eq!(reason.len(), 1_023 + '…'.len_utf8(), "{} bytes", reason.len());
+            assert!(reason.starts_with("€€€") && reason.ends_with('…'));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_largest_dirty_answer_is_a_few_kib_so_it_always_fits_a_frame() {
+    let c = Ctx { room: "r".repeat(MAX_CTX_FIELD), t: "t".repeat(MAX_CTX_FIELD), inc: "i".repeat(MAX_CTX_FIELD) };
+    let reason = short_reason("x".repeat(1 << 20));
+    let frame = encode_resp(&Resp::Dirty { ctx: c, version: u64::MAX, reason }).unwrap();
+    assert!(frame.len() < 16 << 10, "{} bytes", frame.len());
 }
 
 #[test]

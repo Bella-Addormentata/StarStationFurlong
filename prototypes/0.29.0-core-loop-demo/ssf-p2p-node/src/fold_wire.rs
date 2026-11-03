@@ -11,7 +11,10 @@
 //! other, and nothing round-trips through JSON text.
 //!
 //! The worker answers every `Cold` and `Warm` with exactly one `Resp`, in the
-//! order it got them; a `Forget` has no answer.
+//! order it got them; a `Forget` has no answer. Every answer names its table
+//! (room, table and incarnation ids of at most [`MAX_CTX_FIELD`] bytes, both
+//! ways), so that a `Dirty` answer, whose reason is cut short by the worker, is
+//! a few KiB and fits a frame whatever the request that named the table held.
 //!
 //! The decoder is for bytes from another process, so it takes nothing on trust:
 //! a frame past [`MAX_FRAME`] is refused before it is read, nothing is
@@ -34,6 +37,11 @@ use crate::house_bytes::{CVal, Ctx, MAX_DEPTH};
 /// big cold read over several frames (a `Cold` and `Warm`s: adding records
 /// one batch at a time folds as adding them all at once).
 pub const MAX_FRAME: usize = 32 << 20;
+
+/// The longest a room, table or incarnation id may be in a frame. The node's are short; the limit
+/// makes sure that an answer naming a table, with a reason it is dirty, fits a frame however full
+/// the request that named it was (a table's ids come back in every answer).
+pub const MAX_CTX_FIELD: usize = 4 << 10;
 
 /// How deep a value may nest. The node's [`CVal`]s never pass `MAX_DEPTH`.
 const WIRE_DEPTH: usize = MAX_DEPTH + 4;
@@ -101,7 +109,8 @@ impl Resp {
 pub enum WireError {
     /// The bytes ended inside a field.
     Truncated,
-    /// A frame (or one to be sent) past [`MAX_FRAME`], or of no bytes.
+    /// A frame (or one to be sent) past [`MAX_FRAME`], or of no bytes; or a room, table or
+    /// incarnation id past [`MAX_CTX_FIELD`].
     BadSize(usize),
     /// A tag that names nothing.
     BadTag(u8),
@@ -157,6 +166,8 @@ struct Out {
     b: Vec<u8>,
     /// The size the frame would have, copied or not.
     total: usize,
+    /// A field that may not be sent, the first found: `finish` refuses the frame for it.
+    bad: Option<WireError>,
 }
 
 /// The byte count and the most a body may be.
@@ -184,9 +195,12 @@ impl Out {
         self.bytes(s.as_bytes());
     }
     fn ctx(&mut self, c: &Ctx) {
-        self.str(&c.room);
-        self.str(&c.t);
-        self.str(&c.inc);
+        for id in [&c.room, &c.t, &c.inc] {
+            if id.len() > MAX_CTX_FIELD && self.bad.is_none() {
+                self.bad = Some(WireError::BadSize(id.len()));
+            }
+            self.str(id);
+        }
     }
     fn strs(&mut self, v: &[String]) {
         self.u32(v.len());
@@ -236,6 +250,9 @@ impl Out {
     }
     /// The whole frame: the byte count, then the body.
     fn finish(self) -> Result<Vec<u8>, WireError> {
+        if let Some(e) = self.bad {
+            return Err(e);
+        }
         let body = self.total - 4;
         if body == 0 || body > MAX_FRAME {
             return Err(WireError::BadSize(body));
@@ -248,7 +265,7 @@ impl Out {
 
 fn out() -> Out {
     // Room for the byte count, filled in by `finish`.
-    Out { b: vec![0; 4], total: 4 }
+    Out { b: vec![0; 4], total: 4, bad: None }
 }
 
 /// A request as a whole frame, the byte count included.
@@ -353,7 +370,16 @@ impl<'a> In<'a> {
         std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| WireError::BadUtf8)
     }
     fn ctx(&mut self) -> Result<Ctx, WireError> {
-        Ok(Ctx { room: self.str()?, t: self.str()?, inc: self.str()? })
+        Ok(Ctx { room: self.id()?, t: self.id()?, inc: self.id()? })
+    }
+    /// A room, table or incarnation id: no longer than [`MAX_CTX_FIELD`], said before it is read.
+    fn id(&mut self) -> Result<String, WireError> {
+        let n = self.u32()?;
+        if n > MAX_CTX_FIELD {
+            return Err(WireError::BadSize(n));
+        }
+        let bytes = self.take(n)?;
+        std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| WireError::BadUtf8)
     }
     fn strs(&mut self) -> Result<Vec<String>, WireError> {
         let n = self.u32()?;
