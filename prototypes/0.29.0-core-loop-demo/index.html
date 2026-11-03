@@ -127,6 +127,21 @@
           <span class="label">Reachability</span>
           <span class="value" id="network-reachability">--</span>
         </div>
+        <!-- ⛓️ The Chia switch (chiaLane.ts): whether Chia is off on this computer
+             and why, and the one button that turns it off at once or back on at
+             the node's next start, for every Chia network. main.ts writes these
+             with textContent, hidden and data-* only, so focus stays on the button
+             from TURN CHIA OFF to CONFIRM to TURNING CHIA OFF. -->
+        <div class="network-row" id="chia-lane-row">
+          <span class="label">Chia</span>
+          <span class="value" id="network-chia-lane">--</span>
+        </div>
+        <div class="chia-lane-detail">
+          <div id="chia-lane-note" hidden></div>
+          <button type="button" id="chia-lane-switch" hidden aria-describedby="chia-lane-note chia-lane-warning"></button>
+          <div id="chia-lane-warning" hidden></div>
+          <div id="chia-lane-error" role="status" hidden></div>
+        </div>
         <!-- 📖 The Phone Book listing in words (phoneBook.ts): the same readout as
              the top bar's icon, here for whoever reads the Network rows rather than
              the bar, keyboard and screen-reader users among them. -->

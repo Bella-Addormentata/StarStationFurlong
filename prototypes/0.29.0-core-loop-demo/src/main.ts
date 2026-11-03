@@ -300,6 +300,8 @@ import {
 import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
+import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, turnChiaLane } from "./chiaLane";
+import type { ChiaLaneTurn } from "./chiaLane";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -1044,6 +1046,85 @@ function renderPhoneBookIndicator(fp: LocalFingerprint | null): void {
   btn.setAttribute("aria-label", ind.title);
   btn.dataset.state = ind.state ?? "";
   btn.dataset.opens = ind.opens ?? "";
+}
+
+/** ⛓️ The CHIA row's switch (chiaLane.ts): TURN CHIA OFF armed and waiting
+ *  for CONFIRM, a turn in flight, and the last turn's failure. Opening the
+ *  Network view disarms it and clears the failure; the node's own memory of
+ *  the switch rides on its fingerprint. */
+let chiaLaneArmed = false;
+let chiaLaneTurning: ChiaLaneTurn | null = null;
+let chiaLaneError: string | null = null;
+/** When the switch last changed what it does: a tap within BANK_SETTLE_MS
+ *  of that is the second half of a double-click or a held Enter, not a
+ *  decision (bankBackup.ts `freshTap`, the Bank switch's rule). */
+let chiaLaneChangedAt = 0;
+/** What the switch did at the last render, so a change from any cause (a
+ *  tap, a turn finishing, a fingerprint round) starts the settle time. */
+let chiaLaneShownAct: string | null = null;
+
+/** ⛓️ The CHIA row of the Network rows, from the node that answered the last
+ *  probe (none while it does not: a stopped node's switch is not shown).
+ *  Written with textContent, hidden and attributes only, never innerHTML, so
+ *  focus stays on the one button whatever it says. */
+function renderChiaLaneRow(): void {
+  const row = chiaLaneRow(localNodeLive ? localFingerprint : null, { armed: chiaLaneArmed, turning: chiaLaneTurning, error: chiaLaneError });
+  setNetworkRow("network-chia-lane", row.value, row.colour);
+  const line = (id: string, text: string | null): void => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    // Emptied as well as hidden: the button's aria-describedby names these,
+    // and a description is read from hidden text too.
+    el.textContent = text ?? "";
+    el.hidden = !text;
+  };
+  line("chia-lane-note", row.note);
+  line("chia-lane-warning", row.warning);
+  line("chia-lane-error", row.error);
+  const b = row.button;
+  if ((b?.act ?? null) !== chiaLaneShownAct) {
+    chiaLaneShownAct = b?.act ?? null;
+    chiaLaneChangedAt = performance.now();
+  }
+  const btn = document.getElementById(CHIA_LANE_BUTTON_ID) as HTMLButtonElement | null;
+  if (!btn) return;
+  const hadFocus = document.activeElement === btn;
+  btn.hidden = !b;
+  if (hadFocus && !b) {
+    // A switch that went (a turn left nothing to offer) hands focus to its
+    // view, not to the page behind the phone.
+    const view = document.getElementById("phone-app-settings-network");
+    view?.setAttribute("tabindex", "-1");
+    view?.focus({ preventScroll: true });
+  }
+  btn.textContent = b?.label ?? "";
+  btn.dataset.act = b?.act ?? "";
+  btn.dataset.danger = b?.danger ? "true" : "false";
+  if (b?.busy) {
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-busy", "true");
+  } else {
+    btn.removeAttribute("aria-disabled");
+    btn.removeAttribute("aria-busy");
+  }
+}
+
+/** ⛓️ Ask the node to turn Chia off (`off`, `keep`) or back on for its next
+ *  start (`on`), then read its fingerprint again so the CHIA row, the Bank,
+ *  the Phone Book row and the dish show what the node now holds, not what
+ *  the page hoped. */
+async function turnChiaLaneSwitch(turn: ChiaLaneTurn): Promise<void> {
+  if (chiaLaneTurning) return;
+  chiaLaneTurning = turn;
+  chiaLaneArmed = false;
+  chiaLaneError = null;
+  renderChiaLaneRow();
+  const turned = await turnChiaLane(localNodeOrigin, turn === "on");
+  chiaLaneTurning = null;
+  chiaLaneError = turned.ok ? null : turned.error;
+  await refreshLocalFingerprint();
+  chiaLaneChangedAt = performance.now();
+  renderChiaLaneRow();
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -5226,6 +5307,8 @@ async function openBankBackupWindow(): Promise<void> {
 function requestBankBalance(): void {
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
+  // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
+  if (localFingerprint.chia_lane?.off) return;
   const { seq, sent } = networkProvider.requestFaucet("status");
   sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
 }
@@ -8694,6 +8777,14 @@ function setupSpacePhoneOverlay() {
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
+    if (id === "setnet") {
+      // ⛓️ A TURN CHIA OFF armed on an earlier visit waits for no one:
+      // opening the view starts from the switch, and an old failure is not
+      // news (the Bank's rule).
+      chiaLaneArmed = false;
+      if (!chiaLaneTurning) chiaLaneError = null;
+      renderChiaLaneRow();
+    }
     // 📡 #258: the IR blaster, the remote of every set in the room. Repaints
     // itself on tv-map changes while active.
     if (id === "tv") {
@@ -9434,6 +9525,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       localNodeLive = false;
       localNodeOrigin = "";
       bankWalletArmed = false;
+      chiaLaneArmed = false;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -9443,12 +9535,15 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     // 📖 Not the listing icon, though: a cached green would outlive the node,
     // old tooltip and all, so it is withdrawn until the node answers again.
     renderPhoneBookIndicator(null);
+    // ⛓️ Nor the Chia switch: there is no node to send it to.
+    renderChiaLaneRow();
     return localFingerprint;
   }
-  // 🏦 The Bank's RECEIVE reads the address and the wallet switch from the
-  // fingerprint: repaint it while open when either changed (a wallet turned
-  // on or off here, or by SSF_CHIA_LANE at the node's restart).
-  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null]);
+  // 🏦 The Bank's RECEIVE reads the address, the wallet switch and whether
+  // Chia is off from the fingerprint: repaint it while open when any changed
+  // (a wallet turned on or off here, or by SSF_CHIA_LANE at the node's
+  // restart; Chia turned off in the Network rows).
+  const bankSaw = JSON.stringify([localFingerprint?.chia_net?.id ?? null, localFingerprint?.chia_address ?? null, localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null]);
   const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
@@ -9461,7 +9556,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   const backupMoved = setBankBackup(reconcileBackupUi(bankBackup, fingerprint, performance.now(), bankViewOnScreen(), Date.now(), hasNativeShell()));
   if (
     backupMoved ||
-    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null])) &&
+    ((!wasLive || bankSaw !== JSON.stringify([fingerprint.chia_net?.id ?? null, fingerprint.chia_address ?? null, fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null])) &&
       document.getElementById("phone-app-bank")?.classList.contains("active"))
   ) {
     renderBankApp();
@@ -9473,6 +9568,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   setLocalKeeperNode(fingerprint.iroh_node_id ?? null); // 🤝 C3: a keeper's own node counts as the room's
   renderReachabilityRow(fingerprint);
   renderPhoneBookIndicator(fingerprint);
+  renderChiaLaneRow();
   refileCoHostNode(); // 🤝 C3: a co-host's node routes may have moved
   return fingerprint;
 }
@@ -9944,6 +10040,32 @@ function setupNetworkDetailsPanel() {
           ? "Expand network details"
           : "Collapse network details",
       );
+    });
+  }
+
+  // ⛓️ The CHIA row's switch (chiaLane.ts): TURN CHIA OFF arms CONFIRM, and
+  // every act but that one takes a fresh tap, since the same button stands
+  // where the last one was: a double-click or a held Enter would otherwise
+  // confirm, or undo, what the player has not read.
+  const laneBtn = document.getElementById(CHIA_LANE_BUTTON_ID) as HTMLButtonElement | null;
+  if (laneBtn) {
+    laneBtn.addEventListener("click", (e) => {
+      if (laneBtn.getAttribute("aria-disabled") === "true") return;
+      const act = laneBtn.dataset.act;
+      if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), chiaLaneChangedAt)) return;
+      if (act === "arm") {
+        chiaLaneArmed = true;
+        chiaLaneError = null;
+        chiaLaneChangedAt = performance.now();
+        renderChiaLaneRow();
+        return;
+      }
+      const turn = laneTurnOf(act);
+      if (turn) void turnChiaLaneSwitch(turn);
+    });
+    // A held Enter or Space repeats its keydown, and each one taps the button.
+    laneBtn.addEventListener("keydown", (e) => {
+      if (laneKeyRepeat(e)) e.preventDefault();
     });
   }
 
@@ -11328,6 +11450,8 @@ async function init() {
   world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
   // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
   world.faucetChiaNet = () => localFingerprint?.chia_net;
+  // ⛓️ And says Chia is off while the fingerprint does.
+  world.faucetChiaLane = () => localFingerprint?.chia_lane;
   networkProvider.onFaucetReply((env: { payload?: string; room?: string; seq?: number }) => {
     if (typeof env.payload !== "string" || typeof env.room !== "string") return;
     // Only the room open right now is filed: the store drops a reply for a

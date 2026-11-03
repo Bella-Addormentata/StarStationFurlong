@@ -69,6 +69,14 @@ export interface LocalFingerprint {
    *  `SSF_CHIA_LANE=1` turns on. Kept only in the node's shape
    *  (`parseChiaWallet`). */
   chia_wallet?: ChiaWalletSwitch;
+  /** ⛓️ Whether Chia is off on this computer (the node's chia_strict.rs
+   *  `LaneView`): off now or not, why (`SSF_NO_CHIA_LANE` in the node's
+   *  environment, or the Chia switch in the SpacePhone's Network settings),
+   *  and what that switch says for the node's next start (chiaLane.ts).
+   *  Absent from nodes older than the strict lane; a node with the lane but
+   *  not the switch sends no `setting`. Kept only in the node's shape
+   *  (`parseChiaLane`). */
+  chia_lane?: ChiaLane;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
@@ -214,6 +222,51 @@ export function parseChiaWallet(v: unknown): ChiaWalletSwitch | undefined {
   return w;
 }
 
+/** ⛓️ What holds Chia off: `env` for `SSF_NO_CHIA_LANE` in the node's
+ *  environment (it wins when both do), `setting` for the Chia switch in the
+ *  SpacePhone's Network settings (its file said off, or could not be read,
+ *  at the node's start, or it was turned off in this run). */
+export type ChiaLaneSource = 'env' | 'setting';
+
+/** ⛓️ What the Chia switch's file says now, which the node's next start
+ *  reads: `off` while the file says off or cannot be read. */
+export type ChiaLaneSetting = 'on' | 'off';
+
+export interface ChiaLane {
+  /** Chia is off on this computer now: no chain reads, no chain writes. */
+  off: boolean;
+  /** Only while off: what holds it off. */
+  source?: ChiaLaneSource;
+  /** What the switch says for the next start. Sent by every node that has
+   *  the switch (`POST /api/chia/lane`), so it marks the switch the way
+   *  `mnemonic` marks BACK UP: a node with the lane but not the switch never
+   *  sends it. Off now with the source `setting` and this `on` is "off until
+   *  the node restarts". The node cannot know whether `SSF_NO_CHIA_LANE` is
+   *  set at its next start, so this says only what the switch says. */
+  setting?: ChiaLaneSetting;
+  /** The switch's file is there but cannot be read, so it counts as off. */
+  damaged?: true;
+}
+
+const LANE_SOURCES: ReadonlySet<string> = new Set<ChiaLaneSource>(['env', 'setting']);
+const LANE_SETTINGS: ReadonlySet<string> = new Set<ChiaLaneSetting>(['on', 'off']);
+
+/** The node's `chia_lane` in its own shape, or undefined when `off` is not
+ *  a boolean (or it is not an object at all). A source is kept only while
+ *  off and only as a word this page knows; `setting` only as `on` or `off`;
+ *  `damaged` only as true. An unknown word is dropped, never `off`: a page
+ *  that cannot say why still says Chia is off. Nothing else is copied. */
+export function parseChiaLane(v: unknown): ChiaLane | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.off !== 'boolean') return undefined;
+  const lane: ChiaLane = { off: r.off };
+  if (r.off && typeof r.source === 'string' && LANE_SOURCES.has(r.source)) lane.source = r.source as ChiaLaneSource;
+  if (typeof r.setting === 'string' && LANE_SETTINGS.has(r.setting)) lane.setting = r.setting as ChiaLaneSetting;
+  if (r.damaged === true) lane.damaged = true;
+  return lane;
+}
+
 const PRESENCE_STATES: ReadonlySet<string> = new Set<ChiaPresenceState>(['listed', 'sent', 'outdated', 'unlisted']);
 
 const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
@@ -299,6 +352,8 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (presence) fp.chia_presence = presence;
   const wallet = parseChiaWallet(r.chia_wallet);
   if (wallet) fp.chia_wallet = wallet;
+  const lane = parseChiaLane(r.chia_lane);
+  if (lane) fp.chia_lane = lane;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;

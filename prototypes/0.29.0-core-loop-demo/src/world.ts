@@ -210,6 +210,7 @@ import { disposeChalkboard } from "./chalkDoc";
 // ⛓️🥣 The faucet dish fixtures redraw from the last status the node sent.
 import { faucetPending, jarLevel, latestFaucetStatus, type FaucetOp, type FaucetRequestTicket } from "./faucetDish";
 import type { ChiaNetwork } from "./chiaNetwork";
+import type { ChiaLane } from "./nodeFingerprint";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -577,6 +578,10 @@ export class World {
    *  (`chia_net`; `undefined` before any fingerprint was read), so the dish
    *  screen shows a status's network only when the fingerprint agrees. */
   public faucetChiaNet: (() => ChiaNetwork | null | undefined) | null = null;
+  /** ⛓️ main.ts installs whether Chia is off on this computer (the same
+   *  fingerprint's `chia_lane`), so the dish screen says so and offers
+   *  nothing while it is. */
+  public faucetChiaLane: (() => ChiaLane | undefined) | null = null;
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
    *  piles from shared state each frame. Same driven-every-frame idiom as the
@@ -7114,6 +7119,7 @@ export class World {
         request: (op, amount) =>
           request ? request(op, amount) : { seq: 0, sent: Promise.reject(new Error("no node request path installed")) },
         chiaNet: () => this.faucetChiaNet?.(),
+        chiaLane: () => this.faucetChiaLane?.(),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

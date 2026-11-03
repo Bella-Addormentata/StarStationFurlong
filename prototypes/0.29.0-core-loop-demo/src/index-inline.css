@@ -142,6 +142,54 @@
         font-weight: 600;
       }
 
+      /* ⛓️ The CHIA row's note, switch, warning and error (chiaLane.ts), under
+         the row. The button's look follows its data-danger and aria-busy, which
+         main.ts sets: its markup is never rebuilt, so focus stays on it. */
+      .chia-lane-detail {
+        margin: 0 0 6px;
+        font-size: 9.5px;
+        line-height: 1.5;
+        color: rgba(212, 168, 75, 0.6);
+      }
+
+      #chia-lane-switch {
+        margin-top: 4px;
+        padding: 5px 9px;
+        background: rgba(212, 168, 75, 0.10);
+        border: 1px solid rgba(212, 168, 75, 0.35);
+        border-radius: 4px;
+        color: #f0c060;
+        font: 800 9px 'Courier New', monospace;
+        letter-spacing: 1px;
+        cursor: pointer;
+      }
+
+      #chia-lane-switch[hidden],
+      .chia-lane-detail [hidden] {
+        display: none;
+      }
+
+      #chia-lane-switch[data-danger="true"] {
+        background: rgba(255, 23, 68, 0.10);
+        border-color: rgba(255, 23, 68, 0.35);
+        color: #ff8a80;
+      }
+
+      #chia-lane-switch[aria-busy="true"] {
+        cursor: progress;
+        opacity: 0.7;
+      }
+
+      #chia-lane-warning {
+        color: #ffb300;
+        margin-top: 4px;
+      }
+
+      #chia-lane-error {
+        color: #f0a060;
+        margin-top: 4px;
+      }
+
       .network-link-tools {
         margin-top: 10px;
         border-top: 1px solid rgba(212, 168, 75, 0.18);

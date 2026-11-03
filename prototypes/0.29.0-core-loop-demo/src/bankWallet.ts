@@ -22,9 +22,16 @@
 // so the app can show the 24 words; with any other `backup` the Bank offers
 // no CREATE there, and TURN ON of a wallet already on disk works as on
 // testnet11.
+//
+// ⛓️ While Chia is off on this computer (chiaLane.ts: `SSF_NO_CHIA_LANE` in
+// the node's environment, or the Chia switch in the SpacePhone's Network
+// settings), RECEIVE says so and why, above every wallet state: no switch,
+// no address, no balance. A wallet loaded before an in-run off stays loaded
+// until the node stops, but writes nothing to the chain.
 
+import { chiaBackOn, chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';
-import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
 /** The page's own part: CREATE armed and waiting for CONFIRM, a request in
  *  flight, and the last request's failure in the page's or the node's words. */
@@ -135,6 +142,17 @@ export function registryChiaLine(net: ChiaNetwork | null | undefined): string {
   return `Chia account: your SSF wallet, kept by your station node on this computer${where}; turn it on, and see its address and balance, under RECEIVE.`;
 }
 
+/** ⛓️ RECEIVE's line while Chia is off: why, and what that leaves of the
+ *  wallet. `loaded`: the node holds a wallet from before an in-run off. */
+export function chiaOffBankText(lane: ChiaLane, loaded: boolean): string {
+  const why = chiaOffWhy(lane);
+  const text = loaded
+    ? `${why}: your node keeps its SSF wallet loaded until it stops, but writes nothing to the chain with it, so the Bank shows no address or balance.`
+    : `${why}, so your node holds no SSF wallet and the Bank shows no address.`;
+  const back = chiaBackOn(lane);
+  return back ? `${text} ${back}` : text;
+}
+
 /** What the Bank's RECEIVE section shows about the wallet. */
 export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: BankWalletUi): BankWalletView {
   if (!fp) {
@@ -143,6 +161,12 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   const w = fp.chia_wallet;
   const error = ui.error ?? w?.error ?? null;
   const net = fp.chia_net;
+  // ⛓️ Chia off on this computer beats every wallet state: the node turns no
+  // wallet on (it refuses), and one it still holds writes nothing.
+  if (fp.chia_lane?.off) {
+    const loaded = w?.state === 'on' || fp.chia_address !== undefined;
+    return { network: net ? networkLine(net) : null, warning: null, notice: null, button: null, text: chiaOffBankText(fp.chia_lane, loaded), error: ui.error ?? null, showsAddress: false };
+  }
   // A network this page does not know: no address (the fingerprint parse
   // keeps none), no switch, and the reason.
   if (!net) return { network: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };

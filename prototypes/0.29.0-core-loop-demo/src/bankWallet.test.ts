@@ -3,9 +3,9 @@
  * node's fingerprint, and how the page asks the node to turn the wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { UNKNOWN_NETWORK_TEXT, bankWalletView, createInAppText, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
+import { UNKNOWN_NETWORK_TEXT, bankWalletView, chiaOffBankText, createInAppText, mintsOnlyInApp, olderNodeText, receiveNote, registryChiaLine, turnSsfWallet, type BankWalletUi } from './bankWallet';
 import { MAINNET, TESTNET11, addressOn, type ChiaNetwork } from './chiaNetwork';
-import type { ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
 const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
 const ADDR = 'txch1' + 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'.repeat(2).slice(0, 58);
@@ -257,6 +257,82 @@ describe.each([TESTNET11, MAINNET])('bankWalletView on $name', (net) => {
         if (!seed) expect(bankWalletView(on(w), IDLE).text === createInAppText(net)).toBe(mintsOnlyInApp(net, w));
       }
     }
+  });
+
+  describe('⛓️ while Chia is off on this computer', () => {
+    const lanes: [string, ChiaLane][] = [
+      ['the environment', { off: true, source: 'env', setting: 'on' }],
+      ['the environment, saved off too', { off: true, source: 'env', setting: 'off' }],
+      ['the switch', { off: true, source: 'setting', setting: 'off' }],
+      ['a switch that cannot be read', { off: true, source: 'setting', setting: 'off', damaged: true }],
+      ['the switch, back on for the next start', { off: true, source: 'setting', setting: 'on' }],
+      ['an older node', { off: true, source: 'env' }],
+    ];
+    const offOn = (chia_lane: ChiaLane, chia_wallet?: ChiaWalletSwitch, chia_address?: string): LocalFingerprint => ({ ...on(chia_wallet, chia_address), chia_lane });
+
+    it.each(lanes)('offers no CREATE or TURN ON, armed or not, when %s holds it off', (_label, lane) => {
+      const ready: ChiaWalletSwitch[] = [
+        { state: 'ready', mnemonic: true, backup: 'native' },
+        { state: 'ready', seed: true, mnemonic: true },
+        { state: 'ready', legacy: true },
+        { state: 'ready' },
+      ];
+      for (const w of ready) {
+        for (const ui of [IDLE, { ...IDLE, armed: true }]) {
+          const v = bankWalletView(offOn(lane, w), ui);
+          expect(v).toMatchObject({ button: null, warning: null, notice: null, showsAddress: false });
+          expect(v.text).toBe(chiaOffBankText(lane, false));
+          // The network line stays, amber where the coins are real money.
+          expect(v.network).toEqual({ text: expect.stringContaining(`Network: ${net.name}.`), warn: !net.test });
+        }
+      }
+      // Every other state the node may send reads the same way.
+      for (const w of [{ state: 'unbuilt' }, { state: 'off' }, undefined] as (ChiaWalletSwitch | undefined)[]) {
+        expect(bankWalletView(offOn(lane, w), IDLE).text).toBe(chiaOffBankText(lane, false));
+      }
+    });
+
+    it.each(lanes)('shows no address and no TURN OFF or KEEP IT ON for a wallet loaded before %s turned it off', (_label, lane) => {
+      for (const w of [{ state: 'on', stays: true }, { state: 'on', held: true }, { state: 'on' }, { state: 'on', reminted: true }] as ChiaWalletSwitch[]) {
+        const v = bankWalletView(offOn(lane, w, addr), IDLE);
+        expect(v).toMatchObject({ button: null, warning: null, notice: null, showsAddress: false });
+        expect(v.text).toBe(chiaOffBankText(lane, true));
+        expect(v.text).toContain('keeps its SSF wallet loaded until it stops, but writes nothing to the chain with it');
+      }
+      // An address without a switch (a node older than the Bank's) is a loaded wallet too.
+      expect(bankWalletView(offOn(lane, undefined, addr), IDLE)).toMatchObject({ showsAddress: false, text: chiaOffBankText(lane, true) });
+      // On a network this page does not know: no network line, the same words.
+      expect(bankWalletView({ ...offOn(lane, { state: 'ready' }), chia_net: null }, IDLE)).toMatchObject({ network: null, text: chiaOffBankText(lane, false) });
+    });
+
+    it('says why, and how Chia comes back when the switch holds it off', () => {
+      expect(bankWalletView(offOn(lanes[0][1], { state: 'ready', mnemonic: true }), IDLE).text).toBe(
+        "Chia is off on this computer (SSF_NO_CHIA_LANE in your node's environment), so your node holds no SSF wallet and the Bank shows no address.",
+      );
+      expect(bankWalletView(offOn(lanes[2][1], { state: 'ready', mnemonic: true }), IDLE).text).toBe(
+        "Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK), so your node holds no SSF wallet and the Bank shows no address. Turning it back on there brings Chia back at your node's next start.",
+      );
+      expect(bankWalletView(offOn(lanes[2][1], { state: 'on', stays: true }, addr), IDLE).text).toBe(
+        "Chia is off on this computer (turned off in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK): your node keeps its SSF wallet loaded until it stops, but writes nothing to the chain with it, so the Bank shows no address or balance. Turning it back on there brings Chia back at your node's next start.",
+      );
+      expect(bankWalletView(offOn(lanes[4][1], { state: 'on', stays: true }, addr), IDLE).text).toBe(
+        "Chia is off on this computer for the rest of this run (its switch in the SpacePhone's ⚙️ SETTINGS → 🌐 NETWORK is back on for your node's next start): your node keeps its SSF wallet loaded until it stops, but writes nothing to the chain with it, so the Bank shows no address or balance.",
+      );
+      expect(chiaOffBankText(lanes[3][1], false)).toContain('could not be read');
+    });
+
+    it('shows the page\'s own failure, never the node\'s old one', () => {
+      const lane = lanes[2][1];
+      expect(bankWalletView(offOn(lane, { state: 'ready', error: 'Chia is off on this computer' }), IDLE).error).toBeNull();
+      expect(bankWalletView(offOn(lane, { state: 'ready' }), { ...IDLE, error: 'your station node could not be reached' }).error).toBe('your station node could not be reached');
+    });
+
+    it('changes nothing while Chia is on', () => {
+      for (const lane of [{ off: false, setting: 'on' }, { off: false }] as ChiaLane[]) {
+        expect(bankWalletView(offOn(lane, { state: 'ready', mnemonic: true, backup: 'native' }), IDLE)).toEqual(bankWalletView(on({ state: 'ready', mnemonic: true, backup: 'native' }), IDLE));
+        expect(bankWalletView(offOn(lane, { state: 'on', stays: true }, addr), IDLE)).toEqual(bankWalletView(on({ state: 'on', stays: true }, addr), IDLE));
+      }
+    });
   });
 });
 
