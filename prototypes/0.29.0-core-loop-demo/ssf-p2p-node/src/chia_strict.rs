@@ -108,10 +108,11 @@ pub enum Saved {
     /// The file is there but cannot be read, or is not a switch the node can
     /// read: counts as off. The reason, in the node's words.
     Damaged(String),
-    /// A folder by the file's name: counts as off, like a damaged file, and
-    /// the in-game on cannot remove it (it removes a file, never a folder),
-    /// so only its removal by hand brings Chia back. The reason, in the
-    /// node's words.
+    /// A folder by the file's name, or on Windows a link to a folder (a
+    /// directory symlink or a junction, which Windows removes only as it
+    /// removes a folder): counts as off, like a damaged file, and the in-game
+    /// on cannot remove it (it removes a file, never a folder), so only its
+    /// removal by hand brings Chia back. The reason, in the node's words.
     Folder(String),
 }
 
@@ -123,7 +124,13 @@ impl Saved {
     }
 }
 
-/// Read the in-game switch's file at `path` ([`Saved`]).
+/// Read the in-game switch's file at `path` ([`Saved`]). Nothing at `path`,
+/// or a file that says `"off": false`, reads on. A link to nothing reads as
+/// missing through the link, so the entry itself is looked at: a link there
+/// is damaged (fails closed), which the in-game on removes as it removes a
+/// file. On Windows a link to a folder (a directory symlink or a junction)
+/// is removed only as a folder is, never as a file, so it reads as a
+/// folder, whether or not its target is there.
 pub fn saved_of(path: &Path) -> Saved {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<LaneFile>(&bytes) {
@@ -131,12 +138,37 @@ pub fn saved_of(path: &Path) -> Saved {
             Ok(_) => Saved::On,
             Err(e) => Saved::Damaged(format!("{} is not a Chia switch the node can read ({e})", path.display())),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::On,
-        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) => {
-            Saved::Folder(format!("{} is a folder, not a Chia switch the node can read", path.display()))
+        Err(e) => {
+            let missing = e.kind() == std::io::ErrorKind::NotFound;
+            match std::fs::symlink_metadata(path) {
+                Err(gone) if missing && gone.kind() == std::io::ErrorKind::NotFound => Saved::On,
+                Ok(entry) if entry.is_dir() => Saved::Folder(format!("{} is a folder, not a Chia switch the node can read", path.display())),
+                Ok(entry) if link_to_a_folder(&entry) => {
+                    Saved::Folder(format!("{} is a link to a folder, not a Chia switch the node can read", path.display()))
+                }
+                Ok(entry) if missing && entry.file_type().is_symlink() => {
+                    Saved::Damaged(format!("{} is a link to nothing, not a Chia switch the node can read", path.display()))
+                }
+                _ => Saved::Damaged(format!("{} cannot be read ({e})", path.display())),
+            }
         }
-        Err(e) => Saved::Damaged(format!("{} cannot be read ({e})", path.display())),
     }
+}
+
+/// Whether `entry`, a path's own metadata (the link itself, not what it
+/// points to), is a link that Windows removes as a folder: a directory
+/// symlink or a junction, whether or not its target is there. The in-game
+/// on removes a file, so it cannot remove such a link.
+#[cfg(windows)]
+fn link_to_a_folder(entry: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    entry.file_type().is_symlink_dir()
+}
+
+/// Elsewhere a link is removed as a file is, whatever it points to.
+#[cfg(not(windows))]
+fn link_to_a_folder(_entry: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Save the in-game off at `path`: written whole (a temporary file renamed
@@ -711,8 +743,9 @@ mod tests {
         }
         assert!(saved_of(&path).off());
         assert!(forget(&path).is_err(), "the on removes a file, never a folder");
-        // A link to a folder cannot be read either, but it is the link the on
-        // removes: damaged, not a folder.
+        // A link to a folder cannot be read either, but off Windows it is the
+        // link the on removes: damaged, not a folder (on Windows the link is
+        // removed as a folder is, so it reads as one).
         #[cfg(unix)]
         {
             let link = dir.0.join("link-to-a-folder.json");
@@ -724,6 +757,63 @@ mod tests {
             forget(&link).unwrap();
             assert!(!link.exists() && path.is_dir(), "the link is removed, the folder kept");
         }
+    }
+
+    /// A link to nothing by the file's name reads as missing through the
+    /// link, but something is there: damaged, which counts as off, never on,
+    /// and the startup line says so on stderr. The on removes the link
+    /// itself, and then the file reads on; an off saved over a link to
+    /// nothing replaces the link with the file and never makes the link's
+    /// target.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_nothing_reads_damaged_and_the_on_removes_it_and_the_off_replaces_it() {
+        let dir = Dir::new("dangling");
+        let path = dir.file();
+        let nowhere = dir.0.join("nowhere.json");
+        let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+        std::os::unix::fs::symlink(&nowhere, &path).unwrap();
+        match saved_of(&path) {
+            Saved::Damaged(why) => {
+                assert!(why.contains(LANE_FILE) && why.contains("is a link to nothing, not a Chia switch the node can read"), "{why}")
+            }
+            other => panic!("a link to nothing is damaged, not {other:?}"),
+        }
+        assert!(saved_of(&path).off(), "a link to nothing counts as off");
+        let switch = LaneSwitch::read(false, path.clone());
+        assert_eq!(switch.source_at_start(), Some(OffSource::Setting));
+        assert_eq!(switch.view(), LaneView { off: true, source: Some(OffSource::Setting), setting: Setting::Off, damaged: true, stuck: false });
+        let (line, err) = switch.startup_line().unwrap();
+        assert!(err && line.contains("is a link to nothing") && line.contains("so Chia counts as off"), "{line}");
+
+        forget(&path).unwrap();
+        assert!(!is_link(&path), "the link is removed");
+        assert_eq!(saved_of(&path), Saved::On);
+
+        std::os::unix::fs::symlink(&nowhere, &path).unwrap();
+        save_off(&path, 1).unwrap();
+        assert!(!is_link(&path) && path.is_file(), "the file replaces the link");
+        assert!(!nowhere.exists(), "the link's target is never made");
+        assert_eq!(saved_of(&path), Saved::Off);
+    }
+
+    /// The in-game on over a link to nothing: taken, the link is removed,
+    /// Chia stays off for this run, and the next start reads it on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_in_game_on_removes_a_link_to_nothing_and_the_next_start_reads_on() {
+        let dir = Dir::new("dangling-on");
+        let path = dir.file();
+        std::os::unix::fs::symlink(dir.0.join("nowhere.json"), &path).unwrap();
+        let switch = LaneSwitch::read(false, path.clone());
+        assert!(switch.strict(), "a link to nothing holds Chia off at the start");
+        let on = switch.turn(true, 0, || -> std::future::Ready<()> { panic!("an on closes nothing") }).await;
+        assert_eq!(on.status, "200 OK");
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the link is removed");
+        assert!(switch.strict(), "Chia stays off until the node stops");
+        assert_eq!(on.body["lane"], serde_json::json!({ "off": true, "source": "setting", "setting": "on" }));
+        assert_eq!(on.body["note"], turned_note(true, false, true));
+        assert_eq!(LaneSwitch::read(false, path.clone()).source_at_start(), None, "the next start reads it on");
     }
 
     /// The off is saved owner-only, with when, and reads back off; the on
