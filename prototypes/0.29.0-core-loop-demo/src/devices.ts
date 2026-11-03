@@ -266,6 +266,8 @@ import {
   type FaucetRequestTicket,
 } from './faucetDish';
 import { isAddressOn, type ChiaNetwork } from './chiaNetwork';
+import { chiaBackOn, chiaOffWhy } from './chiaLane';
+import type { ChiaLane } from './nodeFingerprint';
 import { qrSvg } from './qrCode';
 
 /** The helm's FUEL gauge: its figure, fill and colour. */
@@ -4617,6 +4619,10 @@ export interface FaucetDishUIDeps {
    *  when it is the same row; before the first status this one names the
    *  network the slot is drawn for. */
   chiaNet: () => ChiaNetwork | null | undefined;
+  /** ⛓️ Whether Chia is off on this computer, from the same fingerprint
+   *  (`chia_lane`, chiaLane.ts): `undefined` while none was read or the node
+   *  is older than the strict lane. Absent: the screen reads Chia as on. */
+  chiaLane?: () => ChiaLane | undefined;
 }
 
 /** Give buttons, in mojos, labelled with the network's ticker. The lobby
@@ -4648,6 +4654,12 @@ const FAUCET_SCREEN_POLL_MS = 20_000;
  * the dish takes no gifts. On a network this page does not know, or a status
  * whose network is not the fingerprint's, it says why no address shows. The
  * address, the QR code and COPY show only for an address on that network.
+ *
+ * ⛓️ While Chia is off on this computer (`SSF_NO_CHIA_LANE`, or the Chia
+ * switch in the SpacePhone's Network settings) the node reads and writes
+ * nothing on the chain: the screen says so and why, and shows no jar
+ * figures (the last status on file is from before), no TAKE, no slot and no
+ * address. A TAKE or GIVE sent before the off still shows, since it may land.
  */
 export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
@@ -4679,11 +4691,19 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       : (fpNet ?? null);
     return { net, known: st !== null || fpNet !== undefined };
   };
-  /** The fingerprint's network as the last draw saw it, so `update` redraws
-   *  when it changes without a new status. */
+  /** ⛓️ The fingerprint's lane while Chia is off, else null. Read again at
+   *  every draw and every TAKE, GIVE or COPY, like the network. */
+  const laneOff = (): ChiaLane | null => {
+    const lane = deps.chiaLane?.();
+    return lane?.off ? lane : null;
+  };
+  /** The fingerprint's network and lane as the last draw saw them, so
+   *  `update` redraws when either changes without a new status. */
   const fpNetKey = (): string => {
     const fpNet = deps.chiaNet();
-    return fpNet === undefined ? '-' : fpNet === null ? '?' : fpNet.id;
+    const net = fpNet === undefined ? '-' : fpNet === null ? '?' : fpNet.id;
+    const lane = laneOff();
+    return lane ? `${net}|off:${lane.source ?? '?'}:${lane.setting ?? '-'}:${lane.damaged ? 'damaged' : ''}:${lane.stuck ? 'stuck' : ''}` : net;
   };
   let drawnFor = '';
 
@@ -4739,6 +4759,33 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       : pending === 'give'
         ? `GIVING… ${unanswered !== null ? unansweredLine('your gift') : 'your gift lands when the next block confirms it (about a minute)'}`
         : '';
+    const off = laneOff();
+    if (off) {
+      // ⛓️ Chia is off: the node refuses every request, saying so, so its
+      // error line would only repeat this one. A spend sent before the off
+      // may still land, but the dish cannot read it until Chia is back on.
+      const back = chiaBackOn(off);
+      const offPending = pending === 'claim'
+        ? 'TAKING… sent before Chia went off: the mojo may still land on the chain, but the dish cannot see it while Chia is off.'
+        : pending === 'give'
+          ? 'GIVING… sent before Chia went off: your gift may still land on the chain, but the dish cannot see it while Chia is off.'
+          : '';
+      panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🥣 FAUCET DISH</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:11px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">CHIA IS OFF</div>
+      ${offPending ? `<div style="font-size:9.5px; color:${CH_PINK};">${offPending}</div>` : ''}
+      <div id="faucet-chia-off" style="font-size:9.5px; color:${CH_GOLD}; line-height:1.5;">
+        ${escapeHtml(`${chiaOffWhy(off)}, so the dish reads nothing from the chain, and takes and gives nothing.${back ? ` ${back}` : ''}`)}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF FAUCET DISH v1 · a keyless Chia coin per room${net ? ` · ${escapeHtml(net.name)}` : ''}
+      </div>
+    `;
+      return;
+    }
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🥣 FAUCET DISH</span>
@@ -4815,7 +4862,7 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // TAKE checks the network again at the click, as GIVE does: the
     // fingerprint may have moved off a test network since this draw.
     panel.querySelector<HTMLButtonElement>('#faucet-take')?.addEventListener('click', () => {
-      if (dishNet(latestFaucetStatus(roomId)).net?.test !== true) {
+      if (laneOff() || dishNet(latestFaucetStatus(roomId)).net?.test !== true) {
         render();
         return;
       }
@@ -4824,6 +4871,8 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
     // GIVE and COPY check the network and the jar's address again at the
     // click: the fingerprint may have moved off a test network since this draw.
     const payInNow = (): ReturnType<typeof latestFaucetStatus> => {
+      // ⛓️ And Chia: it may have gone off since this draw.
+      if (laneOff()) return null;
       const cur = latestFaucetStatus(roomId);
       const curNet = dishNet(cur).net;
       return cur && curNet?.test === true && isAddressOn(curNet, cur.address) ? cur : null;
@@ -4879,9 +4928,9 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       panel?.remove();
       panel = null;
     },
-    // Observer-driven, except for the node's network: a fingerprint that
-    // moves to another network redraws the screen at once, so no GIVE, QR
-    // code or address of the old network stays up.
+    // Observer-driven, except for the node's network and lane: a fingerprint
+    // that moves to another network, or says Chia went off, redraws the
+    // screen at once, so no GIVE, QR code or address of the old one stays up.
     update(): void {
       if (panel && fpNetKey() !== drawnFor) render();
     },

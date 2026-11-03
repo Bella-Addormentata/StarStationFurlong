@@ -281,6 +281,10 @@ pub struct Lane {
     /// side would never come. close() takes it for writing, so it returns
     /// only once none is left running.
     in_flight: tokio::sync::RwLock<()>,
+    /// ⛓️ What held Chia off when the lane was built closed
+    /// ([`Lane::closed`]), for its startup line; `None` for a lane built
+    /// open, closed or not since.
+    off_why: Option<&'static str>,
     /// Every dial's outcome as it comes (tests).
     #[cfg(test)]
     dialled: tokio::sync::watch::Sender<Vec<Dialled>>,
@@ -407,18 +411,20 @@ impl Lane {
             closed,
             readers,
             in_flight: tokio::sync::RwLock::new(()),
+            off_why: None,
             #[cfg(test)]
             dialled: tokio::sync::watch::Sender::new(Vec::new()),
         }
     }
 
-    /// ⛓️ The lane while Chia is off on this computer (`SSF_NO_CHIA_LANE`,
-    /// chia_strict.rs): closed from the start, with no pins and no store
-    /// path, so it never resolves a pin, never reads or writes
+    /// ⛓️ The lane while Chia is off on this computer at the start
+    /// (chia_strict.rs), `why` naming what holds it off for the startup line
+    /// (chia_strict::source_words): closed from the start, with no pins and
+    /// no store path, so it never resolves a pin, never reads or writes
     /// `chia_peers.json`, and refuses every request before it does anything
     /// else ([`Self::peers_for`]).
-    pub fn closed(net: Network) -> Self {
-        let lane = Self::new(net, vec![], false, None);
+    pub fn closed(net: Network, why: &'static str) -> Self {
+        let lane = Self { off_why: Some(why), ..Self::new(net, vec![], false, None) };
         lane.closed.send_replace(true);
         lane
     }
@@ -481,10 +487,10 @@ impl Lane {
     /// was cancelled, returns only once the closes the first started have
     /// ended, since they run as tasks of their own that no caller holds, and
     /// are counted until they end ([`LaneState::closing`]), and once every
-    /// reader is gone, counted the same way ([`Readers`]). It is for the
-    /// in-game Chia switch, which is not wired yet (PR 4 of stage 4); the env
-    /// switch builds the lane closed instead.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// reader is gone, counted the same way ([`Readers`]). It is for Chia
+    /// turned off in the SpacePhone's Network settings while the node runs
+    /// (chia_chain::close_lane); a start with Chia off builds the lane
+    /// closed instead ([`Self::closed`]).
     pub async fn close(&self) {
         // The flag first: a request that has the pool next is refused there,
         // and the network work under way is abandoned.
@@ -552,8 +558,9 @@ impl Lane {
     pub fn describe(&self) -> String {
         if self.is_closed() {
             format!(
-                "off. {} (SSF_NO_CHIA_LANE): no {} full node is asked, and the peer store is neither read nor written",
+                "off. {}{}: no {} full node is asked, and the peer store is neither read nor written",
                 crate::chia_strict::OFF_WORDS,
+                self.off_why.map(|why| format!(" ({why})")).unwrap_or_default(),
                 self.net.id
             )
         } else if self.pins.is_empty() {
@@ -5845,7 +5852,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_lane_refuses_everything_and_touches_no_file() {
         for net in [Network::testnet11(), Network::mainnet()] {
-            let lane = Lane::closed(net.clone());
+            let lane = Lane::closed(net.clone(), "SSF_NO_CHIA_LANE");
             assert!(lane.is_closed());
             assert!(lane.pins.is_empty() && !lane.pin_only && lane.store_path.is_none(), "no pin, no chia_peers.json");
             assert!(lane.pin_port_warnings().is_empty());
@@ -5853,7 +5860,7 @@ mod tests {
             assert!(lane.describe().contains(&net.id), "{}", lane.describe());
             assert!(lane.describe().ends_with("the peer store is neither read nor written"), "{}", lane.describe());
         }
-        let lane = Arc::new(Lane::closed(Network { introducers: vec!["localhost".to_string()], ..net() }));
+        let lane = Arc::new(Lane::closed(Network { introducers: vec!["localhost".to_string()], ..net() }, "SSF_NO_CHIA_LANE"));
         for trust in [Trust::Carrier, Trust::Agreed] {
             all_off(every_op(&PeerLane::new(lane.clone(), trust)).await);
         }
@@ -5950,6 +5957,41 @@ mod tests {
         assert_eq!((asked(&a), asked(&b)), before, "nothing more asked of either peer");
         assert_eq!(std::fs::read(&store).unwrap(), stored, "the store is not written again");
         let _ = std::fs::remove_file(&store);
+    }
+
+    /// ⛓️ The in-game off (chia_strict.rs, the `/api/chia/lane?on=0` route)
+    /// on a lane in use, with the lane's close as the route passes it
+    /// (chia_chain::close_lane, here on a lane of the test's own): by the
+    /// time the turn answers, the switch is saved, every connection is
+    /// closed, the pool is empty and every request is refused, and the
+    /// peers are asked nothing more.
+    #[tokio::test]
+    async fn the_in_game_off_answers_once_its_lane_is_closed_and_refusing() {
+        use crate::chia_strict::{LaneSwitch, OffSource, Saved, LANE_FILE};
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100, "two peers agree");
+        let conns = lane.live_conns().await;
+        assert_eq!(conns.len(), 2);
+        let dir = std::env::temp_dir().join(format!("ssf-lane-off-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let switch = LaneSwitch::read(false, dir.join(LANE_FILE));
+        assert!(!switch.strict());
+        let turned = switch.turn(false, 1_762_150_000, || lane.close()).await;
+        assert_eq!(turned.status, "200 OK");
+        assert_eq!(switch.off_source(), Some(OffSource::Setting));
+        assert_eq!(crate::chia_strict::saved_of(&dir.join(LANE_FILE)), Saved::Off);
+        assert!(lane.is_closed());
+        assert!(conns.iter().all(|c| !c.alive()), "every connection is closed when the turn answers");
+        assert_eq!(lane.live_count().await, 0, "the pool is empty");
+        let asked = |n: &MockNode| n.seen.lock().unwrap().len();
+        let before = (asked(&a), asked(&b));
+        for trust in [Trust::Carrier, Trust::Agreed] {
+            all_off(every_op(&PeerLane::new(lane.clone(), trust)).await);
+        }
+        assert_eq!((asked(&a), asked(&b)), before, "nothing more asked of either peer");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A refill waiting for the pool when the lane closes (close() has set

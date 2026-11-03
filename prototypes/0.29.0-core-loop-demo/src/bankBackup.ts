@@ -428,7 +428,9 @@ export function bankBackupView(
           ? { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false, disabled: false }
           : { act: 'arm', label: 'I SAVED', danger: false, busy: false, disabled: !revealed || ui.revealing },
       keyLine: revealed ? backupKeyLine(ui.key as number) : null,
-      funding: revealed ? { text: BACKUP_FUNDING, address } : null,
+      // ⛓️ While Chia is off the node writes nothing to the chain and the
+      // Bank shows no address (bankWallet.ts): no funding line, no address.
+      funding: revealed && !fp?.chia_lane?.off ? { text: BACKUP_FUNDING, address } : null,
       armedWarning: ui.armed && !ui.saving ? BACKUP_ARMED : null,
       expired: ui.expired && !shown ? BACKUP_EXPIRED : null,
     },

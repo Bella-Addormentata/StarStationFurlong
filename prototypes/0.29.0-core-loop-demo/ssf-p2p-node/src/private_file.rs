@@ -57,6 +57,27 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
+/// Remove a file [`write_private`] wrote, so that the removal survives a
+/// power loss as the write does: the directory is synced after it (on
+/// Unix). A file that is not there counts as removed, and nothing is synced
+/// then, since nothing changed.
+pub fn remove_private(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Reset an EXISTING secret file to 0600 without rewriting it (Unix; a no-op
 /// elsewhere). The contact key is written once and then only read, so a copy
 /// left broader than 0600 would otherwise stay readable for the life of the
@@ -133,6 +154,25 @@ mod tests {
         let c = load_or_create_node_key(&path).unwrap();
         assert_ne!(c.public(), a.public(), "a damaged file is replaced by a fresh key");
         assert_eq!(mode(&path), 0o600, "rewriting a broader file tightens it to 0600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written owner-only is removed, and one that is not there
+    /// counts as removed; something that is not a file is not removed, and
+    /// the error says so.
+    #[test]
+    fn a_private_file_is_removed_and_a_missing_one_counts_as_removed() {
+        let dir = std::env::temp_dir().join(format!("ssf-rm-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("switch.json");
+        write_private(&path, b"{}").unwrap();
+        remove_private(&path).unwrap();
+        assert!(!path.exists(), "removed");
+        remove_private(&path).expect("a missing file counts as removed");
+        let folder = dir.join("folder.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(remove_private(&folder).is_err(), "a directory is not a file");
+        assert!(folder.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

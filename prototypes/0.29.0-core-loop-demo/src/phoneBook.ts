@@ -14,8 +14,9 @@
  *
  * Nothing here is drawn per frame: the fingerprint poll drives it.
  */
+import { chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';
-import type { ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
 
 /** The two colours Dorkmo asked for: green for a current listing, grey for a
  *  stale one (and for none yet). The grey sits a little above the signal bars'
@@ -75,6 +76,10 @@ const moneyPaysNoWrite = (net: ChiaNetwork): PhoneBookIndicator =>
   notPublished(`OFF — on ${net.name} the SSF wallet pays for no Phone Book write yet, so this node writes no listing there`);
 const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
 const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
+/** ⛓️ Chia off on this computer (chiaLane.ts): the node reads and writes no
+ *  listing at all, whatever readout it kept from before an in-run off. */
+const chiaIsOff = (lane: ChiaLane): PhoneBookIndicator =>
+  notPublished(`OFF — ${chiaOffWhy(lane)}, so this node neither reads nor writes the Phone Book`);
 /** On, with no listing reported yet: the publisher's first round runs about a
  *  minute after the wallet turns on, and a node that is not findable never
  *  reports one. */
@@ -82,10 +87,13 @@ const WALLET_ON_UNREPORTED = notPublished("Not in the Phone Book yet — the SSF
 
 /** The icon for a fingerprint round. Hidden, with the row saying why, when
  *  the node did not answer this round (`null`: a cached green must not
- *  outlive the node) or does not publish presence at all (a read-only build,
- *  no wallet, `SSF_CHIA_FINDABLE=0`, no durable contact key). */
+ *  outlive the node), when Chia is off on this computer (a listing the node
+ *  reported before an in-run off is no longer kept up), or when the node
+ *  does not publish presence at all (a read-only build, no wallet,
+ *  `SSF_CHIA_FINDABLE=0`, no durable contact key). */
 export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): PhoneBookIndicator {
   if (!fp) return NO_NODE;
+  if (fp.chia_lane?.off) return chiaIsOff(fp.chia_lane);
   const p = fp.chia_presence;
   if (!p) {
     const state = fp.chia_wallet?.state;

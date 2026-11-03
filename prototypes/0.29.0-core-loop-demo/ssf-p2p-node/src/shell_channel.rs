@@ -465,11 +465,15 @@ pub fn spawn(answer: impl FnMut(Op) -> Zeroizing<String> + Send + 'static) {
 }
 
 /// The `hello` answer: the node's network, the wallet's state, whether its
-/// words are marked saved, and its receive address (all public).
+/// words are marked saved, its receive address, and whether Chia is off on
+/// this computer now (`chia_off`, chia_strict.rs), all public. While Chia is
+/// off the Bank shows no address, so the app's backup window does not ask
+/// the player to check its address against the Bank's.
 pub fn hello_body(
     net: crate::chia_network::ChiaNet,
     wallet: &crate::chia_wallet_switch::WalletSwitch,
     address: Option<&str>,
+    chia_off: bool,
 ) -> Zeroizing<String> {
     Zeroizing::new(
         serde_json::json!({
@@ -478,6 +482,7 @@ pub fn hello_body(
             "wallet": wallet.state,
             "backed_up": wallet.backed_up,
             "address": address,
+            "chia_off": chia_off,
         })
         .to_string(),
     )
@@ -939,7 +944,7 @@ mod tests {
             error: Some("x".into()),
             backup: Backup::Native,
         };
-        let body = hello_body(ChiaNet::Testnet11, &wallet, Some("txch1abc"));
+        let body = hello_body(ChiaNet::Testnet11, &wallet, Some("txch1abc"), false);
         assert!(!body.contains('\n'), "one line");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -950,13 +955,14 @@ mod tests {
                 "wallet": "on",
                 "backed_up": true,
                 "address": "txch1abc",
+                "chia_off": false,
             }),
-            "only public facts: no error, no key fingerprint, no flags beyond backed_up"
+            "only public facts: no error, no key fingerprint, no flags beyond backed_up and chia_off"
         );
         // Mainnet holds an SSF wallet now: the app's hello there names it as
         // on testnet11, Ready before it is made and On with its address.
         let ready = WalletSwitch { state: WalletState::Ready, backed_up: false, ..wallet.clone() };
-        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &ready, None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &ready, None, false)).unwrap();
         assert_eq!(
             v,
             serde_json::json!({
@@ -965,10 +971,11 @@ mod tests {
                 "wallet": "ready",
                 "backed_up": false,
                 "address": null,
+                "chia_off": false,
             })
         );
         let on = WalletSwitch { backed_up: false, ..wallet };
-        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &on, Some("xch1abc"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Mainnet, &on, Some("xch1abc"), false)).unwrap();
         assert_eq!(
             v,
             serde_json::json!({
@@ -977,7 +984,47 @@ mod tests {
                 "wallet": "on",
                 "backed_up": false,
                 "address": "xch1abc",
+                "chia_off": false,
             })
         );
+    }
+
+    /// ⛓️ After an in-game off a wallet loaded before it stays on, with its
+    /// address, until the node stops; the hello says Chia is off beside it,
+    /// so the app's window does not send the player to the Bank for an
+    /// address the Bank no longer shows.
+    #[test]
+    fn hello_says_chia_is_off_beside_a_wallet_loaded_before_the_off() {
+        let wallet = WalletSwitch {
+            state: WalletState::On,
+            seed: false,
+            legacy: false,
+            stays: true,
+            held: false,
+            mnemonic: true,
+            backed_up: false,
+            reminted: false,
+            at_rest: None,
+            at_rest_next: None,
+            rewrapped: false,
+            error: None,
+            backup: Backup::Native,
+        };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Testnet11, &wallet, Some("txch1abc"), true)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "net": { "id": "testnet11", "genesis": ChiaNet::Testnet11.genesis_hex() },
+                "wallet": "on",
+                "backed_up": false,
+                "address": "txch1abc",
+                "chia_off": true,
+            })
+        );
+        // A start with Chia off loads no wallet: not on, no address.
+        let off = WalletSwitch { state: WalletState::Off, ..wallet };
+        let v: serde_json::Value = serde_json::from_str(&hello_body(ChiaNet::Testnet11, &off, None, true)).unwrap();
+        assert_eq!((&v["wallet"], &v["address"], &v["chia_off"]), (&serde_json::json!("off"), &serde_json::Value::Null, &serde_json::json!(true)));
     }
 }

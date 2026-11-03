@@ -147,10 +147,16 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// build with the `chia-publish` feature. Off a test network (`net`) the SSF
 /// wallet pays for no chain write (stage 4 design §4.5 (1),
 /// `chia_publish::money_memo_refusal`), so publishing is off there whatever
-/// the wallet does, and the line says so. While Chia is off (`strict`,
-/// chia_strict.rs) reads and publishing are both off, and the line says why
-/// on every network.
-pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKey, live_addrs: &[String], wallet_on: bool, strict: bool) {
+/// the wallet does, and the line says so. While Chia is off at the start
+/// (`off` names what holds it off, chia_strict.rs) reads and publishing are
+/// both off, and the line says why on every network.
+pub fn startup_status(
+    net: crate::chia_network::ChiaNet,
+    secret: &iroh::SecretKey,
+    live_addrs: &[String],
+    wallet_on: bool,
+    off: Option<crate::chia_strict::OffSource>,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -172,19 +178,17 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
         .and_then(|blob| decode_signed(&blob))
         .map(|round| round == record)
         .unwrap_or(false);
-    let reads = if !cfg!(feature = "chia-read") {
-        "not built"
-    } else if strict {
-        STRICT_STATUS
-    } else if std::env::var("SSF_CHIA_WATCH").ok().as_deref() == Some("0") {
-        "rung-6 only (watcher off: SSF_CHIA_WATCH=0)"
-    } else {
-        "on (rung-6 resolve + beat watcher)"
+    let reads = match off {
+        _ if !cfg!(feature = "chia-read") => "not built".to_string(),
+        Some(source) => strict_status(source),
+        None if std::env::var("SSF_CHIA_WATCH").ok().as_deref() == Some("0") => {
+            "rung-6 only (watcher off: SSF_CHIA_WATCH=0)".to_string()
+        }
+        None => "on (rung-6 resolve + beat watcher)".to_string(),
     };
-    let publish = if strict && cfg!(feature = "chia-publish") {
-        STRICT_STATUS
-    } else {
-        publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch())
+    let publish = match off {
+        Some(source) if cfg!(feature = "chia-publish") => strict_status(source),
+        _ => publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch()).to_string(),
     };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
@@ -192,8 +196,11 @@ pub fn startup_status(net: crate::chia_network::ChiaNet, secret: &iroh::SecretKe
     );
 }
 
-/// The startup line's word on reads and on publishing while Chia is off.
-const STRICT_STATUS: &str = "off (Chia is off on this computer: SSF_NO_CHIA_LANE)";
+/// The startup line's word on reads and on publishing while Chia is off,
+/// with what holds it off (`source`).
+fn strict_status(source: crate::chia_strict::OffSource) -> String {
+    format!("off ({}: {})", crate::chia_strict::OFF_WORDS, crate::chia_strict::source_words(source))
+}
 
 /// The startup line's word on publishing: whether this build can, whether
 /// the SSF wallet pays for a chain write on this network (`pays`: on a test
@@ -967,6 +974,18 @@ mod p6b_tests {
 
 #[cfg(test)]
 mod tests {
+    /// ⛓️ The startup line's word while Chia is off names what holds it off:
+    /// the environment's words as before, or the in-game switch.
+    #[test]
+    fn the_status_word_while_chia_is_off_says_why() {
+        use crate::chia_strict::OffSource;
+        assert_eq!(super::strict_status(OffSource::Env), "off (Chia is off on this computer: SSF_NO_CHIA_LANE)");
+        assert_eq!(
+            super::strict_status(OffSource::Setting),
+            "off (Chia is off on this computer: the Chia switch in the SpacePhone's Network settings)"
+        );
+    }
+
     use super::*;
 
     #[test]
