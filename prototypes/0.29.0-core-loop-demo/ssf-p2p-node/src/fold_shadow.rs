@@ -86,6 +86,11 @@ pub enum Skip {
     /// A checkpoint was written over by another before the node read it (a drain that had not got to the table, or took
     /// its time): the node never had it to compare, and says so, for each.
     Superseded,
+    /// The checkpoint names a house (`h`) that the fold has none required of: a house that stepped down in the open
+    /// round clears what the fold requires without deciding another round, and the trimming page may not have received
+    /// the step-down. (Every checkpoint of a round with a house the fold has stepped down for, and no other: that the fold
+    /// has cleared it by mistake is not told from it. The difference is not a disagreement.)
+    StepDown,
 }
 
 impl Skip {
@@ -102,6 +107,7 @@ impl Skip {
             Skip::Unanswered => "unanswered",
             Skip::Expired => "expired",
             Skip::Superseded => "superseded",
+            Skip::StepDown => "stepdown",
         }
     }
 }
@@ -133,6 +139,19 @@ fn nets_of(pairs: impl IntoIterator<Item = (String, String)>) -> Result<BTreeMap
 
 fn show(m: &BTreeMap<String, i128>) -> String {
     m.iter().map(|(p, n)| format!("{p}:{n}")).collect::<Vec<_>>().join(",")
+}
+
+/// How the nets differ, the first player to differ first: a line is kept to [`LOG_LINE_BYTES`], and the nets of every
+/// player may take more than that before the one that differs. (A player the nets do not name has nothing, as in
+/// both.)
+fn nets_differ(u: i64, ours: &BTreeMap<String, i128>, theirs: &BTreeMap<String, i128>) -> String {
+    let pids: BTreeSet<&String> = ours.keys().chain(theirs.keys()).filter(|p| ours.get(*p) != theirs.get(*p)).collect();
+    let first = pids.iter().next().map_or(String::new(), |p| {
+        let (a, b) = (ours.get(*p).copied().unwrap_or(0), theirs.get(*p).copied().unwrap_or(0));
+        let more = if pids.len() > 1 { format!(" and {} more", pids.len() - 1) } else { String::new() };
+        format!("{} has {a} in the fold and {b} in the checkpoint{more}; ", brief(p, 48))
+    });
+    format!("n through round {u}: {first}the fold has [{}], the checkpoint [{}]", show(ours), show(theirs))
 }
 
 /// The checkpoint `cp` (as the pages read one) against what the fold worked
@@ -186,7 +205,7 @@ pub fn compare(summary: &FoldSummary, cp: &CVal, inc: &str) -> Verdict {
         Err(s) => return Verdict::Skip(s),
     };
     if theirs != nets {
-        return Verdict::Mismatch(format!("n through round {u}: the fold has [{}], the checkpoint [{}]", show(&nets), show(&theirs)));
+        return Verdict::Mismatch(nets_differ(u, &nets, &theirs));
     }
 
     // The close of round u.
@@ -198,7 +217,11 @@ pub fn compare(summary: &FoldSummary, cp: &CVal, inc: &str) -> Verdict {
     let later = summary.rounds.iter().any(|x| x.r > u && x.decided.is_some());
     let ended = cp.get("e").is_some();
     if !later && !ended {
-        if cp.get("h").and_then(CVal::as_str) != summary.required.as_deref() {
+        let h = cp.get("h").and_then(CVal::as_str);
+        if h.is_some() && summary.required.is_none() {
+            return Verdict::Skip(Skip::StepDown);
+        }
+        if h != summary.required.as_deref() {
             return Verdict::Mismatch(format!(
                 "h: the fold wants {:?} named by round {}, the checkpoint says {:?}",
                 summary.required,
@@ -233,12 +256,13 @@ pub struct Tally {
     pub unanswered: u64,
     pub expired: u64,
     pub superseded: u64,
+    pub step_down: u64,
 }
 
 impl Tally {
     /// Every comparison not made.
     pub fn skipped(&self) -> u64 {
-        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired + self.superseded
+        self.past + self.behind + self.big + self.unreadable + self.pending + self.parent + self.stale + self.inputs + self.unanswered + self.expired + self.superseded + self.step_down
     }
 }
 
@@ -258,6 +282,7 @@ impl Tally {
             Verdict::Skip(Skip::Unanswered) => self.unanswered += 1,
             Verdict::Skip(Skip::Expired) => self.expired += 1,
             Verdict::Skip(Skip::Superseded) => self.superseded += 1,
+            Verdict::Skip(Skip::StepDown) => self.step_down += 1,
         }
     }
 }
@@ -306,6 +331,19 @@ pub const COMPARED_HISTORY: usize = 16;
 pub const LOG_LINES: usize = 32;
 /// The most bytes of one such line: a mismatch names the nets of up to 4,096 players.
 pub const LOG_LINE_BYTES: usize = 512;
+
+/// The first `n` characters of `s`, and a … if there were more: a name a peer chose is not let take a line to itself.
+fn brief(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((at, _)) => format!("{}…", &s[..at]),
+        None => s.to_string(),
+    }
+}
+
+/// Which table a line is about: the room, the table and its incarnation (two rooms can have the same table).
+fn tag(room: &str, t: &str, inc: &str) -> String {
+    format!("{} {} {}", brief(room, 64), brief(t, 64), inc)
+}
 
 /// `line`, cut to [`LOG_LINE_BYTES`] at a character.
 fn clip(mut line: String) -> String {
@@ -358,7 +396,7 @@ pub const MAX_SHADOW_TABLES: usize = FOLD_TABLES - 2;
 type TableKey = (String, String);
 
 /// What time it is, asked afresh where it matters (see [`tick_shadow_with`]); the tests give it a time of their own.
-pub type Clock<'a> = &'a dyn Fn() -> Instant;
+pub use crate::fold_supervisor::Clock;
 
 /// What was shown of a table's answer: the answer (which taking up of the table, which frame of it), and where
 /// the pins and the delegations stood then. The answer is believed at a trim only if they stand there still.
@@ -510,7 +548,7 @@ impl RoomShadow {
             self.gone.remove(&k);
             if self.mirror.state(&k.0, &k.1).is_some_and(|st| !st.ended) {
                 tally.note(&Verdict::Skip(Skip::Expired));
-                say(&mut self.said, false, format!("{} {}: skipped (expired: no final checkpoint in {} s)", k.0, k.1, GONE_GRACE.as_secs()));
+                say(&mut self.said, false, format!("{}: skipped (expired: no final checkpoint in {} s)", tag(self.mirror.room(), &k.0, &k.1), GONE_GRACE.as_secs()));
             }
         }
     }
@@ -578,10 +616,11 @@ impl RoomShadow {
         self.inputs = Inputs::default();
     }
 
-    /// Send what has changed. `allow_new` false: the worker still owes a word of letting go
-    /// somewhere, so a table it does not hold yet waits.
-    fn send<L: Launch>(&mut self, now: Instant, sup: &mut Supervisor<L>, allow_new: bool) {
-        self.feed.push_with(now, &mut self.mirror, sup, &self.inputs, allow_new);
+    /// Send what has changed. `room` is the number of tables the worker has a place for that it does not hold yet,
+    /// over all rooms (0 while it still owes a word of letting go somewhere): each one started takes one, and a
+    /// table that would take more waits.
+    fn send<L: Launch>(&mut self, clock: Clock<'_>, sup: &mut Supervisor<L>, room: &mut usize) {
+        self.feed.push_clocked(clock, &mut self.mirror, sup, &self.inputs, room);
     }
 
     /// For each table whose mirror has a checkpoint the table was not
@@ -598,11 +637,14 @@ impl RoomShadow {
     /// it is counted as a comparison not made.
     fn compare(&mut self, tally: &mut Tally, covered: &BTreeSet<TableKey>, pins: u64, delegations: u64) {
         let RoomShadow { mirror, feed, compared, confirmed, said, .. } = self;
+        let room = mirror.room().to_string();
         let keys: Vec<TableKey> = mirror.tables().map(|c| (c.t.clone(), c.inc.clone())).collect();
         compared.retain(|k, _| keys.contains(k));
         confirmed.retain(|k, _| keys.contains(k));
         for key in keys {
             let (t, inc) = (&key.0, &key.1);
+            // (What a line says of which table: the room too, since two rooms can hold the same table.)
+            let at = || tag(&room, t, inc);
             // Checkpoints a page wrote and another page wrote over before the mirror read the table: the node never had
             // them, and each is counted as a comparison not made.
             let lost = mirror.take_superseded(t, inc);
@@ -610,7 +652,7 @@ impl RoomShadow {
                 tally.note(&Verdict::Skip(Skip::Superseded));
             }
             if lost > 0 {
-                say(said, false, format!("{t} {inc}: skipped (superseded: {lost} checkpoint(s) written over before the node read them)"));
+                say(said, false, format!("{}: skipped (superseded: {lost} checkpoint(s) written over before the node read them)", at()));
             }
             let Some(st) = mirror.state(t, inc) else { continue };
             let Some(cp) = st.base else {
@@ -622,7 +664,7 @@ impl RoomShadow {
                     if !seen(compared, &key, &id) {
                         remember(compared, &key, id);
                         tally.note(&Verdict::Skip(Skip::Unreadable));
-                        say(said, false, format!("{t} {inc}: skipped (unreadable: the checkpoint cannot be read as a page reads it)"));
+                        say(said, false, format!("{}: skipped (unreadable: the checkpoint cannot be read as a page reads it)", at()));
                     }
                 }
                 continue;
@@ -643,7 +685,7 @@ impl RoomShadow {
             let Some(fold) = feed.fold(t, inc).filter(|f| f.generation < st.generation) else {
                 remember(compared, &key, id);
                 tally.note(&Verdict::Skip(Skip::Unanswered));
-                say(said, false, format!("{t} {inc} u={u}: skipped (unanswered)"));
+                say(said, false, format!("{} u={u}: skipped (unanswered)", at()));
                 continue;
             };
             remember(compared, &key, id);
@@ -658,10 +700,9 @@ impl RoomShadow {
             }
             tally.note(&verdict);
             match &verdict {
-                Verdict::Agree => eprintln!("🧮 fold-shadow {t} {inc} u={u}: agrees with the checkpoint"),
-                Verdict::Mismatch(why) => say(said, true, format!("{t} {inc} u={u}: MISMATCH — {why}")),
-                Verdict::Skip(Skip::Past) => {}
-                Verdict::Skip(why) => say(said, false, format!("{t} {inc} u={u}: skipped ({})", why.name())),
+                Verdict::Agree => eprintln!("🧮 fold-shadow {} u={u}: agrees with the checkpoint", at()),
+                Verdict::Mismatch(why) => say(said, true, format!("{} u={u}: MISMATCH — {why}", at())),
+                Verdict::Skip(why) => say(said, false, format!("{} u={u}: skipped ({})", at(), why.name())),
             }
         }
     }
@@ -700,6 +741,8 @@ pub struct FoldShadow<L: Launch> {
     pin_walk_time: Option<Duration>,
     /// What each room's mirror reads in a drain (the defaults; less in the tests).
     limits: Limits,
+    /// The tables the worker holds ([`FOLD_TABLES`]; fewer in the tests).
+    places: usize,
     tally: Tally,
     /// The last of what the comparisons said (the mismatches and the comparisons not made).
     log: Log,
@@ -720,6 +763,7 @@ impl<L: Launch> FoldShadow<L> {
             pin_walk: PIN_WALK_KEYS,
             pin_walk_time: None,
             limits: Limits::default(),
+            places: FOLD_TABLES,
             tally: Tally::default(),
             log: Log::default(),
             gone: Counts::default(),
@@ -780,7 +824,9 @@ impl<L: Launch> FoldShadow<L> {
         // (The houses of a plan are the ones its deed holder delegated: they are the room's houses only while the doc
         // names that holder. A holder who changed since the pass read the room, or since the epoch was read, shows
         // nothing whole; one who changes after moves the epoch.)
-        let held = deed.as_deref() == Some(plan.owner.as_str());
+        // (And the key the watch has pinned for that holder is the key the pass pinned: the houses are the ones that
+        // key delegated.)
+        let held = deed.as_deref() == Some(plan.owner.as_str()) && pins.iter().any(|(pid, key)| *pid == plan.owner && *key == plan.owner_key);
         FoldView { tables: plan.tables, houses: plan.houses, pins, settled: plan.complete && pins_settled && held, pins_epoch, watch: Some(watch) }
     }
 
@@ -849,7 +895,6 @@ impl<L: Launch> FoldShadow<L> {
                 room_left -= kept;
             }
         }
-        self.followed = (allowance - room_left) as u64;
         self.over = over;
         let none = BTreeSet::new();
         let mut listed = BTreeSet::new();
@@ -877,9 +922,16 @@ impl<L: Launch> FoldShadow<L> {
                 rs.leave(clock(), &events, &mut self.sup);
             }
         }
-        let allow_new = !self.rooms.values().any(|rs| rs.feed.owes_forget());
+        // The tables followed are the ones the mirrors hold now, after the follow and the release: those the plan names and
+        // those kept for a checkpoint that may yet come (a place of the worker's each, whatever the plan says).
+        self.followed = self.rooms.values().map(|rs| rs.mirror.tables().count() as u64).sum();
+        // The worker holds `places` tables (FOLD_TABLES), whatever the shadow meant to follow: a table kept after the view let it go, because
+        // its checkpoint came after the places were counted, is held all the same. A table it does not hold yet waits
+        // for a place, and takes it when those are let go of (their checkpoints compared on a later tick).
+        let held: usize = self.rooms.values().map(|rs| rs.feed.holds()).sum();
+        let mut room = if self.rooms.values().any(|rs| rs.feed.owes_forget()) { 0 } else { self.places.saturating_sub(held) };
         for rs in self.rooms.values_mut() {
-            rs.send(clock(), &mut self.sup, allow_new);
+            rs.send(clock, &mut self.sup, &mut room);
         }
         // A room let go of goes once the worker has been told of every table.
         let done: Vec<String> = self.rooms.iter().filter(|(_, rs)| rs.leaving && rs.feed.is_idle()).map(|(r, _)| r.clone()).collect();
@@ -892,6 +944,12 @@ impl<L: Launch> FoldShadow<L> {
 
     pub fn tally(&self) -> Tally {
         self.tally
+    }
+
+    /// The tables the worker holds (or is owed a word of letting go of), over all rooms: never more than it has
+    /// places for.
+    pub fn holds(&self) -> usize {
+        self.rooms.values().map(|rs| rs.feed.holds()).sum()
     }
 
     /// The feed's counts over all rooms, those let go of included.

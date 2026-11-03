@@ -48,6 +48,11 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// What time it is, asked afresh where it matters: encoding a frame and starting a process take time, and a request is
+/// owed an answer from the time it was queued, not from the time the pass that posted it began. (The tests give a
+/// time of their own.)
+pub type Clock<'a> = &'a dyn Fn() -> Instant;
+
 use crate::fold_wire::{decode_resp, encode_req, read_frame, write_frame, Req, Resp, WireError};
 use crate::house_bytes::Ctx;
 
@@ -468,11 +473,14 @@ pub struct Supervisor<L: Launch> {
     unsaid: Vec<Event>,
     /// When the worker's process was first seen gone, while its output has not yet said so.
     exit_seen: Option<Instant>,
+    /// A test's pipe clogged before there was a worker to clog (see [`Supervisor::clog`]): the worker started next has it.
+    #[cfg(test)]
+    preclog: std::sync::atomic::AtomicUsize,
 }
 
 impl<L: Launch> Supervisor<L> {
     pub fn new(launch: L, now: Instant) -> Supervisor<L> {
-        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new(), exit_seen: None }
+        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new(), exit_seen: None, #[cfg(test)] preclog: std::sync::atomic::AtomicUsize::new(0) }
     }
 
     pub fn state(&self) -> State {
@@ -506,29 +514,47 @@ impl<L: Launch> Supervisor<L> {
     }
 
     /// A test's way of filling the worker's pipe: `bytes` count as waiting to be written, so frames are
-    /// refused as busy until [`unclog`](Supervisor::unclog) takes them back.
+    /// refused as busy until [`unclog`](Supervisor::unclog) takes them back. (With no worker yet, the one started
+    /// next is the one clogged: a test that clogs before its first tick must not have the first frame through.)
     #[cfg(test)]
     pub(crate) fn clog(&self, bytes: usize) {
-        if let Some(link) = &self.link {
-            link.queued.fetch_add(bytes, Ordering::Relaxed);
+        match &self.link {
+            Some(link) => {
+                link.queued.fetch_add(bytes, Ordering::Relaxed);
+            }
+            None => {
+                self.preclog.fetch_add(bytes, Ordering::Relaxed);
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn unclog(&self, bytes: usize) {
-        if let Some(link) = &self.link {
-            link.queued.fetch_sub(bytes, Ordering::Relaxed);
+        match &self.link {
+            Some(link) => {
+                link.queued.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            None => {
+                let _ = self.preclog.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(bytes)));
+            }
         }
     }
 
     /// Send a frame to the worker, starting one if there is none and the wait
     /// after the last failure is over. Never blocks.
     pub fn post(&mut self, now: Instant, req: &Req) -> Post {
+        self.post_with(&|| now, req)
+    }
+
+    /// [`Supervisor::post`], at the time `clock` says when it matters: after the frame is encoded and the worker
+    /// started (either can take long), the time the request is queued is the time the worker's wait for its answer
+    /// runs from.
+    pub fn post_with(&mut self, clock: Clock<'_>, req: &Req) -> Post {
         let frame = match encode_req(req) {
             Ok(f) => f,
             Err(e) => return Post::TooBig(e),
         };
-        if self.link.is_none() && !self.start(now) {
+        if self.link.is_none() && !self.start(clock) {
             return Post::Down;
         }
         let link = self.link.as_ref().expect("a link after start");
@@ -546,6 +572,7 @@ impl<L: Launch> Supervisor<L> {
             link.unanswered.fetch_add(1, Ordering::SeqCst);
         }
         let sent = link.tx.as_ref().is_some_and(|tx| tx.send(frame).is_ok());
+        let now = clock();
         if !sent {
             self.fail(now, "the worker's writer has ended".into());
             return Post::Down;
@@ -633,22 +660,25 @@ impl<L: Launch> Supervisor<L> {
     }
 
     /// Start a worker if the rules allow. `false`: there is none.
-    fn start(&mut self, now: Instant) -> bool {
+    fn start(&mut self, clock: Clock<'_>) -> bool {
         match self.state {
             State::Off => return false,
-            State::Backoff(until) if now < until => return false,
+            State::Backoff(until) if clock() < until => return false,
             _ => {}
         }
         match self.launch.launch() {
             Ok(link) => {
+                #[cfg(test)]
+                link.queued.fetch_add(self.preclog.swap(0, Ordering::Relaxed), Ordering::Relaxed);
                 self.link = Some(link);
                 self.state = State::Up;
-                self.last_answer = now;
+                // (From the time the process is up, not the time it was asked for.)
+                self.last_answer = clock();
                 self.started += 1;
                 true
             }
             Err(e) => {
-                self.fail(now, format!("the worker would not start: {e}"));
+                self.fail(clock(), format!("the worker would not start: {e}"));
                 false
             }
         }

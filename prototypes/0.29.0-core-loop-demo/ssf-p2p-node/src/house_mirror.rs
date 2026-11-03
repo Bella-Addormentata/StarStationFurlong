@@ -51,6 +51,10 @@
 //! no more than a drain in turn. An action bigger than a whole drain
 //! (finding out a very heavy checkpoint, taking the key list of a session of
 //! the most keys) is admitted when it comes first, and then costs the drain.
+//! The drain's time is looked at between actions, and within a scan of a
+//! session's keys (the list, the count) every [`SCAN_CHECK_KEYS`] keys, when the
+//! drain has done another action before it: a scan given up is made again from
+//! its start by the next drain, which begins with it and so reads it to its end.
 //! What a table holds is bounded too: a session of more than
 //! [`MAX_SESSION_KEYS`] keys is FLOODED (held: no honest session is, it is
 //! trimmed at 20 rounds or 96 KB), whatever the keys are and however it came
@@ -165,6 +169,11 @@ struct Dirt {
     /// as [`rewritten_alike`] tells) since the table last read it: all but the one the drain reads were written over
     /// before it could.
     writes: BTreeMap<String, u64>,
+    /// Live sessions (`ses:` names) that something was made and deleted in, in one transaction: a record that came and
+    /// went before the node could read it. Nothing says which record, or leaves one to read, and a page that saw it
+    /// without its deletion counts it in the next checkpoint it writes: the table keeps this until that checkpoint
+    /// ([`Table::suspect`]).
+    suspect: BTreeSet<String>,
 }
 
 enum Recs {
@@ -186,6 +195,7 @@ impl Dirt {
     fn merge(&mut self, other: Dirt, limit: usize) {
         self.tops.extend(other.tops);
         self.lagged.extend(other.lagged);
+        self.suspect.extend(other.suspect);
         for (name, n) in other.writes {
             let at = self.writes.entry(name).or_insert(0);
             *at = at.saturating_add(n);
@@ -236,7 +246,7 @@ fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
 /// which deletes them, can come in one update (the node was away, or the updates were merged on the way): all of it is
 /// integrated, nothing is left waiting, and the records, made in a map that is deleted by the same update, leave no
 /// event of their own. What the node never read of the session before the trim is told only by this.
-fn made_and_deleted(txn: &TransactionMut) -> bool {
+pub(crate) fn made_and_deleted(txn: &TransactionMut) -> bool {
     let before = txn.before_state();
     txn.delete_set().iter().any(|(client, ranges)| {
         let seen = before.get(client);
@@ -267,6 +277,8 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
     // (After this transaction, did the doc lack something it was sent, or was something made and deleted in it? Asked
     // once, when a checkpoint changes.)
     let mut gap = None;
+    // (And once, when a delegation is first written: was something made and deleted in this transaction?)
+    let mut lost = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         let path = map.path();
@@ -278,12 +290,23 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                     // otherwise is churn all the same.)
                     if key.starts_with("hk:") && !rewritten_alike(change, MAX_TOP_BYTES) {
                         delegations.changes += 1;
-                        if !matches!(change, EntryChange::Inserted(_)) {
+                        // (A delegation that is written and written over in one update, as when the node was away and
+                        // the updates were merged, leaves only the last as an insert: a page that had the first
+                        // separately may count a house the plan never knew. The transaction says that something was
+                        // made and deleted in it, and not what: any insert in such a one is doubted.)
+                        if !matches!(change, EntryChange::Inserted(_)) || *lost.get_or_insert_with(|| made_and_deleted(txn)) {
                             delegations.churned = true;
                         }
                     }
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
+                        // (A session made in an update that also made and deleted a record in it: the session is read
+                        // afresh and has no trace of that record. Only a session already watched is noted: the one a
+                        // page's trim makes is not yet, and what the same update made and deleted was in the session it
+                        // trims, which is noted as a record.)
+                        if key.starts_with("ses:") && !matches!(change, EntryChange::Removed(_)) && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                            dirt.suspect.insert(key.to_string());
+                        }
                         // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
                         // of one is no other.)
                         if key.starts_with("sum:") && !matches!(change, EntryChange::Removed(_)) && !rewritten_alike(change, ALIKE_SUM_BYTES) {
@@ -301,6 +324,12 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 // (A record is a plain value: only a session map holds any.)
                 if !name.starts_with("ses:") || !names.contains(&**name) {
                     continue;
+                }
+                // (A record that came and went in one update, as when the node was away and the updates were merged on the
+                // way, is no change to this map and leaves no key to read. The transaction says that something was made and
+                // deleted in it, and not what or where: the session is doubted.)
+                if *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                    dirt.suspect.insert(name.to_string());
                 }
                 let slot = dirt.recs.entry(name.to_string()).or_insert_with(|| Recs::Keys(BTreeSet::new()));
                 let mut many = false;
@@ -329,6 +358,9 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
 
 // ── A drain's budget ─────────────────────────────────────────────────────────
 
+/// How many keys of a session a scan goes through between looks at the clock.
+const SCAN_CHECK_KEYS: usize = 256;
+
 struct Budget {
     bytes: usize,
     paths: usize,
@@ -352,6 +384,18 @@ impl Budget {
     /// anywhere, and an action is read to its end.)
     fn late(&mut self) -> bool {
         let late = self.used_paths > 0 && self.deadline.is_some_and(|d| Instant::now() >= d);
+        if late {
+            self.spent = true;
+        }
+        late
+    }
+
+    /// The time is up in the middle of an action: one was done before it in this drain, and the deadline has passed.
+    /// (Asked every [`SCAN_CHECK_KEYS`] keys of a scan of a session, which is given up then and begun again by the next
+    /// drain; and not within the first action of a drain, which is read to its end, so that every drain gets somewhere.
+    /// That one is bounded by the most keys a session may hold.)
+    fn interrupt(&mut self) -> bool {
+        let late = self.used_paths > 1 && self.deadline.is_some_and(|d| Instant::now() >= d);
         if late {
             self.spent = true;
         }
@@ -488,6 +532,9 @@ struct Table {
     /// still had changes to be read or listed, or while the doc lacked updates a page had (see
     /// [`Dirt::lagged`]).
     unread_at_trim: bool,
+    /// Something was made and deleted in the live session in one update ([`Dirt::suspect`]) since the base last
+    /// changed: a page may have counted it, and the next trim of the session is not held against what the node read.
+    suspect: bool,
     /// How many times the base has changed since it was first read.
     trims: u64,
     /// Checkpoints written over before the table read them, not yet told to the caller ([`RoomMirror::take_superseded`]).
@@ -530,6 +577,7 @@ impl Table {
             generation: 0,
             version: 0,
             unread_at_trim: false,
+            suspect: false,
             trims: 0,
             superseded: 0,
         }
@@ -548,7 +596,7 @@ impl Table {
             return true;
         }
         let Some(live) = &self.live else { return false };
-        pending.has_recs(live) || (pending.tops.contains(live) && comp.is_some_and(|c| matches!(c.get(txn, live), Some(Out::YMap(_)))))
+        self.suspect || pending.suspect.contains(live) || pending.has_recs(live) || (pending.tops.contains(live) && comp.is_some_and(|c| matches!(c.get(txn, live), Some(Out::YMap(_)))))
     }
 
     fn hold(&self) -> Option<Hold> {
@@ -734,7 +782,18 @@ impl Table {
         if !b.path() {
             return None;
         }
-        let n = ses.keys(txn).take(limits.session_keys.saturating_add(1)).count();
+        self.count_scan(ses, txn, b, limits)
+    }
+
+    /// [`Table::count_keys`] once the count has been begun (it looks at the clock as it goes: see [`Budget::interrupt`]).
+    fn count_scan<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, b: &mut Budget, limits: &Limits) -> Option<usize> {
+        let mut n = 0usize;
+        for _ in ses.keys(txn).take(limits.session_keys.saturating_add(1)) {
+            n += 1;
+            if n % SCAN_CHECK_KEYS == 0 && b.interrupt() {
+                return None;
+            }
+        }
         if !b.charge(n.saturating_mul(VISIT_BYTES)) {
             return None;
         }
@@ -763,6 +822,10 @@ impl Table {
             if seen > limits.session_keys {
                 flooded = true;
                 break;
+            }
+            // (Nothing is kept until the list is made: a list given up is made again.)
+            if seen % SCAN_CHECK_KEYS == 0 && b.interrupt() {
+                return false;
             }
             cost = cost.saturating_add(VISIT_BYTES);
             if key.len() <= MAX_KEY_BYTES {
@@ -830,15 +893,22 @@ impl Table {
             }
             let lagged = pending.lagged.remove(&self.sum_name);
             let unread = changed && (lagged || self.session_unread(pending, comp, txn));
+            let left = self.live.clone();
             self.set_base(new, changed);
             if changed {
                 self.unread_at_trim = unread;
+                // (What was made and deleted in the session the base leaves is not the next session's.)
+                self.suspect = false;
+                if let Some(left) = left {
+                    pending.suspect.remove(&left);
+                }
                 if was_based {
                     self.trims += 1;
                 }
             }
         }
         let Some(live) = self.live.clone() else { return true };
+        self.suspect |= pending.suspect.remove(&live);
 
         // The live session: made, replaced or removed.
         if pending.tops.remove(&live) && !self.need_session {
@@ -1086,6 +1156,11 @@ impl RoomMirror {
         gone
     }
 
+    /// The room this mirror follows.
+    pub fn room(&self) -> &str {
+        &self.room
+    }
+
     /// The tables mirrored.
     pub fn tables(&self) -> impl Iterator<Item = &Ctx> {
         self.tables.values().map(|t| &t.ctx)
@@ -1138,6 +1213,7 @@ impl RoomMirror {
         self.pending.recs.retain(|n, _| names.contains(n));
         self.pending.lagged.retain(|n| names.contains(n));
         self.pending.writes.retain(|n, _| names.contains(n));
+        self.pending.suspect.retain(|n| names.contains(n));
     }
 
     pub fn state(&self, t: &str, inc: &str) -> Option<State<'_>> {

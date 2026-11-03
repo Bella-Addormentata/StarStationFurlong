@@ -140,9 +140,14 @@ fn the_commitment_and_the_carry_are_compared_when_the_checkpoint_is_at_the_last_
     let u = last_decided(&sum).unwrap();
     let cp = page_cp(&sum, u, nets_through(&sum, u), true, true);
     assert_eq!(compare(&sum, &cp, &inc), Verdict::Agree);
-    // A commitment the fold does not want (or none where it does, or one where it wants none).
+    // A commitment the fold does not want: another than the one it wants is a mismatch, and one where it wants none is
+    // not told from a step-down the page has not received.
     let h = with_cp(&cp, "h", Some(s(&"c".repeat(64))));
-    assert!(matches!(compare(&sum, &h, &inc), Verdict::Mismatch(w) if w.starts_with("h:")), "{:?}", compare(&sum, &h, &inc));
+    if sum.required.is_some() {
+        assert!(matches!(compare(&sum, &h, &inc), Verdict::Mismatch(w) if w.starts_with("h:")), "{:?}", compare(&sum, &h, &inc));
+    } else {
+        assert_eq!(compare(&sum, &h, &inc), Verdict::Skip(Skip::StepDown));
+    }
     // A carry the fold does not hold.
     let other = obj(vec![("p", CVal::Int(4)), ("w", obj(vec![]))]);
     let c = with_cp(&cp, "s", Some(other));
@@ -162,6 +167,42 @@ fn a_commitment_none_where_the_fold_wants_one_is_a_mismatch() {
         }
         let none = with_cp(&cp, "h", None);
         assert!(matches!(compare(&sum, &none, &c.ctx.inc), Verdict::Mismatch(w) if w.starts_with("h:")), "{}", c.name);
+        seen += 1;
+    }
+    assert!(seen > 0, "no vector wants a commitment");
+}
+
+/// A house that steps down in the open round clears what the fold requires without deciding another round, and the page
+/// that trimmed may not have received the step-down: a checkpoint naming a commitment where the fold wants none is
+/// inconclusive. (Any other difference in `h` is still a disagreement.)
+#[test]
+fn a_commitment_the_checkpoint_names_where_the_fold_wants_none_is_inconclusive_not_a_mismatch() {
+    let mut seen = 0;
+    for c in cases() {
+        let sum = finished(&c.summary);
+        let (Some(u), Some(_)) = (last_decided(&sum), sum.required.as_ref()) else { continue };
+        let cp = page_cp(&sum, u, nets_through(&sum, u), true, !sum.carry.is_null());
+        if !crate::house::checkpoint_ok(&cp, &c.ctx.inc) {
+            continue;
+        }
+        assert_eq!(compare(&sum, &cp, &c.ctx.inc), Verdict::Agree, "{}: as it stands", c.name);
+        // The fold has folded a step-down the page has not: it requires none, and the checkpoint still names one.
+        let mut stepped = sum.clone();
+        stepped.required = None;
+        assert_eq!(compare(&stepped, &cp, &c.ctx.inc), Verdict::Skip(Skip::StepDown), "{}", c.name);
+        // Nothing named by either is agreed, and the commitment the fold wants against another is still a mismatch.
+        let none = with_cp(&cp, "h", None);
+        assert_eq!(compare(&stepped, &none, &c.ctx.inc), Verdict::Agree, "{}: none and none", c.name);
+        let other = with_cp(&cp, "h", Some(s(&"c".repeat(64))));
+        assert!(matches!(compare(&sum, &other, &c.ctx.inc), Verdict::Mismatch(w) if w.starts_with("h:")), "{}: another named", c.name);
+        // The nets and the close come first: a step-down does not hide what else differs.
+        let mut n = nets_through(&sum, u);
+        if let Some(first) = n.first_mut() {
+            first.1 = (first.1.parse::<i128>().unwrap() + 1_000_003).to_string();
+            let off = page_cp(&sum, u, n, true, !sum.carry.is_null());
+            let got = compare(&stepped, &off, &c.ctx.inc);
+            assert!(matches!(&got, Verdict::Mismatch(w) if w.starts_with("n ")), "{}: nets: {got:?}", c.name);
+        }
         seen += 1;
     }
     assert!(seen > 0, "no vector wants a commitment");
@@ -294,13 +335,22 @@ fn each_verdict_is_counted_under_its_own_name() {
     let mut t = Tally::default();
     t.note(&Verdict::Agree);
     t.note(&Verdict::Mismatch("x".into()));
-    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded] {
+    for why in [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown] {
         t.note(&Verdict::Skip(why));
     }
-    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1 });
-    assert_eq!(t.skipped(), 11);
+    assert_eq!(t, Tally { agree: 1, mismatch: 1, past: 1, behind: 1, big: 1, unreadable: 1, pending: 1, parent: 1, stale: 1, inputs: 1, unanswered: 1, expired: 1, superseded: 1, step_down: 1 });
+    assert_eq!(t.skipped(), 12);
     t.note(&Verdict::Skip(Skip::Pending));
     assert_eq!(t.pending, 2);
+}
+
+/// Each kind of skip is said under a name of its own, since the log is all there is to tell them by.
+#[test]
+fn each_kind_of_skip_has_a_name_of_its_own() {
+    let all = [Skip::Past, Skip::Behind, Skip::Big, Skip::Unreadable, Skip::Pending, Skip::Parent, Skip::Stale, Skip::Inputs, Skip::Unanswered, Skip::Expired, Skip::Superseded, Skip::StepDown];
+    let names: BTreeSet<&str> = all.iter().map(|s| s.name()).collect();
+    assert_eq!(names.len(), all.len(), "{names:?}");
+    assert_eq!(Skip::StepDown.name(), "stepdown");
 }
 
 #[test]
@@ -359,6 +409,8 @@ use yrs::{Map, MapPrelim};
 
 /// The deed holder of the benches' rooms (`roomInfo.owner`), whose houses the plans stand for.
 const OWNER: &str = "owner";
+/// The key the deed holder of the benches' rooms is pinned under (`players.owner.keyB64`): the plans name it.
+const OWNER_KEY: &str = "owner-key";
 
 /// One vector's table in a doc, followed by a `FoldShadow` whose worker is the
 /// real engine in a thread.
@@ -401,6 +453,7 @@ impl Bench {
         };
         bench.write_session();
         bench.set_owner(OWNER);
+        bench.add_player(OWNER, OWNER_KEY);
         bench
     }
 
@@ -473,6 +526,8 @@ impl Bench {
     fn tick(&mut self) {
         let rooms = if self.listed { vec![(self.room().to_string(), self.doc.clone(), self.view.clone())] } else { vec![] };
         self.shadow.tick(self.now, rooms);
+        // The worker is never asked to hold more tables than it has places for, whatever the tick did.
+        assert!(self.shadow.holds() <= self.shadow.places, "{} tables held, the worker has places for {}", self.shadow.holds(), self.shadow.places);
     }
 
     fn until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
@@ -675,11 +730,11 @@ fn when_the_fold_duties_are_off_for_good_nothing_is_followed_and_the_report_says
 #[test]
 fn the_report_adds_up_what_the_shadow_found_and_what_the_feeds_did() {
     let mut b = Bench::new("house roulette 3");
-    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13 };
+    b.shadow.tally = Tally { agree: 1, mismatch: 2, past: 3, behind: 4, big: 5, unreadable: 6, pending: 7, parent: 8, stale: 9, inputs: 10, unanswered: 11, expired: 12, superseded: 13, step_down: 14 };
     b.shadow.gone = Counts { cold: 10, warm: 20, forgets: 30, results: 40, dirty: 11, lost: 12, busy: 50, too_big: 13, bad_results: 14 };
     let r = b.shadow.report();
     assert_eq!((r.shadow_agreed, r.shadow_mismatches), (1, 2));
-    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13, "every kind of skip");
+    assert_eq!(r.shadow_skipped, 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14, "every kind of skip");
     assert_eq!((r.cold_folds, r.dirty, r.lost), (10, 11, 12));
     assert_eq!(r.bad_results, 14 + 13, "a result and a frame nobody could use");
 }
@@ -1375,7 +1430,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
     let b = Bench::new("house roulette 3");
     let (doc, houses) = (b.doc.clone(), b.case.houses.clone());
     let shadow = Mutex::new(b.shadow);
-    let plan = HousePlan { owner: OWNER.to_string(), tables: vec![], houses, complete: true };
+    let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
     let docs = |rooms: &[&str]| -> Vec<(String, Doc)> { rooms.iter().map(|r| (r.to_string(), doc.clone())).collect() };
     // A room with a plan and no table is watched; one with no plan is not.
     tick_shadow(&shadow, docs(&["with", "without"]), Instant::now(), |r| (r == "with").then(|| plan.clone())).unwrap();
@@ -1386,7 +1441,7 @@ fn the_players_of_a_room_are_watched_from_its_first_plan_and_let_go_with_the_roo
         let mut txn = doc.transact_mut();
         players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("A"))])));
     }
-    assert_eq!(shadow.lock().unwrap().pins.get_mut("with").unwrap().view(), (vec![("alice".to_string(), "A".to_string())], true));
+    assert_eq!(shadow.lock().unwrap().pins.get_mut("with").unwrap().view(), (vec![("alice".to_string(), "A".to_string()), (OWNER.to_string(), OWNER_KEY.to_string())], true));
     {
         let mut txn = doc.transact_mut();
         players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s("B"))])));
@@ -1410,7 +1465,7 @@ fn a_view_is_settled_only_with_a_plan_that_is_complete_and_pins_that_are() {
     let wrong = b.wrong_trim(&b.answer());
     let shadow = Mutex::new(b.shadow);
     let go = |complete: bool| {
-        let plan = HousePlan { owner: OWNER.to_string(), tables: tables.clone(), houses: houses.clone(), complete };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete };
         tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
     };
     let confirmed = || shadow.lock().unwrap().rooms[&room].confirmed.len();
@@ -1777,7 +1832,7 @@ fn a_trim_is_held_against_the_node_through_its_own_watch_of_the_players() {
         let live = format!("ses:{}:{}:{}", tables[0].0, tables[0].1, crate::house_bytes::next_sid(&b.case.ctx, Some(&wrong)).unwrap());
         let shadow = Mutex::new(b.shadow);
         let go = || {
-            let plan = HousePlan { owner: OWNER.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true };
+            let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: tables.clone(), houses: houses.clone(), complete: true };
             tick_shadow(&shadow, vec![(room.clone(), doc.clone())], Instant::now(), |_| Some(plan.clone())).unwrap();
         };
         let confirmed = || shadow.lock().unwrap().rooms.get(&room).map_or(0, |rs| rs.confirmed.len());
@@ -1947,7 +2002,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
     let mut shadow = b.shadow;
-    let plan = || HousePlan { owner: OWNER.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let plan = || HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true };
     let first = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     let watch = first.watch.clone().expect("the watch of the players");
     assert_eq!(watch.epoch(), first.pins_epoch);
@@ -1960,7 +2015,7 @@ fn the_view_of_a_room_carries_the_watch_of_its_players_and_the_epoch_they_stood_
     assert!(watch.epoch() > first.pins_epoch);
     let second = shadow.view_of(&room, &doc, plan(), PIN_WALK_KEYS);
     assert_eq!(second.watch, first.watch, "(the same watch: the room's)");
-    assert_eq!((second.pins_epoch, second.pins.len()), (watch.epoch(), 1));
+    assert_eq!((second.pins_epoch, second.pins.len()), (watch.epoch(), 2), "the owner and the player who came");
     assert!(second.settled);
 }
 
@@ -2004,6 +2059,31 @@ fn held(cp: &CVal) -> CVal {
     with_cp(cp, "__proto__", Some(s("x")))
 }
 
+/// A trim at or before the round the fold's own base is (the node started the table on a checkpoint of that round, and
+/// another page writes one of its own) is counted as a comparison not made, and said in the log like any other.
+#[test]
+fn a_trim_at_or_before_the_folds_base_is_counted_and_said_not_passed_over_silently() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    b.ticks(3);
+    let cp = b.page_trim(&b.answer());
+    b.put_checkpoint(&cp);
+    b.until("compared", |b| b.shadow.tally.agree + b.shadow.tally.mismatch > 0);
+    // (The table starts over on that checkpoint: its answer has the round for its base.)
+    b.until("answered again", |b| b.caught_up());
+    b.ticks(5);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, ..Tally::default() });
+    // Another page's checkpoint of the same round (signed otherwise) is no news to the fold.
+    b.put_checkpoint(&with_cp(&cp, "g", Some(s(&"H".repeat(86)))));
+    b.until("skipped", |b| b.shadow.tally.past > 0);
+    b.ticks(10);
+    assert_eq!(b.shadow.tally, Tally { agree: 1, past: 1, ..Tally::default() });
+    let r = b.shadow.report();
+    assert_eq!((r.shadow_skipped, r.shadow_mismatches, r.shadow_agreed), (1, 0, 1));
+    assert_eq!(r.recent_skips.len(), 1, "{:?}", r.recent_skips);
+    assert!(r.recent_skips[0].starts_with(&tag_of(&b)) && r.recent_skips[0].contains("(past)"), "{:?}", r.recent_skips);
+}
+
 /// A page's trim the node cannot read as a page does holds the table with no checkpoint to compare: counted, once, as a
 /// comparison not made, said in the log (the first checkpoint a table is read with is no trim).
 #[test]
@@ -2022,7 +2102,7 @@ fn a_trim_the_node_cannot_read_as_a_page_does_is_counted_once_as_unreadable() {
     let r = b.shadow.report();
     assert_eq!((r.shadow_skipped, r.shadow_mismatches, r.shadow_agreed), (1, 0, 0));
     assert_eq!(r.recent_skips.len(), 1);
-    assert!(r.recent_skips[0].contains("unreadable") && r.recent_skips[0].contains(&b.case.ctx.t), "{:?}", r.recent_skips);
+    assert!(r.recent_skips[0].starts_with(&tag_of(&b)) && r.recent_skips[0].contains("unreadable"), "{:?}", r.recent_skips);
 }
 
 /// ... and the checkpoint a table is first read with is no trim, held or not.
@@ -2054,7 +2134,8 @@ fn what_the_comparisons_say_is_kept_for_the_report() {
     b.until("compared", |b| b.shadow.tally.mismatch > 0);
     let r = b.shadow.report();
     assert_eq!(r.recent_mismatches.len(), 1);
-    assert!(r.recent_mismatches[0].contains("MISMATCH") && r.recent_mismatches[0].contains(&b.case.ctx.t), "{:?}", r.recent_mismatches);
+    assert!(r.recent_mismatches[0].starts_with(&tag_of(&b)) && r.recent_mismatches[0].contains("MISMATCH"), "{:?}", r.recent_mismatches);
+    assert!(r.recent_mismatches[0].contains(" has "), "(the player that differs is named first: {:?})", r.recent_mismatches);
     assert!(r.recent_skips.is_empty());
     let json = serde_json::to_value(&r).unwrap();
     assert_eq!(json["recentMismatches"].as_array().map(Vec::len), Some(1));
@@ -2113,7 +2194,7 @@ fn a_table_given_up_on_for_want_of_a_final_checkpoint_is_told_in_the_log() {
     b.until("let go", |b| b.tables_held() == 0);
     let r = b.shadow.report();
     assert_eq!(r.recent_skips.len(), 1, "{:?}", r.recent_skips);
-    assert!(r.recent_skips[0].contains("expired"), "{:?}", r.recent_skips);
+    assert!(r.recent_skips[0].starts_with(&tag_of(&b)) && r.recent_skips[0].contains("expired"), "{:?}", r.recent_skips);
     assert_eq!(b.shadow.tally.expired, 1);
 }
 
@@ -2216,10 +2297,11 @@ fn the_watch_of_a_rooms_players_is_held_to_the_walk_time_the_shadow_has() {
         let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
         let mut shadow = b.shadow;
         shadow.pin_walk_time = timed.then_some(Duration::ZERO);
-        let plan = HousePlan { owner: OWNER.to_string(), tables: vec![], houses, complete: true };
+        let plan = HousePlan { owner: OWNER.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses, complete: true };
         let view = shadow.view_of(&room, &doc, plan, PIN_WALK_KEYS);
         assert_eq!(view.settled, !timed, "timed={timed}: the players are {}", if timed { "not all read" } else { "all read" });
-        assert_eq!(view.pins.len() == 200, !timed, "timed={timed}");
+        // (The 200 players and the owner.)
+        assert_eq!(view.pins.len() == 201, !timed, "timed={timed}");
     }
 }
 
@@ -2306,6 +2388,11 @@ fn a_table_held_for_a_record_a_page_may_read_otherwise_is_no_unreadable_checkpoi
 }
 
 // ── Review round 5 ───────────────────────────────────────────────────────────
+
+/// How a line of the log names the table it is about: the room, the table and its incarnation.
+fn tag_of(b: &Bench) -> String {
+    format!("{} {} {}", b.room(), b.case.ctx.t, b.case.ctx.inc)
+}
 
 /// Every comparison counted, made or not.
 fn counted(t: Tally) -> u64 {
@@ -2539,7 +2626,7 @@ fn a_delegation_replaced_in_a_room_with_a_plan_and_no_table_yet_is_seen() {
 fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_under() {
     let b = Bench::new("house craps 3");
     let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
-    let plan = |owner: &str| HousePlan { owner: owner.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let plan = |owner: &str| HousePlan { owner: owner.to_string(), owner_key: OWNER_KEY.to_string(), tables: vec![], houses: houses.clone(), complete: true };
     let mut shadow = b.shadow;
     assert!(shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the holder the doc names");
     assert!(!shadow.view_of(&room, &doc, plan("someone else"), PIN_WALK_KEYS).settled, "a plan made under another");
@@ -2550,6 +2637,12 @@ fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_
         info.insert(&mut txn, "owner", "heir");
     }
     assert!(!shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled, "the old plan, the new holder");
+    // (The heir is a player too, and the plan of the new holder names the key it was made with.)
+    let players = doc.get_or_insert_map("players");
+    {
+        let mut txn = doc.transact_mut();
+        players.insert(&mut txn, "heir", to_any(&obj(vec![("keyB64", s(OWNER_KEY))])));
+    }
     assert!(shadow.view_of(&room, &doc, plan("heir"), PIN_WALK_KEYS).settled, "and the plan of the new holder");
     // A room with no holder named has no houses to be settled about.
     {
@@ -2557,6 +2650,43 @@ fn a_view_is_settled_only_while_the_doc_names_the_deed_holder_the_plan_was_made_
         info.remove(&mut txn, "owner");
     }
     assert!(!shadow.view_of(&room, &doc, plan(OWNER), PIN_WALK_KEYS).settled);
+}
+
+/// The houses of a plan are the ones the key it names for the deed holder delegated: a view is settled only while the
+/// watch has pinned that key for the holder (a key replaced between the pass and the watch is not the key of the plan).
+#[test]
+fn a_view_is_settled_only_while_the_watch_pins_the_key_the_plan_was_made_with_for_the_deed_holder() {
+    let b = Bench::new("house craps 3");
+    let (room, doc, houses) = (b.room().to_string(), b.doc.clone(), b.case.houses.clone());
+    let plan = |owner: &str, key: &str| HousePlan { owner: owner.to_string(), owner_key: key.to_string(), tables: vec![], houses: houses.clone(), complete: true };
+    let mut shadow = b.shadow;
+    assert!(shadow.view_of(&room, &doc, plan(OWNER, OWNER_KEY), PIN_WALK_KEYS).settled, "the key the watch has pinned for the holder");
+    assert!(!shadow.view_of(&room, &doc, plan(OWNER, "the key before"), PIN_WALK_KEYS).settled, "a plan made under another key of the holder");
+    assert!(!shadow.view_of(&room, &doc, plan(OWNER, ""), PIN_WALK_KEYS).settled, "or under none");
+    // The deed names a holder the room has no player for: there is no key pinned to agree with.
+    let info = doc.get_or_insert_map("roomInfo");
+    {
+        let mut txn = doc.transact_mut();
+        info.insert(&mut txn, "owner", "ghost");
+    }
+    assert!(!shadow.view_of(&room, &doc, plan("ghost", OWNER_KEY), PIN_WALK_KEYS).settled, "a holder nobody pinned");
+}
+
+/// A table kept after the plan stopped naming it, for the checkpoint a page writes when it compacts it, still takes a
+/// place of the worker's, and the report of the tables followed says so.
+#[test]
+fn a_table_kept_for_its_final_checkpoint_is_still_among_the_tables_the_report_counts() {
+    let mut b = Bench::new("house craps 3");
+    b.until("the first answer", |b| b.caught_up());
+    assert_eq!(b.shadow.report().tables, 1);
+    b.view.as_mut().unwrap().tables.clear();
+    b.ticks(5);
+    assert_eq!((b.tables_held(), b.forgets()), (1, 0), "(kept for its grace)");
+    assert_eq!(b.shadow.report().tables, 1, "and it holds a place of the worker's");
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("the table is let go of", |b| b.tables_held() == 0);
+    b.tick();
+    assert_eq!(b.shadow.report().tables, 0, "and the place is given back");
 }
 
 /// The deed changed hands between the view and the drain: the answer shown whole is taken back by the epoch.
@@ -2619,8 +2749,73 @@ fn a_checkpoint_written_over_before_the_node_read_it_is_counted_as_superseded() 
         assert_eq!(counted(t), if same { 1 } else { 2 }, "same={same}: the last is compared (or passed over), and the one before counted as not made");
         if !same {
             let r = b.shadow.report();
-            assert!(r.recent_skips.iter().any(|l| l.contains("superseded") && l.contains(&b.case.ctx.t)), "{:?}", r.recent_skips);
+            assert!(r.recent_skips.iter().any(|l| l.starts_with(&tag_of(&b)) && l.contains("superseded")), "{:?}", r.recent_skips);
             assert_eq!(r.shadow_skipped, t.skipped());
         }
     }
+}
+
+
+// ── Review round 6 ───────────────────────────────────────────────────────────
+
+/// A line is kept to 512 bytes, so the player that differs comes before the nets of everyone else.
+#[test]
+fn the_player_whose_net_differs_is_named_before_the_nets_of_all_the_others() {
+    let ours: BTreeMap<String, i128> = (0..300).map(|i| (format!("player-{i:04}-{}", "x".repeat(40)), 1)).collect();
+    let mut theirs = ours.clone();
+    let last = ours.keys().last().unwrap().clone();
+    theirs.insert(last.clone(), 7);
+    let why = nets_differ(5, &ours, &theirs);
+    let kept = clip(format!("room t inc u=5: MISMATCH — {why}"));
+    assert!(kept.len() <= LOG_LINE_BYTES + '…'.len_utf8());
+    let named = format!("{}…", &last[..48]);
+    assert!(kept.contains(&named) && kept.contains("has 1 in the fold and 7 in the checkpoint"), "{kept}");
+    // Two differ: the first, and how many more.
+    theirs.insert(ours.keys().next().unwrap().clone(), 2);
+    let why = nets_differ(5, &ours, &theirs);
+    assert!(why.contains("player-0000") && why.contains("has 1 in the fold and 2 in the checkpoint and 1 more;"), "{why}");
+    // A player one of them does not name has nothing there.
+    let (a, b) = (BTreeMap::from([("p".to_string(), 3)]), BTreeMap::new());
+    assert!(nets_differ(2, &a, &b).contains("p has 3 in the fold and 0 in the checkpoint;"));
+    assert!(nets_differ(2, &b, &a).contains("p has 0 in the fold and 3 in the checkpoint;"));
+    // A name a peer chose does not take the line.
+    let long = "é".repeat(500);
+    let why = nets_differ(2, &BTreeMap::from([(long.clone(), 1)]), &BTreeMap::new());
+    assert!(why.starts_with(&format!("n through round 2: {}… has 1 in the fold", "é".repeat(48))), "{}", &why[..120]);
+}
+
+/// A line names the room, whatever the table: two rooms can have the same table and incarnation.
+#[test]
+fn a_line_names_the_room_as_well_as_the_table() {
+    assert_eq!(tag("room-a", "craps-1", "inc"), "room-a craps-1 inc");
+    assert_ne!(tag("room-a", "craps-1", "inc"), tag("room-b", "craps-1", "inc"));
+    let long = "é".repeat(100);
+    assert_eq!(tag(&long, "t", "i"), format!("{}… t i", "é".repeat(64)));
+    assert_eq!(brief("short", 64), "short");
+    assert_eq!(brief(&"a".repeat(64), 64), "a".repeat(64), "of the most is whole");
+}
+
+/// The worker holds `places` tables, and a table it does not hold yet waits for a place, and takes it when one is let go of:
+/// the shadow never asks it to hold more (`Bench::tick` holds it to that every time), whichever tables the cap meant to follow.
+#[test]
+fn a_table_the_worker_has_no_place_for_waits_for_one_and_takes_it_when_one_is_let_go_of() {
+    let mut b = Bench::new("house roulette 3");
+    b.shadow.places = 4;
+    let inc = b.case.ctx.inc.clone();
+    let names: Vec<String> = (0..6).map(|i| format!("t{i:02}")).collect();
+    for t in &names {
+        b.empty_table(t);
+    }
+    b.view.as_mut().unwrap().tables = names.iter().map(|t| (t.clone(), inc.clone())).collect();
+    b.until("the four that have places are answered", |b| b.shadow.counts().results >= 4);
+    b.ticks(10);
+    assert_eq!((b.shadow.holds(), b.shadow.counts().cold), (4, 4), "the other two wait: {:?}", b.shadow.counts());
+    // Two of the tables are let go of when the plan stops naming them and the grace is over: their places go to the two that wait.
+    b.view.as_mut().unwrap().tables = names[2..].iter().map(|t| (t.clone(), inc.clone())).collect();
+    b.ticks(3);
+    assert_eq!((b.shadow.holds(), b.shadow.counts().cold), (4, 4), "(kept for the final checkpoint they may yet have)");
+    b.now += GONE_GRACE + Duration::from_secs(1);
+    b.until("the tables that waited are started", |b| b.shadow.counts().cold >= 6);
+    assert_eq!(b.shadow.counts().lost, 0, "{:?}", b.shadow.counts());
+    assert!(b.shadow.holds() <= 4);
 }

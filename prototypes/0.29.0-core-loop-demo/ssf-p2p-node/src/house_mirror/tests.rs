@@ -2327,3 +2327,296 @@ fn the_checkpoints_written_across_short_drains_are_counted_all_and_those_of_a_ta
     f.drain();
     assert!(f.m.pending.writes.is_empty(), "{:?}", f.m.pending.writes);
 }
+
+// ── Review round 6 ───────────────────────────────────────────────────────────
+
+impl Page {
+    fn put_top(&self, key: &str, v: &CVal) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, key, to_any(v));
+    }
+
+    fn remove_top(&self, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.remove(&mut txn, key);
+    }
+}
+
+/// A delegation written and written over in one update (the node was away, or the updates were merged on the way) shows the
+/// node only the last, as an insert: a page that had the first by itself may have counted a house the plan never knew. The
+/// update says that something was made and deleted in it, and not what, and the delegation is churn.
+#[test]
+fn a_delegation_written_and_written_over_in_one_update_is_churn_though_it_shows_as_an_insert() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    page.put_top("hk:house-a", &s("b"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: true });
+}
+
+/// One written once is not, nor is one in an update that deletes only what the doc already had.
+#[test]
+fn a_delegation_written_once_is_no_churn_even_in_an_update_that_deletes_what_the_doc_had() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false });
+    // A key the doc held goes, and another delegation comes, in one update.
+    page.put_top("elsewhere", &s("x"));
+    let held = f.doc.transact().state_vector();
+    apply_to(&f.doc, &page.diff_since(&held));
+    let before = f.doc.transact().state_vector();
+    page.remove_top("elsewhere");
+    page.put_top("hk:house-b", &s("b"));
+    apply_to(&f.doc, &page.diff_since(&before));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false }, "the block deleted was one the doc held");
+}
+
+/// An update in which something else was made and deleted doubts a delegation it brings once too: what was deleted cannot
+/// be told (some harmless updates are doubted).
+#[test]
+fn a_delegation_brought_with_something_else_made_and_deleted_is_churn_too() {
+    let page = Page::new(7);
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: true });
+}
+
+impl Page {
+    fn remove_rec(&self, ses: &str, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.remove(&mut txn, key);
+    }
+}
+
+impl Fix {
+    /// What is waiting to be taken, taken and dropped (the table may not be serving yet).
+    fn skim(&mut self) {
+        let _ = self.m.take(T, INC, usize::MAX);
+    }
+}
+
+/// A node that was sent a record of the live session and its deletion in one update never had the record to read; the page
+/// that saw the record and not its deletion counts it in the trim it writes after. What the node was sent, `how`:
+///
+/// - "merged": the record and its deletion in one update;
+/// - "separate": the record in one update, its deletion in the next (the node read it);
+/// - "never": no record at all;
+/// - "elsewhere": the record made and deleted in a session no table follows;
+/// - "new session": the session itself comes in the update that made and deleted the record;
+/// - "merged undrained": as "merged", and the trim is sent before the node has drained.
+///
+/// The node has then been sent the page's trim, and has drained it.
+fn trimmed_after(how: &str) -> Fix {
+    let ses = if how == "elsewhere" { "ses:elsewhere:x".to_string() } else { live0() };
+    let mut f = Fix::empty();
+    f.drain();
+    f.skim();
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    if how == "elsewhere" {
+        first.session(&ses, &records(&[(1, 1)]));
+    }
+    let base = first.diff_since(&yrs::StateVector::default());
+    let after_session = first.state();
+    if how != "new session" {
+        apply_to(&f.doc, &base);
+        f.drain();
+        f.skim();
+    }
+    let record = rk(1, 2);
+    if how != "never" {
+        first.put(&ses, &record, &rv(1, 20));
+    }
+    let put = first.diff_since(&after_session);
+    match how {
+        "never" => {}
+        "separate" => {
+            apply_to(&f.doc, &put);
+            f.drain();
+            f.skim();
+            let mid = first.state();
+            first.remove_rec(&ses, &record);
+            apply_to(&f.doc, &first.diff_since(&mid));
+        }
+        _ => {
+            first.remove_rec(&ses, &record);
+            let since = if how == "new session" { yrs::StateVector::default() } else { after_session };
+            apply_to(&f.doc, &first.diff_since(&since));
+        }
+    }
+    // ("undrained": the node is sent the trim before it has looked at the update that made and deleted the record.)
+    if how != "merged undrained" {
+        f.drain();
+        f.skim();
+    }
+    // The page that trims has the session and the record, and not its deletion.
+    let second = Page::new(2);
+    second.apply(&base);
+    if how != "never" {
+        second.apply(&put);
+    }
+    let before = second.state();
+    let base_cp = cp(2);
+    second.trim(&live0(), &base_cp, &live_of(T, Some(&base_cp)));
+    apply_to(&f.doc, &second.diff_since(&before));
+    f.drain();
+    f
+}
+
+#[test]
+fn a_record_made_and_deleted_in_one_update_makes_the_next_trim_of_its_session_unread() {
+    for (how, unread) in [("merged", true), ("merged undrained", true), ("new session", true), ("separate", false), ("never", false), ("elsewhere", false)] {
+        let mut f = trimmed_after(how);
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves: it is not carried to the next.
+        f.skim();
+        let next = live_of(T, Some(&cp(2)));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// ... and it is kept through drains and resets of the table until the trim: a drain that read other things in between
+/// does not lose it.
+#[test]
+fn what_was_made_and_deleted_in_a_session_is_kept_until_the_trim_of_it() {
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let mut f = Fix::empty();
+    f.drain();
+    f.skim();
+    let base = first.diff_since(&yrs::StateVector::default());
+    apply_to(&f.doc, &base);
+    f.drain();
+    f.skim();
+    let after_session = first.state();
+    first.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let put = first.diff_since(&after_session);
+    first.remove_rec(&live0(), &rk(1, 2));
+    apply_to(&f.doc, &first.diff_since(&after_session));
+    // Drains, and other records coming and going, one at a time, as the room goes on.
+    for i in 3..12u32 {
+        f.drain();
+        f.skim();
+        let mid = first.state();
+        first.put(&live0(), &rk(1, i), &rv(1, i as i64));
+        apply_to(&f.doc, &first.diff_since(&mid));
+    }
+    f.drain();
+    f.skim();
+    let second = Page::new(2);
+    second.apply(&base);
+    second.apply(&put);
+    let before = second.state();
+    let base_cp = cp(2);
+    second.trim(&live0(), &base_cp, &live_of(T, Some(&base_cp)));
+    apply_to(&f.doc, &second.diff_since(&before));
+    f.drain();
+    assert_eq!((f.state().trims, f.state().unread_at_trim), (1, true));
+}
+
+/// A table whose base has been read and whose session map has not been listed: the state a drain that ran out of paths
+/// leaves it in.
+fn awaiting_its_session(all: &[(u32, i64)]) -> Fix {
+    let limits = Limits { drain_paths: 1, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(all)));
+    assert!(f.drain().short, "(the base was all that was read)");
+    assert!(f.m.tables.values().all(|t| t.need_session && t.live.is_some()));
+    f
+}
+
+/// A budget with its time already up, that has done `used` actions.
+fn late_budget(used: usize) -> Budget {
+    Budget { bytes: usize::MAX / 2, paths: 100, deadline: Some(Instant::now()), fresh: used == 0, spent: false, used_bytes: 0, used_paths: used }
+}
+
+/// The scan that lists a session's keys looks at the clock as it goes: a drain with its time up that has done something
+/// already gives it up, whole (nothing is kept of a list not made), and the next drain makes it. The first thing a
+/// drain does is read to its end.
+#[test]
+fn the_listing_of_a_big_session_is_given_up_when_the_time_is_up_and_made_again_by_the_next_drain() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    for (used, finished) in [(1usize, true), (2, false), (7, false)] {
+        let mut f = awaiting_its_session(&all);
+        let limits = f.m.limits;
+        let txn = f.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+        let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+        let mut b = late_budget(used);
+        assert_eq!(table.snapshot(&ses, &txn, &mut b, &limits), finished, "used={used}");
+        if finished {
+            assert!(table.cold.is_some() && table.present && !table.need_session);
+        } else {
+            assert!(b.spent, "the drain is over");
+            assert!(table.cold.is_none() && !table.present && table.need_session, "used={used}: nothing of the list is kept");
+        }
+    }
+}
+
+/// ... and the count of a session's keys is the same.
+#[test]
+fn the_count_of_a_big_sessions_keys_is_given_up_when_the_time_is_up() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    // (The count is begun, which is an action of the drain: `used` is the actions done with it.)
+    for (used, count) in [(1usize, Some(1_000)), (2, None), (7, None)] {
+        let mut f = awaiting_its_session(&all);
+        let limits = f.m.limits;
+        let txn = f.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+        let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+        let mut b = late_budget(used);
+        assert_eq!(table.count_scan(&ses, &txn, &mut b, &limits), count, "used={used}");
+        assert_eq!(b.spent, count.is_none(), "used={used}");
+    }
+}
+
+/// A session of fewer keys than the scans look at the clock after is read whole, whatever the time.
+#[test]
+fn a_small_session_is_listed_whole_though_the_time_is_up() {
+    const KEYS: u32 = 255;
+    assert!((KEYS as usize) < SCAN_CHECK_KEYS, "(a session of fewer keys than the scans look at the clock after)");
+    let all: Vec<(u32, i64)> = (0..KEYS).map(|i| (i, i as i64)).collect();
+    let mut f = awaiting_its_session(&all);
+    let limits = f.m.limits;
+    let txn = f.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+    let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+    assert!(table.snapshot(&ses, &txn, &mut late_budget(5), &limits));
+}
+
+/// Drains with no time at all still read a session too big to be listed between two looks at the clock: the first thing a
+/// drain does is read to its end, and so every drain gets somewhere.
+#[test]
+fn drains_with_no_time_at_all_still_read_a_big_session_to_its_end() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    let limits = Limits { drain_time: Some(Duration::ZERO), ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    let mut drains = 0;
+    for _ in 0..5_000 {
+        let d = f.drain();
+        drains += 1;
+        assert!(d.paths > 0 || f.m.current(T, INC), "every drain that has work does some");
+        model.take(&mut f.m, T);
+        if f.m.current(T, INC) {
+            break;
+        }
+    }
+    assert!(f.m.current(T, INC), "it goes on to the end: {drains} drains");
+    assert_eq!(model.recs, model_of(&all));
+}

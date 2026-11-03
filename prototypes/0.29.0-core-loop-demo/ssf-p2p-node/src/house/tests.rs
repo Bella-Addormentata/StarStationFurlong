@@ -3826,6 +3826,7 @@ fn the_fold_follows_the_house_tables_of_a_room_this_house_is_a_house_of() {
     assert_eq!(plan.houses, vec![room.house.public().to_string()]);
     assert!(plan.complete);
     assert_eq!(plan.owner, "owner", "the deed holder the houses stand under, as roomInfo names them");
+    assert_eq!(plan.owner_key, room.owner.public, "and the key the pass pinned for it, whose delegations those houses are");
 }
 
 /// What `roomInfo.owner` names as the deed holder: a string that names someone (a room that is nobody's says

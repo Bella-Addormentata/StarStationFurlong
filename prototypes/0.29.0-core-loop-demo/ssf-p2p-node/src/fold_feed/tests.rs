@@ -1173,6 +1173,80 @@ fn a_first_frame_taken_and_not_sent_waits_when_new_ones_are_not_allowed() {
     assert_eq!(rig.feed.counts().cold, 2);
 }
 
+/// A table the mirror let go of holds its place of the worker's until the worker has been told so: a word the pipe was too
+/// full to take is still owed, and the table is held.
+#[test]
+fn a_table_the_worker_is_still_to_be_told_to_let_go_of_is_still_held() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    assert_eq!((rig.feed.holds(), rig.feed.owes_forget()), (1, false));
+    rig.sup.clog(QUEUE_BYTES);
+    rig.want(&[]);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    assert!(rig.feed.owes_forget(), "the word was refused: owed");
+    assert_eq!(rig.feed.holds(), 1, "and the worker holds the table until it is told");
+    rig.sup.unclog(QUEUE_BYTES);
+    rig.until("told", |r| !r.feed.owes_forget());
+    assert_eq!(rig.feed.holds(), 0, "and then it does not");
+}
+
+/// A table the worker does not hold yet takes one of the places a room is given when it is started; a table it holds
+/// takes none; and a place not given is not taken (the table waits).
+#[test]
+fn each_table_started_takes_one_of_the_places_the_room_is_given_and_a_table_held_takes_none() {
+    let mut rig = stand_rig(&Script::default());
+    rig.session(&live0(), &recs(2));
+    rig.until("caught up", |r| r.caught_up());
+    assert_eq!(rig.feed.holds(), 1);
+    let mut want = vec![(T, INC)];
+    for n in ["t2", "t3", "t4"] {
+        rig.session(&live_of(n, None), &recs(2));
+        want.push((n, INC));
+    }
+    rig.want(&want);
+    rig.put(&live0(), &rk(1, 9), val(9));
+    let now = rig.now;
+    let push = |rig: &mut Rig, room: &mut usize| {
+        {
+            let txn = rig.doc.transact();
+            rig.mirror.drain(&txn);
+        }
+        rig.feed.push_clocked(&|| now, &mut rig.mirror, &mut rig.sup, &rig.inputs, room);
+    };
+    // Two places: the table held is kept up (it takes none), two of the three new ones are started, the last waits.
+    let mut room = 2usize;
+    push(&mut rig, &mut room);
+    let c = rig.feed.counts();
+    assert_eq!((c.cold, c.warm, room), (3, 1, 0), "the held table's warm, and two new tables' colds, took two places");
+    assert_eq!(rig.feed.holds(), 3);
+    assert!(rig.feed.fold("t4", INC).is_none());
+    // None: nothing more is started, however many times the pass is made.
+    for _ in 0..3 {
+        push(&mut rig, &mut room);
+    }
+    assert_eq!((rig.feed.counts().cold, rig.feed.holds()), (3, 3));
+    // One more: the last is started, and takes it.
+    room = 1;
+    push(&mut rig, &mut room);
+    assert_eq!((rig.feed.counts().cold, rig.feed.holds(), room), (4, 4, 0));
+    // More than are wanted: what is left is what was not taken.
+    room = 10;
+    push(&mut rig, &mut room);
+    assert_eq!((rig.feed.counts().cold, room), (4, 10), "nothing new was started, so no place is taken");
+    rig.until("all caught up", |r| ["t2", "t3", "t4"].iter().all(|t| r.caught_up_of(t)) && r.caught_up_of(T));
+    // A table that cannot be started (the worker was too busy) takes no place either.
+    rig.sup.clog(QUEUE_BYTES);
+    rig.session(&live_of("t5", None), &recs(2));
+    want.push(("t5", INC));
+    rig.want(&want);
+    let mut room = 5usize;
+    push(&mut rig, &mut room);
+    assert_eq!((rig.feed.holds(), room), (4, 5), "refused: not held, and no place taken");
+}
+
 #[test]
 fn a_table_whose_version_moved_without_a_change_is_acknowledged_when_the_pipe_clears() {
     let mut rig = Rig::new(ROOM, Arc::new(|| Box::new(Stand { script: Script::default(), asked: 0, alive: true })));

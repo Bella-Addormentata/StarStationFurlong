@@ -593,3 +593,107 @@ fn a_room_that_names_no_deed_holder_at_first_is_told_when_it_does() {
     assert_eq!(p.deed(), Some("alice".to_string()));
     assert_eq!(p.view_at().2, 1);
 }
+
+// ── Review round 6 ───────────────────────────────────────────────────────────
+
+fn apply_update(doc: &Doc, update: &[u8]) {
+    use yrs::updates::decoder::Decode;
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+}
+
+/// All a peer's doc holds, as the one update a node away from the room may be sent.
+fn everything(peer: &Doc) -> Vec<u8> {
+    peer.transact().encode_diff_v1(&yrs::StateVector::default())
+}
+
+/// A key written and written over in one update (the node was away, or the updates were merged on the way) shows the node
+/// only the last; a page that saw the first on its own pinned that. The update says that something was made and deleted in
+/// it, and a player first pinned from it is doubted, as a key replaced is.
+#[test]
+fn a_player_first_pinned_from_an_update_in_which_something_was_made_and_deleted_is_doubted() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    put(&peer, "eve", "A");
+    put(&peer, "eve", "B");
+    apply_update(&doc, &everything(&peer));
+    assert_eq!(pins_of(&mut p)["eve"], "B", "the node sees the last");
+    assert!(!p.view().1, "and cannot say what the first was");
+    // It stays so, whatever comes after.
+    put(&doc, "bob", &key("bob"));
+    assert!(!p.view().1);
+}
+
+/// And the same player written once, or the update made and deleted nothing the doc did not hold, is no doubt.
+#[test]
+fn a_player_first_pinned_from_an_update_in_which_nothing_was_made_and_deleted_is_not() {
+    // Written once.
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    put(&peer, "eve", "A");
+    apply_update(&doc, &everything(&peer));
+    assert_eq!(pins_of(&mut p)["eve"], "A");
+    assert!(p.view().1);
+    // An update that deletes what the doc already had (a player who goes) and brings a new one.
+    let before = doc.transact().state_vector();
+    remove(&peer, "eve");
+    put(&peer, "bob", &key("bob"));
+    let update = peer.transact().encode_diff_v1(&before);
+    apply_update(&doc, &update);
+    assert_eq!(pins_of(&mut p)["bob"], key("bob"));
+    assert!(p.view().1, "the block deleted was one the doc had: nothing was made and deleted in the update");
+}
+
+/// A player the watch has pinned already, written again in such an update, is the key it pinned (a page keeps the pin of a
+/// player who goes): the doubt is of a player first pinned.
+#[test]
+fn a_player_pinned_already_is_not_doubted_when_an_update_of_made_and_deleted_brings_the_same_key_back() {
+    // (The peer's client id is the greater, so that its blocks are the ones standing over the ones the node removed.)
+    let doc = Doc::with_client_id(1);
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    put(&doc, "eve", "A");
+    remove(&doc, "eve");
+    let peer = Doc::with_client_id(9);
+    put(&peer, "eve", "A");
+    put(&peer, "eve", "A");
+    apply_update(&doc, &everything(&peer));
+    assert_eq!(pins_of(&mut p)["eve"], "A");
+    assert!(p.view().1);
+}
+
+/// Neither is a player no page would pin: no key a page reads, or an id past what a page keeps.
+#[test]
+fn a_player_no_page_pins_is_not_doubted_for_an_update_of_made_and_deleted() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    let keyless = || Any::Map(Arc::new(HashMap::from([("other".to_string(), Any::Number(1.0))])));
+    put_any(&peer, "no-key", keyless());
+    put_any(&peer, "no-key", keyless());
+    let long = "x".repeat(MAX_PIN_PID_UNITS + 1);
+    put(&peer, &long, "A");
+    put(&peer, &long, "B");
+    apply_update(&doc, &everything(&peer));
+    assert!(pins_of(&mut p).is_empty(), "{:?}", pins_of(&mut p));
+    assert!(p.view().1, "nothing a page pins is in doubt");
+}
+
+/// An update in which something else was made and deleted doubts a player it brings once, because it cannot be told
+/// what was deleted (the harmless ones are doubted too).
+#[test]
+fn a_player_brought_by_an_update_in_which_something_else_was_made_and_deleted_is_doubted_too() {
+    let doc = Doc::new();
+    let mut p = PlayerPins::attach(&doc, PIN_WALK_KEYS);
+    let peer = Doc::with_client_id(9);
+    let other = peer.get_or_insert_map("elsewhere");
+    {
+        let mut txn = peer.transact_mut();
+        other.insert(&mut txn, "k", 1);
+        other.insert(&mut txn, "k", 2);
+    }
+    put(&peer, "eve", "A");
+    apply_update(&doc, &everything(&peer));
+    assert_eq!(pins_of(&mut p)["eve"], "A");
+    assert!(!p.view().1);
+}

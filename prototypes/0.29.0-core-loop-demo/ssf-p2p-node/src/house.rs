@@ -720,6 +720,10 @@ pub struct HousePlan {
     /// by the delegations of whoever holds the deed, so a plan is a plan of one holder's houses, and the shadow, which
     /// watches the deed itself (fold_pins.rs), holds it against a trim only while the doc names them still.
     pub owner: String,
+    /// The key the pass pinned for that holder, whose delegations name the houses: the shadow holds the plan against a
+    /// trim only while its own watch of the players has the same key pinned for them (a holder whose key was replaced
+    /// between the pass's pin and the watch's, or a first key seen at different times, is another set of houses).
+    pub owner_key: String,
     pub tables: Vec<(String, String)>,
     pub houses: Vec<String>,
     /// The houses are every one the room's records name: the pass that found
@@ -1077,7 +1081,7 @@ impl House {
         houses.push(self.key.public.clone());
         houses.sort();
         houses.dedup();
-        Some(HousePlan { owner: plan.owner.clone(), tables: plan.tables.clone(), houses, complete: plan.complete })
+        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete })
     }
 
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they

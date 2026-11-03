@@ -32,7 +32,11 @@
 //!   players past them are unknown);
 //! - an entry carries a `__proto__` field (AMBIGUOUS: a page reads the key
 //!   with a property access, which can come from the prototype the field sets,
-//!   and the node reads the field itself).
+//!   and the node reads the field itself);
+//! - a player is first seen in an update in which something was made and deleted (CONTESTED, as a key replaced is:
+//!   the update may have written a key and written it over, the node sees only the last, and a page that saw the
+//!   first on its own pinned that. The update does not say what was deleted, so any such update doubts the player it
+//!   brings, and some that are harmless do too).
 //!
 //! These last for as long as the node watches the room.
 //!
@@ -62,6 +66,7 @@ use yrs::types::{DeepObservable, EntryChange, Event, Events};
 use yrs::{Any, Doc, Map, Observable, Out, ReadTxn, Subscription, Transact, TransactionMut};
 
 use crate::house::deed_of;
+use crate::house_mirror::made_and_deleted;
 
 /// The most keys the fold pins in a room: the pages' own MAX_PINNED_KEYS
 /// (past it new players go unpinned there too). The players map is any
@@ -215,6 +220,8 @@ fn lock(m: &Mutex<PinState>) -> MutexGuard<'_, PinState> {
 /// each key that changed.
 fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
     let mut st = lock(shared);
+    // (Asked once, and only when a player is first pinned.)
+    let mut lost = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         if !map.path().is_empty() {
@@ -222,7 +229,16 @@ fn note(shared: &Mutex<PinState>, txn: &TransactionMut, events: &Events) {
         }
         for (pid, change) in map.keys(txn).iter() {
             match change {
-                EntryChange::Inserted(new) => st.learn(pid, Key::None, key_of(new)),
+                EntryChange::Inserted(new) => {
+                    // A player's key written and written over in one update (the node was away and the updates were
+                    // merged on the way) shows only the last as an insert, while a page that saw the first on its own
+                    // pinned it. The transaction says that something was made and deleted in it, and not what: a
+                    // player first pinned from such a one is doubted, as a key replaced is.
+                    if pid_pinnable(pid) && !st.pins.contains_key(&**pid) && key_of(new).pin().is_some() && *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                        st.contest();
+                    }
+                    st.learn(pid, Key::None, key_of(new))
+                }
                 EntryChange::Updated(old, new) => st.learn(pid, key_of(old), key_of(new)),
                 // (A page keeps the pin of a player who goes. One who goes before this watch has read the map
                 // was seen by the pages, and is pinned as they pinned it.)

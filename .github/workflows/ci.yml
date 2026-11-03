@@ -137,7 +137,7 @@ jobs:
       # node's side of it (6b-1c): the mirror of a room's tables, the feed to
       # the worker and the shadow comparison against the pages' checkpoints.
       - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
-        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_view
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins fold_view
 
       - name: 🔎 cargo check --features chia-publish,torrent,house-fold
         run: cargo check --features chia-publish,torrent,house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml

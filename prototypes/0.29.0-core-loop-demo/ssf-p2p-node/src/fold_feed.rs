@@ -44,7 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use crate::fold_supervisor::{backoff, Event, Launch, Post, State, Supervisor};
+use crate::fold_supervisor::{backoff, Clock, Event, Launch, Post, State, Supervisor};
 use crate::fold_wire::{is_result_too_big, Cold, Req, Resp, Warm};
 use crate::house_bytes::{CVal, Ctx};
 use crate::house_fold::FoldSummary;
@@ -406,11 +406,25 @@ impl Feed {
     /// As [`push`](Feed::push), and with `allow_new` false a table the worker does not hold yet
     /// is not started (its first frame waits): the changes to the tables it holds go on.
     pub fn push_with<L: Launch>(&mut self, now: Instant, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs, allow_new: bool) {
+        let mut room = if allow_new { usize::MAX } else { 0 };
+        self.push_clocked(&|| now, mirror, sup, inputs, &mut room);
+    }
+
+    /// The tables of this room the worker holds, or is still owed a word of letting go.
+    pub fn holds(&self) -> usize {
+        self.slots.values().filter(|s| s.open || s.forget_pending).count()
+    }
+
+    /// As [`push_with`](Feed::push_with), with room for `room` tables the worker does not hold yet (each one started
+    /// takes one; 0 is none), and at the time `clock` says when a request is queued: encoding a frame and starting the
+    /// worker take time, and the answer to a request is waited for from the time it was queued.
+    pub fn push_clocked<L: Launch>(&mut self, clock: Clock<'_>, mirror: &mut RoomMirror, sup: &mut Supervisor<L>, inputs: &Inputs, room: &mut usize) {
         if sup.off().is_some() {
             self.drop_all();
             return;
         }
         self.inputs = Some(inputs.clone());
+        let now = clock();
         if matches!(sup.state(), State::Backoff(until) if now < until) {
             return;
         }
@@ -434,7 +448,7 @@ impl Feed {
                 slot.dirty_streak = 0;
                 slot.pending_streak = 0;
                 if slot.open || slot.forget_pending {
-                    forget(counts, now, sup, &ctx, slot);
+                    forget(counts, clock(), sup, &ctx, slot);
                 }
             }
 
@@ -442,7 +456,7 @@ impl Feed {
             if !st.serving() || slot.gave_up == Some(st.generation) {
                 slot.unsent = None;
                 if slot.open || slot.forget_pending {
-                    forget(counts, now, sup, &ctx, slot);
+                    forget(counts, clock(), sup, &ctx, slot);
                 }
                 continue;
             }
@@ -450,11 +464,12 @@ impl Feed {
                 continue;
             }
             if slot.forget_pending {
-                forget(counts, now, sup, &ctx, slot);
+                forget(counts, clock(), sup, &ctx, slot);
                 continue;
             }
-            // A table the worker does not hold yet waits for the word that lets go of the ones it is to drop.
-            if !allow_new && !slot.open && (slot.unsent.is_some() || st.announcing) {
+            // A table the worker does not hold yet waits for the word that lets go of the ones it is to drop, and for
+            // a place among the ones it holds.
+            if *room == 0 && !slot.open && (slot.unsent.is_some() || st.announcing) {
                 continue;
             }
 
@@ -494,9 +509,13 @@ impl Feed {
                     Unsent { req, version, generation, given: inputs.clone() }
                 }
             };
-            if let Sent::Stop = send(counts, now, sup, slot, &ctx, frame) {
+            let held = slot.open;
+            if let Sent::Stop = send(counts, clock, sup, slot, &ctx, frame) {
                 // The rest would be refused too, or the worker is gone.
                 return;
+            }
+            if slot.open && !held {
+                *room = room.saturating_sub(1);
             }
         }
     }
@@ -507,9 +526,9 @@ enum Sent {
     Stop,
 }
 
-fn send<L: Launch>(counts: &mut Counts, now: Instant, sup: &mut Supervisor<L>, slot: &mut Slot, ctx: &Ctx, frame: Unsent) -> Sent {
+fn send<L: Launch>(counts: &mut Counts, clock: Clock<'_>, sup: &mut Supervisor<L>, slot: &mut Slot, ctx: &Ctx, frame: Unsent) -> Sent {
     let was_cold = matches!(frame.req, Req::Cold(_));
-    match sup.post(now, &frame.req) {
+    match sup.post_with(clock, &frame.req) {
         Post::Posted => {
             slot.open = true;
             slot.frames += 1;
