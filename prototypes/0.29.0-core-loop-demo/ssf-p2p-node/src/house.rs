@@ -834,6 +834,9 @@ pub struct House {
     looks: Looks,
     /// The clients' id of this node's doc (its own writes are not what a peer sent).
     own_client: u64,
+    /// Whether anything reads the plans ([`House::fold_plan`]): the fold in shadow. When nothing does, the passes of a tick
+    /// take no look at the doc between them.
+    watch_plans: bool,
     /// The tables held this tick: one whose own record the put-back writes
     /// again is read again ([`House::plan`]).
     held_now: HashSet<(String, String)>,
@@ -900,35 +903,78 @@ pub(crate) fn read_costed(charge: impl FnOnce(usize) -> bool, key_len: usize, ou
     }
 }
 
-/// The clients of a doc and how far each has written, as the doc held them, without the node's own writes (what peers
-/// have sent): equal at two looks if and only if a peer sent nothing between them.
-type Seen = Arc<Vec<(u64, u32)>>;
+/// What peers have sent to a doc, as two words whatever its history: how many clients other than this node's own have
+/// written to it, and a sum of a scramble of each client and how far it has written. Equal at two looks if and only if a
+/// peer sent nothing between them (but for a collision of the 64-bit sum, which a peer cannot aim at: clients are theirs,
+/// but the scramble is not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Seen {
+    clients: u32,
+    sum: u64,
+}
 
+fn scramble(x: u64) -> u64 {
+    let x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// One walk of the doc's clients, with no sorting and nothing kept: the node takes it only between the passes of a tick
+/// that has a table through and another pass to come ([`Looks`]), and not at all when no shadow reads the plan.
 fn seen_of<T: ReadTxn>(txn: &T, own: u64) -> Seen {
-    let mut seen: Vec<(u64, u32)> = txn.state_vector().iter().map(|(client, clock)| (client.get(), *clock)).filter(|(client, _)| *client != own).collect();
-    seen.sort_unstable();
-    Arc::new(seen)
+    let mut seen = Seen::default();
+    for (client, clock) in txn.state_vector().iter() {
+        if client.get() == own {
+            continue;
+        }
+        let h = scramble(scramble(client.get()).wrapping_add(u64::from(*clock)));
+        seen.clients = seen.clients.wrapping_add(1);
+        seen.sum = seen.sum.wrapping_add(h);
+    }
+    seen
 }
 
 /// What a tick's passes saw of the doc between them. The doc is let go between passes (the checks are made without it),
-/// and a table that went through in a pass is not read again in the next: if a peer sent anything since the pass before,
-/// the table is not as it was read, and a record of a house the pass would have learned may be in it. (The looks add up: a
-/// peer that sent between two passes did so after every table that went through before them. A table that goes through in
-/// a pass was read after what a peer sent before it.)
+/// and a table that went through in a pass is not read again in the next: if a peer sent anything since, the table is
+/// not as it was read, and a record of a house the pass would have learned may be in it. So a pass that leaves a table
+/// through, with another to follow, takes a look as it ends ([`Looks::rest`]), and the next takes another as it begins
+/// ([`Looks::resume`]) and compares. Nothing is looked at in a tick of one pass (the usual), in a pass that has nothing
+/// through, or when nothing reads the plan.
 #[derive(Default)]
 struct Looks {
-    last: Option<Seen>,
-    /// Some table that went through was passed over after a peer sent to the doc: the tick's plan is not complete.
+    /// The doc as the last pass left it, when a table had gone through and another pass was to follow.
+    rested: Option<Seen>,
+    /// A peer sent to the doc after a table went through, and it was not read again: the tick's plan is not complete.
     moved: bool,
+    /// How many looks were taken (the tests count them).
+    #[cfg(test)]
+    taken: u32,
 }
 
 impl Looks {
-    /// A pass begins and sees `seen`; `passed_over`: some table went through in a pass before this one.
-    fn look(&mut self, passed_over: bool, seen: Seen) {
-        if passed_over && self.last.as_ref().is_some_and(|then| **then != *seen) {
-            self.moved = true;
+    /// A pass ends with a table through and another to follow: the look is asked for only if it is wanted.
+    fn rest(&mut self, seen: impl FnOnce() -> Seen) {
+        if !self.moved {
+            self.rested = Some(seen());
+            #[cfg(test)]
+            {
+                self.taken += 1;
+            }
         }
-        self.last = Some(seen);
+    }
+
+    /// A pass begins: if the last left a look, a peer sent in between if the doc is other now. (The look is used up.)
+    fn resume(&mut self, seen: impl FnOnce() -> Seen) {
+        if let Some(then) = self.rested.take() {
+            #[cfg(test)]
+            {
+                self.taken += 1;
+            }
+            if then != seen() {
+                self.moved = true;
+            }
+        }
     }
 }
 
@@ -982,6 +1028,7 @@ impl House {
             through: HashMap::new(),
             looks: Looks::default(),
             own_client: 0,
+            watch_plans: true,
             held_now: HashSet::new(),
             stepping_down: false,
             settle_ms: SETTLE_MS,
@@ -1121,6 +1168,12 @@ impl House {
         }
     }
 
+    /// Whether the plans are read at all (the fold in shadow; on until told otherwise). When nothing reads them the
+    /// passes of a tick take no look at the doc between them, which is work for the plan's `complete` and nothing else.
+    pub fn watch_plans(&mut self, on: bool) {
+        self.watch_plans = on;
+    }
+
     /// What the node's fold in shadow follows in `room`: None unless the last
     /// pass found this house delegated (a pass that could not read the room to
     /// the end left the plan before it, which is not complete, so that tables
@@ -1244,6 +1297,12 @@ impl House {
                 let writes = self.plan(room, &txn, now, wall);
                 out.wrote += writes.len();
                 updates.extend(apply(&mut txn, &writes));
+                // (Another pass is to follow and a table is through, which it will not read again: what the doc holds now is
+                // what a peer may have added to by then. Nothing is looked at in the usual tick of one pass.)
+                if self.watch_plans && pass < passes && (!self.wanted.is_empty() || self.reread) && !self.through.is_empty() {
+                    let own = self.own_client;
+                    self.looks.rest(|| seen_of(&txn, own));
+                }
             }
             out.short = self.short;
             if self.wanted.is_empty() && !self.reread {
@@ -1300,6 +1359,10 @@ impl House {
 
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
+        // (What the doc holds as this pass begins, when the pass before it left a look: the doc was let go between them, and
+        // a table that went through is not read again. This is before anything else, so a pass cut short compares too.)
+        let own = self.own_client;
+        self.looks.resume(|| seen_of(txn, own));
         self.unclear_houses.clear();
         self.own_off = false;
         // (The fold follows only what a pass that got this far found; a pass cut short keeps the last one's, not complete.)
@@ -1447,10 +1510,6 @@ impl House {
         }
 
         let mut fair_tables = 0;
-        // (What the doc holds as this pass reads it. It is let go between passes, and a table that went through in an
-        // earlier one is not read again: if a peer sent anything since, it is not as it was read. The looks add up: a peer
-        // that sent between two passes did so after every table that went through before them.)
-        self.looks.look(!self.through.is_empty(), seen_of(txn, self.own_client));
         if !tables.is_empty() {
             let turn = self.rooms[room].turn % tables.len();
             tables.rotate_left(turn);

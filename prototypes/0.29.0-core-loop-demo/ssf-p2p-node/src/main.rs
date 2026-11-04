@@ -2336,6 +2336,15 @@ async fn node_main() -> Result<()> {
             None
         }
     };
+    // (Only the fold in shadow reads the house's plans; without it the house's passes take no look at a doc between them.)
+    let mut house = house;
+    #[cfg(feature = "house-fold")]
+    let plans_read = !house_fold_off_by_env();
+    #[cfg(not(feature = "house-fold"))]
+    let plans_read = false;
+    if let Some(h) = house.as_mut() {
+        h.watch_plans(plans_read);
+    }
     let mut fingerprint = fingerprint;
     fingerprint.house = house.as_ref().map(|h| h.public().to_string());
     // 🧮 The fold in shadow, with a house to be one (it writes nothing to any doc).

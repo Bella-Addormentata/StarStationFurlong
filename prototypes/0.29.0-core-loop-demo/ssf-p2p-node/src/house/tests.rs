@@ -4274,77 +4274,193 @@ fn a_gap_with_no_other_house_pinned_and_a_plan_that_never_went_are_no_gap() {
     assert!(!fold_plan_of(&mut room).unwrap().gapped, "(the plan was there the whole time)");
 }
 
+/// A peer (another client than the house's own) writes `value` under the top-level `key` of the computed map.
+fn peer_top(doc: &Doc, key: &str, value: Any) {
+    let peer = Doc::with_client_id(79);
+    let sv = {
+        let txn = doc.transact();
+        let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+        txn.state_vector()
+    };
+    {
+        let comp = peer.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut peer.transact_mut(), key, value);
+    }
+    let update = peer.transact().encode_state_as_update_v1(&sv);
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+}
+
+/// A tick of several passes in which `how` happens to the doc between the first and the next (while the checks are
+/// made, with the doc let go): whether the plan is complete after it, and how many looks the tick took. A second table
+/// with nothing to check goes through in the first pass; the first has checks to wait for. (In "a peer, with no table
+/// gone through" there is only the first: nothing went through before the checks, and the next pass reads it all.)
+fn between_the_passes(how: &str, watch: bool) -> (bool, u32) {
+    let (complete, taken, _) = between_the_passes_in(how, watch, 8);
+    (complete, taken)
+}
+
+/// [`between_the_passes`] with a tick of `passes` passes at most; the last is whether the tick was short.
+fn between_the_passes_in(how: &str, watch: bool, passes: usize) -> (bool, u32, bool) {
+    let mut room = Room::new(&format!("fold-view-between-{}-{watch}-{passes}", how.replace([' ', ',', '\''], "-")), true);
+    room.house.watch_plans(watch);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    let ses2 = if how.contains("no table") { room.ses_key() } else { second_table(&room) };
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    let (doc, fired) = (room.doc.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let how_now = how.to_string();
+    let setting = to_any(&room_signed("hfair", "roulette-2", &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))])));
+    room.house.on_check = Some(Box::new(move |_| {
+        if fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let value = Any::Number(1.0);
+        match how_now.as_str() {
+            "a peer" | "a peer, with no table gone through" => peer_writes(&doc, &ses2, "x:1:padding", value),
+            // (A setting of the second table that the next pass has to check before it reads anything: it is deferred.)
+            "a peer's setting" => peer_top(&doc, "hf:roulette-2", setting.clone()),
+            "this node" => {
+                let comp = doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = doc.transact_mut();
+                let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
+                m.insert(&mut txn, "x:1:padding", value);
+            }
+            _ => {}
+        }
+    }));
+    let out = room.tick_passes(200, passes);
+    // (With passes enough the tick reads it to its end, whatever the checks take.)
+    assert!(!out.short || passes < 8, "{how}: read to its end");
+    let complete = fold_plan_of(&mut room).expect("a plan").complete;
+    let taken = room.house.looks.taken;
+    // (And the next tick, with nothing between its passes, is complete: what a peer sent is read now.)
+    room.tick(200);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).expect("a plan").complete, "{how}: the next tick");
+    (complete, taken, out.short)
+}
+
 /// Passes of a tick read the doc one after the other, with the doc let go between them for the checks. A table that went
 /// through in a pass is not read again in the next, so a record a peer sent to it in between (naming a house the pass
 /// has not learned) is not seen: the plan is not complete. What this node wrote itself is not what a peer sent.
 #[test]
 fn a_plan_is_not_complete_when_a_peer_sent_to_a_table_that_had_gone_through_between_the_passes() {
     for (how, complete) in [("nothing", true), ("a peer", false), ("this node", true), ("a peer, with no table gone through", true)] {
-        let mut room = Room::new(&format!("fold-view-between-{}", how.replace([' ', ','], "-")), true);
-        let (alice, bob) = (who("alice"), who("bob"));
-        room.closed_on_the_join(&alice, &bob);
-        // (A second table with nothing to check goes through in the first pass; the first has checks to wait for. In the
-        // last case there is only the first: nothing went through before the checks, and the next pass reads it all.)
-        let ses2 = if how.contains("no table") { room.ses_key() } else { second_table(&room) };
-        room.reveal(&alice, 1);
-        room.reveal(&bob, 1);
-        let (doc, fired) = (room.doc.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let how_now = how;
-        room.house.on_check = Some(Box::new(move |_| {
-            if fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let value = Any::Number(1.0);
-            match how_now {
-                "a peer" | "a peer, with no table gone through" => peer_writes(&doc, &ses2, "x:1:padding", value),
-                "this node" => {
-                    let comp = doc.get_or_insert_map(COMPUTED_MAP);
-                    let mut txn = doc.transact_mut();
-                    let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
-                    m.insert(&mut txn, "x:1:padding", value);
-                }
-                _ => {}
-            }
-        }));
-        let out = room.tick(200);
-        assert!(!out.short, "{how}: read to its end");
-        let plan = fold_plan_of(&mut room).expect("a plan");
-        assert_eq!(plan.complete, complete, "{how}");
-        // (And the next tick, with nothing between its passes, is complete: what a peer sent is read now.)
-        room.tick(200);
-        assert!(fold_plan_of(&mut room).expect("a plan").complete, "{how}: the next tick");
+        assert_eq!(between_the_passes(how, true).0, complete, "{how}");
     }
 }
 
-/// What a tick's passes saw of the doc between them: a peer's update is a reason only to a table that had gone through
-/// before it, and a look is compared with the pass before, not with the first.
+/// A pass that is deferred (a record to check before anything is read) compares with the pass before all the same: the
+/// look it leaves is not the one that hides what was sent before it.
 #[test]
-fn the_looks_of_a_ticks_passes_move_only_a_table_that_had_gone_through_before_what_a_peer_sent() {
-    let seen = |n: u32| -> Seen { Arc::new(vec![(7, n)]) };
+fn a_peer_that_sent_before_a_pass_that_is_deferred_is_found_by_the_pass_that_follows() {
+    assert!(!between_the_passes("a peer's setting", true).0, "the plan is not complete");
+}
+
+/// The looks are taken between the passes of a tick that has a table through and another pass to follow: a tick with one
+/// pass, or with nothing through when the checks are made, takes none (a look walks every client the doc has known); and
+/// when no shadow reads the plans (`watch_plans(false)`) none is taken, and the plan says nothing of what a peer sent.
+#[test]
+fn a_look_is_taken_only_between_passes_with_a_table_through_and_only_when_the_plans_are_read() {
+    // A tick of one pass.
+    let mut room = Room::new("fold-view-one-pass", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.tick(200);
+    assert_eq!(room.house.looks.taken, 0, "(a tick of one pass)");
+    assert!(fold_plan_of(&mut room).expect("a plan").complete);
+    // Several passes.
+    let taken = between_the_passes("nothing", true).1;
+    assert!(taken >= 2 && taken % 2 == 0, "a look as a pass ends and one as the next begins: {taken}");
+    assert_eq!(between_the_passes("a peer", true).1, 2, "(none more once the plan is not complete)");
+    assert_eq!(between_the_passes("a peer, with no table gone through", true).1, 0, "(nothing through: nothing to protect)");
+    // The last pass of a tick leaves no look: none is to compare it.
+    let (_, taken, short) = between_the_passes_in("nothing", true, 2);
+    assert!(short, "(two passes were not enough)");
+    assert_eq!(taken, 2, "a look as the first pass ends and one as the second begins, and none as the second ends");
+    // The plans are read until told otherwise.
+    assert!(Room::new("fold-view-default-watch", true).house.watch_plans);
+    // Nothing reads the plans.
+    for how in ["nothing", "a peer", "this node"] {
+        assert_eq!(between_the_passes(how, false), (true, 0), "{how}: not watched");
+    }
+}
+
+/// The look a pass leaves is compared by the next, and used up by it.
+#[test]
+fn the_look_a_pass_leaves_is_compared_by_the_next_and_used_up() {
+    let seen = |n: u32| Seen { clients: n, ..Seen::default() };
     let mut looks = Looks::default();
-    looks.look(false, seen(1));
-    assert!(!looks.moved, "(the first pass has none before it)");
-    looks.look(false, seen(2));
-    assert!(!looks.moved, "a peer sent before any table went through: none was passed over");
-    looks.look(true, seen(2));
-    assert!(!looks.moved, "and nothing since, with a table through");
-    looks.look(true, seen(3));
-    assert!(looks.moved, "a peer sent after a table went through");
+    let mut asked = 0;
+    looks.resume(|| {
+        asked += 1;
+        seen(1)
+    });
+    assert_eq!((asked, looks.moved), (0, false), "(no look left: none is asked for)");
+    looks.rest(|| seen(1));
+    looks.resume(|| seen(1));
+    assert!(!looks.moved, "the doc is as the pass left it");
+    looks.resume(|| {
+        asked += 1;
+        seen(2)
+    });
+    assert_eq!((asked, looks.moved), (0, false), "(a look is used once)");
+    looks.rest(|| seen(2));
+    looks.resume(|| seen(3));
+    assert!(looks.moved, "the doc is other: a peer sent in between");
+    looks.rest(|| panic!("a plan that is not complete takes no more looks"));
+    assert!(looks.rested.is_none());
+    looks.resume(|| panic!("there is none to compare"));
+    assert!(looks.moved, "(for the tick)");
+    // The last look is the one compared.
     let mut looks = Looks::default();
-    looks.look(true, seen(1));
-    looks.look(true, seen(1));
-    assert!(!looks.moved, "nothing sent");
-    // The node's own writes are no look: the clients without it are what is compared.
-    let doc = Doc::with_client_id(5);
-    let map = doc.get_or_insert_map("m");
-    map.insert(&mut doc.transact_mut(), "a", 1);
-    let before = seen_of(&doc.transact(), 5);
-    map.insert(&mut doc.transact_mut(), "b", 2);
-    assert_eq!(*before, *seen_of(&doc.transact(), 5), "the node's own write is not a peer's");
-    assert!(before.is_empty());
-    let peer = Doc::with_client_id(6);
-    peer.get_or_insert_map("m").insert(&mut peer.transact_mut(), "c", 3);
-    let update = peer.transact().encode_state_as_update_v1(&doc.transact().state_vector());
-    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
-    assert_ne!(*before, *seen_of(&doc.transact(), 5), "a peer's is");
+    looks.rest(|| seen(1));
+    looks.rest(|| seen(2));
+    looks.resume(|| seen(2));
+    assert!(!looks.moved, "(the look left last)");
+}
+
+/// What peers have sent to a doc is a few words that change with who wrote and how far, and not with what this node wrote.
+#[test]
+fn what_a_peer_sent_is_a_few_words_that_change_with_who_wrote_how_far_and_not_with_this_nodes_writes() {
+    // A doc this node (client 5) wrote to, and peers (client, how many entries) that wrote to theirs, in this order.
+    let doc_of = |peers: &[(u64, usize)]| {
+        let doc = Doc::with_client_id(5);
+        let map = doc.get_or_insert_map("m");
+        map.insert(&mut doc.transact_mut(), "own", 1);
+        for (client, entries) in peers {
+            let peer = Doc::with_client_id(*client);
+            let theirs = peer.get_or_insert_map("m");
+            for i in 0..*entries {
+                theirs.insert(&mut peer.transact_mut(), format!("k{client}-{i}"), 1);
+            }
+            let update = peer.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+            doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+        }
+        doc
+    };
+    let seen = |doc: &Doc| seen_of(&doc.transact(), 5);
+    assert_eq!(seen(&doc_of(&[])), Seen::default(), "(only this node wrote)");
+    let own_more = doc_of(&[]);
+    let before = seen(&own_more);
+    own_more.get_or_insert_map("m").insert(&mut own_more.transact_mut(), "more", 2);
+    assert_eq!(seen(&own_more), before, "this node's own writes are not a peer's");
+    let all = [
+        doc_of(&[(6, 1)]),
+        doc_of(&[(6, 2)]),
+        doc_of(&[(7, 1)]),
+        doc_of(&[(6, 1), (7, 2)]),
+        doc_of(&[(6, 2), (7, 1)]),
+        doc_of(&[(6, 1), (7, 1), (8, 1)]),
+        doc_of(&[(6, 3)]),
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            assert_eq!(seen(a) == seen(b), i == j, "{i} and {j}");
+        }
+    }
+    assert_eq!(seen(&doc_of(&[(6, 1), (7, 2)])), seen(&doc_of(&[(7, 2), (6, 1)])), "(in whatever order they came)");
+    assert_eq!(seen(&all[3]).clients, 2);
 }
