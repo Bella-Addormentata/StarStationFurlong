@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chia_contact::InboundVerified;
 use crate::chia_knock::{KnockRequest, SentKnock};
-use crate::chia_resolve::LeaseWord;
+use crate::chia_resolve::{LeaseWord, WriteCoins};
 use crate::chia_lane::{self, AddrEntry, BeaconV2, ChiaPresenceRecord, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
 
@@ -131,15 +131,29 @@ pub const MAX_RECONCILE_PAGES: usize = 8;
 /// under: a release that fails to save is logged and the next change saves
 /// it, and a restored coin the chain has long settled is released by the
 /// first reconciliation.
+///
+/// Every parking records WHO PAYS for its spend (stage 4 design §4.4): its
+/// [`Payer`], kept beside the spend's bundle and written with it. The wait
+/// the lease imposes exists so that one payer never has two records for one
+/// era in flight, and that reason holds per payer, not across them:
+/// [`WalletLease::outgoing_pending_for`] asks it of one payer's spends. Every
+/// writer of this build still asks the global
+/// [`WalletLease::outgoing_pending`]; the burner writers (design §13, PRs 9
+/// and 10) are the first to ask per payer.
 pub struct WalletLease {
     gate: tokio::sync::Mutex<()>,
     pending: std::sync::Mutex<HashMap<Bytes32, Parked>>,
-    /// The spend bundle each parked spend pushed, by spend number: what the
-    /// liveness question hands the peers again (`ChainAccess::spend_live`),
-    /// since the peer protocol has no mempool query (plan §14 (6)). Attached
-    /// in the same write as the parking ([`WalletLease::park_with_bundle`]).
-    bundles: std::sync::Mutex<HashMap<u64, SpendBundle>>,
+    /// The spend bundle each parked spend pushed, and who pays for it, by
+    /// spend number: what the liveness question hands the peers again
+    /// (`ChainAccess::spend_live`), since the peer protocol has no mempool
+    /// query (plan §14 (6)). Attached in the same write as the parking
+    /// ([`WalletLease::park_with_bundle`]).
+    bundles: std::sync::Mutex<HashMap<u64, Pushed>>,
     incoming: std::sync::Mutex<Option<Bytes32>>,
+    /// The money address's payer, as [`WalletLease::restore`] was told: whose
+    /// a parking with no payer recorded is (stage 4 design §4.4). `None` until
+    /// a restore names it; such a parking then counts for every payer.
+    money: std::sync::Mutex<Option<Payer>>,
     /// Spend numbers handed out so far (see [`Parking`]).
     spends: std::sync::atomic::AtomicU64,
     /// The last spend a reconciliation asked the mempool about: the next pass
@@ -191,6 +205,52 @@ struct Settling {
     /// moves it, and the depth is measured from there (round 11).
     spent_at: u32,
     bundle: SpendBundle,
+    /// Who pays for the spend, as it was parked ([`Pushed`]): it goes back
+    /// into the parking with the bundle should the block go.
+    payer: Option<Payer>,
+}
+
+/// Who pays for a spend the lease parks (stage 4 design §4.4): the puzzle
+/// hash of the key that signs the spend and pays for it, the address that
+/// key's coins are locked to ([`our_puzzle_hash`]). It is the key whose next
+/// write must wait for this spend, not the address of an input: a TAKE's
+/// input is the dish's coin and its payer the money address it pays into
+/// (`chia_faucet`'s claim), and a burner's first write (PR 9) will spend a
+/// dish coin and the gift g with the burner as its payer.
+///
+/// Outside this module a `Payer` comes from a key alone ([`Payer::of`]):
+/// there is no `Default`, no `From<Bytes32>` and no public constructor from
+/// bytes, so a coin id or a hint, `Bytes32`s both, can never be passed as a
+/// payer by mistake. The lease builds one from the hex its own file holds. It
+/// holds a puzzle hash only, which is public, and its `Debug` shows that hash
+/// and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Payer(Bytes32);
+
+impl Payer {
+    /// The payer `key` is: the standard puzzle hash of its synthetic key.
+    pub fn of(key: &SecretKey) -> Payer {
+        Payer(our_puzzle_hash(key))
+    }
+
+    /// The puzzle hash, hex, as the lease file writes it. Read-only on
+    /// purpose: a mark that files its payer (design §13, PR 10) compares this
+    /// text, and a parse back into a `Payer` outside this module would be a
+    /// new constructor from bytes, to be added deliberately where marks load.
+    pub fn hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// What a parked spend pushed, and who pays for it (see [`WalletLease`]'s
+/// `bundles`). One record, so the payer goes wherever the bundle goes: in
+/// with the parking, out with its release, into settling and back. `payer`
+/// is `None` for a spend an older node parked, whose file named none: such a
+/// spend is the money address's (stage 4 design §4.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Pushed {
+    bundle: SpendBundle,
+    payer: Option<Payer>,
 }
 
 /// Settling spends kept at most (#272 review round 10): past it the oldest
@@ -254,6 +314,10 @@ pub struct DueSpend {
     pub spend: u64,
     pub coins: Vec<ParkedInput>,
     pub bundle: Option<SpendBundle>,
+    /// Who pays for it, as parked (`None`: no payer recorded, as for every
+    /// spend an older node parked): carried into settling with the bundle
+    /// when the spend is released as spent, and read nowhere else.
+    pub payer: Option<Payer>,
 }
 
 /// The parking on disk (see [`WalletLease::restore`]): the parked coins with
@@ -283,6 +347,9 @@ struct SettlingSpend {
     coins: Vec<SettlingCoin>,
     /// Hex of the bundle's wire bytes.
     bundle: String,
+    /// Who pays for the spend, as on [`ParkedBundle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payer: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
@@ -307,6 +374,12 @@ struct ParkedCoin {
 struct ParkedBundle {
     spend: u64,
     bundle: String,
+    /// Who pays for the spend: its [`Payer`]'s puzzle hash, hex (stage 4
+    /// design §4.4). Absent in files older nodes wrote, whose spends are the
+    /// money address's. The file stays version 1: no record of it denies
+    /// unknown fields, so an older node reads the file and skips this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payer: Option<String>,
 }
 
 /// Write `bytes` to `path` as a whole: into a temporary file beside it, then a
@@ -333,6 +406,16 @@ fn parse_coin_id(hex_id: &str) -> Option<Bytes32> {
     Some(Bytes32::new(bytes))
 }
 
+/// A payer as the lease file writes it ([`Payer::hex`]): `Ok(None)` when the
+/// entry names none, as no entry an older node wrote does; `Err` with the
+/// text when it is not 32 bytes of hex.
+fn parse_payer(hex_payer: Option<&str>) -> Result<Option<Payer>, &str> {
+    match hex_payer {
+        None => Ok(None),
+        Some(text) => parse_coin_id(text).map(|ph| Some(Payer(ph))).ok_or(text),
+    }
+}
+
 /// The process-wide lease: one wallet per node, so one lease.
 pub static WALLET_LEASE: std::sync::LazyLock<WalletLease> = std::sync::LazyLock::new(WalletLease::new);
 
@@ -343,6 +426,7 @@ impl WalletLease {
             pending: std::sync::Mutex::new(HashMap::new()),
             bundles: std::sync::Mutex::new(HashMap::new()),
             incoming: std::sync::Mutex::new(None),
+            money: std::sync::Mutex::new(None),
             spends: std::sync::atomic::AtomicU64::new(0),
             probe_cursor: std::sync::atomic::AtomicU64::new(0),
             store: std::sync::Mutex::new(None),
@@ -363,8 +447,9 @@ impl WalletLease {
     /// NOTHING is parked and the spend must not leave: the lease is sealed, or
     /// the parking could not be saved and a restart would forget the spend
     /// (#245 review, round 19). Pushes park through [`Self::park_with_bundle`],
-    /// which saves the bundle in the same write; the bundle-less form serves
-    /// the lease tests.
+    /// which saves the bundle and its payer in the same write; the
+    /// bundle-less form, which records no payer either (an older node's
+    /// parking), serves the lease tests.
     #[cfg(test)]
     pub fn park<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>) -> Result<Parking, LeaseError> {
         self.park_at(coin_ids, Instant::now())
@@ -380,16 +465,25 @@ impl WalletLease {
     /// the spend is still live ([`ChainAccess::spend_live`]) after any
     /// restart. A parking saved before its bundle would, after a crash between
     /// the two writes, hold the wallet's coins with no bundle to ask about
-    /// until an outside spend settled them. `Err` means nothing is parked or
-    /// kept and the spend must not leave.
-    pub fn park_with_bundle<I: Into<ParkedInput>>(&self, coin_ids: impl IntoIterator<Item = I>, bundle: &SpendBundle) -> Result<Parking, LeaseError> {
-        self.park_with_bundle_at(coin_ids, Some(bundle), Instant::now())
+    /// until an outside spend settled them. The spend's `payer` (stage 4
+    /// design §4.4) goes into the same write, beside the bundle. `Err` means
+    /// nothing is parked or kept and the spend must not leave.
+    pub fn park_with_bundle<I: Into<ParkedInput>>(
+        &self,
+        coin_ids: impl IntoIterator<Item = I>,
+        bundle: &SpendBundle,
+        payer: Payer,
+    ) -> Result<Parking, LeaseError> {
+        self.park_with_bundle_at(coin_ids, Some((bundle, payer)), Instant::now())
     }
 
+    /// [`WalletLease::park_with_bundle`] at a given instant; `pushed` is the
+    /// bundle and its payer, which a parking keeps together or not at all
+    /// (none: the tests' bare parking, an older node's).
     fn park_with_bundle_at<I: Into<ParkedInput>>(
         &self,
         coin_ids: impl IntoIterator<Item = I>,
-        bundle: Option<&SpendBundle>,
+        pushed: Option<(&SpendBundle, Payer)>,
         now: Instant,
     ) -> Result<Parking, LeaseError> {
         self.ensure_open()?;
@@ -402,13 +496,14 @@ impl WalletLease {
                 pending.insert(input.coin_id, Parked { at: now, spend, seen_at: input.seen_at });
             }
         }
-        if let Some(bundle) = bundle {
-            self.bundles.lock().unwrap().insert(spend, bundle.clone());
+        if let Some((bundle, payer)) = pushed {
+            self.bundles.lock().unwrap().insert(spend, Pushed { bundle: bundle.clone(), payer: Some(payer) });
         }
         if let Err(e) = self.persist() {
-            // Not saved, so not sent: take the parking and its bundle back whole
-            // (by the spend number, as a rejection would) and let the caller
-            // refuse the spend. The number is used up, so no later spend shares it.
+            // Not saved, so not sent: take the parking and its bundle (with its
+            // payer) back whole (by the spend number, as a rejection would) and
+            // let the caller refuse the spend. The number is used up, so no
+            // later spend shares it.
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
             self.bundles.lock().unwrap().remove(&spend);
             return Err(LeaseError::Unsaved(e));
@@ -537,6 +632,59 @@ impl WalletLease {
         self.pending.lock().unwrap().keys().any(|id| Some(*id) != incoming)
     }
 
+    /// A spend paid by `payer` is still settling: a coin is parked by a spend
+    /// whose payer is `payer` (stage 4 design §4.4), the question of
+    /// [`WalletLease::outgoing_pending`] asked of one payer's spends. A spend
+    /// with no payer recorded (one an older node parked, or a test's bare
+    /// parking) is the money address's, the one [`WalletLease::restore`]
+    /// named; until a restore names it, such a spend counts for every payer,
+    /// fail closed, as the global check counts it. A SETTLING spend counts no
+    /// more than it does there: its coins are spent in a block and the payer's
+    /// next coin is the one it created; a reorganization that drops the block
+    /// parks it again, and then it counts.
+    ///
+    /// The faucet coin a claim spent (the `incoming` marker) is left out, as
+    /// the global check leaves it out, but only while the spend parking it is
+    /// the money address's or names no payer, as every TAKE's does (its payer
+    /// is the money address it pays into). The marker is cleared only when
+    /// [`WalletLease::incoming_pending`] next reads it, so once the peers
+    /// refused a TAKE or the mempool dropped it, the marker can still name a
+    /// dish coin that is free again, and a spend that parks that coin under
+    /// another payer counts for that payer. With the money address named and
+    /// every payer it or none, this is `outgoing_pending` exactly.
+    ///
+    /// It can under-report a payer whose record was lost. Coins are only ever
+    /// over-parked, but a payer can be lost, and then the money address
+    /// over-holds while the payer that really paid under-holds: an older node
+    /// rewrote the file without payers (a rollback, design §8 (6)); a save
+    /// left out a bundle the wire could not encode, and its payer with it
+    /// ([`WalletLease::snapshot`]); or an older node parked the spend before
+    /// payers were filed, as it parked every beacon spend. So it must never be
+    /// a writer's only guard: the writer keeps a second one, its own mark's
+    /// gating or a bundle of its own recognised by its outputs, and the coins
+    /// [`WalletLease::is_taken`] holds stay out of its reach whatever this
+    /// says. Callers hold the gate after a reconciliation, as
+    /// [`publish_memo_with`] does around the global check.
+    ///
+    /// Nothing calls it outside the tests yet: the burner writers will
+    /// (design §13, PR 10). The claim-and-write (PR 9) must also keep a stale
+    /// marker off a burner's parking, since `incoming_pending` reads the
+    /// marker's coin alone and would read a burner's parking of it as a gift
+    /// still landing: it keeps the TAKE's spend number beside the marker, or
+    /// never lets a burner park the marker's coin.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn outgoing_pending_for(&self, payer: Payer) -> bool {
+        let incoming = *self.incoming.lock().unwrap();
+        let money = *self.money.lock().unwrap();
+        let pending = self.pending.lock().unwrap();
+        let pushed = self.bundles.lock().unwrap();
+        pending.iter().any(|(id, parked)| {
+            let paid_by = pushed.get(&parked.spend).and_then(|p| p.payer).or(money);
+            let landing = Some(*id) == incoming && (paid_by.is_none() || paid_by == money);
+            !landing && paid_by.is_none_or(|recorded| recorded == payer)
+        })
+    }
+
     /// A gift to our wallet is still landing: the wallet is not empty even
     /// though the chain does not list the coin yet.
     pub fn incoming_pending(&self) -> bool {
@@ -567,7 +715,8 @@ impl WalletLease {
             .into_iter()
             .map(|(spend, mut coins)| {
                 coins.sort_by_key(|c| c.coin_id);
-                DueSpend { spend, coins, bundle: bundles.get(&spend).cloned() }
+                let pushed = bundles.get(&spend);
+                DueSpend { spend, coins, bundle: pushed.map(|p| p.bundle.clone()), payer: pushed.and_then(|p| p.payer) }
             })
             .collect()
     }
@@ -589,10 +738,11 @@ impl WalletLease {
     /// [`WalletLease::release`]); those among them released as spent with a
     /// bundle, `settling`, are kept settling under their numbers; `reparked`
     /// settling spends go back into the parking under theirs, with a fresh
-    /// grace, never over a NEWER marker of the same coin (a coin a later spend
-    /// took meanwhile keeps that spend's marker; a re-parked spend none of
-    /// whose coins is free again is forgotten, its bundle with it, so no bundle
-    /// parks no coin); `reclocked` settling spends take the height the chain
+    /// grace and their bundle and payer, never over a NEWER marker of the same
+    /// coin (a coin a later spend took meanwhile keeps that spend's marker; a
+    /// re-parked spend none of whose coins is free again is forgotten, its
+    /// bundle and payer with it, so no bundle parks no coin and no payer
+    /// outlives its spend); `reclocked` settling spends take the height the chain
     /// now lists them spent at (round 11); `done` settling spends are forgotten.
     fn retire(&self, released: &[u64], settling: Vec<(u64, Settling)>, reparked: &[u64], reclocked: &[(u64, u32)], done: &[u64], now: Instant) {
         let back: Vec<(u64, Settling)> = {
@@ -630,7 +780,7 @@ impl WalletLease {
                     }
                 }
                 if parked_any {
-                    bundles.insert(spend, s.bundle);
+                    bundles.insert(spend, Pushed { bundle: s.bundle, payer: s.payer });
                 }
             }
         }
@@ -655,7 +805,15 @@ impl WalletLease {
     /// parks until the operator fixes or removes the file and restarts the
     /// node, and nothing is written over it meanwhile (it is left for
     /// recovery); the log at startup says so.
-    pub fn restore(&self, path: &std::path::Path) {
+    ///
+    /// `money` is the payer of the wallet this file belongs to (stage 4
+    /// design §4.4): the file lives beside that wallet's identity and is
+    /// restored as the wallet loads, so a parking it holds with no payer
+    /// recorded, as every parking an older node wrote, is that wallet's. It
+    /// is a puzzle hash, public, and it is named before the file is read, so
+    /// a lease the file seals knows it too.
+    pub fn restore(&self, path: &std::path::Path, money: Payer) {
+        *self.money.lock().unwrap() = Some(money);
         let read = match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<LeaseFile>(&bytes) {
                 Ok(file) => self
@@ -695,7 +853,9 @@ impl WalletLease {
     /// continues from really is above every restored number — a file whose
     /// counter had fallen behind its entries would hand a new spend a restored
     /// number, and one verdict would then release both (compare-and-release
-    /// relies on the numbers being distinct).
+    /// relies on the numbers being distinct). Every payer a bundle or a
+    /// settling spend names is well formed too (stage 4 design §4.4), parsed
+    /// in the same check; one that names none is the money address's.
     fn load(&self, file: &LeaseFile, now: Instant) -> Result<(usize, usize), String> {
         if file.v != 1 {
             return Err(format!("version {} this node does not read (it writes version 1)", file.v));
@@ -726,7 +886,8 @@ impl WalletLease {
             }
             let bytes = hex::decode(&entry.bundle).map_err(|e| format!("malformed bundle for spend #{}: {e}", entry.spend))?;
             let bundle = SpendBundle::from_bytes(&bytes).map_err(|e| format!("unreadable bundle for spend #{}: {e}", entry.spend))?;
-            bundles.push((entry.spend, bundle));
+            let payer = parse_payer(entry.payer.as_deref()).map_err(|bad| format!("malformed payer {bad:?} for spend #{}", entry.spend))?;
+            bundles.push((entry.spend, Pushed { bundle, payer }));
         }
         let mut settling: Vec<(u64, Settling)> = Vec::with_capacity(file.settling.len());
         for entry in &file.settling {
@@ -749,7 +910,9 @@ impl WalletLease {
             }
             let bytes = hex::decode(&entry.bundle).map_err(|e| format!("malformed bundle for settling spend #{}: {e}", entry.spend))?;
             let bundle = SpendBundle::from_bytes(&bytes).map_err(|e| format!("unreadable bundle for settling spend #{}: {e}", entry.spend))?;
-            settling.push((entry.spend, Settling { coins, spent_at: entry.spent_at, bundle }));
+            let payer =
+                parse_payer(entry.payer.as_deref()).map_err(|bad| format!("malformed payer {bad:?} for settling spend #{}", entry.spend))?;
+            settling.push((entry.spend, Settling { coins, spent_at: entry.spent_at, bundle, payer }));
         }
         {
             let mut pending = self.pending.lock().unwrap();
@@ -757,8 +920,8 @@ impl WalletLease {
                 pending.entry(*id).or_insert(Parked { at: now, spend: *spend, seen_at: *seen_at });
             }
             let mut kept = self.bundles.lock().unwrap();
-            for (spend, bundle) in bundles {
-                kept.entry(spend).or_insert(bundle);
+            for (spend, pushed) in bundles {
+                kept.entry(spend).or_insert(pushed);
             }
         }
         let settling_count = settling.len();
@@ -807,12 +970,21 @@ impl WalletLease {
         let mut parked: Vec<ParkedCoin> =
             pending.iter().map(|(id, p)| ParkedCoin { coin: hex::encode(id), spend: p.spend, seen_at: p.seen_at }).collect();
         parked.sort_by(|a, b| (a.spend, &a.coin).cmp(&(b.spend, &b.coin)));
+        // A bundle the wire cannot encode is left out, and its payer with it:
+        // its coins stay parked, and after a restart its spend counts as the
+        // money address's (see `outgoing_pending_for`, on a payer lost).
         let mut bundles: Vec<ParkedBundle> = self
             .bundles
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(spend, bundle)| bundle.to_bytes().ok().map(|bytes| ParkedBundle { spend: *spend, bundle: hex::encode(bytes) }))
+            .filter_map(|(spend, pushed)| {
+                pushed.bundle.to_bytes().ok().map(|bytes| ParkedBundle {
+                    spend: *spend,
+                    bundle: hex::encode(bytes),
+                    payer: pushed.payer.map(|p| p.hex()),
+                })
+            })
             .collect();
         bundles.sort_by_key(|b| b.spend);
         let settling: Vec<SettlingSpend> = self
@@ -826,6 +998,7 @@ impl WalletLease {
                     spent_at: s.spent_at,
                     coins: s.coins.iter().map(|c| SettlingCoin { coin: hex::encode(c.coin_id), seen_at: c.seen_at }).collect(),
                     bundle: hex::encode(bytes),
+                    payer: s.payer.map(|p| p.hex()),
                 })
             })
             .collect();
@@ -943,7 +1116,7 @@ impl WalletLease {
             .filter_map(|d| {
                 let bundle = d.bundle.clone()?;
                 let spent_at = d.coins.iter().filter_map(|c| spent_heights.get(&c.coin_id).copied()).max()?;
-                Some((d.spend, Settling { coins: d.coins.clone(), spent_at, bundle }))
+                Some((d.spend, Settling { coins: d.coins.clone(), spent_at, bundle, payer: d.payer }))
             })
             .collect();
         let mut reparked = Vec::new();
@@ -1073,12 +1246,19 @@ pub fn settling_step(
 ///
 /// Callers hold the lease gate. For the dish's TAKE the input is the FAUCET
 /// coin, not ours: parking it keeps a second TAKE off it the same way.
+///
+/// `payer` is who pays for the spend ([`Payer`], stage 4 design §4.4),
+/// parked with it in the same write: the key that signs it, or for the
+/// dish's TAKE, which no key signs, the money address it pays into. A
+/// required argument with no default, on every way to park outside the
+/// tests, so no caller parks a spend without saying whose it is.
 pub async fn push_parked<I: Into<ParkedInput>>(
     client: &impl ChainAccess,
+    payer: Payer,
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
-    push_parked_with(&WALLET_LEASE, client, bundle, inputs).await
+    push_parked_with(&WALLET_LEASE, client, payer, bundle, inputs).await
 }
 
 /// [`push_parked`] against a given lease (the process-wide one in production;
@@ -1090,10 +1270,11 @@ pub async fn push_parked<I: Into<ParkedInput>>(
 pub async fn push_parked_with<I: Into<ParkedInput>>(
     lease: &WalletLease,
     client: &impl ChainAccess,
+    payer: Payer,
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
-    let parking = lease.park_with_bundle(inputs, &bundle).map_err(PushError::NotSent)?;
+    let parking = lease.park_with_bundle(inputs, &bundle, payer).map_err(PushError::NotSent)?;
     match client.push_tx(bundle).await {
         Ok(()) => Ok(()),
         Err(ChainError::Refused(why)) => {
@@ -1839,15 +2020,20 @@ pub fn presence_memo(
     Ok((Bytes32::new(chia_lane::derive_ck_hint(net, ck, era)), sealed))
 }
 
-/// What an era-bound write left behind: the INPUT coin its spend consumed and
-/// whether the peers acknowledged the push. An unanswered push (`acked`
+/// What an era-bound write left behind: the coins it is found and judged by
+/// and whether the peers acknowledged the push. An unanswered push (`acked`
 /// false) is a write all the same — its input is parked and the bundle may be
 /// in a mempool — so the knock, beacon and presence writers file it as
 /// pending, like an acknowledged one, and let the chain settle it (#272
 /// review; the presence writer since the Phone Book icon's follow-up, which
 /// gave its mark the coin to judge).
 pub struct MemoWrite {
-    pub coin: Bytes32,
+    /// The coins the write is found and judged by (stage 4 design §4.4): its
+    /// `parent`, which the write's own coin names under its hint and which a
+    /// mark files, and its `parked` input, which the lease holds and the
+    /// verdict's spent-height and lease lookups ask about. One coin for every
+    /// write of this build: the INPUT its spend-to-self consumed.
+    pub coins: WriteCoins,
     pub acked: bool,
     /// The lease's number for the spend (#272 review round 12), kept beside
     /// the write so its verdicts can ask whether the lease still holds it
@@ -1859,25 +2045,35 @@ pub struct MemoWrite {
 /// The shared tail of every era-bound write (presence, knock, beacon): under
 /// the lease, reconcile, refuse while a spend of ours is still settling, pick
 /// the payer's largest free coin, spend it to itself carrying `[hint, body]`,
-/// push with the input parked. Returns what the write left behind
-/// ([`MemoWrite`]): the INPUT coin's id — the write's own coin names it as
-/// parent, which is how the write is found again under its hint and judged
-/// ([`crate::chia_resolve::write_standing`]) — and whether the push was
-/// acknowledged.
+/// push with the input parked under its payer ([`Payer::of`] the key that
+/// pays: the wallet's for presence and knocks, the beacon's own for the
+/// beacon). Returns what the write left behind ([`MemoWrite`]): the INPUT
+/// coin's id as both of its coins — the write's own coin names it as parent,
+/// which is how the write is found again under its hint and judged
+/// ([`crate::chia_resolve::write_standing`]), and the lease parked it — and
+/// whether the push was acknowledged.
 ///
 /// Refusing while a spend settles (#231 P6a): a wallet holding more coins
 /// would spend ANOTHER one beside the pending write — two records landing for
 /// one era, the era's write budget paid twice. The confirmation timeout is a
 /// retry for a spend the mempool DROPPED, so a pending one waits for
 /// reconciliation's verdict (the heartbeat tries again on its retry cadence).
+/// The check is the global one, whatever the pending spend's payer: a pending
+/// beacon spend holds the listing and the knocks here and a pending listing
+/// holds the beacon, which is why the beacon lands just after the listing
+/// (stage 4 design §2, §4.3 T5). Asking per payer
+/// ([`WalletLease::outgoing_pending_for`]) is the burner writers' (design
+/// §13, PR 10), with the spacing that keeps two payers' pushes apart (§4.3 T4).
 async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<MemoWrite> {
     publish_memo_with(payer, hint, None, move |_| Ok(body), what).await
 }
 
 /// [`publish_memo`] whose body is built once the INPUT coin is chosen: `body`
-/// gets the input's id — the parent of the coin the memo will ride on — so a
-/// knock can bind its sealing to it ([`chia_lane::seal_to_kx`], #272 review
-/// round 3). With a `gate`, `body` runs and the spend is pushed UNDER it: a
+/// gets the id of the coin the carrier will name as its PARENT — here the
+/// input, which a spend-to-self's new coin names (a burner's first write will
+/// pass the gift g, stage 4 design §4.1) — so a knock can bind its sealing to
+/// it ([`chia_lane::seal_to_kx`], #272 review round 3). With a `gate`, `body`
+/// runs and the spend is pushed UNDER it: a
 /// knock's authorization is read again there, after the lease and coin
 /// lookups, so a room's word that changed while the spend was prepared is seen
 /// (`body` answers [`Withdrawn`]) and no cap can land between that check and
@@ -1907,8 +2103,10 @@ async fn publish_memo_with(
     };
     let body = body(input)?;
     let bundle = build_publish_bundle(crate::chia_network::net(), payer, coin.coin, hint, Bytes::new(body))?;
-    match push_parked(&client, bundle, [(input, coin.confirmed_height)]).await {
-        Ok(()) => Ok(MemoWrite { coin: input, acked: true, spend: WALLET_LEASE.spend_of(&input) }),
+    // The spend's number is the lease's for its PARKED input, the coin it holds.
+    let coins = WriteCoins::one(input);
+    match push_parked(&client, Payer::of(payer), bundle, [(input, coin.confirmed_height)]).await {
+        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked) }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
         // pending and lets the chain's word settle it — filed as a failure it
@@ -1916,7 +2114,7 @@ async fn publish_memo_with(
         // coin (#272 review).
         Err(PushError::Unanswered(e)) => {
             eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
-            Ok(MemoWrite { coin: input, acked: false, spend: WALLET_LEASE.spend_of(&input) })
+            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked) })
         }
         Err(e) => Err(e.into()),
     }
@@ -2060,50 +2258,78 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
 /// input listed spent with no coin under the hint by a fork between the two
 /// lookups reads pending, not dead.
 pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-    write_standing_of(client, &mark.coin_id, &mark.hint, mark.spend, mark.confirmed_height, "beacon").await
+    let coins = WriteCoins::filed(&mark.coin_id)?;
+    let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
+    write_standing_of(client, coins, hint, mark.spend, mark.confirmed_height, "beacon").await
 }
 
 /// 📖 The chain's word on this node's presence write ([`beacon_standing`] for
 /// the listing the Phone Book's icon stands on): its standing, and whether a
 /// listing judged past the height it was confirmed at lacks its coin.
 pub async fn presence_standing(client: &impl ChainAccess, mark: &NodePublishMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-    write_standing_of(client, &mark.coin_id, &mark.hint, mark.spend, mark.confirmed_height, "presence").await
+    let coins = WriteCoins::filed(&mark.coin_id)?;
+    let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
+    write_standing_of(client, coins, hint, mark.spend, mark.confirmed_height, "presence").await
 }
 
-/// The shared lookup behind [`beacon_standing`] and [`presence_standing`]: the
-/// lease's word on the input `coin_id` and whether it still holds `spend`,
-/// then the coin under `hint` and the input's spent height, judged together
-/// by [`crate::chia_resolve::write_standing`]; `None` when the chain could
-/// not be asked, or the mark names no coin or hint (nothing to judge).
+/// The shared lookup behind [`beacon_standing`] and [`presence_standing`], on
+/// the process-wide lease and network: [`write_standing_on`]. The callers
+/// parse the mark's coin and hint first, so a mark that names none, or a
+/// malformed one, is `None` (nothing to judge) before the lease is asked.
 async fn write_standing_of(
     client: &impl ChainAccess,
-    coin_id: &str,
-    hint: &str,
+    coins: WriteCoins,
+    hint: Bytes32,
     spend: Option<u64>,
     confirmed_height: u32,
     what: &str,
 ) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-    let coin = crate::chia_resolve::parse_hex32(coin_id)?;
-    let hint = crate::chia_resolve::parse_hex32(hint)?;
+    write_standing_on(&WALLET_LEASE, crate::chia_network::net(), client, coins, hint, spend, confirmed_height, what).await
+}
+
+/// A write's standing against `lease` on `net` (the process-wide ones in
+/// production; tests bring their own, and read no environment): the lease's
+/// word on the write's input and whether it still holds `spend`, then the
+/// write's own coin under `hint` and the input's spent height, judged
+/// together by [`crate::chia_resolve::write_standing`], with whether a
+/// listing judged past `confirmed_height` lacks the coin; `None` when the
+/// chain could not be asked. Each lookup asks about its own coin of the write
+/// (stage 4 design §4.4): the lease's word and the spent height about
+/// `coins.parked`, the input the lease parked for the spend, and the hint
+/// lookup about `coins.parent`, which the write's own coin names as its
+/// parent. One coin for every write of this build, so every lookup is the one
+/// it always was, in the order it always ran: the lease first (#272 review
+/// round 2), then the hint, then the input.
+#[allow(clippy::too_many_arguments)]
+async fn write_standing_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    coins: WriteCoins,
+    hint: Bytes32,
+    spend: Option<u64>,
+    confirmed_height: u32,
+    what: &str,
+) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
     let spends: Vec<u64> = spend.into_iter().collect();
-    let (words, held) = lease_standing(client, &[coin], &spends).await;
-    let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
+    let (words, held) = lease_standing_on(lease, net, client, &[coins.parked], &spends).await;
+    let word = words.get(&coins.parked).copied().unwrap_or(LeaseWord::Unknown);
     let ours = spend.is_some_and(|s| held.contains(&s));
-    let child = match crate::chia_resolve::child_under_hint(client, hint, coin).await {
+    let child = match crate::chia_resolve::child_under_hint(client, hint, coins.parent).await {
         Ok(child) => child,
         Err(e) => {
             eprintln!("⛓️ ChiaHub {what}: could not read under the {what} hint: {e:#}");
             return None;
         }
     };
-    let spent_at = match crate::chia_resolve::spent_heights(client, vec![coin]).await {
-        Ok(spent) => spent.into_iter().find(|(c, _)| *c == coin).map(|(_, h)| h),
+    let spent_at = match crate::chia_resolve::spent_heights(client, vec![coins.parked]).await {
+        Ok(spent) => spent.into_iter().find(|(c, _)| *c == coins.parked).map(|(_, h)| h),
         Err(e) => {
             eprintln!("⛓️ ChiaHub {what}: could not read the {what}'s input: {e:#}");
             return None;
         }
     };
-    Some((crate::chia_resolve::write_standing(&child, spent_at, lease, ours), child.gone_since(confirmed_height)))
+    Some((crate::chia_resolve::write_standing(&child, spent_at, word, ours), child.gone_since(confirmed_height)))
 }
 
 /// 📖 What the heartbeat does with a judged presence mark ([`presence_step`]).
@@ -2218,11 +2444,24 @@ pub fn beacon_step(mark: &BeaconMark, word: Option<(crate::chia_resolve::WriteSt
 /// asked BEFORE the chain lookups, so a write confirming in between is seen
 /// by them (#272 review round 2).
 pub async fn lease_standing(client: &impl ChainAccess, coins: &[Bytes32], spends: &[u64]) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
-    let _gate = WALLET_LEASE.lock().await;
-    WALLET_LEASE.reconcile(client).await;
+    lease_standing_on(&WALLET_LEASE, crate::chia_network::net(), client, coins, spends).await
+}
+
+/// [`lease_standing`] against a given lease on `net` (the tests' lease and
+/// network): the gate held across the reconciliation and the two reads, as
+/// [`WalletLease::reconcile`] runs it.
+async fn lease_standing_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    coins: &[Bytes32],
+    spends: &[u64],
+) -> (HashMap<Bytes32, LeaseWord>, HashSet<u64>) {
+    let _gate = lease.lock().await;
+    lease.reconcile_at(net, client, Instant::now()).await;
     (
-        coins.iter().map(|c| (*c, WALLET_LEASE.lease_word(c))).collect(),
-        spends.iter().copied().filter(|s| WALLET_LEASE.holds_spend(*s)).collect(),
+        coins.iter().map(|c| (*c, lease.lease_word(c))).collect(),
+        spends.iter().copied().filter(|s| lease.holds_spend(*s)).collect(),
     )
 }
 
@@ -2649,7 +2888,7 @@ pub async fn heartbeat_loop(
                                 // back the marks of older nodes.
                                 confirmed: false,
                                 chain_seen: false,
-                                coin_id: hex::encode(write.coin.to_bytes()),
+                                coin_id: hex::encode(write.coins.parent.to_bytes()),
                                 confirmed_height: 0,
                                 settled: false,
                                 spend: write.spend,
@@ -2772,7 +3011,7 @@ pub async fn heartbeat_loop(
                             room: req.room.clone(),
                             era,
                             hint: hint_hex,
-                            coin_id: hex::encode(write.coin.to_bytes()),
+                            coin_id: hex::encode(write.coins.parent.to_bytes()),
                             pushed_at: now_unix,
                             confirmed_height: 0,
                             last_rendezvous: 0,
@@ -2892,7 +3131,7 @@ pub async fn heartbeat_loop(
                                 last_at: now_unix,
                                 hint: hex::encode(hint.to_bytes()),
                                 node_id: Some(self_id.clone()),
-                                coin_id: hex::encode(write.coin.to_bytes()),
+                                coin_id: hex::encode(write.coins.parent.to_bytes()),
                                 confirmed: false,
                                 confirmed_height: 0,
                                 settled: false,
@@ -3024,7 +3263,7 @@ pub async fn publish_presence(
     // 3. Build + sign the spend-to-self, then push to the mempool with the coin
     //    parked first (push_parked: a timed-out push may still have landed).
     let bundle = build_publish_bundle(crate::chia_network::net(), chia_sk, coin.coin, hint, ciphertext)?;
-    push_parked(&client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
+    push_parked(&client, Payer::of(chia_sk), bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(hint)
 }
 
@@ -3034,6 +3273,22 @@ mod tests {
 
     /// The network the lease tests reconcile on, unless they name another.
     const T11: crate::chia_network::ChiaNet = crate::chia_network::ChiaNet::Testnet11;
+
+    /// The payers the lease tests park under (stage 4 design §4.4): the
+    /// money address a lease is restored with, the beacon's (a key of the
+    /// node's own that is not the wallet's), and a burner's. Fixed puzzle
+    /// hashes: no key is made.
+    fn money() -> Payer {
+        Payer(Bytes32::new([0xa0; 32]))
+    }
+
+    fn beacon() -> Payer {
+        Payer(Bytes32::new([0xb0; 32]))
+    }
+
+    fn burner() -> Payer {
+        Payer(Bytes32::new([0xc0; 32]))
+    }
 
     fn cap(key: u8, chia_mode: bool, public_room: Option<bool>) -> ChiaRoomCap {
         ChiaRoomCap { room_key: [key; 32], chia_mode, share_card: true, public_room, seq: 0, restored: false, pass_private: false, prefetch: false }
@@ -3291,10 +3546,10 @@ mod tests {
     fn a_release_remembers_why_and_the_lease_answers_parked_spent_dropped_or_unknown() {
         let coin = |seed: u8| Bytes32::new([seed; 32]);
         let due = vec![
-            DueSpend { spend: 1, coins: vec![coin(1).into(), coin(2).into()], bundle: None },
-            DueSpend { spend: 2, coins: vec![coin(3).into()], bundle: None },
-            DueSpend { spend: 3, coins: vec![(coin(4), 50).into()], bundle: None },
-            DueSpend { spend: 4, coins: vec![coin(5).into()], bundle: None },
+            DueSpend { spend: 1, coins: vec![coin(1).into(), coin(2).into()], bundle: None, payer: None },
+            DueSpend { spend: 2, coins: vec![coin(3).into()], bundle: None, payer: None },
+            DueSpend { spend: 3, coins: vec![(coin(4), 50).into()], bundle: None, payer: None },
+            DueSpend { spend: 4, coins: vec![coin(5).into()], bundle: None, payer: None },
         ];
         let spent: HashMap<Bytes32, bool> = [(coin(1), true), (coin(2), false), (coin(3), false), (coin(5), false)].into_iter().collect();
         let mempool: HashMap<u64, Option<bool>> = [(2, Some(false)), (4, Some(true))].into_iter().collect();
@@ -3310,7 +3565,7 @@ mod tests {
         );
         let lease = WalletLease::new();
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
-        let parking = lease.park_with_bundle([coin(9)], &bundle).unwrap();
+        let parking = lease.park_with_bundle([coin(9)], &bundle, money()).unwrap();
         lease.remember(&words);
         assert_eq!(lease.lease_word(&coin(9)), LeaseWord::Parked);
         assert_eq!(lease.lease_word(&coin(1)), LeaseWord::Spent);
@@ -3319,7 +3574,7 @@ mod tests {
         assert_eq!(lease.lease_word(&coin(4)), LeaseWord::Unknown, "released on silence: unknown");
         assert_eq!(lease.lease_word(&coin(5)), LeaseWord::Unknown, "still due, never parked here: unknown");
         // A coin parked again by a later spend reads as parked over its old word.
-        let _again = lease.park_with_bundle([coin(3)], &bundle).unwrap();
+        let _again = lease.park_with_bundle([coin(3)], &bundle, money()).unwrap();
         assert_eq!(lease.lease_word(&coin(3)), LeaseWord::Parked);
         lease.unpark(&parking);
         assert_eq!(lease.lease_word(&coin(9)), LeaseWord::Unknown, "handed back by a rejection: no verdict, unknown");
@@ -3473,7 +3728,7 @@ mod tests {
         // No timer releases it, however long the spend waits in the mempool:
         // only the chain/mempool verdict does (release).
         assert!(lease.due_at(t0 + Duration::from_secs(5)).is_empty(), "inside the grace: not asked yet");
-        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a.into()], bundle: None }]);
+        assert_eq!(lease.due_at(t0 + RECONCILE_GRACE), vec![DueSpend { spend: parking.spend, coins: vec![a.into()], bundle: None, payer: None }]);
         lease.release(&[parking.spend]);
         assert!(!lease.is_pending(&a));
         lease.park_at([b], t0).unwrap();
@@ -3515,7 +3770,7 @@ mod tests {
         // both coins stay parked and come due for reconciliation after the grace,
         // as ONE spend.
         let due = lease.due_at(t0 + RECONCILE_GRACE);
-        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a.into(), b.into()], bundle: None }]);
+        assert_eq!(due, vec![DueSpend { spend: parking.spend, coins: vec![a.into(), b.into()], bundle: None, payer: None }]);
         // An explicit rejection hands exactly this parking back.
         lease.unpark(&parking);
         assert!(!lease.is_pending(&a) && !lease.is_pending(&b));
@@ -3535,7 +3790,7 @@ mod tests {
         let client = crate::chia_chain::testing::Unanswering;
         let coin = Bytes32::new([42u8; 32]);
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
-        let outcome = tokio::time::timeout(Duration::from_secs(20), push_parked(&client, bundle, [coin]))
+        let outcome = tokio::time::timeout(Duration::from_secs(20), push_parked(&client, money(), bundle, [coin]))
             .await
             .expect("the test chain answers at once");
         assert!(matches!(outcome, Err(PushError::Unanswered(_))), "{outcome:?}");
@@ -3552,17 +3807,17 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ssf-lease-one-write-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let lease = WalletLease::new();
-        lease.restore(&path);
+        lease.restore(&path, money());
         let ours = Bytes32::new([5u8; 32]);
         let bundle = SpendBundle::new(vec![], Signature::default());
-        let parking = lease.park_with_bundle([ours], &bundle).unwrap();
+        let parking = lease.park_with_bundle([ours], &bundle, money()).unwrap();
         let file: LeaseFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(file.parked.len(), 1, "the coin is parked");
         assert_eq!(file.bundles.len(), 1, "and its bundle is in the same file, from the same write");
         assert_eq!(file.bundles[0].spend, parking.spend);
         // Restored after a crash, the spend still carries the bundle to ask the peers with.
         let again = WalletLease::new();
-        again.restore(&path);
+        again.restore(&path, money());
         let due = again.due_at(Instant::now() + RECONCILE_GRACE + Duration::from_secs(1));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].bundle.as_ref().map(|b| b.name()), Some(bundle.name()));
@@ -3578,6 +3833,7 @@ mod tests {
             spend: n,
             coins: coins.iter().map(|c| ParkedInput { coin_id: *c, seen_at: Some(90) }).collect(),
             bundle: Some(SpendBundle::new(vec![], Signature::default())),
+            payer: None,
         };
         // 1 confirmed (its input spent); 2 dropped (unspent, gone from the
         // mempool); 3 waiting (unspent, in the mempool); 4 unknown (unspent,
@@ -3675,7 +3931,7 @@ mod tests {
         let faucet_coin = Bytes32::new([6u8; 32]);
         // First run: nothing on disk yet; a give and a claim park their coins.
         let first = WalletLease::new();
-        first.restore(&path);
+        first.restore(&path, money());
         assert!(!path.exists() && first.ensure_open().is_ok());
         let on_disk = || std::fs::read_to_string(&path).unwrap();
         let give = first.park([ours]).unwrap();
@@ -3688,7 +3944,7 @@ mod tests {
         // Second run (a restart): the lease starts empty and takes the parking back…
         let second = WalletLease::new();
         assert!(!second.is_pending(&ours));
-        second.restore(&path);
+        second.restore(&path, money());
         assert!(second.is_pending(&ours) && second.is_pending(&faucet_coin));
         assert!(second.outgoing_pending() && second.incoming_pending());
         // …due for reconciliation after a FRESH grace (a restart can fall inside
@@ -3705,7 +3961,7 @@ mod tests {
         second.release(&[give.spend]);
         assert!(!on_disk().contains(&hex::encode(ours)));
         let third = WalletLease::new();
-        third.restore(&path);
+        third.restore(&path, money());
         assert!(!third.is_pending(&ours) && third.is_pending(&faucet_coin) && third.incoming_pending());
         // A file that exists but cannot be read SEALS the lease (round 19): the
         // spends it held may be live, so nothing parks and no spend leaves, and
@@ -3730,14 +3986,21 @@ mod tests {
             format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[],"bundle":"{empty_bundle}"}}]}}"#),
             format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":0,"coins":[{{"coin":"{one}"}}],"bundle":"{empty_bundle}"}}]}}"#),
             format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[{{"coin":"{one}"}}],"bundle":"zz"}}]}}"#),
+            // Stage 4 design §4.4: a malformed payer on a parked spend's
+            // bundle, and on a settling spend.
+            format!(r#"{{"v":1,"spends":1,"parked":[{{"coin":"{one}","spend":1}}],"bundles":[{{"spend":1,"bundle":"{empty_bundle}","payer":"zz"}}]}}"#),
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[{{"coin":"{one}"}}],"bundle":"{empty_bundle}","payer":"zz"}}]}}"#),
         ];
         for text in &broken {
             let bytes = text.as_bytes();
             std::fs::write(&path, bytes).unwrap();
             let sealed = WalletLease::new();
-            sealed.restore(&path);
+            sealed.restore(&path, money());
             assert!(matches!(sealed.ensure_open(), Err(LeaseError::Sealed(_))), "{}", String::from_utf8_lossy(bytes));
             assert!(!sealed.is_pending(&faucet_coin) && !sealed.incoming_pending());
+            // Checked whole before anything is taken (round 21): the broken
+            // file's own coin and spend are not half restored either.
+            assert!(!sealed.is_taken(&Bytes32::new([1u8; 32])) && !sealed.holds_spend(1), "{}", String::from_utf8_lossy(bytes));
             assert!(matches!(sealed.park([ours]), Err(LeaseError::Sealed(_))));
             assert!(matches!(sealed.mark_incoming(faucet_coin), Err(LeaseError::Sealed(_))));
             assert!(!sealed.is_pending(&ours) && !sealed.incoming_pending());
@@ -3753,7 +4016,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("wallet_lease.json");
         let lease = WalletLease::new();
-        lease.restore(&path); // a missing file is a first run: the store is named, nothing is sealed
+        lease.restore(&path, money()); // a missing file is a first run: the store is named, nothing is sealed
         assert!(lease.ensure_open().is_ok());
         let ours = Bytes32::new([8u8; 32]);
         let faucet_coin = Bytes32::new([9u8; 32]);
@@ -3765,7 +4028,7 @@ mod tests {
         // (had it been, the test chain would have read unanswered).
         let client = crate::chia_chain::testing::Unanswering;
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
-        let outcome = push_parked_with(&lease, &client, bundle, [ours]).await;
+        let outcome = push_parked_with(&lease, &client, money(), bundle, [ours]).await;
         assert!(matches!(outcome, Err(PushError::NotSent(LeaseError::Unsaved(_)))), "{outcome:?}");
         assert!(!lease.is_pending(&ours));
         let text = outcome.unwrap_err().to_string();
@@ -3847,9 +4110,9 @@ mod tests {
         let bundle = SpendBundle::new(vec![], Signature::default());
         let t0 = Instant::now();
         let lease = WalletLease::new();
-        lease.restore(&path);
+        lease.restore(&path, money());
         assert!(!lease.holds_spend(1) && lease.spend_of(&id).is_none(), "nothing parked: no spend is held");
-        let parking = lease.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        let parking = lease.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
         let n = parking.spend;
         assert_eq!(lease.spend_of(&id), Some(n), "the writer learns its spend's number from the parking");
         assert!(lease.holds_spend(n) && !lease.holds_spend(n + 1));
@@ -3860,7 +4123,7 @@ mod tests {
         assert_eq!(lease.spend_of(&id), None, "settling is not parked");
         // Across a restart, by the same number.
         let again = WalletLease::new();
-        again.restore(&path);
+        again.restore(&path, money());
         assert!(again.holds_spend(n), "the number outlives the restart with the settling record");
         // The block gone: parked again under its number — held.
         again.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
@@ -3874,7 +4137,7 @@ mod tests {
         assert!(!again.holds_spend(n) && !again.is_taken(&id));
         // A spend released on the peers' refusal is held no more either.
         let other = WalletLease::new();
-        let p = other.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        let p = other.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
         assert!(other.holds_spend(p.spend));
         other.release(&[p.spend]);
         assert!(!other.holds_spend(p.spend) && other.spend_of(&id).is_none());
@@ -3899,13 +4162,13 @@ mod tests {
         let bundle = SpendBundle::new(vec![], Signature::default());
         // A normal run parks a spend and stops before it settles.
         let before = WalletLease::new();
-        before.restore(&path);
-        before.park_with_bundle_at([(id, 900)], Some(&bundle), Instant::now()).unwrap();
+        before.restore(&path, money());
+        before.park_with_bundle_at([(id, 900)], Some((&bundle, money())), Instant::now()).unwrap();
         let written = std::fs::read(&path).unwrap();
         // Chia off: the parking, asked about against the closed lane past
         // every grace, stays as it was, on disk too.
         let off = WalletLease::new();
-        off.restore(&path);
+        off.restore(&path, money());
         let later = Instant::now() + RECONCILE_GRACE * 3;
         assert_eq!(off.due_at(later).len(), 1, "the spend is due a lookup, so the lane is asked");
         let closed = PeerLane::new(std::sync::Arc::new(Lane::closed(crate::chia_peer::Network::testnet11(), "SSF_NO_CHIA_LANE")), Trust::Agreed);
@@ -3914,7 +4177,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), written, "the lease file is as the last normal run left it");
         // The next normal start: restored, the chain lists the input spent.
         let next = WalletLease::new();
-        next.restore(&path);
+        next.restore(&path, money());
         assert!(next.is_parked(&id));
         let spent = Scripted::new(vec![CoinListing {
             records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: true, spent_block_index: 1000 }],
@@ -3954,8 +4217,8 @@ mod tests {
         let bundle = SpendBundle::new(vec![], Signature::default());
         let t0 = Instant::now();
         let lease = WalletLease::new();
-        lease.restore(&path);
-        let parking = lease.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        lease.restore(&path, money());
+        let parking = lease.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
         assert!(lease.is_taken(&id));
         // Past the grace the chain lists the input spent at 1000: the spend is
         // released as spent — its coin no longer parked, the wallet not
@@ -3973,7 +4236,7 @@ mod tests {
         assert_eq!((file.settling[0].spend, file.settling[0].spent_at, file.settling[0].coins[0].seen_at), (parking.spend, 1000, Some(900)));
         // Across a restart the settlement is still open, with the word.
         let again = WalletLease::new();
-        again.restore(&path);
+        again.restore(&path, money());
         assert!(again.is_settling(&id) && !again.is_parked(&id) && again.is_taken(&id));
         assert_eq!(again.lease_word(&id), LeaseWord::Spent, "the word outlives the restart");
         // Peers behind the spend list the input unspent, an undated listing
@@ -4014,7 +4277,7 @@ mod tests {
         assert!(again.is_settling(&id), "deep from the first inclusion, shallow from the block that holds it: still settling");
         // … across a restart …
         let third = WalletLease::new();
-        third.restore(&path);
+        third.restore(&path, money());
         assert!(third.is_settling(&id) && !third.is_parked(&id));
         assert_eq!(third.lease_word(&id), LeaseWord::Spent);
         // … and found spent SETTLED_DEPTH deep from there, at the listing's own height: final.
@@ -4026,7 +4289,7 @@ mod tests {
         // from a complete listing judged past the coin's own confirmation — has
         // nothing left to settle or to push: forgotten.
         let other = WalletLease::new();
-        other.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        other.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
         other.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
         assert!(other.is_settling(&id));
         other.reconcile_at(T11, &empty(false, Some(899)), t1).await;
@@ -4044,9 +4307,9 @@ mod tests {
         // the older spend is parked again (compare-and-release); an older
         // spend none of whose coins is free again is forgotten, bundle and all.
         let raced = WalletLease::new();
-        let old = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t0).unwrap();
+        let old = raced.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
         raced.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
-        let newer = raced.park_with_bundle_at([(id, 900)], Some(&bundle), t1).unwrap();
+        let newer = raced.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t1).unwrap();
         assert!(raced.is_parked(&id) && raced.is_settling(&id));
         raced.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
         assert!(raced.is_parked(&id) && !raced.is_settling(&id));
@@ -4092,12 +4355,12 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             // The older build parked the spend with its bundle, and stopped.
             let before = WalletLease::new();
-            before.restore(&path);
-            before.park_with_bundle([(id, 900)], &bundle).unwrap();
+            before.restore(&path, money());
+            before.park_with_bundle([(id, 900)], &bundle, money()).unwrap();
             // This build takes the parking back; past the grace the chain
             // lists the input unspent.
             let lease = WalletLease::new();
-            lease.restore(&path);
+            lease.restore(&path, money());
             let t1 = Instant::now() + RECONCILE_GRACE;
             let chain = listing(None, 1000);
             lease.reconcile_at(net, &chain, t1).await;
@@ -4140,6 +4403,812 @@ mod tests {
         assert!(lease.outgoing_pending() && !lease.incoming_pending());
         lease.release(&[give.spend]);
         assert!(!lease.outgoing_pending());
+    }
+
+    /// Stage 4 design §4.4: a spend's payer is the key that pays for it, by
+    /// the puzzle hash its coins are locked to.
+    #[test]
+    fn a_payer_is_the_puzzle_hash_its_key_pays_from() {
+        let sk = SecretKey::from_seed(&[21u8; 32]);
+        assert_eq!(Payer::of(&sk), Payer(our_puzzle_hash(&sk)));
+        assert_eq!(Payer::of(&sk).hex(), hex::encode(our_puzzle_hash(&sk)), "the file names it by that hash");
+        assert_ne!(Payer::of(&beacon_wallet_key(&sk)), Payer::of(&sk), "the beacon pays from a key of its own (D7): another payer");
+        assert_ne!(Payer::of(&SecretKey::from_seed(&[22u8; 32])), Payer::of(&sk));
+    }
+
+    /// Stage 4 design §4.4: the payer lands in the parking's one write, beside
+    /// its bundle, in a file that stays version 1, and a restart takes it back
+    /// with the parking.
+    #[test]
+    fn a_payer_is_saved_with_its_parking_and_restored_after_a_restart() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-payer-saved-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let id = Bytes32::new([31u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let parking = lease.park_with_bundle([(id, 900)], &bundle, beacon()).unwrap();
+        let file: LeaseFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.v, 1, "the field is additive: still version 1");
+        assert_eq!((file.parked.len(), file.bundles.len()), (1, 1));
+        assert_eq!(
+            (file.bundles[0].spend, file.bundles[0].payer.clone()),
+            (parking.spend, Some(beacon().hex())),
+            "the payer is in the same write as the coin and its bundle"
+        );
+        assert!(lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(money()));
+        // Restored after a restart: the spend still holds its own payer's
+        // writes, and no other payer's.
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert!(again.outgoing_pending_for(beacon()), "the payer outlives the restart with its parking");
+        assert!(!again.outgoing_pending_for(money()) && !again.outgoing_pending_for(burner()));
+        assert!(again.outgoing_pending(), "the global check counts it whatever its payer");
+        let due = again.due_at(Instant::now() + RECONCILE_GRACE + Duration::from_secs(1));
+        assert_eq!(due.iter().map(|d| (d.spend, d.payer)).collect::<Vec<_>>(), vec![(parking.spend, Some(beacon()))]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stage 4 design §4.4 with #272 review round 10: the payer goes wherever
+    /// the bundle goes — settling when the spend is included, back into the
+    /// parking when its block goes, forgotten with the spend once it is
+    /// settled — and a re-parked spend none of whose coins is free leaves
+    /// neither.
+    #[tokio::test]
+    async fn a_payer_rides_its_spend_through_settling_and_parking_again() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_knock::SETTLED_DEPTH;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-payer-rides-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let ours = Coin::new(Bytes32::new([32u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let id = ours.coin_id();
+        let listing = |spent: Option<u32>, judged_at: Option<u32>| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at,
+            }])
+        };
+        let on_disk = || serde_json::from_slice::<LeaseFile>(&std::fs::read(&path).unwrap()).unwrap();
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let parking = lease.park_with_bundle_at([(id, 900)], Some((&bundle, beacon())), t0).unwrap();
+        // Included: settling with its bundle and its payer, in the file too.
+        let t1 = t0 + RECONCILE_GRACE;
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
+        assert!(lease.is_settling(&id));
+        assert!(!lease.outgoing_pending_for(beacon()), "settling is not spending, for its payer as for the global check");
+        let file = on_disk();
+        assert!(file.bundles.is_empty());
+        assert_eq!((file.settling.len(), file.settling[0].payer.clone()), (1, Some(beacon().hex())), "the payer is kept settling with its bundle");
+        // Across a restart, the block gone: parked again under its own number,
+        // bundle and payer.
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        again.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
+        assert!(again.is_parked(&id));
+        assert!(again.outgoing_pending_for(beacon()) && !again.outgoing_pending_for(money()), "parked again, it holds its own payer's writes alone");
+        let file = on_disk();
+        assert_eq!(
+            file.bundles.iter().map(|b| (b.spend, b.payer.clone())).collect::<Vec<_>>(),
+            vec![(parking.spend, Some(beacon().hex()))],
+            "the payer goes back into the parking with the bundle"
+        );
+        // Landed again: settling anew, the payer carried from the parking …
+        let t2 = t1 + RECONCILE_GRACE;
+        again.reconcile_at(T11, &listing(Some(1005), Some(1006)), t2).await;
+        assert!(again.is_settling(&id));
+        assert_eq!(on_disk().settling[0].payer, Some(beacon().hex()));
+        // … and settled SETTLED_DEPTH deep: forgotten, its payer with it.
+        again.reconcile_at(T11, &listing(Some(1005), Some(1005 + SETTLED_DEPTH)), t2).await;
+        assert!(!again.is_taken(&id) && !again.outgoing_pending_for(beacon()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("payer"), "no payer outlives its spend: {text}");
+        // A newer spend, of another payer, took the coin meanwhile: the old
+        // spend parked again finds no coin free, and leaves neither bundle nor
+        // payer (no bundle parks no coin, round 10).
+        let raced = WalletLease::new();
+        raced.park_with_bundle_at([(id, 900)], Some((&bundle, beacon())), t0).unwrap();
+        raced.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
+        let newer = raced.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t1).unwrap();
+        raced.reconcile_at(T11, &listing(None, Some(1000)), t1).await;
+        assert!(raced.is_parked(&id) && !raced.is_settling(&id));
+        assert_eq!(
+            raced.snapshot().bundles.iter().map(|b| (b.spend, b.payer.clone())).collect::<Vec<_>>(),
+            vec![(newer.spend, Some(money().hex()))],
+            "the newer marker stands with its own payer"
+        );
+        assert!(raced.outgoing_pending_for(money()) && !raced.outgoing_pending_for(beacon()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §4.4: "a parking without the field counts as the money
+    /// address". The file an older node wrote — a spend parked with its
+    /// bundle (S-0 step 2), one parked before bundles were kept (no bundle,
+    /// no height), a TAKE with the marker, a settling spend — loads, and
+    /// every spend in it is the wallet's own, the one the restore named; no
+    /// save fills a payer in.
+    #[tokio::test]
+    async fn a_lease_file_without_payers_loads_and_its_spends_count_as_the_money_address() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-no-payers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let (give, old, take) = (Bytes32::new([41u8; 32]), Bytes32::new([42u8; 32]), Bytes32::new([43u8; 32]));
+        let settled = Coin::new(Bytes32::new([44u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let bundle = hex::encode(SpendBundle::new(vec![], Signature::default()).to_bytes().unwrap());
+        let (give_hex, old_hex, take_hex, settled_hex) = (hex::encode(give), hex::encode(old), hex::encode(take), hex::encode(settled.coin_id()));
+        let text = format!(
+            r#"{{"v":1,"spends":4,"parked":[{{"coin":"{give_hex}","spend":1,"seen_at":900}},{{"coin":"{old_hex}","spend":2}},{{"coin":"{take_hex}","spend":3,"seen_at":900}}],"incoming":"{take_hex}","bundles":[{{"spend":1,"bundle":"{bundle}"}},{{"spend":3,"bundle":"{bundle}"}}],"settling":[{{"spend":4,"spent_at":1000,"coins":[{{"coin":"{settled_hex}","seen_at":900}}],"bundle":"{bundle}"}}]}}"#
+        );
+        std::fs::write(&path, &text).unwrap();
+        let on_disk = || std::fs::read_to_string(&path).unwrap();
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        assert!(lease.ensure_open().is_ok(), "a file without payers loads");
+        assert!(lease.is_parked(&give) && lease.is_parked(&old) && lease.is_parked(&take) && lease.is_settling(&settled.coin_id()));
+        assert!(lease.incoming_pending(), "the TAKE still lands");
+        assert!(lease.outgoing_pending());
+        assert!(lease.outgoing_pending_for(money()), "its spends are the money address's");
+        assert!(!lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(burner()), "…and no other payer's");
+        // A change saves the file, and no payer is filled in: the file
+        // round-trips as the older node wrote it.
+        lease.release(&[1]);
+        assert!(!on_disk().contains("payer"), "{}", on_disk());
+        assert!(lease.outgoing_pending_for(money()), "the spend parked with no bundle, so with no payer, is the money address's");
+        assert!(!lease.outgoing_pending_for(beacon()));
+        // Its block gone, the settling spend is parked again: still the
+        // money address's.
+        let gone = Scripted::new(vec![CoinListing {
+            records: vec![CoinRecord { coin: settled, confirmed_block_index: 900, spent: false, spent_block_index: 0 }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(1000),
+        }]);
+        lease.reconcile_at(T11, &gone, Instant::now()).await;
+        assert!(lease.is_parked(&settled.coin_id()), "parked again");
+        lease.release(&[2]);
+        assert!(lease.outgoing_pending_for(money()) && !lease.outgoing_pending_for(beacon()), "parked again, it is the money address's");
+        assert!(!on_disk().contains("payer"), "{}", on_disk());
+        // With only the TAKE left parked, it is left out by the global check
+        // and by the money address's own alike.
+        lease.release(&[4]);
+        assert!(lease.is_parked(&take) && lease.incoming_pending());
+        assert!(!lease.outgoing_pending() && !lease.outgoing_pending_for(money()) && !lease.outgoing_pending_for(beacon()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §4.4: the field is additive and the file stays version
+    /// 1; any other version still seals, as it always did (round 21), payers
+    /// or not.
+    #[test]
+    fn the_lease_file_stays_version_1_and_a_version_2_file_still_seals() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-payer-v1-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let id = Bytes32::new([51u8; 32]);
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        lease.park_with_bundle([id], &SpendBundle::new(vec![], Signature::default()), beacon()).unwrap();
+        let snapshot = lease.snapshot();
+        assert_eq!((snapshot.v, snapshot.bundles[0].payer.clone()), (1, Some(beacon().hex())));
+        let mut v2 = serde_json::to_value(&snapshot).unwrap();
+        v2["v"] = serde_json::Value::from(2);
+        let bytes = serde_json::to_vec(&v2).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let sealed = WalletLease::new();
+        sealed.restore(&path, money());
+        assert!(matches!(sealed.ensure_open(), Err(LeaseError::Sealed(why)) if why.contains("version 2")));
+        assert!(!sealed.is_taken(&id) && !sealed.outgoing_pending_for(beacon()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "left for recovery");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stage 4 design §4.4 with #245 review rounds 19 and 21: a payer that is
+    /// not 32 bytes of hex, on a parked spend's bundle or on a settling spend,
+    /// seals the lease, checked with the rest of the file before anything is
+    /// taken, and the file is left for recovery. The control: the same file
+    /// with a well-formed payer loads.
+    #[test]
+    fn a_malformed_payer_seals_the_lease() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-payer-malformed-{}.json", std::process::id()));
+        let one = Bytes32::new([1u8; 32]);
+        let coin = hex::encode(one);
+        let bundle = hex::encode(SpendBundle::new(vec![], Signature::default()).to_bytes().unwrap());
+        let parked = |payer: &str| {
+            format!(r#"{{"v":1,"spends":1,"parked":[{{"coin":"{coin}","spend":1}}],"bundles":[{{"spend":1,"bundle":"{bundle}","payer":"{payer}"}}]}}"#)
+        };
+        let settling = |payer: &str| {
+            format!(r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":5,"coins":[{{"coin":"{coin}"}}],"bundle":"{bundle}","payer":"{payer}"}}]}}"#)
+        };
+        // A file shape: the file's text around a payer, and where the seal names it.
+        type Shape<'a> = (&'a dyn Fn(&str) -> String, &'a str);
+        let shapes: [Shape<'_>; 2] = [(&parked, "for spend #1"), (&settling, "for settling spend #1")];
+        let too_long = hex::encode([0xa0u8; 33]);
+        for (file, what) in shapes {
+            for bad in ["zz", "a0a0", too_long.as_str()] {
+                let text = file(bad);
+                std::fs::write(&path, &text).unwrap();
+                let sealed = WalletLease::new();
+                sealed.restore(&path, money());
+                let Err(LeaseError::Sealed(why)) = sealed.ensure_open() else { panic!("{text}: not sealed") };
+                assert!(why.contains("malformed payer") && why.contains(what), "{why}");
+                assert!(!sealed.is_taken(&one) && !sealed.holds_spend(1), "nothing of the file is taken: {text}");
+                assert!(matches!(sealed.park([one]), Err(LeaseError::Sealed(_))));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "left for recovery");
+            }
+            std::fs::write(&path, file(&beacon().hex())).unwrap();
+            let open = WalletLease::new();
+            open.restore(&path, money());
+            assert!(open.ensure_open().is_ok() && open.holds_spend(1), "{what}: a well-formed payer loads");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lease file's records as they stood before payers were filed
+    /// (origin/main at 2dd11e34, before stage 4 PR 7): the same serde
+    /// attributes, and no `payer`. An older node reads this build's file into
+    /// these, and writes them back.
+    mod before_payers {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        pub(super) struct LeaseFile {
+            pub(super) v: u32,
+            pub(super) spends: u64,
+            pub(super) parked: Vec<ParkedCoin>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(super) incoming: Option<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub(super) bundles: Vec<ParkedBundle>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub(super) settling: Vec<SettlingSpend>,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        pub(super) struct SettlingSpend {
+            pub(super) spend: u64,
+            pub(super) spent_at: u32,
+            pub(super) coins: Vec<SettlingCoin>,
+            pub(super) bundle: String,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        pub(super) struct SettlingCoin {
+            pub(super) coin: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(super) seen_at: Option<u32>,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        pub(super) struct ParkedCoin {
+            pub(super) coin: String,
+            pub(super) spend: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(super) seen_at: Option<u32>,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        pub(super) struct ParkedBundle {
+            pub(super) spend: u64,
+            pub(super) bundle: String,
+        }
+    }
+
+    /// What an older node keeps of a lease file this build wrote: everything
+    /// but the payers.
+    fn without_payers(file: &LeaseFile) -> before_payers::LeaseFile {
+        use before_payers as old;
+        old::LeaseFile {
+            v: file.v,
+            spends: file.spends,
+            parked: file.parked.iter().map(|c| old::ParkedCoin { coin: c.coin.clone(), spend: c.spend, seen_at: c.seen_at }).collect(),
+            incoming: file.incoming.clone(),
+            bundles: file.bundles.iter().map(|b| old::ParkedBundle { spend: b.spend, bundle: b.bundle.clone() }).collect(),
+            settling: file
+                .settling
+                .iter()
+                .map(|s| old::SettlingSpend {
+                    spend: s.spend,
+                    spent_at: s.spent_at,
+                    coins: s.coins.iter().map(|c| old::SettlingCoin { coin: c.coin.clone(), seen_at: c.seen_at }).collect(),
+                    bundle: s.bundle.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stage 4 design §4.4 and §8 (6): an older node reads a file this build
+    /// wrote — it denies no unknown field — with every coin, spend number,
+    /// bundle, settling spend, the counter and the marker, and what it writes
+    /// back has no payer. Restored by this build after such a rollback, every
+    /// coin is still held (nothing under-parked) and every spend is the money
+    /// address's: the beacon's spend among them, whose payer was lost.
+    #[tokio::test]
+    async fn an_older_node_reads_a_lease_file_with_payers_and_loses_nothing_it_knew() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-older-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let settles = Coin::new(Bytes32::new([61u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let (beacons, wallets, take) = (Bytes32::new([62u8; 32]), Bytes32::new([63u8; 32]), Bytes32::new([64u8; 32]));
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        lease.park_with_bundle_at([(settles.coin_id(), 900)], Some((&bundle, beacon())), t0).unwrap();
+        let included = Scripted::new(vec![CoinListing {
+            records: vec![CoinRecord { coin: settles, confirmed_block_index: 900, spent: true, spent_block_index: 1000 }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(1001),
+        }]);
+        lease.reconcile_at(T11, &included, t0 + RECONCILE_GRACE).await;
+        assert!(lease.is_settling(&settles.coin_id()));
+        lease.park_with_bundle([(beacons, 900)], &bundle, beacon()).unwrap();
+        lease.park_with_bundle([wallets], &bundle, money()).unwrap();
+        lease.park_with_bundle([take], &bundle, money()).unwrap();
+        lease.mark_incoming(take).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let ours: LeaseFile = serde_json::from_slice(&written).unwrap();
+        assert!(ours.bundles.iter().all(|b| b.payer.is_some()) && ours.settling.iter().all(|s| s.payer.is_some()), "this build names every payer");
+        let theirs: before_payers::LeaseFile = serde_json::from_slice(&written).unwrap();
+        assert_eq!(theirs, without_payers(&ours), "an older node reads all it knew");
+        assert_eq!((theirs.parked.len(), theirs.bundles.len(), theirs.settling.len(), theirs.incoming.is_some()), (3, 3, 1, true));
+        let rolled_back = serde_json::to_vec_pretty(&theirs).unwrap();
+        assert!(!String::from_utf8_lossy(&rolled_back).contains("payer"), "what it writes back names no payer");
+        std::fs::write(&path, &rolled_back).unwrap();
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert!(again.ensure_open().is_ok());
+        for coin in [settles.coin_id(), beacons, wallets, take] {
+            assert!(again.is_taken(&coin), "every coin is still held after the rollback");
+        }
+        assert!(again.outgoing_pending_for(money()));
+        assert!(!again.outgoing_pending_for(beacon()), "the payer lost in the rollback: the beacon's spend reads as the money address's");
+        assert_eq!(again.outgoing_pending(), lease.outgoing_pending(), "the global check is the same either side of the rollback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Forward compatibility, which the payer itself relies on: no record of
+    /// the lease file denies unknown fields, so a field a later build adds, at
+    /// the top or in any entry, is skipped and the file loads with every spend
+    /// and payer it holds.
+    #[test]
+    fn a_lease_file_field_this_node_does_not_know_is_ignored() {
+        let path = std::env::temp_dir().join(format!("ssf-lease-later-field-{}.json", std::process::id()));
+        let (parked, settles) = (Bytes32::new([71u8; 32]), Bytes32::new([72u8; 32]));
+        let (parked_hex, settles_hex, payer) = (hex::encode(parked), hex::encode(settles), beacon().hex());
+        let bundle = hex::encode(SpendBundle::new(vec![], Signature::default()).to_bytes().unwrap());
+        let text = format!(
+            r#"{{"v":1,"spends":2,"later":1,"parked":[{{"coin":"{parked_hex}","spend":1,"later":1}}],"bundles":[{{"spend":1,"bundle":"{bundle}","payer":"{payer}","later":1}}],"settling":[{{"spend":2,"spent_at":5,"coins":[{{"coin":"{settles_hex}","later":1}}],"bundle":"{bundle}","payer":"{payer}","later":1}}]}}"#
+        );
+        std::fs::write(&path, &text).unwrap();
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        assert!(lease.ensure_open().is_ok(), "an unknown field seals nothing");
+        assert!(lease.is_parked(&parked) && lease.is_settling(&settles) && lease.holds_spend(1) && lease.holds_spend(2));
+        assert!(lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(money()));
+        let snapshot = lease.snapshot();
+        assert_eq!((snapshot.bundles[0].payer.clone(), snapshot.settling[0].payer.clone()), (Some(payer.clone()), Some(payer)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stage 4 design §4.4: "two records for one era from one payer" holds per
+    /// payer. Each payer waits on its own parked spends; a spend with no payer
+    /// recorded is the money address's; the TAKE is nobody's to wait for; a
+    /// settling spend holds nobody until its block goes; and a lease no
+    /// restore told the money address holds every payer on a payer-less
+    /// parking, fail closed.
+    #[tokio::test]
+    async fn outgoing_pending_for_holds_each_payer_on_its_own_parked_spends() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-per-payer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let beacons = Coin::new(Bytes32::new([81u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let a = beacons.coin_id();
+        let (m, l, t) = (Bytes32::new([82u8; 32]), Bytes32::new([83u8; 32]), Bytes32::new([84u8; 32]));
+        let listing = |spent: Option<u32>, judged_at: u32| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: beacons, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at: Some(judged_at),
+            }])
+        };
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let t1 = t0 + RECONCILE_GRACE;
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        // Parked at once: the beacon's spend (the only one due at t1), the
+        // wallet's, one an older node parked with no payer, and a TAKE.
+        lease.park_with_bundle_at([(a, 900)], Some((&bundle, beacon())), t0).unwrap();
+        let wallets = lease.park_with_bundle_at([m], Some((&bundle, money())), t1).unwrap();
+        let older = lease.park_at([l], t1).unwrap();
+        lease.park_with_bundle_at([t], Some((&bundle, money())), t1).unwrap();
+        lease.mark_incoming(t).unwrap();
+        assert!(lease.outgoing_pending_for(beacon()) && lease.outgoing_pending_for(money()) && lease.outgoing_pending());
+        assert!(!lease.outgoing_pending_for(burner()), "a payer with nothing parked waits for nothing");
+        lease.release(&[wallets.spend]);
+        assert!(lease.outgoing_pending_for(money()), "the spend with no payer recorded is the money address's");
+        lease.release(&[older.spend]);
+        assert!(!lease.outgoing_pending_for(money()), "the TAKE is left out, as the global check leaves it out");
+        assert!(lease.outgoing_pending() && lease.outgoing_pending_for(beacon()), "the beacon's spend still holds the global check and its own payer");
+        // The beacon's spend included: settling, which holds nobody.
+        lease.reconcile_at(T11, &listing(Some(1000), 1001), t1).await;
+        assert!(lease.is_settling(&a));
+        assert!(!lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending());
+        // Its block gone: parked again, under its payer, across a restart too.
+        lease.reconcile_at(T11, &listing(None, 1000), t1).await;
+        assert!(lease.is_parked(&a) && lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(money()));
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert!(again.outgoing_pending_for(beacon()) && !again.outgoing_pending_for(money()) && !again.outgoing_pending_for(burner()));
+        // Never restored: a parking with no payer recorded holds every payer,
+        // and one that names its payer holds that payer alone.
+        let unnamed = WalletLease::new();
+        unnamed.park_at([l], t0).unwrap();
+        assert!(unnamed.outgoing_pending_for(beacon()) && unnamed.outgoing_pending_for(burner()) && unnamed.outgoing_pending_for(money()));
+        let named = WalletLease::new();
+        named.park_with_bundle_at([m], Some((&bundle, beacon())), t0).unwrap();
+        assert!(named.outgoing_pending_for(beacon()) && !named.outgoing_pending_for(burner()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lease restored from a file of its own in `dir`, the money address
+    /// named.
+    fn restored_in(dir: &std::path::Path, name: &str) -> WalletLease {
+        let path = dir.join(format!("{name}.json"));
+        let _ = std::fs::remove_file(&path);
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        lease
+    }
+
+    /// Stage 4 design §13 row 7, "changes behaviour: none yet": the global
+    /// check every writer of this build asks is today's whatever the payers,
+    /// and with the money address named and every payer it or none, the
+    /// money address's own check gives that same answer in every state the
+    /// lease can be in. A beacon-paid spend is where the two part: the global
+    /// check still holds the wallet's writes on it, as today.
+    #[tokio::test]
+    async fn outgoing_pending_still_counts_every_parked_spend_whatever_its_payer() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = Coin::new(Bytes32::new([91u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let id = ours.coin_id();
+        let faucet = Bytes32::new([92u8; 32]);
+        let listing = |spent: Option<u32>, judged_at: u32| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at: Some(judged_at),
+            }])
+        };
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let row = |name: &'static str, lease: &WalletLease| (name, lease.outgoing_pending(), lease.outgoing_pending_for(money()));
+        let mut rows = Vec::new();
+        rows.push(row("empty", &restored_in(&dir, "empty")));
+        let legacy = restored_in(&dir, "legacy");
+        legacy.park_at([id], t0).unwrap();
+        rows.push(row("legacy", &legacy));
+        let paid = restored_in(&dir, "paid");
+        paid.park_with_bundle_at([id], Some((&bundle, money())), t0).unwrap();
+        rows.push(row("money-paid", &paid));
+        let take = restored_in(&dir, "take");
+        take.park_with_bundle_at([faucet], Some((&bundle, money())), t0).unwrap();
+        take.mark_incoming(faucet).unwrap();
+        rows.push(row("take", &take));
+        let legacy_take = restored_in(&dir, "legacy-take");
+        legacy_take.park_at([faucet], t0).unwrap();
+        legacy_take.mark_incoming(faucet).unwrap();
+        rows.push(row("legacy take", &legacy_take));
+        take.park_with_bundle_at([id], Some((&bundle, money())), t0).unwrap();
+        rows.push(row("take and give", &take));
+        let settling = restored_in(&dir, "settling");
+        settling.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
+        settling.reconcile_at(T11, &listing(Some(1000), 1001), t0 + RECONCILE_GRACE).await;
+        assert!(settling.is_settling(&id));
+        rows.push(row("settling", &settling));
+        settling.reconcile_at(T11, &listing(None, 1000), t0 + RECONCILE_GRACE).await;
+        assert!(settling.is_parked(&id));
+        rows.push(row("re-parked", &settling));
+        let beacons = restored_in(&dir, "beacon");
+        beacons.park_with_bundle_at([id], Some((&bundle, beacon())), t0).unwrap();
+        rows.push(row("beacon-paid", &beacons));
+        assert_eq!(
+            rows,
+            vec![
+                ("empty", false, false),
+                ("legacy", true, true),
+                ("money-paid", true, true),
+                ("take", false, false),
+                ("legacy take", false, false),
+                ("take and give", true, true),
+                ("settling", false, false),
+                ("re-parked", true, true),
+                ("beacon-paid", true, false),
+            ]
+        );
+        for (name, global, own) in &rows {
+            if *name != "beacon-paid" {
+                assert_eq!(global, own, "{name}: every payer the money address's or none, the two checks agree");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gift landing (#245 review round 3) is no payer's to wait for: a
+    /// TAKE of this build, parked under the money address it pays into, and
+    /// one an older node parked with no payer read alike.
+    #[test]
+    fn a_landing_gift_counts_for_no_payers_writes() {
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-landing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let faucet = Bytes32::new([93u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        for (name, payer) in [("this build's TAKE", Some(money())), ("an older node's TAKE", None)] {
+            let lease = restored_in(&dir, name);
+            match payer {
+                Some(payer) => lease.park_with_bundle([faucet], &bundle, payer).map(|_| ()),
+                None => lease.park([faucet]).map(|_| ()),
+            }
+            .unwrap();
+            lease.mark_incoming(faucet).unwrap();
+            assert!(lease.incoming_pending(), "{name}: the gift is landing");
+            assert!(!lease.outgoing_pending() && !lease.outgoing_pending_for(money()), "{name}: not the wallet spending");
+            assert!(!lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(burner()), "{name}: nor any other payer");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The TAKE marker is cleared only when `incoming_pending` next reads it
+    /// (the dish's claim and status read do), so a TAKE the mempool dropped,
+    /// or the peers refused, can leave it naming a dish coin that is free
+    /// again. Stage 4 design §4.4: a spend that then parks that coin under
+    /// ANOTHER payer is that payer's to wait for, marker or not.
+    #[test]
+    fn a_stale_take_marker_leaves_out_no_other_payers_spend() {
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-stale-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let faucet = Bytes32::new([95u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let lease = restored_in(&dir, "lease");
+        let take = lease.park_with_bundle([faucet], &bundle, money()).unwrap();
+        lease.mark_incoming(faucet).unwrap();
+        lease.release(&[take.spend]);
+        assert_eq!(*lease.incoming.lock().unwrap(), Some(faucet), "nothing read the marker since: it still names the coin");
+        let first_write = lease.park_with_bundle([faucet], &bundle, burner()).unwrap();
+        assert!(lease.outgoing_pending_for(burner()), "the burner's parked spend holds the burner's writes");
+        assert!(!lease.outgoing_pending_for(money()) && !lease.outgoing_pending_for(beacon()), "…and nobody else's");
+        // The global check and the landing read are today's: they read the
+        // marker's coin alone, whoever parked it, which is why the
+        // claim-and-write (PR 9) keeps the marker off a burner's parking.
+        assert!(!lease.outgoing_pending() && lease.incoming_pending());
+        lease.release(&[first_write.spend]);
+        assert!(!lease.outgoing_pending_for(burner()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §4.4: a push parks its spend under the payer it names,
+    /// before the push leaves (round 9) and in the parking's one write; a
+    /// parking the file cannot take parks nothing for that payer either.
+    #[tokio::test]
+    async fn a_push_parks_its_spend_under_the_payer_it_names() {
+        use crate::chia_chain::testing::Unanswering;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-push-payer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let _ = std::fs::remove_file(&path);
+        let coin = Bytes32::new([94u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let outcome = push_parked_with(&lease, &Unanswering, beacon(), bundle.clone(), [coin]).await;
+        assert!(matches!(outcome, Err(PushError::Unanswered(_))), "{outcome:?}");
+        assert!(lease.is_parked(&coin) && lease.outgoing_pending_for(beacon()) && !lease.outgoing_pending_for(money()));
+        let file: LeaseFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.bundles.iter().map(|b| b.payer.clone()).collect::<Vec<_>>(), vec![Some(beacon().hex())], "the file names the payer the push named");
+        let unsaved = WalletLease::new();
+        unsaved.restore(&dir.join("missing").join("wallet_lease.json"), money());
+        let outcome = push_parked_with(&unsaved, &Unanswering, beacon(), bundle, [coin]).await;
+        assert!(matches!(outcome, Err(PushError::NotSent(LeaseError::Unsaved(_)))), "{outcome:?}");
+        assert!(!unsaved.is_taken(&coin) && !unsaved.outgoing_pending_for(beacon()));
+        assert!(unsaved.snapshot().bundles.is_empty(), "the bundle and its payer were taken back with the parking");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listing of one page, run to its end, judged at `judged_at`.
+    fn page_of(records: Vec<crate::chia_chain::CoinRecord>, judged_at: Option<u32>) -> crate::chia_chain::CoinListing {
+        crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at }
+    }
+
+    /// The standing [`write_standing_on`] gives on testnet11 against `chain`
+    /// for a write under `hint`, confirmed at `confirmed` (0: pending).
+    async fn standing(
+        lease: &WalletLease,
+        chain: &crate::chia_chain::testing::Scripted,
+        coins: WriteCoins,
+        hint: Bytes32,
+        spend: Option<u64>,
+        confirmed: u32,
+    ) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
+        write_standing_on(lease, T11, chain, coins, hint, spend, confirmed, "test").await
+    }
+
+    /// The standing exactly as `write_standing_of` gave it before the verdict
+    /// split (stage 4 PR 7), against a given lease: one coin asked of the
+    /// lease, the hint and the names listing alike, in that order.
+    async fn standing_before_the_split(
+        lease: &WalletLease,
+        chain: &crate::chia_chain::testing::Scripted,
+        coin: Bytes32,
+        hint: Bytes32,
+        spend: Option<u64>,
+        confirmed: u32,
+    ) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
+        let spends: Vec<u64> = spend.into_iter().collect();
+        let (word, held): (LeaseWord, HashSet<u64>) = {
+            let _gate = lease.lock().await;
+            lease.reconcile_at(T11, chain, Instant::now()).await;
+            (lease.lease_word(&coin), spends.iter().copied().filter(|s| lease.holds_spend(*s)).collect())
+        };
+        let ours = spend.is_some_and(|s| held.contains(&s));
+        let child = crate::chia_resolve::child_under_hint(chain, hint, coin).await.ok()?;
+        let spent_at = crate::chia_resolve::spent_heights(chain, vec![coin]).await.ok()?.into_iter().find(|(c, _)| *c == coin).map(|(_, h)| h);
+        Some((crate::chia_resolve::write_standing(&child, spent_at, word, ours), child.gone_since(confirmed)))
+    }
+
+    /// Stage 4 design §4.4: a write is FOUND under its hint by its parent, the
+    /// coin its own coin names, and JUDGED by its parked input, the coin the
+    /// lease holds: the spent height and the lease's word are that input's,
+    /// never the parent's. One coin for every write of this build; a burner's
+    /// first write (PR 9) has the gift g as its parent and the dish coin as
+    /// its parked input, as here.
+    #[tokio::test]
+    async fn a_write_is_found_by_its_parent_and_judged_by_its_parked_input() {
+        use crate::chia_chain::{testing::Scripted, CoinRecord};
+        use crate::chia_resolve::WriteStanding::{Confirmed, Dead, Pending};
+        let gift = Coin::new(Bytes32::new([101u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let dish = Coin::new(Bytes32::new([102u8; 32]), Bytes32::new([3u8; 32]), 1);
+        let split = WriteCoins { parent: gift.coin_id(), parked: dish.coin_id() };
+        let (parent, parked) = (split.parent, split.parked);
+        let hint = Bytes32::new([103u8; 32]);
+        let child_of = |parent: Bytes32| CoinRecord { coin: Coin::new(parent, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
+        let input = |coin: Coin, spent: Option<u32>| CoinRecord { coin, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        // Found by its parent: the child under the hint names the gift.
+        let chain = Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001)), page_of(vec![], Some(1001))]);
+        assert_eq!(standing(&WalletLease::new(), &chain, split, hint, None, 0).await, Some((Confirmed { height: 1000, seen_at: Some(1001) }, false)));
+        let chain = Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001)), page_of(vec![], Some(1001))]);
+        assert_eq!(
+            standing(&WalletLease::new(), &chain, WriteCoins::one(parked), hint, None, 0).await,
+            Some((Pending, false)),
+            "looked for by the dish coin, the gift's child is not found"
+        );
+        // The spent height is the parked input's, and the names listing asks
+        // for it alone.
+        let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![input(dish, Some(1000))], Some(1001))]);
+        assert_eq!(standing(&WalletLease::new(), &chain, split, hint, None, 0).await, Some((Dead("its coin went to another spend of ours"), false)));
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![parked]], "the names listing asks about the parked input");
+        let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![input(gift, Some(1000)), input(dish, None)], Some(1001))]);
+        assert_eq!(
+            standing(&WalletLease::new(), &chain, split, hint, None, 0).await,
+            Some((Pending, false)),
+            "the gift spent says nothing of the write: every first write spends it"
+        );
+        // The lease's word is the parked input's.
+        let dropped = WalletLease::new();
+        dropped.remember(&[(parked, LeaseWord::Dropped)]);
+        let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![], Some(1001))]);
+        assert_eq!(standing(&dropped, &chain, split, hint, None, 0).await, Some((Dead("the mempool dropped it"), false)));
+        let elsewhere = WalletLease::new();
+        elsewhere.remember(&[(parent, LeaseWord::Dropped)]);
+        let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![], Some(1001))]);
+        assert_eq!(standing(&elsewhere, &chain, split, hint, None, 0).await, Some((Pending, false)), "a word on the gift is no word on the write");
+        // The lease holding the write's own spend still counts (round 12).
+        let held = WalletLease::new();
+        let parking = held.park_with_bundle([(parked, 900)], &bundle, burner()).unwrap();
+        let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![input(dish, Some(1000))], Some(1001))]);
+        assert_eq!(
+            standing(&held, &chain, split, hint, Some(parking.spend), 0).await,
+            Some((Pending, false)),
+            "spent with no child while the lease holds the spend: a fork between the lookups"
+        );
+        // In the order the lookups always ran (round 2): the lease's
+        // reconciliation first — a settling spend is asked about on every
+        // pass — then the hint, then the names listing. Asked in another
+        // order, a page lands in another lookup and the verdict changes.
+        let t0 = Instant::now();
+        let settling = WalletLease::new();
+        let parking = settling.park_with_bundle_at([(parked, 900)], Some((&bundle, burner())), t0).unwrap();
+        settling.reconcile_at(T11, &Scripted::new(vec![page_of(vec![input(dish, Some(1000))], Some(1001))]), t0 + RECONCILE_GRACE).await;
+        assert!(settling.is_settling(&parked));
+        let chain = Scripted::new(vec![
+            page_of(vec![input(dish, Some(1000))], Some(1001)),
+            page_of(vec![child_of(parent)], Some(1001)),
+            page_of(vec![input(dish, Some(1000))], Some(1001)),
+        ]);
+        assert_eq!(
+            standing(&settling, &chain, split, hint, Some(parking.spend), 0).await,
+            Some((Confirmed { height: 1000, seen_at: Some(1001) }, false))
+        );
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![parked], vec![parked]], "the lease's listing, then the input's, both of the parked input");
+        assert!(settling.is_settling(&parked), "asked first, the lease decided nothing new");
+    }
+
+    /// Stage 4 design §13 row 7, "changes behaviour: none yet": for a write
+    /// of one coin, as every write of this build is, the verdict is the one
+    /// the lookup gave before the split, through every branch of
+    /// `write_standing`, `gone_since`, and a failed lookup.
+    #[tokio::test]
+    async fn a_write_of_one_coin_is_judged_exactly_as_before() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_resolve::WriteStanding::{self, Confirmed, Dead, Pending};
+        /// How the lease stands before the lookups: knowing nothing of the
+        /// coin, holding its spend (parked a moment ago, so not yet due a
+        /// lookup of its own), or having released it as dropped.
+        #[derive(Clone, Copy)]
+        enum Before {
+            Fresh,
+            Holding,
+            Released,
+        }
+        let ours = Coin::new(Bytes32::new([111u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let c = ours.coin_id();
+        let hint = Bytes32::new([112u8; 32]);
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let child = CoinRecord { coin: Coin::new(c, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
+        let spent = CoinRecord { coin: ours, confirmed_block_index: 900, spent: true, spent_block_index: 1000 };
+        let cut = CoinListing { records: vec![], truncated: true, next_cursor: None, judged_at: Some(1001) };
+        let empty = |judged_at: u32| page_of(vec![], Some(judged_at));
+        // A row: its name, the lease before the lookups, the pages, the height
+        // the write stood confirmed at, and the verdict it gets either side of
+        // the split.
+        type Row = (&'static str, Before, Vec<CoinListing>, u32, Option<(WriteStanding, bool)>);
+        let rows: Vec<Row> = vec![
+            ("found", Before::Fresh, vec![page_of(vec![child], Some(1001)), page_of(vec![spent.clone()], Some(1001))], 0, Some((Confirmed { height: 1000, seen_at: Some(1001) }, false))),
+            ("cut short", Before::Fresh, vec![cut, empty(1001)], 0, Some((Pending, false))),
+            ("absent, spent and held", Before::Holding, vec![empty(1001), page_of(vec![spent.clone()], Some(1001))], 0, Some((Pending, false))),
+            ("absent, spent, judged at the spend", Before::Fresh, vec![empty(1000), page_of(vec![spent.clone()], Some(1001))], 0, Some((Dead("its coin went to another spend of ours"), false))),
+            ("absent, spent, judged below it", Before::Fresh, vec![empty(999), page_of(vec![spent], Some(999))], 0, Some((Pending, false))),
+            ("absent and dropped", Before::Released, vec![empty(1001), empty(1001)], 0, Some((Dead("the mempool dropped it"), false))),
+            ("absent and parked", Before::Holding, vec![empty(1001), empty(1001)], 0, Some((Pending, false))),
+            ("absent and unknown", Before::Fresh, vec![empty(1001), empty(1001)], 0, Some((Pending, false))),
+            ("gone since its confirmation", Before::Fresh, vec![empty(1001), empty(1001)], 1000, Some((Pending, true))),
+            ("absent below its confirmation", Before::Fresh, vec![empty(999), empty(999)], 1000, Some((Pending, false))),
+            ("the names lookup fails", Before::Fresh, vec![empty(1001)], 0, None),
+            ("the hint lookup fails", Before::Fresh, vec![], 0, None),
+        ];
+        for (name, before, pages, confirmed, want) in rows {
+            let lease_as = || {
+                let lease = WalletLease::new();
+                let spend = match before {
+                    Before::Fresh => None,
+                    Before::Holding => Some(lease.park_with_bundle([(c, 900)], &bundle, money()).unwrap().spend),
+                    Before::Released => {
+                        lease.remember(&[(c, LeaseWord::Dropped)]);
+                        None
+                    }
+                };
+                (lease, spend)
+            };
+            let (now_lease, now_spend) = lease_as();
+            let now = standing(&now_lease, &Scripted::new(pages.clone()), WriteCoins::one(c), hint, now_spend, confirmed).await;
+            let (then_lease, then_spend) = lease_as();
+            let then = standing_before_the_split(&then_lease, &Scripted::new(pages), c, hint, then_spend, confirmed).await;
+            assert_eq!(now, then, "{name}: as before the split");
+            assert_eq!(now, want, "{name}");
+        }
     }
 
     #[test]

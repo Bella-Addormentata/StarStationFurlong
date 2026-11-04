@@ -34,7 +34,7 @@ use crate::chia_chain::{ChainAccess, CoinRecord, PagedRecords};
 use sha2::{Digest, Sha256};
 
 use crate::chia_faucet::MAX_FAUCET_PAGES;
-use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, WALLET_LEASE};
+use crate::chia_publish::{build_publish_bundle, find_spendable_coin, our_puzzle_hash, push_parked, Payer, WALLET_LEASE};
 use crate::chia_resolve::{extract_ciphertext, fetch_coin_spend};
 
 /// Domain for the PUBLIC craps-fairness lookup hint. Unlike presence (keyed on a
@@ -108,7 +108,7 @@ async fn push_fair_record(
 ) -> Result<()> {
     let hint = fair_hint(table, round);
     let bundle = build_publish_bundle(net, chia_sk, coin.coin, hint, Bytes::new(payload.to_vec()))?;
-    push_parked(client, bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
+    push_parked(client, Payer::of(chia_sk), bundle, [(coin.coin.coin_id(), coin.confirmed_height)]).await?;
     Ok(())
 }
 

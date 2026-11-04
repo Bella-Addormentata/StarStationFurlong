@@ -803,6 +803,39 @@ pub fn parse_hex32(hex_id: &str) -> Option<Bytes32> {
     Some(Bytes32::new(bytes))
 }
 
+/// The two coins a write is found and judged by (stage 4 design §4.4):
+/// `parent`, the coin the write's own coin names as its parent under its
+/// hint, which the hint lookup finds it by ([`child_under_hint`]); and
+/// `parked`, the on-chain input the wallet lease parked for its spend, which
+/// the spent-height lookup ([`spent_heights`]) and the lease's word
+/// ([`LeaseWord`]) are about. They are one coin for every write this build
+/// makes, and every mark, knock entry or older node's record: the input a
+/// spend-to-self consumed, which its new coin names. A burner's first write
+/// (PR 9) will have the gift g as its parent and the dish coin as its parked
+/// input. Here, not in the publisher, since the knock verdicts are judged in
+/// read-only builds too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteCoins {
+    pub parent: Bytes32,
+    pub parked: Bytes32,
+}
+
+impl WriteCoins {
+    /// A write whose parked input is its own coin's parent: a spend-to-self
+    /// of one coin, as every write of this build.
+    pub fn one(coin: Bytes32) -> Self {
+        Self { parent: coin, parked: coin }
+    }
+
+    /// The coins a mark or a knock entry filed under its one `coin_id` (hex),
+    /// read back as both: the marks keep one coin until the parked input is
+    /// filed beside it (design §13, PR 10). `None` when it is malformed, as
+    /// [`parse_hex32`] says.
+    pub fn filed(coin_id: &str) -> Option<Self> {
+        parse_hex32(coin_id).map(Self::one)
+    }
+}
+
 /// ONE-SHOT: the freshest presence record `node_id` published under its
 /// contact key `ck` — the introduction lookup at dial exhaustion (rung 6) once
 /// the target's card is known. Reads the chain peak first (the era is the
@@ -1707,5 +1740,20 @@ mod tests {
         assert_eq!(parse_hex32(&hex::encode(input.to_bytes())), Some(input));
         assert_eq!(parse_hex32("zz"), None);
         assert_eq!(parse_hex32("0011"), None, "the wrong length is no id");
+    }
+
+    /// Stage 4 design §4.4: a mark or a knock entry files one coin, and it is
+    /// read back as the write's parent and its parked input alike, which every
+    /// write of this build has as one coin; a malformed one files nothing.
+    #[test]
+    fn a_filed_coin_reads_back_as_the_parent_and_the_parked_input_alike() {
+        let coin = Bytes32::new([7u8; 32]);
+        let one = WriteCoins::one(coin);
+        assert_eq!((one.parent, one.parked), (coin, coin));
+        assert_eq!(WriteCoins::filed(&hex::encode(coin.to_bytes())), Some(one));
+        assert_eq!(WriteCoins::filed(&hex::encode(coin.to_bytes()).to_uppercase()), Some(one), "read as parse_hex32 reads it");
+        assert_eq!(WriteCoins::filed("zz"), None);
+        assert_eq!(WriteCoins::filed("0011"), None, "the wrong length files nothing");
+        assert_eq!(WriteCoins::filed(""), None, "a mark an older node wrote names no coin");
     }
 }
