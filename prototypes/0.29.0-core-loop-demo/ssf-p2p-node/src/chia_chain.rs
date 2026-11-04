@@ -356,13 +356,15 @@ pub(crate) mod testing {
 
     /// A chain that answers listings from a script: the pages in order,
     /// whatever the key or cursor asked for, then nothing. It keeps whether
-    /// each listing asked for spent coins, and how many bundles were handed
-    /// to it (`sent`: a liveness question or a push, both unanswered). The
-    /// peak is answered only when one was given ([`Scripted::with_peak`]).
-    /// Everything else is unanswered.
+    /// each listing asked for spent coins, the coins each lookup by name
+    /// asked for (`asked_names`, in the order asked), and how many bundles
+    /// were handed to it (`sent`: a liveness question or a push, both
+    /// unanswered). The peak is answered only when one was given
+    /// ([`Scripted::with_peak`]). Everything else is unanswered.
     pub(crate) struct Scripted {
         pages: std::sync::Mutex<std::collections::VecDeque<CoinListing>>,
         pub(crate) asked_spent: std::sync::Mutex<Vec<bool>>,
+        pub(crate) asked_names: std::sync::Mutex<Vec<Vec<Bytes32>>>,
         pub(crate) sent: std::sync::atomic::AtomicUsize,
         peak: Option<u32>,
     }
@@ -372,6 +374,7 @@ pub(crate) mod testing {
             Self {
                 pages: std::sync::Mutex::new(pages.into()),
                 asked_spent: std::sync::Mutex::new(Vec::new()),
+                asked_names: std::sync::Mutex::new(Vec::new()),
                 sent: std::sync::atomic::AtomicUsize::new(0),
                 peak: None,
             }
@@ -412,10 +415,11 @@ pub(crate) mod testing {
 
         fn coin_records_by_names(
             &self,
-            _names: Vec<Bytes32>,
+            names: Vec<Bytes32>,
             include_spent: bool,
             _cursor: Option<String>,
         ) -> impl Future<Output = Result<CoinListing, ChainError>> + Send {
+            self.asked_names.lock().unwrap().push(names);
             let page = self.page(include_spent);
             async move { page }
         }

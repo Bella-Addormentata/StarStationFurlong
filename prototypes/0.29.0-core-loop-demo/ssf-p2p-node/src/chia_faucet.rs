@@ -916,9 +916,15 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     // rejection — then the gift is not landing either (incoming_pending reads
     // the parking). A mark that cannot be SAVED stops the claim here, before
     // anything leaves: a restart would otherwise forget it (round 19).
+    // The claim is parked under the money address it pays into (stage 4
+    // design §4.4): no key signs it, and the TAKE is the wallet's own action
+    // under the lease, so an older node's TAKE (no payer filed, the money
+    // address's) and this one read alike, and the `incoming` marker keeps
+    // both out of the wallet's own spending.
     crate::chia_publish::WALLET_LEASE.mark_incoming(target.coin.coin_id())?;
+    let payer = crate::chia_publish::Payer::of(sk);
     let unanswered =
-        pushed(crate::chia_publish::push_parked(client, bundle, [(target.coin.coin_id(), target.confirmed_height)]).await)?;
+        pushed(crate::chia_publish::push_parked(client, payer, bundle, [(target.coin.coin_id(), target.confirmed_height)]).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: claimed {} mojo(s) from coin {} at {} (height {peak})",
@@ -1023,7 +1029,8 @@ async fn give(
     let inputs = coins
         .iter()
         .map(|c| crate::chia_publish::ParkedInput { coin_id: c.coin_id(), seen_at: wallet.seen_at.get(&c.coin_id()).copied() });
-    let unanswered = pushed(crate::chia_publish::push_parked(client, bundle, inputs).await)?;
+    // Paid by the wallet's key: its payer, the money address (§4.4).
+    let unanswered = pushed(crate::chia_publish::push_parked(client, crate::chia_publish::Payer::of(sk), bundle, inputs).await)?;
     match &unanswered {
         None => println!(
             "⛓️🥣 faucet: gave {amount} mojo(s) into {} from {} coin(s), change {change}",

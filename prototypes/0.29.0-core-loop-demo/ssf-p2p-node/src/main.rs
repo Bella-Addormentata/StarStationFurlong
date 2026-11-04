@@ -2082,8 +2082,10 @@ async fn node_main() -> Result<()> {
                 // identity, same CWD-relative convention; before any writer runs. A file
                 // that exists but cannot be read SEALS the lease (round 19):
                 // the node then takes no spend until the operator fixes or
-                // removes it and restarts; the startup log says so.
-                chia_publish::WALLET_LEASE.restore(&chia_net.path(chia_wallet_switch::LEASE_FILE));
+                // removes it and restarts; the startup log says so. The file is
+                // this wallet's, so a parking in it that names no payer is the
+                // wallet's own (stage 4 design §4.4).
+                chia_publish::WALLET_LEASE.restore(&chia_net.path(chia_wallet_switch::LEASE_FILE), chia_publish::Payer::of(&chia_sk));
                 chia_heartbeat_sk = Some(chia_sk.clone());
                 // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
                 // a coin to publish a presence record under a FIXED test room key, so
@@ -6610,7 +6612,7 @@ async fn turn_wallet(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, on: bool) ->
         // so the watcher's reconcile does not run beside it.
         {
             let _gate = chia_publish::WALLET_LEASE.lock().await;
-            chia_publish::WALLET_LEASE.restore(&net.path(chia_wallet_switch::LEASE_FILE));
+            chia_publish::WALLET_LEASE.restore(&net.path(chia_wallet_switch::LEASE_FILE), chia_publish::Payer::of(&chia_sk));
         }
         // The memo, then the meta, then the key: the fingerprint reads the
         // key, then the meta, then the memo (wallet_switch_view), so every
