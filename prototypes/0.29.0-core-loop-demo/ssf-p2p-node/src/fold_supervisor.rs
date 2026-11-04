@@ -48,6 +48,11 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// What time it is, asked afresh where it matters: encoding a frame and starting a process take time, and a request is
+/// owed an answer from the time it was queued, not from the time the pass that posted it began. (The tests give a
+/// time of their own.)
+pub type Clock<'a> = &'a dyn Fn() -> Instant;
+
 use crate::fold_wire::{decode_resp, encode_req, read_frame, write_frame, Req, Resp, WireError};
 use crate::house_bytes::Ctx;
 
@@ -135,6 +140,14 @@ enum Incoming {
     Closed(String),
 }
 
+/// What [`Inbox::admit`] came to.
+enum Admit {
+    /// The link was closed first; nothing was counted or queued.
+    Closed,
+    /// Counted, and `put` ran: whether it queued the answer.
+    Put(bool),
+}
+
 /// The bytes of answers read and waiting for the node: the reader thread asks leave to hand one
 /// over ([`Inbox::admit`]) and waits while too many wait; `poll` says when it took one
 /// ([`Inbox::taken`]); a link that is dropped lets the reader go ([`Inbox::close`]).
@@ -150,17 +163,21 @@ impl Inbox {
         Inbox { held: Mutex::new(0), room: Condvar::new(), closed: AtomicBool::new(false), limit }
     }
 
-    /// Wait until an answer of `n` bytes may join those waiting (or none waits), and count it.
-    /// `false`: the link was closed first.
-    fn admit(&self, n: usize) -> bool {
+    /// Wait until an answer of `n` bytes may join those waiting (or none waits), count it, and
+    /// `put` it in the queue, all under the lock: an answer counted as waiting is already in the
+    /// queue, so a poll that finds the count up never finds the queue empty and calls the worker
+    /// silent (found as a flake of `a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung`:
+    /// counted, not yet queued, and the poll ten seconds on). `Admit::Closed`: the link was
+    /// closed first; `Admit::Put(false)`: `put` found the queue gone.
+    fn admit(&self, n: usize, put: impl FnOnce() -> bool) -> Admit {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if self.closed.load(Ordering::SeqCst) {
-                return false;
+                return Admit::Closed;
             }
             if *held == 0 || held.saturating_add(n) <= self.limit {
                 *held = held.saturating_add(n);
-                return true;
+                return Admit::Put(put());
             }
             held = self.room.wait(held).unwrap_or_else(PoisonError::into_inner);
         }
@@ -265,10 +282,10 @@ impl Link {
                                 drop(body);
                                 // Nor faster than the node takes them, in bytes: this thread waits
                                 // here (and so the worker, on its full pipe) while enough wait.
-                                if !reader_inbox.admit(n) {
-                                    return;
+                                match reader_inbox.admit(n, || tell.send(Incoming::Resp(resp, n)).is_ok()) {
+                                    Admit::Put(true) => continue,
+                                    Admit::Put(false) | Admit::Closed => return,
                                 }
-                                Incoming::Resp(resp, n)
                             }
                             Err(e) => Incoming::Closed(format!("the worker sent a frame that is not an answer: {e}")),
                         }
@@ -306,6 +323,10 @@ impl Drop for Link {
         (self.kill)();
     }
 }
+
+/// Windows' process creation flag for a console program that gets no window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How workers are started.
 pub trait Launch {
@@ -352,7 +373,15 @@ fn sweep(list: &mut Vec<Arc<Mutex<Child>>>) {
 impl Launch for ChildLaunch {
     fn launch(&mut self) -> io::Result<Link> {
         sweep(&mut UNREAPED.lock().unwrap_or_else(PoisonError::into_inner));
-        let mut child = (self.command)()?.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let mut command = (self.command)()?;
+        // The desktop app starts the node with no console (CREATE_NO_WINDOW): a console program the
+        // node starts would open a window of its own on Windows unless it is told not to.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| io::Error::other("no pipe to the worker"))?;
         let stdout = child.stdout.take().ok_or_else(|| io::Error::other("no pipe from the worker"))?;
         let child: Arc<Mutex<Child>> = Arc::new(Mutex::new(child));
@@ -444,11 +473,14 @@ pub struct Supervisor<L: Launch> {
     unsaid: Vec<Event>,
     /// When the worker's process was first seen gone, while its output has not yet said so.
     exit_seen: Option<Instant>,
+    /// A test's pipe clogged before there was a worker to clog (see [`Supervisor::clog`]): the worker started next has it.
+    #[cfg(test)]
+    preclog: std::sync::atomic::AtomicUsize,
 }
 
 impl<L: Launch> Supervisor<L> {
     pub fn new(launch: L, now: Instant) -> Supervisor<L> {
-        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new(), exit_seen: None }
+        Supervisor { launch, link: None, state: State::Idle, policy: RestartPolicy::default(), owed: VecDeque::new(), last_answer: now, held: HashSet::new(), started: 0, failures: 0, unsaid: Vec::new(), exit_seen: None, #[cfg(test)] preclog: std::sync::atomic::AtomicUsize::new(0) }
     }
 
     pub fn state(&self) -> State {
@@ -463,6 +495,12 @@ impl<L: Launch> Supervisor<L> {
     /// `/api/fingerprint`'s `house.fold.off`: why the fold duties are off, if they are.
     pub fn off(&self) -> Option<&'static str> {
         (self.state == State::Off).then_some("crashes")
+    }
+
+    /// The fold duties go off, as too many failures make them (a test of what the shadow does then).
+    #[cfg(test)]
+    pub(crate) fn go_off(&mut self) {
+        self.state = State::Off;
     }
 
     /// Workers started so far, and failures so far.
@@ -482,29 +520,47 @@ impl<L: Launch> Supervisor<L> {
     }
 
     /// A test's way of filling the worker's pipe: `bytes` count as waiting to be written, so frames are
-    /// refused as busy until [`unclog`](Supervisor::unclog) takes them back.
+    /// refused as busy until [`unclog`](Supervisor::unclog) takes them back. (With no worker yet, the one started
+    /// next is the one clogged: a test that clogs before its first tick must not have the first frame through.)
     #[cfg(test)]
     pub(crate) fn clog(&self, bytes: usize) {
-        if let Some(link) = &self.link {
-            link.queued.fetch_add(bytes, Ordering::Relaxed);
+        match &self.link {
+            Some(link) => {
+                link.queued.fetch_add(bytes, Ordering::Relaxed);
+            }
+            None => {
+                self.preclog.fetch_add(bytes, Ordering::Relaxed);
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn unclog(&self, bytes: usize) {
-        if let Some(link) = &self.link {
-            link.queued.fetch_sub(bytes, Ordering::Relaxed);
+        match &self.link {
+            Some(link) => {
+                link.queued.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            None => {
+                let _ = self.preclog.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(bytes)));
+            }
         }
     }
 
     /// Send a frame to the worker, starting one if there is none and the wait
     /// after the last failure is over. Never blocks.
     pub fn post(&mut self, now: Instant, req: &Req) -> Post {
+        self.post_with(&|| now, req)
+    }
+
+    /// [`Supervisor::post`], at the time `clock` says when it matters: after the frame is encoded and the worker
+    /// started (either can take long), the time the request is queued is the time the worker's wait for its answer
+    /// runs from.
+    pub fn post_with(&mut self, clock: Clock<'_>, req: &Req) -> Post {
         let frame = match encode_req(req) {
             Ok(f) => f,
             Err(e) => return Post::TooBig(e),
         };
-        if self.link.is_none() && !self.start(now) {
+        if self.link.is_none() && !self.start(clock) {
             return Post::Down;
         }
         let link = self.link.as_ref().expect("a link after start");
@@ -522,6 +578,7 @@ impl<L: Launch> Supervisor<L> {
             link.unanswered.fetch_add(1, Ordering::SeqCst);
         }
         let sent = link.tx.as_ref().is_some_and(|tx| tx.send(frame).is_ok());
+        let now = clock();
         if !sent {
             self.fail(now, "the worker's writer has ended".into());
             return Post::Down;
@@ -576,6 +633,15 @@ impl<L: Launch> Supervisor<L> {
                 Err(_) => break,
             }
         }
+        // An answer the reader has read and the queue does not hold yet (it is between the pipe and the queue, in
+        // `Inbox::admit`) is the worker's word, not its silence, and is found by the next poll: no failure of silence
+        // or of an exit is found while one is on its way. (The reader counts an answer off `unanswered` when it has
+        // read it whole, before it counts and queues it: so, the queue found empty, answers this side is still
+        // owed that the worker no longer owes are answers in flight. The queue alone cannot say: a poll between the
+        // reader's count and its queueing found it empty, and, a slow node's ten seconds on, called the worker silent.)
+        if self.link.as_ref().is_some_and(|l| l.unanswered.load(Ordering::SeqCst) < self.owed.len()) {
+            return events;
+        }
         // A process that is gone closes its output, and the reader tells us in order, after
         // every answer it wrote: that is how a failure is normally found. A process seen gone
         // whose output has not yet said so (the reader is behind) is given a moment to, so what
@@ -600,22 +666,25 @@ impl<L: Launch> Supervisor<L> {
     }
 
     /// Start a worker if the rules allow. `false`: there is none.
-    fn start(&mut self, now: Instant) -> bool {
+    fn start(&mut self, clock: Clock<'_>) -> bool {
         match self.state {
             State::Off => return false,
-            State::Backoff(until) if now < until => return false,
+            State::Backoff(until) if clock() < until => return false,
             _ => {}
         }
         match self.launch.launch() {
             Ok(link) => {
+                #[cfg(test)]
+                link.queued.fetch_add(self.preclog.swap(0, Ordering::Relaxed), Ordering::Relaxed);
                 self.link = Some(link);
                 self.state = State::Up;
-                self.last_answer = now;
+                // (From the time the process is up, not the time it was asked for.)
+                self.last_answer = clock();
                 self.started += 1;
                 true
             }
             Err(e) => {
-                self.fail(now, format!("the worker would not start: {e}"));
+                self.fail(clock(), format!("the worker would not start: {e}"));
                 false
             }
         }

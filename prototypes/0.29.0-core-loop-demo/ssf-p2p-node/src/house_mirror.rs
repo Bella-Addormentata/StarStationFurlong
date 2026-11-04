@@ -51,6 +51,10 @@
 //! no more than a drain in turn. An action bigger than a whole drain
 //! (finding out a very heavy checkpoint, taking the key list of a session of
 //! the most keys) is admitted when it comes first, and then costs the drain.
+//! The drain's time is looked at between actions, and within a scan of a
+//! session's keys (the list, the count) every [`SCAN_CHECK_KEYS`] keys, when the
+//! drain has done another action before it: a scan given up is made again from
+//! its start by the next drain, which begins with it and so reads it to its end.
 //! What a table holds is bounded too: a session of more than
 //! [`MAX_SESSION_KEYS`] keys is FLOODED (held: no honest session is, it is
 //! trimmed at 20 rounds or 96 KB), whatever the keys are and however it came
@@ -68,6 +72,20 @@
 //! is in the queue until taken, and a table that must be sent again is read
 //! again from the doc.
 //!
+//! WHAT IT CANNOT SEE, AND TELLS. A page's history is not all in the doc: an update that made a block and deleted it
+//! (a record written and written over, a session made and trimmed, a delegation made and withdrawn) arrives with no
+//! trace of it but that something was made and deleted in it ([`made_and_deleted`]), not what or where, and a record
+//! removed or replaced in a live session is a history a page that never saw it does not share. The mirror says so,
+//! and decides nothing of it: [`Delegations`] (changes, `churned` for good, and `hidden`, the updates that may have
+//! hidden one beside the keys they show), a session whose trim is read as `unread_at_trim` (records made and deleted in
+//! it, or removed or replaced in it, or the session itself removed in such an update, or replaced or removed in an
+//! update of its own, which is no page's trim), and the signers of the slips a session held
+//! ([`RoomMirror::take_ended_signers`], told once the session has ended; a name or key longer than a page pins,
+//! [`MAX_SIGNER_BYTES`], is not kept and says so as too many do), which the shadow reads against the pins it was given.
+//! What the observer compares inside the doc's commit is bounded ([`rewritten_alike`]). A trim is the change of the
+//! checkpoint of the session's own table ([`sum_of`]), not of another's; and a checkpoint written over before the node
+//! read it is counted only if a page could take what was written for one ([`may_be_checkpoint`]).
+//!
 //! WHAT THE CALLER CAN RELY ON, after a drain that ran short of nothing (a
 //! table that [`RoomMirror::current`]): the changes taken since the table's
 //! last reset (the first take after it says so, with the base), applied to an
@@ -84,11 +102,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use yrs::types::{DeepObservable, Event, Events, PathSegment};
+use yrs::types::{DeepObservable, EntryChange, Event, Events, PathSegment};
 use yrs::{Doc, Map, MapRef, Out, ReadTxn, Subscription, TransactionMut};
 
-use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, READ_PER_TICK, VISIT_BYTES};
+use crate::house::{checkpoint_ok, parse_key, read_costed, Read, COMPUTED_MAP, MAX_KEY_BYTES, MAX_RECORD_BYTES, MAX_SESSION_KEYS, MAX_TOP_BYTES, READ_PER_TICK, VISIT_BYTES};
 use crate::house_bytes::{self as hb, CVal, Ctx};
 
 /// What a drain reads of a room, charged as the house's tick charges its own
@@ -96,10 +115,25 @@ use crate::house_bytes::{self as hb, CVal, Ctx};
 pub const DRAIN_BYTES: usize = READ_PER_TICK;
 /// The changed paths (and cold-read keys) a drain looks at, whatever they weigh.
 pub const DRAIN_PATHS: usize = 4_096;
+/// How long a drain may hold the doc for the node's own pass ([`Limits::live`]): what is left waits for the next.
+/// The weights above bound what a drain reads; this bounds the time it takes, whatever the doc's size makes of it, for
+/// the house's tick waits for the doc's write lock behind a read held here, with the house's own lock held.
+pub const DRAIN_TIME: Duration = Duration::from_millis(20);
 /// The changed record keys of one live session the mirror lists between two
 /// drains. Past it the session is read afresh. (Honest sessions change a
 /// few dozen keys a tick.)
 pub const MAX_DIRTY_KEYS: usize = 2_048;
+/// The most a checkpoint weighs ([`hb::weigh`]) for the observer to tell it written again as it stands from another:
+/// the observer runs in the commit of the doc, so what it compares is bounded, and a heavier one is another.
+pub const ALIKE_SUM_BYTES: usize = 256 * 1024;
+/// The most (player, signing key) pairs of a session's slips the mirror keeps for a table, to tell the shadow which keys
+/// signed what a session held ([`RoomMirror::take_ended_signers`]): an honest table has a few, and a session of more
+/// is not told, so that nothing counted of it is believed.
+pub const MAX_SIGNERS: usize = 512;
+/// The most bytes of a player's name, or of a signing key, that the mirror keeps of a slip: a page pins at most 128
+/// UTF-16 units of either (3 bytes each, at most), so a longer one is no pin's, and a table of slips with keys of 64 KiB
+/// would hold [`MAX_SIGNERS`] of them for each of its sessions.
+pub const MAX_SIGNER_BYTES: usize = 384;
 /// The changes of a table waiting to be taken (their keys and weights) stop
 /// being read at this; the caller's `take` makes room.
 pub const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
@@ -117,11 +151,21 @@ pub struct Limits {
     pub dirty_keys: usize,
     pub pending_bytes: usize,
     pub session_keys: usize,
+    /// A drain stops, as if it had spent its budget, once it has done something and this has passed
+    /// (None: no limit of time, as in the tests, where a slow machine must not change what a drain does).
+    pub drain_time: Option<Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { drain_bytes: DRAIN_BYTES, drain_paths: DRAIN_PATHS, dirty_keys: MAX_DIRTY_KEYS, pending_bytes: MAX_PENDING_BYTES, session_keys: MAX_SESSION_KEYS }
+        Limits { drain_bytes: DRAIN_BYTES, drain_paths: DRAIN_PATHS, dirty_keys: MAX_DIRTY_KEYS, pending_bytes: MAX_PENDING_BYTES, session_keys: MAX_SESSION_KEYS, drain_time: None }
+    }
+}
+
+impl Limits {
+    /// The limits of the node itself: the defaults, and a drain that takes no longer than [`DRAIN_TIME`].
+    pub fn live() -> Limits {
+        Limits { drain_time: Some(DRAIN_TIME), ..Limits::default() }
     }
 }
 
@@ -138,6 +182,20 @@ struct Dirt {
     tops: BTreeSet<String>,
     /// Changed record keys of a watched live session.
     recs: BTreeMap<String, Recs>,
+    /// Checkpoints (`sum:` names) that changed in a transaction after which the doc held updates it could
+    /// not apply yet, for want of something another peer wrote (a page's trim that deleted records this node
+    /// has not been sent: what it deleted is more than this node has read, and may be more than it will), or in
+    /// which something was made and deleted (records and the trim that deleted them, sent together).
+    lagged: BTreeSet<String>,
+    /// How many times each watched checkpoint (`sum:` name) was written (a value set that was not the one standing,
+    /// as [`rewritten_alike`] tells) since the table last read it: all but the one the drain reads were written over
+    /// before it could.
+    writes: BTreeMap<String, u64>,
+    /// Live sessions (`ses:` names) that something was made and deleted in, in one transaction: a record that came and
+    /// went before the node could read it. Nothing says which record, or leaves one to read, and a page that saw it
+    /// without its deletion counts it in the next checkpoint it writes: the table keeps this until that checkpoint
+    /// ([`Table::suspect`]).
+    suspect: BTreeSet<String>,
 }
 
 enum Recs {
@@ -147,8 +205,23 @@ enum Recs {
 }
 
 impl Dirt {
+    /// Record keys of the session `live` are noted.
+    fn has_recs(&self, live: &str) -> bool {
+        match self.recs.get(live) {
+            Some(Recs::Many) => true,
+            Some(Recs::Keys(keys)) => !keys.is_empty(),
+            None => false,
+        }
+    }
+
     fn merge(&mut self, other: Dirt, limit: usize) {
         self.tops.extend(other.tops);
+        self.lagged.extend(other.lagged);
+        self.suspect.extend(other.suspect);
+        for (name, n) in other.writes {
+            let at = self.writes.entry(name).or_insert(0);
+            *at = at.saturating_add(n);
+        }
         for (name, recs) in other.recs {
             match (self.recs.get_mut(&name), recs) {
                 (None, recs) => {
@@ -171,7 +244,28 @@ impl Dirt {
 #[derive(Default)]
 struct Watch {
     names: HashSet<String>,
+    /// The incarnation of each watched checkpoint's table, by the checkpoint's name (`sum:`): what a value there must
+    /// say to be one.
+    sums: HashMap<String, String>,
     dirt: Dirt,
+    delegations: Delegations,
+}
+
+/// What the observer has seen of the room's delegations (`hk:<house>`), whether or not a table is watched.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delegations {
+    /// Moves with every change to one (and with every update to the map in which something was made and deleted:
+    /// [`Delegations::hidden`]).
+    pub changes: u64,
+    /// One was replaced or removed: a page that had seen it may count a house this node's plan, which learns a
+    /// delegation when a record names the house, cannot know of. (Also one made and deleted that the doc shows no
+    /// trace of, in an update to the map that changed nothing the node could read.)
+    pub churned: bool,
+    /// How many updates to the map may have hidden a delegation made and deleted in them: one in which something was
+    /// made and deleted (the transaction does not say what or where, and the keys it shows do not say that none was a
+    /// delegation), or that left no key to read. A page that saw the delegation counted the house it names, in the
+    /// sessions that were in the room then, and the node never will.
+    pub hidden: u64,
 }
 
 fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
@@ -179,22 +273,161 @@ fn lock(m: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether this transaction deleted a block it also made: something that came to the doc and went in one
+/// transaction, so that nothing was ever there for the node to read. A page's records of a live session and its trim,
+/// which deletes them, can come in one update (the node was away, or the updates were merged on the way): all of it is
+/// integrated, nothing is left waiting, and the records, made in a map that is deleted by the same update, leave no
+/// event of their own. What the node never read of the session before the trim is told only by this.
+pub(crate) fn made_and_deleted(txn: &TransactionMut) -> bool {
+    let before = txn.before_state();
+    txn.delete_set().iter().any(|(client, ranges)| {
+        let seen = before.get(client);
+        ranges.iter().any(|r| r.end > seen)
+    })
+}
+
+/// Whether a change to a key is the value written again as it stands, which every page reads alike (a value of the
+/// doc's plain kind, [`hb::Clarity::Clear`]): the same record under the same key moves nothing.
+///
+/// This runs in the doc's commit, on values a peer wrote: the new one is weighed first ([`hb::weigh`], up to `cap`), and
+/// a value that weighs more, or that a page may read otherwise, is not compared at all and is another. (Two values of
+/// one weight are compared at the cost of that weight: lengths first, then members, so the old one costs no more than
+/// the new.)
+fn rewritten_alike(change: &EntryChange, cap: usize) -> bool {
+    let EntryChange::Updated(Out::Any(old), Out::Any(new)) = change else { return false };
+    match hb::weigh(new, cap) {
+        hb::Weighed::Light { scan, .. } => hb::clarity_within(new, scan, cap) == hb::Clarity::Clear && old == new,
+        hb::Weighed::Heavy | hb::Weighed::Unsure => false,
+    }
+}
+
+/// The watched checkpoints (`sum:`) of the computed map that the transaction set to another value (one written again as
+/// it stands is not one, nor is a key that is not watched): a page's trim of a session writes the checkpoint of the
+/// session's own table, in the transaction that deletes the session it trims ([`sum_of`]).
+fn sums_set_in(names: &HashSet<String>, txn: &TransactionMut, events: &Events) -> HashSet<String> {
+    let mut sums = HashSet::new();
+    for event in events.iter() {
+        let Event::Map(map) = event else { continue };
+        if !map.path().is_empty() {
+            continue;
+        }
+        for (key, change) in map.keys(txn).iter() {
+            if key.starts_with("sum:") && names.contains(&**key) && !rewritten_alike(change, ALIKE_SUM_BYTES) {
+                sums.insert(key.to_string());
+            }
+        }
+    }
+    sums
+}
+
+/// The name of the checkpoint of the table a live session (`ses:<table>:<session>`, the table being `<t>:<inc>`) belongs
+/// to: the one its trim writes.
+fn sum_of(ses: &str) -> Option<String> {
+    let (table, _) = ses.strip_prefix("ses:")?.rsplit_once(':')?;
+    Some(format!("sum:{table}"))
+}
+
+/// Whether a value written under a watched checkpoint's name (`sum:`) could be taken by a page for a checkpoint of the
+/// table of incarnation `inc`: one that is plain and light and none ([`checkpoint_ok`]) is junk on every page, a base
+/// of nothing, and nothing is lost when it is written over. One a page may read otherwise, or that weighs more than
+/// is read here, may be one. (This runs in the doc's commit: the value is weighed first, up to [`ALIKE_SUM_BYTES`].)
+fn may_be_checkpoint(change: &EntryChange, inc: &str) -> bool {
+    let (EntryChange::Inserted(new) | EntryChange::Updated(_, new)) = change else { return true };
+    let Out::Any(new) = new else { return false };
+    match hb::weigh(new, ALIKE_SUM_BYTES) {
+        hb::Weighed::Light { scan, .. } => hb::clarity_within(new, scan, ALIKE_SUM_BYTES) != hb::Clarity::Clear || checkpoint_ok(&CVal::from_any(new), inc),
+        hb::Weighed::Heavy | hb::Weighed::Unsure => true,
+    }
+}
+
 /// The observer's callback. It runs inside the doc's commit: a lookup for
 /// each key that changed, and a key kept only if it is watched.
 fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Events) {
     let mut w = lock(shared);
-    if w.names.is_empty() {
-        return;
-    }
-    let Watch { names, dirt } = &mut *w;
+    let Watch { names, sums, dirt, delegations } = &mut *w;
+    // (After this transaction, did the doc lack something it was sent, or was something made and deleted in it? Asked
+    // once, when a checkpoint changes.)
+    let mut gap = None;
+    // (And once, when a delegation is first written: was something made and deleted in this transaction?)
+    let mut lost = None;
+    // (And once, when a watched session is replaced or removed: which watched checkpoints did the same transaction set?)
+    let mut trimmed: Option<HashSet<String>> = None;
     for event in events.iter() {
         let Event::Map(map) = event else { continue };
         let path = map.path();
         match path.len() {
             0 => {
-                for (key, _) in map.keys(txn).iter() {
+                let keys = map.keys(txn);
+                // (An update that made a delegation and deleted it, or wrote one and wrote it over, shows no key of it,
+                // or shows the last. The map's event has no key to read when that is all it holds (a block made and
+                // deleted shows as no change in the map, and an event of the map with no change in it is always one):
+                // a delegation may have come and gone, and a page that saw it counted the house it names for as long
+                // as the deed holder holds the deed. Nor do the keys it does show say that the update hid none: it
+                // says that something was made and deleted in it, and not what or where, and so it is doubted for the
+                // sessions in the room, as one that left no key is, but not for good. Counted once for the event.)
+                if keys.is_empty() {
+                    delegations.changes += 1;
+                    delegations.hidden += 1;
+                    delegations.churned = true;
+                } else if *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                    delegations.changes += 1;
+                    delegations.hidden += 1;
+                }
+                for (key, change) in keys.iter() {
+                    // (A delegation written again as it stands, as two pages of the deed holder do when both run its duty
+                    // at once, changes nothing: no house comes or goes, and every page reads it alike. One a page may read
+                    // otherwise is churn all the same. And so is one that is the same as it was only in the doc this node
+                    // is left with: written, written over and put back in one update, as when the node was away and the
+                    // updates were merged, it was another on the way, and a page that had that one on its own counted the
+                    // house it names. The transaction says that something was made and deleted in it, and not what: an
+                    // identical rewrite in such a one is doubted.)
+                    if key.starts_with("hk:") && !(rewritten_alike(change, MAX_TOP_BYTES) && !*lost.get_or_insert_with(|| made_and_deleted(txn))) {
+                        delegations.changes += 1;
+                        // (A delegation that is written and written over in one update, as when the node was away and
+                        // the updates were merged, leaves only the last as an insert: a page that had the first
+                        // separately may count a house the plan never knew. The transaction says that something was
+                        // made and deleted in it, and not what: any insert in such a one is doubted.)
+                        if !matches!(change, EntryChange::Inserted(_)) || *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                            delegations.churned = true;
+                        }
+                    }
                     if names.contains(&**key) {
                         dirt.tops.insert(key.to_string());
+                        // (A session made in an update that also made and deleted a record in it: the session is read
+                        // afresh and has no trace of that record. And one removed in such an update: a session made
+                        // under its name in it and deleted too leaves no trace but the removal of the one the node
+                        // held, and a page that saw the one made counted its records. Only a session already watched is
+                        // noted: the one a page's trim makes is not yet, and what the same update made and deleted was
+                        // in the session it trims, whose removal is noted here, and which the base changing, in the
+                        // drain, takes with it.)
+                        //
+                        // And a session map replaced or removed in a transaction of its own: no trim of the session (a
+                        // page's trim writes the checkpoint in the transaction that deletes the session it trims), and
+                        // so the session the pages read from here on is another, made by the one who replaced it, in
+                        // whatever updates, and the records it held are the pages' to count and not the node's to know.
+                        // (A removal in a trim is the base changing, which takes the doubt with it, in the drain: and one
+                        // noted here would outlast it, for the drain that reads it comes after the one that noted it.)
+                        if key.starts_with("ses:")
+                            && (*lost.get_or_insert_with(|| made_and_deleted(txn))
+                                || (!matches!(change, EntryChange::Inserted(_))
+                                    && !sum_of(key).is_some_and(|sum| trimmed.get_or_insert_with(|| sums_set_in(names, txn, events)).contains(&sum))))
+                        {
+                            dirt.suspect.insert(key.to_string());
+                        }
+                        // (A checkpoint set that was not the one standing: a removal is no checkpoint, and a page's put-back
+                        // of one is no other.)
+                        // (And one that no page takes for a checkpoint is no loss when it is written over.)
+                        if key.starts_with("sum:")
+                            && !matches!(change, EntryChange::Removed(_))
+                            && !rewritten_alike(change, ALIKE_SUM_BYTES)
+                            && sums.get(&**key).is_none_or(|inc| may_be_checkpoint(change, inc))
+                        {
+                            let at = dirt.writes.entry(key.to_string()).or_insert(0);
+                            *at = at.saturating_add(1);
+                        }
+                        if key.starts_with("sum:") && *gap.get_or_insert_with(|| txn.store().pending_update().is_some() || txn.store().pending_ds().is_some() || made_and_deleted(txn)) {
+                            dirt.lagged.insert(key.to_string());
+                        }
                     }
                 }
             }
@@ -203,6 +436,28 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
                 // (A record is a plain value: only a session map holds any.)
                 if !name.starts_with("ses:") || !names.contains(&**name) {
                     continue;
+                }
+                // (A record that came and went in one update, as when the node was away and the updates were merged on the
+                // way, is no change to this map and leaves no key to read. The transaction says that something was made and
+                // deleted in it, and not what or where: the session is doubted.)
+                if *lost.get_or_insert_with(|| made_and_deleted(txn)) {
+                    dirt.suspect.insert(name.to_string());
+                }
+                // (A record removed, or replaced by another value under the same key: the keys are the records' hashes,
+                // so no page does either, and one a page that has not seen it counts is a history the node does not
+                // share: the page's next trim of the session is not held against what the node read. A record written
+                // again as it stands is nothing.)
+                for (_, change) in map.keys(txn).iter() {
+                    // (A comparison inside the commit of the doc is bounded: a value that weighs more than a record may,
+                    // or that a page may read otherwise, is not compared and is another.)
+                    let moved = match change {
+                        EntryChange::Inserted(_) => false,
+                        _ => !rewritten_alike(change, MAX_RECORD_BYTES),
+                    };
+                    if moved {
+                        dirt.suspect.insert(name.to_string());
+                        break;
+                    }
                 }
                 let slot = dirt.recs.entry(name.to_string()).or_insert_with(|| Recs::Keys(BTreeSet::new()));
                 let mut many = false;
@@ -231,9 +486,14 @@ fn note(shared: &Mutex<Watch>, limit: usize, txn: &TransactionMut, events: &Even
 
 // ── A drain's budget ─────────────────────────────────────────────────────────
 
+/// How many keys of a session a scan goes through between looks at the clock.
+const SCAN_CHECK_KEYS: usize = 256;
+
 struct Budget {
     bytes: usize,
     paths: usize,
+    /// When the drain must stop (once it has done something).
+    deadline: Option<Instant>,
     /// Nothing charged yet: the one case an action bigger than the whole
     /// budget is admitted (and then costs what is left).
     fresh: bool,
@@ -243,8 +503,31 @@ struct Budget {
 }
 
 impl Budget {
-    fn new(bytes: usize, paths: usize) -> Budget {
-        Budget { bytes, paths, fresh: true, spent: false, used_bytes: 0, used_paths: 0 }
+    fn new(bytes: usize, paths: usize, time: Option<Duration>) -> Budget {
+        Budget { bytes, paths, deadline: time.map(|t| Instant::now() + t), fresh: true, spent: false, used_bytes: 0, used_paths: 0 }
+    }
+
+    /// The time is up: the drain has begun an action before this one, and its deadline has passed. (Asked where an
+    /// action begins, not within it, and not before the first: a drain slow to start is not one that never gets
+    /// anywhere, and an action is read to its end.)
+    fn late(&mut self) -> bool {
+        let late = self.used_paths > 0 && self.deadline.is_some_and(|d| Instant::now() >= d);
+        if late {
+            self.spent = true;
+        }
+        late
+    }
+
+    /// The time is up in the middle of an action: one was done before it in this drain, and the deadline has passed.
+    /// (Asked every [`SCAN_CHECK_KEYS`] keys of a scan of a session, which is given up then and begun again by the next
+    /// drain; and not within the first action of a drain, which is read to its end, so that every drain gets somewhere.
+    /// That one is bounded by the most keys a session may hold.)
+    fn interrupt(&mut self) -> bool {
+        let late = self.used_paths > 1 && self.deadline.is_some_and(|d| Instant::now() >= d);
+        if late {
+            self.spent = true;
+        }
+        late
     }
 
     fn charge(&mut self, n: usize) -> bool {
@@ -269,7 +552,7 @@ impl Budget {
     }
 
     fn path(&mut self) -> bool {
-        if self.spent {
+        if self.spent || self.late() {
             return false;
         }
         if self.paths == 0 {
@@ -298,7 +581,9 @@ enum Base {
 /// Whether two readings of `sum:` are the same checkpoint. A checkpoint is
 /// written again as it was (a peer's page puts it back) and a doc keeps a
 /// map's fields in no order, so two readings of one are compared by their
-/// canonical bytes, not field by field in the order they came.
+/// canonical bytes, not field by field in the order they came. (Two the node
+/// cannot read tell nothing of themselves, so they pass for the same here:
+/// [`Table::step`] takes one written since the last look for another.)
 fn same_base(a: &Base, b: &Base) -> bool {
     match (a, b) {
         (Base::Absent, Base::Absent) | (Base::Held, Base::Held) => true,
@@ -371,6 +656,26 @@ struct Table {
     born: u64,
     generation: u64,
     version: u64,
+    /// The base last changed (a page's trim, a new incarnation) while the live session it left
+    /// still had changes to be read or listed, or while the doc lacked updates a page had (see
+    /// [`Dirt::lagged`]).
+    unread_at_trim: bool,
+    /// Something was made and deleted in the live session in one update ([`Dirt::suspect`]) since the base last
+    /// changed: a page may have counted it, and the next trim of the session is not held against what the node read.
+    suspect: bool,
+    /// How many times the base has changed since it was first read.
+    trims: u64,
+    /// Checkpoints written over before the table read them, not yet told to the caller ([`RoomMirror::take_superseded`]).
+    superseded: u64,
+    /// The (player, signing key) of every slip the live session has held since the table last started over, whether it
+    /// still holds it or not, and whether there were more than [`MAX_SIGNERS`] (`signers_over`: the rest are not kept).
+    signers: BTreeSet<(String, String)>,
+    signers_over: bool,
+    /// The same, of the sessions the table started over from since the caller last asked
+    /// ([`RoomMirror::take_ended_signers`]): the session a page's trim ended is gone from the mirror when the checkpoint
+    /// is read.
+    ended_signers: BTreeSet<(String, String)>,
+    ended_over: bool,
 }
 
 fn cval_bytes(v: &CVal) -> usize {
@@ -408,11 +713,31 @@ impl Table {
             born,
             generation: 0,
             version: 0,
+            unread_at_trim: false,
+            suspect: false,
+            trims: 0,
+            superseded: 0,
+            signers: BTreeSet::new(),
+            signers_over: false,
+            ended_signers: BTreeSet::new(),
+            ended_over: false,
         }
     }
 
     fn ended(&self) -> bool {
         matches!(&self.base, Base::Cp(cp) if cp.get("e").is_some())
+    }
+
+    /// The live session has changes the table has not read: records changed in it (noted, not
+    /// read), or it is still being listed or read, or its map was made or replaced and is in the
+    /// doc now. (A page's trim deletes the session it trims in the transaction that writes the
+    /// checkpoint: a session map gone is not a change to read.)
+    fn session_unread<T: ReadTxn>(&self, pending: &Dirt, comp: Option<&MapRef>, txn: &T) -> bool {
+        if self.need_session || self.cold.is_some() {
+            return true;
+        }
+        let Some(live) = &self.live else { return false };
+        self.suspect || pending.suspect.contains(live) || pending.has_recs(live) || (pending.tops.contains(live) && comp.is_some_and(|c| matches!(c.get(txn, live), Some(Out::YMap(_)))))
     }
 
     fn hold(&self) -> Option<Hold> {
@@ -429,6 +754,12 @@ impl Table {
 
     /// The table starts over: nothing of the session is known.
     fn reset(&mut self) {
+        // (Who signed what the session held is told of the session that ended, once the caller asks.)
+        let over = std::mem::take(&mut self.signers_over);
+        for pair in std::mem::take(&mut self.signers) {
+            self.keep_ended(pair);
+        }
+        self.ended_over |= over;
         self.generation += 1;
         self.version += 1;
         self.keys.clear();
@@ -445,8 +776,9 @@ impl Table {
         self.announce = true;
     }
 
-    fn set_base(&mut self, new: Base) {
-        if self.based && same_base(&new, &self.base) {
+    /// `changed`: the base is not the one the table has (a first reading is a change).
+    fn set_base(&mut self, new: Base, changed: bool) {
+        if !changed {
             return;
         }
         self.based = true;
@@ -468,8 +800,39 @@ impl Table {
         self.present = true;
     }
 
+    /// A pair of an ended session's signers, kept if there is room.
+    fn keep_ended(&mut self, pair: (String, String)) {
+        if self.ended_signers.len() >= MAX_SIGNERS && !self.ended_signers.contains(&pair) {
+            self.ended_over = true;
+        } else {
+            self.ended_signers.insert(pair);
+        }
+    }
+
+    /// Note who signed a slip the session holds: the key of the slip (`s:<round>:<player>:<hash>`) names the player, and
+    /// its value the key it was signed with (`k`), which the fold counts only if it is the key pinned for the player.
+    fn note_signer(&mut self, key: &str, value: &CVal) {
+        let Some(('s', _, Some(pid), _)) = parse_key(key) else { return };
+        let Some(k) = value.get("k").and_then(CVal::as_str) else { return };
+        // (A name or a key longer than any a page pins ([`MAX_SIGNER_BYTES`]) is no pin's and is not copied: the pair
+        // is not told, as when there are too many, so that nothing counted of the session is believed.)
+        if pid.len() > MAX_SIGNER_BYTES || k.len() > MAX_SIGNER_BYTES {
+            self.signers_over = true;
+            return;
+        }
+        let pair = (pid.to_string(), k.to_string());
+        if self.signers.len() >= MAX_SIGNERS && !self.signers.contains(&pair) {
+            self.signers_over = true;
+        } else {
+            self.signers.insert(pair);
+        }
+    }
+
     fn put(&mut self, key: &str, value: Option<CVal>) {
         let size = key.len() + value.as_ref().map_or(0, cval_bytes);
+        if let Some(v) = &value {
+            self.note_signer(key, v);
+        }
         match &value {
             Some(_) => {
                 self.keys.insert(key.to_string(), size);
@@ -597,7 +960,18 @@ impl Table {
         if !b.path() {
             return None;
         }
-        let n = ses.keys(txn).take(limits.session_keys.saturating_add(1)).count();
+        self.count_scan(ses, txn, b, limits)
+    }
+
+    /// [`Table::count_keys`] once the count has been begun (it looks at the clock as it goes: see [`Budget::interrupt`]).
+    fn count_scan<T: ReadTxn>(&mut self, ses: &MapRef, txn: &T, b: &mut Budget, limits: &Limits) -> Option<usize> {
+        let mut n = 0usize;
+        for _ in ses.keys(txn).take(limits.session_keys.saturating_add(1)) {
+            n += 1;
+            if n % SCAN_CHECK_KEYS == 0 && b.interrupt() {
+                return None;
+            }
+        }
         if !b.charge(n.saturating_mul(VISIT_BYTES)) {
             return None;
         }
@@ -626,6 +1000,10 @@ impl Table {
             if seen > limits.session_keys {
                 flooded = true;
                 break;
+            }
+            // (Nothing is kept until the list is made: a list given up is made again.)
+            if seen % SCAN_CHECK_KEYS == 0 && b.interrupt() {
+                return false;
             }
             cost = cost.saturating_add(VISIT_BYTES);
             if key.len() <= MAX_KEY_BYTES {
@@ -676,10 +1054,40 @@ impl Table {
                 Read::Unclear(..) | Read::Heavy => Base::Held,
             };
             pending.tops.remove(&self.sum_name);
+            let sets = pending.writes.remove(&self.sum_name).unwrap_or(0);
             self.read_base = false;
-            self.set_base(new);
+            // (The session the base leaves: what a page wrote to it before it trimmed it, and
+            // this table has not read, is not in what the worker was sent.)
+            let was_based = self.based;
+            // (A checkpoint the node cannot read cannot be told from another it cannot read: one written since the last
+            // look is another.)
+            let same = was_based && same_base(&new, &self.base) && !(new == Base::Held && sets > 0);
+            let changed = !same;
+            // (Of the checkpoints written since the last look, the one standing is the one read, if what stands is one
+            // (a page may take it for a checkpoint): the others were written over before the node could. What stands,
+            // if it is none, is none of them: all that were written were written over.)
+            if was_based {
+                let standing = u64::from(matches!(new, Base::Cp(_) | Base::Held));
+                self.superseded = self.superseded.saturating_add(sets.saturating_sub(standing));
+            }
+            let lagged = pending.lagged.remove(&self.sum_name);
+            let unread = changed && (lagged || self.session_unread(pending, comp, txn));
+            let left = self.live.clone();
+            self.set_base(new, changed);
+            if changed {
+                self.unread_at_trim = unread;
+                // (What was made and deleted in the session the base leaves is not the next session's.)
+                self.suspect = false;
+                if let Some(left) = left {
+                    pending.suspect.remove(&left);
+                }
+                if was_based {
+                    self.trims += 1;
+                }
+            }
         }
         let Some(live) = self.live.clone() else { return true };
+        self.suspect |= pending.suspect.remove(&live);
 
         // The live session: made, replaced or removed.
         if pending.tops.remove(&live) && !self.need_session {
@@ -848,6 +1256,12 @@ pub struct State<'a> {
     pub generation: u64,
     /// Goes up with every change to the base, a record or the hold.
     pub version: u64,
+    /// The base last changed (a page's trim, a new incarnation) while the session it left still
+    /// had changes this mirror had not read: what the worker was sent of that session is not all
+    /// of it, so an answer made before the trim is of less than the checkpoint's page saw.
+    pub unread_at_trim: bool,
+    /// How many times the base has changed since it was first read (a page's trims).
+    pub trims: u64,
 }
 
 impl State<'_> {
@@ -921,6 +1335,11 @@ impl RoomMirror {
         gone
     }
 
+    /// The room this mirror follows.
+    pub fn room(&self) -> &str {
+        &self.room
+    }
+
     /// The tables mirrored.
     pub fn tables(&self) -> impl Iterator<Item = &Ctx> {
         self.tables.values().map(|t| &t.ctx)
@@ -931,7 +1350,7 @@ impl RoomMirror {
         let noted = std::mem::take(&mut lock(&self.shared).dirt);
         self.pending.merge(noted, self.limits.dirty_keys);
         let comp = txn.get_map(COMPUTED_MAP);
-        let mut budget = Budget::new(self.limits.drain_bytes, self.limits.drain_paths);
+        let mut budget = Budget::new(self.limits.drain_bytes, self.limits.drain_paths, self.limits.drain_time);
         let keys: Vec<(String, String)> = self.tables.keys().cloned().collect();
         let mut short = false;
         let mut resets = 0;
@@ -963,7 +1382,10 @@ impl RoomMirror {
     /// The names the observer watches: each table's `sum:`, and its live session.
     fn sync_watch(&mut self) {
         let names: HashSet<String> = self.tables.values().flat_map(|t| [Some(t.sum_name.clone()), t.live.clone()]).flatten().collect();
-        lock(&self.shared).names = names;
+        let sums: HashMap<String, String> = self.tables.values().map(|t| (t.sum_name.clone(), t.ctx.inc.clone())).collect();
+        let mut w = lock(&self.shared);
+        w.names = names;
+        w.sums = sums;
     }
 
     /// Forget dirt that names nothing watched any more.
@@ -971,6 +1393,9 @@ impl RoomMirror {
         let names = lock(&self.shared).names.clone();
         self.pending.tops.retain(|n| names.contains(n));
         self.pending.recs.retain(|n, _| names.contains(n));
+        self.pending.lagged.retain(|n| names.contains(n));
+        self.pending.writes.retain(|n, _| names.contains(n));
+        self.pending.suspect.retain(|n| names.contains(n));
     }
 
     pub fn state(&self, t: &str, inc: &str) -> Option<State<'_>> {
@@ -992,7 +1417,48 @@ impl RoomMirror {
             born: tb.born,
             generation: tb.generation,
             version: tb.version,
+            unread_at_trim: tb.unread_at_trim,
+            trims: tb.trims,
         })
+    }
+
+    /// How many checkpoints of the table were written over, since this was last asked, before the table read them (a
+    /// page wrote another while a drain had not got to the table, or one that was held for a time): each was a trim of the
+    /// table that cannot be held against what the node had worked out, for the node never read it.
+    pub fn take_superseded(&mut self, t: &str, inc: &str) -> u64 {
+        self.tables.get_mut(&(t.to_string(), inc.to_string())).map_or(0, |tb| std::mem::take(&mut tb.superseded))
+    }
+
+    /// Who signed the slips of the session or sessions the table ended since this was last asked (its trims, or any
+    /// other start over of it), as `(player, key)`, and whether there were more than the mirror keeps
+    /// ([`MAX_SIGNERS`]: then the pairs are not all of them). A page counts a slip for the felt only if it is signed
+    /// with the key pinned for the player (its own player's, the key it signs with), so a pair whose key is not the pin
+    /// the node holds for the player is a slip the pages may count differently from the node.
+    pub fn take_ended_signers(&mut self, t: &str, inc: &str) -> (BTreeSet<(String, String)>, bool) {
+        match self.tables.get_mut(&(t.to_string(), inc.to_string())) {
+            Some(tb) => (std::mem::take(&mut tb.ended_signers), std::mem::take(&mut tb.ended_over)),
+            None => (BTreeSet::new(), false),
+        }
+    }
+
+    /// What the observer has seen of the room's delegations since it began.
+    pub fn delegations(&self) -> Delegations {
+        lock(&self.shared).delegations
+    }
+
+    /// The room's delegations are known to have churned, or may have, where this mirror did not see them (the shadow had
+    /// a mirror of the room and let it go, or the house pinned the houses it counts in a stretch in which the room had
+    /// no plan, and nothing watched what the delegations did meanwhile): they count as churned for good, as if this
+    /// mirror had seen it.
+    pub fn inherit_churn(&mut self) {
+        lock(&self.shared).delegations.churned = true;
+    }
+
+    /// The table's checkpoint is waiting to be read: the table is new, or a change to `sum:` has
+    /// been noted that no drain has read.
+    pub fn base_unread(&self, t: &str, inc: &str) -> bool {
+        let Some(tb) = self.tables.get(&(t.to_string(), inc.to_string())) else { return false };
+        tb.read_base || self.pending.tops.contains(&tb.sum_name) || lock(&self.shared).dirt.tops.contains(&tb.sum_name)
     }
 
     /// Start a table over, to be sent again from scratch (the worker lost it):

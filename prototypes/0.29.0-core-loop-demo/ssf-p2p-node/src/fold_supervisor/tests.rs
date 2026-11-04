@@ -316,6 +316,27 @@ fn nothing_starts_until_the_first_frame() {
     assert_eq!(s.counts(), (1, 0));
 }
 
+/// The tests' way of clogging the pipe works before there is a worker too: the worker that is started has it clogged,
+/// and the first frame is refused as busy (the worker is up all the same), not sent.
+#[test]
+fn a_pipe_clogged_before_the_worker_starts_is_the_pipe_of_the_worker_that_does() {
+    let t0 = Instant::now();
+    let (mut s, mut m, launched) = with_one_worker(t0);
+    s.clog(QUEUE_BYTES);
+    assert_eq!(launched.load(Ordering::SeqCst), 0, "(no worker yet)");
+    assert_eq!(s.post(t0, &cold("a", 1)), Post::Busy, "the pipe of that worker is the clogged one");
+    assert_eq!((launched.load(Ordering::SeqCst), s.is_up(), s.owed()), (1, true, 0));
+    s.unclog(QUEUE_BYTES);
+    assert_eq!(s.post(t0, &cold("a", 1)), Post::Posted);
+    assert_eq!(m.next_req(), cold("a", 1));
+    // Taking back before the worker starts: nothing is clogged, and taking back more than was put saturates.
+    let (mut s2, _m2, _) = with_one_worker(t0);
+    s2.clog(5);
+    s2.unclog(50);
+    assert_eq!(s2.post(t0, &cold("a", 1)), Post::Posted);
+    assert_eq!(s2.post(t0, &cold("b", 1)), Post::Posted);
+}
+
 #[test]
 fn a_frame_too_big_to_send_is_refused_and_starts_nothing() {
     let t0 = Instant::now();
@@ -700,6 +721,26 @@ fn a_worker_held_up_by_a_slow_node_is_not_a_worker_that_hung() {
 }
 
 #[test]
+fn an_answer_counted_as_waiting_is_already_in_the_queue() {
+    // (Counted and queued in two steps, a poll between them found the count up and the queue
+    // empty, and, ten seconds on, called the worker silent: a flake of the test above.)
+    for round in 0..300 {
+        let t0 = Instant::now();
+        let (mut s, mut m) = holding(t0, one_answer());
+        s.post(t0, &warm("a", 1));
+        m.next_req();
+        m.reply(&result("a", 1));
+        let link = s.link.as_ref().expect("a link");
+        let deadline = std::time::Instant::now() + secs(30);
+        while link.answer_bytes_waiting() == 0 {
+            assert!(std::time::Instant::now() < deadline, "waited 30 s for an answer to be held");
+            std::hint::spin_loop();
+        }
+        assert!(link.rx.try_recv().is_ok(), "round {round}: an answer counted as waiting is not in the queue");
+    }
+}
+
+#[test]
 fn an_answer_bigger_than_the_whole_allowance_still_comes_when_none_waits() {
     let t0 = Instant::now();
     let (mut s, mut m) = holding(t0, one_answer() / 2);
@@ -1068,7 +1109,7 @@ fn the_sweep_lets_go_of_workers_that_have_exited() {
 #[cfg(unix)]
 #[test]
 fn the_sweep_keeps_a_worker_that_is_still_running() {
-    let mut running = Command::new("sleep").arg("600").spawn().expect("sleep");
+    let running = Command::new("sleep").arg("600").spawn().expect("sleep");
     let pid = running.id();
     let mut list = vec![Arc::new(Mutex::new(quick_child()))];
     let running = Arc::new(Mutex::new(running));
@@ -1081,4 +1122,152 @@ fn the_sweep_keeps_a_worker_that_is_still_running() {
     let mut c = running.lock().unwrap();
     let _ = c.kill();
     let _ = c.wait();
+}
+
+// ── An answer on its way ────────────────────────────────────────────────────
+
+/// An answer the reader has counted off what the worker owes and has not queued yet is the worker's word: neither the
+/// silence of the worker nor the exit of its process is found while it is on its way, and both are found when it is not.
+/// (The reader's step between the count and the queue is held here by taking the count down by hand: a thread cannot be
+/// stopped between two lines of its own.)
+#[test]
+fn no_silence_and_no_exit_is_found_while_an_answer_is_on_its_way() {
+    for exit in [false, true] {
+        let t0 = Instant::now();
+        let (mut s, m) = holding(t0, ANSWER_BYTES);
+        assert_eq!(s.post(t0, &warm("a", 1)), Post::Posted);
+        // The reader has read the answer to the one frame owed, and has not queued it.
+        s.link.as_ref().expect("a link").unanswered.fetch_sub(1, Ordering::SeqCst);
+        if exit {
+            m.exit();
+        }
+        // (Times past the timeout, and past the grace of an exit.)
+        for step in 0..5 {
+            assert!(s.poll(t0 + secs(60 + step * 20)).is_empty(), "exit={exit}: the answer is on its way (step {step})");
+        }
+        assert!(s.is_up(), "exit={exit}");
+        assert_eq!(s.counts().1, 0, "exit={exit}: no failure");
+        // It is queued, or it never was: the count is what the worker owes again, and the silence is found.
+        s.link.as_ref().unwrap().unanswered.fetch_add(1, Ordering::SeqCst);
+        let got = s.poll(t0 + secs(200));
+        assert_eq!(got.len(), 1, "exit={exit}: {got:?}");
+        // (The exit of the process is held for its grace; the silence is long enough to be found first.)
+        assert_eq!(crashed(&got[0]).0, "no answer in 10 s", "exit={exit}");
+    }
+}
+
+/// ... and the exit of a process whose answers are all in is found as before, in its time.
+#[test]
+fn an_exit_with_nothing_on_its_way_is_found_after_its_grace() {
+    let t0 = Instant::now();
+    let (mut s, m) = holding(t0, ANSWER_BYTES);
+    s.post(t0, &warm("a", 1));
+    m.exit();
+    assert!(s.poll(t0 + secs(1)).is_empty(), "the exit is seen");
+    let got = s.poll(t0 + secs(1) + EXIT_GRACE);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(crashed(&got[0]).0, "the worker exited");
+}
+
+/// The answers a poll finds queued are handed over whatever the count says: the check of one on its way is made after them.
+#[test]
+fn an_answer_in_the_queue_is_handed_over_before_the_check_of_one_on_its_way() {
+    let t0 = Instant::now();
+    let (mut s, mut m) = holding(t0, ANSWER_BYTES);
+    for v in 1..=2 {
+        s.post(t0, &warm("a", v));
+        m.next_req();
+    }
+    m.reply(&result("a", 1));
+    until("the first answer queued", || s.link.as_ref().is_some_and(|l| l.answer_bytes_waiting() > 0));
+    // The second is owed and not answered: the first is handed over at once, however late the node looks, and the wait
+    // for the second counts from there.
+    let late = t0 + secs(60);
+    assert_eq!(s.poll(late), vec![Event::Answer(result("a", 1))]);
+    assert!(s.poll(late + secs(9)).is_empty());
+    let got = s.poll(late + secs(11));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(crashed(&got[0]).0, "no answer in 10 s", "the second, owed, is silence");
+}
+
+// ── Review round 6: the time a request is queued ─────────────────────────────
+
+/// Workers that take `took` of virtual time to start (the clock the test gives says so), handed out one by one.
+struct Takes {
+    next: VecDeque<io::Result<Link>>,
+    time: Arc<Mutex<Instant>>,
+    took: Duration,
+}
+
+impl Launch for Takes {
+    fn launch(&mut self) -> io::Result<Link> {
+        *self.time.lock().unwrap() += self.took;
+        self.next.pop_front().unwrap_or_else(|| Err(io::Error::other("no worker left")))
+    }
+}
+
+fn takes(t0: Instant, took: Duration, items: Vec<io::Result<Link>>) -> (Supervisor<Takes>, Arc<Mutex<Instant>>) {
+    let time = Arc::new(Mutex::new(t0));
+    (Supervisor::new(Takes { next: items.into(), time: time.clone(), took }, t0), time)
+}
+
+/// A worker that took half a minute to start is owed its answer from when the frame was queued, which is after it: it is
+/// not called silent for the time the start took.
+#[test]
+fn a_frame_is_owed_its_answer_from_when_it_was_queued_after_the_worker_took_long_to_start() {
+    let t0 = Instant::now();
+    let (link, mut m) = manual_link(false);
+    let (mut s, time) = takes(t0, secs(30), vec![Ok(link)]);
+    let clock = move || *time.lock().unwrap();
+    assert_eq!(s.post_with(&clock, &cold("a", 1)), Post::Posted);
+    let up = t0 + secs(30);
+    assert_eq!(s.owed.front().map(|o| o.posted), Some(up), "queued after the start");
+    assert_eq!(s.last_answer, up, "and the worker is heard from when it is up");
+    m.next_req();
+    assert!(s.poll(up + secs(9)).is_empty(), "nine seconds after it was queued is not silence");
+    let got = s.poll(up + secs(11));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(crashed(&got[0]).0, "no answer in 10 s");
+    // The pass that began with the time before the start (`post`) has no other time to give.
+    let (link, mut m) = manual_link(false);
+    let (mut s, _) = takes(t0, secs(30), vec![Ok(link)]);
+    assert_eq!(s.post(t0, &cold("a", 1)), Post::Posted);
+    assert_eq!(s.owed.front().map(|o| o.posted), Some(t0));
+    m.next_req();
+}
+
+/// A frame posted to a worker that is already up is queued at the time the clock says after it was encoded and sent.
+#[test]
+fn a_frame_is_queued_at_the_time_the_clock_says_when_it_was_sent() {
+    let t0 = Instant::now();
+    let (mut s, _m, _) = with_one_worker(t0);
+    assert_eq!(s.post(t0, &warm("a", 1)), Post::Posted);
+    let readings = std::cell::Cell::new(0u64);
+    let clock = || {
+        readings.set(readings.get() + 1);
+        t0 + secs(readings.get())
+    };
+    assert_eq!(s.post_with(&clock, &warm("a", 2)), Post::Posted);
+    assert_eq!(readings.get(), 1, "read once, after the frame was sent (the worker was up: no start asked for it)");
+    assert_eq!(s.owed.back().map(|o| o.posted), Some(t0 + secs(1)));
+}
+
+/// A worker that would not start is waited for from when it failed, not from when it was asked for; and the wait
+/// is over when the clock says so, whatever time the pass began with.
+#[test]
+fn the_wait_after_a_worker_that_would_not_start_runs_from_when_it_failed_and_is_over_by_the_clock() {
+    let t0 = Instant::now();
+    let (link, _m) = manual_link(false);
+    let (mut s, time) = takes(t0, secs(30), vec![Err(io::Error::other("no")), Ok(link)]);
+    let t = time.clone();
+    let clock = move || *t.lock().unwrap();
+    assert_eq!(s.post_with(&clock, &cold("a", 1)), Post::Down);
+    let failed = t0 + secs(30);
+    assert_eq!(s.state(), State::Backoff(failed + backoff(1)), "from the time the start failed");
+    // Asked for in the wait: not started.
+    assert_eq!(s.post_with(&|| failed + secs(0), &cold("a", 1)), Post::Down);
+    assert_eq!(s.started, 0);
+    // The wait is over by the clock (the pass began before the end of it): started.
+    assert_eq!(s.post_with(&|| failed + backoff(1) + secs(1), &cold("a", 1)), Post::Posted);
+    assert_eq!(s.started, 1);
 }

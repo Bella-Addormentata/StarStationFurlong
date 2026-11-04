@@ -8,9 +8,9 @@ use iroh::SecretKey;
 use yrs::updates::decoder::Decode;
 use yrs::{MapPrelim, WriteTxn};
 
-const ROOM: &str = "room-house";
-const T: &str = "roulette-1";
-const INC: &str = "r0123456789abcdef01234567";
+pub(crate) const ROOM: &str = "room-house";
+pub(crate) const T: &str = "roulette-1";
+pub(crate) const INC: &str = "r0123456789abcdef01234567";
 const NODE: [u8; 32] = [7u8; 32];
 
 struct Who {
@@ -66,11 +66,11 @@ fn seed_of(pid: &str, r: i64) -> String {
     hex::encode(hb::sha256(format!("seed|{pid}|{r}").as_bytes()))
 }
 
-struct Room {
-    doc: Doc,
+pub(crate) struct Room {
+    pub(crate) doc: Doc,
     owner: Who,
-    house: House,
-    now: u64,
+    pub(crate) house: House,
+    pub(crate) now: u64,
     dir: PathBuf,
 }
 
@@ -83,7 +83,7 @@ fn scratch(name: &str) -> PathBuf {
 
 impl Room {
     /// The owner's room, its table switched on, the house delegated or not.
-    fn new(name: &str, delegate: bool) -> Self {
+    pub(crate) fn new(name: &str, delegate: bool) -> Self {
         let dir = scratch(name);
         let mut house = House::open(&NODE, Some(dir.join(STATE_FILE))).unwrap();
         // (The settle after a start has a test of its own.)
@@ -212,7 +212,7 @@ impl Room {
         self.put_top(&format!("hf:{T}"), &rec);
     }
 
-    fn tick(&mut self, after: u64) -> TickOut {
+    pub(crate) fn tick(&mut self, after: u64) -> TickOut {
         self.now += after;
         self.house.tick(ROOM, &self.doc, self.now, 1_700_000_000_000 + self.now)
     }
@@ -224,7 +224,7 @@ impl Room {
     }
 
     /// The live session's records of a kind, by key.
-    fn records(&self, prefix: &str) -> Vec<(String, CVal)> {
+    pub(crate) fn records(&self, prefix: &str) -> Vec<(String, CVal)> {
         let ses = self.ses_key();
         let txn = self.doc.transact();
         let comp = txn.get_map(COMPUTED_MAP).unwrap();
@@ -3809,4 +3809,658 @@ fn a_players_many_slips_and_seeds_are_hashed_once_each() {
     room.tick_passes(TICK_MS, 1);
     let hashed = hb::COMMITS_HASHED.with(|n| n.get());
     assert!(hashed <= 2 * N + 8, "{hashed} commitments hashed in a pass");
+}
+
+// ── What the node's fold in shadow follows ───────────────────────────────────
+
+fn fold_plan_of(room: &mut Room) -> Option<HousePlan> {
+    room.house.fold_plan(ROOM)
+}
+
+#[test]
+fn the_fold_follows_the_house_tables_of_a_room_this_house_is_a_house_of() {
+    let mut room = Room::new("fold-view", true);
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert_eq!(plan.tables, vec![(T.to_string(), INC.to_string())]);
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
+    assert!(plan.complete);
+    assert_eq!(plan.owner, "owner", "the deed holder the houses stand under, as roomInfo names them");
+    assert_eq!(plan.owner_key, room.owner.public, "and the key the pass pinned for it, whose delegations those houses are");
+}
+
+/// What `roomInfo.owner` names as the deed holder: a string that names someone (a room that is nobody's says
+/// "Local-Clone", an unset one is nothing).
+#[test]
+fn the_deed_holder_is_a_string_that_names_someone() {
+    use yrs::{Any, Out};
+    let string = |v: &str| Some(Out::Any(Any::String(v.into())));
+    assert_eq!(deed_of(string("alice")), Some("alice".to_string()));
+    assert_eq!(deed_of(string("")), None, "empty");
+    assert_eq!(deed_of(string("Local-Clone")), None, "nobody's room");
+    assert_eq!(deed_of(Some(Out::Any(Any::Number(1.0)))), None, "not a string");
+    assert_eq!(deed_of(None), None, "unset");
+}
+
+/// The plan is of the deed holder the pass read: a pass after the deed changed hands names the new one.
+#[test]
+fn the_plan_names_the_deed_holder_the_pass_read() {
+    let mut room = Room::new("fold-view-owner", true);
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room).expect("a plan").owner, "owner");
+    // The deed goes to another player of the room, who has a key pinned and has not delegated this house: no plan.
+    let alice = who("alice");
+    {
+        let mut txn = room.doc.transact_mut();
+        let players = txn.get_or_insert_map("players");
+        players.insert(&mut txn, "alice", to_any(&obj(vec![("keyB64", s(&alice.public))])));
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None, "(the house is delegated by the last holder, not this one)");
+}
+
+#[test]
+fn the_fold_follows_nothing_in_a_room_this_house_is_not_delegated_in() {
+    let mut room = Room::new("fold-view-undelegated", false);
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+    // The owner delegates it: followed from the next pass.
+    room.delegate(&room.owner);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).is_some());
+}
+
+#[test]
+fn a_room_with_no_house_table_is_followed_with_no_tables_to_let_the_shadow_forget_the_last() {
+    let mut room = Room::new("fold-view-none", true);
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.remove(&mut txn, &format!("cfg:computed:{T}"));
+    }
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan, with no table in it");
+    assert!(plan.tables.is_empty());
+    // A table the room has marked gone is no table either.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        casino.insert(&mut txn, format!("cfg:computed:{T}"), to_any(&obj(vec![("v", CVal::Int(1)), ("inc", s(INC))])));
+        casino.insert(&mut txn, format!("gone:{T}:{INC}"), Any::Bool(true));
+    }
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan, with no table in it");
+    assert!(plan.tables.is_empty());
+}
+
+#[test]
+fn a_plan_is_not_kept_from_a_pass_that_ended_before_the_room_had_a_house() {
+    let mut room = Room::new("fold-view-stale", true);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).is_some());
+    // The deed holder changes: the next pass cannot pin the new one's key in the players map, so it ends at once.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("nobody-here")));
+    }
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+}
+
+#[test]
+fn another_house_of_the_owners_is_counted_once_this_house_has_read_its_record() {
+    let mut room = Room::new("fold-view-two", true);
+    let mut b_house = second_house(&room);
+    // The other house joins round 1 first; this one reads its join.
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let before = fold_plan_of(&mut room);
+    assert_eq!(before, None, "this house has not ticked yet");
+    room.tick(1_000);
+    room.tick(1_000);
+    assert_eq!(room.records("o:1:").len(), 1, "the other house's join is the table's");
+    let view = fold_plan_of(&mut room).expect("a plan");
+    let mut want = vec![room.house.public().to_string(), b_house.public().to_string()];
+    want.sort();
+    assert_eq!(view.houses, want);
+}
+
+#[test]
+fn a_house_delegated_by_someone_who_is_not_the_deed_holder_is_not_counted() {
+    let mut room = Room::new("fold-view-forged", true);
+    let mallory = who("mallory");
+    let mut b_house = House::open(&[9u8; 32], None).unwrap();
+    b_house.settle_ms = 0;
+    // Mallory delegates it, not the owner.
+    let rec = room_signed("hkey", "", &mallory, obj(vec![("v", CVal::Int(1)), ("h", s(b_house.public()))]));
+    room.put_top(&format!("hk:{}", b_house.public()), &rec);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
+}
+
+#[test]
+fn a_house_a_former_deed_holder_delegated_is_not_counted_and_one_listed_twice_is_counted_once() {
+    let mut room = Room::new("fold-view-former", true);
+    room.tick(1_000);
+    let own = room.house.public().to_string();
+    let owner_key = room.house.rooms[ROOM].fold.as_ref().expect("a plan").owner_key.clone();
+    let other = who("former-house").public;
+    // One verified under a deed holder who is gone (the entry stays until the house is asked about it again) ...
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), "a-former-deed-holder".into());
+    // ... and this house's own key among the list too.
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(own.clone(), owner_key.clone());
+    assert_eq!(fold_plan_of(&mut room).unwrap().houses, vec![own.clone()]);
+    // Under the current deed holder it counts.
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(other.clone(), owner_key);
+    let mut want = vec![own, other];
+    want.sort();
+    assert_eq!(fold_plan_of(&mut room).unwrap().houses, want);
+}
+
+/// The plan is complete when the pass behind it read the room to its end: a
+/// short tick's plan is not.
+#[test]
+fn a_plan_is_not_complete_from_a_pass_that_was_short() {
+    let pad = |n: usize| Any::String(Arc::from("x".repeat(n)));
+    let stray = |i: u8| obj(vec![("r", CVal::Int(1)), ("p", s("carol")), ("s", s(&format!("{i:064x}")))]);
+    let mut room = Room::new("fold-view-short", true);
+    room.tick(0);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "a plain pass");
+    for i in 0..5 {
+        room.put_padded('x', &stray(i), pad(READ_PER_TICK / 4));
+    }
+    assert!(room.tick(200).short);
+    assert!(!fold_plan_of(&mut room).unwrap().complete, "a short pass");
+}
+
+/// A pass that left a table waiting on a value a page may read otherwise (a
+/// house's delegation here) did not resolve what the table names, so its
+/// plan is not complete; the live house's decisions are what they were.
+#[test]
+fn a_plan_is_not_complete_while_a_table_waits_on_a_value_a_page_may_read_otherwise() {
+    let mut room = Room::new("fold-view-unclear", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    let key = format!("hk:{}", b_house.public());
+    let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &key, usize::MAX).unwrap();
+    room.put_top_padded(&key, &deleg, Any::Undefined);
+    let b_pub = b_house.public().to_string();
+    for i in 0..5 {
+        let body = obj(vec![("r", CVal::Int(9)), ("c", s(&format!("{i:064x}"))), ("k", s(&b_pub)), ("g", s(&"A".repeat(86)))]);
+        room.put_raw(&key_of('o', &body), &body);
+    }
+    room.tick(0);
+    let waiting = fold_plan_of(&mut room).unwrap();
+    assert!(!waiting.complete, "the table waits on the delegation");
+    assert!(clean(room.raw_top(&key), &deleg), "(and it went back clean)");
+    for _ in 0..3 {
+        room.tick(200);
+    }
+    assert!(fold_plan_of(&mut room).unwrap().complete, "read clean: complete");
+}
+
+/// A Fair setting a page may read otherwise holds its table for a pass (it
+/// goes back clean first), and the plan, whose houses a table that waited
+/// did not name, is not complete until it plays on.
+#[test]
+fn a_plan_is_not_complete_while_a_table_waits_on_a_fair_setting_a_page_may_read_otherwise() {
+    let mut room = Room::new("fold-plan-fair", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "a plain pass");
+    let rec = room_signed("hfair", T, &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))]));
+    room.put_top_padded(&format!("hf:{T}"), &rec, Any::Undefined);
+    // (A pass for its check, then the last: the table is held, for the cutoff.)
+    room.tick_passes(200, 2);
+    let mem = &room.house.rooms[ROOM].tables[&(T.to_string(), INC.to_string())];
+    assert!(mem.held_since.is_some());
+    assert!(!fold_plan_of(&mut room).unwrap().complete, "the table waits on the setting");
+    room.tick(200);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "read clean: complete");
+}
+
+// ── Review round 4: a pass that could not say ────────────────────────────────
+
+/// A pass that spent its reads before it had seen every switch says nothing of the room, and is no word that the tables
+/// have gone: the plan of the pass before is kept, not complete, so that the shadow does not let go of tables it is
+/// reading (and so cannot compare their trims) because a room had a busy tick.
+#[test]
+fn a_pass_that_could_not_read_every_switch_keeps_the_last_plan_not_complete() {
+    let mut room = Room::new("fold-plan-kept-switches", true);
+    room.tick(1_000);
+    let before = fold_plan_of(&mut room).expect("a plan");
+    assert!(before.complete && before.tables == vec![(T.to_string(), INC.to_string())]);
+    // The casino map grows past what a tick reads.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..60_000 {
+            casino.insert(&mut txn, format!("zz:{i:08}"), Any::Bool(true));
+        }
+    }
+    room.tick(200);
+    assert!(room.house.read_out, "(the pass spent its reads)");
+    let kept = fold_plan_of(&mut room).expect("the plan of the pass before");
+    assert!(!kept.complete, "but not complete");
+    assert_eq!((kept.tables, kept.houses), (before.tables.clone(), before.houses.clone()));
+    // The map is as it was: the next pass reads it all, and the plan is complete again.
+    {
+        let mut txn = room.doc.transact_mut();
+        let casino = txn.get_or_insert_map(CASINO_MAP);
+        for i in 0..60_000 {
+            casino.remove(&mut txn, &format!("zz:{i:08}"));
+        }
+    }
+    room.tick(200);
+    let again = fold_plan_of(&mut room).expect("a plan");
+    assert!(again.complete && again.tables == before.tables);
+}
+
+/// ... and so does a pass whose check of the delegation was put off (the budget of checks, the doc let go for them): a
+/// delegation not checked yet is not one that is not there.
+#[test]
+fn a_pass_whose_check_of_the_delegation_was_put_off_keeps_the_last_plan_not_complete() {
+    let mut room = Room::new("fold-plan-kept-check", true);
+    room.tick(1_000);
+    let before = fold_plan_of(&mut room).expect("a plan");
+    // A new deed holder, who delegates: their record is checked once, and not in the pass that finds it.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.delegate(&who("alice"));
+    room.tick_passes(200, 1);
+    let kept = fold_plan_of(&mut room).expect("the plan of the pass before");
+    assert!(!kept.complete);
+    assert_eq!(kept.tables, before.tables);
+    // The next tick has the check, and the plan is the new deed holder's.
+    room.tick(200);
+    let now = fold_plan_of(&mut room).expect("a plan");
+    assert!(now.complete);
+    assert_eq!(room.house.rooms[ROOM].fold.as_ref().map(|f| f.owner_key.clone()), Some(who("alice").public.clone()));
+}
+
+/// A delegation that is not there is a word: a deed holder who has not delegated this house leaves no plan, as a
+/// pass whose check was not put off shows (the plan is not kept for anything but a pass that could not say).
+#[test]
+fn a_pass_that_found_no_delegation_leaves_no_plan() {
+    let mut room = Room::new("fold-plan-gone", true);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).is_some());
+    // A new deed holder, who has not delegated this house; the old one's delegation names the old one's key.
+    {
+        let mut txn = room.doc.transact_mut();
+        let info = txn.get_or_insert_map("roomInfo");
+        info.insert(&mut txn, "owner", Any::String(Arc::from("alice")));
+    }
+    room.tick(200);
+    assert!(!room.house.deferred, "(nothing was put off: the record is not one to check)");
+    assert_eq!(fold_plan_of(&mut room), None);
+    room.tick(200);
+    assert_eq!(fold_plan_of(&mut room), None);
+}
+
+// ── Review round 7: this house's own delegation ──────────────────────────────
+
+/// The house goes on as the delegate it verified when the record under its key is taken away, written over, or made one a
+/// page may read otherwise, and puts the record back when it is due (REPUT_MS); but until it has, the pages may not count
+/// this house as the plan does, so the plan is not complete, and is again once a pass has read the record put back.
+#[test]
+fn a_plan_is_not_complete_while_the_record_of_this_houses_own_delegation_is_not_the_one_it_holds() {
+    type Spoil = fn(&Room, &str, &CVal);
+    let cases: Vec<(&str, Spoil)> = vec![
+        ("taken away", |room, key, _| {
+            let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = room.doc.transact_mut();
+            comp.remove(&mut txn, key);
+        }),
+        ("written over", |room, key, _| room.put_top(key, &obj(vec![("v", CVal::Int(2))]))),
+        ("a page may read it otherwise", |room, key, deleg| room.put_top_padded(key, deleg, Any::Undefined)),
+    ];
+    for (name, spoil) in cases {
+        let mut room = Room::new(&format!("fold-plan-own-{}", name.len()), true);
+        room.tick(0);
+        room.tick(200);
+        assert!(fold_plan_of(&mut room).unwrap().complete, "{name}: a plain pass");
+        let own = format!("hk:{}", room.house.public());
+        let deleg = top_value_within(&room.doc.get_or_insert_map(COMPUTED_MAP), &room.doc.transact(), &own, usize::MAX).unwrap();
+        spoil(&room, &own, &deleg);
+        // (Not yet due to be put back.)
+        room.tick(200);
+        assert!(!clean(room.raw_top(&own), &deleg), "{name}: the record is still not the one held");
+        assert!(!fold_plan_of(&mut room).unwrap().complete, "{name}: the pages may not count the house");
+        assert_eq!(fold_plan_of(&mut room).unwrap().houses, vec![room.house.public().to_string()], "(the house is in the plan all the same)");
+        // The pass that puts it back read the other.
+        room.tick(REPUT_MS);
+        assert!(clean(room.raw_top(&own), &deleg), "{name}: put back");
+        assert!(!fold_plan_of(&mut room).unwrap().complete, "{name}: the pass that put it back read the other");
+        // And the next reads what every page does.
+        room.tick(200);
+        assert!(fold_plan_of(&mut room).unwrap().complete, "{name}: read as held: complete");
+    }
+}
+
+/// A delegation of another house that is other than the one the plan counts is no matter of this house's own: this
+/// house's record is read for this house only.
+#[test]
+fn another_houses_record_does_not_leave_this_houses_plan_incomplete() {
+    let mut room = Room::new("fold-plan-own-other", true);
+    let b_house = second_house(&room);
+    room.tick(0);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete);
+    room.put_top(&format!("hk:{}", b_house.public()), &obj(vec![("v", CVal::Int(2))]));
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).unwrap().complete, "(the other house's record is none of this house's own)");
+}
+
+// ── Round 10: what the plan's houses are, and when they are all there ────────
+
+/// The deed goes to `holder`, a player of the room.
+fn give_the_deed(room: &Room, holder: &str) {
+    let mut txn = room.doc.transact_mut();
+    let info = txn.get_or_insert_map("roomInfo");
+    info.insert(&mut txn, "owner", Any::String(Arc::from(holder)));
+}
+
+/// A peer (another client than the house's own) writes `value` under `key` in the session `ses`.
+fn peer_writes(doc: &Doc, ses: &str, key: &str, value: Any) {
+    let peer = Doc::with_client_id(78);
+    let sv = {
+        let txn = doc.transact();
+        let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+        txn.state_vector()
+    };
+    {
+        let comp = peer.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = peer.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, value);
+    }
+    let update = peer.transact().encode_state_as_update_v1(&sv);
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+}
+
+/// Houses pinned before a stretch in which the room had no plan (the deed holder was one that had not delegated this
+/// house) are the plan's still, as the pages pin them; but nothing watched their delegations meanwhile, and a page that
+/// binds now counts only those the doc holds: the plan says so.
+#[test]
+fn a_plan_that_comes_back_with_a_house_pinned_before_a_gap_says_so() {
+    let mut room = Room::new("fold-view-gap", true);
+    let mut b_house = second_house(&room);
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    let b_pub = b_house.public().to_string();
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert!(plan.houses.contains(&b_pub), "(the other house is pinned)");
+    assert!(!plan.gapped, "no gap yet");
+    // The deed goes to a player who has not delegated this house: no plan for a tick. The other house's delegation is
+    // withdrawn meanwhile, and the deed comes back.
+    give_the_deed(&room, "alice");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.remove(&mut txn, format!("hk:{b_pub}").as_str());
+    }
+    give_the_deed(&room, "owner");
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan again");
+    assert!(plan.houses.contains(&b_pub), "(it stays pinned, as the pages pin it)");
+    assert!(plan.gapped, "and nothing watched its delegation in between");
+    // The deed goes to another holder who delegates this house too: the houses are theirs, and none is pinned for them.
+    let carol = who("carol");
+    give_the_deed(&room, "carol");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None, "(carol has not delegated it yet)");
+    room.delegate(&carol);
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("carol's plan");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()], "(none of the pinned houses is carol's)");
+    assert!(!plan.gapped, "a gap in which nothing of this deed holder's was pinned is no gap of theirs");
+}
+
+/// A gap with no other house pinned has nothing stale in it; and a plan that never went has a mirror that watched.
+#[test]
+fn a_gap_with_no_other_house_pinned_and_a_plan_that_never_went_are_no_gap() {
+    // No other house.
+    let mut room = Room::new("fold-view-gap-alone", true);
+    room.tick(1_000);
+    give_the_deed(&room, "alice");
+    room.tick(1_000);
+    assert_eq!(fold_plan_of(&mut room), None);
+    give_the_deed(&room, "owner");
+    room.tick(1_000);
+    let plan = fold_plan_of(&mut room).expect("a plan again");
+    assert_eq!(plan.houses, vec![room.house.public().to_string()]);
+    assert!(!plan.gapped, "(it pinned none to be stale)");
+    // A house pinned after the gap is no stale one.
+    let owner_key = room.house.rooms[ROOM].fold.as_ref().expect("a plan").owner_key.clone();
+    let later = who("a-house-pinned-later").public;
+    room.house.rooms.get_mut(ROOM).unwrap().houses.insert(later.clone(), owner_key);
+    let plan = fold_plan_of(&mut room).expect("a plan");
+    assert!(plan.houses.contains(&later), "(pinned now)");
+    assert!(!plan.gapped, "(and after the gap)");
+    // A plan that stays: the delegation withdrawn is the mirror's to see, as it is for as long as the plan stands.
+    let mut room = Room::new("fold-view-no-gap", true);
+    let b_house = second_house(&room);
+    b_house.public();
+    let mut b_house = b_house;
+    b_house.tick(ROOM, &room.doc, room.now, 1_700_000_000_000 + room.now);
+    room.tick(1_000);
+    room.tick(1_000);
+    assert!(fold_plan_of(&mut room).unwrap().houses.len() > 1);
+    {
+        let comp = room.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = room.doc.transact_mut();
+        comp.remove(&mut txn, format!("hk:{}", b_house.public()).as_str());
+    }
+    room.tick(1_000);
+    room.tick(1_000);
+    assert!(!fold_plan_of(&mut room).unwrap().gapped, "(the plan was there the whole time)");
+}
+
+/// A peer (another client than the house's own) writes `value` under the top-level `key` of the computed map.
+fn peer_top(doc: &Doc, key: &str, value: Any) {
+    let peer = Doc::with_client_id(79);
+    let sv = {
+        let txn = doc.transact();
+        let state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        peer.transact_mut().apply_update(yrs::Update::decode_v1(&state).unwrap()).unwrap();
+        txn.state_vector()
+    };
+    {
+        let comp = peer.get_or_insert_map(COMPUTED_MAP);
+        comp.insert(&mut peer.transact_mut(), key, value);
+    }
+    let update = peer.transact().encode_state_as_update_v1(&sv);
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+}
+
+/// A tick of several passes in which `how` happens to the doc between the first and the next (while the checks are
+/// made, with the doc let go): whether the plan is complete after it, and how many looks the tick took. A second table
+/// with nothing to check goes through in the first pass; the first has checks to wait for. (In "a peer, with no table
+/// gone through" there is only the first: nothing went through before the checks, and the next pass reads it all.)
+fn between_the_passes(how: &str, watch: bool) -> (bool, u32) {
+    let (complete, taken, _) = between_the_passes_in(how, watch, 8);
+    (complete, taken)
+}
+
+/// [`between_the_passes`] with a tick of `passes` passes at most; the last is whether the tick was short.
+fn between_the_passes_in(how: &str, watch: bool, passes: usize) -> (bool, u32, bool) {
+    let mut room = Room::new(&format!("fold-view-between-{}-{watch}-{passes}", how.replace([' ', ',', '\''], "-")), true);
+    room.house.watch_plans(watch);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    let ses2 = if how.contains("no table") { room.ses_key() } else { second_table(&room) };
+    room.reveal(&alice, 1);
+    room.reveal(&bob, 1);
+    let (doc, fired) = (room.doc.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let how_now = how.to_string();
+    let setting = to_any(&room_signed("hfair", "roulette-2", &room.owner, obj(vec![("v", CVal::Int(1)), ("m", CVal::Int(1)), ("s", CVal::Int(1))])));
+    room.house.on_check = Some(Box::new(move |_| {
+        if fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let value = Any::Number(1.0);
+        match how_now.as_str() {
+            "a peer" | "a peer, with no table gone through" => peer_writes(&doc, &ses2, "x:1:padding", value),
+            // (A setting of the second table that the next pass has to check before it reads anything: it is deferred.)
+            "a peer's setting" => peer_top(&doc, "hf:roulette-2", setting.clone()),
+            "this node" => {
+                let comp = doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = doc.transact_mut();
+                let Some(Out::YMap(m)) = comp.get(&txn, &ses2) else { panic!("no session") };
+                m.insert(&mut txn, "x:1:padding", value);
+            }
+            _ => {}
+        }
+    }));
+    let out = room.tick_passes(200, passes);
+    // (With passes enough the tick reads it to its end, whatever the checks take.)
+    assert!(!out.short || passes < 8, "{how}: read to its end");
+    let complete = fold_plan_of(&mut room).expect("a plan").complete;
+    let taken = room.house.looks.taken;
+    // (And the next tick, with nothing between its passes, is complete: what a peer sent is read now.)
+    room.tick(200);
+    room.tick(200);
+    assert!(fold_plan_of(&mut room).expect("a plan").complete, "{how}: the next tick");
+    (complete, taken, out.short)
+}
+
+/// Passes of a tick read the doc one after the other, with the doc let go between them for the checks. A table that went
+/// through in a pass is not read again in the next, so a record a peer sent to it in between (naming a house the pass
+/// has not learned) is not seen: the plan is not complete. What this node wrote itself is not what a peer sent.
+#[test]
+fn a_plan_is_not_complete_when_a_peer_sent_to_a_table_that_had_gone_through_between_the_passes() {
+    for (how, complete) in [("nothing", true), ("a peer", false), ("this node", true), ("a peer, with no table gone through", true)] {
+        assert_eq!(between_the_passes(how, true).0, complete, "{how}");
+    }
+}
+
+/// A pass that is deferred (a record to check before anything is read) compares with the pass before all the same: the
+/// look it leaves is not the one that hides what was sent before it.
+#[test]
+fn a_peer_that_sent_before_a_pass_that_is_deferred_is_found_by_the_pass_that_follows() {
+    assert!(!between_the_passes("a peer's setting", true).0, "the plan is not complete");
+}
+
+/// The looks are taken between the passes of a tick that has a table through and another pass to follow: a tick with one
+/// pass, or with nothing through when the checks are made, takes none (a look walks every client the doc has known); and
+/// when no shadow reads the plans (`watch_plans(false)`) none is taken, and the plan says nothing of what a peer sent.
+#[test]
+fn a_look_is_taken_only_between_passes_with_a_table_through_and_only_when_the_plans_are_read() {
+    // A tick of one pass.
+    let mut room = Room::new("fold-view-one-pass", true);
+    let (alice, bob) = (who("alice"), who("bob"));
+    room.closed_on_the_join(&alice, &bob);
+    room.tick(200);
+    assert_eq!(room.house.looks.taken, 0, "(a tick of one pass)");
+    assert!(fold_plan_of(&mut room).expect("a plan").complete);
+    // Several passes.
+    let taken = between_the_passes("nothing", true).1;
+    assert!(taken >= 2 && taken % 2 == 0, "a look as a pass ends and one as the next begins: {taken}");
+    assert_eq!(between_the_passes("a peer", true).1, 2, "(none more once the plan is not complete)");
+    assert_eq!(between_the_passes("a peer, with no table gone through", true).1, 0, "(nothing through: nothing to protect)");
+    // The last pass of a tick leaves no look: none is to compare it.
+    let (_, taken, short) = between_the_passes_in("nothing", true, 2);
+    assert!(short, "(two passes were not enough)");
+    assert_eq!(taken, 2, "a look as the first pass ends and one as the second begins, and none as the second ends");
+    // The plans are read until told otherwise.
+    assert!(Room::new("fold-view-default-watch", true).house.watch_plans);
+    // Nothing reads the plans.
+    for how in ["nothing", "a peer", "this node"] {
+        assert_eq!(between_the_passes(how, false), (true, 0), "{how}: not watched");
+    }
+}
+
+/// The look a pass leaves is compared by the next, and used up by it.
+#[test]
+fn the_look_a_pass_leaves_is_compared_by_the_next_and_used_up() {
+    let seen = |n: u32| Seen { clients: n, ..Seen::default() };
+    let mut looks = Looks::default();
+    let mut asked = 0;
+    looks.resume(|| {
+        asked += 1;
+        seen(1)
+    });
+    assert_eq!((asked, looks.moved), (0, false), "(no look left: none is asked for)");
+    looks.rest(|| seen(1));
+    looks.resume(|| seen(1));
+    assert!(!looks.moved, "the doc is as the pass left it");
+    looks.resume(|| {
+        asked += 1;
+        seen(2)
+    });
+    assert_eq!((asked, looks.moved), (0, false), "(a look is used once)");
+    looks.rest(|| seen(2));
+    looks.resume(|| seen(3));
+    assert!(looks.moved, "the doc is other: a peer sent in between");
+    looks.rest(|| panic!("a plan that is not complete takes no more looks"));
+    assert!(looks.rested.is_none());
+    looks.resume(|| panic!("there is none to compare"));
+    assert!(looks.moved, "(for the tick)");
+    // The last look is the one compared.
+    let mut looks = Looks::default();
+    looks.rest(|| seen(1));
+    looks.rest(|| seen(2));
+    looks.resume(|| seen(2));
+    assert!(!looks.moved, "(the look left last)");
+}
+
+/// What peers have sent to a doc is a few words that change with who wrote and how far, and not with what this node wrote.
+#[test]
+fn what_a_peer_sent_is_a_few_words_that_change_with_who_wrote_how_far_and_not_with_this_nodes_writes() {
+    // A doc this node (client 5) wrote to, and peers (client, how many entries) that wrote to theirs, in this order.
+    let doc_of = |peers: &[(u64, usize)]| {
+        let doc = Doc::with_client_id(5);
+        let map = doc.get_or_insert_map("m");
+        map.insert(&mut doc.transact_mut(), "own", 1);
+        for (client, entries) in peers {
+            let peer = Doc::with_client_id(*client);
+            let theirs = peer.get_or_insert_map("m");
+            for i in 0..*entries {
+                theirs.insert(&mut peer.transact_mut(), format!("k{client}-{i}"), 1);
+            }
+            let update = peer.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+            doc.transact_mut().apply_update(yrs::Update::decode_v1(&update).unwrap()).unwrap();
+        }
+        doc
+    };
+    let seen = |doc: &Doc| seen_of(&doc.transact(), 5);
+    assert_eq!(seen(&doc_of(&[])), Seen::default(), "(only this node wrote)");
+    let own_more = doc_of(&[]);
+    let before = seen(&own_more);
+    own_more.get_or_insert_map("m").insert(&mut own_more.transact_mut(), "more", 2);
+    assert_eq!(seen(&own_more), before, "this node's own writes are not a peer's");
+    let all = [
+        doc_of(&[(6, 1)]),
+        doc_of(&[(6, 2)]),
+        doc_of(&[(7, 1)]),
+        doc_of(&[(6, 1), (7, 2)]),
+        doc_of(&[(6, 2), (7, 1)]),
+        doc_of(&[(6, 1), (7, 1), (8, 1)]),
+        doc_of(&[(6, 3)]),
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            assert_eq!(seen(a) == seen(b), i == j, "{i} and {j}");
+        }
+    }
+    assert_eq!(seen(&doc_of(&[(6, 1), (7, 2)])), seen(&doc_of(&[(7, 2), (6, 1)])), "(in whatever order they came)");
+    assert_eq!(seen(&all[3]).clients, 2);
 }

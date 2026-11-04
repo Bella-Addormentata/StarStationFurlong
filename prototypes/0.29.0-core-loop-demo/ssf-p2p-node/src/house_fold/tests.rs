@@ -565,8 +565,17 @@ fn encoded_strings_are_charged_to_the_memory_limit() {
 fn a_table_replaced_near_the_limit_gives_its_memory_back_first() {
     let ctx = ctx_n(0);
     let mut e = engine_with(&ctx);
-    // The table holds ~32 MB; the limit leaves less than a new context needs on top of it.
-    e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = [new Array(1000000).fill(1), new Array(1000000).fill(2)]")).unwrap();
+    // The table holds some 16 MiB, as the runtime counts it (the allocator decides how much an array
+    // of a million numbers costs, and macOS's counts more than glibc's, so the size is measured, not
+    // assumed); the limit leaves less than a new context needs on top of it.
+    e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big = []")).unwrap();
+    for _ in 0..1_000 {
+        if e.rt.memory_usage().malloc_size >= (16 << 20) {
+            break;
+        }
+        e.call(&key_of(&ctx), COLD_BUDGET, |js| js.eval::<(), _>("globalThis.big.push(new Array(100000).fill(1))")).unwrap();
+    }
+    assert!(e.rt.memory_usage().malloc_size >= (16 << 20), "{} bytes held", e.rt.memory_usage().malloc_size);
     e.rt.set_memory_limit(e.rt.memory_usage().malloc_size as usize + (200 << 10));
     // No call to the collector here: opening the table again must free the old one itself.
     e.open(&ctx, None, &[], &[]).unwrap();

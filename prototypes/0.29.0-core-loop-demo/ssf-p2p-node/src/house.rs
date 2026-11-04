@@ -171,7 +171,7 @@ pub const VISIT_BYTES: usize = 64;
 /// a longer one is no record's, and nothing reads its bytes.
 pub const MAX_KEY_BYTES: usize = 1_024;
 
-const CASINO_MAP: &str = "casino";
+pub(crate) const CASINO_MAP: &str = "casino";
 pub(crate) const COMPUTED_MAP: &str = "casinoComputed";
 
 // ── Shapes (computedFold / computedHouse guards, as far as the house reads) ──
@@ -682,6 +682,66 @@ struct RoomMem {
     /// Which table a tick reads first (in name order, from this one on):
     /// one on from the last after a tick a read was short.
     turn: usize,
+    /// What the last pass found for the node's fold in shadow
+    /// ([`House::fold_plan`]): None while the room has no verified delegation of
+    /// this house. A pass that could not finish reading (its reads spent before
+    /// every switch was seen, or a check put off) keeps the plan of the one
+    /// before, not complete: it says nothing of the room, which is no word that
+    /// the tables have gone.
+    fold: Option<FoldPlan>,
+    /// Some tick ended with the room having no plan while other houses were pinned in it: the deed holder was one
+    /// that had not delegated this house (or its delegation was not verified), and nothing watched what the
+    /// delegations did meanwhile. The houses pinned here stay pinned (as the pages pin them), and a page that binds
+    /// afterwards counts only those whose delegation the doc holds then, so the houses of a plan that comes after
+    /// ([`HousePlan::gapped`]) may be more than the ones a page counts. For the run.
+    gapped: bool,
+}
+
+/// The house tables a pass found in a room it is delegated a house of, and
+/// the deed holder's key they stand under.
+#[derive(Clone, Debug, PartialEq)]
+struct FoldPlan {
+    /// The deed holder, as the room's `roomInfo` named them when the pass read it ([`deed_of`]), and the key they stand under.
+    owner: String,
+    owner_key: String,
+    tables: Vec<(String, String)>,
+    /// The tick that found it read everything it wanted of the room without
+    /// waiting on a check or running out of reads (`TickOut::short` unset),
+    /// and held no table of it over a value a page may read otherwise, nor
+    /// found a house's delegation so: the houses it verified are then every
+    /// one the room's records name.
+    complete: bool,
+}
+
+/// What the house found in a room for the node's fold in shadow
+/// (fold_shadow.rs): the house tables to follow `(t, inc)`, and the keys of
+/// the houses the fold counts (this one, and every other the deed holder
+/// delegated that this house has verified). The players' keys are not here:
+/// the shadow watches the players itself (fold_pins.rs), so that following a
+/// room reads no doc under the house's lock and writes nothing the house
+/// decides by.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HousePlan {
+    /// The deed holder the houses stand under, as `roomInfo` named them when the pass read it: the pages count a house
+    /// by the delegations of whoever holds the deed, so a plan is a plan of one holder's houses, and the shadow, which
+    /// watches the deed itself (fold_pins.rs), holds it against a trim only while the doc names them still.
+    pub owner: String,
+    /// The key the pass pinned for that holder, whose delegations name the houses: the shadow holds the plan against a
+    /// trim only while its own watch of the players has the same key pinned for them (a holder whose key was replaced
+    /// between the pass's pin and the watch's, or a first key seen at different times, is another set of houses).
+    pub owner_key: String,
+    pub tables: Vec<(String, String)>,
+    pub houses: Vec<String>,
+    /// The houses are every one the room's records name: the pass that found
+    /// the tables read the whole room, and held no table (nor found a
+    /// delegation) over a value a page may read otherwise. A fold of a room
+    /// whose houses are not all known can leave out a close a page counts, so
+    /// it is not held against a checkpoint.
+    pub complete: bool,
+    /// The room had a stretch with no plan while other houses were pinned in it (`RoomMem::gapped`): a delegation
+    /// may have been withdrawn in it, which nothing watched, and the houses here, which are pinned for the run, may be
+    /// more than a page that binds now counts. The shadow takes the room's delegations as churned.
+    pub gapped: bool,
 }
 
 /// What the house last did at a table, on disk ([`STATE_FILE`]): the highest
@@ -747,6 +807,11 @@ pub struct House {
     /// and whether it goes back (each table naming one waits; it goes back
     /// once).
     unclear_houses: HashMap<String, bool>,
+    /// Whether this pass found the delegation under this house's own key (`hk:<this house>`) in the doc other than
+    /// the one the house holds: gone, another record, or one a page may read otherwise. The house goes on as the
+    /// delegate it verified, and puts the record back when it is due (REPUT_MS), but until it has, the pages may not
+    /// count this house as the plan does.
+    own_off: bool,
     /// A table held this pass with its values put back: the next pass reads
     /// it again, and it plays on in the same tick. (In the tick's last pass
     /// it is held: the next tick reads it.)
@@ -765,6 +830,13 @@ pub struct House {
     /// check past the budget), whether it counts as running Fair, and
     /// whether it was short: a later pass reads only the others.
     through: HashMap<(String, String), (bool, bool)>,
+    /// What the tick's passes saw of the doc between them ([`Looks`]).
+    looks: Looks,
+    /// The clients' id of this node's doc (its own writes are not what a peer sent).
+    own_client: u64,
+    /// Whether anything reads the plans ([`House::fold_plan`]): the fold in shadow. When nothing does, the passes of a tick
+    /// take no look at the doc between them.
+    watch_plans: bool,
     /// The tables held this tick: one whose own record the put-back writes
     /// again is read again ([`House::plan`]).
     held_now: HashSet<(String, String)>,
@@ -831,6 +903,81 @@ pub(crate) fn read_costed(charge: impl FnOnce(usize) -> bool, key_len: usize, ou
     }
 }
 
+/// What peers have sent to a doc, as two words whatever its history: how many clients other than this node's own have
+/// written to it, and a sum of a scramble of each client and how far it has written. Equal at two looks if and only if a
+/// peer sent nothing between them (but for a collision of the 64-bit sum, which a peer cannot aim at: clients are theirs,
+/// but the scramble is not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Seen {
+    clients: u32,
+    sum: u64,
+}
+
+fn scramble(x: u64) -> u64 {
+    let x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// One walk of the doc's clients, with no sorting and nothing kept: the node takes it only between the passes of a tick
+/// that has a table through and another pass to come ([`Looks`]), and not at all when no shadow reads the plan.
+fn seen_of<T: ReadTxn>(txn: &T, own: u64) -> Seen {
+    let mut seen = Seen::default();
+    for (client, clock) in txn.state_vector().iter() {
+        if client.get() == own {
+            continue;
+        }
+        let h = scramble(scramble(client.get()).wrapping_add(u64::from(*clock)));
+        seen.clients = seen.clients.wrapping_add(1);
+        seen.sum = seen.sum.wrapping_add(h);
+    }
+    seen
+}
+
+/// What a tick's passes saw of the doc between them. The doc is let go between passes (the checks are made without it),
+/// and a table that went through in a pass is not read again in the next: if a peer sent anything since, the table is
+/// not as it was read, and a record of a house the pass would have learned may be in it. So a pass that leaves a table
+/// through, with another to follow, takes a look as it ends ([`Looks::rest`]), and the next takes another as it begins
+/// ([`Looks::resume`]) and compares. Nothing is looked at in a tick of one pass (the usual), in a pass that has nothing
+/// through, or when nothing reads the plan.
+#[derive(Default)]
+struct Looks {
+    /// The doc as the last pass left it, when a table had gone through and another pass was to follow.
+    rested: Option<Seen>,
+    /// A peer sent to the doc after a table went through, and it was not read again: the tick's plan is not complete.
+    moved: bool,
+    /// How many looks were taken (the tests count them).
+    #[cfg(test)]
+    taken: u32,
+}
+
+impl Looks {
+    /// A pass ends with a table through and another to follow: the look is asked for only if it is wanted.
+    fn rest(&mut self, seen: impl FnOnce() -> Seen) {
+        if !self.moved {
+            self.rested = Some(seen());
+            #[cfg(test)]
+            {
+                self.taken += 1;
+            }
+        }
+    }
+
+    /// A pass begins: if the last left a look, a peer sent in between if the doc is other now. (The look is used up.)
+    fn resume(&mut self, seen: impl FnOnce() -> Seen) {
+        if let Some(then) = self.rested.take() {
+            #[cfg(test)]
+            {
+                self.taken += 1;
+            }
+            if then != seen() {
+                self.moved = true;
+            }
+        }
+    }
+}
+
 /// What [`House::tick`] did in a room.
 #[derive(Default, Debug, PartialEq)]
 pub struct TickOut {
@@ -872,12 +1019,16 @@ impl House {
             heals: Vec::new(),
             healing: false,
             unclear_houses: HashMap::new(),
+            own_off: false,
             reread: false,
             last_pass: false,
             wanted: HashMap::new(),
             short: false,
             fresh: 0,
             through: HashMap::new(),
+            looks: Looks::default(),
+            own_client: 0,
+            watch_plans: true,
             held_now: HashSet::new(),
             stepping_down: false,
             settle_ms: SETTLE_MS,
@@ -1008,6 +1159,40 @@ impl House {
         Some(k)
     }
 
+    /// A pass that could not read the room to say what it holds keeps the plan the last one found, not complete
+    /// ([`House::fold_plan`]). (The end of the tick sets `complete` for every plan from whether the tick was short, and a
+    /// tick that kept a plan was; saying it here as well is for whoever reads this alone.)
+    fn keep_plan(&mut self, room: &str, prev: Option<FoldPlan>) {
+        if let (Some(prev), Some(mem)) = (prev, self.rooms.get_mut(room)) {
+            mem.fold = Some(FoldPlan { complete: false, ..prev });
+        }
+    }
+
+    /// Whether the plans are read at all (the fold in shadow; on until told otherwise). When nothing reads them the
+    /// passes of a tick take no look at the doc between them, which is work for the plan's `complete` and nothing else.
+    pub fn watch_plans(&mut self, on: bool) {
+        self.watch_plans = on;
+    }
+
+    /// What the node's fold in shadow follows in `room`: None unless the last
+    /// pass found this house delegated (a pass that could not read the room to
+    /// the end left the plan before it, which is not complete, so that tables
+    /// the shadow is reading are not let go of on a pass that could not say).
+    /// The tables may be none (the last one has ended: the shadow reads what it
+    /// left and lets it go). Copied from what the pass found: no doc is read
+    /// here, so the house's lock is held for a copy only.
+    pub fn fold_plan(&self, room: &str) -> Option<HousePlan> {
+        let mem = self.rooms.get(room)?;
+        let plan = mem.fold.as_ref()?;
+        let mut houses: Vec<String> = mem.houses.iter().filter(|(_, owner)| **owner == plan.owner_key).map(|(k, _)| k.clone()).collect();
+        houses.push(self.key.public.clone());
+        houses.sort();
+        houses.dedup();
+        // (Only a plan that names a house besides this one has any pinned to be stale.)
+        let gapped = mem.gapped && houses.len() > 1;
+        Some(HousePlan { owner: plan.owner.clone(), owner_key: plan.owner_key.clone(), tables: plan.tables.clone(), houses, complete: plan.complete, gapped })
+    }
+
     /// Charge `n` to this tick's reads ([`READ_PER_TICK`]): false once they
     /// are spent, and then the read is short (`deferred`), as is every read
     /// after it this tick.
@@ -1096,6 +1281,8 @@ impl House {
         self.read_out = false;
         self.fresh = 0;
         self.through.clear();
+        self.looks = Looks::default();
+        self.own_client = doc.client_id().get();
         self.held_now.clear();
         self.wanted.clear();
         let mut out = TickOut::default();
@@ -1110,6 +1297,12 @@ impl House {
                 let writes = self.plan(room, &txn, now, wall);
                 out.wrote += writes.len();
                 updates.extend(apply(&mut txn, &writes));
+                // (Another pass is to follow and a table is through, which it will not read again: what the doc holds now is
+                // what a peer may have added to by then. Nothing is looked at in the usual tick of one pass.)
+                if self.watch_plans && pass < passes && (!self.wanted.is_empty() || self.reread) && !self.through.is_empty() {
+                    let own = self.own_client;
+                    self.looks.rest(|| seen_of(&txn, own));
+                }
             }
             out.short = self.short;
             if self.wanted.is_empty() && !self.reread {
@@ -1123,6 +1316,28 @@ impl House {
         }
         self.through.clear();
         self.held_now.clear();
+        // (The plan the last pass made is complete when the tick got to read the room to its end,
+        // and left no table of it waiting on a value a page may read otherwise, which would leave
+        // out of the plan's houses one the table names: the live house's decisions are as they were.
+        // A delegation a page may read otherwise holds the table that names it, so `waiting` says as
+        // much as `houses_clear` does; both are kept, for the rule stands apart from how it is kept.)
+        // (And this house's own delegation: the record the doc holds under its key is the one it holds, as every page
+        // reads it, for the house goes on as the delegate it verified while the record is other, and the pages may not
+        // count it, which `unclear_houses` does not say: it holds the other houses, which a table names.)
+        // (And a peer sent nothing, between the passes, to a table that went through in an earlier one and was not read
+        // again: a record of a house it names that the pass never learned would leave the plan's houses short.)
+        let houses_clear = self.unclear_houses.is_empty() && !self.own_off;
+        let moved_between = self.looks.moved;
+        if let Some(mem) = self.rooms.get_mut(room) {
+            let waiting = mem.fold.as_ref().is_some_and(|p| p.tables.iter().any(|k| mem.tables.get(k).is_some_and(|m| m.held_since.is_some())));
+            if let Some(plan) = mem.fold.as_mut() {
+                plan.complete = !out.short && houses_clear && !waiting && !moved_between;
+            }
+            // (A tick that ended with no plan, in a room that has houses pinned: nothing watches their delegations now.)
+            if mem.fold.is_none() && !mem.houses.is_empty() {
+                mem.gapped = true;
+            }
+        }
         while self.verdicts.len() > MAX_VERDICTS {
             if let Some(old) = self.verdict_order.pop_front() {
                 self.verdicts.remove(&old);
@@ -1144,15 +1359,19 @@ impl House {
 
     fn plan<T: ReadTxn>(&mut self, room: &str, txn: &T, now: u64, wall: u64) -> Vec<Write> {
         let mut writes = Vec::new();
+        // (What the doc holds as this pass begins, when the pass before it left a look: the doc was let go between them, and
+        // a table that went through is not read again. This is before anything else, so a pass cut short compares too.)
+        let own = self.own_client;
+        self.looks.resume(|| seen_of(txn, own));
         self.unclear_houses.clear();
+        self.own_off = false;
+        // (The fold follows only what a pass that got this far found; a pass cut short keeps the last one's, not complete.)
+        let prev = self.rooms.get_mut(room).and_then(|mem| mem.fold.take());
         let Some(comp) = txn.get_map(COMPUTED_MAP) else { return writes };
         let pub_key = self.key.public.clone();
 
         // The deed holder and their key, pinned on first sight.
-        let owner = txn.get_map("roomInfo").and_then(|m| match m.get(txn, "owner") {
-            Some(Out::Any(Any::String(s))) if !s.is_empty() && &*s != "Local-Clone" => Some(s.to_string()),
-            _ => None,
-        });
+        let owner = txn.get_map("roomInfo").and_then(|m| deed_of(m.get(txn, "owner")));
         let Some(owner) = owner else { return writes };
         self.rooms.entry(room.to_string()).or_default();
         let Some(owner_key) = self.pin_of(room, txn, &owner) else { return writes };
@@ -1183,9 +1402,16 @@ impl House {
         // (Its check put off: the next pass.)
         let Some(delegation) = delegation else {
             self.short |= self.deferred;
+            // (A check put off is no word that there is no delegation.)
+            if self.deferred {
+                self.keep_plan(room, prev);
+            }
             return writes;
         };
         self.rooms.get_mut(room).unwrap().delegation = Some(delegation.clone());
+        // (The record in the doc is the one held, and as a page reads it, or the pages may not count this house: the
+        // plan is not complete until the put-back has written it again and a pass has read it so.)
+        self.own_off = !(deleg_clear && deleg_now.as_ref().is_some_and(|v| hb::rec_hash(v) == hb::rec_hash(&delegation)));
 
         // Every house the deed holder delegated (another of their nodes is a
         // house of the room as this one is, and its records hold the line,
@@ -1220,9 +1446,11 @@ impl House {
         // (The switches not all read: nothing in the room, the next tick.)
         if self.read_out {
             self.short = true;
+            self.keep_plan(room, prev);
             return writes;
         }
         tables.sort();
+        self.rooms.get_mut(room).unwrap().fold = Some(FoldPlan { owner: owner.clone(), owner_key: owner_key.clone(), tables: tables.clone(), complete: false });
 
         // The owner's Fair setting of each of them, the one standing over
         // every other seen (fair_after; a new deed holder's count afresh:
@@ -2233,6 +2461,15 @@ fn grace_of(t0: u64, times: &mut [u64]) -> u64 {
     grace
 }
 
+/// The deed holder a room's `roomInfo` map names under `owner`: a non-empty string that is not the placeholder of a
+/// clone made on the spot (a room with no deed holder has no house).
+pub(crate) fn deed_of(out: Option<Out>) -> Option<String> {
+    match out {
+        Some(Out::Any(Any::String(s))) if !s.is_empty() && &*s != "Local-Clone" => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Top-level record `key` (a delegation, a setting, a heartbeat): None as
 /// well when it weighs more than [`MAX_TOP_BYTES`], which none of them does.
 fn top_value<T: ReadTxn>(map: &MapRef, txn: &T, key: &str) -> Option<CVal> {
@@ -2371,4 +2608,4 @@ fn write_state(path: &std::path::Path, done: &HashMap<(String, String, String), 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

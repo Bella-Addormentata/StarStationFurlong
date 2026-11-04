@@ -374,6 +374,133 @@ fn a_new_checkpoint_starts_the_table_over() {
     assert_eq!((f.state().version, d.bytes), (v, 0));
 }
 
+impl Fix {
+    /// A page's trim (writeCheckpointAndTrim): in one transaction the checkpoint, the session it
+    /// trims gone, and the next session.
+    fn page_trim(&self, old: &str, base: &CVal, next: &str, copies: &[(String, CVal)]) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), to_any(base));
+        comp.remove(&mut txn, old);
+        let m = comp.insert(&mut txn, next, MapPrelim::default());
+        for (k, v) in copies {
+            m.insert(&mut txn, k.as_str(), to_any(v));
+        }
+    }
+}
+
+/// A trim that finds the mirror up to date with the session it trims leaves nothing unread: the
+/// session being gone is the trim, not a change to read.
+#[test]
+fn a_trim_of_a_session_read_to_its_end_leaves_nothing_unread() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+    assert!(!f.state().unread_at_trim, "(a table not read yet)");
+    f.drain();
+    f.take();
+    assert!(!f.state().unread_at_trim, "(the first base is no trim)");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[(rk(1, 3), rv(1, 30))]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(!f.state().unread_at_trim);
+}
+
+/// What a page wrote to the session, and the mirror had noted and not read, when the trim came:
+/// the worker was never sent it, though the checkpoint's page counted it.
+#[test]
+fn a_trim_that_comes_with_records_of_the_old_session_still_unread_says_so() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    // A close written, then the trim (the one drain finds both).
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    let v = f.state().version;
+    f.drain();
+    assert_eq!(f.state().generation, 1 + 1, "(the base moved)");
+    assert!(f.state().unread_at_trim);
+    assert!(f.state().version > v);
+    // The next trim, with the session read up, says it was not.
+    f.take();
+    f.drain();
+    f.take();
+    let base2 = cp(3);
+    let next2 = live_of(T, Some(&base2));
+    f.page_trim(&next, &base2, &next2, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next2.as_str()));
+    assert!(!f.state().unread_at_trim);
+}
+
+/// The notes are the mirror's own: a record changed before an earlier drain that ran short of
+/// the table is still unread at the trim.
+#[test]
+fn a_trim_that_comes_while_the_old_session_is_still_being_read_says_so() {
+    let many: Vec<(String, CVal)> = (0..40).map(|i| (rk(1, i), rv(1, i as i64))).collect();
+    let mut f = Fix::seeded(small(3_000, 4), |f| f.session(&live0(), &many));
+    f.drain();
+    assert!(f.state().reading, "the cold read is not finished");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(f.state().unread_at_trim);
+}
+
+/// A session map put there again (not removed by the trim) is a change nobody read.
+#[test]
+fn a_trim_that_leaves_the_old_session_replaced_says_so() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    f.session(&live0(), &records(&[(1, 10), (2, 20)]));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.put_top(&sum_of(T), &base);
+    f.session(&next, &[]);
+    f.drain();
+    assert_eq!(f.state().live, Some(next.as_str()));
+    assert!(f.state().unread_at_trim);
+}
+
+/// A checkpoint written again as it was changes no base: the flag stays as the last change left it.
+#[test]
+fn a_checkpoint_put_back_as_it_was_leaves_the_flag_as_it_was() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    f.drain();
+    f.take();
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert!(f.state().unread_at_trim);
+    f.put_top(&sum_of(T), &base);
+    f.drain();
+    assert!(f.state().unread_at_trim);
+}
+
+#[test]
+fn a_checkpoint_waiting_to_be_read_is_said_to_be() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    assert!(f.m.base_unread(T, INC), "a table not read yet");
+    f.drain();
+    assert!(!f.m.base_unread(T, INC));
+    f.put(&live0(), &rk(1, 2), &rv(1, 20));
+    assert!(!f.m.base_unread(T, INC), "(records are no checkpoint)");
+    let base = cp(2);
+    f.put_top(&sum_of(T), &base);
+    assert!(f.m.base_unread(T, INC), "noted, not yet merged by a drain");
+    // Short of the table: still unread after a drain that did not reach it.
+    f.drain();
+    assert!(!f.m.base_unread(T, INC));
+    assert!(!f.m.base_unread("no-such-table", INC));
+}
+
 #[test]
 fn a_table_let_go_of_and_wanted_again_is_another_whatever_its_generation() {
     let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
@@ -1418,6 +1545,7 @@ fn applying_what_is_taken_gives_the_doc_whatever_the_budgets() {
             dirty_keys: 2 + rng.next(12) as usize,
             pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 64,
+            drain_time: None,
         };
         let mut f = Fix::with(limits);
         let mut model = Model::default();
@@ -1499,8 +1627,9 @@ fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
             dirty_keys: 2 + rng.next(12) as usize,
             pending_bytes: MAX_QUEUED_RECORD + 400 + rng.next(4_000) as usize,
             session_keys: 24,
+            drain_time: None,
         };
-        let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24 };
+        let big = Limits { drain_bytes: 1 << 30, drain_paths: 1 << 20, dirty_keys: 2_048, pending_bytes: 1 << 30, session_keys: 24, drain_time: None };
         let mut f = Fix::with(limits);
         let mut model = Model::default();
         let live = live0();
@@ -1583,5 +1712,1465 @@ fn how_a_table_stands_does_not_depend_on_the_changes_it_came_by() {
             }
         }
         assert!(compared > 10, "seed {seed}: {compared}");
+    }
+}
+
+// ── Review round 3 ───────────────────────────────────────────────────────────
+
+/// A doc built as a page builds its own, with a client id of its own, and the updates that carry its work to another.
+struct Page {
+    doc: Doc,
+}
+
+impl Page {
+    fn new(client: u64) -> Page {
+        Page { doc: Doc::with_client_id(client) }
+    }
+
+    /// Everything the page has done since `since`, as an update.
+    fn diff_since(&self, since: &yrs::StateVector) -> Vec<u8> {
+        self.doc.transact().encode_diff_v1(since)
+    }
+
+    fn state(&self) -> yrs::StateVector {
+        self.doc.transact().state_vector()
+    }
+
+    fn apply(&self, update: &[u8]) {
+        use yrs::updates::decoder::Decode;
+        self.doc.transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+    }
+
+    fn session(&self, name: &str, records: &[(String, CVal)]) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let m = comp.insert(&mut txn, name, MapPrelim::default());
+        for (k, v) in records {
+            m.insert(&mut txn, k.as_str(), to_any(v));
+        }
+    }
+
+    fn put(&self, ses: &str, key: &str, v: &CVal) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.insert(&mut txn, key, to_any(v));
+    }
+
+    fn trim(&self, old: &str, base: &CVal, next: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), to_any(base));
+        comp.remove(&mut txn, old);
+        comp.insert(&mut txn, next, MapPrelim::default());
+    }
+}
+
+/// The page that wrote a record the node never got trims the session that holds it: the node is told to
+/// delete what it was not sent, and what the page counted is more than it has read (and more than it will).
+#[test]
+fn a_trim_that_deletes_records_the_node_was_never_sent_says_it_is_unread() {
+    for gap in [true, false] {
+        let first = Page::new(1);
+        first.session(&live0(), &records(&[(1, 10)]));
+        let sent = first.diff_since(&yrs::StateVector::default());
+        let mut f = Fix::empty();
+        let second = Page::new(2);
+        second.apply(&sent);
+        {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&sent).unwrap()).unwrap();
+        }
+        f.drain();
+        f.take();
+        // The first page writes a close; the second reads it and trims the session.
+        let before = first.state();
+        first.put(&live0(), &rk(1, 2), &rv(1, 20));
+        let close = first.diff_since(&before);
+        second.apply(&close);
+        if !gap {
+            // (This time the node is sent it, and reads it, before the trim.)
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&close).unwrap()).unwrap();
+            f.drain();
+            f.take();
+        }
+        let before = second.state();
+        let base = cp(2);
+        second.trim(&live0(), &base, &live_of(T, Some(&base)));
+        let trim = second.diff_since(&before);
+        {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+        }
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (false, gap), "gap={gap}: the doc waits for what the trim deleted exactly when it was not sent it, and for no update");
+        f.drain();
+        assert_eq!(f.state().generation, 1 + 1, "gap={gap}: (the base moved)");
+        assert_eq!(f.state().unread_at_trim, gap, "gap={gap}");
+        assert_eq!(f.state().trims, 1);
+        // What was lacking comes, and the next trim is not marked by the last. (While the doc still lacks it, every trim is.)
+        if gap {
+            use yrs::updates::decoder::Decode;
+            f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&close).unwrap()).unwrap();
+            assert!(f.doc.transact().store().pending_ds().is_none(), "the delete set is applied when the blocks it names come");
+        }
+        f.drain();
+        f.take();
+        let next = live_of(T, Some(&base));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!(f.state().trims, 2);
+        assert!(!f.state().unread_at_trim, "gap={gap}: the lag of the first trim is not the second's");
+    }
+}
+
+/// The doc can lack more than what a trim deletes: an update it was sent and cannot apply yet, for
+/// want of what its page had (here a record into a session of another table that the node was not sent).
+#[test]
+fn a_trim_that_comes_while_the_doc_waits_for_an_update_says_it_is_unread() {
+    let maker = Page::new(6);
+    maker.session("ses:other:x:y", &[]);
+    let other = maker.diff_since(&yrs::StateVector::default());
+    let writer = Page::new(5);
+    writer.apply(&other);
+    let before = writer.state();
+    writer.put("ses:other:x:y", &rk(1, 1), &rv(1, 10));
+    let orphan = writer.diff_since(&before);
+    // The table's own page work, which needs nothing the node lacks.
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let session = first.diff_since(&yrs::StateVector::default());
+    let trimmer = Page::new(3);
+    trimmer.apply(&session);
+    let before = trimmer.state();
+    let base = cp(2);
+    trimmer.trim(&live0(), &base, &live_of(T, Some(&base)));
+    let trim = trimmer.diff_since(&before);
+    for waits in [true, false] {
+        use yrs::updates::decoder::Decode;
+        let mut f = Fix::empty();
+        {
+            let mut txn = f.doc.transact_mut();
+            txn.apply_update(yrs::Update::decode_v1(&session).unwrap()).unwrap();
+            if waits {
+                txn.apply_update(yrs::Update::decode_v1(&orphan).unwrap()).unwrap();
+            }
+        }
+        f.drain();
+        f.take();
+        f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (waits, false), "waits={waits}: the doc waits for an update, and not for anything the trim deleted");
+        f.drain();
+        assert_eq!(f.state().unread_at_trim, waits, "waits={waits}");
+    }
+}
+
+/// A lag noted for a table that is no longer mirrored is forgotten: the table, mirrored again, is read afresh.
+#[test]
+fn the_lag_noted_for_a_table_no_longer_mirrored_is_not_held_against_it_when_it_comes_back() {
+    use yrs::updates::decoder::Decode;
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let session = first.diff_since(&yrs::StateVector::default());
+    let second = Page::new(2);
+    second.apply(&session);
+    let before = first.state();
+    first.put(&live0(), &rk(1, 2), &rv(1, 20));
+    second.apply(&first.diff_since(&before));
+    let before = second.state();
+    let base = cp(2);
+    second.trim(&live0(), &base, &live_of(T, Some(&base)));
+    let trim = second.diff_since(&before);
+    let mut f = Fix::empty();
+    f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&session).unwrap()).unwrap();
+    f.drain();
+    f.take();
+    // The trim comes (and the doc lacks what it deleted): the lag is noted, and the table is let go of before it is read.
+    f.doc.transact_mut().apply_update(yrs::Update::decode_v1(&trim).unwrap()).unwrap();
+    f.m.want(&[]);
+    f.drain();
+    f.m.want(&[(T.into(), INC.into())]);
+    f.drain();
+    assert!(f.state().settled);
+    assert!(!f.state().unread_at_trim, "the table is read afresh, from a base that is its first");
+}
+
+/// A checkpoint that comes first to a table, or again as it was, is no trim; each one that changes the base is.
+#[test]
+fn the_trims_of_a_table_are_counted_from_the_second_base() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+    assert_eq!(f.state().trims, 0);
+    f.drain();
+    f.take();
+    assert_eq!(f.state().trims, 0, "(a table's first read is no trim)");
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &[]);
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    f.put_top(&sum_of(T), &base);
+    f.drain();
+    assert_eq!(f.state().trims, 1, "the same base again");
+    let base2 = cp(3);
+    f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.state().trims, 2);
+    // A table first read with a checkpoint has had none.
+    let base = cp(2);
+    let g = Fix::seeded(Limits::default(), |f| {
+        f.put_top(&sum_of(T), &base);
+        f.session(&live_of(T, Some(&base)), &records(&[(1, 10)]));
+    });
+    let mut g = g;
+    g.drain();
+    assert_eq!(g.state().trims, 0);
+}
+
+/// The room's delegations (`hk:`) are counted as they change, whether or not a table is watched, and one
+/// that is replaced or removed is churn: a page that had seen the first may count a house the node never learned of.
+#[test]
+fn the_delegations_of_a_room_are_counted_and_a_replacement_or_a_removal_is_churn() {
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    assert_eq!(f.m.delegations(), Delegations::default());
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
+    f.put_top("sum:other:inc", &cp(2));
+    f.put_top("hkx", &s("not a delegation"));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "nothing but `hk:` keys");
+    f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(2))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(3))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "replaced");
+    // One that is removed.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &s("a"));
+    assert!(!f.m.delegations().churned);
+    f.remove_top("hk:house-a");
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 0 }, "removed");
+}
+
+// ── Review round 4 ───────────────────────────────────────────────────────────
+
+fn apply_to(doc: &Doc, update: &[u8]) {
+    use yrs::updates::decoder::Decode;
+    doc.transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+}
+
+/// A delegation written again as it stands is no change: no house comes or goes, and every page reads it alike
+/// (two pages of the deed holder write the same record when both run its duty at once). One written otherwise is churn.
+#[test]
+fn a_delegation_written_again_as_it_stands_is_no_churn() {
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "the same record, twice more");
+    // A record of another delegation is another change all the same, and one that differs from the last is churn.
+    f.put_top("hk:house-b", &obj(vec![("x", CVal::Int(1))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 });
+    f.put_top("hk:house-a", &obj(vec![("x", CVal::Int(2))]));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "a record that differs");
+    // A removal is churn however the record read; and what is written after it is a new record.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    f.put_top("hk:house-a", &s("a"));
+    f.remove_top("hk:house-a");
+    f.put_top("hk:house-a", &s("a"));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 0 }, "removed, and written again");
+    // A record a page may read otherwise (a `__proto__` field) written again as it stands is churn all the same: what
+    // a page reads of it is not what the node reads.
+    let doc = Doc::new();
+    let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+    let f = Fix { doc, m };
+    let ambiguous = || Any::Map(Arc::new(std::collections::HashMap::from([("v".to_string(), Any::Number(1.0)), ("__proto__".to_string(), Any::String(Arc::from("x")))])));
+    f.put_any("hk:house-p", ambiguous());
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
+    f.put_any("hk:house-p", ambiguous());
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 0 }, "the same record, and one a page may read otherwise");
+}
+
+/// The records a page wrote and the trim that deleted them can come to the node in one update: all of it is integrated,
+/// nothing waits, and the records, made in a session the same update deletes, leave no event. The trim is of a session
+/// read only as far as the node was sent, and says so.
+#[test]
+fn a_trim_that_comes_in_one_update_with_the_records_it_deletes_says_it_is_unread() {
+    for together in [true, false] {
+        let first = Page::new(1);
+        first.session(&live0(), &records(&[(1, 10)]));
+        let mut f = Fix::empty();
+        apply_to(&f.doc, &first.diff_since(&yrs::StateVector::default()));
+        f.drain();
+        f.take();
+        let before = first.state();
+        first.put(&live0(), &rk(1, 2), &rv(1, 20));
+        let mid = first.state();
+        let close = first.diff_since(&before);
+        let base = cp(2);
+        first.trim(&live0(), &base, &live_of(T, Some(&base)));
+        let trim = first.diff_since(&mid);
+        if together {
+            apply_to(&f.doc, &first.diff_since(&before));
+        } else {
+            apply_to(&f.doc, &close);
+            f.drain();
+            f.take();
+            apply_to(&f.doc, &trim);
+        }
+        let (update, delete_set) = {
+            let txn = f.doc.transact();
+            (txn.store().pending_update().is_some(), txn.store().pending_ds().is_some())
+        };
+        assert_eq!((update, delete_set), (false, false), "together={together}: nothing waits: the doc was sent all of it");
+        f.drain();
+        assert_eq!(f.state().trims, 1, "together={together}");
+        assert_eq!(f.state().unread_at_trim, together, "together={together}");
+        // The next trim is not marked by the last.
+        f.take();
+        let next = live_of(T, Some(&base));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!(f.state().trims, 2);
+        assert!(!f.state().unread_at_trim, "together={together}: the lag of the first trim is not the second's");
+    }
+}
+
+/// A drain that has taken its time stops, with what it was reading left for the next: the whole of it is read,
+/// each record once, by drains each of which has done something.
+#[test]
+fn a_drain_that_has_taken_its_time_stops_and_the_next_goes_on() {
+    let all: Vec<(u32, i64)> = (0..40).map(|i| (i, i as i64)).collect();
+    // (No time at all: each drain does its first action and then no more.)
+    let limits = Limits { drain_time: Some(Duration::ZERO), ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    let mut shorts = 0;
+    let mut drains = 0;
+    for _ in 0..500 {
+        let d = f.drain();
+        drains += 1;
+        shorts += d.short as usize;
+        assert!(d.paths > 0 || f.m.current(T, INC), "every drain that has work does some");
+        model.take(&mut f.m, T);
+        if f.m.current(T, INC) {
+            break;
+        }
+    }
+    assert!(f.m.current(T, INC), "it goes on to the end: {drains} drains");
+    assert!(shorts >= 2, "the time stopped it: {shorts}");
+    assert_eq!(model.recs, model_of(&all));
+    assert_eq!(model.taken, 40, "each record once");
+    // The same table with no limit of time is read in one drain.
+    let mut g = Fix::seeded(Limits::default(), |g| g.session(&live0(), &records(&all)));
+    assert!(!g.drain().short);
+    assert!(g.m.current(T, INC));
+    // The node's own limits carry the time.
+    assert_eq!(Limits::live().drain_time, Some(DRAIN_TIME));
+    assert_eq!(Limits::default().drain_time, None);
+}
+
+// ── Review round 5 ───────────────────────────────────────────────────────────
+
+/// A value is told written again as it stands only within a weight (the observer runs in the doc's commit): a heavier
+/// one is not compared, and is another; nor is one a page may read otherwise.
+#[test]
+fn a_value_is_told_written_again_only_within_a_weight() {
+    let v = |n: usize| Any::String(Arc::from("x".repeat(n)));
+    let again = |n: usize, cap: usize| rewritten_alike(&EntryChange::Updated(Out::Any(v(n)), Out::Any(v(n))), cap);
+    assert!(again(100, 1_000));
+    assert!(!again(2_000, 1_000), "heavier than the cap: another");
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(v(10)), Out::Any(v(11))), 1_000), "a different value");
+    assert!(!rewritten_alike(&EntryChange::Inserted(Out::Any(v(10))), 1_000), "an insert");
+    assert!(!rewritten_alike(&EntryChange::Removed(Out::Any(v(10))), 1_000), "a removal");
+    let proto = || Any::Map(Arc::new(std::collections::HashMap::from([("v".to_string(), Any::Number(1.0)), ("__proto__".to_string(), Any::String(Arc::from("x")))])));
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(proto()), Out::Any(proto())), 1_000), "one a page may read otherwise");
+    // A map of nested members, the same, within the weight.
+    let nested = || Any::Map(Arc::new(std::collections::HashMap::from([("a".to_string(), Any::Array(vec![Any::Number(1.0), Any::String(Arc::from("y"))].into()))])));
+    assert!(rewritten_alike(&EntryChange::Updated(Out::Any(nested()), Out::Any(nested())), 1_000));
+    // Too deep to weigh: another.
+    let mut deep = Any::Number(1.0);
+    for _ in 0..(hb::MAX_DEPTH + 4) {
+        deep = Any::Array(vec![deep].into());
+    }
+    assert!(!rewritten_alike(&EntryChange::Updated(Out::Any(deep.clone()), Out::Any(deep)), 1_000_000), "deeper than a record goes");
+}
+
+/// A delegation too heavy to be compared in the commit is not compared: written again as it stands, it is churn. One
+/// within the weight is no churn (the test above of round 4).
+#[test]
+fn a_delegation_heavier_than_the_house_reads_is_churn_when_written_again() {
+    for (weight, churn) in [(MAX_TOP_BYTES - 200, false), (MAX_TOP_BYTES + 200, true)] {
+        let doc = Doc::new();
+        let m = RoomMirror::attach_with(&doc, ROOM, Limits::default());
+        let f = Fix { doc, m };
+        let rec = || obj(vec![("x", s(&"y".repeat(weight)))]);
+        f.put_top("hk:house-a", &rec());
+        f.put_top("hk:house-a", &rec());
+        assert_eq!(f.m.delegations(), Delegations { changes: if churn { 2 } else { 1 }, churned: churn, hidden: 0 }, "weight {weight}");
+    }
+}
+
+fn heavy(tag: i64) -> CVal {
+    obj(vec![("v", CVal::Int(1)), ("n", CVal::Int(tag)), ("x", s(&"c".repeat(READ_PER_TICK)))])
+}
+
+/// A checkpoint the node cannot read cannot be told from another it cannot read: one written since the last look is
+/// another, so the trim counts, and a look at the same one again does not count it twice.
+#[test]
+fn a_checkpoint_the_node_cannot_read_replaced_by_another_it_cannot_read_is_a_trim() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &heavy(1));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 0), "(the first base is no trim)");
+    f.drain();
+    f.drain();
+    assert_eq!(f.state().trims, 0, "nothing written, nothing changed");
+    let (generation, version) = (f.state().generation, f.state().version);
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 1), "another it cannot read");
+    assert!(f.state().generation > generation && f.state().version > version, "the table started over on it");
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!(f.state().trims, 2, "(the node cannot tell the same one written again)");
+    f.drain();
+    assert_eq!(f.state().trims, 2, "and once");
+    // The same of a checkpoint a page may read otherwise.
+    let proto = |u: i64| {
+        let CVal::Obj(fields) = cp(u) else { unreachable!() };
+        let mut map: std::collections::HashMap<String, Any> = fields.iter().map(|(k, v)| (k.clone(), to_any(v))).collect();
+        map.insert("__proto__".into(), Any::String(Arc::from("x")));
+        Any::Map(Arc::new(map))
+    };
+    f.put_any(&sum_of(T), proto(5));
+    f.drain();
+    assert_eq!(f.state().trims, 3);
+    f.put_any(&sum_of(T), proto(6));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (Some(Hold::Base), 4));
+    // And a checkpoint it can read after one it cannot is a trim, as before.
+    f.put_top(&sum_of(T), &cp(7));
+    f.drain();
+    assert_eq!((f.state().hold, f.state().trims), (None, 5));
+}
+
+/// A second checkpoint the node cannot read, where the first was the table's first: that is the first trim.
+#[test]
+fn the_first_trim_after_a_first_checkpoint_the_node_cannot_read_is_counted() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &heavy(1));
+    f.drain();
+    assert_eq!(f.state().trims, 0);
+    f.put_top(&sum_of(T), &heavy(2));
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+}
+
+/// Checkpoints a page wrote and another page wrote over before the table was read: the table read the last, and
+/// says how many it did not (each was a trim the node had nothing to hold anything against).
+#[test]
+fn checkpoints_written_over_before_the_table_read_them_are_counted_once_each() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.session(&live_of(T, Some(&cp(1))), &[]);
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (0, 0), "(the first base)");
+    // Three written, one drain: the last is read; the two before it were written over.
+    for u in [2, 3, 4] {
+        f.put_top(&sum_of(T), &cp(u));
+    }
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    assert_eq!(f.m.take_superseded(T, INC), 2);
+    assert_eq!(f.m.take_superseded(T, INC), 0, "told once");
+    // One written between looks, each time: none.
+    f.put_top(&sum_of(T), &cp(5));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(6));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0);
+    // Two in two transactions with nothing read between, though they are the very same checkpoint: one write.
+    f.put_top(&sum_of(T), &cp(7));
+    f.put_top(&sum_of(T), &cp(7));
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (4, 0), "a checkpoint written again as it stands is written over by nothing");
+    // A table not mirrored has none to tell.
+    assert_eq!(f.m.take_superseded("elsewhere", INC), 0);
+}
+
+/// A removal is no checkpoint; one that ends the run leaves the checkpoint before it unread.
+#[test]
+fn a_removal_is_no_checkpoint_written_over_and_one_that_comes_last_leaves_the_checkpoint_before_it_unread() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.drain();
+    // A checkpoint, its removal, another: the first was written over; the removal is nothing.
+    f.put_top(&sum_of(T), &cp(2));
+    f.remove_top(&sum_of(T));
+    f.put_top(&sum_of(T), &cp(3));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 1);
+    // A checkpoint and its removal: the checkpoint was never read.
+    f.put_top(&sum_of(T), &cp(4));
+    f.remove_top(&sum_of(T));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 1);
+    assert!(f.state().base.is_none(), "(and the base is none)");
+    // A removal alone: nothing was written over.
+    f.put_top(&sum_of(T), &cp(5));
+    f.drain();
+    f.remove_top(&sum_of(T));
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0);
+}
+
+/// The count is the mirror's own: the first read of a table counts nothing, whatever was written before it; and what a
+/// table counted before it was let go of is not told of when it comes back.
+#[test]
+fn the_checkpoints_written_before_the_first_look_and_those_of_a_table_let_go_of_are_not_counted() {
+    let mut f = Fix::seeded(Limits::default(), |f| {
+        f.put_top(&sum_of(T), &cp(1));
+        f.put_top(&sum_of(T), &cp(2));
+    });
+    f.drain();
+    assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (0, 0));
+    f.put_top(&sum_of(T), &cp(3));
+    f.put_top(&sum_of(T), &cp(4));
+    f.m.want(&[]);
+    f.m.want(&[(T.into(), INC.into())]);
+    f.drain();
+    assert_eq!(f.m.take_superseded(T, INC), 0, "(it is a table taken up afresh)");
+}
+
+/// A checkpoint of `players` nets of long ids: it weighs about `players * 200` bytes, and a page reads it.
+fn cp_weighing(u: i64, players: usize) -> CVal {
+    let CVal::Obj(mut fields) = cp(u) else { unreachable!() };
+    let nets: Vec<(String, CVal)> = (0..players).map(|i| (format!("{i:0>200}"), s("1"))).collect();
+    for f in fields.iter_mut() {
+        if f.0 == "n" {
+            f.1 = CVal::Obj(nets.clone());
+        }
+    }
+    norm(CVal::Obj(fields))
+}
+
+/// A checkpoint written again as it stands is the same checkpoint: no trim, and written over by nothing, whatever its
+/// weight up to what the house tells apart (the delegation's weight is no bound for it); past that weight a page's
+/// put-back cannot be told from another checkpoint, and counts as one.
+#[test]
+fn a_checkpoint_written_again_as_it_stands_is_the_same_one_up_to_a_weight() {
+    for (players, alike) in [(40usize, true), (1_600, false)] {
+        let mut f = Fix::empty();
+        f.put_top(&sum_of(T), &cp(1));
+        f.session(&live_of(T, Some(&cp(1))), &[]);
+        f.drain();
+        let big = cp_weighing(2, players);
+        let weight = hb::weight(&to_any(&big), usize::MAX).expect("it weighs");
+        assert!(if alike { weight > MAX_TOP_BYTES && weight < ALIKE_SUM_BYTES } else { weight > ALIKE_SUM_BYTES && weight < READ_PER_TICK }, "players {players}: weighs {weight}");
+        f.put_top(&sum_of(T), &big);
+        f.drain();
+        assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (1, 0), "players {players}");
+        assert!(f.state().base.is_some(), "(a base the node reads)");
+        // Written again, as it stands, between two looks: the same base.
+        f.put_top(&sum_of(T), &big);
+        f.drain();
+        assert_eq!((f.state().trims, f.m.take_superseded(T, INC)), (1, 0), "players {players}: written again between looks");
+        // ... and twice, with nothing read between.
+        f.put_top(&sum_of(T), &cp_weighing(3, players));
+        f.put_top(&sum_of(T), &cp_weighing(3, players));
+        f.drain();
+        assert_eq!(f.state().trims, 2, "players {players}");
+        assert_eq!(f.m.take_superseded(T, INC), u64::from(!alike), "players {players}: the second of two alike is {}", if alike { "no checkpoint of its own" } else { "another, past the weight" });
+    }
+}
+
+/// The writes of checkpoints are added over drains that do not reach the table, and forgotten with the table.
+#[test]
+fn the_checkpoints_written_across_short_drains_are_counted_all_and_those_of_a_table_let_go_of_are_not_kept() {
+    let mut f = Fix::empty();
+    f.put_top(&sum_of(T), &cp(1));
+    f.session(&live_of(T, Some(&cp(1))), &[]);
+    f.drain();
+    f.m.limits.drain_paths = 0;
+    f.put_top(&sum_of(T), &cp(2));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(3));
+    f.drain();
+    f.put_top(&sum_of(T), &cp(4));
+    f.drain();
+    assert_eq!(f.state().trims, 0, "(nothing was read)");
+    f.m.limits.drain_paths = DRAIN_PATHS;
+    f.drain();
+    assert_eq!(f.state().trims, 1);
+    assert_eq!(f.m.take_superseded(T, INC), 2, "three written over three drains that read nothing, the last read");
+    // The writes of a table let go of are not kept.
+    f.put_top(&sum_of(T), &cp(5));
+    f.put_top(&sum_of(T), &cp(6));
+    f.m.want(&[]);
+    f.drain();
+    assert!(f.m.pending.writes.is_empty(), "{:?}", f.m.pending.writes);
+}
+
+// ── Review round 6 ───────────────────────────────────────────────────────────
+
+impl Page {
+    fn put_top(&self, key: &str, v: &CVal) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.insert(&mut txn, key, to_any(v));
+    }
+
+    fn remove_top(&self, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        comp.remove(&mut txn, key);
+    }
+}
+
+/// A delegation written and written over in one update (the node was away, or the updates were merged on the way) shows the
+/// node only the last, as an insert: a page that had the first by itself may have counted a house the plan never knew. The
+/// update says that something was made and deleted in it, and not what, and the delegation is churn.
+#[test]
+fn a_delegation_written_and_written_over_in_one_update_is_churn_though_it_shows_as_an_insert() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    page.put_top("hk:house-a", &s("b"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    // (And one of another name may have come and gone in it too, which the keys do not say: `hidden`.)
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 1 });
+}
+
+/// One written once is not, nor is one in an update that deletes only what the doc already had.
+#[test]
+fn a_delegation_written_once_is_no_churn_even_in_an_update_that_deletes_what_the_doc_had() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
+    // A key the doc held goes, and another delegation comes, in one update.
+    page.put_top("elsewhere", &s("x"));
+    let held = f.doc.transact().state_vector();
+    apply_to(&f.doc, &page.diff_since(&held));
+    let before = f.doc.transact().state_vector();
+    page.remove_top("elsewhere");
+    page.put_top("hk:house-b", &s("b"));
+    apply_to(&f.doc, &page.diff_since(&before));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: false, hidden: 0 }, "the block deleted was one the doc held");
+}
+
+/// An update in which something else was made and deleted doubts a delegation it brings once too: what was deleted cannot
+/// be told (some harmless updates are doubted).
+#[test]
+fn a_delegation_brought_with_something_else_made_and_deleted_is_churn_too() {
+    let page = Page::new(7);
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 2, churned: true, hidden: 1 });
+}
+
+impl Page {
+    fn remove_rec(&self, ses: &str, key: &str) {
+        let comp = self.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = self.doc.transact_mut();
+        let Some(Out::YMap(m)) = comp.get(&txn, ses) else { panic!("no session {ses}") };
+        m.remove(&mut txn, key);
+    }
+}
+
+impl Fix {
+    /// What is waiting to be taken, taken and dropped (the table may not be serving yet).
+    fn skim(&mut self) {
+        let _ = self.m.take(T, INC, usize::MAX);
+    }
+}
+
+/// A node that was sent a record of the live session and its deletion in one update never had the record to read; the page
+/// that saw the record and not its deletion counts it in the trim it writes after. What the node was sent, `how`:
+///
+/// - "merged": the record and its deletion in one update;
+/// - "separate": the record in one update, its deletion in the next (the node read it);
+/// - "never": no record at all;
+/// - "elsewhere": the record made and deleted in a session no table follows;
+/// - "new session": the session itself comes in the update that made and deleted the record;
+/// - "merged undrained": as "merged", and the trim is sent before the node has drained.
+///
+/// The node has then been sent the page's trim, and has drained it.
+fn trimmed_after(how: &str) -> Fix {
+    let ses = if how == "elsewhere" { "ses:elsewhere:x".to_string() } else { live0() };
+    let mut f = Fix::empty();
+    f.drain();
+    f.skim();
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    if how == "elsewhere" {
+        first.session(&ses, &records(&[(1, 1)]));
+    }
+    let base = first.diff_since(&yrs::StateVector::default());
+    let after_session = first.state();
+    if how != "new session" {
+        apply_to(&f.doc, &base);
+        f.drain();
+        f.skim();
+    }
+    let record = rk(1, 2);
+    if how != "never" {
+        first.put(&ses, &record, &rv(1, 20));
+    }
+    let put = first.diff_since(&after_session);
+    match how {
+        "never" => {}
+        "separate" => {
+            apply_to(&f.doc, &put);
+            f.drain();
+            f.skim();
+            let mid = first.state();
+            first.remove_rec(&ses, &record);
+            apply_to(&f.doc, &first.diff_since(&mid));
+        }
+        _ => {
+            first.remove_rec(&ses, &record);
+            let since = if how == "new session" { yrs::StateVector::default() } else { after_session };
+            apply_to(&f.doc, &first.diff_since(&since));
+        }
+    }
+    // ("undrained": the node is sent the trim before it has looked at the update that made and deleted the record.)
+    if how != "merged undrained" {
+        f.drain();
+        f.skim();
+    }
+    // The page that trims has the session and the record, and not its deletion.
+    let second = Page::new(2);
+    second.apply(&base);
+    if how != "never" {
+        second.apply(&put);
+    }
+    let before = second.state();
+    let base_cp = cp(2);
+    second.trim(&live0(), &base_cp, &live_of(T, Some(&base_cp)));
+    apply_to(&f.doc, &second.diff_since(&before));
+    f.drain();
+    f
+}
+
+#[test]
+fn a_record_made_and_deleted_in_one_update_makes_the_next_trim_of_its_session_unread() {
+    for (how, unread) in [("merged", true), ("merged undrained", true), ("new session", true), ("separate", true), ("never", false), ("elsewhere", false)] {
+        let mut f = trimmed_after(how);
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves: it is not carried to the next.
+        f.skim();
+        let next = live_of(T, Some(&cp(2)));
+        let base2 = cp(3);
+        f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// ... and it is kept through drains and resets of the table until the trim: a drain that read other things in between
+/// does not lose it.
+#[test]
+fn what_was_made_and_deleted_in_a_session_is_kept_until_the_trim_of_it() {
+    let first = Page::new(1);
+    first.session(&live0(), &records(&[(1, 10)]));
+    let mut f = Fix::empty();
+    f.drain();
+    f.skim();
+    let base = first.diff_since(&yrs::StateVector::default());
+    apply_to(&f.doc, &base);
+    f.drain();
+    f.skim();
+    let after_session = first.state();
+    first.put(&live0(), &rk(1, 2), &rv(1, 20));
+    let put = first.diff_since(&after_session);
+    first.remove_rec(&live0(), &rk(1, 2));
+    apply_to(&f.doc, &first.diff_since(&after_session));
+    // Drains, and other records coming and going, one at a time, as the room goes on.
+    for i in 3..12u32 {
+        f.drain();
+        f.skim();
+        let mid = first.state();
+        first.put(&live0(), &rk(1, i), &rv(1, i as i64));
+        apply_to(&f.doc, &first.diff_since(&mid));
+    }
+    f.drain();
+    f.skim();
+    let second = Page::new(2);
+    second.apply(&base);
+    second.apply(&put);
+    let before = second.state();
+    let base_cp = cp(2);
+    second.trim(&live0(), &base_cp, &live_of(T, Some(&base_cp)));
+    apply_to(&f.doc, &second.diff_since(&before));
+    f.drain();
+    assert_eq!((f.state().trims, f.state().unread_at_trim), (1, true));
+}
+
+/// A table whose base has been read and whose session map has not been listed: the state a drain that ran out of paths
+/// leaves it in.
+fn awaiting_its_session(all: &[(u32, i64)]) -> Fix {
+    let limits = Limits { drain_paths: 1, ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(all)));
+    assert!(f.drain().short, "(the base was all that was read)");
+    assert!(f.m.tables.values().all(|t| t.need_session && t.live.is_some()));
+    f
+}
+
+/// A budget with its time already up, that has done `used` actions.
+fn late_budget(used: usize) -> Budget {
+    Budget { bytes: usize::MAX / 2, paths: 100, deadline: Some(Instant::now()), fresh: used == 0, spent: false, used_bytes: 0, used_paths: used }
+}
+
+/// The scan that lists a session's keys looks at the clock as it goes: a drain with its time up that has done something
+/// already gives it up, whole (nothing is kept of a list not made), and the next drain makes it. The first thing a
+/// drain does is read to its end.
+#[test]
+fn the_listing_of_a_big_session_is_given_up_when_the_time_is_up_and_made_again_by_the_next_drain() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    for (used, finished) in [(1usize, true), (2, false), (7, false)] {
+        let mut f = awaiting_its_session(&all);
+        let limits = f.m.limits;
+        let txn = f.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+        let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+        let mut b = late_budget(used);
+        assert_eq!(table.snapshot(&ses, &txn, &mut b, &limits), finished, "used={used}");
+        if finished {
+            assert!(table.cold.is_some() && table.present && !table.need_session);
+        } else {
+            assert!(b.spent, "the drain is over");
+            assert!(table.cold.is_none() && !table.present && table.need_session, "used={used}: nothing of the list is kept");
+        }
+    }
+}
+
+/// ... and the count of a session's keys is the same.
+#[test]
+fn the_count_of_a_big_sessions_keys_is_given_up_when_the_time_is_up() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    // (The count is begun, which is an action of the drain: `used` is the actions done with it.)
+    for (used, count) in [(1usize, Some(1_000)), (2, None), (7, None)] {
+        let mut f = awaiting_its_session(&all);
+        let limits = f.m.limits;
+        let txn = f.doc.transact();
+        let comp = txn.get_map(COMPUTED_MAP).unwrap();
+        let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+        let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+        let mut b = late_budget(used);
+        assert_eq!(table.count_scan(&ses, &txn, &mut b, &limits), count, "used={used}");
+        assert_eq!(b.spent, count.is_none(), "used={used}");
+    }
+}
+
+/// A session of fewer keys than the scans look at the clock after is read whole, whatever the time.
+#[test]
+fn a_small_session_is_listed_whole_though_the_time_is_up() {
+    const KEYS: u32 = 255;
+    assert!((KEYS as usize) < SCAN_CHECK_KEYS, "(a session of fewer keys than the scans look at the clock after)");
+    let all: Vec<(u32, i64)> = (0..KEYS).map(|i| (i, i as i64)).collect();
+    let mut f = awaiting_its_session(&all);
+    let limits = f.m.limits;
+    let txn = f.doc.transact();
+    let comp = txn.get_map(COMPUTED_MAP).unwrap();
+    let Some(Out::YMap(ses)) = comp.get(&txn, &live0()) else { panic!("the session") };
+    let table = f.m.tables.get_mut(&(T.to_string(), INC.to_string())).unwrap();
+    assert!(table.snapshot(&ses, &txn, &mut late_budget(5), &limits));
+}
+
+/// Drains with no time at all still read a session too big to be listed between two looks at the clock: the first thing a
+/// drain does is read to its end, and so every drain gets somewhere.
+#[test]
+fn drains_with_no_time_at_all_still_read_a_big_session_to_its_end() {
+    let all: Vec<(u32, i64)> = (0..1_000).map(|i| (i, i as i64)).collect();
+    let limits = Limits { drain_time: Some(Duration::ZERO), ..Limits::default() };
+    let mut f = Fix::seeded(limits, |f| f.session(&live0(), &records(&all)));
+    let mut model = Model::default();
+    let mut drains = 0;
+    for _ in 0..5_000 {
+        let d = f.drain();
+        drains += 1;
+        assert!(d.paths > 0 || f.m.current(T, INC), "every drain that has work does some");
+        model.take(&mut f.m, T);
+        if f.m.current(T, INC) {
+            break;
+        }
+    }
+    assert!(f.m.current(T, INC), "it goes on to the end: {drains} drains");
+    assert_eq!(model.recs, model_of(&all));
+}
+
+// ── Review round 7 ───────────────────────────────────────────────────────────
+
+/// A delegation that is the same as it was in the doc the node is left with, after an update that put another between (a
+/// value replaced by a delegation, and put back), is no identical rewrite to a page that had the other on its own: the
+/// update says that something was made and deleted in it, and the rewrite is churn.
+#[test]
+fn a_delegation_put_back_as_it_was_in_an_update_that_changed_it_between_is_churn() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 });
+    // The same record written again by itself, even twice, is nothing (above); with another between, it is.
+    let held = f.doc.transact().state_vector();
+    page.put_top("hk:house-a", &s("b"));
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 1 }, "a, b, a: the doc holds a before and after");
+}
+
+/// And an identical rewrite in an update where something else was made and deleted is doubted too (what was deleted cannot be
+/// told), while one in an update that deletes only what the doc held is not.
+#[test]
+fn an_identical_rewrite_is_churn_only_in_an_update_in_which_something_was_made_and_deleted() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    // The record again, deleting the block the doc held.
+    let held = f.doc.transact().state_vector();
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 0 }, "a plain rewrite");
+    // The record again, with something else made and deleted in the same update.
+    let held = f.doc.transact().state_vector();
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    page.put_top("hk:house-a", &s("a"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations { changes: 3, churned: true, hidden: 1 });
+}
+
+// ── Review round 8 ───────────────────────────────────────────────────────────
+
+/// An update in which something was made and deleted may have hidden a delegation made and deleted in it, whatever keys it
+/// shows: a key that is no delegation beside it does not say that none came and went. One that shows no key says it
+/// all the same. (`hidden` counts the updates, `churned` is for good, and the first is not for the second.)
+#[test]
+fn an_update_that_made_and_deleted_something_beside_the_keys_it_shows_may_have_hidden_a_delegation() {
+    // A key written twice shows as one insert, and the first was made and deleted: not a delegation, and not said to be none.
+    let page = Page::new(7);
+    page.put_top("other", &s("1"));
+    page.put_top("other", &s("2"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 1 }, "doubted, not churned");
+    // The same key once is nothing.
+    let page = Page::new(8);
+    page.put_top("other", &s("1"));
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations::default(), "no delegation, nothing made and deleted");
+    // A later update that deletes only what the doc held is nothing either.
+    let held = f.doc.transact().state_vector();
+    page.put_top("other", &s("2"));
+    apply_to(&f.doc, &page.diff_since(&held));
+    assert_eq!(f.m.delegations(), Delegations::default(), "the block deleted was one the doc held");
+}
+
+/// And one in which the room's map changed in no key at all (a block made and deleted in it) hides a delegation for good.
+#[test]
+fn an_update_that_left_the_room_map_no_key_to_read_is_churn_and_hidden() {
+    let page = Page::new(7);
+    page.put_top("hk:house-a", &s("a"));
+    page.remove_top("hk:house-a");
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    let d = f.m.delegations();
+    assert!(d.churned && d.hidden >= 1 && d.changes >= 1, "{d:?}");
+}
+
+/// The mirror notes what was hidden once per update, not once per key.
+#[test]
+fn what_an_update_hides_is_counted_once_for_the_update() {
+    let page = Page::new(7);
+    for i in 0..5 {
+        page.put_top(&format!("k{i}"), &s("1"));
+        page.put_top(&format!("k{i}"), &s("2"));
+    }
+    let f = Fix::empty();
+    apply_to(&f.doc, &page.diff_since(&yrs::StateVector::default()));
+    assert_eq!(f.m.delegations(), Delegations { changes: 1, churned: false, hidden: 1 });
+}
+
+/// A record in the live session that goes, or is replaced by another under the same key (the keys are the hashes of the
+/// records, so no page does either), is a history a page that never saw it does not share with the node: the trim of
+/// the session is not held against what the node read. A record written again as it stands is nothing, nor is a new one.
+#[test]
+fn a_record_that_is_removed_or_replaced_in_the_live_session_makes_the_next_trim_unread() {
+    for (how, unread) in [("removed", true), ("replaced", true), ("replaced by a shared type", true), ("written again as it stands", false), ("added", false)] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+        f.drain();
+        f.skim();
+        match how {
+            "removed" => f.remove(&live0(), &rk(1, 1)),
+            "replaced" => f.put(&live0(), &rk(1, 1), &rv(1, 99)),
+            "replaced by a shared type" => f.put_nested(&live0(), &rk(1, 1)),
+            "written again as it stands" => f.put(&live0(), &rk(1, 1), &rv(1, 10)),
+            _ => f.put(&live0(), &rk(1, 3), &rv(1, 30)),
+        }
+        // (The node reads the change before the trim: it was sent it all, and the doubt is not of what it did not read.)
+        f.drain();
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves.
+        f.skim();
+        let base2 = cp(3);
+        f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// A removal of the live session in an update in which something was made and deleted (a session made in it under the
+/// same name, with records, and deleted too, leaves no trace but the removal of the one the node held) is doubted as one
+/// that was made in it is. (The checkpoint of the trim, written in the same update, is doubted too, as an update in
+/// which something was made and deleted lagging behind the node; a removal that comes alone starts the table over.)
+#[test]
+fn a_trim_that_removed_the_live_session_in_an_update_that_made_and_deleted_something_is_unread() {
+    for hidden in [true, false] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10)])));
+        f.drain();
+        f.skim();
+        let base = cp(2);
+        let next = live_of(T, Some(&base));
+        {
+            let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+            let mut txn = f.doc.transact_mut();
+            comp.insert(&mut txn, sum_of(T).as_str(), to_any(&base));
+            if hidden {
+                // A session made under the name in this update, with a record, and deleted in it.
+                let m = comp.insert(&mut txn, live0().as_str(), MapPrelim::default());
+                m.insert(&mut txn, rk(1, 5).as_str(), to_any(&rv(1, 50)));
+            }
+            comp.remove(&mut txn, live0().as_str());
+            comp.insert(&mut txn, next.as_str(), MapPrelim::default());
+        }
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, hidden), "hidden={hidden}");
+    }
+}
+
+/// A slip a page counts for the felt: `s:<round>:<player>:<hash>`, signed with the key `k`.
+fn slip(r: i64, pid: &str, n: u32, key: &str) -> (String, CVal) {
+    (format!("s:{r}:{pid}:{n:032x}"), norm(obj(vec![("p", s(pid)), ("k", s(key))])))
+}
+
+fn pair(pid: &str, key: &str) -> (String, String) {
+    (pid.to_string(), key.to_string())
+}
+
+/// The keys that signed the slips a session held are told once it has ended (a trim), for the shadow to see whether the
+/// players were pinned to them; the live session's are not told, and are told once.
+#[test]
+fn the_signers_of_the_slips_of_a_session_are_told_when_it_ends_and_once() {
+    let mut f = Fix::seeded(Limits::default(), |f| {
+        let mut all = records(&[(1, 10)]);
+        all.push(slip(1, "pid-a", 1, "key-a"));
+        all.push(slip(1, "pid-b", 2, "key-b"));
+        f.session(&live0(), &all);
+    });
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "(the session is live)");
+    // A slip that comes later, and one that comes and goes, count; a record that is no slip, and a slip with no key, do not.
+    let (k, v) = slip(1, "pid-c", 3, "key-c");
+    f.put(&live0(), &k, &v);
+    let (k2, v2) = slip(1, "pid-d", 4, "key-d");
+    f.put(&live0(), &k2, &v2);
+    f.drain();
+    f.skim();
+    f.remove(&live0(), &k2);
+    f.put(&live0(), &format!("x:1:pid-e:{:032x}", 5), &norm(obj(vec![("p", s("pid-e")), ("k", s("key-e"))])));
+    f.put(&live0(), &format!("s:1:pid-f:{:032x}", 6), &norm(obj(vec![("p", s("pid-f"))])));
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "(it still is)");
+    let base = cp(2);
+    f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+    f.drain();
+    let told = f.m.take_ended_signers(T, INC);
+    let want: BTreeSet<_> = [pair("pid-a", "key-a"), pair("pid-b", "key-b"), pair("pid-c", "key-c"), pair("pid-d", "key-d")].into_iter().collect();
+    assert_eq!(told, (want, false));
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false), "told once");
+    // The next session's are its own.
+    f.skim();
+    let (k, v) = slip(2, "pid-a", 7, "key-a2");
+    f.put(&live_of(T, Some(&base)), &k, &v);
+    f.drain();
+    f.skim();
+    assert_eq!(f.m.take_ended_signers(T, INC), (BTreeSet::new(), false));
+    let base2 = cp(3);
+    f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.m.take_ended_signers(T, INC), ([pair("pid-a", "key-a2")].into_iter().collect(), false));
+}
+
+/// Two sessions ended between the asks are told together; a table the mirror does not follow tells nothing.
+#[test]
+fn the_signers_of_two_sessions_ended_between_asks_are_told_together() {
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &[slip(1, "pid-a", 1, "key-a")]));
+    f.drain();
+    f.skim();
+    let base = cp(2);
+    let second = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &second, &[slip(1, "pid-b", 2, "key-b")]);
+    f.drain();
+    f.skim();
+    let base2 = cp(3);
+    f.page_trim(&second, &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    let want: BTreeSet<_> = [pair("pid-a", "key-a"), pair("pid-b", "key-b")].into_iter().collect();
+    assert_eq!(f.m.take_ended_signers(T, INC), (want, false));
+    assert_eq!(f.m.take_ended_signers("no-such-table", INC), (BTreeSet::new(), false));
+}
+
+/// A session of more signers than the mirror keeps is told as that, and no one is believed of it.
+#[test]
+fn a_session_with_more_signers_than_the_mirror_keeps_says_so() {
+    let n = MAX_SIGNERS as u32 + 3;
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &(0..n).map(|i| slip(1, &format!("pid-{i}"), i, "key")).collect::<Vec<_>>()));
+    while f.drain().short {}
+    f.skim();
+    let base = cp(2);
+    f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+    f.drain();
+    let (told, over) = f.m.take_ended_signers(T, INC);
+    assert!(over, "more than the mirror keeps");
+    assert_eq!(told.len(), MAX_SIGNERS, "(and the most it keeps)");
+    // The next session starts clean.
+    f.skim();
+    let (k, v) = slip(2, "pid-x", 9, "key-x");
+    f.put(&live_of(T, Some(&base)), &k, &v);
+    f.drain();
+    f.skim();
+    let base2 = cp(3);
+    f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+    f.drain();
+    assert_eq!(f.m.take_ended_signers(T, INC), ([pair("pid-x", "key-x")].into_iter().collect(), false), "the count is not carried");
+}
+
+/// The sessions ended between two asks share the room the mirror keeps: more signers together than it keeps are told as that.
+#[test]
+fn the_signers_of_sessions_ended_between_asks_are_kept_to_the_most_together() {
+    let half = MAX_SIGNERS as u32 / 2 + 10;
+    let first: Vec<_> = (0..half).map(|i| slip(1, &format!("pid-a{i}"), i, "key")).collect();
+    let second: Vec<_> = (0..half).map(|i| slip(1, &format!("pid-b{i}"), i, "key")).collect();
+    let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &first));
+    while f.drain().short {}
+    f.skim();
+    let base = cp(2);
+    let next = live_of(T, Some(&base));
+    f.page_trim(&live0(), &base, &next, &second);
+    while f.drain().short {}
+    f.skim();
+    // (Each session on its own is under what the mirror keeps.)
+    let base2 = cp(3);
+    f.page_trim(&next, &base2, &live_of(T, Some(&base2)), &[]);
+    while f.drain().short {}
+    let (told, over) = f.m.take_ended_signers(T, INC);
+    assert!(over, "the two together are more than it keeps");
+    assert_eq!(told.len(), MAX_SIGNERS);
+}
+
+// ── Review round 9 ───────────────────────────────────────────────────────────
+
+/// The live session replaced, or removed, in an update of its own (no trim: a page's trim writes the checkpoint in the update
+/// that deletes the session it trims) is another session than the one the pages read: the node cannot know what was made
+/// and deleted in it, and the next trim is not held against what it read. A trim that removes the session is the base
+/// changing, and the doubt goes with the session it leaves.
+#[test]
+fn the_live_session_replaced_or_removed_in_an_update_of_its_own_makes_the_next_trim_unread() {
+    for (how, unread) in [("removed", true), ("replaced", true), ("replaced with records", true), ("replaced beside another table's checkpoint", true), ("a record added", false), ("trimmed", false)] {
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &records(&[(1, 10), (2, 20)])));
+        f.drain();
+        f.skim();
+        match how {
+            "removed" | "replaced" | "replaced with records" | "replaced beside another table's checkpoint" => {
+                let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = f.doc.transact_mut();
+                if how.starts_with("replaced beside") {
+                    // (A checkpoint of a table the mirror does not watch is no trim of this one.)
+                    comp.insert(&mut txn, sum_of("a-table-that-is-not-watched").as_str(), to_any(&cp(2)));
+                }
+                if how == "removed" {
+                    comp.remove(&mut txn, live0().as_str());
+                } else {
+                    let m = comp.insert(&mut txn, live0().as_str(), MapPrelim::default());
+                    if how == "replaced with records" {
+                        m.insert(&mut txn, rk(1, 7).as_str(), to_any(&rv(1, 70)));
+                    }
+                }
+            }
+            "a record added" => f.put(&live0(), &rk(1, 3), &rv(1, 30)),
+            _ => {}
+        }
+        // (The node reads the change before the trim, and the session is read afresh if it was replaced.)
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        // The doubt is of the session the trim leaves.
+        f.skim();
+        let base2 = cp(3);
+        f.page_trim(&live_of(T, Some(&base)), &base2, &live_of(T, Some(&base2)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (2, false), "{how}: the next trim");
+    }
+}
+
+/// A value the observer compares inside the commit is bounded: a record written again as it stands moves nothing, but one
+/// that weighs more than a record may is not compared, and is another.
+#[test]
+fn a_record_written_again_is_the_same_only_if_it_is_small_enough_to_be_compared() {
+    let big = |n: usize| norm(obj(vec![("pad", s(&"x".repeat(n)))]));
+    for (how, size, unread) in [("small", 100, false), ("big", 70_000, true)] {
+        let key = rk(1, 1);
+        let record = big(size);
+        let mut f = Fix::seeded(Limits::default(), |f| f.session(&live0(), &[(rk(1, 1), record.clone()), (rk(1, 2), rv(1, 20))]));
+        f.drain();
+        f.skim();
+        f.put(&live0(), &key, &record);
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+    }
+}
+
+/// The players and keys of the slips the mirror keeps are bounded by what a page pins: a longer one is no pin's and is not
+/// kept, and the session says so as one with too many does.
+#[test]
+fn a_signer_longer_than_a_page_pins_is_not_kept_and_the_session_says_so() {
+    // (A name of 128 characters of three bytes is the longest a page pins; 129 are 387 bytes.)
+    for (pid_chars, key_len, over) in [(128, MAX_SIGNER_BYTES, false), (129, 5, true), (5, MAX_SIGNER_BYTES + 1, true), (5, 60_000, true)] {
+        let (pid, key) = ("€".repeat(pid_chars), "k".repeat(key_len));
+        let pid_len = pid.len();
+        let mut f = Fix::seeded(Limits::default(), |f| {
+            let mut all = records(&[(1, 10)]);
+            all.push(slip(1, &pid, 1, &key));
+            all.push(slip(1, "pid-b", 2, "key-b"));
+            f.session(&live0(), &all);
+        });
+        while f.drain().short {}
+        f.skim();
+        let base = cp(2);
+        f.page_trim(&live0(), &base, &live_of(T, Some(&base)), &[]);
+        f.drain();
+        let (told, said_over) = f.m.take_ended_signers(T, INC);
+        assert_eq!(said_over, over, "{pid_len}/{key_len}");
+        let mut want: BTreeSet<(String, String)> = [pair("pid-b", "key-b")].into_iter().collect();
+        if !over {
+            want.insert(pair(&pid, &key));
+        }
+        assert_eq!(told, want, "{pid_len}/{key_len}: a pair that is no pin's is not kept");
+    }
+}
+
+/// A room's mirror that is told the delegations churned before it began says so, and the delegations are churned for good.
+#[test]
+fn a_mirror_can_be_told_that_the_delegations_churned_before_it_began() {
+    let f = Fix::empty();
+    assert!(!f.m.delegations().churned);
+    let mut f = f;
+    f.m.inherit_churn();
+    assert!(f.m.delegations().churned);
+    assert_eq!(f.m.delegations().changes, 0, "(it changed nothing it saw)");
+}
+
+// ── Round 10 ─────────────────────────────────────────────────────────────────
+
+/// A value no page takes for a checkpoint (plain, light, and none) is no checkpoint written over: only what a page may
+/// take for one, or the node cannot tell, is told of as lost. What stands, if it is no checkpoint, is none of the
+/// ones written.
+#[test]
+fn a_value_no_page_takes_for_a_checkpoint_is_no_checkpoint_written_over() {
+    let junk = || norm(obj(vec![("v", CVal::Int(1)), ("pad", s("x"))]));
+    let proto = |u: i64| {
+        let Any::Map(m) = to_any(&cp(u)) else { panic!("a map") };
+        let mut m = (*m).clone();
+        m.insert("__proto__".into(), Any::String(Arc::from("x")));
+        Any::Map(Arc::new(m))
+    };
+    // (A map with a `__proto__` field and a key a typed array keeps from being a field: a page may read it as anything.)
+    let anything = |u: i64| {
+        let Any::Map(m) = to_any(&cp(u)) else { panic!("a map") };
+        let mut m = (*m).clone();
+        m.insert("__proto__".into(), Any::String(Arc::from("x")));
+        m.insert("length".into(), Any::Number(1.0));
+        Any::Map(Arc::new(m))
+    };
+    // (A checkpoint with a house commitment: the pages take it only for the table of a house incarnation.)
+    let house_cp = |u: i64| {
+        let CVal::Obj(mut fields) = cp(u) else { panic!("an object") };
+        fields.push(("h".to_string(), s(&"d".repeat(64))));
+        norm(CVal::Obj(fields))
+    };
+    let nested = |f: &Fix| {
+        let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = f.doc.transact_mut();
+        comp.insert(&mut txn, sum_of(T).as_str(), MapPrelim::default());
+    };
+    // (what is written between two looks, in order; the checkpoints lost; the base at the end is a checkpoint)
+    for (how, lost, stands) in [
+        ("a checkpoint", 0, true),
+        ("junk", 0, false),
+        ("junk, a checkpoint, junk, a checkpoint", 1, true),
+        ("a checkpoint, junk", 1, false),
+        ("junk, junk, a checkpoint, junk", 1, false),
+        ("a nested map, a checkpoint", 0, true),
+        ("a checkpoint a page may read otherwise, another", 1, true),
+        ("a value a page may read as anything, another", 1, true),
+        ("a checkpoint too heavy to read, another", 1, true),
+        ("a checkpoint, a checkpoint too heavy to read", 1, false),
+        ("a house checkpoint, a house checkpoint", 1, true),
+    ] {
+        let mut f = Fix::empty();
+        f.put_top(&sum_of(T), &cp(1));
+        f.session(&live_of(T, Some(&cp(1))), &[]);
+        f.drain();
+        f.skim();
+        assert_eq!(f.m.take_superseded(T, INC), 0, "{how}: (the first base)");
+        let mut u = 2;
+        for step in how.split(", ") {
+            match step {
+                "a checkpoint" | "another" => {
+                    f.put_top(&sum_of(T), &cp(u));
+                    u += 1;
+                }
+                "a house checkpoint" => {
+                    f.put_top(&sum_of(T), &house_cp(u));
+                    u += 1;
+                }
+                "junk" => f.put_top(&sum_of(T), &junk()),
+                "a nested map" => nested(&f),
+                "a checkpoint a page may read otherwise" => {
+                    f.put_any(&sum_of(T), proto(u));
+                    u += 1;
+                }
+                "a value a page may read as anything" => {
+                    f.put_any(&sum_of(T), anything(u));
+                    u += 1;
+                }
+                "a checkpoint too heavy to read" => {
+                    f.put_top(&sum_of(T), &heavy(u));
+                    u += 1;
+                }
+                other => panic!("{other}"),
+            }
+        }
+        f.drain();
+        assert_eq!(f.m.take_superseded(T, INC), lost, "{how}");
+        assert_eq!(matches!(f.state().base, Some(_)), stands, "{how}");
+    }
+}
+
+/// A page's trim writes the checkpoint of its own table in the transaction that deletes the session it trims. The
+/// checkpoint of another table changing in the same transaction is that table's trim and not this one's: a session
+/// replaced or removed beside it is replaced or removed on its own, and the history it held is the pages' to count.
+#[test]
+fn a_session_replaced_beside_another_tables_trim_is_a_session_replaced_on_its_own() {
+    const B: &str = "table-b";
+    let b_live = |base: Option<&CVal>| live_of(B, base);
+    let b_trim = |f: &Fix, a_edit: &dyn Fn(&yrs::MapRef, &mut yrs::TransactionMut)| {
+        let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+        let mut txn = f.doc.transact_mut();
+        let base = cp(5);
+        comp.insert(&mut txn, sum_of(B).as_str(), to_any(&base));
+        comp.remove(&mut txn, b_live(Some(&cp(4))).as_str());
+        comp.insert(&mut txn, b_live(Some(&base)).as_str(), MapPrelim::default());
+        a_edit(&comp, &mut txn);
+    };
+    for (how, unread) in [
+        ("another table's trim beside A's session replaced", true),
+        ("another table's trim beside A's session removed", true),
+        ("A's checkpoint written again as it stands beside A's session replaced", true),
+        ("A's own trim", false),
+        ("A's own trim beside another table's", false),
+    ] {
+        let a_base = cp(2);
+        let mut f = Fix::seeded(Limits::default(), |f| {
+            f.put_top(&sum_of(T), &a_base);
+            f.session(&live_of(T, Some(&a_base)), &records(&[(1, 10)]));
+            f.put_top(&sum_of(B), &cp(4));
+            f.session(&b_live(Some(&cp(4))), &records(&[(1, 10)]));
+        });
+        f.m.want(&[(T.into(), INC.into()), (B.into(), INC.into())]);
+        while f.drain().short {}
+        f.skim();
+        let _ = f.m.take(B, INC, usize::MAX);
+        let a_live = live_of(T, Some(&a_base));
+        match how {
+            "another table's trim beside A's session replaced" => b_trim(&f, &|comp, txn| {
+                comp.insert(txn, a_live.as_str(), MapPrelim::default());
+            }),
+            "another table's trim beside A's session removed" => b_trim(&f, &|comp, txn| {
+                comp.remove(txn, a_live.as_str());
+            }),
+            "A's checkpoint written again as it stands beside A's session replaced" => {
+                let comp = f.doc.get_or_insert_map(COMPUTED_MAP);
+                let mut txn = f.doc.transact_mut();
+                comp.insert(&mut txn, sum_of(T).as_str(), to_any(&a_base));
+                comp.insert(&mut txn, a_live.as_str(), MapPrelim::default());
+            }
+            "A's own trim" => {
+                let base = cp(3);
+                f.page_trim(&a_live, &base, &live_of(T, Some(&base)), &[]);
+            }
+            _ => b_trim(&f, &|comp, txn| {
+                let base = cp(3);
+                comp.insert(txn, sum_of(T).as_str(), to_any(&base));
+                comp.remove(txn, a_live.as_str());
+                comp.insert(txn, live_of(T, Some(&base)).as_str(), MapPrelim::default());
+            }),
+        }
+        while f.drain().short {}
+        f.skim();
+        // A's next trim: the session it trims is the one the pages read.
+        let (cur, next_base) = match how {
+            "A's own trim" | "A's own trim beside another table's" => (live_of(T, Some(&cp(3))), cp(4)),
+            _ => (a_live.clone(), cp(3)),
+        };
+        if how == "A's own trim" || how == "A's own trim beside another table's" {
+            assert_eq!(f.state().trims, 1, "{how}: the trim");
+            assert!(!f.state().unread_at_trim, "{how}: a trim is no doubt");
+            f.page_trim(&cur, &next_base, &live_of(T, Some(&next_base)), &[]);
+            f.drain();
+            assert_eq!((f.state().trims, f.state().unread_at_trim), (2, unread), "{how}: the next trim");
+        } else {
+            f.page_trim(&cur, &next_base, &live_of(T, Some(&next_base)), &[]);
+            f.drain();
+            assert_eq!((f.state().trims, f.state().unread_at_trim), (1, unread), "{how}");
+        }
     }
 }

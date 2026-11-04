@@ -133,6 +133,12 @@ mod house_mirror;
 // The mirror's changes sent to the fold worker, and its answers kept (PR 6b-1c-ii).
 #[cfg(feature = "house-fold")]
 mod fold_feed;
+// The node's fold held against the pages' checkpoints, in shadow (PR 6b-1c-iii), and the
+// players' keys as the pages pin them, which it folds with.
+#[cfg(feature = "house-fold")]
+mod fold_pins;
+#[cfg(feature = "house-fold")]
+mod fold_shadow;
 
 // 🛑 Refuse a v1 Yjs update that every page refuses, on the raw bytes, before
 // the node decodes it (yrs 0.27.2 crashes on a non-UTF-8 string, overflows on
@@ -424,6 +430,61 @@ pub struct Fingerprint {
     /// unreadable) or the node is older.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub house: Option<String>,
+    /// 🧮 What the node's fold of the casino tables it is a house of has done
+    /// in shadow (fold_shadow.rs), live on every request. Absent in a build
+    /// without the `house-fold` feature, when the house is off, or when the
+    /// fold is turned off (`SSF_HOUSE_FOLD=0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub house_fold: Option<HouseFoldReport>,
+}
+
+/// 🧮 The fold in shadow, as the fingerprint reports it. Defined here, always
+/// compiled, because the fingerprint carries it in every build while the fold
+/// that fills it exists only with the `house-fold` feature.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HouseFoldReport {
+    /// The rule set each house incarnation letter is folded by.
+    pub rules: std::collections::BTreeMap<String, String>,
+    /// The incarnation letters this node folds.
+    pub letters: String,
+    /// Whether the node attests a trim (writes `hs:`): not in shadow.
+    pub attest: bool,
+    /// Page checkpoints the fold's nets, closes, commitments and carries
+    /// agreed with, and ones they differed from: the mismatches are what a
+    /// release has to find zero of before the node writes `hs:` (PR 6b-2).
+    pub shadow_agreed: u64,
+    pub shadow_mismatches: u64,
+    /// Checkpoints not compared: the fold had not got there, or was already past.
+    pub shadow_skipped: u64,
+    /// Tables sent to the worker from scratch.
+    pub cold_folds: u64,
+    /// Answers that said a table is dirty.
+    pub dirty: u64,
+    /// Tables lost to a worker that failed.
+    pub lost: u64,
+    /// Results and frames given up on.
+    pub bad_results: u64,
+    pub worker_starts: u64,
+    pub worker_restarts: u64,
+    pub worker_failures: u64,
+    /// Rooms followed now.
+    pub rooms: u64,
+    /// House tables followed now, and ones left out because the worker holds
+    /// only so many (they are followed as others end).
+    pub tables: u64,
+    pub tables_over: u64,
+    /// Why the fold is off (`crashes`: the worker failed too often; `env`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off: Option<String>,
+    /// The last mismatches the comparisons found, and the last comparisons not made, each with the table, the
+    /// checkpoint's round and why (a mismatch: the field and both values), the newest last. Kept here because the
+    /// desktop app starts the node with no console, so a line printed to stderr reaches nobody there. At most 32 lines
+    /// of 512 bytes each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_mismatches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_skips: Vec<String>,
 }
 
 /// 📖 The node's Phone Book listing as the browser sees it (`Fingerprint::
@@ -740,6 +801,12 @@ pub struct HubState {
     /// (a house that forgot what it revealed could reveal a round twice).
     /// Locked after `rooms`, never before.
     pub house: Option<Mutex<house::House>>,
+    /// 🧮 The node's fold of the casino tables it is a house of, held against
+    /// the pages' checkpoints in shadow (fold_shadow.rs): None without a house,
+    /// or turned off (`SSF_HOUSE_FOLD=0`). Ticked by the house's loop only;
+    /// locked after `house` is let go, never before.
+    #[cfg(feature = "house-fold")]
+    pub fold_shadow: Option<Mutex<fold_shadow::FoldShadow<fold_supervisor::ChildLaunch>>>,
     /// 📌 #315: the board-bundle lane: the bundles this node carries for
     /// anyone (`board-bundles/`), what it published, and each peer's budget.
     /// Locked briefly, never across an await, never inside another lock.
@@ -990,6 +1057,7 @@ pub fn compute_fingerprint(
         blob_cap: None,
         torrent: false,
         house: None,
+        house_fold: None,
     })
 }
 
@@ -1063,6 +1131,7 @@ mod fingerprint_json_tests {
             blob_cap: None,
             torrent: false,
             house: None,
+            house_fold: None,
         }
     }
 
@@ -2271,8 +2340,28 @@ async fn node_main() -> Result<()> {
             None
         }
     };
+    // (Only the fold in shadow reads the house's plans; without it the house's passes take no look at a doc between them.)
+    let mut house = house;
+    #[cfg(feature = "house-fold")]
+    let plans_read = !house_fold_off_by_env();
+    #[cfg(not(feature = "house-fold"))]
+    let plans_read = false;
+    if let Some(h) = house.as_mut() {
+        h.watch_plans(plans_read);
+    }
     let mut fingerprint = fingerprint;
     fingerprint.house = house.as_ref().map(|h| h.public().to_string());
+    // 🧮 The fold in shadow, with a house to be one (it writes nothing to any doc).
+    #[cfg(feature = "house-fold")]
+    let fold_shadow = if house.is_none() {
+        None
+    } else if house_fold_off_by_env() {
+        println!("🧮 The fold in shadow is off (SSF_HOUSE_FOLD)");
+        fingerprint.house_fold = Some(HouseFoldReport { off: Some("env".to_string()), ..HouseFoldReport::default() });
+        None
+    } else {
+        Some(Mutex::new(fold_shadow::FoldShadow::live(fold_supervisor::ChildLaunch::new(), std::time::Instant::now())))
+    };
     let hub = Arc::new(HubState {
         rooms: Mutex::new(HashMap::new()),
         fingerprint: Mutex::new(fingerprint),
@@ -2321,6 +2410,8 @@ async fn node_main() -> Result<()> {
         presence_status: Mutex::new(None),
         blobs,
         house: house.map(Mutex::new),
+        #[cfg(feature = "house-fold")]
+        fold_shadow,
         #[cfg(feature = "chia-read")]
         board_bundles: Mutex::new(board_bundles::BoardLane::load(
             std::path::Path::new(board_bundles::BUNDLES_DIR),
@@ -4470,6 +4561,9 @@ fn house_now() -> u64 {
 /// and send what it wrote.
 async fn house_loop(hub: SharedHub) {
     HOUSE_SEQ.store(rand::random::<u32>() >> 1, std::sync::atomic::Ordering::Relaxed);
+    // Whether a pass of the fold in shadow is still running (one at a time, and none holds up the house).
+    #[cfg(feature = "house-fold")]
+    let shadow_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(house::TICK_MS)).await;
         let mut sent = house_sends().lock().await;
@@ -4490,6 +4584,10 @@ async fn house_loop(hub: SharedHub) {
             send_house_update(&hub, &room_id, update.clone(), false).await;
             sent.push_back((now, room_id, update));
         }
+        // (The sends are done and the lock on them let go before the fold in shadow has its turn.)
+        drop(sent);
+        #[cfg(feature = "house-fold")]
+        spawn_fold_shadow(&hub, &shadow_busy);
     }
 }
 
@@ -4700,6 +4798,74 @@ fn house_tick(hub: &SharedHub) -> Vec<(String, Vec<u8>)> {
         }
     }
     out
+}
+
+/// 🧮 `SSF_HOUSE_FOLD=0` (or off, false, no) turns the fold in shadow off.
+#[cfg(feature = "house-fold")]
+fn house_fold_off_by_env() -> bool {
+    fold_switched_off(std::env::var("SSF_HOUSE_FOLD").ok().as_deref())
+}
+
+/// Whether the value of `SSF_HOUSE_FOLD` (None: not set) turns the fold in shadow off.
+#[cfg(feature = "house-fold")]
+fn fold_switched_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+}
+
+#[cfg(all(test, feature = "house-fold"))]
+mod house_fold_switch_tests {
+    use super::fold_switched_off;
+
+    #[test]
+    fn the_fold_in_shadow_is_on_unless_the_switch_says_off() {
+        assert!(!fold_switched_off(None), "not set: on");
+        for on in ["", "1", "on", "true", "yes", "maybe", "00"] {
+            assert!(!fold_switched_off(Some(on)), "{on:?}");
+        }
+        for off in ["0", "off", "OFF", "False", " no ", "No"] {
+            assert!(fold_switched_off(Some(off)), "{off:?}");
+        }
+    }
+}
+
+/// 🧮 One pass of the fold in shadow over the served rooms: what the house
+/// found to follow in each room (the plan its last tick made), then the
+/// shadow's pass. It reads the docs and writes none; a panic in it costs the
+/// shadow its pass and nothing else. It runs after the house's tick has sent
+/// what it wrote, and not inside it, so what it reads (megabytes a room) and
+/// the worker it may start never hold up a reveal or the step-down.
+#[cfg(feature = "house-fold")]
+fn fold_shadow_pass(hub: &SharedHub) {
+    let (Some(shadow), Some(house)) = (hub.fold_shadow.as_ref(), hub.house.as_ref()) else { return };
+    // (The house, then the doc, as its own tick takes them. The time is asked as it is wanted: the pass may wait for a lock
+    // or a doc, and a request posted by the time it began would be called unanswered the sooner.)
+    let report = fold_shadow::tick_shadow_with(shadow, served_docs(&hub.rooms), &std::time::Instant::now, |room_id| house::lock(house).fold_plan(room_id));
+    match report {
+        Some(report) => hub.fingerprint.lock().unwrap().house_fold = Some(report),
+        None => eprintln!("🧮 fold-shadow: its pass failed; the house goes on"),
+    }
+}
+
+/// Starts a pass of the fold in shadow on the blocking pool and goes on: none
+/// when the last is still running.
+#[cfg(feature = "house-fold")]
+fn spawn_fold_shadow(hub: &SharedHub, busy: &Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    if hub.fold_shadow.is_none() || busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // (Cleared when the pass ends however it ends.)
+    struct Done(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let (hub, done) = (hub.clone(), Done(busy.clone()));
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        fold_shadow_pass(&hub);
+    });
 }
 
 /// Step the house down in every served room now (house.rs step_down), and

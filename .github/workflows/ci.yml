@@ -109,10 +109,11 @@ jobs:
       # for three watcher ticks, and a control run without the switch dials
       # the pin; there the page's in-game off closes its connections, and a
       # third start reads the switch's file and builds the lane closed. It
-      # takes about four minutes, so it runs once, in the set players get,
-      # and not in the chia-publish or mainnet steps.
-      - name: 🧪 cargo test --features chia-publish,torrent (the release set)
-        run: cargo test --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+      # takes about four minutes, so it runs once, in the set players get
+      # (house-fold included, since 6b-1c-iii), and not in the chia-publish
+      # or mainnet steps.
+      - name: 🧪 cargo test --features chia-publish,torrent,house-fold (the release set)
+        run: cargo test --features chia-publish,torrent,house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
       # ⛓️ Chia mainnet, a development build only (release.yml never names the
       # feature): it compiles and passes, and with the variable set here every
@@ -126,14 +127,17 @@ jobs:
         run: cargo check --features chia-publish,torrent,chia-mainnet --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
       # 🧮 The node's copy of the pages' fold: their TypeScript run in QuickJS
-      # (rquickjs, a C dependency) behind a feature no release names yet (PR
-      # 6b-1). Its tests fold test-vectors/fold-engine-v1.json and want the
+      # (rquickjs, a C dependency) behind a feature the release names since
+      # PR 6b-1c-iii (it runs in shadow: the release set above carries it). Its
+      # tests fold test-vectors/fold-engine-v1.json and want the
       # pages' own bytes; the engine's limits and memory are tested too. And
       # its child process (6b-1b): the frames, the worker loop, the
       # supervisor's rules, and the real binary started as `--fold-worker`
-      # (tests/fold_worker_process.rs, which also builds the binary).
-      - name: 🧪 cargo test --features house-fold (the QuickJS fold and its worker process)
-        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor
+      # (tests/fold_worker_process.rs, which also builds the binary). And the
+      # node's side of it (6b-1c): the mirror of a room's tables, the feed to
+      # the worker and the shadow comparison against the pages' checkpoints.
+      - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins fold_view
 
       - name: 🔎 cargo check --features chia-publish,torrent,house-fold
         run: cargo check --features chia-publish,torrent,house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
@@ -153,9 +157,9 @@ jobs:
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
 
-      - name: 🔎 cargo check --features chia-publish,torrent
+      - name: 🔎 cargo check --features chia-publish,torrent,house-fold
         shell: bash
-        run: cargo check --features chia-publish,torrent --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+        run: cargo check --features chia-publish,torrent,house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
 
       # 🏦 The SSF wallet's tests on NTFS and the Windows API (the filters
       # match chia_wallet::, chia_wallet_switch:: and chia_at_rest::, whose
@@ -168,10 +172,14 @@ jobs:
       # tests run the interrupt, the stack and memory limits and the pages'
       # vectors on the Windows build too, before any release carries it. And
       # its child process: the pipes, the kill and the real `--fold-worker`
-      # binary are Windows' own to prove.
-      - name: 🧪 cargo test --features house-fold (the QuickJS fold and its worker process)
+      # binary are Windows' own to prove. And the watch of the players
+      # (fold_pins) and the house's own tests (`house::tests`, the plan the
+      # shadow follows among them): a filter names the modules it runs, and
+      # `cargo check --tests` only compiles them. The filter has no trailing
+      # `::`: a YAML plain scalar cannot end in a colon.
+      - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
         shell: bash
-        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins house::tests
 
   node-check-macos:
     name: 🦀 Node cargo check + wallet tests on macOS (release features)
@@ -191,8 +199,15 @@ jobs:
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
 
-      - name: 🔎 cargo check --features chia-publish,torrent --tests
-        run: cargo check --features chia-publish,torrent --tests --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+      - name: 🔎 cargo check --features chia-publish,torrent,house-fold --tests
+        run: cargo check --features chia-publish,torrent,house-fold --tests --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      # 🧮 The fold's child process on macOS (the release's .dmg carries the
+      # node): the pipes, the kill and the reaper, the real `--fold-worker`
+      # binary, and the feed and shadow over them, the watch of the players
+      # (fold_pins) and the house's own tests (`house::tests`).
+      - name: 🧪 cargo test --features house-fold (the QuickJS fold, its worker process and the shadow)
+        run: cargo test --features house-fold --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml -- house_fold fold_wire fold_worker fold_supervisor house_mirror fold_feed fold_shadow fold_pins house::tests
 
       # 🏦 The SSF wallet's tests on APFS and the macOS API. With
       # SSF_KEYCHAIN_TESTS=1 the keychain tests run against temporary
