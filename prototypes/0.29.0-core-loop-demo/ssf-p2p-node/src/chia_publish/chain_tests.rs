@@ -33,7 +33,7 @@ use crate::chia_knock::SETTLED_DEPTH;
 use crate::chia_peer::mock::chain::{MockChain, FAILED};
 use crate::chia_peer::mock::MockNode;
 use crate::chia_peer_lane::{Lane, PeerLane, Trust};
-use crate::chia_resolve::{child_under_hint, read_ck, read_inbox, spent_heights, unix_now, HintChild, WriteStanding};
+use crate::chia_resolve::{child_under_hint, extract_ciphertext, memo_digest, read_ck, read_inbox, spent_heights, unix_now, HintChild, WriteStanding};
 use chia_protocol::ProtocolMessageTypes;
 
 const NET: crate::chia_network::ChiaNet = crate::chia_network::ChiaNet::Testnet11;
@@ -130,10 +130,23 @@ impl Setup {
     /// test takes seconds), so it asks about no parked spend, and judges the
     /// settling ones by the same chain again.
     /// The write spends one coin, `input`, to itself, as every write of this
-    /// build does ([`WriteCoins::one`]).
+    /// build does ([`WriteCoins::one`]). Judged as a mark an older node saved
+    /// is, with no memo digest: by its hint alone ([`Self::standing_with_memo`]
+    /// for a mark this build saves).
     async fn standing(&mut self, hint: Bytes32, input: Bytes32, spend: u64) -> WriteStanding {
+        self.judge(hint, input, None, spend).await
+    }
+
+    /// [`Self::standing`] of a write whose mark keeps `memo`, the digest of
+    /// the memo it carried ([`memo_of`]), as every mark this build saves
+    /// does: its coin under the hint confirms it only if it carries that memo.
+    async fn standing_with_memo(&mut self, hint: Bytes32, input: Bytes32, memo: Bytes32, spend: u64) -> WriteStanding {
+        self.judge(hint, input, Some(memo), spend).await
+    }
+
+    async fn judge(&mut self, hint: Bytes32, input: Bytes32, memo: Option<Bytes32>, spend: u64) -> WriteStanding {
         self.reconcile().await;
-        let judged = write_standing_on(&self.lease, NET, &self.money, WriteCoins::one(input), hint, Some(spend), 0, "test").await;
+        let judged = write_standing_on(&self.lease, NET, &self.money, WriteCoins::one(input), hint, memo, Some(spend), 0, "test").await;
         judged.expect("the chain answered").0
     }
 
@@ -172,16 +185,39 @@ fn entries() -> Vec<AddrEntry> {
 
 /// A presence write of `node` under `ck` for `era`, spending `coin` of
 /// `payer`: its hint and its bundle, built as the presence writer builds
-/// them ([`presence_memo`], [`build_publish_bundle`]).
+/// them ([`presence_memo`], [`memo_bundle`]). The digest the writer's mark
+/// keeps is checked, for every write a test makes, to be the one a reader
+/// takes from the bundle ([`our_memo`]), which the tests judge it by.
 fn presence_write(payer: &SecretKey, node: &iroh::SecretKey, ck: &[u8; 32], coin: Coin, era: u64) -> (Bytes32, SpendBundle) {
     let (hint, memo) = presence_memo(NET, node, ck, era, &entries(), unix_now()).unwrap();
-    (hint, build_publish_bundle(NET, payer, coin, hint, Bytes::new(memo)).unwrap())
+    (hint, our_memo(payer, coin, hint, memo))
+}
+
+/// A write of ours carrying `body` under `hint`, spending `coin` of `payer`,
+/// built as every writer of ours builds it ([`memo_bundle`]): its bundle,
+/// once the digest its mark would keep is shown to be [`memo_of`] it.
+fn our_memo(payer: &SecretKey, coin: Coin, hint: Bytes32, body: Vec<u8>) -> SpendBundle {
+    let (bundle, saved) = memo_bundle(NET, payer, coin, hint, body).unwrap();
+    assert_eq!(saved, memo_of(&bundle, hint), "the digest the writer saves is the one its readers take from its spend");
+    bundle
 }
 
 /// The coin a write of `payer`'s spending `coin` creates: back to the
 /// wallet at the coin's full amount, since a write pays no fee.
 fn written(payer: &SecretKey, coin: Coin) -> Coin {
     Coin::new(coin.coin_id(), our_puzzle_hash(payer), coin.amount)
+}
+
+/// The digest of the memo `bundle` carries under `hint` ([`memo_digest`]):
+/// what the write's mark keeps of it, taken as a reader takes the memo
+/// ([`extract_ciphertext`]) from the first of the bundle's spends carrying
+/// one under the hint.
+fn memo_of(bundle: &SpendBundle, hint: Bytes32) -> Bytes32 {
+    let carried = bundle.coin_spends.iter().find_map(|cs| {
+        let spend = crate::chia_chain::PuzzleAndSolution { puzzle_reveal: cs.puzzle_reveal.clone(), solution: cs.solution.clone() };
+        extract_ciphertext(&spend, hint).expect("the spend runs")
+    });
+    memo_digest(&carried.expect("the bundle carries a memo under the hint"))
 }
 
 /// The dish's TAKE of `dish` to `recipient`, keyless and fee 0, as
@@ -205,11 +241,12 @@ async fn a_presence_write_lands_and_the_resolver_reads_it_back() {
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     assert_eq!(s.chain.fee_of(&bundle), 0, "a presence write pays no fee");
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).expect("parked under its spend");
     assert_eq!(s.chain.mempool(), vec![bundle.name()]);
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending, "in the mempool, the spend is live");
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Pending, "in the mempool, the spend is live");
     assert!(s.lease.is_parked(&coin.coin_id()));
 
     let landed = s.chain.farm().await;
@@ -222,7 +259,7 @@ async fn a_presence_write_lands_and_the_resolver_reads_it_back() {
     assert_eq!(found[0].record.addrs, vec!["198.51.100.7:4444".to_string()]);
     assert_eq!((found[0].coin_id, found[0].confirmed_height, found[0].hint), (written(&payer, coin).coin_id(), landed, hint));
 
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert_eq!(s.lease.lease_word(&coin.coin_id()), LeaseWord::Spent);
     assert!(s.lease.is_settling(&coin.coin_id()) && s.lease.holds_spend(spend), "spent, and kept until it settles");
     s.chain.farm_blocks(SETTLED_DEPTH - 1).await;
@@ -291,7 +328,7 @@ async fn a_knock_opens_for_the_host_and_for_nobody_else() {
 
     let ck_from = [41u8; 32];
     let memo = knock_memo(NET, &knocker_node, &req, &ROOM_KEY, 0, coins[0].coin_id(), Some(ck_from), unix_now()).unwrap();
-    let knock = build_publish_bundle(NET, &knocker, coins[0], hint, Bytes::new(memo.clone())).unwrap();
+    let knock = our_memo(&knocker, coins[0], hint, memo.clone());
     s.push(&knocker, &knock, (coins[0].coin_id(), funded)).await.unwrap();
     let replay = build_publish_bundle(NET, &thief, coins[1], hint, Bytes::new(memo)).unwrap();
     s.money.push_tx(replay).await.unwrap();
@@ -323,6 +360,7 @@ async fn a_full_mempool_refuses_a_fresh_fee_zero_write_and_takes_it_once_cleared
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.chain.set_full(true);
     match s.push(&payer, &bundle, (coin.coin_id(), funded)).await {
         Err(PushError::Rejected(why)) => assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO"), "{why}"),
@@ -337,7 +375,7 @@ async fn a_full_mempool_refuses_a_fresh_fee_zero_write_and_takes_it_once_cleared
     let landed = s.chain.farm().await;
     assert_eq!(s.chain.fee_of(&bundle), 0);
     assert_eq!(s.chain.children(coin.coin_id()), vec![written(&payer, coin)]);
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert_eq!(s.sent(), HashSet::from([bundle.name()]));
     assert!(s.chain.unanswered().is_empty());
 }
@@ -354,6 +392,7 @@ async fn an_evicted_write_the_nodes_still_remember_stays_parked_until_they_forge
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     s.chain.evict_all();
@@ -370,7 +409,7 @@ async fn an_evicted_write_the_nodes_still_remember_stays_parked_until_they_forge
     s.reconcile().await;
     assert_eq!(s.chain.mempool(), vec![bundle.name()], "the probe was taken");
     let landed = s.chain.farm().await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert_eq!(s.chain.fee_of(&bundle), 0);
     assert_eq!(s.sent(), HashSet::from([bundle.name()]), "the saved bundle, never built again");
     assert!(s.chain.unanswered().is_empty());
@@ -388,6 +427,7 @@ async fn a_write_evicted_from_a_full_mempool_stays_parked_and_lands_once_the_mem
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     s.reconcile().await;
@@ -405,7 +445,7 @@ async fn a_write_evicted_from_a_full_mempool_stays_parked_and_lands_once_the_mem
     s.reconcile().await;
     assert_eq!(s.chain.mempool(), vec![bundle.name()]);
     let landed = s.chain.farm().await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert_eq!(s.chain.fee_of(&bundle), 0, "no fee added");
     assert_eq!(s.sent(), HashSet::from([bundle.name()]));
     assert!(s.chain.unanswered().is_empty());
@@ -464,24 +504,25 @@ async fn a_reorg_drops_the_write_and_the_lease_pushes_its_saved_bundle_again_unt
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     let landed = s.chain.farm().await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert!(s.lease.is_settling(&coin.coin_id()));
 
     let peak = s.chain.reorg(1).await;
     assert_eq!(peak, landed + 1);
     assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, None, "the spend is undone");
     assert!(s.chain.children(coin.coin_id()).is_empty() && s.chain.mempool().is_empty());
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending);
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Pending);
     assert!(s.lease.is_parked(&coin.coin_id()) && s.lease.holds_spend(spend), "parked again under its own number");
 
     s.reconcile().await;
     assert_eq!(s.chain.mempool(), vec![bundle.name()], "the probe pushed the saved bundle");
     let again = s.chain.farm().await;
     assert_eq!(again, landed + 2);
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
     assert_eq!(s.sent(), HashSet::from([bundle.name()]));
     assert!(s.chain.unanswered().is_empty());
 }
@@ -501,10 +542,11 @@ async fn a_reorg_one_node_has_not_taken_yet_gives_no_verdict_and_the_lease_keeps
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     let landed = s.chain.farm().await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     assert!(s.lease.is_settling(&coin.coin_id()));
 
     s.chain.hold(&s.b);
@@ -515,7 +557,7 @@ async fn a_reorg_one_node_has_not_taken_yet_gives_no_verdict_and_the_lease_keeps
     assert!(s.lease.is_settling(&coin.coin_id()) && s.lease.holds_spend(spend), "no verdict: still settling under its own number");
     assert!(!s.lease.is_parked(&coin.coin_id()));
     assert_eq!(s.lane.live_count().await, 0, "the two disagree on the chain, so the lane let both go");
-    let judged = write_standing_on(&s.lease, NET, &s.money, WriteCoins::one(coin.coin_id()), hint, Some(spend), landed, "test").await;
+    let judged = write_standing_on(&s.lease, NET, &s.money, WriteCoins::one(coin.coin_id()), hint, Some(memo), Some(spend), landed, "test").await;
     assert_eq!(judged, None, "the writer's lookup has no answer either");
     assert!(s.lease.is_settling(&coin.coin_id()) && s.lease.holds_spend(spend));
     assert_eq!(s.chain.received().len(), sends, "nothing was sent while the two disagree");
@@ -523,12 +565,12 @@ async fn a_reorg_one_node_has_not_taken_yet_gives_no_verdict_and_the_lease_keeps
 
     s.chain.release(&s.b).await;
     s.new_lane();
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending);
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Pending);
     assert_eq!(s.lease.spend_of(&coin.coin_id()), Some(spend), "parked again under its own number");
     s.reconcile().await;
     assert_eq!(s.chain.mempool(), vec![bundle.name()], "the probe pushed the saved bundle");
     let again = s.chain.farm().await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
     assert_eq!(s.chain.fee_of(&bundle), 0);
     assert_eq!(s.sent(), HashSet::from([bundle.name()]), "one bundle, never built again");
     assert!(s.chain.unanswered().is_empty());
@@ -568,7 +610,7 @@ async fn an_ephemeral_coin_is_found_through_its_parent_by_every_lookup_the_resol
     let mut want = vec![(dish.coin_id(), landed), (gift.coin_id(), landed)];
     want.sort();
     assert_eq!(spent, want);
-    assert_eq!(child_under_hint(&s.money, hint, gift.coin_id()).await.unwrap(), HintChild::Confirmed { height: landed, judged_at: Some(landed) });
+    assert_eq!(child_under_hint(&s.money, hint, gift.coin_id(), Some(memo_of(&both, hint))).await.unwrap(), HintChild::Confirmed { height: landed, judged_at: Some(landed) });
     s.reconcile().await;
     assert!(s.lease.is_settling(&dish.coin_id()) && s.lease.holds_spend(spend), "the TAKE's input settles as any spend's");
     assert!(s.chain.unanswered().is_empty());
@@ -587,6 +629,7 @@ async fn a_foreign_spend_of_a_coin_our_write_holds_is_seen_as_another_spend_of_o
     let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
     let funded = s.chain.farm().await;
     let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let memo = memo_of(&bundle, hint);
     s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     let (_, other) = presence_write(&payer, &iroh::SecretKey::generate(), &[22u8; 32], coin, 0);
@@ -595,14 +638,106 @@ async fn a_foreign_spend_of_a_coin_our_write_holds_is_seen_as_another_spend_of_o
     assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, Some(spent));
     assert!(s.chain.mempool().is_empty(), "the block spent the write's coin, so the mempools let the write go");
 
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending, "the lease still holds the spend");
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Pending, "the lease still holds the spend");
     assert!(s.lease.is_settling(&coin.coin_id()));
     assert!(!s.money.spend_live(bundle.clone()).await.unwrap(), "a double spend everywhere: dead");
     assert_eq!(s.chain.acks_for(bundle.name()).split_off(2), vec![(FAILED, Some("DOUBLE_SPEND".to_string())); 2]);
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
     assert!(!s.lease.holds_spend(spend));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A write of ours lands and is confirmed, and then a reorganisation,
+/// reaching one node late as real ones do, replaces its block by a fork whose
+/// first block holds another write of ours from the same coin (the same
+/// wallet, another contact key, so another hint). The new fork makes the
+/// same coin at the same height, and a full node never deletes a hint row:
+/// once both nodes have the fork, both list the coin under the old hint as
+/// well as the new. The coin's parent spend is now the other write's, so a
+/// reader opens nothing of ours under the old hint, and the writer's verdict
+/// says so too: not confirmed — pending while the lease holds the spend, so
+/// the Phone Book's green goes — for one agreed spend request more, and dead
+/// once the coin is spent SETTLED_DEPTH deep, so the listing is written
+/// again. The other write confirms under its own hint and memo. A node that
+/// never took the old block has no stale row, and a lane on it and on one
+/// that did disagrees: no verdict at all.
+#[tokio::test]
+async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the_write_the_old_fork_held() {
+    let mut s = setup().await;
+    let (payer, node) = (wallet(16), iroh::SecretKey::generate());
+    let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
+    let funded = s.chain.farm().await;
+    let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    let (other_hint, other) = presence_write(&payer, &iroh::SecretKey::generate(), &[22u8; 32], coin, 0);
+    assert_ne!(hint, other_hint);
+    let (memo, other_memo) = (memo_of(&bundle, hint), memo_of(&other, other_hint));
+    let ours = written(&payer, coin);
+
+    // Our write lands, and its mark is saved seen on chain.
+    s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
+    let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
+    let landed = s.chain.farm().await;
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    let write = MemoWrite { coins: WriteCoins::one(coin.coin_id()), acked: true, spend: Some(spend), memo };
+    let made = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
+    let word = presence_standing_on(&s.lease, NET, &s.money, &made).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)));
+    let PresenceStep::Save(mark) = presence_step(&made, word, 0, landed) else { panic!("confirmed: saved") };
+    assert!(mark.chain_seen && mark.confirmed_height == landed && mark.memo == hex::encode(memo), "{mark:?}");
+
+    // The new fork, staged as a real one: node b is held on the old one while
+    // node a takes it, and the lane gives no verdict while the two disagree.
+    s.chain.hold(&s.b);
+    let peak = s.chain.reorg_including(1, vec![other.clone()]).await;
+    assert_eq!(peak, landed + 1);
+    assert_eq!(s.chain.record(ours.coin_id()), Some((ours, landed, None)), "the same coin at the same height, made by the other write");
+    s.reconcile().await;
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &mark).await, None, "the two nodes disagree: no verdict");
+    s.chain.release(&s.b).await;
+    s.new_lane();
+
+    // The stale row: both nodes list the coin under the old hint as under the
+    // new. Its parent's spend at that height is the other write's, so a
+    // reader opens nothing of ours.
+    for h in [hint, other_hint] {
+        let listed = s.money.coin_records_by_hint(h, None, true, None).await.unwrap();
+        assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), vec![(ours, landed)], "under {h}");
+    }
+    let served = s.money.puzzle_and_solution(coin.coin_id(), landed).await.unwrap().expect("the coin was spent at that height");
+    assert_eq!(served.solution, other.coin_spends[0].solution, "the other write's spend");
+    assert!(read_ck(NET, &s.carrier, &CK, peak, unix_now(), &mut HashMap::new()).await.unwrap().is_empty(), "nothing of ours to read");
+
+    // The verdict: not confirmed. The lease still holds the spend (settling),
+    // so the write is pending, and the listing judged past its block lacks
+    // it: the mark goes back to pending, the green with it. One agreed spend
+    // request, of each node once, is what the check costs.
+    s.reconcile().await;
+    let asked = s.asked(ProtocolMessageTypes::RequestPuzzleSolution);
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word, Some((WriteStanding::Pending, true)), "the coin under the hint carries the other write");
+    assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleSolution) - asked, 2, "the parent's spend, of each node once");
+    let PresenceStep::Save(again) = presence_step(&mark, word, 0, peak) else { panic!("pending again: saved") };
+    assert!(!again.chain_seen && again.confirmed_height == 0, "{again:?}");
+    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending, "an older node's mark, by the hint alone, is not confirmed either");
+    assert_eq!(
+        child_under_hint(&s.money, other_hint, coin.coin_id(), Some(other_memo)).await.unwrap(),
+        HintChild::Confirmed { height: landed, judged_at: Some(peak) },
+        "the other write is confirmed under its own hint and memo"
+    );
+
+    // Spent SETTLED_DEPTH deep, the lease lets the spend go: the write is
+    // dead, and the listing is written again.
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert!(!s.lease.holds_spend(spend));
+
+    // A node that never took the old block has the hint rows of the chain as
+    // it stands, with no stale row: a lane on it and on node a disagrees.
+    let late = s.chain.node().await;
+    let fresh = PeerLane::new(s.chain.lane(&s.a, &late), Trust::Agreed);
+    assert!(child_under_hint(&fresh, hint, coin.coin_id(), Some(memo)).await.is_err(), "one node lists the stale row, the other not: no verdict");
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -675,7 +810,7 @@ async fn a_closed_lane_makes_no_connection_and_the_mock_chain_sees_nothing() {
     let kx = crate::chia_contact::kx_card_secret(&node);
     assert!(read_inbox(NET, &s.carrier, &kx, &CK, &ROOM_KEY, ROOM, funded, unix_now(), &mut HashMap::new()).await.is_err());
     assert!(spent_heights(&s.money, vec![first.coin_id()]).await.is_err());
-    assert!(child_under_hint(&s.money, hint, first.coin_id()).await.is_err());
+    assert!(child_under_hint(&s.money, hint, first.coin_id(), Some(memo_of(&bundle, hint))).await.is_err());
     assert!(s.carrier.peak_height().await.is_err());
     assert_eq!(s.chain.connections(), 0);
     assert!(s.asked_nothing());

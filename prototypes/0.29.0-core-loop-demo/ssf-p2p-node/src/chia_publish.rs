@@ -1584,6 +1584,21 @@ pub fn build_publish_bundle(
     sign_standard_spends(net, chia_sk, ctx.take())
 }
 
+/// A write's bundle carrying `body` under `hint`, built by
+/// [`build_publish_bundle`], and the digest its mark keeps of the memo it
+/// carries ([`crate::chia_resolve::memo_digest`]): `body` is the spend's
+/// second memo byte for byte, the one a reader opens and the writer's verdict
+/// checks ([`crate::chia_resolve::child_under_hint`]). The two are made in
+/// one place so the digest saved is the one the chain serves
+/// (`a_writes_memo_digest_is_the_one_its_readers_take_from_its_spend`): a
+/// digest of anything else would make each write of ours a stale row to its
+/// own verdict, and have it written again and again.
+pub fn memo_bundle(net: crate::chia_network::ChiaNet, chia_sk: &SecretKey, coin: Coin, hint: Bytes32, body: Vec<u8>) -> Result<(SpendBundle, Bytes32)> {
+    let memo = crate::chia_resolve::memo_digest(&body);
+    let bundle = build_publish_bundle(net, chia_sk, coin, hint, Bytes::new(body))?;
+    Ok((bundle, memo))
+}
+
 /// Sign standard-puzzle coin spends with our SYNTHETIC key for `net` (its
 /// consensus constants give the AGG_SIG additional data, so a spend signed
 /// for one network is not valid on another) and bundle them. Shared by the
@@ -1748,6 +1763,15 @@ pub struct NodePublishMark {
     /// older node wrote: nothing to judge, the watcher's read alone confirms.
     #[serde(default)]
     pub coin_id: String,
+    /// The digest of the memo the write carried, hex
+    /// ([`crate::chia_resolve::memo_digest`] of its ciphertext): the coin
+    /// under the hint confirms the write only if its output carries that
+    /// memo ([`crate::chia_resolve::child_under_hint`]), so the same coin
+    /// made again by another write of ours from the input is told apart. A
+    /// digest of public chain data: it holds no key material. Empty in a mark
+    /// an older node wrote, which is judged by its hint alone.
+    #[serde(default)]
+    pub memo: String,
     /// The height the record's coin was read back at, 0 while pending: a
     /// listing judged at or past it that lacks the coin says the block that
     /// held it is gone; one judged below it says nothing.
@@ -1776,6 +1800,29 @@ pub struct NodePublishMark {
 }
 
 impl NodePublishMark {
+    /// The mark a presence write leaves once its push returned: pending until
+    /// the chain's own word — the mark's lookup confirms it (or voids it),
+    /// with or without the watcher, which only ever read back the marks of
+    /// older nodes — and naming what that lookup judges it by: its coin, its
+    /// hint, the digest of its memo and the lease's number for its spend.
+    pub fn written(era: u64, writes: u32, addrs_sig: String, last_at: u64, hint: Bytes32, write: &MemoWrite, node_id: String) -> Self {
+        NodePublishMark {
+            era,
+            writes,
+            addrs_sig,
+            last_at,
+            hint: hex::encode(hint.to_bytes()),
+            confirmed: false,
+            chain_seen: false,
+            coin_id: hex::encode(write.coins.parent.to_bytes()),
+            memo: hex::encode(write.memo.to_bytes()),
+            confirmed_height: 0,
+            settled: false,
+            spend: write.spend,
+            node_id: Some(node_id),
+        }
+    }
+
     /// A missing or unreadable file is "never published" (one early republish
     /// at worst: spend-to-self is idempotent in effect).
     pub fn load(path: &std::path::Path) -> Option<Self> {
@@ -1806,6 +1853,7 @@ impl NodePublishMark {
             confirmed: false,
             chain_seen: false,
             coin_id: String::new(),
+            memo: String::new(),
             confirmed_height: 0,
             settled: false,
             spend: None,
@@ -2040,6 +2088,14 @@ pub struct MemoWrite {
     /// ([`WalletLease::holds_spend`]). `None` only if the input was not parked
     /// once the push returned, which the lease does not allow.
     pub spend: Option<u64>,
+    /// The digest of the memo the write carries
+    /// ([`crate::chia_resolve::memo_digest`] of its body, the ciphertext that
+    /// is its coin's second memo, made with its bundle by [`memo_bundle`]),
+    /// kept on its mark so the verdict confirms
+    /// the write only by a coin whose output carries it — not by the same
+    /// coin made again by another write of ours from the input. A digest of
+    /// public chain data: it holds no key material.
+    pub memo: Bytes32,
 }
 
 /// The shared tail of every era-bound write (presence, knock, beacon): under
@@ -2101,12 +2157,11 @@ async fn publish_memo_with(
         Some(gate) => Some(gate.lock().await),
         None => None,
     };
-    let body = body(input)?;
-    let bundle = build_publish_bundle(crate::chia_network::net(), payer, coin.coin, hint, Bytes::new(body))?;
+    let (bundle, memo) = memo_bundle(crate::chia_network::net(), payer, coin.coin, hint, body(input)?)?;
     // The spend's number is the lease's for its PARKED input, the coin it holds.
     let coins = WriteCoins::one(input);
     match push_parked(&client, Payer::of(payer), bundle, [(input, coin.confirmed_height)]).await {
-        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked) }),
+        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked), memo }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
         // pending and lets the chain's word settle it — filed as a failure it
@@ -2114,7 +2169,7 @@ async fn publish_memo_with(
         // coin (#272 review).
         Err(PushError::Unanswered(e)) => {
             eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
-            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked) })
+            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked), memo })
         }
         Err(e) => Err(e.into()),
     }
@@ -2182,6 +2237,14 @@ pub struct BeaconMark {
     /// hint ([`crate::chia_resolve::child_under_hint`]).
     #[serde(default)]
     pub coin_id: String,
+    /// The digest of the memo the beacon carried, hex
+    /// ([`crate::chia_resolve::memo_digest`]): only a coin whose output
+    /// carries it confirms the beacon, not the same coin made again by
+    /// another write of ours from its input. A digest of public chain data:
+    /// it holds no key material. Empty in a mark an older node wrote, which
+    /// is judged by its hint alone.
+    #[serde(default)]
+    pub memo: String,
     /// The beacon's own coin was read back under the era's hint. Until then
     /// the write is PENDING (#272 review): the peers' acceptance puts a spend
     /// in a mempool, and a zero-fee spend can still be dropped from it. A
@@ -2214,6 +2277,24 @@ pub struct BeaconMark {
 }
 
 impl BeaconMark {
+    /// The mark a beacon write leaves once its push returned: pending until
+    /// the chain's word, naming what its lookup judges it by — its coin, its
+    /// hint, the digest of its memo and the lease's number for its spend.
+    pub fn written(era: u64, last_at: u64, hint: Bytes32, write: &MemoWrite, node_id: String) -> Self {
+        BeaconMark {
+            era,
+            last_at,
+            hint: hex::encode(hint.to_bytes()),
+            node_id: Some(node_id),
+            coin_id: hex::encode(write.coins.parent.to_bytes()),
+            memo: hex::encode(write.memo.to_bytes()),
+            confirmed: false,
+            confirmed_height: 0,
+            settled: false,
+            spend: write.spend,
+        }
+    }
+
     pub fn load(path: &std::path::Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
         let _ = crate::chia_contact::tighten_private(path);
@@ -2256,41 +2337,57 @@ pub fn beacon_due(mark: Option<&BeaconMark>, era: u64, node_id: &str) -> bool {
 /// or the mark names no coin (nothing to judge). The lease is asked in the
 /// same breath whether it still holds the mark's spend (round 12), so an
 /// input listed spent with no coin under the hint by a fork between the two
-/// lookups reads pending, not dead.
+/// lookups reads pending, not dead. The coin under the hint confirms the
+/// beacon only if its output carries the memo whose digest the mark keeps
+/// (an older node's mark keeps none: its hint alone).
 pub async fn beacon_standing(client: &impl ChainAccess, mark: &BeaconMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
+    beacon_standing_on(&WALLET_LEASE, crate::chia_network::net(), client, mark).await
+}
+
+/// [`beacon_standing`] against a given lease on `net` (the tests' own). The
+/// mark's coin and hint are parsed first, so a mark that names none, or a
+/// malformed one, is `None` (nothing to judge) before the lease is asked; a
+/// memo digest it does not keep, or keeps malformed, is none, and the coin
+/// is judged by its hint alone.
+async fn beacon_standing_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    mark: &BeaconMark,
+) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
     let coins = WriteCoins::filed(&mark.coin_id)?;
     let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
-    write_standing_of(client, coins, hint, mark.spend, mark.confirmed_height, "beacon").await
+    let memo = crate::chia_resolve::parse_hex32(&mark.memo);
+    write_standing_on(lease, net, client, coins, hint, memo, mark.spend, mark.confirmed_height, "beacon").await
 }
 
 /// 📖 The chain's word on this node's presence write ([`beacon_standing`] for
 /// the listing the Phone Book's icon stands on): its standing, and whether a
 /// listing judged past the height it was confirmed at lacks its coin.
 pub async fn presence_standing(client: &impl ChainAccess, mark: &NodePublishMark) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-    let coins = WriteCoins::filed(&mark.coin_id)?;
-    let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
-    write_standing_of(client, coins, hint, mark.spend, mark.confirmed_height, "presence").await
+    presence_standing_on(&WALLET_LEASE, crate::chia_network::net(), client, mark).await
 }
 
-/// The shared lookup behind [`beacon_standing`] and [`presence_standing`], on
-/// the process-wide lease and network: [`write_standing_on`]. The callers
-/// parse the mark's coin and hint first, so a mark that names none, or a
-/// malformed one, is `None` (nothing to judge) before the lease is asked.
-async fn write_standing_of(
+/// [`presence_standing`] against a given lease on `net` (the tests' own),
+/// the mark read as [`beacon_standing_on`] reads a beacon's.
+async fn presence_standing_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
     client: &impl ChainAccess,
-    coins: WriteCoins,
-    hint: Bytes32,
-    spend: Option<u64>,
-    confirmed_height: u32,
-    what: &str,
+    mark: &NodePublishMark,
 ) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-    write_standing_on(&WALLET_LEASE, crate::chia_network::net(), client, coins, hint, spend, confirmed_height, what).await
+    let coins = WriteCoins::filed(&mark.coin_id)?;
+    let hint = crate::chia_resolve::parse_hex32(&mark.hint)?;
+    let memo = crate::chia_resolve::parse_hex32(&mark.memo);
+    write_standing_on(lease, net, client, coins, hint, memo, mark.spend, mark.confirmed_height, "presence").await
 }
 
 /// A write's standing against `lease` on `net` (the process-wide ones in
 /// production; tests bring their own, and read no environment): the lease's
 /// word on the write's input and whether it still holds `spend`, then the
-/// write's own coin under `hint` and the input's spent height, judged
+/// write's own coin under `hint` — carrying the memo of digest `memo`, when
+/// the mark keeps one ([`crate::chia_resolve::child_under_hint`]) — and the
+/// input's spent height, judged
 /// together by [`crate::chia_resolve::write_standing`], with whether a
 /// listing judged past `confirmed_height` lacks the coin; `None` when the
 /// chain could not be asked. Each lookup asks about its own coin of the write
@@ -2307,6 +2404,7 @@ async fn write_standing_on(
     client: &impl ChainAccess,
     coins: WriteCoins,
     hint: Bytes32,
+    memo: Option<Bytes32>,
     spend: Option<u64>,
     confirmed_height: u32,
     what: &str,
@@ -2315,7 +2413,7 @@ async fn write_standing_on(
     let (words, held) = lease_standing_on(lease, net, client, &[coins.parked], &spends).await;
     let word = words.get(&coins.parked).copied().unwrap_or(LeaseWord::Unknown);
     let ours = spend.is_some_and(|s| held.contains(&s));
-    let child = match crate::chia_resolve::child_under_hint(client, hint, coins.parent).await {
+    let child = match crate::chia_resolve::child_under_hint(client, hint, coins.parent, memo).await {
         Ok(child) => child,
         Err(e) => {
             eprintln!("⛓️ ChiaHub {what}: could not read under the {what} hint: {e:#}");
@@ -2546,6 +2644,26 @@ pub async fn publish_knock(
 pub fn knock_hint(net: crate::chia_network::ChiaNet, req: &KnockRequest, room_key: &[u8; 32], era: u64) -> Bytes32 {
     let lane = chia_lane::derive_lane_token(room_key);
     Bytes32::new(chia_lane::derive_inbox_hint(net, &req.ck_host, &lane, era))
+}
+
+/// The knock book's entry for a knock written for `req` in `era` under
+/// `hint`, pushed at `pushed_at`: pending, its clock not started, naming what
+/// the watcher's lookup judges it by — its coin, its hint, the digest of its
+/// memo and the lease's number for its spend.
+pub fn sent_knock_of(req: &KnockRequest, era: u64, hint: Bytes32, write: &MemoWrite, pushed_at: u64) -> SentKnock {
+    SentKnock {
+        host: req.host.clone(),
+        room: req.room.clone(),
+        era,
+        hint: hex::encode(hint.to_bytes()),
+        coin_id: hex::encode(write.coins.parent.to_bytes()),
+        memo: hex::encode(write.memo.to_bytes()),
+        pushed_at,
+        confirmed_height: 0,
+        last_rendezvous: 0,
+        settled: false,
+        spend: write.spend,
+    }
 }
 
 /// The memo a knock for `req` carries on `net` once its input coin `input`
@@ -2876,24 +2994,8 @@ pub async fn heartbeat_loop(
                                 Some(m) if m.era == era && mark_is_ours(m, era_hint, &self_id) => m.writes + 1,
                                 _ => 1,
                             };
-                            let mark = NodePublishMark {
-                                era,
-                                writes,
-                                addrs_sig: sig.clone(),
-                                last_at: now_unix,
-                                hint: hex::encode(hint.to_bytes()),
-                                // 📖 Pending until the chain's own word: the
-                                // mark's lookup confirms it (or voids it), with
-                                // or without the watcher, which only ever read
-                                // back the marks of older nodes.
-                                confirmed: false,
-                                chain_seen: false,
-                                coin_id: hex::encode(write.coins.parent.to_bytes()),
-                                confirmed_height: 0,
-                                settled: false,
-                                spend: write.spend,
-                                node_id: Some(self_id.clone()),
-                            };
+                            // 📖 Pending until the chain's own word.
+                            let mark = NodePublishMark::written(era, writes, sig.clone(), now_unix, hint, &write, self_id.clone());
                             if let Err(e) = mark.save(mark_path) {
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
                             }
@@ -3006,18 +3108,7 @@ pub async fn heartbeat_loop(
                         // died — unfiled, it would be knocked again beside the
                         // first (#272 review).
                         let mut book = hub.knocks.lock().unwrap();
-                        book.record_sent(SentKnock {
-                            host: req.host.clone(),
-                            room: req.room.clone(),
-                            era,
-                            hint: hint_hex,
-                            coin_id: hex::encode(write.coins.parent.to_bytes()),
-                            pushed_at: now_unix,
-                            confirmed_height: 0,
-                            last_rendezvous: 0,
-                            settled: false,
-                            spend: write.spend,
-                        });
+                        book.record_sent(sent_knock_of(&req, era, hint, &write, now_unix));
                         if let Err(e) = book.save(knocks_path) {
                             eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
                         }
@@ -3126,17 +3217,7 @@ pub async fn heartbeat_loop(
                     beacon_attempt = Some(Instant::now());
                     match publish_beacon(net, &iroh_sk, beacon_sk, era, now_unix).await {
                         Ok((hint, write)) => {
-                            let mark = BeaconMark {
-                                era,
-                                last_at: now_unix,
-                                hint: hex::encode(hint.to_bytes()),
-                                node_id: Some(self_id.clone()),
-                                coin_id: hex::encode(write.coins.parent.to_bytes()),
-                                confirmed: false,
-                                confirmed_height: 0,
-                                settled: false,
-                                spend: write.spend,
-                            };
+                            let mark = BeaconMark::written(era, now_unix, hint, &write, self_id.clone());
                             if let Err(e) = mark.save(beacon_mark_path) {
                                 eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
                             }
@@ -3328,6 +3409,7 @@ mod tests {
             confirmed: true,
             chain_seen: true,
             coin_id: String::new(),
+            memo: String::new(),
             confirmed_height: 0,
             settled: false,
             spend: None,
@@ -3398,6 +3480,7 @@ mod tests {
             confirmed: true,
             chain_seen: true,
             coin_id: String::new(),
+            memo: String::new(),
             confirmed_height: 0,
             settled: false,
             spend: None,
@@ -3460,6 +3543,7 @@ mod tests {
             confirmed: false,
             chain_seen: false,
             coin_id: "c".into(),
+            memo: "m".into(),
             confirmed_height: 0,
             settled: false,
             spend: Some(7),
@@ -3516,6 +3600,7 @@ mod tests {
         let void = confirmed.voided();
         assert_eq!((void.era, void.writes, void.addrs_sig.as_str(), void.hint.as_str()), (era, 3, "a", "h"), "the era, its write count and the addresses stay");
         assert_eq!((void.last_at, void.confirmed, void.chain_seen, void.coin_id.as_str(), void.confirmed_height, void.settled, void.spend), (0, false, false, "", 0, false, None));
+        assert_eq!((confirmed.memo.as_str(), void.memo.as_str()), ("m", ""), "the write's memo digest goes with the write");
         assert!(!void.unsettled_for(era, "n"), "nothing left to judge");
         assert!(node_publish_due(Some(&void), era, "a", now, "h", "n", false), "void: due at once");
         let spent_void = NodePublishMark { writes: 1 + MAX_NODE_WRITES_PER_ERA, ..void.clone() };
@@ -3527,7 +3612,7 @@ mod tests {
         let kept: NodePublishMark = serde_json::from_slice(&serde_json::to_vec(&confirmed).unwrap()).unwrap();
         assert_eq!(kept, confirmed);
         let old: NodePublishMark = serde_json::from_str(r#"{"era":5,"writes":1,"addrs_sig":"a","last_at":1,"hint":"h","confirmed":true,"chain_seen":true,"node_id":"n"}"#).unwrap();
-        assert!(old.coin_id.is_empty() && old.confirmed_height == 0 && !old.settled && old.spend.is_none());
+        assert!(old.coin_id.is_empty() && old.memo.is_empty() && old.confirmed_height == 0 && !old.settled && old.spend.is_none());
         assert!(!old.unsettled_for(era, "n"), "no coin to look up: not judged");
         assert!(mark_confirmed_by(&NodePublishMark { chain_seen: false, ..old.clone() }, 1), "…the watcher's read confirms it, as before");
     }
@@ -3588,7 +3673,7 @@ mod tests {
     #[test]
     fn a_pending_beacon_mark_holds_until_the_chain_settles_it() {
         assert!(beacon_due(None, 5, "n"), "never written: due");
-        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
+        let pending = BeaconMark { era: 5, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), memo: "m".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
         assert!(!beacon_due(Some(&pending), 5, "n"), "pending: the chain's word settles it, not a second write");
         let confirmed = BeaconMark { confirmed: true, ..pending.clone() };
         assert!(!beacon_due(Some(&confirmed), 5, "n"));
@@ -3598,6 +3683,7 @@ mod tests {
         let legacy: BeaconMark = serde_json::from_str(r#"{"era":5,"last_at":1,"hint":"h","node_id":"n"}"#).unwrap();
         assert!(!legacy.confirmed);
         assert!(legacy.coin_id.is_empty());
+        assert!(legacy.memo.is_empty(), "no memo digest: judged by its hint alone");
         let round: BeaconMark = serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
         assert_eq!(round, pending);
     }
@@ -3615,7 +3701,7 @@ mod tests {
         let era = 5u64;
         let h0 = 5 * ERA_BLOCKS;
         let found = |height: u32, seen_at: Option<u32>| Confirmed { height, seen_at };
-        let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
+        let pending = BeaconMark { era, last_at: 1, hint: "h".into(), node_id: Some("n".into()), coin_id: "c".into(), memo: "m".into(), confirmed: false, confirmed_height: 0, settled: false, spend: None };
         assert!(pending.unsettled_for(era, "n"));
         assert!(!pending.unsettled_for(era, "other") && !pending.unsettled_for(era + 1, "n"));
         assert!(!BeaconMark { coin_id: String::new(), ..pending.clone() }.unsettled_for(era, "n"), "no coin: nothing to judge");
@@ -5032,8 +5118,20 @@ mod tests {
         crate::chia_chain::CoinListing { records, truncated: false, next_cursor: None, judged_at }
     }
 
+    /// The memo every write [`standing`] judges carries: its mark keeps the
+    /// digest, and its parent's spend makes its coin with it
+    /// ([`written_by`]).
+    const WRITE_MEMO: &[u8] = b"the write";
+
+    /// The spend of `child`'s parent that made `child` under `hint` carrying
+    /// [`WRITE_MEMO`].
+    fn written_by(child: &Coin, hint: Bytes32) -> crate::chia_chain::PuzzleAndSolution {
+        crate::chia_chain::testing::memo_spend(child, hint, WRITE_MEMO)
+    }
+
     /// The standing [`write_standing_on`] gives on testnet11 against `chain`
-    /// for a write under `hint`, confirmed at `confirmed` (0: pending).
+    /// for a write under `hint` carrying [`WRITE_MEMO`], confirmed at
+    /// `confirmed` (0: pending).
     async fn standing(
         lease: &WalletLease,
         chain: &crate::chia_chain::testing::Scripted,
@@ -5042,12 +5140,14 @@ mod tests {
         spend: Option<u64>,
         confirmed: u32,
     ) -> Option<(crate::chia_resolve::WriteStanding, bool)> {
-        write_standing_on(lease, T11, chain, coins, hint, spend, confirmed, "test").await
+        let memo = Some(crate::chia_resolve::memo_digest(WRITE_MEMO));
+        write_standing_on(lease, T11, chain, coins, hint, memo, spend, confirmed, "test").await
     }
 
     /// The standing exactly as `write_standing_of` gave it before the verdict
     /// split (stage 4 PR 7), against a given lease: one coin asked of the
-    /// lease, the hint and the names listing alike, in that order.
+    /// lease, the hint and the names listing alike, in that order — the hint
+    /// lookup taking the memo digest it takes since ([`WRITE_MEMO`]'s).
     async fn standing_before_the_split(
         lease: &WalletLease,
         chain: &crate::chia_chain::testing::Scripted,
@@ -5063,7 +5163,7 @@ mod tests {
             (lease.lease_word(&coin), spends.iter().copied().filter(|s| lease.holds_spend(*s)).collect())
         };
         let ours = spend.is_some_and(|s| held.contains(&s));
-        let child = crate::chia_resolve::child_under_hint(chain, hint, coin).await.ok()?;
+        let child = crate::chia_resolve::child_under_hint(chain, hint, coin, Some(crate::chia_resolve::memo_digest(WRITE_MEMO))).await.ok()?;
         let spent_at = crate::chia_resolve::spent_heights(chain, vec![coin]).await.ok()?.into_iter().find(|(c, _)| *c == coin).map(|(_, h)| h);
         Some((crate::chia_resolve::write_standing(&child, spent_at, word, ours), child.gone_since(confirmed)))
     }
@@ -5086,9 +5186,12 @@ mod tests {
         let child_of = |parent: Bytes32| CoinRecord { coin: Coin::new(parent, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
         let input = |coin: Coin, spent: Option<u32>| CoinRecord { coin, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) };
         let bundle = SpendBundle::new(vec![], Signature::default());
-        // Found by its parent: the child under the hint names the gift.
-        let chain = Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001)), page_of(vec![], Some(1001))]);
+        // Found by its parent: the child under the hint names the gift, whose
+        // spend made it carrying the write.
+        let by_gift = written_by(&child_of(parent).coin, hint);
+        let chain = Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001)), page_of(vec![], Some(1001))]).with_spend(parent, by_gift.clone());
         assert_eq!(standing(&WalletLease::new(), &chain, split, hint, None, 0).await, Some((Confirmed { height: 1000, seen_at: Some(1001) }, false)));
+        assert_eq!(*chain.asked_spends.lock().unwrap(), vec![(parent, 1000)], "the gift's spend, at the child's height");
         let chain = Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001)), page_of(vec![], Some(1001))]);
         assert_eq!(
             standing(&WalletLease::new(), &chain, WriteCoins::one(parked), hint, None, 0).await,
@@ -5137,7 +5240,8 @@ mod tests {
             page_of(vec![input(dish, Some(1000))], Some(1001)),
             page_of(vec![child_of(parent)], Some(1001)),
             page_of(vec![input(dish, Some(1000))], Some(1001)),
-        ]);
+        ])
+        .with_spend(parent, by_gift);
         assert_eq!(
             standing(&settling, &chain, split, hint, Some(parking.spend), 0).await,
             Some((Confirmed { height: 1000, seen_at: Some(1001) }, false))
@@ -5169,6 +5273,10 @@ mod tests {
         let bundle = SpendBundle::new(vec![], Signature::default());
         let child = CoinRecord { coin: Coin::new(c, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
         let spent = CoinRecord { coin: ours, confirmed_block_index: 900, spent: true, spent_block_index: 1000 };
+        // The write's own spend, which made the child carrying it: on both
+        // sides, so the row that lists the child confirms it either side.
+        let by_ours = written_by(&child.coin, hint);
+        let chain_of = |pages: Vec<CoinListing>| Scripted::new(pages).with_spend(c, by_ours.clone());
         let cut = CoinListing { records: vec![], truncated: true, next_cursor: None, judged_at: Some(1001) };
         let empty = |judged_at: u32| page_of(vec![], Some(judged_at));
         // A row: its name, the lease before the lookups, the pages, the height
@@ -5203,12 +5311,164 @@ mod tests {
                 (lease, spend)
             };
             let (now_lease, now_spend) = lease_as();
-            let now = standing(&now_lease, &Scripted::new(pages.clone()), WriteCoins::one(c), hint, now_spend, confirmed).await;
+            let now = standing(&now_lease, &chain_of(pages.clone()), WriteCoins::one(c), hint, now_spend, confirmed).await;
             let (then_lease, then_spend) = lease_as();
-            let then = standing_before_the_split(&then_lease, &Scripted::new(pages), c, hint, then_spend, confirmed).await;
+            let then = standing_before_the_split(&then_lease, &chain_of(pages), c, hint, then_spend, confirmed).await;
             assert_eq!(now, then, "{name}: as before the split");
             assert_eq!(now, want, "{name}");
         }
+    }
+
+    /// The memo check at the beacon and presence verdicts: each reads the
+    /// digest its mark keeps, and its coin under the hint confirms it only if
+    /// the input's spend made that coin carrying the hint and that memo. The
+    /// coin made again by another write of ours from the input — under
+    /// another hint, or under the same with another memo — still listed under
+    /// the mark's hint (a row an orphaned block left) is a stale row: not
+    /// confirmed, and, its input spent and the lease holding no spend of it,
+    /// its coin went to another spend of ours. A mark an older node saved
+    /// keeps no digest, and is judged by its hint alone; a malformed digest
+    /// is none.
+    #[tokio::test]
+    async fn the_beacon_and_presence_verdicts_confirm_a_write_only_by_the_memo_its_mark_keeps() {
+        use crate::chia_chain::{testing::Scripted, CoinRecord};
+        use crate::chia_resolve::WriteStanding::{Confirmed, Dead};
+        let input = Coin::new(Bytes32::new([141u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let (hint, other_hint) = (Bytes32::new([142u8; 32]), Bytes32::new([143u8; 32]));
+        let made = Coin::new(input.coin_id(), Bytes32::new([4u8; 32]), 1);
+        let write = MemoWrite { coins: WriteCoins::one(input.coin_id()), acked: true, spend: None, memo: crate::chia_resolve::memo_digest(b"our write") };
+        // The coin listed under the hint, then the input spent at its height;
+        // the input's spend carried `carried` under `carried_hint`.
+        let chain = |carried_hint: Bytes32, carried: &[u8]| {
+            Scripted::new(vec![
+                page_of(vec![CoinRecord { coin: made, confirmed_block_index: 1000, spent: false, spent_block_index: 0 }], Some(1001)),
+                page_of(vec![CoinRecord { coin: input, confirmed_block_index: 900, spent: true, spent_block_index: 1000 }], Some(1001)),
+            ])
+            .with_spend(input.coin_id(), crate::chia_chain::testing::memo_spend(&made, carried_hint, carried))
+        };
+        let confirmed = Some((Confirmed { height: 1000, seen_at: Some(1001) }, false));
+        let elsewhere = Some((Dead("its coin went to another spend of ours"), false));
+        let beacon = BeaconMark::written(5, 1, hint, &write, "n".into());
+        let presence = NodePublishMark::written(5, 1, "a".into(), 1, hint, &write, "n".into());
+        let ours = beacon.memo.clone();
+        assert_eq!(presence.memo, ours);
+        let rows: Vec<(String, Bytes32, &[u8], _, &str)> = vec![
+            (ours.clone(), hint, &b"our write"[..], confirmed.clone(), "its own memo"),
+            (ours.clone(), other_hint, &b"our write"[..], elsewhere.clone(), "the coin made again under another hint"),
+            (ours, hint, &b"another write"[..], elsewhere.clone(), "the coin made again under this hint with another memo"),
+            (String::new(), hint, &b"another write"[..], confirmed.clone(), "an older node's mark: the hint alone"),
+            (String::new(), other_hint, &b"our write"[..], elsewhere, "an older node's mark still tells another hint apart"),
+            ("zz".into(), hint, &b"another write"[..], confirmed, "a malformed digest is none"),
+        ];
+        for (memo, carried_hint, carried, want, why) in rows {
+            let on = chain(carried_hint, carried);
+            assert_eq!(beacon_standing_on(&WalletLease::new(), T11, &on, &BeaconMark { memo: memo.clone(), ..beacon.clone() }).await, want, "beacon: {why}");
+            assert_eq!(*on.asked_spends.lock().unwrap(), vec![(input.coin_id(), 1000)], "beacon: {why}");
+            let on = chain(carried_hint, carried);
+            assert_eq!(presence_standing_on(&WalletLease::new(), T11, &on, &NodePublishMark { memo, ..presence.clone() }).await, want, "presence: {why}");
+        }
+    }
+
+    /// The digest a write's mark keeps, made with its bundle ([`memo_bundle`],
+    /// the one place a writer makes it), is the digest of the memo its
+    /// readers take from its spend ([`crate::chia_resolve::extract_ciphertext`])
+    /// and of the second memo of the output the writer's verdict reads
+    /// ([`crate::chia_resolve::output_memos`] of the coin the write makes). A
+    /// digest of anything else, or a memo laid out otherwise by the builder,
+    /// would have every write of this build judged a stale row of its own
+    /// coin, and written again.
+    #[test]
+    fn a_writes_memo_digest_is_the_one_its_readers_take_from_its_spend() {
+        use crate::chia_network::ChiaNet;
+        let sk = SecretKey::from_seed(&[14u8; 32]);
+        let coin = Coin::new(Bytes32::new([153u8; 32]), our_puzzle_hash(&sk), 1000);
+        let hint = Bytes32::new([154u8; 32]);
+        let body = b"a sealed write".to_vec();
+        let (bundle, memo) = memo_bundle(ChiaNet::Testnet11, &sk, coin, hint, body.clone()).unwrap();
+        assert_eq!(bundle, build_publish_bundle(ChiaNet::Testnet11, &sk, coin, hint, Bytes::new(body)).unwrap(), "the one builder's bundle");
+        assert_eq!(bundle.coin_spends.len(), 1);
+        let spend = crate::chia_chain::PuzzleAndSolution {
+            puzzle_reveal: bundle.coin_spends[0].puzzle_reveal.clone(),
+            solution: bundle.coin_spends[0].solution.clone(),
+        };
+        let read = crate::chia_resolve::extract_ciphertext(&spend, hint).unwrap().expect("a reader opens the memo under the hint");
+        assert_eq!(memo, crate::chia_resolve::memo_digest(&read), "the digest of what a reader opens");
+        let ours = Coin::new(coin.coin_id(), our_puzzle_hash(&sk), coin.amount - PUBLISH_FEE);
+        let memos = crate::chia_resolve::output_memos(&spend, ours.puzzle_hash, ours.amount).unwrap().expect("the spend makes the write's coin");
+        assert_eq!(memos.len(), 2, "[hint, memo]");
+        assert_eq!(memos[0].as_ref(), hint.as_ref());
+        assert_eq!(memo, crate::chia_resolve::memo_digest(memos[1].as_ref()), "the digest of the memo the verdict reads");
+        assert!(ChiaNet::ALL.iter().filter(|net| !net.is_test()).all(|net| memo_bundle(*net, &sk, coin, hint, vec![1]).is_err()), "off a test network, refused as the builder refuses");
+    }
+
+    /// A mark keeps the digest of its write's memo from the moment the write
+    /// files it — presence, beacon and sent knock alike, beside the coin and
+    /// the lease's number for the spend — and keeps it across a restart; a
+    /// void presence mark forgets it with the write.
+    #[test]
+    fn each_mark_keeps_its_writes_memo_digest_and_a_void_one_forgets_it() {
+        let write = MemoWrite { coins: WriteCoins::one(Bytes32::new([151u8; 32])), acked: false, spend: Some(9), memo: crate::chia_resolve::memo_digest(b"memo") };
+        let (hint, coin, digest) = (Bytes32::new([152u8; 32]), hex::encode([151u8; 32]), hex::encode(write.memo));
+        let presence = NodePublishMark::written(5, 2, "a".into(), 100, hint, &write, "n".into());
+        assert_eq!(
+            presence,
+            NodePublishMark {
+                era: 5,
+                writes: 2,
+                addrs_sig: "a".into(),
+                last_at: 100,
+                hint: hex::encode(hint),
+                confirmed: false,
+                chain_seen: false,
+                coin_id: coin.clone(),
+                memo: digest.clone(),
+                confirmed_height: 0,
+                settled: false,
+                spend: Some(9),
+                node_id: Some("n".into()),
+            }
+        );
+        let void = presence.voided();
+        assert_eq!((void.memo.as_str(), void.coin_id.as_str(), void.spend), ("", "", None), "void: the write forgotten, its memo digest with it");
+        assert_eq!(void.hint, presence.hint, "the hint stays, as the era and the addresses do");
+        let beacon = BeaconMark::written(5, 100, hint, &write, "n".into());
+        assert_eq!(
+            beacon,
+            BeaconMark {
+                era: 5,
+                last_at: 100,
+                hint: hex::encode(hint),
+                node_id: Some("n".into()),
+                coin_id: coin.clone(),
+                memo: digest.clone(),
+                confirmed: false,
+                confirmed_height: 0,
+                settled: false,
+                spend: Some(9),
+            }
+        );
+        let req = KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [2u8; 32], attempts: 1 };
+        let knock = sent_knock_of(&req, 5, hint, &write, 100);
+        assert_eq!(
+            knock,
+            SentKnock {
+                host: "H".into(),
+                room: "r".into(),
+                era: 5,
+                hint: hex::encode(hint),
+                coin_id: coin,
+                memo: digest,
+                pushed_at: 100,
+                confirmed_height: 0,
+                last_rendezvous: 0,
+                settled: false,
+                spend: Some(9),
+            }
+        );
+        // Across a restart, each file keeps it.
+        assert_eq!(serde_json::from_slice::<NodePublishMark>(&serde_json::to_vec(&presence).unwrap()).unwrap(), presence);
+        assert_eq!(serde_json::from_slice::<BeaconMark>(&serde_json::to_vec(&beacon).unwrap()).unwrap(), beacon);
+        assert_eq!(serde_json::from_slice::<SentKnock>(&serde_json::to_vec(&knock).unwrap()).unwrap(), knock);
     }
 
     #[test]
