@@ -108,7 +108,8 @@ const NONZERO_FEE_MINIMUM_FPC: u128 = 5;
 /// `max_subscribe_response_items` for a wallet peer.
 const PAGE_LIMIT: usize = 100_000;
 /// How long a new block waits for every connection to show it filed the
-/// announcement ([`MockChain::farm_blocks`]); only a broken test waits it out.
+/// announcement ([`MockChain::farm_blocks`]); only a broken test waits it out
+/// (one holding a connection accepted and idle short of its handshake, say).
 const BARRIER: Duration = Duration::from_secs(5);
 
 /// `MempoolInclusionStatus`, as `TransactionAck.status` carries it.
@@ -234,6 +235,14 @@ impl Announcement {
     /// lowers it.
     fn message(&self, fork_point: u32) -> Message {
         reply(&NewPeakWallet::new(self.header_hash, self.height, u128::from(self.height) + 1, fork_point))
+    }
+
+    /// What a connection is sent of it: the `NewPeakWallet`, then a
+    /// websocket ping carrying the generation, whose pong shows the client
+    /// filed the peak ([`serve`]). The handshake's greeting and every later
+    /// announcement are sent alike.
+    fn frames(&self, fork_point: u32) -> [WsMessage; 2] {
+        [binary(&self.message(fork_point)), WsMessage::Ping(self.generation.to_be_bytes().to_vec())]
     }
 }
 
@@ -385,7 +394,8 @@ struct Pool {
     conflicts: Vec<Item>,
     seen: VecDeque<Bytes32>,
     /// The §12 switch: the mempool is at capacity, and takes nothing under
-    /// the nonzero fee minimum.
+    /// the nonzero fee minimum, save its own items tried again at a
+    /// reorganisation ([`new_peak_slow`]).
     full: bool,
 }
 
@@ -555,16 +565,24 @@ fn new_peak_fast(net: ChiaNet, chain: &Chain, pool: &mut Pool, spent: &HashSet<B
 
 /// `new_peak` on its slow path, for a peak not on top of the last one: a new
 /// mempool, the seen cache emptied, every old item tried again on the new
-/// chain (each one taken back into the seen cache), then the caches.
+/// chain through `add_spend_bundle` (each one taken back into the seen cache;
+/// one whose input the new chain lacks, UNKNOWN_UNSPENT, or has spent,
+/// DOUBLE_SPEND, is dropped and forgotten; one now height-locked waits in
+/// the pending cache), then the caches. The new mempool holds only old items,
+/// which fitted the old one together, so none of them meets a full one (a
+/// full node's `at_full_capacity` is false for each); the caches tried after
+/// them do, as full as it was.
 fn new_peak_slow(net: ChiaNet, chain: &Chain, pool: &mut Pool) {
     let old = std::mem::take(&mut pool.items);
     pool.seen.clear();
+    let full = std::mem::replace(&mut pool.full, false);
     for item in old {
         let name = item.name;
         if readmit(net, chain, pool, item) {
             pool.add_seen(name);
         }
     }
+    pool.full = full;
     retry_caches(net, chain, pool);
 }
 
@@ -915,28 +933,44 @@ fn binary(message: &Message) -> WsMessage {
     WsMessage::Binary(message.to_bytes().expect("encoding a message"))
 }
 
+/// Per connection accepted and not yet ended: its node, and the generation
+/// of the last announcement it showed it filed, `None` until it has shown
+/// one ([`Shared::acks`]).
+type Acks = HashMap<u64, (usize, Option<u64>)>;
+
 struct Shared {
     model: Mutex<Model>,
-    /// Per connection: its node, and the last announcement it showed it
-    /// filed (the generation its pong carried, [`serve`]).
-    acks: watch::Sender<HashMap<u64, (usize, u64)>>,
+    /// Every connection from the moment its node accepts it, before its TLS,
+    /// until [`serve`] ends for it, whichever way: its node, and the last
+    /// announcement it showed it filed, the generation its pong carried.
+    /// `None` until its first pong, so a connection that has not handshaken
+    /// yet, or has and not yet ponged the peak it was greeted with, has filed
+    /// nothing (not even generation 0, block 0's announcement), and holds
+    /// every barrier of its node ([`MockChain::barrier`]).
+    acks: watch::Sender<Acks>,
     next_conn: AtomicU64,
 }
 
 impl Shared {
-    /// The handshake's answer, and the connection's registration at the
-    /// node's current announcement, under one lock of the model, so a block
-    /// announced meanwhile reaches it either way.
-    fn handshake(&self, node: usize, conn: u64, announced: &mut watch::Receiver<Announcement>) -> Vec<WsMessage> {
+    /// The handshake's answer: the node's handshake, then its peak as
+    /// announced now, the fork point the peak itself (a full node announces
+    /// its peak right after a handshake), then the ping carrying that
+    /// announcement's generation, as every later announcement is followed by
+    /// one. Nothing is recorded as filed here: the connection, listed with
+    /// nothing filed since it was accepted, files the greeting only by the
+    /// pong for that ping. Read under one lock of the model, under which
+    /// every announcement is made, so the peak it greets with is the node's
+    /// announcement at one instant of the model and any announcement after
+    /// that instant is a change its receiver has not seen, which [`serve`]
+    /// pushes once the answer is out: a block announced meanwhile reaches the
+    /// connection either way, and so does the barrier's ping.
+    fn handshake(&self, announced: &mut watch::Receiver<Announcement>) -> Vec<WsMessage> {
         let model = self.model.lock().unwrap();
         let now = *announced.borrow_and_update();
-        self.acks.send_modify(|acks| {
-            acks.insert(conn, (node, now.generation));
-        });
         let handshake = Handshake::new(model.network.id.clone(), PROTOCOL_VERSION.to_string(), "mock".to_string(), 0, NodeType::FullNode, vec![]);
-        // Right after a handshake a full node announces its peak, the fork
-        // point the peak itself.
-        vec![binary(&reply(&handshake)), binary(&now.message(now.height))]
+        let mut out = vec![binary(&reply(&handshake))];
+        out.extend(now.frames(now.height));
+        out
     }
 
     fn answer(&self, node: usize, request: &Message) -> Vec<WsMessage> {
@@ -954,13 +988,26 @@ impl Shared {
     }
 }
 
-/// One accepted connection: the TLS a full node runs (a client certificate
-/// the Chia CA signed demanded), the websocket, then requests answered from
-/// the model and announcements pushed as they come. Each announcement is
-/// followed by a websocket ping carrying its generation. The client's reader
-/// files a `NewPeakWallet` before it reads the next frame, and its websocket
-/// sends the pong for a ping when it next reads, so a pong for a generation
-/// shows the announcement was filed: the barrier of [`MockChain::farm_blocks`].
+/// One accepted connection, listed in [`Shared::acks`] with nothing filed
+/// since its node accepted it: the TLS a full node runs (a client
+/// certificate the Chia CA signed demanded), the websocket, then requests
+/// answered from the model and, once the client has handshaken,
+/// announcements pushed as they come. The greeting the handshake is answered
+/// with and each later announcement are followed by a websocket ping
+/// carrying the announcement's generation ([`Announcement::frames`]). The
+/// client's reader files a `NewPeakWallet` before it reads the next frame,
+/// and its websocket sends the pong for a ping when it next reads, so a pong
+/// for a generation shows the announcement was filed: the barrier of
+/// [`MockChain::farm_blocks`]. However it ends (a TLS or websocket handshake
+/// that fails, a close, a socket that errs or a send that does), the
+/// connection leaves the list, so it holds no barrier after. One accepted
+/// and left idle short of the Chia handshake holds every barrier of its node
+/// until [`BARRIER`] runs out, and the barrier panics; no client here does
+/// that, as the lane's dial runs TCP, TLS, the websocket upgrade and the
+/// handshake straight through, or drops the socket where it stands
+/// ([`PeerConn::connect_until`]).
+///
+/// [`PeerConn::connect_until`]: crate::chia_peer::PeerConn::connect_until
 async fn serve(
     shared: Arc<Shared>,
     node: usize,
@@ -982,7 +1029,7 @@ async fn serve(
                             break 'talk;
                         }
                         let now = *announced.borrow_and_update();
-                        vec![binary(&now.message(now.fork_point)), WsMessage::Ping(now.generation.to_be_bytes().to_vec())]
+                        now.frames(now.fork_point).into()
                     }
                     frame = stream.next() => match frame {
                         Some(Ok(WsMessage::Binary(bytes))) => {
@@ -990,7 +1037,7 @@ async fn serve(
                             requests.lock().unwrap().push(message.msg_type);
                             if message.msg_type == ProtocolMessageTypes::Handshake {
                                 registered = true;
-                                shared.handshake(node, conn, &mut announced)
+                                shared.handshake(&mut announced)
                             } else {
                                 shared.answer(node, &message)
                             }
@@ -999,8 +1046,8 @@ async fn serve(
                             if let Ok(generation) = <[u8; 8]>::try_from(data.as_slice()) {
                                 let generation = u64::from_be_bytes(generation);
                                 shared.acks.send_modify(|acks| {
-                                    if let Some(acked) = acks.get_mut(&conn) {
-                                        acked.1 = acked.1.max(generation);
+                                    if let Some((_, filed)) = acks.get_mut(&conn) {
+                                        *filed = Some(filed.map_or(generation, |filed| filed.max(generation)));
                                     }
                                 });
                             }
@@ -1089,12 +1136,17 @@ impl MockChain {
         let task = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else { break };
+                let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
                 let announced = {
                     let mut model = shared.model.lock().unwrap();
                     model.connections += 1;
+                    // Listed as it is accepted, before its TLS, with nothing
+                    // filed; `serve` takes it off the list when it ends.
+                    shared.acks.send_modify(|acks| {
+                        acks.insert(conn, (index, None));
+                    });
                     model.nodes[index].announce.subscribe()
                 };
-                let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(serve(shared.clone(), index, node_requests.clone(), acceptor.clone(), tcp, announced, conn));
             }
         });
@@ -1136,7 +1188,8 @@ impl MockChain {
     }
 
     /// One block. Returns the new peak once every connection of every node
-    /// not held has filed it.
+    /// not held has filed it, one accepted and not yet handshaken included
+    /// ([`Self::barrier`]).
     pub(crate) async fn farm(&self) -> u32 {
         self.farm_blocks(1).await
     }
@@ -1260,25 +1313,33 @@ impl MockChain {
     }
 
     /// Until every connection of the nodes `told` shows it filed
-    /// `generation` (or has closed), for at most [`BARRIER`]. Without it a
-    /// lane could read one connection's new peak beside the other's old one,
-    /// take the two for peers disagreeing on the chain, and cool both for
-    /// ten minutes. Real nodes do disagree so after a reorganisation, for the
-    /// seconds a fork takes to reach them all; a test stages that window with
-    /// [`Self::hold`] and [`Self::release`].
+    /// `generation` (or has ended), for at most [`BARRIER`]. Every
+    /// connection counts from the moment its node accepted it
+    /// ([`Shared::acks`]): one still short of its handshake, or handshaking
+    /// meanwhile, is greeted with the node's peak as announced at its
+    /// handshake (this announcement or a later one) and counts as filed only
+    /// once it pongs the ping that follows. A connection of a node not told
+    /// (held) is not waited for. Without the barrier a lane could read one
+    /// connection's new peak beside the other's old one, take the two for
+    /// peers disagreeing on the chain, and cool both for ten minutes. Real
+    /// nodes do disagree so after a reorganisation, for the seconds a fork
+    /// takes to reach them all; a test stages that window with [`Self::hold`]
+    /// and [`Self::release`].
     async fn barrier(&self, told: &[usize], generation: u64) {
-        let current = |acks: &HashMap<u64, (usize, u64)>| acks.values().all(|(node, acked)| !told.contains(node) || *acked >= generation);
+        let filed = |filed: &Option<u64>| filed.is_some_and(|filed| filed >= generation);
+        let current = |acks: &Acks| acks.values().all(|(node, acked)| !told.contains(node) || filed(acked));
         let mut acks = self.0.acks.subscribe();
-        let filed = tokio::time::timeout(BARRIER, acks.wait_for(current)).await.map(|seen| seen.is_ok());
-        if filed != Ok(true) {
-            let late: Vec<(u64, (usize, u64))> =
-                self.0.acks.borrow().iter().filter(|(_, (node, acked))| told.contains(node) && *acked < generation).map(|(c, a)| (*c, *a)).collect();
+        let done = tokio::time::timeout(BARRIER, acks.wait_for(current)).await.map(|seen| seen.is_ok());
+        if done != Ok(true) {
+            let late: Vec<(u64, (usize, Option<u64>))> =
+                self.0.acks.borrow().iter().filter(|(_, (node, acked))| told.contains(node) && !filed(acked)).map(|(c, a)| (*c, *a)).collect();
             panic!("connections (id, (node, generation filed)) {late:?} did not file announcement {generation} within {BARRIER:?}");
         }
     }
 
     /// Every node's mempool made full (or not): from here it refuses a bundle
-    /// under the nonzero fee minimum with INVALID_FEE_TOO_CLOSE_TO_ZERO.
+    /// under the nonzero fee minimum with INVALID_FEE_TOO_CLOSE_TO_ZERO. The
+    /// items it holds keep their place, a reorganisation included.
     pub(crate) fn set_full(&self, full: bool) {
         for node in &mut self.lock().nodes {
             node.pool.full = full;

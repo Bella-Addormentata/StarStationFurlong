@@ -68,6 +68,63 @@ fn kinds(node: &MockNode) -> HashSet<ProtocolMessageTypes> {
     node.seen.lock().unwrap().iter().copied().collect()
 }
 
+/// A wallet's socket to a node, driven by hand: the test says when it
+/// handshakes and when it next reads (which is when its websocket sends the
+/// pong for a ping it read).
+type Raw = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// TLS to `node` as the lane's client certificate.
+async fn tls_to(node: &MockNode) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let tcp = tokio::net::TcpStream::connect(node.addr).await.unwrap();
+    let name = rustls::pki_types::ServerName::IpAddress(node.addr.ip().into());
+    tokio_rustls::TlsConnector::from(TLS.clone()).connect(name, tcp).await.unwrap()
+}
+
+/// TCP, TLS and the websocket upgrade a lane's dial makes, and nothing of
+/// the Chia protocol yet. Once this returns, the node has accepted the
+/// connection (its TLS answered), so the connection is listed.
+async fn raw_socket(node: &MockNode) -> Raw {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let request = format!("wss://{}/ws", node.addr).into_client_request().unwrap();
+    tokio_tungstenite::client_async(request, tls_to(node).await).await.unwrap().0
+}
+
+/// The next frame the node sends, `what` the test expects, read for at most
+/// [`BARRIER`]: a frame the node never sends fails the test, naming it,
+/// rather than hanging it, since the block or release the test holds pinned
+/// is not polled meanwhile and its own [`BARRIER`] never runs out.
+async fn next_frame(raw: &mut Raw, what: &str) -> WsMessage {
+    match tokio::time::timeout(BARRIER, raw.next()).await {
+        Ok(Some(frame)) => frame.expect("a frame"),
+        Ok(None) => panic!("the node closed the socket before {what}"),
+        Err(_) => panic!("no {what} within {BARRIER:?}"),
+    }
+}
+
+/// The Chia handshake a wallet sends, and the node's greeting read: its
+/// handshake, the peak it announces, and the ping after it, whose pong the
+/// socket queues, to send when it is next read or flushed. Returns the peak
+/// and the generation the ping carries.
+async fn greet(raw: &mut Raw, network: &Network) -> (NewPeakWallet, u64) {
+    let hello = Handshake::new(network.id.clone(), PROTOCOL_VERSION.to_string(), "0.0.0".to_string(), 0, NodeType::Wallet, vec![]);
+    raw.send(binary(&reply(&hello))).await.unwrap();
+    let mut messages = Vec::new();
+    for kind in [ProtocolMessageTypes::Handshake, ProtocolMessageTypes::NewPeakWallet] {
+        let WsMessage::Binary(bytes) = next_frame(raw, &format!("{kind:?}")).await else { panic!("expected a {kind:?}") };
+        let message = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(message.msg_type, kind);
+        messages.push(message);
+    }
+    let WsMessage::Ping(generation) = next_frame(raw, "ping after the peak").await else { panic!("expected the ping after the peak") };
+    let generation = u64::from_be_bytes(generation.try_into().expect("a generation"));
+    (NewPeakWallet::from_bytes(&messages[1].data).unwrap(), generation)
+}
+
+/// Every listed connection: its node and the generation it filed.
+fn listed(chain: &MockChain) -> Vec<(usize, Option<u64>)> {
+    chain.0.acks.borrow().values().copied().collect()
+}
+
 /// One model answers both nodes, so an agreed read, which fails on any
 /// disagreement between them, gets an answer from every method the lane
 /// has, and both nodes are asked the same kinds of request.
@@ -128,6 +185,83 @@ async fn a_peak_both_nodes_announce_is_the_agreed_peak_after_every_block_and_eve
     assert_eq!(s.money.peak_height().await.unwrap(), 44);
     assert_eq!(s.carrier.peak_height().await.unwrap(), 44);
     assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The barrier counts a connection from the moment its node accepts it, not
+/// from its handshake. One past its TLS and websocket upgrade and short of
+/// the Chia handshake holds a block back; handshaking while the block
+/// waits, it is greeted with the new peak and a ping carrying the
+/// announcement's generation, and the block waits on until the pong for
+/// that ping arrives. No clock decides it: the lane has not dialled, so the
+/// test's socket is the only connection, and the test's runtime runs one
+/// task at a time, so a poll of the block straight after a frame is read
+/// sees nothing the node did after sending it.
+#[tokio::test]
+async fn a_connection_accepted_before_a_block_holds_it_back_until_it_pongs_the_peak_its_handshake_is_greeted_with() {
+    use futures_util::FutureExt;
+    let s = setup().await;
+    let mut raw = raw_socket(&s.a).await;
+    assert_eq!(listed(&s.chain), vec![(0, None)], "listed once accepted, with nothing filed");
+
+    let farming = s.chain.farm();
+    tokio::pin!(farming);
+    assert_eq!(farming.as_mut().now_or_never(), None, "the block waits on a connection not yet handshaken");
+    let (peak, generation) = greet(&mut raw, &s.chain.network()).await;
+    assert_eq!((peak.height, peak.header_hash, peak.fork_point_with_previous_peak), (1, s.chain.header_hash(1).unwrap(), 1));
+    assert_eq!(generation, 1, "the block's announcement");
+    assert_eq!(farming.as_mut().now_or_never(), None, "greeted, its pong not yet sent: the block still waits");
+    assert_eq!(listed(&s.chain), vec![(0, None)], "the greeting files nothing");
+    raw.flush().await.expect("the pong sent");
+    assert_eq!(farming.await, 1);
+    assert_eq!(listed(&s.chain), vec![(0, Some(1))]);
+
+    drop(raw);
+    assert_eq!(s.chain.farm().await, 2, "a closed connection holds no block back");
+    assert_eq!(s.money.peak_height().await.unwrap(), 2);
+    assert_eq!(s.lane.live_count().await, 2);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A connection whose TLS or websocket handshake fails leaves the list as it
+/// fails, though its client holds the socket open, so it holds no block
+/// back. One to a node held is not waited for by a block that node is not
+/// told of, and is waited for by the node's release, which tells it: until
+/// it pongs the peak its handshake is greeted with.
+#[tokio::test]
+async fn a_connection_failing_its_tls_or_websocket_handshake_or_to_a_held_node_holds_no_block_back() {
+    use futures_util::FutureExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = setup().await;
+    // Not TLS: the node's TLS refuses it and closes the socket (the read
+    // ends then), and the connection has left the list by then.
+    let mut not_tls = tokio::net::TcpStream::connect(s.a.addr).await.unwrap();
+    not_tls.write_all(b"GET /ws HTTP/1.1\r\nHost: mock\r\n\r\n").await.unwrap();
+    let _ = not_tls.read_to_end(&mut Vec::new()).await;
+    // TLS, then a request that asks for no websocket.
+    let mut not_ws = tls_to(&s.a).await;
+    not_ws.write_all(b"GET /ws HTTP/1.1\r\nHost: mock\r\n\r\n").await.unwrap();
+    let _ = not_ws.read_to_end(&mut Vec::new()).await;
+    assert!(listed(&s.chain).is_empty(), "both left the list as they failed");
+
+    s.chain.hold(&s.b);
+    let mut to_held = raw_socket(&s.b).await;
+    assert_eq!(listed(&s.chain), vec![(1, None)]);
+    assert_eq!(s.chain.farm().now_or_never(), Some(1), "the block is not held back by a node it is not told of");
+
+    let releasing = s.chain.release(&s.b);
+    tokio::pin!(releasing);
+    assert_eq!(releasing.as_mut().now_or_never(), None, "the release waits on the connection to the node it tells");
+    let (peak, generation) = greet(&mut to_held, &s.chain.network()).await;
+    assert_eq!((peak.height, peak.header_hash, generation), (1, s.chain.header_hash(1).unwrap(), 2));
+    assert_eq!(releasing.as_mut().now_or_never(), None);
+    to_held.flush().await.expect("the pong sent");
+    releasing.await;
+    assert_eq!(listed(&s.chain), vec![(1, Some(2))]);
+
+    drop((not_tls, not_ws, to_held));
+    assert_eq!(s.money.peak_height().await.unwrap(), 1);
+    assert_eq!(s.lane.live_count().await, 2);
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -297,6 +431,180 @@ async fn a_reorg_drops_its_blocks_spends_and_coins_and_the_bundle_lands_when_pus
     let landed = s.chain.farm().await;
     assert_eq!(landed, h + 2);
     assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, Some(h + 2));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A reorganisation takes each node through `new_peak`'s slow path: a new
+/// mempool, and every old item tried again on the new chain. A bundle still
+/// in both mempools whose input the new fork keeps (made below the fork) is
+/// taken back by both, stays there through the reorganisation, and lands in
+/// the next block, which spends the input and makes its child.
+#[tokio::test]
+async fn a_bundle_in_both_mempools_whose_input_survives_a_reorg_stays_in_both_and_lands_in_the_next_block() {
+    let s = setup().await;
+    let coin = s.chain.fund(open_puzzle_hash(), 1000, None);
+    let created = s.chain.farm().await;
+    s.chain.farm_blocks(2).await;
+    let write = pass_on(coin);
+    s.money.push_tx(write.clone()).await.unwrap();
+    for node in [&s.a, &s.b] {
+        assert_eq!(s.chain.mempool_on(node), vec![write.name()]);
+    }
+
+    let peak = s.chain.reorg(2).await;
+    assert_eq!(peak, created + 3);
+    assert_eq!(s.chain.record(coin.coin_id()), Some((coin, created, None)), "the input is below the fork, unspent");
+    for node in [&s.a, &s.b] {
+        assert_eq!(s.chain.mempool_on(node), vec![write.name()], "taken back on the new chain");
+    }
+    let h = s.chain.farm().await;
+    assert_eq!(s.chain.record(coin.coin_id()), Some((coin, created, Some(h))), "the next block spends it");
+    assert_eq!(s.chain.record(passed(coin).coin_id()), Some((passed(coin), h, None)));
+    assert_eq!(s.chain.children(coin.coin_id()), vec![passed(coin)]);
+    for node in [&s.a, &s.b] {
+        assert!(s.chain.mempool_on(node).is_empty(), "it left with the block that carried it");
+    }
+    assert_eq!(s.chain.acks_for(write.name()), vec![(SUCCESS, None); 2], "pushed once, to both nodes");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A bundle still in both mempools whose input a reorganisation drops (made
+/// in a block above the fork, and made again by none of the new fork's) is
+/// UNKNOWN_UNSPENT on the new chain: both nodes drop it from their mempools
+/// and from their seen caches, so the next block carries nothing of it, and
+/// pushed again it is refused UNKNOWN_UNSPENT, not final (a node behind the
+/// input's block says the same of a live spend), rather than
+/// ALREADY_INCLUDING_TRANSACTION.
+#[tokio::test]
+async fn a_bundle_in_both_mempools_whose_input_a_reorg_drops_leaves_both_lands_nowhere_and_is_unknown_unspent_when_pushed_again() {
+    let s = setup().await;
+    let coin = s.chain.fund(open_puzzle_hash(), 1000, None);
+    let created = s.chain.farm().await;
+    let write = pass_on(coin);
+    s.money.push_tx(write.clone()).await.unwrap();
+    for node in [&s.a, &s.b] {
+        assert_eq!(s.chain.mempool_on(node), vec![write.name()]);
+    }
+
+    let peak = s.chain.reorg(1).await;
+    assert_eq!(peak, created + 1);
+    assert_eq!(s.chain.record(coin.coin_id()), None, "the block that made the input is gone, and nothing made it again");
+    for node in [&s.a, &s.b] {
+        assert!(s.chain.mempool_on(node).is_empty(), "dropped on the new chain");
+    }
+    let h = s.chain.farm().await;
+    assert_eq!(h, peak + 1);
+    assert_eq!(s.chain.record(passed(coin).coin_id()), None, "the next block carries nothing of it");
+    assert!(s.chain.children(coin.coin_id()).is_empty());
+
+    let why = refusal(s.money.push_tx(write.clone()).await);
+    assert!(why.contains("UNKNOWN_UNSPENT") && !refusal_is_final(&why), "{why}");
+    let unknown = (FAILED, Some("UNKNOWN_UNSPENT".to_string()));
+    assert_eq!(s.chain.acks_for(write.name()), vec![(SUCCESS, None), (SUCCESS, None), unknown.clone(), unknown]);
+    unanswered(s.money.spend_live(write).await);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A bundle still in both mempools whose input the new fork spends another
+/// way is a DOUBLE_SPEND on the new chain: both nodes drop it from their
+/// mempools, the next block carries nothing of it (the input's one child is
+/// the other spend's), and pushed again it is refused DOUBLE_SPEND, final.
+#[tokio::test]
+async fn a_bundle_in_both_mempools_whose_input_the_new_fork_spends_another_way_leaves_both_and_is_a_double_spend_when_pushed_again() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    let created = s.chain.farm().await;
+    s.chain.farm().await;
+    let ours = pass_on(coin);
+    let theirs = open_spend(coin, &[Cond::CreateCoin(hint(6), coin.amount, vec![])]);
+    s.money.push_tx(ours.clone()).await.unwrap();
+    for node in [&s.a, &s.b] {
+        assert_eq!(s.chain.mempool_on(node), vec![ours.name()]);
+    }
+
+    let peak = s.chain.reorg_including(1, vec![theirs]).await;
+    let spent = created + 1;
+    assert_eq!(peak, spent + 1, "the fork is at the input's block; the first new block carries the other spend");
+    assert_eq!(s.chain.record(coin.coin_id()), Some((coin, created, Some(spent))));
+    for node in [&s.a, &s.b] {
+        assert!(s.chain.mempool_on(node).is_empty(), "dropped on the new chain");
+    }
+    s.chain.farm().await;
+    assert_eq!(s.chain.record(passed(coin).coin_id()), None, "the next block carries nothing of ours");
+    assert_eq!(s.chain.children(coin.coin_id()), vec![Coin::new(coin.coin_id(), hint(6), coin.amount)]);
+
+    let why = refusal(s.money.push_tx(ours.clone()).await);
+    assert!(why.contains("DOUBLE_SPEND") && refusal_is_final(&why), "{why}");
+    assert!(!s.money.spend_live(ours).await.unwrap(), "both nodes call it a double spend");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A full mempool keeps its items through a reorganisation: the new mempool
+/// a full node makes holds only its old items, which fitted the old one
+/// together, so it is short of capacity for each (`at_full_capacity`), and a
+/// fee-0 bundle whose input survives is taken back by both nodes and lands.
+/// Full again once they are back, each still refuses a fresh fee-0 bundle.
+#[tokio::test]
+async fn a_full_mempool_takes_its_own_fee_zero_bundle_back_at_a_reorg_and_still_refuses_a_fresh_one() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    let fresh = s.chain.fund(open, 1000, None);
+    s.chain.farm_blocks(2).await;
+    let write = pass_on(coin);
+    s.money.push_tx(write.clone()).await.unwrap();
+    s.chain.set_full(true);
+
+    s.chain.reorg(1).await;
+    for node in [&s.a, &s.b] {
+        assert_eq!(s.chain.mempool_on(node), vec![write.name()], "taken back, fee 0, by a full mempool");
+    }
+    let why = refusal(s.money.push_tx(pass_on(fresh)).await);
+    assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO") && !refusal_is_final(&why), "{why}");
+    let h = s.chain.farm().await;
+    assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, Some(h));
+    assert_eq!(s.chain.record(fresh.coin_id()).unwrap().2, None);
+    s.chain.set_full(false);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The caches a reorganisation tries after the old items meet the mempool
+/// as full as it was: a fee-0 bundle waiting in the pending cache for a
+/// height the new fork reaches is due at the new peak, where both full
+/// mempools refuse it, INVALID_FEE_TOO_CLOSE_TO_ZERO, and it leaves the
+/// pending cache (`new_peak` drains what is due). Pushed again while they
+/// are full it is refused the same (nothing remembers it), no later block
+/// tries it again, and once they are no longer full it is taken and lands.
+#[tokio::test]
+async fn a_full_mempool_refuses_a_fee_zero_bundle_the_pending_cache_holds_once_a_reorg_makes_it_due() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    let created = s.chain.farm().await;
+    s.chain.farm().await;
+    let locked = open_spend(coin, &[Cond::AssertHeightRelative(2), Cond::CreateCoin(open, coin.amount, vec![])]);
+    s.money.push_tx(locked.clone()).await.expect("a height-locked bundle waits, accepted");
+    let pending = (PENDING, Some("ASSERT_HEIGHT_RELATIVE_FAILED".to_string()));
+    assert_eq!(s.chain.acks_for(locked.name()), vec![pending.clone(); 2]);
+    s.chain.set_full(true);
+
+    assert_eq!(s.chain.reorg(1).await, created + 2, "the new peak is the height its lock passes at");
+    assert_eq!(s.chain.record(coin.coin_id()), Some((coin, created, None)), "the input is below the fork, unspent");
+    for node in [&s.a, &s.b] {
+        assert!(s.chain.mempool_on(node).is_empty(), "due at the new peak, and refused there by a full mempool");
+    }
+    let why = refusal(s.money.push_tx(locked.clone()).await);
+    assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO") && !refusal_is_final(&why), "{why}");
+    let too_low = (FAILED, Some("INVALID_FEE_TOO_CLOSE_TO_ZERO".to_string()));
+    assert_eq!(s.chain.acks_for(locked.name()), vec![pending.clone(), pending, too_low.clone(), too_low]);
+
+    s.chain.set_full(false);
+    s.chain.farm().await;
+    assert!(s.chain.mempool().is_empty(), "gone from the pending cache, so no block tries it again");
+    s.money.push_tx(locked).await.unwrap();
+    let h = s.chain.farm().await;
+    assert_eq!(s.chain.record(coin.coin_id()), Some((coin, created, Some(h))));
     assert!(s.chain.unanswered().is_empty());
 }
 
