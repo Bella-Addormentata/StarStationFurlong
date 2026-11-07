@@ -227,7 +227,7 @@ import type {
 } from './games/coinPusher';
 import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash, signBytes, TableFold } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
-import { asFin, asXf, isFairOnlyInc, parseFairOnlyKey, readCk, xfId } from './computedFairOnly';
+import { asFin, asXf, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId } from './computedFairOnly';
 import type { CkRead, CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
 import type { Resolution } from './computedFairOnlyAuth';
@@ -3996,9 +3996,12 @@ function inertFairOnly(kind: 'ck' | 'xf' | 'fin', key: string, value: unknown): 
 }
 
 /** Whether `value` at room key `key` is a delegation the resolver can use: a
- *  delegation's shape, under its own house's key (as an honest writer stores
- *  one). */
+ *  delegation's shape, light enough (it is a few short fields: one padded past
+ *  MAX_SMALL_RECORD_BYTES is junk to the resolver, as a padded transfer is,
+ *  and asDelegation does not weigh it), under its own house's key (as an
+ *  honest writer stores one). */
 function fedDelegation(key: string, value: unknown): boolean {
+  if (weightOf(value, MAX_SMALL_RECORD_BYTES) === null) return false;
   const d = asDelegation(value);
   return d !== null && key === delegationKey(d.h);
 }
@@ -4329,7 +4332,8 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
  *  this page counted of it (tableLost) waits for nothing that will come.
  *  Its last counts stand, and it stops only itself, as a table whose book
  *  is lost does, or any peer could stop every spend in the casino by
- *  making a session map and deleting it. */
+ *  making a session map and deleting it. (Except for a FAIR ONLY game's
+ *  resolution waiting for a check: that will be made.) */
 export function computedSettled(tableId?: string): boolean {
   const settled = (key: string): boolean => {
     const c = computedIncs.get(key);
@@ -4337,7 +4341,16 @@ export function computedSettled(tableId?: string): boolean {
   };
   if (tableId !== undefined) return [...(computedIncsOf.get(tableId) ?? [])].every((inc) => settled(`${tableId}:${inc}`));
   const whole = !docHoldsPart();
-  for (const c of computedIncs.values()) if (!settled(c.key) && !(whole && tableLost(c.t))) return false;
+  for (const c of computedIncs.values()) {
+    if (settled(c.key)) continue;
+    // 🔒 A FAIR ONLY game whose resolution waits for a check is not frozen for
+    // good, whatever became of the session this page counted: the check will
+    // be made, and the checkpoint it waits for (a trim deletes that very
+    // session as it writes it) may take what the table was counted to hold.
+    // Nothing is spent until it is.
+    if (whole && tableLost(c.t) && c.fo?.res?.pending !== true) continue;
+    return false;
+  }
   return true;
 }
 

@@ -119,6 +119,13 @@ function pin(page: Page, ...ids: TestIdentity[]): void {
 
 const casinoComputed = (page: Page): Y.Map<unknown> => page.doc.getMap<unknown>('casinoComputed');
 
+/** `value` padded with fields valued undefined, which the shape checks read as absent and a weight
+ *  (weightOf) counts: 600 of them weigh some 10 KB, past MAX_SMALL_RECORD_BYTES (8 KB). */
+const padded = <V extends object>(value: V): V => ({
+  ...value,
+  ...Object.fromEntries(Array.from({ length: 600 }, (_, i) => [`pad${i}`, undefined])),
+});
+
 /** Top-level records into the doc, in one transaction. */
 function put(page: Page, ...recs: { key: string; value: unknown }[]): void {
   page.doc.transact(() => {
@@ -445,6 +452,8 @@ describe('what a page takes for a FAIR ONLY game, and what is junk to it', () =>
       { key: delegationKey(house2.pub), value: { junk: 1 } },
       // (the root's own value, already read at its key, under a key that is not its id: the read is remembered by value and key)
       { key: ckKey(T, P.inc, hex('4', 32)), value: root.value },
+      // a delegation of the shape it wants, padded past what a small record weighs: junk to the resolver, so to the page
+      { key: delegationKey(house2.pub), value: padded(delegation(owner, house2.pub)) },
     ];
     for (const j of junk) {
       put(a, j);
@@ -540,7 +549,7 @@ describe('the base a page counts from', () => {
     expect(page.casino.computedResolutionOf(T, ctx.inc)).toMatchObject({ newer: true, base: null });
   });
 
-  it('with no checkpoint the game is not open: its session is weighed and counts nothing, until one comes', async () => {
+  it('with no checkpoint the game is not open: its session counts nothing and weighs nothing (it is no live session of anything), until one comes', async () => {
     const page = await loadPage(1);
     page.casino.buyInChips(A.pid, 100);
     page.casino.buyInChips(B.pid, 100);
@@ -551,8 +560,11 @@ describe('the base a page counts from', () => {
     expect(chips(page, A)).toBe(100);
     expect(chips(page, B)).toBe(100);
     expect(page.casino.computedSettled()).toBe(true);
+    expect(page.casino.computedRoomBytes()).toBe(0);
+    // the checkpoint comes: the session is read whole, with the records that came before it, and weighed
     put(page, root);
     expect(chips(page, A)).toBe(100 + netOf(foldOf(r1.all), A) - 7);
+    expect(page.casino.computedRoomBytes()).toBeGreaterThan(0);
   });
 
   it('goes on from the checkpoint it counted when the doc loses it, and an older one put back does not take the table back', async () => {
@@ -780,6 +792,31 @@ describe('a check that has not been made yet', () => {
     expect(page.casino.computedResolutionOf(T, P.inc)!.base?.key).toBe(trim.key);
     expect(chips(page, A)).toBe(125);
     expect(page.casino.computedSettled()).toBe(true);
+  });
+
+  it('a trim put off that deletes the session the page counted leaves the table lost but not settled: nothing is spent until the check is made', async () => {
+    const { page: a, r1 } = await openedPage();
+    const counted = 100 + netOf(foldOf(r1.all), A);
+    expect(chips(a, A)).toBe(counted);
+    expect(a.casino.computedSettled()).toBe(true);
+    // the trim comes with no time to check it: the session it replaces is gone, the root still stands
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    const trim = trimOf(P, 'p');
+    trimTo(a, P, trim);
+    expect(a.casino.computedResolutionOf(T, P.inc)).toMatchObject({ pending: true });
+    expect(a.casino.computedResolutionOf(T, P.inc)!.base?.key).toBe(root.key);
+    expect(a.casino.casinoWhole(T)).toBe(false); // (lost: what it counted is not in the doc, and nothing is in its place yet)
+    expect(a.casino.computedSettled(T)).toBe(false);
+    expect(a.casino.computedSettled()).toBe(false); // (the lost table does not excuse a check that will be made)
+    expect(chips(a, A)).toBe(counted); // (its last counts stand meanwhile)
+    // the check made: the trim is the base, the table whole again, and spending goes on
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+    await flush();
+    expect(a.casino.computedResolutionOf(T, P.inc)).toMatchObject({ pending: false });
+    expect(a.casino.computedResolutionOf(T, P.inc)!.base?.key).toBe(trim.key);
+    expect(a.casino.casinoWhole(T)).toBe(true);
+    expect(a.casino.computedSettled()).toBe(true);
+    expect(chips(a, A)).toBe(125);
   });
 
   it('each signature is checked once, however many records come after it', async () => {
@@ -1046,6 +1083,38 @@ describe('which houses decide a round', () => {
     late.casino.bindCasinoDoc(copy, ROOM);
     expect(chips(late, A)).toBe(100 - 10);
     expect(chips(late, B)).toBe(100 - 5);
+  });
+
+  it('a delegation padded past what a small record weighs makes no house and moves nothing: found at bind, replaced or deleted after, and a good one put in its place counts', async () => {
+    const a = await loadPage(1);
+    a.casino.buyInChips(A.pid, 100);
+    a.casino.buyInChips(B.pid, 100);
+    pin(a, A, B);
+    put(a, root);
+    const second = houseRound(house2);
+    putSession(a, P, SID, ...second);
+    const key = delegationKey(house2.pub);
+    put(a, { key, value: padded(delegation(owner, house2.pub)) });
+    // the doc as a page finds it: bound to a copy that holds the padded delegation already
+    const late = await loadPage(3);
+    const copy = new Y.Doc();
+    Y.applyUpdate(copy, Y.encodeStateAsUpdate(a.doc));
+    late.casino.bindCasinoDoc(copy, ROOM);
+    const res = () => late.casino.computedResolutionOf(T, P.inc)!;
+    const before = res();
+    expect(chips(late, A)).toBe(100 - 10);
+    expect(chips(late, B)).toBe(100 - 5);
+    // replaced by another padded one, then deleted: the game is not resolved again
+    copy.transact(() => copy.getMap<unknown>('casinoComputed').set(key, padded({ ...delegation(owner, house2.pub), more: undefined })));
+    expect(res()).toBe(before);
+    copy.transact(() => copy.getMap<unknown>('casinoComputed').delete(key));
+    expect(res()).toBe(before);
+    // the same delegation, light: it is a house, and the round it decides counts
+    const decided = foldOf(second, root.value, P, cachingCheck().check, housesAre(house2));
+    copy.transact(() => copy.getMap<unknown>('casinoComputed').set(key, delegation(owner, house2.pub)));
+    expect(res()).not.toBe(before);
+    expect(chips(late, A)).toBe(100 + netOf(decided, A));
+    expect(chips(late, B)).toBe(100 + netOf(decided, B));
   });
 
   it('a page bound again to a doc without the delegation has no house of it any more', async () => {
