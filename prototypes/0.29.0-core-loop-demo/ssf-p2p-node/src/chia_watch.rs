@@ -302,7 +302,10 @@ fn parked_inputs(filed: &[Option<WriteCoins>]) -> Vec<Bytes32> {
 /// whether a listing run to its end and judged at or past the height it stood
 /// confirmed at lacks it ([`chia_resolve::HintChild::gone_since`], #272 review
 /// round 9), and its standing ([`chia_resolve::write_standing`]). Its own coin
-/// is looked for under `hint` by its `coins.parent`, and the input's spent
+/// is looked for under `hint` by its `coins.parent`, carrying the memo of
+/// digest `memo` when the entry keeps one ([`chia_resolve::child_under_hint`]:
+/// the knock the host opens, not the same coin made again by the next write
+/// from the input), and the input's spent
 /// height (`spent`) and the lease's word (`words`) are read at its
 /// `coins.parked` (stage 4 design §4.4); `held` holds the batch's spends the
 /// lease still holds (round 12). `Err` when the hint could not be read:
@@ -312,13 +315,14 @@ async fn sent_knock_standing(
     client: &impl crate::chia_chain::ChainAccess,
     coins: WriteCoins,
     hint: Bytes32,
+    memo: Option<Bytes32>,
     confirmed_height: u32,
     spend: Option<u64>,
     spent: &[(Bytes32, u32)],
     words: &HashMap<Bytes32, LeaseWord>,
     held: &HashSet<u64>,
 ) -> anyhow::Result<(bool, WriteStanding)> {
-    let child = chia_resolve::child_under_hint(client, hint, coins.parent).await?;
+    let child = chia_resolve::child_under_hint(client, hint, coins.parent, memo).await?;
     let spent_at = spent.iter().find(|(c, _)| *c == coins.parked).map(|(_, h)| *h);
     let lease = words.get(&coins.parked).copied().unwrap_or(LeaseWord::Unknown);
     let ours = spend.is_some_and(|s| held.contains(&s));
@@ -342,8 +346,10 @@ type SentVerdict = (String, String, u64, u32, bool, WriteStanding);
 /// ([`parked_inputs`]); then each entry's hint, in book order, about its
 /// parent ([`sent_knock_standing`]): the coins of stage 4 design §4.4. An
 /// entry whose coin id or hint is malformed is dead; one whose hint could not
-/// be read gets no verdict, and is judged again next tick. `Err` when the
-/// names listing could not be read: nothing is judged this tick.
+/// be read gets no verdict, and is judged again next tick. The memo digest an
+/// entry keeps is the one its coin's output must carry; an entry that keeps
+/// none (an older node's) or a malformed one is judged by its hint alone.
+/// `Err` when the names listing could not be read: nothing is judged this tick.
 async fn sent_knock_verdicts<L, Asked>(
     client: &impl crate::chia_chain::ChainAccess,
     pending: &[SentKnock],
@@ -364,7 +370,8 @@ where
             verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, WriteStanding::Dead("its entry in the knock book is malformed")));
             continue;
         };
-        match sent_knock_standing(client, write, hint, k.confirmed_height, k.spend, &spent, &words, &held).await {
+        let memo = chia_resolve::parse_hex32(&k.memo);
+        match sent_knock_standing(client, write, hint, memo, k.confirmed_height, k.spend, &spent, &words, &held).await {
             Ok((gone, standing)) => verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, gone, standing)),
             Err(e) => eprintln!("⛓️ ChiaHub knock: could not read under our knock's inbox hint: {e:#}"),
         }
@@ -1454,6 +1461,7 @@ mod tests {
             era: 3,
             hint: hint.into(),
             coin_id: coin_id.into(),
+            memo: String::new(),
             pushed_at: 100,
             confirmed_height: 0,
             last_rendezvous: 0,
@@ -1479,12 +1487,14 @@ mod tests {
         let split = WriteCoins { parent, parked };
         let hint = Bytes32::new([123u8; 32]);
         let child_of = |parent: Bytes32| CoinRecord { coin: Coin::new(parent, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
-        let found = || Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001))]);
+        // The parent's spend made the child carrying the knock.
+        let memo = chia_resolve::memo_digest(b"the knock");
+        let found = || Scripted::new(vec![page_of(vec![child_of(parent)], Some(1001))]).with_spend(parent, crate::chia_chain::testing::memo_spend(&child_of(parent).coin, hint, b"the knock"));
         let absent = || Scripted::new(vec![page_of(vec![], Some(1001))]);
         let none: HashMap<Bytes32, LeaseWord> = HashMap::new();
         let unheld: HashSet<u64> = HashSet::new();
         let judge = |chain: Scripted, coins: WriteCoins, confirmed: u32, spend: Option<u64>, spent: Vec<(Bytes32, u32)>, words: HashMap<Bytes32, LeaseWord>, held: HashSet<u64>| async move {
-            sent_knock_standing(&chain, coins, hint, confirmed, spend, &spent, &words, &held).await.ok()
+            sent_knock_standing(&chain, coins, hint, Some(memo), confirmed, spend, &spent, &words, &held).await.ok()
         };
         // Found by its parent.
         assert_eq!(judge(found(), split, 0, None, vec![], none.clone(), unheld.clone()).await, Some((false, Confirmed { height: 1000, seen_at: Some(1001) })));
@@ -1525,6 +1535,11 @@ mod tests {
         let coin = Bytes32::new([131u8; 32]);
         let hint = Bytes32::new([132u8; 32]);
         let child = CoinRecord { coin: Coin::new(coin, Bytes32::new([4u8; 32]), 1), confirmed_block_index: 1000, spent: false, spent_block_index: 0 };
+        // The coin's spend, which made the child carrying the knock: on both
+        // chains, so the row that lists the child confirms it either side.
+        let memo = chia_resolve::memo_digest(b"the knock");
+        let spend_of_coin = crate::chia_chain::testing::memo_spend(&child.coin, hint, b"the knock");
+        let chain_of = |pages: Vec<CoinListing>| Scripted::new(pages).with_spend(coin, spend_of_coin.clone());
         let cut = CoinListing { records: vec![], truncated: true, next_cursor: None, judged_at: Some(1001) };
         let empty = |judged_at: u32| page_of(vec![], Some(judged_at));
         let dropped = HashMap::from([(coin, LeaseWord::Dropped)]);
@@ -1548,10 +1563,14 @@ mod tests {
             ("the hint lookup fails", vec![], 0, None, vec![], none, HashSet::new()),
         ];
         for (name, pages, confirmed, spend, spent, words, held) in rows {
-            let now = sent_knock_standing(&Scripted::new(pages.clone()), WriteCoins::one(coin), hint, confirmed, spend, &spent, &words, &held).await.ok();
-            // The loop's body before the split, verbatim but for the log line.
-            let chain = Scripted::new(pages);
-            let before = match chia_resolve::child_under_hint(&chain, hint, coin).await {
+            let now = sent_knock_standing(&chain_of(pages.clone()), WriteCoins::one(coin), hint, Some(memo), confirmed, spend, &spent, &words, &held).await.ok();
+            if name == "found" {
+                assert_eq!(now, Some((false, WriteStanding::Confirmed { height: 1000, seen_at: Some(1001) })), "the child found, by its parent's spend");
+            }
+            // The loop's body before the split, verbatim but for the log line
+            // and the memo the hint lookup takes since.
+            let chain = chain_of(pages);
+            let before = match chia_resolve::child_under_hint(&chain, hint, coin, Some(memo)).await {
                 Ok(child) => {
                     let spent_at = spent.iter().find(|(c, _)| *c == coin).map(|(_, h)| *h);
                     let lease = words.get(&coin).copied().unwrap_or(LeaseWord::Unknown);
@@ -1650,8 +1669,10 @@ mod tests {
         let (k1, k2, k3, k4, k7) = (split(1), split(2), split(3), split(4), split(7));
         let c5 = input(5).coin_id();
         let filed_hex = |coins: WriteCoins| hex::encode(coins.parent);
+        // The first knock keeps the digest of its memo, which its coin carries.
+        let first = SentKnock { memo: hex::encode(chia_resolve::memo_digest(b"knock 1")), ..sent_knock(&filed_hex(k1), &hint_hex, Some(1)) };
         let pending = vec![
-            sent_knock(&filed_hex(k1), &hint_hex, Some(1)),
+            first,
             sent_knock(&filed_hex(k2), &hint_hex, None),
             sent_knock(&filed_hex(k3), &hint_hex, None),
             sent_knock(&filed_hex(k4), &hint_hex, Some(4)),
@@ -1660,6 +1681,7 @@ mod tests {
             sent_knock(&filed_hex(k7), &hint_hex, None),
         ];
         let filed = vec![Some(k1), Some(k2), Some(k3), Some(k4), Some(WriteCoins::one(c5)), None, Some(k7)];
+        let made = child_record(k1.parent, 1000).coin;
         let chain = Scripted::new(vec![
             // The names listing: the second and the fourth knock's parked inputs spent.
             page_of(vec![spent_record(input(2), 1000), spent_record(input(4), 1000)], Some(1001)),
@@ -1669,7 +1691,8 @@ mod tests {
             page_of(vec![], Some(1001)),
             page_of(vec![], Some(1001)),
             // None for the last knock: its hint cannot be read.
-        ]);
+        ])
+        .with_spend(k1.parent, crate::chia_chain::testing::memo_spend(&made, hint, b"knock 1"));
         let lease = ScriptedLease::new(k3.parked, 4);
         let verdicts = sent_knock_verdicts(&chain, &pending, &filed, |coins, spends| std::future::ready(lease.answer(&chain, &coins, &spends))).await.unwrap();
         let parked = vec![k1.parked, k2.parked, k3.parked, k4.parked, c5, k7.parked];
@@ -1695,8 +1718,9 @@ mod tests {
         assert_eq!(*silent.asked_spent.lock().unwrap(), vec![true], "the names listing alone, no hint");
     }
 
-    /// The batch before the split, verbatim but for the log lines and the
-    /// lease's seam: `None` where the names listing could not be read.
+    /// The batch before the split, verbatim but for the log lines, the
+    /// lease's seam and the memo digest the hint lookup takes since: `None`
+    /// where the names listing could not be read.
     async fn sent_knocks_judged_before_the_split(
         agreed: &crate::chia_chain::testing::Scripted,
         lease: &ScriptedLease,
@@ -1713,7 +1737,7 @@ mod tests {
                         verdicts.push((k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, WriteStanding::Dead("its entry in the knock book is malformed")));
                         continue;
                     };
-                    let child = match chia_resolve::child_under_hint(agreed, hint, coin).await {
+                    let child = match chia_resolve::child_under_hint(agreed, hint, coin, chia_resolve::parse_hex32(&k.memo)).await {
                         Ok(child) => child,
                         Err(_) => continue,
                     };
@@ -1764,9 +1788,13 @@ mod tests {
             page_of(vec![], Some(1001)),
             page_of(vec![], Some(1001)),
         ];
+        // The first knock's coin's spend made the child carrying the knock,
+        // on both chains.
+        let first_spend = crate::chia_chain::testing::memo_spend(&child_record(coin(1), 1000).coin, Bytes32::new([0xcc; 32]), b"knock 1");
+        let chain_of = |pages: Vec<crate::chia_chain::CoinListing>| Scripted::new(pages).with_spend(coin(1), first_spend.clone());
         // The script as above, then a chain whose names listing cannot be read.
         for (pages, read) in [(pages, true), (vec![], false)] {
-            let (chain, earlier) = (Scripted::new(pages.clone()), Scripted::new(pages));
+            let (chain, earlier) = (chain_of(pages.clone()), chain_of(pages));
             let (lease, earlier_lease) = (ScriptedLease::new(coin(3), 4), ScriptedLease::new(coin(3), 4));
             let now = sent_knock_verdicts(&chain, &pending, &filed_coins(&pending), |coins, spends| std::future::ready(lease.answer(&chain, &coins, &spends))).await.ok();
             let before = sent_knocks_judged_before_the_split(&earlier, &earlier_lease, &pending).await;
@@ -1775,6 +1803,7 @@ mod tests {
             assert_eq!(*lease.asked.lock().unwrap(), *earlier_lease.asked.lock().unwrap());
             assert_eq!(*chain.asked_names.lock().unwrap(), *earlier.asked_names.lock().unwrap());
             assert_eq!(*chain.asked_spent.lock().unwrap(), *earlier.asked_spent.lock().unwrap());
+            assert_eq!(*chain.asked_spends.lock().unwrap(), *earlier.asked_spends.lock().unwrap());
             if let Some(verdicts) = now {
                 let standings: Vec<(bool, WriteStanding)> = verdicts.into_iter().map(|(_, _, _, _, gone, standing)| (gone, standing)).collect();
                 assert_eq!(
@@ -1793,5 +1822,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The memo check at the knock verdict: the batch reads the digest each
+    /// entry keeps, and an entry's coin under its hint confirms the knock only
+    /// if the input's spend made that coin carrying the hint and that memo —
+    /// the knock the host opens. The coin made again by the next write from
+    /// the input (another knock, to another host, under another hint; or
+    /// under the same hint with another memo) still listed under this knock's
+    /// hint — a row an orphaned block left — is a stale row: not confirmed,
+    /// and, its input spent and the lease holding no spend of it, its coin
+    /// went to another spend of ours, so the knock is dropped and knocked
+    /// again. An entry an older node wrote keeps no digest and is judged by
+    /// its hint alone; a malformed digest is none.
+    #[tokio::test]
+    async fn a_sent_knock_is_confirmed_only_by_the_memo_its_entry_keeps() {
+        use WriteStanding::{Confirmed, Dead};
+        /// The verdicts on one knock of `input(1)` under `hint` whose entry
+        /// keeps `memo`, its input listed spent at 1000 and its coin listed
+        /// under the hint, made by a spend that carried `carried` under
+        /// `carried_hint`; and the spends asked for.
+        async fn judged(hint: Bytes32, memo: &str, carried_hint: Bytes32, carried: &[u8]) -> (Vec<(bool, WriteStanding)>, Vec<(Bytes32, u32)>) {
+            let coin = input(1);
+            let made = child_record(coin.coin_id(), 1000).coin;
+            let chain = crate::chia_chain::testing::Scripted::new(vec![
+                page_of(vec![spent_record(coin, 1000)], Some(1001)),
+                page_of(vec![child_record(coin.coin_id(), 1000)], Some(1001)),
+            ])
+            .with_spend(coin.coin_id(), crate::chia_chain::testing::memo_spend(&made, carried_hint, carried));
+            let pending = vec![SentKnock { memo: memo.into(), ..sent_knock(&hex::encode(coin.coin_id()), &hex::encode(hint), None) }];
+            let lease = ScriptedLease::new(Bytes32::new([0u8; 32]), 0);
+            let verdicts = sent_knock_verdicts(&chain, &pending, &filed_coins(&pending), |coins, spends| std::future::ready(lease.answer(&chain, &coins, &spends))).await.unwrap();
+            let asked = chain.asked_spends.lock().unwrap().clone();
+            (verdicts.into_iter().map(|(_, _, _, _, gone, standing)| (gone, standing)).collect(), asked)
+        }
+        let (hint, other_hint) = (Bytes32::new([0xcc; 32]), Bytes32::new([0xdd; 32]));
+        let ours = hex::encode(chia_resolve::memo_digest(b"our knock"));
+        let once = vec![(input(1).coin_id(), 1000)];
+        let confirmed = vec![(false, Confirmed { height: 1000, seen_at: Some(1001) })];
+        let elsewhere = vec![(false, Dead("its coin went to another spend of ours"))];
+        assert_eq!(judged(hint, &ours, hint, b"our knock").await, (confirmed.clone(), once.clone()), "its own memo");
+        assert_eq!(judged(hint, &ours, other_hint, b"our knock").await, (elsewhere.clone(), once.clone()), "the coin made again under another hint");
+        assert_eq!(judged(hint, &ours, hint, b"another knock").await, (elsewhere.clone(), once.clone()), "the coin made again under this hint with another memo");
+        assert_eq!(judged(hint, "", hint, b"another knock").await, (confirmed.clone(), once.clone()), "an older node's entry: the hint alone");
+        assert_eq!(judged(hint, "", other_hint, b"our knock").await, (elsewhere, once.clone()), "an older node's entry still tells another hint apart");
+        assert_eq!(judged(hint, "zz", hint, b"another knock").await, (confirmed, once), "a malformed digest is none");
     }
 }

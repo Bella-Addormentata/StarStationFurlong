@@ -354,19 +354,46 @@ pub(crate) mod testing {
         }
     }
 
+    /// A spend whose puzzle is `1` (it returns its solution) and whose
+    /// solution is one CREATE_COIN (opcode 51) per output given, in order:
+    /// its puzzle hash, its amount and its memos.
+    pub(crate) fn spend_creating(outputs: &[(Bytes32, u64, Vec<chia_protocol::Bytes>)]) -> PuzzleAndSolution {
+        use clvm_traits::ToClvm;
+        // One CREATE_COIN as CLVM lays it out: (51 puzzle_hash amount memos).
+        type CreateCoin = (u8, (Bytes32, (u64, (Vec<chia_protocol::Bytes>, ()))));
+        let mut a = clvmr::Allocator::new();
+        let conditions: Vec<CreateCoin> =
+            outputs.iter().map(|(puzzle_hash, amount, memos)| (51u8, (*puzzle_hash, (*amount, (memos.clone(), ()))))).collect();
+        let solution = conditions.to_clvm(&mut a).unwrap();
+        let solution = Program::from(clvmr::serde::node_to_bytes(&a, solution).unwrap());
+        PuzzleAndSolution { puzzle_reveal: Program::from(vec![1u8]), solution }
+    }
+
+    /// The spend of `coin`'s parent that makes `coin` with `[hint, memo]` as
+    /// its memos, as every write's spend makes its coin ([`spend_creating`]).
+    pub(crate) fn memo_spend(coin: &Coin, hint: Bytes32, memo: &[u8]) -> PuzzleAndSolution {
+        let memos = vec![chia_protocol::Bytes::new(hint.to_vec()), chia_protocol::Bytes::new(memo.to_vec())];
+        spend_creating(&[(coin.puzzle_hash, coin.amount, memos)])
+    }
+
     /// A chain that answers listings from a script: the pages in order,
     /// whatever the key or cursor asked for, then nothing. It keeps whether
     /// each listing asked for spent coins, the coins each lookup by name
     /// asked for (`asked_names`, in the order asked), and how many bundles
     /// were handed to it (`sent`: a liveness question or a push, both
     /// unanswered). The peak is answered only when one was given
-    /// ([`Scripted::with_peak`]). Everything else is unanswered.
+    /// ([`Scripted::with_peak`]), and a coin's spend only when it was scripted
+    /// ([`Scripted::with_spend`], [`Scripted::with_no_spend`]), whatever the
+    /// height asked; each coin and height a spend was asked for is kept
+    /// (`asked_spends`), in order. Everything else is unanswered.
     pub(crate) struct Scripted {
         pages: std::sync::Mutex<std::collections::VecDeque<CoinListing>>,
         pub(crate) asked_spent: std::sync::Mutex<Vec<bool>>,
         pub(crate) asked_names: std::sync::Mutex<Vec<Vec<Bytes32>>>,
         pub(crate) sent: std::sync::atomic::AtomicUsize,
         peak: Option<u32>,
+        spends: HashMap<Bytes32, Option<PuzzleAndSolution>>,
+        pub(crate) asked_spends: std::sync::Mutex<Vec<(Bytes32, u32)>>,
     }
 
     impl Scripted {
@@ -377,12 +404,27 @@ pub(crate) mod testing {
                 asked_names: std::sync::Mutex::new(Vec::new()),
                 sent: std::sync::atomic::AtomicUsize::new(0),
                 peak: None,
+                spends: HashMap::new(),
+                asked_spends: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         /// The same chain, answering `peak` as its peak height.
         pub(crate) fn with_peak(self, peak: u32) -> Self {
             Self { peak: Some(peak), ..self }
+        }
+
+        /// The same chain, answering `spend` as the spend of `coin`.
+        pub(crate) fn with_spend(mut self, coin: Bytes32, spend: PuzzleAndSolution) -> Self {
+            self.spends.insert(coin, Some(spend));
+            self
+        }
+
+        /// The same chain, answering that `coin` has no spend (a full node's
+        /// rejection: not spent in the block at that height).
+        pub(crate) fn with_no_spend(mut self, coin: Bytes32) -> Self {
+            self.spends.insert(coin, None);
+            self
         }
 
         fn page(&self, include_spent: bool) -> Result<CoinListing, ChainError> {
@@ -426,10 +468,12 @@ pub(crate) mod testing {
 
         fn puzzle_and_solution(
             &self,
-            _coin_id: Bytes32,
-            _height: u32,
+            coin_id: Bytes32,
+            height: u32,
         ) -> impl Future<Output = Result<Option<PuzzleAndSolution>, ChainError>> + Send {
-            async { Err(silence()) }
+            self.asked_spends.lock().unwrap().push((coin_id, height));
+            let spend = self.spends.get(&coin_id).cloned().ok_or_else(silence);
+            async move { spend }
         }
 
         fn peak_height(&self) -> impl Future<Output = Result<u32, ChainError>> + Send {

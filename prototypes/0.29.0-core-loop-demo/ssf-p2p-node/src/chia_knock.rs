@@ -149,6 +149,16 @@ pub struct SentKnock {
     /// judged ([`crate::chia_resolve::write_standing`]) — its spent flag alone
     /// proves nothing, since a dropped knock's coin goes to the next write.
     pub coin_id: String,
+    /// The digest of the memo the knock carried, hex
+    /// ([`crate::chia_resolve::memo_digest`] of its sealed knock): the coin
+    /// under the hint confirms the knock only if its output carries that
+    /// memo ([`crate::chia_resolve::child_under_hint`]) — the knock the host
+    /// opens — so the same coin made again by the next write from the input
+    /// (which may be a knock to another host) is told apart. A digest of
+    /// public chain data: it holds no key material. Empty in an entry an
+    /// older node wrote, which is judged by its hint alone.
+    #[serde(default)]
+    pub memo: String,
     pub pushed_at: u64,
     /// 0 until the spend confirmed.
     #[serde(default)]
@@ -583,6 +593,7 @@ mod tests {
             era,
             hint: "ab".into(),
             coin_id: coin.into(),
+            memo: "cd".repeat(32),
             pushed_at,
             confirmed_height: 0,
             last_rendezvous: 0,
@@ -707,6 +718,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<KnockBook>(&saved).unwrap(), book, "the word is kept");
         let old: SentKnock = serde_json::from_str(r#"{"host":"H","room":"r","era":3,"hint":"ab","coin_id":"c","pushed_at":1,"confirmed_height":1000}"#).unwrap();
         assert!(!old.settled, "an entry from before the word was kept is judged again");
+        assert!(old.memo.is_empty(), "an entry from before the memo was kept loads, and is judged by its hint alone");
         book.record_inbox(InboxKnock { from: "J".into(), room: "r".into(), era: 3, confirmed_height: 3 * ERA_BLOCKS + 5, coin_id: "k1".into(), last_rendezvous: 3 * ERA_BLOCKS + 5, settled: false });
         assert_eq!(book.unsettled_inbox().len(), 1, "a knock read: judged until a lookup settles it, whatever the peak");
         assert!(book.settle_inbox("k1"));

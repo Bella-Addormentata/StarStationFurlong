@@ -43,6 +43,7 @@ use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
 use chia_sdk_types::{run_puzzle, Conditions};
 use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
+use sha2::{Digest, Sha256};
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
 use crate::chia_network::ChiaNet;
@@ -668,10 +669,18 @@ pub async fn coin_heights(client: &impl ChainAccess, coin_ids: Vec<Bytes32>) -> 
 
 /// #231 P6b: whether a write's own coin sits under `hint` — the coin a
 /// spend-to-self creates names the coin it spent as its parent, so the child
-/// under the hint whose `parent_coin_info` is the write's INPUT is the write
-/// itself, confirmed where that child confirmed. The input's spent flag alone
-/// says nothing of the write (#272 review): the mempool may have dropped the
-/// write and a later spend of ours taken the same coin.
+/// under the hint whose `parent_coin_info` is the write's INPUT, made by an
+/// output that carries the write, is the write itself, confirmed where that
+/// child confirmed. The input's spent flag alone says nothing of the write
+/// (#272 review): the mempool may have dropped the write and a later spend of
+/// ours taken the same coin. Nor does the child's id alone: every write of
+/// ours from one input makes the same coin whatever its hint, and a full node
+/// never deletes a hint row (a reorganization rolls back the coins, not the
+/// hints), so a coin made again by another spend of the input can still be
+/// listed under the hint an orphaned block gave it — as it is when two writes
+/// of ours from one input under two hints meet across a fork, or one wallet
+/// writes from two places. The verdict reads the parent's spend, as every
+/// reader does ([`extract_ciphertext`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HintChild {
     /// The write's own coin is under the hint, confirmed at `height`, found
@@ -680,12 +689,26 @@ pub enum HintChild {
     /// is the height the answering peers stood at, and bounds how deep THEY
     /// saw the coin (#272 review round 10): a settlement is a lookup's word,
     /// so its depth is measured at the lookup's own height as well as the
-    /// agreed peak, and an undated lookup settles nothing.
+    /// agreed peak, and an undated lookup settles nothing. Its parent's spend,
+    /// read at `height`, makes it by an output whose first memo is the hint
+    /// and which carries a second memo, the one a reader opens: of the digest
+    /// the write's mark keeps ([`memo_digest`]), or, for an older node's mark
+    /// that keeps none, any second memo — which tells a write under another
+    /// hint apart, but not another write of ours under this one.
     Confirmed { height: u32, judged_at: Option<u32> },
-    /// The listing ran to its end and no coin under the hint names the input
-    /// as its parent; judged at this height (`None`: the source gave none).
+    /// The listing ran to its end and no coin under the hint is the write's:
+    /// none names the input as its parent, or the one that does was made by
+    /// another spend of the input (a stale row), its output carrying another
+    /// hint, no second memo, or — only when the write's mark keeps a digest —
+    /// a second memo of another digest; judged at this height (`None`: the
+    /// source gave none).
     Absent { judged_at: Option<u32> },
-    /// The listing was cut short before its end: nothing can be said yet.
+    /// The listing was cut short before its end, or the parent's spend at the
+    /// child's height does not make the child (no spend there, or none with
+    /// its output), or a later coin of the parent's is listed at another
+    /// height than its spend was fetched at: the listing and the spend
+    /// disagree, a reorganization between the requests, and nothing can be
+    /// said yet.
     Unknown,
 }
 
@@ -702,11 +725,27 @@ impl HintChild {
 }
 
 /// Look for the write that spent `parent` among the coins under `hint`,
-/// paging within the poll budget.
-pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: Bytes32) -> Result<HintChild> {
+/// paging within the poll budget. A coin listed with `parent` as its parent
+/// is the write's only if its parent's spend, fetched at the coin's height
+/// ([`fetch_coin_spend`], one request per lookup however many listed coins
+/// name the parent: every coin a spend makes confirms in its one block),
+/// makes it by an output carrying the write ([`carries_write`]): the hint as
+/// its first memo and, given `memo` (the digest the write's mark keeps,
+/// [`memo_digest`]), a second memo of that digest — given none (an older
+/// node's mark), any second memo, which still tells a write under another
+/// hint apart. A listed coin whose output carries anything else is a stale
+/// row, passed over: the listing goes on, and ends as it would without it.
+/// No spend at the coin's height, a spend that does not make the coin, or a
+/// later coin of the parent's listed at another height than the spend was
+/// fetched at: the listing and the spend disagree, and nothing is judged
+/// ([`HintChild::Unknown`]). A spend that cannot be fetched is an error, as
+/// a listing that cannot be read is: no verdict this tick.
+pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: Bytes32, memo: Option<Bytes32>) -> Result<HintChild> {
     let mut page: Option<String> = None;
     let mut judged_at: Option<u32> = None;
     let mut undated = false;
+    // The parent's spend once fetched, with the height it was fetched at.
+    let mut spend: Option<(u32, PuzzleAndSolution)> = None;
     for _ in 0..MAX_PAGES_PER_POLL {
         let listing = client
             .coin_records_by_hint(hint, None, true, page.take())
@@ -716,8 +755,23 @@ pub async fn child_under_hint(client: &impl ChainAccess, hint: Bytes32, parent: 
             Some(h) => judged_at = Some(judged_at.map_or(h, |lowest| lowest.min(h))),
             None => undated = true,
         }
-        if let Some(rec) = listing.records.iter().find(|r| r.coin.parent_coin_info == parent) {
-            return Ok(HintChild::Confirmed { height: rec.confirmed_block_index, judged_at: if undated { None } else { judged_at } });
+        for rec in listing.records.iter().filter(|r| r.coin.parent_coin_info == parent) {
+            let height = rec.confirmed_block_index;
+            let (fetched_at, parent_spend) = match spend.take() {
+                Some((fetched_at, _)) if fetched_at != height => return Ok(HintChild::Unknown),
+                Some(fetched) => fetched,
+                None => match fetch_coin_spend(client, parent, height).await? {
+                    Some(fetched) => (height, fetched),
+                    None => return Ok(HintChild::Unknown),
+                },
+            };
+            let carried = carries_write(&parent_spend, &rec.coin, hint, memo)?;
+            spend = Some((fetched_at, parent_spend));
+            match carried {
+                Some(true) => return Ok(HintChild::Confirmed { height, judged_at: if undated { None } else { judged_at } }),
+                Some(false) => continue,
+                None => return Ok(HintChild::Unknown),
+            }
         }
         match (listing.truncated, listing.next_cursor) {
             (true, Some(next)) => page = Some(next),
@@ -767,7 +821,14 @@ pub enum WriteStanding {
 /// hint ([`child_under_hint`]), `spent_at` the height its input was spent at
 /// when the chain lists it spent ([`spent_heights`]), `lease` the wallet
 /// lease's word on the input ([`LeaseWord`], asked BEFORE the two lookups).
-/// Only the write's OWN coin confirms it. An input spent with no child under
+/// Only the write's OWN coin confirms it: the child its input's spend made by
+/// an output carrying the write's hint and memo, what a reader opens (the
+/// memo known by the digest the write's mark keeps; an older node's mark
+/// keeps none, and any second memo is taken). The
+/// same coin listed under the hint but made by another spend of the input (a
+/// hint row an orphaned block left, or another write of ours from the input
+/// under another hint) is no child of the write's: it reads [`HintChild::Absent`]
+/// once the listing ends. An input spent with no child under
 /// the hint went to ANOTHER spend of ours — but only on a listing judged at or
 /// past that spend, since a source still behind it may not list the child yet.
 /// An input unspent is dead only on the lease's word that the peers refused
@@ -949,6 +1010,29 @@ pub(crate) async fn fetch_coin_spend(
 /// Run the parent spend and return the ciphertext (2nd memo) of the create_coin
 /// whose FIRST memo is our `hint` — the ecosystem hint convention we published with.
 pub(crate) fn extract_ciphertext(coin_spend: &PuzzleAndSolution, hint: Bytes32) -> Result<Option<Vec<u8>>> {
+    Ok(created_coins(coin_spend)?
+        .into_iter()
+        .find(|out| out.memos.len() >= 2 && out.memos[0].as_ref() == hint.as_ref())
+        .map(|out| out.memos[1].clone().into_inner()))
+}
+
+/// One output of a spend: a CREATE_COIN's puzzle hash and amount, which with
+/// the spent coin name the coin it makes, and its memos — empty when it has
+/// none, or when they do not read as a list of atoms (no reader takes those).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreatedCoin {
+    pub puzzle_hash: Bytes32,
+    pub amount: u64,
+    pub memos: Vec<Bytes>,
+}
+
+/// THE condition walk over a spend: run its puzzle with its solution and list
+/// every CREATE_COIN its conditions hold, in order ([`CreatedCoin`]). The
+/// readers take a ciphertext through it ([`extract_ciphertext`]), and the
+/// writer's verdict the memos of the output that made its coin
+/// ([`output_memos`]). `Err` when the spend does not run, or its result is no
+/// list of conditions.
+pub(crate) fn created_coins(coin_spend: &PuzzleAndSolution) -> Result<Vec<CreatedCoin>> {
     let mut allocator = Allocator::new();
     let puzzle: NodePtr = coin_spend
         .puzzle_reveal
@@ -962,23 +1046,47 @@ pub(crate) fn extract_ciphertext(coin_spend: &PuzzleAndSolution, hint: Bytes32) 
         .map_err(|e| anyhow!("run_puzzle: {e:?}"))?;
     let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output)
         .map_err(|e| anyhow!("conditions from_clvm: {e:?}"))?;
+    let mut created = Vec::new();
     for condition in conditions {
         let Some(create_coin) = condition.into_create_coin() else {
             continue;
         };
-        let memos_ptr = match create_coin.memos {
-            Memos::Some(ptr) => ptr,
-            Memos::None => continue,
+        let memos = match create_coin.memos {
+            Memos::Some(ptr) => Vec::<Bytes>::from_clvm(&allocator, ptr).unwrap_or_default(),
+            Memos::None => Vec::new(),
         };
-        let memos = match Vec::<Bytes>::from_clvm(&allocator, memos_ptr) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if memos.len() >= 2 && memos[0].as_ref() == hint.as_ref() {
-            return Ok(Some(memos[1].clone().into_inner()));
-        }
+        created.push(CreatedCoin { puzzle_hash: create_coin.puzzle_hash, amount: create_coin.amount, memos });
     }
-    Ok(None)
+    Ok(created)
+}
+
+/// The memos of the CREATE_COIN in `coin_spend` that makes the coin of
+/// `puzzle_hash` and `amount` — a coin is its parent, puzzle hash and amount,
+/// so in its parent's spend the two name its output, and the chain refuses a
+/// spend that makes one coin twice — or `None` when the spend makes no such
+/// coin ([`created_coins`]).
+pub(crate) fn output_memos(coin_spend: &PuzzleAndSolution, puzzle_hash: Bytes32, amount: u64) -> Result<Option<Vec<Bytes>>> {
+    Ok(created_coins(coin_spend)?.into_iter().find(|out| out.puzzle_hash == puzzle_hash && out.amount == amount).map(|out| out.memos))
+}
+
+/// Does the output of `parent_spend` that makes `coin` carry a write under
+/// `hint`: the hint as its first memo, and a second memo beside it, the one a
+/// reader opens — of digest `memo`, when one is given ([`memo_digest`])?
+/// `None` when the spend makes no such coin ([`output_memos`]).
+fn carries_write(parent_spend: &PuzzleAndSolution, coin: &chia_protocol::Coin, hint: Bytes32, memo: Option<Bytes32>) -> Result<Option<bool>> {
+    Ok(output_memos(parent_spend, coin.puzzle_hash, coin.amount)?.map(|memos| {
+        memos.len() >= 2 && memos[0].as_ref() == hint.as_ref() && memo.is_none_or(|digest| memo_digest(memos[1].as_ref()) == digest)
+    }))
+}
+
+/// The digest a write's mark keeps of the memo the write carries: SHA-256 of
+/// its ciphertext, the second memo of its output, byte for byte as the chain
+/// serves it to every reader. So the writer's verdict tells its own output
+/// from another write's on the same coin ([`child_under_hint`]) without
+/// keeping the bytes. A digest of public chain data: it holds no key
+/// material.
+pub fn memo_digest(memo: &[u8]) -> Bytes32 {
+    Bytes32::new(Sha256::digest(memo).into())
 }
 
 /// How old a cached chain peak may be before it is as good as none. The watcher
@@ -1454,16 +1562,12 @@ mod tests {
         /// File `memo` under `hint` in a coin confirmed at `height`, made by
         /// the spend of the coin `parent` (the writer's input coin, which a
         /// knock's seal binds). The parent's puzzle is `1`, which returns its
-        /// solution: one CREATE_COIN (opcode 51) whose memos are `[hint, memo]`.
+        /// solution: one CREATE_COIN (opcode 51) whose memos are `[hint, memo]`
+        /// ([`crate::chia_chain::testing::memo_spend`]).
         fn file(&mut self, hint: Bytes32, memo: Vec<u8>, parent: [u8; 32], height: u32) {
             let parent = Bytes32::new(parent);
-            let puzzle_hash = Bytes32::new([0x5a; 32]);
-            let mut a = Allocator::new();
-            let conditions = ((51u8, (puzzle_hash, (1u64, ((hint, (Bytes::new(memo), ())), ())))), ());
-            let solution = conditions.to_clvm(&mut a).unwrap();
-            let solution = chia_protocol::Program::from(clvmr::serde::node_to_bytes(&a, solution).unwrap());
-            self.spends.insert(parent, PuzzleAndSolution { puzzle_reveal: chia_protocol::Program::from(vec![1u8]), solution });
-            let coin = chia_protocol::Coin::new(parent, puzzle_hash, 1);
+            let coin = chia_protocol::Coin::new(parent, Bytes32::new([0x5a; 32]), 1);
+            self.spends.insert(parent, crate::chia_chain::testing::memo_spend(&coin, hint, &memo));
             let record = crate::chia_chain::CoinRecord { coin, confirmed_block_index: height, spent: false, spent_block_index: 0 };
             self.filed.entry(hint).or_default().push(record);
         }
@@ -1712,34 +1816,156 @@ mod tests {
             next_cursor: next.map(str::to_string),
             judged_at,
         };
+        // The write's own spend: it made the coin under the hint carrying the
+        // write's memo. Scripted on every chain below, so a listing that names
+        // the coin confirms it, and one that does not never asks for it.
+        let memo = b"the write".to_vec();
+        let digest = Some(memo_digest(&memo));
+        let ours = |pages: Vec<CoinListing>| Scripted::new(pages).with_spend(input, crate::chia_chain::testing::memo_spend(&rec(7, 101).coin, hint, &memo));
         // Two pages: the write's own coin is on the second, found by a lookup
         // judged at the lowest height over the pages read (round 10).
-        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(7, 101)], false, None, Some(120))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) });
-        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(120)), page(vec![rec(7, 101)], true, Some("d"), Some(130))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) }, "the lowest page so far, not the one that held it");
+        let chain = ours(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(7, 101)], false, None, Some(120))]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) });
+        assert_eq!(*chain.asked_spends.lock().unwrap(), vec![(input, 101)], "the parent's spend, at the coin's height, once");
+        let chain = ours(vec![page(vec![rec(1, 100)], true, Some("c"), Some(120)), page(vec![rec(7, 101)], true, Some("d"), Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: Some(120) }, "the lowest page so far, not the one that held it");
         // Found after an undated page: the height the peers stood at is
         // unknown, and no settlement can be measured by it.
-        let chain = Scripted::new(vec![page(vec![], true, Some("c"), None), page(vec![rec(7, 101)], false, None, Some(130))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: None });
+        let chain = ours(vec![page(vec![], true, Some("c"), None), page(vec![rec(7, 101)], false, None, Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Confirmed { height: 101, judged_at: None });
         // A listing run to its end without it, judged at the lowest height over its pages.
-        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(2, 101)], false, None, Some(120))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Absent { judged_at: Some(120) });
+        let chain = ours(vec![page(vec![rec(1, 100)], true, Some("c"), Some(130)), page(vec![rec(2, 101)], false, None, Some(120))]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Absent { judged_at: Some(120) });
+        assert!(chain.asked_spends.lock().unwrap().is_empty(), "no child of the input listed: no spend asked for");
         // One undated page leaves the listing undated.
-        let chain = Scripted::new(vec![page(vec![], true, Some("c"), Some(130)), page(vec![], false, None, None)]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Absent { judged_at: None });
+        let chain = ours(vec![page(vec![], true, Some("c"), Some(130)), page(vec![], false, None, None)]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Absent { judged_at: None });
         // Cut short with nowhere to go on: unknown.
-        let chain = Scripted::new(vec![page(vec![rec(1, 100)], true, None, Some(130))]);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Unknown);
+        let chain = ours(vec![page(vec![rec(1, 100)], true, None, Some(130))]);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Unknown);
         // Still cut short when the page budget is spent: unknown too.
         let pages: Vec<CoinListing> = (0..MAX_PAGES_PER_POLL + 1).map(|_| page(vec![], true, Some("c"), Some(130))).collect();
-        let chain = Scripted::new(pages);
-        assert_eq!(child_under_hint(&chain, hint, input).await.unwrap(), HintChild::Unknown);
+        let chain = ours(pages);
+        assert_eq!(child_under_hint(&chain, hint, input, digest).await.unwrap(), HintChild::Unknown);
         // A chain that does not answer is an error, not a verdict.
-        assert!(child_under_hint(&crate::chia_chain::testing::Unanswering, hint, input).await.is_err());
+        assert!(child_under_hint(&crate::chia_chain::testing::Unanswering, hint, input, digest).await.is_err());
         assert_eq!(parse_hex32(&hex::encode(input.to_bytes())), Some(input));
         assert_eq!(parse_hex32("zz"), None);
         assert_eq!(parse_hex32("0011"), None, "the wrong length is no id");
+    }
+
+    /// The memo check: a coin listed under the hint with the write's input as
+    /// its parent is the write's only when the input's spend, fetched at the
+    /// coin's height, makes it by an output carrying the hint and the write's
+    /// memo. Every write from one input makes the same coin whatever its
+    /// hint, and a full node keeps the hint rows of an orphaned block, so the
+    /// coin made again by another write — under another hint, or under the
+    /// same one with another memo — can still be listed under ours: a stale
+    /// row, passed over, and the listing ends as it would without it.
+    #[tokio::test]
+    async fn the_child_under_the_hint_is_the_write_only_when_its_parents_spend_carries_the_hint_and_the_memo() {
+        use crate::chia_chain::testing::{memo_spend, spend_creating, Scripted};
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        use chia_protocol::Coin;
+        let input = Bytes32::new([7u8; 32]);
+        let (hint, other_hint) = (Bytes32::new([8u8; 32]), Bytes32::new([9u8; 32]));
+        let (memo, other_memo) = (b"our write".to_vec(), b"another write".to_vec());
+        let digest = memo_digest(&memo);
+        let child = Coin::new(input, Bytes32::new([1u8; 32]), 1);
+        let rec = |coin: Coin, height: u32| CoinRecord { coin, confirmed_block_index: height, spent: false, spent_block_index: 0 };
+        let page = |records: Vec<CoinRecord>, truncated: bool, next: Option<&str>| CoinListing { records, truncated, next_cursor: next.map(str::to_string), judged_at: Some(120) };
+        let ended = |records: Vec<CoinRecord>| page(records, false, None);
+        let listed = || Scripted::new(vec![ended(vec![rec(child, 101)])]);
+        // The verdict, and the spends asked for on the way to it.
+        let judge = |chain: Scripted, memo: Option<Bytes32>| async move {
+            let verdict = child_under_hint(&chain, hint, input, memo).await.map_err(|e| e.to_string());
+            let asked = chain.asked_spends.lock().unwrap().clone();
+            (verdict, asked)
+        };
+        let once = vec![(input, 101)];
+        let confirmed = Ok(HintChild::Confirmed { height: 101, judged_at: Some(120) });
+        let absent = Ok(HintChild::Absent { judged_at: Some(120) });
+        let unknown = Ok(HintChild::Unknown);
+        // The write's own output: confirmed by the digest, or by the hint
+        // alone for a mark an older node saved, which keeps no digest.
+        for given in [Some(digest), None] {
+            let chain = listed().with_spend(input, memo_spend(&child, hint, &memo));
+            assert_eq!(judge(chain, given).await, (confirmed.clone(), once.clone()), "{given:?}");
+        }
+        // The coin made again by a write under another hint (the row an
+        // orphaned block left): stale, digest or none. Run to its end the
+        // listing is absent; cut short with nowhere to go on, unknown.
+        for given in [Some(digest), None] {
+            let chain = listed().with_spend(input, memo_spend(&child, other_hint, &memo));
+            assert_eq!(judge(chain, given).await, (absent.clone(), once.clone()), "another hint, {given:?}");
+        }
+        let chain = Scripted::new(vec![page(vec![rec(child, 101)], true, None)]).with_spend(input, memo_spend(&child, other_hint, &memo));
+        assert_eq!(judge(chain, Some(digest)).await, (unknown.clone(), once.clone()), "cut short");
+        // The same hint and another memo (another write of ours under it, one
+        // wallet writing from two places): stale by the digest; with no
+        // digest, the hint alone takes it.
+        let chain = listed().with_spend(input, memo_spend(&child, hint, &other_memo));
+        assert_eq!(judge(chain, Some(digest)).await, (absent.clone(), once.clone()), "another memo");
+        let chain = listed().with_spend(input, memo_spend(&child, hint, &other_memo));
+        assert_eq!(judge(chain, None).await, (confirmed.clone(), once.clone()), "another memo, no digest: the hint alone");
+        // An output with the hint and no second memo carries nothing a reader opens.
+        let bare = spend_creating(&[(child.puzzle_hash, child.amount, vec![Bytes::new(hint.to_vec())])]);
+        assert_eq!(judge(listed().with_spend(input, bare), None).await, (absent.clone(), once.clone()), "the hint alone, no memo");
+        // The output carrying the write makes another coin (another puzzle
+        // hash, another amount): the spend does not make the coin listed, so
+        // the listing and the spend disagree, and nothing is judged.
+        for other in [Coin::new(input, Bytes32::new([2u8; 32]), 1), Coin::new(input, child.puzzle_hash, 2)] {
+            let chain = listed().with_spend(input, memo_spend(&other, hint, &memo));
+            assert_eq!(judge(chain, Some(digest)).await, (unknown.clone(), once.clone()), "{other:?}");
+        }
+        // No spend of the input at the coin's height: unknown. A spend not
+        // answered: an error, so no verdict this tick.
+        assert_eq!(judge(listed().with_no_spend(input), Some(digest)).await, (unknown.clone(), once.clone()), "no spend");
+        let (unanswered, asked) = judge(listed(), Some(digest)).await;
+        assert!(unanswered.is_err(), "{unanswered:?}");
+        assert_eq!(asked, once);
+        // One fetch per parent however many listed coins name it: another
+        // coin of the one spend under another hint (a stale row), then, on
+        // the next page, the write's own coin.
+        let stale = Coin::new(input, Bytes32::new([3u8; 32]), 1);
+        let memos = |hint: Bytes32, memo: &[u8]| vec![Bytes::new(hint.to_vec()), Bytes::new(memo.to_vec())];
+        let two = |ours: &[u8]| spend_creating(&[(stale.puzzle_hash, stale.amount, memos(other_hint, &other_memo)), (child.puzzle_hash, child.amount, memos(hint, ours))]);
+        let pages = || vec![page(vec![rec(stale, 101)], true, Some("c")), ended(vec![rec(child, 101)])];
+        assert_eq!(judge(Scripted::new(pages()).with_spend(input, two(&memo)), Some(digest)).await, (confirmed.clone(), once.clone()), "read on past a stale row");
+        assert_eq!(judge(Scripted::new(pages()).with_spend(input, two(&other_memo)), Some(digest)).await, (absent.clone(), once.clone()), "two stale rows");
+        let chain = Scripted::new(vec![ended(vec![rec(stale, 101), rec(child, 101)])]).with_spend(input, two(&memo));
+        assert_eq!(judge(chain, Some(digest)).await, (confirmed.clone(), once.clone()), "on one page");
+        // A later coin of the input's at another height than the spend was
+        // fetched at: the pages straddle a reorganization, nothing is judged.
+        let chain = Scripted::new(vec![page(vec![rec(stale, 101)], true, Some("c")), ended(vec![rec(child, 102)])]).with_spend(input, two(&memo));
+        assert_eq!(judge(chain, Some(digest)).await, (unknown, once), "another height");
+    }
+
+    /// The one condition walk ([`created_coins`]) lists every output of a
+    /// spend in order, with its memos; the writer's verdict takes the output
+    /// that makes a given coin ([`output_memos`]), and a reader still takes
+    /// the first output under its hint ([`extract_ciphertext`]), as before.
+    #[test]
+    fn the_shared_walk_lists_every_output_and_each_side_takes_its_own() {
+        use crate::chia_chain::testing::spend_creating;
+        let (hint, other_hint) = (Bytes32::new([8u8; 32]), Bytes32::new([9u8; 32]));
+        let ph = |n: u8| Bytes32::new([n; 32]);
+        let memos = |hint: Bytes32, memo: &[u8]| vec![Bytes::new(hint.to_vec()), Bytes::new(memo.to_vec())];
+        let spend = spend_creating(&[(ph(1), 1, memos(other_hint, b"a")), (ph(2), 5, vec![]), (ph(3), 1, memos(hint, b"b")), (ph(4), 1, memos(hint, b"c"))]);
+        let created = created_coins(&spend).unwrap();
+        assert_eq!(
+            created.iter().map(|c| (c.puzzle_hash, c.amount, c.memos.len())).collect::<Vec<_>>(),
+            vec![(ph(1), 1, 2), (ph(2), 5, 0), (ph(3), 1, 2), (ph(4), 1, 2)]
+        );
+        assert_eq!(extract_ciphertext(&spend, hint).unwrap(), Some(b"b".to_vec()), "a reader takes the first output under its hint");
+        assert_eq!(extract_ciphertext(&spend, Bytes32::new([10u8; 32])).unwrap(), None);
+        assert_eq!(output_memos(&spend, ph(4), 1).unwrap(), Some(memos(hint, b"c")), "the output that makes the coin");
+        assert_eq!(output_memos(&spend, ph(2), 5).unwrap(), Some(vec![]), "an output with no memos");
+        assert_eq!(output_memos(&spend, ph(4), 2).unwrap(), None, "no output makes that coin");
+        assert_eq!(hex::encode(memo_digest(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256");
+        // A spend that raises is an error for both sides.
+        let raises = PuzzleAndSolution { puzzle_reveal: chia_protocol::Program::from(vec![0xff, 0x08, 0x80]), solution: chia_protocol::Program::from(vec![0x80]) };
+        assert!(created_coins(&raises).is_err() && extract_ciphertext(&raises, hint).is_err());
     }
 
     /// Stage 4 design §4.4: a mark or a knock entry files one coin, and it is
