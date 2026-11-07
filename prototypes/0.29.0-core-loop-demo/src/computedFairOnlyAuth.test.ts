@@ -663,15 +663,30 @@ describe('what is not yet checked (pending)', () => {
     const again = resolveGame(held.env, T, P.inc, recordsOf(all));
     expect(again.base?.key).toBe(five.key);
     expect(again).toMatchObject({ pending: false, invalid: [forged.key] });
-    // Past the places there is one that could not be the base: it does not hold the pass.
+    // Past the places there is one that could not be the base, by its round or, on the same round, by its sweeps: it does not hold the pass.
     const one = trimOf(P, 'p', { u: 1, l: hex('9', 32) });
-    const low = resolve('p', [root, ...threes, forged, one], { liveSid: live, hold: [hashOf(forged)] });
-    expect(low.res.base?.ck.u).toBe(3);
-    expect(low.res.pending).toBe(false);
+    const same = trimOf(P, 'p', { n: { alice: '31', bob: '-31' } });
+    for (const [what, past] of [['a lower round', one], ['the same round and fewer sweeps', same]] as const) {
+      const low = resolve('p', [root, ...threes, forged, past], { liveSid: live, hold: [hashOf(forged)] });
+      expect(low.res.base?.ck.u, what).toBe(3);
+      expect(low.res.pending, what).toBe(false);
+    }
     // And with nothing put off, a full set of good ones is the limit S3 documents: nothing frees a place, so nothing waits.
     const full = resolve('p', [root, ...threes, trimOf(P, 'p', { b: live, w: 1, l: hex('d', 32) }), five], { liveSid: live });
     expect(full.res).toMatchObject({ pending: false, invalid: [] });
     expect(full.res.base?.ck.u).toBe(3);
+  });
+
+  it('a checkpoint that failed is not one left unlooked at: with another put off under the base, the pass is settled', () => {
+    const root = rootOf(P, 'p');
+    const states = [0, 1, 2, 3].map((i) => trimOf(P, 'p', { n: { alice: `${20 + i}`, bob: `-${20 + i}` } }));
+    const byId = [...states].sort((a, b) => (a.key < b.key ? -1 : 1));
+    // a forged checkpoint of a higher round fails, and takes no place, and the highest id of the round is put off
+    const forged = changed(P, trimOf(P, 'p', { u: 9, l: hex('e', 32) }), { g: BAD_SIG });
+    const held = resolve('p', [root, ...states, forged], { hold: [hashOf(byId[3])] });
+    expect(held.res.invalid).toEqual([forged.key]);
+    expect(held.res.base?.key).toBe(byId[0].key);
+    expect(held.res.pending).toBe(false);
   });
 
   it('a transfer put off leaves the chain where it was, and the pass pending', () => {
