@@ -138,8 +138,11 @@ export interface Resolution {
   fin: FinRec | null;
   /** S7: there is a base and it isn't an end. */
   live: boolean;
-  /** Doc keys of records whose id or signature fails under the key they
-   *  claim (`ck:` and `xf:` only): delete them. */
+  /** Doc keys of records that are whole (their shape is right and their id is
+   *  the one in the key) and whose signature fails under the key they claim
+   *  (`ck:` and `xf:` only): delete them. A record whose shape or id is wrong is
+   *  junk and is never listed: readers pass it over, and authority can depend on
+   *  a record that is still being put back. */
   invalid: readonly string[];
   /** A check was put off, and its answer could still change this one. */
   pending: boolean;
