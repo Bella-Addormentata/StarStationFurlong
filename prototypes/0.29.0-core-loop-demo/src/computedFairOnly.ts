@@ -58,7 +58,8 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import {
-  canon, hasFields, isCarry, isHex32, isHex64, isHouseSumOutcome, isNet, isPid, isPlain, isPub, isSig, MAX_TABLE_PIDS, signBytes, U_MAX,
+  canon, hasFields, isCarry, isHex32, isHex64, isHouseSumOutcome, isNet, isPid, isPlain, isPub, isSig, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS,
+  nextSid3, signBytes, U_MAX, utf8Length, wellFormed,
 } from './computedFold';
 import type { Checkpoint, FoldCtx } from './computedFold';
 import type { CrapsCarry } from './computedCraps';
@@ -83,14 +84,11 @@ export const isKnownRv = (rv: string): boolean => KNOWN_RV.has(rv);
  *  40-digit nets, a craps carry and the transfers weigh some 1.3 MB at the
  *  very worst (the specs build that game). */
 export const MAX_CHECKPOINT_BYTES = 1.5 * 1024 * 1024;
-/** The UTF-8 bytes the ids of a game's players may total, beside
- *  MAX_TABLE_PIDS (its checkpoint's nets and every slip its session froze): a
- *  close that would pass it is invalid (S6 (e), the fold's, PR 6c-3). An id
- *  is up to 256 UTF-16 units, up to 768 bytes, so without this 4,000 of them
- *  could take a checkpoint past MAX_CHECKPOINT_BYTES and no trim could be
- *  written. An honest id is a 43-character key: this is some 6 times what
- *  4,000 of those take. */
-export const MAX_TABLE_PID_BYTES = 1_000_000;
+// MAX_TABLE_PID_BYTES (the UTF-8 bytes the ids of a game's players may total,
+// S6 (e)) and nextSid3 live in computedFold, which needs them: the fold is
+// bundled for the node and must not reach this file's records. They are
+// re-exported so this stays the one place the records' callers look.
+export { MAX_TABLE_PID_BYTES, nextSid3 };
 /** Transfers of authority a game's chain follows. */
 export const MAX_TRANSFERS = 8;
 /** A deed offer made before the game opened can't move it (a sale-back
@@ -219,21 +217,6 @@ export function xfId(value: unknown): string | null {
   return c === null ? null : bytesToHex(sha256(utf8ToBytes(`ssf-xf-id-v1|${c}`))).slice(0, 32);
 }
 
-/** The live session after a FAIR ONLY checkpoint: the first 24 hex of
- *  sha256("ssf-ct-sid-v3|" + canon({room, t, inc, b, u, w, l, d, o, n, e, s, h})),
- *  absent fields left out. It leaves out `ok`, `j`, `rv`, `ts` (bound through
- *  `inc`) and `k`, `g`, `f`, `dl`, `x`, so two authorities signing the same
- *  state open the same session, which is what lets a transfer keep the game
- *  going. Unlike computedFold's nextSid it binds the room, and `w` gives a
- *  sweep a session of its own. */
-export function nextSid3(ctx: FoldCtx, cp: Pick<CkRec, 'b' | 'u' | 'w' | 'l' | 'd' | 'o' | 'n' | 'e' | 's' | 'h'>): string {
-  const c = canon({
-    room: ctx.room, t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, w: cp.w, l: cp.l, d: cp.d, o: cp.o, n: cp.n, e: cp.e, s: cp.s, h: cp.h,
-  });
-  if (c === null) throw new TypeError('nextSid3: the checkpoint must be canonical');
-  return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v3|${c}`))).slice(0, 24);
-}
-
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
 export const ckKey = (t: string, inc: string, id: string): string => `ck:${t}:${inc}:${id}`;
@@ -268,18 +251,6 @@ export function parseFairOnlyKey(key: string): FairOnlyKey | null {
 
 /** Nesting a record may have and still be weighed (the Rust twin's MAX_DEPTH). */
 export const MAX_WEIGHT_DEPTH = 16;
-
-function utf8Length(s: string): number {
-  let n = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 0x80) n += 1;
-    else if (c < 0x800) n += 2;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { n += 4; i++; }
-    else n += 3; // a BMP character, or a lone surrogate (TextEncoder writes U+FFFD)
-  }
-  return n;
-}
 
 /** About what a value weighs as JSON — the Rust twin of house_bytes.rs
  *  `weight`, so a page and the node agree on which record is too heavy to
@@ -345,25 +316,6 @@ const RV = /^[a-z][a-z0-9]{0,7}$/;
 const CK_D = /^[hz]:[0-9a-f]{32}$/;
 
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
-
-/** Whether `s` has no unpaired surrogate. Yjs writes a string as UTF-8, which
- *  has none, so a peer reads U+FFFD where this page holds one, and nothing
- *  signed or hashed over the text (an offer maker's signature, the id and the
- *  signature of a checkpoint that names a player by it) would hold there: the
- *  page that wrote it would count a record no other page can read. */
-function wellFormed(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff) {
-      const d = s.charCodeAt(i + 1); // NaN past the end
-      if (!(d >= 0xdc00 && d <= 0xdfff)) return false;
-      i++;
-    } else if (c >= 0xdc00 && c <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
-}
 
 const isText = (v: unknown): v is string => typeof v === 'string' && v.length <= MAX_OFFER_TEXT && wellFormed(v);
 
