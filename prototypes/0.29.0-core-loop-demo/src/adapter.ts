@@ -1507,7 +1507,13 @@ export function setVestibuleOpacity(group: THREE.Group, opacity: number): void {
       if (!mat || seen.has(mat)) continue;
       seen.add(mat);
       mat.opacity = opacity;
-      mat.transparent = transparent;
+      // three.js compiles an opaque material with its alpha forced to 1 and
+      // doesn't recompile on a `transparent` flip alone, so a tube first drawn
+      // solid (the airlock's arrival tube) would never fade again.
+      if (mat.transparent !== transparent) {
+        mat.transparent = transparent;
+        mat.needsUpdate = true;
+      }
     }
   });
   group.userData.opacity = opacity;

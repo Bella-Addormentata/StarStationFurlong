@@ -336,6 +336,18 @@ import {
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw, getCameraForwardYaw, addStationBias, resetStationBias } from "./cameraRig";
+import {
+  blocksRoomView,
+  boxCorners,
+  EntryReveal,
+  isoCameraDir,
+  isoModuleTarget,
+  isoVestibuleTarget,
+  poseFootprint,
+  type CamDir,
+  type RoomHalf,
+  type XZPoint,
+} from "./isoSurroundings";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -544,6 +556,27 @@ export class World {
   private static readonly VESTIBULE_BASE_OPACITY = 0;
   /** Proximity fade range (m from the door's front stand-point). */
   private static readonly VESTIBULE_FADE_RANGE = 4.0;
+  /** 🏙️ The door whose tube the pointer rests on in the iso room view (out
+   *  past the floor grid — main.ts's hover pass), or null. */
+  private hoveredVestibuleDoorId: string | null = null;
+  /** 🏙️ The room-entry reveal: everything around the room solid for a moment
+   *  on arrival, then the near side fades (isoSurroundings.ts). */
+  private surroundReveal = new EntryReveal();
+  /** 🏙️ The room the reveal last started for, and last frame's zoom level
+   *  (a step in from the station view counts as entering). */
+  private surroundRoomId = "";
+  private surroundLastZoom = 0;
+  /** 🏙️ Each neighbour shell's current opacity, by room id, so a rebuild of
+   *  the shells (every atlas change) carries on where the last one was. */
+  private shellOpacity = new Map<string, number>();
+  /** 🏙️ Scratch box for a tube's footprint (one per frame per tube). */
+  private readonly vestibuleBox = new THREE.Box3();
+  /** First-person resting opacity of the neighbour shells (out a window). */
+  private static readonly FP_SHELL_OPACITY = 0.85;
+  /** 🏙️ How fast something fades AWAY in the iso room view (per second);
+   *  coming in uses the faster 6. Slow enough that the near side is seen to
+   *  fade after the entry reveal. */
+  private static readonly ISO_FADE_OUT_RATE = 3;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{
@@ -1410,18 +1443,35 @@ export class World {
       // Pure BACKDROP — deliberately NOT `isAtlasModule` (that flag routes the
       // exterior view's click-to-connect); you can't interact with a neighbour
       // from inside your own room, so it must never become a click target.
-      mod.userData = { isFpNeighbour: true, roomId: pose.roomId };
+      // 🏙️ hops + footprint: the iso room view shows the adjacent modules
+      // (hops 1), solid unless they stand between the camera and the room.
+      const half = { halfX: nd.cols * 3, halfZ: nd.rows * 3 };
+      mod.userData = {
+        isFpNeighbour: true,
+        roomId: pose.roomId,
+        hops: pose.hops,
+        footprint: poseFootprint(pose, half),
+      };
+      // Built solid; updateNeighbourShells sets each module's opacity per
+      // view (translucent out a first-person window, solid or gone in iso).
       const shell = buildOctagonShell(
-        { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
-        { opacity: 0.85 },
+        half,
+        {},
         {},
         pose.cupola ?? null, // 🔭 its cupola end walls, when gossiped
       );
       this.disableFog(shell.group); // stay crisp at station distances
+      World.noteBaseOpacity(shell.group);
       mod.add(shell.group);
       mod.position.set(pose.x, 0, pose.z);
       mod.rotation.y = pose.rotY;
+      World.setShellOpacity(mod, this.shellOpacity.get(pose.roomId) ?? 0);
       g.add(mod);
+    }
+    // Forget the opacity of modules no longer laid out.
+    const laidOut = new Set(poses.map((p) => p.roomId));
+    for (const id of [...this.shellOpacity.keys()]) {
+      if (!laidOut.has(id)) this.shellOpacity.delete(id);
     }
     // 🔗 neighbour↔neighbour connector tubes. The current room's OWN tubes are
     // already drawn into platformGroup (paired-vestibule path) and show through
@@ -1467,6 +1517,9 @@ export class World {
         this.disableFog(chain);
         const wrap = new THREE.Group();
         wrap.name = `fpAtlasConnector-${fromId}-${doorId}`;
+        // 🏙️ Shown out a first-person window only: in the iso room view they
+        // would join modules that view does not draw.
+        wrap.userData = { isFpConnector: true };
         wrap.add(chain);
         wrap.position.set(fromPose.x, 0, fromPose.z);
         wrap.rotation.y = fromPose.rotY;
@@ -1475,6 +1528,142 @@ export class World {
     }
     this.fpNeighbourShells = g;
     this.platformGroup.add(g);
+  }
+
+  /** 🏙️ Remember each material's own opacity (glass is 0.18) before the
+   *  module's opacity is first set, so setShellOpacity can scale it. */
+  private static noteBaseOpacity(obj: THREE.Object3D): void {
+    obj.traverse((o) => {
+      const matField = (o as THREE.Mesh).material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        if (m && m.userData.baseOpacity === undefined) m.userData.baseOpacity = m.opacity;
+      }
+    });
+  }
+
+  /** 🏙️ Set one neighbour module's opacity: every material at its own
+   *  opacity times `k`, opaque only at full strength (glass stays glass), and
+   *  the module hidden outright once it has faded away. */
+  private static setShellOpacity(mod: THREE.Object3D, k: number): void {
+    mod.traverse((o) => {
+      const matField = (o as THREE.Mesh).material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        if (!m) continue;
+        const base = (m.userData.baseOpacity as number | undefined) ?? 1;
+        m.opacity = base * k;
+        const transparent = m.opacity < 0.999;
+        // three.js compiles an opaque material with its alpha forced to 1 and
+        // doesn't recompile on a `transparent` flip alone: without this, a
+        // shell first drawn solid would stay solid all through its fade.
+        if (m.transparent !== transparent) {
+          m.transparent = transparent;
+          m.needsUpdate = true;
+        }
+      }
+    });
+    mod.visible = k > 0.005;
+    mod.userData.opacity = k;
+  }
+
+  /**
+   * 🏙️ Drive the neighbour shells for the view (owner request). Out a
+   * first-person window: every module the atlas knows, translucent, with the
+   * tubes between them. In the iso room view: only the ADJACENT modules
+   * (hops 1), solid when they sit behind or beside the room, faded away when
+   * they stand between the camera and the room, except while the room-entry
+   * reveal holds everything solid. Hidden in the exterior views (which draw
+   * their own), during the morph and in hull edit.
+   */
+  private updateNeighbourShells(
+    deltaTime: number,
+    zoomLevel: number,
+    revealing: boolean,
+    cam: CamDir,
+    room: RoomHalf,
+  ): void {
+    const g = this.fpNeighbourShells;
+    if (!g) return;
+    g.visible = zoomLevel <= 2 && !this.isMorphing && !this.hullEditView;
+    if (!g.visible) return;
+    const iso = zoomLevel === 2;
+    // A change of view snaps (the camera itself jumps); within a view, fade.
+    const snap = zoomLevel !== this.surroundLastZoom;
+    for (const child of g.children) {
+      const ud = child.userData as {
+        isFpConnector?: boolean;
+        isFpNeighbour?: boolean;
+        roomId?: string;
+        hops?: number;
+        footprint?: XZPoint[];
+      };
+      if (ud.isFpConnector) {
+        child.visible = !iso;
+        continue;
+      }
+      if (!ud.isFpNeighbour || !ud.roomId) continue;
+      let target: number;
+      if (!iso) target = World.FP_SHELL_OPACITY;
+      else if (ud.hops !== 1 || !ud.footprint) target = 0;
+      else {
+        target = isoModuleTarget({
+          blocks: blocksRoomView(ud.footprint, room, cam),
+          revealing,
+        });
+      }
+      const current = this.shellOpacity.get(ud.roomId) ?? 0;
+      let next = target;
+      if (!snap && current !== target) {
+        const rate = target < current && iso ? World.ISO_FADE_OUT_RATE : 6;
+        next = current + (target - current) * Math.min(1, rate * deltaTime);
+        if (Math.abs(next - target) < 0.005) next = target;
+      }
+      if (next === current && child.userData.opacity === next) continue;
+      this.shellOpacity.set(ud.roomId, next);
+      World.setShellOpacity(child, next);
+    }
+  }
+
+  /**
+   * 🏙️ Is the room-entry reveal on this frame? It starts when the room
+   * changes under the iso room view (a door, a pass, a beam-in) or the view
+   * steps in from the station view, holds while the arrival is still going
+   * on (the swap's curtain, the walk-in), and ends REVEAL_HOLD_MS after.
+   */
+  private tickSurroundReveal(zoomLevel: number): boolean {
+    const now = performance.now();
+    const roomId = World.activeRoomId();
+    if (roomId !== this.surroundRoomId) {
+      this.surroundRoomId = roomId;
+      this.hoveredVestibuleDoorId = null; // that door was the last room's
+      if (zoomLevel === 2) this.surroundReveal.start(now);
+    }
+    if (zoomLevel === 2 && this.surroundLastZoom >= 3) this.surroundReveal.start(now);
+    if (zoomLevel !== 2) {
+      this.surroundReveal.cancel();
+      this.hoveredVestibuleDoorId = null;
+      return false;
+    }
+    // Busy: a door walk (the walk-in), the swap's curtain, or a clone-vat
+    // spawn (a beam-in or the boot entry walks out of the vat).
+    const busy =
+      this.player.getActiveDoorId() !== null ||
+      this.player.isVatSpawning() ||
+      (this.isTransitBusy?.() ?? false);
+    return this.surroundReveal.update(now, busy);
+  }
+
+  /** 🏙️ main.ts's hover pass: the door whose tube the pointer rests on, out
+   *  past the floor grid in the iso room view, or null. */
+  public setHoveredVestibule(doorId: string | null): void {
+    this.hoveredVestibuleDoorId = doorId;
   }
 
   /** 🛑🛰️ #80 S5: rebuild the FP neighbour shells when the atlas changes (a
@@ -4130,14 +4319,9 @@ export class World {
     this.dockingSystem?.syncPlacementView(zoomLevel);
 
     // 🛑🛰️ #80 S5: the neighbour-module shells (the station seen OUT a window)
-    // show ONLY in first person — hidden in the iso room view (zoomLevel 2) and
-    // the exterior atlas (zoomLevel ≥ 3, which draws its own shells), and during
-    // the morph lerp / hull-edit. `zoomLevel <= 1` is the same L1-vs-L2
-    // discriminator the skylight/roof cutaway uses.
-    if (this.fpNeighbourShells) {
-      this.fpNeighbourShells.visible =
-        zoomLevel <= 1 && !this.isMorphing && !this.hullEditView;
-    }
+    // are driven with the paired-door tubes further down (🏙️ updateNeighbourShells):
+    // the whole station in first person, the adjacent modules in the iso room
+    // view, none in the exterior atlas (zoomLevel ≥ 3, which draws its own).
 
     // Animate station planet (rotation + gentle floating)
     if (this.stationPlanet) {
@@ -4320,7 +4504,16 @@ export class World {
     // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
     // (Supersedes the old transitVestibule visibility line #45 sat next to.)
-    this.updatePairedVestibules(deltaTime, zoomLevel);
+    // 🏙️ …and, in the iso room view, the far side solid, the near side
+    // faded, everything solid for a moment on entering (isoSurroundings.ts).
+    {
+      const revealing = this.tickSurroundReveal(zoomLevel);
+      const cam = isoCameraDir(getCameraYaw());
+      const room = roomHalfExtents();
+      this.updatePairedVestibules(deltaTime, zoomLevel, revealing, cam, room);
+      this.updateNeighbourShells(deltaTime, zoomLevel, revealing, cam, room);
+      this.surroundLastZoom = zoomLevel;
+    }
     this.updateFirstPersonAutoDoors(zoomLevel);
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
@@ -5477,7 +5670,13 @@ export class World {
     if (!crossing) this.fpTransitArmed = true;
   }
 
-  private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
+  private updatePairedVestibules(
+    deltaTime: number,
+    zoomLevel: number,
+    revealing: boolean,
+    cam: CamDir,
+    room: RoomHalf,
+  ): void {
     const ds = this.dockingSystem;
     if (!ds) return;
     this.drainOrphanVestibules(); // 🚪 #91: retry deferred removed-door tubes
@@ -5541,6 +5740,8 @@ export class World {
       vestibule.visible = zoomLevel < 4 && !this.isMorphing;
       if (!vestibule.visible) continue;
 
+      const crossing =
+        this.transitVestibuleDoorId === door.id || activeDoorId === door.id;
       let target: number;
       if (ghost) {
         target = 0.35; // #62 P4: armed-but-unpaired chain — fixed ghost preview
@@ -5554,10 +5755,7 @@ export class World {
         // "a few of the vestibules are missing or invisible … it seems to
         // change based on which module you are in").
         target = 1.0;
-      } else if (
-        this.transitVestibuleDoorId === door.id ||
-        activeDoorId === door.id
-      ) {
+      } else if (crossing) {
         target = 1.0; // transit / walk-through in progress — fully material
       } else {
         const dist = Math.hypot(
@@ -5572,10 +5770,31 @@ export class World {
         target =
           World.VESTIBULE_BASE_OPACITY + t * (1 - World.VESTIBULE_BASE_OPACITY);
       }
+      // 🏙️ The iso room view (owner request): a tube that does not stand
+      // between the camera and the room (the far side, or off to a side) is
+      // solid; a near one keeps the fade above, shows half solid under the
+      // pointer, and is solid while the room-entry reveal holds. The ghost
+      // preview keeps its fixed look.
+      if (zoomLevel === 2 && !ghost) {
+        const b = this.vestibuleBox.setFromObject(vestibule);
+        target = isoVestibuleTarget({
+          blocks: blocksRoomView(
+            boxCorners(b.min.x, b.max.x, b.min.z, b.max.z),
+            room,
+            cam,
+          ),
+          revealing,
+          crossing,
+          hovered: this.hoveredVestibuleDoorId === door.id,
+          proximity: target,
+        });
+      }
 
       const current = (vestibule.userData.opacity as number) ?? 0;
       if (current === target) continue;
-      let next = current + (target - current) * Math.min(1, 6 * deltaTime);
+      const rate =
+        zoomLevel === 2 && target < current ? World.ISO_FADE_OUT_RATE : 6;
+      let next = current + (target - current) * Math.min(1, rate * deltaTime);
       if (Math.abs(next - target) < 0.005) next = target;
       setVestibuleOpacity(vestibule, next);
     }
