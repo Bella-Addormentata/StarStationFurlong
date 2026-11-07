@@ -396,7 +396,7 @@ import {
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
-  bindFloorPlan, subscribeFloorPlan, readRoomDims, endCupolaWalls,
+  bindFloorPlan, subscribeFloorPlan, readRoomDims, endCupolaWalls, roomHalfExtents,
 } from "./floorPlanDoc";
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
@@ -11783,6 +11783,7 @@ function setupClickToEnter() {
     // Point-and-click navigation arms only once the world is actually
     // visible — intro clicks can never raycast through the curtain.
     window.addEventListener("click", onCanvasClick);
+    window.addEventListener("pointermove", onCanvasPointerMove); // 🏙️ tube hover
   };
 
   // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
@@ -11990,6 +11991,60 @@ function pickTvSet(scene: THREE.Scene, ray: THREE.Raycaster): string | null {
   return deviceId;
 }
 
+/** 🏙️ Does the ray meet the ground outside the current room's floor grid
+ *  (or never meet it)? Out there a click or a hover is about a door's tube. */
+function rayLandsPastFloor(ray: THREE.Ray): boolean {
+  const groundT = -ray.origin.y / ray.direction.y;
+  if (!(groundT > 0)) return true;
+  const gx = ray.origin.x + ray.direction.x * groundT;
+  const gz = ray.origin.z + ray.direction.z * groundT;
+  const { halfX, halfZ } = roomHalfExtents();
+  return Math.abs(gx) > halfX || Math.abs(gz) > halfZ;
+}
+
+/**
+ * 🏙️ The iso room view's hover pass (owner request): a near-side tube the
+ * pointer rests on, out past the floor grid, shows half solid, so you can see
+ * the door a click there walks you through (the click pass above). Coalesced
+ * to one raycast a frame; only the room's own paired-door tubes are tested.
+ */
+let hoverPointer: { x: number; y: number; onCanvas: boolean } | null = null;
+let hoverQueued = false;
+const hoverRaycaster = new THREE.Raycaster();
+const hoverNdc = new THREE.Vector2();
+function onCanvasPointerMove(event: PointerEvent): void {
+  hoverPointer = {
+    x: event.clientX,
+    y: event.clientY,
+    onCanvas: event.target === window.gameRenderer?.renderer?.domElement,
+  };
+  if (hoverQueued) return;
+  hoverQueued = true;
+  requestAnimationFrame(() => {
+    hoverQueued = false;
+    world?.setHoveredVestibule(hoveredVestibuleDoor());
+  });
+}
+function hoveredVestibuleDoor(): string | null {
+  const p = hoverPointer;
+  const api = window.gameRenderer;
+  if (!p || !p.onCanvas || !hasEntered || !api || !world) return null;
+  if (!multiScaleZoom || multiScaleZoom.getLevel() !== 2) return null;
+  if (roomEdit.isEditModeActive() || isDeviceFocusActive() || world.getAirlockScene()) return null;
+  hoverNdc.set((p.x / window.innerWidth) * 2 - 1, -(p.y / window.innerHeight) * 2 + 1);
+  hoverRaycaster.setFromCamera(hoverNdc, api.camera);
+  if (!rayLandsPastFloor(hoverRaycaster.ray)) return null;
+  const groups = [...world.getPairedVestibuleGroups().entries()];
+  const hit = hoverRaycaster.intersectObjects(groups.map(([, g]) => g), true)[0];
+  if (!hit) return null;
+  for (const [doorId, group] of groups) {
+    let node: THREE.Object3D | null = hit.object;
+    while (node && node !== group) node = node.parent;
+    if (node) return doorId;
+  }
+  return null;
+}
+
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
   // 🚪🔒 Sealed in the airlock the room on screen is a stand-in: nothing to click.
@@ -12160,14 +12215,12 @@ function onCanvasClick(event: MouseEvent): void {
   //    hit the tube outside, turning wall clicks into surprise walkthroughs.
   //    In-room clicks stay floor clicks: the tubes are translucent and a
   //    near-side tube visually overlaps interior floor, so the pass only
-  //    claims clicks whose ground point lands OUTSIDE the wall footprint —
-  //    out where the tube actually lives (hull.WALL_LINE = 6).
+  //    claims clicks whose ground point lands OUTSIDE the floor grid —
+  //    out where the tube actually lives (🏙️ the room's own size now, not
+  //    the 6 m of the old fixed room: a bigger room's near-wall floor stays
+  //    a floor click).
   if (multiScaleZoom && multiScaleZoom.getLevel() === 2) {
-    const groundT = -raycaster.ray.origin.y / raycaster.ray.direction.y;
-    const gx = raycaster.ray.origin.x + raycaster.ray.direction.x * groundT;
-    const gz = raycaster.ray.origin.z + raycaster.ray.direction.z * groundT;
-    const insideRoom = groundT > 0 && Math.abs(gx) <= 6 && Math.abs(gz) <= 6;
-    if (!insideRoom) {
+    if (rayLandsPastFloor(raycaster.ray)) {
       const vestibuleGroups: THREE.Object3D[] = [];
       scene.traverse((child) => {
         if (
