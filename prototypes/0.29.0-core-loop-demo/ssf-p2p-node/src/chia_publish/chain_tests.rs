@@ -451,6 +451,47 @@ async fn a_write_evicted_from_a_full_mempool_stays_parked_and_lands_once_the_mem
     assert!(s.chain.unanswered().is_empty());
 }
 
+/// A write the lease probed while it sat in both mempools (which takes its
+/// name out of the seen caches) and that both then evicted meets two nodes
+/// too busy to validate it in time: the next probe hears
+/// INVALID_SPEND_BUNDLE from both, a soft failure and no final word, so the
+/// coin stays parked under its own number and nothing is freed. Once the
+/// nodes are no longer busy, the probe pushes the saved fee-0 bundle and it
+/// lands.
+#[tokio::test]
+async fn a_write_both_busy_nodes_refuse_stays_parked_and_lands_once_they_are_not_busy() {
+    let mut s = setup().await;
+    let (payer, node) = (wallet(15), iroh::SecretKey::generate());
+    let coin = s.chain.fund(our_puzzle_hash(&payer), 1000, None);
+    let funded = s.chain.farm().await;
+    let (hint, bundle) = presence_write(&payer, &node, &CK, coin, 0);
+    s.push(&payer, &bundle, (coin.coin_id(), funded)).await.unwrap();
+    let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
+    assert_eq!((s.chain.mempool_on(&s.a), s.chain.mempool_on(&s.b)), (vec![bundle.name()], vec![bundle.name()]));
+    s.reconcile().await;
+    assert!(s.lease.is_parked(&coin.coin_id()), "live in the mempool");
+    s.chain.evict_all();
+    s.chain.set_busy(&s.a, true);
+    s.chain.set_busy(&s.b, true);
+    s.reconcile().await;
+    assert!(s.lease.is_parked(&coin.coin_id()), "a busy node's refusal is no final word");
+    assert_eq!(s.lease.spend_of(&coin.coin_id()), Some(spend), "nothing freed: parked under its own number");
+    let busy = (FAILED, Some("INVALID_SPEND_BUNDLE".to_string()));
+    assert_eq!(s.chain.acks_for(bundle.name()).split_off(4), vec![busy; 2]);
+    s.chain.farm().await;
+    assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, None);
+
+    s.chain.set_busy(&s.a, false);
+    s.chain.set_busy(&s.b, false);
+    s.reconcile().await;
+    assert_eq!(s.chain.mempool(), vec![bundle.name()], "the probe pushed the saved bundle");
+    let landed = s.chain.farm().await;
+    assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    assert_eq!(s.chain.fee_of(&bundle), 0, "no fee added");
+    assert_eq!(s.sent(), HashSet::from([bundle.name()]), "the saved bundle, never built again");
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// A reorganisation drops the block holding a write the lease had released
 /// as spent and kept settling: the next reconciliation finds its input
 /// unspent and parks the spend again, the write reads pending, and the

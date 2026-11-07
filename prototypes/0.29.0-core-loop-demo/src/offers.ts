@@ -20,36 +20,16 @@
  */
 import * as Y from 'yjs';
 import { getIdentityPub, signIdentity, verifyIdentity } from './keypair';
+import { offerSignBytes } from './offerBytes';
+import type { OfferAsset, TransferOffer } from './offerBytes';
 import {
   ventureRecord, isOfficeHere, transferShares, writeVentureLink,
   removeVentureLink, ventureLedger, type VentureLedgerEntry,
 } from './ventures';
 
-export type OfferAsset =
-  | { kind: 'deed'; roomId: string; roomName: string }
-  | { kind: 'shares'; ventureId: string; ventureName: string; officeRoomId: string; count: number };
-
-export interface TransferOffer {
-  v: 1;
-  kind: 'transfer-offer';
-  asset: OfferAsset;
-  makerPub: string;      // Ed25519 identity of the current holder (base64url)
-  makerName: string;     // display; signed so a doctored preview can't rename the maker
-  /** DIRECTED offer: only this identity may redeem. Absent ⇒ BEARER offer
-   *  (first redeemer takes it — exactly a Chia offer file's semantics). */
-  toPub?: string;
-  /** COMPANY recipient (deed offers only): redeeming assigns the module to
-   *  this venture as property. Redeemer must hold its shares. */
-  toVentureId?: string;
-  toVentureName?: string;
-  /** Asking price. v1: MUST be 0 (gift). Non-zero parses but is refused at
-   *  redemption — priced offers arrive with the Registry. */
-  price: number;
-  issuedAt: number;
-  expiresAt: number;     // required — lost clipboard scraps must not haunt a module
-  nonce: string;         // random one-time id — the replay-protection key
-  sig: string;           // maker's signature over the canonical bytes
-}
+// The offer's shape and the bytes its maker signs live in offerBytes.ts (pure),
+// so a module that only recomputes them needn't pull in the doc binding below.
+export type { OfferAsset, TransferOffer } from './offerBytes';
 
 export const OFFER_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -83,33 +63,6 @@ export function subscribeOffers(listener: () => void): () => void {
 
 function docAlive(): boolean {
   return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && offersYMap !== null;
-}
-
-// ── Canonical sign-bytes (domain-tagged, explicit key order — the
-//    contact-card recipe: `?? null` normalization on BOTH sign and verify) ────
-
-function assetCanonical(a: OfferAsset): unknown {
-  return a.kind === 'deed'
-    ? { kind: 'deed', roomId: a.roomId, roomName: a.roomName }
-    : { kind: 'shares', ventureId: a.ventureId, ventureName: a.ventureName,
-        officeRoomId: a.officeRoomId, count: a.count };
-}
-
-function offerSignBytes(o: Omit<TransferOffer, 'sig'>): Uint8Array {
-  const canonical = JSON.stringify({
-    k: 'ssf-transfer-offer:v1',
-    asset: assetCanonical(o.asset),
-    makerPub: o.makerPub,
-    makerName: o.makerName,
-    toPub: o.toPub ?? null,
-    toVentureId: o.toVentureId ?? null,
-    toVentureName: o.toVentureName ?? null,
-    price: o.price,
-    issuedAt: o.issuedAt,
-    expiresAt: o.expiresAt,
-    nonce: o.nonce,
-  });
-  return new TextEncoder().encode(canonical);
 }
 
 function mintNonce(): string {

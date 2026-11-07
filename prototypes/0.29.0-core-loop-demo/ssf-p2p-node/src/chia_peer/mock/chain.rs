@@ -29,6 +29,20 @@
 //!     pending cache for height-locked spends and its conflict cache, and the
 //!     order in which `add_transaction` and `validate_spend_bundle` judge a
 //!     bundle and the `TransactionAck` each verdict gives;
+//!   - a node too busy to validate a bundle in time
+//!     ([`MockChain::set_busy`]): `pre_validate_spendbundle` raises a
+//!     `ValueError` when the CLVM run and the signature check took longer
+//!     than the node's `validation_timeout` (2 s by default), or longer than
+//!     0.1 s at more than 5 × `validation_timeout` ns per unit of execution
+//!     and condition cost (10 ns by default), which for a bundle under 10
+//!     million cost (a standard spend is some 3 million) is any run over
+//!     0.1 s; `add_transaction` answers either FAILED INVALID_SPEND_BUNDLE
+//!     as a soft failure, the bundle left out
+//!     of the seen cache and the mempool as it was. The refusal comes where
+//!     that check does: after the mempool (SUCCESS) and the seen cache
+//!     (ALREADY_INCLUDING_TRANSACTION) are looked in, and after the CLVM
+//!     run and the signature check passed, since a bundle they refuse is
+//!     refused by its own name however long they took;
 //!   - each new block on the fast path of `new_peak` (the items it spent
 //!     leave the mempool and the seen cache, then the caches are tried
 //!     again), and a reorganisation on the slow path (a new mempool, the seen
@@ -598,6 +612,8 @@ struct NodeState {
     /// took, kept through every rewind and reorganisation.
     hints: HashSet<(Bytes32, Bytes)>,
     held: Option<Chain>,
+    /// Too busy to validate a bundle in time ([`MockChain::set_busy`]).
+    busy: bool,
 }
 
 /// One `TransactionAck` a node sent.
@@ -645,13 +661,15 @@ impl Model {
     /// `send_transaction` and `add_transaction` on one node, in their order:
     /// a bundle in the mempool is SUCCESS and leaves the seen cache; one in
     /// the seen cache is ALREADY_INCLUDING_TRANSACTION; one pre-validation
-    /// refuses stays in the seen cache, refused; one it passes enters the
-    /// seen cache and is judged, and leaves it again unless it is taken.
+    /// refuses stays in the seen cache, refused; one it passes on a busy node
+    /// is refused INVALID_SPEND_BUNDLE and not remembered (pre-validation's
+    /// timeout); else it enters the seen cache and is judged, and leaves it
+    /// again unless it is taken.
     fn send_transaction(&mut self, node: usize, bundle: SpendBundle) -> (u8, Option<String>) {
         let name = bundle.name();
         let net = self.net;
         let Model { chain, nodes, arrivals, .. } = self;
-        let NodeState { pool, held, .. } = &mut nodes[node];
+        let NodeState { pool, held, busy, .. } = &mut nodes[node];
         let view = held.as_ref().unwrap_or(chain);
         if pool.holds(&name) {
             pool.remove_seen(&name);
@@ -671,6 +689,12 @@ impl Model {
                 return (FAILED, Some(err_name(code)));
             }
         };
+        if *busy {
+            // Pre-validation ran too long (either of its two timeouts): a
+            // soft failure (a `ValueError`), refused, not remembered, the
+            // mempool as it was.
+            return (FAILED, Some(err_name(ErrorCode::InvalidSpendBundle)));
+        }
         if conds.execution_cost + conds.condition_cost == 0 {
             // A soft failure (a `ValueError`): refused, not remembered.
             return (FAILED, Some(err_name(ErrorCode::InvalidSpendBundle)));
@@ -1126,7 +1150,7 @@ impl MockChain {
             let mut model = self.lock();
             let announce = watch::Sender::new(model.announced);
             let hints = model.chain.hints_above(0).collect();
-            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None });
+            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None, busy: false });
             model.nodes.len() - 1
         };
         let cert = CERTS.get(index).cloned().unwrap_or_else(|| Arc::new(chia_ssl::ChiaCertificate::generate().unwrap()));
@@ -1353,6 +1377,28 @@ impl MockChain {
         model.nodes[index].pool.full = full;
     }
 
+    /// One node made too busy to validate a bundle in time (or not), as a
+    /// full node is whose `pre_validate_spendbundle` trips either of its
+    /// timeouts: the CLVM run and the signature check took longer than its
+    /// `validation_timeout` (`block_creation_timeout`, 2 seconds by
+    /// default), or longer than 0.1 s at more than 5 × `validation_timeout`
+    /// ns per unit of execution and condition cost (10 ns by default), which
+    /// for a bundle under 10 million cost (a standard spend is some 3
+    /// million) means any run over 0.1 s, the one a small bundle meets
+    /// first. From here a bundle it is sent is refused FAILED
+    /// INVALID_SPEND_BUNDLE, a soft failure: left out of its seen cache, its
+    /// mempool as it was, so the next send is judged afresh. What
+    /// `add_transaction` answers before that check answers as ever: a bundle
+    /// in its mempool is SUCCESS, one in its seen cache
+    /// ALREADY_INCLUDING_TRANSACTION, and one the CLVM run or the signature
+    /// check refuses has that refusal's name. Only a send is refused: a
+    /// block or a reorganisation tries the node's items again as ever.
+    pub(crate) fn set_busy(&self, node: &MockNode, busy: bool) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].busy = busy;
+    }
+
     /// Every node's mempool emptied, as a full mempool evicts what pays
     /// least. Eviction takes items out of the mempool and touches nothing
     /// else: the pending and conflict caches keep the bundles put aside in
@@ -1468,6 +1514,10 @@ pub(crate) enum Cond {
     /// `AGG_SIG_ME` public key (48 bytes) and message.
     AggSigMe(Bytes, Bytes),
     AssertMyPuzzleHash(Bytes32),
+    /// `ASSERT_COIN_ANNOUNCEMENT` of an announcement id.
+    AssertCoinAnnouncement(Bytes32),
+    /// `ASSERT_PUZZLE_ANNOUNCEMENT` of an announcement id.
+    AssertPuzzleAnnouncement(Bytes32),
 }
 
 /// A spend of `coin`, at [`open_puzzle_hash`], making `conditions`.
@@ -1482,6 +1532,8 @@ pub(crate) fn open_coin_spend(coin: Coin, conditions: &[Cond]) -> CoinSpend {
             Cond::AssertHeightRelative(blocks) => clvm_list!(82, *blocks).to_clvm(&mut a),
             Cond::AggSigMe(key, message) => clvm_list!(50, key.clone(), message.clone()).to_clvm(&mut a),
             Cond::AssertMyPuzzleHash(puzzle_hash) => clvm_list!(72, *puzzle_hash).to_clvm(&mut a),
+            Cond::AssertCoinAnnouncement(id) => clvm_list!(61, *id).to_clvm(&mut a),
+            Cond::AssertPuzzleAnnouncement(id) => clvm_list!(63, *id).to_clvm(&mut a),
         };
         list.push(node.expect("a condition"));
     }
