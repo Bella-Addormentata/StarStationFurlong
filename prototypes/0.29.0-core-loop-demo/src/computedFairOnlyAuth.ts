@@ -294,8 +294,11 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   const valid: Counted[] = [];
   const waiting: Counted[] = [];
   let looked = 0;
-  for (const cd of plausible) {
-    if (looked >= MAX_CK_CANDIDATES) break;
+  // Where the looking stopped for want of a place, if it did.
+  let cut = plausible.length;
+  for (let i = 0; i < plausible.length; i++) {
+    const cd = plausible[i];
+    if (looked >= MAX_CK_CANDIDATES) { cut = i; break; }
     // Anything below a checkpoint already found valid can't be the base.
     if (valid.length > 0 && cd.ck.u < valid[0].ck.u) continue;
     const v = checkedCk(cd);
@@ -308,9 +311,13 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     }
   }
   const base = valid[0] ?? null;
-  // A waiting checkpoint holds the pass only if it would be the base were it good, by S3's whole
-  // order (the round, an end, the sweeps, the id): one that ranks under the base changes nothing.
-  if (waiting.some((w) => !base || byBest(w, base) < 0)) pending = true;
+  // A waiting checkpoint holds the pass if it would be the base were it good, by S3's whole order
+  // (the round, an end, the sweeps, the id): one that ranks under the base changes nothing... unless
+  // it holds a place of the cap. A checkpoint put off counts as looked at, so it can crowd out one
+  // past the cap that its failing would let in: with any waiting, a checkpoint left unlooked at for
+  // want of a place that could be the base keeps the pass pending too.
+  if (waiting.some((w) => !base || byBest(w, base) < 0)
+    || (waiting.length > 0 && plausible.slice(cut).some((cd) => !base || byBest(cd, base) < 0))) pending = true;
 
   // S5: an end order standing at the base: one an owner-level key holding the game there signed.
   let fin: FinRec | null = null;

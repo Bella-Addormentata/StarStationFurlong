@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { recHash } from './computedFold';
-import { ckId, ckKey, finKey, MAX_SMALL_RECORD_BYTES, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, sealFin, weightOf, xfId, xfKey } from './computedFairOnly';
+import { ckId, ckKey, finKey, MAX_SMALL_RECORD_BYTES, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, sealFin, sealXf, weightOf, xfId, xfKey } from './computedFairOnly';
 import type { CkRec, FairOnlyLetter, XferRec } from './computedFairOnly';
 import { MAX_CK_CANDIDATES, resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Resolution } from './computedFairOnlyAuth';
@@ -495,9 +495,11 @@ describe('transfers (S2)', () => {
   });
 });
 
-/** A transfer record whose signatures are as given: the seller's offer, then the buyer's `g`. */
+/** A transfer record whose signatures are as given: the seller's on the offer as it stands, and the buyer's
+ *  `g` (by default the buyer signs this very record, so a change to the offer fails the seller's signature alone). */
 function sealForged(ctx: FoldCtx, offer: XferRec['o'], g?: string): Entry {
-  const value = { v: 1, o: offer, u: 3, k: buyer.pub, g: g ?? xferOf(ctx, owner, buyer, 3).value.g };
+  if (g === undefined) return sealXf(ctx, { v: 1, o: offer, u: 3, k: buyer.pub }, buyer.sign);
+  const value = { v: 1, o: offer, u: 3, k: buyer.pub, g };
   return { key: xfKey(ctx.t, ctx.inc, xfId(value) as string), value };
 }
 
@@ -641,6 +643,35 @@ describe('what is not yet checked (pending)', () => {
     const byId = [...states].sort((a, b) => (a.key < b.key ? -1 : 1));
     expect(resolve('p', [root, ...states], { hold: [hashOf(byId[3])] }).res.pending, 'the highest id').toBe(false);
     expect(resolve('p', [root, ...states], { hold: [hashOf(byId[0])] }).res.pending, 'the lowest id').toBe(true);
+  });
+
+  it('one put off that holds a place of the cap keeps the pass pending while a better one lies past the places', () => {
+    const root = rootOf(P, 'p');
+    const live = nextSid3(P, root.value);
+    // Seven good checkpoints of round 3 (each with a sweep) and a forged one of round 3 close the live session: the eight places.
+    const threes = Array.from({ length: MAX_CK_CANDIDATES - 1 }, (_, i) => trimOf(P, 'p', { b: live, w: 1, n: { alice: `${20 + i}`, bob: `-${20 + i}` } }));
+    const forged = changed(P, trimOf(P, 'p', { b: live, l: hex('d', 32) }), { g: BAD_SIG });
+    // A good one of round 5, closing a session that is not the live one, comes after them.
+    const five = trimOf(P, 'p', { u: 5, l: hex('e', 32) });
+    const all = [root, ...threes, forged, five];
+    const held = resolve('p', all, { liveSid: live, hold: [hashOf(forged)] });
+    expect(held.res.base?.ck.u, 'the round 3 stands for now').toBe(3);
+    expect(held.verified, 'the round 5 is not looked at: the forgery holds the eighth place').not.toContain(hashOf(five));
+    expect(held.res.pending, 'but its failing would let the round 5 in').toBe(true);
+    // Checked, the forgery fails and takes no place: the round 5 is the base, and nothing is waiting.
+    held.hold.delete(hashOf(forged));
+    const again = resolveGame(held.env, T, P.inc, recordsOf(all));
+    expect(again.base?.key).toBe(five.key);
+    expect(again).toMatchObject({ pending: false, invalid: [forged.key] });
+    // Past the places there is one that could not be the base: it does not hold the pass.
+    const one = trimOf(P, 'p', { u: 1, l: hex('9', 32) });
+    const low = resolve('p', [root, ...threes, forged, one], { liveSid: live, hold: [hashOf(forged)] });
+    expect(low.res.base?.ck.u).toBe(3);
+    expect(low.res.pending).toBe(false);
+    // And with nothing put off, a full set of good ones is the limit S3 documents: nothing frees a place, so nothing waits.
+    const full = resolve('p', [root, ...threes, trimOf(P, 'p', { b: live, w: 1, l: hex('d', 32) }), five], { liveSid: live });
+    expect(full.res).toMatchObject({ pending: false, invalid: [] });
+    expect(full.res.base?.ck.u).toBe(3);
   });
 
   it('a transfer put off leaves the chain where it was, and the pass pending', () => {
