@@ -98,6 +98,13 @@ export const MAX_TRANSFERS = 8;
 export const OFFER_SKEW_MS = 600_000;
 /** The longest maker or room name an offer may carry in a transfer record. */
 export const MAX_OFFER_TEXT = 256;
+/** A transfer, a deed offer, an end order or a delegation heavier than this
+ *  (see weightOf) is junk, unread: the heaviest honest one, a transfer whose
+ *  two names are 256 three-byte characters, weighs under 3 kB, and one padded
+ *  with undefined fields (which no reader counts, and canon and the signature
+ *  leave out, but the node weighs) stops here, before a key is sorted or a
+ *  record hashed. A checkpoint has its own, higher, cap (MAX_CHECKPOINT_BYTES). */
+export const MAX_SMALL_RECORD_BYTES = 8 * 1024;
 /** `l` of a checkpoint that closed no round. */
 export const NO_CLOSE = '0'.repeat(32);
 
@@ -370,7 +377,7 @@ function carryWellFormed(s: CrapsCarry): boolean {
 
 /** A fin: {v:1, k, g}. The signature is the resolver's to check. */
 export function asFin(v: unknown): FinRec | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'k', 'g'])) return null;
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null || !hasFields(v, ['v', 'k', 'g'])) return null;
   return v.v === 1 && isPub(v.k) && isSig(v.g) ? (v as unknown as FinRec) : null;
 }
 
@@ -379,7 +386,8 @@ export function asFin(v: unknown): FinRec | null {
  *  integers the node ports (only integers, short names). Whether the maker
  *  signed it, and whether it is for this game, are the resolver's. */
 export function asDeedOffer(v: unknown, room: string): DeedOffer | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'kind', 'asset', 'makerPub', 'makerName', 'toPub', 'price', 'issuedAt', 'expiresAt', 'nonce', 'sig'])) return null;
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null) return null;
+  if (!hasFields(v, ['v', 'kind', 'asset', 'makerPub', 'makerName', 'toPub', 'price', 'issuedAt', 'expiresAt', 'nonce', 'sig'])) return null;
   if (v.v !== 1 || v.kind !== 'transfer-offer') return null;
   const a = v.asset;
   if (!isPlain(a) || !hasFields(a, ['kind', 'roomId', 'roomName'])) return null;
@@ -394,7 +402,8 @@ export function asDeedOffer(v: unknown, room: string): DeedOffer | null {
  *  signatures hold, and whether the offer is newer than the game, are the
  *  resolver's. */
 export function asXf(v: unknown, room: string): XferRec | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'o', 'u', 'k', 'g'])) return null;
+  // (Weighed whole before any field is looked at: the offer inside is weighed again, which is small.)
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null || !hasFields(v, ['v', 'o', 'u', 'k', 'g'])) return null;
   if (v.v !== 1 || !isSig(v.g) || !Number.isSafeInteger(v.u) || (v.u as number) < 0 || (v.u as number) > U_MAX) return null;
   // (The buyer's key `k` is a key because it is the offer's `toPub`, which is one.)
   const o = asDeedOffer(v.o, room);
@@ -466,7 +475,7 @@ function ckBody(v: Record<string, unknown>, room: string, letter: FairOnlyLetter
   // Who delegated the signer. The root's names the owner's house; any other
   // record's names the signer itself, as a house.
   if (v.dl !== undefined) {
-    const dl = asDelegation(v.dl);
+    const dl = weightOf(v.dl, MAX_SMALL_RECORD_BYTES) === null ? null : asDelegation(v.dl);
     if (!dl || (root ? dl.k !== v.ok : dl.h !== v.k)) return null;
   }
   // The transfers that brought the game to this record's authority.

@@ -13,7 +13,7 @@ import * as Y from 'yjs';
 import { canon, MAX_TABLE_PIDS, nextSid, signBytes } from './computedFold';
 import {
   asDeedOffer, asDo, asFin, asXf, ckId, ckKey, doKey, FAIR_ONLY_GAMES, FAIR_ONLY_RV, faironlyInc, finKey, isFairOnlyInc, isKnownRv,
-  MAX_CHECKPOINT_BYTES, MAX_OFFER_TEXT, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, MAX_WEIGHT_DEPTH, nextSid3, NO_CLOSE, OFFER_SKEW_MS, parseFairOnlyKey,
+  MAX_CHECKPOINT_BYTES, MAX_OFFER_TEXT, MAX_SMALL_RECORD_BYTES, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, MAX_WEIGHT_DEPTH, nextSid3, NO_CLOSE, OFFER_SKEW_MS, parseFairOnlyKey,
   readCk, sealCk, sealFin, sealXf, weightOf, xfId, xfKey,
 } from './computedFairOnly';
 import type { CkRec, DeedOffer, FairOnlyLetter, FairOnlyName, XferRec } from './computedFairOnly';
@@ -286,10 +286,11 @@ describe('weightOf', () => {
 describe('the constants', () => {
   it('are the ones the node twin and design §8.9 name: a change to one is a change to what is junk', () => {
     expect({
-      FAIR_ONLY_RV, MAX_CHECKPOINT_BYTES, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, OFFER_SKEW_MS, MAX_OFFER_TEXT, MAX_WEIGHT_DEPTH, NO_CLOSE,
+      FAIR_ONLY_RV, MAX_CHECKPOINT_BYTES, MAX_SMALL_RECORD_BYTES, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, OFFER_SKEW_MS, MAX_OFFER_TEXT, MAX_WEIGHT_DEPTH,
+      NO_CLOSE,
     }).toEqual({
-      FAIR_ONLY_RV: 'f1', MAX_CHECKPOINT_BYTES: 1_572_864, MAX_TABLE_PID_BYTES: 1_000_000, MAX_TRANSFERS: 8, OFFER_SKEW_MS: 600_000,
-      MAX_OFFER_TEXT: 256, MAX_WEIGHT_DEPTH: 16, NO_CLOSE: '0'.repeat(32),
+      FAIR_ONLY_RV: 'f1', MAX_CHECKPOINT_BYTES: 1_572_864, MAX_SMALL_RECORD_BYTES: 8_192, MAX_TABLE_PID_BYTES: 1_000_000, MAX_TRANSFERS: 8,
+      OFFER_SKEW_MS: 600_000, MAX_OFFER_TEXT: 256, MAX_WEIGHT_DEPTH: 16, NO_CLOSE: '0'.repeat(32),
     });
   });
 });
@@ -371,6 +372,53 @@ describe('fins, offers, transfers', () => {
     ]) expect(asXf(bad, ROOM)).toBeNull();
     expect(asXf(xf, 'room-other')).toBeNull();
     for (const bad of [null, undefined, 'x', 7, [], [xf]]) expect(asXf(bad, ROOM), String(bad)).toBeNull();
+  });
+
+  /** `v` with `n` fields that are undefined: no reader counts them, and canon (so an id and a signature) leaves them out. */
+  const pad = <V extends object>(v: V, n: number): V => ({ ...v, ...Object.fromEntries(Array.from({ length: n }, (_, i) => [`pad${i}`, undefined])) });
+
+  it('weighs a transfer, an offer or an end order before it reads a field: padded past the small-record cap it is junk, and a little padding is the same record', () => {
+    const xf = sealXf(P, { v: 1, o: offer, u: 3, k: buyer.pub }, buyer.sign).value;
+    const many = 2_000;
+    for (const [what, clean, read] of [
+      ['an end order', fin, (v: unknown) => asFin(v)],
+      ['an offer', offer, (v: unknown) => asDeedOffer(v, ROOM)],
+      ['a transfer', xf, (v: unknown) => asXf(v, ROOM)],
+      ['a do: record', offer, (v: unknown) => asDo(doKey(offer.nonce), v, ROOM)],
+    ] as const) {
+      expect(canon(pad(clean, many)), `${what}: the same record to canon`).toBe(canon(clean));
+      expect(weightOf(pad(clean, many), MAX_SMALL_RECORD_BYTES), what).toBeNull();
+      expect(read(clean), `${what}, clean`).not.toBeNull();
+      expect(read(pad(clean, 3)), `${what}, a little padding`).not.toBeNull();
+      expect(read(pad(clean, many)), `${what}, past the cap`).toBeNull();
+    }
+    // the padding is the weighed total of the record, wherever it sits
+    expect(asXf({ ...xf, o: pad(offer, many) }, ROOM), 'inside the offer of a transfer').toBeNull();
+    expect(asXf({ ...xf, o: { ...offer, asset: pad(offer.asset, many) } }, ROOM), 'inside its asset').toBeNull();
+    // ... and the cap is where the weight is: the most fields that fit are read, one more is junk
+    let lo = 0;
+    let hi = many;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (weightOf(pad(fin, mid), MAX_SMALL_RECORD_BYTES) === null) hi = mid - 1;
+      else lo = mid;
+    }
+    expect(lo, 'the search found the edge').toBeGreaterThan(100);
+    expect(lo).toBeLessThan(many);
+    expect(asFin(pad(fin, lo)), 'the most that fit').not.toBeNull();
+    expect(asFin(pad(fin, lo + 1)), 'one more').toBeNull();
+  });
+
+  it('never refuses an honest one: the heaviest a transfer can be weighs under 3 kB', () => {
+    const longRoom = 'room-' + 'x'.repeat(200);
+    const kanji = '漢'.repeat(MAX_OFFER_TEXT); // 256 units of 3 bytes
+    const o = offerOf(owner, buyer, { makerName: kanji, asset: { kind: 'deed', roomId: longRoom, roomName: kanji } });
+    const xf = sealXf(P, { v: 1, o, u: 2 ** 48, k: buyer.pub }, buyer.sign).value;
+    const weight = weightOf(xf, MAX_SMALL_RECORD_BYTES) as number;
+    expect(weight).toBeGreaterThan(1_500); // (two names of 768 bytes)
+    expect(weight).toBeLessThan(3_000);
+    expect(weight * 2, 'with room to spare').toBeLessThan(MAX_SMALL_RECORD_BYTES);
+    expect(asXf(xf, longRoom)).not.toBeNull();
   });
 
   it('a do: record is a deed offer kept under its own nonce', () => {
@@ -769,6 +817,11 @@ describe('reading a checkpoint (S0)', () => {
     refuses('p', 'root dl by someone else', { dl: delegation(buyer, house.pub) }, 'root');
     refuses('p', 'root signed by another key', { k: buyer.pub }, 'root');
     expect(read(P, changed(P, trims.p, { dl: undefined })).kind, 'no dl: an authority signs').toBe('ok');
+    // (a delegation is a few short fields: padded past the small-record cap it is junk, wherever the checkpoint carries it)
+    const padded = { ...DL_HOUSE, ...Object.fromEntries(Array.from({ length: 2_000 }, (_, i) => [`pad${i}`, undefined])) };
+    expect(read(P, changed(P, trims.p, { dl: { ...DL_HOUSE, pad0: undefined } })).kind, 'a little padding is the same delegation').toBe('ok');
+    expect(weightOf(padded, MAX_SMALL_RECORD_BYTES)).toBeNull();
+    refuses('p', 'dl padded past the small-record cap', { dl: padded });
   });
 
   it('x is a chain of at most 8 whole transfers, and the root has none', () => {
@@ -782,6 +835,7 @@ describe('reading a checkpoint (S0)', () => {
     refuses('p', 'x entry with an offer to someone else', { x: [{ ...xf, k: owner.pub }] });
     refuses('p', 'x entry for another room', { x: [{ ...xf, o: { ...xf.o, asset: { kind: 'deed', roomId: 'room-other', roomName: 'n' } } }] });
     refuses('p', 'x entry junk', { x: [{ ...xf, u: -1 }] });
+    refuses('p', 'x entry padded past the small-record cap', { x: [{ ...xf, ...Object.fromEntries(Array.from({ length: 2_000 }, (_, i) => [`pad${i}`, undefined])) }] });
     refuses('p', 'x on the root', { x: [xf] }, 'root');
   });
 
