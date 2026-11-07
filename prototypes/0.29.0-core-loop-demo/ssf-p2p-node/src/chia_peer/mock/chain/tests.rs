@@ -702,6 +702,10 @@ async fn a_bundle_refused_before_it_is_judged_carries_its_chia_error_name_and_is
     let key = Bytes::new(chia_bls::SecretKey::from_seed(&[9u8; 32]).public_key().to_bytes().to_vec());
     let unsigned = open_spend(coin, &[Cond::AggSigMe(key, Bytes::new(b"hello".to_vec())), Cond::CreateCoin(open, 1000, vec![])]);
     let elsewhere = open_spend(coin, &[Cond::AssertMyPuzzleHash(hint(8)), Cond::CreateCoin(open, 1000, vec![])]);
+    // Announcements none of the bundle's spends makes: Chia names either
+    // failed assertion ASSERT_ANNOUNCE_CONSUMED_FAILED.
+    let unannounced_coin = open_spend(coin, &[Cond::AssertCoinAnnouncement(hint(10)), Cond::CreateCoin(open, 1000, vec![])]);
+    let unannounced_puzzle = open_spend(coin, &[Cond::AssertPuzzleAnnouncement(hint(11)), Cond::CreateCoin(open, 1000, vec![])]);
     let mut a = clvmr::Allocator::new();
     let huge = a.new_atom(&vec![0u8; 500_000]).unwrap();
     let huge = Program::from(clvmr::serde::node_to_bytes(&a, huge).unwrap());
@@ -711,6 +715,8 @@ async fn a_bundle_refused_before_it_is_judged_carries_its_chia_error_name_and_is
         (wrong_puzzle.clone(), "WRONG_PUZZLE_HASH"),
         (unsigned, "BAD_AGGREGATE_SIGNATURE"),
         (elsewhere, "ASSERT_MY_PUZZLEHASH_FAILED"),
+        (unannounced_coin, "ASSERT_ANNOUNCE_CONSUMED_FAILED"),
+        (unannounced_puzzle, "ASSERT_ANNOUNCE_CONSUMED_FAILED"),
         (too_costly, "BLOCK_COST_EXCEEDS_MAX"),
     ] {
         let why = refusal(s.money.push_tx(bundle.clone()).await);
@@ -720,19 +726,34 @@ async fn a_bundle_refused_before_it_is_judged_carries_its_chia_error_name_and_is
     let why = refusal(s.money.push_tx(wrong_puzzle.clone()).await);
     assert!(why.contains("ALREADY_INCLUDING_TRANSACTION") && !refusal_is_final(&why), "{why}");
     unanswered(s.money.spend_live(wrong_puzzle).await);
-    // A gap on main, outside this test-only module: `refusal_is_final` lists
-    // ASSERT_COIN_ANNOUNCEMENT_FAILED and ASSERT_PUZZLE_ANNOUNCEMENT_FAILED,
-    // which no full node sends, and not ASSERT_ANNOUNCE_CONSUMED_FAILED, which
-    // every one does. So a bundle whose announcement assertion fails reads as
-    // no verdict, not dead, and the lease keeps probing it. Until a change to
-    // the lane adds the real name (and makes this assert that it is final), a
-    // writer that ties two spends by an announcement (PR 9's claim and write)
-    // must not count on that refusal to kill a bundle built wrong.
     assert_eq!(
         err_name(ErrorCode::AssertCoinAnnouncementFailed),
-        "ASSERT_ANNOUNCE_CONSUMED_FAILED",
+        err_name(ErrorCode::AssertPuzzleAnnouncementFailed),
         "chia_rs folds both announcement assertions into Chia's code 12"
     );
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A bundle whose coin or puzzle announcement assertion fails is refused
+/// ASSERT_ANNOUNCE_CONSUMED_FAILED by both nodes, a final word from each,
+/// so the lane calls it dead: what the lease's probe of a bundle whose push
+/// never left (a stop between the two) hears, freeing its coins. Sent again,
+/// both remember it, ALREADY_INCLUDING_TRANSACTION, which is no verdict.
+#[tokio::test]
+async fn a_bundle_both_nodes_refuse_assert_announce_consumed_failed_is_dead_through_the_lane() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let refused = (FAILED, Some("ASSERT_ANNOUNCE_CONSUMED_FAILED".to_string()));
+    for assertion in [Cond::AssertCoinAnnouncement(hint(10)), Cond::AssertPuzzleAnnouncement(hint(11))] {
+        let bundle = open_spend(coin, &[assertion, Cond::CreateCoin(open, 1000, vec![])]);
+        assert!(!s.money.spend_live(bundle.clone()).await.unwrap(), "both nodes' final word: dead");
+        assert_eq!(s.chain.acks_for(bundle.name()), vec![refused.clone(); 2]);
+        unanswered(s.money.spend_live(bundle).await);
+    }
+    assert!(s.chain.mempool().is_empty());
+    assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, None);
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -841,6 +862,90 @@ async fn the_seen_cache_answers_an_evicted_bundle_already_including_until_it_for
     let h = s.chain.farm().await;
     assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, Some(h));
     assert_eq!(s.chain.children(coin.coin_id()).len(), 1);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A node too busy to validate a bundle in time refuses it
+/// INVALID_SPEND_BUNDLE, `add_transaction`'s soft failure, which is no
+/// final word and which the node does not remember. With both nodes busy a
+/// fresh bundle is refused by both and its liveness has no verdict; it is
+/// in neither seen cache, so once they are not busy it is taken (SUCCESS,
+/// not ALREADY_INCLUDING_TRANSACTION) and lands. A bundle a node holds is
+/// SUCCESS there before anything is validated, busy or not, so with both
+/// busy it is live.
+#[tokio::test]
+async fn a_busy_node_refuses_a_good_bundle_with_invalid_spend_bundle_not_final_not_remembered_and_answers_one_it_holds_success() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    let later = s.chain.fund(open, 2000, None);
+    s.chain.farm().await;
+    let busy = (FAILED, Some("INVALID_SPEND_BUNDLE".to_string()));
+
+    let write = pass_on(coin);
+    s.chain.set_busy(&s.a, true);
+    s.chain.set_busy(&s.b, true);
+    let why = refusal(s.money.push_tx(write.clone()).await);
+    assert!(why.contains("INVALID_SPEND_BUNDLE") && !refusal_is_final(&why), "{why}");
+    unanswered(s.money.spend_live(write.clone()).await);
+    assert_eq!(s.chain.acks_for(write.name()), vec![busy.clone(); 4], "the push and the probe, refused by both");
+    assert!(s.chain.mempool().is_empty());
+    assert!(!s.chain.lock().nodes.iter().any(|n| n.pool.seen(&write.name())), "in neither seen cache");
+    s.chain.set_busy(&s.a, false);
+    s.chain.set_busy(&s.b, false);
+    s.money.push_tx(write.clone()).await.expect("judged afresh by both");
+    assert_eq!(s.chain.acks_for(write.name()).split_off(4), vec![(SUCCESS, None); 2]);
+    let h = s.chain.farm().await;
+    assert_eq!(s.chain.record(coin.coin_id()).unwrap().2, Some(h));
+    assert_eq!(s.chain.children(coin.coin_id()), vec![passed(coin)]);
+
+    let held = pass_on(later);
+    s.chain.set_busy(&s.b, true);
+    s.money.push_tx(held.clone()).await.expect("one node took it");
+    assert_eq!(s.chain.mempool_on(&s.a), vec![held.name()]);
+    assert!(s.chain.mempool_on(&s.b).is_empty());
+    s.chain.set_busy(&s.a, true);
+    assert!(s.money.spend_live(held.clone()).await.unwrap(), "the node that holds it answers SUCCESS, busy or not");
+    let mut probed = s.chain.acks_for(held.name()).split_off(2);
+    probed.sort();
+    assert_eq!(probed, vec![(SUCCESS, None), busy], "the holder's SUCCESS, the other's busy refusal");
+    s.chain.set_busy(&s.a, false);
+    s.chain.set_busy(&s.b, false);
+    let h = s.chain.farm().await;
+    assert_eq!(s.chain.record(later.coin_id()).unwrap().2, Some(h));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A busy node's timeout is checked only once the CLVM run and the signature
+/// check passed, so a bundle either refuses keeps that refusal's own name on
+/// a busy node: with both busy, a bundle whose announcement assertion fails
+/// and one whose signature is missing are each refused by name by both, a
+/// final word, so dead. Each refusal is remembered, and the seen cache is
+/// looked in before anything is validated, so sent again to the still-busy
+/// nodes each is ALREADY_INCLUDING_TRANSACTION from both, not the busy
+/// refusal.
+#[tokio::test]
+async fn a_busy_node_refuses_a_bad_bundle_by_its_own_name_and_one_it_remembers_already_including() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let key = Bytes::new(chia_bls::SecretKey::from_seed(&[9u8; 32]).public_key().to_bytes().to_vec());
+    let unannounced = open_spend(coin, &[Cond::AssertCoinAnnouncement(hint(10)), Cond::CreateCoin(open, 1000, vec![])]);
+    let unsigned = open_spend(coin, &[Cond::AggSigMe(key, Bytes::new(b"hello".to_vec())), Cond::CreateCoin(open, 1000, vec![])]);
+    s.chain.set_busy(&s.a, true);
+    s.chain.set_busy(&s.b, true);
+    let seen = (FAILED, Some("ALREADY_INCLUDING_TRANSACTION".to_string()));
+    for (bundle, name) in [(unannounced, "ASSERT_ANNOUNCE_CONSUMED_FAILED"), (unsigned, "BAD_AGGREGATE_SIGNATURE")] {
+        assert!(!s.money.spend_live(bundle.clone()).await.unwrap(), "{name} from both, busy or not: dead");
+        assert_eq!(s.chain.acks_for(bundle.name()), vec![(FAILED, Some(name.to_string())); 2]);
+        let why = refusal(s.money.push_tx(bundle.clone()).await);
+        assert!(why.contains("ALREADY_INCLUDING_TRANSACTION") && !why.contains("INVALID_SPEND_BUNDLE"), "{why}");
+        assert_eq!(s.chain.acks_for(bundle.name()).split_off(2), vec![seen.clone(); 2], "remembered by both");
+    }
+    assert!(s.chain.mempool().is_empty());
+    s.chain.set_busy(&s.a, false);
+    s.chain.set_busy(&s.b, false);
     assert!(s.chain.unanswered().is_empty());
 }
 

@@ -119,11 +119,12 @@
 //! The mempool delta (§14 (6)): the wallet protocol has no mempool query, so
 //! `spend_live` hands the parked spend bundle to the peers AGAIN and reads
 //! their `TransactionAck`: accepted or pending means the spend is live (and in
-//! the mempool once more if it had been dropped); refused by every peer means
-//! it is dead and its coins come free ONLY when a refusal is final — the
-//! bundle itself can never land ([`refusal_is_final`]) — since a refusal for
-//! fee or load says nothing about a copy an earlier peer may still hold.
-//! `push_tx` reads the same acks, once.
+//! the mempool once more if it had been dropped); refused by every peer, it
+//! is dead (and its coins come free) only when EVERY peer's refusal is final
+//! — the bundle itself can never land ([`refusal_is_final`]) — since a
+//! refusal for fee or load says nothing about a copy an earlier peer may
+//! still hold: one such refusal among them leaves no verdict, and the coins
+//! stay parked. `push_tx` reads the same acks, once.
 //!
 //! What this lane does NOT do yet, by plan: weight‑proof light sync (header
 //! trust stays trusted‑set), inclusion proofs (PR D), coin‑state subscriptions
@@ -1914,13 +1915,14 @@ pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> 
 /// Whether a full node's reason for refusing a bundle says the bundle can
 /// NEVER land (an input already spent, a condition that fails, a bad
 /// signature, a malformed spend), as against its own policy or state (a fee
-/// too low for a full mempool, "seen before", not synced, a timelock not yet
-/// reached, an input it does not know: `UNKNOWN_UNSPENT` is what a node that
-/// has not reached the input's creation block says of a perfectly live spend,
-/// and the liveness peers are chosen afresh, so two lagging replacements
-/// could say it together while the spend sits in a mempool elsewhere; #271
-/// review, round 19). The names are chia-blockchain's `Err` codes as
-/// `TransactionAck.error` spells them; an unknown reason is not final.
+/// too low for a full mempool, "seen before", not synced, a node too busy to
+/// validate it in time, a timelock not yet reached, an input it does not
+/// know: `UNKNOWN_UNSPENT` is what a node that has not reached the input's
+/// creation block says of a perfectly live spend, and the liveness peers are
+/// chosen afresh, so two lagging replacements could say it together while
+/// the spend sits in a mempool elsewhere; #271 review, round 19). The names
+/// are chia-blockchain's `Err` codes as `TransactionAck.error` spells them;
+/// an unknown reason is not final.
 pub(crate) fn refusal_is_final(reason: &str) -> bool {
     const FINAL: &[&str] = &[
         "DOUBLE_SPEND",
@@ -1931,8 +1933,10 @@ pub(crate) fn refusal_is_final(reason: &str) -> bool {
         "ASSERT_MY_AMOUNT_FAILED",
         "ASSERT_MY_BIRTH_SECONDS_FAILED",
         "ASSERT_MY_BIRTH_HEIGHT_FAILED",
-        "ASSERT_COIN_ANNOUNCEMENT_FAILED",
-        "ASSERT_PUZZLE_ANNOUNCEMENT_FAILED",
+        // A coin or puzzle announcement the bundle asserts and none of its
+        // own spends makes: a mempool judges each bundle on its own, so it
+        // can never be made. Chia has one code for both assertions (12).
+        "ASSERT_ANNOUNCE_CONSUMED_FAILED",
         "ASSERT_CONCURRENT_SPEND_FAILED",
         "ASSERT_CONCURRENT_PUZZLE_FAILED",
         "ASSERT_EPHEMERAL_FAILED",
@@ -1945,7 +1949,14 @@ pub(crate) fn refusal_is_final(reason: &str) -> bool {
         "DUPLICATE_OUTPUT",
         "BAD_AGGREGATE_SIGNATURE",
         "INVALID_CONDITION",
-        "INVALID_SPEND_BUNDLE",
+        // Not INVALID_SPEND_BUNDLE: it is a busy node's soft refusal.
+        // `full_node.py` answers a pre-validation timeout with it (as
+        // `mempool_manager.py` does a validation that ran too long) and does
+        // not remember the bundle, so a good one is refused with it. It is
+        // final only for shapes SSF never builds: an empty bundle, too many
+        // atoms or pairs for its cost, a cost of zero, and the fast-forward
+        // singleton checks (one effective spend id twice, no spend that is
+        // not fast-forward).
         "INVALID_COIN_SOLUTION",
         "GENERATOR_RUNTIME_ERROR",
         "WRONG_PUZZLE_HASH",
@@ -5139,7 +5150,7 @@ mod tests {
     fn only_a_final_refusal_kills_a_spend() {
         assert!(refusal_is_final("203.0.113.5:58444: DOUBLE_SPEND"));
         assert!(refusal_is_final("x: ASSERT_MY_COIN_ID_FAILED"));
-        assert!(refusal_is_final("x: ASSERT_COIN_ANNOUNCEMENT_FAILED"));
+        assert!(refusal_is_final("x: ASSERT_ANNOUNCE_CONSUMED_FAILED"), "either announcement assertion, as a full node names it");
         assert!(refusal_is_final("x: ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED"), "a 'before' timelock that failed is past for good");
         assert!(refusal_is_final("x: BAD_AGGREGATE_SIGNATURE"));
         assert!(!refusal_is_final("x: ASSERT_HEIGHT_RELATIVE_FAILED"), "a timelock can still pass");
@@ -5148,6 +5159,7 @@ mod tests {
         assert!(!refusal_is_final("x: INVALID_FEE_TOO_CLOSE_TO_ZERO"));
         assert!(!refusal_is_final("x: ALREADY_INCLUDING_TRANSACTION"));
         assert!(!refusal_is_final("x: MEMPOOL_CONFLICT"));
+        assert!(!refusal_is_final("x: INVALID_SPEND_BUNDLE"), "a node too busy to validate a good bundle in time refuses it so");
         assert!(!refusal_is_final("x: status 3"));
     }
 
