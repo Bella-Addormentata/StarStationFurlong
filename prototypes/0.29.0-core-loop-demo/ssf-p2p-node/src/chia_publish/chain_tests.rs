@@ -662,7 +662,9 @@ async fn a_foreign_spend_of_a_coin_our_write_holds_is_seen_as_another_spend_of_o
 /// once the coin is spent SETTLED_DEPTH deep, so the listing is written
 /// again. The other write confirms under its own hint and memo. A node that
 /// never took the old block has no stale row, and a lane on it and on one
-/// that did disagrees: no verdict at all.
+/// that did settles the coin only the one lists by its id and its parent's
+/// spend, which carries the other hint: the row is stale, the write absent,
+/// and neither node is let go.
 #[tokio::test]
 async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the_write_the_old_fork_held() {
     let mut s = setup().await;
@@ -734,10 +736,92 @@ async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the
     assert!(!s.lease.holds_spend(spend));
 
     // A node that never took the old block has the hint rows of the chain as
-    // it stands, with no stale row: a lane on it and on node a disagrees.
+    // it stands, with no stale row: a lane on it and on node a settles the
+    // coin only node a lists, by its id and its parent's spend.
     let late = s.chain.node().await;
-    let fresh = PeerLane::new(s.chain.lane(&s.a, &late), Trust::Agreed);
-    assert!(child_under_hint(&fresh, hint, coin.coin_id(), Some(memo)).await.is_err(), "one node lists the stale row, the other not: no verdict");
+    let fresh_lane = s.chain.lane(&s.a, &late);
+    let fresh = PeerLane::new(fresh_lane.clone(), Trust::Agreed);
+    let now = s.chain.peak();
+    assert_eq!(
+        child_under_hint(&fresh, hint, coin.coin_id(), Some(memo)).await.unwrap(),
+        HintChild::Absent { judged_at: Some(now) },
+        "one node lists the stale row, the other not: the spend carries the other hint, so the write is absent"
+    );
+    assert_eq!(fresh_lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A stale row under a room's inbox hint on one node only, planted by a
+/// third party, as anyone holding the hint can with one spend in a block
+/// that happens to be orphaned: node b is held while a block carrying the
+/// third party's write under the inbox hint comes and goes, and the fork
+/// that replaces it carries the same spend under another hint, which makes
+/// the same coin. Node a lists the coin under the inbox hint, b does not.
+/// The host's agreed inbox read asks both for the coin by id and for its
+/// parent's spend, finds the row stale, reads the room's real knock, and
+/// lets neither node go; and the knock's own verdict, our write judged
+/// under the same hint by [`write_standing_on`], still settles: confirmed.
+#[tokio::test]
+async fn a_stale_inbox_row_on_one_node_hides_no_knock_lets_no_peer_go_and_our_knock_still_settles() {
+    let mut s = setup().await;
+    let host = iroh::SecretKey::generate();
+    let host_kx = crate::chia_contact::kx_card_secret(&host);
+    let ck_host = [32u8; 32];
+    let req = KnockRequest {
+        room: ROOM.into(),
+        host: host.public().to_string(),
+        ck_host,
+        kx_host: crate::chia_contact::kx_public(&host_kx),
+        attempts: 0,
+    };
+    let hint = knock_hint(NET, &req, &ROOM_KEY, 0);
+    let (knocker, planter) = (wallet(17), wallet(18));
+    let knocker_node = iroh::SecretKey::generate();
+    let coin = s.chain.fund(our_puzzle_hash(&knocker), 1000, None);
+    let planted = s.chain.fund(our_puzzle_hash(&planter), 1000, None);
+    let funded = s.chain.farm().await;
+
+    // Our knock lands under the inbox hint, issued at a fixed time the
+    // host reads it at.
+    let issued = 1_700_000_000;
+    let ck_from = [42u8; 32];
+    let memo = knock_memo(NET, &knocker_node, &req, &ROOM_KEY, 0, coin.coin_id(), Some(ck_from), issued).unwrap();
+    let knock = our_memo(&knocker, coin, hint, memo);
+    let digest = memo_of(&knock, hint);
+    s.push(&knocker, &knock, (coin.coin_id(), funded)).await.unwrap();
+    let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
+    let landed = s.chain.farm().await;
+
+    // The plant: node b is held through the orphaned block, so node a alone
+    // keeps its row; the new fork makes the same coin under another hint.
+    let body = Bytes::new(vec![7u8; 64]);
+    let elsewhere = Bytes32::new([43u8; 32]);
+    let under_inbox = build_publish_bundle(NET, &planter, planted, hint, body.clone()).unwrap();
+    let under_elsewhere = build_publish_bundle(NET, &planter, planted, elsewhere, body).unwrap();
+    s.chain.hold(&s.b);
+    s.chain.include_next(under_inbox);
+    s.chain.farm().await;
+    let peak = s.chain.reorg_including(1, vec![under_elsewhere]).await;
+    s.chain.release(&s.b).await;
+    let stale = written(&planter, planted);
+    assert_eq!(s.chain.record(stale.coin_id()), Some((stale, peak - 1, None)), "the same coin, made again by the new fork");
+
+    // The host reads the room's knock, and only it; the coin only node a
+    // lists under the hint is asked of each node by id, once.
+    let by_id = |s: &Setup| [&s.a, &s.b].map(|n| n.seen.lock().unwrap().iter().filter(|k| **k == ProtocolMessageTypes::RequestCoinState).count());
+    let before = by_id(&s);
+    let opened = read_inbox(NET, &s.money, &host_kx, &ck_host, &ROOM_KEY, ROOM, peak, issued, &mut HashMap::new()).await.unwrap();
+    assert_eq!(opened.iter().map(|f| (f.item.from, f.item.ck_from)).collect::<Vec<_>>(), vec![(knocker_node.public(), Some(ck_from))]);
+    assert_eq!((opened[0].coin_id, opened[0].confirmed_height), (written(&knocker, coin).coin_id(), landed));
+    let after = by_id(&s);
+    assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 1], "the one-sided coin, asked of each node by id, once");
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    let listed = s.money.coin_records_by_hint(hint, None, true, None).await.unwrap();
+    assert_eq!(listed.records.iter().map(|r| r.coin).collect::<Vec<_>>(), vec![written(&knocker, coin)], "the lane itself leaves the stale row out");
+
+    // Our knock's verdict, through the lookup behind it, settles.
+    assert_eq!(s.standing_with_memo(hint, coin.coin_id(), digest, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(peak) });
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
     assert!(s.chain.unanswered().is_empty());
 }
 

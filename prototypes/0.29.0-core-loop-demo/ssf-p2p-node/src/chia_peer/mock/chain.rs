@@ -74,6 +74,14 @@
 //! barrier ([`MockChain::farm_blocks`]); real nodes take a fork seconds
 //! apart, which a test stages with [`MockChain::hold`] and
 //! [`MockChain::release`].
+//!
+//! A node can also be made to say what its chain does not, which no node
+//! here does on its own: leave a coin out of its listings
+//! ([`MockChain::hide_on`]), deny one by id ([`MockChain::deny_on`]) or
+//! serve another spend than the chain's ([`MockChain::serve_spend_on`]).
+//! These stand for a lying peer, or one whose stores are short, beside an
+//! honest one: what the lane's settling of the coins two peers' hinted
+//! listings differ on is to tell apart from a stale hint row.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -614,6 +622,24 @@ struct NodeState {
     held: Option<Chain>,
     /// Too busy to validate a bundle in time ([`MockChain::set_busy`]).
     busy: bool,
+    /// What it says against its chain (the module notes).
+    lies: Lies,
+}
+
+/// What a node says against the chain it serves ([`MockChain::hide_on`],
+/// [`MockChain::deny_on`], [`MockChain::serve_spend_on`]).
+#[derive(Default)]
+struct Lies {
+    /// Coins its listings leave out, its hint rows and puzzle hashes
+    /// notwithstanding.
+    hidden: HashSet<Bytes32>,
+    /// Coins its coin-state answers leave out, as a chain without them
+    /// would; the ids are echoed all the same.
+    denied: HashSet<Bytes32>,
+    /// Spends it serves in place of the chain's, by the spent coin's id,
+    /// whatever the height asked: a puzzle and solution, or `None` to
+    /// refuse the request as for a coin not spent there.
+    spends: HashMap<Bytes32, Option<(Program, Program)>>,
 }
 
 /// One `TransactionAck` a node sent.
@@ -843,16 +869,20 @@ impl Model {
             }
             ProtocolMessageTypes::RequestPuzzleState => {
                 let asked = RequestPuzzleState::from_bytes(&request.data).ok()?;
-                Some(puzzle_state(self.view(node), &self.nodes[node].hints, self.page_limit, asked))
+                Some(puzzle_state(self.view(node), &self.nodes[node].hints, &self.nodes[node].lies.hidden, self.page_limit, asked))
             }
             ProtocolMessageTypes::RequestCoinState => {
                 let asked = RequestCoinState::from_bytes(&request.data).ok()?;
-                Some(coin_state(self.view(node), self.page_limit, asked))
+                Some(coin_state(self.view(node), &self.nodes[node].lies.denied, self.page_limit, asked))
             }
             ProtocolMessageTypes::RequestPuzzleSolution => {
                 let asked = RequestPuzzleSolution::from_bytes(&request.data).ok()?;
                 let found = self.view(node).coins.get(&asked.coin_name).filter(|rec| rec.spent == Some(asked.height));
-                Some(match found.and_then(|rec| rec.spend.clone()) {
+                let served = match self.nodes[node].lies.spends.get(&asked.coin_name) {
+                    Some(lie) => lie.clone(),
+                    None => found.and_then(|rec| rec.spend.clone()),
+                };
+                Some(match served {
                     Some((puzzle, solution)) => {
                         reply(&RespondPuzzleSolution::new(PuzzleSolutionResponse::new(asked.coin_name, asked.height, puzzle, solution)))
                     }
@@ -889,8 +919,9 @@ impl Model {
 /// `chain`, as `batch_coin_states_by_puzzle_hashes` takes the coin records
 /// whose name is among the hint rows' coin ids: a coin made again on a new
 /// fork with another hint is listed under both, once, as it stands now,
-/// and a row whose coin is not on `chain` lists nothing.
-fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, limit: usize, asked: RequestPuzzleState) -> Message {
+/// and a row whose coin is not on `chain` lists nothing. A coin in `hidden`
+/// is left out whatever matches it ([`MockChain::hide_on`]).
+fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, hidden: &HashSet<Bytes32>, limit: usize, asked: RequestPuzzleState) -> Message {
     let mut keys = Vec::new();
     for key in asked.puzzle_hashes {
         if !keys.contains(&key) {
@@ -911,6 +942,7 @@ fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, limit: usize, 
         .coins
         .values()
         .filter(|rec| keys.contains(&rec.coin.puzzle_hash) || hinted.contains(&rec.coin.coin_id()))
+        .filter(|rec| !hidden.contains(&rec.coin.coin_id()))
         .filter(|rec| rec.created >= since || rec.spent.is_some_and(|spent| spent >= since))
         .filter(|rec| if rec.spent.is_some() { filters.include_spent } else { filters.include_unspent })
         .filter(|rec| rec.coin.amount >= filters.min_amount)
@@ -932,8 +964,9 @@ fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, limit: usize, 
 
 /// `request_coin_state`: the ids asked for, cut at `limit` and echoed, and
 /// the states of the coins among them changed after the anchor. An id the
-/// chain does not know is echoed with no state.
-fn coin_state(chain: &Chain, limit: usize, asked: RequestCoinState) -> Message {
+/// chain does not know is echoed with no state, as is one in `denied`
+/// ([`MockChain::deny_on`]).
+fn coin_state(chain: &Chain, denied: &HashSet<Bytes32>, limit: usize, asked: RequestCoinState) -> Message {
     let mut ids = Vec::new();
     for id in asked.coin_ids.into_iter().take(limit) {
         if !ids.contains(&id) {
@@ -946,6 +979,7 @@ fn coin_state(chain: &Chain, limit: usize, asked: RequestCoinState) -> Message {
     let since = asked.previous_height.map_or(0, |height| height + 1);
     let states = ids
         .iter()
+        .filter(|id| !denied.contains(*id))
         .filter_map(|id| chain.coins.get(id))
         .filter(|rec| rec.created >= since || rec.spent.is_some_and(|spent| spent >= since))
         .map(CoinRec::state)
@@ -1150,7 +1184,7 @@ impl MockChain {
             let mut model = self.lock();
             let announce = watch::Sender::new(model.announced);
             let hints = model.chain.hints_above(0).collect();
-            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None, busy: false });
+            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None, busy: false, lies: Lies::default() });
             model.nodes.len() - 1
         };
         let cert = CERTS.get(index).cloned().unwrap_or_else(|| Arc::new(chia_ssl::ChiaCertificate::generate().unwrap()));
@@ -1399,6 +1433,34 @@ impl MockChain {
         model.nodes[index].busy = busy;
     }
 
+    /// `node`'s listings made to leave coin `id` out from here, its hint rows
+    /// and the coin's puzzle hash notwithstanding, though it still answers
+    /// for the coin by id and serves the spend that made it: a peer hiding
+    /// a coin, or one whose hint store lacks its row.
+    pub(crate) fn hide_on(&self, node: &MockNode, id: Bytes32) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.hidden.insert(id);
+    }
+
+    /// `node` made to deny coin `id` from here: its coin-state answers echo
+    /// the id with no state, as for a coin its chain does not know, though
+    /// its listings still give it.
+    pub(crate) fn deny_on(&self, node: &MockNode, id: Bytes32) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.denied.insert(id);
+    }
+
+    /// `node` made to serve `spend` from here for the spend of coin `id`, at
+    /// whatever height it is asked: its puzzle and solution, or `None` to
+    /// refuse the request, as for a coin its chain did not spend there.
+    pub(crate) fn serve_spend_on(&self, node: &MockNode, id: Bytes32, spend: Option<CoinSpend>) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.spends.insert(id, spend.map(|cs| (cs.puzzle_reveal, cs.solution)));
+    }
+
     /// Every node's mempool emptied, as a full mempool evicts what pays
     /// least. Eviction takes items out of the mempool and touches nothing
     /// else: the pending and conflict caches keep the bundles put aside in
@@ -1510,6 +1572,9 @@ pub(crate) fn open_puzzle_hash() -> Bytes32 {
 pub(crate) enum Cond {
     /// `CREATE_COIN` puzzle hash, amount and memos (none: no memo list).
     CreateCoin(Bytes32, u64, Vec<Bytes>),
+    /// `CREATE_COIN` puzzle hash and amount, with its memos argument given
+    /// whole: any CLVM, a list of atoms or not.
+    CreateCoinMemos(Bytes32, u64, Program),
     AssertHeightRelative(u32),
     /// `AGG_SIG_ME` public key (48 bytes) and message.
     AggSigMe(Bytes, Bytes),
@@ -1529,6 +1594,7 @@ pub(crate) fn open_coin_spend(coin: Coin, conditions: &[Cond]) -> CoinSpend {
         let node = match condition {
             Cond::CreateCoin(puzzle_hash, amount, memos) if memos.is_empty() => clvm_list!(51, *puzzle_hash, *amount).to_clvm(&mut a),
             Cond::CreateCoin(puzzle_hash, amount, memos) => clvm_list!(51, *puzzle_hash, *amount, memos.clone()).to_clvm(&mut a),
+            Cond::CreateCoinMemos(puzzle_hash, amount, memos) => clvm_list!(51, *puzzle_hash, *amount, memos.clone()).to_clvm(&mut a),
             Cond::AssertHeightRelative(blocks) => clvm_list!(82, *blocks).to_clvm(&mut a),
             Cond::AggSigMe(key, message) => clvm_list!(50, key.clone(), message.clone()).to_clvm(&mut a),
             Cond::AssertMyPuzzleHash(puzzle_hash) => clvm_list!(72, *puzzle_hash).to_clvm(&mut a),

@@ -78,7 +78,16 @@
 //!     the listing over rather than losing a coin whose spend it undid; pages
 //!     whose views stand more than [`MAX_PEAK_LAG`] blocks apart are not
 //!     judged; and a peer that answers the coin request but not the header
-//!     request after it is let go.
+//!     request after it is let go. Hinted listings differ honestly too: a
+//!     full node never deletes a hint row, so a coin a new fork made again
+//!     under another hint stays listed under the old one by the nodes that
+//!     took the orphaned block alone. Coins one peer lists under a hint and
+//!     the other leaves out are settled by their ids and their parents'
+//!     spends, asked of both peers alike ([`settle_disputed`]): kept when the
+//!     spend made them under the hint, as a full node reads a hint
+//!     ([`hints_made`]), left out as stale rows otherwise, and nobody let go
+//!     either way; a difference in what the peers say of them is a
+//!     disagreement like any other.
 //!     One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     holding no pair in step (none by source and group, or every one out
@@ -140,11 +149,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use chia_protocol::{
-    Bytes32, CoinState, CoinStateFilters, RejectCoinState, RejectHeaderRequest, RejectPuzzleSolution, RejectPuzzleState,
+    Bytes, Bytes32, CoinState, CoinStateFilters, RejectCoinState, RejectHeaderRequest, RejectPuzzleSolution, RejectPuzzleState,
     RejectStateReason, RequestBlockHeader, RequestCoinState, RequestPeers, RequestPuzzleSolution, RequestPuzzleState,
     RespondBlockHeader, RespondCoinState, RespondPeers, RespondPuzzleSolution, RespondPuzzleState, SendTransaction,
     SpendBundle, TransactionAck,
 };
+use chia_consensus::conditions::{parse_args, Condition};
+use chia_consensus::opcodes::{parse_opcode, CREATE_COIN};
+use chia_sdk_types::run_puzzle;
+use clvm_traits::ToClvm;
+use clvmr::Allocator;
 use futures_util::future::join_all;
 use rand::seq::SliceRandom;
 
@@ -200,6 +214,14 @@ pub const PEAK_SETTLE_ATTEMPTS: usize = 3;
 /// A peer this many blocks or more behind another is lagging: its verdict is
 /// non-final rather than agreed at the common height.
 pub const MAX_PEAK_LAG: u32 = 6;
+/// The most spends (a parent, at the height its children were made) one
+/// settling of a hinted listing's one-sided coins fetches, of each peer,
+/// and runs, once each ([`settle_disputed`]): more is no verdict, nobody let
+/// go (the listing peers' connections dropped, so the next read takes
+/// another pair), so a flood of stale rows costs a read its answer and
+/// never a peer, nor more than this many spend requests of each peer and
+/// puzzle runs.
+pub const MAX_DISPUTED_PARENTS: usize = 16;
 /// An agreed peak read trusts an announcement this old at most; older, the
 /// peer is asked whether the chain has moved past its peak
 /// ([`Lane::prove_current`]). The agreed height is the publisher's era clock:
@@ -1564,7 +1586,7 @@ impl Lane {
     /// The connections still alive (tests); one found dead here returns to
     /// the queue like any dropped peer.
     #[cfg(test)]
-    async fn live_conns(&self) -> Vec<Arc<PeerConn>> {
+    pub(crate) async fn live_conns(&self) -> Vec<Arc<PeerConn>> {
         let mut state = self.state.lock().await;
         self.reap(&mut state);
         state.conns.clone()
@@ -2558,6 +2580,22 @@ pub(crate) struct Settled {
     pub unverified: Vec<usize>,
     pub knowledge_at: (u32, Bytes32),
     pub unverified_knowledge: Vec<usize>,
+    /// The coins some pages list and others leave out where they would be,
+    /// left out of `listing` meanwhile: only a hinted listing's
+    /// ([`settle_hinted_pages`]), to be settled by their ids and their
+    /// parents' spends ([`settle_disputed`]); any other verdict has none.
+    pub disputed: Vec<Disputed>,
+}
+
+/// A coin some peers' pages list and others leave out where it would be
+/// (a finished page, or one cut by a peer that knows no more than the
+/// lowest knowledge): its record, as every page that lists it gives it, the
+/// pages (by index) that list it, and those that leave it out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Disputed {
+    pub record: CoinRecord,
+    pub listed_by: Vec<usize>,
+    pub missing_from: Vec<usize>,
 }
 
 /// Judge the peers' pages of one listing together. Two honest peers need not
@@ -2591,6 +2629,17 @@ pub(crate) struct Settled {
 /// absent, since the wallet lease takes a parked input absent from a complete
 /// listing for gone. Otherwise the listing continues from the lowest height.
 pub(crate) fn settle_pages(pages: &[Page], include_spent: bool, min_height: Option<u32>) -> Option<Settled> {
+    settle_hinted_pages(pages, include_spent, min_height).filter(|settled| settled.disputed.is_empty())
+}
+
+/// [`settle_pages`] for a hinted listing: a coin some pages list and others
+/// leave out where it would be is not a disagreement yet but
+/// [`Settled::disputed`], left out of the listing until it is settled by its
+/// id and its parent's spend ([`settle_disputed`]), since a full node never
+/// deletes a hint row and only the nodes that took an orphaned block keep
+/// its rows. Every other difference is a disagreement as in
+/// [`settle_pages`]: a record two pages give otherwise above all.
+pub(crate) fn settle_hinted_pages(pages: &[Page], include_spent: bool, min_height: Option<u32>) -> Option<Settled> {
     let low = pages.iter().min_by_key(|p| p.height)?;
     let (height, header_hash) = (low.height, low.header_hash);
     if pages.iter().any(|p| p.height == height && p.header_hash != header_hash) {
@@ -2617,7 +2666,7 @@ pub(crate) fn settle_pages(pages: &[Page], include_spent: bool, min_height: Opti
             records_from(states, include_spent, min_height)
         })
         .collect();
-    let (records, unknown) = agreed(&lists, |i, _| !pages[i].finished && pages[i].knowledge > knowledge)?;
+    let Agreement { records, left_out: unknown, one_sided: disputed } = agreed(&lists, |i, _| !pages[i].finished && pages[i].knowledge > knowledge, true)?;
     let judged_at = Some(knowledge);
     let listing = if unknown {
         CoinListing { records, truncated: true, next_cursor: None, judged_at }
@@ -2632,6 +2681,7 @@ pub(crate) fn settle_pages(pages: &[Page], include_spent: bool, min_height: Opti
         unverified: above(pages, height),
         knowledge_at: (knowledge, knowledge_hash),
         unverified_knowledge: ahead_of(pages, knowledge),
+        disputed,
     })
 }
 
@@ -2682,7 +2732,7 @@ pub(crate) fn settle_states(pages: &[Page], include_spent: bool) -> Option<Settl
     let finished = pages.iter().all(|p| p.finished);
     let hidden = hides_a_coin(pages, knowledge);
     let lists: Vec<Vec<CoinRecord>> = pages.iter().map(|p| records_from(as_of(p.states.clone(), knowledge), include_spent, None)).collect();
-    let (records, unknown) = agreed(&lists, |i, id| pages[i].pending.contains(id))?;
+    let Agreement { records, left_out: unknown, .. } = agreed(&lists, |i, id| pages[i].pending.contains(id), false)?;
     let listing = CoinListing { records, truncated: !finished || hidden || unknown, next_cursor: None, judged_at: Some(knowledge) };
     Some(Settled {
         listing,
@@ -2690,14 +2740,27 @@ pub(crate) fn settle_states(pages: &[Page], include_spent: bool) -> Option<Settl
         unverified: above(pages, height),
         knowledge_at: (knowledge, knowledge_hash),
         unverified_knowledge: ahead_of(pages, knowledge),
+        disputed: vec![],
     })
+}
+
+/// What [`agreed`] makes of the peers' lists: the records every list gives
+/// alike, in the first list's (height, id) order; whether any coin had to be
+/// left out as unknown; and, when asked for, the one-sided coins.
+struct Agreement {
+    records: Vec<CoinRecord>,
+    left_out: bool,
+    one_sided: Vec<Disputed>,
 }
 
 /// The records every list gives alike, and whether any coin had to be left
 /// out as unknown: a coin missing from list `i` is unknown when
-/// `unknown(i, &id)` says so, else its absence is a difference. `None` on any
-/// difference. The records keep the first list's (height, id) order.
-fn agreed(lists: &[Vec<CoinRecord>], unknown: impl Fn(usize, &Bytes32) -> bool) -> Option<(Vec<CoinRecord>, bool)> {
+/// `unknown(i, &id)` says so, else its absence is a difference, unless
+/// `one_sided`, when the coin is left out of the records and comes back
+/// [`Disputed`], with the lists that left it out. `None` on any other
+/// difference, a record two lists give otherwise above all. The records keep
+/// the first list's (height, id) order.
+fn agreed(lists: &[Vec<CoinRecord>], unknown: impl Fn(usize, &Bytes32) -> bool, one_sided: bool) -> Option<Agreement> {
     let first = lists.first()?;
     let by_id: Vec<HashMap<Bytes32, &CoinRecord>> = lists.iter().map(|l| l.iter().map(|r| (r.coin.coin_id(), r)).collect()).collect();
     let mut ids: Vec<Bytes32> = by_id.iter().flat_map(|m| m.keys().copied()).collect();
@@ -2705,26 +2768,36 @@ fn agreed(lists: &[Vec<CoinRecord>], unknown: impl Fn(usize, &Bytes32) -> bool) 
     ids.dedup();
     let mut left_out = false;
     let mut keep: HashSet<Bytes32> = HashSet::new();
+    let mut disputed: Vec<Disputed> = Vec::new();
     for id in ids {
         let mut seen: Option<&CoinRecord> = None;
         let mut everywhere = true;
+        let mut listed_by: Vec<usize> = Vec::new();
+        let mut missing_from: Vec<usize> = Vec::new();
         for (i, m) in by_id.iter().enumerate() {
             match m.get(&id) {
-                Some(r) => match seen {
-                    Some(s) if s != *r => return None,
-                    _ => seen = Some(*r),
-                },
+                Some(r) => {
+                    match seen {
+                        Some(s) if s != *r => return None,
+                        _ => seen = Some(*r),
+                    }
+                    listed_by.push(i);
+                }
                 None if unknown(i, &id) => everywhere = false,
+                None if one_sided => missing_from.push(i),
                 None => return None,
             }
         }
-        if everywhere {
-            keep.insert(id);
-        } else {
-            left_out = true;
+        match seen {
+            Some(record) if !missing_from.is_empty() => disputed.push(Disputed { record: record.clone(), listed_by, missing_from }),
+            _ if everywhere => {
+                keep.insert(id);
+            }
+            _ => left_out = true,
         }
     }
-    Some((first.iter().filter(|r| keep.contains(&r.coin.coin_id())).cloned().collect(), left_out))
+    let records = first.iter().filter(|r| keep.contains(&r.coin.coin_id())).cloned().collect();
+    Some(Agreement { records, left_out, one_sided: disputed })
 }
 
 /// Does taking the pages as of `knowledge` leave a coin out that a peer has
@@ -2766,7 +2839,7 @@ fn as_of(states: Vec<CoinState>, height: u32) -> Vec<CoinState> {
 /// otherwise stay pooled and be chosen again and again. A carrier's lone
 /// answer has nobody to ask.
 async fn confirmed(lane: &Lane, answers: &[(Arc<PeerConn>, Page)], settled: Settled) -> Result<Option<CoinListing>, ChainError> {
-    let Settled { listing, at, unverified, knowledge_at, unverified_knowledge } = settled;
+    let Settled { listing, at, unverified, knowledge_at, unverified_knowledge, .. } = settled;
     let mut checks: Vec<(usize, u32, Bytes32)> = unverified.into_iter().map(|i| (i, at.0, at.1)).collect();
     for i in unverified_knowledge {
         // One request where the two heights are one (a finished page at the
@@ -2811,17 +2884,307 @@ fn in_step(pages: &[Page]) -> Result<(), ChainError> {
 
 /// Settle the peers' listing pages ([`settle_pages`]), their views in step
 /// ([`in_step`]), and have the peers ahead show the header at the height
-/// judged ([`confirmed`]).
+/// judged ([`confirmed`]). A listing under `hint` is settled as a hinted one
+/// ([`settle_hinted_pages`]): the coins some pages list and others leave out
+/// are settled after the headers, on the same peers ([`settle_disputed`]),
+/// so a pair whose pages stand on two chains is let go before anything more
+/// is asked of it. A listing the peers agree on costs no request more. Any
+/// other listing has no such coin to settle: one would be a disagreement,
+/// never a coin left out of the listing.
 async fn settle_listing(
     lane: &Lane,
     answers: Vec<(Arc<PeerConn>, Page)>,
     include_spent: bool,
     min_height: Option<u32>,
+    hint: Option<Bytes32>,
 ) -> Result<Option<CoinListing>, ChainError> {
     let pages: Vec<Page> = answers.iter().map(|(_, p)| p.clone()).collect();
     in_step(&pages)?;
-    let Some(settled) = settle_pages(&pages, include_spent, min_height) else { return Ok(None) };
-    confirmed(lane, &answers, settled).await
+    let settled = match hint {
+        Some(_) => settle_hinted_pages(&pages, include_spent, min_height),
+        None => settle_pages(&pages, include_spent, min_height),
+    };
+    let Some(mut settled) = settled else { return Ok(None) };
+    let disputed = std::mem::take(&mut settled.disputed);
+    let knowledge = settled.knowledge_at.0;
+    let Some(listing) = confirmed(lane, &answers, settled).await? else { return Ok(None) };
+    match hint {
+        _ if disputed.is_empty() => Ok(Some(listing)),
+        Some(hint) => settle_disputed(lane, &answers, hint, knowledge, disputed, listing).await,
+        None => Ok(None),
+    }
+}
+
+/// Settle the coins of a hinted listing that some peers' pages list and
+/// others leave out ([`settle_hinted_pages`]), on the peers that gave the
+/// pages, once they have shown their headers ([`confirmed`]). A full node
+/// never deletes a hint row (`hint_store.py`), and a coin's id does not
+/// depend on its memo: a coin a new fork made again under another hint
+/// stays listed under the old one by every node that took the orphaned
+/// block, and only by those, which anyone who can compute the hint can
+/// bring about with one spend in a block that happens to be orphaned. Two
+/// honest peers then differ, and neither is to be let go for it. So:
+///   1. every peer is asked for those coins by id, in one lookup
+///      ([`states_on`]), and must give each one's record, as of the height
+///      the pages were taken as of, as the pages that list it do: a peer
+///      that denies one, or gives another record, disagrees, and so do
+///      peers one of which refuses the lookup the other answers;
+///   2. every peer is asked for the spend that made each (its parent's, at
+///      the height it was created at; one request per distinct spend) and
+///      must serve it alike: another spend, or none beside one, disagrees;
+///   3. each spend is run once ([`hints_made`]), and a coin whose output in
+///      that spend a full node files under the hint, or whose own puzzle
+///      hash is the hint (it needs no spend), is kept, the peers that left
+///      it out named in the log: a page without a coin the chain made under
+///      the hint is a peer hiding it, or one whose hint store lacks a row;
+///      any other is a stale row, left out, nobody let go and nothing
+///      logged, since every read of the hint meets it again for the rest of
+///      its era.
+///
+/// No verdict, and nobody let go, when:
+///   * a peer does not answer, leaves ids of the lookup unanswered, or its
+///     view fell back below that height: the connection of each such peer
+///     is dropped (back to the queue, as a silent peer's of any request
+///     is);
+///   * the coins were made by more than [`MAX_DISPUTED_PARENTS`] spends
+///     (counted once the lookup has shown them real, so coins a peer made up
+///     are denied first), or no peer serves a spend that made one, as no
+///     honest node listing the coin would fail to: this pair settles
+///     neither, so the connections of the peers whose pages listed the
+///     coins are dropped, and the next read takes another pair rather than
+///     meeting the same rows, or the same liar, again and again;
+///   * every peer refuses the lookup, which no honest node does: each
+///     connection is dropped;
+///   * an agreed spend does not run or makes no such coin, here: the peers
+///     and the chain agree, and the fault is the reading's.
+///
+/// `Ok(None)` is a disagreement, and the caller lets the public peers go as
+/// for any other ([`Lane::verdict`]).
+async fn settle_disputed(
+    lane: &Lane,
+    answers: &[(Arc<PeerConn>, Page)],
+    hint: Bytes32,
+    knowledge: u32,
+    disputed: Vec<Disputed>,
+    mut listing: CoinListing,
+) -> Result<Option<CoinListing>, ChainError> {
+    let peers: Vec<Arc<PeerConn>> = answers.iter().map(|(peer, _)| peer.clone()).collect();
+    let mut listers: Vec<usize> = disputed.iter().flat_map(|d| d.listed_by.iter().copied()).collect();
+    listers.sort_unstable();
+    listers.dedup();
+
+    let ids: Vec<Bytes32> = disputed.iter().map(|d| d.record.coin.coin_id()).collect();
+    let lookups = join_all(peers.iter().map(|peer| states_on(peer.clone(), lane.net.clone(), ids.clone()))).await;
+    let Some(pages) = answered(lane, &peers, "the lookup by id of one-sided coins", lookups).await? else { return Ok(None) };
+    let mut short: Vec<String> = Vec::new();
+    for (peer, page) in peers.iter().zip(&pages) {
+        let why = if !page.pending.is_empty() {
+            format!("{} answered for {} of the {} coins asked by id", peer.addr(), ids.len() - page.pending.len(), ids.len())
+        } else if page.knowledge < knowledge {
+            format!("{}'s view fell back to height {} below the listing's {knowledge}", peer.addr(), page.knowledge)
+        } else {
+            continue;
+        };
+        lane.drop_conn(peer).await;
+        short.push(why);
+    }
+    if !short.is_empty() {
+        return Err(unanswered(format!(
+            "coins by hint: {} while one-sided coins were settled; non-final, nobody let go, those connections dropped",
+            short.join("; ")
+        )));
+    }
+    for (peer, page) in peers.iter().zip(pages) {
+        let records: HashMap<Bytes32, CoinRecord> =
+            records_from(as_of(page.states, knowledge), true, None).into_iter().map(|r| (r.coin.coin_id(), r)).collect();
+        if let Some(d) = disputed.iter().find(|d| records.get(&d.record.coin.coin_id()) != Some(&d.record)) {
+            let id = d.record.coin.coin_id();
+            match records.get(&id) {
+                None => eprintln!("⛓️ chain peers: {} denies coin {id} by id, which a listing under hint {hint} gives", peer.addr()),
+                Some(_) => eprintln!("⛓️ chain peers: {} gives coin {id} by id otherwise than a listing under hint {hint} does", peer.addr()),
+            }
+            return Ok(None);
+        }
+    }
+
+    let mut spends: Vec<(Bytes32, u32)> = disputed
+        .iter()
+        .filter(|d| d.record.coin.puzzle_hash != hint)
+        .map(|d| (d.record.coin.parent_coin_info, d.record.confirmed_block_index))
+        .collect();
+    spends.sort_unstable();
+    spends.dedup();
+    if spends.len() > MAX_DISPUTED_PARENTS {
+        drop_listers(lane, &peers, &listers).await;
+        return Err(unanswered(format!(
+            "coins by hint: {} coins some peers list and others leave out, made by {} spends, more than the {MAX_DISPUTED_PARENTS} one listing settles; non-final, nobody let go, the listing peers' connections dropped",
+            disputed.len(),
+            spends.len()
+        )));
+    }
+
+    let fetched = join_all(peers.iter().map(|peer| join_all(spends.iter().map(|&(parent, height)| spend_on(peer.clone(), parent, height))))).await;
+    let fetched: Vec<Result<Vec<Option<PuzzleAndSolution>>, ChainError>> = fetched.into_iter().map(|theirs| theirs.into_iter().collect()).collect();
+    let Some(served) = answered(lane, &peers, "the spends that made one-sided coins", fetched).await? else { return Ok(None) };
+    let mut agreed_spends: Vec<PuzzleAndSolution> = Vec::with_capacity(spends.len());
+    for (j, &(parent, height)) in spends.iter().enumerate() {
+        if let Some(i) = (1..served.len()).find(|&i| served[i][j] != served[0][j]) {
+            eprintln!("⛓️ chain peers: {} serves the spend of {parent} at height {height} otherwise than {}", peers[i].addr(), peers[0].addr());
+            return Ok(None);
+        }
+        match &served[0][j] {
+            Some(spend) => agreed_spends.push(spend.clone()),
+            None => {
+                drop_listers(lane, &peers, &listers).await;
+                return Err(unanswered(format!(
+                    "coins by hint: no peer serves the spend of {parent} at height {height}, which made a coin some of them list; non-final, nobody let go, the listing peers' connections dropped"
+                )));
+            }
+        }
+    }
+
+    // Each spend run once, off the async workers: one spend may hold a
+    // block's worth of CLVM, and a page may name up to
+    // MAX_DISPUTED_PARENTS of them.
+    let runs = tokio::task::spawn_blocking(move || agreed_spends.iter().map(hints_made).collect::<Vec<_>>())
+        .await
+        .map_err(|e| unanswered(format!("coins by hint: the spends that made one-sided coins could not be run ({e}); non-final, nobody let go")))?;
+    let mut made: HashMap<(Bytes32, u32), HashMap<(Bytes32, u64), Bytes>> = HashMap::with_capacity(spends.len());
+    for (&(parent, height), run) in spends.iter().zip(runs) {
+        match run {
+            Ok(outputs) => {
+                made.insert((parent, height), outputs);
+            }
+            Err(e) => {
+                return Err(unanswered(format!(
+                    "coins by hint: the spend of {parent} at height {height} the peers serve does not run ({e:#}); non-final, nobody let go"
+                )))
+            }
+        }
+    }
+
+    for d in disputed {
+        let coin = d.record.coin;
+        let carried = coin.puzzle_hash == hint
+            || match made[&(coin.parent_coin_info, d.record.confirmed_block_index)].get(&(coin.puzzle_hash, coin.amount)) {
+                Some(filed) => filed.as_ref() == hint.as_ref(),
+                None => {
+                    return Err(unanswered(format!(
+                        "coins by hint: the spend the peers serve for the parent of coin {} makes no such coin; non-final, nobody let go",
+                        coin.coin_id()
+                    )))
+                }
+            };
+        if carried {
+            let left_out: Vec<String> = d.missing_from.iter().map(|&i| peers[i].addr().to_string()).collect();
+            eprintln!(
+                "⛓️ chain peers: {} left coin {} out of its listing under hint {hint}, though its own answers by id and of the spend show the chain made it under that hint; the coin is kept",
+                left_out.join(", "),
+                coin.coin_id()
+            );
+            listing.records.push(d.record);
+        }
+    }
+    listing.records.sort_by_key(|r| (r.confirmed_block_index, r.coin.coin_id()));
+    Ok(Some(listing))
+}
+
+/// The coins `spend` makes, by puzzle hash and amount, each with the hint a
+/// full node files it under (empty for none): the first element of its
+/// CREATE_COIN's memos when that is an atom of 32 bytes or fewer, whatever
+/// follows it, as consensus reads the spend's conditions in a block
+/// (`chia_consensus::conditions::parse_args`, the parse the full node's hint
+/// store is filled from, `hint_management.py`), and only the conditions it
+/// takes for CREATE_COIN. The readers' memo parse
+/// ([`crate::chia_resolve::created_coins`]) reads no memo where the list
+/// does not read as atoms throughout, nor an output whose CREATE_COIN takes
+/// more arguments than the memos, which a block may carry; the listing is the
+/// full node's, so the lane judges a row by the full node's rule. `Err` when
+/// the spend does not run, or its result is no list of conditions a block
+/// would carry.
+fn hints_made(spend: &PuzzleAndSolution) -> anyhow::Result<HashMap<(Bytes32, u64), Bytes>> {
+    use chia_consensus::validation_error::{first, next, rest};
+    #[cfg(test)]
+    {
+        *SPEND_RUNS.lock().unwrap().entry(spend.solution.to_vec()).or_default() += 1;
+    }
+    let mut a = Allocator::new();
+    let puzzle = spend.puzzle_reveal.to_clvm(&mut a).map_err(|e| anyhow!("the puzzle reveal: {e:?}"))?;
+    let solution = spend.solution.to_clvm(&mut a).map_err(|e| anyhow!("the solution: {e:?}"))?;
+    let mut conditions = run_puzzle(&mut a, puzzle, solution).map_err(|e| anyhow!("the puzzle does not run: {e:?}"))?;
+    let mut made = HashMap::new();
+    let invalid = |e: chia_consensus::validation_error::ValidationErr| anyhow!("its conditions: {:?}", e.1);
+    while let Some((condition, more)) = next(&a, conditions).map_err(invalid)? {
+        conditions = more;
+        if parse_opcode(&a, first(&a, condition).map_err(invalid)?, 0) != Some(CREATE_COIN) {
+            continue;
+        }
+        let Condition::CreateCoin(puzzle_hash, amount, hint) = parse_args(&a, rest(&a, condition).map_err(invalid)?, CREATE_COIN, 0).map_err(invalid)? else {
+            continue;
+        };
+        let puzzle_hash = Bytes32::new(<[u8; 32]>::try_from(a.atom(puzzle_hash).as_ref())?);
+        if made.insert((puzzle_hash, amount), Bytes::new(a.atom(hint).as_ref().to_vec())).is_some() {
+            return Err(anyhow!("it makes the coin of puzzle hash {puzzle_hash} and amount {amount} twice"));
+        }
+    }
+    Ok(made)
+}
+
+/// How many times [`hints_made`] has run each spend, by its solution's
+/// bytes (tests: a settling runs each spend once, however many coins it
+/// made).
+#[cfg(test)]
+pub(crate) static SPEND_RUNS: std::sync::LazyLock<std::sync::Mutex<HashMap<Vec<u8>, usize>>> = std::sync::LazyLock::new(Default::default);
+
+/// The answers the peers give one more request of a settling
+/// ([`settle_disputed`]), judged as [`Lane::verdict`] judges theirs to the
+/// request itself: a peer that does not answer has its connection dropped,
+/// each one, and there is no verdict; some refusing what others answer is a
+/// split verdict (`Ok(None)`: the caller lets the peers go); every one
+/// refusing, as no honest node refuses these, is no verdict, each
+/// connection dropped; otherwise the answers, in the peers' order.
+async fn answered<T>(lane: &Lane, peers: &[Arc<PeerConn>], what: &str, results: Vec<Result<T, ChainError>>) -> Result<Option<Vec<T>>, ChainError> {
+    let mut oks = Vec::new();
+    let mut silences = Vec::new();
+    let mut refusals = Vec::new();
+    for (peer, result) in peers.iter().zip(results) {
+        match result {
+            Ok(v) => oks.push(v),
+            Err(ChainError::Unanswered(e)) => {
+                lane.drop_conn(peer).await;
+                silences.push(format!("{}: {e:#}", peer.addr()));
+            }
+            Err(ChainError::Refused(why)) => refusals.push(format!("{}: {why}", peer.addr())),
+        }
+    }
+    if !silences.is_empty() {
+        return Err(unanswered(format!(
+            "coins by hint: {} of {} peers gave no answer to {what} ({}); non-final, nobody let go",
+            silences.len(),
+            peers.len(),
+            silences.join("; ")
+        )));
+    }
+    if refusals.is_empty() {
+        return Ok(Some(oks));
+    }
+    if oks.is_empty() {
+        for peer in peers {
+            lane.drop_conn(peer).await;
+        }
+        return Err(unanswered(format!("coins by hint: every peer refused {what} ({}); non-final, nobody let go", refusals.join("; "))));
+    }
+    eprintln!("⛓️ chain peers: {what} refused by some peers and answered by others ({})", refusals.join("; "));
+    Ok(None)
+}
+
+/// Drop the connections of the peers at `listers` (back to the queue, not
+/// let go): their pages listed one-sided coins that could not be settled
+/// ([`settle_disputed`]).
+async fn drop_listers(lane: &Lane, peers: &[Arc<PeerConn>], listers: &[usize]) {
+    for &i in listers {
+        lane.drop_conn(&peers[i]).await;
+    }
 }
 
 /// [`settle_listing`] for coin-state lookups ([`settle_states`]).
@@ -3086,7 +3449,7 @@ impl ChainAccess for PeerLane {
                 "coins by hint",
                 self.trust,
                 move |peer| listing_on(peer, net.clone(), vec![hint], true, start_height, cursor.clone()),
-                move |answers| settle_listing(lane, answers, include_spent, start_height),
+                move |answers| settle_listing(lane, answers, include_spent, start_height, Some(hint)),
             )
             .await
         }
@@ -3105,7 +3468,7 @@ impl ChainAccess for PeerLane {
                 "coins by puzzle hash",
                 self.trust,
                 move |peer| listing_on(peer, net.clone(), vec![puzzle_hash], false, None, cursor.clone()),
-                move |answers| settle_listing(lane, answers, include_spent, None),
+                move |answers| settle_listing(lane, answers, include_spent, None, None),
             )
             .await
         }
@@ -6743,5 +7106,100 @@ mod tests {
             .await;
             assert!(ended.is_ok(), "round {round} ({at:?}) ends within its bound");
         }
+    }
+
+    /// A spend of `conditions` at the puzzle `1`, which returns its solution:
+    /// the conditions as built in `a`.
+    fn spend_of(build: impl FnOnce(&mut Allocator) -> Vec<clvmr::NodePtr>) -> PuzzleAndSolution {
+        let mut a = Allocator::new();
+        let conditions = build(&mut a);
+        let list = conditions.to_clvm(&mut a).unwrap();
+        PuzzleAndSolution { puzzle_reveal: Program::from(vec![1u8]), solution: Program::from(clvmr::serde::node_to_bytes(&a, list).unwrap()) }
+    }
+
+    /// The hint a coin is filed under is the one consensus reads, which the
+    /// full node's hint store is filled from: the first element of the
+    /// CREATE_COIN's memos when it is an atom of 32 bytes or fewer, whatever
+    /// follows it, in the list or after the memos argument (a block may
+    /// carry either); none when that element is a pair or a longer atom, or
+    /// there are no memos. A condition whose opcode is no CREATE_COIN to
+    /// consensus (51 written with a redundant leading zero) makes nothing,
+    /// and other conditions are passed over.
+    #[test]
+    fn a_spends_outputs_are_filed_under_the_first_memo_atom_consensus_reads_whatever_follows_it() {
+        use clvm_traits::clvm_list;
+        let ph = Bytes32::new([3u8; 32]);
+        let h = Bytes32::new([4u8; 32]);
+        let spend = spend_of(|a| {
+            vec![
+                clvm_list!(51, ph, 1u64, clvm_list!(h, Bytes::new(vec![7u8]))).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 2u64, clvm_list!(h, clvm_list!(1))).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 3u64, (h, 5)).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 4u64, clvm_list!(h), 9).to_clvm(a).unwrap(),
+                clvm_list!(Bytes::new(vec![0, 51]), ph, 5u64, clvm_list!(h)).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 6u64, clvm_list!(clvm_list!(h))).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 7u64, clvm_list!(Bytes::new(vec![4u8; 33]))).to_clvm(a).unwrap(),
+                clvm_list!(51, ph, 8u64).to_clvm(a).unwrap(),
+                clvm_list!(73, 100u64).to_clvm(a).unwrap(),
+            ]
+        });
+        let made = hints_made(&spend).unwrap();
+        let hinted = Bytes::new(h.to_vec());
+        let none = Bytes::new(vec![]);
+        let want: HashMap<(Bytes32, u64), Bytes> = [
+            ((ph, 1), hinted.clone()),
+            ((ph, 2), hinted.clone()),
+            ((ph, 3), hinted.clone()),
+            ((ph, 4), hinted),
+            ((ph, 6), none.clone()),
+            ((ph, 7), none.clone()),
+            ((ph, 8), none),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(made, want);
+
+        let twice = spend_of(|a| vec![clvm_list!(51, ph, 1u64).to_clvm(a).unwrap(), clvm_list!(51, ph, 1u64, clvm_list!(h)).to_clvm(a).unwrap()]);
+        assert!(hints_made(&twice).is_err(), "a spend that makes one coin twice is none a block carries");
+        let no_list = PuzzleAndSolution { puzzle_reveal: Program::from(vec![1u8]), solution: Program::from(vec![5u8]) };
+        assert!(hints_made(&no_list).is_err(), "conditions that are no list");
+    }
+
+    /// The answers to one more request of a settling are judged as a
+    /// verdict's are: every peer that does not answer has its connection
+    /// dropped, not only the first; a refusal beside an answer is a split
+    /// verdict, with nobody dropped here (the caller lets them go); a
+    /// refusal beside a silence is no verdict, the silent peer dropped; and
+    /// every peer refusing is no verdict, each dropped.
+    #[tokio::test]
+    async fn a_settlings_answers_drop_every_silent_peer_and_split_on_a_refusal_beside_an_answer() {
+        let a = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(4, 50, None)], (1, None), Some(peak_at(100))).await;
+        let silent = || Err::<u8, _>(unanswered("timed out".to_string()));
+        let refused = || Err::<u8, _>(ChainError::Refused("rejected".to_string()));
+        let pooled = |lane: Arc<Lane>| async move {
+            PeerLane::new(lane.clone(), Trust::Agreed).coin_records_by_names(vec![coin(4).coin_id()], true, None).await.unwrap();
+            let peers = lane.live_conns().await;
+            assert_eq!(peers.len(), 2);
+            peers
+        };
+
+        let one = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let peers = pooled(one.clone()).await;
+        assert!(matches!(answered(&one, &peers, "x", vec![Ok(1), Ok(2)]).await, Ok(Some(v)) if v == vec![1, 2]));
+        assert!(matches!(answered(&one, &peers, "x", vec![Ok(1), refused()]).await, Ok(None)), "a split verdict");
+        assert_eq!(one.live_count().await, 2, "nobody dropped for it here");
+        assert!(matches!(answered(&one, &peers, "x", vec![refused(), silent()]).await, Err(ChainError::Unanswered(_))));
+        assert_eq!(one.live_conns().await.iter().map(|p| p.addr()).collect::<Vec<_>>(), vec![peers[0].addr()], "the silent peer is dropped");
+
+        let two = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let peers = pooled(two.clone()).await;
+        assert!(matches!(answered(&two, &peers, "x", vec![silent(), silent()]).await, Err(ChainError::Unanswered(_))));
+        assert_eq!(two.live_count().await, 0, "both silent peers are dropped");
+
+        let three = lane(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)], vec![], false, None);
+        let peers = pooled(three.clone()).await;
+        assert!(matches!(answered(&three, &peers, "x", vec![refused(), refused()]).await, Err(ChainError::Unanswered(_))));
+        assert_eq!(three.live_count().await, 0, "both refusing peers are dropped");
     }
 }

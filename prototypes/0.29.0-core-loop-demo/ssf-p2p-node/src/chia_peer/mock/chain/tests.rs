@@ -1013,9 +1013,11 @@ async fn a_coin_made_again_on_a_new_fork_with_another_hint_is_listed_under_both_
 /// adds the rows of the blocks above the fork point, as a full node taking
 /// the new peak adds those of the blocks since the fork, and never the old
 /// fork's. Under the new hint both nodes list the coin and agree; under the
-/// old one only the node that took the old fork does, so an agreed listing
-/// there has no answer, as one from two real nodes with those histories has
-/// none.
+/// old one only the node that took the old fork does, as only one of two
+/// real nodes with those histories does. The agreed listing there asks
+/// both for the coin by id and for its parent's spend, finds the spend made
+/// it under the new hint, so the row stale, and lists nothing, letting
+/// neither node go.
 #[tokio::test]
 async fn a_node_held_through_the_old_fork_never_gets_its_hint_row_so_only_the_other_lists_the_coin_under_it() {
     let s = setup().await;
@@ -1044,7 +1046,10 @@ async fn a_node_held_through_the_old_fork_never_gets_its_hint_row_so_only_the_ot
 
     let listed = s.money.coin_records_by_hint(hint(2), None, true, None).await.unwrap();
     assert_eq!(listed.records.iter().map(|r| r.coin).collect::<Vec<_>>(), vec![child], "both nodes list it under the new hint");
-    unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    let stale = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert!(stale.records.is_empty() && !stale.truncated, "the row only node a keeps is stale: {stale:?}");
+    assert_eq!(stale.judged_at, Some(peak));
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -1100,5 +1105,415 @@ async fn a_node_held_after_it_took_the_old_fork_keeps_its_hint_row_when_released
             assert_eq!((answer.coin_states, answer.height, answer.is_finished), (expected, peak, true), "{which}, {filters:?}");
         }
     }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// How many requests of `kind` `node` has read.
+fn asked(node: &MockNode, kind: ProtocolMessageTypes) -> usize {
+    node.seen.lock().unwrap().iter().filter(|k| **k == kind).count()
+}
+
+/// The coin-state and spend requests each node has read, node a's first.
+fn by_id_and_spends(s: &Setup) -> [(usize, usize); 2] {
+    [&s.a, &s.b].map(|n| (asked(n, ProtocolMessageTypes::RequestCoinState), asked(n, ProtocolMessageTypes::RequestPuzzleSolution)))
+}
+
+/// The requests of [`by_id_and_spends`] each node has read since `before`.
+fn asked_since(s: &Setup, before: [(usize, usize); 2]) -> [(usize, usize); 2] {
+    let now = by_id_and_spends(s);
+    [0, 1].map(|i| (now[i].0 - before[i].0, now[i].1 - before[i].1))
+}
+
+/// The nodes the lane still holds a connection to.
+async fn live(s: &Setup) -> Vec<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = s.lane.live_conns().await.iter().map(|c| c.addr()).collect();
+    addrs.sort();
+    addrs
+}
+
+/// How many times the lane has run `spend` to read the hints of what it
+/// made ([`crate::chia_peer_lane::SPEND_RUNS`]).
+fn runs_of(spend: &CoinSpend) -> usize {
+    crate::chia_peer_lane::SPEND_RUNS.lock().unwrap().get(&spend.solution.to_vec()).copied().unwrap_or(0)
+}
+
+/// Any CLVM value as a program: a memos argument of any shape
+/// ([`Cond::CreateCoinMemos`]).
+fn program(value: impl clvm_traits::ToClvm<clvmr::Allocator>) -> Program {
+    let mut a = clvmr::Allocator::new();
+    let node = value.to_clvm(&mut a).expect("a CLVM value");
+    Program::from(clvmr::serde::node_to_bytes(&a, node).expect("its bytes"))
+}
+
+/// Each of `parents` passed whole to the open puzzle under the memo `hint`:
+/// the child [`passed`] names, made again under any other hint by the same
+/// spend with that memo.
+fn passing(parents: &[Coin], hint: Bytes32) -> Vec<CoinSpend> {
+    parents.iter().map(|p| open_coin_spend(*p, &[Cond::CreateCoin(open_puzzle_hash(), p.amount, memo(hint))])).collect()
+}
+
+fn bundle(spends: Vec<CoinSpend>) -> SpendBundle {
+    SpendBundle::new(spends, chia_bls::Signature::default())
+}
+
+/// Stale hint rows on node a alone, come by as two real nodes come by them:
+/// node b is held while a block carrying `old` comes and goes, replaced by
+/// a fork whose first block carries `new`, the same spends with other
+/// memos, which make the same coins at the same height; then b is released
+/// onto the new fork. Node a keeps the old block's rows beside the new
+/// one's, and b has the new one's alone. Returns the peak; the coins are
+/// made a block below it.
+async fn stale_rows_on_a(s: &Setup, old: SpendBundle, new: SpendBundle) -> u32 {
+    s.chain.hold(&s.b);
+    s.chain.include_next(old);
+    s.chain.farm().await;
+    let peak = s.chain.reorg_including(1, vec![new]).await;
+    s.chain.release(&s.b).await;
+    peak
+}
+
+/// A stale row node a alone keeps is settled by the coin's id and its
+/// parent's spend only when both nodes say the same of the coin. Node a,
+/// which lists it under the old hint, denying it by id, or node b, which
+/// leaves it out, denying it while a gives it, is a disagreement as any
+/// other: the listing has no answer and both public peers are let go.
+#[tokio::test]
+async fn a_coin_one_node_lists_under_a_hint_and_either_node_denies_by_id_is_a_disagreement_and_both_nodes_are_let_go() {
+    for denier in ["a, which lists it", "b, which leaves it out"] {
+        let s = setup().await;
+        let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+        s.chain.farm().await;
+        stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+        let node = if denier.starts_with('a') { &s.a } else { &s.b };
+        s.chain.deny_on(node, passed(parent).coin_id());
+        let before = by_id_and_spends(&s);
+
+        let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+        assert!(why.contains("disagree"), "{denier}: {why}");
+        assert_eq!(s.lane.live_count().await, 0, "{denier}: both peers were let go");
+        assert_eq!(asked_since(&s, before), [(1, 0); 2], "{denier}: one lookup of each node by id, and no spend once a node denied the coin");
+        assert!(s.chain.unanswered().is_empty());
+    }
+}
+
+/// A genuine hinted coin one node leaves out of its listing (a peer hiding
+/// it, or one whose hint store lacks the row) while it gives the coin by id
+/// and serves the spend that made it, which carries the hint as its first
+/// memo, is kept, and nobody is let go: the listing comes back whole, in
+/// height then id order. A coin at the hint's own puzzle hash it leaves out
+/// is kept on its record alone, its parent's spend never asked for (a
+/// funding coin's parent was never spent, and no node could serve one).
+#[tokio::test]
+async fn a_hinted_coin_one_node_leaves_out_but_gives_by_id_is_kept_when_its_parent_spend_carries_the_hint_and_nobody_is_let_go() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    s.money.push_tx(bundle(passing(&[parent], hint(1)))).await.unwrap();
+    let both = s.chain.fund(open, 500, Some(hint(1)));
+    let at_hint = s.chain.fund(hint(1), 700, None);
+    let made = s.chain.farm().await;
+    let child = passed(parent);
+    s.chain.hide_on(&s.b, child.coin_id());
+    s.chain.hide_on(&s.b, at_hint.coin_id());
+    let before = by_id_and_spends(&s);
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    let mut want = vec![(both, made), (child, made), (at_hint, made)];
+    want.sort_by_key(|(c, _)| c.coin_id());
+    assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), want, "both coins b left out are kept");
+    assert!(!listed.truncated && listed.judged_at == Some(made));
+    assert_eq!(asked_since(&s, before), [(1, 1); 2], "one lookup by id and one spend of each node; none for the coin at the hint");
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A coin is filed under the hint a full node reads in its output: the
+/// first element of the CREATE_COIN's memos when that is an atom, whatever
+/// follows it. Under memos `(hint (1))` or `(hint . 5)`, which read as no
+/// list of atoms, both nodes file the coin under the hint, so node b
+/// leaving those coins out is a peer hiding them, and the lane keeps them,
+/// as it keeps any coin the chain made under the hint, nobody let go.
+#[tokio::test]
+async fn a_coin_whose_memos_are_no_list_of_atoms_but_start_with_the_hint_is_kept_when_one_node_leaves_it_out() {
+    use clvm_traits::clvm_list;
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let nested = program(clvm_list!(hint(1), clvm_list!(1)));
+    let dotted = program((hint(1), 5));
+    let spend = open_coin_spend(parent, &[Cond::CreateCoinMemos(open, 600, nested), Cond::CreateCoinMemos(open, 400, dotted)]);
+    s.money.push_tx(bundle(vec![spend])).await.unwrap();
+    let made = s.chain.farm().await;
+    let children: Vec<Coin> = [600, 400].map(|amount| Coin::new(parent.coin_id(), open, amount)).to_vec();
+    for child in &children {
+        s.chain.hide_on(&s.b, child.coin_id());
+    }
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    let mut want: Vec<(Coin, u32)> = children.iter().map(|c| (*c, made)).collect();
+    want.sort_by_key(|(c, _)| c.coin_id());
+    assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), want, "both coins b left out are kept");
+    assert!(!listed.truncated && listed.judged_at == Some(made));
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A one-sided coin is judged by the output that makes it, not by its
+/// siblings: the new fork's spend makes it under another hint beside a
+/// sibling under the listed one, and its row is stale all the same, while
+/// the sibling, which both nodes list, stays.
+#[tokio::test]
+async fn a_one_sided_coin_whose_parent_spend_makes_a_sibling_under_the_hint_is_still_a_stale_row() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let made = |first: Bytes32, second: Bytes32| {
+        bundle(vec![open_coin_spend(parent, &[Cond::CreateCoin(open, 600, memo(first)), Cond::CreateCoin(open, 400, memo(second))])])
+    };
+    stale_rows_on_a(&s, made(hint(1), hint(2)), made(hint(2), hint(1))).await;
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert_eq!(listed.records.iter().map(|r| r.coin.amount).collect::<Vec<_>>(), vec![400], "the 600 row is stale: {listed:?}");
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The hint as a later memo of the output, not its first, files no row: a
+/// one-sided coin the new fork made with memos (other hint, listed hint) is
+/// a stale row.
+#[tokio::test]
+async fn the_hint_as_a_later_memo_of_the_output_files_no_row_so_a_one_sided_coin_made_so_is_stale() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let later = vec![Bytes::new(hint(2).to_vec()), Bytes::new(hint(1).to_vec())];
+    let new = bundle(vec![open_coin_spend(parent, &[Cond::CreateCoin(open, 1000, later)])]);
+    stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), new).await;
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert!(listed.records.is_empty() && !listed.truncated, "{listed:?}");
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A kept coin is merged into the listing in height then id order: made a
+/// block below a coin both nodes list, it comes first.
+#[tokio::test]
+async fn a_kept_coin_is_listed_in_height_order_among_the_coins_both_nodes_list() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    s.money.push_tx(bundle(passing(&[parent], hint(1)))).await.unwrap();
+    let made = s.chain.farm().await;
+    let later = s.chain.fund(open, 500, Some(hint(1)));
+    let after = s.chain.farm().await;
+    s.chain.hide_on(&s.b, passed(parent).coin_id());
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), vec![(passed(parent), made), (later, after)]);
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Node a a block ahead, the one-sided coin spent in that block: a's
+/// answer by id is taken as of the listing's height, where the coin stands
+/// unspent as both pages give it, so the row is settled as stale, dated at
+/// the lower height, and nobody is let go.
+#[tokio::test]
+async fn a_node_ahead_whose_one_sided_coin_was_spent_above_the_listing_gives_it_by_id_as_of_the_listing() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    let peak = stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+    s.chain.hold(&s.b);
+    s.chain.include_next(pass_on(passed(parent)));
+    assert_eq!(s.chain.farm().await, peak + 1);
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert!(listed.records.is_empty() && !listed.truncated && listed.judged_at == Some(peak), "{listed:?}");
+    assert_eq!(s.lane.live_count().await, 2, "neither node was let go");
+    s.chain.release(&s.b).await;
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Only a hinted listing settles one-sided coins: a puzzle-hash listing one
+/// node leaves a coin out of is a disagreement as before, both nodes let
+/// go, nothing asked by id or for a spend.
+#[tokio::test]
+async fn a_puzzle_hash_listing_one_node_leaves_a_coin_out_of_is_a_disagreement_and_asks_nothing_by_id() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let coin = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    s.chain.hide_on(&s.b, coin.coin_id());
+    let before = by_id_and_spends(&s);
+
+    let why = unanswered(s.money.coin_records_by_puzzle_hash(open, true, None).await);
+    assert!(why.contains("disagree"), "{why}");
+    assert_eq!(by_id_and_spends(&s), before, "nothing asked by id or for a spend");
+    assert_eq!(s.lane.live_count().await, 0, "both peers were let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Node a serves another spend of the parent than node b does: the old
+/// fork's, which made the coin under the old hint, as a peer keeping its
+/// stale row would have to. The two spends differ, which is a
+/// disagreement: the listing has no answer and both are let go.
+#[tokio::test]
+async fn a_one_sided_coin_whose_parent_spend_the_nodes_serve_otherwise_is_a_disagreement_and_both_nodes_are_let_go() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+    s.chain.serve_spend_on(&s.a, parent.coin_id(), passing(&[parent], hint(1)).pop());
+    let before = by_id_and_spends(&s);
+
+    let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(why.contains("disagree"), "{why}");
+    assert_eq!(asked_since(&s, before), [(1, 1); 2], "both nodes asked by id and for the spend");
+    assert_eq!(s.lane.live_count().await, 0, "both peers were let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The spend that made a one-sided coin served by neither node is no
+/// verdict, and nobody is let go. But no honest pair lists a coin under a
+/// hint whose making none of them can show, so node a, whose page listed
+/// it, has its connection dropped (back to the queue), and the next read
+/// takes another pair rather than meeting the same answer again.
+#[tokio::test]
+async fn a_one_sided_coin_whose_parent_spend_neither_node_serves_gives_no_answer_and_drops_only_the_node_that_listed_it() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+    for node in [&s.a, &s.b] {
+        s.chain.serve_spend_on(node, parent.coin_id(), None);
+    }
+    let before = by_id_and_spends(&s);
+
+    let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(why.contains("no peer serves the spend"), "{why}");
+    assert_eq!(asked_since(&s, before), [(1, 1); 2]);
+    assert_eq!(live(&s).await, vec![s.b.addr], "node a, which listed the coin, is dropped; neither is let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// One-sided coins made by sixteen spends in one listing
+/// ([`crate::chia_peer_lane::MAX_DISPUTED_PARENTS`]) are settled: every row
+/// is stale and the listing empty, at one lookup by id and sixteen spend
+/// requests of each node. Made by seventeen, they are no verdict, and
+/// nobody is let go: asked of each node by id, which shows them real, and
+/// no spend asked for; node a, whose page listed them, has its connection
+/// dropped, so the next read takes another pair.
+#[tokio::test]
+async fn one_sided_coins_made_by_more_than_sixteen_spends_give_no_answer_and_drop_only_the_node_that_listed_them() {
+    use crate::chia_peer_lane::MAX_DISPUTED_PARENTS;
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let over: Vec<Coin> = (0..=MAX_DISPUTED_PARENTS as u64).map(|n| s.chain.fund(open, 1000 + n, None)).collect();
+    let at: Vec<Coin> = (0..MAX_DISPUTED_PARENTS as u64).map(|n| s.chain.fund(open, 2000 + n, None)).collect();
+    s.chain.farm().await;
+    let old = [passing(&over, hint(1)), passing(&at, hint(3))].concat();
+    let new = [passing(&over, hint(2)), passing(&at, hint(4))].concat();
+    let peak = stale_rows_on_a(&s, bundle(old), bundle(new)).await;
+    assert_eq!(s.chain.record(passed(over[0]).coin_id()), Some((passed(over[0]), peak - 1, None)));
+
+    let before = by_id_and_spends(&s);
+    let listed = s.money.coin_records_by_hint(hint(3), None, true, None).await.unwrap();
+    assert!(listed.records.is_empty() && !listed.truncated, "sixteen stale rows settled: {listed:?}");
+    assert_eq!(asked_since(&s, before), [(1, MAX_DISPUTED_PARENTS); 2]);
+    assert_eq!(s.lane.live_count().await, 2);
+
+    let before = by_id_and_spends(&s);
+    let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(why.contains("17 spends, more than the 16"), "{why}");
+    assert_eq!(asked_since(&s, before), [(1, 0); 2], "the seventeen asked of each node by id, and no spend");
+    assert_eq!(live(&s).await, vec![s.b.addr], "node a, which listed them, is dropped; neither is let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// One-sided coins are asked by id before their spends are counted, so
+/// coins over the limit that a node denies, as it would coins the other
+/// made up, are a disagreement all the same: both nodes let go, no spend
+/// asked for.
+#[tokio::test]
+async fn one_sided_coins_over_the_limit_a_node_denies_by_id_are_a_disagreement_all_the_same() {
+    use crate::chia_peer_lane::MAX_DISPUTED_PARENTS;
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let over: Vec<Coin> = (0..=MAX_DISPUTED_PARENTS as u64).map(|n| s.chain.fund(open, 3000 + n, None)).collect();
+    s.chain.farm().await;
+    stale_rows_on_a(&s, bundle(passing(&over, hint(1))), bundle(passing(&over, hint(2)))).await;
+    s.chain.deny_on(&s.b, passed(over[0]).coin_id());
+    let before = by_id_and_spends(&s);
+
+    let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(why.contains("disagree"), "{why}");
+    assert_eq!(asked_since(&s, before), [(1, 0); 2]);
+    assert_eq!(s.lane.live_count().await, 0, "both peers were let go");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A hinted listing both nodes agree on asks neither for a coin by id nor
+/// for a spend, a stale row both keep included: the coin both list under
+/// the old hint is listed, as two real nodes that took both forks list it
+/// (whether its memo carries the hint is the readers' to judge).
+#[tokio::test]
+async fn a_hinted_listing_both_nodes_agree_on_asks_neither_for_a_coin_by_id_nor_for_a_spend() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    s.chain.include_next(bundle(passing(&[parent], hint(1))));
+    s.chain.farm().await;
+    let peak = s.chain.reorg_including(1, vec![bundle(passing(&[parent], hint(2)))]).await;
+    let before = by_id_and_spends(&s);
+
+    for h in [hint(1), hint(2)] {
+        let listed = s.money.coin_records_by_hint(h, None, true, None).await.unwrap();
+        assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), vec![(passed(parent), peak - 1)]);
+    }
+    assert!(s.money.coin_records_by_hint(hint(5), None, true, None).await.unwrap().records.is_empty());
+    assert_eq!(by_id_and_spends(&s), before, "no request more than the listings");
+    assert_eq!(s.lane.live_count().await, 2);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Settling a page's one-sided coins costs one lookup by id of each node,
+/// all the coins in it, one request of each node per spend that made them,
+/// and one run of each spend: three stale rows, two of them children of one
+/// parent, cost one lookup and two spend requests of each node, and each of
+/// the two spends is run once.
+#[tokio::test]
+async fn settling_one_sided_coins_asks_each_node_once_by_id_and_once_per_spend_and_runs_each_spend_once() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let (twice, once) = (s.chain.fund(open, 1000, None), s.chain.fund(open, 503, None));
+    s.chain.farm().await;
+    let made = |h: Bytes32| {
+        bundle(vec![
+            open_coin_spend(twice, &[Cond::CreateCoin(open, 401, memo(h)), Cond::CreateCoin(open, 599, memo(h))]),
+            open_coin_spend(once, &[Cond::CreateCoin(open, 503, memo(h))]),
+        ])
+    };
+    let peak = stale_rows_on_a(&s, made(hint(1)), made(hint(2))).await;
+    assert_eq!(s.chain.children(twice.coin_id()).len(), 2);
+    let new = made(hint(2)).coin_spends;
+    assert_eq!(new.iter().map(runs_of).collect::<Vec<_>>(), vec![0, 0]);
+    let before = by_id_and_spends(&s);
+
+    let stale = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert!(stale.records.is_empty() && !stale.truncated && stale.judged_at == Some(peak), "{stale:?}");
+    assert_eq!(asked_since(&s, before), [(1, 2); 2], "one lookup by id, and the two parents' spends, of each node");
+    assert_eq!(new.iter().map(runs_of).collect::<Vec<_>>(), vec![1, 1], "each spend run once, the one that made two coins too");
+    let after = by_id_and_spends(&s);
+    let listed = s.money.coin_records_by_hint(hint(2), None, true, None).await.unwrap();
+    assert_eq!(listed.records.len(), 3, "all three under the new hint, which both nodes list");
+    assert_eq!(by_id_and_spends(&s), after, "and nothing more asked for that");
+    assert_eq!(s.lane.live_count().await, 2);
     assert!(s.chain.unanswered().is_empty());
 }
