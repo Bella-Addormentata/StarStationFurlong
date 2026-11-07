@@ -39,6 +39,11 @@ export const HOVER_OPACITY = 0.5;
  *  (the swap's curtain, the walk-in) is over, before the near side fades. */
 export const REVEAL_HOLD_MS = 1500;
 
+/** The longest the reveal ever lasts, however long the arrival says it is
+ *  busy (a clone held in its vat for want of a free spot, say): past this
+ *  the near side fades anyway. A swap is bounded well inside it. */
+export const REVEAL_MAX_MS = 30_000;
+
 /** Tolerance (m) at the room's screen edges: a box that only touches the
  *  room's outline on screen (a tube on a side wall, say) does not cover it. */
 const SCREEN_MARGIN = 0.25;
@@ -149,12 +154,14 @@ export class EntryReveal {
   private on = false;
   private busy = false;
   private holdUntil = -Infinity;
+  private endsBy = -Infinity;
 
   /** A room was just entered at `now` (ms). */
   start(now: number): void {
     this.on = true;
     this.busy = false;
     this.holdUntil = now + REVEAL_HOLD_MS;
+    this.endsBy = now + REVEAL_MAX_MS;
   }
 
   /** Stop at once (the view left the room, say). */
@@ -170,6 +177,10 @@ export class EntryReveal {
    *  reveal already on is held: a door walk later in the visit starts nothing. */
   update(now: number, busy: boolean): boolean {
     if (!this.on) return false;
+    if (now > this.endsBy) {
+      this.cancel();
+      return false;
+    }
     if (busy) {
       this.busy = true;
       return true;

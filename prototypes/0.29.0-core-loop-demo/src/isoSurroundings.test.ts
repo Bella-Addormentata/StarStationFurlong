@@ -9,6 +9,7 @@ import {
   isoVestibuleTarget,
   poseFootprint,
   REVEAL_HOLD_MS,
+  REVEAL_MAX_MS,
   type XZPoint,
 } from './isoSurroundings';
 
@@ -181,6 +182,14 @@ describe('EntryReveal', () => {
     expect(r.update(back, false)).toBe(true);
     expect(r.update(back + REVEAL_HOLD_MS - 1, false)).toBe(true);
     expect(r.update(back + REVEAL_HOLD_MS + 1, false)).toBe(false);
+  });
+
+  it('never outlasts its cap, however long the arrival stays busy', () => {
+    const r = new EntryReveal();
+    r.start(0);
+    expect(r.update(REVEAL_MAX_MS - 1, true)).toBe(true);
+    expect(r.update(REVEAL_MAX_MS + 1, true)).toBe(false);
+    expect(r.update(REVEAL_MAX_MS + 2, true)).toBe(false);
   });
 
   it('can be cancelled', () => {

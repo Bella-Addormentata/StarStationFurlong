@@ -1559,7 +1559,14 @@ export class World {
         if (!m) continue;
         const base = (m.userData.baseOpacity as number | undefined) ?? 1;
         m.opacity = base * k;
-        m.transparent = m.opacity < 0.999;
+        const transparent = m.opacity < 0.999;
+        // three.js compiles an opaque material with its alpha forced to 1 and
+        // doesn't recompile on a `transparent` flip alone: without this, a
+        // shell first drawn solid would stay solid all through its fade.
+        if (m.transparent !== transparent) {
+          m.transparent = transparent;
+          m.needsUpdate = true;
+        }
       }
     });
     mod.visible = k > 0.005;
@@ -1644,8 +1651,11 @@ export class World {
       this.hoveredVestibuleDoorId = null;
       return false;
     }
+    // Busy: a door walk (the walk-in), the swap's curtain, or a clone-vat
+    // spawn (a beam-in or the boot entry walks out of the vat).
     const busy =
       this.player.getActiveDoorId() !== null ||
+      this.player.isVatSpawning() ||
       (this.isTransitBusy?.() ?? false);
     return this.surroundReveal.update(now, busy);
   }
