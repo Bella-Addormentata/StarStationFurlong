@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  canon, houseCommitKey, MAX_HELD_ROUNDS, MAX_SESSION_ROUNDS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid3, TableFold, utf8Length,
+  canon, houseCommitKey, MAX_CLOSES_PER_ROUND, MAX_HELD_ROUNDS, MAX_SESSION_ROUNDS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid3, TableFold, utf8Length,
 } from './computedFold';
 import type { FoldCtx, FoldResult, HouseCheck, SigCheck } from './computedFold';
 import { ctxOf, hex, house, rootOf, trimOf } from './computedFairOnlyKit';
@@ -788,7 +788,7 @@ describe('keptBytes: what the pass used, which junk cannot raise', () => {
     expect(res.keptBytes).toBe([a1, r1.b1, r1.join, open, r1.ra, r1.rb, abandon].reduce((n, b) => n + sizeOf(b), 0));
   });
 
-  it('counts the open round\'s felt, its newest version only, and its join and reveal from a house of that round', () => {
+  it('counts the open round\'s felt, its newest version only, and the join a house of that round wrote', () => {
     const join = kit.houseJoin(H, 1);
     const v1 = kit.slip(A, 1, [red(2)]);
     const v2 = kit.slip(A, 1, [red(3)], { v: 2 });
@@ -801,21 +801,24 @@ describe('keptBytes: what the pass used, which junk cannot raise', () => {
     expect(open(join, v1, v2).bytes).toBe(sizeOf(join) + sizeOf(v1) + sizeOf(v2));
   });
 
-  it('counts the open round\'s house reveal while it waits on a seed, if its key is a house of the round', () => {
-    // Bob\'s seed is not in, and the reveal lists his slip: it cannot decide the round yet
-    const waiting = (...more: Built<unknown>[]) => new TestSession().put(r1.a1, r1.b1, r1.join, r1.close, r1.ra, r1.hr, ...more);
-    const held = [r1.a1, r1.b1, r1.join, r1.close, r1.ra, r1.hr].reduce((n, b) => n + sizeOf(b), 0);
-    const res = foldAt(waiting());
+  it('counts a house reveal once it decides the round, not while it waits on a seed', () => {
+    // Bob's seed is not in, and the reveal lists his slip: it cannot decide the round yet
+    const waiting = (...more: Built<unknown>[]) => new TestSession().put(r1.a1, r1.b1, r1.join, r1.close, r1.ra, ...more);
+    const held = [r1.a1, r1.b1, r1.join, r1.close, r1.ra].reduce((n, b) => n + sizeOf(b), 0);
+    const res = foldAt(waiting(r1.hr));
     expect(res.rounds.map((v) => [v.r, v.decided])).toEqual([[1, null]]);
-    expect(res.keptBytes).toBe(held);
-    // another key's reveal of the round is in the books and not in what was kept
+    expect(res.bytes).toBe(held + sizeOf(r1.hr));
+    expect(res.keptBytes, 'the reveal has decided nothing yet').toBe(held);
+    // another key's reveal of the round is in the books and not in what was kept either
     const rogue = kit.houseReveal(ROGUE, 1, [r1.close.hash], [r1.a1.hash, r1.b1.hash]);
-    const withRogue = foldAt(waiting(rogue));
-    expect(withRogue.bytes).toBe(held + sizeOf(rogue));
-    expect(withRogue.keptBytes).toBe(held);
+    expect(foldAt(waiting(r1.hr, rogue)).keptBytes).toBe(held);
+    // Bob's seed comes: the reveal decides the round, and is kept
+    const decided = foldAt(waiting(r1.hr, r1.rb));
+    expect(decided.rounds.map((v) => v.decided)).toEqual(['house']);
+    expect(decided.keptBytes).toBe(held + sizeOf(r1.hr) + sizeOf(r1.rb));
   });
 
-  it('counts a house record of the open round only while its key is a house of that round, and its signature holds', () => {
+  it('counts a join of the open round only while its key is a house of that round, and its signature holds', () => {
     // (the fold takes any base it is given: this one names no commitment, so the open round 4 takes a join)
     const noCommit = { ...trimOf(P, 'p').value, h: undefined };
     const join = kit.houseJoin(H, 4);
@@ -837,6 +840,89 @@ describe('keptBytes: what the pass used, which junk cannot raise', () => {
     expect(res.bytes).toBeGreaterThan(0);
     expect(res.keptBytes).toBe(0);
     expect(res.joins).toEqual([]);
+  });
+
+  describe('depends on the records, not on what was checked before them', () => {
+    /** keptBytes after each record of `order` is fed to one fold that is read in between. */
+    const oneByOne = (order: readonly Built<unknown>[], base: Base = root.value): number[] => {
+      const fold = new TableFold(P, sigs.check, undefined, undefined, onlyH);
+      fold.setFairOnlyBase(base);
+      return order.map((b) => {
+        fold.apply([[b.key, b.rec]]);
+        return fold.result().keptBytes;
+      });
+    };
+    /** …and a fresh fold's, over the same prefixes. */
+    const fresh = (order: readonly Built<unknown>[], base: Base = root.value): number[] =>
+      order.map((_, i) => foldAt(new TestSession().put(...order.slice(0, i + 1)), base).keptBytes);
+    const orders = <T,>(rs: readonly T[]): T[][] => {
+      const half = Math.floor(rs.length / 2);
+      return [[...rs], [...rs].reverse(), [...rs.slice(half), ...rs.slice(0, half)], rs.flatMap((r, i) => (i % 2 === 0 ? [r] : [])).concat(rs.filter((_, i) => i % 2 === 1))];
+    };
+    const byHash = <T extends { hash: string }>(rs: readonly T[]): T[] => [...rs].sort((a, b) => (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
+
+    it('a join checked alone and then pushed past the cap by better ones is not kept', () => {
+      // (the fold takes any base it is given: this one names no commitment, so the open round 4 takes joins)
+      const noCommit = { ...trimOf(P, 'p').value, h: undefined };
+      const commit = (i: number): string => i.toString(16).padStart(2, '0').repeat(32);
+      const joins = Array.from({ length: MAX_CLOSES_PER_ROUND + 1 }, (_, i) => kit.houseJoin(H, 4, commit(i + 1)));
+      const sorted = byHash(joins);
+      const counted = sorted.slice(0, MAX_CLOSES_PER_ROUND).reduce((n, b) => n + sizeOf(b), 0);
+      const all = foldAt(new TestSession().put(...joins), noCommit);
+      expect(all.joins.map((j) => j.hash)).toEqual(sorted.slice(0, MAX_CLOSES_PER_ROUND).map((j) => j.hash));
+      expect(all.keptBytes, 'the first 32 in hash order').toBe(counted);
+      expect(all.bytes).toBe(counted + sizeOf(sorted[MAX_CLOSES_PER_ROUND]));
+      // the one past the cap is read first, alone, and its signature is checked and good…
+      const last = sorted[MAX_CLOSES_PER_ROUND];
+      const fold = new TableFold(P, sigs.check, undefined, undefined, onlyH);
+      fold.setFairOnlyBase(noCommit);
+      fold.apply([[last.key, last.rec]]);
+      expect(fold.result().keptBytes, 'alone, it is counted').toBe(sizeOf(last));
+      // …then the 32 that rank before it come
+      fold.apply(sorted.slice(0, MAX_CLOSES_PER_ROUND).map((b) => [b.key, b.rec] as const));
+      const after = fold.result();
+      expect(after.joins.map((j) => j.hash)).toEqual(all.joins.map((j) => j.hash));
+      expect(after.keptBytes, 'it is no longer one of the joins the pass counts').toBe(counted);
+      expect(after.bytes).toBe(all.bytes);
+      // and whatever the order they came in
+      for (const order of orders(joins)) expect(oneByOne(order, noCommit).at(-1)).toBe(counted);
+    });
+
+    it('a house reveal checked while its close stood, and the close gone since, is not kept', () => {
+      const all = [r1.a1, r1.b1, r1.join, r1.close, r1.ra, r1.hr];
+      const fold = new TableFold(P, sigs.check, undefined, undefined, onlyH);
+      fold.setFairOnlyBase(root.value);
+      fold.reset(new TestSession().put(...all).records.entries());
+      expect(fold.result().rounds.map((v) => [v.r, v.decided])).toEqual([[1, null]]);   // (the reveal waits on Bob's seed)
+      fold.apply([[r1.close.key, undefined]]);
+      const after = fold.result();
+      const gone = foldAt(new TestSession().put(r1.a1, r1.b1, r1.join, r1.ra, r1.hr));
+      expect(after.bytes).toBe(gone.bytes);
+      expect(after.keptBytes).toBe(gone.keptBytes);
+      // the felts of the open round and the join it counts: not the seed, not the reveal
+      expect(after.keptBytes).toBe([r1.a1, r1.b1, r1.join].reduce((n, b) => n + sizeOf(b), 0));
+    });
+
+    it('a fold fed one record at a time, in any order, keeps what a fresh fold keeps, junk and all', () => {
+      const stranger = kit.abandon(C, 1, r1.close.hash);
+      const carolSlip = kit.slip(C, 1, [red(1)]);
+      const a1v2 = kit.slip(A, 1, [red(20)], { v: 2 });
+      const rogue = kit.houseReveal(ROGUE, 1, [r1.close.hash], [r1.a1.hash, r1.b1.hash]);
+      const rogueJoin = kit.houseJoin(ROGUE, 1);
+      const records: Built<unknown>[] = [r1.a1, r1.b1, r1.join, r1.close, r1.ra, r1.rb, r1.hr, stranger, carolSlip, a1v2, rogue, rogueJoin];
+      for (const order of orders(records)) {
+        expect(oneByOne(order)).toEqual(fresh(order));
+        expect(oneByOne(order).at(-1)).toBe(total);
+      }
+    });
+
+    it('nor does a round that is voided, a rival close, or a deletion', () => {
+      const rival = kit.close(B, 1, SID, [r1.a1, r1.b1], r1.join.rec.c);
+      const open = kit.close(A, 1, SID, [r1.a1, r1.b1], r1.join.rec.c);
+      const abandon = kit.abandon(B, 1, open.hash);
+      const records: Built<unknown>[] = [r1.a1, r1.b1, r1.join, open, r1.ra, r1.rb, abandon, rival, r1.hr];
+      for (const order of orders(records)) expect(oneByOne(order)).toEqual(fresh(order));
+    });
   });
 
   it('is the weight of the rounds within the cap, none of what lies past it', () => {

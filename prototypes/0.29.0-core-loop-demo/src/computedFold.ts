@@ -870,12 +870,15 @@ export interface FoldResult {
    *  doc, which junk grows as much as records do. */ rawBytes: number;
   /** FAIR ONLY (design S6): the same weight as `bytes`, of the records this
    *  pass USED only: the closes it found valid, the slips they froze and the
-   *  reveals that open them, the open round's chosen felts, the abandons and
-   *  the house records that counted. A record anyone can write for nothing (a
-   *  forged signature, a round far ahead, a close that names the wrong thing, a
-   *  stranger's abandon, an old version of a felt) is never in it, so junk
-   *  can't raise it: what pressure and pauses read, where `rawBytes - keptBytes`
-   *  is what a sweep clears. At other tables it is `bytes`. */ keptBytes: number;
+   *  reveals that open them, the open round's chosen felts, the abandon or
+   *  house reveal that decided each round, and the house joins the pass counted
+   *  (a close's commitment rests on one, or it is one of `joins`). A record
+   *  anyone can write for nothing (a forged signature, a round far ahead, a
+   *  close that names the wrong thing, a stranger's abandon, an old version of
+   *  a felt) is never in it, so junk can't raise it: what pressure and pauses
+   *  read, where `rawBytes - keptBytes` is what a sweep clears. It depends on
+   *  the records and not on the order they came in. At other tables it is
+   *  `bytes`. */ keptBytes: number;
   /** Indexed record count. */ records: number;
 }
 
@@ -2614,7 +2617,7 @@ export class TableFold {
       pending: this.sawPending,
       bytes: this.bytes,
       rawBytes: this.rawBytes,
-      keptBytes: this.fairOnly ? this.keptOf(eligible, infos, outcomes, rests, felts, open) : this.bytes,
+      keptBytes: this.fairOnly ? this.keptOf(eligible, infos, outcomes, rests, felts, joins, open) : this.bytes,
       records: this.entries.size,
     };
   }
@@ -2623,16 +2626,22 @@ export class TableFold {
    *  (S6; FoldResult.keptBytes): the closes found valid (a rival's too) with the
    *  slips they froze and the reveals that open those; the abandon or house
    *  reveal that decided each, and the house records its commitment rests on;
-   *  the open round's chosen felts, and its house records that count. Each is
-   *  counted once. Nothing else is: not a close that failed a rule, a slip no
-   *  close froze, a stranger's abandon, a forged signature, a round past the
-   *  cap, an old version of a felt — what anyone can write for nothing never
-   *  raises it. A house record counts only while its key is a house of its
-   *  round (houseOk, asked without marking the pass pending: it is not a
-   *  question of the count). */
+   *  the open round's chosen felts, and the joins the pass counted for it
+   *  (FoldResult.joins). Each is counted once. Nothing else is: not a close
+   *  that failed a rule, a slip no close froze, a stranger's abandon, a forged
+   *  signature, a round past the cap, an old version of a felt — what anyone
+   *  can write for nothing never raises it.
+   *
+   *  It is a function of the records and not of what happened to be checked
+   *  before: a record counts for the choice this pass made of it (a counted
+   *  join, the reveal that decided a round), never for a verdict it holds
+   *  from an earlier pass. A house reveal that waits on a seed is counted
+   *  once it decides the round, and a join once a close rests on it or it is
+   *  one of the open round's. So a fold fed one record at a time, in any
+   *  order, and a fresh one agree. */
   private keptOf(
     eligible: readonly (readonly CloseEntry[])[], infos: ReadonlyMap<string, CloseInfo>, outcomes: ReadonlyMap<string, Outcome>,
-    rests: ReadonlyMap<string, string[]>, felts: ReadonlyMap<string, SlipInfo>, open: number,
+    rests: ReadonlyMap<string, string[]>, felts: ReadonlyMap<string, SlipInfo>, joins: FoldResult['joins'], open: number,
   ): number {
     const used = new Set<string>();
     for (const ok of eligible) {
@@ -2650,9 +2659,10 @@ export class TableFold {
       }
     }
     for (const s of felts.values()) used.add(s.key);
-    for (const at of [this.hRevealsAt.get(open), this.joinsAt.get(open)]) {
-      if (at) for (const e of at.values()) if (e.verdict === true && this.houseOk(e.rec.k, e.rec.r) === true) used.add(e.key);
-    }
+    // (The joins are the ones joinsOf chose: the first MAX_CLOSES_PER_ROUND, in hash order, that are a house's and
+    // verify. One that was checked once, and lies past them now, is not one of them.)
+    const at = this.joinsAt.get(open);
+    if (at) for (const j of joins) used.add(at.get(j.hash)!.key);
     let kept = 0;
     for (const key of used) kept += this.entries.get(key)?.size ?? 0;
     return kept;
