@@ -535,3 +535,157 @@ async fn the_seen_cache_answers_an_evicted_bundle_already_including_until_it_for
     assert_eq!(s.chain.children(coin.coin_id()).len(), 1);
     assert!(s.chain.unanswered().is_empty());
 }
+
+/// A coin's id is its parent, puzzle hash and amount, not its memo, so a new
+/// fork that spends the parent the same way with another memo makes the same
+/// coin with another hint. A full node keeps every hint row it ever added
+/// (`hint_store.py` deletes none, and a reorganisation rolls back only the
+/// coin and block stores), and finds hinted coins through the coin records
+/// (`batch_coin_states_by_puzzle_hashes`): the coin is listed under both
+/// hints, once each, as the new fork made it, and a row whose coin the
+/// reorganisation dropped and nothing made again lists nothing.
+#[tokio::test]
+async fn a_coin_made_again_on_a_new_fork_with_another_hint_is_listed_under_both_as_a_full_node_lists_it() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    let other = s.chain.fund(open, 500, None);
+    s.chain.farm_blocks(2).await;
+    let child = Coin::new(parent.coin_id(), open, 1000);
+    let dropped = Coin::new(other.coin_id(), open, 500);
+    let old = SpendBundle::new(
+        vec![
+            open_coin_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(1)))]),
+            open_coin_spend(other, &[Cond::CreateCoin(open, 500, memo(hint(3)))]),
+        ],
+        chia_bls::Signature::default(),
+    );
+    s.money.push_tx(old.clone()).await.unwrap();
+    let first = s.chain.farm().await;
+    assert_eq!(s.chain.children(parent.coin_id()), vec![child]);
+    for (h, coin) in [(hint(1), child), (hint(3), dropped)] {
+        let listed = s.money.coin_records_by_hint(h, None, true, None).await.unwrap();
+        assert_eq!(listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(), vec![(coin, first)]);
+    }
+
+    // The new fork starts a block lower, so the coin is made at another height.
+    let again = open_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(2)))]);
+    let peak = s.chain.reorg_including(2, vec![again.clone()]).await;
+    let made = first - 1;
+    assert_eq!(peak, first + 1);
+    assert_eq!(s.chain.children(parent.coin_id()), vec![child], "the same coin id, made again");
+    assert_eq!(s.chain.record(child.coin_id()), Some((child, made, None)));
+    assert_eq!(s.chain.record(dropped.coin_id()), None, "nothing made the other child again");
+    for (h, which) in [(hint(1), "the old fork's hint"), (hint(2), "the new fork's hint")] {
+        let listed = s.money.coin_records_by_hint(h, None, true, None).await.unwrap();
+        let found: Vec<(Coin, u32, bool)> = listed.records.iter().map(|r| (r.coin, r.confirmed_block_index, r.spent)).collect();
+        assert_eq!(found, vec![(child, made, false)], "under {which}: once, as the new fork made it");
+        assert!(!listed.truncated);
+        assert_eq!(listed.judged_at, Some(peak));
+    }
+    let spend = s.money.puzzle_and_solution(parent.coin_id(), made).await.unwrap().expect("the new fork's spend");
+    assert_eq!(spend.solution, again.coin_spends[0].solution, "the parent's spend carries the new memo");
+    assert_ne!(spend.solution, old.coin_spends[0].solution);
+    assert_eq!(s.money.puzzle_and_solution(parent.coin_id(), first).await.unwrap(), None, "no spend at the old fork's height");
+    let gone = s.money.coin_records_by_hint(hint(3), None, true, None).await.unwrap();
+    assert!(gone.records.is_empty() && !gone.truncated, "a hint row whose coin is off the chain lists nothing: {gone:?}");
+
+    assert_eq!(s.lane.live_count().await, 2, "both nodes agreed on every answer");
+    assert_eq!(kinds(&s.a), kinds(&s.b));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Each node keeps the hint table of the blocks it took. A node held while
+/// the old fork's block came and went, then released onto the new fork,
+/// adds the rows of the blocks above the fork point, as a full node taking
+/// the new peak adds those of the blocks since the fork, and never the old
+/// fork's. Under the new hint both nodes list the coin and agree; under the
+/// old one only the node that took the old fork does, so an agreed listing
+/// there has no answer, as one from two real nodes with those histories has
+/// none.
+#[tokio::test]
+async fn a_node_held_through_the_old_fork_never_gets_its_hint_row_so_only_the_other_lists_the_coin_under_it() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm().await;
+    let child = Coin::new(parent.coin_id(), open, 1000);
+    s.chain.hold(&s.b);
+    s.chain.include_next(open_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(1)))]));
+    s.chain.farm().await;
+    let peak = s.chain.reorg_including(1, vec![open_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(2)))])]).await;
+    s.chain.release(&s.b).await;
+    let made = peak - 1;
+    assert_eq!(s.chain.record(child.coin_id()), Some((child, made, None)));
+
+    let network = s.chain.network();
+    let filters = chia_protocol::CoinStateFilters::new(true, true, true, 0);
+    for (node, under_old) in [(&s.a, vec![CoinState::new(child, None, Some(made))]), (&s.b, vec![])] {
+        let conn = PeerConn::connect(node.addr, Source::Introducer, &network, TLS.clone()).await.unwrap();
+        for (h, expected) in [(hint(2), vec![CoinState::new(child, None, Some(made))]), (hint(1), under_old.clone())] {
+            let asked = RequestPuzzleState::new(vec![h], None, network.genesis, filters.clone(), false);
+            let answer = conn.request::<RespondPuzzleState, _>(asked).await.unwrap();
+            assert_eq!((answer.coin_states, answer.height, answer.is_finished), (expected, peak, true));
+        }
+    }
+
+    let listed = s.money.coin_records_by_hint(hint(2), None, true, None).await.unwrap();
+    assert_eq!(listed.records.iter().map(|r| r.coin).collect::<Vec<_>>(), vec![child], "both nodes list it under the new hint");
+    unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A node held after it took the old fork's block keeps that block's hint
+/// row when it is released onto the new fork (on the slow path, from the
+/// fork point it shares with the chain it held) and adds the new fork's
+/// beside it: like the node never held, it lists the coin under both hints,
+/// as the new fork made it, so an agreed listing under either has an
+/// answer. A node brought up now takes the rows of the chain as it stands,
+/// as a node syncing it does, so it lists the coin under the new hint
+/// alone; and a request that leaves hinted coins out lists none under
+/// either.
+#[tokio::test]
+async fn a_node_held_after_it_took_the_old_fork_keeps_its_hint_row_when_released_onto_the_new_one() {
+    let s = setup().await;
+    let open = open_puzzle_hash();
+    let parent = s.chain.fund(open, 1000, None);
+    s.chain.farm_blocks(2).await;
+    let child = Coin::new(parent.coin_id(), open, 1000);
+    s.chain.include_next(open_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(1)))]));
+    let first = s.chain.farm().await;
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    let found: Vec<(Coin, u32)> = listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect();
+    assert_eq!(found, vec![(child, first)], "both nodes took the old fork's block");
+
+    s.chain.hold(&s.b);
+    let peak = s.chain.reorg_including(2, vec![open_spend(parent, &[Cond::CreateCoin(open, 1000, memo(hint(2)))])]).await;
+    s.chain.release(&s.b).await;
+    let made = first - 1;
+    assert_eq!(peak, first + 1);
+    assert_eq!(s.chain.record(child.coin_id()), Some((child, made, None)), "the same coin, made again lower");
+
+    for (h, which) in [(hint(1), "the old fork's hint"), (hint(2), "the new fork's hint")] {
+        let listed = s.money.coin_records_by_hint(h, None, true, None).await.unwrap();
+        let found: Vec<(Coin, u32, bool)> = listed.records.iter().map(|r| (r.coin, r.confirmed_block_index, r.spent)).collect();
+        assert_eq!(found, vec![(child, made, false)], "under {which}: both nodes list it, as the new fork made it");
+        assert_eq!(listed.judged_at, Some(peak));
+    }
+    assert_eq!(s.lane.live_count().await, 2, "both nodes agreed on every answer");
+
+    let network = s.chain.network();
+    let late = s.chain.node().await;
+    let now = vec![CoinState::new(child, None, Some(made))];
+    let hinted = chia_protocol::CoinStateFilters::new(true, true, true, 0);
+    let unhinted = chia_protocol::CoinStateFilters::new(true, true, false, 0);
+    for (node, under_old, which) in [(&s.a, now.clone(), "a, never held"), (&s.b, now.clone(), "b, held and released"), (&late, vec![], "a node brought up now")] {
+        let conn = PeerConn::connect(node.addr, Source::Introducer, &network, TLS.clone()).await.unwrap();
+        for (h, filters, expected) in
+            [(hint(2), &hinted, now.clone()), (hint(1), &hinted, under_old), (hint(2), &unhinted, vec![]), (hint(1), &unhinted, vec![])]
+        {
+            let asked = RequestPuzzleState::new(vec![h], None, network.genesis, filters.clone(), false);
+            let answer = conn.request::<RespondPuzzleState, _>(asked).await.unwrap();
+            assert_eq!((answer.coin_states, answer.height, answer.is_finished), (expected, peak, true), "{which}, {filters:?}");
+        }
+    }
+    assert!(s.chain.unanswered().is_empty());
+}

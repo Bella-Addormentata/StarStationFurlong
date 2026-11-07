@@ -7,12 +7,20 @@
 //!
 //! What a real full node does and the model copies, from chia-blockchain
 //! 2.7.4 (`full_node_api.py`, `full_node.py`, `mempool_manager.py`,
-//! `coin_store.py`, `util/errors.py`), each pinned by a test in
-//! [`tests`]:
-//!   - a coin set with created and spent heights per coin, a hint per coin
-//!     (the first memo of its `CREATE_COIN`, kept when it is 1 to 32 bytes),
-//!     and the puzzle and solution of every spend, ephemeral coins (created
-//!     and spent in one block) included;
+//! `coin_store.py`, `hint_store.py`, `hint_management.py`,
+//! `util/errors.py`), each pinned by a test in [`tests`]:
+//!   - a coin set with created and spent heights per coin and the puzzle and
+//!     solution of every spend, ephemeral coins (created and spent in one
+//!     block) included;
+//!   - a hint table PER NODE, as each full node has its own hint store: a
+//!     (coin id, hint) row for each coin a block the node took created with
+//!     a hint (the first memo of its `CREATE_COIN`, kept when it is 1 to 32
+//!     bytes), added once and never removed, so it outlives a rewind and a
+//!     reorganisation as a full node's does. A coin's id does not depend on
+//!     its memo, so a coin a new fork makes again with another memo is
+//!     listed under both hints; hinted coins are found through the coin
+//!     records the node's chain holds, so a row whose coin is gone lists
+//!     nothing;
 //!   - `RequestPuzzleState` as `request_puzzle_state` answers it: anchored at
 //!     the header the request names, ordered by the height a coin last
 //!     changed, cut at the response-item limit without splitting a block,
@@ -195,6 +203,15 @@ fn sha256(parts: &[&[u8]]) -> Bytes32 {
     Bytes32::new(hasher.finalize().into())
 }
 
+/// The hint row a coin made with `hint` gives its block, if any: a full node
+/// stores a hint that is not empty (`get_hints_and_subscription_coin_ids`),
+/// and chia_rs gives one only for a first memo of at most 32 bytes.
+fn hint_row(rows: &mut Vec<(Bytes32, Bytes)>, coin: Coin, hint: Option<Bytes>) {
+    if let Some(hint) = hint.filter(|hint| !hint.is_empty()) {
+        rows.push((coin.coin_id(), hint));
+    }
+}
+
 fn timestamp(height: u32) -> u64 {
     BASE_TIMESTAMP + BLOCK_SECS * u64::from(height)
 }
@@ -227,6 +244,11 @@ struct Block {
     salt: Bytes32,
     /// The coins the block spent, for the mempool's fast path.
     spent: Vec<Bytes32>,
+    /// The (coin id, hint) rows of the coins it created, which each node
+    /// that takes the block adds to its hint table, as
+    /// `peak_post_processing` (and `ingest_batch` while syncing) hands
+    /// `get_hints_and_subscription_coin_ids`'s rows to `add_hints`.
+    hints: Vec<(Bytes32, Bytes)>,
 }
 
 #[derive(Clone)]
@@ -234,7 +256,6 @@ struct CoinRec {
     coin: Coin,
     created: u32,
     spent: Option<u32>,
-    hint: Option<Bytes>,
     /// The puzzle reveal and solution of the spend, once spent.
     spend: Option<(Program, Program)>,
 }
@@ -264,7 +285,7 @@ impl Chain {
     fn new(genesis: Bytes32) -> Self {
         // Block 0 is the one every mock node serves: on the genesis
         // challenge, unsalted, so the lane's network binding passes.
-        let first = Block { header_hash: header_on(0, genesis, zero()).header_hash(), salt: zero(), spent: vec![] };
+        let first = Block { header_hash: header_on(0, genesis, zero()).header_hash(), salt: zero(), spent: vec![], hints: vec![] };
         Self { genesis, blocks: vec![first], coins: HashMap::new() }
     }
 
@@ -291,15 +312,23 @@ impl Chain {
         }
     }
 
-    fn push(&mut self, salt: Bytes32, spent: Vec<Bytes32>) -> u32 {
+    fn push(&mut self, salt: Bytes32, spent: Vec<Bytes32>, hints: Vec<(Bytes32, Bytes)>) -> u32 {
         let height = self.blocks.len() as u32;
         let prev = self.blocks[height as usize - 1].header_hash;
-        self.blocks.push(Block { header_hash: header_on(height, prev, salt).header_hash(), salt, spent });
+        self.blocks.push(Block { header_hash: header_on(height, prev, salt).header_hash(), salt, spent, hints });
         height
     }
 
+    /// The hint rows of the blocks above `height`: what a node that takes
+    /// them adds to its hint table.
+    fn hints_above(&self, height: u32) -> impl Iterator<Item = (Bytes32, Bytes)> + '_ {
+        self.blocks[height as usize + 1..].iter().flat_map(|block| block.hints.iter().cloned())
+    }
+
     /// Undo every block above `to`: the coins they created are gone and the
-    /// spends they made are undone, as `rollback_to_block` does.
+    /// spends they made are undone, as `rollback_to_block` does. No node's
+    /// hint table is touched: a full node rolls back its coin and block
+    /// stores and never its hint store.
     fn rewind(&mut self, to: u32) {
         self.blocks.truncate(to as usize + 1);
         self.coins.retain(|_, rec| rec.created <= to);
@@ -540,12 +569,16 @@ fn new_peak_slow(net: ChiaNet, chain: &Chain, pool: &mut Pool) {
 }
 
 /// One mock full node: its address, what it last announced, its mempool,
-/// and the chain it is held at, if held. The requests it read are its
-/// [`MockNode`]'s `seen`.
+/// its hint table, and the chain it is held at, if held. The requests it
+/// read are its [`MockNode`]'s `seen`.
 struct NodeState {
     addr: SocketAddr,
     announce: watch::Sender<Announcement>,
     pool: Pool,
+    /// Its hint store (`hint_store.py`: `UNIQUE (coin_id, hint)`, rows added
+    /// by `INSERT OR IGNORE` and never deleted): the rows of every block it
+    /// took, kept through every rewind and reorganisation.
+    hints: HashSet<(Bytes32, Bytes)>,
     held: Option<Chain>,
 }
 
@@ -674,13 +707,21 @@ impl Model {
 
     /// Put one bundle in block `height`: what it creates first, then what it
     /// spends, so a coin it creates and spends is created and spent at
-    /// `height`, and kept.
-    fn apply(&mut self, bundle: &SpendBundle, conds: &OwnedSpendBundleConditions, height: u32, spent: &mut Vec<Bytes32>) {
+    /// `height`, and kept. Each coin made with a hint gives the block a hint
+    /// row.
+    fn apply(
+        &mut self,
+        bundle: &SpendBundle,
+        conds: &OwnedSpendBundleConditions,
+        height: u32,
+        spent: &mut Vec<Bytes32>,
+        hints: &mut Vec<(Bytes32, Bytes)>,
+    ) {
         for spend in &conds.spends {
             for (puzzle_hash, amount, hint) in &spend.create_coin {
                 let coin = Coin::new(spend.coin_id, *puzzle_hash, *amount);
-                let hint = hint.clone().filter(|h| !h.is_empty());
-                self.chain.coins.insert(coin.coin_id(), CoinRec { coin, created: height, spent: None, hint, spend: None });
+                self.chain.coins.insert(coin.coin_id(), CoinRec { coin, created: height, spent: None, spend: None });
+                hint_row(hints, coin, hint.clone());
             }
         }
         for coin_spend in &bundle.coin_spends {
@@ -699,14 +740,16 @@ impl Model {
     fn build_block(&mut self, first: Vec<SpendBundle>, from_mempool: bool) -> u32 {
         let height = self.chain.peak() + 1;
         let mut spent = Vec::new();
+        let mut hints = Vec::new();
         for (coin, hint) in std::mem::take(&mut self.next_coins) {
-            self.chain.coins.insert(coin.coin_id(), CoinRec { coin, created: height, spent: None, hint, spend: None });
+            self.chain.coins.insert(coin.coin_id(), CoinRec { coin, created: height, spent: None, spend: None });
+            hint_row(&mut hints, coin, hint);
         }
         for bundle in first {
             let conds = pre_validate(self.net, height - 1, &bundle)
                 .unwrap_or_else(|code| panic!("a bundle the test has block {height} carry is invalid: {}", err_name(code)));
             assert!(self.fits(&conds, height), "a bundle the test has block {height} carry does not fit the chain");
-            self.apply(&bundle, &conds, height, &mut spent);
+            self.apply(&bundle, &conds, height, &mut spent, &mut hints);
         }
         if from_mempool {
             let mut items: Vec<Item> = self.nodes.iter().filter(|n| n.held.is_none()).flat_map(|n| n.pool.items.iter().cloned()).collect();
@@ -717,10 +760,10 @@ impl Model {
                     continue;
                 }
                 carried.insert(item.name);
-                self.apply(&item.bundle, &item.conds, height, &mut spent);
+                self.apply(&item.bundle, &item.conds, height, &mut spent, &mut hints);
             }
         }
-        self.chain.push(self.salt, spent)
+        self.chain.push(self.salt, spent, hints)
     }
 
     /// Tell every node not held of the main chain's peak, and return the
@@ -758,7 +801,7 @@ impl Model {
             }
             ProtocolMessageTypes::RequestPuzzleState => {
                 let asked = RequestPuzzleState::from_bytes(&request.data).ok()?;
-                Some(puzzle_state(self.view(node), self.page_limit, asked))
+                Some(puzzle_state(self.view(node), &self.nodes[node].hints, self.page_limit, asked))
             }
             ProtocolMessageTypes::RequestCoinState => {
                 let asked = RequestCoinState::from_bytes(&request.data).ok()?;
@@ -799,8 +842,13 @@ impl Model {
 /// `request_puzzle_state`: the coins at the puzzle hashes (or hinted to
 /// them) changed after the anchor, oldest change first, at most `limit`;
 /// when cut, never inside a block, and dated by the block before the first
-/// one left out.
-fn puzzle_state(chain: &Chain, limit: usize, asked: RequestPuzzleState) -> Message {
+/// one left out. A hinted coin is one whose id a row of the node's `hints`
+/// lists under one of the puzzle hashes, found among the coin records of
+/// `chain`, as `batch_coin_states_by_puzzle_hashes` takes the coin records
+/// whose name is among the hint rows' coin ids: a coin made again on a new
+/// fork with another hint is listed under both, once, as it stands now,
+/// and a row whose coin is not on `chain` lists nothing.
+fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, limit: usize, asked: RequestPuzzleState) -> Message {
     let mut keys = Vec::new();
     for key in asked.puzzle_hashes {
         if !keys.contains(&key) {
@@ -812,13 +860,15 @@ fn puzzle_state(chain: &Chain, limit: usize, asked: RequestPuzzleState) -> Messa
     }
     let since = asked.previous_height.map_or(0, |height| height + 1);
     let filters = &asked.filters;
+    let hinted: HashSet<Bytes32> = if filters.include_hinted {
+        hints.iter().filter(|(_, hint)| keys.iter().any(|key| key.as_ref() == hint.as_ref())).map(|(id, _)| *id).collect()
+    } else {
+        HashSet::new()
+    };
     let mut found: Vec<&CoinRec> = chain
         .coins
         .values()
-        .filter(|rec| {
-            keys.contains(&rec.coin.puzzle_hash)
-                || (filters.include_hinted && rec.hint.as_ref().is_some_and(|hint| keys.iter().any(|key| key.as_ref() == hint.as_ref())))
-        })
+        .filter(|rec| keys.contains(&rec.coin.puzzle_hash) || hinted.contains(&rec.coin.coin_id()))
         .filter(|rec| rec.created >= since || rec.spent.is_some_and(|spent| spent >= since))
         .filter(|rec| if rec.spent.is_some() { filters.include_spent } else { filters.include_unspent })
         .filter(|rec| rec.coin.amount >= filters.min_amount)
@@ -1018,7 +1068,9 @@ impl MockChain {
 
     /// One more full node on this chain, on a port of its own (loopback
     /// groups by port, so two nodes are two network groups), presenting a
-    /// certificate of its own, with a mempool of its own.
+    /// certificate of its own, with a mempool of its own and a hint table of
+    /// its own, which starts with the rows of the chain's blocks, as a node
+    /// syncing it adds them.
     pub(crate) async fn node(&self) -> MockNode {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1026,7 +1078,8 @@ impl MockChain {
         let index = {
             let mut model = self.lock();
             let announce = watch::Sender::new(model.announced);
-            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), held: None });
+            let hints = model.chain.hints_above(0).collect();
+            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None });
             model.nodes.len() - 1
         };
         let cert = CERTS.get(index).cloned().unwrap_or_else(|| Arc::new(chia_ssl::ChiaCertificate::generate().unwrap()));
@@ -1102,6 +1155,7 @@ impl MockChain {
                 let spent: HashSet<Bytes32> = model.chain.blocks[height as usize].spent.iter().copied().collect();
                 let Model { net, chain, nodes, .. } = &mut *model;
                 for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+                    node.hints.extend(chain.hints_above(height - 1));
                     new_peak_fast(*net, chain, &mut node.pool, &spent);
                 }
             }
@@ -1129,7 +1183,8 @@ impl MockChain {
     /// [`Self::include_next`] bundles), and no new block takes from the
     /// mempools: the old blocks' bundles are not given back to them, as a
     /// full node gives back none. Every node not held then takes the new
-    /// chain on the slow path, and is told the fork point.
+    /// chain on the slow path, adds the new blocks' hint rows to the ones it
+    /// keeps from the old, and is told the fork point.
     pub(crate) async fn reorg_including(&self, n: u32, bundles: Vec<SpendBundle>) -> u32 {
         let (generation, told, peak) = {
             let mut model = self.lock();
@@ -1147,6 +1202,7 @@ impl MockChain {
             }
             let Model { net, chain, nodes, .. } = &mut *model;
             for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+                node.hints.extend(chain.hints_above(fork));
                 new_peak_slow(*net, chain, &mut node.pool);
             }
             let (generation, told) = model.announce(fork);
@@ -1157,19 +1213,27 @@ impl MockChain {
     }
 
     /// Hold `node` where it is: from here it answers from the chain as it
-    /// stands now, judges bundles against it, and announces nothing, while
-    /// the other nodes follow every block and reorganisation. Two nodes then
-    /// disagree as two real ones a block or a fork apart do.
+    /// stands now, judges bundles against it, announces nothing and adds no
+    /// hint row, while the other nodes follow every block and
+    /// reorganisation. Two nodes then disagree as two real ones a block or a
+    /// fork apart do. A held node is released before it is held again:
+    /// holding it again would move its view to the chain now without the
+    /// hint rows and mempool update of the blocks it skipped.
     pub(crate) fn hold(&self, node: &MockNode) {
         let mut model = self.lock();
         let index = model.index_of(node);
+        assert!(model.nodes[index].held.is_none(), "the node is held already: release it first");
         let snapshot = model.chain.clone();
         model.nodes[index].held = Some(snapshot);
     }
 
     /// Let a held node catch up: on the fast path when the chain grew on the
     /// tip it held, else on the slow path, then announced the peak with the
-    /// fork point it shares with the chain it held.
+    /// fork point it shares with the chain it held. It adds the hint rows of
+    /// the blocks above that fork point to the ones it kept, as a full node
+    /// taking the new peak adds those of the blocks since the fork: so it
+    /// has the rows of the fork it held and of the chain now, and none of a
+    /// block that came and went while it was held.
     pub(crate) async fn release(&self, node: &MockNode) {
         let (generation, told) = {
             let mut model = self.lock();
@@ -1178,7 +1242,9 @@ impl MockChain {
             let common = model.chain.common(&held);
             let net = model.net;
             let Model { chain, nodes, .. } = &mut *model;
-            let pool = &mut nodes[index].pool;
+            let state = &mut nodes[index];
+            state.hints.extend(chain.hints_above(common));
+            let pool = &mut state.pool;
             if common == held.peak() {
                 let spent: HashSet<Bytes32> = chain.blocks[common as usize + 1..].iter().flat_map(|b| b.spent.iter().copied()).collect();
                 new_peak_fast(net, chain, pool, &spent);
