@@ -1,5 +1,5 @@
 {
-  "note": "A FAIR ONLY table's bytes, as the pages compute them (src/computedFairOnlyVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house_bytes.rs tests read it). names: faironlyInc. records: each a whole page-written record (`ck:` checkpoint, `fin:` end order, `xf:` transfer) at ctx, its key, its id (ckId/xfId; null for a fin), and signBytes (hex) which `k` signed as `g`. sids: nextSid3. offers: the bytes a deed offer's maker signs (offerSignBytes, hex) and the offer with that signature; a lone surrogate can't be in JSON, and Yjs writes one as U+FFFD, so none is here. weights: weightOf(value, cap), null past the cap or the depth; the node's weight() says the same.",
+  "note": "A FAIR ONLY table's bytes, as the pages compute them (src/computedFairOnlyVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house_bytes.rs tests read it). names: faironlyInc. records: each a whole page-written record (`ck:` checkpoint, `fin:` end order, `xf:` transfer) at ctx, its key, its id (ckId/xfId; null for a fin), and signBytes (hex) which `k` signed as `g`. sids: nextSid3. offers: the bytes a deed offer's maker signs (offerSignBytes, hex) and the offer with that signature; a lone surrogate can't be in JSON, and Yjs writes one as U+FFFD, so pages refuse one in an offer's text and none is here. weights: weightOf(value, cap), null past the cap or the depth; the node's weight() says the same.",
   "names": [
     {
       "letter": "p",
@@ -1534,6 +1534,170 @@
         }
       },
       "cap": 769,
+      "weight": null
+    },
+    {
+      "value": {
+        "z": {
+          "z": {
+            "z": {
+              "z": {
+                "z": {
+                  "z": {
+                    "z": {
+                      "z": {
+                        "z": {
+                          "z": {
+                            "z": {
+                              "z": {
+                                "z": {
+                                  "z": {
+                                    "z": {
+                                      "z": {
+                                        "a": {
+                                          "$undefined": true
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "cap": 1000,
+      "weight": 127
+    },
+    {
+      "value": {
+        "z": {
+          "z": {
+            "z": {
+              "z": {
+                "z": {
+                  "z": {
+                    "z": {
+                      "z": {
+                        "z": {
+                          "z": {
+                            "z": {
+                              "z": {
+                                "z": {
+                                  "z": {
+                                    "z": {
+                                      "z": {
+                                        "z": {
+                                          "a": {
+                                            "$undefined": true
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "cap": 1000,
+      "weight": null
+    },
+    {
+      "value": [
+        [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      [
+                        [
+                          [
+                            [
+                              [
+                                [
+                                  [
+                                    [
+                                      {
+                                        "$undefined": true
+                                      }
+                                    ]
+                                  ]
+                                ]
+                              ]
+                            ]
+                          ]
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "cap": 1000,
+      "weight": 56
+    },
+    {
+      "value": [
+        [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      [
+                        [
+                          [
+                            [
+                              [
+                                [
+                                  [
+                                    [
+                                      [
+                                        {
+                                          "$undefined": true
+                                        }
+                                      ]
+                                    ]
+                                  ]
+                                ]
+                              ]
+                            ]
+                          ]
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "cap": 1000,
       "weight": null
     }
   ]

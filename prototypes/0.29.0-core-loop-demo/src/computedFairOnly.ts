@@ -281,10 +281,13 @@ function utf8Length(s: string): number {
  *  An undefined field weighs like any other (its key, 4, and 8 for the
  *  value): a peer can write one and no reader counts it, and the node weighs
  *  it as padding, so a page that skipped it would call a record light that
- *  the node calls too heavy to read. Weighed only as far as `cap` and
- *  MAX_WEIGHT_DEPTH: null past either, so finding a heavy value out costs
- *  about `cap` however big it is (an object's keys are listed once, and the
- *  value is in memory already: that costs about what holding it did). */
+ *  the node calls too heavy to read. It is charged at the field and takes no
+ *  depth of its own (the node does not visit it), where an undefined member
+ *  of an array is visited, one level down, like any member. Weighed only as
+ *  far as `cap` and MAX_WEIGHT_DEPTH: null past either, so finding a heavy
+ *  value out costs about `cap` however big it is (an object's keys are listed
+ *  once, and the value is in memory already: that costs about what holding it
+ *  did). */
 export function weightOf(v: unknown, cap: number): number | null {
   let total = 0;
   const stack: [unknown, number][] = [[v, 0]];
@@ -308,8 +311,12 @@ export function weightOf(v: unknown, cap: number): number | null {
       for (const k of Object.keys(x)) {
         if (k.length > cap) return null;
         total += utf8Length(k) + 4;
+        const field = x[k];
+        // An undefined field is charged where it stands and not visited, as the
+        // node charges it: it takes no depth of its own.
+        if (field === undefined) total += 8;
         if (total > cap) return null;
-        stack.push([x[k], depth + 1]);
+        if (field !== undefined) stack.push([field, depth + 1]);
       }
       total += 2;
     } else {
@@ -330,7 +337,27 @@ const RV = /^[a-z][a-z0-9]{0,7}$/;
 const CK_D = /^[hz]:[0-9a-f]{32}$/;
 
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
-const isText = (v: unknown): v is string => typeof v === 'string' && v.length <= MAX_OFFER_TEXT;
+
+/** Whether `s` has no unpaired surrogate. Yjs writes a string as UTF-8, which
+ *  has none, so a peer reads U+FFFD where this page holds one, and nothing
+ *  signed or hashed over the text (the maker's signature, the id of the
+ *  record that holds it) would hold there: the page that wrote it would
+ *  count a transfer no other page can read. */
+function wellFormed(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1); // NaN past the end
+      if (!(d >= 0xdc00 && d <= 0xdfff)) return false;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const isText = (v: unknown): v is string => typeof v === 'string' && v.length <= MAX_OFFER_TEXT && wellFormed(v);
 
 /** A fin: {v:1, k, g}. The signature is the resolver's to check. */
 export function asFin(v: unknown): FinRec | null {

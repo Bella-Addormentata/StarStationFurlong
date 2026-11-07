@@ -9,19 +9,21 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
 import { canon, MAX_TABLE_PIDS, nextSid, signBytes } from './computedFold';
 import {
   asDeedOffer, asDo, asFin, asXf, ckId, ckKey, doKey, FAIR_ONLY_GAMES, FAIR_ONLY_RV, faironlyInc, finKey, isFairOnlyInc, isKnownRv,
   MAX_CHECKPOINT_BYTES, MAX_OFFER_TEXT, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, MAX_WEIGHT_DEPTH, nextSid3, NO_CLOSE, OFFER_SKEW_MS, parseFairOnlyKey,
   readCk, sealCk, sealFin, sealXf, weightOf, xfId, xfKey,
 } from './computedFairOnly';
-import type { CkRec, FairOnlyLetter, FairOnlyName, XferRec } from './computedFairOnly';
+import type { CkRec, DeedOffer, FairOnlyLetter, FairOnlyName, XferRec } from './computedFairOnly';
 import {
   buyer, changed, ctxOf, delegation, DL_HOUSE, hex, house, houseSigner, NAME, offerOf, OPENING_CARRY, owner, P, Q, ROOM, rootOf, T, trimOf,
 } from './computedFairOnlyKit';
 import type { FoldCtx } from './computedFold';
 import { testIdentity } from './computedTestKit';
 import { verifyIdentityStrict } from './keypair';
+import { offerSignBytes } from './offerBytes';
 
 /** (The context a record is read at is the room's alone; the specs pass the game's for the reader's sake.) */
 const read = (_ctx: FoldCtx, c: { key: string; value: unknown }) => readCk(ROOM, c.key, c.value);
@@ -235,6 +237,22 @@ describe('weightOf', () => {
     expect(weightOf({ a: undefined }, 14)).toBeNull();
   });
 
+  it('charges an undefined field where it stands, so it takes no depth, and visits an undefined member of an array one level down', () => {
+    // {a: undefined} inside 16 objects is 15 and 7 for each wrapper, and light: the node does not visit the field.
+    let inObjects: unknown = { a: undefined };
+    for (let i = 0; i < MAX_WEIGHT_DEPTH; i++) inObjects = { z: inObjects };
+    expect(weightOf(inObjects, 1_000)).toBe(15 + 7 * MAX_WEIGHT_DEPTH);
+    expect(weightOf({ z: inObjects }, 1_000)).toBeNull(); // (the inner object itself is now too deep)
+    // [undefined] inside 15 arrays has its member on the last level there is; one more and it is a level past.
+    let inArrays: unknown = [undefined];
+    for (let i = 0; i < MAX_WEIGHT_DEPTH - 1; i++) inArrays = [inArrays];
+    expect(weightOf(inArrays, 1_000)).toBe(11 + 3 * (MAX_WEIGHT_DEPTH - 1));
+    expect(weightOf([inArrays], 1_000)).toBeNull();
+    // It counts against the cap at the field, the whole 8 of it.
+    expect(weightOf({ a: { b: undefined } }, 2 + 5 + 2 + 5 + 8)).toBe(22);
+    expect(weightOf({ a: { b: undefined } }, 2 + 5 + 2 + 5 + 7)).toBeNull();
+  });
+
   it('is not got round by padding with undefined fields, however many', () => {
     const pad: Record<string, unknown> = {};
     for (let i = 0; i < 300_000; i++) pad[`k${i}`] = undefined;
@@ -311,6 +329,36 @@ describe('fins, offers, transfers', () => {
     }
     expect(asDeedOffer(null, ROOM)).toBeNull();
     expect(asDeedOffer([], ROOM)).toBeNull();
+  });
+
+  it('refuses text with an unpaired surrogate, and reads a pair as the character it is', () => {
+    for (const text of ['\ud800', 'a\ud800b', '\udc00', 'a\udc00', '\udc00\ud800', '\ud83d', 'x\ud83dy', '😀\ud83d', '\ud83d😀\ude00', '\udbff', '\udfff', 'a\udfff']) {
+      expect(asDeedOffer({ ...offer, makerName: text }, ROOM), JSON.stringify(text)).toBeNull();
+      expect(asDeedOffer({ ...offer, asset: { ...offer.asset, roomName: text } }, ROOM), JSON.stringify(text)).toBeNull();
+    }
+    for (const text of ['😀', 'a😀b', '😀', '퟿', '', '􏿿', '𐀀', '😀😀']) {
+      expect(asDeedOffer({ ...offer, makerName: text }, ROOM), JSON.stringify(text)).not.toBeNull();
+      expect(asDeedOffer({ ...offer, asset: { ...offer.asset, roomName: text } }, ROOM), JSON.stringify(text)).not.toBeNull();
+    }
+    // (Wherever the offer is read: in a transfer, or kept under its nonce.)
+    const lone = { ...offer, makerName: 'a\ud800' };
+    expect(asXf(sealXf(P, { v: 1, o: lone, u: 3, k: buyer.pub }, buyer.sign).value, ROOM)).toBeNull();
+    expect(asDo(doKey(offer.nonce), lone, ROOM)).toBeNull();
+  });
+
+  it('refuses it because Yjs writes strings as UTF-8: a peer reads U+FFFD, and the maker\'s signature fails there', () => {
+    const bad = offerOf(owner, buyer, { makerName: 'Ma\ud800ker' });
+    expect(verifyIdentityStrict(owner.pub, offerSignBytes(bad), bad.sig)).toBe(true); // (it holds where it was written)
+    const a = new Y.Doc();
+    a.getMap('m').set('o', bad);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    const got = b.getMap('m').get('o') as DeedOffer;
+    expect(got.makerName).toBe('Ma�ker');
+    expect(verifyIdentityStrict(owner.pub, offerSignBytes(got), got.sig)).toBe(false);
+    // So the page that wrote it does not read it either, and agrees with every peer.
+    expect(asDeedOffer(bad, ROOM)).toBeNull();
+    expect(asDeedOffer(got, ROOM)).not.toBeNull();
   });
 
   it('a transfer is {v, o, u, k, g} with the offer made out to k', () => {

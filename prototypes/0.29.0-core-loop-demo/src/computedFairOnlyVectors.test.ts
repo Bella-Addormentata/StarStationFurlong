@@ -129,6 +129,7 @@ function realize(v: unknown): unknown {
 
 function weightCases() {
   const deep = (n: number): unknown => { let v: unknown = 1; for (let i = 0; i < n; i++) v = [v]; return v; };
+  const wrap = (inner: unknown, n: number, around: (v: unknown) => unknown): unknown => { let v = inner; for (let i = 0; i < n; i++) v = around(v); return v; };
   const padded = { ...trimOf(Q, 'q').value, pad0: UNDEF, pad1: UNDEF, pad2: UNDEF };
   const values: { value: unknown; cap: number }[] = [
     { value: 'abc', cap: 100 }, { value: '', cap: 100 }, { value: 'é', cap: 100 }, { value: '€uro', cap: 100 }, { value: '😀', cap: 100 },
@@ -142,6 +143,10 @@ function weightCases() {
     // An undefined field weighs its key, 4 and 8, as the node weighs the padding a peer can write so.
     { value: { a: UNDEF }, cap: 15 }, { value: { a: UNDEF }, cap: 14 }, { value: { a: UNDEF, bb: 1 }, cap: 100 }, { value: [UNDEF, 1], cap: 100 },
     { value: { n: { alice: UNDEF }, k: 'x' }, cap: 100 }, { value: padded, cap: 1_572_864 }, { value: padded, cap: weightOf(trimOf(Q, 'q').value, 1_572_864)! + 20 },
+    // An undefined field takes no depth (the node charges it where it stands): {a: undefined} in 16 objects is light
+    // (127), in 17 its object is past the depth. An undefined member of an array is a member, a level down.
+    { value: wrap({ a: UNDEF }, 16, (v) => ({ z: v })), cap: 1_000 }, { value: wrap({ a: UNDEF }, 17, (v) => ({ z: v })), cap: 1_000 },
+    { value: wrap([UNDEF], 15, (v) => [v]), cap: 1_000 }, { value: wrap([UNDEF], 16, (v) => [v]), cap: 1_000 },
   ];
   return values.map((c) => {
     // (What the file holds, markers and all, is what is weighed.)
@@ -157,7 +162,7 @@ function build() {
     bytes: bytesToHex(signBytes(r.kind as SignedKind, r.ctx, r.value)),
   }));
   return {
-    note: 'A FAIR ONLY table\'s bytes, as the pages compute them (src/computedFairOnlyVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house_bytes.rs tests read it). names: faironlyInc. records: each a whole page-written record (`ck:` checkpoint, `fin:` end order, `xf:` transfer) at ctx, its key, its id (ckId/xfId; null for a fin), and signBytes (hex) which `k` signed as `g`. sids: nextSid3. offers: the bytes a deed offer\'s maker signs (offerSignBytes, hex) and the offer with that signature; a lone surrogate can\'t be in JSON, and Yjs writes one as U+FFFD, so none is here. weights: weightOf(value, cap), null past the cap or the depth; the node\'s weight() says the same.',
+    note: 'A FAIR ONLY table\'s bytes, as the pages compute them (src/computedFairOnlyVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house_bytes.rs tests read it). names: faironlyInc. records: each a whole page-written record (`ck:` checkpoint, `fin:` end order, `xf:` transfer) at ctx, its key, its id (ckId/xfId; null for a fin), and signBytes (hex) which `k` signed as `g`. sids: nextSid3. offers: the bytes a deed offer\'s maker signs (offerSignBytes, hex) and the offer with that signature; a lone surrogate can\'t be in JSON, and Yjs writes one as U+FFFD, so pages refuse one in an offer\'s text and none is here. weights: weightOf(value, cap), null past the cap or the depth; the node\'s weight() says the same.',
     names: nameCases(),
     records,
     sids: sidCases(),
