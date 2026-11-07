@@ -87,6 +87,26 @@
  *     round is the latest wins, so a round the house decided, and every
  *     round before it, can't be outgrown by a chain written after it.
  *   - The house's seed joins the mix (pocketOf / computedCraps diceOf).
+ *
+ * FAIR ONLY (`p…` roulette, `q…` craps; houseOnly, PR 6c-3; design-final §8.3
+ * S6). A house table that never plays without its house: the same rules, and
+ *   (a) every close names a house commitment, the required one or a counted
+ *       join's: no round is Friendly, so no forfeit and no "every reveal in"
+ *       ever decides one;
+ *   (b) a close for a round more than MAX_HELD_ROUNDS past the base is invalid;
+ *   (d) an abandon counts only from the key of a present frozen slip of the
+ *       close it names, and a stranger's is ignored before any signature is
+ *       checked;
+ *   (e) a close is invalid if the players of the base, of the closes it
+ *       descends from and of its own frozen slips would pass MAX_TABLE_PIDS,
+ *       or the UTF-8 bytes of their ids MAX_TABLE_PID_BYTES, so every
+ *       checkpoint a session can lead to fits the cap on one;
+ *   (f) a house record counts only from a house that decides its round
+ *       (HouseCheck is asked with the record's round).
+ * Its base is not a `sum:` but the FAIR ONLY checkpoint the authority resolver
+ * chose (setFairOnlyBase; the session is nextSid3 of it), and with none the
+ * fold counts nothing. Its result also says how many bytes the records the
+ * pass USED weigh (keptBytes), which junk can't raise.
  */
 
 import { sha256 } from '@noble/hashes/sha256';
@@ -127,6 +147,18 @@ export const MAX_CHECKPOINT_PIDS = 4_096;
  *  (computedTable closeDuty), so the next checkpoint's nets stay under
  *  MAX_CHECKPOINT_PIDS and trims go on. */
 export const MAX_TABLE_PIDS = 4_000;
+/** The UTF-8 bytes the ids of a FAIR ONLY game's players may total, beside
+ *  MAX_TABLE_PIDS (its checkpoint's nets, its carry's riders and every slip
+ *  its session froze): a close that would pass it is invalid (S6 (e)). An id is
+ *  up to 256 UTF-16 units, up to 768 bytes, so without this 4,000 of them could
+ *  take a checkpoint past MAX_CHECKPOINT_BYTES and no trim could be written. An
+ *  honest id is a 43-character key: this is some 6 times what 4,000 of those
+ *  take. */
+export const MAX_TABLE_PID_BYTES = 1_000_000;
+/** Rounds a FAIR ONLY session may run past its base: a close for a later one is
+ *  invalid (S6 (b)), so a table whose house can't checkpoint holds, at most,
+ *  this many rounds of records (twice the trim's TRIM_ROUNDS) and then waits. */
+export const MAX_HELD_ROUNDS = 40;
 /** The only bound on an `hs:`'s `u` — far past any real round (~25 s a round);
  *  no restore uses an absolute round bound. */
 export const U_MAX = 2 ** 48;
@@ -140,8 +172,9 @@ export interface FoldCtx {
   room: string;
   /** The table's furniture id. */
   t: string;
-  /** The computed incarnation, /^[ckrd][0-9a-f]{24}$/: `c` and `r` roulette,
-   *  `k` and `d` craps; `r` and `d` are house tables (houseRules). */
+  /** The computed incarnation, /^[ckrdpq][0-9a-f]{24}$/: `c`, `r` and `p`
+   *  roulette, `k`, `d` and `q` craps; `r`, `d`, `p` and `q` are house tables
+   *  (houseRules), and `p` and `q` FAIR ONLY ones (houseOnly). */
   inc: string;
 }
 
@@ -355,6 +388,72 @@ export function nextSid(ctx: FoldCtx, cp: Pick<Checkpoint, 'b' | 'u' | 'l' | 'n'
   const c = canon({ t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, l: cp.l, n: cp.n, e: cp.e, s: cp.s, h: cp.h });
   if (c === null) throw new TypeError('nextSid: the checkpoint must be canonical');
   return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v1|${c}`))).slice(0, 24);
+}
+
+/** What a FAIR ONLY base is to the fold, and to the session it opens: a FAIR
+ *  ONLY checkpoint (computedFairOnly CkRec) without its signer, signature and
+ *  proofs. The resolver hands the fold the base it chose (S3); readCk has
+ *  already judged the shape (nets are NET strings, `s` an isCarry). */
+export interface Sid3Input {
+  /** The session it closes ('g' on the opening root). */ b: string;
+  /** The last round folded (0 on the root). */ u: number;
+  /** Sweeps at this `u`; absent means 0. */ w?: number;
+  /** recHash of round u's close (NO_CLOSE at u = 0). */ l: string;
+  /** How round u was decided: 'h:' or 'z:' and a record hash. */ d?: string;
+  /** Round u's outcome, when the house decided it: a pocket, or the dice. */ o?: number | [number, number];
+  /** pid → net since the incarnation opened. */ n: Record<string, string>;
+  /** 1 = ended. */ e?: 1;
+  /** Craps only, while live: the carry the next roll plays from. */ s?: CrapsCarry;
+  /** The commitment the session's first round must name. */ h?: string;
+}
+
+/** The live session after a FAIR ONLY checkpoint: the first 24 hex of
+ *  sha256("ssf-ct-sid-v3|" + canon({room, t, inc, b, u, w, l, d, o, n, e, s, h})),
+ *  absent fields left out. It leaves out `ok`, `j`, `rv`, `ts` (bound through
+ *  `inc`) and `k`, `g`, `f`, `dl`, `x`, so two authorities signing the same
+ *  state open the same session, which is what lets a transfer keep the game
+ *  going. Unlike nextSid it binds the room, and `w` gives a sweep a session of
+ *  its own. (computedFairOnly re-exports it; it lives here because the fold
+ *  needs it and the node's bundle of the fold must not reach the records.) */
+export function nextSid3(ctx: FoldCtx, cp: Sid3Input): string {
+  const c = canon({
+    room: ctx.room, t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, w: cp.w, l: cp.l, d: cp.d, o: cp.o, n: cp.n, e: cp.e, s: cp.s, h: cp.h,
+  });
+  if (c === null) throw new TypeError('nextSid3: the checkpoint must be canonical');
+  return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v3|${c}`))).slice(0, 24);
+}
+
+/** The bytes `s` takes as UTF-8, as a TextEncoder writes it: an astral
+ *  character four, a lone surrogate three (it writes U+FFFD). */
+export function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { n += 4; i++; }
+    else n += 3; // a BMP character, or a lone surrogate (TextEncoder writes U+FFFD)
+  }
+  return n;
+}
+
+/** Whether `s` has no unpaired surrogate. Yjs writes a string as UTF-8, which
+ *  has none, so a peer reads U+FFFD where this page holds one, and nothing
+ *  signed or hashed over the text (an offer maker's signature, the id and the
+ *  signature of a checkpoint that names a player by it) would hold there: the
+ *  page that wrote it would count a record no other page can read. */
+export function wellFormed(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1); // NaN past the end
+      if (!(d >= 0xdc00 && d <= 0xdfff)) return false;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** A duty pages take in turn: dutyRank orders them for each. 'restore' puts
@@ -649,8 +748,12 @@ export type SigCheck = (hash: string, kind: SignedKind, pub: string, bytes: () =
  * deed (the caller pins it). The caller's: it calls TableFold.houseChanged
  * when an answer may change.
  * Without one, no key is a house.
+ * `round` is the round the record is for. PR 5's houses are the room's and
+ * don't depend on it (a check may ignore it); a FAIR ONLY game's do: the
+ * house that decides a round is the one its authority delegated for that
+ * round, and moves with the game (S6 (f)).
  */
-export type HouseCheck = (pub: string) => boolean | undefined;
+export type HouseCheck = (pub: string, round: number) => boolean | undefined;
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
@@ -765,6 +868,17 @@ export interface FoldResult {
   /** Σ (key.length + an estimate of the value's size) over EVERY key of the
    *  live session, junk included (rawSize): what the session weighs in the
    *  doc, which junk grows as much as records do. */ rawBytes: number;
+  /** FAIR ONLY (design S6): the same weight as `bytes`, of the records this
+   *  pass USED only: the closes it found valid, the slips they froze and the
+   *  reveals that open them, the open round's chosen felts, the abandon or
+   *  house reveal that decided each round, and the house joins the pass counted
+   *  (a close's commitment rests on one, or it is one of `joins`). A record
+   *  anyone can write for nothing (a forged signature, a round far ahead, a
+   *  close that names the wrong thing, a stranger's abandon, an old version of
+   *  a felt) is never in it, so junk can't raise it: what pressure and pauses
+   *  read, where `rawBytes - keptBytes` is what a sweep clears. It depends on
+   *  the records and not on the order they came in. At other tables it is
+   *  `bytes`. */ keptBytes: number;
   /** Indexed record count. */ records: number;
 }
 
@@ -829,8 +943,9 @@ export interface FoldGame<S> {
   /** Whether a close may freeze this slip so that it counts: roulette needs
    *  a felt with something on it. */
   frozenOk(s: SlipEntry): boolean;
-  /** The carried state a session starts from (null cp: a new incarnation). */
-  start(cp: Checkpoint | null): S;
+  /** The carried state a session starts from (null cp: a new incarnation); a
+   *  FAIR ONLY base is read by its carry alone. */
+  start(cp: Pick<Checkpoint, 's'> | null): S;
   /** A short string that changes whenever `s` does (a memo key). */
   key(s: S): string;
   /** Play round r of close `out` (P: the frozen slips present, by pid; M: the
@@ -944,15 +1059,24 @@ export const crapsGame: FoldGame<CrapsCarry> = {
 
 export type GameName = 'roulette' | 'craps';
 
-/** The game an incarnation plays, from its name: `k…` and `d…` craps, else roulette. */
+/** The game an incarnation plays, from its name: `k…`, `d…` and `q…` craps,
+ *  else roulette. */
 export function gameOfInc(inc: string): GameName {
-  return inc[0] === 'k' || inc[0] === 'd' ? 'craps' : 'roulette';
+  return inc[0] === 'k' || inc[0] === 'd' || inc[0] === 'q' ? 'craps' : 'roulette';
 }
 
-/** Whether an incarnation is a house table (PR 5's names, `r…` and `d…`):
- *  its rounds may take the house's seed, by THE HOUSE's rules above. */
+/** Whether an incarnation is a house table (PR 5's names, `r…` and `d…`, and
+ *  FAIR ONLY's `p…` and `q…`): its rounds may take the house's seed, by THE
+ *  HOUSE's rules above. */
 export function houseRules(inc: string): boolean {
-  return inc[0] === 'r' || inc[0] === 'd';
+  return inc[0] === 'r' || inc[0] === 'd' || inc[0] === 'p' || inc[0] === 'q';
+}
+
+/** Whether an incarnation is a FAIR ONLY table (`p…` roulette, `q…` craps): a
+ *  house table that never plays without its house, by FAIR ONLY's rules above.
+ *  Its base is a FAIR ONLY checkpoint (TableFold.setFairOnlyBase). */
+export function houseOnly(inc: string): boolean {
+  return inc[0] === 'p' || inc[0] === 'q';
 }
 
 /** The rules an incarnation's rounds are played by. */
@@ -1073,7 +1197,26 @@ export interface Signed {
   /** dutyRank for this record's duty, computed on first use. */
   rank?: string;
 }
+/** The players of a FAIR ONLY close's chain (S6 e), as a list of links so that
+ *  rival closes share what they descend from: the base's own, then each close's
+ *  frozen players that no link before it holds. `count` and `bytes` (UTF-8 of
+ *  the ids) are the whole chain's up to and including this link. */
+interface PidLink {
+  parent: PidLink | null;
+  own: Set<string>;
+  count: number;
+  bytes: number;
+}
+
+function linkHas(link: PidLink | null, pid: string): boolean {
+  for (let l = link; l !== null; l = l.parent) if (l.own.has(pid)) return true;
+  return false;
+}
+
 interface CloseEntry extends EntryBase<'c', CloseRec>, Signed {
+  /** FAIR ONLY: the players of this close's chain (S6 e), valid while the
+   *  parent's link is the very object it was made from. */
+  pids?: { parent: PidLink; link: PidLink };
   /** Memo of closeInfo, valid while this round's slip set is unchanged. */
   info?: { ver: number; info: CloseInfo };
   /** Memo of signerPresent, the same way. */
@@ -1122,6 +1265,22 @@ function rawSize(value: unknown): number {
     if (typeof j === 'string') return j.length;
   } catch { /* unserializable */ }
   return 64;
+}
+
+/** The player ids a session record names: a slip's and a reveal's player, the
+ *  players a close froze, the players a forfeit counts. */
+function playersOf(kind: RecKind, rec: unknown): readonly string[] {
+  switch (kind) {
+    case 's':
+    case 'x':
+      return [(rec as SlipRec | RevealRec).p];
+    case 'c':
+      return Object.keys((rec as CloseRec).f);
+    case 'f':
+      return (rec as ForfeitRec).n;
+    default:
+      return [];
+  }
 }
 
 /** Two-level map helpers: inner maps are created on demand and dropped once
@@ -1222,8 +1381,16 @@ export class TableFold {
   private readonly game: FoldGame<unknown>;
   /** THE HOUSE's rules apply (houseRules): else house records are junk. */
   private readonly house: boolean;
+  /** FAIR ONLY's rules apply too (houseOnly): S6 in the header. */
+  private readonly fairOnly: boolean;
   private readonly houseOk: HouseCheck;
   private base: FoldBase = { sid: 'g', u: 0, l: null, n: new Map(), ended: false, state: null, h: null };
+  /** FAIR ONLY: whether setFairOnlyBase gave a base. With none the fold counts
+   *  nothing (the table is not open: S4), whatever records it holds. */
+  private hasBase = false;
+  /** FAIR ONLY: where every chain's players start (S6 e): the base's own, its
+   *  nets' and its carry's riders'. */
+  private basePids: PidLink = { parent: null, own: new Set(), count: 0, bytes: 0 };
 
   private entries = new Map<string, Entry>();
   private slipsByHash = new Map<string, SlipEntry>();
@@ -1291,15 +1458,20 @@ export class TableFold {
     this.keyOf = keyOf;
     this.game = game;
     this.house = houseRules(ctx.inc);
+    this.fairOnly = houseOnly(ctx.inc);
     this.houseOk = houseOk ?? (() => false);
-    this.base = { ...this.base, state: game.start(null) };
+    // (A FAIR ONLY fold has no session until it is given a base: the sid of a
+    // v1 incarnation's first session, 'g', would let a close naming it count.)
+    this.base = { ...this.base, sid: this.fairOnly ? '' : this.base.sid, state: game.start(null) };
   }
 
   /** Point at the incarnation's checkpoint (null = none) — the live session id
    *  follows from it (nextSid). A changed sid clears the index. A checkpoint
    *  that fails the game's asCheckpoint counts as none, as does one naming a
-   *  house commitment at a table that isn't a house table. */
+   *  house commitment at a table that isn't a house table. (Not for a FAIR
+   *  ONLY table: its base is setFairOnlyBase's.) */
   setBase(cp: Checkpoint | null): void {
+    if (this.fairOnly) throw new TypeError('setBase: a FAIR ONLY table has a FAIR ONLY base (setFairOnlyBase)');
     let ok = cp === null ? null : this.game.asCheckpoint(cp);
     if (ok?.h !== undefined && !this.house) ok = null;
     const sid = nextSid(this.ctx, ok);
@@ -1332,6 +1504,43 @@ export class TableFold {
       }
     }
     this.dirty = true;
+  }
+
+  /** FAIR ONLY: point the fold at the base the authority resolver chose (design
+   *  §8.3 S3), or at none. The live session follows from it (nextSid3), and a
+   *  changed session clears the index, as setBase does; the same session again
+   *  redoes nothing. With no base the fold counts nothing: the table is not
+   *  open (S4). `cp` is a checkpoint readCk accepted (its nets are NET strings,
+   *  its carry an isCarry). */
+  setFairOnlyBase(cp: Sid3Input | null): void {
+    if (!this.fairOnly) throw new TypeError('setFairOnlyBase: only a FAIR ONLY table has a FAIR ONLY base');
+    if (cp === null) {
+      if (!this.hasBase) return;
+      this.clearIndex();
+      this.hasBase = false;
+      this.basePids = { parent: null, own: new Set(), count: 0, bytes: 0 };
+      this.base = { sid: '', u: 0, l: null, n: new Map(), ended: false, state: this.game.start(null), h: null };
+      return;
+    }
+    const sid = nextSid3(this.ctx, cp);
+    if (this.hasBase && sid === this.base.sid) return;
+    this.clearIndex();
+    const n = new Map<string, bigint>();
+    const pids = new Set<string>();
+    for (const pid of Object.keys(cp.n).sort()) {
+      const v = cp.n[pid];
+      // (canon leaves a net that is undefined out of the record's id, so it is no player)
+      if (v === undefined) continue;
+      n.set(pid, BigInt(v));
+      pids.add(pid);
+    }
+    // The riders of a craps carry play on whether or not they write a slip: the game holds them too.
+    if (cp.s) for (const pid of Object.keys(cp.s.w)) pids.add(pid);
+    let bytes = 0;
+    for (const pid of pids) bytes += utf8Length(pid);
+    this.basePids = { parent: null, own: pids, count: pids.size, bytes };
+    this.base = { sid, u: cp.u, l: cp.u === 0 ? null : cp.l, n, ended: cp.e === 1, state: this.game.start(cp), h: cp.h ?? null };
+    this.hasBase = true;
   }
 
   /** 🔁 The round-u evidence (§6.2 B) this page keeps when the new checkpoint
@@ -1469,6 +1678,10 @@ export class TableFold {
       : pk.kind === 'h' ? asHouseReveal(value)
       : asHouseCommit(value);
     if (pk.kind === 'c' && (rec as CloseRec | null)?.h !== undefined && !this.house) return null;
+    // FAIR ONLY: a record that names a player by an unpaired surrogate is whole
+    // only on the page that wrote it (Yjs writes UTF-8: a peer reads U+FFFD
+    // and the record's key and signature fail there), so no page counts it.
+    if (this.fairOnly && rec && !playersOf(pk.kind, rec).every(wellFormed)) return null;
     const c = rec && canon(rec);
     if (!rec || c === null) return null;
     const hash = hashOfCanon(c);
@@ -1693,21 +1906,49 @@ export class TableFold {
     return info;
   }
 
+  /** FAIR ONLY (S6 e): the players of close `c`'s chain, given its parent's
+   *  (the base's, or the close before's): the parent's, then the players `c`
+   *  freezes that no link before it holds, however its slips fare (a slip not
+   *  there, or failing, is still a name a close put in `f`). Kept on the close
+   *  while the parent's link is the very object it was made from, so rival
+   *  closes share what they descend from and a pass that changed nothing
+   *  makes none. The players are counted as a set; their bytes as UTF-8, the
+   *  way a checkpoint will weigh the ids. */
+  private pidLink(c: CloseEntry, parent: PidLink): PidLink {
+    if (c.pids?.parent === parent) return c.pids.link;
+    const own = new Set<string>();
+    let count = parent.count;
+    let bytes = parent.bytes;
+    for (const pid of Object.keys(c.rec.f)) {
+      if (own.has(pid) || linkHas(parent, pid)) continue;
+      own.add(pid);
+      count++;
+      bytes += utf8Length(pid);
+    }
+    const link: PidLink = { parent, own, count, bytes };
+    c.pids = { parent, link };
+    return link;
+  }
+
+  /** The reveal of (r, pid) that opens commitment `c`, if any: the first such
+   *  `x:<r>:<pid>:*` in index order, which is the one whose seed counts. */
+  private revealFor(r: number, pid: string, c: string): RevealEntry | null {
+    const mine = this.revealsAt.get(r)?.get(pid);
+    if (mine) for (const x of mine.values()) if (x.commit === c) return x;
+    return null;
+  }
+
   /** The seed a reveal of (r, pid) gives for commitment `c`, if any: some
    *  `x:<r>:<pid>:*` whose seed opens it. */
   private seedFor(r: number, pid: string, c: string): string | null {
-    const mine = this.revealsAt.get(r)?.get(pid);
-    if (mine) for (const x of mine.values()) if (x.commit === c) return x.rec.s;
-    return null;
+    return this.revealFor(r, pid, c)?.rec.s ?? null;
   }
 
   /** The recHash of a reveal of (r, pid) that opens commitment `c`, matching
    *  seedFor's choice (the first such in index order), for the round-u copies
    *  (deciderCopies). null when none opens it on this page. */
   private revealHashFor(r: number, pid: string, c: string): string | null {
-    const mine = this.revealsAt.get(r)?.get(pid);
-    if (mine) for (const x of mine.values()) if (x.commit === c) return x.hash;
-    return null;
+    return this.revealFor(r, pid, c)?.hash ?? null;
   }
 
   /** The §6.1 b copy keys for a decided round `view`, whose close froze the
@@ -1905,18 +2146,19 @@ export class TableFold {
 
   // ── The house ─────────────────────────────────────────────────────────────
 
-  /** Whether `pub` is a house (HouseCheck); not known yet marks the pass pending. */
-  private isHouse(pub: string): boolean | undefined {
-    const ok = this.houseOk(pub);
+  /** Whether `pub` is a house of round `r` (HouseCheck); not known yet marks
+   *  the pass pending. */
+  private isHouse(pub: string, r: number): boolean | undefined {
+    const ok = this.houseOk(pub, r);
     if (ok === undefined) this.sawPending = true;
     return ok;
   }
 
-  /** A house record counts: a house's, its signature good. undefined while
-   *  either isn't known (no signature is checked for a key not yet known to
-   *  be a house's, nor for one known not to be). */
+  /** A house record counts: a house's for its round (S6 f), its signature
+   *  good. undefined while either isn't known (no signature is checked for a
+   *  key not yet known to be a house's, nor for one known not to be). */
   private houseRecOk(e: HouseRevealEntry | HouseCommitEntry): boolean | undefined {
-    const by = this.isHouse(e.rec.k);
+    const by = this.isHouse(e.rec.k, e.rec.r);
     if (by !== true) return by;
     return this.ask(e, e.kind === 'h' ? 'hreveal' : 'hcommit');
   }
@@ -1986,13 +2228,14 @@ export class TableFold {
    *  commitment required after its parent (null for none): that one, unless a
    *  step-down lifted it; else nothing, or a counted join record's
    *  commitment whose seed no step-down revealed. 'pending' while the join
-   *  record it names is being checked. */
+   *  record it names is being checked. At a FAIR ONLY table there is no
+   *  "nothing": every close names a commitment (S6 a), so no round is Friendly. */
   private commitState(c: CloseEntry, req: string | null): 'valid' | 'pending' | 'invalid' {
     if (!this.house) return 'valid';
     const r = c.rec.r;
     if (req !== null && !this.steppedDown(r, req)) return c.rec.h === req ? 'valid' : 'invalid';
     const h = c.rec.h;
-    if (h === undefined) return 'valid';
+    if (h === undefined) return this.fairOnly ? 'invalid' : 'valid';
     if (this.steppedDown(r, h)) return 'invalid';
     const joins = this.joinsOf(r);
     if (joins.ok.some((o) => o.rec.c === h)) return 'valid';
@@ -2090,10 +2333,17 @@ export class TableFold {
       decided = 'reveals';
       counted = present;
     }
-    // (c) Nobody can finish it: void.
+    // (c) Nobody can finish it: void. At a FAIR ONLY table only a bettor of the
+    // round can say so (S6 d): an abandon counts only from the key of a present
+    // frozen slip of the close, and a stranger's is passed over before any
+    // signature is checked.
     const abandons = decided ? undefined : this.abandonsOf.get(c.hash);
     if (abandons) {
-      const z = this.bestVerified([...abandons.values()].filter((x) => x.rec.r === r).sort(this.byRank), 'abandon');
+      const bettors = this.fairOnly ? new Set([...P.values()].map((s) => s.rec.k)) : null;
+      const z = this.bestVerified(
+        [...abandons.values()].filter((x) => x.rec.r === r && (bettors === null || bettors.has(x.rec.k))).sort(this.byRank),
+        'abandon',
+      );
       if (z) {
         decided = 'void';
         abandon = { hash: z.hash, rec: z.rec };
@@ -2128,6 +2378,15 @@ export class TableFold {
     this.sawPending = false;
     this.sInAt.clear();
     const { sid, u } = this.base;
+    // A FAIR ONLY table with no base is not open (S4): it counts nothing and
+    // shows nothing, whatever records it holds.
+    if (this.fairOnly && !this.hasBase) {
+      return {
+        base: this.base, rounds: [], tip: null, open: 1, parent: sid, houseTable: true, required: null, joins: [],
+        openCloses: [], felts: new Map(), nets: new Map(), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
+        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: 0, records: this.entries.size,
+      };
+    }
     // An ended incarnation plays no more rounds: a session map under the sid
     // its final checkpoint names is junk someone wrote after the end (no
     // build opens one), and counts nothing. The checkpoint's nets are all
@@ -2137,7 +2396,7 @@ export class TableFold {
         base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, houseTable: this.house, required: null, joins: [],
         openCloses: [], felts: new Map(),
         nets: new Map(this.base.n), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
-        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, records: this.entries.size,
+        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: this.fairOnly ? 0 : this.bytes, records: this.entries.size,
       };
     }
 
@@ -2151,8 +2410,13 @@ export class TableFold {
     const outcomes = new Map<string, Outcome>();
     const rests = new Map<string, string[]>();
     const eligible: CloseEntry[][] = [];
+    // FAIR ONLY: the players of each eligible close's chain (S6 e), by hash.
+    const links = new Map<string, PidLink>();
     let decidedBefore = new Set<string>();
-    for (let i = 0; i < MAX_SESSION_ROUNDS; i++) {
+    // A FAIR ONLY session holds MAX_HELD_ROUNDS rounds past its base and then
+    // waits for a checkpoint (S6 b): a close for a later round is never looked at.
+    const maxRounds = this.fairOnly ? MAX_HELD_ROUNDS : MAX_SESSION_ROUNDS;
+    for (let i = 0; i < maxRounds; i++) {
       const atR = this.closesAt.get(u + 1 + i);
       if (!atR) break;
       const cands: CloseEntry[] = [];
@@ -2172,6 +2436,16 @@ export class TableFold {
       for (const c of cands) {
         if (considered >= MAX_CLOSES_PER_ROUND) break;
         const req = this.requiredAfter(i === 0 ? null : outcomes.get(c.rec.q)!);
+        // FAIR ONLY (S6 e), before any signature is asked about: a close whose
+        // chain would pass the players a checkpoint can hold is invalid.
+        let link: PidLink | null = null;
+        if (this.fairOnly) {
+          link = this.pidLink(c, i === 0 ? this.basePids : links.get(c.rec.q)!);
+          if (link.count > MAX_TABLE_PIDS || link.bytes > MAX_TABLE_PID_BYTES) {
+            states.set(c.hash, 'invalid');
+            continue;
+          }
+        }
         const named = this.commitState(c, req);
         if (named === 'invalid') {
           states.set(c.hash, 'invalid');
@@ -2184,6 +2458,7 @@ export class TableFold {
         considered++;
         if (state !== 'valid') continue;
         ok.push(c);
+        if (link) links.set(c.hash, link);
         infos.set(c.hash, info);
         const on = this.restsOn(c, req);
         if (on.length > 0) rests.set(c.hash, on);
@@ -2342,7 +2617,54 @@ export class TableFold {
       pending: this.sawPending,
       bytes: this.bytes,
       rawBytes: this.rawBytes,
+      keptBytes: this.fairOnly ? this.keptOf(eligible, infos, outcomes, rests, felts, joins, open) : this.bytes,
       records: this.entries.size,
     };
+  }
+
+  /** FAIR ONLY: what the records this pass used weigh, as `bytes` weighs them
+   *  (S6; FoldResult.keptBytes): the closes found valid (a rival's too) with the
+   *  slips they froze and the reveals that open those; the abandon or house
+   *  reveal that decided each, and the house records its commitment rests on;
+   *  the open round's chosen felts, and the joins the pass counted for it
+   *  (FoldResult.joins). Each is counted once. Nothing else is: not a close
+   *  that failed a rule, a slip no close froze, a stranger's abandon, a forged
+   *  signature, a round past the cap, an old version of a felt — what anyone
+   *  can write for nothing never raises it.
+   *
+   *  It is a function of the records and not of what happened to be checked
+   *  before: a record counts for the choice this pass made of it (a counted
+   *  join, the reveal that decided a round), never for a verdict it holds
+   *  from an earlier pass. A house reveal that waits on a seed is counted
+   *  once it decides the round, and a join once a close rests on it or it is
+   *  one of the open round's. So a fold fed one record at a time, in any
+   *  order, and a fresh one agree. */
+  private keptOf(
+    eligible: readonly (readonly CloseEntry[])[], infos: ReadonlyMap<string, CloseInfo>, outcomes: ReadonlyMap<string, Outcome>,
+    rests: ReadonlyMap<string, string[]>, felts: ReadonlyMap<string, SlipInfo>, joins: FoldResult['joins'], open: number,
+  ): number {
+    const used = new Set<string>();
+    for (const ok of eligible) {
+      for (const c of ok) {
+        used.add(c.key);
+        for (const [pid, s] of infos.get(c.hash)!.P) {
+          used.add(s.key);
+          const x = this.revealFor(c.rec.r, pid, s.rec.c);
+          if (x) used.add(x.key);
+        }
+        const d = outcomes.get(c.hash)!;
+        if (d.abandon) used.add(`z:${c.rec.r}:${d.abandon.hash}`);
+        if (d.house) used.add(`h:${c.rec.r}:${d.house.hash}`);
+        for (const key of rests.get(c.hash) ?? []) used.add(key);
+      }
+    }
+    for (const s of felts.values()) used.add(s.key);
+    // (The joins are the ones joinsOf chose: the first MAX_CLOSES_PER_ROUND, in hash order, that are a house's and
+    // verify. One that was checked once, and lies past them now, is not one of them.)
+    const at = this.joinsAt.get(open);
+    if (at) for (const j of joins) used.add(at.get(j.hash)!.key);
+    let kept = 0;
+    for (const key of used) kept += this.entries.get(key)?.size ?? 0;
+    return kept;
   }
 }

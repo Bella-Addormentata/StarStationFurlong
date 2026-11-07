@@ -58,7 +58,8 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import {
-  canon, hasFields, isCarry, isHex32, isHex64, isHouseSumOutcome, isNet, isPid, isPlain, isPub, isSig, MAX_TABLE_PIDS, signBytes, U_MAX,
+  canon, hasFields, isCarry, isHex32, isHex64, isHouseSumOutcome, isNet, isPid, isPlain, isPub, isSig, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS,
+  nextSid3, signBytes, U_MAX, utf8Length, wellFormed,
 } from './computedFold';
 import type { Checkpoint, FoldCtx } from './computedFold';
 import type { CrapsCarry } from './computedCraps';
@@ -83,14 +84,11 @@ export const isKnownRv = (rv: string): boolean => KNOWN_RV.has(rv);
  *  40-digit nets, a craps carry and the transfers weigh some 1.3 MB at the
  *  very worst (the specs build that game). */
 export const MAX_CHECKPOINT_BYTES = 1.5 * 1024 * 1024;
-/** The UTF-8 bytes the ids of a game's players may total, beside
- *  MAX_TABLE_PIDS (its checkpoint's nets and every slip its session froze): a
- *  close that would pass it is invalid (S6 (e), the fold's, PR 6c-3). An id
- *  is up to 256 UTF-16 units, up to 768 bytes, so without this 4,000 of them
- *  could take a checkpoint past MAX_CHECKPOINT_BYTES and no trim could be
- *  written. An honest id is a 43-character key: this is some 6 times what
- *  4,000 of those take. */
-export const MAX_TABLE_PID_BYTES = 1_000_000;
+// MAX_TABLE_PID_BYTES (the UTF-8 bytes the ids of a game's players may total,
+// S6 (e)) and nextSid3 live in computedFold, which needs them: the fold is
+// bundled for the node and must not reach this file's records. They are
+// re-exported so this stays the one place the records' callers look.
+export { MAX_TABLE_PID_BYTES, nextSid3 };
 /** Transfers of authority a game's chain follows. */
 export const MAX_TRANSFERS = 8;
 /** A deed offer made before the game opened can't move it (a sale-back
@@ -98,6 +96,13 @@ export const MAX_TRANSFERS = 8;
 export const OFFER_SKEW_MS = 600_000;
 /** The longest maker or room name an offer may carry in a transfer record. */
 export const MAX_OFFER_TEXT = 256;
+/** A transfer, a deed offer, an end order or a delegation heavier than this
+ *  (see weightOf) is junk, unread: the heaviest honest one, a transfer whose
+ *  two names are 256 three-byte characters, weighs under 3 kB, and one padded
+ *  with undefined fields (which no reader counts, and canon and the signature
+ *  leave out, but the node weighs) stops here, before a key is sorted or a
+ *  record hashed. A checkpoint has its own, higher, cap (MAX_CHECKPOINT_BYTES). */
+export const MAX_SMALL_RECORD_BYTES = 8 * 1024;
 /** `l` of a checkpoint that closed no round. */
 export const NO_CLOSE = '0'.repeat(32);
 
@@ -212,21 +217,6 @@ export function xfId(value: unknown): string | null {
   return c === null ? null : bytesToHex(sha256(utf8ToBytes(`ssf-xf-id-v1|${c}`))).slice(0, 32);
 }
 
-/** The live session after a FAIR ONLY checkpoint: the first 24 hex of
- *  sha256("ssf-ct-sid-v3|" + canon({room, t, inc, b, u, w, l, d, o, n, e, s, h})),
- *  absent fields left out. It leaves out `ok`, `j`, `rv`, `ts` (bound through
- *  `inc`) and `k`, `g`, `f`, `dl`, `x`, so two authorities signing the same
- *  state open the same session, which is what lets a transfer keep the game
- *  going. Unlike computedFold's nextSid it binds the room, and `w` gives a
- *  sweep a session of its own. */
-export function nextSid3(ctx: FoldCtx, cp: Pick<CkRec, 'b' | 'u' | 'w' | 'l' | 'd' | 'o' | 'n' | 'e' | 's' | 'h'>): string {
-  const c = canon({
-    room: ctx.room, t: ctx.t, inc: ctx.inc, b: cp.b, u: cp.u, w: cp.w, l: cp.l, d: cp.d, o: cp.o, n: cp.n, e: cp.e, s: cp.s, h: cp.h,
-  });
-  if (c === null) throw new TypeError('nextSid3: the checkpoint must be canonical');
-  return bytesToHex(sha256(utf8ToBytes(`ssf-ct-sid-v3|${c}`))).slice(0, 24);
-}
-
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
 export const ckKey = (t: string, inc: string, id: string): string => `ck:${t}:${inc}:${id}`;
@@ -261,18 +251,6 @@ export function parseFairOnlyKey(key: string): FairOnlyKey | null {
 
 /** Nesting a record may have and still be weighed (the Rust twin's MAX_DEPTH). */
 export const MAX_WEIGHT_DEPTH = 16;
-
-function utf8Length(s: string): number {
-  let n = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 0x80) n += 1;
-    else if (c < 0x800) n += 2;
-    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { n += 4; i++; }
-    else n += 3; // a BMP character, or a lone surrogate (TextEncoder writes U+FFFD)
-  }
-  return n;
-}
 
 /** About what a value weighs as JSON — the Rust twin of house_bytes.rs
  *  `weight`, so a page and the node agree on which record is too heavy to
@@ -339,25 +317,6 @@ const CK_D = /^[hz]:[0-9a-f]{32}$/;
 
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
-/** Whether `s` has no unpaired surrogate. Yjs writes a string as UTF-8, which
- *  has none, so a peer reads U+FFFD where this page holds one, and nothing
- *  signed or hashed over the text (an offer maker's signature, the id and the
- *  signature of a checkpoint that names a player by it) would hold there: the
- *  page that wrote it would count a record no other page can read. */
-function wellFormed(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff) {
-      const d = s.charCodeAt(i + 1); // NaN past the end
-      if (!(d >= 0xdc00 && d <= 0xdfff)) return false;
-      i++;
-    } else if (c >= 0xdc00 && c <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
-}
-
 const isText = (v: unknown): v is string => typeof v === 'string' && v.length <= MAX_OFFER_TEXT && wellFormed(v);
 
 /** Whether every id a craps carry holds (its riders, the shooter, the last
@@ -370,7 +329,7 @@ function carryWellFormed(s: CrapsCarry): boolean {
 
 /** A fin: {v:1, k, g}. The signature is the resolver's to check. */
 export function asFin(v: unknown): FinRec | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'k', 'g'])) return null;
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null || !hasFields(v, ['v', 'k', 'g'])) return null;
   return v.v === 1 && isPub(v.k) && isSig(v.g) ? (v as unknown as FinRec) : null;
 }
 
@@ -379,7 +338,8 @@ export function asFin(v: unknown): FinRec | null {
  *  integers the node ports (only integers, short names). Whether the maker
  *  signed it, and whether it is for this game, are the resolver's. */
 export function asDeedOffer(v: unknown, room: string): DeedOffer | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'kind', 'asset', 'makerPub', 'makerName', 'toPub', 'price', 'issuedAt', 'expiresAt', 'nonce', 'sig'])) return null;
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null) return null;
+  if (!hasFields(v, ['v', 'kind', 'asset', 'makerPub', 'makerName', 'toPub', 'price', 'issuedAt', 'expiresAt', 'nonce', 'sig'])) return null;
   if (v.v !== 1 || v.kind !== 'transfer-offer') return null;
   const a = v.asset;
   if (!isPlain(a) || !hasFields(a, ['kind', 'roomId', 'roomName'])) return null;
@@ -394,7 +354,8 @@ export function asDeedOffer(v: unknown, room: string): DeedOffer | null {
  *  signatures hold, and whether the offer is newer than the game, are the
  *  resolver's. */
 export function asXf(v: unknown, room: string): XferRec | null {
-  if (!isPlain(v) || !hasFields(v, ['v', 'o', 'u', 'k', 'g'])) return null;
+  // (Weighed whole before any field is looked at: the offer inside is weighed again, which is small.)
+  if (!isPlain(v) || weightOf(v, MAX_SMALL_RECORD_BYTES) === null || !hasFields(v, ['v', 'o', 'u', 'k', 'g'])) return null;
   if (v.v !== 1 || !isSig(v.g) || !Number.isSafeInteger(v.u) || (v.u as number) < 0 || (v.u as number) > U_MAX) return null;
   // (The buyer's key `k` is a key because it is the offer's `toPub`, which is one.)
   const o = asDeedOffer(v.o, room);
@@ -466,7 +427,7 @@ function ckBody(v: Record<string, unknown>, room: string, letter: FairOnlyLetter
   // Who delegated the signer. The root's names the owner's house; any other
   // record's names the signer itself, as a house.
   if (v.dl !== undefined) {
-    const dl = asDelegation(v.dl);
+    const dl = weightOf(v.dl, MAX_SMALL_RECORD_BYTES) === null ? null : asDelegation(v.dl);
     if (!dl || (root ? dl.k !== v.ok : dl.h !== v.k)) return null;
   }
   // The transfers that brought the game to this record's authority.
