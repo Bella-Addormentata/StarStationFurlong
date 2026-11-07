@@ -1,0 +1,1370 @@
+{
+  "note": "A FAIR ONLY table's bytes, as the pages compute them (src/computedFairOnlyVectors.test.ts writes this with VECTORS_WRITE=1; ssf-p2p-node house_bytes.rs tests read it). names: faironlyInc. records: each a whole page-written record (`ck:` checkpoint, `fin:` end order, `xf:` transfer) at ctx, its key, its id (ckId/xfId; null for a fin), and signBytes (hex) which `k` signed as `g`. sids: nextSid3. offers: the bytes a deed offer's maker signs (offerSignBytes, hex) and the offer with that signature; a lone surrogate can't be in JSON, and Yjs writes one as U+FFFD, so none is here. weights: weightOf(value, cap), null past the cap or the depth; the node's weight() says the same.",
+  "names": [
+    {
+      "letter": "p",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 1700000000000,
+      "inc": "paa3c5e0c0af58e2835ff59b4"
+    },
+    {
+      "letter": "q",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 1700000000000,
+      "inc": "q546c5bccec92eac2f18f765a"
+    },
+    {
+      "letter": "q",
+      "room": "room-fo",
+      "t": "craps:1",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 1700000000000,
+      "inc": "qdbe7e37aa09055824b5a9aa8"
+    },
+    {
+      "letter": "p",
+      "room": "room-é-😀",
+      "t": "tablé-😀",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 1700000000000,
+      "inc": "pb0ece7af8b42335ca2cfc6a4"
+    },
+    {
+      "letter": "p",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 0,
+      "inc": "pe234310cc3b81417b2d8f36e"
+    },
+    {
+      "letter": "p",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f1",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 9007199254740991,
+      "inc": "p04206a70b99016d540e82359"
+    },
+    {
+      "letter": "p",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f2",
+      "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+      "j": "0123456789abcdef",
+      "ts": 1700000000000,
+      "inc": "p4eed31b695d0037ca5ccbbb4"
+    },
+    {
+      "letter": "p",
+      "room": "room-fo",
+      "t": "roulette-1",
+      "rv": "f1",
+      "ok": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+      "j": "fedcba9876543210",
+      "ts": 1700000000000,
+      "inc": "paefd4d17bbbaed9f71e144ec"
+    }
+  ],
+  "records": [
+    {
+      "name": "p root",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:c0191e9d8cbb1d72358fb30505433cf2",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "g",
+        "u": 0,
+        "l": "00000000000000000000000000000000",
+        "n": {},
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "g": "L2Z0JDCEfMhaJTJqVm2E9ueTMDdhHbwhCAkXwirJzEqMgRgWW6rRNYfnkZ6WEGVf4Jh3yR_hz0bXf-hKEu6NBg"
+      },
+      "id": "c0191e9d8cbb1d72358fb30505433cf2",
+      "bytes": "19d5147ac0eba287480a5e3947e67c477397b60df783ef3f0629942ed66775e5"
+    },
+    {
+      "name": "p trim",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:7f7f69503f58369c58c092f27d0dbe8c",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": 17,
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "JLipGvZS_6sbwLSmB7INMm09G5wKlGVYBWGveE8QeuaG2HfzImlb6DZyvRxCv7awLsC01c_FIRqEpp4qwHw-Bw"
+      },
+      "id": "7f7f69503f58369c58c092f27d0dbe8c",
+      "bytes": "2b3a53189d1a762c8cbe36029909f9f22b66711a3f9dd5729b5c166976427cca"
+    },
+    {
+      "name": "p void trim",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:1813b4fad269e07fec1be8a6d6f040a5",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "z:cccccccccccccccccccccccccccccccc",
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "0Rd9GaHkyyH6wc0m40Uwj5508yZgePYX5INnu0Utbd4F0Bv27vSi5O1DCrH6Kakpad8I1XjpWGguUtCRWBSCDQ"
+      },
+      "id": "1813b4fad269e07fec1be8a6d6f040a5",
+      "bytes": "f18dcf0b34fc9718363de685b8d77b2b2ec709a3e946cbb86eab25076219fa79"
+    },
+    {
+      "name": "p sweep",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:049d4cae73f88c79a3392b9a4eeb239f",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "163af1bb187f1a9430883c13",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": 17,
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "w": 1,
+        "g": "bkV3r3yoKyMhtvezZZA9vPWxyzrR94fQiSWn0KfkmkprzxwNk9rxaoZHLcaa7ZkkJynZfljoJ8shonQJ7gEEAg"
+      },
+      "id": "049d4cae73f88c79a3392b9a4eeb239f",
+      "bytes": "3f5e18a42865393c719a0ce08d675ed8f8d9a010f8cd0a6b174aaa2713b7ae47"
+    },
+    {
+      "name": "p end",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:860f657911e831eeccb6b3fd5e2496df",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "163af1bb187f1a9430883c13",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": 17,
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "e": 1,
+        "f": {
+          "v": 1,
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "en9wEefxEPL6_tVyTpvB_9sXc2_-guE1Ozq6FniH757P5wLzAC2I4ZaKYoV-_Y5T1R9Sdn9ARgXljaDYiHigDg"
+        },
+        "g": "_xkGDlzcpM3ZsBasCobe1jNlwyUIDLP7VUdY_DY7McSMRvlI7jBoxzm0AKVyP2nxG7zAD19chfjLOhX4ar3yCQ"
+      },
+      "id": "860f657911e831eeccb6b3fd5e2496df",
+      "bytes": "2b14ac6fccbda04ef5fcf779457ae6f4b824a0284ff9e4015afd27b57f8eebbb"
+    },
+    {
+      "name": "p adoption",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "ck:roulette-1:paa3c5e0c0af58e2835ff59b4:09040ca5243a0458abcddad9082ca592",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": 17,
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "x": [
+          {
+            "v": 1,
+            "o": {
+              "v": 1,
+              "kind": "transfer-offer",
+              "asset": {
+                "kind": "deed",
+                "roomId": "room-fo",
+                "roomName": "Furlong"
+              },
+              "makerPub": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+              "makerName": "Maker",
+              "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+              "price": 0,
+              "issuedAt": 1700000001000,
+              "expiresAt": 1700604801000,
+              "nonce": "0123456789abcdef01234567",
+              "sig": "4jXEb-rfGbEu2jGRMPwC_Xvga6KRm352P2Ey0RHou3qowXkm0t6j0zc0xOMfq1d5PLtgmgoHk5htogDIGTbeBQ"
+            },
+            "u": 3,
+            "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+            "g": "eqoiaevjWcYkaphLx-4EBCel5L0DLGEi7Kv6LKVwgaF_9SZNm-_7LJDxXX7YvG8kKEcbD72JpKeAOGrdltmsAg"
+          }
+        ],
+        "g": "lASbiJTFebfuSDt9V-FqxIdustioi4wjil9GevckPNLmCU3BuxdWiIYlsi-0cjsehTXEUizsBIkpaIg6Pw83CQ"
+      },
+      "id": "09040ca5243a0458abcddad9082ca592",
+      "bytes": "ff1fce9bdec278b0299fe870bdc65fc352861f54b493b204cd9d067535624c10"
+    },
+    {
+      "name": "p fin",
+      "kind": "fin",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "fin:roulette-1:paa3c5e0c0af58e2835ff59b4",
+      "value": {
+        "v": 1,
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "g": "en9wEefxEPL6_tVyTpvB_9sXc2_-guE1Ozq6FniH757P5wLzAC2I4ZaKYoV-_Y5T1R9Sdn9ARgXljaDYiHigDg"
+      },
+      "id": null,
+      "bytes": "02f544728a5318f21973db658b6eb2c2933d3107ff02a62ec3e4dea8d2e237a3"
+    },
+    {
+      "name": "p transfer",
+      "kind": "xf",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "key": "xf:roulette-1:paa3c5e0c0af58e2835ff59b4:d0bfd15acfb257d19955568306031bfe",
+      "value": {
+        "v": 1,
+        "o": {
+          "v": 1,
+          "kind": "transfer-offer",
+          "asset": {
+            "kind": "deed",
+            "roomId": "room-fo",
+            "roomName": "Furlong"
+          },
+          "makerPub": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "makerName": "Maker",
+          "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+          "price": 0,
+          "issuedAt": 1700000001000,
+          "expiresAt": 1700604801000,
+          "nonce": "0123456789abcdef01234567",
+          "sig": "4jXEb-rfGbEu2jGRMPwC_Xvga6KRm352P2Ey0RHou3qowXkm0t6j0zc0xOMfq1d5PLtgmgoHk5htogDIGTbeBQ"
+        },
+        "u": 3,
+        "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "g": "eqoiaevjWcYkaphLx-4EBCel5L0DLGEi7Kv6LKVwgaF_9SZNm-_7LJDxXX7YvG8kKEcbD72JpKeAOGrdltmsAg"
+      },
+      "id": "d0bfd15acfb257d19955568306031bfe",
+      "bytes": "804434f0888bdf2824bfd099f6a70390644f8f09d307a8ec9b85ec8b2c564b36"
+    },
+    {
+      "name": "q root",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:b5df4b6a9a5cb90f6bbc231f2da6a6ac",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "g",
+        "u": 0,
+        "l": "00000000000000000000000000000000",
+        "n": {},
+        "s": {
+          "p": 0,
+          "w": {}
+        },
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "g": "9hCs0uiojiNMmu8tEx0_QDoAvUn4CsXzawR0rByS8MgrDycmHv3Zl8PhvIAEAVOr7AHgxHRBll-GOMpwPRQJDA"
+      },
+      "id": "b5df4b6a9a5cb90f6bbc231f2da6a6ac",
+      "bytes": "d3e7f81f5f59fbcd17b21468cf9cd400b5f2c976167674fd267e1b71ac26b24a"
+    },
+    {
+      "name": "q trim",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:aaf7d6dbb82e5014a022989a72b3e9da",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "8v7ZBnS1DNcPMs4fmjtYn8TubrLHQVuEYN6xCe5lQI84jywB7RxeXKq_CQWC6i5RZKmlccDgikgT31UD4UtZBw"
+      },
+      "id": "aaf7d6dbb82e5014a022989a72b3e9da",
+      "bytes": "c070e629d23a9d628af636cc44e5121f3df751b1a0dcdc9a32e60b6f843223a3"
+    },
+    {
+      "name": "q void trim",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:693c1772a0cbae0fec923d5b765bdb06",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "z:cccccccccccccccccccccccccccccccc",
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "HDmxJum-1fAfO5K1fMDGxMCRBkQy6ywEFA6IPhzd8nel2m4BjAO9wWJ7q2fiOoKxJ2nvqvEbGvokybiUReQoDw"
+      },
+      "id": "693c1772a0cbae0fec923d5b765bdb06",
+      "bytes": "739a24f32819477d92c9452eb3eb43d3a54a86b20098acf85fb2df96189d23bd"
+    },
+    {
+      "name": "q sweep",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:b9a87d35766818175439e2c0a8741a3e",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "930675300d7151e27e0ecae5",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "w": 1,
+        "g": "J_jz8tEAvkL7mez_jU7uIKWXeRcgO2uz1DE9TI_6XlbIT-auCvIH5qlfZxF7xnaU-NzOdG4ODQAgjjEiBeULCw"
+      },
+      "id": "b9a87d35766818175439e2c0a8741a3e",
+      "bytes": "08cb17e359132c98b3f5bfc28ebe6fc2c946cc4817eda464732aec2566315770"
+    },
+    {
+      "name": "q end",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:ebba90de8ae3e43d8239dfa632f0e306",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "930675300d7151e27e0ecae5",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "e": 1,
+        "f": {
+          "v": 1,
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "nZfkg7EH0JLW9o_Trgd3NwhTkxCyKNVfbzoNo-8BSxB3cHyXonW0W1F-Ui7xItYdr8sE1SK2jb-JKmUU9PRmDA"
+        },
+        "g": "AxTZjFwso3DemeCQ6RQi0paqcl7CCDrfvyW5lBGBwg3P8S50XS4YJRKyu93B63MqUpo094aX71VR7yigr3sCBw"
+      },
+      "id": "ebba90de8ae3e43d8239dfa632f0e306",
+      "bytes": "8663843b44e6dc002e448d7df5eefacb0ad1f21c3fb85f6ec37366a0e87cf7ed"
+    },
+    {
+      "name": "q adoption",
+      "kind": "ck",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "ck:roulette-1:q546c5bccec92eac2f18f765a:88013a765fa197f8e73c23aadf0aebf5",
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "x": [
+          {
+            "v": 1,
+            "o": {
+              "v": 1,
+              "kind": "transfer-offer",
+              "asset": {
+                "kind": "deed",
+                "roomId": "room-fo",
+                "roomName": "Furlong"
+              },
+              "makerPub": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+              "makerName": "Maker",
+              "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+              "price": 0,
+              "issuedAt": 1700000001000,
+              "expiresAt": 1700604801000,
+              "nonce": "0123456789abcdef01234567",
+              "sig": "4jXEb-rfGbEu2jGRMPwC_Xvga6KRm352P2Ey0RHou3qowXkm0t6j0zc0xOMfq1d5PLtgmgoHk5htogDIGTbeBQ"
+            },
+            "u": 3,
+            "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+            "g": "xWzBTYS0Fi6ab1_l_6SMi1vIwRMxE_Yw6bZ50LWPOig2IT4Mm5rLajtTz2YabFSCB9pRBnFyl8ROqOdojjnkAw"
+          }
+        ],
+        "g": "8F6qjWEh6lTzVTUDulu99TsLj9w6brFZqgQzDYk-cVLlP_Loc7WtYe8Boy5k34mmQTlGCUJGisBSUhxEH6b6Aw"
+      },
+      "id": "88013a765fa197f8e73c23aadf0aebf5",
+      "bytes": "43ec33ccff04dccef296733c0cd4b25b67f271ba5e964d888bba370178f91411"
+    },
+    {
+      "name": "q fin",
+      "kind": "fin",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "fin:roulette-1:q546c5bccec92eac2f18f765a",
+      "value": {
+        "v": 1,
+        "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "g": "nZfkg7EH0JLW9o_Trgd3NwhTkxCyKNVfbzoNo-8BSxB3cHyXonW0W1F-Ui7xItYdr8sE1SK2jb-JKmUU9PRmDA"
+      },
+      "id": null,
+      "bytes": "d3fd8659519f2616f9adcd77dcc895b046084f2cf4034b98fb08b0f1b57bfeac"
+    },
+    {
+      "name": "q transfer",
+      "kind": "xf",
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "key": "xf:roulette-1:q546c5bccec92eac2f18f765a:84158769d080d8e6f288a71fe9c18897",
+      "value": {
+        "v": 1,
+        "o": {
+          "v": 1,
+          "kind": "transfer-offer",
+          "asset": {
+            "kind": "deed",
+            "roomId": "room-fo",
+            "roomName": "Furlong"
+          },
+          "makerPub": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "makerName": "Maker",
+          "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+          "price": 0,
+          "issuedAt": 1700000001000,
+          "expiresAt": 1700604801000,
+          "nonce": "0123456789abcdef01234567",
+          "sig": "4jXEb-rfGbEu2jGRMPwC_Xvga6KRm352P2Ey0RHou3qowXkm0t6j0zc0xOMfq1d5PLtgmgoHk5htogDIGTbeBQ"
+        },
+        "u": 3,
+        "k": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "g": "xWzBTYS0Fi6ab1_l_6SMi1vIwRMxE_Yw6bZ50LWPOig2IT4Mm5rLajtTz2YabFSCB9pRBnFyl8ROqOdojjnkAw"
+      },
+      "id": "84158769d080d8e6f288a71fe9c18897",
+      "bytes": "ac613dec68ba5af16aaee698a77289127368f592ac44fb93d16e41830dfef65f"
+    }
+  ],
+  "sids": [
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "cp": {
+        "b": "g",
+        "u": 0,
+        "l": "00000000000000000000000000000000",
+        "n": {}
+      },
+      "sid": "815d8b0420099fe82ba041a7"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "cp": {
+        "b": "g",
+        "u": 0,
+        "l": "00000000000000000000000000000000",
+        "n": {},
+        "s": {
+          "p": 0,
+          "w": {}
+        }
+      },
+      "sid": "bce6f11b3e710fcc9f3d962b"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": 17,
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sid": "163af1bb187f1a9430883c13"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sid": "930675300d7151e27e0ecae5"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "w": 2
+      },
+      "sid": "91d7d90836b5cb3769939fb4"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "e": 1
+      },
+      "sid": "07b31b3e03c45ad4764d271a"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "craps:1",
+        "inc": "q546c5bccec92eac2f18f765a"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "sid": "d4cb52f8d1896e2735fbbbe7"
+    },
+    {
+      "ctx": {
+        "room": "room-fo",
+        "t": "roulette-1",
+        "inc": "paa3c5e0c0af58e2835ff59b4"
+      },
+      "cp": {
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "n": {
+          "é": "1",
+          "😀": "-2",
+          "alice": "3"
+        }
+      },
+      "sid": "952fe4996d94b6d1ff21b3f5"
+    }
+  ],
+  "offers": [
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "Dana"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "Dana",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "oLdEyMfIhI2HwJ-Sb9NCxGmBBqIBlHU-m30hozaVEW5nRPteFqH3fpPfNZ0v33caVCt5hEFTJ9TTbviGzx82Aw"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a2244616e61227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2244616e61222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": ""
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "yEHlujznC5JZIvpkfcr-pR1aeyycmrI0Wejw6oFGrVA536sD30cbU0Vw1LN3Vi98K-4XPwbbMNsBw09uhPYfAg"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a22227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a22222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "quote \" backslash \\ slash /"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "quote \" backslash \\ slash /",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "oB0vRqOE2n6Tvv_b1oAuQp6DBK1llRAkm4tdSXO8-waJWkRwoXqqfC5C7yDk8a2HqPB76DzUwaSUuQt8ciarAg"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a2271756f7465205c22206261636b736c617368205c5c20736c617368202f227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2271756f7465205c22206261636b736c617368205c5c20736c617368202f222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "controls \u0000\u0001\b\t\n\u000b\f\r\u001f"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "controls \u0000\u0001\b\t\n\u000b\f\r\u001f",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "dyQeYElxI-5L_pVHxGxI77o8Pnk72LmrdZi1GuqOGdAP8uWkPxHKMX6ghiCkwXTqPt_Ihdtk0CY-4Q4LhmR4Cg"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a22636f6e74726f6c73205c75303030305c75303030315c625c745c6e5c75303030625c665c725c75303031667f227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a22636f6e74726f6c73205c75303030305c75303030315c625c745c6e5c75303030625c665c725c75303031667f222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "line sep "
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "line sep ",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "DMwlOgy6wwvTUc8JT5gYUoGS00y9YQAnSHbbuJqzC8XFrRM0bk3tq5T8slHU15eo5OB11R28j32SxgaBIEerDQ"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a226c696e65e280a8736570e280a9227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a226c696e65e280a8736570e280a9222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "astral 😀 and é and ﬀ"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "astral 😀 and é and ﬀ",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "3JGGDhX0XCaVTsZt6FHoeieq9dGhgoXuZesUadZrkoSgb5i8arXaBAMPOc_mgglVE5oby20zkZ7zixI_yJvyBA"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a2261737472616c20f09f988020616e6420c3a920616e6420efac80227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2261737472616c20f09f988020616e6420c3a920616e6420efac80222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "퟿￿"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "퟿￿",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "fA6-aMhiKwEkmDsJztOS1ZVqOXlZ_66j0bcJFTTdcjFw3T_wqenXVltAiFj4g9ipCdA1n3Y0UI_TFZZ9fwUTDQ"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a22ed9fbfee8080efbfbf227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a22ed9fbfee8080efbfbf222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "Furlong"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "Dana",
+        "toPub": "ziNh1sh9IN88Z4IygmscYuqyH23Bz8qclvY1qv2tUd0",
+        "price": 0,
+        "issuedAt": 0,
+        "expiresAt": 9007199254740991,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "1BKQk72lL-tdSjtWJ62GeWdXYCVL2Hv7cKVpGZZOLL73vLUQ8EJGFGil8QgjYH6T1M3eIrMNB_EVs3bdVK0TCA"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a224675726c6f6e67227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2244616e61222c22746f507562223a227a694e6831736839494e38385a344979676d736359757179483233427a3871636c76593171763274556430222c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a302c22657870697265734174223a393030373139393235343734303939312c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "Furlong"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "Dana",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "sig": "Es1UmGPhrdtbmQd0TY4Zdoo5fRTJs_riM-C6xk-q6WyWDB_6kAmGL1YaG-k2E2CkA-IqGmHMalP41qUXkCRgCA"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a224675726c6f6e67227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2244616e61222c22746f507562223a6e756c6c2c22746f56656e747572654964223a6e756c6c2c22746f56656e747572654e616d65223a6e756c6c2c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    },
+    {
+      "offer": {
+        "v": 1,
+        "kind": "transfer-offer",
+        "asset": {
+          "kind": "deed",
+          "roomId": "room-fo",
+          "roomName": "Furlong"
+        },
+        "makerPub": "9P3AIsxTNFSXW7Rro-oAqi1KX5taiEkf6xEVwn1JpUA",
+        "makerName": "Dana",
+        "price": 0,
+        "issuedAt": 1700000000000,
+        "expiresAt": 1700000001000,
+        "nonce": "0123456789abcdef01234567",
+        "toVentureId": "venture-1",
+        "toVentureName": "Ünïted 😀 Ventures",
+        "sig": "u5SW8UH5rVV4k047lPNpByJit5INP4CxXDoXEBho2bYdC3O1xESmPAWNjrEbauT73-W7zZz53zvrmuMnp1LLCA"
+      },
+      "bytes": "7b226b223a227373662d7472616e736665722d6f666665723a7631222c226173736574223a7b226b696e64223a2264656564222c22726f6f6d4964223a22726f6f6d2d666f222c22726f6f6d4e616d65223a224675726c6f6e67227d2c226d616b6572507562223a2239503341497378544e465358573752726f2d6f417169314b5835746169456b6636784556776e314a705541222c226d616b65724e616d65223a2244616e61222c22746f507562223a6e756c6c2c22746f56656e747572654964223a2276656e747572652d31222c22746f56656e747572654e616d65223a22c39c6ec3af74656420f09f98802056656e7475726573222c227072696365223a302c226973737565644174223a313730303030303030303030302c22657870697265734174223a313730303030303030313030302c226e6f6e6365223a22303132333435363738396162636465663031323334353637227d"
+    }
+  ],
+  "weights": [
+    {
+      "value": "abc",
+      "cap": 100,
+      "weight": 5
+    },
+    {
+      "value": "",
+      "cap": 100,
+      "weight": 2
+    },
+    {
+      "value": "é",
+      "cap": 100,
+      "weight": 4
+    },
+    {
+      "value": "€uro",
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": "😀",
+      "cap": 100,
+      "weight": 6
+    },
+    {
+      "value": 0,
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": 12345678901,
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": 1.5,
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": true,
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": null,
+      "cap": 100,
+      "weight": 8
+    },
+    {
+      "value": [],
+      "cap": 100,
+      "weight": 2
+    },
+    {
+      "value": {},
+      "cap": 100,
+      "weight": 2
+    },
+    {
+      "value": [
+        1,
+        "a",
+        [
+          2,
+          []
+        ]
+      ],
+      "cap": 100,
+      "weight": 30
+    },
+    {
+      "value": [
+        1,
+        2,
+        3
+      ],
+      "cap": 100,
+      "weight": 29
+    },
+    {
+      "value": {
+        "ab": 1
+      },
+      "cap": 100,
+      "weight": 16
+    },
+    {
+      "value": {
+        "a": "x",
+        "b": [
+          1
+        ]
+      },
+      "cap": 100,
+      "weight": 26
+    },
+    {
+      "value": {
+        "é": {
+          "😀": [
+            "€"
+          ]
+        }
+      },
+      "cap": 100,
+      "weight": 26
+    },
+    {
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "cap": 100,
+      "weight": 100
+    },
+    {
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "cap": 100,
+      "weight": null
+    },
+    {
+      "value": [
+        1,
+        2,
+        3
+      ],
+      "cap": 29,
+      "weight": 29
+    },
+    {
+      "value": [
+        1,
+        2,
+        3
+      ],
+      "cap": 28,
+      "weight": null
+    },
+    {
+      "value": {
+        "a": 1,
+        "b": 2
+      },
+      "cap": 28,
+      "weight": 28
+    },
+    {
+      "value": {
+        "a": 1,
+        "b": 2
+      },
+      "cap": 27,
+      "weight": null
+    },
+    {
+      "value": [
+        [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      [
+                        [
+                          [
+                            [
+                              [
+                                [
+                                  [
+                                    [
+                                      1
+                                    ]
+                                  ]
+                                ]
+                              ]
+                            ]
+                          ]
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "cap": 10000,
+      "weight": 56
+    },
+    {
+      "value": [
+        [
+          [
+            [
+              [
+                [
+                  [
+                    [
+                      [
+                        [
+                          [
+                            [
+                              [
+                                [
+                                  [
+                                    [
+                                      [
+                                        1
+                                      ]
+                                    ]
+                                  ]
+                                ]
+                              ]
+                            ]
+                          ]
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      ],
+      "cap": 10000,
+      "weight": null
+    },
+    {
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "8v7ZBnS1DNcPMs4fmjtYn8TubrLHQVuEYN6xCe5lQI84jywB7RxeXKq_CQWC6i5RZKmlccDgikgT31UD4UtZBw"
+      },
+      "cap": 1572864,
+      "weight": 749
+    },
+    {
+      "value": {
+        "v": 1,
+        "ok": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+        "j": "0123456789abcdef",
+        "rv": "f1",
+        "ts": 1700000000000,
+        "b": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "u": 3,
+        "l": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "d": "h:cccccccccccccccccccccccccccccccc",
+        "o": [
+          3,
+          4
+        ],
+        "n": {
+          "alice": "25",
+          "bob": "-25"
+        },
+        "s": {
+          "p": 6,
+          "w": {}
+        },
+        "h": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "dl": {
+          "v": 1,
+          "h": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+          "k": "A4cjU8no5WPhgeWd6ZEwlHPYE-dyQ_d3rz6yO4Upi6o",
+          "g": "Gkic78WcUkfprQyOxWI91SY-y8iZQnEhZ8wZHKS5zbCcYrhY-FvfHJxB-kqZOdCbJ6qWFiUAYg5vyMM2qRxODw"
+        },
+        "k": "mjoAc2J6-jw7fNnUAwhkucLB4YLVZiw4WTPGvTPUiL4",
+        "g": "8v7ZBnS1DNcPMs4fmjtYn8TubrLHQVuEYN6xCe5lQI84jywB7RxeXKq_CQWC6i5RZKmlccDgikgT31UD4UtZBw"
+      },
+      "cap": 500,
+      "weight": null
+    }
+  ]
+}

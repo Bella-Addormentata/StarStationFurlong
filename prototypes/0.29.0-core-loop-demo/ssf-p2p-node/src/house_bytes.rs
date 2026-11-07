@@ -493,6 +493,91 @@ pub fn next_sid(ctx: &Ctx, cp: Option<&CVal>) -> Option<String> {
     Some(sha256_hex(&format!("ssf-ct-sid-v1|{c}"))[..24].to_string())
 }
 
+// ── FAIR ONLY tables (src/computedFairOnly.ts) ───────────────────────────────
+
+/// computedFairOnly faironlyInc: the letter and the first 24 hex of
+/// sha256(`ssf-computed-faironly-inc-v1|<letter>|<room>|<t>|<rv>|<ok>|<j>|<ts>`),
+/// the incarnation a FAIR ONLY game is known by. It binds the owner key `ok`
+/// that opened it, so no record can claim another authority for the name.
+pub fn faironly_inc(letter: char, room: &str, t: &str, rv: &str, ok: &str, j: &str, ts: i64) -> String {
+    let hash = sha256_hex(&format!("ssf-computed-faironly-inc-v1|{letter}|{room}|{t}|{rv}|{ok}|{j}|{ts}"));
+    format!("{letter}{}", &hash[..24])
+}
+
+/// computedFairOnly ckId: the first 32 hex of sha256(`ssf-ck-id-v1|` +
+/// canon(value)), the key a checkpoint is stored under. The value is the
+/// whole record, `g` included. None for junk.
+pub fn ck_id(v: &CVal) -> Option<String> {
+    canon(v).map(|c| sha256_hex(&format!("ssf-ck-id-v1|{c}"))[..32].to_string())
+}
+
+/// computedFairOnly xfId: the first 32 hex of sha256(`ssf-xf-id-v1|` +
+/// canon(value)), the key a transfer of authority is stored under.
+pub fn xf_id(v: &CVal) -> Option<String> {
+    canon(v).map(|c| sha256_hex(&format!("ssf-xf-id-v1|{c}"))[..32].to_string())
+}
+
+/// computedFairOnly nextSid3: the live session after a FAIR ONLY checkpoint,
+/// the first 24 hex of sha256(`ssf-ct-sid-v3|` + canon({room, t, inc, b, u,
+/// w, l, d, o, n, e, s, h})), absent fields left out. Unlike [`next_sid`] it
+/// binds the room, and `w` (sweeps) gives a sweep a session of its own; `ok`,
+/// `j`, `rv`, `ts`, `k`, `g`, `f`, `dl` and `x` are not in it.
+pub fn next_sid3(ctx: &Ctx, cp: &CVal) -> Option<String> {
+    let mut fields = vec![
+        ("room".to_string(), CVal::Str(ctx.room.clone())),
+        ("t".to_string(), CVal::Str(ctx.t.clone())),
+        ("inc".to_string(), CVal::Str(ctx.inc.clone())),
+    ];
+    for k in ["b", "u", "w", "l", "d", "o", "n", "e", "s", "h"] {
+        if let Some(v) = cp.get(k) {
+            fields.push((k.to_string(), v.clone()));
+        }
+    }
+    let c = canon(&CVal::Obj(fields))?;
+    Some(sha256_hex(&format!("ssf-ct-sid-v3|{c}"))[..24].to_string())
+}
+
+/// The fields of a deed offer its maker signs (offers.ts TransferOffer, a
+/// `deed` asset): the strings are the offer's own, the numbers safe integers.
+pub struct DeedOfferBytes<'a> {
+    pub room_id: &'a str,
+    pub room_name: &'a str,
+    pub maker_pub: &'a str,
+    pub maker_name: &'a str,
+    pub to_pub: Option<&'a str>,
+    pub to_venture_id: Option<&'a str>,
+    pub to_venture_name: Option<&'a str>,
+    pub price: i64,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub nonce: &'a str,
+}
+
+/// offerBytes offerSignBytes of a deed offer: what the maker signs (the
+/// signature is over these bytes, not their hash). JSON.stringify of the
+/// fields in a fixed order, an absent recipient as null.
+pub fn offer_sign_bytes(o: &DeedOfferBytes) -> Vec<u8> {
+    let mut out = String::from(r#"{"k":"ssf-transfer-offer:v1","asset":{"kind":"deed","roomId":"#);
+    json_str(&mut out, o.room_id);
+    out.push_str(r#","roomName":"#);
+    json_str(&mut out, o.room_name);
+    out.push_str(r#"},"makerPub":"#);
+    json_str(&mut out, o.maker_pub);
+    out.push_str(r#","makerName":"#);
+    json_str(&mut out, o.maker_name);
+    for (name, v) in [("toPub", o.to_pub), ("toVentureId", o.to_venture_id), ("toVentureName", o.to_venture_name)] {
+        out.push_str(&format!(r#","{name}":"#));
+        match v {
+            Some(s) => json_str(&mut out, s),
+            None => out.push_str("null"),
+        }
+    }
+    out.push_str(&format!(r#","price":{},"issuedAt":{},"expiresAt":{},"nonce":"#, o.price, o.issued_at, o.expires_at));
+    json_str(&mut out, o.nonce);
+    out.push('}');
+    out.into_bytes()
+}
+
 /// computedFold dutyRank: sha256 hex of `ssf-ct-rank-v1|<duty>|<room>|<t>|<inc>|<round>|<pub>`.
 pub fn duty_rank(duty: &str, ctx: &Ctx, round: i64, pub_key: &str) -> String {
     sha256_hex(&format!("ssf-ct-rank-v1|{duty}|{}|{}|{}|{round}|{pub_key}", ctx.room, ctx.t, ctx.inc))
@@ -722,6 +807,154 @@ mod tests {
             // Under another message, none of them is anyone's signature.
             assert!(!verify(k, b"cash out everything", g), "{name} on another message");
         }
+    }
+
+    const CK_VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-vectors/computed-checkpoint-v1.json");
+
+    fn load_ck() -> Value {
+        let raw = std::fs::read_to_string(CK_VECTORS).unwrap_or_else(|e| panic!("cannot read {CK_VECTORS}: {e}"));
+        serde_json::from_str(&raw).expect("vector file is valid JSON")
+    }
+
+    #[test]
+    fn faironly_names_match_typescript() {
+        let v = load_ck();
+        let names = v["names"].as_array().unwrap();
+        assert!(names.len() >= 8);
+        for n in names {
+            let letter = n["letter"].as_str().unwrap().chars().next().unwrap();
+            let got = faironly_inc(
+                letter,
+                n["room"].as_str().unwrap(),
+                n["t"].as_str().unwrap(),
+                n["rv"].as_str().unwrap(),
+                n["ok"].as_str().unwrap(),
+                n["j"].as_str().unwrap(),
+                n["ts"].as_i64().unwrap(),
+            );
+            assert_eq!(got, n["inc"].as_str().unwrap(), "name of {n}");
+        }
+    }
+
+    #[test]
+    fn faironly_records_ids_keys_and_signed_bytes_match_typescript() {
+        let v = load_ck();
+        let records = v["records"].as_array().unwrap();
+        assert_eq!(records.len(), 16);
+        for r in records {
+            let name = r["name"].as_str().unwrap();
+            let kind = r["kind"].as_str().unwrap();
+            let ctx = ctx_of(&r["ctx"]);
+            let value = CVal::from_json(&r["value"]);
+            let key = r["key"].as_str().unwrap();
+            let id = match kind {
+                "ck" => ck_id(&value),
+                "xf" => xf_id(&value),
+                _ => None,
+            };
+            assert_eq!(id.as_deref(), r["id"].as_str(), "{name}: id");
+            let want_key = match (kind, &id) {
+                ("fin", _) => format!("fin:{}:{}", ctx.t, ctx.inc),
+                (k, Some(id)) => format!("{k}:{}:{}:{id}", ctx.t, ctx.inc),
+                _ => unreachable!(),
+            };
+            assert_eq!(key, want_key, "{name}: key");
+            let bytes = sign_bytes(kind, &ctx, &value).unwrap();
+            assert_eq!(hex::encode(bytes), r["bytes"].as_str().unwrap(), "{name}: signed bytes");
+            let k = value.get("k").and_then(CVal::as_str).unwrap();
+            let g = value.get("g").and_then(CVal::as_str).unwrap();
+            assert!(verify(k, &bytes, g), "{name}: signature");
+            // Another kind, room, table or incarnation is another signature's.
+            for other in ["ck", "fin", "xf"].into_iter().filter(|o| *o != kind) {
+                assert!(!verify(k, &sign_bytes(other, &ctx, &value).unwrap(), g), "{name}: as {other}");
+            }
+            assert!(!verify(k, &sign_bytes(kind, &Ctx { room: "room-other".into(), ..ctx.clone() }, &value).unwrap(), g), "{name}: other room");
+            // A value that changed has another id.
+            if let Some(id) = id {
+                let mut fields = value.fields().unwrap().into_iter().cloned().collect::<Vec<_>>();
+                fields.push(("extra".to_string(), CVal::Int(1)));
+                let more = CVal::Obj(fields);
+                let other = if kind == "ck" { ck_id(&more) } else { xf_id(&more) };
+                assert_ne!(other.unwrap(), id, "{name}: another value");
+            }
+        }
+    }
+
+    #[test]
+    fn faironly_session_ids_match_typescript() {
+        let v = load_ck();
+        let sids = v["sids"].as_array().unwrap();
+        assert!(sids.len() >= 8);
+        for s in sids {
+            let ctx = ctx_of(&s["ctx"]);
+            let cp = CVal::from_json(&s["cp"]);
+            assert_eq!(next_sid3(&ctx, &cp).as_deref(), s["sid"].as_str(), "sid of {s}");
+            // Not the v1 session id, which leaves out the room.
+            assert_ne!(next_sid(&ctx, Some(&cp)).as_deref(), s["sid"].as_str());
+            // The signer, the name's inputs and the proofs are not in it.
+            let mut fields = cp.fields().unwrap().into_iter().cloned().collect::<Vec<_>>();
+            for k in ["ok", "j", "rv", "ts", "k", "g", "f", "dl", "x"] {
+                fields.push((k.to_string(), CVal::Str("z".into())));
+            }
+            assert_eq!(next_sid3(&ctx, &CVal::Obj(fields)).as_deref(), s["sid"].as_str(), "extras");
+        }
+    }
+
+    #[test]
+    fn deed_offer_bytes_match_typescript() {
+        let v = load_ck();
+        let offers = v["offers"].as_array().unwrap();
+        assert!(offers.len() >= 10);
+        for case in offers {
+            let o = &case["offer"];
+            let s = |k: &str| o[k].as_str().unwrap();
+            let opt = |k: &str| o.get(k).and_then(Value::as_str);
+            let bytes = offer_sign_bytes(&DeedOfferBytes {
+                room_id: o["asset"]["roomId"].as_str().unwrap(),
+                room_name: o["asset"]["roomName"].as_str().unwrap(),
+                maker_pub: s("makerPub"),
+                maker_name: s("makerName"),
+                to_pub: opt("toPub"),
+                to_venture_id: opt("toVentureId"),
+                to_venture_name: opt("toVentureName"),
+                price: o["price"].as_i64().unwrap(),
+                issued_at: o["issuedAt"].as_i64().unwrap(),
+                expires_at: o["expiresAt"].as_i64().unwrap(),
+                nonce: s("nonce"),
+            });
+            assert_eq!(hex::encode(&bytes), case["bytes"].as_str().unwrap(), "bytes of {o}");
+            assert!(verify(s("makerPub"), &bytes, s("sig")), "the maker's signature on {o}");
+            // JSON.stringify leaves U+2028 and U+007F as they are, and escapes the other controls.
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(!text.contains('\u{0}') && !text.contains('\n'));
+        }
+    }
+
+    /// A JSON value as the Yjs value a doc would hold.
+    fn any_of(v: &Value) -> yrs::Any {
+        match v {
+            Value::String(s) => yrs::Any::from(s.as_str()),
+            Value::Number(n) => yrs::Any::Number(n.as_f64().unwrap()),
+            Value::Bool(b) => yrs::Any::Bool(*b),
+            Value::Null => yrs::Any::Null,
+            Value::Array(a) => yrs::Any::from(a.iter().map(any_of).collect::<Vec<_>>()),
+            Value::Object(o) => yrs::Any::from(o.iter().map(|(k, v)| (k.clone(), any_of(v))).collect::<std::collections::HashMap<_, _>>()),
+        }
+    }
+
+    #[test]
+    fn weights_match_the_pages() {
+        let v = load_ck();
+        let cases = v["weights"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        let mut heavy = 0;
+        for c in cases {
+            let cap = c["cap"].as_u64().unwrap() as usize;
+            let want = c["weight"].as_u64().map(|w| w as usize);
+            heavy += want.is_none() as usize;
+            assert_eq!(weight(&any_of(&c["value"]), cap), want, "weight of {} within {cap}", c["value"]);
+        }
+        assert!(heavy >= 5, "the vectors hold values past their cap");
     }
 
     #[test]
