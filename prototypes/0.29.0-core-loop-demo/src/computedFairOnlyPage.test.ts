@@ -366,6 +366,41 @@ describe('a page counts a FAIR ONLY game it finds in a doc', () => {
   });
 });
 
+// ── Who opened it ────────────────────────────────────────────────────────────
+
+describe('who a page takes to have opened a game: no one is checked yet (the trust root, design §2.2, owner question 13)', () => {
+  /** The game a guest opens for itself: its name binds the guest's key, and its house is the guest's own. */
+  const guestName = { ...NAME, ok: stranger.pub, j: hex('3', 16) };
+  const G = ctxOf('p', T, guestName);
+  const theirs = (n: Record<string, string>) => trimOf(G, 'p', { ok: stranger.pub, j: guestName.j, k: house2.pub, dl: delegation(stranger, house2.pub), n });
+
+  it('a game a guest opened with its own key counts like any other, beside the owner\'s: the resolution says whose it is, and a page has no verified owner to admit an opener against until the ownership root', async () => {
+    const page = await loadPage(1);
+    page.casino.buyInChips(A.pid, 100);
+    pin(page, A, B, owner, stranger);
+    page.doc.transact(() => page.doc.getMap('roomInfo').set('owner', owner.pid));
+    put(page, root, theirs({ [A.pid]: '900', [B.pid]: '-900' }));
+    expect(page.casino.computedResolutionOf(T, P.inc)).toMatchObject({ live: true, holder: owner.pub });
+    expect(page.casino.computedResolutionOf(T, G.inc)).toMatchObject({ live: true, pending: false, holder: stranger.pub, invalid: [] });
+    expect(chips(page, A)).toBe(100 + 900);
+    expect(chips(page, B)).toBe(0); // (it never bought in: its balance reads from 0 up)
+    // and the ledger it feeds has no author for a record either: a peer needs no game to give a player chips
+    page.doc.transact(() => page.doc.getMap('casinoChips').set('peer:alice', { p: A.pid, d: 500, b: 0, c: 0, at: 0 }));
+    expect(chips(page, A)).toBe(100 + 900 + 500);
+  });
+
+  it('what the owner\'s own game holds is not touched by it: its base, its holder and its nets stand', async () => {
+    const { page, r1 } = await openedPage();
+    const res = foldOf(r1.all);
+    const before = chips(page, A);
+    expect(before).toBe(100 + netOf(res, A));
+    put(page, theirs({ [A.pid]: '900' }));
+    expect(page.casino.computedResolutionOf(T, P.inc)).toMatchObject({ live: true, holder: owner.pub });
+    expect(page.casino.computedResolutionOf(T, P.inc)!.base).toMatchObject({ key: root.key });
+    expect(chips(page, A)).toBe(before + 900);
+  });
+});
+
 // ── What starts a page tracking a game ───────────────────────────────────────
 
 describe('what a page takes for a FAIR ONLY game, and what is junk to it', () => {

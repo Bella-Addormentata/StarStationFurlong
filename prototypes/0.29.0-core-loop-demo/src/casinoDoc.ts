@@ -4069,7 +4069,14 @@ function refreshFairOnly(dirty?: Set<ComputedInc>): void {
 
 /** countComputed of a FAIR ONLY game (its table is whole): the fold follows the
  *  base the resolution names, its nets go into the ledger, and its felts hold
- *  while the game is live. */
+ *  while the game is live.
+ *
+ *  Whoever opened the game, it counts: its name binds its opener's key, and a
+ *  page has no verified owner to admit an opener against until the ownership
+ *  root (TODO; design §2.2, owner question 13). So a game a guest opens with
+ *  its own key counts as the owner's does, as a chip record a guest writes does
+ *  (the ledger is unsigned); `holder` says whose it is. Nothing writes a game
+ *  yet, and a signed ledger must count only games opened by the verified owner. */
 function countFairOnly(c: ComputedInc, map: Y.Map<unknown>, whole: boolean, keys?: Set<string>): void {
   const fo = c.fo!;
   const resolved = fo.res!;
