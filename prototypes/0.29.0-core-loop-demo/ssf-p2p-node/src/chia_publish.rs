@@ -5368,3 +5368,8 @@ mod tests {
         assert_ne!(t11.aggregated_signature, main.aggregated_signature);
     }
 }
+
+/// The writers and readers above, end to end through the real lane on the
+/// mock chain (stage 4 design §12).
+#[cfg(test)]
+mod chain_tests;
