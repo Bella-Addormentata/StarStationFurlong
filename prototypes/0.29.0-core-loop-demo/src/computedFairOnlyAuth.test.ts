@@ -9,9 +9,9 @@
 
 import { describe, expect, it } from 'vitest';
 import { recHash } from './computedFold';
-import { ckKey, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, sealFin, xfId, xfKey } from './computedFairOnly';
+import { ckId, ckKey, finKey, MAX_SMALL_RECORD_BYTES, MAX_TRANSFERS, nextSid3, OFFER_SKEW_MS, sealFin, weightOf, xfId, xfKey } from './computedFairOnly';
 import type { CkRec, FairOnlyLetter, XferRec } from './computedFairOnly';
-import { MAX_CK_CANDIDATES, resolveGame, tableGame } from './computedFairOnlyAuth';
+import { MAX_CK_CANDIDATES, resolveGame, sigId, tableGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Resolution } from './computedFairOnlyAuth';
 import {
   authEnv, buyer, changed, ctxOf, delegation, DL_HOUSE, fourth, hex, house, house2, houseSigner, NAME, owner, P, Q, recordsOf, rootOf,
@@ -81,6 +81,18 @@ describe('the base (S3)', () => {
       const other = trimOf(ctx, letter, { n: { alice: '26', bob: '-26' } });
       const [lo, hi] = [plain, other].sort((a, b) => (a.key < b.key ? -1 : 1));
       expect(resolve(letter, [hi, lo]).res.base?.key, 'the lowest id').toBe(lo.key);
+      // A sweep outranks the plain record of its round whichever of the two has the lower id (a record with no `w` has no sweeps, not one).
+      let tried = 0;
+      for (let i = 1; i < 200 && tried < 3; i++) {
+        const n = { alice: String(i), bob: String(-i) };
+        const bare = trimOf(ctx, letter, { n });
+        const swept = trimOf(ctx, letter, { n, b: nextSid3(ctx, bare.value), w: 1 });
+        if (!(swept.key > bare.key)) continue;
+        tried++;
+        expect(resolve(letter, [bare, swept]).res.base?.key, `a sweep with the higher id (${i})`).toBe(swept.key);
+        expect(resolve(letter, [swept, bare]).res.base?.key, `a sweep with the higher id (${i}), the other way round`).toBe(swept.key);
+      }
+      expect(tried, 'three such pairs were found').toBe(3);
     }
   });
 
@@ -605,6 +617,32 @@ describe('what is not yet checked (pending)', () => {
     expect(tie.res.pending).toBe(true);
   });
 
+  it('one that ranks under the base by S3\'s whole order, not only by its round, does not hold the pass', () => {
+    const root = rootOf(P, 'p');
+    const fin = sealFin(P, owner.pub, owner.sign).value;
+    const end = trimOf(P, 'p', { e: 1, f: fin, s: undefined, h: undefined, k: owner.pub, dl: undefined });
+    const live = trimOf(P, 'p', { n: { alice: '21', bob: '-21' } });
+    // an end stands at the round, and a live checkpoint of that round is put off: either answer leaves the end the base
+    const underEnd = resolve('p', [root, end, live], { hold: [hashOf(live)] });
+    expect(underEnd.res).toMatchObject({ pending: false, live: false, invalid: [] });
+    expect(underEnd.res.base?.key).toBe(end.key);
+    // ... but an end of that round put off, over a live base, could be the base
+    const overLive = resolve('p', [root, end, live], { hold: [hashOf(end)] });
+    expect(overLive.res.base?.key).toBe(live.key);
+    expect(overLive.res.pending).toBe(true);
+    // fewer sweeps are under the base; more are over it
+    const three = trimOf(P, 'p');
+    const sweeps = [1, 2].map((w) => trimOf(P, 'p', { b: nextSid3(P, three.value), w }));
+    const [one, two] = sweeps;
+    expect(resolve('p', [root, one, two], { hold: [hashOf(one)] }).res.pending, 'one sweep under two').toBe(false);
+    expect(resolve('p', [root, one, two], { hold: [hashOf(two)] }).res.pending, 'two over one').toBe(true);
+    // the same round, the same kind: the lower id wins, so only a lower one put off holds the pass
+    const states = [0, 1, 2, 3].map((i) => trimOf(P, 'p', { n: { alice: `${20 + i}`, bob: `-${20 + i}` } }));
+    const byId = [...states].sort((a, b) => (a.key < b.key ? -1 : 1));
+    expect(resolve('p', [root, ...states], { hold: [hashOf(byId[3])] }).res.pending, 'the highest id').toBe(false);
+    expect(resolve('p', [root, ...states], { hold: [hashOf(byId[0])] }).res.pending, 'the lowest id').toBe(true);
+  });
+
   it('a transfer put off leaves the chain where it was, and the pass pending', () => {
     const root = rootOf(P, 'p');
     const trim = trimOf(P, 'p');
@@ -702,7 +740,7 @@ describe('who decides a round (houseAt)', () => {
     const res = resolveGame(env, T, P.inc, recordsOf([root], [forged, { ...forged }, forged]));
     calls.length = 0;
     expect(res.houseAt(house2.pub, 1)).toBe(false);
-    expect(calls).toEqual([recHash(forged) as string]);
+    expect(calls).toEqual([sigId('hkey', T, P.inc, recHash(forged) as string)]);
   });
 
   it('a delegation put off does not hide one that holds', () => {
@@ -771,6 +809,152 @@ describe('the answer does not depend on the order the records come in', () => {
       expect(view(resolve('p', [...all.slice(shift), ...all.slice(0, shift)]).res), `rotated by ${shift}`).toEqual(want);
     }
     expect(view(resolve('p', [...all].reverse()).res)).toEqual(want);
+  });
+});
+
+describe('what a check is asked about (the id)', () => {
+  it('names the record under what its signature binds: the game for a game\'s own signatures, the room alone for the others', () => {
+    const h = hex('a', 64);
+    expect(sigId('ck', T, P.inc, h)).toBe(`ck|${T}|${P.inc}|${h}`);
+    expect(sigId('xf', T, P.inc, h)).toBe(`xf|${T}|${P.inc}|${h}`);
+    expect(sigId('fin', T, P.inc, h)).toBe(`fin|${T}|${P.inc}|${h}`);
+    expect(sigId('offer', T, P.inc, h)).toBe(`offer|${h}`);
+    expect(sigId('hkey', T, P.inc, h)).toBe(`hkey|${h}`);
+    const ids = new Set([
+      sigId('ck', T, P.inc, h), sigId('xf', T, P.inc, h), sigId('fin', T, P.inc, h), sigId('ck', 'roulette-2', P.inc, h), sigId('ck', T, Q.inc, h),
+      sigId('ck', T, P.inc, hex('b', 64)),
+    ]);
+    expect(ids.size, 'no two of a different kind, table, game or record').toBe(6);
+    // (a table id that holds the separator makes no id of another table: the game and the hash have a fixed spelling)
+    expect(sigId('ck', 'a|b', P.inc, h)).not.toBe(sigId('ck', 'a', P.inc, h));
+  });
+
+  it('is what the resolver gives the check, for every signature it asks about', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p');
+    const xf = xferOf(P, owner, buyer, 3);
+    const adoption = trimOf(P, 'p', { k: buyer.pub, dl: undefined, x: [xf.value] });
+    const fin = sealFin(P, buyer.pub, buyer.sign);
+    const a = authEnv();
+    const asked: string[] = [];
+    const env = { ...a.env, sig: (id: string, pub: string, bytes: () => Uint8Array, sig: string) => { asked.push(id); return a.env.sig(id, pub, bytes, sig); } };
+    const res = resolveGame(env, T, P.inc, recordsOf([root, trim, xf, adoption, fin], [delegation(owner, house2.pub)]));
+    expect(res.houseAt(house2.pub, 1)).toBe(true);
+    expect(res.fin).not.toBeNull();
+    const want = [
+      sigId('ck', T, P.inc, hashOf(adoption)), sigId('ck', T, P.inc, hashOf(trim)), sigId('offer', T, P.inc, recHash(xf.value.o) as string),
+      sigId('xf', T, P.inc, hashOf(xf)), sigId('fin', T, P.inc, hashOf(fin)), sigId('hkey', T, P.inc, recHash(DL_HOUSE) as string),
+      sigId('hkey', T, P.inc, recHash(delegation(owner, house2.pub)) as string),
+    ];
+    for (const id of want) expect(asked, id).toContain(id);
+    // nothing is asked under a bare hash
+    for (const id of asked) expect(id).toMatch(/^(ck|xf|fin)\|.+\|[pq][0-9a-f]{24}\|[0-9a-f]{32,64}$|^(offer|hkey)\|[0-9a-f]{32,64}$/);
+  });
+
+  it('is the same for an end order inside an end checkpoint, which no record of its own carries', () => {
+    const root = rootOf(P, 'p');
+    const fin = sealFin(P, owner.pub, owner.sign).value;
+    const end = trimOf(P, 'p', { e: 1, f: fin, s: undefined, h: undefined, k: owner.pub, dl: undefined });
+    const a = authEnv();
+    const asked: string[] = [];
+    const env = { ...a.env, sig: (id: string, pub: string, bytes: () => Uint8Array, sig: string) => { asked.push(id); return a.env.sig(id, pub, bytes, sig); } };
+    const res = resolveGame(env, T, P.inc, recordsOf([root, end]));
+    expect(res.base?.key, 'the end is the base').toBe(end.key);
+    expect(asked).toContain(sigId('fin', T, P.inc, recHash(fin) as string));
+    expect(asked, 'not under the bare hash').not.toContain(recHash(fin));
+  });
+});
+
+describe('games that share a cache of verdicts', () => {
+  const T2 = 'roulette-2';
+  const P2 = ctxOf('p', T2);
+  const rootA = rootOf(P, 'p');
+  const trimA = trimOf(P, 'p');
+  const xfA = xferOf(P, owner, buyer, 3);
+  const finA = sealFin(P, owner.pub, owner.sign);
+  const rootB = rootOf(P2, 'p');
+  const trimB = trimOf(P2, 'p');
+  // (another game's records, the same bytes: the key is B's and the value is what A's writers signed)
+  const xfCopy = { key: xfKey(T2, P2.inc, xfId(xfA.value) as string), value: xfA.value };
+  const finCopy = { key: finKey(T2, P2.inc), value: finA.value };
+
+  /** Both games read by one environment (so one cache), in the order given. */
+  const both = (a: Entry[], b: Entry[], order: ('a' | 'b')[]) => {
+    const { env, verified } = authEnv();
+    const out = {} as Record<'a' | 'b', Resolution>;
+    for (const g of order) out[g] = g === 'a' ? resolveGame(env, T, P.inc, recordsOf(a)) : resolveGame(env, T2, P2.inc, recordsOf(b));
+    return { ...out, verified };
+  };
+
+  it('a transfer the buyer signed for one game is no transfer in another, whichever is read first', () => {
+    for (const order of [['a', 'b'], ['b', 'a']] as const) {
+      const r = both([rootA, trimA, xfA], [rootB, trimB, xfCopy], [...order]);
+      expect(r.a.holder, `A, read ${order.join(' then ')}`).toBe(buyer.pub);
+      expect(r.a.invalid, 'A\'s own transfer is not reported').toEqual([]);
+      expect(r.b.holder, 'B keeps its owner').toBe(owner.pub);
+      expect(r.b.invalid, 'and the copy is reported there').toEqual([xfCopy.key]);
+    }
+  });
+
+  it('nor is an end order, nor a checkpoint', () => {
+    for (const order of [['a', 'b'], ['b', 'a']] as const) {
+      const r = both([rootA, trimA, finA], [rootB, trimB, finCopy], [...order]);
+      expect(r.a.fin, `A, read ${order.join(' then ')}`).not.toBeNull();
+      expect(r.b.fin, 'B has no end order').toBeNull();
+    }
+    // A's trim under B's key, read in B because the two games were opened with the same inputs at two tables (the name is of the table too);
+    // the house signed it for A
+    const asB = { key: ckKey(T2, P2.inc, ckId(trimA.value) as string), value: trimA.value };
+    for (const order of [['a', 'b'], ['b', 'a']] as const) {
+      const r = both([rootA, trimA], [rootB, asB], [...order]);
+      expect(r.a.base?.key, `A, read ${order.join(' then ')}`).toBe(trimA.key);
+      expect(r.a.invalid).toEqual([]);
+      expect(r.b.base?.key, 'B stays at its root').toBe(rootB.key);
+      expect(r.b.invalid, 'and the copy is reported there').toEqual([asB.key]);
+    }
+  });
+
+  it('while a signature that binds the room alone is checked once for them all', () => {
+    const r = both([rootA, trimA, xfA], [rootB, trimB, xfCopy], ['a', 'b']);
+    expect(r.verified.filter((h) => h === recHash(DL_HOUSE)).length, 'the owner\'s delegation of the house').toBe(1);
+    expect(r.verified.filter((h) => h === recHash(xfA.value.o)).length, 'the maker\'s signature on the offer').toBe(1);
+    expect(r.verified.filter((h) => h === hashOf(xfA)).length, 'but the buyer\'s, which is for a game, in each').toBe(2);
+  });
+});
+
+describe('records padded with undefined fields', () => {
+  /** `v` with `n` fields that are undefined: no reader counts them, and neither the id nor the signature sees them. */
+  const pad = <T extends object>(v: T, n = 2_000): T => ({ ...v, ...Object.fromEntries(Array.from({ length: n }, (_, i) => [`pad${i}`, undefined])) });
+
+  it('a transfer, an end order or a delegation padded past the small-record cap is not read, checked or reported, and its clean twin is', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p');
+    const xf = xferOf(P, owner, buyer, 3);
+    const padded = { key: xf.key, value: pad(xf.value) };
+    expect(xfId(padded.value), 'the same record to canon, the id and the signature').toBe(xfId(xf.value));
+    expect(weightOf(padded.value, MAX_SMALL_RECORD_BYTES)).toBeNull();
+    const bare = resolve('p', [root, trim]);
+    const clean = resolve('p', [root, trim, xf]);
+    expect(clean.res.holder).toBe(buyer.pub);
+    const fat = resolve('p', [root, trim, padded]);
+    expect(fat.res).toMatchObject({ holder: owner.pub, invalid: [], pending: false });
+    expect(fat.verified, 'and nothing of it was checked').toEqual(bare.verified);
+    // a little padding is the same record
+    expect(resolve('p', [root, trim, { key: xf.key, value: pad(xf.value, 3) }]).res.holder).toBe(buyer.pub);
+    // padding inside the offer weighs the transfer as much
+    expect(resolve('p', [root, trim, { key: xf.key, value: { ...xf.value, o: pad(xf.value.o) } }]).res.holder).toBe(owner.pub);
+
+    const fin = sealFin(P, owner.pub, owner.sign);
+    expect(resolve('p', [root, trim, fin]).res.fin).not.toBeNull();
+    const fatFin = resolve('p', [root, trim, { key: fin.key, value: pad(fin.value) }]);
+    expect(fatFin.res).toMatchObject({ fin: null, invalid: [], pending: false });
+    expect(fatFin.verified).toEqual(bare.verified);
+
+    const ours = delegation(owner, house2.pub);
+    expect(resolve('p', [root], { delegations: [ours] }).res.houseAt(house2.pub, 1)).toBe(true);
+    const fatDl = resolve('p', [root], { delegations: [pad(ours)] });
+    expect(fatDl.res.houseAt(house2.pub, 1)).toBe(false);
+    expect(fatDl.verified, 'the delegation was not checked').not.toContain(recHash(ours));
   });
 });
 

@@ -29,7 +29,10 @@
  * asks again when it has. The check must be the STRICT one (keypair.ts
  * verifyIdentityStrict, ed25519-dalek's verify_strict in the node): the
  * maker's signature on a deed offer included, which offers.ts verifyOffer
- * (the lenient one) does not give.
+ * (the lenient one) does not give. Each is asked about under an id (sigId)
+ * that names its record and what the signature binds, so a cache keyed by the
+ * id alone can be shared by the games of a room without one game's verdict
+ * answering for another's.
  *
  * COST. A record is looked at by its shape first (no signatures), then by
  * whether its signer could hold the game (no signatures), and only then by its
@@ -42,7 +45,7 @@
 
 import { recHash, signBytes } from './computedFold';
 import type { FoldCtx } from './computedFold';
-import { asFin, MAX_TRANSFERS, OFFER_SKEW_MS, parseFairOnlyKey, readCk, xfId } from './computedFairOnly';
+import { asFin, MAX_SMALL_RECORD_BYTES, MAX_TRANSFERS, OFFER_SKEW_MS, parseFairOnlyKey, readCk, weightOf, xfId } from './computedFairOnly';
 import type { CkRead, CkRec, FairOnlyLetter, FairOnlyName, FinRec, XferRec } from './computedFairOnly';
 import { asDelegation, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
@@ -60,10 +63,25 @@ export const MAX_CK_CANDIDATES = 8;
 // ── What the caller gives ────────────────────────────────────────────────────
 
 /** A signature's verdict: true or false once it is checked; `undefined` while
- *  the caller's time budget puts it off. `hash` names the signed thing (the
- *  recHash of its record, signature included) for the caller's cache: the same
- *  hash must always give the same final verdict. */
-export type SigCheckFn = (hash: string, pub: string, bytes: () => Uint8Array, sig: string) => boolean | undefined;
+ *  the caller's time budget puts it off. `id` names the signed thing for the
+ *  caller's cache (sigId): its record's hash under the kind of signature and,
+ *  for a signature over a game's records, the game. The same id always has the
+ *  same final verdict, so a cache shared by games, or kept by id alone, never
+ *  carries a verdict from one game or one kind of signature to another. */
+export type SigCheckFn = (id: string, pub: string, bytes: () => Uint8Array, sig: string) => boolean | undefined;
+
+/** What a signature is over, for sigId. */
+export type SigKind = 'ck' | 'fin' | 'xf' | 'offer' | 'hkey';
+
+/** The id a verdict is cached under (SigCheckFn): `hash`, the recHash of the
+ *  signed record, signature included, under what the signature binds. A
+ *  checkpoint's, an end order's and a transfer's signature cover the table and
+ *  the incarnation (signBytes), so the same record copied into another game is
+ *  another thing to check there, and its id says so; a deed offer's and a
+ *  delegation's cover the room alone, which a cache is kept for. */
+export function sigId(kind: SigKind, t: string, inc: string, hash: string): string {
+  return kind === 'offer' || kind === 'hkey' ? `${kind}|${hash}` : `${kind}|${t}|${inc}|${hash}`;
+}
 
 export interface AuthEnv {
   /** casinoRoomId(): signed into every record, never stored. */
@@ -202,11 +220,11 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     const oh = recHash(o);
     if (oh === null) return false;
     const { sig, ...unsigned } = o;
-    const maker = env.sig(oh, o.makerPub, () => offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
+    const maker = env.sig(sigId('offer', t, inc, oh), o.makerPub, () => offerSignBytes(unsigned as Omit<TransferOffer, 'sig'>), sig);
     if (maker !== true) return maker;
     const xh = recHash(s.xf);
     if (xh === null) return false;
-    return env.sig(xh, s.xf.k, () => signBytes('xf', ctx, s.xf), s.xf.g);
+    return env.sig(sigId('xf', t, inc, xh), s.xf.k, () => signBytes('xf', ctx, s.xf), s.xf.g);
   };
   let chainPending = false;
   while (chain.length <= MAX_TRANSFERS) {
@@ -259,16 +277,16 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       if (v === undefined) open = true;
       return v === false;
     };
-    if (fails(env.sig(h, c.k, () => signBytes('ck', ctx, c), c.g))) return false;
+    if (fails(env.sig(sigId('ck', t, inc, h), c.k, () => signBytes('ck', ctx, c), c.g))) return false;
     if (c.dl) {
       const dl = c.dl;
       const dh = recHash(dl);
-      if (dh === null || fails(env.sig(dh, dl.k, () => roomSignBytes('hkey', env.room, '', dl), dl.g))) return false;
+      if (dh === null || fails(env.sig(sigId('hkey', t, inc, dh), dl.k, () => roomSignBytes('hkey', env.room, '', dl), dl.g))) return false;
     }
     if (c.f) {
       const fin = c.f;
       const fh = recHash(fin);
-      if (fh === null || fails(env.sig(fh, fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
+      if (fh === null || fails(env.sig(sigId('fin', t, inc, fh), fin.k, () => signBytes('fin', ctx, fin), fin.g))) return false;
     }
     return open ? undefined : true;
   };
@@ -290,8 +308,9 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
     }
   }
   const base = valid[0] ?? null;
-  // A waiting checkpoint matters only if it could beat the base.
-  if (waiting.some((w) => !base || w.ck.u >= base.ck.u)) pending = true;
+  // A waiting checkpoint holds the pass only if it would be the base were it good, by S3's whole
+  // order (the round, an end, the sweeps, the id): one that ranks under the base changes nothing.
+  if (waiting.some((w) => !base || byBest(w, base) < 0)) pending = true;
 
   // S5: an end order standing at the base: one an owner-level key holding the game there signed.
   let fin: FinRec | null = null;
@@ -304,7 +323,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       if (!holds(f.k, base.ck.u)) continue;
       const fh = recHash(f);
       if (fh === null) continue;
-      const v = env.sig(fh, f.k, () => signBytes('fin', ctx, f), f.g);
+      const v = env.sig(sigId('fin', t, inc, fh), f.k, () => signBytes('fin', ctx, f), f.g);
       if (v === true) { fin = f; break; }
       if (v === undefined) pending = true;
     }
@@ -314,7 +333,8 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   const delegations: { d: DelegationRec; hash: string }[] = [];
   const seen = new Set<string>();
   const addDelegation = (raw: unknown): void => {
-    const d = asDelegation(raw);
+    // (A delegation is a few short fields: one padded past that is junk, as a padded transfer is.)
+    const d = weightOf(raw, MAX_SMALL_RECORD_BYTES) === null ? null : asDelegation(raw);
     const hash = d && recHash(d);
     if (d && hash && !seen.has(hash)) { seen.add(hash); delegations.push({ d, hash }); }
   };
@@ -328,7 +348,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       // Delegated by the key that holds the game for `round`: after the round it took the game, up to the round it gave it.
       const holder = chain.some((h, i) => h.k === d.k && h.from < round && (i + 1 === chain.length || round <= chain[i + 1].from));
       if (!holder) continue;
-      const v = env.sig(hash, d.k, () => roomSignBytes('hkey', env.room, '', d), d.g);
+      const v = env.sig(sigId('hkey', t, inc, hash), d.k, () => roomSignBytes('hkey', env.room, '', d), d.g);
       if (v === true) return true;
       if (v === undefined) waitingOn = true;
     }

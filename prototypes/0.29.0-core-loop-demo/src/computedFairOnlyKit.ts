@@ -117,9 +117,13 @@ export function recordsOf(entries: ReadonlyArray<{ key: string; value: unknown }
   };
 }
 
+/** The record hash a check's id (computedFairOnlyAuth sigId) is of: its last part. */
+export const hashOfSigId = (id: string): string => id.slice(id.lastIndexOf('|') + 1);
+
 /** The strict check a page gives, as a spec's environment: each signed thing is
- *  verified once (in the order `verified` lists), and the hashes in `hold` read
- *  as not checked yet for as long as they stay there. */
+ *  verified once (in the order `verified` lists the hashes of their records),
+ *  by its id alone as a cache that games share would key it, and the hashes in
+ *  `hold` read as not checked yet for as long as they stay there. */
 export function authEnv(opts: { liveSid?: string; hold?: Iterable<string> } = {}) {
   const cache = new Map<string, boolean>();
   const hold = new Set(opts.hold ?? []);
@@ -127,12 +131,13 @@ export function authEnv(opts: { liveSid?: string; hold?: Iterable<string> } = {}
   const env: AuthEnv = {
     room: ROOM,
     liveSid: opts.liveSid,
-    sig: (hash, pub, bytes, sig) => {
+    sig: (id, pub, bytes, sig) => {
+      const hash = hashOfSigId(id);
       if (hold.has(hash)) return undefined;
-      let v = cache.get(hash);
+      let v = cache.get(id);
       if (v === undefined) {
         v = verifyIdentityStrict(pub, bytes(), sig);
-        cache.set(hash, v);
+        cache.set(id, v);
         verified.push(hash);
       }
       return v;
