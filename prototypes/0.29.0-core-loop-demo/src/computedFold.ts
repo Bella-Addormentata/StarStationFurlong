@@ -260,7 +260,11 @@ export interface HouseSum {
   g: string;
 }
 
-export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum' | 'hreveal' | 'hcommit' | 'hsum';
+/** What a signature is for: every kind has its own domain, so a signature
+ *  good for one is never good for another. `ck`, `fin` and `xf` are a FAIR
+ *  ONLY table's checkpoint, end order and transfer of authority
+ *  (computedFairOnly). */
+export type SignedKind = 'slip' | 'close' | 'forfeit' | 'abandon' | 'sum' | 'hreveal' | 'hcommit' | 'hsum' | 'ck' | 'fin' | 'xf';
 
 // ── Encoding ─────────────────────────────────────────────────────────────────
 
@@ -398,17 +402,17 @@ const SIG = /^[A-Za-z0-9_-]{86}$/;
 const NET = /^-?[1-9]\d{0,39}$/;
 
 /** casinoDoc isPlayerKey. */
-function isPid(v: unknown): v is string {
+export function isPid(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0 && v.length <= 256 && v !== '__proto__';
 }
 
-const isRound = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 1;
+export const isRound = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 1;
 const isStr = (re: RegExp) => (v: unknown): v is string => typeof v === 'string' && re.test(v);
-const isHex32 = isStr(HEX32);
+export const isHex32 = isStr(HEX32);
 export const isHex64 = isStr(HEX64);
-const isSid = isStr(SID);
+export const isSid = isStr(SID);
 const isParent = isStr(PARENT);
-const isNet = isStr(NET);
+export const isNet = isStr(NET);
 export const isPub = isStr(PUB);
 export const isSig = isStr(SIG);
 
@@ -518,7 +522,7 @@ export function asCrapsSlip(v: unknown): CrapsSlipRec | null {
  *  with a canonical felt that has chips on it; a shooter and a last shooter
  *  that are player ids short enough to hold the dice; `i` only with a
  *  shooter. Every carry a roll makes passes it. */
-function isCarry(v: unknown): v is CrapsCarry {
+export function isCarry(v: unknown): v is CrapsCarry {
   if (!isPlain(v) || !hasFields(v, ['p', 'w'], ['h', 'a', 'i'])) return false;
   if (typeof v.p !== 'number' || !CARRY_POINTS.has(v.p) || !isPlain(v.w)) return false;
   const w = v.w;
@@ -987,7 +991,7 @@ const HOUSE_SUM_D = /^(r|[fzh]:[0-9a-f]{32})$/;
 
 /** A round-`u` outcome `o` an hs: may carry: roulette a pocket (0..36); craps a
  *  pair of dice, each 1..6. */
-function isHouseSumOutcome(o: unknown, craps: boolean): boolean {
+export function isHouseSumOutcome(o: unknown, craps: boolean): boolean {
   if (craps) {
     return Array.isArray(o) && o.length === 2
       && Number.isSafeInteger(o[0]) && (o[0] as number) >= 1 && (o[0] as number) <= 6
