@@ -497,10 +497,18 @@ pub fn next_sid(ctx: &Ctx, cp: Option<&CVal>) -> Option<String> {
 
 /// computedFairOnly faironlyInc: the letter and the first 24 hex of
 /// sha256(`ssf-computed-faironly-inc-v1|<letter>|<room>|<t>|<rv>|<ok>|<j>|<ts>`),
-/// the incarnation a FAIR ONLY game is known by. It binds the owner key `ok`
-/// that opened it, so no record can claim another authority for the name.
+/// each text field as JSON.stringify spells it (a room or table id may hold a
+/// `|`, and unquoted, (`a|b`, `c`) and (`a`, `b|c`) would make one name), the
+/// incarnation a FAIR ONLY game is known by. It binds the owner key `ok` that
+/// opened it, so no record can claim another authority for the name.
 pub fn faironly_inc(letter: char, room: &str, t: &str, rv: &str, ok: &str, j: &str, ts: i64) -> String {
-    let hash = sha256_hex(&format!("ssf-computed-faironly-inc-v1|{letter}|{room}|{t}|{rv}|{ok}|{j}|{ts}"));
+    let mut pre = format!("ssf-computed-faironly-inc-v1|{letter}");
+    for field in [room, t, rv, ok, j] {
+        pre.push('|');
+        json_str(&mut pre, field);
+    }
+    pre.push_str(&format!("|{ts}"));
+    let hash = sha256_hex(&pre);
     format!("{letter}{}", &hash[..24])
 }
 
@@ -938,6 +946,8 @@ mod tests {
             Value::Bool(b) => yrs::Any::Bool(*b),
             Value::Null => yrs::Any::Null,
             Value::Array(a) => yrs::Any::from(a.iter().map(any_of).collect::<Vec<_>>()),
+            // The vectors' way of writing an undefined value, which JSON can't hold.
+            Value::Object(o) if o.len() == 1 && o.get("$undefined") == Some(&Value::Bool(true)) => yrs::Any::Undefined,
             Value::Object(o) => yrs::Any::from(o.iter().map(|(k, v)| (k.clone(), any_of(v))).collect::<std::collections::HashMap<_, _>>()),
         }
     }

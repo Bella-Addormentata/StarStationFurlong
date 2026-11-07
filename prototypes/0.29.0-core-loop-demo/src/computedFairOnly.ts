@@ -17,10 +17,12 @@
  *
  * THE NAME BINDS THE AUTHORITY (faironlyInc):
  *   inc = letter + first 24 hex of sha256("ssf-computed-faironly-inc-v1|"
- *         + letter|room|t|rv|ok|j|ts)
- * `ok` is the identity key of the owner who opened the game, `j` 16 random
- * hex (so every switch-on makes a new name), `rv` the rules version and `ts`
- * the opening time (it only dates the deed offers that may move the game).
+ *         + letter|q(room)|q(t)|q(rv)|q(ok)|q(j)|ts)
+ * where q is JSON.stringify, so that a room or table id holding a `|` can't
+ * make one name of two different (room, table) pairs. `ok` is the identity
+ * key of the owner who opened the game, `j` 16 random hex (so every switch-on
+ * makes a new name), `rv` the rules version and `ts` the opening time (it
+ * only dates the deed offers that may move the game).
  * Every checkpoint carries those four and is read only if they hash to the
  * incarnation it sits under, so a record can't claim another authority for
  * the same name, and a later rewrite of `roomInfo.owner` changes nothing
@@ -73,11 +75,21 @@ export const FAIR_ONLY_RV = 'f1';
 const KNOWN_RV: ReadonlySet<string> = new Set([FAIR_ONLY_RV]);
 export const isKnownRv = (rv: string): boolean => KNOWN_RV.has(rv);
 
-/** A checkpoint heavier than this (see weightOf) is junk, unhashed. The
- *  honest worst case is about 1.2 MB (4,000 players of 256 characters with
- *  40-digit nets, plus a craps carry and the transfers), so the cap never
- *  refuses an honest one; it bounds what junk costs to hash. */
+/** A checkpoint heavier than this (see weightOf) is junk, unhashed: it bounds
+ *  what junk costs to hash, and to read (the node reads a room's records
+ *  within 4 MiB a tick). A game the fold lets be never reaches it: at most
+ *  MAX_TABLE_PIDS players, whose ids total at most MAX_TABLE_PID_BYTES, with
+ *  40-digit nets, a craps carry and the transfers weigh some 1.3 MB at the
+ *  very worst (the specs build that game). */
 export const MAX_CHECKPOINT_BYTES = 1.5 * 1024 * 1024;
+/** The UTF-8 bytes the ids of a game's players may total, beside
+ *  MAX_TABLE_PIDS (its checkpoint's nets and every slip its session froze): a
+ *  close that would pass it is invalid (S6 (e), the fold's, PR 6c-3). An id
+ *  is up to 256 UTF-16 units, up to 768 bytes, so without this 4,000 of them
+ *  could take a checkpoint past MAX_CHECKPOINT_BYTES and no trim could be
+ *  written. An honest id is a 43-character key: this is some 6 times what
+ *  4,000 of those take. */
+export const MAX_TABLE_PID_BYTES = 1_000_000;
 /** Transfers of authority a game's chain follows. */
 export const MAX_TRANSFERS = 8;
 /** A deed offer made before the game opened can't move it (a sale-back
@@ -112,9 +124,14 @@ export interface FairOnlyName {
 }
 
 /** The incarnation name: the letter and the first 24 hex of
- *  sha256("ssf-computed-faironly-inc-v1|<letter>|<room>|<t>|<rv>|<ok>|<j>|<ts>"). */
+ *  sha256("ssf-computed-faironly-inc-v1|<letter>|<room>|<t>|<rv>|<ok>|<j>|<ts>"),
+ *  each text field as JSON.stringify spells it: a room or table id may hold a
+ *  `|`, and unquoted, (`a|b`, `c`) and (`a`, `b|c`) would make one name. Every
+ *  signature of a FAIR ONLY record covers its incarnation, so the name is
+ *  what binds a record to its room and table. */
 export function faironlyInc(letter: FairOnlyLetter, room: string, t: string, n: FairOnlyName): string {
-  const pre = `ssf-computed-faironly-inc-v1|${letter}|${room}|${t}|${n.rv}|${n.ok}|${n.j}|${n.ts}`;
+  const q = JSON.stringify;
+  const pre = `ssf-computed-faironly-inc-v1|${letter}|${q(room)}|${q(t)}|${q(n.rv)}|${q(n.ok)}|${q(n.j)}|${n.ts}`;
   return letter + bytesToHex(sha256(utf8ToBytes(pre))).slice(0, 24);
 }
 
@@ -261,9 +278,13 @@ function utf8Length(s: string): number {
  *  read: a string its UTF-8 bytes and two quotes, a number (or anything not a
  *  string, array or object) 8, an array two brackets and a comma for each
  *  member, an object two braces and for each field its key's bytes and 4.
- *  An undefined field weighs nothing, as no reader counts one. Weighed only
- *  as far as `cap` and MAX_WEIGHT_DEPTH: null past either, so finding a heavy
- *  value out costs about `cap` however big it is. */
+ *  An undefined field weighs like any other (its key, 4, and 8 for the
+ *  value): a peer can write one and no reader counts it, and the node weighs
+ *  it as padding, so a page that skipped it would call a record light that
+ *  the node calls too heavy to read. Weighed only as far as `cap` and
+ *  MAX_WEIGHT_DEPTH: null past either, so finding a heavy value out costs
+ *  about `cap` however big it is (an object's keys are listed once, and the
+ *  value is in memory already: that costs about what holding it did). */
 export function weightOf(v: unknown, cap: number): number | null {
   let total = 0;
   const stack: [unknown, number][] = [[v, 0]];
@@ -285,7 +306,6 @@ export function weightOf(v: unknown, cap: number): number | null {
       total += 2;
     } else if (isPlain(x)) {
       for (const k of Object.keys(x)) {
-        if (x[k] === undefined) continue;
         if (k.length > cap) return null;
         total += utf8Length(k) + 4;
         if (total > cap) return null;
@@ -363,9 +383,13 @@ export type CkRead =
 
 const JUNK: CkRead = Object.freeze({ kind: 'junk' });
 
-/** Whether `s` is the carry a craps table opens with. */
+/** The carry a craps table opens with, `{p: 0, w: {}}`, as canon spells it. */
+const OPENING_CARRY_CANON = '{"p":0,"w":{}}';
+
+/** Whether `s` is the carry a craps table opens with. By canon's spelling, so
+ *  that a field left undefined is no field here, as it is in the record's id. */
 function isOpeningCarry(s: unknown): boolean {
-  return isPlain(s) && Object.keys(s).length === 2 && s.p === 0 && isPlain(s.w) && Object.keys(s.w).length === 0;
+  return canon(s) === OPENING_CARRY_CANON;
 }
 
 /** The checks of design §8.3 S0 on a value whose name has been settled: the
@@ -387,7 +411,8 @@ function ckBody(v: Record<string, unknown>, room: string, letter: FairOnlyLetter
   if (v.o !== undefined && !(typeof v.d === 'string' && v.d.startsWith('h:') && isHouseSumOutcome(v.o, letter === 'q'))) return null;
   // The nets: since the incarnation opened, so none before a round.
   if (!isPlain(v.n)) return null;
-  const pids = Object.keys(v.n);
+  // (A player whose net is undefined is no player, as in the record's id.)
+  const pids = Object.keys(v.n).filter((pid) => (v.n as Record<string, unknown>)[pid] !== undefined);
   if (pids.length > MAX_TABLE_PIDS || (u === 0 && pids.length > 0)) return null;
   if (!pids.every((pid) => isPid(pid) && isNet((v.n as Record<string, unknown>)[pid]))) return null;
   // An end carries the authority's end order, and nothing a live game plays on.
@@ -449,10 +474,16 @@ export function readCk(room: string, key: string, value: unknown): CkRead {
  *  house's key for a house's. */
 export type Signer = (bytes: Uint8Array) => string;
 
+/** `o` without its undefined fields: canon (so a record's id and signature)
+ *  leaves them out, but the doc would keep each as padding the node weighs. */
+function defined<T extends object>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}
+
 /** A checkpoint as its writer stores it: signed under `ctx` (its incarnation
  *  a FAIR ONLY name) and keyed by its own hash. Throws on a body canon refuses. */
 export function sealCk(ctx: FoldCtx, body: Omit<CkRec, 'g'>, sign: Signer): { key: string; value: CkRec } {
-  const value = { ...body, g: sign(signBytes('ck', ctx, body)) } as CkRec;
+  const value = defined({ ...body, g: sign(signBytes('ck', ctx, body)) }) as CkRec;
   const id = ckId(value);
   if (id === null) throw new TypeError('sealCk: a checkpoint must be canonical');
   return { key: ckKey(ctx.t, ctx.inc, id), value };
@@ -466,7 +497,7 @@ export function sealFin(ctx: FoldCtx, k: string, sign: Signer): { key: string; v
 
 /** A transfer of authority, signed by the buyer `body.k`. */
 export function sealXf(ctx: FoldCtx, body: Omit<XferRec, 'g'>, sign: Signer): { key: string; value: XferRec } {
-  const value = { ...body, g: sign(signBytes('xf', ctx, body)) } as XferRec;
+  const value = defined({ ...body, g: sign(signBytes('xf', ctx, body)) }) as XferRec;
   const id = xfId(value);
   if (id === null) throw new TypeError('sealXf: a transfer must be canonical');
   return { key: xfKey(ctx.t, ctx.inc, id), value };

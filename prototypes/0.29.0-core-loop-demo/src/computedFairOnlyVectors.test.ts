@@ -44,6 +44,10 @@ function nameCases() {
     { letter: 'p', room: ROOM, t: T, name: { ...NAME, ts: MAX_SAFE } },
     { letter: 'p', room: ROOM, t: T, name: { ...NAME, rv: 'f2' } },
     { letter: 'p', room: ROOM, t: T, name: { ...NAME, ok: buyer.pub, j: 'fedcba9876543210' } },
+    // A room or table id that holds a `|`, the quote that spells one, and what JSON.stringify escapes: the two splits of `a|b|c` differ.
+    { letter: 'p', room: 'a|b', t: 'c', name: NAME },
+    { letter: 'p', room: 'a', t: 'b|c', name: NAME },
+    { letter: 'q', room: 'quote " backslash \\ slash / ctrl \u0001\n\u007f sep \u2028', t: 'tab\t | 😀 "|"', name: NAME },
   ];
   return cases.map((c) => ({ letter: c.letter, room: c.room, t: c.t, ...c.name, inc: faironlyInc(c.letter, c.room, c.t, c.name) }));
 }
@@ -112,8 +116,20 @@ function offerCases() {
   });
 }
 
+/** How a vector writes an undefined value, which JSON can't hold: the node reads it as one. */
+const UNDEF = { $undefined: true };
+function realize(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(realize);
+  if (v !== null && typeof v === 'object') {
+    if ((v as Record<string, unknown>).$undefined === true) return undefined;
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, realize(x)]));
+  }
+  return v;
+}
+
 function weightCases() {
   const deep = (n: number): unknown => { let v: unknown = 1; for (let i = 0; i < n; i++) v = [v]; return v; };
+  const padded = { ...trimOf(Q, 'q').value, pad0: UNDEF, pad1: UNDEF, pad2: UNDEF };
   const values: { value: unknown; cap: number }[] = [
     { value: 'abc', cap: 100 }, { value: '', cap: 100 }, { value: 'é', cap: 100 }, { value: '€uro', cap: 100 }, { value: '😀', cap: 100 },
     { value: 0, cap: 100 }, { value: 12345678901, cap: 100 }, { value: 1.5, cap: 100 }, { value: true, cap: 100 }, { value: null, cap: 100 },
@@ -123,8 +139,15 @@ function weightCases() {
     { value: { a: 1, b: 2 }, cap: 28 }, { value: { a: 1, b: 2 }, cap: 27 },
     { value: deep(16), cap: 10_000 }, { value: deep(17), cap: 10_000 },
     { value: trimOf(Q, 'q').value, cap: 1_572_864 }, { value: trimOf(Q, 'q').value, cap: 500 },
+    // An undefined field weighs its key, 4 and 8, as the node weighs the padding a peer can write so.
+    { value: { a: UNDEF }, cap: 15 }, { value: { a: UNDEF }, cap: 14 }, { value: { a: UNDEF, bb: 1 }, cap: 100 }, { value: [UNDEF, 1], cap: 100 },
+    { value: { n: { alice: UNDEF }, k: 'x' }, cap: 100 }, { value: padded, cap: 1_572_864 }, { value: padded, cap: weightOf(trimOf(Q, 'q').value, 1_572_864)! + 20 },
   ];
-  return values.map((c) => ({ value: c.value, cap: c.cap, weight: weightOf(c.value, c.cap) }));
+  return values.map((c) => {
+    // (What the file holds, markers and all, is what is weighed.)
+    const stored = JSON.parse(JSON.stringify(c.value));
+    return { value: stored, cap: c.cap, weight: weightOf(realize(stored), c.cap) };
+  });
 }
 
 function build() {

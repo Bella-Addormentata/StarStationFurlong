@@ -9,11 +9,11 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { describe, expect, it } from 'vitest';
-import { canon, nextSid, signBytes } from './computedFold';
+import { canon, MAX_TABLE_PIDS, nextSid, signBytes } from './computedFold';
 import {
-  asDeedOffer, asDo, asFin, asXf, ckId, ckKey, doKey, FAIR_ONLY_GAMES, faironlyInc, finKey, isFairOnlyInc, isKnownRv,
-  MAX_CHECKPOINT_BYTES, MAX_OFFER_TEXT, MAX_TRANSFERS, MAX_WEIGHT_DEPTH, nextSid3, NO_CLOSE, parseFairOnlyKey, readCk, sealCk, sealFin,
-  sealXf, weightOf, xfId, xfKey,
+  asDeedOffer, asDo, asFin, asXf, ckId, ckKey, doKey, FAIR_ONLY_GAMES, FAIR_ONLY_RV, faironlyInc, finKey, isFairOnlyInc, isKnownRv,
+  MAX_CHECKPOINT_BYTES, MAX_OFFER_TEXT, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, MAX_WEIGHT_DEPTH, nextSid3, NO_CLOSE, OFFER_SKEW_MS, parseFairOnlyKey,
+  readCk, sealCk, sealFin, sealXf, weightOf, xfId, xfKey,
 } from './computedFairOnly';
 import type { CkRec, FairOnlyLetter, FairOnlyName, XferRec } from './computedFairOnly';
 import {
@@ -28,7 +28,7 @@ const read = (_ctx: FoldCtx, c: { key: string; value: unknown }) => readCk(ROOM,
 
 describe('names', () => {
   it('is the letter and 24 hex of the stated hash', () => {
-    const pre = `ssf-computed-faironly-inc-v1|p|${ROOM}|${T}|f1|${NAME.ok}|${NAME.j}|${NAME.ts}`;
+    const pre = `ssf-computed-faironly-inc-v1|p|"${ROOM}"|"${T}"|"f1"|"${NAME.ok}"|"${NAME.j}"|${NAME.ts}`;
     expect(faironlyInc('p', ROOM, T, NAME)).toBe(`p${bytesToHex(sha256(utf8ToBytes(pre))).slice(0, 24)}`);
     expect(P.inc).toMatch(/^p[0-9a-f]{24}$/);
     expect(Q.inc).toMatch(/^q[0-9a-f]{24}$/);
@@ -45,6 +45,29 @@ describe('names', () => {
       faironlyInc('p', ROOM, T, { ...NAME, ts: NAME.ts + 1 }),
     ]);
     expect(names.size).toBe(8);
+  });
+
+  it('does not make one name of two (room, table) pairs that join to the same text', () => {
+    const pairs: [string, string][] = [
+      ['a|b', 'c'], ['a', 'b|c'], ['a|b|c', ''], ['', 'a|b|c'], ['a"', '|b'], ['a', '"|b'], ['a\\', '"|"b'], ['a\\"|', 'b'], ['a|"', '"|b'],
+    ];
+    expect(new Set(pairs.map(([room, t]) => faironlyInc('p', room, t, NAME))).size).toBe(pairs.length);
+  });
+
+  it('so what one room and table signed or wrote binds to no other, though the signed bytes join alike', () => {
+    const ctx1: FoldCtx = { room: 'a|b', t: 'c', inc: faironlyInc('p', 'a|b', 'c', NAME) };
+    const ctx2: FoldCtx = { room: 'a', t: 'b|c', inc: faironlyInc('p', 'a', 'b|c', NAME) };
+    expect(ctx1.inc).not.toBe(ctx2.inc);
+    // A checkpoint of the first is junk in the second, under the key it would have there ...
+    const root = rootOf(ctx1, 'p');
+    expect(readCk('a|b', root.key, root.value).kind).toBe('ok');
+    expect(readCk('a', ckKey('b|c', ctx1.inc, ckId(root.value) as string), root.value)).toEqual({ kind: 'junk' });
+    // ... and an end order the owner signed in the first is signed over bytes the second's name makes different.
+    const fin1 = sealFin(ctx1, owner.pub, owner.sign).value;
+    const fin2 = sealFin(ctx2, owner.pub, owner.sign).value;
+    expect(fin1.g).not.toBe(fin2.g);
+    expect(verifyIdentityStrict(owner.pub, signBytes('fin', ctx1, fin1), fin1.g)).toBe(true);
+    expect(verifyIdentityStrict(owner.pub, signBytes('fin', ctx2, fin1), fin1.g)).toBe(false);
   });
 
   it('is recognised by its letter and length alone, and only p and q', () => {
@@ -171,6 +194,19 @@ describe('ids, session ids and signatures', () => {
   });
 });
 
+describe('sealing', () => {
+  it('leaves the undefined fields of a body out of the record it stores', () => {
+    const body = { ...rootOf(P, 'p').value, g: undefined, x: undefined, w: undefined } as unknown as Omit<CkRec, 'g'>;
+    const sealed = sealCk(P, body, owner.sign);
+    expect(Object.keys(sealed.value)).not.toContain('x');
+    expect(Object.keys(sealed.value)).not.toContain('w');
+    expect(sealed.key).toBe(rootOf(P, 'p').key);
+    expect(Object.values(sealed.value).every((v) => v !== undefined)).toBe(true);
+    const xf = sealXf(P, { v: 1, o: offerOf(owner, buyer), u: 3, k: buyer.pub, g: undefined } as unknown as Omit<XferRec, 'g'>, buyer.sign);
+    expect(Object.values(xf.value).every((v) => v !== undefined)).toBe(true);
+  });
+});
+
 describe('weightOf', () => {
   it('weighs a string by its UTF-8 bytes and quotes, anything else scalar 8', () => {
     expect(weightOf('abc', 100)).toBe(5);
@@ -191,9 +227,21 @@ describe('weightOf', () => {
     expect(weightOf(new Uint8Array(5), 100)).toBe(7);
   });
 
-  it('weighs no undefined field, which no reader counts', () => {
-    expect(weightOf({ a: undefined, b: 1 }, 100)).toBe(2 + (1 + 4) + 8);
-    expect(weightOf({ a: undefined }, 100)).toBe(2);
+  it('weighs an undefined field like any other, as the node weighs the padding a peer can write', () => {
+    expect(weightOf({ a: undefined }, 100)).toBe(2 + (1 + 4) + 8);
+    expect(weightOf({ a: undefined, b: 1 }, 100)).toBe(2 + (1 + 4) + 8 + (1 + 4) + 8);
+    expect(weightOf([undefined, 1], 100)).toBe(2 + (1 + 8) + (1 + 8));
+    expect(weightOf({ a: undefined }, 15)).toBe(15);
+    expect(weightOf({ a: undefined }, 14)).toBeNull();
+  });
+
+  it('is not got round by padding with undefined fields, however many', () => {
+    const pad: Record<string, unknown> = {};
+    for (let i = 0; i < 300_000; i++) pad[`k${i}`] = undefined;
+    const t0 = Date.now();
+    expect(weightOf(pad, MAX_CHECKPOINT_BYTES)).toBeNull();
+    expect(weightOf({ x: pad, y: [pad] }, MAX_CHECKPOINT_BYTES)).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1_000);
   });
 
   it('gives up at the cap, and at a depth no record has', () => {
@@ -214,6 +262,17 @@ describe('weightOf', () => {
     expect(weightOf(big, 1_000)).toBeNull();
     expect(weightOf(new Array(5_000_000).fill(1), 1_000)).toBeNull();
     expect(Date.now() - t0).toBeLessThan(500);
+  });
+});
+
+describe('the constants', () => {
+  it('are the ones the node twin and design §8.9 name: a change to one is a change to what is junk', () => {
+    expect({
+      FAIR_ONLY_RV, MAX_CHECKPOINT_BYTES, MAX_TABLE_PID_BYTES, MAX_TRANSFERS, OFFER_SKEW_MS, MAX_OFFER_TEXT, MAX_WEIGHT_DEPTH, NO_CLOSE,
+    }).toEqual({
+      FAIR_ONLY_RV: 'f1', MAX_CHECKPOINT_BYTES: 1_572_864, MAX_TABLE_PID_BYTES: 1_000_000, MAX_TRANSFERS: 8, OFFER_SKEW_MS: 600_000,
+      MAX_OFFER_TEXT: 256, MAX_WEIGHT_DEPTH: 16, NO_CLOSE: '0'.repeat(32),
+    });
   });
 });
 
@@ -398,14 +457,65 @@ describe('reading a checkpoint (S0)', () => {
     const { key, value } = trims.p;
     const heavy = { ...value, pad: 'x'.repeat(MAX_CHECKPOINT_BYTES) };
     expect(readCk(ROOM, key, heavy)).toEqual({ kind: 'junk' });
-    // 4,000 players of 256 characters with 40-digit nets are what an honest game holds, and fit.
+  });
+
+  it('weighs the padding of undefined fields, so a record padded past the cap is junk, and a little of it is the same record', () => {
+    const { key, value } = trims.p;
+    const padded = { ...value, pad0: undefined, pad1: undefined };
+    expect(ckId(padded), 'canon leaves them out: the same record').toBe(ckId(value));
+    expect(readCk(ROOM, key, padded).kind).toBe('ok');
+    const fat: Record<string, unknown> = { ...value };
+    for (let i = 0; i < 100_000; i++) fat[`pad${i}`] = undefined;
+    expect(ckId(fat)).toBe(ckId(value));
+    expect(readCk(ROOM, key, fat)).toEqual({ kind: 'junk' });
+  });
+
+  /** A craps game at the most the fold lets one be: `n` players, the fullest carry, and 8 transfers of the longest names. */
+  const fullest = (pids: string[]) => {
+    const room = 'r'.repeat(200);
+    const ctx: FoldCtx = { room, t: T, inc: faironlyInc('q', room, T, NAME) };
     const n: Record<string, string> = {};
-    for (let i = 0; i < 4_000; i++) n[`${i}`.padStart(256, 'p')] = `-${'9'.repeat(39)}`;
-    const big = changed(P, trims.p, { n });
-    const w = weightOf(big.value, Number.MAX_SAFE_INTEGER) as number;
-    expect(w).toBeGreaterThan(1_100_000);
-    expect(w).toBeLessThan(MAX_CHECKPOINT_BYTES);
-    expect(readCk(ROOM, big.key, big.value).kind).toBe('ok');
+    for (const pid of pids) n[pid] = `-${'9'.repeat(39)}`;
+    // The carry: 31 riders (long ids) with a felt on each of the 49 spots, the most chips a felt holds.
+    const spots = [
+      ...['pass', 'dontpass', 'come', 'dontcome', 'field', 'big6', 'big8', 'anyseven', 'anycraps', 'two', 'three', 'yo', 'twelve', 'passodds', 'dontpassodds'].map((type) => ({ type })),
+      ...[4, 5, 6, 8, 9, 10].flatMap((pick) => ['place', 'comeodds', 'dontcomeodds', 'come', 'dontcome'].map((type) => ({ type, pick }))),
+      ...[4, 6, 8, 10].map((pick) => ({ type: 'hard', pick })),
+    ];
+    const key = (b: { type: string; pick?: number }) => `${b.type}:${(b as { pick?: number }).pick ?? ''}`;
+    const felt = spots.map((b) => ({ ...b, amount: 20_000_000_000 })).sort((a, b) => (key(a) < key(b) ? -1 : 1));
+    const w: Record<string, unknown> = {};
+    for (let i = 0; i < 31; i++) w[`${i}`.padStart(2, '0') + '漢'.repeat(127)] = felt;
+    const xfs = Array.from({ length: MAX_TRANSFERS }, (_, i) => sealXf(ctx, {
+      v: 1, k: buyer.pub, u: 3,
+      o: offerOf(owner, buyer, { asset: { kind: 'deed', roomId: room, roomName: '漢'.repeat(MAX_OFFER_TEXT) }, makerName: '漢'.repeat(MAX_OFFER_TEXT), nonce: `${i}`.padStart(24, '0') }),
+    }, buyer.sign).value);
+    const c = trimOf(ctx, 'q', { n, s: { p: 6, w, h: 'p'.repeat(128), a: 'a'.repeat(128) }, x: xfs, k: buyer.pub, dl: undefined });
+    return { room, c, weight: weightOf(c.value, Number.MAX_SAFE_INTEGER) as number };
+  };
+  const bytesOf = (s: string) => utf8ToBytes(s).length;
+
+  it('is no heavier than the cap at the most the fold lets a game be: players whose ids total MAX_TABLE_PID_BYTES, riders, 8 transfers', () => {
+    // 4,000 players of 250 bytes of ids (the most players), and as many 256-unit ids of 3-byte characters as the bytes allow (the longest ids).
+    const many = Array.from({ length: MAX_TABLE_PIDS }, (_, i) => String(i).padStart(4, '0') + '漢'.repeat(82));
+    expect(many.reduce((sum, pid) => sum + bytesOf(pid), 0)).toBe(MAX_TABLE_PID_BYTES);
+    const longest = Array.from({ length: Math.floor(MAX_TABLE_PID_BYTES / 768) }, (_, i) => String.fromCharCode(0x4e00 + i) + '漢'.repeat(255));
+    expect(longest.every((pid) => pid.length === 256 && bytesOf(pid) === 768)).toBe(true);
+    for (const pids of [many, longest]) {
+      const { room, c, weight } = fullest(pids);
+      expect(weight).toBeGreaterThan(1_100_000);
+      expect(weight).toBeLessThan(1_400_000);
+      expect(weight).toBeLessThan(MAX_CHECKPOINT_BYTES);
+      expect(readCk(room, c.key, c.value).kind).toBe('ok');
+    }
+  });
+
+  it('is past the cap with ids past that, which is why the fold limits their bytes', () => {
+    // 4,000 players of 256 characters of 3 bytes: what the fold's count alone would allow.
+    const wide = Array.from({ length: MAX_TABLE_PIDS }, (_, i) => String.fromCharCode(0x4e00 + i) + '漢'.repeat(255));
+    const { room, c, weight } = fullest(wide);
+    expect(weight).toBeGreaterThan(MAX_CHECKPOINT_BYTES);
+    expect(readCk(room, c.key, c.value)).toEqual({ kind: 'junk' });
   });
 
   /** One rule at a time: `patch` laid over a good record of `letter` (and the
@@ -529,6 +639,23 @@ describe('reading a checkpoint (S0)', () => {
     for (const s of [{ p: 7, w: {} }, { p: 6 }, { p: 6, w: [] }, { p: 6, w: {}, extra: 1 }, 'x', null, [], { p: 6, w: { alice: [] } }]) refuses('q', `craps s ${JSON.stringify(s)}`, { s });
     refuses('p', 'roulette with s', { s: OPENING_CARRY });
     expect(read(Q, changed(Q, trims.q, { s: { p: 0, w: {} } })).kind).toBe('ok');
+  });
+
+  it('a field left undefined is no field in the opening carry or the nets, as in the record\'s id', () => {
+    for (const s of [{ p: 0, w: {}, h: undefined }, { p: 0, w: {}, a: undefined, i: undefined }]) {
+      const c = changed(Q, roots.q, { s });
+      expect(ckId(c.value), 'the root\'s own id').toBe(ckId(roots.q.value));
+      expect(read(Q, c).kind, JSON.stringify(s)).toBe('ok');
+    }
+    // (a rider whose felt is undefined is a rider, and no felt: that is isCarry's, as at every table)
+    refuses('q', 'a rider with no felt', { s: { p: 0, w: { alice: undefined } } }, 'root');
+    for (const [letter, ctx, root] of [['p', P, roots.p], ['q', Q, roots.q]] as const) {
+      const c = changed(ctx, root, { n: { alice: undefined } });
+      expect(ckId(c.value)).toBe(ckId(root.value));
+      expect(read(ctx, c).kind, `${letter} root with a net left undefined`).toBe('ok');
+      expect(read(ctx, changed(ctx, trims[letter], { n: { alice: undefined } })).kind, `${letter} trim with the only net left undefined`).toBe('ok');
+    }
+    refuses('p', 'a net of no form among the undefined', { n: { alice: undefined, bob: '0' } });
   });
 
   it('the opening state is the opening carry, and no commitment yet', () => {
