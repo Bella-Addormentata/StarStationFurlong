@@ -11784,6 +11784,7 @@ function setupClickToEnter() {
     // visible — intro clicks can never raycast through the curtain.
     window.addEventListener("click", onCanvasClick);
     window.addEventListener("pointermove", onCanvasPointerMove); // 🏙️ tube hover
+    window.addEventListener("pointerout", onPagePointerOut);
   };
 
   // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
@@ -12005,11 +12006,12 @@ function rayLandsPastFloor(ray: THREE.Ray): boolean {
 /**
  * 🏙️ The iso room view's hover pass (owner request): a near-side tube the
  * pointer rests on, out past the floor grid, shows half solid, so you can see
- * the door a click there walks you through (the click pass above). Coalesced
- * to one raycast a frame; only the room's own paired-door tubes are tested.
+ * the door a click there walks you through (the click pass above). The saved
+ * pointer is tested once a frame, after the camera moves (a turn of the view,
+ * or the camera following the avatar, slides tubes under a still pointer);
+ * only the room's own paired-door tubes are tested.
  */
 let hoverPointer: { x: number; y: number; onCanvas: boolean } | null = null;
-let hoverQueued = false;
 const hoverRaycaster = new THREE.Raycaster();
 const hoverNdc = new THREE.Vector2();
 function onCanvasPointerMove(event: PointerEvent): void {
@@ -12018,12 +12020,10 @@ function onCanvasPointerMove(event: PointerEvent): void {
     y: event.clientY,
     onCanvas: event.target === window.gameRenderer?.renderer?.domElement,
   };
-  if (hoverQueued) return;
-  hoverQueued = true;
-  requestAnimationFrame(() => {
-    hoverQueued = false;
-    world?.setHoveredVestibule(hoveredVestibuleDoor());
-  });
+}
+/** The pointer left the page: nothing is under it. */
+function onPagePointerOut(event: PointerEvent): void {
+  if (event.relatedTarget === null) hoverPointer = null;
 }
 function hoveredVestibuleDoor(): string | null {
   const p = hoverPointer;
@@ -12032,6 +12032,7 @@ function hoveredVestibuleDoor(): string | null {
   if (!multiScaleZoom || multiScaleZoom.getLevel() !== 2) return null;
   if (roomEdit.isEditModeActive() || isDeviceFocusActive() || world.getAirlockScene()) return null;
   hoverNdc.set((p.x / window.innerWidth) * 2 - 1, -(p.y / window.innerHeight) * 2 + 1);
+  api.camera.updateMatrixWorld(); // the rig may have moved it this frame
   hoverRaycaster.setFromCamera(hoverNdc, api.camera);
   if (!rayLandsPastFloor(hoverRaycaster.ray)) return null;
   const groups = [...world.getPairedVestibuleGroups().entries()];
@@ -12394,6 +12395,8 @@ function animate() {
   // camera while it owns the view (levels 2–4, no device focus). Runs after
   // the zoom tick so a level snap and the rig agree within the same frame.
   updateCameraRig(deltaTime);
+  // 🏙️ The near tube under the pointer, against where the camera now is.
+  world?.setHoveredVestibule(hoveredVestibuleDoor());
 
   if (hasEntered && !controlsHintShown && world.isPlayerActive()) {
     const controls = document.getElementById("controls");

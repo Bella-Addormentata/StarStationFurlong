@@ -338,6 +338,7 @@ import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw, getCameraForwardYaw, addStationBias, resetStationBias } from "./cameraRig";
 import {
   blocksRoomView,
+  boxCorners,
   EntryReveal,
   isoCameraDir,
   isoModuleTarget,
@@ -345,7 +346,7 @@ import {
   poseFootprint,
   type CamDir,
   type RoomHalf,
-  type XZBox,
+  type XZPoint,
 } from "./isoSurroundings";
 
 /**
@@ -1594,7 +1595,7 @@ export class World {
         isFpNeighbour?: boolean;
         roomId?: string;
         hops?: number;
-        footprint?: XZBox;
+        footprint?: XZPoint[];
       };
       if (ud.isFpConnector) {
         child.visible = !iso;
@@ -5768,7 +5769,7 @@ export class World {
         const b = this.vestibuleBox.setFromObject(vestibule);
         target = isoVestibuleTarget({
           blocks: blocksRoomView(
-            { minX: b.min.x, maxX: b.max.x, minZ: b.min.z, maxZ: b.max.z },
+            boxCorners(b.min.x, b.max.x, b.min.z, b.max.z),
             room,
             cam,
           ),

@@ -14,12 +14,10 @@
  * Pure: world.ts feeds it boxes and the camera's direction; the tests pin it.
  */
 
-/** A footprint on the ground, in the current room's frame (room centre at 0). */
-export interface XZBox {
-  minX: number;
-  maxX: number;
-  minZ: number;
-  maxZ: number;
+/** A point on the ground, in the current room's frame (room centre at 0). */
+export interface XZPoint {
+  x: number;
+  z: number;
 }
 
 /** The current room's floor half-extents (floorPlanDoc.roomHalfExtents). */
@@ -55,44 +53,69 @@ export function isoCameraDir(yaw: number): CamDir {
   };
 }
 
+/** The four corners of an axis-aligned box on the ground (a tube's bounds). */
+export function boxCorners(minX: number, maxX: number, minZ: number, maxZ: number): XZPoint[] {
+  return [
+    { x: minX, z: minZ },
+    { x: maxX, z: minZ },
+    { x: maxX, z: maxZ },
+    { x: minX, z: maxZ },
+  ];
+}
+
 /**
  * Does something outside the room stand between the iso camera and the room?
- * True when the box's centre lies on the camera's side of the room AND the box
- * overlaps the room across the screen. The camera is orthographic, so "across
- * the screen" is the ground axis square to the camera's direction; anything
- * out to the side of the room on that axis never covers it, however tall.
+ * `corners` outline its footprint on the ground (a module's turned floor box,
+ * a tube's bounds). True when the footprint's centre lies on the camera's
+ * side of the room AND it overlaps the room across the screen. The camera is
+ * orthographic, so "across the screen" is the ground axis square to the
+ * camera's direction; anything out to the side of the room on that axis
+ * never covers it, however tall.
  */
-export function blocksRoomView(box: XZBox, room: RoomHalf, cam: CamDir): boolean {
-  const cx = (box.minX + box.maxX) / 2;
-  const cz = (box.minZ + box.maxZ) / 2;
+export function blocksRoomView(corners: readonly XZPoint[], room: RoomHalf, cam: CamDir): boolean {
+  if (corners.length === 0) return false;
+  let cx = 0;
+  let cz = 0;
+  for (const c of corners) {
+    cx += c.x;
+    cz += c.z;
+  }
+  cx /= corners.length;
+  cz /= corners.length;
   if (cx * cam.x + cz * cam.z <= 0) return false; // behind the room, or square to it
   const sx = cam.z;
   const sz = -cam.x;
   const reach = room.halfX * Math.abs(sx) + room.halfZ * Math.abs(sz);
   let lo = Infinity;
   let hi = -Infinity;
-  for (const x of [box.minX, box.maxX]) {
-    for (const z of [box.minZ, box.maxZ]) {
-      const s = x * sx + z * sz;
-      if (s < lo) lo = s;
-      if (s > hi) hi = s;
-    }
+  for (const c of corners) {
+    const s = c.x * sx + c.z * sz;
+    if (s < lo) lo = s;
+    if (s > hi) hi = s;
   }
   return hi > -reach + SCREEN_MARGIN && lo < reach - SCREEN_MARGIN;
 }
 
-/** A module's ground footprint from its atlas pose: centre, heading and floor
- *  half-extents (the octagon's widest point is its floor box). */
+/** A module's ground footprint from its atlas pose: the four corners of its
+ *  floor box (the octagon's widest point), turned with the module, so a
+ *  module set at 45° is measured by its own outline, not a box around it. */
 export function poseFootprint(
   pose: { x: number; z: number; rotY: number },
   half: RoomHalf,
-): XZBox {
+): XZPoint[] {
   const cos = Math.cos(pose.rotY);
   const sin = Math.sin(pose.rotY);
-  // three.js turns +x toward −z for a positive rotation.y.
-  const ex = Math.abs(half.halfX * cos) + Math.abs(half.halfZ * sin);
-  const ez = Math.abs(half.halfX * sin) + Math.abs(half.halfZ * cos);
-  return { minX: pose.x - ex, maxX: pose.x + ex, minZ: pose.z - ez, maxZ: pose.z + ez };
+  // three.js's rotation.y: local (x, z) → (x·cos + z·sin, −x·sin + z·cos).
+  return [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ].map(([sx, sz]) => {
+    const lx = sx * half.halfX;
+    const lz = sz * half.halfZ;
+    return { x: pose.x + lx * cos + lz * sin, z: pose.z - lx * sin + lz * cos };
+  });
 }
 
 /**
@@ -124,28 +147,36 @@ export function isoModuleTarget(o: { blocks: boolean; revealing: boolean }): num
  */
 export class EntryReveal {
   private on = false;
+  private busy = false;
   private holdUntil = -Infinity;
 
   /** A room was just entered at `now` (ms). */
   start(now: number): void {
     this.on = true;
+    this.busy = false;
     this.holdUntil = now + REVEAL_HOLD_MS;
   }
 
   /** Stop at once (the view left the room, say). */
   cancel(): void {
     this.on = false;
+    this.busy = false;
   }
 
   /** Whether the reveal is on at `now`. `busy` = the arrival is still going
    *  on; while it is, the reveal stays on however long a frame takes (a join
-   *  can stall the page), and the hold counts from its end. Only a reveal
-   *  already on is held: a door walk later in the visit starts nothing. */
+   *  can stall the page), and the hold counts from the first frame that sees
+   *  it over (frames paused in a background tab don't eat the hold). Only a
+   *  reveal already on is held: a door walk later in the visit starts nothing. */
   update(now: number, busy: boolean): boolean {
     if (!this.on) return false;
     if (busy) {
-      this.holdUntil = now + REVEAL_HOLD_MS;
+      this.busy = true;
       return true;
+    }
+    if (this.busy) {
+      this.busy = false;
+      this.holdUntil = now + REVEAL_HOLD_MS;
     }
     if (now > this.holdUntil) this.on = false;
     return this.on;

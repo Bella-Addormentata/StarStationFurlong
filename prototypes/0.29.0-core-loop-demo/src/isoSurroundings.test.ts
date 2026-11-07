@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   blocksRoomView,
+  boxCorners,
   EntryReveal,
   HOVER_OPACITY,
   isoCameraDir,
@@ -8,19 +9,25 @@ import {
   isoVestibuleTarget,
   poseFootprint,
   REVEAL_HOLD_MS,
-  type XZBox,
+  type XZPoint,
 } from './isoSurroundings';
 
 const ROOM = { halfX: 6, halfZ: 6 };
 /** A straight tube out of a wall at lateral 0 (2.4 m across, 3 m long). */
-const tube = (wall: 'x+' | 'x-' | 'z+' | 'z-', lateral = 0, half = 6): XZBox => {
+const tube = (wall: 'x+' | 'x-' | 'z+' | 'z-', lateral = 0, half = 6): XZPoint[] => {
   switch (wall) {
-    case 'x+': return { minX: half, maxX: half + 3, minZ: lateral - 1.2, maxZ: lateral + 1.2 };
-    case 'x-': return { minX: -half - 3, maxX: -half, minZ: lateral - 1.2, maxZ: lateral + 1.2 };
-    case 'z+': return { minX: lateral - 1.2, maxX: lateral + 1.2, minZ: half, maxZ: half + 3 };
-    case 'z-': return { minX: lateral - 1.2, maxX: lateral + 1.2, minZ: -half - 3, maxZ: -half };
+    case 'x+': return boxCorners(half, half + 3, lateral - 1.2, lateral + 1.2);
+    case 'x-': return boxCorners(-half - 3, -half, lateral - 1.2, lateral + 1.2);
+    case 'z+': return boxCorners(lateral - 1.2, lateral + 1.2, half, half + 3);
+    case 'z-': return boxCorners(lateral - 1.2, lateral + 1.2, -half - 3, -half);
   }
 };
+const bounds = (pts: XZPoint[]) => ({
+  minX: Math.min(...pts.map((p) => p.x)),
+  maxX: Math.max(...pts.map((p) => p.x)),
+  minZ: Math.min(...pts.map((p) => p.z)),
+  maxZ: Math.max(...pts.map((p) => p.z)),
+});
 
 describe('isoCameraDir', () => {
   it('starts on the +x +z diagonal and turns with the detents', () => {
@@ -79,11 +86,20 @@ describe('blocksRoomView', () => {
     expect(blocksRoomView(east, ROOM, cam)).toBe(true);
     expect(blocksRoomView(west, ROOM, cam)).toBe(false);
   });
+
+  it('measures a module set at 45° by its own outline, not a box around it', () => {
+    const cam = isoCameraDir(0);
+    const turned = poseFootprint({ x: 18, z: -9, rotY: Math.PI / 4 }, { halfX: 6, halfZ: 6 });
+    // Beside the room on screen: solid. The box around it would overlap.
+    expect(blocksRoomView(turned, ROOM, cam)).toBe(false);
+    const b = bounds(turned);
+    expect(blocksRoomView(boxCorners(b.minX, b.maxX, b.minZ, b.maxZ), ROOM, cam)).toBe(true);
+  });
 });
 
 describe('poseFootprint', () => {
   it('swaps the extents for a quarter turn', () => {
-    const box = poseFootprint({ x: 10, z: -2, rotY: Math.PI / 2 }, { halfX: 9, halfZ: 3 });
+    const box = bounds(poseFootprint({ x: 10, z: -2, rotY: Math.PI / 2 }, { halfX: 9, halfZ: 3 }));
     expect(box.minX).toBeCloseTo(7);
     expect(box.maxX).toBeCloseTo(13);
     expect(box.minZ).toBeCloseTo(-11);
@@ -137,8 +153,10 @@ describe('EntryReveal', () => {
     r.start(0);
     // The curtain and the walk-in run well past the hold.
     for (let t = 0; t <= 6000; t += 100) expect(r.update(t, true)).toBe(true);
-    expect(r.update(6000 + REVEAL_HOLD_MS - 1, false)).toBe(true);
-    expect(r.update(6000 + REVEAL_HOLD_MS + 1, false)).toBe(false);
+    // The first idle frame starts the hold.
+    expect(r.update(6100, false)).toBe(true);
+    expect(r.update(6100 + REVEAL_HOLD_MS - 1, false)).toBe(true);
+    expect(r.update(6100 + REVEAL_HOLD_MS + 1, false)).toBe(false);
     // Over: the next door walk does not bring it back.
     expect(r.update(9000, true)).toBe(false);
   });
@@ -149,7 +167,20 @@ describe('EntryReveal', () => {
     expect(r.update(100, true)).toBe(true);
     // The page stalls for longer than the hold mid-swap: still on.
     expect(r.update(100 + 3 * REVEAL_HOLD_MS, true)).toBe(true);
-    expect(r.update(100 + 4 * REVEAL_HOLD_MS + 1, false)).toBe(false);
+    const idle = 100 + 3 * REVEAL_HOLD_MS + 50;
+    expect(r.update(idle, false)).toBe(true);
+    expect(r.update(idle + REVEAL_HOLD_MS + 1, false)).toBe(false);
+  });
+
+  it('gives the full hold from the first frame that sees the arrival over', () => {
+    const r = new EntryReveal();
+    r.start(0);
+    expect(r.update(100, true)).toBe(true);
+    // Frames paused (a background tab) while the swap finished.
+    const back = 100 + 5 * REVEAL_HOLD_MS;
+    expect(r.update(back, false)).toBe(true);
+    expect(r.update(back + REVEAL_HOLD_MS - 1, false)).toBe(true);
+    expect(r.update(back + REVEAL_HOLD_MS + 1, false)).toBe(false);
   });
 
   it('can be cancelled', () => {
