@@ -1189,6 +1189,11 @@ pub(crate) mod mock {
 
     pub(crate) type Handler = Arc<dyn Fn(&Message) -> Vec<Message> + Send + Sync>;
 
+    /// An in-memory coin set behind two or more mock full nodes, with a
+    /// mempool, reorganisations and the announcements a real node makes
+    /// (stage 4 design §12, "Mock chain").
+    pub(crate) mod chain;
+
     pub(crate) struct MockNode {
         pub addr: SocketAddr,
         /// The certificate the node presents; [`spawn_as`] brings up a second
@@ -1215,8 +1220,19 @@ pub(crate) mod mock {
 
     /// A header block at `height` whose previous-header hash is `prev` and
     /// everything else zero: enough for the binding check and for a
-    /// deterministic `header_hash()` per height.
+    /// deterministic `header_hash()` per height. It is [`header_on`] on the
+    /// first fork, byte for byte.
     pub(crate) fn header_at(height: u32, prev: Bytes32) -> HeaderBlock {
+        header_on(height, prev, Bytes32::new([0u8; 32]))
+    }
+
+    /// A header block at `height` whose previous-header hash is `prev`, with
+    /// `fork` as its foliage's reward-block hash and everything else zero.
+    /// The header hash covers the foliage alone, not the height, so a chain
+    /// of these differs block by block only through `prev`, and a block built
+    /// again on the same parent after a reorganisation differs from the one
+    /// it replaces only through `fork` ([`chain`], stage 4 design §12).
+    pub(crate) fn header_on(height: u32, prev: Bytes32, fork: Bytes32) -> HeaderBlock {
         let zero = Bytes32::new([0u8; 32]);
         let g1 = chia_bls::G1Element::default();
         let g2 = chia_bls::G2Element::default();
@@ -1241,7 +1257,7 @@ pub(crate) mod mock {
             false,
         );
         let data = FoliageBlockData::new(zero, PoolTarget::new(zero, 0), None, zero, zero);
-        let foliage = Foliage::new(prev, zero, data, g2, None, None);
+        let foliage = Foliage::new(prev, fork, data, g2, None, None);
         HeaderBlock::new(vec![], reward, None, proof.clone(), None, proof, None, foliage, None, Bytes::new(vec![]), None)
     }
 
