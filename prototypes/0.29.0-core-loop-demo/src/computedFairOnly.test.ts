@@ -689,6 +689,51 @@ describe('reading a checkpoint (S0)', () => {
     expect(read(Q, changed(Q, trims.q, { s: { p: 0, w: {} } })).kind).toBe('ok');
   });
 
+  it('a player or a rider named by an unpaired surrogate is refused, a pair is a character', () => {
+    // Yjs writes strings as UTF-8, so a peer reads U+FFFD where the page that wrote the record holds the
+    // surrogate, and the record's id and signature fail there (the next spec shows it).
+    const lone = ['\ud800', 'al\ud800ice', '\udc00', 'a\udc00', '\udc00\ud800', '😀\ud83d', '\ud83d😀\ude00', '\udbff', '\udfff', 'a\udfff'];
+    for (const pid of lone) {
+      for (const letter of ['p', 'q'] as const) refuses(letter, `a net for ${JSON.stringify(pid)}`, { n: { [pid]: '25', bob: '-25' } });
+    }
+    for (const pid of ['😀', 'a😀b', '퟿', '𐀀', '😀😀']) {
+      for (const [letter, ctx] of [['p', P], ['q', Q]] as const) {
+        expect(read(ctx, changed(ctx, trims[letter], { n: { [pid]: '25', bob: '-25' } })).kind, JSON.stringify(pid)).toBe('ok');
+      }
+    }
+    // The craps carry names players too: its riders, the shooter and the last shooter.
+    const pass = [{ type: 'pass', amount: 1 }];
+    const carry = (patch: Record<string, unknown>) => ({ p: 6, w: { alice: pass }, h: 'alice', a: 'bob', ...patch });
+    expect(read(Q, changed(Q, trims.q, { s: carry({}) })).kind, 'the carry unchanged').toBe('ok');
+    for (const pid of lone) {
+      refuses('q', `a rider ${JSON.stringify(pid)}`, { s: carry({ w: { [pid]: pass } }) });
+      refuses('q', `a shooter ${JSON.stringify(pid)}`, { s: carry({ h: pid }) });
+      refuses('q', `a last shooter ${JSON.stringify(pid)}`, { s: carry({ a: pid }) });
+    }
+    for (const pid of ['😀', 'a😀b']) {
+      expect(read(Q, changed(Q, trims.q, { s: carry({ w: { [pid]: pass }, h: pid, a: pid }) })).kind, JSON.stringify(pid)).toBe('ok');
+    }
+  });
+
+  it('refuses it because a peer reads U+FFFD there and the record\'s id and signature fail', () => {
+    // What the page that wrote the record holds: it is whole where it was made.
+    const bad = trimOf(P, 'p', { n: { 'al\ud800ice': '25', bob: '-25' } });
+    expect(bad.key).toBe(ckKey(T, P.inc, ckId(bad.value) as string));
+    expect(verifyIdentityStrict(house.pub, signBytes('ck', P, bad.value), bad.value.g)).toBe(true);
+    const a = new Y.Doc();
+    a.getMap('m').set('v', bad.value);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    const got = b.getMap('m').get('v') as CkRec;
+    expect(Object.keys(got.n)).toEqual(['al�ice', 'bob']);
+    // ... but not on the peer: another id, and the house's signature does not cover what it reads.
+    expect(ckId(got)).not.toBe(ckId(bad.value));
+    expect(verifyIdentityStrict(house.pub, signBytes('ck', P, got), got.g)).toBe(false);
+    // So every peer reads it as junk, and now so does the page that wrote it: they agree.
+    expect(readCk(ROOM, bad.key, got)).toEqual({ kind: 'junk' });
+    expect(readCk(ROOM, bad.key, bad.value)).toEqual({ kind: 'junk' });
+  });
+
   it('a field left undefined is no field in the opening carry or the nets, as in the record\'s id', () => {
     for (const s of [{ p: 0, w: {}, h: undefined }, { p: 0, w: {}, a: undefined, i: undefined }]) {
       const c = changed(Q, roots.q, { s });

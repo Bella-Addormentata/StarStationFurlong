@@ -61,6 +61,7 @@ import {
   canon, hasFields, isCarry, isHex32, isHex64, isHouseSumOutcome, isNet, isPid, isPlain, isPub, isSig, MAX_TABLE_PIDS, signBytes, U_MAX,
 } from './computedFold';
 import type { Checkpoint, FoldCtx } from './computedFold';
+import type { CrapsCarry } from './computedCraps';
 import { asDelegation } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
 
@@ -340,9 +341,9 @@ const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as nu
 
 /** Whether `s` has no unpaired surrogate. Yjs writes a string as UTF-8, which
  *  has none, so a peer reads U+FFFD where this page holds one, and nothing
- *  signed or hashed over the text (the maker's signature, the id of the
- *  record that holds it) would hold there: the page that wrote it would
- *  count a transfer no other page can read. */
+ *  signed or hashed over the text (an offer maker's signature, the id and the
+ *  signature of a checkpoint that names a player by it) would hold there: the
+ *  page that wrote it would count a record no other page can read. */
 function wellFormed(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
@@ -358,6 +359,14 @@ function wellFormed(s: string): boolean {
 }
 
 const isText = (v: unknown): v is string => typeof v === 'string' && v.length <= MAX_OFFER_TEXT && wellFormed(v);
+
+/** Whether every id a craps carry holds (its riders, the shooter, the last
+ *  shooter) is text Yjs carries as it is: isCarry, which PR 2's checkpoints
+ *  also use, takes any 1 to 256 units, but here a rider named by an unpaired
+ *  surrogate would make a record that only the page that wrote it can read. */
+function carryWellFormed(s: CrapsCarry): boolean {
+  return Object.keys(s.w).every(wellFormed) && (s.h === undefined || wellFormed(s.h)) && (s.a === undefined || wellFormed(s.a));
+}
 
 /** A fin: {v:1, k, g}. The signature is the resolver's to check. */
 export function asFin(v: unknown): FinRec | null {
@@ -441,7 +450,7 @@ function ckBody(v: Record<string, unknown>, room: string, letter: FairOnlyLetter
   // (A player whose net is undefined is no player, as in the record's id.)
   const pids = Object.keys(v.n).filter((pid) => (v.n as Record<string, unknown>)[pid] !== undefined);
   if (pids.length > MAX_TABLE_PIDS || (u === 0 && pids.length > 0)) return null;
-  if (!pids.every((pid) => isPid(pid) && isNet((v.n as Record<string, unknown>)[pid]))) return null;
+  if (!pids.every((pid) => isPid(pid) && wellFormed(pid) && isNet((v.n as Record<string, unknown>)[pid]))) return null;
   // An end carries the authority's end order, and nothing a live game plays on.
   if (v.e !== undefined && v.e !== 1) return null;
   const ended = v.e === 1;
@@ -450,6 +459,7 @@ function ckBody(v: Record<string, unknown>, room: string, letter: FairOnlyLetter
   if (ended && (v.s !== undefined || v.h !== undefined || v.w !== undefined)) return null;
   // The craps carry: there while live, only at craps, and the opening one at u = 0.
   if (letter === 'q' && !ended ? !isCarry(v.s) : v.s !== undefined) return null;
+  if (v.s !== undefined && !carryWellFormed(v.s as CrapsCarry)) return null;
   if (u === 0 && v.s !== undefined && !isOpeningCarry(v.s)) return null;
   // The commitment the next round must name: none before the house has joined one.
   if (v.h !== undefined && (!isHex64(v.h) || u === 0)) return null;
