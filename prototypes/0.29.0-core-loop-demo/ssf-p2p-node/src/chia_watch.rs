@@ -279,12 +279,15 @@ async fn lease_standing(_client: &impl crate::chia_chain::ChainAccess, coins: &[
     (coins.iter().map(|c| (*c, LeaseWord::Unknown)).collect(), HashSet::new())
 }
 
-/// The coins each knock we sent filed ([`WriteCoins::filed`]), one per entry
-/// in book order: `None` where the entry's coin id is malformed. The hint is
-/// not read here, so an entry with a good coin and a bad hint files its coins
-/// all the same, and its verdict is the malformed one.
+/// The coins each knock we sent filed ([`WriteCoins::filed`]): its coin id
+/// as the parent and its parked input beside it, one per entry in book order
+/// (stage 4 design §4.4). An entry with no parked input, as an older node
+/// wrote them, files its one coin; `None` where the entry's coin id or
+/// parked input is malformed. The hint is not read here, so an entry with
+/// good coins and a bad hint files its coins all the same, and its verdict
+/// is the malformed one.
 fn filed_coins(pending: &[SentKnock]) -> Vec<Option<WriteCoins>> {
-    pending.iter().map(|k| WriteCoins::filed(&k.coin_id)).collect()
+    pending.iter().map(|k| WriteCoins::filed(&k.coin_id, &k.parked)).collect()
 }
 
 /// What the wallet lease and the names listing are asked about for the
@@ -345,10 +348,11 @@ type SentVerdict = (String, String, u64, u32, bool, WriteStanding);
 /// names listing, in one call for the batch, about the same parked inputs
 /// ([`parked_inputs`]); then each entry's hint, in book order, about its
 /// parent ([`sent_knock_standing`]): the coins of stage 4 design §4.4. An
-/// entry whose coin id or hint is malformed is dead; one whose hint could not
-/// be read gets no verdict, and is judged again next tick. The memo digest an
-/// entry keeps is the one its coin's output must carry; an entry that keeps
-/// none (an older node's) or a malformed one is judged by its hint alone.
+/// entry whose coin id, parked input or hint is malformed is dead; one whose
+/// hint could not be read gets no verdict, and is judged again next tick. The
+/// memo digest an entry keeps is the one its coin's output must carry; an
+/// entry that keeps none (an older node's) or a malformed one is judged by
+/// its hint alone.
 /// `Err` when the names listing could not be read: nothing is judged this tick.
 async fn sent_knock_verdicts<L, Asked>(
     client: &impl crate::chia_chain::ChainAccess,
@@ -758,7 +762,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // review): a dropped knock's coin is the next write's input. The
             // lease is asked FIRST, the chain after, so a knock confirming in
             // between is seen by the lookups and never read as dropped. Each
-            // verdict names its entry by input coin AND hint (#272 review round
+            // verdict names its entry by coin id AND hint (#272 review round
             // 4): a dropped knock's input is released to the next write, which
             // may be another knock, so two entries can share a coin. An input
             // spent with no child under the hint is the coin's going to another
@@ -774,8 +778,10 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // with the knocks it read, below. Each lookup asks about its own
             // coin of the knock (stage 4 design §4.4): the lease and the names
             // listing about its parked input, the hint lookup about its
-            // parent (sent_knock_verdicts); one coin for every knock of this
-            // build.
+            // parent (sent_knock_verdicts), as the entry filed them
+            // (filed_coins): one coin for a knock the SSF wallet pays for,
+            // while a burner's first knock files its gift g and its dish
+            // coin F.
             let pending = hub.knocks.lock().unwrap().unsettled_sent(knock_peak);
             if !pending.is_empty() {
                 let filed = filed_coins(&pending);
@@ -1467,6 +1473,8 @@ mod tests {
             last_rendezvous: 0,
             settled: false,
             spend,
+            parked: String::new(),
+            payer: None,
         }
     }
 
@@ -1608,6 +1616,21 @@ mod tests {
         // A split write is listed by its parked input alone.
         let (p, q) = (Bytes32::new([0x11; 32]), Bytes32::new([0x22; 32]));
         assert_eq!(parked_inputs(&[Some(WriteCoins { parent: p, parked: q }), None, Some(WriteCoins::one(ca))]), vec![q, ca]);
+        // Entries that file their parked input beside their coin: the coin
+        // filed twice is one coin, as a knock the SSF wallet pays for files
+        // it; another coin files the pair, and the batch lists it by its
+        // parked input; a malformed parked input files nothing, never the one
+        // coin, so its entry is dead as malformed.
+        let (g, f) = ("11".repeat(32), "22".repeat(32));
+        let filing = vec![
+            SentKnock { parked: a.clone(), ..sent_knock(&a, &hint, Some(4)) },
+            SentKnock { parked: f, ..sent_knock(&g, &hint, Some(5)) },
+            SentKnock { parked: "zz".into(), ..sent_knock(&b, &hint, Some(6)) },
+            SentKnock { parked: "0011".into(), ..sent_knock(&a, &hint, None) },
+        ];
+        let filed = filed_coins(&filing);
+        assert_eq!(filed, vec![Some(WriteCoins::one(ca)), Some(WriteCoins { parent: p, parked: q }), None, None]);
+        assert_eq!(parked_inputs(&filed), vec![ca, q]);
     }
 
     /// The batch's lease, for the tests: its word is `Dropped` on `dropped`
@@ -1650,15 +1673,18 @@ mod tests {
     }
 
     /// Stage 4 design §4.4, the batch itself: for knocks whose parent and
-    /// parked input differ, as a burner's will (PR 10), the lease is asked
-    /// first, before any listing, and with the names listing in one call
-    /// about the parked inputs, in book order; each hint is asked about its
-    /// entry's parent. So a parked input listed spent kills its knock, the
-    /// lease's word on a parked input is its knock's word, and the lease
-    /// holding the knock's own spend keeps it pending (#272 review round 12).
+    /// parked input differ, as a burner's first knock files them (its gift g
+    /// and its dish coin F), the batch is fed by the coins each entry filed
+    /// ([`filed_coins`]). The lease is asked first, before any listing, and
+    /// with the names listing in one call about the parked inputs, in book
+    /// order; each hint is asked about its entry's parent. So a parked input
+    /// listed spent kills its knock, the lease's word on a parked input is
+    /// its knock's word, and the lease holding the knock's own spend keeps it
+    /// pending (#272 review round 12).
     /// A malformed entry is dead, its coins asked about only when its coin id
-    /// is good; a hint that cannot be read judges nothing; a names listing
-    /// that cannot be read judges the batch not at all.
+    /// and its parked input are good; a hint that cannot be read judges
+    /// nothing; a names listing that cannot be read judges the batch not at
+    /// all.
     #[tokio::test]
     async fn the_sent_knocks_batch_asks_the_lease_and_names_by_parked_input_and_each_hint_by_parent() {
         use crate::chia_chain::testing::Scripted;
@@ -1668,19 +1694,23 @@ mod tests {
         let split = |n: u8| WriteCoins { parent: Bytes32::new([0x40 + n; 32]), parked: input(n).coin_id() };
         let (k1, k2, k3, k4, k7) = (split(1), split(2), split(3), split(4), split(7));
         let c5 = input(5).coin_id();
-        let filed_hex = |coins: WriteCoins| hex::encode(coins.parent);
+        // A split knock's entry, filing its parent and its parked input.
+        let split_knock = |coins: WriteCoins, spend: Option<u64>| SentKnock { parked: hex::encode(coins.parked), ..sent_knock(&hex::encode(coins.parent), &hint_hex, spend) };
         // The first knock keeps the digest of its memo, which its coin carries.
-        let first = SentKnock { memo: hex::encode(chia_resolve::memo_digest(b"knock 1")), ..sent_knock(&filed_hex(k1), &hint_hex, Some(1)) };
+        let first = SentKnock { memo: hex::encode(chia_resolve::memo_digest(b"knock 1")), ..split_knock(k1, Some(1)) };
         let pending = vec![
             first,
-            sent_knock(&filed_hex(k2), &hint_hex, None),
-            sent_knock(&filed_hex(k3), &hint_hex, None),
-            sent_knock(&filed_hex(k4), &hint_hex, Some(4)),
+            split_knock(k2, None),
+            split_knock(k3, None),
+            split_knock(k4, Some(4)),
             sent_knock(&hex::encode(c5), "zz", Some(5)),
             sent_knock("zz", &hint_hex, Some(6)),
-            sent_knock(&filed_hex(k7), &hint_hex, None),
+            // A good coin id and hint beside a malformed parked input.
+            SentKnock { parked: "zz".into(), ..sent_knock(&hex::encode(input(6).coin_id()), &hint_hex, Some(7)) },
+            split_knock(k7, None),
         ];
-        let filed = vec![Some(k1), Some(k2), Some(k3), Some(k4), Some(WriteCoins::one(c5)), None, Some(k7)];
+        let filed = filed_coins(&pending);
+        assert_eq!(filed, vec![Some(k1), Some(k2), Some(k3), Some(k4), Some(WriteCoins::one(c5)), None, None, Some(k7)], "the coins each entry filed");
         let made = child_record(k1.parent, 1000).coin;
         let chain = Scripted::new(vec![
             // The names listing: the second and the fourth knock's parked inputs spent.
@@ -1696,7 +1726,7 @@ mod tests {
         let lease = ScriptedLease::new(k3.parked, 4);
         let verdicts = sent_knock_verdicts(&chain, &pending, &filed, |coins, spends| std::future::ready(lease.answer(&chain, &coins, &spends))).await.unwrap();
         let parked = vec![k1.parked, k2.parked, k3.parked, k4.parked, c5, k7.parked];
-        assert_eq!(*lease.asked.lock().unwrap(), vec![(parked.clone(), vec![1, 4, 5, 6], 0)], "the lease, first, about the parked inputs");
+        assert_eq!(*lease.asked.lock().unwrap(), vec![(parked.clone(), vec![1, 4, 5, 6, 7], 0)], "the lease, first, about the parked inputs");
         assert_eq!(*chain.asked_names.lock().unwrap(), vec![parked], "the names listing, once, about the parked inputs");
         let verdict = |k: &SentKnock, standing: WriteStanding| (k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, standing);
         assert_eq!(
@@ -1708,6 +1738,7 @@ mod tests {
                 verdict(&pending[3], Pending),
                 verdict(&pending[4], Dead("its entry in the knock book is malformed")),
                 verdict(&pending[5], Dead("its entry in the knock book is malformed")),
+                verdict(&pending[6], Dead("its entry in the knock book is malformed")),
             ]
         );
         // A names listing that cannot be read: the lease was still asked first.

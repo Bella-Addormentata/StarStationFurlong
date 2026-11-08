@@ -665,7 +665,8 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// against R1 to R7 ([`build_burner_bundle`]; a broken rule is the
 /// [`BurnerRule`] inside the error) and pushed with its on-chain input parked
 /// under the burner as its payer ([`Payer::of_burner`]): F for a first
-/// write, never g. An acknowledged or an unanswered push is a write, `acked`
+/// write, never g. The [`MemoWrite`] names that payer, for a first write and
+/// a rewrite alike. An acknowledged or an unanswered push is a write, `acked`
 /// true or false, as in `publish_memo_with`, and a first write's gift is
 /// counted in the fuse; a refused one, or one the lease would not park, is
 /// the [`PushError`] inside the error, and counts nothing.
@@ -755,7 +756,7 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     if built.gift.is_some() {
         fuse.lock().unwrap().count(era, payer);
     }
-    Ok(MemoWrite { coins: built.coins, acked, spend: lease.spend_of(&built.coins.parked), memo: built.memo })
+    Ok(MemoWrite { coins: built.coins, acked, spend: lease.spend_of(&built.coins.parked), memo: built.memo, payer })
 }
 
 /// [`burner_write_with`] on the node's own lease and fuse ([`WALLET_LEASE`],
@@ -764,12 +765,12 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// design §10; a peer that lies about a burner coin risks at most a refused
 /// push) and the OS random source.
 ///
-/// Its [`MemoWrite`] must not be filed in `NodePublishMark`, `BeaconMark` or
-/// `SentKnock` until PR 10 files `parked` beside the parent: those marks
-/// keep one coin and read it back as both ([`WriteCoins::filed`]), so a
-/// first write filed there would be judged by g alone, and its verdict would
-/// never find the dish coin it parked. Like the builder it has no network
-/// check of its own: until PR 10 its one caller, the claim-and-write
+/// Its [`MemoWrite`] files whole in `NodePublishMark`, `BeaconMark` or
+/// `SentKnock` (§4.4): its parent as the mark's coin id (the gift g for a
+/// first write), its parked input beside it (the dish coin F) and the
+/// burner as its payer, and the mark's reader judges it by both coins
+/// ([`WriteCoins::filed`]). Like the builder it has no network check of its
+/// own: until PR 10's writers land, its one caller, the claim-and-write
 /// self-test hook ([`claim_write_selftest`]), runs only with
 /// SSF_CHIA_BURNERS=1 on a test network (§13 row 9), and keeps no mark.
 pub async fn burner_write(

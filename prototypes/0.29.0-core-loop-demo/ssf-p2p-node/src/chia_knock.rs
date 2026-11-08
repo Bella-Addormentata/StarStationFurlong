@@ -148,10 +148,14 @@ pub struct SentKnock {
     pub era: u64,
     /// The inbox hint written under, hex (what the operator can look up).
     pub hint: String,
-    /// The coin the knock spend consumed, hex: the knock's own coin names it
-    /// as parent, which is how the knock is found again under the hint and
-    /// judged ([`crate::chia_resolve::write_standing`]) — its spent flag alone
-    /// proves nothing, since a dropped knock's coin goes to the next write.
+    /// The parent of the knock's own coin, hex: the coin whose spend made the
+    /// coin carrying the knock under the hint, which is how the knock is found
+    /// again and judged ([`crate::chia_resolve::write_standing`]) — its spent
+    /// flag alone proves nothing, since a dropped knock's coin goes to the next
+    /// write. For a knock the SSF wallet pays for, it is also the input the
+    /// spend consumed; for a burner's knock, always the first write of its
+    /// key, it is the gift g, and `parked` names the dish coin F the spend
+    /// consumed (stage 4 design §4.1, §4.4). With `hint` it names the entry in the book.
     pub coin_id: String,
     /// The digest of the memo the knock carried, hex
     /// ([`crate::chia_resolve::memo_digest`] of its sealed knock): the coin
@@ -184,6 +188,23 @@ pub struct SentKnock {
     /// entry an older node wrote.
     #[serde(default)]
     pub spend: Option<u64>,
+    /// The on-chain input the wallet lease parked for the knock's spend, hex,
+    /// which the input's spent height and the lease's word are read at
+    /// ([`crate::chia_resolve::WriteCoins::filed`]): the dish coin F for a
+    /// burner's first knock, whose `coin_id` is the gift g, and the same coin
+    /// as `coin_id` for every other knock (stage 4 design §4.1, §4.4). Empty
+    /// in an entry an older node wrote, whose one coin is both.
+    #[serde(default)]
+    pub parked: String,
+    /// Who paid for the knock, as the lease parked its spend: the payer's
+    /// puzzle hash, hex, as the publisher's payer writes it (the SSF wallet's
+    /// for a knock it pays for, a burner's for a burner's), filed as text and
+    /// never parsed back, for the burner writers to tell a burner's knock from
+    /// the wallet's (stage 4 design §4.4, PR 10). Every knock this build
+    /// writes names one. `None` in an entry an
+    /// older node wrote, whose knock the SSF wallet paid for.
+    #[serde(default)]
+    pub payer: Option<String>,
 }
 
 /// A knock read from this node's inbox.
@@ -369,10 +390,13 @@ impl KnockBook {
     /// and the clock follows (#272 review round 7): a clock not yet dialed on
     /// moves whole, one already dialed on keeps the peak it was last planned
     /// at, and its next boundary is counted from the new height above that. An
-    /// entry is named by BOTH (#272 review round 4): a dropped knock's input is
-    /// released to the next write, which may be another knock to another host,
-    /// so two entries can share an input coin — their hints tell them apart.
-    /// Returns true when something changed.
+    /// entry is named by BOTH its coin id, the parent of the knock's coin
+    /// ([`SentKnock::coin_id`]: the gift g for a burner's first knock, the
+    /// input itself for every other, stage 4 design §4.4), and its hint (#272
+    /// review round 4): a dropped knock's input is released to the next
+    /// write, which may be another knock to another host, so two entries can
+    /// share a coin id — their hints tell them apart. Returns true when
+    /// something changed.
     pub fn confirm_sent(&mut self, coin_id: &str, hint: &str, height: u32) -> bool {
         let mut changed = false;
         for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != height) {
@@ -404,7 +428,7 @@ impl KnockBook {
     /// A knock of ours that never counts — the chain confirmed it OUTSIDE its
     /// era (the host's reader rejects it, so nobody dials back), or its spend
     /// never landed ([`crate::chia_resolve::WriteStanding::Dead`]): forgotten,
-    /// the next dial exhaustion knocks again. Named by input coin AND hint, as
+    /// the next dial exhaustion knocks again. Named by coin id AND hint, as
     /// [`Self::confirm_sent`]. Returns true when one went.
     pub fn drop_sent(&mut self, coin_id: &str, hint: &str) -> bool {
         let before = self.sent.len();
@@ -603,6 +627,8 @@ mod tests {
             last_rendezvous: 0,
             settled: false,
             spend: None,
+            parked: coin.into(),
+            payer: Some("ef".repeat(32)),
         }
     }
 
@@ -920,6 +946,73 @@ mod tests {
         assert_eq!(KnockBook::load(&path), book);
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(KnockBook::load(&path), KnockBook::default(), "an unreadable file starts empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §4.4 and §8 (6): a knock entry files its parked input
+    /// and its payer beside its coin, and `knocks.json` keeps both across a
+    /// restart. An entry an older node wrote has neither, whether it is in
+    /// the shape the build before this one wrote or an older one still: it
+    /// loads with no parked input, which reads back as its one coin, and no
+    /// payer, and the rest of the entry is read as before.
+    #[test]
+    fn a_sent_knock_keeps_its_parked_input_and_payer_through_the_book_file_and_an_older_entry_loads_without_them() {
+        use crate::chia_resolve::{parse_hex32, WriteCoins};
+        let dir = std::env::temp_dir().join(format!("ssf-knocks-parked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(KNOCKS_FILE);
+        // A burner's first knock: the gift as its coin, the dish coin as its
+        // parked input, the burner as its payer.
+        let (gift, dish, burner) = ("a1".repeat(32), "f1".repeat(32), "b1".repeat(32));
+        let mut book = KnockBook::default();
+        book.record_sent(SentKnock { parked: dish.clone(), payer: Some(burner.clone()), ..sent("H", 3, &gift, 100) });
+        book.save(&path).unwrap();
+        let loaded = KnockBook::load(&path);
+        assert_eq!(loaded, book);
+        let k = &loaded.sent[0];
+        assert_eq!((k.coin_id.as_str(), k.parked.as_str(), k.payer.as_deref()), (gift.as_str(), dish.as_str(), Some(burner.as_str())));
+        assert_eq!(WriteCoins::filed(&k.coin_id, &k.parked), Some(WriteCoins { parent: parse_hex32(&gift).unwrap(), parked: parse_hex32(&dish).unwrap() }));
+        // knocks.json as the build before this one writes it, and an entry
+        // older still that keeps only the fields that never had a default.
+        let coin = "c0".repeat(32);
+        let older = format!(
+            r#"{{
+  "sent": [
+    {{
+      "host": "H",
+      "room": "r",
+      "era": 3,
+      "hint": "ab",
+      "coin_id": "{coin}",
+      "memo": "{memo}",
+      "pushed_at": 100,
+      "confirmed_height": 0,
+      "last_rendezvous": 0,
+      "settled": false,
+      "spend": 7
+    }},
+    {{
+      "host": "G",
+      "room": "r",
+      "era": 3,
+      "hint": "ab",
+      "coin_id": "{coin}",
+      "pushed_at": 200
+    }}
+  ],
+  "inbox": []
+}}"#,
+            memo = "cd".repeat(32)
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = KnockBook::load(&path);
+        let then = SentKnock { memo: "cd".repeat(32), spend: Some(7), parked: String::new(), payer: None, ..sent("H", 3, &coin, 100) };
+        let oldest = SentKnock { memo: String::new(), parked: String::new(), payer: None, ..sent("G", 3, &coin, 200) };
+        assert_eq!(loaded.sent, vec![then, oldest], "loaded, with no parked input and no payer");
+        assert!(loaded.inbox.is_empty());
+        for k in &loaded.sent {
+            assert_eq!(WriteCoins::filed(&k.coin_id, &k.parked), parse_hex32(&coin).map(WriteCoins::one), "{}: read back as its one coin", k.host);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
