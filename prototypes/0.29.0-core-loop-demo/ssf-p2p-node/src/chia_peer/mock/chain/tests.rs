@@ -2073,9 +2073,10 @@ async fn a_node_listing_more_made_up_coins_of_one_spend_than_one_settling_takes_
     assert!(s.chain.unanswered().is_empty());
 }
 
-/// A node that leaves ids of the lookup by id unanswered after
-/// [`STATE_ROUNDS`] requests, here one that echoes none of the ids it is
-/// asked for and so makes no progress, is silent, as no honest node is for
+/// A node that leaves ids of the lookup by id unanswered, after
+/// [`STATE_ROUNDS`] requests or at the first request that answers none of
+/// those left, here one that echoes none of the ids it is asked for and so
+/// is asked once, is silent, as no honest node is for
 /// the coins one settling takes: the read has no verdict, that node's
 /// connection is dropped, a pin's too, as a silent peer's of any request
 /// is, nobody is let go, and the other node stays.

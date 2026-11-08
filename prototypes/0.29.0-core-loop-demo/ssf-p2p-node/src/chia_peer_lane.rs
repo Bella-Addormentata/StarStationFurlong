@@ -3043,8 +3043,9 @@ async fn settle_listing(
 /// honest connection alone.
 ///
 /// No verdict, and nobody let go, when:
-///   * a peer does not answer a round, leaves ids of the lookup unanswered
-///     after [`STATE_ROUNDS`] requests (an honest node answers up to
+///   * a peer does not answer a round, leaves ids of the lookup unanswered,
+///     after [`STATE_ROUNDS`] requests or at the first request that answers
+///     none of those left ([`states_on`]; an honest node answers up to
 ///     100,000 ids a request to a wallet peer, `max_subscribe_response_items`,
 ///     far more than [`MAX_DISPUTED_COINS`]), or cannot show its chain
 ///     inside a peak that stands still ([`anchored`]): each such peer is
@@ -3081,8 +3082,9 @@ async fn settle_listing(
 /// fairness lane, eight either way. A peer listing real coins outside the
 /// hint, which no answer tells from stale rows, costs a read at most that
 /// and changes no answer it gives: when every such coin is taken its rows
-/// are left out, nobody let go; otherwise the read has none, and its own
-/// connection is dropped beside the other's.
+/// are left out, nobody let go; otherwise the read has none, and every
+/// public connection of the pair is dropped, its own and the other's alike,
+/// a pin's never.
 async fn settle_disputed(
     lane: &Lane,
     answers: &[(Arc<PeerConn>, Page)],
