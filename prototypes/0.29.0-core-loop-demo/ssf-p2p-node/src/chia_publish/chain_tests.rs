@@ -23,9 +23,21 @@
 //! (`a_reorg_that_gives_the_dish_coin_to_another_claimer_has_the_write_built_again_from_another_coin`),
 //! and waits out a full mempool with no fee added
 //! (`a_full_mempool_holds_a_claim_and_write_and_it_lands_once_cleared_with_no_fee_added`).
-//! No test here calls the node's own writer (`claim_write::burner_write`),
-//! its fuse (`GIFT_FUSE`) or the flag, and none reads the process's
-//! network, so they run alike whatever network CI names.
+//!
+//! A listing the SSF wallet pays for goes through the money writer's own
+//! seam, [`publish_node_presence_on`], on the test's lease, network, chain
+//! and clock ([`Setup::money_listing`]): it names the wallet as its payer
+//! and the lease holds it for that wallet alone
+//! (`a_money_presence_write_files_the_wallet_as_its_payer_and_the_lease_holds_it_for_the_wallet`),
+//! and it keeps main's global check, waiting while any spend on its lease
+//! is parked
+//! (`a_money_presence_write_waits_while_any_spend_on_its_lease_is_parked_as_on_main`).
+//!
+//! No test here calls the node's own writers (`claim_write::burner_write`,
+//! [`publish_node_presence`] and the money writer it runs on the
+//! process-wide lease), the burner writer's fuse (`GIFT_FUSE`) or the flag,
+//! and none reads the process's network, so they run alike whatever
+//! network CI names.
 //!
 //! The presence mark, the beacon mark and a knock entry file a write whole
 //! (§4.4): its parent as their coin id, its parked input beside it and its
@@ -217,6 +229,18 @@ impl Setup {
         let at = self.later();
         let mut rng = StdRng::seed_from_u64(seed);
         sendable(burner_write_with(&self.lease, &self.fuse, NET, &self.money, at, key, era, hint, gate, body, &mut rng, "test")).await
+    }
+
+    /// `node`'s listing for `era`, sealed under [`CK`] with `entries` and
+    /// dated `now_unix`, written by the money writer's own seam
+    /// ([`publish_node_presence_on`]) on the test's lease, network and
+    /// chain, at the next instant ([`Self::later`]), and paid for by the
+    /// wallet key `payer`: the write the SSF wallet pays for, as the
+    /// heartbeat writes it with burner keys off. Its future is checked to be
+    /// `Send`, as the heartbeat's task needs it to be.
+    async fn money_listing(&mut self, payer: &SecretKey, node: &iroh::SecretKey, era: u64, entries: &[AddrEntry], now_unix: u64) -> Result<(Bytes32, MemoWrite)> {
+        let at = self.later();
+        sendable(publish_node_presence_on(&self.lease, NET, &self.money, move || at, node, payer, &CK, era, entries, now_unix)).await
     }
 
     /// The gifts the test's fuse counts against `era` ([`GiftFuse`]).
@@ -1372,13 +1396,14 @@ async fn a_reorg_drops_a_claim_and_write_and_the_lease_pushes_its_saved_two_spen
 }
 
 /// Stage 4 design §10, the mempool-full row, for a claim and write. A full
-/// mempool refuses its fee-0 bundle: F is handed back and no gift is
-/// counted. Once it clears, the write is built again, the same bundle with
-/// no fee added, and lands. A second burner's claim and write is taken,
-/// probed while it waits in the mempool, and then evicted from a full one,
-/// whose refusal is no final word: its dish coin stays parked, and the
-/// burner's next write waits. Once the mempool clears, the probe pushes the
-/// saved two-spend bundle, which lands as built.
+/// mempool refuses its fee-0 bundle, which reads as the chain busy
+/// ([`chain_busy`]) and is a refusal, not a wait: F is handed back and no
+/// gift is counted. Once it clears, the write is built again, the same
+/// bundle with no fee added, and lands. A second burner's claim and write
+/// is taken, probed while it waits in the mempool, and then evicted from a
+/// full one, whose refusal is no final word: its dish coin stays parked,
+/// and the burner's next write waits. Once the mempool clears, the probe
+/// pushes the saved two-spend bundle, which lands as built.
 #[tokio::test]
 async fn a_full_mempool_holds_a_claim_and_write_and_it_lands_once_cleared_with_no_fee_added() {
     let mut s = setup().await;
@@ -1392,6 +1417,9 @@ async fn a_full_mempool_holds_a_claim_and_write_and_it_lands_once_cleared_with_n
     let turned_away = s.burner_write(&key, 0, hint, None, move |_| Ok(first), 1).await;
     let why = refused(&turned_away).expect("every peer refused the push");
     assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO"), "{why}");
+    let e = turned_away.as_ref().err().expect("refused");
+    assert!(chain_busy(e), "the nodes' own refusal reads as the chain busy: {e:#}");
+    assert!(!is_typed_wait(e), "and is a refusal, not a wait (§10)");
     assert!(!s.lease.is_taken(&f.coin_id()), "a refusal hands F back");
     assert_eq!(s.gifts(0), 0, "a refused push counts no gift");
     assert!(s.chain.mempool().is_empty());
@@ -1764,6 +1792,99 @@ async fn a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_fro
         s.chain.farm_blocks(SETTLED_DEPTH).await;
         s.reconcile().await;
     }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.4, a write the SSF wallet pays for, through the money
+/// writer's own seam: wallet W's listing spends W's one coin to itself, fee
+/// 0, and names W as its payer, the payer the lease parked it under. Its
+/// mark files W's hex as the payer and the coin as both of its coins. While
+/// the bundle is in the mempool the lease holds it for W, as a parked spend
+/// and for a gift, and for no other wallet; once it lands it still holds it
+/// for W's gift while it settles, but not for W's next write. The resolver
+/// reads the record back under the era's hint, and the mark's own reader
+/// confirms it.
+#[tokio::test]
+async fn a_money_presence_write_files_the_wallet_as_its_payer_and_the_lease_holds_it_for_the_wallet() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(70), iroh::SecretKey::generate());
+    let (paid_by, other) = (Payer::of(&w), Payer::of(&wallet(71)));
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    s.chain.farm().await;
+    let at = unix_now();
+    let (hint, write) = s.money_listing(&w, &node, 0, &entries(), at).await.unwrap();
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_ck_hint(NET, &CK, 0)), "the era's listing hint under the contact key");
+    assert_eq!(write.payer, paid_by, "the wallet pays");
+    assert_eq!(write.coins, WriteCoins::one(coin.coin_id()), "its one coin, spent to itself");
+    assert!(write.acked);
+    assert_eq!(write.spend, s.lease.spend_of(&coin.coin_id()));
+    let bundle = s.chain.received().last().cloned().expect("the write was sent");
+    assert_eq!(s.chain.mempool(), vec![bundle.name()]);
+    assert_eq!(s.chain.fee_of(&bundle), 0, "a listing pays no fee");
+    assert_eq!(write.memo, memo_of(&bundle, hint));
+
+    let mark = NodePublishMark::written(0, 1, "a".into(), at, hint, &write, node.public().to_string());
+    let (one, w_hex) = (hex::encode(coin.coin_id()), paid_by.hex());
+    assert_eq!(
+        (mark.coin_id.as_str(), mark.parked.as_str(), mark.payer.as_deref()),
+        (one.as_str(), one.as_str(), Some(w_hex.as_str())),
+        "the mark files the one coin as both, and the wallet as its payer"
+    );
+    assert!(s.lease.outgoing_pending_for(paid_by) && s.lease.holds_for(paid_by), "parked for the wallet");
+    assert!(!s.lease.outgoing_pending_for(other) && !s.lease.holds_for(other), "and for no other wallet");
+
+    let landed = s.chain.farm().await;
+    let found = read_ck(NET, &s.carrier, &CK, landed, unix_now(), &mut HashMap::new()).await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].record.node_id, node.public().to_string());
+    assert_eq!((found[0].coin_id, found[0].confirmed_height, found[0].hint), (written(&w, coin).coin_id(), landed, hint));
+    s.reconcile().await;
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "its mark's reader confirms it");
+    assert!(s.lease.is_settling(&coin.coin_id()));
+    assert!(s.lease.holds_for(paid_by) && !s.lease.outgoing_pending_for(paid_by), "settling: held for a gift, not for the next write");
+    assert!(!s.lease.holds_for(other));
+    assert_eq!(s.sent(), HashSet::from([bundle.name()]), "one write");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The money writer keeps main's global check on the lease it is given: a
+/// spend of any payer still parked holds a write the SSF wallet pays for
+/// (`publish_memo_on`, stage 4 design §4.3 T4 for the spacing that will
+/// replace it). A burner's claim and write is live in the mempool, its dish
+/// coin parked under the burner. Wallet W's listing then waits, as the
+/// settling wallet's write always did: nothing new is sent, since the
+/// reconciliation's probe pushes the burner's own bundle again, and W's
+/// coin is not taken. Once the burner's write lands, W's listing goes out.
+#[tokio::test]
+async fn a_money_presence_write_waits_while_any_spend_on_its_lease_is_parked_as_on_main() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(70), iroh::SecretKey::generate());
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let (f, _) = ready_dish(&s, 1).await;
+    let key = burner(72, 0);
+    let hint = Bytes32::new([0x5a; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a burner's record, live in the mempool".to_vec()), 1).await.unwrap();
+    assert_eq!(first.coins.parked, f.coin_id());
+    let live = s.chain.received().last().cloned().expect("the burner's write was sent");
+    assert_eq!(s.chain.mempool(), vec![live.name()]);
+    assert!(!s.lease.outgoing_pending_for(Payer::of(&w)), "nothing of the wallet's is parked");
+    let pushes = s.chain.acks_for(live.name()).len();
+
+    let held = s.money_listing(&w, &node, 0, &entries(), unix_now()).await.err().expect("the listing waits");
+    assert_eq!(held.downcast_ref::<MemoWait>(), Some(&MemoWait::Settling("presence".into())), "{held:#}");
+    assert!(is_typed_wait(&held));
+    assert!(s.chain.acks_for(live.name()).len() > pushes, "the probe pushed the burner's bundle again");
+    assert_eq!(s.sent(), HashSet::from([live.name()]), "nothing new sent");
+    assert_eq!(s.chain.mempool(), vec![live.name()]);
+    assert!(s.lease.is_parked(&f.coin_id()), "the burner's spend is live, parked");
+    assert!(!s.lease.is_taken(&coin.coin_id()), "the wallet's coin is not taken");
+    assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "and is unspent");
+
+    s.chain.farm().await;
+    let (_, write) = s.money_listing(&w, &node, 0, &entries(), unix_now()).await.unwrap();
+    assert_eq!((write.coins, write.payer), (WriteCoins::one(coin.coin_id()), Payer::of(&w)), "the burner's spend landed: the listing goes out");
+    assert_eq!(s.sent().len(), 2);
     assert!(s.chain.unanswered().is_empty());
 }
 

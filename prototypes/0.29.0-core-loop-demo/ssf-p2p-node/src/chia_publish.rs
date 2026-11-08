@@ -696,7 +696,7 @@ impl WalletLease {
     /// gating or a bundle of its own recognised by its outputs, and the coins
     /// [`WalletLease::is_taken`] holds stay out of its reach whatever this
     /// says. Callers hold the gate after a reconciliation, as
-    /// [`publish_memo_with`] does around the global check.
+    /// [`publish_memo_on`] does around the global check.
     ///
     /// The claim-and-write's writer asks it of the burner it writes for
     /// (`claim_write::burner_write_with`, design §13 row 9): before any
@@ -1553,9 +1553,21 @@ pub async fn find_spendable_coin(
     client: &impl ChainAccess,
     puzzle_hash: Bytes32,
 ) -> Result<Option<crate::chia_faucet::FaucetCoin>> {
+    find_spendable_coin_on(&WALLET_LEASE, client, puzzle_hash).await
+}
+
+/// [`find_spendable_coin`] against a given lease: the process-wide one in
+/// production, a test's own on the mock chain. The coins skipped are the
+/// ones `lease` holds, so a writer on that lease never takes a coin its own
+/// spends still hold.
+pub async fn find_spendable_coin_on(
+    lease: &WalletLease,
+    client: &impl ChainAccess,
+    puzzle_hash: Bytes32,
+) -> Result<Option<crate::chia_faucet::FaucetCoin>> {
     let listing = crate::chia_faucet::unspent_at(client, puzzle_hash).await?;
     let mut coins: Vec<crate::chia_faucet::FaucetCoin> =
-        listing.coins.into_iter().filter(|c| !WALLET_LEASE.is_taken(&c.coin.coin_id())).collect();
+        listing.coins.into_iter().filter(|c| !lease.is_taken(&c.coin.coin_id())).collect();
     if coins.is_empty() && listing.partial {
         eprintln!(
             "⛓️ wallet: no free coin in the first {} pages at {puzzle_hash}; the listing was cut short, so there may be one further on",
@@ -2148,6 +2160,12 @@ pub fn presence_status(
 /// caller files it as pending and lets the chain's word settle it
 /// ([`presence_step`]), as the knock and beacon writers do. The hint and the
 /// seal are `net`'s ([`presence_memo`]).
+///
+/// It runs [`publish_node_presence_on`] on the process-wide lease, the
+/// process's money lane and the wall clock, read where the lease is
+/// reconciled, as it always was. Building the lane's handle first reads
+/// nothing ([`crate::chia_chain::connect`] does no I/O), so the lease's
+/// checks, their order and their errors are the same as before.
 pub async fn publish_node_presence(
     net: crate::chia_network::ChiaNet,
     iroh_sk: &iroh::SecretKey,
@@ -2157,8 +2175,31 @@ pub async fn publish_node_presence(
     entries: &[AddrEntry],
     now: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
-    let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now)?;
-    let write = publish_memo(chia_sk, hint, sealed, "presence").await?;
+    let client = crate::chia_chain::connect();
+    publish_node_presence_on(&WALLET_LEASE, net, &client, Instant::now, iroh_sk, chia_sk, ck, era, entries, now).await
+}
+
+/// [`publish_node_presence`] on a given lease, network, chain and clock (the
+/// tests' own on the mock chain): the record sealed for `era` on `net`
+/// ([`presence_memo`]), then written by [`publish_memo_on`], paid for by the
+/// wallet key `chia_sk`, which the write names as its payer
+/// ([`Payer::of`], stage 4 design §4.4). `now` is read once, where the lease
+/// is reconciled. `now_unix` dates the record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_node_presence_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    now: impl FnOnce() -> Instant,
+    iroh_sk: &iroh::SecretKey,
+    chia_sk: &SecretKey,
+    ck: &[u8; 32],
+    era: u64,
+    entries: &[AddrEntry],
+    now_unix: u64,
+) -> Result<(Bytes32, MemoWrite)> {
+    let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now_unix)?;
+    let write = publish_memo_on(lease, net, client, now, chia_sk, hint, None, move |_| Ok(sealed), "presence").await?;
     Ok((hint, write))
 }
 
@@ -2269,6 +2310,13 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
 /// lookups, so a room's word that changed while the spend was prepared is seen
 /// (`body` answers [`Withdrawn`]) and no cap can land between that check and
 /// the push — the card gate's own contract (#272 review round 5).
+///
+/// It runs [`publish_memo_on`] on the process-wide lease, the process's
+/// network and money lane, and the wall clock, read where the lease is
+/// reconciled, as it always was. Building the lane's handle before the
+/// lease's gate reads nothing ([`crate::chia_chain::connect`] does no I/O),
+/// so the lease's checks, their order and their errors are the same as
+/// before.
 async fn publish_memo_with(
     payer: &SecretKey,
     hint: Bytes32,
@@ -2276,27 +2324,53 @@ async fn publish_memo_with(
     body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
     what: &str,
 ) -> Result<MemoWrite> {
-    let _lease = WALLET_LEASE.lock().await;
-    WALLET_LEASE.ensure_open()?;
     let client = crate::chia_chain::connect();
-    WALLET_LEASE.reconcile(&client).await;
-    if WALLET_LEASE.outgoing_pending() {
+    publish_memo_on(&WALLET_LEASE, crate::chia_network::net(), &client, Instant::now, payer, hint, gate, body, what).await
+}
+
+/// [`publish_memo_with`] on a given lease, network, chain and clock: the
+/// process-wide ones in production, a test's own on the mock chain. `now`
+/// is read once, when the lease is reconciled
+/// ([`WalletLease::reconcile_at`]). The checks are the money writer's, in
+/// its order: the lease's gate, the lease open, the reconciliation, the
+/// global check that no spend on `lease` is still settling, whatever its
+/// payer ([`WalletLease::outgoing_pending`], kept on purpose until the
+/// burner writers space their payers, stage 4 design §4.3 T4), then the
+/// payer's largest coin `lease` does not hold ([`find_spendable_coin_on`]).
+/// The spend is parked on `lease` under [`Payer::of`] `payer`, which the
+/// write names (§4.4).
+#[allow(clippy::too_many_arguments)]
+async fn publish_memo_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    now: impl FnOnce() -> Instant,
+    payer: &SecretKey,
+    hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    what: &str,
+) -> Result<MemoWrite> {
+    let _lease = lease.lock().await;
+    lease.ensure_open()?;
+    lease.reconcile_at(net, client, now()).await;
+    if lease.outgoing_pending() {
         return Err(MemoWait::Settling(what.to_string()).into());
     }
     let our_ph = our_puzzle_hash(payer);
-    let coin = find_spendable_coin(&client, our_ph).await?.ok_or(MemoWait::Unfunded(our_ph))?;
+    let coin = find_spendable_coin_on(lease, client, our_ph).await?.ok_or(MemoWait::Unfunded(our_ph))?;
     let input = coin.coin.coin_id();
     let _gate = match gate {
         Some(gate) => Some(gate.lock().await),
         None => None,
     };
-    let (bundle, memo) = memo_bundle(crate::chia_network::net(), payer, coin.coin, hint, body(input)?)?;
+    let (bundle, memo) = memo_bundle(net, payer, coin.coin, hint, body(input)?)?;
     // The spend's number is the lease's for its PARKED input, the coin it holds.
     let coins = WriteCoins::one(input);
     // The payer the input is parked under is the one the write names.
     let paid_by = Payer::of(payer);
-    match push_parked(&client, paid_by, bundle, [(input, coin.confirmed_height)]).await {
-        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked), memo, payer: paid_by }),
+    match push_parked_with(lease, client, paid_by, bundle, [(input, coin.confirmed_height)]).await {
+        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: lease.spend_of(&coins.parked), memo, payer: paid_by }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
         // pending and lets the chain's word settle it — filed as a failure it
@@ -2304,7 +2378,7 @@ async fn publish_memo_with(
         // coin (#272 review).
         Err(PushError::Unanswered(e)) => {
             eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
-            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked), memo, payer: paid_by })
+            Ok(MemoWrite { coins, acked: false, spend: lease.spend_of(&coins.parked), memo, payer: paid_by })
         }
         Err(e) => Err(e.into()),
     }
@@ -2419,7 +2493,9 @@ pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
 /// wallet unfunded or still settling, no dish coin ready, the lease not
 /// parking, the chain unread) is none, and the knock arm tries again after
 /// [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]); every other failure, a push
-/// the peers refused among them, is one ([`knock_attempt_counts`]).
+/// the peers refused among them, is one ([`knock_attempt_counts`]). A push
+/// refused because the chain is busy ([`chain_busy`]) is such a refusal, and
+/// uses one (§10: a first push refused for its fee is a rejection).
 pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 
 /// Whether `e` is a wait rather than a failure (stage 4 design §5.2, §10):
@@ -2454,6 +2530,76 @@ fn is_typed_wait(e: &anyhow::Error) -> bool {
     })
 }
 
+/// The name a full node gives a bundle whose fee its full mempool will not
+/// take: every SSF write pays a fee of 0, so this is what a busy chain
+/// answers it (stage 4 design §10, Mempool full; that a full mempool refuses
+/// fee 0 is the design's inference). The mock chain's full mempool answers
+/// it too (`MockChain::set_full`).
+const FEE_TOO_CLOSE_TO_ZERO: &str = "INVALID_FEE_TOO_CLOSE_TO_ZERO";
+
+/// Whether a push every peer refused with `reason` was refused only because
+/// the chain is busy (stage 4 design §10, Mempool full). `reason` is the
+/// peers' reasons as the lane joins them, one per peer, separated by "; "
+/// (`chia_peer_lane::push_verdict`). It is busy only when every peer's
+/// reason names [`FEE_TOO_CLOSE_TO_ZERO`]: a peer that gave any other
+/// reason, a final one such as a lost race's DOUBLE_SPEND or a policy one
+/// such as UNKNOWN_UNSPENT, says the push may fail for more than the chain
+/// being busy, and the refusal is read as it always was, by its own text.
+/// Another fee code is not read as busy either.
+fn refusal_is_chain_busy(reason: &str) -> bool {
+    reason.split("; ").all(|peer| peer.contains(FEE_TOO_CLOSE_TO_ZERO))
+}
+
+/// Whether `e` is a push every peer refused because the chain is busy
+/// ([`refusal_is_chain_busy`]): somewhere in its chain is a
+/// [`PushError::Rejected`] for that reason alone. It is still a refusal, and
+/// so no wait ([`is_typed_wait`]): a first push refused for its fee is a
+/// rejection (stage 4 design §10), its input handed back, and a knock it
+/// refuses uses an attempt (§5.2). Only the words change, with burner keys
+/// on ([`knock_failure_words`], [`beacon_failure_line`]).
+fn chain_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| matches!(cause.downcast_ref::<PushError>(), Some(PushError::Rejected(why)) if refusal_is_chain_busy(why)))
+}
+
+/// How a log line names a push refused because the chain is busy
+/// ([`chain_busy`]), in place of the peers' own reasons. It names no key,
+/// hash or address.
+const CHAIN_BUSY_WORDS: &str = "the chain is busy (a full mempool refused its zero fee)";
+
+/// Why a knock failed with `e`, in the knock arm's failure line
+/// ([`knock_failed`]): with burner keys on (`burners`), a push refused
+/// because the chain is busy reads [`CHAIN_BUSY_WORDS`] (stage 4 design
+/// §10), and it still uses an attempt (§5.2). Every other failure, and
+/// every failure with burner keys off, reads `e`'s own text, as on main.
+fn knock_failure_words(burners: bool, e: &anyhow::Error) -> String {
+    if burners && chain_busy(e) {
+        CHAIN_BUSY_WORDS.to_string()
+    } else {
+        format!("{e:#}")
+    }
+}
+
+/// The beacon arm's line for the era `era` beacon's write that failed with
+/// `e`. With burner keys on (`burners`), a push refused because the chain
+/// is busy ([`chain_busy`]) says the beacon waits and that waiting costs
+/// nothing (stage 4 design §10, Mempool full): the refused push paid
+/// nothing, and the arm tries again on its retry cadence, as after every
+/// failure. Every other failure, and every failure with burner keys off,
+/// gets the line it always had, word for word.
+fn beacon_failure_line(burners: bool, era: u64, e: &anyhow::Error) -> String {
+    if burners && chain_busy(e) {
+        format!(
+            "⛓️ ChiaHub beacon: the era {era} beacon waits — {CHAIN_BUSY_WORDS}; waiting costs nothing (retry in {} min)",
+            HEARTBEAT_RETRY_SECS / 60
+        )
+    } else {
+        format!(
+            "⛓️ ChiaHub beacon: publish for era {era} failed: {e:#} (retry in {} min; the beacon wallet is funded separately)",
+            HEARTBEAT_RETRY_SECS / 60
+        )
+    }
+}
+
 /// Whether a knock that failed with `e` uses one of its
 /// [`MAX_KNOCK_ATTEMPTS`]. With burner keys off (`burners` false) every
 /// failure does, so the knock arm is today's. With them on, a wait
@@ -2484,7 +2630,9 @@ fn knock_paced(wait: Option<Instant>, now: Instant) -> bool {
 /// failure with them off, uses an attempt: the request goes back in the
 /// queue while it has attempts left and is dropped after its
 /// [`MAX_KNOCK_ATTEMPTS`]th, `wait` left as it was, so with burner keys off
-/// the arm is main's. Each case says so in the log.
+/// the arm is main's. Each case says so in the log, a failure in
+/// [`knock_failure_words`]: with burner keys on, a push refused because the
+/// chain is busy is named so, and uses an attempt like any refusal.
 fn knock_failed(burners: bool, mut req: KnockRequest, e: &anyhow::Error, now: Instant, queue: &mut std::collections::VecDeque<KnockRequest>, wait: &mut Option<Instant>) {
     if !knock_attempt_counts(burners, e) {
         *wait = Some(now);
@@ -2498,12 +2646,13 @@ fn knock_failed(burners: bool, mut req: KnockRequest, e: &anyhow::Error, now: In
         return;
     }
     req.attempts = req.attempts.saturating_add(1);
+    let why = knock_failure_words(burners, e);
     if req.attempts < MAX_KNOCK_ATTEMPTS {
-        eprintln!("⛓️ ChiaHub knock: knock on {} for room {} failed: {e:#} (retry next tick)", short(&req.host), req.room);
+        eprintln!("⛓️ ChiaHub knock: knock on {} for room {} failed: {why} (retry next tick)", short(&req.host), req.room);
         queue.push_back(req);
     } else {
         eprintln!(
-            "⛓️ ChiaHub knock: knock on {} for room {} failed {} times: {e:#} — dropped; the next dial exhaustion asks again",
+            "⛓️ ChiaHub knock: knock on {} for room {} failed {} times: {why} — dropped; the next dial exhaustion asks again",
             short(&req.host),
             req.room,
             req.attempts
@@ -3080,7 +3229,8 @@ pub async fn heartbeat_loop(
     // watcher is not told to read this node's own listing for it.
     let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
     // Burner keys on for this run (SSF_CHIA_BURNERS=1 on a test network): in
-    // the heartbeat they change only the knock rule (stage 4 design §5.2).
+    // the heartbeat they change only the knock rule (stage 4 design §5.2)
+    // and the words the knock and beacon lines give a busy chain (§10).
     let burners = burners_enabled();
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
@@ -3559,10 +3709,8 @@ pub async fn heartbeat_loop(
                             );
                             beacon_mark = Some(mark);
                         }
-                        Err(e) => eprintln!(
-                            "⛓️ ChiaHub beacon: publish for era {era} failed: {e:#} (retry in {} min; the beacon wallet is funded separately)",
-                            HEARTBEAT_RETRY_SECS / 60
-                        ),
+                        // With burner keys off, the line it always had.
+                        Err(e) => eprintln!("{}", beacon_failure_line(burners, era, &e)),
                     }
                     continue; // one spend per tick
                 }
@@ -6321,6 +6469,10 @@ mod tests {
         assert_eq!(unfunded.to_string(), format!("{unfunded:#}"), "one line either way");
     }
 
+    /// The [`knock_failures`] row of a push every peer refused for its fee
+    /// alone: the chain busy ([`chain_busy`]), and still a failure.
+    const BUSY: &str = "a push every peer refused for its fee, the chain busy";
+
     /// Real errors of each kind a knock can fail with, as the code that
     /// fails makes them where a test can reach it: the waits of stage 4
     /// design §5.2 first, then the failures. The chain's are read from a
@@ -6333,7 +6485,10 @@ mod tests {
     /// claim_write's own tests reach on a chain with no peak, and to a push
     /// every peer refused. A broken burner rule is the rule checker's own
     /// refusal (`check_burner_spends`), since the seam builds only from
-    /// inputs that keep the rules.
+    /// inputs that keep the rules. Two of the pushes refused carry two
+    /// peers' reasons, joined as the lane joins them: both for the fee,
+    /// which is the chain being busy ([`BUSY`], §10), and one for each of a
+    /// lost race and the fee.
     async fn knock_failures(test: &str) -> (Vec<(&'static str, anyhow::Error)>, Vec<(&'static str, anyhow::Error)>) {
         use super::claim_write::{check_burner_spends, BurnerRule, BurnerWait};
         use crate::chia_chain::testing::{Scripted, Unanswering};
@@ -6370,13 +6525,14 @@ mod tests {
             ("the lease sealed", sealed.ensure_open().unwrap_err().into()),
             ("the lease sealed, at the push", push_parked_with(&sealed, &Unanswering, money(), empty(), [coin]).await.unwrap_err().into()),
             ("the lease unsaved, at the push", push_parked_with(&unsaved, &Unanswering, money(), empty(), [coin]).await.unwrap_err().into()),
-            ("the wallet's listing unread", find_spendable_coin(&Unanswering, Bytes32::new([0xa1; 32])).await.unwrap_err()),
+            ("the wallet's listing unread", find_spendable_coin_on(&WalletLease::new(), &Unanswering, Bytes32::new([0xa1; 32])).await.unwrap_err()),
             ("the peak unread", Unanswering.peak_height().await.unwrap_err().into()),
             ("a wait under a context", anyhow::Error::from(MemoWait::Unfunded(Bytes32::new([0xa1; 32]))).context("knock on H")),
         ];
         let failures: Vec<(&'static str, anyhow::Error)> = vec![
             ("a push every peer refused, a lost race", PushError::Rejected("addr: DOUBLE_SPEND".into()).into()),
-            ("a push refused for its fee", PushError::Rejected("INVALID_FEE_TOO_CLOSE_TO_ZERO".into()).into()),
+            (BUSY, PushError::Rejected("a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into()).into()),
+            ("a push one peer refused as spent and one for its fee", PushError::Rejected("a: DOUBLE_SPEND; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into()).into()),
             ("a host card whose key cannot be sealed to", knock_memo(T11, &iroh_sk, &host, &[6u8; 32], 0, coin, None, 1_791_700_000).unwrap_err()),
             ("a burner rule the bundle breaks", check_burner_spends(T11, nobody, &[]).unwrap_err().into()),
             ("a burner paying more than itself", BurnerRule::R5.into()),
@@ -6392,31 +6548,105 @@ mod tests {
     /// chain unread) uses no attempt, and every other failure uses one, a
     /// push every peer refused and a host card that can never be sealed to
     /// among them, so a request that can never leave is still dropped after
-    /// its attempts.
+    /// its attempts. A push refused because the chain is busy is such a
+    /// refusal (§10: a first push refused for its fee is a rejection): it
+    /// uses an attempt, and only its words say the chain is busy. No other
+    /// row reads as busy, the push one peer refused as spent among them.
     #[tokio::test]
     async fn with_burners_on_a_knock_that_only_waits_uses_no_attempt_and_every_other_failure_uses_one() {
         let (waits, failures) = knock_failures("on").await;
         let named = |list: &[(&str, anyhow::Error)], name: &str| list.iter().find(|(what, _)| *what == name).map(|(_, e)| format!("{e:#}")).unwrap();
         assert!(named(&failures, "a host card whose key cannot be sealed to").contains("low-order point"), "the seal's own error");
         assert!(named(&waits, "the dish's listing unread").starts_with("coin lookup: unanswered"), "the listing's own error");
+        assert!(failures.iter().any(|(what, _)| *what == BUSY), "the busy row is among the failures");
         for (what, e) in &waits {
             assert!(is_typed_wait(e), "{what} is a wait: {e:#}");
             assert!(!knock_attempt_counts(true, e), "{what} uses no attempt: {e:#}");
+            assert!(!chain_busy(e), "{what} is not the chain busy: {e:#}");
         }
         for (what, e) in &failures {
             assert!(!is_typed_wait(e), "{what} is no wait: {e:#}");
             assert!(knock_attempt_counts(true, e), "{what} uses an attempt: {e:#}");
+            assert_eq!(chain_busy(e), *what == BUSY, "{what}: {e:#}");
+            let words = if *what == BUSY { CHAIN_BUSY_WORDS.to_string() } else { format!("{e:#}") };
+            assert_eq!(knock_failure_words(true, e), words, "{what}");
         }
     }
 
     /// With burner keys off, every knock failure uses an attempt, waits and
-    /// all, as it always did: the knock arm is main's.
+    /// all, as it always did, and its line gives the error's own text, a
+    /// busy chain's included: the knock arm is main's.
     #[tokio::test]
     async fn with_burners_off_every_knock_failure_uses_an_attempt_as_before() {
         let (waits, failures) = knock_failures("off").await;
         for (what, e) in waits.iter().chain(&failures) {
             assert!(knock_attempt_counts(false, e), "{what}: {e:#}");
+            assert_eq!(knock_failure_words(false, e), format!("{e:#}"), "{what}");
         }
+    }
+
+    /// Stage 4 design §10, Mempool full: a push every peer refused with
+    /// INVALID_FEE_TOO_CLOSE_TO_ZERO, the fee-0 refusal of a full mempool, is
+    /// the chain busy, one peer's or two peers' reasons as the lane joins
+    /// them, and under a writer's context. A refusal in which any peer gave
+    /// another reason is not: a lost race's DOUBLE_SPEND, a peer behind the
+    /// input's block, a mempool conflict, another fee code, or no reason at
+    /// all. Nor is anything but a refusal: a wait, a push unanswered or not
+    /// sent, or a dry dish.
+    #[test]
+    fn a_full_mempools_fee_refusal_is_the_chain_busy_and_nothing_else_is() {
+        use super::claim_write::BurnerWait;
+        assert!(refusal_is_chain_busy("203.0.113.5:58444: INVALID_FEE_TOO_CLOSE_TO_ZERO"));
+        assert!(refusal_is_chain_busy("a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: INVALID_FEE_TOO_CLOSE_TO_ZERO"), "both peers' mempools full");
+        for not_busy in [
+            "a: DOUBLE_SPEND; b: INVALID_FEE_TOO_CLOSE_TO_ZERO",
+            "a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: DOUBLE_SPEND",
+            "a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: UNKNOWN_UNSPENT",
+            "a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: MEMPOOL_CONFLICT",
+            "x: INVALID_FEE_LOW_FEE",
+            "x: UNKNOWN_UNSPENT",
+            "x: DOUBLE_SPEND",
+            "",
+        ] {
+            assert!(!refusal_is_chain_busy(not_busy), "{not_busy:?} is not the chain busy");
+        }
+
+        let busy = || anyhow::Error::from(PushError::Rejected("a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into()));
+        assert!(chain_busy(&busy()));
+        assert!(chain_busy(&busy().context("presence")), "read through a writer's context");
+        assert!(!is_typed_wait(&busy()), "a refusal, not a wait (§10: a first push refused for its fee is a rejection)");
+        let lost = anyhow::Error::from(PushError::Rejected("a: DOUBLE_SPEND; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into()));
+        assert!(!chain_busy(&lost));
+        let others: Vec<(&str, anyhow::Error)> = vec![
+            ("the wallet still settling", MemoWait::Settling("presence".into()).into()),
+            ("a push unanswered", PushError::Unanswered(anyhow!("timed out")).into()),
+            ("a push not sent", PushError::NotSent(LeaseError::Sealed("unreadable".into())).into()),
+            ("no lobby coin for a burner", BurnerWait::NoCoinReady.into()),
+            ("an untyped error naming the code", anyhow!("x: INVALID_FEE_TOO_CLOSE_TO_ZERO")),
+        ];
+        for (what, e) in &others {
+            assert!(!chain_busy(e), "{what}: {e:#}");
+        }
+    }
+
+    /// The beacon arm's failure line (stage 4 design §10): with burner keys
+    /// on, a push refused because the chain is busy says the beacon waits and
+    /// that waiting costs nothing, and names no peer's reason; any other
+    /// failure, and every failure with burner keys off, gets the line the
+    /// beacon always had, word for word.
+    #[test]
+    fn the_beacon_line_says_the_chain_is_busy_only_with_burner_keys_on() {
+        let busy = anyhow::Error::from(PushError::Rejected("a: INVALID_FEE_TOO_CLOSE_TO_ZERO; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into())).context("beacon");
+        let lost = anyhow::Error::from(PushError::Rejected("a: DOUBLE_SPEND; b: DOUBLE_SPEND".into())).context("beacon");
+        let main = |e: &anyhow::Error| format!("⛓️ ChiaHub beacon: publish for era 7 failed: {e:#} (retry in 5 min; the beacon wallet is funded separately)");
+        assert_eq!(
+            beacon_failure_line(true, 7, &busy),
+            "⛓️ ChiaHub beacon: the era 7 beacon waits — the chain is busy (a full mempool refused its zero fee); waiting costs nothing (retry in 5 min)"
+        );
+        assert_eq!(beacon_failure_line(false, 7, &busy), main(&busy), "burner keys off: main's line");
+        assert_eq!(beacon_failure_line(true, 7, &lost), main(&lost), "a lost race: main's line");
+        assert_eq!(beacon_failure_line(false, 7, &lost), main(&lost));
+        assert!(main(&busy).contains("INVALID_FEE_TOO_CLOSE_TO_ZERO"), "main's line gives the peers' reasons");
     }
 
     /// A knock that waited rests the knock arm for the retry cadence, not a
