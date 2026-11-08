@@ -761,7 +761,7 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
             // review): a dropped knock's coin is the next write's input. The
             // lease is asked FIRST, the chain after, so a knock confirming in
             // between is seen by the lookups and never read as dropped. Each
-            // verdict names its entry by input coin AND hint (#272 review round
+            // verdict names its entry by coin id AND hint (#272 review round
             // 4): a dropped knock's input is released to the next write, which
             // may be another knock, so two entries can share a coin. An input
             // spent with no child under the hint is the coin's going to another

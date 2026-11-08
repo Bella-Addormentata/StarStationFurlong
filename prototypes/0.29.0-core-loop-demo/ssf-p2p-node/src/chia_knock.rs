@@ -389,10 +389,13 @@ impl KnockBook {
     /// and the clock follows (#272 review round 7): a clock not yet dialed on
     /// moves whole, one already dialed on keeps the peak it was last planned
     /// at, and its next boundary is counted from the new height above that. An
-    /// entry is named by BOTH (#272 review round 4): a dropped knock's input is
-    /// released to the next write, which may be another knock to another host,
-    /// so two entries can share an input coin — their hints tell them apart.
-    /// Returns true when something changed.
+    /// entry is named by BOTH its coin id, the parent of the knock's coin
+    /// ([`SentKnock::coin_id`]: the gift g for a burner's first knock, the
+    /// input itself for every other, stage 4 design §4.4), and its hint (#272
+    /// review round 4): a dropped knock's input is released to the next
+    /// write, which may be another knock to another host, so two entries can
+    /// share a coin id — their hints tell them apart. Returns true when
+    /// something changed.
     pub fn confirm_sent(&mut self, coin_id: &str, hint: &str, height: u32) -> bool {
         let mut changed = false;
         for k in self.sent.iter_mut().filter(|k| k.coin_id == coin_id && k.hint == hint && k.confirmed_height != height) {
@@ -424,7 +427,7 @@ impl KnockBook {
     /// A knock of ours that never counts — the chain confirmed it OUTSIDE its
     /// era (the host's reader rejects it, so nobody dials back), or its spend
     /// never landed ([`crate::chia_resolve::WriteStanding::Dead`]): forgotten,
-    /// the next dial exhaustion knocks again. Named by input coin AND hint, as
+    /// the next dial exhaustion knocks again. Named by coin id AND hint, as
     /// [`Self::confirm_sent`]. Returns true when one went.
     pub fn drop_sent(&mut self, coin_id: &str, hint: &str) -> bool {
         let before = self.sent.len();

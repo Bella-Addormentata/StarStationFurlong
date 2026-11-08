@@ -27,6 +27,15 @@
 //! its fuse (`GIFT_FUSE`) or the flag, and none reads the process's
 //! network, so they run alike whatever network CI names.
 //!
+//! The presence mark, the beacon mark and a knock entry file a write whole
+//! (§4.4): its parent as their coin id, its parked input beside it and its
+//! payer. A burner's first write filed there is judged by the marks' own
+//! readers on the test's lease and network, g under the hint and F as its
+//! input
+//! (`a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_dish_coin_as_input_and_its_rewrite_by_its_one_coin`),
+//! and dies with F
+//! (`a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_from_its_mark_once_settled_and_pending_for_ever_without_its_parked_input`).
+//!
 //! What has no seam yet is left for the burner writers of §13 row 10, under
 //! the names they will carry:
 //! `a_rewrite_spends_the_listing_burners_coin_and_the_next_era_writes_from_the_next_burner`,
@@ -42,7 +51,7 @@ use std::sync::Arc;
 use super::claim_write::{build_burner_bundle, burner_write_with, BurnerInput, BurnerWait, GiftFuse};
 use crate::chia_burner::{BurnerKey, BurnerRoot, MoneyKey};
 use crate::chia_faucet::{claim_spend, claim_to, dish_claim, FaucetCoin, FaucetParams, GAP_BLOCKS, GIFT_MOJOS, MAX_FAUCET_PAGES};
-use crate::chia_knock::SETTLED_DEPTH;
+use crate::chia_knock::{KnockBook, SETTLED_DEPTH};
 use crate::chia_peer::mock::chain::{MockChain, FAILED};
 use crate::chia_peer::mock::MockNode;
 use crate::chia_peer_lane::{Lane, PeerLane, Trust};
@@ -912,7 +921,10 @@ async fn a_foreign_spend_of_a_coin_our_write_holds_is_seen_as_another_spend_of_o
 /// never took the old block has no stale row, and a lane on it and on one
 /// that did settles the coin only the one lists by its id and its parent's
 /// spend, which carries the other hint: the row is stale, the write absent,
-/// and neither node is let go.
+/// and neither node is let go. The write's mark files its one coin as its
+/// parked input too, and the wallet as its payer (stage 4 design §4.4); the
+/// same mark as an older node saved it, with neither, is judged the same at
+/// every step.
 #[tokio::test]
 async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the_write_the_old_fork_held() {
     let mut s = setup().await;
@@ -932,8 +944,15 @@ async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the
     assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     let write = MemoWrite { coins: WriteCoins::one(coin.coin_id()), acked: true, spend: Some(spend), memo, payer: Payer::of(&payer) };
     let made = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
+    // The mark files the write's one coin as its parked input too, and the
+    // wallet that paid as its payer (stage 4 design §4.4). The same mark as
+    // an older node saved it, with neither, is judged the same at every step.
+    let one = hex::encode(coin.coin_id());
+    assert_eq!((made.coin_id.as_str(), made.parked.as_str(), made.payer.clone()), (one.as_str(), one.as_str(), Some(Payer::of(&payer).hex())));
+    let older = |mark: &NodePublishMark| NodePublishMark { parked: String::new(), payer: None, ..mark.clone() };
     let word = presence_standing_on(&s.lease, NET, &s.money, &made).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)));
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &older(&made)).await, word, "an older node's mark of it, judged as before");
     let PresenceStep::Save(mark) = presence_step(&made, word, 0, landed) else { panic!("confirmed: saved") };
     assert!(mark.chain_seen && mark.confirmed_height == landed && mark.memo == hex::encode(memo), "{mark:?}");
 
@@ -968,6 +987,7 @@ async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word, Some((WriteStanding::Pending, true)), "the coin under the hint carries the other write");
     assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleSolution) - asked, 2, "the parent's spend, of each node once");
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &older(&mark)).await, word, "an older node's mark of it, judged as before");
     let PresenceStep::Save(again) = presence_step(&mark, word, 0, peak) else { panic!("pending again: saved") };
     assert!(!again.chain_seen && again.confirmed_height == 0, "{again:?}");
     assert_eq!(s.standing(hint, coin.coin_id(), spend).await, WriteStanding::Pending, "an older node's mark, by the hint alone, is not confirmed either");
@@ -982,6 +1002,10 @@ async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the
     s.chain.farm_blocks(SETTLED_DEPTH).await;
     assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
     assert!(!s.lease.holds_spend(spend));
+    let word = presence_standing_on(&s.lease, NET, &s.money, &again).await;
+    assert_eq!(word, Some((WriteStanding::Dead("its coin went to another spend of ours"), false)), "the mark's own reader says so too");
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &older(&again)).await, word, "an older node's mark of it, judged as before");
+    assert_eq!(presence_step(&again, word, 0, s.chain.peak()), PresenceStep::Void("never landed — its coin went to another spend of ours".into()));
 
     // A node that never took the old block has the hint rows of the chain as
     // it stands, with no stale row: a lane on it and on node a settles the
@@ -1526,7 +1550,10 @@ async fn a_restart_mid_claim_and_write_pushes_the_saved_two_spend_bundle_and_fun
 /// the host, with the knocker's contact key. A control knock built by hand
 /// from another dish coin, sealed to that dish coin's id (the input the
 /// lease parks) rather than to its gift, lands under the same hint and does
-/// not open.
+/// not open. The knock book's entry for the write (§4.4) files g as its coin
+/// id, F as its parked input and the knock burner as its payer: its coins
+/// read back as the write's and are confirmed at the height it landed, and
+/// the book confirms the entry by g under the hint.
 #[tokio::test]
 async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens_for_the_host() {
     let mut s = setup().await;
@@ -1571,6 +1598,172 @@ async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens
     assert_eq!(opened.iter().map(|o| (o.item.from, o.item.ck_from)).collect::<Vec<_>>(), vec![(knocker_node.public(), Some(ck_from))]);
     assert_eq!((opened[0].coin_id, opened[0].confirmed_height), (burner_coin(&key, g.coin_id()).coin_id(), landed));
     assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+
+    // The knock book's entry files the write whole (§4.4): g as its coin id,
+    // F as its parked input and the knock burner as its payer. Read back, its
+    // coins are the write's, its verdict is the write's, and the book
+    // confirms it by g under the hint, never by F.
+    let entry = sent_knock_of(&req, 0, hint, &write, issued);
+    let (g_hex, f_hex, hint_hex) = (hex::encode(g.coin_id()), hex::encode(f.coin_id()), hex::encode(hint));
+    assert_eq!(
+        (entry.coin_id.as_str(), entry.parked.as_str(), entry.payer.clone()),
+        (g_hex.as_str(), f_hex.as_str(), Some(Payer::of_burner(&key).hex())),
+        "the entry files g, F and the knock burner"
+    );
+    let filed = WriteCoins::filed(&entry.coin_id, &entry.parked);
+    assert_eq!(filed, Some(write.coins), "the entry's coins read back as the write's");
+    let digest = crate::chia_resolve::parse_hex32(&entry.memo).expect("the entry keeps its memo's digest");
+    assert_eq!(s.judge_split(hint, filed.unwrap(), digest, entry.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    let mut book = KnockBook::default();
+    book.record_sent(entry);
+    assert!(book.knocked_this_era(&req.host, 0));
+    assert!(!book.confirm_sent(&f_hex, &hint_hex, landed), "the book names the entry by g, not by its dish coin");
+    assert!(book.confirm_sent(&g_hex, &hint_hex, landed), "confirmed by g under the hint");
+    assert_eq!(book.sent.iter().map(|k| k.confirmed_height).collect::<Vec<_>>(), vec![landed]);
+    assert!(book.pending_sent().is_empty());
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.1 and §4.4, the marks: a burner's first write filed in
+/// the presence mark and the beacon mark names its two coins and its payer,
+/// the gift g as its coin id, the dish coin F as its parked input and the
+/// burner. Each mark's own reader judges it by them, g under the hint and F
+/// as the input the lease parked and the chain spent: pending in the
+/// mempool, then confirmed at the height it landed, which the presence step
+/// saves as seen on chain and the beacon step as confirmed, both coins and
+/// the payer kept. The burner's rewrite, from the coin the first write made,
+/// is filed with that one coin as both and is confirmed at its own height.
+#[tokio::test]
+async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_dish_coin_as_input_and_its_rewrite_by_its_one_coin() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 10).await;
+    let (key, node) = (burner(54, 0), iroh::SecretKey::generate());
+    let payer = Payer::of_burner(&key).hex();
+    let g = gift(&key, f);
+    let (hint, memo) = presence_memo(NET, &node, &CK, 0, &entries(), unix_now()).unwrap();
+    let write = s.burner_write(&key, 0, hint, None, |_| Ok(memo), 1).await.unwrap();
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+
+    // One write filed in both marks under its hint, so that each reader
+    // judges the coins and the hint its own mark names. The beacon's own
+    // writer moves to a burner in a later PR (§13 row 10).
+    let mark = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
+    let beacon = BeaconMark::written(0, unix_now(), hint, &write, node.public().to_string());
+    let (g_hex, f_hex) = (hex::encode(g.coin_id()), hex::encode(f.coin_id()));
+    let filed = (g_hex.as_str(), f_hex.as_str(), Some(payer.as_str()));
+    assert_eq!((mark.coin_id.as_str(), mark.parked.as_str(), mark.payer.as_deref()), filed, "the presence mark files g, F and the burner");
+    assert_eq!((beacon.coin_id.as_str(), beacon.parked.as_str(), beacon.payer.as_deref()), filed, "and so does the beacon mark");
+    s.reconcile().await;
+    let pending = Some((WriteStanding::Pending, false));
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &mark).await, pending, "in the mempool, F parked");
+    assert_eq!(beacon_standing_on(&s.lease, NET, &s.money, &beacon).await, pending);
+
+    let landed = s.chain.farm().await;
+    s.reconcile().await;
+    let confirmed = Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false));
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word, confirmed, "g under the hint, F spent: confirmed");
+    let PresenceStep::Save(seen) = presence_step(&mark, word, 0, landed) else { panic!("confirmed: saved") };
+    assert!(seen.chain_seen && seen.confirmed_height == landed, "{seen:?}");
+    assert_eq!((seen.coin_id.as_str(), seen.parked.as_str(), seen.payer.as_deref()), filed, "saved with its coins and its payer");
+    let word = beacon_standing_on(&s.lease, NET, &s.money, &beacon).await;
+    assert_eq!(word, confirmed);
+    let BeaconStep::Save(saved) = beacon_step(&beacon, word, 0, landed) else { panic!("confirmed: saved") };
+    assert!(saved.confirmed && saved.confirmed_height == landed, "{saved:?}");
+    assert_eq!((saved.coin_id.as_str(), saved.parked.as_str(), saved.payer.as_deref()), filed, "saved with its coins and its payer");
+
+    // The rewrite spends the coin the first write made, and its mark files
+    // that one coin as both.
+    let written = burner_coin(&key, g.coin_id());
+    let (again_hint, memo) = presence_memo(NET, &node, &CK, 0, &entries(), unix_now()).unwrap();
+    assert_eq!(again_hint, hint);
+    let rewrite = s.burner_write(&key, 0, hint, None, |_| Ok(memo), 2).await.unwrap();
+    assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "written from the burner's own coin");
+    let rewritten_mark = NodePublishMark::written(0, 2, "a".into(), unix_now(), hint, &rewrite, node.public().to_string());
+    let one = hex::encode(written.coin_id());
+    assert_eq!(
+        (rewritten_mark.coin_id.as_str(), rewritten_mark.parked.as_str(), rewritten_mark.payer.as_deref()),
+        (one.as_str(), one.as_str(), Some(payer.as_str())),
+        "the rewrite's mark files its one coin as both, and the burner"
+    );
+    let rewritten = s.chain.farm().await;
+    assert!(rewritten > landed);
+    s.reconcile().await;
+    let word = presence_standing_on(&s.lease, NET, &s.money, &rewritten_mark).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: rewritten, seen_at: Some(rewritten) }, false)));
+    let PresenceStep::Save(seen) = presence_step(&rewritten_mark, word, 0, rewritten) else { panic!("confirmed: saved") };
+    assert!(seen.chain_seen && seen.confirmed_height == rewritten && seen.writes == 2, "{seen:?}");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.4 and §10, a lost race read through the marks: our
+/// claim and write is filed in the presence mark and the beacon mark, and a
+/// stranger's claim of its dish coin F lands first. Both readers say pending
+/// while the lease keeps the bundle settling, and once F is spent
+/// SETTLED_DEPTH deep, dead, in today's words (PR 10 tells a stranger's
+/// claim from a spend of ours): the presence step voids its mark and the
+/// beacon step forgets its own, so each is due again. The same marks
+/// without their parked input, one coin read back as both, read pending for
+/// ever and are kept, which would block the beacon for the era: g is on no
+/// chain and the lease never parked it, so nothing the chain or the lease
+/// says of it can ever settle the write. That is why a mark files F.
+#[tokio::test]
+async fn a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_from_its_mark_once_settled_and_pending_for_ever_without_its_parked_input() {
+    let mut s = setup().await;
+    // One mojo, so the stranger's claim leaves no remainder at the dish.
+    let (f, _) = ready_dish(&s, 1).await;
+    let (key, node) = (burner(55, 0), iroh::SecretKey::generate());
+    let payer = Payer::of_burner(&key);
+    let g = gift(&key, f);
+    let (hint, memo) = presence_memo(NET, &node, &CK, 0, &entries(), unix_now()).unwrap();
+    let write = s.burner_write(&key, 0, hint, None, |_| Ok(memo), 1).await.unwrap();
+    // One write filed in both marks, as in the test before: each reader
+    // judges the coins and the hint its own mark names.
+    let mark = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
+    let beacon = BeaconMark::written(0, unix_now(), hint, &write, node.public().to_string());
+    let (g_hex, f_hex) = (hex::encode(g.coin_id()), hex::encode(f.coin_id()));
+    assert_eq!((mark.coin_id.as_str(), mark.parked.as_str()), (g_hex.as_str(), f_hex.as_str()));
+    assert_eq!((beacon.coin_id.as_str(), beacon.parked.as_str()), (g_hex.as_str(), f_hex.as_str()));
+    let one_coin = NodePublishMark { parked: String::new(), ..mark.clone() };
+    let one_coin_beacon = BeaconMark { parked: String::new(), ..beacon.clone() };
+
+    let stranger = Bytes32::new([0x65; 32]);
+    s.chain.include_next(claim(&lobby(), f, stranger));
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(f.coin_id()), vec![Coin::new(f.coin_id(), stranger, 1)], "the stranger's claim took F");
+    assert!(s.chain.mempool().is_empty(), "the block spent F, so the mempools let our bundle go");
+    assert_eq!(s.chain.record(g.coin_id()), None, "g is on no chain");
+    s.reconcile().await;
+    let pending = Some((WriteStanding::Pending, false));
+    assert_eq!(presence_standing_on(&s.lease, NET, &s.money, &mark).await, pending, "the lease still holds the bundle");
+    assert_eq!(beacon_standing_on(&s.lease, NET, &s.money, &beacon).await, pending);
+    assert!(s.lease.is_settling(&f.coin_id()) && s.lease.holds_for(payer));
+
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    s.reconcile().await;
+    assert!(!s.lease.holds_for(payer), "settled: the lease let the bundle go");
+    let peak = s.chain.peak();
+    let dead = Some((WriteStanding::Dead("its coin went to another spend of ours"), false));
+    let never_landed = "never landed — its coin went to another spend of ours".to_string();
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word, dead, "F spent with no coin of ours under the hint");
+    assert_eq!(presence_step(&mark, word, 0, peak), PresenceStep::Void(never_landed.clone()), "void: the listing is due again");
+    let word = beacon_standing_on(&s.lease, NET, &s.money, &beacon).await;
+    assert_eq!(word, dead);
+    assert_eq!(beacon_step(&beacon, word, 0, peak), BeaconStep::Forget(never_landed), "forgotten: the beacon is due again");
+
+    // Without F: g unspent and unknown to the lease, so pending, and kept so,
+    // however deep the chain grows.
+    for _ in 0..2 {
+        let word = presence_standing_on(&s.lease, NET, &s.money, &one_coin).await;
+        assert_eq!(word, pending, "judged at g alone, the write never settles");
+        assert_eq!(presence_step(&one_coin, word, 0, s.chain.peak()), PresenceStep::Keep);
+        let word = beacon_standing_on(&s.lease, NET, &s.money, &one_coin_beacon).await;
+        assert_eq!(word, pending);
+        assert_eq!(beacon_step(&one_coin_beacon, word, 0, s.chain.peak()), BeaconStep::Keep);
+        s.chain.farm_blocks(SETTLED_DEPTH).await;
+        s.reconcile().await;
+    }
     assert!(s.chain.unanswered().is_empty());
 }
 

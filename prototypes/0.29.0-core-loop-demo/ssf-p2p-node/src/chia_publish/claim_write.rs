@@ -765,12 +765,12 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// design §10; a peer that lies about a burner coin risks at most a refused
 /// push) and the OS random source.
 ///
-/// Its [`MemoWrite`] must not be filed in `NodePublishMark`, `BeaconMark` or
-/// `SentKnock` until PR 10 files `parked` beside the parent: those marks
-/// keep one coin and read it back as both ([`WriteCoins::filed`]), so a
-/// first write filed there would be judged by g alone, and its verdict would
-/// never find the dish coin it parked. Like the builder it has no network
-/// check of its own: until PR 10 its one caller, the claim-and-write
+/// Its [`MemoWrite`] files whole in `NodePublishMark`, `BeaconMark` or
+/// `SentKnock` (§4.4): its parent as the mark's coin id (the gift g for a
+/// first write), its parked input beside it (the dish coin F) and the
+/// burner as its payer, and the mark's reader judges it by both coins
+/// ([`WriteCoins::filed`]). Like the builder it has no network check of its
+/// own: until PR 10's writers land, its one caller, the claim-and-write
 /// self-test hook ([`claim_write_selftest`]), runs only with
 /// SSF_CHIA_BURNERS=1 on a test network (§13 row 9), and keeps no mark.
 pub async fn burner_write(
