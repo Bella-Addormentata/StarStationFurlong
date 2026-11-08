@@ -18,9 +18,9 @@ import * as Y from 'yjs';
 import { seedTable } from './computedFold';
 import { faironlyInc, sealFin } from './computedFairOnly';
 import { delegation, hex, house, NAME, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run } from './computedPageKit';
+import { clockOf, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run, sync } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { red } from './computedTestKit';
+import { black, red } from './computedTestKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -63,16 +63,16 @@ function tick(p: Page, from: number, ms: number, step = STEP, tables?: string[])
   return from + ms + step;
 }
 
-describe('the seeds behind the slips of a page-signed incarnation, while its table plays a FAIR ONLY game', () => {
-  /** A's page, the page-signed incarnation switched on and a slip of A's frozen on it. */
-  async function frozen(): Promise<{ a: Page; felt: string }> {
-    const [a] = await openRoom(['A'], T0);
-    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
-    const felt = a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c;
-    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
-    return { a, felt };
-  }
+/** A's page, the page-signed incarnation switched on and a slip of A's frozen on it. */
+async function frozen(): Promise<{ a: Page; felt: string }> {
+  const [a] = await openRoom(['A'], T0);
+  expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+  const felt = a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c;
+  expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  return { a, felt };
+}
 
+describe('the seeds behind the slips of a page-signed incarnation, while its table plays a FAIR ONLY game', () => {
   it('are kept: the table plays the game, the page-signed incarnation the switch names is waiting, and a page lets go of nothing it wrote for it', async () => {
     const { a, felt } = await frozen();
     record(a, root);
@@ -187,5 +187,193 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     expect(a.casino.computedIncEnded(TABLE, INC)).toBe(true);
     expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  // A hint is a FAIR ONLY name in the switch that no live game stands behind: a
+  // game that has ended, or a name nothing opened. The page puts the switch back
+  // over it in its turn; until it has, the compaction duty must not take the
+  // incarnation for an ended one and let go of the seeds behind its frozen slips.
+  it('are kept at a table out of the room under a made-up FAIR ONLY name in the switch: the compaction duty alone looks, and a hint is no end', async () => {
+    const { a, felt } = await frozen();
+    switchTo(a, G.inc); // (no record of the game: a name nothing opened)
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    tick(a, T0 + STEP, 2_000, STEP, []);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+
+  it('are kept by a page waking from a sleep under a made-up name, until it is awake and puts the switch back', async () => {
+    const { a, felt } = await frozen();
+    tick(a, T0 + STEP, 800);
+    switchTo(a, G.inc); // (a name nothing opened, arrived while the page slept)
+    const wake = T0 + 11_000;
+    const at = tick(a, wake, 2_000); // (the lapse: the page is not awake, nothing is put back yet)
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc });
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    tick(a, at, 7_000);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+
+  it('are kept by a page waking from a sleep after the game ended, the switch carrying its dead name: put back once awake', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    switchTo(a, G.inc);
+    tick(a, T0 + STEP, 800);
+    record(a, end); // (the game ends while the page sleeps)
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc); // (the dead name: nothing live)
+    expect(a.casino.isComputedTable(TABLE)).toBe(false);
+    const wake = T0 + 11_000;
+    const at = tick(a, wake, 2_000);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc });
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    tick(a, at, 7_000);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+});
+
+describe('what the room does about a page-signed incarnation waiting beside a FAIR ONLY game', () => {
+  it('the card\'s readers of a table state find none at a game, and let go of nothing of the page-signed incarnation beside it', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.table.computedCheckpointView(TABLE, T0 + 500)).toBeNull();
+    expect(a.table.computedRoundCheck(TABLE, T0 + 500)).toBeNull();
+    expect(a.table.computedMine(TABLE, T0 + 500)).toBeNull();
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (the seed behind the frozen slip survives the card's reads)
+  });
+
+  it('the switch row of the card reads the table on at a game, and the page-signed incarnation beside it stays as it is', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    const state = a.table.computedSwitchState(TABLE, 'roulette', true, T0 + 500);
+    expect(state.on).toBe(true);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+
+  // Interim, until the house has controls over a game (PR 6c-4c, 6c-5): the
+  // press has no game of its own to finalise, so it takes the hint away and
+  // marks the house's choice, and the game goes on.
+  it('the card\'s switch-off at a game the switch names is not refused: the hint goes, the house\'s choice is marked, and the game is not ended', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    switchTo(a, G.inc);
+    const at = tick(a, T0 + STEP, 800);
+    expect(a.table.switchComputedOff(TABLE, at)).toBe('ok');
+    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    expect(casinoOf(a).get(`cfg:ownerrun:${TABLE}`)).toBe(1);
+    expect(a.casino.isComputedTable(TABLE)).toBe(true); // (the game goes on)
+    expect(a.casino.computedIncEnded(TABLE, G.inc)).toBe(false);
+    expect(casinoOf(a).has(`gone:${TABLE}:${G.inc}`)).toBe(false);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+
+  it('out of the room for AWAY_MS, the page-signed incarnation the switch names is ended as a removal ends it, and the game is left alone', async () => {
+    const { a } = await frozen();
+    record(a, root);
+    expect(a.casino.computedLiveTables()).toEqual([{ t: TABLE, inc: INC }]); // (the page-signed one: the game is nobody's to watch for the room)
+    tick(a, T0 + STEP, 2 * a.table.AWAY_MS + 5_000, 1_000, []);
+    expect(casinoOf(a).has(`gone:${TABLE}:${INC}`)).toBe(true);
+    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    expect(casinoOf(a).has(`gone:${TABLE}:${G.inc}`)).toBe(false);
+    expect(a.casino.isComputedTable(TABLE)).toBe(true); // (the game goes on)
+  });
+});
+
+describe('the stakes and the waits of a page-signed incarnation, while its table plays a FAIR ONLY game', () => {
+  /** Two pages, a slip each on the page-signed incarnation (red 9, black 9). */
+  async function staked(): Promise<{ a: Page; b: Page }> {
+    const [a, b] = await openRoom(['A', 'B'], T0);
+    clockOf(a, T0);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+    clockOf(b, T0);
+    expect(b.table.writeComputedSlip(TABLE, [black(9)], T0)).toBe('ok');
+    sync(T0, a, b);
+    expect(a.casino.readChips(a.pid)).toBe(991);
+    expect(b.casino.readChips(b.pid)).toBe(991);
+    return { a, b };
+  }
+
+  it('stay held while the game is played, the switch naming it or not: the slips settle when the game ends, so the chips are not there to spend meanwhile', async () => {
+    const { a, b } = await staked();
+    record(a, root);
+    sync(T0 + 1, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    switchTo(a, G.inc);
+    sync(T0 + 2, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    clockOf(a, T0 + 3);
+    expect(a.casino.cashOutChips(a.pid, 1_000)).toBe(991); // (what is not staked, no more)
+  });
+
+  it('stay held through the game\'s end: the switch still names the dead game until it is put back, and no recount frees them between', async () => {
+    const { a, b } = await staked();
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    record(a, end);
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncEnded(TABLE, G.inc)).toBe(true);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc }); // (not put back yet)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    // (A record in the incarnation's own session counts it again meanwhile: still held.)
+    a.doc.transact(() => (computedOf(a).get(`ses:${TABLE}:${INC}:g`) as Y.Map<unknown>).set('x:junk', 1));
+    sync(T0 + 2, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    run([a, b], T0 + 3, T0 + 2 * a.table.REPUT_MS, { step: STEP });
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+  });
+
+  it('are freed when another page-signed incarnation takes the switch and no game is played, as ever', async () => {
+    const { a, b } = await staked();
+    a.doc.transact(() => {
+      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: 'c' + '5d'.repeat(12) });
+      computedOf(a).set(`ses:${TABLE}:${'c' + '5d'.repeat(12)}:g`, new Y.Map());
+    });
+    sync(T0 + 1, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+  });
+
+  /** Both pages ticked until the close is in, then the game opens (its root and the
+   *  switch naming it) and is played for `ms` with both pages ticking, then ends. */
+  async function playedBeside(ms: number): Promise<{ a: Page; b: Page; at: number }> {
+    const { a, b } = await staked();
+    const closed = (): boolean => keysIn(a, 'c', 1).length > 0;
+    const at = run([a, b], T0 + STEP, T0 + 60_000, { step: STEP, until: closed });
+    expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
+    expect(keysIn(a, 'r', 1)).toEqual([]); // (no seed is out: the pages have not ticked since the close came)
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(at, a, b);
+    const mid = run([a, b], at + STEP, at + ms, { step: STEP });
+    record(a, end);
+    sync(mid, a, b);
+    return { a, b, at: mid };
+  }
+
+  it('start their waits afresh when the table goes back to them: a close seen before the game does not forfeit the player whose page had not yet revealed', async () => {
+    const { a, b, at } = await playedBeside(40_000);
+    run([a, b], at + STEP, at + 20_000, { step: STEP });
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    const round = a.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!;
+    expect(round.decided).toBe('reveals');
+    expect(round.forfeit).toBeUndefined();
+    expect([...round.counted].sort()).toEqual([a.pid, b.pid].sort());
+    expect(b.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!.decided).toBe('reveals');
+  });
+
+  it('still run: a player whose page never reveals is forfeited a grace after the table goes back, not at once', async () => {
+    const { a, b, at } = await playedBeside(40_000);
+    // B's page is gone: only A's ticks, its seed goes out, and the grace runs from the table's return.
+    sync(at, a, b);
+    const soon = run([a], at + STEP, at + 1_000, { step: STEP });
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    expect(a.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!.decided).toBeNull();
+    run([a], soon, soon + 30_000, { step: STEP });
+    const round = a.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!;
+    expect(round.decided).toBe('forfeit');
+    expect(round.forfeit!.rec.n).toEqual([a.pid]);
   });
 });

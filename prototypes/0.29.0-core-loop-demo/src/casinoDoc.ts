@@ -3991,6 +3991,24 @@ function recountComputedHeld(incKey: string, held: ReadonlyMap<string, bigint>):
   else computedHeld.delete(incKey);
 }
 
+/** Whether the switch of table `t` stands behind page-signed incarnation `inc`
+ *  as far as its felts go: it names `inc`, or a FAIR ONLY game, live or not.
+ *  Such a name is S9's hint to the game the table plays, not another
+ *  incarnation taking `inc`'s place (computedIncOf): while the game is live
+ *  the page-signed incarnation only waits, its frozen slips still to settle
+ *  when the game ends (computedEndedIncs, computedTable tableOf), and where it
+ *  is not live the pages that ran `inc` put the switch back over the name
+ *  (putComputedSwitchBack), so the felts go on holding what their players
+ *  staked either way. (Nothing here ends an incarnation: that is a `gone:`
+ *  mark, a checkpoint that says so, or compaction after the wait.) Held by the
+ *  name alone, not by the game's liveness: no recount is due when a game opens
+ *  or ends, and none flickers the stake free between the game's end and the
+ *  put-back. */
+function switchHoldsFelts(casino: Y.Map<unknown>, t: string, inc: string): boolean {
+  const named = computedCfgInc(casino.get(`cfg:computed:${t}`));
+  return named === inc || (named !== null && isFairOnlyInc(named));
+}
+
 /** Count one incarnation as its fold reads now: its nets in the ledger, and
  *  what its felts hold while it is live, both from one result. On a doc
  *  holding part of an update, or missing what this page counted of the
@@ -4011,7 +4029,7 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
   computedParked.delete(c.key);
   c.stale = false;
   const res = c.fold.result();
-  const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+  const live = switchHoldsFelts(casino, c.t, c.inc)
     && !casino.has(goneKey(c.t, c.inc)) && !res.base.ended;
   recountComputed(chipIndex, c.key, res.nets);
   recountComputedHeld(c.key, live ? res.held : NO_COMPUTED_HELD);
@@ -4970,7 +4988,10 @@ export interface EndedComputed {
  *  page-signed one's place: while a game is live the table plays it (S9) and
  *  the page-signed incarnations only wait, their frozen slips still to reveal
  *  when the game ends or the deed moves (computedIncOf). Compaction would
- *  make that wait final: the end checkpoint, the sessions, then the seeds. */
+ *  make that wait final: the end checkpoint, the sessions, then the seeds.
+ *  (The wait is kept by the pages that ran them: they put the switch back
+ *  when the game ends. With none left, nothing does, and the incarnation is
+ *  an abandoned one, compacted after the wait, its open round void.) */
 export function computedEndedIncs(): EndedComputed[] {
   const casino = ensureMap();
   const map = computedMap!;

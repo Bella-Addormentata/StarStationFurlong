@@ -1500,6 +1500,25 @@ describe('the game a table plays (S9): the deed holder\'s, else the switch\'s, e
     off();
   });
 
+  it('a deed holder\'s key that arrives after the deed does moves the table\'s game as a deed changing hands does: its view is told once, the card can say so', async () => {
+    const page = await loadPage(1);
+    const c = page.casino;
+    pin(page, buyer);
+    deedTo(page, owner); // (the room names the owner, but the owner's key is not in the players map yet)
+    const theirs = gameBy(buyer, hex('4', 16));
+    put(page, root, theirs.root);
+    switchTo(page, theirs.ctx.inc);
+    expect(played(page)).toBe(theirs.ctx.inc); // (no deed holder's key to go by: the switch's game)
+    expect(c.computedGameMovedOf(T)).toEqual({ from: P.inc, to: theirs.ctx.inc });
+    const heard = vi.fn();
+    const off = c.subscribeCasinoKey(`computed:${T}`, heard);
+    pin(page, owner); // (the owner's key shows up)
+    expect(played(page)).toBe(P.inc);
+    expect(c.computedGameMovedOf(T)).toEqual({ from: theirs.ctx.inc, to: P.inc });
+    expect(heard).toHaveBeenCalledTimes(1);
+    off();
+  });
+
   it('a page that comes to a doc where the deed has moved starts from what is there: nothing moved for it', async () => {
     const page = await loadPage(1);
     pin(page, owner, buyer);
@@ -1847,6 +1866,20 @@ describe('a page-signed table beside a FAIR ONLY game: its switch is still its o
     other.casino.clearTableKeys(T, 'local');
     expect(casinoOf(other).has(`gone:${T}:${X}`)).toBe(true);
     expect(casinoOf(other).has(`gone:${T}:${P.inc}`)).toBe(false);
+  });
+
+  it('a removal marks the page-signed name the switch carries ended even when the doc holds nothing of it, beside a live game: a record that turns up under that name later is an ended incarnation\'s', async () => {
+    const { page } = await openedPage();
+    const c = page.casino;
+    expect(c.computedResolutionOf(T, P.inc)).toMatchObject({ live: true });
+    const bare = `r${'7'.repeat(24)}`;
+    switchTo(page, bare); // (a bare switch: a name nothing in the doc stands behind)
+    expect(c.computedIncOf(T)).toBe(P.inc);
+    c.clearTableKeys(T, 'local');
+    expect(c.computedIncEnded(T, bare)).toBe(true);
+    expect(casinoOf(page).has(`gone:${T}:${bare}`)).toBe(true);
+    expect(casinoOf(page).has(`gone:${T}:${P.inc}`)).toBe(false);
+    expect(casinoOf(page).has(`cfg:computed:${T}`)).toBe(false);
   });
 
   it('a switch a peer took away is lost, and put back: the game is not the page-signed table\'s to stand for', async () => {

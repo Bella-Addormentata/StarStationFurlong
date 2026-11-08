@@ -513,6 +513,14 @@ interface TableState {
   changed: { seq: number; round: number; undid: [number, number] | null };
   tickedAt: number | null;
   reputAt: number | null;
+  /** 🔒 A FAIR ONLY game was the one played while this state waited (tableOf):
+   *  when the table plays its incarnation again, it starts its waits afresh
+   *  (resumed), as after a wake, and `wakeAt` is when it did (0 before). No
+   *  duty ran here meanwhile, so no seed could be revealed in the time that
+   *  went by, and a first-seen time from before it would put the grace long
+   *  past. */
+  gated: boolean;
+  wakeAt: number;
   /** The last decided round this page saw on the chain: what the felt
    *  shows once a trim has taken the round out of the session, when it is
    *  the round the checkpoint kept (its close). */
@@ -608,6 +616,26 @@ let compactedAt: number | null = null;
 const away = new Set<string>();
 const awayAt = new Map<string, number>();
 
+/** Forget what table st was waiting on, so every wait starts again from now:
+ *  its first-seen times, the rounds it saw decided, and each timer a wake
+ *  would break (the window, the re-arm, the seed out, the ask, the chain that
+ *  fell short, a copy gone missing). What the page kept for the table's
+ *  sake (its slips, burned commitments, seeds) stays. */
+function forgetWaits(st: TableState): void {
+  st.seen.clear();
+  st.decided.clear();
+  st.rearm = null;
+  st.window = null;
+  st.flung = null;
+  st.missingAt.clear();
+  st.opened.clear();
+  st.seedOutAt = null;
+  st.askedFor = null;
+  st.shortAt = null;
+  // (A copy keeps its value: only when it went missing starts again.)
+  for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
+}
+
 /** Look at this page's clock: a new binding starts every table afresh; a
  *  wake, or a clock gone back by TABLE_CLOCK_SLACK_MS or more, forgets every
  *  first-seen time (a timer whose wait spanned it starts again). */
@@ -646,20 +674,7 @@ function lookAtClock(now: number): void {
     // this page watched come in.)
     clock.realFrom = Math.max(clock.realFrom, now + TABLE_LEASE_LAPSE_MS, clock.last ?? now);
     clock.gen += 1;
-    for (const st of tables.values()) {
-      st.seen.clear();
-      st.decided.clear();
-      st.rearm = null;
-      st.window = null;
-      st.flung = null;
-      st.missingAt.clear();
-      st.opened.clear();
-      st.seedOutAt = null;
-      st.askedFor = null;
-      st.shortAt = null;
-      // (A copy keeps its value: only when it went missing starts again.)
-      for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
-    }
+    for (const st of tables.values()) forgetWaits(st);
     endedAt.clear();
     awayAt.clear();
   }
@@ -686,12 +701,13 @@ function watchedClose(st: TableState, round: RoundView): boolean {
 
 /** When this page first saw session key `key` of table st, on its clock:
  *  casinoDoc's arrival stamp, read as now if later than now and as the last
- *  wake if before it, kept from the first ask on. */
+ *  wake (or the table's own, st.wakeAt: it was resumed) if before it, kept
+ *  from the first ask on. */
 function seen(st: TableState, key: string, now: number): number {
   let at = st.seen.get(key);
   if (at === undefined) {
     const raw = computedSeenAt(st.t, key);
-    at = Math.min(now, Math.max(raw ?? now, clock.wakeAt));
+    at = Math.min(now, Math.max(raw ?? now, clock.wakeAt, st.wakeAt));
     st.seen.set(key, at);
   }
   return at;
@@ -704,7 +720,7 @@ function newTable(t: string, inc: string): TableState {
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
-    tickedAt: null, reputAt: null,
+    tickedAt: null, reputAt: null, gated: false, wakeAt: 0,
     lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
@@ -719,8 +735,14 @@ function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult 
   if (!isComputedTable(t)) return null;
   const inc = computedIncOf(t)!;
   // (🔒 A FAIR ONLY game is played by no duty of a page-signed table: its own
-  // are PR 6c-4b's, which open this.)
-  if (isFairOnlyInc(inc)) return null;
+  // are PR 6c-4b's, which open this. The page-signed incarnation this page ran
+  // waits as it is, and is served again, its waits started afresh, once the
+  // table plays it.)
+  if (isFairOnlyInc(inc)) {
+    const waits = tables.get(t);
+    if (waits) waits.gated = true;
+    return null;
+  }
   if (game !== undefined && gameOfInc(inc) !== game) return null;
   const res = computedFoldOf(t);
   if (!res) return null;
@@ -729,6 +751,14 @@ function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult 
     // (A new incarnation: nothing of the last one's will be revealed now.)
     if (st) letGo(st, () => false);
     tables.set(t, st = newTable(t, inc));
+  } else if (st.gated) {
+    // (Resumed after a game: no duty ran here meanwhile. As after a wake, a
+    // timer whose wait spanned it starts again, or a close seen before the
+    // game would have its grace long past and the first page to reveal would
+    // forfeit the players whose pages hadn't yet.)
+    st.gated = false;
+    forgetWaits(st);
+    st.wakeAt = clock.last ?? Date.now();
   }
   noteResult(st, res);
   return { st, res };
@@ -3873,7 +3903,9 @@ function sessionPubs(e: EndedComputed): Set<string> {
  * of, seeds and all, on every page: one ended for good (computedIncEnded),
  * or one whose switch names another incarnation (unless the table plays a
  * FAIR ONLY game, which takes none of the page-signed state: it waits to the
- * end, its own or the game's). Not one whose switch is
+ * end, its own or the game's; the pages that ran it put the switch back when
+ * the game ends (putSwitchBack), and with none left it is an abandoned one,
+ * compacted, its open round void). Not one whose switch is
  * only missing (a peer's delete, put back a second later, ends nothing until
  * compaction makes it final), nor anything on a frame whose doc was bound
  * afresh since this page looked at its clock (leaving the room destroys the
