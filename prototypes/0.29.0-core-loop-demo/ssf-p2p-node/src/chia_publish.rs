@@ -215,10 +215,11 @@ struct Settling {
 /// key's coins are locked to ([`our_puzzle_hash`]). It is the key whose next
 /// write must wait for this spend, not the address of an input: a TAKE's
 /// input is the dish's coin and its payer the money address it pays into
-/// (`chia_faucet`'s claim), and a burner's first write (PR 9) will spend a
-/// dish coin and the gift g with the burner as its payer.
+/// (`chia_faucet`'s claim), and a burner's first write spends a dish coin
+/// and the gift g with the burner as its payer ([`Payer::of_burner`]).
 ///
-/// Outside this module a `Payer` comes from a key alone ([`Payer::of`]):
+/// Outside this module a `Payer` comes from a key alone ([`Payer::of`] for
+/// a wallet key, [`Payer::of_burner`] for a burner's):
 /// there is no `Default`, no `From<Bytes32>` and no public constructor from
 /// bytes, so a coin id or a hint, `Bytes32`s both, can never be passed as a
 /// payer by mistake. The lease builds one from the hex its own file holds. It
@@ -231,6 +232,16 @@ impl Payer {
     /// The payer `key` is: the standard puzzle hash of its synthetic key.
     pub fn of(key: &SecretKey) -> Payer {
         Payer(our_puzzle_hash(key))
+    }
+
+    /// The payer a burner is: its puzzle hash, the address its 1-mojo coin
+    /// sits at, so its writes wait on its own spends alone (stage 4 design
+    /// §4.4). It lives here, not in `chia_burner`, whose pin scan lists every
+    /// line there that builds a key or reads its secret; this one asks the
+    /// key for its public puzzle hash alone, so that list stays as it is.
+    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
+    pub fn of_burner(key: &crate::chia_burner::BurnerKey) -> Payer {
+        Payer(key.puzzle_hash())
     }
 
     /// The puzzle hash, hex, as the lease file writes it. Read-only on
@@ -554,6 +565,21 @@ impl WalletLease {
         Ok(())
     }
 
+    /// Does the TAKE marker name `coin`, whether or not a spend still parks
+    /// it? It only reads. [`WalletLease::incoming_pending`] is what clears
+    /// the marker, and only when it next runs, so a TAKE the peers refused or
+    /// the mempool dropped can leave the marker naming a dish coin that is
+    /// free again, one [`WalletLease::is_taken`] no longer names. A burner
+    /// that parked that coin would read to `incoming_pending` as the TAKE's
+    /// gift still landing, and to [`WalletLease::outgoing_pending`] as no
+    /// spend of ours. So the claim-and-write leaves the marker's coin alone,
+    /// as it leaves a taken coin alone, and the marker stays as it is, for
+    /// testnet TAKE (stage 4 design §4.4).
+    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
+    pub fn is_incoming_marker(&self, coin: &Bytes32) -> bool {
+        *self.incoming.lock().unwrap() == Some(*coin)
+    }
+
     /// Is `coin` parked — consumed by a spend the chain and the mempool have
     /// not settled yet?
     pub fn is_parked(&self, coin: &Bytes32) -> bool {
@@ -666,12 +692,14 @@ impl WalletLease {
     /// says. Callers hold the gate after a reconciliation, as
     /// [`publish_memo_with`] does around the global check.
     ///
-    /// Nothing calls it outside the tests yet: the burner writers will
-    /// (design §13, PR 10). The claim-and-write (PR 9) must also keep a stale
-    /// marker off a burner's parking, since `incoming_pending` reads the
-    /// marker's coin alone and would read a burner's parking of it as a gift
-    /// still landing: it keeps the TAKE's spend number beside the marker, or
-    /// never lets a burner park the marker's coin.
+    /// Nothing calls it outside the tests yet: the claim-and-write's gift
+    /// rule will, through [`WalletLease::holds_for`] (design §13 row 9), and
+    /// so will the burner writers (row 10). A stale marker is kept off a
+    /// burner's parking, since `incoming_pending` reads the marker's coin
+    /// alone and would read a burner's parking of it as a gift still landing:
+    /// the claim-and-write never lets a burner park the marker's coin
+    /// ([`WalletLease::is_incoming_marker`]), so the lease file gains no
+    /// field for it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn outgoing_pending_for(&self, payer: Payer) -> bool {
         let incoming = *self.incoming.lock().unwrap();
@@ -683,6 +711,29 @@ impl WalletLease {
             let landing = Some(*id) == incoming && (paid_by.is_none() || paid_by == money);
             !landing && paid_by.is_none_or(|recorded| recorded == payer)
         })
+    }
+
+    /// Does the lease hold a spend paid by `payer`, parked or settling? It is
+    /// the gift rule's question (stage 4 design §5.2: a key is funded only
+    /// while no bundle for it is held). Parked spends are asked through
+    /// [`WalletLease::outgoing_pending_for`]. A settling spend counts when
+    /// its payer is `payer`, and one with no payer recorded counts as a
+    /// parked one does there: the money address's, or every payer's until a
+    /// restore names it. A rewrite waits on parked spends alone, since a
+    /// settling write's coin is the one it writes from next; a gift waits on
+    /// settling ones too. If a stranger's claim of the dish coin lands where
+    /// ours would have, the lease reads our bundle's input as spent and keeps
+    /// the bundle settling, while the burner holds no coin. That bundle is
+    /// judged dead only once the dish coin is settled SETTLED_DEPTH deep, and
+    /// only then is the key funded again (§10, a lost race), never while a
+    /// reorganization could still bring our bundle back.
+    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
+    pub fn holds_for(&self, payer: Payer) -> bool {
+        if self.outgoing_pending_for(payer) {
+            return true;
+        }
+        let money = *self.money.lock().unwrap();
+        self.settling.lock().unwrap().values().any(|s| s.payer.or(money).is_none_or(|recorded| recorded == payer))
     }
 
     /// A gift to our wallet is still landing: the wallet is not empty even
@@ -5082,6 +5133,126 @@ mod tests {
         assert!(!lease.outgoing_pending() && lease.incoming_pending());
         lease.release(&[first_write.spend]);
         assert!(!lease.outgoing_pending_for(burner()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §4.4: a burner pays for its own writes, by its puzzle
+    /// hash: a payer of its own, not the money address's, and each slot's
+    /// burner another payer.
+    #[test]
+    fn a_burners_payer_is_its_puzzle_hash_and_not_the_moneys() {
+        use crate::chia_burner::{BurnerRoot, MoneyKey};
+        let wallet = SecretKey::from_seed(&[1u8; 32]);
+        let root = BurnerRoot::of(&MoneyKey::new(wallet.clone()), T11);
+        let key = root.presence(&[2u8; 32], 0);
+        assert_eq!(Payer::of_burner(&key), Payer(key.puzzle_hash()));
+        assert_eq!(Payer::of_burner(&key).hex(), hex::encode(key.puzzle_hash()), "the file names it by that hash");
+        assert_ne!(Payer::of_burner(&key), Payer::of(&wallet), "a burner is not the money address");
+        assert_ne!(Payer::of_burner(&key), Payer::of_burner(&root.presence(&[2u8; 32], 1)), "the next era's burner");
+        assert_ne!(Payer::of_burner(&key), Payer::of_burner(&root.knock(&[2u8; 32], 0)), "a knock's burner");
+    }
+
+    /// Stage 4 design §4.4 and §13 row 9: the TAKE marker can outlive its
+    /// TAKE's parking and name a dish coin that is free again, and the
+    /// claim-and-write keeps that coin from every burner's claim, since its
+    /// pick leaves out what `is_taken` or `is_incoming_marker` names.
+    /// Reading the marker clears nothing; once `incoming_pending` clears it,
+    /// the coin is a dish coin like any other.
+    #[test]
+    fn a_stale_take_marker_keeps_its_dish_coin_from_any_burners_claim() {
+        use crate::chia_faucet::{pick_ready_coin, FaucetCoin, FaucetParams};
+        use rand::SeedableRng;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-stale-marker-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = FaucetParams::lobby(T11);
+        let dish = |n: u8| FaucetCoin { coin: Coin::new(Bytes32::new([n; 32]), params.puzzle_hash(), 10), confirmed_height: 100 };
+        let (marked, free) = (dish(98), dish(99));
+        let faucet = marked.coin.coin_id();
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let lease = restored_in(&dir, "lease");
+        let take = lease.park_with_bundle([faucet], &bundle, money()).unwrap();
+        lease.mark_incoming(faucet).unwrap();
+        assert!(lease.is_taken(&faucet) && lease.is_incoming_marker(&faucet), "while the TAKE is parked, both name its coin");
+        lease.release(&[take.spend]);
+        assert!(lease.is_incoming_marker(&faucet), "the TAKE gone, the marker still names its coin");
+        assert!(!lease.is_taken(&faucet), "…which the lease no longer holds");
+        assert!(!lease.is_incoming_marker(&free.coin.coin_id()));
+        assert_eq!(*lease.incoming.lock().unwrap(), Some(faucet), "a read clears nothing");
+        let taken = |id: &Bytes32| lease.is_taken(id) || lease.is_incoming_marker(id);
+        let coins = [marked, free.clone()];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        for _ in 0..64 {
+            assert_eq!(pick_ready_coin(&coins, &params, 200, taken, &mut rng), Some(&free), "never the marker's coin");
+        }
+        assert!(!lease.incoming_pending(), "nothing parks it, so no gift is landing, and this read clears the marker");
+        assert!(!lease.is_incoming_marker(&faucet) && !lease.is_taken(&faucet));
+        let picked: HashSet<Bytes32> =
+            (0..64).filter_map(|_| pick_ready_coin(&coins, &params, 200, taken, &mut rng)).map(|c| c.coin.coin_id()).collect();
+        assert!(picked.contains(&faucet), "cleared, it is a dish coin like any other");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §5.2 and §10: a key is funded only while no bundle for
+    /// it is held, parked or settling. A burner's spend held settling (its
+    /// dish coin listed spent, whether by our bundle or by a stranger's claim
+    /// at the same height) holds the burner's next gift, though not a
+    /// rewrite (`outgoing_pending_for`), and holds no other payer's; settled
+    /// SETTLED_DEPTH deep, it holds nothing. A settling spend that names no
+    /// payer is the money address's once a restore names it, and every
+    /// payer's until then, as a parked one is.
+    #[tokio::test]
+    async fn a_payers_settling_spend_holds_its_next_gift_and_no_one_elses() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_knock::SETTLED_DEPTH;
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-holds-for-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dish = Coin::new(Bytes32::new([96u8; 32]), Bytes32::new([2u8; 32]), 10);
+        let id = dish.coin_id();
+        let listing = |spent: Option<u32>, judged_at: Option<u32>| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: dish, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at,
+            }])
+        };
+        let bundle = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let lease = restored_in(&dir, "lease");
+        lease.park_with_bundle_at([(id, 900)], Some((&bundle, burner())), t0).unwrap();
+        assert!(lease.holds_for(burner()) && lease.outgoing_pending_for(burner()), "parked: it holds the gift and the rewrite");
+        assert!(!lease.holds_for(beacon()) && !lease.holds_for(money()));
+        let t1 = t0 + RECONCILE_GRACE;
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1001)), t1).await;
+        assert!(lease.is_settling(&id));
+        assert!(lease.holds_for(burner()), "settling: the burner's next gift waits on it");
+        assert!(!lease.outgoing_pending_for(burner()), "…and a rewrite does not");
+        assert!(!lease.holds_for(beacon()) && !lease.holds_for(money()), "nobody else's");
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1000 + SETTLED_DEPTH - 1)), t1).await;
+        assert!(lease.holds_for(burner()), "not yet SETTLED_DEPTH deep");
+        lease.reconcile_at(T11, &listing(Some(1000), Some(1000 + SETTLED_DEPTH)), t1).await;
+        assert!(!lease.is_taken(&id) && !lease.holds_for(burner()), "settled: the key may be funded again");
+
+        // A settling spend an older node filed, with no payer.
+        let settled = Coin::new(Bytes32::new([97u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let text = format!(
+            r#"{{"v":1,"spends":1,"parked":[],"settling":[{{"spend":1,"spent_at":1000,"coins":[{{"coin":"{}","seen_at":900}}],"bundle":"{}"}}]}}"#,
+            hex::encode(settled.coin_id()),
+            hex::encode(bundle.to_bytes().unwrap())
+        );
+        let unnamed = WalletLease::new();
+        unnamed.load(&serde_json::from_str(&text).unwrap(), t0).unwrap();
+        assert!(unnamed.is_settling(&settled.coin_id()));
+        for payer in [money(), beacon(), burner()] {
+            assert!(unnamed.holds_for(payer), "{payer:?}: no money address named, so it holds every payer, fail closed");
+            assert!(!unnamed.outgoing_pending_for(payer), "{payer:?}");
+        }
+        let path = dir.join("older.json");
+        std::fs::write(&path, &text).unwrap();
+        let named = WalletLease::new();
+        named.restore(&path, money());
+        assert!(named.is_settling(&settled.coin_id()) && named.holds_for(money()), "the money address's, once a restore names it");
+        assert!(!named.holds_for(beacon()) && !named.holds_for(burner()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

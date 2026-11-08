@@ -26,9 +26,7 @@
 use super::*;
 use std::sync::Arc;
 
-use chia_protocol::Program;
-
-use crate::chia_faucet::{claim_solution, FaucetParams, GAP_BLOCKS, GIFT_MOJOS};
+use crate::chia_faucet::{claim_spend, FaucetParams, GAP_BLOCKS, GIFT_MOJOS};
 use crate::chia_knock::SETTLED_DEPTH;
 use crate::chia_peer::mock::chain::{MockChain, FAILED};
 use crate::chia_peer::mock::MockNode;
@@ -220,14 +218,10 @@ fn memo_of(bundle: &SpendBundle, hint: Bytes32) -> Bytes32 {
     memo_digest(&carried.expect("the bundle carries a memo under the hint"))
 }
 
-/// The dish's TAKE of `dish` to `recipient`, keyless and fee 0, as
-/// `chia_faucet`'s claim builds it.
+/// The dish's TAKE of `dish` to `recipient`, keyless and fee 0, built by
+/// the builder `chia_faucet`'s claim uses ([`claim_spend`]).
 fn claim(params: &FaucetParams, dish: Coin, recipient: Bytes32) -> SpendBundle {
-    let mut a = clvmr::Allocator::new();
-    let puzzle = params.puzzle_reveal(&mut a).unwrap();
-    let solution = claim_solution(&mut a, params.puzzle_hash(), dish.amount, recipient, 0).unwrap();
-    let bytes = |node| Program::from(clvmr::serde::node_to_bytes(&a, node).unwrap());
-    SpendBundle::new(vec![CoinSpend::new(dish, bytes(puzzle), bytes(solution))], Signature::default())
+    SpendBundle::new(vec![claim_spend(params, dish, recipient).unwrap()], Signature::default())
 }
 
 /// A presence write lands, the resolver's reader opens it under the
