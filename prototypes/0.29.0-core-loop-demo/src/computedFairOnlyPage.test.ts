@@ -1938,6 +1938,49 @@ describe('a page-signed table beside a FAIR ONLY game: its switch is still its o
     expect(c.computedLiveTables()).toEqual([]);
   });
 
+  it('is not an ended incarnation for compaction while the switch names a live game: the name is a hint, and the page-signed incarnation only waits', async () => {
+    const page = await beside();
+    const c = page.casino;
+    const ended = (): string[] => c.computedEndedIncs().map((e) => `${e.t}:${e.inc}`);
+    const Y2 = `r${'4'.repeat(24)}`;
+    expect(ended()).toEqual([]); // (the switch names it)
+    switchTo(page, P.inc);
+    expect(c.computedIncOf(T)).toBe(P.inc);
+    expect(c.computedEndedIncs()).toEqual([]);
+    // the same as ever: a missing switch, or the name of a game that is not live, is no incarnation holding it
+    switchTo(page, null);
+    expect(ended()).toEqual([`${T}:${X}`]);
+    switchTo(page, Q.inc);
+    expect(c.computedResolutionOf(T, Q.inc)).toBeNull(); // (a name nothing opened: a dead hint)
+    expect(ended()).toEqual([`${T}:${X}`]);
+    switchTo(page, P.inc);
+    expect(ended()).toEqual([]);
+    // another page-signed incarnation's name takes its place; the game's name is the place of neither
+    c.writeComputedOn(T, Y2);
+    expect(ended()).toEqual([`${T}:${X}`]);
+    switchTo(page, P.inc);
+    expect(ended()).toEqual([]);
+    // and a removal still ends it, the switch naming the game or not
+    page.doc.transact(() => casinoOf(page).set(`gone:${T}:${X}`, 1));
+    expect(ended()).toEqual([`${T}:${X}`]);
+    page.doc.transact(() => casinoOf(page).set(`gone:${T}:${Y2}`, 1));
+    expect(ended()).toEqual([`${T}:${X}`, `${T}:${Y2}`]);
+  });
+
+  it('waits no longer when the game it waited beside ends: its name in the switch is a dead hint then, put back over as a missing switch is', async () => {
+    const page = await beside();
+    const c = page.casino;
+    pin(page, owner);
+    switchTo(page, P.inc);
+    expect(c.computedEndedIncs()).toEqual([]);
+    put(page, endOf(OWNERS, owner));
+    expect(c.computedResolutionOf(T, P.inc)).toMatchObject({ live: false });
+    // (the page puts the dead name back over in its turn, before compaction looks: until then the switch names nothing that holds it)
+    expect(c.computedEndedIncs().map((e) => `${e.t}:${e.inc}`)).toEqual([`${T}:${X}`]);
+    expect(c.putComputedSwitchBack(T, X)).toBe(true);
+    expect(c.computedEndedIncs()).toEqual([]);
+  });
+
   it('a restore in motion at the page-signed table the switch names is that table\'s, whichever game is played', async () => {
     const page = await beside();
     const c = page.casino;

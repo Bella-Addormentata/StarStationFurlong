@@ -4965,7 +4965,12 @@ export interface EndedComputed {
  *  switch that is missing or names another incarnation, or a checkpoint
  *  saying it ended) and still has a session map in the doc, by key. A table
  *  a removal took out isn't among the room's tables any more, so this, not
- *  the tables passed in, is what compaction goes by. */
+ *  the tables passed in, is what compaction goes by. 🔒 A switch naming a
+ *  live FAIR ONLY game (S7) is a hint, not another incarnation taking a
+ *  page-signed one's place: while a game is live the table plays it (S9) and
+ *  the page-signed incarnations only wait, their frozen slips still to reveal
+ *  when the game ends or the deed moves (computedIncOf). Compaction would
+ *  make that wait final: the end checkpoint, the sessions, then the seeds. */
 export function computedEndedIncs(): EndedComputed[] {
   const casino = ensureMap();
   const map = computedMap!;
@@ -4979,7 +4984,8 @@ export function computedEndedIncs(): EndedComputed[] {
     const c = computedIncs.get(key);
     // (A FAIR ONLY game is compacted by its own rules: PR 6c-4b.)
     if (!c?.last || c.fo) continue;
-    const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
+    const named = computedCfgInc(casino.get(`cfg:computed:${c.t}`));
+    const live = (named === c.inc || (named !== null && isFairOnlyInc(named) && fairOnlyLive(c.t, named)))
       && !casino.has(goneKey(c.t, c.inc)) && heldBase(c, map)?.e !== 1;
     if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
   }

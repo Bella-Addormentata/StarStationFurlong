@@ -56,10 +56,10 @@ function switchTo(p: Page, inc: string): void {
   p.doc.transact(() => casinoOf(p).set(`cfg:computed:${TABLE}`, { v: 1, inc }));
 }
 
-/** Frames of `p` every STEP over `ms` from `from`; the time after. */
-function tick(p: Page, from: number, ms: number): number {
-  run([p], from, from + ms, { step: STEP });
-  return from + ms + STEP;
+/** Frames of `p` every `step` (STEP) over `ms` from `from`; the time after. */
+function tick(p: Page, from: number, ms: number, step = STEP): number {
+  run([p], from, from + ms, { step });
+  return from + ms + step;
 }
 
 describe('the seeds behind the slips of a page-signed incarnation, while its table plays a FAIR ONLY game', () => {
@@ -90,6 +90,24 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     tick(a, T0 + STEP, 2 * a.table.REPUT_MS);
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
     expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc }); // (a live game\'s name is left)
+  });
+
+  it('are kept past the compaction wait while the switch names the game: the page-signed incarnation is not an ended one, its session, slip and seed stay', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    switchTo(a, G.inc);
+    const ses = `ses:${TABLE}:${INC}:g`;
+    const records = (): string[] => [...((computedOf(a).get(ses) as Y.Map<unknown> | undefined)?.keys() ?? [])].sort();
+    const before = records();
+    expect(before.length).toBeGreaterThan(0); // (the slip, among them)
+    tick(a, T0 + STEP, 2 * a.table.COMPACT_FALLBACK_MS, 1_000); // (past COMPACT_MS, and the wait of a page that wrote no slip of its own)
+    expect(a.casino.computedEndedIncs()).toEqual([]);
+    expect(records()).toEqual(before);
+    expect(computedOf(a).get(ses)).toBeInstanceOf(Y.Map);
+    expect(casinoOf(a).has(`gone:${TABLE}:${INC}`)).toBe(false);
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
   });
 
   it('are still there when the game ends and the table goes back to the page-signed incarnation: the switch put back, the slip frozen', async () => {
