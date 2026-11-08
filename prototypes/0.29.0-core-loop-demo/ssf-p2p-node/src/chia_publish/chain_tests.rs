@@ -1517,6 +1517,7 @@ async fn a_stale_take_marker_never_lets_a_burner_claim_its_dish_coin() {
     assert_eq!(write.coins.parked, f2.coin_id());
     let other = s.burner_write(&burner(41, 0), 0, Bytes32::new([0x55; 32]), None, |_| Ok(b"another record".to_vec()), 2).await;
     assert_eq!(waited(&other), Some(BurnerWait::NoCoinReady), "F1 marked and F2 parked: no coin ready");
+    assert!(!knock_attempt_counts(true, other.as_ref().err().unwrap()), "a dry dish is no knock attempt (§5.2)");
     assert!(s.lease.is_incoming_marker(&f1.coin_id()) && !s.lease.is_taken(&f1.coin_id()), "the marker stays as it was");
     assert_eq!(s.chain.received().iter().map(SpendBundle::name).collect::<HashSet<_>>().len(), 1, "one bundle sent");
     assert!(s.chain.unanswered().is_empty());
@@ -1534,6 +1535,7 @@ async fn the_fuse_stops_a_seventeenth_gift_and_sends_nothing() {
     let hint = Bytes32::new([0x56; 32]);
     let blown = s.burner_write(&burner(42, 0), 0, hint, None, |_| Ok(b"a seventeenth gift".to_vec()), 1).await;
     assert_eq!(waited(&blown), Some(BurnerWait::FuseBlown { era: 0 }));
+    assert!(!knock_attempt_counts(true, blown.as_ref().err().unwrap()), "a blown fuse is no knock attempt (§5.2)");
     assert!(s.chain.received().is_empty(), "nothing sent");
     assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin parked");
     assert_eq!(s.gifts(0), 16);
@@ -1631,6 +1633,7 @@ async fn a_claim_and_write_that_loses_the_race_for_its_dish_coin_is_refused_hand
     assert!(!s.chain.reorg_staged(), "the block came as our bundle was sent");
     let why = refused(&lost).expect("every peer refused the push");
     assert_eq!(why.matches("DOUBLE_SPEND").count(), 2, "{why}");
+    assert!(knock_attempt_counts(true, lost.as_ref().err().unwrap()), "a push every peer refused is a knock attempt (§5.2)");
     assert!(!s.lease.is_taken(&f.coin_id()), "a refusal hands F back");
     assert!(!s.lease.outgoing_pending_for(Payer::of_burner(&key)));
     assert_eq!(s.gifts(0), 0, "a refused push counts no gift");

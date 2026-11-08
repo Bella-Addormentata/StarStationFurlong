@@ -43,7 +43,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::{ChainAccess, PagedRecords};
+use crate::chia_chain::{ChainAccess, ChainError, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -451,11 +451,31 @@ pub struct Unspent {
     pub partial: bool,
 }
 
+/// A coin listing the chain did not give ([`unspent_at`]): the chain's own
+/// error for the page that failed, under the words the listing's callers
+/// have always logged ("coin lookup: ..."). It is typed so that a caller
+/// can tell a failed read, which a later try may get past, from a refusal:
+/// a knock that could not read the chain waits and uses no attempt (stage 4
+/// design §5.2, `chia_publish::is_typed_wait`).
+#[derive(Debug)]
+pub struct CoinLookupFailed(pub ChainError);
+
+impl std::fmt::Display for CoinLookupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "coin lookup: {}", self.0)
+    }
+}
+
+/// No source: the text already holds the chain's error, and an alternate
+/// print (`{:#}`) would say it twice.
+impl std::error::Error for CoinLookupFailed {}
+
 /// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
 /// coins are asked for as well: the chain pages by a coin's latest change, so
 /// a coin listed unspent on one page comes again, spent, on a later one when
 /// the chain moved on in between, and only that later record says so
-/// ([`PagedRecords`]); the spent ones are dropped once every page is in.
+/// ([`PagedRecords`]); the spent ones are dropped once every page is in. A
+/// page the chain did not give fails the listing as [`CoinLookupFailed`].
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
     let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
@@ -464,7 +484,7 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
         let listing = client
             .coin_records_by_puzzle_hash(puzzle_hash, true, cursor.take())
             .await
-            .map_err(|e| anyhow!("coin lookup: {e}"))?;
+            .map_err(CoinLookupFailed)?;
         pages += 1;
         gathered.fold(listing.records);
         let truncated = listing.truncated;
@@ -962,7 +982,8 @@ impl std::error::Error for ClaimToError {}
 /// holds, and the TAKE marker's. It neither pushes nor parks nor marks
 /// anything, so calling it twice picks twice from the same coins.
 /// `ClaimToError::PeakUnavailable` and `ClaimToError::NoCoinReady` come back
-/// typed; a listing that failed is a plain error.
+/// typed; a listing that failed is no `ClaimToError` but the listing's own
+/// [`CoinLookupFailed`].
 #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
 pub async fn claim_to<R: rand::Rng + ?Sized>(
     net: ChiaNet,
@@ -2364,7 +2385,8 @@ mod tests {
     /// Stage 4 design §5.2 and §10: a dish with no ready coin the caller does
     /// not hold is `ClaimToError::NoCoinReady`, a wait the caller tells from
     /// a failure by its type; with no peak answered it is `PeakUnavailable`,
-    /// and the dish is not listed. A listing that fails is a plain error.
+    /// and the dish is not listed. A listing that fails is no wait for the
+    /// dish but the listing's own failed read ([`CoinLookupFailed`]).
     #[tokio::test]
     async fn claim_to_says_no_coin_ready_as_its_own_error() {
         use crate::chia_chain::testing::Scripted;
@@ -2388,6 +2410,8 @@ mod tests {
         assert!(chain.asked_spent.lock().unwrap().is_empty(), "no listing without a peak");
         let chain = Scripted::new(vec![]).with_peak(200);
         let err = claim_to(T11, &chain, recipient, |_| false, &mut rng).await.unwrap_err();
-        assert_eq!(typed(&err), None, "a failed listing is no wait: {err}");
+        assert_eq!(typed(&err), None, "a failed listing is no wait for the dish: {err}");
+        assert!(err.downcast_ref::<CoinLookupFailed>().is_some(), "but a failed read, typed: {err}");
+        assert_eq!(err.to_string(), "coin lookup: unanswered (nothing listens (test chain))", "in the words the listing always said");
     }
 }

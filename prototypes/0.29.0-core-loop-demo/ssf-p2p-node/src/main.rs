@@ -6369,8 +6369,9 @@ mod test_hook_tests {
 }
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
-/// what the load did, its key fingerprint and receive address and, with the
-/// beacon on, the beacon's address. Never the words.
+/// what the load did, its key fingerprint and receive address, with the
+/// beacon on the beacon's address and, with SSF_CHIA_BURNERS set to `1`,
+/// what burner keys do on this network. Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
     chia_wallet::log_receive_address(net, id);
@@ -6383,6 +6384,14 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
         if let Some(warning) = warning {
             eprintln!("{warning}");
         }
+    }
+    // Stage 4 design §8 (2): burner keys on for a test network's run, or
+    // ignored off one, said as a refused test hook is; nothing is said when
+    // the variable is not `1`.
+    match chia_publish::burners() {
+        (true, Some(line)) => println!("{line}"),
+        (false, Some(line)) => eprintln!("{line}"),
+        _ => {}
     }
 }
 

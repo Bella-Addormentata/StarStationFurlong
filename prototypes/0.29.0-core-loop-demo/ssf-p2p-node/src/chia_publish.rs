@@ -2205,12 +2205,10 @@ async fn publish_memo_with(
     let client = crate::chia_chain::connect();
     WALLET_LEASE.reconcile(&client).await;
     if WALLET_LEASE.outgoing_pending() {
-        return Err(anyhow!("a spend from this wallet is still settling — the {what} write waits for its verdict"));
+        return Err(MemoWait::Settling(what.to_string()).into());
     }
     let our_ph = our_puzzle_hash(payer);
-    let coin = find_spendable_coin(&client, our_ph)
-        .await?
-        .ok_or_else(|| anyhow!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"))?;
+    let coin = find_spendable_coin(&client, our_ph).await?.ok_or(MemoWait::Unfunded(our_ph))?;
     let input = coin.coin.coin_id();
     let _gate = match gate {
         Some(gate) => Some(gate.lock().await),
@@ -2234,6 +2232,31 @@ async fn publish_memo_with(
     }
 }
 
+/// Why a write the SSF wallet pays for ([`publish_memo_with`]) did not go
+/// out this time although nothing about it is wrong: it waits, and the
+/// heartbeat tries again on its retry cadence. The text is the one the log
+/// has always said; the type lets the knock arm tell a wait from a failure
+/// by downcasting ([`is_typed_wait`], stage 4 design §5.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoWait {
+    /// A spend of ours is still settling ([`WalletLease::outgoing_pending`]),
+    /// so the write it names waits for its verdict (#231 P6a).
+    Settling(String),
+    /// The wallet holds no free coin at its puzzle hash, the one named.
+    Unfunded(Bytes32),
+}
+
+impl std::fmt::Display for MemoWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoWait::Settling(what) => write!(f, "a spend from this wallet is still settling — the {what} write waits for its verdict"),
+            MemoWait::Unfunded(puzzle_hash) => write!(f, "chia wallet unfunded — no unspent coin at puzzle hash {puzzle_hash}"),
+        }
+    }
+}
+
+impl std::error::Error for MemoWait {}
+
 // ── #231 P6b: knocks and beacons ─────────────────────────────────────────────
 
 /// D7: the beacon role is opt-in (`SSF_CHIA_BEACON=1`): a public entry point
@@ -2242,6 +2265,50 @@ async fn publish_memo_with(
 /// roster of every active node id would be a public weekly directory.
 pub fn beacon_enabled() -> bool {
     std::env::var("SSF_CHIA_BEACON").ok().as_deref() == Some("1")
+}
+
+/// The variable that turns burner keys on for a run (stage 4 design §8 (2),
+/// §13 row 9): `SSF_CHIA_BURNERS=1`, on a test network only.
+pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
+
+/// Whether [`BURNERS_ENV`] set to `raw` turns burner keys on for `net`, and
+/// the line said once a wallet loads (stage 4 design §8 (2)). Exactly `1` on
+/// a test network turns them on, and the line says what that does in this
+/// build: the knock rule of §5.2 ([`knock_attempt_counts`]), with the
+/// listing, knocks and beacon paid as before. Exactly `1` off a test network
+/// is ignored with a line: there no memo spend leaves the money key
+/// ([`refuse_money_memo`]), and nothing exits or changes. Any other value
+/// (unset, empty, `0`, `true`, a stray space, not UTF-8) is off and says
+/// nothing, whatever the network, as a hook's does (main.rs `test_hook`).
+/// It reads no environment, so its tests ask it every value on every
+/// network.
+pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsStr>) -> (bool, Option<String>) {
+    if raw != Some(std::ffi::OsStr::new("1")) {
+        return (false, None);
+    }
+    if !net.is_test() {
+        return (false, Some(format!("⛓️ ChiaHub: {BURNERS_ENV}=1 is ignored on {}. Burner keys are tried on a test network only.", net.name())));
+    }
+    let line = format!(
+        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. The listing, knocks and beacon are still paid as before.",
+        net.name(),
+        HEARTBEAT_RETRY_SECS / 60
+    );
+    (true, Some(line))
+}
+
+/// The process's [`BURNERS_ENV`] on its network ([`burners_of`]), read once,
+/// as `chia_wallet_switch::env_switch` reads `SSF_CHIA_LANE`: the startup
+/// line and the heartbeat's knock rule see the same value. The network is
+/// settled before anything asks.
+pub fn burners() -> &'static (bool, Option<String>) {
+    static BURNERS: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
+    BURNERS.get_or_init(|| burners_of(crate::chia_network::net(), std::env::var_os(BURNERS_ENV).as_deref()))
+}
+
+/// Whether burner keys are on for this run ([`burners`]).
+pub fn burners_enabled() -> bool {
+    burners().0
 }
 
 /// #231 P6b/D7: a beacon is an entry point to the WELCOME room and nothing
@@ -2266,10 +2333,69 @@ pub fn serves_welcome_room(hub: &crate::SharedHub) -> bool {
 const CTX_BEACON_WALLET: &str = "ssf-chia-beacon-wallet-v1";
 /// Where the beacon's last write is remembered, 0600 like every node file.
 pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
-/// Retries of a knock that failed to leave (an unfunded wallet, a spend still
-/// settling) before the request is dropped; the next dial exhaustion queues
-/// it again.
+/// Attempts of a knock that failed to leave before the request is dropped;
+/// the next dial exhaustion queues it again. With burner keys off every
+/// failure is one, as it always was. With them on ([`burners_enabled`],
+/// stage 4 design §5.2) a knock that only waits ([`is_typed_wait`]: the
+/// wallet unfunded or still settling, no dish coin ready, the lease not
+/// parking, the chain unread) is none, and the knock arm tries again after
+/// [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]); every other failure, a push
+/// the peers refused among them, is one ([`knock_attempt_counts`]).
 pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
+
+/// Whether `e` is a wait rather than a failure (stage 4 design §5.2, §10):
+/// somewhere in its chain is one of the typed reasons a write did not go
+/// out although nothing about the write is wrong, so the same write tried
+/// later can go out. They are:
+/// - [`MemoWait`]: the SSF wallet still settling a spend, or unfunded;
+/// - `claim_write::BurnerWait`: a burner's every wait (its spend in flight
+///   or settling, its listing cut short, no peak, no dish coin ready, the
+///   fuse blown);
+/// - `chia_faucet::ClaimToError::NoCoinReady` and `PeakUnavailable`: a dry
+///   or griefed dish, or no peak to judge it by;
+/// - [`LeaseError`] and [`PushError::NotSent`]: the lease sealed, or not
+///   parking the spend, so nothing left;
+/// - a failed chain read: a [`ChainError`], or a coin listing that failed
+///   (`chia_faucet::CoinLookupFailed`).
+///
+/// Nothing else is a wait: a push every peer refused
+/// ([`PushError::Rejected`], a lost race among them), a body that could not
+/// be built or sealed, a builder's error or a broken burner rule
+/// (`claim_write::BurnerRule`), a refused claim, and anything untyped.
+fn is_typed_wait(e: &anyhow::Error) -> bool {
+    use crate::chia_faucet::{ClaimToError, CoinLookupFailed};
+    e.chain().any(|cause| {
+        cause.is::<MemoWait>()
+            || cause.is::<claim_write::BurnerWait>()
+            || matches!(cause.downcast_ref::<ClaimToError>(), Some(ClaimToError::NoCoinReady | ClaimToError::PeakUnavailable))
+            || cause.is::<LeaseError>()
+            || matches!(cause.downcast_ref::<PushError>(), Some(PushError::NotSent(_)))
+            || cause.is::<ChainError>()
+            || cause.is::<CoinLookupFailed>()
+    })
+}
+
+/// Whether a knock that failed with `e` uses one of its
+/// [`MAX_KNOCK_ATTEMPTS`]. With burner keys off (`burners` false) every
+/// failure does, so the knock arm is today's. With them on, a wait
+/// ([`is_typed_wait`]) does not, and every other failure does. That is how
+/// this node reads "only a push the peers refused counts" (stage 4 design
+/// §5.2): a dry dish, an unfunded wallet or an unread chain never ends a
+/// knock, while a request that can never leave, such as one to a host card
+/// whose key cannot be sealed to, is still dropped after its attempts, as on
+/// main, instead of being tried for ever.
+fn knock_attempt_counts(burners: bool, e: &anyhow::Error) -> bool {
+    !burners || !is_typed_wait(e)
+}
+
+/// Whether the knock arm may try at `now`, the last knock that waited having
+/// waited at `wait` ([`knock_attempt_counts`]): at once if none did, and
+/// otherwise once [`HEARTBEAT_RETRY_SECS`] have passed, so a wait does not
+/// take every tick from the beacon and the rooms (stage 4 design §5.2:
+/// attempts are paced by the retry).
+fn knock_paced(wait: Option<Instant>, now: Instant) -> bool {
+    wait.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
+}
 
 /// The beacon's own wallet key, funded SEPARATELY (its address is printed at
 /// startup): a clear-text node id must never share coin lineage with the
@@ -2809,6 +2935,9 @@ pub async fn heartbeat_loop(
     // the row's edition, and judges a write an older build left; the
     // watcher is not told to read this node's own listing for it.
     let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
+    // Burner keys on for this run (SSF_CHIA_BURNERS=1 on a test network): in
+    // the heartbeat they change only the knock rule (stage 4 design §5.2).
+    let burners = burners_enabled();
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
     let mut refused_logged: HashSet<String> = HashSet::new();
@@ -2863,6 +2992,10 @@ pub async fn heartbeat_loop(
     let beacon_mark_path = beacon_mark_file.as_path();
     let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
     let mut beacon_attempt: Option<Instant> = None;
+    // When the last knock only waited (burners on, `knock_attempt_counts`):
+    // the knock arm rests for the retry cadence from then (`knock_paced`).
+    // With burners off it is never set, and the arm is today's.
+    let mut knock_wait: Option<Instant> = None;
     let mut welcome_warned = false;
     if let (Some(_), Some(m)) = (&beacon_sk, &beacon_mark) {
         println!(
@@ -3117,7 +3250,7 @@ pub async fn heartbeat_loop(
         // meanwhile (a link by any path cancels the knock). Era-bound like
         // presence: no write without a peak, inside the era's guard blocks, or
         // on a peak the presence lookups above let age out.
-        if knock_waiting && money_refused.is_none() && peak > 0 && !era_guard(peak) && !peak_aged("knock") {
+        if knock_waiting && money_refused.is_none() && peak > 0 && !era_guard(peak) && knock_paced(knock_wait, Instant::now()) && !peak_aged("knock") {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -3155,6 +3288,7 @@ pub async fn heartbeat_loop(
                 };
                 match publish_knock(net, &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
                     Ok((hint, write)) => {
+                        knock_wait = None;
                         let hint_hex = hex::encode(hint.to_bytes());
                         println!(
                             "⛓️ ChiaHub knock: {} on {} for room {} in era {era} · inbox hint {} — both sides dial on the confirmation height",
@@ -3181,6 +3315,19 @@ pub async fn heartbeat_loop(
                             short(&req.host),
                             req.room
                         );
+                    }
+                    // Burners on: a knock that only waits keeps its
+                    // attempts and goes back in the queue, and the arm rests
+                    // for the retry cadence (stage 4 design §5.2).
+                    Err(e) if !knock_attempt_counts(burners, &e) => {
+                        knock_wait = Some(Instant::now());
+                        eprintln!(
+                            "⛓️ ChiaHub knock: knock on {} for room {} waits: {e:#} — not an attempt; tried again in {} min",
+                            short(&req.host),
+                            req.room,
+                            HEARTBEAT_RETRY_SECS / 60
+                        );
+                        hub.knock_queue.lock().unwrap().push_back(req);
                     }
                     Err(e) => {
                         req.attempts = req.attempts.saturating_add(1);
@@ -5808,6 +5955,163 @@ mod tests {
         let main = sign_standard_spends(ChiaNet::Mainnet, &sk, t11.coin_spends.clone()).unwrap();
         assert_eq!(t11.coin_spends, main.coin_spends, "the same spend; only the signature differs");
         assert_ne!(t11.aggregated_signature, main.aggregated_signature);
+    }
+
+    /// Stage 4 design §8 (2): `SSF_CHIA_BURNERS` is on with exactly `1` on a
+    /// test network, and its line says what it does in this build. `1` off a
+    /// test network is ignored, with one line; any other value is off and
+    /// says nothing, on every network. No environment is read.
+    #[test]
+    fn ssf_chia_burners_is_on_with_exactly_1_on_a_test_network_and_ignored_with_a_line_off_one() {
+        use crate::chia_network::ChiaNet;
+        use std::ffi::OsStr;
+        for net in ChiaNet::ALL {
+            assert_eq!(burners_of(net, None), (false, None), "unset on {net:?}");
+            for raw in ["", "0", "true", "yes", " 1", "1 ", "11", "01"] {
+                assert_eq!(burners_of(net, Some(OsStr::new(raw))), (false, None), "{raw:?} on {net:?}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                for raw in [&[0xffu8][..], &[b'1', 0xff][..]] {
+                    assert_eq!(burners_of(net, Some(OsStr::from_bytes(raw))), (false, None), "not UTF-8 ({raw:?}) on {net:?}");
+                }
+            }
+            let (on, line) = burners_of(net, Some(OsStr::new("1")));
+            assert_eq!(on, net.is_test(), "{net:?}");
+            assert!(line.is_some(), "1 is said on {net:?}");
+        }
+        assert_eq!(
+            burners_of(ChiaNet::Testnet11, Some(OsStr::new("1"))).1.as_deref(),
+            Some(
+                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. The listing, knocks and beacon are still paid as before."
+            )
+        );
+        assert_eq!(
+            burners_of(ChiaNet::Mainnet, Some(OsStr::new("1"))).1.as_deref(),
+            Some("⛓️ ChiaHub: SSF_CHIA_BURNERS=1 is ignored on Chia mainnet. Burner keys are tried on a test network only.")
+        );
+    }
+
+    /// The reasons a money-paid write waits are typed now, and say what the
+    /// log always said: the text is the one `publish_memo_with` gave as a
+    /// plain error before, so the presence, knock and beacon lines read the
+    /// same (stage 4 design §5.2).
+    #[test]
+    fn a_money_writes_waits_are_typed_and_read_as_they_always_did() {
+        let what = "knock";
+        let settling: anyhow::Error = MemoWait::Settling(what.to_string()).into();
+        assert_eq!(format!("{settling:#}"), format!("a spend from this wallet is still settling — the {what} write waits for its verdict"));
+        let our_ph = Bytes32::new([0xa1; 32]);
+        let unfunded: anyhow::Error = MemoWait::Unfunded(our_ph).into();
+        assert_eq!(format!("{unfunded:#}"), format!("chia wallet unfunded — no unspent coin at puzzle hash {our_ph}"));
+        assert_eq!(unfunded.to_string(), format!("{unfunded:#}"), "one line either way");
+    }
+
+    /// Real errors of each kind a knock can fail with, as the code that
+    /// fails makes them where a test can reach it: the waits of stage 4
+    /// design §5.2 first, then the failures. The chain's are read from a
+    /// chain that answers nothing, the lease's from a lease sealed by an
+    /// unreadable file and one whose file cannot be saved, the dish's from
+    /// `claim_to`, and the seal's from a host card whose key is a low-order
+    /// point. The burner writer's waits, its rules and a push the peers
+    /// refused are their own values, as the writer's seam returns them
+    /// (chain_tests drives the seam to each).
+    async fn knock_failures(test: &str) -> (Vec<(&'static str, anyhow::Error)>, Vec<(&'static str, anyhow::Error)>) {
+        use super::claim_write::{check_burner_spends, BurnerRule, BurnerWait};
+        use crate::chia_chain::testing::{Scripted, Unanswering};
+        use crate::chia_faucet::{claim_to, ClaimToError};
+        use rand::SeedableRng;
+        let nobody = Bytes32::new([0xc1; 32]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let dir = std::env::temp_dir().join(format!("ssf-knock-attempts-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sealed = WalletLease::new();
+        std::fs::write(dir.join("sealed.json"), b"not a lease").unwrap();
+        sealed.restore(&dir.join("sealed.json"), money());
+        let unsaved = WalletLease::new();
+        unsaved.restore(&dir.join("missing").join("wallet_lease.json"), money());
+        let empty = || SpendBundle::new(vec![], chia_bls::Signature::default());
+        let coin = Bytes32::new([0xc2; 32]);
+        let empty_dish = crate::chia_chain::CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: None };
+        let host = KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts: 0 };
+        let iroh_sk = iroh::SecretKey::from_bytes(&[5u8; 32]);
+
+        let waits: Vec<(&'static str, anyhow::Error)> = vec![
+            ("the wallet still settling", MemoWait::Settling("knock".into()).into()),
+            ("the wallet unfunded", MemoWait::Unfunded(Bytes32::new([0xa1; 32])).into()),
+            ("a burner's spend in flight", BurnerWait::Held.into()),
+            ("a burner's bundle settling", BurnerWait::Settling.into()),
+            ("a burner's listing cut short", BurnerWait::ListingCutShort.into()),
+            ("no peak for a burner's gift", BurnerWait::PeakUnavailable.into()),
+            ("no lobby coin for a burner", BurnerWait::NoCoinReady.into()),
+            ("the fuse blown", BurnerWait::FuseBlown { era: 3 }.into()),
+            ("no dish coin ready", claim_to(T11, &Scripted::new(vec![empty_dish]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
+            ("no peak for the dish", claim_to(T11, &Unanswering, nobody, |_| false, &mut rng).await.unwrap_err()),
+            ("the dish's listing unread", claim_to(T11, &Scripted::new(vec![]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
+            ("the lease sealed", sealed.ensure_open().unwrap_err().into()),
+            ("the lease sealed, at the push", push_parked_with(&sealed, &Unanswering, money(), empty(), [coin]).await.unwrap_err().into()),
+            ("the lease unsaved, at the push", push_parked_with(&unsaved, &Unanswering, money(), empty(), [coin]).await.unwrap_err().into()),
+            ("the wallet's listing unread", find_spendable_coin(&Unanswering, Bytes32::new([0xa1; 32])).await.unwrap_err()),
+            ("the peak unread", Unanswering.peak_height().await.unwrap_err().into()),
+            ("a wait under a context", anyhow::Error::from(MemoWait::Unfunded(Bytes32::new([0xa1; 32]))).context("knock on H")),
+        ];
+        let failures: Vec<(&'static str, anyhow::Error)> = vec![
+            ("a push every peer refused, a lost race", PushError::Rejected("addr: DOUBLE_SPEND".into()).into()),
+            ("a push refused for its fee", PushError::Rejected("INVALID_FEE_TOO_CLOSE_TO_ZERO".into()).into()),
+            ("a host card whose key cannot be sealed to", knock_memo(T11, &iroh_sk, &host, &[6u8; 32], 0, coin, None, 1_791_700_000).unwrap_err()),
+            ("a burner rule the bundle breaks", check_burner_spends(T11, nobody, &[]).unwrap_err().into()),
+            ("a burner paying more than itself", BurnerRule::R5.into()),
+            ("a claim the dish refuses", ClaimToError::Refused("no claim here").into()),
+            ("an untyped error", anyhow!("memo alloc failed")),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        (waits, failures)
+    }
+
+    /// Stage 4 design §5.2 with burner keys on: a knock that only waits (the
+    /// wallet unfunded or settling, no dish coin, the lease not parking, the
+    /// chain unread) uses no attempt, and every other failure uses one, a
+    /// push every peer refused and a host card that can never be sealed to
+    /// among them, so a request that can never leave is still dropped after
+    /// its attempts.
+    #[tokio::test]
+    async fn with_burners_on_a_knock_that_only_waits_uses_no_attempt_and_every_other_failure_uses_one() {
+        let (waits, failures) = knock_failures("on").await;
+        let named = |list: &[(&str, anyhow::Error)], name: &str| list.iter().find(|(what, _)| *what == name).map(|(_, e)| format!("{e:#}")).unwrap();
+        assert!(named(&failures, "a host card whose key cannot be sealed to").contains("low-order point"), "the seal's own error");
+        assert!(named(&waits, "the dish's listing unread").starts_with("coin lookup: unanswered"), "the listing's own error");
+        for (what, e) in &waits {
+            assert!(is_typed_wait(e), "{what} is a wait: {e:#}");
+            assert!(!knock_attempt_counts(true, e), "{what} uses no attempt: {e:#}");
+        }
+        for (what, e) in &failures {
+            assert!(!is_typed_wait(e), "{what} is no wait: {e:#}");
+            assert!(knock_attempt_counts(true, e), "{what} uses an attempt: {e:#}");
+        }
+    }
+
+    /// With burner keys off, every knock failure uses an attempt, waits and
+    /// all, as it always did: the knock arm is main's.
+    #[tokio::test]
+    async fn with_burners_off_every_knock_failure_uses_an_attempt_as_before() {
+        let (waits, failures) = knock_failures("off").await;
+        for (what, e) in waits.iter().chain(&failures) {
+            assert!(knock_attempt_counts(false, e), "{what}: {e:#}");
+        }
+    }
+
+    /// A knock that waited rests the knock arm for the retry cadence, not a
+    /// tick (stage 4 design §5.2): the beacon and the rooms keep their ticks.
+    #[test]
+    fn a_knock_that_waits_is_paced_by_the_retry_cadence() {
+        let t0 = Instant::now();
+        assert!(knock_paced(None, t0), "no knock waited: the arm runs");
+        assert!(!knock_paced(Some(t0), t0), "just waited");
+        assert!(!knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
+        assert!(knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "the retry cadence has passed");
+        assert_eq!(HEARTBEAT_RETRY_SECS, 300);
     }
 }
 
