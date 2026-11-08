@@ -359,8 +359,9 @@ export class DoorDockingPortSystem {
   private doorFadeMats: Map<DoorId, THREE.Material[]> = new Map();
   /** Current eased fade opacity per door (1 = solid). */
   private doorFadeOpacity: Map<DoorId, number> = new Map();
-  /** Resting opacity of a camera-facing door in the isometric view. */
-  private static readonly FACING_FADE_OPACITY = 0.35;
+  /** Resting opacity of a camera-facing door in the isometric view: very
+   *  faint, so a near-wall door never hides the room behind it. */
+  public static readonly FACING_FADE_OPACITY = 0.1;
   // Handlers
   private onConnectionRequestCallback:
     | ((doorId: string, address: string) => void)
@@ -4633,7 +4634,13 @@ export class DoorDockingPortSystem {
       const transparent = next < 0.999;
       for (const mat of mats) {
         mat.opacity = next;
-        mat.transparent = transparent;
+        // three.js compiles an opaque material with its alpha forced to 1 and
+        // doesn't recompile on a `transparent` flip alone, so a door first
+        // drawn solid (a far wall before the view turned) stayed solid.
+        if (mat.transparent !== transparent) {
+          mat.transparent = transparent;
+          mat.needsUpdate = true;
+        }
       }
     }
   }
