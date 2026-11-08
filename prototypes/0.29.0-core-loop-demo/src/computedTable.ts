@@ -748,7 +748,8 @@ function newTable(t: string, inc: string): TableState {
  *  switchLeft), even if it carries a FAIR ONLY hint now. A name that is no such
  *  incarnation takes nobody's place: a FAIR ONLY hint, one nothing opened, one
  *  that has ended, one of the table's other game (a peer's doing: nothing this
- *  table can play), junk, none. Nor on a doc holding part of an update
+ *  table can play; beside a live game the incarnation waits under it, its felts
+ *  held: casinoDoc otherGameStands), junk, none. Nor on a doc holding part of an update
  *  (casinoWhole): the switch it reads may be one a parked write has since
  *  moved, and seeds let go of on that reading cannot be had back. The one test
  *  of over for the frames: tableOf and the compaction duty replace the state by
