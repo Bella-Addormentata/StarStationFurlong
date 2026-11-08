@@ -229,7 +229,7 @@ import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDig
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
 import { asFin, asXf, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId } from './computedFairOnly';
 import type { CkRead, CkRec } from './computedFairOnly';
-import { resolveGame } from './computedFairOnlyAuth';
+import { resolveGame, tableGame } from './computedFairOnlyAuth';
 import type { Resolution } from './computedFairOnlyAuth';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
@@ -1411,10 +1411,10 @@ export function clearTableKeys(
     // marks nothing of it), which a page that ran it would otherwise put
     // back on the table put back under the same id (putComputedSwitchBack).
     if (!opts.keepComputed) {
-      const cinc = computedIncOf(tableId);
-      if (cinc !== null) markRemoved(map, tableId, cinc);
-      // (Not a FAIR ONLY game: a removal marks nothing of one, S7. Its end is
-      // its authority's.)
+      const cinc = switchIncOf(tableId);
+      // (Not a FAIR ONLY game, one the switch names or not: a removal marks
+      // nothing of one, S7. Its end is its authority's.)
+      if (cinc !== null && !isFairOnlyInc(cinc)) markRemoved(map, tableId, cinc);
       for (const inc of computedIncsOf.get(tableId) ?? []) {
         const other = computedIncs.get(`${tableId}:${inc}`)!;
         if (inc !== cinc && !other.fo && other.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
@@ -2104,9 +2104,10 @@ let computedMap: Y.Map<unknown> | null = null;
  *  🔒 FAIR ONLY games (`p` roulette, `q` craps: computedFairOnly) are named
  *  apart, by isFairOnlyInc, and only where their records live: the sessions of
  *  one (`ses:`, its first never `g`) and its own top-level records (`ck:`,
- *  `xf:`, `fin:`). A `sum:`, an `hs:` or a switch naming one is junk to this
- *  build: a page-signed checkpoint is nothing of theirs, and what plays a table
- *  is the PR 6c-4a-2 switch's to settle. */
+ *  `xf:`, `fin:`). A `sum:`, an `hs:` or a `g` session of one is junk to this
+ *  build: a page-signed checkpoint is nothing of theirs. A table's switch may
+ *  name one (computedCfgInc), as a hint to the game the table plays
+ *  (computedIncOf, design S9). */
 const COMPUTED_INC = /^[ckrd][0-9a-f]{24}$/;
 /** A session's id: `g` for an incarnation's first, else nextSid's 24 hex. */
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
@@ -2294,6 +2295,15 @@ let hkFeed: unknown[] | null = null;
  *  (refreshFairOnly): a record of one or a delegation of the room moved, a
  *  check that waited may be done, or the game is new. */
 let staleGames = new Set<ComputedInc>();
+/** 🔒 How many FAIR ONLY games this page tracks: with none, the game a table
+ *  plays is its switch's, as it always was (computedIncOf), at no cost. */
+let foGames = 0;
+/** 🔒 The game each table with a FAIR ONLY game played as last looked at
+ *  (notePlayedGames; null: none), and where S9's choice moved from one FAIR
+ *  ONLY game to another since this page bound the doc (the ⚙ card's 🚩 THE
+ *  TABLE'S GAME MOVED: computedGameMovedOf). */
+let foPlayed = new Map<string, string | null>();
+let foMoved = new Map<string, { from: string; to: string }>();
 /** 🔒 The verdicts on the signatures a FAIR ONLY game's resolution asks about
  *  (authCheck), by sigId: one map for every game of the room, since an id
  *  binds what it covers (a record copied into another game is another thing
@@ -2428,9 +2438,12 @@ function heldBase(c: ComputedInc, map: Y.Map<unknown>): Checkpoint | null {
 }
 
 /** heldBase of incarnation `inc` of table `tableId`: the doc's checkpoint
- *  for one this page doesn't track. */
+ *  for one this page doesn't track. 🔒 A FAIR ONLY game's is the one its
+ *  resolution names (null for none, or a game this page doesn't track): a
+ *  `sum:` of its name is junk, never read. */
 function baseOf(tableId: string, inc: string): Checkpoint | null {
   const c = computedIncs.get(`${tableId}:${inc}`);
+  if (isFairOnlyInc(inc)) return c?.fo?.res?.base?.ck ?? null;
   return c ? heldBase(c, computedMap!) : checkpointAt(computedMap!, tableId, inc);
 }
 
@@ -2744,27 +2757,61 @@ export function computedSlipDoubted(tableId: string, hash: string): boolean {
 }
 
 /** The incarnation a switch names: exactly {v: 1, inc}, `inc` a computed
- *  one's name. Null for none, or anything else (no timestamp: identical
+ *  one's name, 🔒 or a FAIR ONLY game's (a hint to the game the table plays:
+ *  computedIncOf). Null for none, or anything else (no timestamp: identical
  *  switches written at once merge). (Exported for the house's test
- *  vectors: the owner's node reads switches as this does.) */
+ *  vectors: the owner's node reads switches as this does, and reads a
+ *  FAIR ONLY name as none until its half of PR 6c.) */
 export function computedCfgInc(value: unknown): string | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const cfg = value as { v?: unknown; inc?: unknown };
-  return Object.keys(cfg).length === 2 && cfg.v === 1 && typeof cfg.inc === 'string' && COMPUTED_INC.test(cfg.inc)
+  return Object.keys(cfg).length === 2 && cfg.v === 1 && typeof cfg.inc === 'string' && (COMPUTED_INC.test(cfg.inc) || isFairOnlyInc(cfg.inc))
     ? cfg.inc : null;
 }
 
-/** The computed incarnation table `tableId`'s switch names, or null. */
-export function computedIncOf(tableId: string): string | null {
+/** The incarnation table `tableId`'s switch names, as written, or null: the
+ *  switch API's (put it back, take it away, drop one nothing stands behind)
+ *  and every page-signed duty's, which have no part in the game a table plays
+ *  when that is a FAIR ONLY one (computedIncOf). */
+export function switchIncOf(tableId: string): string | null {
   return computedCfgInc(ensureMap().get(`cfg:computed:${tableId}`));
 }
 
-/** Whether table `tableId` is a computed one now: its switch names an
- *  incarnation no removal has ended (`gone:`) and whose checkpoint doesn't
- *  say it ended. (Its decided nets count either way: the ledger.) */
+/** The incarnation table `tableId` plays, or null: the one its switch names,
+ *  as it always was, 🔒 unless the table has a live FAIR ONLY game, when it
+ *  is S9's choice among them (computedFairOnlyAuth tableGame: the game the
+ *  deed holder holds, else the one the switch names, else the only live one,
+ *  else the lowest name), the switch being a hint. A page never plays the
+ *  switch's game against it for a reason of its own: only the games' state
+ *  and the deed move this. */
+export function computedIncOf(tableId: string): string | null {
+  const named = switchIncOf(tableId);
+  if (foGames === 0) return named;
+  const games: Resolution[] = [];
+  for (const inc of computedIncsOf.get(tableId) ?? []) {
+    const res = computedIncs.get(`${tableId}:${inc}`)?.fo?.res;
+    if (res) games.push(res);
+  }
+  return tableGame(games, deedHolderKey(), named)?.inc ?? named;
+}
+
+/** Whether FAIR ONLY game `inc` of table `tableId` is live (S7): its
+ *  resolution names a base that doesn't end it. The table's switch, `gone:`
+ *  marks and a removal have no part in it. */
+function fairOnlyLive(tableId: string, inc: string): boolean {
+  return computedIncs.get(`${tableId}:${inc}`)?.fo?.res?.live === true;
+}
+
+/** Whether table `tableId` is a computed one now: it plays an incarnation no
+ *  removal has ended (`gone:`) and whose checkpoint doesn't say it ended.
+ *  (Its decided nets count either way: the ledger.) 🔒 A FAIR ONLY game is
+ *  one while it is live, which its base alone says (S7): a game nothing has
+ *  opened (no base) is no table, whatever the switch says (S4). */
 export function isComputedTable(tableId: string): boolean {
   const inc = computedIncOf(tableId);
-  return inc !== null && !casinoMap!.has(goneKey(tableId, inc)) && baseOf(tableId, inc)?.e !== 1;
+  if (inc === null) return false;
+  if (isFairOnlyInc(inc)) return fairOnlyLive(tableId, inc);
+  return !casinoMap!.has(goneKey(tableId, inc)) && baseOf(tableId, inc)?.e !== 1;
 }
 
 /** Whether table `tableId` is a computed table of `game` now
@@ -2786,6 +2833,8 @@ export function isComputedFor(tableId: string, game: GameName): boolean {
  *  incarnation goes on. */
 export function computedIncEnded(tableId: string, inc: string): boolean {
   const casino = ensureMap();
+  // (🔒 A FAIR ONLY game's end is its base's alone: S7.)
+  if (isFairOnlyInc(inc)) return baseOf(tableId, inc)?.e === 1;
   return casino.has(goneKey(tableId, inc)) || baseOf(tableId, inc)?.e === 1;
 }
 
@@ -2865,8 +2914,8 @@ export function writeComputedOn(tableId: string, inc: string): void {
 export function putComputedSwitchBack(tableId: string, inc: string): boolean {
   const casino = ensureMap();
   const c = ordinaryInc(tableId, inc);
-  if (!c?.live || computedIncEnded(tableId, inc) || computedIncOf(tableId) === inc) return false;
-  const now = computedIncOf(tableId);
+  if (!c?.live || computedIncEnded(tableId, inc) || switchIncOf(tableId) === inc) return false;
+  const now = switchIncOf(tableId);
   if (now !== null && computedIncs.has(`${tableId}:${now}`) && !computedIncEnded(tableId, now)) return false;
   boundDoc!.transact(() => {
     casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
@@ -2884,11 +2933,13 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
  *  runs no owner-run round there meanwhile (croupier, crapsCroupier): the
  *  table's players are mid-round on the computed one. */
 export function computedSwitchLost(tableId: string, game?: GameName): boolean {
-  const named = computedIncOf(tableId);
+  const named = switchIncOf(tableId);
   if (named !== null && !computedIncEnded(tableId, named) && (game === undefined || gameOfInc(named) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
     if (game !== undefined && gameOfInc(inc) !== game) continue;
-    // (A FAIR ONLY game isn't the switch's to lose: PR 6c-4a-2.)
+    // (A FAIR ONLY game isn't the switch's to lose: the table plays S9's choice
+    // of them, the switch a hint. A switch that names one, live or not, is
+    // not lost: nothing is put back over it here.)
     const c = computedIncs.get(`${tableId}:${inc}`)!;
     if (!c.fo && c.live && !computedIncEnded(tableId, inc)) return true;
   }
@@ -2904,8 +2955,10 @@ export function computedSwitchLost(tableId: string, game?: GameName): boolean {
 export function writeComputedOff(tableId: string): void {
   const casino = ensureMap();
   boundDoc!.transact(() => {
-    const inc = computedIncOf(tableId);
-    if (inc !== null && !casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
+    const inc = switchIncOf(tableId);
+    // (🔒 Nothing is marked ended of a FAIR ONLY game a switch names: its end is
+    // its authority's, by its checkpoint; the switch is a hint and goes alone.)
+    if (inc !== null && !isFairOnlyInc(inc) && !casino.has(goneKey(tableId, inc))) casino.set(goneKey(tableId, inc), 1);
     casino.delete(`cfg:computed:${tableId}`);
   });
 }
@@ -2922,8 +2975,10 @@ export function writeComputedOff(tableId: string): void {
  *  it a lapse on (croupier), and the house's switch-off drops it at once
  *  (computedTable). */
 export function computedSwitchBare(tableId: string): boolean {
-  const inc = computedIncOf(tableId);
-  if (inc === null || computedIncEnded(tableId, inc)) return false;
+  const inc = switchIncOf(tableId);
+  // (🔒 A FAIR ONLY name nothing stands behind is no table (S4: it is not open, and
+  // the table goes on as it was), so there is no stopped table to free.)
+  if (inc === null || isFairOnlyInc(inc) || computedIncEnded(tableId, inc)) return false;
   const map = computedMap!;
   return baseOf(tableId, inc) === null && !sessionKeysOf(map, tableId, inc).some((key) => map.get(key) instanceof Y.Map);
 }
@@ -2941,7 +2996,8 @@ export function computedSwitchBare(tableId: string): boolean {
  *  written) otherwise. */
 export function writeComputedGone(tableId: string, inc: string): boolean {
   const casino = ensureMap();
-  if (computedIncOf(tableId) !== inc || computedIncEnded(tableId, inc)) return false;
+  // (🔒 No removal marks a FAIR ONLY game ended: S7.)
+  if (isFairOnlyInc(inc) || switchIncOf(tableId) !== inc || computedIncEnded(tableId, inc)) return false;
   boundDoc!.transact(() => {
     markRemoved(casino, tableId, inc);
     casino.delete(`cfg:computed:${tableId}`);
@@ -3729,7 +3785,10 @@ function trackComputed(t: string, inc: string): ComputedInc {
     countedSid: null, chain: [], gaveUp: null, calm: 0, last: null, liveHeld: false, seen: new Map(), refuted: [], dropped: [], doubted: new Set(), forged: false, fo,
   };
   computedIncs.set(key, c);
-  if (fo) staleGames.add(c);
+  if (fo) {
+    foGames += 1;
+    staleGames.add(c);
+  }
   let incs = computedIncsOf.get(t);
   if (!incs) computedIncsOf.set(t, incs = new Set());
   incs.add(inc);
@@ -4065,6 +4124,36 @@ function refreshFairOnly(dirty?: Set<ComputedInc>): void {
     resolveFairOnly(c);
     dirty?.add(c);
   }
+  notePlayedGames();
+}
+
+/** Look at the game each table with a FAIR ONLY game plays now (computedIncOf:
+ *  S9) after anything that may move it (a game resolved again, the switch, the
+ *  deed holder): tell the table's view when it moved, and keep that it went from
+ *  one FAIR ONLY game to another, for the ⚙ card (computedGameMovedOf). The first
+ *  look at a table (a new binding, or its first FAIR ONLY game) moves nothing:
+ *  the view is painted from what is there. */
+function notePlayedGames(): void {
+  if (foGames === 0) return;
+  const tables = new Set<string>();
+  for (const c of computedIncs.values()) if (c.fo) tables.add(c.t);
+  for (const t of tables) {
+    const now = computedIncOf(t);
+    const was = foPlayed.get(t);
+    foPlayed.set(t, now);
+    if (was === undefined || was === now) continue;
+    viewTouched.add(`computed:${t}`);
+    if (was !== null && now !== null && isFairOnlyInc(was) && isFairOnlyInc(now) && fairOnlyLive(t, now)) foMoved.set(t, { from: was, to: now });
+  }
+}
+
+/** 🔒 Where S9's choice of table `tableId`'s game moved from one FAIR ONLY game to
+ *  another during this visit (the deed holder changed, a switch named another,
+ *  the game it played ended): the ⚙ card's 🚩 THE TABLE'S GAME MOVED TO THE HOUSE
+ *  OF <name> (PR 6c-4c). Null for none. Read-only. */
+export function computedGameMovedOf(tableId: string): { from: string; to: string } | null {
+  const moved = foMoved.get(tableId);
+  return moved ? { ...moved } : null;
 }
 
 /** countComputed of a FAIR ONLY game (its table is whole): the fold follows the
@@ -4132,6 +4221,9 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   hkFeed = null;
   authVerdicts = new Map();
   staleGames = new Set();
+  foGames = 0;
+  foPlayed = new Map();
+  foMoved = new Map();
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
@@ -4394,7 +4486,12 @@ export function computedSessionForWrite(tableId: string): Y.Map<unknown> | null 
   if (!isComputedTable(tableId)) return null;
   const inc = computedIncOf(tableId)!;
   const map = computedMap!;
-  const sid = nextSid({ room: boundRoomId, t: tableId, inc }, baseOf(tableId, inc));
+  // (🔒 A FAIR ONLY game's session is the one the base its resolution names
+  // opens, which a table that is computed has.)
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  const base = c?.fo?.res?.base?.ck ?? null;
+  const sid = c?.fo ? (base === null ? null : sid3Of(c, base)) : nextSid({ room: boundRoomId, t: tableId, inc }, baseOf(tableId, inc));
+  if (sid === null) return null;
   const live = map.get(sessionKey(tableId, inc, sid));
   return live instanceof Y.Map ? (live as Y.Map<unknown>) : null;
 }
@@ -4441,7 +4538,7 @@ export function writeCheckpointAndTrim(
 ): boolean {
   ensureMap();
   const map = computedMap!;
-  if (!isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
+  if (!ordinaryInc(tableId, inc) || !isComputedTable(tableId) || computedIncOf(tableId) !== inc || !casinoWhole(tableId)) return false;
   const ok = asCheckpointFor({ inc })(cp);
   const ctx: FoldCtx = { room: boundRoomId, t: tableId, inc };
   if (!ok || ok.e === 1 || ok.b !== nextSid(ctx, baseOf(tableId, inc))) return false;
@@ -4573,7 +4670,7 @@ export function computedRecoveries(): ComputedRecovery[] {
  *  (recoveryTrigger 'rewind', 'jump', 'end'). The page counts it as every
  *  build does while the head comes back; nothing builds on it meanwhile (no
  *  trim, no end: computedTable). */
-export function computedRestorePending(tableId: string, inc: string | null = computedIncOf(tableId)): boolean {
+export function computedRestorePending(tableId: string, inc: string | null = switchIncOf(tableId)): boolean {
   const c = inc === null ? undefined : ordinaryInc(tableId, inc);
   if (!c || !computedMap || !recoveryOn) return false;
   const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
@@ -4764,6 +4861,7 @@ export function computedGaveUp(tableId: string): { from: number; to: number } | 
  *  head is put back): switching the table off and on is the way out. */
 export function computedCheckpointBroken(tableId: string): boolean {
   const inc = computedIncOf(tableId);
+  // (🔒 Never a FAIR ONLY game: its base's round is U_MAX at most, readCk.)
   const base = inc === null ? null : baseOf(tableId, inc);
   if (base === null || base.e === 1 || Number.isSafeInteger(base.u + 1)) return false;
   const c = computedIncs.get(`${tableId}:${inc}`);
@@ -4852,8 +4950,10 @@ export function computedEndedIncs(): EndedComputed[] {
 export function computedLiveTables(): { t: string; inc: string }[] {
   const out: { t: string; inc: string }[] = [];
   for (const [t, incs] of computedIncsOf) {
-    const inc = computedIncOf(t);
-    if (inc !== null && incs.has(inc) && isComputedTable(t)) out.push({ t, inc });
+    // (The switch's, not the game played: awayDuty ends tables a page-signed
+    // incarnation runs. 🔒 A FAIR ONLY game's end is its authority's.)
+    const inc = switchIncOf(t);
+    if (inc !== null && incs.has(inc) && ordinaryInc(t, inc) && !computedIncEnded(t, inc)) out.push({ t, inc });
   }
   return out;
 }

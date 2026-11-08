@@ -195,6 +195,7 @@ import {
   readTableState,
   reopenComputedSession,
   restoreComputedCheckpoint,
+  switchIncOf,
   transactCasino,
   writeCheckpointAndTrim,
   writeComputedGone,
@@ -219,6 +220,7 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
+import { isFairOnlyInc } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import {
   BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
@@ -716,6 +718,9 @@ function newTable(t: string, inc: string): TableState {
 function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult } | null {
   if (!isComputedTable(t)) return null;
   const inc = computedIncOf(t)!;
+  // (🔒 A FAIR ONLY game is played by no duty of a page-signed table: its own
+  // are PR 6c-4b's, which open this.)
+  if (isFairOnlyInc(inc)) return null;
   if (game !== undefined && gameOfInc(inc) !== game) return null;
   const res = computedFoldOf(t);
   if (!res) return null;
@@ -2688,7 +2693,7 @@ function awayDuty(inRoom: ReadonlyMap<string, GameName>, now: number): void {
  */
 function putSwitchBack(t: string, now: number): void {
   const st = tables.get(t);
-  if (!st || computedIncOf(t) === st.inc || !tablesAwake(now) || !casinoWhole(t)) return;
+  if (!st || switchIncOf(t) === st.inc || !tablesAwake(now) || !casinoWhole(t)) return;
   transactCasino(() => putComputedSwitchBack(t, st.inc));
 }
 

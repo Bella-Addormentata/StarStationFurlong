@@ -43,7 +43,6 @@ import {
   casinoWhole,
   clearTableKeys,
   COMPUTED_MIN_BUILD,
-  computedIncOf,
   computedSwitchBare,
   computedSwitchLost,
   creditTableOutcome,
@@ -58,6 +57,7 @@ import {
   readTableState,
   rouletteListLost,
   setTablesAwakeCheck,
+  switchIncOf,
   TABLE_BUILD,
   tableEndingStakes,
   tableIncOf,
@@ -643,7 +643,7 @@ const bareSeen = new Map<string, { epoch: number; wake: number; inc: string; at:
  * True when it dropped it (the caller's tick is over).
  */
 export function dropBareSwitch(tableId: string, now: number): boolean {
-  const inc = computedSwitchBare(tableId) ? computedIncOf(tableId) : null;
+  const inc = computedSwitchBare(tableId) ? switchIncOf(tableId) : null;
   if (inc === null) {
     bareSeen.delete(tableId);
     return false;
