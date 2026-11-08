@@ -29,10 +29,9 @@
 //!
 //! The presence mark, the beacon mark and a knock entry file a write whole
 //! (§4.4): its parent as their coin id, its parked input beside it and its
-//! payer. A burner's first write filed there is judged by the marks' own
-//! readers on the test's lease and network, g under the hint and F as its
-//! input
-//! (`a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_dish_coin_as_input_and_its_rewrite_by_its_one_coin`),
+//! payer. A burner's first write filed there is confirmed by the marks' own
+//! readers on the test's lease and network, by g under the hint
+//! (`a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_rewrite_by_its_one_coin`),
 //! and dies with F
 //! (`a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_from_its_mark_once_settled_and_pending_for_ever_without_its_parked_input`).
 //!
@@ -1627,14 +1626,15 @@ async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens
 /// Stage 4 design §4.1 and §4.4, the marks: a burner's first write filed in
 /// the presence mark and the beacon mark names its two coins and its payer,
 /// the gift g as its coin id, the dish coin F as its parked input and the
-/// burner. Each mark's own reader judges it by them, g under the hint and F
-/// as the input the lease parked and the chain spent: pending in the
-/// mempool, then confirmed at the height it landed, which the presence step
-/// saves as seen on chain and the beacon step as confirmed, both coins and
-/// the payer kept. The burner's rewrite, from the coin the first write made,
+/// burner. Each mark's own reader judges it: pending in the mempool, then
+/// confirmed at the height it landed, by its coin under the hint, which
+/// names g as its parent. The presence step saves it as seen on chain and the
+/// beacon step as confirmed, both coins and the payer kept. A landed write
+/// reads confirmed whatever its parked input says; that the readers ask
+/// about F is shown by a write that dies, in the stranger-claim test below. The burner's rewrite, from the coin the first write made,
 /// is filed with that one coin as both and is confirmed at its own height.
 #[tokio::test]
-async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_dish_coin_as_input_and_its_rewrite_by_its_one_coin() {
+async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_the_hint_and_its_rewrite_by_its_one_coin() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 10).await;
     let (key, node) = (burner(54, 0), iroh::SecretKey::generate());
@@ -1662,7 +1662,7 @@ async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_
     s.reconcile().await;
     let confirmed = Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false));
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
-    assert_eq!(word, confirmed, "g under the hint, F spent: confirmed");
+    assert_eq!(word, confirmed, "g under the hint: confirmed");
     let PresenceStep::Save(seen) = presence_step(&mark, word, 0, landed) else { panic!("confirmed: saved") };
     assert!(seen.chain_seen && seen.confirmed_height == landed, "{seen:?}");
     assert_eq!((seen.coin_id.as_str(), seen.parked.as_str(), seen.payer.as_deref()), filed, "saved with its coins and its payer");

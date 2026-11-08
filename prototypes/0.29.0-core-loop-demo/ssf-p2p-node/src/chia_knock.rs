@@ -152,10 +152,10 @@ pub struct SentKnock {
     /// coin carrying the knock under the hint, which is how the knock is found
     /// again and judged ([`crate::chia_resolve::write_standing`]) — its spent
     /// flag alone proves nothing, since a dropped knock's coin goes to the next
-    /// write. For a knock the SSF wallet pays for, and for a burner's rewrite,
-    /// it is also the input the spend consumed; for a burner's first knock it
-    /// is the gift g, and `parked` names the dish coin F the spend consumed
-    /// (stage 4 design §4.1, §4.4). With `hint` it names the entry in the book.
+    /// write. For a knock the SSF wallet pays for, it is also the input the
+    /// spend consumed; for a burner's knock, always the first write of its
+    /// key, it is the gift g, and `parked` names the dish coin F the spend
+    /// consumed (stage 4 design §4.1, §4.4). With `hint` it names the entry in the book.
     pub coin_id: String,
     /// The digest of the memo the knock carried, hex
     /// ([`crate::chia_resolve::memo_digest`] of its sealed knock): the coin
@@ -198,9 +198,10 @@ pub struct SentKnock {
     pub parked: String,
     /// Who paid for the knock, as the lease parked its spend: the payer's
     /// puzzle hash, hex, as the publisher's payer writes it (the SSF wallet's
-    /// for a knock it pays for, a burner's for a burner's), for the hint rule
-    /// to compare as text and never parse back (stage 4 design §4.4, §8.3,
-    /// PR 10). Every knock this build writes names one. `None` in an entry an
+    /// for a knock it pays for, a burner's for a burner's), filed as text and
+    /// never parsed back, for the burner writers to tell a burner's knock from
+    /// the wallet's (stage 4 design §4.4, PR 10). Every knock this build
+    /// writes names one. `None` in an entry an
     /// older node wrote, whose knock the SSF wallet paid for.
     #[serde(default)]
     pub payer: Option<String>,

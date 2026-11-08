@@ -245,8 +245,8 @@ impl Payer {
 
     /// The puzzle hash, hex, as the lease file writes it and the marks file
     /// it: the presence mark, the beacon mark and a knock entry name their
-    /// write's payer by this text (stage 4 design §4.4), for the hint rule
-    /// (§8.3, PR 10) to compare as text. Read-only on purpose: no mark parses
+    /// write's payer by this text (stage 4 design §4.4); the hint rule (§8.3,
+    /// PR 10) compares the presence mark's as text. Read-only on purpose: no mark parses
     /// it back into a `Payer`, since outside this module that would be a new
     /// constructor from bytes.
     pub fn hex(&self) -> String {
