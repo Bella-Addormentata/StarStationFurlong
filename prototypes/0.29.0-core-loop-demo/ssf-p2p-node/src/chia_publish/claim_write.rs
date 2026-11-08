@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
 use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
-use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH};
+use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH};
 use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{created_coins, memo_digest, CreatedCoin, WriteCoins};
 
@@ -337,13 +337,17 @@ pub fn build_burner_bundle(net: ChiaNet, key: &BurnerKey, input: &BurnerInput, h
 pub enum BurnerWait {
     /// A spend the burner pays for is parked, its push in flight or in a
     /// mempool: a second write beside it would put two records of one payer
-    /// on the chain (§4.4).
+    /// on the chain (§4.4). The spend is known by the payer the lease filed
+    /// for it, or by the burner's puzzle hash: its saved bundle spends a coin
+    /// there, or the coin it parks is the burner's.
     Held,
     /// The burner holds no coin and the lease still holds a bundle it paid
     /// for, settling: the coin that bundle spent is listed spent, by our
     /// bundle or by another spend at the same height (a stranger's claim of
     /// the dish coin, §5.4), and a reorganization could bring our bundle
-    /// back, so a gift now could be the key's second (§5.2, §10).
+    /// back, so a gift now could be the key's second (§5.2, §10). The bundle
+    /// is known by its payer or by a spend of it at the burner's puzzle hash;
+    /// a 1-mojo coin of the burner's that the lease holds settling waits too.
     Settling,
     /// The burner holds no coin the listing showed, and the listing of its
     /// puzzle hash was cut short, so it cannot tell that it holds none: a
@@ -406,13 +410,20 @@ struct FuseFile {
 /// A gift is known to have landed only by the chain's verdict, SETTLED_DEPTH
 /// deep. So the fuse counts a gift when its bundle leaves (the push
 /// acknowledged or unanswered, [`burner_write_with`]), one entry for the
-/// payer it funds, and gives the entry back when the bundle is seen to have
-/// died: a later write for that payer finds the burner holding no coin and
-/// the lease holding no bundle of its, so the gift never landed through us
-/// ([`GiftFuse::refund`]). Counted at the push, a gift can be over-counted
-/// for as long as its bundle is in flight, never under-counted; given back,
-/// a lost race or a redirected claim (§5.4) delays a listing but never ends
-/// the era's funding.
+/// payer it funds, and gives the entry back only on the chain's word that
+/// the bundle died: a later write for that payer finds the burner holding
+/// no coin, the lease holding no bundle of its, and the burner's puzzle hash
+/// never holding a coin at all, spent ones included ([`never_held_a_coin`],
+/// [`GiftFuse::refund`]). A gift that landed made a coin there whose record
+/// stays, so its entry is never given back, even once that coin is spent
+/// somewhere other than our lease (a cloned folder or a stolen W, §10) or a
+/// listing of unspent coins misses it. Counted at the push, a gift is
+/// over-counted while its bundle is in flight, and for good when its burner
+/// held a coin before (a stray, or a beacon key's earlier era), which fails
+/// closed. It is under-counted only where the lease let a bundle go as dead
+/// that lands after all, or the fuse's file could not be saved (logged).
+/// Given back, a lost race or a redirected claim (§5.4) delays a listing but
+/// never ends the era's funding.
 ///
 /// It is kept per network in [`GIFT_FUSE_FILE`] and saved at every count and
 /// refund, so a node restarting in a loop cannot draw a fresh fuse at each
@@ -505,6 +516,14 @@ impl GiftFuse {
         ))
     }
 
+    /// Has a gift to `payer` been counted that weighs on `era`? What the
+    /// writer asks before it asks the chain whether the gift landed
+    /// ([`never_held_a_coin`]), so a burner the fuse holds nothing for costs
+    /// no lookup. A later era holds none, as it has nothing to give back.
+    pub(super) fn holds(&self, era: u64, payer: Payer) -> bool {
+        era <= self.era && self.payers.contains(&payer.hex())
+    }
+
     /// Count a gift to `payer` in `era`, its bundle gone to the peers, and
     /// save. A save that fails is logged, and the count holds in memory.
     pub fn count(&mut self, era: u64, payer: Payer) {
@@ -514,8 +533,9 @@ impl GiftFuse {
     }
 
     /// Give back one gift counted to `payer`, its bundle seen to have died
-    /// (the burner holds no coin and the lease no bundle of its), and save:
-    /// `true` if the fuse held one. A later era has nothing to give back.
+    /// (the burner holds no coin, the lease no bundle of its, and the chain
+    /// no coin it ever held: [`never_held_a_coin`]), and save: `true` if the
+    /// fuse held one. A later era has nothing to give back.
     pub fn refund(&mut self, era: u64, payer: Payer) -> bool {
         self.roll(era);
         let hex = payer.hex();
@@ -548,6 +568,22 @@ impl GiftFuse {
 /// process's.
 pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(GiftFuse::load(&crate::chia_network::net().path(GIFT_FUSE_FILE))));
 
+/// Does the chain show that the burner at `burner_ph` never held a coin?
+/// Its listing, spent coins included, is whole and empty. It is the fuse's
+/// positive evidence that a counted gift's bundle died (stage 4 design
+/// §5.2): a gift that landed made g and the burner's coin there, and their
+/// records stay, spent or not, whatever became of the coin since, while a
+/// bundle that died made nothing. It is asked only once the lease has let
+/// the bundle go, on the chain's word, so the listing is judged past the
+/// block that would have made them. A listing cut short, or holding any
+/// record, is `false`: the gift is kept counted, fail closed. A listing the
+/// chain did not give is [`CoinLookupFailed`], a wait, so the write is
+/// tried again rather than funded with the question open.
+async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Result<bool> {
+    let listing = client.coin_records_by_puzzle_hash(burner_ph, true, None).await.map_err(CoinLookupFailed)?;
+    Ok(listing.records.is_empty() && !listing.truncated)
+}
+
 /// `key`'s write of `body` under `hint` in `era` (stage 4 design §4.1,
 /// §5.2), against a given lease, fuse, network, chain, instant and random
 /// source: the node's own in production ([`burner_write`]), the tests' own
@@ -555,6 +591,10 @@ pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(Gi
 ///
 /// - A spend the burner pays for still parked is [`BurnerWait::Held`]: one
 ///   write in flight per payer (§4.4, [`WalletLease::outgoing_pending_for`]).
+///   Since a payer the lease filed can be lost (a rollback, §8 (6)), it is
+///   asked of the burner's puzzle hash as well, which no record loses: a
+///   parked bundle that spends a coin there ([`WalletLease::parks_spend_at`]),
+///   or a 1-mojo coin there the lease parks, is `Held` too.
 /// - A coin of exactly 1 mojo at the burner that the lease does not hold is
 ///   written from, the oldest first (the table's rewrite row). A coin of any
 ///   other amount is a stray and is never written from (R7).
@@ -562,13 +602,16 @@ pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(Gi
 ///   coin in the same bundle as the write (§5.1), under the gift rules
 ///   (§5.2): not while its listing was cut short
 ///   ([`BurnerWait::ListingCutShort`]), not while the lease holds a bundle
-///   it paid for, parked or settling ([`BurnerWait::Settling`],
-///   [`WalletLease::holds_for`]), and not past the fuse
-///   ([`BurnerWait::FuseBlown`]). A gift the fuse counted for the burner,
-///   whose bundle has died since, is given back first ([`GiftFuse::refund`]).
-///   The coin is one the lease does not hold and the TAKE marker does not
-///   name ([`WalletLease::is_incoming_marker`]); a dry dish or an unanswered
-///   peak is [`BurnerWait::NoCoinReady`] or [`BurnerWait::PeakUnavailable`].
+///   for it, parked or settling, by its payer or by its puzzle hash, or a
+///   1-mojo coin of its ([`BurnerWait::Settling`], [`WalletLease::holds_for`],
+///   [`WalletLease::holds_spend_at`]), and not past the fuse
+///   ([`BurnerWait::FuseBlown`]). A gift the fuse counted for the burner is
+///   given back first if the chain shows the burner never held a coin, so
+///   its bundle died ([`never_held_a_coin`], [`GiftFuse::refund`]); one that
+///   landed stays counted. The coin is one the lease does not hold and the
+///   TAKE marker does not name ([`WalletLease::is_incoming_marker`]); a dry
+///   dish or an unanswered peak is [`BurnerWait::NoCoinReady`] or
+///   [`BurnerWait::PeakUnavailable`].
 ///
 /// `body` gets the id of the coin the write's own coin will name as its
 /// parent, g for a first write and the burner's coin for a rewrite, so a
@@ -604,27 +647,33 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     lease.ensure_open()?;
     lease.reconcile_at(net, client, now).await;
     let payer = Payer::of_burner(key);
-    if lease.outgoing_pending_for(payer) {
+    let burner_ph = key.puzzle_hash();
+    if lease.outgoing_pending_for(payer) || lease.parks_spend_at(burner_ph) {
         return Err(BurnerWait::Held.into());
     }
-    let burner_ph = key.puzzle_hash();
     let Unspent { coins, partial } = unspent_at(client, burner_ph).await?;
-    let own = coins
-        .into_iter()
-        .filter(|c| c.coin.amount == 1 && !lease.is_taken(&c.coin.coin_id()))
-        .min_by_key(|c| (c.confirmed_height, c.coin.coin_id()));
+    let ones: Vec<FaucetCoin> = coins.into_iter().filter(|c| c.coin.amount == 1).collect();
+    if ones.iter().any(|c| lease.is_parked(&c.coin.coin_id())) {
+        return Err(BurnerWait::Held.into());
+    }
+    let own = ones.iter().filter(|c| !lease.is_taken(&c.coin.coin_id())).min_by_key(|c| (c.confirmed_height, c.coin.coin_id())).cloned();
     let input = match own {
         Some(own) => BurnerInput::Own(own),
         None => {
             if partial {
                 return Err(BurnerWait::ListingCutShort.into());
             }
-            if lease.holds_for(payer) {
+            // Every 1-mojo coin listed here is one the lease holds settling.
+            if !ones.is_empty() || lease.holds_for(payer) || lease.holds_spend_at(burner_ph) {
                 return Err(BurnerWait::Settling.into());
             }
-            let refunded = fuse.lock().unwrap().refund(era, payer);
-            if refunded {
-                eprintln!("⛓️ ChiaHub {what}: the burner's last bundle died before it landed, so its gift goes back to the fuse");
+            let counted = fuse.lock().unwrap().holds(era, payer);
+            if counted {
+                if !never_held_a_coin(client, burner_ph).await? {
+                    eprintln!("⛓️ ChiaHub {what}: the burner held a coin before and holds none now, so the fuse keeps its gift counted");
+                } else if fuse.lock().unwrap().refund(era, payer) {
+                    eprintln!("⛓️ ChiaHub {what}: the burner's last bundle died before it landed, so its gift goes back to the fuse");
+                }
             }
             fuse.lock().unwrap().allows(era)?;
             let taken = |id: &Bytes32| lease.is_taken(id) || lease.is_incoming_marker(id);
@@ -1286,12 +1335,14 @@ mod tests {
         fuse.count(2, a);
         fuse.count(2, b);
         fuse.count(2, a);
+        assert!(fuse.holds(2, a) && fuse.holds(1, a) && !fuse.holds(2, c), "a counted, c not");
+        assert!(!fuse.holds(3, a), "a later era holds nothing");
         assert!(fuse.refund(2, a), "one of a's");
         assert_eq!(fuse.gifts_in(2), 2);
         assert!(!fuse.refund(2, c), "c was funded nothing");
         assert_eq!(fuse.gifts_in(2), 2);
         assert!(fuse.refund(2, a), "a's other");
-        assert!(!fuse.refund(2, a), "a holds nothing more");
+        assert!(!fuse.holds(2, a) && !fuse.refund(2, a), "a holds nothing more");
         assert_eq!(fuse.payers, vec![b.hex()], "b's stays");
 
         let mut blown = GiftFuse::preset(2, payers(16));
@@ -1300,6 +1351,30 @@ mod tests {
         assert_eq!((blown.gifts_in(2), blown.allows(2)), (15, Ok(())), "given one back, the fuse lets one through");
         assert!(!blown.refund(3, b), "a later era has nothing to give back");
         assert_eq!(blown.gifts_in(3), 0);
+    }
+
+    /// Stage 4 design §5.2: with no peak to judge the lobby dish by, a
+    /// burner's gift waits, typed, as the writer's other waits do. The
+    /// burner holds no coin, the lease holds nothing and the fuse has room,
+    /// so the write comes to its claim, which asks the peak before anything
+    /// else; no peer answers it, the write is `BurnerWait::PeakUnavailable`,
+    /// and only the burner's own listing was read, nothing pushed and no
+    /// gift counted.
+    #[tokio::test]
+    async fn a_burner_gift_with_no_peak_to_judge_the_dish_by_waits_and_sends_nothing() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let none = crate::chia_chain::CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: None };
+        let chain = Scripted::new(vec![none]);
+        let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
+        let net = ChiaNet::Testnet11;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &burner(net, 1), 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+        let e = write.err().expect("the write waits");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{e:#}");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "the burner's listing alone was read");
+        assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0);
     }
 
     /// The fuse is kept across a restart, per its file: what was counted and

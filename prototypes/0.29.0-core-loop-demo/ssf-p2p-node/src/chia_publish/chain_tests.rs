@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use super::claim_write::{build_burner_bundle, burner_write_with, BurnerInput, BurnerWait, GiftFuse};
 use crate::chia_burner::{BurnerKey, BurnerRoot, MoneyKey};
-use crate::chia_faucet::{claim_spend, claim_to, dish_claim, FaucetCoin, FaucetParams, GAP_BLOCKS, GIFT_MOJOS};
+use crate::chia_faucet::{claim_spend, claim_to, dish_claim, FaucetCoin, FaucetParams, GAP_BLOCKS, GIFT_MOJOS, MAX_FAUCET_PAGES};
 use crate::chia_knock::SETTLED_DEPTH;
 use crate::chia_peer::mock::chain::{MockChain, FAILED};
 use crate::chia_peer::mock::MockNode;
@@ -390,6 +390,92 @@ fn signed_by_the_burner_alone(key: &BurnerKey, spent: Coin) -> Vec<(PublicKey, O
 /// `future`, once the compiler has checked it is `Send`.
 fn sendable<F: std::future::Future + Send>(future: F) -> F {
     future
+}
+
+/// The test's money lane, but a push it hands on comes back unanswered: the
+/// bundle reached the nodes and the answer was lost, as on a timeout after
+/// the send. Every other request is the lane's own.
+struct Unacked<'a>(&'a PeerLane);
+
+impl ChainAccess for Unacked<'_> {
+    fn coin_records_by_hint(
+        &self,
+        hint: Bytes32,
+        start_height: Option<u32>,
+        include_spent: bool,
+        cursor: Option<String>,
+    ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, ChainError>> + Send {
+        self.0.coin_records_by_hint(hint, start_height, include_spent, cursor)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+        cursor: Option<String>,
+    ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, ChainError>> + Send {
+        self.0.coin_records_by_puzzle_hash(puzzle_hash, include_spent, cursor)
+    }
+
+    fn coin_records_by_names(
+        &self,
+        names: Vec<Bytes32>,
+        include_spent: bool,
+        cursor: Option<String>,
+    ) -> impl std::future::Future<Output = Result<crate::chia_chain::CoinListing, ChainError>> + Send {
+        self.0.coin_records_by_names(names, include_spent, cursor)
+    }
+
+    fn puzzle_and_solution(
+        &self,
+        coin_id: Bytes32,
+        height: u32,
+    ) -> impl std::future::Future<Output = Result<Option<crate::chia_chain::PuzzleAndSolution>, ChainError>> + Send {
+        self.0.puzzle_and_solution(coin_id, height)
+    }
+
+    fn peak_height(&self) -> impl std::future::Future<Output = Result<u32, ChainError>> + Send {
+        self.0.peak_height()
+    }
+
+    fn spend_live(&self, bundle: SpendBundle) -> impl std::future::Future<Output = Result<bool, ChainError>> + Send {
+        self.0.spend_live(bundle)
+    }
+
+    fn push_tx(&self, bundle: SpendBundle) -> impl std::future::Future<Output = Result<(), ChainError>> + Send {
+        let pushed = self.0.push_tx(bundle);
+        async move {
+            pushed.await?;
+            Err(ChainError::Unanswered(anyhow!("the answer was lost after the send (test chain)")))
+        }
+    }
+}
+
+/// The lease file at `path` as a build older than stage 4's payers rewrites
+/// it, every `payer` gone from its bundles and settling spends (a rollback,
+/// stage 4 design §8 (6)), and the test's lease restored from it again for
+/// the money wallet `money`, as this build loads it on its next start: each
+/// spend the file kept now reads as the money address's.
+fn roll_back(s: &mut Setup, path: &std::path::Path, money: &SecretKey) {
+    let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    for list in ["bundles", "settling"] {
+        for entry in file.get_mut(list).and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+            entry.as_object_mut().expect("an entry is an object").remove("payer");
+        }
+    }
+    std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+    s.lease = WalletLease::new();
+    restore(&s.lease, path, money);
+}
+
+/// A spend of `coin`, the burner's, by a holder of `key` that is not this
+/// lease (a cloned folder, or a stolen W: stage 4 design §10), sending its 1
+/// mojo to `elsewhere`, signed and not parked.
+fn spent_elsewhere(key: &BurnerKey, coin: Coin, elsewhere: Bytes32) -> SpendBundle {
+    let mut ctx = SpendContext::new();
+    let conditions = Conditions::new().create_coin(elsewhere, coin.amount, chia_puzzle_types::Memos::None);
+    StandardLayer::new(key.public_key().derive_synthetic()).spend(&mut ctx, coin, conditions).unwrap();
+    key.sign_spends(NET, ctx.take()).unwrap()
 }
 
 /// A presence write lands, the resolver's reader opens it under the
@@ -1433,10 +1519,11 @@ async fn a_restart_mid_claim_and_write_pushes_the_saved_two_spend_bundle_and_fun
 /// Stage 4 design §4.1, the knock row: the burner writer hands its body g's
 /// id, the parent its coin will name, so a knock sealed in the body binds
 /// the carrier it lands as. The knock, written from its own burner K(h)
-/// under the gate, opens for the host, with the knocker's contact key. A
-/// control knock built by hand from another dish coin, sealed to that dish
-/// coin's id (the input the lease parks) rather than to its gift, lands
-/// under the same hint and does not open.
+/// under the gate (held while its body is sealed, let go after), opens for
+/// the host, with the knocker's contact key. A control knock built by hand
+/// from another dish coin, sealed to that dish coin's id (the input the
+/// lease parks) rather than to its gift, lands under the same hint and does
+/// not open.
 #[tokio::test]
 async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens_for_the_host() {
     let mut s = setup().await;
@@ -1465,7 +1552,10 @@ async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens
     push_for(&s.lease, &s.money, Payer::of_burner(&control_key), &control.bundle, &[(f2.coin_id(), made)]).await.unwrap();
 
     let gate = tokio::sync::Mutex::new(());
-    let body = |parent: Bytes32| knock_memo(NET, &knocker_node, &req, &ROOM_KEY, 0, parent, Some(ck_from), issued);
+    let body = |parent: Bytes32| {
+        assert!(gate.try_lock().is_err(), "the body is sealed under the gate");
+        knock_memo(NET, &knocker_node, &req, &ROOM_KEY, 0, parent, Some(ck_from), issued)
+    };
     let write = s.burner_write(&key, 0, hint, Some(&gate), body, 1).await.unwrap();
     let g = gift(&key, f);
     assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "the dish coin the control left");
@@ -1689,5 +1779,204 @@ async fn a_claim_and_write_whose_ephemeral_parent_no_node_serves_reads_pending_a
     assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
     let found = read_ck(NET, &s.carrier, &CK, landed, unix_now(), &mut HashMap::new()).await.unwrap();
     assert_eq!(found.iter().map(|r| (r.record.node_id.clone(), r.coin_id)).collect::<Vec<_>>(), vec![(node.public().to_string(), burner_coin(&key, g.coin_id()).coin_id())]);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §5.2, the fuse, and §10, a burner spent elsewhere: a gift
+/// that landed is never given back. A burner's claim and write lands and
+/// settles, and then its coin is spent to another puzzle hash by a holder of
+/// its key that is not this lease (a cloned folder, or a stolen W). The
+/// burner now holds no coin and the lease nothing of its, so it is funded
+/// again (§5.2; PR 10's foreign-spend pause is what stops a thief), but its
+/// puzzle hash held coins, so the first gift stays counted: two gifts
+/// landed through us, two counted. Only a burner that never held a coin, as
+/// in the lost-race tests, has its gift given back.
+#[tokio::test]
+async fn a_landed_gift_stays_counted_when_its_burners_coin_is_later_spent_elsewhere() {
+    let mut s = setup().await;
+    let (coins, _) = ready_dishes(&s, &[1, 1]).await;
+    let key = burner(47, 0);
+    let payer = Payer::of_burner(&key);
+    let hint = Bytes32::new([0x5c; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a first record".to_vec()), 1).await.unwrap();
+    let landed = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    s.reconcile().await;
+    assert!(!s.lease.holds_for(payer), "settled: the lease holds nothing of the burner's");
+    assert_eq!(s.gifts(0), 1);
+
+    let written = burner_coin(&key, first.coins.parent);
+    let elsewhere = Bytes32::new([0x5d; 32]);
+    s.money.push_tx(spent_elsewhere(&key, written, elsewhere)).await.unwrap();
+    let gone = s.chain.farm().await;
+    assert_eq!(s.chain.record(written.coin_id()).unwrap().2, Some(gone), "the burner's coin spent outside the lease");
+    assert_eq!(s.chain.children(written.coin_id()), vec![Coin::new(written.coin_id(), elsewhere, 1)]);
+    assert!(!s.lease.is_taken(&written.coin_id()));
+
+    let second = s.burner_write(&key, 0, hint, None, |_| Ok(b"funded again".to_vec()), 2).await.unwrap();
+    let spare = coins.into_iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
+    assert_eq!(second.coins, WriteCoins { parent: gift(&key, spare).coin_id(), parked: spare.coin_id() }, "funded again, from the other coin");
+    assert_eq!(s.gifts(0), 2, "the landed gift is not given back: two gifts, two counted");
+    let again = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, second.coins, second.memo, second.spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.4 and §5.2, the gift rule's second guard: the payer the
+/// lease filed for a spend can be lost (a rollback rewrites
+/// wallet_lease.json without `payer`, §8 (6)), and the spend then reads as
+/// the money address's. The burner writer still knows its burner's bundles
+/// by their spends at the burner's puzzle hash, and its coins by their own
+/// ids. A claim and write parked, its payer lost, holds the burner's next
+/// write though a second lobby coin is ready. Once it lands the burner
+/// writes from its coin, and that rewrite parked, its payer lost too, holds
+/// the next write, though the coin it parks is no longer the burner's own
+/// to write from. No second gift is ever built.
+#[tokio::test]
+async fn a_burner_bundle_whose_payer_a_rollback_lost_still_holds_the_burners_next_write() {
+    let mut s = setup().await;
+    let dir = Dir::new("rollback-payer");
+    let path = dir.0.join("wallet_lease.json");
+    let money = wallet(48);
+    restore(&s.lease, &path, &money);
+    let (coins, _) = ready_dishes(&s, &[1, 1]).await;
+    let key = burner(48, 0);
+    let payer = Payer::of_burner(&key);
+    let hint = Bytes32::new([0x5e; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a first record".to_vec()), 1).await.unwrap();
+    let pushed = s.chain.received().last().cloned().expect("the write was sent");
+    let spare = coins.into_iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
+
+    roll_back(&mut s, &path, &money);
+    assert!(s.lease.is_parked(&first.coins.parked));
+    assert!(!s.lease.outgoing_pending_for(payer) && !s.lease.holds_for(payer), "the payer lost: no payer record holds the burner");
+    assert!(s.lease.outgoing_pending_for(Payer::of(&money)), "the money address's, as the file now reads");
+    assert!(s.lease.parks_spend_at(key.puzzle_hash()), "the saved bundle spends g, at the burner");
+    let held = s.burner_write(&key, 0, hint, None, |_| Ok(b"a second gift".to_vec()), 2).await;
+    assert_eq!(waited(&held), Some(BurnerWait::Held), "the burner's bundle, known by its spend");
+    assert!(!s.lease.is_taken(&spare.coin_id()), "the spare lobby coin never claimed");
+    assert_eq!(s.sent(), HashSet::from([pushed.name()]), "no second gift built");
+    assert_eq!(s.gifts(0), 1);
+
+    let landed = s.chain.farm().await;
+    let written = burner_coin(&key, first.coins.parent);
+    assert_eq!(s.chain.record(written.coin_id()), Some((written, landed, None)));
+    let rewrite = s.burner_write(&key, 0, hint, None, |_| Ok(b"a rewrite".to_vec()), 3).await.unwrap();
+    assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "the burner writes from its coin");
+    let rewritten = s.chain.received().last().cloned().expect("the rewrite was sent");
+
+    roll_back(&mut s, &path, &money);
+    assert!(s.lease.is_parked(&written.coin_id()) && !s.lease.holds_for(payer), "the rewrite's payer lost too");
+    let held = s.burner_write(&key, 0, hint, None, |_| Ok(b"a gift beside its coin".to_vec()), 4).await;
+    assert_eq!(waited(&held), Some(BurnerWait::Held), "its parked coin holds the burner");
+    assert!(!s.lease.is_taken(&spare.coin_id()), "the spare lobby coin never claimed");
+    assert_eq!(s.sent(), HashSet::from([pushed.name(), rewritten.name()]), "no gift built beside the rewrite");
+    assert_eq!(s.gifts(0), 1);
+
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(written.coin_id()), vec![burner_coin(&key, written.coin_id())], "the rewrite lands, one coin at the burner");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §5.2, failing closed: a burner whose coin listing is cut
+/// short cannot tell that it holds no coin, so it is not funded. Strays of 2
+/// mojos paid to its puzzle hash (anyone can, §5.4) fill the listing past
+/// [`MAX_FAUCET_PAGES`] pages of one coin each, and none is a coin it writes
+/// from. The write waits, typed, which is no knock attempt; nothing is sent,
+/// the ready lobby coin is left alone and no gift is counted.
+#[tokio::test]
+async fn a_burner_whose_coin_listing_is_cut_short_is_not_funded() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 10).await;
+    let key = burner(49, 0);
+    for _ in 0..=MAX_FAUCET_PAGES {
+        s.chain.fund(key.puzzle_hash(), 2, None);
+    }
+    s.chain.farm().await;
+    s.chain.set_page_limit(1);
+    let cut = s.burner_write(&key, 0, Bytes32::new([0x5f; 32]), None, |_| Ok(b"a record".to_vec()), 1).await;
+    assert_eq!(waited(&cut), Some(BurnerWait::ListingCutShort));
+    assert!(!knock_attempt_counts(true, cut.as_ref().err().unwrap()), "a listing cut short is no knock attempt (§5.2)");
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin parked");
+    assert_eq!(s.gifts(0), 0);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §5.2 and §10: a claim and write whose push goes
+/// unanswered may be in a mempool, so it is a write, `acked` false, with F
+/// parked under the burner, and its gift is counted as it left, as an
+/// acknowledged one's is. The burner's next write waits for it. The push
+/// had reached the nodes, so the next block carries it, and the write is
+/// confirmed and read back: one bundle, one gift.
+#[tokio::test]
+async fn an_unanswered_claim_and_write_is_a_write_parked_and_counted_and_it_lands() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 10).await;
+    let (key, node) = (burner(50, 0), iroh::SecretKey::generate());
+    let payer = Payer::of_burner(&key);
+    let g = gift(&key, f);
+    let (hint, memo) = presence_memo(NET, &node, &CK, 0, &entries(), unix_now()).unwrap();
+    let at = s.later();
+    let mut rng = StdRng::seed_from_u64(1);
+    let unacked = Unacked(&s.money);
+    let write = sendable(burner_write_with(&s.lease, &s.fuse, NET, &unacked, at, &key, 0, hint, None, |_| Ok(memo), &mut rng, "test"))
+        .await
+        .expect("an unanswered push is a write");
+    assert!(!write.acked, "unanswered");
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    assert!(s.lease.is_parked(&f.coin_id()) && s.lease.outgoing_pending_for(payer), "F parked under the burner");
+    assert!(write.spend.is_some() && write.spend == s.lease.spend_of(&f.coin_id()));
+    assert_eq!(s.gifts(0), 1, "counted as it left");
+
+    let waiting = s.burner_write(&key, 0, hint, None, |_| Ok(b"not yet".to_vec()), 2).await;
+    assert_eq!(waited(&waiting), Some(BurnerWait::Held), "the unanswered write holds the burner's next");
+    assert_eq!(s.gifts(0), 1);
+    let landed = s.chain.farm().await;
+    assert_eq!(s.chain.children(g.coin_id()), vec![burner_coin(&key, g.coin_id())]);
+    assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    let found = read_ck(NET, &s.carrier, &CK, landed, unix_now(), &mut HashMap::new()).await.unwrap();
+    assert_eq!(found.iter().map(|r| (r.record.node_id.clone(), r.coin_id)).collect::<Vec<_>>(), vec![(node.public().to_string(), burner_coin(&key, g.coin_id()).coin_id())]);
+    assert_eq!(s.sent().len(), 1, "one bundle");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.2, R7, and §5.4: anyone can pay a burner's public
+/// puzzle hash, and what they pay is never written from unless it is a
+/// coin of exactly 1 mojo. A burner holding only a stray of 2 mojos is
+/// funded as if it held nothing, the stray left alone; beside the coin its
+/// first write made, the older stray is passed over again and the rewrite
+/// spends that coin; and with a second 1-mojo coin paid to it later, the
+/// next rewrite spends the older of the two. One gift in all.
+#[tokio::test]
+async fn a_burner_writes_only_from_a_one_mojo_coin_the_oldest_first_and_never_from_a_stray() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 1).await;
+    let key = burner(51, 0);
+    let hint = Bytes32::new([0x60; 32]);
+    let stray = s.chain.fund(key.puzzle_hash(), 2, None);
+    let paid = s.chain.farm().await;
+
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a first record".to_vec()), 1).await.unwrap();
+    assert_eq!(first.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "funded as if it held nothing");
+    let landed = s.chain.farm().await;
+    let written = burner_coin(&key, first.coins.parent);
+    assert_eq!(s.chain.record(written.coin_id()), Some((written, landed, None)));
+
+    let rewrite = s.burner_write(&key, 0, hint, None, |_| Ok(b"a rewrite".to_vec()), 2).await.unwrap();
+    assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "the 1-mojo coin, not the older stray");
+    s.chain.farm().await;
+    let next = burner_coin(&key, written.coin_id());
+
+    let later = s.chain.fund(key.puzzle_hash(), 1, None);
+    let paid_later = s.chain.farm().await;
+    let oldest = s.burner_write(&key, 0, hint, None, |_| Ok(b"another rewrite".to_vec()), 3).await.unwrap();
+    assert_eq!(oldest.coins, WriteCoins::one(next.coin_id()), "the older of two 1-mojo coins");
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(next.coin_id()), vec![burner_coin(&key, next.coin_id())]);
+    assert_eq!(s.chain.record(stray.coin_id()), Some((stray, paid, None)), "the stray, never spent");
+    assert_eq!(s.chain.record(later.coin_id()), Some((later, paid_later, None)), "the younger coin, not spent yet");
+    assert_eq!(s.gifts(0), 1, "one gift");
     assert!(s.chain.unanswered().is_empty());
 }

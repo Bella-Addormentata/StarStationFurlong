@@ -263,6 +263,12 @@ struct Pushed {
     payer: Option<Payer>,
 }
 
+/// Does `bundle` spend a coin at `puzzle_hash`? What
+/// [`WalletLease::parks_spend_at`] asks of each saved bundle.
+fn spends_at(bundle: &SpendBundle, puzzle_hash: Bytes32) -> bool {
+    bundle.coin_spends.iter().any(|cs| cs.coin.puzzle_hash == puzzle_hash)
+}
+
 /// Settling spends kept at most (#272 review round 10): past it the oldest
 /// is forgotten, with a log line, as a release forgot every spend before —
 /// a bound on the file, reached only if the chain cannot be read for as long
@@ -693,10 +699,14 @@ impl WalletLease {
     /// The claim-and-write's writer asks it of the burner it writes for
     /// (`claim_write::burner_write_with`, design §13 row 9): before any
     /// write, and through [`WalletLease::holds_for`] before a gift; the
-    /// burner writers of row 10 will ask it too. A stale marker is kept off
-    /// a burner's parking, since `incoming_pending` reads the marker's coin
-    /// alone and would read a burner's parking of it as a gift still landing:
-    /// that writer never lets a burner claim the marker's coin
+    /// burner writers of row 10 will ask it too. Its second guard is the
+    /// burner's own puzzle hash, which no payer record can lose: a saved
+    /// bundle that spends a coin there ([`WalletLease::parks_spend_at`],
+    /// [`WalletLease::holds_spend_at`]), and a 1-mojo coin there that the
+    /// lease holds. A stale marker is kept off a burner's parking, since
+    /// `incoming_pending` reads the marker's coin alone and would read a
+    /// burner's parking of it as a gift still landing: that writer never
+    /// lets a burner claim the marker's coin
     /// ([`WalletLease::is_incoming_marker`]), so the lease file gains no
     /// field for it.
     pub fn outgoing_pending_for(&self, payer: Payer) -> bool {
@@ -731,6 +741,31 @@ impl WalletLease {
         }
         let money = *self.money.lock().unwrap();
         self.settling.lock().unwrap().values().any(|s| s.payer.or(money).is_none_or(|recorded| recorded == payer))
+    }
+
+    /// Does a parked spend's saved bundle spend a coin at `puzzle_hash`? A
+    /// burner's every bundle spends exactly one coin at the burner's puzzle
+    /// hash (R1, stage 4 design §4.2): g for a first write, the burner's own
+    /// coin for a rewrite. So this recognises a burner's write in flight by
+    /// the bundle itself, whatever payer was filed for it or lost since
+    /// ([`WalletLease::outgoing_pending_for`] names the ways one is lost),
+    /// and the burner writer waits on it as on its payer's parked spends. A
+    /// parked spend whose bundle was not saved is not seen here; its coins
+    /// still are, by [`WalletLease::is_taken`].
+    pub fn parks_spend_at(&self, puzzle_hash: Bytes32) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let pushed = self.bundles.lock().unwrap();
+        pending.values().any(|parked| pushed.get(&parked.spend).is_some_and(|p| spends_at(&p.bundle, puzzle_hash)))
+    }
+
+    /// [`WalletLease::parks_spend_at`], or a settling spend's bundle spends a
+    /// coin at `puzzle_hash`: the gift rule's question asked of the burner's
+    /// puzzle hash rather than of its payer (stage 4 design §5.2, a key is
+    /// funded only while no bundle for it is held), as
+    /// [`WalletLease::holds_for`] asks it of the payer. A settling spend
+    /// always keeps its bundle, so none is missed.
+    pub fn holds_spend_at(&self, puzzle_hash: Bytes32) -> bool {
+        self.parks_spend_at(puzzle_hash) || self.settling.lock().unwrap().values().any(|s| spends_at(&s.bundle, puzzle_hash))
     }
 
     /// A gift to our wallet is still landing: the wallet is not empty even
@@ -2398,6 +2433,41 @@ fn knock_paced(wait: Option<Instant>, now: Instant) -> bool {
     wait.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
 }
 
+/// What the knock arm does with `req` once its knock failed with `e` at
+/// `now`, on the heartbeat's own `queue` and `wait` (stage 4 design §5.2).
+/// With burner keys on (`burners`), a wait ([`knock_attempt_counts`]) keeps
+/// its attempts and goes back in the queue, and the arm rests from `now`
+/// (`wait`, which [`knock_paced`] reads). Every other failure, and every
+/// failure with them off, uses an attempt: the request goes back in the
+/// queue while it has attempts left and is dropped after its
+/// [`MAX_KNOCK_ATTEMPTS`]th, `wait` left as it was, so with burner keys off
+/// the arm is main's. Each case says so in the log.
+fn knock_failed(burners: bool, mut req: KnockRequest, e: &anyhow::Error, now: Instant, queue: &mut std::collections::VecDeque<KnockRequest>, wait: &mut Option<Instant>) {
+    if !knock_attempt_counts(burners, e) {
+        *wait = Some(now);
+        eprintln!(
+            "⛓️ ChiaHub knock: knock on {} for room {} waits: {e:#} — not an attempt; tried again in {} min",
+            short(&req.host),
+            req.room,
+            HEARTBEAT_RETRY_SECS / 60
+        );
+        queue.push_back(req);
+        return;
+    }
+    req.attempts = req.attempts.saturating_add(1);
+    if req.attempts < MAX_KNOCK_ATTEMPTS {
+        eprintln!("⛓️ ChiaHub knock: knock on {} for room {} failed: {e:#} (retry next tick)", short(&req.host), req.room);
+        queue.push_back(req);
+    } else {
+        eprintln!(
+            "⛓️ ChiaHub knock: knock on {} for room {} failed {} times: {e:#} — dropped; the next dial exhaustion asks again",
+            short(&req.host),
+            req.room,
+            req.attempts
+        );
+    }
+}
+
 /// The beacon's own wallet key, funded SEPARATELY (its address is printed at
 /// startup): a clear-text node id must never share coin lineage with the
 /// sealed records (D7). It is blake3 of the WALLET key (m/12381/8444/2/0,
@@ -2993,8 +3063,8 @@ pub async fn heartbeat_loop(
     let beacon_mark_path = beacon_mark_file.as_path();
     let mut beacon_mark: Option<BeaconMark> = beacon_sk.as_ref().and_then(|_| BeaconMark::load(beacon_mark_path));
     let mut beacon_attempt: Option<Instant> = None;
-    // When the last knock only waited (burners on, `knock_attempt_counts`):
-    // the knock arm rests for the retry cadence from then (`knock_paced`).
+    // When the last knock only waited (burners on, `knock_failed`): the
+    // knock arm rests for the retry cadence from then (`knock_paced`).
     // With burners off it is never set, and the arm is today's.
     let mut knock_wait: Option<Instant> = None;
     let mut welcome_warned = false;
@@ -3268,7 +3338,7 @@ pub async fn heartbeat_loop(
                 }
                 break Some((req, cap.room_key));
             };
-            if let Some((mut req, room_key)) = next {
+            if let Some((req, room_key)) = next {
                 // The room's word is read AGAIN at spend time, under the card
                 // gate, after the lease and coin lookups (#272 review round 5):
                 // a cap turning the room public or its switch off meanwhile
@@ -3317,32 +3387,10 @@ pub async fn heartbeat_loop(
                             req.room
                         );
                     }
-                    // Burners on: a knock that only waits keeps its
-                    // attempts and goes back in the queue, and the arm rests
-                    // for the retry cadence (stage 4 design §5.2).
-                    Err(e) if !knock_attempt_counts(burners, &e) => {
-                        knock_wait = Some(Instant::now());
-                        eprintln!(
-                            "⛓️ ChiaHub knock: knock on {} for room {} waits: {e:#} — not an attempt; tried again in {} min",
-                            short(&req.host),
-                            req.room,
-                            HEARTBEAT_RETRY_SECS / 60
-                        );
-                        hub.knock_queue.lock().unwrap().push_back(req);
-                    }
+                    // A wait (burners on) or an attempt used: back in the
+                    // queue or dropped, as `knock_failed` says.
                     Err(e) => {
-                        req.attempts = req.attempts.saturating_add(1);
-                        if req.attempts < MAX_KNOCK_ATTEMPTS {
-                            eprintln!("⛓️ ChiaHub knock: knock on {} for room {} failed: {e:#} (retry next tick)", short(&req.host), req.room);
-                            hub.knock_queue.lock().unwrap().push_back(req);
-                        } else {
-                            eprintln!(
-                                "⛓️ ChiaHub knock: knock on {} for room {} failed {} times: {e:#} — dropped; the next dial exhaustion asks again",
-                                short(&req.host),
-                                req.room,
-                                req.attempts
-                            );
-                        }
+                        knock_failed(burners, req, &e, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait);
                     }
                 }
                 continue; // one spend per tick
@@ -5700,7 +5748,9 @@ mod tests {
     }
 
     /// The digest a write's mark keeps, made with its bundle ([`memo_bundle`],
-    /// the one place a writer makes it), is the digest of the memo its
+    /// the one place a writer the SSF wallet's keys pay for makes it; the
+    /// burner builder makes its own the same way,
+    /// `claim_write::build_burner_bundle`), is the digest of the memo its
     /// readers take from its spend ([`crate::chia_resolve::extract_ciphertext`])
     /// and of the second memo of the output the writer's verdict reads
     /// ([`crate::chia_resolve::output_memos`] of the coin the write makes). A
@@ -5841,9 +5891,12 @@ mod tests {
         }
     }
 
-    /// 🛑 Stage 4 design §4.5 (1): the one builder of a memo spend refuses
-    /// off a test network, before it signs, whichever wallet key pays (the
-    /// money key, or the beacon key made from it); a test network builds
+    /// 🛑 Stage 4 design §4.5 (1): the builder of every memo spend the SSF
+    /// wallet's keys pay for refuses off a test network, before it signs,
+    /// whichever of them pays (the money key, or the beacon key made from
+    /// it). The burner builder, `claim_write::build_burner_bundle`, signs
+    /// with a burner key alone and has no such refusal: its callers' gate is
+    /// SSF_CHIA_BURNERS on a test network until PR 10. A test network builds
     /// the spend as before. The refusal says why in the player's words, and
     /// the log line names every write that stops.
     #[test]
@@ -6015,9 +6068,13 @@ mod tests {
     /// chain that answers nothing, the lease's from a lease sealed by an
     /// unreadable file and one whose file cannot be saved, the dish's from
     /// `claim_to`, and the seal's from a host card whose key is a low-order
-    /// point. The burner writer's waits, its rules and a push the peers
-    /// refused are their own values, as the writer's seam returns them
-    /// (chain_tests drives the seam to each).
+    /// point. The burner writer's waits and a push the peers refused are
+    /// their own values, of the types its seam returns them as: chain_tests
+    /// drives the seam to every wait but `PeakUnavailable`, which
+    /// claim_write's own tests reach on a chain with no peak, and to a push
+    /// every peer refused. A broken burner rule is the rule checker's own
+    /// refusal (`check_burner_spends`), since the seam builds only from
+    /// inputs that keep the rules.
     async fn knock_failures(test: &str) -> (Vec<(&'static str, anyhow::Error)>, Vec<(&'static str, anyhow::Error)>) {
         use super::claim_write::{check_burner_spends, BurnerRule, BurnerWait};
         use crate::chia_chain::testing::{Scripted, Unanswering};
@@ -6113,6 +6170,38 @@ mod tests {
         assert!(!knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
         assert!(knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "the retry cadence has passed");
         assert_eq!(HEARTBEAT_RETRY_SECS, 300);
+    }
+
+    /// The knock arm's handling of a failed knock (stage 4 design §5.2), as
+    /// the heartbeat applies it to its queue and its pacing: with burner keys
+    /// on, a wait goes back in the queue with its attempts as they were and
+    /// rests the arm from now; every other failure uses an attempt, goes back
+    /// while it has attempts left, is dropped after its last, and leaves the
+    /// arm's rest as it was. With burner keys off every failure, waits and
+    /// all, is an attempt, exactly as on main.
+    #[tokio::test]
+    async fn a_failed_knock_waits_in_the_queue_with_burners_on_and_uses_its_attempts_as_on_main_with_them_off() {
+        use std::collections::VecDeque;
+        let (waits, failures) = knock_failures("arm").await;
+        let req = |attempts: u8| KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts };
+        let (rested, now) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let last = MAX_KNOCK_ATTEMPTS - 1;
+        let after = |burners: bool, attempts: u8, e: &anyhow::Error, wait: Option<Instant>| {
+            let (mut queue, mut wait) = (VecDeque::new(), wait);
+            knock_failed(burners, req(attempts), e, now, &mut queue, &mut wait);
+            (queue, wait)
+        };
+        for (what, e) in &waits {
+            assert_eq!(after(true, last, e, None), (VecDeque::from([req(last)]), Some(now)), "{what}, burners on: back in the queue, its attempts kept, the arm resting");
+            assert_eq!(after(false, 0, e, Some(rested)), (VecDeque::from([req(1)]), Some(rested)), "{what}, burners off: an attempt, as on main");
+            assert_eq!(after(false, last, e, None), (VecDeque::new(), None), "{what}, burners off: dropped after its last attempt, as on main");
+        }
+        for (what, e) in &failures {
+            for burners in [true, false] {
+                assert_eq!(after(burners, 0, e, Some(rested)), (VecDeque::from([req(1)]), Some(rested)), "{what}, burners {burners}: an attempt");
+                assert_eq!(after(burners, last, e, None), (VecDeque::new(), None), "{what}, burners {burners}: dropped after its last attempt");
+            }
+        }
     }
 }
 
