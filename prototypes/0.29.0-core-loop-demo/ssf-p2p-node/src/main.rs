@@ -498,14 +498,19 @@ pub struct ChiaPresence {
     /// The current era (edition) by the agreed chain peak, 0 while no peak is
     /// agreed yet.
     pub era: u64,
-    /// The era of the listing on record, 0 when there is none.
+    /// The era of the listing on record, 0 when there is none. With burner
+    /// keys on, it is the era before while this era's listing waits for its
+    /// slot or its late-start delay (stage 4 design §4.3, T1 and T2).
     pub listed_era: u64,
     /// Unix seconds of the last write on record, 0 when there is none.
     pub last_at: u64,
     /// The watcher has read the listing on record back from the chain.
     pub confirmed: bool,
-    /// The listing on record is for this era and carries the node's current
-    /// public address set.
+    /// The listing on record is in force with the node's current public
+    /// address set: this era's, or, with burner keys on, last era's while
+    /// this era's waits for its slot or its late-start delay (stage 4 design
+    /// §4.3), its addresses compared then without the inbound flag a new era
+    /// clears.
     pub current: bool,
     /// How many public addresses the node would list right now.
     pub public_addrs: u32,
@@ -519,7 +524,10 @@ pub struct ChiaPresence {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChiaPresenceState {
-    /// This era's listing is confirmed on chain with the current addresses.
+    /// This era's listing is confirmed on chain with the current addresses,
+    /// or, with burner keys on, last era's confirmed listing while this era's
+    /// waits for its slot or its late-start delay; readers read both editions
+    /// (stage 4 design §4.3).
     Listed,
     /// This era's listing with the current addresses is out, awaiting the
     /// watcher's confirmation.

@@ -2564,13 +2564,13 @@ fn listing_wait_words(step: ListingStep, burner_path: bool) -> Option<&'static s
 /// paying (`burner_path` false) and a step that writes or has nothing due,
 /// that is the readout's chain as it always was, word for word.
 ///
-/// Last era's listing reads as listed only on the burner path, while the
-/// era's first write waits for its slot or its late start (T1, T2). The
-/// step waits for either only when last era's listing is ours and
-/// confirmed or read back ([`has_last_era_listing`]), and readers still find
-/// it then, since they scan the current era and the one before. Once the
-/// write is due, a failing write reads as outdated, with the words of the
-/// failure ([`listing_failure_words`], which say so where last week's
+/// Last era's listing reads as listed ([`presence_status_with`]) only on the
+/// burner path, while the era's first write waits for its slot or its late
+/// start (T1, T2). The step waits for either only when last era's listing is
+/// ours and confirmed or read back ([`has_last_era_listing`]), and readers
+/// still find it then, since they scan the current era and the one before.
+/// Once the write is due, a failing write reads as outdated, with the words
+/// of the failure ([`listing_failure_words`], which say so where last week's
 /// listing still works).
 #[cfg_attr(not(test), allow(dead_code))] // until the heartbeat's listing arm calls it (PR 10b's heartbeat stage, which removes this)
 pub(crate) fn listing_readout(
@@ -2665,13 +2665,48 @@ pub fn presence_state(
     }
 }
 
+/// 📖 [`presence_state`], with last era's listing standing in for this era's
+/// while the era's first write from a burner key waits (stage 4 design §4.3,
+/// T1 and T2). With `last_era_holds`, which the listing's readout gives only
+/// on the burner path while the step waits for its slot or its late start
+/// ([`listing_readout`]), a mark of ours from the era before that the watcher
+/// read back from the chain (`chain_seen`), with the live address set up to
+/// the inbound flag a new era clears ([`sig_without_inbound`]), is *listed*:
+/// readers scan the current era and the one before, so it is the listing
+/// they find. One the peers accepted but the watcher never read back is not
+/// held: *listed* is the chain's word alone, as it is for this era's.
+/// Anything else is [`presence_state`]'s word, and so is everything with
+/// `last_era_holds` false: with the SSF wallet paying, the readout is as it
+/// always was.
+pub fn presence_state_with(
+    mark: Option<&NodePublishMark>,
+    ours: bool,
+    era: Option<u64>,
+    addrs_sig: &str,
+    last_era_holds: bool,
+) -> crate::ChiaPresenceState {
+    match (mark, era) {
+        (Some(m), Some(era))
+            if last_era_holds
+                && ours
+                && era.checked_sub(1) == Some(m.era)
+                && m.chain_seen
+                && sig_without_inbound(&m.addrs_sig) == sig_without_inbound(addrs_sig) =>
+        {
+            crate::ChiaPresenceState::Listed
+        }
+        _ => presence_state(mark, ours, era, addrs_sig),
+    }
+}
+
 /// 📖 The whole readout the fingerprint carries ([`crate::ChiaPresence`]):
 /// [`presence_state`] with the figures the browser's tooltip names. A listing
 /// is ours by its signer, and, when it names the agreed era, by this era's
 /// `hint` too ([`mark_is_ours`]): the hint is era-bound, so last era's listing
 /// can only be judged by who signed it, and it is exactly the stale listing
 /// the grey book stands for. `error` is the last failed attempt's text, or why
-/// nothing can be written right now.
+/// nothing can be written right now. It is [`presence_status_with`] with last
+/// era's listing never standing in for this era's.
 pub fn presence_status(
     mark: Option<&NodePublishMark>,
     hint: Option<&str>,
@@ -2681,11 +2716,33 @@ pub fn presence_status(
     public_addrs: usize,
     error: Option<&str>,
 ) -> crate::ChiaPresence {
+    presence_status_with(mark, hint, node_id, era, addrs_sig, public_addrs, error, false)
+}
+
+/// 📖 [`presence_status`] on the burner path: with `last_era_holds`, last
+/// era's listing read back from the chain is *listed* while this era's waits
+/// for its slot or its late start ([`presence_state_with`], stage 4 design
+/// §4.3). That listing is ours by its signer, as any listing of an era
+/// before the agreed one is, and the figures are its own: `listed_era` is
+/// the era before, `confirmed` is the chain's read, and `current` holds,
+/// since it is the listing in force. With `last_era_holds` false the
+/// readout is [`presence_status`]'s, word for word.
+#[allow(clippy::too_many_arguments)]
+pub fn presence_status_with(
+    mark: Option<&NodePublishMark>,
+    hint: Option<&str>,
+    node_id: &str,
+    era: Option<u64>,
+    addrs_sig: &str,
+    public_addrs: usize,
+    error: Option<&str>,
+    last_era_holds: bool,
+) -> crate::ChiaPresence {
     let ours = mark.is_some_and(|m| match (hint, era) {
         (Some(h), Some(e)) if m.era == e => mark_is_ours(m, h, node_id),
         _ => m.node_id.as_deref() == Some(node_id),
     });
-    let state = presence_state(mark, ours, era, addrs_sig);
+    let state = presence_state_with(mark, ours, era, addrs_sig, last_era_holds);
     let on_record = mark.filter(|_| ours);
     crate::ChiaPresence {
         state,
@@ -5326,6 +5383,79 @@ mod tests {
         assert_eq!(other.error.as_deref(), Some("chia wallet unfunded"));
         let changed = presence_status(Some(&pending), Some("h"), "n", Some(5), "b", 3, None);
         assert_eq!((changed.state, changed.current, changed.confirmed, changed.public_addrs), (Outdated, false, false, 3));
+    }
+
+    /// 📖 With burner keys on, last edition's listing read back from the
+    /// chain still reads as listed, with its own figures, while this
+    /// edition's waits for its slot or its late start (stage 4 design §4.3):
+    /// the inbound flag the new edition cleared is no change. A real change of
+    /// addresses, a listing never read back, an older one, another identity's
+    /// or no edition to judge by reads as before, and without the hold every
+    /// readout is the SSF wallet's, word for word.
+    #[test]
+    fn last_editions_listing_reads_listed_while_this_editions_waits_for_its_slot_and_outdated_otherwise() {
+        use crate::ChiaPresenceState::*;
+        let now = 1_791_700_000u64;
+        let last = NodePublishMark {
+            era: 7,
+            writes: 1,
+            addrs_sig: "a:1/1".into(),
+            last_at: now,
+            hint: "h7".into(),
+            confirmed: true,
+            chain_seen: true,
+            node_id: Some("n".into()),
+            ..NodePublishMark::default()
+        };
+        let busy = Some("the chain is busy");
+        let held = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, true);
+        assert_eq!(
+            held,
+            crate::ChiaPresence {
+                state: Listed,
+                era: 8,
+                listed_era: 7,
+                last_at: now,
+                confirmed: true,
+                current: true,
+                public_addrs: 2,
+                error: busy.map(str::to_owned),
+            },
+            "last edition's listing is the one in force, and the text beside it is carried as given"
+        );
+        let unheld = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, false);
+        assert_eq!((unheld.state, unheld.listed_era, unheld.confirmed, unheld.current), (Outdated, 7, true, false), "no hold: last edition's listing is stale");
+        assert_eq!(unheld, presence_status(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy), "no hold: the readout as it always was");
+        assert_eq!(presence_state_with(Some(&last), false, Some(8), "a:1/0", true), Unlisted, "a mark that is not ours is held for nobody");
+        assert_eq!(presence_state_with(None, false, Some(8), "a:1/0", true), Unlisted, "nothing on record");
+
+        let accepted = NodePublishMark { chain_seen: false, ..last.clone() };
+        let pending = NodePublishMark { confirmed: false, chain_seen: false, ..last.clone() };
+        let older = NodePublishMark { era: 6, hint: "h6".into(), ..last.clone() };
+        let sent = NodePublishMark { era: 8, hint: "h8".into(), addrs_sig: "a:1/0".into(), confirmed: false, chain_seen: false, ..last.clone() };
+        for (mark, node, era, sig, want, why) in [
+            (&last, "n", Some(8), "a:1/1", Listed, "the inbound flag already measured again this edition"),
+            (&last, "n", Some(8), "b:2/0", Outdated, "a real change of address set"),
+            (&last, "n", Some(8), "a:1/2", Outdated, "a flag other than the inbound one changed"),
+            (&accepted, "n", Some(8), "a:1/0", Outdated, "accepted by the peers but never read back from the chain"),
+            (&pending, "n", Some(8), "a:1/0", Outdated, "never confirmed at all"),
+            (&older, "n", Some(8), "a:1/0", Outdated, "two editions old: readers no longer scan it"),
+            (&last, "other-node", Some(8), "a:1/0", Unlisted, "another identity's listing"),
+            (&last, "n", None, "a:1/0", Outdated, "no agreed peak to judge the edition by"),
+            (&last, "n", Some(7), "a:1/1", Listed, "its own edition: listed as always"),
+            (&last, "n", Some(7), "a:1/0", Outdated, "its own edition: the hold relaxes no compare of this edition's listing"),
+            (&sent, "n", Some(8), "a:1/0", Sent, "this edition's own listing is judged as always"),
+        ] {
+            let hint = era.map(|e| format!("h{e}"));
+            let status = presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, true);
+            assert_eq!(status.state, want, "{why}");
+            assert_eq!(status.current, matches!(want, Listed | Sent), "{why}");
+            assert_eq!(
+                presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, false),
+                presence_status(Some(mark), hint.as_deref(), node, era, sig, 2, None),
+                "{why}: no hold, the readout as it always was"
+            );
+        }
     }
 
     /// 📖 The listing the Phone Book's icon stands on follows the chain's word
