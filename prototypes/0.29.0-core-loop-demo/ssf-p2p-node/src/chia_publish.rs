@@ -239,7 +239,6 @@ impl Payer {
     /// §4.4). It lives here, not in `chia_burner`, whose pin scan lists every
     /// line there that builds a key or reads its secret; this one asks the
     /// key for its public puzzle hash alone, so that list stays as it is.
-    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
     pub fn of_burner(key: &crate::chia_burner::BurnerKey) -> Payer {
         Payer(key.puzzle_hash())
     }
@@ -575,7 +574,6 @@ impl WalletLease {
     /// spend of ours. So the claim-and-write leaves the marker's coin alone,
     /// as it leaves a taken coin alone, and the marker stays as it is, for
     /// testnet TAKE (stage 4 design §4.4).
-    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
     pub fn is_incoming_marker(&self, coin: &Bytes32) -> bool {
         *self.incoming.lock().unwrap() == Some(*coin)
     }
@@ -692,15 +690,15 @@ impl WalletLease {
     /// says. Callers hold the gate after a reconciliation, as
     /// [`publish_memo_with`] does around the global check.
     ///
-    /// Nothing calls it outside the tests yet: the claim-and-write's gift
-    /// rule will, through [`WalletLease::holds_for`] (design §13 row 9), and
-    /// so will the burner writers (row 10). A stale marker is kept off a
-    /// burner's parking, since `incoming_pending` reads the marker's coin
+    /// The claim-and-write's writer asks it of the burner it writes for
+    /// (`claim_write::burner_write_with`, design §13 row 9): before any
+    /// write, and through [`WalletLease::holds_for`] before a gift; the
+    /// burner writers of row 10 will ask it too. A stale marker is kept off
+    /// a burner's parking, since `incoming_pending` reads the marker's coin
     /// alone and would read a burner's parking of it as a gift still landing:
-    /// the claim-and-write never lets a burner park the marker's coin
+    /// that writer never lets a burner claim the marker's coin
     /// ([`WalletLease::is_incoming_marker`]), so the lease file gains no
     /// field for it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn outgoing_pending_for(&self, payer: Payer) -> bool {
         let incoming = *self.incoming.lock().unwrap();
         let money = *self.money.lock().unwrap();
@@ -727,7 +725,6 @@ impl WalletLease {
     /// judged dead only once the dish coin is settled SETTLED_DEPTH deep, and
     /// only then is the key funded again (§10, a lost race), never while a
     /// reorganization could still bring our bundle back.
-    #[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
     pub fn holds_for(&self, payer: Payer) -> bool {
         if self.outgoing_pending_for(payer) {
             return true;
@@ -2187,9 +2184,10 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
 
 /// [`publish_memo`] whose body is built once the INPUT coin is chosen: `body`
 /// gets the id of the coin the carrier will name as its PARENT — here the
-/// input, which a spend-to-self's new coin names (a burner's first write will
-/// pass the gift g, stage 4 design §4.1) — so a knock can bind its sealing to
-/// it ([`chia_lane::seal_to_kx`], #272 review round 3). With a `gate`, `body`
+/// input, which a spend-to-self's new coin names (a burner's first write
+/// passes the gift g instead, `claim_write::burner_write_with`, stage 4
+/// design §4.1) — so a knock can bind its sealing to it
+/// ([`chia_lane::seal_to_kx`], #272 review round 3). With a `gate`, `body`
 /// runs and the spend is pushed UNDER it: a
 /// knock's authorization is read again there, after the lease and coin
 /// lookups, so a room's word that changed while the spend was prepared is seen
@@ -5355,9 +5353,9 @@ mod tests {
     /// Stage 4 design §4.4: a write is FOUND under its hint by its parent, the
     /// coin its own coin names, and JUDGED by its parked input, the coin the
     /// lease holds: the spent height and the lease's word are that input's,
-    /// never the parent's. One coin for every write of this build; a burner's
-    /// first write (PR 9) has the gift g as its parent and the dish coin as
-    /// its parked input, as here.
+    /// never the parent's. One coin for a spend-to-self of one coin; a
+    /// burner's first write (`claim_write`'s) has the gift g as its parent
+    /// and the dish coin as its parked input, as here.
     #[tokio::test]
     async fn a_write_is_found_by_its_parent_and_judged_by_its_parked_input() {
         use crate::chia_chain::{testing::Scripted, CoinRecord};
@@ -5435,8 +5433,8 @@ mod tests {
     }
 
     /// Stage 4 design §13 row 7, "changes behaviour: none yet": for a write
-    /// of one coin, as every write of this build is, the verdict is the one
-    /// the lookup gave before the split, through every branch of
+    /// of one coin, as every write is but a burner's first, the verdict is
+    /// the one the lookup gave before the split, through every branch of
     /// `write_standing`, `gone_since`, and a failed lookup.
     #[tokio::test]
     async fn a_write_of_one_coin_is_judged_exactly_as_before() {
@@ -5559,8 +5557,8 @@ mod tests {
     /// and of the second memo of the output the writer's verdict reads
     /// ([`crate::chia_resolve::output_memos`] of the coin the write makes). A
     /// digest of anything else, or a memo laid out otherwise by the builder,
-    /// would have every write of this build judged a stale row of its own
-    /// coin, and written again.
+    /// would have every write the SSF wallet's keys pay for judged a stale
+    /// row of its own coin, and written again.
     #[test]
     fn a_writes_memo_digest_is_the_one_its_readers_take_from_its_spend() {
         use crate::chia_network::ChiaNet;
@@ -5813,8 +5811,9 @@ mod tests {
     }
 }
 
-/// The claim-and-write's bundle builder, and the rules R1 to R7 it checks
-/// over a burner's spends (stage 4 design §4.1, §4.2, §13 row 9).
+/// The claim-and-write's bundle builder, the rules R1 to R7 it checks over
+/// a burner's spends, and the writer that pushes it under the gift rules
+/// and the fuse (stage 4 design §4.1, §4.2, §5.2, §13 row 9).
 mod claim_write;
 
 /// The writers and readers above, end to end through the real lane on the

@@ -19,8 +19,18 @@
 //! on every network, and which callers reach it, on which network, is their
 //! gate (SSF_CHIA_BURNERS on a test network until PR 10, §13 rows 9 and 10).
 //! Its tests run on each network for that reason.
+//!
+//! The writer ([`burner_write_with`], and [`burner_write`] on the node's own
+//! lease and chain) picks what a write spends under the gift rules of §5.2:
+//! the burner's own coin when it holds one, and otherwise a gift from the
+//! lobby dish, never a second while a bundle for the key is held, and never
+//! past the node's fuse for the era ([`GiftFuse`]). Waiting is not failing:
+//! each reason to wait comes back typed ([`BurnerWait`]).
 
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend, Program, SpendBundle};
@@ -30,11 +40,12 @@ use chia_sdk_types::Conditions;
 use clvm_traits::{FromClvm, ToClvm};
 use clvm_utils::{tree_hash, CurriedProgram};
 use clvmr::{Allocator, NodePtr};
+use serde::{Deserialize, Serialize};
 
-use super::ParkedInput;
+use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
-use crate::chia_chain::PuzzleAndSolution;
-use crate::chia_faucet::{DishClaim, FaucetCoin, FaucetParams, FAUCET_MOD_HASH};
+use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
+use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH};
 use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{created_coins, memo_digest, CreatedCoin, WriteCoins};
 
@@ -203,7 +214,6 @@ pub fn check_burner_spends(net: ChiaNet, burner_ph: Bytes32, spends: &[CoinSpend
 /// dish coin F to the burner, whose gift g the write spends in the same
 /// bundle (the first write under a slot), or the burner's own coin of 1 mojo
 /// with the height it was seen confirmed at (a rewrite).
-#[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
 #[allow(clippy::large_enum_variant)] // one per write, passed by reference, so its size costs nothing
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BurnerInput {
@@ -244,7 +254,6 @@ impl BurnerInput {
 
 /// A burner's write, built and signed, and not pushed
 /// ([`build_burner_bundle`]).
-#[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BurnerBundle {
     /// The signed bundle: F's claim and g's spend for a first write, in that
@@ -293,7 +302,6 @@ fn burner_spends(key: &BurnerKey, input: &BurnerInput, hint: Bytes32, body: Byte
 /// asks `refuse_money_memo`, whose refusal is of the SSF wallet's keys, and
 /// has no network refusal of its own: its callers' gate is the flag
 /// (module doc).
-#[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
 pub fn build_burner_bundle(net: ChiaNet, key: &BurnerKey, input: &BurnerInput, hint: Bytes32, body: Vec<u8>) -> Result<BurnerBundle> {
     let burner_ph = key.puzzle_hash();
     let memo = memo_digest(&body);
@@ -313,6 +321,367 @@ pub fn build_burner_bundle(net: ChiaNet, key: &BurnerKey, input: &BurnerInput, h
         },
         written: Coin::new(parent, burner_ph, 1),
     })
+}
+
+/// Why a burner's write did not go out this time although nothing went
+/// wrong (stage 4 design §5.2, §10): the writer waits, and tries again on
+/// its retry cadence. None of these is a refusal or a failed read, and none
+/// is a knock attempt (§5.2), so a caller tells them from a failure by
+/// downcasting the error to this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BurnerWait {
+    /// A spend the burner pays for is parked, its push in flight or in a
+    /// mempool: a second write beside it would put two records of one payer
+    /// on the chain (§4.4).
+    Held,
+    /// The burner holds no coin and the lease still holds a bundle it paid
+    /// for, settling: the coin that bundle spent is listed spent, by our
+    /// bundle or by another spend at the same height (a stranger's claim of
+    /// the dish coin, §5.4), and a reorganization could bring our bundle
+    /// back, so a gift now could be the key's second (§5.2, §10).
+    Settling,
+    /// The burner holds no coin the listing showed, and the listing of its
+    /// puzzle hash was cut short, so it cannot tell that it holds none: a
+    /// gift could be its second (fail closed).
+    ListingCutShort,
+    /// No peer answered the peak, so no lobby coin can be judged ready.
+    PeakUnavailable,
+    /// No lobby coin is ready that the lease does not hold: a dry or griefed
+    /// dish (§10).
+    NoCoinReady,
+    /// The fuse is blown: the lobby dish gave this node's burners
+    /// [`MAX_GIFTS_PER_ERA`] gifts in `era`, the era the fuse counted them
+    /// in ([`GiftFuse::allows`]).
+    FuseBlown { era: u64 },
+}
+
+impl fmt::Display for BurnerWait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BurnerWait::Held => f.write_str("a spend this burner pays for is still in flight; its next write waits for the chain's verdict"),
+            BurnerWait::Settling => {
+                f.write_str("this burner's last bundle is still settling and the burner holds no coin, so it is not funded again until the chain settles it")
+            }
+            BurnerWait::ListingCutShort => f.write_str("the burner's coin listing was cut short, so it cannot tell that the burner holds no coin"),
+            BurnerWait::PeakUnavailable => f.write_str("chain peak unavailable (peers unreachable?)"),
+            BurnerWait::NoCoinReady => f.write_str("no mojo in the lobby dish right now; it refills on the block clock"),
+            BurnerWait::FuseBlown { era } => write!(
+                f,
+                "{MAX_GIFTS_PER_ERA} gifts from the lobby dish in era {era}; no burner is funded again before era {}",
+                era.saturating_add(1)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BurnerWait {}
+
+/// The most gifts the lobby dish gives this node's burners in one era
+/// (stage 4 design §5.2): one listing, the hosts knocked, a first beacon,
+/// and losses.
+pub const MAX_GIFTS_PER_ERA: u32 = 16;
+
+/// Where the fuse is kept, per network ([`ChiaNet::path`]), 0600 like every
+/// node file.
+pub const GIFT_FUSE_FILE: &str = "gift_fuse.json";
+
+/// The fuse as its file keeps it: the era its gifts were counted in, and one
+/// entry per gift counted, the payer's puzzle hash in hex ([`Payer::hex`]).
+#[derive(Serialize, Deserialize)]
+struct FuseFile {
+    era: u64,
+    payers: Vec<String>,
+}
+
+/// The fuse on the lobby dish's gifts to this node's burners (stage 4
+/// design §5.2): at most [`MAX_GIFTS_PER_ERA`] landed gifts per node per
+/// era, so a bug, or a cloned data folder, cannot drain the dish through us.
+/// Past it the node funds no burner before the next era, and says so once.
+///
+/// A gift is known to have landed only by the chain's verdict, SETTLED_DEPTH
+/// deep. So the fuse counts a gift when its bundle leaves (the push
+/// acknowledged or unanswered, [`burner_write_with`]), one entry for the
+/// payer it funds, and gives the entry back when the bundle is seen to have
+/// died: a later write for that payer finds the burner holding no coin and
+/// the lease holding no bundle of its, so the gift never landed through us
+/// ([`GiftFuse::refund`]). Counted at the push, a gift can be over-counted
+/// for as long as its bundle is in flight, never under-counted; given back,
+/// a lost race or a redirected claim (§5.4) delays a listing but never ends
+/// the era's funding.
+///
+/// It is kept per network in [`GIFT_FUSE_FILE`] and saved at every count and
+/// refund, so a node restarting in a loop cannot draw a fresh fuse at each
+/// start. A missing or malformed file, or one in an older format (no
+/// `payers`), starts a fresh fuse, as the beacon's mark does
+/// (`BeaconMark::load`). It resets only at a later era: an earlier era than
+/// the one it counted (a clock set back) reads the stored count, fail
+/// closed.
+#[derive(Debug)]
+pub struct GiftFuse {
+    /// The era the gifts in `payers` were counted in.
+    era: u64,
+    /// One entry per gift counted in `era`: the hex of the payer it funded.
+    payers: Vec<String>,
+    /// The era whose blown fuse was last logged, so the line is said once
+    /// per era in a run.
+    said: Option<u64>,
+    /// Where it is saved; `None` keeps it in memory alone.
+    path: Option<PathBuf>,
+}
+
+impl GiftFuse {
+    /// A fresh fuse kept in memory alone, saved nowhere: the tests' own.
+    #[cfg(test)]
+    pub(super) fn new() -> GiftFuse {
+        GiftFuse { era: 0, payers: Vec::new(), said: None, path: None }
+    }
+
+    /// A fuse in memory alone that has counted a gift to each of `payers` in
+    /// `era`, for the tests that start from a used or blown fuse.
+    #[cfg(test)]
+    pub(super) fn preset(era: u64, payers: impl IntoIterator<Item = Payer>) -> GiftFuse {
+        GiftFuse { era, payers: payers.into_iter().map(|payer| payer.hex()).collect(), said: None, path: None }
+    }
+
+    /// The fuse saved at `path`, which every later count and refund saves to.
+    /// A missing, unreadable or malformed file, an older format among them,
+    /// gives a fresh fuse.
+    pub fn load(path: &Path) -> GiftFuse {
+        let file = std::fs::read(path).ok().and_then(|bytes| {
+            let _ = crate::chia_contact::tighten_private(path); // 0600 like every node file
+            serde_json::from_slice::<FuseFile>(&bytes).ok()
+        });
+        let (era, payers) = file.map_or((0, Vec::new()), |f| (f.era, f.payers));
+        GiftFuse { era, payers, said: None, path: Some(path.to_path_buf()) }
+    }
+
+    /// The gifts counted that weigh on `era`: none for an era past the one
+    /// the fuse counted, the stored count for that era or any earlier one.
+    pub(super) fn gifts_in(&self, era: u64) -> u32 {
+        if era > self.era {
+            0
+        } else {
+            u32::try_from(self.payers.len()).unwrap_or(u32::MAX)
+        }
+    }
+
+    /// Start the count again at `era` if it is past the one counted.
+    fn roll(&mut self, era: u64) {
+        if era > self.era {
+            self.era = era;
+            self.payers.clear();
+        }
+    }
+
+    /// May a burner be funded in `era`? [`BurnerWait::FuseBlown`] once
+    /// [`MAX_GIFTS_PER_ERA`] gifts weigh on it, the era named the one they
+    /// were counted in; the first refusal for that era logs why.
+    pub fn allows(&mut self, era: u64) -> Result<(), BurnerWait> {
+        self.roll(era);
+        if self.gifts_in(era) < MAX_GIFTS_PER_ERA {
+            return Ok(());
+        }
+        if let Some(line) = self.say_blown() {
+            eprintln!("{line}");
+        }
+        Err(BurnerWait::FuseBlown { era: self.era })
+    }
+
+    /// The line a blown fuse logs, the first time it is asked in its era;
+    /// `None` after that.
+    fn say_blown(&mut self) -> Option<String> {
+        if self.said == Some(self.era) {
+            return None;
+        }
+        self.said = Some(self.era);
+        Some(format!(
+            "⛓️ ChiaHub burners: {MAX_GIFTS_PER_ERA} gifts from the lobby dish this era; no burner is funded again before era {}",
+            self.era.saturating_add(1)
+        ))
+    }
+
+    /// Count a gift to `payer` in `era`, its bundle gone to the peers, and
+    /// save. A save that fails is logged, and the count holds in memory.
+    pub fn count(&mut self, era: u64, payer: Payer) {
+        self.roll(era);
+        self.payers.push(payer.hex());
+        self.save_or_log();
+    }
+
+    /// Give back one gift counted to `payer`, its bundle seen to have died
+    /// (the burner holds no coin and the lease no bundle of its), and save:
+    /// `true` if the fuse held one. A later era has nothing to give back.
+    pub fn refund(&mut self, era: u64, payer: Payer) -> bool {
+        self.roll(era);
+        let hex = payer.hex();
+        let Some(at) = self.payers.iter().position(|counted| *counted == hex) else { return false };
+        self.payers.remove(at);
+        self.save_or_log();
+        true
+    }
+
+    /// Save the fuse to its file, if it has one, as `BeaconMark::save` does
+    /// (`write_private`, 0600 and atomic); a failure is logged.
+    fn save_or_log(&self) {
+        let Some(path) = &self.path else { return };
+        let file = FuseFile { era: self.era, payers: self.payers.clone() };
+        let saved = serde_json::to_vec_pretty(&file)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::chia_contact::write_private(path, &bytes));
+        if let Err(e) = saved {
+            eprintln!(
+                "⛓️ ChiaHub burners: the gift fuse could not be saved to {} ({e}); it holds in memory until the node stops",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The node's fuse ([`GiftFuse`]), loaded from its network's
+/// [`GIFT_FUSE_FILE`] the first time a burner write asks it. Production
+/// only: the tests bring a fuse of their own, since the network is the
+/// process's.
+pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(GiftFuse::load(&crate::chia_network::net().path(GIFT_FUSE_FILE))));
+
+/// `key`'s write of `body` under `hint` in `era` (stage 4 design §4.1,
+/// §5.2), against a given lease, fuse, network, chain, instant and random
+/// source: the node's own in production ([`burner_write`]), the tests' own
+/// on the mock chain. Under the lease's gate, after a reconciliation:
+///
+/// - A spend the burner pays for still parked is [`BurnerWait::Held`]: one
+///   write in flight per payer (§4.4, [`WalletLease::outgoing_pending_for`]).
+/// - A coin of exactly 1 mojo at the burner that the lease does not hold is
+///   written from, the oldest first (the table's rewrite row). A coin of any
+///   other amount is a stray and is never written from (R7).
+/// - Holding none, the burner is funded by the claim of a random ready lobby
+///   coin in the same bundle as the write (§5.1), under the gift rules
+///   (§5.2): not while its listing was cut short
+///   ([`BurnerWait::ListingCutShort`]), not while the lease holds a bundle
+///   it paid for, parked or settling ([`BurnerWait::Settling`],
+///   [`WalletLease::holds_for`]), and not past the fuse
+///   ([`BurnerWait::FuseBlown`]). A gift the fuse counted for the burner,
+///   whose bundle has died since, is given back first ([`GiftFuse::refund`]).
+///   The coin is one the lease does not hold and the TAKE marker does not
+///   name ([`WalletLease::is_incoming_marker`]); a dry dish or an unanswered
+///   peak is [`BurnerWait::NoCoinReady`] or [`BurnerWait::PeakUnavailable`].
+///
+/// `body` gets the id of the coin the write's own coin will name as its
+/// parent, g for a first write and the burner's coin for a rewrite, so a
+/// knock seals to it. With a `gate`, `body` runs and the bundle is pushed
+/// under it, as `publish_memo_with` does. The bundle is built and checked
+/// against R1 to R7 ([`build_burner_bundle`]; a broken rule is the
+/// [`BurnerRule`] inside the error) and pushed with its on-chain input parked
+/// under the burner as its payer ([`Payer::of_burner`]): F for a first
+/// write, never g. An acknowledged or an unanswered push is a write, `acked`
+/// true or false, as in `publish_memo_with`, and a first write's gift is
+/// counted in the fuse; a refused one, or one the lease would not park, is
+/// the [`PushError`] inside the error, and counts nothing.
+///
+/// The fuse is a std mutex, locked only for one statement at a time and
+/// never across an await, so the future is `Send` and a spawned task can run
+/// it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &Mutex<GiftFuse>,
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    now: Instant,
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    rng: &mut R,
+    what: &str,
+) -> Result<MemoWrite> {
+    let _lease = lease.lock().await;
+    lease.ensure_open()?;
+    lease.reconcile_at(net, client, now).await;
+    let payer = Payer::of_burner(key);
+    if lease.outgoing_pending_for(payer) {
+        return Err(BurnerWait::Held.into());
+    }
+    let burner_ph = key.puzzle_hash();
+    let Unspent { coins, partial } = unspent_at(client, burner_ph).await?;
+    let own = coins
+        .into_iter()
+        .filter(|c| c.coin.amount == 1 && !lease.is_taken(&c.coin.coin_id()))
+        .min_by_key(|c| (c.confirmed_height, c.coin.coin_id()));
+    let input = match own {
+        Some(own) => BurnerInput::Own(own),
+        None => {
+            if partial {
+                return Err(BurnerWait::ListingCutShort.into());
+            }
+            if lease.holds_for(payer) {
+                return Err(BurnerWait::Settling.into());
+            }
+            let refunded = fuse.lock().unwrap().refund(era, payer);
+            if refunded {
+                eprintln!("⛓️ ChiaHub {what}: the burner's last bundle died before it landed, so its gift goes back to the fuse");
+            }
+            fuse.lock().unwrap().allows(era)?;
+            let taken = |id: &Bytes32| lease.is_taken(id) || lease.is_incoming_marker(id);
+            match claim_to(net, client, burner_ph, taken, rng).await {
+                Ok(claim) => BurnerInput::Claim(claim),
+                Err(e) => {
+                    return Err(match e.downcast_ref::<ClaimToError>() {
+                        Some(ClaimToError::NoCoinReady) => BurnerWait::NoCoinReady.into(),
+                        Some(ClaimToError::PeakUnavailable) => BurnerWait::PeakUnavailable.into(),
+                        _ => e,
+                    })
+                }
+            }
+        }
+    };
+    let _gate = match gate {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
+    let built = build_burner_bundle(net, key, &input, hint, body(input.parent())?)?;
+    let acked = match push_parked_with(lease, client, payer, built.bundle, [built.parked]).await {
+        Ok(()) => true,
+        // Indeterminate, not failed: the bundle may be in a mempool and its
+        // input is parked, so it is a write, and its gift is counted.
+        Err(PushError::Unanswered(e)) => {
+            eprintln!("⛓️ ChiaHub {what}: the burner's push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
+            false
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if built.gift.is_some() {
+        fuse.lock().unwrap().count(era, payer);
+    }
+    Ok(MemoWrite { coins: built.coins, acked, spend: lease.spend_of(&built.coins.parked), memo: built.memo })
+}
+
+/// [`burner_write_with`] on the node's own lease and fuse ([`WALLET_LEASE`],
+/// [`GIFT_FUSE`]), its network, the money lane's chain
+/// (`chia_chain::connect`: money paths need two agreeing peers, stage 4
+/// design §10; a peer that lies about a burner coin risks at most a refused
+/// push) and the OS random source.
+///
+/// Its [`MemoWrite`] must not be filed in `NodePublishMark`, `BeaconMark` or
+/// `SentKnock` until PR 10 files `parked` beside the parent: those marks
+/// keep one coin and read it back as both ([`WriteCoins::filed`]), so a
+/// first write filed there would be judged by g alone, and its verdict would
+/// never find the dish coin it parked. Like the builder it has no network
+/// check of its own: until PR 10 its one caller, the claim-and-write
+/// self-test hook, runs only with SSF_CHIA_BURNERS=1 on a test network
+/// (§13 row 9), and keeps no mark.
+#[allow(dead_code)] // its caller, the claim-and-write self-test hook (stage 4 design §13 row 9), comes with main.rs's hooks
+pub async fn burner_write(
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    what: &str,
+) -> Result<MemoWrite> {
+    let client = crate::chia_chain::connect();
+    let net = crate::chia_network::net();
+    burner_write_with(&WALLET_LEASE, &GIFT_FUSE, net, &client, Instant::now(), key, era, hint, gate, body, &mut rand::rngs::OsRng, what).await
 }
 
 #[cfg(test)]
@@ -652,6 +1021,157 @@ mod tests {
                 let built = build_burner_bundle(net, &key, &stray, hint, BODY.to_vec());
                 assert_eq!(refused_under(built), Some(R7), "{net:?}: a stray of {amount}");
             }
+        }
+    }
+
+    /// `n` payers, each another test burner's on testnet11.
+    fn payers(n: u8) -> Vec<Payer> {
+        (0..n).map(|i| Payer::of_burner(&burner(ChiaNet::Testnet11, i))).collect()
+    }
+
+    /// A directory of the test's own, removed when it is dropped, a failed
+    /// assertion included.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ssf-gift-fuse-{tag}-{}-{}", std::process::id(), rand::random::<u64>()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Stage 4 design §5.2: at most sixteen gifts per node per era. Each is
+    /// let through and counted, the seventeenth is refused as a wait that
+    /// names the era, and the next era opens the fuse again. An earlier era
+    /// (a clock set back) reads the count of the era it counted, so it
+    /// fails closed rather than starting a fresh count.
+    #[test]
+    fn the_fuse_lets_sixteen_gifts_through_an_era_and_opens_again_in_the_next() {
+        let mut fuse = GiftFuse::new();
+        let funded = payers(17);
+        for (n, payer) in funded.iter().take(16).enumerate() {
+            assert_eq!(fuse.allows(5), Ok(()), "gift {n}");
+            fuse.count(5, *payer);
+            assert_eq!(fuse.gifts_in(5), u32::try_from(n + 1).unwrap());
+        }
+        assert_eq!(fuse.allows(5), Err(BurnerWait::FuseBlown { era: 5 }), "the seventeenth");
+        assert_eq!(fuse.allows(5), Err(BurnerWait::FuseBlown { era: 5 }), "and every one after it");
+        assert_eq!(
+            BurnerWait::FuseBlown { era: 5 }.to_string(),
+            "16 gifts from the lobby dish in era 5; no burner is funded again before era 6"
+        );
+        assert_eq!((fuse.gifts_in(4), fuse.allows(4)), (16, Err(BurnerWait::FuseBlown { era: 5 })), "an earlier era fails closed");
+        assert_eq!(fuse.gifts_in(6), 0);
+        assert_eq!(fuse.allows(6), Ok(()), "the next era opens it");
+        fuse.count(6, funded[16]);
+        assert_eq!((fuse.gifts_in(6), fuse.gifts_in(5)), (1, 1), "the count is the new era's, and an earlier one reads it");
+    }
+
+    /// The blown fuse says why once per era: the first refusal of an era
+    /// logs its line, which names the next era, and no later refusal of that
+    /// era says it again. A later era that blows says its own.
+    #[test]
+    fn the_fuse_says_once_per_era_that_it_is_blown() {
+        let mut fuse = GiftFuse::preset(3, payers(16));
+        assert_eq!(
+            fuse.say_blown().as_deref(),
+            Some("⛓️ ChiaHub burners: 16 gifts from the lobby dish this era; no burner is funded again before era 4")
+        );
+        assert_eq!(fuse.say_blown(), None, "said once");
+
+        let mut fuse = GiftFuse::preset(3, payers(16));
+        assert_eq!(fuse.allows(3), Err(BurnerWait::FuseBlown { era: 3 }));
+        assert_eq!(fuse.said, Some(3), "the first refusal said it");
+        assert_eq!(fuse.say_blown(), None, "…so nothing says it again this era");
+        assert_eq!(fuse.allows(3), Err(BurnerWait::FuseBlown { era: 3 }));
+        assert_eq!(fuse.said, Some(3));
+
+        assert_eq!(fuse.allows(4), Ok(()));
+        for payer in payers(16) {
+            fuse.count(4, payer);
+        }
+        assert_eq!(fuse.allows(4), Err(BurnerWait::FuseBlown { era: 4 }));
+        assert_eq!(fuse.said, Some(4), "a later era says its own");
+        assert_eq!(fuse.say_blown(), None);
+    }
+
+    /// Stage 4 design §5.2 and §5.4: a gift whose bundle died never landed
+    /// through us, so the fuse gives it back: one entry of that payer's, and
+    /// none of anyone else's. A payer it holds nothing for gets nothing back,
+    /// and a blown fuse given a gift back lets the next one through. A later
+    /// era has nothing to give back.
+    #[test]
+    fn the_fuse_gives_back_a_gift_whose_bundle_died_and_no_other() {
+        let [a, b, c]: [Payer; 3] = payers(3).try_into().unwrap();
+        let mut fuse = GiftFuse::new();
+        fuse.count(2, a);
+        fuse.count(2, b);
+        fuse.count(2, a);
+        assert!(fuse.refund(2, a), "one of a's");
+        assert_eq!(fuse.gifts_in(2), 2);
+        assert!(!fuse.refund(2, c), "c was funded nothing");
+        assert_eq!(fuse.gifts_in(2), 2);
+        assert!(fuse.refund(2, a), "a's other");
+        assert!(!fuse.refund(2, a), "a holds nothing more");
+        assert_eq!(fuse.payers, vec![b.hex()], "b's stays");
+
+        let mut blown = GiftFuse::preset(2, payers(16));
+        assert_eq!(blown.allows(2), Err(BurnerWait::FuseBlown { era: 2 }));
+        assert!(blown.refund(2, a));
+        assert_eq!((blown.gifts_in(2), blown.allows(2)), (15, Ok(())), "given one back, the fuse lets one through");
+        assert!(!blown.refund(3, b), "a later era has nothing to give back");
+        assert_eq!(blown.gifts_in(3), 0);
+    }
+
+    /// The fuse is kept across a restart, per its file: what was counted and
+    /// given back is what a load reads, the file written 0600. A missing
+    /// file, one that is not the fuse's JSON, and one in an older format
+    /// (a bare count, with no payers) start a fresh fuse, which saves to the
+    /// same file at its first count.
+    #[test]
+    fn the_fuse_is_kept_across_a_restart_and_a_bad_file_starts_it_fresh() {
+        let dir = Dir::new("restart");
+        let path = dir.0.join(GIFT_FUSE_FILE);
+        let [a, b]: [Payer; 2] = payers(2).try_into().unwrap();
+
+        let mut fuse = GiftFuse::load(&path);
+        assert_eq!((fuse.era, fuse.gifts_in(0), fuse.path.as_deref()), (0, 0, Some(path.as_path())), "missing: fresh");
+        assert!(!path.exists(), "a load writes nothing");
+        fuse.count(7, a);
+        fuse.count(7, b);
+        let again = GiftFuse::load(&path);
+        assert_eq!((again.era, again.gifts_in(7), again.payers.clone()), (7, 2, vec![a.hex(), b.hex()]));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({ "era": 7, "payers": [a.hex(), b.hex()] }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let mut again = again;
+        assert!(again.refund(7, a));
+        assert_eq!(GiftFuse::load(&path).payers, vec![b.hex()], "a gift given back is saved too");
+
+        let mut blown = GiftFuse { path: Some(path.clone()), ..GiftFuse::preset(7, payers(15)) };
+        blown.count(7, a);
+        let mut fuse = GiftFuse::load(&path);
+        assert_eq!(fuse.allows(7), Err(BurnerWait::FuseBlown { era: 7 }), "a blown fuse stays blown across a restart");
+        assert_eq!(fuse.allows(8), Ok(()), "…until the next era");
+
+        for bad in ["", "not json", "{\"era\": 7", "{\"era\": \"seven\", \"payers\": []}", "{\"era\": 7, \"gifts\": 16}", "[7, 16]"] {
+            std::fs::write(&path, bad).unwrap();
+            let mut fuse = GiftFuse::load(&path);
+            assert_eq!((fuse.era, fuse.gifts_in(7)), (0, 0), "{bad:?}: fresh");
+            assert_eq!(fuse.allows(7), Ok(()), "{bad:?}");
+            fuse.count(7, a);
+            assert_eq!(GiftFuse::load(&path).payers, vec![a.hex()], "{bad:?}: saved over at its first count");
         }
     }
 }

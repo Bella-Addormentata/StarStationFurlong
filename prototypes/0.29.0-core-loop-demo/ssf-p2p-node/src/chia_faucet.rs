@@ -963,7 +963,7 @@ impl std::error::Error for ClaimToError {}
 /// anything, so calling it twice picks twice from the same coins.
 /// `ClaimToError::PeakUnavailable` and `ClaimToError::NoCoinReady` come back
 /// typed; a listing that failed is a plain error.
-#[cfg_attr(not(test), allow(dead_code))] // nothing calls it outside the tests until the burner writer (stage 4 design §13 row 9)
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
 pub async fn claim_to<R: rand::Rng + ?Sized>(
     net: ChiaNet,
     client: &impl ChainAccess,

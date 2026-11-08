@@ -896,3 +896,65 @@ async fn a_closed_lane_makes_no_connection_and_the_mock_chain_sees_nothing() {
     assert!(s.asked_nothing());
     assert!(s.chain.received().is_empty());
 }
+
+/// The burner writer on the mock chain (stage 4 design §4.1, §5.2), as a
+/// smoke test of its seam: a burner holding no coin is funded by the claim
+/// of the one ready lobby coin F in its write's own bundle, the body is
+/// handed g as the parent, the gift is counted once in the fuse, and a
+/// second write while F is parked waits. Once the write has landed, the
+/// next one spends the burner's own coin and counts no gift. The writer's
+/// future is `Send`, so a spawned task can run it.
+#[tokio::test]
+async fn the_burner_writer_funds_a_burner_once_and_then_writes_from_its_coin() {
+    use super::claim_write::{burner_write_with, BurnerWait, GiftFuse};
+    use crate::chia_burner::{BurnerRoot, MoneyKey};
+    use rand::{rngs::StdRng, SeedableRng};
+    fn send<F: std::future::Future + Send>(future: F) -> F {
+        future
+    }
+
+    let mut s = setup().await;
+    let fuse = std::sync::Mutex::new(GiftFuse::new());
+    let lobby = FaucetParams::lobby(NET);
+    let f = s.chain.fund(lobby.puzzle_hash(), 10, None);
+    s.chain.farm().await;
+    s.chain.farm_blocks(GAP_BLOCKS).await;
+    let key = BurnerRoot::of(&MoneyKey::new(wallet(30)), NET).presence(&CK, 0);
+    let ph = key.puzzle_hash();
+    let hint = Bytes32::new([0x51; 32]);
+    let g = Coin::new(f.coin_id(), ph, lobby.gift);
+
+    let mut handed = None;
+    let at = s.later();
+    let body = |parent: Bytes32| -> Result<Vec<u8>> {
+        handed = Some(parent);
+        Ok(b"a first write".to_vec())
+    };
+    let first = send(burner_write_with(&s.lease, &fuse, NET, &s.money, at, &key, 0, hint, None, body, &mut StdRng::seed_from_u64(1), "test")).await.unwrap();
+    assert_eq!(handed, Some(g.coin_id()), "the body seals to g");
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    assert!(first.acked);
+    assert_eq!(first.spend, s.lease.spend_of(&f.coin_id()), "F parked, under the write's spend");
+    assert!(first.spend.is_some() && !s.lease.is_parked(&g.coin_id()), "never g");
+    assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "one gift counted");
+    assert_eq!(s.sent().len(), 1, "one bundle");
+    let bundle = s.chain.received().remove(0);
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![f, g], "F's claim and g's spend");
+    assert_eq!(s.chain.fee_of(&bundle), 0);
+
+    let at = s.later();
+    let held = burner_write_with(&s.lease, &fuse, NET, &s.money, at, &key, 0, hint, None, |_| Ok(b"again".to_vec()), &mut StdRng::seed_from_u64(2), "test").await;
+    assert_eq!(held.err().and_then(|e| e.downcast_ref::<BurnerWait>().copied()), Some(BurnerWait::Held), "F still parked");
+    assert_eq!(s.sent(), HashSet::from([bundle.name()]), "nothing more sent");
+
+    s.chain.farm().await;
+    let written = Coin::new(g.coin_id(), ph, 1);
+    assert_eq!(s.chain.children(g.coin_id()), vec![written]);
+    let at = s.later();
+    let rewrite = burner_write_with(&s.lease, &fuse, NET, &s.money, at, &key, 0, hint, None, |_| Ok(b"a rewrite".to_vec()), &mut StdRng::seed_from_u64(3), "test").await.unwrap();
+    assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "written from the burner's own coin");
+    assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "no second gift");
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(written.coin_id()), vec![Coin::new(written.coin_id(), ph, 1)]);
+    assert!(s.chain.unanswered().is_empty());
+}
