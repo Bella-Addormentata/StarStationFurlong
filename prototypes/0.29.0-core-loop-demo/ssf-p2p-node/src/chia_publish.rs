@@ -2274,9 +2274,10 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// Whether [`BURNERS_ENV`] set to `raw` turns burner keys on for `net`, and
 /// the line said once a wallet loads (stage 4 design §8 (2)). Exactly `1` on
 /// a test network turns them on, and the line says what that does in this
-/// build: the knock rule of §5.2 ([`knock_attempt_counts`]), with the
-/// listing, knocks and beacon paid as before. Exactly `1` off a test network
-/// is ignored with a line: there no memo spend leaves the money key
+/// build: the knock rule of §5.2 ([`knock_attempt_counts`]) and the
+/// claim-and-write self-test hook it opens ([`claim_write_selftest`]), with
+/// the listing, knocks and beacon paid as before. Exactly `1` off a test
+/// network is ignored with a line: there no memo spend leaves the money key
 /// ([`refuse_money_memo`]), and nothing exits or changes. Any other value
 /// (unset, empty, `0`, `true`, a stray space, not UTF-8) is off and says
 /// nothing, whatever the network, as a hook's does (main.rs `test_hook`).
@@ -2290,7 +2291,7 @@ pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsSt
         return (false, Some(format!("⛓️ ChiaHub: {BURNERS_ENV}=1 is ignored on {}. Burner keys are tried on a test network only.", net.name())));
     }
     let line = format!(
-        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. The listing, knocks and beacon are still paid as before.",
+        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The listing, knocks and beacon are still paid as before.",
         net.name(),
         HEARTBEAT_RETRY_SECS / 60
     );
@@ -2299,8 +2300,8 @@ pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsSt
 
 /// The process's [`BURNERS_ENV`] on its network ([`burners_of`]), read once,
 /// as `chia_wallet_switch::env_switch` reads `SSF_CHIA_LANE`: the startup
-/// line and the heartbeat's knock rule see the same value. The network is
-/// settled before anything asks.
+/// line, the heartbeat's knock rule and the self-test hook see the same
+/// value. The network is settled before anything asks.
 pub fn burners() -> &'static (bool, Option<String>) {
     static BURNERS: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
     BURNERS.get_or_init(|| burners_of(crate::chia_network::net(), std::env::var_os(BURNERS_ENV).as_deref()))
@@ -5984,7 +5985,7 @@ mod tests {
         assert_eq!(
             burners_of(ChiaNet::Testnet11, Some(OsStr::new("1"))).1.as_deref(),
             Some(
-                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. The listing, knocks and beacon are still paid as before."
+                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The listing, knocks and beacon are still paid as before."
             )
         );
         assert_eq!(
@@ -6116,9 +6117,11 @@ mod tests {
 }
 
 /// The claim-and-write's bundle builder, the rules R1 to R7 it checks over
-/// a burner's spends, and the writer that pushes it under the gift rules
-/// and the fuse (stage 4 design §4.1, §4.2, §5.2, §13 row 9).
+/// a burner's spends, the writer that pushes it under the gift rules and
+/// the fuse, and its self-test on a real test network (stage 4 design §4.1,
+/// §4.2, §5.2, §13 row 9).
 mod claim_write;
+pub(crate) use claim_write::claim_write_selftest;
 
 /// The writers and readers above, end to end through the real lane on the
 /// mock chain (stage 4 design §12).

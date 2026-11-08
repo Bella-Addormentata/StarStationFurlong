@@ -26,6 +26,11 @@
 //! lobby dish, never a second while a bundle for the key is held, and never
 //! past the node's fuse for the era ([`GiftFuse`]). Waiting is not failing:
 //! each reason to wait comes back typed ([`BurnerWait`]).
+//!
+//! Until PR 10 the writer's one caller outside the tests is
+//! [`claim_write_selftest`], the hook that makes one real claim-and-write on
+//! a test network and reads it back through its ephemeral parent
+//! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -668,9 +673,8 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// first write filed there would be judged by g alone, and its verdict would
 /// never find the dish coin it parked. Like the builder it has no network
 /// check of its own: until PR 10 its one caller, the claim-and-write
-/// self-test hook, runs only with SSF_CHIA_BURNERS=1 on a test network
-/// (§13 row 9), and keeps no mark.
-#[allow(dead_code)] // its caller, the claim-and-write self-test hook (stage 4 design §13 row 9), comes with main.rs's hooks
+/// self-test hook ([`claim_write_selftest`]), runs only with
+/// SSF_CHIA_BURNERS=1 on a test network (§13 row 9), and keeps no mark.
 pub async fn burner_write(
     key: &BurnerKey,
     era: u64,
@@ -682,6 +686,174 @@ pub async fn burner_write(
     let client = crate::chia_chain::connect();
     let net = crate::chia_network::net();
     burner_write_with(&WALLET_LEASE, &GIFT_FUSE, net, &client, Instant::now(), key, era, hint, gate, body, &mut rand::rngs::OsRng, what).await
+}
+
+/// The blake3 `derive_key` context of the claim-and-write self-test's hint.
+const CTX_CLAIM_WRITE_TEST: &str = "ssf-chia-claim-write-test-v1";
+
+/// The prefix of the self-test's log lines, as the craps self-test has its own.
+const SELFTEST: &str = "⛓️🧪 claim-write selftest";
+
+/// How many times the self-test asks the writer while it only waits
+/// ([`BurnerWait`]), and how long it waits between asks.
+const SELFTEST_TRIES: u32 = 20;
+const SELFTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the self-test asks the chain's verdict on its write, and for how
+/// long before it gives up.
+const SELFTEST_VERDICT_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+const SELFTEST_VERDICT_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How many times the self-test reads its record back on the carrier lane,
+/// one [`SELFTEST_VERDICT_EVERY`] apart, since the first reachable peer can
+/// be a block behind the agreed ones that confirmed it.
+const SELFTEST_READS: u32 = 9;
+
+/// The hint the self-test writes under in `era`. It is derived from a
+/// constant and the era alone, so it is public, and no listing, knock or
+/// beacon is ever written under it.
+fn claim_write_test_hint(era: u64) -> Bytes32 {
+    Bytes32::new(blake3::derive_key(CTX_CLAIM_WRITE_TEST, &era.to_le_bytes()))
+}
+
+/// The era the self-test writes in: the agreed peak's, refused inside the
+/// era's last [`super::ERA_GUARD_BLOCKS`], where a write could confirm in the
+/// next era, as every era-bound write is.
+async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
+    let peak = crate::chia_resolve::peak_height(client).await.ok_or_else(|| anyhow!("chain peak unavailable (peers unreachable?)"))?;
+    if super::era_guard(peak) {
+        return Err(anyhow!("the era ends within {} blocks; run the test again in the new era", super::ERA_GUARD_BLOCKS));
+    }
+    Ok(crate::chia_lane::era_of(peak))
+}
+
+/// The claim-and-write self-test (SSF_CHIA_CLAIM_WRITE_TEST=1 with
+/// SSF_CHIA_BURNERS=1, on a test network: main.rs). It makes one real
+/// claim-and-write from a burner on the network's lobby dish ([`burner_write`],
+/// stage 4 design §4.1), waits for the chain's verdict on it, and reads the
+/// record back through its ephemeral parent g on the carrier lane: the
+/// inferred fetch of §4.1 and §14 (2), tried on real peers before PR 10
+/// builds every writer on it (§13 row 9). It is not a row 9 item itself but
+/// an addition beside them, so it is its own hook, off by default.
+///
+/// The burner is K(h_test) of the wallet's root on `net`, with h_test
+/// [`claim_write_test_hint`] of the era: the knock kind's derivation used as
+/// a test slot that no knock is ever written under. It claims a random ready
+/// lobby coin F to itself and, in the same bundle, writes 64 random bytes
+/// under h_test: two coin spends, the burner's one signature, no fee, parked
+/// under the burner as its payer, holding F alone. The bytes carry no node
+/// id and no address, and the write is filed in no mark.
+///
+/// A knock's key is never spent again (§4.1), so a second run in the same
+/// era that finds the burner holding its coin says the test already ran and
+/// writes nothing. Its coin can land in the moment between that check and the
+/// writer's own listing, and the run then writes once from it; it is a test
+/// slot, so nothing is lost but a mojo's move.
+///
+/// PASS needs a Confirmed verdict ([`super::write_standing_on`] by g and F,
+/// which already fetches g's spend on the agreed lane) and then the record
+/// found on the carrier lane with g as its parent. If the verdict is still
+/// pending after 30 minutes while F reads spent, the likely cause is that
+/// the peers do not serve g, and the FAIL says the §10 fallback is needed.
+///
+/// A bundle it parked outlives the run: like any spend in flight, it is
+/// pushed again and settled on any later start on a test network, with
+/// SSF_CHIA_BURNERS set or not, and until it settles the money writers'
+/// settling check, which asks about every payer, holds them. Nothing new is
+/// built without the flag.
+pub async fn claim_write_selftest(net: ChiaNet, wallet: chia_bls::SecretKey) -> Result<()> {
+    use crate::chia_burner::{BurnerRoot, MoneyKey};
+    use crate::chia_resolve::{read_hint_items, spent_heights, HintCursor, WriteStanding};
+
+    anyhow::ensure!(net.is_test(), "the claim-and-write self-test runs on a test network only");
+    let client = crate::chia_chain::connect();
+    let era = selftest_era(&client).await?;
+    let hint = claim_write_test_hint(era);
+    let key = BurnerRoot::of(&MoneyKey::new(wallet), net).knock(&hint.to_bytes(), era);
+    let mut body = [0u8; 64];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut body);
+    println!("{SELFTEST} — {} era {era}, test hint {}", net.name(), hex::encode(&hint.to_bytes()[..8]));
+
+    let mut tries = 0u32;
+    let write = loop {
+        if !unspent_at(&client, key.puzzle_hash()).await?.coins.is_empty() {
+            println!("{SELFTEST}: already ran this era (its burner holds its coin); nothing is written");
+            return Ok(());
+        }
+        match burner_write(&key, era, hint, None, |_| Ok(body.to_vec()), "claim-write test").await {
+            Ok(write) => break write,
+            Err(e) if e.downcast_ref::<BurnerWait>().is_some() && tries + 1 < SELFTEST_TRIES => {
+                tries += 1;
+                println!("{SELFTEST}: waits ({tries}/{SELFTEST_TRIES}): {e:#}; asks again in {} s", SELFTEST_RETRY.as_secs());
+                tokio::time::sleep(SELFTEST_RETRY).await;
+                if selftest_era(&client).await? != era {
+                    return Err(anyhow!("the era turned while the test waited; run it again"));
+                }
+            }
+            Err(e) => return Err(e.context("the claim-and-write did not go out")),
+        }
+    };
+    let (g, f) = (write.coins.parent, write.coins.parked);
+    if g == f {
+        println!("{SELFTEST}: already ran this era (its burner's coin landed as this run asked, so it wrote from that coin)");
+        return Ok(());
+    }
+    println!(
+        "   ✅ claim and write {}: dish coin F {f}, gift g {g}, new coin {}",
+        if write.acked { "pushed" } else { "pushed, unanswered (the chain's word settles it)" },
+        Coin::new(g, key.puzzle_hash(), 1).coin_id()
+    );
+
+    let asked = Instant::now();
+    let height = loop {
+        let standing = super::write_standing_on(
+            &WALLET_LEASE,
+            net,
+            &crate::chia_chain::connect(),
+            write.coins,
+            hint,
+            Some(write.memo),
+            write.spend,
+            0,
+            "claim-write test",
+        )
+        .await;
+        match standing.map(|(standing, _)| standing) {
+            Some(WriteStanding::Confirmed { height, .. }) => break height,
+            Some(WriteStanding::Dead(why)) => return Err(anyhow!("the claim-and-write died: {why}")),
+            _ if asked.elapsed() >= SELFTEST_VERDICT_FOR => {
+                let f_spent = spent_heights(&client, vec![f]).await.is_ok_and(|spent| spent.iter().any(|(coin, _)| *coin == f));
+                return Err(if f_spent {
+                    anyhow!("F is spent but the write is still pending after 30 minutes: the ephemeral parent g was not served (design §10 fallback)")
+                } else {
+                    anyhow!("the bundle has not landed in 30 minutes (F is unspent); its spend stays parked and settles on a later run")
+                });
+            }
+            _ => tokio::time::sleep(SELFTEST_VERDICT_EVERY).await,
+        }
+    };
+    println!("   ✅ confirmed at height {height}, judged through g on the agreed lane");
+
+    let opener = |ciphertext: &[u8], parent: Bytes32, _height: u32| (ciphertext == body.as_slice()).then_some(parent);
+    let mut read = 0u32;
+    loop {
+        read += 1;
+        let found = read_hint_items(&crate::chia_chain::connect_carrier(), hint, &mut HintCursor::default(), &opener).await;
+        match found {
+            Ok(found) if found.iter().any(|item| item.item == g) => {
+                println!("{SELFTEST} PASS — the record was read back on the carrier lane through its ephemeral parent g (design §4.1)");
+                return Ok(());
+            }
+            Ok(_) | Err(_) if read < SELFTEST_READS => tokio::time::sleep(SELFTEST_VERDICT_EVERY).await,
+            Ok(found) => {
+                return Err(anyhow!(
+                    "confirmed, but the carrier lane's read under the hint found no record through g ({} other item(s)): the design §10 fallback is needed",
+                    found.len()
+                ))
+            }
+            Err(e) => return Err(e.context("confirmed, but the carrier lane's read under the hint failed")),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -41,10 +41,11 @@
 //! hashes, the copies a move leaves, and a burner's `SecretKey`, which
 //! chia-bls does not wipe.
 #![cfg(feature = "chia-publish")]
-// Nothing in the node calls this module yet: PR 9 (`claim-and-write`, the
-// bundle builder) and PR 10 (`burner-writers`) are its callers (design §13).
-// Until then only its own tests use it, so a build without them would warn
-// that all of it is dead code.
+// PR 9 (`claim-and-write`: the bundle builder and its self-test hook) calls
+// the root, K(h) and a burner key's puzzle hash and signature; PR 10
+// (`burner-writers`) calls the rest, P(e) and the slots among them (design
+// §13). Until then only this module's tests use those, so a build without
+// them would warn that they are dead code.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::fmt;
