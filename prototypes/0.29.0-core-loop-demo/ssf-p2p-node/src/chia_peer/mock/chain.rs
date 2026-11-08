@@ -73,12 +73,16 @@
 //! Every reorganisation reaches every node not held at once, behind the
 //! barrier ([`MockChain::farm_blocks`]); real nodes take a fork seconds
 //! apart, which a test stages with [`MockChain::hold`] and
-//! [`MockChain::release`].
+//! [`MockChain::release`]. One staged to come just as a node is to answer a
+//! request ([`MockChain::reorg_before`]) has no barrier: each connection
+//! hears of the new peak when its announcement arrives, a moment after the
+//! answer, as a real node's peers hear of one.
 //!
 //! A node can also be made to say what its chain does not, which no node
 //! here does on its own: leave a coin out of its listings
-//! ([`MockChain::hide_on`]), deny one by id ([`MockChain::deny_on`]) or
-//! serve another spend than the chain's ([`MockChain::serve_spend_on`]).
+//! ([`MockChain::hide_on`]), deny one by id ([`MockChain::deny_on`]), serve
+//! another spend than the chain's ([`MockChain::serve_spend_on`]) or refuse
+//! every lookup by id ([`MockChain::refuse_lookups_on`]).
 //! These stand for a lying peer, or one whose stores are short, beside an
 //! honest one: what the lane's settling of the coins two peers' hinted
 //! listings differ on is to tell apart from a stale hint row.
@@ -640,6 +644,8 @@ struct Lies {
     /// whatever the height asked: a puzzle and solution, or `None` to
     /// refuse the request as for a coin not spent there.
     spends: HashMap<Bytes32, Option<(Program, Program)>>,
+    /// Every `RequestCoinState` refused ([`MockChain::refuse_lookups_on`]).
+    refuse_lookups: bool,
 }
 
 /// One `TransactionAck` a node sent.
@@ -673,6 +679,10 @@ struct Model {
     acks: Vec<Ack>,
     unanswered: Vec<ProtocolMessageTypes>,
     connections: usize,
+    /// A reorganisation to come just before a node answers the next request
+    /// of this kind ([`MockChain::reorg_before`]): its depth and the bundles
+    /// its first block carries.
+    reorg_before: Option<(ProtocolMessageTypes, u32, Vec<SpendBundle>)>,
 }
 
 impl Model {
@@ -856,9 +866,39 @@ impl Model {
         (self.generation, told)
     }
 
+    /// [`MockChain::reorg_including`] on the model: the last `n` blocks
+    /// replaced by `n + 1` others, every node not held taking the new chain
+    /// and told of it. Returns the generation and the nodes told, for the
+    /// barrier.
+    fn reorganise(&mut self, n: u32, bundles: Vec<SpendBundle>) -> (u64, Vec<usize>) {
+        let old = self.chain.peak();
+        assert!(n >= 1 && n <= old, "a reorganisation of 1 to {old} blocks");
+        let fork = old - n;
+        self.chain.rewind(fork);
+        self.forks += 1;
+        self.salt = sha256(&[b"ssf mock chain fork", &self.forks.to_be_bytes()]);
+        let mut first = std::mem::take(&mut self.next_first);
+        first.extend(bundles);
+        self.build_block(first, false);
+        for _ in 0..n {
+            self.build_block(vec![], false);
+        }
+        let Model { net, chain, nodes, .. } = &mut *self;
+        for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+            node.hints.extend(chain.hints_above(fork));
+            new_peak_slow(*net, chain, &mut node.pool);
+        }
+        self.announce(fork)
+    }
+
     /// Answer one request as a full node does, or `None` for a request it
-    /// has no answer for.
+    /// has no answer for. A reorganisation staged for a request of its kind
+    /// ([`MockChain::reorg_before`]) comes first.
     fn answer(&mut self, node: usize, request: &Message) -> Option<Message> {
+        if self.reorg_before.as_ref().is_some_and(|(kind, ..)| *kind == request.msg_type) {
+            let (_, n, bundles) = self.reorg_before.take().expect("a staged reorganisation");
+            self.reorganise(n, bundles);
+        }
         match request.msg_type {
             ProtocolMessageTypes::RequestBlockHeader => {
                 let asked = RequestBlockHeader::from_bytes(&request.data).ok()?;
@@ -873,6 +913,9 @@ impl Model {
             }
             ProtocolMessageTypes::RequestCoinState => {
                 let asked = RequestCoinState::from_bytes(&request.data).ok()?;
+                if self.nodes[node].lies.refuse_lookups {
+                    return Some(reply(&RejectCoinState::new(RejectStateReason::ExceededSubscriptionLimit)));
+                }
                 Some(coin_state(self.view(node), &self.nodes[node].lies.denied, self.page_limit, asked))
             }
             ProtocolMessageTypes::RequestPuzzleSolution => {
@@ -1157,6 +1200,7 @@ impl MockChain {
             acks: Vec::new(),
             unanswered: Vec::new(),
             connections: 0,
+            reorg_before: None,
         };
         Self(Arc::new(Shared { model: Mutex::new(model), acks: watch::Sender::new(HashMap::new()), next_conn: AtomicU64::new(0) }))
     }
@@ -1223,6 +1267,18 @@ impl MockChain {
         Arc::new(
             Lane::new(self.network(), vec![], false, None)
                 .with_candidates(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)])
+                .with_tls(TLS.clone()),
+        )
+    }
+
+    /// A lane with `pin` pinned (`SSF_CHIA_PEERS`, its address as typed)
+    /// and `public` its one public peer (introducer), sharing the binary's
+    /// client certificate, with no peer store: an agreed read takes the pin
+    /// and the public peer, which stand in two network groups.
+    pub(crate) fn pinned_lane(&self, pin: &MockNode, public: &MockNode) -> Arc<Lane> {
+        Arc::new(
+            Lane::new(self.network(), vec![pin.addr.to_string()], false, None)
+                .with_candidates(vec![(public.addr, Source::Introducer)])
                 .with_tls(TLS.clone()),
         )
     }
@@ -1299,28 +1355,29 @@ impl MockChain {
     pub(crate) async fn reorg_including(&self, n: u32, bundles: Vec<SpendBundle>) -> u32 {
         let (generation, told, peak) = {
             let mut model = self.lock();
-            let old = model.chain.peak();
-            assert!(n >= 1 && n <= old, "a reorganisation of 1 to {old} blocks");
-            let fork = old - n;
-            model.chain.rewind(fork);
-            model.forks += 1;
-            model.salt = sha256(&[b"ssf mock chain fork", &model.forks.to_be_bytes()]);
-            let mut first = std::mem::take(&mut model.next_first);
-            first.extend(bundles);
-            model.build_block(first, false);
-            for _ in 0..n {
-                model.build_block(vec![], false);
-            }
-            let Model { net, chain, nodes, .. } = &mut *model;
-            for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
-                node.hints.extend(chain.hints_above(fork));
-                new_peak_slow(*net, chain, &mut node.pool);
-            }
-            let (generation, told) = model.announce(fork);
+            let (generation, told) = model.reorganise(n, bundles);
             (generation, told, model.chain.peak())
         };
         self.barrier(&told, generation).await;
         peak
+    }
+
+    /// [`Self::reorg_including`] staged to come just as some node is to
+    /// answer its next request of `kind`, which it then answers from the new
+    /// chain, as does every node after it: a reorganisation between two
+    /// rounds of a lane's request. Once, with no barrier: each connection
+    /// hears of the new peak when its announcement arrives, a moment after
+    /// the answer.
+    pub(crate) fn reorg_before(&self, kind: ProtocolMessageTypes, n: u32, bundles: Vec<SpendBundle>) {
+        let mut model = self.lock();
+        assert!(model.reorg_before.is_none(), "one staged reorganisation at a time");
+        model.reorg_before = Some((kind, n, bundles));
+    }
+
+    /// Whether a reorganisation staged by [`Self::reorg_before`] is still to
+    /// come.
+    pub(crate) fn reorg_staged(&self) -> bool {
+        self.lock().reorg_before.is_some()
     }
 
     /// Hold `node` where it is: from here it answers from the chain as it
@@ -1459,6 +1516,15 @@ impl MockChain {
         let mut model = self.lock();
         let index = model.index_of(node);
         model.nodes[index].lies.spends.insert(id, spend.map(|cs| (cs.puzzle_reveal, cs.solution)));
+    }
+
+    /// `node` made to refuse every lookup by id from here
+    /// (`RejectCoinState`), which no honest node does for a lookup that asks
+    /// for no subscription.
+    pub(crate) fn refuse_lookups_on(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.refuse_lookups = true;
     }
 
     /// Every node's mempool emptied, as a full mempool evicts what pays
