@@ -1583,10 +1583,15 @@ impl std::error::Error for MoneyMemoRefused {}
 
 /// [`money_memo_refusal`] at a write: `Err` off a test network, and the
 /// first refusal in the process logs [`money_memo_line`]. Every spend that
-/// carries a memo is built by [`build_publish_bundle`], which asks this
-/// first, so none leaves the SSF wallet's keys off a test network: presence
-/// and knocks (the money key), the beacon (its key comes from the money
-/// key), v1 room records and both env test hooks. The heartbeat asks it once
+/// carries a memo and is paid by the SSF wallet's keys is built by
+/// [`build_publish_bundle`], which asks this first, so none leaves those
+/// keys off a test network: presence and knocks (the money key), the beacon
+/// (its key comes from the money key), v1 room records and both env test
+/// hooks. The second memo builder, a burner's
+/// (`claim_write::build_burner_bundle`, stage 4 design §4.2), does not ask
+/// it: it signs with a `BurnerKey` alone and has no network check of its
+/// own, and until PR 10 nothing reaches it but behind SSF_CHIA_BURNERS=1 on
+/// a test network (§13 row 9). The heartbeat asks it once
 /// at its start, so a mainnet node plans no write that would be refused,
 /// looks up no coin for one, and says why on the Phone Book row.
 pub fn refuse_money_memo(net: crate::chia_network::ChiaNet) -> Result<(), MoneyMemoRefused> {
@@ -1602,9 +1607,11 @@ pub fn refuse_money_memo(net: crate::chia_network::ChiaNet) -> Result<(), MoneyM
 
 /// Build the SIGNED SpendBundle: spend `coin` back to our own puzzle hash at
 /// `amount − fee`, carrying MEMOS = `( hint ciphertext )` (a proper 2-element
-/// CLVM list). Signed for `net` with the synthetic BLS key. The one builder
-/// of a memo spend, so off a test network it refuses
-/// ([`refuse_money_memo`]) before it signs anything.
+/// CLVM list). Signed for `net` with the synthetic BLS key. The builder of
+/// every memo spend the SSF wallet's keys pay for, so off a test network it
+/// refuses ([`refuse_money_memo`]) before it signs anything. The other memo
+/// builder is a burner's (`claim_write::build_burner_bundle`), which signs
+/// with a `BurnerKey` only and lays its memos out as this one does.
 pub fn build_publish_bundle(
     net: crate::chia_network::ChiaNet,
     chia_sk: &SecretKey,
@@ -2130,8 +2137,11 @@ pub struct MemoWrite {
     /// The coins the write is found and judged by (stage 4 design §4.4): its
     /// `parent`, which the write's own coin names under its hint and which a
     /// mark files, and its `parked` input, which the lease holds and the
-    /// verdict's spent-height and lease lookups ask about. One coin for every
-    /// write of this build: the INPUT its spend-to-self consumed.
+    /// verdict's spent-height and lease lookups ask about. One coin for a
+    /// spend-to-self of one coin ([`WriteCoins::one`]): the INPUT it
+    /// consumed. A burner's first write (`claim_write::build_burner_bundle`)
+    /// has two: the gift g as its parent and the dish coin F as its parked
+    /// input.
     pub coins: WriteCoins,
     pub acked: bool,
     /// The lease's number for the spend (#272 review round 12), kept beside
@@ -2445,9 +2455,12 @@ async fn presence_standing_on(
 /// (stage 4 design §4.4): the lease's word and the spent height about
 /// `coins.parked`, the input the lease parked for the spend, and the hint
 /// lookup about `coins.parent`, which the write's own coin names as its
-/// parent. One coin for every write of this build, so every lookup is the one
-/// it always was, in the order it always ran: the lease first (#272 review
-/// round 2), then the hint, then the input.
+/// parent. For a spend-to-self of one coin ([`WriteCoins::one`]) the two
+/// are that coin, so every lookup is the one it always was, in the order it
+/// always ran: the lease first (#272 review round 2), then the hint, then
+/// the input. For a burner's first write (`claim_write::build_burner_bundle`)
+/// the hint lookup asks about the gift g and the other two about the dish
+/// coin F, in the same order.
 #[allow(clippy::too_many_arguments)]
 async fn write_standing_on(
     lease: &WalletLease,
@@ -5799,6 +5812,10 @@ mod tests {
         assert_ne!(t11.aggregated_signature, main.aggregated_signature);
     }
 }
+
+/// The claim-and-write's bundle builder, and the rules R1 to R7 it checks
+/// over a burner's spends (stage 4 design §4.1, §4.2, §13 row 9).
+mod claim_write;
 
 /// The writers and readers above, end to end through the real lane on the
 /// mock chain (stage 4 design §12).

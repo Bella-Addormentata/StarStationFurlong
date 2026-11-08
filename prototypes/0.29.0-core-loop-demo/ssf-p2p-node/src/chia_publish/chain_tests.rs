@@ -127,8 +127,10 @@ impl Setup {
     /// the wall clock, less than the grace after any spend here was parked (a
     /// test takes seconds), so it asks about no parked spend, and judges the
     /// settling ones by the same chain again.
-    /// The write spends one coin, `input`, to itself, as every write of this
-    /// build does ([`WriteCoins::one`]). Judged as a mark an older node saved
+    /// The write spends one coin, `input`, to itself ([`WriteCoins::one`]),
+    /// as every write but a burner's first does: that one is found by the
+    /// gift g and parked as the dish coin F (`claim_write`'s builder, stage 4
+    /// design §4.4). Judged as a mark an older node saved
     /// is, with no memo digest: by its hint alone ([`Self::standing_with_memo`]
     /// for a mark this build saves).
     async fn standing(&mut self, hint: Bytes32, input: Bytes32, spend: u64) -> WriteStanding {
