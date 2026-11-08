@@ -2004,6 +2004,50 @@ async fn a_lookup_dated_by_a_peak_the_chain_then_leaves_leaves_the_read_unanswer
     assert!(s.chain.unanswered().is_empty());
 }
 
+/// The same node a block ahead, its peak swapped during the spend round for
+/// another at the same height, the listing's block surviving: the peak its
+/// lookup was dated by is gone, though the peak's height stands. The first
+/// window, begun on the lookup's peak, asks only the header at the
+/// listing's height, which a still has; read by its height alone, a's peak
+/// would stand still across it, and the read would settle on a lookup
+/// answered from a chain a has left. The peak's hash moved: a's spend and
+/// headers are asked again, in a window begun on another peak than the
+/// lookup's, so the lookup peak's header is asked too and shows a's chain
+/// moved; the read has no verdict, a is dropped, not let go, and node b,
+/// held at the listing's block, shows its chain in one window and stays.
+#[tokio::test]
+async fn a_lookups_peak_swapped_for_another_at_the_same_height_during_the_spend_round_leaves_the_read_unanswered() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    let peak = stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+    remembered(&s).await;
+    s.chain.hold(&s.b);
+    assert_eq!(s.chain.farm().await, peak + 1, "node a a block ahead");
+    let (listed_at, looked_up_at) = (s.chain.header_hash(peak), s.chain.header_hash(peak + 1));
+    s.chain.swap_before(ProtocolMessageTypes::RequestPuzzleSolution, 1);
+    let (before, shown) = (by_id_and_spends(&s), headers(&s));
+
+    let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+    assert!(why.contains("moved off the listing's block") && why.contains(&format!("header at height {} it stood on", peak + 1)), "{why}");
+    assert!(!s.chain.reorg_staged(), "the swap came as a spend was asked for");
+    assert_eq!(s.chain.peak(), peak + 1, "the peak's height kept");
+    assert_ne!(s.chain.header_hash(peak + 1), looked_up_at, "under another hash");
+    assert_eq!(s.chain.header_hash(peak), listed_at, "the listing's block survives");
+    assert_eq!(asked_since(&s, before), [(1, 2), (1, 1)], "node a's spend asked again once its peak's hash moved; node b's in one window");
+    let now = headers(&s);
+    assert_eq!(
+        [now[0] - shown[0], now[1] - shown[1]],
+        [4, 1],
+        "node a: the listing's header as its page is confirmed against b's, then in the first window, then the listing's and the lookup peak's \
+         in the second; node b: the listing's"
+    );
+    assert_eq!(live(&s).await, vec![s.b.addr], "node a, whose chain moved, is dropped; node b stays");
+    assert!(!let_go(&s, &s.a).await && s.lane.stores(s.a.addr).await, "and not let go");
+    s.chain.release(&s.b).await;
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// A 2.7.4 node files a block's hint rows only after it has committed the
 /// block and moved its peak, and reads that peak after it has queried its
 /// coins, so its finished page can lack the coins of the very block it is
@@ -2151,6 +2195,48 @@ async fn a_node_echoing_none_of_the_ids_asked_by_id_is_silent_and_dropped_a_pin_
         let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
         assert!(why.contains(&format!("{} answered for 0 of the 1 coins asked by id", silent.addr)), "pin: {pin}: {why}");
         assert_eq!(asked_since(&s, before), [(1, 0); 2], "pin: {pin}");
+        assert_eq!(live(&s).await, vec![other.addr], "pin: {pin}: the silent node is dropped");
+        for node in [&s.a, &s.b] {
+            assert!(!let_go(&s, node).await, "pin: {pin}: nobody is let go");
+        }
+        if !pin {
+            assert!(s.lane.stores(silent.addr).await, "the store keeps the public node dropped");
+        }
+        assert!(s.chain.unanswered().is_empty());
+    }
+}
+
+/// A node that gives no answer the lane can read to a spend request (here
+/// one that answers it with a message of another kind, which the lane
+/// takes as it takes a request left unanswered) is silent, as no honest
+/// node is: its window ends there, with no header asked, and the read has
+/// no verdict. Were its silence taken for a spend it does not serve, the
+/// node that served the spend would read as disagreeing with it, or the
+/// listers as listing a coin nobody made, and honest nodes would be let
+/// go. Its connection is dropped, a pin's too, as a silent peer's of any
+/// request is; nobody is let go; and the other node, its spend served and
+/// its chain shown in one window, stays.
+#[tokio::test]
+async fn a_node_giving_no_answer_to_a_spend_request_is_silent_and_dropped_a_pin_too_and_nobody_is_let_go() {
+    for pin in [false, true] {
+        let s = if pin { pinned().await } else { setup().await };
+        let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+        s.chain.farm().await;
+        stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+        remembered(&s).await;
+        let (silent, other) = if pin { (&s.a, &s.b) } else { (&s.b, &s.a) };
+        s.chain.answer_spends_amiss_on(silent);
+        let (before, shown) = (by_id_and_spends(&s), headers(&s));
+
+        let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+        assert!(
+            why.contains(&format!("1 of 2 peers did not show their chain, or the spends on it ({}: it gave no answer to the spends", silent.addr)),
+            "pin: {pin}: {why}"
+        );
+        assert!(!why.contains("moved off"), "pin: {pin}: the other node's window stood: {why}");
+        assert_eq!(asked_since(&s, before), [(1, 1); 2], "pin: {pin}: one lookup by id of each node, and its spend in one window");
+        let (now, (i, j)) = (headers(&s), if pin { (0, 1) } else { (1, 0) });
+        assert_eq!((now[i] - shown[i], now[j] - shown[j]), (0, 1), "pin: {pin}: no header asked of the silent node, the listing's of the other");
         assert_eq!(live(&s).await, vec![other.addr], "pin: {pin}: the silent node is dropped");
         for node in [&s.a, &s.b] {
             assert!(!let_go(&s, node).await, "pin: {pin}: nobody is let go");

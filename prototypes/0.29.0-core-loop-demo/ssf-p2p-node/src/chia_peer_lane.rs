@@ -229,9 +229,10 @@ pub const PEAK_SETTLE_ATTEMPTS: usize = 3;
 /// non-final rather than agreed at the common height.
 pub const MAX_PEAK_LAG: u32 = 6;
 /// The most spends (a parent, at the height its children were made) one
-/// settling of a hinted listing page's one-sided coins fetches of each peer
-/// and runs, once each ([`settle_disputed`]): the first this many in
-/// (parent, height) order, their coins taken up to [`MAX_DISPUTED_COINS`].
+/// settling of a hinted listing page's one-sided coins fetches of each peer,
+/// once in each window it is asked in ([`anchored`]), and runs, once each
+/// ([`settle_disputed`]): the first this many in (parent, height) order,
+/// their coins taken up to [`MAX_DISPUTED_COINS`].
 /// More leave the other coins unsettled and the read without a verdict: the
 /// coins taken are judged all the same, and the public peers found at
 /// fault among them let go; when none is, the connections of the pair's

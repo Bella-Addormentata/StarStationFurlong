@@ -75,6 +75,7 @@
 //! apart, which a test stages with [`MockChain::hold`] and
 //! [`MockChain::release`]. A change staged to come just as a node is to
 //! answer a request of a kind (a reorganisation, [`MockChain::reorg_before`];
+//! the top blocks replaced at the same height, [`MockChain::swap_before`];
 //! one block, [`MockChain::block_before`]; or a return to a chain saved
 //! earlier, its blocks with the same hashes, and more,
 //! [`MockChain::return_before`]) has no barrier: each connection hears of the
@@ -91,8 +92,10 @@
 //! ([`MockChain::hide_on`]), list coins its chain never made
 //! ([`MockChain::invent_on`]), deny one by id ([`MockChain::deny_on`]), serve
 //! another spend than the chain's ([`MockChain::serve_spend_on`]), refuse
-//! every lookup by id ([`MockChain::refuse_lookups_on`]) or echo none of the
-//! ids a lookup asks ([`MockChain::echo_no_lookup_ids_on`]).
+//! every lookup by id ([`MockChain::refuse_lookups_on`]), echo none of the
+//! ids a lookup asks ([`MockChain::echo_no_lookup_ids_on`]) or give no
+//! answer the lane can read to a spend request
+//! ([`MockChain::answer_spends_amiss_on`]).
 //! These stand for a lying peer, or one whose stores are short, beside an
 //! honest one: what the lane's settling of the coins two peers' hinted
 //! listings differ on is to tell apart from a stale hint row.
@@ -670,6 +673,9 @@ struct Lies {
     /// Every `RespondCoinState` echoes none of the ids asked, and carries no
     /// state ([`MockChain::echo_no_lookup_ids_on`]).
     echo_none: bool,
+    /// Every `RequestPuzzleSolution` answered with a message of another kind
+    /// ([`MockChain::answer_spends_amiss_on`]).
+    spends_amiss: bool,
 }
 
 /// One `TransactionAck` a node sent.
@@ -686,6 +692,9 @@ enum Staged {
     /// A reorganisation ([`Model::reorganise`]): its depth and the bundles
     /// its first block carries.
     Reorg(u32, Vec<SpendBundle>),
+    /// The last this many blocks replaced by as many others
+    /// ([`Model::replace`]).
+    Swap(u32),
     /// One block ([`Model::grow`]).
     Block,
     /// The chain saved, every block of it as it was, and this many blocks
@@ -720,8 +729,8 @@ struct Model {
     connections: usize,
     /// Changes of the chain to come, in order, each just before a node
     /// answers the first request of its kind once the one before it has come
-    /// ([`MockChain::reorg_before`], [`MockChain::block_before`],
-    /// [`MockChain::return_before`]).
+    /// ([`MockChain::reorg_before`], [`MockChain::swap_before`],
+    /// [`MockChain::block_before`], [`MockChain::return_before`]).
     staged: VecDeque<(ProtocolMessageTypes, Staged)>,
     /// A quiet node to announce its peak once the time given has passed
     /// ([`MockChain::speak_after`]), for [`serve`] to schedule.
@@ -925,8 +934,19 @@ impl Model {
     /// and told of it. Returns the generation and the nodes told, for the
     /// barrier.
     fn reorganise(&mut self, n: u32, bundles: Vec<SpendBundle>) -> (u64, Vec<usize>) {
+        self.replace(n, n + 1, bundles)
+    }
+
+    /// The last `n` blocks replaced by `blocks` others on a new fork, at
+    /// least as many (a full node takes no lower chain), the first carrying
+    /// the [`MockChain::include_next`] bundles and `bundles`, every node not
+    /// held taking the new chain and told of it ([`Self::reorganise`];
+    /// [`MockChain::swap_before`] when `blocks` is `n`, the peak's height
+    /// kept under another hash). Returns the generation and the nodes told.
+    fn replace(&mut self, n: u32, blocks: u32, bundles: Vec<SpendBundle>) -> (u64, Vec<usize>) {
         let old = self.chain.peak();
         assert!(n >= 1 && n <= old, "a reorganisation of 1 to {old} blocks");
+        assert!(blocks >= n, "a fork a node takes is no lower than the chain it replaces");
         let fork = old - n;
         self.chain.rewind(fork);
         self.forks += 1;
@@ -934,7 +954,7 @@ impl Model {
         let mut first = std::mem::take(&mut self.next_first);
         first.extend(bundles);
         self.build_block(first, false);
-        for _ in 0..n {
+        for _ in 1..blocks {
             self.build_block(vec![], false);
         }
         let Model { net, chain, nodes, .. } = &mut *self;
@@ -996,6 +1016,9 @@ impl Model {
                 Staged::Reorg(n, bundles) => {
                     self.reorganise(n, bundles);
                 }
+                Staged::Swap(n) => {
+                    self.replace(n, n, vec![]);
+                }
                 Staged::Block => self.grow(),
                 Staged::Return(saved, n) => {
                     self.return_to(saved, n);
@@ -1037,6 +1060,9 @@ impl Model {
             }
             ProtocolMessageTypes::RequestPuzzleSolution => {
                 let asked = RequestPuzzleSolution::from_bytes(&request.data).ok()?;
+                if self.nodes[node].lies.spends_amiss {
+                    return Some(reply(&RejectHeaderRequest::new(asked.height)));
+                }
                 let found = self.view(node).coins.get(&asked.coin_name).filter(|rec| rec.spent == Some(asked.height));
                 let served = match self.nodes[node].lies.spends.get(&asked.coin_name) {
                     Some(lie) => lie.clone(),
@@ -1538,6 +1564,19 @@ impl MockChain {
         self.lock().staged.push_back((kind, Staged::Reorg(n, bundles)));
     }
 
+    /// The last `n` blocks replaced by `n` others on a new fork, staged as
+    /// [`Self::reorg_before`] stages a reorganisation: the peak keeps its
+    /// height under another hash, as a node's does when it takes a fork no
+    /// higher than its chain but heavier (a block weighs the difficulty it
+    /// was farmed at, which can differ between forks that part before an
+    /// adjustment), or when it announces such a peak. Nothing on the new
+    /// fork but the [`Self::include_next`] bundles; every node not held takes
+    /// it on the slow path, adds the new blocks' hint rows to the ones it
+    /// keeps, and is told of the new peak.
+    pub(crate) fn swap_before(&self, kind: ProtocolMessageTypes, n: u32) {
+        self.lock().staged.push_back((kind, Staged::Swap(n)));
+    }
+
     /// One block staged as [`Self::reorg_before`] stages a reorganisation:
     /// carrying the mempools' items (not the bundles of
     /// [`Self::include_next`], which wait for the next block farmed), taken
@@ -1566,7 +1605,8 @@ impl MockChain {
     }
 
     /// Whether a change staged by [`Self::reorg_before`],
-    /// [`Self::block_before`] or [`Self::return_before`] is still to come.
+    /// [`Self::swap_before`], [`Self::block_before`] or
+    /// [`Self::return_before`] is still to come.
     pub(crate) fn reorg_staged(&self) -> bool {
         !self.lock().staged.is_empty()
     }
@@ -1736,6 +1776,22 @@ impl MockChain {
         let mut model = self.lock();
         let index = model.index_of(node);
         model.nodes[index].lies.echo_none = true;
+    }
+
+    /// `node` made to answer every spend request from here
+    /// (`RequestPuzzleSolution`) with a message of another kind, a header's
+    /// refusal under the request's id, which the lane can read as neither
+    /// the spend nor its refusal: a node that gives the request no answer,
+    /// at once, where one that stays silent costs the lane its
+    /// [`REQUEST_TIMEOUT`] of waiting, and one that hangs up drops its own
+    /// connection. Its connection stays open, so the lane's own drop of it
+    /// shows.
+    ///
+    /// [`REQUEST_TIMEOUT`]: crate::chia_peer::REQUEST_TIMEOUT
+    pub(crate) fn answer_spends_amiss_on(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.spends_amiss = true;
     }
 
     /// `node` made quiet: from here it follows every block as ever (its
