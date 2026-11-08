@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
 use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
-use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS};
+use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS, MAX_FAUCET_PAGES};
 use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{created_coins, memo_digest, CreatedCoin, WriteCoins};
 
@@ -423,10 +423,13 @@ struct FuseFile {
 /// been at its burner other than by a gift: a stray of exactly 1 mojo,
 /// which the burner writes from (R7), or a beacon key's coin of an earlier
 /// era. That fails closed. A stray of any other amount is never written
-/// from and proves nothing, so it keeps no dead gift counted: anyone can
-/// pay one to a burner's puzzle hash, and if it kept the count, a peer we
-/// push to, which can redirect our keyless claim for free (§5.4), could
-/// fill the fuse with gifts that never landed. It is under-counted only
+/// from and proves nothing, so it keeps no dead gift counted, however many
+/// pages of them the listing must follow, up to [`MAX_FAUCET_PAGES`]: anyone
+/// can pay one to a burner's puzzle hash, and if it kept the count, a peer
+/// we push to, which can redirect our keyless claim for free (§5.4), could
+/// fill the fuse with gifts that never landed. Strays past that many pages
+/// cut the listing short, which keeps the count, fail closed; filling them
+/// costs a stranger a spend per stray. It is under-counted only
 /// where the lease let a bundle go as dead that lands after all, or the
 /// fuse's file could not be saved (logged). Given back, a lost race or a
 /// redirected claim delays a listing but never ends the era's funding
@@ -602,13 +605,27 @@ pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(Gi
 /// lands between the writer's two listings keeps a dead gift counted once,
 /// which fails closed too.
 ///
-/// A listing cut short is `false` as well, since the gift's records could
-/// lie past the cut: the gift is kept counted, fail closed. A listing the
-/// chain did not give is [`CoinLookupFailed`], a wait, so the write is tried
-/// again rather than funded with the question open.
+/// The listing is followed page by page, as [`unspent_at`] follows it, up to
+/// [`MAX_FAUCET_PAGES`], and stops at the first record of 1 mojo. So strays
+/// of other amounts that fill a page, or a peer that answers in short pages,
+/// do not keep a dead gift counted. A listing still cut short past that
+/// budget, or cut short with no cursor to follow, is `false`, since the
+/// gift's records could lie past the cut: the gift is kept counted, fail
+/// closed. A page the chain did not give is [`CoinLookupFailed`], a wait, so
+/// the write is tried again rather than funded with the question open.
 async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Result<bool> {
-    let listing = client.coin_records_by_puzzle_hash(burner_ph, true, None).await.map_err(CoinLookupFailed)?;
-    Ok(!listing.truncated && !listing.records.iter().any(|r| r.coin.amount == GIFT_MOJOS))
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_FAUCET_PAGES {
+        let listing = client.coin_records_by_puzzle_hash(burner_ph, true, cursor.take()).await.map_err(CoinLookupFailed)?;
+        if listing.records.iter().any(|r| r.coin.amount == GIFT_MOJOS) {
+            return Ok(false);
+        }
+        match listing.next_cursor {
+            Some(next) if listing.truncated => cursor = Some(next),
+            _ => return Ok(!listing.truncated),
+        }
+    }
+    Ok(false)
 }
 
 /// `key`'s write of `body` under `hint` in `era` (stage 4 design §4.1,

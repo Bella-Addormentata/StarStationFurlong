@@ -1708,7 +1708,8 @@ async fn a_claim_and_write_a_strangers_claim_beat_gives_its_gift_back_to_the_fus
 /// bundle go, the burner's next write gives the dead gift back and is
 /// funded from F2, and the era has one gift counted, not two: a peer that
 /// redirects our claims again and again delays the listing but never fills
-/// the fuse. The strays are never spent.
+/// the fuse, however many pages of strays it pays there up to
+/// [`MAX_FAUCET_PAGES`] (the next test). The strays are never spent.
 #[tokio::test]
 async fn a_stray_at_a_burner_keeps_no_dead_gift_counted_once_a_redirected_claim_kills_its_bundle() {
     let mut s = setup().await;
@@ -1753,6 +1754,57 @@ async fn a_stray_at_a_burner_keeps_no_dead_gift_counted_once_a_redirected_claim_
     }
     let rebuilt = s.chain.received().last().cloned().expect("the write was sent");
     assert_eq!(s.sent(), HashSet::from([lost.name(), rebuilt.name()]));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §5.2 and §5.4, strays past one page: the redirect of the
+/// test before, with four strays of 2 mojos and of 0 paid to the burner in
+/// blocks of their own, and nodes that answer two coins a page, as a full
+/// node with a low `max_subscribe_response_items` or the redirecting peer
+/// itself may. The burner's listing then comes in two pages, the first cut
+/// short with a cursor. The fuse's check follows the cursor, as the writer's
+/// own listing does, and finds no coin of 1 mojo, so the dead gift is given
+/// back: the next write is funded from F2 and the era has one gift counted,
+/// not two.
+#[tokio::test]
+async fn strays_past_one_page_at_a_burner_keep_no_dead_gift_counted() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 1).await;
+    let key = burner(57, 0);
+    let payer = Payer::of_burner(&key);
+    let hint = Bytes32::new([0x63; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record a peer redirects".to_vec()), 1).await.unwrap();
+    assert_eq!(s.gifts(0), 1, "counted as it left");
+
+    let f2 = s.chain.fund(lobby().puzzle_hash(), 1, None);
+    let peer = Bytes32::new([0x64; 32]);
+    s.chain.include_next(claim(&lobby(), f, peer));
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(f.coin_id()), vec![Coin::new(f.coin_id(), peer, 1)], "F's claim went to the peer");
+    let mut strays = Vec::new();
+    for amount in [2, 0, 2, 0] {
+        strays.push(s.chain.fund(key.puzzle_hash(), amount, None));
+        s.chain.farm().await;
+    }
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert!(!s.lease.holds_for(payer) && !s.lease.holds_spend_at(key.puzzle_hash()), "the lease let the bundle go");
+
+    s.chain.set_page_limit(2);
+    let page = s.money.coin_records_by_puzzle_hash(key.puzzle_hash(), true, None).await.unwrap();
+    assert!(page.truncated && page.next_cursor.is_some(), "the burner's first page is cut short, with a cursor");
+    assert!(page.records.iter().all(|r| r.coin.amount != GIFT_MOJOS), "and holds strays only");
+    let second = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record from F2".to_vec()), 2).await.unwrap();
+    let g2 = gift(&key, f2);
+    assert_eq!(second.coins, WriteCoins { parent: g2.coin_id(), parked: f2.coin_id() }, "funded again from F2, beside the strays");
+    assert_eq!(s.gifts(0), 1, "the dead gift given back past the page and the new one counted: one, not two");
+
+    let landed = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, second.coins, second.memo, second.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    for stray in strays {
+        let (coin, _, spent) = s.chain.record(stray.coin_id()).expect("the stray is on chain");
+        assert_eq!((coin, spent), (stray, None), "a stray, never spent");
+    }
     assert!(s.chain.unanswered().is_empty());
 }
 
