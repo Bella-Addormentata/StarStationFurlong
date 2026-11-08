@@ -1641,8 +1641,10 @@ async fn a_reorg_between_the_listing_and_its_lookup_by_id_leaves_the_read_unansw
 /// drops the block that made the one-sided coin, so neither node serves
 /// the spend that made it any more, which would read as node a listing a
 /// coin nobody can show it was made, and let an honest node go. Both first
-/// show where they stand: the listing's block is gone, so the read has no
-/// verdict and nobody is let go.
+/// show where they stand: the fork's announcement lands inside the window
+/// of each node's spends and headers, so each is asked for its spend again
+/// in a window its peak stands still across, which shows the listing's
+/// block gone: the read has no verdict and nobody is let go.
 #[tokio::test]
 async fn a_reorg_between_the_lookup_by_id_and_the_spend_round_leaves_the_read_unanswered_and_lets_neither_node_go() {
     let s = setup().await;
@@ -1656,7 +1658,7 @@ async fn a_reorg_between_the_lookup_by_id_and_the_spend_round_leaves_the_read_un
     let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
     assert!(why.contains("moved off the listing's block"), "{why}");
     assert!(!s.chain.reorg_staged(), "the fork came as the spend was asked for");
-    assert_eq!(asked_since(&s, before), [(1, 1); 2], "one lookup by id and one spend of each node");
+    assert_eq!(asked_since(&s, before), [(1, 2); 2], "one lookup by id of each node, and its spend in two windows: the one the fork came in, and the next");
     for node in [&s.a, &s.b] {
         assert!(!let_go(&s, node).await && s.lane.stores(node.addr).await, "neither node is let go");
     }
@@ -1701,6 +1703,60 @@ async fn a_coin_made_again_at_the_same_height_under_another_memo_between_the_rou
     let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
     assert!(listed.records.is_empty() && !listed.truncated, "on the new chain the row is stale: {listed:?}");
     assert_eq!(s.lane.live_count().await, 2, "and nobody is let go for it");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Two reorganisations inside one settling (#393 review): during the spend
+/// round both nodes switch to a fork, B, which makes the one-sided coin
+/// again (the same parent, puzzle hash and amount, so the same id, at the
+/// same height) under another memo, and before they show their headers
+/// they switch to a heavier extension of the listing's own chain, its
+/// blocks back with the same hashes and two more. The headers at the
+/// listing's height and at the lookup's peak are then the listing's again,
+/// but the spends fetched came from B: judged by them, the coin node b hid
+/// would be a stale row, left out of the listing, and b would pass as
+/// honest. Each node is asked for its spends and shows its chain inside one
+/// window its announced peak stands still across: B's announcement lands
+/// inside the first window, so the spends are asked again, on the
+/// listing's chain, and judged there. The coin is kept, and node b, which
+/// hid it a block below its page's peak, is let go; node a stays.
+#[tokio::test]
+async fn a_fork_that_comes_during_the_spend_round_and_is_overtaken_by_the_listings_own_chain_before_the_headers_is_not_judged_by_its_spend() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    s.chain.include_next(bundle(passing(&[parent], hint(1))));
+    let made = s.chain.farm().await;
+    let peak = s.chain.farm().await;
+    let child = passed(parent);
+    remembered(&s).await;
+    s.chain.hide_on(&s.b, child.coin_id());
+    let listed_on = s.chain.save();
+    let (at_made, at_peak) = (s.chain.header_hash(made), s.chain.header_hash(peak));
+    // Fork B: the two blocks from `made` replaced by three, its first, at
+    // `made`, making the child again under the other hint.
+    s.chain.reorg_before(ProtocolMessageTypes::RequestPuzzleSolution, 2, vec![bundle(passing(&[parent], hint(2)))]);
+    // Then the listing's chain again, two blocks above it: heavier than B.
+    s.chain.return_before(ProtocolMessageTypes::RequestBlockHeader, &listed_on, 2);
+    let before = by_id_and_spends(&s);
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert_eq!(
+        listed.records.iter().map(|r| (r.coin, r.confirmed_block_index)).collect::<Vec<_>>(),
+        vec![(child, made)],
+        "the coin the listing's chain made under the hint is kept: no spend of fork B is judged beside it"
+    );
+    assert!(!listed.truncated && listed.judged_at == Some(peak), "{listed:?}");
+    assert!(!s.chain.reorg_staged(), "both forks came during the read");
+    assert_eq!(s.chain.peak(), peak + 2, "the listing's chain, two blocks above the listing");
+    assert_eq!((s.chain.header_hash(made), s.chain.header_hash(peak)), (at_made, at_peak), "its blocks as they were");
+    assert_eq!(s.chain.record(child.coin_id()), Some((child, made, None)));
+    for (by_id, spends) in asked_since(&s, before) {
+        assert!(by_id == 1 && (2..=crate::chia_peer_lane::PEAK_SETTLE_ATTEMPTS).contains(&spends), "the spend asked again once B's peak landed: {by_id}, {spends}");
+    }
+    assert_eq!(live(&s).await, vec![s.a.addr], "node b, which hid the coin, is gone from the pool");
+    assert!(let_go(&s, &s.b).await, "and let go: never passed as honest");
+    assert!(!let_go(&s, &s.a).await && s.lane.stores(s.a.addr).await, "node a stays, noted good");
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -2183,6 +2239,80 @@ async fn a_pin_whose_peak_moves_during_every_check_of_its_chain_is_silent_and_dr
     assert!(!let_go(&s, &s.b).await && s.lane.stores(s.b.addr).await);
     s.chain.release(&s.b).await;
     assert!(s.chain.unanswered().is_empty());
+}
+
+/// One block announced during the spend round, the listing's block kept:
+/// its announcement lands inside the window of each node's spends and
+/// headers, so neither window stands, and each node is asked for its spends
+/// and its headers again, in a window its peak stands still across. The
+/// read settles, the row stale, nobody dropped: one lookup by id of each
+/// node, its spend asked twice, and three headers, the listing's in the
+/// first window, and in the second the listing's and the lookup's peak's,
+/// the peak it now announces being another.
+#[tokio::test]
+async fn a_block_announced_during_the_spend_round_has_each_node_asked_for_its_spends_again_and_the_read_settles() {
+    let s = setup().await;
+    let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+    s.chain.farm().await;
+    let peak = stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+    remembered(&s).await;
+    s.chain.block_before(ProtocolMessageTypes::RequestPuzzleSolution);
+    let (before, shown) = (by_id_and_spends(&s), headers(&s));
+
+    let listed = s.money.coin_records_by_hint(hint(1), None, true, None).await.unwrap();
+    assert!(listed.records.is_empty() && !listed.truncated && listed.judged_at == Some(peak), "the row is stale: {listed:?}");
+    assert!(!s.chain.reorg_staged(), "the block came as a spend was asked for");
+    assert_eq!(s.chain.peak(), peak + 1);
+    assert_eq!(asked_since(&s, before), [(1, 2); 2], "each node's spend asked in two windows: the one the block came in, and the next");
+    let now = headers(&s);
+    assert_eq!([now[0] - shown[0], now[1] - shown[1]], [3, 3], "one header of each node in the first window, two in the second");
+    assert_eq!(s.lane.live_count().await, 2, "nobody is dropped");
+    for node in [&s.a, &s.b] {
+        assert!(!let_go(&s, node).await && s.lane.stores(node.addr).await);
+    }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A node whose announced peak moves during every window of its spends and
+/// its chain (the chain takes a block before each spend it serves, which it
+/// announces ahead of the spend) cannot show the spends came from the chain
+/// its headers show within [`PEAK_SETTLE_ATTEMPTS`] windows: it is silent,
+/// its connection dropped, a pin's too, as a silent peer's of any request
+/// is; the read has no verdict and nobody is let go; node b, held where the
+/// listing was taken, serves its spend and shows its chain in one window,
+/// and stays.
+///
+/// [`PEAK_SETTLE_ATTEMPTS`]: crate::chia_peer_lane::PEAK_SETTLE_ATTEMPTS
+#[tokio::test]
+async fn a_node_whose_peak_moves_during_every_window_of_its_spends_and_its_chain_is_silent_and_dropped_a_pin_too_and_nobody_is_let_go() {
+    let attempts = crate::chia_peer_lane::PEAK_SETTLE_ATTEMPTS;
+    for pin in [false, true] {
+        let s = if pin { pinned().await } else { setup().await };
+        let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+        s.chain.farm().await;
+        let peak = stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+        remembered(&s).await;
+        s.chain.hold(&s.b);
+        s.chain.restless_before(&s.a, ProtocolMessageTypes::RequestPuzzleSolution);
+        let before = by_id_and_spends(&s);
+
+        let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+        assert!(
+            why.contains("did not show their chain") && why.contains(&format!("moved during each of {attempts} checks of its spends and its chain")),
+            "pin: {pin}: {why}"
+        );
+        assert_eq!(s.chain.peak(), peak + attempts as u32, "pin: {pin}: a block before each spend node a served");
+        assert_eq!(asked_since(&s, before), [(1, attempts), (1, 1)], "pin: {pin}: node a's spend asked once a window, node b's in one");
+        assert_eq!(live(&s).await, vec![s.b.addr], "pin: {pin}: node a, silent, is dropped; node b stays");
+        for node in [&s.a, &s.b] {
+            assert!(!let_go(&s, node).await, "pin: {pin}: nobody is let go");
+        }
+        if !pin {
+            assert!(s.lane.stores(s.a.addr).await, "the store keeps the public node dropped");
+        }
+        s.chain.release(&s.b).await;
+        assert!(s.chain.unanswered().is_empty());
+    }
 }
 
 /// A coin at the hint's own puzzle hash, which a listing lists with no

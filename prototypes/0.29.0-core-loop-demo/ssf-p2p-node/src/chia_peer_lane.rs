@@ -83,10 +83,11 @@
 //!     under another hint stays listed under the old one by the nodes that
 //!     took the orphaned block alone. Coins one peer lists under a hint and
 //!     the other leaves out are settled by their ids and their parents'
-//!     spends, asked of both peers alike and judged only once both show
-//!     they still stand on the chain the listing was taken as of
-//!     ([`settle_disputed`]): a coin the spend made under the hint, as a
-//!     block runs the spend and a full node reads its hint ([`hints_made`]),
+//!     spends, asked of both peers alike and judged only once each peer, in
+//!     one window its announced peak stands still across, has served the
+//!     spends and shown it still stands on the chain the listing was taken
+//!     as of ([`settle_disputed`]): a coin the spend made under the hint, as
+//!     a block runs the spend and a full node reads its hint ([`hints_made`]),
 //!     is kept and the peer that left it out let go (unless the coin is one
 //!     of the block its page is dated by, or changed above it, which a full
 //!     node's own lag explains); a coin whose making no peer serves is left
@@ -95,6 +96,10 @@
 //!     what the peers say of the coins is a disagreement like any other.
 //!     One settling takes at most [`MAX_DISPUTED_PARENTS`] spends and
 //!     [`MAX_DISPUTED_COINS`] coins; more leave the read without a verdict.
+//!     It asks each peer for each spend once a window, in at most
+//!     [`PEAK_SETTLE_ATTEMPTS`] windows, so at most
+//!     [`MAX_DISPUTED_PARENTS`] × [`PEAK_SETTLE_ATTEMPTS`] spend requests a
+//!     peer a page, and 2 × [`PEAK_SETTLE_ATTEMPTS`] header requests.
 //!     One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     holding no pair in step (none by source and group, or every one out
@@ -235,7 +240,10 @@ pub const MAX_PEAK_LAG: u32 = 6;
 /// nothing settled tells which of them lists the rows a fork left behind
 /// and which hides what the chain made. So a flood of stale rows costs a
 /// read its answer and never lets a peer go, nor costs more than this many
-/// spend requests of each peer and spend runs a page.
+/// spend runs a page, and this many spend requests of each peer in each of
+/// the at most [`PEAK_SETTLE_ATTEMPTS`] windows its spends and its chain
+/// are asked in ([`anchored`]): at most this many × [`PEAK_SETTLE_ATTEMPTS`]
+/// of each peer a page.
 pub const MAX_DISPUTED_PARENTS: usize = 16;
 /// The most one-sided coins one settling of a hinted listing page asks of
 /// each peer by id and judges ([`settle_disputed`]): those of the first
@@ -2995,24 +3003,27 @@ async fn settle_listing(
 ///   1. every peer is asked for the coins taken by id, in one lookup
 ///      ([`lookup_on`]: asked again, once, when it is dated below the
 ///      anchor and the peer then announces a peak at or above it);
-///   2. unless the lookup has told the verdict already (a peer refused it,
-///      or gave a coin otherwise than the pages that list it, or dated it
-///      below the anchor), every peer is asked for the spends that made the
-///      coins, one request per spend;
-///   3. every peer shows it still stands on the anchor's chain
-///      ([`anchored`]) before anything it said in either round is judged: an
-///      answer from another chain (a reorganisation between the rounds)
-///      would read as a disagreement, or a coin made again at the same
-///      height under another memo would be judged by the new fork's spend
-///      beside the old fork's listing;
-///   4. each peer must give each coin by id, as of the anchor's height, as
+///   2. every peer, in one window its announced peak stands still across
+///      ([`anchored`]), is asked for the spends that made the coins, one
+///      request per spend, unless the lookup has told the verdict already
+///      (a peer refused it, or gave a coin otherwise than the pages that
+///      list it, or dated it below the anchor), and then shows it still
+///      stands on the anchor's chain; nothing any peer said in either round
+///      is judged before every peer's window stands: an answer from another
+///      chain (a reorganisation after the lookup) would read as a
+///      disagreement, or a coin made again at the same height under another
+///      memo would be judged by the new fork's spend beside the old fork's
+///      listing, and a fork that came during the spends and was overtaken
+///      by the anchor's own chain before the headers moves the peak inside
+///      the window, so the spends are asked again;
+///   3. each peer must give each coin by id, as of the anchor's height, as
 ///      the pages that list it do: a peer that denies one, or gives another
 ///      record, disagrees, and so do peers one of which refuses the lookup
 ///      the other answers;
-///   5. every spend fetched must be served alike by every peer, all of them
+///   4. every spend fetched must be served alike by every peer, all of them
 ///      compared before anything more is made of any, whatever their order:
 ///      another spend, or none beside one, disagrees;
-///   6. each spend the peers serve is run once, as its block ran it
+///   5. each spend the peers serve is run once, as its block ran it
 ///      ([`hints_made`]), and each coin taken is judged:
 ///        * a coin whose output in that spend a full node files under the
 ///          hint, or whose own puzzle hash is the hint, is kept: the chain
@@ -3047,8 +3058,9 @@ async fn settle_listing(
 ///     after [`STATE_ROUNDS`] requests or at the first request that answers
 ///     none of those left ([`states_on`]; an honest node answers up to
 ///     100,000 ids a request to a wallet peer, `max_subscribe_response_items`,
-///     far more than [`MAX_DISPUTED_COINS`]), or cannot show its chain
-///     inside a peak that stands still ([`anchored`]): each such peer is
+///     far more than [`MAX_DISPUTED_COINS`]), or cannot serve its spends and
+///     show its chain in one window its peak stands still across, in
+///     [`PEAK_SETTLE_ATTEMPTS`] windows ([`anchored`]): each such peer is
 ///     silent, its connection dropped, a pin's too, as a silent peer's of
 ///     any request is;
 ///   * a peer's chain moved off the anchor ([`anchored`]): the public peers
@@ -3068,23 +3080,28 @@ async fn settle_listing(
 /// blocks has that node let go as a hider, where main let both peers go
 /// for any one-sided coin. And a liar can leave out a coin of the block its
 /// page is dated by, or give it by id spent above that block, and stay:
-/// the coin is kept either way, so that changes no answer.
+/// the coin is kept either way, so that changes no answer. Last, a node's
+/// announcements lag the chain it answers from by its post-processing of a
+/// block, so two reorganisations both inside that lag, one to a fork its
+/// spends are served from and one back to the anchor's chain before its
+/// headers are, move no peak the lane has heard of, and are not seen.
 ///
 /// What one page's settling costs, at most: of each peer, 2 ×
 /// [`STATE_ROUNDS`] × [`PEAK_SETTLE_ATTEMPTS`] coin-state requests for the
 /// lookup, each for at most [`MAX_DISPUTED_COINS`] ids, and a wait of up to
-/// [`PEAK_GRACE`] between its two tries; [`MAX_DISPUTED_PARENTS`] spend
-/// requests; and 2 × [`PEAK_SETTLE_ATTEMPTS`] header requests for the
-/// anchor; of the lane, [`MAX_DISPUTED_PARENTS`] spend runs, each within
-/// the block's cost, off the async workers. A hinted read pays that once
-/// per page it follows: up to `chia_resolve::MAX_PAGES_PER_POLL` pages for
-/// the readers, and up to `chia_faucet::MAX_FAUCET_PAGES` for the craps
-/// fairness lane, eight either way. A peer listing real coins outside the
-/// hint, which no answer tells from stale rows, costs a read at most that
-/// and changes no answer it gives: when every such coin is taken its rows
-/// are left out, nobody let go; otherwise the read has none, and every
-/// public connection of the pair is dropped, its own and the other's alike,
-/// a pin's never.
+/// [`PEAK_GRACE`] between its two tries; [`MAX_DISPUTED_PARENTS`] ×
+/// [`PEAK_SETTLE_ATTEMPTS`] spend requests and 2 × [`PEAK_SETTLE_ATTEMPTS`]
+/// header requests, in at most [`PEAK_SETTLE_ATTEMPTS`] windows; of the
+/// lane, [`MAX_DISPUTED_PARENTS`] spend runs, of the spends of the window
+/// that stood, each within the block's cost, off the async workers. A
+/// hinted read pays that once per page it follows: up to
+/// `chia_resolve::MAX_PAGES_PER_POLL` pages for the readers, and up to
+/// `chia_faucet::MAX_FAUCET_PAGES` for the craps fairness lane, eight
+/// either way. A peer listing real coins outside the hint, which no answer
+/// tells from stale rows, costs a read at most that and changes no answer
+/// it gives: when every such coin is taken its rows are left out, nobody
+/// let go; otherwise the read has none, and every public connection of the
+/// pair is dropped, its own and the other's alike, a pin's never.
 async fn settle_disputed(
     lane: &Lane,
     answers: &[(Arc<PeerConn>, Page)],
@@ -3096,7 +3113,6 @@ async fn settle_disputed(
     let peers: Vec<Arc<PeerConn>> = answers.iter().map(|(peer, _)| peer.clone()).collect();
     let knowledge = anchor.0;
     const LOOKUP: &str = "the lookup by id of one-sided coins";
-    const SPENDS: &str = "the spends that made one-sided coins";
 
     // The coins this settling takes, and the spends that made them.
     let one_sided = disputed.len();
@@ -3145,22 +3161,15 @@ async fn settle_disputed(
         .collect();
     let alike = given.iter().all(|records| records.as_ref().is_some_and(|records| disputed.iter().all(|d| records.get(&d.record.coin.coin_id()) == Some(&d.record))));
 
-    // 2. The spends that made them, unless the lookup has told the verdict.
-    let fetched = if alike {
-        let fetched = join_all(peers.iter().map(|peer| join_all(spends.iter().map(|&(parent, height)| spend_on(peer.clone(), parent, height))))).await;
-        let fetched: Vec<Result<Vec<Option<PuzzleAndSolution>>, ChainError>> = fetched.into_iter().map(|theirs| theirs.into_iter().collect()).collect();
-        heard(lane, &peers, SPENDS, &fetched).await?;
-        Some(fetched)
-    } else {
-        None
-    };
-
-    // 3. Every peer still on the anchor's chain, before anything it said is
-    // judged.
+    // 2. Each peer, in one window its peak stands still across, serves the
+    // spends that made them, unless the lookup has told the verdict, and
+    // shows it still stands on the anchor's chain, before anything any peer
+    // said is judged.
     let lookup_peaks: Vec<Option<(u32, Bytes32)>> = lookups.iter().map(|l| l.as_ref().ok().map(|page| (page.knowledge, page.knowledge_hash))).collect();
-    anchored(lane, &peers, anchor, &lookup_peaks).await?;
+    let asked: &[(Bytes32, u32)] = if alike { &spends } else { &[] };
+    let served = anchored(lane, &peers, anchor, &lookup_peaks, asked).await?;
 
-    // 4. The lookup judged.
+    // 3. The lookup judged.
     let Some(_) = answered(lane, &peers, LOOKUP, lookups).await? else { return Ok(None) };
     for (peer, records) in peers.iter().zip(&given) {
         let Some(records) = records else { continue };
@@ -3173,13 +3182,12 @@ async fn settle_disputed(
             return Ok(None);
         }
     }
-    let Some(fetched) = fetched else {
+    if !alike {
         // Unreached: a lookup that told the verdict was judged above.
         return Err(unanswered("coins by hint: the one-sided coins' lookup was judged without its verdict; non-final, nobody let go".to_string()));
-    };
+    }
 
-    // 5. The spends judged, every one of them compared first.
-    let Some(served) = answered(lane, &peers, SPENDS, fetched).await? else { return Ok(None) };
+    // 4. The spends judged, every one of them compared first.
     for (j, &(parent, height)) in spends.iter().enumerate() {
         if let Some(i) = (1..served.len()).find(|&i| served[i][j] != served[0][j]) {
             eprintln!("⛓️ chain peers: {} serves the spend of {parent} at height {height} otherwise than {}", peers[i].addr(), peers[0].addr());
@@ -3187,7 +3195,7 @@ async fn settle_disputed(
         }
     }
 
-    // 6. Each spend every peer serves run once, off the async workers: one
+    // 5. Each spend every peer serves run once, off the async workers: one
     // spend may hold a block's worth of CLVM, and a page may name up to
     // MAX_DISPUTED_PARENTS of them.
     let consensus = lane.net.consensus;
@@ -3346,46 +3354,66 @@ async fn lookup_on(peer: Arc<PeerConn>, net: Network, ids: Vec<Bytes32>, knowled
 
 /// What [`anchored`] finds of one peer.
 enum Anchor {
-    /// It stands on the anchor's chain.
-    Held,
+    /// It stands on the anchor's chain, and the spends it served (in the
+    /// order asked; `None` for one it does not serve) came from it.
+    Held(Vec<Option<PuzzleAndSolution>>),
     /// Its chain moved off it: why.
     Moved(String),
-    /// It did not show where it stands.
+    /// It did not serve the spends, or did not show where it stands.
     Silent(anyhow::Error),
 }
 
-/// Does each peer still stand on the chain a listing was taken as of
-/// (`anchor`: the lowest knowledge among its pages and the header there),
-/// after the rounds of [`settle_disputed`] and before any answer of theirs
-/// is judged? Asked of each peer inside a peak bracket that stands still
-/// (its announced peak alike before and after, header and height; asked
-/// again up to [`PEAK_SETTLE_ATTEMPTS`] times, and a peer whose peak moves
-/// throughout is silent): the header at the anchor's height must be the
-/// anchor's, and, when that peak is not the one the peer's lookup page was
-/// dated by (`lookups`, from [`states_on`]; `None` for a lookup refused),
-/// the header at the lookup peak's height must still be the lookup peak's,
-/// so the chain the lookup was answered from holds the listing's block too
-/// (a header hash fixes its ancestry, and a peak never comes back to a
-/// block it left, since the chain it left for was heavier). A lookup page
-/// still dated below the anchor's height once asked again ([`lookup_on`])
-/// has moved off it too: the peer cannot show its view reached the
-/// listing's block. At most two header
-/// requests per bracket. The spends asked between the lookup and this check
-/// are taken as answered from the chain it finds: a fork that came and was
-/// overtaken again between the two, the peer's chain holding the lookup's
-/// peak once more, is not seen.
+/// The spends `spends` (a parent, at the height its children were made) of
+/// each peer, served from the chain a listing was taken as of (`anchor`:
+/// the lowest knowledge among its pages and the header there), and does
+/// each peer still stand on that chain, after the lookup of
+/// [`settle_disputed`] and before any answer of theirs is judged? Asked of
+/// each peer in one window its announced peak stands still across, from
+/// the first spend request to the last header answer (its peak alike
+/// before and after, header and height): first the spends, every one at
+/// once, then the header at the anchor's height, which must be the
+/// anchor's, and, when the peak the window stands on is not the one the
+/// peer's lookup page was dated by (`lookups`, from [`states_on`]; `None`
+/// for a lookup refused), the header at the lookup peak's height, which
+/// must still be the lookup peak's, so the chain the lookup was answered
+/// from holds the listing's block too. A header hash fixes its ancestry,
+/// and a peak never comes back to a block it left, since the chain it left
+/// for was heavier: no peak announced inside the window, the spends came
+/// from the chain the headers show, and a fork that came during the spends
+/// and was overtaken by the anchor's own chain before the headers moved
+/// the peak in between. A window the peak moved in is asked again, spends
+/// and headers alike, up to [`PEAK_SETTLE_ATTEMPTS`] windows, and a peer
+/// whose peak moves in every one is silent: a liar flapping its peak pays a
+/// connection for it, and an honest node's peak seldom moves twice running
+/// in a window well under a second long. A spend request with no answer is
+/// silence too. A lookup page still dated below the anchor's height once
+/// asked again ([`lookup_on`]) has moved off it: the peer cannot show its
+/// view reached the listing's block, and is asked nothing more. At most
+/// `spends.len()` spend requests and two header requests a window. What a
+/// window cannot see: a node's announcements lag the chain it answers from
+/// by its post-processing of a block, so two reorganisations both inside
+/// that lag (a fork its spends are served from, then the anchor's chain
+/// back before its headers are) move no peak the lane has heard of.
 ///
-/// `Ok(())` when every peer stands there. Otherwise no verdict, and nobody
+/// The spends each peer served in the window that stood, in the peers'
+/// order, when every peer stands there. Otherwise no verdict, and nobody
 /// let go: a silent peer's connection is dropped, a pin's too, as any
 /// request's silent peer's is, and so is a public peer's whose chain moved,
 /// a pin's never.
-async fn anchored(lane: &Lane, peers: &[Arc<PeerConn>], anchor: (u32, Bytes32), lookups: &[Option<(u32, Bytes32)>]) -> Result<(), ChainError> {
-    let checks = join_all(peers.iter().zip(lookups).map(|(peer, &lookup)| anchor_on(peer, anchor, lookup))).await;
+async fn anchored(
+    lane: &Lane,
+    peers: &[Arc<PeerConn>],
+    anchor: (u32, Bytes32),
+    lookups: &[Option<(u32, Bytes32)>],
+    spends: &[(Bytes32, u32)],
+) -> Result<Vec<Vec<Option<PuzzleAndSolution>>>, ChainError> {
+    let checks = join_all(peers.iter().zip(lookups).map(|(peer, &lookup)| anchor_on(peer, anchor, lookup, spends))).await;
+    let mut served = Vec::with_capacity(peers.len());
     let mut moved: Vec<String> = Vec::new();
     let mut silent: Vec<String> = Vec::new();
     for (peer, check) in peers.iter().zip(checks) {
         match check {
-            Anchor::Held => {}
+            Anchor::Held(theirs) => served.push(theirs),
             Anchor::Moved(why) => {
                 if peer.source() != Source::Pin {
                     lane.drop_conn(peer).await;
@@ -3399,14 +3427,14 @@ async fn anchored(lane: &Lane, peers: &[Arc<PeerConn>], anchor: (u32, Bytes32), 
         }
     }
     if moved.is_empty() && silent.is_empty() {
-        return Ok(());
+        return Ok(served);
     }
     let mut why = Vec::new();
     if !moved.is_empty() {
         why.push(format!("the chain moved off the listing's block at height {} ({})", anchor.0, moved.join("; ")));
     }
     if !silent.is_empty() {
-        why.push(format!("{} of {} peers did not show their chain ({})", silent.len(), peers.len(), silent.join("; ")));
+        why.push(format!("{} of {} peers did not show their chain, or the spends on it ({})", silent.len(), peers.len(), silent.join("; ")));
     }
     Err(unanswered(format!(
         "coins by hint: {} while one-sided coins were settled; non-final, nobody let go, the public connections that moved and every silent one dropped",
@@ -3415,7 +3443,7 @@ async fn anchored(lane: &Lane, peers: &[Arc<PeerConn>], anchor: (u32, Bytes32), 
 }
 
 /// [`anchored`] of one peer.
-async fn anchor_on(peer: &Arc<PeerConn>, anchor: (u32, Bytes32), lookup: Option<(u32, Bytes32)>) -> Anchor {
+async fn anchor_on(peer: &Arc<PeerConn>, anchor: (u32, Bytes32), lookup: Option<(u32, Bytes32)>, spends: &[(Bytes32, u32)]) -> Anchor {
     if let Some((height, _)) = lookup.filter(|&(height, _)| height < anchor.0) {
         return Anchor::Moved(format!("{}'s lookup by id is dated at height {height}, below it", peer.addr()));
     }
@@ -3423,6 +3451,15 @@ async fn anchor_on(peer: &Arc<PeerConn>, anchor: (u32, Bytes32), lookup: Option<
         let Some(before) = peer.peak_now() else {
             return Anchor::Silent(anyhow!("it announced no peak to show its chain by"));
         };
+        // The spends first, then the headers that show the chain they came
+        // from, all inside the window.
+        let mut served = Vec::with_capacity(spends.len());
+        for answer in join_all(spends.iter().map(|&(parent, height)| spend_on(peer.clone(), parent, height))).await {
+            match answer {
+                Ok(spend) => served.push(spend),
+                Err(e) => return Anchor::Silent(anyhow!("it gave no answer to the spends that made one-sided coins: {e}")),
+            }
+        }
         let mut asks = vec![anchor];
         if let Some(lookup) = lookup.filter(|&lookup| lookup != (before.height, before.header_hash)) {
             asks.push(lookup);
@@ -3440,12 +3477,13 @@ async fn anchor_on(peer: &Arc<PeerConn>, anchor: (u32, Bytes32), lookup: Option<
         }
         if peer.peak_now() == Some(before) {
             return match moved {
-                None => Anchor::Held,
+                None => Anchor::Held(served),
                 Some(why) => Anchor::Moved(why),
             };
         }
     }
-    Anchor::Silent(anyhow!("its announced peak moved during each of {PEAK_SETTLE_ATTEMPTS} checks of its chain"))
+    let what = if spends.is_empty() { "its chain" } else { "its spends and its chain" };
+    Anchor::Silent(anyhow!("its announced peak moved during each of {PEAK_SETTLE_ATTEMPTS} checks of {what}"))
 }
 
 /// The coins `spend` makes, by puzzle hash and amount, each with the hint a

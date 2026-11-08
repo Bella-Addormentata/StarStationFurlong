@@ -73,13 +73,18 @@
 //! Every reorganisation reaches every node not held at once, behind the
 //! barrier ([`MockChain::farm_blocks`]); real nodes take a fork seconds
 //! apart, which a test stages with [`MockChain::hold`] and
-//! [`MockChain::release`]. One staged to come just as a node is to answer a
-//! request ([`MockChain::reorg_before`]) has no barrier: each connection
-//! hears of the new peak when its announcement arrives, a moment after the
-//! answer, as a real node's peers hear of one. A node can also follow the
-//! chain while its announcements lag ([`MockChain::quiet`]), as a full node's
-//! announcement to wallets follows its post-processing of a block, or take a
-//! block before each header it serves ([`MockChain::restless`]).
+//! [`MockChain::release`]. A change staged to come just as a node is to
+//! answer a request of a kind (a reorganisation, [`MockChain::reorg_before`];
+//! one block, [`MockChain::block_before`]; or a return to a chain saved
+//! earlier, its blocks with the same hashes, and more,
+//! [`MockChain::return_before`]) has no barrier: each connection hears of the
+//! new peak when its announcement arrives, a moment after the answer, as a
+//! real node's peers hear of one. Several can be staged, to come one after
+//! the other. A node can also follow the chain while its announcements lag
+//! ([`MockChain::quiet`]), as a full node's announcement to wallets follows
+//! its post-processing of a block, or take a block before each header it
+//! serves ([`MockChain::restless`]), or each request of another kind
+//! ([`MockChain::restless_before`]).
 //!
 //! A node can also be made to say what its chain does not, which no node
 //! here does on its own: leave a coin out of its listings
@@ -636,9 +641,9 @@ struct NodeState {
     /// and the time given has passed after that ([`MockChain::speak_after`]),
     /// if one is.
     quiet: Option<Option<(ProtocolMessageTypes, Duration)>>,
-    /// The chain takes a block, announced, before it serves each header
-    /// ([`MockChain::restless`]).
-    restless: bool,
+    /// The chain takes a block, announced, before it answers each request
+    /// of this kind ([`MockChain::restless_before`]).
+    restless: Option<ProtocolMessageTypes>,
     /// What it says against its chain (the module notes).
     lies: Lies,
 }
@@ -675,6 +680,19 @@ struct Ack {
     error: Option<String>,
 }
 
+/// A change of the chain staged to come just before a node answers a
+/// request ([`Model::staged`]).
+enum Staged {
+    /// A reorganisation ([`Model::reorganise`]): its depth and the bundles
+    /// its first block carries.
+    Reorg(u32, Vec<SpendBundle>),
+    /// One block ([`Model::grow`]).
+    Block,
+    /// The chain saved, every block of it as it was, and this many blocks
+    /// more ([`Model::return_to`]).
+    Return(Chain, u32),
+}
+
 struct Model {
     net: ChiaNet,
     network: Network,
@@ -700,10 +718,11 @@ struct Model {
     acks: Vec<Ack>,
     unanswered: Vec<ProtocolMessageTypes>,
     connections: usize,
-    /// A reorganisation to come just before a node answers the next request
-    /// of this kind ([`MockChain::reorg_before`]): its depth and the bundles
-    /// its first block carries.
-    reorg_before: Option<(ProtocolMessageTypes, u32, Vec<SpendBundle>)>,
+    /// Changes of the chain to come, in order, each just before a node
+    /// answers the first request of its kind once the one before it has come
+    /// ([`MockChain::reorg_before`], [`MockChain::block_before`],
+    /// [`MockChain::return_before`]).
+    staged: VecDeque<(ProtocolMessageTypes, Staged)>,
     /// A quiet node to announce its peak once the time given has passed
     /// ([`MockChain::speak_after`]), for [`serve`] to schedule.
     speak_later: Option<(usize, Duration)>,
@@ -926,24 +945,65 @@ impl Model {
         self.announce(fork)
     }
 
-    /// Answer one request as a full node does, or `None` for a request it
-    /// has no answer for. A reorganisation staged for a request of its kind
-    /// ([`MockChain::reorg_before`]) comes first.
-    fn answer(&mut self, node: usize, request: &Message) -> Option<Message> {
-        if self.reorg_before.as_ref().is_some_and(|(kind, ..)| *kind == request.msg_type) {
-            let (_, n, bundles) = self.reorg_before.take().expect("a staged reorganisation");
-            self.reorganise(n, bundles);
+    /// [`MockChain::return_before`] on the model: the main chain made the
+    /// one saved again, every block of it with the hashes it had, so the
+    /// coins and spends it held, then `n` blocks more on a new fork, which
+    /// carry nothing; every node not held takes it on the slow path, adds
+    /// the hint rows of its blocks above the fork point to the ones it keeps,
+    /// and is told of it. It must be heavier than the chain it replaces, as
+    /// a full node takes no lighter one: its peak higher. Returns the
+    /// generation and the nodes told.
+    fn return_to(&mut self, saved: Chain, n: u32) -> (u64, Vec<usize>) {
+        let now = self.chain.peak();
+        assert!(saved.peak() + n > now, "a chain returned to is heavier than the one it replaces: its peak above {now}");
+        let fork = self.chain.common(&saved);
+        self.chain = saved;
+        self.forks += 1;
+        self.salt = sha256(&[b"ssf mock chain fork", &self.forks.to_be_bytes()]);
+        for _ in 0..n {
+            self.build_block(vec![], false);
         }
-        if self.nodes[node].restless && request.msg_type == ProtocolMessageTypes::RequestBlockHeader {
-            let fork_point = self.chain.peak();
-            let height = self.build_block(vec![], true);
-            let spent: HashSet<Bytes32> = self.chain.blocks[height as usize].spent.iter().copied().collect();
-            let Model { net, chain, nodes, .. } = &mut *self;
-            for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
-                node.hints.extend(chain.hints_above(height - 1));
-                new_peak_fast(*net, chain, &mut node.pool, &spent);
+        let Model { net, chain, nodes, .. } = &mut *self;
+        for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+            node.hints.extend(chain.hints_above(fork));
+            new_peak_slow(*net, chain, &mut node.pool);
+        }
+        self.announce(fork)
+    }
+
+    /// One block on the main chain, carrying the mempools' items, taken by
+    /// every node not held on the fast path and announced, with no barrier.
+    fn grow(&mut self) {
+        let fork_point = self.chain.peak();
+        let height = self.build_block(vec![], true);
+        let spent: HashSet<Bytes32> = self.chain.blocks[height as usize].spent.iter().copied().collect();
+        let Model { net, chain, nodes, .. } = &mut *self;
+        for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+            node.hints.extend(chain.hints_above(height - 1));
+            new_peak_fast(*net, chain, &mut node.pool, &spent);
+        }
+        self.announce(fork_point);
+    }
+
+    /// Answer one request as a full node does, or `None` for a request it
+    /// has no answer for. The next change staged, when it is staged for a
+    /// request of this kind ([`Model::staged`]), comes first, then a
+    /// restless node's block ([`MockChain::restless_before`]).
+    fn answer(&mut self, node: usize, request: &Message) -> Option<Message> {
+        if self.staged.front().is_some_and(|(kind, _)| *kind == request.msg_type) {
+            let (_, change) = self.staged.pop_front().expect("a staged change");
+            match change {
+                Staged::Reorg(n, bundles) => {
+                    self.reorganise(n, bundles);
+                }
+                Staged::Block => self.grow(),
+                Staged::Return(saved, n) => {
+                    self.return_to(saved, n);
+                }
             }
-            self.announce(fork_point);
+        }
+        if self.nodes[node].restless == Some(request.msg_type) {
+            self.grow();
         }
         let answer = self.answer_now(node, request);
         if let Some(Some((kind, after))) = self.nodes[node].quiet {
@@ -1141,12 +1201,12 @@ impl Shared {
     }
 
     /// The node's answer to `request`. A restless node's new block
-    /// ([`MockChain::restless`]) is announced on `announced`'s connection
-    /// ahead of the header it answers, so the client has filed the new peak
-    /// by the time it reads the header.
+    /// ([`MockChain::restless_before`]) is announced on `announced`'s
+    /// connection ahead of the answer, so the client has filed the new peak
+    /// by the time it reads the answer.
     fn answer(&self, node: usize, request: &Message, announced: &mut watch::Receiver<Announcement>) -> Vec<WsMessage> {
         let mut model = self.model.lock().unwrap();
-        let restless = model.nodes[node].restless && request.msg_type == ProtocolMessageTypes::RequestBlockHeader;
+        let restless = model.nodes[node].restless == Some(request.msg_type);
         match model.answer(node, request) {
             Some(mut answer) => {
                 answer.id = request.id;
@@ -1265,6 +1325,10 @@ async fn serve(
 #[derive(Clone)]
 pub(crate) struct MockChain(Arc<Shared>);
 
+/// The main chain as it stood once ([`MockChain::save`]), to come back to
+/// ([`MockChain::return_before`]).
+pub(crate) struct Saved(Chain);
+
 impl MockChain {
     /// Block 0 alone, on `net`'s genesis challenge.
     pub(crate) fn new(net: ChiaNet) -> Self {
@@ -1290,7 +1354,7 @@ impl MockChain {
             acks: Vec::new(),
             unanswered: Vec::new(),
             connections: 0,
-            reorg_before: None,
+            staged: VecDeque::new(),
             speak_later: None,
         };
         Self(Arc::new(Shared { model: Mutex::new(model), acks: watch::Sender::new(HashMap::new()), next_conn: AtomicU64::new(0) }))
@@ -1327,7 +1391,7 @@ impl MockChain {
                 held: None,
                 busy: false,
                 quiet: None,
-                restless: false,
+                restless: None,
                 lies: Lies::default(),
             });
             model.nodes.len() - 1
@@ -1468,17 +1532,43 @@ impl MockChain {
     /// chain, as does every node after it: a reorganisation between two
     /// rounds of a lane's request. Once, with no barrier: each connection
     /// hears of the new peak when its announcement arrives, a moment after
-    /// the answer.
+    /// the answer. Changes staged one after another come in that order, each
+    /// at the first request of its kind once the one before it has come.
     pub(crate) fn reorg_before(&self, kind: ProtocolMessageTypes, n: u32, bundles: Vec<SpendBundle>) {
-        let mut model = self.lock();
-        assert!(model.reorg_before.is_none(), "one staged reorganisation at a time");
-        model.reorg_before = Some((kind, n, bundles));
+        self.lock().staged.push_back((kind, Staged::Reorg(n, bundles)));
     }
 
-    /// Whether a reorganisation staged by [`Self::reorg_before`] is still to
-    /// come.
+    /// One block staged as [`Self::reorg_before`] stages a reorganisation:
+    /// carrying the mempools' items (not the bundles of
+    /// [`Self::include_next`], which wait for the next block farmed), taken
+    /// on the fast path by every node not held and told of just as some node
+    /// is to answer its next request of `kind`, with no barrier.
+    pub(crate) fn block_before(&self, kind: ProtocolMessageTypes) {
+        self.lock().staged.push_back((kind, Staged::Block));
+    }
+
+    /// The main chain as it stands now, to come back to
+    /// ([`Self::return_before`]).
+    pub(crate) fn save(&self) -> Saved {
+        Saved(self.lock().chain.clone())
+    }
+
+    /// A return to the chain `saved`, staged as [`Self::reorg_before`]
+    /// stages a reorganisation: the main chain made that one again, every
+    /// block of it with the hash it had, and `n` blocks more on a new fork,
+    /// heavier than the chain it replaces (its peak higher), so a fork that
+    /// came after the save is overtaken by the saved chain's own extension,
+    /// as a full node takes the heavier chain back. Every node not held takes
+    /// it on the slow path, adds the hint rows of its blocks above the fork
+    /// point (it keeps those it had), and is told of the new peak.
+    pub(crate) fn return_before(&self, kind: ProtocolMessageTypes, saved: &Saved, n: u32) {
+        self.lock().staged.push_back((kind, Staged::Return(saved.0.clone(), n)));
+    }
+
+    /// Whether a change staged by [`Self::reorg_before`],
+    /// [`Self::block_before`] or [`Self::return_before`] is still to come.
     pub(crate) fn reorg_staged(&self) -> bool {
-        self.lock().reorg_before.is_some()
+        !self.lock().staged.is_empty()
     }
 
     /// Hold `node` where it is: from here it answers from the chain as it
@@ -1696,9 +1786,15 @@ impl MockChain {
     /// not quiet announces, `node` ahead of the header it serves; so a peak
     /// read before a header request of it and after differ, every time.
     pub(crate) fn restless(&self, node: &MockNode) {
+        self.restless_before(node, ProtocolMessageTypes::RequestBlockHeader);
+    }
+
+    /// [`Self::restless`] before each request of `kind` `node` answers, in
+    /// place of each header.
+    pub(crate) fn restless_before(&self, node: &MockNode, kind: ProtocolMessageTypes) {
         let mut model = self.lock();
         let index = model.index_of(node);
-        model.nodes[index].restless = true;
+        model.nodes[index].restless = Some(kind);
     }
 
     /// Every node's mempool emptied, as a full mempool evicts what pays
