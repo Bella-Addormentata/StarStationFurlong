@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
 use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
-use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH};
+use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS};
 use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{created_coins, memo_digest, CreatedCoin, WriteCoins};
 
@@ -413,17 +413,25 @@ struct FuseFile {
 /// payer it funds, and gives the entry back only on the chain's word that
 /// the bundle died: a later write for that payer finds the burner holding
 /// no coin, the lease holding no bundle of its, and the burner's puzzle hash
-/// never holding a coin at all, spent ones included ([`never_held_a_coin`],
-/// [`GiftFuse::refund`]). A gift that landed made a coin there whose record
-/// stays, so its entry is never given back, even once that coin is spent
-/// somewhere other than our lease (a cloned folder or a stolen W, §10) or a
-/// listing of unspent coins misses it. Counted at the push, a gift is
-/// over-counted while its bundle is in flight, and for good when its burner
-/// held a coin before (a stray, or a beacon key's earlier era), which fails
-/// closed. It is under-counted only where the lease let a bundle go as dead
-/// that lands after all, or the fuse's file could not be saved (logged).
-/// Given back, a lost race or a redirected claim (§5.4) delays a listing but
-/// never ends the era's funding.
+/// never holding a coin of the gift's 1 mojo, spent ones included
+/// ([`never_held_a_coin`], [`GiftFuse::refund`]). A gift that landed made
+/// two such coins there, g and the burner's coin, whose records stay, so its
+/// entry is never given back, even once that coin is spent somewhere other
+/// than our lease (a cloned folder or a stolen W, §10) or a listing of
+/// unspent coins misses it. Counted at the push, a gift is over-counted
+/// while its bundle is in flight, and for good when a coin of 1 mojo has
+/// been at its burner other than by a gift: a stray of exactly 1 mojo,
+/// which the burner writes from (R7), or a beacon key's coin of an earlier
+/// era. That fails closed. A stray of any other amount is never written
+/// from and proves nothing, so it keeps no dead gift counted: anyone can
+/// pay one to a burner's puzzle hash, and if it kept the count, a peer we
+/// push to, which can redirect our keyless claim for free (§5.4), could
+/// fill the fuse with gifts that never landed. It is under-counted only
+/// where the lease let a bundle go as dead that lands after all, or the
+/// fuse's file could not be saved (logged). Given back, a lost race or a
+/// redirected claim delays a listing but never ends the era's funding
+/// (§5.2): a stranger's stray keeps a dead gift counted only when it is of
+/// 1 mojo, and then the burner writes from it and needs no gift.
 ///
 /// It is kept per network in [`GIFT_FUSE_FILE`] and saved at every count and
 /// refund, so a node restarting in a loop cannot draw a fresh fuse at each
@@ -534,8 +542,8 @@ impl GiftFuse {
 
     /// Give back one gift counted to `payer`, its bundle seen to have died
     /// (the burner holds no coin, the lease no bundle of its, and the chain
-    /// no coin it ever held: [`never_held_a_coin`]), and save: `true` if the
-    /// fuse held one. A later era has nothing to give back.
+    /// no coin of 1 mojo it ever held: [`never_held_a_coin`]), and save:
+    /// `true` if the fuse held one. A later era has nothing to give back.
     pub fn refund(&mut self, era: u64, payer: Payer) -> bool {
         self.roll(era);
         let hex = payer.hex();
@@ -568,20 +576,39 @@ impl GiftFuse {
 /// process's.
 pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(GiftFuse::load(&crate::chia_network::net().path(GIFT_FUSE_FILE))));
 
-/// Does the chain show that the burner at `burner_ph` never held a coin?
-/// Its listing, spent coins included, is whole and empty. It is the fuse's
-/// positive evidence that a counted gift's bundle died (stage 4 design
-/// §5.2): a gift that landed made g and the burner's coin there, and their
+/// Does the chain show that the burner at `burner_ph` never held a coin of
+/// the gift's amount? Its listing, spent coins included, is whole and holds
+/// no record of [`GIFT_MOJOS`], 1 mojo. It is the fuse's positive evidence
+/// that a counted gift's bundle died (stage 4 design §5.2): a gift that
+/// landed made g and the burner's coin there, both of 1 mojo, and their
 /// records stay, spent or not, whatever became of the coin since, while a
 /// bundle that died made nothing. It is asked only once the lease has let
 /// the bundle go, on the chain's word, so the listing is judged past the
-/// block that would have made them. A listing cut short, or holding any
-/// record, is `false`: the gift is kept counted, fail closed. A listing the
-/// chain did not give is [`CoinLookupFailed`], a wait, so the write is
-/// tried again rather than funded with the question open.
+/// block that would have made them.
+///
+/// Only records of 1 mojo are judged. A coin of any other amount at the
+/// burner is a stray that anyone can pay to its puzzle hash (§5.4), and the
+/// burner never writes from it (R7), so it proves nothing about the gift.
+/// Judged, it would keep every dead gift to that burner counted, and a peer
+/// that redirects our keyless claims for free (§5.4) could blow the fuse
+/// with gifts that never landed, though a lost race or a redirected claim
+/// must never end the era's funding (§5.2). A record of 1 mojo keeps the
+/// gift counted whoever paid it, fail closed. The writer asks this only
+/// when the burner holds no unspent 1-mojo coin (one the lease does not
+/// hold is written from, and one it holds makes the write wait), and only
+/// the burner's key can spend a coin there. So a 1-mojo record is a landed
+/// gift's, a coin the burner wrote from (a stray of exactly 1 mojo among
+/// them), or one another holder of its key spent (§10). A 1-mojo coin that
+/// lands between the writer's two listings keeps a dead gift counted once,
+/// which fails closed too.
+///
+/// A listing cut short is `false` as well, since the gift's records could
+/// lie past the cut: the gift is kept counted, fail closed. A listing the
+/// chain did not give is [`CoinLookupFailed`], a wait, so the write is tried
+/// again rather than funded with the question open.
 async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Result<bool> {
     let listing = client.coin_records_by_puzzle_hash(burner_ph, true, None).await.map_err(CoinLookupFailed)?;
-    Ok(listing.records.is_empty() && !listing.truncated)
+    Ok(!listing.truncated && !listing.records.iter().any(|r| r.coin.amount == GIFT_MOJOS))
 }
 
 /// `key`'s write of `body` under `hint` in `era` (stage 4 design §4.1,
@@ -606,12 +633,13 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 ///   1-mojo coin of its ([`BurnerWait::Settling`], [`WalletLease::holds_for`],
 ///   [`WalletLease::holds_spend_at`]), and not past the fuse
 ///   ([`BurnerWait::FuseBlown`]). A gift the fuse counted for the burner is
-///   given back first if the chain shows the burner never held a coin, so
-///   its bundle died ([`never_held_a_coin`], [`GiftFuse::refund`]); one that
-///   landed stays counted. The coin is one the lease does not hold and the
-///   TAKE marker does not name ([`WalletLease::is_incoming_marker`]); a dry
-///   dish or an unanswered peak is [`BurnerWait::NoCoinReady`] or
-///   [`BurnerWait::PeakUnavailable`].
+///   given back first if the chain shows the burner never held a coin of
+///   the gift's 1 mojo, so its bundle died ([`never_held_a_coin`],
+///   [`GiftFuse::refund`]); one that landed stays counted, and a stray of
+///   another amount there changes neither. The coin is one the lease does
+///   not hold and the TAKE marker does not name
+///   ([`WalletLease::is_incoming_marker`]); a dry dish or an unanswered peak
+///   is [`BurnerWait::NoCoinReady`] or [`BurnerWait::PeakUnavailable`].
 ///
 /// `body` gets the id of the coin the write's own coin will name as its
 /// parent, g for a first write and the burner's coin for a rewrite, so a
@@ -664,13 +692,16 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
                 return Err(BurnerWait::ListingCutShort.into());
             }
             // Every 1-mojo coin listed here is one the lease holds settling.
+            // A settling spend keeps its bundle, which spends that coin at
+            // the burner, so `holds_spend_at` already waits on it: the
+            // `ones` arm is a second guard, kept as one.
             if !ones.is_empty() || lease.holds_for(payer) || lease.holds_spend_at(burner_ph) {
                 return Err(BurnerWait::Settling.into());
             }
             let counted = fuse.lock().unwrap().holds(era, payer);
             if counted {
                 if !never_held_a_coin(client, burner_ph).await? {
-                    eprintln!("⛓️ ChiaHub {what}: the burner held a coin before and holds none now, so the fuse keeps its gift counted");
+                    eprintln!("⛓️ ChiaHub {what}: the burner held a 1-mojo coin before, or its listing was cut short, so the fuse keeps its gift counted");
                 } else if fuse.lock().unwrap().refund(era, payer) {
                     eprintln!("⛓️ ChiaHub {what}: the burner's last bundle died before it landed, so its gift goes back to the fuse");
                 }
@@ -1375,6 +1406,62 @@ mod tests {
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "the burner's listing alone was read");
         assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 0);
+    }
+
+    /// Stage 4 design §5.2, the fuse's refund failing closed on a listing
+    /// cut short: a gift is counted for a burner that holds no coin, with
+    /// nothing of its in the lease, so the writer asks the chain whether its
+    /// puzzle hash ever held a coin of 1 mojo. The listing it gets back is
+    /// cut short, empty or showing only a stray of 2 mojos, and the gift's
+    /// coins could lie past the cut, so the gift stays counted. The write
+    /// goes on to its claim, which waits for the peak it cannot read:
+    /// nothing is pushed.
+    #[tokio::test]
+    async fn a_burner_listing_cut_short_keeps_a_counted_gift_counted() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        use rand::SeedableRng;
+        let net = ChiaNet::Testnet11;
+        let key = burner(net, 1);
+        let stray = CoinRecord { coin: coin_at(2, key.puzzle_hash(), 2).coin, confirmed_block_index: SEEN_AT, spent: false, spent_block_index: 0 };
+        for shown in [vec![], vec![stray]] {
+            let n = shown.len();
+            let listing = |truncated: bool| CoinListing { records: shown.clone(), truncated, next_cursor: None, judged_at: None };
+            let chain = Scripted::new(vec![listing(false), listing(true)]);
+            let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::preset(0, [Payer::of_burner(&key)])));
+            let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+            let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+            let e = write.err().expect("the write waits");
+            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{n} shown: {e:#}");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{n} shown: the burner's listing, then the refund's");
+            assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "{n} shown: the gift kept counted");
+            assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "{n} shown: nothing pushed");
+        }
+    }
+
+    /// Stage 4 design §5.2, the fuse's refund failing closed on a failed
+    /// read: a gift is counted for a burner that holds no coin, with nothing
+    /// of its in the lease, and the listing the refund asks for is not
+    /// given. The write waits, typed as the failed read it is
+    /// ([`CoinLookupFailed`]), which is no knock attempt; the gift stays
+    /// counted, no claim is asked and nothing is pushed.
+    #[tokio::test]
+    async fn a_burner_listing_the_chain_does_not_give_keeps_a_counted_gift_counted_and_waits() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let net = ChiaNet::Testnet11;
+        let key = burner(net, 1);
+        let none = crate::chia_chain::CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: None };
+        let chain = Scripted::new(vec![none]);
+        let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::preset(0, [Payer::of_burner(&key)])));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+        let e = write.err().expect("the write waits");
+        assert!(e.downcast_ref::<CoinLookupFailed>().is_some(), "a failed read: {e:#}");
+        assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "a failed read is no knock attempt (§5.2)");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "the burner's listing, then the refund's, unanswered");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "the gift kept counted");
+        assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
     }
 
     /// The fuse is kept across a restart, per its file: what was counted and

@@ -1698,6 +1698,64 @@ async fn a_claim_and_write_a_strangers_claim_beat_gives_its_gift_back_to_the_fus
     assert!(s.chain.unanswered().is_empty());
 }
 
+/// Stage 4 design §5.2 and §5.4, a stray beside a redirected claim: a peer
+/// we push to reads the burner's puzzle hash in our bundle, pays strays of
+/// 2 mojos and of 0 there, and has F's claim, re-solved to its own address,
+/// land first, which costs it nothing. Our claim and write dies on a spent
+/// F, its gift counted as it left. Neither stray is a coin the burner writes from
+/// (R7), nor a sign that its gift landed, which would have left coins of 1
+/// mojo there. So once F is spent SETTLED_DEPTH deep and the lease lets the
+/// bundle go, the burner's next write gives the dead gift back and is
+/// funded from F2, and the era has one gift counted, not two: a peer that
+/// redirects our claims again and again delays the listing but never fills
+/// the fuse. The strays are never spent.
+#[tokio::test]
+async fn a_stray_at_a_burner_keeps_no_dead_gift_counted_once_a_redirected_claim_kills_its_bundle() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 1).await;
+    let key = burner(52, 0);
+    let payer = Payer::of_burner(&key);
+    let hint = Bytes32::new([0x61; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record a peer redirects".to_vec()), 1).await.unwrap();
+    let lost = s.chain.received().last().cloned().expect("the write was sent");
+    assert_eq!(s.gifts(0), 1, "counted as it left");
+
+    let mut strays = vec![s.chain.fund(key.puzzle_hash(), 2, None), s.chain.fund(key.puzzle_hash(), 0, None)];
+    strays.sort_by_key(Coin::coin_id);
+    let f2 = s.chain.fund(lobby().puzzle_hash(), 1, None);
+    let peer = Bytes32::new([0x62; 32]);
+    s.chain.include_next(claim(&lobby(), f, peer));
+    let redirected = s.chain.farm().await;
+    assert_eq!(s.chain.children(f.coin_id()), vec![Coin::new(f.coin_id(), peer, 1)], "F's claim went to the peer");
+    let listed = s.money.coin_records_by_puzzle_hash(key.puzzle_hash(), true, None).await.unwrap();
+    let mut at_burner: Vec<(Coin, bool)> = listed.records.iter().map(|r| (r.coin, r.spent)).collect();
+    at_burner.sort_by_key(|(coin, _)| coin.coin_id());
+    assert_eq!(at_burner, strays.iter().map(|stray| (*stray, false)).collect::<Vec<_>>(), "the burner's whole listing: the two strays");
+    assert!(!listed.truncated);
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Pending, "the lease still holds the bundle");
+    let settling = s.burner_write(&key, 0, hint, None, |_| Ok(b"not yet".to_vec()), 2).await;
+    assert_eq!(waited(&settling), Some(BurnerWait::Settling), "the strays are no coin it writes from, and its bundle still settles");
+    assert_eq!(s.gifts(0), 1);
+
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert!(!s.lease.holds_for(payer) && !s.lease.holds_spend_at(key.puzzle_hash()), "the lease let the bundle go");
+    let second = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record from F2".to_vec()), 3).await.unwrap();
+    let g2 = gift(&key, f2);
+    assert_eq!(second.coins, WriteCoins { parent: g2.coin_id(), parked: f2.coin_id() }, "funded again from F2, beside the strays");
+    assert_eq!(s.gifts(0), 1, "the dead gift given back and the new one counted: one, not two");
+
+    let landed = s.chain.farm().await;
+    assert_eq!(s.chain.children(g2.coin_id()), vec![burner_coin(&key, g2.coin_id())]);
+    assert_eq!(s.judge_split(hint, second.coins, second.memo, second.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    for stray in strays {
+        assert_eq!(s.chain.record(stray.coin_id()), Some((stray, redirected, None)), "a stray, never spent");
+    }
+    let rebuilt = s.chain.received().last().cloned().expect("the write was sent");
+    assert_eq!(s.sent(), HashSet::from([lost.name(), rebuilt.name()]));
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// Stage 4 design §10, the lost race whose loser is refused: a stranger's
 /// claim of the dish coin F waits in the mempools, and a block that carries
 /// it comes just as our claim and write is sent, so every node refuses ours
@@ -1788,9 +1846,11 @@ async fn a_claim_and_write_whose_ephemeral_parent_no_node_serves_reads_pending_a
 /// its key that is not this lease (a cloned folder, or a stolen W). The
 /// burner now holds no coin and the lease nothing of its, so it is funded
 /// again (§5.2; PR 10's foreign-spend pause is what stops a thief), but its
-/// puzzle hash held coins, so the first gift stays counted: two gifts
-/// landed through us, two counted. Only a burner that never held a coin, as
-/// in the lost-race tests, has its gift given back.
+/// puzzle hash held coins of 1 mojo, so the first gift stays counted: two
+/// gifts landed through us, two counted. Only a burner that never held a
+/// coin of 1 mojo, as in the lost-race tests, has its gift given back,
+/// whatever strays of other amounts it holds
+/// (`a_stray_at_a_burner_keeps_no_dead_gift_counted_once_a_redirected_claim_kills_its_bundle`).
 #[tokio::test]
 async fn a_landed_gift_stays_counted_when_its_burners_coin_is_later_spent_elsewhere() {
     let mut s = setup().await;
@@ -1876,6 +1936,70 @@ async fn a_burner_bundle_whose_payer_a_rollback_lost_still_holds_the_burners_nex
 
     s.chain.farm().await;
     assert_eq!(s.chain.children(written.coin_id()), vec![burner_coin(&key, written.coin_id())], "the rewrite lands, one coin at the burner");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.4 and §5.2, the gift rule's second guard on a SETTLING
+/// bundle: a stranger's claim of the dish coin F lands first, so our claim
+/// and write never lands, and the lease keeps it settling while a
+/// reorganization could still bring it back (§10). A rollback then loses
+/// its payer (§8 (6)), and the spend reads as the money address's, so no
+/// payer record holds the burner. The burner holds no coin, and its puzzle
+/// hash never held one, so the fuse would give its gift back and a second
+/// gift would follow; but the settling bundle still spends g at the
+/// burner's puzzle hash, so the burner's next write waits as settling,
+/// though a spare lobby coin is ready: nothing new is sent and the fuse is
+/// unchanged. Once F is spent SETTLED_DEPTH deep the lease lets the bundle
+/// go, and the next write gives the dead gift back and is funded from the
+/// spare coin, one gift counted.
+#[tokio::test]
+async fn a_settling_burner_bundle_whose_payer_a_rollback_lost_still_holds_back_a_second_gift() {
+    let mut s = setup().await;
+    let dir = Dir::new("rollback-settling");
+    let path = dir.0.join("wallet_lease.json");
+    let money = wallet(53);
+    restore(&s.lease, &path, &money);
+    let (coins, _) = ready_dishes(&s, &[1, 1]).await;
+    let key = burner(53, 0);
+    let payer = Payer::of_burner(&key);
+    let hint = Bytes32::new([0x63; 32]);
+    let first = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record that never lands".to_vec()), 1).await.unwrap();
+    let lost = s.chain.received().last().cloned().expect("the write was sent");
+    let f = coins.iter().copied().find(|c| c.coin_id() == first.coins.parked).expect("F, a lobby coin");
+    let spare = coins.iter().copied().find(|c| c.coin_id() != f.coin_id()).expect("the other lobby coin");
+    assert_eq!(s.gifts(0), 1);
+
+    let stranger = Bytes32::new([0x64; 32]);
+    s.chain.include_next(claim(&lobby(), f, stranger));
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(f.coin_id()), vec![Coin::new(f.coin_id(), stranger, 1)], "the stranger's claim took F");
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Pending, "the lease still holds the bundle");
+    assert!(s.lease.is_settling(&f.coin_id()) && s.lease.holds_for(payer));
+
+    roll_back(&mut s, &path, &money);
+    assert!(s.lease.is_settling(&f.coin_id()), "still settling, as the file kept it");
+    assert!(!s.lease.holds_for(payer), "the payer lost: no payer record holds the burner");
+    assert!(s.lease.holds_for(Payer::of(&money)), "the money address's, as the file now reads");
+    assert!(
+        !s.lease.parks_spend_at(key.puzzle_hash()) && s.lease.holds_spend_at(key.puzzle_hash()),
+        "nothing parked, and the settling bundle spends g, at the burner"
+    );
+    let held = s.burner_write(&key, 0, hint, None, |_| Ok(b"a second gift".to_vec()), 2).await;
+    assert_eq!(waited(&held), Some(BurnerWait::Settling), "the burner's settling bundle, known by its spend");
+    assert!(!s.lease.is_taken(&spare.coin_id()), "the spare lobby coin never claimed");
+    assert_eq!(s.sent(), HashSet::from([lost.name()]), "no second gift built");
+    assert_eq!(s.gifts(0), 1, "the fuse unchanged");
+
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    s.reconcile().await;
+    assert!(!s.lease.is_settling(&f.coin_id()) && !s.lease.holds_spend_at(key.puzzle_hash()), "settled: the lease let the bundle go");
+    let second = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record from the spare coin".to_vec()), 3).await.unwrap();
+    assert_eq!(second.coins, WriteCoins { parent: gift(&key, spare).coin_id(), parked: spare.coin_id() }, "funded again, from the spare coin");
+    assert_eq!(s.gifts(0), 1, "the dead gift given back, the new one counted");
+    let landed = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, second.coins, second.memo, second.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+    let rebuilt = s.chain.received().last().cloned().expect("the write was sent");
+    assert_eq!(s.sent(), HashSet::from([lost.name(), rebuilt.name()]));
     assert!(s.chain.unanswered().is_empty());
 }
 
