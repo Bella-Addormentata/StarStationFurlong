@@ -869,12 +869,15 @@ pub fn parse_hex32(hex_id: &str) -> Option<Bytes32> {
 /// hint, which the hint lookup finds it by ([`child_under_hint`]); and
 /// `parked`, the on-chain input the wallet lease parked for its spend, which
 /// the spent-height lookup ([`spent_heights`]) and the lease's word
-/// ([`LeaseWord`]) are about. They are one coin for every write this build
-/// makes, and every mark, knock entry or older node's record: the input a
-/// spend-to-self consumed, which its new coin names. A burner's first write
-/// (PR 9) will have the gift g as its parent and the dish coin as its parked
-/// input. Here, not in the publisher, since the knock verdicts are judged in
-/// read-only builds too.
+/// ([`LeaseWord`]) are about. They are one coin for a spend-to-self of one
+/// coin, as every write paid by the SSF wallet's keys is, and a burner's
+/// rewrite, and for every mark, knock entry or older node's record: the
+/// input it consumed, which its new coin names. A burner's first write
+/// (`chia_publish`'s claim-and-write, stage 4 design §4.1) has two: the gift
+/// g as its parent and the dish coin F as its parked input. No mark files
+/// that pair until PR 10 files `parked` beside the parent
+/// ([`WriteCoins::filed`]). Here, not in the publisher, since the knock
+/// verdicts are judged in read-only builds too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteCoins {
     pub parent: Bytes32,
@@ -883,7 +886,7 @@ pub struct WriteCoins {
 
 impl WriteCoins {
     /// A write whose parked input is its own coin's parent: a spend-to-self
-    /// of one coin, as every write of this build.
+    /// of one coin, as every write is but a burner's first.
     pub fn one(coin: Bytes32) -> Self {
         Self { parent: coin, parked: coin }
     }
@@ -1970,7 +1973,8 @@ mod tests {
 
     /// Stage 4 design §4.4: a mark or a knock entry files one coin, and it is
     /// read back as the write's parent and its parked input alike, which every
-    /// write of this build has as one coin; a malformed one files nothing.
+    /// write a mark files has as one coin (a burner's first write, whose two
+    /// differ, is filed in none until PR 10); a malformed one files nothing.
     #[test]
     fn a_filed_coin_reads_back_as_the_parent_and_the_parked_input_alike() {
         let coin = Bytes32::new([7u8; 32]);

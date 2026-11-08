@@ -30,6 +30,12 @@
 //! TAKE there (stage 4 design §4.5): a mojo into the SSF wallet marks it as a
 //! player's ([`MAINNET_NO_TAKE`]), and nobody claims from a room's own dish,
 //! which would group its takers by room ([`MAINNET_NO_ROOM_DISH`]).
+//!
+//! The claim spend is built by [`claim_spend`] for TAKE and for the
+//! claim-and-write alike (stage 4 design §5.1). The claim-and-write's
+//! [`claim_to`] claims a random ready lobby coin to a burner and pushes
+//! nothing: the burner's own write goes in the same bundle, and the lease,
+//! not this module, parks it.
 #![cfg(feature = "chia-read")]
 
 use std::collections::HashMap;
@@ -37,7 +43,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::{ChainAccess, PagedRecords};
+use crate::chia_chain::{ChainAccess, ChainError, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -127,6 +133,19 @@ impl FaucetParams {
         }
     }
 
+    /// The lobby dish of `net`, the one [`Self::is_lobby`] accepts: the
+    /// welcome room's, whose key ships in every build
+    /// (`chia_rooms::BUNDLED_ROOM_KEYS_B64`), at that network's address. It
+    /// is the only dish a burner is funded from (stage 4 design §5.1, R6 in
+    /// §4.2): a shared pool, so a claim there ties its taker to some Star
+    /// Station node and to no room.
+    #[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+    pub fn lobby(net: ChiaNet) -> FaucetParams {
+        let key = crate::chia_rooms::decode_room_key(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64[0])
+            .expect("the bundled welcome key decodes");
+        Self::for_room(net, &key)
+    }
+
     /// The lobby dish of `net`: the one whose room key ships in every build
     /// (the welcome room, `chia_rooms::BUNDLED_ROOM_KEYS_B64`), at that
     /// network's address. Every other dish is a room's own, and so is the
@@ -210,6 +229,32 @@ pub fn claim_solution(
     clvm_list!(my_puzzle_hash, my_amount, recipient, fee)
         .to_clvm(a)
         .map_err(|e| anyhow!("faucet solution: {e:?}"))
+}
+
+/// The claim of `coin` at `params`'s dish that pays the gift to
+/// `recipient`, fee 0: the curried puzzle as its reveal and
+/// [`claim_solution`] as its solution, run here first, so a solution the
+/// puzzle rejects (a coin below the gift, say) never reaches the mempool.
+/// No key signs it: the puzzle has no AGG_SIG condition, so a bundle of
+/// claims alone aggregates the identity signature (stage 4 design §5.4).
+/// TAKE sends it to the money address; the claim-and-write sends it to a
+/// burner, beside the burner's spend of the gift in the same bundle
+/// (§4.1, §5.1).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+pub fn claim_spend(params: &FaucetParams, coin: Coin, recipient: Bytes32) -> Result<chia_protocol::CoinSpend> {
+    use chia_protocol::{CoinSpend, Program};
+    use clvmr::serde::node_to_bytes;
+
+    let mut a = Allocator::new();
+    let puzzle = params.puzzle_reveal(&mut a)?;
+    let solution = claim_solution(&mut a, params.puzzle_hash(), coin.amount, recipient, 0)?;
+    chia_sdk_types::run_puzzle(&mut a, puzzle, solution)
+        .map_err(|e| anyhow!("faucet puzzle rejected our claim locally: {e:?}"))?;
+    Ok(CoinSpend::new(
+        coin,
+        Program::from(node_to_bytes(&a, puzzle).map_err(|e| anyhow!("serialize reveal: {e:?}"))?),
+        Program::from(node_to_bytes(&a, solution).map_err(|e| anyhow!("serialize solution: {e:?}"))?),
+    ))
 }
 
 /// One unspent coin at the faucet address, as the chain reports it.
@@ -406,11 +451,32 @@ pub struct Unspent {
     pub partial: bool,
 }
 
+/// A coin listing the chain did not give ([`unspent_at`]): the chain's own
+/// error for the page that failed, under the words the listing's callers
+/// have always logged ("coin lookup: ..."). It is typed so that a caller
+/// can tell a failed read, which a later try may get past, from a refusal:
+/// with burner keys on (SSF_CHIA_BURNERS=1 on a test network), a knock that
+/// could not read the chain waits and uses no attempt (stage 4 design §5.2,
+/// `chia_publish::is_typed_wait`); with them off it uses one, as on main.
+#[derive(Debug)]
+pub struct CoinLookupFailed(pub ChainError);
+
+impl std::fmt::Display for CoinLookupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "coin lookup: {}", self.0)
+    }
+}
+
+/// No source: the text already holds the chain's error, and an alternate
+/// print (`{:#}`) would say it twice.
+impl std::error::Error for CoinLookupFailed {}
+
 /// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
 /// coins are asked for as well: the chain pages by a coin's latest change, so
 /// a coin listed unspent on one page comes again, spent, on a later one when
 /// the chain moved on in between, and only that later record says so
-/// ([`PagedRecords`]); the spent ones are dropped once every page is in.
+/// ([`PagedRecords`]); the spent ones are dropped once every page is in. A
+/// page the chain did not give fails the listing as [`CoinLookupFailed`].
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
     let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
@@ -419,7 +485,7 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
         let listing = client
             .coin_records_by_puzzle_hash(puzzle_hash, true, cursor.take())
             .await
-            .map_err(|e| anyhow!("coin lookup: {e}"))?;
+            .map_err(CoinLookupFailed)?;
         pages += 1;
         gathered.fold(listing.records);
         let truncated = listing.truncated;
@@ -840,13 +906,109 @@ pub fn pick_ready_coin<'a, R: rand::Rng + ?Sized>(
     ready.choose(rng).copied()
 }
 
+/// A claim of one dish coin to a recipient, built and not pushed
+/// ([`dish_claim`]): the spend, and the two coins it creates, whose ids are
+/// known before anything leaves (stage 4 design §4.1). `gift` is the gift at
+/// the recipient: for a burner it is the ephemeral coin g, which the
+/// burner's write spends in the same bundle. `remainder` is the rest of the
+/// dish coin back at the dish, `None` when the coin held exactly the gift,
+/// as `puzzles/faucet.clsp` creates it only when it is above 0.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DishClaim {
+    pub params: FaucetParams,
+    pub dish: FaucetCoin,
+    pub spend: chia_protocol::CoinSpend,
+    pub gift: Coin,
+    pub remainder: Option<Coin>,
+}
+
+/// The claim of `dish` at `params`'s dish to `recipient` ([`claim_spend`]),
+/// with the coins it creates. Pure, and for any dish: which dish may fund
+/// whom is the caller's rule, not this one's. The spend is built and run
+/// first, so a coin below the gift is the puzzle's refusal, never an
+/// underflow here; fee 0, so the remainder is the coin less the gift.
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+pub fn dish_claim(params: &FaucetParams, dish: FaucetCoin, recipient: Bytes32) -> Result<DishClaim> {
+    let spend = claim_spend(params, dish.coin, recipient)?;
+    let rest = dish.coin.amount.checked_sub(params.gift).ok_or_else(|| anyhow!("faucet: a coin below the gift"))?;
+    let parent = dish.coin.coin_id();
+    Ok(DishClaim {
+        params: *params,
+        gift: Coin::new(parent, recipient, params.gift),
+        remainder: (rest > 0).then(|| Coin::new(parent, params.puzzle_hash(), rest)),
+        dish,
+        spend,
+    })
+}
+
+/// Why [`claim_to`] built no claim, when it is a typed answer rather than a
+/// failed read: a caller tells waiting for the dish from a failure by
+/// downcasting the error to this. `NoCoinReady` is a dry or griefed dish
+/// (stage 4 design §10): nothing went wrong, and the next tick tries again
+/// with another random coin, so it is no knock attempt (§5.2).
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimToError {
+    /// No claim may be made at the lobby dish on this network
+    /// ([`dish_claim_refusal`]).
+    Refused(&'static str),
+    /// No peer answered the peak, so no coin can be judged ready.
+    PeakUnavailable,
+    /// No coin at the lobby dish is ready that the caller does not hold.
+    NoCoinReady,
+}
+
+impl std::fmt::Display for ClaimToError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimToError::Refused(why) => f.write_str(why),
+            ClaimToError::PeakUnavailable => f.write_str("chain peak unavailable (peers unreachable?)"),
+            ClaimToError::NoCoinReady => f.write_str("no mojo in the dish right now; it refills on the block clock"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimToError {}
+
+/// The claim of a random ready lobby coin to `recipient`, built and not
+/// pushed (stage 4 design §5.1): the claim-and-write puts it in one bundle
+/// with the recipient burner's spend of the gift. Only the lobby dish of
+/// `net` funds a burner ([`FaucetParams::lobby`]; R6 in §4.2), and it asks
+/// the dish's own rule alone ([`dish_claim_refusal`], which admits the lobby
+/// on every network), never TAKE's, which refuses any claim into the SSF
+/// wallet off a test network: the recipient here is not the money address.
+/// The coin is picked at random among the ready ones `taken` does not
+/// name ([`pick_ready_coin`], §5.2): the caller names the coins the lease
+/// holds, and the TAKE marker's. It neither pushes nor parks nor marks
+/// anything, so calling it twice picks twice from the same coins.
+/// `ClaimToError::PeakUnavailable` and `ClaimToError::NoCoinReady` come back
+/// typed; a listing that failed is no `ClaimToError` but the listing's own
+/// [`CoinLookupFailed`].
+#[cfg_attr(not(feature = "chia-publish"), allow(dead_code))] // the read build claims nothing
+pub async fn claim_to<R: rand::Rng + ?Sized>(
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    recipient: Bytes32,
+    taken: impl Fn(&Bytes32) -> bool,
+    rng: &mut R,
+) -> Result<DishClaim> {
+    let params = FaucetParams::lobby(net);
+    if let Some(why) = dish_claim_refusal(net, &params) {
+        return Err(ClaimToError::Refused(why).into());
+    }
+    let peak = crate::chia_resolve::peak_height(client).await.ok_or(ClaimToError::PeakUnavailable)?;
+    let coins = unspent_at(client, params.puzzle_hash()).await?.coins;
+    let picked = pick_ready_coin(&coins, &params, peak, taken, rng).ok_or(ClaimToError::NoCoinReady)?;
+    dish_claim(&params, picked.clone(), recipient)
+}
+
 /// CLAIM: spend a ready faucet coin picked at random ([`pick_ready_coin`]),
 /// GIFT to our own address, keyless. Refused first off a test network
 /// ([`take_refusal`]), before the wallet or the chain is asked anything.
 #[cfg(feature = "chia-publish")]
 async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &FaucetParams) -> Result<FaucetReply> {
-    use chia_protocol::{CoinSpend, Program, SpendBundle};
-    use clvmr::serde::node_to_bytes;
+    use chia_protocol::SpendBundle;
 
     if let Some(why) = take_refusal(ctx.net, params) {
         return Err(anyhow!(why));
@@ -894,17 +1056,9 @@ async fn claim(ctx: &FaucetContext<'_>, client: &impl ChainAccess, params: &Fauc
     };
     let recipient = crate::chia_publish::our_puzzle_hash(sk);
 
-    let mut a = Allocator::new();
-    let puzzle = params.puzzle_reveal(&mut a)?;
-    let solution = claim_solution(&mut a, faucet_ph, target.coin.amount, recipient, 0)?;
-    // Dry-run locally first: a solution the puzzle rejects never reaches the mempool.
-    chia_sdk_types::run_puzzle(&mut a, puzzle, solution)
-        .map_err(|e| anyhow!("faucet puzzle rejected our claim locally: {e:?}"))?;
-    let coin_spend = CoinSpend::new(
-        target.coin,
-        Program::from(node_to_bytes(&a, puzzle).map_err(|e| anyhow!("serialize reveal: {e:?}"))?),
-        Program::from(node_to_bytes(&a, solution).map_err(|e| anyhow!("serialize solution: {e:?}"))?),
-    );
+    // Dry-run locally first (claim_spend): a solution the puzzle rejects never
+    // reaches the mempool.
+    let coin_spend = claim_spend(params, target.coin, recipient)?;
     // Keyless: no AGG_SIG condition anywhere, so the aggregate is the identity.
     let bundle = SpendBundle::new(vec![coin_spend], chia_bls::Signature::default());
     // Not our coin, but a second TAKE before this one confirms must not pick it,
@@ -1172,9 +1326,11 @@ mod tests {
     }
 
     /// The lobby dish itself on `net`: the welcome room's, whose key ships in
-    /// every build.
+    /// every build ([`FaucetParams::lobby`], which
+    /// `the_lobby_dish_is_the_bundled_welcome_rooms_on_each_network` checks
+    /// against the key written out).
     fn lobby_params(net: ChiaNet) -> FaucetParams {
-        FaucetParams::for_room(net, &lobby_key())
+        FaucetParams::lobby(net)
     }
 
     /// The welcome room's key, the one `chia_rooms::BUNDLED_ROOM_KEYS_B64`
@@ -2067,5 +2223,196 @@ mod tests {
             assert!(!test_params().is_lobby(net), "{net:?}: a fixed tag");
             assert_ne!(lobby_params(net), lobby_params(other), "{net:?}: one lobby dish per network");
         }
+    }
+
+    /// Stage 4 design §5.1: the dish a burner is funded from is the welcome
+    /// room's on each network, its key written out here rather than taken
+    /// through the helpers, which call `FaucetParams::lobby` themselves. It
+    /// is the dish `is_lobby` accepts, at the puzzle hash `DISHES` pins, each
+    /// network's own, and the dish's claim rule admits a claim at it on every
+    /// network.
+    #[test]
+    fn the_lobby_dish_is_the_bundled_welcome_rooms_on_each_network() {
+        for net in ChiaNet::ALL {
+            let other = ChiaNet::ALL.into_iter().find(|n| *n != net).unwrap();
+            let lobby = FaucetParams::lobby(net);
+            let written_out = FaucetParams::for_room(
+                net,
+                &crate::chia_rooms::decode_room_key(crate::chia_rooms::BUNDLED_ROOM_KEYS_B64[0]).unwrap(),
+            );
+            assert_eq!(lobby, written_out, "{net:?}");
+            assert!(lobby.is_lobby(net), "{net:?}");
+            assert_ne!(lobby, FaucetParams::lobby(other), "{net:?}: each network has its own");
+            let pinned = DISHES.iter().find(|d| d.net == net && d.lobby).expect("a pinned lobby row per network");
+            assert_eq!(hex::encode(lobby.puzzle_hash()), pinned.puzzle_hash, "{net:?}");
+            assert_eq!(dish_claim_refusal(net, &lobby), None, "{net:?}: the lobby admits a claim");
+        }
+    }
+
+    /// The claim TAKE sends, now built by `claim_spend` for TAKE and the
+    /// claim-and-write alike: the same spend as one built by hand the way
+    /// `address_matches_the_sdk_encoder_and_a_claim_bundle_is_keyless` builds
+    /// it, fee 0, and no signature is required of it (stage 4 design §5.4).
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn a_claim_spend_is_the_keyless_fee_zero_claim_take_sends() {
+        use chia_protocol::{CoinSpend, Program};
+        use clvmr::serde::node_to_bytes;
+
+        for params in [FaucetParams::for_room(T11, &[3u8; 32]), FaucetParams::lobby(T11)] {
+            let ph = params.puzzle_hash();
+            let mut a = Allocator::new();
+            let puzzle = params.puzzle_reveal(&mut a).unwrap();
+            let recipient = Bytes32::new([4u8; 32]);
+            let solution = claim_solution(&mut a, ph, 1000, recipient, 0).unwrap();
+            let coin = Coin::new(Bytes32::new([2u8; 32]), ph, 1000);
+            let by_hand = CoinSpend::new(
+                coin,
+                Program::from(node_to_bytes(&a, puzzle).unwrap()),
+                Program::from(node_to_bytes(&a, solution).unwrap()),
+            );
+            let spend = claim_spend(&params, coin, recipient).unwrap();
+            assert_eq!(spend, by_hand);
+            let mut b = Allocator::new();
+            let constants = chia_sdk_signer::AggSigConstants::from(&*chia_sdk_types::TESTNET11_CONSTANTS);
+            let required = chia_sdk_signer::RequiredSignature::from_coin_spends(&mut b, &[spend], &constants).unwrap();
+            assert!(required.is_empty(), "no key signs a claim");
+        }
+    }
+
+    /// Stage 4 design §4.1: a dish claim names the coins its spend creates
+    /// before anything leaves: the gift at the recipient, whose id is the
+    /// hash of F's id, the recipient's puzzle hash and 1 (for a burner, g),
+    /// and the rest back at the dish, none when F held exactly the gift. The
+    /// readers' own condition walk finds those coins and no other, so the
+    /// claim pays no fee. A coin below the gift is the puzzle's refusal, not
+    /// an underflow.
+    #[test]
+    fn a_dish_claim_pays_the_gift_to_its_recipient_and_the_rest_back_to_the_dish() {
+        let params = test_params();
+        let ph = params.puzzle_hash();
+        let recipient = Bytes32::new([9u8; 32]);
+        let dish = |amount: u64| FaucetCoin { coin: Coin::new(Bytes32::new([5u8; 32]), ph, amount), confirmed_height: 100 };
+        let created = |claim: &DishClaim| -> Vec<Coin> {
+            let spend = crate::chia_chain::PuzzleAndSolution {
+                puzzle_reveal: claim.spend.puzzle_reveal.clone(),
+                solution: claim.spend.solution.clone(),
+            };
+            crate::chia_resolve::created_coins(&spend)
+                .unwrap()
+                .into_iter()
+                .map(|c| Coin::new(claim.dish.coin.coin_id(), c.puzzle_hash, c.amount))
+                .collect()
+        };
+
+        let f = dish(10);
+        let claim = dish_claim(&params, f.clone(), recipient).unwrap();
+        assert_eq!((claim.params, &claim.dish), (params, &f));
+        assert_eq!(claim.spend, claim_spend(&params, f.coin, recipient).unwrap(), "the spend TAKE sends");
+        assert_eq!(claim.gift.coin_id(), Coin::new(f.coin.coin_id(), recipient, 1).coin_id(), "g's id is known before the push");
+        assert_eq!(claim.remainder, Some(Coin::new(f.coin.coin_id(), ph, 9)));
+        assert_eq!(created(&claim), vec![claim.remainder.unwrap(), claim.gift], "what the spend creates, and no fee");
+        assert_eq!(run(&params, claim.spend.solution.clone()).unwrap().len(), 5);
+
+        let last = dish_claim(&params, dish(1), recipient).unwrap();
+        assert_eq!(last.remainder, None, "the last mojo leaves nothing at the dish");
+        assert_eq!(created(&last), vec![last.gift]);
+        assert_eq!(run(&params, last.spend.solution.clone()).unwrap().len(), 4);
+
+        let below = dish_claim(&params, dish(0), recipient).unwrap_err();
+        assert!(below.to_string().contains("rejected our claim locally"), "{below}");
+    }
+
+    /// One listing page of the coins at the lobby dish of `net`, each
+    /// `(parent byte, amount, confirmed height)`, all unspent.
+    fn lobby_listing(net: ChiaNet, coins: &[(u8, u64, u32)]) -> crate::chia_chain::CoinListing {
+        let ph = FaucetParams::lobby(net).puzzle_hash();
+        crate::chia_chain::CoinListing {
+            records: coins
+                .iter()
+                .map(|&(n, amount, height)| crate::chia_chain::CoinRecord {
+                    coin: Coin::new(Bytes32::new([n; 32]), ph, amount),
+                    confirmed_block_index: height,
+                    spent: false,
+                    spent_block_index: 0,
+                })
+                .collect(),
+            truncated: false,
+            next_cursor: None,
+            judged_at: None,
+        }
+    }
+
+    /// Stage 4 design §5.1 and §5.2: `claim_to` claims from the lobby dish
+    /// alone, at random among its ready coins that it is not told are taken,
+    /// and picks afresh on each call, since it pushes and marks nothing. A
+    /// coin inside its gap, or one the caller holds, is never picked. Off a
+    /// test network it asks the dish's own rule, which admits the lobby, not
+    /// TAKE's, which refuses a claim into the SSF wallet there.
+    #[tokio::test]
+    async fn claim_to_picks_at_random_among_ready_lobby_coins_it_is_not_told_are_taken() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let recipient = Bytes32::new([0xc1; 32]);
+        let peak = 200;
+        let coins = [
+            (1, 10, 100), // ready
+            (2, 1, 150),  // ready, exactly one gift
+            (3, 7, 120),  // ready, but the caller holds it
+            (4, 50, 190), // inside its gap until 222
+        ];
+        let held = Coin::new(Bytes32::new([3u8; 32]), FaucetParams::lobby(T11).puzzle_hash(), 7).coin_id();
+        let taken = |id: &Bytes32| *id == held;
+        let mut seen: HashMap<u8, u32> = HashMap::new();
+        for seed in 0..64u64 {
+            let chain = Scripted::new(vec![lobby_listing(T11, &coins)]).with_peak(peak);
+            let claim = claim_to(T11, &chain, recipient, taken, &mut rand::rngs::StdRng::seed_from_u64(seed)).await.unwrap();
+            assert_eq!(claim.params, FaucetParams::lobby(T11), "seed {seed}: the lobby dish alone");
+            assert_eq!(claim.spend.coin, claim.dish.coin, "seed {seed}");
+            assert_eq!(claim.gift, Coin::new(claim.dish.coin.coin_id(), recipient, GIFT_MOJOS), "seed {seed}");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "seed {seed}: one listing of the dish");
+            *seen.entry(claim.dish.coin.parent_coin_info.as_ref()[0]).or_default() += 1;
+        }
+        let mut picked: Vec<u8> = seen.keys().copied().collect();
+        picked.sort_unstable();
+        assert_eq!(picked, vec![1, 2], "both free ready coins, never the held one or the one inside its gap: {seen:?}");
+        let main = ChiaNet::Mainnet;
+        let chain = Scripted::new(vec![lobby_listing(main, &coins)]).with_peak(peak);
+        let claim = claim_to(main, &chain, recipient, |_| false, &mut rand::rngs::StdRng::seed_from_u64(7)).await.unwrap();
+        assert_eq!(claim.params, FaucetParams::lobby(main), "mainnet's own lobby dish");
+        assert!(take_refusal(main, &claim.params).is_some(), "where TAKE's rule refuses a claim into the SSF wallet");
+    }
+
+    /// Stage 4 design §5.2 and §10: a dish with no ready coin the caller does
+    /// not hold is `ClaimToError::NoCoinReady`, a wait the caller tells from
+    /// a failure by its type; with no peak answered it is `PeakUnavailable`,
+    /// and the dish is not listed. A listing that fails is no wait for the
+    /// dish but the listing's own failed read ([`CoinLookupFailed`]).
+    #[tokio::test]
+    async fn claim_to_says_no_coin_ready_as_its_own_error() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let recipient = Bytes32::new([0xc1; 32]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let typed = |e: &anyhow::Error| e.downcast_ref::<ClaimToError>().copied();
+        let ready = [(1, 10, 100)];
+        for (why, coins, held) in [
+            ("inside its gap, or dust", &[(1, 10, 190), (2, 0, 100)][..], false),
+            ("every ready coin held", &ready[..], true),
+            ("an empty dish", &[][..], false),
+        ] {
+            let chain = Scripted::new(vec![lobby_listing(T11, coins)]).with_peak(200);
+            let err = claim_to(T11, &chain, recipient, |_| held, &mut rng).await.unwrap_err();
+            assert_eq!(typed(&err), Some(ClaimToError::NoCoinReady), "{why}: {err}");
+        }
+        let chain = Scripted::new(vec![lobby_listing(T11, &ready)]);
+        let err = claim_to(T11, &chain, recipient, |_| false, &mut rng).await.unwrap_err();
+        assert_eq!(typed(&err), Some(ClaimToError::PeakUnavailable), "{err}");
+        assert!(chain.asked_spent.lock().unwrap().is_empty(), "no listing without a peak");
+        let chain = Scripted::new(vec![]).with_peak(200);
+        let err = claim_to(T11, &chain, recipient, |_| false, &mut rng).await.unwrap_err();
+        assert_eq!(typed(&err), None, "a failed listing is no wait for the dish: {err}");
+        assert!(err.downcast_ref::<CoinLookupFailed>().is_some(), "but a failed read, typed: {err}");
+        assert_eq!(err.to_string(), "coin lookup: unanswered (nothing listens (test chain))", "in the words the listing always said");
     }
 }

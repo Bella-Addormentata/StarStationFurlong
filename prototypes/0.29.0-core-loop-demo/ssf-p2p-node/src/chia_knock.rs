@@ -120,7 +120,11 @@ pub struct KnockRequest {
     pub ck_host: [u8; 32],
     /// The host's contact-card key the knock is sealed to.
     pub kx_host: [u8; 32],
-    /// Failed attempts to send it so far (the publisher drops it after a few).
+    /// Failed attempts to send it so far (the publisher drops it after
+    /// `chia_publish::MAX_KNOCK_ATTEMPTS`). With burner keys on
+    /// (SSF_CHIA_BURNERS=1), a try that only waited, for the wallet's funds,
+    /// a spend still settling or a chain that did not answer, is none (stage
+    /// 4 design §5.2, `chia_publish::knock_attempt_counts`).
     pub attempts: u8,
 }
 

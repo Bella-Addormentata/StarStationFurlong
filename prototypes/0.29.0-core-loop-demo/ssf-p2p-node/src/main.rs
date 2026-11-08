@@ -99,7 +99,8 @@ mod chia_at_rest;
 #[cfg(feature = "chia-publish")]
 mod chia_publish;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
-// for the lane's writes. Nothing calls them yet; PRs 9 and 10 do.
+// for the lane's writes. PR 9's claim-and-write and its self-test hook call
+// them; PR 10's writers will.
 #[cfg(feature = "chia-publish")]
 mod chia_burner;
 #[cfg(feature = "chia-publish")]
@@ -2200,6 +2201,28 @@ async fn node_main() -> Result<()> {
                             eprintln!("🎲⛓️ craps-fair selftest FAILED: {e:#}");
                         }
                     });
+                }
+                // ⛓️🧪 Claim-and-write self-test hook
+                // (SSF_CHIA_CLAIM_WRITE_TEST=1, stage 4 design §13 row 9):
+                // once at startup, with burner keys on (SSF_CHIA_BURNERS=1), a
+                // burner claims a lobby dish coin and writes 64 random bytes in
+                // the same bundle, waits for the chain's verdict and reads the
+                // record back through its ephemeral parent. A test network only
+                // (`test_hook_on`). Spawned so it never blocks startup; logs
+                // each step and PASS or FAIL. Best run alone: until its bundle
+                // settles, the money writers' settling check, which asks about
+                // every payer, holds the hooks above and the heartbeat's writes.
+                if test_hook_on(chia_net, "SSF_CHIA_CLAIM_WRITE_TEST") {
+                    if chia_publish::burners_enabled() {
+                        let wallet = chia_sk.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = chia_publish::claim_write_selftest(chia_net, wallet).await {
+                                eprintln!("⛓️🧪 claim-write selftest FAIL: {e:#}");
+                            }
+                        });
+                    } else {
+                        eprintln!("⛓️ ChiaHub: SSF_CHIA_CLAIM_WRITE_TEST=1 needs SSF_CHIA_BURNERS=1; nothing is written.");
+                    }
                 }
             }
             Err(e) => {
@@ -6316,8 +6339,9 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
 /// `net`, and the line said when it is set and refused. The hooks run on a
 /// test network only (stage 4 design §4.5 (3)): the publish hook writes this
 /// node's addresses under a room key anyone can compute from a constant in
-/// the source, and the craps hook writes plaintext. Like the hooks, `1`
-/// alone sets one.
+/// the source, the craps hook writes plaintext, and the claim-and-write hook
+/// spends a lobby dish coin under a hint computed the same way. Like the
+/// hooks, `1` alone sets one.
 #[cfg(feature = "chia-publish")]
 fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool, Option<String>) {
     match raw {
@@ -6348,7 +6372,7 @@ mod test_hook_tests {
     /// value runs nothing anywhere and says nothing. No environment is read.
     #[test]
     fn the_env_test_hooks_run_on_a_test_network_only() {
-        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST"] {
+        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST"] {
             for net in ChiaNet::ALL {
                 for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
                     assert_eq!(test_hook(net, var, raw), (false, None), "{var}={raw:?} on {net:?}");
@@ -6369,8 +6393,9 @@ mod test_hook_tests {
 }
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
-/// what the load did, its key fingerprint and receive address and, with the
-/// beacon on, the beacon's address. Never the words.
+/// what the load did, its key fingerprint and receive address, with the
+/// beacon on the beacon's address and, with SSF_CHIA_BURNERS set to `1`,
+/// what burner keys do on this network. Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
     chia_wallet::log_receive_address(net, id);
@@ -6383,6 +6408,14 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
         if let Some(warning) = warning {
             eprintln!("{warning}");
         }
+    }
+    // Stage 4 design §8 (2): burner keys on for a test network's run, or
+    // ignored off one, said as a refused test hook is; nothing is said when
+    // the variable is not `1`.
+    match chia_publish::burners() {
+        (true, Some(line)) => println!("{line}"),
+        (false, Some(line)) => eprintln!("{line}"),
+        _ => {}
     }
 }
 
