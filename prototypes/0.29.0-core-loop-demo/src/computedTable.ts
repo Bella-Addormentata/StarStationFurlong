@@ -153,6 +153,7 @@ import {
   computedCheckpointOf,
   computedEndedIncs,
   computedFoldOf,
+  computedGameMovesOf,
   computedRedecide,
   computedIncEnded,
   computedIncFor,
@@ -195,8 +196,9 @@ import {
   readTableState,
   reopenComputedSession,
   restoreComputedCheckpoint,
-  switchedPageSignedInc,
   switchIncOf,
+  switchLeft,
+  switchLeftFor,
   transactCasino,
   writeCheckpointAndTrim,
   writeComputedGone,
@@ -514,13 +516,11 @@ interface TableState {
   changed: { seq: number; round: number; undid: [number, number] | null };
   tickedAt: number | null;
   reputAt: number | null;
-  /** 🔒 A FAIR ONLY game was the one played while this state waited (tableOf):
-   *  when the table plays its incarnation again, it starts its waits afresh
-   *  (resumed), as after a wake, and `wakeAt` is when it did (0 before). No
-   *  duty ran here meanwhile, so no seed could be revealed in the time that
-   *  went by, and a first-seen time from before it would put the grace long
-   *  past. */
-  gated: boolean;
+  /** 🔒 When the table started this state's waits afresh (tableOf resumes it
+   *  once a FAIR ONLY game was played at the table since it was last served), as
+   *  after a wake; 0 before. No duty ran here meanwhile, so no seed could be
+   *  revealed in the time that went by, and a first-seen time from before it
+   *  would put the grace long past. */
   wakeAt: number;
   /** The last decided round this page saw on the chain: what the felt
    *  shows once a trim has taken the round out of the session, when it is
@@ -617,6 +617,20 @@ let compactedAt: number | null = null;
 const away = new Set<string>();
 const awayAt = new Map<string, number>();
 
+/** By table: how many times its game had moved to or from a FAIR ONLY one
+ *  (casinoDoc computedGameMovesOf) when this page last served its page-signed
+ *  state (tableOf). Whatever state the table plays when that count is not the
+ *  one now, one that waited or one made afresh, starts its waits afresh, as
+ *  after a wake: a FAIR ONLY game was played meanwhile, and no duty of the
+ *  page-signed state ran. A state made after the game has no first-seen times
+ *  of its own, either: the records it reads came to this page long ago, and a
+ *  close among them would have its grace long past. Counted by the doc, not by
+ *  a frame that looked at the table meanwhile: a table out of the room's list
+ *  for the whole game, or a page whose first frame comes after it, resumes the
+ *  same. Kept apart from the states: a page that was bound while the game was
+ *  played has none. */
+const servedMoves = new Map<string, number>();
+
 /** Forget what table st was waiting on, so every wait starts again from now:
  *  its first-seen times, the rounds it saw decided, and each timer a wake
  *  would break (the window, the re-arm, the seed out, the ask, the chain that
@@ -648,6 +662,7 @@ function lookAtClock(now: number): void {
     // wrote, saw and kept was of that binding.
     clock.epoch = epoch;
     tables.clear();
+    servedMoves.clear();
     endedByMe.clear();
     endedAt.clear();
     compactedAt = null;
@@ -721,11 +736,46 @@ function newTable(t: string, inc: string): TableState {
     seen: new Map(), decided: new Map(), mine: new Map(), burned: new Map(),
     pending: null, lateFelt: null, lateAdded: false, lastSlip: null, rearm: null, window: null, flung: null, left: false, undone: 0, changes: 0, changesTold: 0, toldOver: new Map(), undoneAway: false,
     rolled: new Map(), changed: { seq: 0, round: 0, undid: null },
-    tickedAt: null, reputAt: null, gated: false, wakeAt: 0,
+    tickedAt: null, reputAt: null, wakeAt: 0,
     lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
     decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
   };
+}
+
+/** Whether the incarnation table st holds the state of is over, the switch
+ *  having named another page-signed one of its game after it (casinoDoc
+ *  switchLeft), even if it carries a FAIR ONLY hint now. A name that is no such
+ *  incarnation takes nobody's place: a FAIR ONLY hint, one nothing opened, one
+ *  that has ended, one of the table's other game (a peer's doing: nothing this
+ *  table can play), junk, none. Nor on a doc holding part of an update
+ *  (casinoWhole): the switch it reads may be one a parked write has since
+ *  moved, and seeds let go of on that reading cannot be had back. The one test
+ *  of over for the frames: tableOf and the compaction duty replace the state by
+ *  it, and putSwitchBack puts nothing back for it. */
+function isOver(st: TableState): boolean {
+  return casinoWhole(st.t) && switchLeft(st.t, st.inc);
+}
+
+/** Table st's incarnation is over (isOver), a game played or not: nothing of it
+ *  will be revealed now, so its seeds are let go of, and the state this page
+ *  keeps for the table is the incarnation the switch named after it, made
+ *  afresh (casinoDoc switchLeftFor). Played a game meanwhile or not, it is
+ *  served as any state is (tableOf resumes it if a game was played since the
+ *  table was last served). The one place that does it, for a table in the room's
+ *  list (tableOf) and for one out of it (compactDuty). When that incarnation has
+ *  ended since, nothing takes this one's place: the state goes with the seeds,
+ *  having nothing left to serve (putSwitchBack refuses an incarnation that is
+ *  over all the same: it would put the switch back on one whose stakes are
+ *  free and whose seeds are gone). */
+function supersede(st: TableState): void {
+  letGo(st, () => false);
+  const next = switchLeftFor(st.t, st.inc);
+  if (next === null) {
+    tables.delete(st.t);
+    return;
+  }
+  tables.set(st.t, newTable(st.t, next));
 }
 
 /** Table t's state and fold result, when it is a computed table casinoDoc
@@ -739,26 +789,14 @@ function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult 
   // are PR 6c-4b's, which open this. The page-signed incarnation this page ran
   // waits as it is, and is served again, its waits started afresh, once the
   // table plays it. A game defers its duties, though, never its end nor the
-  // switch's moving: once the switch names another page-signed incarnation
-  // the doc holds, the one this page ran is over, its stakes freed (casinoDoc
-  // switchHoldsFelts) and its slips never to settle, so its state is replaced
-  // by the other's as it would be with no game, and nothing is put back for it
-  // when the game ends. Not while the doc holds part of an update, though
-  // (casinoWhole): the switch it reads may be one a parked write has since
-  // moved, and compactDuty waits for a whole doc before it lets go of seeds too.)
+  // switch's moving: once the switch has named another page-signed incarnation
+  // the doc holds (isOver), the one this page ran is over, its stakes freed
+  // (casinoDoc switchHoldsFelts) and its slips never to settle, so its state is
+  // replaced by the other's as it would be with no game, and nothing is put
+  // back for it when the game ends.)
   if (isFairOnlyInc(inc)) {
     const waits = tables.get(t);
-    if (waits) {
-      const next = switchedPageSignedInc(t);
-      if (next !== null && next !== waits.inc && casinoWhole(t)) {
-        letGo(waits, () => false);
-        const fresh = newTable(t, next);
-        fresh.gated = true;
-        tables.set(t, fresh);
-      } else {
-        waits.gated = true;
-      }
-    }
+    if (waits && isOver(waits)) supersede(waits);
     return null;
   }
   if (game !== undefined && gameOfInc(inc) !== game) return null;
@@ -769,20 +807,23 @@ function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult 
     // (A new incarnation: nothing of the last one's will be revealed now.)
     if (st) letGo(st, () => false);
     tables.set(t, st = newTable(t, inc));
-  } else if (st.gated) {
-    // (Resumed after a game: no duty ran here meanwhile. As after a wake, a
-    // timer whose wait spanned it starts again, or a close seen before the
-    // game would have its grace long past and the first page to reveal would
-    // forfeit the players whose pages hadn't yet. And, as after a wake, what
-    // was built on those waits is built again (clock.gen): a betting view
-    // cached expired, with the fold unchanged, would close on the old
+  }
+  const moves = computedGameMovesOf(t);
+  if (moves !== (servedMoves.get(t) ?? 0)) {
+    // (Resumed after a game: it was played at this table since this page last
+    // served it, or since it was bound, and no duty of this state ran meanwhile.
+    // As after a wake, a timer whose wait spanned it starts again, or a close
+    // seen before the game would have its grace long past and the first page to
+    // reveal would forfeit the players whose pages hadn't yet. And, as after a
+    // wake, what was built on those waits is built again (clock.gen): a betting
+    // view cached expired, with the fold unchanged, would close on the old
     // deadline, and the scan keeps the idle time it took from the first-seen
     // ones.)
-    st.gated = false;
     forgetWaits(st);
     st.wakeAt = clock.last ?? Date.now();
     clock.gen += 1;
   }
+  servedMoves.set(t, moves);
   noteResult(st, res);
   return { st, res };
 }
@@ -2741,12 +2782,18 @@ function awayDuty(inRoom: ReadonlyMap<string, GameName>, now: number): void {
  * putComputedSwitchBack has the rest). A switch naming another incarnation
  * the doc holds records of stays: two of the house's pages switching on at
  * once, on docs that disagreed on the table's removals, name two, and the
- * doc keeps one (the other is compacted). Of the tables passed only: a
- * removed one is ended, and this page runs it no more.
+ * doc keeps one (the other is compacted). Not one this page's own count has
+ * the switch leave for another (isOver): that one is over for good, whatever
+ * the switch names by the time of the frame (a hint at a name no game stands
+ * behind, the end of the one it was left for), and the frame replaces its
+ * state instead; its stakes are free by then, and held again by a put-back
+ * they would be locked for chips the page's players have spent, or for slips
+ * the pages that let go of its seeds can no longer settle. Of the tables
+ * passed only: a removed one is ended, and this page runs it no more.
  */
 function putSwitchBack(t: string, now: number): void {
   const st = tables.get(t);
-  if (!st || switchIncOf(t) === st.inc || !tablesAwake(now) || !casinoWhole(t)) return;
+  if (!st || switchIncOf(t) === st.inc || isOver(st) || !tablesAwake(now) || !casinoWhole(t)) return;
   transactCasino(() => putComputedSwitchBack(t, st.inc));
 }
 
@@ -3924,7 +3971,7 @@ function sessionPubs(e: EndedComputed): Set<string> {
  * from casinoDoc, not the tables passed in: a removed table isn't among
  * them. And what this page wrote for an incarnation that is over is let go
  * of, seeds and all, on every page: one ended for good (computedIncEnded),
- * or one whose switch names another page-signed incarnation (a game played
+ * or one the switch has left for another page-signed incarnation (isOver; a game played
  * changes nothing of that: it defers a page-signed incarnation's duties and
  * leaves its state to wait to the end, its own or the game's, while the
  * switch names the game or none, but not once the switch has moved to
@@ -3946,19 +3993,32 @@ function compactDuty(pub: string, now: number): void {
   // all: no duty runs for it now, so nothing of it will be revealed. (A
   // switch naming an incarnation that has ended is a lost one, as a missing
   // switch is: computedSwitchLost. It is put back, and the seeds go only if
-  // the incarnation ends.) 🔒 By the switch's name, not the game the table
-  // plays (computedIncOf): while a FAIR ONLY game is played, the page-signed
+  // the incarnation ends.) 🔒 By the switch (as this page counted it) and the ends
+  // the doc holds, not the game the table plays (computedIncOf): while a FAIR ONLY game is played, the page-signed
   // incarnation the switch still names is only waiting, its frozen slips
   // still to reveal when the game ends or the deed moves, and a FAIR ONLY name
   // in the switch (a live game's, or a dead hint put back over) is a hint, not
-  // another incarnation taking this one's place. A page-signed name is: the
-  // incarnation the switch left is over, its stakes freed (casinoDoc
-  // switchHoldsFelts) and nothing of it to settle, a game played or not
-  // (tableOf replaces its state the same way, but at a table in the room only).
-  for (const st of tables.values()) {
-    if (st.mine.size === 0 || !casinoWhole(st.t)) continue;
-    const named = switchIncOf(st.t);
-    if (computedIncEnded(st.t, st.inc) || (named !== null && named !== st.inc && !isFairOnlyInc(named) && !computedIncEnded(st.t, named))) letGo(st, () => false);
+  // another incarnation taking this one's place. A page-signed incarnation the
+  // doc holds is (isOver: not a name nothing opened, which the page that ran
+  // this one puts the switch back over once it is awake): this one is over, its
+  // stakes freed (casinoDoc switchHoldsFelts) and nothing of it to settle, a
+  // game played or not, and a hint that comes after doesn't undo it. Its state
+  // is the other's from here (none if that has ended since), at a table out of
+  // the room's list as at one in it (tableOf), even with no slip of this page's
+  // to let go of: the state this page keeps for the table is the incarnation
+  // the switch left it for, not a stale one (and the put-back, going by isOver,
+  // puts nothing back on the one left). One that has ended too (its
+  // `gone:` mark came with the write that moved the switch, as the house's
+  // migration writes them (migrateComputed), or after it) is no exception: its seeds go and the
+  // other's state takes its place, or nothing does if that has ended since, as
+  // in the room's list (tableOf).
+  for (const st of [...tables.values()]) {
+    if (!casinoWhole(st.t)) continue;
+    if (isOver(st)) {
+      supersede(st);
+      continue;
+    }
+    if (computedIncEnded(st.t, st.inc)) letGo(st, () => false);
   }
   // (Timed from when this page saw it ended, or woke: asleep or not.)
   const awake = tablesAwake(now);

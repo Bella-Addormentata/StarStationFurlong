@@ -1690,6 +1690,70 @@ describe('the game a table plays (S9): the deed holder\'s, else the switch\'s, e
     expect(played(page)).toBe(theirs.ctx.inc); // (a live game is played over the switch's page-signed incarnation)
     expect(c.computedGameMovedOf(T)).toBeNull();
   });
+
+  // What the page-signed duties of a table go by to know a game was played at it since they last ran: the
+  // count of the moves of its game to or from a live one, the doc's (computedGameMovesOf).
+  it('counts the moves of the table\'s game to or from a live game: a game opening, ending, or the deed changing hands; not a switch among page-signed incarnations, a hint, nor the first look at the table', async () => {
+    const page = await loadPage(1);
+    const c = page.casino;
+    pin(page, owner, buyer, third);
+    deedTo(page, owner);
+    const theirs = gameBy(buyer, hex('4', 16));
+    const x = `r${'1'.repeat(24)}`;
+    const moves = (): number => c.computedGameMovesOf(T);
+    expect(moves()).toBe(0);
+    c.writeComputedOn(T, x); // (a page-signed incarnation: no game has a part in it)
+    expect(moves()).toBe(0);
+    put(page, root); // the owner's game opens over it: the first look at the table moves nothing
+    expect(played(page)).toBe(P.inc);
+    expect(moves()).toBe(0);
+    put(page, theirs.root); // another opens: the deed holder's is played still
+    expect(played(page)).toBe(P.inc);
+    expect(moves()).toBe(0);
+    deedTo(page, buyer); // the deed changes hands: the table goes from one game to the other
+    expect(played(page)).toBe(theirs.ctx.inc);
+    expect(moves()).toBe(1);
+    switchTo(page, P.inc); // a hint at the game not played moves nothing
+    expect(played(page)).toBe(theirs.ctx.inc);
+    expect(moves()).toBe(1);
+    put(page, endOf(theirs, buyer)); // the game it played ends: the other is played
+    expect(played(page)).toBe(P.inc);
+    expect(moves()).toBe(2);
+    put(page, endOf(OWNERS, owner)); // the last one ends: no game is played, whatever the switch still names
+    expect(c.isComputedTable(T)).toBe(false);
+    expect(moves()).toBe(3);
+    c.writeComputedOn(T, x); // the table goes back to the page-signed incarnation: its end was counted
+    expect(played(page)).toBe(x);
+    expect(moves()).toBe(3);
+    const again = gameBy(third, hex('5', 16));
+    put(page, again.root); // a game opens at it again
+    expect(played(page)).toBe(again.ctx.inc);
+    expect(moves()).toBe(4);
+    put(page, endOf(again, third));
+    expect(played(page)).toBe(x);
+    expect(moves()).toBe(5);
+    expect(c.computedGameMovesOf('roulette-2')).toBe(0); // (the count is of a table)
+  });
+
+  it('counts nothing of a game played before the page bound the doc: its end is the first move it counts, and a binding forgets the count', async () => {
+    const page = await loadPage(1);
+    pin(page, owner);
+    deedTo(page, owner);
+    put(page, root);
+    const copy = new Y.Doc();
+    Y.applyUpdate(copy, Y.encodeStateAsUpdate(page.doc));
+    const late = await loadPage(2);
+    late.casino.bindCasinoDoc(copy, ROOM);
+    late.doc = copy;
+    expect(late.casino.computedIncOf(T)).toBe(P.inc);
+    expect(late.casino.computedGameMovesOf(T)).toBe(0); // (it found the game played)
+    put(late, endOf(OWNERS, owner));
+    expect(late.casino.computedGameMovesOf(T)).toBe(1); // (and saw it end)
+    const over = new Y.Doc();
+    Y.applyUpdate(over, Y.encodeStateAsUpdate(late.doc));
+    late.casino.bindCasinoDoc(over, ROOM);
+    expect(late.casino.computedGameMovesOf(T)).toBe(0);
+  });
 });
 
 // ── The switch at a FAIR ONLY table ──────────────────────────────────────────
@@ -1988,11 +2052,12 @@ describe('a page-signed table beside a FAIR ONLY game: its switch is still its o
     expect(ended()).toEqual([`${T}:${X}`]);
     switchTo(page, P.inc);
     expect(ended()).toEqual([]);
-    // another page-signed incarnation's name takes its place; the game's name is the place of neither
+    // another page-signed incarnation's name takes its place; the game's name is the place of neither,
+    // and no way back to the one the switch left: it holds the other, whose place it is
     c.writeComputedOn(T, Y2);
     expect(ended()).toEqual([`${T}:${X}`]);
     switchTo(page, P.inc);
-    expect(ended()).toEqual([]);
+    expect(ended()).toEqual([`${T}:${X}`]);
     // and a removal still ends it, the switch naming the game or not
     page.doc.transact(() => casinoOf(page).set(`gone:${T}:${X}`, 1));
     expect(ended()).toEqual([`${T}:${X}`]);
