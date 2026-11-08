@@ -87,11 +87,14 @@
 //!     they still stand on the chain the listing was taken as of
 //!     ([`settle_disputed`]): a coin the spend made under the hint, as a
 //!     block runs the spend and a full node reads its hint ([`hints_made`]),
-//!     is kept and the peer that left it out let go; a coin whose making no
-//!     peer serves is left out and the peer that listed it let go; any other
-//!     is a stale row, left out, nobody let go; a pin is never let go, and a
-//!     difference in what the peers say of the coins is a disagreement like
-//!     any other.
+//!     is kept and the peer that left it out let go (unless the coin is one
+//!     of the block its page is dated by, or changed above it, which a full
+//!     node's own lag explains); a coin whose making no peer serves is left
+//!     out and the peer that listed it let go; any other is a stale row,
+//!     left out, nobody let go; a pin is never let go, and a difference in
+//!     what the peers say of the coins is a disagreement like any other.
+//!     One settling takes at most [`MAX_DISPUTED_PARENTS`] spends and
+//!     [`MAX_DISPUTED_COINS`] coins; more leave the read without a verdict.
 //!     One source holds at most
 //!     [`PER_SOURCE_CAP`] of the [`MAX_CONNS`] connections, and a full pool
 //!     holding no pair in step (none by source and group, or every one out
@@ -223,17 +226,30 @@ pub const MAX_PEAK_LAG: u32 = 6;
 /// The most spends (a parent, at the height its children were made) one
 /// settling of a hinted listing page's one-sided coins fetches of each peer
 /// and runs, once each ([`settle_disputed`]): the first this many in
-/// (parent, height) order. More leave the other coins unsettled and the
-/// read without a verdict: the coins of the spends settled are judged all
-/// the same, and the public peers found at fault among them let go; when
-/// none is, the connections of the pair's public peers are all dropped
-/// (back to the queue, neither cooled for long nor forgotten), the lister's
-/// and the other's alike, a pin's never, since nothing settled tells which
-/// of them lists the rows a fork left behind and which hides what the chain
-/// made. So a flood of stale rows costs a read its answer and never a peer,
-/// nor more than this many spend requests of each peer and spend runs a
-/// page.
+/// (parent, height) order, their coins taken up to [`MAX_DISPUTED_COINS`].
+/// More leave the other coins unsettled and the read without a verdict: the
+/// coins taken are judged all the same, and the public peers found at
+/// fault among them let go; when none is, the connections of the pair's
+/// public peers are all dropped (back to the queue, neither cooled for long
+/// nor forgotten), the lister's and the other's alike, a pin's never, since
+/// nothing settled tells which of them lists the rows a fork left behind
+/// and which hides what the chain made. So a flood of stale rows costs a
+/// read its answer and never lets a peer go, nor costs more than this many
+/// spend requests of each peer and spend runs a page.
 pub const MAX_DISPUTED_PARENTS: usize = 16;
+/// The most one-sided coins one settling of a hinted listing page asks of
+/// each peer by id and judges ([`settle_disputed`]): those of the first
+/// [`MAX_DISPUTED_PARENTS`] spends and those at the hint's own puzzle hash,
+/// in (parent, height, id) order. The other peer's page sets how many coins
+/// are one-sided, and a 2.7.4 node answers at most 100,000 ids a lookup to
+/// a wallet peer (`max_subscribe_response_items`), echoing the ids it took:
+/// a lookup of every coin one lying page can list would leave an honest
+/// peer short after [`STATE_ROUNDS`] requests, and so silent, a pin too,
+/// while the liar answered every id at once. Far below that limit, an
+/// honest node answers the lookup in one request; more coins leave the rest
+/// unsettled and the read without a verdict, as spends past
+/// [`MAX_DISPUTED_PARENTS`] do.
+pub const MAX_DISPUTED_COINS: usize = 1024;
 /// An agreed peak read trusts an announcement this old at most; older, the
 /// peer is asked whether the chain has moved past its peak
 /// ([`Lane::prove_current`]). The agreed height is the publisher's era clock:
@@ -2956,18 +2972,33 @@ async fn settle_listing(
 /// who can compute the hint can bring about with one spend in a block that
 /// happens to be orphaned. Two honest peers then differ, and neither is to
 /// be let go for it. But every block a node takes files a row for each coin
-/// it makes under a hint (`full_node.py`, `add_hints`), so an honest node's
-/// current chain never lacks one: a page that leaves out a coin the chain
-/// made under the hint hid it. So:
-///   1. every peer is asked for those coins by id, in one lookup
-///      ([`states_on`]);
+/// it makes under a hint (`full_node.py`, `add_hints`), so a page that
+/// leaves out a coin the chain made under the hint hid it, but for the
+/// moment a 2.7.4 node's rows and coins lag the height its page is dated
+/// by: it files a block's rows only after it has committed the block and
+/// moved its peak, and reads that peak after it has queried its coins
+/// (`request_puzzle_state`), so a finished page can lack the coins of the
+/// block it is dated by; and a page cut short is dated by the node's
+/// announcement, which follows the block's post-processing, while its
+/// coins are the coin store's, a block ahead, so a coin spent in that block
+/// has moved past the cut. So a page is held to a coin it left out only
+/// when the coin was made below the height the page is dated by and, by
+/// that peer's own lookup, changed nowhere above it.
+///
+/// One settling takes the coins of the first [`MAX_DISPUTED_PARENTS`]
+/// spends that made them (a parent, at the height its children were
+/// created at, in (parent, height) order) and the coins at the hint's own
+/// puzzle hash, which a listing lists with no spend made under the hint, at
+/// most [`MAX_DISPUTED_COINS`] coins in all, in (parent, height, id) order
+/// ([`to_settle`]): the other peer's page sets how many coins are one-sided,
+/// and the lookup asks for every coin taken. So:
+///   1. every peer is asked for the coins taken by id, in one lookup
+///      ([`lookup_on`]: asked again, once, when it is dated below the
+///      anchor and the peer then announces a peak at or above it);
 ///   2. unless the lookup has told the verdict already (a peer refused it,
 ///      or gave a coin otherwise than the pages that list it, or dated it
 ///      below the anchor), every peer is asked for the spends that made the
-///      coins: their parents', at the heights they were created at, one
-///      request per distinct spend, the first [`MAX_DISPUTED_PARENTS`] of
-///      them in (parent, height) order; a coin at the hint's own puzzle hash
-///      is listed under it with no spend and needs none;
+///      coins, one request per spend;
 ///   3. every peer shows it still stands on the anchor's chain
 ///      ([`anchored`]) before anything it said in either round is judged: an
 ///      answer from another chain (a reorganisation between the rounds)
@@ -2982,10 +3013,13 @@ async fn settle_listing(
 ///      compared before anything more is made of any, whatever their order:
 ///      another spend, or none beside one, disagrees;
 ///   6. each spend the peers serve is run once, as its block ran it
-///      ([`hints_made`]), and each coin of a spend settled is judged:
+///      ([`hints_made`]), and each coin taken is judged:
 ///        * a coin whose output in that spend a full node files under the
 ///          hint, or whose own puzzle hash is the hint, is kept: the chain
-///          made it under the hint, so the pages that left it out hid it;
+///          made it under the hint, so the pages that left it out hid it,
+///          and each is at fault unless the lag above explains its page
+///          (the coin made at or above the height the page is dated by, or
+///          changed above it by that peer's lookup), when it is only logged;
 ///        * a coin whose spend no peer serves is left out: an honest node
 ///          lists a coin under a hint only once a spend on its chain made it
 ///          so (a reward coin carries no memo), and serves that spend, so the
@@ -2994,25 +3028,28 @@ async fn settle_listing(
 ///          logged, since every read of the hint meets it again for the rest
 ///          of its era.
 ///
-/// When the peers at fault (the pages that hid a kept coin, and those that
-/// listed a coin whose spend no peer serves) are every peer of the pair,
-/// `Ok(None)`: a disagreement, the caller lets the public peers go as for
-/// any other ([`Lane::verdict`]). Otherwise the public peers among them are
-/// let go ([`Lane::evict`], which spares a pin), and the listing comes back
-/// with the kept coins in it, in height then id order. More spends than
-/// [`MAX_DISPUTED_PARENTS`] leave the other coins unsettled, so the read has
-/// no verdict: the coins of the spends settled are judged all the same and
-/// the public peers at fault among them let go; when none is at fault,
-/// every public peer of the pair has its connection dropped (back to the
-/// queue, neither cooled for long nor forgotten), a pin's never, so a
-/// lister and a hider alike leave the pair, and neither can veto every read
-/// of a hint at the cost of an honest connection alone.
+/// When the peers at fault are every peer of the pair, `Ok(None)`: a
+/// disagreement, the caller lets the public peers go as for any other
+/// ([`Lane::verdict`]). Otherwise the public peers among them are let go
+/// ([`Lane::evict`], which spares a pin, and leaves [`Lane::note_good`]
+/// nothing of theirs to keep), and, when every one-sided coin was taken,
+/// the listing comes back with the kept coins in it, in height then id
+/// order. Coins left untaken leave the read without a verdict: the coins
+/// taken are judged all the same and the public peers at fault among them
+/// let go; when none is at fault, every public peer of the pair has its
+/// connection dropped (back to the queue, neither cooled for long nor
+/// forgotten), a pin's never, so a lister and a hider alike leave the
+/// pair, and neither can veto every read of a hint at the cost of an
+/// honest connection alone.
 ///
 /// No verdict, and nobody let go, when:
 ///   * a peer does not answer a round, leaves ids of the lookup unanswered
-///     after [`STATE_ROUNDS`] requests, or cannot show its chain inside a
-///     peak that stands still ([`anchored`]): each such peer is silent, its
-///     connection dropped, a pin's too, as a silent peer's of any request is;
+///     after [`STATE_ROUNDS`] requests (an honest node answers up to
+///     100,000 ids a request to a wallet peer, `max_subscribe_response_items`,
+///     far more than [`MAX_DISPUTED_COINS`]), or cannot show its chain
+///     inside a peak that stands still ([`anchored`]): each such peer is
+///     silent, its connection dropped, a pin's too, as a silent peer's of
+///     any request is;
 ///   * a peer's chain moved off the anchor ([`anchored`]): the public peers
 ///     whose chain moved have their connections dropped (a liar that tells
 ///     one story in the listing and another in the rounds pays a connection
@@ -3022,18 +3059,30 @@ async fn settle_listing(
 ///   * an agreed spend does not run, or makes no such coin: the peers and
 ///     the chain agree, and the fault is the reading's.
 ///
-/// What one page's settling costs, at most: of each peer, [`STATE_ROUNDS`]
-/// × [`PEAK_SETTLE_ATTEMPTS`] coin-state requests for the lookup,
-/// [`MAX_DISPUTED_PARENTS`] spend requests, and 2 × [`PEAK_SETTLE_ATTEMPTS`]
-/// header requests for the anchor; of the lane, [`MAX_DISPUTED_PARENTS`]
-/// spend runs, each within the block's cost, off the async workers. A
-/// hinted read pays that once per page it follows: up to
-/// `chia_resolve::MAX_PAGES_PER_POLL` pages for the readers, and up to
-/// `chia_faucet::MAX_FAUCET_PAGES` for the craps fairness lane, eight
-/// either way. A peer listing real coins outside the hint, which no answer
-/// tells from stale rows, costs a read at most that and changes no answer
-/// it gives: under the cap its rows are left out, nobody let go; past it
-/// the read has none, and its own connection is dropped beside the other's.
+/// What the lane cannot tell from hiding: a node that takes several blocks
+/// at once (a sync batch) files their rows after all of them, a page read
+/// across two blocks taken in quick succession may lack the rows of the
+/// one below its peak, and a node stopped between a block and its rows
+/// never files them; a page of such a node that leaves out a coin of those
+/// blocks has that node let go as a hider, where main let both peers go
+/// for any one-sided coin. And a liar can leave out a coin of the block its
+/// page is dated by, or give it by id spent above that block, and stay:
+/// the coin is kept either way, so that changes no answer.
+///
+/// What one page's settling costs, at most: of each peer, 2 ×
+/// [`STATE_ROUNDS`] × [`PEAK_SETTLE_ATTEMPTS`] coin-state requests for the
+/// lookup, each for at most [`MAX_DISPUTED_COINS`] ids, and a wait of up to
+/// [`PEAK_GRACE`] between its two tries; [`MAX_DISPUTED_PARENTS`] spend
+/// requests; and 2 × [`PEAK_SETTLE_ATTEMPTS`] header requests for the
+/// anchor; of the lane, [`MAX_DISPUTED_PARENTS`] spend runs, each within
+/// the block's cost, off the async workers. A hinted read pays that once
+/// per page it follows: up to `chia_resolve::MAX_PAGES_PER_POLL` pages for
+/// the readers, and up to `chia_faucet::MAX_FAUCET_PAGES` for the craps
+/// fairness lane, eight either way. A peer listing real coins outside the
+/// hint, which no answer tells from stale rows, costs a read at most that
+/// and changes no answer it gives: when every such coin is taken its rows
+/// are left out, nobody let go; otherwise the read has none, and its own
+/// connection is dropped beside the other's.
 async fn settle_disputed(
     lane: &Lane,
     answers: &[(Arc<PeerConn>, Page)],
@@ -3047,9 +3096,19 @@ async fn settle_disputed(
     const LOOKUP: &str = "the lookup by id of one-sided coins";
     const SPENDS: &str = "the spends that made one-sided coins";
 
+    // The coins this settling takes, and the spends that made them.
+    let one_sided = disputed.len();
+    let mut every_spend: Vec<(Bytes32, u32)> =
+        disputed.iter().filter(|d| d.record.coin.puzzle_hash != hint).map(|d| (d.record.coin.parent_coin_info, d.record.confirmed_block_index)).collect();
+    every_spend.sort_unstable();
+    every_spend.dedup();
+    let all_spends = every_spend.len();
+    let (disputed, spends) = to_settle(disputed, hint);
+    let untaken = one_sided - disputed.len();
+
     // 1. The coins by id.
     let ids: Vec<Bytes32> = disputed.iter().map(|d| d.record.coin.coin_id()).collect();
-    let lookups = join_all(peers.iter().map(|peer| states_on(peer.clone(), lane.net.clone(), ids.clone()))).await;
+    let lookups = join_all(peers.iter().map(|peer| lookup_on(peer.clone(), lane.net.clone(), ids.clone(), knowledge))).await;
     heard(lane, &peers, LOOKUP, &lookups).await?;
     let mut short: Vec<String> = Vec::new();
     for (peer, lookup) in peers.iter().zip(&lookups) {
@@ -3077,18 +3136,14 @@ async fn settle_disputed(
             _ => None,
         })
         .collect();
+    // Each lookup's own latest change of each coin, above the anchor too.
+    let changed: Vec<HashMap<Bytes32, u32>> = lookups
+        .iter()
+        .map(|lookup| lookup.as_ref().map(|page| page.states.iter().map(|s| (s.coin.coin_id(), changed_at(s))).collect()).unwrap_or_default())
+        .collect();
     let alike = given.iter().all(|records| records.as_ref().is_some_and(|records| disputed.iter().all(|d| records.get(&d.record.coin.coin_id()) == Some(&d.record))));
 
     // 2. The spends that made them, unless the lookup has told the verdict.
-    let mut spends: Vec<(Bytes32, u32)> = disputed
-        .iter()
-        .filter(|d| d.record.coin.puzzle_hash != hint)
-        .map(|d| (d.record.coin.parent_coin_info, d.record.confirmed_block_index))
-        .collect();
-    spends.sort_unstable();
-    spends.dedup();
-    let all_spends = spends.len();
-    spends.truncate(MAX_DISPUTED_PARENTS);
     let fetched = if alike {
         let fetched = join_all(peers.iter().map(|peer| join_all(spends.iter().map(|&(parent, height)| spend_on(peer.clone(), parent, height))))).await;
         let fetched: Vec<Result<Vec<Option<PuzzleAndSolution>>, ChainError>> = fetched.into_iter().map(|theirs| theirs.into_iter().collect()).collect();
@@ -3185,16 +3240,33 @@ async fn settle_disputed(
                 }
             }
         } else {
-            // Its spend is past MAX_DISPUTED_PARENTS: unsettled.
-            continue;
+            // Unreached: every coin taken away from the hint's puzzle hash
+            // has its spend among those fetched (`to_settle`).
+            return Err(unanswered(format!("coins by hint: coin {} was taken without its spend; non-final, nobody let go", coin.coin_id())));
         };
         if kept {
-            eprintln!(
-                "⛓️ chain peers: {} left coin {} out of its listing under hint {hint}, though its record and its parent's spend show the chain made it under that hint; the coin is kept",
-                addrs(&d.missing_from),
-                coin.coin_id()
-            );
-            for &i in &d.missing_from {
+            // The page left it out where it should have held it: the coin
+            // made below the height the page is dated by and, by the peer's
+            // own lookup, changed nowhere above it.
+            let (hid, lagged): (Vec<usize>, Vec<usize>) = d.missing_from.iter().partition(|&&i| {
+                let dated = answers[i].1.knowledge;
+                d.record.confirmed_block_index < dated && changed[i].get(&coin.coin_id()).is_some_and(|&at| at <= dated)
+            });
+            if !hid.is_empty() {
+                eprintln!(
+                    "⛓️ chain peers: {} left coin {} out of its listing under hint {hint}, though its record and its parent's spend show the chain made it under that hint; the coin is kept",
+                    addrs(&hid),
+                    coin.coin_id()
+                );
+            }
+            if !lagged.is_empty() {
+                eprintln!(
+                    "⛓️ chain peers: {} left coin {} out of its listing under hint {hint}, a coin of the block its page is dated by or changed above it, which a full node's own lag explains; the coin is kept, nobody held to it",
+                    addrs(&lagged),
+                    coin.coin_id()
+                );
+            }
+            for i in hid {
                 at_fault[i] = true;
             }
             listing.records.push(d.record);
@@ -3207,20 +3279,67 @@ async fn settle_disputed(
         return Ok(None);
     }
     lane.evict(&faulty, "its listing under a hint hid a coin the chain made under it, or listed one whose making no peer serves").await;
-    if all_spends > MAX_DISPUTED_PARENTS {
+    if untaken > 0 {
         if faulty.is_empty() {
             for peer in peers.iter().filter(|peer| peer.source() != Source::Pin) {
                 lane.drop_conn(peer).await;
             }
         }
+        let past = if all_spends > MAX_DISPUTED_PARENTS {
+            format!("made by {all_spends} spends, more than the {MAX_DISPUTED_PARENTS}")
+        } else {
+            format!("more than the {MAX_DISPUTED_COINS}")
+        };
         return Err(unanswered(format!(
-            "coins by hint: {} coins some peers list and others leave out, made by {all_spends} spends, more than the {MAX_DISPUTED_PARENTS} one listing settles; non-final, {}",
-            ids.len(),
+            "coins by hint: {one_sided} coins some peers list and others leave out, {past} one listing settles; non-final, {}",
             if faulty.is_empty() { "nobody at fault among those settled, the public peers' connections dropped" } else { "the public peers found at fault among those settled let go" }
         )));
     }
     listing.records.sort_by_key(|r| (r.confirmed_block_index, r.coin.coin_id()));
     Ok(Some(listing))
+}
+
+/// The one-sided coins one settling takes ([`settle_disputed`]), in
+/// (parent, height, id) order, and the spends that made those of them away
+/// from `hint`'s own puzzle hash, in (parent, height) order: every coin at
+/// that puzzle hash and every coin of the first [`MAX_DISPUTED_PARENTS`]
+/// spends, up to [`MAX_DISPUTED_COINS`] coins.
+fn to_settle(mut disputed: Vec<Disputed>, hint: Bytes32) -> (Vec<Disputed>, Vec<(Bytes32, u32)>) {
+    disputed.sort_by_key(|d| (d.record.coin.parent_coin_info, d.record.confirmed_block_index, d.record.coin.coin_id()));
+    let mut spends: Vec<(Bytes32, u32)> = Vec::new();
+    let mut taken: Vec<Disputed> = Vec::new();
+    for d in disputed {
+        if taken.len() == MAX_DISPUTED_COINS {
+            break;
+        }
+        let spend = (d.record.coin.parent_coin_info, d.record.confirmed_block_index);
+        if d.record.coin.puzzle_hash != hint && spends.last() != Some(&spend) {
+            if spends.len() == MAX_DISPUTED_PARENTS {
+                continue;
+            }
+            spends.push(spend);
+        }
+        taken.push(d);
+    }
+    (taken, spends)
+}
+
+/// [`states_on`] for a settling ([`settle_disputed`]), dated at or above
+/// `knowledge`, the height the listing was taken as of, where the peer can
+/// date it so. A 2.7.4 node dates a finished page by its chain's peak
+/// (`request_puzzle_state`) and announces that peak to wallets only once
+/// the block is post-processed (`peak_post_processing_2`), so a lookup
+/// answered meanwhile is dated by its last announcement, below the
+/// listing's height. Such a lookup is asked again, once, when the peer
+/// announces a peak at or above `knowledge` within [`PEAK_GRACE`]; one
+/// still dated below it shows a chain that moved off the listing's
+/// ([`anchored`]).
+async fn lookup_on(peer: Arc<PeerConn>, net: Network, ids: Vec<Bytes32>, knowledge: u32) -> Result<Page, ChainError> {
+    let page = states_on(peer.clone(), net.clone(), ids.clone()).await?;
+    if page.knowledge >= knowledge || peer.wait_peak_past(knowledge - 1, PEAK_GRACE).await.is_none() {
+        return Ok(page);
+    }
+    states_on(peer, net, ids).await
 }
 
 /// What [`anchored`] finds of one peer.
@@ -3246,7 +3365,9 @@ enum Anchor {
 /// so the chain the lookup was answered from holds the listing's block too
 /// (a header hash fixes its ancestry, and a peak never comes back to a
 /// block it left, since the chain it left for was heavier). A lookup page
-/// dated below the anchor's height has moved off it too. At most two header
+/// still dated below the anchor's height once asked again ([`lookup_on`])
+/// has moved off it too: the peer cannot show its view reached the
+/// listing's block. At most two header
 /// requests per bracket. The spends asked between the lookup and this check
 /// are taken as answered from the chain it finds: a fork that came and was
 /// overtaken again between the two, the peer's chain holding the lookup's
@@ -3342,9 +3463,10 @@ async fn anchor_on(peer: &Arc<PeerConn>, anchor: (u32, Bytes32), lookup: Option<
 /// activation height the two can differ for that one block, which this
 /// reads by the new rule a block early. At every height a 2.7.4 node runs
 /// today no flag that changes what a valid spend computes is set: the
-/// keccak256 and sha256tree operators outside the softfork guard (ops 62
-/// and 63) wait for hard fork 2, which is not scheduled, and are unknown
-/// operators returning nil meanwhile, here as in a block; the other flags a
+/// keccak256 operator outside the softfork guard (op 62) waits for hard
+/// fork 2, which is not scheduled, and the sha256tree operator outside it
+/// (op 63) is enabled at no height yet, hard fork 2's included; both are
+/// unknown operators returning nil meanwhile, here as in a block; the other flags a
 /// 2.7.4 node adds make a spend fail and change nothing a spend that ran in
 /// a block computed. Never a wallet's run: `chia_sdk_types::run_puzzle`
 /// enables keccak256 outside the guard (and runs the debug dialect in debug
@@ -3550,10 +3672,16 @@ async fn listing_on(
                 // line would date the page a block late; a new block at the
                 // same height would mix two chains into one page). A finished
                 // page is dated by the peer's own word, the peak it names, and
-                // needs no announcement; but the node reads that peak before
-                // it queries its coins, so a peak that moved meanwhile may
-                // have put another chain's coins under the header named, and
-                // the page is asked for again.
+                // needs no announcement. A 2.7.4 node queries its coins first
+                // and reads that peak after (`request_puzzle_state`), and
+                // announces a block to wallets only once it has
+                // post-processed it, filing its hint rows among the rest: so a
+                // finished page can lack the coins, or the hint rows, of the
+                // block it is dated by, which no bracket of announcements
+                // shows ([`settle_disputed`] holds no page to a coin of that
+                // block). A peak that moved during the request may have put
+                // another chain's coins under the header named, and the page
+                // is asked for again.
                 let after = peer.peak_now();
                 if before == after {
                     match after {
@@ -7504,6 +7632,50 @@ mod tests {
         }
         assert_eq!(filed_by(&spend, 0), filed);
         assert_eq!(filed_by(&spend, clvmr::chia_dialect::ENABLE_SHA256_TREE), other, "with the operator enabled, the other branch");
+    }
+
+    /// One settling takes every coin at the hint's own puzzle hash and the
+    /// coins of the first [`MAX_DISPUTED_PARENTS`] spends in (parent,
+    /// height) order, whatever order the pages gave them in, a spend being a
+    /// parent at one height, and never more than [`MAX_DISPUTED_COINS`]
+    /// coins, even of one spend.
+    #[test]
+    fn a_settling_takes_the_coins_at_the_hint_and_those_of_the_first_spends_up_to_the_coin_limit() {
+        let (hint, other) = (Bytes32::new([0xee; 32]), Bytes32::new([0xdd; 32]));
+        let one_sided = |parent: u8, height: u32, puzzle_hash: Bytes32, amount: u64| Disputed {
+            record: CoinRecord {
+                coin: Coin::new(Bytes32::new([parent; 32]), puzzle_hash, amount),
+                confirmed_block_index: height,
+                spent: false,
+                spent_block_index: 0,
+            },
+            listed_by: vec![0],
+            missing_from: vec![1],
+        };
+        let mut coins: Vec<Disputed> = (0..20u8).rev().map(|p| one_sided(p, 5, other, 1)).collect();
+        coins.push(one_sided(3, 6, other, 1));
+        coins.push(one_sided(3, 5, other, 2));
+        coins.push(one_sided(200, 5, hint, 1));
+        coins.push(one_sided(201, 9, hint, 2));
+        let (taken, spends) = to_settle(coins, hint);
+        let mut want: Vec<(Bytes32, u32)> = (0..15u8).map(|p| (Bytes32::new([p; 32]), 5)).collect();
+        want.push((Bytes32::new([3; 32]), 6));
+        want.sort_unstable();
+        assert_eq!(spends, want, "the first sixteen spends, parent 3 at two heights two of them");
+        assert_eq!(spends.len(), MAX_DISPUTED_PARENTS);
+        assert_eq!(taken.len(), 19, "their seventeen coins and both coins at the hint");
+        assert!(taken.iter().all(|d| d.record.coin.puzzle_hash == hint || want.contains(&(d.record.coin.parent_coin_info, d.record.confirmed_block_index))));
+        let order: Vec<(Bytes32, u32, Bytes32)> = taken.iter().map(|d| (d.record.coin.parent_coin_info, d.record.confirmed_block_index, d.record.coin.coin_id())).collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "in (parent, height, id) order");
+
+        let many: Vec<Disputed> = (0..MAX_DISPUTED_COINS as u64 + 5).map(|n| one_sided(7, 8, other, n)).collect();
+        let (taken, spends) = to_settle(many, hint);
+        assert_eq!(spends, vec![(Bytes32::new([7; 32]), 8)]);
+        assert_eq!(taken.len(), MAX_DISPUTED_COINS, "one spend's coins, cut at the coin limit");
+        let at_hint: Vec<Disputed> = (0..MAX_DISPUTED_COINS as u64 + 5).map(|n| one_sided(9, 8, hint, n)).collect();
+        let (taken, spends) = to_settle(at_hint, hint);
+        assert!(spends.is_empty());
+        assert_eq!(taken.len(), MAX_DISPUTED_COINS, "coins at the hint, cut at the coin limit too");
     }
 
     /// The answers to one more request of a settling are judged as a

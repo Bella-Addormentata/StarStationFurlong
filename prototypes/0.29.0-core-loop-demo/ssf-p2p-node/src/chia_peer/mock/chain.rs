@@ -76,13 +76,18 @@
 //! [`MockChain::release`]. One staged to come just as a node is to answer a
 //! request ([`MockChain::reorg_before`]) has no barrier: each connection
 //! hears of the new peak when its announcement arrives, a moment after the
-//! answer, as a real node's peers hear of one.
+//! answer, as a real node's peers hear of one. A node can also follow the
+//! chain while its announcements lag ([`MockChain::quiet`]), as a full node's
+//! announcement to wallets follows its post-processing of a block, or take a
+//! block before each header it serves ([`MockChain::restless`]).
 //!
 //! A node can also be made to say what its chain does not, which no node
 //! here does on its own: leave a coin out of its listings
-//! ([`MockChain::hide_on`]), deny one by id ([`MockChain::deny_on`]), serve
-//! another spend than the chain's ([`MockChain::serve_spend_on`]) or refuse
-//! every lookup by id ([`MockChain::refuse_lookups_on`]).
+//! ([`MockChain::hide_on`]), list coins its chain never made
+//! ([`MockChain::invent_on`]), deny one by id ([`MockChain::deny_on`]), serve
+//! another spend than the chain's ([`MockChain::serve_spend_on`]), refuse
+//! every lookup by id ([`MockChain::refuse_lookups_on`]) or echo none of the
+//! ids a lookup asks ([`MockChain::echo_no_lookup_ids_on`]).
 //! These stand for a lying peer, or one whose stores are short, beside an
 //! honest one: what the lane's settling of the coins two peers' hinted
 //! listings differ on is to tell apart from a stale hint row.
@@ -626,6 +631,14 @@ struct NodeState {
     held: Option<Chain>,
     /// Too busy to validate a bundle in time ([`MockChain::set_busy`]).
     busy: bool,
+    /// Its announcements withheld while it follows the chain
+    /// ([`MockChain::quiet`]), until it answers a request of the kind given
+    /// and the time given has passed after that ([`MockChain::speak_after`]),
+    /// if one is.
+    quiet: Option<Option<(ProtocolMessageTypes, Duration)>>,
+    /// The chain takes a block, announced, before it serves each header
+    /// ([`MockChain::restless`]).
+    restless: bool,
     /// What it says against its chain (the module notes).
     lies: Lies,
 }
@@ -646,6 +659,12 @@ struct Lies {
     spends: HashMap<Bytes32, Option<(Program, Program)>>,
     /// Every `RequestCoinState` refused ([`MockChain::refuse_lookups_on`]).
     refuse_lookups: bool,
+    /// Coins its chain never made, by id, which its listings give under the
+    /// hint named and its lookups give by id ([`MockChain::invent_on`]).
+    invented: HashMap<Bytes32, (Bytes32, CoinRec)>,
+    /// Every `RespondCoinState` echoes none of the ids asked, and carries no
+    /// state ([`MockChain::echo_no_lookup_ids_on`]).
+    echo_none: bool,
 }
 
 /// One `TransactionAck` a node sent.
@@ -675,6 +694,8 @@ struct Model {
     funded: u64,
     arrivals: u64,
     page_limit: usize,
+    /// The most ids one `RespondCoinState` takes ([`MockChain::set_lookup_limit`]).
+    lookup_limit: usize,
     received: Vec<SpendBundle>,
     acks: Vec<Ack>,
     unanswered: Vec<ProtocolMessageTypes>,
@@ -683,6 +704,9 @@ struct Model {
     /// of this kind ([`MockChain::reorg_before`]): its depth and the bundles
     /// its first block carries.
     reorg_before: Option<(ProtocolMessageTypes, u32, Vec<SpendBundle>)>,
+    /// A quiet node to announce its peak once the time given has passed
+    /// ([`MockChain::speak_after`]), for [`serve`] to schedule.
+    speak_later: Option<(usize, Duration)>,
 }
 
 impl Model {
@@ -858,12 +882,23 @@ impl Model {
         self.announced = announced;
         let mut told = Vec::new();
         for (index, node) in self.nodes.iter().enumerate() {
-            if node.held.is_none() {
+            if node.held.is_none() && node.quiet.is_none() {
                 node.announce.send_replace(announced);
                 told.push(index);
             }
         }
         (self.generation, told)
+    }
+
+    /// A quiet node's withheld announcement ([`MockChain::quiet`]): the
+    /// main chain's peak, with the fork point its last announcement, which
+    /// the chain has only grown from since.
+    fn speak(&mut self, node: usize) {
+        self.nodes[node].quiet = None;
+        self.generation += 1;
+        let fork_point = self.nodes[node].announce.borrow().height;
+        let announced = Announcement { generation: self.generation, fork_point, ..self.announced };
+        self.nodes[node].announce.send_replace(announced);
     }
 
     /// [`MockChain::reorg_including`] on the model: the last `n` blocks
@@ -899,6 +934,28 @@ impl Model {
             let (_, n, bundles) = self.reorg_before.take().expect("a staged reorganisation");
             self.reorganise(n, bundles);
         }
+        if self.nodes[node].restless && request.msg_type == ProtocolMessageTypes::RequestBlockHeader {
+            let fork_point = self.chain.peak();
+            let height = self.build_block(vec![], true);
+            let spent: HashSet<Bytes32> = self.chain.blocks[height as usize].spent.iter().copied().collect();
+            let Model { net, chain, nodes, .. } = &mut *self;
+            for node in nodes.iter_mut().filter(|n| n.held.is_none()) {
+                node.hints.extend(chain.hints_above(height - 1));
+                new_peak_fast(*net, chain, &mut node.pool, &spent);
+            }
+            self.announce(fork_point);
+        }
+        let answer = self.answer_now(node, request);
+        if let Some(Some((kind, after))) = self.nodes[node].quiet {
+            if kind == request.msg_type {
+                self.nodes[node].quiet = Some(None);
+                self.speak_later = Some((node, after));
+            }
+        }
+        answer
+    }
+
+    fn answer_now(&mut self, node: usize, request: &Message) -> Option<Message> {
         match request.msg_type {
             ProtocolMessageTypes::RequestBlockHeader => {
                 let asked = RequestBlockHeader::from_bytes(&request.data).ok()?;
@@ -909,14 +966,14 @@ impl Model {
             }
             ProtocolMessageTypes::RequestPuzzleState => {
                 let asked = RequestPuzzleState::from_bytes(&request.data).ok()?;
-                Some(puzzle_state(self.view(node), &self.nodes[node].hints, &self.nodes[node].lies.hidden, self.page_limit, asked))
+                Some(puzzle_state(self.view(node), &self.nodes[node].hints, &self.nodes[node].lies, self.page_limit, asked))
             }
             ProtocolMessageTypes::RequestCoinState => {
                 let asked = RequestCoinState::from_bytes(&request.data).ok()?;
                 if self.nodes[node].lies.refuse_lookups {
                     return Some(reply(&RejectCoinState::new(RejectStateReason::ExceededSubscriptionLimit)));
                 }
-                Some(coin_state(self.view(node), &self.nodes[node].lies.denied, self.page_limit, asked))
+                Some(coin_state(self.view(node), &self.nodes[node].lies, self.lookup_limit, asked))
             }
             ProtocolMessageTypes::RequestPuzzleSolution => {
                 let asked = RequestPuzzleSolution::from_bytes(&request.data).ok()?;
@@ -962,9 +1019,11 @@ impl Model {
 /// `chain`, as `batch_coin_states_by_puzzle_hashes` takes the coin records
 /// whose name is among the hint rows' coin ids: a coin made again on a new
 /// fork with another hint is listed under both, once, as it stands now,
-/// and a row whose coin is not on `chain` lists nothing. A coin in `hidden`
-/// is left out whatever matches it ([`MockChain::hide_on`]).
-fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, hidden: &HashSet<Bytes32>, limit: usize, asked: RequestPuzzleState) -> Message {
+/// and a row whose coin is not on `chain` lists nothing. A coin the node
+/// hides is left out whatever matches it ([`MockChain::hide_on`]), and a
+/// coin it made up is listed under the hint it named
+/// ([`MockChain::invent_on`]).
+fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, lies: &Lies, limit: usize, asked: RequestPuzzleState) -> Message {
     let mut keys = Vec::new();
     for key in asked.puzzle_hashes {
         if !keys.contains(&key) {
@@ -981,11 +1040,13 @@ fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, hidden: &HashS
     } else {
         HashSet::new()
     };
+    let invented = lies.invented.values().filter(|(hint, _)| filters.include_hinted && keys.contains(hint)).map(|(_, rec)| rec);
     let mut found: Vec<&CoinRec> = chain
         .coins
         .values()
         .filter(|rec| keys.contains(&rec.coin.puzzle_hash) || hinted.contains(&rec.coin.coin_id()))
-        .filter(|rec| !hidden.contains(&rec.coin.coin_id()))
+        .chain(invented)
+        .filter(|rec| !lies.hidden.contains(&rec.coin.coin_id()))
         .filter(|rec| rec.created >= since || rec.spent.is_some_and(|spent| spent >= since))
         .filter(|rec| if rec.spent.is_some() { filters.include_spent } else { filters.include_unspent })
         .filter(|rec| rec.coin.amount >= filters.min_amount)
@@ -1007,9 +1068,14 @@ fn puzzle_state(chain: &Chain, hints: &HashSet<(Bytes32, Bytes)>, hidden: &HashS
 
 /// `request_coin_state`: the ids asked for, cut at `limit` and echoed, and
 /// the states of the coins among them changed after the anchor. An id the
-/// chain does not know is echoed with no state, as is one in `denied`
-/// ([`MockChain::deny_on`]).
-fn coin_state(chain: &Chain, denied: &HashSet<Bytes32>, limit: usize, asked: RequestCoinState) -> Message {
+/// chain does not know is echoed with no state, as is one the node denies
+/// ([`MockChain::deny_on`]); one it made up has the state it gave it
+/// ([`MockChain::invent_on`]); and a node echoing no id gives nothing
+/// ([`MockChain::echo_no_lookup_ids_on`]).
+fn coin_state(chain: &Chain, lies: &Lies, limit: usize, asked: RequestCoinState) -> Message {
+    if lies.echo_none {
+        return reply(&RespondCoinState::new(vec![], vec![]));
+    }
     let mut ids = Vec::new();
     for id in asked.coin_ids.into_iter().take(limit) {
         if !ids.contains(&id) {
@@ -1022,8 +1088,8 @@ fn coin_state(chain: &Chain, denied: &HashSet<Bytes32>, limit: usize, asked: Req
     let since = asked.previous_height.map_or(0, |height| height + 1);
     let states = ids
         .iter()
-        .filter(|id| !denied.contains(*id))
-        .filter_map(|id| chain.coins.get(id))
+        .filter(|id| !lies.denied.contains(*id))
+        .filter_map(|id| chain.coins.get(id).or_else(|| lies.invented.get(id).map(|(_, rec)| rec)))
         .filter(|rec| rec.created >= since || rec.spent.is_some_and(|spent| spent >= since))
         .map(CoinRec::state)
         .collect();
@@ -1074,12 +1140,23 @@ impl Shared {
         out
     }
 
-    fn answer(&self, node: usize, request: &Message) -> Vec<WsMessage> {
+    /// The node's answer to `request`. A restless node's new block
+    /// ([`MockChain::restless`]) is announced on `announced`'s connection
+    /// ahead of the header it answers, so the client has filed the new peak
+    /// by the time it reads the header.
+    fn answer(&self, node: usize, request: &Message, announced: &mut watch::Receiver<Announcement>) -> Vec<WsMessage> {
         let mut model = self.model.lock().unwrap();
+        let restless = model.nodes[node].restless && request.msg_type == ProtocolMessageTypes::RequestBlockHeader;
         match model.answer(node, request) {
             Some(mut answer) => {
                 answer.id = request.id;
-                vec![binary(&answer)]
+                let mut out = Vec::new();
+                if restless && announced.has_changed().unwrap_or(false) {
+                    let now = *announced.borrow_and_update();
+                    out.extend(now.frames(now.fork_point));
+                }
+                out.push(binary(&answer));
+                out
             }
             None => {
                 model.unanswered.push(request.msg_type);
@@ -1140,7 +1217,19 @@ async fn serve(
                                 registered = true;
                                 shared.handshake(&mut announced)
                             } else {
-                                shared.answer(node, &message)
+                                let out = shared.answer(node, &message, &mut announced);
+                                let later = shared.model.lock().unwrap().speak_later.take();
+                                if let Some((quiet, after)) = later {
+                                    let shared = shared.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(after).await;
+                                        let mut model = shared.model.lock().unwrap();
+                                        if model.nodes[quiet].quiet.is_some() {
+                                            model.speak(quiet);
+                                        }
+                                    });
+                                }
+                                out
                             }
                         }
                         Some(Ok(WsMessage::Pong(data))) => {
@@ -1196,11 +1285,13 @@ impl MockChain {
             funded: 0,
             arrivals: 0,
             page_limit: PAGE_LIMIT,
+            lookup_limit: PAGE_LIMIT,
             received: Vec::new(),
             acks: Vec::new(),
             unanswered: Vec::new(),
             connections: 0,
             reorg_before: None,
+            speak_later: None,
         };
         Self(Arc::new(Shared { model: Mutex::new(model), acks: watch::Sender::new(HashMap::new()), next_conn: AtomicU64::new(0) }))
     }
@@ -1228,7 +1319,17 @@ impl MockChain {
             let mut model = self.lock();
             let announce = watch::Sender::new(model.announced);
             let hints = model.chain.hints_above(0).collect();
-            model.nodes.push(NodeState { addr, announce, pool: Pool::default(), hints, held: None, busy: false, lies: Lies::default() });
+            model.nodes.push(NodeState {
+                addr,
+                announce,
+                pool: Pool::default(),
+                hints,
+                held: None,
+                busy: false,
+                quiet: None,
+                restless: false,
+                lies: Lies::default(),
+            });
             model.nodes.len() - 1
         };
         let cert = CERTS.get(index).cloned().unwrap_or_else(|| Arc::new(chia_ssl::ChiaCertificate::generate().unwrap()));
@@ -1527,6 +1628,79 @@ impl MockChain {
         model.nodes[index].lies.refuse_lookups = true;
     }
 
+    /// `node` made to list `coins` from here, which its chain never made,
+    /// under `hint` as coins created at `height` and unspent, and to give
+    /// them so by id: a peer making coins up and keeping its story.
+    pub(crate) fn invent_on(&self, node: &MockNode, hint: Bytes32, coins: &[Coin], height: u32) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        for coin in coins {
+            let rec = CoinRec { coin: *coin, created: height, spent: None, spend: None };
+            model.nodes[index].lies.invented.insert(coin.coin_id(), (hint, rec));
+        }
+    }
+
+    /// `node` made to echo none of the ids a lookup by id asks from here,
+    /// with no state either: a lookup that makes no progress.
+    pub(crate) fn echo_no_lookup_ids_on(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.echo_none = true;
+    }
+
+    /// `node` made quiet: from here it follows every block as ever (its
+    /// view, hint rows and mempool), but announces none, so its peak as its
+    /// connections know it lags its own chain, as a full node's announcement
+    /// to wallets lags its post-processing of a block. The barrier of a
+    /// block does not wait for it. Only blocks may come while it is quiet,
+    /// no reorganisation. [`Self::speak`] or [`Self::speak_after`] ends it.
+    pub(crate) fn quiet(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        assert!(model.nodes[index].held.is_none(), "a held node announces nothing anyway");
+        model.nodes[index].quiet = Some(None);
+    }
+
+    /// A quiet node made to announce its peak `after` it has answered its
+    /// next request of `kind`, with no barrier: a full node's announcement
+    /// to wallets that follows its answers by that long, as it follows its
+    /// post-processing of a block.
+    pub(crate) fn speak_after(&self, node: &MockNode, kind: ProtocolMessageTypes, after: Duration) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        assert!(model.nodes[index].quiet.is_some(), "a quiet node");
+        model.nodes[index].quiet = Some(Some((kind, after)));
+    }
+
+    /// Whether `node` is quiet still ([`Self::quiet`]).
+    pub(crate) fn is_quiet(&self, node: &MockNode) -> bool {
+        let model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].quiet.is_some()
+    }
+
+    /// A quiet node announces its peak now, and every connection of it
+    /// files it ([`Self::barrier`]).
+    pub(crate) async fn speak(&self, node: &MockNode) {
+        let (generation, told) = {
+            let mut model = self.lock();
+            let index = model.index_of(node);
+            model.speak(index);
+            (model.generation, vec![index])
+        };
+        self.barrier(&told, generation).await;
+    }
+
+    /// `node` made restless: from here, before it serves each header, the
+    /// chain takes a block, which every node not held takes and every one
+    /// not quiet announces, `node` ahead of the header it serves; so a peak
+    /// read before a header request of it and after differ, every time.
+    pub(crate) fn restless(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].restless = true;
+    }
+
     /// Every node's mempool emptied, as a full mempool evicts what pays
     /// least. Eviction takes items out of the mempool and touches nothing
     /// else: the pending and conflict caches keep the bundles put aside in
@@ -1622,9 +1796,19 @@ impl MockChain {
         self.lock().unanswered.clone()
     }
 
-    /// The most coin states (and coin ids) one answer carries.
+    /// The most coin states (and coin ids) one answer carries, a listing's
+    /// and a lookup's by id alike.
     pub(crate) fn set_page_limit(&self, limit: usize) {
-        self.lock().page_limit = limit;
+        let mut model = self.lock();
+        model.page_limit = limit;
+        model.lookup_limit = limit;
+    }
+
+    /// The most ids one lookup by id takes and echoes, a listing's limit
+    /// left as it is: a full node's `max_subscribe_response_items` caps the
+    /// two alike, but a lying peer's listing is capped by nothing.
+    pub(crate) fn set_lookup_limit(&self, limit: usize) {
+        self.lock().lookup_limit = limit;
     }
 }
 
