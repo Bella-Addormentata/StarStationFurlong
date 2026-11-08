@@ -265,6 +265,37 @@ struct Pushed {
     payer: Option<Payer>,
 }
 
+/// A write the lease holds under a hint ([`WalletLease::held_write_under`]):
+/// the coins it is judged by (stage 4 design §4.4), the lease's number for
+/// its spend, the record its coin carries, and the payer filed for the spend
+/// (`None`: none was filed, which is the money address's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldWrite {
+    pub coins: WriteCoins,
+    pub spend: u64,
+    pub record: Vec<u8>,
+    pub payer: Option<Payer>,
+}
+
+impl HeldWrite {
+    /// The write spend number `spend` makes under `hint` with `bundle`, its
+    /// parked inputs `inputs`, or `None` if no spend in the bundle makes a
+    /// coin carrying the hint and a record. Its parent is the coin whose spend
+    /// makes that coin, which the coin names; its parked input is the first
+    /// coin the bundle spends that the lease holds for it: the same coin for
+    /// a write from one coin, the dish coin F for a burner's first write,
+    /// whose parent is the gift g (§4.1).
+    fn of(spend: u64, inputs: &[Bytes32], bundle: &SpendBundle, payer: Option<Payer>, hint: Bytes32) -> Option<HeldWrite> {
+        let (parent, record) = bundle.coin_spends.iter().find_map(|cs| {
+            let run = crate::chia_chain::PuzzleAndSolution { puzzle_reveal: cs.puzzle_reveal.clone(), solution: cs.solution.clone() };
+            let record = crate::chia_resolve::extract_ciphertext(&run, hint).ok().flatten()?;
+            Some((cs.coin.coin_id(), record))
+        })?;
+        let parked = bundle.coin_spends.iter().map(|cs| cs.coin.coin_id()).find(|id| inputs.contains(id))?;
+        Some(HeldWrite { coins: WriteCoins { parent, parked }, spend, record, payer })
+    }
+}
+
 /// Does `bundle` spend a coin at `puzzle_hash`? What
 /// [`WalletLease::parks_spend_at`] asks of each saved bundle.
 fn spends_at(bundle: &SpendBundle, puzzle_hash: Bytes32) -> bool {
@@ -444,8 +475,9 @@ pub static WALLET_LEASE: std::sync::LazyLock<WalletLease> = std::sync::LazyLock:
 /// ([`WalletLease::outgoing_pending`]), as it always was. With them on
 /// (stage 4 design §4.4) it is the spends the wallet's payer `money` pays
 /// for ([`WalletLease::outgoing_pending_for`]), a spend with no payer
-/// recorded among them: the listing's spend from P(e), whose input is a
-/// lobby dish coin, and the beacon's from its own wallet B are not the
+/// recorded among them. What decides is the payer, not the input: the
+/// listing's spends from P(e) (its first write's lobby dish coin, its
+/// rewrites' own coin) and the beacon's from its own wallet B are not the
 /// wallet's, and a GIVE spends the wallet's own free coins, picked under
 /// the lease, so giving never waits on them.
 pub fn wallet_spending(lease: &WalletLease, money: Payer, burners: bool) -> bool {
@@ -719,8 +751,11 @@ impl WalletLease {
     ///
     /// The claim-and-write's writer asks it of the burner it writes for
     /// (`claim_write::burner_write_with`, design §13 row 9): before any
-    /// write, and through [`WalletLease::holds_for`] before a gift; the
-    /// burner writers of row 10 will ask it too. Its second guard is the
+    /// write, and through [`WalletLease::holds_for`] before a gift. The
+    /// listing's writer from P(e) (row 10, [`publish_node_presence_with`])
+    /// is that writer, and asks it of P(e) so, and of the SSF wallet's payer
+    /// as well before P(e)'s first write (`claim_write::BurnerWait::MoneyInFlight`);
+    /// the knock and beacon writers of row 10 will ask it too. Its second guard is the
     /// burner's own puzzle hash, which no payer record can lose: a saved
     /// bundle that spends a coin there ([`WalletLease::parks_spend_at`],
     /// [`WalletLease::holds_spend_at`]), and a 1-mojo coin there that the
@@ -787,6 +822,35 @@ impl WalletLease {
     /// always keeps its bundle, so none is missed.
     pub fn holds_spend_at(&self, puzzle_hash: Bytes32) -> bool {
         self.parks_spend_at(puzzle_hash) || self.settling.lock().unwrap().values().any(|s| spends_at(&s.bundle, puzzle_hash))
+    }
+
+    /// The newest write the lease holds under `hint`, parked with its saved
+    /// bundle or settling: a spend whose bundle makes a coin carrying `hint`
+    /// as its first memo and a record beside it, as every memo write does
+    /// ([`crate::chia_resolve::extract_ciphertext`]). The lease saves a
+    /// spend's bundle and payer in the same write as its parking, before the
+    /// push, and keeps a settling spend's until the chain settles it
+    /// [`crate::chia_knock::SETTLED_DEPTH`] deep, so a write is found here
+    /// for that long whatever became of the mark that filed it
+    /// ([`lost_listing_mark`]). A parked spend whose bundle was not saved is
+    /// not seen, and neither is one the lease has forgotten.
+    pub(crate) fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
+        let mut held: Vec<(u64, Vec<Bytes32>, SpendBundle, Option<Payer>)> = Vec::new();
+        {
+            let pending = self.pending.lock().unwrap();
+            let pushed = self.bundles.lock().unwrap();
+            for (spend, p) in pushed.iter() {
+                let inputs: Vec<Bytes32> = pending.iter().filter(|(_, parked)| parked.spend == *spend).map(|(id, _)| *id).collect();
+                if !inputs.is_empty() {
+                    held.push((*spend, inputs, p.bundle.clone(), p.payer));
+                }
+            }
+        }
+        for (spend, s) in self.settling.lock().unwrap().iter() {
+            held.push((*spend, s.coins.iter().map(|c| c.coin_id).collect(), s.bundle.clone(), s.payer));
+        }
+        held.sort_by_key(|(spend, ..)| std::cmp::Reverse(*spend));
+        held.into_iter().find_map(|(spend, inputs, bundle, payer)| HeldWrite::of(spend, &inputs, &bundle, payer, hint))
     }
 
     /// A gift to our wallet is still landing: the wallet is not empty even
@@ -1655,8 +1719,9 @@ impl std::error::Error for MoneyMemoRefused {}
 /// hooks. The second memo builder, a burner's
 /// (`claim_write::build_burner_bundle`, stage 4 design §4.2), does not ask
 /// it: it signs with a `BurnerKey` alone and has no network check of its
-/// own, and until PR 10 nothing reaches it but behind SSF_CHIA_BURNERS=1 on
-/// a test network (§13 row 9). The heartbeat asks it once
+/// own, and nothing reaches it but behind SSF_CHIA_BURNERS=1 on a test
+/// network: the claim-and-write's self-test hook and, since PR 10b, the
+/// listing written from P(e) (§13 rows 9 and 10). The heartbeat asks it once
 /// at its start, so a mainnet node plans no write that would be refused,
 /// looks up no coin for one, and says why on the Phone Book row.
 pub fn refuse_money_memo(net: crate::chia_network::ChiaNet) -> Result<(), MoneyMemoRefused> {
@@ -1882,7 +1947,10 @@ pub const LATE_GUARD_MARGIN_BLOCKS: u32 = 32;
 /// The Phone Book's words while the era's first listing from a burner key
 /// waits for its slot (T1, stage 4 design §4.3), which falls in the era's
 /// first day ([`crate::chia_burner::SLOT_BLOCKS`]). Last era's listing is
-/// still read then, and the readout shows it listed ([`listing_readout`]).
+/// still read then, and the readout shows it listed ([`listing_readout`])
+/// once the chain has read it back with the live addresses
+/// ([`presence_state_with`]); one the peers accepted but the chain never
+/// showed reads outdated beside these words.
 const LISTING_SLOT_WORDS: &str = "this edition's listing goes out at a random time in its first day";
 /// The words while it waits a late start (T2), at most
 /// [`LATE_START_MAX_BLOCKS`] blocks, about an hour.
@@ -2041,6 +2109,14 @@ impl NodePublishMark {
         self.era == era && self.node_id.as_deref() == Some(node_id) && !self.settled && !self.coin_id.is_empty()
     }
 
+    /// Is this the mark of a void write ([`NodePublishMark::voided`]): no
+    /// coin and no spend to judge, pending from no time at all, never
+    /// confirmed? Nothing of its era stands on chain for it. A mark an older
+    /// node saved names no coin either, but dates its write.
+    pub fn is_void(&self) -> bool {
+        self.coin_id.is_empty() && self.spend.is_none() && self.last_at == 0 && !self.confirmed && !self.chain_seen
+    }
+
     /// The mark after its write is void (the mempool dropped the spend, or it
     /// confirmed outside its era): nothing on chain, so pending from no time
     /// at all, which makes the next write due at once — but the era, its
@@ -2189,6 +2265,17 @@ fn has_last_era_listing(mark: Option<&NodePublishMark>, era: u64, last_hint: &st
     mark.is_some_and(|m| era.checked_sub(1) == Some(m.era) && mark_is_ours(m, last_hint, node_id) && (m.confirmed || m.chain_seen))
 }
 
+/// Does last era's listing still work, as the burner path's failure words
+/// say of it ([`listing_failure_words`], stage 4 design §10)? It does while
+/// the mark on record is that listing ([`has_last_era_listing`]) and it
+/// carries the live address set `sig`, up to the inbound flag a new era
+/// clears ([`sig_without_inbound`]), as the held *listed* readout asks
+/// ([`presence_state_with`]). After a change of address, last era's listing
+/// is still read, but it sends readers to where the station no longer is.
+fn last_week_still_works(mark: Option<&NodePublishMark>, era: u64, last_hint: &str, node_id: &str, sig: &str) -> bool {
+    has_last_era_listing(mark, era, last_hint, node_id) && mark.is_some_and(|m| sig_without_inbound(&m.addrs_sig) == sig_without_inbound(sig))
+}
+
 /// Who paid for a listing, as the hint rule (stage 4 design §8.3) and its
 /// words tell payers apart. A mark names its payer as [`Payer::hex`] text,
 /// which is compared as text and never parsed back.
@@ -2276,6 +2363,22 @@ pub(crate) enum ListingWait {
     Change,
 }
 
+/// What the listing's readout holds the Phone Book's state to
+/// ([`listing_readout`], [`presence_state_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingHold {
+    /// Nothing: the state is the listing on record's own ([`presence_state`]).
+    Nothing,
+    /// Last era's listing stands in for this era's while the era's first
+    /// write from a burner key waits for its slot or its late start (stage 4
+    /// design §4.3, T1 and T2).
+    LastEra,
+    /// The hint rule holds the next write (§8.3), and this era's listing on
+    /// record is void ([`NodePublishMark::is_void`]): no listing of this era
+    /// stands, so it is not *sent*, and none is coming before the next era.
+    Unlanded,
+}
+
 /// The SSF wallet's listing step: [`node_publish_due`] as it always was,
 /// except that the hint rule ([`hint_rule_holds`], §8.3) holds a write due
 /// under a hint this wallet's own listing burner already wrote under this
@@ -2326,6 +2429,82 @@ pub(crate) fn money_path_burner_payer(
     m.payer.as_deref().filter(|p| *p != money)?;
     let root = BurnerRoot::of(&MoneyKey::new(wallet.clone()), net);
     Some(Payer::of_burner(&root.presence(ck, era)).hex())
+}
+
+/// This era's listing as its mark would have filed it, rebuilt from the
+/// write the lease still holds under the era's hint, when the mark on record
+/// does not name it and the hint rule (stage 4 design §8.3) would hold the
+/// listing's next write on it. The heartbeat files it in place of the mark
+/// on record.
+///
+/// The heartbeat files a listing's mark once its push returns, and the lease
+/// parks the write's spend, with its bundle and payer, before the push. A
+/// node that stops between the two, or whose marks file is lost or cannot
+/// be read, keeps the write in its lease (parked, then settling until the
+/// chain settles it [`crate::chia_knock::SETTLED_DEPTH`] deep,
+/// [`WalletLease::held_write_under`]) and an older mark, or none. Started
+/// again on the other path (burner keys turned on or off in the middle of
+/// the era), its next write would go out under the same hint from the
+/// other payer, the link the hint rule is there to prevent, and a wait for
+/// the spend to land would only put that write off. So the lost mark is
+/// filed again: the era, the hint and the payer the lease parked the spend
+/// under (`None` when none was filed, which counts as the SSF wallet's),
+/// the coins, the record's digest and the spend's number, and the address
+/// set, the date and the node id the record itself carries, opened under
+/// `ck` ([`chia_lane::open_v2`]). The era's write count is the floor, 1,
+/// since a lost mark's count is not on chain. The mark's reader then judges
+/// the write as any other ([`presence_step`]), and the hint rule holds the
+/// other payer's write until the next era.
+///
+/// `burner_path`, `money` and `burner` are the hint rule's
+/// ([`hint_rule_holds`]): `burner` gives this wallet's listing burner's
+/// payer text for the rebuilt mark, asked only once a write is found. A
+/// write the rule would not hold on is left alone, so the step is the one
+/// it always was: the burner's own, on the burner path, and the SSF
+/// wallet's on its own path, as on main. Off a test network nothing is
+/// rebuilt; no memo write is made there from the SSF wallet (§4.5) or,
+/// until burner keys reach it, from a burner. A write the lease has
+/// forgotten, or whose bundle was not saved, is not found: a marks file
+/// lost after the chain settled the era's write leaves nothing to rebuild
+/// from here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lost_listing_mark(
+    lease: &WalletLease,
+    mark: Option<&NodePublishMark>,
+    net: crate::chia_network::ChiaNet,
+    ck: &[u8; 32],
+    era: u64,
+    burner_path: bool,
+    money: &str,
+    burner: impl FnOnce(&NodePublishMark) -> Option<String>,
+) -> Option<NodePublishMark> {
+    let hint = Bytes32::new(chia_lane::derive_ck_hint(net, ck, era));
+    let era_hint = hex::encode(hint.to_bytes());
+    if !net.is_test() || mark.is_some_and(|m| m.era == era && m.hint == era_hint) {
+        return None;
+    }
+    let held = lease.held_write_under(hint)?;
+    let plain = chia_lane::open_v2(net, ck, KIND_PRESENCE, era, &held.record).ok()?;
+    let record = chia_lane::decode_presence_v2(&plain, era).ok()?;
+    let found = NodePublishMark {
+        era,
+        writes: 1,
+        addrs_sig: addrs_signature(&record.addrs),
+        last_at: record.issued_at,
+        hint: era_hint,
+        confirmed: false,
+        chain_seen: false,
+        coin_id: hex::encode(held.coins.parent.to_bytes()),
+        memo: hex::encode(crate::chia_resolve::memo_digest(&held.record).to_bytes()),
+        confirmed_height: 0,
+        settled: false,
+        spend: Some(held.spend),
+        node_id: Some(record.node_id.to_string()),
+        parked: hex::encode(held.coins.parked.to_bytes()),
+        payer: held.payer.map(|p| p.hex()),
+    };
+    let burner = burner(&found);
+    hint_rule_holds(Some(&found), era, &found.hint, burner_path, money, burner.as_deref()).map(|_| found)
 }
 
 /// T2's due block (stage 4 design §4.3): `d` blocks after `first_peak`, the
@@ -2567,42 +2746,75 @@ fn listing_wait_words(step: ListingStep, burner_path: bool) -> Option<&'static s
     }
 }
 
+/// The Phone Book's words for a hold (§8.3) while this era's listing on
+/// record is void ([`NodePublishMark::is_void`]): the mempool dropped its
+/// write, or it confirmed outside its era, so it is not in the book, and the
+/// hint rule still keeps this path's payer off the era's hint. Like the
+/// hold's words ([`listing_wait_words`]) they name the class of the payer
+/// that holds it and nothing they have not checked.
+fn unlanded_hold_words(by: PaidBy, burner_path: bool) -> &'static str {
+    match (burner_path, by) {
+        (true, PaidBy::Money) => {
+            "this edition's listing, paid by the SSF wallet, did not make it into the book, and one hint never has two payers: the next edition's listing goes out from its own key"
+        }
+        (true, PaidBy::Burner | PaidBy::Other) => {
+            "this edition's listing, paid by another key, did not make it into the book, and one hint never has two payers: the next edition's listing goes out from its own key"
+        }
+        (false, PaidBy::Money) => {
+            "this edition's listing, paid by the SSF wallet, did not make it into the book, and one hint never has two payers: the SSF wallet writes the next edition's"
+        }
+        (false, PaidBy::Burner | PaidBy::Other) => {
+            "this edition's listing, paid by another key, did not make it into the book, and one hint never has two payers: the SSF wallet writes the next edition's"
+        }
+    }
+}
+
 /// The Phone Book's readout of the listing arm: the one text the readout
-/// gives beside the state, and whether last era's listing still reads as
-/// listed. The text is the first that applies: why no memo can be written on
-/// this network at all (`money_refused`), why the step waits or is held
-/// ([`listing_wait_words`]), the last failed attempt's words
+/// gives beside the state, and what it holds the state to
+/// ([`ListingHold`]). The text is the first that applies: why no memo can
+/// be written on this network at all (`money_refused`), why the step waits
+/// or is held ([`listing_wait_words`], or [`unlanded_hold_words`] for a hold
+/// on a void listing, `void`), the last failed attempt's words
 /// (`node_last_error`), the era's write budget spent although the address
 /// set changed (`budget_spent`), and the lease still holding the spend of a
 /// listing pending past its timeout (`spend_live`). With the SSF wallet
 /// paying (`burner_path` false) and a step that writes or has nothing due,
-/// that is the readout's chain as it always was, word for word.
+/// that is the readout's chain as it always was, word for word, and it holds
+/// nothing.
 ///
-/// Last era's listing reads as listed ([`presence_status_with`]) only on the
+/// Last era's listing reads as listed ([`ListingHold::LastEra`]) only on the
 /// burner path, while the era's first write waits for its slot or its late
 /// start (T1, T2). The step waits for either only when last era's listing is
 /// ours and confirmed or read back ([`has_last_era_listing`]), and readers
 /// still find it then, since they scan the current era and the one before.
 /// Once the write is due, a failing write reads as outdated, with the words
 /// of the failure ([`listing_failure_words`], which say so where last week's
-/// listing still works).
+/// listing still works). A hold by the hint rule on this era's listing on
+/// record that is void (`void`, [`NodePublishMark::is_void`]) reads as
+/// outdated, not sent ([`ListingHold::Unlanded`]): no write of this era
+/// stands, and the hold keeps one from going out before the next era.
 pub(crate) fn listing_readout(
     money_refused: Option<&str>,
     step: ListingStep,
     burner_path: bool,
+    void: bool,
     node_last_error: Option<&str>,
     budget_spent: bool,
     spend_live: bool,
-) -> (Option<String>, bool) {
+) -> (Option<String>, ListingHold) {
     let (budget, live) = if burner_path { (BURNER_BUDGET_SPENT_WORDS, BURNER_SPEND_LIVE_WORDS) } else { (BUDGET_SPENT_WORDS, SPEND_LIVE_WORDS) };
-    let why_not = money_refused
-        .or(listing_wait_words(step, burner_path))
-        .or(node_last_error)
-        .or(budget_spent.then_some(budget))
-        .or(spend_live.then_some(live));
-    let last_era_holds =
-        money_refused.is_none() && burner_path && matches!(step, ListingStep::Wait(ListingWait::Slot | ListingWait::LateStart));
-    (why_not.map(str::to_owned), last_era_holds)
+    let wait = match step {
+        ListingStep::HeldByHint(by) if void => Some(unlanded_hold_words(by, burner_path)),
+        _ => listing_wait_words(step, burner_path),
+    };
+    let why_not = money_refused.or(wait).or(node_last_error).or(budget_spent.then_some(budget)).or(spend_live.then_some(live));
+    let hold = match step {
+        _ if money_refused.is_some() => ListingHold::Nothing,
+        ListingStep::Wait(ListingWait::Slot | ListingWait::LateStart) if burner_path => ListingHold::LastEra,
+        ListingStep::HeldByHint(_) if void => ListingHold::Unlanded,
+        _ => ListingHold::Nothing,
+    };
+    (why_not.map(str::to_owned), hold)
 }
 
 /// The address set a presence record carries: the node's live addresses
@@ -2678,44 +2890,53 @@ pub fn presence_state(
     }
 }
 
-/// 📖 [`presence_state`], with last era's listing standing in for this era's
-/// while the era's first write from a burner key waits (stage 4 design §4.3,
-/// T1 and T2). With `last_era_holds`, which the listing's readout gives only
-/// on the burner path while the step waits for its slot or its late start
-/// ([`listing_readout`]), a mark of ours from the era before that the watcher
-/// read back from the chain (`chain_seen`), with the live address set up to
-/// the inbound flag a new era clears ([`sig_without_inbound`]), is *listed*:
-/// readers scan the current era and the one before, so it is the listing
-/// they find. One the peers accepted but the watcher never read back is not
-/// held: *listed* is the chain's word alone, as it is for this era's.
-/// Anything else is [`presence_state`]'s word, and so is everything with
-/// `last_era_holds` false: with the SSF wallet paying, the readout is as it
-/// always was.
+/// 📖 [`presence_state`], held as the listing's readout says (`hold`,
+/// [`listing_readout`]). With [`ListingHold::LastEra`], which the readout
+/// gives only on the burner path while the era's first write from a burner
+/// key waits for its slot or its late start (stage 4 design §4.3, T1 and
+/// T2), a mark of ours from the era before that the watcher read back from
+/// the chain (`chain_seen`), with the live address set up to the inbound
+/// flag a new era clears ([`sig_without_inbound`]), is *listed*: readers
+/// scan the current era and the one before, so it is the listing they find.
+/// One the peers accepted but the watcher never read back is not held:
+/// *listed* is the chain's word alone, as it is for this era's. With
+/// [`ListingHold::Unlanded`], which the readout gives while the hint rule
+/// holds the next write and this era's listing on record is void, a mark
+/// that would read *sent* is *outdated*: no write of this era stands, and
+/// none is coming before the next era. Anything else is [`presence_state`]'s
+/// word, and so is everything with [`ListingHold::Nothing`], which is all the
+/// readout gives with the SSF wallet paying but under the hint rule after
+/// burner keys were turned off in the middle of an era: there the readout is
+/// as it always was.
 pub fn presence_state_with(
     mark: Option<&NodePublishMark>,
     ours: bool,
     era: Option<u64>,
     addrs_sig: &str,
-    last_era_holds: bool,
+    hold: ListingHold,
 ) -> crate::ChiaPresenceState {
+    use crate::ChiaPresenceState::*;
     match (mark, era) {
         (Some(m), Some(era))
-            if last_era_holds
+            if hold == ListingHold::LastEra
                 && ours
                 && era.checked_sub(1) == Some(m.era)
                 && m.chain_seen
                 && sig_without_inbound(&m.addrs_sig) == sig_without_inbound(addrs_sig) =>
         {
-            crate::ChiaPresenceState::Listed
+            Listed
         }
-        _ => presence_state(mark, ours, era, addrs_sig),
+        _ => match (hold, presence_state(mark, ours, era, addrs_sig)) {
+            (ListingHold::Unlanded, Sent) => Outdated,
+            (_, state) => state,
+        },
     }
 }
 
-/// 📖 [`presence_status_with`] with last era's listing never standing in for
-/// this era's: the readout as it was before burner keys, which the SSF
-/// wallet's path still gives. Only the tests call it, to pin that readout
-/// and that the hold changes nothing else.
+/// 📖 [`presence_status_with`] holding nothing ([`ListingHold::Nothing`]):
+/// the readout as it was before burner keys, which the SSF wallet's path
+/// still gives. Only the tests call it, to pin that readout and that a hold
+/// changes nothing else.
 #[cfg(test)]
 pub fn presence_status(
     mark: Option<&NodePublishMark>,
@@ -2726,7 +2947,7 @@ pub fn presence_status(
     public_addrs: usize,
     error: Option<&str>,
 ) -> crate::ChiaPresence {
-    presence_status_with(mark, hint, node_id, era, addrs_sig, public_addrs, error, false)
+    presence_status_with(mark, hint, node_id, era, addrs_sig, public_addrs, error, ListingHold::Nothing)
 }
 
 /// 📖 The whole readout the fingerprint carries ([`crate::ChiaPresence`]):
@@ -2737,14 +2958,16 @@ pub fn presence_status(
 /// listing the grey book stands for. `error` is the last failed attempt's
 /// text, or why nothing can be written right now ([`listing_readout`]).
 ///
-/// On the burner path, with `last_era_holds`, last era's listing read back
-/// from the chain is *listed* while this era's waits for its slot or its
-/// late start (stage 4 design §4.3). That listing is ours by its signer, as
-/// any listing of an era before the agreed one is, and the figures are its
-/// own: `listed_era` is the era before, `confirmed` is the chain's read, and
-/// `current` holds, since it is the listing in force. With `last_era_holds`
-/// false the readout is the one it always was, word for word
-/// ([`presence_state`]'s state).
+/// On the burner path, with [`ListingHold::LastEra`], last era's listing
+/// read back from the chain is *listed* while this era's waits for its slot
+/// or its late start (stage 4 design §4.3). That listing is ours by its
+/// signer, as any listing of an era before the agreed one is, and the
+/// figures are its own: `listed_era` is the era before, `confirmed` is the
+/// chain's read, and `current` holds, since it is the listing in force. With
+/// [`ListingHold::Unlanded`] a void listing of this era held by the hint
+/// rule is *outdated*, and not `current`. With [`ListingHold::Nothing`] the
+/// readout is the one it always was, word for word ([`presence_state`]'s
+/// state).
 #[allow(clippy::too_many_arguments)]
 pub fn presence_status_with(
     mark: Option<&NodePublishMark>,
@@ -2754,13 +2977,13 @@ pub fn presence_status_with(
     addrs_sig: &str,
     public_addrs: usize,
     error: Option<&str>,
-    last_era_holds: bool,
+    hold: ListingHold,
 ) -> crate::ChiaPresence {
     let ours = mark.is_some_and(|m| match (hint, era) {
         (Some(h), Some(e)) if m.era == e => mark_is_ours(m, h, node_id),
         _ => m.node_id.as_deref() == Some(node_id),
     });
-    let state = presence_state_with(mark, ours, era, addrs_sig, last_era_holds);
+    let state = presence_state_with(mark, ours, era, addrs_sig, hold);
     let on_record = mark.filter(|_| ours);
     crate::ChiaPresence {
         state,
@@ -2844,10 +3067,15 @@ pub(crate) async fn publish_node_presence_on(
 ///
 /// `money` is the SSF wallet's payer ([`Payer::of`] its key). While the lease
 /// parks a spend it pays for, the era's first write from P(e) waits
-/// (`claim_write::BurnerWait::MoneyInFlight`): that spend could be this
-/// era's listing, pushed by the SSF wallet just before a restart that never
-/// saved its mark, and P(e)'s write beside it would put two payers under
-/// one hint (§8.3). A rewrite from P(e)'s own coin does not wait on it.
+/// (`claim_write::BurnerWait::MoneyInFlight`), and goes out once that spend
+/// lands; a rewrite from P(e)'s own coin does not wait on it. The wait does
+/// not decide the hint: a spend in flight that is this era's listing,
+/// pushed by the SSF wallet just before a restart that never saved its
+/// mark, would still have P(e) write beside it once it lands, two payers
+/// under one hint (§8.3). The heartbeat keeps that from happening before it
+/// asks for a write, by filing the lost mark again from the write the lease
+/// holds under the hint ([`lost_listing_mark`]), on which the hint rule
+/// holds the step ([`burner_listing_step`]).
 #[allow(clippy::too_many_arguments)]
 async fn publish_node_presence_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -4240,6 +4468,27 @@ pub async fn heartbeat_loop(
             let inbound = hub.inbound_verified.lock().unwrap().clone();
             let entries = public_addr_entries(&addrs, &inbound, peak, now_unix);
             let sig = addrs_signature(&entries);
+            // This era's listing, written by the other path's payer before a
+            // restart that lost its mark, filed again from the write the
+            // lease still holds under the era's hint ([`lost_listing_mark`]),
+            // so that the hint rule (§8.3) holds this path's write for the
+            // rest of the era. The write is found parked or settling alike.
+            // The line names no payer.
+            if let Some(era) = era_now {
+                let found = lost_listing_mark(&WALLET_LEASE, node_mark.as_ref(), net, &hub.contact_key, era, listing_root.is_some(), &money_payer, |m| match &listing_root {
+                    Some(root) => Some(listing_clock.burner_payer(root, &hub.contact_key, era, &m.hint)),
+                    None => money_path_burner_payer(Some(m), era, &m.hint, &money_payer, net, &chia_sk, &hub.contact_key),
+                });
+                if let Some(mark) = found {
+                    println!(
+                        "⛓️ ChiaHub presence: the wallet lease still holds the era {era} listing, written before a restart that lost its mark — filed again; one hint never has two payers, so this edition's listing stays as it is"
+                    );
+                    if let Err(e) = mark.save(mark_path) {
+                        eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
+                    }
+                    node_mark = Some(mark);
+                }
+            }
             // The listing's spend still on the lease (its input parked, or
             // included and settling): live, so the clock's retry writes
             // nothing beside it ([`node_publish_due`]). Read after the lookup
@@ -4259,7 +4508,8 @@ pub async fn heartbeat_loop(
             // What the listing arm does this tick ([`ListingStep`]), for the
             // write below and the Phone Book's readout. Nothing is due
             // inside the era guard or with no era agreed, where the readout
-            // is the one it always was.
+            // gives no wait words and holds no listing ([`listing_readout`]):
+            // with the SSF wallet paying, the one it always was.
             let mut step = ListingStep::Idle;
             let mut spent_this_tick = false;
             if peak > 0 && era_guard(peak) {
@@ -4293,8 +4543,12 @@ pub async fn heartbeat_loop(
                     ),
                     // The SSF wallet's clock, as on main, save the hint rule
                     // after a listing this wallet's own P(e) paid for this
-                    // era (the flag turned off mid-era), the one case in
-                    // which this wallet's P(e) is derived here.
+                    // era (the flag turned off mid-era). This wallet's P(e)
+                    // is derived here only for a mark of this era under this
+                    // hint whose payer is neither none nor the SSF wallet's
+                    // ([`money_path_burner_payer`]): its own P(e)'s, or
+                    // another wallet's after a swap mid-era, which the
+                    // text then tells apart.
                     None => money_listing_step(
                         node_mark.as_ref(),
                         era,
@@ -4346,9 +4600,11 @@ pub async fn heartbeat_loop(
                             node_last_error = Some(match &listing_root {
                                 // §10's words. Last week's listing still works
                                 // only while the mark on record is last era's
-                                // listing of ours: once this era's is written,
-                                // the file no longer says.
-                                Some(_) => listing_failure_words(&e, has_last_era_listing(node_mark.as_ref(), era, &last_hint, &self_id)),
+                                // listing of ours with the live addresses:
+                                // once this era's is written, the file no
+                                // longer says, and after a change of address
+                                // it sends readers to the old ones.
+                                Some(_) => listing_failure_words(&e, last_week_still_works(node_mark.as_ref(), era, &last_hint, &self_id, &sig)),
                                 None => format!("{e:#}"),
                             });
                         }
@@ -4373,11 +4629,15 @@ pub async fn heartbeat_loop(
                 && era_now.is_some_and(|era| {
                     node_mark.as_ref().is_some_and(|m| m.era == era && !m.confirmed && now_unix.saturating_sub(m.last_at) >= PRESENCE_CONFIRM_TIMEOUT_SECS)
                 });
+            // This era's listing on record is void: its write was dropped,
+            // or it confirmed outside its era. Under a hold by the hint rule
+            // it reads outdated (§8.3).
+            let void = era_now.is_some_and(|era| node_mark.as_ref().is_some_and(|m| m.era == era && m.is_void()));
             // The text and the held state come from the listing's readout
             // ([`listing_readout`]): with the SSF wallet paying, the chain as
             // it always was.
-            let (why_not, last_era_holds) =
-                listing_readout(money_refused.as_deref(), step, listing_root.is_some(), node_last_error.as_deref(), budget_spent, spend_live);
+            let (why_not, hold) =
+                listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live);
             let status = presence_status_with(
                 node_mark.as_ref(),
                 hint_now.as_deref(),
@@ -4386,7 +4646,7 @@ pub async fn heartbeat_loop(
                 &sig,
                 entries.len(),
                 why_not.as_deref(),
-                last_era_holds,
+                hold,
             );
             *hub.presence_status.lock().unwrap() = Some(status);
             if spent_this_tick {
@@ -5204,6 +5464,61 @@ mod tests {
         assert!(clock.change.is_none(), "…and the clock forgotten");
     }
 
+    /// T3's clock belongs to its era (stage 4 design §4.3): a change still
+    /// waiting its jitter as an era ends is not carried into the next. At a
+    /// tick of the new era the mark is last era's listing, and the same
+    /// changed set is a change before the slot, drawn again from that tick,
+    /// so it does not go out on the old era's draw.
+    #[test]
+    fn a_change_still_waiting_its_jitter_as_the_edition_ends_is_drawn_again_in_the_next() {
+        let g = Gates::new();
+        let e = g.era_with_slots(8, 100);
+        let (old, new) = ("198.51.100.7:4444/0", "203.0.113.9:4444/0");
+        let mark = g.mark(e, old, GATE_NOW, Some(g.burner(e)));
+        let p = block(e, u64::from(ERA_BLOCKS - ERA_GUARD_BLOCKS) - 3);
+        let due = GATE_NOW + ADDR_CHANGE_DEBOUNCE_SECS;
+        let left = u32::try_from(era_start(e + 1) - u64::from(p)).unwrap();
+        let seed = (0..200u64)
+            .find(|&s| {
+                let mut clock = ListingClock::default();
+                g.step(&mut clock, Some(&mark), p, due, new, &mut seeded(s));
+                clock.change.is_some_and(|c| c.jitter > left)
+            })
+            .expect("a jitter that outlasts the era");
+        let mut clock = ListingClock::default();
+        assert_eq!(g.step(&mut clock, Some(&mark), p, due, new, &mut seeded(seed)), ListingStep::Wait(ListingWait::Change), "drawn, and waiting as the era ends");
+        let j = clock.change.as_ref().map(|c| c.jitter).unwrap();
+        let q = block(e + 1, 40);
+        assert!(u64::from(q) >= u64::from(p) + u64::from(j), "the old draw would be due by then");
+        let step = g.step(&mut clock, Some(&mark), q, due + 3600, new, &mut seeded(seed + 1));
+        let seen = clock.change.as_ref().expect("the change is due: a jitter is drawn");
+        assert_eq!((seen.era, seen.due_peak), (e + 1, q), "the new era's own draw, from its own tick");
+        assert_eq!(step, if seen.jitter == 0 { ListingStep::Write } else { ListingStep::Wait(ListingWait::Change) });
+    }
+
+    /// Stage 4 design §10: the burner path's failure words say that last
+    /// week's listing still works only while the mark on record is last
+    /// era's listing of ours, confirmed or read back, with the live address
+    /// set, the inbound flag a new era clears aside. After a change of
+    /// address that listing is still read, but it sends readers to the old
+    /// addresses.
+    #[test]
+    fn last_weeks_listing_still_works_only_while_it_carries_the_live_addresses() {
+        let g = Gates::new();
+        let e = 8;
+        let (sig, cleared, moved) = ("198.51.100.7:4444/1", "198.51.100.7:4444/0", "203.0.113.9:4444/0");
+        let last_hint = g.hint(e - 1);
+        let last = g.mark(e - 1, sig, GATE_NOW - 3600, Some(g.burner(e - 1)));
+        let works = |mark: &NodePublishMark, live: &str| last_week_still_works(Some(mark), e, &last_hint, GATE_NODE, live);
+        assert!(works(&last, sig), "the same set");
+        assert!(works(&last, cleared), "the inbound flag the new era cleared");
+        assert!(!works(&last, moved), "a changed set: it sends readers to the old address");
+        assert!(has_last_era_listing(Some(&last), e, &last_hint, GATE_NODE), "though it is still last era's listing");
+        assert!(!works(&NodePublishMark { confirmed: false, chain_seen: false, ..last.clone() }, sig), "never confirmed nor read back");
+        assert!(!works(&g.mark(e, sig, GATE_NOW, Some(g.burner(e))), sig), "this era's listing on record");
+        assert!(!last_week_still_works(None, e, &last_hint, GATE_NODE, sig), "nothing on record");
+    }
+
     /// Before the era's first write, last era's address set and the live one
     /// are compared with the inbound flag cleared (stage 4 design §4.3): the
     /// flag the new era cleared is no change, and the slot decides. A real
@@ -5229,8 +5544,18 @@ mod tests {
         assert_eq!(clock.change.as_ref().map(|c| (c.due_peak, c.jitter)), Some((p, j)), "the flag on again on the changed set: the same change");
         assert_eq!(g.step(&mut clock, Some(&last), p + j, GATE_NOW + 120, moved, &mut rng), ListingStep::Write, "after its jitter");
         assert!(u64::from(p + j) < era_start(e) + slot, "well before the slot");
+        // Last era's write ten minutes less a minute ago: the change waits
+        // the rest of the debounce, counted from that write, before any
+        // jitter is drawn, at a peak past every jitter as well.
         let recent = NodePublishMark { last_at: GATE_NOW - 60, ..last.clone() };
-        assert_eq!(g.step(&mut ListingClock::default(), Some(&recent), p, GATE_NOW, moved, &mut rng), ListingStep::Wait(ListingWait::Change), "inside the debounce");
+        let mut clock = ListingClock::default();
+        assert_eq!(g.step(&mut clock, Some(&recent), p, GATE_NOW, moved, &mut rng), ListingStep::Wait(ListingWait::Change), "inside the debounce");
+        assert!(clock.change.is_none(), "no jitter is drawn inside the debounce");
+        let later = p + CHANGE_JITTER_MAX_BLOCKS + 1;
+        assert_eq!(g.step(&mut clock, Some(&recent), later, GATE_NOW + ADDR_CHANGE_DEBOUNCE_SECS - 61, moved, &mut rng), ListingStep::Wait(ListingWait::Change), "still inside it");
+        assert!(clock.change.is_none());
+        g.step(&mut clock, Some(&recent), later, GATE_NOW + ADDR_CHANGE_DEBOUNCE_SECS - 60, moved, &mut rng);
+        assert_eq!(clock.change.as_ref().map(|c| c.due_peak), Some(later), "due once the debounce has passed, drawn there");
     }
 
     /// Stage 4 design §12, Migration: a listing of this era that the SSF
@@ -5362,7 +5687,9 @@ mod tests {
         let recent = g.mark(e - 1, old, GATE_NOW - 60, Some(g.burner(e - 1)));
         let mut clock = ListingClock::default();
         assert_eq!(g.step(&mut clock, Some(&recent), block(e, slot - 1), GATE_NOW, new, &mut rng), ListingStep::Wait(ListingWait::Change), "a change inside its debounce");
+        assert!(clock.change.is_none(), "no jitter is drawn inside the debounce");
         assert_eq!(g.step(&mut clock, Some(&recent), block(e, slot), GATE_NOW + 60, new, &mut rng), ListingStep::Write, "the slot comes first");
+        assert!(clock.change.is_none(), "…and still none drawn");
     }
 
     /// The era's listing burner's payer text is derived once an era and
@@ -5521,32 +5848,55 @@ mod tests {
         for refused in [None, Some("no memo spend from the SSF wallet here")] {
             for error in [None, Some("push_tx rejected")] {
                 for (budget, live) in [(false, false), (true, false), (false, true), (true, true)] {
-                    for step in [Write, Idle] {
-                        assert_eq!(listing_readout(refused, step, false, error, budget, live), (main(refused, error, budget, live), false), "{refused:?} {error:?} {budget} {live} {step:?}");
+                    for (step, void) in [(Write, false), (Idle, false), (Write, true), (Idle, true)] {
+                        assert_eq!(
+                            listing_readout(refused, step, false, void, error, budget, live),
+                            (main(refused, error, budget, live), ListingHold::Nothing),
+                            "{refused:?} {error:?} {budget} {live} {step:?} {void}"
+                        );
                     }
                 }
             }
         }
         let held = HeldByHint(PaidBy::Burner);
         let held_words = listing_wait_words(held, false).map(str::to_owned);
-        assert_eq!(listing_readout(None, held, false, Some("push_tx rejected"), true, true), (held_words, false), "the SSF wallet held: its words first");
-        assert_eq!(listing_readout(Some("refused"), held, false, None, false, false), (Some("refused".into()), false), "…after a refusal");
+        assert_eq!(listing_readout(None, held, false, false, Some("push_tx rejected"), true, true), (held_words, ListingHold::Nothing), "the SSF wallet held: its words first");
+        assert_eq!(listing_readout(Some("refused"), held, false, false, None, false, false), (Some("refused".into()), ListingHold::Nothing), "…after a refusal");
 
         for (step, words, holds) in [
             (Wait(ListingWait::Slot), LISTING_SLOT_WORDS, true),
             (Wait(ListingWait::LateStart), LISTING_LATE_WORDS, true),
             (Wait(ListingWait::Change), LISTING_CHANGE_WORDS, false),
         ] {
-            assert_eq!(listing_readout(None, step, true, Some("push_tx rejected"), true, true), (Some(words.into()), holds), "{step:?}");
-            assert_eq!(listing_readout(Some("refused"), step, true, None, false, false), (Some("refused".into()), false), "{step:?} after a refusal");
+            let hold = if holds { ListingHold::LastEra } else { ListingHold::Nothing };
+            for void in [false, true] {
+                assert_eq!(listing_readout(None, step, true, void, Some("push_tx rejected"), true, true), (Some(words.into()), hold), "{step:?} {void}");
+                assert_eq!(listing_readout(Some("refused"), step, true, void, None, false, false), (Some("refused".into()), ListingHold::Nothing), "{step:?} after a refusal");
+            }
         }
         let burner_held = HeldByHint(PaidBy::Money);
-        assert_eq!(listing_readout(None, burner_held, true, None, false, false), (listing_wait_words(burner_held, true).map(str::to_owned), false));
+        assert_eq!(listing_readout(None, burner_held, true, false, None, false, false), (listing_wait_words(burner_held, true).map(str::to_owned), ListingHold::Nothing));
         for step in [Write, Idle] {
-            assert_eq!(listing_readout(None, step, true, Some("push_tx rejected"), true, true), (Some("push_tx rejected".into()), false), "{step:?}");
-            assert_eq!(listing_readout(None, step, true, None, true, true), (Some(BURNER_BUDGET_SPENT_WORDS.into()), false), "{step:?}");
-            assert_eq!(listing_readout(None, step, true, None, false, true), (Some(BURNER_SPEND_LIVE_WORDS.into()), false), "{step:?}");
-            assert_eq!(listing_readout(None, step, true, None, false, false), (None, false), "{step:?}");
+            assert_eq!(listing_readout(None, step, true, false, Some("push_tx rejected"), true, true), (Some("push_tx rejected".into()), ListingHold::Nothing), "{step:?}");
+            assert_eq!(listing_readout(None, step, true, false, None, true, true), (Some(BURNER_BUDGET_SPENT_WORDS.into()), ListingHold::Nothing), "{step:?}");
+            assert_eq!(listing_readout(None, step, true, false, None, false, true), (Some(BURNER_SPEND_LIVE_WORDS.into()), ListingHold::Nothing), "{step:?}");
+            assert_eq!(listing_readout(None, step, true, true, None, false, false), (None, ListingHold::Nothing), "{step:?}");
+        }
+
+        // A hold on a void listing of this era: its own words, which claim
+        // nothing stays, and the state held to outdated (§8.3).
+        for (burner_path, by) in [(true, PaidBy::Money), (true, PaidBy::Other), (false, PaidBy::Burner), (false, PaidBy::Other)] {
+            let held = HeldByHint(by);
+            let words = unlanded_hold_words(by, burner_path);
+            assert!(words.contains("did not make it into the book") && !words.contains("stays as it is"), "{words}");
+            assert_eq!(words.contains("paid by the SSF wallet"), by == PaidBy::Money, "{words}");
+            assert_eq!(
+                listing_readout(None, held, burner_path, true, Some("push_tx rejected"), true, true),
+                (Some(words.into()), ListingHold::Unlanded),
+                "{burner_path} {by:?}"
+            );
+            assert_eq!(listing_readout(None, held, burner_path, false, None, false, false), (listing_wait_words(held, burner_path).map(str::to_owned), ListingHold::Nothing));
+            assert_eq!(listing_readout(Some("refused"), held, burner_path, true, None, false, false), (Some("refused".into()), ListingHold::Nothing), "after a refusal");
         }
     }
 
@@ -5633,7 +5983,7 @@ mod tests {
             ..NodePublishMark::default()
         };
         let busy = Some("the chain is busy");
-        let held = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, true);
+        let held = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, ListingHold::LastEra);
         assert_eq!(
             held,
             crate::ChiaPresence {
@@ -5648,11 +5998,11 @@ mod tests {
             },
             "last edition's listing is the one in force, and the text beside it is carried as given"
         );
-        let unheld = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, false);
+        let unheld = presence_status_with(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy, ListingHold::Nothing);
         assert_eq!((unheld.state, unheld.listed_era, unheld.confirmed, unheld.current), (Outdated, 7, true, false), "no hold: last edition's listing is stale");
         assert_eq!(unheld, presence_status(Some(&last), Some("h8"), "n", Some(8), "a:1/0", 2, busy), "no hold: the readout as it always was");
-        assert_eq!(presence_state_with(Some(&last), false, Some(8), "a:1/0", true), Unlisted, "a mark that is not ours is held for nobody");
-        assert_eq!(presence_state_with(None, false, Some(8), "a:1/0", true), Unlisted, "nothing on record");
+        assert_eq!(presence_state_with(Some(&last), false, Some(8), "a:1/0", ListingHold::LastEra), Unlisted, "a mark that is not ours is held for nobody");
+        assert_eq!(presence_state_with(None, false, Some(8), "a:1/0", ListingHold::LastEra), Unlisted, "nothing on record");
 
         let accepted = NodePublishMark { chain_seen: false, ..last.clone() };
         let pending = NodePublishMark { confirmed: false, chain_seen: false, ..last.clone() };
@@ -5672,15 +6022,50 @@ mod tests {
             (&sent, "n", Some(8), "a:1/0", Sent, "this edition's own listing is judged as always"),
         ] {
             let hint = era.map(|e| format!("h{e}"));
-            let status = presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, true);
+            let status = presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, ListingHold::LastEra);
             assert_eq!(status.state, want, "{why}");
             assert_eq!(status.current, matches!(want, Listed | Sent), "{why}");
             assert_eq!(
-                presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, false),
+                presence_status_with(Some(mark), hint.as_deref(), node, era, sig, 2, None, ListingHold::Nothing),
                 presence_status(Some(mark), hint.as_deref(), node, era, sig, 2, None),
                 "{why}: no hold, the readout as it always was"
             );
         }
+    }
+
+    /// 📖 Stage 4 design §8.3: a void listing of this era that the hint rule
+    /// holds reads as outdated, not sent, since no write of the era stands
+    /// and none is coming before the next era; its figures are its own.
+    /// Without the hold it reads sent, as it always did, and the hold
+    /// changes no state but *sent*. A mark an older node saved, which names
+    /// no coin but dates its write, is not void.
+    #[test]
+    fn a_void_listing_held_by_the_hint_rule_reads_outdated_not_sent() {
+        use crate::ChiaPresenceState::*;
+        let written = NodePublishMark {
+            era: 8,
+            writes: 1,
+            addrs_sig: "a:1/0".into(),
+            last_at: 1_791_700_000,
+            hint: "h8".into(),
+            coin_id: "11".repeat(32),
+            spend: Some(3),
+            node_id: Some("n".into()),
+            payer: Some("the SSF wallet's".into()),
+            ..NodePublishMark::default()
+        };
+        let void = written.voided();
+        assert!(void.is_void() && !written.is_void());
+        assert!(!NodePublishMark { coin_id: String::new(), spend: None, ..written.clone() }.is_void(), "an older node's mark dates its write");
+        let held = presence_status_with(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None, ListingHold::Unlanded);
+        assert_eq!((held.state, held.current, held.listed_era, held.confirmed), (Outdated, false, 8, false), "{held:?}");
+        let unheld = presence_status_with(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None, ListingHold::Nothing);
+        assert_eq!((unheld.state, unheld.current), (Sent, true), "no hold: sent, as always");
+        assert_eq!(unheld, presence_status(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None));
+        let seen = NodePublishMark { confirmed: true, chain_seen: true, ..written.clone() };
+        assert_eq!(presence_state_with(Some(&seen), true, Some(8), "a:1/0", ListingHold::Unlanded), Listed, "only sent is changed");
+        assert_eq!(presence_state_with(Some(&void), true, Some(8), "b:2/0", ListingHold::Unlanded), Outdated);
+        assert_eq!(presence_state_with(Some(&void), false, Some(8), "a:1/0", ListingHold::Unlanded), Unlisted);
     }
 
     /// 📖 The listing the Phone Book's icon stands on follows the chain's word
@@ -8009,7 +8394,7 @@ mod tests {
     /// whichever of them pays (the money key, or the beacon key made from
     /// it). The burner builder, `claim_write::build_burner_bundle`, signs
     /// with a burner key alone and has no such refusal: its callers' gate is
-    /// SSF_CHIA_BURNERS on a test network until PR 10. A test network builds
+    /// SSF_CHIA_BURNERS on a test network (§13 rows 9 and 10). A test network builds
     /// the spend as before. The refusal says why in the player's words, and
     /// the log line names every write that stops.
     #[test]

@@ -361,11 +361,16 @@ pub enum BurnerWait {
     NoCoinReady,
     /// The burner holds no coin, and the lease still parks a spend paid for
     /// by the payer its writer was given to wait on: the SSF wallet, for the
-    /// listing (§8.3). Until that spend lands it could be this era's listing,
-    /// written by the SSF wallet under the same hint before a restart that
-    /// lost its mark, and the burner's first write beside it would put two
-    /// payers under one hint, so the burner is not funded beside it. A
-    /// rewrite, from the burner's own coin, never waits so.
+    /// listing (§8.3, the crash window). The burner is not funded beside a
+    /// spend of that payer's in flight, and its first write goes out once
+    /// the spend lands. The wait alone does not keep one hint to one payer:
+    /// if the spend is this era's listing, written by the SSF wallet under
+    /// the same hint before a restart that lost its mark, it puts the
+    /// burner's write off and no more. What holds the burner then is the
+    /// listing's mark, which the heartbeat files again from the write the
+    /// lease holds under the hint (`chia_publish::lost_listing_mark`), and
+    /// the hint rule it brings. A rewrite, from the burner's own coin, never
+    /// waits so.
     MoneyInFlight,
     /// The fuse is blown: the lobby dish gave this node's burners
     /// [`MAX_GIFTS_PER_ERA`] gifts in `era`, the era the fuse counted them
@@ -664,11 +669,13 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 ///   that `money` pays for, when the caller names one
 ///   ([`BurnerWait::MoneyInFlight`], [`WalletLease::outgoing_pending_for`]),
 ///   and not past the fuse ([`BurnerWait::FuseBlown`]). The listing names
-///   the SSF wallet's payer there (§8.3, the crash window): until that
-///   spend lands it could be this era's listing, which the SSF wallet wrote
-///   under the same hint before a restart lost its mark. A rewrite never
-///   waits on it, since the burner then already holds the coin its first
-///   write under the hint made. A gift the fuse counted for the burner is
+///   the SSF wallet's payer there (§8.3, the crash window). The writer does
+///   not read the hint a parked spend writes under, so the wait only puts
+///   the burner's write off until that spend lands; the listing's hint rule
+///   is its caller's, on the listing's mark (`chia_publish::hint_rule_holds`,
+///   with a lost mark filed again by `chia_publish::lost_listing_mark`). A
+///   rewrite never waits on it, since the burner then already holds the coin
+///   its first write under the hint made. A gift the fuse counted for the burner is
 ///   given back first if the chain shows the burner never held a coin of
 ///   the gift's 1 mojo, so its bundle died ([`never_held_a_coin`],
 ///   [`GiftFuse::refund`]); one that landed stays counted, and a stray of

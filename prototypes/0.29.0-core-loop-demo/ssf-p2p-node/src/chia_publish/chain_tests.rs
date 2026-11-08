@@ -52,7 +52,11 @@
 //! did not write the era's listing, judged by the listing steps on the marks
 //! the two seams file and their reader confirms
 //! (`a_burner_rewrite_after_a_money_paid_listing_of_this_era_is_held_by_the_hint_rule`,
-//! `a_money_rewrite_after_a_burner_paid_listing_of_this_era_is_held_by_the_hint_rule`).
+//! `a_money_rewrite_after_a_burner_paid_listing_of_this_era_is_held_by_the_hint_rule`),
+//! and on a mark a restart lost, filed again from the write the lease
+//! still holds under the hint ([`lost_listing_mark`]), in either direction
+//! (`a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_filed_again_and_holds_the_burner`,
+//! `a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_holds_the_ssf_wallet`).
 //! The other wait and refusal words the listing gives are pinned beside
 //! [`listing_failure_words`]; the tests here show that the words for each
 //! failure the chain gives name no burner's puzzle hash or address.
@@ -2727,6 +2731,7 @@ async fn a_burner_rewrite_after_a_money_paid_listing_of_this_era_is_held_by_the_
     }
     let mut clock = ListingClock::default();
     assert_eq!(burner_step(&mut clock, &w, Some(&mark), &node, (start, at + 1, &moved), &mut rng), ListingStep::Wait(ListingWait::Change), "inside the debounce");
+    assert!(clock.change.is_none(), "no jitter is drawn inside the debounce, counted from W's write");
     // Past the debounce the change is due, and its jitter is drawn here.
     burner_step(&mut clock, &w, Some(&mark), &node, (start + 1, debounced, &moved), &mut rng);
     let jittered = start + 1 + CHANGE_JITTER_MAX_BLOCKS;
@@ -2951,64 +2956,188 @@ async fn a_listing_on_a_root_of_another_network_is_refused_and_sends_nothing() {
     assert!(s.chain.unanswered().is_empty());
 }
 
-/// Stage 4 design §8.3, the crash window: wallet W's listing for era 0 goes
-/// out through the money writer's own seam, and the node stops before its
-/// mark is saved. It restarts with burner keys on, its lease restored from
-/// the file with W's spend still parked, live in the mempools, and no mark
-/// of the era. The listing's first write from W's listing burner P(0) then
-/// waits while that spend is in flight (`BurnerWait::MoneyInFlight`), a wait
-/// and not a failure: nothing new is sent, since the reconciliation's probe
+/// Stage 4 design §8.3, the crash window's wait, and §4.4, per payer: a
+/// spend the SSF wallet W pays for is in flight, here a knock of W's under
+/// another hint, live in the mempools, and the listing's first write from
+/// W's listing burner P(0) waits (`BurnerWait::MoneyInFlight`), a wait and
+/// not a failure: nothing new is sent, since the reconciliation's probe
 /// pushes W's own bundle again, no lobby coin is parked and no gift is
 /// counted. The Phone Book says the listing goes out once that spend lands,
 /// and neither its words nor the log's text names P(0). Once W's spend
-/// lands, P(0)'s first write goes out under the same hint. A later spend of
-/// W's in flight, such as a knock, holds no rewrite from P(0)'s own coin.
+/// lands, P(0)'s first write goes out. The wait is the SSF wallet's alone:
+/// a live claim and write of another burner holds no wallet's first write,
+/// and a later spend of W's in flight holds no rewrite from P(0)'s own
+/// coin. A spend in flight that is this era's listing does not end with the
+/// wait: the next tests show its lost mark filed again, holding P(0) for the
+/// era.
 #[tokio::test]
 async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_in_flight_and_goes_out_once_it_lands() {
     let mut s = setup().await;
-    let dir = Dir::new("crash-window");
-    let path = dir.0.join("wallet_lease.json");
-    let (w, node) = (wallet(68), iroh::SecretKey::generate());
+    let (w, v, node) = (wallet(68), wallet(69), iroh::SecretKey::generate());
     let key = burner(68, 0);
-    s.chain.fund(our_puzzle_hash(&w), 1000, None);
-    let (f, _) = ready_dish(&s, 1).await;
-    s.lease = WalletLease::new();
-    restore(&s.lease, &path, &w);
-    let at = unix_now();
-    let (hint, _) = s.money_listing(&w, &node, 0, &entries(), at).await.unwrap();
-    let money = s.chain.received().last().cloned().expect("W's listing was sent");
+    let (dish, _) = ready_dishes(&s, &[1, 1, 1]).await;
 
-    s.lease = WalletLease::new();
-    restore(&s.lease, &path, &w);
-    assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's spend restored, parked");
-    let held = s.listing(&w, &node, 0, &entries(), at, 1).await.map(|(_, write)| write);
+    // Another burner's claim and write, live: wallet V's first listing
+    // write is not held by it.
+    let stranger = burner(98, 0);
+    s.burner_write(&stranger, 0, Bytes32::new([0x5d; 32]), None, |_| Ok(b"another burner's record, live".to_vec()), 1).await.unwrap();
+    let theirs = s.chain.received().last().cloned().expect("the other burner's write was sent");
+    assert_eq!(s.chain.mempool(), vec![theirs.name()]);
+    assert!(s.lease.outgoing_pending_for(Payer::of_burner(&stranger)) && !s.lease.outgoing_pending_for(Payer::of(&v)));
+    let (_, vs) = s.listing(&v, &node, 0, &entries(), unix_now(), 2).await.expect("not held by another payer's spend");
+    assert_eq!(vs.payer, Payer::of_burner(&burner(69, 0)), "V's P(0) writes");
+    let v_listing = s.chain.received().last().cloned().expect("V's listing was sent");
+    s.chain.farm().await;
+
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let funded = s.chain.farm().await;
+    let knock = our_memo(&w, coin, Bytes32::new([0x5b; 32]), b"a knock of W's, in flight".to_vec());
+    s.push(&w, &knock, (coin.coin_id(), funded)).await.unwrap();
+    assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock parked, live");
+    let at = unix_now();
+    let held = s.listing(&w, &node, 0, &entries(), at, 3).await.map(|(_, write)| write);
     assert_eq!(waited(&held), Some(BurnerWait::MoneyInFlight));
     let e = held.as_ref().err().expect("it waited");
     assert!(is_typed_wait(e), "a wait, not a failure");
     assert_eq!(listing_failure_words(e, false), "A spend from the SSF wallet is still on its way. Your listing goes out once it lands.");
     names_no_burner(e, &key);
-    assert_eq!(s.sent(), HashSet::from([money.name()]), "nothing new sent");
-    assert_eq!(s.chain.mempool(), vec![money.name()], "W's spend, live");
-    assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin parked");
-    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert_eq!(s.sent(), HashSet::from([theirs.name(), v_listing.name(), knock.name()]), "nothing new sent");
+    assert_eq!(s.chain.mempool(), vec![knock.name()], "W's knock, live");
+    let free = |s: &Setup| dish.iter().filter(|c| !s.lease.is_taken(&c.coin_id()) && s.chain.record(c.coin_id()).is_some_and(|r| r.2.is_none())).count();
+    assert_eq!(free(&s), 1, "no lobby coin parked for P(0)");
+    assert_eq!(s.gifts(0), 2, "no gift counted for P(0): the other burner's and V's");
 
     s.chain.farm().await;
-    let (again, first) = s.listing(&w, &node, 0, &entries(), at, 2).await.unwrap();
-    assert_eq!(again, hint, "the same hint");
+    let (hint, first) = s.listing(&w, &node, 0, &entries(), at, 4).await.unwrap();
+    let f = *dish.iter().find(|c| c.coin_id() == first.coins.parked).expect("a lobby coin, parked");
     let g = gift(&key, f);
-    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "W's spend landed: P(0)'s first write goes out");
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "W's knock landed: P(0)'s first write goes out");
     assert_eq!(first.payer, Payer::of_burner(&key));
-    assert_eq!(s.gifts(0), 1);
+    assert_eq!(s.gifts(0), 3);
     let landed = s.chain.farm().await;
     assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
 
     let coin = s.chain.fund(our_puzzle_hash(&w), 500, None);
     let funded = s.chain.farm().await;
-    let knock = our_memo(&w, coin, Bytes32::new([0x5c; 32]), b"a knock of W's, in flight".to_vec());
+    let knock = our_memo(&w, coin, Bytes32::new([0x5c; 32]), b"another knock of W's, in flight".to_vec());
     s.push(&w, &knock, (coin.coin_id(), funded)).await.unwrap();
     assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock parked, live");
     let written = burner_coin(&key, g.coin_id());
-    let (_, rewrite) = s.listing(&w, &node, 0, &entries_of("203.0.113.9:4444", 0), at + 700, 3).await.unwrap();
+    let (_, rewrite) = s.listing(&w, &node, 0, &entries_of("203.0.113.9:4444", 0), at + 700, 5).await.unwrap();
     assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "a rewrite from P(0)'s own coin does not wait on it");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §8.3, the crash window: wallet W's listing for era 0 goes
+/// out through the money writer's own seam, and the node stops before its
+/// mark is saved, so it has none on record. It restarts with burner keys on,
+/// its lease restored from the file with W's spend still parked, live in the
+/// mempools. The lost mark is filed again from the write the lease holds
+/// under the era's hint ([`lost_listing_mark`]): exactly the mark the
+/// heartbeat would have saved, naming W as its payer, with the listing's
+/// coins, record digest and spend, and the address set, date and node id
+/// its record carries. With it, the burner path's step holds P(0)'s write
+/// by the hint rule where, with no mark, P(0) would write at once; the
+/// seam's own wait holds P(0)'s first write while W's spend is parked. Once
+/// W's spend lands it is still found while it settles, and the mark's reader
+/// confirms the write. The step goes on holding P(0) for the era, and P(0)
+/// never writes. A mark that names the write is not filed again, and on the
+/// SSF wallet's own path W's write is not filed again either: its step is
+/// main's. A lease that has forgotten the write rebuilds nothing.
+#[tokio::test]
+async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_filed_again_and_holds_the_burner() {
+    let mut s = setup().await;
+    let dir = Dir::new("lost-money-mark");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(70), iroh::SecretKey::generate());
+    let (money, p0, id) = (Payer::of(&w).hex(), Payer::of_burner(&burner(70, 0)).hex(), node.public().to_string());
+    s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let (f, _) = ready_dish(&s, 1).await;
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let at = unix_now();
+    let (hint, write) = s.money_listing(&w, &node, 0, &entries(), at).await.unwrap();
+    let theirs = s.chain.received().last().cloned().expect("W's listing was sent");
+    let sig = addrs_signature(&entries());
+    let saved = NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone());
+
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's spend restored, parked");
+    let burner_path = |lease: &WalletLease, mark: Option<&NodePublishMark>| lost_listing_mark(lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone()));
+    let lost = burner_path(&s.lease, None).expect("W's listing, filed again");
+    assert_eq!(lost, saved, "the mark the heartbeat would have saved");
+    assert_eq!(lost.payer.as_deref(), Some(money.as_str()), "naming W");
+
+    let (peak, moved) = (s.chain.peak(), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
+    let mut rng = StdRng::seed_from_u64(1);
+    assert_eq!(burner_step(&mut ListingClock::default(), &w, None, &node, (peak, at + 60, &sig), &mut rng), ListingStep::Write, "with no mark P(0) would write at once");
+    for (now, live) in [(at + PRESENCE_CONFIRM_TIMEOUT_SECS, &sig), (at + ADDR_CHANGE_DEBOUNCE_SECS, &moved)] {
+        let step = burner_step(&mut ListingClock::default(), &w, Some(&lost), &node, (peak + 1 + CHANGE_JITTER_MAX_BLOCKS, now, live), &mut rng);
+        assert_eq!(step, ListingStep::HeldByHint(PaidBy::Money), "{live} at {now}");
+    }
+    let parked = s.listing(&w, &node, 0, &entries(), at, 1).await.map(|(_, write)| write);
+    assert_eq!(waited(&parked), Some(BurnerWait::MoneyInFlight), "the seam's own wait, while W's spend is parked");
+
+    let landed = s.chain.farm().await;
+    s.reconcile().await;
+    assert!(!s.lease.outgoing_pending_for(Payer::of(&w)) && s.lease.holds_for(Payer::of(&w)), "W's spend settling");
+    assert_eq!(burner_path(&s.lease, None), Some(saved.clone()), "still found while it settles");
+    assert_eq!(burner_path(&s.lease, Some(&lost)), None, "a mark that names it is not filed again");
+    let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "the mark's reader confirms W's write");
+    let PresenceStep::Save(mark) = presence_step(&lost, word, 0, landed) else { panic!("confirmed: saved") };
+    let step = burner_step(&mut ListingClock::default(), &w, Some(&mark), &node, (landed + 1 + CHANGE_JITTER_MAX_BLOCKS, at + ADDR_CHANGE_DEBOUNCE_SECS, &moved), &mut rng);
+    assert_eq!(step, ListingStep::HeldByHint(PaidBy::Money), "held for the era");
+
+    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
+    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive), None, "on the SSF wallet's path its own write is left to main's rule");
+    assert_eq!(burner_path(&WalletLease::new(), None), None, "a lease that has forgotten the write rebuilds nothing");
+    assert_eq!(s.sent(), HashSet::from([theirs.name()]), "P(0) never wrote");
+    assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §8.3, the crash window the other way: wallet W's listing
+/// for era 0 goes out from its listing burner P(0) through the listing's own
+/// seam, and the node stops before its mark is saved. It restarts with
+/// burner keys off, its lease restored with P(0)'s claim and write parked.
+/// On the SSF wallet's path the lost mark is filed again, naming P(0), the
+/// burner the heartbeat derives for it (`money_path_burner_payer`), and the
+/// SSF wallet's step is held by the hint rule where, with no mark, main's
+/// rule writes at once. On the burner path P(0)'s own write is not filed
+/// again: the burner's own rules judge it, as they did.
+#[tokio::test]
+async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_holds_the_ssf_wallet() {
+    let mut s = setup().await;
+    let dir = Dir::new("lost-burner-mark");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(71), iroh::SecretKey::generate());
+    let (money, p0, id) = (Payer::of(&w).hex(), Payer::of_burner(&burner(71, 0)).hex(), node.public().to_string());
+    ready_dish(&s, 1).await;
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let at = unix_now();
+    let (hint, write) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let sig = addrs_signature(&entries());
+
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    assert!(s.lease.outgoing_pending_for(Payer::of_burner(&burner(71, 0))), "P(0)'s spend restored, parked");
+    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
+    let lost = lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).expect("P(0)'s listing, filed again");
+    assert_eq!(lost, NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone()), "the mark the heartbeat would have saved");
+    assert_eq!(lost.payer.as_deref(), Some(p0.as_str()), "naming P(0)");
+    assert_eq!(lost.parked, hex::encode(write.coins.parked), "its dish coin parked, its gift the parent");
+
+    let (hint0, moved) = (hex::encode(hint), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
+    let changed = at + ADDR_CHANGE_DEBOUNCE_SECS;
+    assert_eq!(money_listing_step(None, 0, &sig, at, &hint0, &id, false, &money, None), ListingStep::Write, "with no mark main's rule writes at once");
+    let derived = money_path_burner_payer(Some(&lost), 0, &hint0, &money, NET, &w, &CK);
+    assert_eq!(derived.as_deref(), Some(p0.as_str()));
+    assert_eq!(money_listing_step(Some(&lost), 0, &moved, changed, &hint0, &id, false, &money, derived.as_deref()), ListingStep::HeldByHint(PaidBy::Burner));
+
+    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, true, &money, |_| Some(p0.clone())), None, "on the burner path its own write is left to the burner's rules");
     assert!(s.chain.unanswered().is_empty());
 }
