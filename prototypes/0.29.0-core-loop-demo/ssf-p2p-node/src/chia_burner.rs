@@ -214,6 +214,14 @@ impl BurnerRoot {
         first.copy_from_slice(&out.as_bytes()[..8]);
         u64::from_le_bytes(*first) % SLOT_BLOCKS
     }
+
+    /// The network this root was made for, whose listing hint P(e) is
+    /// derived under (§3.5). The listing's writer refuses a root of another
+    /// network (`chia_publish::publish_node_presence_with`): its P(e) would
+    /// not be the key of the hint the listing is written under there.
+    pub fn net(&self) -> ChiaNet {
+        self.1
+    }
 }
 
 /// Wipes R, so that a dropped root leaves none of its bytes behind.
@@ -689,6 +697,15 @@ mod tests {
                 let h = inbox_hint(net, &CK_HOST, &ROOM_KEY, era);
                 assert_eq!(before.knock(&h, era).public_key(), after.knock(&h, era).public_key(), "{net:?}: K(h, {era})");
             }
+        }
+    }
+
+    /// A root names the network it was made for on every network, so the
+    /// listing's writer can refuse a root of another one (§3.5).
+    #[test]
+    fn a_root_names_the_network_it_was_made_for() {
+        for net in ChiaNet::ALL {
+            assert_eq!(BurnerRoot::of(&zero_money(), net).net(), net, "{net:?}");
         }
     }
 

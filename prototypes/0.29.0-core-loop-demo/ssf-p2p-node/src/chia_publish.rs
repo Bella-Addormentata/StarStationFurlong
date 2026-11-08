@@ -2807,6 +2807,81 @@ pub(crate) async fn publish_node_presence_on(
     Ok((hint, write))
 }
 
+/// The listing for `era` written from this wallet's listing burner P(e)
+/// (stage 4 design §3.2, §4.1), on a given lease, gift fuse, network, chain,
+/// instant and random source (the tests' own on the mock chain): the record
+/// sealed for `era` on `net` ([`presence_memo`]), written by the burner's
+/// writer (`claim_write::burner_write_with`) under the gift rules and the
+/// fuse (§5.2). The era's first write claims a lobby dish coin in its own
+/// bundle, which funds P(e) with the gift g; a rewrite spends P(e)'s one
+/// coin. Either way the write names P(e) as its payer ([`Payer::of_burner`]),
+/// which the mark files for the hint rule (§8.3), and the money key pays for
+/// nothing.
+///
+/// `root` must be `net`'s ([`crate::chia_burner::BurnerRoot::net`]): P(e)
+/// is derived under the listing hint of the root's network and the record is
+/// written under `net`'s, and the two are the same hint only on the same
+/// network (§3.5). A root of another network is refused before the lease or
+/// the chain is asked anything, so nothing is parked or sent.
+///
+/// `money` is the SSF wallet's payer ([`Payer::of`] its key). While the lease
+/// parks a spend it pays for, the era's first write from P(e) waits
+/// (`claim_write::BurnerWait::MoneyInFlight`): that spend could be this
+/// era's listing, pushed by the SSF wallet just before a restart that never
+/// saved its mark, and P(e)'s write beside it would put two payers under
+/// one hint (§8.3). A rewrite from P(e)'s own coin does not wait on it.
+#[allow(clippy::too_many_arguments)]
+async fn publish_node_presence_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &std::sync::Mutex<claim_write::GiftFuse>,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    at: Instant,
+    root: &crate::chia_burner::BurnerRoot,
+    money: Payer,
+    iroh_sk: &iroh::SecretKey,
+    ck: &[u8; 32],
+    era: u64,
+    entries: &[AddrEntry],
+    now_unix: u64,
+    rng: &mut R,
+) -> Result<(Bytes32, MemoWrite)> {
+    anyhow::ensure!(
+        root.net() == net,
+        "the listing's burner root is for {} and this write is on {}; nothing is written",
+        root.net().name(),
+        net.name()
+    );
+    let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now_unix)?;
+    let key = root.presence(ck, era);
+    let write = claim_write::burner_write_with(lease, fuse, net, client, at, &key, era, hint, None, move |_| Ok(sealed), rng, "presence", Some(money)).await?;
+    Ok((hint, write))
+}
+
+/// [`publish_node_presence_with`] on the node's own lease and gift fuse
+/// ([`WALLET_LEASE`], `claim_write::GIFT_FUSE`), the money lane's chain
+/// ([`crate::chia_chain::connect`], two agreeing peers, as the burner's
+/// writer takes it: stage 4 design §10), the wall clock and the OS random
+/// source: the listing the heartbeat writes from P(e) with burner keys on
+/// (§4.3, §13 row 10). No test calls it: its lease, fuse and chain are the
+/// process's.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // until the heartbeat's listing arm calls it (PR 10b's heartbeat stage, which removes this)
+async fn publish_burner_presence(
+    net: crate::chia_network::ChiaNet,
+    root: &crate::chia_burner::BurnerRoot,
+    money: Payer,
+    iroh_sk: &iroh::SecretKey,
+    ck: &[u8; 32],
+    era: u64,
+    entries: &[AddrEntry],
+    now_unix: u64,
+) -> Result<(Bytes32, MemoWrite)> {
+    let client = crate::chia_chain::connect();
+    publish_node_presence_with(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now(), root, money, iroh_sk, ck, era, entries, now_unix, &mut rand::rngs::OsRng)
+        .await
+}
+
 /// What a presence write files for `era` on `net`: the hint, `ck`'s listing
 /// hint on `net`, and the memo, the record encoded, signed (iroh key) and
 /// sealed under `ck` on `net`. Both are `net`'s (stage 4 design §3.5:
@@ -3109,7 +3184,8 @@ pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 /// - [`MemoWait`]: the SSF wallet still settling a spend, or unfunded;
 /// - `claim_write::BurnerWait`: a burner's every wait (its spend in flight
 ///   or settling, its listing cut short, no peak, no dish coin ready, the
-///   fuse blown);
+///   fuse blown, and for the listing's first write a spend of the SSF
+///   wallet's in flight);
 /// - `chia_faucet::ClaimToError::NoCoinReady` and `PeakUnavailable`: a dry
 ///   or griefed dish, or no peak to judge it by;
 /// - [`LeaseError`] and [`PushError::NotSent`]: the lease sealed, or not
@@ -3216,12 +3292,21 @@ fn dish_dry(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether `e` says the era's first listing from P(e) waits on a spend the
+/// SSF wallet pays for, still parked (stage 4 design §8.3, the crash window):
+/// somewhere in its chain is `claim_write::BurnerWait::MoneyInFlight`.
+fn money_in_flight(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| matches!(cause.downcast_ref::<claim_write::BurnerWait>(), Some(claim_write::BurnerWait::MoneyInFlight)))
+}
+
 /// The Phone Book's words for a listing from a burner key that failed with
 /// `e` (stage 4 design §10). A dry dish ([`dish_dry`]) and a busy chain
 /// ([`chain_busy`]) get §10's own sentences, which say that the station
 /// tries again and, where `last_week` says last era's listing is still read,
-/// that it still works. Every other failure reads as its own text (`{e:#}`),
-/// as the readout always gave it: a lost race's refusal, another wait of the
+/// that it still works. A first write waiting on a spend of the SSF wallet's
+/// ([`money_in_flight`], §8.3) says it goes out once that spend lands, in
+/// the same way. Every other failure reads as its own text (`{e:#}`), as the
+/// readout always gave it: a lost race's refusal, another wait of the
 /// burner's, the lease's errors. None of the sentences names a key, a hash
 /// or an address.
 #[cfg_attr(not(test), allow(dead_code))] // until the heartbeat's listing arm calls it (PR 10b's heartbeat stage, which removes this)
@@ -3235,6 +3320,9 @@ fn listing_failure_words(e: &anyhow::Error, last_week: bool) -> String {
         } else {
             "The chain is busy. Your listing waits for room. Waiting costs nothing.".to_string()
         }
+    } else if money_in_flight(e) {
+        let still = if last_week { " Last week's listing still works." } else { "" };
+        format!("A spend from the SSF wallet is still on its way. Your listing goes out once it lands.{still}")
     } else {
         format!("{e:#}")
     }
@@ -5204,10 +5292,11 @@ mod tests {
     }
 
     /// Stage 4 design §10's Phone Book sentences for a listing from a
-    /// burner key: a dry dish and a busy chain, each with and without the
-    /// word that last era's listing still works. Every other failure reads
-    /// as its own text, a lost race and the burner's other waits among them.
-    /// None of them sends the page to the Bank, whose cue is "unfunded".
+    /// burner key: a dry dish and a busy chain, and the first write's wait on
+    /// a spend of the SSF wallet's (§8.3), each with and without the word
+    /// that last era's listing still works. Every other failure reads as its
+    /// own text, a lost race and the burner's other waits among them. None of
+    /// them sends the page to the Bank, whose cue is "unfunded".
     #[test]
     fn the_listings_failures_say_what_section_10_says() {
         use super::claim_write::BurnerWait;
@@ -5223,6 +5312,12 @@ mod tests {
         assert_eq!(listing_failure_words(&full, true), "The chain is busy. Your listing waits for room. Waiting costs nothing, and last week's listing still works.");
         assert_eq!(listing_failure_words(&full, false), "The chain is busy. Your listing waits for room. Waiting costs nothing.");
         said.extend([listing_failure_words(&full, true), listing_failure_words(&full, false)]);
+        let landing = "A spend from the SSF wallet is still on its way. Your listing goes out once it lands.";
+        for e in [anyhow::Error::from(BurnerWait::MoneyInFlight), anyhow::Error::from(BurnerWait::MoneyInFlight).context("presence")] {
+            assert_eq!(listing_failure_words(&e, true), format!("{landing} Last week's listing still works."), "{e:#}");
+            assert_eq!(listing_failure_words(&e, false), landing, "{e:#}");
+            said.extend([listing_failure_words(&e, true), listing_failure_words(&e, false)]);
+        }
         let others: Vec<anyhow::Error> = vec![
             anyhow::Error::from(PushError::Rejected("a: DOUBLE_SPEND".into())).context("presence"),
             PushError::Rejected("a: DOUBLE_SPEND; b: INVALID_FEE_TOO_CLOSE_TO_ZERO".into()).into(),
@@ -7972,6 +8067,7 @@ mod tests {
             ("no peak for a burner's gift", BurnerWait::PeakUnavailable.into()),
             ("no lobby coin for a burner", BurnerWait::NoCoinReady.into()),
             ("the fuse blown", BurnerWait::FuseBlown { era: 3 }.into()),
+            ("a burner's first write behind the SSF wallet's spend", BurnerWait::MoneyInFlight.into()),
             ("no dish coin ready", claim_to(T11, &Scripted::new(vec![empty_dish]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
             ("no peak for the dish", claim_to(T11, &Unanswering, nobody, |_| false, &mut rng).await.unwrap_err()),
             ("the dish's listing unread", claim_to(T11, &Scripted::new(vec![]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),

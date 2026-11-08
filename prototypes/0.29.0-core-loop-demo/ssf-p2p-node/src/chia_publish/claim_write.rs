@@ -27,7 +27,8 @@
 //! past the node's fuse for the era ([`GiftFuse`]). Waiting is not failing:
 //! each reason to wait comes back typed ([`BurnerWait`]).
 //!
-//! Until PR 10 the writer's one caller outside the tests is
+//! Outside the tests the writer is called by the listing's writer from its
+//! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b) and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
 //! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
@@ -358,6 +359,14 @@ pub enum BurnerWait {
     /// No lobby coin is ready that the lease does not hold: a dry or griefed
     /// dish (§10).
     NoCoinReady,
+    /// The burner holds no coin, and the lease still parks a spend paid for
+    /// by the payer its writer was given to wait on: the SSF wallet, for the
+    /// listing (§8.3). Until that spend lands it could be this era's listing,
+    /// written by the SSF wallet under the same hint before a restart that
+    /// lost its mark, and the burner's first write beside it would put two
+    /// payers under one hint, so the burner is not funded beside it. A
+    /// rewrite, from the burner's own coin, never waits so.
+    MoneyInFlight,
     /// The fuse is blown: the lobby dish gave this node's burners
     /// [`MAX_GIFTS_PER_ERA`] gifts in `era`, the era the fuse counted them
     /// in ([`GiftFuse::allows`]).
@@ -374,6 +383,9 @@ impl fmt::Display for BurnerWait {
             BurnerWait::ListingCutShort => f.write_str("the burner's coin listing was cut short, so it cannot tell that the burner holds no coin"),
             BurnerWait::PeakUnavailable => f.write_str("chain peak unavailable (peers unreachable?)"),
             BurnerWait::NoCoinReady => f.write_str("no mojo in the lobby dish right now; it refills on the block clock"),
+            BurnerWait::MoneyInFlight => {
+                f.write_str("a spend the SSF wallet pays for is still in flight, so the burner is not funded beside it; its first write waits for the chain's verdict")
+            }
             BurnerWait::FuseBlown { era } => write!(
                 f,
                 "{MAX_GIFTS_PER_ERA} gifts from the lobby dish in era {era}; no burner is funded again before era {}",
@@ -648,8 +660,15 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 ///   ([`BurnerWait::ListingCutShort`]), not while the lease holds a bundle
 ///   for it, parked or settling, by its payer or by its puzzle hash, or a
 ///   1-mojo coin of its ([`BurnerWait::Settling`], [`WalletLease::holds_for`],
-///   [`WalletLease::holds_spend_at`]), and not past the fuse
-///   ([`BurnerWait::FuseBlown`]). A gift the fuse counted for the burner is
+///   [`WalletLease::holds_spend_at`]), not while the lease parks a spend
+///   that `money` pays for, when the caller names one
+///   ([`BurnerWait::MoneyInFlight`], [`WalletLease::outgoing_pending_for`]),
+///   and not past the fuse ([`BurnerWait::FuseBlown`]). The listing names
+///   the SSF wallet's payer there (§8.3, the crash window): until that
+///   spend lands it could be this era's listing, which the SSF wallet wrote
+///   under the same hint before a restart lost its mark. A rewrite never
+///   waits on it, since the burner then already holds the coin its first
+///   write under the hint made. A gift the fuse counted for the burner is
 ///   given back first if the chain shows the burner never held a coin of
 ///   the gift's 1 mojo, so its bundle died ([`never_held_a_coin`],
 ///   [`GiftFuse::refund`]); one that landed stays counted, and a stray of
@@ -688,6 +707,7 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
     rng: &mut R,
     what: &str,
+    money: Option<Payer>,
 ) -> Result<MemoWrite> {
     let _lease = lease.lock().await;
     lease.ensure_open()?;
@@ -715,6 +735,9 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
             // `ones` arm is a second guard, kept as one.
             if !ones.is_empty() || lease.holds_for(payer) || lease.holds_spend_at(burner_ph) {
                 return Err(BurnerWait::Settling.into());
+            }
+            if money.is_some_and(|money| lease.outgoing_pending_for(money)) {
+                return Err(BurnerWait::MoneyInFlight.into());
             }
             let counted = fuse.lock().unwrap().holds(era, payer);
             if counted {
@@ -783,7 +806,7 @@ pub async fn burner_write(
 ) -> Result<MemoWrite> {
     let client = crate::chia_chain::connect();
     let net = crate::chia_network::net();
-    burner_write_with(&WALLET_LEASE, &GIFT_FUSE, net, &client, Instant::now(), key, era, hint, gate, body, &mut rand::rngs::OsRng, what).await
+    burner_write_with(&WALLET_LEASE, &GIFT_FUSE, net, &client, Instant::now(), key, era, hint, gate, body, &mut rand::rngs::OsRng, what, None).await
 }
 
 /// The blake3 `derive_key` context of the claim-and-write self-test's hint.
@@ -1418,7 +1441,7 @@ mod tests {
         let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
         let net = ChiaNet::Testnet11;
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &burner(net, 1), 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &burner(net, 1), 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test", None).await;
         let e = write.err().expect("the write waits");
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{e:#}");
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "the burner's listing alone was read");
@@ -1448,7 +1471,7 @@ mod tests {
             let chain = Scripted::new(vec![listing(false), listing(true)]);
             let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::preset(0, [Payer::of_burner(&key)])));
             let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-            let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+            let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test", None).await;
             let e = write.err().expect("the write waits");
             assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{n} shown: {e:#}");
             assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{n} shown: the burner's listing, then the refund's");
@@ -1473,7 +1496,7 @@ mod tests {
         let chain = Scripted::new(vec![none]);
         let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::preset(0, [Payer::of_burner(&key)])));
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test").await;
+        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test", None).await;
         let e = write.err().expect("the write waits");
         assert!(e.downcast_ref::<CoinLookupFailed>().is_some(), "a failed read: {e:#}");
         assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "a failed read is no knock attempt (§5.2)");
