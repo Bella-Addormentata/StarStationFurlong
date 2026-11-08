@@ -2286,6 +2286,36 @@ async fn a_node_giving_no_answer_to_a_spend_request_is_silent_and_dropped_a_pin_
     }
 }
 
+/// Two quiet nodes made to speak after the same kind of request
+/// ([`MockChain::speak_after`]), each answering one before either
+/// connection schedules its announcement, as two connections may: both
+/// announcements are queued for scheduling. One slot kept only the last,
+/// and left the other node quiet for good.
+#[tokio::test]
+async fn two_quiet_nodes_answering_at_once_each_have_their_announcement_scheduled() {
+    let s = setup().await;
+    s.chain.farm().await;
+    let after = Duration::from_millis(50);
+    for node in [&s.a, &s.b] {
+        s.chain.quiet(node);
+        s.chain.speak_after(node, ProtocolMessageTypes::RequestBlockHeader, after);
+    }
+    {
+        let mut model = s.chain.lock();
+        let (a, b) = (model.index_of(&s.a), model.index_of(&s.b));
+        for node in [a, b] {
+            assert!(model.answer(node, &reply(&RequestBlockHeader::new(0))).is_some());
+        }
+        assert_eq!(model.speak_later, vec![(a, after), (b, after)], "both announcements are queued");
+        model.speak_later.clear();
+    }
+    for node in [&s.a, &s.b] {
+        assert!(s.chain.is_quiet(node), "neither has spoken yet");
+        s.chain.speak(node).await;
+    }
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// A 2.7.4 node dates a finished page by its chain's peak, and announces
 /// that peak to wallets only once the block is post-processed: node b's
 /// page, and so the listing, is dated by a block b has not announced, and

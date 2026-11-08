@@ -736,9 +736,10 @@ struct Model {
     /// ([`MockChain::reorg_before`], [`MockChain::swap_before`],
     /// [`MockChain::block_before`], [`MockChain::return_before`]).
     staged: VecDeque<(ProtocolMessageTypes, Staged)>,
-    /// A quiet node to announce its peak once the time given has passed
-    /// ([`MockChain::speak_after`]), for [`serve`] to schedule.
-    speak_later: Option<(usize, Duration)>,
+    /// The quiet nodes to announce their peaks once the time given has
+    /// passed ([`MockChain::speak_after`]), for [`serve`] to schedule: a
+    /// queue, so two nodes answering at once each have theirs scheduled.
+    speak_later: Vec<(usize, Duration)>,
 }
 
 impl Model {
@@ -1036,7 +1037,7 @@ impl Model {
         if let Some(Some((kind, after))) = self.nodes[node].quiet {
             if kind == request.msg_type {
                 self.nodes[node].quiet = Some(None);
-                self.speak_later = Some((node, after));
+                self.speak_later.push((node, after));
             }
         }
         answer
@@ -1311,8 +1312,8 @@ async fn serve(
                                 shared.handshake(&mut announced)
                             } else {
                                 let out = shared.answer(node, &message, &mut announced);
-                                let later = shared.model.lock().unwrap().speak_later.take();
-                                if let Some((quiet, after)) = later {
+                                let later = std::mem::take(&mut shared.model.lock().unwrap().speak_later);
+                                for (quiet, after) in later {
                                     let shared = shared.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(after).await;
@@ -1388,7 +1389,7 @@ impl MockChain {
             unanswered: Vec::new(),
             connections: 0,
             staged: VecDeque::new(),
-            speak_later: None,
+            speak_later: Vec::new(),
         };
         Self(Arc::new(Shared { model: Mutex::new(model), acks: watch::Sender::new(HashMap::new()), next_conn: AtomicU64::new(0) }))
     }
