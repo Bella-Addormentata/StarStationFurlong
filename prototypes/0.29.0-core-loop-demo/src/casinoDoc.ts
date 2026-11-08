@@ -5021,13 +5021,23 @@ export function computedEndedIncs(): EndedComputed[] {
  *  page finds one whose removal it never ran. */
 export function computedLiveTables(): { t: string; inc: string }[] {
   const out: { t: string; inc: string }[] = [];
-  for (const [t, incs] of computedIncsOf) {
-    // (The switch's, not the game played: awayDuty ends tables a page-signed
-    // incarnation runs. 🔒 A FAIR ONLY game's end is its authority's.)
-    const inc = switchIncOf(t);
-    if (inc !== null && incs.has(inc) && ordinaryInc(t, inc) && !computedIncEnded(t, inc)) out.push({ t, inc });
+  for (const t of computedIncsOf.keys()) {
+    const inc = switchedPageSignedInc(t);
+    if (inc !== null) out.push({ t, inc });
   }
   return out;
+}
+
+/** The page-signed incarnation table `tableId`'s switch names, when this page
+ *  counts it (the doc holds a session or a checkpoint of it) and nothing has
+ *  ended it; else null. The switch's, not the game played: the incarnation
+ *  awayDuty watches, and the one a page-signed state waits for beside a FAIR
+ *  ONLY game (computedTable tableOf: a game defers the duties of a page-signed
+ *  incarnation, never its end or the switch's moving to another). 🔒 A FAIR
+ *  ONLY game's end is its authority's, and its name is a hint, not this. */
+export function switchedPageSignedInc(tableId: string): string | null {
+  const inc = switchIncOf(tableId);
+  return inc !== null && ordinaryInc(tableId, inc) !== undefined && !computedIncEnded(tableId, inc) ? inc : null;
 }
 
 // ── 🎲🎡 #226: who stands where, and the shooter's throw ─────────────────────

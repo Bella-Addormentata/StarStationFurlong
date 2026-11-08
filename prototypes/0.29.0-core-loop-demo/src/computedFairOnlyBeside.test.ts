@@ -15,10 +15,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { seedTable } from './computedFold';
+import { seedTable, slipCommit, slipKeyFor } from './computedFold';
 import { faironlyInc, sealFin } from './computedFairOnly';
 import { delegation, hex, house, NAME, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { clockOf, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run, sync } from './computedPageKit';
+import { clockOf, deliver, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run, send, signAs, sync, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, red } from './computedTestKit';
 
@@ -148,35 +148,108 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
   });
 
-  it('are kept while a game is played though another page-signed incarnation takes the switch: the table takes no state from it, and the incarnation this page ran goes on when the game ends', async () => {
+  // A game defers the duties of a page-signed incarnation, never its end or the
+  // switch's moving to another: the stakes of the one the switch left are freed
+  // (switchHoldsFelts), so nothing of it may settle afterwards.
+  it('go when another page-signed incarnation takes the switch while a game is played, as they do when none is: the state is replaced by the other\'s, and when the game ends the switch is put back on that one', async () => {
     const { a, felt } = await frozen();
     record(a, root);
     takeSwitch(a);
     expect(a.casino.computedIncOf(TABLE)).toBe(G.inc); // (the game is the one played, the switch a hint)
     let at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS); // (short of COMPACT_MS: the incarnation is not final)
     expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
-    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull(); // (nothing of it will be revealed now)
     // The owner's page names the game again, and the game ends over its name: the
-    // switch is put back over the dead hint, on the incarnation this page ran.
+    // switch is put back over the dead hint, on the incarnation this page runs now.
     switchTo(a, G.inc);
     record(a, end);
     at = tick(a, at, 2 * a.table.REPUT_MS);
-    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
-    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
-    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (the slip it froze can be revealed)
-    expect(a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c).toBe(felt);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: other });
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+    expect(a.casino.computedFoldOf(TABLE)!.felts.size).toBe(0); // (the slip it froze is nobody's to settle)
   });
 
-  it.each(WHERE)('go when the game ends with the switch on the other incarnation, which the table then plays, %s', async (_, tables) => {
+  // A doc that holds part of an update may read a switch that a parked write has
+  // since overwritten: nothing is let go of until it is whole (compactDuty waits too).
+  it('are kept while the page holds part of an update, the switch it reads being one a parked write overwrites: the state is replaced only when the doc is whole and the switch still names the other', async () => {
+    const [a, b, c] = await openRoom(['A', 'B', 'C'], T0);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+    const felt = a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c;
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b, c);
+    // B and C write at once, neither having heard of the other: B moves the switch to the other
+    // incarnation; C writes twice, the second naming the game again (and it wins, C being the
+    // higher client). A is handed B's write and C's second only.
+    const fromB = updatesOf(b, () => {
+      b.doc.transact(() => {
+        casinoOf(b).set(`cfg:computed:${TABLE}`, { v: 1, inc: other });
+        computedOf(b).set(`ses:${TABLE}:${other}:g`, new Y.Map());
+      });
+    });
+    const fromC = updatesOf(c, () => {
+      c.doc.transact(() => casinoOf(c).set('unrelated', 1));
+      c.doc.transact(() => casinoOf(c).set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc }));
+    });
+    expect(fromB).toHaveLength(1);
+    expect(fromC).toHaveLength(2);
+    deliver(T0 + 2, a, [fromB[0], fromC[1]]); // (C's first never came: its second is parked)
+    expect(a.casino.casinoWhole()).toBe(false);
+    expect(a.casino.switchedPageSignedInc(TABLE)).toBe(other); // (what the doc reads of the switch)
+    const at = tick(a, T0 + 3, 2 * a.table.REPUT_MS);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    deliver(at, a, [fromC[0]]);
+    expect(a.casino.casinoWhole()).toBe(true);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc }); // (C's write won)
+    expect(a.casino.switchedPageSignedInc(TABLE)).toBeNull();
+    tick(a, at + STEP, 2 * a.table.REPUT_MS);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+  });
+
+  // A name that is no other incarnation takes nothing's place: one nothing opened
+  // is put back over (the switch is junk, as a missing one is), and one that has
+  // ended names no table.
+  const JUNK = 'c' + '6e'.repeat(12);
+  it.each([
+    ['a page-signed name nothing opened', (p: Page) => switchTo(p, JUNK)],
+    ['a page-signed incarnation that has ended', (p: Page) => { takeSwitch(p); p.doc.transact(() => casinoOf(p).set(`gone:${TABLE}:${other}`, 1)); }],
+  ] as [string, (p: Page) => void][])('are kept while a game is played when the switch names %s: no incarnation took their place, and the switch is put back over the name', async (_, name) => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    name(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.casino.switchedPageSignedInc(TABLE)).toBeNull();
+    tick(a, T0 + STEP, 2 * a.table.REPUT_MS);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+  });
+
+  it('are kept at a table out of the room too, until the switch leaves them for another page-signed incarnation: then the compaction duty lets go of them, a game played or not', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    switchTo(a, G.inc);
+    const at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS, STEP, []);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    takeSwitch(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    tick(a, at, 2 * a.table.REPUT_MS, STEP, []);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  it.each(WHERE)('go when another page-signed incarnation takes the switch while a game is played, and the game ends with the switch still on it, which the table then plays, %s', async (_, tables) => {
     const { a, felt } = await frozen();
     record(a, root);
     takeSwitch(a);
     const at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS, STEP, tables);
-    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull(); // (the switch left it: over, a game played or not)
     record(a, end);
     expect(a.casino.computedIncOf(TABLE)).toBe(other);
     tick(a, at, 2 * a.table.REPUT_MS, STEP, tables);
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: other });
   });
 
   it('go with the end of the incarnation, a game played or not: the switch left it, and compaction ended it', async () => {
@@ -186,6 +259,23 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     tick(a, T0 + STEP, 2 * a.table.COMPACT_FALLBACK_MS, 1_000);
     expect(a.casino.computedIncEnded(TABLE, INC)).toBe(true);
     expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  // Nothing but the end of the incarnation itself is in the way here: the switch
+  // names the game, no other incarnation took its place, and a removal marked it
+  // ended. No table will go back to it, so nothing waits for it: compaction lets go
+  // of the seeds as it would with no game played.
+  it.each(WHERE)('go with the end of the incarnation when the switch names the game and a removal ended it: no table goes back to it, %s', async (_, tables) => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    switchTo(a, G.inc);
+    const at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS, STEP, tables);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (it waits, as long as it is not an ended one)
+    a.doc.transact(() => casinoOf(a).set(`gone:${TABLE}:${INC}`, 1));
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(true);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    tick(a, at, 2 * a.table.REPUT_MS, STEP, tables);
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
   });
 
@@ -336,6 +426,37 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
   });
 
+  it('are freed when another page-signed incarnation takes the switch while a game is played, and nothing of them comes back to settle when the game ends: the switch goes back to the other', async () => {
+    const { a, b } = await staked();
+    const other = 'c' + '5d'.repeat(12);
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    a.doc.transact(() => {
+      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: other });
+      computedOf(a).set(`ses:${TABLE}:${other}:g`, new Y.Map());
+    });
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc); // (the game is still the one played)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    // (the chips are free: they can be spent)
+    clockOf(a, T0 + 3);
+    expect(a.casino.cashOutChips(a.pid, 1_000)).toBe(1_000);
+    const at = run([a, b], T0 + 4, T0 + 2 * a.table.REPUT_MS, { step: STEP });
+    // The game ends over a hint naming it again; the pages put the switch back on the
+    // incarnation they run now, and the slips of the first are not resumed to settle
+    // against chips that went meanwhile.
+    switchTo(a, G.inc);
+    record(a, end);
+    sync(at, a, b);
+    run([a, b], at + STEP, at + 2 * a.table.REPUT_MS, { step: STEP });
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: other });
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    expect(a.casino.readChips(a.pid)).toBe(0);
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+  });
+
   /** Both pages ticked until the close is in, then the game opens (its root and the
    *  switch naming it) and is played for `ms` with both pages ticking, then ends. */
   async function playedBeside(ms: number): Promise<{ a: Page; b: Page; at: number }> {
@@ -362,6 +483,69 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     expect(round.forfeit).toBeUndefined();
     expect([...round.counted].sort()).toEqual([a.pid, b.pid].sort());
     expect(b.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!.decided).toBe('reveals');
+  });
+
+  it('start a betting window afresh too: the view built before the game, of a window that had run out, is not served again, the session being as it was', async () => {
+    const [a] = await openRoom(['A'], T0);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+    const window = a.table.BET_WINDOW_MS;
+    // The page ticks to just short of the deadline and reads the table after it: the view of a
+    // window run out is built and kept (the fold is the same until a close comes, and nothing
+    // woke the page), the close not written yet.
+    run([a], T0 + STEP, T0 + window - 1_000, { step: STEP });
+    const expired = a.table.readComputedRoulette(TABLE, T0 + window + 1_000)!;
+    expect(expired.phase).toBe('betting');
+    expect(expired.phaseDeadline!).toBeLessThan(T0 + window + 1_000);
+    expect(keysIn(a, 'c', 1)).toEqual([]);
+    // A game opens at the table and is played for a while, and ends.
+    record(a, root);
+    switchTo(a, G.inc);
+    const mid = run([a], T0 + window + 1_200, T0 + window + 41_000, { step: STEP });
+    expect(keysIn(a, 'c', 1)).toEqual([]); // (no duty of the page-signed incarnation ran meanwhile)
+    record(a, end);
+    const back = run([a], mid, mid + 20_000, { step: STEP, until: () => a.casino.computedIncOf(TABLE) === INC });
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    // The table is the page-signed incarnation's again: its window starts from here, as after a wake.
+    expect(keysIn(a, 'c', 1)).toEqual([]);
+    expect(a.table.readComputedRoulette(TABLE, back + 500)!.phaseDeadline!).toBeGreaterThanOrEqual(back + window - 1_000);
+    run([a], back + STEP, back + window - 2_000, { step: STEP });
+    expect(keysIn(a, 'c', 1)).toEqual([]);
+    run([a], back + window - 1_800, back + window + 5_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
+  });
+
+  it('start afresh for the other incarnation that took the switch while the game was played, too: a slip that came to the page meanwhile does not run its betting window out', async () => {
+    const [a, b] = await openRoom(['A', 'B'], T0);
+    const other = 'c' + '5b'.repeat(12);
+    const ctxOther = { room: PAGE_ROOM, t: TABLE, inc: other };
+    const window = a.table.BET_WINDOW_MS;
+    let at = tick(a, T0 + STEP, 1_000); // (A runs the page-signed incarnation: its state is there)
+    record(a, root);
+    switchTo(a, G.inc);
+    at = tick(a, at, 2_000); // (a game is played: A waits)
+    // B's page, which has not heard of the game, opened the other incarnation and put a slip down on
+    // it. The doc hands A both while the game is played, and the switch is moved to the other.
+    b.doc.transact(() => {
+      const ses = new Y.Map<unknown>();
+      const slip = signAs(b, 'slip', { r: 1, p: b.pid, v: 1, b: [red(9)], c: slipCommit(ctxOther, 1, b.pid, hex('9', 32)) }, ctxOther);
+      ses.set(slipKeyFor(ctxOther)(slip)!, slip);
+      computedOf(b).set(`ses:${TABLE}:${other}:g`, ses);
+    });
+    send(at, b, a);
+    a.doc.transact(() => casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: other }));
+    // A single look at the table (the card reads it) is what puts the other's state in place of the
+    // one that waited; the page's frames go on, the table out of its list.
+    clockOf(a, at);
+    a.table.computedCheckpointView(TABLE);
+    at = tick(a, at + STEP, 3 * window, STEP, []); // (the window would have run out, long over, had it run)
+    switchTo(a, G.inc);
+    record(a, end);
+    const back = run([a], at, at + 20_000, { step: STEP, until: () => a.casino.computedIncOf(TABLE) === other });
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    // The table is the other incarnation's now, and its window starts from here, as after a wake.
+    const view = a.table.readComputedRoulette(TABLE, back + 2 * STEP)!;
+    expect(view.phase).toBe('betting');
+    expect(view.phaseDeadline!).toBeGreaterThanOrEqual(back + window - 1_000);
   });
 
   it('still run: a player whose page never reveals is forfeited a grace after the table goes back, not at once', async () => {
