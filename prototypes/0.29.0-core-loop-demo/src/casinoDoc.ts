@@ -225,8 +225,12 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, parseKey, recHash, signBytes, TableFold } from './computedFold';
-import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
+import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash, signBytes, TableFold } from './computedFold';
+import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
+import { asFin, asXf, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId } from './computedFairOnly';
+import type { CkRead, CkRec } from './computedFairOnly';
+import { resolveGame } from './computedFairOnlyAuth';
+import type { Resolution } from './computedFairOnlyAuth';
 import {
   asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
 } from './computedHouse';
@@ -1409,8 +1413,11 @@ export function clearTableKeys(
     if (!opts.keepComputed) {
       const cinc = computedIncOf(tableId);
       if (cinc !== null) markRemoved(map, tableId, cinc);
+      // (Not a FAIR ONLY game: a removal marks nothing of one, S7. Its end is
+      // its authority's.)
       for (const inc of computedIncsOf.get(tableId) ?? []) {
-        if (inc !== cinc && computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
+        const other = computedIncs.get(`${tableId}:${inc}`)!;
+        if (inc !== cinc && !other.fo && other.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
       }
       map.delete(`cfg:computed:${tableId}`);
     }
@@ -2092,7 +2099,14 @@ let computedMap: Y.Map<unknown> | null = null;
  *  a build that reads only `c` names (computed roulette's) sees a craps
  *  switch as junk. This build opens `r` and `d`, house tables (computedFold
  *  houseRules), which a build before it (v0.49 and older) reads as junk too
- *  and leaves alone, rather than play them by rules without the house. */
+ *  and leaves alone, rather than play them by rules without the house.
+ *
+ *  🔒 FAIR ONLY games (`p` roulette, `q` craps: computedFairOnly) are named
+ *  apart, by isFairOnlyInc, and only where their records live: the sessions of
+ *  one (`ses:`, its first never `g`) and its own top-level records (`ck:`,
+ *  `xf:`, `fin:`). A `sum:`, an `hs:` or a switch naming one is junk to this
+ *  build: a page-signed checkpoint is nothing of theirs, and what plays a table
+ *  is the PR 6c-4a-2 switch's to settle. */
 const COMPUTED_INC = /^[ckrd][0-9a-f]{24}$/;
 /** A session's id: `g` for an incarnation's first, else nextSid's 24 hex. */
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
@@ -2162,6 +2176,33 @@ interface ComputedInc {
   /** Whether a rewind or a jump stood at this page's last count
    *  (recoveryTrigger): its head back, noteDoubted. */
   forged: boolean;
+  /** 🔒 What this page holds of a FAIR ONLY game (PR 6c-4a): null at every
+   *  other table. Such a game has no chain, no recovery and no doubt: its
+   *  checkpoints are the house's and its authority's, and the authority
+   *  resolver (computedFairOnlyAuth) says which stands. */
+  fo: FairOnlyState | null;
+}
+
+/** What a page holds of one FAIR ONLY game (ComputedInc fo). */
+interface FairOnlyState {
+  /** The game's records as the doc holds them now, by doc key: kept from the
+   *  keys each transaction changed, never read by scanning the doc. */
+  cks: Map<string, unknown>;
+  xfs: Map<string, unknown>;
+  fin: unknown;
+  /** The resolver's answer as last made (null before the first). */
+  res: Resolution | null;
+  /** The checkpoint this page last counted from, as the doc held it (design
+   *  §8.3 S4's X): offered to the resolver as if the doc still held it, so a
+   *  checkpoint deleted from the doc, or an older one put in its place, moves
+   *  nothing. Replaced when a resolution names another base, and given up by
+   *  the duties of PR 6c-4b only. */
+  held: { key: string; value: CkRec } | null;
+  /** The base the fold was last pointed at (null: none; undefined: never). */
+  folded: CkRec | null | undefined;
+  /** nextSid3 of the checkpoint last asked about (sid3Of). */
+  sidFor: CkRec | null;
+  sid: string;
 }
 
 /** A checkpoint this page counted: the value the doc held (put back as it
@@ -2241,6 +2282,28 @@ let computedHeldBy = new Map<string, bigint>();
 const computedParked = new Set<string>();
 /** Each incarnation's signature verdicts, by record hash. */
 let computedVerdicts = new Map<string, Map<string, boolean>>();
+/** 🔒 The room's delegations the resolver can use (`hk:<pub>` → value, those
+ *  fedDelegation takes) as the doc holds them, kept from the keys each
+ *  transaction changed: a FAIR ONLY game's house may be delegated there as well
+ *  as in its checkpoints (the resolver reads both). Anything else a guest writes
+ *  under an `hk:` key is nothing to a game and is not kept. */
+let hkRaw = new Map<string, unknown>();
+/** …of them, as a list for the resolver; null when it is to be made again (hkFeedOf). */
+let hkFeed: unknown[] | null = null;
+/** 🔒 The FAIR ONLY games to resolve again before anything is counted
+ *  (refreshFairOnly): a record of one or a delegation of the room moved, a
+ *  check that waited may be done, or the game is new. */
+let staleGames = new Set<ComputedInc>();
+/** 🔒 The verdicts on the signatures a FAIR ONLY game's resolution asks about
+ *  (authCheck), by sigId: one map for every game of the room, since an id
+ *  binds what it covers (a record copied into another game is another thing
+ *  to check there). The latest AUTH_VERDICTS_MAX, the oldest going first, as
+ *  houseVerdicts: the verdicts of the fold's records are per incarnation and
+ *  let go of what a new session doesn't hold (readComputedWhole), but these
+ *  are of checkpoints and chains, which no session holds. */
+let authVerdicts = new Map<string, boolean>();
+const AUTH_VERDICTS_MAX = 2_048;
+let authVerdictsMax = AUTH_VERDICTS_MAX;
 /** The computed tables (`computed:<tableId>`) whose fold moved since the
  *  last notify (takeTouched). */
 const viewTouched = new Set<string>();
@@ -2281,7 +2344,18 @@ function computedKeyParts(key: string): { t: string; inc: string; sid?: string }
   }
   const cut = rest.lastIndexOf(':');
   const inc = rest.slice(cut + 1);
-  return cut > 0 && COMPUTED_INC.test(inc) ? { t: rest.slice(0, cut), inc, ...(sid !== undefined ? { sid } : {}) } : null;
+  // (A FAIR ONLY game has sessions and nothing else here: no `g`, no `sum:`.)
+  const named = COMPUTED_INC.test(inc) || (sid !== undefined && sid !== 'g' && isFairOnlyInc(inc));
+  return cut > 0 && named ? { t: rest.slice(0, cut), inc, ...(sid !== undefined ? { sid } : {}) } : null;
+}
+
+/** The FAIR ONLY game a top-level key is a record of: `ck:<t>:<inc>:<id>`
+ *  (a checkpoint), `xf:<t>:<inc>:<id>` (a transfer) or `fin:<t>:<inc>` (an end
+ *  order). Null for any other key, a malformed one, and `do:<nonce>` (a deed
+ *  offer belongs to no game until a transfer carries it). */
+function fairOnlyKeyParts(key: string): { kind: 'ck' | 'xf' | 'fin'; t: string; inc: string } | null {
+  const at = parseFairOnlyKey(key);
+  return at !== null && at.kind !== 'do' ? { kind: at.kind, t: at.t, inc: at.inc } : null;
 }
 
 const sessionKey = (t: string, inc: string, sid: string): string => `ses:${t}:${inc}:${sid}`;
@@ -2358,6 +2432,15 @@ function heldBase(c: ComputedInc, map: Y.Map<unknown>): Checkpoint | null {
 function baseOf(tableId: string, inc: string): Checkpoint | null {
   const c = computedIncs.get(`${tableId}:${inc}`);
   return c ? heldBase(c, computedMap!) : checkpointAt(computedMap!, tableId, inc);
+}
+
+/** The tracked incarnation `inc` of table `tableId` if its checkpoints are a
+ *  page's to sign, else undefined: not a FAIR ONLY game (a `p…` or `q…` name),
+ *  whose checkpoints are its house's and its authority's, and which the
+ *  recovery, the finalising and the switch below have no part in. */
+function ordinaryInc(tableId: string, inc: string): ComputedInc | undefined {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  return c && !c.fo ? c : undefined;
 }
 
 /** 🏛️ The owner-signed checkpoint that takes part in incarnation `c`'s
@@ -2781,7 +2864,7 @@ export function writeComputedOn(tableId: string, inc: string): void {
  *  bytes from every page: whichever write the doc keeps, it is the same. */
 export function putComputedSwitchBack(tableId: string, inc: string): boolean {
   const casino = ensureMap();
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!c?.live || computedIncEnded(tableId, inc) || computedIncOf(tableId) === inc) return false;
   const now = computedIncOf(tableId);
   if (now !== null && computedIncs.has(`${tableId}:${now}`) && !computedIncEnded(tableId, now)) return false;
@@ -2805,7 +2888,9 @@ export function computedSwitchLost(tableId: string, game?: GameName): boolean {
   if (named !== null && !computedIncEnded(tableId, named) && (game === undefined || gameOfInc(named) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
     if (game !== undefined && gameOfInc(inc) !== game) continue;
-    if (computedIncs.get(`${tableId}:${inc}`)!.live && !computedIncEnded(tableId, inc)) return true;
+    // (A FAIR ONLY game isn't the switch's to lose: PR 6c-4a-2.)
+    const c = computedIncs.get(`${tableId}:${inc}`)!;
+    if (!c.fo && c.live && !computedIncEnded(tableId, inc)) return true;
   }
   return false;
 }
@@ -2910,9 +2995,10 @@ let fastInFlight = new Set<string>();
 let fastToNoble = new Set<string>();
 const FAST_TO_NOBLE_MAX = 4_096;
 
-/** A verdict's id across both kinds of check: a fold's record by its
- *  incarnation and hash, a room record by its own id (roomRecOk). */
-function fastId(kind: 'fold' | 'room', id: string): string {
+/** A verdict's id across the kinds of check: a fold's record by its
+ *  incarnation and hash, a room record by its own id (roomRecOk), a FAIR ONLY
+ *  game's signature by its sigId (authCheck). */
+function fastId(kind: 'fold' | 'room' | 'auth', id: string): string {
   return `${kind}|${id}`;
 }
 
@@ -2951,22 +3037,25 @@ function sendFast(id: string, pub: string, bytes: () => Uint8Array, sig: string,
   return 'sent';
 }
 
-/** 🧪 Swap the signature check, the budget per recount or its clock (any
- *  left out, and all with no argument, go back to the real ones). A budget
- *  of 0 checks nothing and so queues nothing: the next call queues the slice
- *  that checks what waited. */
+/** 🧪 Swap the signature check, the budget per recount, its clock or how
+ *  many verdicts of a FAIR ONLY game's signatures are kept (any left out,
+ *  and all with no argument, go back to the real ones). A budget of 0 checks
+ *  nothing and so queues nothing: the next call queues the slice that checks
+ *  what waited. */
 export function setComputedVerifyForTests(opts: {
   verify?: (pub: string, bytes: Uint8Array, sig: string) => boolean;
   budgetMs?: number;
   now?: () => number;
+  authMax?: number;
 } = {}): void {
   verifyWith = opts.verify ?? null;
   verifyBudgetMs = opts.budgetMs ?? COMPUTED_VERIFY_MS;
+  authVerdictsMax = opts.authMax ?? AUTH_VERDICTS_MAX;
   fastToNoble = new Set();
   verifyNow = opts.now ?? defaultVerifyNow;
   if (roomWaiting.size > 0) queueVerifySlice();
   for (const c of computedIncs.values()) {
-    if (c.last?.pending) {
+    if (c.last?.pending || c.fo?.res?.pending) {
       queueVerifySlice();
       break;
     }
@@ -3023,6 +3112,44 @@ function queueVerifySlice(): void {
     verifyQueued = false;
     boundDoc!.transact(() => {}, CT_VERIFY);
   }, 0);
+}
+
+/** 🔒 The SigCheckFn of a FAIR ONLY game's resolution (computedFairOnlyAuth):
+ *  a cached verdict, else a check while this recount's budget lasts, else "not
+ *  checked yet" (the resolution is pending, and the slice that queues, or
+ *  WebCrypto's answer, resolves it again: countTransaction). The same strict
+ *  check as every other signature of the room, under an id that binds what the
+ *  signature covers (sigId). */
+function authCheck(id: string, pub: string, bytes: () => Uint8Array, sig: string): boolean | undefined {
+  const known = authVerdicts.get(id);
+  if (known !== undefined) return known;
+  const fid = fastId('auth', id);
+  if (fastInFlight.has(fid)) return undefined;
+  if (verifySpent >= verifyBudgetMs) {
+    const fast = sendFast(fid, pub, bytes, sig, () => setAuthVerdict(id, true));
+    if (fast === false) {
+      setAuthVerdict(id, false);
+      return false;
+    }
+    if (fast === null) queueVerifySlice();
+    return undefined;
+  }
+  const from = verifyNow();
+  let ok: boolean;
+  try {
+    ok = (verifyWith ?? verifyIdentityStrict)(pub, bytes(), sig) === true;
+  } catch {
+    ok = false;
+  }
+  verifySpent += Math.max(0, verifyNow() - from);
+  setAuthVerdict(id, ok);
+  return ok;
+}
+
+/** Keep a FAIR ONLY signature's verdict, the oldest going first past AUTH_VERDICTS_MAX. */
+function setAuthVerdict(id: string, ok: boolean): void {
+  if (!authVerdicts.has(id) && authVerdicts.size >= authVerdictsMax) authVerdicts.delete(authVerdicts.keys().next().value as string);
+  authVerdicts.set(id, ok);
 }
 
 /** The writing page's own record checks out: it signed it (it never checks
@@ -3591,12 +3718,18 @@ function trackComputed(t: string, inc: string): ComputedInc {
   let c = computedIncs.get(key);
   if (c) return c;
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
+  // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
+  const fo: FairOnlyState | null = isFairOnlyInc(inc)
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, folded: undefined, sidFor: null, sid: '' }
+    : null;
+  const houses: HouseCheck = fo ? (pub, round) => fo.res?.houseAt(pub, round) : houseOkOf;
   c = {
-    t, inc, key, ctx, fold: new TableFold(ctx, computedCheck(key), computedPinOf, undefined, houseOkOf),
-    cp: null, sid: 'g', live: null, sidOf: { cp: null, sid: 'g' }, stale: true,
-    countedSid: null, chain: [], gaveUp: null, calm: 0, last: null, liveHeld: false, seen: new Map(), refuted: [], dropped: [], doubted: new Set(), forged: false,
+    t, inc, key, ctx, fold: new TableFold(ctx, computedCheck(key), computedPinOf, undefined, houses),
+    cp: null, sid: fo ? '' : 'g', live: null, sidOf: { cp: null, sid: 'g' }, stale: true,
+    countedSid: null, chain: [], gaveUp: null, calm: 0, last: null, liveHeld: false, seen: new Map(), refuted: [], dropped: [], doubted: new Set(), forged: false, fo,
   };
   computedIncs.set(key, c);
+  if (fo) staleGames.add(c);
   let incs = computedIncsOf.get(t);
   if (!incs) computedIncsOf.set(t, incs = new Set());
   incs.add(inc);
@@ -3624,9 +3757,32 @@ function computedLost(tableId: string): boolean {
  *  rounds would read as never played. The recovery duty opens it again, and
  *  past GIVE_UP_MS gives those rounds up (giveUpComputed). */
 function incLost(c: ComputedInc, map: Y.Map<unknown>): boolean {
+  if (c.fo) return fairOnlySessionLost(c, map);
   const cp = heldBase(c, map);
   if (c.chain.length > 0 && cp === null) return true;
   return sessionLost(c, map, cp);
+}
+
+/** 🔒 incLost of a FAIR ONLY game: the live session this page counted is gone
+ *  from the doc while the base that opens it stands. (The base itself is never
+ *  lost: the page holds it, and offers it to the resolver whatever the doc
+ *  does with it. Nor is a game that has ended: its nets stand from its end
+ *  checkpoint, and no session of it counts, so compaction may delete them.) */
+function fairOnlySessionLost(c: ComputedInc, map: Y.Map<unknown>): boolean {
+  const base = c.fo!.res?.base?.ck;
+  return c.countedSid !== null && base !== undefined && base.e !== 1 && sid3Of(c, base) === c.countedSid
+    && !(map.get(sessionKey(c.t, c.inc, c.countedSid)) instanceof Y.Map);
+}
+
+/** The sid of the session FAIR ONLY checkpoint `ck` opens (nextSid3, hashed
+ *  once per checkpoint: casinoWhole asks every frame). */
+function sid3Of(c: ComputedInc, ck: CkRec): string {
+  const fo = c.fo!;
+  if (fo.sidFor !== ck) {
+    fo.sid = nextSid3(c.ctx, ck);
+    fo.sidFor = ck;
+  }
+  return fo.sid;
 }
 
 function sessionLost(c: ComputedInc, map: Y.Map<unknown>, cp: Checkpoint | null): boolean {
@@ -3675,14 +3831,23 @@ const heldValue = (value: unknown): unknown => (value === undefined ? null : val
  *  session that opens (a session map made in this very transaction reports
  *  nothing of its own). The stamps of keys it no longer holds go (a record
  *  copied into the next session keeps its stamp: same key), and once it is
- *  another session, the verdicts of records it doesn't hold. */
+ *  another session, the verdicts of records it doesn't hold. 🔒 A FAIR ONLY
+ *  game's checkpoint is the resolver's choice (resolveFairOnly), and with none
+ *  it has no session and counts nothing (S4: the table is not open). */
 function readComputedWhole(c: ComputedInc, map: Y.Map<unknown>): void {
-  const cp = heldBase(c, map);
-  const sid = liveSidOf(c, cp);
-  const raw = map.get(sessionKey(c.t, c.inc, sid));
+  const fo = c.fo;
+  const base = fo ? fo.res!.base?.ck ?? null : null;
+  const cp = fo ? null : heldBase(c, map);
+  const sid = fo ? (base === null ? '' : sid3Of(c, base)) : liveSidOf(c, cp);
+  const raw = sid === '' ? undefined : map.get(sessionKey(c.t, c.inc, sid));
   const live = raw instanceof Y.Map ? (raw as Y.Map<unknown>) : null;
   const entries = live ? [...live.entries()].map(([key, value]): [string, unknown] => [key, heldValue(value)]) : [];
-  c.fold.setBase(cp);
+  if (fo) {
+    c.fold.setFairOnlyBase(base);
+    fo.folded = base;
+  } else {
+    c.fold.setBase(cp);
+  }
   c.fold.reset(entries);
   const keys = new Set(entries.map(([key]) => key));
   for (const key of [...c.seen.keys()]) if (!keys.has(key)) c.seen.delete(key);
@@ -3754,6 +3919,10 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
     c.stale = true;
     return;
   }
+  if (c.fo) {
+    countFairOnly(c, map, whole, keys);
+    return;
+  }
   if (whole || c.stale) readComputedWhole(c, map);
   else if (keys) applyComputed(c, keys);
   computedParked.delete(c.key);
@@ -3780,6 +3949,162 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
   }
 }
 
+// ── 🔒 FAIR ONLY games (computedFairOnly; PR 6c-4a-1) ────────────────────────
+// A FAIR ONLY game (letters `p` roulette, `q` craps) is a house table whose
+// authority is bound into its name and which keeps its checkpoints at the top
+// level of `casinoComputed` (`ck:`), beside its transfers (`xf:`) and its end
+// order (`fin:`). The page keeps those records as the doc holds them, asks the
+// authority resolver (computedFairOnlyAuth) which checkpoint stands, and folds
+// the session that checkpoint opens, where an ordinary table's page-signed
+// chain of checkpoints, its recovery and its doubt have no part. Its nets go
+// into the ledger whenever it has a base, and its felts hold chips while it is
+// live (a base that isn't an end): the table's switch and a removal's `gone:`
+// mark are not in it (design §8.3 S7, S8). Nothing here writes a record, and
+// until PR 6c-5 nothing writes a name this reads.
+
+/** Keep the value the doc holds at FAIR ONLY record `key` (gone: none) of the
+ *  game `c`, and read the game again before it is counted — unless the record
+ *  was nothing to the resolver before and is nothing now. */
+function noteFairOnlyRecord(c: ComputedInc, kind: 'ck' | 'xf' | 'fin', key: string, map: Y.Map<unknown>): void {
+  const fo = c.fo!;
+  const value = map.get(key);
+  let was: unknown;
+  if (kind === 'fin') {
+    was = fo.fin;
+    fo.fin = value;
+  } else {
+    const records = kind === 'ck' ? fo.cks : fo.xfs;
+    was = records.get(key);
+    if (value === undefined) records.delete(key);
+    else records.set(key, value);
+  }
+  if (!staleGames.has(c) && (!inertFairOnly(kind, key, was) || !inertFairOnly(kind, key, value))) staleGames.add(c);
+}
+
+/** Whether a value at a FAIR ONLY record key is nothing to the resolver: none,
+ *  or what its own readers take for junk (readCk; asXf under its key's id;
+ *  asFin). A guest can write any value under a well-formed key, so junk
+ *  written, changed or deleted resolves nothing again. (A rules version this
+ *  build doesn't know is not junk: it reads UPDATE TO PLAY.) */
+function inertFairOnly(kind: 'ck' | 'xf' | 'fin', key: string, value: unknown): boolean {
+  if (value === undefined) return true;
+  if (kind === 'ck') return readCkMemo(key, value).kind === 'junk';
+  if (kind === 'fin') return asFin(value) === null;
+  const xf = asXf(value, boundRoomId);
+  const at = parseFairOnlyKey(key);
+  return xf === null || at === null || at.kind !== 'xf' || xfId(xf) !== at.id;
+}
+
+/** Whether `value` at room key `key` is a delegation the resolver can use: a
+ *  delegation's shape, light enough (it is a few short fields: one padded past
+ *  MAX_SMALL_RECORD_BYTES is junk to the resolver, as a padded transfer is,
+ *  and asDelegation does not weigh it), under its own house's key (as an
+ *  honest writer stores one). */
+function fedDelegation(key: string, value: unknown): boolean {
+  if (weightOf(value, MAX_SMALL_RECORD_BYTES) === null) return false;
+  const d = asDelegation(value);
+  return d !== null && key === delegationKey(d.h);
+}
+
+/** Keep the value the doc holds at room delegation `key` (`hk:<pub>`; gone:
+ *  none) if the resolver can use it, and read every FAIR ONLY game again if it
+ *  was one or is: a house of theirs may be delegated there. Junk under an `hk:`
+ *  key, written, changed or deleted, moves nothing. */
+function noteDelegation(key: string, map: Y.Map<unknown>): void {
+  const value = map.get(key);
+  const was = hkRaw.has(key);
+  const now = value !== undefined && fedDelegation(key, value);
+  if (now) hkRaw.set(key, value);
+  else hkRaw.delete(key);
+  if (!was && !now) return;
+  hkFeed = null;
+  for (const c of computedIncs.values()) if (c.fo) staleGames.add(c);
+}
+
+/** The room's delegations as a resolution reads them, made once per change. */
+function hkFeedOf(): unknown[] {
+  hkFeed ??= [...hkRaw.values()];
+  return hkFeed;
+}
+
+/** readCk, once per value (a checkpoint weighs up to MAX_CHECKPOINT_BYTES and a
+ *  resolution reads every one the game has): the same value at the same key in
+ *  the same room reads the same. */
+const ckReads = new WeakMap<object, { room: string; key: string; read: CkRead }>();
+function readCkMemo(key: string, value: unknown): CkRead {
+  if (typeof value !== 'object' || value === null) return readCk(boundRoomId, key, value);
+  const hit = ckReads.get(value);
+  if (hit && hit.room === boundRoomId && hit.key === key) return hit.read;
+  const read = readCk(boundRoomId, key, value);
+  ckReads.set(value, { room: boundRoomId, key, read });
+  return read;
+}
+
+/** Resolve FAIR ONLY game `c` from the records it has now (design §8.3): the
+ *  doc's, and the checkpoint this page counted last as if the doc held it still
+ *  (S4), so that one deleted from the doc, or an older one put in its place,
+ *  can't take the table back. The fold asks the answer for its houses, and asks
+ *  again for as long as it was made without a check that waited (pending). */
+function resolveFairOnly(c: ComputedInc): void {
+  const fo = c.fo!;
+  const cks = fo.held ? new Map(fo.cks).set(fo.held.key, fo.held.value) : fo.cks;
+  fo.res = resolveGame(
+    { room: boundRoomId, sig: authCheck, liveSid: c.sid === '' ? undefined : c.sid, read: readCkMemo },
+    c.t, c.inc, { cks, xfs: fo.xfs, fin: fo.fin, delegations: hkFeedOf() },
+  );
+  c.fold.houseChanged();
+}
+
+/** Resolve again every FAIR ONLY game whose records, or the room's delegations,
+ *  changed, or whose answer waited for a check (staleGames): before anything
+ *  counts, since what counts (and whether a table is lost: incLost) goes by the
+ *  answer. The games it did are `dirty`. */
+function refreshFairOnly(dirty?: Set<ComputedInc>): void {
+  for (const c of staleGames) {
+    staleGames.delete(c);
+    resolveFairOnly(c);
+    dirty?.add(c);
+  }
+}
+
+/** countComputed of a FAIR ONLY game (its table is whole): the fold follows the
+ *  base the resolution names, its nets go into the ledger, and its felts hold
+ *  while the game is live.
+ *
+ *  Whoever opened the game, it counts: its name binds its opener's key, and a
+ *  page has no verified owner to admit an opener against until the ownership
+ *  root (TODO; design §2.2, owner question 13). So a game a guest opens with
+ *  its own key counts as the owner's does, as a chip record a guest writes does
+ *  (the ledger is unsigned); `holder` says whose it is. Nothing writes a game
+ *  yet, and a signed ledger must count only games opened by the verified owner. */
+function countFairOnly(c: ComputedInc, map: Y.Map<unknown>, whole: boolean, keys?: Set<string>): void {
+  const fo = c.fo!;
+  const resolved = fo.res!;
+  if (whole || c.stale || (resolved.base?.ck ?? null) !== fo.folded) readComputedWhole(c, map);
+  else if (keys) applyComputed(c, keys);
+  computedParked.delete(c.key);
+  c.stale = false;
+  const res = c.fold.result();
+  const live = resolved.live;
+  recountComputed(chipIndex, c.key, res.nets);
+  recountComputedHeld(c.key, live ? res.held : NO_COMPUTED_HELD);
+  if (res !== c.last || live !== c.liveHeld) viewTouched.add(`computed:${c.t}`);
+  c.last = res;
+  c.liveHeld = live;
+  c.countedSid = c.live ? c.sid : null;
+  // What the page counted from is what it goes on from if the doc loses it
+  // (and none named: the table is not open, but the page keeps what it held).
+  if (resolved.base !== null) fo.held = { key: resolved.base.key, value: resolved.base.ck };
+}
+
+/** 🔒 What this page's resolution says of FAIR ONLY game `inc` of table
+ *  `tableId` (who holds it, which checkpoint stands, whether it is live, what
+ *  is still to be checked), or null for a game this page doesn't track.
+ *  Read-only. */
+export function computedResolutionOf(tableId: string, inc: string): Resolution | null {
+  return computedIncs.get(`${tableId}:${inc}`)?.fo?.res ?? null;
+}
+
 /** Track every computed incarnation the doc holds, count each, and recount
  *  before any observer runs whenever a transaction touches one: a listener
  *  of a casino key changed in the same transaction reads the new chips, and
@@ -3803,6 +4128,10 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   housePinned = new Map();
   houseDelegations = new Map();
   houseVerdicts = new Map();
+  hkRaw = new Map();
+  hkFeed = null;
+  authVerdicts = new Map();
+  staleGames = new Set();
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
@@ -3813,14 +4142,20 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   for (const key of map.keys()) {
     const at = computedKeyParts(key);
     if (at) trackComputed(at.t, at.inc);
+    const fk = fairOnlyKeyParts(key);
+    if (fk) noteFairOnlyRecord(trackComputed(fk.t, fk.inc), fk.kind, key, map);
     const house = houseKeyParts(key);
-    if (house?.kind === 'hkey') houseOkOf(house.of);
-    else if (house?.kind === 'hfair') noteFairSetting(house.of);
+    if (house?.kind === 'hkey') {
+      const value = map.get(key);
+      if (fedDelegation(key, value)) hkRaw.set(key, value);
+      houseOkOf(house.of);
+    } else if (house?.kind === 'hfair') noteFairSetting(house.of);
     else {
       const hs = houseSumKeyParts(key);
       if (hs) noteHouseSum(hs.t, hs.inc);
     }
   }
+  refreshFairOnly();
   for (const c of computedIncs.values()) countComputed(c, map, casino, true);
   // (bindCasinoDoc's own notify repaints every listener from the fresh doc.)
   chipsTouched.clear();
@@ -3863,12 +4198,21 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
     for (const key of top) {
       const house = key === null ? null : houseKeyParts(key);
       if (house?.kind === 'hkey') {
+        noteDelegation(key!, map);
         if (!pinnedHouse(house.of) && houseOkOf(house.of) === true) pinned.push(house.of);
       } else if (house?.kind === 'hbeat') noteBeat(house.of);
       else if (house?.kind === 'hfair') noteFairSetting(house.of);
       else if (key !== null) {
         const hs = houseSumKeyParts(key);
         if (hs) noteHouseSum(hs.t, hs.inc);
+      }
+      // 🔒 A record of a FAIR ONLY game: the game is read again (its base may
+      // be another's), and counted.
+      const fk = key === null ? null : fairOnlyKeyParts(key);
+      if (fk) {
+        const c = computedIncs.get(`${fk.t}:${fk.inc}`) ?? (map.has(key!) ? trackComputed(fk.t, fk.inc) : undefined);
+        if (c) noteFairOnlyRecord(c, fk.kind, key!, map);
+        continue;
       }
       const at = key === null ? null : computedKeyParts(key);
       if (!at) continue;
@@ -3955,8 +4299,14 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
       }
     }
   }
-  // A slice: what waited for its checks.
-  if (tr.origin === CT_VERIFY) for (const c of computedIncs.values()) if (c.last?.pending) dirty.add(c);
+  // A slice: what waited for its checks. (A FAIR ONLY game's resolution that
+  // waited is made again.)
+  if (tr.origin === CT_VERIFY) {
+    for (const c of computedIncs.values()) {
+      if (c.last?.pending) dirty.add(c);
+      if (c.fo?.res?.pending) staleGames.add(c);
+    }
+  }
   // A recount asked for (giveUpComputed): read whole.
   if (tr.origin === CT_RECOUNT) {
     for (const c of recountWhole) {
@@ -3965,6 +4315,10 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
     }
     recountWhole.clear();
   }
+  // 🔒 The FAIR ONLY games whose records changed are resolved before any is
+  // counted: what counts, and whether a table is lost (casinoWhole), goes by
+  // the answer.
+  refreshFairOnly(dirty);
   for (const c of dirty) countComputed(c, map, casino, whole.has(c), changed.get(c));
   // The rest of an update came: what waited reads as it is.
   if (computedParked.size > 0 && casinoWhole()) {
@@ -3978,18 +4332,32 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
 /** False while a computed table (table `tableId`'s, when named) waits: for
  *  the rest of an update, or for the doc to hold what it counted (parked),
  *  or for its records' signatures to be checked (its result pending: a slip
- *  not checked yet holds nothing so far). Nothing is spent meanwhile
+ *  not checked yet holds nothing so far; 🔒 a FAIR ONLY game's too, whose
+ *  resolution may wait for a checkpoint's or a transfer's). Nothing is spent meanwhile
  *  (spendableChips). Asked of every table, one frozen for good doesn't
  *  count: on a doc holding every update whole, a table missing something
  *  this page counted of it (tableLost) waits for nothing that will come.
  *  Its last counts stand, and it stops only itself, as a table whose book
  *  is lost does, or any peer could stop every spend in the casino by
- *  making a session map and deleting it. */
+ *  making a session map and deleting it. (Except for a FAIR ONLY game's
+ *  resolution waiting for a check: that will be made.) */
 export function computedSettled(tableId?: string): boolean {
-  const settled = (key: string): boolean => !computedParked.has(key) && computedIncs.get(key)?.last?.pending !== true;
+  const settled = (key: string): boolean => {
+    const c = computedIncs.get(key);
+    return !computedParked.has(key) && c?.last?.pending !== true && c?.fo?.res?.pending !== true;
+  };
   if (tableId !== undefined) return [...(computedIncsOf.get(tableId) ?? [])].every((inc) => settled(`${tableId}:${inc}`));
   const whole = !docHoldsPart();
-  for (const c of computedIncs.values()) if (!settled(c.key) && !(whole && tableLost(c.t))) return false;
+  for (const c of computedIncs.values()) {
+    if (settled(c.key)) continue;
+    // 🔒 A FAIR ONLY game whose resolution waits for a check is not frozen for
+    // good, whatever became of the session this page counted: the check will
+    // be made, and the checkpoint it waits for (a trim deletes that very
+    // session as it writes it) may take what the table was counted to hold.
+    // Nothing is spent until it is.
+    if (whole && tableLost(c.t) && c.fo?.res?.pending !== true) continue;
+    return false;
+  }
   return true;
 }
 
@@ -4105,7 +4473,7 @@ export function writeCheckpointAndTrim(
 export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | null): boolean {
   const casino = ensureMap();
   const map = computedMap!;
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!c || !casinoWhole(tableId)) return false;
   const was = heldBase(c, map);
   if (cp !== null) {
@@ -4166,6 +4534,7 @@ export function computedRecoveries(): ComputedRecovery[] {
   if (!map || !casino) return [];
   const out: ComputedRecovery[] = [];
   for (const c of computedIncs.values()) {
+    if (c.fo) continue;
     const base = heldBase(c, map);
     const doc = checkpointAt(map, c.t, c.inc);
     const head = c.chain[c.chain.length - 1];
@@ -4205,7 +4574,7 @@ export function computedRecoveries(): ComputedRecovery[] {
  *  build does while the head comes back; nothing builds on it meanwhile (no
  *  trim, no end: computedTable). */
 export function computedRestorePending(tableId: string, inc: string | null = computedIncOf(tableId)): boolean {
-  const c = inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`);
+  const c = inc === null ? undefined : ordinaryInc(tableId, inc);
   if (!c || !computedMap || !recoveryOn) return false;
   const trigger = recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc));
   return trigger === 'rewind' || trigger === 'jump' || trigger === 'end';
@@ -4231,7 +4600,7 @@ export function computedRestorePending(tableId: string, inc: string | null = com
  * signed head (PR 6a-2). Returns whether it gave way.
  */
 export function giveWayComputed(tableId: string, inc: string): boolean {
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!c || !computedMap || !recoveryOn) return false;
   const head = c.chain[c.chain.length - 1];
   if (!head || head.seen) return false;
@@ -4286,6 +4655,7 @@ export function computedRecoveryPending(): boolean {
   const casino = casinoMap;
   if (!map || !casino || !recoveryOn) return false;
   for (const c of computedIncs.values()) {
+    if (c.fo) continue;
     const base = heldBase(c, map);
     if (recoveryTrigger(c, checkpointAt(map, c.t, c.inc)) !== null) return true;
     const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
@@ -4311,7 +4681,7 @@ export function computedRecoveryPending(): boolean {
  */
 export function restoreComputedCheckpoint(tableId: string, inc: string, head: object): boolean {
   const map = computedMap;
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!map || !c || !recoveryOn || docHoldsPart()) return false;
   const trigger = recoveryTrigger(c, checkpointAt(map, tableId, inc));
   if (trigger === null) return false;
@@ -4340,7 +4710,7 @@ export function restoreComputedCheckpoint(tableId: string, inc: string, head: ob
 export function reopenComputedSession(tableId: string, inc: string): boolean {
   const map = computedMap;
   const casino = casinoMap;
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!map || !casino || !c || !recoveryOn || docHoldsPart()) return false;
   const base = heldBase(c, map);
   if (base?.e === 1 || computedCfgInc(casino.get(`cfg:computed:${tableId}`)) !== inc || casino.has(goneKey(tableId, inc))) return false;
@@ -4369,7 +4739,7 @@ const recountWhole = new Set<ComputedInc>();
  */
 export function giveUpComputed(tableId: string, inc: string): boolean {
   const map = computedMap;
-  const c = computedIncs.get(`${tableId}:${inc}`);
+  const c = ordinaryInc(tableId, inc);
   if (!map || !c || !recoveryOn || docHoldsPart() || !sessionLost(c, map, heldBase(c, map))) return false;
   const res = c.last;
   const to = res ? Math.max(res.base.u, ...res.rounds.filter((r) => r.decided !== null).map((r) => r.r)) : 0;
@@ -4464,7 +4834,8 @@ export function computedEndedIncs(): EndedComputed[] {
   const out: EndedComputed[] = [];
   for (const key of [...withSession].sort()) {
     const c = computedIncs.get(key);
-    if (!c?.last) continue;
+    // (A FAIR ONLY game is compacted by its own rules: PR 6c-4b.)
+    if (!c?.last || c.fo) continue;
     const live = computedCfgInc(casino.get(`cfg:computed:${c.t}`)) === c.inc
       && !casino.has(goneKey(c.t, c.inc)) && heldBase(c, map)?.e !== 1;
     if (!live) out.push({ t: c.t, inc: c.inc, res: c.last, session: c.live });
