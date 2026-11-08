@@ -95,7 +95,8 @@
 //! every lookup by id ([`MockChain::refuse_lookups_on`]), echo none of the
 //! ids a lookup asks ([`MockChain::echo_no_lookup_ids_on`]) or give no
 //! answer the lane can read to a spend request
-//! ([`MockChain::answer_spends_amiss_on`]).
+//! ([`MockChain::answer_spends_amiss_on`]) or a lookup by id
+//! ([`MockChain::answer_lookups_amiss_on`]).
 //! These stand for a lying peer, or one whose stores are short, beside an
 //! honest one: what the lane's settling of the coins two peers' hinted
 //! listings differ on is to tell apart from a stale hint row.
@@ -676,6 +677,9 @@ struct Lies {
     /// Every `RequestPuzzleSolution` answered with a message of another kind
     /// ([`MockChain::answer_spends_amiss_on`]).
     spends_amiss: bool,
+    /// Every `RequestCoinState` answered with a message of another kind
+    /// ([`MockChain::answer_lookups_amiss_on`]).
+    lookups_amiss: bool,
 }
 
 /// One `TransactionAck` a node sent.
@@ -1055,6 +1059,9 @@ impl Model {
                 let asked = RequestCoinState::from_bytes(&request.data).ok()?;
                 if self.nodes[node].lies.refuse_lookups {
                     return Some(reply(&RejectCoinState::new(RejectStateReason::ExceededSubscriptionLimit)));
+                }
+                if self.nodes[node].lies.lookups_amiss {
+                    return Some(reply(&RejectHeaderRequest::new(0)));
                 }
                 Some(coin_state(self.view(node), &self.nodes[node].lies, self.lookup_limit, asked))
             }
@@ -1792,6 +1799,15 @@ impl MockChain {
         let mut model = self.lock();
         let index = model.index_of(node);
         model.nodes[index].lies.spends_amiss = true;
+    }
+
+    /// [`Self::answer_spends_amiss_on`] for every lookup by id
+    /// (`RequestCoinState`) from here: a node that gives a lookup no answer,
+    /// at once, its connection left open.
+    pub(crate) fn answer_lookups_amiss_on(&self, node: &MockNode) {
+        let mut model = self.lock();
+        let index = model.index_of(node);
+        model.nodes[index].lies.lookups_amiss = true;
     }
 
     /// `node` made quiet: from here it follows every block as ever (its

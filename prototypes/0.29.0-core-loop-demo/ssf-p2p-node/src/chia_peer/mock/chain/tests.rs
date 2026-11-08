@@ -2206,6 +2206,44 @@ async fn a_node_echoing_none_of_the_ids_asked_by_id_is_silent_and_dropped_a_pin_
     }
 }
 
+/// The same beside a node that gives the lookup by id no answer at all
+/// (one that answers it with a message of another kind): both are silent,
+/// each its own way, and both connections are dropped, a pin's too,
+/// whichever of the two it is. Were the lookup with no answer to end the
+/// read first, the node leaving ids unanswered would keep its place, and be
+/// asked again on the next read as though it had answered. Nobody is let
+/// go.
+#[tokio::test]
+async fn a_node_leaving_ids_asked_by_id_unanswered_beside_one_giving_the_lookup_no_answer_is_dropped_too_a_pin_too_and_nobody_is_let_go() {
+    for (pin, pin_short) in [(false, false), (true, false), (true, true)] {
+        let s = if pin { pinned().await } else { setup().await };
+        let parent = s.chain.fund(open_puzzle_hash(), 1000, None);
+        s.chain.farm().await;
+        stale_rows_on_a(&s, bundle(passing(&[parent], hint(1))), bundle(passing(&[parent], hint(2)))).await;
+        remembered(&s).await;
+        let (short, silent) = if pin_short { (&s.a, &s.b) } else { (&s.b, &s.a) };
+        s.chain.echo_no_lookup_ids_on(short);
+        s.chain.answer_lookups_amiss_on(silent);
+        let before = by_id_and_spends(&s);
+
+        let why = unanswered(s.money.coin_records_by_hint(hint(1), None, true, None).await);
+        let case = format!("pin: {pin}, the pin short: {pin_short}");
+        assert!(why.contains(&format!("{} answered for 0 of the 1 coins asked by id", short.addr)), "{case}: {why}");
+        assert!(why.contains(&format!("1 of 2 peers gave no answer to the lookup by id of one-sided coins ({}:", silent.addr)), "{case}: {why}");
+        assert_eq!(asked_since(&s, before), [(1, 0); 2], "{case}: one lookup by id of each node, and no spend");
+        assert_eq!(live(&s).await, Vec::<SocketAddr>::new(), "{case}: both silent nodes are dropped");
+        for node in [&s.a, &s.b] {
+            assert!(!let_go(&s, node).await, "{case}: nobody is let go");
+        }
+        for node in [&s.a, &s.b] {
+            if !(pin && node.addr == s.a.addr) {
+                assert!(s.lane.stores(node.addr).await, "{case}: the store keeps a public node dropped");
+            }
+        }
+        assert!(s.chain.unanswered().is_empty());
+    }
+}
+
 /// A node that gives no answer the lane can read to a spend request (here
 /// one that answers it with a message of another kind, which the lane
 /// takes as it takes a request left unanswered) is silent, as no honest

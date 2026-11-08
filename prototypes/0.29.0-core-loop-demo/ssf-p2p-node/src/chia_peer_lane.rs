@@ -3128,7 +3128,8 @@ async fn settle_disputed(
     // 1. The coins by id.
     let ids: Vec<Bytes32> = disputed.iter().map(|d| d.record.coin.coin_id()).collect();
     let lookups = join_all(peers.iter().map(|peer| lookup_on(peer.clone(), lane.net.clone(), ids.clone(), knowledge))).await;
-    heard(lane, &peers, LOOKUP, &lookups).await?;
+    // A lookup leaving ids unanswered is silence, as one with no answer is:
+    // every silent peer of either kind is dropped before the read returns.
     let mut short: Vec<String> = Vec::new();
     for (peer, lookup) in peers.iter().zip(&lookups) {
         if let Ok(page) = lookup {
@@ -3138,12 +3139,19 @@ async fn settle_disputed(
             }
         }
     }
+    let silent = heard(lane, &peers, LOOKUP, &lookups).await;
     if !short.is_empty() {
+        let also = match &silent {
+            Err(ChainError::Unanswered(e)) => format!("; and {e:#}"),
+            Err(e) => format!("; and {e}"),
+            Ok(()) => String::new(),
+        };
         return Err(unanswered(format!(
-            "coins by hint: {} while one-sided coins were settled; non-final, nobody let go, those connections dropped",
+            "coins by hint: {} while one-sided coins were settled; non-final, nobody let go, those connections dropped{also}",
             short.join("; ")
         )));
     }
+    silent?;
     // Each lookup's records as of the anchor's height; `None` for one
     // refused, or dated below the anchor (a chain that moved, [`anchored`]).
     let given: Vec<Option<HashMap<Bytes32, CoinRecord>>> = lookups
