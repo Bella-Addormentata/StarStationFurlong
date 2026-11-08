@@ -100,7 +100,8 @@ mod chia_at_rest;
 mod chia_publish;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
 // for the lane's writes. PR 9's claim-and-write and its self-test hook call
-// them; PR 10's writers will.
+// them, and the listing is written from P(e) (PR 10b); the knock and beacon
+// writers follow.
 #[cfg(feature = "chia-publish")]
 mod chia_burner;
 #[cfg(feature = "chia-publish")]
@@ -2916,6 +2917,8 @@ async fn handle_wt_connection_inner(
                                         env: chia_wallet_switch::env_switch(),
                                         #[cfg(feature = "chia-publish")]
                                         turnable: bank_can_turn_on(chia_network::net()),
+                                        #[cfg(feature = "chia-publish")]
+                                        burners: chia_publish::burners_enabled(),
                                     };
                                     chia_faucet::handle_request(&ctx, &envelope.room, &envelope.payload).await
                                 } else {

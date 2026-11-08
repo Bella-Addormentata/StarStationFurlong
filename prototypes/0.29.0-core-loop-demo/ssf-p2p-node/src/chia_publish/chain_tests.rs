@@ -57,9 +57,9 @@
 //! [`listing_failure_words`]; the tests here show that the words for each
 //! failure the chain gives name no burner's puzzle hash or address.
 //!
-//! No test here calls the node's own writers (`claim_write::burner_write`,
-//! [`publish_node_presence`] and the money writer it runs on the
-//! process-wide lease, and [`publish_burner_presence`]), the burner writer's
+//! No test here calls the node's own writers, which run on the
+//! process-wide lease (`claim_write::burner_write`, [`publish_burner_presence`],
+//! [`publish_node_presence`] and [`publish_memo_with`]), the burner writer's
 //! fuse (`GIFT_FUSE`) or the flag, and none reads the process's network, so
 //! they run alike whatever network CI names.
 //!
@@ -424,16 +424,17 @@ fn burner_step(clock: &mut ListingClock, wallet: &SecretKey, mark: Option<&NodeP
 }
 
 /// That neither the Phone Book's words for the listing's failure `e`
-/// ([`listing_failure_words`], with last week's listing working or not) nor
-/// the log's text of it (`{e:#}`) names the listing burner `key`: not its
-/// payer text, the hex of its puzzle hash, and not its address on any
+/// ([`listing_failure_words`], with last week's listing working or not), the
+/// heartbeat's log line for it on the burner path ([`listing_failure_line`])
+/// nor the log's text of it (`{e:#}`) names the listing burner `key`: not
+/// its payer text, the hex of its puzzle hash, and not its address on any
 /// network. A log or a screen that named it would tie the listing's coin to
 /// this station for whoever reads it, the link stage 4 design §2 closes.
 fn names_no_burner(e: &anyhow::Error, key: &BurnerKey) {
     let hex = Payer::of_burner(key).hex();
     let addresses: Vec<String> =
         crate::chia_network::ChiaNet::ALL.iter().map(|net| chia_sdk_utils::Address::new(key.puzzle_hash(), net.prefix().to_string()).encode().unwrap()).collect();
-    for text in [listing_failure_words(e, true), listing_failure_words(e, false), format!("{e:#}")] {
+    for text in [listing_failure_words(e, true), listing_failure_words(e, false), listing_failure_line(true, 0, e), format!("{e:#}")] {
         assert!(!text.contains(&hex), "{text}");
         assert!(addresses.iter().all(|a| !text.contains(a.as_str())), "{text}");
     }

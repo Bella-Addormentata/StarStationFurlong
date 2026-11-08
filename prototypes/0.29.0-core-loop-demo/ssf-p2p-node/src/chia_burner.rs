@@ -41,12 +41,6 @@
 //! hashes, the copies a move leaves, and a burner's `SecretKey`, which
 //! chia-bls does not wipe.
 #![cfg(feature = "chia-publish")]
-// PR 9 (`claim-and-write`: the bundle builder and its self-test hook) calls
-// the root, K(h) and a burner key's puzzle hash and signature; PR 10
-// (`burner-writers`) calls the rest, P(e) and the slots among them (design
-// §13). Until then only this module's tests use those, so a build without
-// them would warn that they are dead code.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fmt;
 
@@ -98,6 +92,7 @@ impl MoneyKey {
     /// The wallet key, for the money spends, which take it as a plain
     /// `SecretKey` today. Never for the publisher: from PR 10 its entry
     /// points take a [`BurnerKey`], and no `SecretKey` makes one.
+    #[cfg_attr(not(test), allow(dead_code))] // No caller outside the tests until the publisher's keys (PR 10h) hand the money spends their key through it.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
     }

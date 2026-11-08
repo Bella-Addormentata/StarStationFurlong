@@ -17,8 +17,8 @@
 //! signs with the SSF wallet's keys. It signs with a [`BurnerKey`] alone,
 //! never a money key, and has no network check of its own: the rules hold
 //! on every network, and which callers reach it, on which network, is their
-//! gate (SSF_CHIA_BURNERS on a test network until PR 10, §13 rows 9 and 10).
-//! Its tests run on each network for that reason.
+//! gate (SSF_CHIA_BURNERS on a test network, §13 rows 9 and 10). Its tests
+//! run on each network for that reason.
 //!
 //! The writer ([`burner_write_with`], and [`burner_write`] on the node's own
 //! lease and chain) picks what a write spends under the gift rules of §5.2:
@@ -793,9 +793,12 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// first write), its parked input beside it (the dish coin F) and the
 /// burner as its payer, and the mark's reader judges it by both coins
 /// ([`WriteCoins::filed`]). Like the builder it has no network check of its
-/// own: until PR 10's writers land, its one caller, the claim-and-write
-/// self-test hook ([`claim_write_selftest`]), runs only with
-/// SSF_CHIA_BURNERS=1 on a test network (§13 row 9), and keeps no mark.
+/// own: its one caller, the claim-and-write self-test hook
+/// ([`claim_write_selftest`]), runs only with SSF_CHIA_BURNERS=1 on a test
+/// network (§13 row 9), and keeps no mark. The listing does not come
+/// through here: it reaches [`burner_write_with`] through its own wrapper
+/// (`chia_publish::publish_burner_presence`, §13 row 10), and the heartbeat
+/// files its write in the presence mark.
 pub async fn burner_write(
     key: &BurnerKey,
     era: u64,
