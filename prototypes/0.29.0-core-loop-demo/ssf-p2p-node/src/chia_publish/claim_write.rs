@@ -665,7 +665,8 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// against R1 to R7 ([`build_burner_bundle`]; a broken rule is the
 /// [`BurnerRule`] inside the error) and pushed with its on-chain input parked
 /// under the burner as its payer ([`Payer::of_burner`]): F for a first
-/// write, never g. An acknowledged or an unanswered push is a write, `acked`
+/// write, never g. The [`MemoWrite`] names that payer, for a first write and
+/// a rewrite alike. An acknowledged or an unanswered push is a write, `acked`
 /// true or false, as in `publish_memo_with`, and a first write's gift is
 /// counted in the fuse; a refused one, or one the lease would not park, is
 /// the [`PushError`] inside the error, and counts nothing.
@@ -755,7 +756,7 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     if built.gift.is_some() {
         fuse.lock().unwrap().count(era, payer);
     }
-    Ok(MemoWrite { coins: built.coins, acked, spend: lease.spend_of(&built.coins.parked), memo: built.memo })
+    Ok(MemoWrite { coins: built.coins, acked, spend: lease.spend_of(&built.coins.parked), memo: built.memo, payer })
 }
 
 /// [`burner_write_with`] on the node's own lease and fuse ([`WALLET_LEASE`],

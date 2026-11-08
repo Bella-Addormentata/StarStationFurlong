@@ -930,7 +930,7 @@ async fn a_coin_made_again_under_another_hint_by_a_new_fork_does_not_confirm_the
     let spend = s.lease.spend_of(&coin.coin_id()).unwrap();
     let landed = s.chain.farm().await;
     assert_eq!(s.standing_with_memo(hint, coin.coin_id(), memo, spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
-    let write = MemoWrite { coins: WriteCoins::one(coin.coin_id()), acked: true, spend: Some(spend), memo };
+    let write = MemoWrite { coins: WriteCoins::one(coin.coin_id()), acked: true, spend: Some(spend), memo, payer: Payer::of(&payer) };
     let made = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
     let word = presence_standing_on(&s.lease, NET, &s.money, &made).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)));
@@ -1154,10 +1154,11 @@ async fn a_closed_lane_makes_no_connection_and_the_mock_chain_sees_nothing() {
 /// its write's own bundle. The bundle is two spends, F's claim and the gift
 /// g's, with one signature, the burner's over g, and no fee; the body is
 /// sealed knowing g, its coin's parent; F is parked under the burner as its
-/// payer, never g; and the gift is counted once in the fuse. While F is
-/// parked, the burner's next write waits and nothing more is built. Once it
-/// lands, g is made and spent in one block, F's remainder is back at the
-/// dish, and the resolver's reader opens the record through g, its parent.
+/// payer, never g, and the write names that payer; and the gift is counted
+/// once in the fuse. While F is parked, the burner's next write waits and
+/// nothing more is built. Once it lands, g is made and spent in one block,
+/// F's remainder is back at the dish, and the resolver's reader opens the
+/// record through g, its parent.
 /// The write's verdict, by g under the hint and by F as its input, is
 /// confirmed. The lease keeps F settling as the burner's spend, which holds
 /// back a second gift (`holds_for`) and not the burner's own writes, whose
@@ -1183,6 +1184,7 @@ async fn a_claim_and_write_lands_and_the_resolver_opens_the_record_through_the_e
     assert!(write.acked);
     assert!(write.spend.is_some() && write.spend == s.lease.spend_of(&f.coin_id()), "F parked, under the write's spend");
     assert!(!s.lease.is_parked(&g.coin_id()), "never g");
+    assert_eq!(write.payer, payer, "the write names the burner as its payer, the one F is parked under");
     let bundle = s.chain.received().last().cloned().expect("the write was sent");
     assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![f, g], "two spends: F's claim, then g's");
     assert_eq!(s.chain.fee_of(&bundle), 0);
@@ -1415,10 +1417,10 @@ async fn a_full_mempool_holds_a_claim_and_write_and_it_lands_once_cleared_with_n
 /// a burner holding its 1-mojo coin writes from it and is never given a
 /// second gift. Right after its first write lands, while the lease still
 /// keeps F settling, its next write spends the coin the first one made: one
-/// spend, its own signature over that coin, no lobby coin spent and no gift
-/// counted. Settled SETTLED_DEPTH deep, with the lease holding nothing of
-/// the burner's, a lobby coin ready and the fuse blown for the era, its next
-/// write is a rewrite again.
+/// spend, its own signature over that coin, the burner named as its payer,
+/// no lobby coin spent and no gift counted. Settled SETTLED_DEPTH deep, with
+/// the lease holding nothing of the burner's, a lobby coin ready and the fuse
+/// blown for the era, its next write is a rewrite again.
 #[tokio::test]
 async fn a_burner_holding_its_coin_writes_from_it_and_is_given_no_second_gift() {
     let mut s = setup().await;
@@ -1442,6 +1444,7 @@ async fn a_burner_holding_its_coin_writes_from_it_and_is_given_no_second_gift() 
     assert_eq!(handed, Some(written.coin_id()), "the body is sealed knowing the coin it spends");
     assert_eq!(rewrite.coins, WriteCoins::one(written.coin_id()), "written from the burner's own coin");
     assert_eq!(rewrite.spend, s.lease.spend_of(&written.coin_id()));
+    assert_eq!(rewrite.payer, payer, "the rewrite names the burner as its payer");
     let bundle = s.chain.received().last().cloned().expect("the write was sent");
     assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![written], "one spend, of the burner's own coin");
     assert_eq!(signatures(&bundle), signed_by_the_burner_alone(&key, written));

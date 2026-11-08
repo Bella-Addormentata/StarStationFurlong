@@ -2158,13 +2158,13 @@ pub fn presence_memo(
     Ok((Bytes32::new(chia_lane::derive_ck_hint(net, ck, era)), sealed))
 }
 
-/// What an era-bound write left behind: the coins it is found and judged by
-/// and whether the peers acknowledged the push. An unanswered push (`acked`
-/// false) is a write all the same — its input is parked and the bundle may be
-/// in a mempool — so the knock, beacon and presence writers file it as
-/// pending, like an acknowledged one, and let the chain settle it (#272
-/// review; the presence writer since the Phone Book icon's follow-up, which
-/// gave its mark the coin to judge).
+/// What an era-bound write left behind: the coins it is found and judged by,
+/// whether the peers acknowledged the push, and the payer its spend was
+/// parked under. An unanswered push (`acked` false) is a write all the same
+/// — its input is parked and the bundle may be in a mempool — so the knock,
+/// beacon and presence writers file it as pending, like an acknowledged one,
+/// and let the chain settle it (#272 review; the presence writer since the
+/// Phone Book icon's follow-up, which gave its mark the coin to judge).
 pub struct MemoWrite {
     /// The coins the write is found and judged by (stage 4 design §4.4): its
     /// `parent`, which the write's own coin names under its hint and which a
@@ -2189,6 +2189,18 @@ pub struct MemoWrite {
     /// coin made again by another write of ours from the input. A digest of
     /// public chain data: it holds no key material.
     pub memo: Bytes32,
+    /// The payer the lease parked the spend under, whose next write waits on
+    /// this one (stage 4 design §4.4). For a write the SSF wallet's keys pay
+    /// for it is [`Payer::of`] the paying key: the wallet's for presence and
+    /// knocks, the beacon wallet's for the beacon. For a burner's write it is
+    /// [`Payer::of_burner`] its key, a first write's too, although the dish
+    /// coin F it parked is not at the burner's address. Every write names
+    /// one. The marks file its hex ([`Payer::hex`]) beside the coins, for the
+    /// hint rule to read (design §8.3).
+    // Until the marks' constructors read it (the next step of PR 10a), only
+    // the tests do: this allowance goes with that step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub payer: Payer,
 }
 
 /// The shared tail of every era-bound write (presence, knock, beacon): under
@@ -2199,8 +2211,9 @@ pub struct MemoWrite {
 /// beacon). Returns what the write left behind ([`MemoWrite`]): the INPUT
 /// coin's id as both of its coins — the write's own coin names it as parent,
 /// which is how the write is found again under its hint and judged
-/// ([`crate::chia_resolve::write_standing`]), and the lease parked it — and
-/// whether the push was acknowledged.
+/// ([`crate::chia_resolve::write_standing`]), and the lease parked it — its
+/// payer, the one the lease parked it under, and whether the push was
+/// acknowledged.
 ///
 /// Refusing while a spend settles (#231 P6a): a wallet holding more coins
 /// would spend ANOTHER one beside the pending write — two records landing for
@@ -2252,8 +2265,10 @@ async fn publish_memo_with(
     let (bundle, memo) = memo_bundle(crate::chia_network::net(), payer, coin.coin, hint, body(input)?)?;
     // The spend's number is the lease's for its PARKED input, the coin it holds.
     let coins = WriteCoins::one(input);
-    match push_parked(&client, Payer::of(payer), bundle, [(input, coin.confirmed_height)]).await {
-        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked), memo }),
+    // The payer the input is parked under is the one the write names.
+    let paid_by = Payer::of(payer);
+    match push_parked(&client, paid_by, bundle, [(input, coin.confirmed_height)]).await {
+        Ok(()) => Ok(MemoWrite { coins, acked: true, spend: WALLET_LEASE.spend_of(&coins.parked), memo, payer: paid_by }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
         // pending and lets the chain's word settle it — filed as a failure it
@@ -2261,7 +2276,7 @@ async fn publish_memo_with(
         // coin (#272 review).
         Err(PushError::Unanswered(e)) => {
             eprintln!("⛓️ ChiaHub {what}: the push went unanswered ({e:#}) — filed as pending; the chain's word settles it");
-            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked), memo })
+            Ok(MemoWrite { coins, acked: false, spend: WALLET_LEASE.spend_of(&coins.parked), memo, payer: paid_by })
         }
         Err(e) => Err(e.into()),
     }
@@ -5714,7 +5729,8 @@ mod tests {
         let input = Coin::new(Bytes32::new([141u8; 32]), Bytes32::new([2u8; 32]), 1);
         let (hint, other_hint) = (Bytes32::new([142u8; 32]), Bytes32::new([143u8; 32]));
         let made = Coin::new(input.coin_id(), Bytes32::new([4u8; 32]), 1);
-        let write = MemoWrite { coins: WriteCoins::one(input.coin_id()), acked: true, spend: None, memo: crate::chia_resolve::memo_digest(b"our write") };
+        let payer = Payer::of(&SecretKey::from_seed(&[144u8; 32]));
+        let write = MemoWrite { coins: WriteCoins::one(input.coin_id()), acked: true, spend: None, memo: crate::chia_resolve::memo_digest(b"our write"), payer };
         // The coin listed under the hint, then the input spent at its height;
         // the input's spend carried `carried` under `carried_hint`.
         let chain = |carried_hint: Bytes32, carried: &[u8]| {
@@ -5787,7 +5803,8 @@ mod tests {
     /// void presence mark forgets it with the write.
     #[test]
     fn each_mark_keeps_its_writes_memo_digest_and_a_void_one_forgets_it() {
-        let write = MemoWrite { coins: WriteCoins::one(Bytes32::new([151u8; 32])), acked: false, spend: Some(9), memo: crate::chia_resolve::memo_digest(b"memo") };
+        let payer = Payer::of(&SecretKey::from_seed(&[150u8; 32]));
+        let write = MemoWrite { coins: WriteCoins::one(Bytes32::new([151u8; 32])), acked: false, spend: Some(9), memo: crate::chia_resolve::memo_digest(b"memo"), payer };
         let (hint, coin, digest) = (Bytes32::new([152u8; 32]), hex::encode([151u8; 32]), hex::encode(write.memo));
         let presence = NodePublishMark::written(5, 2, "a".into(), 100, hint, &write, "n".into());
         assert_eq!(
