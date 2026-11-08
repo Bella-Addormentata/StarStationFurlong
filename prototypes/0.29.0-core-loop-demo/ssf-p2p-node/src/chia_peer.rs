@@ -86,15 +86,20 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PEAK_STALE: Duration = Duration::from_secs(600);
 
 /// The chain the node binds to: its handshake name, its genesis challenge (the
-/// §14 (4) binding), the full nodes' default port and the DNS introducers that
+/// §14 (4) binding), the full nodes' default port, the DNS introducers that
 /// bootstrap peer discovery (the same class as the mesh's DHT bootstrap nodes;
-/// see the External Infrastructure Register).
+/// see the External Infrastructure Register), and its consensus constants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Network {
     pub id: String,
     pub genesis: Bytes32,
     pub port: u16,
     pub introducers: Vec<String>,
+    /// The network's consensus constants ([`ChiaNet::constants`]): the lane
+    /// runs a spend its peers serve under the rules the network's blocks
+    /// run it by, the CLVM flags at its height and the block's cost limit
+    /// (`chia_peer_lane::hints_made`).
+    pub consensus: &'static chia_consensus::consensus_constants::ConsensusConstants,
 }
 
 impl Network {
@@ -111,12 +116,14 @@ impl Network {
                 genesis: chia_sdk_types::TESTNET11_CONSTANTS.genesis_challenge,
                 port: 58444,
                 introducers: vec!["dns-introducer-testnet11.chia.net".to_string()],
+                consensus: net.constants(),
             },
             ChiaNet::Mainnet => Self {
                 id: "mainnet".to_string(),
                 genesis: chia_sdk_types::MAINNET_CONSTANTS.genesis_challenge,
                 port: 8444,
                 introducers: vec!["dns-introducer.chia.net".to_string()],
+                consensus: net.constants(),
             },
         }
     }
@@ -1437,7 +1444,7 @@ mod tests {
     }
 
     fn net() -> Network {
-        Network { id: "mocknet".to_string(), genesis: genesis(), port: 0, introducers: vec![] }
+        Network { id: "mocknet".to_string(), genesis: genesis(), port: 0, introducers: vec![], consensus: &chia_sdk_types::TESTNET11_CONSTANTS }
     }
 
     fn silent() -> Handler {
@@ -1928,6 +1935,7 @@ mod tests {
             assert_eq!(net.genesis, chia_net.constants().genesis_challenge, "{chia_net:?}");
             assert_eq!(net.genesis.to_string(), chia_net.genesis_hex(), "{chia_net:?}");
             assert_eq!(net.introducers.len(), 1, "{chia_net:?}");
+            assert!(std::ptr::eq(net.consensus, chia_net.constants()), "{chia_net:?}: its own consensus constants");
         }
         assert_eq!(Network::of(ChiaNet::Testnet11), Network::testnet11());
         assert_eq!(Network::of(ChiaNet::Mainnet), Network::mainnet());
