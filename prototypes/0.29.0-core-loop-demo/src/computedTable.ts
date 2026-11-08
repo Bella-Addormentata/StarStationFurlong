@@ -3887,11 +3887,15 @@ function compactDuty(pub: string, now: number): void {
   // all: no duty runs for it now, so nothing of it will be revealed. (A
   // switch naming an incarnation that has ended is a lost one, as a missing
   // switch is: computedSwitchLost. It is put back, and the seeds go only if
-  // the incarnation ends.)
+  // the incarnation ends.) 🔒 By the switch's name, not the game the table
+  // plays (computedIncOf): while a FAIR ONLY game is played, the page-signed
+  // incarnation the switch still names is only waiting, its frozen slips
+  // still to reveal when the game ends or the deed moves, and a FAIR ONLY name
+  // in the switch is a hint, not another incarnation taking this one's place.
   for (const st of tables.values()) {
     if (st.mine.size === 0 || !casinoWhole(st.t)) continue;
-    const inc = computedIncOf(st.t);
-    if (computedIncEnded(st.t, st.inc) || (inc !== null && inc !== st.inc && !computedIncEnded(st.t, inc))) letGo(st, () => false);
+    const named = switchIncOf(st.t);
+    if (computedIncEnded(st.t, st.inc) || (named !== null && named !== st.inc && !isFairOnlyInc(named) && !computedIncEnded(st.t, named))) letGo(st, () => false);
   }
   // (Timed from when this page saw it ended, or woke: asleep or not.)
   const awake = tablesAwake(now);

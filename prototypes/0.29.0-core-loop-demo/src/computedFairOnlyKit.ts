@@ -47,10 +47,10 @@ export const signerOf = (k: unknown): ((bytes: Uint8Array) => string) => {
   return k === house2.pub ? (bytes) => houseSign(house2.secret, bytes) : houseSigner;
 };
 
-/** A delegation of `h` by `by`, as the room's deed holder signs one. */
-export function delegation(by: TestIdentity, h: string): DelegationRec {
+/** A delegation of `h` by `by`, as the room's deed holder signs one (in `room`: the kit's, unless a spec plays in another). */
+export function delegation(by: TestIdentity, h: string, room = ROOM): DelegationRec {
   const body = { v: 1 as const, h, k: by.pub };
-  return { ...body, g: by.sign(roomSignBytes('hkey', ROOM, '', body)) };
+  return { ...body, g: by.sign(roomSignBytes('hkey', room, '', body)) };
 }
 /** The owner's delegation of the house. */
 export const DL_HOUSE = delegation(owner, house.pub);

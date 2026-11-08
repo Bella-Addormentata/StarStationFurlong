@@ -2304,6 +2304,20 @@ let foGames = 0;
  *  TABLE'S GAME MOVED: computedGameMovedOf). */
 let foPlayed = new Map<string, string | null>();
 let foMoved = new Map<string, { from: string; to: string }>();
+/** 🔒 The tables with a FAIR ONLY game this page tracks, and the ones
+ *  notePlayedGames is to look at next: a table a game of which was resolved
+ *  again, or whose switch changed, or all of them when the deed holder's key
+ *  did (foLookAll): S9's choice goes by nothing else. Not every table of the
+ *  doc on every transaction (junk under a well-formed key tracks a game, and a
+ *  guest can write many). */
+let foTables = new Set<string>();
+let foLook = new Set<string>();
+let foLookAll = false;
+/** 🔒 The live games of each table (their resolutions, by incarnation): what S9 chooses
+ *  among (computedIncOf), kept where a game is resolved (resolveFairOnly), so that a
+ *  table with many games that are not live (junk under well-formed keys starts one each)
+ *  costs a call no more than a table with none. */
+let foLive = new Map<string, Map<string, Resolution>>();
 /** 🔒 The verdicts on the signatures a FAIR ONLY game's resolution asks about
  *  (authCheck), by sigId: one map for every game of the room, since an id
  *  binds what it covers (a record copied into another game is another thing
@@ -2787,12 +2801,9 @@ export function switchIncOf(tableId: string): string | null {
 export function computedIncOf(tableId: string): string | null {
   const named = switchIncOf(tableId);
   if (foGames === 0) return named;
-  const games: Resolution[] = [];
-  for (const inc of computedIncsOf.get(tableId) ?? []) {
-    const res = computedIncs.get(`${tableId}:${inc}`)?.fo?.res;
-    if (res) games.push(res);
-  }
-  return tableGame(games, deedHolderKey(), named)?.inc ?? named;
+  const live = foLive.get(tableId);
+  if (!live || live.size === 0) return named;
+  return tableGame([...live.values()], deedHolderKey(), named)?.inc ?? named;
 }
 
 /** Whether FAIR ONLY game `inc` of table `tableId` is live (S7): its
@@ -2908,15 +2919,20 @@ export function writeComputedOn(tableId: string, inc: string): void {
  *  of the table, say) in its place. No build takes a switch away
  *  but in the transaction that ends its incarnation (the house's switch-off,
  *  a removal: both mark it), so one gone with its incarnation unended is a
- *  peer's doing. Only while the doc holds the incarnation's live session,
- *  and nothing has ended it; false (nothing written) otherwise. The same
- *  bytes from every page: whichever write the doc keeps, it is the same. */
+ *  peer's doing. 🔒 A FAIR ONLY name holds the switch only while its game is
+ *  live (S7): one nothing opened, one the doc holds only junk records of (no
+ *  base) or one that ended is a dead hint, put back over as a made-up
+ *  page-signed name is, since the table plays nothing under it while `inc` is
+ *  live; a live game's name is left, whichever game the table plays (S9: the
+ *  switch is its hint). Only while the doc holds the incarnation's live
+ *  session, and nothing has ended it; false (nothing written) otherwise. The
+ *  same bytes from every page: whichever write the doc keeps, it is the same. */
 export function putComputedSwitchBack(tableId: string, inc: string): boolean {
   const casino = ensureMap();
   const c = ordinaryInc(tableId, inc);
   if (!c?.live || computedIncEnded(tableId, inc) || switchIncOf(tableId) === inc) return false;
   const now = switchIncOf(tableId);
-  if (now !== null && computedIncs.has(`${tableId}:${now}`) && !computedIncEnded(tableId, now)) return false;
+  if (now !== null && (isFairOnlyInc(now) ? fairOnlyLive(tableId, now) : computedIncs.has(`${tableId}:${now}`) && !computedIncEnded(tableId, now))) return false;
   boundDoc!.transact(() => {
     casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
   });
@@ -2931,15 +2947,22 @@ export function putComputedSwitchBack(tableId: string, inc: string): boolean {
  *  incarnation names none of this game's (a peer's write over it, put back
  *  the same way when the doc holds nothing of the name it wrote). The robot
  *  runs no owner-run round there meanwhile (croupier, crapsCroupier): the
- *  table's players are mid-round on the computed one. */
+ *  table's players are mid-round on the computed one. 🔒 A FAIR ONLY name
+ *  counts as an incarnation while its game is live (S7): one nothing opened,
+ *  or that ended, names none, as an ended name doesn't, so a live page-signed
+ *  incarnation beside it makes the switch lost (the robot must not run its
+ *  round over that one's, and the page that runs it puts the switch back). A
+ *  live game's name is never lost. */
 export function computedSwitchLost(tableId: string, game?: GameName): boolean {
   const named = switchIncOf(tableId);
-  if (named !== null && !computedIncEnded(tableId, named) && (game === undefined || gameOfInc(named) === game)) return false;
+  const open = named !== null && (isFairOnlyInc(named) ? fairOnlyLive(tableId, named) : !computedIncEnded(tableId, named));
+  if (open && (game === undefined || gameOfInc(named!) === game)) return false;
   for (const inc of computedIncsOf.get(tableId) ?? []) {
     if (game !== undefined && gameOfInc(inc) !== game) continue;
     // (A FAIR ONLY game isn't the switch's to lose: the table plays S9's choice
-    // of them, the switch a hint. A switch that names one, live or not, is
-    // not lost: nothing is put back over it here.)
+    // of them, the switch a hint, and none makes the switch lost by being in
+    // the doc: only a live page-signed incarnation does, beside a switch that
+    // names no open one.)
     const c = computedIncs.get(`${tableId}:${inc}`)!;
     if (!c.fo && c.live && !computedIncEnded(tableId, inc)) return true;
   }
@@ -3787,6 +3810,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   computedIncs.set(key, c);
   if (fo) {
     foGames += 1;
+    foTables.add(t);
     staleGames.add(c);
   }
   let incs = computedIncsOf.get(t);
@@ -4111,6 +4135,11 @@ function resolveFairOnly(c: ComputedInc): void {
     { room: boundRoomId, sig: authCheck, liveSid: c.sid === '' ? undefined : c.sid, read: readCkMemo },
     c.t, c.inc, { cks, xfs: fo.xfs, fin: fo.fin, delegations: hkFeedOf() },
   );
+  let live = foLive.get(c.t);
+  if (fo.res.live) {
+    if (!live) foLive.set(c.t, live = new Map());
+    live.set(c.inc, fo.res);
+  } else live?.delete(c.inc);
   c.fold.houseChanged();
 }
 
@@ -4123,27 +4152,35 @@ function refreshFairOnly(dirty?: Set<ComputedInc>): void {
     staleGames.delete(c);
     resolveFairOnly(c);
     dirty?.add(c);
+    foLook.add(c.t);
   }
   notePlayedGames();
 }
 
 /** Look at the game each table with a FAIR ONLY game plays now (computedIncOf:
- *  S9) after anything that may move it (a game resolved again, the switch, the
- *  deed holder): tell the table's view when it moved, and keep that it went from
- *  one FAIR ONLY game to another, for the ⚙ card (computedGameMovedOf). The first
- *  look at a table (a new binding, or its first FAIR ONLY game) moves nothing:
- *  the view is painted from what is there. */
+ *  S9) after anything that may move it: tell the table's view when it moved,
+ *  and keep that it went from one FAIR ONLY game to another, for the ⚙ card
+ *  (computedGameMovedOf). Only the tables that may have moved (foLook: a game
+ *  of theirs resolved again, or their switch changed), or all of them when the
+ *  deed holder did (foLookAll): S9 reads the table's games, the deed holder's
+ *  key and the switch, and nothing else. The first look at a table (a new
+ *  binding, or its first FAIR ONLY game) moves nothing: the view is painted
+ *  from what is there. A FAIR ONLY name that is not live is no game played (the
+ *  switch's hint, where nothing is open), so a game that ended and then
+ *  another that opened is an opening, not a move between them. */
 function notePlayedGames(): void {
   if (foGames === 0) return;
-  const tables = new Set<string>();
-  for (const c of computedIncs.values()) if (c.fo) tables.add(c.t);
+  const tables = foLookAll ? [...foTables] : [...foLook];
+  foLookAll = false;
+  foLook = new Set();
   for (const t of tables) {
-    const now = computedIncOf(t);
+    const played = computedIncOf(t);
+    const now = played !== null && isFairOnlyInc(played) && !fairOnlyLive(t, played) ? null : played;
     const was = foPlayed.get(t);
     foPlayed.set(t, now);
     if (was === undefined || was === now) continue;
     viewTouched.add(`computed:${t}`);
-    if (was !== null && now !== null && isFairOnlyInc(was) && isFairOnlyInc(now) && fairOnlyLive(t, now)) foMoved.set(t, { from: was, to: now });
+    if (was !== null && now !== null && isFairOnlyInc(was) && isFairOnlyInc(now)) foMoved.set(t, { from: was, to: now });
   }
 }
 
@@ -4224,6 +4261,10 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   foGames = 0;
   foPlayed = new Map();
   foMoved = new Map();
+  foTables = new Set();
+  foLook = new Set();
+  foLookAll = false;
+  foLive = new Map();
   roomWaiting = new Set();
   houseBeats = new Map();
   fairSeen = new Map();
@@ -4331,6 +4372,8 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
     if (typeof houseDeedKey === 'string') deedChangedSeen = true;
     houseDeedKey = deedKey;
     houseMoved = true;
+    // (🔒 S9 plays the deed holder's game: every table with one is looked at.)
+    if (foGames > 0) foLookAll = true;
   }
   if (houseMoved) {
     houseChangedAll(dirty);
@@ -4383,6 +4426,8 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
       if (key.startsWith('cfg:computed:')) {
         const t = key.slice('cfg:computed:'.length);
         for (const inc of computedIncsOf.get(t) ?? []) dirty.add(computedIncs.get(`${t}:${inc}`)!);
+        // (🔒 The switch is S9's hint: the table's game may be another now.)
+        if (foTables.has(t)) foLook.add(t);
       } else if (key.startsWith('gone:')) {
         const c = computedIncs.get(key.slice('gone:'.length));
         if (c) dirty.add(c);
