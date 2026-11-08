@@ -871,13 +871,14 @@ pub fn parse_hex32(hex_id: &str) -> Option<Bytes32> {
 /// the spent-height lookup ([`spent_heights`]) and the lease's word
 /// ([`LeaseWord`]) are about. They are one coin for a spend-to-self of one
 /// coin, as every write paid by the SSF wallet's keys is, and a burner's
-/// rewrite, and for every mark, knock entry or older node's record: the
-/// input it consumed, which its new coin names. A burner's first write
-/// (`chia_publish`'s claim-and-write, stage 4 design §4.1) has two: the gift
-/// g as its parent and the dish coin F as its parked input. No mark files
-/// that pair until PR 10 files `parked` beside the parent
-/// ([`WriteCoins::filed`]). Here, not in the publisher, since the knock
-/// verdicts are judged in read-only builds too.
+/// rewrite: the input it consumed, which its new coin names. A burner's
+/// first write (`chia_publish`'s claim-and-write, stage 4 design §4.1) has
+/// two: the gift g as its parent and the dish coin F as its parked input.
+/// A mark or a knock entry files both, the parent as its `coin_id` and the
+/// parked input beside it as its `parked` ([`WriteCoins::filed`]); one an
+/// older node saved has no `parked`, and reads back as its one coin, as it
+/// was judged before. Here, not in the publisher, since the knock verdicts
+/// are judged in read-only builds too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteCoins {
     pub parent: Bytes32,
@@ -891,12 +892,22 @@ impl WriteCoins {
         Self { parent: coin, parked: coin }
     }
 
-    /// The coins a mark or a knock entry filed under its one `coin_id` (hex),
-    /// read back as both: the marks keep one coin until the parked input is
-    /// filed beside it (design §13, PR 10). `None` when it is malformed, as
-    /// [`parse_hex32`] says.
-    pub fn filed(coin_id: &str) -> Option<Self> {
-        parse_hex32(coin_id).map(Self::one)
+    /// The coins a mark or a knock entry filed (stage 4 design §4.4): its
+    /// `coin_id` (hex) as the parent and its `parked` (hex) as the parked
+    /// input. An empty `parked` is a mark or an entry an older node saved,
+    /// whose one coin is both, so it is judged as it was before. `None` when
+    /// either is malformed, as [`parse_hex32`] says, an empty `coin_id`
+    /// included: a mark then has nothing to judge, and a knock entry is dead
+    /// as malformed. A malformed `parked` never falls back to the one coin:
+    /// a burner's first write filed so would be judged at its gift g, which
+    /// the lease never parked and no spend on chain consumes, and read
+    /// pending for ever.
+    pub fn filed(coin_id: &str, parked: &str) -> Option<Self> {
+        let parent = parse_hex32(coin_id)?;
+        if parked.is_empty() {
+            return Some(Self::one(parent));
+        }
+        Some(Self { parent, parked: parse_hex32(parked)? })
     }
 }
 
@@ -1971,19 +1982,31 @@ mod tests {
         assert!(created_coins(&raises).is_err() && extract_ciphertext(&raises, hint).is_err());
     }
 
-    /// Stage 4 design §4.4: a mark or a knock entry files one coin, and it is
-    /// read back as the write's parent and its parked input alike, which every
-    /// write a mark files has as one coin (a burner's first write, whose two
-    /// differ, is filed in none until PR 10); a malformed one files nothing.
+    /// Stage 4 design §4.4: a mark or a knock entry files its write's parent
+    /// as `coin_id` and its parked input as `parked`. One an older node saved
+    /// files no parked input and reads back as its one coin, the parent and
+    /// the parked input alike, as it was judged before; a write the SSF
+    /// wallet's keys pay for files its one coin twice and reads back the
+    /// same; a burner's first write reads back as its gift and its dish coin.
+    /// A malformed coin id or parked input files nothing, and neither does a
+    /// parked input with no coin beside it.
     #[test]
-    fn a_filed_coin_reads_back_as_the_parent_and_the_parked_input_alike() {
+    fn a_filed_coin_with_no_parked_input_reads_back_as_one_coin_and_a_filed_pair_as_its_parent_and_parked_input() {
         let coin = Bytes32::new([7u8; 32]);
+        let (g, f) = (Bytes32::new([8u8; 32]), Bytes32::new([9u8; 32]));
+        let hex_of = |id: Bytes32| hex::encode(id.to_bytes());
         let one = WriteCoins::one(coin);
+        let pair = WriteCoins { parent: g, parked: f };
         assert_eq!((one.parent, one.parked), (coin, coin));
-        assert_eq!(WriteCoins::filed(&hex::encode(coin.to_bytes())), Some(one));
-        assert_eq!(WriteCoins::filed(&hex::encode(coin.to_bytes()).to_uppercase()), Some(one), "read as parse_hex32 reads it");
-        assert_eq!(WriteCoins::filed("zz"), None);
-        assert_eq!(WriteCoins::filed("0011"), None, "the wrong length files nothing");
-        assert_eq!(WriteCoins::filed(""), None, "a mark an older node wrote names no coin");
+        assert_eq!(WriteCoins::filed(&hex_of(coin), ""), Some(one), "a mark an older node saved: its one coin is both");
+        assert_eq!(WriteCoins::filed(&hex_of(coin), &hex_of(coin)), Some(one), "one coin filed twice");
+        assert_eq!(WriteCoins::filed(&hex_of(g), &hex_of(f)), Some(pair), "the gift as the parent, the dish coin as the parked input");
+        assert_eq!(WriteCoins::filed(&hex_of(g).to_uppercase(), &hex_of(f).to_uppercase()), Some(pair), "read as parse_hex32 reads them");
+        assert_eq!(WriteCoins::filed("zz", ""), None);
+        assert_eq!(WriteCoins::filed("0011", ""), None, "the wrong length files nothing");
+        assert_eq!(WriteCoins::filed("", ""), None, "a mark an older node wrote names no coin");
+        assert_eq!(WriteCoins::filed(&hex_of(coin), "zz"), None, "a malformed parked input files nothing, not the one coin");
+        assert_eq!(WriteCoins::filed(&hex_of(coin), "0011"), None, "nor one of the wrong length");
+        assert_eq!(WriteCoins::filed("", &hex_of(f)), None, "no coin: nothing to judge");
     }
 }
