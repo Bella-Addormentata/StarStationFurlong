@@ -2336,6 +2336,13 @@ let foGames = 0;
  *  TABLE'S GAME MOVED: computedGameMovedOf). */
 let foPlayed = new Map<string, string | null>();
 let foMoved = new Map<string, { from: string; to: string }>();
+/** 🔒 Which games have a live FAIR ONLY game at each table as last looked at (bit 1:
+ *  roulette, bit 2: craps; a table with none has no entry): a name of the other game
+ *  holds a page-signed incarnation's felts beside a live game of its own game only
+ *  (otherGameStands), and a second game of the other letter opening or ending moves
+ *  that though the game played does not (S9 goes by the holder, the switch and the
+ *  lowest name, and no letter). */
+let foLivesOf = new Map<string, number>();
 /** 🔒 How many times, by table, the game it plays moved to or from a live FAIR ONLY
  *  game since this page bound the doc: one opened, one ended, or S9's choice went from
  *  one to another (computedGameMovesOf). */
@@ -4052,24 +4059,36 @@ function switchHoldsFelts(named: string | null, c: ComputedInc): boolean {
 }
 
 /** Whether `named`, the name in the switch of table `c.t`, is an incarnation of the
- *  other game that the doc holds and nothing has ended, while a FAIR ONLY game is
- *  live at the table: page-signed incarnation `c`'s game cannot play it, so it is a
- *  peer's doing (or a forgery), and it is no successor of `c` and no hint to the game
- *  either. The table plays the game and `c` waits, as it waits under a hint: its
+ *  other game that the doc holds and nothing has ended, while a FAIR ONLY game of `c`'s
+ *  game is live at the table: page-signed incarnation `c`'s game cannot play it, so it
+ *  is a peer's doing (or a forgery), and it is no successor of `c` and no hint to the
+ *  game either. The table plays the game and `c` waits, as it waits under a hint: its
  *  players are mid-round, its seeds and its state are kept, so the stakes of its felts
  *  stay held (the chips are not there to spend while the round can still settle) and
  *  compaction leaves it be. The room takes the name away a minute on (computedTable
- *  awayDuty ends a name of another game than the table's, as a removal ends it), and the
- *  pages that ran `c` put the switch back then; a table out of the room's list has no
- *  such page, and compaction ends the abandoned incarnation, its open round void. A name
+ *  awayDuty ends a name of another game than the table's, as a removal ends it, and
+ *  names the incarnation its pages run in the same write); a table out of the room's
+ *  list has no such page, and compaction ends the abandoned incarnation, its open round
+ *  void. Where the game live is not of `c`'s game, `c` waits for nothing: the table
+ *  cannot play it, so the name of the table's own game in the switch (written after `c`
+ *  was named, or beside a session of `c` that nothing named) holds none of its stakes,
+ *  and compaction ends it after its wait. A name
  *  the doc holds nothing of, or one that has ended, is a lost switch instead, which those
  *  pages put back at their next look. With no live game it is the same lost switch, as on
  *  main: the stakes free, and compaction ending the incarnation after its wait unless the
  *  name goes first (a name deleted within seconds is put over by the pages that ran the
  *  incarnation: putSwitchBack, pinned by computedRobotPages.test.ts). */
 function otherGameStands(c: ComputedInc, named: string): boolean {
-  return (foLive.get(c.t)?.size ?? 0) > 0
-    && gameOfInc(named) !== gameOfInc(c.inc) && ordinaryInc(c.t, named) !== undefined && !computedIncEnded(c.t, named);
+  return gameOfInc(named) !== gameOfInc(c.inc) && liveGameOf(c.t, gameOfInc(c.inc))
+    && ordinaryInc(c.t, named) !== undefined && !computedIncEnded(c.t, named);
+}
+
+/** Whether table `t` has a live FAIR ONLY game of `game`. */
+function liveGameOf(t: string, game: GameName): boolean {
+  const live = foLive.get(t);
+  if (live === undefined) return false;
+  for (const name of live.keys()) if (gameOfInc(name) === game) return true;
+  return false;
 }
 
 /** Whether the switch of table `tableId` has left page-signed incarnation `inc`
@@ -4278,7 +4297,9 @@ function refreshFairOnly(dirty?: Set<ComputedInc>): void {
  *  page-signed duties that wait meanwhile (computedGameMovesOf). A game opening
  *  or ending also puts the table's page-signed incarnations in `dirty`, to be
  *  counted again: a name of the table's other game holds their felts only beside
- *  a live game (switchHoldsFelts). Only the tables that may have moved (foLook:
+ *  a live game of their own game (switchHoldsFelts), so a game of the other letter
+ *  opening or ending beside the game played does too (foLivesOf), though it moves
+ *  neither the view nor the count of moves. Only the tables that may have moved (foLook:
  *  a game of theirs resolved again, or their switch changed), or all of them when
  *  the deed holder did (foLookAll): S9 reads the table's games, the deed holder's
  *  key and the switch, and nothing else. The first look at a table (a new
@@ -4297,17 +4318,23 @@ function notePlayedGames(dirty?: Set<ComputedInc>): void {
     const now = played !== null && isFairOnlyInc(played) && !fairOnlyLive(t, played) ? null : played;
     const was = foPlayed.get(t);
     foPlayed.set(t, now);
-    if (was === now) continue;
+    const lives = (liveGameOf(t, 'roulette') ? 1 : 0) | (liveGameOf(t, 'craps') ? 2 : 0);
+    const livesMoved = lives !== (foLivesOf.get(t) ?? 0);
+    if (lives === 0) foLivesOf.delete(t);
+    else foLivesOf.set(t, lives);
+    if (was === now && !livesMoved) continue;
     const from = was !== undefined && was !== null && isFairOnlyInc(was);
     const to = now !== null && isFairOnlyInc(now);
     // (A game opening or ending, the table's first included, moves what the table's
     // page-signed incarnations wait under: a name of the other game holds their
-    // felts only beside a live game.)
-    if ((from || to) && dirty) for (const inc of computedIncsOf.get(t) ?? []) {
+    // felts only beside a live game of their own game. So does a game of the other
+    // letter opening or ending beside the game played, which moves no view and
+    // counts no move.)
+    if ((from || to || livesMoved) && dirty) for (const inc of computedIncsOf.get(t) ?? []) {
       const c = computedIncs.get(`${t}:${inc}`);
       if (c && !c.fo) dirty.add(c);
     }
-    if (was === undefined) continue; // (the first look at a table touches no view and counts no move)
+    if (was === now || was === undefined) continue; // (the first look at a table touches no view and counts no move)
     viewTouched.add(`computed:${t}`);
     if (from || to) foMoves.set(t, (foMoves.get(t) ?? 0) + 1);
     if (from && to) foMoved.set(t, { from: was!, to: now! });
@@ -4403,6 +4430,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   foGames = 0;
   foPlayed = new Map();
   foMoved = new Map();
+  foLivesOf = new Map();
   foMoves = new Map();
   foTables = new Set();
   foLook = new Set();

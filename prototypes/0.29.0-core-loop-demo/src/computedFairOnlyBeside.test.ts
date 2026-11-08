@@ -15,12 +15,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { seedTable, slipCommit, slipKeyFor } from './computedFold';
-import { faironlyInc, sealFin } from './computedFairOnly';
-import { delegation, hex, house, NAME, owner, rootOf, trimOf } from './computedFairOnlyKit';
+import { dutyRank, seedTable, slipCommit, slipKeyFor } from './computedFold';
+import { faironlyInc, NO_CLOSE, sealCk, sealFin } from './computedFairOnly';
+import { delegation, hex, house, NAME, OPENING_CARRY, owner, rootOf, trimOf } from './computedFairOnlyKit';
 import { clockOf, deliver, frame, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run, send, signAs, switchOn, sync, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { black, red } from './computedTestKit';
+import { black, red, testHouse } from './computedTestKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -43,6 +43,8 @@ const root = rootOf(G, 'p', { dl: delegation(owner, house.pub, PAGE_ROOM) });
 const end = trimOf(G, 'p', {
   ok: NAME.ok, j: NAME.j, u: 5, l: hex('e', 32), e: 1, f: sealFin(G, owner.pub, owner.sign).value, s: undefined, h: undefined, k: owner.pub, dl: undefined, n: {},
 });
+/** The house a room has when the deed holder's page delegates a key (the migration of a table PR 2-4 opened needs one). */
+const HOUSE = testHouse('beside-room-house');
 /** A second game the owner opens at the same table once the first has ended, and its end. */
 const NAME2 = { ...NAME, j: 'fedcba9876543210' };
 const G2 = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, NAME2) };
@@ -50,8 +52,30 @@ const root2 = rootOf(G2, 'p', { j: NAME2.j, dl: delegation(owner, house.pub, PAG
 const end2 = trimOf(G2, 'p', {
   ok: NAME2.ok, j: NAME2.j, u: 5, l: hex('e', 32), e: 1, f: sealFin(G2, owner.pub, owner.sign).value, s: undefined, h: undefined, k: owner.pub, dl: undefined, n: {},
 });
+/** A craps game the kit's owner opens at the same (roulette) table: a forgery (an honest table plays its own letter), but a state the doc can hold. */
+const NAMER = { ...NAME, j: '0123456789abcdef' };
+const GR = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('q', PAGE_ROOM, TABLE, NAMER) };
+const rootR = rootOf(GR, 'q', { j: NAMER.j, dl: delegation(owner, house.pub, PAGE_ROOM) });
+
+/** A game at ANOTHER table of the room, and its end: a live game there is no game at this table. */
+const OTHER_T = 'roulette-2';
+const GO = { room: PAGE_ROOM, t: OTHER_T, inc: faironlyInc('p', PAGE_ROOM, OTHER_T, NAME) };
+const rootO = rootOf(GO, 'p', { dl: delegation(owner, house.pub, PAGE_ROOM) });
+const endO = trimOf(GO, 'p', {
+  ok: NAME.ok, j: NAME.j, u: 5, l: hex('e', 32), e: 1, f: sealFin(GO, owner.pub, owner.sign).value, s: undefined, h: undefined, k: owner.pub, dl: undefined, n: {},
+});
 
 const seedCtx = (p: Page, r: number) => ({ room: CTX.room, table: seedTable(CTX), round: r, party: p.pid, house: '' });
+
+/** A craps game at the roulette table held by page `p` (a forgery: an honest table plays its own letter): the game the deed holder plays when the room names `p` its owner, whatever its letter (S9). */
+function crapsGameHeldBy(p: Page): { inc: string; root: { key: string; value: unknown } } {
+  const name = { ...NAME, ok: p.pub, j: 'abcdef0123456789' };
+  const ctx = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('q', PAGE_ROOM, TABLE, name) };
+  const sign = (bytes: Uint8Array): string => p.keypair.signIdentity(bytes);
+  const dl = delegation({ pub: p.pub, sign } as never, house.pub, PAGE_ROOM);
+  const body = { v: 1, ok: p.pub, j: name.j, rv: name.rv, ts: name.ts, b: 'g', u: 0, l: NO_CLOSE, n: {}, s: OPENING_CARRY, dl, k: p.pub };
+  return { inc: ctx.inc, root: sealCk(ctx, body as never, sign) };
+}
 
 /** Page p back in the room on a fresh doc holding `from`'s state, as a rejoin
  *  binds one: what it kept of its tables is of the last binding, its seeds are
@@ -1218,6 +1242,130 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     }
   });
 
+  // The write that ends the name is the one that puts the switch back, in the room's list: a
+  // look at the doc between the two would find the switch bare and the stakes free, and a
+  // cash-out in that frame would take chips a round that resumes rests on. Out of the list no
+  // page names it back, though each holds a state of the incarnation (it ran the table before
+  // the game opened): a removed table is ended, and this page runs it no more.
+  it.each([
+    ['at a table in the room', undefined],
+    ['at a table out of the room: no page names it back, though each holds a state of the incarnation', []],
+  ] as [string, string[] | undefined][])('stay held through the room clearing the name of the table\'s other game: the write that ends it names them again, so no look between the two finds the switch bare and their stakes free, %s', async (_, tables) => {
+    const { a, b } = await staked();
+    const craps = 'k' + '3f'.repeat(12);
+    run([a, b], T0, T0, { step: STEP }); // (a frame at the table in the room's list before the game opens: each page holds a state of the incarnation)
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    takeSwitchTo(a, craps);
+    sync(T0 + 2, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    let cleared = -1;
+    for (let T = T0 + 3; T < T0 + 3 + 3 * a.table.AWAY_MS && cleared < 0; T += 500) {
+      run([a, b], T, T, { step: STEP, tables });
+      if (casinoOf(a).has(`gone:${TABLE}:${craps}`)) cleared = T;
+    }
+    expect(cleared).toBeGreaterThan(0);
+    // (The clear is on both pages, and neither has had a frame since.)
+    if (tables === undefined) {
+      expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+      for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+      clockOf(a, cleared);
+      expect(a.casino.cashOutChips(a.pid, 1_000)).toBe(991);
+      expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+    } else {
+      expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    }
+  });
+
+  // An incarnation of the table's other game waits for nothing: the table cannot play it, so
+  // the name of the table's own game that a peer wrote after it holds none of its stakes, and
+  // compaction ends it after its wait, as with no game. Whether the switch ever named it or
+  // not: any guest can write the key of a session of it.
+  it.each([
+    ['that the switch has left for theirs', true],
+    ['that the switch never named, a stray session', false],
+  ] as [string, boolean][])('hold nothing of an incarnation of the table\'s other game %s beside a live game: it is listed and compacted after its wait, and theirs stay held', async (_, named) => {
+    const { a, b } = await staked();
+    const craps = 'k' + '3f'.repeat(12);
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    if (named) {
+      takeSwitchTo(a, craps); // (a peer opens the craps incarnation and takes the switch to it...)
+      sync(T0 + 2, a, b);
+    } else {
+      a.doc.transact(() => computedOf(a).set(`ses:${TABLE}:${craps}:g`, new Y.Map())); // (...or only writes a session of it)
+    }
+    switchTo(a, INC); // (...and writes the switch back to the table's own)
+    sync(T0 + 3, a, b);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).toContain(craps);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).not.toContain(INC);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    run([a, b], T0 + 4, T0 + 4 + 3 * a.table.COMPACT_FALLBACK_MS, { step: 1_000 });
+    expect(a.casino.computedIncEnded(TABLE, craps)).toBe(true);
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+  });
+
+  // What a name of the other game holds follows the games live at the table by their letter,
+  // not the game played: a roulette game opening or ending beside a craps game that is played
+  // (S9 plays the deed holder's, whatever its letter) moves what the incarnation's stakes wait
+  // under, and the page that lived the history must count what a page bound afresh on the doc
+  // counts.
+  it('follow a game of their own letter opening and ending beside a craps game the deed holder plays: the stakes held under a name of the other game are counted again, as a page bound afresh counts them', async () => {
+    const { a, b } = await staked();
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid)); // (A holds the deed)
+    sync(T0, a, b);
+    const Q = crapsGameHeldBy(a);
+    const craps = 'k' + '3f'.repeat(12);
+    record(a, Q.root);
+    takeSwitchTo(a, craps);
+    sync(T0 + 1, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(Q.inc); // (the deed holder's game is played)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000); // (no roulette game is live: the craps name holds nothing)
+    const moves = a.casino.computedGameMovesOf(TABLE);
+    record(a, root); // (the roulette game opens beside it)
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(Q.inc); // (still the craps game played)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    rejoin(b, a, 777, T0 + 3); // (a page bound afresh on the doc counts the same)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    record(a, end); // (...and ends)
+    sync(T0 + 4, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(Q.inc);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    rejoin(b, a, 778, T0 + 5);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(moves); // (the game played did not move)
+  });
+
+  // The live letters are what moved, not their number: the roulette game ends in the write in
+  // which a second craps game opens (two live games before, two after), the deed holder's
+  // craps game played all along, and the stakes held under the name of the other game are free.
+  it('follow the live letters and not their number: the roulette game ending in the write in which a second craps game opens frees the stakes held under a name of the other game', async () => {
+    const { a, b } = await staked();
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid)); // (A holds the deed)
+    sync(T0, a, b);
+    const Q = crapsGameHeldBy(a);
+    const craps = 'k' + '3f'.repeat(12);
+    record(a, Q.root);
+    takeSwitchTo(a, craps);
+    record(a, root); // (the roulette game opens beside the deed holder's craps game)
+    sync(T0 + 1, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(Q.inc);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    a.doc.transact(() => { // (one write: the roulette game ends, a second craps game opens)
+      computedOf(a).set(end.key, end.value);
+      computedOf(a).set(rootR.key, rootR.value);
+    });
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(Q.inc); // (the deed holder's craps game is played all along)
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    rejoin(b, a, 779, T0 + 3); // (a page bound afresh counts the same)
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+  });
+
   // The game can end while the name stands. No game is live then, so the name is the lost
   // switch that main reads it as: the stakes are free, and compaction ends the incarnation
   // after its wait (the room's clearing of the name, which the pages' put-back answers, comes
@@ -1297,9 +1445,10 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
 
   // The stakes follow the name too: held under a tracked incarnation of the other game
   // beside a live game, free under one that has ended (a lost switch, put back at once),
-  // held again when the mark is deleted, and free again when it is written. Each is a count
-  // of the table's others that no record of theirs brought.
-  it('follow the other game\'s name as it qualifies beside a live game: held when its removal\'s mark is deleted, free when it is written', async () => {
+  // held again when the mark is deleted, free again when it is written, and held again when
+  // it is deleted again (each flip is recorded as it is: the count after the third is not a
+  // repeat of the first). Each is a count of the table's others that no record of theirs brought.
+  it('follow the other game\'s name as it qualifies beside a live game: held when its removal\'s mark is deleted, free when it is written, held when it is deleted again', async () => {
     const { a, b } = await staked();
     const craps = 'k' + '3f'.repeat(12);
     record(a, root);
@@ -1318,6 +1467,113 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     a.doc.transact(() => casinoOf(a).set(`gone:${TABLE}:${craps}`, 1));
     sync(T0 + 4, a, b);
     for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    a.doc.transact(() => casinoOf(a).delete(`gone:${TABLE}:${craps}`));
+    sync(T0 + 5, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+  });
+
+  // The same by an end checkpoint (a sum: record that carries e:1) and not a mark: the name
+  // is ended by one, revived by one that does not end it, ended by one again, and the stakes
+  // are free, held and free; a page bound afresh on a doc that holds the name ended by a
+  // checkpoint reads the revival against that, and one bound on the doc that holds it alive
+  // reads the end.
+  it('follow the other game\'s name as an end checkpoint ends it and revives it beside a live game: free, held, free', async () => {
+    const { a, b } = await staked();
+    const craps = 'k' + '3f'.repeat(12);
+    const sum = (e: boolean) => signAs(a, 'sum', { v: 1, b: 'g', u: 1, l: hex('e', 32), n: {}, ...(e ? { e: 1 as const } : { s: { p: 0, w: {} } }) }, { room: PAGE_ROOM, t: TABLE, inc: craps });
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    a.doc.transact(() => {
+      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: craps });
+      computedOf(a).set(`ses:${TABLE}:${craps}:g`, new Y.Map());
+      computedOf(a).set(`sum:${TABLE}:${craps}`, sum(true));
+    });
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncEnded(TABLE, craps)).toBe(true);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).toContain(INC);
+    record(a, { key: `sum:${TABLE}:${craps}`, value: sum(false) });
+    sync(T0 + 3, a, b);
+    expect(a.casino.computedIncEnded(TABLE, craps)).toBe(false);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).not.toContain(INC);
+    record(a, { key: `sum:${TABLE}:${craps}`, value: sum(true) });
+    sync(T0 + 4, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+  });
+
+  it('follow the other game\'s name for a page bound with it ended by an end checkpoint in the doc already: the revival holds the stakes, and the end of a name bound alive frees them', async () => {
+    const { a, b } = await staked();
+    const craps = 'k' + '3f'.repeat(12);
+    const sum = (e: boolean) => signAs(a, 'sum', { v: 1, b: 'g', u: 1, l: hex('e', 32), n: {}, ...(e ? { e: 1 as const } : { s: { p: 0, w: {} } }) }, { room: PAGE_ROOM, t: TABLE, inc: craps });
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    a.doc.transact(() => {
+      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: craps });
+      computedOf(a).set(`ses:${TABLE}:${craps}:g`, new Y.Map());
+      computedOf(a).set(`sum:${TABLE}:${craps}`, sum(true));
+    });
+    sync(T0 + 2, a, b);
+    rejoin(b, a, 12, T0 + 3); // (B is bound afresh on a doc that holds the name ended by a checkpoint)
+    expect(b.casino.readChips(b.pid)).toBe(1_000);
+    record(a, { key: `sum:${TABLE}:${craps}`, value: sum(false) });
+    sync(T0 + 4, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991);
+    rejoin(b, a, 13, T0 + 5); // (and again, on a doc that holds it alive)
+    expect(b.casino.readChips(b.pid)).toBe(991);
+    record(a, { key: `sum:${TABLE}:${craps}`, value: sum(true) });
+    sync(T0 + 6, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+  });
+
+  // The recount when a game opens or ends reaches EVERY page-signed incarnation of the
+  // table, not only the first the page tracked: the switch moved to a second incarnation of
+  // the table's game before a name of the other game came, and the stakes sit on the second.
+  it('follow the game opening and ending for the second page-signed incarnation of the table, too: the stakes sit on the one the switch moved to', async () => {
+    const [a, b] = await openRoom(['A', 'B'], T0);
+    const second = 'c' + '5d'.repeat(12);
+    const craps = 'k' + '3f'.repeat(12);
+    takeSwitchTo(a, second); // (the switch moves to the second incarnation of the table's game; the first is over)
+    sync(T0 + 1, a, b);
+    const at = run([a, b], T0 + 2, T0 + 2_000, { step: STEP });
+    expect(a.casino.computedIncOf(TABLE)).toBe(second);
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], at)).toBe('ok');
+    clockOf(b, at);
+    expect(b.table.writeComputedSlip(TABLE, [black(9)], at)).toBe('ok');
+    sync(at, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991); // (stakes on the second)
+    takeSwitchTo(a, craps); // (a name of the other game, tracked; no game live yet: a lost switch)
+    sync(at + 1, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    record(a, root); // (a game opens)
+    sync(at + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(991); // (held: the second waits under the name)
+    record(a, end); // (the game ends)
+    sync(at + 3, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+  });
+
+  // A live game at ANOTHER table of the room is no game at this one: a name of the other game
+  // in this table's switch is main's lost switch here (the stakes free, the incarnation listed),
+  // whatever is played elsewhere, and the game's opening and ending there move nothing here.
+  it('stay free under a tracked incarnation of the table\'s other game when the game that is live is at another table of the room: it is no game here', async () => {
+    const { a, b } = await staked();
+    const craps = 'k' + '3f'.repeat(12);
+    record(a, rootO); // (a live game at roulette-2)
+    takeSwitchTo(a, craps);
+    sync(T0 + 1, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(craps); // (no game here: the switch's name is played)
+    expect(a.casino.computedIncOf(OTHER_T)).toBe(GO.inc);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).toContain(INC);
+    record(a, endO); // (and its end moves nothing here)
+    sync(T0 + 2, a, b);
+    for (const p of [a, b]) expect(p.casino.readChips(p.pid)).toBe(1_000);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).toContain(INC);
   });
 
   // A page bound afresh finds the name in the doc already, ended or not, and reads the turns
@@ -1378,7 +1634,7 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
   // to take a place, or ceases to: the specs around this one make it turn), not at each of
   // its records: a busy named incarnation among a flood of made-up names costs a count or two
   // a record, not a count of every name.
-  it('do not count the table\'s others again at each record of the incarnation the switch names: a flood of names and a busy named incarnation cost a count or two a record', async () => {
+  it.each([['unended', false], ['ended', true]] as [string, boolean][])('do not count the table\'s others again at each record of the %s incarnation the switch names: a flood of names and a busy named incarnation cost a count or two a record', async (_, ended) => {
     const [a] = await openRoom(['A'], T0);
     clockOf(a, T0);
     expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
@@ -1387,7 +1643,10 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     for (let i = 0; i < names; i++) {
       a.doc.transact(() => computedOf(a).set(`ses:${TABLE}:${name(i)}:g`, new Y.Map()));
     }
-    a.doc.transact(() => casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: name(0) }));
+    a.doc.transact(() => {
+      if (ended) casinoOf(a).set(`gone:${TABLE}:${name(0)}`, 1); // (an ended incarnation takes no place: its records turn nothing)
+      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: name(0) });
+    });
     const spy = vi.spyOn(a.fold.TableFold.prototype, 'result');
     const records = 20;
     for (let k = 0; k < records; k++) {
@@ -1395,6 +1654,69 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     }
     // (A record of the named incarnation counts it; with a count of the other forty for each, 800.)
     expect(spy.mock.calls.length).toBeLessThanOrEqual(4 * records);
+  });
+
+  // The count of the game's moves (computedGameMovesOf) is of a table's game opening, ending
+  // or moving to another, not of the switch moving between page-signed incarnations while a
+  // dead game is tracked at the table.
+  it('count no move of the table\'s game when the switch moves from one page-signed incarnation to another, a game that ended being tracked at the table', async () => {
+    const { a, b } = await staked();
+    const other = 'c' + '5d'.repeat(12);
+    record(a, root);
+    sync(T0 + 1, a, b);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(0); // (the first look at the table moves nothing)
+    record(a, end);
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    const moves = a.casino.computedGameMovesOf(TABLE);
+    expect(moves).toBe(1); // (the game ended: one move)
+    takeSwitchTo(a, other);
+    sync(T0 + 3, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(moves); // (a page-signed incarnation taking the switch moves no game)
+    expect(b.casino.computedGameMovesOf(TABLE)).toBe(moves);
+  });
+
+  // The recount when a game opens or ends (and when a game of the other letter does) is due
+  // at that move, not at each record of a game that stays live: a flood of names tracked at
+  // the table costs a count or two a record of the game, not a count of every name.
+  it('do not count the table\'s others again at each record of a game that stays live: a flood of names costs a count or two a record', async () => {
+    const [a] = await openRoom(['A'], T0);
+    clockOf(a, T0);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+    const names = 40;
+    const name = (i: number): string => `c${(i + 2).toString(16).padStart(24, '0')}`;
+    for (let i = 0; i < names; i++) {
+      a.doc.transact(() => computedOf(a).set(`ses:${TABLE}:${name(i)}:g`, new Y.Map()));
+    }
+    record(a, root); // (the game opens: the table's others are counted again, once)
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    const spy = vi.spyOn(a.fold.TableFold.prototype, 'result');
+    const records = 20;
+    for (let k = 0; k < records; k++) record(a, trimOf(G, 'p', { u: 4 + k }));
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    // (A record of the game counts it; with a count of the other forty for each, 800.)
+    expect(spy.mock.calls.length).toBeLessThanOrEqual(4 * records);
+  });
+
+  // The names a page tracked are looked at once, at the transaction that follows: a plain
+  // write of the casino map, 20 of them, costs nothing for the sixty names tracked before.
+  it('look at a name tracked once and not again: later transactions cost nothing for the names a page tracked before', async () => {
+    const calls = async (names: number): Promise<number> => {
+      const [a] = await openRoom(['A'], T0);
+      const name = (i: number): string => `c${(i + 1).toString(16).padStart(24, '0')}`;
+      for (let i = 0; i < names; i++) {
+        a.doc.transact(() => computedOf(a).set(`ses:${TABLE}:${name(i)}:g`, new Y.Map()));
+      }
+      const spy = vi.spyOn(Y.Map.prototype, 'has');
+      for (let k = 0; k < 20; k++) a.doc.transact(() => casinoOf(a).set(`junk:${k}`, k));
+      const n = spy.mock.calls.length;
+      spy.mockRestore();
+      return n;
+    };
+    const few = await calls(1);
+    const many = await calls(60);
+    expect(many).toBeLessThanOrEqual(few + 2 * 20);
   });
 
   // A name nothing of which the doc holds takes nobody's place, whichever game it is
@@ -1464,8 +1786,13 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
 
   /** Both pages ticked until the close is in, then the game opens (its root and the
    *  switch naming it) and is played for `ms` with both pages ticking, then ends. */
-  async function playedBeside(ms: number): Promise<{ a: Page; b: Page; at: number }> {
+  async function playedBeside(ms: number, withHouse = false): Promise<{ a: Page; b: Page; at: number }> {
     const { a, b } = await staked();
+    if (withHouse) { // (the room has a house: A holds the deed and delegates the house's key on its next frame)
+      a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', a.pid));
+      sync(T0, a, b);
+      a.table.setLocalHouse(HOUSE.pub);
+    }
     const closed = (): boolean => keysIn(a, 'c', 1).length > 0;
     const at = run([a, b], T0 + STEP, T0 + 60_000, { step: STEP, until: closed });
     expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
@@ -1476,6 +1803,7 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     const mid = run([a, b], at + STEP, at + ms, { step: STEP });
     record(a, end);
     sync(mid, a, b);
+    if (withHouse) expect(a.casino.houseSetUp()).toBe(true);
     return { a, b, at: mid };
   }
 
@@ -1488,6 +1816,40 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     expect(round.forfeit).toBeUndefined();
     expect([...round.counted].sort()).toEqual([a.pid, b.pid].sort());
     expect(b.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!.decided).toBe('reveals');
+  });
+
+  // The time a state is served again from is the page's clock, which a read or a frame
+  // sets. A read that serves the table before any frame (the display asks which round is
+  // decided to; the migration of a table PR 2-4 opened, with a house in the room) refreshes
+  // it first, as every other read does: else the state would wait from the time of the
+  // last frame, seconds old, and the next frame, short of a wake, would find the grace of
+  // a close long past and forfeit the player whose page had not yet revealed. (The page
+  // whose turn is first among the bettors is the one that reads, and frames first: a page
+  // behind it in turn stands by a few seconds, and the other's reveal comes in meanwhile.)
+  it.each([
+    ['the round decided to, without a game', false, (p: Page) => expect(typeof p.table.computedDecidedTo(TABLE)).toBe('number')],
+    ['the round decided to, at a roulette table', false, (p: Page) => expect(typeof p.table.computedDecidedTo(TABLE, 'roulette')).toBe('number')],
+    ['the migration to a house table, the room having a house', true, (p: Page) => expect(p.table.autoSwitchComputed(TABLE, 'roulette')).toBe(false)],
+  ] as [string, boolean, (p: Page) => void][])('start afresh from now for a read that serves the table before any frame, too: the page\'s last frame is seconds old, the grace is from the read and not from it (%s)', async (_, withHouse, read) => {
+    const { a, b, at } = await playedBeside(40_000, withHouse);
+    const [first, second] = [a, b].sort((x, y) => (dutyRank('forfeit', CTX, 1, x.pub) < dutyRank('forfeit', CTX, 1, y.pub) ? -1 : 1));
+    const last = at - STEP; // (the pages' last frames, in the game)
+    // Another page puts the switch back (written as it writes it); the page's has not looked since its last frame.
+    switchTo(first, INC);
+    sync(last + 1_500, first, second);
+    expect(first.casino.computedIncOf(TABLE)).toBe(INC);
+    expect(first.casino.computedGameMovesOf(TABLE)).toBeGreaterThan(0); // (the doc counted the game, this page looking at nothing)
+    // Its display asks five seconds after that frame, and its next frame comes at once: short of a wake,
+    // past the grace of a close seen at the last frame (REVEAL_GRACE_MS). The other page looks then too.
+    clockOf(first, last + 5_000);
+    read(first);
+    run([first, second], last + 5_000, last + 5_000 + 2_000, { step: STEP });
+    expect(first.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!.forfeit).toBeUndefined();
+    run([first, second], last + 7_200, last + 30_000, { step: STEP });
+    const round = first.casino.computedFoldOf(TABLE)!.rounds.find((r) => r.r === 1)!;
+    expect(round.decided).toBe('reveals');
+    expect(round.forfeit).toBeUndefined();
+    expect([...round.counted].sort()).toEqual([a.pid, b.pid].sort());
   });
 
   it('start a betting window afresh too: the view built before the game, of a window that had run out, is not served again, the session being as it was', async () => {

@@ -2749,6 +2749,11 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
  * moment between a removal and its teardown on the page removing it. Every
  * page writes the same few keys, and only until one of them lands. Not on a
  * frame whose doc was bound afresh since this page looked at its clock.
+ * Where the name is another game's and the table is in the room's list, the
+ * write that ends it also puts the switch back on the incarnation this page
+ * runs, if it runs one (putSwitchBack): that incarnation waited beside a
+ * live game with its stakes held under the name (casinoDoc otherGameStands),
+ * and a switch bare for the length of a frame would have freed them.
  */
 function awayDuty(inRoom: ReadonlyMap<string, GameName>, now: number): void {
   if (casinoDocEpoch() !== clock.epoch) return;
@@ -2764,7 +2769,15 @@ function awayDuty(inRoom: ReadonlyMap<string, GameName>, now: number): void {
     let at = awayAt.get(key);
     if (at === undefined || at > now) awayAt.set(key, at = now);
     if (now - at < AWAY_MS) continue;
-    if (transactCasino(() => writeComputedGone(t, inc))) away.delete(key);
+    // (A table in the room's list: the switch goes back to the incarnation this page runs in the same write,
+    // as its next frame would put it back (putSwitchBack), or no look at the doc between the two would find
+    // the switch bare and the stakes of that incarnation free, held as they were under the name just ended.
+    // At a table out of the list no page puts it back, and the incarnation is compacted instead.)
+    if (transactCasino(() => {
+      if (!writeComputedGone(t, inc)) return false;
+      if (inRoom.has(t)) putSwitchBack(t, now);
+      return true;
+    })) away.delete(key);
   }
   for (const key of [...awayAt.keys()]) if (!watching.has(key)) awayAt.delete(key);
 }
@@ -4341,11 +4354,14 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
  * every page computes alike (computedIncFor: `r` or `d`). The house's
  * choice of owner-run play is untouched (the table stays computed). The
  * driving page's, with the automatic switch-on (autoSwitchComputed). True
- * when it moved the table.
+ * when it moved the table. Like every entry that serves a table, it looks at
+ * the page's clock first (`now`), once it gets as far as the table: serving
+ * the state again after a game takes the time from it (tableOf).
  */
 function migrateComputed(t: string, game: GameName, now: number): boolean {
   const inc = computedIncOf(t);
   if (inc === null || houseRules(inc) || gameOfInc(inc) !== game || !houseSetUp() || switchGate(t, now)) return false;
+  lookAtClock(now);
   const at = tableOf(t, game);
   if (!at) return false;
   const { st, res } = at;
@@ -4894,8 +4910,11 @@ export function computedUndoneCount(t: string): number {
  *  checkpoint's round is then not counted. With `game`, null too while
  *  the switch names the other game's incarnation (as every per-frame read:
  *  a game-blind read there would let go of this page's state for the live
- *  one, its seeds among it, for the other's). */
-export function computedDecidedTo(t: string, game?: GameName): number | null {
+ *  one, its seeds among it, for the other's). Like every read that serves a
+ *  table, it looks at the page's clock first (`now`): serving the state again
+ *  after a game takes the time from it (tableOf). */
+export function computedDecidedTo(t: string, game?: GameName, now = Date.now()): number | null {
+  lookAtClock(now);
   const at = tableOf(t, game);
   if (!at) return null;
   const D = lastDecided(at.res);
@@ -4910,7 +4929,8 @@ export function computedDecidedTo(t: string, game?: GameName): number | null {
  *  else every close of the open roll naming its parent. Null for none. A
  *  dice throw counts as before the close when its stamp is no later
  *  (computedThrowSeenAt: one update stamps both alike). */
-export function computedCrapsClose(t: string, round: number): { at: number; hash: string } | null {
+export function computedCrapsClose(t: string, round: number, now = Date.now()): { at: number; hash: string } | null {
+  lookAtClock(now);
   const at = tableOf(t, 'craps');
   if (!at) return null;
   const { res } = at;
@@ -4929,7 +4949,8 @@ export function computedCrapsClose(t: string, round: number): { at: number; hash
  *  this room has never shown (no players-map entry has carried one): a
  *  rider who left before this page came, or one a modified page made up to
  *  fill the table. Display only, in pid order. */
-export function computedUnknownRiders(t: string): string[] {
+export function computedUnknownRiders(t: string, now = Date.now()): string[] {
+  lookAtClock(now);
   const at = tableOf(t, 'craps');
   if (!at) return [];
   return Object.keys((at.res.carry as CrapsCarry).w).filter((pid) => keyFor(pid) === undefined).sort();
@@ -4939,7 +4960,8 @@ export function computedUnknownRiders(t: string): string[] {
  *  incarnation, the last roll decided on the chain, their net in it (the
  *  fold's, across trims), and whether they have bets riding. For the
  *  table's "while you were away" (page-local: a reload forgets it). */
-export function computedTally(t: string): { inc: string; roll: number; net: number; riding: boolean } | null {
+export function computedTally(t: string, now = Date.now()): { inc: string; roll: number; net: number; riding: boolean } | null {
+  lookAtClock(now);
   const at = tableOf(t, 'craps');
   if (!at) return null;
   const me = getPlayerId();

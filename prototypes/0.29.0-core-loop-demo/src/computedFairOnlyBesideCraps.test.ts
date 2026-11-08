@@ -41,6 +41,11 @@ const end = trimOf(G, 'q', {
   ok: NAME.ok, j: NAME.j, u: 5, l: hex('e', 32), e: 1, f: sealFin(G, owner.pub, owner.sign).value, s: undefined, h: undefined, k: owner.pub, dl: undefined, n: {},
 });
 
+/** A roulette-lettered game at the craps table, the owner's (a forgery: an honest table plays its own letter). Its name sorts before the craps game's, so S9 plays it. */
+const NAMEP = { ...NAME, j: '0123456789abcdef' };
+const GP = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, NAMEP) };
+const rootP = rootOf(GP, 'p', { j: NAMEP.j, dl: delegation(owner, house.pub, PAGE_ROOM) });
+
 const seedCtx = (p: Page, r: number) => ({ room: CTX.room, table: seedTable(CTX), round: r, party: p.pid, house: '' });
 const casinoOf = (p: Page) => p.doc.getMap('casino');
 const computedOf = (p: Page) => p.doc.getMap('casinoComputed');
@@ -185,6 +190,90 @@ describe('the seeds behind the bets of a page-signed craps incarnation, while it
       expect(a.casino.computedIncEnded(TABLE, INC)).toBe(true); // (abandoned: nobody puts the switch back)
       expect(chipsOf(a, b)).toEqual([10, 1_000]); // (void: nobody charged; A has cashed out what was free)
     }
+  });
+
+  // The write that ends the name is the one that puts the switch back, in the room's list: a
+  // look at the doc between the two would find the switch bare and the stakes free.
+  it('stay held through the room clearing the name of the table\'s other game (c…): the write that ends it names them again, so no look between the two finds the switch bare and their stakes free', async () => {
+    const { a, b } = await staked();
+    const roulette = 'c' + '3f'.repeat(12);
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    takeSwitchTo(a, roulette);
+    sync(T0 + 2, a, b);
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+    let cleared = -1;
+    for (let T = T0 + 3; T < T0 + 3 + 3 * a.table.AWAY_MS && cleared < 0; T += 500) {
+      run([a, b], T, T, { step: STEP, tables: [REF] });
+      if (casinoOf(a).has(`gone:${TABLE}:${roulette}`)) cleared = T;
+    }
+    expect(cleared).toBeGreaterThan(0);
+    // (The clear is on both pages, and neither has had a frame since.)
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+    clockOf(a, cleared);
+    expect(a.casino.cashOutChips(a.pid, 1_000)).toBe(990);
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+  });
+
+  // An incarnation of the table's other game waits for nothing: the table cannot play it, so
+  // the name of the table's own game that a peer wrote after it holds none of its stakes, and
+  // compaction ends it after its wait, as with no game. Whether the switch ever named it or
+  // not: any guest can write the key of a session of it.
+  it.each([
+    ['that the switch has left for theirs', true],
+    ['that the switch never named, a stray session', false],
+  ] as [string, boolean][])('hold nothing of an incarnation of the table\'s other game (c…) %s beside a live game: it is listed and compacted after its wait, and theirs stay held', async (_, named) => {
+    const { a, b } = await staked();
+    const roulette = 'c' + '3f'.repeat(12);
+    record(a, root);
+    switchTo(a, G.inc);
+    sync(T0 + 1, a, b);
+    if (named) {
+      takeSwitchTo(a, roulette); // (a peer opens the roulette incarnation and takes the switch to it...)
+      sync(T0 + 2, a, b);
+    } else {
+      a.doc.transact(() => computedOf(a).set(`ses:${TABLE}:${roulette}:g`, new Y.Map())); // (...or only writes a session of it)
+    }
+    switchTo(a, INC); // (...and writes the switch back to the table's own)
+    sync(T0 + 3, a, b);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).toContain(roulette);
+    expect(a.casino.computedEndedIncs().map((e) => e.inc)).not.toContain(INC);
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+    run([a, b], T0 + 4, T0 + 4 + 3 * a.table.COMPACT_FALLBACK_MS, { step: 1_000, tables: [REF] });
+    expect(a.casino.computedIncEnded(TABLE, roulette)).toBe(true);
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+  });
+
+  // What a name of the other game holds follows the games live at the table by their letter,
+  // not the game played: a craps game opening or ending beside a roulette game that is played
+  // (S9 goes by holder, switch and lowest name, and 'p' sorts before 'q') moves what the
+  // incarnation's stakes wait under, and the page that lived the history must count what a
+  // page bound afresh on the doc counts. It moves no view and counts no move of the game played.
+  it('follow a game of their own letter opening and ending beside another game that is played: the stakes held under a name of the other game are counted again, as a page bound afresh counts them', async () => {
+    const { a, b } = await staked();
+    const roulette = 'c' + '3f'.repeat(12);
+    record(a, rootP); // (a roulette game at the craps table, played: the lowest name)
+    takeSwitchTo(a, roulette);
+    sync(T0 + 1, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(GP.inc);
+    expect(chipsOf(a, b)).toEqual([1_000, 1_000]); // (no craps game is live: the other game's name holds nothing)
+    const moves = a.casino.computedGameMovesOf(TABLE);
+    record(a, root); // (the craps game opens beside it)
+    sync(T0 + 2, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(GP.inc); // (still the roulette game played)
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+    rejoin(b, a, 777, T0 + 3); // (a page bound afresh on the doc counts the same)
+    expect(chipsOf(a, b)).toEqual([990, 995]);
+    record(a, end); // (...and ends)
+    sync(T0 + 4, a, b);
+    expect(a.casino.computedIncOf(TABLE)).toBe(GP.inc);
+    expect(chipsOf(a, b)).toEqual([1_000, 1_000]);
+    rejoin(b, a, 778, T0 + 5);
+    expect(chipsOf(a, b)).toEqual([1_000, 1_000]);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(moves); // (the game played did not move)
   });
 
   // A name nothing of which the doc holds takes nobody's place, whichever game it is of: the
@@ -455,5 +544,35 @@ describe('the roll window of a page-signed craps incarnation, after its table pl
     expect(keysIn(a, 'c', 1, TABLE)).toEqual([]);
     run([a], back + window - 1_800, back + window + 5_000, { step: STEP, tables: [REF], until: () => keysIn(a, 'c', 1, TABLE).length > 0 });
     expect(keysIn(a, 'c', 1, TABLE).length).toBeGreaterThan(0);
+  });
+
+  // The time a state is served again from is the page's clock, which a read or a frame sets.
+  // A read that serves the table before any frame (the display asks for the round decided to,
+  // the tally, the riders no page has shown, a roll's close) refreshes it first, as every other
+  // read does: else the window would start again from the time of the last frame, seconds old.
+  it.each([
+    ['the round decided to', (p: Page) => p.table.computedDecidedTo(TABLE, 'craps')],
+    ['the tally of the "while you were away"', (p: Page) => p.table.computedTally(TABLE)],
+    ['the riders no page has shown', (p: Page) => p.table.computedUnknownRiders(TABLE)],
+    ['the close of a roll', (p: Page) => p.table.computedCrapsClose(TABLE, 1)],
+  ] as [string, (p: Page) => unknown][])('is started afresh from the time of a read that serves the table before any frame, too: the page\'s last frame is seconds old, the window is from the read and not from it (%s)', async (_, read) => {
+    const [a] = await openCrapsRoom(['A'], T0);
+    standAt(a, 1);
+    expect(crapsBet(a, [{ type: 'pass', amount: 10 }], T0)).toBe('ok');
+    const window = a.croupier.CRAPS_BET_WINDOW_MS;
+    run([a], T0 + STEP, T0 + 2_000, { step: STEP, tables: [REF] });
+    record(a, root);
+    switchTo(a, G.inc);
+    const last = run([a], T0 + 2_200, T0 + 40_000, { step: STEP, tables: [REF] }) - STEP; // (the page's last frame, in the game)
+    record(a, end);
+    switchTo(a, INC); // (another page puts the switch back; this page has not looked since its last frame)
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBeGreaterThan(0); // (the doc counted the game, this page looking at nothing)
+    clockOf(a, last + 5_000);
+    read(a);
+    const view = crapsOf(a, last + 5_500)!;
+    expect(view.phase).toBe('betting');
+    expect(view.phaseDeadline!).toBeGreaterThanOrEqual(last + 5_000 + window - 1_000);
+    expect(keysIn(a, 'c', 1, TABLE)).toEqual([]);
   });
 });
