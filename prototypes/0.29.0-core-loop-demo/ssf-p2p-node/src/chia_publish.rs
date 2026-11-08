@@ -245,9 +245,10 @@ impl Payer {
 
     /// The puzzle hash, hex, as the lease file writes it and the marks file
     /// it: the presence mark, the beacon mark and a knock entry name their
-    /// write's payer by this text (stage 4 design §4.4, §8.3), and compare it
-    /// as text. Read-only on purpose: no mark parses it back into a `Payer`,
-    /// since outside this module that would be a new constructor from bytes.
+    /// write's payer by this text (stage 4 design §4.4), for the hint rule
+    /// (§8.3, PR 10) to compare as text. Read-only on purpose: no mark parses
+    /// it back into a `Payer`, since outside this module that would be a new
+    /// constructor from bytes.
     pub fn hex(&self) -> String {
         hex::encode(self.0)
     }
@@ -1903,9 +1904,10 @@ pub struct NodePublishMark {
     /// Who paid for the write, as the lease parked its spend: the payer's
     /// [`Payer::hex`] text, the paying key's ([`Payer::of`]) for a write the
     /// SSF wallet pays for and the burner's ([`Payer::of_burner`]) for a
-    /// burner's, compared as text and never parsed back (stage 4 design
-    /// §4.4, §8.3). Every write this build files names one. `None` in a mark
-    /// an older node wrote, which counts as paid by the money address.
+    /// burner's, for the hint rule to compare as text and never parse back
+    /// (stage 4 design §4.4, §8.3, PR 10). Every write this build files names
+    /// one. `None` in a mark an older node wrote, which counts as paid by the
+    /// money address.
     #[serde(default)]
     pub payer: Option<String>,
 }
@@ -2584,10 +2586,10 @@ pub struct BeaconMark {
     pub parked: String,
     /// Who paid for the beacon, as the lease parked its spend: the payer's
     /// [`Payer::hex`] text, the beacon wallet's ([`Payer::of`] its key) for a
-    /// beacon it pays for and the burner's for a burner's, compared as text
-    /// and never parsed back (stage 4 design §4.4). Every beacon this build
-    /// files names one. `None` in a mark an older node wrote, whose beacon
-    /// the beacon wallet paid for.
+    /// beacon it pays for and the burner's for a burner's, filed to be
+    /// compared as text and never parsed back (stage 4 design §4.4, PR 10).
+    /// Every beacon this build files names one. `None` in a mark an older
+    /// node wrote, whose beacon the beacon wallet paid for.
     #[serde(default)]
     pub payer: Option<String>,
 }
@@ -6077,9 +6079,11 @@ mod tests {
     /// Stage 4 design §4.4: a mark whose parked input is malformed has
     /// nothing to judge, as one whose coin is malformed: the presence and
     /// beacon verdicts are `None` before the lease or the chain is asked, and
-    /// never fall back to the one coin, which for a burner's first write
-    /// would be judged at a gift the lease never parked, and read pending for
-    /// ever. Filed whole, the same marks are looked up.
+    /// never fall back to the one coin: for a burner's first write that never
+    /// lands, the lease and the spent height would then be asked about a gift
+    /// the lease never parked and no chain holds, and the write would read
+    /// pending for ever instead of dead. Filed whole, the same marks are
+    /// looked up.
     #[tokio::test]
     async fn a_mark_whose_parked_input_is_malformed_is_not_judged_and_the_chain_is_not_asked() {
         use crate::chia_chain::testing::Scripted;

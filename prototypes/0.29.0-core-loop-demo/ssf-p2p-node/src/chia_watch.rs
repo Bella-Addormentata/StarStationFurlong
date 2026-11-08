@@ -348,10 +348,11 @@ type SentVerdict = (String, String, u64, u32, bool, WriteStanding);
 /// names listing, in one call for the batch, about the same parked inputs
 /// ([`parked_inputs`]); then each entry's hint, in book order, about its
 /// parent ([`sent_knock_standing`]): the coins of stage 4 design §4.4. An
-/// entry whose coin id or hint is malformed is dead; one whose hint could not
-/// be read gets no verdict, and is judged again next tick. The memo digest an
-/// entry keeps is the one its coin's output must carry; an entry that keeps
-/// none (an older node's) or a malformed one is judged by its hint alone.
+/// entry whose coin id, parked input or hint is malformed is dead; one whose
+/// hint could not be read gets no verdict, and is judged again next tick. The
+/// memo digest an entry keeps is the one its coin's output must carry; an
+/// entry that keeps none (an older node's) or a malformed one is judged by
+/// its hint alone.
 /// `Err` when the names listing could not be read: nothing is judged this tick.
 async fn sent_knock_verdicts<L, Asked>(
     client: &impl crate::chia_chain::ChainAccess,
@@ -1681,8 +1682,9 @@ mod tests {
     /// its knock's word, and the lease holding the knock's own spend keeps it
     /// pending (#272 review round 12).
     /// A malformed entry is dead, its coins asked about only when its coin id
-    /// is good; a hint that cannot be read judges nothing; a names listing
-    /// that cannot be read judges the batch not at all.
+    /// and its parked input are good; a hint that cannot be read judges
+    /// nothing; a names listing that cannot be read judges the batch not at
+    /// all.
     #[tokio::test]
     async fn the_sent_knocks_batch_asks_the_lease_and_names_by_parked_input_and_each_hint_by_parent() {
         use crate::chia_chain::testing::Scripted;
@@ -1703,10 +1705,12 @@ mod tests {
             split_knock(k4, Some(4)),
             sent_knock(&hex::encode(c5), "zz", Some(5)),
             sent_knock("zz", &hint_hex, Some(6)),
+            // A good coin id and hint beside a malformed parked input.
+            SentKnock { parked: "zz".into(), ..sent_knock(&hex::encode(input(6).coin_id()), &hint_hex, Some(7)) },
             split_knock(k7, None),
         ];
         let filed = filed_coins(&pending);
-        assert_eq!(filed, vec![Some(k1), Some(k2), Some(k3), Some(k4), Some(WriteCoins::one(c5)), None, Some(k7)], "the coins each entry filed");
+        assert_eq!(filed, vec![Some(k1), Some(k2), Some(k3), Some(k4), Some(WriteCoins::one(c5)), None, None, Some(k7)], "the coins each entry filed");
         let made = child_record(k1.parent, 1000).coin;
         let chain = Scripted::new(vec![
             // The names listing: the second and the fourth knock's parked inputs spent.
@@ -1722,7 +1726,7 @@ mod tests {
         let lease = ScriptedLease::new(k3.parked, 4);
         let verdicts = sent_knock_verdicts(&chain, &pending, &filed, |coins, spends| std::future::ready(lease.answer(&chain, &coins, &spends))).await.unwrap();
         let parked = vec![k1.parked, k2.parked, k3.parked, k4.parked, c5, k7.parked];
-        assert_eq!(*lease.asked.lock().unwrap(), vec![(parked.clone(), vec![1, 4, 5, 6], 0)], "the lease, first, about the parked inputs");
+        assert_eq!(*lease.asked.lock().unwrap(), vec![(parked.clone(), vec![1, 4, 5, 6, 7], 0)], "the lease, first, about the parked inputs");
         assert_eq!(*chain.asked_names.lock().unwrap(), vec![parked], "the names listing, once, about the parked inputs");
         let verdict = |k: &SentKnock, standing: WriteStanding| (k.coin_id.clone(), k.hint.clone(), k.era, k.confirmed_height, false, standing);
         assert_eq!(
@@ -1734,6 +1738,7 @@ mod tests {
                 verdict(&pending[3], Pending),
                 verdict(&pending[4], Dead("its entry in the knock book is malformed")),
                 verdict(&pending[5], Dead("its entry in the knock book is malformed")),
+                verdict(&pending[6], Dead("its entry in the knock book is malformed")),
             ]
         );
         // A names listing that cannot be read: the lease was still asked first.

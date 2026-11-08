@@ -198,10 +198,10 @@ pub struct SentKnock {
     pub parked: String,
     /// Who paid for the knock, as the lease parked its spend: the payer's
     /// puzzle hash, hex, as the publisher's payer writes it (the SSF wallet's
-    /// for a knock it pays for, a burner's for a burner's), compared as text
-    /// and never parsed back (stage 4 design §4.4, §8.3). Every knock this
-    /// build writes names one. `None` in an entry an older node wrote, whose
-    /// knock the SSF wallet paid for.
+    /// for a knock it pays for, a burner's for a burner's), for the hint rule
+    /// to compare as text and never parse back (stage 4 design §4.4, §8.3,
+    /// PR 10). Every knock this build writes names one. `None` in an entry an
+    /// older node wrote, whose knock the SSF wallet paid for.
     #[serde(default)]
     pub payer: Option<String>,
 }

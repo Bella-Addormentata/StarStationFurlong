@@ -899,9 +899,12 @@ impl WriteCoins {
     /// either is malformed, as [`parse_hex32`] says, an empty `coin_id`
     /// included: a mark then has nothing to judge, and a knock entry is dead
     /// as malformed. A malformed `parked` never falls back to the one coin:
-    /// a burner's first write filed so would be judged at its gift g, which
-    /// the lease never parked and no spend on chain consumes, and read
-    /// pending for ever.
+    /// a burner's first write filed so would have its input's spent height
+    /// and the lease's word read at its gift g, which the lease never parked.
+    /// One that never lands (its dish coin F taken by another spend, or its
+    /// spend dropped) leaves g on no chain, so it would read pending for ever
+    /// instead of dead; one that lands is still confirmed, by its own coin
+    /// under the hint, which names g as its parent.
     pub fn filed(coin_id: &str, parked: &str) -> Option<Self> {
         let parent = parse_hex32(coin_id)?;
         if parked.is_empty() {
