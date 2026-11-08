@@ -3871,7 +3871,9 @@ function sessionPubs(e: EndedComputed): Set<string> {
  * from casinoDoc, not the tables passed in: a removed table isn't among
  * them. And what this page wrote for an incarnation that is over is let go
  * of, seeds and all, on every page: one ended for good (computedIncEnded),
- * or one whose switch names another incarnation. Not one whose switch is
+ * or one whose switch names another incarnation (unless the table plays a
+ * FAIR ONLY game, which takes none of the page-signed state: it waits to the
+ * end, its own or the game's). Not one whose switch is
  * only missing (a peer's delete, put back a second later, ends nothing until
  * compaction makes it final), nor anything on a frame whose doc was bound
  * afresh since this page looked at its clock (leaving the room destroys the
@@ -3892,10 +3894,20 @@ function compactDuty(pub: string, now: number): void {
   // incarnation the switch still names is only waiting, its frozen slips
   // still to reveal when the game ends or the deed moves, and a FAIR ONLY name
   // in the switch is a hint, not another incarnation taking this one's place.
+  // Nor is another page-signed name, while the game is played: the table
+  // takes no state from it (tableOf is null under a game: the state stays),
+  // and the switch put back over a dead hint when the game ends names the
+  // incarnation this page runs (putSwitchBack), whose slips then go on. Its
+  // seeds go with its end (computedIncEnded: compaction makes an incarnation
+  // the switch has left one), or when the table plays the other (tableOf).
+  // `beside`: the table plays a FAIR ONLY game, S9's choice of the live ones,
+  // or the FAIR ONLY name the switch carries when none is live (a dead hint,
+  // put back over).
   for (const st of tables.values()) {
     if (st.mine.size === 0 || !casinoWhole(st.t)) continue;
     const named = switchIncOf(st.t);
-    if (computedIncEnded(st.t, st.inc) || (named !== null && named !== st.inc && !isFairOnlyInc(named) && !computedIncEnded(st.t, named))) letGo(st, () => false);
+    const beside = isFairOnlyInc(computedIncOf(st.t) ?? '');
+    if (computedIncEnded(st.t, st.inc) || (!beside && named !== null && named !== st.inc && !computedIncEnded(st.t, named))) letGo(st, () => false);
   }
   // (Timed from when this page saw it ended, or woke: asleep or not.)
   const awake = tablesAwake(now);

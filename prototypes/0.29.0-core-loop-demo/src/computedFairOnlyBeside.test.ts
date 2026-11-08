@@ -56,9 +56,10 @@ function switchTo(p: Page, inc: string): void {
   p.doc.transact(() => casinoOf(p).set(`cfg:computed:${TABLE}`, { v: 1, inc }));
 }
 
-/** Frames of `p` every `step` (STEP) over `ms` from `from`; the time after. */
-function tick(p: Page, from: number, ms: number, step = STEP): number {
-  run([p], from, from + ms, { step });
+/** Frames of `p` every `step` (STEP) over `ms` from `from`, the room's tables
+ *  being `tables` (the page kit's one by default); the time after. */
+function tick(p: Page, from: number, ms: number, step = STEP, tables?: string[]): number {
+  run([p], from, from + ms, { step, tables });
   return from + ms + step;
 }
 
@@ -125,15 +126,66 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     expect(a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c).toBe(felt);
   });
 
-  it('go when another page-signed incarnation takes the switch, as ever: a name the doc holds a session of, that nothing has ended', async () => {
+  /** Another page-signed incarnation the doc holds a session of, that nothing has ended. */
+  const other = 'c' + '5d'.repeat(12);
+  function takeSwitch(p: Page): void {
+    p.doc.transact(() => {
+      casinoOf(p).set(`cfg:computed:${TABLE}`, { v: 1, inc: other });
+      computedOf(p).set(`ses:${TABLE}:${other}:g`, new Y.Map());
+    });
+  }
+
+  /** The table in the room's list, or out of it: then no duty of a table runs
+   *  (tableOf replaces no state, putSwitchBack puts nothing back) and the
+   *  compaction duty alone looks, as it does at a table a removal took out. */
+  const WHERE: [string, string[] | undefined][] = [['at a table in the room', undefined], ['at a table out of the room: the compaction duty alone looks', []]];
+
+  it.each(WHERE)('go when another page-signed incarnation takes the switch and no game is played, as ever, %s', async (_, tables) => {
+    const { a, felt } = await frozen();
+    takeSwitch(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    tick(a, T0 + STEP, 2 * a.table.REPUT_MS, STEP, tables);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  it('are kept while a game is played though another page-signed incarnation takes the switch: the table takes no state from it, and the incarnation this page ran goes on when the game ends', async () => {
     const { a, felt } = await frozen();
     record(a, root);
-    const other = 'c' + '5d'.repeat(12);
-    a.doc.transact(() => {
-      casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: other });
-      computedOf(a).set(`ses:${TABLE}:${other}:g`, new Y.Map());
-    });
-    tick(a, T0 + STEP, 2 * a.table.REPUT_MS);
+    takeSwitch(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc); // (the game is the one played, the switch a hint)
+    let at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS); // (short of COMPACT_MS: the incarnation is not final)
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(false);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    // The owner's page names the game again, and the game ends over its name: the
+    // switch is put back over the dead hint, on the incarnation this page ran.
+    switchTo(a, G.inc);
+    record(a, end);
+    at = tick(a, at, 2 * a.table.REPUT_MS);
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: INC });
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (the slip it froze can be revealed)
+    expect(a.casino.computedFoldOf(TABLE)!.felts.get(a.pid)!.rec.c).toBe(felt);
+  });
+
+  it.each(WHERE)('go when the game ends with the switch on the other incarnation, which the table then plays, %s', async (_, tables) => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    takeSwitch(a);
+    const at = tick(a, T0 + STEP, 2 * a.table.REPUT_MS, STEP, tables);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull();
+    record(a, end);
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    tick(a, at, 2 * a.table.REPUT_MS, STEP, tables);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  it('go with the end of the incarnation, a game played or not: the switch left it, and compaction ended it', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    takeSwitch(a);
+    tick(a, T0 + STEP, 2 * a.table.COMPACT_FALLBACK_MS, 1_000);
+    expect(a.casino.computedIncEnded(TABLE, INC)).toBe(true);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
   });
 });
