@@ -116,7 +116,9 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
     case 'listed':
       // A listing back in force (the addresses changed and changed back) can
       // carry the failed attempt in between: the node keeps that text until a
-      // write succeeds, and it is the reason a tap goes to the Bank app.
+      // write succeeds, and it is the reason a tap goes to the Bank app. Last
+      // week's listing held in force while this week's waits for its slot
+      // carries the node's words for when this week's goes out.
       return shown(PHONE_BOOK_GREEN, true, listedTitle(p) + (error ? ` · ${error}` : ''));
     case 'sent':
       // What the node does if the chain stays silent, not how long the chain
@@ -139,6 +141,14 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
   }
 }
 
+/** The listed title names the edition the listing is in. With burner keys
+ *  on (SSF_CHIA_BURNERS=1 on a test network, stage 4 design §4.3), a node
+ *  keeps last week's listing listed while this week's waits for its slot or
+ *  its late start: readers scan this edition and the one before, so last
+ *  week's is the listing they find. The node then sends `listed_era` as the
+ *  edition before `era`, edition 0 included. A node that pays from its SSF
+ *  wallet never does, so its title is this week's, as is any other edition
+ *  a readout names. */
 function listedTitle(p: ChiaPresence): string {
   const n = p.public_addrs;
   const addrs = n === 0
@@ -146,12 +156,25 @@ function listedTitle(p: ChiaPresence): string {
     : n === 1
       ? "your node's public address is on chain"
       : `your node's ${n} public addresses are on chain`;
+  if (p.era > 0 && p.listed_era === p.era - 1) return `Listed in last week's Phone Book: ${addrs} (edition ${p.listed_era})`;
   return `Listed in this week's Phone Book: ${addrs} (edition ${p.era})`;
 }
 
 /** Why the listing is stale, and what happens next: the publisher's promise
- *  when the node reports nothing in the way, else the node's own words. */
+ *  when the node reports nothing in the way, else the node's own words. A
+ *  listing of this edition with these addresses that did not make it into
+ *  the book, held by the hint rule until the next edition (`unlanded`), has
+ *  only the node's words: neither its edition nor its addresses changed. A
+ *  node that writes its listing from burner keys says in its own words what
+ *  its listing waits for: when this edition's goes out (at a random time in
+ *  its first day, within about an hour, or within about 20 minutes of a
+ *  change), that the chain is busy or the lobby dish has no mojo ready (and,
+ *  where it holds, that last week's listing still works), or that the hint
+ *  rule holds a rewrite until the next edition. The promise shows only when
+ *  the node reports nothing in the way, which on that path means the write
+ *  is due now. */
 function outdatedReason(p: ChiaPresence, error: string | undefined): string {
+  if (p.unlanded) return error ?? "this edition's listing did not make it into the book";
   if (p.era === 0) return "no chain peak agreed yet, so this week's edition is unknown" + (error ? ` · ${error}` : '');
   if (p.listed_era !== p.era) {
     return `it is from edition ${p.listed_era} and this is edition ${p.era}` + (error ? ` · ${error}` : '; the new listing goes out shortly');

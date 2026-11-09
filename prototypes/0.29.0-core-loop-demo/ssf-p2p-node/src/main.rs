@@ -100,7 +100,8 @@ mod chia_at_rest;
 mod chia_publish;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
 // for the lane's writes. PR 9's claim-and-write and its self-test hook call
-// them; PR 10's writers will.
+// them, and the listing is written from P(e) (PR 10b); the knock and beacon
+// writers follow.
 #[cfg(feature = "chia-publish")]
 mod chia_burner;
 #[cfg(feature = "chia-publish")]
@@ -498,14 +499,19 @@ pub struct ChiaPresence {
     /// The current era (edition) by the agreed chain peak, 0 while no peak is
     /// agreed yet.
     pub era: u64,
-    /// The era of the listing on record, 0 when there is none.
+    /// The era of the listing on record, 0 when there is none. With burner
+    /// keys on, it is the era before while this era's listing waits for its
+    /// slot or its late-start delay (stage 4 design §4.3, T1 and T2).
     pub listed_era: u64,
     /// Unix seconds of the last write on record, 0 when there is none.
     pub last_at: u64,
     /// The watcher has read the listing on record back from the chain.
     pub confirmed: bool,
-    /// The listing on record is for this era and carries the node's current
-    /// public address set.
+    /// The listing on record is in force with the node's current public
+    /// address set: this era's, or, with burner keys on, last era's while
+    /// this era's waits for its slot or its late-start delay (stage 4 design
+    /// §4.3), its addresses compared then without the inbound flag a new era
+    /// clears.
     pub current: bool,
     /// How many public addresses the node would list right now.
     pub public_addrs: u32,
@@ -513,13 +519,24 @@ pub struct ChiaPresence {
     /// wallet is the one the Bank app can fix).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// This edition's listing on record, with the live address set, did not
+    /// make it into the book, and the hint rule (stage 4 design §8.3) holds
+    /// the next write until the next edition: it is outdated, though neither
+    /// its edition nor its addresses are. Only with burner keys on, or after
+    /// they were turned off in the middle of an edition. Sent only when
+    /// true, so every other readout is the text it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlanded: bool,
 }
 
 /// 📖 The four looks of the phone book icon.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChiaPresenceState {
-    /// This era's listing is confirmed on chain with the current addresses.
+    /// This era's listing is confirmed on chain with the current addresses,
+    /// or, with burner keys on, last era's confirmed listing while this era's
+    /// waits for its slot or its late-start delay; readers read both editions
+    /// (stage 4 design §4.3).
     Listed,
     /// This era's listing with the current addresses is out, awaiting the
     /// watcher's confirmation.
@@ -1252,6 +1269,7 @@ mod fingerprint_json_tests {
             current: true,
             public_addrs: 2,
             error: None,
+            unlanded: false,
         });
         let json = serde_json::to_string(&some).unwrap();
         assert!(json.contains("\"chia_presence\":{\"state\":\"listed\",\"era\":7,\"listed_era\":7,\"last_at\":1700000000,\"confirmed\":true,\"current\":true,\"public_addrs\":2}"), "{json}");
@@ -1268,12 +1286,33 @@ mod fingerprint_json_tests {
             current: false,
             public_addrs: 1,
             error: Some("chia wallet unfunded".into()),
+            unlanded: false,
         });
         let json = serde_json::to_string(&failing).unwrap();
         assert!(json.contains("\"state\":\"unlisted\""), "{json}");
         assert!(json.contains("\"error\":\"chia wallet unfunded\""), "{json}");
+        assert!(!json.contains("unlanded"), "{json}");
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_presence, failing.chia_presence);
+
+        // 📖 A listing of this edition that did not land, held by the hint
+        // rule (stage 4 design §8.3), says so; no other readout carries it.
+        let mut unlanded = fp();
+        unlanded.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Outdated,
+            era: 8,
+            listed_era: 8,
+            last_at: 0,
+            confirmed: false,
+            current: false,
+            public_addrs: 2,
+            error: Some("this edition's listing did not make it into the book".into()),
+            unlanded: true,
+        });
+        let json = serde_json::to_string(&unlanded).unwrap();
+        assert!(json.contains("\"error\":\"this edition's listing did not make it into the book\",\"unlanded\":true}"), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, unlanded.chia_presence);
     }
 
     /// ⛓️ The network rides as the page reads it: the id, the genesis as
@@ -2908,6 +2947,8 @@ async fn handle_wt_connection_inner(
                                         env: chia_wallet_switch::env_switch(),
                                         #[cfg(feature = "chia-publish")]
                                         turnable: bank_can_turn_on(chia_network::net()),
+                                        #[cfg(feature = "chia-publish")]
+                                        burners: chia_publish::burners_enabled(),
                                     };
                                     chia_faucet::handle_request(&ctx, &envelope.room, &envelope.payload).await
                                 } else {

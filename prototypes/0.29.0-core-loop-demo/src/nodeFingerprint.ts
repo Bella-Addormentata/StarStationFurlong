@@ -92,17 +92,25 @@ export interface LocalFingerprint {
 }
 
 /** 📖 The four looks of the phone book: this edition's listing confirmed
- *  with the current addresses (`listed`), out but not yet read back (`sent`),
- *  a listing of ours that is stale (`outdated`: an older edition, other
- *  addresses, no chain peak to judge by), none of ours (`unlisted`). */
+ *  with the current addresses (`listed`; with burner keys on, last edition's
+ *  too, while this edition's waits for its slot), out but not yet read back
+ *  (`sent`), a listing of ours that is stale (`outdated`: an older edition,
+ *  other addresses, no chain peak to judge by), none of ours (`unlisted`). */
 export type ChiaPresenceState = 'listed' | 'sent' | 'outdated' | 'unlisted';
 
 /** The node's readout (`ChiaPresence` in ssf-p2p-node main.rs): `era` is the
  *  current edition by the agreed peak (0 while none is agreed), `listed_era`
  *  and `last_at` describe the listing on record (0 when there is none),
- *  `confirmed` says the chain showed it back, `current` that it names this
- *  edition and these addresses, `public_addrs` how many the node would list
- *  now, and `error` is the last failed attempt's text when there is one. */
+ *  `confirmed` says the chain showed it back, `current` that it is the
+ *  listing in force with these addresses, `public_addrs` how many the node
+ *  would list now, and `error` is the last failed attempt's text, or the
+ *  node's words for what the listing waits for, when there is one. A `listed`
+ *  listing names this edition, or, with burner keys on (stage 4 design §4.3),
+ *  the edition before, while this edition's waits for its slot or its late
+ *  start: `listed_era` is then `era - 1`, and readers still find it.
+ *  `unlanded`, sent only when true, says an `outdated` listing of this
+ *  edition with these addresses did not make it into the book, and the hint
+ *  rule (§8.3) holds the next write until the next edition. */
 export interface ChiaPresence {
   state: ChiaPresenceState;
   era: number;
@@ -112,6 +120,7 @@ export interface ChiaPresence {
   current: boolean;
   public_addrs: number;
   error?: string;
+  unlanded?: boolean;
 }
 
 /** 🏦 The SSF wallet switch's state: `unbuilt` (a node built without
@@ -280,7 +289,8 @@ const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isS
 /** The node's `chia_presence` in its own shape, or undefined for anything
  *  else: an unknown state, a count that is not a non-negative integer, a flag
  *  that is not a boolean, or an error that is not a string. A readout the
- *  page cannot trust is no readout: the icon stays hidden rather than guess. */
+ *  page cannot trust is no readout: the icon stays hidden rather than guess.
+ *  `unlanded` is kept only when true, as the node sends it. */
 export function parseChiaPresence(v: unknown): ChiaPresence | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const r = v as Record<string, unknown>;
@@ -288,6 +298,7 @@ export function parseChiaPresence(v: unknown): ChiaPresence | undefined {
   if (!isCount(r.era) || !isCount(r.listed_era) || !isCount(r.last_at) || !isCount(r.public_addrs)) return undefined;
   if (typeof r.confirmed !== 'boolean' || typeof r.current !== 'boolean') return undefined;
   if (r.error !== undefined && typeof r.error !== 'string') return undefined;
+  if (r.unlanded !== undefined && typeof r.unlanded !== 'boolean') return undefined;
   const p: ChiaPresence = {
     state: r.state as ChiaPresenceState,
     era: r.era,
@@ -298,6 +309,7 @@ export function parseChiaPresence(v: unknown): ChiaPresence | undefined {
     public_addrs: r.public_addrs,
   };
   if (typeof r.error === 'string') p.error = r.error;
+  if (r.unlanded === true) p.unlanded = true;
   return p;
 }
 

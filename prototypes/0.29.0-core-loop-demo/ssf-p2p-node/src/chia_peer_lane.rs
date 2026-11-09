@@ -1998,7 +1998,10 @@ pub(crate) fn live_verdict(outcomes: &[AckOutcome]) -> Result<bool, ChainError> 
 /// chosen afresh, so two lagging replacements could say it together while
 /// the spend sits in a mempool elsewhere; #271 review, round 19). The names
 /// are chia-blockchain's `Err` codes as `TransactionAck.error` spells them;
-/// an unknown reason is not final.
+/// an unknown reason is not final. One of the policy refusals is read
+/// further elsewhere: a push every peer refused for a fee too low for a
+/// full mempool is the chain being busy, in `chia_publish`'s
+/// `refusal_is_chain_busy` (stage 4 design §10).
 pub(crate) fn refusal_is_final(reason: &str) -> bool {
     const FINAL: &[&str] = &[
         "DOUBLE_SPEND",

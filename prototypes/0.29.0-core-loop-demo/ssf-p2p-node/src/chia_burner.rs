@@ -41,12 +41,6 @@
 //! hashes, the copies a move leaves, and a burner's `SecretKey`, which
 //! chia-bls does not wipe.
 #![cfg(feature = "chia-publish")]
-// PR 9 (`claim-and-write`: the bundle builder and its self-test hook) calls
-// the root, K(h) and a burner key's puzzle hash and signature; PR 10
-// (`burner-writers`) calls the rest, P(e) and the slots among them (design
-// §13). Until then only this module's tests use those, so a build without
-// them would warn that they are dead code.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fmt;
 
@@ -98,6 +92,7 @@ impl MoneyKey {
     /// The wallet key, for the money spends, which take it as a plain
     /// `SecretKey` today. Never for the publisher: from PR 10 its entry
     /// points take a [`BurnerKey`], and no `SecretKey` makes one.
+    #[cfg_attr(not(test), allow(dead_code))] // No caller outside the tests until the publisher's keys (PR 10h) hand the money spends their key through it.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
     }
@@ -213,6 +208,14 @@ impl BurnerRoot {
         let mut first = Zeroizing::new([0u8; 8]);
         first.copy_from_slice(&out.as_bytes()[..8]);
         u64::from_le_bytes(*first) % SLOT_BLOCKS
+    }
+
+    /// The network this root was made for, whose listing hint P(e) is
+    /// derived under (§3.5). The listing's writer refuses a root of another
+    /// network (`chia_publish::publish_node_presence_with`): its P(e) would
+    /// not be the key of the hint the listing is written under there.
+    pub fn net(&self) -> ChiaNet {
+        self.1
     }
 }
 
@@ -689,6 +692,15 @@ mod tests {
                 let h = inbox_hint(net, &CK_HOST, &ROOM_KEY, era);
                 assert_eq!(before.knock(&h, era).public_key(), after.knock(&h, era).public_key(), "{net:?}: K(h, {era})");
             }
+        }
+    }
+
+    /// A root names the network it was made for on every network, so the
+    /// listing's writer can refuse a root of another one (§3.5).
+    #[test]
+    fn a_root_names_the_network_it_was_made_for() {
+        for net in ChiaNet::ALL {
+            assert_eq!(BurnerRoot::of(&zero_money(), net).net(), net, "{net:?}");
         }
     }
 

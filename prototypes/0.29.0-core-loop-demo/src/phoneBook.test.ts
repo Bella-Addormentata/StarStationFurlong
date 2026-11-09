@@ -51,6 +51,37 @@ describe('phoneBookIndicator', () => {
     expect(relisted.opens).toBe('bank');
   });
 
+  it("reads last week's listing as listed while this week's waits for its slot, in the node's words", () => {
+    // A node writing from burner keys (stage 4 design §4.3) holds last
+    // edition's listing in force until this edition's slot or late start.
+    const held = phoneBookIndicator(withPresence({ era: 8, listed_era: 7 }));
+    expect(held).toMatchObject({ visible: true, state: 'listed', colour: PHONE_BOOK_GREEN, filled: true, opens: 'setnet' });
+    const lastWeek = "Listed in last week's Phone Book: your node's 2 public addresses are on chain (edition 7)";
+    expect(held.title).toBe(lastWeek);
+    expect(held.row).toEqual({ value: lastWeek, colour: PHONE_BOOK_GREEN });
+    // The node's words for when this week's goes out (chia_publish.rs
+    // LISTING_SLOT_WORDS, LISTING_LATE_WORDS) follow, whole.
+    for (const words of [
+      "this edition's listing goes out at a random time in its first day",
+      "this edition's listing goes out at a random time within about an hour",
+    ]) {
+      const ind = phoneBookIndicator(withPresence({ era: 8, listed_era: 7, error: words }));
+      expect(ind.title).toBe(`${lastWeek} · ${words}`);
+      expect(ind.opens).toBe('setnet');
+    }
+    expect(phoneBookIndicator(withPresence({ era: 8, listed_era: 7, public_addrs: 1 })).title)
+      .toBe("Listed in last week's Phone Book: your node's public address is on chain (edition 7)");
+    // This week's listing reads as it always did, and so does a listing whose
+    // edition the node does not report.
+    expect(phoneBookIndicator(withPresence({ era: 8, listed_era: 8 })).title)
+      .toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 8)");
+    expect(phoneBookIndicator(withPresence({ era: 8, listed_era: 0 })).title)
+      .toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 8)");
+    // Edition 0 is an edition like any other: in edition 1 its listing is last week's.
+    expect(phoneBookIndicator(withPresence({ era: 1, listed_era: 0 })).title)
+      .toBe("Listed in last week's Phone Book: your node's 2 public addresses are on chain (edition 0)");
+  });
+
   it('is a green outline while the listing is sent and not yet read back', () => {
     const ind = phoneBookIndicator(withPresence({ state: 'sent', confirmed: false }));
     expect(ind).toMatchObject({ visible: true, state: 'sent', colour: PHONE_BOOK_GREEN, filled: false, opens: 'setnet' });
@@ -77,6 +108,55 @@ describe('phoneBookIndicator', () => {
     expect(spent.title).toBe("Phone Book listing outdated: your addresses changed · this era's write budget is spent; the next listing goes out with the new era");
     const failed = phoneBookIndicator(withPresence({ state: 'outdated', era: 8, listed_era: 7, current: false, error: 'peers refused the spend' }));
     expect(failed.title).toBe('Phone Book listing outdated: it is from edition 7 and this is edition 8 · peers refused the spend');
+  });
+
+  it("says the burner listing's waits after an outdated listing in the node's words, and never sends them to the Bank", () => {
+    const stale = (p: Partial<ChiaPresence>) => phoneBookIndicator(withPresence({ state: 'outdated', current: false, ...p }));
+    const lastEdition = 'Phone Book listing outdated: it is from edition 7 and this is edition 8';
+    // The node's words (chia_publish.rs: LISTING_CHANGE_WORDS, and stage 4
+    // design §10's sentences in listing_failure_words) replace the promise.
+    const rows: [string, string][] = [
+      ['change', 'the new listing goes out at a random time within about 20 minutes'],
+      ['busy', "The chain is busy. Your listing waits for room. Waiting costs nothing, and last week's listing still works."],
+      ['dish', "The lobby dish has no mojo ready. Your station tries again every few minutes. Last week's listing still works."],
+      ['in flight', "A spend from the SSF wallet is still on its way. Your listing goes out once it lands. Last week's listing still works."],
+    ];
+    for (const [what, words] of rows) {
+      const ind = stale({ era: 8, listed_era: 7, error: words });
+      expect(ind.title, what).toBe(`${lastEdition} · ${words}`);
+      expect(ind).toMatchObject({ state: 'outdated', colour: PHONE_BOOK_GREY, filled: true, opens: 'setnet' });
+    }
+    // A hold of the hint rule (chia_publish.rs listing_wait_words) is shown
+    // whole: every one fits the tooltip.
+    for (const words of [
+      "this edition's listing was paid by the SSF wallet and stays as it is: one hint never has two payers; the next edition's listing goes out from its own key",
+      "this edition's listing was paid by another key and stays as it is: one hint never has two payers; the next edition's listing goes out from its own key",
+    ]) {
+      const ind = stale({ error: words });
+      expect(ind.title).toBe(`Phone Book listing outdated: your addresses changed · ${words}`);
+      expect(ind.title.endsWith('…')).toBe(false);
+      expect(ind.opens).toBe('setnet');
+    }
+    // A listing of this edition with these addresses that did not make it
+    // into the book, held by the hint rule (chia_publish.rs
+    // unlanded_hold_words): the node's words alone, since neither the
+    // edition nor the addresses changed, and whole.
+    for (const words of [
+      "this edition's listing, paid by the SSF wallet, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key",
+      "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key",
+      "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the SSF wallet writes the next edition's",
+    ]) {
+      const ind = stale({ era: 8, listed_era: 8, unlanded: true, error: words });
+      expect(ind.title).toBe(`Phone Book listing outdated: ${words}`);
+      expect(ind.title.endsWith('…')).toBe(false);
+      expect(ind).toMatchObject({ state: 'outdated', colour: PHONE_BOOK_GREY, filled: true, opens: 'setnet' });
+    }
+    expect(stale({ era: 8, listed_era: 8, unlanded: true }).title).toBe("Phone Book listing outdated: this edition's listing did not make it into the book");
+    // The burner path's budget and spend words, the same way.
+    const spent = "this edition's write budget is spent; the next listing goes out in the next edition";
+    expect(stale({ error: spent }).title).toBe(`Phone Book listing outdated: your addresses changed · ${spent}`);
+    const inFlight = "the listing's last spend is still in flight, so it is not written again; the chain settles it";
+    expect(stale({ era: 8, listed_era: 7, error: inFlight }).title).toBe(`${lastEdition} · ${inFlight}`);
   });
 
   it('is a grey outline while nothing of ours is listed, and sends an unfunded node to the Bank app', () => {

@@ -179,6 +179,12 @@ describe('parseNodeFingerprint', () => {
     }
     // Extra keys from a newer node are not carried along.
     expect(parseChiaPresence({ ...listed, writes: 3 })).toEqual(listed);
+    // 📖 A listing of this edition that did not land says so (stage 4 design
+    // §8.3); only true is carried, as the node sends it, and only a boolean.
+    const unlanded = { ...listed, state: 'outdated', current: false, unlanded: true };
+    expect(parseChiaPresence(unlanded)).toEqual(unlanded);
+    expect(parseChiaPresence({ ...listed, unlanded: false })).toEqual(listed);
+    expect(parseChiaPresence({ ...listed, unlanded: 'yes' })).toBeUndefined();
   });
 
   it('refuses what is not a fingerprint: a stranger on the port, or a shape that merely passes a truthiness check', () => {

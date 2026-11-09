@@ -329,9 +329,12 @@ pub struct FaucetStatus {
     pub network: ChiaNet,
     /// A spend FROM our wallet is still settling: the lease has a coin of ours
     /// parked by a push the chain and the mempool have not settled yet (see
-    /// `chia_publish::WalletLease::outgoing_pending`). The browser keeps its
-    /// GIVING… pending while this holds and clears it from a later snapshot
-    /// that no longer says so, never on elapsed time (#245 review, round 11).
+    /// `chia_publish::WalletLease::outgoing_pending`; with burner keys on, a
+    /// spend the wallet pays for, `chia_publish::wallet_spending`, so the
+    /// listing's burner spend and the beacon's are not it). The browser keeps
+    /// its GIVING… pending while this holds and clears it from a later
+    /// snapshot that no longer says so, never on elapsed time (#245 review,
+    /// round 11).
     /// Read from the lease, not inferred from the wallet listing, which a
     /// flood of outputs can cut short of the parked coin (round 16).
     pub spending: bool,
@@ -588,6 +591,12 @@ pub struct FaucetContext<'a> {
     /// names the desktop app instead of the Bank.
     #[cfg(feature = "chia-publish")]
     pub turnable: bool,
+    /// Burner keys on for this run (`chia_publish::burners_enabled`): the
+    /// dish counts the wallet's own spends in flight only
+    /// (`chia_publish::wallet_spending`, stage 4 design §4.4), since the
+    /// listing's burner spend and the beacon's are not the wallet's.
+    #[cfg(feature = "chia-publish")]
+    pub burners: bool,
 }
 
 /// Serve one `faucet` request from the LOCAL browser for `room`.
@@ -687,7 +696,9 @@ async fn status_under_turn(ctx: &FaucetContext<'_>, client: &impl ChainAccess, p
                 let landing = crate::chia_publish::WALLET_LEASE.incoming_pending();
                 // From the lease, not the listing: a parked coin the cut-short
                 // listing never reached is still a spend in flight (round 16).
-                st.spending = crate::chia_publish::WALLET_LEASE.outgoing_pending();
+                // With burner keys on, the wallet's own spends alone (stage 4
+                // design §4.4).
+                st.spending = dish_spending(ctx, &crate::chia_publish::WALLET_LEASE, sk);
                 st.landing = landing;
                 let dish = Dish { gift: params.gift, ready: st.ready > 0, empty: st.coins == 0, gives: ctx.net.is_test() };
                 let part = wallet_part(&wallet, landing, st.spending, sealed.as_ref(), dish);
@@ -741,6 +752,17 @@ impl WalletView {
     fn spendable_mojos(&self) -> u128 {
         self.spendable.iter().map(|c| u128::from(c.amount)).sum()
     }
+}
+
+/// Whether the dish reads a spend from the SSF wallet `sk` on `lease` as
+/// still confirming ([`FaucetStatus::spending`]): `chia_publish::wallet_spending`
+/// with this run's burner flag (`ctx.burners`), so that with burner keys on
+/// the listing's spends from P(e) and the beacon's are not the wallet's
+/// (stage 4 design §4.4), and with them off every spend but a claim's is, as
+/// it always was. The snapshot asks it of the process's lease.
+#[cfg(feature = "chia-publish")]
+fn dish_spending(ctx: &FaucetContext<'_>, lease: &crate::chia_publish::WalletLease, sk: &chia_bls::SecretKey) -> bool {
+    crate::chia_publish::wallet_spending(lease, crate::chia_publish::Payer::of(sk), ctx.burners)
 }
 
 #[cfg(feature = "chia-publish")]
@@ -1716,6 +1738,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let reply = rt.block_on(handle_request(&ctx, "home-abc", br#"{"op":"status"}"#));
@@ -1754,6 +1778,8 @@ mod tests {
                 env: crate::chia_wallet_switch::EnvSwitch::On,
                 #[cfg(feature = "chia-publish")]
                 turnable: true,
+                #[cfg(feature = "chia-publish")]
+                burners: false,
             };
             let built = CLIENTS_BUILT.with(|n| n.get());
             for (payload, op) in [(&br#"{"op":"status"}"#[..], "status"), (br#"{"op":"claim"}"#, "claim"), (br#"{"op":"give","amount":5}"#, "give")] {
@@ -1903,6 +1929,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         for held in [true, false] {
             let take = |dish: &FaucetParams| rt.block_on(claim(&ctx(ChiaNet::Mainnet, held), &chain, dish)).unwrap_err().to_string();
@@ -1983,6 +2011,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let lobby_note = "On mainnet the dish gives no mojo to this node's wallet. On mainnet the dish does not take gifts from this node.";
@@ -2005,7 +2035,7 @@ mod tests {
                 // wallet on: the same note, since neither is why.
                 use crate::chia_wallet_switch::EnvSwitch;
                 for (env, turnable) in [(EnvSwitch::Off, true), (EnvSwitch::Unset, false)] {
-                    let held_off = FaucetContext { net: ChiaNet::Mainnet, chia_off: false, rooms: &rooms, wallet: None, env, turnable };
+                    let held_off = FaucetContext { net: ChiaNet::Mainnet, chia_off: false, rooms: &rooms, wallet: None, env, turnable, burners: false };
                     let st = rt.block_on(status(&held_off, &jar(), &params)).unwrap();
                     assert!(!st.can_give && !st.can_claim, "{st:?}");
                     assert_eq!(st.note, note);
@@ -2036,6 +2066,7 @@ mod tests {
             wallet: Some(sk),
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             turnable: true,
+            burners: false,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let note = format!("{MAINNET_NO_TAKE} {MAINNET_NO_GIVE}");
@@ -2050,6 +2081,38 @@ mod tests {
         assert_eq!(st.wallet_mojos, Some(5_000), "{st:?}");
         assert!(!st.can_give && !st.can_claim, "a funded wallet still gives nothing on mainnet: {st:?}");
         assert_eq!(st.note, note);
+    }
+
+    /// Stage 4 design §4.4 at the dish: the snapshot's "still confirming" goes
+    /// by the run's burner flag the context carries. With burner keys on, a
+    /// spend another key pays for (the listing's from P(e), the beacon's from
+    /// B) is not the wallet's, and one the wallet pays for is; with them off,
+    /// every parked spend is, as it always was. Each lease is the test's own,
+    /// with nothing restored.
+    #[cfg(feature = "chia-publish")]
+    #[test]
+    fn the_dish_reads_the_wallets_own_spends_alone_as_confirming_with_burner_keys_on() {
+        use crate::chia_publish::{Payer, WalletLease};
+        let sk = chia_bls::SecretKey::from_seed(&[7u8; 32]);
+        let other = Payer::of(&chia_bls::SecretKey::from_seed(&[8u8; 32]));
+        let rooms = Mutex::new(HashMap::new());
+        let ctx = |burners: bool| FaucetContext {
+            net: ChiaNet::Testnet11,
+            rooms: &rooms,
+            chia_off: false,
+            wallet: Some(sk.clone()),
+            env: crate::chia_wallet_switch::EnvSwitch::Unset,
+            turnable: true,
+            burners,
+        };
+        let bundle = chia_protocol::SpendBundle::new(vec![], chia_bls::Signature::default());
+        for (what, payer, on) in [("another key's", other, false), ("the wallet's", Payer::of(&sk), true)] {
+            let lease = WalletLease::new();
+            assert!(!dish_spending(&ctx(true), &lease, &sk) && !dish_spending(&ctx(false), &lease, &sk), "nothing parked");
+            lease.park_with_bundle([Bytes32::new([0x94; 32])], &bundle, payer).unwrap();
+            assert_eq!(dish_spending(&ctx(true), &lease, &sk), on, "burner keys on, a spend {what}");
+            assert!(dish_spending(&ctx(false), &lease, &sk), "burner keys off, a spend {what}: every spend, as before");
+        }
     }
 
     /// GIVE on mainnet is refused before the wallet or the chain is asked:
@@ -2069,6 +2132,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 1)).unwrap_err();
         assert_eq!(err.to_string(), MAINNET_NO_GIVE);
@@ -2083,6 +2148,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         assert_eq!(rt.block_on(give(&none, &chain, &test_params(), 1)).unwrap_err().to_string(), MAINNET_NO_GIVE);
         // Testnet11 gets past the network check: a gift too small to leave
@@ -2098,6 +2165,8 @@ mod tests {
             env: crate::chia_wallet_switch::EnvSwitch::Unset,
             #[cfg(feature = "chia-publish")]
             turnable: true,
+            #[cfg(feature = "chia-publish")]
+            burners: false,
         };
         let err = rt.block_on(give(&ctx, &chain, &test_params(), 0)).unwrap_err().to_string();
         #[cfg(feature = "chia-publish")]
