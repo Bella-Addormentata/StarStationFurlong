@@ -619,7 +619,8 @@ pub struct FaucetContext<'a> {
     /// Burner keys on for this run (`chia_publish::burners_enabled`): the
     /// dish counts the wallet's own spends in flight only
     /// (`chia_publish::wallet_spending`, stage 4 design §4.4), since the
-    /// listing's burner spend and the beacon's are not the wallet's.
+    /// listing's and the knocks' burner spends and the beacon's are not the
+    /// wallet's.
     #[cfg(feature = "chia-publish")]
     pub burners: bool,
 }
@@ -782,8 +783,8 @@ impl WalletView {
 /// Whether the dish reads a spend from the SSF wallet `sk` on `lease` as
 /// still confirming ([`FaucetStatus::spending`]): `chia_publish::wallet_spending`
 /// with this run's burner flag (`ctx.burners`), so that with burner keys on
-/// the listing's spends from P(e) and the beacon's are not the wallet's
-/// (stage 4 design §4.4), and with them off every spend but a claim's is, as
+/// the listing's spends from P(e), the knocks' from their own keys K(h) and
+/// the beacon's are not the wallet's (stage 4 design §4.4), and with them off every spend but a claim's is, as
 /// it always was. The snapshot asks it of the process's lease.
 #[cfg(feature = "chia-publish")]
 fn dish_spending(ctx: &FaucetContext<'_>, lease: &crate::chia_publish::WalletLease, sk: &chia_bls::SecretKey) -> bool {

@@ -174,7 +174,8 @@ impl BurnerRoot {
     /// K(h) of §3.2: the key of one knock. `inbox_hint` is the hint the
     /// knock is written under in `era`, `chia_lane::derive_inbox_hint(net,
     /// ck_host, lane, era)` on the root's network, so it is one key per host
-    /// per era (§3.1, Slots).
+    /// and room per era (§3.1, Slots): the room's lane is in the hint, and a
+    /// knock to the same host for another room has another key.
     pub fn knock(&self, inbox_hint: &[u8; 32], era: u64) -> BurnerKey {
         // §3.2: K(h) = key(2, e, h) with h = derive_inbox_hint(ck_host, lane, e).
         // The caller gives h, already on its network (§3.5), so this line

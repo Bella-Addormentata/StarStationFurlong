@@ -122,9 +122,14 @@ pub struct KnockRequest {
     pub kx_host: [u8; 32],
     /// Failed attempts to send it so far (the publisher drops it after
     /// `chia_publish::MAX_KNOCK_ATTEMPTS`). With burner keys on
-    /// (SSF_CHIA_BURNERS=1), a try that only waited, for the wallet's funds,
-    /// a spend still settling or a chain that did not answer, is none (stage
-    /// 4 design §5.2, `chia_publish::knock_attempt_counts`).
+    /// (SSF_CHIA_BURNERS=1), the knock is written from its own burner key
+    /// K(h), and a try that only waited, for a mojo ready in the lobby dish,
+    /// for the fuse on the edition's gifts, for a spend still settling or for
+    /// a chain that did not answer, is none (stage 4 design §5.2,
+    /// `chia_publish::knock_attempt_counts`). A knock found already written
+    /// by its own key (`chia_publish::claim_write::AlreadyKnocked`), or
+    /// withdrawn at spend time (`chia_publish::Withdrawn`), uses none either
+    /// way and is dropped, not tried again.
     pub attempts: u8,
 }
 
@@ -305,6 +310,15 @@ pub struct KnockBook {
 impl KnockBook {
     /// A missing file is an empty book; an unreadable one is logged and starts
     /// empty (one early knock at worst: the era budget is the host's to read).
+    /// With burner keys on (stage 4 design §4.1, the knock row; §9) a lost
+    /// book gives no second knock for the same host and room in an era, since
+    /// that knock's key answers: it wrote, and a knock's key writes once. A
+    /// knock to that host for another room uses another key, since the room's
+    /// lane is in its inbox hint, and goes out: the one early knock at worst.
+    /// The knock its key answers for then has no entry, so this node does
+    /// not dial the host at that knock's confirmation height (no entry is
+    /// rebuilt from the chain), unless the wallet lease still holds its write
+    /// (`chia_publish::lost_knock_entry`).
     pub fn load(path: &Path) -> KnockBook {
         match std::fs::read(path) {
             Ok(bytes) => {

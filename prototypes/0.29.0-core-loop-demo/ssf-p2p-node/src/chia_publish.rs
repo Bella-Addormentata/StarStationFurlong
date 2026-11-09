@@ -480,9 +480,10 @@ pub static WALLET_LEASE: std::sync::LazyLock<WalletLease> = std::sync::LazyLock:
 /// for ([`WalletLease::outgoing_pending_for`]), a spend with no payer
 /// recorded among them. What decides is the payer, not the input: the
 /// listing's spends from P(e) (its first write's lobby dish coin, its
-/// rewrites' own coin) and the beacon's from its own wallet B are not the
-/// wallet's, and a GIVE spends the wallet's own free coins, picked under
-/// the lease, so giving never waits on them.
+/// rewrites' own coin), each knock's from its own key K(h) (the lobby dish
+/// coin its one write claims), and the beacon's from its own wallet B are
+/// not the wallet's, and a GIVE spends the wallet's own free coins, picked
+/// under the lease, so giving never waits on them.
 pub fn wallet_spending(lease: &WalletLease, money: Payer, burners: bool) -> bool {
     if burners {
         lease.outgoing_pending_for(money)
@@ -757,8 +758,10 @@ impl WalletLease {
     /// write, and through [`WalletLease::holds_for`] before a gift. The
     /// listing's writer from P(e) (row 10, [`publish_node_presence_with`])
     /// is that writer, and asks it of P(e) so, and of the SSF wallet's payer
-    /// as well before P(e)'s first write (`claim_write::BurnerWait::MoneyInFlight`);
-    /// the knock and beacon writers of row 10 will ask it too. Its second guard is the
+    /// as well before P(e)'s first write (`claim_write::BurnerWait::MoneyInFlight`).
+    /// The knock's writer from K(h) ([`publish_knock_with`],
+    /// `claim_write::knock_write_with`) asks it of K(h)'s payer alone; the
+    /// beacon writer of row 10 will ask it too. Its second guard is the
     /// burner's own puzzle hash, which no payer record can lose: a saved
     /// bundle that spends a coin there ([`WalletLease::parks_spend_at`],
     /// [`WalletLease::holds_spend_at`]), and a 1-mojo coin there that the
@@ -834,9 +837,10 @@ impl WalletLease {
     /// spend's bundle and payer in the same write as its parking, before the
     /// push, and keeps a settling spend's until the chain settles it
     /// [`crate::chia_knock::SETTLED_DEPTH`] deep, so a write is found here
-    /// for that long whatever became of the mark that filed it
-    /// ([`lost_listing_mark`]). A parked spend whose bundle was not saved is
-    /// not seen, and neither is one the lease has forgotten.
+    /// for that long whatever became of the mark or the knock entry that
+    /// filed it ([`lost_listing_mark`], [`lost_knock_entry`]). A parked spend
+    /// whose bundle was not saved is not seen, and neither is one the lease
+    /// has forgotten.
     pub(crate) fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
         // A spend's number, the inputs the lease parks for it, its bundle,
         // its payer, and the height the chain spent it at once it settles.
@@ -3248,7 +3252,9 @@ pub struct MemoWrite {
     pub payer: Payer,
 }
 
-/// The shared tail of every era-bound write (presence, knock, beacon): under
+/// The shared tail of every era-bound write a wallet key pays for
+/// (presence, knock, beacon; with burner keys on, the listing and the knocks
+/// have the burner's writer instead, `claim_write`): under
 /// the lease, reconcile, refuse while a spend of ours is still settling, pick
 /// the payer's largest free coin, spend it to itself carrying `[hint, body]`,
 /// push with the input parked under its payer ([`Payer::of`] the key that
@@ -3266,11 +3272,15 @@ pub struct MemoWrite {
 /// retry for a spend the mempool DROPPED, so a pending one waits for
 /// reconciliation's verdict (the heartbeat tries again on its retry cadence).
 /// The check is the global one, whatever the pending spend's payer: a pending
-/// beacon spend holds the listing and the knocks here and a pending listing
-/// holds the beacon, which is why the beacon lands just after the listing
-/// (stage 4 design §2, §4.3 T5). Asking per payer
-/// ([`WalletLease::outgoing_pending_for`]) is the burner writers' (design
-/// §13, PR 10), with the spacing that keeps two payers' pushes apart (§4.3 T4).
+/// beacon spend holds a listing and a knock the SSF wallet pays for, and any
+/// pending listing or knock holds the beacon, a burner's among them, which
+/// is why the beacon lands just after the listing (stage 4 design §2, §4.3
+/// T5). Asking per payer ([`WalletLease::outgoing_pending_for`]) is the
+/// burner writers' (design §13, PR 10): the listing's and the knocks' from
+/// their own keys (`claim_write::burner_write_with`,
+/// `claim_write::knock_write_with`) wait on their own payer's spends alone,
+/// so a pending beacon does not hold them. The spacing that keeps two
+/// payers' pushes apart (§4.3 T4) is still to come.
 async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &str) -> Result<MemoWrite> {
     publish_memo_with(payer, hint, None, move |_| Ok(body), what).await
 }
@@ -3409,16 +3419,24 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// a test network turns them on, and the line says what that does in this
 /// build: the Phone Book listing written from the wallet's listing burner
 /// P(e), funded by the lobby dish, at its slot, after a late start or at
-/// once for a newcomer (§4.3, [`burner_listing_step`]); the knock rule of
-/// §5.2 ([`knock_attempt_counts`]); and the claim-and-write self-test hook
-/// it opens ([`claim_write_selftest`]), with knocks and the beacon paid as
-/// before. Exactly `1` off a test
-/// network is ignored with a line: there no memo spend leaves the money key
-/// ([`refuse_money_memo`]), and nothing exits or changes. Any other value
-/// (unset, empty, `0`, `true`, a stray space, not UTF-8) is off and says
-/// nothing, whatever the network, as a hook's does (main.rs `test_hook`).
-/// It reads no environment, so its tests ask it every value on every
-/// network.
+/// once for a newcomer (§4.3, [`burner_listing_step`]); each knock written
+/// from its own burner key K(h), funded the same way, once per host and
+/// room per edition, since K(h) is one key per inbox hint, which is the
+/// host's for one room's lane in one era, and it writes once (§3.2, §4.1,
+/// the knock row, [`publish_knock_with`]); the knock rule of §5.2
+/// ([`knock_attempt_counts`]), under which a knock that only waits, for a
+/// dish coin, for the fuse once the edition's
+/// `claim_write::MAX_GIFTS_PER_ERA` gifts are given, for a spend still
+/// settling or for an unread chain, uses none of its attempts; and the
+/// claim-and-write self-test hook it opens ([`claim_write_selftest`]), with
+/// the beacon paid as before. The line names no busy chain among the waits:
+/// a push refused for its fee still uses an attempt (§10). Exactly `1` off
+/// a test network is ignored with a line: there no memo spend leaves the
+/// money key ([`refuse_money_memo`]), and nothing exits or changes. Any
+/// other value (unset, empty, `0`, `true`, a stray space, not UTF-8) is off
+/// and says nothing, whatever the network, as a hook's does (main.rs
+/// `test_hook`). It reads no environment, so its tests ask it every value
+/// on every network.
 pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsStr>) -> (bool, Option<String>) {
     if raw != Some(std::ffi::OsStr::new("1")) {
         return (false, None);
@@ -3427,8 +3445,9 @@ pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsSt
         return (false, Some(format!("⛓️ ChiaHub: {BURNERS_ENV}=1 is ignored on {}. Burner keys are tried on a test network only.", net.name())));
     }
     let line = format!(
-        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. Knocks and the beacon are still paid as before.",
+        "⛓️ ChiaHub burners ({BURNERS_ENV}=1): on for {}. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's {} gifts given, a spend still settling, the chain unread) uses none of its {MAX_KNOCK_ATTEMPTS} attempts and is tried again in {} minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The beacon is still paid as before.",
         net.name(),
+        claim_write::MAX_GIFTS_PER_ERA,
         HEARTBEAT_RETRY_SECS / 60
     );
     (true, Some(line))
@@ -3436,9 +3455,10 @@ pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsSt
 
 /// The process's [`BURNERS_ENV`] on its network ([`burners_of`]), read once,
 /// as `chia_wallet_switch::env_switch` reads `SSF_CHIA_LANE`: the startup
-/// line, the heartbeat's listing path and knock rule, the dish's count of
-/// the wallet's spends in flight ([`wallet_spending`]) and the self-test
-/// hook see the same value. The network is settled before anything asks.
+/// line, the heartbeat's listing and knock paths and its knock rule, the
+/// dish's count of the wallet's spends in flight ([`wallet_spending`]) and
+/// the self-test hook see the same value. The network is settled before
+/// anything asks.
 pub fn burners() -> &'static (bool, Option<String>) {
     static BURNERS: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
     BURNERS.get_or_init(|| burners_of(crate::chia_network::net(), std::env::var_os(BURNERS_ENV).as_deref()))
@@ -3474,13 +3494,15 @@ pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
 /// Attempts of a knock that failed to leave before the request is dropped;
 /// the next dial exhaustion queues it again. With burner keys off every
 /// failure is one, as it always was. With them on ([`burners_enabled`],
-/// stage 4 design §5.2) a knock that only waits ([`is_typed_wait`]: the
-/// wallet unfunded or still settling, no dish coin ready, the lease not
-/// parking, the chain unread) is none, and the knock arm tries again after
-/// [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]); every other failure, a push
-/// the peers refused among them, is one ([`knock_attempt_counts`]). A push
-/// refused because the chain is busy ([`chain_busy`]) is such a refusal, and
-/// uses one (§10: a first push refused for its fee is a rejection). A knock
+/// stage 4 design §5.2) a knock is written from its own burner key K(h),
+/// and one that only waits ([`is_typed_wait`]: K(h)'s spend in flight or
+/// settling, its listing cut short, no dish coin ready, the edition's gifts
+/// all given, the lease not parking, the chain unread) is none, and the
+/// knock arm tries again after [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]);
+/// every other failure, a push the peers refused among them, is one
+/// ([`knock_attempt_counts`]). A push refused because the chain is busy
+/// ([`chain_busy`]) is such a refusal, and uses one (§10: a first push
+/// refused for its fee is a rejection). A knock
 /// withdrawn at spend time ([`Withdrawn`]), or found already written by its
 /// own key (`claim_write::AlreadyKnocked`, §4.1, the knock row), uses none
 /// either way: it is dropped with one line, not tried again
@@ -3841,6 +3863,25 @@ fn knock_not_written(
         found.note(&req.host, era);
     }
     println!("{line}");
+}
+
+/// The line the knock arm prints once a knock for `host` in `room` is
+/// written in `era` under `hint`, its push acknowledged (`acked`) or
+/// unanswered. With burner keys off it is the line the arm always gave,
+/// word for word. Written from its own burner key K(h) (`from_burner`, the
+/// burner path: stage 4 design §4.1, the knock row), it says so at its end,
+/// as the listing's line names its edition's key. It names the host by its
+/// shortened node id ([`short`]) and the hint by its first 16 hex digits,
+/// and no key, puzzle hash or address: who paid is said by kind alone.
+fn knock_sent_line(acked: bool, host: &str, room: &str, era: u64, hint: Bytes32, from_burner: bool) -> String {
+    let hint_hex = hex::encode(hint.to_bytes());
+    format!(
+        "⛓️ ChiaHub knock: {} on {} for room {room} in era {era} · inbox hint {} — both sides dial on the confirmation height{}",
+        if acked { "knocked" } else { "knock pushed, unanswered (filed as pending; the chain's word settles it)" },
+        short(host),
+        &hint_hex[..16],
+        if from_burner { " · from its own burner key" } else { "" }
+    )
 }
 
 /// The beacon's own wallet key, funded SEPARATELY (its address is printed at
@@ -4371,7 +4412,6 @@ async fn publish_knock_on(
 /// entry (§8.3, the crash window) is kept from a second payer by the knock
 /// arm before it asks for a write, which files the entry again from the
 /// write the lease holds under the hint ([`lost_knock_entry`]).
-#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it, through publish_burner_knock
 #[allow(clippy::too_many_arguments)]
 async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -4424,7 +4464,6 @@ async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
 /// source: the knock the heartbeat writes from K(h) with burner keys on
 /// (§13 row 10). No test calls it: its lease, fuse and chain are the
 /// process's.
-#[allow(dead_code)] // until the knock arm calls it
 #[allow(clippy::too_many_arguments)]
 async fn publish_burner_knock(
     net: crate::chia_network::ChiaNet,
@@ -4515,7 +4554,6 @@ pub fn sent_knock_of(req: &KnockRequest, era: u64, hint: Bytes32, write: &MemoWr
 /// The heartbeat asks it only on a test network, where knocks are written,
 /// and only for a request it does not skip ([`knock_skipped`]): a host the
 /// book holds a knock on this era already has its entry.
-#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lost_knock_entry(
     held: Option<HeldWrite>,
@@ -4545,6 +4583,20 @@ pub(crate) fn lost_knock_entry(
         parked: hex::encode(held.coins.parked.to_bytes()),
         payer: held.payer.map(|p| p.hex()),
     })
+}
+
+/// The line the knock arm prints when it files `req`'s knock in `era` again
+/// from the write the lease still holds under its inbox hint
+/// ([`lost_knock_entry`], stage 4 design §8.3). It names the host by its
+/// shortened node id ([`short`]), the room and the era, and neither who
+/// paid nor any key, puzzle hash or address, as the listing's line for a
+/// lost mark names no payer.
+fn lost_knock_line(req: &KnockRequest, era: u64) -> String {
+    format!(
+        "⛓️ ChiaHub knock: the wallet lease still holds the era {era} knock on {} for room {}, written before a restart that lost its entry — filed again; one inbox hint never has two payers, so nothing new is written under it (no attempt used)",
+        short(&req.host),
+        req.room
+    )
 }
 
 /// The memo a knock for `req` carries on `net` once its input coin `input`
@@ -4630,15 +4682,18 @@ pub async fn heartbeat_loop(
     let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
     // Burner keys on for this run (SSF_CHIA_BURNERS=1 on a test network): in
     // the heartbeat they write the listing from this wallet's listing burner
-    // P(e) at its slot (stage 4 design §4.3, [`burner_listing_step`]), and
-    // change the knock rule (§5.2) and the words the knock and beacon lines
-    // give a busy chain (§10). Knocks and the beacon are still paid as before.
+    // P(e) at its slot (stage 4 design §4.3, [`burner_listing_step`]) and
+    // each knock from its own burner key K(h), once (§4.1, the knock row),
+    // and change the knock rule (§5.2) and the words the knock and beacon
+    // lines give a busy chain (§10). The listing and each knock are written
+    // from their own burner keys; the beacon is still paid as before.
     let burners = burners_enabled();
-    // The root the listing burners and their slots come from (§3.2), made
-    // once from the wallet key, on the burner path alone. Off a test network
-    // burner keys are never on ([`burners_of`]), so no root is made there,
-    // and with the flag off the listing arm is the SSF wallet's, as on main
-    // ([`money_listing_step`]).
+    // The root the listing's burners and their slots come from, and the
+    // knocks' keys (§3.2), made once from the wallet key, on the burner path
+    // alone. Off a test network burner keys are never on ([`burners_of`]),
+    // so no root is made there, and with the flag off the listing arm and
+    // the knock arm are the SSF wallet's, as on main
+    // ([`money_listing_step`], [`publish_knock`]).
     let listing_root = burners.then(|| crate::chia_burner::BurnerRoot::of(&crate::chia_burner::MoneyKey::new(chia_sk.clone()), net));
     // The SSF wallet's payer text, as the marks file it, for the hint rule
     // (§8.3) on either path.
@@ -5099,6 +5154,35 @@ pub async fn heartbeat_loop(
                 break Some((req, cap.room_key));
             };
             if let Some((req, room_key)) = next {
+                // A knock under this request's inbox hint that the lease
+                // still holds, written before a stop that lost its entry
+                // (stage 4 design §8.3, the crash window), is filed again
+                // from the lease, and nothing new is written under the hint
+                // ([`lost_knock_entry`]): on the burner path whoever paid
+                // for it, and on the money path only one another payer paid
+                // for (burner keys turned off after the stop). It is asked
+                // on a test network alone, the only one knocks are written
+                // on, and it uses none of the request's attempts. The line
+                // names no key.
+                let hint = knock_hint(net, &req, &room_key, era);
+                let writer_payer = match &listing_root {
+                    Some(root) => Payer::of_burner(&root.knock(&hint.to_bytes(), era)),
+                    None => Payer::of(&chia_sk),
+                };
+                let lost = if net.is_test() {
+                    lost_knock_entry(WALLET_LEASE.held_write_under(hint), &writer_payer, listing_root.is_some(), &req, hint, era, now_unix)
+                } else {
+                    None
+                };
+                if let Some(entry) = lost {
+                    println!("{}", lost_knock_line(&req, era));
+                    let mut book = hub.knocks.lock().unwrap();
+                    book.record_sent(entry);
+                    if let Err(e) = book.save(knocks_path) {
+                        eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
+                    }
+                    continue; // the arm's one request this tick, though nothing is spent
+                }
                 // The room's word is read AGAIN at spend time, under the card
                 // gate, after the lease and coin lookups (#272 review round 5):
                 // a cap turning the room public or its switch off meanwhile
@@ -5117,17 +5201,20 @@ pub async fn heartbeat_loop(
                         knock_leave(cap.as_ref(), linked, hub.contact_key_durable, crate::chia_contact::share_card_enabled(), &hub.contact_key)
                     }
                 };
-                match publish_knock(net, &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
+                // On the burner path the knock is a claim-and-write from its
+                // own key K(h), written once (§4.1, the knock row: a key
+                // that already wrote is `claim_write::AlreadyKnocked`), paid
+                // for by no key of the wallet's; with burner keys off it is
+                // the SSF wallet's write, as on main. The path decides, as
+                // it does for the listing, never which key paid.
+                let sent = match &listing_root {
+                    Some(root) => publish_burner_knock(net, root, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await,
+                    None => publish_knock(net, &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await,
+                };
+                match sent {
                     Ok((hint, write)) => {
                         knock_wait = None;
-                        let hint_hex = hex::encode(hint.to_bytes());
-                        println!(
-                            "⛓️ ChiaHub knock: {} on {} for room {} in era {era} · inbox hint {} — both sides dial on the confirmation height",
-                            if write.acked { "knocked" } else { "knock pushed, unanswered (filed as pending; the chain's word settles it)" },
-                            short(&req.host),
-                            req.room,
-                            &hint_hex[..16]
-                        );
+                        println!("{}", knock_sent_line(write.acked, &req.host, &req.room, era, hint, listing_root.is_some()));
                         // Filed whether or not the push was answered: an
                         // unanswered knock may be in a mempool with its coin
                         // parked, and only a filed knock gets its confirmation
@@ -8965,9 +9052,13 @@ mod tests {
     }
 
     /// Stage 4 design §8 (2): `SSF_CHIA_BURNERS` is on with exactly `1` on a
-    /// test network, and its line says what it does in this build. `1` off a
-    /// test network is ignored, with one line; any other value is off and
-    /// says nothing, on every network. No environment is read.
+    /// test network, and its line says what it does in this build: the
+    /// listing and each knock written from burner keys of their own, a knock
+    /// once per host and room per edition, the waits that use no attempt,
+    /// and the beacon paid as before. It names no busy chain among the
+    /// waits, since a push refused for its fee still uses an attempt (§10).
+    /// `1` off a test network is ignored, with one line; any other value is
+    /// off and says nothing, on every network. No environment is read.
     #[test]
     fn ssf_chia_burners_is_on_with_exactly_1_on_a_test_network_and_ignored_with_a_line_off_one() {
         use crate::chia_network::ChiaNet;
@@ -8987,11 +9078,12 @@ mod tests {
             let (on, line) = burners_of(net, Some(OsStr::new("1")));
             assert_eq!(on, net.is_test(), "{net:?}");
             assert!(line.is_some(), "1 is said on {net:?}");
+            assert!(!line.unwrap_or_default().contains("busy"), "no busy chain among the waits on {net:?}");
         }
         assert_eq!(
             burners_of(ChiaNet::Testnet11, Some(OsStr::new("1"))).1.as_deref(),
             Some(
-                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. A knock that only waits (the wallet unfunded or still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. Knocks and the beacon are still paid as before."
+                "⛓️ ChiaHub burners (SSF_CHIA_BURNERS=1): on for testnet11. The Phone Book listing is written from a burner key the lobby dish funds, and goes out in each edition's first day, within about an hour of coming online after it, or at once for a station not listed last edition. Each knock is written from a burner key of its own, funded the same way, once per host and room per edition: a knock's key that has written is never written again. A knock that only waits (no mojo ready in the lobby dish, the edition's 16 gifts given, a spend still settling, the chain unread) uses none of its 3 attempts and is tried again in 5 minutes. SSF_CHIA_CLAIM_WRITE_TEST=1 runs one claim-and-write from the lobby dish at startup. The beacon is still paid as before."
             )
         );
         assert_eq!(
@@ -9437,6 +9529,50 @@ mod tests {
                 assert_eq!(got, files.then(|| filed(paid_by)), "burner path {burner_path}, paid by {who}, spent at {spent_at:?}");
             }
         }
+    }
+
+    /// The line a knock written is said in ([`knock_sent_line`]): with
+    /// burner keys off it is the knock arm's line as it always was, word for
+    /// word, acknowledged or unanswered, and written from its own burner key
+    /// K(h) it is the same line saying so at its end (stage 4 design §4.1,
+    /// the knock row). Either way it names the host by its shortened node id
+    /// alone and the hint by its first 16 hex digits alone.
+    #[test]
+    fn a_sent_knocks_line_is_mains_without_burner_keys_and_says_its_own_key_with_them() {
+        let host = "0123456789abcdef0123";
+        let hint = Bytes32::new(std::array::from_fn(|i| i as u8));
+        let mains = [
+            (true, "⛓️ ChiaHub knock: knocked on 0123456789abcdef for room r in era 4 · inbox hint 0001020304050607 — both sides dial on the confirmation height"),
+            (
+                false,
+                "⛓️ ChiaHub knock: knock pushed, unanswered (filed as pending; the chain's word settles it) on 0123456789abcdef for room r in era 4 · inbox hint 0001020304050607 — both sides dial on the confirmation height",
+            ),
+        ];
+        for (acked, main) in mains {
+            assert_eq!(knock_sent_line(acked, host, "r", 4, hint, false), main, "acked {acked}, burner keys off");
+            let from_burner = knock_sent_line(acked, host, "r", 4, hint, true);
+            assert_eq!(from_burner, format!("{main} · from its own burner key"), "acked {acked}, from its own burner key");
+            for line in [main.to_string(), from_burner] {
+                assert!(!line.contains(host), "acked {acked}: the host's node id beyond its first 16 characters: {line}");
+                assert!(!line.contains(&hex::encode(&hint.to_bytes()[..9])), "acked {acked}: the hint beyond its first 16 hex digits: {line}");
+            }
+        }
+    }
+
+    /// The line a knock filed again from the lease is said in
+    /// ([`lost_knock_line`], stage 4 design §8.3): one line naming the
+    /// host's shortened node id, the room and the era, and neither who paid
+    /// nor anything of the write's.
+    #[test]
+    fn a_knock_filed_again_from_the_lease_is_said_in_one_line_that_names_no_payer() {
+        let req = KnockRequest { room: "r".into(), host: "0123456789abcdef0123".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts: 0 };
+        let line = lost_knock_line(&req, 4);
+        assert_eq!(
+            line,
+            "⛓️ ChiaHub knock: the wallet lease still holds the era 4 knock on 0123456789abcdef for room r, written before a restart that lost its entry — filed again; one inbox hint never has two payers, so nothing new is written under it (no attempt used)"
+        );
+        assert!(!line.contains('\n'), "one line");
+        assert!(!line.contains(&req.host), "the host's node id beyond its first 16 characters");
     }
 
     /// A host this run found its knock already written to is skipped for

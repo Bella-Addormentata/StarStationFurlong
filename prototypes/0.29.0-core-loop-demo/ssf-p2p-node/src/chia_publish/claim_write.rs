@@ -428,7 +428,6 @@ impl fmt::Display for AlreadyKnocked {
 impl std::error::Error for AlreadyKnocked {}
 
 /// The rule a burner's key writes its slot under (stage 4 design §4.1).
-#[cfg_attr(not(test), allow(dead_code))] // only the tests build `Once` until the knock arm calls `knock_write_with`
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     /// The listing's and the self-test's: a later write spends the key's own
@@ -814,7 +813,6 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// neither sees the other's bundle and both can land: two gifts for one key
 /// and two coins at K(h), each opening only for the host. That is accepted,
 /// as §9 accepts one extra bundle.
-#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn knock_write_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
