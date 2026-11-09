@@ -4428,3 +4428,53 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
     assert!(s.chain.unanswered().is_empty());
 }
+
+/// Stage 4 design §8.3, between the knock arm's step and its writer
+/// ([`knock_on_path`]): the step reads the lease under its gate and gives the
+/// gate back before the burner's writer takes it again, and the writer asks
+/// the lease once more, under its own gate, naming the SSF wallet's payer as
+/// the step gives it, the wallet key's ([`Payer::of`]). Here the step finds
+/// nothing held under the knock's hint, and a knock the SSF wallet pays for
+/// is parked under that hint at the very point the step hands over to the
+/// writer, where it reads the clock. The writer waits
+/// ([`BurnerWait::MoneyUnderHint`]): K(h) claims no lobby coin, sends nothing
+/// and counts no gift, and the wallet's knock stays the only write under the
+/// hint. The next step then finds the wallet's knock and files it, writing
+/// nothing.
+#[tokio::test]
+async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_the_burners_writer() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(97), iroh::SecretKey::generate());
+    let money = Payer::of(&w);
+    let (req, _) = host_card([0x97; 32]);
+    let key = knock_key(97, &req, 0);
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let (dish, made) = ready_dishes(&s, &[1, 1]).await;
+    let hint = knock_hint(NET, &req, &ROOM_KEY, 0);
+    let theirs = build_publish_bundle(NET, &w, coin, hint, Bytes::new(b"a sealed knock".to_vec())).unwrap();
+    assert_eq!(s.lease.held_write_under(hint).await, None, "nothing under the hint when the step reads the lease");
+
+    let at = s.later();
+    let (root, gate) = (root(97), tokio::sync::Mutex::new(()));
+    let mut rng = StdRng::seed_from_u64(1);
+    let lease = &s.lease;
+    let parks = || {
+        lease.park_with_bundle_at([(coin.coin_id(), made)], Some((&theirs, money)), at).expect("W's knock, parked between the step's read and the writer's");
+        at
+    };
+    let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, Some(&root), &node, &w, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+    let e = done.as_ref().err().expect("K(h) does not write beside W's knock");
+    assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::MoneyUnderHint), "the writer's own read of the lease, naming W as the step gave it: {e:#}");
+    assert!(is_typed_wait(e), "a wait: no attempt used");
+    knock_names_no_burner(e, &req, &key);
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(dish.iter().all(|c| !s.lease.is_taken(&c.coin_id())), "no lobby coin claimed");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert!(s.lease.outgoing_pending_for(money) && !s.lease.holds_for(Payer::of_burner(&key)), "W's knock parked, nothing of K(h)'s");
+
+    let filed = arm_refiled(&s.arm_knock(97, true, &node, &req, 0, || Ok(None), unix_now(), 2).await).expect("the next step files W's knock");
+    assert_eq!((filed.coin_id, filed.payer), (hex::encode(coin.coin_id().to_bytes()), Some(money.hex())), "W's write, naming W");
+    assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
+    assert_eq!(s.gifts(0), 0);
+    assert!(s.chain.unanswered().is_empty());
+}

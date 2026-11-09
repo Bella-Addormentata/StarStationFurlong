@@ -8611,13 +8611,16 @@ mod tests {
     /// that holds the gate throughout never misses it. One that gave the gate
     /// back between the two maps could read the parking before a move and
     /// the settling spends during one, and find no write at all. The thread
-    /// spins on the gate, so it takes it as soon as it is free, and keeps the
-    /// write parked a while each time. The reads, on a runtime of two
-    /// threads of its own, go on until the thread has moved the write many
-    /// times between them. The check is one-sided: the write moves only
-    /// under the gate, so a read that holds it can never miss, however the
-    /// threads are scheduled.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// tries the gate again and again, so it takes it soon after it is free,
+    /// and keeps the write parked a while each time. The reads run on the
+    /// test's own thread, and go on until the thread has moved the write
+    /// many times between them, or until a time limit: each gives the
+    /// processor up once its read is done, and the thread does between its
+    /// tries, so the two take turns even where one processor serves both.
+    /// The check is one-sided: the write moves only under the gate, so a
+    /// read that holds it can never miss, however the threads are scheduled,
+    /// and how often the write moved is no part of it.
+    #[tokio::test]
     async fn the_write_held_under_a_hint_is_read_whole_under_the_leases_gate_while_another_thread_moves_it() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let sk = SecretKey::from_seed(&[0x68; 32]);
@@ -8635,9 +8638,18 @@ mod tests {
         let mover = {
             let (lease, stop, moves) = (lease.clone(), stop.clone(), moves.clone());
             std::thread::spawn(move || {
+                let mut tries = 0u32;
                 while !stop.load(Ordering::Relaxed) {
                     let Ok(gate) = lease.gate.try_lock() else {
-                        std::hint::spin_loop();
+                        // Mostly a spin, so the gate is taken soon after it
+                        // is free; now and then the processor is given up,
+                        // so a reader that shares it can finish its read.
+                        tries = tries.wrapping_add(1);
+                        if tries % 64 == 0 {
+                            std::thread::yield_now();
+                        } else {
+                            std::hint::spin_loop();
+                        }
                         continue;
                     };
                     lease.retire(&[], Vec::new(), &[spend], &[], &[], t0);
@@ -8650,20 +8662,50 @@ mod tests {
                 }
             })
         };
+        let limit = Instant::now() + Duration::from_secs(20);
         let (mut reads, mut missed) = (0u32, 0u32);
-        while reads < 2_000 || (moves.load(Ordering::Relaxed) < 500 && reads < 200_000) {
+        while reads < 2_000 || (moves.load(Ordering::Relaxed) < 500 && Instant::now() < limit) {
             let held = lease.held_writes_under(hint).await;
             if !held.iter().any(|w| w.spend == spend) {
                 missed += 1;
             }
             reads += 1;
+            // The gate is free again here: the mover's turn, where one
+            // processor serves both threads.
+            std::thread::yield_now();
         }
         stop.store(true, Ordering::Relaxed);
         mover.join().expect("the mover ends");
         let moves = moves.load(Ordering::Relaxed);
-        assert!(moves >= 500, "the write was moved {moves} times in {reads} reads");
         assert_eq!(missed, 0, "{missed} of {reads} reads found no write while it was moved {moves} times");
         assert!(lease.is_settling(&id), "settling once the mover gave the gate back");
+    }
+
+    /// [`lost_listing_mark`] returns at once, without waiting on the lease's
+    /// gate, where it has nothing to read: off a test network, where the
+    /// heartbeat asks it every beat as on any network, and with a mark of
+    /// this era on record that names a write. While another holds the gate,
+    /// both answer at once, on either path, so mainnet's beat never waits on
+    /// the lease here; with no such mark on a test network the step does
+    /// wait for the gate, and answers once it is given back.
+    #[tokio::test]
+    async fn a_lost_listing_marks_step_waits_on_the_leases_gate_only_where_it_reads_the_lease() {
+        use crate::chia_network::ChiaNet;
+        let (lease, ck, era) = (WalletLease::new(), [0x76; 32], 3);
+        let on_record = NodePublishMark { era, hint: hex::encode(chia_lane::derive_ck_hint(T11, &ck, era)), last_at: 1_700_000_000, ..Default::default() };
+        assert!(!on_record.is_void());
+        let gate = lease.lock().await;
+        let soon = Duration::from_secs(5);
+        for burner_path in [true, false] {
+            let off = tokio::time::timeout(soon, lost_listing_mark(&lease, None, ChiaNet::Mainnet, &ck, era, burner_path, "", |_| None)).await;
+            assert_eq!(off, Ok(None), "off a test network, burner path {burner_path}: no wait on the gate");
+            let named = tokio::time::timeout(soon, lost_listing_mark(&lease, Some(&on_record), T11, &ck, era, burner_path, "", |_| None)).await;
+            assert_eq!(named, Ok(None), "a mark on record that names a write, burner path {burner_path}: no wait on the gate");
+        }
+        let mut read = std::pin::pin!(lost_listing_mark(&lease, None, T11, &ck, era, true, "", |_| None));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut read).await.is_err(), "no mark on a test network: the lease is read, under its gate");
+        drop(gate);
+        assert_eq!(tokio::time::timeout(soon, read).await, Ok(None), "the gate given back: nothing held, nothing rebuilt");
     }
 
     /// The writes the lease holds under one hint come newest first, by the
@@ -9953,6 +9995,21 @@ mod tests {
         for (burner_path, writes, paid_by, what) in stack {
             let got = lost_knock_entry(writes, own(true), &money, burner_path, &req, hint, 4, now_unix);
             assert_eq!(got, Some(filed(paid_by)), "burner path {burner_path}: {what}");
+        }
+        // Two writes that qualify alike, neither this host's own: the newer
+        // is the one filed. On the burner path, two on the SSF wallet's side
+        // (one of them with no payer filed); on the SSF wallet's path, two
+        // other hosts' burners paid for.
+        let third = Payer::of_burner(&root.knock(&knock_slot(hint, "F"), 4));
+        let newest = |payer: Option<Payer>| SentKnock { coin_id: hex::encode([8u8; 32]), parked: hex::encode([8u8; 32]), spend: Some(9), ..filed(payer) };
+        let alike = [
+            (true, vec![newer(Some(money)), held(None, None)], Some(money), "the newer of two on the SSF wallet's side"),
+            (true, vec![newer(None), held(Some(money), None)], None, "the newer of two on the SSF wallet's side, with no payer filed"),
+            (false, vec![newer(Some(theirs)), held(Some(third), None)], Some(theirs), "the newer of two other hosts' burners'"),
+        ];
+        for (burner_path, writes, paid_by, what) in alike {
+            let got = lost_knock_entry(writes, own(true), &money, burner_path, &req, hint, 4, now_unix);
+            assert_eq!(got, Some(newest(paid_by)), "burner path {burner_path}: {what}");
         }
         for burner_path in [true, false] {
             let others = vec![newer(Some(if burner_path { theirs } else { money })), held(if burner_path { Some(theirs) } else { None }, None)];

@@ -2182,6 +2182,34 @@ mod tests {
             assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "{what}: no gift counted");
             assert_eq!(lease.is_settling(&coin.coin_id()), settling, "{what}: the lease as it was");
         }
+
+        // The order of the knock's checks (`knock_write_with`'s doc). With
+        // the SSF wallet's write held under the hint, a key whose own write
+        // the chain lists, a spent record at the key, waits on the wallet's
+        // write and is not read as already knocked, which would end the
+        // knock for the era before the arm's step filed the wallet's write.
+        // Without the wallet's write the same listing is already knocked.
+        // And a spend the lease holds for the key itself is held before
+        // either is asked, with the key's listing unread.
+        let under_hint = || crate::chia_publish::build_publish_bundle(net, &sk, coin, Bytes32::new(HINT), Bytes::new(BODY.to_vec())).unwrap();
+        let wrote = || Scripted::new(vec![page(vec![record(Coin::new(Bytes32::new([4; 32]), key.puzzle_hash(), 1), true)], false)]);
+        let fuse = Mutex::new(GiftFuse::new());
+        let (lease, chain) = (WalletLease::new(), wrote());
+        lease.park_with_bundle([coin.coin_id()], &under_hint(), ssf_wallet()).unwrap();
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::MoneyUnderHint), "the wallet's write is asked of before the key's own: {e:#}");
+        assert_eq!(e.downcast_ref::<AlreadyKnocked>(), None, "a wait, not a drop: {e:#}");
+        let chain = wrote();
+        let e = knock_on_lease(&WalletLease::new(), &chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "with no write of the wallet's held: {e:#}");
+        let (lease, chain) = (WalletLease::new(), wrote());
+        lease.park_with_bundle([coin.coin_id()], &under_hint(), ssf_wallet()).unwrap();
+        lease.park_with_bundle([Bytes32::new([5; 32])], &SpendBundle::new(vec![], chia_bls::Signature::default()), Payer::of_burner(&key)).unwrap();
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is held");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "the key's own spend first: {e:#}");
+        assert!(chain.asked_spent.lock().unwrap().is_empty(), "held before the key's listing is read");
+        assert_eq!(sent(&chain), 0, "nothing sent");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
     }
 
     /// R7 at a knock's key: a coin of any amount but 1 mojo is a stray,

@@ -327,8 +327,14 @@ mod tests {
         MoneyKey::new(keys_from_mnemonic(&zero_words()).wallet)
     }
 
-    /// The knock vector's inbox hint: the host's for the room's lane in the
-    /// era, on `net` (§3.5: mainnet's carries the network tag).
+    /// The knock vectors' 32 bytes: a host's inbox hint for the room's lane
+    /// in the era, on `net` (§3.5: mainnet's carries the network tag). The
+    /// tests here pin [`BurnerRoot::knock`]'s line on the bytes it is given,
+    /// and what holds of its keys whatever those bytes are (off the wallet's
+    /// paths, not the beacon key, never printed), under the name K(h) as
+    /// §3.2 writes it. The knock writer gives that line the hint bound to
+    /// the host's node id (`chia_publish::knock_slot`), and the key it then
+    /// writes from is pinned end to end beside it, in `chia_publish`'s tests.
     fn inbox_hint(net: ChiaNet, ck_host: &[u8; 32], room_key: &[u8; 32], era: u64) -> [u8; 32] {
         derive_inbox_hint(net, ck_host, &derive_lane_token(room_key), era)
     }
