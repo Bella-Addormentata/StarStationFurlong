@@ -838,7 +838,10 @@ impl WalletLease {
     /// ([`lost_listing_mark`]). A parked spend whose bundle was not saved is
     /// not seen, and neither is one the lease has forgotten.
     pub(crate) fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
-        let mut held: Vec<(u64, Vec<Bytes32>, SpendBundle, Option<Payer>, Option<u32>)> = Vec::new();
+        // A spend's number, the inputs the lease parks for it, its bundle,
+        // its payer, and the height the chain spent it at once it settles.
+        type Held = (u64, Vec<Bytes32>, SpendBundle, Option<Payer>, Option<u32>);
+        let mut held: Vec<Held> = Vec::new();
         {
             let pending = self.pending.lock().unwrap();
             let pushed = self.bundles.lock().unwrap();
