@@ -24,11 +24,16 @@
 //! lease and chain) picks what a write spends under the gift rules of §5.2:
 //! the burner's own coin when it holds one, and otherwise a gift from the
 //! lobby dish, never a second while a bundle for the key is held, and never
-//! past the node's fuse for the era ([`GiftFuse`]). Waiting is not failing:
-//! each reason to wait comes back typed ([`BurnerWait`]).
+//! past the node's fuse for the era ([`GiftFuse`]). A knock's key K(h) is the
+//! exception: it writes once and is never spent again (§4.1, the knock row),
+//! so the knock's writer ([`knock_write_with`]) reads a key that already
+//! wrote as [`AlreadyKnocked`] and writes nothing. Waiting is not failing:
+//! each reason to wait comes back typed ([`BurnerWait`]). An
+//! [`AlreadyKnocked`] is no wait: it is the end of that knock.
 //!
 //! Outside the tests the writer is called by the listing's writer from its
-//! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b) and by
+//! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b), by
+//! the knock's writer from K(h) (`publish_knock_with`, PR 10c), and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
 //! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
@@ -50,8 +55,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
-use crate::chia_chain::{ChainAccess, PuzzleAndSolution};
-use crate::chia_faucet::{claim_to, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS, MAX_FAUCET_PAGES};
+use crate::chia_chain::{ChainAccess, CoinRecord, PuzzleAndSolution};
+use crate::chia_faucet::{claim_to, records_at, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS, MAX_FAUCET_PAGES};
 use crate::chia_network::ChiaNet;
 use crate::chia_resolve::{created_coins, memo_digest, CreatedCoin, WriteCoins};
 
@@ -352,7 +357,9 @@ pub enum BurnerWait {
     Settling,
     /// The burner holds no coin the listing showed, and the listing of its
     /// puzzle hash was cut short, so it cannot tell that it holds none: a
-    /// gift could be its second (fail closed).
+    /// gift could be its second (fail closed). A knock's key waits so on any
+    /// listing cut short, whatever it showed, since a record past the cut
+    /// could be its own write ([`knock_write_with`]).
     ListingCutShort,
     /// No peer answered the peak, so no lobby coin can be judged ready.
     PeakUnavailable,
@@ -402,6 +409,35 @@ impl fmt::Display for BurnerWait {
 
 impl std::error::Error for BurnerWait {}
 
+/// Why a knock was not written although nothing went wrong: its key K(h)
+/// already wrote (stage 4 design §4.1, the knock row: K(h) is never spent
+/// again; §9: a coin K(h) wrote means "already knocked"). It is a sibling of
+/// [`BurnerWait`], not one of its waits: the same knock tried again finds
+/// the same records under the same key, so the caller drops the request and
+/// uses none of its attempts ([`knock_write_with`]). Its text names neither
+/// the key nor its puzzle hash or address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlreadyKnocked;
+
+impl fmt::Display for AlreadyKnocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a knock on this host for this room already went out this era from its own key, and a knock's key writes once")
+    }
+}
+
+impl std::error::Error for AlreadyKnocked {}
+
+/// The rule a burner's key writes its slot under (stage 4 design §4.1).
+#[cfg_attr(not(test), allow(dead_code))] // only the tests build `Once` until the knock arm calls `knock_write_with`
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// The listing's and the self-test's: a later write spends the key's own
+    /// 1-mojo coin to itself (the table's rewrite row, R5).
+    Rewritten,
+    /// A knock's: K(h) writes once and is never spent again (the knock row).
+    Once,
+}
+
 /// The most gifts the lobby dish gives this node's burners in one era
 /// (stage 4 design §5.2): one listing, the hosts knocked, a first beacon,
 /// and losses.
@@ -438,8 +474,9 @@ struct FuseFile {
 /// unspent coins misses it. Counted at the push, a gift is over-counted
 /// while its bundle is in flight, and for good when a coin of 1 mojo has
 /// been at its burner other than by a gift: a stray of exactly 1 mojo,
-/// which the burner writes from (R7), or a beacon key's coin of an earlier
-/// era. That fails closed. A stray of any other amount is never written
+/// which the burner writes from (R7; a knock's key writes from a lone one
+/// once, [`knock_write_with`]), or a beacon key's coin of an earlier era.
+/// That fails closed. A stray of any other amount is never written
 /// from and proves nothing, so it keeps no dead gift counted, however many
 /// pages of them the listing must follow, up to [`MAX_FAUCET_PAGES`]: anyone
 /// can pay one to a burner's puzzle hash, and if it kept the count, a peer
@@ -451,7 +488,8 @@ struct FuseFile {
 /// fuse's file could not be saved (logged). Given back, a lost race or a
 /// redirected claim delays a listing but never ends the era's funding
 /// (§5.2): a stranger's stray keeps a dead gift counted only when it is of
-/// 1 mojo, and then the burner writes from it and needs no gift.
+/// 1 mojo, and then the burner writes from it and needs no gift, a knock's
+/// key too, since a stranger's coin has its parent elsewhere.
 ///
 /// It is kept per network in [`GIFT_FUSE_FILE`] and saved at every count and
 /// refund, so a node restarting in a loop cannot draw a fresh fuse at each
@@ -618,9 +656,17 @@ pub static GIFT_FUSE: LazyLock<Mutex<GiftFuse>> = LazyLock::new(|| Mutex::new(Gi
 /// hold is written from, and one it holds makes the write wait), and only
 /// the burner's key can spend a coin there. So a 1-mojo record is a landed
 /// gift's, a coin the burner wrote from (a stray of exactly 1 mojo among
-/// them), or one another holder of its key spent (§10). A 1-mojo coin that
-/// lands between the writer's two listings keeps a dead gift counted once,
-/// which fails closed too.
+/// them, which a knock's key writes from too, once, when it is a lone one
+/// whose parent is elsewhere), or one another holder of its key spent
+/// (§10). A 1-mojo coin that lands between the writer's two listings keeps
+/// a dead gift counted once, which fails closed too.
+///
+/// It is not how the knock's slot asks whether its key already wrote
+/// ([`knock_key_unwritten`]). That is read from the writer's own listing
+/// before this is asked, so a knock's key that holds a spent record never
+/// comes here. And a listing cut short, which keeps a gift counted here, as
+/// the fuse needs, is a wait there, since it proves too little to end a
+/// knock.
 ///
 /// The listing is followed page by page, as [`unspent_at`] follows it, up to
 /// [`MAX_FAUCET_PAGES`], and stops at the first record of 1 mojo. So strays
@@ -700,6 +746,10 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// The fuse is a std mutex, locked only for one statement at a time and
 /// never across an await, so the future is `Send` and a spawned task can run
 /// it.
+///
+/// This is the writer of a slot that is rewritten, the listing's and the
+/// self-test's. A knock's key writes once, through [`knock_write_with`],
+/// which shares this body and adds the knock slot's own checks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -716,6 +766,145 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     what: &str,
     money: Option<Payer>,
 ) -> Result<MemoWrite> {
+    write_slot(lease, fuse, net, client, now, key, era, hint, gate, body, rng, what, money, Slot::Rewritten).await
+}
+
+/// A knock's write from its key K(h) (stage 4 design §4.1, the knock row:
+/// K(h) is never spent again; §9: a coin K(h) wrote means "already
+/// knocked"), against a given lease, fuse, network, chain, instant and
+/// random source, as [`burner_write_with`] takes them. It is that writer
+/// under the knock's write-once rule: under the lease's gate, after the same
+/// `Held` checks and from the same one listing of the key ([`records_at`]),
+/// the key's slot is judged ([`knock_key_unwritten`]) before anything is
+/// claimed, parked, pushed or counted. It names no money payer to wait on,
+/// so it never waits [`BurnerWait::MoneyInFlight`], and its lines name the
+/// write a "knock".
+///
+/// What the lease and the chain hold for K(h) gives, in this order:
+/// - its spend parked, in flight or restored after a restart:
+///   [`BurnerWait::Held`], while the lease pushes the saved bundle again;
+/// - its listing cut short: [`BurnerWait::ListingCutShort`];
+/// - a spent record at its puzzle hash (the knock landed, settling or
+///   settled, whether the lease's file is kept or lost), or an unspent
+///   1-mojo coin there whose parent is at the key too or is not returned:
+///   [`AlreadyKnocked`]. Nothing is claimed, parked, sent or counted, and
+///   the fuse is untouched, blown or not;
+/// - a lone unspent 1-mojo coin whose parent is elsewhere, the lease not
+///   holding it (our claim, lifted out of our bundle by a peer and pushed
+///   alone, §5.4, or a stray of exactly 1 mojo): the knock is written from
+///   it, once, as a rewrite is, with no gift, and the next knock reads its
+///   spent record;
+/// - no such coin and a bundle of its the lease holds settling (a lost race
+///   the chain has not settled): [`BurnerWait::Settling`];
+/// - that bundle judged dead: its gift is given back to the fuse and a new
+///   claim is made, as for any first write.
+///
+/// A coin of any other amount there is a stray, never written from (R7),
+/// and it neither stops the knock nor keeps a dead gift counted.
+///
+/// [`AlreadyKnocked`] is no [`BurnerWait`] and no wait: the same knock tried
+/// again reads the same records, so its caller drops the request and uses
+/// none of its attempts. No knock entry is rebuilt from the chain for it: a
+/// knock whose entry the node lost is filed again only from the write the
+/// lease still holds under its hint (`chia_publish::lost_knock_entry`).
+///
+/// Twins, the same words on two machines, derive the same K(h) for a host,
+/// room and era (§3.3's twins property holds for P(e), not for K(h)). One
+/// after the other, the second reads [`AlreadyKnocked`]. At the same time
+/// neither sees the other's bundle and both can land: two gifts for one key
+/// and two coins at K(h), each opening only for the host. That is accepted,
+/// as §9 accepts one extra bundle.
+#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn knock_write_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &Mutex<GiftFuse>,
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    now: Instant,
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    rng: &mut R,
+) -> Result<MemoWrite> {
+    write_slot(lease, fuse, net, client, now, key, era, hint, gate, body, rng, "knock", None, Slot::Once).await
+}
+
+/// Has the knock key at `burner_ph` never written? The knock slot's own
+/// question (stage 4 design §4.1, the knock row: K(h) writes once), asked
+/// by the writer under the lease's gate after its `Held` checks, of the
+/// key's one listing ([`records_at`]: `records`, cut short when `partial`)
+/// and of `unheld`, its unspent 1-mojo coins the lease does not hold. `Ok`
+/// when it never wrote, and the writer goes on as for any burner. Otherwise,
+/// in this order:
+///
+/// - A listing cut short is [`BurnerWait::ListingCutShort`]: a record past
+///   the cut could be the key's. A wait is as closed as a drop, since
+///   nothing is written, and it can recover.
+/// - A spent record there, of any amount, is [`AlreadyKnocked`]: only the
+///   key can spend a coin at its puzzle hash, and a landed knock spends g
+///   there in its own block. A settling knock reads so at once, before the
+///   writer's `Settling` check.
+/// - An unspent 1-mojo coin whose parent is at the key too is the key's own
+///   write, and one whose parent the chain does not return could be:
+///   [`AlreadyKnocked`] both, fail closed. The parents are asked by id in
+///   one lookup, and a lookup that fails is [`CoinLookupFailed`], a wait.
+///
+/// What is left is a key that never spent a coin: no coin of 1 mojo, or lone
+/// ones whose parents are elsewhere. A peer we push to sees the key's puzzle
+/// hash in the clear, as the keyless claim's recipient, and can push our
+/// claim alone or pay a coin of 1 mojo there (§5.4). Neither cancels the
+/// knock: the writer writes from such a coin once. Only the key can make a
+/// coin whose parent is at the key, so a peer that hides records can at
+/// worst make the knock read as written, or wait.
+async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, records: &[CoinRecord], partial: bool, unheld: &[Coin]) -> Result<()> {
+    if partial {
+        return Err(BurnerWait::ListingCutShort.into());
+    }
+    if records.iter().any(|r| r.spent) {
+        return Err(AlreadyKnocked.into());
+    }
+    let mut parents: Vec<Bytes32> = unheld.iter().map(|coin| coin.parent_coin_info).collect();
+    parents.sort();
+    parents.dedup();
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let listing = client.coin_records_by_names(parents.clone(), true, None).await.map_err(CoinLookupFailed)?;
+    let elsewhere = |parent: &Bytes32| listing.records.iter().any(|r| r.coin.coin_id() == *parent && r.coin.puzzle_hash != burner_ph);
+    if parents.iter().all(elsewhere) {
+        Ok(())
+    } else {
+        Err(AlreadyKnocked.into())
+    }
+}
+
+/// The body of [`burner_write_with`] and [`knock_write_with`]: every step
+/// their docs give, with `slot` the rule the key writes under. The knock's
+/// slot ([`Slot::Once`]) adds one step, its own question
+/// ([`knock_key_unwritten`]), between the `Held` checks and the choice of
+/// what to write from; a rewritten slot reads the key's listing exactly as
+/// [`unspent_at`] gives it ([`Unspent::of`]) and never looks at its spent
+/// records.
+#[allow(clippy::too_many_arguments)]
+async fn write_slot<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &Mutex<GiftFuse>,
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    now: Instant,
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    gate: Option<&tokio::sync::Mutex<()>>,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    rng: &mut R,
+    what: &str,
+    money: Option<Payer>,
+    slot: Slot,
+) -> Result<MemoWrite> {
     let _lease = lease.lock().await;
     lease.ensure_open()?;
     lease.reconcile_at(net, client, now).await;
@@ -724,10 +913,15 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     if lease.outgoing_pending_for(payer) || lease.parks_spend_at(burner_ph) {
         return Err(BurnerWait::Held.into());
     }
-    let Unspent { coins, partial } = unspent_at(client, burner_ph).await?;
+    let (records, partial) = records_at(client, burner_ph).await?;
+    let coins = Unspent::of(&records, partial).coins;
     let ones: Vec<FaucetCoin> = coins.into_iter().filter(|c| c.coin.amount == 1).collect();
     if ones.iter().any(|c| lease.is_parked(&c.coin.coin_id())) {
         return Err(BurnerWait::Held.into());
+    }
+    if slot == Slot::Once {
+        let unheld: Vec<Coin> = ones.iter().filter(|c| !lease.is_taken(&c.coin.coin_id())).map(|c| c.coin).collect();
+        knock_key_unwritten(client, burner_ph, &records, partial, &unheld).await?;
     }
     let own = ones.iter().filter(|c| !lease.is_taken(&c.coin.coin_id())).min_by_key(|c| (c.confirmed_height, c.coin.coin_id())).cloned();
     let input = match own {
@@ -805,7 +999,10 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// network (§13 row 9), and keeps no mark. The listing does not come
 /// through here: it reaches [`burner_write_with`] through its own wrapper
 /// (`chia_publish::publish_burner_presence`, §13 row 10), and the heartbeat
-/// files its write in the presence mark.
+/// files its write in the presence mark. Neither does a knock: its key
+/// writes once, through [`knock_write_with`] (`chia_publish::publish_knock_with`),
+/// and the heartbeat files its write in `knocks.json`. This writes a slot
+/// that is rewritten.
 pub async fn burner_write(
     key: &BurnerKey,
     era: u64,
@@ -880,6 +1077,14 @@ async fn selftest_era(client: &impl ChainAccess) -> Result<u64> {
 /// writes nothing. Its coin can land in the moment between that check and the
 /// writer's own listing, and the run then writes once from it; it is a test
 /// slot, so nothing is lost but a mojo's move.
+///
+/// It writes through [`burner_write`], the rewrite slot, and not the knock's
+/// write-once slot ([`knock_write_with`]). h_test is no knock's hint, so no
+/// host could be knocked twice, and a rerun in the same era must still
+/// exercise the write path: an earlier run's write that lands in that
+/// moment would end the rerun on the write-once slot in [`AlreadyKnocked`],
+/// an error that is no wait, where this one writes from its coin and says
+/// the test already ran.
 ///
 /// PASS needs a Confirmed verdict ([`super::write_standing_on`] by g and F,
 /// which already fetches g's spend on the agreed lane) and then the record
@@ -1513,6 +1718,286 @@ mod tests {
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "the burner's listing, then the refund's, unanswered");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "the gift kept counted");
         assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
+    }
+
+    /// The `n`th test knock key on `net`: K(h) of the inbox hint `[n; 32]`
+    /// in era 0, so each `n` is another knock.
+    fn knock(net: ChiaNet, n: u8) -> BurnerKey {
+        BurnerRoot::of(&money(), net).knock(&[n; 32], 0)
+    }
+
+    /// `coin`'s record, confirmed at [`SEEN_AT`], and spent a block later
+    /// when `spent`.
+    fn record(coin: Coin, spent: bool) -> CoinRecord {
+        CoinRecord { coin, confirmed_block_index: SEEN_AT, spent, spent_block_index: if spent { SEEN_AT + 1 } else { 0 } }
+    }
+
+    /// One page of `records`, whole, or cut short with no cursor to follow
+    /// when `truncated`.
+    fn page(records: Vec<CoinRecord>, truncated: bool) -> crate::chia_chain::CoinListing {
+        crate::chia_chain::CoinListing { records, truncated, next_cursor: None, judged_at: None }
+    }
+
+    /// The bundles handed to `chain`.
+    fn sent(chain: &crate::chia_chain::testing::Scripted) -> usize {
+        chain.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `key`'s knock on `chain` on testnet11 in era 0, with a fresh lease,
+    /// `fuse`, the test hint and body, and a seeded random source.
+    async fn knock_on(chain: &crate::chia_chain::testing::Scripted, fuse: &Mutex<GiftFuse>, key: &BurnerKey) -> Result<MemoWrite> {
+        use rand::SeedableRng;
+        let lease = WalletLease::new();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        knock_write_with(&lease, fuse, ChiaNet::Testnet11, chain, Instant::now(), key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng).await
+    }
+
+    /// A fuse that has counted one gift to `key` in era 0, and `strangers`
+    /// more to other burners.
+    fn fuse_holding(key: &BurnerKey, strangers: u8) -> Mutex<GiftFuse> {
+        Mutex::new(GiftFuse::preset(0, std::iter::once(Payer::of_burner(key)).chain(payers(strangers))))
+    }
+
+    /// Stage 4 design §4.1, the knock row: K(h) is never spent again. One
+    /// listing shows the key's coin of 1 mojo, unspent, and the lookup of its
+    /// parent shows the parent at the key too (g, spent, its record missing
+    /// from the listing): the coin is the key's own write. The rewrite slot
+    /// writes from it, one push from that coin with no parent asked, as the
+    /// listing's key does; the knock slot reads the key as already knocked,
+    /// after one listing and one lookup by id, and sends nothing and counts
+    /// no gift. The error is no wait, and its text names neither the key's
+    /// payer, its puzzle hash nor its address.
+    #[tokio::test]
+    async fn a_knock_key_holding_its_own_write_is_already_knocked_where_a_rewritten_slot_would_write_from_it() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let net = ChiaNet::Testnet11;
+        let key = knock(net, 1);
+        let ph = key.puzzle_hash();
+        let g = Coin::new(Bytes32::new([3; 32]), ph, 1);
+        let written = Coin::new(g.coin_id(), ph, 1);
+
+        let chain = Scripted::new(vec![page(vec![record(written, false)], false)]);
+        let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let write = burner_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, "test", None).await;
+        let write = write.expect("the rewritten slot writes from its coin");
+        assert_eq!(write.coins, WriteCoins::one(written.coin_id()), "from the key's own coin");
+        assert_eq!(sent(&chain), 1, "one push");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "the key's listing alone");
+        assert!(chain.asked_names.lock().unwrap().is_empty(), "no parent asked");
+
+        let chain = Scripted::new(vec![page(vec![record(written, false)], false), page(vec![record(g, true)], false)]);
+        let fuse = Mutex::new(GiftFuse::new());
+        let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "{e:#}");
+        assert!(e.downcast_ref::<BurnerWait>().is_none(), "no wait: {e:#}");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "one listing, then one lookup by id");
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![g.coin_id()]], "the coin's parent");
+        assert_eq!(sent(&chain), 0, "nothing sent");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
+
+        assert_eq!(e.to_string(), "a knock on this host for this room already went out this era from its own key, and a knock's key writes once");
+        let text = format!("{e:#} {e:?}");
+        let address = crate::chia_faucet::bech32m::encode(net.prefix(), ph.as_ref());
+        for named in [Payer::of_burner(&key).hex(), hex::encode(ph), address] {
+            assert!(!text.contains(&named), "{text}");
+        }
+    }
+
+    /// Stage 4 design §4.1, the knock row, and §5.2: a key that spent any
+    /// coin has written, since only its key can spend at its puzzle hash. A
+    /// landed knock (g spent, its written coin unspent), the same with that
+    /// coin since spent elsewhere (a cloned folder, §10), and a spent stray
+    /// of 2 mojos each read as already knocked from the key's one listing:
+    /// no parent is asked and nothing is sent. The fuse is never asked: a
+    /// gift it counted for the key stays counted, with no refund, and a
+    /// blown fuse (the key's gift and fifteen strangers') is not the answer.
+    #[tokio::test]
+    async fn a_knock_key_that_spent_any_coin_is_already_knocked_from_one_listing_past_a_counted_gift_or_a_blown_fuse() {
+        use crate::chia_chain::testing::Scripted;
+        let key = knock(ChiaNet::Testnet11, 1);
+        let ph = key.puzzle_hash();
+        let g = Coin::new(Bytes32::new([3; 32]), ph, 1);
+        let written = Coin::new(g.coin_id(), ph, 1);
+        let stray = Coin::new(Bytes32::new([4; 32]), ph, 2);
+        let rows = [
+            ("a landed knock", vec![record(g, true), record(written, false)]),
+            ("its coin spent elsewhere", vec![record(g, true), record(written, true)]),
+            ("a spent stray of 2 mojos", vec![record(stray, true)]),
+        ];
+        for (what, records) in rows {
+            for (strangers, gifts) in [(0, 1), (15, 16)] {
+                let chain = Scripted::new(vec![page(records.clone(), false)]);
+                let fuse = fuse_holding(&key, strangers);
+                let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock is not written");
+                assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "{what}, {gifts} gifts: {e:#}");
+                assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "{what}, {gifts} gifts: one listing");
+                assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}, {gifts} gifts: no parent asked");
+                assert_eq!(sent(&chain), 0, "{what}, {gifts} gifts: nothing sent");
+                assert_eq!(fuse.lock().unwrap().gifts_in(0), gifts, "{what}: the counted gifts stay counted");
+            }
+        }
+    }
+
+    /// A knock key's listing cut short (truncated with no cursor) cannot say
+    /// the key never wrote: a record past the cut could be its. The knock
+    /// waits, typed as [`BurnerWait::ListingCutShort`], which is no knock
+    /// attempt, whatever the cut listing shows: nothing, a spent record of 1
+    /// mojo, or a lone coin of 1 mojo. Only the one listing is read, no
+    /// parent is asked, nothing is sent, and a gift counted for the key stays
+    /// counted.
+    #[tokio::test]
+    async fn a_knock_key_whose_listing_is_cut_short_waits_typed_and_asks_nothing_more() {
+        use crate::chia_chain::testing::Scripted;
+        let key = knock(ChiaNet::Testnet11, 1);
+        let ph = key.puzzle_hash();
+        let g = Coin::new(Bytes32::new([3; 32]), ph, 1);
+        let rows = [("nothing", vec![]), ("a spent record of 1 mojo", vec![record(g, true)]), ("a lone coin of 1 mojo", vec![record(g, false)])];
+        for (what, records) in rows {
+            let chain = Scripted::new(vec![page(records, true)]);
+            let fuse = fuse_holding(&key, 0);
+            let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
+            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::ListingCutShort), "{what}: {e:#}");
+            assert!(crate::chia_publish::is_typed_wait(&e), "{what}: a wait");
+            assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "{what}: no knock attempt (§5.2)");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "{what}: the one listing");
+            assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}: no parent asked");
+            assert_eq!(sent(&chain), 0, "{what}: nothing sent");
+            assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "{what}: the gift kept counted");
+        }
+    }
+
+    /// Stage 4 design §5.4: the peers we push a knock to see its key's
+    /// puzzle hash in the clear, as the keyless claim's recipient, so one can
+    /// push our claim of F alone (g lands unspent at the key) or pay a coin
+    /// of exactly 1 mojo there. Neither cancels the knock. A lone 1-mojo coin
+    /// whose parent the lookup by id shows elsewhere (F at the lobby dish) is
+    /// written from, once, as a rewrite is: one push from that coin, and no
+    /// gift counted. A parent at the key itself is the key's own write, and
+    /// a parent the lookup does not return could be; both read as already
+    /// knocked and send nothing, and so does a second lone coin whose parent
+    /// is at the key beside one whose parent is elsewhere.
+    #[tokio::test]
+    async fn a_lone_one_mojo_coin_at_a_knock_key_is_written_from_once_unless_a_parent_is_the_key_or_not_returned() {
+        use crate::chia_chain::testing::Scripted;
+        let net = ChiaNet::Testnet11;
+        let key = knock(net, 1);
+        let ph = key.puzzle_hash();
+        let f = Coin::new(Bytes32::new([5; 32]), FaucetParams::lobby(net).puzzle_hash(), 10);
+        let lifted = Coin::new(f.coin_id(), ph, 1);
+        let at_key = Coin::new(Bytes32::new([3; 32]), ph, 1);
+        let written = Coin::new(at_key.coin_id(), ph, 1);
+
+        let chain = Scripted::new(vec![page(vec![record(lifted, false)], false), page(vec![record(f, true)], false)]);
+        let fuse = Mutex::new(GiftFuse::new());
+        let write = knock_on(&chain, &fuse, &key).await.expect("written from the lone coin");
+        assert_eq!(write.coins, WriteCoins::one(lifted.coin_id()), "from that coin, as a rewrite is");
+        assert_eq!(write.payer, Payer::of_burner(&key));
+        assert!(!write.acked, "the test chain leaves the push unanswered");
+        assert_eq!(sent(&chain), 1, "one push");
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![f.coin_id()]], "its parent, by id");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
+
+        let rows = [
+            ("a parent at the key", vec![record(written, false)], vec![record(at_key, true)]),
+            ("a parent not returned", vec![record(lifted, false)], vec![]),
+            ("one parent elsewhere, one at the key", vec![record(lifted, false), record(written, false)], vec![record(f, true), record(at_key, true)]),
+        ];
+        for (what, listed, parents) in rows {
+            let chain = Scripted::new(vec![page(listed, false), page(parents, false)]);
+            let fuse = Mutex::new(GiftFuse::new());
+            let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock is not written");
+            assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "{what}: {e:#}");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{what}: one listing, one lookup by id");
+            assert_eq!(sent(&chain), 0, "{what}: nothing sent");
+            assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "{what}: no gift counted");
+        }
+    }
+
+    /// A knock that the lease holds in flight waits [`BurnerWait::Held`]
+    /// before anything else is judged, as every burner write does. A spend
+    /// parked under the key as its payer holds it before the key's listing is
+    /// read. A 1-mojo coin at the key that the lease parks under another
+    /// payer's record (a payer the lease filed can be lost, §8 (6)) holds it
+    /// once the listing shows the coin, and no parent is asked of it.
+    #[tokio::test]
+    async fn a_knock_the_lease_holds_in_flight_is_held_before_its_key_is_judged() {
+        use crate::chia_chain::testing::Scripted;
+        use rand::SeedableRng;
+        let net = ChiaNet::Testnet11;
+        let key = knock(net, 1);
+        let coin = Coin::new(Bytes32::new([3; 32]), key.puzzle_hash(), 1);
+        let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
+        let other = Payer::of_burner(&burner(net, 2));
+        let rows = [("its own spend", Bytes32::new([5; 32]), Payer::of_burner(&key), vec![]), ("its coin under another payer", coin.coin_id(), other, vec![true])];
+        for (what, parked, payer, listings) in rows {
+            let chain = Scripted::new(vec![page(vec![record(coin, false)], false)]);
+            let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
+            lease.park_with_bundle([parked], &bundle, payer).unwrap();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+            let e = knock_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng).await;
+            let e = e.err().expect("the knock is held");
+            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "{what}: {e:#}");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), listings, "{what}");
+            assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}: no parent asked");
+            assert_eq!(sent(&chain), 0, "{what}");
+        }
+    }
+
+    /// R7 at a knock's key: a coin of any amount but 1 mojo is a stray,
+    /// never written from, and anyone can pay one there, so it does not stop
+    /// the knock. With only an unspent stray listed, no parent is asked and
+    /// the knock goes on to its claim, which waits for the peak it cannot
+    /// read: nothing is built from the stray or sent. A gift counted for the
+    /// key is given back, since the refund's own listing shows only the
+    /// stray, no coin of 1 mojo.
+    #[tokio::test]
+    async fn a_stray_of_another_amount_at_a_knock_key_is_no_knock_and_never_written_from() {
+        use crate::chia_chain::testing::Scripted;
+        let key = knock(ChiaNet::Testnet11, 1);
+        for amount in [0, 2, 1_000] {
+            let stray = vec![record(Coin::new(Bytes32::new([4; 32]), key.puzzle_hash(), amount), false)];
+            for (counted, listings) in [(false, vec![true]), (true, vec![true, true])] {
+                let chain = Scripted::new(vec![page(stray.clone(), false), page(stray.clone(), false)]);
+                let fuse = if counted { fuse_holding(&key, 0) } else { Mutex::new(GiftFuse::new()) };
+                let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
+                let what = format!("a stray of {amount}, a gift counted: {counted}");
+                assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{what}: {e:#}");
+                assert_eq!(*chain.asked_spent.lock().unwrap(), listings, "{what}: the key's listing, and the refund's for a counted gift");
+                assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}: no parent asked");
+                assert_eq!(sent(&chain), 0, "{what}: nothing sent");
+                assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "{what}: no gift counted, or the counted one given back");
+            }
+        }
+    }
+
+    /// Stage 4 design §5.2: a knock that cannot read the chain waits and
+    /// uses no attempt. The lookup of a lone coin's parent is not given, or,
+    /// with no coin there and a gift counted for the key, the refund's
+    /// listing is not: either way the knock waits, typed as the failed read
+    /// it is ([`CoinLookupFailed`]), which the knock arm re-queues as a wait
+    /// and counts as no attempt. It is not read as already knocked, nothing
+    /// is sent, and the counted gift stays counted.
+    #[tokio::test]
+    async fn a_knock_key_whose_parent_or_refund_lookup_the_chain_does_not_give_waits_typed_as_a_failed_read() {
+        use crate::chia_chain::testing::Scripted;
+        let key = knock(ChiaNet::Testnet11, 1);
+        let lone = Coin::new(Bytes32::new([3; 32]), key.puzzle_hash(), 1);
+        let rows = [("the parent's lookup", vec![record(lone, false)], vec![vec![lone.parent_coin_info]]), ("the refund's listing", vec![], vec![])];
+        for (what, listed, names) in rows {
+            let chain = Scripted::new(vec![page(listed, false)]);
+            let fuse = fuse_holding(&key, 0);
+            let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
+            assert!(e.downcast_ref::<CoinLookupFailed>().is_some(), "{what}: a failed read: {e:#}");
+            assert!(e.downcast_ref::<AlreadyKnocked>().is_none(), "{what}: not read as knocked");
+            assert!(crate::chia_publish::is_typed_wait(&e), "{what}: a wait");
+            assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "{what}: no knock attempt (§5.2)");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{what}: the key's listing, then the unanswered read");
+            assert_eq!(*chain.asked_names.lock().unwrap(), names, "{what}");
+            assert_eq!(sent(&chain), 0, "{what}: nothing sent");
+            assert_eq!(fuse.lock().unwrap().gifts_in(0), 1, "{what}: the gift kept counted");
+        }
     }
 
     /// The fuse is kept across a restart, per its file: what was counted and

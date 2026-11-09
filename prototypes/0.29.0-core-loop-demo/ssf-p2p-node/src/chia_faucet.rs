@@ -43,7 +43,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::{ChainAccess, ChainError, PagedRecords};
+use crate::chia_chain::{ChainAccess, ChainError, CoinRecord, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -454,6 +454,22 @@ pub struct Unspent {
     pub partial: bool,
 }
 
+impl Unspent {
+    /// The unspent coins among `records`, a listing as [`records_at`] gathers
+    /// it, in its order, and `partial` as it says. This is all [`unspent_at`]
+    /// keeps of the listing, so a caller that reads the records for more, as
+    /// the knock's write-once slot does, still sees the coins every other
+    /// caller sees.
+    pub(crate) fn of(records: &[CoinRecord], partial: bool) -> Unspent {
+        let coins = records
+            .iter()
+            .filter(|r| !r.spent)
+            .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
+            .collect();
+        Unspent { coins, partial }
+    }
+}
+
 /// A coin listing the chain did not give ([`unspent_at`]): the chain's own
 /// error for the page that failed, under the words the listing's callers
 /// have always logged ("coin lookup: ..."). It is typed so that a caller
@@ -474,13 +490,28 @@ impl std::fmt::Display for CoinLookupFailed {
 /// print (`{:#}`) would say it twice.
 impl std::error::Error for CoinLookupFailed {}
 
-/// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
+/// The unspent coins at `puzzle_hash`, following the listing's cursor: the
+/// unspent ones among [`records_at`]'s records ([`Unspent::of`]). Spent
 /// coins are asked for as well: the chain pages by a coin's latest change, so
 /// a coin listed unspent on one page comes again, spent, on a later one when
 /// the chain moved on in between, and only that later record says so
 /// ([`PagedRecords`]); the spent ones are dropped once every page is in. A
 /// page the chain did not give fails the listing as [`CoinLookupFailed`].
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
+    let (records, partial) = records_at(client, puzzle_hash).await?;
+    Ok(Unspent::of(&records, partial))
+}
+
+/// Every coin listed at `puzzle_hash`, spent ones included, each once in its
+/// latest record ([`PagedRecords`]) and in the order a single page has, and
+/// whether the listing was cut short: still truncated after
+/// [`MAX_FAUCET_PAGES`] pages, or truncated with no cursor to follow. A page
+/// the chain did not give fails it as [`CoinLookupFailed`]. It is the one
+/// listing [`unspent_at`] filters, so the two ask the chain for the same
+/// pages and agree on every unspent coin. The knock's write-once slot reads
+/// the spent records as well, from that same listing
+/// (`chia_publish::claim_write`, stage 4 design §4.1, the knock row).
+pub(crate) async fn records_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<(Vec<CoinRecord>, bool)> {
     let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
@@ -502,13 +533,7 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
             _ => break truncated,
         }
     };
-    let coins = gathered
-        .into_records()
-        .into_iter()
-        .filter(|r| !r.spent)
-        .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
-        .collect();
-    Ok(Unspent { coins, partial })
+    Ok((gathered.into_records(), partial))
 }
 
 // ── The browser lane: `faucet` envelopes ────────────────────────────────────
