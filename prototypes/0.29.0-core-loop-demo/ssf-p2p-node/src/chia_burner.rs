@@ -171,15 +171,25 @@ impl BurnerRoot {
         self.key(KIND_PRESENCE, era, &chia_lane::derive_ck_hint(self.1, ck, era))
     }
 
-    /// K(h) of §3.2: the key of one knock. `inbox_hint` is the hint the
-    /// knock is written under in `era`, `chia_lane::derive_inbox_hint(net,
-    /// ck_host, lane, era)` on the root's network, so it is one key per host
-    /// per era (§3.1, Slots).
-    pub fn knock(&self, inbox_hint: &[u8; 32], era: u64) -> BurnerKey {
-        // §3.2: K(h) = key(2, e, h) with h = derive_inbox_hint(ck_host, lane, e).
-        // The caller gives h, already on its network (§3.5), so this line
-        // takes no network of its own.
-        self.key(KIND_KNOCK, era, inbox_hint)
+    /// K(h) of §3.2: the key of one knock, key(2, e, ·) of the 32 bytes the
+    /// caller gives in `slot`, the knock's slot in §3.1's sense (the Slots
+    /// table: what one key serves), not §3.2's slot(k, e) ([`Self::slot`]).
+    /// The knock writer gives `chia_publish::knock_slot`, not the inbox hint
+    /// itself: the hint the knock is written under in `era`,
+    /// `chia_lane::derive_inbox_hint(net, ck_host, lane, era)` on the root's
+    /// network, bound to the host's node id. So it is one key per host and
+    /// room per era: the room's lane is in the hint, and a knock to the same
+    /// host for another room has another key; and two hosts whose cards
+    /// name one contact key, and so share the hint, have a key each, where
+    /// §3.2's K(h) = key(2, e, h) would give them one between them, which
+    /// writes once. The derivation here is §3.2's line, unchanged, and its
+    /// vectors are pinned on the bytes it is given.
+    pub fn knock(&self, slot: &[u8; 32], era: u64) -> BurnerKey {
+        // §3.2: K(h) = key(2, e, h) with h = derive_inbox_hint(ck_host, lane, e);
+        // the knock writer passes h bound to the host's node id
+        // (`chia_publish::knock_slot`). The caller gives its bytes, already
+        // on its network (§3.5), so this line takes no network of its own.
+        self.key(KIND_KNOCK, era, slot)
     }
 
     /// slot(k, e) of §3.2: how many blocks into era `era` the first write of
@@ -317,8 +327,14 @@ mod tests {
         MoneyKey::new(keys_from_mnemonic(&zero_words()).wallet)
     }
 
-    /// The knock vector's inbox hint: the host's for the room's lane in the
-    /// era, on `net` (§3.5: mainnet's carries the network tag).
+    /// The knock vectors' 32 bytes: a host's inbox hint for the room's lane
+    /// in the era, on `net` (§3.5: mainnet's carries the network tag). The
+    /// tests here pin [`BurnerRoot::knock`]'s line on the bytes it is given,
+    /// and what holds of its keys whatever those bytes are (off the wallet's
+    /// paths, not the beacon key, never printed), under the name K(h) as
+    /// §3.2 writes it. The knock writer gives that line the hint bound to
+    /// the host's node id (`chia_publish::knock_slot`), and the key it then
+    /// writes from is pinned end to end beside it, in `chia_publish`'s tests.
     fn inbox_hint(net: ChiaNet, ck_host: &[u8; 32], room_key: &[u8; 32], era: u64) -> [u8; 32] {
         derive_inbox_hint(net, ck_host, &derive_lane_token(room_key), era)
     }

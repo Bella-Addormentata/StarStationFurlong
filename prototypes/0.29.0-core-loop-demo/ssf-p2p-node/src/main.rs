@@ -100,8 +100,8 @@ mod chia_at_rest;
 mod chia_publish;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
 // for the lane's writes. PR 9's claim-and-write and its self-test hook call
-// them, and the listing is written from P(e) (PR 10b); the knock and beacon
-// writers follow.
+// them, the listing is written from P(e) (PR 10b) and each knock from its own
+// K(h) (PR 10c); the beacon writer follows.
 #[cfg(feature = "chia-publish")]
 mod chia_burner;
 #[cfg(feature = "chia-publish")]

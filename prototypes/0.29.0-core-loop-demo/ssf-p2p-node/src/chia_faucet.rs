@@ -43,7 +43,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use chia_protocol::{Bytes32, Coin};
-use crate::chia_chain::{ChainAccess, ChainError, PagedRecords};
+use crate::chia_chain::{ChainAccess, ChainError, CoinRecord, PagedRecords};
 use clvm_traits::{clvm_curried_args, clvm_list, ToClvm};
 use clvm_utils::{CurriedProgram, ToTreeHash, TreeHash};
 use clvmr::serde::node_from_bytes;
@@ -454,6 +454,22 @@ pub struct Unspent {
     pub partial: bool,
 }
 
+impl Unspent {
+    /// The unspent coins among `records`, a listing as [`records_at`] gathers
+    /// it, in its order, and `partial` as it says. This is all [`unspent_at`]
+    /// keeps of the listing, so a caller that reads the records for more, as
+    /// the knock's write-once slot does, still sees the coins every other
+    /// caller sees.
+    pub(crate) fn of(records: &[CoinRecord], partial: bool) -> Unspent {
+        let coins = records
+            .iter()
+            .filter(|r| !r.spent)
+            .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
+            .collect();
+        Unspent { coins, partial }
+    }
+}
+
 /// A coin listing the chain did not give ([`unspent_at`]): the chain's own
 /// error for the page that failed, under the words the listing's callers
 /// have always logged ("coin lookup: ..."). It is typed so that a caller
@@ -474,13 +490,28 @@ impl std::fmt::Display for CoinLookupFailed {
 /// print (`{:#}`) would say it twice.
 impl std::error::Error for CoinLookupFailed {}
 
-/// The unspent coins at `puzzle_hash`, following the listing's cursor. Spent
+/// The unspent coins at `puzzle_hash`, following the listing's cursor: the
+/// unspent ones among [`records_at`]'s records ([`Unspent::of`]). Spent
 /// coins are asked for as well: the chain pages by a coin's latest change, so
 /// a coin listed unspent on one page comes again, spent, on a later one when
 /// the chain moved on in between, and only that later record says so
 /// ([`PagedRecords`]); the spent ones are dropped once every page is in. A
 /// page the chain did not give fails the listing as [`CoinLookupFailed`].
 pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<Unspent> {
+    let (records, partial) = records_at(client, puzzle_hash).await?;
+    Ok(Unspent::of(&records, partial))
+}
+
+/// Every coin listed at `puzzle_hash`, spent ones included, each once in its
+/// latest record ([`PagedRecords`]) and in the order a single page has, and
+/// whether the listing was cut short: still truncated after
+/// [`MAX_FAUCET_PAGES`] pages, or truncated with no cursor to follow. A page
+/// the chain did not give fails it as [`CoinLookupFailed`]. It is the one
+/// listing [`unspent_at`] filters, so the two ask the chain for the same
+/// pages and agree on every unspent coin. The knock's write-once slot reads
+/// the spent records as well, from that same listing
+/// (`chia_publish::claim_write`, stage 4 design §4.1, the knock row).
+pub(crate) async fn records_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Result<(Vec<CoinRecord>, bool)> {
     let mut gathered = PagedRecords::default();
     let mut cursor: Option<String> = None;
     let mut pages = 0usize;
@@ -502,13 +533,7 @@ pub async fn unspent_at(client: &impl ChainAccess, puzzle_hash: Bytes32) -> Resu
             _ => break truncated,
         }
     };
-    let coins = gathered
-        .into_records()
-        .into_iter()
-        .filter(|r| !r.spent)
-        .map(|r| FaucetCoin { coin: r.coin, confirmed_height: r.confirmed_block_index })
-        .collect();
-    Ok(Unspent { coins, partial })
+    Ok((gathered.into_records(), partial))
 }
 
 // ── The browser lane: `faucet` envelopes ────────────────────────────────────
@@ -594,7 +619,8 @@ pub struct FaucetContext<'a> {
     /// Burner keys on for this run (`chia_publish::burners_enabled`): the
     /// dish counts the wallet's own spends in flight only
     /// (`chia_publish::wallet_spending`, stage 4 design §4.4), since the
-    /// listing's burner spend and the beacon's are not the wallet's.
+    /// listing's and the knocks' burner spends and the beacon's are not the
+    /// wallet's.
     #[cfg(feature = "chia-publish")]
     pub burners: bool,
 }
@@ -757,8 +783,8 @@ impl WalletView {
 /// Whether the dish reads a spend from the SSF wallet `sk` on `lease` as
 /// still confirming ([`FaucetStatus::spending`]): `chia_publish::wallet_spending`
 /// with this run's burner flag (`ctx.burners`), so that with burner keys on
-/// the listing's spends from P(e) and the beacon's are not the wallet's
-/// (stage 4 design §4.4), and with them off every spend but a claim's is, as
+/// the listing's spends from P(e), the knocks' from their own keys K(h) and
+/// the beacon's are not the wallet's (stage 4 design §4.4), and with them off every spend but a claim's is, as
 /// it always was. The snapshot asks it of the process's lease.
 #[cfg(feature = "chia-publish")]
 fn dish_spending(ctx: &FaucetContext<'_>, lease: &crate::chia_publish::WalletLease, sk: &chia_bls::SecretKey) -> bool {
@@ -1411,6 +1437,46 @@ mod tests {
         assert_eq!(got.coins.iter().map(|c| c.coin.amount).collect::<Vec<_>>(), vec![2, 3], "coin 1, spent between the pages, is gone");
         assert!(!got.partial);
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "spent coins asked for, so the spend can be seen");
+    }
+
+    /// [`unspent_at`] is [`records_at`]'s one listing filtered to its unspent
+    /// coins ([`Unspent::of`]), with the listing's `partial` passed on whole.
+    /// A listing cut short with no cursor, and one still cut short once
+    /// [`MAX_FAUCET_PAGES`] pages are in, read as partial from both, so the
+    /// wallet view's fail-closed guard and the dish's note of a partial
+    /// listing (#245 review) still see the cut; a whole listing, its cursor
+    /// followed, reads as whole. Both ask the chain for the same pages and
+    /// keep the same unspent coins.
+    #[tokio::test]
+    async fn a_listing_cut_short_reads_as_partial_from_unspent_at_as_from_records_at() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        let ph = Bytes32::new([9u8; 32]);
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), ph, u64::from(seed));
+        let rec = |c: Coin, spent: bool| CoinRecord { coin: c, confirmed_block_index: 80, spent, spent_block_index: if spent { 81 } else { 0 } };
+        // One unspent coin and one spent coin a page.
+        let listing = |n: u8, truncated: bool, cursor: bool| CoinListing {
+            records: vec![rec(coin(n), false), rec(coin(n + 100), true)],
+            truncated,
+            next_cursor: cursor.then(|| format!("page-{n}")),
+            judged_at: None,
+        };
+        let budget = MAX_FAUCET_PAGES as u8;
+        let rows: Vec<(&str, Vec<CoinListing>, usize, bool)> = vec![
+            ("a whole listing, its cursor followed", vec![listing(1, true, true), listing(2, false, false)], 2, false),
+            ("cut short with no cursor", vec![listing(1, true, false)], 1, true),
+            ("still cut short past the page budget", (1..=budget + 1).map(|n| listing(n, true, true)).collect(), MAX_FAUCET_PAGES, true),
+        ];
+        for (what, pages, asked, partial) in rows {
+            let (by_records, by_unspent) = (Scripted::new(pages.clone()), Scripted::new(pages));
+            let (records, cut) = records_at(&by_records, ph).await.unwrap();
+            let got = unspent_at(&by_unspent, ph).await.unwrap();
+            assert_eq!((cut, got.partial), (partial, partial), "{what}");
+            assert_eq!(got.coins.len(), asked, "{what}: one unspent coin a page read");
+            assert_eq!(got.coins, Unspent::of(&records, cut).coins, "{what}: the same unspent coins");
+            assert_eq!(*by_unspent.asked_spent.lock().unwrap(), vec![true; asked], "{what}: the pages read, spent coins asked for");
+            assert_eq!(*by_records.asked_spent.lock().unwrap(), vec![true; asked], "{what}: the same pages");
+        }
     }
 
     /// The mod hash is the one origin/main's code gave before the network

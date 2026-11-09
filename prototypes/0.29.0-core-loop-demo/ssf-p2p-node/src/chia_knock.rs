@@ -115,16 +115,23 @@ pub fn settled_by(confirmed: u32, peak: u32, seen_at: Option<u32>) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnockRequest {
     pub room: String,
-    /// The host's node id.
+    /// The host's node id. A knock's burner key is bound to it as well as
+    /// to the inbox hint (`chia_publish::knock_slot`), so two hosts whose
+    /// cards name one contact key each have a knock key of their own.
     pub host: String,
     pub ck_host: [u8; 32],
     /// The host's contact-card key the knock is sealed to.
     pub kx_host: [u8; 32],
     /// Failed attempts to send it so far (the publisher drops it after
     /// `chia_publish::MAX_KNOCK_ATTEMPTS`). With burner keys on
-    /// (SSF_CHIA_BURNERS=1), a try that only waited, for the wallet's funds,
-    /// a spend still settling or a chain that did not answer, is none (stage
-    /// 4 design §5.2, `chia_publish::knock_attempt_counts`).
+    /// (SSF_CHIA_BURNERS=1), the knock is written from its own burner key
+    /// K(h), and a try that only waited, for a mojo ready in the lobby dish,
+    /// for the fuse on the edition's gifts, for a spend still settling or for
+    /// a chain that did not answer, is none (stage 4 design §5.2,
+    /// `chia_publish::knock_attempt_counts`). A knock found already written
+    /// by its own key (`chia_publish::claim_write::AlreadyKnocked`), or
+    /// withdrawn at spend time (`chia_publish::Withdrawn`), uses none either
+    /// way and is dropped, not tried again.
     pub attempts: u8,
 }
 
@@ -305,6 +312,17 @@ pub struct KnockBook {
 impl KnockBook {
     /// A missing file is an empty book; an unreadable one is logged and starts
     /// empty (one early knock at worst: the era budget is the host's to read).
+    /// With burner keys on (stage 4 design §4.1, the knock row; §9) a lost
+    /// book gives no second knock for the same host and room in an era, since
+    /// that knock's key answers: it wrote, and a knock's key writes once. The
+    /// key is the host's own, bound to its node id, so a knock to another
+    /// host whose card names the same contact key does not answer for it. A
+    /// knock to that host for another room uses another key, since the room's
+    /// lane is in its inbox hint, and goes out: the one early knock at worst.
+    /// The knock its key answers for then has no entry, so this node does
+    /// not dial the host at that knock's confirmation height (no entry is
+    /// rebuilt from the chain), unless the wallet lease still holds its write
+    /// (`chia_publish::lost_knock_entry`).
     pub fn load(path: &Path) -> KnockBook {
         match std::fs::read(path) {
             Ok(bytes) => {
@@ -651,6 +669,28 @@ mod tests {
         assert!(book.confirm_sent("x", "bb", 96_800));
         assert_eq!((book.sent[0].confirmed_height, book.sent[0].last_rendezvous), (96_800, 96_800));
         assert!(book.knocked_this_era("G", 3) && !book.knocked_this_era("H", 3), "H may be knocked on again");
+    }
+
+    #[test]
+    fn two_knocks_under_one_hint_on_two_coins_are_judged_apart() {
+        // Stage 4 design §3.1 and P6a: two hosts whose cards name one contact
+        // key share the inbox hint of a room's lane, and each gets a knock
+        // from a burner key of its own, with its own gift g as its coin id.
+        // The chain's word on one, named by its coin and the hint, moves
+        // that entry alone.
+        let mut book = KnockBook::default();
+        book.record_sent(sent("H", 3, "ga", 100));
+        book.record_sent(sent("G", 3, "gb", 200));
+        assert!(book.confirm_sent("ga", "ab", 96_800));
+        assert_eq!(book.pending_sent().iter().map(|k| k.host.as_str()).collect::<Vec<_>>(), vec!["G"], "H's alone is confirmed");
+        assert!(book.settle_sent("ga", "ab"));
+        assert!(!book.settle_sent("gb", "ab"), "G's is not confirmed, so not settled");
+        assert!(book.unconfirm_sent("ga", "ab"));
+        assert_eq!(book.pending_sent().len(), 2, "H's alone is pending again");
+        assert!(book.confirm_sent("gb", "ab", 96_801));
+        assert!(book.drop_sent("ga", "ab"));
+        assert_eq!(book.sent.iter().map(|k| (k.host.as_str(), k.confirmed_height)).collect::<Vec<_>>(), vec![("G", 96_801)], "H's alone is forgotten");
+        assert!(book.knocked_this_era("G", 3) && !book.knocked_this_era("H", 3));
     }
 
     #[test]
