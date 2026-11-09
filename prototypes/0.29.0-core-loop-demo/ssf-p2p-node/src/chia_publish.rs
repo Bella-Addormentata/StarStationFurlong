@@ -8618,6 +8618,46 @@ mod tests {
         assert!(lease.is_settling(&id), "settling once the mover gave the gate back");
     }
 
+    /// The writes the lease holds under one hint come newest first, by the
+    /// lease's number for their spends, parked or settling alike
+    /// ([`WalletLease::held_writes_under`]), and the one write the
+    /// listing's lookup takes is the newest ([`WalletLease::held_write_under`]):
+    /// a listing written twice under its hint in one era, its first write
+    /// settling, rebuilds its lost mark from the second ([`lost_listing_mark`]),
+    /// and a knock's filing goes through them newest first
+    /// ([`lost_knock_entry`]). Three memo writes under one hint, the middle
+    /// one settling, are listed newest first, though the lease keeps the
+    /// parked and the settling ones apart; a write under another hint is not
+    /// listed.
+    #[tokio::test]
+    async fn the_writes_held_under_a_hint_are_listed_newest_first_parked_or_settling() {
+        let sk = SecretKey::from_seed(&[0x6b; 32]);
+        let hint = Bytes32::new([0x6c; 32]);
+        let coins: Vec<Coin> = [0x6d, 0x6e, 0x71, 0x72].iter().map(|&b| Coin::new(Bytes32::new([b; 32]), our_puzzle_hash(&sk), 1000)).collect();
+        let lease = WalletLease::new();
+        let t0 = Instant::now();
+        let mut spends = Vec::new();
+        for (n, coin) in coins.iter().enumerate() {
+            let under = if n == 3 { Bytes32::new([0x73; 32]) } else { hint };
+            let bundle = build_publish_bundle(T11, &sk, *coin, under, Bytes::new(vec![n as u8])).unwrap();
+            let spend = lease.park_with_bundle_at([(coin.coin_id(), 900)], Some((&bundle, money())), t0).unwrap().spend;
+            if n == 1 {
+                let settling = Settling { coins: vec![ParkedInput { coin_id: coin.coin_id(), seen_at: Some(900) }], spent_at: 1000, bundle, payer: Some(money()) };
+                lease.retire(&[spend], vec![(spend, settling)], &[], &[], &[], t0);
+            }
+            spends.push(spend);
+        }
+        assert!(spends.windows(2).all(|w| w[0] < w[1]), "numbered in the order parked: {spends:?}");
+        assert!(lease.is_parked(&coins[0].coin_id()) && lease.is_settling(&coins[1].coin_id()) && lease.is_parked(&coins[2].coin_id()));
+
+        let held = lease.held_writes_under(hint).await;
+        assert_eq!(held.iter().map(|w| w.spend).collect::<Vec<_>>(), vec![spends[2], spends[1], spends[0]], "newest first, the settling one among them");
+        assert_eq!(held.iter().map(|w| w.spent_at).collect::<Vec<_>>(), vec![None, Some(1000), None]);
+        assert_eq!(held.iter().map(|w| w.record.clone()).collect::<Vec<_>>(), vec![vec![2], vec![1], vec![0]], "each its own record");
+        let newest = lease.held_write_under(hint).await.expect("held");
+        assert_eq!(newest, held[0], "the newest");
+    }
+
     /// Stage 4 design §4.4: a push parks its spend under the payer it names,
     /// before the push leaves (round 9) and in the parking's one write; a
     /// parking the file cannot take parks nothing for that payer either.
