@@ -3,6 +3,7 @@ name = "ssf-roomlog-bakeoff"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-3: RoomLog substrate bakeoff (SsfLog custom vs rust-p2panda)"
 
 [dependencies]

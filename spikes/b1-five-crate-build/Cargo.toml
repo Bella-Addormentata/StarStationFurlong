@@ -3,6 +3,7 @@ name = "ssf-node-hello"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-1: do the five v006 crates compile and link together for desktop AND aarch64-linux-android, and at what size? (STUDY-Architecture v006 §15.1 #1)"
 
 # ⚠️ THIS PROJECT IS A GATE, NOT A PRODUCT.

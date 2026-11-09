@@ -3,6 +3,7 @@ name = "ssf-station-seals-v2"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-4: Station Seals v2 mini-spec & prototype (FROST t-of-n, pruning property tests)"
 
 [dependencies]

@@ -4,7 +4,7 @@
   "type": "module",
   "description": "StarStation Furlong - Phase 1 Ortho Camera Demo (locked orthographic camera)",
   "author": "StarStation Team",
-  "license": "ISC",
+  "license": "WTFPL",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
