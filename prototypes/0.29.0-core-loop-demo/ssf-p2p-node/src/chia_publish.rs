@@ -8552,6 +8552,72 @@ mod tests {
         assert_eq!(parked, Some(HeldWrite { spent_at: None, ..settling }), "the write as the gate's holder left it: parked again");
     }
 
+    /// Stage 4 design §8.3, the crash window's lookup
+    /// ([`WalletLease::held_writes_under`]): the lease's gate is held for the
+    /// whole read, through the parking and the settling spends both, not
+    /// only taken before it. A thread beside the reads moves a settling memo
+    /// write back into the parking and out to settling again, over and over
+    /// ([`WalletLease::retire`], as a reconciliation does that finds the
+    /// write's block gone and then finds it again), and only while it holds
+    /// the gate, so whenever the gate is free the write is settling. A read
+    /// that holds the gate throughout never misses it. One that gave the gate
+    /// back between the two maps could read the parking before a move and
+    /// the settling spends during one, and find no write at all. The thread
+    /// spins on the gate, so it takes it as soon as it is free, and keeps the
+    /// write parked a while each time. The reads, on a runtime of two
+    /// threads of its own, go on until the thread has moved the write many
+    /// times between them. The check is one-sided: the write moves only
+    /// under the gate, so a read that holds it can never miss, however the
+    /// threads are scheduled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_write_held_under_a_hint_is_read_whole_under_the_leases_gate_while_another_thread_moves_it() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let sk = SecretKey::from_seed(&[0x68; 32]);
+        let ours = Coin::new(Bytes32::new([0x69; 32]), our_puzzle_hash(&sk), 1000);
+        let (id, hint) = (ours.coin_id(), Bytes32::new([0x6a; 32]));
+        let bundle = build_publish_bundle(T11, &sk, ours, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+        let settling = move |bundle: &SpendBundle| Settling { coins: vec![ParkedInput { coin_id: id, seen_at: Some(900) }], spent_at: 1000, bundle: bundle.clone(), payer: Some(money()) };
+        let lease = std::sync::Arc::new(WalletLease::new());
+        let t0 = Instant::now();
+        let spend = lease.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap().spend;
+        lease.retire(&[spend], vec![(spend, settling(&bundle))], &[], &[], &[], t0);
+        assert!(lease.is_settling(&id) && !lease.is_parked(&id), "settling while the gate is free");
+
+        let (stop, moves) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicU64::new(0)));
+        let mover = {
+            let (lease, stop, moves) = (lease.clone(), stop.clone(), moves.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok(gate) = lease.gate.try_lock() else {
+                        std::hint::spin_loop();
+                        continue;
+                    };
+                    lease.retire(&[], Vec::new(), &[spend], &[], &[], t0);
+                    // Parked again a while, under the gate.
+                    std::thread::sleep(Duration::from_micros(20));
+                    lease.retire(&[spend], vec![(spend, settling(&bundle))], &[], &[], &[], t0);
+                    drop(gate);
+                    moves.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let (mut reads, mut missed) = (0u32, 0u32);
+        while reads < 2_000 || (moves.load(Ordering::Relaxed) < 500 && reads < 200_000) {
+            let held = lease.held_writes_under(hint).await;
+            if !held.iter().any(|w| w.spend == spend) {
+                missed += 1;
+            }
+            reads += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        mover.join().expect("the mover ends");
+        let moves = moves.load(Ordering::Relaxed);
+        assert!(moves >= 500, "the write was moved {moves} times in {reads} reads");
+        assert_eq!(missed, 0, "{missed} of {reads} reads found no write while it was moved {moves} times");
+        assert!(lease.is_settling(&id), "settling once the mover gave the gate back");
+    }
+
     /// Stage 4 design §4.4: a push parks its spend under the payer it names,
     /// before the push leaves (round 9) and in the parking's one write; a
     /// parking the file cannot take parks nothing for that payer either.
