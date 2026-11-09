@@ -9207,6 +9207,7 @@ mod tests {
             ("a burner's spend in flight", BurnerWait::Held.into()),
             ("a burner's bundle settling", BurnerWait::Settling.into()),
             ("a burner's listing cut short", BurnerWait::ListingCutShort.into()),
+            ("a knock's key unread, its listing or its parents' lookup cut short", BurnerWait::KnockKeyUnread.into()),
             ("no peak for a burner's gift", BurnerWait::PeakUnavailable.into()),
             ("no lobby coin for a burner", BurnerWait::NoCoinReady.into()),
             ("the fuse blown", BurnerWait::FuseBlown { era: 3 }.into()),

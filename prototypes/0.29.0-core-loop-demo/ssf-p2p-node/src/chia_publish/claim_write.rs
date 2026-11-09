@@ -357,12 +357,18 @@ pub enum BurnerWait {
     Settling,
     /// The burner holds no coin the listing showed, and the listing of its
     /// puzzle hash was cut short, so it cannot tell that it holds none: a
-    /// gift could be its second (fail closed). A knock's key waits so on any
-    /// listing cut short, whatever it showed, since a record past the cut
-    /// could be its own write, and on a lookup of its lone coins' parents
-    /// cut short with a parent left out, since that parent could be at the
-    /// key ([`knock_write_with`]).
+    /// gift could be its second (fail closed). A knock's key waits as
+    /// [`BurnerWait::KnockKeyUnread`] instead.
     ListingCutShort,
+    /// A knock's key K(h) cannot be told unwritten from what the chain gave
+    /// (§4.1, the knock row: K(h) writes once): the listing of its puzzle
+    /// hash was cut short, whatever it showed, since a record past the cut
+    /// could be its own write; or the lookup by id of its lone coins'
+    /// parents was cut short with a parent left out, since that parent could
+    /// be at the key ([`knock_write_with`]). Fail closed, but as a wait, not
+    /// as [`AlreadyKnocked`], which would end the knock for the era on a read
+    /// that was only incomplete: the next read may be whole.
+    KnockKeyUnread,
     /// No peer answered the peak, so no lobby coin can be judged ready.
     PeakUnavailable,
     /// No lobby coin is ready that the lease does not hold: a dry or griefed
@@ -395,6 +401,9 @@ impl fmt::Display for BurnerWait {
                 f.write_str("this burner's last bundle is still settling and the burner holds no coin, so it is not funded again until the chain settles it")
             }
             BurnerWait::ListingCutShort => f.write_str("the burner's coin listing was cut short, so it cannot tell that the burner holds no coin"),
+            BurnerWait::KnockKeyUnread => {
+                f.write_str("the chain's listing of this knock's own key, or of its coins' parents, was cut short, so it cannot tell whether the key already wrote")
+            }
             BurnerWait::PeakUnavailable => f.write_str("chain peak unavailable (peers unreachable?)"),
             BurnerWait::NoCoinReady => f.write_str("no mojo in the lobby dish right now; it refills on the block clock"),
             BurnerWait::MoneyInFlight => {
@@ -785,7 +794,7 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// - its spend parked, in flight or restored after a restart:
 ///   [`BurnerWait::Held`], while the lease pushes the saved bundle again;
 /// - its listing cut short, or the lookup of its lone coins' parents cut
-///   short with a parent left out: [`BurnerWait::ListingCutShort`];
+///   short with a parent left out: [`BurnerWait::KnockKeyUnread`];
 /// - a spent record at its puzzle hash (the knock landed, settling or
 ///   settled, whether the lease's file is kept or lost), or an unspent
 ///   1-mojo coin there whose parent is at the key too or is not returned by
@@ -841,7 +850,7 @@ pub(crate) async fn knock_write_with<R: rand::Rng + ?Sized + Send>(
 /// when it never wrote, and the writer goes on as for any burner. Otherwise,
 /// in this order:
 ///
-/// - A listing cut short is [`BurnerWait::ListingCutShort`]: a record past
+/// - A listing cut short is [`BurnerWait::KnockKeyUnread`]: a record past
 ///   the cut could be the key's. A wait is as closed as a drop, since
 ///   nothing is written, and it can recover.
 /// - A spent record there, of any amount, is [`AlreadyKnocked`]: only the
@@ -858,7 +867,7 @@ pub(crate) async fn knock_write_with<R: rand::Rng + ?Sized + Send>(
 ///   with no cursor, as the peer lane cuts a lookup by id it could not
 ///   finish) says nothing of the coins it left out, as every other reader
 ///   of one takes it (`chia_resolve::coin_heights`). A parent it left out is
-///   [`BurnerWait::ListingCutShort`], a wait, not [`AlreadyKnocked`], which
+///   [`BurnerWait::KnockKeyUnread`], a wait, not [`AlreadyKnocked`], which
 ///   would end the knock for the era on a read that was only incomplete. A
 ///   parent it did return at the key is [`AlreadyKnocked`] all the same.
 ///
@@ -879,7 +888,7 @@ pub(crate) async fn knock_write_with<R: rand::Rng + ?Sized + Send>(
 /// bundle.
 async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, records: &[CoinRecord], partial: bool, unheld: &[Coin]) -> Result<()> {
     if partial {
-        return Err(BurnerWait::ListingCutShort.into());
+        return Err(BurnerWait::KnockKeyUnread.into());
     }
     if records.iter().any(|r| r.spent) {
         return Err(AlreadyKnocked.into());
@@ -912,7 +921,7 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
     } else if whole {
         Err(AlreadyKnocked.into())
     } else {
-        Err(BurnerWait::ListingCutShort.into())
+        Err(BurnerWait::KnockKeyUnread.into())
     }
 }
 
@@ -1877,7 +1886,7 @@ mod tests {
 
     /// A knock key's listing cut short (truncated with no cursor) cannot say
     /// the key never wrote: a record past the cut could be its. The knock
-    /// waits, typed as [`BurnerWait::ListingCutShort`], which is no knock
+    /// waits, typed as [`BurnerWait::KnockKeyUnread`], which is no knock
     /// attempt, whatever the cut listing shows: nothing, a spent record of 1
     /// mojo, or a lone coin of 1 mojo. Only the one listing is read, no
     /// parent is asked, nothing is sent, and a gift counted for the key stays
@@ -1893,7 +1902,7 @@ mod tests {
             let chain = Scripted::new(vec![page(records, true)]);
             let fuse = fuse_holding(&key, 0);
             let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
-            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::ListingCutShort), "{what}: {e:#}");
+            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::KnockKeyUnread), "{what}: {e:#}");
             assert!(crate::chia_publish::is_typed_wait(&e), "{what}: a wait");
             assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "{what}: no knock attempt (§5.2)");
             assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "{what}: the one listing");
@@ -1954,7 +1963,7 @@ mod tests {
     /// every reader of one takes it (`chia_resolve::coin_heights`). A lone
     /// 1-mojo coin at a knock key whose parent the lookup left out, cut short
     /// with no cursor (the peer lane's cut), is a wait typed as
-    /// [`BurnerWait::ListingCutShort`], no knock attempt and not
+    /// [`BurnerWait::KnockKeyUnread`], no knock attempt and not
     /// [`AlreadyKnocked`], so the knock arm queues it again and does not
     /// note the host: nothing is sent or counted. A parent the cut lookup
     /// did return at the key is already knocked all the same, and a cursor
@@ -1974,7 +1983,7 @@ mod tests {
         let chain = Scripted::new(vec![page(vec![record(lifted, false)], false), page(vec![], true)]);
         let fuse = Mutex::new(GiftFuse::new());
         let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock waits");
-        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::ListingCutShort), "{e:#}");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::KnockKeyUnread), "{e:#}");
         assert!(crate::chia_publish::already_knocked(&e).is_none(), "not read as knocked, so the host is not noted: {e:#}");
         assert!(crate::chia_publish::is_typed_wait(&e), "a wait");
         assert!(!crate::chia_publish::knock_attempt_counts(true, &e), "no knock attempt (§5.2)");
