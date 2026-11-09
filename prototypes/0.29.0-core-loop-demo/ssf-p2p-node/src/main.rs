@@ -519,6 +519,14 @@ pub struct ChiaPresence {
     /// wallet is the one the Bank app can fix).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// This edition's listing on record, with the live address set, did not
+    /// make it into the book, and the hint rule (stage 4 design §8.3) holds
+    /// the next write until the next edition: it is outdated, though neither
+    /// its edition nor its addresses are. Only with burner keys on, or after
+    /// they were turned off in the middle of an edition. Sent only when
+    /// true, so every other readout is the text it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlanded: bool,
 }
 
 /// 📖 The four looks of the phone book icon.
@@ -1261,6 +1269,7 @@ mod fingerprint_json_tests {
             current: true,
             public_addrs: 2,
             error: None,
+            unlanded: false,
         });
         let json = serde_json::to_string(&some).unwrap();
         assert!(json.contains("\"chia_presence\":{\"state\":\"listed\",\"era\":7,\"listed_era\":7,\"last_at\":1700000000,\"confirmed\":true,\"current\":true,\"public_addrs\":2}"), "{json}");
@@ -1277,12 +1286,33 @@ mod fingerprint_json_tests {
             current: false,
             public_addrs: 1,
             error: Some("chia wallet unfunded".into()),
+            unlanded: false,
         });
         let json = serde_json::to_string(&failing).unwrap();
         assert!(json.contains("\"state\":\"unlisted\""), "{json}");
         assert!(json.contains("\"error\":\"chia wallet unfunded\""), "{json}");
+        assert!(!json.contains("unlanded"), "{json}");
         let back: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(back.chia_presence, failing.chia_presence);
+
+        // 📖 A listing of this edition that did not land, held by the hint
+        // rule (stage 4 design §8.3), says so; no other readout carries it.
+        let mut unlanded = fp();
+        unlanded.chia_presence = Some(ChiaPresence {
+            state: ChiaPresenceState::Outdated,
+            era: 8,
+            listed_era: 8,
+            last_at: 0,
+            confirmed: false,
+            current: false,
+            public_addrs: 2,
+            error: Some("this edition's listing did not make it into the book".into()),
+            unlanded: true,
+        });
+        let json = serde_json::to_string(&unlanded).unwrap();
+        assert!(json.contains("\"error\":\"this edition's listing did not make it into the book\",\"unlanded\":true}"), "{json}");
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chia_presence, unlanded.chia_presence);
     }
 
     /// ⛓️ The network rides as the page reads it: the id, the genesis as

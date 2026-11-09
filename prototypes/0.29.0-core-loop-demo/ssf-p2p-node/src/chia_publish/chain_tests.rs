@@ -3068,6 +3068,18 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     let lost = burner_path(&s.lease, None).expect("W's listing, filed again");
     assert_eq!(lost, saved, "the mark the heartbeat would have saved");
     assert_eq!(lost.payer.as_deref(), Some(money.as_str()), "naming W");
+    // A mark on record that names no write of this era's under its hint is
+    // lost all the same: another edition's (the one file is saved over each
+    // edition, so a stop loses only this edition's save), this edition's
+    // under another hint (the contact key replaced), and this edition's
+    // void one, which names no write at all.
+    let hint_of = |ck: &[u8; 32], era: u64| hex::encode(chia_lane::derive_ck_hint(NET, ck, era));
+    let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
+    let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
+    let void = saved.voided();
+    for (on_record, what) in [(&other_era, "another edition's mark"), (&other_hint, "a mark under another hint"), (&void, "this edition's void mark")] {
+        assert_eq!(burner_path(&s.lease, Some(on_record)), Some(saved.clone()), "{what}");
+    }
 
     let (peak, moved) = (s.chain.peak(), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let mut rng = StdRng::seed_from_u64(1);
@@ -3083,6 +3095,7 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     s.reconcile().await;
     assert!(!s.lease.outgoing_pending_for(Payer::of(&w)) && s.lease.holds_for(Payer::of(&w)), "W's spend settling");
     assert_eq!(burner_path(&s.lease, None), Some(saved.clone()), "still found while it settles");
+    assert_eq!(burner_path(&s.lease, Some(&void)), Some(saved.clone()), "…over a void mark too, spent in its own era");
     assert_eq!(burner_path(&s.lease, Some(&lost)), None, "a mark that names it is not filed again");
     let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "the mark's reader confirms W's write");
@@ -3127,9 +3140,19 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     assert!(s.lease.outgoing_pending_for(Payer::of_burner(&burner(71, 0))), "P(0)'s spend restored, parked");
     let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
     let lost = lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).expect("P(0)'s listing, filed again");
-    assert_eq!(lost, NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone()), "the mark the heartbeat would have saved");
+    let saved = NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone());
+    assert_eq!(lost, saved, "the mark the heartbeat would have saved");
     assert_eq!(lost.payer.as_deref(), Some(p0.as_str()), "naming P(0)");
     assert_eq!(lost.parked, hex::encode(write.coins.parked), "its dish coin parked, its gift the parent");
+    // Another edition's mark on record, or this edition's under another
+    // hint or void, names no write of this era's under its hint.
+    let hint_of = |ck: &[u8; 32], era: u64| hex::encode(chia_lane::derive_ck_hint(NET, ck, era));
+    let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
+    let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
+    for on_record in [&other_era, &other_hint, &saved.voided()] {
+        assert_eq!(lost_listing_mark(&s.lease, Some(on_record), NET, &CK, 0, false, &money, derive), Some(saved.clone()), "{on_record:?}");
+    }
+    assert_eq!(lost_listing_mark(&s.lease, Some(&saved), NET, &CK, 0, false, &money, derive), None, "a mark that names it is not filed again");
 
     let (hint0, moved) = (hex::encode(hint), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let changed = at + ADDR_CHANGE_DEBOUNCE_SECS;
@@ -3139,5 +3162,42 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     assert_eq!(money_listing_step(Some(&lost), 0, &moved, changed, &hint0, &id, false, &money, derived.as_deref()), ListingStep::HeldByHint(PaidBy::Burner));
 
     assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, true, &money, |_| Some(p0.clone())), None, "on the burner path its own write is left to the burner's rules");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §8.3, a lost mark's write that the chain put in a block of
+/// the next era: wallet W's listing for era 0 goes out in the era's last
+/// block and lands in era 1's first, and the node stops before its mark is
+/// saved. Filed again from the lease while the spend settles, the mark is
+/// voided at once (confirmed outside its era, so readers will not take it),
+/// and its payer stays, so the hint rule still holds P(0): W's coin is on
+/// chain under era 0's hint. Over that void mark the same write is not filed
+/// again, so the heartbeat does not file it and void it on every tick.
+#[tokio::test]
+async fn a_lost_marks_write_confirmed_outside_its_era_is_filed_and_voided_once() {
+    let mut s = setup().await;
+    let dir = Dir::new("lost-mark-outside-era");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(72), iroh::SecretKey::generate());
+    let (money, p0) = (Payer::of(&w).hex(), Payer::of_burner(&burner(72, 0)).hex());
+    s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    s.chain.farm_to(ERA_BLOCKS - 1).await;
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let (hint, _) = s.money_listing(&w, &node, 0, &entries(), unix_now()).await.unwrap();
+    let landed = s.chain.farm().await;
+    assert_eq!(chia_lane::era_of(landed), 1, "in era 1's first block");
+    s.reconcile().await;
+    assert!(s.lease.holds_for(Payer::of(&w)) && !s.lease.outgoing_pending_for(Payer::of(&w)), "W's spend settling");
+
+    let burner_path = |mark: Option<&NodePublishMark>| lost_listing_mark(&s.lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone()));
+    let lost = burner_path(None).expect("W's listing, filed again");
+    let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
+    let PresenceStep::Void(why) = presence_step(&lost, word, 0, landed) else { panic!("confirmed outside its era: void") };
+    assert!(why.contains("outside its era"), "{why}");
+    let void = lost.voided();
+    assert_eq!((void.payer.as_deref(), void.hint.as_str()), (Some(money.as_str()), hex::encode(hint).as_str()), "the payer and the hint stay");
+    assert_eq!(hint_rule_holds(Some(&void), 0, &void.hint, true, &money, Some(&p0)), Some(PaidBy::Money), "so the hint rule holds P(0)");
+    assert_eq!(burner_path(Some(&void)), None, "not filed again over its own void mark");
     assert!(s.chain.unanswered().is_empty());
 }

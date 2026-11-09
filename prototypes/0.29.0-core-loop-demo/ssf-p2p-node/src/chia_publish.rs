@@ -267,14 +267,17 @@ struct Pushed {
 
 /// A write the lease holds under a hint ([`WalletLease::held_write_under`]):
 /// the coins it is judged by (stage 4 design §4.4), the lease's number for
-/// its spend, the record its coin carries, and the payer filed for the spend
-/// (`None`: none was filed, which is the money address's).
+/// its spend, the record its coin carries, the payer filed for the spend
+/// (`None`: none was filed, which is the money address's), and the height
+/// the chain listed its inputs spent at once it is settling (`None` while it
+/// is parked).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HeldWrite {
     pub coins: WriteCoins,
     pub spend: u64,
     pub record: Vec<u8>,
     pub payer: Option<Payer>,
+    pub spent_at: Option<u32>,
 }
 
 impl HeldWrite {
@@ -285,14 +288,14 @@ impl HeldWrite {
     /// coin the bundle spends that the lease holds for it: the same coin for
     /// a write from one coin, the dish coin F for a burner's first write,
     /// whose parent is the gift g (§4.1).
-    fn of(spend: u64, inputs: &[Bytes32], bundle: &SpendBundle, payer: Option<Payer>, hint: Bytes32) -> Option<HeldWrite> {
+    fn of(spend: u64, inputs: &[Bytes32], bundle: &SpendBundle, payer: Option<Payer>, spent_at: Option<u32>, hint: Bytes32) -> Option<HeldWrite> {
         let (parent, record) = bundle.coin_spends.iter().find_map(|cs| {
             let run = crate::chia_chain::PuzzleAndSolution { puzzle_reveal: cs.puzzle_reveal.clone(), solution: cs.solution.clone() };
             let record = crate::chia_resolve::extract_ciphertext(&run, hint).ok().flatten()?;
             Some((cs.coin.coin_id(), record))
         })?;
         let parked = bundle.coin_spends.iter().map(|cs| cs.coin.coin_id()).find(|id| inputs.contains(id))?;
-        Some(HeldWrite { coins: WriteCoins { parent, parked }, spend, record, payer })
+        Some(HeldWrite { coins: WriteCoins { parent, parked }, spend, record, payer, spent_at })
     }
 }
 
@@ -835,22 +838,22 @@ impl WalletLease {
     /// ([`lost_listing_mark`]). A parked spend whose bundle was not saved is
     /// not seen, and neither is one the lease has forgotten.
     pub(crate) fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
-        let mut held: Vec<(u64, Vec<Bytes32>, SpendBundle, Option<Payer>)> = Vec::new();
+        let mut held: Vec<(u64, Vec<Bytes32>, SpendBundle, Option<Payer>, Option<u32>)> = Vec::new();
         {
             let pending = self.pending.lock().unwrap();
             let pushed = self.bundles.lock().unwrap();
             for (spend, p) in pushed.iter() {
                 let inputs: Vec<Bytes32> = pending.iter().filter(|(_, parked)| parked.spend == *spend).map(|(id, _)| *id).collect();
                 if !inputs.is_empty() {
-                    held.push((*spend, inputs, p.bundle.clone(), p.payer));
+                    held.push((*spend, inputs, p.bundle.clone(), p.payer, None));
                 }
             }
         }
         for (spend, s) in self.settling.lock().unwrap().iter() {
-            held.push((*spend, s.coins.iter().map(|c| c.coin_id).collect(), s.bundle.clone(), s.payer));
+            held.push((*spend, s.coins.iter().map(|c| c.coin_id).collect(), s.bundle.clone(), s.payer, Some(s.spent_at)));
         }
         held.sort_by_key(|(spend, ..)| std::cmp::Reverse(*spend));
-        held.into_iter().find_map(|(spend, inputs, bundle, payer)| HeldWrite::of(spend, &inputs, &bundle, payer, hint))
+        held.into_iter().find_map(|(spend, inputs, bundle, payer, spent_at)| HeldWrite::of(spend, &inputs, &bundle, payer, spent_at, hint))
     }
 
     /// A gift to our wallet is still landing: the wallet is not empty even
@@ -2442,7 +2445,9 @@ pub(crate) fn money_path_burner_payer(
 /// node that stops between the two, or whose marks file is lost or cannot
 /// be read, keeps the write in its lease (parked, then settling until the
 /// chain settles it [`crate::chia_knock::SETTLED_DEPTH`] deep,
-/// [`WalletLease::held_write_under`]) and an older mark, or none. Started
+/// [`WalletLease::held_write_under`]) and an older mark, or none, or this
+/// era's mark of an earlier write that died ([`NodePublishMark::is_void`]),
+/// which names no write at all. Started
 /// again on the other path (burner keys turned on or off in the middle of
 /// the era), its next write would go out under the same hint from the
 /// other payer, the link the hint rule is there to prevent, and a wait for
@@ -2454,7 +2459,14 @@ pub(crate) fn money_path_burner_payer(
 /// `ck` ([`chia_lane::open_v2`]). The era's write count is the floor, 1,
 /// since a lost mark's count is not on chain. The mark's reader then judges
 /// the write as any other ([`presence_step`]), and the hint rule holds the
-/// other payer's write until the next era.
+/// other payer's write until the next era. A mark of this era under this
+/// hint that names a write is the one on record, and nothing is filed over
+/// it. Over a void one, a write the chain spent in a block of another era
+/// is not filed: it is the write the mark was voided for, confirmed outside
+/// its era ([`presence_step`]), still settling, and filing it again would
+/// only void it again. With no mark of this era it is filed all the same,
+/// and voided: its coin is on chain under the hint, so the void mark's
+/// payer keeps the hint rule.
 ///
 /// `burner_path`, `money` and `burner` are the hint rule's
 /// ([`hint_rule_holds`]): `burner` gives this wallet's listing burner's
@@ -2480,10 +2492,14 @@ pub(crate) fn lost_listing_mark(
 ) -> Option<NodePublishMark> {
     let hint = Bytes32::new(chia_lane::derive_ck_hint(net, ck, era));
     let era_hint = hex::encode(hint.to_bytes());
-    if !net.is_test() || mark.is_some_and(|m| m.era == era && m.hint == era_hint) {
+    let on_record = mark.filter(|m| m.era == era && m.hint == era_hint);
+    if !net.is_test() || on_record.is_some_and(|m| !m.is_void()) {
         return None;
     }
     let held = lease.held_write_under(hint)?;
+    if on_record.is_some() && held.spent_at.is_some_and(|h| chia_lane::era_of(h) != era) {
+        return None;
+    }
     let plain = chia_lane::open_v2(net, ck, KIND_PRESENCE, era, &held.record).ok()?;
     let record = chia_lane::decode_presence_v2(&plain, era).ok()?;
     let found = NodePublishMark {
@@ -2755,16 +2771,16 @@ fn listing_wait_words(step: ListingStep, burner_path: bool) -> Option<&'static s
 fn unlanded_hold_words(by: PaidBy, burner_path: bool) -> &'static str {
     match (burner_path, by) {
         (true, PaidBy::Money) => {
-            "this edition's listing, paid by the SSF wallet, did not make it into the book, and one hint never has two payers: the next edition's listing goes out from its own key"
+            "this edition's listing, paid by the SSF wallet, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key"
         }
         (true, PaidBy::Burner | PaidBy::Other) => {
-            "this edition's listing, paid by another key, did not make it into the book, and one hint never has two payers: the next edition's listing goes out from its own key"
+            "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key"
         }
         (false, PaidBy::Money) => {
-            "this edition's listing, paid by the SSF wallet, did not make it into the book, and one hint never has two payers: the SSF wallet writes the next edition's"
+            "this edition's listing, paid by the SSF wallet, did not make it into the book; one hint never has two payers, so the SSF wallet writes the next edition's"
         }
         (false, PaidBy::Burner | PaidBy::Other) => {
-            "this edition's listing, paid by another key, did not make it into the book, and one hint never has two payers: the SSF wallet writes the next edition's"
+            "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the SSF wallet writes the next edition's"
         }
     }
 }
@@ -2965,7 +2981,10 @@ pub fn presence_status(
 /// figures are its own: `listed_era` is the era before, `confirmed` is the
 /// chain's read, and `current` holds, since it is the listing in force. With
 /// [`ListingHold::Unlanded`] a void listing of this era held by the hint
-/// rule is *outdated*, and not `current`. With [`ListingHold::Nothing`] the
+/// rule is *outdated*, and not `current`, and where it would otherwise read
+/// *sent* (this era's, with the live address set) the readout says so
+/// (`unlanded`), so that the page does not read an outdated listing of this
+/// era as a change of address. With [`ListingHold::Nothing`] the
 /// readout is the one it always was, word for word ([`presence_state`]'s
 /// state).
 #[allow(clippy::too_many_arguments)]
@@ -2984,6 +3003,7 @@ pub fn presence_status_with(
         _ => m.node_id.as_deref() == Some(node_id),
     });
     let state = presence_state_with(mark, ours, era, addrs_sig, hold);
+    let unlanded = hold == ListingHold::Unlanded && presence_state(mark, ours, era, addrs_sig) == crate::ChiaPresenceState::Sent;
     let on_record = mark.filter(|_| ours);
     crate::ChiaPresence {
         state,
@@ -2994,6 +3014,7 @@ pub fn presence_status_with(
         current: matches!(state, crate::ChiaPresenceState::Listed | crate::ChiaPresenceState::Sent),
         public_addrs: u32::try_from(public_addrs).unwrap_or(u32::MAX),
         error: error.map(str::to_owned),
+        unlanded,
     }
 }
 
@@ -4469,8 +4490,9 @@ pub async fn heartbeat_loop(
             let entries = public_addr_entries(&addrs, &inbound, peak, now_unix);
             let sig = addrs_signature(&entries);
             // This era's listing, written by the other path's payer before a
-            // restart that lost its mark, filed again from the write the
-            // lease still holds under the era's hint ([`lost_listing_mark`]),
+            // restart that lost its mark (the mark on record is older, void,
+            // or none), filed again from the write the lease still holds
+            // under the era's hint ([`lost_listing_mark`]),
             // so that the hint rule (§8.3) holds this path's write for the
             // rest of the era. The write is found parked or settling alike.
             // The line names no payer.
@@ -5890,6 +5912,7 @@ mod tests {
             let words = unlanded_hold_words(by, burner_path);
             assert!(words.contains("did not make it into the book") && !words.contains("stays as it is"), "{words}");
             assert_eq!(words.contains("paid by the SSF wallet"), by == PaidBy::Money, "{words}");
+            assert!(words.chars().count() < 160 && !words.to_lowercase().contains("unfunded"), "fits the page's 160 characters: {words}");
             assert_eq!(
                 listing_readout(None, held, burner_path, true, Some("push_tx rejected"), true, true),
                 (Some(words.into()), ListingHold::Unlanded),
@@ -5941,7 +5964,7 @@ mod tests {
         let listed = presence_status(Some(&mark), Some("h"), "n", Some(5), "a", 2, None);
         assert_eq!(
             listed,
-            crate::ChiaPresence { state: Listed, era: 5, listed_era: 5, last_at: now, confirmed: true, current: true, public_addrs: 2, error: None }
+            crate::ChiaPresence { state: Listed, era: 5, listed_era: 5, last_at: now, confirmed: true, current: true, public_addrs: 2, error: None, unlanded: false }
         );
         let stale = presence_status(Some(&mark), Some("h6"), "n", Some(6), "a", 2, None);
         assert_eq!(stale.state, Outdated, "a new era brings a new hint, so last era's listing is ours by its signer: the grey book");
@@ -5995,6 +6018,7 @@ mod tests {
                 current: true,
                 public_addrs: 2,
                 error: busy.map(str::to_owned),
+                unlanded: false,
             },
             "last edition's listing is the one in force, and the text beside it is carried as given"
         );
@@ -6059,8 +6083,16 @@ mod tests {
         assert!(!NodePublishMark { coin_id: String::new(), spend: None, ..written.clone() }.is_void(), "an older node's mark dates its write");
         let held = presence_status_with(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None, ListingHold::Unlanded);
         assert_eq!((held.state, held.current, held.listed_era, held.confirmed), (Outdated, false, 8, false), "{held:?}");
+        assert!(held.unlanded, "the readout says why a listing of this edition with these addresses is outdated");
+        let moved = presence_status_with(Some(&void), Some("h8"), "n", Some(8), "b:2/0", 2, None, ListingHold::Unlanded);
+        assert_eq!((moved.state, moved.unlanded), (Outdated, false), "the addresses changed too: that is the page's reason, and it is true");
         let unheld = presence_status_with(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None, ListingHold::Nothing);
-        assert_eq!((unheld.state, unheld.current), (Sent, true), "no hold: sent, as always");
+        assert_eq!((unheld.state, unheld.current, unheld.unlanded), (Sent, true, false), "no hold: sent, as always");
+        for hold in [ListingHold::Nothing, ListingHold::LastEra] {
+            assert!(!presence_status_with(Some(&written), Some("h8"), "n", Some(8), "a:1/0", 2, None, hold).unlanded, "{hold:?}");
+        }
+        let theirs = presence_status_with(Some(&void), Some("h8"), "another", Some(8), "a:1/0", 2, None, ListingHold::Unlanded);
+        assert_eq!((theirs.state, theirs.unlanded), (Unlisted, false), "not ours: nothing of ours to say did not land");
         assert_eq!(unheld, presence_status(Some(&void), Some("h8"), "n", Some(8), "a:1/0", 2, None));
         let seen = NodePublishMark { confirmed: true, chain_seen: true, ..written.clone() };
         assert_eq!(presence_state_with(Some(&seen), true, Some(8), "a:1/0", ListingHold::Unlanded), Listed, "only sent is changed");

@@ -161,6 +161,9 @@ function listedTitle(p: ChiaPresence): string {
 
 /** Why the listing is stale, and what happens next: the publisher's promise
  *  when the node reports nothing in the way, else the node's own words. A
+ *  listing of this edition with these addresses that did not make it into
+ *  the book, held by the hint rule until the next edition (`unlanded`), has
+ *  only the node's words: neither its edition nor its addresses changed. A
  *  node that writes its listing from burner keys says in its own words what
  *  its listing waits for: when this edition's goes out (at a random time in
  *  its first day, within about an hour, or within about 20 minutes of a
@@ -170,6 +173,7 @@ function listedTitle(p: ChiaPresence): string {
  *  the node reports nothing in the way, which on that path means the write
  *  is due now. */
 function outdatedReason(p: ChiaPresence, error: string | undefined): string {
+  if (p.unlanded) return error ?? "this edition's listing did not make it into the book";
   if (p.era === 0) return "no chain peak agreed yet, so this week's edition is unknown" + (error ? ` · ${error}` : '');
   if (p.listed_era !== p.era) {
     return `it is from edition ${p.listed_era} and this is edition ${p.era}` + (error ? ` · ${error}` : '; the new listing goes out shortly');

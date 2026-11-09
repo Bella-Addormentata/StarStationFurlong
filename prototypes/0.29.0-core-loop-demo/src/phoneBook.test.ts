@@ -134,6 +134,21 @@ describe('phoneBookIndicator', () => {
       expect(ind.title.endsWith('…')).toBe(false);
       expect(ind.opens).toBe('setnet');
     }
+    // A listing of this edition with these addresses that did not make it
+    // into the book, held by the hint rule (chia_publish.rs
+    // unlanded_hold_words): the node's words alone, since neither the
+    // edition nor the addresses changed, and whole.
+    for (const words of [
+      "this edition's listing, paid by the SSF wallet, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key",
+      "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the next edition's goes out from its own key",
+      "this edition's listing, paid by another key, did not make it into the book; one hint never has two payers, so the SSF wallet writes the next edition's",
+    ]) {
+      const ind = stale({ era: 8, listed_era: 8, unlanded: true, error: words });
+      expect(ind.title).toBe(`Phone Book listing outdated: ${words}`);
+      expect(ind.title.endsWith('…')).toBe(false);
+      expect(ind).toMatchObject({ state: 'outdated', colour: PHONE_BOOK_GREY, filled: true, opens: 'setnet' });
+    }
+    expect(stale({ era: 8, listed_era: 8, unlanded: true }).title).toBe("Phone Book listing outdated: this edition's listing did not make it into the book");
     // The burner path's budget and spend words, the same way.
     const spent = "this edition's write budget is spent; the next listing goes out in the next edition";
     expect(stale({ error: spent }).title).toBe(`Phone Book listing outdated: your addresses changed · ${spent}`);
