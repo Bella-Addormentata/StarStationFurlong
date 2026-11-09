@@ -3179,6 +3179,53 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     assert!(s.chain.unanswered().is_empty());
 }
 
+/// Stage 4 design §4.3, last week's listing held listed: a burner's listing
+/// for era 0 lands in the era's last block and is confirmed, and the era
+/// turns while it is still shallow. While era 1's first write waits for its
+/// slot, era 0's listing reads listed, and on the burner path the heartbeat
+/// judges it by its own era until it settles ([`listing_judged_era`]). A
+/// reorganization then drops its block: judged again, it is pending, its
+/// green goes, the readout no longer holds it, and the station counts as
+/// not listed last edition, so era 1's listing is due at once.
+#[tokio::test]
+async fn last_weeks_listing_a_shallow_reorg_drops_after_the_era_turns_is_no_longer_held_listed() {
+    let mut s = setup().await;
+    ready_dish(&s, 1).await;
+    let (w, node) = (wallet(73), iroh::SecretKey::generate());
+    let id = node.public().to_string();
+    s.chain.farm_to(ERA_BLOCKS - 2).await;
+    let at = unix_now();
+    let (hint, write) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let landed = s.chain.farm().await;
+    assert_eq!(chia_lane::era_of(landed), 0, "in era 0's last block");
+    let peak = s.chain.farm().await;
+    assert_eq!(chia_lane::era_of(peak), 1, "the era turned");
+    s.reconcile().await;
+    let sig = addrs_signature(&entries());
+    let sent = NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone());
+    assert_eq!(listing_judged_era(Some(&sent), 1, &id, true), Some(0), "judged by its own era");
+    assert_eq!(listing_judged_era(Some(&sent), 1, &id, false), None, "not with the SSF wallet paying");
+    let word = presence_standing_on(&s.lease, NET, &s.money, &sent).await;
+    let PresenceStep::Save(seen) = presence_step(&sent, word, 0, peak) else { panic!("confirmed: saved") };
+    assert!(seen.chain_seen && !seen.settled, "{seen:?}");
+
+    let hint1 = hex::encode(chia_lane::derive_ck_hint(NET, &CK, 1));
+    let held = presence_status_with(Some(&seen), Some(&hint1), &id, Some(1), &sig, 1, None, ListingHold::LastEra);
+    assert_eq!((held.state, held.listed_era), (crate::ChiaPresenceState::Listed, 0), "last week's listing, listed");
+
+    s.chain.reorg(2).await;
+    s.reconcile().await;
+    assert_eq!(listing_judged_era(Some(&seen), 1, &id, true), Some(0), "still unsettled: judged again");
+    let word = presence_standing_on(&s.lease, NET, &s.money, &seen).await;
+    let PresenceStep::Save(gone) = presence_step(&seen, word, 0, s.chain.peak()) else { panic!("its block is gone: saved pending") };
+    assert!(!gone.chain_seen && !gone.confirmed, "{gone:?}");
+    let after = presence_status_with(Some(&gone), Some(&hint1), &id, Some(1), &sig, 1, None, ListingHold::LastEra);
+    assert_eq!((after.state, after.current), (crate::ChiaPresenceState::Outdated, false), "no longer held listed");
+    let hint0 = hex::encode(hint);
+    assert!(!has_last_era_listing(Some(&gone), 1, &hint0, &id), "not listed last edition: era 1's listing is due at once");
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// Stage 4 design §8.3, a lost mark's write that the chain put in a block of
 /// the next era: wallet W's listing for era 0 goes out in the era's last
 /// block and lands in era 1's first, and the node stops before its mark is

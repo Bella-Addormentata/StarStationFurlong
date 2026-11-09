@@ -146,8 +146,9 @@ export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): Pho
  *  keeps last week's listing listed while this week's waits for its slot or
  *  its late start: readers scan this edition and the one before, so last
  *  week's is the listing they find. The node then sends `listed_era` as the
- *  edition before `era`. A node that pays from its SSF wallet never does, so
- *  its title is this week's. */
+ *  edition before `era`, edition 0 included. A node that pays from its SSF
+ *  wallet never does, so its title is this week's, as is any other edition
+ *  a readout names. */
 function listedTitle(p: ChiaPresence): string {
   const n = p.public_addrs;
   const addrs = n === 0
@@ -155,7 +156,7 @@ function listedTitle(p: ChiaPresence): string {
     : n === 1
       ? "your node's public address is on chain"
       : `your node's ${n} public addresses are on chain`;
-  if (p.listed_era !== 0 && p.listed_era !== p.era) return `Listed in last week's Phone Book: ${addrs} (edition ${p.listed_era})`;
+  if (p.era > 0 && p.listed_era === p.era - 1) return `Listed in last week's Phone Book: ${addrs} (edition ${p.listed_era})`;
   return `Listed in this week's Phone Book: ${addrs} (edition ${p.era})`;
 }
 

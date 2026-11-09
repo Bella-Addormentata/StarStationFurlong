@@ -77,6 +77,9 @@ describe('phoneBookIndicator', () => {
       .toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 8)");
     expect(phoneBookIndicator(withPresence({ era: 8, listed_era: 0 })).title)
       .toBe("Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 8)");
+    // Edition 0 is an edition like any other: in edition 1 its listing is last week's.
+    expect(phoneBookIndicator(withPresence({ era: 1, listed_era: 0 })).title)
+      .toBe("Listed in last week's Phone Book: your node's 2 public addresses are on chain (edition 0)");
   });
 
   it('is a green outline while the listing is sent and not yet read back', () => {

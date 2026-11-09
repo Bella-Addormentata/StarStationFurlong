@@ -2259,6 +2259,26 @@ fn era_start(era: u64) -> u64 {
     era.saturating_mul(u64::from(ERA_BLOCKS))
 }
 
+/// The era the heartbeat judges the listing on record by this tick
+/// ([`presence_step`]), or `None` when it judges nothing: this era's while
+/// it is unsettled ([`NodePublishMark::unsettled_for`]), and, on the burner
+/// path (`burner_path`), last era's while it is unsettled, since it reads
+/// listed while this era's first write waits for its slot or its late start
+/// ([`ListingHold::LastEra`], stage 4 design §4.3): a shallow
+/// reorganization that drops it after the era turned takes the green with
+/// it, and a station whose listing readers no longer find writes at once
+/// ([`has_last_era_listing`]). With the SSF wallet paying, last era's
+/// listing is not judged once the era turns, as on main: it never reads
+/// listed then.
+pub(crate) fn listing_judged_era(mark: Option<&NodePublishMark>, era: u64, node_id: &str, burner_path: bool) -> Option<u64> {
+    let m = mark?;
+    if m.unsettled_for(era, node_id) {
+        return Some(era);
+    }
+    let last = era.checked_sub(1).filter(|_| burner_path)?;
+    m.unsettled_for(last, node_id).then_some(last)
+}
+
 /// Was this station listed last era, as the newcomer exception of stage 4
 /// design §4.3 (T1) asks: is `mark` a write of era `era - 1`, ours under
 /// that era's hint `last_hint` and as `node_id` ([`mark_is_ours`]), and
@@ -2922,6 +2942,9 @@ pub fn presence_state(
 /// the chain (`chain_seen`), with the live address set up to the inbound
 /// flag a new era clears ([`sig_without_inbound`]), is *listed*: readers
 /// scan the current era and the one before, so it is the listing they find.
+/// The heartbeat judges it by its own era until it settles
+/// ([`listing_judged_era`]), so a reorganization that drops it clears its
+/// `chain_seen`, and it is no longer held.
 /// One the peers accepted but the watcher never read back is not held:
 /// *listed* is the chain's word alone, as it is for this era's. With
 /// [`ListingHold::Unlanded`], which the readout gives while the hint rule
@@ -4442,13 +4465,22 @@ pub async fn heartbeat_loop(
             // SETTLED_DEPTH deep, and a listing judged past its block that
             // lacks the coin returns it to pending, the green with it. Marked
             // final at its first sighting, a listing a shallow reorganization
-            // dropped would show green for the rest of the era.
-            if let Some(era) = era_now {
-                if let Some(m) = node_mark.as_ref().filter(|m| m.unsettled_for(era, &self_id)).cloned() {
+            // dropped would show green for the rest of the era. On the burner
+            // path last era's listing is judged by its own era too, until it
+            // settles, while it stands in for this era's
+            // ([`listing_judged_era`]).
+            if let Some(now) = era_now {
+                let judged = listing_judged_era(node_mark.as_ref(), now, &self_id, listing_root.is_some());
+                if let (Some(era), Some(m)) = (judged, node_mark.clone()) {
                     match presence_step(&m, presence_standing(&peak_client, &m).await, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
-                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; {}", write_again_words(net));
+                            let next = if era == now {
+                                write_again_words(net)
+                            } else {
+                                "this edition's listing is due at once, as for a station not listed last edition".to_string()
+                            };
+                            println!("⛓️ ChiaHub presence: the era {era} listing {why}; {next}");
                             let void = m.voided();
                             if let Err(e) = void.save(mark_path) {
                                 eprintln!("⛓️ ChiaHub presence: could not save {NODE_MARK_FILE}: {e}");
@@ -5524,6 +5556,38 @@ mod tests {
         let seen = clock.change.as_ref().expect("the change is due: a jitter is drawn");
         assert_eq!((seen.era, seen.due_peak), (e + 1, q), "the new era's own draw, from its own tick");
         assert_eq!(step, if seen.jitter == 0 { ListingStep::Write } else { ListingStep::Wait(ListingWait::Change) });
+    }
+
+    /// Stage 4 design §4.3: on the burner path last era's listing reads
+    /// listed while this era's first write waits for its slot, so the
+    /// heartbeat judges it by its own era until it settles, as it does this
+    /// era's; with the SSF wallet paying it is not judged once the era
+    /// turns, as on main.
+    #[test]
+    fn last_weeks_listing_is_judged_by_its_own_era_until_it_settles_only_on_the_burner_path() {
+        let mark = NodePublishMark {
+            era: 7,
+            writes: 1,
+            addrs_sig: "a:1/0".into(),
+            last_at: 1_791_700_000,
+            hint: "h7".into(),
+            coin_id: "11".repeat(32),
+            confirmed: true,
+            chain_seen: true,
+            spend: Some(3),
+            node_id: Some("n".into()),
+            ..NodePublishMark::default()
+        };
+        assert_eq!(listing_judged_era(Some(&mark), 7, "n", false), Some(7), "this era's, on either path");
+        assert_eq!(listing_judged_era(Some(&mark), 7, "n", true), Some(7));
+        assert_eq!(listing_judged_era(Some(&mark), 8, "n", true), Some(7), "last era's, on the burner path, by its own era");
+        assert_eq!(listing_judged_era(Some(&mark), 8, "n", false), None, "with the SSF wallet paying, as on main");
+        assert_eq!(listing_judged_era(Some(&mark), 9, "n", true), None, "two eras back: not read, not judged");
+        assert_eq!(listing_judged_era(Some(&mark), 8, "another", true), None, "another node id's");
+        assert_eq!(listing_judged_era(Some(&NodePublishMark { settled: true, ..mark.clone() }), 8, "n", true), None, "settled");
+        assert_eq!(listing_judged_era(Some(&mark.voided()), 8, "n", true), None, "void: nothing to judge");
+        assert_eq!(listing_judged_era(Some(&NodePublishMark { era: 0, ..mark.clone() }), 0, "n", true), Some(0));
+        assert_eq!(listing_judged_era(None, 8, "n", true), None);
     }
 
     /// Stage 4 design §10: the burner path's failure words say that last
