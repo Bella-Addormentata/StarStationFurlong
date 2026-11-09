@@ -8645,7 +8645,7 @@ mod tests {
                         // is free; now and then the processor is given up,
                         // so a reader that shares it can finish its read.
                         tries = tries.wrapping_add(1);
-                        if tries % 64 == 0 {
+                        if tries & 63 == 0 {
                             std::thread::yield_now();
                         } else {
                             std::hint::spin_loop();
