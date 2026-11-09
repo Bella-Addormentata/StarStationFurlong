@@ -3279,13 +3279,13 @@ async fn publish_memo(payer: &SecretKey, hint: Bytes32, body: Vec<u8>, what: &st
 /// gets the id of the coin the carrier will name as its PARENT — here the
 /// input, which a spend-to-self's new coin names (a burner's first write
 /// passes the gift g instead, `claim_write::burner_write_with`, stage 4
-/// design §4.1) — so a knock can bind its sealing to it
+/// design §4.1) — so a write can bind its sealing to it
 /// ([`chia_lane::seal_to_kx`], #272 review round 3). With a `gate`, `body`
-/// runs and the spend is pushed UNDER it: a
-/// knock's authorization is read again there, after the lease and coin
-/// lookups, so a room's word that changed while the spend was prepared is seen
-/// (`body` answers [`Withdrawn`]) and no cap can land between that check and
-/// the push — the card gate's own contract (#272 review round 5).
+/// runs and the spend is pushed UNDER it, as [`publish_memo_on`] does. Its
+/// one caller is [`publish_memo`], the beacon's, with no gate: the knock,
+/// whose authorization is read again under the card gate (#272 review round
+/// 5), reaches [`publish_memo_on`] through its own seam
+/// ([`publish_knock_on`]), on the network its caller names.
 ///
 /// It runs [`publish_memo_on`] on the process-wide lease, the process's
 /// network and money lane, and the wall clock, read where the lease is
@@ -3313,8 +3313,13 @@ async fn publish_memo_with(
 /// payer ([`WalletLease::outgoing_pending`], kept on purpose until the
 /// burner writers space their payers, stage 4 design §4.3 T4), then the
 /// payer's largest coin `lease` does not hold ([`find_spendable_coin_on`]).
-/// The spend is parked on `lease` under [`Payer::of`] `payer`, which the
-/// write names (§4.4).
+/// With a `gate`, `body` runs and the spend is pushed UNDER it: a knock's
+/// authorization is read again there ([`publish_knock_on`]), after the lease
+/// and coin lookups, so a room's word that changed while the spend was
+/// prepared is seen (`body` answers [`Withdrawn`]) and no cap can land
+/// between that check and the push — the card gate's own contract (#272
+/// review round 5). The spend is parked on `lease` under [`Payer::of`]
+/// `payer`, which the write names (§4.4).
 #[allow(clippy::too_many_arguments)]
 async fn publish_memo_on(
     lease: &WalletLease,
@@ -4261,6 +4266,17 @@ pub fn knock_leave(
 /// room's word at spend time, and [`Withdrawn`] writes nothing. Returns the
 /// hint and the write ([`MemoWrite`]: the input coin the knock is found again
 /// by). The hint and the seal are `net`'s ([`knock_hint`], [`knock_memo`]).
+///
+/// It runs [`publish_knock_on`] on the process-wide lease, the process's
+/// money lane and the wall clock, read where the lease is reconciled, as it
+/// always was, paid for by the SSF wallet's key `chia_sk`: the knock the
+/// heartbeat writes with burner keys off (stage 4 design §13 row 10). Its
+/// one caller passes the process's network, which the lease and the bundle
+/// were always written on. Building the lane's handle first reads nothing
+/// ([`crate::chia_chain::connect`] does no I/O), so the lease's checks,
+/// their order and their errors are the same as before. No test calls it:
+/// its lease and chain are the process's.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_knock(
     net: crate::chia_network::ChiaNet,
     iroh_sk: &iroh::SecretKey,
@@ -4272,24 +4288,157 @@ pub async fn publish_knock(
     era: u64,
     now: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
+    let client = crate::chia_chain::connect();
+    publish_knock_on(&WALLET_LEASE, net, &client, Instant::now, iroh_sk, chia_sk, gate, leave, req, room_key, era, now).await
+}
+
+/// [`publish_knock`] on a given lease, network, chain and clock (the tests'
+/// own on the mock chain): the knock sealed for `era` on `net` once its
+/// input coin is known ([`knock_memo`]), then written by [`publish_memo_on`]
+/// under `gate`, paid for by the wallet key `chia_sk`, which the write names
+/// as its payer ([`Payer::of`], stage 4 design §4.4). It keeps the money
+/// writer's checks in their order, the global one among them: while any
+/// spend on `lease` is parked, whatever its payer (a burner's knock or
+/// listing included), the knock waits ([`MemoWait::Settling`]). A knock the
+/// SSF wallet pays for has no write-once rule of its key's: the knock
+/// book's one knock per host per era (`KnockBook::knocked_this_era`) is its
+/// rule, as on main. `now` is read once, where the lease is reconciled.
+/// `now_unix` dates the knock.
+#[allow(clippy::too_many_arguments)]
+async fn publish_knock_on(
+    lease: &WalletLease,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    now: impl FnOnce() -> Instant,
+    iroh_sk: &iroh::SecretKey,
+    chia_sk: &SecretKey,
+    gate: &tokio::sync::Mutex<()>,
+    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    now_unix: u64,
+) -> Result<(Bytes32, MemoWrite)> {
     let hint = knock_hint(net, req, room_key, era);
     // Built and sealed once the input coin is known: its id is the parent of
     // the coin the knock rides on, and the sealing binds it (so the host opens
     // the knock under that coin alone — a copy under another never decodes,
     // #272 review round 3) and the lane token (so only a holder of the room
     // key can have written it, round 5).
-    let write = publish_memo_with(
+    let write = publish_memo_on(
+        lease,
+        net,
+        client,
+        now,
         chia_sk,
         hint,
         Some(gate),
         move |input| {
             let ck_from = leave()?;
-            knock_memo(net, iroh_sk, req, room_key, era, input, ck_from, now)
+            knock_memo(net, iroh_sk, req, room_key, era, input, ck_from, now_unix)
         },
         "knock",
     )
     .await?;
     Ok((hint, write))
+}
+
+/// The knock for `req` in `era` written from its own burner key K(h) (stage
+/// 4 design §3.2, §4.1, the knock row), on a given lease, gift fuse,
+/// network, chain, instant and random source (the tests' own on the mock
+/// chain): K(h) is `root`'s knock key for the knock's inbox hint h
+/// ([`knock_hint`], [`crate::chia_burner::BurnerRoot::knock`]), and the
+/// knock is written by the knock's writer (`claim_write::knock_write_with`)
+/// under the gift rules and the fuse (§5.2). K(h) writes once: its first
+/// write claims a lobby dish coin F in its own bundle, which funds it with
+/// the gift g, and the knock is sealed to g, its coin's parent, under
+/// `gate`, after the lease and coin lookups (#272 review round 5), with
+/// `leave` asked there as [`publish_knock`] asks it. A key that already
+/// wrote is `claim_write::AlreadyKnocked`, and nothing is written. The
+/// write names K(h) as its payer ([`Payer::of_burner`]), which the knock
+/// book files beside g and F ([`sent_knock_of`]), and the money key pays
+/// for nothing: no money payer is named, so the knock never waits on a
+/// spend of the SSF wallet's.
+///
+/// `root` must be `net`'s ([`crate::chia_burner::BurnerRoot::net`]): K(h)
+/// is derived from the inbox hint of the root's network and the knock is
+/// written under `net`'s, and the two are the same hint only on the same
+/// network (§3.5). A root of another network is refused before the lease or
+/// the chain is asked anything, so nothing is parked or sent.
+///
+/// The writer does not read the hint a parked spend writes under. A knock
+/// the SSF wallet wrote under the same hint before a restart that lost its
+/// entry (§8.3, the crash window) is kept from a second payer by the knock
+/// arm before it asks for a write, which files the entry again from the
+/// write the lease holds under the hint ([`lost_knock_entry`]).
+#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it, through publish_burner_knock
+#[allow(clippy::too_many_arguments)]
+async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &std::sync::Mutex<claim_write::GiftFuse>,
+    net: crate::chia_network::ChiaNet,
+    client: &impl ChainAccess,
+    at: Instant,
+    root: &crate::chia_burner::BurnerRoot,
+    iroh_sk: &iroh::SecretKey,
+    gate: &tokio::sync::Mutex<()>,
+    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    now_unix: u64,
+    rng: &mut R,
+) -> Result<(Bytes32, MemoWrite)> {
+    anyhow::ensure!(
+        root.net() == net,
+        "the knock's burner root is for {} and this write is on {}; nothing is written",
+        root.net().name(),
+        net.name()
+    );
+    let hint = knock_hint(net, req, room_key, era);
+    let key = root.knock(&hint.to_bytes(), era);
+    let write = claim_write::knock_write_with(
+        lease,
+        fuse,
+        net,
+        client,
+        at,
+        &key,
+        era,
+        hint,
+        Some(gate),
+        move |parent| {
+            let ck_from = leave()?;
+            knock_memo(net, iroh_sk, req, room_key, era, parent, ck_from, now_unix)
+        },
+        rng,
+    )
+    .await?;
+    Ok((hint, write))
+}
+
+/// [`publish_knock_with`] on the node's own lease and gift fuse
+/// ([`WALLET_LEASE`], `claim_write::GIFT_FUSE`), the money lane's chain
+/// ([`crate::chia_chain::connect`], two agreeing peers, as the burner's
+/// writer takes it: stage 4 design §10), the wall clock and the OS random
+/// source: the knock the heartbeat writes from K(h) with burner keys on
+/// (§13 row 10). No test calls it: its lease, fuse and chain are the
+/// process's.
+#[allow(dead_code)] // until the knock arm calls it
+#[allow(clippy::too_many_arguments)]
+async fn publish_burner_knock(
+    net: crate::chia_network::ChiaNet,
+    root: &crate::chia_burner::BurnerRoot,
+    iroh_sk: &iroh::SecretKey,
+    gate: &tokio::sync::Mutex<()>,
+    leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    now_unix: u64,
+) -> Result<(Bytes32, MemoWrite)> {
+    let client = crate::chia_chain::connect();
+    publish_knock_with(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now(), root, iroh_sk, gate, leave, req, room_key, era, now_unix, &mut rand::rngs::OsRng).await
 }
 
 /// The hint a knock for `req` is filed under in `era` on `net`: the host's
@@ -4323,6 +4472,79 @@ pub fn sent_knock_of(req: &KnockRequest, era: u64, hint: Bytes32, write: &MemoWr
         parked: hex::encode(write.coins.parked.to_bytes()),
         payer: Some(write.payer.hex()),
     }
+}
+
+/// The knock book's entry for a knock the lease still holds under `hint`,
+/// the inbox hint of `req` in `era` ([`knock_hint`]), whose entry a stop
+/// lost: `held` is the write the lease holds under it
+/// ([`WalletLease::held_write_under`]), parked with its saved bundle or
+/// settling, and `None` when it holds none. The heartbeat saves
+/// `knocks.json` after the push returns, while the lease parks the spend and
+/// saves its bundle before the push (stage 4 design §4.4), so a node that
+/// stops in between restarts with the knock in its lease and not in its
+/// book. Started again on the other path (burner keys turned on or off in
+/// the middle of the era), the next knock to that host would go out from
+/// the other payer under the same inbox hint, the link §8.3 forbids. On the
+/// burner path K(h)'s own knock would read as already written
+/// (`claim_write::AlreadyKnocked`) and never be filed, so this node would
+/// never dial the host at its confirmation height. So the entry is filed
+/// again, exactly as [`sent_knock_of`] files a write: the request's
+/// host and room, the era and the hint, the write's parent as its coin id
+/// and its parked input beside it (the gift g and the dish coin F for a
+/// burner's first write, §4.1), the digest of the record its coin carries,
+/// the lease's number for its spend, the payer the lease parked it under
+/// (`None` when none was filed, which counts as the SSF wallet's), and
+/// `now_unix` as the time it was pushed. The arm then writes nothing for
+/// the request, uses none of its attempts, and the book's rule of one knock
+/// per host per era holds the host from then on.
+///
+/// `writer_payer` is the payer the path writes the knock with, K(h) on the
+/// burner path (`burner_path`) and the SSF wallet on the money path. On the
+/// burner path a held write from any payer is filed: the SSF wallet's, from
+/// before burner keys were turned on, or K(h)'s own, whose key would only
+/// read `claim_write::AlreadyKnocked` once it lands. On the money path only
+/// a held write another payer paid for is filed (burner keys turned off
+/// after a stop); one `writer_payer` paid for, or one with no payer filed,
+/// is left to main's rule, as on main, where the global check holds the
+/// knock while the spend is parked and the book's "one early knock at
+/// worst" stands (`KnockBook::load`). A write the lease has forgotten, or
+/// whose bundle was not saved, is not found, and nothing is filed: the
+/// window is closed for as long as the lease remembers the spend, until the
+/// chain settles it [`crate::chia_knock::SETTLED_DEPTH`] deep.
+///
+/// The heartbeat asks it only on a test network, where knocks are written,
+/// and only for a request it does not skip ([`knock_skipped`]): a host the
+/// book holds a knock on this era already has its entry.
+#[cfg_attr(not(test), allow(dead_code))] // until the knock arm calls it
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lost_knock_entry(
+    held: Option<HeldWrite>,
+    writer_payer: &Payer,
+    burner_path: bool,
+    req: &KnockRequest,
+    hint: Bytes32,
+    era: u64,
+    now_unix: u64,
+) -> Option<SentKnock> {
+    let held = held?;
+    if !burner_path && held.payer.is_none_or(|paid_by| paid_by == *writer_payer) {
+        return None;
+    }
+    Some(SentKnock {
+        host: req.host.clone(),
+        room: req.room.clone(),
+        era,
+        hint: hex::encode(hint.to_bytes()),
+        coin_id: hex::encode(held.coins.parent.to_bytes()),
+        memo: hex::encode(crate::chia_resolve::memo_digest(&held.record).to_bytes()),
+        pushed_at: now_unix,
+        confirmed_height: 0,
+        last_rendezvous: 0,
+        settled: false,
+        spend: Some(held.spend),
+        parked: hex::encode(held.coins.parked.to_bytes()),
+        payer: held.payer.map(|p| p.hex()),
+    })
 }
 
 /// The memo a knock for `req` carries on `net` once its input coin `input`
@@ -9151,6 +9373,68 @@ mod tests {
                         assert_eq!(found, ChainKnocked::default(), "{case}: no host noted");
                     }
                 }
+            }
+        }
+    }
+
+    /// Stage 4 design §8.3, the crash window, for knocks
+    /// ([`lost_knock_entry`]): with no write held under the knock's hint
+    /// nothing is filed. On the burner path a held write is filed whoever
+    /// paid for it: the SSF wallet, no payer filed (the SSF wallet's too), or
+    /// K(h). On the SSF wallet's path only another payer's is filed, and the
+    /// wallet's own, or one with no payer filed, is left to main's rule. A
+    /// write held settling is filed as a parked one is. An entry filed is the
+    /// write whole, as `sent_knock_of` files one: the request's host and
+    /// room, the era and the hint, the parent as its coin id and the parked
+    /// input beside it, the digest of the record, the lease's number for the
+    /// spend, the payer as the lease filed it, the time given, and a clock
+    /// not started.
+    #[test]
+    fn a_knock_the_lease_holds_under_its_hint_is_filed_again_on_the_burner_path_from_any_payer_and_on_the_money_path_only_from_another() {
+        let req = KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts: 0 };
+        let (hint, now_unix) = (Bytes32::new([5; 32]), 1_700_000_000);
+        let wallet = SecretKey::from_seed(&[9; 32]);
+        let money = Payer::of(&wallet);
+        let root = crate::chia_burner::BurnerRoot::of(&crate::chia_burner::MoneyKey::new(wallet.clone()), crate::chia_network::ChiaNet::Testnet11);
+        let knock = Payer::of_burner(&root.knock(&hint.to_bytes(), 4));
+        let held = |payer: Option<Payer>, spent_at: Option<u32>| HeldWrite {
+            coins: WriteCoins { parent: Bytes32::new([2; 32]), parked: Bytes32::new([3; 32]) },
+            spend: 7,
+            record: b"a sealed knock".to_vec(),
+            payer,
+            spent_at,
+        };
+        let filed = |payer: Option<Payer>| SentKnock {
+            host: "H".into(),
+            room: "r".into(),
+            era: 4,
+            hint: hex::encode([5u8; 32]),
+            coin_id: hex::encode([2u8; 32]),
+            memo: hex::encode(crate::chia_resolve::memo_digest(b"a sealed knock").to_bytes()),
+            pushed_at: now_unix,
+            confirmed_height: 0,
+            last_rendezvous: 0,
+            settled: false,
+            spend: Some(7),
+            parked: hex::encode([3u8; 32]),
+            payer: payer.map(|p| p.hex()),
+        };
+        for (burner_path, writer) in [(true, knock), (false, money)] {
+            assert_eq!(lost_knock_entry(None, &writer, burner_path, &req, hint, 4, now_unix), None, "nothing held, burner path {burner_path}");
+        }
+        let rows = [
+            (true, Some(money), "the SSF wallet", true),
+            (true, None, "no payer filed", true),
+            (true, Some(knock), "K(h)", true),
+            (false, Some(money), "the SSF wallet", false),
+            (false, None, "no payer filed", false),
+            (false, Some(knock), "K(h)", true),
+        ];
+        for (burner_path, paid_by, who, files) in rows {
+            let writer = if burner_path { knock } else { money };
+            for spent_at in [None, Some(12)] {
+                let got = lost_knock_entry(Some(held(paid_by, spent_at)), &writer, burner_path, &req, hint, 4, now_unix);
+                assert_eq!(got, files.then(|| filed(paid_by)), "burner path {burner_path}, paid by {who}, spent at {spent_at:?}");
             }
         }
     }
