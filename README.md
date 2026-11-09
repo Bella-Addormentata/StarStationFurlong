@@ -150,8 +150,8 @@ Third-party pieces bundled here keep their own licenses, which the WTFPL does no
 replace:
 
 * The arcade's NES homebrew games and the emulators it ships (jsnes, EmulatorJS and
-  its cores) are under GPL, zlib, CC BY, MPL and non-commercial terms, listed game by
-  game and core by core in
+  its cores) are under Apache-2.0, GPL, zlib, CC BY, MPL and non-commercial terms,
+  listed game by game and core by core in
   [`public/arcade/README.md`](prototypes/0.29.0-core-loop-demo/public/arcade/README.md),
   with the texts in [`public/arcade/licenses/`](prototypes/0.29.0-core-loop-demo/public/arcade/licenses/).
 * The party speaker's recordings are CC BY-SA 3.0 and CC0, credited in
