@@ -1439,6 +1439,46 @@ mod tests {
         assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "spent coins asked for, so the spend can be seen");
     }
 
+    /// [`unspent_at`] is [`records_at`]'s one listing filtered to its unspent
+    /// coins ([`Unspent::of`]), with the listing's `partial` passed on whole.
+    /// A listing cut short with no cursor, and one still cut short once
+    /// [`MAX_FAUCET_PAGES`] pages are in, read as partial from both, so the
+    /// wallet view's fail-closed guard and the dish's note of a partial
+    /// listing (#245 review) still see the cut; a whole listing, its cursor
+    /// followed, reads as whole. Both ask the chain for the same pages and
+    /// keep the same unspent coins.
+    #[tokio::test]
+    async fn a_listing_cut_short_reads_as_partial_from_unspent_at_as_from_records_at() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::{CoinListing, CoinRecord};
+        let ph = Bytes32::new([9u8; 32]);
+        let coin = |seed: u8| Coin::new(Bytes32::new([seed; 32]), ph, u64::from(seed));
+        let rec = |c: Coin, spent: bool| CoinRecord { coin: c, confirmed_block_index: 80, spent, spent_block_index: if spent { 81 } else { 0 } };
+        // One unspent coin and one spent coin a page.
+        let listing = |n: u8, truncated: bool, cursor: bool| CoinListing {
+            records: vec![rec(coin(n), false), rec(coin(n + 100), true)],
+            truncated,
+            next_cursor: cursor.then(|| format!("page-{n}")),
+            judged_at: None,
+        };
+        let budget = MAX_FAUCET_PAGES as u8;
+        let rows: Vec<(&str, Vec<CoinListing>, usize, bool)> = vec![
+            ("a whole listing, its cursor followed", vec![listing(1, true, true), listing(2, false, false)], 2, false),
+            ("cut short with no cursor", vec![listing(1, true, false)], 1, true),
+            ("still cut short past the page budget", (1..=budget + 1).map(|n| listing(n, true, true)).collect(), MAX_FAUCET_PAGES, true),
+        ];
+        for (what, pages, asked, partial) in rows {
+            let (by_records, by_unspent) = (Scripted::new(pages.clone()), Scripted::new(pages));
+            let (records, cut) = records_at(&by_records, ph).await.unwrap();
+            let got = unspent_at(&by_unspent, ph).await.unwrap();
+            assert_eq!((cut, got.partial), (partial, partial), "{what}");
+            assert_eq!(got.coins.len(), asked, "{what}: one unspent coin a page read");
+            assert_eq!(got.coins, Unspent::of(&records, cut).coins, "{what}: the same unspent coins");
+            assert_eq!(*by_unspent.asked_spent.lock().unwrap(), vec![true; asked], "{what}: the pages read, spent coins asked for");
+            assert_eq!(*by_records.asked_spent.lock().unwrap(), vec![true; asked], "{what}: the same pages");
+        }
+    }
+
     /// The mod hash is the one origin/main's code gave before the network
     /// tag (247bc685): the tag goes into the curried room tag alone, never
     /// into the module (stage 4 design §3.5).
