@@ -820,6 +820,12 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// knock whose entry the node lost is filed again only from the write the
 /// lease still holds under its hint (`chia_publish::lost_knock_entry`).
 ///
+/// K(h) is the knock's own key for its host, room and era
+/// (`chia_publish::knock_burner`): its inbox hint bound to the host's node
+/// id, so two hosts whose cards name one contact key, and so share the
+/// hint, have a key each, and neither's knock makes the other's read as
+/// [`AlreadyKnocked`].
+///
 /// Twins, the same words on two machines, derive the same K(h) for a host,
 /// room and era (§3.3's twins property holds for P(e), not for K(h)). One
 /// after the other, the second reads [`AlreadyKnocked`]. At the same time
@@ -1772,8 +1778,8 @@ mod tests {
         assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing pushed");
     }
 
-    /// The `n`th test knock key on `net`: K(h) of the inbox hint `[n; 32]`
-    /// in era 0, so each `n` is another knock.
+    /// The `n`th test knock key on `net`: the root's knock key of the 32
+    /// bytes `[n; 32]` in era 0, so each `n` is another knock.
     fn knock(net: ChiaNet, n: u8) -> BurnerKey {
         BurnerRoot::of(&money(), net).knock(&[n; 32], 0)
     }
