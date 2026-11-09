@@ -870,9 +870,13 @@ impl WalletLease {
     /// listing's or a knock's hint but the heartbeat, which is the caller
     /// and writes one at a time, and a reconciliation only moves or forgets
     /// the spends the view saw. So no write the view missed is held when the
-    /// writer is asked. The gate is a `tokio` mutex, which is not reentrant:
-    /// a caller that already holds it would wait on itself here forever, so
-    /// it reads through [`Self::held_writes_under_locked`] instead.
+    /// writer is asked. A knock's writer does not rest on that alone: under
+    /// the gate it writes under, it reads the lease again and does not write
+    /// beside a write of the SSF wallet's under its hint
+    /// (`claim_write::BurnerWait::MoneyUnderHint`). The gate is a `tokio`
+    /// mutex, which is not reentrant: a caller that already holds it, as
+    /// that writer does, would wait on itself here forever, so it reads
+    /// through [`Self::held_writes_under_locked`] instead.
     pub(crate) async fn held_writes_under(&self, hint: Bytes32) -> Vec<HeldWrite> {
         let _gate = self.lock().await;
         self.held_writes_under_locked(hint)
@@ -888,9 +892,10 @@ impl WalletLease {
     }
 
     /// [`Self::held_writes_under`]'s read, for a caller that holds the
-    /// lease's gate ([`Self::lock`]): the read is one view of the lease only
-    /// under the gate, since it reads the parking and the settling spends
-    /// one after the other.
+    /// lease's gate ([`Self::lock`]), as a knock's writer does
+    /// (`claim_write::knock_write_with`): the read is one view of the lease
+    /// only under the gate, since it reads the parking and the settling
+    /// spends one after the other.
     fn held_writes_under_locked(&self, hint: Bytes32) -> Vec<HeldWrite> {
         // A spend's number, the inputs the lease parks for it, its bundle,
         // its payer, and the height the chain spent it at once it settles.
@@ -4479,7 +4484,7 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
         }
     }
     let (hint, write) = match root {
-        Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,
+        Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, Payer::of(chia_sk), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,
         None => publish_knock_on(lease, net, client, now, iroh_sk, chia_sk, gate, leave, req, room_key, era, now_unix).await?,
     };
     Ok(KnockDone::Written { hint, write, from_burner: root.is_some() })
@@ -4557,8 +4562,8 @@ async fn publish_knock_on(
 /// `claim_write::AlreadyKnocked`, and nothing is written. The write names
 /// K(h) as its payer ([`Payer::of_burner`]), which the knock book files
 /// beside its coins ([`sent_knock_of`]), and the money key pays for
-/// nothing: no money payer is named, so the knock never waits on a spend
-/// of the SSF wallet's.
+/// nothing: the knock never waits on a spend of the SSF wallet's in flight,
+/// and its payer `money` is asked of the knock's hint alone (below).
 ///
 /// `root` must be `net`'s ([`crate::chia_burner::BurnerRoot::net`]): K(h)
 /// is derived from the inbox hint of the root's network and the knock is
@@ -4566,12 +4571,15 @@ async fn publish_knock_on(
 /// network (§3.5). A root of another network is refused before the lease or
 /// the chain is asked anything, so nothing is parked or sent.
 ///
-/// The writer does not read the hint a parked spend writes under. A knock
-/// the SSF wallet wrote under the same hint before a restart that lost its
-/// entry (§8.3, the crash window) is kept from a burner beside it by the
-/// knock arm's step before it asks for a write ([`knock_on_path`]), which
-/// files the entry again from the write the lease holds under the hint
-/// ([`lost_knock_entry`]).
+/// A knock the SSF wallet wrote under the same hint before a restart that
+/// lost its entry (§8.3, the crash window) is kept from a burner beside it
+/// by the knock arm's step before it asks for a write ([`knock_on_path`]),
+/// which files the entry again from the write the lease holds under the
+/// hint ([`lost_knock_entry`]). The writer checks it again under the gate
+/// it writes under: a write `money`, the SSF wallet's payer, paid for, or
+/// one with no payer filed, held under the hint is
+/// `claim_write::BurnerWait::MoneyUnderHint`, a wait, and nothing is
+/// written.
 #[allow(clippy::too_many_arguments)]
 async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -4580,6 +4588,7 @@ async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
     client: &impl ChainAccess,
     at: Instant,
     root: &crate::chia_burner::BurnerRoot,
+    money: Payer,
     iroh_sk: &iroh::SecretKey,
     gate: &tokio::sync::Mutex<()>,
     leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
@@ -4612,6 +4621,7 @@ async fn publish_knock_with<R: rand::Rng + ?Sized + Send>(
             knock_memo(net, iroh_sk, req, room_key, era, parent, ck_from, now_unix)
         },
         rng,
+        money,
     )
     .await?;
     Ok((hint, write))
@@ -9522,6 +9532,7 @@ mod tests {
             ("no lobby coin for a burner", BurnerWait::NoCoinReady.into()),
             ("the fuse blown", BurnerWait::FuseBlown { era: 3 }.into()),
             ("a burner's first write behind the SSF wallet's spend", BurnerWait::MoneyInFlight.into()),
+            ("a knock's key beside the SSF wallet's knock under its hint", BurnerWait::MoneyUnderHint.into()),
             ("no dish coin ready", claim_to(T11, &Scripted::new(vec![empty_dish]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
             ("no peak for the dish", claim_to(T11, &Unanswering, nobody, |_| false, &mut rng).await.unwrap_err()),
             ("the dish's listing unread", claim_to(T11, &Scripted::new(vec![]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),

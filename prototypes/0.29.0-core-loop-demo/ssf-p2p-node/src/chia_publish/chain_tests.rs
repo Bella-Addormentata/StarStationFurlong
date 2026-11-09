@@ -346,8 +346,10 @@ impl Setup {
     /// [`knock_key`]), by the knock's own seam ([`publish_knock_with`]) on
     /// the test's lease, fuse, network and chain, at the next instant
     /// ([`Self::later`]), under a card gate of its own, with the room's word
-    /// at spend time `leave` and the random source seeded by `seed`: the
-    /// knock the heartbeat writes with burner keys on. It is dated now. Its
+    /// at spend time `leave` and the random source seeded by `seed`, and
+    /// with test wallet `wallet`'s key as the SSF wallet's, beside whose
+    /// writes under the hint K(h) does not write: the knock the heartbeat
+    /// writes with burner keys on. It is dated now. Its
     /// future is checked to be `Send`, as the heartbeat's task needs it to
     /// be.
     async fn knock(
@@ -362,7 +364,7 @@ impl Setup {
         let at = self.later();
         let (root, gate) = (root(wallet), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(publish_knock_with(&self.lease, &self.fuse, NET, &self.money, at, &root, node, &gate, leave, req, &ROOM_KEY, era, unix_now(), &mut rng)).await
+        sendable(publish_knock_with(&self.lease, &self.fuse, NET, &self.money, at, &root, Payer::of(&self::wallet(wallet)), node, &gate, leave, req, &ROOM_KEY, era, unix_now(), &mut rng)).await
     }
 
     /// `node`'s knock for `req` in `era`, paid for by the wallet key `payer`,
@@ -4169,7 +4171,7 @@ async fn a_knock_with_a_burner_root_of_another_network_is_refused_and_writes_not
         let root = BurnerRoot::of(&MoneyKey::new(w.clone()), other);
         let at = s.later();
         let mut rng = StdRng::seed_from_u64(1);
-        let refused = publish_knock_with(&s.lease, &s.fuse, NET, &s.money, at, &root, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng)
+        let refused = publish_knock_with(&s.lease, &s.fuse, NET, &s.money, at, &root, Payer::of(&w), &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng)
             .await
             .err()
             .expect("a root of another network is refused");
@@ -4344,9 +4346,10 @@ async fn the_knock_arms_step_writes_from_its_own_burner_key_on_the_burner_path_a
 /// path: on the burner path it keeps its dial-back, and on the SSF wallet's
 /// path (burner keys turned off after a stop) it is another payer's, which
 /// W must not write beside. A lease that has forgotten a write files
-/// nothing. Without the step the writer does not read the hint: asked for
-/// the knock W's write holds the hint of, K(h) writes under it beside W,
-/// the second payer the step keeps off it.
+/// nothing. Asked alone, without the step, the burner's writer does not
+/// write beside W either: it reads the lease under its own gate as it
+/// writes and waits (`BurnerWait::MoneyUnderHint`), sending nothing and
+/// counting no gift.
 #[tokio::test]
 async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_lease_holds_under_its_hint() {
     let mut s = setup().await;
@@ -4417,10 +4420,11 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     }
     assert_eq!(lost_knock_entry(WalletLease::new().held_writes_under(hint2).await, || Payer::of_burner(&key2), &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
 
-    let before = s.sent();
-    let (beside, unguarded) = s.knock(91, &node, &req, 0, || Ok(None), 5).await.expect("the writer alone does not read the hint");
-    let bundle = s.chain.received().last().cloned().expect("K(h)'s knock was sent");
-    assert_eq!((beside, unguarded.payer), (hint, Payer::of_burner(&key)), "K(h), under the hint W's knock holds");
-    assert!(spends_at(&bundle, key.puzzle_hash()) && !before.contains(&bundle.name()), "a second payer's write under the hint");
+    let (before, gifts) = (s.sent(), s.gifts(0));
+    let alone = s.knock(91, &node, &req, 0, || Ok(None), 5).await.map(|(_, write)| write);
+    assert_eq!(waited(&alone), Some(BurnerWait::MoneyUnderHint), "the writer's own check, under the hint W's knock holds");
+    assert_eq!(s.sent(), before, "nothing sent");
+    assert_eq!(s.gifts(0), gifts, "no gift counted");
+    assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
     assert!(s.chain.unanswered().is_empty());
 }
