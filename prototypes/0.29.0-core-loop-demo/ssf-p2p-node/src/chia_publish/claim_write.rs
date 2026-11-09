@@ -38,6 +38,7 @@
 //! a test network and reads it back through its ephemeral parent
 //! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -899,12 +900,19 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
     if parents.is_empty() {
         return Ok(());
     }
-    let mut found: Vec<CoinRecord> = Vec::new();
+    // Where each coin the lookup returns sits, by its id, hashed once as its
+    // page comes in, so each parent is one map lookup: the check stays
+    // linear in the coins at the key, whose distinct parents anyone can
+    // multiply by paying the key strays of 1 mojo, while it holds the lease's
+    // gate. A coin's id hashes its puzzle hash in, so a coin returned twice
+    // (on two pages) names the same place either time, as the first copy a
+    // scan would find does.
+    let mut found: HashMap<Bytes32, Bytes32> = HashMap::new();
     let mut cursor: Option<String> = None;
     let mut whole = false;
     for _ in 0..MAX_FAUCET_PAGES {
         let listing = client.coin_records_by_names(parents.clone(), true, cursor.take()).await.map_err(CoinLookupFailed)?;
-        found.extend(listing.records);
+        found.extend(listing.records.iter().map(|r| (r.coin.coin_id(), r.coin.puzzle_hash)));
         match listing.next_cursor {
             Some(next) if listing.truncated => cursor = Some(next),
             _ => {
@@ -913,7 +921,7 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
             }
         }
     }
-    let parent_at = |parent: &Bytes32| found.iter().find(|r| r.coin.coin_id() == *parent).map(|r| r.coin.puzzle_hash);
+    let parent_at = |parent: &Bytes32| found.get(parent).copied();
     if parents.iter().any(|parent| parent_at(parent) == Some(burner_ph)) {
         Err(AlreadyKnocked.into())
     } else if parents.iter().all(|parent| parent_at(parent).is_some()) {
