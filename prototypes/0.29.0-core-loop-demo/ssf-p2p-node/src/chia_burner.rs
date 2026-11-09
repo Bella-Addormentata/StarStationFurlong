@@ -172,22 +172,24 @@ impl BurnerRoot {
     }
 
     /// K(h) of §3.2: the key of one knock, key(2, e, ·) of the 32 bytes the
-    /// caller gives in `inbox_hint`. The knock writer gives the knock's slot
-    /// (`chia_publish::knock_slot`): the hint the knock is written under in
-    /// `era`, `chia_lane::derive_inbox_hint(net, ck_host, lane, era)` on the
-    /// root's network, bound to the host's node id. So it is one key per
-    /// host and room per era (§3.1, Slots): the room's lane is in the hint,
-    /// and a knock to the same host for another room has another key; and
-    /// two hosts whose cards name one contact key, and so share the hint,
-    /// have a key each, where §3.2's K(h) = key(2, e, h) would give them one
-    /// between them, which writes once. The derivation here is §3.2's line,
-    /// unchanged, and its vectors are pinned on the bytes it is given.
-    pub fn knock(&self, inbox_hint: &[u8; 32], era: u64) -> BurnerKey {
+    /// caller gives in `slot`, the knock's slot in §3.1's sense (the Slots
+    /// table: what one key serves), not §3.2's slot(k, e) ([`Self::slot`]).
+    /// The knock writer gives `chia_publish::knock_slot`, not the inbox hint
+    /// itself: the hint the knock is written under in `era`,
+    /// `chia_lane::derive_inbox_hint(net, ck_host, lane, era)` on the root's
+    /// network, bound to the host's node id. So it is one key per host and
+    /// room per era: the room's lane is in the hint, and a knock to the same
+    /// host for another room has another key; and two hosts whose cards
+    /// name one contact key, and so share the hint, have a key each, where
+    /// §3.2's K(h) = key(2, e, h) would give them one between them, which
+    /// writes once. The derivation here is §3.2's line, unchanged, and its
+    /// vectors are pinned on the bytes it is given.
+    pub fn knock(&self, slot: &[u8; 32], era: u64) -> BurnerKey {
         // §3.2: K(h) = key(2, e, h) with h = derive_inbox_hint(ck_host, lane, e);
         // the knock writer passes h bound to the host's node id
         // (`chia_publish::knock_slot`). The caller gives its bytes, already
         // on its network (§3.5), so this line takes no network of its own.
-        self.key(KIND_KNOCK, era, inbox_hint)
+        self.key(KIND_KNOCK, era, slot)
     }
 
     /// slot(k, e) of §3.2: how many blocks into era `era` the first write of

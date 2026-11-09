@@ -2029,7 +2029,10 @@ mod tests {
     /// note the host: nothing is sent or counted. A parent the cut lookup
     /// did return at the key is already knocked all the same, and a cursor
     /// the lookup gives is followed, so a parent elsewhere on its second
-    /// page lets the knock go out from the coin, with no gift.
+    /// page lets the knock go out from the coin, with no gift. Every page's
+    /// coins count: two lone coins whose parents come on two pages are both
+    /// judged, and a parent at the key on a first page is already knocked
+    /// though the second page is cut short.
     #[tokio::test]
     async fn a_lone_coins_parent_left_out_of_a_lookup_cut_short_is_a_wait_and_one_past_its_cursor_is_read() {
         use crate::chia_chain::testing::Scripted;
