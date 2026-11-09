@@ -33,7 +33,7 @@ use clvmr::Allocator;
 use serde::{Deserialize, Serialize};
 
 use crate::chia_contact::InboundVerified;
-use crate::chia_knock::{KnockRequest, SentKnock};
+use crate::chia_knock::{KnockBook, KnockRequest, SentKnock};
 use crate::chia_resolve::{LeaseWord, WriteCoins};
 use crate::chia_lane::{self, AddrEntry, BeaconV2, ChiaPresenceRecord, KnockV2, PresenceV2, ERA_BLOCKS, ERA_SECS, KIND_KNOCK, KIND_PRESENCE};
 use crate::chia_rooms::ChiaRoomCap;
@@ -3475,7 +3475,11 @@ pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
 /// [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]); every other failure, a push
 /// the peers refused among them, is one ([`knock_attempt_counts`]). A push
 /// refused because the chain is busy ([`chain_busy`]) is such a refusal, and
-/// uses one (§10: a first push refused for its fee is a rejection).
+/// uses one (§10: a first push refused for its fee is a rejection). A knock
+/// withdrawn at spend time ([`Withdrawn`]), or found already written by its
+/// own key (`claim_write::AlreadyKnocked`, §4.1, the knock row), uses none
+/// either way: it is dropped with one line, not tried again
+/// ([`knock_not_written`]).
 pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 
 /// Whether `e` is a wait rather than a failure (stage 4 design §5.2, §10):
@@ -3497,7 +3501,12 @@ pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 /// Nothing else is a wait: a push every peer refused
 /// ([`PushError::Rejected`], a lost race among them), a body that could not
 /// be built or sealed, a builder's error or a broken burner rule
-/// (`claim_write::BurnerRule`), a refused claim, and anything untyped.
+/// (`claim_write::BurnerRule`), a refused claim, and anything untyped. Nor
+/// is a knock whose own key already wrote (`claim_write::AlreadyKnocked`,
+/// §4.1, the knock row), which is no `BurnerWait`: tried again, it reads the
+/// same records under the same key. It never reaches [`knock_failed`], which
+/// would count it as an attempt and queue it again: [`knock_not_written`]
+/// drops it first.
 fn is_typed_wait(e: &anyhow::Error) -> bool {
     use crate::chia_faucet::{ClaimToError, CoinLookupFailed};
     e.chain().any(|cause| {
@@ -3708,6 +3717,125 @@ fn knock_failed(burners: bool, mut req: KnockRequest, e: &anyhow::Error, now: In
             req.attempts
         );
     }
+}
+
+/// The first `claim_write::AlreadyKnocked` in `e`'s chain, if any: a knock
+/// whose own key K(h) already wrote this era (stage 4 design §4.1, the knock
+/// row: K(h) is never spent again). It is read through the whole chain, so
+/// a writer's context around it still finds it.
+fn already_knocked(e: &anyhow::Error) -> Option<&claim_write::AlreadyKnocked> {
+    e.chain().find_map(|cause| cause.downcast_ref::<claim_write::AlreadyKnocked>())
+}
+
+/// The one line the knock arm prints for a knock that is not written and is
+/// not tried again, or `None` for every other error, which goes to
+/// [`knock_failed`] ([`knock_not_written`]). There are two such knocks:
+/// - one [`Withdrawn`] at spend time (#272 review round 5): the room's word
+///   changed while the spend was prepared. Its line is the one the knock arm
+///   always gave it, word for word, and it is read as the arm always read
+///   it, from the error itself;
+/// - one whose own key K(h) already wrote this era
+///   (`claim_write::AlreadyKnocked`, stage 4 design §4.1, the knock row; §9:
+///   a coin K(h) wrote means "already knocked"). It uses no attempt, and this
+///   run does not knock on that host again this era ([`ChainKnocked`]); a
+///   restart reads the key's coins again and gets the same answer.
+///
+/// Each line names the host by its shortened node id ([`short`]) and the
+/// room, and no key, puzzle hash or address: `AlreadyKnocked`'s text names
+/// none.
+fn knock_dropped_line(req: &KnockRequest, e: &anyhow::Error) -> Option<String> {
+    if e.downcast_ref::<Withdrawn>().is_some() {
+        return Some(format!(
+            "⛓️ ChiaHub knock: not knocking on {} for room {} — {e} (the room's word changed while the spend was prepared)",
+            short(&req.host),
+            req.room
+        ));
+    }
+    already_knocked(e).map(|already| {
+        format!(
+            "⛓️ ChiaHub knock: not knocking on {} for room {} — {already} (no attempt used; this host is not knocked on again this era by this run)",
+            short(&req.host),
+            req.room
+        )
+    })
+}
+
+/// The hosts this run found its own knock already written to in one era
+/// (`claim_write::AlreadyKnocked`, stage 4 design §9), so that the knock arm
+/// skips them for the rest of that era ([`knock_skipped`]): the next dial
+/// exhaustion queues the knock again, and without this each one would read
+/// K(h)'s coins again only to find the same answer. It is per host,
+/// whatever the room, as the knock book's rule of one knock per host per era
+/// is (`KnockBook::knocked_this_era`, §5.2). RAM only, like the queue: a
+/// restart reads the key's coins once more. It holds one era at a time, and
+/// a note for another era forgets the one before. A note is not judged again
+/// within the era: a reorganization that later takes away the records that
+/// answered (§10, Reorg) does not bring the host back before the era ends.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChainKnocked {
+    era: u64,
+    hosts: HashSet<String>,
+}
+
+impl ChainKnocked {
+    /// Note that `host`'s knock in `era` was already written by its own key.
+    /// A note for another era than the one held forgets that era's hosts.
+    fn note(&mut self, host: &str, era: u64) {
+        if era != self.era {
+            self.era = era;
+            self.hosts.clear();
+        }
+        self.hosts.insert(host.to_string());
+    }
+
+    /// Whether `host` was noted in `era`.
+    fn holds(&self, host: &str, era: u64) -> bool {
+        self.era == era && self.hosts.contains(host)
+    }
+}
+
+/// Whether the knock arm skips a queued request to `host` in `era` without
+/// trying it: the knock book holds a knock on that host this era
+/// (`KnockBook::knocked_this_era`, one knock per host per era, stage 4
+/// design §5.2), or this run found that host's knock already written by its
+/// own key ([`ChainKnocked`]). Either way it is per host, whatever the room.
+fn knock_skipped(book: &KnockBook, found: &ChainKnocked, host: &str, era: u64) -> bool {
+    book.knocked_this_era(host, era) || found.holds(host, era)
+}
+
+/// What the knock arm does with `req` once its knock in `era` was not
+/// written, with `e`, at `now`, on the heartbeat's own `queue`, `wait` and
+/// `found` (stage 4 design §5.2). A knock withdrawn at spend time, or one
+/// whose own key already wrote ([`knock_dropped_line`]), is dropped with its
+/// one line: it is not queued again, it uses no attempt, and the arm's rest
+/// (`wait`) is left as it was. One already written also notes its host in
+/// `found`, so the arm skips that host for the rest of the era
+/// ([`knock_skipped`]). Every other error goes to [`knock_failed`], exactly
+/// as before.
+///
+/// `claim_write::AlreadyKnocked` is no typed wait ([`is_typed_wait`]), and
+/// [`knock_failed`] would count it as an attempt and queue it again, to read
+/// the same records under the same key: so it is caught here, before
+/// [`knock_failed`].
+#[allow(clippy::too_many_arguments)]
+fn knock_not_written(
+    burners: bool,
+    req: KnockRequest,
+    e: &anyhow::Error,
+    era: u64,
+    now: Instant,
+    queue: &mut std::collections::VecDeque<KnockRequest>,
+    wait: &mut Option<Instant>,
+    found: &mut ChainKnocked,
+) {
+    let Some(line) = knock_dropped_line(&req, e) else {
+        knock_failed(burners, req, e, now, queue, wait);
+        return;
+    };
+    if already_knocked(e).is_some() {
+        found.note(&req.host, era);
+    }
+    println!("{line}");
 }
 
 /// The beacon's own wallet key, funded SEPARATELY (its address is printed at
@@ -4355,6 +4483,11 @@ pub async fn heartbeat_loop(
     // knock arm rests for the retry cadence from then (`knock_paced`).
     // With burners off it is never set, and the arm is today's.
     let mut knock_wait: Option<Instant> = None;
+    // The hosts this run found its knock already written to this era by the
+    // knock's own key (`ChainKnocked`, `knock_not_written`), skipped for the
+    // rest of the era. Only the burner path writes a knock from its own key,
+    // so with burners off it stays empty.
+    let mut chain_knocked = ChainKnocked::default();
     let mut welcome_warned = false;
     if let (Some(_), Some(m)) = (&beacon_sk, &beacon_mark) {
         println!(
@@ -4720,10 +4853,12 @@ pub async fn heartbeat_loop(
         // publishes (priority presence > knock > beacon). A queued request is
         // still honoured only if its room still allows cards (the toggle may
         // have flipped, the browser may have declared the room public), the
-        // host was not knocked on this era already, and the two are not linked
-        // meanwhile (a link by any path cancels the knock). Era-bound like
-        // presence: no write without a peak, inside the era's guard blocks, or
-        // on a peak the presence lookups above let age out.
+        // host was not knocked on this era already (the book's word, or this
+        // run's finding that the knock's own key wrote: `knock_skipped`), and
+        // the two are not linked meanwhile (a link by any path cancels the
+        // knock). Era-bound like presence: no write without a peak, inside
+        // the era's guard blocks, or on a peak the presence lookups above let
+        // age out.
         if knock_waiting && money_refused.is_none() && peak > 0 && !era_guard(peak) && knock_paced(knock_wait, Instant::now()) && !peak_aged("knock") {
             let era = chia_lane::era_of(peak);
             let next = loop {
@@ -4733,7 +4868,7 @@ pub async fn heartbeat_loop(
                     println!("⛓️ ChiaHub knock: not knocking on {} for room {} — the room no longer uses cards", short(&req.host), req.room);
                     continue;
                 };
-                if hub.knocks.lock().unwrap().knocked_this_era(&req.host, era) {
+                if knock_skipped(&hub.knocks.lock().unwrap(), &chain_knocked, &req.host, era) {
                     continue;
                 }
                 if req.host.parse::<iroh::PublicKey>().is_ok_and(|pk| crate::linked_in_room(&hub, &req.room, &pk)) {
@@ -4783,18 +4918,12 @@ pub async fn heartbeat_loop(
                             eprintln!("⛓️ ChiaHub knock: could not save {}: {e}", crate::chia_knock::KNOCKS_FILE);
                         }
                     }
-                    Err(e) if e.downcast_ref::<Withdrawn>().is_some() => {
-                        println!(
-                            "⛓️ ChiaHub knock: not knocking on {} for room {} — {e} (the room's word changed while the spend was prepared)",
-                            short(&req.host),
-                            req.room
-                        );
-                    }
-                    // A wait (burners on) or an attempt used: back in the
-                    // queue or dropped, as `knock_failed` says.
-                    Err(e) => {
-                        knock_failed(burners, req, &e, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait);
-                    }
+                    // A knock withdrawn at spend time, or already written by
+                    // its own key, is dropped with its line; every other
+                    // error is a wait (burners on) or an attempt used, back
+                    // in the queue or dropped, as `knock_failed` says
+                    // (`knock_not_written`).
+                    Err(e) => knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked),
                 }
                 continue; // one spend per tick
             }
@@ -8684,8 +8813,16 @@ mod tests {
     /// peers' reasons, joined as the lane joins them: both for the fee,
     /// which is the chain being busy ([`BUSY`], §10), and one for each of a
     /// lost race and the fee.
-    async fn knock_failures(test: &str) -> (Vec<(&'static str, anyhow::Error)>, Vec<(&'static str, anyhow::Error)>) {
-        use super::claim_write::{check_burner_spends, BurnerRule, BurnerWait};
+    ///
+    /// Last come the drops: the knocks that are not written and are never
+    /// tried again ([`knock_not_written`]). One is a room's word withdrawn at
+    /// spend time, as [`knock_leave`] gives it for a room with no cap
+    /// ([`Withdrawn`]). The other is a knock whose own key already wrote this
+    /// era, the knock writer's own value (`claim_write::AlreadyKnocked`, of
+    /// the type its seam returns it as), which claim_write's own tests drive
+    /// the writer to.
+    async fn knock_failures(test: &str) -> (KnockErrors, KnockErrors, KnockErrors) {
+        use super::claim_write::{check_burner_spends, AlreadyKnocked, BurnerRule, BurnerWait};
         use crate::chia_chain::testing::{Scripted, Unanswering};
         use crate::chia_faucet::{claim_to, ClaimToError};
         use rand::SeedableRng;
@@ -8735,9 +8872,24 @@ mod tests {
             ("a claim the dish refuses", ClaimToError::Refused("no claim here").into()),
             ("an untyped error", anyhow!("memo alloc failed")),
         ];
+        let drops: Vec<(&'static str, anyhow::Error)> = vec![
+            (WITHDRAWN, anyhow::Error::from(knock_leave(None, false, true, true, &[0; 32]).unwrap_err())),
+            (ALREADY_KNOCKED, AlreadyKnocked.into()),
+        ];
         let _ = std::fs::remove_dir_all(&dir);
-        (waits, failures)
+        (waits, failures, drops)
     }
+
+    /// One list of [`knock_failures`]: each row names what failed, and holds
+    /// the error.
+    type KnockErrors = Vec<(&'static str, anyhow::Error)>;
+
+    /// The [`knock_failures`] drop of a room's word withdrawn at spend time.
+    const WITHDRAWN: &str = "a room's word withdrawn at spend time";
+
+    /// The [`knock_failures`] drop of a knock whose own key already wrote
+    /// this era.
+    const ALREADY_KNOCKED: &str = "a knock's key that already wrote this era";
 
     /// Stage 4 design §5.2 with burner keys on: a knock that only waits (the
     /// wallet unfunded or settling, no dish coin, the lease not parking, the
@@ -8747,10 +8899,14 @@ mod tests {
     /// its attempts. A push refused because the chain is busy is such a
     /// refusal (§10: a first push refused for its fee is a rejection): it
     /// uses an attempt, and only its words say the chain is busy. No other
-    /// row reads as busy, the push one peer refused as spent among them.
+    /// row reads as busy, the push one peer refused as spent among them. A
+    /// knock withdrawn at spend time, or whose own key already wrote, is
+    /// neither a wait nor the chain busy: it is dropped with its own line,
+    /// and no wait or failure is.
     #[tokio::test]
     async fn with_burners_on_a_knock_that_only_waits_uses_no_attempt_and_every_other_failure_uses_one() {
-        let (waits, failures) = knock_failures("on").await;
+        let (waits, failures, drops) = knock_failures("on").await;
+        let host = KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts: 0 };
         let named = |list: &[(&str, anyhow::Error)], name: &str| list.iter().find(|(what, _)| *what == name).map(|(_, e)| format!("{e:#}")).unwrap();
         assert!(named(&failures, "a host card whose key cannot be sealed to").contains("low-order point"), "the seal's own error");
         assert!(named(&waits, "the dish's listing unread").starts_with("coin lookup: unanswered"), "the listing's own error");
@@ -8767,6 +8923,14 @@ mod tests {
             let words = if *what == BUSY { CHAIN_BUSY_WORDS.to_string() } else { format!("{e:#}") };
             assert_eq!(knock_failure_words(true, e), words, "{what}");
         }
+        for (what, e) in &drops {
+            assert!(!is_typed_wait(e), "{what} is no wait: {e:#}");
+            assert!(!chain_busy(e), "{what} is not the chain busy: {e:#}");
+            assert!(knock_dropped_line(&host, e).is_some(), "{what} is dropped with its line: {e:#}");
+        }
+        for (what, e) in waits.iter().chain(&failures) {
+            assert_eq!(knock_dropped_line(&host, e), None, "{what} is not dropped: {e:#}");
+        }
     }
 
     /// With burner keys off, every knock failure uses an attempt, waits and
@@ -8774,7 +8938,7 @@ mod tests {
     /// busy chain's included: the knock arm is main's.
     #[tokio::test]
     async fn with_burners_off_every_knock_failure_uses_an_attempt_as_before() {
-        let (waits, failures) = knock_failures("off").await;
+        let (waits, failures, _) = knock_failures("off").await;
         for (what, e) in waits.iter().chain(&failures) {
             assert!(knock_attempt_counts(false, e), "{what}: {e:#}");
             assert_eq!(knock_failure_words(false, e), format!("{e:#}"), "{what}");
@@ -8898,7 +9062,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_knock_waits_in_the_queue_with_burners_on_and_uses_its_attempts_as_on_main_with_them_off() {
         use std::collections::VecDeque;
-        let (waits, failures) = knock_failures("arm").await;
+        let (waits, failures, _) = knock_failures("arm").await;
         let req = |attempts: u8| KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts };
         let (rested, now) = (Instant::now(), Instant::now() + Duration::from_secs(1));
         let last = MAX_KNOCK_ATTEMPTS - 1;
@@ -8917,6 +9081,138 @@ mod tests {
                 assert_eq!(after(burners, 0, e, Some(rested)), (VecDeque::from([req(1)]), Some(rested)), "{what}, burners {burners}: an attempt");
                 assert_eq!(after(burners, last, e, None), (VecDeque::new(), None), "{what}, burners {burners}: dropped after its last attempt");
             }
+        }
+    }
+
+    /// Stage 4 design §5.2 and §4.1's knock row: a knock withdrawn at spend
+    /// time, or one whose own key already wrote this era, is dropped with
+    /// one line. It uses no attempt, leaves the arm's rest and the rest of
+    /// the queue as they were, and is never queued again, with burner keys
+    /// on or off, on its first attempt or its last. Only the one already
+    /// written notes its host for the era, and a writer's context around it
+    /// still finds it. Neither is a wait. The withdrawn line is the one the
+    /// knock arm always printed, word for word, and neither line names more
+    /// than the host's shortened node id and the room.
+    #[tokio::test]
+    async fn a_knock_withdrawn_or_already_written_is_dropped_with_one_line_uses_no_attempt_and_is_never_queued_again() {
+        use std::collections::VecDeque;
+        let (_, _, drops) = knock_failures("dropped").await;
+        assert_eq!(drops.iter().map(|(what, _)| *what).collect::<Vec<_>>(), [WITHDRAWN, ALREADY_KNOCKED]);
+        let host = "0123456789abcdef0123";
+        let req = |attempts: u8| KnockRequest { room: "r".into(), host: host.into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts };
+        let other = KnockRequest { room: "s".into(), host: "G".into(), ck_host: [2u8; 32], kx_host: [0u8; 32], attempts: 1 };
+        let (rested, now) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let withdrawn = "⛓️ ChiaHub knock: not knocking on 0123456789abcdef for room r — the room no longer uses cards (the room's word changed while the spend was prepared)";
+        let written = "⛓️ ChiaHub knock: not knocking on 0123456789abcdef for room r — a knock on this host for this room already went out this era from its own key, and a knock's key writes once (no attempt used; this host is not knocked on again this era by this run)";
+        let wrapped = anyhow::Error::from(super::claim_write::AlreadyKnocked).context("x");
+        let rows = [(WITHDRAWN, &drops[0].1, withdrawn, false), (ALREADY_KNOCKED, &drops[1].1, written, true), ("already written, under a context", &wrapped, written, true)];
+        for (what, e, line, noted) in rows {
+            assert!(!is_typed_wait(e), "{what} is no wait: {e:#}");
+            assert_eq!(knock_dropped_line(&req(0), e).as_deref(), Some(line), "{what}");
+            for burners in [true, false] {
+                for attempts in [0, MAX_KNOCK_ATTEMPTS - 1] {
+                    for wait in [None, Some(rested)] {
+                        let (mut queue, mut rest, mut found) = (VecDeque::from([other.clone()]), wait, ChainKnocked::default());
+                        knock_not_written(burners, req(attempts), e, 4, now, &mut queue, &mut rest, &mut found);
+                        let case = format!("{what}, burners {burners}, attempts {attempts}, wait {wait:?}");
+                        assert_eq!(queue, VecDeque::from([other.clone()]), "{case}: not queued again, the rest of the queue as it was");
+                        assert_eq!(rest, wait, "{case}: the arm's rest as it was");
+                        assert_eq!(found.holds(host, 4), noted, "{case}: noted only if already written");
+                        assert!(!found.holds(host, 5) && !found.holds("G", 4), "{case}: that host, that era");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every other error a knock fails with goes to [`knock_failed`] exactly
+    /// as before (stage 4 design §5.2): no drop line, the same queue, with
+    /// the same attempts, and the same rest of the arm as `knock_failed`
+    /// leaves on its own, waits and failures alike, burner keys on or off,
+    /// on a first attempt or a last. No host is noted.
+    #[tokio::test]
+    async fn every_other_knock_error_goes_to_knock_failed_exactly_as_before() {
+        use std::collections::VecDeque;
+        let (waits, failures, _) = knock_failures("failed").await;
+        let req = |attempts: u8| KnockRequest { room: "r".into(), host: "H".into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts };
+        let other = KnockRequest { room: "s".into(), host: "G".into(), ck_host: [2u8; 32], kx_host: [0u8; 32], attempts: 1 };
+        let (rested, now) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        for (what, e) in waits.iter().chain(&failures) {
+            assert_eq!(knock_dropped_line(&req(0), e), None, "{what}: {e:#}");
+            for burners in [true, false] {
+                for attempts in [0, MAX_KNOCK_ATTEMPTS - 1] {
+                    for wait in [None, Some(rested)] {
+                        let (mut queue, mut rest, mut found) = (VecDeque::from([other.clone()]), wait, ChainKnocked::default());
+                        knock_not_written(burners, req(attempts), e, 4, now, &mut queue, &mut rest, &mut found);
+                        let (mut alone, mut alone_rest) = (VecDeque::from([other.clone()]), wait);
+                        knock_failed(burners, req(attempts), e, now, &mut alone, &mut alone_rest);
+                        let case = format!("{what}, burners {burners}, attempts {attempts}, wait {wait:?}");
+                        assert_eq!((queue, rest), (alone, alone_rest), "{case}: as knock_failed leaves it");
+                        assert_eq!(found, ChainKnocked::default(), "{case}: no host noted");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A host this run found its knock already written to is skipped for
+    /// the rest of that era, and only that host and that era: a note in a
+    /// new era forgets the one before (stage 4 design §9; RAM only).
+    #[test]
+    fn a_host_the_chain_shows_knocked_is_skipped_for_the_rest_of_that_era_only() {
+        let mut found = ChainKnocked::default();
+        assert!(!found.holds("H", 0), "nothing noted");
+        found.note("H", 4);
+        assert!(found.holds("H", 4));
+        assert!(!found.holds("G", 4), "another host");
+        assert!(!found.holds("H", 5), "another era");
+        assert!(!found.holds("H", 3), "an era before");
+        found.note("G", 4);
+        assert!(found.holds("H", 4) && found.holds("G", 4), "two hosts in one era");
+        found.note("X", 5);
+        assert!(found.holds("X", 5));
+        assert!(!found.holds("H", 4) && !found.holds("G", 4), "the new era forgot the old one");
+        assert!(!found.holds("H", 5), "a host of the old era is not carried into the new one");
+    }
+
+    /// The knock arm skips a queued request when the knock book holds a
+    /// knock on that host this era, or this run found that host's knock
+    /// already written by its own key, in any room (stage 4 design §5.2,
+    /// §9). Another host, or another era, is not skipped.
+    #[test]
+    fn a_queued_knock_is_skipped_for_a_host_the_book_or_this_run_shows_knocked_this_era() {
+        let sent = SentKnock {
+            host: "B".into(),
+            room: "r".into(),
+            era: 4,
+            hint: "00".into(),
+            coin_id: "00".into(),
+            memo: String::new(),
+            pushed_at: 1,
+            confirmed_height: 0,
+            last_rendezvous: 0,
+            settled: false,
+            spend: None,
+            parked: String::new(),
+            payer: None,
+        };
+        let empty = KnockBook::default();
+        let booked = KnockBook { sent: vec![sent], inbox: vec![] };
+        let none = ChainKnocked::default();
+        let mut found = ChainKnocked::default();
+        found.note("C", 4);
+        let rows: [(&str, &KnockBook, &ChainKnocked, &str, u64, bool); 8] = [
+            ("nothing known", &empty, &none, "C", 4, false),
+            ("the chain's word alone", &empty, &found, "C", 4, true),
+            ("the chain's word, another era", &empty, &found, "C", 5, false),
+            ("the chain's word, another host", &empty, &found, "D", 4, false),
+            ("the book's word alone", &booked, &none, "B", 4, true),
+            ("the book's word, another era", &booked, &none, "B", 5, false),
+            ("the book's word, another host", &booked, &none, "D", 4, false),
+            ("the chain's word beside the book's", &booked, &found, "C", 4, true),
+        ];
+        for (what, book, chain, host, era, skipped) in rows {
+            assert_eq!(knock_skipped(book, chain, host, era), skipped, "{what}: {host} in era {era}");
         }
     }
 }
