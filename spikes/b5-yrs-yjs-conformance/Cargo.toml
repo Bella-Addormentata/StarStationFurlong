@@ -3,6 +3,7 @@ name = "ssf-yjs-conformance-spike"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-5: yrs ⇄ Yjs sync conformance & memory metrics"
 
 [dependencies]

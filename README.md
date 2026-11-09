@@ -136,3 +136,27 @@ undocumented.
 *(If the queue grows enough that even this chafes, the standard fix is changelog
 fragments — one `changelog.d/<pr>.md` per PR, concatenated at release. That needs a step
 added to the release workflow, so it is a deliberate change rather than a convention.)*
+
+---
+
+## License
+
+StarStationFurlong's own work in this repository is released under the
+[Do What The Fuck You Want To Public License, Version 2](LICENSE) (WTFPL, SPDX
+`WTFPL`): copy it, change it, share it, do what you want with it. It comes without
+any warranty, to the extent permitted by applicable law.
+
+Third-party pieces bundled here keep their own licenses, which the WTFPL does not
+replace:
+
+* The arcade's NES homebrew games and the emulators it ships (jsnes, EmulatorJS and
+  its cores) are under Apache-2.0, GPL, zlib, CC BY, MPL and non-commercial terms,
+  listed game by game and core by core in
+  [`public/arcade/README.md`](prototypes/0.29.0-core-loop-demo/public/arcade/README.md),
+  with the texts in [`public/arcade/licenses/`](prototypes/0.29.0-core-loop-demo/public/arcade/licenses/).
+* The party speaker's recordings are CC BY-SA 3.0 and CC0, credited in
+  [`public/audio/LICENSES.md`](prototypes/0.29.0-core-loop-demo/public/audio/LICENSES.md).
+* The forked `librqbit-dht` and `librqbit-tracker-comms` crates under
+  [`ssf-p2p-node/vendor/`](prototypes/0.29.0-core-loop-demo/ssf-p2p-node/vendor/) are
+  Apache-2.0, with each fork's changes in its `SSF-FORK.md`.
+* The libraries pulled in through npm and Cargo are under their own licenses.

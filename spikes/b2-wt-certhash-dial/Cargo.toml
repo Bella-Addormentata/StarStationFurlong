@@ -3,6 +3,7 @@ name = "ssf-wt-spike"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-2: WebTransport certhash dial matrix & cert rotation"
 
 [dependencies]

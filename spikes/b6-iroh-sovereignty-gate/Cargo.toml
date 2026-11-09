@@ -3,6 +3,7 @@ name = "ssf-iroh-sovereignty-gate"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "WTFPL"
 description = "Spike B-6: iroh sovereignty gate (self-hosted-relay-only drill)"
 
 [dependencies]
