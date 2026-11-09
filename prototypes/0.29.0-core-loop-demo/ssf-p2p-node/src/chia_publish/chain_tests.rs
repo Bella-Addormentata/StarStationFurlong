@@ -3821,8 +3821,11 @@ async fn two_hosts_whose_cards_share_a_contact_key_each_get_a_knock_from_a_burne
 /// lease, exactly the entry the heartbeat would have saved, though B's
 /// write under the hint is the newer: the lease's writes under the hint are
 /// read whole ([`WalletLease::held_writes_under`]), and A's own is found
-/// behind B's. Nothing more is written for A, and once both land each opens
-/// for its own host.
+/// behind B's. Nothing more is written for A. With burner keys turned off
+/// after the stop, the step on the SSF wallet's path files each host's own
+/// knock too, A's behind B's newer one, with the root it makes from the
+/// SSF wallet's key, and the SSF wallet writes nothing under the hint. Once
+/// both land each opens for its own host.
 #[tokio::test]
 async fn a_knock_whose_entry_a_restart_lost_is_not_filed_as_another_hosts_under_a_shared_contact_key_and_is_filed_again_as_its_own() {
     let mut s = setup().await;
@@ -3856,6 +3859,13 @@ async fn a_knock_whose_entry_a_restart_lost_is_not_filed_as_another_hosts_under_
     assert_eq!(lost.payer, Some(Payer::of_burner(&k_a).hex()), "naming A's own key");
     assert_eq!(s.sent(), HashSet::from([a_bundle.name(), b_bundle.name()]), "nothing more sent");
     assert_eq!(s.gifts(0), 2, "no third gift");
+
+    let saved_b = sent_knock_of(&b, 0, hint, &to_b, at);
+    for (req, entry, who, seed) in [(&a, &saved, "A", 4), (&b, &saved_b, "B", 5)] {
+        let refiled = arm_refiled(&s.arm_knock(94, false, &node, req, 0, || Ok(None), at, seed).await);
+        assert_eq!(refiled.as_ref(), Some(entry), "{who}'s own knock, on the SSF wallet's path");
+    }
+    assert_eq!(s.sent(), HashSet::from([a_bundle.name(), b_bundle.name()]), "the SSF wallet wrote nothing");
 
     let landed = s.chain.farm().await;
     for (req, kx, write, key) in [(&a, &a_kx, &to_a, &k_a), (&b, &b_kx, &to_b, &k_b)] {
@@ -4374,7 +4384,7 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     for (elsewhere, what) in [(knock_hint(NET, &other, &ROOM_KEY, 0), "another host's hint"), (knock_hint(NET, &req, &ROOM_KEY, 1), "another era's hint")] {
         let held = s.lease.held_write_under(elsewhere).await;
         assert_eq!(held, None, "{what}");
-        assert_eq!(lost_knock_entry(held, &Payer::of_burner(&key), &money, true, &req, elsewhere, 0, at), None, "{what}");
+        assert_eq!(lost_knock_entry(held, || Payer::of_burner(&key), &money, true, &req, elsewhere, 0, at), None, "{what}");
     }
     let mut book = book;
     book.record_sent(lost.clone());
@@ -4405,7 +4415,7 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
         let done = s.arm_knock(91, burner_path, &node, &other, 0, || Ok(None), at, 4).await;
         assert_eq!(arm_refiled(&done), Some(entry.clone()), "{what}");
     }
-    assert_eq!(lost_knock_entry(WalletLease::new().held_writes_under(hint2).await, &money, &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
+    assert_eq!(lost_knock_entry(WalletLease::new().held_writes_under(hint2).await, || Payer::of_burner(&key2), &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
 
     let before = s.sent();
     let (beside, unguarded) = s.knock(91, &node, &req, 0, || Ok(None), 5).await.expect("the writer alone does not read the hint");
