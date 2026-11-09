@@ -2020,6 +2020,33 @@ mod tests {
         assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![f.coin_id()], vec![f.coin_id()]], "the lookup's second page");
         assert_eq!(sent(&chain), 1, "one push");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
+
+        // Every page's coins are kept as the lookup goes on. Two lone coins
+        // whose parents are elsewhere, one parent on each of two pages, are
+        // both judged, and the knock goes out from one of them; a parent at
+        // the key on the first page is already knocked, though the second
+        // page is cut short.
+        let to_page_2 = |records| crate::chia_chain::CoinListing { records, truncated: true, next_cursor: Some("page-2".into()), judged_at: None };
+        let g = Coin::new(Bytes32::new([6; 32]), FaucetParams::lobby(net).puzzle_hash(), 10);
+        let lifted_too = Coin::new(g.coin_id(), ph, 1);
+        let mut parents = vec![f.coin_id(), g.coin_id()];
+        parents.sort();
+        let listed = vec![record(lifted, false), record(lifted_too, false)];
+        let chain = Scripted::new(vec![page(listed, false), to_page_2(vec![record(f, true)]), page(vec![record(g, true)], false)]);
+        let fuse = Mutex::new(GiftFuse::new());
+        let write = knock_on(&chain, &fuse, &key).await.expect("written from a lone coin");
+        assert_eq!(write.coins, WriteCoins::one(lifted.coin_id().min(lifted_too.coin_id())), "from the first of the two, as a rewrite picks");
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![parents.clone(), parents], "both parents, over two pages");
+        assert_eq!(sent(&chain), 1, "one push");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
+
+        let chain = Scripted::new(vec![page(vec![record(written, false)], false), to_page_2(vec![record(at_key, true)]), page(vec![], true)]);
+        let fuse = Mutex::new(GiftFuse::new());
+        let e = knock_on(&chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "a parent at the key on the first page, the second cut short: {e:#}");
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![at_key.coin_id()], vec![at_key.coin_id()]], "the lookup's second page");
+        assert_eq!(sent(&chain), 0, "nothing sent");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
     }
 
     /// A knock that the lease holds in flight waits [`BurnerWait::Held`]
