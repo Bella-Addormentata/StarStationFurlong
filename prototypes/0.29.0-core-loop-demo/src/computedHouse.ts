@@ -45,7 +45,7 @@ import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { canon, hasFields, isPlain, isPub, isSig, recHash } from './computedFold';
-import type { FoldCtx } from './computedFold';
+import type { FoldCtx, FoldResult } from './computedFold';
 
 // The derivations below sign synchronously (keypair.ts wires the same).
 ed.etc.sha512Sync ??= (...m: Uint8Array[]) => sha512(ed.etc.concatBytes(...m));
@@ -137,6 +137,52 @@ export function roomSignBytes(kind: RoomKind, room: string, t: string, body: obj
 /** blake3 derive_key contexts (house.rs uses the same strings). */
 export const HOUSE_KEY_CONTEXT = 'ssf-house-key-v1';
 export const HOUSE_SEED_KEY_CONTEXT = 'ssf-house-seed-key-v1';
+
+// ── Whose commitment a close names (PR 6c-4b-1b) ──────────────────────────
+
+/** The house that holds the seed behind the commitment `res.required` names, and
+ *  so the only one that can reveal for a close of the open round: the signer of the
+ *  house reveal that decided the last round decided (the reveal carried it), or for
+ *  a session's first round the house that signed the base (`delegate`, see casinoDoc
+ *  baseHouseOf). Undefined for none a page can tell: nothing is required (the
+ *  joins of the open round are what a close names then), the checkpoint that
+ *  carried it names no house, or the house is none of the game's for the open
+ *  round any more (`houseOfOpen`): a hand-over moves a game to a holder whose
+ *  houses the seller's are not, and a commitment of one that is not is nobody's
+ *  to wait for: the close that names it is voided by an abandon, and the round
+ *  after is open to the houses that are. (Asked once where a game is counted:
+ *  houseOfOpen scans the room's delegations.) */
+export function committingHouse(res: FoldResult, delegate: string | undefined, houseOfOpen: (pub: string) => boolean): string | undefined {
+  if (res.required === null) return undefined;
+  // (`rounds` ends with the tip, the open round's own close, when there is one: it decided nothing.)
+  const decided = res.tip === null ? res.rounds.length : res.rounds.length - 1;
+  const house = decided > 0 ? res.rounds[decided - 1].house?.rec.k : delegate;
+  return house !== undefined && houseOfOpen(house) ? house : undefined;
+}
+
+/** The house a close for the open round of `res` depends on for its commitment
+ *  `h`: the one that holds the seed behind it. Undefined when a page can't tell:
+ *  `h` is none the fold counts for the open round, or `h` is the required
+ *  commitment and `committing` (committingHouse) is none.
+ *  - `h` is the required commitment (`res.required`): `committing`.
+ *  - `h` is a join of the open round (`res.joins`, listed while nothing is
+ *    required): the house that signed the join, which the fold counted as a house
+ *    of this round. */
+export function houseOfCommit(res: FoldResult, committing: string | undefined, h: string | undefined): string | undefined {
+  if (h === undefined) return undefined;
+  return h === res.required ? committing : res.joins.find((j) => j.rec.c === h)?.rec.k;
+}
+
+/** Every key houseOfCommit can answer with for the open round of `res`: the
+ *  committing house, or the signers of the joins it lists (at most
+ *  MAX_CLOSES_PER_ROUND; none are listed while a commitment is required, so the
+ *  two never both stand). The keys whose beats a page hears for a game (casinoDoc
+ *  FairOnlyState.houses), and no others. */
+export function commitHouses(res: FoldResult, committing: string | undefined): string[] {
+  const out = committing === undefined ? [] : [committing];
+  for (const j of res.joins) if (!out.includes(j.rec.k)) out.push(j.rec.k);
+  return out;
+}
 
 /** The house's ed25519 secret, from the node's 32-byte secret key. */
 export function houseSecretOf(nodeSecret: Uint8Array): Uint8Array {

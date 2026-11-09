@@ -232,7 +232,8 @@ import type { CkRead, CkRec } from './computedFairOnly';
 import { resolveGame, tableGame } from './computedFairOnlyAuth';
 import type { Resolution } from './computedFairOnlyAuth';
 import {
-  asBeat, asDelegation, asFairSetting, beatKey, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts, roomSignBytes,
+  asBeat, asDelegation, asFairSetting, beatKey, commitHouses, committingHouse, delegationKey, fairAfter, fairSettingKey, HOUSE_HEARD_MS, houseKeyParts,
+  houseOfCommit, roomSignBytes,
 } from './computedHouse';
 import type { DelegationRec, FairSettingRec, RoomKind } from './computedHouse';
 import { legacyOwnerMarker } from './roomOwner';
@@ -2230,6 +2231,22 @@ interface FairOnlyState {
   /** nextSid3 of the checkpoint last asked about (sid3Of). */
   sidFor: CkRec | null;
   sid: string;
+  /** 🔒 The keys this page hears as the game's houses (noteBeat; PR 6c-4b-1b): the
+   *  ones a close of the open round could name the commitment of (computedHouse
+   *  commitHouses): the committing house and the signers of the joins the open round
+   *  lists (at most MAX_CLOSES_PER_ROUND). Empty while the game is not live. A
+   *  stranger gets a key in only by signing a join the fold counted. */
+  houses: ReadonlySet<string>;
+  /** …of them, the house that holds the seed behind the commitment a close must
+   *  name, while it is one of the game's for the open round (computedHouse
+   *  committingHouse), or undefined. Found where the game is counted, not at each
+   *  tick: the resolution's houseAt scans the room's delegations. */
+  committing: string | undefined;
+  /** …and whether that search waited: a delegation's signature was put off (houseAt
+   *  answered undefined), so `committing` may be a house not found yet. The slice
+   *  that checks it counts the game again (countTransaction), as it does a result
+   *  whose fold waited. */
+  committingWaits: boolean;
 }
 
 /** A checkpoint this page counted: the value the doc held (put back as it
@@ -2806,10 +2823,9 @@ function noteDoubted(c: ComputedInc, was: FoldResult | null, res: FoldResult, ma
 }
 
 /** 🩹 Whether this page doubts slip `hash` at table `tableId`'s
- *  switched-on incarnation (ComputedInc doubted): its closes freeze it only
- *  for its own player. */
-export function computedSlipDoubted(tableId: string, hash: string): boolean {
-  const inc = computedIncOf(tableId);
+ *  switched-on incarnation, or at `inc` (ComputedInc doubted): its closes
+ *  freeze it only for its own player. */
+export function computedSlipDoubted(tableId: string, hash: string, inc: string | null = computedIncOf(tableId)): boolean {
   return inc !== null && computedIncs.get(`${tableId}:${inc}`)?.doubted.has(hash) === true;
 }
 
@@ -2863,7 +2879,14 @@ function fairOnlyLive(tableId: string, inc: string): boolean {
  *  opened (no base) is no table, whatever the switch says (S4). */
 export function isComputedTable(tableId: string): boolean {
   const inc = computedIncOf(tableId);
-  if (inc === null) return false;
+  return inc !== null && isComputedInc(tableId, inc);
+}
+
+/** isComputedTable of incarnation `inc` of table `tableId`, the one the table
+ *  plays or another it keeps (a FAIR ONLY game the table has left, whose duties a
+ *  page goes on with: computedTable tickComputedTables): nothing has ended it
+ *  (`gone:`, its checkpoint), or, for a FAIR ONLY game, it is live. */
+export function isComputedInc(tableId: string, inc: string): boolean {
   if (isFairOnlyInc(inc)) return fairOnlyLive(tableId, inc);
   return !casinoMap!.has(goneKey(tableId, inc)) && baseOf(tableId, inc)?.e !== 1;
 }
@@ -3177,7 +3200,7 @@ export function setComputedVerifyForTests(opts: {
   verifyNow = opts.now ?? defaultVerifyNow;
   if (roomWaiting.size > 0) queueVerifySlice();
   for (const c of computedIncs.values()) {
-    if (c.last?.pending || c.fo?.res?.pending) {
+    if (c.last?.pending || c.fo?.res?.pending || c.fo?.committingWaits) {
       queueVerifySlice();
       break;
     }
@@ -3275,9 +3298,8 @@ function setAuthVerdict(id: string, ok: boolean): void {
 }
 
 /** The writing page's own record checks out: it signed it (it never checks
- *  its own records). Of table `tableId`'s live incarnation. */
-export function markComputedVerdict(tableId: string, hash: string): void {
-  const inc = computedIncOf(tableId);
+ *  its own records). Of table `tableId`'s live incarnation, or of `inc`. */
+export function markComputedVerdict(tableId: string, hash: string, inc: string | null = computedIncOf(tableId)): void {
   if (inc !== null) verdictsOf(`${tableId}:${inc}`).set(hash, true);
 }
 
@@ -3320,6 +3342,14 @@ const HOUSE_VERDICTS_MAX = 2_048;
 let roomWaiting = new Set<string>();
 /** Each house's highest heartbeat seen, and when (this page's clock). */
 let houseBeats = new Map<string, { n: number; at: number }>();
+/** 🔒 How many of the doc's live FAIR ONLY games hear each key as a house now
+ *  (FairOnlyState.houses): a beat counts from such a key as from a house the deed
+ *  holder pinned (noteBeat), for what a game asks of it (houseHeardFrom) and no
+ *  more: the room's own questions (houseHeardAt, houseOnline) still read the
+ *  pinned houses only. */
+let gameHouseRefs = new Map<string, number>();
+/** What a FAIR ONLY game that is not live hears. */
+const NO_HOUSES: ReadonlySet<string> = new Set();
 /** The newest Fair setting by the deed holder this page has seen, per table. */
 let fairSeen = new Map<string, FairSettingRec>();
 /** The best valid owner-signed checkpoint (`hs:`) this page has counted, per
@@ -3499,14 +3529,18 @@ function fairOf(t: string): FairSettingRec | undefined {
 }
 
 /** Note a house's heartbeat as the doc holds it now: by a house, newer than
- *  any this page saw of it, its signature good. */
+ *  any this page saw of it, its signature good. 🔒 A house is a key the deed
+ *  holder delegated, or one a live FAIR ONLY game hears (FairOnlyState.houses):
+ *  a game's houses are its authority's delegations, which the deed holder's pin
+ *  stands for nowhere. A beat of any other key is dropped before its signature
+ *  is looked at, so a flood of them signed by strangers costs a lookup each. */
 function noteBeat(pub: string): void {
   const rec = asBeat(computedMap?.get(beatKey(pub)));
   if (!rec || rec.k !== pub) return;
   const house = houseOkOf(pub);
   // (Its delegation's check put off: the beat is read again after it.)
   if (house === undefined) roomWaiting.add(beatKey(pub));
-  if (house !== true) return;
+  if (house !== true && !gameHouseRefs.has(pub)) return;
   const was = houseBeats.get(pub);
   if (was && was.n >= rec.n) return;
   if (roomRecOk('hbeat', '', rec, beatKey(pub)) === true) houseBeats.set(pub, { n: rec.n, at: txNow ?? Date.now() });
@@ -3697,7 +3731,12 @@ export function readFairSetting(tableId: string): 'fair' | 'friendly' {
 export function houseHeardAt(): number | null {
   const owner = deedHolderKey();
   let at: number | null = null;
-  for (const [pub, b] of houseBeats) if (pinnedHouse(pub, owner) && (at === null || b.at > at)) at = b.at;
+  // (The keys the deed holder pinned, not every beat counted: houseBeats also holds
+  // those of the keys live games hear, which strangers' games add to without a cap.)
+  for (const pub of housePinned.keys()) {
+    const b = houseBeats.get(pub);
+    if (b && pinnedHouse(pub, owner) && (at === null || b.at > at)) at = b.at;
+  }
   return at;
 }
 
@@ -3706,6 +3745,80 @@ export function houseHeardAt(): number | null {
 export function houseOnline(now = Date.now()): boolean {
   const at = houseHeardAt();
   return at !== null && now - at <= HOUSE_HEARD_MS;
+}
+
+/** 🔒 Whether house `pub` was heard in the last HOUSE_HEARD_MS (a clock that went
+ *  back reads as heard, as houseOnline's does): a beat counted from it while it
+ *  was a house the deed holder pinned, or one a live FAIR ONLY game hears
+ *  (FairOnlyState.houses). A key that is neither now was heard by nothing:
+ *  the answer a FAIR ONLY game's close or abandon asks of the house whose
+ *  commitment it names (computedTable closePaused, abandonWait), which the room's
+ *  houseOnline (the deed holder's houses) can't give for a game of another
+ *  authority. */
+export function houseHeardFrom(pub: string, now = Date.now()): boolean {
+  const beat = houseBeats.get(pub);
+  return beat !== undefined && now - beat.at <= HOUSE_HEARD_MS && (gameHouseRefs.has(pub) || pinnedHouse(pub));
+}
+
+/** 🔒 The keys this page hears as the houses of FAIR ONLY game `inc` of table
+ *  `tableId` (FairOnlyState.houses; none for a game that is not live or not
+ *  tracked). Read-only. */
+export function computedGameHouses(tableId: string, inc: string): ReadonlySet<string> {
+  return computedIncs.get(`${tableId}:${inc}`)?.fo?.houses ?? NO_HOUSES;
+}
+
+/** 🔒 The house a close that names commitment `h` for the open round of FAIR
+ *  ONLY game `inc` of table `tableId` depends on, as this page counted the game
+ *  (computedHouse houseOfCommit): the one house that holds the seed behind `h`.
+ *  Undefined for none a page can tell, which is no house to wait for. Read-only. */
+export function computedCommitHouse(tableId: string, inc: string, h: string | undefined): string | undefined {
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  return c?.last && c.fo ? houseOfCommit(c.last, c.fo.committing, h) : undefined;
+}
+
+/** The house that signed a game's base when the base is a house's trim: the one
+ *  that holds the seed behind the commitment `h` it carries (a house trims only
+ *  after its own reveal decided the round, design N3). A sweep, which any house
+ *  of the holder may sign over the same content, carries another's commitment,
+ *  and an adoption is signed by a buyer with no house: none either. */
+function baseHouseOf(resolved: Resolution): string | undefined {
+  const ck = resolved.base?.ck;
+  return ck !== undefined && ck.w === undefined ? ck.dl?.h : undefined;
+}
+
+/** Whether a key is a house of the game for the round `res` has open (the
+ *  resolution's houseAt: delegated by the key that holds the game then). One whose
+ *  delegation is not checked yet is none for now, and `onWait` is told. */
+function houseOfOpen(resolved: Resolution, res: FoldResult, onWait: () => void): (pub: string) => boolean {
+  return (pub) => {
+    const at = resolved.houseAt(pub, res.open);
+    if (at === undefined) onWait();
+    return at === true;
+  };
+}
+
+/** Hear the keys `keys` (and no others) as FAIR ONLY game `fo`'s houses: a key
+ *  new to the game counts from the next beat that comes in (the one already in
+ *  the doc may be any age, and the doc keeps no time: a peer's writing it again
+ *  is the next that comes in, for a beat proves the house signed it, not when),
+ *  one it no longer hears has its beat forgotten unless the deed holder pinned
+ *  it. */
+function setGameHouses(fo: FairOnlyState, keys: readonly string[]): void {
+  const was = fo.houses;
+  if (keys.length === was.size && keys.every((k) => was.has(k))) return;
+  const next = new Set(keys);
+  for (const k of next) if (!was.has(k)) gameHouseRefs.set(k, (gameHouseRefs.get(k) ?? 0) + 1);
+  for (const k of was) {
+    if (next.has(k)) continue;
+    const left = (gameHouseRefs.get(k) ?? 1) - 1;
+    if (left > 0) {
+      gameHouseRefs.set(k, left);
+      continue;
+    }
+    gameHouseRefs.delete(k);
+    if (!housePinned.has(k)) houseBeats.delete(k);
+  }
+  fo.houses = next;
 }
 
 /** 🏠 Whether the room has a house at all: a delegation this page counted.
@@ -3842,7 +3955,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, folded: undefined, sidFor: null, sid: '' }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
     : null;
   const houses: HouseCheck = fo ? (pub, round) => fo.res?.houseAt(pub, round) : houseOkOf;
   c = {
@@ -4387,6 +4500,14 @@ function countFairOnly(c: ComputedInc, map: Y.Map<unknown>, whole: boolean, keys
   c.last = res;
   c.liveHeld = live;
   c.countedSid = c.live ? c.sid : null;
+  // (The houses a close of the open round would name the commitment of: the
+  // beats a page hears for the game, houseHeardFrom. None while it is not live. A
+  // delegation put off leaves the committing house unknown for now: the slice that
+  // checks it counts the game again, committingWaits.)
+  let waits = false;
+  fo.committing = live ? committingHouse(res, baseHouseOf(resolved), houseOfOpen(resolved, res, () => { waits = true; })) : undefined;
+  fo.committingWaits = waits;
+  setGameHouses(fo, live ? commitHouses(res, fo.committing) : []);
   // What the page counted from is what it goes on from if the doc loses it
   // (and none named: the table is not open, but the page keeps what it held).
   if (resolved.base !== null) fo.held = { key: resolved.base.key, value: resolved.base.ck };
@@ -4439,6 +4560,7 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   foLive = new Map();
   roomWaiting = new Set();
   houseBeats = new Map();
+  gameHouseRefs = new Map();
   fairSeen = new Map();
   houseSumSeen = new Map();
   houseSumBackoff = new Map();
@@ -4614,10 +4736,11 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
     }
   }
   // A slice: what waited for its checks. (A FAIR ONLY game's resolution that
-  // waited is made again.)
+  // waited is made again, and a game whose committing house waited for a
+  // delegation's check is counted again.)
   if (tr.origin === CT_VERIFY) {
     for (const c of computedIncs.values()) {
-      if (c.last?.pending) dirty.add(c);
+      if (c.last?.pending || c.fo?.committingWaits) dirty.add(c);
       if (c.fo?.res?.pending) staleGames.add(c);
     }
   }
@@ -4700,37 +4823,38 @@ export function computedSettled(tableId?: string): boolean {
 }
 
 /** The fold of table `tableId`'s switched-on incarnation as last counted
- *  (null for none, or one parked before it was ever counted). Read-only. */
-export function computedFoldOf(tableId: string): FoldResult | null {
-  const inc = computedIncOf(tableId);
+ *  (null for none, or one parked before it was ever counted). Read-only.
+ *  🔒 Of incarnation `inc` when one is given: the duties of a page's state of
+ *  a game read the game's own fold, which is not the table's when the table
+ *  has moved to another (computedTable). */
+export function computedFoldOf(tableId: string, inc: string | null = computedIncOf(tableId)): FoldResult | null {
   return inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.last ?? null;
 }
 
-/** 🔁 The round-u view (§6.2 C) of table `tableId`'s switched-on incarnation:
- *  the candidate decisions for round u (the base's) that reproduce the counted
- *  checkpoint's nets and craps carry, in the fold's order — the page shows the
- *  first in place of its own when it differs (the L7 fix). Empty with no prior
- *  evidence (a new page, or a split). Read-only; no count or spend reads it. */
-export function computedRedecide(tableId: string): RedecideCandidate[] {
-  const inc = computedIncOf(tableId);
+/** 🔁 The round-u view (§6.2 C) of table `tableId`'s switched-on incarnation
+ *  (or of `inc`): the candidate decisions for round u (the base's) that
+ *  reproduce the counted checkpoint's nets and craps carry, in the fold's
+ *  order — the page shows the first in place of its own when it differs (the
+ *  L7 fix). Empty with no prior evidence (a new page, or a split). Read-only;
+ *  no count or spend reads it. */
+export function computedRedecide(tableId: string, inc: string | null = computedIncOf(tableId)): RedecideCandidate[] {
   const c = inc === null ? null : computedIncs.get(`${tableId}:${inc}`);
   return c ? c.fold.redecide() : [];
 }
 
 /** When this page first saw record `key` in the live session of table
- *  `tableId`'s switched-on incarnation (its own Date.now(), raw: a duty
- *  clamps it to its own clock), or undefined. */
-export function computedSeenAt(tableId: string, key: string): number | undefined {
-  const inc = computedIncOf(tableId);
+ *  `tableId`'s switched-on incarnation (or of `inc`; its own Date.now(), raw: a
+ *  duty clamps it to its own clock), or undefined. */
+export function computedSeenAt(tableId: string, key: string, inc: string | null = computedIncOf(tableId)): number | undefined {
   return inc === null ? undefined : computedIncs.get(`${tableId}:${inc}`)?.seen.get(key);
 }
 
-/** The live session map of a computed table to write records into, read
- *  afresh on every call (a trim replaces it, and a write through an old one
- *  vanishes), or null when the table isn't computed or has none. */
-export function computedSessionForWrite(tableId: string): Y.Map<unknown> | null {
-  if (!isComputedTable(tableId)) return null;
-  const inc = computedIncOf(tableId)!;
+/** The live session map of a computed table (its switched-on incarnation, or
+ *  `inc`) to write records into, read afresh on every call (a trim replaces it,
+ *  and a write through an old one vanishes), or null when the table isn't
+ *  computed or has none. */
+export function computedSessionForWrite(tableId: string, inc: string | null = computedIncOf(tableId)): Y.Map<unknown> | null {
+  if (inc === null || !isComputedInc(tableId, inc)) return null;
   const map = computedMap!;
   // (🔒 A FAIR ONLY game's session is the one the base its resolution names
   // opens, which a table that is computed has.)
@@ -5114,12 +5238,11 @@ export function computedCheckpointBroken(tableId: string): boolean {
   return !(c && computedMap && recoveryOn && recoveryTrigger(c, checkpointAt(computedMap, tableId, c.inc)) !== null);
 }
 
-/** The players table `tableId`'s switched-on incarnation counts as at the
- *  table, as last counted: its base's nets, and every one a close froze in
- *  its session (an upper bound on the next checkpoint's nets: closeDuty
+/** The players table `tableId`'s switched-on incarnation (or `inc`) counts as
+ *  at the table, as last counted: its base's nets, and every one a close froze
+ *  in its session (an upper bound on the next checkpoint's nets: closeDuty
  *  freezes no newcomer once it holds MAX_TABLE_PIDS). */
-export function computedTablePids(tableId: string): ReadonlySet<string> {
-  const inc = computedIncOf(tableId);
+export function computedTablePids(tableId: string, inc: string | null = computedIncOf(tableId)): ReadonlySet<string> {
   const res = inc === null ? null : computedIncs.get(`${tableId}:${inc}`)?.last;
   if (!res) return EMPTY_PIDS;
   let out = tablePids.get(res);
@@ -5142,8 +5265,8 @@ const tablePids = new WeakMap<FoldResult, Set<string>>();
 
 /** The UTF-8 bytes the ids of computedTablePids(tableId) take: what a FAIR ONLY
  *  game's close weighs against MAX_TABLE_PID_BYTES (S6 e), kept with the set. */
-export function computedTablePidBytes(tableId: string): number {
-  const pids = computedTablePids(tableId);
+export function computedTablePidBytes(tableId: string, inc: string | null = computedIncOf(tableId)): number {
+  const pids = computedTablePids(tableId, inc);
   let bytes = tablePidBytes.get(pids);
   if (bytes === undefined) {
     bytes = 0;

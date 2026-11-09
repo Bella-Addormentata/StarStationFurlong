@@ -18,7 +18,7 @@ import { faironlyInc, sealFin } from './computedFairOnly';
 import { asAbandon, asClose, dutyRank, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid3, seedTable, utf8Length } from './computedFold';
 import type { CloseRec, FoldCtx } from './computedFold';
 import { delegation, hex, house as H, NAME, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { clockOf, deleteIn, deliver, frame, keysIn, loadPage, openRoom, PAGE_CTX, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, sync, trimByHand, updatesOf } from './computedPageKit';
+import { Beating, clockOf, deleteIn, deliver, frame, keysIn, loadPage, openRoom, PAGE_CTX, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run as runBare, sync, trimByHand, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red, straight, testIdentity } from './computedTestKit';
 import type { Built, TestIdentity } from './computedTestKit';
@@ -31,6 +31,7 @@ const STEP = 200;
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(T0);
+  beat = null;
 });
 
 afterEach(() => {
@@ -43,6 +44,12 @@ const G = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, N
 const root = rootOf(G, 'p', { dl: delegation(owner, H.pub, PAGE_ROOM) });
 const SID = nextSid3(G, root.value);
 const kit = new ComputedKit(G);
+
+/** The house keeps beating while a spec runs its game, as its node does (an unheard house pauses the closes: PR
+ *  6c-4b-1b). gameRoom makes it, in the first page's doc; a spec that has the house go quiet mutes it. */
+let beat: Beating | null = null;
+const run = (pages: Page[], from: number, to: number, opts: Parameters<typeof runBare>[3] = {}): number =>
+  runBare(pages, from, to, { each: beat?.each, ...opts });
 
 const top = (p: Page) => p.doc.getMap<unknown>('casinoComputed');
 const casinoOf = (p: Page) => p.doc.getMap<unknown>('casino');
@@ -81,6 +88,7 @@ async function gameRoom(names: string[], pids: string[] = [], opts: { resync?: (
     top(a).set(root.key, root.value);
     top(a).set(`ses:${TABLE}:${G.inc}:${SID}`, new Y.Map());
   });
+  beat = new Beating(a, H);
   sync(T0, ...pages);
   run(pages, T0, T0, { step: STEP }); // (awake)
   return pages;
@@ -759,6 +767,7 @@ describe('an abandon at a FAIR ONLY game', () => {
     expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
     sync(T0, ...pages);
     const closedAt = run(pages, T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    beat!.muted = true; // (the house never reveals, and is not heard again)
     run(pages, closedAt + STEP, closedAt + 3_000, { step: STEP });
     for (const p of pages) expect(foldOf(p).tip).toMatchObject({ r: 1, decided: null });
     return { pages, a, b, c, closedAt, closeHash: hashIn(keysIn(a, 'c', 1)[0]) };
@@ -812,6 +821,7 @@ describe('an abandon at a FAIR ONLY game', () => {
     expect(second.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
     sync(T0, ...pages);
     const closedAt = run(pages, T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(first, 'c', 1).length > 0 });
+    beat!.muted = true;
     run(pages, closedAt + STEP, closedAt + 3_000, { step: STEP });
     const at = run([first], closedAt + 3_000 + STEP, closedAt + 60_000, { step: STEP, until: () => keysIn(first, 'z', 1).length > 0 });
     expect(at).toBeGreaterThanOrEqual(closedAt + 15_000);
@@ -928,6 +938,7 @@ describe('a game and a page-signed incarnation at one table', () => {
       top(a).set(`ses:${TABLE}:${G.inc}:${SID}`, new Y.Map());
     });
     expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    beat = new Beating(a, H);
     house(a, kit.houseJoin(H, 1));
     const at = run([a], T0 + STEP, T0 + 3_000, { step: STEP });
     expect(a.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
@@ -969,9 +980,12 @@ describe('what a page shows and does at the table of a game', () => {
   it('a table ticked as the other game\'s plays nothing: a roulette game under a craps table\'s duties', async () => {
     const pages = await betting();
     const [a] = pages;
-    const before = Y.encodeStateAsUpdate(a.doc);
+    // (the house beats all the while, so that the game, if it were served, would be closed: only its beats change the doc)
+    const records = (): string => JSON.stringify(['casinoComputed', 'casino'].map((name) =>
+      [...a.doc.getMap<unknown>(name).entries()].filter(([k]) => !k.startsWith('hb:')).map(([k, v]) => [k, v instanceof Y.Map ? v.toJSON() : v]).sort()));
+    const before = records();
     run(pages, T0 + STEP, T0 + 60_000, { step: STEP, tables: [{ id: TABLE, game: 'craps' }] });
-    expect(Y.encodeStateAsUpdate(a.doc)).toEqual(before);
+    expect(records()).toEqual(before);
     expect(keysIn(a, 'c')).toEqual([]);
     run(pages, T0 + 60_000 + STEP, T0 + 90_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
     expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
@@ -1081,6 +1095,7 @@ describe('two games at one table', () => {
     const window = a.table.BET_WINDOW_MS;
     const at = run([a], T0 + STEP, T0 + 3_000, { step: STEP });
     expect(a.table.writeComputedSlip(TABLE, [red(9)], at)).toBe('ok');
+    beat!.muted = true; // (the house falls silent: a game left is served, and with its house heard would close its round meanwhile)
     // The page ticks to just short of the deadline and reads the table after it: the view of a window run
     // out is built and kept (the fold is the same until a close comes), the close not written yet.
     run([a], at + STEP, at + window - 1_000, { step: STEP });
@@ -1093,6 +1108,7 @@ describe('two games at one table', () => {
     const mid = run([a], at + window + 1_200, at + window + 41_000, { step: STEP });
     expect(keysIn(a, 'c')).toEqual([]);
     nameGame(a, G.inc);
+    beat!.muted = false;
     const back = run([a], mid + STEP, mid + 3_000, { step: STEP });
     expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
     // The game's window starts from here, as after a wake: no close at the old deadline.

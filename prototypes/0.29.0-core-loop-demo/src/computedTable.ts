@@ -151,6 +151,7 @@ import {
   casinoWhole,
   checkpointLabelOf,
   computedCheckpointOf,
+  computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
   computedFoldOf,
@@ -180,6 +181,7 @@ import {
   giveUpComputed,
   giveWayComputed,
   holdsDeed,
+  houseHeardFrom,
   houseOnline,
   houseSetUp,
   houseSumBackedOff,
@@ -659,13 +661,15 @@ const awayAt = new Map<string, number>();
  *  state (tableOf). Whatever state the table plays when that count is not the
  *  one now, one that waited or one made afresh, starts its waits afresh, as
  *  after a wake: a FAIR ONLY game was played meanwhile, and no duty of the
- *  page-signed state ran. A state made after the game has no first-seen times
- *  of its own, either: the records it reads came to this page long ago, and a
- *  close among them would have its grace long past. Counted by the doc, not by
- *  a frame that looked at the table meanwhile: a table out of the room's list
- *  for the whole game, or a page whose first frame comes after it, resumes the
- *  same. Kept apart from the states: a page that was bound while the game was
- *  played has none. */
+ *  page-signed state ran (nor all of a FAIR ONLY game's that was left: it is
+ *  served on the side, serveLeftGames, and starts afresh when played again all
+ *  the same). A state made after the game has no first-seen times of its own,
+ *  either: the records it reads came to this page long ago, and a close among
+ *  them would have its grace long past. Counted by the doc, not by a frame that
+ *  looked at the table meanwhile: a table out of the room's list for the whole
+ *  game, or a page whose first frame comes after it, resumes the same. Kept
+ *  apart from the states: a page that was bound while the game was played has
+ *  none. */
 const servedMoves = new Map<string, number>();
 
 /** Forget what table st was waiting on, so every wait starts again from now:
@@ -749,7 +753,7 @@ function lookAtClock(now: number): void {
  *  seed would rewrite a round every page has shown (and its own seed's
  *  lateness would choose, the result known, whether it counts). */
 function watchedClose(st: TableState, round: RoundView): boolean {
-  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
+  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`, st.inc);
   return raw !== undefined && clock.inAt !== null && raw > Math.max(clock.realFrom, clock.inAt);
 }
 
@@ -760,7 +764,7 @@ function watchedClose(st: TableState, round: RoundView): boolean {
 function seen(st: TableState, key: string, now: number): number {
   let at = st.seen.get(key);
   if (at === undefined) {
-    const raw = computedSeenAt(st.t, key);
+    const raw = computedSeenAt(st.t, key, st.inc);
     at = Math.min(now, Math.max(raw ?? now, clock.wakeAt, st.wakeAt));
     st.seen.set(key, at);
   }
@@ -819,12 +823,13 @@ function supersede(st: TableState): void {
 
 /** A state served again, its waits started afresh, as after a wake: no duty of
  *  it ran while the table played another incarnation (or since this page was
- *  bound), so a timer whose wait spanned that starts again (or a close seen
- *  before would have its grace long past, and the first page to reveal would
- *  forfeit the players whose pages hadn't yet), and what was built on those
- *  waits is built again (clock.gen): a betting view cached expired, with the
- *  fold unchanged, would close on the old deadline, and the scan keeps the idle
- *  time it took from the first-seen ones. */
+ *  bound; a FAIR ONLY game left had only the few of serveLeftGames), so a timer
+ *  whose wait spanned that starts again (or a close seen before would have its
+ *  grace long past, and the first page to reveal would forfeit the players
+ *  whose pages hadn't yet), and what was built on those waits is built again
+ *  (clock.gen): a betting view cached expired, with the fold unchanged, would
+ *  close on the old deadline, and the scan keeps the idle time it took from the
+ *  first-seen ones. */
 function resumeWaits(st: TableState): void {
   forgetWaits(st);
   st.wakeAt = clock.last ?? Date.now();
@@ -874,9 +879,10 @@ function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult 
   }
   // (Resumed after a move: the game the table plays went to or from a FAIR ONLY
   // one at this table since this page last served it, or since it was bound, and
-  // no duty of this state ran meanwhile. The doc counts the moves (casinoDoc
-  // computedGameMovesOf), so a table no frame looked at during the game, and a
-  // page whose first frame comes after it, resume the same.)
+  // no duty of this state ran meanwhile, bar the few a game left has
+  // (serveLeftGames). The doc counts the moves (casinoDoc computedGameMovesOf),
+  // so a table no frame looked at during the game, and a page whose first frame
+  // comes after it, resume the same.)
   const moves = computedGameMovesOf(t);
   if (moves !== (servedMoves.get(t) ?? 0)) resumeWaits(st);
   servedMoves.set(t, moves);
@@ -898,7 +904,7 @@ function ordinaryTableOf(t: string): { st: TableState; res: FoldResult } | null 
 
 /** The fold's result now, noted (the state of a duty after another wrote). */
 function resultOf(st: TableState): FoldResult | null {
-  const res = computedFoldOf(st.t);
+  const res = computedFoldOf(st.t, st.inc);
   if (res) noteResult(st, res);
   return res;
 }
@@ -933,7 +939,7 @@ function chosenRoundU(st: TableState, res: FoldResult): RedecideCandidate | null
   // checkpoint; fold order picks among them and the chips are right either way
   // (C4, §6.4). The owner's signed d/o is bound to its own decision separately
   // (attestDuty), so a replay can't make it vouch for a pocket it didn't fold.
-  return computedRedecide(st.t)[0] ?? null;
+  return computedRedecide(st.t, st.inc)[0] ?? null;
 }
 
 /** Keep what the fold said that a trim takes away: the last decided round
@@ -1247,7 +1253,7 @@ function movedOn(st: TableState, was: FoldResult, res: FoldResult, since: Readon
   // by the page that counted the higher, and a close of it then freezes
   // them. The seed store holds 256. An earlier build forgot them all.)
   const lastClosed = Math.max(was.rounds.length > 0 ? was.rounds[was.rounds.length - 1].r : was.base.u, playedTo(st, was));
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   // 🩹 The "round after, never seen closed" keep is for a plain trim, where
   // this page's own round-(u+1) slip was composed against the session that
   // the trim carried forward. Ending a forgery is not that: the round-(u+1)
@@ -1340,13 +1346,13 @@ function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
     const was = st.chainClose.get(v.r);
     st.chainClose.set(v.r, v.close);
     if (was === undefined || was === v.close || !watchedClose(st, v)) continue;
-    const closeAt = computedSeenAt(st.t, `c:${v.r}:${v.close}`)!;
+    const closeAt = computedSeenAt(st.t, `c:${v.r}:${v.close}`, st.inc)!;
     sc ??= scanOf(st, res);
     for (const pid of v.revealed) {
       const slip = frozenSlip(sc, v, pid);
       const out = slip !== null && (sc.reveals.get(v.r)?.get(pid) ?? []).some((key) => {
         const x = asReveal(sc!.ses?.get(key));
-        const at = computedSeenAt(st.t, key);
+        const at = computedSeenAt(st.t, key, st.inc);
         return x !== null && at !== undefined && at < closeAt && revealKey(x) === key && slipCommit(st.ctx, x.r, x.p, x.s) === slip.c;
       });
       if (out) {
@@ -1429,7 +1435,7 @@ function pushIn<K>(m: Map<K, string[]>, k: K, key: string): void {
  *  any change to the session's keys is a new result). */
 function scanOf(st: TableState, res: FoldResult): Scan {
   if (st.scan && st.scan.res === res && st.scan.gen === clock.gen) return st.scan;
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   const sc: Scan = {
     res, gen: clock.gen, ses, slipOf: st.slipOf,
     slips: new Map(), reveals: new Map(), closes: new Map(), forfeits: new Map(), abandons: new Map(), houses: new Map(), joins: new Map(),
@@ -2394,7 +2400,7 @@ function roundCheck(st: TableState, res: FoldResult, now: number): ComputedRound
   // reveal: otherwise every seed reads as seen with it, in time or not. (Of
   // the house's, only a seed seen before its reveal: one that crossed it on
   // the way counts nothing, and the house can't have had it.)
-  const closeAt = computedSeenAt(st.t, `c:${D.r}:${D.close}`);
+  const closeAt = computedSeenAt(st.t, `c:${D.r}:${D.close}`, st.inc);
   const H = D.decided === 'house' ? D.house : undefined;
   if ((F || H) && closeAt !== undefined && closeAt > clock.realFrom) {
     const closeSeen = seen(st, `c:${D.r}:${D.close}`, now);
@@ -2511,10 +2517,10 @@ function signed<T extends { k: string }>(ctx: FoldCtx, kind: SignedKind, body: T
  *  it), in a transaction of its own, and keep it to put back. A record this
  *  page signed is marked checked first, so the recount never checks it. */
 function put(st: TableState, key: string, rec: object, r: number, isSigned: boolean): boolean {
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   const pk = parseKey(key);
   if (!ses || !pk) return false;
-  if (isSigned) markComputedVerdict(st.t, pk.h);
+  if (isSigned) markComputedVerdict(st.t, pk.h, st.inc);
   transactCasino(() => ses.set(key, rec));
   st.mine.set(key, { r, kind: pk.kind, rec, bytes: canon(rec)! });
   return true;
@@ -2555,7 +2561,7 @@ function extraOf(st: TableState, rec: AnySlipRec): CrapsExtra | undefined {
 function writeSlip(
   st: TableState, res: FoldResult, o: number, felt: RouletteBet[] | CrapsBet[], fresh: boolean, now: number, extra?: CrapsExtra,
 ): boolean {
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   if (!ses) return false;
   const me = getPlayerId();
   const pub = getIdentityPub();
@@ -2800,12 +2806,67 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
     tickTable(st, now);
     tellPhase(st, now);
   }
+  serveLeftGames(inRoom, now);
   // A live table out of the room ends; ended incarnations, whatever tables
   // were passed (a removed one isn't), are compacted.
   awayDuty(inRoom, now);
   compactDuty(getIdentityPub(), now);
   recoverDuty(getIdentityPub(), now);
   houseDuty(now);
+}
+
+/**
+ * 🔒 Serve the FAIR ONLY games the tables passed have left (S9 moved the table
+ * to another game of the deed holder's, or of the switch's hint): each live
+ * game this page keeps a state of, of the table's game, beside the one played.
+ * What the page put into such a game while it was played reaches a decision
+ * all the same: its seeds are revealed, its close written while its house is
+ * heard (closePaused) and its abandon (houseAway), its put-backs go, its notes
+ * are kept.
+ * Not what would start something for the player where the table no longer plays
+ * the game (tickTable side): the held felt, the riders' bets, the phase the
+ * table's listeners are told of, which is the game played's. Only a state that
+ * exists is served: a page serves a game it has played at the table, and one
+ * it has not, or that it was bound after the table left, it does not (a state
+ * made at a look at the table is the game played's: tableOf). A game that has
+ * ended is let go of by compaction, as before. Nor a game the page has nothing
+ * in (nothingAtStake): a table's hint can name many games in turn, and the
+ * page would pay for the gates of each at every frame for no duty. What a pass
+ * costs a state that is not due is a lookup and a comparison.
+ */
+function serveLeftGames(inRoom: ReadonlyMap<string, GameName>, now: number): void {
+  if (fairTables.size === 0) return;
+  const me = getPlayerId();
+  // (The game each table plays, asked of S9 once for a table in this pass, and only for a state that is due: S9 reads
+  // all the table's games, which a hint can multiply, and the pass looks at every state the page keeps.)
+  const played = new Map<string, string | null>();
+  for (const st of [...fairTables.values()]) {
+    if (inRoom.get(st.t) !== st.game) continue;
+    if (st.tickedAt !== null && now >= st.tickedAt && now - st.tickedAt < TICK_MS) continue;
+    let inc = played.get(st.t);
+    if (inc === undefined) played.set(st.t, (inc = computedIncOf(st.t)));
+    if (st.inc === inc) continue;
+    if (computedResolutionOf(st.t, st.inc)?.live !== true) continue;
+    if (nothingAtStake(st, me)) continue;
+    st.tickedAt = now;
+    tickTable(st, now, true);
+  }
+}
+
+/** Whether the page has nothing in the game of state `st` that a duty would go on
+ *  with: no record it wrote or keeps a copy of, and its player has no felt on the
+ *  open round (undecided: being played or closed). Every duty of a game the table
+ *  has left is its player's (their seed, their close, their abandon, what they put
+ *  back and the copies they keep), so a page that only looked at the game has
+ *  none. The felt may be a record of the player's other tab: the page has written
+ *  nothing, and the tab that did may be gone. A round decided asks no more of a
+ *  page that wrote nothing in it and kept no copy: what its player's other tab
+ *  wrote there and a peer deleted is put back once the table plays the game
+ *  again. Read from the fold directly: noticing a result is the duties'. */
+function nothingAtStake(st: TableState, me: string): boolean {
+  if (st.mine.size > 0 || st.witness.size > 0) return false;
+  const res = computedFoldOf(st.t, st.inc);
+  return res === null || !res.felts.has(me);
 }
 
 /**
@@ -2892,7 +2953,7 @@ function putSwitchBack(t: string, now: number): void {
   transactCasino(() => putComputedSwitchBack(t, st.inc));
 }
 
-function tickTable(st: TableState, now: number): void {
+function tickTable(st: TableState, now: number, side = false): void {
   // Nothing at all before the room's state is in: the doc may be the room
   // cache's copy, and a seed revealed for a close the room has since
   // dropped is a seed out for nothing.
@@ -2917,8 +2978,12 @@ function tickTable(st: TableState, now: number): void {
   // (First: what a round rests on is kept before any duty reads it lost.)
   if (!forged) noteChain(st, now);
   if (!forged) noteWitness(st, me, now);
-  flushDuty(st, me, now);
-  rideDuty(st, me, now);
+  // (🔒 A game the table has left starts nothing new for the player: no felt
+  // held back goes, no riding bets are put down for a roll it plays no more.)
+  if (!side) {
+    flushDuty(st, me, now);
+    rideDuty(st, me, now);
+  }
   recommitDuty(st, me, now);
   noteSeedOut(st, now);
   closeDuty(st, me, pub, now);
@@ -2957,7 +3022,7 @@ function tellPhase(st: TableState, now: number): void {
  *  undecided round the room may have voided meanwhile (wakeHolds). */
 function revealDuty(st: TableState, me: string, now: number): void {
   const res = resultOf(st);
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   if (!res || !ses) return;
   const sc = scanOf(st, res);
   for (const round of res.rounds) {
@@ -2997,7 +3062,7 @@ function heardAround(at: number, now: number): boolean {
  *  link came back after a deaf spell came all at once with what followed it
  *  (its seeds, its void), as one that came as the page woke. */
 function watchedLive(st: TableState, round: RoundView, now: number): boolean {
-  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
+  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`, st.inc);
   return raw !== undefined && watchedClose(st, round) && heardAround(raw, now);
 }
 
@@ -3053,7 +3118,7 @@ function voidHolds(st: TableState, round: RoundView, now: number): boolean {
  */
 function wakeHolds(st: TableState, round: RoundView, me: string, now: number): boolean {
   if (round.decided !== null || watchedClose(st, round)) return false;
-  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`);
+  const raw = computedSeenAt(st.t, `c:${round.r}:${round.close}`, st.inc);
   if (raw === undefined) return false;
   const old = now - raw >= ABANDON_MS - TABLE_CLOCK_SLACK_MS;
   if (old && !tablesAwake(now)) return true;
@@ -3358,7 +3423,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   if (!res) return;
   const h = res.required ?? res.joins[0]?.rec.c;
   const fair = isFairOnlyInc(st.inc);
-  if (fair && (h === undefined || closePaused(st, res))) return;
+  if (fair && (h === undefined || closePaused(st, res, h, now))) return;
   const craps = st.game === 'craps';
   const deadline = craps ? crapsDutyOn(st, res, now) ?? undefined : bettingOn(st, res, now)?.view.phaseDeadline;
   if (deadline === undefined) return;
@@ -3368,7 +3433,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   if (res.openCloses.some((c) => c.state !== 'invalid')) return;
   // (A table holding MAX_TABLE_PIDS players freezes no newcomer: its next
   // checkpoint couldn't carry them all. This page's own player either.)
-  if (crowdedOut(st.t, me)) return;
+  if (crowdedOut(st.t, me, st.inc)) return;
   const sc = scanOf(st, res);
   // (A close of its own on this parent stands it down only if it names what a
   // close would name now. One the fold refused because the house stepped the
@@ -3385,7 +3450,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   // (Seen just now, as this tick noted it: noteSeedOut.)
   if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
   const others = (craps ? [...res.felts.values()].filter((s) => crapsFreezable(res.carry as CrapsCarry, s)) : staked)
-    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c) && !computedSlipDoubted(st.t, s.hash))
+    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c) && !computedSlipDoubted(st.t, s.hash, st.inc))
     .map((s) => ({ s, at: seen(st, s.key, now) }))
     .sort((a, b) => a.at - b.at || (a.s.rec.p < b.s.rec.p ? -1 : 1));
   // (Newcomers are counted as they go in, this page's own player first: the
@@ -3393,7 +3458,7 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   // passes the caps (S6 e) however each fits alone. Such a close would hold the
   // round: its page writes no other (signedIn), and the pages that see the
   // table as this one does would each write the same.)
-  const room = pidRoomOf(st.t);
+  const room = pidRoomOf(st.t, st.inc);
   if (room) pidTaken(room, me);
   const f: Record<string, string> = { [me]: own.hash };
   for (const { s } of others) {
@@ -3418,11 +3483,21 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
  *   ROOM_BYTES. Kept bytes only, and not the open round's felts that no close
  *   froze (feltBytes): junk can't pause a table (the house sweeps it), nor a
  *   few long felts the table's strangers put down on the round that is open.
+ * - the house whose commitment the close would name (`h`) is not heard
+ *   (houseAway): only that house holds the seed behind it, so a close written
+ *   while it is away is a round nobody reveals for. Another house heard
+ *   decides nothing. A house the page can't tell, or that is none of the
+ *   game's for the open round any more (a hand-over moved the game to a
+ *   holder whose houses it is not), is no pause: the close that names it is
+ *   voided by an abandon, and the round after is the houses' that are, the
+ *   abandon waiting the longer.
  * The bets themselves, the reveals and an abandon go on: the bets stay on the
- * felt. (That the house is heard is a pause beside these: PR 6c-4b-1b.)
+ * felt.
  */
-function closePaused(st: TableState, res: FoldResult): boolean {
-  return fairClosePaused(res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, (computedResolutionOf(st.t, st.inc)?.fin ?? null) !== null);
+function closePaused(st: TableState, res: FoldResult, h: string, now: number): boolean {
+  return fairClosePaused(
+    res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, (computedResolutionOf(st.t, st.inc)?.fin ?? null) !== null,
+  ) || houseAway(st, h, now);
 }
 
 /** closePaused's rule on its own inputs: the session's kept bytes, the room's
@@ -3430,6 +3505,22 @@ function closePaused(st: TableState, res: FoldResult): boolean {
  *  holds MAX_HELD_ROUNDS), and whether a fin stands. */
 export function fairClosePaused(kept: number, room: number, ahead: number, fin: boolean): boolean {
   return kept >= PAUSE_BYTES || room >= ROOM_BYTES || ahead > MAX_HELD_ROUNDS || fin;
+}
+
+/**
+ * Whether this page knows the house whose commitment `h` a close of table st's
+ * open round names and has not heard it for HOUSE_HEARD_MS (casinoDoc).
+ * - At a FAIR ONLY game, `h` is the one required after the last round
+ *   decided (its house reveal carried it), or a join of the open round
+ *   (computedCommitHouse): the one house that can reveal for the close,
+ *   whoever delegated it. A page that can't tell which house it is hears none,
+ *   and the round is not held for it.
+ * - At a house table it is the room's house: any one of the deed holder's.
+ */
+function houseAway(st: TableState, h: string, now: number): boolean {
+  if (!isFairOnlyInc(st.inc)) return !houseOnline(now);
+  const house = computedCommitHouse(st.t, st.inc, h);
+  return house !== undefined && !houseHeardFrom(house, now);
 }
 
 /**
@@ -3681,7 +3772,7 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
     }
   }
   const idx = placeOf('abandon', st.ctx, tip.r, pubs, pub);
-  if (now < closeSeen + abandonWait(tip, now) + idx * STAGGER_MS) return;
+  if (now < closeSeen + abandonWait(st, tip, now) + idx * STAGGER_MS) return;
   const rec = signed(st.ctx, 'abandon', { r: tip.r, x: tip.close, k: pub });
   const key = abandonKey(rec);
   if (key) put(st, key, rec, tip.r, true);
@@ -3689,13 +3780,16 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
 
 /** How long after its close the abandon waits to void tip: ABANDON_MS, or
  *  at a Fair round HOUSE_HEARD_MS while this page hasn't heard the house for
- *  that long (casinoDoc houseOnline) — unless the house's reveal of the
- *  close is in, as the fold counts it (verified, a house's: RoundView
- *  houseWaits): it waits on a seed it counted, which the room has (one this
- *  page hasn't heard yet), and voided meanwhile the round would read void,
- *  then decided as the seed came. A forged one holds nothing. */
-function abandonWait(tip: RoundView, now: number): number {
-  if (tip.closeRec.h === undefined || houseOnline(now) || tip.houseWaits !== undefined) return ABANDON_MS;
+ *  that long (houseAway: the room's house at a house table; at a FAIR ONLY game
+ *  the house whose commitment the close names, and none this page can't tell) —
+ *  unless the house's reveal of the close is in, as the fold counts it
+ *  (verified, a house's: RoundView houseWaits): it waits on a seed it counted,
+ *  which the room has (one this page hasn't heard yet), and voided meanwhile
+ *  the round would read void, then decided as the seed came. A forged one
+ *  holds nothing. */
+function abandonWait(st: TableState, tip: RoundView, now: number): number {
+  const h = tip.closeRec.h;
+  if (h === undefined || tip.houseWaits !== undefined || !houseAway(st, h, now)) return ABANDON_MS;
   return HOUSE_HEARD_MS;
 }
 
@@ -3718,7 +3812,7 @@ function reputDuty(st: TableState, me: string, now: number): void {
   if (st.reputAt !== null && now >= st.reputAt && now - st.reputAt < REPUT_MS) return;
   st.reputAt = now;
   const res = resultOf(st);
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   if (!res || !ses) return;
   const u = res.base.u;
   for (const [c, r] of [...st.burned]) if (r <= u) st.burned.delete(c);
@@ -3904,7 +3998,7 @@ function playedTo(st: TableState, res: FoldResult): number {
 function witnessLost(st: TableState, res: FoldResult, now: number): Map<string, string[]> {
   const was = st.lost;
   if (was && was.res === res && was.gen === clock.gen && was.ver === st.witnessVer) return was.out;
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   const out = new Map<string, string[]>();
   for (const [close, w] of st.witness) {
     for (const [key, copy] of w.copies) {
@@ -3950,7 +4044,7 @@ function heldBack(st: TableState, res: FoldResult, close: string, now: number): 
  */
 function witnessDuty(st: TableState, pub: string, now: number): void {
   const res = resultOf(st);
-  const ses = computedSessionForWrite(st.t);
+  const ses = computedSessionForWrite(st.t, st.inc);
   if (!res || !ses || st.witness.size === 0) return;
   const lost = witnessLost(st, res, now);
   if (![...lost.values()].some((keys) => keys.some((key) => !st.mine.has(key)))) {
@@ -3971,7 +4065,7 @@ function witnessDuty(st: TableState, pub: string, now: number): void {
       const copy = w.copies.get(key)!;
       if (done.has(key) || st.mine.has(key) || now < copy.missingAt! + turn) continue;
       const pk = parseKey(key)!;
-      if (pk.kind !== 'x') markComputedVerdict(st.t, pk.h);
+      if (pk.kind !== 'x') markComputedVerdict(st.t, pk.h, st.inc);
       transactCasino(() => ses.set(key, copy.v));
       done.add(key);
     }
@@ -4427,11 +4521,10 @@ interface PidRoom {
 
 /** The room table `t` has for players now, or null when this page counts none
  *  (it holds no base: computedRecoveryOn). */
-function pidRoomOf(t: string): PidRoom | null {
+function pidRoomOf(t: string, inc: string | null = computedIncOf(t)): PidRoom | null {
   if (!computedRecoveryOn()) return null;
-  const inc = computedIncOf(t);
-  const has = computedTablePids(t);
-  return { has, count: has.size, bytes: computedTablePidBytes(t), maxBytes: inc !== null && isFairOnlyInc(inc) ? MAX_TABLE_PID_BYTES : Infinity };
+  const has = computedTablePids(t, inc);
+  return { has, count: has.size, bytes: computedTablePidBytes(t, inc), maxBytes: inc !== null && isFairOnlyInc(inc) ? MAX_TABLE_PID_BYTES : Infinity };
 }
 
 /** Whether pid `p` has a place at the table: it plays there, or the players
@@ -4450,11 +4543,11 @@ function pidTaken(room: PidRoom, p: string): boolean {
   return true;
 }
 
-/** Whether pid `me` would join table `t` as a newcomer it has no place for
- *  (MAX_TABLE_PIDS: computedTablePids; and at a FAIR ONLY game their ids'
- *  bytes, MAX_TABLE_PID_BYTES). */
-function crowdedOut(t: string, me: string): boolean {
-  const room = pidRoomOf(t);
+/** Whether pid `me` would join table `t` (its game `inc`, the one played by
+ *  default) as a newcomer it has no place for (MAX_TABLE_PIDS: computedTablePids;
+ *  and at a FAIR ONLY game their ids' bytes, MAX_TABLE_PID_BYTES). */
+function crowdedOut(t: string, me: string, inc: string | null = computedIncOf(t)): boolean {
+  const room = pidRoomOf(t, inc);
   return room !== null && !pidFits(room, me);
 }
 
@@ -5203,7 +5296,7 @@ export function leaveComputedTables(now = Date.now()): void {
       leaveCraps(st, me, now);
       continue;
     }
-    const held = computedFoldOf(st.t)?.felts.get(me);
+    const held = computedFoldOf(st.t, st.inc)?.felts.get(me);
     // (Nothing waits for a flush now, nor is one held to go later: the page
     // won't tick here again. A felt held back was never on the table.)
     st.pending = null;
@@ -5236,7 +5329,7 @@ function leaveCraps(st: TableState, me: string, now: number): void {
   st.left = true;
   st.pending = null;
   if (!tablesAwake(now) || !casinoWhole(st.t) || !computedSettled(st.t)) return;
-  const res = computedFoldOf(st.t);
+  const res = computedFoldOf(st.t, st.inc);
   const latest = res?.felts.get(me);
   const rec = latest?.rec as CrapsSlipRec | undefined;
   if (!res || !latest || !rec || !st.mine.has(latest.key) || rec.l === 1) return;
