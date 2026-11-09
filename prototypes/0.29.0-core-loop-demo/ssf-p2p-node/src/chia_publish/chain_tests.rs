@@ -3072,14 +3072,25 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     // lost all the same: another edition's (the one file is saved over each
     // edition, so a stop loses only this edition's save), this edition's
     // under another hint (the contact key replaced), and this edition's
-    // void one, which names no write at all.
+    // void one, which names no write at all. Over the void one the era's
+    // write count goes on, as the writer counted it, so the era's budget
+    // holds: W's listing was the era's second write.
     let hint_of = |ck: &[u8; 32], era: u64| hex::encode(chia_lane::derive_ck_hint(NET, ck, era));
     let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
     let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
-    let void = saved.voided();
-    for (on_record, what) in [(&other_era, "another edition's mark"), (&other_hint, "a mark under another hint"), (&void, "this edition's void mark")] {
+    for (on_record, what) in [(&other_era, "another edition's mark"), (&other_hint, "a mark under another hint")] {
         assert_eq!(burner_path(&s.lease, Some(on_record)), Some(saved.clone()), "{what}");
     }
+    let void = saved.voided();
+    let second = NodePublishMark { writes: 2, ..saved.clone() };
+    assert_eq!(burner_path(&s.lease, Some(&void)), Some(second.clone()), "this edition's void mark");
+    // Another node id's void mark counts nothing of this node's, and a mark
+    // of another edition keeps the floor.
+    let counted = NodePublishMark { writes: 5, ..void.clone() };
+    assert_eq!(burner_path(&s.lease, Some(&counted)), Some(NodePublishMark { writes: 6, ..saved.clone() }), "the count goes on");
+    let another = NodePublishMark { node_id: Some("another node".into()), ..counted.clone() };
+    assert_eq!(burner_path(&s.lease, Some(&another)).map(|m| m.writes), Some(1), "another node id's");
+    assert_eq!(burner_path(&s.lease, Some(&NodePublishMark { writes: 5, ..other_era.clone() })).map(|m| m.writes), Some(1), "another edition's");
 
     let (peak, moved) = (s.chain.peak(), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let mut rng = StdRng::seed_from_u64(1);
@@ -3095,7 +3106,7 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     s.reconcile().await;
     assert!(!s.lease.outgoing_pending_for(Payer::of(&w)) && s.lease.holds_for(Payer::of(&w)), "W's spend settling");
     assert_eq!(burner_path(&s.lease, None), Some(saved.clone()), "still found while it settles");
-    assert_eq!(burner_path(&s.lease, Some(&void)), Some(saved.clone()), "…over a void mark too, spent in its own era");
+    assert_eq!(burner_path(&s.lease, Some(&void)), Some(second), "…over a void mark too, spent in its own era");
     assert_eq!(burner_path(&s.lease, Some(&lost)), None, "a mark that names it is not filed again");
     let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "the mark's reader confirms W's write");
@@ -3145,13 +3156,16 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     assert_eq!(lost.payer.as_deref(), Some(p0.as_str()), "naming P(0)");
     assert_eq!(lost.parked, hex::encode(write.coins.parked), "its dish coin parked, its gift the parent");
     // Another edition's mark on record, or this edition's under another
-    // hint or void, names no write of this era's under its hint.
+    // hint or void, names no write of this era's under its hint; over the
+    // void one the era's write count goes on.
     let hint_of = |ck: &[u8; 32], era: u64| hex::encode(chia_lane::derive_ck_hint(NET, ck, era));
     let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
     let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
-    for on_record in [&other_era, &other_hint, &saved.voided()] {
+    for on_record in [&other_era, &other_hint] {
         assert_eq!(lost_listing_mark(&s.lease, Some(on_record), NET, &CK, 0, false, &money, derive), Some(saved.clone()), "{on_record:?}");
     }
+    let second = NodePublishMark { writes: 2, ..saved.clone() };
+    assert_eq!(lost_listing_mark(&s.lease, Some(&saved.voided()), NET, &CK, 0, false, &money, derive), Some(second), "the era's count goes on over a void mark");
     assert_eq!(lost_listing_mark(&s.lease, Some(&saved), NET, &CK, 0, false, &money, derive), None, "a mark that names it is not filed again");
 
     let (hint0, moved) = (hex::encode(hint), addrs_signature(&entries_of("203.0.113.9:4444", 0)));

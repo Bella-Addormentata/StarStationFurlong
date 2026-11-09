@@ -2456,7 +2456,10 @@ pub(crate) fn money_path_burner_payer(
 /// under (`None` when none was filed, which counts as the SSF wallet's),
 /// the coins, the record's digest and the spend's number, and the address
 /// set, the date and the node id the record itself carries, opened under
-/// `ck` ([`chia_lane::open_v2`]). The era's write count is the floor, 1,
+/// `ck` ([`chia_lane::open_v2`]). The era's write count goes on from a void
+/// mark of this era on record, which keeps it ([`NodePublishMark::voided`]),
+/// as the writer counted it: the void mark's count and this write, when the
+/// void mark names the record's node id. Otherwise it is the floor, 1,
 /// since a lost mark's count is not on chain. The mark's reader then judges
 /// the write as any other ([`presence_step`]), and the hint rule holds the
 /// other payer's write until the next era. A mark of this era under this
@@ -2502,9 +2505,11 @@ pub(crate) fn lost_listing_mark(
     }
     let plain = chia_lane::open_v2(net, ck, KIND_PRESENCE, era, &held.record).ok()?;
     let record = chia_lane::decode_presence_v2(&plain, era).ok()?;
+    let node_id = record.node_id.to_string();
+    let writes = on_record.filter(|m| m.node_id.as_deref() == Some(node_id.as_str())).map_or(1, |m| m.writes.saturating_add(1));
     let found = NodePublishMark {
         era,
-        writes: 1,
+        writes,
         addrs_sig: addrs_signature(&record.addrs),
         last_at: record.issued_at,
         hint: era_hint,
@@ -2515,7 +2520,7 @@ pub(crate) fn lost_listing_mark(
         confirmed_height: 0,
         settled: false,
         spend: Some(held.spend),
-        node_id: Some(record.node_id.to_string()),
+        node_id: Some(node_id),
         parked: hex::encode(held.coins.parked.to_bytes()),
         payer: held.payer.map(|p| p.hex()),
     };
