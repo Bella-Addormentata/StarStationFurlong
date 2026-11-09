@@ -15,12 +15,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { dutyRank, seedTable, slipCommit, slipKeyFor } from './computedFold';
+import { dutyRank, nextSid3, seedTable, slipCommit, slipKeyFor } from './computedFold';
 import { faironlyInc, NO_CLOSE, sealCk, sealFin } from './computedFairOnly';
 import { delegation, hex, house, NAME, OPENING_CARRY, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { clockOf, deliver, frame, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, run, send, signAs, switchOn, sync, updatesOf } from './computedPageKit';
+import { clockOf, deliver, frame, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, send, signAs, switchOn, sync, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { black, red, testHouse } from './computedTestKit';
+import { black, ComputedKit, red, testHouse } from './computedTestKit';
 
 vi.stubGlobal('window', { location: { search: '' } });
 
@@ -443,6 +443,30 @@ describe('the seeds behind the slips of a page-signed incarnation, while its tab
     takeSwitch(a);
     expect(a.casino.computedIncOf(TABLE)).toBe(game ? G.inc : other);
     tick(a, at, 2 * a.table.REPUT_MS, STEP, []);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
+  });
+
+  // The first look at the table finds the state the switch left and replaces it, with no
+  // frame come yet (so no compaction duty): a read of the table is a look at it.
+  it('go at the first look at the table when another page-signed incarnation takes the switch while a game is played: a read replaces the state, no frame having come', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    takeSwitch(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (nothing has looked yet)
+    a.table.readComputedRoulette(TABLE, T0 + STEP);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull(); // (nothing of the incarnation the switch left will be revealed now)
+  });
+
+  // A look that asks for the other game finds nothing to read, and still passes the states beside the
+  // game by: the table is looked at all the same.
+  it('go at the first look at the table that asks for the other game too: a read of craps at the roulette game\'s table replaces the state', async () => {
+    const { a, felt } = await frozen();
+    record(a, root);
+    takeSwitch(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.fair.seedFor(felt, seedCtx(a, 1))).not.toBeNull(); // (nothing has looked yet)
+    expect(a.table.readComputedCraps(TABLE, T0 + STEP)).toBeNull();
     expect(a.fair.seedFor(felt, seedCtx(a, 1))).toBeNull();
   });
 
@@ -1881,6 +1905,59 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
   });
 
+  // The page's clock is the look's own, as every wait of the table is: the first look that serves
+  // the table again after the game, a read at a time of its own with no frame between, starts the
+  // window there, and not at the wall clock, which stands where the last frame left it.
+  it('start afresh on the page\'s clock, the time of the look that serves the table again: the window of a slip starts there, no frame having come since the game ended', async () => {
+    const [a] = await openRoom(['A'], T0);
+    expect(a.table.writeComputedSlip(TABLE, [red(9)], T0)).toBe('ok');
+    const window = a.table.BET_WINDOW_MS;
+    record(a, root); // (the switch names the page-signed incarnation all the while: the game is played over it)
+    const mid = run([a], T0 + STEP, T0 + 5_000, { step: STEP });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    record(a, end);
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    const look = mid + 30_000;
+    expect(Date.now()).toBeLessThan(mid); // (the wall clock stands at the last frame)
+    const view = a.table.readComputedRoulette(TABLE, look)!;
+    expect(view.phase).toBe('betting');
+    expect(view.phaseDeadline!).toBeGreaterThanOrEqual(look + window - 1_000);
+  });
+
+  // The count of the games played is a table's own: a game that opens and ends at one table moves
+  // no other, so a table beside it that the page looks at every frame, a game of its own played
+  // all the while, keeps the waits it had.
+  it('do not start afresh for a table the game is not at: the window running at another table of the page, the game it plays, runs out when it did', async () => {
+    const T2 = 'roulette-2';
+    const G2 = { room: PAGE_ROOM, t: T2, inc: faironlyInc('p', PAGE_ROOM, T2, NAME) };
+    const root2 = rootOf(G2, 'p', { dl: delegation(owner, house.pub, PAGE_ROOM) });
+    const kit2 = new ComputedKit(G2);
+    const [a] = await openRoom(['A'], T0);
+    a.doc.transact(() => {
+      computedOf(a).set(root2.key, root2.value);
+      computedOf(a).set(`ses:${T2}:${G2.inc}:${nextSid3(G2, root2.value)}`, new Y.Map());
+    });
+    const join = kit2.houseJoin(house, 1);
+    putIn(a, [[join.key, join.rec]], T2);
+    expect(a.casino.computedIncOf(T2)).toBe(G2.inc);
+    expect(a.table.writeComputedSlip(T2, [red(9)], T0)).toBe('ok');
+    const window = a.table.BET_WINDOW_MS;
+    const tables = [TABLE, T2];
+    const opened = run([a], T0 + STEP, T0 + window - 4_000, { step: STEP, tables });
+    expect(keysIn(a, 'c', 1, T2)).toEqual([]); // (the window is still running)
+    // A game opens at the first table and ends: that table moved, and the other did not.
+    record(a, root);
+    switchTo(a, G.inc);
+    const played = run([a], opened, opened + 1_000, { step: STEP, tables });
+    record(a, end);
+    const back = run([a], played, played + 2_000, { step: STEP, tables, until: () => a.casino.computedIncOf(TABLE) === INC });
+    expect(a.casino.computedIncOf(TABLE)).toBe(INC);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(1);
+    expect(a.casino.computedGameMovesOf(T2)).toBe(0);
+    run([a], back + STEP, T0 + window + 4_000, { step: STEP, tables, until: () => keysIn(a, 'c', 1, T2).length > 0 });
+    expect(keysIn(a, 'c', 1, T2).length).toBeGreaterThan(0);
+  });
+
   it.each([
     ['the card reads the table: a look puts the other\'s state in place of the one that waited', true],
     ['nothing looks at the table in the room\'s list: the compaction duty alone puts it in place', false],
@@ -1999,6 +2076,32 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     at = tick(a, at, 2_000); // (the table is back in the room\'s list: the switch is put back over the name)
     expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: other });
     expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    const view = a.table.readComputedRoulette(TABLE, at + STEP)!;
+    expect(view.phase).toBe('betting');
+    expect(view.phaseDeadline!).toBeLessThan(at); // (the window started when the slip came, and nothing has started it afresh)
+  });
+
+  // A move between page-signed incarnations is the switch's, as ever: it is
+  // no move of the table to or from a game, whether the page looks at the table
+  // all the while or not, and nothing is served afresh.
+  it('do not start afresh when the table moves between page-signed incarnations with no game played, the table in the room\'s list all along: the window of a slip that came meanwhile is served as it is', async () => {
+    const [a, b] = await openRoom(['A', 'B'], T0);
+    const other = 'c' + '5b'.repeat(12);
+    const ctxOther = { room: PAGE_ROOM, t: TABLE, inc: other };
+    const window = a.table.BET_WINDOW_MS;
+    let at = tick(a, T0 + STEP, 1_000); // (A runs the page-signed incarnation: its state is there, and it looks at the table)
+    b.doc.transact(() => {
+      const ses = new Y.Map<unknown>();
+      const slip = signAs(b, 'slip', { r: 1, p: b.pid, v: 1, b: [red(9)], c: slipCommit(ctxOther, 1, b.pid, hex('9', 32)) }, ctxOther);
+      ses.set(slipKeyFor(ctxOther)(slip)!, slip);
+      computedOf(b).set(`ses:${TABLE}:${other}:g`, ses);
+    });
+    send(at, b, a);
+    at = tick(a, at + STEP, 3 * window); // (the other's slip is there, its window long over had it run, the table still plays the first)
+    a.doc.transact(() => casinoOf(a).set(`cfg:computed:${TABLE}`, { v: 1, inc: other }));
+    at = tick(a, at + STEP, 2_000);
+    expect(a.casino.computedIncOf(TABLE)).toBe(other);
+    expect(a.casino.computedGameMovesOf(TABLE)).toBe(0);
     const view = a.table.readComputedRoulette(TABLE, at + STEP)!;
     expect(view.phase).toBe('betting');
     expect(view.phaseDeadline!).toBeLessThan(at); // (the window started when the slip came, and nothing has started it afresh)

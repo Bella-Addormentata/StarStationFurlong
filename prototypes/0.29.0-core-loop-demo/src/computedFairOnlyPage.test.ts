@@ -1876,17 +1876,17 @@ describe('a switch that names a FAIR ONLY game: a hint the page-signed machinery
     expect(lists()).toEqual({ recoveries: [], pending: false, ended: [], live: [] });
   });
 
-  it('is played by no duty of a page-signed table yet: its state is none, a frame writes nothing, and a slip is refused (PR 6c-4b opens them one by one)', async () => {
+  it('is played by the duties PR 6c-4b-1a opens: its state is the game\'s, a frame with nothing to do writes nothing, and a slip this page holds no chips for is refused', async () => {
     const { page: a } = await openedPage();
     const table = await import('./computedTable'); // (the load of the modules the page is)
     switchTo(a, P.inc);
     expect(a.casino.isComputedTable(T)).toBe(true);
-    expect(table.readComputedRoulette(T)).toBeNull();
+    expect(table.readComputedRoulette(T)).toMatchObject({ kind: 'roulette', inc: P.inc, phase: 'settled', round: 1 });
     expect(table.readComputedBets(T, 2)).toEqual({});
     const before = Y.encodeStateAsUpdate(a.doc);
     for (const at of [1_700_000_100_000, 1_700_000_400_000, 1_700_003_000_000]) table.tickComputedTables([T], at);
     expect(Y.encodeStateAsUpdate(a.doc)).toEqual(before);
-    expect(table.writeComputedSlip(T, [red(5)])).not.toMatchObject({ ok: true });
+    expect(table.writeComputedSlip(T, [red(5)])).toBe('chips'); // (this page's player holds none: the ledger refuses, not the game)
     expect(Y.encodeStateAsUpdate(a.doc)).toEqual(before);
   });
 });

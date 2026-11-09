@@ -1228,6 +1228,27 @@ describe('🪑 a table holding MAX_TABLE_PIDS players', () => {
       expect(Object.keys(round!.frozen)).not.toContain(c.pid);
     }
   }, 120_000);
+
+  it('weighs no bytes of ids: fat ids, over MAX_TABLE_PID_BYTES together but few, leave the table room (that cap is a FAIR ONLY game\'s, S6 e)', async () => {
+    const pages = await openRoom(['A', 'B', 'C'], T0);
+    const [a, b, c] = pages;
+    const { at: decided } = decideRound([a, b], T0 + STEP, [[red(10)], [red(11)]]);
+    const crowd: Record<string, bigint> = Object.fromEntries(foldOf(a).nets);
+    for (const p of [a, b]) crowd[p.pid] ??= 1n;
+    // 1,400 ids of the longest an id can be (256 three-byte characters): 1,075,200 bytes, a third of the players the cap allows.
+    for (let i = 0; i < 1_400; i++) crowd[String.fromCharCode(0x4e00 + i) + '漢'.repeat(255)] = 1n;
+    trimByHand(a, testIdentity('trim-fat'), crowd);
+    sync(decided, ...pages);
+    const open = run(pages, decided + STEP, decided + 60_000, { step: STEP, until: () => pages.every((p) => viewOf(p, Date.now())?.phase === 'betting') });
+    expect(a.casino.computedTablePids(TABLE).size).toBeLessThan(a.fold.MAX_TABLE_PIDS);
+    expect(a.casino.computedTablePidBytes(TABLE)).toBeGreaterThan(a.fold.MAX_TABLE_PID_BYTES);
+    expect(c.table.writeComputedSlip(TABLE, [red(5)], open)).toBe('ok');
+    expect(a.table.writeComputedSlip(TABLE, [red(5)], open)).toBe('ok');
+    sync(open, ...pages);
+    const r = foldOf(a).open;
+    run(pages, open + STEP, open + 60_000, { step: STEP, until: () => [a, b, c].every((p) => decidedOn(p, r)) });
+    for (const p of [a, b]) expect(Object.keys(foldOf(p).rounds.find((v) => v.r === r)!.frozen)).toContain(c.pid);
+  }, 120_000);
 });
 
 describe('🩹 nothing makes a forged checkpoint final', () => {

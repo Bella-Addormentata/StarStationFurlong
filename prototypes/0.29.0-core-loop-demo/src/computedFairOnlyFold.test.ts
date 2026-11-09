@@ -121,7 +121,7 @@ describe('a FAIR ONLY table has a FAIR ONLY base', () => {
     const session = putRound1(r);
     const res = foldAt(session, null);
     expect(res.rounds).toEqual([]);
-    expect(res).toMatchObject({ tip: null, open: 1, keptBytes: 0, pending: false, houseTable: true, required: null });
+    expect(res).toMatchObject({ tip: null, open: 1, keptBytes: 0, feltBytes: 0, pending: false, houseTable: true, required: null });
     // (it names no session: the first session of an ordinary table, 'g', is not its)
     expect(res.parent).toBe('');
     expect(res.base.sid).toBe('');
@@ -142,11 +142,11 @@ describe('a FAIR ONLY table has a FAIR ONLY base', () => {
     expect(fold.result().rounds.map((v) => [v.r, v.decided])).toEqual([[1, 'house']]);
     // taking the base away again stops the count
     fold.setFairOnlyBase(null);
-    expect(fold.result()).toMatchObject({ rounds: [], keptBytes: 0, records: 0 });
+    expect(fold.result()).toMatchObject({ rounds: [], keptBytes: 0, feltBytes: 0, records: 0 });
     // and with the session fed again, the table is still not open: nothing is counted, shown or held
     fold.reset(session.records.entries());
     const none = fold.result();
-    expect(none).toMatchObject({ rounds: [], tip: null, open: 1, parent: '', keptBytes: 0, records: 7 });
+    expect(none).toMatchObject({ rounds: [], tip: null, open: 1, parent: '', keptBytes: 0, feltBytes: 0, records: 7 });
     expect(none.base.sid).toBe('');
     expect(none.felts.size).toBe(0);
     expect(none.held.size).toBe(0);
@@ -184,6 +184,7 @@ describe('a FAIR ONLY table has a FAIR ONLY base', () => {
     expect(res.base.ended).toBe(true);
     expect(res.nets).toEqual(res.base.n);
     expect(res.keptBytes).toBe(0);
+    expect(res.feltBytes).toBe(0); // (the part of what is kept that only felts account for: none of nothing)
     expect(res.held.size).toBe(0);
   });
 });
@@ -801,6 +802,24 @@ describe('keptBytes: what the pass used, which junk cannot raise', () => {
     expect(open(join, v1, v2).bytes).toBe(sizeOf(join) + sizeOf(v1) + sizeOf(v2));
   });
 
+  it('feltBytes is what only the open round\'s felts account for: a felt a valid close froze is counted with its close, a newer version of it is a felt', () => {
+    const join = kit.houseJoin(H, 1);
+    const v1 = kit.slip(A, 1, [red(2)]);
+    const v2 = kit.slip(A, 1, [red(3)], { v: 2 });
+    const b1 = kit.slip(B, 1, [black(4)]);
+    const open = (...more: Built<unknown>[]) => foldAt(new TestSession().put(...more));
+    const sum = (...bs: Built<unknown>[]) => bs.reduce((n, b) => n + sizeOf(b), 0);
+    expect(open(join)).toMatchObject({ keptBytes: sum(join), feltBytes: 0 });
+    expect(open(join, v1)).toMatchObject({ keptBytes: sum(join, v1), feltBytes: sum(v1) });
+    expect(open(join, v1, v2), 'the newest version only').toMatchObject({ keptBytes: sum(join, v2), feltBytes: sum(v2) });
+    expect(open(join, v1, b1), 'every player\'s').toMatchObject({ keptBytes: sum(join, v1, b1), feltBytes: sum(v1, b1) });
+    // a close freezes both: they are the close's now, and no felt's
+    const close = kit.close(A, 1, SID, [v1, b1], join.rec.c);
+    expect(open(join, v1, b1, close)).toMatchObject({ keptBytes: sum(join, v1, b1, close), feltBytes: 0 });
+    // the version A put down after the close is a felt of the round, and only a felt
+    expect(open(join, v1, b1, close, v2)).toMatchObject({ keptBytes: sum(join, v1, b1, close, v2), feltBytes: sum(v2) });
+  });
+
   it('counts a house reveal once it decides the round, not while it waits on a seed', () => {
     // Bob's seed is not in, and the reveal lists his slip: it cannot decide the round yet
     const waiting = (...more: Built<unknown>[]) => new TestSession().put(r1.a1, r1.b1, r1.join, r1.close, r1.ra, ...more);
@@ -947,6 +966,7 @@ describe('keptBytes: what the pass used, which junk cannot raise', () => {
     expect(res.rounds.map((v) => v.decided), 'a stranger\'s abandon voids the round there').toEqual(['void']);
     expect(res.keptBytes).toBe(res.bytes);
     expect(res.keptBytes).toBeGreaterThan(0);
+    expect(res.feltBytes, 'no pause reads it there').toBe(0);
     // (a slip nobody froze, of the round that is over, is in it there, and is not at a FAIR ONLY table)
     const stray = rkit.slip(C, 1, [red(1)]);
     const withStray = at(abandon, stray);

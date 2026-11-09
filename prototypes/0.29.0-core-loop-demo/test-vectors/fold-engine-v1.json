@@ -590,7 +590,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"ca2373f46111f3e355781ef436a0f767\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":1,\"open\":1,\"parent\":\"g\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"constructor\",\"47\"],[\"erin\",\"82\"]],\"carry\":null,\"pending\":true,\"records\":15,\"bytes\":4589,\"rawBytes\":4589}",
-   "digest": "c786402663656d9f8e295bca5c3397a2261c25cef2aaa588f00516d8276f944d"
+   "digest": "774298e2494dfa84893e2300a8df5b02da3d31225cd4e229d4ac75de59af5ca8"
   },
   {
    "name": "roulette 1",
@@ -1340,7 +1340,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"79c912de939ae783d88c92b5a06eebea\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"p:q\"],\"pocket\":14,\"deltas\":[[\"alice\",\"-46\"],[\"p:q\",\"-17\"]],\"copies\":[\"x:1:alice:87fffcea679d7f6310959fc70b3cbc20\",\"x:1:p:q:dbf4f5442c8a4ca3af231b33fd7aeb64\"]},{\"r\":2,\"close\":\"f6be905a7971578e03b41ccbca1f303c\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":2,\"open\":2,\"parent\":\"79c912de939ae783d88c92b5a06eebea\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"-46\"],[\"p:q\",\"-17\"]],\"held\":[[\"p:q\",\"42\"]],\"carry\":null,\"pending\":false,\"records\":19,\"bytes\":5226,\"rawBytes\":5322}",
-   "digest": "98e930aa6754cd00f9420d2151d8d06a8344b30e3da989413eccd11a72a6f558"
+   "digest": "66ba534e2e923936b3854151bc16da9d499dc1cd0c90a78246179d075a5e66b9"
   },
   {
    "name": "roulette 2",
@@ -2160,7 +2160,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"ccc9ce8860ea832576917acf\",\"u\":2,\"l\":\"d5ba92a6ea2c470d88cc9fd78d258a46\",\"n\":[[\"bob\",\"-61\"],[\"toString\",\"-191\"]],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":3,\"close\":\"1c74b2603de5a75e6b422eefbd5602c6\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":3,\"open\":3,\"parent\":\"ccc9ce8860ea832576917acf\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"bob\",\"-61\"],[\"toString\",\"-191\"]],\"held\":[[\"bob\",\"108\"]],\"carry\":null,\"pending\":false,\"records\":24,\"bytes\":6365,\"rawBytes\":6365}",
-   "digest": "f39730475b8536aa42f72fa3647350ce1f956009835ff7274ea602f11df35ce1"
+   "digest": "9408b23ede1c8dd46bf796fec773c6faf8730ed7cf3b62066f88095befc717e8"
   },
   {
    "name": "roulette 3",
@@ -2318,7 +2318,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"fb2268faf2eedb9c72b735f698de523d\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":1,\"open\":1,\"parent\":\"g\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"45\"],[\"dave\",\"50\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1240,\"rawBytes\":1240}",
-   "digest": "2827c5869aac0ef545a5a7f1ab582cc6df77dc13143e07ba69344a8f2d83cdb1"
+   "digest": "9bfb0b9721d79e20203472892819dcdfd2e7f4d2eac9fe80a652e9a33b9b804f"
   },
   {
    "name": "roulette 4",
@@ -3421,7 +3421,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"b6465332884bf457638ce663\",\"u\":1,\"l\":\"247c36d550b9b4cc2037b8ddeccc3a4c\",\"n\":[[\"bob\",\"-55\"],[\"p:q\",\"78\"],[\"toString\",\"-124\"],[\"x y\",\"-34\"]],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":2,\"close\":\"5dc53ffe5763f548d09f19b68501a864\",\"decided\":\"reveals\",\"counted\":[\"bob\",\"toString\"],\"pocket\":17,\"deltas\":[[\"bob\",\"17\"],[\"toString\",\"-1\"]],\"copies\":[\"x:2:bob:a3b734b563c72a91816667397fe0a8d9\",\"x:2:toString:e8d345b58049b29d8d6eb63012a0d2b8\"]},{\"r\":3,\"close\":\"e62db4a8686316b34f1f1fba42d37cfe\",\"decided\":\"reveals\",\"counted\":[\"bob\",\"p:q\"],\"pocket\":23,\"deltas\":[[\"bob\",\"3\"],[\"p:q\",\"20\"]],\"copies\":[\"x:3:bob:6485001952b3d10df0fd1e7fa72a98ad\",\"x:3:p:q:26e7b08c1ac06114f754c13311f06c07\"]},{\"r\":4,\"close\":\"396834c4b6a1d386dee0e09e53d4bd86\",\"decided\":\"reveals\",\"counted\":[\"bob\",\"x y\"],\"pocket\":19,\"deltas\":[[\"bob\",\"62\"],[\"x y\",\"-5\"]],\"copies\":[\"x:4:bob:1744329f5d47423b74ba67b08ad55c73\",\"x:4:x y:78a4507487db7f995e0f95dfbcda430a\"]}],\"tip\":null,\"open\":5,\"parent\":\"396834c4b6a1d386dee0e09e53d4bd86\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"bob\",\"27\"],[\"p:q\",\"98\"],[\"toString\",\"-125\"],[\"x y\",\"-39\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":28,\"bytes\":7687,\"rawBytes\":7698}",
-   "digest": "95f9386d01847f48b592ab5ebdee84593cfed95eca06cde132983be27e28fa56"
+   "digest": "7b80a038fecd9712e037183c34e7e1c7b97dda1b563b4013d67b332c3c45aedd"
   },
   {
    "name": "roulette 5",
@@ -3868,7 +3868,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"4f1d0bed7f680ccc9d225c70303b7e23\",\"decided\":\"reveals\",\"counted\":[\"a‍b\"],\"pocket\":5,\"deltas\":[[\"a‍b\",\"60\"]],\"copies\":[\"x:1:a‍b:042f7b77167d85271754c6530760cbed\"]},{\"r\":2,\"close\":\"46ee24e9049b269af166ac32ba4289af\",\"decided\":\"forfeit\",\"counted\":[\"a‍b\"],\"pocket\":0,\"deltas\":[[\"a‍b\",\"-55\"],[\"toString\",\"-12\"]],\"forfeit\":\"491f03e17eeadbf36a7ea090ac53e1d8\",\"copies\":[\"f:2:491f03e17eeadbf36a7ea090ac53e1d8\",\"x:2:a‍b:57dd06721ec19adb1cc42feadcbd4504\"]}],\"tip\":null,\"open\":3,\"parent\":\"46ee24e9049b269af166ac32ba4289af\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"a‍b\",\"5\"],[\"toString\",\"-12\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":10,\"bytes\":2844,\"rawBytes\":2891}",
-   "digest": "5efe19a7254119c236b22a693ebd4c0ecfe5aabd9d912d21f71b9289957ae95e"
+   "digest": "8efbc3bffc2973c98ba2853b6ec7ad57771c159be607418c432aa5831f633bdc"
   },
   {
    "name": "house roulette 0",
@@ -4721,7 +4721,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"constructor\",\"49\"]],\"carry\":null,\"pending\":true,\"records\":24,\"bytes\":6793,\"rawBytes\":6793}",
-   "digest": "3ae4189e2f4b4ba40cf45b1e2e5ba1d8794a156f0b92c9ac435ba3f169b84096"
+   "digest": "d3507a139e2ea96b57347982ccfb299457f26690584afbed0f8dd8e9018fbb9e"
   },
   {
    "name": "house roulette 1",
@@ -5388,7 +5388,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"e8ef576cd8c66c588eea8bb64f32a510\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":1,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[\"8fe91e627cc320017846eff31b8a85bc\"],\"nets\":[],\"held\":[[\"alice\",\"68\"],[\"bob\",\"36\"]],\"carry\":null,\"pending\":false,\"records\":17,\"bytes\":5478,\"rawBytes\":5478}",
-   "digest": "ccb1cecff6ed894455fa01112f251c92bd276a06fccaf9d64a28d8119901b352"
+   "digest": "0c15cd6754663715c7f4b572780be7237f729b8e89b64e784fbc1e3459bd2f41"
   },
   {
    "name": "house roulette 2",
@@ -5977,7 +5977,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"85a85792a702d053690b8d9a71d824ab\",\"decided\":\"house\",\"counted\":[\"alice\"],\"pocket\":21,\"deltas\":[[\"alice\",\"-1\"]],\"house\":\"0f9b01686787040715c54a8216fda464\",\"copies\":[\"h:1:0f9b01686787040715c54a8216fda464\",\"x:1:alice:87fffcea679d7f6310959fc70b3cbc20\"]},{\"r\":2,\"close\":\"f9a11d85f8ce7beb89091d24fd98d614\",\"decided\":null,\"counted\":[],\"pocket\":null,\"deltas\":[]}],\"tip\":2,\"open\":2,\"parent\":\"85a85792a702d053690b8d9a71d824ab\",\"houseTable\":true,\"required\":\"b9a67381ec84257910236072e8876c31503fb2016d549c1021e73321db1206ea\",\"joins\":[],\"nets\":[[\"alice\",\"-1\"]],\"held\":[[\"bob\",\"13\"]],\"carry\":null,\"pending\":true,\"records\":16,\"bytes\":4773,\"rawBytes\":4833}",
-   "digest": "0810994d867462278d45e0ae0b62238d0a473f6e41810ffc838ff95a9bee57dd"
+   "digest": "45a7e1502dbdec870a5675165a932a65c6f5216d89f8fdbef232957040f55f81"
   },
   {
    "name": "house roulette 3",
@@ -6370,7 +6370,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"901ee8091ef2ee3a56c70a241e070105\",\"decided\":\"reveals\",\"counted\":[\"dave\",\"erin\"],\"pocket\":10,\"deltas\":[[\"dave\",\"46\"],[\"erin\",\"39\"]],\"copies\":[\"x:1:dave:4e7bd1efe06fe8e57000c0185eb3f1ca\",\"x:1:erin:859101e285d7947065c01d1072ee98ad\"]}],\"tip\":null,\"open\":2,\"parent\":\"901ee8091ef2ee3a56c70a241e070105\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[[\"dave\",\"46\"],[\"erin\",\"39\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":9,\"bytes\":2560,\"rawBytes\":2560}",
-   "digest": "eb479ff4a69048a0dc3fa177489348d7032cd8a86fe845975cedaf368fb30e04"
+   "digest": "f34c95e0deb3246154d73340fceb57a3f0a429f98f524156e6df4713dd18008a"
   },
   {
    "name": "house roulette 4",
@@ -6853,7 +6853,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"d70b17eda92f07858e701e07\",\"u\":3,\"l\":\"a6f8720d3470827c0becb489133a3efa\",\"n\":[[\"a‍b\",\"-69\"]],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":4,\"close\":\"6f980146e8d518ea068e283c0cbf8b79\",\"decided\":\"house\",\"counted\":[\"a‍b\",\"erin\"],\"pocket\":26,\"deltas\":[[\"a‍b\",\"24\"],[\"erin\",\"18\"]],\"house\":\"736253c05f80e2472314b24ca7a99a36\",\"copies\":[\"h:4:736253c05f80e2472314b24ca7a99a36\",\"x:4:a‍b:c9aa6908e3b321c7aa8067052a53fa70\",\"x:4:erin:6448900cef37779de4d20ad4e6488baf\"]},{\"r\":5,\"close\":\"0500814f93accb45a080eb8796a30e27\",\"decided\":\"house\",\"counted\":[\"erin\"],\"pocket\":28,\"deltas\":[[\"erin\",\"-58\"]],\"house\":\"af61a1f069d946b0a26b383e78bb31cd\",\"copies\":[\"h:5:af61a1f069d946b0a26b383e78bb31cd\",\"x:5:erin:c16f133a07b84026d1fdee7bc4beeb1d\"]}],\"tip\":null,\"open\":6,\"parent\":\"0500814f93accb45a080eb8796a30e27\",\"houseTable\":true,\"required\":\"97f9ea2a6d533a669d9dd638704149deffce38bae0adee1150291d7774d8431d\",\"joins\":[],\"nets\":[[\"a‍b\",\"-45\"],[\"erin\",\"-40\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":13,\"bytes\":3929,\"rawBytes\":3929}",
-   "digest": "c45734a802c7f3aca425619ecc3eb1ead776e8dc909b505f5a15e6f8db233bca"
+   "digest": "dceea97af27d0ff15e987d1d678234cecd34de2ab9d0ce594761c677955e3965"
   },
   {
    "name": "house roulette 5",
@@ -7400,7 +7400,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"3c7b97f9b9a80e09386a0e5f\",\"u\":5,\"l\":\"2f25639d6f736799677bc7c426bd91cf\",\"n\":[[\"alice\",\"-54\"]],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":6,\"parent\":\"3c7b97f9b9a80e09386a0e5f\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"-54\"]],\"held\":[[\"alice\",\"47\"]],\"carry\":null,\"pending\":true,\"records\":13,\"bytes\":3817,\"rawBytes\":3864}",
-   "digest": "ee62a7be1d1ee7c0a7f201e2f58a8390e63a543408cec6196886a5db1b7dcf3e"
+   "digest": "b988d7bff83d6bbadd0e00a083ae1e54744a60e52bd7dd663097274e2fdf392a"
   },
   {
    "name": "craps 0",
@@ -9084,7 +9084,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"b024f802e09e908929aa0c6a3c9e2472\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"constructor\",\"erin\"],\"pocket\":null,\"deltas\":[[\"alice\",\"-58\"],[\"constructor\",\"0\"],[\"erin\",\"-38\"]],\"copies\":[\"x:1:alice:b9667af7526668dbe6236411c886977f\",\"x:1:constructor:11aea198611b6f9bac9b180e7c7c6181\",\"x:1:erin:eb26d2be2a77b2d7f4fde9fb303c7699\"],\"dice\":[1,6]},{\"r\":2,\"close\":\"24058f18ccb8a952a64dcfbfb5583ee0\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"constructor\",\"😀a\"],\"pocket\":null,\"deltas\":[[\"alice\",\"0\"],[\"constructor\",\"0\"],[\"😀a\",\"-35\"]],\"copies\":[\"x:2:alice:da8b709f656216fb91e8e10352aa7ac7\",\"x:2:constructor:89869c2d85483f97f6ce0818c9177c13\",\"x:2:😀a:c2777c9b12bad20af38c75b638f02c23\"],\"dice\":[5,2]}],\"tip\":null,\"open\":3,\"parent\":\"24058f18ccb8a952a64dcfbfb5583ee0\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"-58\"],[\"erin\",\"-38\"],[\"😀a\",\"-35\"]],\"held\":[[\"erin\",\"9\"]],\"carry\":{\"p\":0,\"w\":{}},\"pending\":false,\"records\":49,\"bytes\":14207,\"rawBytes\":14207}",
-   "digest": "4ff149c6b87547b14dee24e0b25bc8b529f004c09e18983364ab1d691cd09b0d"
+   "digest": "8d718d98b3b06bafc94ed668a70f2efd349006ae30bc7e96203953c5029e90f8"
   },
   {
    "name": "house craps 1",
@@ -9543,7 +9543,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"132dcc7cb28a6b192a25a85a\",\"u\":3,\"l\":\"4c7b4f71bbeebebc20e52b4c84be4ccd\",\"n\":[[\"constructor\",\"-1267\"]],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":4,\"close\":\"39d6deb35f21430eca6c5b510467f633\",\"decided\":\"void\",\"counted\":[],\"pocket\":null,\"deltas\":[[\"a‍b\",\"0\"],[\"constructor\",\"0\"]],\"abandon\":\"87a72f636414f65da2b6b9df7198b269\",\"copies\":[\"z:4:87a72f636414f65da2b6b9df7198b269\"],\"dice\":null}],\"tip\":null,\"open\":5,\"parent\":\"39d6deb35f21430eca6c5b510467f633\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[[\"constructor\",\"-1267\"]],\"held\":[[\"a‍b\",\"16\"],[\"constructor\",\"74\"]],\"carry\":{\"h\":\"a‍b\",\"i\":1,\"p\":9,\"w\":{\"a‍b\":[{\"amount\":16,\"type\":\"pass\"}],\"constructor\":[{\"amount\":42,\"type\":\"dontcome\"},{\"amount\":23,\"type\":\"pass\"}]}},\"pending\":false,\"records\":11,\"bytes\":3528,\"rawBytes\":3528}",
-   "digest": "23fb4a1791ca03da072b3fa387a847d259a51b82e366b96b0134ed3fd55da327"
+   "digest": "6b6ba321d9aaf91c4e8ba4749a9b9b633b15e49e805e467f6c1f75582a985670"
   },
   {
    "name": "craps 2",
@@ -9905,7 +9905,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"db5ae4e86c34859cf30608bd08940eb4\",\"decided\":\"forfeit\",\"counted\":[\"！b\"],\"pocket\":null,\"deltas\":[[\"😀a\",\"-31\"],[\"！b\",\"0\"]],\"forfeit\":\"cb54a7e3d233fdc8609c1283152a5d1b\",\"copies\":[\"f:1:cb54a7e3d233fdc8609c1283152a5d1b\",\"x:1:！b:a94275573b4993339581807e4e5caf34\"],\"dice\":[4,6]}],\"tip\":null,\"open\":2,\"parent\":\"db5ae4e86c34859cf30608bd08940eb4\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"😀a\",\"-31\"]],\"held\":[],\"carry\":{\"p\":10,\"w\":{}},\"pending\":false,\"records\":10,\"bytes\":2589,\"rawBytes\":2600}",
-   "digest": "0e486dfded2d13e15702658f69cf09f49d32a1562a3aca449e3cd831d214f48a"
+   "digest": "88a0a373b205649573344d4c41c6cea707f06b89327bca0a467e6f6a8ebf9bef"
   },
   {
    "name": "house craps 3",
@@ -11235,7 +11235,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"09ac1a8e2a5bc927b6163466cec6ce23\",\"decided\":\"void\",\"counted\":[],\"pocket\":null,\"deltas\":[[\"alice\",\"0\"]],\"house\":\"fda757607c33b0ee059c2d474d4c5ce8\",\"copies\":[\"h:1:fda757607c33b0ee059c2d474d4c5ce8\"],\"dice\":null},{\"r\":2,\"close\":\"96f52833782fc8348591602e19bd045a\",\"decided\":\"reveals\",\"counted\":[\"alice\"],\"pocket\":null,\"deltas\":[[\"alice\",\"3\"]],\"copies\":[\"x:2:alice:da8b709f656216fb91e8e10352aa7ac7\"],\"dice\":[6,1]},{\"r\":3,\"close\":\"e0b8a3289aad0fb36e9a900b1d45b335\",\"decided\":\"reveals\",\"counted\":[\"alice\",\"😀a\"],\"pocket\":null,\"deltas\":[[\"alice\",\"0\"],[\"😀a\",\"-66\"]],\"copies\":[\"x:3:alice:98026b1082a3b72b583627fd30d73379\",\"x:3:😀a:d407e4cdd12b4cebecd160a8a2c4cbb7\"],\"dice\":[6,6]}],\"tip\":null,\"open\":4,\"parent\":\"e0b8a3289aad0fb36e9a900b1d45b335\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"3\"],[\"😀a\",\"-66\"]],\"held\":[[\"alice\",\"20\"],[\"erin\",\"40\"]],\"carry\":{\"p\":0,\"w\":{}},\"pending\":true,\"records\":38,\"bytes\":10986,\"rawBytes\":10986}",
-   "digest": "28f7f4d3fbaf2ade9620fd6a8862ec2627402ec8273cf2efbedcff7925aecb39"
+   "digest": "e547d34a423646b31223c773df54479a94d8f5f3c664a08b97830db006f7d01f"
   },
   {
    "name": "craps 4",
@@ -11381,7 +11381,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"b626f067882fcc9429eaf0de\",\"u\":1,\"l\":\"1d0acc83780184eafe18e3d2e237fc1e\",\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":2,\"parent\":\"b626f067882fcc9429eaf0de\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"dave\",\"82\"]],\"carry\":{\"p\":6,\"w\":{}},\"pending\":false,\"records\":3,\"bytes\":797,\"rawBytes\":797}",
-   "digest": "32bfb952d3e15253aa184c16219a66e8b31ecf27415790382755451e806b98e7"
+   "digest": "f4d5f1f4cf78169b5e2d808dd44535e1da1a14e39dcaf3d14b00181839f9d3ee"
   },
   {
    "name": "house craps 5",
@@ -11846,7 +11846,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[\"6388d7fe9dc13e29d0d9c44397de4f50\"],\"nets\":[],\"held\":[[\"constructor\",\"49\"]],\"carry\":{\"p\":0,\"w\":{}},\"pending\":false,\"records\":15,\"bytes\":4556,\"rawBytes\":4556}",
-   "digest": "0f66d8f3e209076e9f676bc5e84236d6c81fd098fa9ccae1aba3c65aac7e8160"
+   "digest": "87b0234c619eca4569c0a899fbedabef1a73d9b56af4faadd5068fcb4f3bcf57"
   },
   {
    "name": "craps 6",
@@ -12467,7 +12467,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"cec9dbdce379be78e1faf17c\",\"u\":1,\"l\":\"906255def5584f8305d971b9af8e5d32\",\"n\":[[\"p:q\",\"-1798\"],[\"toString\",\"-1346\"]],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":2,\"close\":\"70870ca87aa1c17b5b7ed17dbd65d4b4\",\"decided\":\"reveals\",\"counted\":[\"p:q\",\"toString\",\"！b\"],\"pocket\":null,\"deltas\":[[\"p:q\",\"0\"],[\"toString\",\"0\"],[\"！b\",\"0\"]],\"copies\":[\"x:2:p:q:72d418f50bd722569dbc3a975d1d5b6c\",\"x:2:toString:e8d345b58049b29d8d6eb63012a0d2b8\",\"x:2:！b:1457ae8e76462f751181fe0f6430c0cf\"],\"dice\":[4,3]},{\"r\":3,\"close\":\"255f500c993ea676c2380e87d6eada43\",\"decided\":\"reveals\",\"counted\":[\"p:q\",\"！b\"],\"pocket\":null,\"deltas\":[[\"p:q\",\"0\"],[\"！b\",\"0\"]],\"copies\":[\"x:3:p:q:26e7b08c1ac06114f754c13311f06c07\",\"x:3:！b:e7172e741df099b82c08d65a9152efc7\"],\"dice\":[2,6]}],\"tip\":null,\"open\":4,\"parent\":\"255f500c993ea676c2380e87d6eada43\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"p:q\",\"-1798\"],[\"toString\",\"-1346\"]],\"held\":[[\"p:q\",\"7\"],[\"！b\",\"9\"]],\"carry\":{\"a\":\"！b\",\"h\":\"p:q\",\"i\":1,\"p\":8,\"w\":{\"p:q\":[{\"amount\":7,\"pick\":6,\"type\":\"place\"}],\"！b\":[{\"amount\":9,\"pick\":10,\"type\":\"place\"}]}},\"pending\":false,\"records\":15,\"bytes\":4269,\"rawBytes\":4269}",
-   "digest": "6518e4e2d5dc3ea8079bed8fccb76e8f1453e435edc8df8c9b1678e4d49ca0b2"
+   "digest": "2dd7712b3eeab2baca95df199fc264994842bd4c0cab36ff41bcc067d3ee3fb8"
   },
   {
    "name": "house craps 7",
@@ -14143,7 +14143,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[\"6388d7fe9dc13e29d0d9c44397de4f50\"],\"nets\":[],\"held\":[],\"carry\":{\"p\":0,\"w\":{}},\"pending\":false,\"records\":49,\"bytes\":14660,\"rawBytes\":14660}",
-   "digest": "4ac60bd5d6f134919d74fba830492f134057c7287b455be69db23b7b14a9c08c"
+   "digest": "2d09b321f3e568d4503c3ea397b2bcb38a29a0140b6ddd8973c4654dea340bc3"
   },
   {
    "name": "real signatures, one round decided by the house",
@@ -14455,7 +14455,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"0142bb6da451f0f5e2d8e3a22cbc671a\",\"decided\":\"house\",\"counted\":[\"alice\",\"bob\"],\"pocket\":8,\"deltas\":[[\"alice\",\"-5\"],[\"bob\",\"-2\"]],\"house\":\"cbdb6d1b04e13795f7d536e08e485666\",\"copies\":[\"h:1:cbdb6d1b04e13795f7d536e08e485666\",\"x:1:alice:87fffcea679d7f6310959fc70b3cbc20\",\"x:1:bob:7c4a2ab5b80ba88d098db34844df7e5a\"]}],\"tip\":null,\"open\":2,\"parent\":\"0142bb6da451f0f5e2d8e3a22cbc671a\",\"houseTable\":true,\"required\":\"b9a67381ec84257910236072e8876c31503fb2016d549c1021e73321db1206ea\",\"joins\":[],\"nets\":[[\"alice\",\"-5\"],[\"bob\",\"-2\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":9,\"bytes\":2524,\"rawBytes\":2524}",
-   "digest": "7a4cfa9bbec35fbfa63cdff86b11035e07cb352bf5dd84a313756b209799f8a5"
+   "digest": "506b8a52a8f8f95bf66323a10fc884dfe1f0ee3abafd679836aa006679f83e4f"
   },
   {
    "name": "values only a node is handed",
@@ -15440,7 +15440,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[{\"r\":1,\"close\":\"17953cdd4d377dbf40750d0e7a4d052a\",\"decided\":\"reveals\",\"counted\":[\"\\u0000\",\"\\\"\\\\/\",\"alice\",\"a‍b\",\"x y\",\"é\",\"😀\",\"！\",\"�\"],\"pocket\":14,\"deltas\":[[\"\\u0000\",\"-7\"],[\"\\\"\\\\/\",\"-8\"],[\"alice\",\"5\"],[\"a‍b\",\"-3\"],[\"x y\",\"-4\"],[\"é\",\"-6\"],[\"😀\",\"-1\"],[\"！\",\"-2\"],[\"�\",\"-5\"]],\"copies\":[\"x:1:\\u0000:7b04750939ba1c68eb2f1d431af6d8ee\",\"x:1:\\\"\\\\/:098ff5739e885386e24d3161f2c4c63e\",\"x:1:alice:87fffcea679d7f6310959fc70b3cbc20\",\"x:1:a‍b:042f7b77167d85271754c6530760cbed\",\"x:1:x y:95138036849f25431a8643aa84072929\",\"x:1:é:8d8624df04f2628d3ca4db858fd3dc21\",\"x:1:😀:81f129b9284e0178a3b34e3be612e6bc\",\"x:1:！:648291c7535a0f4514239bb6372cc1e1\",\"x:1:�:c8b082c4d2602ad3c963545a15fcd86d\"]}],\"tip\":null,\"open\":2,\"parent\":\"17953cdd4d377dbf40750d0e7a4d052a\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[[\"\\u0000\",\"-7\"],[\"\\\"\\\\/\",\"-8\"],[\"alice\",\"5\"],[\"a‍b\",\"-3\"],[\"x y\",\"-4\"],[\"é\",\"-6\"],[\"😀\",\"-1\"],[\"！\",\"-2\"],[\"�\",\"-5\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":20,\"bytes\":4747,\"rawBytes\":6893}",
-   "digest": "f0721a1d44b2fb86031e21f0a19641dc3b383da9e01785352eaaa588244cb3ac"
+   "digest": "a3cf0f43437de29b96e419c351ba60f453483e34225cf6f33b4850e91d16bd49"
   },
   {
    "name": "a rogue key writes a felt under another player's name (c)",
@@ -15632,7 +15632,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"10\"],[\"bob\",\"7\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1253,\"rawBytes\":1253}",
-   "digest": "e140052bb11009fec86a748cc0e3730f648fae948c0cfecd5a890920ddfe4e2d"
+   "digest": "b869593cef0e48d1ac8ac5983b2db48a63f0065a9a176acbb1116d156322baeb"
   },
   {
    "name": "a rogue key writes a felt under another player's name (r)",
@@ -15824,7 +15824,7 @@
     ]
    ],
    "summary": "{\"v\":1,\"rules\":\"h1\",\"base\":{\"sid\":\"g\",\"u\":0,\"l\":null,\"n\":[],\"ended\":false,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":1,\"parent\":\"g\",\"houseTable\":true,\"required\":null,\"joins\":[],\"nets\":[],\"held\":[[\"alice\",\"10\"],[\"bob\",\"7\"]],\"carry\":null,\"pending\":false,\"records\":4,\"bytes\":1253,\"rawBytes\":1253}",
-   "digest": "f886eb8439e77c4b92dd5f4e808ba19b386c2bd13d28d5bdded229ea266eb161"
+   "digest": "f23cad055820960ab121377bcdef6164b4d753410c88ffe292b2b76982ce4351"
   },
   {
    "name": "ended c",
@@ -15941,7 +15941,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"d45b257e7df042a2774b71e1\",\"u\":3,\"l\":\"687c7441724ff7b0c75ccb82842ea60d\",\"n\":[[\"alice\",\"40\"],[\"bob\",\"-40\"]],\"ended\":true,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":4,\"parent\":\"d45b257e7df042a2774b71e1\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"40\"],[\"bob\",\"-40\"]],\"held\":[],\"carry\":null,\"pending\":false,\"records\":3,\"bytes\":711,\"rawBytes\":711}",
-   "digest": "11f97c0d92d680e3099f06dad958b2186dbdf2f3496e8a6beccd2b145f3ec76a"
+   "digest": "8deaaccb8738747980da0e159b57912f67f467ab0d9af610541d59d4a4ccdc73"
   },
   {
    "name": "ended k",
@@ -16060,7 +16060,7 @@
     []
    ],
    "summary": "{\"v\":1,\"rules\":\"f1\",\"base\":{\"sid\":\"bc7d6951f9fe074c03929958\",\"u\":3,\"l\":\"687c7441724ff7b0c75ccb82842ea60d\",\"n\":[[\"alice\",\"40\"],[\"bob\",\"-40\"]],\"ended\":true,\"h\":null},\"rounds\":[],\"tip\":null,\"open\":4,\"parent\":\"bc7d6951f9fe074c03929958\",\"houseTable\":false,\"required\":null,\"joins\":[],\"nets\":[[\"alice\",\"40\"],[\"bob\",\"-40\"]],\"held\":[],\"carry\":{\"p\":0,\"w\":{}},\"pending\":false,\"records\":3,\"bytes\":752,\"rawBytes\":752}",
-   "digest": "a8ad15e761aa62461cb7802ce65d60febaed37bd77c4ca9f3c7aa9cbb375ed85"
+   "digest": "19bee520dafa1cb557bfca4921ffdb1a5cf8807c0da9aefc90c53e80799c8a1b"
   }
  ]
 }
