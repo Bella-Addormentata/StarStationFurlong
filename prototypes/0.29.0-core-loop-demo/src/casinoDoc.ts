@@ -3340,8 +3340,9 @@ const HOUSE_VERDICTS_MAX = 2_048;
  *  check a recount's budget put off: the slice it queued reads each again
  *  (recheckRoomRecords). */
 let roomWaiting = new Set<string>();
-/** Each house's highest heartbeat seen, and when (this page's clock). */
-let houseBeats = new Map<string, { n: number; at: number }>();
+/** Each house's highest heartbeat seen, and when (this page's clock): null
+ *  once that is forgotten (forgetBeat), the count alone staying. */
+let houseBeats = new Map<string, { n: number; at: number | null }>();
 /** 🔒 How many of the doc's live FAIR ONLY games hear each key as a house now
  *  (FairOnlyState.houses): a beat counts from such a key as from a house the deed
  *  holder pinned (noteBeat), for what a game asks of it (houseHeardFrom) and no
@@ -3735,7 +3736,7 @@ export function houseHeardAt(): number | null {
   // those of the keys live games hear, which strangers' games add to without a cap.)
   for (const pub of housePinned.keys()) {
     const b = houseBeats.get(pub);
-    if (b && pinnedHouse(pub, owner) && (at === null || b.at > at)) at = b.at;
+    if (b && b.at !== null && pinnedHouse(pub, owner) && (at === null || b.at > at)) at = b.at;
   }
   return at;
 }
@@ -3748,16 +3749,18 @@ export function houseOnline(now = Date.now()): boolean {
 }
 
 /** 🔒 Whether house `pub` was heard in the last HOUSE_HEARD_MS (a clock that went
- *  back reads as heard, as houseOnline's does): a beat counted from it while it
- *  was a house the deed holder pinned, or one a live FAIR ONLY game hears
- *  (FairOnlyState.houses). A key that is neither now was heard by nothing:
+ *  back reads as heard, as houseOnline's does): a beat counted from it as a
+ *  house the deed holder pins now, or one a live FAIR ONLY game hears
+ *  (FairOnlyState.houses), and not forgotten since (forgetBeat: one counted
+ *  under a former deed holder's pin is not a game's to go by). A key that is
+ *  neither now was heard by nothing:
  *  the answer a FAIR ONLY game's close or abandon asks of the house whose
  *  commitment it names (computedTable closePaused, abandonWait), which the room's
  *  houseOnline (the deed holder's houses) can't give for a game of another
  *  authority. */
 export function houseHeardFrom(pub: string, now = Date.now()): boolean {
-  const beat = houseBeats.get(pub);
-  return beat !== undefined && now - beat.at <= HOUSE_HEARD_MS && (gameHouseRefs.has(pub) || pinnedHouse(pub));
+  const at = houseBeats.get(pub)?.at ?? null;
+  return at !== null && now - at <= HOUSE_HEARD_MS && (gameHouseRefs.has(pub) || pinnedHouse(pub));
 }
 
 /** 🔒 The keys this page hears as the houses of FAIR ONLY game `inc` of table
@@ -3797,17 +3800,38 @@ function houseOfOpen(resolved: Resolution, res: FoldResult, onWait: () => void):
   };
 }
 
+/** Forget when `pub` was last heard: it is heard again from the next beat that
+ *  comes in. A key some deed holder pinned keeps its count (housePinned holds
+ *  it anyway), so the record it was counted from is no beat when a peer writes
+ *  it again, or when a new holder's delegation has the doc's beat read again
+ *  (countTransaction: a house pinned now). Any other key's goes whole: a
+ *  stranger's game adds keys without a cap. */
+function forgetBeat(pub: string): void {
+  const beat = houseBeats.get(pub);
+  if (!beat) return;
+  if (housePinned.has(pub)) houseBeats.set(pub, { n: beat.n, at: null });
+  else houseBeats.delete(pub);
+}
+
 /** Hear the keys `keys` (and no others) as FAIR ONLY game `fo`'s houses: a key
  *  new to the game counts from the next beat that comes in (the one already in
  *  the doc may be any age, and the doc keeps no time: a peer's writing it again
  *  is the next that comes in, for a beat proves the house signed it, not when),
- *  one it no longer hears has its beat forgotten unless the deed holder pinned
- *  it. */
+ *  one it no longer hears has its beat forgotten (forgetBeat). Both unless the
+ *  deed holder pins the key now (a handover leaves the old holder's pin in
+ *  housePinned, and a beat counted under it is that holder's), and the first
+ *  only for the first game to hear the key (a beat counted for another that
+ *  hears it is the key's). */
 function setGameHouses(fo: FairOnlyState, keys: readonly string[]): void {
   const was = fo.houses;
   if (keys.length === was.size && keys.every((k) => was.has(k))) return;
   const next = new Set(keys);
-  for (const k of next) if (!was.has(k)) gameHouseRefs.set(k, (gameHouseRefs.get(k) ?? 0) + 1);
+  for (const k of next) {
+    if (was.has(k)) continue;
+    const refs = gameHouseRefs.get(k) ?? 0;
+    if (refs === 0 && !pinnedHouse(k)) forgetBeat(k);
+    gameHouseRefs.set(k, refs + 1);
+  }
   for (const k of was) {
     if (next.has(k)) continue;
     const left = (gameHouseRefs.get(k) ?? 1) - 1;
@@ -3816,7 +3840,7 @@ function setGameHouses(fo: FairOnlyState, keys: readonly string[]): void {
       continue;
     }
     gameHouseRefs.delete(k);
-    if (!housePinned.has(k)) houseBeats.delete(k);
+    if (!pinnedHouse(k)) forgetBeat(k);
   }
   fo.houses = next;
 }

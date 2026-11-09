@@ -267,6 +267,30 @@ describe('the beats a page counts', () => {
     expect(heard(a, H.pub, T0 + 13_000 + HOUSE_HEARD_MS)).toBe(true);
   });
 
+  it('looks at no signature of a beat of a key that is no house: a stranger\'s costs a lookup, a house\'s one check, and the same record again none', async () => {
+    const [a] = await gameRoom(['A']);
+    house(a, kit.houseJoin(H, 1));
+    const checked: string[] = [];
+    a.casino.setComputedVerifyForTests({
+      now: () => 0,
+      verify: (pub) => {
+        checked.push(pub);
+        return true;
+      },
+    });
+    beatIn(a, T0 + 1_000, STRANGER, 1);
+    beatIn(a, T0 + 1_000, STRANGER, 2);
+    expect(checked).toEqual([]);
+    beatIn(a, T0 + 1_000, H, 1);
+    expect(checked).toEqual([H.pub]);
+    expect(heard(a, H.pub, T0 + 1_000)).toBe(true);
+    // (the same record written again is no newer than the count kept: not looked at either)
+    const key = `hb:${H.pub}`;
+    a.doc.transact(() => top(a).set(key, top(a).get(key)));
+    expect(checked).toEqual([H.pub]);
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+  });
+
   it('is no house of the room: the beats of a game\'s house make neither the room\'s houses heard nor online', async () => {
     const [a] = await gameRoom(['A']);
     house(a, kit.houseJoin(H, 1));
@@ -339,6 +363,82 @@ describe('the beats a page counts', () => {
     expect(housesOf(a)).toEqual([]);
     expect(a.casino.houseOnline(T0 + 1_000)).toBe(true);
     expect(heard(a, H.pub, T0 + 1_000)).toBe(true);
+  });
+
+  it('keeps the beat of a key the deed holder has pinned when a game first hears it: the room counted it, and it is a house of the room all the same', async () => {
+    const [a] = await gameRoom(['A']);
+    pinHouses(a, H);
+    beatIn(a, T0 + 1_000, H, 1);
+    expect(a.casino.houseOnline(T0 + 1_000)).toBe(true);
+    expect(housesOf(a)).toEqual([]);
+    clockOf(a, T0 + 2_000);
+    house(a, kit.houseJoin(H, 1));
+    expect(housesOf(a)).toEqual([H.pub]);
+    expect(heard(a, H.pub, T0 + 2_000)).toBe(true);
+    expect(a.casino.houseOnline(T0 + 2_000)).toBe(true);
+  });
+
+  it('keeps the beat of a key another game hears when a second game comes to hear it: the key was heard all the while, and a beat is the key\'s, not the game\'s', async () => {
+    const [a] = await gameRoom(['A']);
+    openSecond(a, H);
+    house(a, kit.houseJoin(H, 1));
+    beatIn(a, T0 + 1_000, H, 1);
+    expect(heard(a, H.pub, T0 + 1_000)).toBe(true);
+    expect(housesOf(a, T2, G2.inc)).toEqual([]);
+    clockOf(a, T0 + 2_000);
+    const second = kit2.houseJoin(H, 1);
+    putIn(a, [[second.key, second.rec]], T2);
+    expect(housesOf(a, T2, G2.inc)).toEqual([H.pub]);
+    expect(heard(a, H.pub, T0 + 2_000)).toBe(true);
+    // (and the first game still hears it: nothing was cleared under it)
+    expect(housesOf(a)).toEqual([H.pub]);
+  });
+
+  it('hears a key a former deed holder pinned from the next beat when a game first hears it: the beat counted under that pin is that holder\'s, and its record written again is none', async () => {
+    const [a] = await gameRoom(['A']);
+    pinHouses(a, H);
+    beatIn(a, T0 + 1_000, H, 1);
+    expect(a.casino.houseOnline(T0 + 1_000)).toBe(true);
+    // (the deed moves on: H is a house of the room no longer, and no game hears it yet)
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', 'someone-else'));
+    expect(a.casino.houseOnline(T0 + 1_000)).toBe(false);
+    expect(heard(a, H.pub, T0 + 1_000)).toBe(false);
+    // (a game comes to hear it a moment after that beat: it counts from the next that comes in, as for any key new to a game)
+    clockOf(a, T0 + 2_000);
+    house(a, kit.houseJoin(H, 1));
+    expect(housesOf(a)).toEqual([H.pub]);
+    expect(heard(a, H.pub, T0 + 2_000)).toBe(false);
+    // (a peer writes the record of that beat again: the page kept its count, the time alone forgotten, so it is no beat)
+    const key = `hb:${H.pub}`;
+    a.doc.transact(() => top(a).set(key, top(a).get(key)));
+    expect(heard(a, H.pub, T0 + 2_000)).toBe(false);
+    beatIn(a, T0 + 3_000, H, 2);
+    expect(heard(a, H.pub, T0 + 3_000)).toBe(true);
+  });
+
+  it('forgets the beat of a key a former deed holder pinned when the last game that hears it stops: the deed back with that holder counts it from the next beat', async () => {
+    const [a] = await gameRoom(['A']);
+    pinHouses(a, H);
+    house(a, kit.houseJoin(H, 1));
+    beatIn(a, T0 + 1_000, H, 1);
+    expect(a.casino.houseOnline(T0 + 1_000)).toBe(true);
+    // (the deed moves on, and the game ends while it is away: the pin that kept the beat is the old holder's)
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', 'someone-else'));
+    endGame(a);
+    expect(housesOf(a)).toEqual([]);
+    // (the deed comes back: H is a house of the room again, and the page has heard nothing of it since)
+    clockOf(a, T0 + 2_000);
+    a.doc.transact(() => a.doc.getMap('roomInfo').set('owner', owner.pid));
+    expect(a.casino.houseOkOf(H.pub)).toBe(true);
+    expect(a.casino.houseOnline(T0 + 2_000)).toBe(false);
+    expect(a.casino.houseHeardAt()).toBeNull();
+    // (the record of that beat written again is none: its count stayed)
+    const key = `hb:${H.pub}`;
+    a.doc.transact(() => top(a).set(key, top(a).get(key)));
+    expect(a.casino.houseOnline(T0 + 2_000)).toBe(false);
+    beatIn(a, T0 + 3_000, H, 2);
+    expect(a.casino.houseOnline(T0 + 3_000)).toBe(true);
+    expect(a.casino.houseHeardAt()).toBe(T0 + 3_000);
   });
 
   it('forgets with the doc: a doc bound again hears through its own count, and a game ending in it leaves nothing heard', async () => {
@@ -747,6 +847,42 @@ describe('a game handed over', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(housesOf(a)).toEqual([H.pub]);
     expect(foldOf(a)).toMatchObject({ open: 2, required: kit.houseCommit(H, 2) });
+  });
+
+  it('is heard through a house the buyer delegates again only from its next beat, when the deed went with the game: the beat counted under the seller\'s pin, read again at the delegation, is none', async () => {
+    const { a, b, at } = await decidedByH();
+    // (the seller holds the deed too, and H is its house of the room as of the game: both hear it)
+    pinHouses(a, H);
+    beatIn(a, at, H, 1_000);
+    expect(a.casino.houseOnline(at)).toBe(true);
+    expect(heard(a, H.pub, at)).toBe(true);
+    // the deed goes to the buyer, and the game with it: H is a house of neither now
+    const xf = handOver(1);
+    a.doc.transact(() => a.doc.getMap('players').set(buyer.pid, { keyB64: buyer.pub, name: buyer.pid }));
+    clockOf(a, at + STEP);
+    a.doc.transact(() => {
+      a.doc.getMap('roomInfo').set('owner', buyer.pid);
+      top(a).set(xf.key, xf.value);
+    });
+    expect(housesOf(a)).toEqual([]);
+    expect(a.casino.houseOkOf(H.pub)).toBe(false);
+    expect(heard(a, H.pub, at + STEP)).toBe(false);
+    expect(a.casino.houseOnline(at + STEP)).toBe(false);
+    // the buyer keeps the node and delegates its key: a house of the room and of the game again, with the doc holding
+    // the beat it wrote under the seller. That beat is read again as the house is pinned, and is no beat: the page
+    // counted it then, and what it heard under the seller's pin was the seller's house
+    clockOf(a, at + STEP * 2);
+    a.doc.transact(() => top(a).set(`hk:${H.pub}`, delegation(buyer, H.pub, PAGE_ROOM)));
+    expect(a.casino.houseOkOf(H.pub)).toBe(true);
+    expect(housesOf(a)).toEqual([H.pub]);
+    expect(heard(a, H.pub, at + STEP * 2)).toBe(false);
+    expect(a.casino.houseOnline(at + STEP * 2)).toBe(false);
+    // its next beat is one, for the room and for the game
+    beatIn(a, at + STEP * 3, H, 1_001);
+    expect(heard(a, H.pub, at + STEP * 3)).toBe(true);
+    expect(a.casino.houseOnline(at + STEP * 3)).toBe(true);
+    sync(at + STEP * 3, a, b);
+    expect(housesOf(b)).toEqual([H.pub]);
   });
 
   it('waits for no slice once the delegation it waited for is checked: asking for the slice that checks what waited queues none', async () => {
