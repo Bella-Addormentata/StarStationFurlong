@@ -879,6 +879,13 @@ export interface FoldResult {
    *  read, where `rawBytes - keptBytes` is what a sweep clears. It depends on
    *  the records and not on the order they came in. At other tables it is
    *  `bytes`. */ keptBytes: number;
+  /** FAIR ONLY: the part of `keptBytes` only the open round's chosen felts
+   *  account for (a felt a valid close froze is counted with its close, not
+   *  here), which a pause must not read: anyone at the table can put a long
+   *  felt down on the open round (a slip is about 21 KB at most: 400 bets, each
+   *  of an amount up to MAX_BET_AMOUNT, and a player id of 256 units), and
+   *  with a pause that read them a handful of them would stop the closes that
+   *  move those felts out of the open round, for good. 0 at other tables. */ feltBytes: number;
   /** Indexed record count. */ records: number;
 }
 
@@ -2384,7 +2391,7 @@ export class TableFold {
       return {
         base: this.base, rounds: [], tip: null, open: 1, parent: sid, houseTable: true, required: null, joins: [],
         openCloses: [], felts: new Map(), nets: new Map(), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
-        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: 0, records: this.entries.size,
+        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: 0, feltBytes: 0, records: this.entries.size,
       };
     }
     // An ended incarnation plays no more rounds: a session map under the sid
@@ -2396,7 +2403,7 @@ export class TableFold {
         base: this.base, rounds: [], tip: null, open: u + 1, parent: sid, houseTable: this.house, required: null, joins: [],
         openCloses: [], felts: new Map(),
         nets: new Map(this.base.n), held: new Map(), carry: this.base.state, revealedCommits: new Set(),
-        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: this.fairOnly ? 0 : this.bytes, records: this.entries.size,
+        pending: false, bytes: this.bytes, rawBytes: this.rawBytes, keptBytes: this.fairOnly ? 0 : this.bytes, feltBytes: 0, records: this.entries.size,
       };
     }
 
@@ -2599,6 +2606,7 @@ export class TableFold {
     const revealedCommits = new Set<string>();
     for (const c of [...this.revealCommits.keys()].sort()) if (this.slipCommits.has(c)) revealedCommits.add(c);
 
+    const kept = this.fairOnly ? this.keptOf(eligible, infos, outcomes, rests, felts, joins, open) : null;
     return {
       base: this.base,
       rounds,
@@ -2617,7 +2625,8 @@ export class TableFold {
       pending: this.sawPending,
       bytes: this.bytes,
       rawBytes: this.rawBytes,
-      keptBytes: this.fairOnly ? this.keptOf(eligible, infos, outcomes, rests, felts, joins, open) : this.bytes,
+      keptBytes: kept ? kept.bytes : this.bytes,
+      feltBytes: kept ? kept.felts : 0,
       records: this.entries.size,
     };
   }
@@ -2638,11 +2647,15 @@ export class TableFold {
    *  from an earlier pass. A house reveal that waits on a seed is counted
    *  once it decides the round, and a join once a close rests on it or it is
    *  one of the open round's. So a fold fed one record at a time, in any
-   *  order, and a fresh one agree. */
+   *  order, and a fresh one agree.
+   *
+   *  `felts` is the part the open round's chosen felts account for alone
+   *  (FoldResult.feltBytes): the felts no valid close froze, which anyone at
+   *  the table can raise. */
   private keptOf(
     eligible: readonly (readonly CloseEntry[])[], infos: ReadonlyMap<string, CloseInfo>, outcomes: ReadonlyMap<string, Outcome>,
     rests: ReadonlyMap<string, string[]>, felts: ReadonlyMap<string, SlipInfo>, joins: FoldResult['joins'], open: number,
-  ): number {
+  ): { bytes: number; felts: number } {
     const used = new Set<string>();
     for (const ok of eligible) {
       for (const c of ok) {
@@ -2658,13 +2671,20 @@ export class TableFold {
         for (const key of rests.get(c.hash) ?? []) used.add(key);
       }
     }
-    for (const s of felts.values()) used.add(s.key);
+    // (A felt a close froze above is counted there: a felt of the open round is
+    // counted once, with the first that has it.)
+    let feltOnly = 0;
+    for (const s of felts.values()) {
+      if (used.has(s.key)) continue;
+      used.add(s.key);
+      feltOnly += this.entries.get(s.key)?.size ?? 0;
+    }
     // (The joins are the ones joinsOf chose: the first MAX_CLOSES_PER_ROUND, in hash order, that are a house's and
     // verify. One that was checked once, and lies past them now, is not one of them.)
     const at = this.joinsAt.get(open);
     if (at) for (const j of joins) used.add(at.get(j.hash)!.key);
-    let kept = 0;
-    for (const key of used) kept += this.entries.get(key)?.size ?? 0;
-    return kept;
+    let bytes = 0;
+    for (const key of used) bytes += this.entries.get(key)?.size ?? 0;
+    return { bytes, felts: feltOnly };
   }
 }

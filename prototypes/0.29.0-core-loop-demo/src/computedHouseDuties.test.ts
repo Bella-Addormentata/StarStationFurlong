@@ -585,6 +585,31 @@ describe('a Fair round on the pages', () => {
     }
   });
 
+  it("a close of a page's own that the house stepped down is written again, naming the join that follows, and once: a lone bettor's round is not held for good", async () => {
+    const [a] = await houseRoom(['A']);
+    house(a, kit.houseJoin(H, 1));
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    const closedAt = run([a], T0 + STEP, T0 + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
+    expect(closesOf(a, 1).map((c) => c.h)).toEqual([kit.houseCommit(H, 1)]);
+    run([a], closedAt + STEP, closedAt + 3_000, { step: STEP });
+    expect(foldOf(a).tip).toMatchObject({ r: 1, decided: null });
+    // The house steps the commitment down (its seed is public from now on) and joins the round again with another.
+    const altSeed = kit.seed('house-alt', 1);
+    const alt = kit.houseCommit(H, 1, altSeed);
+    house(a, kit.stepDown(H, 1), kit.houseJoin(H, 1, alt));
+    const stepped = closedAt + 3_000;
+    expect(foldOf(a)).toMatchObject({ tip: null, open: 1, required: null });
+    expect(foldOf(a).openCloses.map((c) => c.state)).toEqual(['invalid']);
+    const again = run([a], stepped + STEP, stepped + 120_000, { step: STEP, until: () => closesOf(a, 1).some((c) => c.h === alt) });
+    const key = keysIn(a, 'c', 1).find((k) => recOf<CloseRec>(a, k).h === alt)!;
+    expect(foldOf(a).tip).toMatchObject({ r: 1, close: hashIn(key), decided: null });
+    run([a], again + STEP, again + 20_000, { step: STEP });
+    expect(closesOf(a, 1)).toHaveLength(2);
+    house(a, kit.houseReveal(H, 1, [hashIn(key)], frozenOf(recOf<CloseRec>(a, key)), { s: altSeed }));
+    run([a], again + 20_000 + STEP, again + 24_000, { step: STEP });
+    expect(foldOf(a).rounds[0]).toMatchObject({ decided: 'house', counted: [a.pid] });
+  });
+
   it('a deed handover ends the old holder\'s house on every page alike, loaded before it or after, and the new holder\'s delegation of it stands', async () => {
     const { pages, a, b, close, closedAt, closeHash } = await closedFairRound();
     run(pages, closedAt + STEP, closedAt + 2_000, { step: STEP });

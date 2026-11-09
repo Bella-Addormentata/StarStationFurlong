@@ -225,7 +225,7 @@ import type {
   CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
   PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
-import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash, signBytes, TableFold } from './computedFold';
+import { asCheckpointFor, asHouseSumFor, compareHouseSum, gameOfInc, houseSumDigest, MAX_SESSION_ROUNDS, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash, signBytes, TableFold, utf8Length } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, HouseCheck, HouseSum, RedecideCandidate, SigCheck } from './computedFold';
 import { asFin, asXf, isFairOnlyInc, MAX_SMALL_RECORD_BYTES, parseFairOnlyKey, readCk, weightOf, xfId } from './computedFairOnly';
 import type { CkRead, CkRec } from './computedFairOnly';
@@ -4048,9 +4048,10 @@ function recountComputedHeld(incKey: string, held: ReadonlyMap<string, bigint>):
  *  mark, a checkpoint that says so, or compaction after the wait.) A hint
  *  holds by the name alone, not by the game's liveness: no recount is due for
  *  it when a game opens or ends, and none flickers the stake free between the
- *  game's end and the put-back. A name of the other game holds with a game live
- *  and not without one, so a game opening or ending counts the table's
- *  incarnations again (notePlayedGames). Neither holds once the switch has
+ *  game's end and the put-back. A name of the other game holds with a live game
+ *  of `c`'s own game and not without one, so the table's incarnations are
+ *  counted again when the game played moves from or to a game, and when the set
+ *  of live letters moves (notePlayedGames). Neither holds once the switch has
  *  named another page-signed incarnation of `c`'s game since (`c.leftFor`):
  *  then `c` is over, and its pages let go of its slips, so a name that comes
  *  after holds nothing of it. */
@@ -5139,6 +5140,20 @@ export function computedTablePids(tableId: string): ReadonlySet<string> {
 const EMPTY_PIDS: ReadonlySet<string> = new Set();
 const tablePids = new WeakMap<FoldResult, Set<string>>();
 
+/** The UTF-8 bytes the ids of computedTablePids(tableId) take: what a FAIR ONLY
+ *  game's close weighs against MAX_TABLE_PID_BYTES (S6 e), kept with the set. */
+export function computedTablePidBytes(tableId: string): number {
+  const pids = computedTablePids(tableId);
+  let bytes = tablePidBytes.get(pids);
+  if (bytes === undefined) {
+    bytes = 0;
+    for (const pid of pids) bytes += utf8Length(pid);
+    tablePidBytes.set(pids, bytes);
+  }
+  return bytes;
+}
+const tablePidBytes = new WeakMap<ReadonlySet<string>, number>();
+
 /** What the room's computed sessions weigh: Σ rawBytes (computedFold: every
  *  key, junk included) over each incarnation's live session as last counted,
  *  ended ones too until they are compacted. A session past ROOM_MIN_BYTES is
@@ -5146,6 +5161,17 @@ const tablePids = new WeakMap<FoldResult, Set<string>>();
 export function computedRoomBytes(): number {
   let total = 0;
   for (const c of computedIncs.values()) if (c.live && c.last) total += c.last.rawBytes;
+  return total;
+}
+
+/** 🔒 What the room's FAIR ONLY games weigh in kept bytes (FoldResult
+ *  keptBytes: the records each pass used, which junk can't raise; less the
+ *  felts of the open round no close froze, feltBytes, which anyone can put
+ *  down), over every game that is live, as last counted (design §8.4 P3:
+ *  pages close nothing while this passes ROOM_BYTES, as no page trims a game). */
+export function computedFairOnlyBytes(): number {
+  let total = 0;
+  for (const c of computedIncs.values()) if (c.fo?.res?.live === true && c.last) total += c.last.keptBytes - c.last.feltBytes;
   return total;
 }
 

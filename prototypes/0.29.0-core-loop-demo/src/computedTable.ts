@@ -152,6 +152,7 @@ import {
   checkpointLabelOf,
   computedCheckpointOf,
   computedEndedIncs,
+  computedFairOnlyBytes,
   computedFoldOf,
   computedGameMovesOf,
   computedRedecide,
@@ -160,6 +161,7 @@ import {
   computedIncOf,
   computedLiveTables,
   computedRecoveries,
+  computedResolutionOf,
   computedRestorePending,
   computedRecoveryOn,
   computedRoomBytes,
@@ -168,6 +170,7 @@ import {
   computedSettled,
   computedSlipDoubted,
   computedSwitchLost,
+  computedTablePidBytes,
   computedTablePids,
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
@@ -212,8 +215,8 @@ import {
 import type { ComputedRecovery, EndedComputed, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
-  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_SLIP_BETS, MAX_TABLE_PIDS, nextSid, parseKey,
-  recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor,
+  forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_SLIP_BETS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid, parseKey,
+  recHash, revealKey, seedTable, signBytes, slipCommit, slipKeyFor, utf8Length,
 } from './computedFold';
 import type {
   AbandonRec, AnySlipRec, Checkpoint, CloseRec, CrapsSlipRec, Decision, Duty, FoldCtx, FoldResult, ForfeitRec, GameName, HouseSum, RecKind,
@@ -280,6 +283,13 @@ export const TRIM_ROUNDS = 20;
 export const TRIM_BYTES = 96 * 1024;
 export const ROOM_BYTES = 384 * 1024;
 export const ROOM_MIN_BYTES = 24 * 1024;
+/** 🔒 A FAIR ONLY game's session holding this many kept bytes (FoldResult
+ *  keptBytes less the felts of the open round no close has frozen, feltBytes:
+ *  what anyone can put down, and a close is what moves out of the open round)
+ *  pauses its closes (design §8.4 P3): no page trims a game, so the house's
+ *  trim must come first. The room's FAIR ONLY games together pause at
+ *  ROOM_BYTES. */
+export const PAUSE_BYTES = 192 * 1024;
 /** No new record for this long is pressure to trim too. */
 export const IDLE_MS = 60_000;
 /** A page none of the last round's bettors is on trims after this idle. */
@@ -517,10 +527,12 @@ interface TableState {
   tickedAt: number | null;
   reputAt: number | null;
   /** 🔒 When the table started this state's waits afresh (tableOf resumes it
-   *  once a FAIR ONLY game was played at the table since it was last served), as
-   *  after a wake; 0 before. No duty ran here meanwhile, so no seed could be
-   *  revealed in the time that went by, and a first-seen time from before it
-   *  would put the grace long past. */
+   *  once the game the table plays moved to or from a FAIR ONLY one since the
+   *  table was last served: a page-signed incarnation's state waits while a
+   *  game is played, a game's while another is or the page-signed incarnation
+   *  is), as after a wake; 0 before. No duty ran here meanwhile, so no seed
+   *  could be revealed in the time that went by, and a first-seen time from
+   *  before it would put the grace long past. */
   wakeAt: number;
   /** The last decided round this page saw on the chain: what the felt
    *  shows once a trim has taken the round out of the session, when it is
@@ -600,7 +612,32 @@ interface TableState {
 const clock = {
   epoch: -1, wakes: 0, last: null as number | null, wakeAt: 0, gen: 0, inAt: null as number | null, realFrom: 0,
 };
+/** By table: the state of the page-signed incarnation this page runs there
+ *  (`c k r d`; a new one lets go of the last). */
 const tables = new Map<string, TableState>();
+/** 🔒 By `<tableId>:<inc>`: the state of each FAIR ONLY game this page plays
+ *  (`p q`), apart from the page-signed incarnation's under the same table. A
+ *  table may hold several games and a page-signed incarnation, and the one
+ *  played changes as S9's choice moves with the deed (computedIncOf); what this
+ *  page wrote for the others (its frozen slips, and the seeds behind them)
+ *  waits for the day they are played again, so a state is let go only when its
+ *  own game ends (compactDuty). */
+const fairTables = new Map<string, TableState>();
+
+/** Every state this page keeps: the page-signed incarnations' and the games'. */
+function* allStates(): IterableIterator<TableState> {
+  yield* tables.values();
+  yield* fairTables.values();
+}
+
+/** The state of the game table `t` plays now (computedIncOf), if this page
+ *  has looked at it: the game's own when that is a FAIR ONLY one, else the
+ *  table's page-signed state (which may be of an incarnation the switch no
+ *  longer names: a reader checks `inc`). */
+function stateOf(t: string): TableState | undefined {
+  const inc = computedIncOf(t);
+  return inc !== null && isFairOnlyInc(inc) ? fairTables.get(`${t}:${inc}`) : tables.get(t);
+}
 /** 🏛️ The sids of the final checkpoints this page itself wrote (switch-off or
  *  compaction, finalizeComputed): D2 vouches for an end only when it is one of
  *  these (its own; a cheat's forged `e:1` carrying this page's key is not).
@@ -663,6 +700,7 @@ function lookAtClock(now: number): void {
     clock.epoch = epoch;
     tables.clear();
     servedMoves.clear();
+    fairTables.clear();
     endedByMe.clear();
     endedAt.clear();
     compactedAt = null;
@@ -690,7 +728,7 @@ function lookAtClock(now: number): void {
     // this page watched come in.)
     clock.realFrom = Math.max(clock.realFrom, now + TABLE_LEASE_LAPSE_MS, clock.last ?? now);
     clock.gen += 1;
-    for (const st of tables.values()) forgetWaits(st);
+    for (const st of allStates()) forgetWaits(st);
     endedAt.clear();
     awayAt.clear();
   }
@@ -779,54 +817,83 @@ function supersede(st: TableState): void {
   tables.set(st.t, newTable(st.t, next));
 }
 
+/** A state served again, its waits started afresh, as after a wake: no duty of
+ *  it ran while the table played another incarnation (or since this page was
+ *  bound), so a timer whose wait spanned that starts again (or a close seen
+ *  before would have its grace long past, and the first page to reveal would
+ *  forfeit the players whose pages hadn't yet), and what was built on those
+ *  waits is built again (clock.gen): a betting view cached expired, with the
+ *  fold unchanged, would close on the old deadline, and the scan keeps the idle
+ *  time it took from the first-seen ones. */
+function resumeWaits(st: TableState): void {
+  forgetWaits(st);
+  st.wakeAt = clock.last ?? Date.now();
+  clock.gen += 1;
+}
+
+/** 🔒 A look at table t while a FAIR ONLY game is played: a game defers a
+ *  page-signed incarnation's duties, never its end nor the switch's moving.
+ *  Once the switch has named another page-signed incarnation the doc holds
+ *  (isOver), the one this page ran is over, its stakes freed (casinoDoc
+ *  switchHoldsFelts) and its slips never to settle, so its state is replaced by
+ *  the other's as it would be with no game, and nothing is put back for it when
+ *  the game ends. Otherwise it waits as it is, and is served again, its waits
+ *  started afresh, once the table plays it (tableOf). */
+function passBy(t: string): void {
+  const waits = tables.get(t);
+  if (waits && isOver(waits)) supersede(waits);
+}
+
 /** Table t's state and fold result, when it is a computed table casinoDoc
  *  has a result for; given a game, only when the incarnation's name says
  *  that game (a craps name under a roulette table runs nothing here, nor a
- *  roulette one under a craps table: awayDuty ends it). */
+ *  roulette one under a craps table: awayDuty ends it). 🔒 The game played
+ *  (computedIncOf) is a FAIR ONLY one's when the table has one live: its state
+ *  is its own (fairTables), and the other states of the table wait (passBy);
+ *  every state is resumed once the game played moved to or from a game since it
+ *  was last served. */
 function tableOf(t: string, game?: GameName): { st: TableState; res: FoldResult } | null {
   if (!isComputedTable(t)) return null;
   const inc = computedIncOf(t)!;
-  // (🔒 A FAIR ONLY game is played by no duty of a page-signed table: its own
-  // are PR 6c-4b's, which open this. The page-signed incarnation this page ran
-  // waits as it is, and is served again, its waits started afresh, once the
-  // table plays it. A game defers its duties, though, never its end nor the
-  // switch's moving: once the switch has named another page-signed incarnation
-  // the doc holds (isOver), the one this page ran is over, its stakes freed
-  // (casinoDoc switchHoldsFelts) and its slips never to settle, so its state is
-  // replaced by the other's as it would be with no game, and nothing is put
-  // back for it when the game ends.)
-  if (isFairOnlyInc(inc)) {
-    const waits = tables.get(t);
-    if (waits && isOver(waits)) supersede(waits);
-    return null;
-  }
+  if (isFairOnlyInc(inc)) passBy(t);
   if (game !== undefined && gameOfInc(inc) !== game) return null;
   const res = computedFoldOf(t);
   if (!res) return null;
-  let st = tables.get(t);
-  if (!st || st.inc !== inc) {
-    // (A new incarnation: nothing of the last one's will be revealed now.)
-    if (st) letGo(st, () => false);
-    tables.set(t, st = newTable(t, inc));
+  let st: TableState | undefined;
+  if (isFairOnlyInc(inc)) {
+    const key = `${t}:${inc}`;
+    st = fairTables.get(key);
+    if (!st) fairTables.set(key, st = newTable(t, inc));
+  } else {
+    st = tables.get(t);
+    if (!st || st.inc !== inc) {
+      // (A new incarnation: nothing of the last one's will be revealed now.)
+      if (st) letGo(st, () => false);
+      tables.set(t, st = newTable(t, inc));
+    }
   }
+  // (Resumed after a move: the game the table plays went to or from a FAIR ONLY
+  // one at this table since this page last served it, or since it was bound, and
+  // no duty of this state ran meanwhile. The doc counts the moves (casinoDoc
+  // computedGameMovesOf), so a table no frame looked at during the game, and a
+  // page whose first frame comes after it, resume the same.)
   const moves = computedGameMovesOf(t);
-  if (moves !== (servedMoves.get(t) ?? 0)) {
-    // (Resumed after a game: it was played at this table since this page last
-    // served it, or since it was bound, and no duty of this state ran meanwhile.
-    // As after a wake, a timer whose wait spanned it starts again, or a close
-    // seen before the game would have its grace long past and the first page to
-    // reveal would forfeit the players whose pages hadn't yet. And, as after a
-    // wake, what was built on those waits is built again (clock.gen): a betting
-    // view cached expired, with the fold unchanged, would close on the old
-    // deadline, and the scan keeps the idle time it took from the first-seen
-    // ones.)
-    forgetWaits(st);
-    st.wakeAt = clock.last ?? Date.now();
-    clock.gen += 1;
-  }
+  if (moves !== (servedMoves.get(t) ?? 0)) resumeWaits(st);
   servedMoves.set(t, moves);
   noteResult(st, res);
   return { st, res };
+}
+
+/** …and only a page-signed incarnation's: the switch API's (the house's
+ *  switch-off and its refusals) is about the incarnation the switch names, and
+ *  a game's end is its authority's. */
+function ordinaryTableOf(t: string): { st: TableState; res: FoldResult } | null {
+  const inc = computedIncOf(t);
+  if (inc === null) return null;
+  if (!isFairOnlyInc(inc)) return tableOf(t);
+  // (A look at a game's table passes the states beside it by as tableOf does.)
+  passBy(t);
+  return null;
 }
 
 /** The fold's result now, noted (the state of a duty after another wrote). */
@@ -949,6 +1016,9 @@ function noteResult(st: TableState, res: FoldResult): void {
  *  §6.3. On any failure it writes nothing and forgets its chain (st.attested).
  *  Not a hot path: once per trim this page folds, about a signature's worth. */
 function attestDuty(st: TableState, was: FoldResult, res: FoldResult, carriedPlayed = 0): void {
+  // 🔒 None at a FAIR ONLY game: its checkpoints are its house's, resolved by
+  // its authority (S3), and there is no `hs:` over them to write.
+  if (isFairOnlyInc(st.inc)) return;
   if (!holdsDeed()) {
     st.attested = null;
     st.pendingAttest = null;
@@ -1828,7 +1898,7 @@ export function readComputedBets(t: string, round: number, now = Date.now()): Re
  *  felt this page holds back to write (the coalescing) laid over it. */
 export function readMyComputedBets(t: string, me: string, round: number, now = Date.now()): RouletteBet[] {
   const bets = readComputedBets(t, round, now);
-  const st = tables.get(t);
+  const st = stateOf(t);
   const p = st?.pending;
   if (p && p.r === round && me === getPlayerId() && st!.view?.view.phase === 'betting' && st!.view.view.round === round) {
     return p.felt as RouletteBet[];
@@ -2121,7 +2191,7 @@ export function readComputedCrapsBets(t: string, round: number, now = Date.now()
  */
 export function readMyComputedCrapsBets(t: string, me: string, round: number, now = Date.now()): { felt: CrapsBet[]; basis: string } {
   const bets = readComputedCrapsBets(t, round, now);
-  const st = tables.get(t);
+  const st = stateOf(t);
   const carry = (st?.lastRes?.carry as CrapsCarry | undefined) ?? EMPTY_CARRY;
   const basis = basisOf(carry, me);
   const p = st?.pending;
@@ -2415,7 +2485,10 @@ export interface ComputedCheckpointView {
 }
 export function computedCheckpointView(t: string, now = Date.now()): ComputedCheckpointView | null {
   lookAtClock(now);
-  const at = tableOf(t);
+  // (🔒 A game's checkpoints are its house's, resolved by its authority, with
+  // no owner-signed `hs:` to label or back off from: the card's lines at a
+  // game are PR 6c-4c's.)
+  const at = ordinaryTableOf(t);
   if (!at) return null;
   const { st, res } = at;
   const cp = st.cpDiff && st.cpDiff.sid === res.base.sid ? st.cpDiff : null;
@@ -2699,6 +2772,14 @@ export type ComputedTableRef = string | { id: string; game: GameName };
  * games); and the compaction of any ended incarnation, of these tables or
  * not. A phase this page's clock alone moved on tells the table's listeners
  * once.
+ *
+ * 🔒 A table that plays a FAIR ONLY game (computedIncOf) runs these duties on
+ * the game's own state (fairTables). The page-signed incarnation's state beside
+ * it waits as it is (passBy), and is served again, its waits started afresh,
+ * once the table plays it (tableOf). At a game no page trims or vouches for the
+ * checkpoints (they are its house's), a close needs a house commitment to name
+ * and waits while the game is paused (closePaused), and an abandon is a
+ * bettor's alone. The state of a game is let go with the game (compactDuty).
  */
 export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Date.now()): void {
   lookAtClock(now);
@@ -3225,8 +3306,9 @@ function noteSeedOut(st: TableState, now: number): void {
  * 4. Close the open round's betting, in this page's turn among the players
  * with chips on it (dutyRank), BET_WINDOW_MS after the window started.
  * Stands down for a close of the round already in (valid, or still being
- * checked), or a close this page's key already signed on this parent (in
- * the doc, so a reload knows: signedIn); and for a seed of the round
+ * checked), or a close this page's key already signed on this parent and
+ * naming what it would name now (in the doc, so a reload knows: signedIn); and
+ * for a seed of the round
  * already out (some close this page hasn't seen froze it: seedOut), until
  * ABANDON_MS after this page first saw it so (seedOutAt): a close deleted
  * after its seeds went out, by a peer, with its author gone, would else
@@ -3239,8 +3321,12 @@ function noteSeedOut(st: TableState, now: number): void {
  * rule, and chips may move once: the split a delete makes, as a cut-off
  * room's. Freezes each player's latest felt with chips on it, but no burned
  * commitment, at most MAX_FROZEN, its own always, the rest earliest seen
- * first. Its turn moves back for a felt of its own that changed late, or
- * that its player's other tab wrote (closeDue).
+ * first, and no newcomer the table has no room left for (MAX_TABLE_PIDS
+ * players, at a FAIR ONLY game MAX_TABLE_PID_BYTES of their ids too): this
+ * page's own player is counted first, then the rest in that order, so the close
+ * stays within what the fold takes of a chain (S6 e) and a table near the
+ * caps closes with as many newcomers as fit. Its turn moves back for a felt
+ * of its own that changed late, or that its player's other tab wrote (closeDue).
  *
  * At craps it runs whenever the roll's window has started and no close is
  * in (crapsDutyOn), W the end of betting; its turns while the roll waits
@@ -3255,10 +3341,24 @@ function noteSeedOut(st: TableState, now: number): void {
  * Fair, stands it down as any close does: none is written to take a round
  * the house joined late from one already closed Friendly (the house reveals
  * for no close of a round another close of names nothing: house.rs).
+ *
+ * 🔒 At a FAIR ONLY game no round is Friendly, and a close that names nothing
+ * is invalid (S6 a): with no commitment to name (no join of the round yet, or
+ * the house stepped down) it writes none, and the bets stay on the felt. Nor
+ * while the game is paused (closePaused, design §8.4 P3).
+ *
+ * A close of its own on this parent that names a commitment the house has
+ * since stepped down (the fold refuses it) does not stand the page down, at a
+ * house table as at a game: it writes another for the same round, naming the
+ * join that follows (at a house table with none, a Friendly one; at a game
+ * none, until a join is in).
  */
 function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
   if (!res) return;
+  const h = res.required ?? res.joins[0]?.rec.c;
+  const fair = isFairOnlyInc(st.inc);
+  if (fair && (h === undefined || closePaused(st, res))) return;
   const craps = st.game === 'craps';
   const deadline = craps ? crapsDutyOn(st, res, now) ?? undefined : bettingOn(st, res, now)?.view.phaseDeadline;
   if (deadline === undefined) return;
@@ -3270,7 +3370,12 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   // checkpoint couldn't carry them all. This page's own player either.)
   if (crowdedOut(st.t, me)) return;
   const sc = scanOf(st, res);
-  if (signedIn<CloseRec>(st, sc, 'close', asClose, sc.closes, o, pub, (c) => c.q === res.parent)) return;
+  // (A close of its own on this parent stands it down only if it names what a
+  // close would name now. One the fold refused because the house stepped the
+  // commitment it names down is no such close: the round would hold for good,
+  // its page writing no other. A close refused for the caps names the same
+  // commitment, and is not written again.)
+  if (signedIn<CloseRec>(st, sc, 'close', asClose, sc.closes, o, pub, (c) => c.q === res.parent && c.h === h)) return;
   const staked = [...res.felts.values()].filter((s) => s.rec.b.length > 0);
   const pubs = staked.map((s) => s.rec.k);
   const idx = placeOf('close', st.ctx, o, pubs, pub);
@@ -3280,15 +3385,51 @@ function closeDuty(st: TableState, me: string, pub: string, now: number): void {
   // (Seen just now, as this tick noted it: noteSeedOut.)
   if (seedOut(st, sc, o) && now < (st.seedOutAt?.at ?? now) + ABANDON_MS + idx * STAGGER_MS) return;
   const others = (craps ? [...res.felts.values()].filter((s) => crapsFreezable(res.carry as CrapsCarry, s)) : staked)
-    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c) && !crowdedOut(st.t, s.rec.p) && !computedSlipDoubted(st.t, s.hash))
+    .filter((s) => s.rec.p !== me && !burnedCommit(st, res, s.rec.c) && !computedSlipDoubted(st.t, s.hash))
     .map((s) => ({ s, at: seen(st, s.key, now) }))
     .sort((a, b) => a.at - b.at || (a.s.rec.p < b.s.rec.p ? -1 : 1));
+  // (Newcomers are counted as they go in, this page's own player first: the
+  // table has room for them together, and the fold refuses a close whose chain
+  // passes the caps (S6 e) however each fits alone. Such a close would hold the
+  // round: its page writes no other (signedIn), and the pages that see the
+  // table as this one does would each write the same.)
+  const room = pidRoomOf(st.t);
+  if (room) pidTaken(room, me);
   const f: Record<string, string> = { [me]: own.hash };
-  for (const { s } of others.slice(0, MAX_FROZEN - 1)) f[s.rec.p] = s.hash;
-  const h = res.required ?? res.joins[0]?.rec.c;
+  for (const { s } of others) {
+    if (Object.keys(f).length >= MAX_FROZEN) break;
+    if (room && !pidTaken(room, s.rec.p)) continue;
+    f[s.rec.p] = s.hash;
+  }
   const rec = signed(st.ctx, 'close', { r: o, q: res.parent, f, ...(h !== undefined ? { h } : {}), k: pub });
   const key = closeKey(rec);
   if (key) put(st, key, rec, o, true);
+}
+
+/**
+ * 🔒 Whether a FAIR ONLY game pauses its closes (design §8.4 P3). No page
+ * trims a game (trimDuty), so its house's trim is what makes room, and a
+ * session nobody trims must not grow without end. Closes wait while
+ * - a fin stands (S5): the game is ending, the house decides or voids the
+ *   round in flight and joins no more;
+ * - the open round is past the rounds a session may hold (MAX_HELD_ROUNDS): a
+ *   close for it is invalid (S6 b);
+ * - the session's kept bytes pass PAUSE_BYTES, or the room's games' together
+ *   ROOM_BYTES. Kept bytes only, and not the open round's felts that no close
+ *   froze (feltBytes): junk can't pause a table (the house sweeps it), nor a
+ *   few long felts the table's strangers put down on the round that is open.
+ * The bets themselves, the reveals and an abandon go on: the bets stay on the
+ * felt. (That the house is heard is a pause beside these: PR 6c-4b-1b.)
+ */
+function closePaused(st: TableState, res: FoldResult): boolean {
+  return fairClosePaused(res.keptBytes - res.feltBytes, computedFairOnlyBytes(), res.open - res.base.u, (computedResolutionOf(st.t, st.inc)?.fin ?? null) !== null);
+}
+
+/** closePaused's rule on its own inputs: the session's kept bytes, the room's
+ *  games' together, how many rounds the open one is past the base (a session
+ *  holds MAX_HELD_ROUNDS), and whether a fin stands. */
+export function fairClosePaused(kept: number, room: number, ahead: number, fin: boolean): boolean {
+  return kept >= PAUSE_BYTES || room >= ROOM_BYTES || ahead > MAX_HELD_ROUNDS || fin;
 }
 
 /**
@@ -3507,6 +3648,12 @@ function answerDuty(st: TableState, me: string, pub: string, now: number): void 
  * long, or only HOUSE_HEARD_MS once this page hasn't heard the house for
  * that long (abandonWait): the house has gone, and the round is voided
  * sooner. Its next round is joinable, and Friendly while no house joins it.
+ *
+ * 🔒 At a FAIR ONLY game an abandon counts only from the key of a present
+ * frozen slip of the close it names (S6 d), so only such a page writes one,
+ * and takes its turn among those pages alone: a record of any other would
+ * count for nothing, and a flood of slips signed by strangers would push the
+ * bettors' turns out. (That is every round there: its close names the house.)
  */
 function abandonDuty(st: TableState, me: string, pub: string, now: number): void {
   const res = resultOf(st);
@@ -3514,17 +3661,24 @@ function abandonDuty(st: TableState, me: string, pub: string, now: number): void
   if (!res || !tip) return;
   const closeSeen = seen(st, `c:${tip.r}:${tip.close}`, now);
   if (now < closeSeen + (tip.closeRec.h !== undefined ? HOUSE_HEARD_MS : ABANDON_MS)) return;
-  let wrote = false;
-  for (const m of st.mine.values()) if (m.r > res.base.u) wrote = true;
-  if (!wrote && readSeat(st.t, me) === null) return;
+  const sc = scanOf(st, res);
+  const bettors = isFairOnlyInc(st.inc) ? frozenPubs(sc, tip) : null;
+  if (bettors) {
+    if (!bettors.includes(pub)) return;
+  } else {
+    let wrote = false;
+    for (const m of st.mine.values()) if (m.r > res.base.u) wrote = true;
+    if (!wrote && readSeat(st.t, me) === null) return;
+  }
   if (heldBack(st, res, tip.close, now)) return;
   if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return;
-  const sc = scanOf(st, res);
   if (signedIn<AbandonRec>(st, sc, 'abandon', asAbandon, sc.abandons, tip.r, pub, (z) => z.x === tip.close)) return;
-  const pubs = new Set(checkedSlipPubs(st, sc));
-  for (const pid of Object.keys(readSeats(st.t))) {
-    const k = keyFor(pid);
-    if (k) pubs.add(k);
+  const pubs = new Set(bettors ?? checkedSlipPubs(st, sc));
+  if (!bettors) {
+    for (const pid of Object.keys(readSeats(st.t))) {
+      const k = keyFor(pid);
+      if (k) pubs.add(k);
+    }
   }
   const idx = placeOf('abandon', st.ctx, tip.r, pubs, pub);
   if (now < closeSeen + abandonWait(tip, now) + idx * STAGGER_MS) return;
@@ -3860,8 +4014,13 @@ function witnessDuty(st: TableState, pub: string, now: number): void {
  * every round the room decided meanwhile would void as the link came back.
  * The rounds and the bytes are pressure of records this page holds, deaf or
  * not (a room of one hears nobody, and still trims on them).
+ *
+ * 🔒 Never at a FAIR ONLY game (design §8.4 P1): its checkpoints are its
+ * house's, and a page's would be one no authority signed. The game pauses its
+ * closes instead while its session is heavy or long (closePaused).
  */
 function trimDuty(st: TableState, pub: string, now: number): void {
+  if (isFairOnlyInc(st.inc)) return;
   // (Again: a round this tick's duties decided is seen missing now.)
   noteMissing(st, now);
   const res = resultOf(st);
@@ -4033,6 +4192,15 @@ function compactDuty(pub: string, now: number): void {
       continue;
     }
     if (computedIncEnded(st.t, st.inc)) letGo(st, () => false);
+  }
+  // 🔒 A FAIR ONLY game's state goes with the game, and only then: its end is
+  // its base's alone (S7), whichever game the table plays now, and a game not
+  // played is waiting (the deed may move back to it), so the switch's name
+  // supersedes nothing of it.
+  for (const [key, st] of [...fairTables]) {
+    if (!casinoWhole(st.t) || !computedIncEnded(st.t, st.inc)) continue;
+    letGo(st, () => false);
+    fairTables.delete(key);
   }
   // (Timed from when this page saw it ended, or woke: asleep or not.)
   const awake = tablesAwake(now);
@@ -4246,12 +4414,48 @@ export function computedContested(t: string, now = Date.now()): boolean {
   return !!w && w.overAt !== null && w.overwrites >= CONTESTED_COUNT && w.overAt <= now && now - w.overAt <= CONTESTED_CALM_MS;
 }
 
+/** What table `t`'s players take of the room a close has for them: how many
+ *  there are (computedTablePids) and the bytes of their ids, against
+ *  MAX_TABLE_PIDS players and (a FAIR ONLY game's closes only, S6 e)
+ *  MAX_TABLE_PID_BYTES of ids. `taken` grows as a close freezes newcomers. */
+interface PidRoom {
+  has: ReadonlySet<string>;
+  count: number;
+  bytes: number;
+  maxBytes: number;
+}
+
+/** The room table `t` has for players now, or null when this page counts none
+ *  (it holds no base: computedRecoveryOn). */
+function pidRoomOf(t: string): PidRoom | null {
+  if (!computedRecoveryOn()) return null;
+  const inc = computedIncOf(t);
+  const has = computedTablePids(t);
+  return { has, count: has.size, bytes: computedTablePidBytes(t), maxBytes: inc !== null && isFairOnlyInc(inc) ? MAX_TABLE_PID_BYTES : Infinity };
+}
+
+/** Whether pid `p` has a place at the table: it plays there, or the players
+ *  and their ids' bytes would stay under the caps with it as one more. */
+function pidFits(room: PidRoom, p: string): boolean {
+  return room.has.has(p) || (room.count < MAX_TABLE_PIDS && room.bytes + utf8Length(p) <= room.maxBytes);
+}
+
+/** …and takes the place: a close freezing `p` counts it, newcomers after it
+ *  fit what is left. False (and nothing taken) when it has none. */
+function pidTaken(room: PidRoom, p: string): boolean {
+  if (room.has.has(p)) return true;
+  if (!pidFits(room, p)) return false;
+  room.count += 1;
+  room.bytes += utf8Length(p);
+  return true;
+}
+
 /** Whether pid `me` would join table `t` as a newcomer it has no place for
- *  (MAX_TABLE_PIDS: computedTablePids). */
+ *  (MAX_TABLE_PIDS: computedTablePids; and at a FAIR ONLY game their ids'
+ *  bytes, MAX_TABLE_PID_BYTES). */
 function crowdedOut(t: string, me: string): boolean {
-  if (!computedRecoveryOn()) return false;
-  const pids = computedTablePids(t);
-  return pids.size >= MAX_TABLE_PIDS && !pids.has(me);
+  const room = pidRoomOf(t);
+  return room !== null && !pidFits(room, me);
 }
 
 // ── 🏠 The house ─────────────────────────────────────────────────────────────
@@ -4615,7 +4819,9 @@ function contractRides(carry: CrapsCarry): boolean {
 function offRefusal(t: string, now: number, again = false): ComputedSwitchRefusal | null {
   const gate = switchGate(t, now);
   if (gate) return gate;
-  const at = tableOf(t);
+  // (🔒 The incarnation the switch names, not a game the table plays: a game
+  // is ended by its authority.)
+  const at = ordinaryTableOf(t);
   if (!at) return null;
   const e = viewOf(at.st, at.res, now);
   if (e.holding !== null) return 'busy';
@@ -4685,7 +4891,7 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
   if (!isComputedTable(t)) return 'ok';
   const refused = offRefusal(t, now, again);
   if (refused) return refused;
-  const at = tableOf(t);
+  const at = ordinaryTableOf(t);
   if (!at) {
     // (Nothing of it to finalise: the switch goes, its incarnation marked
     // ended, so a session of it turning up later is compacted as a removed
@@ -4871,7 +5077,7 @@ export function computedMine(t: string, now = Date.now()): ComputedMine | null {
  *  anyone can write. */
 export function noteComputedFling(t: string, round: number, seed: number, now = Date.now()): void {
   lookAtClock(now);
-  const st = tables.get(t);
+  const st = stateOf(t);
   if (!st || st.game !== 'craps' || computedIncOf(t) !== st.inc) return;
   st.flung = { r: round, at: now, seed };
 }
@@ -4892,14 +5098,14 @@ export function computedFlungFor(t: string, now = Date.now()): { r: number; seed
 /** 🎲 The last earlier roll of computed craps table `t` this page saw
  *  change (noteChanged), counted: seq 0 for none. */
 export function computedRollChange(t: string): { seq: number; round: number; undid: [number, number] | null } {
-  return tables.get(t)?.changed ?? { seq: 0, round: 0, undid: null };
+  return stateOf(t)?.changed ?? { seq: 0, round: 0, undid: null };
 }
 
 /** 🎲 How many held changes this page has dropped at computed craps table
  *  `t` because the roll before changed under them (THE LAST ROLL CHANGED:
  *  the table's notice, once per change). */
 export function computedUndoneCount(t: string): number {
-  return tables.get(t)?.undone ?? 0;
+  return stateOf(t)?.undone ?? 0;
 }
 
 /** The last round of computed table `t`'s live chain that is decided (its
@@ -4991,7 +5197,7 @@ export function computedTally(t: string, now = Date.now()): { inc: string; roll:
  */
 export function leaveComputedTables(now = Date.now()): void {
   const me = getPlayerId();
-  for (const st of [...tables.values()]) {
+  for (const st of [...allStates()]) {
     if (computedIncOf(st.t) !== st.inc || !isComputedTable(st.t)) continue;
     if (st.game === 'craps') {
       leaveCraps(st, me, now);
@@ -5056,7 +5262,7 @@ function leaveCraps(st: TableState, me: string, now: number): void {
  *  writes each goodbye again as the felt it was); changes undone as it left
  *  are said now (noteUndone). */
 export function backAtComputedTables(): void {
-  for (const st of tables.values()) {
+  for (const st of allStates()) {
     st.left = false;
     if (!st.undoneAway) continue;
     st.undoneAway = false;
