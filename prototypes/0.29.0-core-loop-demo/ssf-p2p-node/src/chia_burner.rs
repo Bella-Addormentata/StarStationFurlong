@@ -10,17 +10,21 @@
 //!   network beside it (public, not wiped), since P(e) is derived under that
 //!   network's listing hint, which carries the network tag on mainnet
 //!   (§3.5).
-//! - [`BurnerKey`] is one slot's key: P(e), the listing's for an era, or
-//!   K(h), one knock's. Only a root's derivations make one: no trait turns
-//!   a `MoneyKey` (or any other `SecretKey`) into one, and no line of this
-//!   file builds one from anything else (the two tests under Types).
+//! - [`BurnerKey`] is one slot's key: P(e), the listing's for an era, K(h),
+//!   one knock's, or B, the beacon's. Only a root's derivations and
+//!   [`MoneyKey::beacon`] make one: no trait turns a `MoneyKey` (or any
+//!   other `SecretKey`) into one, and no line of this file builds one from
+//!   anything else (the two tests under Types).
 //!
 //! The derivation is §3.2's, line by line (each line is quoted where it is
 //! built). Every burner key is a blake3 PRF output fed to Chia's KeyGen,
 //! not a Chia HD path, so it is off every m/12381/8444/2/* path and off the
 //! master key (§3.3), and Sage and the Chia wallet restoring the same words
-//! never list or co-spend a burner coin. The beacon is not a burner: it keeps
-//! `chia_publish::beacon_wallet_key` of the wallet key, unchanged (§3.1).
+//! never list or co-spend a burner coin. The beacon's key B is a
+//! `BurnerKey` too, but not a root's: it is
+//! `chia_publish::beacon_wallet_key` of the wallet key, unchanged (§3.1), so
+//! its address does not move, and [`MoneyKey::beacon`] is the one line that
+//! makes it.
 //!
 //! The slots of §4.3 (T1 and T5) come from the same root: [`BurnerRoot::slot`]
 //! is how many blocks into an era a kind's first write is due, secret, and
@@ -39,7 +43,9 @@
 //! by reference, not copied out of a `Hash` that would be left behind. Out of
 //! this file's reach: the state blake3 keeps on its own stack while it
 //! hashes, the copies a move leaves, and a burner's `SecretKey`, which
-//! chia-bls does not wipe.
+//! chia-bls does not wipe. B's derivation wipes the same two things, the
+//! copy of W and B's seed, where it is made
+//! (`chia_publish::beacon_wallet_key`).
 #![cfg(feature = "chia-publish")]
 
 use std::fmt;
@@ -75,10 +81,12 @@ pub const SLOT_BLOCKS: u64 = 4_608;
 
 /// The wallet key, m/12381/8444/2/0 unhardened (§3.4): the key the money
 /// spends take (the Bank, GIVE, testnet TAKE, a future TRANSFER), and the W
-/// a [`BurnerRoot`] is made from. It does not turn into a [`BurnerKey`] or
-/// come from one: no `From`, `TryFrom`, `Into`, `AsRef`, `Borrow` or
-/// `Deref` joins them (`tests::a_money_key_cannot_reach_the_publisher`),
-/// and the only line that builds a `BurnerKey` is a root's derivation
+/// a [`BurnerRoot`] is made from. It does not come from a [`BurnerKey`],
+/// and it turns into exactly one, B, the beacon's, through the named method
+/// [`MoneyKey::beacon`] and through no trait: no `From`, `TryFrom`, `Into`,
+/// `AsRef`, `Borrow` or `Deref` joins the two types
+/// (`tests::a_money_key_cannot_reach_the_publisher`), and the only lines
+/// that build a `BurnerKey` are a root's derivation and that method
 /// (`tests::every_line_that_builds_a_key_or_reads_its_secret_is_pinned`).
 pub struct MoneyKey(SecretKey);
 
@@ -95,6 +103,18 @@ impl MoneyKey {
     #[cfg_attr(not(test), allow(dead_code))] // No caller outside the tests until the publisher's keys (PR 10h) hand the money spends their key through it.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
+    }
+
+    /// B of §3.2, the beacon's key: `chia_publish::beacon_wallet_key` of the
+    /// wallet key, unchanged (§3.1; §3.4's table, "one key per network ...
+    /// its address does not move"), so a beacon written from it pays from
+    /// the address the beacon always paid from. It is the one [`BurnerKey`]
+    /// no root makes: R is one-way from the wallet key, and B needs the
+    /// wallet key itself, so it is a named derivation from the `MoneyKey`,
+    /// never a trait. On the burner path the beacon is written from it
+    /// (§4.1, the two beacon rows).
+    pub(crate) fn beacon(&self) -> BurnerKey {
+        BurnerKey(chia_publish::beacon_wallet_key(&self.0))
     }
 }
 
@@ -243,10 +263,11 @@ impl fmt::Debug for BurnerRoot {
     }
 }
 
-/// One slot's key (§3.4): what the publisher signs a listing or a knock with
-/// from PR 10. Only [`BurnerRoot::presence`] and [`BurnerRoot::knock`] make
-/// one. There is no constructor from a `SecretKey`, from raw bytes or from a
-/// [`MoneyKey`], and the key never leaves it: it gives its public key, its
+/// One slot's key (§3.4): what the publisher signs a listing, a knock or
+/// the beacon with from PR 10. Only [`BurnerRoot::presence`],
+/// [`BurnerRoot::knock`] and [`MoneyKey::beacon`] make one. There is no
+/// constructor from a `SecretKey` or from raw bytes, and no conversion from
+/// a [`MoneyKey`], and the key never leaves it: it gives its public key, its
 /// puzzle hash and its signature over a spend, never the `SecretKey` itself.
 /// Its field is private, so only this file can build one or read its key,
 /// and `tests::every_line_that_builds_a_key_or_reads_its_secret_is_pinned`
@@ -665,10 +686,12 @@ mod tests {
         assert_eq!(checked, 2 * 4 * 3);
     }
 
-    /// §12 Derivation: no burner is the beacon key, and the beacon key is
-    /// unchanged: `beacon_wallet_key` of the zero mnemonic's wallet key still
-    /// gives the address chia_wallet.rs's `beacon_key_is_off_the_wallet_path`
-    /// pinned.
+    /// §12 Derivation: no root's burner is the beacon key, and the beacon
+    /// key is unchanged: `beacon_wallet_key` of the zero mnemonic's wallet
+    /// key still gives the address chia_wallet.rs's
+    /// `beacon_key_is_off_the_wallet_path` pinned, and B, the `BurnerKey`
+    /// [`MoneyKey::beacon`] makes, is that key: the same public key and the
+    /// same puzzle hash, so the beacon's address does not move (§3.1).
     #[test]
     fn no_burner_is_the_beacon_key_and_the_beacon_key_is_unchanged() {
         let wallet = keys_from_mnemonic(&zero_words()).wallet;
@@ -679,12 +702,16 @@ mod tests {
             "the value chia_wallet.rs pinned for the beacon key"
         );
         let money = MoneyKey::new(wallet);
+        let b = money.beacon();
+        assert_eq!(b.public_key(), beacon.public_key(), "B is the beacon wallet's key");
+        assert_eq!(b.puzzle_hash(), chia_publish::our_puzzle_hash(&beacon), "B pays from the beacon wallet's address");
+        assert_ne!(b.public_key(), money.secret_key().public_key(), "B is not the wallet key");
         for net in ChiaNet::ALL {
             let root = BurnerRoot::of(&money, net);
             for era in [0u64, 1, 123] {
                 for key in [root.presence(&CK, era), root.knock(&inbox_hint(net, &CK_HOST, &ROOM_KEY, era), era)] {
-                    assert_ne!(key.public_key(), beacon.public_key(), "{net:?}, era {era}");
-                    assert_ne!(key.puzzle_hash(), chia_publish::our_puzzle_hash(&beacon), "{net:?}, era {era}");
+                    assert_ne!(key.public_key(), b.public_key(), "{net:?}, era {era}");
+                    assert_ne!(key.puzzle_hash(), b.puzzle_hash(), "{net:?}, era {era}");
                 }
             }
         }
@@ -793,7 +820,9 @@ mod tests {
 
     /// §3.4 and §12 Types: a `MoneyKey` cannot reach the publisher, whose
     /// entry points take a `BurnerKey` from PR 10, and a `BurnerKey` comes
-    /// only from a root. The design asks for a compile-fail doc test. This
+    /// only from a root's derivations or, for B, from the named method
+    /// [`MoneyKey::beacon`], never by a conversion. The design asks for a
+    /// compile-fail doc test. This
     /// crate is a binary with no library target, so rustdoc runs no doc
     /// tests for it, and its lockfile has neither `trybuild` nor
     /// `static_assertions` (no dependency is added for this). So the proof
@@ -845,8 +874,9 @@ mod tests {
         refuted!(BurnerKey: Into<SecretKey>);
         refuted!(&'static BurnerKey: Into<SecretKey>);
         refuted!(SecretKey: TryFrom<&'static BurnerKey>);
-        // A burner key is made by a root's derivations only: not from a
-        // SecretKey, raw bytes, text or a root by conversion.
+        // A burner key is made by a root's derivations, or for B by
+        // `MoneyKey::beacon`, only: not from a SecretKey, raw bytes, text or
+        // a root by conversion.
         refuted!(BurnerKey: From<SecretKey>);
         refuted!(BurnerKey: From<&'static SecretKey>);
         refuted!(BurnerKey: TryFrom<SecretKey>);
@@ -971,27 +1001,27 @@ mod tests {
     /// `BurnerKey(sk)` or `.map(BurnerKey)`); builds through `Self` or a
     /// `0:` field; reads a `.0` field; or uses `unsafe` (a `transmute`
     /// builds anything). So the three fields stay private, a `BurnerKey` is
-    /// built only in
-    /// `BurnerRoot::key`, a root only in `BurnerRoot::of` and a `MoneyKey`
-    /// only in `MoneyKey::new`, and a secret is read only by those two
-    /// derivations, `MoneyKey::secret_key`, the burner's public key, puzzle
-    /// hash and signer, the redacted Debug and the wipe. A new constructor,
-    /// accessor or field visibility changes the list and fails here until it
-    /// is pinned on purpose. The beacon's
-    /// `BurnerKey` (§3.4, PR 10) will be such a line: B is
-    /// `beacon_wallet_key(W)` (§3.2), a derivation from the `MoneyKey`, not
-    /// a constructor from any `SecretKey`. The scan reads text, not the
+    /// built only in `BurnerRoot::key` and `MoneyKey::beacon`, a root only
+    /// in `BurnerRoot::of` and a `MoneyKey` only in `MoneyKey::new`, and a
+    /// secret is read only by those three derivations,
+    /// `MoneyKey::secret_key`, the burner's public key, puzzle hash and
+    /// signer, the redacted Debug and the wipe. A new constructor, accessor
+    /// or field visibility changes the list and fails here until it is
+    /// pinned on purpose. The beacon's `BurnerKey` (§3.4, PR 10d) is such a
+    /// line: B is `beacon_wallet_key(W)` (§3.2), a derivation from the
+    /// `MoneyKey`, not a constructor from any `SecretKey`. The scan reads text, not the
     /// parsed program: it pins what is written here, for a reviewer to check
     /// against the design, and would not see a name a macro pastes together.
     #[test]
     fn every_line_that_builds_a_key_or_reads_its_secret_is_pinned() {
-        const PINNED_LINES: [(&str, &str); 20] = [
+        const PINNED_LINES: [(&str, &str); 21] = [
             ("", "use chia_bls::{PublicKey, SecretKey};"),
             ("", "pub struct MoneyKey(SecretKey);"),
             ("impl MoneyKey, fn new", "pub(crate) fn new(wallet: SecretKey) -> MoneyKey {"),
             ("impl MoneyKey, fn new", "MoneyKey(wallet)"),
             ("impl MoneyKey, fn secret_key", "pub(crate) fn secret_key(&self) -> &SecretKey {"),
             ("impl MoneyKey, fn secret_key", "&self.0"),
+            ("impl MoneyKey, fn beacon", "BurnerKey(chia_publish::beacon_wallet_key(&self.0))"),
             ("impl fmt::Debug for MoneyKey, fn fmt", "f.write_str(\"MoneyKey(..)\")"),
             ("", "pub struct BurnerRoot([u8; 32], ChiaNet);"),
             ("impl BurnerRoot, fn of", "let w = Zeroizing::new(money.0.to_bytes());"),
@@ -1106,7 +1136,7 @@ mod tests {
             assert_eq!(format!("{root:?}"), "BurnerRoot(..)");
             assert_eq!(format!("{root:#?}"), "BurnerRoot(..)");
             assert_redacted(&format!("{root:?}"), &root.0, "BurnerRoot");
-            for key in [root.presence(&CK, 0), root.knock(&inbox_hint(net, &CK_HOST, &ROOM_KEY, 0), 0)] {
+            for key in [root.presence(&CK, 0), root.knock(&inbox_hint(net, &CK_HOST, &ROOM_KEY, 0), 0), money.beacon()] {
                 let dbg = format!("{key:?}");
                 assert_eq!(dbg, format!("BurnerKey {{ fingerprint: {}, .. }}", key.public_key().get_fingerprint()));
                 assert_redacted(&dbg, &key.0.to_bytes(), "BurnerKey");
