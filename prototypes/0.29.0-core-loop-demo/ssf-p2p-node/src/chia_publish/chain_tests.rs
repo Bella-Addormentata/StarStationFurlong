@@ -3256,8 +3256,8 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     s.lease = WalletLease::new();
     restore(&s.lease, &path, &w);
     assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's spend restored, parked");
-    let burner_path = |lease: &WalletLease, mark: Option<&NodePublishMark>| lost_listing_mark(lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone()));
-    let lost = burner_path(&s.lease, None).expect("W's listing, filed again");
+    let burner_path = async |lease: &WalletLease, mark: Option<&NodePublishMark>| lost_listing_mark(lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone())).await;
+    let lost = burner_path(&s.lease, None).await.expect("W's listing, filed again");
     assert_eq!(lost, saved, "the mark the heartbeat would have saved");
     assert_eq!(lost.payer.as_deref(), Some(money.as_str()), "naming W");
     // A mark on record that names no write of this era's under its hint is
@@ -3271,18 +3271,18 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
     let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
     for (on_record, what) in [(&other_era, "another edition's mark"), (&other_hint, "a mark under another hint")] {
-        assert_eq!(burner_path(&s.lease, Some(on_record)), Some(saved.clone()), "{what}");
+        assert_eq!(burner_path(&s.lease, Some(on_record)).await, Some(saved.clone()), "{what}");
     }
     let void = saved.voided();
     let second = NodePublishMark { writes: 2, ..saved.clone() };
-    assert_eq!(burner_path(&s.lease, Some(&void)), Some(second.clone()), "this edition's void mark");
+    assert_eq!(burner_path(&s.lease, Some(&void)).await, Some(second.clone()), "this edition's void mark");
     // Another node id's void mark counts nothing of this node's, and a mark
     // of another edition keeps the floor.
     let counted = NodePublishMark { writes: 5, ..void.clone() };
-    assert_eq!(burner_path(&s.lease, Some(&counted)), Some(NodePublishMark { writes: 6, ..saved.clone() }), "the count goes on");
+    assert_eq!(burner_path(&s.lease, Some(&counted)).await, Some(NodePublishMark { writes: 6, ..saved.clone() }), "the count goes on");
     let another = NodePublishMark { node_id: Some("another node".into()), ..counted.clone() };
-    assert_eq!(burner_path(&s.lease, Some(&another)).map(|m| m.writes), Some(1), "another node id's");
-    assert_eq!(burner_path(&s.lease, Some(&NodePublishMark { writes: 5, ..other_era.clone() })).map(|m| m.writes), Some(1), "another edition's");
+    assert_eq!(burner_path(&s.lease, Some(&another)).await.map(|m| m.writes), Some(1), "another node id's");
+    assert_eq!(burner_path(&s.lease, Some(&NodePublishMark { writes: 5, ..other_era.clone() })).await.map(|m| m.writes), Some(1), "another edition's");
 
     let (peak, moved) = (s.chain.peak(), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let mut rng = StdRng::seed_from_u64(1);
@@ -3297,9 +3297,9 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     let landed = s.chain.farm().await;
     s.reconcile().await;
     assert!(!s.lease.outgoing_pending_for(Payer::of(&w)) && s.lease.holds_for(Payer::of(&w)), "W's spend settling");
-    assert_eq!(burner_path(&s.lease, None), Some(saved.clone()), "still found while it settles");
-    assert_eq!(burner_path(&s.lease, Some(&void)), Some(second), "…over a void mark too, spent in its own era");
-    assert_eq!(burner_path(&s.lease, Some(&lost)), None, "a mark that names it is not filed again");
+    assert_eq!(burner_path(&s.lease, None).await, Some(saved.clone()), "still found while it settles");
+    assert_eq!(burner_path(&s.lease, Some(&void)).await, Some(second), "…over a void mark too, spent in its own era");
+    assert_eq!(burner_path(&s.lease, Some(&lost)).await, None, "a mark that names it is not filed again");
     let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "the mark's reader confirms W's write");
     let PresenceStep::Save(mark) = presence_step(&lost, word, 0, landed) else { panic!("confirmed: saved") };
@@ -3307,8 +3307,8 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     assert_eq!(step, ListingStep::HeldByHint(PaidBy::Money), "held for the era");
 
     let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
-    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive), None, "on the SSF wallet's path its own write is left to main's rule");
-    assert_eq!(burner_path(&WalletLease::new(), None), None, "a lease that has forgotten the write rebuilds nothing");
+    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).await, None, "on the SSF wallet's path its own write is left to main's rule");
+    assert_eq!(burner_path(&WalletLease::new(), None).await, None, "a lease that has forgotten the write rebuilds nothing");
     assert_eq!(s.sent(), HashSet::from([theirs.name()]), "P(0) never wrote");
     assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin parked");
     assert_eq!(s.gifts(0), 0, "no gift counted");
@@ -3342,7 +3342,7 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     restore(&s.lease, &path, &w);
     assert!(s.lease.outgoing_pending_for(Payer::of_burner(&burner(71, 0))), "P(0)'s spend restored, parked");
     let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
-    let lost = lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).expect("P(0)'s listing, filed again");
+    let lost = lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).await.expect("P(0)'s listing, filed again");
     let saved = NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone());
     assert_eq!(lost, saved, "the mark the heartbeat would have saved");
     assert_eq!(lost.payer.as_deref(), Some(p0.as_str()), "naming P(0)");
@@ -3354,11 +3354,11 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     let other_era = NodePublishMark { era: 1, hint: hint_of(&CK, 1), ..saved.clone() };
     let other_hint = NodePublishMark { hint: hint_of(&[0x77; 32], 0), ..saved.clone() };
     for on_record in [&other_era, &other_hint] {
-        assert_eq!(lost_listing_mark(&s.lease, Some(on_record), NET, &CK, 0, false, &money, derive), Some(saved.clone()), "{on_record:?}");
+        assert_eq!(lost_listing_mark(&s.lease, Some(on_record), NET, &CK, 0, false, &money, derive).await, Some(saved.clone()), "{on_record:?}");
     }
     let second = NodePublishMark { writes: 2, ..saved.clone() };
-    assert_eq!(lost_listing_mark(&s.lease, Some(&saved.voided()), NET, &CK, 0, false, &money, derive), Some(second), "the era's count goes on over a void mark");
-    assert_eq!(lost_listing_mark(&s.lease, Some(&saved), NET, &CK, 0, false, &money, derive), None, "a mark that names it is not filed again");
+    assert_eq!(lost_listing_mark(&s.lease, Some(&saved.voided()), NET, &CK, 0, false, &money, derive).await, Some(second), "the era's count goes on over a void mark");
+    assert_eq!(lost_listing_mark(&s.lease, Some(&saved), NET, &CK, 0, false, &money, derive).await, None, "a mark that names it is not filed again");
 
     let (hint0, moved) = (hex::encode(hint), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let changed = at + ADDR_CHANGE_DEBOUNCE_SECS;
@@ -3367,7 +3367,7 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     assert_eq!(derived.as_deref(), Some(p0.as_str()));
     assert_eq!(money_listing_step(Some(&lost), 0, &moved, changed, &hint0, &id, false, &money, derived.as_deref()), ListingStep::HeldByHint(PaidBy::Burner));
 
-    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, true, &money, |_| Some(p0.clone())), None, "on the burner path its own write is left to the burner's rules");
+    assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, true, &money, |_| Some(p0.clone())).await, None, "on the burner path its own write is left to the burner's rules");
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -3443,15 +3443,15 @@ async fn a_lost_marks_write_confirmed_outside_its_era_is_filed_and_voided_once()
     s.reconcile().await;
     assert!(s.lease.holds_for(Payer::of(&w)) && !s.lease.outgoing_pending_for(Payer::of(&w)), "W's spend settling");
 
-    let burner_path = |mark: Option<&NodePublishMark>| lost_listing_mark(&s.lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone()));
-    let lost = burner_path(None).expect("W's listing, filed again");
+    let burner_path = async |mark: Option<&NodePublishMark>| lost_listing_mark(&s.lease, mark, NET, &CK, 0, true, &money, |_| Some(p0.clone())).await;
+    let lost = burner_path(None).await.expect("W's listing, filed again");
     let word = presence_standing_on(&s.lease, NET, &s.money, &lost).await;
     let PresenceStep::Void(why) = presence_step(&lost, word, 0, landed) else { panic!("confirmed outside its era: void") };
     assert!(why.contains("outside its era"), "{why}");
     let void = lost.voided();
     assert_eq!((void.payer.as_deref(), void.hint.as_str()), (Some(money.as_str()), hex::encode(hint).as_str()), "the payer and the hint stay");
     assert_eq!(hint_rule_holds(Some(&void), 0, &void.hint, true, &money, Some(&p0)), Some(PaidBy::Money), "so the hint rule holds P(0)");
-    assert_eq!(burner_path(Some(&void)), None, "not filed again over its own void mark");
+    assert_eq!(burner_path(Some(&void)).await, None, "not filed again over its own void mark");
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -4256,7 +4256,7 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     let e = main_rule.as_ref().err().expect("on the SSF wallet's path its own write is left to main's rule");
     assert_eq!(e.downcast_ref::<MemoWait>(), Some(&MemoWait::Settling("knock".to_string())), "main's global check, while W's spend is parked: {e:#}");
     for (elsewhere, what) in [(knock_hint(NET, &other, &ROOM_KEY, 0), "another host's hint"), (knock_hint(NET, &req, &ROOM_KEY, 1), "another era's hint")] {
-        let held = s.lease.held_write_under(elsewhere);
+        let held = s.lease.held_write_under(elsewhere).await;
         assert_eq!(held, None, "{what}");
         assert_eq!(lost_knock_entry(held, &Payer::of_burner(&key), true, &req, elsewhere, 0, at), None, "{what}");
     }
@@ -4282,14 +4282,14 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     s.chain.farm().await;
     s.reconcile().await;
     assert!(s.lease.holds_for(Payer::of_burner(&key2)) && !s.lease.outgoing_pending_for(Payer::of_burner(&key2)), "K(h)'s knock settling");
-    let held = s.lease.held_write_under(hint2).expect("held while it settles");
+    let held = s.lease.held_write_under(hint2).await.expect("held while it settles");
     assert!(held.spent_at.is_some());
     let entry = sent_knock_of(&other, 0, hint2, &write2, at);
     for (burner_path, what) in [(true, "K(h)'s own, on the burner path"), (false, "another payer's, on the SSF wallet's path")] {
         let done = s.arm_knock(91, burner_path, &node, &other, 0, || Ok(None), at, 4).await;
         assert_eq!(arm_refiled(&done), Some(entry.clone()), "{what}");
     }
-    assert_eq!(lost_knock_entry(WalletLease::new().held_write_under(hint2), &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
+    assert_eq!(lost_knock_entry(WalletLease::new().held_write_under(hint2).await, &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
 
     let before = s.sent();
     let (beside, unguarded) = s.knock(91, &node, &req, 0, || Ok(None), 5).await.expect("the writer alone does not read the hint");

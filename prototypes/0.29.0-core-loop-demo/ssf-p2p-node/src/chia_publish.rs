@@ -842,7 +842,43 @@ impl WalletLease {
     /// filed it ([`lost_listing_mark`], [`lost_knock_entry`]). A parked spend
     /// whose bundle was not saved is not seen, and neither is one the lease
     /// has forgotten.
-    pub(crate) fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
+    ///
+    /// It is read under the lease's gate ([`Self::lock`]), taken for the
+    /// whole read and given back before it returns. The lease keeps a spend
+    /// in one of two maps, the parking or the settling spends, and moves it
+    /// from one to the other a map at a time: a reconciliation that finds a
+    /// settling spend's block gone takes it out of the settling spends
+    /// before it parks it again ([`Self::retire`]). The lobby dish's
+    /// handlers reconcile on their own tasks beside the heartbeat, so a read
+    /// of the two maps without the gate could fall between the two steps
+    /// and find no write while the lease holds one, and the writer it is
+    /// asked for would then write beside it under the same hint (stage 4
+    /// design §8.3). Under the gate the read is one view of the lease, since
+    /// every change to the parking while the node runs is made under it:
+    /// every caller of [`push_parked_with`] but the lease's own tests parks
+    /// and hands back under it, every reconciliation, and so every
+    /// [`Self::retire`], runs under it, and the restore when the wallet is
+    /// turned on takes it. The restore at startup does not, and runs before
+    /// the heartbeat and the watcher are started. Once the gate is given
+    /// back the view can only age, and for the callers here that is enough.
+    /// Between this read and their writer taking the gate again, nothing
+    /// parks a write under a listing's or a knock's hint but the heartbeat,
+    /// which is the caller and writes one at a time, and a reconciliation
+    /// only moves or forgets the spends the view saw. So a write the view
+    /// finds is filed again and no writer is asked, and one it does not find
+    /// is not held. The gate is a `tokio` mutex, which is not reentrant: a
+    /// caller that already holds it would wait on itself here forever, so it
+    /// reads through [`Self::held_write_under_locked`] instead.
+    pub(crate) async fn held_write_under(&self, hint: Bytes32) -> Option<HeldWrite> {
+        let _gate = self.lock().await;
+        self.held_write_under_locked(hint)
+    }
+
+    /// [`Self::held_write_under`]'s read, for a caller that holds the
+    /// lease's gate ([`Self::lock`]): the read is one view of the lease only
+    /// under the gate, since it reads the parking and the settling spends
+    /// one after the other.
+    fn held_write_under_locked(&self, hint: Bytes32) -> Option<HeldWrite> {
         // A spend's number, the inputs the lease parks for it, its bundle,
         // its payer, and the height the chain spent it at once it settles.
         type Held = (u64, Vec<Bytes32>, SpendBundle, Option<Payer>, Option<u32>);
@@ -2510,8 +2546,13 @@ pub(crate) fn money_path_burner_payer(
 /// forgotten, or whose bundle was not saved, is not found: a marks file
 /// lost after the chain settled the era's write leaves nothing to rebuild
 /// from here.
+///
+/// The lease is read under its gate ([`WalletLease::held_write_under`]),
+/// so the caller must not hold it. Off a test network, and with a mark of
+/// this era on record that names a write, nothing is read, and the step
+/// returns at once without waiting on the gate.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lost_listing_mark(
+pub(crate) async fn lost_listing_mark(
     lease: &WalletLease,
     mark: Option<&NodePublishMark>,
     net: crate::chia_network::ChiaNet,
@@ -2527,7 +2568,7 @@ pub(crate) fn lost_listing_mark(
     if !net.is_test() || on_record.is_some_and(|m| !m.is_void()) {
         return None;
     }
-    let held = lease.held_write_under(hint)?;
+    let held = lease.held_write_under(hint).await?;
     if on_record.is_some() && held.spent_at.is_some_and(|h| chia_lane::era_of(h) != era) {
         return None;
     }
@@ -4367,7 +4408,9 @@ pub(crate) enum KnockDone {
 /// write the lease still holds under the knock's inbox hint ([`knock_hint`],
 /// [`WalletLease::held_write_under`]) is asked of [`lost_knock_entry`],
 /// with the payer this path writes with (K(h) on the burner path, the SSF
-/// wallet's on the money path). An entry it files is
+/// wallet's on the money path). The lease is read under its gate, so a
+/// spend a reconciliation is moving meanwhile is not missed, and the gate
+/// is given back before the writer takes it. An entry it files is
 /// [`KnockDone::Refiled`], and nothing is written under the hint, so the
 /// hint never has two payers (§8.3, the crash window). Otherwise the path's
 /// own writer writes the knock: from K(h), once, on the burner path
@@ -4402,7 +4445,11 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
             Some(root) => Payer::of_burner(&root.knock(&hint.to_bytes(), era)),
             None => Payer::of(chia_sk),
         };
-        if let Some(entry) = lost_knock_entry(lease.held_write_under(hint), &writer_payer, root.is_some(), req, hint, era, now_unix) {
+        // Read under the lease's gate and given back here, before the
+        // writer below takes the gate again (a `tokio` mutex, not
+        // reentrant).
+        let held = lease.held_write_under(hint).await;
+        if let Some(entry) = lost_knock_entry(held, &writer_payer, root.is_some(), req, hint, era, now_unix) {
             return Ok(KnockDone::Refiled(entry));
         }
     }
@@ -5014,7 +5061,8 @@ pub async fn heartbeat_loop(
                 let found = lost_listing_mark(&WALLET_LEASE, node_mark.as_ref(), net, &hub.contact_key, era, listing_root.is_some(), &money_payer, |m| match &listing_root {
                     Some(root) => Some(listing_clock.burner_payer(root, &hub.contact_key, era, &m.hint)),
                     None => money_path_burner_payer(Some(m), era, &m.hint, &money_payer, net, &chia_sk, &hub.contact_key),
-                });
+                })
+                .await;
                 if let Some(mark) = found {
                     println!(
                         "⛓️ ChiaHub presence: the wallet lease still holds the era {era} listing, written before a restart that lost its mark — filed again; one hint never has two payers, so this edition's listing stays as it is"
@@ -8366,6 +8414,50 @@ mod tests {
         assert!(named.is_settling(&settled.coin_id()) && named.holds_for(money()), "the money address's, once a restore names it");
         assert!(!named.holds_for(beacon()) && !named.holds_for(burner()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §8.3, the crash window's lookup
+    /// ([`WalletLease::held_write_under`]): the write the lease holds under
+    /// a hint is read under the lease's gate, as its holder leaves the
+    /// lease. A memo write is parked, then settling. While the gate is held
+    /// the read does not return, and the holder reconciles the lease against
+    /// a chain that lost the write's block, so the spend goes back into the
+    /// parking ([`WalletLease::retire`], which takes it out of the settling
+    /// spends before it parks it again). Once the gate is given back the read
+    /// returns the write, parked again. A read that did not wait on the gate
+    /// could fall between those two steps and find no write at all.
+    #[tokio::test]
+    async fn the_write_held_under_a_hint_is_read_under_the_leases_gate() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let sk = SecretKey::from_seed(&[0x5c; 32]);
+        let ours = Coin::new(Bytes32::new([0x5d; 32]), our_puzzle_hash(&sk), 1000);
+        let (id, hint) = (ours.coin_id(), Bytes32::new([0x5e; 32]));
+        let bundle = build_publish_bundle(T11, &sk, ours, hint, Bytes::new(vec![1, 2, 3])).unwrap();
+        let listing = |spent: Option<u32>, judged_at: u32| {
+            Scripted::new(vec![CoinListing {
+                records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+                truncated: false,
+                next_cursor: None,
+                judged_at: Some(judged_at),
+            }])
+        };
+        let lease = WalletLease::new();
+        let t0 = Instant::now();
+        lease.park_with_bundle_at([(id, 900)], Some((&bundle, money())), t0).unwrap();
+        let t1 = t0 + RECONCILE_GRACE;
+        lease.reconcile_at(T11, &listing(Some(1000), 1001), t1).await;
+        assert!(lease.is_settling(&id));
+        let settling = lease.held_write_under(hint).await.expect("held while it settles");
+        assert_eq!((settling.coins, settling.payer, settling.spent_at), (WriteCoins::one(id), Some(money()), Some(1000)));
+
+        let gate = lease.lock().await;
+        let mut read = std::pin::pin!(lease.held_write_under(hint));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut read).await.is_err(), "the read waits while the gate is held");
+        lease.reconcile_at(T11, &listing(None, 1000), t1).await;
+        assert!(lease.is_parked(&id), "the write's block gone: parked again");
+        drop(gate);
+        let parked = tokio::time::timeout(Duration::from_secs(5), read).await.expect("the gate given back, the read returns");
+        assert_eq!(parked, Some(HeldWrite { spent_at: None, ..settling }), "the write as the gate's holder left it: parked again");
     }
 
     /// Stage 4 design §4.4: a push parks its spend under the payer it names,
