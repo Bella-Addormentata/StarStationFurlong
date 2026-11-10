@@ -2280,9 +2280,14 @@ interface FairOnlyState {
   lacking: boolean;
   returns: number;
   /** 🔒 How many times, since the doc was bound, a transaction changed the key
-   *  of the session the game's base opens (its map came, went, or was written
-   *  over): each time it goes is a disappearance of its own for the page that
-   *  waits to open it again, though it came and went between two of its looks
+   *  of a session of the game (a map came, went, or was written over): each
+   *  time the map of the session its base opens goes is a disappearance of its
+   *  own for the page that waits to open it again, though it came and went
+   *  between two of its looks. The key of ANY session of the game counts, the
+   *  base read or not: while a check is waited for the game names no base
+   *  (fairOnlySessionOf is null), and which session a change was of cannot be
+   *  told then. So the wait is for the game's sessions at rest, and a key of
+   *  another session that comes or goes starts it again
    *  (computedFairOnlyRecoveries sesMoves; computedTable openStep). */
   sesMoves: number;
   /** The base the fold was last pointed at (null: none; undefined: never). */
@@ -4901,10 +4906,13 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
       whole.add(c);
       dirty.add(c);
       // (🔒 A game's session gone is the put-back duty's to open again, and each
-      // time the map of the session its base opens comes or goes is told: sesMoves.)
+      // time the map of one of its sessions comes or goes is told: sesMoves. Of
+      // any of them, not only of the one its base opens now: while a check is
+      // waited for the game names no base, and a map that came and went then
+      // is a disappearance all the same.)
       if (c.fo) {
         foCheck.add(c);
-        if (at.sid === fairOnlySessionOf(c)) c.fo.sesMoves += 1;
+        c.fo.sesMoves += 1;
       }
     }
   }
@@ -5462,9 +5470,9 @@ export interface FairOnlyRecovery {
    *  (reopenFairOnlySession makes one). */
   sessionMissing: boolean;
   /** The session the game's base opens (null: it has no base, or has ended),
-   *  and how many times a transaction changed its key since the doc was bound
-   *  (FairOnlyState sesMoves): the wait for its map is one disappearance's, and
-   *  one session's. */
+   *  and how many times a transaction changed the key of a session of the game
+   *  since the doc was bound (FairOnlyState sesMoves): the wait for its map is
+   *  one disappearance's, and one session's. */
   sid: string | null;
   sesMoves: number;
   /** The keys that take turns at it: the signers of the staked felts this page

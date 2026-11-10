@@ -234,7 +234,8 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     expect(putBack(a)).toBe(0);
     del(a, root.key);
     expect(res(a)).toMatchObject({ live: true, base: { key: root.key } });
-    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, sessionMissing: false, sid: SID, sesMoves: 0, pubs: [], returns: 0 }]);
+    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, sessionMissing: false, sid: SID, sesMoves: 1, pubs: [], returns: 0 }]);
+    // (the one move of a session's key: the map the game was opened with)
     expect(putBack(a)).toBe(1);
     expect(top(a).get(root.key)).toEqual(root.value);
     expect(lacks(a)).toEqual([]);
@@ -1272,6 +1273,8 @@ describe('the put-back duty', () => {
     loop(stoodAt + KEEP_BACKOFF_MS - STEP);
     expect(wrote).toHaveLength(3);
     expect(a.table.computedContested(TABLE, clockOf(a, T - STEP))).toBe(true);
+    // (and no more at the moment it ends, asked before the page's frame of that moment forgets it)
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
     loop(stoodAt + KEEP_BACKOFF_MS);
     expect(wrote).toEqual([t1, t1 + JUNK_GAP_MS, t1 + 2 * JUNK_GAP_MS, stoodAt + KEEP_BACKOFF_MS]);
     expect(a.table.computedContested(TABLE, clockOf(a, T - STEP))).toBe(false);
@@ -1305,6 +1308,80 @@ describe('the put-back duty', () => {
     expect(wrote).toHaveLength(3);
     loop(stoodAt + KEEP_BACKOFF_MS);
     expect(wrote[3]).toBe(stoodAt + KEEP_BACKOFF_MS);
+  });
+
+  it('what comes back in the last minute of a stand-down begins none by itself: the page puts back at its end, and stands down again at once when that put-back does not last either', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote: number[] = [];
+    /** The page's frames, to `to`: a peer deletes the base whenever it is there, and writes it itself before the
+     *  frames of `puts`. */
+    const loop = (to: number, puts: number[] = []): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (top(a).has(root.key)) del(a, root.key);
+        if (puts.includes(T)) set(a, root.key, root.value);
+        const had = top(a).has(root.key);
+        frame(T, a);
+        if (!had && top(a).has(root.key)) wrote.push(T);
+      }
+    };
+    const contested = (at: number): boolean => a.table.computedContested(TABLE, clockOf(a, at));
+    const t1 = T;
+    const stoodAt = t1 + 2 * JUNK_GAP_MS + STEP;
+    loop(stoodAt);
+    expect(wrote).toHaveLength(3);
+    // the peer writes the base and deletes it, three times in the last seconds of the stand-down
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    loop(end - STEP, [end - 3_000, end - 2_000, end - 1_000]);
+    expect(wrote).toHaveLength(3);
+    expect(contested(end - STEP)).toBe(true);
+    // the page puts the base back at the end of its stand-down all the same
+    loop(end);
+    expect(wrote.slice(3)).toEqual([end]);
+    expect(contested(end)).toBe(false);
+    // that one deleted too, it stands down at its next look: the three of the last minute count with it, and it makes
+    // no other
+    loop(end + 10_000);
+    expect(wrote.slice(3)).toEqual([end]);
+    expect(contested(end + STEP)).toBe(true);
+    // for KEEP_BACKOFF_MS from that look
+    loop(end + STEP + KEEP_BACKOFF_MS - STEP);
+    expect(wrote.slice(3)).toEqual([end]);
+    loop(end + STEP + KEEP_BACKOFF_MS);
+    expect(wrote.slice(3)).toEqual([end, end + STEP + KEEP_BACKOFF_MS]);
+  });
+
+  it('a put-back read at the look a stand-down ends is read outside it: with two of its last minute it begins the next, whoever made it', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote: number[] = [];
+    const loop = (to: number, puts: number[] = []): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (top(a).has(root.key)) del(a, root.key);
+        if (puts.includes(T)) set(a, root.key, root.value);
+        const had = top(a).has(root.key);
+        frame(T, a);
+        if (!had && top(a).has(root.key)) wrote.push(T);
+      }
+    };
+    const contested = (at: number): boolean => a.table.computedContested(TABLE, clockOf(a, at));
+    const t1 = T;
+    const stoodAt = t1 + 2 * JUNK_GAP_MS + STEP;
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    // the base comes back twice in the last seconds of the stand-down, and once more at the look it ends: the room's
+    // put-back after it is that one, and it does not last
+    loop(end, [end - 2_000, end - 1_000, end]);
+    expect(wrote).toHaveLength(3);
+    expect(contested(end)).toBe(false);
+    loop(end + 10_000);
+    expect(wrote).toHaveLength(3);
+    expect(contested(end + STEP)).toBe(true);
   });
 
   it('stands down all the same when the peer deletes the session\'s map as well: the table is not whole then, and the put-backs are counted', async () => {
@@ -1360,6 +1437,52 @@ describe('the put-back duty', () => {
     run(pages, T, T + 15_000, { each: peer });
     expect(wrote).toHaveLength(2 * CONTESTED_COUNT);
     expect(new Set(wrote.map((w) => w.by)).size).toBe(1);
+  });
+
+  it('pages whose stand-downs end a little apart stand down together again: the put-back a page reads in the last moments of its own counts on it, and it makes none', async () => {
+    const [a, b] = await pagesWhere((x, y) => before('restore', 0, x, y));
+    bet(a, b);
+    let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote = putBacksOf([a, b], root.key);
+    /** One step: a peer deletes the base whenever the doc holds it, and the pages' frames, each handed the other's
+     *  writes before and after (run); B draws no frame at the steps of `idle`. Then the next, to `to`. */
+    const steps = (to: number, idle: number[] = []): void => {
+      for (; T <= to; T += STEP) {
+        NOW = T;
+        if (top(a).has(root.key)) {
+          clockOf(a, T);
+          del(a, root.key);
+        }
+        sync(T, a, b);
+        frame(T, a);
+        if (!idle.includes(T)) frame(T, b);
+        sync(T, a, b);
+      }
+    };
+    const contested = (p: Page, at: number): boolean => p.table.computedContested(TABLE, clockOf(p, at));
+    // the first in turn makes three put-backs that do not last and stands down; B, which drew no frame for two looks
+    // just then, stands down two looks later
+    const t1 = T;
+    const stoodA = t1 + 2 * JUNK_GAP_MS + STEP;
+    steps(stoodA + 2 * STEP, [stoodA, stoodA + STEP]);
+    expect(wrote.map((w) => [w.by, w.at - t1])).toEqual([[a.pid, 0], [a.pid, JUNK_GAP_MS], [a.pid, 2 * JUNK_GAP_MS]]);
+    expect(contested(a, stoodA)).toBe(true);
+    expect(contested(b, stoodA + STEP)).toBe(false);
+    expect(contested(b, stoodA + 2 * STEP)).toBe(true);
+    // A's stand-down ends first, and it puts the base back: B reads that one before its own is over
+    const endA = stoodA + KEEP_BACKOFF_MS;
+    steps(endA + STEP);
+    expect(wrote.slice(3).map((w) => [w.by, w.at - endA])).toEqual([[a.pid, 0]]);
+    expect(contested(b, endA + STEP)).toBe(true);
+    // two more of A's that do not last, and both stand down at the same look: B made none
+    steps(endA + 15_000);
+    expect(wrote.slice(3).map((w) => [w.by, w.at - endA])).toEqual([[a.pid, 0], [a.pid, JUNK_GAP_MS], [a.pid, 2 * JUNK_GAP_MS]]);
+    const again = endA + 2 * JUNK_GAP_MS + STEP;
+    for (const p of [a, b]) {
+      expect(contested(p, again - STEP), p.pid).toBe(false);
+      expect(contested(p, again), p.pid).toBe(true);
+    }
   });
 
   it('put-backs that last count for nothing: a record deleted once a minute is put back every time', async () => {
@@ -1576,6 +1699,30 @@ describe('the put-back duty', () => {
     expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
   });
 
+  it('nor what came back once the page had the game in mind no more: found whole with no put-back of late, a game is forgotten', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { CONTESTED_CALM_MS } = a.table;
+    const wrote = putBacksOf([a], root.key);
+    const gone = (): void => del(b, root.key);
+    const back = (): void => set(b, root.key, root.value);
+    // the base deleted once: the page puts it back, it lasts, and CONTESTED_CALM_MS after the page read it back it has
+    // the game in mind no more
+    const t0 = T;
+    send(T, a, b);
+    handed(T, b, a, gone);
+    T = frames(a, T, t0 + STEP + CONTESTED_CALM_MS);
+    expect(wrote.map((w) => w.at)).toEqual([t0]);
+    // gone and back three times between two looks of the page, and gone: it puts the base back at once
+    const t1 = T;
+    send(t1, a, b);
+    handed(t1, b, a, gone, back, gone, back, gone, back, gone);
+    T = frames(a, T, t1 + 5 * STEP);
+    expect(wrote.map((w) => w.at)).toEqual([t0, t1]);
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
+  });
+
   it('put-backs that came and went between two looks are each counted: with CONTESTED_COUNT of them the page stands down at its next look', async () => {
     const [a, b] = await gameRoom(['A', 'B']);
     expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
@@ -1587,14 +1734,17 @@ describe('the put-back duty', () => {
     handed(T, b, a, gone);
     T = frames(a, T, t0);
     expect(wrote.map((w) => w.at)).toEqual([t0]);
-    // its own put-back deleted, and two more made by a peer and deleted, before it looks again
-    send(t0, a, b);
-    handed(t0, b, a, gone, back, gone, back, gone);
+    // its own put-back deleted two seconds on, and two more made by a peer and deleted, all between two of its looks
+    T = frames(a, T, t0 + 2_000 - STEP);
+    const t1 = T;
+    send(t1, a, b);
+    handed(t1, b, a, gone, back, gone, back, gone);
     expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(a.table.CONTESTED_COUNT);
-    expect(a.table.computedContested(TABLE, clockOf(a, t0))).toBe(false);
-    T = frames(a, T, t0 + 5_000);
+    expect(a.table.computedContested(TABLE, clockOf(a, t1 - STEP))).toBe(false);
+    T = frames(a, T, t1 + 5_000);
+    // (the look that stands it down writes nothing, though its turn has come and its last put-back is JUNK_GAP_MS old)
     expect(wrote).toHaveLength(1);
-    expect(a.table.computedContested(TABLE, clockOf(a, t0 + STEP))).toBe(true);
+    expect(a.table.computedContested(TABLE, clockOf(a, t1))).toBe(true);
     expect(top(a).has(root.key)).toBe(false);
   });
 
@@ -1761,7 +1911,7 @@ describe('the put-back duty', () => {
     const [a] = await gameRoom(['A']);
     expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
     let T = run([a], T0 + STEP, T0 + 2 * STEP);
-    const { KEEP_BACKOFF_MS } = a.table;
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
     const wrote = putBacksOf([a], root.key);
     const peer = (): void => {
       if (top(a).has(root.key)) del(a, root.key);
@@ -1783,9 +1933,10 @@ describe('the put-back duty', () => {
     T = frames(a, T, awake + KEEP_BACKOFF_MS - STEP, peer);
     expect(wrote).toHaveLength(3);
     expect(contested(T - STEP)).toBe(true);
-    // and then puts the base back: its three put-backs of before, under a minute old on its clock, are not counted again
-    frames(a, T, awake + KEEP_BACKOFF_MS, peer);
-    expect(wrote.slice(3).map((w) => w.at - awake)).toEqual([KEEP_BACKOFF_MS]);
+    // and then puts the base back: its three put-backs of before, under a minute old on its clock, are not counted
+    // again, with the one it makes then either (deleted, it makes another)
+    frames(a, T, awake + KEEP_BACKOFF_MS + JUNK_GAP_MS, peer);
+    expect(wrote.slice(3).map((w) => w.at - awake)).toEqual([KEEP_BACKOFF_MS, KEEP_BACKOFF_MS + JUNK_GAP_MS]);
   });
 
   it('a stand-down that ended is forgotten once the game is found whole: a clock gone back to before its end does not bring it back', async () => {
@@ -1812,6 +1963,92 @@ describe('the put-back duty', () => {
     T = frames(a, T, awake + 2 * STEP);
     expect(wrote.slice(3).map((w) => w.at - awake)).toEqual([0]);
     expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
+  });
+
+  it('and when put-backs of late keep the game in mind past the stand-down\'s end: found whole, it is forgotten at the look of its end all the same', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote = putBacksOf([a], root.key);
+    const peer = (): void => {
+      if (top(a).has(root.key)) del(a, root.key);
+    };
+    const t0 = T;
+    const end = t0 + 2 * JUNK_GAP_MS + STEP + KEEP_BACKOFF_MS;
+    T = frames(a, T, t0 + 4_000, peer);
+    expect(wrote).toHaveLength(3);
+    // a peer puts the base back, and it lasts; five seconds before the stand-down ends it is deleted and put back
+    // again, between two looks of the page
+    send(T, a, b);
+    handed(T, b, a, () => set(b, root.key, root.value));
+    T = frames(a, T, end - 5_000 - STEP);
+    send(T, a, b);
+    handed(T, b, a, () => del(b, root.key), () => set(b, root.key, root.value));
+    // (the page's last look before its clock goes back is the one at the stand-down's end)
+    T = frames(a, T, end);
+    expect(lacks(a)).toEqual([]);
+    expect(a.table.computedContested(TABLE, clockOf(a, end))).toBe(false);
+    // the page's clock goes back five minutes, and the base is deleted: awake, the page puts it back at once
+    a.skew = -300_000;
+    del(a, root.key);
+    const awake = T + a.croupier.TABLE_LEASE_LAPSE_MS;
+    T = frames(a, T, awake + 2 * STEP);
+    expect(wrote.slice(3).map((w) => w.at - awake)).toEqual([0]);
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
+  });
+
+  it('a stand-down that ended is forgotten at the page\'s first look past its end, the game lacking still: a clock gone back to before its end does not bring it back', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote = putBacksOf([a], root.key);
+    const peer = (): void => {
+      if (top(a).has(root.key)) del(a, root.key);
+    };
+    const t0 = T;
+    const end = t0 + 2 * JUNK_GAP_MS + STEP + KEEP_BACKOFF_MS;
+    // the stand-down runs out with the base gone all the while; the page puts it back at its end, and that one is
+    // deleted too
+    T = frames(a, T, end + STEP, peer);
+    expect(wrote.map((w) => w.at - t0)).toEqual([0, JUNK_GAP_MS, 2 * JUNK_GAP_MS, end - t0]);
+    expect(a.table.computedContested(TABLE, clockOf(a, end + STEP))).toBe(false);
+    // the page's clock goes back five minutes: awake, it puts the base back at once
+    a.skew = -300_000;
+    const awake = T + a.croupier.TABLE_LEASE_LAPSE_MS;
+    T = frames(a, T, awake + 2 * STEP, peer);
+    expect(wrote.slice(4).map((w) => w.at - awake)).toEqual([0]);
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(false);
+  });
+
+  it('the turns after a stand-down are from its end, or from when the page\'s wait began if that is later: a page that slept through the end waits its turn from when it is awake', async () => {
+    // (a page with no felt: its turn is OUTSIDER_WAIT_MS on)
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OUTSIDER_WAIT_MS, KEEP_BACKOFF_MS } = a.table;
+    const { TABLE_LEASE_LAPSE_MS } = a.croupier;
+    const wrote = putBacksOf([a], root.key);
+    const peer = (): void => {
+      if (top(a).has(root.key)) del(a, root.key);
+    };
+    // three put-backs that do not last, each a turn after the one before went: the page stands down
+    const t0 = T;
+    T = frames(a, T, t0 + 3 * OUTSIDER_WAIT_MS + 5 * STEP, peer);
+    expect(wrote.map((w) => w.at - t0)).toEqual([OUTSIDER_WAIT_MS, 2 * OUTSIDER_WAIT_MS + STEP, 3 * OUTSIDER_WAIT_MS + 2 * STEP]);
+    const stoodAt = wrote[2].at + STEP;
+    expect(a.table.computedContested(TABLE, clockOf(a, stoodAt - STEP))).toBe(false);
+    expect(a.table.computedContested(TABLE, clockOf(a, stoodAt))).toBe(true);
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    // it draws no frame from three seconds before the end of its stand-down to four after: it wakes, and waits a
+    // lapse out
+    frames(a, T, end - 3_000, peer);
+    const woke = end + 4_000;
+    const awake = woke + TABLE_LEASE_LAPSE_MS;
+    T = frames(a, woke, awake + OUTSIDER_WAIT_MS - STEP, peer);
+    expect(wrote).toHaveLength(3);
+    frames(a, T, awake + OUTSIDER_WAIT_MS, peer);
+    expect(wrote.slice(3).map((w) => w.at - awake)).toEqual([OUTSIDER_WAIT_MS]);
   });
 
   it('a doc bound again starts with no stand-down of the binding before', async () => {
@@ -1913,25 +2150,27 @@ describe('the put-back duty', () => {
     expect(top(a).has(SES)).toBe(false);
   });
 
-  it('a key of another session of the game that comes or goes starts no wait again: only the map of the session the base opens does', async () => {
+  it('a key of another session of the game that comes or goes starts the wait again, as the map of the session the base opens does: the moves are counted of the game\'s sessions, whichever its base opens when they are made', async () => {
+    // (a page with no felt: its turn is OUTSIDER_WAIT_MS on)
     const [a] = await gameRoom(['A']);
     let T = run([a], T0 + STEP, T0 + 2 * STEP);
     const wait = a.table.OPEN_WAIT_MS + a.table.OUTSIDER_WAIT_MS;
     clockOf(a, T);
     del(a, SES);
     const t0 = T;
-    // a peer writes a map under another session's key of the game every second, and deletes it
+    T = frames(a, T, t0 + 3_000 - STEP);
+    // a peer writes a map under another session's key of the game, and deletes it two seconds on
     const other = `ses:${TABLE}:${G.inc}:${'f'.repeat(SID.length)}`;
     expect(other).not.toBe(SES);
-    let n = 0;
-    const peer = (): void => {
-      if (++n % 5 !== 0) return;
-      if (top(a).has(other)) del(a, other);
-      else set(a, other, new Y.Map());
-    };
-    T = frames(a, T, t0 + wait - STEP, peer);
+    set(a, other, new Y.Map());
+    T = frames(a, T, T + 2_000 - STEP);
+    del(a, other);
+    const t1 = T;
+    // (four moves: the map the game was opened with, its going, the other one's coming and going)
+    expect(lacks(a)).toMatchObject([{ missing: 0, sessionMissing: true, sid: SID, sesMoves: 4 }]);
+    T = frames(a, T, t1 + wait - STEP);
     expect(top(a).has(SES)).toBe(false);
-    frames(a, T, t0 + wait, peer);
+    frames(a, T, t1 + wait);
     expect(top(a).get(SES)).toBeInstanceOf(Y.Map);
   });
 
@@ -1998,13 +2237,46 @@ describe('the put-back duty', () => {
     expect(res(late)).toMatchObject({ pending: true, base: null });
     T = frames(late, T, T);
     expect(lacks(late)).toEqual([]);
-    // checks run again: the session is listed as missing again, and no key of it moved
+    // checks run again: the session is listed as missing again, and no key of a session moved meanwhile (two had: the
+    // map the page bound the doc with, and its going)
     late.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0 });
     clockOf(late, T);
     del(late, delegationKey(third.pub));
     const t1 = T;
     expect(res(late)).toMatchObject({ pending: false, base: { key: root.key } });
-    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, sesMoves: 1 }]);
+    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, sesMoves: 2 }]);
+    T = frames(late, T, t1 + wait - STEP);
+    expect(top(late).has(SES)).toBe(false);
+    frames(late, T, t1 + wait);
+    expect(top(late).get(SES)).toBeInstanceOf(Y.Map);
+  });
+
+  it('and when the map came and went while the game named no base for want of a check, between two looks of the page: the moves of a session\'s key are counted whether the game\'s base is read or not', async () => {
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    // (a page that keeps one verdict at a time, and has no felt: its turn is OUTSIDER_WAIT_MS on)
+    const late = await oneVerdictFrom(a, T);
+    T = run([late], T, T + STEP);
+    const wait = late.table.OPEN_WAIT_MS + late.table.OUTSIDER_WAIT_MS;
+    clockOf(late, T);
+    del(late, SES);
+    const t0 = T;
+    T = frames(late, T, t0 + 3_000 - STEP);
+    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, sid: SID, sesMoves: 2 }]);
+    // between two looks of the page: no check can run and the room's delegations change (the game waits, and names no
+    // base), another page opens the session, a peer deletes it, and checks run again
+    late.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0, budgetMs: 0 });
+    set(late, delegationKey(third.pub), delegation(owner, third.pub, PAGE_ROOM));
+    expect(res(late)).toMatchObject({ pending: true, base: null });
+    set(late, SES, new Y.Map());
+    del(late, SES);
+    late.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0 });
+    clockOf(late, T);
+    del(late, delegationKey(third.pub));
+    const t1 = T;
+    expect(res(late)).toMatchObject({ pending: false, base: { key: root.key } });
+    // (the same session to open, its map gone as before: only the count of the moves tells the page it came and went)
+    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, sid: SID, sesMoves: 4 }]);
     T = frames(late, T, t1 + wait - STEP);
     expect(top(late).has(SES)).toBe(false);
     frames(late, T, t1 + wait);

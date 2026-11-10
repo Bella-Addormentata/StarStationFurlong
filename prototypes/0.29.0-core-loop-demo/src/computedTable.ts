@@ -4528,19 +4528,23 @@ interface Keeping {
    *  missing). */
   at: number | null;
   missingAt: number | null;
-  /** The session that wait is for, and casinoDoc's count of the changes of its
-   *  key as this page last read it (FairOnlyRecovery sid, sesMoves): a map that
-   *  came and went since, or another session to open, is a wait of its own. */
+  /** The session that wait is for, and casinoDoc's count of the changes of the
+   *  keys of the game's sessions as this page last read it (FairOnlyRecovery
+   *  sid, sesMoves): a map that came and went since, or another session to
+   *  open, is a wait of its own. */
   sid: string | null;
   sesMoves: number;
   /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
    *  and when it read each put-back since (its own and other pages'), within
-   *  CONTESTED_CALM_MS. */
+   *  CONTESTED_CALM_MS. Whether it read one while it did not stand down, since
+   *  it last began to (`fresh`): no stand-down begins without. */
   seen: number;
   back: number[];
+  fresh: boolean;
   /** This page's last put-back of the game (JUNK_GAP_MS; null: none). */
   wroteAt: number | null;
-  /** It puts none back until then (KEEP_BACKOFF_MS; 0: never stood down). */
+  /** It puts none back until then (KEEP_BACKOFF_MS; 0: it does not stand down.
+   *  One that is over is forgotten at this page's first look past its end). */
   until: number;
 }
 const keeping = new Map<string, Keeping>();
@@ -4565,7 +4569,14 @@ let keptAt: number | null = null;
  *   held them at. After CONTESTED_COUNT put-backs within CONTESTED_CALM_MS
  *   that did not last, whichever pages made them (casinoDoc counts every
  *   put-back the page's doc sees, computedFairOnlyReturns), none for
- *   KEEP_BACKOFF_MS: the room stands down together.
+ *   KEEP_BACKOFF_MS: the room stands down together. The put-backs a page reads
+ *   while it stands down count toward the next stand-down, so that pages whose
+ *   stand-downs end a little apart stand down together again, but one of the
+ *   CONTESTED_COUNT is read while it does not: after a stand-down the records
+ *   are put back once at the least before the next begins, by the page whose
+ *   turn it is if by no one else, whatever a peer wrote and deleted meanwhile.
+ *   A stand-down that is over is forgotten at the page's first look past its
+ *   end.
  * - **The live session's map**, gone with the game live: an empty one
  *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
  *   while, as at a page-signed table (recoverDuty: two pages that made one at
@@ -4596,7 +4607,7 @@ function fairKeepDuty(pub: string, now: number): void {
     listed.add(key);
     let w = keeping.get(key);
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
-    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], wroteAt: null, until: 0 });
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
     if (!ready) {
       w.at = null;
@@ -4615,39 +4626,55 @@ function fairKeepDuty(pub: string, now: number): void {
     w.at = null;
     w.missingAt = null;
     w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
-    if (w.back.length === 0 && now >= w.until) keeping.delete(key);
+    // (A stand-down that is over is forgotten here as at a game that lacks
+    // something, keepStep: the put-backs of late that keep the game in mind
+    // keep no stand-down for a clock gone back to bring back.)
+    if (now >= w.until) w.until = 0;
+    if (w.back.length === 0 && w.until === 0) keeping.delete(key);
   }
 }
 
 /** Count the put-backs of the game since this page last read them (`returns`:
  *  casinoDoc computedFairOnlyReturns), each as of now: a look is TICK_MS after
  *  the one before at the most on an awake page. Whether there was one. No more
- *  than CONTESTED_COUNT of a look are kept: more say nothing more. */
+ *  than CONTESTED_COUNT of a look are kept: more say nothing more. The ones
+ *  read while this page stands down are counted like the others (a page whose
+ *  stand-down ends a little after another's reads that one's put-backs before
+ *  its own is over, and stands down with it again), but begin no stand-down by
+ *  themselves, `fresh`: what a peer writes and deletes in the last minute of a
+ *  stand-down begins the next no sooner than a put-back made after it. */
 function noteReturns(w: Keeping, returns: number, now: number): boolean {
   const came = returns - w.seen;
   w.seen = returns;
   for (let i = 0; i < Math.min(came, CONTESTED_COUNT); i++) w.back.push(now);
+  if (came > 0 && now >= w.until) w.fresh = true;
   return came > 0;
 }
 
 function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
+  // (A clock gone back leaves no stand-down longer than one. And one that is
+  // over is forgotten at this page's first look past its end, whatever the
+  // game lacks then: a clock gone back after that brings none back.)
+  if (w.until > now + KEEP_BACKOFF_MS) w.until = now + KEEP_BACKOFF_MS;
+  const over = w.until !== 0 && now >= w.until ? w.until : null;
+  if (over !== null) w.until = 0;
   if (r.missing === 0) {
     w.at = null;
     return;
   }
   if (w.at === null || w.at > now) w.at = now;
-  // (A clock gone back leaves no stand-down longer than one.)
-  if (w.until > now + KEEP_BACKOFF_MS) w.until = now + KEEP_BACKOFF_MS;
   if (now < w.until) return;
+  // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
+  if (over !== null && w.at < over) w.at = over;
   w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
-  if (w.back.length >= CONTESTED_COUNT) {
+  if (w.fresh && w.back.length >= CONTESTED_COUNT) {
     w.until = now + KEEP_BACKOFF_MS;
     w.back = [];
+    w.fresh = false;
     notifyCasinoView(r.t);
     return;
   }
-  // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
-  if (now < Math.max(w.at, w.until) + turnOf('restore', r, r.u, pub)) return;
+  if (now < w.at + turnOf('restore', r, r.u, pub)) return;
   if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
   if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
 }
@@ -4657,7 +4684,9 @@ function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): vo
   // opened that a peer deleted before this page's next look was there and went,
   // and a base that opens another session has another map to wait for. A wait
   // that ran on through either would end out of its turn, beside the page whose
-  // turn it is, and of two maps made at once the doc keeps one.)
+  // turn it is, and of two maps made at once the doc keeps one. The moves are
+  // of the keys of all the game's sessions, casinoDoc sesMoves: the wait is
+  // for the game's sessions at rest.)
   if (w.sid !== r.sid || w.sesMoves !== r.sesMoves) {
     w.sid = r.sid;
     w.sesMoves = r.sesMoves;
