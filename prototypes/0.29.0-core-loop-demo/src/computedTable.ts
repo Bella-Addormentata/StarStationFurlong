@@ -4576,7 +4576,7 @@ let keptAt: number | null = null;
  *   are put back once at the least before the next begins, by the page whose
  *   turn it is if by no one else, whatever a peer wrote and deleted meanwhile.
  *   A stand-down that is over is forgotten at the page's first look past its
- *   end.
+ *   end, whatever the page does at that look (standOver).
  * - **The live session's map**, gone with the game live: an empty one
  *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
  *   while, as at a page-signed table (recoverDuty: two pages that made one at
@@ -4609,26 +4609,26 @@ function fairKeepDuty(pub: string, now: number): void {
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
     if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
+    const over = standOver(w, now);
     if (!ready) {
       w.at = null;
       w.missingAt = null;
       continue;
     }
     if (came) w.at = null;
-    keepStep(w, r, pub, now);
+    keepStep(w, r, pub, now, over);
     openStep(w, r, pub, now);
   }
   // (A game with nothing missing is not listed: its waits are over, and what
   // is left of it is how often its records came back of late.)
   for (const [key, w] of [...keeping]) {
     if (listed.has(key)) continue;
+    // (The put-backs of late that keep the game in mind keep no stand-down
+    // that is over for a clock gone back to bring back: standOver.)
     noteReturns(w, computedFairOnlyReturns(w.t, w.inc), now);
+    standOver(w, now);
     w.at = null;
     w.missingAt = null;
-    // (A stand-down that is over is forgotten here as at a game that lacks
-    // something, keepStep: the put-backs of late that keep the game in mind
-    // keep no stand-down for a clock gone back to bring back.)
-    if (now >= w.until) w.until = 0;
     if (w.back.length === 0 && w.until === 0) keeping.delete(key);
   }
 }
@@ -4657,13 +4657,23 @@ function noteReturns(w: Keeping, returns: number, now: number): boolean {
   return came > 0;
 }
 
-function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
-  // (A clock gone back leaves no stand-down longer than one. And one that is
-  // over is forgotten at this page's first look past its end, whatever the
-  // game lacks then: a clock gone back after that brings none back.)
+/** Forget a stand-down that is over: when it ended, or null (none is over at
+ *  this look). At this page's first look past its end, whatever the page does
+ *  at that look and whatever the game lacks then, as the put-backs counted are
+ *  let go of (noteReturns): a page that is not ready reads its clock here too
+ *  (it slept through the end, say, and waits out the lapse of its waking), and
+ *  an end left in mind there would stand the page down again when its clock
+ *  went back to before it, with nothing put back that did not last. */
+function standOver(w: Keeping, now: number): number | null {
+  if (w.until === 0 || now < w.until) return null;
+  const over = w.until;
+  w.until = 0;
+  return over;
+}
+
+function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, over: number | null): void {
+  // (A clock gone back leaves no stand-down longer than one.)
   if (w.until > now + KEEP_BACKOFF_MS) w.until = now + KEEP_BACKOFF_MS;
-  const over = w.until !== 0 && now >= w.until ? w.until : null;
-  if (over !== null) w.until = 0;
   if (r.missing === 0) {
     w.at = null;
     return;
