@@ -247,14 +247,45 @@ describe('faucet dish: a status that left the wallet unread', () => {
     expect(asFaucetStatus({ ...wire(), walletSkipped: 'true' })?.walletSkipped).toBe(false);
   });
 
-  it('keeps figures only for such a status, and only from a status on file', () => {
-    const onFile = status({ walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true });
+  it('keeps figures only for such a status, and only when some are on file', () => {
+    const kept = { snapshot: 2, walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true };
     const skipped = status({ walletSkipped: true, coins: 4 });
-    expect(keepWalletFigures(skipped, onFile)).toEqual({ ...skipped, walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true });
+    expect(keepWalletFigures(skipped, kept)).toEqual({ ...skipped, walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true });
     expect(keepWalletFigures(skipped, null)).toBe(skipped);
     expect(keepWalletFigures(skipped, undefined)).toBe(skipped);
     const read = status({ walletMojos: null });
-    expect(keepWalletFigures(read, onFile)).toBe(read);
+    expect(keepWalletFigures(read, kept)).toBe(read);
+  });
+
+  // Replies ride separate streams, so the Bank's read (an older snapshot) can
+  // land after a dish poll captured later. As a look at the jar it is older
+  // and is not filed; as a look at the wallet it is the newest there is.
+  it('takes the wallet figures of a read answered after a newer status that left the wallet unread', () => {
+    const room = 'wallet-late-read';
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 3, coins: 7, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 2, coins: 1, walletMojos: 5000n, walletSpendableMojos: 5000n }) });
+    const now = latestFaucetStatus(room);
+    expect([now?.snapshot, now?.coins, now?.walletSkipped]).toEqual([3, 7, true]);
+    expect([now?.walletMojos, now?.walletSpendableMojos]).toEqual([5000n, 5000n]);
+    // An even older read, answered later still, does not put its figures back.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 1, walletMojos: 1n }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(5000n);
+    // Nor does it touch a newer status that read the wallet itself.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 5, walletMojos: 6000n }) });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 4, walletMojos: 5500n }) });
+    expect([latestFaucetStatus(room)?.snapshot, latestFaucetStatus(room)?.walletMojos]).toEqual([5, 6000n]);
+    // A later poll that leaves the wallet unread keeps the newest read's figures.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 6, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(6000n);
+    // Leaving the room forgets them: the next room's first poll keeps nothing.
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 7, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
+    clearFaucetRoom(room);
   });
 });
 

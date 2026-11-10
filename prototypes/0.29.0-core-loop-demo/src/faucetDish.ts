@@ -58,8 +58,8 @@ export interface FaucetStatus {
    *  a test network it reads the wallet's coins only for a request that asks
    *  for the balance (the Bank's), so that the dish's own polls do not show
    *  full nodes the wallet's address. The three wallet fields above are then
-   *  the ones kept from the last status that read it (see setFaucetReply),
-   *  or null when none did. False from an older node. */
+   *  those of the newest status that read it (see setFaucetReply), or null
+   *  when none did. False from an older node. */
   walletSkipped: boolean;
   /** The node's coin listing was cut short (a flood of outputs): coins, ready
    *  and totalMojos cover the pages it read; the jar holds more. */
@@ -100,19 +100,29 @@ export interface FaucetReply {
 
 export type FaucetOp = 'status' | 'claim' | 'give';
 
-/** ⛓️ `st` as the store files it over `onFile`, the room's status on file on
- *  the same network (or none). A status whose node left the wallet unread
- *  (`walletSkipped`) says nothing about the wallet, so the figures on file
- *  are kept: a dish poll landing after the Bank's read would otherwise blank
- *  RECEIVE's balance until the next REFRESH. Any other status is filed as it
- *  came, the wallet's absence included (no wallet loaded reads as null). */
-export function keepWalletFigures(st: FaucetStatus, onFile: FaucetStatus | null | undefined): FaucetStatus {
-  if (!st.walletSkipped || !onFile) return st;
+/** ⛓️ The wallet half of a status that read the wallet, and the node's number
+ *  for that snapshot (0 from an older node, which orders nothing). */
+export interface WalletFigures {
+  snapshot: number;
+  walletMojos: bigint | null;
+  walletSpendableMojos: bigint | null;
+  walletPartial: boolean;
+}
+
+/** ⛓️ `st` as the store files it, with `kept` the room's wallet figures on
+ *  file (those of the newest status on this network that read the wallet, or
+ *  none). A status whose node left the wallet unread (`walletSkipped`) says
+ *  nothing about the wallet, so it is filed with the figures kept: a dish
+ *  poll landing after the Bank's read would otherwise blank RECEIVE's balance
+ *  until the next REFRESH. Any other status is filed as it came, the wallet's
+ *  absence included (no wallet loaded reads as null). */
+export function keepWalletFigures(st: FaucetStatus, kept: WalletFigures | null | undefined): FaucetStatus {
+  if (!st.walletSkipped || !kept) return st;
   return {
     ...st,
-    walletMojos: onFile.walletMojos,
-    walletSpendableMojos: onFile.walletSpendableMojos,
-    walletPartial: onFile.walletPartial,
+    walletMojos: kept.walletMojos,
+    walletSpendableMojos: kept.walletSpendableMojos,
+    walletPartial: kept.walletPartial,
   };
 }
 
@@ -279,6 +289,10 @@ const lastError = new Map<string, string>();
 const pending = new Map<string, Pending>();
 /** The node's snapshot number of the newest status filed per room (see setFaucetReply). */
 const latestSnapshot = new Map<string, number>();
+/** ⛓️ Per room, the wallet figures of the newest status that read the wallet
+ *  (see setFaucetReply): ordered among themselves, apart from the jar's view,
+ *  since off a test network most statuses leave the wallet unread. */
+const walletOnFile = new Map<string, WalletFigures>();
 const listeners = new Set<() => void>();
 /** The room whose node session this store listens to right now (see openFaucetRoom). */
 let openRoom: string | null = null;
@@ -390,16 +404,21 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  status, its snapshot numbering, its error and its pending action all
  *  belong to the other chain.
  *
- *  ⛓️ A status whose node left the wallet unread keeps the wallet figures
- *  on file (keepWalletFigures). That happens off a test network only, where
- *  no TAKE or GIVE is ever pending, so the judging below reads figures the
- *  node sent with the status it judges. */
+ *  ⛓️ A status whose node left the wallet unread is filed with the wallet
+ *  figures of the newest status that read it (keepWalletFigures). Those are
+ *  ordered by the node's numbering among the statuses that read the wallet,
+ *  apart from the jar's view: the Bank's read answered after a newer dish
+ *  poll is an older look at the jar, and is not filed as one, but it is the
+ *  newest look at the wallet, and its figures are. That happens off a test
+ *  network only, where no TAKE or GIVE is ever pending, so the judging below
+ *  reads figures the node sent with the status it judges. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (roomId !== openRoom) return;
   const before = latest.get(roomId);
   if (reply.status && before && netKey(before.net) !== netKey(reply.status.net)) {
     latest.delete(roomId);
     latestSnapshot.delete(roomId);
+    walletOnFile.delete(roomId);
     lastError.delete(roomId);
     pending.delete(roomId);
   }
@@ -440,12 +459,31 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     const st = reply.status;
     // An older snapshot answered late is not filed over a newer one (an older
     // node numbers nothing and always files).
+    // ⛓️ The wallet's figures first, ordered among the statuses that read the
+    // wallet (what is on file is on this status's network by now: another
+    // network's was cleared above).
+    if (!st.walletSkipped) {
+      const kept = walletOnFile.get(roomId);
+      if (!(st.snapshot > 0 && kept !== undefined && st.snapshot < kept.snapshot)) {
+        walletOnFile.set(roomId, {
+          snapshot: st.snapshot,
+          walletMojos: st.walletMojos,
+          walletSpendableMojos: st.walletSpendableMojos,
+          walletPartial: st.walletPartial,
+        });
+      }
+    }
     const newest = latestSnapshot.get(roomId) ?? 0;
     if (!(st.snapshot > 0 && st.snapshot < newest)) {
       if (st.snapshot > 0) latestSnapshot.set(roomId, st.snapshot);
-      // ⛓️ The status on file is on the same network by now (another
-      // network's was cleared above).
-      latest.set(roomId, keepWalletFigures(st, latest.get(roomId)));
+      latest.set(roomId, keepWalletFigures(st, walletOnFile.get(roomId)));
+    } else if (!st.walletSkipped) {
+      // An older look that read the wallet, answered after a newer one that
+      // left it unread: the jar stays the newer look's, and takes the wallet
+      // figures now on file (this status's, unless a later one read the
+      // wallet too).
+      const onFile = latest.get(roomId);
+      if (onFile?.walletSkipped) latest.set(roomId, keepWalletFigures(onFile, walletOnFile.get(roomId)));
     }
   }
   // Judge the pending action on the newest view there is: the status just
@@ -491,5 +529,6 @@ export function clearFaucetRoom(roomId: string): void {
   lastError.delete(roomId);
   pending.delete(roomId);
   latestSnapshot.delete(roomId);
+  walletOnFile.delete(roomId);
   notify();
 }

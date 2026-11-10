@@ -5465,13 +5465,14 @@ function requestBankBalance(): void {
   sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
 }
 
-/** The Bank app is the phone's open view: RECEIVE's balance is on screen, so
- *  a faucet status sent now asks the node for the wallet's coins too (see
- *  requestBankBalance), and every status that lands while it is open carries
- *  the balance. With the Bank closed nothing shows the balance, and off a
- *  test network the dish's polls then leave the wallet unread. */
-function bankAppOpen(): boolean {
-  return document.getElementById("phone-app-bank")?.classList.contains("active") === true;
+/** ⛓️ Does a faucet status sent now ask the node for the wallet's coins too?
+ *  Only while RECEIVE's balance is on screen: the Bank is the phone's view
+ *  AND the phone is out (bankViewOnScreen). Tab puts the phone away without
+ *  taking `active` off the Bank's view, so the view's class alone would keep
+ *  the dish's polls asking for a balance nobody can see. With the Bank off
+ *  screen, and off a test network, those polls leave the wallet unread. */
+function statusAsksForBalance(): boolean {
+  return bankViewOnScreen();
 }
 
 function renderBankApp(): void {
@@ -11659,9 +11660,9 @@ async function init() {
   // 🏦 The Bank app's RECEIVE balance is read from the same store as the
   // dish: repaint the view while it is open whenever a status lands.
   subscribeFaucet(() => {
-    if (bankAppOpen()) renderBankApp();
+    if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
   });
-  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount, bankAppOpen());
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount, statusAsksForBalance());
   // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
   world.faucetChiaNet = () => localFingerprint?.chia_net;
   // ⛓️ And says Chia is off while the fingerprint does.
@@ -11678,7 +11679,7 @@ async function init() {
     if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
   });
   window.setInterval(() => {
-    if (world.hasFaucetDish()) networkProvider.requestFaucet("status", undefined, bankAppOpen()).sent.catch(() => {});
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status", undefined, statusAsksForBalance()).sent.catch(() => {});
   }, 60_000);
 
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
