@@ -42,7 +42,12 @@
 //!     the last stored or gossiped peer the lane knows while another fresh
 //!     peer is at hand, so a second source stays to pair with),
 //!     `RequestPeers` gossip from a connected
-//!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
+//!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed,
+//!     and again [`GOSSIP_AGAIN`] after an answer once nothing queued is
+//!     left to dial, since a full node answers each request with a new random
+//!     sample of its address book and few of the addresses in one take a
+//!     connection; [`gossip_take`] says which addresses of an answer are
+//!     queued),
 //!     and the store of known‑good peers kept in `chia_peers.json`
 //!     across runs; whatever the three name, only a public, internet-routable
 //!     address is queued (the node's own address judge, as for a presence
@@ -112,10 +117,13 @@
 //!     gossip, so a waiting one can bring its own, and it rejoins the queue
 //!     after [`RETRY_AFTER`]. A stored peer that disagrees with a verdict,
 //!     or with a pin, is evicted; so is a public peer whose announced peak
-//!     stands more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER
-//!     peers in distinct network groups both reach, behind it or alone ahead
-//!     of it (one peer's announcement, inflated or not, condemns nobody, and
-//!     two peers in one network group corroborate nothing between them); the
+//!     stands more than [`MAX_PEAK_LAG`] blocks behind a height two OTHER
+//!     peers in distinct network groups both reach, or alone that far ahead
+//!     of a height two such peers agree on, in step with each other (one
+//!     peer's announcement, inflated or not, condemns nobody; two peers in
+//!     one network group corroborate nothing between them; and two peers
+//!     still catching up, far from each other, say nothing against the one
+//!     at the tip); the
 //!     two peers of an agreed pair must be within that lag of each other, or
 //!     the pair is passed over, non-final, for one without either of them,
 //!     while discovery looks for a peer to break the tie. A peer that stops
@@ -190,8 +198,20 @@ pub const CANDIDATE_CAP: usize = 256;
 /// Candidates dialled at once.
 pub const PARALLEL_DIALS: usize = 4;
 /// Rounds of dialling one request may spend before it gives up (the peers the
-/// last round reaches are still judged).
-pub const MAX_ROUNDS: usize = 4;
+/// last round reaches are still judged). Eight rounds of three dials are two
+/// dozen addresses a request: on testnet11 about one gossiped address in a
+/// hundred took a connection (live check, 2026-11-10), so a second peer is
+/// several requests away, and half as many rounds made it twice as many.
+pub const MAX_ROUNDS: usize = 8;
+/// How long one request may spend dialling before it gives up, whatever
+/// rounds are left: eight rounds of addresses that answer nothing end at
+/// [`crate::chia_peer::DIAL_TIMEOUT`] each, inside this, while addresses that
+/// take the connection and then stall (each later stage has
+/// [`CONNECT_TIMEOUT`] of its own) do not hold a request for minutes. The
+/// dial under way when it runs out is finished and judged; a round that ran
+/// out of it waiting, for its turn at discovery or for its refill's lookups
+/// and gossip answers, starts no dial.
+pub const DISCOVERY_BUDGET: Duration = Duration::from_secs(40);
 /// How long a public address that failed or disagreed is left alone.
 pub const RETRY_AFTER: Duration = Duration::from_secs(600);
 /// How long a pin that failed is left alone (its owner may be restarting it).
@@ -210,12 +230,22 @@ pub const INTRODUCE_RETRY: Duration = Duration::from_secs(60);
 /// How long a connection whose gossip request failed waits before it is asked
 /// again (a request that failed says nothing about the peer's address book).
 pub const GOSSIP_RETRY: Duration = Duration::from_secs(60);
+/// How soon a connection that answered a gossip request may be asked again,
+/// once nothing it or anyone named is left to dial. A full node answers each
+/// request with a new random sample of its address book (chia-blockchain
+/// 2.7.4, `AddressManager.get_peers_`: at most 1,000 addresses, 23% of the
+/// book) and takes ten such requests a minute from a peer
+/// (`rate_limit_numbers.py`, `request_peers`); this asks two a minute at most.
+pub const GOSSIP_AGAIN: Duration = Duration::from_secs(30);
 /// Connections one public source may hold at once: one slot always stays for
 /// another source, so four introducer peers cannot fill the pool and shut
 /// gossip and the store out of the agreed pair (§14 (2)).
 pub const PER_SOURCE_CAP: usize = MAX_CONNS - 1;
 /// Addresses taken from one introducer answer or one gossip answer.
 pub const ADDRS_PER_ANSWER: usize = 32;
+/// Addresses read of one gossip answer at most (a full node sends up to
+/// 1,000); the rest of a longer answer is not looked at.
+pub const GOSSIP_READ: usize = 1024;
 /// Requests one coin-state lookup may spend when a peer answers for fewer ids
 /// than it was asked (Chia caps a request at its response-item limit and
 /// echoes the ids it took).
@@ -345,6 +375,9 @@ pub struct Lane {
     /// ([`Lane::closed`]), for its startup line; `None` for a lane built
     /// open, closed or not since.
     off_why: Option<&'static str>,
+    /// How long one request may spend dialling ([`DISCOVERY_BUDGET`]; tests
+    /// set their own).
+    budget: Duration,
     /// Every dial's outcome as it comes (tests).
     #[cfg(test)]
     dialled: tokio::sync::watch::Sender<Vec<Dialled>>,
@@ -371,9 +404,9 @@ struct LaneState {
     /// `None` before the first dial, or while a pin does not resolve: the pins
     /// count as short then.
     pin_target: Option<usize>,
-    /// Connections asked for gossip: `None`, it answered (not asked again);
-    /// `Some(at)`, the request failed (asked again after `at`).
-    gossiped: HashMap<SocketAddr, Option<Instant>>,
+    /// Connections asked for gossip, and when each may be asked again
+    /// ([`Asked`]).
+    gossiped: HashMap<SocketAddr, Asked>,
     /// How many closes are under way off the lock ([`close_later`]): of
     /// connections let go, and of those the pool held when the lane closed.
     /// [`Lane::close`] waits for none to be left, so every call waits for
@@ -391,6 +424,19 @@ struct LaneState {
     /// ranges included.
     #[cfg(test)]
     public_only: bool,
+}
+
+/// A connection asked for gossip, and when it may be asked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// It answered, or its request is out: asked again after the instant
+    /// ([`GOSSIP_AGAIN`]), and only once nothing queued is left to dial. A
+    /// request abandoned on the way (its requester gave up) is one of these
+    /// too, so the connection is asked again all the same.
+    Answered(Instant),
+    /// The request failed: asked again after the instant ([`GOSSIP_RETRY`]),
+    /// whatever is queued.
+    Failed(Instant),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +518,7 @@ impl Lane {
             readers,
             in_flight: tokio::sync::RwLock::new(()),
             off_why: None,
+            budget: DISCOVERY_BUDGET,
             #[cfg(test)]
             dialled: tokio::sync::watch::Sender::new(Vec::new()),
         }
@@ -604,7 +651,28 @@ impl Lane {
         let mut state = self.state.lock().await;
         state.pin_retry_after = None;
         state.cooling.clear();
-        state.gossiped.retain(|_, retry| retry.is_none());
+        state.gossiped.retain(|_, asked| matches!(asked, Asked::Answered(_)));
+    }
+
+    /// Let every connection that answered a gossip request be asked again at
+    /// once, when nothing queued is left to dial (tests).
+    #[cfg(test)]
+    pub async fn expire_gossip_wait(&self) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        for asked in state.gossiped.values_mut() {
+            if matches!(asked, Asked::Answered(_)) {
+                *asked = Asked::Answered(now);
+            }
+        }
+    }
+
+    /// Give a request `budget` to spend dialling instead of
+    /// [`DISCOVERY_BUDGET`] (tests).
+    #[cfg(test)]
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Reuse a TLS configuration (tests share one certificate).
@@ -704,6 +772,8 @@ impl Lane {
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
         self.refuse_if_closed()?;
         let pinned = !self.pins.is_empty();
+        let started = Instant::now();
+        let spent = || started.elapsed() >= self.budget;
         // One pass more than there are dial rounds: the peers the LAST round
         // reached are judged like any other before the request gives up.
         for round in 0..=MAX_ROUNDS {
@@ -736,9 +806,10 @@ impl Lane {
             if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
             }
-            if self.pin_only || round == MAX_ROUNDS {
+            if self.pin_only || round == MAX_ROUNDS || spent() {
                 // Nothing public is ever dialled in pin-only mode; otherwise
-                // the dial rounds are spent.
+                // the dial rounds are spent, or the time a request may spend
+                // on them ([`DISCOVERY_BUDGET`]).
                 break;
             }
             let _discovering = self.discovery.lock().await;
@@ -747,7 +818,18 @@ impl Lane {
             if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
             }
+            // The wait for the turn counts against the request's time, and
+            // so does the refill below (a name lookup, a gossip answer that
+            // is slow to come): out of time after either, no dial is started.
+            if spent() {
+                break;
+            }
             self.refill(trust).await;
+            if spent() {
+                // What the refill changed without a dial is still chosen
+                // from: the next pass chooses, and stops there if it cannot.
+                continue;
+            }
             // A refill can change the pool without a dial (a connected stored
             // peer the introducer named is fresh now), so the round is spent
             // only when there was nothing to dial AND nothing new to choose.
@@ -840,16 +922,20 @@ impl Lane {
         Ok(None)
     }
 
-    /// Before an agreed verdict, a public peer whose announced peak stands
-    /// more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER peers in
-    /// distinct network groups both reach is let go ([`outlier`]): below it,
-    /// the peer lags, and its answers describe an older chain state, so a
-    /// match between it and a current peer would not mean what an agreement
-    /// should; above it, with no peer in another group anywhere near its
-    /// height, the peer stands alone ahead of everything two independent
-    /// peers agree on (an inflated announcement, or one node ahead of a
-    /// lagging pool; let go and dialled again after [`RETRY_AFTER`], it is
-    /// back either way). Nothing is let go on one peer's word, and two peers
+    /// Before an agreed verdict, a public peer out of step with the pool is
+    /// let go ([`outlier`]). One whose announced peak stands more than
+    /// [`MAX_PEAK_LAG`] blocks below a height two OTHER peers in distinct
+    /// network groups both reach lags: its answers describe an older chain
+    /// state, so a match between it and a current peer would not mean what
+    /// an agreement should. One that far above a height two such peers
+    /// agree on, in step with each other, with no peer in another group
+    /// anywhere near its own height, stands alone ahead of everything two
+    /// independent peers agree on (an inflated announcement, or one node
+    /// ahead of a lagging pair; let go and dialled again after
+    /// [`RETRY_AFTER`], it is back either way). Two peers that both stand
+    /// below it but far from each other agree on nothing: they are two
+    /// nodes still catching up, and the lower of them is the one that goes,
+    /// as lagging. Nothing is let go on one peer's word, and two peers
     /// in one network group (one host on two ports, say) corroborate nothing
     /// between them, so a pool of two, or of one group against one peer,
     /// lets nobody go here: a gap inside the chosen pair is then non-final
@@ -1083,7 +1169,10 @@ impl Lane {
     /// which the store and gossip can never supply) and it is due (its last
     /// answer used up and [`INTRODUCE_EVERY`] passed, or [`INTRODUCE_RETRY`]
     /// after an answer that named nobody); and gossip from every connection
-    /// not yet asked. The interval holds across requests and dial rounds
+    /// not yet asked, from one whose request failed once [`GOSSIP_RETRY`] has
+    /// passed, and from one that answered once nothing queued is left to dial
+    /// and [`GOSSIP_AGAIN`] has passed ([`gossip_take`] says what an answer
+    /// adds). The interval holds across requests and dial rounds
     /// alike: while the introducer cools down, the queued, stored and
     /// gossiped candidates are what there is to try. The lookup and the
     /// gossip requests run with the pool unlocked; what they bring is merged
@@ -1133,16 +1222,28 @@ impl Lane {
             // No veto for introducer candidates still queued: those are cooling
             // after failed dials, and only the deadline and the need decide.
             let introduce = !self.net.introducers.is_empty() && state.introduce_after.is_none_or(|at| now >= at) && (need_fresh || !ready);
+            // A connection is asked for gossip when it never was; again once
+            // a failed request's wait has passed; and again after an answer,
+            // once nothing queued is left to dial and [`GOSSIP_AGAIN`] has
+            // passed. A full node answers each request with a new random
+            // sample of its address book, and on a thin network the first
+            // sample seldom names a peer that takes a connection: asked once
+            // and never again, the lane had tried its 32 addresses and then
+            // stood a peer short for good (live check, 2026-11-10).
             let unasked: Vec<Arc<PeerConn>> = state
                 .conns
                 .iter()
-                .filter(|c| !state.gossiped.get(&c.addr()).is_some_and(|retry| retry.is_none() || retry.is_some_and(|at| now < at)))
+                .filter(|c| match state.gossiped.get(&c.addr()) {
+                    None => true,
+                    Some(Asked::Failed(at)) => now >= *at,
+                    Some(Asked::Answered(at)) => !ready && now >= *at,
+                })
                 .cloned()
                 .collect();
             // Marked asked before the requests leave, so no other requester
             // asks the same peers meanwhile.
             for conn in &unasked {
-                state.gossiped.insert(conn.addr(), None);
+                state.gossiped.insert(conn.addr(), Asked::Answered(now + GOSSIP_AGAIN));
             }
             (introduce, unasked)
         };
@@ -1165,23 +1266,24 @@ impl Lane {
         } else {
             None
         };
-        let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<SocketAddr>>)> = Vec::with_capacity(unasked.len());
+        let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<(SocketAddr, u64)>>)> = Vec::with_capacity(unasked.len());
         for conn in unasked {
             // Closed meanwhile: no further peer is asked, and the request out
             // is abandoned.
             let Some(answered) = self.while_open(conn.request::<RespondPeers, _>(RequestPeers::new())).await else { return };
             let answer = match answered {
-                Ok(answer) => {
-                    let mut addrs: Vec<SocketAddr> = answer
+                // Each address with the time the peer says it last saw it;
+                // which of them are taken is chosen with the pool in hand,
+                // below ([`gossip_take`]).
+                Ok(answer) => Some(
+                    answer
                         .peer_list
                         .iter()
-                        .filter_map(|p| p.host.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, p.port)))
-                        .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
-                        .collect();
-                    addrs.shuffle(&mut rand::thread_rng());
-                    addrs.truncate(ADDRS_PER_ANSWER);
-                    Some(addrs)
-                }
+                        .take(GOSSIP_READ)
+                        .filter_map(|p| p.host.parse::<IpAddr>().ok().map(|ip| (canonical(SocketAddr::new(ip, p.port)), p.timestamp)))
+                        .filter(|(a, _)| !a.ip().is_unspecified() && a.port() != 0)
+                        .collect(),
+                ),
                 Err(e) => {
                     eprintln!("⛓️ chain peers: {} gossip: {e:#} (asked again in {} s)", conn.addr(), GOSSIP_RETRY.as_secs());
                     None
@@ -1204,13 +1306,16 @@ impl Lane {
         }
         for (conn, answer) in gossip {
             match answer {
-                Some(addrs) => {
-                    let n = addrs.len();
-                    push_candidates(state, addrs.into_iter().map(|addr| Candidate::new(addr, Source::Gossip)).collect());
-                    eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
+                Some(named) => {
+                    let n = named.len();
+                    let held: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).chain(state.candidates.iter().map(|c| c.addr)).collect();
+                    let dialable: Vec<(SocketAddr, u64)> = named.into_iter().filter(|(addr, _)| admitted(state, *addr)).collect();
+                    let (known, taken) = gossip_take(dialable, &held, unix_now(), &mut rand::thread_rng());
+                    eprintln!("⛓️ chain peers: {} gossiped {n} full nodes: {} taken to try, {} known already", conn.addr(), taken.len(), known.len());
+                    push_candidates(state, known.into_iter().chain(taken).map(|addr| Candidate::new(addr, Source::Gossip)).collect());
                 }
                 None => {
-                    state.gossiped.insert(conn.addr(), Some(Instant::now() + GOSSIP_RETRY));
+                    state.gossiped.insert(conn.addr(), Asked::Failed(Instant::now() + GOSSIP_RETRY));
                 }
             }
         }
@@ -1295,7 +1400,11 @@ impl Lane {
                     }
                 }
             }
-            ready.sort_by_key(|c| (have.contains(&c.source()), groups.contains(&group_of(c.addr)), !c.source().is_fresh()));
+            // Among equals, an address never dialled goes before one that
+            // failed before: on a thin network nearly every gossiped address
+            // fails, and their second and third tries would otherwise stand
+            // ahead of every address gossip named since.
+            ready.sort_by_key(|c| (have.contains(&c.source()), groups.contains(&group_of(c.addr)), !c.source().is_fresh(), c.failures));
             if first.is_none() {
                 if let Some(i) = self.rotation(state, paired, &ready) {
                     let peer = state.conns[i].clone();
@@ -2140,26 +2249,40 @@ pub(crate) fn tryable<S: Into<Sources> + Copy>(pooled: &[(S, Group, bool)], cand
 /// Does a peer announcing `height` stand out of step with the rest of the
 /// pool? `announced` holds (address, network group, announced height) for
 /// every connection with a known peak, the peer itself among them or not.
-/// The others' corroborated height is the highest height two of them in
-/// distinct network groups both reach ([`corroborated`]); the peer is an
-/// outlier when it stands more than [`MAX_PEAK_LAG`] blocks below it
-/// (lagging), or more than that above it with no peer in another group
-/// within the lag of its own height (alone ahead of everything two
-/// independent peers agree on). With no two others in distinct groups there
-/// is no corroboration and no outlier: one peer's word condemns nobody, and
-/// two peers in one group (one host on two ports, say) corroborate nothing
-/// between them (#271 review, round 21). The reason, or `None`.
+///
+/// It lags when it stands more than [`MAX_PEAK_LAG`] blocks below the
+/// others' corroborated height, the highest height two of them in distinct
+/// network groups both reach ([`corroborated`]): two independent peers each
+/// say the chain is at least that long.
+///
+/// It stands alone ahead when it is more than that above the highest
+/// height two of the others in distinct groups agree on, in step with each
+/// other ([`agreed_height`]), with no peer in another group within the lag
+/// of its own height. That two others both reach a height says nothing
+/// against a peer above it; only two that agree where the tip is do. Two
+/// peers below it and far from each other are two nodes still catching up,
+/// and judged by what they both reach they let the one node at the tip go:
+/// on testnet11 the pool's first three peers were two such nodes, 285,000
+/// and 128,000 blocks behind, and the introducer's one node in step, which
+/// was let go for ten minutes and left the pool no fresh peer to pair with
+/// (the second live check, 2026-11-10).
+///
+/// With no two others in distinct groups there is no corroboration and no
+/// outlier: one peer's word condemns nobody, and two peers in one group
+/// (one host on two ports, say) corroborate nothing between them (#271
+/// review, round 21). The reason, or `None`.
 pub(crate) fn outlier(announced: &[(SocketAddr, Group, u32)], addr: SocketAddr, group: Group, height: u32) -> Option<String> {
     let others: Vec<(SocketAddr, Group, u32)> = announced.iter().copied().filter(|(a, _, _)| *a != addr).collect();
     let reference = corroborated(&others)?;
     if reference.saturating_sub(height) > MAX_PEAK_LAG {
         return Some(format!("lags {} blocks behind the height two other peers reach", reference - height));
     }
+    let agreed = agreed_height(&others)?;
     let near = others.iter().any(|(_, g, h)| *g != group && h.saturating_add(MAX_PEAK_LAG) >= height);
-    if height.saturating_sub(reference) > MAX_PEAK_LAG && !near {
+    if height.saturating_sub(agreed) > MAX_PEAK_LAG && !near {
         return Some(format!(
-            "announces height {height}, {} blocks above anything two other peers reach, and no peer elsewhere comes near it",
-            height - reference
+            "announces height {height}, {} blocks above the height two other peers agree on, and no peer elsewhere comes near it",
+            height - agreed
         ));
     }
     None
@@ -2168,11 +2291,25 @@ pub(crate) fn outlier(announced: &[(SocketAddr, Group, u32)], addr: SocketAddr, 
 /// The highest height two of `peers` in distinct network groups both reach;
 /// `None` with fewer than two groups among them.
 pub(crate) fn corroborated(peers: &[(SocketAddr, Group, u32)]) -> Option<u32> {
+    highest_shared(peers, |_, _| true)
+}
+
+/// The highest height two of `peers` in distinct network groups agree on:
+/// the lower of two announced heights within [`MAX_PEAK_LAG`] of each other,
+/// which is what a pair in step is ([`pair_in_step`]). `None` when no two in
+/// distinct groups stand that close.
+pub(crate) fn agreed_height(peers: &[(SocketAddr, Group, u32)]) -> Option<u32> {
+    highest_shared(peers, |a, b| a.abs_diff(b) <= MAX_PEAK_LAG)
+}
+
+/// The highest height two of `peers` in distinct network groups both reach,
+/// among the pairs whose two heights pass `counts`.
+fn highest_shared(peers: &[(SocketAddr, Group, u32)], counts: impl Fn(u32, u32) -> bool) -> Option<u32> {
     let mut best: Option<u32> = None;
     for (i, (_, ga, ha)) in peers.iter().enumerate() {
         for (_, gb, hb) in &peers[i + 1..] {
             let both = (*ha).min(*hb);
-            if gb != ga && best.is_none_or(|b| both > b) {
+            if gb != ga && counts(*ha, *hb) && best.is_none_or(|b| both > b) {
                 best = Some(both);
             }
         }
@@ -2280,6 +2417,46 @@ impl Drop for Closing {
         drop(self.peer.take());
         self.under_way.send_modify(|n| *n -= 1);
     }
+}
+
+/// What one gossip answer adds: `named` holds each address with the time the
+/// peer says it last saw it, `held` the addresses the lane already has,
+/// connected or queued. First, every address of the answer the lane holds
+/// already: gossip names it too now, so a connection the introducer named may
+/// stand for gossip in a pair ([`push_candidates`], [`pick_agreed`]). A full
+/// node answers with up to 1,000 addresses, and looking for those among the
+/// few taken to dial alone would seldom find one. Second, at most
+/// [`ADDRS_PER_ANSWER`] addresses new to the lane, to dial in this order:
+/// half are the ones the peer saw most recently (a full node stamps anew the
+/// peers it dialled itself and still holds, chia-blockchain 2.7.4
+/// `update_peer_timestamp_on_message`, so a late stamp should mark an address
+/// likelier to take a connection: read in the source, not measured; an
+/// address stamped in the future counts as seen now), the other half drawn
+/// at random from the rest, so a peer's timestamps alone do not decide every
+/// address tried. An address the answer repeats counts once.
+fn gossip_take(named: Vec<(SocketAddr, u64)>, held: &HashSet<SocketAddr>, now: u64, rng: &mut impl rand::Rng) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut known: Vec<SocketAddr> = Vec::new();
+    let mut new: Vec<(SocketAddr, u64)> = Vec::new();
+    for (addr, at) in named {
+        if !seen.insert(addr) {
+            continue;
+        }
+        if held.contains(&addr) {
+            known.push(addr);
+        } else {
+            new.push((addr, at.min(now)));
+        }
+    }
+    // Shuffled first, so addresses stamped alike come in no order of the
+    // peer's choosing; the sort is stable.
+    new.shuffle(rng);
+    new.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    let recent = (ADDRS_PER_ANSWER / 2).min(new.len());
+    let mut rest = new.split_off(recent);
+    rest.shuffle(rng);
+    rest.truncate(ADDRS_PER_ANSWER - recent);
+    (known, new.into_iter().chain(rest).map(|(addr, _)| addr).collect())
 }
 
 /// Queue candidates not yet known. An address already queued or connected is
@@ -3963,7 +4140,7 @@ impl ChainAccess for PeerLane {
 mod tests {
     use super::*;
     use crate::chia_peer::mock::{header_at, reply, spawn, spawn_as, spawn_on, Handler, MockNode};
-    use crate::chia_peer::tls_client_config;
+    use crate::chia_peer::{tls_client_config, DIAL_TIMEOUT};
     use chia_protocol::{Coin, Message, NewPeakWallet, NodeType, Program, PuzzleSolutionResponse, TimestampedPeerInfo};
     use chia_traits::Streamable;
     use std::sync::{LazyLock, Mutex};
@@ -5437,6 +5614,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_peers_still_catching_up_do_not_outvote_the_one_at_the_tip() {
+        // As on testnet11 in the second live check (2026-11-10): `low`
+        // (introducer) and `mid` (gossip) are still catching up, out of step
+        // with the tip and with each other, and `tip` (introducer) is the one
+        // node in step with the chain. Judged by the height `low` and `mid`
+        // both reach, `tip` stood alone ahead and was let go for
+        // [`RETRY_AFTER`], and the pool was left with no fresh peer in step.
+        // The two agree on nothing, so `tip` stays; `low` lags behind what
+        // the other two both reach and goes. `tip` gossips C, which agrees
+        // with it: against the two of them `mid` lags and goes too, and
+        // `tip` and C settle the read, all within one request.
+        let far = MAX_PEAK_LAG + 1;
+        let (low_at, mid_at, tip_at) = (100, 100 + far, 100 + 2 * far);
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(tip_at))).await;
+        let tip = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(tip_at)), node(vec![state(1, 90, None)], (1, None), vec![c.addr])).await;
+        let low = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(low_at))).await;
+        let mid = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(mid_at))).await;
+        let lane = lane(vec![(low.addr, Source::Introducer), (mid.addr, Source::Gossip), (tip.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        let live: Vec<SocketAddr> = lane.live_conns().await.iter().map(|p| p.addr()).collect();
+        assert!(live.contains(&tip.addr) && live.contains(&c.addr), "the node at the tip and the peer it named settle the read: {live:?}");
+        assert!(!live.contains(&low.addr) && !live.contains(&mid.addr), "the two still catching up are let go: {live:?}");
+        let state = lane.state.lock().await;
+        assert!(!state.cooling.contains_key(&tip.addr), "the node at the tip was never let go");
+        assert!(state.cooling.contains_key(&low.addr) && state.cooling.contains_key(&mid.addr), "and the other two wait their turn again");
+    }
+
+    #[tokio::test]
     async fn an_inflated_peak_from_a_third_peer_condemns_no_honest_peer() {
         // Two honest peers agree at 100; a third announces a height far above.
         // Alone ahead of a height two independent peers reach, the third is the
@@ -6163,6 +6369,46 @@ mod tests {
         assert_eq!(corroborated(&[peer(1, 5)]), None);
         assert_eq!(corroborated(&[host([127, 0, 0, 1], 5), host([127, 0, 0, 2], 9)]), None, "one group");
         assert_eq!(corroborated(&[peer(1, 5), peer(2, 9), peer(3, 7)]), Some(7));
+        // What two peers agree on is the lower of two heights in step, in
+        // distinct groups; what they both reach needs no such closeness.
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5 + MAX_PEAK_LAG)]), Some(5), "in step at the lag itself");
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5 + far)]), None, "out of step");
+        assert_eq!(corroborated(&[peer(1, 5), peer(2, 5 + far)]), Some(5));
+        assert_eq!(agreed_height(&[host([127, 0, 0, 1], 5), host([127, 0, 0, 2], 5)]), None, "one group agrees with nobody");
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5), peer(3, 900), peer(4, 901)]), Some(900), "the highest such pair");
+    }
+
+    /// The second live check's pool on testnet11 (2026-11-10), by its
+    /// heights: two nodes still catching up, far below the tip and far from
+    /// each other, and the introducer's one node at the tip. The two agree
+    /// on nothing, so the node at the tip is let go on no word of theirs;
+    /// the lower of them lags behind what the other two both reach, and
+    /// goes. Once two peers at the tip stand beside it, the other goes the
+    /// same way. A pair that does agree, in step with each other, still
+    /// lets a lone announcer far above it go.
+    #[test]
+    fn two_peers_still_catching_up_agree_on_nothing_against_the_one_at_the_tip() {
+        let at = |n: u16| SocketAddr::from(([127, 0, 0, 1], n));
+        let g = |n: u16| group_of(at(n));
+        let peer = |n: u16, h: u32| (at(n), g(n), h);
+        let (low, mid, tip) = (4_661_567, 4_817_783, 4_946_177);
+        let pool = [peer(1, low), peer(2, mid), peer(3, tip)];
+        assert_eq!(outlier(&pool, at(3), g(3), tip), None, "the node at the tip stays");
+        assert!(outlier(&pool, at(1), g(1), low).is_some_and(|w| w.contains("lags 156216 blocks")), "the lower of the two lags");
+        assert_eq!(outlier(&pool, at(2), g(2), mid), None, "the other stays until two peers stand above it");
+        let later = [peer(2, mid), peer(3, tip), peer(4, tip - 1), peer(5, tip)];
+        assert!(outlier(&later, at(2), g(2), mid).is_some_and(|w| w.contains("lags")));
+        for n in [3, 4, 5] {
+            let h = later.iter().find(|p| p.0 == at(n)).unwrap().2;
+            assert_eq!(outlier(&later, at(n), g(n), h), None, "peer {n} at the tip stays");
+        }
+        // Just out of step is enough to agree on nothing…
+        let far = MAX_PEAK_LAG + 1;
+        let apart = [peer(1, 100), peer(2, 100 + far), peer(3, 100 + 2 * far)];
+        assert_eq!(outlier(&apart, at(3), g(3), 100 + 2 * far), None);
+        // …and two in step still tell a lone announcer above them.
+        let agreeing = [peer(1, 100), peer(2, 100 + MAX_PEAK_LAG), peer(3, 100 + MAX_PEAK_LAG + far)];
+        assert!(outlier(&agreeing, at(3), g(3), 100 + MAX_PEAK_LAG + far).is_some_and(|w| w.contains("above the height two other peers agree on")));
     }
 
     #[test]
@@ -6405,13 +6651,224 @@ mod tests {
         let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
         let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
         assert!(err.to_string().contains("fewer than two"), "{err}");
-        assert!(matches!(retrying.state.lock().await.gossiped.get(&a.addr), Some(Some(_))), "marked to ask again later, not never");
+        assert!(matches!(retrying.state.lock().await.gossiped.get(&a.addr), Some(Asked::Failed(_))), "marked to ask again later, not never");
         let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
         assert!(err.to_string().contains("fewer than two"), "{err}");
         assert_eq!(asked(), 1, "not asked again before the delay");
         retrying.expire_pin_cooldown().await;
         assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's gossip brought B");
         assert_eq!(asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_gossip_named_nobody_reachable_is_asked_again_once_nothing_is_left_to_dial() {
+        // The live check of 2026-11-10 on testnet11: the first peer's gossip
+        // named 32 addresses, none took a connection, and the lane never
+        // asked it again, so every money read stood a peer short for good.
+        // A's first answer names addresses nobody answers at; its later ones
+        // name B.
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let dead = vec![closed().await, closed().await];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = node(vec![state(1, 90, None)], (1, None), dead.clone());
+        let later = node(vec![state(1, 90, None)], (1, None), vec![b.addr]);
+        let two_answers: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                first(m)
+            } else {
+                later(m)
+            }
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), two_answers).await;
+        let thin = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(thin.clone(), Trust::Agreed);
+        let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(asked(), 1, "asked once in the request that used its answer up");
+        {
+            let state = thin.state.lock().await;
+            assert!(matches!(state.gossiped.get(&a.addr), Some(Asked::Answered(_))), "marked to ask again, not never");
+            assert!(dead.iter().all(|d| state.cooling.contains_key(d)), "both addresses were dialled and cool");
+        }
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(asked(), 1, "not asked again before its wait has passed");
+        thin.expire_gossip_wait().await;
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's second answer brought B");
+        assert_eq!(asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_answered_is_not_asked_again_while_an_address_waits_to_be_dialled() {
+        // A new sample is for a queue that ran dry: while something queued can
+        // still be dialled, nobody is asked for more, however long ago it
+        // answered; and once asked, a peer has its wait again.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let waiting = closed().await;
+        let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 1, "a connection never asked is asked");
+        lane.expire_gossip_wait().await;
+        lane.state.lock().await.candidates.push_back(Candidate::new(waiting, Source::Gossip));
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 1, "an address is left to dial: nobody is asked for more");
+        lane.state.lock().await.cooling.insert(waiting, Instant::now() + RETRY_AFTER);
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 2, "the only address queued is cooling, so nothing is left to dial: asked again");
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 2, "and not again before its wait has passed");
+    }
+
+    #[tokio::test]
+    async fn an_address_never_dialled_is_tried_before_one_that_failed() {
+        // Three addresses that failed a dial before stand ahead of three
+        // never tried in the queue; the pool has three places. The next round
+        // dials the three never tried.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        let failed = [closed().await, closed().await, closed().await];
+        let untried = [closed().await, closed().await, closed().await];
+        {
+            let mut state = lane.state.lock().await;
+            for addr in failed {
+                state.candidates.push_back(Candidate { failures: 1, ..Candidate::new(addr, Source::Gossip) });
+            }
+            for addr in untried {
+                state.candidates.push_back(Candidate::new(addr, Source::Gossip));
+            }
+        }
+        assert!(lane.dial().await);
+        let dialled: HashSet<SocketAddr> = lane.dialled.borrow().iter().map(|(addr, _)| *addr).filter(|addr| *addr != a.addr).collect();
+        assert_eq!(dialled, untried.into_iter().collect::<HashSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_request_out_of_time_dials_no_further() {
+        // The dial rounds a request may spend are bounded in time too
+        // ([`DISCOVERY_BUDGET`]): with none left, a money read a peer short
+        // gives up without a dial, B still queued for the next request.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let hurried = Arc::new(
+            Lane::new(net(), vec![], false, None)
+                .with_candidates(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)])
+                .with_tls(TLS.clone())
+                .with_budget(Duration::ZERO),
+        );
+        let err = PeerLane::new(hurried.clone(), Trust::Agreed).coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert!(hurried.dialled.borrow().is_empty(), "nothing was dialled");
+        assert_eq!(hurried.state.lock().await.candidates.len(), 2, "both wait for a request with time to spend");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_time_ran_out_waiting_its_turn_dials_no_further() {
+        // Discovery is one requester at a time, and the wait for the turn is
+        // the request's own time: a money read that got its turn after its
+        // time had run out dials nobody, A and B still queued.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let budget = Duration::from_millis(200);
+        let waiting = Arc::new(
+            Lane::new(net(), vec![], false, None)
+                .with_candidates(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)])
+                .with_tls(TLS.clone())
+                .with_budget(budget),
+        );
+        let turn = waiting.discovery.lock().await;
+        let money = PeerLane::new(waiting.clone(), Trust::Agreed);
+        let (read, ()) = tokio::join!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None), async {
+            // Another requester holds the turn for twice the request's time.
+            tokio::time::sleep(budget * 2).await;
+            drop(turn);
+        });
+        let err = read.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert!(waiting.dialled.borrow().is_empty(), "nothing was dialled");
+        let state = waiting.state.lock().await;
+        assert_eq!(state.candidates.len(), 2, "both wait for a request with time to spend");
+        // Nor was a refill started, which could ask the introducer and every
+        // peer for addresses: its first act is to read the store.
+        assert!(!state.store_loaded, "no refill was started");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_time_ran_out_in_the_refill_dials_no_further() {
+        // A takes the connection at once and is then slow to answer the
+        // gossip request: the time a request may spend runs out while its
+        // refill waits for the answer, so B, which the answer names, is
+        // queued and left for the next request.
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let budget = Duration::from_millis(400);
+        let answers = node(vec![state(1, 90, None)], (1, None), vec![b.addr]);
+        let slow_gossip: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                // The answer leaves once twice the request's time has passed,
+                // whatever thread the mock answers on.
+                std::thread::sleep(budget * 2);
+            }
+            answers(m)
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), slow_gossip).await;
+        let slow = Arc::new(
+            Lane::new(net(), vec![], false, None).with_candidates(vec![(a.addr, Source::Introducer)]).with_tls(TLS.clone()).with_budget(budget),
+        );
+        let err = PeerLane::new(slow.clone(), Trust::Agreed).coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(slow.dialled.borrow().iter().map(|(addr, _)| *addr).collect::<Vec<_>>(), vec![a.addr], "only A was dialled");
+        let state = slow.state.lock().await;
+        assert!(state.candidates.iter().any(|c| c.addr == b.addr), "B is queued for the next request");
+        assert!(!state.cooling.contains_key(&b.addr), "and was not tried");
+    }
+
+    #[test]
+    fn the_dial_rounds_of_unanswered_addresses_fit_the_time_a_request_may_spend() {
+        // What the two constants are for: a request whose every address
+        // answers nothing still gets all its rounds, and a dial of such an
+        // address ends before the later stages' bound would.
+        assert!(DIAL_TIMEOUT * MAX_ROUNDS as u32 <= DISCOVERY_BUDGET);
+        assert!(DIAL_TIMEOUT < CONNECT_TIMEOUT);
+        // Two requests a minute at most, a fifth of what a 2.7.4 full node
+        // takes (ten a minute) before it drops the peer for flooding.
+        assert!(GOSSIP_AGAIN >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_gossip_answer_adds_what_the_lane_holds_and_a_bounded_choice_of_the_rest() {
+        let addr = |n: u16| SocketAddr::from(([198, 51, (n / 256) as u8, (n % 256) as u8], 58444));
+        let mut rng = rand::thread_rng();
+        // 200 addresses, the n-th last seen at time n; the lane holds three.
+        let named: Vec<(SocketAddr, u64)> = (0..200).map(|n| (addr(n), u64::from(n))).collect();
+        let held: HashSet<SocketAddr> = [addr(5), addr(150), addr(199)].into_iter().collect();
+        let (known, taken) = gossip_take(named.clone(), &held, 1_000, &mut rng);
+        assert_eq!(known, vec![addr(5), addr(150), addr(199)], "every address the lane holds, wherever it stands in the answer");
+        assert_eq!(taken.len(), ADDRS_PER_ANSWER, "and no more new ones than the cap");
+        let recent: Vec<SocketAddr> = (183..=198).rev().map(addr).collect();
+        assert_eq!(taken[..ADDRS_PER_ANSWER / 2], recent[..], "first the ones the peer saw most recently, newest first");
+        let rest = &taken[ADDRS_PER_ANSWER / 2..];
+        assert!(rest.iter().all(|a| !recent.contains(a) && !held.contains(a)), "then others the lane does not hold");
+        assert_eq!(taken.iter().collect::<HashSet<_>>().len(), taken.len(), "none twice");
+        // The other half is drawn at random from all the rest, not the next
+        // most recent: sixteen of 181 all falling among the newest sixteen of
+        // them has no chance worth the name.
+        assert!(rest.iter().any(|a| *a < addr(167)), "the second half reaches past the next most recent");
+
+        // Fewer new addresses than the cap: all are taken; one named twice counts once.
+        let few: Vec<(SocketAddr, u64)> = vec![(addr(1), 10), (addr(2), 30), (addr(1), 50), (addr(3), 20)];
+        let (known, taken) = gossip_take(few, &HashSet::new(), 1_000, &mut rng);
+        assert!(known.is_empty());
+        assert_eq!(taken, vec![addr(2), addr(3), addr(1)], "newest first, the repeat's first mention counted");
+
+        // A timestamp ahead of the clock counts as now: among forty addresses
+        // seen now, the one stamped ahead is not first every time.
+        let ahead = addr(999);
+        let crowd: Vec<(SocketAddr, u64)> = std::iter::once((ahead, u64::MAX)).chain((0..40).map(|n| (addr(n), 1_000))).collect();
+        let firsts: HashSet<SocketAddr> = (0..64).map(|_| gossip_take(crowd.clone(), &HashSet::new(), 1_000, &mut rng).1[0]).collect();
+        assert!(firsts.len() > 1, "an address stamped in the future does not outrank the ones seen now");
     }
 
     #[tokio::test]
