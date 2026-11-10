@@ -15,14 +15,15 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { faironlyInc, finKey, sealFin, xfId, xfKey } from './computedFairOnly';
+import { faironlyInc, finKey, NO_CLOSE, sealCk, sealFin, xfId, xfKey } from './computedFairOnly';
+import type { CkRec } from './computedFairOnly';
 import { asClose, dutyRank, nextSid3 } from './computedFold';
 import type { CloseRec } from './computedFold';
 import { buyer, delegation, fourth, hex, house as H, house2 as H2, NAME, owner, rootOf, stranger, third, trimOf, xferOf } from './computedFairOnlyKit';
-import { Beating, beatOf, clockOf, deliver, frame, keysIn, loadPage, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run as runBare, send, sync, updatesOf } from './computedPageKit';
+import { Beating, beatOf, clockOf, deliver, frame, keysIn, loadPage, PAGE_INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run as runBare, send, sync, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red } from './computedTestKit';
-import type { Built, TestHouse } from './computedTestKit';
+import type { Built, TestHouse, TestIdentity } from './computedTestKit';
 import { delegationKey } from './computedHouse';
 import { verifyIdentityStrict } from './keypair';
 
@@ -110,6 +111,8 @@ function openGame(pages: Page[]): Page[] {
   a.doc.transact(() => {
     top(a).set(root.key, root.value);
     top(a).set(SES, new Y.Map());
+    // (the switch names the game, as the opening of one writes it: 6c-5)
+    a.doc.getMap<unknown>('casino').set(`cfg:computed:${TABLE}`, { v: 1, inc: G.inc });
   });
   sync(T0, ...pages);
   runBare(pages, T0, T0, { step: STEP }); // (awake)
@@ -234,7 +237,7 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     expect(putBack(a)).toBe(0);
     del(a, root.key);
     expect(res(a)).toMatchObject({ live: true, base: { key: root.key } });
-    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, sessionMissing: false, sid: SID, sesMoves: 1, pubs: [], returns: 0 }]);
+    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, tableMissing: false, tableMoves: 0, sessionMissing: false, sid: SID, sesMoves: 1, pubs: [], returns: 0 }]);
     // (the one move of a session's key: the map the game was opened with)
     expect(putBack(a)).toBe(1);
     expect(top(a).get(root.key)).toEqual(root.value);
@@ -1994,6 +1997,7 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     a.doc.transact(() => {
       top(a).set(root2.key, root2.value);
       top(a).set(`ses:${T2}:${G2.inc}:${nextSid3(G2, root2.value)}`, new Y.Map());
+      a.doc.getMap<unknown>('casino').set(`cfg:computed:${T2}`, { v: 1, inc: G2.inc });
     });
     expect(a.casino.computedFairOnlyChecking()).toBe(1);
     expect(lacks(a)).toEqual([]);
@@ -3420,5 +3424,961 @@ describe('the put-back duty', () => {
     frames(a, T, due + STEP + wait);
     expect(top(a).get(ses)).toBeInstanceOf(Y.Map);
     expect(top(a).has(SES)).toBe(false);
+  });
+});
+
+// ── 6c-4b-2b: the switch and the table ───────────────────────────────────────
+
+const casinoOf = (p: Page) => p.doc.getMap<unknown>('casino');
+const layoutOf = (p: Page) => p.doc.getMap<unknown>('furniture');
+/** The table's switch, and the game's name in it as every page writes it. */
+const SWITCH = `cfg:computed:${TABLE}`;
+const ON = { v: 1, inc: G.inc };
+/** The table as the room's layout holds it (furnitureDoc FurnitureRecord), and as it stands once moved. */
+const PLACED = { kind: 'roulette-table', x: 2, z: -3, rot: 1, movable: true };
+const MOVED = { ...PLACED, x: 4, rot: 2 };
+const place = (p: Page, value: unknown = PLACED): void => p.doc.transact(() => { layoutOf(p).set(TABLE, value); });
+const takeOut = (p: Page): void => p.doc.transact(() => { layoutOf(p).delete(TABLE); });
+const switchTo = (p: Page, value: unknown): void => p.doc.transact(() => {
+  if (value === undefined) casinoOf(p).delete(SWITCH);
+  else casinoOf(p).set(SWITCH, value);
+});
+/** Page p puts the game's table back, by hand: whether it wrote. */
+const putTable = (p: Page): boolean => p.casino.putBackFairOnlyTable(TABLE, G.inc);
+/** The switch on the page kit's page-signed incarnation of the table. */
+const BESIDE = { v: 1, inc: PAGE_INC };
+/** A page-signed incarnation of the table, live (the doc holds its session, and nothing has ended it), named by the
+ *  switch in page p's doc: it waits beside the game the table plays. */
+const waitBeside = (p: Page): void => p.doc.transact(() => {
+  casinoOf(p).set(SWITCH, BESIDE);
+  top(p).set(`ses:${TABLE}:${PAGE_INC}:g`, new Y.Map());
+});
+/** The room's deed as the doc names it, the holder's key pinned as the players map shows it. */
+function deedTo(p: Page, who: TestIdentity): void {
+  p.doc.transact(() => {
+    p.doc.getMap('players').set(who.pid, { keyB64: who.pub, name: who.pid });
+    p.doc.getMap('roomInfo').set('owner', who.pid);
+  });
+}
+/** A game of its own that `who` opens at the table (its name binds their key; its house is H), in page p's doc. */
+function openBy(p: Page, who: TestIdentity, j: string) {
+  const name = { ...NAME, ok: who.pub, j };
+  const ctx = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, name) };
+  const body = { v: 1, ok: who.pub, j, rv: name.rv, ts: name.ts, b: 'g', u: 0, l: NO_CLOSE, n: {}, dl: delegation(who, H.pub, PAGE_ROOM), k: who.pub };
+  const rec = sealCk(ctx, body as unknown as Omit<CkRec, 'g'>, who.sign);
+  p.doc.transact(() => {
+    top(p).set(rec.key, rec.value);
+    top(p).set(`ses:${TABLE}:${ctx.inc}:${nextSid3(ctx, rec.value)}`, new Y.Map());
+  });
+  return { ctx, root: rec };
+}
+
+describe('the switch of the table a game is played at, put back on that game', () => {
+  it('a switch gone, junk, with a field too many, or naming a game nothing opened or a page-signed incarnation the doc holds nothing of is one more thing the doc lacks: the table plays the game all the same, and the switch goes back with the records in one write', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(lacks(a)).toEqual([]);
+    const made = faironlyInc('p', PAGE_ROOM, TABLE, { ...NAME, j: 'fedcba9876543210' });
+    for (const wrong of [undefined, 'junk', { ...ON, at: 5 }, { v: 1, inc: made }, { v: 1, inc: PAGE_INC }]) {
+      switchTo(a, wrong);
+      expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+      expect(lacks(a)).toMatchObject([{ missing: 1, tableMissing: false, sessionMissing: false }]);
+      expect(putBack(a)).toBe(1);
+      expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+      expect(lacks(a)).toEqual([]);
+      expect(putBack(a)).toBe(0);
+    }
+    // with the base gone as well: both in one write
+    a.doc.transact(() => {
+      casinoOf(a).delete(SWITCH);
+      top(a).delete(root.key);
+    });
+    expect(lacks(a)).toMatchObject([{ missing: 2 }]);
+    expect(updatesOf(a, () => expect(putBack(a)).toBe(2))).toHaveLength(1);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(top(a).get(root.key)).toEqual(root.value);
+  });
+
+  it('is not written over the name of a page-signed incarnation the doc holds that nothing has ended, which waits beside the game: the switch is the game\'s to put back once that incarnation has ended, and not while its end is taken away again', async () => {
+    const [a] = await gameRoom(['A']);
+    // a page-signed incarnation of the table, live, holds the switch: the game is played, and the doc lacks nothing of it
+    waitBeside(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(a.casino.switchedPageSignedInc(TABLE)).toBe(PAGE_INC);
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+    expect(casinoOf(a).get(SWITCH)).toEqual(BESIDE);
+    // (a record of the game gone goes back alone, and the switch stays as it is)
+    del(a, root.key);
+    expect(lacks(a)).toMatchObject([{ missing: 1 }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(root.key)).toEqual(root.value);
+    expect(casinoOf(a).get(SWITCH)).toEqual(BESIDE);
+    expect(lacks(a)).toEqual([]);
+    // the incarnation ends with the switch still on it (a mark, as a removal writes one): the game is counted again
+    const mark = `gone:${TABLE}:${PAGE_INC}`;
+    a.doc.transact(() => { casinoOf(a).set(mark, 1); });
+    expect(a.casino.switchedPageSignedInc(TABLE)).toBeNull();
+    expect(lacks(a)).toMatchObject([{ missing: 1 }]);
+    // (the mark taken away again: the incarnation stands, and the switch is its own once more)
+    a.doc.transact(() => { casinoOf(a).delete(mark); });
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+    a.doc.transact(() => { casinoOf(a).set(mark, 1); });
+    expect(putBack(a)).toBe(1);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('so the table is that incarnation\'s again the moment the game ends, on a page that never ran it as on any other: no page wrote the switch meanwhile', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    waitBeside(a);
+    sync(T0, a, b);
+    const writes = writesOf([a, b], casinoOf, SWITCH);
+    const T = run([a, b], T0 + STEP, T0 + 5_000);
+    expect(writes).toEqual([]);
+    for (const p of [a, b]) {
+      expect(p.casino.computedIncOf(TABLE)).toBe(G.inc);
+      expect(casinoOf(p).get(SWITCH)).toEqual(BESIDE);
+    }
+    endGame(a);
+    sync(T, a, b);
+    for (const p of [a, b]) expect(p.casino.computedIncOf(TABLE)).toBe(PAGE_INC);
+  });
+
+  it('goes back on the game the table plays and no other: of two live games the one the switch named, and once the deed holder holds the other, that one', async () => {
+    const [a] = await gameRoom(['A']);
+    const other = openBy(a, stranger, 'fedcba9876543210');
+    const theirs = (p: Page) => p.casino.computedFairOnlyRecoveries().filter((r) => r.inc === other.ctx.inc);
+    const ours = (p: Page) => p.casino.computedFairOnlyRecoveries().filter((r) => r.inc === G.inc);
+    // (no deed holder: the switch's hint says which)
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(lacks(a)).toEqual([]);
+    // the deed is the stranger's: the table plays their game, and the switch goes to it
+    deedTo(a, stranger);
+    expect(a.casino.computedIncOf(TABLE)).toBe(other.ctx.inc);
+    expect(theirs(a)).toMatchObject([{ missing: 1 }]);
+    expect(ours(a)).toEqual([]);
+    expect(a.casino.putBackFairOnlyRecords(TABLE, G.inc)).toBe(0);
+    expect(a.casino.putBackFairOnlyRecords(TABLE, other.ctx.inc)).toBe(1);
+    expect(casinoOf(a).get(SWITCH)).toEqual({ v: 1, inc: other.ctx.inc });
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('the game a table leaves is counted again at the move, as the one it comes to is: the switch it lacked it lacks no more from that moment, a lack ended like any other, and it lacks it anew when the table plays it again', async () => {
+    const [a] = await gameRoom(['A']);
+    // the switch on a name nothing has opened: the table plays the owner's game, which lacks the switch
+    const j = 'fedcba9876543210';
+    const named = faironlyInc('p', PAGE_ROOM, TABLE, { ...NAME, ok: stranger.pub, j });
+    switchTo(a, { v: 1, inc: named });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(lacks(a)).toMatchObject([{ inc: G.inc, missing: 1, returns: 0 }]);
+    // the stranger opens the game of that name: the table plays it, as the switch says, with no write to the switch
+    // nor to a record of the owner's game, which lacks nothing from then
+    const other = openBy(a, stranger, j);
+    expect(other.ctx.inc).toBe(named);
+    expect(a.casino.computedIncOf(TABLE)).toBe(named);
+    expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(1);
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+    // the deed is the owner's: the table plays the owner's game again, which lacks the switch anew
+    deedTo(a, owner);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(lacks(a)).toMatchObject([{ inc: G.inc, missing: 1, returns: 1 }]);
+    expect(a.casino.putBackFairOnlyRecords(TABLE, named)).toBe(0);
+    expect(putBack(a)).toBe(1);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(2);
+    expect(a.casino.computedFairOnlyReturns(TABLE, named)).toBe(0);
+  });
+
+  it('not for a game that ended, nor for one whose end order stands no less than before: the switch of an ended game is no one\'s to put back', async () => {
+    const [a] = await gameRoom(['A']);
+    endGame(a);
+    expect(res(a).live).toBe(false);
+    switchTo(a, undefined);
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+    expect(casinoOf(a).has(SWITCH)).toBe(false);
+  });
+
+  it('a switch that comes back counts as a put-back, whoever wrote it', async () => {
+    const [a] = await gameRoom(['A']);
+    switchTo(a, undefined);
+    expect(lacks(a)).toMatchObject([{ missing: 1, returns: 0 }]);
+    switchTo(a, ON);
+    expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(1);
+    switchTo(a, 'junk');
+    expect(putBack(a)).toBe(1);
+    expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(2);
+  });
+});
+
+describe('the table a game is played at, put back into the room', () => {
+  it('reads a casino table\'s placement as the room\'s layout does, and nothing else as one', async () => {
+    const [a] = await gameRoom(['A']);
+    const { isFurnitureRecord } = await import('./furnitureDoc');
+    const game = a.casino.tableRecordGame;
+    expect(game(PLACED)).toBe('roulette');
+    expect(game({ ...PLACED, kind: 'craps-table' })).toBe('craps');
+    expect(game({ ...PLACED, mountParent: 'wall-1' })).toBe('roulette');
+    // (turned any of the four ways)
+    for (const rot of [0, 1, 2, 3]) {
+      expect(game({ ...PLACED, rot })).toBe('roulette');
+      expect(isFurnitureRecord({ ...PLACED, rot })).toBe(true);
+    }
+    for (const bad of [
+      undefined, null, 'roulette-table', [PLACED], {}, { ...PLACED, kind: 'sofa' }, { ...PLACED, kind: 'no-such-thing' },
+      { ...PLACED, x: '2' }, { ...PLACED, x: Number.NaN }, { ...PLACED, z: Number.POSITIVE_INFINITY }, { ...PLACED, rot: 4 }, { ...PLACED, rot: 1.5 },
+      { ...PLACED, movable: 1 }, { ...PLACED, mountParent: 7 },
+    ]) expect(game(bad)).toBeNull();
+    // what it reads as a table, the layout reads as furniture
+    for (const good of [PLACED, MOVED, { ...PLACED, kind: 'craps-table' }, { ...PLACED, mountParent: 'wall-1' }]) expect(isFurnitureRecord(good)).toBe(true);
+  });
+
+  it('a table taken out of the layout while its game is live is listed, and put back as it last stood with the switch, in one write; a table the page never saw placed is not', async () => {
+    const [a] = await gameRoom(['A']);
+    // never placed: nothing is out
+    expect(lacks(a)).toEqual([]);
+    expect(putTable(a)).toBe(false);
+    place(a);
+    expect(lacks(a)).toEqual([]);
+    // moved: held where it stands now
+    place(a, MOVED);
+    // the removal, as a page that hears it makes it: the table out, and the teardown takes the switch
+    takeOut(a);
+    switchTo(a, undefined);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    // (the switch is not listed alone: it goes back with the table)
+    expect(lacks(a)).toMatchObject([{ missing: 0, tableMissing: true, tableMoves: 3 }]);
+    expect(putBack(a)).toBe(0);
+    expect(updatesOf(a, () => expect(putTable(a)).toBe(true))).toHaveLength(1);
+    expect(layoutOf(a).get(TABLE)).toEqual(MOVED);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(lacks(a)).toEqual([]);
+    expect(putTable(a)).toBe(false);
+    expect(a.casino.computedFairOnlyReturns(TABLE, G.inc)).toBe(1);
+  });
+
+  it('junk under the table\'s id, other furniture, or a table of the other game is no table of the game: it is out, and put back over them as it last stood, the switch that names the game left unwritten', async () => {
+    // (a table of the other game under the id is none the page saw placed of the game's: there, or taken out, nothing is out)
+    const [never] = await gameRoom(['N']);
+    place(never, { ...PLACED, kind: 'craps-table', x: 9 });
+    expect(lacks(never)).toEqual([]);
+    expect(putTable(never)).toBe(false);
+    takeOut(never);
+    expect(lacks(never)).toEqual([]);
+    expect(putTable(never)).toBe(false);
+    expect(layoutOf(never).has(TABLE)).toBe(false);
+    // a page that saw the game's table placed, and then each of these over it
+    const [a] = await gameRoom(['A']);
+    place(a);
+    const switched = writesOf([a], casinoOf, SWITCH);
+    for (const over of ['junk', { ...PLACED, kind: 'sofa' }, { ...PLACED, rot: 9 }, { ...PLACED, kind: 'craps-table', x: 9 }]) {
+      place(a, over);
+      expect(lacks(a)).toMatchObject([{ tableMissing: true }]);
+      expect(putTable(a)).toBe(true);
+      expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    }
+    // (a table of the other game written under the id and then taken out leaves the game's own held)
+    place(a, { ...PLACED, kind: 'craps-table', x: 9 });
+    takeOut(a);
+    expect(putTable(a)).toBe(true);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    // (the switch named the game all along: the table went back alone each time)
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(switched).toEqual([]);
+  });
+
+  it('not while an end order stands: the game\'s holder takes the table out by ending the game, and neither the table nor the switch goes back', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    const fin = sealFin(G, owner.pub, owner.sign);
+    set(a, fin.key, fin.value);
+    expect(res(a)).toMatchObject({ live: true, fin: { k: owner.pub } });
+    takeOut(a);
+    switchTo(a, undefined);
+    expect(lacks(a)).toEqual([]);
+    expect(putTable(a)).toBe(false);
+    expect(putBack(a)).toBe(0);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    expect(casinoOf(a).has(SWITCH)).toBe(false);
+  });
+
+  it('not of a game the table does not play, nor of one that ended', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    const other = openBy(a, stranger, 'fedcba9876543210');
+    takeOut(a);
+    // (the table plays the owner's game: the switch names it)
+    expect(lacks(a).map((r) => [r.inc, r.tableMissing])).toEqual([[G.inc, true]]);
+    expect(a.casino.putBackFairOnlyTable(TABLE, other.ctx.inc)).toBe(false);
+    endGame(a);
+    // (the other game is the only live one now: the table plays it, and it is its table that is out)
+    expect(a.casino.computedIncOf(TABLE)).toBe(other.ctx.inc);
+    expect(putTable(a)).toBe(false);
+    expect(lacks(a).map((r) => [r.inc, r.tableMissing])).toEqual([[other.ctx.inc, true]]);
+    expect(a.casino.putBackFairOnlyTable(TABLE, other.ctx.inc)).toBe(true);
+    expect(casinoOf(a).get(SWITCH)).toEqual({ v: 1, inc: other.ctx.inc });
+  });
+
+  it('the removal\'s own teardown takes the switch and nothing of the game: its bets stand, and the table and the switch go back together', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(foldOf(a).felts.has(a.pid)).toBe(true);
+    // the table is taken out, and the page that hears of it tears the table down (world.ts: croupier closeTable)
+    takeOut(a);
+    a.croupier.closeTable(TABLE, 'heard');
+    expect(casinoOf(a).has(SWITCH)).toBe(false);
+    expect(res(a)).toMatchObject({ live: true, base: { key: root.key } });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(foldOf(a).felts.has(a.pid)).toBe(true);
+    expect(lacks(a)).toMatchObject([{ missing: 0, tableMissing: true, sessionMissing: false }]);
+    expect(putTable(a)).toBe(true);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+    expect(foldOf(a).felts.has(a.pid)).toBe(true);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('goes back alone under a switch that names a page-signed incarnation nothing has ended: that name is left as the switch\'s own put-back leaves it', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    waitBeside(a);
+    takeOut(a);
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(lacks(a)).toMatchObject([{ missing: 0, tableMissing: true }]);
+    expect(updatesOf(a, () => expect(putTable(a)).toBe(true))).toHaveLength(1);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    expect(casinoOf(a).get(SWITCH)).toEqual(BESIDE);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('not while the check of an end order waits: the game is live as far as it is checked and its table is listed out, but nothing goes back while the order may stand, and nothing once it does', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    takeOut(a);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true }]);
+    // no check can run, and the owner's end order comes: what the page checked of the game stands, the order waits
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    const fin = sealFin(G, owner.pub, owner.sign);
+    set(a, fin.key, fin.value);
+    expect(res(a)).toMatchObject({ pending: true, live: true, base: { key: root.key }, fin: null });
+    expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true }]);
+    expect(putTable(a)).toBe(false);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    // checks run again: the order stands, and the table is its holder's to take out
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+    set(a, delegationKey(third.pub), delegation(owner, third.pub, PAGE_ROOM));
+    expect(res(a)).toMatchObject({ pending: false, live: true, fin: { k: owner.pub } });
+    expect(lacks(a)).toEqual([]);
+    expect(putTable(a)).toBe(false);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+  });
+
+  it('not on a doc that holds part of an update, nor into one that was destroyed', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    place(a);
+    sync(T0, a, b);
+    // a doc that holds part of an update
+    const [first, second] = updatesOf(b, () => {
+      set(b, 'x:1', 1);
+      set(b, 'x:2', 2);
+    });
+    takeOut(a);
+    deliver(T0, a, [second]);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true }]);
+    expect(putTable(a)).toBe(false);
+    deliver(T0, a, [first]);
+    expect(putTable(a)).toBe(true);
+    // a doc that was destroyed
+    takeOut(a);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true }]);
+    const layout = layoutOf(a);
+    a.doc.destroy();
+    expect(putTable(a)).toBe(false);
+    expect(layout.has(TABLE)).toBe(false);
+  });
+
+  it('not of a name the switch holds that nothing opened: a game whose root fails its check is no game the table plays, and no table of it is out', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    // a root under the stranger's name signed by another key: the page tracks the name, and counts no game from it
+    const name = { ...NAME, ok: stranger.pub, j: 'fedcba9876543210' };
+    const ctx = { room: PAGE_ROOM, t: TABLE, inc: faironlyInc('p', PAGE_ROOM, TABLE, name) };
+    const body = { v: 1, ok: stranger.pub, j: name.j, rv: name.rv, ts: name.ts, b: 'g', u: 0, l: NO_CLOSE, n: {}, dl: delegation(stranger, H.pub, PAGE_ROOM), k: stranger.pub };
+    const forged = sealCk(ctx, body as unknown as Omit<CkRec, 'g'>, third.sign);
+    a.doc.transact(() => {
+      top(a).set(forged.key, forged.value);
+      top(a).set(`ses:${TABLE}:${ctx.inc}:${nextSid3(ctx, forged.value)}`, new Y.Map());
+    });
+    expect(a.casino.computedResolutionOf(TABLE, ctx.inc)).toMatchObject({ live: false, pending: false, base: null, fin: null });
+    // the owner's game ends, and the switch is left on the forged name: S9 names it where nothing is open
+    endGame(a);
+    switchTo(a, { v: 1, inc: ctx.inc });
+    expect(a.casino.computedIncOf(TABLE)).toBe(ctx.inc);
+    takeOut(a);
+    expect(lacks(a)).toEqual([]);
+    expect(a.casino.putBackFairOnlyTable(TABLE, ctx.inc)).toBe(false);
+    expect(a.casino.putBackFairOnlyRecords(TABLE, ctx.inc)).toBe(0);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+  });
+
+  it('a doc bound again holds the table as the layout has it then: one taken out before is not out, and nothing is put back; one that stands there is held from the binding on, and the layout\'s changes are counted from it', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    takeOut(a);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true, tableMoves: 2 }]);
+    rebind(a);
+    expect(res(a)).toMatchObject({ live: true });
+    expect(a.casino.computedFairOnlyRecoveries().filter((r) => r.tableMissing)).toEqual([]);
+    expect(putTable(a)).toBe(false);
+    // placed and taken out again on this binding: out (two changes of the layout under it), and put back
+    place(a, MOVED);
+    takeOut(a);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true, tableMoves: 2 }]);
+    expect(putTable(a)).toBe(true);
+    expect(layoutOf(a).get(TABLE)).toEqual(MOVED);
+    // bound once more with the table standing: the page holds it as the layout has it, with no change of the layout to tell it
+    rebind(a);
+    takeOut(a);
+    expect(lacks(a)).toMatchObject([{ tableMissing: true, tableMoves: 1 }]);
+    expect(putTable(a)).toBe(true);
+    expect(layoutOf(a).get(TABLE)).toEqual(MOVED);
+  });
+
+  it('a table that stood under an id and went before a game of it was there is none the page saw placed: nothing is out, and the layout\'s changes are counted from the game\'s coming', async () => {
+    const [a] = await gameRoom(['A']);
+    const at2 = (): ReturnType<typeof lacks> => lacks(a).filter((r) => r.t === T2);
+    const place2 = (value?: unknown): void => a.doc.transact(() => {
+      if (value === undefined) layoutOf(a).delete(T2);
+      else layoutOf(a).set(T2, value);
+    });
+    // another table of the room is placed and taken out, and then a game opens at it
+    place2(PLACED);
+    place2();
+    const root2 = rootOf(G2, 'p', { dl: delegation(owner, H.pub, PAGE_ROOM) });
+    a.doc.transact(() => {
+      top(a).set(root2.key, root2.value);
+      top(a).set(`ses:${T2}:${G2.inc}:${nextSid3(G2, root2.value)}`, new Y.Map());
+      casinoOf(a).set(`cfg:computed:${T2}`, { v: 1, inc: G2.inc });
+    });
+    expect(a.casino.computedIncOf(T2)).toBe(G2.inc);
+    expect(a.casino.computedResolutionOf(T2, G2.inc)).toMatchObject({ live: true, pending: false, fin: null });
+    expect(at2()).toEqual([]);
+    expect(a.casino.putBackFairOnlyTable(T2, G2.inc)).toBe(false);
+    expect(layoutOf(a).has(T2)).toBe(false);
+    // placed and taken out with the game there: out, two changes counted, and put back
+    place2(PLACED);
+    place2();
+    expect(at2()).toMatchObject([{ tableMissing: true, tableMoves: 2 }]);
+    expect(a.casino.putBackFairOnlyTable(T2, G2.inc)).toBe(true);
+    expect(layoutOf(a).get(T2)).toEqual(PLACED);
+    // (the first table's game lacks nothing through all of it)
+    expect(lacks(a)).toEqual([]);
+  });
+});
+
+/** A frame of page p as World draws one: the tick is passed the table while the room's layout holds it on that page
+ *  (a table never placed is one of a room that seeds its tables: passed always). */
+function roomFrame(T: number, p: Page, placed = true): void {
+  frame(T, p, !placed || layoutOf(p).has(TABLE) ? [TABLE] : []);
+}
+/** …of page p alone, every STEP from `from` to `to` (inclusive), `peer(T)` acting first in each. Returns `to` + STEP. */
+function roomFrames(p: Page, from: number, to: number, peer?: (T: number) => void): number {
+  let T = from;
+  for (; T <= to; T += STEP) {
+    NOW = T;
+    clockOf(p, T);
+    peer?.(T);
+    roomFrame(T, p);
+  }
+  return T;
+}
+/** …of `pages`, each handed the others' writes before and after its frame, as run() hands them. */
+function roomRun(pages: Page[], from: number, to: number): number {
+  let T = from;
+  for (; T <= to; T += STEP) {
+    NOW = T;
+    beating.forEach((b) => b.each(T));
+    sync(T, ...pages);
+    for (const p of pages) roomFrame(T, p);
+    sync(T, ...pages);
+  }
+  return T;
+}
+/** A removal of the table as a page that hears it makes it, in page p's doc: the table out of the layout, and its
+ *  switch taken by the teardown (croupier closeTable, clearTableKeys). */
+const remove = (p: Page): void => p.doc.transact(() => {
+  layoutOf(p).delete(TABLE);
+  casinoOf(p).delete(SWITCH);
+});
+/** The writes of `key` in `map` that `pages` make from here on (putBacksOf, for any map of the doc). */
+function writesOf(pages: Page[], map: (p: Page) => Y.Map<unknown>, key: string): { by: string; at: number }[] {
+  const out: { by: string; at: number }[] = [];
+  for (const p of pages) {
+    p.doc.on('afterTransaction', (tr: Y.Transaction) => {
+      if (tr.local && tr.changed.get(map(p) as never)?.has(key) && map(p).has(key)) out.push({ by: p.pid, at: NOW });
+    });
+  }
+  return out;
+}
+
+describe('the put-back duty, at the switch and the table', () => {
+  it('the switch goes back at once, in turn, as a record does: the first page writes it at its next frame, and a page handed the write writes nothing', async () => {
+    const [a, b, c] = await gameRoom(['A', 'B', 'C']);
+    bet(a, b);
+    let T = run([a, b, c], T0 + STEP, T0 + 2 * STEP);
+    switchTo(c, undefined);
+    sync(T, a, b, c);
+    const wrote = writesOf([a, b, c], casinoOf, SWITCH);
+    const at0 = T;
+    T = run([a, b, c], T, T + 25_000);
+    for (const p of [a, b, c]) expect(casinoOf(p).get(SWITCH)).toEqual(ON);
+    expect(wrote.map((w) => w.at)).toEqual([at0]);
+    expect(dutyRank('restore', G, 0, [a, b].find((p) => p.pid === wrote[0].by)!.pub)).toBe([a, b].map((p) => dutyRank('restore', G, 0, p.pub)).sort()[0]);
+  });
+
+  it('a table taken out is put back OPEN_WAIT_MS on, in the turns of the records after that, with the switch: each page on its own, the first then and the next STAGGER_MS on', async () => {
+    const [a, b] = await gameRoom(['A', 'B']);
+    place(a);
+    bet(a, b);
+    let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
+    clockOf(a, T);
+    remove(a);
+    sync(T, a, b);
+    const [first, second] = before('restore', 0, a, b) ? [a, b] : [b, a];
+    const { STAGGER_MS, OPEN_WAIT_MS } = a.table;
+    const at0 = T;
+    const backAt = new Map<Page, number>();
+    for (; T <= at0 + OPEN_WAIT_MS + 2 * STAGGER_MS; T += STEP) {
+      for (const p of [a, b]) {
+        roomFrame(T, p);
+        if (layoutOf(p).has(TABLE) && !backAt.has(p)) {
+          backAt.set(p, T - at0);
+          // (the switch came in the same write)
+          expect(casinoOf(p).get(SWITCH)).toEqual(ON);
+        }
+      }
+    }
+    expect(backAt.get(first)).toBe(OPEN_WAIT_MS);
+    expect(backAt.get(second)).toBe(framed(OPEN_WAIT_MS + STAGGER_MS));
+    for (const p of [a, b]) expect(layoutOf(p).get(TABLE)).toEqual(PLACED);
+  });
+
+  it('a page that is handed the first one\'s put-back of the table writes nothing, and a page with no felt would come OUTSIDER_WAIT_MS after the places', async () => {
+    const [a, b, c] = await gameRoom(['A', 'B', 'C']);
+    place(a);
+    bet(a, b);
+    let T = run([a, b, c], T0 + STEP, T0 + 2 * STEP);
+    clockOf(c, T);
+    remove(c);
+    sync(T, a, b, c);
+    const wrote = writesOf([a, b, c], layoutOf, TABLE);
+    const { OPEN_WAIT_MS, OUTSIDER_WAIT_MS, STAGGER_MS } = a.table;
+    const at0 = T;
+    T = roomRun([a, b, c], T, T + 30_000);
+    expect(wrote.map((w) => w.at - at0)).toEqual([OPEN_WAIT_MS]);
+    expect(dutyRank('restore', G, 0, [a, b].find((p) => p.pid === wrote[0].by)!.pub)).toBe([a, b].map((p) => dutyRank('restore', G, 0, p.pub)).sort()[0]);
+    // taken out again, with the page that has no felt alone to hear of it
+    clockOf(c, T);
+    remove(c);
+    const at1 = T;
+    T = roomFrames(c, T, at1 + OPEN_WAIT_MS + 2 * STAGGER_MS + OUTSIDER_WAIT_MS - STEP);
+    expect(layoutOf(c).has(TABLE)).toBe(false);
+    roomFrames(c, T, at1 + OPEN_WAIT_MS + 2 * STAGGER_MS + OUTSIDER_WAIT_MS);
+    expect(layoutOf(c).get(TABLE)).toEqual(PLACED);
+  });
+
+  it('the records of a game whose table is out go back at once all the same; the switch waits for the table, which comes JUNK_GAP_MS after a put-back of the records at the earliest', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, JUNK_GAP_MS } = a.table;
+    clockOf(a, T);
+    remove(a);
+    del(a, root.key);
+    const t0 = T;
+    T = roomFrames(a, T, T);
+    expect(top(a).get(root.key)).toEqual(root.value);
+    expect(casinoOf(a).has(SWITCH)).toBe(false);
+    // the base is deleted again two frames before the table's turn: it goes back then, and the table a gap after it
+    T = roomFrames(a, T, t0 + OPEN_WAIT_MS - 3 * STEP);
+    del(a, root.key);
+    const again = T;
+    T = roomFrames(a, T, T);
+    expect(top(a).get(root.key)).toEqual(root.value);
+    T = roomFrames(a, T, again + JUNK_GAP_MS - STEP);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    expect(casinoOf(a).has(SWITCH)).toBe(false);
+    roomFrames(a, T, again + JUNK_GAP_MS);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+  });
+
+  it('a page that does not hear the room puts no table back until it has heard the room for OPEN_WAIT_MS: the end of the game may be on its way', async () => {
+    const [a] = await gameRoom(['A'], { hears: true });
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS } = a.table;
+    clockOf(a, T);
+    remove(a);
+    T = roomFrames(a, T, T + 2 * OPEN_WAIT_MS);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    const heardFrom = T;
+    const hears = (now: number): void => a.table.noteRoomHeard(clockOf(a, now));
+    T = roomFrames(a, T, heardFrom + OPEN_WAIT_MS - STEP, hears);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    roomFrames(a, T, heardFrom + OPEN_WAIT_MS, hears);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+  });
+
+  it('a table that came back and went again is waited for anew, from when it went again: between two looks of the page, or with a look that found it there', async () => {
+    for (const looked of [false, true]) {
+      const [a] = await gameRoom(['A']);
+      place(a);
+      expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+      let T = run([a], T0 + STEP, T0 + 2 * STEP);
+      const { OPEN_WAIT_MS } = a.table;
+      clockOf(a, T);
+      remove(a);
+      const t0 = T;
+      T = roomFrames(a, T, t0 + 3_000 - STEP);
+      // a peer puts it back, and it is taken out again
+      place(a);
+      if (looked) {
+        // (the look finds the table there with no switch, and writes the switch at once: nothing lacks after it)
+        T = roomFrames(a, T, T);
+        expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+        expect(lacks(a)).toEqual([]);
+      }
+      takeOut(a);
+      const t1 = T;
+      T = roomFrames(a, T, t1 + OPEN_WAIT_MS - STEP);
+      expect(layoutOf(a).has(TABLE), `looked ${looked}`).toBe(false);
+      roomFrames(a, T, t1 + OPEN_WAIT_MS);
+      expect(layoutOf(a).get(TABLE), `looked ${looked}`).toEqual(PLACED);
+    }
+  });
+
+  it('a table whose game was not the one played for a while is waited for anew, from when the table plays the game again: with a look that found the game whole meanwhile, or one that found it lacking a record', async () => {
+    for (const lacking of [false, true]) {
+      const [a] = await gameRoom(['A']);
+      place(a);
+      const other = openBy(a, stranger, 'fedcba9876543210');
+      expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+      let T = run([a], T0 + STEP, T0 + 2 * STEP);
+      const { OPEN_WAIT_MS, JUNK_GAP_MS } = a.table;
+      // the base, deleted once and put back: a put-back of late keeps the game in mind while it is found whole
+      clockOf(a, T);
+      del(a, root.key);
+      const wrote = T;
+      T = roomFrames(a, T, T);
+      expect(top(a).get(root.key)).toEqual(root.value);
+      // (lacking: deleted again at once, the base stays out until the page's gap is over)
+      if (lacking) del(a, root.key);
+      takeOut(a);
+      T = roomFrames(a, T, T);
+      expect(lacks(a).filter((r) => r.inc === G.inc).map((r) => [r.missing, r.tableMissing])).toEqual([[lacking ? 1 : 0, true]]);
+      // the table plays the other game for a look (the switch names it), then this one again
+      switchTo(a, { v: 1, inc: other.ctx.inc });
+      T = roomFrames(a, T, T);
+      expect(a.casino.computedIncOf(TABLE)).toBe(other.ctx.inc);
+      expect(lacks(a).filter((r) => r.inc === G.inc).map((r) => [r.missing, r.tableMissing])).toEqual(lacking ? [[1, false]] : []);
+      switchTo(a, ON);
+      expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+      const t1 = T;
+      T = roomFrames(a, T, t1 + OPEN_WAIT_MS - STEP);
+      expect(layoutOf(a).has(TABLE), `lacking ${lacking}`).toBe(false);
+      // (the base went back when the gap was over, long before)
+      expect(top(a).get(root.key)).toEqual(root.value);
+      expect(wrote + JUNK_GAP_MS).toBeLessThan(t1 + OPEN_WAIT_MS - JUNK_GAP_MS);
+      roomFrames(a, T, t1 + OPEN_WAIT_MS);
+      expect(layoutOf(a).get(TABLE), `lacking ${lacking}`).toEqual(PLACED);
+    }
+  });
+
+  it('a table taken out each time it is put back: after CONTESTED_COUNT put-backs that did not last the page stands down from the table as from the records, says so, and puts it back once more when the stand-down is over', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote: number[] = [];
+    /** A peer removes the table whenever it is there; the page's frames, to `to`. */
+    const loop = (to: number): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (layoutOf(a).has(TABLE)) remove(a);
+        roomFrame(T, a);
+        if (layoutOf(a).has(TABLE)) wrote.push(T);
+      }
+    };
+    const t1 = T;
+    loop(t1 + 30_000);
+    // (each wait is from the frame that found it out again: a frame after the put-back)
+    expect(wrote.map((w) => w - t1)).toEqual([OPEN_WAIT_MS, 2 * OPEN_WAIT_MS + STEP, 3 * OPEN_WAIT_MS + 2 * STEP]);
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(true);
+    const stoodAt = t1 + 3 * OPEN_WAIT_MS + 3 * STEP;
+    loop(stoodAt + KEEP_BACKOFF_MS - STEP);
+    expect(wrote).toHaveLength(3);
+    loop(stoodAt + KEEP_BACKOFF_MS);
+    expect(wrote).toHaveLength(4);
+  });
+
+  it('one stand-down for all a page puts back of a game: a record deleted while the page stands down from the table stays out until the stand-down is over, goes back then, and the table JUNK_GAP_MS after it', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, KEEP_BACKOFF_MS, JUNK_GAP_MS } = a.table;
+    /** A peer removes the table whenever it is there, until `quiet`; the page's frames, to `to`. */
+    let quiet = false;
+    const loop = (to: number): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (!quiet && layoutOf(a).has(TABLE)) remove(a);
+        roomFrame(T, a);
+      }
+    };
+    const stoodAt = T + 3 * OPEN_WAIT_MS + 3 * STEP;
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    loop(stoodAt + 10_000);
+    expect(a.table.computedContested(TABLE, clockOf(a, T - STEP))).toBe(true);
+    clockOf(a, T);
+    del(a, root.key);
+    quiet = true;
+    loop(end - STEP);
+    expect(top(a).has(root.key)).toBe(false);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    loop(end);
+    expect(top(a).get(root.key)).toEqual(root.value);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    loop(end + JUNK_GAP_MS - STEP);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    loop(end + JUNK_GAP_MS);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+  });
+
+  it('the table\'s turns after a stand-down are from its end: each page on its own, the first puts it back then and the next STAGGER_MS on', async () => {
+    const [a, b] = await pagesWhere((x, y) => before('restore', 0, x, y));
+    place(a);
+    bet(a, b);
+    let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, KEEP_BACKOFF_MS, STAGGER_MS } = a.table;
+    const wrote = writesOf([a, b], layoutOf, TABLE);
+    /** A peer removes the table whenever it is there, and the pages' frames, each handed the other's writes before and
+     *  after; `apart`: nothing is removed, and nothing handed on. Then the next step, to `to`. */
+    const steps = (to: number, apart = false): void => {
+      for (; T <= to; T += STEP) {
+        NOW = T;
+        if (!apart && layoutOf(a).has(TABLE)) {
+          clockOf(a, T);
+          remove(a);
+        }
+        if (!apart) sync(T, a, b);
+        roomFrame(T, a);
+        roomFrame(T, b);
+        if (!apart) sync(T, a, b);
+      }
+    };
+    const t1 = T;
+    const stoodAt = t1 + 3 * OPEN_WAIT_MS + 3 * STEP;
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    steps(end - STEP);
+    expect(wrote.map((w) => [w.by, w.at - t1])).toEqual([[a.pid, OPEN_WAIT_MS], [a.pid, 2 * OPEN_WAIT_MS + STEP], [a.pid, 3 * OPEN_WAIT_MS + 2 * STEP]]);
+    for (const p of [a, b]) expect(p.table.computedContested(TABLE, clockOf(p, end - STEP)), p.pid).toBe(true);
+    steps(end + 2 * STAGGER_MS, true);
+    expect(wrote.slice(3).map((w) => [w.by, w.at - end])).toEqual([[a.pid, 0], [b.pid, framed(STAGGER_MS)]]);
+  });
+
+  it('or from OPEN_WAIT_MS after the table went, if that is later: one that came back and went again in the stand-down\'s last seconds is waited for from then', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, KEEP_BACKOFF_MS } = a.table;
+    let quiet = false;
+    const loop = (to: number): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (!quiet && layoutOf(a).has(TABLE)) remove(a);
+        roomFrame(T, a);
+      }
+    };
+    const stoodAt = T + 3 * OPEN_WAIT_MS + 3 * STEP;
+    const end = stoodAt + KEEP_BACKOFF_MS;
+    loop(end - 2_000 - STEP);
+    expect(a.table.computedContested(TABLE, clockOf(a, T - STEP))).toBe(true);
+    // two seconds before the end a peer puts the table back and takes it out again, between two looks of the page
+    clockOf(a, T);
+    place(a);
+    takeOut(a);
+    const went = T;
+    quiet = true;
+    loop(went + OPEN_WAIT_MS - STEP);
+    expect(went + OPEN_WAIT_MS).toBe(end + 3_000);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+    loop(went + OPEN_WAIT_MS);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+  });
+
+  it('a switch deleted each time it is put back stands the page down as a record does: CONTESTED_COUNT put-backs JUNK_GAP_MS apart, then none for KEEP_BACKOFF_MS, and the table plays the game all the while', async () => {
+    const [a] = await gameRoom(['A']);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { JUNK_GAP_MS, KEEP_BACKOFF_MS } = a.table;
+    const wrote: number[] = [];
+    const loop = (to: number): void => {
+      for (; T <= to; T += STEP) {
+        clockOf(a, T);
+        if (casinoOf(a).has(SWITCH)) switchTo(a, undefined);
+        frame(T, a);
+        if (casinoOf(a).has(SWITCH)) wrote.push(T);
+        expect(a.casino.computedIncOf(TABLE)).toBe(G.inc);
+      }
+    };
+    const t1 = T;
+    loop(t1 + 10_000);
+    expect(wrote).toEqual([t1, t1 + JUNK_GAP_MS, t1 + 2 * JUNK_GAP_MS]);
+    expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(true);
+    const stoodAt = t1 + 2 * JUNK_GAP_MS + STEP;
+    loop(stoodAt + KEEP_BACKOFF_MS - STEP);
+    expect(wrote).toHaveLength(3);
+    loop(stoodAt + KEEP_BACKOFF_MS);
+    expect(wrote).toHaveLength(4);
+  });
+
+  it('a page that slept starts the wait for the table again once it is awake', async () => {
+    const [a, b] = await pagesWhere((x, y) => before('restore', 0, x, y));
+    place(a);
+    bet(a, b);
+    let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS } = a.table;
+    const { TABLE_LEASE_LAPSE_MS } = a.croupier;
+    clockOf(a, T);
+    remove(a);
+    roomFrame(T, a);
+    // asleep for longer than the wait: it wakes, waits a lapse out, and then the wait for the table
+    const woke = T + 10_000;
+    const awake = woke + TABLE_LEASE_LAPSE_MS;
+    let backAt: number | null = null;
+    for (T = woke; T <= awake + OPEN_WAIT_MS + STEP; T += STEP) {
+      roomFrame(T, a);
+      if (layoutOf(a).has(TABLE) && backAt === null) backAt = T - awake;
+    }
+    expect(backAt).toBe(framed(OPEN_WAIT_MS));
+  });
+
+  it('the table\'s turns are those of the round the game\'s base is at, as the records\' are', async () => {
+    // a round at which the turns at the records are not those of round 0
+    let u = 0;
+    const differs = (x: Page, y: Page): boolean => {
+      for (u = 1; u <= 40; u++) if (before('restore', u, x, y) !== before('restore', 0, x, y)) return true;
+      return false;
+    };
+    const [a, b] = await pagesWhere(differs);
+    // the house's checkpoint at that round, and the session it opens
+    const trim = trimOf(G, 'p', { b: SID, u, n: {}, h: kit.houseCommit(H, u + 1), dl: delegation(owner, H.pub, PAGE_ROOM) });
+    a.doc.transact(() => {
+      top(a).set(trim.key, trim.value);
+      top(a).delete(SES);
+      top(a).set(`ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`, new Y.Map());
+    });
+    place(a);
+    sync(T0, a, b);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], T0)).toBe('ok');
+    sync(T0, a, b);
+    let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
+    clockOf(a, T);
+    remove(a);
+    sync(T, a, b);
+    for (const p of [a, b]) expect(lacks(p)).toMatchObject([{ u, missing: 0, tableMissing: true, pubs: [a.pub, b.pub].sort() }]);
+    const { STAGGER_MS, OPEN_WAIT_MS } = a.table;
+    const at0 = T;
+    const backAt = new Map<Page, number>();
+    for (; T <= at0 + OPEN_WAIT_MS + 2 * STAGGER_MS; T += STEP) {
+      for (const p of [a, b]) {
+        roomFrame(T, p);
+        if (layoutOf(p).has(TABLE) && !backAt.has(p)) backAt.set(p, T - at0);
+      }
+    }
+    const [first, second] = before('restore', u, a, b) ? [a, b] : [b, a];
+    expect([first, second].map((p) => backAt.get(p))).toEqual([OPEN_WAIT_MS, framed(OPEN_WAIT_MS + STAGGER_MS)]);
+  });
+
+  it('a clock gone back a little, to before the wait for the table began, starts the wait from where it went back to', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS } = a.table;
+    clockOf(a, T);
+    remove(a);
+    // one look, at which the wait begins, and at the next the page's clock reads 800 ms earlier: before the wait began
+    const t0 = T;
+    T = roomFrames(a, T, t0);
+    a.skew = -800;
+    const stepped = T;
+    expect(clockOf(a, stepped)).toBeLessThan(t0);
+    let backAt: number | null = null;
+    for (; T <= stepped + OPEN_WAIT_MS + 2_000; T += STEP) {
+      NOW = T;
+      roomFrame(T, a);
+      expect(a.croupier.tablesAwake(clockOf(a, T))).toBe(true);
+      if (backAt === null && layoutOf(a).has(TABLE)) backAt = T - stepped;
+    }
+    expect(backAt).toBe(framed(OPEN_WAIT_MS));
+  });
+
+  it('a clock gone back a minute: the page\'s own last put-back of the game, stamped after now, holds the table back no longer than the wait for it', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS } = a.table;
+    // the base, deleted and put back: the page's last put-back of the game is stamped then
+    clockOf(a, T);
+    del(a, root.key);
+    T = roomFrames(a, T, T);
+    expect(top(a).get(root.key)).toEqual(root.value);
+    // its clock reads a minute earlier (a wake, whose lapse it waits out), and the table is taken out
+    a.skew = -60_000;
+    clockOf(a, T);
+    remove(a);
+    const awake = T + a.croupier.TABLE_LEASE_LAPSE_MS;
+    let backAt: number | null = null;
+    for (; T <= awake + OPEN_WAIT_MS + 2_000; T += STEP) {
+      NOW = T;
+      roomFrame(T, a);
+      if (backAt === null && layoutOf(a).has(TABLE)) backAt = T - awake;
+    }
+    expect(backAt).toBe(framed(OPEN_WAIT_MS));
+    expect(casinoOf(a).get(SWITCH)).toEqual(ON);
+  });
+
+  it('the page\'s put-back of the table counts for the gap as one of the records does: a record deleted right after it goes back JUNK_GAP_MS after the table did', async () => {
+    const [a] = await gameRoom(['A']);
+    place(a);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], T0)).toBe('ok');
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OPEN_WAIT_MS, JUNK_GAP_MS } = a.table;
+    const wrote = putBacksOf([a], root.key);
+    clockOf(a, T);
+    remove(a);
+    const t0 = T;
+    T = roomFrames(a, T, t0 + OPEN_WAIT_MS);
+    expect(layoutOf(a).get(TABLE)).toEqual(PLACED);
+    const t1 = t0 + OPEN_WAIT_MS;
+    // a peer deletes the base right then: it goes back a gap after the table, not at the page's next look
+    del(a, root.key);
+    roomFrames(a, T, t1 + 3 * JUNK_GAP_MS);
+    expect(wrote.map((w) => w.at - t1)).toEqual([JUNK_GAP_MS]);
+    expect(top(a).get(root.key)).toEqual(root.value);
   });
 });

@@ -681,9 +681,17 @@ describe('what the room does about a page-signed incarnation waiting beside a FA
     const { a } = await frozen();
     record(a, root);
     expect(a.casino.computedLiveTables()).toEqual([{ t: TABLE, inc: INC }]); // (the page-signed one: the game is nobody's to watch for the room)
+    // (the write that marks the incarnation takes the switch, as a removal's does)
+    let tookSwitch: boolean | null = null;
+    casinoOf(a).observe((e) => {
+      if (e.keysChanged.has(`gone:${TABLE}:${INC}`)) tookSwitch = e.keysChanged.has(`cfg:computed:${TABLE}`) && !casinoOf(a).has(`cfg:computed:${TABLE}`);
+    });
     tick(a, T0 + STEP, 2 * a.table.AWAY_MS + 5_000, 1_000, []);
     expect(casinoOf(a).has(`gone:${TABLE}:${INC}`)).toBe(true);
-    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    expect(tookSwitch).toBe(true);
+    // (the game's pages then put the switch back on the game, its hint: PR 6c-4b-2b. This page never saw the table placed in
+    // the room's layout, so it knows of no table out to wait for.)
+    expect(casinoOf(a).get(`cfg:computed:${TABLE}`)).toEqual({ v: 1, inc: G.inc });
     expect(casinoOf(a).has(`gone:${TABLE}:${G.inc}`)).toBe(false);
     expect(a.casino.isComputedTable(TABLE)).toBe(true); // (the game goes on)
   });
