@@ -266,6 +266,9 @@ describe('the picture', () => {
 });
 
 describe('trims', () => {
+  // The wipes' own ids, w0aaaaaa..w5aaaaaa. Not startsWith('w'): a stroke drawn
+  // here gets a random base-36 id (newEntryId), which starts with 'w' 1 time in 36.
+  const isWipe = (id: string): boolean => /^w\daaaaaa$/.test(id);
   const fill = (n: number, at0: number): void => {
     for (let i = 0; i < n; i++) remote(`t${String(i).padStart(7, '0')}`, 'chalk', at0 + i, [line(10 + (i % 60) * 20, 10 + Math.floor(i / 60) * 60, 20 + (i % 60) * 20, 40 + Math.floor(i / 60) * 60, 3)]);
   };
@@ -289,7 +292,7 @@ describe('trims', () => {
     expect(n).toBe(2 * 60 + 6); // the first two rows' chalk, and the wipes
     const keys = readChalkBoard(BOARD, now).shown.map((e) => e.id);
     expect(keys).toContain('young000');
-    expect(keys.some((k) => k.startsWith('w'))).toBe(false);
+    expect(keys.some(isWipe)).toBe(false);
     // Nothing anyone could see changed: no cell moved by INVISIBLE_BELOW.
     const after = freshPaint(BOARD, now);
     let worst = 0;
@@ -311,7 +314,7 @@ describe('trims', () => {
     remote('late0000', 'chalk', T0 + 5_000, [line(10, 20, 1200, 20)]);
     for (let k = 0; k < 400; k++) chalkBoardFrame(BOARD, (now += 16));
     const ids = readChalkBoard(BOARD, now).shown.map((e) => e.id);
-    expect(ids.filter((k) => k.startsWith('w'))).toHaveLength(6); // the wipes still cover it
+    expect(ids.filter(isWipe)).toHaveLength(6); // the wipes still cover it
     expect(ids).toContain('late0000');
   });
 
