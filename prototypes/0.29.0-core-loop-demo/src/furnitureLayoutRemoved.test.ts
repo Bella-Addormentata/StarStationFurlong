@@ -209,4 +209,41 @@ describe("World's removal of a table", () => {
     expect(body).toContain('closeTable(itemId, closing);');
     expect(body).toContain('closeCrapsTable(itemId, closing);');
   });
+
+  it("each teardown says which game's table closes, and the editor takes an item down while the layout holds its record still: a FAIR ONLY game's switch is left only by the teardown of a table of the other game (casinoDoc clearTableKeys)", () => {
+    const body = world.slice(world.indexOf('public removeFurnitureVisuals('));
+    // (a roulette table's teardown is croupier closeTable, a craps table's crapsCroupier closeCrapsTable)
+    expect(body.indexOf('if (removedKind === "roulette-table") {\n      closeTable(itemId, closing);')).toBeGreaterThan(-1);
+    expect(body.indexOf('} else if (removedKind === "craps-table") {\n      closeCrapsTable(itemId, closing);')).toBeGreaterThan(-1);
+    const croupier = readFileSync(new URL('./croupier.ts', import.meta.url), 'utf8');
+    const craps = readFileSync(new URL('./crapsCroupier.ts', import.meta.url), 'utf8');
+    expect(croupier).toContain("closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));");
+    expect(craps).toContain("closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));");
+    expect(croupier).toContain('clearTableKeys(tableId, closing, opts);');
+    // (EditMode.removeSelected: the visuals and the table's session first, the layout's record after)
+    const edit = readFileSync(new URL('./editMode.ts', import.meta.url), 'utf8');
+    const down = edit.indexOf('world.removeFurnitureVisuals(itemId);');
+    const gone = edit.indexOf('deleteFurnitureItem(itemId);');
+    expect(down).toBeGreaterThan(-1);
+    expect(gone).toBeGreaterThan(down);
+    expect(edit.indexOf('world.removeFurnitureVisuals(itemId);', down + 1)).toBe(-1);
+    expect(edit.indexOf('deleteFurnitureItem(itemId);', gone + 1)).toBe(-1);
+  });
+});
+
+describe("World's frame", () => {
+  const world = readFileSync(new URL('./world.ts', import.meta.url), 'utf8');
+
+  it('is marked as one that runs tables by computedTable tableFrame, which the specs\' frames go by too: with the room\'s last table out a page stays awake for what a FAIR ONLY game asks of it', () => {
+    const start = world.indexOf('private updateCroupier(): void {');
+    const body = world.slice(start, world.indexOf('\n  }\n', start));
+    expect(body).toContain('if (tableFrame(tables.length)) noteTablesRunning();');
+    expect(body.split('noteTablesRunning(').length).toBe(2);
+    // (before the tick of the frame, which asks whether the page is awake)
+    expect(body.indexOf('if (tableFrame(tables.length)) noteTablesRunning();')).toBeLessThan(body.indexOf('tickComputedTables('));
+    const kit = readFileSync(new URL('./computedPageKit.ts', import.meta.url), 'utf8');
+    expect(kit).toContain('if (p.table.tableFrame(tables.length)) p.croupier.noteTablesRunning(now);');
+    const sim = readFileSync(new URL('./computedSim.ts', import.meta.url), 'utf8');
+    expect(sim).toContain('if (table.tableFrame(tables.length)) croupier.noteTablesRunning(now);');
+  });
 });

@@ -2118,7 +2118,11 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
 
   // The count of the games played at a table is the doc's: it does not wait for a
   // frame to look at the table. A page whose list of the room's tables held this
-  // one in no frame of the game serves its state afresh all the same.
+  // one in no frame of the game serves its state afresh all the same. (Its list
+  // holds another table meanwhile, so its frames run tables and the page stays
+  // awake: with no table in its list and nothing owed it would sleep a lapse on,
+  // as a page of World's does, computedTable tableFrame, and wake from that
+  // sleep too late for the grace.)
   it('start afresh for a page that looked at the table in no frame of the game, too: the table out of its list while the game is played leaves the waits of its state where they were no more', async () => {
     const { a, b } = await staked();
     const closed = (): boolean => keysIn(a, 'c', 1).length > 0;
@@ -2128,7 +2132,8 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     record(a, root);
     switchTo(a, G.inc);
     sync(at, a, b);
-    const mid = runLists([[a, []], [b, undefined]], at + STEP, at + 40_000); // (the table is in B's list, not in A's)
+    const mid = runLists([[a, [OTHER_T]], [b, undefined]], at + STEP, at + 40_000); // (the table is in B's list, not in A's)
+    expect(a.croupier.tablesAwake(mid)).toBe(true);
     expect(keysIn(a, 'r', 1)).toEqual([]);
     record(a, end);
     sync(mid, a, b);

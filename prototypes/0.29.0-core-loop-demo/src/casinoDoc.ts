@@ -1360,9 +1360,12 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
  *  of an owner-run round an earlier build opened on a computed table ends
  *  only that round's incarnation. 🔀 `keepConfig`: the table stays (the
- *  switch to computed, that sweep), and so do the house's settings for it. */
+ *  switch to computed, that sweep), and so do the house's settings for it.
+ *  🔒 `closes`: the game of the table taken down (croupier closeTable,
+ *  crapsCroupier closeCrapsTable), which decides whether a FAIR ONLY game's
+ *  switch is that table's to take with it (below). */
 export function clearTableKeys(
-  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean; closes?: GameName } = {},
 ): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
@@ -1421,12 +1424,17 @@ export function clearTableKeys(
         if (inc !== cinc && !other.fo && other.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
       }
       // 🔒 The switch goes with the table, but for one that names a FAIR ONLY
-      // game while the layout holds a table of that game under the id: what
-      // closed then is an item that table was written over (World takes down
-      // an item whose id came to hold another kind), a table of the other
-      // game the game's own was put back over with its switch
-      // (putBackFairOnlyTable), and the switch is the table's that stands.
-      const stands = cinc !== null && isFairOnlyInc(cinc) && tableRecordGame(layoutMap?.get(tableId)) === gameOfInc(cinc);
+      // game of the other game than the table that closes, while the layout
+      // holds a table of the switch's game under the id: what closed then is
+      // an item that table was written over (World takes down an item whose
+      // id came to hold another kind), a table of the other game the game's
+      // own was put back over with its switch (putBackFairOnlyTable), and
+      // the switch is the table's that stands. Not by the layout alone: the
+      // editor takes a table down before it deletes the table's record
+      // (EditMode.removeSelected), so at a removal this page makes the layout
+      // still holds the very table that closes, and its switch goes with it.
+      const named = cinc !== null && isFairOnlyInc(cinc) ? gameOfInc(cinc) : null;
+      const stands = named !== null && opts.closes !== undefined && opts.closes !== named && tableRecordGame(layoutMap?.get(tableId)) === named;
       if (!stands) map.delete(`cfg:computed:${tableId}`);
     }
     map.delete(`throw:${tableId}`);
@@ -6009,7 +6017,8 @@ export function putBackFairOnlyRecords(tableId: string, inc: string): number {
  * ended is left, as fairOnlySwitchOff leaves it: fairOnlySwitchFree). Where
  * it goes back over a table of the other game, the pages take that table
  * down as one removed, and its teardown leaves the switch written here
- * (clearTableKeys: the game's table stands under the id). The
+ * (clearTableKeys: what closes is a table of the other game, and the game's
+ * own stands under the id). The
  * placement is the layout's own value, so every page that
  * saw the table where it last stood writes the same record. Not while a check
  * of the game's resolution waits (an end order may be what waits), nor on a

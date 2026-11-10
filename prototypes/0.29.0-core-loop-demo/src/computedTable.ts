@@ -154,6 +154,7 @@ import {
   computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
+  computedFairOnlyChecking,
   computedFairOnlyRecoveries,
   computedFairOnlyReturns,
   computedFoldOf,
@@ -164,6 +165,7 @@ import {
   computedIncOf,
   computedLiveTables,
   computedRecoveries,
+  computedRecoveryPending,
   computedResolutionOf,
   computedRestorePending,
   computedRecoveryOn,
@@ -4997,6 +4999,47 @@ export function computedCompactionPending(): boolean {
   } catch {
     return false;
   }
+}
+
+/** 🔒 Whether a FAIR ONLY game has work owed that no table of the room
+ *  carries: something of it for the put-back duty to look at (casinoDoc
+ *  computedFairOnlyChecking: a game the doc lacks a record, the switch, the
+ *  table or the session's map of stays there until it is whole, through a
+ *  stand-down too, whose end the page must be awake at), or a live game this
+ *  page has something at stake in (serveLeftGames: its seed to reveal, its
+ *  close, its abandon, what it puts back). Both are an awake page's, and with
+ *  the room's last table out World would mark no frame: the page would read as
+ *  asleep a lapse on, and for good. (Without this term the table went back by
+ *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
+ *  lapse: no later turn came, no page without a felt wrote, nothing ran after
+ *  a stand-down, and no round in flight was served past the lapse.) Only asked
+ *  in a room with no table (tableFrame), and never throws out of World's
+ *  frame. What it costs with no game tracked is a set's size, twice. */
+export function computedFairOnlyPending(): boolean {
+  try {
+    if (computedFairOnlyChecking() > 0) return true;
+    if (fairTables.size === 0) return false;
+    const me = getPlayerId();
+    for (const st of fairTables.values()) {
+      if (computedResolutionOf(st.t, st.inc)?.live === true && !nothingAtStake(st, me)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a frame of this page is one that runs tables, which World marks
+ *  (croupier noteTablesRunning: a page that stops marking reads as asleep a
+ *  lapse later, tablesAwake, and every duty here is an awake page's): the room
+ *  has a table (`tables` of them), or work waits that no table carries: an
+ *  ended incarnation to compact or one to end (computedCompactionPending), a
+ *  recovery owed (casinoDoc computedRecoveryPending), a FAIR ONLY game's
+ *  put-backs or its round in flight (computedFairOnlyPending). One place for
+ *  World's frame and the specs' (computedPageKit frame, computedSim), so a
+ *  spec's page sleeps where the app's does. */
+export function tableFrame(tables: number): boolean {
+  return tables > 0 || computedCompactionPending() || computedRecoveryPending() || computedFairOnlyPending();
 }
 
 // ── 🔀 The switch ────────────────────────────────────────────────────────────

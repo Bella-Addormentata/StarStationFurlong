@@ -72,6 +72,7 @@ import {
   whenCasinoWhole,
 } from './casinoDoc';
 import type { TableClosing, TableOperatorLease } from './casinoDoc';
+import type { GameName } from './computedFold';
 import { getPlayerId } from './identity';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
@@ -756,8 +757,9 @@ export function timerOnThisClock(
  * (idempotent LWW delete) so no orphan records survive.
  */
 export function closeTable(tableId: string, closing: TableClosing = 'heard'): void {
-  // One transaction: no page sees the refunds without the table gone.
-  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing)));
+  // One transaction: no page sees the refunds without the table gone. (What
+  // closes is a roulette table: clearTableKeys `closes`.)
+  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));
 }
 
 /** 📒 A table's removal, on a doc holding every update whole (casinoWhole):
@@ -781,9 +783,10 @@ export function closeWhenWhole(tableId: string, close: () => void): void {
  *  the keys go (clearTableKeys; `keepComputed`: a computed table's own
  *  incarnation stays, for the sweep of an owner-run round on it;
  *  `keepConfig`: the house's settings for the table stay, for that sweep and
- *  the switch to computed). */
+ *  the switch to computed; `closes`: the game of a table taken down, which
+ *  clearTableKeys goes by at a FAIR ONLY game's switch). */
 export function refundAndClear(
-  tableId: string, closing: TableClosing, opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+  tableId: string, closing: TableClosing, opts: { keepComputed?: boolean; keepConfig?: boolean; closes?: GameName } = {},
 ): void {
   const end = tableEndingStakes(tableId);
   for (const [pid, taken] of Object.entries(end?.taken ?? {})) creditTableOutcome(tableId, end!.inc, 'end', pid, taken);
