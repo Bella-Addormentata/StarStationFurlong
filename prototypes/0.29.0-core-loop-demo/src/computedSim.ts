@@ -1496,7 +1496,7 @@ export class Sim {
         const { casino, croupier, table } = sp.p;
         const tables = this.tables.filter((t) => sp.inRoom.has(t));
         const wakes = croupier.tablesWakeCount();
-        if (tables.length || table.computedCompactionPending() || casino.computedRecoveryPending()) croupier.noteTablesRunning(now);
+        if (table.tableFrame(tables.length)) croupier.noteTablesRunning(now);
         if (croupier.tablesWakeCount() !== wakes) {
           this.wasAway(sp);
           sp.restartAt = { at: now, T: this.T };

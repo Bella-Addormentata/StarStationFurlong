@@ -266,7 +266,7 @@ import {
   towHoldsDock,
 } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
-import { setRoomStateArrivedCheck, setSoleCroupierPredicate, setTableInRoomPredicate } from "./croupier";
+import { setRoomStateArrivedCheck, setSoleCroupierPredicate, setTableInRoomPredicate, tableOfGameAmong } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
@@ -11746,8 +11746,10 @@ async function init() {
     return currentRoomDeedIsMine();
   });
   // 📒 A table removal heard while the casino doc holds part of an update
-  // waits for the rest, unless the table is back in the room by then.
-  setTableInRoomPredicate((tableId) => FURNITURE.some((item) => item.id === tableId));
+  // waits for the rest, unless the table is back in the room by then: a
+  // table of the game taken down (other furniture the id came to hold, a
+  // sofa or a table of the other game, is not that table back).
+  setTableInRoomPredicate((tableId, game) => tableOfGameAmong(FURNITURE, tableId, game));
   // 🛰️ Nor are the tables run on a doc the room's state hasn't reached this
   // visit: it may be the room cache's copy from before this page left, its
   // own table lease in it (croupier tablesAwake).

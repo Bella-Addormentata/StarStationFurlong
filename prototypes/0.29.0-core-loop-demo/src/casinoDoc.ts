@@ -1360,9 +1360,12 @@ export type TableClosing = 'local' | 'heard' | 'elsewhere';
  *  `gone:` mark ends it: COMPUTED TABLES), unless `keepComputed`: the sweep
  *  of an owner-run round an earlier build opened on a computed table ends
  *  only that round's incarnation. 🔀 `keepConfig`: the table stays (the
- *  switch to computed, that sweep), and so do the house's settings for it. */
+ *  switch to computed, that sweep), and so do the house's settings for it.
+ *  🔒 `closes`: the game of the table taken down (croupier closeTable,
+ *  crapsCroupier closeCrapsTable), which decides whether a FAIR ONLY game's
+ *  switch is that table's to take with it (below). */
 export function clearTableKeys(
-  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean } = {},
+  tableId: string, closing: TableClosing = 'heard', opts: { keepComputed?: boolean; keepConfig?: boolean; closes?: GameName } = {},
 ): void {
   const map = ensureMap();
   const betPrefix = `bets:${tableId}:`;
@@ -1420,7 +1423,19 @@ export function clearTableKeys(
         const other = computedIncs.get(`${tableId}:${inc}`)!;
         if (inc !== cinc && !other.fo && other.live && !computedIncEnded(tableId, inc)) markRemoved(map, tableId, inc);
       }
-      map.delete(`cfg:computed:${tableId}`);
+      // 🔒 The switch goes with the table, but for one that names a FAIR ONLY
+      // game of the other game than the table that closes, while the layout
+      // holds a table of the switch's game under the id: what closed then is
+      // an item that table was written over (World takes down an item whose
+      // id came to hold another kind), a table of the other game the game's
+      // own was put back over with its switch (putBackFairOnlyTable), and
+      // the switch is the table's that stands. Not by the layout alone: the
+      // editor takes a table down before it deletes the table's record
+      // (EditMode.removeSelected), so at a removal this page makes the layout
+      // still holds the very table that closes, and its switch goes with it.
+      const named = cinc !== null && isFairOnlyInc(cinc) ? gameOfInc(cinc) : null;
+      const stands = named !== null && opts.closes !== undefined && opts.closes !== named && tableRecordGame(layoutMap?.get(tableId)) === named;
+      if (!stands) map.delete(`cfg:computed:${tableId}`);
     }
     map.delete(`throw:${tableId}`);
     const seatPrefix = `seat:${tableId}:`;
@@ -2305,14 +2320,25 @@ interface FairOnlyState {
    *  that checks it looks again). */
   hkOver: Map<string, unknown>;
   hkWaits: boolean;
-  /** 🔒 Whether the doc lacked something this page holds of the game when that
-   *  was last told (noteFairOnlyLacks: after each count, and while the game is
-   *  not counted because its table is not whole), and how many times since the
-   *  doc was bound all of it was found there again after it was not: a
-   *  put-back, this page's or another's (computedFairOnlyReturns; the put-back
-   *  duty counts the ones that do not last). */
+  /** 🔒 Whether the doc lacked a record this page holds of the game (or, of
+   *  the game its table plays, the table's switch: `lacking`), and whether the
+   *  table of the game it plays was out of the room's layout (`tableOut`), when
+   *  that was last told (noteFairOnlyLacks: after each count, and while the game
+   *  is not counted because its table is not whole). The two are told apart:
+   *  the records are put back by one write and the table by another, and a
+   *  table that stays out must hide no put-back of the records. How many times
+   *  since the doc was bound the records were all found there again after one
+   *  was not, or the table after it was out: a put-back, this page's or
+   *  another's (`returns`: computedFairOnlyReturns; the put-back duty counts
+   *  the ones that do not last). And how many times the table went out
+   *  (`tableOuts`: it was not out when last told, the game not being the one
+   *  played or an end order standing included): each is a wait of its own for
+   *  the page that puts the table back, though the table was back, or was
+   *  another game's, between two of that page's looks only. */
   lacking: boolean;
+  tableOut: boolean;
   returns: number;
+  tableOuts: number;
   /** 🔒 How many times, since the doc was bound, a transaction changed the key
    *  of a session of the game (a map came, went, or was written over): each
    *  time the map of the session its base opens goes is a disappearance of its
@@ -2483,6 +2509,31 @@ let foLookAll = false;
  *  table with many games that are not live (junk under well-formed keys starts one each)
  *  costs a call no more than a table with none. */
 let foLive = new Map<string, Map<string, Resolution>>();
+/** 🔒 The game each table plays (computedIncOf), as first asked in the pass
+ *  under way: a count of the games a transaction touched, or the put-back
+ *  duty's look at the games that may lack something (playedPass). Null outside
+ *  one. A change of a table's switch or of its record in the layout counts
+ *  every game of the table again, and each asks whether it is the one played
+ *  (fairOnlyPlays): asked of S9 anew each time, that is a scan of the table's
+ *  live games for each of them, and a guest can open many. Nothing a pass does
+ *  moves what S9 goes by (the games' liveness, the deed holder's key, the
+ *  switch), so one answer serves it. What a page writes back is asked for
+ *  outside a pass, fresh (putBackFairOnlyRecords, putBackFairOnlyTable). */
+let playedInPass: Map<string, string | null> | null = null;
+/** 🔒 The room's layout (the doc's `furniture` map, furnitureDoc's: a table's
+ *  placement under its id), and of each table with a FAIR ONLY game this page
+ *  tracks the last placement it saw there, since the doc was bound, of a
+ *  roulette table and of a craps table: what the pages put back when the table
+ *  of a live game is taken out of the room (design §8.4 P5: fairOnlyTableOut,
+ *  putBackFairOnlyTable). Each game's kind of table is kept apart: a table of
+ *  the other game written under the id is not the game's table, and takes
+ *  nothing from what is held of it. And how many times, by table, a
+ *  transaction changed the layout's key of it: a table that came back and went
+ *  again between two looks of a page is another disappearance (FairOnlyRecovery
+ *  tableMoves). */
+let layoutMap: Y.Map<unknown> | null = null;
+let tableSeen = new Map<string, Map<GameName, unknown>>();
+let tableMoves = new Map<string, number>();
 /** 🔒 The verdicts on the signatures a FAIR ONLY game's resolution asks about
  *  (authCheck), by sigId: one map for every game of the room, since an id
  *  binds what it covers (a record copied into another game is another thing
@@ -4084,7 +4135,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkUnder: new Map(), hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkUnder: new Map(), hkOver: new Map(), hkWaits: false, lacking: false, tableOut: false, returns: 0, tableOuts: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
     : null;
   // (…and the page keeps which keys it answered were, and the delegation the
   // resolution went by for each: they are what the fold's counts stand on,
@@ -4110,6 +4161,8 @@ function trackComputed(t: string, inc: string): ComputedInc {
   computedIncs.set(key, c);
   if (fo) {
     foGames += 1;
+    // (The placement of its table, as the layout holds it now: noteTableRecord.)
+    if (!foTables.has(t)) noteTableRecord(t);
     foTables.add(t);
     staleGames.add(c);
   }
@@ -4824,6 +4877,13 @@ function notePlayedGames(dirty?: Set<ComputedInc>): void {
     const now = played !== null && isFairOnlyInc(played) && !fairOnlyLive(t, played) ? null : played;
     const was = foPlayed.get(t);
     foPlayed.set(t, now);
+    // (🔒 The table's games are counted again when the one it plays is another:
+    // the switch and the table are put back for that one alone, so what the doc
+    // lacks of each goes by it: noteFairOnlyLacks.)
+    if (was !== now && dirty) for (const inc of computedIncsOf.get(t) ?? []) {
+      const c = computedIncs.get(`${t}:${inc}`);
+      if (c?.fo) dirty.add(c);
+    }
     const lives = (liveGameOf(t, 'roulette') ? 1 : 0) | (liveGameOf(t, 'craps') ? 2 : 0);
     const livesMoved = lives !== (foLivesOf.get(t) ?? 0);
     if (lives === 0) foLivesOf.delete(t);
@@ -4931,13 +4991,28 @@ function countFairOnly(c: ComputedInc, map: Y.Map<unknown>, whole: boolean, keys
  *  write of the next, and a base that reads as gone between the two has not
  *  come back when the write lands. A game found lacking is one the put-back
  *  duty looks at (a count that was no resolution finds one too: what stood
- *  under a held delegation's key, checked by a slice). */
+ *  under a held delegation's key, checked by a slice). What the doc lacks of
+ *  the game its table plays is also the table's switch, off the game
+ *  (fairOnlySwitchOff), and the table, out of the room's layout
+ *  (fairOnlyTableOut): the game is counted again when the switch or the
+ *  layout's record of the table changes (countTransaction) and when the table
+ *  plays another game (notePlayedGames), so one of them coming back is a
+ *  put-back counted as a record's is. The records (the switch with them: one
+ *  write puts them back) and the table are told apart, and each coming back
+ *  is counted by itself: while the table is out a record deleted each time it
+ *  is put back is a put-back that did not last each time, which one flag for
+ *  both would read as one lack that never ended (and the pages would write it
+ *  back for good, with no stand-down). */
 function noteFairOnlyLacks(c: ComputedInc, map: Y.Map<unknown>): void {
   const fo = c.fo!;
-  const lacking = fairOnlyLacks(c, map).length > 0;
+  const lacking = fairOnlyLacks(c, map).length > 0 || fairOnlySwitchOff(c);
+  const tableOut = fairOnlyTableOut(c);
   if (fo.lacking && !lacking) fo.returns += 1;
+  if (fo.tableOut && !tableOut) fo.returns += 1;
+  if (tableOut && !fo.tableOut) fo.tableOuts += 1;
   fo.lacking = lacking;
-  if (lacking) foCheck.add(c);
+  fo.tableOut = tableOut;
+  if (lacking || tableOut) foCheck.add(c);
 }
 
 /** 🔒 What this page's resolution says of FAIR ONLY game `inc` of table
@@ -4955,6 +5030,9 @@ export function computedResolutionOf(tableId: string, inc: string): Resolution |
 function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
   const map = doc.getMap<unknown>('casinoComputed');
   computedMap = map;
+  layoutMap = doc.getMap<unknown>('furniture');
+  tableSeen = new Map();
+  tableMoves = new Map();
   computedIncs = new Map();
   computedIncsOf = new Map();
   newlyTracked = [];
@@ -5011,7 +5089,9 @@ function bindComputed(doc: Y.Doc, casino: Y.Map<unknown>): void {
     }
   }
   refreshFairOnly();
-  for (const c of computedIncs.values()) countComputed(c, map, casino, true);
+  playedPass(() => {
+    for (const c of computedIncs.values()) countComputed(c, map, casino, true);
+  });
   // (🔒 What each page-signed incarnation takes as the doc holds it: a turn is read
   // against this, so one that ends after the bind is a turn, and not a first read.)
   for (const c of computedIncs.values()) c.takesPlace = !c.fo && !computedIncEnded(c.t, c.inc);
@@ -5122,6 +5202,21 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   }
   // (A beat that came before its house was pinned: read now.)
   for (const pub of pinned) noteBeat(pub);
+  // 🔒 The room's layout: the table of a FAIR ONLY game placed, moved, taken out
+  // or put back. Its games are counted again (what the doc lacks of the one the
+  // table plays goes by it: noteFairOnlyLacks).
+  const laid = layoutMap ? tr.changed.get(layoutMap as unknown as Y.AbstractType<Y.YEvent<any>>) : undefined;
+  if (laid) {
+    for (const t of laid) {
+      if (t === null || !foTables.has(t)) continue;
+      tableMoves.set(t, (tableMoves.get(t) ?? 0) + 1);
+      noteTableRecord(t);
+      for (const inc of computedIncsOf.get(t) ?? []) {
+        const c = computedIncs.get(`${t}:${inc}`)!;
+        if (c.fo) dirty.add(c);
+      }
+    }
+  }
   if (computedIncs.size === 0) return;
   if (computedKeysMoved) {
     computedKeysMoved = false;
@@ -5208,9 +5303,11 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
     if (takes === y.takesPlace) continue;
     y.takesPlace = takes;
     if (computedCfgInc(casino.get(`cfg:computed:${y.t}`)) !== y.inc) continue;
+    // (And the table's FAIR ONLY games: the switch is theirs to put back or not
+    // by whether the incarnation it names stands, fairOnlySwitchFree.)
     for (const inc of computedIncsOf.get(y.t) ?? []) {
       const sibling = computedIncs.get(`${y.t}:${inc}`);
-      if (sibling && sibling !== y && !sibling.fo) dirty.add(sibling);
+      if (sibling && sibling !== y) dirty.add(sibling);
     }
   }
   newlyTracked = [];
@@ -5218,14 +5315,17 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
   // counted: what counts, and whether a table is lost (casinoWhole), goes by
   // the answer.
   refreshFairOnly(dirty);
-  for (const c of dirty) countComputed(c, map, casino, whole.has(c), changed.get(c));
-  // The rest of an update came: what waited reads as it is.
-  if (computedParked.size > 0 && casinoWhole()) {
-    for (const key of [...computedParked]) {
-      const c = computedIncs.get(key)!;
-      if (!dirty.has(c)) countComputed(c, map, casino, true);
+  // (🔒 The game each table plays is asked once for all of them: playedInPass.)
+  playedPass(() => {
+    for (const c of dirty) countComputed(c, map, casino, whole.has(c), changed.get(c));
+    // The rest of an update came: what waited reads as it is.
+    if (computedParked.size > 0 && casinoWhole()) {
+      for (const key of [...computedParked]) {
+        const c = computedIncs.get(key)!;
+        if (!dirty.has(c)) countComputed(c, map, casino, true);
+      }
     }
-  }
+  });
 }
 
 /** False while a computed table (table `tableId`'s, when named) waits: for
@@ -5628,7 +5728,7 @@ export function reopenComputedSession(tableId: string, inc: string): boolean {
   return true;
 }
 
-// ── 🔒 What a FAIR ONLY game stands on, put back (design §8.4 P2; PR 6c-4b-2) ──
+// ── 🔒 What a FAIR ONLY game stands on, put back, and the switch and the table of the game played (design §8.4 P2, P4, P5; PR 6c-4b-2) ──
 
 /** One FAIR ONLY game the doc has lost something of, as the put-back duty reads
  *  it (computedTable fairKeepDuty). */
@@ -5638,9 +5738,21 @@ export interface FairOnlyRecovery {
   ctx: FoldCtx;
   /** The round of the base this page counts the game from. */
   u: number;
-  /** How many of the records this page holds of the game the doc lacks
-   *  (putBackFairOnlyRecords writes them). */
+  /** How many of the records this page holds of the game the doc lacks, the
+   *  table's switch counted as one when the game is the one the table plays and
+   *  the switch names another or none (putBackFairOnlyRecords writes them). */
   missing: number;
+  /** The game is the one its table plays, no end order stands, and the table
+   *  is out of the room's layout, where this page saw it placed
+   *  (putBackFairOnlyTable puts it back, and the switch with it); and how many
+   *  times a transaction changed the layout's key of the table since the doc
+   *  was bound, and how many times the game's table went out as this page
+   *  counted it (FairOnlyState tableOuts: out of the layout, or the table
+   *  playing the game again, or an end order standing no more): the wait for
+   *  the table is one disappearance's. */
+  tableMissing: boolean;
+  tableMoves: number;
+  tableOuts: number;
   /** The game is live and the session its base opens has no map in the doc
    *  (reopenFairOnlySession makes one). */
   sessionMissing: boolean;
@@ -5701,6 +5813,110 @@ function fairOnlyLacks(c: ComputedInc, map: Y.Map<unknown>): [string, unknown][]
   return back;
 }
 
+/** 🔒 The game a layout record's table plays, when the value is a casino
+ *  table's placement as furnitureDoc reads one (isFurnitureRecord: its kind,
+ *  where it stands, how it is turned): 'roulette' for a roulette table, 'craps'
+ *  for a craps table. Null for anything else: no record, junk, or furniture of
+ *  another kind. */
+export function tableRecordGame(value: unknown): GameName | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const r = value as { kind?: unknown; x?: unknown; z?: unknown; rot?: unknown; movable?: unknown; mountParent?: unknown };
+  const game = r.kind === 'roulette-table' ? 'roulette' : r.kind === 'craps-table' ? 'craps' : null;
+  if (game === null || !Number.isFinite(r.x) || !Number.isFinite(r.z)) return null;
+  if (r.rot !== 0 && r.rot !== 1 && r.rot !== 2 && r.rot !== 3) return null;
+  if (typeof r.movable !== 'boolean' || (r.mountParent !== undefined && typeof r.mountParent !== 'string')) return null;
+  return game;
+}
+
+/** Keep the placement the layout holds of table `t` now, when it is a casino
+ *  table's, as the last one seen of a table of its game (tableSeen): what is
+ *  put back. A table moved is held where it stands now; one taken out, or
+ *  written over by junk, by other furniture or by a table of the other game,
+ *  stays held as it last stood. */
+function noteTableRecord(t: string): void {
+  const value = layoutMap?.get(t);
+  const game = tableRecordGame(value);
+  if (game === null) return;
+  let seen = tableSeen.get(t);
+  if (!seen) tableSeen.set(t, seen = new Map());
+  seen.set(game, value);
+}
+
+/** Run `pass` with the game each table plays asked of S9 once (playedInPass). */
+function playedPass<T>(pass: () => T): T {
+  if (playedInPass !== null) return pass();
+  playedInPass = new Map();
+  try {
+    return pass();
+  } finally {
+    playedInPass = null;
+  }
+}
+
+/** The game table `t` plays (computedIncOf): as first asked in the pass under
+ *  way, or asked now outside one. */
+function playedOf(t: string): string | null {
+  if (playedInPass === null) return computedIncOf(t);
+  let inc = playedInPass.get(t);
+  if (inc === undefined) playedInPass.set(t, inc = computedIncOf(t));
+  return inc;
+}
+
+/** Whether game `c` is the one its table plays (S9: computedIncOf), live. */
+function fairOnlyPlays(c: ComputedInc): boolean {
+  return c.fo!.res?.live === true && playedOf(c.t) === c.inc;
+}
+
+/** Whether the table of game `c` is out of the room's layout: this page saw a
+ *  table of the game's kind placed under its id, and the layout holds none
+ *  there now (no record, junk, furniture of another kind, or a table of the
+ *  other game). A table this page never saw placed is not out: there is
+ *  nothing to put back. */
+function fairOnlyLayoutOut(c: ComputedInc): boolean {
+  const game = gameOfInc(c.inc);
+  return tableSeen.get(c.t)?.has(game) === true && tableRecordGame(layoutMap?.get(c.t)) !== game;
+}
+
+/** 🔒 Whether the table of game `c` is to be put back (design §8.4 P5): the
+ *  game is the one the table plays, the table is out of the layout, and no end
+ *  order stands (B14.3: the game's authority takes its table out by ending the
+ *  game, and a removal with the order standing is its own). Whether a check
+ *  waits is not asked here: a resolution that waits for a moment is no return
+ *  of the table, and putBackFairOnlyTable writes nothing meanwhile. */
+function fairOnlyTableOut(c: ComputedInc): boolean {
+  return c.fo!.res?.fin === null && fairOnlyPlays(c) && fairOnlyLayoutOut(c);
+}
+
+/** 🔒 Whether the table's switch is to be put back on game `c` (design §8.4
+ *  P4): the game is the one the table plays, and the switch names another
+ *  incarnation or none. The switch is S9's hint, and S9's choice with the hint
+ *  on the game it chose is that game still, so the write moves no table. Not
+ *  over the name of a page-signed incarnation the doc holds that nothing has
+ *  ended (fairOnlySwitchFree): that one waits beside the game, and its name in
+ *  the switch is what makes the table its again the moment the game ends. Not
+ *  while the table is out of the layout: a removal takes the switch with the
+ *  table on every page that hears it (clearTableKeys), and the switch goes
+ *  back with the table (putBackFairOnlyTable), or not at all. */
+function fairOnlySwitchOff(c: ComputedInc): boolean {
+  return fairOnlyPlays(c) && fairOnlySwitchFree(c) && !fairOnlyLayoutOut(c);
+}
+
+/** 🔒 Whether the switch of game `c`'s table is off the game and the game's
+ *  pages' to write: it names none, a name nothing stands behind, one that has
+ *  ended, or another game, and not a page-signed incarnation the doc holds that
+ *  nothing has ended (switchedPageSignedInc). A game defers such an
+ *  incarnation's duties, never its end nor the switch's moving (PR 6c-4a-2):
+ *  with the game's name written over its own, the switch would name an ended
+ *  game when the game ends, which only a page that ran the incarnation puts
+ *  back (computedTable putSwitchBack), a frame late there and never on a page
+ *  loaded meanwhile. S9 plays the game without the hint while it is the deed
+ *  holder's, the only live one or the lowest name. When that incarnation ends
+ *  with the switch still on it the game is counted again (countTransaction),
+ *  and the switch is the game's from then. */
+function fairOnlySwitchFree(c: ComputedInc): boolean {
+  return switchIncOf(c.t) !== c.inc && switchedPageSignedInc(c.t) === null;
+}
+
 /** The session game `c`'s base opens while the game is live, or null (no base,
  *  or one that ends it). */
 function fairOnlySessionOf(c: ComputedInc): string | null {
@@ -5722,18 +5938,23 @@ function fairOnlySessionMissing(c: ComputedInc, map: Y.Map<unknown>): boolean {
 export function computedFairOnlyRecoveries(): FairOnlyRecovery[] {
   const map = computedMap;
   if (!map || foCheck.size === 0) return [];
+  return playedPass(() => fairOnlyRecoveries(map));
+}
+
+function fairOnlyRecoveries(map: Y.Map<unknown>): FairOnlyRecovery[] {
   const out: FairOnlyRecovery[] = [];
   for (const c of [...foCheck]) {
-    const missing = fairOnlyLacks(c, map).length;
+    const missing = fairOnlyLacks(c, map).length + (fairOnlySwitchOff(c) ? 1 : 0);
     const sessionMissing = fairOnlySessionMissing(c, map);
-    if (missing === 0 && !sessionMissing) {
+    const tableMissing = fairOnlyTableOut(c);
+    if (missing === 0 && !sessionMissing && !tableMissing) {
       foCheck.delete(c);
       continue;
     }
     const pubs = new Set<string>();
     for (const s of c.last?.felts.values() ?? []) if (s.rec.b.length > 0) pubs.add(s.rec.k);
     out.push({
-      t: c.t, inc: c.inc, ctx: c.ctx, u: c.fo!.res?.base?.ck.u ?? 0, missing, sessionMissing,
+      t: c.t, inc: c.inc, ctx: c.ctx, u: c.fo!.res?.base?.ck.u ?? 0, missing, tableMissing, tableMoves: tableMoves.get(c.t) ?? 0, tableOuts: c.fo!.tableOuts, sessionMissing,
       sid: fairOnlySessionOf(c), sesMoves: c.fo!.sesMoves, pubs: [...pubs].sort(), returns: c.fo!.returns,
     });
   }
@@ -5742,9 +5963,11 @@ export function computedFairOnlyRecoveries(): FairOnlyRecovery[] {
 
 /** 🔒 How many times, since the doc was bound, the records this page holds of
  *  FAIR ONLY game `inc` of table `tableId` were all in the doc again after the
- *  doc had lacked one (FairOnlyState returns): the put-backs of the game this
- *  page saw, its own and other pages'. 0 for a game it doesn't track.
- *  Read-only. */
+ *  doc had lacked one (FairOnlyState returns), the table's switch counted
+ *  with them and the table by itself while the table plays the game
+ *  (noteFairOnlyLacks):
+ *  the put-backs of the game this page saw, its own and other pages'. 0 for a
+ *  game it doesn't track. Read-only. */
 export function computedFairOnlyReturns(tableId: string, inc: string): number {
   return computedIncs.get(`${tableId}:${inc}`)?.fo?.returns ?? 0;
 }
@@ -5762,19 +5985,56 @@ export function computedFairOnlyChecking(): number {
  * key, and whichever write the doc keeps is the same. On a doc holding every
  * update whole (a trim deletes the checkpoint it replaces in the update that
  * writes the next, and Yjs applies the deletes of an update it holds part of
- * first). Returns how many it wrote (0: nothing lacks, or the doc holds part).
- * No page signs anything here, and none of it is a record this page made.
+ * first). With them, in the same transaction, the table's switch on the game
+ * when the table plays it and the switch names another incarnation or none
+ * (design §8.4 P4; fairOnlySwitchOff says when): `{ v: 1, inc }`, the value
+ * every page writes. Returns how many it wrote, the switch counted as one (0:
+ * nothing lacks, or the doc holds part). No page signs anything here, and none
+ * of it is a record this page made.
  */
 export function putBackFairOnlyRecords(tableId: string, inc: string): number {
   const map = computedMap;
   const c = computedIncs.get(`${tableId}:${inc}`);
   if (!map || !c?.fo || !docAlive() || docHoldsPart()) return 0;
   const back = fairOnlyLacks(c, map);
-  if (back.length === 0) return 0;
+  const hint = fairOnlySwitchOff(c);
+  if (back.length === 0 && !hint) return 0;
+  const casino = ensureMap();
   boundDoc!.transact(() => {
     for (const [key, value] of back) map.set(key, value);
+    if (hint) casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
   });
-  return back.length;
+  return back.length + (hint ? 1 : 0);
+}
+
+/**
+ * 🔒 Put the table of FAIR ONLY game `inc` back into the room's layout as this
+ * page last saw it placed, and the table's switch on the game with it, in one
+ * transaction (design §8.4 P5; fairOnlyTableOut says when): a table taken out
+ * by a peer while its game is live, which the removal's teardown took the
+ * switch of on every page that heard it (clearTableKeys; it marks nothing of
+ * the game, S7; a switch that names a page-signed incarnation nothing has
+ * ended is left, as fairOnlySwitchOff leaves it: fairOnlySwitchFree). Where
+ * it goes back over a table of the other game, the pages take that table
+ * down as one removed, and its teardown leaves the switch written here
+ * (clearTableKeys: what closes is a table of the other game, and the game's
+ * own stands under the id). The
+ * placement is the layout's own value, so every page that
+ * saw the table where it last stood writes the same record. Not while a check
+ * of the game's resolution waits (an end order may be what waits), nor on a
+ * doc that holds part of an update. False (nothing written) otherwise.
+ */
+export function putBackFairOnlyTable(tableId: string, inc: string): boolean {
+  const layout = layoutMap;
+  const c = computedIncs.get(`${tableId}:${inc}`);
+  if (!layout || !c?.fo || !docAlive() || docHoldsPart() || c.fo.res?.pending !== false || !fairOnlyTableOut(c)) return false;
+  const placed = tableSeen.get(tableId)!.get(gameOfInc(inc));
+  const casino = ensureMap();
+  boundDoc!.transact(() => {
+    layout.set(tableId, placed);
+    if (fairOnlySwitchFree(c)) casino.set(`cfg:computed:${tableId}`, { v: 1, inc });
+  });
+  return true;
 }
 
 /**

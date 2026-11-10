@@ -1847,9 +1847,11 @@ describe("World's frame (world.ts updateCroupier)", () => {
   });
 
   it('marks the frame while a removed computed table waits to be compacted or recovered, with no table left in the room too', () => {
-    expect(body).toContain('if (tables.length || computedCompactionPending() || computedRecoveryPending()) noteTablesRunning();');
-    expect(world).toMatch(/import \{ autoSwitchComputed, computedCompactionPending, tickComputedTables \} from "\.\/computedTable";/);
-    expect(world).toMatch(/import \{ computedRecoveryPending, [^}]*\} from "\.\/casinoDoc";/);
+    // (World asks computedTable, whose tableFrame holds the terms: the specs' frames ask it too.)
+    expect(body).toContain('if (tableFrame(tables.length)) noteTablesRunning();');
+    expect(world).toMatch(/import \{ autoSwitchComputed, tableFrame, tickComputedTables \} from "\.\/computedTable";/);
+    const table = readFileSync(new URL('./computedTable.ts', import.meta.url), 'utf8');
+    expect(table).toContain('return tables > 0 || computedCompactionPending() || computedRecoveryPending() || computedFairOnlyPending();');
   });
 
   it("switches each owner-run table on by itself on the house's driving page (the table lease), before its beat", () => {

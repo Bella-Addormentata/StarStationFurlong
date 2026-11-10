@@ -981,18 +981,21 @@ describe('what a page shows and does at the table of a game', () => {
     expect(foldOf(a).felts.get(a.pid)!.rec.b).toHaveLength(2);
   });
 
-  it('a table ticked as the other game\'s plays nothing: a roulette game under a craps table\'s duties', async () => {
+  // (Until PR 6c-4b-2b a game under a table the room lists as the other game's was served by no duty at all. A table
+  // of the other game written under the id is a table out of the room for the game, and a round in flight is served
+  // wherever its table is: computedTable serveLeftGames.)
+  it('a table ticked as the other game\'s is none of that game\'s: a roulette game under a craps table\'s listing is served by its own duties, its round closed at its deadline, and no craps round is played there', async () => {
     const pages = await betting();
     const [a] = pages;
-    // (the house beats all the while, so that the game, if it were served, would be closed: only its beats change the doc)
-    const records = (): string => JSON.stringify(['casinoComputed', 'casino'].map((name) =>
-      [...a.doc.getMap<unknown>(name).entries()].filter(([k]) => !k.startsWith('hb:')).map(([k, v]) => [k, v instanceof Y.Map ? v.toJSON() : v]).sort()));
-    const before = records();
-    run(pages, T0 + STEP, T0 + 60_000, { step: STEP, tables: [{ id: TABLE, game: 'craps' }] });
-    expect(records()).toEqual(before);
-    expect(keysIn(a, 'c')).toEqual([]);
-    run(pages, T0 + 60_000 + STEP, T0 + 90_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
-    expect(keysIn(a, 'c', 1).length).toBeGreaterThan(0);
+    const tables = [{ id: TABLE, game: 'craps' as const }];
+    const closedAt = run(pages, T0 + STEP, T0 + 90_000, { step: STEP, tables, until: () => keysIn(a, 'c', 1).length > 0 });
+    expect(closedAt).toBeGreaterThanOrEqual(T0 + a.table.BET_WINDOW_MS - STEP * 2);
+    expect(closedAt).toBeLessThanOrEqual(T0 + a.table.BET_WINDOW_MS + STEP * 4);
+    // (the close is the roulette game's, on its house's commitment, and freezes the two slips)
+    for (const c of closesOf(a, 1)) expect(c.h).toBe(kit.houseCommit(H, 1));
+    expect(frozenOf(closesOf(a, 1)[0])).toHaveLength(2);
+    // (nothing of craps: no craps state is read at the table)
+    expect(a.table.readComputedCraps(TABLE, closedAt)).toBeNull();
   });
 
   it('the card has no checkpoint lines at a game: a game is not trimmed by a page', async () => {

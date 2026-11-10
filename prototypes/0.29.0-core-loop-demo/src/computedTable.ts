@@ -154,6 +154,7 @@ import {
   computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
+  computedFairOnlyChecking,
   computedFairOnlyRecoveries,
   computedFairOnlyReturns,
   computedFoldOf,
@@ -164,6 +165,7 @@ import {
   computedIncOf,
   computedLiveTables,
   computedRecoveries,
+  computedRecoveryPending,
   computedResolutionOf,
   computedRestorePending,
   computedRecoveryOn,
@@ -193,6 +195,7 @@ import {
   ownerRunChosen,
   putBackHouseRecords,
   putBackFairOnlyRecords,
+  putBackFairOnlyTable,
   putComputedSwitchBack,
   readAllBets,
   readAllCrapsBets,
@@ -2824,7 +2827,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
     tickTable(st, now);
     tellPhase(st, now);
   }
-  serveLeftGames(inRoom, now);
+  serveLeftGames(now);
   // A live table out of the room ends; ended incarnations, whatever tables
   // were passed (a removed one isn't), are compacted.
   awayDuty(inRoom, now);
@@ -2835,36 +2838,38 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
 }
 
 /**
- * 🔒 Serve the FAIR ONLY games the tables passed have left (S9 moved the table
- * to another game of the deed holder's, or of the switch's hint): each live
- * game this page keeps a state of, of the table's game, beside the one played.
- * What the page put into such a game while it was played reaches a decision
- * all the same: its seeds are revealed, its close written while its house is
- * heard (closePaused) and its abandon (houseAway), its put-backs go, its notes
- * are kept.
- * Not what would start something for the player where the table no longer plays
- * the game (tickTable side): the held felt, the riders' bets, the phase the
- * table's listeners are told of, which is the game played's. Only a state that
- * exists is served: a page serves a game it has played at the table, and one
- * it has not, or that it was bound after the table left, it does not (a state
- * made at a look at the table is the game played's: tableOf). A game that has
- * ended is let go of by compaction, as before. Nor a game the page has nothing
- * in (nothingAtStake): a table's hint can name many games in turn, and the
- * page would pay for the gates of each at every frame for no duty. What a pass
- * costs a state that is not due is a lookup and a comparison.
+ * 🔒 Serve the live FAIR ONLY games this page keeps a state of that the pass
+ * over the tables did not: a game its table has left (S9 moved the table to
+ * another game of the deed holder's, or of the switch's hint), and a game whose
+ * table is not among those passed as a table of its game: taken out of the
+ * room's layout (a removal has no part in a game, S7, and the pages put the
+ * table of the game played back: fairKeepDuty), or standing there as a table
+ * of the other game.
+ * What the page put into such a game reaches a decision all the same: its
+ * seeds are revealed, its close written while its house is heard (closePaused)
+ * and its abandon (houseAway), its put-backs go, its notes are kept. A round
+ * in flight does not wait for a record of the room's layout that any peer can
+ * delete: with the game unserved while its table is out, no page would reveal,
+ * and the first page served again would forfeit the others on graces that ran
+ * out meanwhile.
+ * Not what would start something for the player where no table plays the game
+ * (tickTable side): the held felt, the riders' bets, the phase the table's
+ * listeners are told of, which is the game played's at a table in the room.
+ * Only a state that exists is served: a page serves a game it has played at
+ * the table, and one it has not, or that it was bound after the table left, it
+ * does not (a state is made at a look at a table that plays the game:
+ * tableOf). A game that has ended is let go of by compaction, as before. Nor a
+ * game the page has nothing in (nothingAtStake): a table's hint can name many
+ * games in turn, and the page would pay for the gates of each at every frame
+ * for no duty. The state the pass over the tables served is not due here (its
+ * tick is TICK_MS old at the most), so no game is asked of S9: what a pass
+ * costs a state that is not due is a comparison.
  */
-function serveLeftGames(inRoom: ReadonlyMap<string, GameName>, now: number): void {
+function serveLeftGames(now: number): void {
   if (fairTables.size === 0) return;
   const me = getPlayerId();
-  // (The game each table plays, asked of S9 once for a table in this pass, and only for a state that is due: S9 reads
-  // all the table's games, which a hint can multiply, and the pass looks at every state the page keeps.)
-  const played = new Map<string, string | null>();
   for (const st of [...fairTables.values()]) {
-    if (inRoom.get(st.t) !== st.game) continue;
     if (st.tickedAt !== null && now >= st.tickedAt && now - st.tickedAt < TICK_MS) continue;
-    let inc = played.get(st.t);
-    if (inc === undefined) played.set(st.t, (inc = computedIncOf(st.t)));
-    if (st.inc === inc) continue;
     if (computedResolutionOf(st.t, st.inc)?.live !== true) continue;
     if (nothingAtStake(st, me)) continue;
     st.tickedAt = now;
@@ -4534,6 +4539,14 @@ interface Keeping {
    *  open, is a wait of its own. */
   sid: string | null;
   sesMoves: number;
+  /** Since when this page sees the game's table out of the room's layout
+   *  (null: it is not), and casinoDoc's counts of the changes of the layout's
+   *  key of it and of the times it went out, as this page last read them
+   *  (FairOnlyRecovery tableMoves, tableOuts): a table that came back and went
+   *  since, or was another game's meanwhile, is a wait of its own. */
+  tableAt: number | null;
+  tableMoves: number;
+  tableOuts: number;
   /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
    *  and when it read each put-back since (its own and other pages'), within
    *  CONTESTED_CALM_MS. Whether it read one while it did not stand down, since
@@ -4560,7 +4573,9 @@ let keptAt: number | null = null;
  * computedFairOnlyRecoveries has which, and when one is missing). The page
  * counts from what it holds meanwhile, so nothing waits on this: it is for the
  * pages that come later, which can count nothing of a game whose base the doc
- * lacks.
+ * lacks. And of the game its table plays, what makes the table play it for a
+ * page that comes later: the table's switch (P4) and the table in the room's
+ * layout (P5).
  * - **The records**: at once, in turn (dutyRank('restore') among the signers of
  *   the game's staked felts, STAGGER_MS a place; a page with no felt there
  *   OUTSIDER_WAIT_MS later; the turns start again each time the records come
@@ -4577,6 +4592,25 @@ let keptAt: number | null = null;
  *   turn it is if by no one else, whatever a peer wrote and deleted meanwhile.
  *   A stand-down that is over is forgotten at the page's first look past its
  *   end, whatever the page does at that look (standOver).
+ * - **The table's switch**, naming another incarnation or none while the table
+ *   plays the game (S9's choice among the table's live games, to which the
+ *   switch is a hint: casinoDoc computedIncOf): one more record, written with
+ *   the others in the same write and by the same turns. Not while the table is
+ *   out of the layout.
+ * - **The table**, out of the room's layout while the game it plays is live
+ *   and no end order stands (the game's authority takes a table out by ending
+ *   the game): as this page last saw it placed, the switch with it in one
+ *   write, OPEN_WAIT_MS on, in the turns of the records after that, with the
+ *   room heard all the while, JUNK_GAP_MS after this page's last put-back of
+ *   the game at the earliest. The wait is one disappearance's: a table that
+ *   came back and went, an end order that stood meanwhile, or the table
+ *   playing another game meanwhile starts it again, between two looks of the
+ *   page as well (casinoDoc counts the times the table went out: tableOuts).
+ *   One stand-down for all a page puts back of a game: a table or a switch
+ *   that comes back is a put-back counted as a record's is, the records' and
+ *   the table's each by itself (a table that stays out hides no put-back of
+ *   the records), so CONTESTED_COUNT is of put-backs of the game, and a page
+ *   that finds something of it lacking after the last of them stands down.
  * - **The live session's map**, gone with the game live: an empty one
  *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
  *   while, as at a page-signed table (recoverDuty: two pages that made one at
@@ -4588,7 +4622,7 @@ let keptAt: number | null = null;
  * clock, so the page writes that much later and in its turn still (a wait
  * started again would end somewhere among the turns after it), and one gone
  * back by TABLE_CLOCK_SLACK_MS or more is a wake (croupier tablesAwake), whose
- * lapse starts both waits again. Not on a frame whose doc was bound afresh
+ * lapse starts the waits again. Not on a frame whose doc was bound afresh
  * since this page looked at its clock. Nothing is signed, and nothing is given
  * up: a page holds what it counted for as long as it is bound.
  */
@@ -4607,16 +4641,18 @@ function fairKeepDuty(pub: string, now: number): void {
     listed.add(key);
     let w = keeping.get(key);
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
-    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, tableAt: null, tableMoves: r.tableMoves, tableOuts: r.tableOuts, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
     const over = standOver(w, now);
     if (!ready) {
       w.at = null;
       w.missingAt = null;
+      w.tableAt = null;
       continue;
     }
     if (came) w.at = null;
     keepStep(w, r, pub, now, over);
+    tableStep(w, r, pub, now, over);
     openStep(w, r, pub, now);
   }
   // (A game with nothing missing is not listed: its waits are over, and what
@@ -4629,6 +4665,7 @@ function fairKeepDuty(pub: string, now: number): void {
     standOver(w, now);
     w.at = null;
     w.missingAt = null;
+    w.tableAt = null;
     if (w.back.length === 0 && w.until === 0) keeping.delete(key);
   }
 }
@@ -4679,9 +4716,22 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, ove
     return;
   }
   if (w.at === null || w.at > now) w.at = now;
-  if (now < w.until) return;
   // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
   if (over !== null && w.at < over) w.at = over;
+  if (standsDown(w, r, now)) return;
+  if (now < w.at + turnOf('restore', r, r.u, pub)) return;
+  if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
+  if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
+}
+
+/** Whether this page puts nothing of the game back now: it stands down
+ *  (KEEP_BACKOFF_MS), from now on when CONTESTED_COUNT put-backs of the game
+ *  within CONTESTED_CALM_MS did not last, one of them at the least read while
+ *  it did not stand down (the look that finds the game lacking again), or from
+ *  before. One stand-down for all the page puts back of a game: its records,
+ *  the table's switch and the table. */
+function standsDown(w: Keeping, r: FairOnlyRecovery, now: number): boolean {
+  if (now < w.until) return true;
   // (What was counted is let go of where a stand-down begins. None of it would
   // be counted past one as it is: a stand-down is longer than
   // CONTESTED_CALM_MS, and noteReturns lets go at every look.)
@@ -4690,11 +4740,38 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, ove
     w.back = [];
     w.fresh = false;
     notifyCasinoView(r.t);
+    return true;
+  }
+  return false;
+}
+
+/** The game's table, out of the room's layout (design §8.4 P5): put back, and
+ *  the switch with it, OPEN_WAIT_MS on, in the turns of the records after
+ *  that, with the room heard all the while (the game's end may be on its way:
+ *  its authority takes a table out by ending the game), JUNK_GAP_MS after this
+ *  page's last put-back of the game, and not while the room stands down. The
+ *  wait is one disappearance's: the layout's key of the table changed
+ *  (tableMoves), or the table was not out for the game at some count since this
+ *  page last looked (tableOuts: it stood there, it played another game, an end
+ *  order stood), between two looks of this page as well, and the wait starts
+ *  again. */
+function tableStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, over: number | null): void {
+  if (w.tableMoves !== r.tableMoves || w.tableOuts !== r.tableOuts) {
+    w.tableMoves = r.tableMoves;
+    w.tableOuts = r.tableOuts;
+    w.tableAt = null;
+  }
+  if (!r.tableMissing) {
+    w.tableAt = null;
     return;
   }
-  if (now < w.at + turnOf('restore', r, r.u, pub)) return;
+  if (w.tableAt === null || w.tableAt > now) w.tableAt = now;
+  // (After a stand-down the turns start when it is over, as the records' do.)
+  if (over !== null && w.tableAt + OPEN_WAIT_MS < over) w.tableAt = over - OPEN_WAIT_MS;
+  if (standsDown(w, r, now)) return;
+  if (now < w.tableAt + OPEN_WAIT_MS + turnOf('restore', r, r.u, pub) || !heardThrough(now - OPEN_WAIT_MS, now)) return;
   if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
-  if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
+  if (putBackFairOnlyTable(r.t, r.inc)) w.wroteAt = now;
 }
 
 function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
@@ -4922,6 +4999,47 @@ export function computedCompactionPending(): boolean {
   } catch {
     return false;
   }
+}
+
+/** 🔒 Whether a FAIR ONLY game has work owed that no table of the room
+ *  carries: something of it for the put-back duty to look at (casinoDoc
+ *  computedFairOnlyChecking: a game the doc lacks a record, the switch, the
+ *  table or the session's map of stays there until it is whole, through a
+ *  stand-down too, whose end the page must be awake at), or a live game this
+ *  page has something at stake in (serveLeftGames: its seed to reveal, its
+ *  close, its abandon, what it puts back). Both are an awake page's, and with
+ *  the room's last table out World would mark no frame: the page would read as
+ *  asleep a lapse on, and for good. (Without this term the table went back by
+ *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
+ *  lapse: no later turn came, no page without a felt wrote, nothing ran after
+ *  a stand-down, and no round in flight was served past the lapse.) Only asked
+ *  in a room with no table (tableFrame), and never throws out of World's
+ *  frame. What it costs with no game tracked is a set's size, twice. */
+export function computedFairOnlyPending(): boolean {
+  try {
+    if (computedFairOnlyChecking() > 0) return true;
+    if (fairTables.size === 0) return false;
+    const me = getPlayerId();
+    for (const st of fairTables.values()) {
+      if (computedResolutionOf(st.t, st.inc)?.live === true && !nothingAtStake(st, me)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a frame of this page is one that runs tables, which World marks
+ *  (croupier noteTablesRunning: a page that stops marking reads as asleep a
+ *  lapse later, tablesAwake, and every duty here is an awake page's): the room
+ *  has a table (`tables` of them), or work waits that no table carries: an
+ *  ended incarnation to compact or one to end (computedCompactionPending), a
+ *  recovery owed (casinoDoc computedRecoveryPending), a FAIR ONLY game's
+ *  put-backs or its round in flight (computedFairOnlyPending). One place for
+ *  World's frame and the specs' (computedPageKit frame, computedSim), so a
+ *  spec's page sleeps where the app's does. */
+export function tableFrame(tables: number): boolean {
+  return tables > 0 || computedCompactionPending() || computedRecoveryPending() || computedFairOnlyPending();
 }
 
 // ── 🔀 The switch ────────────────────────────────────────────────────────────

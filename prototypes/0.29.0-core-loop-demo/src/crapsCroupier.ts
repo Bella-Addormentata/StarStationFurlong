@@ -594,8 +594,9 @@ export function tickAutoStickman(tableId: string): void {
  */
 export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone. (On a
-  // doc holding every update whole: croupier.closeWhenWhole.)
-  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing)));
+  // doc holding every update whole: croupier.closeWhenWhole. What closes is a
+  // craps table: clearTableKeys `closes`.)
+  closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────
