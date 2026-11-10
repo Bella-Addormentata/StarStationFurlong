@@ -117,10 +117,13 @@
 //!     gossip, so a waiting one can bring its own, and it rejoins the queue
 //!     after [`RETRY_AFTER`]. A stored peer that disagrees with a verdict,
 //!     or with a pin, is evicted; so is a public peer whose announced peak
-//!     stands more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER
-//!     peers in distinct network groups both reach, behind it or alone ahead
-//!     of it (one peer's announcement, inflated or not, condemns nobody, and
-//!     two peers in one network group corroborate nothing between them); the
+//!     stands more than [`MAX_PEAK_LAG`] blocks behind a height two OTHER
+//!     peers in distinct network groups both reach, or alone that far ahead
+//!     of a height two such peers agree on, in step with each other (one
+//!     peer's announcement, inflated or not, condemns nobody; two peers in
+//!     one network group corroborate nothing between them; and two peers
+//!     still catching up, far from each other, say nothing against the one
+//!     at the tip); the
 //!     two peers of an agreed pair must be within that lag of each other, or
 //!     the pair is passed over, non-final, for one without either of them,
 //!     while discovery looks for a peer to break the tie. A peer that stops
@@ -919,16 +922,20 @@ impl Lane {
         Ok(None)
     }
 
-    /// Before an agreed verdict, a public peer whose announced peak stands
-    /// more than [`MAX_PEAK_LAG`] blocks away from a height two OTHER peers in
-    /// distinct network groups both reach is let go ([`outlier`]): below it,
-    /// the peer lags, and its answers describe an older chain state, so a
-    /// match between it and a current peer would not mean what an agreement
-    /// should; above it, with no peer in another group anywhere near its
-    /// height, the peer stands alone ahead of everything two independent
-    /// peers agree on (an inflated announcement, or one node ahead of a
-    /// lagging pool; let go and dialled again after [`RETRY_AFTER`], it is
-    /// back either way). Nothing is let go on one peer's word, and two peers
+    /// Before an agreed verdict, a public peer out of step with the pool is
+    /// let go ([`outlier`]). One whose announced peak stands more than
+    /// [`MAX_PEAK_LAG`] blocks below a height two OTHER peers in distinct
+    /// network groups both reach lags: its answers describe an older chain
+    /// state, so a match between it and a current peer would not mean what
+    /// an agreement should. One that far above a height two such peers
+    /// agree on, in step with each other, with no peer in another group
+    /// anywhere near its own height, stands alone ahead of everything two
+    /// independent peers agree on (an inflated announcement, or one node
+    /// ahead of a lagging pair; let go and dialled again after
+    /// [`RETRY_AFTER`], it is back either way). Two peers that both stand
+    /// below it but far from each other agree on nothing: they are two
+    /// nodes still catching up, and the lower of them is the one that goes,
+    /// as lagging. Nothing is let go on one peer's word, and two peers
     /// in one network group (one host on two ports, say) corroborate nothing
     /// between them, so a pool of two, or of one group against one peer,
     /// lets nobody go here: a gap inside the chosen pair is then non-final
@@ -2242,26 +2249,40 @@ pub(crate) fn tryable<S: Into<Sources> + Copy>(pooled: &[(S, Group, bool)], cand
 /// Does a peer announcing `height` stand out of step with the rest of the
 /// pool? `announced` holds (address, network group, announced height) for
 /// every connection with a known peak, the peer itself among them or not.
-/// The others' corroborated height is the highest height two of them in
-/// distinct network groups both reach ([`corroborated`]); the peer is an
-/// outlier when it stands more than [`MAX_PEAK_LAG`] blocks below it
-/// (lagging), or more than that above it with no peer in another group
-/// within the lag of its own height (alone ahead of everything two
-/// independent peers agree on). With no two others in distinct groups there
-/// is no corroboration and no outlier: one peer's word condemns nobody, and
-/// two peers in one group (one host on two ports, say) corroborate nothing
-/// between them (#271 review, round 21). The reason, or `None`.
+///
+/// It lags when it stands more than [`MAX_PEAK_LAG`] blocks below the
+/// others' corroborated height, the highest height two of them in distinct
+/// network groups both reach ([`corroborated`]): two independent peers each
+/// say the chain is at least that long.
+///
+/// It stands alone ahead when it is more than that above the highest
+/// height two of the others in distinct groups agree on, in step with each
+/// other ([`agreed_height`]), with no peer in another group within the lag
+/// of its own height. That two others both reach a height says nothing
+/// against a peer above it; only two that agree where the tip is do. Two
+/// peers below it and far from each other are two nodes still catching up,
+/// and judged by what they both reach they let the one node at the tip go:
+/// on testnet11 the pool's first three peers were two such nodes, 285,000
+/// and 128,000 blocks behind, and the introducer's one node in step, which
+/// was let go for ten minutes and left the pool no fresh peer to pair with
+/// (the second live check, 2026-11-10).
+///
+/// With no two others in distinct groups there is no corroboration and no
+/// outlier: one peer's word condemns nobody, and two peers in one group
+/// (one host on two ports, say) corroborate nothing between them (#271
+/// review, round 21). The reason, or `None`.
 pub(crate) fn outlier(announced: &[(SocketAddr, Group, u32)], addr: SocketAddr, group: Group, height: u32) -> Option<String> {
     let others: Vec<(SocketAddr, Group, u32)> = announced.iter().copied().filter(|(a, _, _)| *a != addr).collect();
     let reference = corroborated(&others)?;
     if reference.saturating_sub(height) > MAX_PEAK_LAG {
         return Some(format!("lags {} blocks behind the height two other peers reach", reference - height));
     }
+    let agreed = agreed_height(&others)?;
     let near = others.iter().any(|(_, g, h)| *g != group && h.saturating_add(MAX_PEAK_LAG) >= height);
-    if height.saturating_sub(reference) > MAX_PEAK_LAG && !near {
+    if height.saturating_sub(agreed) > MAX_PEAK_LAG && !near {
         return Some(format!(
-            "announces height {height}, {} blocks above anything two other peers reach, and no peer elsewhere comes near it",
-            height - reference
+            "announces height {height}, {} blocks above the height two other peers agree on, and no peer elsewhere comes near it",
+            height - agreed
         ));
     }
     None
@@ -2270,11 +2291,25 @@ pub(crate) fn outlier(announced: &[(SocketAddr, Group, u32)], addr: SocketAddr, 
 /// The highest height two of `peers` in distinct network groups both reach;
 /// `None` with fewer than two groups among them.
 pub(crate) fn corroborated(peers: &[(SocketAddr, Group, u32)]) -> Option<u32> {
+    highest_shared(peers, |_, _| true)
+}
+
+/// The highest height two of `peers` in distinct network groups agree on:
+/// the lower of two announced heights within [`MAX_PEAK_LAG`] of each other,
+/// which is what a pair in step is ([`pair_in_step`]). `None` when no two in
+/// distinct groups stand that close.
+pub(crate) fn agreed_height(peers: &[(SocketAddr, Group, u32)]) -> Option<u32> {
+    highest_shared(peers, |a, b| a.abs_diff(b) <= MAX_PEAK_LAG)
+}
+
+/// The highest height two of `peers` in distinct network groups both reach,
+/// among the pairs whose two heights pass `counts`.
+fn highest_shared(peers: &[(SocketAddr, Group, u32)], counts: impl Fn(u32, u32) -> bool) -> Option<u32> {
     let mut best: Option<u32> = None;
     for (i, (_, ga, ha)) in peers.iter().enumerate() {
         for (_, gb, hb) in &peers[i + 1..] {
             let both = (*ha).min(*hb);
-            if gb != ga && best.is_none_or(|b| both > b) {
+            if gb != ga && counts(*ha, *hb) && best.is_none_or(|b| both > b) {
                 best = Some(both);
             }
         }
@@ -5579,6 +5614,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_peers_still_catching_up_do_not_outvote_the_one_at_the_tip() {
+        // As on testnet11 in the second live check (2026-11-10): `low`
+        // (introducer) and `mid` (gossip) are still catching up, out of step
+        // with the tip and with each other, and `tip` (introducer) is the one
+        // node in step with the chain. Judged by the height `low` and `mid`
+        // both reach, `tip` stood alone ahead and was let go for
+        // [`RETRY_AFTER`], and the pool was left with no fresh peer in step.
+        // The two agree on nothing, so `tip` stays; `low` lags behind what
+        // the other two both reach and goes. `tip` gossips C, which agrees
+        // with it: against the two of them `mid` lags and goes too, and
+        // `tip` and C settle the read, all within one request.
+        let far = MAX_PEAK_LAG + 1;
+        let (low_at, mid_at, tip_at) = (100, 100 + far, 100 + 2 * far);
+        let c = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(tip_at))).await;
+        let tip = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(tip_at)), node(vec![state(1, 90, None)], (1, None), vec![c.addr])).await;
+        let low = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(low_at))).await;
+        let mid = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(mid_at))).await;
+        let lane = lane(vec![(low.addr, Source::Introducer), (mid.addr, Source::Gossip), (tip.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(lane.clone(), Trust::Agreed);
+        assert_eq!(money.coin_records_by_names(vec![coin(1).coin_id()], true, None).await.unwrap().records.len(), 1);
+        let live: Vec<SocketAddr> = lane.live_conns().await.iter().map(|p| p.addr()).collect();
+        assert!(live.contains(&tip.addr) && live.contains(&c.addr), "the node at the tip and the peer it named settle the read: {live:?}");
+        assert!(!live.contains(&low.addr) && !live.contains(&mid.addr), "the two still catching up are let go: {live:?}");
+        let state = lane.state.lock().await;
+        assert!(!state.cooling.contains_key(&tip.addr), "the node at the tip was never let go");
+        assert!(state.cooling.contains_key(&low.addr) && state.cooling.contains_key(&mid.addr), "and the other two wait their turn again");
+    }
+
+    #[tokio::test]
     async fn an_inflated_peak_from_a_third_peer_condemns_no_honest_peer() {
         // Two honest peers agree at 100; a third announces a height far above.
         // Alone ahead of a height two independent peers reach, the third is the
@@ -6305,6 +6369,46 @@ mod tests {
         assert_eq!(corroborated(&[peer(1, 5)]), None);
         assert_eq!(corroborated(&[host([127, 0, 0, 1], 5), host([127, 0, 0, 2], 9)]), None, "one group");
         assert_eq!(corroborated(&[peer(1, 5), peer(2, 9), peer(3, 7)]), Some(7));
+        // What two peers agree on is the lower of two heights in step, in
+        // distinct groups; what they both reach needs no such closeness.
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5 + MAX_PEAK_LAG)]), Some(5), "in step at the lag itself");
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5 + far)]), None, "out of step");
+        assert_eq!(corroborated(&[peer(1, 5), peer(2, 5 + far)]), Some(5));
+        assert_eq!(agreed_height(&[host([127, 0, 0, 1], 5), host([127, 0, 0, 2], 5)]), None, "one group agrees with nobody");
+        assert_eq!(agreed_height(&[peer(1, 5), peer(2, 5), peer(3, 900), peer(4, 901)]), Some(900), "the highest such pair");
+    }
+
+    /// The second live check's pool on testnet11 (2026-11-10), by its
+    /// heights: two nodes still catching up, far below the tip and far from
+    /// each other, and the introducer's one node at the tip. The two agree
+    /// on nothing, so the node at the tip is let go on no word of theirs;
+    /// the lower of them lags behind what the other two both reach, and
+    /// goes. Once two peers at the tip stand beside it, the other goes the
+    /// same way. A pair that does agree, in step with each other, still
+    /// lets a lone announcer far above it go.
+    #[test]
+    fn two_peers_still_catching_up_agree_on_nothing_against_the_one_at_the_tip() {
+        let at = |n: u16| SocketAddr::from(([127, 0, 0, 1], n));
+        let g = |n: u16| group_of(at(n));
+        let peer = |n: u16, h: u32| (at(n), g(n), h);
+        let (low, mid, tip) = (4_661_567, 4_817_783, 4_946_177);
+        let pool = [peer(1, low), peer(2, mid), peer(3, tip)];
+        assert_eq!(outlier(&pool, at(3), g(3), tip), None, "the node at the tip stays");
+        assert!(outlier(&pool, at(1), g(1), low).is_some_and(|w| w.contains("lags 156216 blocks")), "the lower of the two lags");
+        assert_eq!(outlier(&pool, at(2), g(2), mid), None, "the other stays until two peers stand above it");
+        let later = [peer(2, mid), peer(3, tip), peer(4, tip - 1), peer(5, tip)];
+        assert!(outlier(&later, at(2), g(2), mid).is_some_and(|w| w.contains("lags")));
+        for n in [3, 4, 5] {
+            let h = later.iter().find(|p| p.0 == at(n)).unwrap().2;
+            assert_eq!(outlier(&later, at(n), g(n), h), None, "peer {n} at the tip stays");
+        }
+        // Just out of step is enough to agree on nothing…
+        let far = MAX_PEAK_LAG + 1;
+        let apart = [peer(1, 100), peer(2, 100 + far), peer(3, 100 + 2 * far)];
+        assert_eq!(outlier(&apart, at(3), g(3), 100 + 2 * far), None);
+        // …and two in step still tell a lone announcer above them.
+        let agreeing = [peer(1, 100), peer(2, 100 + MAX_PEAK_LAG), peer(3, 100 + MAX_PEAK_LAG + far)];
+        assert!(outlier(&agreeing, at(3), g(3), 100 + MAX_PEAK_LAG + far).is_some_and(|w| w.contains("above the height two other peers agree on")));
     }
 
     #[test]
