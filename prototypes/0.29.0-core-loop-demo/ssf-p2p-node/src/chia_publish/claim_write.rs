@@ -33,7 +33,8 @@
 //!
 //! Outside the tests the writer is called by the listing's writer from its
 //! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b), by
-//! the knock's writer from K(h) (`publish_knock_with`, PR 10c), and by
+//! the knock's writer from K(h) (`publish_knock_with`, PR 10c), by the
+//! beacon's writer from its key B (`publish_beacon_with`, PR 10d), and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
 //! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).
@@ -386,7 +387,11 @@ pub enum BurnerWait {
     /// listing's mark, which the heartbeat files again from the write the
     /// lease holds under the hint (`chia_publish::lost_listing_mark`), and
     /// the hint rule it brings. A rewrite, from the burner's own coin, never
-    /// waits so.
+    /// waits so. Only the listing names a payer to wait on here. A knock's
+    /// key is kept off a hint the SSF wallet wrote under by
+    /// [`BurnerWait::MoneyUnderHint`], and the beacon's names none, since the
+    /// SSF wallet writes nothing under the beacon's hint; it waits on every
+    /// other spend of this node instead ([`BurnerWait::OtherWriteInFlight`]).
     MoneyInFlight,
     /// A knock's key K(h) would write under an inbox hint the lease holds a
     /// write of the SSF wallet's under: one the SSF wallet paid for, or one
@@ -400,6 +405,16 @@ pub enum BurnerWait {
     /// under the hint, such as another host's knock under a contact key two
     /// cards name, does not hold it.
     MoneyUnderHint,
+    /// The beacon's key B would write while the lease parks another spend of
+    /// this node, whatever its payer: a listing from P(e), a knock from K(h)
+    /// or a spend of the SSF wallet's ([`WalletLease::outgoing_pending`]).
+    /// The beacon carries the node id in the clear, so it is not pushed
+    /// while another of this node's spends waits in a mempool, as the
+    /// beacon the beacon wallet pays for never was
+    /// (`chia_publish::publish_memo_on`'s global check). The spacing between
+    /// payers (stage 4 design §4.3 T4, PR 10e) replaces this hold. A spend B
+    /// itself pays for is [`BurnerWait::Held`], as for every burner.
+    OtherWriteInFlight,
     /// The fuse is blown: the lobby dish gave this node's burners
     /// [`MAX_GIFTS_PER_ERA`] gifts in `era`, the era the fuse counted them
     /// in ([`GiftFuse::allows`]).
@@ -425,6 +440,7 @@ impl fmt::Display for BurnerWait {
             BurnerWait::MoneyUnderHint => {
                 f.write_str("the wallet lease holds a knock the SSF wallet wrote under this knock's inbox hint, so the knock's own key does not write beside it; the next try files that knock")
             }
+            BurnerWait::OtherWriteInFlight => f.write_str("another write of this station is still in flight; the beacon goes out after it"),
             BurnerWait::FuseBlown { era } => write!(
                 f,
                 "{MAX_GIFTS_PER_ERA} gifts from the lobby dish in era {era}; no burner is funded again before era {}",
@@ -460,6 +476,11 @@ enum Slot {
     /// The listing's and the self-test's: a later write spends the key's own
     /// 1-mojo coin to itself (the table's rewrite row, R5).
     Rewritten,
+    /// The beacon's: rewritten as the listing's is (the table's two beacon
+    /// rows), and not written while the lease parks another spend of this
+    /// node ([`BurnerWait::OtherWriteInFlight`]), until the payers are
+    /// spaced (§4.3 T4, PR 10e).
+    RewrittenAlone,
     /// A knock's: K(h) writes once and is never spent again (the knock row),
     /// and never beside a write of the SSF wallet's, `money`, under its hint
     /// (§8.3).
@@ -761,13 +782,13 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// `body` gets the id of the coin the write's own coin will name as its
 /// parent, g for a first write and the burner's coin for a rewrite, so a
 /// knock seals to it. With a `gate`, `body` runs and the bundle is pushed
-/// under it, as `publish_memo_with` does. The bundle is built and checked
+/// under it, as `chia_publish::publish_memo_on` does. The bundle is built and checked
 /// against R1 to R7 ([`build_burner_bundle`]; a broken rule is the
 /// [`BurnerRule`] inside the error) and pushed with its on-chain input parked
 /// under the burner as its payer ([`Payer::of_burner`]): F for a first
 /// write, never g. The [`MemoWrite`] names that payer, for a first write and
 /// a rewrite alike. An acknowledged or an unanswered push is a write, `acked`
-/// true or false, as in `publish_memo_with`, and a first write's gift is
+/// true or false, as in `chia_publish::publish_memo_on`, and a first write's gift is
 /// counted in the fuse; a refused one, or one the lease would not park, is
 /// the [`PushError`] inside the error, and counts nothing.
 ///
@@ -777,7 +798,9 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 ///
 /// This is the writer of a slot that is rewritten, the listing's and the
 /// self-test's. A knock's key writes once, through [`knock_write_with`],
-/// which shares this body and adds the knock slot's own checks.
+/// which shares this body and adds the knock slot's own checks. The
+/// beacon's key is rewritten too, through [`beacon_write_with`], which
+/// shares this body and adds its hold beside another write of this node.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -795,6 +818,43 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     money: Option<Payer>,
 ) -> Result<MemoWrite> {
     write_slot(lease, fuse, net, client, now, key, era, hint, gate, body, rng, what, money, Slot::Rewritten).await
+}
+
+/// The beacon's write from its key B (stage 4 design §4.1, the two beacon
+/// rows), on a given lease, fuse, network, chain, instant and random source,
+/// as [`burner_write_with`] takes them: the writer of a slot that is
+/// rewritten, whose lines name the write a "beacon". B's first write claims
+/// a lobby dish coin in its own bundle, under the gift rules and the fuse
+/// (§5.2), and every later one spends B's oldest 1-mojo coin the lease does
+/// not hold to itself, with no gift. A coin of any other amount at B, such
+/// as one an operator sent it while the beacon wallet was funded by hand, is
+/// a stray and is never written from (R7).
+///
+/// It adds one check to that writer's, under the lease's gate, after the
+/// reconciliation and B's own [`BurnerWait::Held`] check and before the
+/// chain is asked for B's coins: while the lease parks any other spend of
+/// this node, whatever its payer, the beacon waits
+/// ([`BurnerWait::OtherWriteInFlight`]). That is the ordering the beacon
+/// always had, through the money writer's global check
+/// (`chia_publish::publish_memo_on`), kept until the payers are spaced
+/// (§4.3 T4, PR 10e), which replaces it. It names no payer to wait on
+/// before a first write ([`BurnerWait::MoneyInFlight`]): the hold above
+/// already covers a spend of the SSF wallet's, and the SSF wallet never
+/// writes under the beacon's hint.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn beacon_write_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &Mutex<GiftFuse>,
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    now: Instant,
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    rng: &mut R,
+) -> Result<MemoWrite> {
+    write_slot(lease, fuse, net, client, now, key, era, hint, None, body, rng, "beacon", None, Slot::RewrittenAlone).await
 }
 
 /// A knock's write from its key K(h) (stage 4 design §4.1, the knock row:
@@ -968,8 +1028,11 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
     }
 }
 
-/// The body of [`burner_write_with`] and [`knock_write_with`]: every step
-/// their docs give, with `slot` the rule the key writes under. The knock's
+/// The body of [`burner_write_with`], [`beacon_write_with`] and
+/// [`knock_write_with`]: every step their docs give, with `slot` the rule
+/// the key writes under. The beacon's slot ([`Slot::RewrittenAlone`]) adds
+/// one step after the first `Held` check: no other spend of this node parked
+/// ([`BurnerWait::OtherWriteInFlight`]). The knock's
 /// slot ([`Slot::Once`]) adds two steps between the `Held` checks and the
 /// choice of what to write from: no write of the SSF wallet's held under
 /// its hint ([`BurnerWait::MoneyUnderHint`]), then its own question
@@ -1000,6 +1063,9 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
     let burner_ph = key.puzzle_hash();
     if lease.outgoing_pending_for(payer) || lease.parks_spend_at(burner_ph) {
         return Err(BurnerWait::Held.into());
+    }
+    if slot == Slot::RewrittenAlone && lease.outgoing_pending() {
+        return Err(BurnerWait::OtherWriteInFlight.into());
     }
     let (records, partial) = records_at(client, burner_ph).await?;
     let coins = Unspent::of(&records, partial).coins;
@@ -1095,8 +1161,10 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
 /// (`chia_publish::publish_burner_presence`, §13 row 10), and the heartbeat
 /// files its write in the presence mark. Neither does a knock: its key
 /// writes once, through [`knock_write_with`] (`chia_publish::publish_knock_with`),
-/// and the heartbeat files its write in `knocks.json`. This writes a slot
-/// that is rewritten.
+/// and the heartbeat files its write in `knocks.json`. Nor does the beacon:
+/// its key B writes through [`beacon_write_with`]
+/// (`chia_publish::publish_beacon_with`), and the heartbeat files its write
+/// in the beacon mark. This writes a slot that is rewritten.
 pub async fn burner_write(
     key: &BurnerKey,
     era: u64,

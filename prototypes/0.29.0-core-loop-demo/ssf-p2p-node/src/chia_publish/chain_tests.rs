@@ -113,10 +113,51 @@
 //! and under a hint two hosts share it is filed for its own host alone,
 //! found behind the other host's newer knock
 //! (`a_knock_whose_entry_a_restart_lost_is_not_filed_as_another_hosts_under_a_shared_contact_key_and_is_filed_again_as_its_own`).
+//! The beacon is written from its own key B, the beacon wallet's key
+//! ([`beacon_wallet_key`], `MoneyKey::beacon`), on both paths. The beacon
+//! arm's step chooses the writer ([`beacon_on_path`], [`Setup::arm_beacon`]):
+//! with burner keys on, the beacon's own seam ([`publish_beacon_with`],
+//! [`Setup::beacon`]); with them off, the money writer's. B's first write
+//! with burner keys on claims a gift at B's unchanged address, and a
+//! newcomer reads it back as this node's beacon
+//! (`a_burner_beacons_first_write_claims_a_gift_at_bs_unchanged_address_and_is_read_back_as_this_nodes_beacon`).
+//! The next era's is written from B's oldest 1-mojo coin with no gift, never
+//! from a coin sent to fund B
+//! (`the_next_eras_burner_beacon_is_written_from_bs_oldest_one_mojo_coin_with_no_gift_and_never_from_its_funded_coin`),
+//! and off the burner path it is main's, paid from B's largest coin
+//! (`a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_and_waits_behind_any_parked_spend`).
+//! A beacon B paid for as a wallet, still in flight, holds the burner's
+//! (`a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_settles`),
+//! as does any other spend of this node the lease has parked, on both paths
+//! (`a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lands`).
+//! The beacon guard refuses the beacon on both paths while the other
+//! network's beacon mark in the same folder is fresh, asks the chain nothing
+//! and leaves that file as it was
+//! (`a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_beacon_on_both_paths_asks_the_chain_nothing_and_leaves_the_file_as_it_was`).
+//! The burner beacon's waits and refusals are the burner writer's: no dish
+//! coin ready
+//! (`a_burner_beacon_with_no_dish_coin_ready_waits_names_no_key_and_goes_out_once_one_is`),
+//! a lost race for one
+//! (`a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_from_another_coin`),
+//! a full mempool
+//! (`a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_lands_once_cleared_with_no_fee`)
+//! and a blown fuse
+//! (`a_burner_beacon_the_blown_fuse_holds_waits_claims_nothing_and_is_funded_in_the_next_era`).
+//! A beacon whose mark a restart lost is held while it is in flight and then
+//! rewritten from B's coin with no second gift
+//! (`a_burner_beacon_whose_mark_a_restart_lost_is_held_while_in_flight_and_then_rewritten_from_bs_coin_with_no_second_gift`).
+//! A clone's beacon from B's coin leaves ours to be written from the coin it
+//! made
+//! (`a_clones_beacon_from_bs_coin_leaves_ours_to_be_written_from_the_coin_it_made_with_no_gift`),
+//! and a reorganization that gives a first beacon's dish coin to a stranger
+//! has it written again from another coin, with one gift counted
+//! (`a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_written_again_from_another_coin_with_one_gift_counted`).
+//! The step refuses a burner root of another network
+//! (`a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing`).
 //!
 //! No test here calls the node's own writers, which run on the
 //! process-wide lease (`claim_write::burner_write`, [`publish_burner_presence`],
-//! [`publish_node_presence`], [`publish_knock`] and [`publish_memo_with`]),
+//! [`publish_node_presence`], [`publish_knock`] and [`publish_beacon`]),
 //! the burner writer's fuse (`GIFT_FUSE`) or the flag, and none reads the
 //! process's network, so they run alike whatever network CI names.
 //!
@@ -146,7 +187,7 @@ use crate::chia_knock::{KnockBook, SETTLED_DEPTH};
 use crate::chia_peer::mock::chain::{MockChain, FAILED};
 use crate::chia_peer::mock::MockNode;
 use crate::chia_peer_lane::{Lane, PeerLane, Trust};
-use crate::chia_resolve::{child_under_hint, extract_ciphertext, memo_digest, read_ck, read_inbox, spent_heights, unix_now, HintChild, WriteStanding};
+use crate::chia_resolve::{child_under_hint, extract_ciphertext, memo_digest, read_beacons, read_ck, read_inbox, spent_heights, unix_now, HintChild, WriteStanding};
 use chia_protocol::ProtocolMessageTypes;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -413,6 +454,40 @@ impl Setup {
         let path = burner_path.then_some(&root);
         let mut rng = StdRng::seed_from_u64(seed);
         sendable(knock_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &payer, &gate, leave, req, &ROOM_KEY, era, now_unix, &mut rng)).await
+    }
+
+    /// `node`'s beacon for `era`, dated `now_unix`, written from B, the
+    /// beacon key of test wallet `wallet` as a burner key ([`beacon_key`]),
+    /// by the beacon's own seam ([`publish_beacon_with`]) on the test's
+    /// lease, fuse, network and chain, at the next instant ([`Self::later`]),
+    /// with the random source seeded by `seed`: the write the heartbeat makes
+    /// with burner keys on, once the beacon guard has let it by. Its future
+    /// is checked to be `Send`, as the heartbeat's task needs it to be.
+    async fn beacon(&mut self, wallet: u8, node: &iroh::SecretKey, era: u64, now_unix: u64, seed: u64) -> Result<(Bytes32, MemoWrite)> {
+        let at = self.later();
+        let key = beacon_key(wallet);
+        let mut rng = StdRng::seed_from_u64(seed);
+        sendable(publish_beacon_with(&self.lease, &self.fuse, NET, &self.money, at, &key, node, era, now_unix, &mut rng)).await
+    }
+
+    /// What the beacon arm's step makes of a due try for `node`'s beacon in
+    /// `era` ([`beacon_on_path`]), on the test's lease, fuse, network and
+    /// chain, at the next instant ([`Self::later`]), dated `now_unix`, in
+    /// the data folder `data`, where the step itself finds the other
+    /// network's beacon mark for its guard, with the random source seeded by
+    /// `seed`: the step the heartbeat takes for a beacon that is due. On the
+    /// burner path (`burner_path`) its root is test wallet `wallet_n`'s on
+    /// the test's network ([`root`]); off it there is none. The step is given
+    /// `wallet_n`'s key, the SSF wallet's, and derives B from it itself. Its
+    /// future is checked to be `Send`, as the heartbeat's task needs it to
+    /// be.
+    #[allow(clippy::too_many_arguments)]
+    async fn arm_beacon(&mut self, wallet_n: u8, burner_path: bool, node: &iroh::SecretKey, era: u64, data: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
+        let at = self.later();
+        let (root, w) = (root(wallet_n), wallet(wallet_n));
+        let path = burner_path.then_some(&root);
+        let mut rng = StdRng::seed_from_u64(seed);
+        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &w, data, era, now_unix, &mut rng)).await
     }
 
     /// The gifts the test's fuse counts against `era` ([`GiftFuse`]).
@@ -811,6 +886,120 @@ fn knock_arm(e: &anyhow::Error, req: &KnockRequest, era: u64) -> (VecDeque<Knock
     let (mut queue, mut wait, mut found) = (VecDeque::new(), None, ChainKnocked::default());
     knock_not_written(true, req.clone(), e, era, Instant::now(), &mut queue, &mut wait, &mut found);
     (queue, wait, found)
+}
+
+/// B, the beacon key of test wallet `n`, as the beacon wallet's key
+/// ([`beacon_wallet_key`]): the key that pays for the beacon with burner keys
+/// off, from a coin sent to its address.
+fn beacon_wallet(n: u8) -> SecretKey {
+    beacon_wallet_key(&wallet(n))
+}
+
+/// B of test wallet `n` as a burner key (`MoneyKey::beacon`): the key that
+/// writes the beacon with burner keys on. It is [`beacon_wallet`]'s key, so
+/// the two name one payer and one address.
+fn beacon_key(n: u8) -> BurnerKey {
+    MoneyKey::new(wallet(n)).beacon()
+}
+
+/// A data folder for the beacon arm's step where nothing is: a folder of
+/// the temp directory that is never made, so it holds no beacon mark of the
+/// other network's and the guard lets every try by. No test here reads a
+/// real data folder.
+fn no_data_folder() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ssf-mock-chain-no-data-folder-{}-{}", std::process::id(), rand::random::<u64>()))
+}
+
+/// The other network's beacon mark in the test's own data folder `dir`, at
+/// the path the guard reads there ([`other_beacon_mark`]), written
+/// as a node of that network saves it, dated `last_at`, and left readable by
+/// all (0644 on unix) so a read that tightened it would show: its path.
+fn other_mark(dir: &Dir, last_at: u64) -> std::path::PathBuf {
+    let path = dir.0.join(other_beacon_mark(NET));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mark = BeaconMark { era: 3, last_at, hint: "aa".repeat(32), ..Default::default() };
+    std::fs::write(&path, serde_json::to_vec(&mark).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    path
+}
+
+/// The file at `path` as the guard must leave it: its bytes and, on unix,
+/// its mode.
+fn file_state(path: &std::path::Path) -> (Vec<u8>, u32) {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let mode = 0;
+    (std::fs::read(path).unwrap(), mode)
+}
+
+/// The beacon the arm's step wrote ([`BeaconDone::Written`]): its hint, its
+/// write and whether B wrote it as a burner key. A guarded or failed step
+/// fails the test.
+fn beacon_wrote(done: Result<BeaconDone>) -> (Bytes32, MemoWrite, bool) {
+    match done {
+        Ok(BeaconDone::Written { hint, write, from_burner }) => (hint, write, from_burner),
+        Ok(BeaconDone::Guarded(line)) => panic!("guarded, not written: {line}"),
+        Err(e) => panic!("not written: {e:#}"),
+    }
+}
+
+/// Why the beacon arm's step waited on the burner path, if it did
+/// ([`BurnerWait`]), read as a caller reads it, by downcasting.
+fn beacon_waited(done: &Result<BeaconDone>) -> Option<BurnerWait> {
+    done.as_ref().err().and_then(|e| e.downcast_ref::<BurnerWait>().copied())
+}
+
+/// The beacon guard's line, if the arm's step was refused by it
+/// ([`BeaconDone::Guarded`]).
+fn beacon_guarded(done: &Result<BeaconDone>) -> Option<String> {
+    match done {
+        Ok(BeaconDone::Guarded(line)) => Some(line.clone()),
+        _ => None,
+    }
+}
+
+/// The peers' reasons, if every peer refused the beacon's push
+/// ([`PushError::Rejected`]).
+fn beacon_refused(done: &Result<BeaconDone>) -> Option<String> {
+    match done.as_ref().err().and_then(|e| e.downcast_ref::<PushError>()) {
+        Some(PushError::Rejected(why)) => Some(why.clone()),
+        _ => None,
+    }
+}
+
+/// That no text the beacon arm gives for the beacon's failure `e` names its
+/// key `key`: neither its failure line on the burner path or off it
+/// ([`beacon_failure_line`]) nor the log's text of it (`{e:#}`) holds the
+/// key's payer text, the hex of its puzzle hash, or its address on any
+/// network. The beacon carries the node id in the clear, so a log that named
+/// B beside it would add nothing a reader of the chain lacks; the rule is
+/// kept all the same, so that no burner's wait or refusal ever names a key.
+fn names_no_beacon(e: &anyhow::Error, key: &BurnerKey) {
+    let hex = Payer::of_burner(key).hex();
+    let addresses: Vec<String> =
+        crate::chia_network::ChiaNet::ALL.iter().map(|net| chia_sdk_utils::Address::new(key.puzzle_hash(), net.prefix().to_string()).encode().unwrap()).collect();
+    for text in [beacon_failure_line(true, 0, e), beacon_failure_line(false, 0, e), format!("{e:#}")] {
+        assert!(!text.contains(&hex), "{text}");
+        assert!(addresses.iter().all(|a| !text.contains(a.as_str())), "{text}");
+    }
+}
+
+/// The beacons read under era `era`'s public hint as a newcomer reads them
+/// ([`read_beacons`], on the carrier lane, at `peak` and `now`): each one's
+/// node id, the coin that carries it and the height it was confirmed at. The
+/// reader keeps one beacon a node, the newest.
+async fn beacons_of(s: &Setup, era: u64, peak: u32, now: u64) -> Vec<(iroh::PublicKey, Bytes32, u32)> {
+    let hint = Bytes32::new(chia_lane::derive_beacon_hint(NET, era));
+    let found = read_beacons(NET, &s.carrier, peak, now).await.unwrap();
+    found.iter().filter(|b| b.hint == hint).map(|b| (b.item.node_id, b.coin_id, b.confirmed_height)).collect()
 }
 
 /// A presence write lands, the resolver's reader opens it under the
@@ -1977,7 +2166,7 @@ async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_
 
     // One write filed in both marks under its hint, so that each reader
     // judges the coins and the hint its own mark names. The beacon's own
-    // writer moves to a burner in a later PR (§13 row 10).
+    // writer from its key B is shown further down ([`Setup::beacon`]).
     let mark = NodePublishMark::written(0, 1, "a".into(), unix_now(), hint, &write, node.public().to_string());
     let beacon = BeaconMark::written(0, unix_now(), hint, &write, node.public().to_string());
     let (g_hex, f_hex) = (hex::encode(g.coin_id()), hex::encode(f.coin_id()));
@@ -4476,5 +4665,678 @@ async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_
     assert_eq!((filed.coin_id, filed.payer), (hex::encode(coin.coin_id().to_bytes()), Some(money.hex())), "W's write, naming W");
     assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
     assert_eq!(s.gifts(0), 0);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.1, the beacon's first row, and §3.1: with burner keys
+/// on the beacon is written from its key B as a burner key, and B's address
+/// is the one the beacon wallet always had. B holds a 1000-mojo coin an
+/// operator sent it on main's "fund" line; the burner path never spends it
+/// (R7). B's first write claims a lobby dish coin F in its own bundle: two
+/// spends, F's claim and the gift g's, one signature, B's own over g, and no
+/// fee. It names B as its payer, the payer the beacon wallet's key names
+/// too, and never the SSF wallet; one gift is counted. Once it lands a
+/// newcomer reads it under the era's public hint as this node's beacon, at
+/// B's new 1-mojo coin, and the beacon mark filed from the write, naming B,
+/// is confirmed by its own reader. The funded coin is still unspent.
+#[tokio::test]
+async fn a_burner_beacons_first_write_claims_a_gift_at_bs_unchanged_address_and_is_read_back_as_this_nodes_beacon() {
+    let mut s = setup().await;
+    let (key, node) = (beacon_key(120), iroh::SecretKey::generate());
+    assert_eq!(key.puzzle_hash(), our_puzzle_hash(&beacon_wallet(120)), "B's address is the beacon wallet's");
+    let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
+    let (f, _) = ready_dish(&s, 10).await;
+    let g = gift(&key, f);
+    let now = unix_now();
+    let (hint, write) = s.beacon(120, &node, 0, now, 1).await.unwrap();
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 0)), "era 0's public beacon hint");
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "g as its parent, F parked");
+    assert_eq!(write.payer, Payer::of_burner(&key), "B pays");
+    assert_eq!(write.payer, Payer::of(&beacon_wallet(120)), "the payer the beacon wallet's key names");
+    assert_ne!(write.payer, Payer::of(&wallet(120)), "never the SSF wallet");
+    assert!(write.acked);
+    let bundle = s.chain.received().last().cloned().expect("the beacon was sent");
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![f, g], "two spends: F's claim, then g's");
+    assert_eq!(signatures(&bundle), signed_by_the_burner_alone(&key, g));
+    assert_eq!(s.chain.fee_of(&bundle), 0, "a beacon pays no fee");
+    assert_eq!(write.memo, memo_of(&bundle, hint));
+    assert_eq!(s.gifts(0), 1, "one gift counted");
+    assert!(s.lease.outgoing_pending_for(write.payer) && !s.lease.outgoing_pending_for(Payer::of(&wallet(120))), "parked for B, not for W");
+
+    let landed = s.chain.farm().await;
+    let written = burner_coin(&key, g.coin_id());
+    assert_eq!(beacons_of(&s, 0, landed, now).await, vec![(node.public(), written.coin_id(), landed)], "read as this node's beacon, at B's 1-mojo coin");
+    let mark = BeaconMark::written(0, now, hint, &write, node.public().to_string());
+    assert_eq!(mark.payer, Some(Payer::of_burner(&key).hex()), "the mark names B");
+    s.reconcile().await;
+    let word = beacon_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)));
+    assert_eq!(s.chain.record(funded.coin_id()).map(|r| r.2), Some(None), "the funded coin, never spent on the burner path");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.1, the beacon's second row: B is one key for every
+/// era, so the next era's beacon is a rewrite. Era 0's beacon lands from a
+/// gift and makes B's 1-mojo coin c0. A stranger then sends B another 1-mojo
+/// coin, and B still holds the 1000-mojo coin an operator once sent it. In
+/// era 1, with the fuse blown and a lobby coin ready, the beacon is written
+/// from c0, the oldest of B's 1-mojo coins: one spend, B's own signature, no
+/// gift and no lobby coin taken, so neither the blown fuse nor a dry dish
+/// holds a beacon B already has a coin for. It is read under era 1's hint at
+/// the coin c0's spend made. The stranger's coin and the funded coin are
+/// unspent (R1, R7).
+#[tokio::test]
+async fn the_next_eras_burner_beacon_is_written_from_bs_oldest_one_mojo_coin_with_no_gift_and_never_from_its_funded_coin() {
+    let mut s = setup().await;
+    let (key, node) = (beacon_key(121), iroh::SecretKey::generate());
+    let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
+    let (dish, _) = ready_dishes(&s, &[10, 10]).await;
+    let now = unix_now();
+    let (hint0, first) = s.beacon(121, &node, 0, now, 1).await.unwrap();
+    let f = *dish.iter().find(|c| c.coin_id() == first.coins.parked).expect("a ready lobby coin, parked");
+    let spare = *dish.iter().find(|c| c.coin_id() != f.coin_id()).unwrap();
+    let g = gift(&key, f);
+    assert_eq!(first.coins.parent, g.coin_id());
+    s.chain.farm().await;
+    let c0 = burner_coin(&key, g.coin_id());
+    let theirs = s.chain.fund(key.puzzle_hash(), 1, None);
+    s.chain.farm().await;
+    assert_eq!(s.gifts(0), 1, "era 0's one gift");
+
+    s.chain.farm_to(ERA_BLOCKS).await;
+    s.preset_fuse(1, strangers(16));
+    let (hint1, next) = s.beacon(121, &node, 1, now, 2).await.unwrap();
+    assert_eq!(hint1, Bytes32::new(chia_lane::derive_beacon_hint(NET, 1)));
+    assert_ne!(hint1, hint0, "a new era, a new hint");
+    assert_eq!(next.payer, first.payer, "and the same payer: B is one key for every era");
+    assert_eq!(next.coins, WriteCoins::one(c0.coin_id()), "written from B's oldest 1-mojo coin");
+    let bundle = s.chain.received().last().cloned().expect("the beacon was sent");
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![c0], "one spend, of B's own coin");
+    assert_eq!(signatures(&bundle), signed_by_the_burner_alone(&key, c0));
+    assert_eq!(s.chain.fee_of(&bundle), 0);
+    assert_eq!(s.gifts(1), 16, "no gift: the blown fuse does not hold a rewrite");
+    assert!(!s.lease.is_taken(&spare.coin_id()), "no lobby coin taken");
+
+    let landed = s.chain.farm().await;
+    assert_eq!(chia_lane::era_of(landed), 1);
+    assert_eq!(beacons_of(&s, 1, landed, now).await, vec![(node.public(), burner_coin(&key, c0.coin_id()).coin_id(), landed)]);
+    for (coin, what) in [(theirs, "the stranger's 1-mojo coin"), (funded, "the funded coin"), (spare, "the other lobby coin")] {
+        assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "{what}, unspent");
+    }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §13 row 10, burner keys off: the beacon arm's step
+/// ([`beacon_on_path`]) with no burner root writes the beacon from the
+/// beacon wallet, as on main, through the money writer. B holds a 1000-mojo
+/// coin and a 1-mojo coin. While another payer's spend is parked on the
+/// lease, here a burner's write, the beacon waits by main's global check
+/// (`MemoWait::Settling`), naming the beacon, and sends nothing. Once that
+/// spend lands, the beacon spends B's largest coin to itself, as main does,
+/// names B as its payer, the payer B names as a burner key too, and says it
+/// was not written on the burner path. It claims no lobby coin and counts
+/// no gift, and B's 1-mojo coin is unspent: the path chooses the writer,
+/// never the coins B happens to hold.
+#[tokio::test]
+async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_and_waits_behind_any_parked_spend() {
+    let mut s = setup().await;
+    let (b, node, none) = (beacon_wallet(95), iroh::SecretKey::generate(), no_data_folder());
+    let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
+    let one = s.chain.fund(our_puzzle_hash(&b), 1, None);
+    let (dish, _) = ready_dishes(&s, &[1, 1]).await;
+    let other = burner(95, 0);
+    let theirs = s.burner_write(&other, 0, Bytes32::new([0x95; 32]), None, |_| Ok(b"another payer's record, in flight".to_vec()), 1).await.unwrap();
+    assert!(s.lease.outgoing_pending_for(theirs.payer), "a burner's write parked on the lease");
+    assert_eq!(s.gifts(0), 1, "its gift");
+    let sent = s.sent();
+
+    let held = s.arm_beacon(95, false, &node, 0, &none, unix_now(), 2).await;
+    let e = held.as_ref().err().expect("it waits");
+    assert_eq!(e.downcast_ref::<MemoWait>(), Some(&MemoWait::Settling("beacon".to_string())), "main's global check");
+    assert!(is_typed_wait(e));
+    assert_eq!(
+        beacon_failure_line(false, 0, e),
+        format!("⛓️ ChiaHub beacon: publish for era 0 failed: {e:#} (retry in {} min; the beacon wallet is funded separately)", HEARTBEAT_RETRY_SECS / 60),
+        "main's line"
+    );
+    assert_eq!(s.sent(), sent, "nothing new sent");
+
+    s.chain.farm().await;
+    let now = unix_now();
+    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(95, false, &node, 0, &none, now, 3).await);
+    assert!(!from_burner, "written off the burner path");
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 0)));
+    assert_eq!(write.coins, WriteCoins::one(funded.coin_id()), "B's largest coin, as on main");
+    assert_eq!(write.payer, Payer::of(&b), "the beacon wallet pays");
+    assert_eq!(write.payer, Payer::of_burner(&beacon_key(95)), "one payer on both paths");
+    let line = beacon_sent_line(write.acked, 0, &hex::encode(hint), from_burner);
+    assert!(!line.contains("burner"), "{line}");
+    assert_eq!(s.gifts(0), 1, "the money writer counts no gift");
+    let landed = s.chain.farm().await;
+    assert_eq!(s.chain.children(funded.coin_id()), vec![written(&b, funded)], "spent to itself, whole");
+    assert_eq!(beacons_of(&s, 0, landed, now).await, vec![(node.public(), written(&b, funded).coin_id(), landed)]);
+    assert_eq!(s.chain.record(one.coin_id()).map(|r| r.2), Some(None), "B's 1-mojo coin, unspent");
+    let spare = dish.iter().find(|c| c.coin_id() != theirs.coins.parked).expect("the other lobby coin");
+    assert!(!s.lease.is_taken(&spare.coin_id()) && s.chain.record(spare.coin_id()).is_some_and(|r| r.2.is_none()), "unclaimed");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.4, per payer, across the flag: B is one payer on both
+/// paths, so a beacon the beacon wallet paid for holds the burner path's
+/// beacon as a spend of B's own. With burner keys off the era's beacon is
+/// pushed from B's funded coin and parked for B. Burner keys are then
+/// turned on: the step waits while that spend is in flight
+/// (`BurnerWait::Held`), claiming and sending nothing, and while it settles
+/// (`BurnerWait::Settling`), since the coin it made is no 1-mojo coin of
+/// B's. Only once it has settled is B funded by the lobby dish and the
+/// beacon written from the gift, saying it came from its own burner key.
+/// The money beacon's 1000-mojo coin stays at B, unspent.
+#[tokio::test]
+async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_settles() {
+    let mut s = setup().await;
+    let (b, key, node, none) = (beacon_wallet(96), beacon_key(96), iroh::SecretKey::generate(), no_data_folder());
+    let payer = Payer::of_burner(&key);
+    let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
+    let (f, _) = ready_dish(&s, 10).await;
+    let (_, money_write, from_burner) = beacon_wrote(s.arm_beacon(96, false, &node, 0, &none, unix_now(), 1).await);
+    assert!(!from_burner);
+    assert_eq!((money_write.coins, money_write.payer), (WriteCoins::one(funded.coin_id()), payer), "from B's funded coin, B paying");
+    assert!(s.lease.outgoing_pending_for(payer), "parked for B, the one payer of both paths");
+    let sent = s.sent();
+
+    let held = s.arm_beacon(96, true, &node, 0, &none, unix_now(), 2).await;
+    assert_eq!(beacon_waited(&held), Some(BurnerWait::Held), "B's own spend, in flight");
+    names_no_beacon(held.as_ref().err().unwrap(), &key);
+    assert_eq!(s.sent(), sent, "nothing new sent");
+    assert!(!s.lease.is_taken(&f.coin_id()), "no lobby coin claimed");
+    assert_eq!(s.gifts(0), 0);
+
+    s.chain.farm().await;
+    let settling = s.arm_beacon(96, true, &node, 0, &none, unix_now(), 3).await;
+    assert_eq!(beacon_waited(&settling), Some(BurnerWait::Settling), "landed, B's spend settling");
+    assert!(!s.lease.is_taken(&f.coin_id()) && s.gifts(0) == 0, "still nothing claimed");
+
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(96, true, &node, 0, &none, unix_now(), 4).await);
+    assert!(from_burner, "written on the burner path");
+    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "from the lobby dish coin it claims");
+    assert_eq!(write.payer, payer);
+    assert_eq!(s.gifts(0), 1, "one gift counted");
+    let line = beacon_sent_line(write.acked, 0, &hex::encode(hint), from_burner);
+    assert!(line.ends_with(" · from its own burner key"), "{line}");
+    assert_eq!(s.chain.record(written(&b, funded).coin_id()).map(|r| r.2), Some(None), "the money beacon's coin stays at B, unspent");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4, not yet built (PR 10e), and what stands in for
+/// it: on the burner path the beacon does not go out while the lease parks
+/// any other spend of this node, whatever its payer
+/// (`BurnerWait::OtherWriteInFlight`), so it is never pushed into a mempool
+/// window another of this node's payers has open, as the beacon wallet's
+/// never was through main's global check. The hold is one-way: a listing or
+/// a knock from its own burner does not wait on a parked beacon, as on the
+/// 10c head, until the payers are spaced. The beacon waits before the
+/// chain is asked for B's coins. A knock the SSF wallet W paid for is in
+/// flight: off the burner path the beacon waits by main's check, and on it
+/// by the burner's own, a wait whose line asks for no funding and names no
+/// key; nothing is sent, no lobby coin is claimed and no gift is counted.
+/// Once W's knock lands, a listing from W's listing burner P(0) is in
+/// flight, and it holds the beacon in the same way. Once that lands too the
+/// beacon goes out from a gift. B's funded coin is never spent on the
+/// burner path.
+#[tokio::test]
+async fn a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lands() {
+    let mut s = setup().await;
+    let (w, key, node, none) = (wallet(122), beacon_key(122), iroh::SecretKey::generate(), no_data_folder());
+    let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let (dish, made) = ready_dishes(&s, &[1, 1]).await;
+    let knock = our_memo(&w, coin, Bytes32::new([0x7a; 32]), b"a knock of W's, in flight".to_vec());
+    s.push(&w, &knock, (coin.coin_id(), made)).await.unwrap();
+    assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock parked, live");
+    let sent = s.sent();
+
+    let off = s.arm_beacon(122, false, &node, 0, &none, unix_now(), 1).await;
+    assert_eq!(off.as_ref().err().and_then(|e| e.downcast_ref::<MemoWait>()), Some(&MemoWait::Settling("beacon".to_string())), "off the burner path: main's global check");
+    let listed = s.asked(ProtocolMessageTypes::RequestPuzzleState);
+    let on = s.arm_beacon(122, true, &node, 0, &none, unix_now(), 2).await;
+    assert_eq!(beacon_waited(&on), Some(BurnerWait::OtherWriteInFlight), "on it: the burner's own hold");
+    assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleState), listed, "held before the chain is asked for B's coins");
+    let e = on.as_ref().err().expect("it waited");
+    assert!(is_typed_wait(e), "a wait, not a failure");
+    assert_eq!(
+        beacon_failure_line(true, 0, e),
+        format!("⛓️ ChiaHub beacon: the era 0 beacon waits: another write of this station is still in flight; the beacon goes out after it (retry in {} min)", HEARTBEAT_RETRY_SECS / 60)
+    );
+    names_no_beacon(e, &key);
+    assert!(beacon_took_the_tick(&on), "the writer was reached: the tick is used");
+    assert_eq!(s.sent(), sent, "nothing new sent");
+    assert!(dish.iter().all(|c| !s.lease.is_taken(&c.coin_id())), "no lobby coin claimed");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert!(!s.lease.holds_for(Payer::of_burner(&key)), "nothing of B's on the lease");
+
+    s.chain.farm().await;
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), unix_now(), 3).await.unwrap();
+    assert!(s.lease.outgoing_pending_for(listing.payer) && !s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock landed; P(0)'s listing parked, live");
+    let on = s.arm_beacon(122, true, &node, 0, &none, unix_now(), 4).await;
+    assert_eq!(beacon_waited(&on), Some(BurnerWait::OtherWriteInFlight), "beside the listing burner's spend too");
+    assert_eq!(s.gifts(0), 1, "the listing's gift alone");
+
+    s.chain.farm().await;
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(122, true, &node, 0, &none, unix_now(), 5).await);
+    assert!(from_burner);
+    let f = *dish.iter().find(|c| c.coin_id() != listing.coins.parked).expect("the other lobby coin");
+    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "both landed: the beacon goes out from a gift");
+    assert_eq!(write.payer, Payer::of_burner(&key));
+    assert_eq!(s.gifts(0), 2);
+    assert_eq!(s.chain.record(funded.coin_id()).map(|r| r.2), Some(None), "B's funded coin, never spent on the burner path");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.5 (7), the beacon guard, in the arm's step on both
+/// paths: this data folder holds a beacon mark of the other network dated a
+/// day ago, and the step refuses the beacon with the guard's line, which
+/// names both networks and the file. It asks the chain nothing, sends,
+/// claims and parks nothing, counts no gift and does not use the tick, and
+/// the other network's file is left as it was, its bytes and its mode. A
+/// mark dated exactly 14 days ago lets the beacon by on each path: off the
+/// burner path from B's funded coin, and, once that has settled, on it from
+/// a gift, though this network's own fresh mark lies in the same folder:
+/// the step finds the other network's file in the folder it is given and
+/// never reads its own. A file there that does not parse is dated by when it last
+/// changed, read back from the file itself, and refuses again on both
+/// paths, the chain still asked nothing.
+#[tokio::test]
+async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_beacon_on_both_paths_asks_the_chain_nothing_and_leaves_the_file_as_it_was() {
+    let mut s = setup().await;
+    let dir = Dir::new("beacon-guard");
+    let (key, node) = (beacon_key(123), iroh::SecretKey::generate());
+    let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
+    let (f, _) = ready_dish(&s, 10).await;
+    let now = unix_now();
+    let path = other_mark(&dir, now - 86_400);
+    let before = file_state(&path);
+    #[cfg(unix)]
+    assert_eq!(before.1, 0o644);
+    let asked = |s: &Setup| (s.a.seen.lock().unwrap().len(), s.b.seen.lock().unwrap().len());
+    assert!(s.asked_nothing(), "nothing asked before the first try");
+    for (burner_path, seed) in [(true, 1), (false, 2)] {
+        let done = s.arm_beacon(123, burner_path, &node, 0, &dir.0, now, seed).await;
+        let line = beacon_guarded(&done).expect("refused by the guard");
+        assert_eq!(Some(line.clone()), beacon_guard(NET, &path, read_other_beacon(&path), now), "the guard's own line");
+        assert!(line.contains(NET.name()) && line.contains(other_beacon_net(NET).name()) && line.contains(&path.display().to_string()), "{line}");
+        assert!(!beacon_took_the_tick(&done), "a guarded try does not use the tick");
+        assert!(s.asked_nothing(), "the chain was asked nothing (burner path: {burner_path})");
+    }
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&f.coin_id()) && !s.lease.outgoing_pending(), "nothing claimed or parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert_eq!(file_state(&path), before, "the other network's file, as it was");
+
+    // Exactly 14 days old: the beacon goes out, on either path. This
+    // network's own mark, written a moment ago as the node saves it after a
+    // beacon, lies in the same folder and holds nothing back: the step
+    // reads the other network's file, never its own.
+    let path = other_mark(&dir, now - BEACON_GUARD_SECS);
+    let own = dir.0.join(NET.path(BEACON_MARK_FILE));
+    assert_ne!(own, path, "two files");
+    std::fs::write(&own, serde_json::to_vec(&BeaconMark { era: 0, last_at: now, hint: "bb".repeat(32), ..Default::default() }).unwrap()).unwrap();
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, false, &node, 0, &dir.0, now, 3).await);
+    assert!(!from_burner);
+    assert_eq!(write.coins, WriteCoins::one(funded.coin_id()), "off the burner path, from B's funded coin");
+    s.chain.farm().await;
+    s.reconcile().await;
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, true, &node, 0, &dir.0, now, 4).await);
+    assert!(from_burner);
+    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "on it, from a gift");
+    assert_eq!(file_state(&path).0, serde_json::to_vec(&BeaconMark { era: 3, last_at: now - BEACON_GUARD_SECS, hint: "aa".repeat(32), ..Default::default() }).unwrap());
+
+    // A file that does not parse is dated by when it last changed.
+    std::fs::write(&path, b"{").unwrap();
+    let changed = std::fs::metadata(&path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(read_other_beacon(&path), OtherBeacon::At(changed), "dated by the file's own time");
+    let (quiet, sent) = (asked(&s), s.sent());
+    for (burner_path, seed) in [(true, 5), (false, 6)] {
+        let at = unix_now();
+        let done = s.arm_beacon(123, burner_path, &node, 0, &dir.0, at, seed).await;
+        let line = beacon_guarded(&done).expect("refused by the guard");
+        assert_eq!(Some(line), beacon_guard(NET, &path, OtherBeacon::At(changed), at));
+        assert_eq!(asked(&s), quiet, "the chain was asked nothing (burner path: {burner_path})");
+    }
+    assert_eq!(s.sent(), sent, "nothing more sent");
+    assert_eq!(std::fs::read(&path).unwrap(), b"{", "the file, as it was");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, Dish dry or griefed, for the beacon: with no lobby
+/// coin ready, the beacon from B waits (`BurnerWait::NoCoinReady`), a wait
+/// and not a failure. It sends nothing, parks nothing and counts no gift,
+/// and its line says it waits, asks for no funding and names no key. The
+/// try reached the writer, so it used the tick. Once a lobby coin is ready
+/// the next try claims it, lands, and is read.
+#[tokio::test]
+async fn a_burner_beacon_with_no_dish_coin_ready_waits_names_no_key_and_goes_out_once_one_is() {
+    let mut s = setup().await;
+    let (key, node, none) = (beacon_key(125), iroh::SecretKey::generate(), no_data_folder());
+    s.chain.farm().await;
+    let dry = s.arm_beacon(125, true, &node, 0, &none, unix_now(), 1).await;
+    assert_eq!(beacon_waited(&dry), Some(BurnerWait::NoCoinReady));
+    let e = dry.as_ref().err().expect("it waited");
+    assert!(is_typed_wait(e), "a wait, not a failure");
+    let line = beacon_failure_line(true, 0, e);
+    assert_eq!(line, format!("⛓️ ChiaHub beacon: the era 0 beacon waits: {e:#} (retry in {} min)", HEARTBEAT_RETRY_SECS / 60));
+    assert!(!line.contains("funded separately") && !line.contains("faucet"), "{line}");
+    names_no_beacon(e, &key);
+    assert!(beacon_took_the_tick(&dry));
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.outgoing_pending(), "nothing parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+
+    let (f, _) = ready_dish(&s, 10).await;
+    let now = unix_now();
+    let (_, write, _) = beacon_wrote(s.arm_beacon(125, true, &node, 0, &none, now, 2).await);
+    let g = gift(&key, f);
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "the ready coin, claimed");
+    assert_eq!(s.gifts(0), 1);
+    let landed = s.chain.farm().await;
+    assert_eq!(beacons_of(&s, 0, landed, now).await, vec![(node.public(), burner_coin(&key, g.coin_id()).coin_id(), landed)]);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, the lost race whose loser is refused, for the
+/// beacon: a stranger's claim of the dish coin F waits in the mempools, and
+/// a block that carries it comes just as the beacon from B is sent, so every
+/// node refuses it as a double spend. That is a refusal, not a busy chain
+/// and not a wait: its line says the beacon failed, in its own text, which
+/// names no key. F is handed back and no gift is counted. The next try
+/// claims another lobby coin, F2, which has come to be ready, lands, and is
+/// read.
+#[tokio::test]
+async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_from_another_coin() {
+    let mut s = setup().await;
+    let f = s.chain.fund(lobby().puzzle_hash(), 10, None);
+    s.chain.farm().await;
+    // F2 one block younger, so it is ready one block after F.
+    let f2 = s.chain.fund(lobby().puzzle_hash(), 10, None);
+    s.chain.farm().await;
+    s.chain.farm_blocks(GAP_BLOCKS - 1).await;
+    let (key, node, none) = (beacon_key(126), iroh::SecretKey::generate(), no_data_folder());
+    let stranger = Bytes32::new([0x67; 32]);
+    s.money.push_tx(claim(&lobby(), f, stranger)).await.unwrap();
+    s.chain.block_before(ProtocolMessageTypes::SendTransaction);
+
+    let lost = s.arm_beacon(126, true, &node, 0, &none, unix_now(), 1).await;
+    assert!(!s.chain.reorg_staged(), "the block came as the beacon was sent");
+    let why = beacon_refused(&lost).expect("every peer refused the push");
+    assert_eq!(why.matches("DOUBLE_SPEND").count(), 2, "{why}");
+    let e = lost.as_ref().err().expect("refused");
+    assert!(!chain_busy(e) && !is_typed_wait(e), "a lost race: a refusal, not a busy chain or a wait");
+    assert_eq!(beacon_failure_line(true, 0, e), format!("⛓️ ChiaHub beacon: the era 0 beacon failed: {e:#} (retry in {} min)", HEARTBEAT_RETRY_SECS / 60));
+    names_no_beacon(e, &key);
+    assert!(!s.lease.is_taken(&f.coin_id()), "a refusal hands F back");
+    assert_eq!(s.gifts(0), 0, "a refused push counts no gift");
+
+    // A block every connection has filed, so the lane's peak is the chain's.
+    s.chain.farm().await;
+    let now = unix_now();
+    let (_, write, _) = beacon_wrote(s.arm_beacon(126, true, &node, 0, &none, now, 2).await);
+    let g2 = gift(&key, f2);
+    assert_eq!(write.coins, WriteCoins { parent: g2.coin_id(), parked: f2.coin_id() }, "another coin");
+    assert_eq!(s.gifts(0), 1);
+    let landed = s.chain.farm().await;
+    assert_eq!(beacons_of(&s, 0, landed, now).await, vec![(node.public(), burner_coin(&key, g2.coin_id()).coin_id(), landed)]);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, Mempool full, for the beacon: every node's full
+/// mempool refuses the beacon from B for its zero fee. That reads as the
+/// chain being busy, and is still a refusal, not a wait: F is handed back,
+/// no gift is counted, and nothing waits in a mempool. The line says the
+/// beacon waits and that waiting costs nothing, asks for no funding and
+/// names no key. Once the mempools clear, the next try lands with no fee
+/// added and is read.
+#[tokio::test]
+async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_lands_once_cleared_with_no_fee() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 10).await;
+    let (key, node, none) = (beacon_key(127), iroh::SecretKey::generate(), no_data_folder());
+    s.chain.set_full(true);
+    let turned_away = s.arm_beacon(127, true, &node, 0, &none, unix_now(), 1).await;
+    let why = beacon_refused(&turned_away).expect("every peer refused the push");
+    assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO"), "{why}");
+    let e = turned_away.as_ref().err().expect("refused");
+    assert!(chain_busy(e), "the chain busy: {e:#}");
+    assert!(!is_typed_wait(e), "and a refusal, not a wait (§10)");
+    assert_eq!(
+        beacon_failure_line(true, 0, e),
+        format!("⛓️ ChiaHub beacon: the era 0 beacon waits — the chain is busy (a full mempool refused its zero fee); waiting costs nothing (retry in {} min)", HEARTBEAT_RETRY_SECS / 60)
+    );
+    names_no_beacon(e, &key);
+    assert!(!s.lease.is_taken(&f.coin_id()), "a refusal hands F back");
+    assert_eq!(s.gifts(0), 0, "a refused push counts no gift");
+    assert!(s.chain.mempool().is_empty());
+
+    s.chain.set_full(false);
+    let now = unix_now();
+    let (_, write, _) = beacon_wrote(s.arm_beacon(127, true, &node, 0, &none, now, 2).await);
+    let g = gift(&key, f);
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    let bundle = s.chain.received().last().cloned().expect("the beacon was sent");
+    assert_eq!(s.chain.fee_of(&bundle), 0, "no fee added");
+    let landed = s.chain.farm().await;
+    assert_eq!(beacons_of(&s, 0, landed, now).await, vec![(node.public(), burner_coin(&key, g.coin_id()).coin_id(), landed)]);
+    assert_eq!(s.gifts(0), 1);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §5.2, the fuse, for the beacon: with 16 gifts counted in
+/// era 0, the beacon from B waits (`BurnerWait::FuseBlown`), naming the
+/// era, though a lobby coin is ready. Nothing is sent or claimed, and the
+/// wait names no key. In era 1 the fuse's new era funds B, the same key,
+/// from that coin. Nothing here farms across an era: the era is the step's
+/// argument.
+#[tokio::test]
+async fn a_burner_beacon_the_blown_fuse_holds_waits_claims_nothing_and_is_funded_in_the_next_era() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 10).await;
+    let (key, node, none) = (beacon_key(128), iroh::SecretKey::generate(), no_data_folder());
+    s.preset_fuse(0, strangers(16));
+    let blown = s.arm_beacon(128, true, &node, 0, &none, unix_now(), 1).await;
+    assert_eq!(beacon_waited(&blown), Some(BurnerWait::FuseBlown { era: 0 }));
+    let e = blown.as_ref().err().expect("it waited");
+    assert!(is_typed_wait(e));
+    names_no_beacon(e, &key);
+    assert!(s.chain.received().is_empty() && !s.lease.is_taken(&f.coin_id()), "nothing sent or claimed");
+    assert_eq!(s.gifts(0), 16);
+
+    let (hint, next_era, _) = beacon_wrote(s.arm_beacon(128, true, &node, 1, &none, unix_now(), 2).await);
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 1)), "era 1's beacon hint");
+    assert_eq!(next_era.payer, Payer::of_burner(&key), "the same B");
+    assert_eq!(next_era.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() });
+    assert_eq!(s.gifts(1), 1, "the fuse's new era funds it");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §8 (the crash window) for the beacon, which has no step
+/// that files a lost mark again: B's first beacon is pushed, and the node
+/// stops before its beacon mark is saved. It restarts with the lease
+/// restored from its file, which reads B back as the spend's payer, and
+/// with no mark the beacon is due again. While the spend is in flight the
+/// next try only waits (`BurnerWait::Held`): no new bundle is sent and no
+/// second gift is counted. Once it lands, the next try is a rewrite from
+/// the coin the first one made, under the same hint, with no second gift:
+/// a lost mark costs one more beacon of this node in the era, from the same
+/// key, and nothing from the dish. A newcomer reads one beacon a node, the
+/// newer of the two.
+#[tokio::test]
+async fn a_burner_beacon_whose_mark_a_restart_lost_is_held_while_in_flight_and_then_rewritten_from_bs_coin_with_no_second_gift() {
+    let mut s = setup().await;
+    let dir = Dir::new("restart-beacon");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, key, node) = (wallet(129), beacon_key(129), iroh::SecretKey::generate());
+    let payer = Payer::of_burner(&key);
+    let (f, _) = ready_dish(&s, 10).await;
+    let g = gift(&key, f);
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let now = unix_now();
+    let (hint, first) = s.beacon(129, &node, 0, now, 1).await.unwrap();
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    let sent = s.sent();
+    assert_eq!(s.gifts(0), 1);
+
+    // The node stops before the beacon mark is saved, and starts again.
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    s.new_lane();
+    assert!(s.lease.outgoing_pending_for(payer) && !s.lease.outgoing_pending_for(Payer::of(&w)), "B, read back from the file as the payer");
+    let held = s.beacon(129, &node, 0, now, 2).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Held), "the restored spend holds the beacon");
+    assert_eq!(s.sent(), sent, "no bundle that was not sent before");
+    assert_eq!(s.gifts(0), 1, "no second gift");
+
+    let landed = s.chain.farm().await;
+    let c0 = burner_coin(&key, g.coin_id());
+    let (again, rewrite) = s.beacon(129, &node, 0, now, 3).await.unwrap();
+    assert_eq!(again, hint, "the same hint");
+    assert_eq!((rewrite.coins, rewrite.payer), (WriteCoins::one(c0.coin_id()), payer), "a rewrite, from the coin the first beacon made");
+    let bundle = s.chain.received().last().cloned().expect("the rewrite was sent");
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![c0], "one spend, of B's own coin");
+    assert_eq!(s.gifts(0), 1, "and no second gift");
+    let rewritten = s.chain.farm().await;
+    let c1 = burner_coin(&key, c0.coin_id());
+    assert_eq!(s.chain.record(c0.coin_id()), Some((c0, landed, Some(rewritten))), "the first beacon's coin, spent by the rewrite");
+    assert_eq!(s.chain.record(c1.coin_id()), Some((c1, rewritten, None)), "two beacons of this node in the era, from one key");
+    assert_eq!(beacons_of(&s, 0, rewritten, now).await, vec![(node.public(), c1.coin_id(), rewritten)], "a newcomer reads one beacon a node, the newer");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, a cloned data folder, for the beacon's key: B is one
+/// key for every era, so a clone holds it too. Our era 0 beacon lands from a
+/// gift and makes B's coin c0. In era 1 the clone, another lease and another
+/// fuse on the same wallet and node id, writes its beacon from c0 and
+/// lands, making c1. Our own era 1 beacon then goes out from c1, the coin
+/// the clone's write made: B's one coin, whoever spent it last. Neither
+/// write takes a gift, so a clone costs the dish nothing after B's first
+/// era. The chain then carries two beacons with one node id in the era, of
+/// which a newcomer reads the newer. Nothing pauses for the clone's spend
+/// until the pause of §10 is built (PR 10f).
+#[tokio::test]
+async fn a_clones_beacon_from_bs_coin_leaves_ours_to_be_written_from_the_coin_it_made_with_no_gift() {
+    let mut s = setup().await;
+    let (key, node) = (beacon_key(130), iroh::SecretKey::generate());
+    let (f, _) = ready_dish(&s, 10).await;
+    let g = gift(&key, f);
+    let now = unix_now();
+    let (_, first) = s.beacon(130, &node, 0, now, 1).await.unwrap();
+    assert_eq!(first.coins.parent, g.coin_id());
+    s.chain.farm().await;
+    let c0 = burner_coin(&key, g.coin_id());
+    s.chain.farm_to(ERA_BLOCKS).await;
+
+    // The clone: a lease and a fuse of its own, the same wallet and node.
+    let ours = std::mem::take(&mut s.lease);
+    let our_fuse = std::mem::replace(&mut s.fuse, std::sync::Mutex::new(GiftFuse::new()));
+    let (_, theirs) = s.beacon(130, &node, 1, now, 2).await.unwrap();
+    assert_eq!(theirs.coins, WriteCoins::one(c0.coin_id()), "the clone writes from B's one coin");
+    assert_eq!(s.gifts(1), 0, "with no gift");
+    let cloned = s.chain.farm().await;
+    let c1 = burner_coin(&key, c0.coin_id());
+    assert_eq!(s.chain.children(c0.coin_id()), vec![c1]);
+
+    s.lease = ours;
+    s.fuse = our_fuse;
+    let (_, next) = s.beacon(130, &node, 1, now, 3).await.unwrap();
+    assert_eq!(next.coins, WriteCoins::one(c1.coin_id()), "ours goes out from the coin the clone's write made");
+    assert_eq!(next.payer, first.payer);
+    assert_eq!((s.gifts(0), s.gifts(1)), (1, 0), "B was funded once, in its first era");
+    let landed = s.chain.farm().await;
+    let c2 = burner_coin(&key, c1.coin_id());
+    assert_eq!(s.chain.record(c1.coin_id()), Some((c1, cloned, Some(landed))), "the clone's beacon, its coin spent by ours");
+    assert_eq!(s.chain.record(c2.coin_id()), Some((c2, landed, None)), "two beacons with one node id in the era");
+    assert_eq!(beacons_of(&s, 1, landed, now).await, vec![(node.public(), c2.coin_id(), landed)], "a newcomer reads one beacon a node, the newer");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, the reorg row, for a first beacon whose dish coin a
+/// stranger took: B's first beacon lands and is confirmed, and a
+/// reorganization replaces its block by a fork whose first block holds a
+/// stranger's claim of F1. B then has no record at all. The next try waits
+/// (`BurnerWait::Settling`) while the lease keeps the dead bundle settling,
+/// still so one block short of F1's settling. Once F1 is settled the write
+/// is dead, and the beacon is written again from another lobby coin, F2, by
+/// the same B, and read at the new gift's coin; the old beacon is on no
+/// chain. The dead bundle's gift was given back, so one gift is counted, as
+/// one landed.
+#[tokio::test]
+async fn a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_written_again_from_another_coin_with_one_gift_counted() {
+    let mut s = setup().await;
+    let (f1, _) = ready_dish(&s, 1).await;
+    let (key, node) = (beacon_key(131), iroh::SecretKey::generate());
+    let payer = Payer::of_burner(&key);
+    let now = unix_now();
+    let (hint, first) = s.beacon(131, &node, 0, now, 1).await.unwrap();
+    let saved = s.chain.received().last().cloned().expect("the beacon was sent");
+    let landed = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+
+    let f2 = s.chain.fund(lobby().puzzle_hash(), 1, None);
+    let stranger = Bytes32::new([0x92; 32]);
+    s.chain.reorg_including(1, vec![claim(&lobby(), f1, stranger)]).await;
+    assert_eq!(s.chain.record(f1.coin_id()).unwrap().2, Some(landed), "F1 spent at the same height, by the stranger's claim");
+    assert!(s.money.coin_records_by_puzzle_hash(key.puzzle_hash(), true, None).await.unwrap().records.is_empty(), "B has no record");
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Pending, "the lease still holds the bundle");
+    let waiting = s.beacon(131, &node, 0, now, 2).await.map(|(_, write)| write);
+    assert_eq!(waited(&waiting), Some(BurnerWait::Settling));
+    s.chain.farm_blocks(SETTLED_DEPTH - 2).await;
+    let one_short = s.beacon(131, &node, 0, now, 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&one_short), Some(BurnerWait::Settling), "one block short of settled");
+    assert_eq!(s.gifts(0), 1);
+
+    s.chain.farm_blocks(2).await;
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert!(!s.lease.holds_for(payer));
+    let (again_hint, second) = s.beacon(131, &node, 0, now, 4).await.unwrap();
+    let g2 = gift(&key, f2);
+    assert_eq!(again_hint, hint);
+    assert_eq!((second.coins, second.payer), (WriteCoins { parent: g2.coin_id(), parked: f2.coin_id() }, payer), "another lobby coin, the same B");
+    assert_eq!(s.gifts(0), 1, "the dead bundle's gift given back, the new one counted");
+    let rebuilt = s.chain.received().last().cloned().expect("the beacon was sent");
+    let again = s.chain.farm().await;
+    assert_eq!(beacons_of(&s, 0, again, now).await, vec![(node.public(), burner_coin(&key, g2.coin_id()).coin_id(), again)], "the old beacon is on no chain");
+    assert_eq!(s.sent(), HashSet::from([saved.name(), rebuilt.name()]));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §3.5: the beacon arm's step refuses a burner root of
+/// another network than the test's before it reaches a writer, with an
+/// error naming both networks and no key. It is a failure, not a wait. No
+/// node is asked anything, nothing is sent or parked, the ready lobby coin
+/// is not taken and no gift is counted. The same wallet's root for the
+/// test's network writes.
+#[tokio::test]
+async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 1).await;
+    let (w, key, node, none) = (wallet(132), beacon_key(132), iroh::SecretKey::generate(), no_data_folder());
+    for other in crate::chia_network::ChiaNet::ALL.into_iter().filter(|net| *net != NET) {
+        let root = BurnerRoot::of(&MoneyKey::new(w.clone()), other);
+        let at = s.later();
+        let mut rng = StdRng::seed_from_u64(1);
+        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, Some(&root), &node, &w, &none, 0, unix_now(), &mut rng).await;
+        let e = refused.as_ref().err().expect("a root of another network is refused");
+        assert_eq!(format!("{e:#}"), format!("the beacon's burner root is for {} and this write is on testnet11; nothing is written", other.name()));
+        assert!(!is_typed_wait(e), "a failure, not a wait");
+        names_no_beacon(e, &key);
+    }
+    assert!(s.asked_nothing(), "no node was asked anything");
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&f.coin_id()) && !s.lease.outgoing_pending(), "nothing parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(132, true, &node, 0, &none, unix_now(), 2).await);
+    assert!(from_burner);
+    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "the test network's own root writes");
+    assert_eq!(s.gifts(0), 1);
     assert!(s.chain.unanswered().is_empty());
 }
