@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
-import { parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
+import { parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseHouseFold, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -303,5 +303,50 @@ describe('the house key', () => {
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 'A+/z'.repeat(10) + 'abc' })?.house).toBeUndefined();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house: 43 })?.house).toBeUndefined();
     expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.house).toBeUndefined();
+  });
+});
+
+describe("the node's fold report", () => {
+  /** What a node of today sends (ssf-p2p-node `HouseFoldReport`): it folds house tables in shadow. */
+  const today = {
+    rules: { r: 'h1', d: 'h1' }, letters: 'rd', attest: false, shadowAgreed: 3, shadowMismatches: 0, shadowSkipped: 0, coldFolds: 1, dirty: 0, lost: 0,
+    badResults: 0, workerStarts: 1, workerRestarts: 0, workerFailures: 0, rooms: 1, tables: 2, tablesOver: 0,
+  };
+
+  it('is kept as the letters it folds, the rules versions it serves and whether it is off, and nothing else', () => {
+    expect(parseHouseFold(today)).toEqual({ letters: 'rd', rv: [] });
+    expect(parseHouseFold({ ...today, letters: 'rdpq', rv: ['f1'] })).toEqual({ letters: 'rdpq', rv: ['f1'] });
+    expect(parseHouseFold({ letters: 'pq', rv: ['f1', 'f2', 'a0bcdefg'] })).toEqual({ letters: 'pq', rv: ['f1', 'f2', 'a0bcdefg'] });
+    // Off, as the node sends it turned off in its environment: no letters, and a reason.
+    expect(parseHouseFold({ rules: {}, letters: '', attest: false, off: 'env' })).toEqual({ letters: '', rv: [], off: true });
+    for (const off of ['crashes', '', true, 0, false, {}]) expect(parseHouseFold({ ...today, off }), String(off)).toEqual({ letters: 'rd', rv: [], off: true });
+    for (const off of [undefined, null]) expect(parseHouseFold({ ...today, off }), String(off)).toEqual({ letters: 'rd', rv: [] });
+    // The list is the report's own: the page's copy does not follow it.
+    const rv = ['f1'];
+    const fold = parseHouseFold({ letters: 'pq', rv })!;
+    rv.push('f2');
+    expect(fold.rv).toEqual(['f1']);
+  });
+
+  it('is no report when the page cannot read it', () => {
+    for (const v of [undefined, null, 'rd', 7, true, [], ['rd']]) expect(parseHouseFold(v), String(v)).toBeUndefined();
+    for (const letters of [undefined, null, 7, ['r', 'd'], 'RD', 'r d', 'r1', 'a'.repeat(27)]) {
+      expect(parseHouseFold({ ...today, letters }), String(letters)).toBeUndefined();
+    }
+    expect(parseHouseFold({ letters: 'a'.repeat(26) })).toEqual({ letters: 'a'.repeat(26), rv: [] });
+    const versions = Array.from({ length: 17 }, (_, i) => `f${i}`);
+    for (const rv of [null, 'f1', 7, {}, ['F1'], ['1f'], [''], ['f1', 7], [null], [true], ['f12345678'], versions]) {
+      expect(parseHouseFold({ letters: 'pq', rv }), JSON.stringify(rv)).toBeUndefined();
+    }
+    expect(parseHouseFold({ letters: 'pq', rv: versions.slice(0, 16) })?.rv).toHaveLength(16);
+  });
+
+  it('rides in the fingerprint as `house_fold`, left out when it is no report', () => {
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house_fold: { ...today, letters: 'rdpq', rv: ['f1'] } })?.house_fold)
+      .toEqual({ letters: 'rdpq', rv: ['f1'] });
+    const fp = parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, house_fold: { letters: 7 } });
+    expect(fp).not.toBeNull();
+    expect(fp && 'house_fold' in fp).toBe(false);
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.house_fold).toBeUndefined();
   });
 });
