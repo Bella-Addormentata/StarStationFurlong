@@ -63,7 +63,7 @@ use clvm_utils::{tree_hash, CurriedProgram};
 use clvmr::{Allocator, NodePtr};
 use serde::{Deserialize, Serialize};
 
-use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, Spacing, WalletLease, WALLET_LEASE};
+use super::{push_parked_as, MemoWrite, ParkedInput, Payer, PushError, Resend, Spacing, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
 use crate::chia_chain::{ChainAccess, CoinRecord, PuzzleAndSolution};
 use crate::chia_faucet::{claim_to, records_at, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS, MAX_FAUCET_PAGES};
@@ -534,6 +534,19 @@ enum Slot {
     /// and never beside a write of the SSF wallet's, `money`, under its hint
     /// (§8.3).
     Once { money: Payer },
+}
+
+impl Slot {
+    /// When a write under this rule may go to the peers again once it is
+    /// parked ([`Resend`]): the listing's and a knock's only while the
+    /// player's LIST ME is on (stage 4 design §4.5 (6)); the beacon's and
+    /// the self-test's, which LIST ME does not govern, always.
+    fn resend(self) -> Resend {
+        match self {
+            Slot::Rewritten => Resend::Always,
+            Slot::Listing | Slot::Once { .. } => Resend::WhileListed,
+        }
+    }
 }
 
 /// The most gifts the lobby dish gives this node's burners in one era
@@ -1253,7 +1266,7 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
         None => None,
     };
     let built = build_burner_bundle(net, key, &input, hint, body(input.parent())?)?;
-    let acked = match push_parked_with(lease, client, payer, built.bundle, [built.parked]).await {
+    let acked = match push_parked_as(lease, client, payer, slot.resend(), built.bundle, [built.parked]).await {
         Ok(()) => true,
         // Indeterminate, not failed: the bundle may be in a mempool and its
         // input is parked, so it is a write, and its gift is counted.

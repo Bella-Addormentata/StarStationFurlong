@@ -498,6 +498,40 @@ mod tests {
         for writer in ["\nasync fn publish_burner_presence(", "\npub async fn publish_node_presence(", "\npub async fn publish_knock("] {
             assert_eq!(code_lines(item(publish, writer), "Listed"), ["_listed: &crate::chia_listing::Listed,"], "{writer}");
         }
+        // What the switch allowed is parked as its own (`Resend`), so the
+        // saved bundle stops going to the peers again when the switch is
+        // turned off. On the wallet's path the listing's writer and the
+        // knocks' say so, and the beacon's, which has its own setting,
+        // does not; on a burner's path the slot's rule says it; and the
+        // lease leaves LIST ME's spends out of its liveness question by
+        // the switch it is told to ask.
+        assert_eq!(code_lines(publish, "Resend::WhileListed"), [
+            "if resend == Resend::WhileListed {",
+            "let write = publish_memo_on(lease, net, client, now, chia_sk, hint, None, move |_| Ok(sealed), \"presence\", Resend::WhileListed).await?;",
+            "Resend::WhileListed,",
+        ]);
+        assert_eq!(code_lines(item(publish, "\nasync fn publish_knock_on("), "Resend::"), ["Resend::WhileListed,"]);
+        assert_eq!(code_lines(publish, "Resend::Always"), [
+            "self.park_with_bundle_as(coin_ids, bundle, payer, Resend::Always)",
+            "self.park_pushed_at(coin_ids, pushed, Resend::Always, now)",
+            "push_parked_as(lease, client, payer, Resend::Always, bundle, inputs).await",
+            "let write = publish_memo_on(lease, net, client, now, beacon_sk, hint, None, body, \"beacon\", Resend::Always).await?;",
+        ]);
+        assert_eq!(code_lines(publish, "sends_again("), [
+            "fn sends_again(&self, spend: u64, list_me_on: bool) -> bool {",
+            "due.iter().filter(|d| self.asks_the_peers(net, d.payer) && self.sends_again(d.spend, list_me_on)).cloned().collect();",
+            "} else if !self.sends_again(*spend, list_me_on) {",
+        ]);
+        let claim = lf(include_str!("claim_write.rs"));
+        let claim = code(&claim);
+        assert_eq!(code_lines(item(claim, "\nimpl Slot {"), "Resend::"), ["Slot::Rewritten => Resend::Always,", "Slot::Listing | Slot::Once { .. } => Resend::WhileListed,"]);
+        assert_eq!(code_lines(claim, "push_parked"), [
+            "use super::{push_parked_as, MemoWrite, ParkedInput, Payer, PushError, Resend, Spacing, WalletLease, WALLET_LEASE};",
+            "let acked = match push_parked_as(lease, client, payer, slot.resend(), built.bundle, [built.parked]).await {",
+        ]);
+        let main = lf(include_str!("../main.rs"));
+        assert_eq!(code_lines(&main, "ask_list_me("), ["chia_publish::WALLET_LEASE.ask_list_me({"]);
+        assert!(main.contains("    chia_publish::WALLET_LEASE.ask_list_me({\n        let hub = hub.clone();\n        move || hub.list_me.on()\n    });"));
         assert_eq!(code_lines(heartbeat, "keys.root()"), [
             "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
             "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",

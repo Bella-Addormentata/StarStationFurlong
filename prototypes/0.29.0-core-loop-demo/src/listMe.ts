@@ -18,6 +18,14 @@
 // off on this computer (chiaLane.ts) holds everything off: the node refuses
 // an on until Chia is back.
 //
+// A LIST ME is the player's word for one network on one station node: the
+// ones whose warning stood on the page when CONFIRM was tapped. The page
+// remembers which those were (`ListMeTarget`), shows CONFIRM only while the
+// node that answers is still that node on that network, and sends both with
+// the request, which the node refuses if it is another or runs elsewhere
+// (started on mainnet at the same port, say, while a testnet11 confirmation
+// stood open). An off names neither: it only stops writes.
+//
 // This module decides what the lines and the button under the PHONE BOOK row
 // say, from the node's fingerprint (`chia_listing`, nodeFingerprint.ts) and
 // the page's own state, and sends the request, so both are tested without
@@ -45,6 +53,36 @@ export interface ListMeUi {
   turning: 'on' | 'off' | null;
   error: string | null;
 }
+
+/** What a LIST ME was armed for: the network and the station node whose
+ *  warning the player read. */
+export interface ListMeTarget {
+  /** The network's id, as the node names it (`ChiaNet::id()`). */
+  net: string;
+  /** The node's iroh node id. */
+  node: string;
+}
+
+/** What a LIST ME tapped now would be for: none while no node answers, and
+ *  none on a network this page does not know, which it cannot name to the
+ *  node. */
+export function listMeTarget(fp: LocalFingerprint | null | undefined): ListMeTarget | null {
+  if (!fp?.chia_net) return null;
+  return { net: fp.chia_net.id, node: fp.iroh_node_id ?? '' };
+}
+
+/** Whether a LIST ME armed for `armed` still stands: the node that answers
+ *  now is the one it was armed on, on the same network. */
+export function listMeStands(armed: ListMeTarget | null, fp: LocalFingerprint | null | undefined): boolean {
+  const now = listMeTarget(fp);
+  return !!armed && !!now && armed.net === now.net && armed.node === now.node;
+}
+
+/** Why no LIST ME is offered on a network this page does not know. */
+export const LIST_ME_UNKNOWN_NETWORK = 'This page does not know that network, so LIST ME cannot be turned on from it: update Star Station.';
+
+/** The page's refusal of an on with nothing it was confirmed for. */
+export const LIST_ME_NOT_CONFIRMED = 'LIST ME was not confirmed for this station node and its network: tap LIST ME again';
 
 /** What the switch does when tapped: `arm` shows CONFIRM, `confirm` turns
  *  LIST ME on, `off` turns it off (no CONFIRM: it only stops writes). */
@@ -150,26 +188,34 @@ export function listMeRow(fp: LocalFingerprint | null | undefined, ui: ListMeUi)
     return row(listMeOnNote(net) + waits, unlist);
   }
   const note = listing.damaged ? listMeDamagedNote(net) : listing.chosen ? listMeOffNote(net) : listMeDefaultOffNote(net);
+  // A LIST ME names its network to the node, and this page has no name for
+  // one it does not know: none is offered there.
+  if (!net) return row(`${note} ${LIST_ME_UNKNOWN_NETWORK}`, null);
   if (ui.armed && !busy) return row(note, { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false }, listMeWarning(net, listing.held === true));
   return row(note, { act: 'arm', label: 'LIST ME', danger: false, busy: false });
 }
 
-/** Ask the node at `origin` to turn LIST ME on or off for its network.
- *  Never throws: a refusal comes back in the node's words, anything else in
- *  the page's. */
+/** Ask the node at `origin` to turn LIST ME on or off. An on is for
+ *  `target`, the network and the node it was confirmed for, and the node
+ *  takes it only if it is that node on that network; an off names nothing
+ *  (`target` is not read). Never throws: a refusal comes back in the node's
+ *  words, anything else in the page's. */
 export async function turnListMe(
   origin: string,
   on: boolean,
+  target: ListMeTarget | null,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = LIST_ME_TIMEOUT_MS,
 ): Promise<TurnResult> {
   if (!origin) return { ok: false, error: 'your station node is not answering' };
+  if (on && !target) return { ok: false, error: LIST_ME_NOT_CONFIRMED };
+  const query = on && target ? `on=1&net=${encodeURIComponent(target.net)}&node=${encodeURIComponent(target.node)}` : 'on=0';
   const ctl = new AbortController();
   const deadline = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     // No redirect: the answer must be the node's own (the fingerprint probe's
     // rule). No body and no custom header: a simple request, no preflight.
-    const res = await fetchImpl(`${origin}/api/chia/listing?on=${on ? 1 : 0}`, { method: 'POST', signal: ctl.signal, redirect: 'error' });
+    const res = await fetchImpl(`${origin}/api/chia/listing?${query}`, { method: 'POST', signal: ctl.signal, redirect: 'error' });
     if (res.status === 404) {
       return { ok: false, error: 'your station node is older than LIST ME: update Star Station' };
     }

@@ -2523,6 +2523,15 @@ async fn node_main() -> Result<()> {
             chia_resolve::unix_now(),
         )),
     });
+    // 📖 The wallet lease asks the same switch before a saved bundle of a
+    // listing's or a knock's goes to the peers again (chia_publish.rs
+    // `Resend`): turned off, LIST ME stops those too, in this run and after
+    // a restart.
+    #[cfg(feature = "chia-publish")]
+    chia_publish::WALLET_LEASE.ask_list_me({
+        let hub = hub.clone();
+        move || hub.list_me.on()
+    });
 
     // 🖥️ The desktop app's channel thread, once the hub exists: its ops
     // read the wallet's key, meta and switch there (the startup wallet is
@@ -7603,13 +7612,18 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                 // 📖 The SpacePhone's LIST ME switch (chia_listing.rs): `on=1`
                 // lets this station write its Phone Book listing and its
                 // knocks on the node's network from the publisher's next
-                // tick, `on=0` stops both at once, and either is remembered
-                // for that network alone. Behind the wallet switch's gate:
-                // only this machine's own game page may ask.
+                // tick, `on=0` stops both at once (and the saved bundles of
+                // writes already sent stop going to the peers again,
+                // chia_publish.rs `Resend`), and either is remembered for
+                // that network alone. Behind the wallet switch's gate: only
+                // this machine's own game page may ask.
                 let target = req.split_whitespace().nth(1).unwrap_or("");
                 let host_header = header_value(&req, "host");
                 let local = chia_wallet_switch::local_page(origin_header.as_deref(), host_header.as_deref(), bound_port);
-                let (status, body) = match chia_listing::listing_gate(local, target) {
+                // An on names the network and the node it was confirmed
+                // for, and is taken only by that node on that network.
+                let node_id = hub_clone.fingerprint.lock().unwrap().iroh_node_id.clone();
+                let (status, body) = match chia_listing::listing_gate(local, target, chia_network::net(), &node_id) {
                     Ok(on) => turn_listing(&hub_clone, on),
                     Err(refused) => refused,
                 };

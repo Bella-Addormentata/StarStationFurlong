@@ -301,7 +301,7 @@ import type { BankBackupUi } from "./bankBackup";
 import { hasNativeShell, openBackup } from "./nativeShell";
 import { phoneBookIconSvg, phoneBookIndicator } from "./phoneBook";
 import { CHIA_LANE_BUTTON_ID, chiaLaneRow, laneKeyRepeat, laneTurnOf, meshFeedback, shareCardFeedback, turnChiaLane } from "./chiaLane";
-import { LIST_ME_BUTTON_ID, listMeRow, listMeTurnOf, turnListMe } from "./listMe";
+import { LIST_ME_BUTTON_ID, listMeRow, listMeStands, listMeTarget, listMeTurnOf, turnListMe, type ListMeTarget } from "./listMe";
 import type { ChiaLaneTurn } from "./chiaLane";
 import { isFlightKey } from "./freeFlightStick";
 import { armTvDrive, isTvKind, leaveTvRoom, tvDriveArmed, tvLabel } from "./tvSession";
@@ -1112,10 +1112,12 @@ function renderChiaLaneRow(): void {
 }
 
 /** 📖 LIST ME under the PHONE BOOK row (listMe.ts): armed and waiting for
- *  CONFIRM, a turn in flight, and the last turn's failure. Opening the
- *  Network view disarms it and clears the failure; the node's own memory of
- *  the switch rides on its fingerprint. */
-let listMeArmed = false;
+ *  CONFIRM (for the network and the node whose warning was read, and no
+ *  other: a fingerprint that names another disarms it), a turn in flight,
+ *  and the last turn's failure. Opening the Network view disarms it and
+ *  clears the failure; the node's own memory of the switch rides on its
+ *  fingerprint. */
+let listMeArmed: ListMeTarget | null = null;
 let listMeTurning: "on" | "off" | null = null;
 let listMeError: string | null = null;
 /** When the switch last changed what it does (the CHIA switch's rule: a tap
@@ -1129,7 +1131,8 @@ let listMeShownAct: string | null = null;
  *  textContent, hidden and attributes only, never innerHTML, so focus stays
  *  on the one button from LIST ME to CONFIRM to LISTING. */
 function renderListMeRow(): void {
-  const row = listMeRow(localNodeLive ? localFingerprint : null, { armed: listMeArmed, turning: listMeTurning, error: listMeError });
+  const fp = localNodeLive ? localFingerprint : null;
+  const row = listMeRow(fp, { armed: listMeStands(listMeArmed, fp), turning: listMeTurning, error: listMeError });
   const line = (id: string, text: string | null): void => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -1259,11 +1262,14 @@ async function turnChiaLaneSwitch(turn: ChiaLaneTurn): Promise<void> {
  *  what the node now holds, not what the page hoped. */
 async function turnListMeSwitch(on: boolean): Promise<void> {
   if (listMeTurning) return;
+  // An on goes out for what CONFIRM was armed for, not for whatever node
+  // answers when it arrives: the node refuses another's.
+  const armedFor = listMeArmed;
   listMeTurning = on ? "on" : "off";
-  listMeArmed = false;
+  listMeArmed = null;
   listMeError = null;
   renderListMeRow();
-  const turned = await turnListMe(localNodeOrigin, on);
+  const turned = await turnListMe(localNodeOrigin, on, on ? armedFor : null);
   listMeTurning = null;
   listMeError = turned.ok ? null : turned.error;
   await refreshLocalFingerprint();
@@ -8934,7 +8940,7 @@ function setupSpacePhoneOverlay() {
       if (!chiaLaneTurning) chiaLaneError = null;
       renderChiaLaneRow();
       // 📖 The same for a LIST ME armed on an earlier visit.
-      listMeArmed = false;
+      listMeArmed = null;
       if (!listMeTurning) listMeError = null;
       renderListMeRow();
       // Land focus in the view so its ↑/↓ traversal reaches the CHIA switch
@@ -9687,7 +9693,7 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
       localNodeOrigin = "";
       bankWalletArmed = false;
       chiaLaneArmed = false;
-      listMeArmed = false;
+      listMeArmed = null;
     }
     if (backupMoved || (wasLive && document.getElementById("phone-app-bank")?.classList.contains("active"))) renderBankApp();
     // Node unreachable this round: keep the last-known fingerprint (if any)
@@ -9710,6 +9716,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   const meshWas = chiaMeshOffered(localFingerprint?.chia_net);
   const wasLive = localNodeLive;
   localFingerprint = fingerprint;
+  // 📖 A LIST ME armed on another node, or on this one's other network (a
+  // node restarted between two probes), is armed no longer: CONFIRM is for
+  // the warning that was read.
+  if (!listMeStands(listMeArmed, fingerprint)) listMeArmed = null;
   // 🛑 The Chia Mesh switch follows the node's network (test networks only).
   if (chiaMeshOffered(fingerprint.chia_net) !== meshWas) refreshChiaModeToggle();
   localNodeOrigin = nodeOrigin;
@@ -10241,7 +10251,7 @@ function setupNetworkDetailsPanel() {
       const act = listBtn.dataset.act;
       if (act !== "arm" && !freshTap((e as MouseEvent).detail, performance.now(), listMeChangedAt)) return;
       if (act === "arm") {
-        listMeArmed = true;
+        listMeArmed = listMeTarget(localNodeLive ? localFingerprint : null);
         listMeError = null;
         listMeChangedAt = performance.now();
         renderListMeRow();

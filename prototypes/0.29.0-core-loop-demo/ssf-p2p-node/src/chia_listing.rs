@@ -181,18 +181,44 @@ pub fn view_of(net: ChiaNet, saved: &Saved, findable: bool) -> ListingView {
     ListingView { on: saved.on(net), chosen: saved.chosen(), held: !findable, damaged: matches!(saved, Saved::Damaged(_)) }
 }
 
-/// The route's query: `/api/chia/listing?on=1` turns LIST ME on, `on=0`
-/// off, nothing else.
-pub fn listing_asked(target: &str) -> Option<bool> {
+/// What the page asks of the route: the turn, and for which network and
+/// which station node its player confirmed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListingAsk<'a> {
+    pub on: bool,
+    /// `net=`: the network the page showed, by its id ([`ChiaNet::id`]).
+    pub net: Option<&'a str>,
+    /// `node=`: the node the page showed, by its iroh node id.
+    pub node: Option<&'a str>,
+}
+
+/// The route's query: `/api/chia/listing?on=0` turns LIST ME off, and
+/// `on=1&net=<network id>&node=<iroh node id>` turns it on. Each key at
+/// most once, in any order, and no other key.
+pub fn listing_asked(target: &str) -> Option<ListingAsk<'_>> {
     let (path, query) = target.split_once('?')?;
     if path != "/api/chia/listing" {
         return None;
     }
-    match query {
-        "on=1" => Some(true),
-        "on=0" => Some(false),
-        _ => None,
+    let (mut on, mut net, mut node) = (None, None, None);
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        let taken = match key {
+            "on" => on.replace(match value {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            })
+            .is_some(),
+            "net" => net.replace(value).is_some(),
+            "node" => node.replace(value).is_some(),
+            _ => return None,
+        };
+        if taken {
+            return None;
+        }
     }
+    Some(ListingAsk { on: on?, net, node })
 }
 
 /// The route's refusal for a request from anything but this computer's own
@@ -200,7 +226,20 @@ pub fn listing_asked(target: &str) -> Option<bool> {
 pub const PAGE_ONLY_WORDS: &str = "only this computer's own Star Station page can turn LIST ME on or off";
 
 /// The route's refusal for a query it does not know.
-pub const BAD_ASK_WORDS: &str = "ask with on=1 or on=0";
+pub const BAD_ASK_WORDS: &str = "ask with on=0, or with on=1 and the net= and node= the LIST ME was confirmed for";
+
+/// The route's refusal of an on confirmed for another network than this
+/// node runs on.
+pub fn other_network_words(net: ChiaNet) -> String {
+    format!(
+        "LIST ME was not turned on: it was confirmed for another network than the one this station node runs on now ({}). Look at the Network settings again",
+        net.name()
+    )
+}
+
+/// The route's refusal of an on confirmed for another station node.
+pub const OTHER_NODE_WORDS: &str =
+    "LIST ME was not turned on: it was confirmed for another station node than the one that answers now. Look at the Network settings again";
 
 /// The route's refusal for a build that only reads the chain: it writes no
 /// listing and no knock, so it has no switch.
@@ -213,11 +252,31 @@ pub const UNBUILT_WORDS: &str = "this build of the node only reads the chain, so
 /// web origin or none, sent to a loopback Host on the API's own port. A
 /// forged page that turned the wallet on can still start no write: this
 /// switch is behind the same gate, and off where the coins are real.
-pub fn listing_gate(local: bool, target: &str) -> Result<bool, (&'static str, serde_json::Value)> {
+///
+/// An on is the player's word for one network on one station node, so it
+/// names both, as the page showed them when its player tapped CONFIRM, and
+/// is taken only by that node on that network (`net`, `node_id`: this
+/// node's own). A node started on another network at the same port while a
+/// confirmation stood open on the page is asked for the network the player
+/// read, and refuses. An off names neither and is always taken: it only
+/// stops writes, on whichever network this node would make them.
+pub fn listing_gate(local: bool, target: &str, net: ChiaNet, node_id: &str) -> Result<bool, (&'static str, serde_json::Value)> {
+    let refused = |status: &'static str, error: &str| Err((status, serde_json::json!({ "ok": false, "error": error })));
     if !local {
-        return Err(("403 Forbidden", serde_json::json!({ "ok": false, "error": PAGE_ONLY_WORDS })));
+        return refused("403 Forbidden", PAGE_ONLY_WORDS);
     }
-    listing_asked(target).ok_or(("400 Bad Request", serde_json::json!({ "ok": false, "error": BAD_ASK_WORDS })))
+    let Some(ask) = listing_asked(target) else {
+        return refused("400 Bad Request", BAD_ASK_WORDS);
+    };
+    if !ask.on {
+        return Ok(false);
+    }
+    match (ask.net, ask.node) {
+        (Some(asked), Some(_)) if asked != net.id() => refused("409 Conflict", &other_network_words(net)),
+        (Some(_), Some(asked)) if asked != node_id => refused("409 Conflict", OTHER_NODE_WORDS),
+        (Some(_), Some(_)) => Ok(true),
+        _ => refused("400 Bad Request", BAD_ASK_WORDS),
+    }
 }
 
 /// An on's refusal while Chia is off on this computer: the switch would
@@ -336,15 +395,26 @@ impl ListMe {
     /// One turn of the switch at `now` (unix seconds), with whether Chia is
     /// off on this computer (`chia_off`).
     ///
-    /// An on is saved first and holds only once it is saved: a switch the
-    /// disk would not keep is not turned on, since the next start would
-    /// read something else. It is refused while Chia is off
-    /// ([`CHIA_OFF_WORDS`]).
+    /// An on is saved first and holds only once the file reads on: a switch
+    /// the disk would not keep is not turned on, since the next start would
+    /// read something else. A save can report a failure after the new file
+    /// took its name (the folder's sync comes last, private_file.rs), so a
+    /// failed save is judged by what the file reads then, which is what the
+    /// next start reads: on, the turn is taken and the node's log says the
+    /// save was not confirmed; anything else, it is refused. The player is
+    /// never told "not turned on" over a file that turns it on at the next
+    /// start. It is refused while Chia is off ([`CHIA_OFF_WORDS`]).
     ///
     /// An off holds from this call whatever the disk does: when its save
     /// fails, the switch is off for the rest of the run and the answer says
     /// what the next start will read.
     pub fn turn(&self, on: bool, now: u64, chia_off: bool) -> ListingTurn {
+        self.turn_with(on, now, chia_off, save)
+    }
+
+    /// [`ListMe::turn`] with the save it makes (a test's can fail after it
+    /// wrote the file).
+    fn turn_with(&self, on: bool, now: u64, chia_off: bool, save: impl FnOnce(&Path, bool, u64) -> std::io::Result<()>) -> ListingTurn {
         let mut saved = self.saved.lock().unwrap();
         let view = |saved: &Saved| view_of(self.net, saved, self.findable);
         if on && chia_off {
@@ -355,6 +425,16 @@ impl ListMe {
             (Ok(()), _) => {
                 *saved = if on { Saved::On } else { Saved::Off };
                 ListingTurn::taken(view(&saved), turned_line(self.net, on, !self.findable))
+            }
+            (Err(e), true) if matches!(saved_of(&self.path), Saved::On) => {
+                *saved = Saved::On;
+                let mut turn = ListingTurn::taken(view(&saved), turned_line(self.net, true, !self.findable));
+                if let Some(line) = turn.line.as_mut() {
+                    line.push_str(&format!(
+                        "\n⚠️  LIST ME: {file} reads on, but its save was not confirmed ({e}): after a power cut it may read as it did before"
+                    ));
+                }
+                turn
             }
             (Err(e), true) => ListingTurn::refused(
                 &format!("LIST ME was not turned on: its switch could not be saved ({e})"),
@@ -480,8 +560,13 @@ mod tests {
 
     #[test]
     fn the_route_takes_on_or_off_from_this_computers_page_and_nothing_else() {
-        assert_eq!(listing_asked("/api/chia/listing?on=1"), Some(true));
-        assert_eq!(listing_asked("/api/chia/listing?on=0"), Some(false));
+        assert_eq!(listing_asked("/api/chia/listing?on=1"), Some(ListingAsk { on: true, net: None, node: None }));
+        assert_eq!(listing_asked("/api/chia/listing?on=0"), Some(ListingAsk { on: false, net: None, node: None }));
+        assert_eq!(
+            listing_asked("/api/chia/listing?on=1&net=mainnet&node=abc"),
+            Some(ListingAsk { on: true, net: Some("mainnet"), node: Some("abc") })
+        );
+        assert_eq!(listing_asked("/api/chia/listing?node=abc&on=0&net="), Some(ListingAsk { on: false, net: Some(""), node: Some("abc") }));
         for bad in [
             "/api/chia/listing",
             "/api/chia/listing?",
@@ -489,6 +574,11 @@ mod tests {
             "/api/chia/listing?on=2",
             "/api/chia/listing?on=true",
             "/api/chia/listing?on=1&x=1",
+            "/api/chia/listing?on=1&on=0",
+            "/api/chia/listing?on=1&net=mainnet&net=testnet11&node=abc",
+            "/api/chia/listing?on=1&net=mainnet&node=abc&node=abc",
+            "/api/chia/listing?net=mainnet&node=abc",
+            "/api/chia/listing?on=1&net",
             "/api/chia/listing?off=1",
             "/api/chia/listing/?on=1",
             "/api/chia/lane?on=1",
@@ -497,13 +587,83 @@ mod tests {
         ] {
             assert_eq!(listing_asked(bad), None, "{bad:?}");
         }
-        assert_eq!(listing_gate(true, "/api/chia/listing?on=1"), Ok(true));
-        assert_eq!(listing_gate(true, "/api/chia/listing?on=0"), Ok(false));
-        // Not this computer's page: refused before the query is read at all.
-        for target in ["/api/chia/listing?on=1", "/api/chia/listing?on=0", "/api/chia/listing?on=9"] {
-            assert_eq!(listing_gate(false, target), Err(("403 Forbidden", serde_json::json!({ "ok": false, "error": PAGE_ONLY_WORDS }))));
+        let refused = |status: &'static str, error: &str| Err((status, serde_json::json!({ "ok": false, "error": error })));
+        for net in ChiaNet::ALL {
+            let on = format!("/api/chia/listing?on=1&net={}&node=abc", net.id());
+            assert_eq!(listing_gate(true, &on, net, "abc"), Ok(true), "{net:?}");
+            // An off names nothing, and is taken whatever it names.
+            assert_eq!(listing_gate(true, "/api/chia/listing?on=0", net, "abc"), Ok(false));
+            assert_eq!(listing_gate(true, "/api/chia/listing?on=0&net=nowhere&node=other", net, "abc"), Ok(false));
+            // Not this computer's page: refused before the query is read at all.
+            for target in [on.as_str(), "/api/chia/listing?on=0", "/api/chia/listing?on=9"] {
+                assert_eq!(listing_gate(false, target, net, "abc"), refused("403 Forbidden", PAGE_ONLY_WORDS));
+            }
+            assert_eq!(listing_gate(true, "/api/chia/listing?on=9", net, "abc"), refused("400 Bad Request", BAD_ASK_WORDS));
         }
-        assert_eq!(listing_gate(true, "/api/chia/listing?on=9"), Err(("400 Bad Request", serde_json::json!({ "ok": false, "error": BAD_ASK_WORDS }))));
+    }
+
+    #[test]
+    fn an_on_is_taken_only_for_the_network_and_the_node_it_was_confirmed_for() {
+        // The page's player read one network's warning and tapped CONFIRM;
+        // the node that answers runs on another (started there at the same
+        // port meanwhile), or is another station. Neither turns on.
+        let refused = |status: &'static str, error: &str| Err((status, serde_json::json!({ "ok": false, "error": error })));
+        for net in ChiaNet::ALL {
+            for other in ChiaNet::ALL.into_iter().filter(|other| *other != net) {
+                let asked = format!("/api/chia/listing?on=1&net={}&node=abc", other.id());
+                assert_eq!(listing_gate(true, &asked, net, "abc"), refused("409 Conflict", &other_network_words(net)), "{other:?} asked of {net:?}");
+            }
+            let here = format!("/api/chia/listing?on=1&net={}", net.id());
+            assert_eq!(listing_gate(true, &format!("{here}&node=another"), net, "abc"), refused("409 Conflict", OTHER_NODE_WORDS));
+            assert_eq!(listing_gate(true, &format!("{here}&node="), net, "abc"), refused("409 Conflict", OTHER_NODE_WORDS));
+            // An on that names no network or no node is no confirmation.
+            for bare in ["/api/chia/listing?on=1".to_string(), here.clone(), "/api/chia/listing?on=1&node=abc".to_string()] {
+                assert_eq!(listing_gate(true, &bare, net, "abc"), refused("400 Bad Request", BAD_ASK_WORDS), "{bare}");
+            }
+            // The network is judged first: its words name where the node runs.
+            assert_eq!(
+                listing_gate(true, "/api/chia/listing?on=1&net=nowhere&node=another", net, "abc"),
+                refused("409 Conflict", &other_network_words(net))
+            );
+            assert!(other_network_words(net).contains(net.name()) && !other_network_words(net).contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn an_on_whose_save_failed_after_the_file_was_written_is_on_and_says_so() {
+        // The folder's sync comes after the rename (private_file.rs): the
+        // save reports a failure, and the file reads on. The next start
+        // would turn LIST ME on, so the player is not told it stayed off.
+        let dir = temp_dir("late");
+        for net in ChiaNet::ALL {
+            let path = dir.join(format!("{}-{LISTING_FILE}", net.id()));
+            save(&path, false, 1).unwrap();
+            let switch = ListMe::read(net, path.clone(), true);
+            assert!(!switch.on());
+            let late = |path: &Path, on: bool, now: u64| {
+                save(path, on, now)?;
+                Err(std::io::Error::other("the folder could not be synced"))
+            };
+            let on = switch.turn_with(true, 2, false, late);
+            assert_eq!(on.status, "200 OK", "{net:?}: {}", on.body);
+            assert_eq!(on.body, serde_json::json!({ "ok": true, "listing": { "on": true, "chosen": true } }));
+            assert!(switch.on() && switch.listed().is_some(), "{net:?}: on now, as at the next start");
+            assert!(ListMe::read(net, path.clone(), true).on(), "{net:?}: the next start reads on");
+            let line = on.line.unwrap();
+            assert!(line.starts_with(&turned_line(net, true, false)), "{line}");
+            assert!(line.contains("reads on, but its save was not confirmed (the folder could not be synced)"), "{line}");
+            assert!(!on.failed);
+            // A save that failed before the file changed is refused as ever:
+            // the file reads off, and so does the next start.
+            let off = switch.turn(false, 3, false);
+            assert_eq!(off.status, "200 OK");
+            let early = |_: &Path, _: bool, _: u64| Err(std::io::Error::other("the disk is full"));
+            let refused = switch.turn_with(true, 4, false, early);
+            assert_eq!(refused.status, "409 Conflict");
+            assert_eq!(refused.body["error"], "LIST ME was not turned on: its switch could not be saved (the disk is full)");
+            assert!(!switch.on() && !ListMe::read(net, path.clone(), true).on(), "{net:?}: off now and at the next start");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

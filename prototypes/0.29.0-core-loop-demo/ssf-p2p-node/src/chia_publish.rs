@@ -16,7 +16,7 @@
 //! never published under, armed or not — see [`publishable_rooms`].
 #![cfg(feature = "chia-publish")]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -205,6 +205,50 @@ pub struct WalletLease {
     /// copy of this station ([`OwnSpends`]). Written with the parking, in the
     /// same save.
     own: std::sync::Mutex<OwnSpends>,
+    /// The spends parked as LIST ME's ([`Resend::WhileListed`]: a listing's
+    /// write or a knock's), by spend number. A spend keeps its number from
+    /// its parking through settling and back, so the mark needs no place in
+    /// those records: it is asked of the number wherever the bundle would go
+    /// to the peers again ([`WalletLease::sends_again`]). Saved with the
+    /// parking, in the same write, for the spends the file still holds.
+    listed: std::sync::Mutex<BTreeSet<u64>>,
+    /// The node's LIST ME switch, asked at each reconciliation
+    /// ([`WalletLease::ask_list_me`]): whether it is on now. `None` until
+    /// the node names it, and a lease not told sends no bundle of LIST ME's
+    /// again, as one whose switch is off.
+    list_me: std::sync::Mutex<Option<ListMeAsk>>,
+}
+
+/// How the lease asks the node's LIST ME switch whether it is on
+/// ([`WalletLease::ask_list_me`]).
+type ListMeAsk = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// When a parked spend's saved bundle may go to the peers again, as the
+/// liveness question of a reconciliation hands it to them
+/// ([`mempool_probes`]) and as a spend parked again after its block went.
+///
+/// A bundle handed to the peers again is a broadcast: if every mempool had
+/// dropped it, that is what puts the write back on its way. So a write the
+/// player's LIST ME allowed (stage 4 design §4.5 (6)) is sent again only
+/// while LIST ME is still on. Turned off, the spend stays parked with its
+/// bundle and its coins stay reserved; the chain's own word still settles
+/// it (a coin of its spent or gone), and the question is asked again once
+/// LIST ME is back on.
+///
+/// The cost, taken knowingly: a write the mempools dropped, whose LIST ME
+/// was then turned off, stays parked until the chain settles it or LIST ME
+/// is turned on again, since only the peers can say it is dead and asking
+/// them sends it. Its payer writes nothing meanwhile, which for a listing's
+/// key or a knock's is what off means; a writer that waits on every parked
+/// spend (the SSF wallet's own on a test network, [`publish_memo_on`]: the
+/// beacon it pays for there) waits with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resend {
+    /// Whatever LIST ME says: the beacon's writes (their own setting,
+    /// `SSF_CHIA_BEACON`), the dish's and every other spend.
+    Always,
+    /// Only while LIST ME is on: the listing's writes and the knocks'.
+    WhileListed,
 }
 
 /// Coins the lease remembers its own spends consumed at most
@@ -606,6 +650,12 @@ struct LeaseFile {
     own_watching: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     own_spends: Vec<OwnSpend>,
+    /// The parked and settling spends that are LIST ME's
+    /// ([`Resend::WhileListed`]), by number. Absent in files older builds
+    /// wrote, whose spends are sent again as they always were; an older
+    /// build reads the file and skips this, as for a payer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    list_me: Vec<u64>,
 }
 
 /// One coin of [`OwnSpends`] as the lease file keeps it.
@@ -736,7 +786,28 @@ impl WalletLease {
             settling: std::sync::Mutex::new(BTreeMap::new()),
             spacing: std::sync::Mutex::new(HashMap::new()),
             own: std::sync::Mutex::new(OwnSpends::default()),
+            listed: std::sync::Mutex::new(BTreeSet::new()),
+            list_me: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Name the node's LIST ME switch: `on` says whether it is on when
+    /// asked, and is asked at each reconciliation, so a turn holds from the
+    /// next one. Until this is called the lease sends no bundle of LIST
+    /// ME's again ([`Resend::WhileListed`]).
+    pub fn ask_list_me(&self, on: impl Fn() -> bool + Send + Sync + 'static) {
+        *self.list_me.lock().unwrap() = Some(Box::new(on));
+    }
+
+    /// Whether LIST ME is on now, by the switch the node named.
+    fn list_me_on(&self) -> bool {
+        self.list_me.lock().unwrap().as_ref().is_some_and(|on| on())
+    }
+
+    /// Whether `spend`'s saved bundle may go to the peers again, with LIST
+    /// ME on or off as `list_me_on` says ([`Resend`]).
+    fn sends_again(&self, spend: u64, list_me_on: bool) -> bool {
+        list_me_on || !self.listed.lock().unwrap().contains(&spend)
     }
 
     /// Hold the guard across select → build → push.
@@ -777,7 +848,20 @@ impl WalletLease {
         bundle: &SpendBundle,
         payer: Payer,
     ) -> Result<Parking, LeaseError> {
-        self.park_with_bundle_at(coin_ids, Some((bundle, payer)), Instant::now())
+        self.park_with_bundle_as(coin_ids, bundle, payer, Resend::Always)
+    }
+
+    /// [`WalletLease::park_with_bundle`], saying when the bundle may go to
+    /// the peers again ([`Resend`]): the mark goes into the same write as
+    /// the parking, so no spend of LIST ME's is ever parked without it.
+    pub fn park_with_bundle_as<I: Into<ParkedInput>>(
+        &self,
+        coin_ids: impl IntoIterator<Item = I>,
+        bundle: &SpendBundle,
+        payer: Payer,
+        resend: Resend,
+    ) -> Result<Parking, LeaseError> {
+        self.park_pushed_at(coin_ids, Some((bundle, payer)), resend, Instant::now())
     }
 
     /// [`WalletLease::park_with_bundle`] at a given instant; `pushed` is the
@@ -789,8 +873,23 @@ impl WalletLease {
         pushed: Option<(&SpendBundle, Payer)>,
         now: Instant,
     ) -> Result<Parking, LeaseError> {
+        self.park_pushed_at(coin_ids, pushed, Resend::Always, now)
+    }
+
+    /// The parking itself, for [`WalletLease::park_with_bundle_as`] and
+    /// [`WalletLease::park_with_bundle_at`].
+    fn park_pushed_at<I: Into<ParkedInput>>(
+        &self,
+        coin_ids: impl IntoIterator<Item = I>,
+        pushed: Option<(&SpendBundle, Payer)>,
+        resend: Resend,
+        now: Instant,
+    ) -> Result<Parking, LeaseError> {
         self.ensure_open()?;
         let spend = self.spends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if resend == Resend::WhileListed {
+            self.listed.lock().unwrap().insert(spend);
+        }
         let inputs: Vec<ParkedInput> = coin_ids.into_iter().map(Into::into).collect();
         let coins: Vec<Bytes32> = inputs.iter().map(|input| input.coin_id).collect();
         {
@@ -819,6 +918,7 @@ impl WalletLease {
             // spends too, since it spent nothing.
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
             self.bundles.lock().unwrap().remove(&spend);
+            self.listed.lock().unwrap().remove(&spend);
             let mut own = self.own.lock().unwrap();
             for (coin, change) in noted.into_iter().rev() {
                 own.take_back(&coin, change);
@@ -1541,6 +1641,16 @@ impl WalletLease {
             }
         }
         let settling_count = settling.len();
+        // LIST ME's marks, for the spends the file holds: a number it holds
+        // no spend for marks nothing, and is left out.
+        {
+            let mut listed = self.listed.lock().unwrap();
+            for spend in &file.list_me {
+                if parked.iter().any(|(_, held, _)| held == spend) || settling.iter().any(|(held, _)| held == spend) {
+                    listed.insert(*spend);
+                }
+            }
+        }
         {
             let mut kept = self.settling.lock().unwrap();
             for (spend, s) in settling {
@@ -1622,6 +1732,17 @@ impl WalletLease {
             let own = self.own.lock().unwrap();
             (own.watching, own.coins.iter().map(|(coin, once)| OwnSpend { coin: hex::encode(coin), once: *once }).collect())
         };
+        // LIST ME's marks of the spends this snapshot holds, parked or
+        // settling: the mark of a spend the lease let go has nothing left to
+        // hold back.
+        let list_me: Vec<u64> = self
+            .listed
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|spend| parked.iter().any(|p| p.spend == *spend) || settling.iter().any(|s| s.spend == *spend))
+            .collect();
         LeaseFile {
             v: 1,
             spends: self.spends.load(std::sync::atomic::Ordering::Relaxed),
@@ -1631,6 +1752,7 @@ impl WalletLease {
             settling,
             own_watching,
             own_spends,
+            list_me,
         }
     }
 
@@ -1818,7 +1940,13 @@ impl WalletLease {
         // theirs spent or gone, as any spend the peers are not asked about.
         let mut in_mempool: HashMap<u64, Option<bool>> = HashMap::new();
         let after = self.probe_cursor.load(std::sync::atomic::Ordering::Relaxed);
-        let asked: Vec<DueSpend> = due.iter().filter(|d| self.asks_the_peers(net, d.payer)).cloned().collect();
+        //
+        // 📖 And no bundle of LIST ME's goes out again while LIST ME is off
+        // ([`Resend::WhileListed`]), on any network: its spend stays parked
+        // the same way.
+        let list_me_on = self.list_me_on();
+        let asked: Vec<DueSpend> =
+            due.iter().filter(|d| self.asks_the_peers(net, d.payer) && self.sends_again(d.spend, list_me_on)).cloned().collect();
         let probes = mempool_probes(&asked, &spent_on_chain, after);
         if let Some((last, _)) = probes.last() {
             self.probe_cursor.store(*last, std::sync::atomic::Ordering::Relaxed);
@@ -1890,7 +2018,13 @@ impl WalletLease {
                     println!(
                         "⛓️ wallet lease: the block that spent spend #{spend}'s coins at height {} is gone (a reorganization); parked again, {}",
                         s.spent_at,
-                        if self.asks_the_peers(net, s.payer) { "to be pushed again" } else { "for the chain to settle (no spend is sent again here)" }
+                        if !self.asks_the_peers(net, s.payer) {
+                            "for the chain to settle (no spend is sent again here)"
+                        } else if !self.sends_again(*spend, list_me_on) {
+                            "for the chain to settle (LIST ME is off, so its spend is not sent again)"
+                        } else {
+                            "to be pushed again"
+                        }
                     );
                     reparked.push(*spend);
                 }
@@ -2030,7 +2164,22 @@ pub async fn push_parked_with<I: Into<ParkedInput>>(
     bundle: SpendBundle,
     inputs: impl IntoIterator<Item = I>,
 ) -> Result<(), PushError> {
-    let parking = lease.park_with_bundle(inputs, &bundle, payer).map_err(PushError::NotSent)?;
+    push_parked_as(lease, client, payer, Resend::Always, bundle, inputs).await
+}
+
+/// [`push_parked_with`], saying when the saved bundle may go to the peers
+/// again ([`Resend`]): [`Resend::WhileListed`] for a listing's write and a
+/// knock's, which the player's LIST ME allowed and which stop being sent
+/// with it.
+pub async fn push_parked_as<I: Into<ParkedInput>>(
+    lease: &WalletLease,
+    client: &impl ChainAccess,
+    payer: Payer,
+    resend: Resend,
+    bundle: SpendBundle,
+    inputs: impl IntoIterator<Item = I>,
+) -> Result<(), PushError> {
+    let parking = lease.park_with_bundle_as(inputs, &bundle, payer, resend).map_err(PushError::NotSent)?;
     match client.push_tx(bundle).await {
         Ok(()) => Ok(()),
         Err(ChainError::Refused(why)) => {
@@ -3778,7 +3927,7 @@ pub(crate) async fn publish_node_presence_on(
     now_unix: u64,
 ) -> Result<(Bytes32, MemoWrite)> {
     let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now_unix)?;
-    let write = publish_memo_on(lease, net, client, now, chia_sk, hint, None, move |_| Ok(sealed), "presence").await?;
+    let write = publish_memo_on(lease, net, client, now, chia_sk, hint, None, move |_| Ok(sealed), "presence", Resend::WhileListed).await?;
     Ok((hint, write))
 }
 
@@ -4011,6 +4160,7 @@ async fn publish_memo_on(
     gate: Option<&tokio::sync::Mutex<()>>,
     body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
     what: &str,
+    resend: Resend,
 ) -> Result<MemoWrite> {
     let _lease = lease.lock().await;
     lease.ensure_open()?;
@@ -4030,7 +4180,7 @@ async fn publish_memo_on(
     let coins = WriteCoins::one(input);
     // The payer the input is parked under is the one the write names.
     let paid_by = Payer::of(payer);
-    match push_parked_with(lease, client, paid_by, bundle, [(input, coin.confirmed_height)]).await {
+    match push_parked_as(lease, client, paid_by, resend, bundle, [(input, coin.confirmed_height)]).await {
         Ok(()) => Ok(MemoWrite { coins, acked: true, spend: lease.spend_of(&coins.parked), memo, payer: paid_by }),
         // Indeterminate, not failed: the bundle may be in a mempool and the
         // input is parked. Reported as a write, so the caller files it as
@@ -5902,6 +6052,7 @@ async fn publish_knock_on(
             knock_memo(net, iroh_sk, req, room_key, era, input, ck_from, now_unix)
         },
         "knock",
+        Resend::WhileListed,
     )
     .await?;
     Ok((hint, write))
@@ -6448,7 +6599,7 @@ async fn publish_beacon_on(
 ) -> Result<(Bytes32, MemoWrite)> {
     let (hint, plain) = beacon_memo(net, iroh_sk, era, now_unix)?;
     let body = move |_| dated().map(|()| plain);
-    let write = publish_memo_on(lease, net, client, now, beacon_sk, hint, None, body, "beacon").await?;
+    let write = publish_memo_on(lease, net, client, now, beacon_sk, hint, None, body, "beacon", Resend::Always).await?;
     Ok((hint, write))
 }
 
@@ -11381,6 +11532,119 @@ mod tests {
         lease.reconcile_at(T11, &chain, due).await;
         assert_eq!(counts(&chain), (2, 1), "the control: on a test network the wallet's spend is asked about");
         assert_eq!(lease.lease_word(&id), LeaseWord::Dropped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 📖 Stage 4 design §4.5 (6): what LIST ME allowed stops being sent
+    /// with it. A listing's write or a knock's is parked as LIST ME's
+    /// ([`Resend::WhileListed`]), and the liveness question, which hands a
+    /// parked spend's saved bundle to the peers again, leaves it out while
+    /// the switch is off: a bundle every mempool dropped would otherwise
+    /// be put back on its way after the player said stop. On both
+    /// networks, for a burner's spend (which is asked about everywhere,
+    /// the test above); the wallet's own on mainnet is never asked about
+    /// in any case. The spend stays parked, its coin reserved, and the
+    /// chain's word still settles it. A spend parked without the mark (the
+    /// beacon's, which has its own setting) is asked about as ever. A
+    /// lease whose node named no switch sends no bundle of LIST ME's
+    /// either.
+    #[tokio::test]
+    async fn while_list_me_is_off_the_lease_sends_no_saved_bundle_of_a_listing_or_a_knock_again() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_network::ChiaNet;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let dir = std::env::temp_dir().join(format!("ssf-lease-list-me-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let ours = Coin::new(Bytes32::new([95u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let id = ours.coin_id();
+        let page = |spent: Option<u32>, judged_at: u32| CoinListing {
+            records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(judged_at),
+        };
+        let sent = |chain: &Scripted| chain.sent.load(Relaxed);
+        let live = |spent: Option<u32>, judged_at: u32| Scripted::new(vec![page(spent, judged_at)]).with_liveness(true);
+        let switched = |lease: &WalletLease| {
+            let on = std::sync::Arc::new(AtomicBool::new(false));
+            let asked = on.clone();
+            lease.ask_list_me(move || asked.load(Relaxed));
+            on
+        };
+
+        for net in ChiaNet::ALL {
+            let name = format!("listed-{}", net.id());
+            let lease = restored_in(&dir, &name);
+            let on = switched(&lease);
+            let t0 = Instant::now();
+            let parking = lease.park_pushed_at([(id, 900)], Some((&plain, burner())), Resend::WhileListed, t0).unwrap();
+            assert!(std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap().contains(&format!("\"list_me\": [\n    {}\n  ]", parking.spend)));
+            let t1 = t0 + RECONCILE_GRACE;
+
+            // LIST ME off: the chain is read, the bundle stays here.
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t1).await;
+            assert_eq!(sent(&chain), 0, "{net:?}: off, nothing goes to the peers again");
+            assert!(lease.is_parked(&id), "{net:?}: and the coin stays parked");
+
+            // Nor after a restart with the switch off, nor by a lease whose
+            // node named no switch: the mark is in the file.
+            for told in [true, false] {
+                let again = WalletLease::new();
+                again.restore(&dir.join(format!("{name}.json")), money());
+                if told {
+                    switched(&again);
+                }
+                let chain = live(None, 1000);
+                again.reconcile_at(net, &chain, Instant::now() + RECONCILE_GRACE).await;
+                assert_eq!(sent(&chain), 0, "{net:?}: restarted, told {told}");
+                assert!(again.is_parked(&id), "{net:?}");
+            }
+
+            // Its block gone after it landed: parked again, and still not sent.
+            lease.reconcile_at(net, &live(Some(1000), 1001), t1).await;
+            assert!(lease.is_settling(&id), "{net:?}: the chain's word settles it, asked or not");
+            lease.reconcile_at(net, &live(None, 1000), t1).await;
+            assert!(lease.is_parked(&id), "{net:?}: parked again");
+            let t2 = t1 + RECONCILE_GRACE;
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(sent(&chain), 0, "{net:?}: parked again under its number, which still carries the mark");
+
+            // LIST ME back on: asked like any burner's spend.
+            on.store(true, Relaxed);
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(sent(&chain), 1, "{net:?}: on again, the liveness question is asked");
+            assert!(lease.is_parked(&id), "{net:?}: live, so parked");
+            // And off again holds from the next reconciliation.
+            on.store(false, Relaxed);
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(sent(&chain), 0, "{net:?}");
+
+            // The beacon's spend carries no mark: asked whatever LIST ME says.
+            let beacons = restored_in(&dir, &format!("beacon-{}", net.id()));
+            switched(&beacons);
+            beacons.park_with_bundle_at([(id, 900)], Some((&plain, beacon())), t0).unwrap();
+            assert!(!std::fs::read_to_string(dir.join(format!("beacon-{}.json", net.id()))).unwrap().contains("list_me"));
+            let chain = live(None, 1000);
+            beacons.reconcile_at(net, &chain, t1).await;
+            assert_eq!(sent(&chain), 1, "{net:?}: the beacon has its own setting");
+        }
+
+        // A parking that could not be saved takes its mark back with it,
+        // and a mark for a spend the file does not hold marks nothing.
+        let unsaved = WalletLease::new();
+        *unsaved.store.lock().unwrap() = Some(dir.join("no-such-folder").join("lease.json"));
+        assert!(matches!(unsaved.park_pushed_at([(id, 900)], Some((&plain, burner())), Resend::WhileListed, Instant::now()), Err(LeaseError::Unsaved(_))));
+        assert!(unsaved.listed.lock().unwrap().is_empty());
+        let stray = dir.join("stray.json");
+        std::fs::write(&stray, r#"{"v":1,"spends":7,"parked":[],"list_me":[3,7]}"#).unwrap();
+        let loaded = WalletLease::new();
+        loaded.restore(&stray, money());
+        assert!(loaded.listed.lock().unwrap().is_empty() && loaded.sealed.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
