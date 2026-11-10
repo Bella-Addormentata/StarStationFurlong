@@ -23,9 +23,10 @@ import { diceOf } from './computedCraps';
 import type { CrapsCarry } from './computedCraps';
 import { gameOfInc, seedTable } from './computedFold';
 import type { FoldCtx, SignedKind } from './computedFold';
+import { beatKey, HEARTBEAT_MS, houseSign, roomSignBytes } from './computedHouse';
 import type { ComputedTableRef } from './computedTable';
 import { ComputedKit } from './computedTestKit';
-import type { TestIdentity } from './computedTestKit';
+import type { TestHouse, TestIdentity } from './computedTestKit';
 import type { CrapsBet } from './games/craps';
 
 export interface Page {
@@ -168,18 +169,53 @@ export function frame(T: number, p: Page, tables: ComputedTableRef[] = [PAGE_TAB
 
 /** Frames of `pages` every `step` ms from `from` to `to` (inclusive), each
  *  synced before it runs; stops early, returning the time, once `until`
- *  holds after a step. Returns `to` + step when it never did. */
+ *  holds after a step. Returns `to` + step when it never did. `each(T)` is
+ *  called first in every step, before the pages are synced: whatever it
+ *  writes (a house's heartbeat) reaches them in that step. */
 export function run(
-  pages: Page[], from: number, to: number, opts: { step?: number; until?: () => boolean; tables?: ComputedTableRef[] } = {},
+  pages: Page[], from: number, to: number,
+  opts: { step?: number; until?: () => boolean; tables?: ComputedTableRef[]; each?: (T: number) => void } = {},
 ): number {
   const step = opts.step ?? 100;
   for (let T = from; T <= to; T += step) {
+    opts.each?.(T);
     sync(T, ...pages);
     for (const p of pages) frame(T, p, opts.tables);
     sync(T, ...pages);
     if (opts.until?.()) return T;
   }
   return to + step;
+}
+
+/** A house's heartbeat `n` (the node's clock), as the node writes one:
+ *  [key, record] of `hb:<house>`, signed by the house in the room's domain. */
+export function beatOf(room: string, h: TestHouse, n: number): [key: string, rec: unknown] {
+  const body = { v: 1 as const, n, k: h.pub };
+  return [beatKey(h.pub), { ...body, g: houseSign(h.secret, roomSignBytes('hbeat', room, '', body)) }];
+}
+
+/** A house that keeps beating while a spec runs: `each(T)` (pass it to run())
+ *  writes its next heartbeat in `page`'s doc, at that page's clock, once
+ *  HEARTBEAT_MS of the spec's time have passed since the last (the first at
+ *  once), until `muted`. */
+export class Beating {
+  private n = 0;
+  private last: number | null = null;
+  muted = false;
+  constructor(private readonly page: Page, private readonly house: TestHouse, private readonly room: string = PAGE_ROOM) {}
+
+  /** The spec's time of the last beat written, or null for none. */
+  get lastAt(): number | null {
+    return this.last;
+  }
+
+  each = (T: number): void => {
+    if (this.muted || (this.last !== null && T >= this.last && T - this.last < HEARTBEAT_MS)) return;
+    this.last = T;
+    clockOf(this.page, T);
+    const [key, rec] = beatOf(this.room, this.house, ++this.n);
+    this.page.doc.transact(() => this.page.doc.getMap('casinoComputed').set(key, rec));
+  };
 }
 
 /** The house's switch-on, as commit 4 writes it: the switch and the first

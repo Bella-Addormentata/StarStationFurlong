@@ -18,7 +18,7 @@ import * as Y from 'yjs';
 import { dutyRank, nextSid3, seedTable, slipCommit, slipKeyFor } from './computedFold';
 import { faironlyInc, NO_CLOSE, sealCk, sealFin } from './computedFairOnly';
 import { delegation, hex, house, NAME, OPENING_CARRY, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { clockOf, deliver, frame, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, send, signAs, switchOn, sync, updatesOf } from './computedPageKit';
+import { Beating, clockOf, deliver, frame, keysIn, openRoom, PAGE_CTX as CTX, PAGE_INC as INC, PAGE_ROOM, PAGE_TABLE as TABLE, putIn, run, send, signAs, switchOn, sync, updatesOf } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { black, ComputedKit, red, testHouse } from './computedTestKit';
 
@@ -1943,18 +1943,19 @@ describe('the stakes and the waits of a page-signed incarnation, while its table
     expect(a.table.writeComputedSlip(T2, [red(9)], T0)).toBe('ok');
     const window = a.table.BET_WINDOW_MS;
     const tables = [TABLE, T2];
-    const opened = run([a], T0 + STEP, T0 + window - 4_000, { step: STEP, tables });
+    const each = new Beating(a, house).each; // (the game's house is heard all the while: the close needs it)
+    const opened = run([a], T0 + STEP, T0 + window - 4_000, { step: STEP, tables, each });
     expect(keysIn(a, 'c', 1, T2)).toEqual([]); // (the window is still running)
     // A game opens at the first table and ends: that table moved, and the other did not.
     record(a, root);
     switchTo(a, G.inc);
-    const played = run([a], opened, opened + 1_000, { step: STEP, tables });
+    const played = run([a], opened, opened + 1_000, { step: STEP, tables, each });
     record(a, end);
-    const back = run([a], played, played + 2_000, { step: STEP, tables, until: () => a.casino.computedIncOf(TABLE) === INC });
+    const back = run([a], played, played + 2_000, { step: STEP, tables, each, until: () => a.casino.computedIncOf(TABLE) === INC });
     expect(a.casino.computedIncOf(TABLE)).toBe(INC);
     expect(a.casino.computedGameMovesOf(TABLE)).toBe(1);
     expect(a.casino.computedGameMovesOf(T2)).toBe(0);
-    run([a], back + STEP, T0 + window + 4_000, { step: STEP, tables, until: () => keysIn(a, 'c', 1, T2).length > 0 });
+    run([a], back + STEP, T0 + window + 4_000, { step: STEP, tables, each, until: () => keysIn(a, 'c', 1, T2).length > 0 });
     expect(keysIn(a, 'c', 1, T2).length).toBeGreaterThan(0);
   });
 

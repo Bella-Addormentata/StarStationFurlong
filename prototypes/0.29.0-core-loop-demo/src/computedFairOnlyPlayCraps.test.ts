@@ -17,7 +17,7 @@ import { diceOf } from './computedCraps';
 import { asClose, MAX_TABLE_PIDS, nextSid3, seedTable } from './computedFold';
 import type { CloseRec, CrapsSlipRec, HouseRevealRec } from './computedFold';
 import { delegation, hex, house as H, NAME, owner, rootOf, trimOf } from './computedFairOnlyKit';
-import { carryOf, clockOf, CRAPS_REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, keysIn, loadPage, PAGE_ROOM, putIn, run, standAt, sync, tagSeed } from './computedPageKit';
+import { Beating, carryOf, clockOf, CRAPS_REF, CRAPS_TABLE as TABLE, crapsBet, crapsOf, keysIn, loadPage, PAGE_ROOM, putIn, run as runBare, standAt, sync, tagSeed } from './computedPageKit';
 import type { Page } from './computedPageKit';
 import { ComputedKit } from './computedTestKit';
 import type { Built } from './computedTestKit';
@@ -43,6 +43,12 @@ const root = rootOf(Q, 'q', { dl: delegation(owner, H.pub, PAGE_ROOM) });
 const SID = nextSid3(Q, root.value);
 const kit = new ComputedKit(Q);
 
+/** The house keeps beating while a spec runs its game, as its node does (an unheard house pauses the closes: PR
+ *  6c-4b-1b). gameRoom makes it, in the first page's doc; a spec that has the house go quiet mutes it. */
+let beat: Beating | null = null;
+const run = (pages: Page[], from: number, to: number, opts: Parameters<typeof runBare>[3] = {}): number =>
+  runBare(pages, from, to, { each: beat?.each, ...opts });
+
 const top = (p: Page) => p.doc.getMap<unknown>('casinoComputed');
 const foldOf = (p: Page) => p.casino.computedFoldOf(TABLE)!;
 const recOf = <R>(p: Page, key: string): R => p.casino.computedSessionForWrite(TABLE)!.get(key) as R;
@@ -66,6 +72,7 @@ async function gameRoom(names: string[]): Promise<Page[]> {
     top(a).set(root.key, root.value);
     top(a).set(`ses:${TABLE}:${Q.inc}:${SID}`, new Y.Map());
   });
+  beat = new Beating(a, H);
   sync(T0, ...pages);
   run(pages, T0, T0, { step: STEP, tables: [CRAPS_REF] }); // (awake)
   return pages;
