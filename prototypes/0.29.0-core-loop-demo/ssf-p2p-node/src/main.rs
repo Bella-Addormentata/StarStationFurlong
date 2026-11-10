@@ -3802,9 +3802,13 @@ async fn dial_peer_inner(
                 Err(e) => eprintln!("⛓️ ChiaHub rung-6 contact-key resolve error: {e:#}"),
             }
         }
+        // 🕳️ The room's v1 record, on a test network only
+        // (`chia_resolve::reads_v1`): off one no station writes a v1 record,
+        // and the lookup would only show a full node which private room this
+        // station is dialing in.
         let chia_cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
         if let Some(cap) = chia_cap {
-            if cap.may_read() {
+            if cap.may_read() && chia_resolve::reads_v1(chia_network::net()) {
                 match chia_resolve::resolve_target(&cap.room_key, &target_str).await {
                     Ok(Some(rec)) => {
                         let addrs = chia_public_dial_addrs(&rec.addrs);
