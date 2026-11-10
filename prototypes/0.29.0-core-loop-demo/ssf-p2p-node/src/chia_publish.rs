@@ -731,16 +731,12 @@ struct ParkedBundle {
 /// sharing violation); then the file is rewritten in place rather than left
 /// stale: a stale parking would silently forget live spends, a torn one is
 /// unreadable and the startup log says so (#245 review, round 18).
+///
+/// 🔒 Owner-only on Unix, the temporary and the fallback too
+/// (`private_file::write_private_replacing`): the file holds whole signed
+/// bundles and the addresses that paid for them.
 fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            let _ = std::fs::remove_file(&tmp);
-            std::fs::write(path, bytes).map_err(|_| rename_err)
-        }
-    }
+    crate::private_file::write_private_replacing(path, bytes)
 }
 
 fn parse_coin_id(hex_id: &str) -> Option<Bytes32> {
@@ -1506,13 +1502,22 @@ impl WalletLease {
     pub fn restore(&self, path: &std::path::Path, money: Payer) {
         *self.money.lock().unwrap() = Some(money);
         let read = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<LeaseFile>(&bytes) {
-                Ok(file) => self
-                    .load(&file, Instant::now())
-                    .map(|counts| (file.spends, counts, file.list_me.is_none()))
-                    .map_err(|e| format!("{} holds a {e}", path.display())),
-                Err(e) => Err(format!("{} is unreadable ({e})", path.display())),
-            },
+            Ok(bytes) => {
+                // 🔒 A file an older build wrote was left to the umask, and
+                // one the lease then seals is never rewritten: tightened
+                // here, whatever it holds. A failure is said and changes
+                // nothing else.
+                if let Err(e) = crate::private_file::tighten_private(path) {
+                    eprintln!("⛓️ wallet lease: could not make {} readable by its owner only ({e})", path.display());
+                }
+                match serde_json::from_slice::<LeaseFile>(&bytes) {
+                    Ok(file) => self
+                        .load(&file, Instant::now())
+                        .map(|counts| (file.spends, counts, file.list_me.is_none()))
+                        .map_err(|e| format!("{} holds a {e}", path.display())),
+                    Err(e) => Err(format!("{} is unreadable ({e})", path.display())),
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, (0, 0), false)),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         };
@@ -9379,6 +9384,47 @@ mod tests {
         // is in the wallet; dropped: the wallet is still empty and may ask again).
         lease.release(&[claim.spend]);
         assert!(!lease.incoming_pending());
+    }
+
+    /// 🔒 The lease file holds whole signed bundles and the addresses that
+    /// paid for them (docs/TDD/ChiaLanePrivacy.md §9): it is written
+    /// owner-only, its temporary too, and a file an older build left to the
+    /// umask is tightened when it is restored. One the lease then seals is
+    /// tightened as well, since nothing writes over it, and is otherwise
+    /// left as it was for recovery. Unix only, where the mode is the rule.
+    #[cfg(unix)]
+    #[test]
+    fn the_lease_file_is_owner_only_and_tightened_when_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let broaden = |p: &std::path::Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = std::env::temp_dir().join(format!("ssf-wallet-lease-mode-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        let first = WalletLease::new();
+        first.restore(&path, money());
+        first.park([Bytes32::new([5u8; 32])]).unwrap();
+        assert_eq!(mode(&path), 0o600, "written owner-only");
+        assert!(!dir.join("wallet_lease.json.tmp").exists(), "through a temporary that became the file");
+        // An older build's file, and a later change's rewrite of it.
+        broaden(&path);
+        first.park([Bytes32::new([6u8; 32])]).unwrap();
+        assert_eq!(mode(&path), 0o600, "a broader file is replaced by an owner-only one");
+        // An older build's file, met at a restart.
+        broaden(&path);
+        let second = WalletLease::new();
+        second.restore(&path, money());
+        assert!(second.is_pending(&Bytes32::new([5u8; 32])) && second.ensure_open().is_ok());
+        assert_eq!(mode(&path), 0o600, "tightened as it is restored");
+        // A file the lease cannot read seals it, and is never written over.
+        std::fs::write(&path, b"{not json").unwrap();
+        broaden(&path);
+        let sealed = WalletLease::new();
+        sealed.restore(&path, money());
+        assert!(sealed.ensure_open().is_err());
+        assert_eq!(mode(&path), 0o600, "a file that seals the lease is tightened too");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json", "and left as it was for recovery");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
