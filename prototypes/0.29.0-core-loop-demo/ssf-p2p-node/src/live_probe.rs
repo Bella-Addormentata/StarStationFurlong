@@ -1,6 +1,8 @@
 //! LIVE PROBE, never to merge (branch `claude/testnet11-live-check`): the
-//! node's own peer lane asked against real testnet11 full nodes. Reads only:
-//! nothing here holds a key or builds a spend. It is run by
+//! node's own peer lane asked against real full nodes, testnet11's or, in a
+//! `chia-mainnet` build started with `SSF_CHIA_NETWORK=mainnet`, mainnet's.
+//! Reads only on either: nothing here holds a key or builds a spend, and no
+//! wallet file is made. It is run by
 //! `.github/workflows/testnet11-live-check.yml` and by nothing else: the test
 //! is ignored, so no other run starts it.
 //!
@@ -10,7 +12,6 @@
 
 use crate::chia_chain::ChainAccess;
 use crate::chia_faucet::{FaucetParams, Unspent};
-use crate::chia_network::ChiaNet;
 use chia_protocol::Bytes32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,12 +54,11 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: asks real testnet11 full nodes; the live-check workflow runs it by name"]
-async fn live_testnet11_reads() {
+#[ignore = "live: asks real full nodes; the live-check workflow runs it by name"]
+async fn live_reads() {
     let t0 = Instant::now();
     let net = crate::chia_network::net();
     say(t0, format!("network: {}", net.name()));
-    assert_eq!(net, ChiaNet::Testnet11, "this probe is testnet11's alone");
     let carrier = crate::chia_chain::connect_carrier();
     let money = crate::chia_chain::connect();
     let wait = Duration::from_secs(300);
@@ -162,6 +162,6 @@ async fn live_testnet11_reads() {
     say(t0, format!("watch: carrier failures {carrier_fail}, money failures {money_fail}, times the handles differed by more than 3 blocks {behind}"));
 
     say(t0, format!("VERDICT carrier peak: {}, money peak: {}", carrier_peak.is_some(), money_peak.is_some()));
-    assert!(carrier_peak.is_some(), "the lane reached no testnet11 full node");
-    assert!(money_peak.is_some(), "the lane found no two agreeing testnet11 full nodes");
+    assert!(carrier_peak.is_some(), "the lane reached no full node");
+    assert!(money_peak.is_some(), "the lane found no two agreeing full nodes");
 }

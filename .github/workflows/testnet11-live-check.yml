@@ -1,8 +1,12 @@
 name: "🧪 testnet11 live check (probe branch, never to merge)"
 
-# A first contact between the node's own Chia peer lane and real testnet11
-# full nodes, on GitHub's machines. READS ONLY: no wallet coin exists on these
-# machines, burner keys stay off, and nothing is spent.
+# Contact between the node's own Chia peer lane and real full nodes, on
+# GitHub's machines. READS ONLY: no wallet coin exists on these machines,
+# burner keys stay off, and nothing is spent.
+#
+# Two networks: testnet11 (all three steps below) and mainnet (step 1 alone:
+# the lane asked directly in a chia-mainnet test build, with no wallet file
+# made and the real binary never started).
 #
 # It lives on the branch claude/testnet11-live-check alone and is not meant to
 # reach main. It adds no host to any build: it runs the node as it is.
@@ -34,13 +38,19 @@ env:
 
 jobs:
   live-check:
-    name: live check on ${{ matrix.os }}
+    name: ${{ matrix.net }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-latest]
+        net: [testnet11, mainnet]
+        include:
+          - net: testnet11
+            features: chia-publish
+          - net: mainnet
+            features: chia-publish,chia-mainnet
     defaults:
       run:
         shell: bash
@@ -55,12 +65,14 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: '${{ env.NODE_DIR }} -> target'
-          key: live-check-${{ matrix.os }}
+          key: live-check-${{ matrix.os }}-${{ matrix.net }}
 
-      - name: Build the tests and the node (chia-publish)
-        run: |
-          cargo test --features chia-publish --bin ssf-p2p-node --no-run --manifest-path "$NODE_DIR/Cargo.toml"
-          cargo build --features chia-publish --manifest-path "$NODE_DIR/Cargo.toml"
+      - name: Build the tests (${{ matrix.features }})
+        run: cargo test --features "${{ matrix.features }}" --bin ssf-p2p-node --no-run --manifest-path "$NODE_DIR/Cargo.toml"
+
+      - name: Build the node (testnet11 alone)
+        if: matrix.net == 'testnet11'
+        run: cargo build --features chia-publish --manifest-path "$NODE_DIR/Cargo.toml"
 
       - name: What this machine's network looks like
         run: |
@@ -78,18 +90,21 @@ jobs:
         id: probe
         timeout-minutes: 30
         continue-on-error: true
+        env:
+          SSF_CHIA_NETWORK: ${{ matrix.net }}
         run: |
-          cargo test --features chia-publish --bin ssf-p2p-node --manifest-path "$NODE_DIR/Cargo.toml" -- --ignored --nocapture --exact live_probe::live_testnet11_reads 2>&1 | tee probe.log
+          cargo test --features "${{ matrix.features }}" --bin ssf-p2p-node --manifest-path "$NODE_DIR/Cargo.toml" -- --ignored --nocapture --exact live_probe::live_reads 2>&1 | tee probe.log
           exit ${PIPESTATUS[0]}
 
       - name: "1b. The peer store the probe left"
         if: always()
         run: |
-          f="$NODE_DIR/chia_peers.json"
-          if [ -f "$f" ]; then echo "chia_peers.json: $(wc -c < "$f") bytes"; head -c 1500 "$f"; echo; else echo "no chia_peers.json was written"; fi
+          for f in "$NODE_DIR/chia_peers.json" "$NODE_DIR/chia-mainnet/chia_peers.json"; do
+            if [ -f "$f" ]; then echo "$f: $(wc -c < "$f") bytes"; head -c 1500 "$f"; echo; else echo "no $f was written"; fi
+          done
 
       - name: "2. The real binary, as a player's node starts, then a restart"
-        if: always()
+        if: always() && matrix.net == 'testnet11'
         timeout-minutes: 12
         run: |
           BIN="$PWD/$NODE_DIR/target/debug/ssf-p2p-node"
@@ -102,7 +117,7 @@ jobs:
           PID=$!; sleep 150; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
 
       - name: "3. The real binary with the SSF wallet on (a new, empty wallet)"
-        if: always()
+        if: always() && matrix.net == 'testnet11'
         timeout-minutes: 8
         env:
           SSF_CHIA_LANE: "1"
@@ -137,7 +152,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-check-${{ matrix.os }}
+          name: live-check-${{ matrix.net }}-${{ matrix.os }}
           path: logs-out/
           if-no-files-found: warn
 
