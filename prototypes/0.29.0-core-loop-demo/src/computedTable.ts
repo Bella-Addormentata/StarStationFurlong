@@ -159,6 +159,7 @@ import {
   computedFairOnlyReturns,
   computedFoldOf,
   computedGameMovesOf,
+  computedGamesHeldBy,
   computedRedecide,
   computedIncEnded,
   computedIncFor,
@@ -180,11 +181,13 @@ import {
   COMPUTED_MIN_BUILD,
   computedVerdictOf,
   delegationHeld,
+  delegationOf,
   fairSettingSeq,
   finalizeComputed,
   giveUpComputed,
   giveWayComputed,
   holdsDeed,
+  HOUSE_ONLY_MIN_BUILD,
   houseHeardFrom,
   houseOnline,
   houseSetUp,
@@ -217,6 +220,7 @@ import {
   writeComputedOff,
   writeComputedOn,
   writeDelegation,
+  writeFairOnlyOn,
   writeFairSetting,
   writeHouseSum,
   writeOwnerRunChosen,
@@ -235,8 +239,9 @@ import {
   addedOver, basisOf, canonFelt, CARRY_POINTS, changeOk, EMPTY_CARRY, feltSum, isCanonFelt, MAX_RIDERS, minPerSpot, own, spotKey, TRIM_SEVEN_OUT_MIN,
 } from './computedCraps';
 import type { CrapsCarry, RollFate } from './computedCraps';
-import { isFairOnlyInc } from './computedFairOnly';
+import { FAIR_ONLY_RV, faironlyInc, isFairOnlyInc, sealCk } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
+import type { DelegationRec } from './computedHouse';
 import {
   BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
@@ -251,6 +256,7 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { getPlayerId } from './identity';
 import { getIdentityPub, signIdentity } from './keypair';
 import { localStandOf } from './localStands';
+import type { HouseFold } from './nodeFingerprint';
 import { heardThrough, noteClockRead } from './roomHearing';
 
 // ── ⏱ Timing ─────────────────────────────────────────────────────────────────
@@ -4870,6 +4876,29 @@ export function setLocalHouse(pub: string | null): void {
   localHouse = typeof pub === 'string' && isPub(pub) ? pub : null;
 }
 
+/** 🔒 What this page's own node says its fold serves (its fingerprint's
+ *  `house_fold`: main.ts setLocalHouseFold), or null for a node that says
+ *  nothing of one, or no node. */
+let localFold: HouseFold | null = null;
+
+/** 🔒 What the fold of this page's own node serves (nodeFingerprint
+ *  parseHouseFold), or null: main.ts, on every fingerprint read, beside the
+ *  house key. A table moves to a FAIR ONLY game only where the node that will
+ *  be its house says it runs them (nodeRunsFairOnly). */
+export function setLocalHouseFold(fold: HouseFold | null): void {
+  localFold = fold;
+}
+
+/** Whether this page's node says it runs FAIR ONLY games of this build's
+ *  rules (design §8.1): its fold names both letters, `p` and `q`, and this
+ *  build's rules version, and is not off. No node of today's says so (they fold
+ *  `r` and `d`, in shadow), so nothing is offered until the node's half of PR
+ *  6c is out. */
+function nodeRunsFairOnly(): boolean {
+  const f = localFold;
+  return f !== null && f.off !== true && f.letters.includes('p') && f.letters.includes('q') && f.rv.includes(FAIR_ONLY_RV);
+}
+
 /**
  * 10. The house's room records: every REPUT_MS, on an awake page with its
  * doc whole, each page puts back what it counted of them that the doc lost
@@ -4945,6 +4974,21 @@ export function computedHouseState(t: string, now = Date.now()): ComputedHouseSt
   return { setUp: houseSetUp(), online, fairness: readFairSetting(t), canSet: holdsDeed(), openFair, waiting };
 }
 
+/** The final checkpoint of the page-signed incarnation `at` runs, as this page
+ *  signs one to end it (the house's switch-off, a migration, the opening of a
+ *  FAIR ONLY game over it): at the last round its fold decided, or its base's,
+ *  with the fold's nets, which count on. Noted as an end this page wrote
+ *  (endedByMe). */
+function finalOf(at: { st: TableState; res: FoldResult }): Checkpoint {
+  const { st, res } = at;
+  const D = lastDecided(res);
+  const u = D ? D.r : Math.max(1, res.base.u);
+  const l = D ? D.close : res.base.l ?? NO_CLOSE;
+  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
+  endedByMe.add(nextSid(st.ctx, cp));
+  return cp;
+}
+
 /**
  * 🏠 Move a table PR 2–4 opened (a `c` or `k` name: no house plays it) onto
  * a house table, once the room has a house (casinoDoc houseSetUp) and the
@@ -4969,11 +5013,7 @@ function migrateComputed(t: string, game: GameName, now: number): boolean {
   if (res.tip || res.held.size > 0 || res.openCloses.some((c) => c.state !== 'invalid')) return false;
   const e = viewOf(st, res, now);
   if (e.view.phase !== 'betting' || e.holding !== null) return false;
-  const D = lastDecided(res);
-  const u = D ? D.r : Math.max(1, res.base.u);
-  const l = D ? D.close : res.base.l ?? NO_CLOSE;
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
-  endedByMe.add(nextSid(st.ctx, cp));
+  const cp = finalOf(at);
   return transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the house table opens (F4 put-back).
@@ -5341,17 +5381,120 @@ export function switchComputedOff(t: string, now = Date.now(), again = false): C
     return 'ok';
   }
   const { st, res } = at;
-  const D = lastDecided(res);
-  const u = D ? D.r : Math.max(1, res.base.u);
-  const l = D ? D.close : res.base.l ?? NO_CLOSE;
-  const cp: Checkpoint = signed(st.ctx, 'sum', { v: 1 as const, b: res.base.sid, u, l, n: netsOf(res), e: 1 as const, k: getIdentityPub() });
-  endedByMe.add(nextSid(st.ctx, cp));
+  const cp = finalOf(at);
   const done = transactCasino(() => {
     if (!finalizeComputed(t, st.inc, cp)) return false;
     // 🏛️ D2: vouch for the end before the table goes owner-run (F4 put-back).
     attestEnd(st.ctx, t, st.inc, res, cp, st.attested, now, playedTo(st, res));
     writeComputedOff(t);
     writeOwnerRunChosen(t, true);
+    return true;
+  });
+  return done ? 'ok' : 'reconnecting';
+}
+
+// ── 🔒 Opening a FAIR ONLY game ──────────────────────────────────────────────
+
+/** Why this page is offered no FAIR ONLY table at all (design §8.1): it does
+ *  not hold the room's deed ('owner'), computed tables are turned off on it
+ *  ('off': the dev flag), the room does not hold its own node's house key as
+ *  this page delegated it ('no-house': no node, as on a Mac, or the delegation
+ *  not written or not checked yet; the design's houseSetUp, asked of the house
+ *  the game's root will name), or that node does not say it runs FAIR ONLY
+ *  games ('no-engine': nodeRunsFairOnly). */
+export type FairOnlyOfferRefusal = 'owner' | 'off' | 'no-house' | 'no-engine';
+
+/** Why FAIR ONLY is not offered on this page, or, where it is, the delegation
+ *  of this page's node's house that the offer stands on: the one the root of a
+ *  game opened on it names (switchFairOnlyOn). */
+function fairOnlyOffer(): FairOnlyOfferRefusal | DelegationRec {
+  if (!holdsDeed()) return 'owner';
+  if (!computedTablesEnabled()) return 'off';
+  const dl = localHouse === null ? null : delegationOf(localHouse);
+  if (dl === null) return 'no-house';
+  return nodeRunsFairOnly() ? dl : 'no-engine';
+}
+
+/** Why FAIR ONLY is not offered on this page, or null where it is: the ⚙
+ *  card's to ask before it shows the choice, and the opening's first check. */
+export function fairOnlyOfferRefusal(): FairOnlyOfferRefusal | null {
+  const offer = fairOnlyOffer();
+  return typeof offer === 'string' ? offer : null;
+}
+
+/** Why a table can't move to a FAIR ONLY game now: what the house's switch
+ *  refuses for (ComputedSwitchRefusal: 'craps' here is a computed name of the
+ *  other game under the table), no offer on this page (FairOnlyOfferRefusal),
+ *  the table playing no house table ('not-house': owner-run, or a name PR 2–4
+ *  opened, which the driving page moves onto a house table first), the table
+ *  playing a FAIR ONLY game another key holds ('theirs': that game is its
+ *  holder's to end), or no house of the room heard ('house-away': round 1 needs
+ *  its join). */
+export type FairOnlyOnRefusal = ComputedSwitchRefusal | FairOnlyOfferRefusal | 'not-house' | 'theirs' | 'house-away';
+export type FairOnlyOnResult = 'ok' | FairOnlyOnRefusal;
+
+/**
+ * 🔒 The room's owner moves house table `t` to a FAIR ONLY game (design §8.7;
+ * the ⚙ card's FAIR ONLY · THE TABLE WAITS FOR THE HOUSE, once it has the
+ * line): in ONE transaction the house table's incarnation ends as a switch-off
+ * ends it (its final checkpoint with the fold's nets, which count on; its
+ * sessions gone; its `gone:` mark; the deed holder's attestation of the end),
+ * and the game opens: a name no other game has (its inputs this page's key,
+ * 16 random hex, this build's rules version and this page's clock:
+ * faironlyInc), its root checkpoint signed by this page's key and naming its
+ * node's house by the delegation the room holds, the empty session the root
+ * opens, and the switch. Every page then plays the game (S9: the deed
+ * holder's); round 1 waits for the house's join, the root carrying no
+ * commitment.
+ *
+ * Refused (nothing written) where FAIR ONLY is not offered on this page
+ * (fairOnlyOfferRefusal), on a page asleep or not whole, at a table that plays
+ * no house table of `game`, while an earlier build than HOUSE_ONLY_MIN_BUILD
+ * drives the room's tables (it reads the switch as none, and would run
+ * owner-run rounds there), while no house of the room is heard, and while the
+ * house table has a round under way as its switch-off would be refused
+ * (offRefusal: a close in or a result's hold; at craps the wait for the throw,
+ * and contract bets riding until the second press, `again`, which hands them
+ * back with the rest), or its last result still shows. Bets on an open round
+ * go back to their players, as at a switch-off. 'ok' with nothing written at a
+ * table where this page's key holds a live game of `game` already. Nothing
+ * calls this yet but the specs: the ⚙ card's line is PR 6c-4c's.
+ */
+export function switchFairOnlyOn(t: string, game: GameName = 'roulette', now = Date.now(), again = false): FairOnlyOnResult {
+  lookAtClock(now);
+  const dl = fairOnlyOffer();
+  if (typeof dl === 'string') return dl;
+  const gate = switchGate(t, now);
+  if (gate) return gate;
+  const me = getIdentityPub();
+  if (computedGamesHeldBy(t, me).some((held) => gameOfInc(held) === game)) return 'ok';
+  const inc = computedIncOf(t);
+  if (inc === null || !isComputedTable(t)) return 'not-house';
+  if (gameOfInc(inc) !== game) return 'craps';
+  if (isFairOnlyInc(inc)) return 'theirs';
+  if (!houseRules(inc)) return 'not-house';
+  if (leaseIsOldBuild(now, HOUSE_ONLY_MIN_BUILD)) return 'old-build';
+  if (!houseOnline(now)) return 'house-away';
+  const refused = offRefusal(t, now, again);
+  if (refused) return refused;
+  // (The incarnation the switch names, when the doc holds anything of it: one
+  // it holds nothing of, a peer's forgery, is only marked ended.)
+  const at = ordinaryTableOf(t);
+  // Nor while its last result shows: the ball lands and the dice stop on
+  // every page first, as the automatic switch and a migration wait for them.
+  if (at && viewOf(at.st, at.res, now).view.phase === 'settled') return 'busy';
+  const letter = game === 'craps' ? 'q' : 'p';
+  const room = casinoRoomId();
+  const name = { rv: FAIR_ONLY_RV, ok: me, j: randomSeedHex().slice(0, 16), ts: Math.floor(now) };
+  const ctx: FoldCtx = { room, t, inc: faironlyInc(letter, room, t, name) };
+  const root = sealCk(ctx, {
+    v: 1, ...name, b: 'g', u: 0, l: NO_CLOSE, n: {}, ...(letter === 'q' ? { s: { p: 0, w: {} } } : {}), dl, k: me,
+  }, signIdentity);
+  const end = at ? { ...at, cp: finalOf(at) } : null;
+  const done = transactCasino(() => {
+    if (!writeFairOnlyOn(t, root, end ? { inc: end.st.inc, cp: end.cp } : undefined)) return false;
+    // 🏛️ D2: vouch for the end, as a switch-off does (F4 put-back).
+    if (end) attestEnd(end.st.ctx, t, end.st.inc, end.res, end.cp, end.st.attested, now, playedTo(end.st, end.res));
     return true;
   });
   return done ? 'ok' : 'reconnecting';

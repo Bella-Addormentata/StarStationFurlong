@@ -1482,11 +1482,16 @@ export function writeCroupierBeat(tableId: string, beatAt: number): void {
 // on the table, reading none of the computed records.
 
 /** The build this page's lease carries: 2 knows computed roulette, 3
- *  computed craps. */
-export const TABLE_BUILD = 3;
+ *  computed craps, 4 FAIR ONLY games (the letters `p` and `q`). */
+export const TABLE_BUILD = 4;
 /** The first build that knows each computed game: a table can't switch to
  *  one while an earlier build drives (croupier leaseIsOldBuild). */
 export const COMPUTED_MIN_BUILD = { roulette: 2, craps: 3 } as const;
+/** 🔒 …and the first that knows a FAIR ONLY game: no table moves to one while
+ *  an earlier build drives (computedTable switchFairOnlyOn, design §8.7). It
+ *  reads the switch of one as no switch at all, and would run owner-run rounds
+ *  on the table. Ordinary switch-ons ask for no more than they did. */
+export const HOUSE_ONLY_MIN_BUILD = 4;
 
 export interface TableOperatorLease {
   /** the driving page (croupier.ts ROULETTE_PAGE_ID) */
@@ -3208,6 +3213,58 @@ export function writeComputedOff(tableId: string): void {
   });
 }
 
+/**
+ * 🔒 Open the FAIR ONLY game whose opening root is `root` at table `tableId`
+ * (design §8.7: computedTable switchFairOnlyOn, the owner's page at a house
+ * table), in ONE transaction: the page-signed incarnation the table played
+ * ended as a switch-off ends it (`ending`: finalizeComputed with its final
+ * checkpoint; left out where the doc holds nothing of the incarnation the
+ * switch names, which is then only marked ended, as writeComputedOff marks
+ * it), the root under its own key, the empty session the root opens
+ * (nextSid3), and the switch naming the game.
+ *
+ * All of it or nothing: refused (false, nothing written) unless the doc holds
+ * the table whole, `root` reads as the opening root of a game of this table in
+ * this room (readCk: its name made of its own inputs, its key its hash, signed
+ * by the key that opens it and naming that key's house), and `ending` would
+ * finalise (finalizable). The root's signatures are the resolver's to check, on
+ * this page as on every other: the game is live here once they are.
+ */
+export function writeFairOnlyOn(tableId: string, root: { key: string; value: CkRec }, ending?: { inc: string; cp: Checkpoint }): boolean {
+  const casino = ensureMap();
+  const map = computedMap!;
+  if (!casinoWhole(tableId)) return false;
+  const read = readCk(boundRoomId, root.key, root.value);
+  if (read.kind !== 'ok' || read.t !== tableId || read.ck.b !== 'g') return false;
+  if (ending && !finalizable(tableId, ending.inc, ending.cp)) return false;
+  const sid = nextSid3({ room: boundRoomId, t: tableId, inc: read.inc }, read.ck);
+  boundDoc!.transact(() => {
+    if (ending) finalizeComputed(tableId, ending.inc, ending.cp);
+    const was = switchIncOf(tableId);
+    if (was !== null && !isFairOnlyInc(was) && !casino.has(goneKey(tableId, was))) casino.set(goneKey(tableId, was), 1);
+    map.set(root.key, root.value);
+    map.set(sessionKey(tableId, read.inc, sid), new Y.Map<unknown>());
+    casino.set(`cfg:computed:${tableId}`, { v: 1, inc: read.inc });
+  });
+  return true;
+}
+
+/** 🔒 Whether table `tableId`'s switch names a FAIR ONLY game whose records
+ *  this page is still checking (its resolution pending: a signature's check
+ *  put off past a recount's budget, made by the slice that queues). Until the
+ *  check is made the game is not live here, and the table reads as no computed
+ *  table (isComputedTable: S4); yet it may be one a moment on. The owner's
+ *  page opens a game and ends the house table under it in one update
+ *  (writeFairOnlyOn), and a driving page that hears it with its budget spent
+ *  must not open an owner-run round in between (croupier openBetting,
+ *  crapsCroupier openCrapsBetting): the round would sit under the game until
+ *  swept (sweepLegacyRound), its bets handed back. A name the doc holds
+ *  nothing of, or only junk under, waits for no check and holds nothing back. */
+export function computedSwitchChecking(tableId: string): boolean {
+  const named = switchIncOf(tableId);
+  return named !== null && isFairOnlyInc(named) && computedIncs.get(`${tableId}:${named}`)?.fo?.res?.pending === true;
+}
+
 /** Whether table `tableId`'s switch is bare: it names an incarnation nothing
  *  has ended, of which the doc holds no session map and no checkpoint. No
  *  build writes one so (the switch-on writes the first session with it, in
@@ -4017,6 +4074,22 @@ export function delegationHeld(pub: string): boolean | undefined {
   const rec = asDelegation(computedMap?.get(delegationKey(pub)));
   if (rec === null || rec.h !== pub || rec.k !== deedHolderKey()) return false;
   return roomRecOk('hkey', '', rec, delegationKey(pub));
+}
+
+/** 🏠 House `pub`'s delegation as the doc holds it now and its deed holder
+ *  signed it (delegationHeld), or null (none, another holder's, or its check
+ *  waiting): what the root of a FAIR ONLY game names as its owner's house
+ *  (computedTable switchFairOnlyOn). */
+export function delegationOf(pub: string): DelegationRec | null {
+  return delegationHeld(pub) === true ? asDelegation(computedMap?.get(delegationKey(pub))) : null;
+}
+
+/** 🔒 The live FAIR ONLY games of table `tableId` that key `pub` holds (their
+ *  names, sorted): the opener's while no transfer moved the game, the last
+ *  buyer's after (Resolution holder). Read-only: of the games this page counts
+ *  as live (foLive), which a game whose check waits is not yet. */
+export function computedGamesHeldBy(tableId: string, pub: string): string[] {
+  return [...(foLive.get(tableId)?.values() ?? [])].filter((g) => g.holder === pub).map((g) => g.inc).sort();
 }
 
 /** 🏠 Write a delegation the deed holder's page signed (computedHouse). */
@@ -5461,6 +5534,21 @@ export function writeCheckpointAndTrim(
   return true;
 }
 
+/** Whether finalizeComputed would finalise incarnation `inc` of table
+ *  `tableId` with `cp` now (its conditions, and nothing written): asked first
+ *  by a write that ends an incarnation and opens a game in one transaction
+ *  (writeFairOnlyOn), which must do both or neither. */
+function finalizable(tableId: string, inc: string, cp: Checkpoint | null): boolean {
+  ensureMap();
+  const map = computedMap!;
+  const c = ordinaryInc(tableId, inc);
+  if (!c || !casinoWhole(tableId)) return false;
+  const was = heldBase(c, map);
+  if (cp === null) return was?.e === 1;
+  const ok = asCheckpointFor({ inc })(cp);
+  return ok !== null && ok.e === 1 && ok.b === liveSidOf(c, was);
+}
+
 /**
  * 🧹 Finalise incarnation `inc` of computed table `tableId`, in ONE
  * transaction: its final checkpoint `cp` (`e: 1`, the fold's nets: they go
@@ -5478,15 +5566,7 @@ export function writeCheckpointAndTrim(
 export function finalizeComputed(tableId: string, inc: string, cp: Checkpoint | null): boolean {
   const casino = ensureMap();
   const map = computedMap!;
-  const c = ordinaryInc(tableId, inc);
-  if (!c || !casinoWhole(tableId)) return false;
-  const was = heldBase(c, map);
-  if (cp !== null) {
-    const ok = asCheckpointFor({ inc })(cp);
-    if (!ok || ok.e !== 1 || ok.b !== liveSidOf(c, was)) return false;
-  } else if (was?.e !== 1) {
-    return false;
-  }
+  if (!finalizable(tableId, inc, cp)) return false;
   boundDoc!.transact(() => {
     if (cp !== null) map.set(`sum:${tableId}:${inc}`, cp);
     for (const key of sessionKeysOf(map, tableId, inc)) map.delete(key);
