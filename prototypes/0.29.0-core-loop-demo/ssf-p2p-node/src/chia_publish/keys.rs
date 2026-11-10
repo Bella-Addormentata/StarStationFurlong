@@ -271,6 +271,15 @@ mod tests {
         source.lines().map(str::trim).filter(|line| !line.starts_with("//") && line.contains(what)).collect()
     }
 
+    /// `source` with its line ends made LF, before anything is cut from it
+    /// or matched in it. Git for Windows with `core.autocrlf=true` checks
+    /// the sources out with CRLF ends (the repo has no `.gitattributes`),
+    /// `include_str!` keeps them, and the cuts below are LF text
+    /// ([`code`], [`item`]), as `chia_burner`'s scan's are.
+    fn lf(source: &str) -> String {
+        source.replace("\r\n", "\n")
+    }
+
     /// What comes before a file's own `mod tests`.
     fn code(source: &str) -> &str {
         &source[..source.find("\nmod tests {").expect("the file's tests")]
@@ -318,14 +327,15 @@ mod tests {
     /// `chia_publish`, or the hub's field under another name.
     #[test]
     fn the_publisher_reads_the_wallet_key_only_through_its_own_keys() {
-        let main = include_str!("../main.rs");
-        let publish = code(include_str!("../chia_publish.rs"));
-        let this = code(include_str!("keys.rs"));
-        let others = [
-            ("claim_write.rs", code(include_str!("claim_write.rs"))),
-            ("foreign_pause.rs", code(include_str!("foreign_pause.rs"))),
-            ("audit.rs", code(include_str!("audit.rs"))),
-        ];
+        // A CRLF checkout reads as an LF one.
+        let crlf = "use a;\r\n\r\nfn one(\r\n    a: A,\r\n) {\r\n    two();\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n}\r\n";
+        assert_eq!(item(code(&lf(crlf)), "\nfn one("), "\nfn one(\n    a: A,\n) {\n    two();");
+        assert_eq!(lf(&lf(crlf)), crlf.replace('\r', ""), "and an LF one as itself");
+
+        let (main, publish, this) = (lf(include_str!("../main.rs")), lf(include_str!("../chia_publish.rs")), lf(include_str!("keys.rs")));
+        let (claim, pause, audit) = (lf(include_str!("claim_write.rs")), lf(include_str!("foreign_pause.rs")), lf(include_str!("audit.rs")));
+        let (main, publish, this) = (main.as_str(), code(&publish), code(&this));
+        let others = [("claim_write.rs", code(&claim)), ("foreign_pause.rs", code(&pause)), ("audit.rs", code(&audit))];
 
         // main.rs: the keys are made once, for the process's network.
         assert_eq!(code_lines(main, "PublisherKeys"), ["let keys = chia_publish::PublisherKeys::of(net, chia_sk);"]);
