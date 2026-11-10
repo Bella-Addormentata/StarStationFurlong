@@ -402,6 +402,9 @@ mod tests {
     /// text and no proof.
     /// - The heartbeat asks whether burner keys are on once, and makes its
     ///   paths from that and the money refusal.
+    /// - The money refusal is read on seven lines and no more: where it is
+    ///   made, the paths, the Phone Book's flag, the listing's due rule and
+    ///   its readout, the knock's arm, and the beacon's due rule.
     /// - The root is handed out twice: for the beacon's slot on the beacon's
     ///   path, and for the listing's and the knocks' keys on the listing's.
     ///   The money path's hint rule reads it on two more lines, and makes a
@@ -430,6 +433,20 @@ mod tests {
         assert_eq!(code_lines(heartbeat, "burners_enabled()"), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
         assert_eq!(code_lines(heartbeat, "burner_paths("), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
         assert_eq!(code_lines(heartbeat, "let money_refused"), ["let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);"]);
+        // Every read of the money key's refusal in the heartbeat. The last
+        // is the beacon's due rule (`beacon_arm_due`), which holds the arm
+        // where the money key is refused and the beacon is off the burner
+        // path. Off a test network burner keys are always on today, so no
+        // run reaches that case: this reading alone keeps the line in place.
+        assert_eq!(code_lines(heartbeat, "money_refused"), [
+            "let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);",
+            "let paths = burner_paths(burners_enabled(), money_refused.is_some());",
+            "hub.presence_publishing.store(findable && money_refused.is_none(), std::sync::atomic::Ordering::Relaxed);",
+            "let due = listing_due(money_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));",
+            "listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),",
+            "if knock_arm_open(knock_waiting, money_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged(\"knock\") {",
+            "money_refused: money_refused.is_some(),",
+        ]);
         assert_eq!(code_lines(heartbeat, "keys.root()"), [
             "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
             "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",
