@@ -364,13 +364,13 @@ mod tests {
         // Where the wallet key is taken out of the keys.
         assert_eq!(code_lines(publish, "secret_key"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
-            "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix).await?",
+            "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
             "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix).await,",
             "Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,",
         ]);
         assert_eq!(code_lines(publish, ".money()"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
-            "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix).await?",
+            "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
             "None => match keys.money() {",
             "let published = match keys.money() {",
         ]);
@@ -380,7 +380,7 @@ mod tests {
             "let money_payer = keys.money_payer().hex();",
             "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,",
         ]);
-        assert_eq!(code_lines(publish, "keys.beacon()"), ["publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, rng).await?"]);
+        assert_eq!(code_lines(publish, "keys.beacon()"), ["publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, dated, rng).await?"]);
         for (name, other) in others {
             for what in ["secret_key", ".money()", "PublisherKeys"] {
                 assert_eq!(code_lines(other, what), [""; 0], "{name}: {what}");
@@ -393,5 +393,102 @@ mod tests {
         }
         // The scan sees the field where it is: main.rs sets it.
         assert!(!code_lines(main, ".chia_wallet").is_empty());
+    }
+
+    /// What the heartbeat's source says of its paths (stage 4 design §13
+    /// row 10, §4.5 (6)), read as the scan above reads the wallet key. No
+    /// test runs the heartbeat, so this is the one check that it hands each
+    /// arm the path [`super::burner_paths`] gives it. It is a reading of
+    /// text and no proof.
+    /// - The heartbeat asks whether burner keys are on once, and makes its
+    ///   paths from that and the money refusal.
+    /// - The root is handed out twice: for the beacon's slot on the beacon's
+    ///   path, and for the listing's and the knocks' keys on the listing's.
+    ///   The money path's hint rule reads it on two more lines, and makes a
+    ///   listing key from it for a test network's root alone.
+    /// - The beacon's arm is given the beacon's path and its root: its slot
+    ///   clock, its due rule, its seam, and its words for a failed try and
+    ///   for a beacon written again.
+    /// - The knock's seam, its line for a knock not written and the words
+    ///   after a void listing are given the listing's path, and the
+    ///   listing's arm its root. So off a test network, where the listing's
+    ///   path is closed, a knock is handed the money path, which ends in
+    ///   the keys' refusal, and no listing or knock key is made.
+    /// - The beacon's seam dates this network's push from the writer's last
+    ///   step on both paths, and the forgotten mark's date is carried
+    ///   before the mark is removed.
+    ///
+    /// What it does not see: a path read under another name, or an arm
+    /// that reaches a writer some other way.
+    #[test]
+    fn the_heartbeat_hands_each_arm_its_own_path() {
+        let publish = lf(include_str!("../chia_publish.rs"));
+        let publish = code(&publish);
+        let heartbeat = item(publish, "\npub async fn heartbeat_loop(");
+
+        assert_eq!(code_lines(heartbeat, "burners_enabled()"), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
+        assert_eq!(code_lines(heartbeat, "burner_paths("), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
+        assert_eq!(code_lines(heartbeat, "let money_refused"), ["let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);"]);
+        assert_eq!(code_lines(heartbeat, "keys.root()"), [
+            "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
+            "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",
+            "None => money_path_burner_payer(Some(m), era, &m.hint, &money_payer, keys.root(), &hub.contact_key),",
+            "money_path_burner_payer(node_mark.as_ref(), era, era_hint, &money_payer, keys.root(), &hub.contact_key).as_deref(),",
+        ]);
+        let hint_rule = item(publish, "\npub(crate) fn money_path_burner_payer(");
+        assert_eq!(
+            code_lines(hint_rule, "root."),
+            ["let m = mark.filter(|m| root.net().is_test() && m.era == era && m.hint == era_hint)?;", "Some(Payer::of_burner(&root.presence(ck, era)).hex())"],
+            "the money path's hint rule makes a listing key from a test network's root only"
+        );
+        assert_eq!(code_lines(heartbeat, "paths."), [
+            "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
+            "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",
+            "let next = after_void_words(lost, paused_now(&mut foreign_pause, Some(now), now_unix), era == now, net, paths.listing);",
+            "let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;",
+            "waits_its_turn = knock_not_written(paths.listing, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);",
+            "println!(\"⛓️ ChiaHub beacon: the era {era} beacon {why}; {}\", write_again_words(net, paths.beacon));",
+            "let done = publish_beacon(net, &keys, paths.beacon, &iroh_sk, era, now_unix).await;",
+            "let failed = done.as_ref().err().map(|e| beacon_failure_line(paths.beacon, era, e));",
+        ]);
+        assert_eq!(code_lines(heartbeat, "burner_root"), [
+            "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
+            "beacon_sees_peak(&mut beacon_clock, burner_root, peak, &mut rand::rngs::OsRng);",
+            "root: burner_root,",
+        ]);
+        assert_eq!(code_lines(heartbeat, "publish_knock("), ["let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;"]);
+        assert_eq!(code_lines(heartbeat, "publish_beacon("), ["let done = publish_beacon(net, &keys, paths.beacon, &iroh_sk, era, now_unix).await;"]);
+        assert_eq!(code_lines(heartbeat, "publish_burner_presence("), [
+            "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,",
+        ]);
+        assert_eq!(code_lines(heartbeat, "let written = match "), ["let written = match listing_root {"], "the listing's writer is chosen by the listing's root");
+
+        // The beacon's dated push: made in the seam, handed to both writers,
+        // and called by each as its body, the last step before a bundle.
+        let seam = item(publish, "\nasync fn beacon_on_path<");
+        assert_eq!(code_lines(seam, "let pushed = "), ["let pushed = data.join(net.path(BEACON_PUSHED_FILE));"], "this network's own file");
+        assert_eq!(code_lines(seam, "date_beacon_push(").len(), 1);
+        assert_eq!(code_lines(seam, "dated"), [
+            "let dated = move || date_beacon_push(&pushed, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
+            "publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, dated, rng).await?",
+            "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
+        ]);
+        assert_eq!(code_lines(seam, "other_beacon("), ["let (other_file, other) = other_beacon(data, net);"], "the guard reads the other network's two files");
+        assert_eq!(code_lines(publish, "dated().map("), ["let body = move |_| dated().map(|()| plain);"; 2], "both writers date the push from their body");
+        for writer in ["\nasync fn publish_beacon_with<", "\nasync fn publish_beacon_on("] {
+            assert_eq!(code_lines(item(publish, writer), "dated().map(").len(), 1, "{writer}");
+        }
+        assert_eq!(code_lines(publish, "date_beacon_push("), [
+            "fn date_beacon_push(path: &std::path::Path, at: u64) -> std::io::Result<()> {",
+            "date_beacon_push(pushed, last_at)?;",
+            "let dated = move || date_beacon_push(&pushed, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
+        ]);
+        assert_eq!(code_lines(heartbeat, "forget_beacon_mark("), ["if let Err(e) = forget_beacon_mark(beacon_mark_path, beacon_pushed_path, m.last_at) {"]);
+        assert_eq!(code_lines(heartbeat, "let beacon_pushed_file = "), ["let beacon_pushed_file = crate::chia_network::net().path(BEACON_PUSHED_FILE);"]);
+        // The mark is removed by its forgetting alone, which dates first.
+        let forget = item(publish, "\nfn forget_beacon_mark(");
+        let steps: Vec<&str> = code_lines(forget, "(").into_iter().filter(|line| line.contains("date_beacon_push(") || line.contains("remove_file(")).collect();
+        assert_eq!(steps, ["date_beacon_push(pushed, last_at)?;", "match std::fs::remove_file(mark) {"], "the date is carried before the mark goes");
+        assert_eq!(code_lines(heartbeat, "remove_file(beacon_mark_path)"), [""; 0], "the heartbeat removes the mark through its forgetting only");
     }
 }

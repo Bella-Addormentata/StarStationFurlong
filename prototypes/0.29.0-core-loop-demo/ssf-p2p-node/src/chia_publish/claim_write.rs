@@ -17,8 +17,10 @@
 //! signs with the SSF wallet's keys. It signs with a [`BurnerKey`] alone,
 //! never a money key, and has no network check of its own: the rules hold
 //! on every network, and which callers reach it, on which network, is their
-//! gate (SSF_CHIA_BURNERS on a test network, §13 rows 9 and 10). Its tests
-//! run on each network for that reason.
+//! gate (`super::burner_paths`: SSF_CHIA_BURNERS on a test network, §13
+//! rows 9 and 10; off one the beacon's writer alone, until the player's
+//! LIST ME opens the listing's and the knocks', §4.5 (6)). Its tests run on
+//! each network for that reason.
 //!
 //! The writer ([`burner_write_with`], and [`burner_write`] on the node's own
 //! lease and chain) picks what a write spends under the gift rules of §5.2:
@@ -318,8 +320,8 @@ fn burner_spends(key: &BurnerKey, input: &BurnerInput, hint: Bytes32, body: Byte
 /// over the final spends before anything is signed ([`check_burner_spends`]),
 /// and a broken one comes back as a [`BurnerRule`] inside the error. It never
 /// asks `refuse_money_memo`, whose refusal is of the SSF wallet's keys, and
-/// has no network refusal of its own: its callers' gate is the flag
-/// (module doc).
+/// has no network refusal of its own: which network it is reached on is its
+/// callers' gate (module doc).
 pub fn build_burner_bundle(net: ChiaNet, key: &BurnerKey, input: &BurnerInput, hint: Bytes32, body: Vec<u8>) -> Result<BurnerBundle> {
     let burner_ph = key.puzzle_hash();
     let memo = memo_digest(&body);

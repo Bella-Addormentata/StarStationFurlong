@@ -36,9 +36,8 @@
 //! - the beacon's key B, when the wallet loads with the beacon on
 //!   (`SSF_CHIA_BEACON=1`), on either path: B is one key and one address
 //!   with burner keys on or off ([`wallet_lines`]). It is named wherever
-//!   the beacon is on, also where the beacon writes nothing yet (off a
-//!   test network, where the beacon's own line names the same address
-//!   and says so);
+//!   the beacon is on, on every network: on the burner path, the only one
+//!   off a test network, the beacon's own startup line names no address;
 //! - the claim-and-write self-test's key, when that hook runs
 //!   (`claim_write::claim_write_selftest`).
 //!
@@ -156,8 +155,8 @@ pub(crate) fn audit_line(net: ChiaNet, key: AuditKey, payer: Payer) -> String {
 /// ([`super::beacon_wallet_key`]). B pays for the beacon on either path,
 /// as the beacon wallet's key or as a burner key, at one address, so its
 /// line is the same with burner keys on or off. It is said wherever the
-/// beacon is on, also on a network where the beacon writes nothing yet,
-/// where nothing sits at the address.
+/// beacon is on, on every network, whether or not a coin sits at the
+/// address yet.
 pub fn wallet_lines(net: ChiaNet, audit: &(bool, Option<String>), beacon_on: bool, wallet: &SecretKey) -> Vec<String> {
     let (true, notice) = audit else {
         return Vec::new();
