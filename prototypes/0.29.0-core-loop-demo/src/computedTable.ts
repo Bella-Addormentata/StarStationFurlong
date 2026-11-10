@@ -4625,7 +4625,6 @@ function fairKeepDuty(pub: string, now: number): void {
     noteReturns(w, computedFairOnlyReturns(w.t, w.inc), now);
     w.at = null;
     w.missingAt = null;
-    w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
     // (A stand-down that is over is forgotten here as at a game that lacks
     // something, keepStep: the put-backs of late that keep the game in mind
     // keep no stand-down for a clock gone back to bring back.)
@@ -4637,13 +4636,20 @@ function fairKeepDuty(pub: string, now: number): void {
 /** Count the put-backs of the game since this page last read them (`returns`:
  *  casinoDoc computedFairOnlyReturns), each as of now: a look is TICK_MS after
  *  the one before at the most on an awake page. Whether there was one. No more
- *  than CONTESTED_COUNT of a look are kept: more say nothing more. The ones
+ *  than CONTESTED_COUNT of a look are kept: more say nothing more. And let go
+ *  of the ones read CONTESTED_CALM_MS ago or more, and of the ones stamped
+ *  after now (the clock went back: how long ago they were read is not known).
+ *  At every look, whatever the page does at it: a page that is not ready, one
+ *  that stands down, and one whose game lacks only its session's map read
+ *  their clock here too, and one stamped after now that was let be until the
+ *  clock had caught up with it would count again then, as if just read. The ones
  *  read while this page stands down are counted like the others (a page whose
  *  stand-down ends a little after another's reads that one's put-backs before
  *  its own is over, and stands down with it again), but begin no stand-down by
  *  themselves, `fresh`: what a peer writes and deletes in the last minute of a
  *  stand-down begins the next no sooner than a put-back made after it. */
 function noteReturns(w: Keeping, returns: number, now: number): boolean {
+  w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
   const came = returns - w.seen;
   w.seen = returns;
   for (let i = 0; i < Math.min(came, CONTESTED_COUNT); i++) w.back.push(now);
@@ -4666,7 +4672,9 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): vo
   if (now < w.until) return;
   // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
   if (over !== null && w.at < over) w.at = over;
-  w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
+  // (What was counted is let go of where a stand-down begins. None of it would
+  // be counted past one as it is: a stand-down is longer than
+  // CONTESTED_CALM_MS, and noteReturns lets go at every look.)
   if (w.fresh && w.back.length >= CONTESTED_COUNT) {
     w.until = now + KEEP_BACKOFF_MS;
     w.back = [];
