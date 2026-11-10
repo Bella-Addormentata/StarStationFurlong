@@ -2334,9 +2334,11 @@ async fn node_main() -> Result<()> {
     // testnet11 under the same fixed test room key the publish hook uses, and log
     // the recovered node_id + addrs — the READ side of mesh introduction. Read-only
     // (no wallet needed); spawned so it never blocks startup. Never while
-    // Chia is off (`chia_plan`).
+    // Chia is off (`chia_plan`), and on a test network only (`test_hook_on`):
+    // the hint it asks a full node for is computed from a constant in the
+    // source, so the request marks the asking address as a Star Station node.
     #[cfg(feature = "chia-read")]
-    if chia_plan.resolve_hook {
+    if chia_plan.resolve_hook && test_hook_on(chia_net, "SSF_CHIA_RESOLVE_TEST") {
         let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
         tokio::spawn(async move {
             match chia_resolve::resolve_by_room_key(&test_room_key).await {
@@ -6451,9 +6453,11 @@ fn wallet_switch_view(hub: &HubState) -> (chia_wallet_switch::WalletSwitch, Opti
 /// test network only (stage 4 design §4.5 (3)): the publish hook writes this
 /// node's addresses under a room key anyone can compute from a constant in
 /// the source, the craps hook writes plaintext, and the claim-and-write hook
-/// spends a lobby dish coin under a hint computed the same way. Like the
-/// hooks, `1` alone sets one.
-#[cfg(feature = "chia-publish")]
+/// spends a lobby dish coin under a hint computed the same way. The resolve
+/// hook writes nothing, but asks a full node for the hint of that same room
+/// key, which no player's station asks for. Like the hooks, `1` alone sets
+/// one.
+#[cfg(feature = "chia-read")]
 fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool, Option<String>) {
     match raw {
         Some("1") if net.is_test() => (true, None),
@@ -6464,7 +6468,7 @@ fn test_hook(net: chia_network::ChiaNet, var: &str, raw: Option<&str>) -> (bool,
 
 /// [`test_hook`] for the environment's `var`: says the refusal, if any, and
 /// returns whether the hook runs.
-#[cfg(feature = "chia-publish")]
+#[cfg(feature = "chia-read")]
 fn test_hook_on(net: chia_network::ChiaNet, var: &str) -> bool {
     let (runs, refused) = test_hook(net, var, std::env::var(var).ok().as_deref());
     if let Some(line) = refused {
@@ -6473,7 +6477,7 @@ fn test_hook_on(net: chia_network::ChiaNet, var: &str) -> bool {
     runs
 }
 
-#[cfg(all(test, feature = "chia-publish"))]
+#[cfg(all(test, feature = "chia-read"))]
 mod test_hook_tests {
     use super::test_hook;
     use crate::chia_network::ChiaNet;
@@ -6483,7 +6487,7 @@ mod test_hook_tests {
     /// value runs nothing anywhere and says nothing. No environment is read.
     #[test]
     fn the_env_test_hooks_run_on_a_test_network_only() {
-        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST"] {
+        for var in ["SSF_CHIA_PUBLISH_TEST", "SSF_CHIA_CRAPS_FAIR_TEST", "SSF_CHIA_CLAIM_WRITE_TEST", "SSF_CHIA_RESOLVE_TEST"] {
             for net in ChiaNet::ALL {
                 for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
                     assert_eq!(test_hook(net, var, raw), (false, None), "{var}={raw:?} on {net:?}");
@@ -6500,6 +6504,20 @@ mod test_hook_tests {
                 }
             }
         }
+    }
+
+    /// The read-only hook starts through the same rule as the three that
+    /// write (docs/TDD/ChiaLanePrivacy.md §7): this file's one place that
+    /// starts it asks `test_hook_on` first. Read from the source, since the
+    /// start is in `main` itself.
+    #[test]
+    fn the_resolve_hook_starts_through_the_rule() {
+        let source = include_str!("main.rs");
+        // Joined here so that this test's own lines are not counted.
+        let plan = ["chia_plan", "resolve_hook"].join(".");
+        let start = format!("if {plan} && test_hook_on(chia_net, \"SSF_CHIA_RESOLVE_TEST\") {{");
+        assert_eq!(source.matches(&start).count(), 1, "the hook's start asks the rule");
+        assert_eq!(source.matches(&plan).count(), 1, "and nothing else starts it");
     }
 }
 

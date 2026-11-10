@@ -340,7 +340,12 @@ impl PeerLane {
 pub struct Lane {
     net: Network,
     pins: Vec<String>,
+    /// Pin-only mode in effect: asked for, with a pin to ask.
     pin_only: bool,
+    /// Pin-only mode as the operator asked for it, pin or no pin: with no
+    /// pin it does nothing, and the startup warnings say so
+    /// ([`pin_port_warnings`]).
+    pin_only_asked: bool,
     store_path: Option<PathBuf>,
     tls: tokio::sync::OnceCell<Arc<rustls::ClientConfig>>,
     /// The pool: held for choosing and bookkeeping alone, never across a dial,
@@ -503,6 +508,7 @@ impl Lane {
     }
 
     pub fn new(net: Network, pins: Vec<String>, pin_only: bool, store_path: Option<PathBuf>) -> Self {
+        let pin_only_asked = pin_only;
         let pin_only = pin_only && !pins.is_empty();
         let closed = tokio::sync::watch::Sender::new(false);
         let readers = Readers::new(closed.subscribe());
@@ -510,6 +516,7 @@ impl Lane {
             net,
             pins,
             pin_only,
+            pin_only_asked,
             store_path,
             tls: tokio::sync::OnceCell::new(),
             state: tokio::sync::Mutex::new(LaneState::default()),
@@ -712,9 +719,11 @@ impl Lane {
         }
     }
 
-    /// The startup warnings for this lane's pins ([`pin_port_warnings`]).
+    /// The startup warnings for this lane's pins ([`pin_port_warnings`]),
+    /// from pin-only mode as it was asked for: asked with no pin, it does
+    /// nothing, and that is said.
     pub fn pin_port_warnings(&self) -> Vec<String> {
-        pin_port_warnings(&self.pins, self.pin_only, &self.net)
+        pin_port_warnings(&self.pins, self.pin_only_asked, &self.net)
     }
 
     async fn tls(&self) -> Result<Arc<rustls::ClientConfig>, ChainError> {
@@ -2633,8 +2642,22 @@ fn pin_port(pin: &str) -> PinPort {
 /// other peer is dialed: each line then says chain writes will fail when
 /// every pin's port is unreadable, and that they work only if a pin on
 /// another port serves `net` otherwise. A pin without a port takes the
-/// network's and never warns. Pure, so a test can run it for both networks.
+/// network's and never warns.
+///
+/// `pin_only` is the mode as the operator asked for it. Asked with no pin
+/// at all it does nothing ([`Lane::new`]): public full nodes are found and
+/// asked as if it were unset, which an operator who set it to keep the
+/// station's requests on a full node of their own would not expect. One
+/// line says so (docs/TDD/ChiaLanePrivacy.md §8).
+///
+/// Pure, so a test can run it for both networks.
 pub fn pin_port_warnings(pins: &[String], pin_only: bool, net: &Network) -> Vec<String> {
+    if pin_only && pins.is_empty() {
+        return vec![format!(
+            "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so it does nothing: public {} full nodes are found and asked as if it were unset. To ask a full node of your own alone, name it in SSF_CHIA_PEERS.",
+            net.id
+        )];
+    }
     let flagged: Vec<(&String, PinPort)> = pins
         .iter()
         .map(|pin| (pin, pin_port(pin)))
@@ -7009,7 +7032,16 @@ mod tests {
         let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for (net, other) in [(Network::testnet11(), 8444u16), (Network::mainnet(), 58444u16)] {
             let right = net.port;
-            assert!(pin_port_warnings(&[], true, &net).is_empty(), "no pins, nothing to say");
+            assert!(pin_port_warnings(&[], false, &net).is_empty(), "no pins, nothing to say");
+            // Pin-only asked for with no pin does nothing, and one line
+            // says so: public full nodes are asked.
+            assert_eq!(
+                pin_port_warnings(&[], true, &net),
+                vec![format!(
+                    "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so it does nothing: public {} full nodes are found and asked as if it were unset. To ask a full node of your own alone, name it in SSF_CHIA_PEERS.",
+                    net.id
+                )]
+            );
             let ok = pins(&["203.0.113.5", "localhost", &format!("203.0.113.6:{right}"), &format!("[2001:db8::1]:{right}")]);
             assert!(pin_port_warnings(&ok, false, &net).is_empty(), "{}", net.id);
             assert!(pin_port_warnings(&ok, true, &net).is_empty(), "{}", net.id);
@@ -7090,9 +7122,14 @@ mod tests {
         assert!(pinned.describe().contains("plus one public peer"));
         let only = Lane::new(Network::testnet11(), vec!["10.0.0.2".to_string()], true, None);
         assert!(only.describe().contains("ONLY"));
-        // Pin-only without a pin is just the public posture.
+        // Pin-only without a pin is just the public posture, and the
+        // lane's startup warnings say that it does nothing.
         let none = Lane::new(Network::testnet11(), vec![], true, None);
         assert!(!none.pin_only);
+        assert_eq!(none.describe(), public.describe());
+        assert_eq!(none.pin_port_warnings(), pin_port_warnings(&[], true, &Network::testnet11()));
+        assert_eq!(none.pin_port_warnings().len(), 1);
+        assert!(public.pin_port_warnings().is_empty() && only.pin_port_warnings().is_empty());
         let _ = Mutex::new(());
     }
 
