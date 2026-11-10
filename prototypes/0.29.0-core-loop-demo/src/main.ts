@@ -5459,18 +5459,19 @@ let bankBalanceOwed = false;
  *  over the room's link to the node, so there is nothing to ask before a room
  *  is joined, and nothing while no wallet is loaded.
  *
- *  ⛓️ It asks only with the Bank on screen. A read that comes due while it is
- *  not (a wallet turned on whose answer landed after Tab put the phone away:
- *  turnBankWallet waits on the node twice before it gets here) is owed, and
- *  sent when the Bank is back on screen (the screen watch in renderBankApp),
- *  so the full nodes are never asked for a balance nobody can see. */
+ *  ⛓️ It asks only with the Bank on screen (statusAsksForBalance). A read
+ *  that comes due while it is not (a wallet turned on whose answer landed
+ *  after Tab put the phone away, or the window was minimised: turnBankWallet
+ *  waits on the node twice before it gets here) is owed, and sent when the
+ *  Bank is back on screen (the screen watch in renderBankApp), so the full
+ *  nodes are never asked for a balance nobody can see. */
 function requestBankBalance(): void {
   bankBalanceOwed = false;
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
   // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
   if (localFingerprint.chia_lane?.off) return;
-  if (!bankViewOnScreen()) {
+  if (!statusAsksForBalance()) {
     bankBalanceOwed = true;
     return;
   }
@@ -5482,12 +5483,16 @@ function requestBankBalance(): void {
 
 /** ⛓️ Does a faucet status sent now ask the node for the wallet's coins too?
  *  Only while RECEIVE's balance is on screen: the Bank is the phone's view
- *  AND the phone is out (bankViewOnScreen). Tab puts the phone away without
- *  taking `active` off the Bank's view, so the view's class alone would keep
- *  the dish's polls asking for a balance nobody can see. With the Bank off
- *  screen, and off a test network, those polls leave the wallet unread. */
+ *  AND the phone is out (bankViewOnScreen), AND the page itself is not
+ *  hidden. Tab puts the phone away without taking `active` off the Bank's
+ *  view, so the view's class alone would keep the dish's polls asking for a
+ *  balance nobody can see; and a minimised window or a background tab keeps
+ *  its timers, the dish's 60-second poll among them, so a phone left out on
+ *  the Bank would keep asking for as long as the player is away. With the
+ *  Bank off screen, and off a test network, those polls leave the wallet
+ *  unread. */
 function statusAsksForBalance(): boolean {
-  return bankViewOnScreen();
+  return bankViewOnScreen() && document.visibilityState !== "hidden";
 }
 
 function renderBankApp(): void {
@@ -5829,6 +5834,8 @@ function renderBankApp(): void {
     if (phone) watch.observe(phone, { attributes: true, attributeFilter: ["class"] });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") bankBackupLeftScreen();
+      // ⛓️ Shown again: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
     // the phone's toggle and preventDefaults every press), and a COPY only a
