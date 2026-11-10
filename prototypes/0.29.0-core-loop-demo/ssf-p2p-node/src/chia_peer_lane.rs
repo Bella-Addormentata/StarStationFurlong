@@ -42,7 +42,12 @@
 //!     the last stored or gossiped peer the lane knows while another fresh
 //!     peer is at hand, so a second source stays to pair with),
 //!     `RequestPeers` gossip from a connected
-//!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed),
+//!     peer (asked once; again after [`GOSSIP_RETRY`] if the request failed,
+//!     and again [`GOSSIP_AGAIN`] after an answer once nothing queued is
+//!     left to dial, since a full node answers each request with a new random
+//!     sample of its address book and few of the addresses in one take a
+//!     connection; [`gossip_take`] says which addresses of an answer are
+//!     queued),
 //!     and the store of known‑good peers kept in `chia_peers.json`
 //!     across runs; whatever the three name, only a public, internet-routable
 //!     address is queued (the node's own address judge, as for a presence
@@ -190,8 +195,18 @@ pub const CANDIDATE_CAP: usize = 256;
 /// Candidates dialled at once.
 pub const PARALLEL_DIALS: usize = 4;
 /// Rounds of dialling one request may spend before it gives up (the peers the
-/// last round reaches are still judged).
-pub const MAX_ROUNDS: usize = 4;
+/// last round reaches are still judged). Eight rounds of three dials are two
+/// dozen addresses a request: on testnet11 about one gossiped address in a
+/// hundred took a connection (live check, 2026-11-10), so a second peer is
+/// several requests away, and half as many rounds made it twice as many.
+pub const MAX_ROUNDS: usize = 8;
+/// How long one request may spend dialling before it gives up, whatever
+/// rounds are left: eight rounds of addresses that answer nothing end at
+/// [`crate::chia_peer::DIAL_TIMEOUT`] each, inside this, while addresses that
+/// take the connection and then stall (each later stage has
+/// [`CONNECT_TIMEOUT`] of its own) do not hold a request for minutes. The
+/// round under way when it runs out is finished and judged.
+pub const DISCOVERY_BUDGET: Duration = Duration::from_secs(40);
 /// How long a public address that failed or disagreed is left alone.
 pub const RETRY_AFTER: Duration = Duration::from_secs(600);
 /// How long a pin that failed is left alone (its owner may be restarting it).
@@ -210,12 +225,22 @@ pub const INTRODUCE_RETRY: Duration = Duration::from_secs(60);
 /// How long a connection whose gossip request failed waits before it is asked
 /// again (a request that failed says nothing about the peer's address book).
 pub const GOSSIP_RETRY: Duration = Duration::from_secs(60);
+/// How soon a connection that answered a gossip request may be asked again,
+/// once nothing it or anyone named is left to dial. A full node answers each
+/// request with a new random sample of its address book (chia-blockchain
+/// 2.7.4, `AddressManager.get_peers_`: at most 1,000 addresses, 23% of the
+/// book) and takes ten such requests a minute from a peer
+/// (`rate_limit_numbers.py`, `request_peers`); this asks two a minute at most.
+pub const GOSSIP_AGAIN: Duration = Duration::from_secs(30);
 /// Connections one public source may hold at once: one slot always stays for
 /// another source, so four introducer peers cannot fill the pool and shut
 /// gossip and the store out of the agreed pair (§14 (2)).
 pub const PER_SOURCE_CAP: usize = MAX_CONNS - 1;
 /// Addresses taken from one introducer answer or one gossip answer.
 pub const ADDRS_PER_ANSWER: usize = 32;
+/// Addresses read of one gossip answer at most (a full node sends up to
+/// 1,000); the rest of a longer answer is not looked at.
+pub const GOSSIP_READ: usize = 1024;
 /// Requests one coin-state lookup may spend when a peer answers for fewer ids
 /// than it was asked (Chia caps a request at its response-item limit and
 /// echoes the ids it took).
@@ -345,6 +370,9 @@ pub struct Lane {
     /// ([`Lane::closed`]), for its startup line; `None` for a lane built
     /// open, closed or not since.
     off_why: Option<&'static str>,
+    /// How long one request may spend dialling ([`DISCOVERY_BUDGET`]; tests
+    /// set their own).
+    budget: Duration,
     /// Every dial's outcome as it comes (tests).
     #[cfg(test)]
     dialled: tokio::sync::watch::Sender<Vec<Dialled>>,
@@ -371,9 +399,9 @@ struct LaneState {
     /// `None` before the first dial, or while a pin does not resolve: the pins
     /// count as short then.
     pin_target: Option<usize>,
-    /// Connections asked for gossip: `None`, it answered (not asked again);
-    /// `Some(at)`, the request failed (asked again after `at`).
-    gossiped: HashMap<SocketAddr, Option<Instant>>,
+    /// Connections asked for gossip, and when each may be asked again
+    /// ([`Asked`]).
+    gossiped: HashMap<SocketAddr, Asked>,
     /// How many closes are under way off the lock ([`close_later`]): of
     /// connections let go, and of those the pool held when the lane closed.
     /// [`Lane::close`] waits for none to be left, so every call waits for
@@ -391,6 +419,19 @@ struct LaneState {
     /// ranges included.
     #[cfg(test)]
     public_only: bool,
+}
+
+/// A connection asked for gossip, and when it may be asked again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// It answered, or its request is out: asked again after the instant
+    /// ([`GOSSIP_AGAIN`]), and only once nothing queued is left to dial. A
+    /// request abandoned on the way (its requester gave up) is one of these
+    /// too, so the connection is asked again all the same.
+    Answered(Instant),
+    /// The request failed: asked again after the instant ([`GOSSIP_RETRY`]),
+    /// whatever is queued.
+    Failed(Instant),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +513,7 @@ impl Lane {
             readers,
             in_flight: tokio::sync::RwLock::new(()),
             off_why: None,
+            budget: DISCOVERY_BUDGET,
             #[cfg(test)]
             dialled: tokio::sync::watch::Sender::new(Vec::new()),
         }
@@ -604,7 +646,28 @@ impl Lane {
         let mut state = self.state.lock().await;
         state.pin_retry_after = None;
         state.cooling.clear();
-        state.gossiped.retain(|_, retry| retry.is_none());
+        state.gossiped.retain(|_, asked| matches!(asked, Asked::Answered(_)));
+    }
+
+    /// Let every connection that answered a gossip request be asked again at
+    /// once, when nothing queued is left to dial (tests).
+    #[cfg(test)]
+    pub async fn expire_gossip_wait(&self) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        for asked in state.gossiped.values_mut() {
+            if matches!(asked, Asked::Answered(_)) {
+                *asked = Asked::Answered(now);
+            }
+        }
+    }
+
+    /// Give a request `budget` to spend dialling instead of
+    /// [`DISCOVERY_BUDGET`] (tests).
+    #[cfg(test)]
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Reuse a TLS configuration (tests share one certificate).
@@ -704,6 +767,7 @@ impl Lane {
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
         self.refuse_if_closed()?;
         let pinned = !self.pins.is_empty();
+        let started = Instant::now();
         // One pass more than there are dial rounds: the peers the LAST round
         // reached are judged like any other before the request gives up.
         for round in 0..=MAX_ROUNDS {
@@ -736,9 +800,10 @@ impl Lane {
             if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
             }
-            if self.pin_only || round == MAX_ROUNDS {
+            if self.pin_only || round == MAX_ROUNDS || started.elapsed() >= self.budget {
                 // Nothing public is ever dialled in pin-only mode; otherwise
-                // the dial rounds are spent.
+                // the dial rounds are spent, or the time a request may spend
+                // on them ([`DISCOVERY_BUDGET`]).
                 break;
             }
             let _discovering = self.discovery.lock().await;
@@ -1083,7 +1148,10 @@ impl Lane {
     /// which the store and gossip can never supply) and it is due (its last
     /// answer used up and [`INTRODUCE_EVERY`] passed, or [`INTRODUCE_RETRY`]
     /// after an answer that named nobody); and gossip from every connection
-    /// not yet asked. The interval holds across requests and dial rounds
+    /// not yet asked, from one whose request failed once [`GOSSIP_RETRY`] has
+    /// passed, and from one that answered once nothing queued is left to dial
+    /// and [`GOSSIP_AGAIN`] has passed ([`gossip_take`] says what an answer
+    /// adds). The interval holds across requests and dial rounds
     /// alike: while the introducer cools down, the queued, stored and
     /// gossiped candidates are what there is to try. The lookup and the
     /// gossip requests run with the pool unlocked; what they bring is merged
@@ -1133,16 +1201,28 @@ impl Lane {
             // No veto for introducer candidates still queued: those are cooling
             // after failed dials, and only the deadline and the need decide.
             let introduce = !self.net.introducers.is_empty() && state.introduce_after.is_none_or(|at| now >= at) && (need_fresh || !ready);
+            // A connection is asked for gossip when it never was; again once
+            // a failed request's wait has passed; and again after an answer,
+            // once nothing queued is left to dial and [`GOSSIP_AGAIN`] has
+            // passed. A full node answers each request with a new random
+            // sample of its address book, and on a thin network the first
+            // sample seldom names a peer that takes a connection: asked once
+            // and never again, the lane had tried its 32 addresses and then
+            // stood a peer short for good (live check, 2026-11-10).
             let unasked: Vec<Arc<PeerConn>> = state
                 .conns
                 .iter()
-                .filter(|c| !state.gossiped.get(&c.addr()).is_some_and(|retry| retry.is_none() || retry.is_some_and(|at| now < at)))
+                .filter(|c| match state.gossiped.get(&c.addr()) {
+                    None => true,
+                    Some(Asked::Failed(at)) => now >= *at,
+                    Some(Asked::Answered(at)) => !ready && now >= *at,
+                })
                 .cloned()
                 .collect();
             // Marked asked before the requests leave, so no other requester
             // asks the same peers meanwhile.
             for conn in &unasked {
-                state.gossiped.insert(conn.addr(), None);
+                state.gossiped.insert(conn.addr(), Asked::Answered(now + GOSSIP_AGAIN));
             }
             (introduce, unasked)
         };
@@ -1165,23 +1245,24 @@ impl Lane {
         } else {
             None
         };
-        let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<SocketAddr>>)> = Vec::with_capacity(unasked.len());
+        let mut gossip: Vec<(Arc<PeerConn>, Option<Vec<(SocketAddr, u64)>>)> = Vec::with_capacity(unasked.len());
         for conn in unasked {
             // Closed meanwhile: no further peer is asked, and the request out
             // is abandoned.
             let Some(answered) = self.while_open(conn.request::<RespondPeers, _>(RequestPeers::new())).await else { return };
             let answer = match answered {
-                Ok(answer) => {
-                    let mut addrs: Vec<SocketAddr> = answer
+                // Each address with the time the peer says it last saw it;
+                // which of them are taken is chosen with the pool in hand,
+                // below ([`gossip_take`]).
+                Ok(answer) => Some(
+                    answer
                         .peer_list
                         .iter()
-                        .filter_map(|p| p.host.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, p.port)))
-                        .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
-                        .collect();
-                    addrs.shuffle(&mut rand::thread_rng());
-                    addrs.truncate(ADDRS_PER_ANSWER);
-                    Some(addrs)
-                }
+                        .take(GOSSIP_READ)
+                        .filter_map(|p| p.host.parse::<IpAddr>().ok().map(|ip| (canonical(SocketAddr::new(ip, p.port)), p.timestamp)))
+                        .filter(|(a, _)| !a.ip().is_unspecified() && a.port() != 0)
+                        .collect(),
+                ),
                 Err(e) => {
                     eprintln!("⛓️ chain peers: {} gossip: {e:#} (asked again in {} s)", conn.addr(), GOSSIP_RETRY.as_secs());
                     None
@@ -1204,13 +1285,16 @@ impl Lane {
         }
         for (conn, answer) in gossip {
             match answer {
-                Some(addrs) => {
-                    let n = addrs.len();
-                    push_candidates(state, addrs.into_iter().map(|addr| Candidate::new(addr, Source::Gossip)).collect());
-                    eprintln!("⛓️ chain peers: {} gossiped {n} full nodes", conn.addr());
+                Some(named) => {
+                    let n = named.len();
+                    let held: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).chain(state.candidates.iter().map(|c| c.addr)).collect();
+                    let dialable: Vec<(SocketAddr, u64)> = named.into_iter().filter(|(addr, _)| admitted(state, *addr)).collect();
+                    let (known, taken) = gossip_take(dialable, &held, unix_now(), &mut rand::thread_rng());
+                    eprintln!("⛓️ chain peers: {} gossiped {n} full nodes: {} taken to try, {} known already", conn.addr(), taken.len(), known.len());
+                    push_candidates(state, known.into_iter().chain(taken).map(|addr| Candidate::new(addr, Source::Gossip)).collect());
                 }
                 None => {
-                    state.gossiped.insert(conn.addr(), Some(Instant::now() + GOSSIP_RETRY));
+                    state.gossiped.insert(conn.addr(), Asked::Failed(Instant::now() + GOSSIP_RETRY));
                 }
             }
         }
@@ -1295,7 +1379,11 @@ impl Lane {
                     }
                 }
             }
-            ready.sort_by_key(|c| (have.contains(&c.source()), groups.contains(&group_of(c.addr)), !c.source().is_fresh()));
+            // Among equals, an address never dialled goes before one that
+            // failed before: on a thin network nearly every gossiped address
+            // fails, and their second and third tries would otherwise stand
+            // ahead of every address gossip named since.
+            ready.sort_by_key(|c| (have.contains(&c.source()), groups.contains(&group_of(c.addr)), !c.source().is_fresh(), c.failures));
             if first.is_none() {
                 if let Some(i) = self.rotation(state, paired, &ready) {
                     let peer = state.conns[i].clone();
@@ -2280,6 +2368,46 @@ impl Drop for Closing {
         drop(self.peer.take());
         self.under_way.send_modify(|n| *n -= 1);
     }
+}
+
+/// What one gossip answer adds: `named` holds each address with the time the
+/// peer says it last saw it, `held` the addresses the lane already has,
+/// connected or queued. First, every address of the answer the lane holds
+/// already: gossip names it too now, so a connection the introducer named may
+/// stand for gossip in a pair ([`push_candidates`], [`pick_agreed`]). A full
+/// node answers with up to 1,000 addresses, and looking for those among the
+/// few taken to dial alone would seldom find one. Second, at most
+/// [`ADDRS_PER_ANSWER`] addresses new to the lane, to dial in this order:
+/// half are the ones the peer saw most recently (a full node stamps anew the
+/// peers it dialled itself and still holds, chia-blockchain 2.7.4
+/// `update_peer_timestamp_on_message`, so a late stamp should mark an address
+/// likelier to take a connection: read in the source, not measured; an
+/// address stamped in the future counts as seen now), the other half drawn
+/// at random from the rest, so a peer's timestamps alone do not decide every
+/// address tried. An address the answer repeats counts once.
+fn gossip_take(named: Vec<(SocketAddr, u64)>, held: &HashSet<SocketAddr>, now: u64, rng: &mut impl rand::Rng) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut known: Vec<SocketAddr> = Vec::new();
+    let mut new: Vec<(SocketAddr, u64)> = Vec::new();
+    for (addr, at) in named {
+        if !seen.insert(addr) {
+            continue;
+        }
+        if held.contains(&addr) {
+            known.push(addr);
+        } else {
+            new.push((addr, at.min(now)));
+        }
+    }
+    // Shuffled first, so addresses stamped alike come in no order of the
+    // peer's choosing; the sort is stable.
+    new.shuffle(rng);
+    new.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    let recent = (ADDRS_PER_ANSWER / 2).min(new.len());
+    let mut rest = new.split_off(recent);
+    rest.shuffle(rng);
+    rest.truncate(ADDRS_PER_ANSWER - recent);
+    (known, new.into_iter().chain(rest).map(|(addr, _)| addr).collect())
 }
 
 /// Queue candidates not yet known. An address already queued or connected is
@@ -3963,7 +4091,7 @@ impl ChainAccess for PeerLane {
 mod tests {
     use super::*;
     use crate::chia_peer::mock::{header_at, reply, spawn, spawn_as, spawn_on, Handler, MockNode};
-    use crate::chia_peer::tls_client_config;
+    use crate::chia_peer::{tls_client_config, DIAL_TIMEOUT};
     use chia_protocol::{Coin, Message, NewPeakWallet, NodeType, Program, PuzzleSolutionResponse, TimestampedPeerInfo};
     use chia_traits::Streamable;
     use std::sync::{LazyLock, Mutex};
@@ -6405,13 +6533,164 @@ mod tests {
         let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
         let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
         assert!(err.to_string().contains("fewer than two"), "{err}");
-        assert!(matches!(retrying.state.lock().await.gossiped.get(&a.addr), Some(Some(_))), "marked to ask again later, not never");
+        assert!(matches!(retrying.state.lock().await.gossiped.get(&a.addr), Some(Asked::Failed(_))), "marked to ask again later, not never");
         let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
         assert!(err.to_string().contains("fewer than two"), "{err}");
         assert_eq!(asked(), 1, "not asked again before the delay");
         retrying.expire_pin_cooldown().await;
         assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's gossip brought B");
         assert_eq!(asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_gossip_named_nobody_reachable_is_asked_again_once_nothing_is_left_to_dial() {
+        // The live check of 2026-11-10 on testnet11: the first peer's gossip
+        // named 32 addresses, none took a connection, and the lane never
+        // asked it again, so every money read stood a peer short for good.
+        // A's first answer names addresses nobody answers at; its later ones
+        // name B.
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let dead = vec![closed().await, closed().await];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = node(vec![state(1, 90, None)], (1, None), dead.clone());
+        let later = node(vec![state(1, 90, None)], (1, None), vec![b.addr]);
+        let two_answers: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                first(m)
+            } else {
+                later(m)
+            }
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), two_answers).await;
+        let thin = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        let money = PeerLane::new(thin.clone(), Trust::Agreed);
+        let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(asked(), 1, "asked once in the request that used its answer up");
+        {
+            let state = thin.state.lock().await;
+            assert!(matches!(state.gossiped.get(&a.addr), Some(Asked::Answered(_))), "marked to ask again, not never");
+            assert!(dead.iter().all(|d| state.cooling.contains_key(d)), "both addresses were dialled and cool");
+        }
+        let err = money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(asked(), 1, "not asked again before its wait has passed");
+        thin.expire_gossip_wait().await;
+        assert_eq!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap().records.len(), 1, "asked again, A's second answer brought B");
+        assert_eq!(asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_answered_is_not_asked_again_while_an_address_waits_to_be_dialled() {
+        // A new sample is for a queue that ran dry: while something queued can
+        // still be dialled, nobody is asked for more, however long ago it
+        // answered; and once asked, a peer has its wait again.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let waiting = closed().await;
+        let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        let asked = || a.seen.lock().unwrap().iter().filter(|t| **t == chia_protocol::ProtocolMessageTypes::RequestPeers).count();
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 1, "a connection never asked is asked");
+        lane.expire_gossip_wait().await;
+        lane.state.lock().await.candidates.push_back(Candidate::new(waiting, Source::Gossip));
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 1, "an address is left to dial: nobody is asked for more");
+        lane.state.lock().await.cooling.insert(waiting, Instant::now() + RETRY_AFTER);
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 2, "the only address queued is cooling, so nothing is left to dial: asked again");
+        lane.refill(Trust::Agreed).await;
+        assert_eq!(asked(), 2, "and not again before its wait has passed");
+    }
+
+    #[tokio::test]
+    async fn an_address_never_dialled_is_tried_before_one_that_failed() {
+        // Three addresses that failed a dial before stand ahead of three
+        // never tried in the queue; the pool has three places. The next round
+        // dials the three never tried.
+        let a = full_node(vec![], (1, None), Some(peak_at(100))).await;
+        let lane = lane(vec![(a.addr, Source::Introducer)], vec![], false, None);
+        assert_eq!(PeerLane::new(lane.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        let failed = [closed().await, closed().await, closed().await];
+        let untried = [closed().await, closed().await, closed().await];
+        {
+            let mut state = lane.state.lock().await;
+            for addr in failed {
+                state.candidates.push_back(Candidate { failures: 1, ..Candidate::new(addr, Source::Gossip) });
+            }
+            for addr in untried {
+                state.candidates.push_back(Candidate::new(addr, Source::Gossip));
+            }
+        }
+        assert!(lane.dial().await);
+        let dialled: HashSet<SocketAddr> = lane.dialled.borrow().iter().map(|(addr, _)| *addr).filter(|addr| *addr != a.addr).collect();
+        assert_eq!(dialled, untried.into_iter().collect::<HashSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_request_out_of_time_dials_no_further() {
+        // The dial rounds a request may spend are bounded in time too
+        // ([`DISCOVERY_BUDGET`]): with none left, a money read a peer short
+        // gives up without a dial, B still queued for the next request.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let hurried = Arc::new(
+            Lane::new(net(), vec![], false, None)
+                .with_candidates(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)])
+                .with_tls(TLS.clone())
+                .with_budget(Duration::ZERO),
+        );
+        let err = PeerLane::new(hurried.clone(), Trust::Agreed).coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert!(hurried.dialled.borrow().is_empty(), "nothing was dialled");
+        assert_eq!(hurried.state.lock().await.candidates.len(), 2, "both wait for a request with time to spend");
+    }
+
+    #[test]
+    fn the_dial_rounds_of_unanswered_addresses_fit_the_time_a_request_may_spend() {
+        // What the two constants are for: a request whose every address
+        // answers nothing still gets all its rounds, and a dial of such an
+        // address ends before the later stages' bound would.
+        assert!(DIAL_TIMEOUT * MAX_ROUNDS as u32 <= DISCOVERY_BUDGET);
+        assert!(DIAL_TIMEOUT < CONNECT_TIMEOUT);
+        // Two requests a minute at most, a fifth of what a 2.7.4 full node
+        // takes (ten a minute) before it drops the peer for flooding.
+        assert!(GOSSIP_AGAIN >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_gossip_answer_adds_what_the_lane_holds_and_a_bounded_choice_of_the_rest() {
+        let addr = |n: u16| SocketAddr::from(([198, 51, (n / 256) as u8, (n % 256) as u8], 58444));
+        let mut rng = rand::thread_rng();
+        // 200 addresses, the n-th last seen at time n; the lane holds three.
+        let named: Vec<(SocketAddr, u64)> = (0..200).map(|n| (addr(n), u64::from(n))).collect();
+        let held: HashSet<SocketAddr> = [addr(5), addr(150), addr(199)].into_iter().collect();
+        let (known, taken) = gossip_take(named.clone(), &held, 1_000, &mut rng);
+        assert_eq!(known, vec![addr(5), addr(150), addr(199)], "every address the lane holds, wherever it stands in the answer");
+        assert_eq!(taken.len(), ADDRS_PER_ANSWER, "and no more new ones than the cap");
+        let recent: Vec<SocketAddr> = (183..=198).rev().map(addr).collect();
+        assert_eq!(taken[..ADDRS_PER_ANSWER / 2], recent[..], "first the ones the peer saw most recently, newest first");
+        let rest = &taken[ADDRS_PER_ANSWER / 2..];
+        assert!(rest.iter().all(|a| !recent.contains(a) && !held.contains(a)), "then others the lane does not hold");
+        assert_eq!(taken.iter().collect::<HashSet<_>>().len(), taken.len(), "none twice");
+        // The other half is drawn at random from all the rest, not the next
+        // most recent: sixteen of 181 all falling among the newest sixteen of
+        // them has no chance worth the name.
+        assert!(rest.iter().any(|a| *a < addr(167)), "the second half reaches past the next most recent");
+
+        // Fewer new addresses than the cap: all are taken; one named twice counts once.
+        let few: Vec<(SocketAddr, u64)> = vec![(addr(1), 10), (addr(2), 30), (addr(1), 50), (addr(3), 20)];
+        let (known, taken) = gossip_take(few, &HashSet::new(), 1_000, &mut rng);
+        assert!(known.is_empty());
+        assert_eq!(taken, vec![addr(2), addr(3), addr(1)], "newest first, the repeat's first mention counted");
+
+        // A timestamp ahead of the clock counts as now: among forty addresses
+        // seen now, the one stamped ahead is not first every time.
+        let ahead = addr(999);
+        let crowd: Vec<(SocketAddr, u64)> = std::iter::once((ahead, u64::MAX)).chain((0..40).map(|n| (addr(n), 1_000))).collect();
+        let firsts: HashSet<SocketAddr> = (0..64).map(|_| gossip_take(crowd.clone(), &HashSet::new(), 1_000, &mut rng).1[0]).collect();
+        assert!(firsts.len() > 1, "an address stamped in the future does not outrank the ones seen now");
     }
 
     #[tokio::test]
