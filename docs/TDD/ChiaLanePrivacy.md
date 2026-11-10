@@ -63,7 +63,7 @@ There are two kinds of request (`chia_chain.rs`):
 | What is asked | When | Lane | What it shows the peer |
 |---|---|---|---|
 | The chain's peak | Each tick with something to read for. Usually it is the peer's own announcement; the node asks only when that is more than 10 minutes old | Carrier | That this IP runs the client. |
-| The station's own listing hints, this era and the last | Every beat (32 blocks; `SSF_CHIA_BEAT_BLOCKS`), whether or not the station lists | Carrier | Which listing hint belongs to this IP. |
+| The station's own listing hints, this era and the last | Every beat (32 blocks; `SSF_CHIA_BEAT_BLOCKS`) of a tick with something to read for. A station that does not list asks all the same, unless it has nothing else to read for either: no room that is not public, no card held, no inbox to watch and no knock in its book (`watch_loop`) | Carrier | Which listing hint belongs to this IP. |
 | Each contact's listing hints, this era and the last: every peer in `peers.json` with a contact key | Every beat, four times less often while the station is connected to every station that claims the key; 8 keys a tick at most (`MAX_CK_READS_PER_TICK`) | Carrier | The station's contact list, as hints. |
 | v1 room hints for each room that is not public, three UTC days | Every beat, four times less often for a room with a connected peer | Carrier | The station's private rooms, as hints. They carry no network tag, and the watcher reads them on mainnet too, so the same bytes are asked on both chains. |
 | Inbox hints for each room that shares cards, this era and the last | Every beat | Agreed | Which inboxes this IP watches. |
@@ -212,7 +212,7 @@ The data folder is the node's working directory. Its secret and state files are 
 | `rooms/<room id>.cap` | Data root | A room's key and its switches (Chia mesh, public or private, SHARE CARD). |
 | `rooms/<room id>.bin` | Data root | The room's document, with the room key in it. Written without the owner-only step. |
 | `chia_lane_off.json` | Data root | The CHIA off switch. |
-| `chia_identity.json` | Per network | The SSF wallet: the entropy of its 24 words. In the clear (`protect: "none"`) until the player marks the words saved; from then locked with DPAPI on Windows or the login keychain on macOS, and still in the clear on Linux, or anywhere with `SSF_WALLET_AT_REST=none` (`chia_at_rest.rs`). An older `chia_identity.seed`, and the `chia_identity.seed.retired-<time>` copy the node keeps when it retires one, is a raw seed. |
+| `chia_identity.json` | Per network | The SSF wallet: the entropy of its 24 words. In the clear (`protect: "none"`) until the player marks the words saved. The node then locks it with DPAPI on Windows or the login keychain on macOS. It stays in the clear on Linux, with `SSF_WALLET_AT_REST=none` (which leaves a file already locked as it is), and whenever the lock does not land: a locked keychain, a folder on exFAT or FAT, another node holding the file. The log then says the file "stays in the clear for now", and the node tries again at its next start (`chia_at_rest.rs`, `chia_wallet.rs`). An older `chia_identity.seed`, and the `chia_identity.seed.retired-<time>` copy the node keeps when it retires one, is a raw seed. |
 | `chia_wallet.json`, `chia_words_saved.json`, `chia_listing.json` | Per network | The wallet's switch, the mark that the words were saved, LIST ME. Nothing secret. |
 | `wallet_lease.json` | Per network | Parked coins and, for each spend still settling, the whole signed bundle and the address that paid. Written without the owner-only step. |
 | `publish_marks.json`, `beacon_mark.json` | Per network | The last listing and beacon: era, hint, coin id, node id, the paying address, and for the listing its address set in the clear. |
@@ -280,7 +280,7 @@ A one-off developer review of what the chain actually shows. The game never depe
 
 **Gaps this document's check against the code found.** Each is a place where the code does less than a reader might assume. Most show only to the full nodes a station talks to or to someone at the computer; the timing ones show on the chain.
 - On mainnet the publisher never reads the money address, but a dish status does, every 60 seconds in a room with a dish while a wallet is loaded. The two agreed full nodes therefore see the money address and the burner addresses from one IP.
-- LIST ME does not hold the beacon or a v1 room record, and with LIST ME off the watcher still asks a full node for the station's own listing hints.
+- LIST ME does not hold the beacon or a v1 room record, and with LIST ME off the watcher still asks a full node for the station's own listing hints, except on a station with nothing else to read for (§3).
 - v1 room hints are still read on mainnet, untagged (§6, 22). The v1 writer goes in stage 4 PR 12. `chia_lane.rs` says v1 stays readable for two eras, but no code ends the reads yet.
 - A machine that slept past its listing slot writes as soon as it wakes, and a station whose address changed since last era does not wait for its slot (§5, T2 and T3).
 - With burners on on testnet11, a room's v1 record is still paid by the wallet and not spaced, which pairs the listing key with the wallet's address by time (§7). It goes with the v1 writer.
