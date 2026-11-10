@@ -131,7 +131,7 @@ import {
   findPath,
   nearestWalkableCell,
 } from "./pathfinding";
-import { subscribeFurniture, readAllFurniture, layoutRemoved, layoutRemovedHere } from "./furnitureDoc";
+import { subscribeFurniture, readAllFurniture, layoutKeeps, layoutRemoved, layoutRemovedHere } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
@@ -3449,9 +3449,16 @@ export class World {
 
     const changedIds = new Set<string>();
 
-    // 1. Removals — local items no longer in the shared layout.
+    // 1. Removals — local items no longer in the shared layout. An id that
+    // a change this page heard or made wrote a record of another kind under
+    // holds another item now: the one that stood there goes as one removed
+    // does (its visuals, its handles, its table's session), and step 2
+    // builds the one the layout holds. Without this a page that came in
+    // while a sofa lay under a table's id kept the sofa when the table was
+    // put back (only poses were ever moved in place). (layoutKeeps: not an
+    // item of the room left whose id holds another kind here.)
     for (const item of [...FURNITURE]) {
-      if (records.has(item.id)) continue;
+      if (layoutKeeps(item, records)) continue;
       this.evictAndDefocusForItem(item.id);
       // A removal this page made of the room's layout (a template it
       // applied), one it heard, or a table of the room left behind.

@@ -4538,11 +4538,13 @@ interface Keeping {
   sid: string | null;
   sesMoves: number;
   /** Since when this page sees the game's table out of the room's layout
-   *  (null: it is not), and casinoDoc's count of the changes of the layout's
-   *  key of it as this page last read it (FairOnlyRecovery tableMoves): a
-   *  table that came back and went since is a wait of its own. */
+   *  (null: it is not), and casinoDoc's counts of the changes of the layout's
+   *  key of it and of the times it went out, as this page last read them
+   *  (FairOnlyRecovery tableMoves, tableOuts): a table that came back and went
+   *  since, or was another game's meanwhile, is a wait of its own. */
   tableAt: number | null;
   tableMoves: number;
+  tableOuts: number;
   /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
    *  and when it read each put-back since (its own and other pages'), within
    *  CONTESTED_CALM_MS. Whether it read one while it did not stand down, since
@@ -4600,9 +4602,13 @@ let keptAt: number | null = null;
  *   room heard all the while, JUNK_GAP_MS after this page's last put-back of
  *   the game at the earliest. The wait is one disappearance's: a table that
  *   came back and went, an end order that stood meanwhile, or the table
- *   playing another game meanwhile starts it again. One stand-down for all a
- *   page puts back of a game: a table or a switch that comes back is a put-back
- *   counted as a record's is.
+ *   playing another game meanwhile starts it again, between two looks of the
+ *   page as well (casinoDoc counts the times the table went out: tableOuts).
+ *   One stand-down for all a page puts back of a game: a table or a switch
+ *   that comes back is a put-back counted as a record's is, the records' and
+ *   the table's each by itself (a table that stays out hides no put-back of
+ *   the records), so CONTESTED_COUNT is of put-backs of the game, and a page
+ *   that finds something of it lacking after the last of them stands down.
  * - **The live session's map**, gone with the game live: an empty one
  *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
  *   while, as at a page-signed table (recoverDuty: two pages that made one at
@@ -4633,7 +4639,7 @@ function fairKeepDuty(pub: string, now: number): void {
     listed.add(key);
     let w = keeping.get(key);
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
-    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, tableAt: null, tableMoves: r.tableMoves, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, tableAt: null, tableMoves: r.tableMoves, tableOuts: r.tableOuts, seen: r.returns, back: [], fresh: false, wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
     const over = standOver(w, now);
     if (!ready) {
@@ -4742,10 +4748,15 @@ function standsDown(w: Keeping, r: FairOnlyRecovery, now: number): boolean {
  *  that, with the room heard all the while (the game's end may be on its way:
  *  its authority takes a table out by ending the game), JUNK_GAP_MS after this
  *  page's last put-back of the game, and not while the room stands down. The
- *  wait is one disappearance's (tableMoves). */
+ *  wait is one disappearance's: the layout's key of the table changed
+ *  (tableMoves), or the table was not out for the game at some count since this
+ *  page last looked (tableOuts: it stood there, it played another game, an end
+ *  order stood), between two looks of this page as well, and the wait starts
+ *  again. */
 function tableStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number, over: number | null): void {
-  if (w.tableMoves !== r.tableMoves) {
+  if (w.tableMoves !== r.tableMoves || w.tableOuts !== r.tableOuts) {
     w.tableMoves = r.tableMoves;
+    w.tableOuts = r.tableOuts;
     w.tableAt = null;
   }
   if (!r.tableMissing) {

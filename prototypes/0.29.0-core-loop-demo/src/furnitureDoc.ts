@@ -55,9 +55,18 @@ function notify(): void {
 }
 
 /** Items the bound layout held until a change removed them, and those of
- *  them this page's own change removed. */
+ *  them this page's own change removed. An item written over by one of
+ *  another kind, or by what is no record, is removed as one deleted is: what
+ *  stood under the id stands there no more (World.reconcileFurniture takes it
+ *  down, and builds what the layout holds there now). */
 let removedIds = new Set<string>();
 let removedLocallyIds = new Set<string>();
+
+/** Whether a change of a key took the item `was` out: the key holds a record
+ *  of another kind now, or none. (What was no record was no item.) */
+function tookOut(was: unknown, now: unknown): boolean {
+  return isFurnitureRecord(was) && !(isFurnitureRecord(now) && now.kind === was.kind);
+}
 
 export function bindFurnitureDoc(doc: Y.Doc): void {
   boundDoc = doc;
@@ -69,9 +78,10 @@ export function bindFurnitureDoc(doc: Y.Doc): void {
   const removedLocally = removedLocallyIds;
   map.observe((event) => {
     event.changes.keys.forEach((change, id) => {
-      if (change.action === 'delete') removedHere.add(id);
+      const gone = change.action === 'delete' || (change.action === 'update' && tookOut(change.oldValue, map.get(id)));
+      if (gone) removedHere.add(id);
       else removedHere.delete(id);
-      if (change.action === 'delete' && event.transaction.local) removedLocally.add(id);
+      if (gone && event.transaction.local) removedLocally.add(id);
       else removedLocally.delete(id);
     });
     notify();
@@ -79,7 +89,8 @@ export function bindFurnitureDoc(doc: Y.Doc): void {
   notify(); // reconcile from the fresh doc (mirror of rebuildChatLog / bindGamesDoc)
 }
 
-/** Whether the bound room's layout held `id` and a change took it out, as
+/** Whether the bound room's layout held `id` and a change took it out (it
+ *  deleted the record, or wrote one of another kind or junk over it), as
  *  opposed to an item of the room this page left, which the doc it joined
  *  never had (World.reconcileFurniture tells the two apart). */
 export function layoutRemoved(id: string): boolean {
@@ -90,6 +101,25 @@ export function layoutRemoved(id: string): boolean {
  *  doubled batch it cleared), not one it heard from another page. */
 export function layoutRemovedHere(id: string): boolean {
   return removedLocallyIds.has(id);
+}
+
+/** Whether the item a page shows under an id stays: `records`
+ *  (readAllFurniture) has a record under the id, and of the item's kind, or
+ *  of another kind that no change of the bound layout wrote over the item
+ *  (layoutRemoved). With no record the item goes. With one of another kind
+ *  that a change this page heard or made put there, it goes as an item
+ *  removed, and what the layout holds under the id is built in its place
+ *  (World.reconcileFurniture: a page that came in while a sofa lay under a
+ *  table's id shows the table once the table is put back). An item the page
+ *  brought from the room it left stays as it was where the room it joined
+ *  holds another kind under the id, as it always did: nothing here took it
+ *  out, and its teardown would write to what the item that stands here keeps
+ *  in the doc (a table's state and bets). No tool of a room writes one id
+ *  for two kinds (ids carry the kind), so only a crafted record meets one.
+ *  Where the item stands is not asked: a move keeps it. */
+export function layoutKeeps(item: { id: string; kind: FurnitureKind }, records: ReadonlyMap<string, FurnitureRecord>): boolean {
+  const record = records.get(item.id);
+  return record !== undefined && (record.kind === item.kind || !removedIds.has(item.id));
 }
 
 export function subscribeFurniture(listener: () => void): () => void {
