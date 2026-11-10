@@ -136,10 +136,12 @@ jobs:
           cut_short() { sed -E 's/t?xch1[a-z0-9]{20,}/<address>/g; s/([0-9a-fA-F]{8})[0-9a-fA-F]{56,}/\1…/g'; }
           for f in node-default-1.log node-default-2.log node-wallet.log; do
             echo "=================== $f ($(wc -l < "$f" 2>/dev/null || echo 0) lines) ==================="
-            [ -f "$f" ] && cut_short < "$f" | head -400
+            if [ -f "$f" ]; then cut_short < "$f" | head -400; fi
           done
           mkdir -p logs-out
-          for f in probe.log node-default-1.log node-default-2.log node-wallet.log; do [ -f "$f" ] && cut_short < "$f" > "logs-out/$f"; done
+          for f in probe.log node-default-1.log node-default-2.log node-wallet.log; do
+            if [ -f "$f" ]; then cut_short < "$f" > "logs-out/$f"; fi
+          done
 
       - name: Names this machine asked DNS for (Linux)
         if: always() && runner.os == 'Linux'
