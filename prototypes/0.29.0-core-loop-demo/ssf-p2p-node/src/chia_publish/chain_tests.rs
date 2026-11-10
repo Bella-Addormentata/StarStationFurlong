@@ -321,7 +321,13 @@ async fn setup_on(net: crate::chia_network::ChiaNet) -> Setup {
     let money = PeerLane::new(lane.clone(), Trust::Agreed);
     let carrier = PeerLane::new(lane.clone(), Trust::Carrier);
     let fuse = std::sync::Mutex::new(GiftFuse::new());
-    Setup { net, chain, a, b, lane, money, carrier, lease: WalletLease::new(), fuse, clock: Instant::now() }
+    // LIST ME is on in these tests' world: every listing and knock here is
+    // written on the switch's word, so the lease may send its saved bundle
+    // again (`Resend::WhileListed`). A test of the switch turned off names
+    // its own.
+    let lease = WalletLease::new();
+    lease.ask_list_me(|| true);
+    Setup { net, chain, a, b, lane, money, carrier, lease, fuse, clock: Instant::now() }
 }
 
 /// [`push_for`] of a write the wallet key `payer` signs and pays for.
@@ -5158,6 +5164,57 @@ async fn a_reorg_that_drops_a_landed_knock_has_its_saved_bundle_pushed_again_whi
     let after = s.knock(89, &node, &req, 0, || Ok(None), 3).await.map(|(_, write)| write);
     assert!(knocked_already(&after), "{:?}", after.as_ref().err());
     assert_eq!(s.sent(), HashSet::from([bundle.name()]), "one bundle, never built again");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// 📖 The same reorganization with LIST ME turned off meanwhile (stage 4
+/// design §4.5 (6)). The knock was written on the switch's word, so the
+/// lease holds its saved bundle back: the knock reads pending, K(h)'s spend
+/// stays parked and F reserved, and nothing goes to the peers again, at the
+/// watcher's question or at a writer's. Before, the probe pushed the bundle
+/// whatever the switch said, and a knock the player had stopped landed
+/// again. Turned back on, the probe pushes it and it lands as above.
+#[tokio::test]
+async fn a_reorg_that_drops_a_landed_knock_sends_nothing_again_while_list_me_is_off() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut s = setup().await;
+    let list_me = Arc::new(AtomicBool::new(true));
+    s.lease.ask_list_me({
+        let on = list_me.clone();
+        move || on.load(Relaxed)
+    });
+    let (f, _) = ready_dish(&s, 10).await;
+    let node = iroh::SecretKey::generate();
+    let (req, _) = host_card([0x89; 32]);
+    let key = knock_key(89, &req, 0);
+    let g = gift(&key, f);
+    let (hint, write) = s.knock(89, &node, &req, 0, || Ok(None), 1).await.unwrap();
+    let bundle = s.chain.received().last().cloned().expect("the knock was sent");
+    let landed = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Confirmed { height: landed, seen_at: Some(landed) });
+
+    // UNLIST ME, and then the knock's block goes.
+    list_me.store(false, Relaxed);
+    s.chain.reorg(1).await;
+    assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Pending);
+    assert!(s.lease.is_parked(&f.coin_id()), "parked again");
+    let waiting = s.knock(89, &node, &req, 0, || Ok(None), 2).await.map(|(_, write)| write);
+    assert_eq!(waited(&waiting), Some(BurnerWait::Held), "K(h)'s spend is still the lease's");
+    assert!(s.chain.mempool().is_empty(), "off: the saved bundle stays with the node");
+    assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Pending, "the watcher's question sends nothing either");
+    assert!(s.chain.mempool().is_empty());
+    assert_eq!(s.chain.record(g.coin_id()), None, "g is on no chain");
+    assert!(s.lease.is_parked(&f.coin_id()), "and F stays reserved");
+
+    // LIST ME again: the probe pushes the one bundle, and it lands.
+    list_me.store(true, Relaxed);
+    let waiting = s.knock(89, &node, &req, 0, || Ok(None), 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&waiting), Some(BurnerWait::Held));
+    assert_eq!(s.chain.mempool(), vec![bundle.name()], "on again: the probe pushed the saved bundle");
+    let again = s.chain.farm().await;
+    assert_eq!(s.judge_split(hint, write.coins, write.memo, write.spend).await, WriteStanding::Confirmed { height: again, seen_at: Some(again) });
+    assert_eq!(s.sent(), HashSet::from([bundle.name()]), "one bundle, never built again");
+    assert_eq!(s.gifts(0), 1, "no second gift");
     assert!(s.chain.unanswered().is_empty());
 }
 
