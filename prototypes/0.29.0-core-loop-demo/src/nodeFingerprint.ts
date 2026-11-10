@@ -77,6 +77,15 @@ export interface LocalFingerprint {
    *  not the switch sends no `setting`. Kept only in the node's shape
    *  (`parseChiaLane`). */
   chia_lane?: ChiaLane;
+  /** 📖 LIST ME, the player's switch for this station's Phone Book writes
+   *  on the node's network (the node's chia_listing.rs `ListingView`):
+   *  whether the node may write its listing and its knocks there, whether
+   *  the player turned the switch or its default stands, and whether
+   *  `SSF_CHIA_FINDABLE=0` holds the listing off all the same (listMe.ts).
+   *  Sent by every node that has the switch (`POST /api/chia/listing`);
+   *  absent from older nodes and from builds that only read the chain. Kept
+   *  only in the node's shape (`parseChiaListing`). */
+  chia_listing?: ChiaListing;
   /** 📦 This launch's blob-lane token (64 hex): what the node's `/blob` and
    *  `/api/blob/` routes ask for beside an allowed Origin (blobLane.ts).
    *  Absent while the node runs without the lane, and from older nodes. */
@@ -282,6 +291,40 @@ export function parseChiaLane(v: unknown): ChiaLane | undefined {
   return lane;
 }
 
+/** 📖 What the node's LIST ME switch says for its network (the node's
+ *  chia_listing.rs). It says what the switch says, never whether anything
+ *  was written: the listing's own readout is `chia_presence`. */
+export interface ChiaListing {
+  /** LIST ME is on: by the player's word, or by the network's default (on
+   *  for a test network, off where the coins are real money). */
+  on: boolean;
+  /** The player turned the switch on this network (`false`: its default
+   *  stands, or its file cannot be read). */
+  chosen: boolean;
+  /** `SSF_CHIA_FINDABLE=0` in the node's environment holds the listing off
+   *  whatever `on` says; the knocks follow `on`. */
+  held?: true;
+  /** The switch's file is there but cannot be read, so it counts as off. */
+  damaged?: true;
+}
+
+/** The node's `chia_listing` in its own shape, or undefined when `on` or
+ *  `chosen` is not a boolean (or it is not an object at all): a switch this
+ *  page cannot read is no switch, and the page then offers none. `held` and
+ *  `damaged` are kept only as true. A switch that cannot be read never
+ *  reads as on here, whatever else the answer says. Nothing else is
+ *  copied. */
+export function parseChiaListing(v: unknown): ChiaListing | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.on !== 'boolean' || typeof r.chosen !== 'boolean') return undefined;
+  const damaged = r.damaged === true;
+  const listing: ChiaListing = { on: r.on && !damaged, chosen: r.chosen };
+  if (r.held === true) listing.held = true;
+  if (damaged) listing.damaged = true;
+  return listing;
+}
+
 const PRESENCE_STATES: ReadonlySet<string> = new Set<ChiaPresenceState>(['listed', 'sent', 'outdated', 'unlisted']);
 
 const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
@@ -372,6 +415,8 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (wallet) fp.chia_wallet = wallet;
   const lane = parseChiaLane(r.chia_lane);
   if (lane) fp.chia_lane = lane;
+  const listing = parseChiaListing(r.chia_listing);
+  if (listing) fp.chia_listing = listing;
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;

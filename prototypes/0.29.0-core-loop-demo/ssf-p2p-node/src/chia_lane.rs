@@ -146,17 +146,18 @@ pub fn open(room_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 /// default (#231 D3, `SSF_CHIA_WATCH=0` turns the watcher off), publishing waits
 /// for the SSF wallet (`wallet_on`: it loaded at this start, after the Bank's
 /// switch or `SSF_CHIA_LANE=1` turned it on, chia_wallet_switch.rs) and a
-/// build with the `chia-publish` feature. Off a test network (`net`) the SSF
-/// wallet pays for no chain write (stage 4 design §4.5 (1),
-/// `chia_publish::money_memo_refusal`), so publishing is off there whatever
-/// the wallet does, and the line says so. While Chia is off at the start
-/// (`off` names what holds it off, chia_strict.rs) reads and publishing are
-/// both off, and the line says why on every network.
+/// build with the `chia-publish` feature, and the player's LIST ME for the
+/// network (`listed`, chia_listing.rs: off where the coins are real money
+/// until the player turns it on, stage 4 design §4.5 (6)). With LIST ME off
+/// publishing is off whatever the wallet does, and the line says so. While
+/// Chia is off at the start (`off` names what holds it off, chia_strict.rs)
+/// reads and publishing are both off, and the line says why on every
+/// network.
 pub fn startup_status(
-    net: crate::chia_network::ChiaNet,
     secret: &iroh::SecretKey,
     live_addrs: &[String],
     wallet_on: bool,
+    listed: bool,
     off: Option<crate::chia_strict::OffSource>,
 ) {
     let now = std::time::SystemTime::now()
@@ -190,7 +191,7 @@ pub fn startup_status(
     };
     let publish = match off {
         Some(source) if cfg!(feature = "chia-publish") => strict_status(source),
-        _ => publish_status(cfg!(feature = "chia-publish"), net.is_test(), wallet_on, crate::chia_wallet_switch::env_switch()).to_string(),
+        _ => publish_status(cfg!(feature = "chia-publish"), listed, wallet_on, crate::chia_wallet_switch::env_switch()).to_string(),
     };
     println!(
         "⛓️ ChiaHub lane: crypto self-test {} · chain reads {reads} · publishing {publish}",
@@ -205,23 +206,23 @@ fn strict_status(source: crate::chia_strict::OffSource) -> String {
 }
 
 /// The startup line's word on publishing: whether this build can, whether
-/// the SSF wallet pays for a chain write on this network (`pays`: on a test
-/// network only, the rule of `chia_publish::money_memo_refusal`), whether it
-/// loaded, and what holds it off. Where it pays for none, turning it on in
-/// the Bank publishes nothing either, so the line sends no one there, and
-/// says what is not written yet: the listing and the knocks, which wait
-/// for the player's LIST ME (stage 4 design §4.5 (6)). It does not say the
-/// lane only reads there: a beacon the operator turned on is written from
-/// a key of its own.
-pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
+/// LIST ME is on for this network (`listed`, chia_listing.rs), whether the
+/// SSF wallet loaded, and what holds it off. With LIST ME off, turning the
+/// wallet on in the Bank publishes nothing either, so the line sends no one
+/// there: it names the switch, and what is not written while it is off, the
+/// listing and the knocks (stage 4 design §4.5 (6)). It does not say the
+/// lane only reads then: a beacon the operator turned on is written from a
+/// key of its own. Who pays is not this line's: on a test network the SSF
+/// wallet may, and off one the lobby dish does (`chia_publish::burner_paths`).
+pub fn publish_status(built: bool, listed: bool, wallet_on: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
     if !built {
         "not built"
-    } else if wallet_on && pays {
+    } else if wallet_on && listed {
         "on (the SSF wallet is on)"
     } else if env == crate::chia_wallet_switch::EnvSwitch::Off {
         "off (SSF_CHIA_LANE holds the SSF wallet off)"
-    } else if !pays {
-        "off (on this network the SSF wallet pays for no chain write, and no listing or knock is written yet)"
+    } else if !listed {
+        "off (LIST ME is off for this network: no listing or knock is written until it is turned on in the SpacePhone's Network settings)"
     } else {
         "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
     }
@@ -1040,36 +1041,39 @@ mod p6b_tests {
         assert_ne!(room_lane_id("lobby"), room_lane_id("lobbz"));
     }
 
-    /// The startup line's word on publishing, for each network: testnet11
-    /// keeps every text it had; off a test network the SSF wallet pays for
-    /// no chain write (stage 4 design §4.5 (1)), so publishing is off there,
-    /// wallet on or not, and the line sends no one to the Bank for it. It
-    /// names what is not written yet, the listing and the knocks, and does
-    /// not say the lane only reads the chain.
+    /// The startup line's word on publishing. With LIST ME on (where a
+    /// test network starts, stage 4 design §4.5 (6)) every text is the one
+    /// testnet11 had. With LIST ME off (where a network of real coins
+    /// starts) publishing is off, wallet on or not, and the line sends no
+    /// one to the Bank for it: it names the switch and what is not written
+    /// while it is off, the listing and the knocks, and does not say the
+    /// lane only reads the chain.
     #[test]
-    fn the_publish_status_says_publishing_is_on_only_where_the_ssf_wallet_pays() {
-        use crate::chia_network::ChiaNet::{self, Mainnet, Testnet11};
+    fn the_publish_status_says_publishing_is_on_only_where_list_me_is() {
         use crate::chia_wallet_switch::EnvSwitch::{Off, On, Unset};
         const ON: &str = "on (the SSF wallet is on)";
         const HELD_OFF: &str = "off (SSF_CHIA_LANE holds the SSF wallet off)";
         const BANK: &str = "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)";
-        const PAYS_NONE: &str = "off (on this network the SSF wallet pays for no chain write, and no listing or knock is written yet)";
-        assert!(!PAYS_NONE.contains("only reads"), "a beacon the operator turned on is written there from a key of its own");
+        const UNLISTED: &str = "off (LIST ME is off for this network: no listing or knock is written until it is turned on in the SpacePhone's Network settings)";
+        assert!(!UNLISTED.contains("only reads"), "a beacon the operator turned on is written from a key of its own");
         for env in [Unset, On, Off] {
-            assert_eq!(publish_status(true, Testnet11.is_test(), true, env), ON, "{env:?}");
-            assert_eq!(publish_status(true, Testnet11.is_test(), false, env), if env == Off { HELD_OFF } else { BANK }, "{env:?}");
+            assert_eq!(publish_status(true, true, true, env), ON, "{env:?}");
+            assert_eq!(publish_status(true, true, false, env), if env == Off { HELD_OFF } else { BANK }, "{env:?}");
             for wallet_on in [false, true] {
-                let line = publish_status(true, Mainnet.is_test(), wallet_on, env);
-                assert_eq!(line, if env == Off { HELD_OFF } else { PAYS_NONE }, "{env:?} wallet_on={wallet_on}");
+                let line = publish_status(true, false, wallet_on, env);
+                assert_eq!(line, if env == Off { HELD_OFF } else { UNLISTED }, "{env:?} wallet_on={wallet_on}");
                 assert!(!line.contains("Bank"), "{line}");
             }
         }
-        for net in ChiaNet::ALL {
+        for listed in [false, true] {
             for wallet_on in [false, true] {
-                assert_eq!(publish_status(false, net.is_test(), wallet_on, Unset), "not built", "a read-only build says only that");
+                assert_eq!(publish_status(false, listed, wallet_on, Unset), "not built", "a read-only build says only that");
             }
-            #[cfg(feature = "chia-publish")]
-            assert_eq!(net.is_test(), crate::chia_publish::money_memo_refusal(net).is_none(), "{net:?}");
+        }
+        // The switch starts where the line's two halves say: on for a test
+        // network, off where the coins are real.
+        for net in crate::chia_network::ChiaNet::ALL {
+            assert_eq!(crate::chia_listing::default_on(net), net.is_test(), "{net:?}");
         }
     }
 }

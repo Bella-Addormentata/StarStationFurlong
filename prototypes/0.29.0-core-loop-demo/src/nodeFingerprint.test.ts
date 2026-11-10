@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11, addressOn, isAddressOn } from './chiaNetwork';
-import { parseChiaLane, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
+import { parseChiaLane, parseChiaListing, parseChiaPresence, parseChiaWallet, parseNodeFingerprint } from './nodeFingerprint';
 
 const BYTES = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 const HEX = [...BYTES].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -158,6 +158,34 @@ describe('parseNodeFingerprint', () => {
     }
     // Nothing else is copied.
     expect(fp({ off: true, source: 'setting', setting: 'off', at: 1_700_000_000, path: '/home/x/chia_lane_off.json' })).toEqual({ off: true, source: 'setting', setting: 'off' });
+  });
+
+  it('keeps what LIST ME says only in the node\'s own shape, and never reads a damaged switch as on (📖 LIST ME)', () => {
+    const fp = (chia_listing: unknown) => parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443, chia_listing })?.chia_listing;
+    // Every shape the node sends (chia_listing.rs ListingView).
+    expect(fp({ on: true, chosen: false })).toEqual({ on: true, chosen: false });
+    expect(fp({ on: false, chosen: false })).toEqual({ on: false, chosen: false });
+    expect(fp({ on: true, chosen: true })).toEqual({ on: true, chosen: true });
+    expect(fp({ on: false, chosen: true })).toEqual({ on: false, chosen: true });
+    expect(fp({ on: true, chosen: true, held: true })).toEqual({ on: true, chosen: true, held: true });
+    expect(fp({ on: false, chosen: false, held: true })).toEqual({ on: false, chosen: false, held: true });
+    expect(fp({ on: false, chosen: false, damaged: true })).toEqual({ on: false, chosen: false, damaged: true });
+    // A switch that cannot be read counts as off, whatever `on` says.
+    expect(fp({ on: true, chosen: true, damaged: true })).toEqual({ on: false, chosen: true, damaged: true });
+    // An older node sends no switch at all.
+    expect(parseNodeFingerprint({ hex: HEX, base64: B64, port: 4443 })?.chia_listing).toBeUndefined();
+    // `held` and `damaged` only as true.
+    for (const junk of [false, 'true', 1, null, 0]) {
+      expect(fp({ on: true, chosen: true, held: junk, damaged: junk })).toEqual({ on: true, chosen: true });
+    }
+    // An `on` or a `chosen` that is not a boolean, or no object at all: no
+    // switch, never one guessed as on.
+    for (const bad of [null, undefined, 'on', 1, true, [], {}, { on: true }, { chosen: true }, { on: 'true', chosen: true }, { on: 1, chosen: false }, { on: true, chosen: null }]) {
+      expect(fp(bad)).toBeUndefined();
+      expect(parseChiaListing(bad)).toBeUndefined();
+    }
+    // Nothing else is copied.
+    expect(fp({ on: false, chosen: true, at: 1_700_000_000, path: '/home/x/chia_listing.json' })).toEqual({ on: false, chosen: true });
   });
 
   it('keeps the node\'s Phone Book readout only in the node\'s own shape (📖 top bar icon)', () => {
