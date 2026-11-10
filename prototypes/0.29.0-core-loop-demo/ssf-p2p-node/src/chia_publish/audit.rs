@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(code_lines(publish, "audit.listing("), ["for line in audit.listing(root, &hub.contact_key, era) {"]);
         assert_eq!(code_lines(publish, "audit_knock("), [
             "fn audit_knock(",
-            "let audit_line = audit_knock(&mut audit, listing_root.as_ref(), net, &req, &room_key, era, &done);",
+            "let audit_line = audit_knock(&mut audit, listing_root, net, &req, &room_key, era, &done);",
         ]);
         assert_eq!(code_lines(publish, "audit_line("), Vec::<&str>::new(), "no line is made in chia_publish.rs itself");
         assert_eq!(code_lines(publish, "audit_of("), Vec::<&str>::new());

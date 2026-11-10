@@ -6739,8 +6739,14 @@ fn start_publisher(hub: &SharedHub, iroh_endpoint: &IrohEndpoint, chia_sk: chia_
     let hub_hb = hub.clone();
     let iroh_hb = iroh_endpoint.clone();
     let iroh_sk_hb = hub.secret_key.clone();
+    // ⛓️ Stage 4 design §3.4: the heartbeat is handed the publisher's keys,
+    // made here from the wallet key for the process's network, and no
+    // wallet key. Off a test network they keep none. The hub still holds
+    // the wallet key for the Bank and the dish (`HubState::chia_wallet`),
+    // and the publisher's code reads it nowhere (`chia_publish/keys.rs`).
+    let keys = chia_publish::PublisherKeys::of(net, chia_sk);
     tokio::spawn(async move {
-        chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, chia_sk).await;
+        chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, keys).await;
     });
 }
 
