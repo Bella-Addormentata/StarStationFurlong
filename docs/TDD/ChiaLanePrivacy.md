@@ -57,7 +57,7 @@ The node subscribes to nothing. It asks again on a 60-second tick, so a peer see
 
 There are two kinds of request (`chia_chain.rs`):
 - A **carrier** read (`connect_carrier`) goes to one peer: a connected pin first, else the first connection, and one stand-in if that peer is silent.
-- An **agreed** read (`connect`) and every push go to the agreed set: two peers from different sources and network groups, or the pin alone in pin-only mode. A spend that is still settling is handed to the agreed set of that moment again (`spend_live`), which may be other peers than the ones that first saw it.
+- An **agreed** read (`connect`) and every push go to the agreed set: two peers from different sources and network groups, or the pin alone in pin-only mode. A spend whose inputs the chain still shows unspent is handed to the agreed set of that moment again (`spend_live`), which may be other peers than the ones that first saw it.
 
 | What is asked | When | Lane | What it shows the peer |
 |---|---|---|---|
@@ -82,12 +82,12 @@ Outside the lane, the node also asks two websites for its public IPv4 address ov
 |---|---|---|
 | **A**, anyone with the chain | No key | The lobby dish's address (it is computed from the welcome room's key, which ships in every build: `lobby` in `chia_faucet.rs`), every claim from it and the address each claim paid. Every Star Station dish, by the pinned module hash each claim reveals (`FAUCET_MOD_HASH`). When each record was written and, from its length, its kind. Every beacon's node id. On the wallet path (§7): a station's whole line of writes at one address, and whoever funded that address. A cannot open a listing or a knock, and on the burner path cannot tell which burner is whose. |
 | **A+**, many full nodes | A's view, and the time each node first saw a bundle | A guess at the IP a bundle started from. |
-| **B**, a card holder | Station X's contact key | X's listing hint for any era, and the key that opens every listing under it: X's node id and its public addresses, week by week, on both networks, for as long as X keeps the same `contact.key`. On the wallet path B can also follow the listing's coin to X's wallet address and its other writes. |
-| **C**, a pass holder of a private room | The room key, and the member cards the pass carries | Everything B can, for each member whose card is in the pass. Each such member's inbox hint for that room, so how many knocks were filed there and when; C cannot open them. On testnet11, that room's v1 records, home-network addresses included. |
-| **A host that was knocked on** | Its own node key, the room key | The knock: the knocker's node id and the room, and the knocker's contact key when it was handed out, which makes the host a card holder (B) of the knocker. |
+| **B**, a card holder | Station X's contact key | X's listing hint for any era, and the key that opens every listing under it: X's node id and its public addresses, each with a flag saying whether the node took an inbound connection there, and the time of every write, week by week, on both networks, for as long as X keeps the same `contact.key`. On the wallet path B can also follow the listing's coin to X's wallet address and its other writes. |
+| **C**, a pass holder of a private room | The room key, and the member cards the pass carries | Everything B can, for each member whose card is in the pass. Each such member's inbox hint for that room, so how many knocks were filed there and when; C cannot open them, but on the wallet path each knock's coin shows its knocker's wallet address. On testnet11, that room's v1 records, home-network addresses included. |
+| **A host that was knocked on** | Its own node key, the room key | The knock: the knocker's node id and the room, and the knocker's contact key when it was handed out, which makes the host a card holder (B) of the knocker. On the wallet path, also the knocker's wallet address: the knock is a spend of the wallet's coin. |
 | **D**, the full nodes the station talks to | The connection | §3. |
 | **E**, whoever can read the data folder | The files | §9. |
-| **F**, Sage or the Chia wallet on the same 24 words | The words | The SSF wallet's coins at the wallet's own derivation path. Burner keys are off every wallet path (`burner_keys_are_off_every_wallet_path_and_off_the_master` in `chia_burner.rs`), so F never lists or co-spends a burner coin. On the wallet path F sees the coin that pays for writes as an ordinary coin and can spend it. |
+| **F**, Sage or the Chia wallet on the same 24 words | The words | The SSF wallet's coins at the wallet's own derivation path. Burner keys are made by hashing, not from the wallet's key tree, so they are on no wallet path and F never lists or co-spends a burner coin. (`burner_keys_are_off_every_wallet_path_and_off_the_master` in `chia_burner.rs` pins that for sample listing and knock keys against the master key and the first 1,001 wallet indices, hardened and unhardened; the beacon key has a smaller test of its own in `chia_wallet.rs`.) On the wallet path F sees the coin that pays for writes as an ordinary coin and can spend it. |
 
 The burner path closes the on-chain links for A, B and C. It does nothing about D or E.
 
@@ -96,42 +96,43 @@ The burner path closes the on-chain links for A, B and C. It does nothing about 
 This is the burner path: the only path off a test network, and on testnet11 the path a node takes with `SSF_CHIA_BURNERS=1` (`burners_of` in `chia_publish.rs`). The stage 4 design that code comments cite by section is not a file in this repository; this section and §6 restate what of it was built.
 
 **Keys** (`chia_burner.rs`, `chia_publish/keys.rs`). W is the SSF wallet's key and G the network's genesis challenge.
-- The root R is `blake3::derive_key("ssf-chia-burner-root-v1", W ‖ G)`. It lives in memory only and is made once per run; nothing new is written to disk.
+- The root R is `blake3::derive_key("ssf-chia-burner-root-v1", W ‖ G)`. It lives in memory only and is made once per run; no new secret is written to disk (the burners' puzzle hashes are: §9).
 - A burner key is `blake3::keyed_hash(R, "ssf-chia-burner-v1" ‖ kind ‖ era ‖ slot)`, used as a BLS seed.
 - **P(e)**, the listing key: the slot is the era's listing hint. One key per era and per contact key.
 - **K**, a knock key: the slot is made from the inbox hint and the host's node id (`knock_slot`). One key per host, room and era. The design keyed it on the inbox hint alone; binding the node id is a departure, so two hosts that share a contact key get two keys, which reads on chain as two knockers under one inbox hint.
 - **B**, the beacon key, is `blake3::derive_key("ssf-chia-beacon-wallet-v1", W)`: the same key in every era. It differs per network only because each network has its own wallet words.
+- Two stations on the same wallet words share R, and so B, their slots and every knock key. They share a listing key only if they also share `contact.key`.
 - A burner key leaks nothing about W, R or another burner (**inferred**: blake3 in keyed mode is a pseudo-random function).
 - The publisher's key set (`PublisherKeys`) holds no wallet key off a test network. The process still holds the wallet key there for the Bank and the dish; that the publisher never reads it is pinned by a source-scan test, not by the types.
 
 **Coins** (`chia_publish/claim_write.rs`).
-- A key's first write is one bundle of two spends: a lobby dish coin F, claimed with no key, and the gift g, a 1-mojo coin the claim creates at the burner's address and the burner spends at once. The outputs are F's remainder back to the dish, g, and a 1-mojo coin at the burner's address carrying the two memos (hint, body). One signature, the burner's, at fee 0. No coin of the wallet is in it.
+- A key's first write is one bundle of two spends: a lobby dish coin F, claimed with no key, and the gift g, a 1-mojo coin the claim creates at the burner's address and the burner spends at once. The outputs are F's remainder back to the dish (when F held more than the gift), g, and a 1-mojo coin at the burner's address carrying the two memos (hint, body). One signature, the burner's, at fee 0. No coin of the wallet is in it.
 - A rewrite spends the key's 1-mojo coin to a 1-mojo coin at the same address. A knock key writes once.
 - Before it signs, the builder refuses a bundle that breaks a rule (`broken_rules`): exactly one input at the burner's address (R1); no input that is neither the burner's nor a dish's, so never a wallet coin (R2); every output is at the burner's address, or a dish's remainder back to its own dish (R3); one dish coin at most (R4); the burner's spend makes one 1-mojo coin and nothing else, and nothing is left over as a fee (R5); no dish but this network's lobby (R6); the burner's input is a coin of exactly 1 mojo (R7).
-- A fuse stops funding after 16 burners in an era (`MAX_GIFTS_PER_ERA`, `gift_fuse.json`), so a fault or a copied folder cannot drain the dish through one station.
+- A fuse stops funding after 16 gifts in an era (`MAX_GIFTS_PER_ERA`), so a fault cannot drain the dish through one station. The count is a local file, `gift_fuse.json`: a copy of the folder, or a folder that lost the file, starts its own 16.
 - The dish coin is picked at random among the ready ones. Burner coins are never swept.
 
 **Timing** (burner path only).
-- **T1.** The era's first listing is due at a secret slot in the era's first day: `slot(kind, era)`, a number from 0 to 4,607 blocks made from R (`SLOT_BLOCKS`). Two stations on the same wallet words share their slots.
+- **T1.** The era's first listing is due at a secret slot in the era's first day: `slot(kind, era)`, a number from 0 to 4,607 blocks made from R (`SLOT_BLOCKS`).
 - **A newcomer** writes at its next tick instead. The node decides this from its one local mark in `publish_marks.json`, not from the chain: it waits for the slot only when that mark is last era's, its own, and confirmed or seen on chain.
 - **T2.** A node that first sees an era after its slot waits a fresh random 0 to 192 blocks, about an hour at most (`LATE_START_MAX_BLOCKS`). A restart draws again. Not covered: a run that saw the era before its slot and then slept past it writes at its next tick after waking.
-- **T3.** An address change waits out the 10-minute debounce and then 0 to 32 more blocks (`CHANGE_JITTER_MAX_BLOCKS`). The retry of a write that did not confirm within 30 minutes is not jittered, nor is the rewrite of a write the chain dropped.
-- **T4.** Two pushes of one station from different keys land at least 32 blocks apart: the later one waits 32 to 64 blocks from the other's landing (`SPACING_MIN_BLOCKS`, `SPACING_MAX_BLOCKS`). A spend stuck for more than 20 minutes holds the others no longer, and a restart forgets the draw.
+- **T3.** An address change is written once 10 minutes have passed since the station's last write (not since the change), and then 0 to 32 more blocks (`CHANGE_JITTER_MAX_BLOCKS`). A change since last era's listing takes the slot's place: that station's first listing of the era leaves 0 to 32 blocks after it first sees the era, not at its slot. The retry of a write that did not confirm within 30 minutes is not jittered, nor is the rewrite of a write the chain dropped.
+- **T4.** A burner's push lands at least 32 blocks from any other spend of the station: it waits 32 to 64 blocks from the other's landing (`SPACING_MIN_BLOCKS`, `SPACING_MAX_BLOCKS`). A spend stuck for more than 20 minutes holds the others no longer, and a restart forgets the draw. Only a burner's push is spaced. A spend the SSF wallet pays for on testnet11 (a v1 room record, a GIVE) is not, so it can land right beside a burner's.
 - **T5.** The beacon has a slot of its own and obeys T4.
 - Kept from before: one try per 60-second tick, in the order listing, knock, beacon.
 
-**Another copy.** A spend of the listing key's coin that this station's lease never parked means another copy of the station is writing (the same wallet words and contact key). Listing, knocks and beacon pause for two hours, and until the next era the second time (`chia_publish/foreign_pause.rs`).
+**Another copy.** A spend of the listing key's coin that this station's lease never parked is taken to mean that another copy of the station is writing (the same wallet words and contact key); a lease file that was lost or restored from a backup can look the same. Listing, knocks and beacon pause for two hours, and until the next era the second time (`chia_publish/foreign_pause.rs`). Only the listing key is watched, so a copy that only knocks or beacons is not noticed.
 
-**The lease.** Each spend is parked and its signed bundle saved in `wallet_lease.json` before it is pushed, per paying key, and handed to the peers again while it settles 32 blocks deep (`SETTLED_DEPTH`). With LIST ME off, a listing's or a knock's saved bundle is not handed out again; the beacon's is.
+**The lease.** Each spend is parked and its signed bundle saved in `wallet_lease.json` before it is pushed, per paying key. While the chain still shows the spend's inputs unspent, the bundle is handed to the peers again. Once they are spent it is kept until the spend is 32 blocks deep (`SETTLED_DEPTH`), and goes out again only if a reorganisation undoes the spend. With LIST ME off, a listing's or a knock's saved bundle is not handed out again; the beacon's is, except from a lease file an older build wrote, where every spend is held as LIST ME's. Off a test network a saved bundle of the SSF wallet's own never goes out again.
 
 ## 6. What stays visible
 
 What is still true with all of §5 working.
 
 **Funding and shape**
-1. Every burner's first coin is a gift from the lobby dish. The claim shows the burner's address, the dish and the height, and the dish is recognisable by its module hash. Anyone can list every burner and count Star Station's writers per era. Which burner is whose is not shown.
+1. A burner's first coin is a gift from the lobby dish, unless a 1-mojo coin was already waiting at its address (5). The claim shows the burner's address, the dish and the height, and the dish is recognisable by its module hash. Anyone can list every burner and count Star Station's writers per era. Which burner is whose is not shown.
 2. Whoever gives the mainnet lobby dish its coin is tied to Star Station for ever. The plan is a quiet gift from Sage at stage 5.
-3. The shape of a write is recognisable (**inferred** from the shapes): one coin in and one 1-mojo coin out at fee 0, two memos, a 32-byte hint and a body of 360, 392 or 320 bytes, and claims from the pinned module. The body's length shows the kind. Nothing is padded.
+3. The shape of a write is recognisable (**inferred** from the shapes): one coin in and one 1-mojo coin out at fee 0, two memos, a 32-byte hint and a body of 360, 392 or 320 bytes, and claims from the pinned module. The body's length shows the kind: each kind has one fixed length, and the three are not padded to a common one.
 4. One 1-mojo coin per key stays on chain for ever.
 5. Anyone can pay a burner's address. A coin of any other amount is never written from, but a stranger's coin of exactly 1 mojo is, oldest first, and then becomes the parent of the station's next write. That ties the burner to the stranger's coin and says nothing about the station.
 6. Anyone who holds a pending bundle can attach a fee coin of their own and replace it (**inferred**: Chia's replace-by-fee takes a superset bundle with a higher fee, and BLS signatures aggregate without the signer). Same effect as 5.
@@ -139,17 +140,17 @@ What is still true with all of §5 working.
 
 **Time**
 
-8. Every write is a dated public event. T1 to T5 hide the era's start and the pairing of one station's writes. They cannot hide a player who is online at the same hours each week, or an IP that changes at the same hour. The gaps named in §5 (a machine that slept past its slot, an unjittered retry, a draw forgotten at a restart) are real, and every push leaves on a 60-second tick whose phase is fixed for the run.
-9. All of an era's listings come from one key, so its rewrites are linked to each other, and their count (9 at most) is the number of times the station's addresses changed that era.
-10. "k knocks were filed under one hint in era e" is visible to anyone, and a pass holder who holds the host's card knows which host and room that is.
-11. After a knock confirms at height h, both sides dial at h + 10n blocks for n from 1 to 6, then every 320 blocks for two eras. Someone who watches a station's network traffic can match its dials to the chain.
+8. Every write is a dated public event. T1 to T5 hide the era's start and the pairing of one station's writes. They cannot hide a player who is online at the same hours each week, or an IP that changes at the same hour. The gaps named in §5 are real: a machine that slept past its slot, a station whose address changed since last era, an unjittered retry, a draw forgotten at a restart, and on testnet11 a wallet-paid spend that is not spaced.
+9. All of an era's listings come from one key, so its rewrites are linked to each other. Their count (9 at most, by the node's own mark) shows how often the station wrote that era: its address changes, a change of an address's inbound flag, and retries.
+10. "k knocks were filed under one hint in era e" is visible to anyone, and a pass holder who holds the host's card knows which host and room that is. A station knocks on a host once an era at most, so k is close to the number of stations that knocked.
+11. After a knock confirms at height h, both sides dial at h + 10n blocks for n from 1 to 6, then every 320 blocks, for between one and two eras (`RENDEZVOUS_NEAR_STEP`, `RENDEZVOUS_FAR_STEP` in `chia_knock.rs`). Someone who watches a station's network traffic can match its dials to the chain.
 12. With few stations on mainnet, counts and times can pair a station's weeks statistically. The crowd grows with players.
 
 **Observers who hold more than the chain**
 
 13. The full nodes the station talks to (D) see its IP with everything in §3: its burners, its beacon, the dish, the hints of the contacts it reads, and its money address. No key scheme removes this. A full node of one's own (`SSF_CHIA_PEERS` with `SSF_CHIA_PIN_ONLY=1`) keeps it on one's own machine. Turning Chia off removes it.
 14. A card holder reads a station's whole address history for as long as the station keeps its contact key, by design. There is no control in the game that changes the key: deleting `contact.key` makes the node mint a new one at its next start, which stops this for the future only and makes every card handed out before stale.
-15. A private room's pass carries the room key and every member card the sender knows. So every pass holder is a card holder of those members, and can count the knocks filed for them in that room.
+15. A private room's pass carries the room key, the sender's own card while SHARE CARD is on, and the member cards that came in the pass the sender joined by, 64 at most. So every pass holder is a card holder of those members, and can count the knocks filed for them in that room.
 16. A knock hands the knocker's contact key to the host, when the knocker's card may be handed out in that room.
 17. Knocks have no forward secrecy. They are sealed to a key made from the host's long-term node key, so whoever later gets `iroh_node_id.key` and the room key can open every knock ever sent to that station for that room.
 18. The data folder (§9): the wallet key gives every burner key, and the state files tie the station's writes together.
@@ -166,14 +167,14 @@ What is still true with all of §5 working.
 
 | | testnet11 in a release build | testnet11 with `SSF_CHIA_BURNERS=1` | mainnet (development build only) |
 |---|---|---|---|
-| Who pays for a listing and a knock | The SSF wallet: its largest free coin, recreated whole at its own address at fee 0 (`publish_memo_on`, `build_publish_bundle`). Every listing, every knock, the money and whoever funded it are one line of coins. | Burner keys, funded by the lobby dish. If the wallet already wrote this era's listing, the burner writes nothing under that hint and the listing is not rewritten until the next era, so one hint never has two payers (`hint_rule_holds`). | Burner keys only. `refuse_money_memo` refuses any memo spend from the wallet's key. |
+| Who pays for a listing and a knock | The SSF wallet: its largest free coin, recreated whole at its own address at fee 0 (`publish_memo_on`, `build_publish_bundle`). Every listing, every knock, the money and whoever funded it are one line of coins. | Burner keys, funded by the lobby dish. If the wallet already wrote this era's listing, the burner writes nothing under that hint and the listing is not rewritten until the next era, so that one hint does not get two payers (`hint_rule_holds`). The rule reads the node's own mark, not the chain, so it holds only while `publish_marks.json` survives. | Burner keys only. `refuse_money_memo` refuses any memo spend from the wallet's key. |
 | Timing T1 to T5 | None: the wallet writes at the first tick of an era, and a beacon lands just after the listing. | On. | On. |
 | LIST ME starts | On. | On. | Off, until the player taps LIST ME and then CONFIRM. |
-| v1 room records | Written for a room whose Chia mesh switch is on, paid by the wallet. | The same, still paid by the wallet. | Never written (`publishable_rooms`); the switch is hidden. They are still read. |
+| v1 room records | Written for a room whose Chia mesh switch is on, paid by the wallet. | The same, still paid by the wallet and not spaced from the burner's writes. Both follow the same address change, the wallet's at once and the burner's 10 minutes or more later, which pairs the listing key with the wallet's address by time. | Never written (`publishable_rooms`); the switch is hidden. They are still read. |
 | Beacon, if lit | From B, which the operator funds by hand. | From B, funded by the lobby dish. | From B, funded by the lobby dish. |
 | TAKE A MOJO, GIVE | Yes. | Yes. | Refused, and nobody claims at any dish but the lobby (`dish_claim_refusal`). |
-| Test hooks | With their variables. | With their variables. | Ignored, with one line saying so. |
-| The 24 words | Shown by the desktop app in its own window. A page shows them only when the app's channel is off and the page's origin is listed in `SSF_BANK_DEV_PAGES`. | The same. | The desktop app's window only (`page_allowed`). A new wallet is made only while the app's channel is live (`may_mint`). |
+| Test hooks | With their variables. | With their variables. | The three that write are ignored, with one line saying so. `SSF_CHIA_RESOLVE_TEST=1`, which only reads one fixed test hint, still runs. |
+| The 24 words | Shown by the desktop app in its own window. A page shows them only in a run the desktop app did not start, when the page's origin is listed in `SSF_BANK_DEV_PAGES`, and until the words are marked saved. | The same. | The desktop app's window only (`page_allowed`). A new wallet is made only while the app's channel is live (`may_mint`). |
 | Hints and seals | No network tag. | No network tag. | The genesis challenge mixed in; the lobby dish has its own address. |
 
 So on testnet11 today nothing in §5 is in effect unless the operator sets the flag, and a card holder can follow a station's listing to its wallet address. Making burners the default on testnet11, and deleting the v1 writer, is the next code step after the two-machine drill (stage 4 PR 12).
