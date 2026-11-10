@@ -4268,13 +4268,30 @@ struct BeaconFacts<'a> {
     node_id: &'a str,
 }
 
+/// Notes a tick's agreed peak on the beacon's clock, on the burner path
+/// (`root`). The heartbeat calls it as soon as it has the tick's peak,
+/// before the listing's or a knock's arm can take the tick (one spend per
+/// tick), so the era's first peak is the first one this run saw (stage 4
+/// design §4.3 T2) and not the first one the beacon's own arm was reached
+/// on: a run that saw the era before the beacon's slot then draws no late
+/// start, and one that saw it past the slot counts its late start from
+/// that first peak, however many ticks the other arms took. Off the burner
+/// path (no root), or with no agreed peak (0), nothing is noted.
+fn beacon_sees_peak<R: rand::Rng + ?Sized>(clock: &mut BeaconClock, root: Option<&crate::chia_burner::BurnerRoot>, peak: u32, rng: &mut R) {
+    if let (Some(root), true) = (root, peak > 0) {
+        let era = chia_lane::era_of(peak);
+        clock.see_peak(era, peak, root.slot(chia_lane::KIND_BEACON, era), rng);
+    }
+}
+
 /// Whether the beacon arm tries a write this tick. Off the burner path it
 /// is main's rule, unchanged: a test network, reachable, serving the welcome
 /// room, the retry cadence passed, and no beacon of this era as this node
 /// id on record ([`beacon_due`]). On the burner path the era's beacon slot
-/// must be open as well ([`beacon_slot_open`]), and each tick's peak is
-/// noted on `clock` first, whatever else holds, so the era's first peak is
-/// the first one the arm saw.
+/// must be open as well ([`beacon_slot_open`]). The heartbeat has noted the
+/// tick's peak on `clock` by then ([`beacon_sees_peak`]); it is noted here
+/// again, whatever else holds, which changes nothing once the era's first
+/// peak is kept, so the rule is whole for a caller that noted none.
 fn beacon_arm_due<R: rand::Rng + ?Sized>(clock: &mut BeaconClock, f: &BeaconFacts<'_>, rng: &mut R) -> bool {
     if let Some(root) = f.root {
         clock.see_peak(f.era, f.peak, root.slot(chia_lane::KIND_BEACON, f.era), rng);
@@ -5453,6 +5470,13 @@ pub async fn heartbeat_loop(
                 agreed_peak = crate::chia_resolve::ChainPeak::new(peak, now_unix);
                 *hub.chia_peak.lock().unwrap() = agreed_peak;
             }
+        }
+        // The beacon's clock sees the tick's agreed peak here, before the
+        // listing's or a knock's arm can take the tick (§4.3 T2: the first
+        // agreed peak this run saw in the era), not only on the ticks that
+        // reach the beacon's own arm (`beacon_sees_peak`).
+        if beacon_on {
+            beacon_sees_peak(&mut beacon_clock, listing_root.as_ref(), peak, &mut rand::rngs::OsRng);
         }
         // Every era-bound write of this tick (presence, knock, beacon) is
         // signed for the era of that peak, and the era guard's budget
@@ -10322,6 +10346,62 @@ mod tests {
             assert!(beacon_arm_due(&mut untouched, &off, &mut other), "off the burner path the slot never holds it: {into} blocks in");
         }
         assert_eq!(untouched.first, None, "off the burner path the clock is never written");
+    }
+
+    /// T2's first peak is the first one the run saw, not the first tick the
+    /// beacon's arm was reached on (stage 4 design §4.3): the heartbeat
+    /// notes each tick's peak before the listing's or a knock's arm can
+    /// take the tick ([`beacon_sees_peak`]). A run that saw the era before
+    /// the beacon's slot on a tick another arm took draws no late start,
+    /// and is due at the slot; the same later tick with nothing noted
+    /// before it would have drawn one. A run that saw the era past the slot
+    /// counts its late start from that first peak, not from the first tick
+    /// its arm reached. Off the burner path, or with no agreed peak, nothing
+    /// is noted.
+    #[test]
+    fn the_beacon_clock_notes_a_peak_on_a_tick_another_arm_took() {
+        use crate::chia_burner::SLOT_BLOCKS;
+        let g = Gates::new();
+        let slot = |e: u64| g.root.slot(chia_lane::KIND_BEACON, e);
+        let e = (8u64..).find(|&e| (100..SLOT_BLOCKS - 100).contains(&slot(e))).unwrap();
+        let s = slot(e);
+        let past = block(e, s + 3);
+        // A seed whose late start, drawn at `past`, would not be over there.
+        let seed = (0..64u64)
+            .find(|&seed| {
+                let mut unnoted = BeaconClock::default();
+                !beacon_arm_due(&mut unnoted, &beacon_facts(&g, e, past), &mut seeded(seed)) && unnoted.first.is_some_and(|f| f.late.is_some_and(|d| d >= 2))
+            })
+            .expect("a seed that draws a late start of 2 blocks or more");
+
+        // Seen before the slot, on a tick the listing's arm took: no late
+        // start, so the beacon is due on the first tick past the slot.
+        let mut clock = BeaconClock::default();
+        beacon_sees_peak(&mut clock, Some(&g.root), block(e, s - 2), &mut seeded(seed));
+        assert_eq!(clock.first, Some(FirstPeak { era: e, peak: block(e, s - 2), late: None }), "noted before the slot: no late start");
+        assert!(beacon_arm_due(&mut clock, &beacon_facts(&g, e, past), &mut seeded(seed)), "due past the slot, with no late start");
+
+        // Seen past the slot on ticks other arms took: the late start runs
+        // from that first peak, and later ticks' peaks change nothing.
+        let first = block(e, s + 50);
+        let mut late = BeaconClock::default();
+        beacon_sees_peak(&mut late, Some(&g.root), first, &mut seeded(seed));
+        let d = late.first.and_then(|f| f.late).expect("past the slot: a late start is drawn");
+        beacon_sees_peak(&mut late, Some(&g.root), first + 40, &mut seeded(seed + 1));
+        assert_eq!(late.first, Some(FirstPeak { era: e, peak: first, late: Some(d) }), "a later tick's peak changes nothing");
+        assert!(d >= 2, "the seed's draw: {d}");
+        assert!(!beacon_arm_due(&mut late, &beacon_facts(&g, e, first + d - 1), &mut seeded(seed + 2)), "the block before it is due");
+        assert!(beacon_arm_due(&mut late, &beacon_facts(&g, e, first + d), &mut seeded(seed + 2)), "{d} blocks after the first peak the run saw");
+
+        // A new era's peak is noted for that era.
+        beacon_sees_peak(&mut late, Some(&g.root), block(e + 1, 0), &mut seeded(seed));
+        assert_eq!(late.first.map(|f| (f.era, f.peak)), Some((e + 1, block(e + 1, 0))), "the next era's first peak");
+
+        // Off the burner path, or with no agreed peak, nothing is noted.
+        let mut untouched = BeaconClock::default();
+        beacon_sees_peak(&mut untouched, None, past, &mut seeded(seed));
+        beacon_sees_peak(&mut untouched, Some(&g.root), 0, &mut seeded(seed));
+        assert_eq!(untouched.first, None);
     }
 
     /// Whether the beacon arm tries a write, over every combination of what
