@@ -1,0 +1,148 @@
+name: "🧪 testnet11 live check (probe branch, never to merge)"
+
+# A first contact between the node's own Chia peer lane and real testnet11
+# full nodes, on GitHub's machines. READS ONLY: no wallet coin exists on these
+# machines, burner keys stay off, and nothing is spent.
+#
+# It lives on the branch claude/testnet11-live-check alone and is not meant to
+# reach main. It adds no host to any build: it runs the node as it is.
+#
+#   1. The ignored test src/live_probe.rs: the lane asked directly (first
+#      reachable peer, two agreeing peers, the welcome room's faucet dish,
+#      beacons, a hint nobody uses, the peak watched for eight minutes).
+#   2. The real binary, as a player's node starts: four minutes, then a
+#      restart (the stored peers should come before the introducer).
+#   3. The real binary with the SSF wallet on (SSF_CHIA_LANE=1): a new, empty
+#      wallet, so the publisher reads and can write nothing.
+#
+# Logs are printed with every address and every 64-digit hex cut short.
+
+on:
+  push:
+    branches: [claude/testnet11-live-check]
+  workflow_dispatch:
+
+concurrency:
+  group: testnet11-live-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_DIR: prototypes/0.29.0-core-loop-demo/ssf-p2p-node
+
+jobs:
+  live-check:
+    name: live check on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.NODE_DIR }} -> target'
+          key: live-check-${{ matrix.os }}
+
+      - name: Build the tests and the node (chia-publish)
+        run: |
+          cargo test --features chia-publish --bin ssf-p2p-node --no-run --manifest-path "$NODE_DIR/Cargo.toml"
+          cargo build --features chia-publish --manifest-path "$NODE_DIR/Cargo.toml"
+
+      - name: What this machine's network looks like
+        run: |
+          echo "IPv4 route:"; (ip -4 route show default 2>/dev/null || route print -4 2>/dev/null | head -20) || true
+          echo "IPv6 global addresses:"; (ip -6 addr show scope global 2>/dev/null || netsh interface ipv6 show addresses 2>/dev/null | head -30) || true
+
+      - name: Watch DNS (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          command -v tcpdump >/dev/null || sudo apt-get install -y -q tcpdump || true
+          sudo sh -c 'nohup tcpdump -l -n -i any udp port 53 > /tmp/dns.txt 2>/dev/null &'
+          sleep 2
+
+      - name: "1. The lane asked directly (reads only)"
+        id: probe
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          cargo test --features chia-publish --bin ssf-p2p-node --manifest-path "$NODE_DIR/Cargo.toml" -- --ignored --nocapture --exact live_probe::live_testnet11_reads 2>&1 | tee probe.log
+          exit ${PIPESTATUS[0]}
+
+      - name: "1b. The peer store the probe left"
+        if: always()
+        run: |
+          f="$NODE_DIR/chia_peers.json"
+          if [ -f "$f" ]; then echo "chia_peers.json: $(wc -c < "$f") bytes"; head -c 1500 "$f"; echo; else echo "no chia_peers.json was written"; fi
+
+      - name: "2. The real binary, as a player's node starts, then a restart"
+        if: always()
+        timeout-minutes: 12
+        run: |
+          BIN="$PWD/$NODE_DIR/target/debug/ssf-p2p-node"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          mkdir -p run-default && cd run-default
+          "$BIN" > ../node-default-1.log 2>&1 &
+          PID=$!; sleep 240; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
+          echo "files after the first run:"; ls -la
+          "$BIN" > ../node-default-2.log 2>&1 &
+          PID=$!; sleep 150; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
+
+      - name: "3. The real binary with the SSF wallet on (a new, empty wallet)"
+        if: always()
+        timeout-minutes: 8
+        env:
+          SSF_CHIA_LANE: "1"
+          SSF_CHIA_BEAT_BLOCKS: "2"
+        run: |
+          BIN="$PWD/$NODE_DIR/target/debug/ssf-p2p-node"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          mkdir -p run-wallet && cd run-wallet
+          "$BIN" > ../node-wallet.log 2>&1 &
+          PID=$!; sleep 300; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true
+          echo "files after the run (names only):"; ls
+
+      - name: The logs, with addresses and long hex cut short
+        if: always()
+        run: |
+          cut_short() { sed -E 's/t?xch1[a-z0-9]{20,}/<address>/g; s/([0-9a-fA-F]{8})[0-9a-fA-F]{56,}/\1…/g'; }
+          for f in node-default-1.log node-default-2.log node-wallet.log; do
+            echo "=================== $f ($(wc -l < "$f" 2>/dev/null || echo 0) lines) ==================="
+            [ -f "$f" ] && cut_short < "$f" | head -400
+          done
+          mkdir -p logs-out
+          for f in probe.log node-default-1.log node-default-2.log node-wallet.log; do [ -f "$f" ] && cut_short < "$f" > "logs-out/$f"; done
+
+      - name: Names this machine asked DNS for (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          sudo pkill tcpdump || true
+          sleep 1
+          grep -oE ' (A|AAAA)\? [^ ]+' /tmp/dns.txt | sort | uniq -c | sort -rn | head -60 || true
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-check-${{ matrix.os }}
+          path: logs-out/
+          if-no-files-found: warn
+
+      - name: The probe's verdict
+        if: always()
+        run: |
+          grep -E "PROBE .*(VERDICT|ANSWERED|GAVE UP|lobby dish \(|beacons|watch:)" probe.log || true
+          [ "${{ steps.probe.outcome }}" = "success" ]

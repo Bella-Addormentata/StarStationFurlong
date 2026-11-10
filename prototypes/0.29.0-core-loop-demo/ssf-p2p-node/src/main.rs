@@ -98,6 +98,10 @@ mod chia_wallet;
 mod chia_at_rest;
 #[cfg(feature = "chia-publish")]
 mod chia_publish;
+// LIVE PROBE (branch claude/testnet11-live-check, never to merge): the lane
+// asked against real testnet11 full nodes, reads only.
+#[cfg(all(test, feature = "chia-publish"))]
+mod live_probe;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
 // for the lane's writes. PR 9's claim-and-write and its self-test hook call
 // them, the listing is written from P(e) (PR 10b), each knock from its own
