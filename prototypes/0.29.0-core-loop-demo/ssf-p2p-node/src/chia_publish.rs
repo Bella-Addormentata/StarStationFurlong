@@ -193,6 +193,13 @@ pub struct WalletLease {
     /// chain or the mempool settles it anew ([`settling_step`]). Bounded
     /// ([`MAX_SETTLING`]).
     settling: std::sync::Mutex<BTreeMap<u64, Settling>>,
+    /// T4's memory (stage 4 design §4.3), by payer: the wait drawn for a
+    /// payer that found another payer's spend landed ([`SpacedUntil`],
+    /// [`WalletLease::spacing`]). This run's memory only: the file carries
+    /// the settling spends, from which a restart draws again, so the fewest
+    /// blocks hold across one and only the draw is new. Bounded
+    /// ([`MAX_SPACED`]).
+    spacing: std::sync::Mutex<HashMap<Bytes32, SpacedUntil>>,
 }
 
 /// A spend released as spent, kept until the chain settles it (see
@@ -314,6 +321,84 @@ pub const MAX_SETTLING: usize = 64;
 /// Release verdicts remembered at most; past it the memory starts afresh (a
 /// forgotten verdict reads as [`LeaseWord::Unknown`], which kills nothing).
 pub const MAX_RELEASES_REMEMBERED: usize = 4096;
+
+/// T4 (stage 4 design §4.3): the fewest blocks between a spend of one
+/// payer of this node landing and the next push of another, and the most a
+/// push waits for it. The wait is drawn between the two, once for a payer
+/// and a landing ([`spacing_due`]): a fixed 32 would itself tie one
+/// station's writes together, 33 blocks apart every time.
+pub const SPACING_MIN_BLOCKS: u32 = 32;
+pub const SPACING_MAX_BLOCKS: u32 = 64;
+
+/// How long a spend still in flight holds the other payers' writes (T4):
+/// [`SPACING_MAX_BLOCKS`] blocks at the chain's 18.75 s a block, the "about
+/// 20 minutes" a knock may wait (design owner question 9). It is time, not
+/// blocks, since the lease knows when it parked a spend and not the height;
+/// once the spend lands the lease reads the height the chain spent it at,
+/// and the wait is counted in blocks from there. A spend stuck in a mempool
+/// for longer holds only its own payer (§10, a stuck spend).
+pub const SPACING_IN_FLIGHT_HOLD: Duration = Duration::from_secs(20 * 60);
+
+/// Payers whose spacing is remembered at most ([`WalletLease`]'s
+/// `spacing`); past it the one due earliest is forgotten. A node's payers
+/// in an era are its listing's key, its knocks' and the beacon's, and the
+/// lobby dish funds at most `claim_write::MAX_GIFTS_PER_ERA` of them.
+pub const MAX_SPACED: usize = 64;
+
+/// What the lease holds of the spends other payers of this node paid for,
+/// as T4 asks of it for one payer ([`WalletLease::other_spends`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OtherSpends {
+    /// One is parked, and was parked less than [`SPACING_IN_FLIGHT_HOLD`]
+    /// ago: pushed, restored from the lease file, or parked again after a
+    /// reorganization took its block.
+    pub in_flight: bool,
+    /// The latest height the chain spent a settling one at.
+    pub landed: Option<u32>,
+}
+
+/// What T4 keeps for a payer that waits on another payer's landed spend:
+/// the landing its wait was drawn for, and the first block the payer may
+/// push at. It outlives the lease's settling record of that spend, which
+/// goes once the spend is [`crate::chia_knock::SETTLED_DEPTH`] deep, so a
+/// wait drawn longer than that is still kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpacedUntil {
+    pub landed: u32,
+    pub due: u32,
+}
+
+/// T4's step for one payer (stage 4 design §4.3): what is kept for it once
+/// the lease shows the latest landing of another payer's spend at `landed`
+/// (none: no such spend is settling), given what was `kept` before. A
+/// landing newer than the one kept draws a wait, `draw()` blocks cut to
+/// [`SPACING_MIN_BLOCKS`]..=[`SPACING_MAX_BLOCKS`], and the payer is due
+/// that many blocks after it, never earlier than it was already due. The
+/// same landing, or an older one (a reorganization moved the block down),
+/// draws nothing, so asking every tick never shortens or lengthens the
+/// wait. With no landing the kept wait stands.
+pub(crate) fn spacing_due(kept: Option<SpacedUntil>, landed: Option<u32>, draw: impl FnOnce() -> u32) -> Option<SpacedUntil> {
+    match (kept, landed) {
+        (Some(k), Some(la)) if la <= k.landed => Some(k),
+        (kept, Some(la)) => {
+            let wait = draw().clamp(SPACING_MIN_BLOCKS, SPACING_MAX_BLOCKS);
+            let due = la.saturating_add(wait).max(kept.map_or(0, |k| k.due));
+            Some(SpacedUntil { landed: la, due })
+        }
+        (kept, None) => kept,
+    }
+}
+
+/// What T4 says of a payer's next push ([`WalletLease::spacing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Spacing {
+    /// Nothing holds it.
+    Clear,
+    /// Another payer's spend is still in flight ([`OtherSpends::in_flight`]).
+    InFlight,
+    /// It may push from this block on: the agreed peak decides.
+    Due(u32),
+}
 
 /// A parked coin: when, by which spend (see [`Parking`]), and the height it
 /// was seen confirmed at when selected (`None`: unknown, as for a coin an
@@ -507,6 +592,7 @@ impl WalletLease {
             sealed: std::sync::Mutex::new(None),
             released: std::sync::Mutex::new(HashMap::new()),
             settling: std::sync::Mutex::new(BTreeMap::new()),
+            spacing: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -832,6 +918,66 @@ impl WalletLease {
     /// always keeps its bundle, so none is missed.
     pub fn holds_spend_at(&self, puzzle_hash: Bytes32) -> bool {
         self.parks_spend_at(puzzle_hash) || self.settling.lock().unwrap().values().any(|s| spends_at(&s.bundle, puzzle_hash))
+    }
+
+    /// What the lease holds of the spends OTHER payers paid for, as T4 asks
+    /// it for `payer`, whose coins sit at `puzzle_hash` (stage 4 design §4.3:
+    /// two pushes from different payers of one node land at least 32 blocks
+    /// apart). A spend is `payer`'s own, and not counted, when the payer
+    /// filed for it is `payer`, or its saved bundle spends a coin at
+    /// `puzzle_hash`, which no lost payer record can hide
+    /// ([`WalletLease::parks_spend_at`]). Every other spend counts, whoever
+    /// paid: another burner, the SSF wallet (a v1 room record, a GIVE, a
+    /// test hook), a claim into it (a TAKE, the `incoming` marker's coin
+    /// among them, which lands on the chain like any spend), and a spend
+    /// with no payer filed, which is the SSF wallet's or unknown, fail
+    /// closed.
+    ///
+    /// A parked one counts as in flight for [`SPACING_IN_FLIGHT_HOLD`] from
+    /// its parking as of `now`, and a settling one by the height the chain
+    /// spent it at. A parked spend an older node left with no bundle keeps
+    /// no settling record once it lands, so its landing is not seen here.
+    /// Callers hold the gate after a reconciliation, so a spend that landed
+    /// is read settling, not in flight.
+    pub(crate) fn other_spends(&self, payer: Payer, puzzle_hash: Bytes32, now: Instant) -> OtherSpends {
+        let own = |paid_by: Option<Payer>, bundle: Option<&SpendBundle>| paid_by == Some(payer) || bundle.is_some_and(|b| spends_at(b, puzzle_hash));
+        let in_flight = {
+            let pending = self.pending.lock().unwrap();
+            let pushed = self.bundles.lock().unwrap();
+            pending.values().any(|parked| {
+                let spend = pushed.get(&parked.spend);
+                !own(spend.and_then(|p| p.payer), spend.map(|p| &p.bundle)) && now.saturating_duration_since(parked.at) < SPACING_IN_FLIGHT_HOLD
+            })
+        };
+        let landed = self.settling.lock().unwrap().values().filter(|s| !own(s.payer, Some(&s.bundle))).map(|s| s.spent_at).max();
+        OtherSpends { in_flight, landed }
+    }
+
+    /// T4 for `payer`'s next push (stage 4 design §4.3), as the lease reads
+    /// at `now`: held while another payer's spend is in flight; otherwise
+    /// due from the block its wait gives ([`spacing_due`], drawn from `rng`
+    /// once for a payer and a landing, and kept in this run's memory); and
+    /// clear when no other payer's spend landed that this payer waited on.
+    /// The caller compares [`Spacing::Due`]'s block with the agreed peak.
+    /// Callers hold the gate after a reconciliation
+    /// ([`WalletLease::other_spends`]).
+    pub(crate) fn spacing<R: rand::Rng + ?Sized>(&self, payer: Payer, puzzle_hash: Bytes32, now: Instant, rng: &mut R) -> Spacing {
+        let others = self.other_spends(payer, puzzle_hash, now);
+        let mut kept = self.spacing.lock().unwrap();
+        let until = spacing_due(kept.get(&payer.0).copied(), others.landed, || rng.gen_range(SPACING_MIN_BLOCKS..=SPACING_MAX_BLOCKS));
+        if let Some(until) = until {
+            if kept.len() >= MAX_SPACED && !kept.contains_key(&payer.0) {
+                if let Some(earliest) = kept.iter().min_by_key(|(key, k)| (k.due, **key)).map(|(key, _)| *key) {
+                    kept.remove(&earliest);
+                }
+            }
+            kept.insert(payer.0, until);
+        }
+        match until {
+            _ if others.in_flight => Spacing::InFlight,
+            Some(until) => Spacing::Due(until.due),
+            None => Spacing::Clear,
+        }
     }
 
     /// The writes the lease holds under `hint`, newest first, parked with
@@ -3352,8 +3498,9 @@ pub struct MemoWrite {
 /// ([`WalletLease::reconcile_at`]). The checks are the money writer's, in
 /// its order: the lease's gate, the lease open, the reconciliation, the
 /// global check that no spend on `lease` is still settling, whatever its
-/// payer ([`WalletLease::outgoing_pending`], kept on purpose until the
-/// burner writers space their payers, stage 4 design §4.3 T4), then the
+/// payer ([`WalletLease::outgoing_pending`], kept on purpose for the money
+/// writer: the burner writers space their payers instead, stage 4 design
+/// §4.3 T4), then the
 /// payer's largest coin `lease` does not hold ([`find_spendable_coin_on`]).
 /// With a `gate`, `body` runs and the spend is pushed UNDER it: a knock's
 /// authorization is read again there ([`publish_knock_on`]), after the lease
@@ -3379,12 +3526,14 @@ pub struct MemoWrite {
 /// on K(h)'s spends alone, and the listing's from P(e)
 /// (`claim_write::burner_write_with`) on P(e)'s and, before its first write,
 /// on the SSF wallet's own (`claim_write::BurnerWait::MoneyInFlight`).
-/// Neither waits on the beacon, which B pays for. The beacon's from B
-/// (`claim_write::beacon_write_with`) waits on B's own spends and, until the
-/// payers are spaced, on any other spend this node has parked
-/// (`claim_write::BurnerWait::OtherWriteInFlight`), which keeps for it the
-/// ordering this check gave the beacon wallet's. The spacing that keeps two
-/// payers' pushes apart (§4.3 T4) is still to come.
+/// The beacon's from B (`claim_write::beacon_write_with`) waits on B's own
+/// spends. And every burner's write is spaced from the other payers'
+/// spends, the SSF wallet's among them (§4.3 T4,
+/// `claim_write::BurnerWait::Spaced`, [`WalletLease::spacing`]): held while
+/// one is in flight, for at most [`SPACING_IN_FLIGHT_HOLD`], and for 32 to
+/// 64 blocks after one landed. This writer, the SSF wallet's, is not spaced
+/// from the burners': its global check holds it behind any parked spend,
+/// and no further.
 #[allow(clippy::too_many_arguments)]
 async fn publish_memo_on(
     lease: &WalletLease,
@@ -3673,6 +3822,8 @@ fn beacon_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> String
         format!("⛓️ ChiaHub beacon: publish for era {era} failed: {e:#} (retry in {retry} min; the beacon wallet is funded separately)")
     } else if chain_busy(e) {
         format!("⛓️ ChiaHub beacon: the era {era} beacon waits — {CHAIN_BUSY_WORDS}; waiting costs nothing (retry in {retry} min)")
+    } else if spaced(e) {
+        format!("⛓️ ChiaHub beacon: the era {era} beacon waits its turn: {e:#} (tried again at each tick)")
     } else {
         let verb = if is_typed_wait(e) { "waits" } else { "failed" };
         format!("⛓️ ChiaHub beacon: the era {era} beacon {verb}: {e:#} (retry in {retry} min)")
@@ -3721,6 +3872,9 @@ fn listing_failure_words(e: &anyhow::Error, last_week: bool) -> String {
     } else if money_in_flight(e) {
         let still = if last_week { " Last week's listing still works." } else { "" };
         format!("A spend from the SSF wallet is still on its way. Your listing goes out once it lands.{still}")
+    } else if spaced(e) {
+        let still = if last_week { " Last week's listing still works." } else { "" };
+        format!("Your station's Chia writes go out some minutes apart. Your listing goes out in its turn. Waiting costs nothing.{still}")
     } else {
         format!("{e:#}")
     }
@@ -3742,6 +3896,8 @@ fn listing_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> Strin
         format!("⛓️ ChiaHub presence: publish for era {era} failed: {e:#} (retry in {retry} min)")
     } else if chain_busy(e) {
         format!("⛓️ ChiaHub presence: the era {era} listing waits — {CHAIN_BUSY_WORDS}; waiting costs nothing (retry in {retry} min)")
+    } else if spaced(e) {
+        format!("⛓️ ChiaHub presence: the era {era} listing waits its turn: {e:#} (tried again at each tick)")
     } else {
         let verb = if is_typed_wait(e) { "waits" } else { "failed" };
         format!("⛓️ ChiaHub presence: the era {era} listing {verb}: {e:#} (retry in {retry} min)")
@@ -3759,6 +3915,38 @@ fn listing_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> Strin
 /// main, instead of being tried for ever.
 fn knock_attempt_counts(burners: bool, e: &anyhow::Error) -> bool {
     !burners || !is_typed_wait(e)
+}
+
+/// Whether `e` is T4's wait (stage 4 design §4.3): somewhere in its chain
+/// is `claim_write::BurnerWait::Spaced`, a burner's write held so that it
+/// lands at least 32 blocks from another payer's of this node. It is a
+/// typed wait ([`is_typed_wait`]), so it is no knock attempt, and it keeps
+/// the tick, so the arms keep their order while one waits (listing, then
+/// knock, then beacon, then the rooms). Unlike every other wait, the arm
+/// that met it does not rest for the retry cadence ([`paced_from`]): its
+/// due block is at most [`SPACING_MAX_BLOCKS`] blocks off, and a rest of
+/// [`HEARTBEAT_RETRY_SECS`] could add a quarter as much again.
+fn spaced(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| matches!(cause.downcast_ref::<claim_write::BurnerWait>(), Some(claim_write::BurnerWait::Spaced)))
+}
+
+/// What an arm's retry cadence counts from after a try at `tried` that
+/// ended in `done`: `tried`, or nothing after T4's wait ([`spaced`]), so
+/// the arm tries again at its next tick.
+fn paced_from<T>(tried: Instant, done: &Result<T>) -> Option<Instant> {
+    match done {
+        Err(e) if spaced(e) => None,
+        _ => Some(tried),
+    }
+}
+
+/// Whether an arm says T4's wait now: at the first of a run of tries that
+/// met it (`waits`), not at every tick of the run. `said` is the arm's own
+/// memory of the last try, which any other outcome clears.
+fn spaced_first(said: &mut bool, waits: bool) -> bool {
+    let first = waits && !*said;
+    *said = waits;
+    first
 }
 
 /// Whether the knock arm may try at `now`, the last knock that waited having
@@ -3902,6 +4090,13 @@ fn knock_skipped(book: &KnockBook, found: &ChainKnocked, host: &str, era: u64) -
 /// ([`knock_skipped`]). Every other error goes to [`knock_failed`], exactly
 /// as before.
 ///
+/// A knock that met T4's wait ([`spaced`], stage 4 design §4.3: "waiting is
+/// not a knock attempt") goes back to the FRONT of the queue, its attempts
+/// as they were and the arm's rest as it was, so the arm tries it again at
+/// its next tick and it goes out at its due block, in its place. Its line
+/// is returned, not printed, for the arm to say once for a run of such
+/// ticks ([`spaced_first`]); every other case returns none.
+///
 /// `claim_write::AlreadyKnocked` is no typed wait ([`is_typed_wait`]), and
 /// [`knock_failed`] would count it as an attempt and queue it again, to read
 /// the same records under the same key: so it is caught here, before
@@ -3916,15 +4111,25 @@ fn knock_not_written(
     queue: &mut std::collections::VecDeque<KnockRequest>,
     wait: &mut Option<Instant>,
     found: &mut ChainKnocked,
-) {
+) -> Option<String> {
+    if spaced(e) {
+        let line = format!(
+            "⛓️ ChiaHub knock: knock on {} for room {} waits its turn: {e:#} — not an attempt; tried again at each tick",
+            short(&req.host),
+            req.room
+        );
+        queue.push_front(req);
+        return Some(line);
+    }
     let Some(line) = knock_dropped_line(&req, e) else {
         knock_failed(burners, req, e, now, queue, wait);
-        return;
+        return None;
     };
     if already_knocked(e).is_some() {
         found.note(&req.host, era);
     }
     println!("{line}");
+    None
 }
 
 /// The line the knock arm prints once a knock for `host` in `room` is
@@ -5182,9 +5387,9 @@ async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
 /// public hint on `net` ([`beacon_memo`]), by the beacon's writer
 /// (`claim_write::beacon_write_with`). B's first write claims a lobby dish
 /// coin in its own bundle, and every later era's spends B's own 1-mojo coin
-/// to itself, with no gift and no fee. It waits while the lease parks any
-/// other spend of this node (`claim_write::BurnerWait::OtherWriteInFlight`),
-/// until the payers are spaced (§4.3 T4, PR 10e). The write names B as its
+/// to itself, with no gift and no fee. It is spaced from every other
+/// payer's spend, as every burner's write is (§4.3 T4,
+/// `claim_write::BurnerWait::Spaced`). The write names B as its
 /// payer ([`Payer::of_burner`]), the payer the beacon wallet's key names
 /// too, which the beacon mark files beside its coins ([`BeaconMark::written`]).
 #[allow(clippy::too_many_arguments)]
@@ -5412,6 +5617,12 @@ pub async fn heartbeat_loop(
     // knock arm rests for the retry cadence from then (`knock_paced`).
     // With burners off it is never set, and the arm is today's.
     let mut knock_wait: Option<Instant> = None;
+    // Whether each arm's last try met T4's wait (§4.3, `spaced`), so its
+    // line is said once for a run of such ticks (`spaced_first`). Only a
+    // burner's writer gives that wait, so with burners off none is set.
+    let mut listing_spaced = false;
+    let mut knock_spaced = false;
+    let mut beacon_spaced = false;
     // The hosts this run found its knock already written to this era by the
     // knock's own key (`ChainKnocked`, `knock_not_written`), skipped for the
     // rest of the era. Only the burner path writes a knock from its own key,
@@ -5699,11 +5910,17 @@ pub async fn heartbeat_loop(
                 let due = money_refused.is_none() && step == ListingStep::Write && retry_ok;
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
-                    node_attempt = Some(Instant::now());
+                    let tried = Instant::now();
                     let written = match &listing_root {
                         Some(root) => publish_burner_presence(net, root, Payer::of(&chia_sk), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,
                         None => publish_node_presence(net, &iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await,
                     };
+                    // The retry cadence counts from this try, save after
+                    // T4's wait, which is tried again at the next tick
+                    // (`paced_from`) and said once for a run of such ticks.
+                    node_attempt = paced_from(tried, &written);
+                    let waits_its_turn = written.as_ref().err().is_some_and(spaced);
+                    let said_before = !spaced_first(&mut listing_spaced, waits_its_turn);
                     match written {
                         Ok((hint, write)) => {
                             let writes = match &node_mark {
@@ -5728,7 +5945,9 @@ pub async fn heartbeat_loop(
                             node_last_error = None;
                         }
                         Err(e) => {
-                            eprintln!("{}", listing_failure_line(listing_root.is_some(), era, &e));
+                            if !(waits_its_turn && said_before) {
+                                eprintln!("{}", listing_failure_line(listing_root.is_some(), era, &e));
+                            }
                             node_last_error = Some(match &listing_root {
                                 // §10's words. Last week's listing still works
                                 // only while the mark on record is last era's
@@ -5814,6 +6033,8 @@ pub async fn heartbeat_loop(
                 break Some((req, cap.room_key));
             };
             if let Some((req, room_key)) = next {
+                // Whether this try met T4's wait (`knock_not_written`).
+                let mut waits_its_turn = false;
                 // The room's word is read AGAIN at spend time, under the card
                 // gate, after the lease and coin lookups (#272 review round 5):
                 // a cap turning the room public or its switch off meanwhile
@@ -5879,8 +6100,18 @@ pub async fn heartbeat_loop(
                     // error is a wait (burners on) or an attempt used, back
                     // in the queue or dropped, as `knock_failed` says
                     // (`knock_not_written`).
-                    Err(e) => knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked),
+                    //
+                    // One that met T4's wait is back at the queue's front
+                    // with its line, said once for a run of such ticks.
+                    Err(e) => {
+                        let line = knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);
+                        waits_its_turn = line.is_some();
+                        if let Some(line) = line.filter(|_| !knock_spaced) {
+                            eprintln!("{line}");
+                        }
+                    }
                 }
+                knock_spaced = waits_its_turn;
                 continue; // one spend per tick
             }
         }
@@ -5975,13 +6206,18 @@ pub async fn heartbeat_loop(
             let due = beacon_arm_due(&mut beacon_clock, &facts, &mut rand::rngs::OsRng);
             // Due, and the peak not aged out during the lookups above.
             if due && !peak_aged("beacon") {
-                beacon_attempt = Some(Instant::now());
+                let tried = Instant::now();
                 // The arm's whole step from here to the write is one seam
                 // (`beacon_on_path`), chosen by the path as the listing's
                 // and the knock's are, never by which key paid: the
                 // guard first, on either path (§4.5 (7)), then the path's
                 // writer with the key it writes from.
                 let done = publish_beacon(net, listing_root.as_ref(), &iroh_sk, &chia_sk, era, now_unix).await;
+                // Paced from this try, save after T4's wait (`paced_from`),
+                // whose line is said once for a run of such ticks.
+                beacon_attempt = paced_from(tried, &done);
+                let waits_its_turn = done.as_ref().err().is_some_and(spaced);
+                let said_before = !spaced_first(&mut beacon_spaced, waits_its_turn);
                 if let Some(line) = beacon_guard_note(&mut beacon_guard_said, &done) {
                     eprintln!("{line}");
                 }
@@ -6000,7 +6236,11 @@ pub async fn heartbeat_loop(
                         beacon_mark = Some(mark);
                     }
                     // With burner keys off, the line it always had.
-                    Err(e) => eprintln!("{}", beacon_failure_line(listing_root.is_some(), era, &e)),
+                    Err(e) => {
+                        if !(waits_its_turn && said_before) {
+                            eprintln!("{}", beacon_failure_line(listing_root.is_some(), era, &e));
+                        }
+                    }
                 }
                 if took_the_tick {
                     continue; // one spend per tick
@@ -6954,8 +7194,9 @@ mod tests {
     }
 
     /// Stage 4 design §10's Phone Book sentences for a listing from a
-    /// burner key: a dry dish and a busy chain, and the first write's wait on
-    /// a spend of the SSF wallet's (§8.3), each with and without the word
+    /// burner key: a dry dish and a busy chain, the first write's wait on
+    /// a spend of the SSF wallet's (§8.3), and its turn among the station's
+    /// writes (§4.3 T4), each with and without the word
     /// that last era's listing still works. Every other failure reads as its
     /// own text, a lost race and the burner's other waits among them. None of
     /// them sends the page to the Bank, whose cue is "unfunded".
@@ -6978,6 +7219,13 @@ mod tests {
         for e in [anyhow::Error::from(BurnerWait::MoneyInFlight), anyhow::Error::from(BurnerWait::MoneyInFlight).context("presence")] {
             assert_eq!(listing_failure_words(&e, true), format!("{landing} Last week's listing still works."), "{e:#}");
             assert_eq!(listing_failure_words(&e, false), landing, "{e:#}");
+            said.extend([listing_failure_words(&e, true), listing_failure_words(&e, false)]);
+        }
+        // T4's wait (§4.3): the station's writes go out some minutes apart.
+        let turn = "Your station's Chia writes go out some minutes apart. Your listing goes out in its turn. Waiting costs nothing.";
+        for e in [anyhow::Error::from(BurnerWait::Spaced), anyhow::Error::from(BurnerWait::Spaced).context("presence")] {
+            assert_eq!(listing_failure_words(&e, true), format!("{turn} Last week's listing still works."), "{e:#}");
+            assert_eq!(listing_failure_words(&e, false), turn, "{e:#}");
             said.extend([listing_failure_words(&e, true), listing_failure_words(&e, false)]);
         }
         let others: Vec<anyhow::Error> = vec![
@@ -8755,6 +9003,257 @@ mod tests {
         lease
     }
 
+    /// A bundle that spends one coin at `puzzle_hash`, and that coin's id:
+    /// what the lease reads of a saved bundle ([`spends_at`]). Nothing runs
+    /// it.
+    fn spend_at(puzzle_hash: Bytes32, parent: u8) -> (SpendBundle, Bytes32) {
+        let coin = Coin::new(Bytes32::new([parent; 32]), puzzle_hash, 1);
+        let nil = || chia_protocol::Program::from(vec![0x80u8]);
+        (SpendBundle::new(vec![CoinSpend::new(coin, nil(), nil())], Signature::default()), coin.coin_id())
+    }
+
+    /// A lease restored from a file of its own in `dir` that holds `spends`
+    /// settling: for each, the height the chain spent it at, the payer filed
+    /// for it, if any, and its bundle. They are numbered from 1 in order.
+    fn settling_lease(dir: &std::path::Path, name: &str, spends: &[(u32, Option<Payer>, &SpendBundle)]) -> WalletLease {
+        let entries: Vec<String> = spends
+            .iter()
+            .enumerate()
+            .map(|(i, (spent_at, payer, bundle))| {
+                let payer = payer.map_or(String::new(), |p| format!(r#","payer":"{}""#, p.hex()));
+                let (coin, bundle) = (hex::encode([0x40 + i as u8; 32]), hex::encode(bundle.to_bytes().unwrap()));
+                format!(r#"{{"spend":{},"spent_at":{spent_at},"coins":[{{"coin":"{coin}"}}],"bundle":"{bundle}"{payer}}}"#, i + 1)
+            })
+            .collect();
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, format!(r#"{{"v":1,"spends":{},"parked":[],"settling":[{}]}}"#, spends.len(), entries.join(","))).unwrap();
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        assert!(lease.ensure_open().is_ok(), "the file loads");
+        lease
+    }
+
+    /// T4's step for one payer (stage 4 design §4.3: a push that would land
+    /// within 32 blocks of another payer's waits 32 to 64 blocks). A landing
+    /// draws a wait once and the payer is due that many blocks after it;
+    /// the same landing asked about again, an older one, or none (its
+    /// record settled and gone) draws nothing and keeps the wait; a newer
+    /// landing draws again from its own height and never brings the due
+    /// block forward. A draw outside 32..=64 is cut to it, and the top of
+    /// the height's range does not wrap.
+    #[test]
+    fn a_landing_draws_a_payers_wait_once_between_32_and_64_blocks_and_a_newer_one_never_brings_it_forward() {
+        let never = || -> u32 { panic!("nothing is drawn") };
+        assert_eq!(spacing_due(None, None, never), None, "nothing kept, nothing landed");
+        let first = spacing_due(None, Some(1000), || 40).expect("a landing draws");
+        assert_eq!(first, SpacedUntil { landed: 1000, due: 1040 });
+        assert_eq!(spacing_due(Some(first), Some(1000), never), Some(first), "the same landing, at every tick");
+        assert_eq!(spacing_due(Some(first), Some(990), never), Some(first), "an older one: a block moved down");
+        assert_eq!(spacing_due(Some(first), None, never), Some(first), "its record settled and gone: the wait stands");
+        assert_eq!(spacing_due(Some(first), Some(1001), || 64), Some(SpacedUntil { landed: 1001, due: 1065 }), "a newer landing draws from its own height");
+        let long = SpacedUntil { landed: 1000, due: 1064 };
+        assert_eq!(spacing_due(Some(long), Some(1001), || 32), Some(SpacedUntil { landed: 1001, due: 1064 }), "and never brings the due block forward");
+        for (draw, wait) in [(0, 32), (31, 32), (32, 32), (33, 33), (63, 63), (64, 64), (65, 64), (u32::MAX, 64)] {
+            assert_eq!(spacing_due(None, Some(5), || draw), Some(SpacedUntil { landed: 5, due: 5 + wait }), "a draw of {draw}");
+        }
+        assert_eq!(spacing_due(None, Some(u32::MAX - 3), || 32).map(|k| k.due), Some(u32::MAX), "no wrap at the top");
+        assert_eq!((SPACING_MIN_BLOCKS, SPACING_MAX_BLOCKS), (32, 64), "§4.3 T4");
+        assert_eq!(SPACING_MIN_BLOCKS, crate::chia_knock::SETTLED_DEPTH, "a settling record lasts at least the fewest blocks");
+        assert_eq!(SPACING_IN_FLIGHT_HOLD, Duration::from_secs(20 * 60), "about 20 minutes: 64 blocks at 18.75 s");
+    }
+
+    /// What T4 counts as another payer's spend (stage 4 design §4.3 and
+    /// §11 row 8: one node's writes from different payers are at least 32
+    /// blocks apart). Parked, each counts as in flight: a spend the SSF
+    /// wallet pays for, the beacon's, one an older node parked with no
+    /// bundle and no payer, and a claim into the SSF wallet. The asker's own
+    /// does not, by the payer filed for it or, where that record was lost,
+    /// by its saved bundle spending a coin at the asker's puzzle hash; a
+    /// bundle with no payer filed that spends elsewhere is another's, fail
+    /// closed. A parked spend counts for 20 minutes from its parking and no
+    /// longer, though it still holds its own payer. Settling, the others'
+    /// latest landing is given, the asker's own left out in both ways.
+    #[test]
+    fn t4_counts_every_spend_the_lease_holds_but_the_askers_own_in_flight_for_twenty_minutes_and_landed_at_its_height() {
+        let dir = std::env::temp_dir().join(format!("ssf-lease-other-spends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t0 = Instant::now();
+        let (me, mine_at) = (burner(), Bytes32::new([0xc1; 32]));
+        let asks = |lease: &WalletLease, at: Instant| lease.other_spends(me, mine_at, at);
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let coin = |n: u8| Bytes32::new([n; 32]);
+        let flying = OtherSpends { in_flight: true, landed: None };
+
+        assert_eq!(asks(&restored_in(&dir, "empty"), t0), OtherSpends::default(), "nothing held");
+        for (name, payer) in [("money", money()), ("beacon", beacon())] {
+            let lease = restored_in(&dir, name);
+            lease.park_with_bundle_at([coin(1)], Some((&plain, payer)), t0).unwrap();
+            assert_eq!(asks(&lease, t0), flying, "a spend the {name} pays for");
+        }
+        let own = restored_in(&dir, "own");
+        own.park_with_bundle_at([coin(1)], Some((&plain, me)), t0).unwrap();
+        assert_eq!(asks(&own, t0), OtherSpends::default(), "the asker's own spend is not another's");
+        let older = restored_in(&dir, "older");
+        older.park_at([coin(1)], t0).unwrap();
+        assert_eq!(asks(&older, t0), flying, "no bundle and no payer: another's, fail closed");
+        let take = restored_in(&dir, "take");
+        take.park_with_bundle_at([coin(2)], Some((&plain, money())), t0).unwrap();
+        take.mark_incoming(coin(2)).unwrap();
+        assert_eq!(asks(&take, t0), flying, "a claim into the SSF wallet lands on the chain like any spend");
+
+        // The payer record lost (a rollback to an older build and back):
+        // the bundle itself says whose it is.
+        let (at_mine, mine_coin) = spend_at(mine_at, 3);
+        let (elsewhere, their_coin) = spend_at(Bytes32::new([0xd1; 32]), 4);
+        for (what, bundle, parked, counted) in [("at the asker's puzzle hash", &at_mine, mine_coin, false), ("elsewhere", &elsewhere, their_coin, true)] {
+            let wrote = restored_in(&dir, "wrote");
+            wrote.park_with_bundle_at([parked], Some((bundle, beacon())), t0).unwrap();
+            let mut file = wrote.snapshot();
+            file.bundles[0].payer = None;
+            let lost = WalletLease::new();
+            lost.load(&file, t0).unwrap();
+            assert_eq!(asks(&lost, t0).in_flight, counted, "a bundle with no payer filed that spends {what}");
+        }
+
+        // For 20 minutes from its parking, to the instant.
+        let held = restored_in(&dir, "held");
+        held.park_with_bundle_at([coin(5)], Some((&plain, money())), t0).unwrap();
+        assert!(asks(&held, t0 + SPACING_IN_FLIGHT_HOLD - Duration::from_millis(1)).in_flight);
+        assert_eq!(asks(&held, t0 + SPACING_IN_FLIGHT_HOLD), OtherSpends::default(), "stuck for 20 minutes: it holds the other payers no longer");
+        assert!(held.outgoing_pending_for(money()), "and its own payer still (§10, a stuck spend)");
+        let ahead = restored_in(&dir, "ahead");
+        ahead.park_with_bundle_at([coin(6)], Some((&plain, money())), t0 + Duration::from_secs(5)).unwrap();
+        assert!(asks(&ahead, t0).in_flight, "parked after the instant asked about: in flight");
+
+        // Settling: the others' latest landing.
+        let landed = settling_lease(&dir, "landed", &[(1000, Some(money()), &plain), (1010, Some(beacon()), &plain), (1020, Some(me), &plain), (1030, None, &at_mine)]);
+        assert_eq!(asks(&landed, t0), OtherSpends { in_flight: false, landed: Some(1010) }, "the asker's own left out, by its payer and by its bundle");
+        assert_eq!(landed.other_spends(beacon(), beacon().0, t0).landed, Some(1030), "for the beacon: the burner's, though no payer is filed for it");
+        assert_eq!(landed.other_spends(money(), money().0, t0).landed, Some(1030));
+        let unnamed = settling_lease(&dir, "unnamed", &[(1040, None, &elsewhere), (1000, Some(money()), &plain)]);
+        assert_eq!(asks(&unnamed, t0).landed, Some(1040), "one with no payer filed, spending elsewhere, is another's");
+        let mine_alone = settling_lease(&dir, "mine", &[(1000, Some(me), &plain)]);
+        assert_eq!(asks(&mine_alone, t0), OtherSpends::default(), "a rewrite is never spaced from the payer's own last write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T4 on the lease (stage 4 design §4.3). A payer with only its own
+    /// spend held is clear, and nothing is drawn. Behind another payer's
+    /// spend in flight it is held, with no wait drawn, for 20 minutes. Once
+    /// that spend has landed, its wait is drawn from the random source once,
+    /// 32 to 64 blocks past the landing, and every later ask gives the same
+    /// block and draws nothing; each payer draws its own. The block drawn
+    /// outlives the settling record, which goes at 32 blocks deep. A later
+    /// landing of another payer's holds the payer again, and its new block
+    /// is never earlier. A restart forgets the draw and keeps the landing,
+    /// from which it draws again, so the fewest blocks hold across it. The
+    /// waits kept are bounded: past the bound the one due earliest is
+    /// forgotten.
+    #[tokio::test]
+    async fn a_payer_is_held_behind_anothers_spend_in_flight_then_due_at_a_block_drawn_once_that_outlives_the_settling_record() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use rand::{Rng, RngCore};
+        let dir = std::env::temp_dir().join(format!("ssf-lease-spacing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let me = burner();
+        let same = |a: &StdRng, b: &StdRng| a.clone().next_u64() == b.clone().next_u64();
+        let mut rng = seeded(1);
+
+        let clear = restored_in(&dir, "clear");
+        clear.park_with_bundle_at([Bytes32::new([1; 32])], Some((&plain, me)), t0).unwrap();
+        assert_eq!(clear.spacing(me, me.0, t0, &mut rng), Spacing::Clear, "its own spend does not space it");
+        assert!(same(&rng, &seeded(1)) && clear.spacing.lock().unwrap().is_empty(), "nothing drawn or kept");
+
+        let flying = restored_in(&dir, "flying");
+        flying.park_with_bundle_at([Bytes32::new([2; 32])], Some((&plain, money())), t0).unwrap();
+        assert_eq!(flying.spacing(me, me.0, t0, &mut rng), Spacing::InFlight);
+        assert_eq!(flying.spacing(me, me.0, t0 + SPACING_IN_FLIGHT_HOLD - Duration::from_millis(1), &mut rng), Spacing::InFlight);
+        assert_eq!(flying.spacing(me, me.0, t0 + SPACING_IN_FLIGHT_HOLD, &mut rng), Spacing::Clear, "a stuck spend holds only its own payer");
+        assert_eq!(flying.spacing(money(), money().0, t0, &mut rng), Spacing::Clear, "and never spaces its own payer");
+        assert!(same(&rng, &seeded(1)), "no wait is drawn for a spend that has not landed");
+
+        // Landed at 1000: drawn once, from the random source.
+        let landed = settling_lease(&dir, "landed", &[(1000, Some(money()), &plain)]);
+        let Spacing::Due(due) = landed.spacing(me, me.0, t0, &mut rng) else { panic!("due at a block") };
+        assert_eq!(due, 1000 + seeded(1).gen_range(SPACING_MIN_BLOCKS..=SPACING_MAX_BLOCKS), "the wait follows the random source");
+        assert!((1032..=1064).contains(&due), "{due}");
+        let drawn = rng.clone();
+        for _ in 0..4 {
+            assert_eq!(landed.spacing(me, me.0, t0, &mut rng), Spacing::Due(due), "the same block at every tick");
+        }
+        assert!(same(&rng, &drawn), "and nothing more drawn");
+        assert_eq!(landed.spacing(money(), money().0, t0, &mut rng), Spacing::Clear, "the payer that landed is not spaced from itself");
+        assert!(same(&rng, &drawn));
+        let Spacing::Due(beacons) = landed.spacing(beacon(), beacon().0, t0, &mut rng) else { panic!("due at a block") };
+        assert!((1032..=1064).contains(&beacons) && !same(&rng, &drawn), "each payer draws its own wait");
+
+        // 32 blocks deep the settling record goes; the block drawn stays.
+        landed.retire(&[], Vec::new(), &[], &[], &[1], t0);
+        assert_eq!(landed.other_spends(me, me.0, t0), OtherSpends::default(), "settled: the lease holds the spend no longer");
+        assert_eq!(landed.spacing(me, me.0, t0, &mut rng), Spacing::Due(due), "the wait drawn outlives the record");
+
+        // The beacon's spend goes out and lands at 1010: held again, and
+        // never due earlier than before.
+        let beacons_coin = Coin::new(Bytes32::new([81u8; 32]), Bytes32::new([2u8; 32]), 1);
+        landed.park_with_bundle_at([(beacons_coin.coin_id(), 900)], Some((&plain, beacon())), t0).unwrap();
+        assert_eq!(landed.spacing(me, me.0, t0, &mut rng), Spacing::InFlight, "another's spend in flight holds it, whatever block it was due at");
+        let listing = Scripted::new(vec![CoinListing {
+            records: vec![CoinRecord { coin: beacons_coin, confirmed_block_index: 900, spent: true, spent_block_index: 1010 }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(1011),
+        }]);
+        landed.reconcile_at(T11, &listing, t0 + RECONCILE_GRACE).await;
+        assert!(landed.is_settling(&beacons_coin.coin_id()), "landed at 1010");
+        let Spacing::Due(next) = landed.spacing(me, me.0, t0, &mut rng) else { panic!("due at a block") };
+        assert!(next >= due && (1042..=1074.max(due)).contains(&next), "32 to 64 blocks past the new landing, and never earlier than before: {next} after {due}");
+        assert_eq!(landed.spacing(beacon(), beacon().0, t0, &mut rng), Spacing::Due(beacons), "the beacon's own landing does not move the beacon's wait");
+
+        // A restart: the draw is forgotten, the landing is not.
+        let again = WalletLease::new();
+        again.restore(&dir.join("landed.json"), money());
+        assert!(again.spacing.lock().unwrap().is_empty(), "this run's memory only");
+        let Spacing::Due(redrawn) = again.spacing(me, me.0, t0, &mut seeded(2)) else { panic!("due at a block") };
+        assert!((1042..=1074).contains(&redrawn), "drawn again from the landing the file kept: {redrawn}");
+
+        // Bounded, and every draw inside 32..=64, both ends reached.
+        let bounded = settling_lease(&dir, "bounded", &[(500, Some(money()), &plain)]);
+        let payer_n = |n: u16| {
+            let mut bytes = [0xe0u8; 32];
+            bytes[..2].copy_from_slice(&n.to_be_bytes());
+            Payer(Bytes32::new(bytes))
+        };
+        let mut dues = Vec::new();
+        for n in 0..MAX_SPACED as u16 {
+            let Spacing::Due(due) = bounded.spacing(payer_n(n), payer_n(n).0, t0, &mut rng) else { panic!("due at a block") };
+            dues.push((due, payer_n(n).0));
+        }
+        assert_eq!(bounded.spacing.lock().unwrap().len(), MAX_SPACED);
+        assert_eq!(bounded.spacing(payer_n(7), payer_n(7).0, t0, &mut rng), Spacing::Due(dues[7].0), "one already kept is asked again at the bound");
+        assert_eq!(bounded.spacing.lock().unwrap().len(), MAX_SPACED, "and forgets nobody");
+        let earliest = *dues.iter().min().unwrap();
+        let newcomer = payer_n(1000);
+        assert!(matches!(bounded.spacing(newcomer, newcomer.0, t0, &mut rng), Spacing::Due(_)));
+        {
+            let kept = bounded.spacing.lock().unwrap();
+            assert_eq!(kept.len(), MAX_SPACED, "bounded");
+            assert!(!kept.contains_key(&earliest.1) && kept.contains_key(&newcomer.0), "the one due earliest is forgotten");
+            assert_eq!(dues.iter().filter(|(_, key)| kept.contains_key(key)).count(), MAX_SPACED - 1, "and no other");
+        }
+        let mut waits = std::collections::BTreeSet::new();
+        for n in 2000..2600u16 {
+            let Spacing::Due(due) = bounded.spacing(payer_n(n), payer_n(n).0, t0, &mut rng) else { panic!("due at a block") };
+            waits.insert(due - 500);
+        }
+        assert_eq!((waits.first().copied(), waits.last().copied()), (Some(SPACING_MIN_BLOCKS), Some(SPACING_MAX_BLOCKS)), "every wait in 32..=64, both ends drawn");
+        assert_eq!(bounded.spacing.lock().unwrap().len(), MAX_SPACED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Stage 4 design §13 row 7, "changes behaviour: none yet": the global
     /// check every writer of this build asks is today's whatever the payers,
     /// and with the money address named and every payer it or none, the
@@ -10041,7 +10540,6 @@ mod tests {
             ("the fuse blown", BurnerWait::FuseBlown { era: 3 }.into()),
             ("a burner's first write behind the SSF wallet's spend", BurnerWait::MoneyInFlight.into()),
             ("a knock's key beside the SSF wallet's knock under its hint", BurnerWait::MoneyUnderHint.into()),
-            ("the beacon behind another write of this node", BurnerWait::OtherWriteInFlight.into()),
             ("no dish coin ready", claim_to(T11, &Scripted::new(vec![empty_dish]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
             ("no peak for the dish", claim_to(T11, &Unanswering, nobody, |_| false, &mut rng).await.unwrap_err()),
             ("the dish's listing unread", claim_to(T11, &Scripted::new(vec![]).with_peak(200), nobody, |_| false, &mut rng).await.unwrap_err()),
@@ -10193,7 +10691,6 @@ mod tests {
         let main = |e: &anyhow::Error| format!("⛓️ ChiaHub beacon: publish for era 7 failed: {e:#} (retry in 5 min; the beacon wallet is funded separately)");
         let waits: Vec<anyhow::Error> = vec![
             claim_write::BurnerWait::NoCoinReady.into(),
-            claim_write::BurnerWait::OtherWriteInFlight.into(),
             claim_write::BurnerWait::Held.into(),
             claim_write::BurnerWait::Settling.into(),
             claim_write::BurnerWait::FuseBlown { era: 7 }.into(),
@@ -10208,9 +10705,10 @@ mod tests {
         for e in &waits {
             assert_eq!(beacon_failure_line(true, 7, e), format!("⛓️ ChiaHub beacon: the era 7 beacon waits: {e:#} (retry in 5 min)"), "a wait waits: {e:#}");
         }
+        // T4's wait is tried again at each tick, and says so.
         assert_eq!(
-            beacon_failure_line(true, 7, &claim_write::BurnerWait::OtherWriteInFlight.into()),
-            "⛓️ ChiaHub beacon: the era 7 beacon waits: another write of this station is still in flight; the beacon goes out after it (retry in 5 min)"
+            beacon_failure_line(true, 7, &claim_write::BurnerWait::Spaced.into()),
+            "⛓️ ChiaHub beacon: the era 7 beacon waits its turn: another write of this station went out a few minutes ago or is still in flight; this one goes out in its turn, some minutes after it (tried again at each tick)"
         );
         for e in waits.iter().chain([&busy, &lost]) {
             assert_eq!(beacon_failure_line(false, 7, e), main(e), "burner keys off: main's line for {e:#}");
@@ -10607,7 +11105,7 @@ mod tests {
         assert!(!beacon_took_the_tick(&Ok(BeaconDone::Guarded("refused".into()))));
         assert!(beacon_took_the_tick(&some_beacon_write()));
         assert!(beacon_took_the_tick(&Err(anyhow!("a writer's error"))));
-        assert!(beacon_took_the_tick(&Err(claim_write::BurnerWait::OtherWriteInFlight.into())), "a wait is the writer's answer too");
+        assert!(beacon_took_the_tick(&Err(claim_write::BurnerWait::Spaced.into())), "a wait is the writer's answer too, T4's among them");
     }
 
     /// The listing arm's failure line. With the SSF wallet paying, it is the
@@ -10615,6 +11113,8 @@ mod tests {
     /// burner path a wait says the listing waits, a push refused because the
     /// chain is busy says so and that waiting costs nothing, naming no peer's
     /// reason (stage 4 design §10), and anything else failed, in its own text.
+    /// A listing spaced from another payer's write (§4.3 T4) waits its turn
+    /// and names no retry cadence, since it is tried again at each tick.
     #[test]
     fn the_listing_line_says_a_burner_listing_waits_or_failed_and_is_the_ssf_wallets_line_as_it_was() {
         use super::claim_write::BurnerWait;
@@ -10639,6 +11139,14 @@ mod tests {
         for e in [&lost, &untyped] {
             assert_eq!(listing_failure_line(true, 7, e), format!("⛓️ ChiaHub presence: the era 7 listing failed: {e:#} (retry in 5 min)"));
         }
+        // T4's wait is tried again at each tick, and says so; with the SSF
+        // wallet paying no writer gives it, and the line is main's.
+        let turn = anyhow::Error::from(BurnerWait::Spaced).context("presence");
+        assert_eq!(
+            listing_failure_line(true, 7, &turn),
+            "⛓️ ChiaHub presence: the era 7 listing waits its turn: presence: another write of this station went out a few minutes ago or is still in flight; this one goes out in its turn, some minutes after it (tried again at each tick)"
+        );
+        assert_eq!(listing_failure_line(false, 7, &turn), main(&turn));
     }
 
     /// A knock that waited rests the knock arm for the retry cadence, not a
@@ -10651,6 +11159,92 @@ mod tests {
         assert!(!knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS - 1)));
         assert!(knock_paced(Some(t0), t0 + Duration::from_secs(HEARTBEAT_RETRY_SECS)), "the retry cadence has passed");
         assert_eq!(HEARTBEAT_RETRY_SECS, 300);
+    }
+
+    /// T4's wait (stage 4 design §4.3) is told from every other error a
+    /// writer gives: only `claim_write::BurnerWait::Spaced`, bare or under a
+    /// writer's context, is it. It is a typed wait, so with burner keys on
+    /// it is no knock attempt. No other wait, failure or drop of a knock
+    /// reads as it.
+    #[tokio::test]
+    async fn only_the_spaced_wait_reads_as_spaced_and_it_is_a_typed_wait_and_no_attempt() {
+        use super::claim_write::BurnerWait;
+        let bare = anyhow::Error::from(BurnerWait::Spaced);
+        let wrapped = anyhow::Error::from(BurnerWait::Spaced).context("knock on H").context("the arm");
+        for e in [&bare, &wrapped] {
+            assert!(spaced(e) && is_typed_wait(e), "{e:#}");
+            assert!(!knock_attempt_counts(true, e), "waiting is not a knock attempt: {e:#}");
+            assert!(!chain_busy(e) && !money_in_flight(e), "{e:#}");
+        }
+        let (waits, failures, drops) = knock_failures("spaced").await;
+        for (what, e) in waits.iter().chain(&failures).chain(&drops) {
+            assert!(!spaced(e), "{what}: {e:#}");
+        }
+        assert!(!spaced(&anyhow!("{}", BurnerWait::Spaced)), "its words alone, untyped, are not it");
+    }
+
+    /// The arm's pacing and its line around T4's wait (stage 4 design §4.3:
+    /// a push that would break the spacing waits 32 to 64 blocks). A try
+    /// that met it does not start the retry cadence, so the arm tries again
+    /// at its next tick and the write goes out at its due block; every other
+    /// outcome, a write, another wait or a failure, counts the cadence from
+    /// the try. And the wait is said at the first of a run of tries that met
+    /// it, not at every tick: any other outcome ends the run, and the next
+    /// such wait is said again.
+    #[test]
+    fn a_spaced_try_starts_no_retry_cadence_and_is_said_once_for_a_run_of_ticks() {
+        use super::claim_write::BurnerWait;
+        let tried = Instant::now();
+        let wait = |w: BurnerWait| -> Result<()> { Err(w.into()) };
+        assert_eq!(paced_from(tried, &wait(BurnerWait::Spaced)), None, "tried again at the next tick");
+        assert_eq!(paced_from(tried, &wait(BurnerWait::Spaced).map_err(|e| e.context("presence"))), None, "under a writer's context too");
+        assert_eq!(paced_from(tried, &Ok(())), Some(tried), "a write is paced");
+        for other in [BurnerWait::NoCoinReady, BurnerWait::Held, BurnerWait::Settling, BurnerWait::MoneyInFlight, BurnerWait::PeakUnavailable, BurnerWait::FuseBlown { era: 1 }] {
+            assert_eq!(paced_from(tried, &wait(other)), Some(tried), "every other wait rests the arm: {other}");
+        }
+        assert_eq!(paced_from::<()>(tried, &Err(anyhow!("a writer's error"))), Some(tried), "a failure is paced");
+
+        let mut said = false;
+        let run: Vec<bool> = [true, true, true, false, false, true, false, true, true].into_iter().map(|waits| spaced_first(&mut said, waits)).collect();
+        assert_eq!(run, [true, false, false, false, false, true, false, true, false], "said at the first tick of each run");
+        assert!(said, "the last try waited");
+    }
+
+    /// The knock arm's handling of a knock that met T4's wait (stage 4
+    /// design §4.3: "waiting is not a knock attempt"): it goes back to the
+    /// FRONT of the queue, ahead of the requests behind it, with its
+    /// attempts as they were, on its first attempt or its last; the arm's
+    /// rest is left as it was, so the arm tries it again at its next tick;
+    /// no host is noted; and its line comes back for the arm to say once. It
+    /// names the host's shortened node id and the room, no key, and says it
+    /// is no attempt.
+    #[test]
+    fn a_spaced_knock_goes_back_to_the_front_of_the_queue_with_no_attempt_used_and_no_rest() {
+        use super::claim_write::BurnerWait;
+        use std::collections::VecDeque;
+        let host = "0123456789abcdef0123";
+        let req = |attempts: u8| KnockRequest { room: "r".into(), host: host.into(), ck_host: [1u8; 32], kx_host: [0u8; 32], attempts };
+        let other = KnockRequest { room: "s".into(), host: "G".into(), ck_host: [2u8; 32], kx_host: [0u8; 32], attempts: 1 };
+        let (rested, now) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+        let line = "⛓️ ChiaHub knock: knock on 0123456789abcdef for room r waits its turn: another write of this station went out a few minutes ago or is still in flight; this one goes out in its turn, some minutes after it — not an attempt; tried again at each tick";
+        let e = anyhow::Error::from(BurnerWait::Spaced);
+        for burners in [true, false] {
+            for attempts in [0, MAX_KNOCK_ATTEMPTS - 1] {
+                for wait in [None, Some(rested)] {
+                    let (mut queue, mut rest, mut found) = (VecDeque::from([other.clone()]), wait, ChainKnocked::default());
+                    let said = knock_not_written(burners, req(attempts), &e, 4, now, &mut queue, &mut rest, &mut found);
+                    let case = format!("burners {burners}, attempts {attempts}, wait {wait:?}");
+                    assert_eq!(said.as_deref(), Some(line), "{case}");
+                    assert_eq!(queue, VecDeque::from([req(attempts), other.clone()]), "{case}: at the front, its attempts as they were");
+                    assert_eq!(rest, wait, "{case}: the arm's rest as it was");
+                    assert_eq!(found, ChainKnocked::default(), "{case}: no host noted");
+                }
+            }
+        }
+        // Every other error returns no line: the arm has nothing to say once.
+        let (mut queue, mut rest, mut found) = (VecDeque::new(), None, ChainKnocked::default());
+        assert_eq!(knock_not_written(true, req(0), &BurnerWait::NoCoinReady.into(), 4, now, &mut queue, &mut rest, &mut found), None);
+        assert_eq!((queue, rest), (VecDeque::from([req(0)]), Some(now)), "another wait: at the back, the arm resting");
     }
 
     /// The knock arm's handling of a failed knock (stage 4 design §5.2), as

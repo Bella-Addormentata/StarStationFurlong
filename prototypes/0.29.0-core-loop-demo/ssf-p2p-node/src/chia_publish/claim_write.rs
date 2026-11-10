@@ -55,7 +55,7 @@ use clvm_utils::{tree_hash, CurriedProgram};
 use clvmr::{Allocator, NodePtr};
 use serde::{Deserialize, Serialize};
 
-use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, WalletLease, WALLET_LEASE};
+use super::{push_parked_with, MemoWrite, ParkedInput, Payer, PushError, Spacing, WalletLease, WALLET_LEASE};
 use crate::chia_burner::BurnerKey;
 use crate::chia_chain::{ChainAccess, CoinRecord, PuzzleAndSolution};
 use crate::chia_faucet::{claim_to, records_at, unspent_at, ClaimToError, CoinLookupFailed, DishClaim, FaucetCoin, FaucetParams, Unspent, FAUCET_MOD_HASH, GIFT_MOJOS, MAX_FAUCET_PAGES};
@@ -371,7 +371,10 @@ pub enum BurnerWait {
     /// as [`AlreadyKnocked`], which would end the knock for the era on a read
     /// that was only incomplete: the next read may be whole.
     KnockKeyUnread,
-    /// No peer answered the peak, so no lobby coin can be judged ready.
+    /// No peer answered the peak, so no lobby coin can be judged ready, or,
+    /// for a burner that waits on another payer's landed spend, the block
+    /// its wait ends at cannot be compared with the chain's
+    /// ([`BurnerWait::Spaced`], fail closed).
     PeakUnavailable,
     /// No lobby coin is ready that the lease does not hold: a dry or griefed
     /// dish (§10).
@@ -390,8 +393,9 @@ pub enum BurnerWait {
     /// waits so. Only the listing names a payer to wait on here. A knock's
     /// key is kept off a hint the SSF wallet wrote under by
     /// [`BurnerWait::MoneyUnderHint`], and the beacon's names none, since the
-    /// SSF wallet writes nothing under the beacon's hint; it waits on every
-    /// other spend of this node instead ([`BurnerWait::OtherWriteInFlight`]).
+    /// SSF wallet writes nothing under the beacon's hint. Every burner's
+    /// write is spaced from a spend of the SSF wallet's besides, as from any
+    /// other payer's ([`BurnerWait::Spaced`]).
     MoneyInFlight,
     /// A knock's key K(h) would write under an inbox hint the lease holds a
     /// write of the SSF wallet's under: one the SSF wallet paid for, or one
@@ -405,16 +409,19 @@ pub enum BurnerWait {
     /// under the hint, such as another host's knock under a contact key two
     /// cards name, does not hold it.
     MoneyUnderHint,
-    /// The beacon's key B would write while the lease parks another spend of
-    /// this node, whatever its payer: a listing from P(e), a knock from K(h)
-    /// or a spend of the SSF wallet's ([`WalletLease::outgoing_pending`]).
-    /// The beacon carries the node id in the clear, so it is not pushed
-    /// while another of this node's spends waits in a mempool, as the
-    /// beacon the beacon wallet pays for never was
-    /// (`chia_publish::publish_memo_on`'s global check). The spacing between
-    /// payers (stage 4 design §4.3 T4, PR 10e) replaces this hold. A spend B
-    /// itself pays for is [`BurnerWait::Held`], as for every burner.
-    OtherWriteInFlight,
+    /// T4 (stage 4 design §4.3): two pushes from different payers of one
+    /// node land at least 32 blocks apart, so nothing on the chain shows
+    /// that a listing, a knock and a beacon written minutes apart are one
+    /// station's. The burner would push while the lease shows another
+    /// payer's spend still in flight, or landed fewer blocks ago than the
+    /// wait drawn for it, 32 to 64 ([`WalletLease::spacing`]). The other
+    /// payer is any but this burner: another burner of this node, or the
+    /// SSF wallet. A spend this burner itself pays for is
+    /// [`BurnerWait::Held`], and a rewrite from its own coin is never spaced
+    /// from its own last write. It is a wait like the others, and no knock
+    /// attempt; the arm that meets it tries again at its next tick, not on
+    /// its retry cadence (`chia_publish::spaced`).
+    Spaced,
     /// The fuse is blown: the lobby dish gave this node's burners
     /// [`MAX_GIFTS_PER_ERA`] gifts in `era`, the era the fuse counted them
     /// in ([`GiftFuse::allows`]).
@@ -440,7 +447,7 @@ impl fmt::Display for BurnerWait {
             BurnerWait::MoneyUnderHint => {
                 f.write_str("the wallet lease holds a knock the SSF wallet wrote under this knock's inbox hint, so the knock's own key does not write beside it; the next try files that knock")
             }
-            BurnerWait::OtherWriteInFlight => f.write_str("another write of this station is still in flight; the beacon goes out after it"),
+            BurnerWait::Spaced => f.write_str("another write of this station went out a few minutes ago or is still in flight; this one goes out in its turn, some minutes after it"),
             BurnerWait::FuseBlown { era } => write!(
                 f,
                 "{MAX_GIFTS_PER_ERA} gifts from the lobby dish in era {era}; no burner is funded again before era {}",
@@ -473,14 +480,9 @@ impl std::error::Error for AlreadyKnocked {}
 /// The rule a burner's key writes its slot under (stage 4 design §4.1).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
-    /// The listing's and the self-test's: a later write spends the key's own
-    /// 1-mojo coin to itself (the table's rewrite row, R5).
+    /// The listing's, the beacon's and the self-test's: a later write spends
+    /// the key's own 1-mojo coin to itself (the table's rewrite rows, R5).
     Rewritten,
-    /// The beacon's: rewritten as the listing's is (the table's two beacon
-    /// rows), and not written while the lease parks another spend of this
-    /// node ([`BurnerWait::OtherWriteInFlight`]), until the payers are
-    /// spaced (§4.3 T4, PR 10e).
-    RewrittenAlone,
     /// A knock's: K(h) writes once and is never spent again (the knock row),
     /// and never beside a write of the SSF wallet's, `money`, under its hint
     /// (§8.3).
@@ -751,6 +753,13 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 ///   asked of the burner's puzzle hash as well, which no record loses: a
 ///   parked bundle that spends a coin there ([`WalletLease::parks_spend_at`]),
 ///   or a 1-mojo coin there the lease parks, is `Held` too.
+/// - T4 (§4.3): a spend another payer of this node paid for, still in
+///   flight or landed fewer blocks ago than the wait drawn for it, is
+///   [`BurnerWait::Spaced`] ([`WalletLease::spacing`]). It is asked before
+///   the chain is asked for the burner's coins, so a spaced write asks the
+///   peers nothing about the burner; the agreed peak is read only when a
+///   wait in blocks is kept for the burner, and a peak the peers do not
+///   give is [`BurnerWait::PeakUnavailable`], fail closed.
 /// - A coin of exactly 1 mojo at the burner that the lease does not hold is
 ///   written from, the oldest first (the table's rewrite row). A coin of any
 ///   other amount is a stray and is never written from (R7).
@@ -799,8 +808,8 @@ async fn never_held_a_coin(client: &impl ChainAccess, burner_ph: Bytes32) -> Res
 /// This is the writer of a slot that is rewritten, the listing's and the
 /// self-test's. A knock's key writes once, through [`knock_write_with`],
 /// which shares this body and adds the knock slot's own checks. The
-/// beacon's key is rewritten too, through [`beacon_write_with`], which
-/// shares this body and adds its hold beside another write of this node.
+/// beacon's key is rewritten too, through [`beacon_write_with`], which is
+/// this writer with the beacon's name and no payer to wait on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -830,17 +839,11 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 /// as one an operator sent it while the beacon wallet was funded by hand, is
 /// a stray and is never written from (R7).
 ///
-/// It adds one check to that writer's, under the lease's gate, after the
-/// reconciliation and B's own [`BurnerWait::Held`] check and before the
-/// chain is asked for B's coins: while the lease parks any other spend of
-/// this node, whatever its payer, the beacon waits
-/// ([`BurnerWait::OtherWriteInFlight`]). That is the ordering the beacon
-/// always had, through the money writer's global check
-/// (`chia_publish::publish_memo_on`), kept until the payers are spaced
-/// (§4.3 T4, PR 10e), which replaces it. It names no payer to wait on
-/// before a first write ([`BurnerWait::MoneyInFlight`]): the hold above
-/// already covers a spend of the SSF wallet's, and the SSF wallet never
-/// writes under the beacon's hint.
+/// It is spaced from every other payer's spend as every burner's write is
+/// (§4.3 T4, [`BurnerWait::Spaced`]), which took the place of the hold it
+/// had beside any parked spend of this node. It names no payer to wait on
+/// before a first write ([`BurnerWait::MoneyInFlight`]): the SSF wallet
+/// never writes under the beacon's hint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn beacon_write_with<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -854,7 +857,7 @@ pub(crate) async fn beacon_write_with<R: rand::Rng + ?Sized + Send>(
     body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
     rng: &mut R,
 ) -> Result<MemoWrite> {
-    write_slot(lease, fuse, net, client, now, key, era, hint, None, body, rng, "beacon", None, Slot::RewrittenAlone).await
+    write_slot(lease, fuse, net, client, now, key, era, hint, None, body, rng, "beacon", None, Slot::Rewritten).await
 }
 
 /// A knock's write from its key K(h) (stage 4 design §4.1, the knock row:
@@ -1030,9 +1033,8 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
 
 /// The body of [`burner_write_with`], [`beacon_write_with`] and
 /// [`knock_write_with`]: every step their docs give, with `slot` the rule
-/// the key writes under. The beacon's slot ([`Slot::RewrittenAlone`]) adds
-/// one step after the first `Held` check: no other spend of this node parked
-/// ([`BurnerWait::OtherWriteInFlight`]). The knock's
+/// the key writes under. Every slot is spaced from the other payers' spends
+/// after the first `Held` check ([`BurnerWait::Spaced`]). The knock's
 /// slot ([`Slot::Once`]) adds two steps between the `Held` checks and the
 /// choice of what to write from: no write of the SSF wallet's held under
 /// its hint ([`BurnerWait::MoneyUnderHint`]), then its own question
@@ -1064,8 +1066,15 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
     if lease.outgoing_pending_for(payer) || lease.parks_spend_at(burner_ph) {
         return Err(BurnerWait::Held.into());
     }
-    if slot == Slot::RewrittenAlone && lease.outgoing_pending() {
-        return Err(BurnerWait::OtherWriteInFlight.into());
+    match lease.spacing(payer, burner_ph, now, rng) {
+        Spacing::Clear => {}
+        Spacing::InFlight => return Err(BurnerWait::Spaced.into()),
+        Spacing::Due(block) => {
+            let peak = client.peak_height().await.map_err(|_| BurnerWait::PeakUnavailable)?;
+            if peak < block {
+                return Err(BurnerWait::Spaced.into());
+            }
+        }
     }
     let (records, partial) = records_at(client, burner_ph).await?;
     let coins = Unspent::of(&records, partial).coins;
@@ -1185,8 +1194,12 @@ const CTX_CLAIM_WRITE_TEST: &str = "ssf-chia-claim-write-test-v1";
 const SELFTEST: &str = "⛓️🧪 claim-write selftest";
 
 /// How many times the self-test asks the writer while it only waits
-/// ([`BurnerWait`]), and how long it waits between asks.
-const SELFTEST_TRIES: u32 = 20;
+/// ([`BurnerWait`]), and how long it waits between asks: 45 minutes in all,
+/// past the longest T4 holds a burner behind another payer's spend, 20
+/// minutes while it is in flight and 64 blocks, about 20 minutes more, once
+/// it has landed (`chia_publish::SPACING_IN_FLIGHT_HOLD`,
+/// `chia_publish::SPACING_MAX_BLOCKS`).
+const SELFTEST_TRIES: u32 = 45;
 const SELFTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How often the self-test asks the chain's verdict on its write, and for how
@@ -1920,9 +1933,44 @@ mod tests {
 
     /// [`knock_on`] on a given lease.
     async fn knock_on_lease(lease: &WalletLease, chain: &crate::chia_chain::testing::Scripted, fuse: &Mutex<GiftFuse>, key: &BurnerKey) -> Result<MemoWrite> {
+        knock_on_lease_at(lease, chain, fuse, key, Instant::now()).await
+    }
+
+    /// [`knock_on_lease`] at a given instant.
+    async fn knock_on_lease_at(lease: &WalletLease, chain: &crate::chia_chain::testing::Scripted, fuse: &Mutex<GiftFuse>, key: &BurnerKey, now: Instant) -> Result<MemoWrite> {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-        knock_write_with(lease, fuse, ChiaNet::Testnet11, chain, Instant::now(), key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, ssf_wallet()).await
+        knock_write_with(lease, fuse, ChiaNet::Testnet11, chain, now, key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, ssf_wallet()).await
+    }
+
+    /// The instant a spend parked now has been in flight for as long as T4
+    /// holds another payer behind it (stage 4 design §4.3,
+    /// `SPACING_IN_FLIGHT_HOLD`): from then on the checks past T4's are
+    /// reached. The spend is long due for the lease's reconciliation by
+    /// then, which asks the chain for its coin before the writer asks
+    /// anything: a test scripts that answer first ([`unjudged`]).
+    fn past_the_hold() -> Instant {
+        Instant::now() + crate::chia_publish::SPACING_IN_FLIGHT_HOLD
+    }
+
+    /// The reconciliation's answer that says nothing of a parked coin: a
+    /// page that names no coin and is not dated, so the spend stays parked
+    /// and no liveness question is put.
+    fn unjudged() -> crate::chia_chain::CoinListing {
+        page(vec![], false)
+    }
+
+    /// The self-test waits past the longest T4 holds its burner behind
+    /// another payer's spend (stage 4 design §4.3): the hold on one in
+    /// flight, then the most blocks after it landed, at the chain's 18.75 s
+    /// a block. Its waits are one fewer than its tries.
+    #[test]
+    fn the_self_test_waits_out_the_longest_spacing_between_payers() {
+        use crate::chia_publish::{SPACING_IN_FLIGHT_HOLD, SPACING_MAX_BLOCKS};
+        let longest = SPACING_IN_FLIGHT_HOLD + std::time::Duration::from_millis(18_750) * SPACING_MAX_BLOCKS;
+        assert_eq!(longest, std::time::Duration::from_secs(40 * 60));
+        assert!(SELFTEST_RETRY * (SELFTEST_TRIES - 1) >= longest, "{SELFTEST_TRIES} tries, {} s apart", SELFTEST_RETRY.as_secs());
+        assert!(SELFTEST_RETRY * (SELFTEST_TRIES - 1) < longest + std::time::Duration::from_secs(10 * 60), "and not much longer");
     }
 
     /// A fuse that has counted one gift to `key` in era 0, and `strangers`
@@ -2170,31 +2218,42 @@ mod tests {
     /// A knock that the lease holds in flight waits [`BurnerWait::Held`]
     /// before anything else is judged, as every burner write does. A spend
     /// parked under the key as its payer holds it before the key's listing is
-    /// read. A 1-mojo coin at the key that the lease parks under another
-    /// payer's record (a payer the lease filed can be lost, §8 (6)) holds it
-    /// once the listing shows the coin, and no parent is asked of it.
+    /// read, and before T4 is asked. A 1-mojo coin at the key that the lease
+    /// parks under another payer's record, with a bundle that spends no coin
+    /// there (a payer the lease filed can be lost, §8 (6)), reads to T4 as
+    /// another payer's spend in flight: the knock waits its turn
+    /// ([`BurnerWait::Spaced`]) with the key's listing unread, and once T4
+    /// holds it no longer the coin holds it, as soon as the listing shows
+    /// the coin, with no parent asked of it.
     #[tokio::test]
     async fn a_knock_the_lease_holds_in_flight_is_held_before_its_key_is_judged() {
         use crate::chia_chain::testing::Scripted;
-        use rand::SeedableRng;
         let net = ChiaNet::Testnet11;
         let key = knock(net, 1);
         let coin = Coin::new(Bytes32::new([3; 32]), key.puzzle_hash(), 1);
         let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
         let other = Payer::of_burner(&burner(net, 2));
-        let rows = [("its own spend", Bytes32::new([5; 32]), Payer::of_burner(&key), vec![]), ("its coin under another payer", coin.coin_id(), other, vec![true])];
-        for (what, parked, payer, listings) in rows {
-            let chain = Scripted::new(vec![page(vec![record(coin, false)], false)]);
-            let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
-            lease.park_with_bundle([parked], &bundle, payer).unwrap();
-            let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-            let e = knock_write_with(&lease, &fuse, net, &chain, Instant::now(), &key, 0, Bytes32::new(HINT), None, |_| Ok(BODY.to_vec()), &mut rng, ssf_wallet()).await;
-            let e = e.err().expect("the knock is held");
-            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "{what}: {e:#}");
-            assert_eq!(*chain.asked_spent.lock().unwrap(), listings, "{what}");
-            assert!(chain.asked_names.lock().unwrap().is_empty(), "{what}: no parent asked");
-            assert_eq!(sent(&chain), 0, "{what}");
-        }
+
+        let chain = Scripted::new(vec![page(vec![record(coin, false)], false)]);
+        let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
+        lease.park_with_bundle([Bytes32::new([5; 32])], &bundle, Payer::of_burner(&key)).unwrap();
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is held");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "its own spend: {e:#}");
+        assert!(chain.asked_spent.lock().unwrap().is_empty() && chain.asked_names.lock().unwrap().is_empty(), "held before the key's listing is read");
+        assert_eq!(sent(&chain), 0);
+
+        let chain = Scripted::new(vec![unjudged(), page(vec![record(coin, false)], false)]);
+        let (lease, fuse) = (WalletLease::new(), Mutex::new(GiftFuse::new()));
+        lease.park_with_bundle([coin.coin_id()], &bundle, other).unwrap();
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock waits its turn");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Spaced), "its coin under another payer, parked a moment ago: {e:#}");
+        assert!(chain.asked_spent.lock().unwrap().is_empty(), "spaced before the key's listing is read");
+        let e = knock_on_lease_at(&lease, &chain, &fuse, &key, past_the_hold()).await.err().expect("the knock is held");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "its coin under another payer, once T4 holds it no longer: {e:#}");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "the lease's parked coin, then the key's listing");
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![coin.coin_id()]], "the lease's own question: no parent asked");
+        assert_eq!(sent(&chain), 0);
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
     }
 
     /// Stage 4 design §8.3: a knock's key never writes beside a write of the
@@ -2202,7 +2261,12 @@ mod tests {
     /// knock's hint that the SSF wallet paid for, parked or settling, or one
     /// with no payer filed, holds the knock as [`BurnerWait::MoneyUnderHint`],
     /// a wait, once the key's listing is read: no parent is asked, and
-    /// nothing is claimed, sent or counted. A write another burner paid for
+    /// nothing is claimed, sent or counted. Such a write is another payer's
+    /// spend too, so while it is in flight, or landed fewer blocks ago than
+    /// the wait drawn for it, T4 holds the knock first
+    /// ([`BurnerWait::Spaced`], §4.3), with the key's listing unread; this
+    /// check is what holds it after that, for as long as the lease holds
+    /// the write. A write another burner paid for
     /// under the hint (another host's knock, under a contact key two cards
     /// name), or one of the SSF wallet's under another hint, does not hold
     /// it: the knock goes on to its claim, which waits for the peak it
@@ -2223,33 +2287,71 @@ mod tests {
             ("another burner's, parked", HINT, Some(other), false, false),
             ("the SSF wallet's under another hint", [0x73; 32], Some(ssf_wallet()), false, false),
         ];
+        // Each is another payer's spend to the knock's key, so T4 is asked
+        // first (§4.3, `BurnerWait::Spaced`): these rows are read once T4
+        // holds the knock no longer, a parked spend 20 minutes on and a
+        // settling one with the peak past the longest wait. The lease's
+        // reconciliation asks for its coin first, parked or settling.
+        let spent_at = SEEN_AT + 1;
         for (what, under, payer, settling, holds) in rows {
             let bundle = crate::chia_publish::build_publish_bundle(net, &sk, coin, Bytes32::new(under), Bytes::new(BODY.to_vec())).unwrap();
             let lease = WalletLease::new();
-            let mut pages = vec![page(vec![], false)];
-            if settling {
+            let chain = if settling {
                 let input = ParkedInput { coin_id: coin.coin_id(), seen_at: Some(SEEN_AT) };
-                lease.retire(&[], vec![(1, super::super::Settling { coins: vec![input], spent_at: SEEN_AT + 1, bundle, payer })], &[], &[], &[], Instant::now());
-                // The lease's reconciliation asks for the settling coin first,
-                // and finds it spent where the lease holds it.
-                let spent = CoinRecord { coin, confirmed_block_index: SEEN_AT, spent: true, spent_block_index: SEEN_AT + 1 };
-                pages.insert(0, CoinListing { records: vec![spent], truncated: false, next_cursor: None, judged_at: Some(SEEN_AT + 2) });
+                lease.retire(&[], vec![(1, super::super::Settling { coins: vec![input], spent_at, bundle, payer })], &[], &[], &[], Instant::now());
+                // It finds the settling coin spent where the lease holds it.
+                let spent = CoinRecord { coin, confirmed_block_index: SEEN_AT, spent: true, spent_block_index: spent_at };
+                let found = CoinListing { records: vec![spent], truncated: false, next_cursor: None, judged_at: Some(spent_at + 1) };
+                Scripted::new(vec![found, page(vec![], false)]).with_peak(spent_at + crate::chia_publish::SPACING_MAX_BLOCKS)
             } else {
                 lease.park_with_bundle([coin.coin_id()], &bundle, payer.expect("a parking names its payer")).unwrap();
-            }
-            let chain = Scripted::new(pages);
+                Scripted::new(vec![unjudged(), page(vec![], false)])
+            };
             let fuse = Mutex::new(GiftFuse::new());
-            let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+            let e = knock_on_lease_at(&lease, &chain, &fuse, &key, past_the_hold()).await.err().expect("the knock is not written");
             let expected = if holds { BurnerWait::MoneyUnderHint } else { BurnerWait::PeakUnavailable };
             assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&expected), "{what}: {e:#}");
-            let listings = if settling { vec![true, true] } else { vec![true] };
-            assert_eq!(*chain.asked_spent.lock().unwrap(), listings, "{what}: the lease's settling coin, then the key's listing, once");
-            let reconciled = if settling { vec![vec![coin.coin_id()]] } else { vec![] };
-            assert_eq!(*chain.asked_names.lock().unwrap(), reconciled, "{what}: no parent asked");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "{what}: the lease's coin, then the key's listing, once");
+            assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![coin.coin_id()]], "{what}: the lease's own question, and no parent asked");
             assert_eq!(sent(&chain), 0, "{what}: nothing sent");
             assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "{what}: no gift counted");
-            assert_eq!(lease.is_settling(&coin.coin_id()), settling, "{what}: the lease as it was");
+            assert_eq!((lease.is_settling(&coin.coin_id()), lease.is_parked(&coin.coin_id())), (settling, !settling), "{what}: the lease as it was");
         }
+
+        // Before that, T4 holds the knock, with the key's listing unread: a
+        // spend parked a moment ago is in flight; one that landed a block
+        // ago holds it until the block drawn, and with no peak to compare
+        // that block with the knock waits, fail closed.
+        let under_hint = || crate::chia_publish::build_publish_bundle(net, &sk, coin, Bytes32::new(HINT), Bytes::new(BODY.to_vec())).unwrap();
+        let landed = || {
+            let lease = WalletLease::new();
+            let input = ParkedInput { coin_id: coin.coin_id(), seen_at: Some(SEEN_AT) };
+            lease.retire(&[], vec![(1, super::super::Settling { coins: vec![input], spent_at, bundle: under_hint(), payer: Some(ssf_wallet()) })], &[], &[], &[], Instant::now());
+            let spent = CoinRecord { coin, confirmed_block_index: SEEN_AT, spent: true, spent_block_index: spent_at };
+            (lease, CoinListing { records: vec![spent], truncated: false, next_cursor: None, judged_at: Some(spent_at + 1) })
+        };
+        let fuse = Mutex::new(GiftFuse::new());
+        let (lease, chain) = (WalletLease::new(), Scripted::new(vec![page(vec![], false)]));
+        lease.park_with_bundle([coin.coin_id()], &under_hint(), ssf_wallet()).unwrap();
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Spaced), "the SSF wallet's, parked a moment ago: {e:#}");
+        assert!(chain.asked_spent.lock().unwrap().is_empty(), "the key's listing unread");
+        for (what, peak, expected) in [
+            ("no peak", None, BurnerWait::PeakUnavailable),
+            ("31 blocks on", Some(spent_at + crate::chia_publish::SPACING_MIN_BLOCKS - 1), BurnerWait::Spaced),
+        ] {
+            let (lease, found) = landed();
+            let chain = Scripted::new(vec![found, page(vec![], false)]);
+            let chain = match peak {
+                Some(peak) => chain.with_peak(peak),
+                None => chain,
+            };
+            let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+            assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&expected), "the SSF wallet's, landed a block ago, {what}: {e:#}");
+            assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "{what}: the lease's settling coin alone, the key's listing unread");
+            assert_eq!(sent(&chain), 0, "{what}: nothing sent");
+        }
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
 
         // The order of the knock's checks (`knock_write_with`'s doc). With
         // the SSF wallet's write held under the hint, a key whose own write
@@ -2259,18 +2361,17 @@ mod tests {
         // Without the wallet's write the same listing is already knocked.
         // And a spend the lease holds for the key itself is held before
         // either is asked, with the key's listing unread.
-        let under_hint = || crate::chia_publish::build_publish_bundle(net, &sk, coin, Bytes32::new(HINT), Bytes::new(BODY.to_vec())).unwrap();
-        let wrote = || Scripted::new(vec![page(vec![record(Coin::new(Bytes32::new([4; 32]), key.puzzle_hash(), 1), true)], false)]);
+        let wrote = || page(vec![record(Coin::new(Bytes32::new([4; 32]), key.puzzle_hash(), 1), true)], false);
         let fuse = Mutex::new(GiftFuse::new());
-        let (lease, chain) = (WalletLease::new(), wrote());
+        let (lease, chain) = (WalletLease::new(), Scripted::new(vec![unjudged(), wrote()]));
         lease.park_with_bundle([coin.coin_id()], &under_hint(), ssf_wallet()).unwrap();
-        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+        let e = knock_on_lease_at(&lease, &chain, &fuse, &key, past_the_hold()).await.err().expect("the knock is not written");
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::MoneyUnderHint), "the wallet's write is asked of before the key's own: {e:#}");
         assert_eq!(e.downcast_ref::<AlreadyKnocked>(), None, "a wait, not a drop: {e:#}");
-        let chain = wrote();
+        let chain = Scripted::new(vec![wrote()]);
         let e = knock_on_lease(&WalletLease::new(), &chain, &fuse, &key).await.err().expect("the knock is not written");
         assert_eq!(e.downcast_ref::<AlreadyKnocked>(), Some(&AlreadyKnocked), "with no write of the wallet's held: {e:#}");
-        let (lease, chain) = (WalletLease::new(), wrote());
+        let (lease, chain) = (WalletLease::new(), Scripted::new(vec![wrote()]));
         lease.park_with_bundle([coin.coin_id()], &under_hint(), ssf_wallet()).unwrap();
         lease.park_with_bundle([Bytes32::new([5; 32])], &SpendBundle::new(vec![], chia_bls::Signature::default()), Payer::of_burner(&key)).unwrap();
         let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is held");

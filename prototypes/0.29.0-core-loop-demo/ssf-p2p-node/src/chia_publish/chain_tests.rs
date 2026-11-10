@@ -128,8 +128,7 @@
 //! (`a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_and_waits_behind_any_parked_spend`).
 //! A beacon B paid for as a wallet, still in flight, holds the burner's
 //! (`a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_settles`),
-//! as does any other spend of this node the lease has parked, on both paths
-//! (`a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lands`).
+//! as a spend of B's own.
 //! The beacon guard refuses the beacon on both paths while the other
 //! network's beacon mark in the same folder is fresh, asks the chain nothing
 //! and leaves that file as it was
@@ -154,6 +153,30 @@
 //! (`a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_written_again_from_another_coin_with_one_gift_counted`).
 //! The step refuses a burner root of another network
 //! (`a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing`).
+//!
+//! T4 (stage 4 design §4.3, §11 row 8) spaces the pushes of one node's
+//! different payers: a burner's writer asks the lease before it reads its
+//! key's coins, and waits (`claim_write::BurnerWait::Spaced`) while another
+//! payer's spend is in flight, for at most [`SPACING_IN_FLIGHT_HOLD`], and
+//! for 32 to 64 blocks after one landed. A listing, a knock and the beacon
+//! of one node land at least 32 blocks apart, each at the block drawn for
+//! it
+//! (`a_listing_a_knock_and_the_beacon_of_one_node_land_at_least_32_blocks_apart_each_at_the_block_drawn_for_it`),
+//! and a spaced knock and beacon wait in their arms' steps with no attempt
+//! used
+//! (`a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_go_out_at_the_blocks_drawn_for_them`).
+//! A spend stuck in the mempools holds the other payers for 20 minutes and
+//! no longer, and its own payer until it lands (§10)
+//! (`a_spend_stuck_in_the_mempools_holds_the_other_payers_for_twenty_minutes_and_its_own_payer_until_it_lands`).
+//! A restart holds a payer behind a restored spend and keeps the fewest
+//! blocks from its landing
+//! (`a_restart_holds_a_payer_behind_a_restored_spend_and_keeps_the_fewest_blocks_from_its_landing`).
+//! A rewrite is not spaced from its own payer's last write, and a spend of
+//! the SSF wallet's spaces a burner as any payer's does
+//! (`a_rewrite_is_not_spaced_from_its_own_last_write_and_the_ssf_wallets_spend_spaces_a_burner_as_any_payers_does`).
+//! The tests of the other rules keep T4 out of what they show: they start
+//! past its hold on a spend in flight ([`Setup::past_the_hold`]) and let a
+//! landing's turn pass before another payer writes ([`Setup::turn`]).
 //!
 //! No test here calls the node's own writers, which run on the
 //! process-wide lease (`claim_write::burner_write`, [`publish_burner_presence`],
@@ -290,6 +313,50 @@ impl Setup {
     async fn reconcile(&mut self) {
         let at = self.later();
         self.lease.reconcile_at(NET, &self.money, at).await;
+    }
+
+    /// The next step ([`Self::later`]) runs at `instant`. T4 counts a
+    /// parked spend as in flight for [`SPACING_IN_FLIGHT_HOLD`] from its
+    /// parking (stage 4 design §4.3), and a writer parks its spend at the
+    /// wall clock's instant ([`push_parked_with`]), while the test's clock
+    /// runs ahead of the wall clock by twice the grace for every step
+    /// taken. A test that means a spend to have been in flight for so long
+    /// sets the clock by the wall clock's reading around its push.
+    fn next_at(&mut self, instant: Instant) {
+        self.clock = instant - RECONCILE_GRACE * 2;
+    }
+
+    /// The test's clock set past T4's hold on a spend in flight
+    /// ([`SPACING_IN_FLIGHT_HOLD`]): every spend parked so far has been in
+    /// flight that long at the next step, and so has every spend parked
+    /// after it, since a writer parks at the wall clock's instant
+    /// ([`Self::next_at`]) and the test's clock now runs that far ahead of
+    /// it. From here on no spend in flight spaces another payer's push;
+    /// only a landing does, until its turn has passed ([`Self::turn`]). A
+    /// test of anything but T4's hold starts with it, so that what it shows
+    /// waiting waits on the rule it is about.
+    fn past_the_hold(&mut self) {
+        self.clock = self.clock.max(Instant::now()) + SPACING_IN_FLIGHT_HOLD;
+    }
+
+    /// The chain farmed up to `height`, if it is not there yet.
+    async fn at_block(&self, height: u32) {
+        if self.chain.peak() < height {
+            self.chain.farm_to(height).await;
+        }
+    }
+
+    /// The other payers' turn (T4, stage 4 design §4.3): the block that
+    /// takes what is in the mempools and [`SPACING_MAX_BLOCKS`] more are
+    /// farmed, and the lease is reconciled until every spend that landed
+    /// has settled and gone, so nothing spaces the next payer's push: the
+    /// longest a push waits behind another payer's. The peak it leaves.
+    async fn turn(&mut self) -> u32 {
+        self.chain.farm().await;
+        let peak = self.chain.farm_blocks(SPACING_MAX_BLOCKS).await;
+        self.reconcile().await;
+        self.reconcile().await;
+        peak
     }
 
     /// A write's standing as the knock and beacon verdicts take it: the
@@ -990,6 +1057,16 @@ fn names_no_beacon(e: &anyhow::Error, key: &BurnerKey) {
         assert!(!text.contains(&hex), "{text}");
         assert!(addresses.iter().all(|a| !text.contains(a.as_str())), "{text}");
     }
+}
+
+/// The blocks T4 makes a payer wait behind another payer's landed spend
+/// when its writer is handed a random source seeded by `seed` ([`Setup`]'s
+/// writers seed one anew for every step): the wait is the first thing a
+/// burner's writer draws, before it picks a lobby coin
+/// ([`WalletLease::spacing`]).
+fn spaced_by(seed: u64) -> u32 {
+    use rand::Rng;
+    StdRng::seed_from_u64(seed).gen_range(SPACING_MIN_BLOCKS..=SPACING_MAX_BLOCKS)
 }
 
 /// The beacons read under era `era`'s public hint as a newcomer reads them
@@ -2076,6 +2153,7 @@ async fn a_restart_mid_claim_and_write_pushes_the_saved_two_spend_bundle_and_fun
 #[tokio::test]
 async fn a_claim_and_write_hands_its_body_the_gift_so_a_knock_sealed_in_it_opens_for_the_host() {
     let mut s = setup().await;
+    s.past_the_hold();
     let host = iroh::SecretKey::generate();
     let host_kx = crate::chia_contact::kx_card_secret(&host);
     let ck_host = [33u8; 32];
@@ -2342,8 +2420,8 @@ async fn a_money_presence_write_files_the_wallet_as_its_payer_and_the_lease_hold
 
 /// The money writer keeps main's global check on the lease it is given: a
 /// spend of any payer still parked holds a write the SSF wallet pays for
-/// (`publish_memo_on`, stage 4 design §4.3 T4 for the spacing that will
-/// replace it). A burner's claim and write is live in the mempool, its dish
+/// (`publish_memo_on`; T4, stage 4 design §4.3, spaces the burners' writes
+/// and leaves this writer its check). A burner's claim and write is live in the mempool, its dish
 /// coin parked under the burner. Wallet W's listing then waits, as the
 /// settling wallet's write always did: nothing new is sent, since the
 /// reconciliation's probe pushes the burner's own bundle again, and W's
@@ -2390,6 +2468,7 @@ async fn a_money_presence_write_waits_while_any_spend_on_its_lease_is_parked_as_
 #[tokio::test]
 async fn a_stale_take_marker_never_lets_a_burner_claim_its_dish_coin() {
     let mut s = setup().await;
+    s.past_the_hold();
     let (coins, made) = ready_dishes(&s, &[10, 10]).await;
     let (f1, f2) = (coins[0], coins[1]);
     let money = wallet(39);
@@ -2458,6 +2537,7 @@ async fn the_fuse_stops_a_seventeenth_gift_and_sends_nothing() {
 #[tokio::test]
 async fn a_claim_and_write_a_strangers_claim_beat_gives_its_gift_back_to_the_fuse_and_its_burner_is_funded_again() {
     let mut s = setup().await;
+    s.past_the_hold();
     let (f, _) = ready_dish(&s, 1).await;
     s.preset_fuse(0, strangers(15));
     let key = burner(43, 0);
@@ -3360,10 +3440,16 @@ async fn a_listing_on_a_root_of_another_network_is_refused_and_sends_nothing() {
 /// and a later spend of W's in flight holds no rewrite from P(0)'s own
 /// coin. A spend in flight that is this era's listing does not end with the
 /// wait: the next tests show its lost mark filed again, holding P(0) for the
-/// era.
+/// era. T4's spacing between payers is a wait of its own, with tests of its
+/// own: here every spend has been in flight past T4's hold
+/// ([`Setup::past_the_hold`]) and a landing's turn has passed before the
+/// next payer writes ([`Setup::turn`]), so what waits here waits on this
+/// rule, which goes on holding P(0)'s first write behind a spend of W's
+/// that T4 holds it for no longer.
 #[tokio::test]
 async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_in_flight_and_goes_out_once_it_lands() {
     let mut s = setup().await;
+    s.past_the_hold();
     let (w, v, node) = (wallet(68), wallet(69), iroh::SecretKey::generate());
     let key = burner(68, 0);
     let (dish, _) = ready_dishes(&s, &[1, 1, 1]).await;
@@ -3378,7 +3464,7 @@ async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_
     let (_, vs) = s.listing(&v, &node, 0, &entries(), unix_now(), 2).await.expect("not held by another payer's spend");
     assert_eq!(vs.payer, Payer::of_burner(&burner(69, 0)), "V's P(0) writes");
     let v_listing = s.chain.received().last().cloned().expect("V's listing was sent");
-    s.chain.farm().await;
+    s.turn().await;
 
     let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
     let funded = s.chain.farm().await;
@@ -3398,11 +3484,11 @@ async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_
     assert_eq!(free(&s), 1, "no lobby coin parked for P(0)");
     assert_eq!(s.gifts(0), 2, "no gift counted for P(0): the other burner's and V's");
 
-    s.chain.farm().await;
+    s.turn().await;
     let (hint, first) = s.listing(&w, &node, 0, &entries(), at, 4).await.unwrap();
     let f = *dish.iter().find(|c| c.coin_id() == first.coins.parked).expect("a lobby coin, parked");
     let g = gift(&key, f);
-    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "W's knock landed: P(0)'s first write goes out");
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "W's knock landed and its turn passed: P(0)'s first write goes out");
     assert_eq!(first.payer, Payer::of_burner(&key));
     assert_eq!(s.gifts(0), 3);
     let landed = s.chain.farm().await;
@@ -3429,7 +3515,8 @@ async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_
 /// coins, record digest and spend, and the address set, date and node id
 /// its record carries. With it, the burner path's step holds P(0)'s write
 /// by the hint rule where, with no mark, P(0) would write at once; the
-/// seam's own wait holds P(0)'s first write while W's spend is parked. Once
+/// seam's own wait holds P(0)'s first write while W's spend is parked, here
+/// in flight past T4's hold, which answers first until then. Once
 /// W's spend lands it is still found while it settles, and the mark's reader
 /// confirms the write. The step goes on holding P(0) for the era, and P(0)
 /// never writes. A mark that names the write is not filed again, and on the
@@ -3438,6 +3525,7 @@ async fn a_burner_listings_first_write_waits_while_a_spend_of_the_ssf_wallet_is_
 #[tokio::test]
 async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_filed_again_and_holds_the_burner() {
     let mut s = setup().await;
+    s.past_the_hold();
     let dir = Dir::new("lost-money-mark");
     let path = dir.0.join("wallet_lease.json");
     let (w, node) = (wallet(70), iroh::SecretKey::generate());
@@ -3867,6 +3955,7 @@ async fn a_knock_whose_coin_a_clone_spent_elsewhere_is_already_knocked_on_any_le
 #[tokio::test]
 async fn a_stray_at_a_knock_key_counts_as_a_knock_only_if_the_key_made_it_and_is_never_written_from_at_any_other_amount() {
     let mut s = setup().await;
+    s.past_the_hold();
     let node = iroh::SecretKey::generate();
     let [(two, two_kx), (lifted, lifted_kx), (made, _), (lone, _)] = [[0x76; 32], [0x77; 32], [0x78; 32], [0x79; 32]].map(host_card);
     let (k_two, k_lifted, k_made, k_lone) = (knock_key(76, &two, 0), knock_key(76, &lifted, 0), knock_key(76, &made, 0), knock_key(76, &lone, 0));
@@ -3907,6 +3996,9 @@ async fn a_stray_at_a_knock_key_counts_as_a_knock_only_if_the_key_made_it_and_is
         assert_eq!(opened.iter().map(|o| o.coin_id).collect::<Vec<_>>(), vec![burner_coin(key, parent).coin_id()], "opens for its host");
     }
 
+    // The two knocks' turn passes first: T4 answers before a key's coins
+    // are read, and each knock's landing would space the other's key.
+    s.turn().await;
     for (req, key, what) in [(&two, &k_two, "the knock beside the stray"), (&lifted, &k_lifted, "the knock from the lifted claim"), (&made, &k_made, "a coin K(h) made"), (&lone, &k_lone, "a coin whose parent no node returns")] {
         let again = s.knock(76, &node, req, 0, || Ok(None), 3).await.map(|(_, write)| write);
         assert!(knocked_already(&again), "{what}: {:?}", again.as_ref().err());
@@ -3931,6 +4023,8 @@ async fn two_knocks_to_two_hosts_in_one_era_come_from_two_burners_with_two_gifts
     let (k_a, k_b) = (knock_key(77, &a, 0), knock_key(77, &b, 0));
     ready_dishes(&s, &[1, 1]).await;
     let (_, to_a) = s.knock(77, &node, &a, 0, || Ok(None), 1).await.unwrap();
+    // Two payers: the second goes out once the first's turn has passed (T4).
+    s.turn().await;
     let (_, to_b) = s.knock(77, &node, &b, 0, || Ok(None), 2).await.unwrap();
     assert_eq!((to_a.payer, to_b.payer), (Payer::of_burner(&k_a), Payer::of_burner(&k_b)));
     assert!(to_a.payer != to_b.payer && k_a.puzzle_hash() != k_b.puzzle_hash(), "two burners");
@@ -3956,7 +4050,8 @@ async fn two_knocks_to_two_hosts_in_one_era_come_from_two_burners_with_two_gifts
 /// ([`knock_on_path`]). Each is written from a burner key of its own, bound
 /// to its host's node id ([`knock_burner`]), with a gift of its own from a
 /// dish coin of its own, under the one hint. The second host is asked for
-/// while the first knock is still parked, and the step does not file that
+/// while the first knock is still parked (in flight past T4's hold, so the
+/// second waits on nothing), and the step does not file that
 /// knock as the second host's, since another host's key paid for it.
 /// Neither is read as already knocked. Once they land each opens for its
 /// own host alone, and a second knock to either host is already knocked by
@@ -3964,6 +4059,7 @@ async fn two_knocks_to_two_hosts_in_one_era_come_from_two_burners_with_two_gifts
 #[tokio::test]
 async fn two_hosts_whose_cards_share_a_contact_key_each_get_a_knock_from_a_burner_of_its_own() {
     let mut s = setup().await;
+    s.past_the_hold();
     let node = iroh::SecretKey::generate();
     let ((a, a_kx), (b, b_kx)) = (host_card([0x95; 32]), host_card([0x95; 32]));
     let hint = knock_hint(NET, &a, &ROOM_KEY, 0);
@@ -3992,6 +4088,9 @@ async fn two_hosts_whose_cards_share_a_contact_key_each_get_a_knock_from_a_burne
             "its own knock opens under the shared hint, and the other's does not"
         );
     }
+    // The two knocks' turn passes first: each landing would space the
+    // other's key (T4) before its own coin is read.
+    s.turn().await;
     for (seed, req) in [(3, &a), (4, &b)] {
         let again = s.knock(93, &node, req, 0, || Ok(None), seed).await.map(|(_, write)| write);
         assert!(knocked_already(&again), "{:?}", again.as_ref().err());
@@ -4005,7 +4104,8 @@ async fn two_hosts_whose_cards_share_a_contact_key_each_get_a_knock_from_a_burne
 /// share: host A's knock goes out from A's own key through the knock arm's
 /// step, and the node stops before `knocks.json` is saved. It restarts with
 /// burner keys on, the book lost and the lease restored from its file, A's
-/// spend parked. Host B, whose card names the same contact key, is asked for
+/// spend parked, in flight past T4's hold. Host B, whose card names the same
+/// contact key, is asked for
 /// first: the step does not file A's held knock as B's, since A's key paid
 /// for it, and B's knock is written from B's own key under the same hint.
 /// Then A is asked for again, and the step files A's lost entry from the
@@ -4020,6 +4120,7 @@ async fn two_hosts_whose_cards_share_a_contact_key_each_get_a_knock_from_a_burne
 #[tokio::test]
 async fn a_knock_whose_entry_a_restart_lost_is_not_filed_as_another_hosts_under_a_shared_contact_key_and_is_filed_again_as_its_own() {
     let mut s = setup().await;
+    s.past_the_hold();
     let dir = Dir::new("lost-shared-knock");
     let path = dir.0.join("wallet_lease.json");
     let (w, node) = (wallet(94), iroh::SecretKey::generate());
@@ -4074,11 +4175,14 @@ async fn a_knock_whose_entry_a_restart_lost_is_not_filed_as_another_hosts_under_
 /// in flight, W79's listing goes out with no wait, since the knock is
 /// K(h)'s and not the wallet's. Three lobby coins are claimed. Once they
 /// land, both of W79's writes are read back, and they share no puzzle hash,
-/// gift or dish coin. W78's spend landed too, so its listing goes out from
-/// the fourth.
+/// gift or dish coin. W78's spend landed too, so once its turn has passed
+/// its listing goes out from the fourth. T4's spacing is not this test's:
+/// every spend here has been in flight past T4's hold
+/// ([`Setup::past_the_hold`]).
 #[tokio::test]
 async fn a_knock_and_the_listing_of_one_node_in_one_era_come_from_two_burners_and_only_the_listings_first_write_waits_on_the_ssf_wallet() {
     let mut s = setup().await;
+    s.past_the_hold();
     let (w78, w79) = (wallet(78), wallet(79));
     let (node78, node79) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
     let ((host78, _), (host79, host79_kx)) = (host_card([0x7c; 32]), host_card([0x7d; 32]));
@@ -4099,7 +4203,7 @@ async fn a_knock_and_the_listing_of_one_node_in_one_era_come_from_two_burners_an
     assert!(s.lease.outgoing_pending_for(knock79.payer) && !s.lease.outgoing_pending_for(Payer::of(&w79)), "W79's knock in flight, paid by its K(h)");
     let (_, listing79) = s.listing(&w79, &node79, 0, &entries(), at, 4).await.expect("not held by the knock");
     assert_eq!(listing79.payer, Payer::of_burner(&burner(79, 0)), "P(0) writes");
-    let claimed = |s: &Setup| dish.iter().filter(|c| s.lease.is_taken(&c.coin_id())).count();
+    let claimed = |s: &Setup| dish.iter().filter(|c| s.lease.is_taken(&c.coin_id()) || s.chain.record(c.coin_id()).is_some_and(|r| r.2.is_some())).count();
     assert_eq!((claimed(&s), s.gifts(0)), (3, 3), "three lobby coins claimed, three gifts");
 
     let landed = s.chain.farm().await;
@@ -4111,7 +4215,8 @@ async fn a_knock_and_the_listing_of_one_node_in_one_era_come_from_two_burners_an
     assert!(knock_key(79, &host79, 0).puzzle_hash() != burner(79, 0).puzzle_hash() && knock79.payer != listing79.payer, "two burners");
     assert!(knock79.coins.parent != listing79.coins.parent && knock79.coins.parked != listing79.coins.parked, "no gift or dish coin shared");
 
-    let (_, listing78) = s.listing(&w78, &node78, 0, &entries(), at, 5).await.expect("W78's spend landed: its listing goes out");
+    s.turn().await;
+    let (_, listing78) = s.listing(&w78, &node78, 0, &entries(), at, 5).await.expect("W78's spend landed and its turn passed: its listing goes out");
     assert_eq!(listing78.payer, Payer::of_burner(&burner(78, 0)));
     assert_eq!((claimed(&s), s.gifts(0)), (4, 4), "the fourth lobby coin");
     assert!(s.chain.unanswered().is_empty());
@@ -4529,19 +4634,25 @@ async fn the_knock_arms_step_writes_from_its_own_burner_key_on_the_burner_path_a
 /// claimed and nothing is sent. On the SSF wallet's own path the step
 /// leaves W's write to main's rule, so main's global check holds the knock
 /// while W's spend is parked, and a write under another hint (another
-/// host's, or another era's) files nothing. Once W's knock lands it is
-/// still found while it settles, and the entry's coins are confirmed. A
-/// burner's knock the lease holds settling, K(h)'s own, is filed on either
-/// path: on the burner path it keeps its dial-back, and on the SSF wallet's
-/// path (burner keys turned off after a stop) it is another payer's, which
-/// W must not write beside. A lease that has forgotten a write files
-/// nothing. Asked alone, without the step, the burner's writer does not
-/// write beside W either: it reads the lease under its own gate as it
-/// writes and waits (`BurnerWait::MoneyUnderHint`), sending nothing and
-/// counting no gift.
+/// host's, or another era's) files nothing. Asked alone, without the step,
+/// the burner's writer does not write beside W either: it reads the lease
+/// under its own gate as it writes and waits
+/// (`BurnerWait::MoneyUnderHint`), sending nothing and counting no gift.
+/// That is the writer's check behind T4, which answers first for as long
+/// as it holds K(h) behind W's spend: here W's knock has been in flight
+/// past T4's hold ([`Setup::past_the_hold`]), and while one settles T4
+/// holds every other payer (the writer's unit tests). Once W's knock lands
+/// it is still found while it settles, and the entry's coins are
+/// confirmed. A burner's knock the lease holds settling, K(h)'s own,
+/// written once W's turn has passed, is filed on either path: on the
+/// burner path it keeps its dial-back, and on the SSF wallet's path
+/// (burner keys turned off after a stop) it is another payer's, which W
+/// must not write beside. A lease that has forgotten a write files
+/// nothing.
 #[tokio::test]
 async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_lease_holds_under_its_hint() {
     let mut s = setup().await;
+    s.past_the_hold();
     let dir = Dir::new("lost-knock-entry");
     let path = dir.0.join("wallet_lease.json");
     let (w, node) = (wallet(91), iroh::SecretKey::generate());
@@ -4584,6 +4695,15 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) still wrote nothing");
     assert_eq!(s.sent(), HashSet::from([theirs.name()]), "W's knock, pushed again at most");
 
+    // Asked alone, without the step, while W's knock is parked, in flight
+    // past T4's hold: the writer's own check under the hint.
+    let (before, gifts) = (s.sent(), s.gifts(0));
+    let alone = s.knock(91, &node, &req, 0, || Ok(None), 5).await.map(|(_, write)| write);
+    assert_eq!(waited(&alone), Some(BurnerWait::MoneyUnderHint), "the writer's own check, under the hint W's knock holds");
+    assert_eq!(s.sent(), before, "nothing sent");
+    assert_eq!(s.gifts(0), gifts, "no gift counted");
+    assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
+
     let landed = s.chain.farm().await;
     let filed = WriteCoins::filed(&lost.coin_id, &lost.parked).expect("the entry's coins");
     let digest = crate::chia_resolve::parse_hex32(&lost.memo).expect("the entry keeps its memo's digest");
@@ -4595,6 +4715,8 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
     assert_eq!(opened.iter().map(|o| o.coin_id).collect::<Vec<_>>(), vec![written(&w, coin).coin_id()], "W's knock opens for the host");
     assert_eq!(s.sent(), HashSet::from([theirs.name()]), "the one knock under the hint");
 
+    // W's turn passes before another payer's knock goes out (T4).
+    s.turn().await;
     let (hint2, write2) = s.knock(91, &node, &other, 0, || Ok(None), 1).await.unwrap();
     let key2 = knock_key(91, &other, 0);
     s.chain.farm().await;
@@ -4608,12 +4730,6 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
         assert_eq!(arm_refiled(&done), Some(entry.clone()), "{what}");
     }
     assert_eq!(lost_knock_entry(WalletLease::new().held_writes_under(hint2).await, || Payer::of_burner(&key2), &money, false, &other, hint2, 0, at), None, "a lease that has forgotten it");
-
-    let (before, gifts) = (s.sent(), s.gifts(0));
-    let alone = s.knock(91, &node, &req, 0, || Ok(None), 5).await.map(|(_, write)| write);
-    assert_eq!(waited(&alone), Some(BurnerWait::MoneyUnderHint), "the writer's own check, under the hint W's knock holds");
-    assert_eq!(s.sent(), before, "nothing sent");
-    assert_eq!(s.gifts(0), gifts, "no gift counted");
     assert!(s.chain.received().iter().all(|b| !spends_at(b, key.puzzle_hash())), "K(h) wrote nothing");
     assert!(s.chain.unanswered().is_empty());
 }
@@ -4621,15 +4737,22 @@ async fn a_knock_whose_entry_a_restart_lost_is_filed_again_from_the_write_the_le
 /// Stage 4 design §8.3, between the knock arm's step and its writer
 /// ([`knock_on_path`]): the step reads the lease under its gate and gives the
 /// gate back before the burner's writer takes it again, and the writer asks
-/// the lease once more, under its own gate, naming the SSF wallet's payer as
-/// the step gives it, the wallet key's ([`Payer::of`]). Here the step finds
-/// nothing held under the knock's hint, and a knock the SSF wallet pays for
-/// is parked under that hint at the very point the step hands over to the
-/// writer, where it reads the clock. The writer waits
-/// ([`BurnerWait::MoneyUnderHint`]): K(h) claims no lobby coin, sends nothing
-/// and counts no gift, and the wallet's knock stays the only write under the
-/// hint. The next step then finds the wallet's knock and files it, writing
-/// nothing.
+/// the lease once more, under its own gate. Here the step finds nothing
+/// held under the knock's hint, and a knock the SSF wallet pays for is
+/// parked under that hint at the very point the step hands over to the
+/// writer, where it reads the clock. The writer waits, by two rules that
+/// each read the lease under the writer's gate:
+/// - T4 first (§4.3): the wallet's knock is another payer's spend in flight
+///   ([`BurnerWait::Spaced`]);
+/// - and behind it the writer's own check under the hint
+///   ([`BurnerWait::MoneyUnderHint`]), naming the SSF wallet's payer as the
+///   step gives it, the wallet key's ([`Payer::of`]). It is reached when
+///   the clock the writer reads puts the wallet's knock in flight past
+///   T4's hold, as a spend stuck in the mempools is.
+///
+/// Either way K(h) claims no lobby coin, sends nothing and counts no gift,
+/// and the wallet's knock stays the only write under the hint. The next
+/// step then finds the wallet's knock and files it, writing nothing.
 #[tokio::test]
 async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_the_burners_writer() {
     let mut s = setup().await;
@@ -4641,25 +4764,34 @@ async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_
     let (dish, made) = ready_dishes(&s, &[1, 1]).await;
     let hint = knock_hint(NET, &req, &ROOM_KEY, 0);
     let theirs = build_publish_bundle(NET, &w, coin, hint, Bytes::new(b"a sealed knock".to_vec())).unwrap();
-    assert_eq!(s.lease.held_write_under(hint).await, None, "nothing under the hint when the step reads the lease");
 
     let at = s.later();
-    let (root, gate) = (root(97), tokio::sync::Mutex::new(()));
-    let mut rng = StdRng::seed_from_u64(1);
-    let lease = &s.lease;
-    let parks = || {
-        lease.park_with_bundle_at([(coin.coin_id(), made)], Some((&theirs, money)), at).expect("W's knock, parked between the step's read and the writer's");
-        at
-    };
-    let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, Some(&root), &node, &w, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
-    let e = done.as_ref().err().expect("K(h) does not write beside W's knock");
-    assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::MoneyUnderHint), "the writer's own read of the lease, naming W as the step gave it: {e:#}");
-    assert!(is_typed_wait(e), "a wait: no attempt used");
-    knock_names_no_burner(e, &req, &key);
-    assert!(s.chain.received().is_empty(), "nothing sent");
-    assert!(dish.iter().all(|c| !s.lease.is_taken(&c.coin_id())), "no lobby coin claimed");
-    assert_eq!(s.gifts(0), 0, "no gift counted");
-    assert!(s.lease.outgoing_pending_for(money) && !s.lease.holds_for(Payer::of_burner(&key)), "W's knock parked, nothing of K(h)'s");
+    for (reads, wait, what) in [
+        (Duration::ZERO, BurnerWait::Spaced, "T4, on the wallet's knock in flight"),
+        (SPACING_IN_FLIGHT_HOLD, BurnerWait::MoneyUnderHint, "the writer's own read of the lease, naming W as the step gave it"),
+    ] {
+        s.lease = WalletLease::new();
+        assert_eq!(s.lease.held_write_under(hint).await, None, "nothing under the hint when the step reads the lease");
+        let (root, gate) = (root(97), tokio::sync::Mutex::new(()));
+        let mut rng = StdRng::seed_from_u64(1);
+        let lease = &s.lease;
+        let parks = || {
+            lease.park_with_bundle_at([(coin.coin_id(), made)], Some((&theirs, money)), at).expect("W's knock, parked between the step's read and the writer's");
+            at + reads
+        };
+        let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, Some(&root), &node, &w, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+        let e = done.as_ref().err().expect("K(h) does not write beside W's knock");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&wait), "{what}: {e:#}");
+        assert!(is_typed_wait(e), "a wait: no attempt used");
+        assert!(!knock_attempt_counts(true, e), "{what}: no knock attempt");
+        knock_names_no_burner(e, &req, &key);
+        // The one bundle a node can have seen is W's own, which the
+        // reconciliation's probe pushes once its parking is past the grace.
+        assert!(s.chain.received().iter().all(|b| b.name() == theirs.name()), "{what}: nothing of K(h)'s sent");
+        assert!(dish.iter().all(|c| !s.lease.is_taken(&c.coin_id())), "no lobby coin claimed");
+        assert_eq!(s.gifts(0), 0, "no gift counted");
+        assert!(s.lease.outgoing_pending_for(money) && !s.lease.holds_for(Payer::of_burner(&key)), "W's knock parked, nothing of K(h)'s");
+    }
 
     let filed = arm_refiled(&s.arm_knock(97, true, &node, &req, 0, || Ok(None), unix_now(), 2).await).expect("the next step files W's knock");
     assert_eq!((filed.coin_id, filed.payer), (hex::encode(coin.coin_id().to_bytes()), Some(money.hex())), "W's write, naming W");
@@ -4868,68 +5000,307 @@ async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_s
     assert!(s.chain.unanswered().is_empty());
 }
 
-/// Stage 4 design §4.3 T4, not yet built (PR 10e), and what stands in for
-/// it: on the burner path the beacon does not go out while the lease parks
-/// any other spend of this node, whatever its payer
-/// (`BurnerWait::OtherWriteInFlight`), so it is never pushed into a mempool
-/// window another of this node's payers has open, as the beacon wallet's
-/// never was through main's global check. The hold is one-way: a listing or
-/// a knock from its own burner does not wait on a parked beacon, as on the
-/// 10c head, until the payers are spaced. The beacon waits before the
-/// chain is asked for B's coins. A knock the SSF wallet W paid for is in
-/// flight: off the burner path the beacon waits by main's check, and on it
-/// by the burner's own, a wait whose line asks for no funding and names no
-/// key; nothing is sent, no lobby coin is claimed and no gift is counted.
-/// Once W's knock lands, a listing from W's listing burner P(0) is in
-/// flight, and it holds the beacon in the same way. Once that lands too the
-/// beacon goes out from a gift. B's funded coin is never spent on the
-/// burner path.
+/// Stage 4 design §4.3 T4 and §11 row 8: one node's writes from different
+/// payers land at least 32 blocks apart, the beacon included. A node lists
+/// from P(0), knocks from K(h) and beacons from B. The listing goes out
+/// first, with nothing to wait on. While it is in flight the knock and the
+/// beacon wait their turn (`BurnerWait::Spaced`), a wait that names no key:
+/// nothing is sent, no lobby coin is claimed, no gift is counted, and the
+/// chain is not asked for the beacon key's coins. Once the listing lands the
+/// knock's wait is drawn once, 32 to 64 blocks; it is still held one block
+/// before its turn, after the listing's settling record has gone from the
+/// lease, and goes out at the block drawn. The beacon is held behind the
+/// knock in flight and then for its own wait, drawn from the knock's landing.
+/// On the chain the three land more than 32 blocks apart, each no more than
+/// 64 blocks and the one that lands it after the one before, from three
+/// payers with a lobby coin and a gift each.
 #[tokio::test]
-async fn a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lands() {
+async fn a_listing_a_knock_and_the_beacon_of_one_node_land_at_least_32_blocks_apart_each_at_the_block_drawn_for_it() {
     let mut s = setup().await;
-    let (w, key, node, none) = (wallet(122), beacon_key(122), iroh::SecretKey::generate(), no_data_folder());
-    let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
-    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
-    let (dish, made) = ready_dishes(&s, &[1, 1]).await;
-    let knock = our_memo(&w, coin, Bytes32::new([0x7a; 32]), b"a knock of W's, in flight".to_vec());
-    s.push(&w, &knock, (coin.coin_id(), made)).await.unwrap();
-    assert!(s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock parked, live");
+    let (w, node) = (wallet(130), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x30; 32]);
+    let (p, k, b) = (burner(130, 0), knock_key(130, &req, 0), beacon_key(130));
+    let (dish, _) = ready_dishes(&s, &[1, 1, 1]).await;
+    let claimed = |s: &Setup| dish.iter().filter(|c| s.lease.is_taken(&c.coin_id()) || s.chain.record(c.coin_id()).is_some_and(|r| r.2.is_some())).count();
+    let now = unix_now();
+    // A wait long enough to outlive the settling record of what it waits on.
+    let long = (1..).find(|seed| spaced_by(*seed) > SETTLED_DEPTH + 2).expect("a seed that draws a long wait");
+
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), now, 1).await.expect("nothing holds the first write");
+    assert_eq!(listing.payer, Payer::of_burner(&p));
+    let (sent, asked) = (s.sent(), s.asked(ProtocolMessageTypes::RequestPuzzleState));
+    let knock = s.knock(130, &node, &req, 0, || Ok(None), 2).await.map(|(_, write)| write);
+    let beacon = s.beacon(130, &node, 0, now, 3).await.map(|(_, write)| write);
+    assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleState), asked, "held before the chain is asked for either key's coins");
+    for (held, what) in [(&knock, "the knock"), (&beacon, "the beacon")] {
+        assert_eq!(waited(held), Some(BurnerWait::Spaced), "{what}, behind the listing in flight");
+        let e = held.as_ref().err().expect("it waited");
+        assert!(is_typed_wait(e) && spaced(e), "{what}: a wait, and no attempt");
+    }
+    knock_names_no_burner(knock.as_ref().err().unwrap(), &req, &k);
+    names_no_beacon(beacon.as_ref().err().unwrap(), &b);
+    assert_eq!((s.sent(), claimed(&s), s.gifts(0)), (sent, 1, 1), "nothing sent, claimed or counted for them");
+
+    // The listing lands: the knock's turn is drawn once from its landing.
+    let listed = s.chain.farm().await;
+    let knock_due = listed + spaced_by(long);
+    let drawn = s.knock(130, &node, &req, 0, || Ok(None), long).await.map(|(_, write)| write);
+    assert_eq!(waited(&drawn), Some(BurnerWait::Spaced), "the listing landed a block ago");
+    assert!(s.lease.holds_for(listing.payer) && !s.lease.outgoing_pending_for(listing.payer), "the listing's spend settling");
+    s.at_block(knock_due - 1).await;
+    let early = s.knock(130, &node, &req, 0, || Ok(None), 4).await.map(|(_, write)| write);
+    assert_eq!(waited(&early), Some(BurnerWait::Spaced), "one block before its turn");
+    assert!(!s.lease.holds_for(listing.payer), "the listing's record settled and gone: the wait drawn outlives it");
+    assert_eq!((s.gifts(0), claimed(&s)), (1, 1), "still nothing claimed for the knock");
+    assert_eq!(s.chain.farm().await, knock_due);
+    let (_, knock) = s.knock(130, &node, &req, 0, || Ok(None), 5).await.expect("the knock's turn");
+    assert_eq!(knock.payer, Payer::of_burner(&k));
+
+    // The beacon: behind the knock in flight, then its own wait from the
+    // knock's landing.
+    let held = s.beacon(130, &node, 0, now, 6).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "behind the knock in flight");
+    let knocked = s.chain.farm().await;
+    let beacon_due = knocked + spaced_by(7);
+    for (peak, seed) in [(knocked, 7), (beacon_due - 1, 8)] {
+        s.at_block(peak).await;
+        let held = s.beacon(130, &node, 0, now, seed).await.map(|(_, write)| write);
+        assert_eq!(waited(&held), Some(BurnerWait::Spaced), "at {peak}, before block {beacon_due}");
+    }
+    assert_eq!(s.chain.farm().await, beacon_due);
+    let (_, beacon) = s.beacon(130, &node, 0, now, 9).await.expect("the beacon's turn");
+    assert_eq!(beacon.payer, Payer::of_burner(&b));
+    let beaconed = s.chain.farm().await;
+
+    let spent_at = |coin: Bytes32| s.chain.record(coin).and_then(|r| r.2);
+    assert_eq!([listing.coins.parked, knock.coins.parked, beacon.coins.parked].map(spent_at), [Some(listed), Some(knocked), Some(beaconed)]);
+    assert_eq!((knocked, beaconed), (knock_due + 1, beacon_due + 1), "each lands in the block after its turn");
+    for (before, after) in [(listed, knocked), (knocked, beaconed)] {
+        assert!((SPACING_MIN_BLOCKS + 1..=SPACING_MAX_BLOCKS + 1).contains(&(after - before)), "{before} then {after}: more than 32 blocks apart");
+    }
+    assert!(listing.payer != knock.payer && knock.payer != beacon.payer && listing.payer != beacon.payer, "three payers");
+    assert_eq!((claimed(&s), s.gifts(0)), (3, 3), "a lobby coin and a gift each");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4 in the arms' steps ([`knock_on_path`],
+/// [`beacon_on_path`]): "waiting is not a knock attempt". A node's listing
+/// landed a block ago. Its knock, asked for through the knock arm's step,
+/// waits its turn: a typed wait that uses no attempt, starts no retry
+/// cadence, and goes back to the front of the queue ahead of the request
+/// behind it, with a line that names the host and the room and no key. Its
+/// beacon, through the beacon arm's step, waits its turn too: the writer was
+/// reached, so the tick is used and the rooms' writes do not slip in ahead,
+/// and its line asks for no funding and names no retry cadence. Nothing is
+/// sent or counted for either. Each then goes out through its arm's step at
+/// the block drawn for it, the knock one block after it was still held, and
+/// the beacon, held again by the knock, never earlier than the block first
+/// drawn for it. The knock opens for its host.
+#[tokio::test]
+async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_go_out_at_the_blocks_drawn_for_them() {
+    let mut s = setup().await;
+    let (w, node, none) = (wallet(131), iroh::SecretKey::generate(), no_data_folder());
+    let ((req, host_kx), (behind, _)) = (host_card([0x31; 32]), host_card([0x32; 32]));
+    let (k, b) = (knock_key(131, &req, 0), beacon_key(131));
+    ready_dishes(&s, &[1, 1, 1]).await;
+    let at = unix_now();
+    s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let listed = s.chain.farm().await;
     let sent = s.sent();
 
-    let off = s.arm_beacon(122, false, &node, 0, &none, unix_now(), 1).await;
-    assert_eq!(off.as_ref().err().and_then(|e| e.downcast_ref::<MemoWait>()), Some(&MemoWait::Settling("beacon".to_string())), "off the burner path: main's global check");
-    let listed = s.asked(ProtocolMessageTypes::RequestPuzzleState);
-    let on = s.arm_beacon(122, true, &node, 0, &none, unix_now(), 2).await;
-    assert_eq!(beacon_waited(&on), Some(BurnerWait::OtherWriteInFlight), "on it: the burner's own hold");
-    assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleState), listed, "held before the chain is asked for B's coins");
-    let e = on.as_ref().err().expect("it waited");
-    assert!(is_typed_wait(e), "a wait, not a failure");
+    let done = s.arm_knock(131, true, &node, &req, 0, || Ok(None), at, 2).await;
+    let knock_due = listed + spaced_by(2);
+    let e = done.as_ref().err().expect("the knock waits its turn");
+    assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Spaced), "{e:#}");
+    assert!(is_typed_wait(e) && !knock_attempt_counts(true, e), "waiting is not a knock attempt");
+    assert_eq!(paced_from(Instant::now(), &done), None, "and starts no retry cadence: tried again at the next tick");
+    let (mut queue, mut rest, mut found) = (VecDeque::from([behind.clone()]), None, ChainKnocked::default());
+    let line = knock_not_written(true, req.clone(), e, 0, Instant::now(), &mut queue, &mut rest, &mut found).expect("its line, for the arm to say once");
+    assert_eq!(queue, VecDeque::from([req.clone(), behind.clone()]), "back at the front, its attempts as they were");
+    assert!(rest.is_none() && !found.holds(&req.host, 0), "the arm does not rest, and the host is not noted");
+    assert!(line.contains("waits its turn") && line.contains("not an attempt") && line.contains(&req.room), "{line}");
+    assert!(!line.contains(&Payer::of_burner(&k).hex()), "{line}");
+    knock_names_no_burner(e, &req, &k);
+
+    let done = s.arm_beacon(131, true, &node, 0, &none, at, 3).await;
+    let first_due = listed + spaced_by(3);
+    assert_eq!(beacon_waited(&done), Some(BurnerWait::Spaced));
+    let e = done.as_ref().err().expect("the beacon waits its turn");
+    assert!(beacon_took_the_tick(&done), "the writer was reached: the tick is used");
+    assert_eq!(paced_from(Instant::now(), &done), None, "tried again at the next tick");
     assert_eq!(
         beacon_failure_line(true, 0, e),
-        format!("⛓️ ChiaHub beacon: the era 0 beacon waits: another write of this station is still in flight; the beacon goes out after it (retry in {} min)", HEARTBEAT_RETRY_SECS / 60)
+        "⛓️ ChiaHub beacon: the era 0 beacon waits its turn: another write of this station went out a few minutes ago or is still in flight; this one goes out in its turn, some minutes after it (tried again at each tick)"
     );
-    names_no_beacon(e, &key);
-    assert!(beacon_took_the_tick(&on), "the writer was reached: the tick is used");
-    assert_eq!(s.sent(), sent, "nothing new sent");
-    assert!(dish.iter().all(|c| !s.lease.is_taken(&c.coin_id())), "no lobby coin claimed");
-    assert_eq!(s.gifts(0), 0, "no gift counted");
-    assert!(!s.lease.holds_for(Payer::of_burner(&key)), "nothing of B's on the lease");
+    names_no_beacon(e, &b);
+    assert_eq!((s.sent(), s.gifts(0)), (sent, 1), "nothing sent or counted for either");
 
-    s.chain.farm().await;
-    let (_, listing) = s.listing(&w, &node, 0, &entries(), unix_now(), 3).await.unwrap();
-    assert!(s.lease.outgoing_pending_for(listing.payer) && !s.lease.outgoing_pending_for(Payer::of(&w)), "W's knock landed; P(0)'s listing parked, live");
-    let on = s.arm_beacon(122, true, &node, 0, &none, unix_now(), 4).await;
-    assert_eq!(beacon_waited(&on), Some(BurnerWait::OtherWriteInFlight), "beside the listing burner's spend too");
-    assert_eq!(s.gifts(0), 1, "the listing's gift alone");
-
-    s.chain.farm().await;
-    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(122, true, &node, 0, &none, unix_now(), 5).await);
+    s.at_block(knock_due - 1).await;
+    let early = s.arm_knock(131, true, &node, &req, 0, || Ok(None), at, 4).await;
+    assert!(early.as_ref().err().is_some_and(spaced), "one block before its turn");
+    assert_eq!(s.chain.farm().await, knock_due);
+    let (_, knock, from_burner) = arm_wrote(s.arm_knock(131, true, &node, &req, 0, || Ok(None), at, 5).await);
     assert!(from_burner);
-    let f = *dish.iter().find(|c| c.coin_id() != listing.coins.parked).expect("the other lobby coin");
-    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "both landed: the beacon goes out from a gift");
-    assert_eq!(write.payer, Payer::of_burner(&key));
-    assert_eq!(s.gifts(0), 2);
-    assert_eq!(s.chain.record(funded.coin_id()).map(|r| r.2), Some(None), "B's funded coin, never spent on the burner path");
+    assert_eq!(knock.payer, Payer::of_burner(&k));
+    let knocked = s.chain.farm().await;
+    let opened = read_inbox(NET, &s.carrier, &host_kx, &req.ck_host, &ROOM_KEY, ROOM, knocked, unix_now(), &mut HashMap::new()).await.unwrap();
+    assert_eq!(opened.iter().map(|o| (o.item.from, o.coin_id)).collect::<Vec<_>>(), vec![(node.public(), burner_coin(&k, knock.coins.parent).coin_id())], "the knock opens for its host");
+
+    // The knock's landing holds the beacon again; its turn is never earlier
+    // than the one drawn from the listing's landing.
+    let again = s.arm_beacon(131, true, &node, 0, &none, at, 6).await;
+    assert_eq!(beacon_waited(&again), Some(BurnerWait::Spaced));
+    let beacon_due = first_due.max(knocked + spaced_by(6));
+    s.at_block(beacon_due - 1).await;
+    assert_eq!(beacon_waited(&s.arm_beacon(131, true, &node, 0, &none, at, 7).await), Some(BurnerWait::Spaced), "one block before its turn");
+    assert_eq!(s.chain.farm().await, beacon_due);
+    let (_, beacon, from_burner) = beacon_wrote(s.arm_beacon(131, true, &node, 0, &none, at, 8).await);
+    assert!(from_burner);
+    let beaconed = s.chain.farm().await;
+    assert_eq!(s.chain.record(beacon.coins.parked).and_then(|r| r.2), Some(beaconed));
+    assert!(beaconed - knocked > SPACING_MIN_BLOCKS && knocked - listed > SPACING_MIN_BLOCKS, "more than 32 blocks apart");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, a stuck spend, beside §4.3 T4: "a stuck spend holds
+/// only its own payer's writes". A listing from P(0) is pushed and no block
+/// takes it. A knock from K(h) is held behind it a second short of 20
+/// minutes after it was parked (`SPACING_IN_FLIGHT_HOLD`), and goes out at
+/// 20 minutes with the listing still in the mempools: T4 holds another
+/// payer no longer than its longest wait. The listing's own payer is held
+/// for as long as its spend is parked: a rewrite from P(0) waits
+/// (`BurnerWait::Held`). The cost is stated, not hidden: the block that then
+/// takes both lands them together. The next payer, the beacon's, is spaced
+/// from that landing as from any other.
+#[tokio::test]
+async fn a_spend_stuck_in_the_mempools_holds_the_other_payers_for_twenty_minutes_and_its_own_payer_until_it_lands() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(132), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x34; 32]);
+    ready_dishes(&s, &[1, 1, 1]).await;
+    let at = unix_now();
+    let before = Instant::now();
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let after = Instant::now();
+    let stuck = s.chain.received().last().cloned().expect("the listing was sent");
+
+    s.next_at(before + SPACING_IN_FLIGHT_HOLD - Duration::from_secs(1));
+    let held = s.knock(132, &node, &req, 0, || Ok(None), 2).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "a second short of 20 minutes");
+    assert_eq!(s.chain.mempool(), vec![stuck.name()], "the listing, still in the mempools");
+    s.next_at(after + SPACING_IN_FLIGHT_HOLD);
+    let (_, knock) = s.knock(132, &node, &req, 0, || Ok(None), 3).await.expect("stuck for 20 minutes: it holds the knock no longer");
+    assert!(s.lease.outgoing_pending_for(listing.payer) && s.lease.outgoing_pending_for(knock.payer), "both in flight");
+    let rewrite = s.listing(&w, &node, 0, &entries_of("203.0.113.9:4444", 0), at + 700, 4).await.map(|(_, write)| write);
+    assert_eq!(waited(&rewrite), Some(BurnerWait::Held), "the listing's own payer waits on its own spend, however long");
+
+    let landed = s.chain.farm().await;
+    let spent_at = |coin: Bytes32| s.chain.record(coin).and_then(|r| r.2);
+    assert_eq!([listing.coins.parked, knock.coins.parked].map(spent_at), [Some(landed), Some(landed)], "one block takes both: past 20 minutes T4 holds them apart no longer (§10)");
+    let beacon = s.beacon(132, &node, 0, at, 5).await.map(|(_, write)| write);
+    assert_eq!(waited(&beacon), Some(BurnerWait::Spaced), "the next payer is spaced from that landing");
+    s.at_block(landed + spaced_by(5)).await;
+    s.beacon(132, &node, 0, at, 6).await.expect("the beacon's turn");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4 across a restart. The waits drawn are this run's
+/// memory; the lease file keeps the spends. A listing from P(0) is in
+/// flight when the node restarts: the lease restored from its file parks
+/// the spend again and the knock from K(h) is held behind it. The listing
+/// lands and the knock's wait is drawn. The node restarts again: the draw is
+/// forgotten, the settling record is not, and 31 blocks after the landing
+/// the knock is still held, by a wait drawn anew from the landing the file
+/// kept. It goes out at that block and lands more than 32 blocks after the
+/// listing.
+#[tokio::test]
+async fn a_restart_holds_a_payer_behind_a_restored_spend_and_keeps_the_fewest_blocks_from_its_landing() {
+    let mut s = setup().await;
+    let dir = Dir::new("spacing-restart");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(133), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x35; 32]);
+    ready_dishes(&s, &[1, 1]).await;
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let at = unix_now();
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    assert!(s.lease.outgoing_pending_for(listing.payer), "the listing's spend restored, parked");
+    let held = s.knock(133, &node, &req, 0, || Ok(None), 2).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "behind the restored spend");
+
+    let listed = s.chain.farm().await;
+    let drawn = s.knock(133, &node, &req, 0, || Ok(None), 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&drawn), Some(BurnerWait::Spaced), "the listing landed: a wait is drawn");
+    assert!(s.lease.holds_for(listing.payer) && !s.lease.outgoing_pending_for(listing.payer), "settling, and so in the file");
+
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    assert!(s.lease.holds_for(listing.payer), "the settling spend restored");
+    s.at_block(listed + SPACING_MIN_BLOCKS - 1).await;
+    let seed = (4..).find(|seed| spaced_by(*seed) != spaced_by(3)).expect("a seed that draws another wait");
+    let still = s.knock(133, &node, &req, 0, || Ok(None), seed).await.map(|(_, write)| write);
+    assert_eq!(waited(&still), Some(BurnerWait::Spaced), "31 blocks after the landing, whatever the last run drew");
+    let due = listed + spaced_by(seed);
+    s.at_block(due - 1).await;
+    let early = s.knock(133, &node, &req, 0, || Ok(None), 90).await.map(|(_, write)| write);
+    assert_eq!(waited(&early), Some(BurnerWait::Spaced), "one block before the turn drawn after the restart");
+    assert_eq!(s.chain.farm().await, due);
+    let (_, knock) = s.knock(133, &node, &req, 0, || Ok(None), 91).await.expect("the knock's turn");
+    let knocked = s.chain.farm().await;
+    assert_eq!(s.chain.record(knock.coins.parked).and_then(|r| r.2), Some(knocked));
+    assert!(knocked - listed > SPACING_MIN_BLOCKS, "{listed} then {knocked}");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4, who is spaced from whom. A rewrite is not spaced
+/// from its own payer's last write: P(0)'s listing lands and P(0) rewrites
+/// it in the next block. The SSF wallet's writer is main's, and T4 is the
+/// burners' rule: a knock the SSF wallet W pays for, off the burner path,
+/// goes out a block after P(0)'s rewrite landed, held by nothing once
+/// nothing is parked. And the SSF wallet is a payer like any other to a
+/// burner: while W's knock is in flight P(0)'s next rewrite waits its turn
+/// (`BurnerWait::Spaced`), and once it lands P(0) is held for the wait
+/// drawn from that landing, to the block.
+#[tokio::test]
+async fn a_rewrite_is_not_spaced_from_its_own_last_write_and_the_ssf_wallets_spend_spaces_a_burner_as_any_payers_does() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(134), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x36; 32]);
+    let p = burner(134, 0);
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    ready_dishes(&s, &[1, 1]).await;
+    let at = unix_now();
+
+    let (_, first) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let listed = s.chain.farm().await;
+    let c0 = burner_coin(&p, first.coins.parent);
+    let (_, rewrite) = s.listing(&w, &node, 0, &entries_of("203.0.113.9:4444", 0), at + 700, 2).await.expect("a rewrite is not spaced from its own payer's last write");
+    assert_eq!((rewrite.coins, rewrite.payer), (WriteCoins::one(c0.coin_id()), first.payer), "from P(0)'s own coin");
+    let rewritten = s.chain.farm().await;
+    assert_eq!(rewritten, listed + 1, "in the next block");
+
+    let (_, ws) = s.money_knock(&w, &node, &req, 0, || Ok(None)).await.expect("the SSF wallet's writer is main's: nothing parked, nothing holds it");
+    assert_eq!((ws.coins, ws.payer), (WriteCoins::one(coin.coin_id()), Payer::of(&w)), "W pays, from its own coin");
+    let held = s.listing(&w, &node, 0, &entries_of("203.0.113.9:5555", 0), at + 1_400, 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "W's spend in flight holds P(0)'s rewrite: the SSF wallet is a payer like any other");
+    assert_eq!(listing_failure_words(held.as_ref().err().unwrap(), false), "Your station's Chia writes go out some minutes apart. Your listing goes out in its turn. Waiting costs nothing.");
+
+    let wrote = s.chain.farm().await;
+    assert_eq!(wrote, rewritten + 1, "W's knock, a block after P(0)'s rewrite: the SSF wallet itself is not spaced");
+    let drawn = s.listing(&w, &node, 0, &entries_of("203.0.113.9:5555", 0), at + 1_400, 4).await.map(|(_, write)| write);
+    assert_eq!(waited(&drawn), Some(BurnerWait::Spaced), "W's knock landed a block ago");
+    let due = wrote + spaced_by(4);
+    s.at_block(due - 1).await;
+    let early = s.listing(&w, &node, 0, &entries_of("203.0.113.9:5555", 0), at + 1_400, 5).await.map(|(_, write)| write);
+    assert_eq!(waited(&early), Some(BurnerWait::Spaced), "one block before its turn");
+    assert_eq!(s.chain.farm().await, due);
+    let (_, next) = s.listing(&w, &node, 0, &entries_of("203.0.113.9:5555", 0), at + 1_400, 6).await.expect("P(0)'s turn");
+    assert_eq!(next.coins, WriteCoins::one(burner_coin(&p, c0.coin_id()).coin_id()), "a rewrite from the coin its last made, with no gift");
+    assert_eq!(s.gifts(0), 1, "one gift, P(0)'s first");
     assert!(s.chain.unanswered().is_empty());
 }
 
