@@ -803,6 +803,31 @@ pub enum LeaseWord {
     Unknown,
 }
 
+/// Why a write never landed, as [`WriteStanding::Dead`] names it. A reason
+/// is told by its text alone, which the writers' lines and the Phone Book
+/// print as it is, so each is one constant, compared and never typed again.
+///
+/// Every peer refused the spend for good, and its input is still unspent
+/// ([`LeaseWord::Dropped`]).
+pub const DEAD_DROPPED: &str = "the mempool dropped it";
+/// The write's one coin was spent with no coin of the write's under its
+/// hint. The same key signed that spend: another write of ours from the
+/// coin, or the same words in another wallet.
+pub const DEAD_OTHER_SPEND: &str = "its coin went to another spend of ours";
+/// A burner's first write lost the lobby dish coin its bundle claimed
+/// (stage 4 design §10, a lost race or a redirected claim): the claim is
+/// keyless, so anyone's claim can take the coin, and the write is built
+/// again from another one ([`WriteStanding::for_coins`]).
+pub const DEAD_DISH_CLAIMED: &str = "its dish coin went to another claim";
+/// The one coin a listing was written from, its own burner key's, went to a
+/// spend that was not this station's: its wallet lease has recorded one
+/// spend of the coin, the write's own (stage 4 design §10, a burner spent
+/// elsewhere). Only a holder of the listing's key signs for the coin, and
+/// two machines on the same words do not share that key (§3.3), so another
+/// copy of this station made the spend
+/// ([`WriteStanding::by_another_copy`]).
+pub const DEAD_FOREIGN: &str = "another copy of this station spent its coin";
+
 /// Where a pending write stands (#231 P6b knocks and beacons, #272 review).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteStanding {
@@ -815,6 +840,42 @@ pub enum WriteStanding {
     Dead(&'static str),
     /// Not settled yet: left as it is, asked again next tick.
     Pending,
+}
+
+impl WriteStanding {
+    /// This standing as the write's `coins` tell it (stage 4 design §4.4,
+    /// §10). A write found by one coin and parked at another is a burner's
+    /// first write, the gift g and the dish coin F, and the coin that "went
+    /// to another spend" is F: its claim is keyless, so the spend is another
+    /// claim, a stranger's as likely as ours, and the death reads
+    /// [`DEAD_DISH_CLAIMED`]. A write of one coin, and every other standing,
+    /// is left as it is. The two readers that hold a write's coins tell it
+    /// so (`chia_publish`'s mark readers and the watcher's knock verdicts).
+    pub fn for_coins(self, coins: WriteCoins) -> WriteStanding {
+        match self {
+            WriteStanding::Dead(DEAD_OTHER_SPEND) if coins.parent != coins.parked => WriteStanding::Dead(DEAD_DISH_CLAIMED),
+            other => other,
+        }
+    }
+
+    /// This standing for a write whose one coin no spend of ours but the
+    /// write's own ever consumed: a death by another spend of the coin
+    /// ([`DEAD_OTHER_SPEND`]) is then another copy of this station's,
+    /// [`DEAD_FOREIGN`] (stage 4 design §10). Every other standing, a lost
+    /// dish coin among them, is left as it is. Its caller decides which
+    /// writes are such, by the lease's records
+    /// (`chia_publish::listing_word`).
+    pub fn by_another_copy(self) -> WriteStanding {
+        match self {
+            WriteStanding::Dead(DEAD_OTHER_SPEND) => WriteStanding::Dead(DEAD_FOREIGN),
+            other => other,
+        }
+    }
+
+    /// Whether the write died to another copy of this station ([`DEAD_FOREIGN`]).
+    pub fn is_foreign(&self) -> bool {
+        matches!(self, WriteStanding::Dead(DEAD_FOREIGN))
+    }
 }
 
 /// Judge a pending write from the chain's word: `child` is what sits under its
@@ -841,18 +902,19 @@ pub enum WriteStanding {
 /// listing, made on the new fork, lacks its child; while the lease holds the
 /// spend, the coin went to no other write of ours and the lease pushes the
 /// spend again, so the write is pending, not dead. Nothing here is decided by
-/// the clock.
+/// the clock. It is given the heights and the lease's word alone, not the
+/// write's coins or who paid for it, so it names every such death
+/// [`DEAD_OTHER_SPEND`]; a reader that holds the coins tells a burner's lost
+/// dish coin from it ([`WriteStanding::for_coins`]).
 pub fn write_standing(child: &HintChild, spent_at: Option<u32>, lease: LeaseWord, held: bool) -> WriteStanding {
     match child {
         HintChild::Confirmed { height, judged_at } => WriteStanding::Confirmed { height: *height, seen_at: *judged_at },
         HintChild::Unknown => WriteStanding::Pending,
         HintChild::Absent { judged_at } => match spent_at {
             Some(_) if held => WriteStanding::Pending,
-            Some(spent) if judged_at.is_some_and(|judged| judged >= spent) => {
-                WriteStanding::Dead("its coin went to another spend of ours")
-            }
+            Some(spent) if judged_at.is_some_and(|judged| judged >= spent) => WriteStanding::Dead(DEAD_OTHER_SPEND),
             Some(_) => WriteStanding::Pending,
-            None if lease == LeaseWord::Dropped => WriteStanding::Dead("the mempool dropped it"),
+            None if lease == LeaseWord::Dropped => WriteStanding::Dead(DEAD_DROPPED),
             None => WriteStanding::Pending,
         },
     }
@@ -1450,6 +1512,45 @@ mod tests {
         assert_eq!(write_standing(&absent(Some(1006)), Some(1000), Unknown, false), WriteStanding::Dead("its coin went to another spend of ours"), "an older entry with no number is judged as before");
         assert_eq!(write_standing(&found(Some(1006)), Some(1000), Spent, true), WriteStanding::Confirmed { height: 900, seen_at: Some(1006) }, "the child found: confirmed, held or not");
         assert_eq!(write_standing(&absent(Some(1006)), None, Parked, true), WriteStanding::Pending, "unspent and held: live in a mempool");
+    }
+
+    /// Stage 4 design §10: a death by another spend of the write's coin is
+    /// told by the coins the write is judged by, and for a listing by whose
+    /// spend took its coin. Every other standing passes through both
+    /// untouched, and the four reasons keep their texts.
+    #[test]
+    fn a_dead_write_is_told_by_its_coins_and_a_listings_by_who_took_its_coin() {
+        use WriteStanding::{Confirmed, Dead, Pending};
+        assert_eq!(DEAD_DROPPED, "the mempool dropped it");
+        assert_eq!(DEAD_OTHER_SPEND, "its coin went to another spend of ours");
+        assert_eq!(DEAD_DISH_CLAIMED, "its dish coin went to another claim");
+        assert_eq!(DEAD_FOREIGN, "another copy of this station spent its coin");
+        let (a, b) = (Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]));
+        let one = WriteCoins::one(a);
+        let split = WriteCoins { parent: a, parked: b };
+        let every = [
+            Confirmed { height: 900, seen_at: Some(950) },
+            Confirmed { height: 900, seen_at: None },
+            Pending,
+            Dead(DEAD_DROPPED),
+            Dead(DEAD_OTHER_SPEND),
+            Dead(DEAD_DISH_CLAIMED),
+            Dead(DEAD_FOREIGN),
+        ];
+        for standing in every {
+            let other_spend = standing == Dead(DEAD_OTHER_SPEND);
+            assert_eq!(standing.clone().for_coins(one), standing, "one coin: as it was");
+            let lost_dish = if other_spend { Dead(DEAD_DISH_CLAIMED) } else { standing.clone() };
+            assert_eq!(standing.clone().for_coins(split), lost_dish, "two coins: the parked one is the dish's");
+            let foreign = if other_spend { Dead(DEAD_FOREIGN) } else { standing.clone() };
+            assert_eq!(standing.clone().by_another_copy(), foreign);
+            assert_eq!(standing.is_foreign(), standing == Dead(DEAD_FOREIGN), "{standing:?}");
+        }
+        // A burner's first write that lost its dish coin is never another
+        // copy's doing: told by its coins first, it is no longer the death
+        // the listing's verdict retells.
+        assert_eq!(Dead(DEAD_OTHER_SPEND).for_coins(split).by_another_copy(), Dead(DEAD_DISH_CLAIMED));
+        assert_eq!(Dead(DEAD_OTHER_SPEND).for_coins(one).by_another_copy(), Dead(DEAD_FOREIGN));
     }
 
     /// A chain whose listings refuse every page cursor (as full nodes do once

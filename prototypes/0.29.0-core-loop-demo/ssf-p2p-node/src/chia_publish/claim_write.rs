@@ -29,7 +29,12 @@
 //! so the knock's writer ([`knock_write_with`]) reads a key that already
 //! wrote as [`AlreadyKnocked`] and writes nothing. Waiting is not failing:
 //! each reason to wait comes back typed ([`BurnerWait`]). An
-//! [`AlreadyKnocked`] is no wait: it is the end of that knock.
+//! [`AlreadyKnocked`] is no wait: it is the end of that knock. The listing's
+//! key P(e) is the one key twins on the same words do not share (§3.3), so
+//! the listing's writer ([`listing_write_with`]) compares what the key has
+//! spent with the lease's records of its own spends, and stops for a coin
+//! another copy of this station spent ([`ForeignSpend`], §10), which is
+//! neither a wait nor a failure of the write: its caller pauses.
 //!
 //! Outside the tests the writer is called by the listing's writer from its
 //! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b), by
@@ -477,12 +482,51 @@ impl fmt::Display for AlreadyKnocked {
 
 impl std::error::Error for AlreadyKnocked {}
 
+/// Why the listing was not written although nothing went wrong on the chain:
+/// its key P(e) spent a coin this station's lease never parked a spend of
+/// (stage 4 design §10, "Burner spent elsewhere"). Only a holder of the key
+/// can spend a coin at its puzzle hash, so another copy of this station did,
+/// from a cloned folder or the same words. It is a sibling of
+/// [`BurnerWait`], not one of its waits: the writer tells of each such coin
+/// once ([`WalletLease::foreign_spends`]), so the same write tried again
+/// goes on, and its caller pauses the listing, the knocks and the beacon
+/// instead (`chia_publish`'s `ForeignPause`). `coin` is the one spent last
+/// among the coins told of, what the pause counts the telling by. Neither
+/// its text nor its `Debug` names the coin, the key, or the key's puzzle
+/// hash or address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ForeignSpend {
+    pub coin: Bytes32,
+}
+
+impl fmt::Debug for ForeignSpend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ForeignSpend { .. }")
+    }
+}
+
+impl fmt::Display for ForeignSpend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("another copy of this station spent a coin of its listing's key, one this station's lease never parked a spend of")
+    }
+}
+
+impl std::error::Error for ForeignSpend {}
+
 /// The rule a burner's key writes its slot under (stage 4 design §4.1).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
-    /// The listing's, the beacon's and the self-test's: a later write spends
-    /// the key's own 1-mojo coin to itself (the table's rewrite rows, R5).
+    /// The beacon's and the self-test's: a later write spends the key's own
+    /// 1-mojo coin to itself (the table's rewrite rows, R5).
     Rewritten,
+    /// The listing's: rewritten as those are, and the one slot whose key
+    /// twins do not share (§3.3: it comes from the words and this station's
+    /// contact key), so a coin spent there that the lease has no record of
+    /// was spent by another copy of this station, a cloned folder
+    /// ([`ForeignSpend`], §10). Two machines on the same words derive the
+    /// same beacon key and the same knock keys, so a spend of theirs by a
+    /// twin is no fault and is not looked for.
+    Listing,
     /// A knock's: K(h) writes once and is never spent again (the knock row),
     /// and never beside a write of the SSF wallet's, `money`, under its hint
     /// (§8.3).
@@ -829,6 +873,50 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
     write_slot(lease, fuse, net, client, now, key, era, hint, gate, body, rng, what, money, Slot::Rewritten).await
 }
 
+/// The listing's write from its key P(e) (stage 4 design §4.1, the two
+/// listing rows), on a given lease, fuse, network, chain, instant and random
+/// source, as [`burner_write_with`] takes them: that writer, with the
+/// listing's name and the SSF wallet's payer `money` to wait on before a
+/// first write (§8.3), and one step more, the listing's own (§10, "Burner
+/// spent elsewhere"). After the `Held` checks and from the key's one listing
+/// ([`records_at`]), when that listing is whole, every spent coin at the key
+/// is compared with the lease's records of its own spends
+/// ([`WalletLease::foreign_spends`]). A coin the records do not hold was
+/// spent by another copy of this station, and the write stops there as
+/// [`ForeignSpend`], before anything is claimed, parked, pushed or counted.
+/// Each coin is told of once, so the next write goes on: from the key's
+/// coin, whichever copy made it, or with a new gift under the fuse.
+///
+/// The first look under a lease file tells of nothing and only starts the
+/// watch, since the records may be short of this station's earlier spends.
+/// A listing cut short is not compared at all: a rewrite from a coin it does
+/// list goes on, and a first write waits as it always did
+/// ([`BurnerWait::ListingCutShort`]).
+///
+/// What this does not see: a copy that spends after this station's last
+/// write of the era is told to no one until one of the two writes again,
+/// and it is the copy that writes next that is told. Two copies whose first
+/// writes of an era are in flight together claim a dish coin each and see
+/// nothing of each other until one writes again. A rewrite that loses its
+/// coin to the other copy's in a race is told by the listing's verdict
+/// instead (`chia_publish::listing_word`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn listing_write_with<R: rand::Rng + ?Sized + Send>(
+    lease: &WalletLease,
+    fuse: &Mutex<GiftFuse>,
+    net: ChiaNet,
+    client: &impl ChainAccess,
+    now: Instant,
+    key: &BurnerKey,
+    era: u64,
+    hint: Bytes32,
+    body: impl FnOnce(Bytes32) -> Result<Vec<u8>>,
+    rng: &mut R,
+    money: Payer,
+) -> Result<MemoWrite> {
+    write_slot(lease, fuse, net, client, now, key, era, hint, None, body, rng, "presence", Some(money), Slot::Listing).await
+}
+
 /// The beacon's write from its key B (stage 4 design §4.1, the two beacon
 /// rows), on a given lease, fuse, network, chain, instant and random source,
 /// as [`burner_write_with`] takes them: the writer of a slot that is
@@ -1031,16 +1119,19 @@ async fn knock_key_unwritten(client: &impl ChainAccess, burner_ph: Bytes32, reco
     }
 }
 
-/// The body of [`burner_write_with`], [`beacon_write_with`] and
-/// [`knock_write_with`]: every step their docs give, with `slot` the rule
-/// the key writes under. Every slot is spaced from the other payers' spends
-/// after the first `Held` check ([`BurnerWait::Spaced`]). The knock's
-/// slot ([`Slot::Once`]) adds two steps between the `Held` checks and the
-/// choice of what to write from: no write of the SSF wallet's held under
-/// its hint ([`BurnerWait::MoneyUnderHint`]), then its own question
-/// ([`knock_key_unwritten`]). A rewritten slot reads the key's listing
-/// exactly as [`unspent_at`] gives it ([`Unspent::of`]) and never looks at
-/// its spent records.
+/// The body of [`burner_write_with`], [`listing_write_with`],
+/// [`beacon_write_with`] and [`knock_write_with`]: every step their docs
+/// give, with `slot` the rule the key writes under. Every slot is spaced
+/// from the other payers' spends after the first `Held` check
+/// ([`BurnerWait::Spaced`]). The knock's slot ([`Slot::Once`]) adds two
+/// steps between the `Held` checks and the choice of what to write from: no
+/// write of the SSF wallet's held under its hint
+/// ([`BurnerWait::MoneyUnderHint`]), then its own question
+/// ([`knock_key_unwritten`]). The listing's ([`Slot::Listing`]) adds one
+/// there: the spent coins of a whole listing against the lease's records of
+/// its own spends ([`ForeignSpend`]). A rewritten slot ([`Slot::Rewritten`])
+/// reads the key's listing exactly as [`unspent_at`] gives it
+/// ([`Unspent::of`]) and never looks at its spent records.
 #[allow(clippy::too_many_arguments)]
 async fn write_slot<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -1084,6 +1175,23 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
     let ones: Vec<FaucetCoin> = coins.into_iter().filter(|c| c.coin.amount == 1).collect();
     if ones.iter().any(|c| lease.is_parked(&c.coin.coin_id())) {
         return Err(BurnerWait::Held.into());
+    }
+    if slot == Slot::Listing && !partial {
+        // Every spend of ours at this key is in the lease's records by now:
+        // one still parked was waited on above, and the records are written
+        // with the parking. A listing cut short is not compared, since the
+        // first look adopts what it is shown and must be shown everything.
+        let spent: Vec<&CoinRecord> = records.iter().filter(|r| r.spent).collect();
+        let ids: Vec<Bytes32> = spent.iter().map(|r| r.coin.coin_id()).collect();
+        let foreign = lease.foreign_spends(&ids);
+        let last = spent
+            .iter()
+            .map(|r| (r.spent_block_index, r.coin.coin_id()))
+            .filter(|(_, id)| foreign.contains(id))
+            .max();
+        if let Some((_, coin)) = last {
+            return Err(ForeignSpend { coin }.into());
+        }
     }
     if let Slot::Once { money: wallet } = slot {
         // The lease as this write is made, under the gate taken above, so

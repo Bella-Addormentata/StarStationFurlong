@@ -311,7 +311,10 @@ fn parked_inputs(filed: &[Option<WriteCoins>]) -> Vec<Bytes32> {
 /// from the input), and the input's spent
 /// height (`spent`) and the lease's word (`words`) are read at its
 /// `coins.parked` (stage 4 design §4.4); `held` holds the batch's spends the
-/// lease still holds (round 12). `Err` when the hint could not be read:
+/// lease still holds (round 12). A knock found by one coin and parked at
+/// another, a burner's first write, that died because its parked coin was
+/// spent lost the dish coin to another claim, and is told so
+/// ([`WriteStanding::for_coins`]). `Err` when the hint could not be read:
 /// nothing is judged for it this tick.
 #[allow(clippy::too_many_arguments)]
 async fn sent_knock_standing(
@@ -329,7 +332,7 @@ async fn sent_knock_standing(
     let spent_at = spent.iter().find(|(c, _)| *c == coins.parked).map(|(_, h)| *h);
     let lease = words.get(&coins.parked).copied().unwrap_or(LeaseWord::Unknown);
     let ours = spend.is_some_and(|s| held.contains(&s));
-    Ok((child.gone_since(confirmed_height), chia_resolve::write_standing(&child, spent_at, lease, ours)))
+    Ok((child.gone_since(confirmed_height), chia_resolve::write_standing(&child, spent_at, lease, ours).for_coins(coins)))
 }
 
 /// One verdict on a knock we sent: the entry's coin id and hint, its own
@@ -1514,7 +1517,7 @@ mod tests {
         // The spent height is the parked input's.
         assert_eq!(
             judge(absent(), split, 0, None, vec![(parked, 1000)], none.clone(), unheld.clone()).await,
-            Some((false, Dead("its coin went to another spend of ours")))
+            Some((false, Dead("its dish coin went to another claim")))
         );
         assert_eq!(judge(absent(), split, 0, None, vec![(parent, 1000)], none.clone(), unheld.clone()).await, Some((false, Pending)), "the parent spent says nothing of the knock");
         // The lease's word is the parked input's.
@@ -1525,7 +1528,7 @@ mod tests {
         assert_eq!(judge(absent(), split, 0, Some(7), vec![(parked, 1000)], none.clone(), HashSet::from([7])).await, Some((false, Pending)));
         assert_eq!(
             judge(absent(), split, 0, Some(8), vec![(parked, 1000)], none.clone(), HashSet::from([7])).await,
-            Some((false, Dead("its coin went to another spend of ours"))),
+            Some((false, Dead("its dish coin went to another claim"))),
             "another spend held is not this knock's"
         );
         // Gone since its confirmation (round 9), and a hint that cannot be read.
@@ -1733,7 +1736,7 @@ mod tests {
             verdicts,
             vec![
                 verdict(&pending[0], Confirmed { height: 1000, seen_at: Some(1001) }),
-                verdict(&pending[1], Dead("its coin went to another spend of ours")),
+                verdict(&pending[1], Dead("its dish coin went to another claim")),
                 verdict(&pending[2], Dead("the mempool dropped it")),
                 verdict(&pending[3], Pending),
                 verdict(&pending[4], Dead("its entry in the knock book is malformed")),

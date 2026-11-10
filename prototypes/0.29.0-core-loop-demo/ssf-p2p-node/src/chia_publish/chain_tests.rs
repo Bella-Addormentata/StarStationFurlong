@@ -61,6 +61,32 @@
 //! [`listing_failure_words`]; the tests here show that the words for each
 //! failure the chain gives name no burner's puzzle hash or address.
 //!
+//! Another copy of this station (§10, "Burner spent elsewhere": a cloned
+//! data folder, [`cloned_folder`]) shares the listing burner P(e), and a
+//! spend of P(e)'s that the lease never parked is that copy's. The
+//! listing's writer stops for such a coin before it claims, parks or sends
+//! anything (`claim_write::ForeignSpend`, [`stopped`]), the heartbeat
+//! counts it on the pause by that coin ([`foreign_spend`], [`ForeignPause`],
+//! [`paused_now`]), and each coin is told of once, so two copies writing in
+//! turn pause for two hours and then until the next era
+//! (`a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hours`).
+//! A rewrite that loses its coin to the copy's rewrite of the same coin is
+//! told by the listing's verdict instead ([`listing_word`]), by the lease's
+//! record of that write's one spend, and is counted once
+//! (`a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_another_copy_and_is_counted_once`).
+//! A rewrite every node refuses because the copy's landed first leaves no
+//! record of its coin, so the next write stops for it
+//! (`a_rewrite_refused_as_the_other_copys_lands_leaves_no_record_of_its_coin_so_the_next_write_stops_for_it`).
+//! A lease that kept no records adopts what its key spent at its first
+//! look, and a coin swept elsewhere is told and the key then funded again
+//! under the fuse
+//! (`a_lease_that_kept_no_records_adopts_what_its_key_spent_and_a_coin_swept_elsewhere_is_told_then_funded_again`).
+//! A listing of the key's coins cut short is neither compared nor adopted
+//! (`a_listing_of_the_keys_coins_cut_short_is_neither_compared_nor_adopted_and_the_spend_is_told_once_it_is_whole`).
+//! The beacon's key and a knock's are shared by twins on the same words
+//! (§3.3), so a spend of theirs by another holder raises no pause: the
+//! clone tests of each stand as they were.
+//!
 //! A knock written from its own burner key K(h), as the heartbeat writes it
 //! with burner keys on, goes through the knock's own seam,
 //! [`publish_knock_with`], on the test's lease, gift fuse, network, chain,
@@ -199,9 +225,6 @@
 //! and dies with F
 //! (`a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_from_its_mark_once_settled_and_pending_for_ever_without_its_parked_input`).
 //!
-//! What has no seam yet is left for the burner writers of §13 row 10, under
-//! the name it will carry:
-//! `a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hours`.
 //! The claim and write aggregated by hand stays, in
 //! `an_ephemeral_coin_is_found_through_its_parent_by_every_lookup_the_resolver_makes`,
 //! as the readers' own proof: it asks nothing of any writer.
@@ -211,6 +234,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::claim_write::{build_burner_bundle, burner_write_with, AlreadyKnocked, BurnerInput, BurnerWait, GiftFuse};
+use super::foreign_pause::{FOREIGN_PAUSE_SECS, PAUSED_NEXT_EDITION_WORDS, PAUSED_TWO_HOURS_WORDS};
 use crate::chia_burner::{BurnerKey, BurnerRoot, MoneyKey};
 use crate::chia_faucet::{claim_spend, claim_to, dish_claim, FaucetCoin, FaucetParams, GAP_BLOCKS, GIFT_MOJOS, MAX_FAUCET_PAGES};
 use crate::chia_knock::{KnockBook, SETTLED_DEPTH};
@@ -584,6 +608,14 @@ impl Setup {
         self.carrier = PeerLane::new(self.lane.clone(), Trust::Carrier);
     }
 
+    /// The test's lease and fuse changed for `other`'s, which takes the
+    /// test's in their place ([`cloned_folder`]): called once, the writes
+    /// that follow are the other copy's; called again, this station's.
+    fn change_copy(&mut self, other: &mut (WalletLease, std::sync::Mutex<GiftFuse>)) {
+        std::mem::swap(&mut self.lease, &mut other.0);
+        std::mem::swap(&mut self.fuse, &mut other.1);
+    }
+
     /// The names of every bundle the nodes were sent, each once.
     fn sent(&self) -> HashSet<Bytes32> {
         self.chain.received().iter().map(SpendBundle::name).collect()
@@ -885,6 +917,61 @@ fn spent_elsewhere(key: &BurnerKey, coin: Coin, elsewhere: Bytes32) -> SpendBund
     let conditions = Conditions::new().create_coin(elsewhere, coin.amount, chia_puzzle_types::Memos::None);
     StandardLayer::new(key.public_key().derive_synthetic()).spend(&mut ctx, coin, conditions).unwrap();
     key.sign_spends(NET, ctx.take()).unwrap()
+}
+
+/// Another copy of this station (stage 4 design §10, a cloned data folder):
+/// the lease file at `path` copied into a folder of its own under `dir` and
+/// loaded there as the wallet `w`'s, as the copy's node loads it, with a
+/// gift fuse that has counted `funded` in `era`, as the fuse file copied
+/// beside it has. A test makes the copy's writes by changing its own lease
+/// and fuse for these ([`Setup::change_copy`]).
+fn cloned_folder(dir: &Dir, path: &std::path::Path, w: &SecretKey, era: u64, funded: Payer) -> (WalletLease, std::sync::Mutex<GiftFuse>) {
+    let folder = dir.0.join("copy");
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join("wallet_lease.json");
+    std::fs::copy(path, &file).expect("the lease has a file to copy");
+    let lease = WalletLease::new();
+    restore(&lease, &file, w);
+    (lease, std::sync::Mutex::new(GiftFuse::preset(era, [funded])))
+}
+
+/// The other copy's rewrite of the listing from `coin`, the coin of the
+/// listing burner `key` made at height `made`: `node`'s record for `era`
+/// with `entries`, dated `now`, built as the listing's writer builds a
+/// rewrite ([`presence_memo`], [`build_burner_bundle`]) by a holder of the
+/// same words, contact key and node key, and parked on no lease of the
+/// test's. It makes the very coin a rewrite of ours from `coin` would make
+/// ([`burner_coin`]); only its memo tells the two apart.
+fn copys_rewrite(key: &BurnerKey, coin: Coin, made: u32, node: &iroh::SecretKey, era: u64, entries: &[AddrEntry], now: u64) -> SpendBundle {
+    let (hint, memo) = presence_memo(NET, node, &CK, era, entries, now).unwrap();
+    let own = BurnerInput::Own(FaucetCoin { coin, confirmed_height: made });
+    build_burner_bundle(NET, key, &own, hint, memo).unwrap().bundle
+}
+
+/// The coin a listing's write stopped for, when it stopped because another
+/// copy of this station spent a coin of the listing's key
+/// (`claim_write::ForeignSpend`, stage 4 design §10), read as the heartbeat
+/// reads it ([`foreign_spend`]).
+fn stopped_for(write: &Result<(Bytes32, MemoWrite)>) -> Option<Bytes32> {
+    write.as_ref().err().and_then(foreign_spend)
+}
+
+/// That the listing's write `write` stopped for `coin`, a coin of its key
+/// `key` that another copy of this station spent: it is neither a wait nor
+/// a refusal by the chain, its log line names no retry, and neither the
+/// Phone Book's words for it, its log line, its text nor its `Debug` names
+/// the burner ([`names_no_burner`]) or the coin.
+fn stopped(write: &Result<(Bytes32, MemoWrite)>, coin: Coin, key: &BurnerKey) {
+    assert_eq!(stopped_for(write), Some(coin.coin_id()), "{:?}", write.as_ref().err());
+    let e = write.as_ref().err().expect("stopped");
+    assert!(!is_typed_wait(e) && !chain_busy(e), "neither a wait nor the chain's refusal");
+    names_no_burner(e, key);
+    let line = listing_failure_line(true, 0, e);
+    assert!(!line.contains("retry"), "{line}");
+    let id = hex::encode(coin.coin_id());
+    for text in [listing_failure_words(e, true), line, format!("{e:#}"), format!("{e:?}")] {
+        assert!(!text.contains(&id), "{text}");
+    }
 }
 
 /// A host the knocks here go to: the request a knocker queues for it on
@@ -1852,8 +1939,8 @@ async fn a_claim_and_write_lands_and_the_resolver_opens_the_record_through_the_e
 /// The write reads pending while the lease keeps its bundle settling, and
 /// the burner, holding no coin, is not funded again meanwhile (§5.2): the
 /// fork could still go and bring the bundle back. Once F1 is spent
-/// SETTLED_DEPTH deep the write reads dead, in today's words (PR 10 tells a
-/// stranger's claim from a spend of ours), and the burner's next write is
+/// SETTLED_DEPTH deep the write reads dead, its dish coin gone to another
+/// claim, and the burner's next write is
 /// built again from F2, its body sealed knowing the new gift g2. It lands
 /// and is read through g2. The fuse gave the dead bundle's gift back, so
 /// the burner has one gift counted, as it has one landed.
@@ -1891,7 +1978,7 @@ async fn a_reorg_that_gives_the_dish_coin_to_another_claimer_has_the_write_built
     assert_eq!(s.gifts(0), 1);
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer));
 
     let (again_hint, memo) = presence_memo(NET, &node, &CK, 0, &entries(), unix_now()).unwrap();
@@ -2305,8 +2392,9 @@ async fn a_burners_first_write_filed_in_its_mark_is_confirmed_by_its_gift_under_
 /// claim and write is filed in the presence mark and the beacon mark, and a
 /// stranger's claim of its dish coin F lands first. Both readers say pending
 /// while the lease keeps the bundle settling, and once F is spent
-/// SETTLED_DEPTH deep, dead, in today's words (PR 10 tells a stranger's
-/// claim from a spend of ours): the presence step voids its mark and the
+/// SETTLED_DEPTH deep, dead, its dish coin gone to another claim (the claim
+/// is keyless, so this is no spend of ours and no other copy's either,
+/// [`WriteStanding::for_coins`]): the presence step voids its mark and the
 /// beacon step forgets its own, so each is due again. The same marks
 /// without their parked input, one coin read back as both, read pending for
 /// ever and are kept, which would block the beacon for the era: g is on no
@@ -2348,8 +2436,8 @@ async fn a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_fro
     s.reconcile().await;
     assert!(!s.lease.holds_for(payer), "settled: the lease let the bundle go");
     let peak = s.chain.peak();
-    let dead = Some((WriteStanding::Dead("its coin went to another spend of ours"), false));
-    let never_landed = "never landed — its coin went to another spend of ours".to_string();
+    let dead = Some((WriteStanding::Dead("its dish coin went to another claim"), false));
+    let never_landed = "never landed — its dish coin went to another claim".to_string();
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word, dead, "F spent with no coin of ours under the hint");
     assert_eq!(presence_step(&mark, word, 0, peak), PresenceStep::Void(never_landed.clone()), "void: the listing is due again");
@@ -2570,7 +2658,7 @@ async fn a_claim_and_write_a_strangers_claim_beat_gives_its_gift_back_to_the_fus
     assert_eq!(s.gifts(0), 16, "nothing given back while the bundle could still land");
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer));
     let mut handed = None;
     let body = |parent: Bytes32| -> Result<Vec<u8>> {
@@ -2635,7 +2723,7 @@ async fn a_stray_at_a_burner_keeps_no_dead_gift_counted_once_a_redirected_claim_
     assert_eq!(s.gifts(0), 1);
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer) && !s.lease.holds_spend_at(key.puzzle_hash()), "the lease let the bundle go");
     let second = s.burner_write(&key, 0, hint, None, |_| Ok(b"a record from F2".to_vec()), 3).await.unwrap();
     let g2 = gift(&key, f2);
@@ -2683,7 +2771,7 @@ async fn strays_past_one_page_at_a_burner_keep_no_dead_gift_counted() {
         s.chain.farm().await;
     }
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer) && !s.lease.holds_spend_at(key.puzzle_hash()), "the lease let the bundle go");
 
     s.chain.set_page_limit(2);
@@ -2793,7 +2881,8 @@ async fn a_claim_and_write_whose_ephemeral_parent_no_node_serves_reads_pending_a
 /// settles, and then its coin is spent to another puzzle hash by a holder of
 /// its key that is not this lease (a cloned folder, or a stolen W). The
 /// burner now holds no coin and the lease nothing of its, so it is funded
-/// again (§5.2; PR 10's foreign-spend pause is what stops a thief), but its
+/// again (§5.2; for the listing's key the pause of §10 comes first,
+/// `a_lease_that_kept_no_records_adopts_what_its_key_spent_and_a_coin_swept_elsewhere_is_told_then_funded_again`), but its
 /// puzzle hash held coins of 1 mojo, so the first gift stays counted: two
 /// gifts landed through us, two counted. Only a burner that never held a
 /// coin of 1 mojo, as in the lost-race tests, has its gift given back,
@@ -3749,6 +3838,339 @@ async fn a_lost_marks_write_confirmed_outside_its_era_is_filed_and_voided_once()
     assert!(s.chain.unanswered().is_empty());
 }
 
+/// Stage 4 design §10, "Burner spent elsewhere", with a cloned data folder
+/// and the two copies writing in turn. Era 0's listing lands from P(0) and
+/// settles, the folder is copied, and the copy, on a lease loaded from the
+/// copied file with a fuse of its own, rewrites the listing from P(0)'s
+/// coin c0. Our next write finds c0 spent with no record of it on our lease
+/// and stops for it: nothing is claimed, parked, sent or counted, it is
+/// neither a wait nor a refusal, and its words name neither the burner nor
+/// the coin. Counted on the pause by that coin, as the heartbeat counts it,
+/// it holds for two hours in §10's own words, across a restart, and the
+/// same coin told of again counts nothing. The lease tells of a coin once,
+/// across a restart too, so the write after the two hours goes on from c1,
+/// the coin the copy's write made, with no second gift. The copy is then
+/// told of our spend of c1 in the same way, once, and writes again. Our
+/// next write stops for the copy's second spend, and a second one in the
+/// era holds until the next era, in its own words. In era 1 nothing holds,
+/// and the listing is written from P(1) with era 1's gift.
+#[tokio::test]
+async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hours() {
+    let mut s = setup().await;
+    let dir = Dir::new("cloned-folder");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(140), iroh::SecretKey::generate());
+    let (p0, p1) = (burner(140, 0), burner(140, 1));
+    let payer = Payer::of_burner(&p0);
+    let (dish, _) = ready_dishes(&s, &[1, 1]).await;
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let t = unix_now();
+    let (here, there) = (entries(), entries_of("203.0.113.9:4444", 0));
+    let (_, first) = s.listing(&w, &node, 0, &here, t, 1).await.unwrap();
+    s.turn().await;
+    let c0 = burner_coin(&p0, first.coins.parent);
+    assert!(!s.lease.holds_for(payer), "settled: the lease holds nothing of P(0)'s");
+
+    // The folder is copied, and the copy rewrites the listing.
+    let mut copy = cloned_folder(&dir, &path, &w, 0, payer);
+    s.change_copy(&mut copy);
+    let (_, theirs) = s.listing(&w, &node, 0, &there, t + 600, 2).await.unwrap();
+    assert_eq!(theirs.coins, WriteCoins::one(c0.coin_id()), "the copy writes from P(0)'s one coin");
+    s.chain.farm().await;
+    let c1 = burner_coin(&p0, c0.coin_id());
+    s.change_copy(&mut copy);
+
+    let sent = s.sent();
+    let at = t + 1_200;
+    let stop = s.listing(&w, &node, 0, &here, at, 3).await;
+    stopped(&stop, c0, &p0);
+    assert_eq!(s.sent(), sent, "nothing sent");
+    assert!(!s.lease.holds_for(payer) && !s.lease.is_taken(&c1.coin_id()), "nothing parked");
+    assert_eq!(s.gifts(0), 1, "nothing counted");
+
+    // Counted on the pause by its coin, as the heartbeat counts it.
+    let pause_file = dir.0.join(FOREIGN_PAUSE_FILE);
+    let mut pause = ForeignPause::load(&pause_file);
+    assert_eq!(paused_now(&mut pause, Some(0), at), None);
+    assert!(pause.note(0, at, stopped_for(&stop).unwrap()));
+    let two_hours = Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS });
+    assert_eq!(paused_now(&mut pause, Some(0), at), two_hours);
+    let readout = listing_readout(None, ListingStep::Write, true, false, None, false, false);
+    assert_eq!(paused_readout(two_hours, readout.clone()).0.as_deref(), Some(PAUSED_TWO_HOURS_WORDS));
+
+    // The node starts again: the pause and the lease are read from their
+    // files.
+    let mut pause = ForeignPause::load(&pause_file);
+    assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS - 1), two_hours, "held to its last second, a restart or not");
+    assert!(!pause.note(0, at + 60, c0.coin_id()), "the same coin told of again counts nothing");
+    assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS), None, "two hours on, nothing holds");
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    let (_, ours) = s.listing(&w, &node, 0, &here, at + FOREIGN_PAUSE_SECS, 4).await.unwrap();
+    assert_eq!(ours.coins, WriteCoins::one(c1.coin_id()), "told of c0 once: the write goes on from the coin the copy's write made");
+    assert_eq!(s.gifts(0), 1, "with no second gift");
+    s.chain.farm().await;
+    let c2 = burner_coin(&p0, c1.coin_id());
+
+    // The copy is told of our spend, once, and writes again.
+    s.change_copy(&mut copy);
+    let sent = s.sent();
+    let stop = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS + 600, 5).await;
+    stopped(&stop, c1, &p0);
+    assert_eq!(s.sent(), sent, "the copy sends nothing either");
+    let (_, theirs) = s.listing(&w, &node, 0, &there, at + 2 * FOREIGN_PAUSE_SECS + 600, 6).await.unwrap();
+    assert_eq!(theirs.coins, WriteCoins::one(c2.coin_id()), "the copy writes from the coin ours made");
+    s.chain.farm().await;
+    s.change_copy(&mut copy);
+
+    // The second time in the era holds until the next era.
+    let again = at + 2 * FOREIGN_PAUSE_SECS + 1_200;
+    let stop = s.listing(&w, &node, 0, &here, again, 7).await;
+    stopped(&stop, c2, &p0);
+    assert!(pause.note(0, again, stopped_for(&stop).unwrap()));
+    assert_eq!(paused_now(&mut pause, Some(0), again), Some(Paused::UntilNextEra));
+    assert_eq!(paused_now(&mut pause, Some(0), again + 6 * 24 * 3600), Some(Paused::UntilNextEra), "for as long as the era lasts");
+    assert_eq!(paused_readout(Some(Paused::UntilNextEra), readout).0.as_deref(), Some(PAUSED_NEXT_EDITION_WORDS));
+
+    s.chain.farm_to(ERA_BLOCKS).await;
+    let next_era = again + 3 * 3600;
+    assert_eq!(paused_now(&mut pause, Some(1), next_era), None, "in the next era nothing holds");
+    let (_, next) = s.listing(&w, &node, 1, &here, next_era, 8).await.unwrap();
+    let f_b = *dish.iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
+    assert_eq!(next.payer, Payer::of_burner(&p1), "era 1's listing comes from P(1)");
+    assert_eq!(next.coins, WriteCoins { parent: gift(&p1, f_b).coin_id(), parked: f_b.coin_id() }, "with era 1's own gift");
+    assert_eq!(s.gifts(1), 1);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, the verdict's half: "the new verdict tells ours from
+/// foreign by the lease's records". Our rewrite of the listing from P(0)'s
+/// coin c0 waits in the mempools when a block takes the other copy's
+/// rewrite of c0 instead. The coin that block makes is the very coin ours
+/// would have made (the same parent, puzzle hash and amount), under the
+/// same hint, and only its memo is not ours. The mark reads pending while
+/// the lease keeps the spend settling, and that word is not retold. Once c0
+/// is spent SETTLED_DEPTH deep the chain's word is dead, its coin gone to
+/// another spend. Our lease has recorded one spend of c0, the write's own,
+/// so the listing's verdict retells it as lost to another copy of this
+/// station and names c0, which the heartbeat counts on the pause; the mark
+/// is voided in those words. With the SSF wallet paying, the word stays as
+/// it came. The writer is told nothing more of c0, which is in the lease's
+/// records as its own spend's, so one spend by the copy is counted once:
+/// after the pause the listing is written from the coin the copy made, with
+/// no second gift.
+#[tokio::test]
+async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_another_copy_and_is_counted_once() {
+    let mut s = setup().await;
+    ready_dish(&s, 1).await;
+    let (w, node) = (wallet(141), iroh::SecretKey::generate());
+    let p0 = burner(141, 0);
+    let t = unix_now();
+    let (here, there) = (entries(), entries_of("203.0.113.9:4444", 0));
+    let (hint, first) = s.listing(&w, &node, 0, &here, t, 1).await.unwrap();
+    s.turn().await;
+    let c0 = burner_coin(&p0, first.coins.parent);
+    let made = s.chain.record(c0.coin_id()).expect("the first listing landed").1;
+
+    let (_, rewrite) = s.listing(&w, &node, 0, &there, t + 600, 2).await.unwrap();
+    assert_eq!(rewrite.coins, WriteCoins::one(c0.coin_id()));
+    assert!(s.lease.spent_once(&c0.coin_id()), "one spend of ours on c0");
+    let mark = NodePublishMark::written(0, 2, "b".into(), t + 600, hint, &rewrite, node.public().to_string());
+    let theirs = copys_rewrite(&p0, c0, made, &node, 0, &here, t + 601);
+    assert_ne!(memo_of(&theirs, hint), rewrite.memo, "the copy's memo is another");
+    s.chain.include_next(theirs);
+    let taken = s.chain.farm().await;
+    let c1 = burner_coin(&p0, c0.coin_id());
+    assert_eq!(s.chain.record(c0.coin_id()).unwrap().2, Some(taken));
+    assert_eq!(s.chain.children(c0.coin_id()), vec![c1], "the coin our rewrite would have made, made by the copy's");
+    assert!(s.chain.mempool().is_empty(), "the block spent the rewrite's coin, so the mempools let it go");
+
+    s.reconcile().await;
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Pending), "the lease still holds the spend");
+    assert_eq!(listing_word(&s.lease, &mark, true, word.clone()), (word, None), "pending is not retold");
+
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    s.reconcile().await;
+    let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
+    assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Dead("its coin went to another spend of ours")), "the chain's word");
+    assert_eq!(listing_word(&s.lease, &mark, false, word.clone()), (word.clone(), None), "with the SSF wallet paying, as it came");
+    let (told, lost_by) = listing_word(&s.lease, &mark, true, word);
+    assert_eq!(told.clone().map(|w| w.0), Some(WriteStanding::Dead("another copy of this station spent its coin")), "one spend of ours, and it was not the one that took c0");
+    assert_eq!(lost_by, Some(c0.coin_id()), "lost by c0");
+    assert_eq!(presence_step(&mark, told, 0, s.chain.peak()), PresenceStep::Void("never landed — another copy of this station spent its coin".into()));
+    let mut pause = ForeignPause::in_memory();
+    let at = t + 1_800;
+    assert!(pause.note(0, at, c0.coin_id()));
+    assert_eq!(paused_now(&mut pause, Some(0), at), Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS }));
+
+    let (_, next) = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS, 3).await.unwrap();
+    assert_eq!(next.coins, WriteCoins::one(c1.coin_id()), "the writer stops for nothing: c0 is in the records, and the write goes on from the copy's coin");
+    assert_eq!(s.gifts(0), 1, "with no second gift");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10, the other copy's rewrite landing as ours is sent. The
+/// copy's rewrite of P(0)'s coin c0 waits in the mempools, and a block that
+/// carries it comes just as our rewrite of c0 is sent, so every node
+/// refuses ours as a double spend. That is a refusal like any lost race's:
+/// c0 is handed back. The lease forgets that a spend of ours took c0, since
+/// a refused spend consumed nothing; left in its records, the copy's spend
+/// of c0 would read as our own for ever. So the next write finds c0 spent
+/// with no record of it and stops for it, and the one after goes on from
+/// the coin the copy made.
+#[tokio::test]
+async fn a_rewrite_refused_as_the_other_copys_lands_leaves_no_record_of_its_coin_so_the_next_write_stops_for_it() {
+    let mut s = setup().await;
+    ready_dish(&s, 1).await;
+    let (w, node) = (wallet(142), iroh::SecretKey::generate());
+    let p0 = burner(142, 0);
+    let t = unix_now();
+    let (here, there) = (entries(), entries_of("203.0.113.9:4444", 0));
+    let (_, first) = s.listing(&w, &node, 0, &here, t, 1).await.unwrap();
+    s.turn().await;
+    let c0 = burner_coin(&p0, first.coins.parent);
+    let made = s.chain.record(c0.coin_id()).expect("the first listing landed").1;
+    let theirs = copys_rewrite(&p0, c0, made, &node, 0, &here, t + 601);
+    s.money.push_tx(theirs.clone()).await.unwrap();
+    s.chain.block_before(ProtocolMessageTypes::SendTransaction);
+
+    let lost = s.listing(&w, &node, 0, &there, t + 600, 2).await;
+    assert!(!s.chain.reorg_staged(), "the block came as our rewrite was sent");
+    assert_eq!(s.chain.children(c0.coin_id()), vec![burner_coin(&p0, c0.coin_id())], "and took the copy's rewrite");
+    assert_eq!(stopped_for(&lost), None, "refused, not stopped: c0 was unspent when the writer looked");
+    let lost = lost.map(|(_, write)| write);
+    let why = refused(&lost).expect("every peer refused the push");
+    assert_eq!(why.matches("DOUBLE_SPEND").count(), 2, "{why}");
+    assert!(!s.lease.is_taken(&c0.coin_id()), "a refusal hands c0 back");
+    assert!(!s.lease.spent_once(&c0.coin_id()), "and no spend of ours is recorded on it");
+
+    // A block every connection has filed, so the lane's peak is the chain's.
+    s.chain.farm().await;
+    let sent = s.sent();
+    let stop = s.listing(&w, &node, 0, &there, t + 1_200, 3).await;
+    stopped(&stop, c0, &p0);
+    assert_eq!(s.sent(), sent, "nothing sent");
+    let (_, next) = s.listing(&w, &node, 0, &there, t + 1_200 + FOREIGN_PAUSE_SECS, 4).await.unwrap();
+    assert_eq!(next.coins, WriteCoins::one(burner_coin(&p0, c0.coin_id()).coin_id()), "told once: the write goes on from the copy's coin");
+    assert_eq!(s.gifts(0), 1, "with no second gift");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §10 on a lease that kept no records of its own spends (an
+/// older build's, or one whose file was lost), and a coin swept away by a
+/// holder of the key. Two listings of ours land from P(0), and the lease is
+/// then lost. The new lease's first look adopts every coin P(0) spent and
+/// stops for none, since it cannot tell this station's earlier spends from
+/// another copy's; the listing is written from P(0)'s coin, and only that
+/// spend is recorded as one spend's alone. A holder of the key then sends
+/// P(0)'s coin elsewhere, which leaves P(0) with no coin. The next write
+/// stops for that coin, counted on the pause. The one after funds P(0)
+/// again from the dish under the fuse (§5.2), its landed gift still
+/// counted: two gifts, two counted.
+#[tokio::test]
+async fn a_lease_that_kept_no_records_adopts_what_its_key_spent_and_a_coin_swept_elsewhere_is_told_then_funded_again() {
+    let mut s = setup().await;
+    let (dish, _) = ready_dishes(&s, &[1, 1]).await;
+    let (w, node) = (wallet(143), iroh::SecretKey::generate());
+    let p0 = burner(143, 0);
+    let t = unix_now();
+    let (here, there) = (entries(), entries_of("203.0.113.9:4444", 0));
+    let (_, first) = s.listing(&w, &node, 0, &here, t, 1).await.unwrap();
+    s.chain.farm().await;
+    let c0 = burner_coin(&p0, first.coins.parent);
+    let (_, second) = s.listing(&w, &node, 0, &there, t + 600, 2).await.unwrap();
+    assert_eq!(second.coins, WriteCoins::one(c0.coin_id()));
+    s.turn().await;
+    let c1 = burner_coin(&p0, c0.coin_id());
+
+    // The lease's file is lost: its records of g and c0 with it.
+    s.lease = WalletLease::new();
+    let (_, third) = s.listing(&w, &node, 0, &here, t + 1_200, 3).await.unwrap();
+    assert_eq!(third.coins, WriteCoins::one(c1.coin_id()), "the first look adopts what P(0) spent and stops for none of it");
+    assert!(!s.lease.spent_once(&c0.coin_id()), "adopted: not known as one spend's alone");
+    assert!(s.lease.spent_once(&c1.coin_id()), "the new write's coin is");
+    s.turn().await;
+    let c2 = burner_coin(&p0, c1.coin_id());
+
+    // A holder of the key sends P(0)'s coin elsewhere.
+    let elsewhere = Bytes32::new([0x8f; 32]);
+    s.money.push_tx(spent_elsewhere(&p0, c2, elsewhere)).await.unwrap();
+    s.chain.farm().await;
+    assert_eq!(s.chain.children(c2.coin_id()), vec![Coin::new(c2.coin_id(), elsewhere, 1)], "P(0) holds no coin now");
+    let sent = s.sent();
+    let at = t + 1_800;
+    let stop = s.listing(&w, &node, 0, &there, at, 4).await;
+    stopped(&stop, c2, &p0);
+    assert_eq!((s.sent(), s.gifts(0)), (sent, 1), "nothing sent, nothing claimed");
+    let mut pause = ForeignPause::in_memory();
+    assert!(pause.note(0, at, c2.coin_id()));
+    assert_eq!(paused_now(&mut pause, Some(0), at), Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS }));
+
+    let (_, funded) = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS, 5).await.unwrap();
+    let spare = *dish.iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
+    assert_eq!(funded.coins, WriteCoins { parent: gift(&p0, spare).coin_id(), parked: spare.coin_id() }, "funded again, from the other lobby coin");
+    assert_eq!(s.gifts(0), 2, "the landed gift is not given back: two gifts, two counted");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// A listing of P(0)'s coins that is cut short is neither compared with the
+/// lease's records nor adopted into them (`claim_write::listing_write_with`).
+/// The other copy rewrites the listing from c0, and strays of 2 mojos paid
+/// to P(0) (anyone can, stage 4 design §5.4) then fill the listing past the
+/// pages one lookup follows. The pages that are read list c0 spent and the
+/// copy's coin c1 unspent, so the rewrite goes on from c1 as it always did,
+/// and nothing stops it. Once the listing is whole the next write stops for
+/// c0: the cut listing adopted nothing. A lease that kept no records then
+/// looks at a cut listing first, which names no coin to write from, and
+/// waits. Its first whole look adopts every spent coin and stops for none,
+/// our own earlier spend of c1 among them, which a watch started on the cut
+/// listing would have told of as another copy's.
+#[tokio::test]
+async fn a_listing_of_the_keys_coins_cut_short_is_neither_compared_nor_adopted_and_the_spend_is_told_once_it_is_whole() {
+    let mut s = setup().await;
+    ready_dish(&s, 1).await;
+    let (w, node) = (wallet(144), iroh::SecretKey::generate());
+    let p0 = burner(144, 0);
+    let t = unix_now();
+    let (here, there) = (entries(), entries_of("203.0.113.9:4444", 0));
+    let (_, first) = s.listing(&w, &node, 0, &here, t, 1).await.unwrap();
+    s.turn().await;
+    let c0 = burner_coin(&p0, first.coins.parent);
+    let made = s.chain.record(c0.coin_id()).expect("the first listing landed").1;
+    s.money.push_tx(copys_rewrite(&p0, c0, made, &node, 0, &there, t + 600)).await.unwrap();
+    s.chain.farm().await;
+    let c1 = burner_coin(&p0, c0.coin_id());
+    for _ in 0..=MAX_FAUCET_PAGES {
+        s.chain.fund(p0.puzzle_hash(), 2, None);
+    }
+    s.chain.farm().await;
+
+    // Two coin states a page: the gift, then c0 and c1, then pages of the
+    // strays' block that never end.
+    let whole = 100_000;
+    s.chain.set_page_limit(2);
+    let (_, cut) = s.listing(&w, &node, 0, &here, t + 1_200, 2).await.unwrap();
+    assert_eq!(cut.coins, WriteCoins::one(c1.coin_id()), "not compared: the rewrite goes on from the coin the pages list");
+    s.chain.farm().await;
+    let c2 = burner_coin(&p0, c1.coin_id());
+    s.chain.set_page_limit(whole);
+    let stop = s.listing(&w, &node, 0, &here, t + 1_800, 3).await;
+    stopped(&stop, c0, &p0);
+
+    // A lease that kept no records, and a cut listing as its first look.
+    s.lease = WalletLease::new();
+    s.chain.set_page_limit(2);
+    let wait = s.listing(&w, &node, 0, &here, t + 2_400, 4).await.map(|(_, write)| write);
+    assert_eq!(waited(&wait), Some(BurnerWait::ListingCutShort), "no coin to write from on the pages read: it waits");
+    s.chain.set_page_limit(whole);
+    let (_, next) = s.listing(&w, &node, 0, &here, t + 3_000, 5).await.unwrap();
+    assert_eq!(next.coins, WriteCoins::one(c2.coin_id()), "the first whole look adopts every spent coin and stops for none");
+    assert_eq!(s.gifts(0), 1, "one gift, P(0)'s first");
+    assert!(s.chain.unanswered().is_empty());
+}
+
 /// Stage 4 design §3.2, §4.1's knock row and §5.2, with burner keys on: a
 /// knock goes out from its own burner key K(h), the knock key of the
 /// wallet's root for the host's inbox hint and node id, though the SSF
@@ -4571,7 +4993,7 @@ async fn a_reorg_that_gives_a_knocks_dish_coin_to_a_stranger_has_it_written_agai
     assert_eq!(s.gifts(0), 1);
 
     s.chain.farm_blocks(2).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer));
     let (again_hint, second) = s.knock(90, &node, &req, 0, || Ok(None), 4).await.unwrap();
     let g2 = gift(&key, f2);
@@ -5702,8 +6124,9 @@ async fn a_burner_beacon_whose_mark_a_restart_lost_is_held_while_in_flight_and_t
 /// the clone's write made: B's one coin, whoever spent it last. Neither
 /// write takes a gift, so a clone costs the dish nothing after B's first
 /// era. The chain then carries two beacons with one node id in the era, of
-/// which a newcomer reads the newer. Nothing pauses for the clone's spend
-/// until the pause of §10 is built (PR 10f).
+/// which a newcomer reads the newer. Nothing stops or pauses for the clone's
+/// spend: twins on the same words share B (§3.3), so a spend of B's coin by
+/// another holder is no fault, and only the listing's key is watched (§10).
 #[tokio::test]
 async fn a_clones_beacon_from_bs_coin_leaves_ours_to_be_written_from_the_coin_it_made_with_no_gift() {
     let mut s = setup().await;
@@ -5777,7 +6200,7 @@ async fn a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_writt
     assert_eq!(s.gifts(0), 1);
 
     s.chain.farm_blocks(2).await;
-    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its coin went to another spend of ours"));
+    assert_eq!(s.judge_split(hint, first.coins, first.memo, first.spend).await, WriteStanding::Dead("its dish coin went to another claim"));
     assert!(!s.lease.holds_for(payer));
     let (again_hint, second) = s.beacon(131, &node, 0, now, 4).await.unwrap();
     let g2 = gift(&key, f2);

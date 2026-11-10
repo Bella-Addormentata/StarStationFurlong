@@ -16,7 +16,7 @@
 //! never published under, armed or not — see [`publishable_rooms`].
 #![cfg(feature = "chia-publish")]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -200,6 +200,94 @@ pub struct WalletLease {
     /// blocks hold across one and only the draw is new. Bounded
     /// ([`MAX_SPACED`]).
     spacing: std::sync::Mutex<HashMap<Bytes32, SpacedUntil>>,
+    /// The lease's records of its own spends at its burners' addresses
+    /// (stage 4 design §10): what tells a spend of ours from one by another
+    /// copy of this station ([`OwnSpends`]). Written with the parking, in the
+    /// same save.
+    own: std::sync::Mutex<OwnSpends>,
+}
+
+/// Coins the lease remembers its own spends consumed at most
+/// ([`WalletLease`]'s `own`); past it the oldest is forgotten. A node's
+/// listing is written at most [`MAX_NODE_WRITES_PER_ERA`] times an era, and
+/// only the current era's key is ever compared with the records, so the
+/// ones forgotten are of eras long past.
+pub const MAX_OWN_SPENDS: usize = 256;
+
+/// The lease's records of its own spends (stage 4 design §10, "the new
+/// verdict tells ours from foreign by the lease's records"): every coin a
+/// spend it parked consumed at its payer's own address, for a payer that is
+/// not the money address's. Those are a burner's coins: the gift g of a
+/// first write and the coin a rewrite spends back to its key, not the dish
+/// coin a first write claims, which sits at the dish's address and is
+/// anyone's to claim. A coin spent at the listing's key that these records
+/// do not hold was spent by another holder of the key: another copy of this
+/// station, from a cloned folder or the same words.
+///
+/// Kept in the lease file beside the parking and saved with it, in the same
+/// write, so a spend that left is never missing here. A file an older build
+/// wrote holds none of it; what its saved bundles spent is taken as recorded
+/// ([`WalletLease::load`]) and the rest is adopted at the first look
+/// ([`WalletLease::foreign_spends`]). Bounded ([`MAX_OWN_SPENDS`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OwnSpends {
+    /// Whether a listing's write has compared its key's spent coins with
+    /// these records yet. Until one has, the records may be short of what
+    /// this station spent before they were kept (an older build's spends, a
+    /// lease file removed), so the first look adopts every spent coin it
+    /// finds and tells of none.
+    watching: bool,
+    /// The coins, oldest first, each with whether it is known to have been
+    /// spent by exactly one spend of ours: `false` for a coin a second spend
+    /// of ours parked too (a write built again from the coin of one the
+    /// peers dropped), one taken from a saved bundle at a restart, or one
+    /// adopted. Only a coin that reads `true` can have been lost to another
+    /// copy when it is spent and the one write that spent it is not there
+    /// ([`WalletLease::spent_once`]).
+    coins: VecDeque<(Bytes32, bool)>,
+}
+
+impl OwnSpends {
+    fn at(&self, coin: &Bytes32) -> Option<usize> {
+        self.coins.iter().position(|(known, _)| known == coin)
+    }
+
+    /// Record `coin`, `once` as [`OwnSpends`]'s `coins` tells it, and return
+    /// what the records held of it before (`None`: nothing). A coin already
+    /// held is no longer one spend's alone, whatever `once` says.
+    fn note(&mut self, coin: Bytes32, once: bool) -> Option<bool> {
+        if let Some(at) = self.at(&coin) {
+            return Some(std::mem::replace(&mut self.coins[at].1, false));
+        }
+        if self.coins.len() >= MAX_OWN_SPENDS {
+            self.coins.pop_front();
+        }
+        self.coins.push_back((coin, once));
+        None
+    }
+
+    /// Take back what [`OwnSpends::note`] did to `coin`, given what it
+    /// returned: the parking it belonged to was not saved, so its spend never
+    /// left.
+    fn take_back(&mut self, coin: &Bytes32, before: Option<bool>) {
+        let Some(at) = self.at(coin) else { return };
+        match before {
+            Some(once) => self.coins[at].1 = once,
+            None => {
+                self.coins.remove(at);
+            }
+        }
+    }
+}
+
+/// The coins `bundle` spends at its payer's own address
+/// ([`OwnSpends`]): none for the money address's payer, `money`, whose
+/// coins no burner's key can spend and whose spends the records leave out.
+fn own_inputs(bundle: &SpendBundle, payer: Payer, money: Option<Payer>) -> Vec<Bytes32> {
+    if money == Some(payer) {
+        return Vec::new();
+    }
+    bundle.coin_spends.iter().filter(|cs| cs.coin.puzzle_hash == payer.0).map(|cs| cs.coin.coin_id()).collect()
 }
 
 /// A spend released as spent, kept until the chain settles it (see
@@ -481,6 +569,25 @@ struct LeaseFile {
     /// with their bundles (#272 review round 10); absent in older files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     settling: Vec<SettlingSpend>,
+    /// The lease's records of its own spends at its burners' addresses
+    /// (stage 4 design §10, [`OwnSpends`]): whether a listing's write has
+    /// looked at them yet, and the coins. Absent in files older builds
+    /// wrote, and the file stays version 1 as for a payer: an older build
+    /// reads the file and skips both.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    own_watching: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    own_spends: Vec<OwnSpend>,
+}
+
+/// One coin of [`OwnSpends`] as the lease file keeps it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct OwnSpend {
+    coin: String,
+    /// Known to have been spent by exactly one spend of ours; left out when
+    /// it is not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    once: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
@@ -600,6 +707,7 @@ impl WalletLease {
             released: std::sync::Mutex::new(HashMap::new()),
             settling: std::sync::Mutex::new(BTreeMap::new()),
             spacing: std::sync::Mutex::new(HashMap::new()),
+            own: std::sync::Mutex::new(OwnSpends::default()),
         }
     }
 
@@ -663,16 +771,30 @@ impl WalletLease {
                 pending.insert(input.coin_id, Parked { at: now, spend, seen_at: input.seen_at });
             }
         }
+        // What the spend consumes at its payer's own address goes into the
+        // lease's records of its own spends (stage 4 design §10), in the same
+        // save as the parking: a spend that leaves is never missing there.
+        let mut noted: Vec<(Bytes32, Option<bool>)> = Vec::new();
         if let Some((bundle, payer)) = pushed {
             self.bundles.lock().unwrap().insert(spend, Pushed { bundle: bundle.clone(), payer: Some(payer) });
+            let money = *self.money.lock().unwrap();
+            let mut own = self.own.lock().unwrap();
+            for coin in own_inputs(bundle, payer, money) {
+                noted.push((coin, own.note(coin, true)));
+            }
         }
         if let Err(e) = self.persist() {
             // Not saved, so not sent: take the parking and its bundle (with its
             // payer) back whole (by the spend number, as a rejection would) and
             // let the caller refuse the spend. The number is used up, so no
-            // later spend shares it.
+            // later spend shares it. Its coins leave the records of our own
+            // spends too, since it spent nothing.
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
             self.bundles.lock().unwrap().remove(&spend);
+            let mut own = self.own.lock().unwrap();
+            for (coin, before) in noted.iter().rev() {
+                own.take_back(coin, *before);
+            }
             return Err(LeaseError::Unsaved(e));
         }
         Ok(Parking { spend, coins })
@@ -690,8 +812,24 @@ impl WalletLease {
     }
 
     /// The chain REJECTED the spend outright, so it holds nothing of it and
-    /// the coins are free again (compare-and-release, see [`Parking`]).
+    /// the coins are free again (compare-and-release, see [`Parking`]). The
+    /// spend consumed nothing, so a coin it alone was recorded for leaves
+    /// the lease's records of its own spends too (stage 4 design §10): were
+    /// it left there, a spend of that coin by another copy of this station,
+    /// which is as likely as anything to be why the peers refused ours,
+    /// would read as our own. A coin an earlier spend of ours was recorded
+    /// for stays, since that spend may yet land.
     pub fn unpark(&self, parking: &Parking) {
+        let refused = self.bundles.lock().unwrap().get(&parking.spend).cloned();
+        if let Some(Pushed { bundle, payer: Some(payer) }) = refused {
+            let money = *self.money.lock().unwrap();
+            let mut own = self.own.lock().unwrap();
+            for coin in own_inputs(&bundle, payer, money) {
+                if let Some(at) = own.at(&coin).filter(|at| own.coins[*at].1) {
+                    own.coins.remove(at);
+                }
+            }
+        }
         self.release(&[parking.spend]);
     }
 
@@ -1326,6 +1464,44 @@ impl WalletLease {
                 parse_payer(entry.payer.as_deref()).map_err(|bad| format!("malformed payer {bad:?} for settling spend #{}", entry.spend))?;
             settling.push((entry.spend, Settling { coins, spent_at: entry.spent_at, bundle, payer }));
         }
+        // The records of our own spends (stage 4 design §10). They hold no
+        // live spend, so a malformed coin id among them seals nothing: the
+        // records are left out whole, and with them the word that a listing
+        // looked, so the next look adopts what it finds.
+        let own_file: Option<Vec<(Bytes32, bool)>> =
+            file.own_spends.iter().map(|entry| parse_coin_id(&entry.coin).map(|coin| (coin, entry.once))).collect();
+        if own_file.is_none() {
+            eprintln!("⛓️ wallet lease: its records of this station's own spends hold a malformed coin id; they start afresh");
+        }
+        // What the saved bundles spend at their payers' own addresses is ours
+        // too, recorded or not: a file an older build wrote has no records.
+        let money = *self.money.lock().unwrap();
+        let mut own_saved: Vec<Bytes32> = Vec::new();
+        for (bundle, payer) in bundles
+            .iter()
+            .map(|(_, pushed)| (&pushed.bundle, pushed.payer))
+            .chain(settling.iter().map(|(_, s)| (&s.bundle, s.payer)))
+        {
+            if let Some(payer) = payer {
+                own_saved.extend(own_inputs(bundle, payer, money));
+            }
+        }
+        {
+            let mut own = self.own.lock().unwrap();
+            if let Some(coins) = own_file {
+                own.watching |= file.own_watching;
+                for (coin, once) in coins {
+                    if own.at(&coin).is_none() {
+                        own.note(coin, once);
+                    }
+                }
+            }
+            for coin in own_saved {
+                if own.at(&coin).is_none() {
+                    own.note(coin, false);
+                }
+            }
+        }
         {
             let mut pending = self.pending.lock().unwrap();
             for (id, spend, seen_at) in &parked {
@@ -1414,7 +1590,71 @@ impl WalletLease {
                 })
             })
             .collect();
-        LeaseFile { v: 1, spends: self.spends.load(std::sync::atomic::Ordering::Relaxed), parked, incoming, bundles, settling }
+        let (own_watching, own_spends) = {
+            let own = self.own.lock().unwrap();
+            (own.watching, own.coins.iter().map(|(coin, once)| OwnSpend { coin: hex::encode(coin), once: *once }).collect())
+        };
+        LeaseFile {
+            v: 1,
+            spends: self.spends.load(std::sync::atomic::Ordering::Relaxed),
+            parked,
+            incoming,
+            bundles,
+            settling,
+            own_watching,
+            own_spends,
+        }
+    }
+
+    /// Compare the spent coins the chain lists at a listing's key, `spent`,
+    /// with the lease's records of its own spends (stage 4 design §10), and
+    /// return the ones no spend of this lease consumed: spent by another
+    /// holder of the key, which is another copy of this station. The caller
+    /// hands every spent coin of a WHOLE listing of the key, of any amount:
+    /// only the key's holders can spend a coin there, whoever paid it in.
+    ///
+    /// Each coin is told of once: the ones returned are adopted into the
+    /// records and saved, so the next look is silent about them and the
+    /// writer goes on. The first look under a lease file tells of none: the
+    /// records may be short of what this station spent before they were
+    /// kept (an older build's spends, a lease file removed), so it adopts
+    /// every spent coin and only starts the watch. A save that fails is
+    /// logged, and the adoption holds in memory; the file then reads as
+    /// before, and a restart tells of the same coins once more, which the
+    /// pause counts once by the coin it was told of.
+    pub fn foreign_spends(&self, spent: &[Bytes32]) -> Vec<Bytes32> {
+        let (first_look, unknown) = {
+            let mut own = self.own.lock().unwrap();
+            let unknown: Vec<Bytes32> = spent.iter().filter(|coin| own.at(coin).is_none()).copied().collect();
+            let first_look = !own.watching;
+            if unknown.is_empty() && !first_look {
+                return Vec::new();
+            }
+            own.watching = true;
+            for coin in &unknown {
+                own.note(*coin, false);
+            }
+            (first_look, unknown)
+        };
+        self.persist_or_log("a look at a listing key's spent coins");
+        if first_look {
+            Vec::new()
+        } else {
+            unknown
+        }
+    }
+
+    /// Did exactly one spend of this lease consume `coin`, as far as its
+    /// records of its own spends go (stage 4 design §10)? What the listing's
+    /// verdict asks of a write's one coin once the chain lists it spent with
+    /// the write's own coin nowhere: with one spend of ours alone on the
+    /// coin, the spend that took it was not ours. `false` for a coin a
+    /// second spend of ours parked, one taken from a saved bundle or
+    /// adopted, and one the records never held or have forgotten, since any
+    /// of those leaves "another spend of ours" possible.
+    pub fn spent_once(&self, coin: &Bytes32) -> bool {
+        let own = self.own.lock().unwrap();
+        own.at(coin).is_some_and(|at| own.coins[at].1)
     }
 
     /// Settle the parked spends against the chain and the mempool: ask the
@@ -3417,13 +3657,15 @@ pub(crate) async fn publish_node_presence_on(
 /// The listing for `era` written from this wallet's listing burner P(e)
 /// (stage 4 design §3.2, §4.1), on a given lease, gift fuse, network, chain,
 /// instant and random source (the tests' own on the mock chain): the record
-/// sealed for `era` on `net` ([`presence_memo`]), written by the burner's
-/// writer (`claim_write::burner_write_with`) under the gift rules and the
-/// fuse (§5.2). The era's first write claims a lobby dish coin in its own
-/// bundle, which funds P(e) with the gift g; a rewrite spends P(e)'s one
-/// coin. Either way the write names P(e) as its payer ([`Payer::of_burner`]),
-/// which the mark files for the hint rule (§8.3), and the money key pays for
-/// nothing.
+/// sealed for `era` on `net` ([`presence_memo`]), written by the listing's
+/// writer (`claim_write::listing_write_with`) under the gift rules and the
+/// fuse (§5.2). That writer stops with `claim_write::ForeignSpend` when the
+/// chain shows that another copy of this station spent a coin of P(e)
+/// (§10), which the heartbeat answers with its pause ([`ForeignPause`]). The
+/// era's first write claims a lobby dish coin in its own bundle, which funds
+/// P(e) with the gift g; a rewrite spends P(e)'s one coin. Either way the
+/// write names P(e) as its payer ([`Payer::of_burner`]), which the mark
+/// files for the hint rule (§8.3), and the money key pays for nothing.
 ///
 /// `root` must be `net`'s ([`crate::chia_burner::BurnerRoot::net`]): P(e)
 /// is derived under the listing hint of the root's network and the record is
@@ -3466,7 +3708,7 @@ async fn publish_node_presence_with<R: rand::Rng + ?Sized + Send>(
     );
     let (hint, sealed) = presence_memo(net, iroh_sk, ck, era, entries, now_unix)?;
     let key = root.presence(ck, era);
-    let write = claim_write::burner_write_with(lease, fuse, net, client, at, &key, era, hint, None, move |_| Ok(sealed), rng, "presence", Some(money)).await?;
+    let write = claim_write::listing_write_with(lease, fuse, net, client, at, &key, era, hint, move |_| Ok(sealed), rng, money).await?;
     Ok((hint, write))
 }
 
@@ -3977,6 +4219,16 @@ fn listing_failure_words(e: &anyhow::Error, last_week: bool) -> String {
     }
 }
 
+/// The coin the listing's write stopped for, when it stopped because another
+/// copy of this station spent a coin of the listing's key (stage 4 design
+/// §10): somewhere in `e`'s chain is `claim_write::ForeignSpend`. It is no
+/// wait ([`is_typed_wait`]) and no failure of the write either: the
+/// heartbeat counts it on the pause ([`ForeignPause::note`]), whose words
+/// take the readout's place, and keeps no failure text for it.
+fn foreign_spend(e: &anyhow::Error) -> Option<Bytes32> {
+    e.chain().find_map(|cause| cause.downcast_ref::<claim_write::ForeignSpend>()).map(|foreign| foreign.coin)
+}
+
 /// The listing arm's log line for the era `era` listing's write that failed
 /// with `e`. With the SSF wallet paying (`burner_path` false) it is the line
 /// it always was, word for word. On the burner path a wait
@@ -3985,14 +4237,18 @@ fn listing_failure_words(e: &anyhow::Error, last_week: bool) -> String {
 /// that waiting costs nothing (stage 4 design §10, Mempool full): it is a
 /// refusal, which paid nothing, and the arm tries again on its retry cadence,
 /// as after every failure. T4's wait ([`spaced`]) says the listing waits
-/// its turn and is tried again at each tick, with no rest. Anything else
-/// failed, in its own text. The
+/// its turn and is tried again at each tick, with no rest. A write stopped
+/// for a spend by another copy of this station ([`foreign_spend`], §10) was
+/// not written, and names no retry: the pause's own line follows it.
+/// Anything else failed, in its own text. The
 /// burner's waits, the lane's refusals and the lease's errors name no key,
 /// puzzle hash or address of the burner, so neither does the line.
 fn listing_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> String {
     let retry = HEARTBEAT_RETRY_SECS / 60;
     if !burner_path {
         format!("⛓️ ChiaHub presence: publish for era {era} failed: {e:#} (retry in {retry} min)")
+    } else if foreign_spend(e).is_some() {
+        format!("⛓️ ChiaHub presence: the era {era} listing was not written: {e:#}")
     } else if chain_busy(e) {
         format!("⛓️ ChiaHub presence: the era {era} listing waits — {CHAIN_BUSY_WORDS}; waiting costs nothing (retry in {retry} min)")
     } else if spaced(e) {
@@ -4590,6 +4846,9 @@ struct BeaconFacts<'a> {
     serves_welcome: bool,
     /// The retry cadence has passed since the last try.
     retry_ok: bool,
+    /// The pause for another copy of this station holds (stage 4 design
+    /// §10, [`ForeignPause`]): never with burner keys off.
+    paused: bool,
     /// The burner path's root, none off it.
     root: Option<&'a crate::chia_burner::BurnerRoot>,
     mark: Option<&'a BeaconMark>,
@@ -4626,7 +4885,13 @@ fn beacon_arm_due<R: rand::Rng + ?Sized>(clock: &mut BeaconClock, f: &BeaconFact
     if let Some(root) = f.root {
         clock.see_peak(f.era, f.peak, root.slot(chia_lane::KIND_BEACON, f.era), rng);
     }
-    !f.money_refused && f.reachable && f.serves_welcome && f.retry_ok && beacon_due(f.mark, f.era, f.node_id) && beacon_slot_open(f.root, clock, f.era, f.peak)
+    !f.money_refused
+        && !f.paused
+        && f.reachable
+        && f.serves_welcome
+        && f.retry_ok
+        && beacon_due(f.mark, f.era, f.node_id)
+        && beacon_slot_open(f.root, clock, f.era, f.peak)
 }
 
 /// #231 P6b: the standing of a pending beacon mark — the lease's word on its
@@ -4735,7 +5000,74 @@ async fn write_standing_on(
             return None;
         }
     };
-    Some((crate::chia_resolve::write_standing(&child, spent_at, word, ours), child.gone_since(confirmed_height)))
+    Some((crate::chia_resolve::write_standing(&child, spent_at, word, ours).for_coins(coins), child.gone_since(confirmed_height)))
+}
+
+/// The listing's standing as the lease's records of its own spends tell it
+/// (stage 4 design §10, "the new verdict tells ours from foreign by the
+/// lease's records"), and the coin it was lost by when another copy of this
+/// station took it. `word` is the chain's word on `mark`
+/// ([`presence_standing`]). A write dead because its coin went to another
+/// spend is retold as dead to another copy
+/// ([`crate::chia_resolve::DEAD_FOREIGN`]) when all of this holds: the
+/// listing is written from burner keys (`burner_path`), the mark's write is
+/// of one coin (a rewrite: a first write's parked coin is the dish's, which
+/// anyone may claim), and exactly one spend of `lease` ever consumed that
+/// coin ([`WalletLease::spent_once`]), the mark's own. The coin is spent and
+/// that one spend's coin is nowhere, so the spend that took it was not
+/// ours, and only a holder of the listing's key could make it.
+///
+/// Every other word is returned as it came, with no coin: a mark the SSF
+/// wallet paid for (its coins are not in those records), a coin a second
+/// spend of ours parked too, where "another spend of ours" stays possible,
+/// and anything with burner keys off. The beacon's mark and a knock's entry
+/// never come here: twins on the same words share those keys (§3.3), and a
+/// spend of theirs by a twin is no fault.
+pub(crate) fn listing_word(
+    lease: &WalletLease,
+    mark: &NodePublishMark,
+    burner_path: bool,
+    word: Option<(crate::chia_resolve::WriteStanding, bool)>,
+) -> (Option<(crate::chia_resolve::WriteStanding, bool)>, Option<Bytes32>) {
+    let only_ours = burner_path
+        .then(|| WriteCoins::filed(&mark.coin_id, &mark.parked))
+        .flatten()
+        .filter(|coins| coins.parent == coins.parked && lease.spent_once(&coins.parked))
+        .map(|coins| coins.parked);
+    match (word, only_ours) {
+        (Some((standing, gone)), Some(coin)) => {
+            let told = standing.by_another_copy();
+            let lost_by = told.is_foreign().then_some(coin);
+            (Some((told, gone)), lost_by)
+        }
+        (word, _) => (word, None),
+    }
+}
+
+/// The pause for another copy of this station that holds at era `era` and
+/// the unix time `now` ([`ForeignPause::holds`], stage 4 design §10), with
+/// the log's line printed when it is not the one last said
+/// ([`ForeignPause::say`]). With no era agreed (`None`) nothing is asked and
+/// nothing holds: no era-bound write goes out then anyway.
+fn paused_now(pause: &mut ForeignPause, era: Option<u64>, now: u64) -> Option<Paused> {
+    let era = era?;
+    if let Some(line) = pause.say(era, now) {
+        eprintln!("{line}");
+    }
+    pause.holds(era, now)
+}
+
+/// The listing's readout ([`listing_readout`]) while the pause for another
+/// copy of this station holds (`paused`, stage 4 design §10): the pause's
+/// own words ([`Paused::words`]) in place of the readout's, since they are
+/// what the owner must act on, and the held state as the readout gave it.
+/// With no pause it is the readout, untouched. A pause holds only with
+/// burner keys on, so never beside a refusal to write on this network.
+fn paused_readout(paused: Option<Paused>, readout: (Option<String>, ListingHold)) -> (Option<String>, ListingHold) {
+    match paused {
+        Some(paused) => (Some(paused.words().to_owned()), readout.1),
+        None => readout,
+    }
 }
 
 /// 📖 What the heartbeat does with a judged presence mark ([`presence_step`]).
@@ -5675,6 +6007,12 @@ pub async fn heartbeat_loop(
     // peak and its late start, a change waiting its jitter, and P(e)'s payer
     // text. No line prints it or anything in it.
     let mut listing_clock = ListingClock::default();
+    // The pause for another copy of this station writing its listing (stage
+    // 4 design §10): counted by the listing's verdict and its writer below,
+    // on the burner path alone, and asked by the listing's, the knock's and
+    // the beacon's arms. Kept in its file with burner keys on; with them
+    // off nothing is ever counted, no file is read, and no arm is held.
+    let mut foreign_pause = if burners { ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE)) } else { ForeignPause::in_memory() };
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
     let mut refused_logged: HashSet<String> = HashSet::new();
@@ -5880,10 +6218,20 @@ pub async fn heartbeat_loop(
             if let Some(now) = era_now {
                 let judged = listing_judged_era(node_mark.as_ref(), now, &self_id, listing_root.is_some());
                 if let (Some(era), Some(m)) = (judged, node_mark.clone()) {
-                    match presence_step(&m, presence_standing(&peak_client, &m).await, era, peak) {
+                    // On the burner path a rewrite whose coin went to a
+                    // spend that was not ours was lost to another copy of
+                    // this station (§10, [`listing_word`]): counted on the
+                    // pause by that coin, in the era the chain is in now.
+                    let (word, lost_by) = listing_word(&WALLET_LEASE, &m, listing_root.is_some(), presence_standing(&peak_client, &m).await);
+                    if let Some(coin) = lost_by {
+                        foreign_pause.note(now, now_unix, coin);
+                    }
+                    match presence_step(&m, word, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
-                            let next = if era == now {
+                            let next = if lost_by.is_some() {
+                                "its next write waits for the pause to end".to_string()
+                            } else if era == now {
                                 write_again_words(net)
                             } else {
                                 "this edition's listing is due at once, as for a station not listed last edition".to_string()
@@ -6035,7 +6383,11 @@ pub async fn heartbeat_loop(
                 let retry_ok = node_attempt
                     .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
                     .unwrap_or(true);
-                let due = money_refused.is_none() && step == ListingStep::Write && retry_ok;
+                // The pause for another copy of this station (§10) holds a
+                // write that is due; the step is what it was, so the readout
+                // below still knows which listing stands.
+                let paused = paused_now(&mut foreign_pause, Some(era), now_unix);
+                let due = money_refused.is_none() && step == ListingStep::Write && retry_ok && paused.is_none();
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     let tried = Instant::now();
@@ -6076,16 +6428,25 @@ pub async fn heartbeat_loop(
                             if let Some(line) = say {
                                 eprintln!("{line}");
                             }
-                            node_last_error = Some(match &listing_root {
+                            node_last_error = match (&listing_root, foreign_spend(&e)) {
+                                // Another copy of this station spent a coin
+                                // of the listing's key (§10): counted on the
+                                // pause by that coin. The pause's words take
+                                // the readout from here, and no failure text
+                                // is kept to outlast them.
+                                (_, Some(coin)) => {
+                                    foreign_pause.note(era, now_unix, coin);
+                                    None
+                                }
                                 // §10's words. Last week's listing still works
                                 // only while the mark on record is last era's
                                 // listing of ours with the live addresses:
                                 // once this era's is written, the file no
                                 // longer says, and after a change of address
                                 // it sends readers to the old ones.
-                                Some(_) => listing_failure_words(&e, last_week_still_works(node_mark.as_ref(), era, &last_hint, &self_id, &sig)),
-                                None => format!("{e:#}"),
-                            });
+                                (Some(_), None) => Some(listing_failure_words(&e, last_week_still_works(node_mark.as_ref(), era, &last_hint, &self_id, &sig))),
+                                (None, None) => Some(format!("{e:#}")),
+                            };
                         }
                     }
                     spent_this_tick = true;
@@ -6115,8 +6476,12 @@ pub async fn heartbeat_loop(
             // The text and the held state come from the listing's readout
             // ([`listing_readout`]): with the SSF wallet paying, the chain as
             // it always was.
-            let (why_not, hold) =
-                listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live);
+            // While the pause for another copy of this station holds (§10),
+            // its words are the text ([`paused_readout`]).
+            let (why_not, hold) = paused_readout(
+                paused_now(&mut foreign_pause, era_now, now_unix),
+                listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),
+            );
             let status = presence_status_with(
                 node_mark.as_ref(),
                 hint_now.as_deref(),
@@ -6143,7 +6508,16 @@ pub async fn heartbeat_loop(
         // knock). Era-bound like presence: no write without a peak, inside
         // the era's guard blocks, or on a peak the presence lookups above let
         // age out.
-        if knock_waiting && money_refused.is_none() && peak > 0 && !era_guard(peak) && knock_paced(knock_wait, Instant::now()) && !peak_aged("knock") {
+        // The pause for another copy of this station (§10) holds the knocks
+        // too: a request stays queued and goes out once the pause is over.
+        if knock_waiting
+            && money_refused.is_none()
+            && peak > 0
+            && !era_guard(peak)
+            && knock_paced(knock_wait, Instant::now())
+            && paused_now(&mut foreign_pause, Some(chia_lane::era_of(peak)), now_unix).is_none()
+            && !peak_aged("knock")
+        {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -6329,6 +6703,7 @@ pub async fn heartbeat_loop(
                 reachable,
                 serves_welcome,
                 retry_ok,
+                paused: paused_now(&mut foreign_pause, Some(era), now_unix).is_some(),
                 root: listing_root.as_ref(),
                 mark: beacon_mark.as_ref(),
                 era,
@@ -8685,6 +9060,421 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A coin of 1 mojo at `payer`'s own address, the `n`th.
+    fn coin_at(payer: Payer, n: u8) -> Coin {
+        Coin::new(Bytes32::new([n; 32]), payer.0, 1)
+    }
+
+    /// A bundle that spends `coins`, as the lease reads one: unsigned, and
+    /// never pushed.
+    fn spending(coins: &[Coin]) -> SpendBundle {
+        let nil = || chia_protocol::Program::from(vec![0x80u8]);
+        SpendBundle::new(coins.iter().map(|coin| CoinSpend::new(*coin, nil(), nil())).collect(), Signature::default())
+    }
+
+    /// A folder of the test's own for a lease file, and the file's path.
+    fn lease_folder(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ssf-lease-{tag}-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet_lease.json");
+        (dir, path)
+    }
+
+    fn lease_file(path: &std::path::Path) -> LeaseFile {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Stage 4 design §10, "by the lease's records": every coin a parked
+    /// spend consumes at its payer's own address is recorded in the parking's
+    /// own write, for every payer but the money address's. A burner's first
+    /// write records the gift g and not the dish coin F, which sits at the
+    /// dish. The file stays version 1, and an older build reads it.
+    #[test]
+    fn the_lease_records_what_its_spends_consume_at_their_payers_own_address() {
+        let (dir, path) = lease_folder("own-spends");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let dish = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([0xd0; 32]), 10);
+        let (g, c, b, m) = (coin_at(burner(), 2), coin_at(burner(), 3), coin_at(beacon(), 4), coin_at(money(), 5));
+        // A first write: F at the dish, g at the burner. The lease parks F.
+        let first = lease.park_with_bundle([(dish.coin_id(), 900)], &spending(&[dish, g]), burner()).unwrap();
+        let file = lease_file(&path);
+        assert_eq!(file.v, 1, "the fields are additive: still version 1");
+        assert_eq!(file.own_spends, vec![OwnSpend { coin: hex::encode(g.coin_id()), once: true }], "g, in the same write as the parking");
+        assert_eq!((file.parked.len(), file.own_watching), (1, false), "no listing has looked yet");
+        assert!(lease.spent_once(&g.coin_id()));
+        assert!(!lease.spent_once(&dish.coin_id()), "the dish coin is anyone's to claim, and is not recorded");
+        // A rewrite, the beacon's write, and a spend of the SSF wallet's.
+        lease.release(&[first.spend]);
+        lease.park_with_bundle([(c.coin_id(), 901)], &spending(&[c]), burner()).unwrap();
+        lease.park_with_bundle([(b.coin_id(), 902)], &spending(&[b]), beacon()).unwrap();
+        lease.park_with_bundle([(m.coin_id(), 903)], &spending(&[m]), money()).unwrap();
+        let recorded: Vec<String> = lease_file(&path).own_spends.into_iter().map(|own| own.coin).collect();
+        assert_eq!(recorded, [g, c, b].map(|coin| hex::encode(coin.coin_id())), "oldest first; the money address's spend is left out");
+        assert!(lease.spent_once(&c.coin_id()) && lease.spent_once(&b.coin_id()) && !lease.spent_once(&m.coin_id()));
+        // A coin at another payer's address in a burner's bundle is not the
+        // burner's own.
+        let other = coin_at(beacon(), 6);
+        lease.park_with_bundle([(other.coin_id(), 904)], &spending(&[other]), burner()).unwrap();
+        assert!(!lease.spent_once(&other.coin_id()));
+        // An older build reads the file, skipping what it does not know.
+        let bytes = std::fs::read(&path).unwrap();
+        let old: before_payers::LeaseFile = serde_json::from_slice(&bytes).expect("an older build reads it");
+        assert_eq!(old.v, 1);
+        // A restart takes the records back, flags and order as they were.
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert_eq!(again.snapshot().own_spends, lease.snapshot().own_spends);
+        assert!(again.spent_once(&g.coin_id()) && again.spent_once(&c.coin_id()));
+        // A parking with no bundle (an older node's) records nothing.
+        let bare = WalletLease::new();
+        bare.park([Bytes32::new([9u8; 32])]).unwrap();
+        assert_eq!(bare.snapshot().own_spends, vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A coin two spends of ours parked is no longer one spend's alone: a
+    /// write built again from the coin of one the peers dropped. The first
+    /// may yet land, so "another spend of ours" stays possible for it
+    /// ([`WalletLease::spent_once`]).
+    #[test]
+    fn a_coin_a_second_spend_of_ours_parks_is_no_longer_one_spends_alone() {
+        let (dir, path) = lease_folder("own-twice");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let c = coin_at(burner(), 3);
+        let first = lease.park_with_bundle([(c.coin_id(), 900)], &spending(&[c]), burner()).unwrap();
+        assert!(lease.spent_once(&c.coin_id()));
+        lease.release(&[first.spend]); // the peers dropped it
+        assert!(lease.spent_once(&c.coin_id()), "a release forgets nothing of it");
+        lease.park_with_bundle([(c.coin_id(), 900)], &spending(&[c]), burner()).unwrap();
+        assert!(!lease.spent_once(&c.coin_id()), "two spends of ours on one coin");
+        assert_eq!(lease_file(&path).own_spends, vec![OwnSpend { coin: hex::encode(c.coin_id()), once: false }], "listed once, and saved so");
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert!(!again.spent_once(&c.coin_id()), "across a restart too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A parking that cannot be saved is taken back whole, its records of
+    /// our own spends with it: the spend never left.
+    #[test]
+    fn a_parking_that_cannot_be_saved_leaves_the_records_of_our_own_spends_as_they_were() {
+        let (dir, path) = lease_folder("own-unsaved");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let (known, new) = (coin_at(burner(), 3), coin_at(burner(), 4));
+        let first = lease.park_with_bundle([(known.coin_id(), 900)], &spending(&[known]), burner()).unwrap();
+        lease.release(&[first.spend]);
+        let before = lease.snapshot().own_spends;
+        assert_eq!(before, vec![OwnSpend { coin: hex::encode(known.coin_id()), once: true }]);
+        // The folder goes: no later write of the file can be made.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let unsaved = lease.park_with_bundle([(known.coin_id(), 900), (new.coin_id(), 901)], &spending(&[known, new]), burner());
+        assert!(matches!(unsaved, Err(LeaseError::Unsaved(_))), "{unsaved:?}");
+        assert_eq!(lease.snapshot().own_spends, before, "the coin it added is gone, and the one it shared is one spend's alone again");
+        assert!(lease.spent_once(&known.coin_id()) && !lease.spent_once(&new.coin_id()));
+        assert!(!lease.is_parked(&known.coin_id()) && !lease.is_parked(&new.coin_id()));
+    }
+
+    /// A spend every peer refused consumed nothing: a coin it alone was
+    /// recorded for leaves the records, so a spend of that coin by another
+    /// copy of this station, the likeliest reason for the refusal, is not
+    /// taken for ours. A coin an earlier spend of ours was recorded for
+    /// stays, since that spend may yet land.
+    #[test]
+    fn a_refused_spends_coin_leaves_the_records_unless_an_earlier_spend_of_ours_shares_it() {
+        let (dir, path) = lease_folder("own-refused");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        assert_eq!(lease.foreign_spends(&[]), vec![], "the first look: the watch starts");
+        let (c, d) = (coin_at(burner(), 3), coin_at(burner(), 4));
+        let refused = lease.park_with_bundle([(c.coin_id(), 900)], &spending(&[c]), burner()).unwrap();
+        assert!(lease.spent_once(&c.coin_id()));
+        lease.unpark(&refused);
+        assert!(!lease.spent_once(&c.coin_id()) && !lease.is_parked(&c.coin_id()));
+        assert_eq!(lease.snapshot().own_spends, vec![], "saved with the release");
+        assert_eq!(lease.foreign_spends(&[c.coin_id()]), vec![c.coin_id()], "spent after all: not by us");
+        // An earlier spend of ours on the coin, dropped: its record stays
+        // when a second spend of the coin is refused.
+        let dropped = lease.park_with_bundle([(d.coin_id(), 900)], &spending(&[d]), burner()).unwrap();
+        lease.release(&[dropped.spend]);
+        let refused = lease.park_with_bundle([(d.coin_id(), 900)], &spending(&[d]), burner()).unwrap();
+        lease.unpark(&refused);
+        assert_eq!(lease.foreign_spends(&[d.coin_id()]), vec![], "the first spend may have landed: ours, as far as the records go");
+        assert!(!lease.spent_once(&d.coin_id()));
+        // A stale rejection, its spend long released, takes nothing back.
+        let e = coin_at(burner(), 5);
+        let first = lease.park_with_bundle([(e.coin_id(), 900)], &spending(&[e]), burner()).unwrap();
+        lease.release(&[first.spend]);
+        lease.unpark(&first);
+        assert!(lease.spent_once(&e.coin_id()), "no bundle of that number is held any more");
+        // The SSF wallet's refused spend had no record to take back.
+        let m = coin_at(money(), 6);
+        let refused = lease.park_with_bundle([(m.coin_id(), 900)], &spending(&[m]), money()).unwrap();
+        lease.unpark(&refused);
+        assert!(!lease.is_parked(&m.coin_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §10: the listing's look at its key's spent coins. The
+    /// first look under a lease file adopts whatever it is shown and tells
+    /// of nothing; after it, a spent coin the records do not hold is told of
+    /// once, and the watch and what it adopted outlive a restart.
+    #[test]
+    fn the_first_look_adopts_and_each_later_look_tells_of_a_foreign_coin_once() {
+        let (dir, path) = lease_folder("own-look");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let id = |n: u8| Bytes32::new([n; 32]);
+        let ours = coin_at(burner(), 3);
+        lease.park_with_bundle([(ours.coin_id(), 900)], &spending(&[ours]), burner()).unwrap();
+        // Spends this station made before the records were kept (an older
+        // build, a lease file removed): adopted, not told of.
+        assert_eq!(lease.foreign_spends(&[id(1), id(2), ours.coin_id()]), vec![], "the first look tells of nothing");
+        let file = lease_file(&path);
+        assert!(file.own_watching, "and the watch is saved");
+        assert_eq!(file.own_spends.len(), 3);
+        assert!(!lease.spent_once(&id(1)), "an adopted coin is no spend of ours that the lease parked");
+        assert!(lease.spent_once(&ours.coin_id()), "one it parked is untouched by the look");
+        assert_eq!(lease.foreign_spends(&[id(1), id(2), ours.coin_id()]), vec![], "the same coins again: nothing");
+        // Another copy spends: told of once, in the order given.
+        assert_eq!(lease.foreign_spends(&[id(1), id(7), ours.coin_id(), id(8)]), vec![id(7), id(8)]);
+        assert_eq!(lease.foreign_spends(&[id(1), id(7), ours.coin_id(), id(8)]), vec![], "told of once");
+        assert_eq!(lease.foreign_spends(&[]), vec![]);
+        // Across a restart: still watching, and what was adopted is known.
+        let again = WalletLease::new();
+        again.restore(&path, money());
+        assert_eq!(again.foreign_spends(&[id(1), id(2), id(7), id(8), ours.coin_id()]), vec![]);
+        assert_eq!(again.foreign_spends(&[id(9)]), vec![id(9)], "no first look after a restart");
+        // A first look that is shown nothing still starts the watch.
+        let empty = WalletLease::new();
+        assert_eq!(empty.foreign_spends(&[]), vec![]);
+        assert_eq!(empty.foreign_spends(&[id(1)]), vec![id(1)]);
+        // A sealed lease writes nothing over its file.
+        let sealed_path = dir.join("sealed.json");
+        std::fs::write(&sealed_path, b"not a lease").unwrap();
+        let sealed = WalletLease::new();
+        sealed.restore(&sealed_path, money());
+        assert_eq!(sealed.foreign_spends(&[id(1)]), vec![]);
+        assert_eq!(std::fs::read(&sealed_path).unwrap(), b"not a lease");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lease file an older build wrote keeps no records. What its saved
+    /// bundles spend at their payers' own addresses, parked or settling, is
+    /// taken as recorded, never as one spend's alone; the watch has not
+    /// started, so the first look adopts the rest. Records with a malformed
+    /// coin id start afresh and seal nothing.
+    #[test]
+    fn a_restart_takes_what_the_saved_bundles_spend_as_ours_and_malformed_records_start_afresh() {
+        let (dir, path) = lease_folder("own-restart");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let (parked, settling, wallet) = (coin_at(burner(), 3), coin_at(beacon(), 4), coin_at(money(), 5));
+        lease.park_with_bundle([(parked.coin_id(), 900)], &spending(&[parked]), burner()).unwrap();
+        let landed = lease.park_with_bundle([(settling.coin_id(), 901)], &spending(&[settling]), beacon()).unwrap();
+        lease.park_with_bundle([(wallet.coin_id(), 902)], &spending(&[wallet]), money()).unwrap();
+        // The beacon's spend landed: settling, with its bundle.
+        let settled = Settling { coins: vec![ParkedInput { coin_id: settling.coin_id(), seen_at: Some(901) }], spent_at: 1000, bundle: spending(&[settling]), payer: Some(beacon()) };
+        lease.retire(&[landed.spend], vec![(landed.spend, settled)], &[], &[], &[], Instant::now());
+        // As an older build left it: no records, no watch.
+        let mut file = lease_file(&path);
+        assert_eq!((file.bundles.len(), file.settling.len(), file.own_spends.len()), (2, 1, 2));
+        file.own_spends.clear();
+        file.own_watching = false;
+        let old = dir.join("older.json");
+        std::fs::write(&old, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(!String::from_utf8(std::fs::read(&old).unwrap()).unwrap().contains("own_"), "an older build's file names neither field");
+        let upgraded = WalletLease::new();
+        upgraded.restore(&old, money());
+        upgraded.ensure_open().expect("an older build's file is read");
+        let recorded = upgraded.snapshot();
+        assert_eq!(
+            recorded.own_spends,
+            Vec::from([parked, settling].map(|coin| OwnSpend { coin: hex::encode(coin.coin_id()), once: false })),
+            "the parked bundle's coin and the settling one's, never as one spend's alone; the SSF wallet's is left out"
+        );
+        assert!(!recorded.own_watching && !upgraded.spent_once(&parked.coin_id()));
+        // A file that says it watches, with a bundle whose coin its records
+        // lack: the bundle's coin is ours all the same.
+        file.own_watching = true;
+        std::fs::write(&old, serde_json::to_vec(&file).unwrap()).unwrap();
+        let watching = WalletLease::new();
+        watching.restore(&old, money());
+        assert_eq!(watching.foreign_spends(&[parked.coin_id(), settling.coin_id()]), vec![], "known from the saved bundles");
+        assert_eq!(watching.foreign_spends(&[wallet.coin_id()]), vec![wallet.coin_id()], "the money address's coin is in no record");
+        // Malformed records: left out whole, the watch with them, and the
+        // lease is not sealed: its parking is taken as it stands.
+        file.own_spends = vec![OwnSpend { coin: hex::encode(parked.coin_id()), once: true }, OwnSpend { coin: "zz".into(), once: true }];
+        std::fs::write(&old, serde_json::to_vec(&file).unwrap()).unwrap();
+        let afresh = WalletLease::new();
+        afresh.restore(&old, money());
+        afresh.ensure_open().expect("malformed records seal nothing");
+        assert!(afresh.is_parked(&parked.coin_id()) && afresh.is_settling(&settling.coin_id()), "the parking is restored");
+        assert!(!afresh.snapshot().own_watching, "the watch starts again at the next look");
+        assert!(!afresh.spent_once(&parked.coin_id()), "known from its bundle alone");
+        assert_eq!(afresh.foreign_spends(&[Bytes32::new([7u8; 32])]), vec![], "a first look again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The records are bounded: past [`MAX_OWN_SPENDS`] the oldest coin is
+    /// forgotten, and a coin taken back leaves the others in their order.
+    #[test]
+    fn the_records_of_our_own_spends_forget_the_oldest_past_their_bound() {
+        let id = |n: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            Bytes32::new(bytes)
+        };
+        let mut own = OwnSpends::default();
+        for n in 0..MAX_OWN_SPENDS {
+            assert_eq!(own.note(id(n), true), None);
+        }
+        assert_eq!(own.coins.len(), MAX_OWN_SPENDS);
+        assert!(own.at(&id(0)).is_some());
+        assert_eq!(own.note(id(MAX_OWN_SPENDS), true), None);
+        assert_eq!(own.coins.len(), MAX_OWN_SPENDS, "bounded");
+        assert!(own.at(&id(0)).is_none() && own.at(&id(1)).is_some(), "the oldest is the one forgotten");
+        // A coin held already is not added again, and loses `once`.
+        assert_eq!(own.note(id(5), true), Some(true));
+        assert_eq!(own.note(id(5), true), Some(false));
+        assert_eq!(own.coins.len(), MAX_OWN_SPENDS);
+        // Taken back: what was there before is there again.
+        own.take_back(&id(5), Some(true));
+        assert_eq!(own.coins[own.at(&id(5)).unwrap()], (id(5), true));
+        own.take_back(&id(MAX_OWN_SPENDS), None);
+        assert!(own.at(&id(MAX_OWN_SPENDS)).is_none());
+        assert_eq!(own.coins.len(), MAX_OWN_SPENDS - 1);
+        own.take_back(&id(MAX_OWN_SPENDS), None); // gone already: nothing
+        assert_eq!(own.coins.front().map(|(coin, _)| *coin), Some(id(1)), "the others keep their order");
+    }
+
+    /// Stage 4 design §10, the verdict's side: a listing's rewrite dead
+    /// because its one coin went to another spend is told as lost to another
+    /// copy of this station only on the burner path, and only when the
+    /// lease's records hold exactly one spend of that coin, the write's own.
+    #[test]
+    fn a_listings_death_is_another_copys_only_by_the_leases_records_of_its_one_coin() {
+        use crate::chia_resolve::{WriteStanding, DEAD_DISH_CLAIMED, DEAD_DROPPED, DEAD_FOREIGN, DEAD_OTHER_SPEND};
+        use WriteStanding::{Confirmed, Dead, Pending};
+        let (dir, path) = lease_folder("listing-word");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let (once, twice, wallet, g) = (coin_at(burner(), 3), coin_at(burner(), 4), coin_at(money(), 5), coin_at(burner(), 6));
+        let dish = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([0xd0; 32]), 10);
+        let park = |coin: Coin, payer: Payer| {
+            let parking = lease.park_with_bundle([(coin.coin_id(), 900)], &spending(&[coin]), payer).unwrap();
+            lease.release(&[parking.spend]);
+        };
+        park(once, burner());
+        park(twice, burner());
+        park(twice, burner());
+        park(wallet, money());
+        let first = lease.park_with_bundle([(dish.coin_id(), 900)], &spending(&[dish, g]), burner()).unwrap();
+        lease.release(&[first.spend]);
+        let mark = |coin_id: Bytes32, parked: Option<Bytes32>| NodePublishMark {
+            coin_id: hex::encode(coin_id),
+            parked: parked.map(hex::encode).unwrap_or_default(),
+            ..Default::default()
+        };
+        let other_spend = || Some((Dead(DEAD_OTHER_SPEND), false));
+        let rewrite = mark(once.coin_id(), Some(once.coin_id()));
+        // The one case: a rewrite on the burner path whose coin one spend of
+        // ours ever consumed.
+        assert_eq!(listing_word(&lease, &rewrite, true, other_spend()), (Some((Dead(DEAD_FOREIGN), false)), Some(once.coin_id())));
+        assert_eq!(
+            listing_word(&lease, &mark(once.coin_id(), None), true, Some((Dead(DEAD_OTHER_SPEND), true))),
+            (Some((Dead(DEAD_FOREIGN), true)), Some(once.coin_id())),
+            "a mark that files its one coin once is the same write, and the lookup's other word is kept"
+        );
+        // With burner keys off the verdict is the one it always was.
+        assert_eq!(listing_word(&lease, &rewrite, false, other_spend()), (other_spend(), None));
+        // Every other word on that mark passes through, with no coin.
+        for word in [
+            None,
+            Some((Pending, false)),
+            Some((Pending, true)),
+            Some((Confirmed { height: 1000, seen_at: Some(1001) }, false)),
+            Some((Dead(DEAD_DROPPED), false)),
+            Some((Dead(DEAD_DISH_CLAIMED), false)),
+            Some((Dead(DEAD_FOREIGN), false)),
+        ] {
+            let through = (word.clone(), word.as_ref().and_then(|(standing, _)| standing.is_foreign().then_some(once.coin_id())));
+            assert_eq!(listing_word(&lease, &rewrite, true, word), through);
+        }
+        // Coins the records do not hold as one spend's alone: two spends of
+        // ours, the SSF wallet's, a coin never parked, and a first write's
+        // dish coin, judged by two coins.
+        for (what, m) in [
+            ("two spends of ours", mark(twice.coin_id(), Some(twice.coin_id()))),
+            ("the SSF wallet's coin", mark(wallet.coin_id(), None)),
+            ("a coin the lease never parked", mark(Bytes32::new([7u8; 32]), None)),
+            ("a first write: g and the dish coin", mark(g.coin_id(), Some(dish.coin_id()))),
+            ("two coins, the parked one recorded once", mark(g.coin_id(), Some(once.coin_id()))),
+            ("a mark that names no coin", NodePublishMark::default()),
+            ("a malformed coin", NodePublishMark { coin_id: "zz".into(), ..Default::default() }),
+        ] {
+            assert_eq!(listing_word(&lease, &m, true, other_spend()), (other_spend(), None), "{what}");
+        }
+        assert!(lease.spent_once(&g.coin_id()), "g is recorded once, but a first write is not judged by it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The readout under the pause for another copy (stage 4 design §10):
+    /// the pause's words take the text and the held state stays; with no
+    /// pause the readout is untouched.
+    #[test]
+    fn the_pause_for_another_copy_takes_the_readouts_text_and_keeps_its_hold() {
+        use foreign_pause::{PAUSED_NEXT_EDITION_WORDS, PAUSED_TWO_HOURS_WORDS};
+        let readouts = [
+            (None, ListingHold::Nothing),
+            (Some("push_tx rejected".to_string()), ListingHold::Nothing),
+            (Some(LISTING_SLOT_WORDS.to_string()), ListingHold::LastEra),
+            (Some("held".to_string()), ListingHold::Unlanded),
+        ];
+        for readout in readouts {
+            assert_eq!(paused_readout(None, readout.clone()), readout);
+            assert_eq!(paused_readout(Some(Paused::TwoHours { until: 9 }), readout.clone()), (Some(PAUSED_TWO_HOURS_WORDS.to_string()), readout.1));
+            assert_eq!(paused_readout(Some(Paused::UntilNextEra), readout.clone()), (Some(PAUSED_NEXT_EDITION_WORDS.to_string()), readout.1));
+        }
+        // What the arms ask each tick: nothing with no era agreed, and the
+        // pause that holds otherwise.
+        let mut pause = ForeignPause::in_memory();
+        assert_eq!(paused_now(&mut pause, Some(7), 1_000), None);
+        assert!(pause.note(7, 1_000, Bytes32::new([1u8; 32])));
+        assert_eq!(paused_now(&mut pause, None, 1_000), None, "no era agreed: nothing is asked");
+        assert_eq!(paused_now(&mut pause, Some(7), 1_000), Some(Paused::TwoHours { until: 1_000 + foreign_pause::FOREIGN_PAUSE_SECS }));
+        assert_eq!(paused_now(&mut pause, Some(7), 1_000 + foreign_pause::FOREIGN_PAUSE_SECS), None);
+    }
+
+    /// A listing's write stopped for a spend by another copy of this station
+    /// (stage 4 design §10) is told apart from every wait and failure: it is
+    /// no wait, its line names no retry and no coin, and the coin it stopped
+    /// for is found however deep the error is wrapped.
+    #[test]
+    fn a_write_stopped_for_another_copys_spend_is_no_wait_and_names_no_retry() {
+        let coin = Bytes32::new([0x5a; 32]);
+        let stopped = anyhow::Error::from(claim_write::ForeignSpend { coin });
+        let wrapped = anyhow::Error::from(claim_write::ForeignSpend { coin }).context("presence");
+        for e in [&stopped, &wrapped] {
+            assert_eq!(foreign_spend(e), Some(coin));
+            assert!(!is_typed_wait(e) && !chain_busy(e) && !spaced(e) && !dish_dry(e), "neither a wait nor a refusal");
+            let line = listing_failure_line(true, 7, e);
+            assert!(line.starts_with("⛓️ ChiaHub presence: the era 7 listing was not written: "), "{line}");
+            assert!(!line.contains("retry") && !line.contains(&hex::encode(coin)), "{line}");
+            assert!(!format!("{e:?}").contains(&hex::encode(coin)), "its Debug names no coin");
+            // With the SSF wallet paying, the line it always was (the writer
+            // never gives this there).
+            assert!(listing_failure_line(false, 7, e).starts_with("⛓️ ChiaHub presence: publish for era 7 failed: "));
+        }
+        for other in [anyhow!("push_tx rejected"), anyhow::Error::from(claim_write::BurnerWait::Held), anyhow::Error::from(claim_write::AlreadyKnocked)] {
+            assert_eq!(foreign_spend(&other), None, "{other:#}");
+        }
+        let held = anyhow::Error::from(claim_write::BurnerWait::Held);
+        assert!(listing_failure_line(true, 7, &held).contains("(retry in 5 min)"), "a wait keeps its retry");
+    }
+
     /// Stage 4 design §4.4 with #272 review round 10: the payer goes wherever
     /// the bundle goes — settling when the spend is included, back into the
     /// parking when its block goes, forgotten with the spend once it is
@@ -10127,7 +10917,7 @@ mod tests {
         // The spent height is the parked input's, and the names listing asks
         // for it alone.
         let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![input(dish, Some(1000))], Some(1001))]);
-        assert_eq!(standing(&WalletLease::new(), &chain, split, hint, None, 0).await, Some((Dead("its coin went to another spend of ours"), false)));
+        assert_eq!(standing(&WalletLease::new(), &chain, split, hint, None, 0).await, Some((Dead("its dish coin went to another claim"), false)));
         assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![parked]], "the names listing asks about the parked input");
         let chain = Scripted::new(vec![page_of(vec![], Some(1001)), page_of(vec![input(gift, Some(1000)), input(dish, None)], Some(1001))]);
         assert_eq!(
@@ -11057,7 +11847,7 @@ mod tests {
     /// The facts of a beacon try with everything main's rule asks for in
     /// place, on the burner path of `g`'s root, in era `era` at `peak`.
     fn beacon_facts(g: &Gates, era: u64, peak: u32) -> BeaconFacts<'_> {
-        BeaconFacts { money_refused: false, reachable: true, serves_welcome: true, retry_ok: true, root: Some(&g.root), mark: None, era, peak, node_id: GATE_NODE }
+        BeaconFacts { money_refused: false, reachable: true, serves_welcome: true, retry_ok: true, paused: false, root: Some(&g.root), mark: None, era, peak, node_id: GATE_NODE }
     }
 
     /// T5 (stage 4 design §4.3): on the burner path the beacon's slot opens
@@ -11223,6 +12013,8 @@ mod tests {
     /// main's rule asks for, the mark on record, the path and the slot. Off
     /// the burner path it is main's expression, written out here, whatever
     /// the peak. On it, the same expression and the era's beacon slot open.
+    /// The pause for another copy of this station (stage 4 design §10)
+    /// holds it whatever else is so.
     #[test]
     fn the_beacon_arm_is_due_as_on_main_off_the_burner_path_and_from_its_slot_on_it() {
         let g = Gates::new();
@@ -11231,22 +12023,33 @@ mod tests {
         let mark = |era: u64, node: &str| BeaconMark { era, node_id: Some(node.into()), ..Default::default() };
         let marks = [None, Some(mark(e, GATE_NODE)), Some(mark(e - 1, GATE_NODE)), Some(mark(e, "another-node"))];
         let (mut rows, mut dues) = (0, 0);
-        for bits in 0u8..16 {
-            let (money_refused, reachable, serves_welcome, retry_ok) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+        for bits in 0u8..32 {
+            let (money_refused, reachable, serves_welcome, retry_ok, paused) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0, bits & 16 != 0);
             for m in &marks {
                 for at_slot in [false, true] {
                     let peak = block(e, if at_slot { s } else { s - 1 });
                     let main = !money_refused && reachable && serves_welcome && retry_ok && beacon_due(m.as_ref(), e, GATE_NODE);
                     for burner_path in [false, true] {
-                        let f = BeaconFacts { money_refused, reachable, serves_welcome, retry_ok, root: burner_path.then_some(&g.root), mark: m.as_ref(), era: e, peak, node_id: GATE_NODE };
+                        let f = BeaconFacts {
+                            money_refused,
+                            reachable,
+                            serves_welcome,
+                            retry_ok,
+                            paused,
+                            root: burner_path.then_some(&g.root),
+                            mark: m.as_ref(),
+                            era: e,
+                            peak,
+                            node_id: GATE_NODE,
+                        };
                         // A run that saw the era at its first block: no late start.
                         let mut clock = BeaconClock::default();
                         clock.see_peak(e, block(e, 0), s, &mut seeded(1));
-                        let want = main && (!burner_path || at_slot);
+                        let want = main && !paused && (!burner_path || at_slot);
                         assert_eq!(
                             beacon_arm_due(&mut clock, &f, &mut seeded(2)),
                             want,
-                            "refused {money_refused}, reachable {reachable}, welcome {serves_welcome}, retry {retry_ok}, mark {m:?}, at the slot {at_slot}, burner path {burner_path}"
+                            "refused {money_refused}, reachable {reachable}, welcome {serves_welcome}, retry {retry_ok}, paused {paused}, mark {m:?}, at the slot {at_slot}, burner path {burner_path}"
                         );
                         rows += 1;
                         dues += u32::from(want);
@@ -11254,8 +12057,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rows, 16 * 4 * 2 * 2);
-        assert_eq!(dues, 3 + 3 + 3, "one combination is due: with three of the four marks, at either peak off the burner path and at the slot on it");
+        assert_eq!(rows, 32 * 4 * 2 * 2);
+        assert_eq!(dues, 3 + 3 + 3, "one combination is due, and never under the pause: with three of the four marks, at either peak off the burner path and at the slot on it");
     }
 
     /// Stage 4 design §4.5 (7): the beacon guard on both networks. The
@@ -11969,6 +12772,11 @@ mod tests {
 /// §4.2, §5.2, §13 row 9).
 mod claim_write;
 pub(crate) use claim_write::claim_write_selftest;
+
+/// The pause for another copy of this station writing its listing (stage 4
+/// design §10, "Burner spent elsewhere"): its clock, its file and its words.
+mod foreign_pause;
+use foreign_pause::{ForeignPause, Paused, FOREIGN_PAUSE_FILE};
 
 /// The writers and readers above, end to end through the real lane on the
 /// mock chain (stage 4 design §12).
