@@ -20,7 +20,7 @@ This is the text the game's help should carry. Today the game says part of it, i
 >
 > On Chia mainnet each week's listing, and each knock, is paid by a one-mojo key of its own that the lobby dish funds. It is never your SSF wallet. Nothing on the chain ties this week's key to last week's, to your knocks, or to your wallet. Anyone can still see that some Star Station node wrote a listing or a knock, when it was written, and that the lobby dish paid for it.
 >
-> On testnet11 today your SSF wallet's coin pays for each listing and each knock, so they all sit on one line of coins at your wallet's address.
+> On testnet11 today your SSF wallet pays for each listing and each knock, so they all sit at your wallet's address.
 >
 > A beacon writes your station's id in the clear every week. Nothing in the game lights one: only whoever starts the node can.
 >
@@ -43,7 +43,7 @@ Every spend carries fee 0 (`PUBLISH_FEE`, `MAX_FEE_MOJOS`). A listing and a knoc
 
 **A station writes nothing when:**
 - Chia is off on the computer (§8): no write, no read, no lookup.
-- No SSF wallet was loaded when the node started: every publishing key is made from the wallet's key. Reads go on. (Turning the wallet off in the Bank takes effect at the next start.)
+- No SSF wallet is loaded: every publishing key is made from the wallet's key. Reads go on. Turning the wallet on in the Bank loads it and starts the publisher in the same run, with no restart (`start_publisher`); turning it off takes effect at the next start.
 - A room does not use cards (it is public, it is the welcome room, or its SHARE CARD is off): no knock on a host there.
 - The build has no `chia-publish` feature.
 - LIST ME is off: no listing and no knock. Turning it off also drops knocks not yet written and stops the node from sending again a listing or knock it had already sent. It withdraws nothing from the chain, and it does not hold the beacon or a v1 room record.
@@ -109,7 +109,7 @@ This is the burner path: the only path off a test network, and on testnet11 the 
 - The publisher's key set (`PublisherKeys`) holds no wallet key off a test network. The process still holds the wallet key there for the Bank and the dish; that the publisher never reads it is pinned by a source-scan test, not by the types.
 
 **Coins** (`chia_publish/claim_write.rs`).
-- A key's first write is one bundle of two spends: a lobby dish coin F, claimed with no key, and the gift g, a 1-mojo coin the claim creates at the burner's address and the burner spends at once. The outputs are F's remainder back to the dish (when F held more than the gift), g, and a 1-mojo coin at the burner's address carrying the two memos (hint, body). One signature, the burner's, at fee 0. No coin of the wallet is in it.
+- A key's first write is one bundle of two spends: a lobby dish coin F, claimed with no key, and the gift g, a 1-mojo coin the claim creates at the burner's address and the burner spends at once. The outputs are F's remainder back to the dish (when F held more than the gift), g, and a 1-mojo coin at the burner's address carrying the two memos (hint, body). One signature, the burner's, at fee 0. No coin of the wallet is in it. If a 1-mojo coin the lease does not hold already sits at the key's address, the write spends that coin and claims nothing (`write_slot`): the gift of a claim that a peer pushed on its own, or a coin someone else paid there (§6, 5).
 - A rewrite spends the key's 1-mojo coin to a 1-mojo coin at the same address. A knock key writes once.
 - Before it signs, the builder refuses a bundle that breaks a rule (`broken_rules`): exactly one input at the burner's address (R1); no input that is neither the burner's nor a dish's, so never a wallet coin (R2); every output is at the burner's address, or a dish's remainder back to its own dish (R3); one dish coin at most (R4); the burner's spend makes one 1-mojo coin and nothing else, and nothing is left over as a fee (R5); no dish but this network's lobby (R6); the burner's input is a coin of exactly 1 mojo (R7).
 - A fuse stops funding after 16 gifts in an era (`MAX_GIFTS_PER_ERA`), so a fault cannot drain the dish through one station. The count is a local file, `gift_fuse.json`: a copy of the folder, or a folder that lost the file, starts its own 16.
@@ -170,7 +170,7 @@ What is still true with all of §5 working.
 
 | | testnet11 in a release build | testnet11 with `SSF_CHIA_BURNERS=1` | mainnet (development build only) |
 |---|---|---|---|
-| Who pays for a listing and a knock | The SSF wallet: its largest free coin, recreated whole at its own address at fee 0 (`publish_memo_on`, `build_publish_bundle`). Every listing, every knock, the money and whoever funded it are one line of coins. | Burner keys, funded by the lobby dish. If the wallet already wrote this era's listing, the burner writes nothing under that hint and the listing is not rewritten until the next era, so that one hint does not get two payers (`hint_rule_holds`). The rule reads the node's own mark, not the chain, so it holds only while `publish_marks.json` survives. | Burner keys only. `refuse_money_memo` refuses any memo spend from the wallet's key. |
+| Who pays for a listing and a knock | The SSF wallet: its largest free coin, recreated whole at its own address at fee 0 (`publish_memo_on`, `build_publish_bundle`). Every listing, every knock and the money sit at one address. They are one line of coins for as long as the same coin stays the wallet's largest free one; a larger deposit becomes the parent of the next write (`find_spendable_coin_on`). Either way, whoever paid the wallet is tied to its writes. | Burner keys, funded by the lobby dish. If the wallet already wrote this era's listing, the burner writes nothing under that hint and the listing is not rewritten until the next era, so that one hint does not get two payers (`hint_rule_holds`). The rule reads the node's own mark, not the chain, so it holds only while `publish_marks.json` survives. | Burner keys only. `refuse_money_memo` refuses any memo spend from the wallet's key. |
 | Timing T1 to T5 | None: the wallet writes at the first tick of an era, and a beacon lands just after the listing. | On. | On. |
 | LIST ME starts | On. | On. | Off, until the player taps LIST ME and then CONFIRM. |
 | v1 room records | Written for a room whose Chia mesh switch is on, paid by the wallet. | The same, still paid by the wallet and not spaced from the burner's writes. Both follow the same address change, the wallet's at once and the burner's 10 minutes or more later, which pairs the listing key with the wallet's address by time. | Never written (`publishable_rooms`); the switch is hidden. They are still read. |
@@ -196,7 +196,7 @@ So on testnet11 today nothing in §5 is in effect unless the operator sets the f
 | `SSF_CHIA_BURNERS=1` | Environment, test network only | Unset: the wallet pays | Setting it moves listing, knocks and beacon to the burner path. Off a test network that path is the only one. | v1 room records, which the wallet still pays for. |
 | `SSF_CHIA_WATCH=0` | Environment | Unset: the watcher runs | The watcher's reads on every beat and, with it, knocks. | The reads a failed dial makes, and the listing. |
 | `SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY` | Environment | Unset: public full nodes | With both set, every request goes to the operator's own full node and no other. Pin-only takes `1`, `true`, `on` or `yes`. | With no pin set, pin-only is ignored without a line saying so. |
-| **The SSF wallet** | The Bank's switch (`chia_wallet.json`, per network); `SSF_CHIA_LANE` holds it on (`1`) or off (any other value that is not empty) | Off until the player makes a wallet | With no wallet on, every write. Turning it off in the Bank takes effect at the node's next start; until then the wallet stays loaded and the node goes on writing. | Reads. |
+| **The SSF wallet** | The Bank's switch (`chia_wallet.json`, per network); `SSF_CHIA_LANE` holds it on (`1`) or off (any other value that is not empty) | Off until the player makes a wallet | With no wallet on, every write. Turning it on in the Bank loads the wallet and starts the publisher at once, in the same run. Turning it off takes effect at the node's next start; until then the wallet stays loaded and the node goes on writing. | Reads. |
 | `SSF_CHIA_AUDIT=1` | Environment | Unset | Nothing; setting it prints the address and puzzle hash of the station's burner keys in the node's own log, for the review in §10. Never key bytes. | |
 | Build features | `cargo build` | Release builds: `chia-publish`, no `chia-mainnet` | Without default features there is no lane; without `chia-publish`, no write; without `chia-mainnet`, the node stops at `SSF_CHIA_NETWORK=mainnet`. | |
 
@@ -252,8 +252,8 @@ A one-off developer review of what the chain actually shows. The game never depe
 | # | Look up | Pass when |
 |---|---|---|
 | 1 | The money address, from the moment burners are on | No coin there carries a memo. No coin goes to or comes from a burner or the dish. On testnet11 this holds only with Chia mesh off in every drill room, since the wallet still pays for v1 records there. |
-| 2 | Each burner's first coin | Its parent is the gift g, and g's parent is a lobby dish coin. |
-| 3 | Every burner spend | One burner input (and the dish coin, for a first write) to one 1-mojo coin at the same address, fee 0, memos of 32 bytes and 360, 392 or 320 bytes. No other output but the dish's remainder. |
+| 2 | Each burner's first coin | Its parent is the gift g, and g's parent is a lobby dish coin. One case is allowed otherwise: a first write from a 1-mojo coin someone else paid to the address (§6, 5). That coin's ancestry is then written down, and it leads neither to the money address nor to another of the station's keys. |
+| 3 | Every burner spend | One burner input to one 1-mojo coin at the same address, fee 0, memos of 32 bytes and 360, 392 or 320 bytes. A key's first write also spends a dish coin in the same bundle, unless its 1-mojo coin was already at the address (a claim a peer pushed on its own, or a coin someone else paid there). No other output but the dish's remainder. |
 | 4 | P(e) against P(e+1), and each knock key against P(e) | No shared address and no shared parent. No burner coin is the parent of another key's coin. The amount is not counted: every burner coin is 1 mojo by rule (R5, R7), the same for every key of every station. |
 | 5 | Hints | Each era's listing hint differs. On mainnet: no v1 hint for the drill rooms, nothing under a test hook's hint, and the mainnet hint for one contact key and era differs from testnet11's. |
 | 6 | Memo bodies | The node id and the drill IPs, as text and as bytes, appear in no listing or knock body. Only the beacon carries the node id, by design. |
