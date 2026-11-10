@@ -889,6 +889,9 @@ pub(crate) async fn burner_write_with<R: rand::Rng + ?Sized + Send>(
 ///
 /// The first look under a lease file tells of nothing and only starts the
 /// watch, since the records may be short of this station's earlier spends.
+/// So does the first look after the two hours of a pause for another copy,
+/// when the heartbeat starts the watch afresh (`WalletLease::watch_afresh`):
+/// what that copy spent while the pause ran is what the pause was for.
 /// A listing cut short is not compared at all: a rewrite from a coin it does
 /// list goes on, and a first write waits as it always did
 /// ([`BurnerWait::ListingCutShort`]).

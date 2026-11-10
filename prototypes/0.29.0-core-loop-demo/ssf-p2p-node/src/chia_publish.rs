@@ -208,10 +208,17 @@ pub struct WalletLease {
 }
 
 /// Coins the lease remembers its own spends consumed at most
-/// ([`WalletLease`]'s `own`); past it the oldest is forgotten. A node's
-/// listing is written at most [`MAX_NODE_WRITES_PER_ERA`] times an era, and
-/// only the current era's key is ever compared with the records, so the
-/// ones forgotten are of eras long past.
+/// ([`WalletLease`]'s `own`); past it the oldest is forgotten. The records
+/// take every burner's coins, not the listing's alone: in an era, at most
+/// [`MAX_NODE_WRITES_PER_ERA`] listing writes, one coin for each gift the
+/// fuse allows (`claim_write::MAX_GIFTS_PER_ERA`: every knock, and each
+/// first write built again after a lost race), a beacon, and the coins
+/// adopted at a look ([`WalletLease::foreign_spends`]), which only another
+/// copy's spends add to. They are asked about the listing key of the era
+/// being written and about the listing mark still judged, this era's or
+/// the last one's, so what a station's own writes push out is of eras
+/// before those. Were a coin of this era's pushed out all the same, the
+/// next look would tell of it as another copy's.
 pub const MAX_OWN_SPENDS: usize = 256;
 
 /// The lease's records of its own spends (stage 4 design §10, "the new
@@ -229,13 +236,15 @@ pub const MAX_OWN_SPENDS: usize = 256;
 /// wrote holds none of it; what its saved bundles spent is taken as recorded
 /// ([`WalletLease::load`]) and the rest is adopted at the first look
 /// ([`WalletLease::foreign_spends`]). Bounded ([`MAX_OWN_SPENDS`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct OwnSpends {
     /// Whether a listing's write has compared its key's spent coins with
     /// these records yet. Until one has, the records may be short of what
     /// this station spent before they were kept (an older build's spends, a
     /// lease file removed), so the first look adopts every spent coin it
-    /// finds and tells of none.
+    /// finds and tells of none. Set back when the two hours of a pause for
+    /// another copy of this station end ([`WalletLease::watch_afresh`]), so
+    /// that what that copy spent during them is adopted too.
     watching: bool,
     /// The coins, oldest first, each with whether it is known to have been
     /// spent by exactly one spend of ours: `false` for a coin a second spend
@@ -247,34 +256,53 @@ struct OwnSpends {
     coins: VecDeque<(Bytes32, bool)>,
 }
 
+/// What [`OwnSpends::note`] changed, for [`OwnSpends::take_back`].
+enum Noted {
+    /// The coin was held, with this flag.
+    Held(bool),
+    /// The coin was new, and pushed out this one, the oldest, if the records
+    /// were full.
+    New(Option<(Bytes32, bool)>),
+}
+
+/// The count and the watch, and no coin: a coin id of a burner's goes in no
+/// line, a debug one included.
+impl std::fmt::Debug for OwnSpends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnSpends").field("watching", &self.watching).field("coins", &self.coins.len()).finish()
+    }
+}
+
 impl OwnSpends {
     fn at(&self, coin: &Bytes32) -> Option<usize> {
         self.coins.iter().position(|(known, _)| known == coin)
     }
 
     /// Record `coin`, `once` as [`OwnSpends`]'s `coins` tells it, and return
-    /// what the records held of it before (`None`: nothing). A coin already
-    /// held is no longer one spend's alone, whatever `once` says.
-    fn note(&mut self, coin: Bytes32, once: bool) -> Option<bool> {
+    /// what that changed. A coin already held is no longer one spend's
+    /// alone, whatever `once` says.
+    fn note(&mut self, coin: Bytes32, once: bool) -> Noted {
         if let Some(at) = self.at(&coin) {
-            return Some(std::mem::replace(&mut self.coins[at].1, false));
+            return Noted::Held(std::mem::replace(&mut self.coins[at].1, false));
         }
-        if self.coins.len() >= MAX_OWN_SPENDS {
-            self.coins.pop_front();
-        }
+        let pushed_out = if self.coins.len() >= MAX_OWN_SPENDS { self.coins.pop_front() } else { None };
         self.coins.push_back((coin, once));
-        None
+        Noted::New(pushed_out)
     }
 
     /// Take back what [`OwnSpends::note`] did to `coin`, given what it
     /// returned: the parking it belonged to was not saved, so its spend never
-    /// left.
-    fn take_back(&mut self, coin: &Bytes32, before: Option<bool>) {
+    /// left. Several are taken back newest first, which leaves the records
+    /// as they were, the oldest ones a full record pushed out included.
+    fn take_back(&mut self, coin: &Bytes32, noted: Noted) {
         let Some(at) = self.at(coin) else { return };
-        match before {
-            Some(once) => self.coins[at].1 = once,
-            None => {
+        match noted {
+            Noted::Held(once) => self.coins[at].1 = once,
+            Noted::New(pushed_out) => {
                 self.coins.remove(at);
+                if let Some(oldest) = pushed_out {
+                    self.coins.push_front(oldest);
+                }
             }
         }
     }
@@ -774,7 +802,7 @@ impl WalletLease {
         // What the spend consumes at its payer's own address goes into the
         // lease's records of its own spends (stage 4 design §10), in the same
         // save as the parking: a spend that leaves is never missing there.
-        let mut noted: Vec<(Bytes32, Option<bool>)> = Vec::new();
+        let mut noted: Vec<(Bytes32, Noted)> = Vec::new();
         if let Some((bundle, payer)) = pushed {
             self.bundles.lock().unwrap().insert(spend, Pushed { bundle: bundle.clone(), payer: Some(payer) });
             let money = *self.money.lock().unwrap();
@@ -792,8 +820,8 @@ impl WalletLease {
             self.pending.lock().unwrap().retain(|_, parked| parked.spend != spend);
             self.bundles.lock().unwrap().remove(&spend);
             let mut own = self.own.lock().unwrap();
-            for (coin, before) in noted.iter().rev() {
-                own.take_back(coin, *before);
+            for (coin, change) in noted.into_iter().rev() {
+                own.take_back(&coin, change);
             }
             return Err(LeaseError::Unsaved(e));
         }
@@ -1622,6 +1650,17 @@ impl WalletLease {
     /// logged, and the adoption holds in memory; the file then reads as
     /// before, and a restart tells of the same coins once more, which the
     /// pause counts once by the coin it was told of.
+    ///
+    /// The records are all this goes by, so a spend of this station's own
+    /// that they do not hold reads as another copy's, once: after a lease
+    /// file put back from an earlier copy of itself (a restored backup, or a
+    /// save a power cut lost), after a spend that was in a mempool when the
+    /// lease file was lost or that an older build's lease let go as dropped
+    /// and that landed after all, and after a push every peer refused
+    /// ([`WalletLease::unpark`] takes its record back) that a peer relayed
+    /// all the same. Each costs one pause, and no money. A station stopped
+    /// between this adoption's save and the pause's own loses the telling:
+    /// the coins are adopted, and nothing pauses for them.
     pub fn foreign_spends(&self, spent: &[Bytes32]) -> Vec<Bytes32> {
         let (first_look, unknown) = {
             let mut own = self.own.lock().unwrap();
@@ -1655,6 +1694,19 @@ impl WalletLease {
     pub fn spent_once(&self, coin: &Bytes32) -> bool {
         let own = self.own.lock().unwrap();
         own.at(coin).is_some_and(|at| own.coins[at].1)
+    }
+
+    /// Start the watch on a listing key's spent coins afresh, and save: the
+    /// next look ([`WalletLease::foreign_spends`]) is a first look again,
+    /// which adopts every spent coin it is shown and tells of none. What
+    /// the records hold stays. The heartbeat asks this once when the two
+    /// hours of a pause for another copy of this station end
+    /// ([`renew_watch`], stage 4 design §10): what that copy spent before
+    /// then was what the pause was for, and only a spend it makes after the
+    /// listing's next write counts as a second time.
+    pub fn watch_afresh(&self) {
+        self.own.lock().unwrap().watching = false;
+        self.persist_or_log("a fresh watch on a listing key's spent coins");
     }
 
     /// Settle the parked spends against the chain and the mempool: ask the
@@ -5070,6 +5122,116 @@ fn paused_readout(paused: Option<Paused>, readout: (Option<String>, ListingHold)
     }
 }
 
+/// The context of [`pause_keys`].
+const CTX_PAUSE_KEYS: &str = "ssf-chia-foreign-pause-keys-v1";
+
+/// The text a pause for another copy of this station is bound to
+/// ([`ForeignPause::load`], stage 4 design §10): the same for the same
+/// wallet words, contact key and network, and for no others, since those
+/// are what the listing's keys come from (§3.2). It is a digest of the
+/// address of era 0's listing key, P(0), which no listing was ever written
+/// from: it gives no address a coin of ours sits at, and it is kept in the
+/// pause's file alone and printed nowhere.
+fn pause_keys(root: &crate::chia_burner::BurnerRoot, ck: &[u8; 32]) -> String {
+    hex::encode(blake3::derive_key(CTX_PAUSE_KEYS, &root.presence(ck, 0).puzzle_hash().to_vec()))
+}
+
+/// Start the lease's watch on the listing key's spent coins afresh once the
+/// two hours of a pause for another copy of this station have ended (stage
+/// 4 design §10; [`ForeignPause::watch_due`]). The heartbeat asks every
+/// tick, before the listing's arm, so the first write after the pause looks
+/// with a fresh watch: it adopts what the other copy spent while the pause
+/// ran, which is what the pause was for, and stops for none of it. The
+/// lease first, then the pause's own record of it: a stop between the two
+/// does it once more at the next start, and never leaves it undone. `true`
+/// when it was done now.
+fn renew_watch(lease: &WalletLease, pause: &mut ForeignPause, now: u64) -> bool {
+    if !pause.watch_due(now) {
+        return false;
+    }
+    lease.watch_afresh();
+    pause.watch_renewed();
+    true
+}
+
+/// Whether the listing's write goes out this tick, the peak's age aside:
+/// this network takes writes (`refused` false), the listing's step says
+/// write, the retry cadence of the last try has run (`retry_ok`), and no
+/// pause for another copy of this station holds (`paused`, stage 4 design
+/// §10). The pause holds a write that is due and changes nothing else: the
+/// step is what it was, so the readout still knows which listing stands.
+fn listing_due(refused: bool, step: ListingStep, retry_ok: bool, paused: Option<Paused>) -> bool {
+    !refused && step == ListingStep::Write && retry_ok && paused.is_none()
+}
+
+/// Whether the knock arm takes this tick, the peak's age aside: a request
+/// waits, this network takes writes (`refused` false), a peak is agreed and
+/// is not in the era's guard blocks, T4's wait of the last try has run
+/// (`paced`, [`knock_paced`]), and no pause for another copy of this
+/// station holds (`paused`, stage 4 design §10). Under the pause a request
+/// stays queued and goes out once the pause is over.
+fn knock_arm_open(waiting: bool, refused: bool, peak: u32, paced: bool, paused: Option<Paused>) -> bool {
+    waiting && !refused && peak > 0 && !era_guard(peak) && paced && paused.is_none()
+}
+
+/// The listing's standing as the lease's records tell it ([`listing_word`]),
+/// with a write lost to another copy of this station counted on the pause
+/// by the coin it was lost by ([`ForeignPause::note`], stage 4 design §10):
+/// in `era`, the era the chain is in now, at the unix time `now`. Returns
+/// the word, and whether the write was lost to another copy.
+fn listing_verdict(
+    lease: &WalletLease,
+    pause: &mut ForeignPause,
+    mark: &NodePublishMark,
+    burner_path: bool,
+    word: Option<(crate::chia_resolve::WriteStanding, bool)>,
+    era: u64,
+    now: u64,
+) -> (Option<(crate::chia_resolve::WriteStanding, bool)>, bool) {
+    let (word, lost_by) = listing_word(lease, mark, burner_path, word);
+    if let Some(coin) = lost_by {
+        pause.note(era, now, coin);
+    }
+    (word, lost_by.is_some())
+}
+
+/// What the log says comes next for a listing found void. One lost to
+/// another copy of this station (`lost`) waits for the pause to end while a
+/// pause holds (`paused`, stage 4 design §10); with none holding (the coin
+/// was counted before, and its pause is over) it is written again like any
+/// other. Otherwise this era's listing is written again
+/// ([`write_again_words`]), and last era's leaves this era's due at once.
+fn after_void_words(lost: bool, paused: Option<Paused>, this_era: bool, net: crate::chia_network::ChiaNet) -> String {
+    if lost && paused.is_some() {
+        "its next write waits for the pause to end".to_string()
+    } else if this_era {
+        write_again_words(net)
+    } else {
+        "this edition's listing is due at once, as for a station not listed last edition".to_string()
+    }
+}
+
+/// What the Phone Book keeps of a listing's write that failed with `e`, the
+/// readout's text until a write goes through. A write stopped because
+/// another copy of this station spent a coin of the listing's key
+/// ([`foreign_spend`], stage 4 design §10) is counted on the pause by that
+/// coin, in era `era` at the unix time `now`, and keeps no text: the
+/// pause's words take the readout from here, and no failure text is kept to
+/// outlast them. Any other failure keeps §10's words on the burner path
+/// ([`listing_failure_words`], with `last_week` as
+/// [`last_week_still_works`] gives it), and its own text with the SSF
+/// wallet paying, as it always did.
+fn listing_not_written(pause: &mut ForeignPause, e: &anyhow::Error, burner_path: bool, last_week: bool, era: u64, now: u64) -> Option<String> {
+    match (burner_path, foreign_spend(e)) {
+        (_, Some(coin)) => {
+            pause.note(era, now, coin);
+            None
+        }
+        (true, None) => Some(listing_failure_words(e, last_week)),
+        (false, None) => Some(format!("{e:#}")),
+    }
+}
+
 /// 📖 What the heartbeat does with a judged presence mark ([`presence_step`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresenceStep {
@@ -6010,9 +6172,14 @@ pub async fn heartbeat_loop(
     // The pause for another copy of this station writing its listing (stage
     // 4 design §10): counted by the listing's verdict and its writer below,
     // on the burner path alone, and asked by the listing's, the knock's and
-    // the beacon's arms. Kept in its file with burner keys on; with them
-    // off nothing is ever counted, no file is read, and no arm is held.
-    let mut foreign_pause = if burners { ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE)) } else { ForeignPause::in_memory() };
+    // the beacon's arms. Kept in its file with burner keys on, for the
+    // listing keys of these words and this contact key alone
+    // ([`pause_keys`]); with them off nothing is ever counted, no file is
+    // read, and no arm is held.
+    let mut foreign_pause = match &listing_root {
+        Some(root) => ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE), &pause_keys(root, &hub.contact_key)),
+        None => ForeignPause::in_memory(),
+    };
     let mut marks: HashMap<String, PublishMark> = HashMap::new();
     // N8: public-space rooms that are armed, already told about once.
     let mut refused_logged: HashSet<String> = HashSet::new();
@@ -6139,6 +6306,13 @@ pub async fn heartbeat_loop(
         // agreed peak, no write. Read only when something era-bound may be
         // written this tick.
         let now_unix = crate::chia_resolve::unix_now();
+        // Once the two hours of a pause for another copy of this station
+        // have ended (§10), the lease's watch starts afresh, before the
+        // listing's arm below writes again ([`renew_watch`]). Nothing is
+        // due with burner keys off, where nothing is ever counted.
+        if renew_watch(&WALLET_LEASE, &mut foreign_pause, now_unix) {
+            println!("⛓️ ChiaHub: the listing key's spent coins are watched afresh after the pause; what the other copy wrote during it is not counted a second time");
+        }
         let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
         let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
         if peak == 0 && (findable || knock_waiting || beacon_on) {
@@ -6220,22 +6394,15 @@ pub async fn heartbeat_loop(
                 if let (Some(era), Some(m)) = (judged, node_mark.clone()) {
                     // On the burner path a rewrite whose coin went to a
                     // spend that was not ours was lost to another copy of
-                    // this station (§10, [`listing_word`]): counted on the
-                    // pause by that coin, in the era the chain is in now.
-                    let (word, lost_by) = listing_word(&WALLET_LEASE, &m, listing_root.is_some(), presence_standing(&peak_client, &m).await);
-                    if let Some(coin) = lost_by {
-                        foreign_pause.note(now, now_unix, coin);
-                    }
+                    // this station (§10, [`listing_verdict`]): counted on
+                    // the pause by that coin, in the era the chain is in
+                    // now.
+                    let (word, lost) =
+                        listing_verdict(&WALLET_LEASE, &mut foreign_pause, &m, listing_root.is_some(), presence_standing(&peak_client, &m).await, now, now_unix);
                     match presence_step(&m, word, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
-                            let next = if lost_by.is_some() {
-                                "its next write waits for the pause to end".to_string()
-                            } else if era == now {
-                                write_again_words(net)
-                            } else {
-                                "this edition's listing is due at once, as for a station not listed last edition".to_string()
-                            };
+                            let next = after_void_words(lost, paused_now(&mut foreign_pause, Some(now), now_unix), era == now, net);
                             println!("⛓️ ChiaHub presence: the era {era} listing {why}; {next}");
                             let void = m.voided();
                             if let Err(e) = void.save(mark_path) {
@@ -6386,8 +6553,7 @@ pub async fn heartbeat_loop(
                 // The pause for another copy of this station (§10) holds a
                 // write that is due; the step is what it was, so the readout
                 // below still knows which listing stands.
-                let paused = paused_now(&mut foreign_pause, Some(era), now_unix);
-                let due = money_refused.is_none() && step == ListingStep::Write && retry_ok && paused.is_none();
+                let due = listing_due(money_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     let tried = Instant::now();
@@ -6428,25 +6594,23 @@ pub async fn heartbeat_loop(
                             if let Some(line) = say {
                                 eprintln!("{line}");
                             }
-                            node_last_error = match (&listing_root, foreign_spend(&e)) {
-                                // Another copy of this station spent a coin
-                                // of the listing's key (§10): counted on the
-                                // pause by that coin. The pause's words take
-                                // the readout from here, and no failure text
-                                // is kept to outlast them.
-                                (_, Some(coin)) => {
-                                    foreign_pause.note(era, now_unix, coin);
-                                    None
-                                }
-                                // §10's words. Last week's listing still works
-                                // only while the mark on record is last era's
-                                // listing of ours with the live addresses:
-                                // once this era's is written, the file no
-                                // longer says, and after a change of address
-                                // it sends readers to the old ones.
-                                (Some(_), None) => Some(listing_failure_words(&e, last_week_still_works(node_mark.as_ref(), era, &last_hint, &self_id, &sig))),
-                                (None, None) => Some(format!("{e:#}")),
-                            };
+                            // A write stopped for another copy of this
+                            // station's spend (§10) is counted on the pause
+                            // and keeps no text ([`listing_not_written`]).
+                            // Otherwise §10's words. Last week's listing
+                            // still works only while the mark on record is
+                            // last era's listing of ours with the live
+                            // addresses: once this era's is written, the
+                            // file no longer says, and after a change of
+                            // address it sends readers to the old ones.
+                            node_last_error = listing_not_written(
+                                &mut foreign_pause,
+                                &e,
+                                listing_root.is_some(),
+                                last_week_still_works(node_mark.as_ref(), era, &last_hint, &self_id, &sig),
+                                era,
+                                now_unix,
+                            );
                         }
                     }
                     spent_this_tick = true;
@@ -6510,14 +6674,8 @@ pub async fn heartbeat_loop(
         // age out.
         // The pause for another copy of this station (§10) holds the knocks
         // too: a request stays queued and goes out once the pause is over.
-        if knock_waiting
-            && money_refused.is_none()
-            && peak > 0
-            && !era_guard(peak)
-            && knock_paced(knock_wait, Instant::now())
-            && paused_now(&mut foreign_pause, Some(chia_lane::era_of(peak)), now_unix).is_none()
-            && !peak_aged("knock")
-        {
+        let knock_paused = paused_now(&mut foreign_pause, (peak > 0).then(|| chia_lane::era_of(peak)), now_unix);
+        if knock_arm_open(knock_waiting, money_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged("knock") {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -9191,9 +9349,10 @@ mod tests {
         let (c, d) = (coin_at(burner(), 3), coin_at(burner(), 4));
         let refused = lease.park_with_bundle([(c.coin_id(), 900)], &spending(&[c]), burner()).unwrap();
         assert!(lease.spent_once(&c.coin_id()));
+        assert_eq!(lease_file(&path).own_spends, vec![OwnSpend { coin: hex::encode(c.coin_id()), once: true }], "saved with the parking");
         lease.unpark(&refused);
         assert!(!lease.spent_once(&c.coin_id()) && !lease.is_parked(&c.coin_id()));
-        assert_eq!(lease.snapshot().own_spends, vec![], "saved with the release");
+        assert_eq!(lease_file(&path).own_spends, vec![], "and gone from the file with the release");
         assert_eq!(lease.foreign_spends(&[c.coin_id()]), vec![c.coin_id()], "spent after all: not by us");
         // An earlier spend of ours on the coin, dropped: its record stays
         // when a second spend of the coin is refused.
@@ -9329,25 +9488,34 @@ mod tests {
         };
         let mut own = OwnSpends::default();
         for n in 0..MAX_OWN_SPENDS {
-            assert_eq!(own.note(id(n), true), None);
+            assert!(matches!(own.note(id(n), true), Noted::New(None)));
         }
         assert_eq!(own.coins.len(), MAX_OWN_SPENDS);
         assert!(own.at(&id(0)).is_some());
-        assert_eq!(own.note(id(MAX_OWN_SPENDS), true), None);
+        let full = own.clone();
+        let over = own.note(id(MAX_OWN_SPENDS), true);
+        assert!(matches!(over, Noted::New(Some(oldest)) if oldest == (id(0), true)), "the oldest is the one pushed out");
         assert_eq!(own.coins.len(), MAX_OWN_SPENDS, "bounded");
-        assert!(own.at(&id(0)).is_none() && own.at(&id(1)).is_some(), "the oldest is the one forgotten");
+        assert!(own.at(&id(0)).is_none() && own.at(&id(1)).is_some());
         // A coin held already is not added again, and loses `once`.
-        assert_eq!(own.note(id(5), true), Some(true));
-        assert_eq!(own.note(id(5), true), Some(false));
+        assert!(matches!(own.note(id(5), true), Noted::Held(true)));
+        let again = own.note(id(5), true);
+        assert!(matches!(again, Noted::Held(false)));
         assert_eq!(own.coins.len(), MAX_OWN_SPENDS);
-        // Taken back: what was there before is there again.
-        own.take_back(&id(5), Some(true));
+        // Taken back, newest first: what was there before is there again,
+        // the coin a full record pushed out included, in its place.
+        own.take_back(&id(5), again);
+        own.take_back(&id(5), Noted::Held(true));
         assert_eq!(own.coins[own.at(&id(5)).unwrap()], (id(5), true));
-        own.take_back(&id(MAX_OWN_SPENDS), None);
-        assert!(own.at(&id(MAX_OWN_SPENDS)).is_none());
-        assert_eq!(own.coins.len(), MAX_OWN_SPENDS - 1);
-        own.take_back(&id(MAX_OWN_SPENDS), None); // gone already: nothing
-        assert_eq!(own.coins.front().map(|(coin, _)| *coin), Some(id(1)), "the others keep their order");
+        own.take_back(&id(MAX_OWN_SPENDS), over);
+        assert!(own == full, "as it was before the coin past the bound");
+        own.take_back(&id(MAX_OWN_SPENDS), Noted::New(None)); // gone already: nothing
+        assert!(own == full);
+        // Its Debug gives the count and names no coin.
+        let debug = format!("{own:?}");
+        assert!(debug.contains(&MAX_OWN_SPENDS.to_string()) && !debug.contains(&hex::encode(id(5))), "{debug}");
+        assert_eq!(own.coins.front().map(|(coin, _)| *coin), Some(id(0)), "the oldest is back at the front");
+        assert_eq!(own.coins.back().map(|(coin, _)| *coin), Some(id(MAX_OWN_SPENDS - 1)), "and the others keep their order");
     }
 
     /// Stage 4 design §10, the verdict's side: a listing's rewrite dead
@@ -9390,7 +9558,9 @@ mod tests {
         );
         // With burner keys off the verdict is the one it always was.
         assert_eq!(listing_word(&lease, &rewrite, false, other_spend()), (other_spend(), None));
-        // Every other word on that mark passes through, with no coin.
+        // Every other word on that mark passes through as it came. One that
+        // already reads dead to another copy (the last) still names the
+        // coin; the others name none.
         for word in [
             None,
             Some((Pending, false)),
@@ -9473,6 +9643,228 @@ mod tests {
         }
         let held = anyhow::Error::from(claim_write::BurnerWait::Held);
         assert!(listing_failure_line(true, 7, &held).contains("(retry in 5 min)"), "a wait keeps its retry");
+    }
+
+    /// Stage 4 design §10, the gates: a pause for another copy of this
+    /// station holds a listing that is due and a knock arm that is open,
+    /// and with no pause each goes out exactly when it did before.
+    #[test]
+    fn a_pause_for_another_copy_holds_a_due_listing_and_an_open_knock_arm_and_nothing_else_changes() {
+        let pauses = [Some(Paused::TwoHours { until: 9 }), Some(Paused::UntilNextEra)];
+        let steps = [
+            ListingStep::Write,
+            ListingStep::Idle,
+            ListingStep::Wait(ListingWait::Slot),
+            ListingStep::Wait(ListingWait::LateStart),
+            ListingStep::Wait(ListingWait::Change),
+            ListingStep::HeldByHint(PaidBy::Money),
+            ListingStep::HeldByHint(PaidBy::Burner),
+        ];
+        let mut due_once = 0;
+        for refused in [false, true] {
+            for step in steps {
+                for retry_ok in [false, true] {
+                    let before = !refused && step == ListingStep::Write && retry_ok;
+                    assert_eq!(listing_due(refused, step, retry_ok, None), before, "{refused} {step:?} {retry_ok}");
+                    due_once += usize::from(before);
+                    for paused in pauses {
+                        assert!(!listing_due(refused, step, retry_ok, paused), "{refused} {step:?} {retry_ok} {paused:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(due_once, 1, "one row of the table writes");
+        // The knock arm: a peak mid-era, none, and one in the era's guard.
+        let (mid, guarded) = (5 * ERA_BLOCKS + 100, 6 * ERA_BLOCKS - 1);
+        assert!(!era_guard(mid) && era_guard(guarded));
+        let mut open_once = 0;
+        for waiting in [false, true] {
+            for refused in [false, true] {
+                for peak in [0, mid, guarded] {
+                    for paced in [false, true] {
+                        let before = waiting && !refused && peak == mid && paced;
+                        assert_eq!(knock_arm_open(waiting, refused, peak, paced, None), before, "{waiting} {refused} {peak} {paced}");
+                        open_once += usize::from(before);
+                        for paused in pauses {
+                            assert!(!knock_arm_open(waiting, refused, peak, paced, paused), "{waiting} {refused} {peak} {paced} {paused:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(open_once, 1, "one row of the table knocks");
+    }
+
+    /// Stage 4 design §10, the verdict's side as the heartbeat runs it: a
+    /// rewrite lost to another copy of this station is counted on the pause
+    /// by its coin, once, in the era the chain is in; any other word counts
+    /// nothing; and the log's next words wait for the pause only while one
+    /// holds.
+    #[test]
+    fn a_listing_lost_to_another_copy_is_counted_on_the_pause_by_its_coin_and_no_other_verdict_is() {
+        use crate::chia_resolve::{WriteStanding, DEAD_DROPPED, DEAD_FOREIGN, DEAD_OTHER_SPEND};
+        use foreign_pause::FOREIGN_PAUSE_SECS;
+        use WriteStanding::{Dead, Pending};
+        let (dir, path) = lease_folder("listing-verdict");
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let (first, second, twice) = (coin_at(burner(), 3), coin_at(burner(), 4), coin_at(burner(), 5));
+        for coin in [first, second, twice, twice] {
+            let parking = lease.park_with_bundle([(coin.coin_id(), 900)], &spending(&[coin]), burner()).unwrap();
+            lease.release(&[parking.spend]);
+        }
+        let rewrite = |coin: Coin| NodePublishMark { coin_id: hex::encode(coin.coin_id()), parked: hex::encode(coin.coin_id()), ..Default::default() };
+        let other_spend = || Some((Dead(DEAD_OTHER_SPEND), false));
+        let (era, t0) = (7u64, 1_700_000_000u64);
+        let two_hours = Some(Paused::TwoHours { until: t0 + FOREIGN_PAUSE_SECS });
+        let mut pause = ForeignPause::in_memory();
+        // Nothing is counted for a word that is not a loss to another copy.
+        for (what, mark, burner_path, word) in [
+            ("burner keys off", rewrite(first), false, other_spend()),
+            ("pending", rewrite(first), true, Some((Pending, false))),
+            ("dropped", rewrite(first), true, Some((Dead(DEAD_DROPPED), false))),
+            ("the chain could not be asked", rewrite(first), true, None),
+            ("two spends of ours on the coin", rewrite(twice), true, other_spend()),
+        ] {
+            assert_eq!(listing_verdict(&lease, &mut pause, &mark, burner_path, word.clone(), era, t0), (word, false), "{what}");
+            assert_eq!(pause.holds(era, t0), None, "{what}");
+        }
+        // The loss: retold, and counted as the era's first.
+        assert_eq!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0), (Some((Dead(DEAD_FOREIGN), false)), true));
+        assert_eq!(pause.holds(era, t0), two_hours);
+        // The same coin judged again, as on a tick before the mark is void:
+        // still a loss, and counted no second time, during the two hours or
+        // after them.
+        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + 60).1);
+        assert_eq!(pause.holds(era, t0 + 60), two_hours);
+        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS).1);
+        assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS), None, "the two hours are over, and the coin is not counted again");
+        // What the log says comes next: the pause, only while one holds.
+        let waits = "its next write waits for the pause to end";
+        assert_eq!(after_void_words(true, two_hours, true, T11), waits);
+        assert_eq!(after_void_words(true, Some(Paused::UntilNextEra), false, T11), waits);
+        assert_eq!(after_void_words(true, None, true, T11), write_again_words(T11), "lost, but its pause is over: written again");
+        assert_eq!(after_void_words(false, two_hours, true, T11), write_again_words(T11), "dead for another reason while a pause holds");
+        let last_era = after_void_words(false, None, false, T11);
+        assert!(last_era.starts_with("this edition's listing is due at once"), "{last_era}");
+        assert_eq!(after_void_words(true, None, false, T11), last_era);
+        // Another coin lost after the two hours: the era's second.
+        assert!(listing_verdict(&lease, &mut pause, &rewrite(second), true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS + 60).1);
+        assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 60), Some(Paused::UntilNextEra));
+        assert_eq!(pause.holds(era + 1, t0 + FOREIGN_PAUSE_SECS + 60), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 4 design §10, the writer's side as the heartbeat runs it: a
+    /// write stopped for another copy's spend is counted on the pause by the
+    /// coin it stopped for and keeps no failure text; every other failure
+    /// keeps its words and counts nothing.
+    #[test]
+    fn a_write_stopped_for_another_copy_is_counted_on_the_pause_and_keeps_no_failure_text() {
+        use foreign_pause::FOREIGN_PAUSE_SECS;
+        let (era, t0) = (7u64, 1_700_000_000u64);
+        let mut pause = ForeignPause::in_memory();
+        // Other failures: their words, as before, and nothing counted.
+        let held = anyhow::Error::from(claim_write::BurnerWait::Held);
+        let refused = anyhow!("push_tx rejected");
+        for (e, last_week) in [(&held, false), (&held, true), (&refused, false), (&refused, true)] {
+            assert_eq!(listing_not_written(&mut pause, e, true, last_week, era, t0), Some(listing_failure_words(e, last_week)));
+            assert_eq!(listing_not_written(&mut pause, e, false, last_week, era, t0), Some(format!("{e:#}")), "the SSF wallet's own text");
+        }
+        assert_eq!(pause.holds(era, t0), None);
+        // The stop, however deep it is wrapped.
+        let coin = Bytes32::new([0x5a; 32]);
+        let stopped = anyhow::Error::from(claim_write::ForeignSpend { coin }).context("presence");
+        assert_eq!(listing_not_written(&mut pause, &stopped, true, true, era, t0), None, "the pause's words take the readout");
+        assert_eq!(pause.holds(era, t0), Some(Paused::TwoHours { until: t0 + FOREIGN_PAUSE_SECS }));
+        // The same coin stopped for again (a restart that lost the lease's
+        // save of the telling): no text, and no second count.
+        assert_eq!(listing_not_written(&mut pause, &stopped, true, true, era, t0 + FOREIGN_PAUSE_SECS), None);
+        assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS), None);
+        // Another coin after the two hours: the era's second.
+        let again = anyhow::Error::from(claim_write::ForeignSpend { coin: Bytes32::new([0x5b; 32]) });
+        assert_eq!(listing_not_written(&mut pause, &again, true, false, era, t0 + FOREIGN_PAUSE_SECS + 1), None);
+        assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 1), Some(Paused::UntilNextEra));
+    }
+
+    /// Stage 4 design §10: one episode of another copy is one time. When
+    /// the two hours end, the lease's watch starts afresh, once: the next
+    /// look adopts what the other copy spent while the pause ran and tells
+    /// of none of it, the records it held stay, and only a spend after that
+    /// look is told of, and counted as the era's second.
+    #[test]
+    fn when_the_two_hours_end_the_watch_starts_afresh_once_and_what_was_spent_meanwhile_is_not_counted_again() {
+        use foreign_pause::FOREIGN_PAUSE_SECS;
+        let (dir, path) = lease_folder("renew-watch");
+        let pause_path = dir.join(FOREIGN_PAUSE_FILE);
+        let lease = WalletLease::new();
+        lease.restore(&path, money());
+        let id = |n: u8| Bytes32::new([n; 32]);
+        let ours = coin_at(burner(), 3);
+        let parking = lease.park_with_bundle([(ours.coin_id(), 900)], &spending(&[ours]), burner()).unwrap();
+        lease.release(&[parking.spend]);
+        let (era, t0) = (7u64, 1_700_000_000u64);
+        let mut pause = ForeignPause::load(&pause_path, "5c");
+        // Nothing counted: nothing is due, and the watch is not touched.
+        assert_eq!(lease.foreign_spends(&[ours.coin_id()]), vec![], "the first look");
+        assert!(!renew_watch(&lease, &mut pause, t0));
+        assert!(lease_file(&path).own_watching);
+        // The other copy spends: told, counted, two hours.
+        assert_eq!(lease.foreign_spends(&[ours.coin_id(), id(7)]), vec![id(7)]);
+        assert!(pause.note(era, t0, id(7)));
+        for during in [t0, t0 + 1, t0 + FOREIGN_PAUSE_SECS - 1] {
+            assert!(!renew_watch(&lease, &mut pause, during), "not while the two hours run");
+        }
+        assert!(lease_file(&path).own_watching);
+        // They end: afresh, saved by both, and once.
+        let records = lease_file(&path).own_spends.len();
+        let over = t0 + FOREIGN_PAUSE_SECS;
+        assert!(renew_watch(&lease, &mut pause, over));
+        let file = lease_file(&path);
+        assert!(!file.own_watching, "the lease's file says the next look is a first one");
+        assert_eq!(file.own_spends.len(), records, "what the records hold stays");
+        assert!(lease.spent_once(&ours.coin_id()));
+        assert!(!renew_watch(&lease, &mut pause, over) && !renew_watch(&lease, &mut pause, over + 600), "done once");
+        assert!(!ForeignPause::load(&pause_path, "5c").watch_due(over), "and not again after a restart");
+        // What the other copy spent meanwhile is adopted, not told of.
+        assert_eq!(lease.foreign_spends(&[ours.coin_id(), id(7), id(8), id(9)]), vec![]);
+        assert_eq!(pause.holds(era, over), None);
+        // A spend of its own after that look is the era's second.
+        assert_eq!(lease.foreign_spends(&[ours.coin_id(), id(7), id(8), id(9), id(10)]), vec![id(10)]);
+        assert!(pause.note(era, over + 600, id(10)));
+        assert_eq!(pause.holds(era, over + 600), Some(Paused::UntilNextEra));
+        assert!(!renew_watch(&lease, &mut pause, over + 600), "nothing to renew for a pause until the next era");
+        // A stop between the lease's fresh watch and the pause's record of
+        // it: done once more at the next start, never left undone.
+        let (lease_b_path, pause_b_path) = (dir.join("b.json"), dir.join("b-pause.json"));
+        let lease_b = WalletLease::new();
+        lease_b.restore(&lease_b_path, money());
+        assert_eq!(lease_b.foreign_spends(&[]), vec![]);
+        let mut pause_b = ForeignPause::load(&pause_b_path, "5c");
+        assert!(pause_b.note(era, t0, id(7)));
+        lease_b.watch_afresh();
+        let mut restarted = ForeignPause::load(&pause_b_path, "5c");
+        assert!(renew_watch(&lease_b, &mut restarted, over) && !lease_file(&lease_b_path).own_watching);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The text a pause is bound to ([`pause_keys`]): one for the same
+    /// words, contact key and network, another for any other, and never an
+    /// address.
+    #[test]
+    fn a_pause_is_bound_to_the_words_the_contact_key_and_the_network_and_names_no_address() {
+        use crate::chia_burner::{BurnerRoot, MoneyKey};
+        let root = |seed: u8, net| BurnerRoot::of(&MoneyKey::new(SecretKey::from_seed(&[seed; 32])), net);
+        let (ck, other_ck) = ([17u8; 32], [18u8; 32]);
+        let keys = pause_keys(&root(9, T11), &ck);
+        assert_eq!(keys, pause_keys(&root(9, T11), &ck), "the same every run");
+        assert_ne!(keys, pause_keys(&root(9, T11), &other_ck), "another contact key");
+        assert_ne!(keys, pause_keys(&root(10, T11), &ck), "other words");
+        assert_ne!(keys, pause_keys(&root(9, crate::chia_network::ChiaNet::Mainnet), &ck), "another network");
+        let address = root(9, T11).presence(&ck, 0).puzzle_hash();
+        assert_eq!(keys, hex::encode(blake3::derive_key("ssf-chia-foreign-pause-keys-v1", &address.to_vec())), "a digest of era 0's listing address");
+        assert_eq!(keys.len(), 64);
+        assert_ne!(keys, hex::encode(address), "not the address itself");
     }
 
     /// Stage 4 design §4.4 with #272 review round 10: the payer goes wherever

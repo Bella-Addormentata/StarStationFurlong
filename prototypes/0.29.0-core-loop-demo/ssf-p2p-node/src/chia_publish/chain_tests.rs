@@ -66,13 +66,18 @@
 //! spend of P(e)'s that the lease never parked is that copy's. The
 //! listing's writer stops for such a coin before it claims, parks or sends
 //! anything (`claim_write::ForeignSpend`, [`stopped`]), the heartbeat
-//! counts it on the pause by that coin ([`foreign_spend`], [`ForeignPause`],
-//! [`paused_now`]), and each coin is told of once, so two copies writing in
-//! turn pause for two hours and then until the next era
+//! counts it on the pause by that coin ([`listing_not_written`],
+//! [`ForeignPause`]), which holds the listing and the knocks
+//! ([`listing_due`], [`knock_arm_open`], [`paused_now`]), and each coin is
+//! told of once. What the copy spends while the two hours run is the same
+//! time: when they end the lease's watch starts afresh ([`renew_watch`]),
+//! and only a spend the copy makes after our next write is a second time,
+//! which holds until the next era
 //! (`a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hours`).
 //! A rewrite that loses its coin to the copy's rewrite of the same coin is
-//! told by the listing's verdict instead ([`listing_word`]), by the lease's
-//! record of that write's one spend, and is counted once
+//! told by the listing's verdict instead ([`listing_verdict`]), by the
+//! lease's record of that write's one spend, and is counted once, the
+//! copy's later rewrite during the two hours with it
 //! (`a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_another_copy_and_is_counted_once`).
 //! A rewrite every node refuses because the copy's landed first leaves no
 //! record of its coin, so the next write stops for it
@@ -3845,15 +3850,20 @@ async fn a_lost_marks_write_confirmed_outside_its_era_is_filed_and_voided_once()
 /// coin c0. Our next write finds c0 spent with no record of it on our lease
 /// and stops for it: nothing is claimed, parked, sent or counted, it is
 /// neither a wait nor a refusal, and its words name neither the burner nor
-/// the coin. Counted on the pause by that coin, as the heartbeat counts it,
-/// it holds for two hours in §10's own words, across a restart, and the
-/// same coin told of again counts nothing. The lease tells of a coin once,
-/// across a restart too, so the write after the two hours goes on from c1,
-/// the coin the copy's write made, with no second gift. The copy is then
-/// told of our spend of c1 in the same way, once, and writes again. Our
-/// next write stops for the copy's second spend, and a second one in the
-/// era holds until the next era, in its own words. In era 1 nothing holds,
-/// and the listing is written from P(1) with era 1's gift.
+/// the coin. Counted on the pause by that coin, as the heartbeat counts it
+/// ([`listing_not_written`]), it holds the listing and the knocks for two
+/// hours in §10's own words, across a restart, for these listing keys alone
+/// ([`pause_keys`]), and the same coin told of again counts nothing.
+///
+/// The copy, which nothing has stopped yet, writes once more while the two
+/// hours run. That is still the first time: when they end the lease's watch
+/// starts afresh ([`renew_watch`]), so our write after them goes on from the
+/// copy's latest coin and stops for none of what the copy spent meanwhile,
+/// with no second gift. The copy is then told of our spend in the same way,
+/// once, and writes again. That spend came after our write, so our next
+/// write stops for it as the second time in the era, which holds until the
+/// next era, in its own words. In era 1 nothing holds, and the listing is
+/// written from P(1) with era 1's gift.
 #[tokio::test]
 async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hours() {
     let mut s = setup().await;
@@ -3889,54 +3899,83 @@ async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hou
     assert!(!s.lease.holds_for(payer) && !s.lease.is_taken(&c1.coin_id()), "nothing parked");
     assert_eq!(s.gifts(0), 1, "nothing counted");
 
-    // Counted on the pause by its coin, as the heartbeat counts it.
+    // Counted on the pause by its coin, as the heartbeat counts it: the
+    // listing and the knocks are held, in §10's words.
     let pause_file = dir.0.join(FOREIGN_PAUSE_FILE);
-    let mut pause = ForeignPause::load(&pause_file);
-    assert_eq!(paused_now(&mut pause, Some(0), at), None);
-    assert!(pause.note(0, at, stopped_for(&stop).unwrap()));
+    let keys = pause_keys(&root(140), &CK);
+    let mut pause = ForeignPause::load(&pause_file, &keys);
+    let peak = s.chain.peak();
+    assert!(listing_due(false, ListingStep::Write, true, paused_now(&mut pause, Some(0), at)), "nothing holds yet");
+    assert!(knock_arm_open(true, false, peak, true, paused_now(&mut pause, Some(0), at)));
+    assert_eq!(listing_not_written(&mut pause, stop.as_ref().err().unwrap(), true, true, 0, at), None, "no failure text: the pause's words take the readout");
     let two_hours = Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS });
     assert_eq!(paused_now(&mut pause, Some(0), at), two_hours);
+    assert!(!listing_due(false, ListingStep::Write, true, two_hours), "the listing is held");
+    assert!(!knock_arm_open(true, false, peak, true, two_hours), "and the knocks");
     let readout = listing_readout(None, ListingStep::Write, true, false, None, false, false);
     assert_eq!(paused_readout(two_hours, readout.clone()).0.as_deref(), Some(PAUSED_TWO_HOURS_WORDS));
+    assert!(!renew_watch(&s.lease, &mut pause, at + 60), "the watch is left as it is while the two hours run");
 
-    // The node starts again: the pause and the lease are read from their
-    // files.
-    let mut pause = ForeignPause::load(&pause_file);
-    assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS - 1), two_hours, "held to its last second, a restart or not");
-    assert!(!pause.note(0, at + 60, c0.coin_id()), "the same coin told of again counts nothing");
-    assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS), None, "two hours on, nothing holds");
-    s.lease = WalletLease::new();
-    restore(&s.lease, &path, &w);
-    let (_, ours) = s.listing(&w, &node, 0, &here, at + FOREIGN_PAUSE_SECS, 4).await.unwrap();
-    assert_eq!(ours.coins, WriteCoins::one(c1.coin_id()), "told of c0 once: the write goes on from the coin the copy's write made");
-    assert_eq!(s.gifts(0), 1, "with no second gift");
+    // The copy, not stopped yet, writes once more while they run.
+    s.change_copy(&mut copy);
+    let (_, theirs) = s.listing(&w, &node, 0, &there, at + 600, 4).await.unwrap();
+    assert_eq!(theirs.coins, WriteCoins::one(c1.coin_id()), "the copy rewrites its own listing");
     s.chain.farm().await;
     let c2 = burner_coin(&p0, c1.coin_id());
+    s.change_copy(&mut copy);
+
+    // The node starts again: the pause and the lease are read from their
+    // files. Another station's keys read no pause from this file.
+    let mut pause = ForeignPause::load(&pause_file, &keys);
+    assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS - 1), two_hours, "held to its last second, a restart or not");
+    assert!(!pause.note(0, at + 60, c0.coin_id()), "the same coin told of again counts nothing");
+    assert_eq!(ForeignPause::load(&pause_file, &pause_keys(&root(141), &CK)).holds(0, at), None, "a pause is for the keys it was counted under");
+    assert_eq!(ForeignPause::load(&pause_file, &pause_keys(&root(140), &[22; 32])).holds(0, at), None, "and a new contact key makes new keys");
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+
+    // The two hours end. The watch starts afresh, so what the copy spent
+    // meanwhile is the same time, not a second one: our write stops for
+    // neither c0 nor c1 and goes on from the copy's latest coin.
+    let over = at + FOREIGN_PAUSE_SECS;
+    assert_eq!(paused_now(&mut pause, Some(0), over), None, "two hours on, nothing holds");
+    assert!(renew_watch(&s.lease, &mut pause, over), "the heartbeat's first tick after the two hours");
+    assert!(!renew_watch(&s.lease, &mut pause, over), "once");
+    assert!(listing_due(false, ListingStep::Write, true, paused_now(&mut pause, Some(0), over)));
+    let (_, ours) = s.listing(&w, &node, 0, &here, over, 5).await.unwrap();
+    assert_eq!(ours.coins, WriteCoins::one(c2.coin_id()), "from the coin the copy's last write made");
+    assert_eq!(s.gifts(0), 1, "with no second gift");
+    assert_eq!(paused_now(&mut pause, Some(0), over), None, "and nothing more is counted");
+    s.chain.farm().await;
+    let c3 = burner_coin(&p0, c2.coin_id());
 
     // The copy is told of our spend, once, and writes again.
     s.change_copy(&mut copy);
     let sent = s.sent();
-    let stop = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS + 600, 5).await;
-    stopped(&stop, c1, &p0);
+    let stop = s.listing(&w, &node, 0, &there, over + 600, 6).await;
+    stopped(&stop, c2, &p0);
     assert_eq!(s.sent(), sent, "the copy sends nothing either");
-    let (_, theirs) = s.listing(&w, &node, 0, &there, at + 2 * FOREIGN_PAUSE_SECS + 600, 6).await.unwrap();
-    assert_eq!(theirs.coins, WriteCoins::one(c2.coin_id()), "the copy writes from the coin ours made");
+    let (_, theirs) = s.listing(&w, &node, 0, &there, over + FOREIGN_PAUSE_SECS + 600, 7).await.unwrap();
+    assert_eq!(theirs.coins, WriteCoins::one(c3.coin_id()), "the copy writes from the coin ours made");
     s.chain.farm().await;
     s.change_copy(&mut copy);
 
-    // The second time in the era holds until the next era.
-    let again = at + 2 * FOREIGN_PAUSE_SECS + 1_200;
-    let stop = s.listing(&w, &node, 0, &here, again, 7).await;
-    stopped(&stop, c2, &p0);
-    assert!(pause.note(0, again, stopped_for(&stop).unwrap()));
+    // That spend came after our write: the second time in the era, which
+    // holds until the next era.
+    let again = over + FOREIGN_PAUSE_SECS + 1_200;
+    let stop = s.listing(&w, &node, 0, &here, again, 8).await;
+    stopped(&stop, c3, &p0);
+    assert_eq!(listing_not_written(&mut pause, stop.as_ref().err().unwrap(), true, true, 0, again), None);
     assert_eq!(paused_now(&mut pause, Some(0), again), Some(Paused::UntilNextEra));
     assert_eq!(paused_now(&mut pause, Some(0), again + 6 * 24 * 3600), Some(Paused::UntilNextEra), "for as long as the era lasts");
+    assert!(!listing_due(false, ListingStep::Write, true, Some(Paused::UntilNextEra)));
+    assert!(!renew_watch(&s.lease, &mut pause, again + FOREIGN_PAUSE_SECS), "no fresh watch under a pause until the next era");
     assert_eq!(paused_readout(Some(Paused::UntilNextEra), readout).0.as_deref(), Some(PAUSED_NEXT_EDITION_WORDS));
 
     s.chain.farm_to(ERA_BLOCKS).await;
     let next_era = again + 3 * 3600;
     assert_eq!(paused_now(&mut pause, Some(1), next_era), None, "in the next era nothing holds");
-    let (_, next) = s.listing(&w, &node, 1, &here, next_era, 8).await.unwrap();
+    let (_, next) = s.listing(&w, &node, 1, &here, next_era, 9).await.unwrap();
     let f_b = *dish.iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
     assert_eq!(next.payer, Payer::of_burner(&p1), "era 1's listing comes from P(1)");
     assert_eq!(next.coins, WriteCoins { parent: gift(&p1, f_b).coin_id(), parked: f_b.coin_id() }, "with era 1's own gift");
@@ -3954,12 +3993,19 @@ async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hou
 /// is spent SETTLED_DEPTH deep the chain's word is dead, its coin gone to
 /// another spend. Our lease has recorded one spend of c0, the write's own,
 /// so the listing's verdict retells it as lost to another copy of this
-/// station and names c0, which the heartbeat counts on the pause; the mark
+/// station and counts it on the pause by c0 ([`listing_verdict`]); the mark
 /// is voided in those words. With the SSF wallet paying, the word stays as
-/// it came. The writer is told nothing more of c0, which is in the lease's
-/// records as its own spend's, so one spend by the copy is counted once:
-/// after the pause the listing is written from the coin the copy made, with
-/// no second gift.
+/// it came and nothing is counted.
+///
+/// One episode is one time. The copy rewrites its listing once more while
+/// the two hours run, from the coin c1 its first rewrite made, which our
+/// lease has no record of. When the two hours end the watch starts afresh
+/// ([`renew_watch`]): our write adopts c1 and goes on from the copy's
+/// latest coin, with no second gift and nothing more counted. Left as it
+/// was, the watch would have stopped that write for c1 and counted the
+/// copy's one episode twice, silencing the station for the era. A copy
+/// still running does raise the second count: its rewrite of the coin our
+/// write made stops our next write, until the next era.
 #[tokio::test]
 async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_another_copy_and_is_counted_once() {
     let mut s = setup().await;
@@ -3986,28 +4032,59 @@ async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_
     assert_eq!(s.chain.children(c0.coin_id()), vec![c1], "the coin our rewrite would have made, made by the copy's");
     assert!(s.chain.mempool().is_empty(), "the block spent the rewrite's coin, so the mempools let it go");
 
+    let mut pause = ForeignPause::in_memory();
+    let at = t + 1_800;
     s.reconcile().await;
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Pending), "the lease still holds the spend");
-    assert_eq!(listing_word(&s.lease, &mark, true, word.clone()), (word, None), "pending is not retold");
+    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, true, word.clone(), 0, at), (word, false), "pending is not retold");
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
     s.reconcile().await;
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Dead("its coin went to another spend of ours")), "the chain's word");
-    assert_eq!(listing_word(&s.lease, &mark, false, word.clone()), (word.clone(), None), "with the SSF wallet paying, as it came");
-    let (told, lost_by) = listing_word(&s.lease, &mark, true, word);
+    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, false, word.clone(), 0, at), (word.clone(), false), "with the SSF wallet paying, as it came");
+    assert_eq!(paused_now(&mut pause, Some(0), at), None, "and nothing is counted for either");
+    assert_eq!(listing_word(&s.lease, &mark, true, word.clone()).1, Some(c0.coin_id()), "lost by c0");
+    let (told, lost) = listing_verdict(&s.lease, &mut pause, &mark, true, word, 0, at);
     assert_eq!(told.clone().map(|w| w.0), Some(WriteStanding::Dead("another copy of this station spent its coin")), "one spend of ours, and it was not the one that took c0");
-    assert_eq!(lost_by, Some(c0.coin_id()), "lost by c0");
+    assert!(lost);
+    let two_hours = Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS });
+    assert_eq!(paused_now(&mut pause, Some(0), at), two_hours, "counted on the pause");
     assert_eq!(presence_step(&mark, told, 0, s.chain.peak()), PresenceStep::Void("never landed — another copy of this station spent its coin".into()));
-    let mut pause = ForeignPause::in_memory();
-    let at = t + 1_800;
-    assert!(pause.note(0, at, c0.coin_id()));
-    assert_eq!(paused_now(&mut pause, Some(0), at), Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS }));
+    assert_eq!(after_void_words(lost, two_hours, true, NET), "its next write waits for the pause to end");
+    assert!(!listing_due(false, ListingStep::Write, true, two_hours));
 
-    let (_, next) = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS, 3).await.unwrap();
-    assert_eq!(next.coins, WriteCoins::one(c1.coin_id()), "the writer stops for nothing: c0 is in the records, and the write goes on from the copy's coin");
+    // While the two hours run the copy rewrites its listing once more, from
+    // the coin its first rewrite made.
+    let made = s.chain.record(c1.coin_id()).expect("the copy's rewrite landed").1;
+    s.money.push_tx(copys_rewrite(&p0, c1, made, &node, 0, &here, at + 600)).await.unwrap();
+    s.chain.farm().await;
+    let c2 = burner_coin(&p0, c1.coin_id());
+    assert_eq!(s.chain.children(c1.coin_id()), vec![c2]);
+    assert!(!s.lease.spent_once(&c1.coin_id()), "our lease has no record of c1");
+
+    // The two hours end: the watch starts afresh, and our write goes on
+    // from the copy's latest coin. The copy's one episode is one time.
+    let over = at + FOREIGN_PAUSE_SECS;
+    assert!(renew_watch(&s.lease, &mut pause, over));
+    assert_eq!(paused_now(&mut pause, Some(0), over), None);
+    let (_, next) = s.listing(&w, &node, 0, &there, over, 3).await.unwrap();
+    assert_eq!(next.coins, WriteCoins::one(c2.coin_id()), "the writer stops for neither c0 nor c1");
     assert_eq!(s.gifts(0), 1, "with no second gift");
+    s.turn().await;
+    let c3 = burner_coin(&p0, c2.coin_id());
+
+    // A copy still running: its rewrite of the coin our write made is the
+    // second time in the era.
+    let made = s.chain.record(c3.coin_id()).expect("our write landed").1;
+    s.money.push_tx(copys_rewrite(&p0, c3, made, &node, 0, &here, over + 600)).await.unwrap();
+    s.chain.farm().await;
+    let again = over + 1_200;
+    let stop = s.listing(&w, &node, 0, &there, again, 4).await;
+    stopped(&stop, c3, &p0);
+    assert_eq!(listing_not_written(&mut pause, stop.as_ref().err().unwrap(), true, false, 0, again), None);
+    assert_eq!(paused_now(&mut pause, Some(0), again), Some(Paused::UntilNextEra));
     assert!(s.chain.unanswered().is_empty());
 }
 
@@ -4105,9 +4182,10 @@ async fn a_lease_that_kept_no_records_adopts_what_its_key_spent_and_a_coin_swept
     stopped(&stop, c2, &p0);
     assert_eq!((s.sent(), s.gifts(0)), (sent, 1), "nothing sent, nothing claimed");
     let mut pause = ForeignPause::in_memory();
-    assert!(pause.note(0, at, c2.coin_id()));
+    assert_eq!(listing_not_written(&mut pause, stop.as_ref().err().unwrap(), true, false, 0, at), None);
     assert_eq!(paused_now(&mut pause, Some(0), at), Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS }));
 
+    assert!(renew_watch(&s.lease, &mut pause, at + FOREIGN_PAUSE_SECS), "the watch starts afresh when the two hours end");
     let (_, funded) = s.listing(&w, &node, 0, &there, at + FOREIGN_PAUSE_SECS, 5).await.unwrap();
     let spare = *dish.iter().find(|c| c.coin_id() != first.coins.parked).expect("the other lobby coin");
     assert_eq!(funded.coins, WriteCoins { parent: gift(&p0, spare).coin_id(), parked: spare.coin_id() }, "funded again, from the other lobby coin");
