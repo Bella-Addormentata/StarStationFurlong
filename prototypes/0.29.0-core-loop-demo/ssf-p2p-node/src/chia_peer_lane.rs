@@ -1289,7 +1289,27 @@ impl Lane {
                     let n = named.len();
                     let held: HashSet<SocketAddr> = state.conns.iter().map(|c| c.addr()).chain(state.candidates.iter().map(|c| c.addr)).collect();
                     let dialable: Vec<(SocketAddr, u64)> = named.into_iter().filter(|(addr, _)| admitted(state, *addr)).collect();
+                    // PROBE ONLY (branch claude/testnet11-live-check, never to
+                    // merge): how old the answer's addresses are, and which
+                    // pick each address taken was, to set against its dial.
+                    let probe_now = unix_now();
+                    let probe_ages: HashMap<SocketAddr, u64> = dialable.iter().map(|(addr, at)| (*addr, probe_now.saturating_sub(*at))).collect();
+                    {
+                        let within = |secs: u64| probe_ages.values().filter(|age| **age <= secs).count();
+                        eprintln!(
+                            "⛓️ probe: answer of {n}: {} dialable; seen within 30 min {}, 2 h {}, 1 day {}, 7 days {}",
+                            dialable.len(),
+                            within(1_800),
+                            within(7_200),
+                            within(86_400),
+                            within(604_800)
+                        );
+                    }
                     let (known, taken) = gossip_take(dialable, &held, unix_now(), &mut rand::thread_rng());
+                    for (i, addr) in taken.iter().enumerate() {
+                        let half = if i < ADDRS_PER_ANSWER / 2 { "recent" } else { "random" };
+                        eprintln!("⛓️ probe: pick {i:>2} {half} {addr} seen {} s ago", probe_ages.get(addr).copied().unwrap_or(u64::MAX));
+                    }
                     eprintln!("⛓️ chain peers: {} gossiped {n} full nodes: {} taken to try, {} known already", conn.addr(), taken.len(), known.len());
                     push_candidates(state, known.into_iter().chain(taken).map(|addr| Candidate::new(addr, Source::Gossip)).collect());
                 }
