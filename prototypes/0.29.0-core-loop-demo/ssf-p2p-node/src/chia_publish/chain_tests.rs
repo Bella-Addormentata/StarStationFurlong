@@ -3928,7 +3928,6 @@ async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hou
     // files. Another station's keys read no pause from this file.
     let mut pause = ForeignPause::load(&pause_file, &keys);
     assert_eq!(paused_now(&mut pause, Some(0), at + FOREIGN_PAUSE_SECS - 1), two_hours, "held to its last second, a restart or not");
-    assert!(!pause.note(0, at + 60, c0.coin_id()), "the same coin told of again counts nothing");
     assert_eq!(ForeignPause::load(&pause_file, &pause_keys(&root(141), &CK)).holds(0, at), None, "a pause is for the keys it was counted under");
     assert_eq!(ForeignPause::load(&pause_file, &pause_keys(&root(140), &[22; 32])).holds(0, at), None, "and a new contact key makes new keys");
     s.lease = WalletLease::new();
@@ -3938,9 +3937,12 @@ async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hou
     // meanwhile is the same time, not a second one: our write stops for
     // neither c0 nor c1 and goes on from the copy's latest coin.
     let over = at + FOREIGN_PAUSE_SECS;
-    assert_eq!(paused_now(&mut pause, Some(0), over), None, "two hours on, nothing holds");
+    assert_eq!(paused_now(&mut pause, Some(0), over), two_hours, "held until the lease's watch is afresh");
     assert!(renew_watch(&s.lease, &mut pause, over), "the heartbeat's first tick after the two hours");
     assert!(!renew_watch(&s.lease, &mut pause, over), "once");
+    assert_eq!(paused_now(&mut pause, Some(0), over), None, "two hours on, nothing holds");
+    assert!(!pause.note(0, over, c0.coin_id()), "the coin it was counted by is remembered across the restart, and counts nothing again");
+    assert_eq!(paused_now(&mut pause, Some(0), over), None);
     assert!(listing_due(false, ListingStep::Write, true, paused_now(&mut pause, Some(0), over)));
     let (_, ours) = s.listing(&w, &node, 0, &here, over, 5).await.unwrap();
     assert_eq!(ours.coins, WriteCoins::one(c2.coin_id()), "from the coin the copy's last write made");
@@ -4062,7 +4064,7 @@ async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_
     s.chain.farm().await;
     let c2 = burner_coin(&p0, c1.coin_id());
     assert_eq!(s.chain.children(c1.coin_id()), vec![c2]);
-    assert!(!s.lease.spent_once(&c1.coin_id()), "our lease has no record of c1");
+    assert!(!s.lease.spent_once(&c1.coin_id()), "no spend of ours alone is on record for c1");
 
     // The two hours end: the watch starts afresh, and our write goes on
     // from the copy's latest coin. The copy's one episode is one time.

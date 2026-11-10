@@ -28,7 +28,10 @@
 //! ([`ForeignPause::watch_due`], `WalletLease::watch_afresh`): the
 //! listing's next write adopts what the key spent meanwhile and stops for
 //! none of it. Only a spend the other copy makes after that write's look is
-//! a second time.
+//! a second time. The pause holds until the lease has saved that fresh
+//! watch ([`ForeignPause::holds`]): a write let go before then would look
+//! with the old watch, now or after a restart, and count the same time
+//! again.
 //!
 //! This file is the clock alone ([`ForeignPause`]): it reads no chain and
 //! no lease, and its time and era are its caller's. The heartbeat owns the
@@ -45,6 +48,15 @@
 //! when its lease file was lost, or that an older build's lease let go as
 //! dropped, and that landed after all; and a push every peer refused that
 //! a peer relayed all the same.
+//!
+//! The two hours are by this machine's clock. An end more than two hours
+//! off, as a clock set back since the count leaves it, is brought in to
+//! two hours from now ([`ForeignPause::keep_time`]). A clock set forward
+//! ends them early, which the node cannot tell from time passing: a spend
+//! the other copy makes after that is the second time. And a station that
+//! was stopped, or had burner keys off, when the two hours ended starts
+//! the watch afresh when it next runs: what the other copy wrote until
+//! then, in a later era too, is adopted and not told of.
 
 use std::path::{Path, PathBuf};
 
@@ -135,7 +147,9 @@ struct PauseFile {
 /// era just before the one it counted in (the peak stepping back over an
 /// era's first block) reads the stored count; an era further back does
 /// not, since no chain steps back that far: the stored era came from a
-/// peak that was wrong, and holds nothing.
+/// peak that was wrong, and its count of two holds nothing there. The two
+/// hours of a first one are by the clock alone, in any era: the spend they
+/// are for was made, whichever era the peak of the moment filed it under.
 ///
 /// Its `Debug` gives the count and no coin.
 pub struct ForeignPause {
@@ -215,24 +229,45 @@ impl ForeignPause {
     }
 
     /// Whether the two hours of the era's first one still run at `now`.
-    /// Their end is never more than four hours off: a clock set back by up
-    /// to two hours since the count still holds them, without a gap, and an
-    /// end further off than that was set by a clock that ran ahead, and
-    /// holds nothing.
     fn two_hours_run(&self, now: u64) -> bool {
-        let left = self.until.saturating_sub(now);
-        self.times >= 1 && left > 0 && left <= 2 * FOREIGN_PAUSE_SECS
+        self.times >= 1 && self.until > now
+    }
+
+    /// Keep the two hours to this clock, at the unix time `now`: an end
+    /// more than two hours off was set by a clock that has been set back
+    /// since, and is brought in to two hours from now, and saved. So the
+    /// two hours never outlast two hours of the clock that looks at them,
+    /// and never drop away to come back later. The heartbeat's askers do
+    /// this before they ask (`super::paused_now`, `super::renew_watch`),
+    /// and so does a count.
+    pub fn keep_time(&mut self, now: u64) {
+        if self.times >= 1 && self.until.saturating_sub(now) > FOREIGN_PAUSE_SECS {
+            self.until = now.saturating_add(FOREIGN_PAUSE_SECS);
+            self.save_or_log();
+        }
     }
 
     /// Take a spend by another copy of this station, learned by `coin` in
-    /// era `era` at the unix time `now`, and save. `true` when it counts,
-    /// as the era's first or a later one. `false`, with no count, when
-    /// `coin` was told of before, and when it is told of while the two
-    /// hours of the era's first one run: those are the owner's time to stop
-    /// the other copy, and what it spent meanwhile is still the first time.
-    /// The first one of an era starts its two hours at `now`; a later one
-    /// starts no clock, since the era's end is what it waits for.
+    /// era `era` at the unix time `now`, and save: what the listing's
+    /// writer stopped for, found spent at its look now
+    /// ([`ForeignPause::note_made`], with the look as what was made).
     pub fn note(&mut self, era: u64, now: u64, coin: Bytes32) -> bool {
+        self.note_made(era, now, coin, now)
+    }
+
+    /// Take a spend by another copy of this station, learned by `coin` in
+    /// era `era` at the unix time `now`, and save. `made` is when this
+    /// station made what the spend crossed: its look at the key's spent
+    /// coins, or the write of its own that the spend took the coin of.
+    /// `true` when it counts, as the era's first or a later one. `false`,
+    /// with no count, when `coin` was told of before, and when `made` is
+    /// before the end of the two hours on record: those are the owner's
+    /// time to stop the other copy, and what it spent before they ended,
+    /// whenever this station learns of it, is still the first time. The
+    /// first one of an era starts its two hours at `now`; a later one
+    /// starts no clock, since the era's end is what it waits for.
+    pub fn note_made(&mut self, era: u64, now: u64, coin: Bytes32, made: u64) -> bool {
+        self.keep_time(now);
         if self.seen.contains(&coin) {
             return false;
         }
@@ -240,12 +275,12 @@ impl ForeignPause {
         if self.seen.len() > MAX_FOREIGN_SEEN {
             self.seen.remove(0);
         }
-        if !self.joins(era) {
-            self.era = era;
-            self.times = 0;
-        }
-        let counts = self.times == 0 || !self.two_hours_run(now);
+        let counts = self.times == 0 || made >= self.until;
         if counts {
+            if !self.joins(era) {
+                self.era = era;
+                self.times = 0;
+            }
             self.times = self.times.saturating_add(1);
             if self.times == 1 {
                 self.until = now.saturating_add(FOREIGN_PAUSE_SECS);
@@ -259,21 +294,24 @@ impl ForeignPause {
     /// The pause that holds in era `era` at the unix time `now`, if one
     /// does. Two counted in an era hold through that era, and the one just
     /// before it, and end with the next. One holds for its two hours,
-    /// whatever the era, and so does the first of two once the era has
-    /// turned.
+    /// whatever the era, and after them until the lease's watch has started
+    /// afresh ([`ForeignPause::watch_due`]), which the heartbeat sees to at
+    /// its next tick: no write looks at the key's spent coins with the old
+    /// watch.
     pub fn holds(&self, era: u64, now: u64) -> Option<Paused> {
         if self.times >= 2 && self.joins(era) {
             return Some(Paused::UntilNextEra);
         }
-        self.two_hours_run(now).then_some(Paused::TwoHours { until: self.until })
+        (self.two_hours_run(now) || self.watch_due(now)).then_some(Paused::TwoHours { until: self.until })
     }
 
     /// Whether the lease's watch is to start afresh at `now`: the two hours
     /// of the era's first one have ended, no second one holds the era, and
-    /// it was not done yet. Its caller starts the watch afresh and then
-    /// says so ([`ForeignPause::watch_renewed`]), in that order, so a stop
-    /// between the two does it again at the next start and never leaves it
-    /// undone.
+    /// it was not done yet. Its caller starts the watch afresh and, once
+    /// the lease has saved that, says so ([`ForeignPause::watch_renewed`]),
+    /// in that order: a stop between the two does it again at the next
+    /// start and never leaves it undone. Until it is done the pause holds
+    /// ([`ForeignPause::holds`]).
     pub fn watch_due(&self, now: u64) -> bool {
         self.times == 1 && !self.renewed && !self.two_hours_run(now)
     }
@@ -361,17 +399,25 @@ mod tests {
         for now in [T0, T0 + 1, until - 1] {
             assert_eq!(pause.holds(7, now), Some(Paused::TwoHours { until }), "at {now}");
         }
-        assert_eq!(pause.holds(7, until), None, "the two hours are over at their end");
-        assert_eq!(pause.holds(7, until + 1), None);
         // Two hours are two hours, whatever the era turns to meanwhile.
         assert_eq!(pause.holds(8, until - 1), Some(Paused::TwoHours { until }));
-        assert_eq!(pause.holds(8, until), None);
+        // At their end the pause holds on until the lease's watch has
+        // started afresh, which the heartbeat sees to at its next tick.
+        for (era, now) in [(7, until), (7, until + 1), (8, until), (9, until + 30 * 24 * HOUR)] {
+            assert_eq!(pause.holds(era, now), Some(Paused::TwoHours { until }), "era {era} at {now}: the watch is not afresh yet");
+        }
+        pause.watch_renewed();
+        for (era, now) in [(7, until), (7, until + 1), (8, until)] {
+            assert_eq!(pause.holds(era, now), None, "era {era} at {now}: the two hours are over");
+        }
+        assert_eq!(pause.holds(7, until - 1), Some(Paused::TwoHours { until }), "a fresh watch ends no two hours early");
     }
 
     #[test]
     fn a_second_one_after_the_two_hours_pauses_until_the_next_era() {
         let mut pause = ForeignPause::in_memory();
         assert!(pause.note(7, T0, coin(1)));
+        pause.watch_renewed();
         let later = T0 + 3 * HOUR;
         assert_eq!(pause.holds(7, later), None, "the first pause is over");
         assert!(pause.note(7, later, coin(2)));
@@ -396,7 +442,8 @@ mod tests {
             assert!(!pause.note(7, now, coin(n)), "told of at {now}: no second time");
             assert_eq!(pause.holds(7, now), Some(Paused::TwoHours { until }), "and the two hours run from the first");
         }
-        assert_eq!(pause.holds(7, until), None, "they end when they would have");
+        pause.watch_renewed();
+        assert_eq!(pause.holds(7, until), None, "they end when they would have, once the watch is afresh");
         // Each was taken, so told of again it still counts nothing.
         assert!(!pause.note(7, until + 60, coin(3)));
         assert_eq!(pause.holds(7, until + 60), None);
@@ -414,6 +461,7 @@ mod tests {
         assert_eq!(pause.holds(8, next), None);
         assert!(pause.note(8, next, coin(3)));
         assert_eq!(pause.holds(8, next), Some(Paused::TwoHours { until: next + FOREIGN_PAUSE_SECS }), "the first of era 8: two hours, not the era");
+        pause.watch_renewed();
         assert_eq!(pause.holds(8, next + FOREIGN_PAUSE_SECS), None);
         assert!(pause.note(8, next + FOREIGN_PAUSE_SECS, coin(4)));
         assert_eq!(pause.holds(8, next + FOREIGN_PAUSE_SECS), Some(Paused::UntilNextEra));
@@ -439,6 +487,7 @@ mod tests {
         let at = later + HOUR;
         assert!(pause.note(3, at, coin(3)));
         assert_eq!(pause.holds(3, at), Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS }), "the first of era 3");
+        pause.watch_renewed();
         assert_eq!(pause.holds(7, at + FOREIGN_PAUSE_SECS), None, "era 7's count is gone");
     }
 
@@ -446,6 +495,7 @@ mod tests {
     fn the_same_coin_is_counted_once() {
         let mut pause = ForeignPause::in_memory();
         assert!(pause.note(7, T0, coin(1)));
+        pause.watch_renewed();
         assert!(!pause.note(7, T0 + 3 * HOUR, coin(1)), "told of again: nothing new");
         assert_eq!(pause.holds(7, T0 + 3 * HOUR), None, "no second pause, and the first one's two hours are not started again");
         assert!(!pause.note(8, T0 + 8 * 24 * HOUR, coin(1)), "in a later era too");
@@ -462,25 +512,92 @@ mod tests {
         assert!(many.note(7, end, coin(0)), "the oldest was forgotten, so it counts again");
     }
 
+    /// The two hours are by this machine's clock. Counted while the clock
+    /// stood ahead, their end is more than two hours off once the clock is
+    /// right: it is brought in to two hours from the first look, saved,
+    /// and neither dropped nor left to come back later.
     #[test]
-    fn a_clock_that_ran_ahead_holds_nothing_and_one_set_back_two_hours_leaves_no_gap() {
-        let mut pause = ForeignPause::in_memory();
-        // Counted while the clock stood a year ahead.
-        let ahead = T0 + 365 * 24 * HOUR;
+    fn an_end_more_than_two_hours_off_is_brought_in_to_two_hours_from_now() {
+        let dir = std::env::temp_dir().join(format!("ssf-foreign-clock-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FOREIGN_PAUSE_FILE);
+        let mut pause = ForeignPause::load(&path, KEYS);
+        // Counted while the clock stood five hours ahead.
+        let ahead = T0 + 5 * HOUR;
         assert!(pause.note(7, ahead, coin(1)));
         assert_eq!(pause.holds(7, ahead), Some(Paused::TwoHours { until: ahead + FOREIGN_PAUSE_SECS }));
-        assert_eq!(pause.holds(7, T0), None, "the clock is right again: an end a year off holds nothing");
-        assert!(pause.watch_due(T0), "and the watch starts afresh, as after any pause that ended");
-        // A clock set back by up to two hours since the count still holds,
-        // from there to the end on record; set back further, nothing holds.
-        let held = Some(Paused::TwoHours { until: ahead + FOREIGN_PAUSE_SECS });
-        assert_eq!(pause.holds(7, ahead - 1), held);
-        assert_eq!(pause.holds(7, ahead - FOREIGN_PAUSE_SECS), held);
-        assert_eq!(pause.holds(7, ahead - FOREIGN_PAUSE_SECS - 1), None);
+        // An end within two hours of the clock is left as it is.
+        pause.keep_time(ahead);
+        pause.keep_time(ahead + HOUR);
+        assert_eq!(pause.holds(7, ahead + HOUR), Some(Paused::TwoHours { until: ahead + FOREIGN_PAUSE_SECS }));
+        // The clock is right again: two hours from now, with no gap in
+        // them, and no pause coming back when the old end draws near.
+        pause.keep_time(T0);
+        let until = T0 + FOREIGN_PAUSE_SECS;
+        for now in [T0, T0 + HOUR, until - 1] {
+            assert_eq!(pause.holds(7, now), Some(Paused::TwoHours { until }), "at {now}");
+            assert!(!pause.watch_due(now));
+        }
+        assert!(pause.watch_due(until));
+        assert_eq!(ForeignPause::load(&path, KEYS).holds(7, until - 1), Some(Paused::TwoHours { until }), "saved: a restart does not start them again");
+        assert!(!pause.note(7, T0 + HOUR, coin(2)), "what is told of meanwhile is the same time");
+        pause.watch_renewed();
+        for now in [until, T0 + 4 * HOUR, ahead + FOREIGN_PAUSE_SECS - 1] {
+            assert_eq!(pause.holds(7, now), None, "at {now}: over, and it does not come back");
+        }
+        // A count looks at the clock too: one told of with the clock right
+        // again counts by the end brought in, not the one a year off.
+        let mut counted = ForeignPause::in_memory();
+        assert!(counted.note(7, T0 + 365 * 24 * HOUR, coin(1)));
+        assert!(!counted.note(7, T0, coin(2)), "inside the two hours from now");
+        assert_eq!(counted.holds(7, T0), Some(Paused::TwoHours { until }));
+        counted.watch_renewed();
+        assert!(counted.note(7, until, coin(3)), "and after them it is the second time");
+        // The end of a second one's era is no clock, but its first one's end
+        // is kept all the same, so nothing holds once the era has turned.
+        let mut era = ForeignPause::in_memory();
+        assert!(era.note(7, ahead, coin(1)));
+        era.watch_renewed();
+        assert!(era.note(7, ahead + 3 * HOUR, coin(2)));
+        era.until = T0 + 365 * 24 * HOUR;
+        era.keep_time(T0);
+        assert_eq!(era.holds(8, until), None);
         // A count at the end of time does not overflow.
         let mut last = ForeignPause::in_memory();
         assert!(last.note(7, u64::MAX - 10, coin(2)));
         assert_eq!(last.holds(7, u64::MAX - 10), Some(Paused::TwoHours { until: u64::MAX }));
+        last.keep_time(u64::MAX - 10);
+        assert_eq!(last.holds(7, u64::MAX - 1), Some(Paused::TwoHours { until: u64::MAX }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write of ours that the other copy's spend took the coin of is
+    /// counted by when the write was made: lost before the two hours ended,
+    /// it is the time they are for, whenever the chain's word on it comes,
+    /// in whichever era. Only a write made after them, and so after the
+    /// fresh watch, is a second time.
+    #[test]
+    fn a_write_made_before_the_two_hours_ended_is_the_first_time_whenever_it_is_learned_lost() {
+        let mut pause = ForeignPause::in_memory();
+        assert!(pause.note(7, T0, coin(1)));
+        let until = T0 + FOREIGN_PAUSE_SECS;
+        pause.watch_renewed();
+        // Learned after the two hours, of writes made before the count,
+        // while they ran, and at their last second; in this era or the next.
+        let later = until + 3 * HOUR;
+        for (n, era, made) in [(2, 7, T0 - 600), (3, 7, T0 + 60), (4, 8, until - 1)] {
+            assert!(!pause.note_made(era, later, coin(n), made), "made at {made}: the first time still");
+            assert_eq!(pause.holds(era, later), None, "and nothing holds for it");
+        }
+        // Each was taken, so told of again it counts nothing.
+        assert!(!pause.note(7, later, coin(3)));
+        // A write made once they had ended is the second time.
+        assert!(pause.note_made(7, later, coin(5), until));
+        assert_eq!(pause.holds(7, later), Some(Paused::UntilNextEra));
+        // With nothing on record, when the write was made is no matter.
+        let mut none = ForeignPause::in_memory();
+        assert!(none.note_made(7, T0, coin(1), 0));
+        assert_eq!(none.holds(7, T0), Some(Paused::TwoHours { until }));
     }
 
     /// When the two hours end the lease's watch is to start afresh, once
@@ -495,9 +612,11 @@ mod tests {
         let until = T0 + FOREIGN_PAUSE_SECS;
         assert!(!pause.watch_due(T0) && !pause.watch_due(until - 1), "not while the two hours run");
         assert!(pause.watch_due(until) && pause.watch_due(until + 60), "due from their end, until it is done");
+        assert_eq!(pause.holds(7, until + 60), Some(Paused::TwoHours { until }), "and the pause holds until it is");
         assert!(ForeignPause::load(&path, KEYS).watch_due(until), "a restart before it was done finds it due");
         pause.watch_renewed();
         assert!(!pause.watch_due(until + 60), "done once");
+        assert_eq!(pause.holds(7, until + 60), None, "and the pause is over");
         assert!(!ForeignPause::load(&path, KEYS).watch_due(until + 60), "and a restart knows");
         // A second one holds the era: nothing is renewed for it.
         assert!(pause.note(7, until + 120, coin(2)));
@@ -517,6 +636,8 @@ mod tests {
         assert!(started.contains("for two hours") && started.contains("Stop the other copy"), "{started}");
         assert_eq!(pause.say(7, T0 + 60), None, "and not again while it holds");
         let ended = T0 + FOREIGN_PAUSE_SECS;
+        assert_eq!(pause.say(7, ended), None, "nor at the two hours' end, while the watch is not afresh");
+        pause.watch_renewed();
         assert_eq!(pause.say(7, ended).as_deref(), Some(PAUSE_OVER_LINE), "its end is said");
         assert_eq!(pause.say(7, ended + 60), None);
         assert!(pause.note(7, ended + 120, coin(2)));
@@ -564,8 +685,8 @@ mod tests {
         let mut again = ForeignPause::load(&path, KEYS);
         assert_eq!(again.holds(7, T0 + 60), Some(Paused::TwoHours { until: T0 + FOREIGN_PAUSE_SECS }), "a restart does not end it");
         assert!(again.say(7, T0 + 60).is_some(), "and the new run says it holds");
-        assert!(!again.note(7, T0 + 60, coin(1)), "the coin it was counted by is remembered across the restart");
         let later = T0 + 3 * HOUR;
+        assert!(!again.note(7, later, coin(1)), "the coin it was counted by is remembered across the restart: after the two hours, where a new coin counts");
         assert!(again.note(7, later, coin(2)));
         assert_eq!(ForeignPause::load(&path, KEYS).holds(7, later), Some(Paused::UntilNextEra));
         // The file names the coins and nothing of a key but the text it was

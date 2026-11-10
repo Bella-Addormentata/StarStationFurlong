@@ -1703,10 +1703,13 @@ impl WalletLease {
     /// hours of a pause for another copy of this station end
     /// ([`renew_watch`], stage 4 design §10): what that copy spent before
     /// then was what the pause was for, and only a spend it makes after the
-    /// listing's next write counts as a second time.
-    pub fn watch_afresh(&self) {
+    /// listing's next write counts as a second time. `Err` when the save
+    /// failed: the file still says the watch is the old one, which a
+    /// restart would look with, so the caller holds its writes and asks
+    /// again.
+    pub fn watch_afresh(&self) -> std::io::Result<()> {
         self.own.lock().unwrap().watching = false;
-        self.persist_or_log("a fresh watch on a listing key's spent coins");
+        self.persist()
     }
 
     /// Settle the parked spends against the chain and the mempool: ask the
@@ -5099,10 +5102,12 @@ pub(crate) fn listing_word(
 /// The pause for another copy of this station that holds at era `era` and
 /// the unix time `now` ([`ForeignPause::holds`], stage 4 design §10), with
 /// the log's line printed when it is not the one last said
-/// ([`ForeignPause::say`]). With no era agreed (`None`) nothing is asked and
-/// nothing holds: no era-bound write goes out then anyway.
+/// ([`ForeignPause::say`]). The two hours are kept to this clock first
+/// ([`ForeignPause::keep_time`]). With no era agreed (`None`) nothing is
+/// asked and nothing holds: no era-bound write goes out then anyway.
 fn paused_now(pause: &mut ForeignPause, era: Option<u64>, now: u64) -> Option<Paused> {
     let era = era?;
+    pause.keep_time(now);
     if let Some(line) = pause.say(era, now) {
         eprintln!("{line}");
     }
@@ -5129,12 +5134,17 @@ const CTX_PAUSE_KEYS: &str = "ssf-chia-foreign-pause-keys-v1";
 /// ([`ForeignPause::load`], stage 4 design §10): the same for the same
 /// wallet words, contact key and network, and for no others, since those
 /// are what the listing's keys come from (§3.2). It is a digest of the
-/// address of era 0's listing key, P(0), which no listing was ever written
-/// from: it gives no address a coin of ours sits at, and it is kept in the
-/// pause's file alone and printed nowhere.
+/// address of the listing key of the last era a number can name
+/// ([`PAUSE_KEYS_ERA`]), which no chain reaches, so no coin of ours ever
+/// sits there; it is one-way besides, kept in the pause's file alone, and
+/// printed nowhere.
 fn pause_keys(root: &crate::chia_burner::BurnerRoot, ck: &[u8; 32]) -> String {
-    hex::encode(blake3::derive_key(CTX_PAUSE_KEYS, &root.presence(ck, 0).puzzle_hash().to_vec()))
+    hex::encode(blake3::derive_key(CTX_PAUSE_KEYS, &root.presence(ck, PAUSE_KEYS_ERA).puzzle_hash().to_vec()))
 }
+
+/// The era whose listing key [`pause_keys`] is made from: one no listing is
+/// written in.
+const PAUSE_KEYS_ERA: u64 = u64::MAX;
 
 /// Start the lease's watch on the listing key's spent coins afresh once the
 /// two hours of a pause for another copy of this station have ended (stage
@@ -5143,15 +5153,26 @@ fn pause_keys(root: &crate::chia_burner::BurnerRoot, ck: &[u8; 32]) -> String {
 /// with a fresh watch: it adopts what the other copy spent while the pause
 /// ran, which is what the pause was for, and stops for none of it. The
 /// lease first, then the pause's own record of it: a stop between the two
-/// does it once more at the next start, and never leaves it undone. `true`
-/// when it was done now.
+/// does it once more at the next start, and never leaves it undone. A
+/// fresh watch the lease could not save is not recorded as done: the pause
+/// holds on ([`ForeignPause::holds`]), so no write looks with a watch a
+/// restart would find as it was, and the next tick asks again. `true` when
+/// it was done now.
 fn renew_watch(lease: &WalletLease, pause: &mut ForeignPause, now: u64) -> bool {
+    pause.keep_time(now);
     if !pause.watch_due(now) {
         return false;
     }
-    lease.watch_afresh();
-    pause.watch_renewed();
-    true
+    match lease.watch_afresh() {
+        Ok(()) => {
+            pause.watch_renewed();
+            true
+        }
+        Err(e) => {
+            eprintln!("⛓️ ChiaHub: the fresh watch after the pause for another copy of this station could not be saved ({e}); the pause holds until it is");
+            false
+        }
+    }
 }
 
 /// Whether the listing's write goes out this tick, the peak's age aside:
@@ -5176,9 +5197,12 @@ fn knock_arm_open(waiting: bool, refused: bool, peak: u32, paced: bool, paused: 
 
 /// The listing's standing as the lease's records tell it ([`listing_word`]),
 /// with a write lost to another copy of this station counted on the pause
-/// by the coin it was lost by ([`ForeignPause::note`], stage 4 design §10):
-/// in `era`, the era the chain is in now, at the unix time `now`. Returns
-/// the word, and whether the write was lost to another copy.
+/// by the coin it was lost by ([`ForeignPause::note_made`], stage 4 design
+/// §10): in `era`, the era the chain is in now, at the unix time `now`, as
+/// a write made when the mark says it was (`last_at`). A write made before
+/// the two hours of a pause ended was lost in the time that pause is for,
+/// however late the chain's word on it comes, and counts nothing more.
+/// Returns the word, and whether the write was lost to another copy.
 fn listing_verdict(
     lease: &WalletLease,
     pause: &mut ForeignPause,
@@ -5190,7 +5214,7 @@ fn listing_verdict(
 ) -> (Option<(crate::chia_resolve::WriteStanding, bool)>, bool) {
     let (word, lost_by) = listing_word(lease, mark, burner_path, word);
     if let Some(coin) = lost_by {
-        pause.note(era, now, coin);
+        pause.note_made(era, now, coin, mark.last_at);
     }
     (word, lost_by.is_some())
 }
@@ -6310,8 +6334,13 @@ pub async fn heartbeat_loop(
         // have ended (§10), the lease's watch starts afresh, before the
         // listing's arm below writes again ([`renew_watch`]). Nothing is
         // due with burner keys off, where nothing is ever counted.
-        if renew_watch(&WALLET_LEASE, &mut foreign_pause, now_unix) {
-            println!("⛓️ ChiaHub: the listing key's spent coins are watched afresh after the pause; what the other copy wrote during it is not counted a second time");
+        // Under the lease's gate, as every writer saves the lease: the
+        // save is then of no parking half made by another task.
+        if foreign_pause.watch_due(now_unix) {
+            let _gate = WALLET_LEASE.lock().await;
+            if renew_watch(&WALLET_LEASE, &mut foreign_pause, now_unix) {
+                println!("⛓️ ChiaHub: the listing key's spent coins are watched afresh after the pause; what the other copy wrote during it is not counted a second time");
+            }
         }
         let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
         let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
@@ -9615,7 +9644,22 @@ mod tests {
         assert!(pause.note(7, 1_000, Bytes32::new([1u8; 32])));
         assert_eq!(paused_now(&mut pause, None, 1_000), None, "no era agreed: nothing is asked");
         assert_eq!(paused_now(&mut pause, Some(7), 1_000), Some(Paused::TwoHours { until: 1_000 + foreign_pause::FOREIGN_PAUSE_SECS }));
-        assert_eq!(paused_now(&mut pause, Some(7), 1_000 + foreign_pause::FOREIGN_PAUSE_SECS), None);
+        let over = 1_000 + foreign_pause::FOREIGN_PAUSE_SECS;
+        assert!(paused_now(&mut pause, Some(7), over).is_some(), "held until the lease's watch is afresh");
+        assert!(renew_watch(&WalletLease::new(), &mut pause, over));
+        assert_eq!(paused_now(&mut pause, Some(7), over), None);
+        // Counted while the clock stood a day ahead: asked with the clock
+        // right again, the two hours run from now, and the watch is not
+        // due until they end.
+        let (mut ahead, mut renewing) = (ForeignPause::in_memory(), ForeignPause::in_memory());
+        for pause in [&mut ahead, &mut renewing] {
+            assert!(pause.note(7, 1_000 + 24 * 3600, Bytes32::new([2u8; 32])));
+        }
+        let from_now = Some(Paused::TwoHours { until: over });
+        assert_eq!(paused_now(&mut ahead, Some(7), 1_000), from_now);
+        assert!(!renew_watch(&WalletLease::new(), &mut renewing, 1_000));
+        assert_eq!(renewing.holds(7, over - 1), from_now, "the watch's asker keeps the clock too");
+        assert!(renew_watch(&WalletLease::new(), &mut renewing, over));
     }
 
     /// A listing's write stopped for a spend by another copy of this station
@@ -9738,6 +9782,7 @@ mod tests {
         assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + 60).1);
         assert_eq!(pause.holds(era, t0 + 60), two_hours);
         assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS).1);
+        assert!(renew_watch(&lease, &mut pause, t0 + FOREIGN_PAUSE_SECS));
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS), None, "the two hours are over, and the coin is not counted again");
         // What the log says comes next: the pause, only while one holds.
         let waits = "its next write waits for the pause to end";
@@ -9748,8 +9793,19 @@ mod tests {
         let last_era = after_void_words(false, None, false, T11);
         assert!(last_era.starts_with("this edition's listing is due at once"), "{last_era}");
         assert_eq!(after_void_words(true, None, false, T11), last_era);
-        // Another coin lost after the two hours: the era's second.
-        assert!(listing_verdict(&lease, &mut pause, &rewrite(second), true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS + 60).1);
+        // A write made before the two hours ended and learned lost after
+        // them (the node was off meanwhile) was lost in the same time: a
+        // loss, and no second count, in this era or the next.
+        let early = coin_at(burner(), 6);
+        let parking = lease.park_with_bundle([(early.coin_id(), 900)], &spending(&[early]), burner()).unwrap();
+        lease.release(&[parking.spend]);
+        let made_before = NodePublishMark { last_at: t0 + FOREIGN_PAUSE_SECS - 1, ..rewrite(early) };
+        assert!(listing_verdict(&lease, &mut pause, &made_before, true, other_spend(), era + 1, t0 + FOREIGN_PAUSE_SECS + 30).1);
+        assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 30), None);
+        assert_eq!(pause.holds(era + 1, t0 + FOREIGN_PAUSE_SECS + 30), None);
+        // Another write, made after the two hours and lost: the era's second.
+        let made_after = NodePublishMark { last_at: t0 + FOREIGN_PAUSE_SECS, ..rewrite(second) };
+        assert!(listing_verdict(&lease, &mut pause, &made_after, true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS + 60).1);
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 60), Some(Paused::UntilNextEra));
         assert_eq!(pause.holds(era + 1, t0 + FOREIGN_PAUSE_SECS + 60), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -9780,6 +9836,7 @@ mod tests {
         // The same coin stopped for again (a restart that lost the lease's
         // save of the telling): no text, and no second count.
         assert_eq!(listing_not_written(&mut pause, &stopped, true, true, era, t0 + FOREIGN_PAUSE_SECS), None);
+        assert!(renew_watch(&WalletLease::new(), &mut pause, t0 + FOREIGN_PAUSE_SECS));
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS), None);
         // Another coin after the two hours: the era's second.
         let again = anyhow::Error::from(claim_write::ForeignSpend { coin: Bytes32::new([0x5b; 32]) });
@@ -9819,6 +9876,7 @@ mod tests {
         // They end: afresh, saved by both, and once.
         let records = lease_file(&path).own_spends.len();
         let over = t0 + FOREIGN_PAUSE_SECS;
+        assert_eq!(pause.holds(era, over), Some(Paused::TwoHours { until: over }), "the pause holds until the watch is afresh");
         assert!(renew_watch(&lease, &mut pause, over));
         let file = lease_file(&path);
         assert!(!file.own_watching, "the lease's file says the next look is a first one");
@@ -9842,9 +9900,26 @@ mod tests {
         assert_eq!(lease_b.foreign_spends(&[]), vec![]);
         let mut pause_b = ForeignPause::load(&pause_b_path, "5c");
         assert!(pause_b.note(era, t0, id(7)));
-        lease_b.watch_afresh();
+        lease_b.watch_afresh().unwrap();
+        assert_eq!(lease_b.foreign_spends(&[id(8)]), vec![], "the fresh look, before the stop");
+        assert!(lease_file(&lease_b_path).own_watching);
         let mut restarted = ForeignPause::load(&pause_b_path, "5c");
-        assert!(renew_watch(&lease_b, &mut restarted, over) && !lease_file(&lease_b_path).own_watching);
+        assert!(renew_watch(&lease_b, &mut restarted, over), "the pause never recorded it: done once more");
+        assert!(!lease_file(&lease_b_path).own_watching);
+        // A fresh watch the lease cannot save is not taken as done: a
+        // restart would look with the old watch and count the same time
+        // again. The pause holds, and it is asked again until it is saved.
+        let gone = dir.join("gone");
+        let (lease_c, mut pause_c) = (WalletLease::new(), ForeignPause::in_memory());
+        lease_c.restore(&gone.join("wallet_lease.json"), money());
+        assert!(pause_c.note(era, t0, id(7)));
+        assert!(!renew_watch(&lease_c, &mut pause_c, over), "the lease's folder is gone: nothing saved");
+        assert_eq!(pause_c.holds(era, over + 3600), Some(Paused::TwoHours { until: over }), "so the pause holds, however long");
+        assert!(!listing_due(false, ListingStep::Write, true, pause_c.holds(era, over + 3600)));
+        std::fs::create_dir_all(&gone).unwrap();
+        assert!(renew_watch(&lease_c, &mut pause_c, over + 3660), "saved at a later tick");
+        assert!(!lease_file(&gone.join("wallet_lease.json")).own_watching);
+        assert_eq!(pause_c.holds(era, over + 3660), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9861,10 +9936,11 @@ mod tests {
         assert_ne!(keys, pause_keys(&root(9, T11), &other_ck), "another contact key");
         assert_ne!(keys, pause_keys(&root(10, T11), &ck), "other words");
         assert_ne!(keys, pause_keys(&root(9, crate::chia_network::ChiaNet::Mainnet), &ck), "another network");
-        let address = root(9, T11).presence(&ck, 0).puzzle_hash();
-        assert_eq!(keys, hex::encode(blake3::derive_key("ssf-chia-foreign-pause-keys-v1", &address.to_vec())), "a digest of era 0's listing address");
+        let address = root(9, T11).presence(&ck, u64::MAX).puzzle_hash();
+        assert_eq!(keys, hex::encode(blake3::derive_key("ssf-chia-foreign-pause-keys-v1", &address.to_vec())), "a digest of the listing address of an era no chain reaches");
         assert_eq!(keys.len(), 64);
         assert_ne!(keys, hex::encode(address), "not the address itself");
+        assert_ne!(keys, hex::encode(blake3::derive_key("ssf-chia-foreign-pause-keys-v1", &root(9, T11).presence(&ck, 0).puzzle_hash().to_vec())), "nor of era 0's, a live key on a new chain");
     }
 
     /// Stage 4 design §4.4 with #272 review round 10: the payer goes wherever
