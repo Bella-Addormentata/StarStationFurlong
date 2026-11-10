@@ -205,7 +205,9 @@ pub const MAX_ROUNDS: usize = 8;
 /// [`crate::chia_peer::DIAL_TIMEOUT`] each, inside this, while addresses that
 /// take the connection and then stall (each later stage has
 /// [`CONNECT_TIMEOUT`] of its own) do not hold a request for minutes. The
-/// round under way when it runs out is finished and judged.
+/// dial under way when it runs out is finished and judged; a round that ran
+/// out of it waiting, for its turn at discovery or for its refill's lookups
+/// and gossip answers, starts no dial.
 pub const DISCOVERY_BUDGET: Duration = Duration::from_secs(40);
 /// How long a public address that failed or disagreed is left alone.
 pub const RETRY_AFTER: Duration = Duration::from_secs(600);
@@ -768,6 +770,7 @@ impl Lane {
         self.refuse_if_closed()?;
         let pinned = !self.pins.is_empty();
         let started = Instant::now();
+        let spent = || started.elapsed() >= self.budget;
         // One pass more than there are dial rounds: the peers the LAST round
         // reached are judged like any other before the request gives up.
         for round in 0..=MAX_ROUNDS {
@@ -800,7 +803,7 @@ impl Lane {
             if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
             }
-            if self.pin_only || round == MAX_ROUNDS || started.elapsed() >= self.budget {
+            if self.pin_only || round == MAX_ROUNDS || spent() {
                 // Nothing public is ever dialled in pin-only mode; otherwise
                 // the dial rounds are spent, or the time a request may spend
                 // on them ([`DISCOVERY_BUDGET`]).
@@ -812,7 +815,18 @@ impl Lane {
             if let Some(set) = self.choose_now(trust).await? {
                 return Ok(set);
             }
+            // The wait for the turn counts against the request's time, and
+            // so does the refill below (a name lookup, a gossip answer that
+            // is slow to come): out of time after either, no dial is started.
+            if spent() {
+                break;
+            }
             self.refill(trust).await;
+            if spent() {
+                // What the refill changed without a dial is still chosen
+                // from: the next pass chooses, and stops there if it cannot.
+                continue;
+            }
             // A refill can change the pool without a dial (a connected stored
             // peer the introducer named is fresh now), so the round is spent
             // only when there was nothing to dial AND nothing new to choose.
@@ -6645,6 +6659,66 @@ mod tests {
         assert!(err.to_string().contains("fewer than two"), "{err}");
         assert!(hurried.dialled.borrow().is_empty(), "nothing was dialled");
         assert_eq!(hurried.state.lock().await.candidates.len(), 2, "both wait for a request with time to spend");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_time_ran_out_waiting_its_turn_dials_no_further() {
+        // Discovery is one requester at a time, and the wait for the turn is
+        // the request's own time: a money read that got its turn after its
+        // time had run out dials nobody, A and B still queued.
+        let a = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let budget = Duration::from_millis(200);
+        let waiting = Arc::new(
+            Lane::new(net(), vec![], false, None)
+                .with_candidates(vec![(a.addr, Source::Introducer), (b.addr, Source::Gossip)])
+                .with_tls(TLS.clone())
+                .with_budget(budget),
+        );
+        let turn = waiting.discovery.lock().await;
+        let money = PeerLane::new(waiting.clone(), Trust::Agreed);
+        let (read, ()) = tokio::join!(money.coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None), async {
+            // Another requester holds the turn for twice the request's time.
+            tokio::time::sleep(budget * 2).await;
+            drop(turn);
+        });
+        let err = read.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert!(waiting.dialled.borrow().is_empty(), "nothing was dialled");
+        let state = waiting.state.lock().await;
+        assert_eq!(state.candidates.len(), 2, "both wait for a request with time to spend");
+        // Nor was a refill started, which could ask the introducer and every
+        // peer for addresses: its first act is to read the store.
+        assert!(!state.store_loaded, "no refill was started");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_time_ran_out_in_the_refill_dials_no_further() {
+        // A takes the connection at once and is then slow to answer the
+        // gossip request: the time a request may spend runs out while its
+        // refill waits for the answer, so B, which the answer names, is
+        // queued and left for the next request.
+        let b = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let budget = Duration::from_millis(400);
+        let answers = node(vec![state(1, 90, None)], (1, None), vec![b.addr]);
+        let slow_gossip: Handler = Arc::new(move |m: &Message| {
+            if m.msg_type == chia_protocol::ProtocolMessageTypes::RequestPeers {
+                // The answer leaves once twice the request's time has passed,
+                // whatever thread the mock answers on.
+                std::thread::sleep(budget * 2);
+            }
+            answers(m)
+        });
+        let a = spawn("mocknet", NodeType::FullNode, genesis(), Some(peak_at(100)), slow_gossip).await;
+        let slow = Arc::new(
+            Lane::new(net(), vec![], false, None).with_candidates(vec![(a.addr, Source::Introducer)]).with_tls(TLS.clone()).with_budget(budget),
+        );
+        let err = PeerLane::new(slow.clone(), Trust::Agreed).coin_records_by_hint(Bytes32::new([9u8; 32]), None, true, None).await.unwrap_err();
+        assert!(err.to_string().contains("fewer than two"), "{err}");
+        assert_eq!(slow.dialled.borrow().iter().map(|(addr, _)| *addr).collect::<Vec<_>>(), vec![a.addr], "only A was dialled");
+        let state = slow.state.lock().await;
+        assert!(state.candidates.iter().any(|c| c.addr == b.addr), "B is queued for the next request");
+        assert!(!state.cooling.contains_key(&b.addr), "and was not tried");
     }
 
     #[test]
