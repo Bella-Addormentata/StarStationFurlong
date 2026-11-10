@@ -1432,22 +1432,33 @@ fn load_configured_relays_from_env() -> Vec<String> {
 // rung: a room now survives not just a closed browser but a NODE RESTART —
 // the owner's machine reboots and visitors still get the room. Corrupt or
 // unreadable files fail OPEN (fresh doc, logged), never fatal.
+//
+// 🔒 A room's document holds the room key, so its file is owner-only on Unix
+// (private_file::write_private_in_place): made 0600, and one an older build
+// left to the umask is tightened when it is rewritten and when it is loaded.
+// The folder itself is left as it was made, so the file names (the room ids,
+// in hex) stay listable there.
 
 const ROOMS_DIR: &str = "rooms";
 
 /// Room ids are user-influenced strings — hex-encode for a filesystem-safe,
 /// reversible filename.
-fn room_doc_path(room_id: &str) -> std::path::PathBuf {
-    std::path::Path::new(ROOMS_DIR).join(format!("{}.bin", hex::encode(room_id.as_bytes())))
+fn room_doc_path(dir: &std::path::Path, room_id: &str) -> std::path::PathBuf {
+    dir.join(format!("{}.bin", hex::encode(room_id.as_bytes())))
 }
 
 /// Write one room's full-state snapshot. Best-effort: failures log and drop.
 fn persist_room_doc(room_id: &str, snapshot: &[u8]) {
-    if let Err(e) = std::fs::create_dir_all(ROOMS_DIR) {
-        eprintln!("💾 room persist: cannot create {ROOMS_DIR}/: {e}");
+    persist_room_doc_in(std::path::Path::new(ROOMS_DIR), room_id, snapshot)
+}
+
+/// [`persist_room_doc`] in `dir`, which the tests name.
+fn persist_room_doc_in(dir: &std::path::Path, room_id: &str, snapshot: &[u8]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("💾 room persist: cannot create {}/: {e}", dir.display());
         return;
     }
-    if let Err(e) = std::fs::write(room_doc_path(room_id), snapshot) {
+    if let Err(e) = private_file::write_private_in_place(&room_doc_path(dir, room_id), snapshot) {
         eprintln!("💾 room persist: write failed for {room_id}: {e}");
     }
 }
@@ -1455,8 +1466,13 @@ fn persist_room_doc(room_id: &str, snapshot: &[u8]) {
 /// Load every persisted room doc at startup → (room_id, snapshot) pairs.
 /// Malformed filenames / unreadable files are skipped with a log line.
 fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
+    load_persisted_rooms_in(std::path::Path::new(ROOMS_DIR))
+}
+
+/// [`load_persisted_rooms`] from `dir`, which the tests name.
+fn load_persisted_rooms_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir(ROOMS_DIR) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return out, // no dir yet — first run
     };
@@ -1471,12 +1487,79 @@ fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
             }
         };
         match std::fs::read(entry.path()) {
-            Ok(bytes) if !bytes.is_empty() => out.push((room_id, bytes)),
-            Ok(_) => {}
+            Ok(bytes) => {
+                // 🔒 A document an older build wrote was left to the umask,
+                // and a room nobody changes again is never rewritten:
+                // tightened as it is loaded. A failure is said, and the
+                // room still loads.
+                if let Err(e) = private_file::tighten_private(&entry.path()) {
+                    eprintln!("💾 room persist: could not make {name} readable by its owner only ({e})");
+                }
+                if !bytes.is_empty() {
+                    out.push((room_id, bytes));
+                }
+            }
             Err(e) => eprintln!("💾 room persist: unreadable {name}: {e}"),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod room_doc_tests {
+    use super::*;
+
+    /// A room's document holds the room key (docs/TDD/ChiaLanePrivacy.md
+    /// §9): its file is saved owner-only, one an older build left to the
+    /// umask is tightened when it is rewritten and when it is loaded, and
+    /// what loads back is what was saved, under the room's own id.
+    #[test]
+    fn a_room_document_is_saved_owner_only_and_loads_back() {
+        let dir = std::env::temp_dir().join(format!("ssf-rooms-{}", rand::random::<u64>()));
+        let rooms = dir.join("rooms");
+        #[cfg(unix)]
+        let mode = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        #[cfg(unix)]
+        let broaden = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        assert!(load_persisted_rooms_in(&rooms).is_empty(), "no folder yet: a first run");
+        persist_room_doc_in(&rooms, "home/one", b"snapshot one, the longer");
+        persist_room_doc_in(&rooms, "two", b"snapshot two");
+        let one = room_doc_path(&rooms, "home/one");
+        let two = room_doc_path(&rooms, "two");
+        assert_eq!(one, rooms.join(format!("{}.bin", hex::encode("home/one"))), "the id in hex, so no room id leaves the folder");
+        #[cfg(unix)]
+        assert_eq!((mode(&one), mode(&two)), (0o600, 0o600), "a new document is owner-only");
+        // A document an older build wrote: tightened by the next save,
+        // which replaces it whole...
+        #[cfg(unix)]
+        broaden(&one);
+        persist_room_doc_in(&rooms, "home/one", b"snapshot one");
+        assert_eq!(std::fs::read(&one).unwrap(), b"snapshot one");
+        #[cfg(unix)]
+        assert_eq!(mode(&one), 0o600, "a broader document is owner-only after a save");
+        // ...and one of a room nobody changes again, by the load.
+        #[cfg(unix)]
+        broaden(&two);
+        // An empty document and a file that is no room's are passed over.
+        std::fs::write(room_doc_path(&rooms, "empty"), b"").unwrap();
+        std::fs::write(rooms.join("not-hex.bin"), b"x").unwrap();
+        std::fs::write(rooms.join("notes.txt"), b"x").unwrap();
+        let mut loaded = load_persisted_rooms_in(&rooms);
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            vec![("home/one".to_string(), b"snapshot one".to_vec()), ("two".to_string(), b"snapshot two".to_vec())]
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&two), 0o600, "a broader document is owner-only after a load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 🔒 The node's iroh key, kept as `contact.key` is (stage 4 design §4.5):

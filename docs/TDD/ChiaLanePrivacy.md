@@ -2,7 +2,7 @@
 
 > **Purpose:** the one place that says what a Star Station node writes to the Chia chain, what it asks Chia full nodes, what it keeps on disk about both, and what each kind of observer can learn from that. It is the written form of the mainnet privacy gate ([#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) P8, [#335](https://github.com/Bella-Addormentata/StarStationFurlong/issues/335) stage 4). §6 lists what the gate does not hide, and §10 is the review that has to pass before mainnet opens to players.
 >
-> **As of:** main after [#415](https://github.com/Bella-Addormentata/StarStationFurlong/pull/415), 2026-11-10. **Proven so far:** the node's reads have met real full nodes on testnet11 and mainnet ([#412](https://github.com/Bella-Addormentata/StarStationFurlong/pull/412)). No write of the burner path has: it has run on the mock chain only (`chia_peer/mock`, `chia_publish/chain_tests.rs`), and the two-machine drill has not happened. Mainnet exists only in a development build (the `chia-mainnet` cargo feature, which the release workflow never builds). A statement marked **inferred** is reasoned from Chia's rules, not observed.
+> **As of:** main after [#416](https://github.com/Bella-Addormentata/StarStationFurlong/pull/416), 2026-11-10. **Proven so far:** the node's reads have met real full nodes on testnet11 and mainnet ([#412](https://github.com/Bella-Addormentata/StarStationFurlong/pull/412)). No write of the burner path has: it has run on the mock chain only (`chia_peer/mock`, `chia_publish/chain_tests.rs`), and the two-machine drill has not happened. Mainnet exists only in a development build (the `chia-mainnet` cargo feature, which the release workflow never builds). A statement marked **inferred** is reasoned from Chia's rules, not observed.
 >
 > **Rule:** a change to what the node writes to the chain, asks of a full node, or stores about either updates this file in the same PR.
 
@@ -202,7 +202,7 @@ So on testnet11 today nothing in §5 is in effect unless the operator sets the f
 
 ## 9. On this computer
 
-The data folder is the node's working directory. Its secret and state files are written owner-only (mode 0600) on Linux and macOS (`write_private` in `private_file.rs`); on Windows the node sets no rule of its own and the folder's own permissions apply. Three kinds of file are written without that step: `wallet_lease.json`, `chia_peers.json` and the room documents in `rooms/`. On mainnet the first two sit in `chia-mainnet/`, a folder the node makes owner-only (mode 0700, `make_state_dir`); on testnet11 they sit in the data root.
+The data folder is the node's working directory. Its secret and state files are written owner-only (mode 0600) on Linux and macOS (`write_private`, `write_private_replacing` and `write_private_in_place` in `private_file.rs`); on Windows the node sets no rule of its own and the folder's own permissions apply. A file system that keeps no modes (FAT, exFAT) keeps none here either. Three kinds of file were written without that step by older builds: `wallet_lease.json`, `chia_peers.json` and the room documents in `rooms/`. One of them left readable by other accounts is made owner-only when the node next writes it, and when it next reads it: the room documents at start, `chia_peers.json` when the node first looks for full nodes, `wallet_lease.json` when a wallet loads. The `rooms/` folder itself stays as it was made, so whoever can list it sees its file names, which are the room ids in hex. On mainnet the per-network files sit in `chia-mainnet/`, a folder the node makes owner-only (mode 0700, `make_state_dir`); on testnet11 they sit in the data root.
 
 | File | Where | Holds |
 |---|---|---|
@@ -210,15 +210,15 @@ The data folder is the node's working directory. Its secret and state files are 
 | `contact.key` | Data root, both networks | The contact key: 32 random bytes. It finds and opens every listing of this station. |
 | `peers.json` | Data root, both networks | Up to 512 other stations: node id, their contact key and card key, the rooms each was met in, when it was last reached, knock times. |
 | `rooms/<room id>.cap` | Data root | A room's key and its switches (Chia mesh, public or private, SHARE CARD). |
-| `rooms/<room id>.bin` | Data root | The room's document, with the room key in it. Written without the owner-only step. |
+| `rooms/<room id>.bin` | Data root | The room's document, with the room key in it. |
 | `chia_lane_off.json` | Data root | The CHIA off switch. |
 | `chia_identity.json` | Per network | The SSF wallet: the entropy of its 24 words. In the clear (`protect: "none"`) until the player marks the words saved. The node then locks it with DPAPI on Windows or the login keychain on macOS. It stays in the clear on Linux, with `SSF_WALLET_AT_REST=none` (which leaves a file already locked as it is), and whenever the lock does not land: a locked keychain, a folder on exFAT or FAT, another node holding the file. The log then says the file "stays in the clear for now", and the node tries again at its next start (`chia_at_rest.rs`, `chia_wallet.rs`). An older `chia_identity.seed`, and the `chia_identity.seed.retired-<time>` copy the node keeps when it retires one, is a raw seed. |
 | `chia_wallet.json`, `chia_words_saved.json`, `chia_listing.json` | Per network | The wallet's switch, the mark that the words were saved, LIST ME. Nothing secret. |
-| `wallet_lease.json` | Per network | Parked coins and, for each spend still settling, the whole signed bundle and the address that paid. Written without the owner-only step. |
+| `wallet_lease.json` | Per network | Parked coins and, for each spend still settling, the whole signed bundle and the address that paid. |
 | `publish_marks.json`, `beacon_mark.json` | Per network | The last listing and beacon: era, hint, coin id, node id, the paying address, and for the listing its address set in the clear. |
 | `knocks.json` | Per network | Knocks sent (host, room, era, hint, coin, paying address) and knocks received (from whom, room, era), in the clear: two eras of them, 256 of each at most. |
 | `gift_fuse.json`, `foreign_pause.json`, `beacon_pushed.json` | Per network | The puzzle hashes of the burners funded this era; the other-copy pause; the date of the last beacon push. |
-| `chia_peers.json` | Per network | The full nodes this station used. Written without the owner-only step. |
+| `chia_peers.json` | Per network | The full nodes this station used. |
 
 "Per network" is the bare name on testnet11 and `chia-mainnet/<name>` on mainnet (`ChiaNet::path` in `chia_network.rs`).
 
@@ -231,7 +231,7 @@ The data folder is the node's working directory. Its secret and state files are 
 
 **The 24 words do not restore a station.** They bring the money back in Sage or the Chia wallet. The node has no restore-from-words screen (`Mnemonic::parse_normalized` is called only in tests), and the words do not bring back `iroh_node_id.key`, `contact.key` or `peers.json`.
 
-**The log.** By default the node prints, at start, the station's node id and the SSF wallet's receive address and key fingerprint, which ties the node id to the money address in one file. It also prints the first 16 hex digits of each hint it writes under, the node ids of hosts, knockers and contacts (some shortened, a host's in full when a dial runs out of routes), room ids, the address of each full node it dials, a coin id on TAKE, and on a failed wallet-paid write the wallet's puzzle hash. It never prints the address or puzzle hash of a listing key or a knock key unless `SSF_CHIA_AUDIT=1`. The beacon key is the exception: with the beacon lit on testnet11 and burners off, the start line prints its address so that the operator can fund it, and a failed beacon write prints its puzzle hash. It is the same key on the burner path.
+**The log.** By default the node prints, at start, the station's node id and the SSF wallet's key fingerprint. On a test network it also prints the wallet's receive address, which is how a node run without a page is funded, and which ties the node id to that address in one file. Off a test network it prints no address of the wallet and says the Bank shows it (`receive_line` and `retired_line` in `chia_wallet.rs`). It also prints the first 16 hex digits of each hint it writes under, the node ids of hosts, knockers and contacts (some shortened, a host's in full when a dial runs out of routes), room ids, the address of each full node it dials, a coin id on TAKE, and on a failed wallet-paid write the wallet's puzzle hash (on a test network only: off one the wallet pays for no write and none is tried). It never prints the address or puzzle hash of a listing key or a knock key unless `SSF_CHIA_AUDIT=1`. The beacon key is the exception: with the beacon lit on testnet11 and burners off, the start line prints its address so that the operator can fund it, and a failed beacon write prints its puzzle hash. It is the same key on the burner path.
 
 **The local page.** The node answers `/api/fingerprint` on 127.0.0.1 with, among other things, the node id, the wallet's receive address while a wallet is loaded, and the state of the listing, the wallet and the switches. The allowlist of origins decides which browser pages may read it; any program on the computer can. On a test network, in a run the desktop app did not start and only where the operator listed a page in `SSF_BANK_DEV_PAGES`, any program on the computer that sends that page's origin is answered with the 24 words until they are marked saved (`app_page` in `chia_wallet_switch.rs` names this as a known gap, accepted for testnet).
 
@@ -286,8 +286,7 @@ A one-off developer review of what the chain actually shows. The game never depe
 - With burners on on testnet11, a room's v1 record is still paid by the wallet and not spaced, which pairs the listing key with the wallet's address by time (§7). It goes with the v1 writer.
 - The hint rule and the gift fuse rest on local files, not on the chain (§5, §7).
 - `SSF_CHIA_RESOLVE_TEST=1` still reads a fixed test hint on mainnet.
-- The default log prints the wallet's receive address, and its puzzle hash on a failed write.
-- `wallet_lease.json` (signed bundles and the addresses that paid), `chia_peers.json` and the room documents are written without the owner-only step. On testnet11 the first two sit in the data root.
+- On a test network the default log prints the wallet's receive address at start, and its puzzle hash on a failed wallet-paid write (§9). Off a test network it prints neither.
 - Pin-only mode with no pin is ignored silently.
 
 ## 12. Where this comes from
