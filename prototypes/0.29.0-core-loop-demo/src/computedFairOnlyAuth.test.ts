@@ -585,6 +585,37 @@ describe('ends and end orders (S5, S7)', () => {
     // no base: nothing to hold it against
     expect(resolve('p', [finBy(owner)]).res.fin).toBeNull();
   });
+
+  it('an end order the caller holds stands where the doc has none that does: after the doc\'s own, each one held in turn, and what is no order of a holder\'s passed over', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p'); // u = 3
+    // (at the round of the sale the seller and the buyer both hold the game: an order of either stands)
+    const xf = xferOf(P, owner, buyer, 3);
+    const mine = sealFin(P, owner.pub, owner.sign);
+    const theirs = sealFin(P, buyer.pub, buyer.sign);
+    const strangers = sealFin(P, stranger.pub, stranger.sign);
+    const forged = { ...mine.value, g: BAD_SIG };
+    const held = (entries: Entry[], fins: unknown[] | undefined, hold: string[] = []) =>
+      resolveGame(authEnv({ hold }).env, T, P.inc, { ...recordsOf(entries), fins });
+    expect(held([root, trim], [mine.value])).toMatchObject({ fin: mine.value, live: true, pending: false, invalid: [] });
+    // the doc's own is named before one held
+    expect(held([root, trim, xf, theirs], [mine.value]).fin).toEqual(theirs.value);
+    expect(held([root, trim, xf, mine], [theirs.value]).fin).toEqual(mine.value);
+    // what the doc has at the key does not stand: the one held does
+    expect(held([root, trim, { key: mine.key, value: { junk: 1 } }], [mine.value]).fin).toEqual(mine.value);
+    expect(held([root, trim, strangers], [mine.value]).fin).toEqual(mine.value);
+    expect(held([root, trim, { key: mine.key, value: forged }], [mine.value]).fin).toEqual(mine.value);
+    // among those held: junk, nothing, a stranger's and a forged one are passed over, and the first that stands is named
+    expect(held([root, trim, xf], [{ junk: 1 }, undefined, strangers.value, forged, theirs.value, mine.value]).fin).toEqual(theirs.value);
+    expect(held([root, trim], [forged]).fin).toBeNull();
+    expect(held([root, trim], [strangers.value]).fin).toBeNull();
+    // one put off is no end order yet
+    expect(held([root, trim], [mine.value], [hashOf(mine)])).toMatchObject({ fin: null, pending: true });
+    // none held, and no base to hold one against
+    expect(held([root, trim], []).fin).toBeNull();
+    expect(held([root, trim], undefined).fin).toBeNull();
+    expect(held([], [mine.value]).fin).toBeNull();
+  });
 });
 
 describe('what is not yet checked (pending)', () => {
@@ -804,6 +835,50 @@ describe('who decides a round (houseAt)', () => {
     expect(held.res.houseAt(house2.pub, 1)).toBeUndefined();
     expect(held.res.houseAt(house.pub, 1), 'the root\'s own is checked with the root').toBe(true);
     expect(held.res.houseAt(stranger.pub, 1), 'no delegation at all: no').toBe(false);
+  });
+
+  it('says which delegation it goes by (houseBy): the value it was given, with its hash; none where the house is not one, and not yet while one that could be it is put off', () => {
+    const root = rootOf(P, 'p');
+    const ours = delegation(owner, house2.pub);
+    const { res } = resolve('p', [root], { delegations: [ours] });
+    // the room's: the very value the caller gave, which it may hold and compare with what the doc holds later
+    expect(res.houseBy(house2.pub, 1)?.value).toBe(ours);
+    expect(res.houseBy(house2.pub, 1)?.hash).toBe(recHash(ours));
+    // the one the game's own checkpoint carries
+    expect(res.houseBy(house.pub, 1)).toEqual({ value: root.value.dl, hash: recHash(root.value.dl) });
+    expect(res.houseBy(house.pub, 0), 'there is no round 0').toBeNull();
+    expect(res.houseBy(stranger.pub, 1), 'a house nobody delegated').toBeNull();
+    // a forged one is none, and one put off is none yet
+    const forged = { ...ours, g: BAD_SIG };
+    expect(resolve('p', [root], { delegations: [forged] }).res.houseBy(house2.pub, 1)).toBeNull();
+    const held = resolve('p', [root], { delegations: [ours], hold: [recHash(ours) as string] });
+    expect(held.res.houseAt(house2.pub, 1)).toBeUndefined();
+    expect(held.res.houseBy(house2.pub, 1)).toBeUndefined();
+    expect(held.res.houseBy(stranger.pub, 1), 'no delegation at all: none, and nothing waited for').toBeNull();
+    // one put off does not hide one that holds: that one is the one gone by
+    const good = delegation(owner, house2.pub);
+    const beside = resolve('p', [root], { delegations: [forged, good], hold: [recHash(forged) as string] });
+    expect(beside.res.houseBy(house2.pub, 1)?.value).toBe(good);
+    // a game with nothing readable has no house
+    expect(resolve('p', []).res.houseBy(house.pub, 1)).toBeNull();
+  });
+
+  it('goes by the delegation the holder of the round signed, of two of one house, and by the room\'s copy before a checkpoint\'s', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p');
+    const xf = xferOf(P, owner, buyer, 3);
+    const sellers = delegation(owner, house2.pub);
+    const buyers = delegation(buyer, house2.pub);
+    // the buyer's first: the order they are given in does not say which round each is for
+    const { res } = resolve('p', [root, trim, xf], { delegations: [buyers, sellers] });
+    expect(res.holder).toBe(buyer.pub);
+    expect(res.houseBy(house2.pub, 3)?.value, 'the round of the sale is the seller\'s').toBe(sellers);
+    expect(res.houseBy(house2.pub, 4)?.value, 'the round after it is the buyer\'s').toBe(buyers);
+    // the buyer's house's own checkpoint carries the buyer's delegation; a copy of it the room holds is given first
+    const adoption = trimOf(P, 'p', { u: 3, k: house2.pub, dl: buyers, x: [xf.value] });
+    const copy = { ...buyers };
+    expect(resolve('p', [root, trim, xf, adoption]).res.houseBy(house2.pub, 4)).toEqual({ value: buyers, hash: recHash(buyers) });
+    expect(resolve('p', [root, trim, xf, adoption], { delegations: [copy] }).res.houseBy(house2.pub, 4)?.value).toBe(copy);
   });
 });
 

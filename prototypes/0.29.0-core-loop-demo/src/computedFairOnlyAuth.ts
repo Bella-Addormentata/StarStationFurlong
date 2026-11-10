@@ -101,6 +101,10 @@ export interface AuthRecords {
   cks: Iterable<readonly [string, unknown]>;
   xfs: Iterable<readonly [string, unknown]>;
   fin?: unknown;
+  /** More end orders to look at as `fin` is: ones the caller counted before and
+   *  keeps while the doc has lost them (a page holds what its game stood on, and
+   *  puts it back). An order proves itself, so where it comes from is nothing. */
+  fins?: Iterable<unknown>;
   delegations?: Iterable<unknown>;
 }
 
@@ -150,6 +154,16 @@ export interface Resolution {
    *  delegated by the key that holds the game for that round. `undefined`
    *  while the delegation's signature is put off. */
   houseAt(pub: string, round: number): boolean | undefined;
+  /** The delegation that makes `pub` a house of round `round` (houseAt is this
+   *  asked yes or no): the first of those this resolution was given (the room's,
+   *  the caller's own, and the ones the game's readable checkpoints carry, in
+   *  that order) that the key holding the game for `round` signed and whose
+   *  check passes, as it was given, with its hash. Null for none; `undefined`
+   *  while one that could be it waits for its check. A caller that keeps what
+   *  its counts stand on asks this, once, and keeps the answer: where the
+   *  resolution found it may be gone from the doc the next time the game is
+   *  resolved, and a second asking may find its verdict let go of. */
+  houseBy(pub: string, round: number): { value: DelegationRec; hash: string } | null | undefined;
 }
 
 // ── Reading ──────────────────────────────────────────────────────────────────
@@ -195,6 +209,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   const none = (): Resolution => ({
     t, inc, letter, newer, name, chain: [], holder: null, base: null, fin: null, live: false, invalid: [], pending: false,
     houseAt: () => false,
+    houseBy: () => null,
   });
   if (name === null) return none();
 
@@ -328,8 +343,10 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   if (base) {
     const finCandidates: FinRec[] = [];
     if (base.ck.f) finCandidates.push(base.ck.f);
-    const own = asFin(rec.fin);
-    if (own) finCandidates.push(own);
+    for (const raw of [rec.fin, ...(rec.fins ?? [])]) {
+      const own = asFin(raw);
+      if (own) finCandidates.push(own);
+    }
     for (const f of finCandidates) {
       if (!holds(f.k, base.ck.u)) continue;
       const fh = recHash(f);
@@ -352,7 +369,7 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   for (const raw of rec.delegations ?? []) addDelegation(raw);
   for (const c of readable) if (c.ck.dl) addDelegation(c.ck.dl);
 
-  const houseAt = (pub: string, round: number): boolean | undefined => {
+  const houseBy = (pub: string, round: number): { value: DelegationRec; hash: string } | null | undefined => {
     let waitingOn = false;
     for (const { d, hash } of delegations) {
       if (d.h !== pub) continue;
@@ -360,15 +377,19 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
       const holder = chain.some((h, i) => h.k === d.k && h.from < round && (i + 1 === chain.length || round <= chain[i + 1].from));
       if (!holder) continue;
       const v = env.sig(sigId('hkey', t, inc, hash), d.k, () => roomSignBytes('hkey', env.room, '', d), d.g);
-      if (v === true) return true;
+      if (v === true) return { value: d, hash };
       if (v === undefined) waitingOn = true;
     }
-    return waitingOn ? undefined : false;
+    return waitingOn ? undefined : null;
+  };
+  const houseAt = (pub: string, round: number): boolean | undefined => {
+    const by = houseBy(pub, round);
+    return by === undefined ? undefined : by !== null;
   };
 
   return {
     t, inc, letter, newer: false, name, chain, holder: chain[chain.length - 1].k, base, fin, live: base !== null && base.ck.e !== 1,
-    invalid: [...invalid].sort(), pending, houseAt,
+    invalid: [...invalid].sort(), pending, houseAt, houseBy,
   };
 }
 
