@@ -3044,7 +3044,8 @@ pub(crate) fn money_listing_step(
 /// neither none nor the money key's text `money`. Every other mark leaves
 /// the step as it always was, so no root is made for it. The root is made
 /// from the wallet key `wallet` on `net` (§3.2) and dropped at once; the
-/// text is a puzzle hash, which no log line prints.
+/// text is a puzzle hash, which no log line prints but the audit's own,
+/// with SSF_CHIA_AUDIT=1 ([`AuditBook::listing`]).
 pub(crate) fn money_path_burner_payer(
     mark: Option<&NodePublishMark>,
     era: u64,
@@ -3209,7 +3210,8 @@ struct BurnerPayerText {
 /// in memory for one run: a restart draws again. Only the slot survives a
 /// restart, since it is derived from the root (stage 4 design §4.3). It has
 /// no `Debug`, since it holds P(e)'s payer text, a puzzle hash no log line
-/// prints.
+/// prints but the audit's own, with SSF_CHIA_AUDIT=1, which derive it
+/// themselves ([`AuditBook::listing`]).
 #[derive(Default)]
 pub(crate) struct ListingClock {
     first: Option<FirstPeak>,
@@ -5208,7 +5210,8 @@ fn knock_arm_open(waiting: bool, refused: bool, peak: u32, paced: bool, paused: 
 /// contact key `ck` make that key now: what a mark must name as its payer
 /// for the loss of its coin to be another copy's ([`listing_word`]). `None`
 /// with burner keys off, which have no root. The text is a puzzle hash,
-/// which no log line prints.
+/// which no log line prints but the audit's own, with SSF_CHIA_AUDIT=1
+/// ([`AuditBook::listing`]).
 fn own_listing_burner(root: Option<&crate::chia_burner::BurnerRoot>, ck: &[u8; 32], mark: &NodePublishMark) -> Option<String> {
     root.map(|root| Payer::of_burner(&root.presence(ck, mark.era)).hex())
 }
@@ -5784,6 +5787,46 @@ pub(crate) fn knock_burner(
     root.knock(&knock_slot(knock_hint(net, req, room_key, era), &req.host), era)
 }
 
+/// The audit's line for a knock's key (stage 4 design §11,
+/// [`AuditBook::knock`]), from what the knock arm's step made of `req` in
+/// `era` on `net` (`done`, [`knock_on_path`]). A line names a knock key
+/// only once the run knows the key has written:
+/// - a knock just written from its own key K(h): the write's own payer;
+/// - a knock the lease still holds, filed again
+///   ([`KnockDone::Refiled`]), whose entry names this host's K(h) of `root`
+///   ([`knock_burner`]) as its payer;
+/// - a knock the chain shows that K(h) already wrote
+///   (`claim_write::AlreadyKnocked`), as one an earlier run wrote reads
+///   when it is asked for again.
+///
+/// Nothing for a knock that waited, failed or was withdrawn, since its key
+/// holds nothing; nothing for one the SSF wallet paid for, written or
+/// filed again, which has no knock key; nothing off the burner path (no
+/// `root`) for a knock not just written; nothing a second time for a key
+/// ([`AuditBook::knock`]); and nothing with the audit off, where no key is
+/// derived.
+fn audit_knock(
+    book: &mut AuditBook,
+    root: Option<&crate::chia_burner::BurnerRoot>,
+    net: crate::chia_network::ChiaNet,
+    req: &KnockRequest,
+    room_key: &[u8; 32],
+    era: u64,
+    done: &Result<KnockDone>,
+) -> Option<String> {
+    if !book.on() {
+        return None;
+    }
+    let own = || root.map(|root| Payer::of_burner(&knock_burner(root, net, req, room_key, era)));
+    let payer = match done {
+        Ok(KnockDone::Written { write, from_burner: true, .. }) => write.payer,
+        Ok(KnockDone::Refiled(entry)) => own().filter(|own| entry.payer.as_deref() == Some(own.hex().as_str()))?,
+        Err(e) if e.downcast_ref::<claim_write::AlreadyKnocked>().is_some() => own()?,
+        _ => return None,
+    };
+    book.knock(net, era, payer)
+}
+
 /// The knock book's entry for a knock written for `req` in `era` under
 /// `hint`, pushed at `pushed_at`: pending, its clock not started, naming what
 /// the watcher's lookup judges it by — its coins (its parent as its coin id,
@@ -6209,8 +6252,17 @@ pub async fn heartbeat_loop(
     let money_payer = Payer::of(&chia_sk).hex();
     // What the burner path's gates remember between ticks: the era's first
     // peak and its late start, a change waiting its jitter, and P(e)'s payer
-    // text. No line prints it or anything in it.
+    // text. No line prints it or anything in it: the audit's lines, with
+    // SSF_CHIA_AUDIT=1, derive the listing's keys themselves
+    // ([`AuditBook::listing`]).
     let mut listing_clock = ListingClock::default();
+    // The sign-off review's audit (stage 4 design §11), off unless
+    // SSF_CHIA_AUDIT=1: what it has named this run, so the listing's keys
+    // and each knock's key are named once ([`AuditBook`]). The beacon's key
+    // is named where the wallet loads (main.rs `announce_wallet`). The
+    // book is made from the process's switch and from nothing else
+    // (`audit::tests::every_audit_line_is_printed_behind_the_processs_switch`).
+    let mut audit = AuditBook::new(audit_enabled());
     // The pause for another copy of this station writing its listing (stage
     // 4 design §10): counted by the listing's verdict and its writer below,
     // on the burner path alone, and asked by the listing's, the knock's and
@@ -6499,6 +6551,15 @@ pub async fn heartbeat_loop(
             // The hint this era's listing is filed under on this network
             // (§3.5), for the mark and the Phone Book's row alike.
             let hint_now = era_now.map(|era| hex::encode(chia_lane::derive_ck_hint(net, &hub.contact_key, era)));
+            // 🔎 Under the audit switch alone (§11): the address of this
+            // era's listing key, and at the run's first asking those of the
+            // eras before it, each said once ([`AuditBook::listing`]).
+            // Without the switch no line names a burner.
+            if let (Some(root), Some(era)) = (&listing_root, era_now) {
+                for line in audit.listing(root, &hub.contact_key, era) {
+                    println!("{line}");
+                }
+            }
             let inbound = hub.inbound_verified.lock().unwrap().clone();
             let entries = public_addr_entries(&addrs, &inbound, peak, now_unix);
             let sig = addrs_signature(&entries);
@@ -6785,7 +6846,14 @@ pub async fn heartbeat_loop(
                 // wallet's and never beside the SSF wallet's knock under the
                 // hint (`claim_write::BurnerWait::MoneyUnderHint`); with
                 // burner keys off it is the SSF wallet's write, as on main.
-                match publish_knock(net, listing_root.as_ref(), &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await {
+                let done = publish_knock(net, listing_root.as_ref(), &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;
+                // 🔎 Under the audit switch alone (§11): the address of this
+                // knock's key, once the step shows the key has written, by
+                // this write, by the write the lease still holds or by the
+                // chain's word ([`audit_knock`]). Said after the step's own
+                // line. Without the switch no line names it.
+                let audit_line = audit_knock(&mut audit, listing_root.as_ref(), net, &req, &room_key, era, &done);
+                match done {
                     Ok(KnockDone::Refiled(entry)) => {
                         println!("{}", lost_knock_line(&req, era));
                         let mut book = hub.knocks.lock().unwrap();
@@ -6821,6 +6889,9 @@ pub async fn heartbeat_loop(
                     Err(e) => {
                         waits_its_turn = knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);
                     }
+                }
+                if let Some(line) = audit_line {
+                    println!("{line}");
                 }
                 let waits = waits_its_turn.is_some();
                 if let Some(line) = said_once(&mut knock_said, waits_its_turn, waits) {
@@ -13297,6 +13368,13 @@ pub(crate) use claim_write::claim_write_selftest;
 /// design §10, "Burner spent elsewhere"): its clock, its file and its words.
 mod foreign_pause;
 use foreign_pause::{ForeignPause, Paused, FOREIGN_PAUSE_FILE};
+
+/// The sign-off review's audit switch (stage 4 design §11, "Inputs"):
+/// `SSF_CHIA_AUDIT=1` has the log name the address of each key the station
+/// writes its listing, its knocks and its beacon from, and never a key.
+mod audit;
+use audit::AuditBook;
+pub use audit::{audit, audit_enabled, wallet_lines as audit_wallet_lines};
 
 /// The writers and readers above, end to end through the real lane on the
 /// mock chain (stage 4 design §12).

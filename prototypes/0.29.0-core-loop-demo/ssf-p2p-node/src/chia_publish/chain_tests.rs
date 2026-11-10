@@ -230,6 +230,15 @@
 //! and dies with F
 //! (`a_burners_first_write_whose_dish_coin_a_stranger_claimed_reads_dead_from_its_mark_once_settled_and_pending_for_ever_without_its_parked_input`).
 //!
+//! The sign-off review's audit (§11, `SSF_CHIA_AUDIT=1`) names the address
+//! each writer's coin sits at, read off the chain after the write the
+//! heartbeat's own seam made: the listing's
+//! (`the_audits_line_for_an_eras_listing_key_names_the_address_that_eras_listing_coin_sits_at`),
+//! a knock's, only once its key has written and once a run
+//! (`the_audits_line_for_a_knock_names_its_key_only_once_the_key_has_written_and_once_a_run`),
+//! and the beacon's, one address on both paths
+//! (`the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_on_both_paths`).
+//!
 //! The claim and write aggregated by hand stays, in
 //! `an_ephemeral_coin_is_found_through_its_parent_by_every_lookup_the_resolver_makes`,
 //! as the readers' own proof: it asks nothing of any writer.
@@ -238,6 +247,7 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use super::audit::{audit_of, AUDIT_ERAS_BACK};
 use super::claim_write::{build_burner_bundle, burner_write_with, AlreadyKnocked, BurnerInput, BurnerWait, GiftFuse};
 use super::foreign_pause::{FOREIGN_PAUSE_SECS, PAUSED_NEXT_EDITION_WORDS, PAUSED_TWO_HOURS_WORDS};
 use crate::chia_burner::{BurnerKey, BurnerRoot, MoneyKey};
@@ -6348,5 +6358,190 @@ async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_no
     assert!(from_burner);
     assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "the test network's own root writes");
     assert_eq!(s.gifts(0), 1);
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// What an audit line names (`audit::audit_line`): the puzzle hash its
+/// address reads back to on the test's network, and its puzzle hash text.
+/// The two are the same 32 bytes, or the test fails here.
+fn audit_names(line: &str) -> (Bytes32, String) {
+    let (what, rest) = line.split_once(" · address ").expect("an address");
+    assert!(what.starts_with("🔎 ChiaHub audit: "), "{line}");
+    let (address, text) = rest.split_once(" · puzzle hash ").expect("a puzzle hash");
+    let at = crate::chia_wallet::address_to_puzzle_hash(NET, address).expect("an address of the test's network");
+    assert_eq!(hex::encode(at), text, "one puzzle hash, as an address and as hex");
+    (at, text.to_string())
+}
+
+/// Stage 4 design §11, the review's inputs: with the audit on, the line for
+/// an era's listing key names where that era's listing sits. A station
+/// lists in era 0 from P(0), by the heartbeat's own seam, and the write
+/// lands. The audit's book, asked as the heartbeat asks it, gives one line
+/// for era 0, and the address in it is where the chain holds the listing's
+/// coin, unspent: the puzzle hash the write's payer has and the mark files.
+/// The line for the next era names another address, where nothing sits. A
+/// book with the audit off names neither.
+#[tokio::test]
+async fn the_audits_line_for_an_eras_listing_key_names_the_address_that_eras_listing_coin_sits_at() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(141), iroh::SecretKey::generate());
+    ready_dish(&s, 1).await;
+    let (_, write) = s.listing(&w, &node, 0, &entries(), unix_now(), 1).await.unwrap();
+    s.chain.farm().await;
+    let listed = burner_coin(&burner(141, 0), write.coins.parent);
+    assert_eq!(s.chain.record(listed.coin_id()).map(|r| r.2), Some(None), "the listing's coin, landed and unspent");
+
+    let mut book = AuditBook::new(true);
+    let lines = book.listing(&root(141), &CK, 0);
+    assert_eq!(lines.len(), 1, "era 0 has no era before it: {lines:?}");
+    assert!(lines[0].starts_with("🔎 ChiaHub audit: listing key, era 0 · address txch1"), "{}", lines[0]);
+    let (at, text) = audit_names(&lines[0]);
+    assert_eq!(at, listed.puzzle_hash, "the address the listing's coin sits at");
+    assert_eq!(text, write.payer.hex(), "the payer text the mark files");
+    assert_eq!(text, NodePublishMark::written(0, 1, String::new(), 0, Bytes32::default(), &write, String::new()).payer.unwrap_or_default());
+
+    let next = book.listing(&root(141), &CK, 1);
+    assert_eq!(next.len(), 1, "the next era's key alone: {next:?}");
+    let (next_at, _) = audit_names(&next[0]);
+    assert!(next_at != at, "another era, another address");
+    assert_eq!(next_at, burner(141, 1).puzzle_hash());
+    let (here, _) = crate::chia_faucet::records_at(&s.money, at).await.unwrap();
+    assert_eq!(here.iter().filter(|r| !r.spent).map(|r| r.coin).collect::<Vec<_>>(), vec![listed], "era 0's address holds the listing's coin alone");
+    assert_eq!(crate::chia_faucet::records_at(&s.money, next_at).await.unwrap().0.len(), 0, "and the next era's holds nothing yet");
+    assert_eq!(AUDIT_ERAS_BACK, 4);
+    assert_eq!(AuditBook::new(false).listing(&root(141), &CK, 0), Vec::<String>::new(), "the audit off names nothing");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §11: with the audit on, a knock's key is named only once
+/// the run knows the key has written, with the address its coin sits at,
+/// and once a run ([`audit_knock`], given what the knock arm's own step
+/// made of the request). In era 1, in turn:
+/// - a knock that waits for a lobby coin names nothing: its key holds
+///   nothing;
+/// - a knock the SSF wallet pays for, with burner keys off, names nothing,
+///   and neither does that knock filed again by the burner path's step
+///   while the lease holds it: it has no knock key;
+/// - a knock written from its own key K(h) names the write's payer, which
+///   is the payer its entry in the knock book files and the address the
+///   chain then holds its coin at;
+/// - the same knock filed again from the lease, its entry lost, names
+///   nothing more in this run, and names the same key in a new run, but
+///   not for another host's request and not off the burner path;
+/// - once it has settled, asked for again, it reads as already knocked by
+///   its key: nothing more in this run, the same line in a new one.
+///
+/// With the audit off none of these names anything.
+#[tokio::test]
+async fn the_audits_line_for_a_knock_names_its_key_only_once_the_key_has_written_and_once_a_run() {
+    let mut s = setup().await;
+    s.past_the_hold();
+    let (w, node) = (wallet(142), iroh::SecretKey::generate());
+    let ((a, _), (b, _)) = (host_card([0x41; 32]), host_card([0x42; 32]));
+    let (root, key) = (root(142), knock_key(142, &a, 1));
+    let (mut book, mut off) = (AuditBook::new(true), AuditBook::new(false));
+    let fresh = || AuditBook::new(true);
+    let mut seed = 0u64;
+    let asked = |on: &mut AuditBook, off: &mut AuditBook, path: Option<&BurnerRoot>, req: &KnockRequest, done: &Result<KnockDone>| {
+        assert_eq!(audit_knock(off, path, NET, req, &ROOM_KEY, 1, done), None, "the audit off names nothing");
+        audit_knock(on, path, NET, req, &ROOM_KEY, 1, done)
+    };
+
+    // No lobby coin is ready: the knock waits and its key holds nothing.
+    seed += 1;
+    let dry = s.arm_knock(142, true, &node, &a, 1, || Ok(None), unix_now(), seed).await;
+    assert_eq!(dry.as_ref().err().and_then(|e| e.downcast_ref::<BurnerWait>().copied()), Some(BurnerWait::NoCoinReady));
+    assert_eq!(asked(&mut book, &mut off, Some(&root), &a, &dry), None, "a knock that waits");
+
+    // The SSF wallet's knock, burner keys off, and the same knock filed
+    // again by the burner path's step while the lease holds it.
+    s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    ready_dishes(&s, &[1, 1]).await;
+    seed += 1;
+    let paid = s.arm_knock(142, false, &node, &b, 1, || Ok(None), unix_now(), seed).await;
+    assert!(matches!(&paid, Ok(KnockDone::Written { from_burner: false, .. })), "written by the SSF wallet");
+    for path in [Some(&root), None] {
+        assert_eq!(asked(&mut book, &mut off, path, &b, &paid), None, "the SSF wallet's knock has no knock key");
+    }
+    seed += 1;
+    let held = s.arm_knock(142, true, &node, &b, 1, || Ok(None), unix_now(), seed).await;
+    assert_eq!(arm_refiled(&held).and_then(|entry| entry.payer), Some(Payer::of(&w).hex()), "filed again, naming the SSF wallet");
+    assert_eq!(asked(&mut fresh(), &mut off, Some(&root), &b, &held), None, "the SSF wallet's knock, filed again");
+    s.turn().await;
+
+    // The knock written from its own key.
+    seed += 1;
+    let done = s.arm_knock(142, true, &node, &a, 1, || Ok(None), unix_now(), seed).await;
+    let line = asked(&mut book, &mut off, Some(&root), &a, &done).expect("written from its own key: named");
+    assert!(line.starts_with("🔎 ChiaHub audit: knock key, era 1 · address txch1"), "{line}");
+    let (hint, write, from_burner) = arm_wrote(done);
+    assert!(from_burner);
+    let (at, text) = audit_names(&line);
+    assert_eq!(at, key.puzzle_hash(), "K(h) of this host, room and era");
+    assert!(at != knock_key(142, &a, 0).puzzle_hash() && at != knock_key(142, &b, 1).puzzle_hash(), "and no other's");
+    assert_eq!(Some(text), sent_knock_of(&a, 1, hint, &write, unix_now()).payer, "the payer text the knock book files");
+
+    // Its entry lost: the step files it again from the lease.
+    seed += 1;
+    let refiled = s.arm_knock(142, true, &node, &a, 1, || Ok(None), unix_now(), seed).await;
+    assert!(arm_refiled(&refiled).is_some(), "filed again from the lease");
+    assert_eq!(asked(&mut book, &mut off, Some(&root), &a, &refiled), None, "named once a run");
+    assert_eq!(asked(&mut fresh(), &mut off, Some(&root), &a, &refiled), Some(line.clone()), "a new run names the key of the knock the lease holds");
+    assert_eq!(asked(&mut fresh(), &mut off, Some(&root), &b, &refiled), None, "an entry this request's key did not pay for");
+    assert_eq!(asked(&mut fresh(), &mut off, None, &a, &refiled), None, "off the burner path");
+
+    // Landed, where the line says, then settled: the chain's word.
+    s.chain.farm().await;
+    let knocked = burner_coin(&key, write.coins.parent);
+    assert_eq!(knocked.puzzle_hash, at, "the address the knock's coin sits at");
+    assert_eq!(s.chain.record(knocked.coin_id()).map(|r| r.2), Some(None), "landed and unspent");
+    s.turn().await;
+    seed += 1;
+    let again = s.arm_knock(142, true, &node, &a, 1, || Ok(None), unix_now(), seed).await;
+    assert!(again.as_ref().err().is_some_and(|e| e.downcast_ref::<AlreadyKnocked>().is_some()), "already knocked by its key");
+    assert_eq!(asked(&mut book, &mut off, Some(&root), &a, &again), None, "named once a run");
+    assert_eq!(asked(&mut fresh(), &mut off, Some(&root), &a, &again), Some(line), "a new run, asked for a knock an earlier one wrote");
+    assert_eq!(asked(&mut fresh(), &mut off, None, &a, &again), None, "off the burner path");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §11: with the audit on and the beacon on, a loaded wallet
+/// says the line of the beacon's key B, and that one line names where the
+/// beacon's coin sits on both paths. With burner keys off the beacon arm's
+/// step pays from the coin sent to B's address, and the coin it makes sits
+/// at the address the line names. Once that has settled, with burner keys
+/// on, the step funds B from the lobby dish and writes from the gift, and
+/// that coin sits at the same address.
+#[tokio::test]
+async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_on_both_paths() {
+    let mut s = setup().await;
+    let (w, b, key, node, none) = (wallet(143), beacon_wallet(143), beacon_key(143), iroh::SecretKey::generate(), no_data_folder());
+    let lines = audit_wallet_lines(NET, &audit_of(Some(std::ffi::OsStr::new("1"))), true, &w);
+    assert_eq!(lines.len(), 2, "the notice and the beacon's key: {lines:?}");
+    assert!(lines[1].starts_with("🔎 ChiaHub audit: beacon key · address txch1"), "{}", lines[1]);
+    let (at, text) = audit_names(&lines[1]);
+
+    let funded = s.chain.fund(at, 1000, None);
+    let (f, _) = ready_dish(&s, 10).await;
+    let (hint, paid, from_burner) = beacon_wrote(s.arm_beacon(143, false, &node, 0, &none, unix_now(), 1).await);
+    assert!(!from_burner);
+    assert_eq!(paid.coins, WriteCoins::one(funded.coin_id()), "a coin sent to the address the line names pays for it");
+    assert_eq!(text, paid.payer.hex());
+    assert_eq!(Some(text.clone()), BeaconMark::written(0, 0, hint, &paid, String::new()).payer, "the payer text the beacon mark files");
+    s.chain.farm().await;
+    assert_eq!(written(&b, funded).puzzle_hash, at, "the beacon wallet's coin sits there");
+    assert_eq!(s.chain.record(written(&b, funded).coin_id()).map(|r| r.2), Some(None));
+
+    // B's own spend settles first: the lease sees it landed, then deep.
+    s.reconcile().await;
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    let (_, gifted, from_burner) = beacon_wrote(s.arm_beacon(143, true, &node, 0, &none, unix_now(), 2).await);
+    assert!(from_burner);
+    assert_eq!(gifted.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "funded by the lobby dish");
+    assert_eq!(text, gifted.payer.hex(), "one payer on both paths");
+    s.chain.farm().await;
+    let beaconed = burner_coin(&key, gifted.coins.parent);
+    assert_eq!(beaconed.puzzle_hash, at, "the burner path's coin sits at the same address");
+    assert_eq!(s.chain.record(beaconed.coin_id()).map(|r| r.2), Some(None));
     assert!(s.chain.unanswered().is_empty());
 }
