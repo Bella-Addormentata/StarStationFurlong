@@ -1401,6 +1401,11 @@ pub async fn claim_write_selftest(net: ChiaNet, wallet: chia_bls::SecretKey) -> 
     let mut body = [0u8; 64];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut body);
     println!("{SELFTEST} — {} era {era}, test hint {}", net.name(), hex::encode(&hint.to_bytes()[..8]));
+    // 🔎 Under the audit switch alone (stage 4 design §11): the address of
+    // the test's key, which the lobby dish's history shows as a recipient.
+    if super::audit::audit_enabled() {
+        println!("{}", super::audit::audit_line(net, super::audit::AuditKey::SelfTest { era }, Payer::of_burner(&key)));
+    }
 
     let mut tries = 0u32;
     let write = loop {

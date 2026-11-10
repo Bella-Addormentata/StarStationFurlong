@@ -6436,8 +6436,10 @@ mod test_hook_tests {
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address, with the
 /// beacon on the beacon's line (which names its address only where the
-/// operator funds it, [`beacon_lines`]) and, with SSF_CHIA_BURNERS set to
-/// `1`, what burner keys do on this network. Never the words.
+/// operator funds it, [`beacon_lines`]), with SSF_CHIA_BURNERS set to
+/// `1`, what burner keys do on this network, and with SSF_CHIA_AUDIT set
+/// to `1`, the audit's notice and the beacon key's address
+/// (`chia_publish::audit_wallet_lines`). Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
     chia_wallet::log_receive_address(net, id);
@@ -6461,6 +6463,12 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
         (true, Some(line)) => println!("{line}"),
         (false, Some(line)) => eprintln!("{line}"),
         _ => {}
+    }
+    // Stage 4 design §11: the sign-off review's audit, with SSF_CHIA_AUDIT
+    // set to `1` alone: its notice, and with the beacon on the address of
+    // the beacon's key, on either path. Nothing is said otherwise.
+    for line in chia_publish::audit_wallet_lines(net, chia_publish::audit(), chia_publish::beacon_enabled(), &id.wallet) {
+        println!("{line}");
     }
 }
 
