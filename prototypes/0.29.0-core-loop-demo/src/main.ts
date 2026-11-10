@@ -14,7 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetError, latestFaucetStatus, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
+import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetStatus, latestWalletError, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
 import { qrSvg } from "./qrCode";
 import {
   acceptNodeCard,
@@ -5446,6 +5446,10 @@ async function openBankBackupWindow(): Promise<void> {
   renderBankApp();
 }
 
+/** ⛓️ A balance read that came due while the Bank was off screen, and waits
+ *  for it to be back (requestBankBalance). */
+let bankBalanceOwed = false;
+
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
  *  The reply lands in the dish's store, whose subscribers repaint the view;
  *  a request that cannot leave (no node, a failed stream) is filed there too,
@@ -5453,12 +5457,23 @@ async function openBankBackupWindow(): Promise<void> {
  *  reading "reading the chain…" for good. Rooms without a dish have no poll
  *  of their own, so this runs on open and on REFRESH. The balance travels
  *  over the room's link to the node, so there is nothing to ask before a room
- *  is joined, and nothing while no wallet is loaded. */
+ *  is joined, and nothing while no wallet is loaded.
+ *
+ *  ⛓️ It asks only with the Bank on screen. A read that comes due while it is
+ *  not (a wallet turned on whose answer landed after Tab put the phone away:
+ *  turnBankWallet waits on the node twice before it gets here) is owed, and
+ *  sent when the Bank is back on screen (the screen watch in renderBankApp),
+ *  so the full nodes are never asked for a balance nobody can see. */
 function requestBankBalance(): void {
+  bankBalanceOwed = false;
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
   // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
   if (localFingerprint.chia_lane?.off) return;
+  if (!bankViewOnScreen()) {
+    bankBalanceOwed = true;
+    return;
+  }
   // ⛓️ The Bank asks for the wallet's coins by name: off a test network the
   // node reads them for no other status.
   const { seq, sent } = networkProvider.requestFaucet("status", undefined, true);
@@ -5630,14 +5645,16 @@ function renderBankApp(): void {
       // on another chain, not yet re-read) is no balance of this address.
       const roomSt = roomId ? latestFaucetStatus(roomId) : null;
       const st = roomSt && roomSt.net?.id === net.id ? roomSt : null;
-      const err = roomId ? latestFaucetError(roomId) : null;
+      const err = roomId ? latestWalletError(roomId) : null;
       const owned = st?.walletMojos ?? null;
       const spendable = st?.walletSpendableMojos ?? owned;
       const confirming = owned !== null && spendable !== null && spendable < owned ? owned - spendable : 0n;
       // The balance is read over the room's link to the node, so there is
       // none before a room is joined. A failed read is shown as such (the
-      // store keeps the node's last error until a later answer clears it) and
-      // a balance kept from before it is dated, not passed off as current.
+      // store keeps the last error until a status that read the wallet clears
+      // it: a dish poll that left the wallet unread clears the dish's error,
+      // and says nothing about the balance) and a balance kept from before it
+      // is dated, not passed off as current.
       const balance = !roomId
         ? "shown once you are in a room (your node answers over the room's link)"
         : owned === null
@@ -5805,6 +5822,8 @@ function renderBankApp(): void {
     const phone = document.getElementById("spacephone-container");
     const watch = new MutationObserver(() => {
       if (!treasuryViewOnScreen(view)) bankBackupLeftScreen();
+      // ⛓️ Back on screen: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     watch.observe(view, { attributes: true, attributeFilter: ["class"] });
     if (phone) watch.observe(phone, { attributes: true, attributeFilter: ["class"] });

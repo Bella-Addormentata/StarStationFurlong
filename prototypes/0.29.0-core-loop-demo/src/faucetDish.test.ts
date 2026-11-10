@@ -13,6 +13,7 @@ import {
   jarLevel,
   keepWalletFigures,
   latestFaucetStatus,
+  latestWalletError,
   markFaucetPending,
   openFaucetRoom,
   parseFaucetReply,
@@ -286,6 +287,45 @@ describe('faucet dish: a status that left the wallet unread', () => {
     setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 7, walletSkipped: true }) });
     expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
     clearFaucetRoom(room);
+  });
+
+  // The Bank dates its balance by the wallet's own error. A dish poll that
+  // left the wallet unread is an answer about the jar: it clears the dish's
+  // error, and the balance it is filed with is still the one from before the
+  // failed read.
+  it('keeps a failed read dating the balance until a status reads the wallet again', () => {
+    const room = 'wallet-error-kept';
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 1, walletMojos: 5000n }) });
+    expect([latestFaucetError(room), latestWalletError(room)]).toEqual([null, null]);
+    // REFRESH fails: both errors stand.
+    failFaucetRequest(room, 'status', 9, new Error('no connection to your node'));
+    const why = 'the request did not reach your node (no connection to your node)';
+    expect([latestFaucetError(room), latestWalletError(room)]).toEqual([why, why]);
+    // A dish poll answers, the wallet unread: the dish's error goes, the
+    // wallet's stays, with the balance from before the failure.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 2, walletSkipped: true }) });
+    expect([latestFaucetError(room), latestWalletError(room)]).toEqual([null, why]);
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(5000n);
+    // A refusal from the node replaces it, and a second such poll keeps that.
+    setFaucetReply(room, { op: 'status', ok: false, error: 'the gateway is down' });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 3, walletSkipped: true }) });
+    expect([latestFaucetError(room), latestWalletError(room)]).toEqual([null, 'the gateway is down']);
+    // An answer with no status (a push whose read after it failed) says
+    // nothing about the wallet either.
+    setFaucetReply(room, { op: 'give', ok: true });
+    expect(latestWalletError(room)).toBe('the gateway is down');
+    // A status that read the wallet clears it, an absent wallet included.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: MAINNET, snapshot: 4 }) });
+    expect([latestFaucetError(room), latestWalletError(room)]).toEqual([null, null]);
+    // Another network's status forgets it, and so does leaving the room.
+    setFaucetReply(room, { op: 'status', ok: false, error: 'the gateway is down' });
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: TESTNET11, snapshot: 1, walletSkipped: true }) });
+    expect(latestWalletError(room)).toBeNull();
+    setFaucetReply(room, { op: 'status', ok: false, error: 'the gateway is down' });
+    clearFaucetRoom(room);
+    expect(latestWalletError(room)).toBeNull();
   });
 });
 

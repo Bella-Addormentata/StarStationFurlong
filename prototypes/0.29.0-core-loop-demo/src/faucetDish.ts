@@ -293,6 +293,11 @@ const latestSnapshot = new Map<string, number>();
  *  (see setFaucetReply): ordered among themselves, apart from the jar's view,
  *  since off a test network most statuses leave the wallet unread. */
 const walletOnFile = new Map<string, WalletFigures>();
+/** ⛓️ Per room, the error that has stood since the wallet was last read (see
+ *  setFaucetReply): filed with every error, cleared only by a status that
+ *  read the wallet. The Bank dates its balance by this one, not by the dish's
+ *  error, which any answer clears. */
+const walletError = new Map<string, string>();
 const listeners = new Set<() => void>();
 /** The room whose node session this store listens to right now (see openFaucetRoom). */
 let openRoom: string | null = null;
@@ -328,6 +333,17 @@ export function latestFaucetStatus(roomId: string): FaucetStatus | null {
 
 export function latestFaucetError(roomId: string): string | null {
   return lastError.get(roomId) ?? null;
+}
+
+/** ⛓️ The error that dates the wallet figures on file (null when none does):
+ *  the last one filed since a status last read the wallet. An answer that left
+ *  the wallet unread clears `latestFaucetError`, since its jar was read, and
+ *  leaves this one, since the balance it carries is the one kept from before
+ *  the failure. An error does not say whether its request asked for the
+ *  wallet, so every error dates the balance until the wallet is read again;
+ *  the Bank reads it whenever it opens. */
+export function latestWalletError(roomId: string): string | null {
+  return walletError.get(roomId) ?? null;
 }
 
 /** A take or give is in flight: from the click until the node reports it
@@ -411,7 +427,10 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  poll is an older look at the jar, and is not filed as one, but it is the
  *  newest look at the wallet, and its figures are. That happens off a test
  *  network only, where no TAKE or GIVE is ever pending, so the judging below
- *  reads figures the node sent with the status it judges. */
+ *  reads figures the node sent with the status it judges. Such a status
+ *  clears the dish's error and not the wallet's (latestWalletError): after a
+ *  balance read that failed, the figures it is filed with are still the ones
+ *  from before the failure. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (roomId !== openRoom) return;
   const before = latest.get(roomId);
@@ -420,6 +439,7 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     latestSnapshot.delete(roomId);
     walletOnFile.delete(roomId);
     lastError.delete(roomId);
+    walletError.delete(roomId);
     pending.delete(roomId);
   }
   const p = pending.get(roomId);
@@ -436,9 +456,12 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
       return;
     }
     lastError.set(roomId, reply.error ?? 'the node refused');
+    walletError.set(roomId, reply.error ?? 'the node refused');
     notify();
     return;
   }
+  // ⛓️ The dish's error goes with any answer. The wallet's goes below, and
+  // only with a status that read the wallet.
   lastError.delete(roomId);
   // This action's own reply: the spend went out. Its floor is recorded BEFORE
   // the snapshot ordering below is consulted: a reply answered after a newer
@@ -463,6 +486,7 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     // wallet (what is on file is on this status's network by now: another
     // network's was cleared above).
     if (!st.walletSkipped) {
+      walletError.delete(roomId);
       const kept = walletOnFile.get(roomId);
       if (!(st.snapshot > 0 && kept !== undefined && st.snapshot < kept.snapshot)) {
         walletOnFile.set(roomId, {
@@ -527,6 +551,7 @@ export function clearFaucetRoom(roomId: string): void {
   if (openRoom === roomId) openRoom = null;
   latest.delete(roomId);
   lastError.delete(roomId);
+  walletError.delete(roomId);
   pending.delete(roomId);
   latestSnapshot.delete(roomId);
   walletOnFile.delete(roomId);
