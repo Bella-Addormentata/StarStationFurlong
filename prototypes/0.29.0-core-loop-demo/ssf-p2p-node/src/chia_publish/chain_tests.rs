@@ -174,6 +174,13 @@
 //! A rewrite is not spaced from its own payer's last write, and a spend of
 //! the SSF wallet's spaces a burner as any payer's does
 //! (`a_rewrite_is_not_spaced_from_its_own_last_write_and_the_ssf_wallets_spend_spaces_a_burner_as_any_payers_does`).
+//! A spend a block takes between the lease's coin listing and its liveness
+//! question, which every node then refuses as a double spend, is read from
+//! the chain again, kept settling, and spaces the next payer
+//! (`a_spend_a_block_takes_between_the_leases_listing_and_its_liveness_question_still_spaces_the_next_payer`).
+//! And a reorganization that takes the block a payer waits on holds the
+//! payer behind the spend again and never brings its turn forward
+//! (`a_reorganization_that_takes_the_block_a_payer_waits_on_holds_it_behind_the_spend_again_and_never_brings_its_turn_forward`).
 //! The tests of the other rules keep T4 out of what they show: they start
 //! past its hold on a spend in flight ([`Setup::past_the_hold`]) and let a
 //! landing's turn pass before another payer writes ([`Setup::turn`]).
@@ -5086,16 +5093,18 @@ async fn a_listing_a_knock_and_the_beacon_of_one_node_land_at_least_32_blocks_ap
 /// Stage 4 design §4.3 T4 in the arms' steps ([`knock_on_path`],
 /// [`beacon_on_path`]): "waiting is not a knock attempt". A node's listing
 /// landed a block ago. Its knock, asked for through the knock arm's step,
-/// waits its turn: a typed wait that uses no attempt, starts no retry
-/// cadence, and goes back to the front of the queue ahead of the request
+/// waits its turn: a typed wait that uses no attempt, leaves the arm's rest
+/// as it was, and goes back to the front of the queue ahead of the request
 /// behind it, with a line that names the host and the room and no key. Its
 /// beacon, through the beacon arm's step, waits its turn too: the writer was
 /// reached, so the tick is used and the rooms' writes do not slip in ahead,
-/// and its line asks for no funding and names no retry cadence. Nothing is
-/// sent or counted for either. Each then goes out through its arm's step at
-/// the block drawn for it, the knock one block after it was still held, and
-/// the beacon, held again by the knock, never earlier than the block first
-/// drawn for it. The knock opens for its host.
+/// the try starts no retry cadence, and its line asks for no funding and
+/// names no retry cadence. Nothing is sent or counted for either. Each then
+/// goes out through its arm's step at the block drawn for it, the knock one
+/// block after it was still held, and the beacon, held again by the knock,
+/// at the block drawn from the knock's landing, which is past any block
+/// drawn from the listing's (that a newer landing never brings a turn
+/// forward is the pure step's own test). The knock opens for its host.
 #[tokio::test]
 async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_go_out_at_the_blocks_drawn_for_them() {
     let mut s = setup().await;
@@ -5113,7 +5122,6 @@ async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_g
     let e = done.as_ref().err().expect("the knock waits its turn");
     assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Spaced), "{e:#}");
     assert!(is_typed_wait(e) && !knock_attempt_counts(true, e), "waiting is not a knock attempt");
-    assert_eq!(paced_from(Instant::now(), &done), None, "and starts no retry cadence: tried again at the next tick");
     let (mut queue, mut rest, mut found) = (VecDeque::from([behind.clone()]), None, ChainKnocked::default());
     let line = knock_not_written(true, req.clone(), e, 0, Instant::now(), &mut queue, &mut rest, &mut found).expect("its line, for the arm to say once");
     assert_eq!(queue, VecDeque::from([req.clone(), behind.clone()]), "back at the front, its attempts as they were");
@@ -5123,7 +5131,6 @@ async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_g
     knock_names_no_burner(e, &req, &k);
 
     let done = s.arm_beacon(131, true, &node, 0, &none, at, 3).await;
-    let first_due = listed + spaced_by(3);
     assert_eq!(beacon_waited(&done), Some(BurnerWait::Spaced));
     let e = done.as_ref().err().expect("the beacon waits its turn");
     assert!(beacon_took_the_tick(&done), "the writer was reached: the tick is used");
@@ -5146,11 +5153,13 @@ async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_g
     let opened = read_inbox(NET, &s.carrier, &host_kx, &req.ck_host, &ROOM_KEY, ROOM, knocked, unix_now(), &mut HashMap::new()).await.unwrap();
     assert_eq!(opened.iter().map(|o| (o.item.from, o.coin_id)).collect::<Vec<_>>(), vec![(node.public(), burner_coin(&k, knock.coins.parent).coin_id())], "the knock opens for its host");
 
-    // The knock's landing holds the beacon again; its turn is never earlier
-    // than the one drawn from the listing's landing.
+    // The knock's landing holds the beacon again: its turn is drawn from
+    // that landing, more than 64 blocks past the listing's, and so past the
+    // block drawn for it from the listing's landing.
     let again = s.arm_beacon(131, true, &node, 0, &none, at, 6).await;
     assert_eq!(beacon_waited(&again), Some(BurnerWait::Spaced));
-    let beacon_due = first_due.max(knocked + spaced_by(6));
+    let beacon_due = knocked + spaced_by(6);
+    assert!(beacon_due > listed + SPACING_MAX_BLOCKS);
     s.at_block(beacon_due - 1).await;
     assert_eq!(beacon_waited(&s.arm_beacon(131, true, &node, 0, &none, at, 7).await), Some(BurnerWait::Spaced), "one block before its turn");
     assert_eq!(s.chain.farm().await, beacon_due);
@@ -5301,6 +5310,108 @@ async fn a_rewrite_is_not_spaced_from_its_own_last_write_and_the_ssf_wallets_spe
     let (_, next) = s.listing(&w, &node, 0, &entries_of("203.0.113.9:5555", 0), at + 1_400, 6).await.expect("P(0)'s turn");
     assert_eq!(next.coins, WriteCoins::one(burner_coin(&p, c0.coin_id()).coin_id()), "a rewrite from the coin its last made, with no gift");
     assert_eq!(s.gifts(0), 1, "one gift, P(0)'s first");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4, measured from a landing the lease could have
+/// missed. A listing from P(0) is in the mempools when the knock's writer
+/// reconciles the lease: its coin listing names the listing's dish coin
+/// unspent, and a block takes the spend just as the first node is to answer
+/// the liveness question that follows, so every node refuses the bundle
+/// pushed again as a double spend, a final refusal that reads as dead. The
+/// lease reads the chain once more before it lets the spend go on that
+/// word, finds the coin spent, and keeps the spend settling at the height it
+/// landed. So the knock waits its turn, counted from that block: held one
+/// block before the block drawn, and out at it, more than 32 blocks after
+/// the listing on the chain. Let go as dead, the spend would have left no
+/// record, and the knock would have gone out in the next block.
+#[tokio::test]
+async fn a_spend_a_block_takes_between_the_leases_listing_and_its_liveness_question_still_spaces_the_next_payer() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(135), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x37; 32]);
+    ready_dishes(&s, &[1, 1]).await;
+    let at = unix_now();
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let pushed = s.chain.received().last().cloned().expect("the listing was sent");
+    assert_eq!(s.chain.mempool(), vec![pushed.name()], "in the mempools");
+    let before = s.chain.peak();
+
+    s.chain.block_before(ProtocolMessageTypes::SendTransaction);
+    let held = s.knock(135, &node, &req, 0, || Ok(None), 2).await.map(|(_, write)| write);
+    assert!(!s.chain.reorg_staged(), "the block came at the lease's liveness question");
+    let listed = s.chain.peak();
+    let spent_at = |coin: Bytes32| s.chain.record(coin).and_then(|r| r.2);
+    assert_eq!((listed, spent_at(listing.coins.parked)), (before + 1, Some(listed)), "and took the listing");
+    assert_eq!(s.chain.acks_for(pushed.name()).split_off(2), vec![(FAILED, Some("DOUBLE_SPEND".to_string())); 2], "every node refused the bundle pushed again: its coin is spent");
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "the knock waits its turn behind the landing");
+    assert!(s.lease.is_settling(&listing.coins.parked), "the listing's spend is kept settling, not let go as dead");
+    assert!(s.lease.holds_for(listing.payer) && !s.lease.outgoing_pending_for(listing.payer));
+    assert_eq!(s.gifts(0), 1, "nothing counted for the knock");
+
+    let due = listed + spaced_by(2);
+    s.at_block(due - 1).await;
+    let early = s.knock(135, &node, &req, 0, || Ok(None), 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&early), Some(BurnerWait::Spaced), "one block before its turn");
+    assert_eq!(s.chain.farm().await, due);
+    let (_, knock) = s.knock(135, &node, &req, 0, || Ok(None), 4).await.expect("the knock's turn");
+    let knocked = s.chain.farm().await;
+    assert_eq!(s.chain.record(knock.coins.parked).and_then(|r| r.2), Some(knocked));
+    assert!(knocked - listed > SPACING_MIN_BLOCKS, "{listed} then {knocked}");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.3 T4 over a reorganization. A listing from P(0)
+/// landed, and the knock's wait was drawn from its landing, a long one. A
+/// reorganization then takes that block. The lease parks the listing's
+/// spend again, and it holds the knock as any spend in flight does, with
+/// the wait first drawn kept. The lease pushes the bundle again and it
+/// lands two blocks above its first landing. The knock's wait is drawn
+/// again from the new landing, a short one this time, which would end before
+/// the block first drawn: the turn is not brought forward. The knock is
+/// held one block before the block first drawn and goes out at it, more
+/// than 32 blocks after the listing on the chain that stands.
+#[tokio::test]
+async fn a_reorganization_that_takes_the_block_a_payer_waits_on_holds_it_behind_the_spend_again_and_never_brings_its_turn_forward() {
+    let mut s = setup().await;
+    let (w, node) = (wallet(136), iroh::SecretKey::generate());
+    let (req, _) = host_card([0x38; 32]);
+    ready_dishes(&s, &[1, 1]).await;
+    let at = unix_now();
+    let long = (10..).find(|seed| spaced_by(*seed) >= SPACING_MIN_BLOCKS + 16).expect("a seed that draws a long wait");
+    let short = (10..).find(|seed| spaced_by(*seed) + 4 < spaced_by(long)).expect("a seed that draws a shorter one");
+    let (_, listing) = s.listing(&w, &node, 0, &entries(), at, 1).await.unwrap();
+    let pushed = s.chain.received().last().cloned().expect("the listing was sent");
+    let listed = s.chain.farm().await;
+    let drawn = s.knock(136, &node, &req, 0, || Ok(None), long).await.map(|(_, write)| write);
+    assert_eq!(waited(&drawn), Some(BurnerWait::Spaced), "the listing landed a block ago");
+    let first_due = listed + spaced_by(long);
+    assert!(s.lease.is_settling(&listing.coins.parked));
+
+    // The block that held the listing is gone, and its bundle with it.
+    assert_eq!(s.chain.reorg(1).await, listed + 1);
+    assert_eq!(s.chain.record(listing.coins.parked).map(|r| r.2), Some(None), "the listing's dish coin is unspent again");
+    assert!(s.chain.mempool().is_empty(), "and its bundle is in no mempool");
+    let held = s.knock(136, &node, &req, 0, || Ok(None), 3).await.map(|(_, write)| write);
+    assert_eq!(waited(&held), Some(BurnerWait::Spaced), "behind the spend, parked again");
+    assert!(s.lease.outgoing_pending_for(listing.payer) && !s.lease.is_settling(&listing.coins.parked), "parked again, to be pushed again");
+    let again = s.knock(136, &node, &req, 0, || Ok(None), 4).await.map(|(_, write)| write);
+    assert_eq!(waited(&again), Some(BurnerWait::Spaced), "in flight again");
+    assert_eq!(s.chain.mempool(), vec![pushed.name()], "the lease pushed the bundle again");
+
+    let relisted = s.chain.farm().await;
+    assert_eq!((relisted, s.chain.record(listing.coins.parked).and_then(|r| r.2)), (listed + 2, Some(relisted)), "landed again, two blocks up");
+    let redrawn = s.knock(136, &node, &req, 0, || Ok(None), short).await.map(|(_, write)| write);
+    assert_eq!(waited(&redrawn), Some(BurnerWait::Spaced), "the new landing draws a wait of its own");
+    assert!(relisted + spaced_by(short) < first_due, "which would end before the block first drawn");
+    s.at_block(first_due - 1).await;
+    let early = s.knock(136, &node, &req, 0, || Ok(None), 5).await.map(|(_, write)| write);
+    assert_eq!(waited(&early), Some(BurnerWait::Spaced), "one block before the block first drawn: the turn is not brought forward");
+    assert_eq!(s.chain.farm().await, first_due);
+    let (_, knock) = s.knock(136, &node, &req, 0, || Ok(None), 6).await.expect("the knock's turn");
+    let knocked = s.chain.farm().await;
+    assert_eq!(s.chain.record(knock.coins.parked).and_then(|r| r.2), Some(knocked));
+    assert!(knocked - relisted > SPACING_MIN_BLOCKS, "{relisted} then {knocked}");
     assert!(s.chain.unanswered().is_empty());
 }
 

@@ -358,14 +358,20 @@ pub(crate) struct OtherSpends {
 }
 
 /// What T4 keeps for a payer that waits on another payer's landed spend:
-/// the landing its wait was drawn for, and the first block the payer may
-/// push at. It outlives the lease's settling record of that spend, which
-/// goes once the spend is [`crate::chia_knock::SETTLED_DEPTH`] deep, so a
-/// wait drawn longer than that is still kept.
+/// the landing its wait was drawn for, the first block the payer may push
+/// at, and whether the agreed peak was seen to reach that block (`met`,
+/// [`WalletLease::spacing_met`]). It outlives the lease's settling record of
+/// that spend, which goes once the spend is
+/// [`crate::chia_knock::SETTLED_DEPTH`] deep, so a wait drawn longer than
+/// that is still kept. A wait that was met stays on record with its
+/// landing, so the same landing draws no second wait while its settling
+/// record lasts, and holds nothing: the payer's later writes are not asked
+/// the peak for it again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpacedUntil {
     pub landed: u32,
     pub due: u32,
+    pub met: bool,
 }
 
 /// T4's step for one payer (stage 4 design §4.3): what is kept for it once
@@ -373,17 +379,18 @@ pub(crate) struct SpacedUntil {
 /// (none: no such spend is settling), given what was `kept` before. A
 /// landing newer than the one kept draws a wait, `draw()` blocks cut to
 /// [`SPACING_MIN_BLOCKS`]..=[`SPACING_MAX_BLOCKS`], and the payer is due
-/// that many blocks after it, never earlier than it was already due. The
-/// same landing, or an older one (a reorganization moved the block down),
-/// draws nothing, so asking every tick never shortens or lengthens the
-/// wait. With no landing the kept wait stands.
+/// that many blocks after it, never earlier than it was already due, and
+/// that wait is not yet met. The same landing, or an older one (a
+/// reorganization moved the block down), draws nothing, so asking every
+/// tick never shortens or lengthens the wait, and a wait already met stays
+/// met. With no landing the kept wait stands.
 pub(crate) fn spacing_due(kept: Option<SpacedUntil>, landed: Option<u32>, draw: impl FnOnce() -> u32) -> Option<SpacedUntil> {
     match (kept, landed) {
         (Some(k), Some(la)) if la <= k.landed => Some(k),
         (kept, Some(la)) => {
             let wait = draw().clamp(SPACING_MIN_BLOCKS, SPACING_MAX_BLOCKS);
             let due = la.saturating_add(wait).max(kept.map_or(0, |k| k.due));
-            Some(SpacedUntil { landed: la, due })
+            Some(SpacedUntil { landed: la, due, met: false })
         }
         (kept, None) => kept,
     }
@@ -937,8 +944,13 @@ impl WalletLease {
     /// its parking as of `now`, and a settling one by the height the chain
     /// spent it at. A parked spend an older node left with no bundle keeps
     /// no settling record once it lands, so its landing is not seen here.
-    /// Callers hold the gate after a reconciliation, so a spend that landed
-    /// is read settling, not in flight.
+    /// Callers hold the gate after a reconciliation, which reads a spend
+    /// that landed as settling once it is due ([`RECONCILE_GRACE`] after its
+    /// parking) and the chain could be read; until then such a spend is
+    /// still parked here and counts as in flight, which holds the other
+    /// payers too. A spend the peers refuse as spent already, landed since
+    /// the reconciliation's listing was read, is read from the chain again
+    /// before it is let go ([`second_word`]), so its landing is kept.
     pub(crate) fn other_spends(&self, payer: Payer, puzzle_hash: Bytes32, now: Instant) -> OtherSpends {
         let own = |paid_by: Option<Payer>, bundle: Option<&SpendBundle>| paid_by == Some(payer) || bundle.is_some_and(|b| spends_at(b, puzzle_hash));
         let in_flight = {
@@ -957,9 +969,11 @@ impl WalletLease {
     /// at `now`: held while another payer's spend is in flight; otherwise
     /// due from the block its wait gives ([`spacing_due`], drawn from `rng`
     /// once for a payer and a landing, and kept in this run's memory); and
-    /// clear when no other payer's spend landed that this payer waited on.
-    /// The caller compares [`Spacing::Due`]'s block with the agreed peak.
-    /// Callers hold the gate after a reconciliation
+    /// clear when no other payer's spend landed that this payer still waits
+    /// on: none landed, or the wait drawn for the latest was met
+    /// ([`WalletLease::spacing_met`]). The caller compares
+    /// [`Spacing::Due`]'s block with the agreed peak, and says so once the
+    /// peak has reached it. Callers hold the gate after a reconciliation
     /// ([`WalletLease::other_spends`]).
     pub(crate) fn spacing<R: rand::Rng + ?Sized>(&self, payer: Payer, puzzle_hash: Bytes32, now: Instant, rng: &mut R) -> Spacing {
         let others = self.other_spends(payer, puzzle_hash, now);
@@ -975,8 +989,24 @@ impl WalletLease {
         }
         match until {
             _ if others.in_flight => Spacing::InFlight,
-            Some(until) => Spacing::Due(until.due),
-            None => Spacing::Clear,
+            Some(until) if !until.met => Spacing::Due(until.due),
+            _ => Spacing::Clear,
+        }
+    }
+
+    /// The agreed peak has reached `block`, the block [`WalletLease::spacing`]
+    /// gave `payer` as due: the wait kept for it is met. It holds nothing
+    /// from here on, and the payer's later writes are not asked the peak
+    /// for it, which a chain that cannot give one would otherwise fail
+    /// ([`claim_write::BurnerWait::PeakUnavailable`]) with nothing left to
+    /// wait for. A landing newer than the one it was drawn for draws a new
+    /// wait ([`spacing_due`]). A wait due later than `block` is not met by
+    /// it.
+    pub(crate) fn spacing_met(&self, payer: Payer, block: u32) {
+        if let Some(kept) = self.spacing.lock().unwrap().get_mut(&payer.0) {
+            if kept.due <= block {
+                kept.met = true;
+            }
         }
     }
 
@@ -1450,8 +1480,8 @@ impl WalletLease {
                 _ => break !truncated,
             }
         };
-        let spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
-        let spent_heights: HashMap<Bytes32, u32> =
+        let mut spent_on_chain: HashMap<Bytes32, bool> = records.iter().map(|r| (r.coin.coin_id(), r.spent)).collect();
+        let mut spent_heights: HashMap<Bytes32, u32> =
             records.iter().filter(|r| r.spent).map(|r| (r.coin.coin_id(), r.spent_block_index)).collect();
         // One liveness question per spend the chain still lists unspent in
         // full (see `mempool_probes`): its bundle goes to the peers again, and
@@ -1479,6 +1509,27 @@ impl WalletLease {
                 }
             };
             in_mempool.insert(spend, live);
+        }
+        // A spend the peers call dead is not let go on their word alone: the
+        // chain is read once more first ([`second_word`]). A block that took
+        // the spend after the listing above was read makes every peer refuse
+        // its bundle as a double spend, which reads as dead though the spend
+        // landed, and released so it would keep no settling record: T4 would
+        // then not know of the landing (stage 4 design §4.3).
+        let refused: Vec<Bytes32> = due
+            .iter()
+            .filter(|d| in_mempool.get(&d.spend).copied().flatten() == Some(false))
+            .flat_map(|d| d.coins.iter().map(|c| c.coin_id))
+            .collect();
+        if !refused.is_empty() {
+            let again: Option<HashMap<Bytes32, Option<u32>>> = match client.coin_records_by_names(refused, true, None).await {
+                Ok(listing) => Some(listing.records.iter().map(|r| (r.coin.coin_id(), r.spent.then_some(r.spent_block_index))).collect()),
+                Err(e) => {
+                    eprintln!("⛓️ wallet lease: coin lookup after the peers' refusal {e}; the refused spends stay parked");
+                    None
+                }
+            };
+            second_word(&due, again.as_ref(), &mut in_mempool, &mut spent_on_chain, &mut spent_heights);
         }
         // The height the listing was judged at for a coin it NAMES (its spent
         // flag stands as of it, cut short or not), and for one it leaves out
@@ -1765,6 +1816,48 @@ pub fn mempool_probes(
         .cloned()
         .take(MAX_MEMPOOL_PROBES)
         .collect()
+}
+
+/// The chain's second word on the spends the peers called dead
+/// (`in_mempool` holds `Some(false)` for each), before any is released on
+/// their word: `again` is a second listing of those spends' inputs, read
+/// after the peers answered (each coin it names, with the height it was
+/// spent at, or none for one unspent; `None`: it could not be read).
+///
+/// The first listing named every input of such a spend unspent. A block
+/// that took the spend between that listing and the question makes every
+/// peer refuse the bundle as a double spend, which is a final refusal, and
+/// the spend would be released as dropped and forgotten though it landed.
+/// So where the second listing names an input spent, the chain's word
+/// stands for it: [`settle`] releases the spend as spent, and it is kept
+/// settling under that height, as any spend that landed. The peers' word
+/// stands only for a spend whose every input the second listing still names
+/// unspent. A spend the second listing could not be read for, or leaves an
+/// input out of, is unasked again (`None`), so it stays parked and the next
+/// pass judges it from its own listing.
+pub fn second_word(
+    due: &[DueSpend],
+    again: Option<&HashMap<Bytes32, Option<u32>>>,
+    in_mempool: &mut HashMap<u64, Option<bool>>,
+    spent_on_chain: &mut HashMap<Bytes32, bool>,
+    spent_heights: &mut HashMap<Bytes32, u32>,
+) {
+    let refused: Vec<&DueSpend> = due.iter().filter(|d| in_mempool.get(&d.spend).copied().flatten() == Some(false)).collect();
+    for d in refused {
+        let Some(again) = again else {
+            in_mempool.insert(d.spend, None);
+            continue;
+        };
+        let spent: Vec<(Bytes32, u32)> = d.coins.iter().filter_map(|c| again.get(&c.coin_id).copied().flatten().map(|at| (c.coin_id, at))).collect();
+        if !spent.is_empty() {
+            for (coin, at) in spent {
+                spent_on_chain.insert(coin, true);
+                spent_heights.insert(coin, at);
+            }
+        } else if !d.coins.iter().all(|c| again.contains_key(&c.coin_id)) {
+            in_mempool.insert(d.spend, None);
+        }
+    }
 }
 
 /// Which parked spends to release, from what the chain and the mempool said.
@@ -3707,6 +3800,8 @@ pub const BEACON_MARK_FILE: &str = "beacon_mark.json";
 /// settling, its listing cut short, no dish coin ready, the edition's gifts
 /// all given, the lease not parking, the chain unread) is none, and the
 /// knock arm tries again after [`HEARTBEAT_RETRY_SECS`] ([`knock_paced`]);
+/// one that waits its turn after another write of this node (§4.3 T4,
+/// [`spaced`]) is none either, and is tried again at the arm's next tick;
 /// every other failure, a push the peers refused among them, is one
 /// ([`knock_attempt_counts`]). A push refused because the chain is busy
 /// ([`chain_busy`]) is such a refusal, and uses one (§10: a first push
@@ -3724,8 +3819,8 @@ pub const MAX_KNOCK_ATTEMPTS: u8 = 3;
 /// - [`MemoWait`]: the SSF wallet still settling a spend, or unfunded;
 /// - `claim_write::BurnerWait`: a burner's every wait (its spend in flight
 ///   or settling, its listing cut short, no peak, no dish coin ready, the
-///   fuse blown, and for the listing's first write a spend of the SSF
-///   wallet's in flight);
+///   fuse blown, its turn after another payer's write of this node, and
+///   for the listing's first write a spend of the SSF wallet's in flight);
 /// - `chia_faucet::ClaimToError::NoCoinReady` and `PeakUnavailable`: a dry
 ///   or griefed dish, or no peak to judge it by;
 /// - [`LeaseError`] and [`PushError::NotSent`]: the lease sealed, or not
@@ -3813,7 +3908,9 @@ fn knock_failure_words(burners: bool, e: &anyhow::Error) -> String {
 /// beacon waits and that waiting costs nothing (stage 4 design §10, Mempool
 /// full), a wait ([`is_typed_wait`]) says it waits, and anything else that
 /// it failed, each in its own text. The arm tries again on its retry
-/// cadence after every one; the beacon keeps no count of attempts. The
+/// cadence after every one but T4's wait ([`spaced`]), whose line says the
+/// beacon waits its turn and is tried again at each tick; the beacon keeps
+/// no count of attempts. The
 /// burner's waits, the lane's refusals and the lease's errors name no key,
 /// puzzle hash or address, so on the burner path neither does the line.
 fn beacon_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> String {
@@ -3887,7 +3984,9 @@ fn listing_failure_words(e: &anyhow::Error, last_week: bool) -> String {
 /// the chain is busy ([`chain_busy`]) says so in [`CHAIN_BUSY_WORDS`] and
 /// that waiting costs nothing (stage 4 design §10, Mempool full): it is a
 /// refusal, which paid nothing, and the arm tries again on its retry cadence,
-/// as after every failure. Anything else failed, in its own text. The
+/// as after every failure. T4's wait ([`spaced`]) says the listing waits
+/// its turn and is tried again at each tick, with no rest. Anything else
+/// failed, in its own text. The
 /// burner's waits, the lane's refusals and the lease's errors name no key,
 /// puzzle hash or address of the burner, so neither does the line.
 fn listing_failure_line(burner_path: bool, era: u64, e: &anyhow::Error) -> String {
@@ -3923,9 +4022,21 @@ fn knock_attempt_counts(burners: bool, e: &anyhow::Error) -> bool {
 /// typed wait ([`is_typed_wait`]), so it is no knock attempt, and it keeps
 /// the tick, so the arms keep their order while one waits (listing, then
 /// knock, then beacon, then the rooms). Unlike every other wait, the arm
-/// that met it does not rest for the retry cadence ([`paced_from`]): its
-/// due block is at most [`SPACING_MAX_BLOCKS`] blocks off, and a rest of
-/// [`HEARTBEAT_RETRY_SECS`] could add a quarter as much again.
+/// that met it does not rest for the retry cadence ([`paced_from`]): the
+/// write is due at a block, at most [`SPACING_MAX_BLOCKS`] after the other
+/// payer's spend landed, and a rest of [`HEARTBEAT_RETRY_SECS`] could put
+/// it a quarter as much again past that block.
+///
+/// So while one burner's write waits its turn, the arms after it get no
+/// tick: neither the knocks behind a waiting listing, nor the beacon and
+/// its mark's judging, nor the rooms' v1 records, which the SSF wallet
+/// writes and which lapse if the wait outlasts them. The wait is the
+/// other spend's time in flight, at most [`SPACING_IN_FLIGHT_HOLD`], and
+/// then 32 to 64 blocks, so about 40 minutes at the longest behind one
+/// spend, and each write queued behind it waits its own turn after it:
+/// several knocks go out one at a time (design owner question 9). A spend
+/// of the SSF wallet's, which is not spaced itself, starts such a wait
+/// each time it goes out.
 fn spaced(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| matches!(cause.downcast_ref::<claim_write::BurnerWait>(), Some(claim_write::BurnerWait::Spaced)))
 }
@@ -3940,20 +4051,34 @@ fn paced_from<T>(tried: Instant, done: &Result<T>) -> Option<Instant> {
     }
 }
 
-/// Whether an arm says T4's wait now: at the first of a run of tries that
-/// met it (`waits`), not at every tick of the run. `said` is the arm's own
-/// memory of the last try, which any other outcome clears.
-fn spaced_first(said: &mut bool, waits: bool) -> bool {
-    let first = waits && !*said;
-    *said = waits;
-    first
+/// The line an arm prints after a try that did not write: `line`, unless
+/// the try met T4's wait (`waits`, [`spaced`]) and `line` is the line the
+/// arm said for its try before, so a run of ticks at which one write waits
+/// its turn says so once and not at every tick. `said` is the arm's own
+/// memory: the line of its last try if that met T4's wait, and nothing
+/// after any other outcome (a write, with no `line`, among them), so the
+/// next run is said again. The line names what waits (the listing's and the
+/// beacon's era, the knock's host and room), so another write's wait is
+/// another line and is said, whatever was said before it.
+fn said_once(said: &mut Option<String>, line: Option<String>, waits: bool) -> Option<String> {
+    if !waits {
+        *said = None;
+        return line;
+    }
+    if *said == line {
+        return None;
+    }
+    said.clone_from(&line);
+    line
 }
 
 /// Whether the knock arm may try at `now`, the last knock that waited having
 /// waited at `wait` ([`knock_attempt_counts`]): at once if none did, and
 /// otherwise once [`HEARTBEAT_RETRY_SECS`] have passed, so a wait does not
 /// take every tick from the beacon and the rooms (stage 4 design §5.2:
-/// attempts are paced by the retry).
+/// attempts are paced by the retry). T4's wait is the one that does not
+/// rest the arm ([`knock_not_written`] leaves `wait` as it was): a knock
+/// waiting its turn is tried at every tick and takes each one ([`spaced`]).
 fn knock_paced(wait: Option<Instant>, now: Instant) -> bool {
     wait.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
 }
@@ -4095,7 +4220,7 @@ fn knock_skipped(book: &KnockBook, found: &ChainKnocked, host: &str, era: u64) -
 /// as they were and the arm's rest as it was, so the arm tries it again at
 /// its next tick and it goes out at its due block, in its place. Its line
 /// is returned, not printed, for the arm to say once for a run of such
-/// ticks ([`spaced_first`]); every other case returns none.
+/// ticks ([`said_once`]); every other case returns none.
 ///
 /// `claim_write::AlreadyKnocked` is no typed wait ([`is_typed_wait`]), and
 /// [`knock_failed`] would count it as an attempt and queue it again, to read
@@ -4983,8 +5108,10 @@ async fn publish_knock_on(
 /// `claim_write::AlreadyKnocked`, and nothing is written. The write names
 /// K(h) as its payer ([`Payer::of_burner`]), which the knock book files
 /// beside its coins ([`sent_knock_of`]), and the money key pays for
-/// nothing: the knock never waits on a spend of the SSF wallet's in flight,
-/// and its payer `money` is asked of the knock's hint alone (below).
+/// nothing. The knock waits on a spend of the SSF wallet's only as it waits
+/// on any other payer's of this node, for its turn (§4.3 T4,
+/// `claim_write::BurnerWait::Spaced`), and its payer `money` is asked of the
+/// knock's hint alone (below).
 ///
 /// `root` must be `net`'s ([`crate::chia_burner::BurnerRoot::net`]): K(h)
 /// is derived from the inbox hint of the root's network and the knock is
@@ -5617,12 +5744,13 @@ pub async fn heartbeat_loop(
     // knock arm rests for the retry cadence from then (`knock_paced`).
     // With burners off it is never set, and the arm is today's.
     let mut knock_wait: Option<Instant> = None;
-    // Whether each arm's last try met T4's wait (§4.3, `spaced`), so its
-    // line is said once for a run of such ticks (`spaced_first`). Only a
-    // burner's writer gives that wait, so with burners off none is set.
-    let mut listing_spaced = false;
-    let mut knock_spaced = false;
-    let mut beacon_spaced = false;
+    // The line of each arm's last try, if that met T4's wait (§4.3,
+    // `spaced`), so it is said once for a run of such ticks (`said_once`).
+    // Only a burner's writer gives that wait, so with burners off none is
+    // set.
+    let mut listing_said: Option<String> = None;
+    let mut knock_said: Option<String> = None;
+    let mut beacon_said: Option<String> = None;
     // The hosts this run found its knock already written to this era by the
     // knock's own key (`ChainKnocked`, `knock_not_written`), skipped for the
     // rest of the era. Only the burner path writes a knock from its own key,
@@ -5919,8 +6047,8 @@ pub async fn heartbeat_loop(
                     // T4's wait, which is tried again at the next tick
                     // (`paced_from`) and said once for a run of such ticks.
                     node_attempt = paced_from(tried, &written);
-                    let waits_its_turn = written.as_ref().err().is_some_and(spaced);
-                    let said_before = !spaced_first(&mut listing_spaced, waits_its_turn);
+                    let failed = written.as_ref().err().map(|e| listing_failure_line(listing_root.is_some(), era, e));
+                    let say = said_once(&mut listing_said, failed, written.as_ref().err().is_some_and(spaced));
                     match written {
                         Ok((hint, write)) => {
                             let writes = match &node_mark {
@@ -5945,8 +6073,8 @@ pub async fn heartbeat_loop(
                             node_last_error = None;
                         }
                         Err(e) => {
-                            if !(waits_its_turn && said_before) {
-                                eprintln!("{}", listing_failure_line(listing_root.is_some(), era, &e));
+                            if let Some(line) = say {
+                                eprintln!("{line}");
                             }
                             node_last_error = Some(match &listing_root {
                                 // §10's words. Last week's listing still works
@@ -6032,9 +6160,13 @@ pub async fn heartbeat_loop(
                 }
                 break Some((req, cap.room_key));
             };
+            // No knock to try: none waits its turn, so the next wait is said.
+            if next.is_none() {
+                knock_said = None;
+            }
             if let Some((req, room_key)) = next {
-                // Whether this try met T4's wait (`knock_not_written`).
-                let mut waits_its_turn = false;
+                // The line of a try that met T4's wait (`knock_not_written`).
+                let mut waits_its_turn: Option<String> = None;
                 // The room's word is read AGAIN at spend time, under the card
                 // gate, after the lease and coin lookups (#272 review round 5):
                 // a cap turning the room public or its switch off meanwhile
@@ -6102,16 +6234,16 @@ pub async fn heartbeat_loop(
                     // (`knock_not_written`).
                     //
                     // One that met T4's wait is back at the queue's front
-                    // with its line, said once for a run of such ticks.
+                    // with its line, said below once for a run of such
+                    // ticks (`said_once`).
                     Err(e) => {
-                        let line = knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);
-                        waits_its_turn = line.is_some();
-                        if let Some(line) = line.filter(|_| !knock_spaced) {
-                            eprintln!("{line}");
-                        }
+                        waits_its_turn = knock_not_written(burners, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);
                     }
                 }
-                knock_spaced = waits_its_turn;
+                let waits = waits_its_turn.is_some();
+                if let Some(line) = said_once(&mut knock_said, waits_its_turn, waits) {
+                    eprintln!("{line}");
+                }
                 continue; // one spend per tick
             }
         }
@@ -6216,8 +6348,8 @@ pub async fn heartbeat_loop(
                 // Paced from this try, save after T4's wait (`paced_from`),
                 // whose line is said once for a run of such ticks.
                 beacon_attempt = paced_from(tried, &done);
-                let waits_its_turn = done.as_ref().err().is_some_and(spaced);
-                let said_before = !spaced_first(&mut beacon_spaced, waits_its_turn);
+                let failed = done.as_ref().err().map(|e| beacon_failure_line(listing_root.is_some(), era, e));
+                let say = said_once(&mut beacon_said, failed, done.as_ref().err().is_some_and(spaced));
                 if let Some(line) = beacon_guard_note(&mut beacon_guard_said, &done) {
                     eprintln!("{line}");
                 }
@@ -6236,9 +6368,9 @@ pub async fn heartbeat_loop(
                         beacon_mark = Some(mark);
                     }
                     // With burner keys off, the line it always had.
-                    Err(e) => {
-                        if !(waits_its_turn && said_before) {
-                            eprintln!("{}", beacon_failure_line(listing_root.is_some(), era, &e));
+                    Err(_) => {
+                        if let Some(line) = say {
+                            eprintln!("{line}");
                         }
                     }
                 }
@@ -9040,21 +9172,27 @@ mod tests {
     /// record settled and gone) draws nothing and keeps the wait; a newer
     /// landing draws again from its own height and never brings the due
     /// block forward. A draw outside 32..=64 is cut to it, and the top of
-    /// the height's range does not wrap.
+    /// the height's range does not wrap. A wait that was met stays met for
+    /// the landing it was drawn for, and a newer landing's wait is not met.
     #[test]
     fn a_landing_draws_a_payers_wait_once_between_32_and_64_blocks_and_a_newer_one_never_brings_it_forward() {
         let never = || -> u32 { panic!("nothing is drawn") };
         assert_eq!(spacing_due(None, None, never), None, "nothing kept, nothing landed");
         let first = spacing_due(None, Some(1000), || 40).expect("a landing draws");
-        assert_eq!(first, SpacedUntil { landed: 1000, due: 1040 });
+        assert_eq!(first, SpacedUntil { landed: 1000, due: 1040, met: false });
         assert_eq!(spacing_due(Some(first), Some(1000), never), Some(first), "the same landing, at every tick");
         assert_eq!(spacing_due(Some(first), Some(990), never), Some(first), "an older one: a block moved down");
         assert_eq!(spacing_due(Some(first), None, never), Some(first), "its record settled and gone: the wait stands");
-        assert_eq!(spacing_due(Some(first), Some(1001), || 64), Some(SpacedUntil { landed: 1001, due: 1065 }), "a newer landing draws from its own height");
-        let long = SpacedUntil { landed: 1000, due: 1064 };
-        assert_eq!(spacing_due(Some(long), Some(1001), || 32), Some(SpacedUntil { landed: 1001, due: 1064 }), "and never brings the due block forward");
+        assert_eq!(spacing_due(Some(first), Some(1001), || 64), Some(SpacedUntil { landed: 1001, due: 1065, met: false }), "a newer landing draws from its own height");
+        let long = SpacedUntil { landed: 1000, due: 1064, met: false };
+        assert_eq!(spacing_due(Some(long), Some(1001), || 32), Some(SpacedUntil { landed: 1001, due: 1064, met: false }), "and never brings the due block forward");
+        let met = SpacedUntil { met: true, ..first };
+        for landed in [Some(1000), Some(990), None] {
+            assert_eq!(spacing_due(Some(met), landed, never), Some(met), "met, and {landed:?} asked about again: it stays met and draws nothing");
+        }
+        assert_eq!(spacing_due(Some(met), Some(1001), || 32), Some(SpacedUntil { landed: 1001, due: 1040, met: false }), "a newer landing's wait is not met, and never due earlier");
         for (draw, wait) in [(0, 32), (31, 32), (32, 32), (33, 33), (63, 63), (64, 64), (65, 64), (u32::MAX, 64)] {
-            assert_eq!(spacing_due(None, Some(5), || draw), Some(SpacedUntil { landed: 5, due: 5 + wait }), "a draw of {draw}");
+            assert_eq!(spacing_due(None, Some(5), || draw), Some(SpacedUntil { landed: 5, due: 5 + wait, met: false }), "a draw of {draw}");
         }
         assert_eq!(spacing_due(None, Some(u32::MAX - 3), || 32).map(|k| k.due), Some(u32::MAX), "no wrap at the top");
         assert_eq!((SPACING_MIN_BLOCKS, SPACING_MAX_BLOCKS), (32, 64), "§4.3 T4");
@@ -9251,6 +9389,185 @@ mod tests {
         }
         assert_eq!((waits.first().copied(), waits.last().copied()), (Some(SPACING_MIN_BLOCKS), Some(SPACING_MAX_BLOCKS)), "every wait in 32..=64, both ends drawn");
         assert_eq!(bounded.spacing.lock().unwrap().len(), MAX_SPACED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chain's second word on a spend the peers refused for good
+    /// ([`second_word`]). Named spent by the second listing, the spend is
+    /// the chain's to settle: the coin reads spent at that height, so
+    /// [`settle`] releases the spend as spent, whatever the peers said. Named
+    /// unspent in every input, it is the peers' to settle, as before. With
+    /// the second listing unread, or an input left out of it, the spend is
+    /// unasked again and stays parked. A spend the peers did not refuse is
+    /// left as it was, whatever the second listing names.
+    #[test]
+    fn a_refused_spend_is_released_as_dropped_only_when_the_chain_read_again_still_names_every_input_unspent() {
+        let coin = |n: u8| Bytes32::new([n; 32]);
+        let due_of = |spend: u64, coins: &[u8]| DueSpend { spend, coins: coins.iter().map(|n| ParkedInput { coin_id: coin(*n), seen_at: Some(900) }).collect(), bundle: None, payer: None };
+        let due = vec![due_of(1, &[1]), due_of(2, &[2, 3]), due_of(3, &[4]), due_of(4, &[5, 6]), due_of(5, &[7]), due_of(6, &[8])];
+        let first: HashMap<Bytes32, bool> = (1..=8).map(|n| (coin(n), false)).collect();
+        let asked: HashMap<u64, Option<bool>> = [(1, Some(false)), (2, Some(false)), (3, Some(false)), (4, Some(false)), (5, Some(true)), (6, None)].into();
+        // Spend 1: its coin spent at 1001. Spend 2: one of two spent at 1002.
+        // Spend 3: unspent still. Spend 4: one input left out. Spends 5 and
+        // 6, not refused: named spent, and left alone.
+        let again: HashMap<Bytes32, Option<u32>> =
+            [(coin(1), Some(1001)), (coin(2), None), (coin(3), Some(1002)), (coin(4), None), (coin(5), None), (coin(7), Some(1003)), (coin(8), Some(1003))].into();
+
+        let (mut in_mempool, mut spent_on_chain, mut spent_heights) = (asked.clone(), first.clone(), HashMap::new());
+        second_word(&due, Some(&again), &mut in_mempool, &mut spent_on_chain, &mut spent_heights);
+        assert_eq!(in_mempool, [(1, Some(false)), (2, Some(false)), (3, Some(false)), (4, None), (5, Some(true)), (6, None)].into(), "an input left out: unasked, so it stays parked");
+        let spent: HashMap<Bytes32, bool> = (1..=8).map(|n| (coin(n), n == 1 || n == 3)).collect();
+        assert_eq!(spent_on_chain, spent, "the chain's word for the coins it names spent, of the refused spends alone");
+        assert_eq!(spent_heights, [(coin(1), 1001), (coin(3), 1002)].into());
+        let mut released = settle(&due, &spent_on_chain, &in_mempool, Some(1003));
+        released.sort();
+        assert_eq!(released, vec![1, 2, 3], "landed, landed, and dead");
+        let words: HashMap<Bytes32, LeaseWord> = release_words(&due, &released, &spent_on_chain, &in_mempool).into_iter().collect();
+        assert_eq!(words, [(coin(1), LeaseWord::Spent), (coin(2), LeaseWord::Spent), (coin(3), LeaseWord::Spent), (coin(4), LeaseWord::Dropped)].into());
+
+        // The second listing unread: every refused spend is unasked again.
+        let (mut in_mempool, mut spent_on_chain, mut spent_heights) = (asked.clone(), first.clone(), HashMap::new());
+        second_word(&due, None, &mut in_mempool, &mut spent_on_chain, &mut spent_heights);
+        assert_eq!(in_mempool, [(1, None), (2, None), (3, None), (4, None), (5, Some(true)), (6, None)].into());
+        assert_eq!((spent_on_chain, spent_heights), (first, HashMap::new()));
+        assert_eq!(settle(&due, &(1..=8).map(|n| (coin(n), false)).collect(), &in_mempool, Some(1003)), Vec::<u64>::new(), "nothing is let go");
+    }
+
+    /// A spend that landed between the reconciliation's listing and its
+    /// liveness question is not forgotten (stage 4 design §4.3 T4 measures
+    /// the other payers' wait from its landing). The listing names its coin
+    /// unspent; the peers then refuse its bundle for good, as they refuse a
+    /// spend the chain has just taken; the chain, read again, names the coin
+    /// spent at 1001. The spend is released as spent and kept settling at
+    /// that height, and another payer is spaced from it. Read again and still
+    /// unspent, the spend is dropped, as before, and spaces nobody. With the
+    /// second listing unread, or silent on the coin, the spend stays parked,
+    /// in flight to the other payers, and a later pass that finds it spent
+    /// keeps it settling. A spend the peers call live is not asked about
+    /// twice, and off a test network no spend is asked about at all.
+    #[tokio::test]
+    async fn a_spend_the_chain_took_after_the_leases_listing_was_read_is_kept_settling_at_the_height_read_again() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let ours = Coin::new(Bytes32::new([93u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let id = ours.coin_id();
+        let t0 = Instant::now();
+        let me = burner();
+        let page = |spent: Option<u32>, judged_at: u32| CoinListing {
+            records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(judged_at),
+        };
+        let silent = |judged_at: u32| CoinListing { records: vec![], truncated: false, next_cursor: None, judged_at: Some(judged_at) };
+        let parked = || {
+            let lease = WalletLease::new();
+            lease.park_with_bundle_at([(id, 900)], Some((&plain, beacon())), t0).unwrap();
+            lease
+        };
+        let due = t0 + RECONCILE_GRACE;
+
+        // Landed after the listing: the chain's second word keeps it.
+        let lease = parked();
+        let chain = Scripted::new(vec![page(None, 1000), page(Some(1001), 1001)]).with_liveness(false);
+        lease.reconcile_at(T11, &chain, due).await;
+        assert_eq!(*chain.asked_names.lock().unwrap(), vec![vec![id], vec![id]], "the listing, and the chain read again after the refusal");
+        assert_eq!(chain.sent.load(std::sync::atomic::Ordering::Relaxed), 1, "one liveness question");
+        assert!(lease.is_settling(&id) && !lease.is_parked(&id), "released as spent, and kept settling");
+        assert_eq!(lease.lease_word(&id), LeaseWord::Spent);
+        assert_eq!(lease.other_spends(me, me.0, due), OtherSpends { in_flight: false, landed: Some(1001) }, "T4 reads the landing");
+        assert!(matches!(lease.spacing(me, me.0, due, &mut seeded(1)), Spacing::Due(block) if (1033..=1065).contains(&block)));
+
+        // Dead: every input still unspent when read again.
+        let lease = parked();
+        let chain = Scripted::new(vec![page(None, 1000), page(None, 1001)]).with_liveness(false);
+        lease.reconcile_at(T11, &chain, due).await;
+        assert_eq!(chain.asked_names.lock().unwrap().len(), 2);
+        assert!(!lease.is_settling(&id) && !lease.is_parked(&id), "let go");
+        assert_eq!(lease.lease_word(&id), LeaseWord::Dropped);
+        assert_eq!(lease.spacing(me, me.0, due, &mut seeded(1)), Spacing::Clear, "it never landed: it spaces nobody");
+
+        // The second listing unread, or silent on the coin: parked still.
+        for (what, second) in [("unread", None), ("silent on the coin", Some(silent(1001)))] {
+            let lease = parked();
+            let chain = Scripted::new(std::iter::once(page(None, 1000)).chain(second).collect()).with_liveness(false);
+            lease.reconcile_at(T11, &chain, due).await;
+            assert_eq!(chain.asked_names.lock().unwrap().len(), 2, "{what}");
+            assert!(lease.is_parked(&id) && !lease.is_settling(&id), "{what}: not let go on the peers' word alone");
+            assert_eq!(lease.spacing(me, me.0, due, &mut seeded(1)), Spacing::InFlight, "{what}: in flight to the other payers");
+            lease.reconcile_at(T11, &Scripted::new(vec![page(Some(1001), 1002)]), due).await;
+            assert!(lease.is_settling(&id), "{what}: the next pass finds it spent");
+            assert_eq!(lease.other_spends(me, me.0, due).landed, Some(1001), "{what}");
+        }
+
+        // Live, or not asked: one listing, and the spend stays parked.
+        let lease = parked();
+        let chain = Scripted::new(vec![page(None, 1000), page(Some(1001), 1001)]).with_liveness(true);
+        lease.reconcile_at(T11, &chain, due).await;
+        assert_eq!((chain.asked_names.lock().unwrap().len(), chain.sent.load(std::sync::atomic::Ordering::Relaxed)), (1, 1), "live: the chain is not read again");
+        assert!(lease.is_parked(&id));
+        let lease = parked();
+        let chain = Scripted::new(vec![page(None, 1000), page(Some(1001), 1001)]).with_liveness(false);
+        lease.reconcile_at(crate::chia_network::ChiaNet::Mainnet, &chain, due).await;
+        assert_eq!((chain.asked_names.lock().unwrap().len(), chain.sent.load(std::sync::atomic::Ordering::Relaxed)), (1, 0), "off a test network no bundle goes out again");
+        assert!(lease.is_parked(&id));
+    }
+
+    /// A wait the agreed peak has met holds nothing (T4, stage 4 design
+    /// §4.3). Told that the peak reached the block drawn
+    /// ([`WalletLease::spacing_met`]), the lease gives the payer clear from
+    /// then on, so its later writes are not asked the peak again; a block
+    /// short of the one drawn meets nothing, and neither does the word for
+    /// another payer. The landing stays on record, so while its settling
+    /// record lasts it draws no second wait. Another payer's spend in flight
+    /// still holds the payer, and once that spend lands, a wait is drawn for
+    /// the new landing, not met.
+    #[tokio::test]
+    async fn a_wait_the_peak_has_met_holds_nothing_until_a_newer_landing_draws_another() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use rand::RngCore;
+        let dir = std::env::temp_dir().join(format!("ssf-lease-spacing-met-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let t0 = Instant::now();
+        let me = burner();
+        let same = |a: &StdRng, b: &StdRng| a.clone().next_u64() == b.clone().next_u64();
+        let mut rng = seeded(3);
+        let lease = settling_lease(&dir, "met", &[(1000, Some(money()), &plain)]);
+        let Spacing::Due(due) = lease.spacing(me, me.0, t0, &mut rng) else { panic!("due at a block") };
+        let drawn = rng.clone();
+
+        lease.spacing_met(me, due - 1);
+        assert_eq!(lease.spacing(me, me.0, t0, &mut rng), Spacing::Due(due), "a block short of the one drawn meets nothing");
+        lease.spacing_met(beacon(), due);
+        assert_eq!(lease.spacing(me, me.0, t0, &mut rng), Spacing::Due(due), "nor does another payer's word");
+        lease.spacing_met(me, due);
+        for _ in 0..3 {
+            assert_eq!(lease.spacing(me, me.0, t0, &mut rng), Spacing::Clear, "met: nothing holds the payer");
+        }
+        assert_eq!(lease.other_spends(me, me.0, t0).landed, Some(1000), "the landing is still settling");
+        assert_eq!(lease.spacing.lock().unwrap().get(&me.0).copied(), Some(SpacedUntil { landed: 1000, due, met: true }), "and stays on record");
+        assert!(same(&rng, &drawn), "so it draws no second wait");
+
+        // Another payer's spend goes out: in flight it holds the payer, met
+        // or not, and landed at 1010 it draws a wait of its own.
+        let beacons_coin = Coin::new(Bytes32::new([83u8; 32]), Bytes32::new([2u8; 32]), 1);
+        lease.park_with_bundle_at([(beacons_coin.coin_id(), 900)], Some((&plain, beacon())), t0).unwrap();
+        assert_eq!(lease.spacing(me, me.0, t0, &mut rng), Spacing::InFlight);
+        let listing = Scripted::new(vec![CoinListing {
+            records: vec![CoinRecord { coin: beacons_coin, confirmed_block_index: 900, spent: true, spent_block_index: 1010 }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(1011),
+        }]);
+        lease.reconcile_at(T11, &listing, t0 + RECONCILE_GRACE).await;
+        assert!(lease.is_settling(&beacons_coin.coin_id()), "landed at 1010");
+        let Spacing::Due(next) = lease.spacing(me, me.0, t0, &mut rng) else { panic!("a newer landing holds the payer again") };
+        assert!(next >= due && next >= 1042 && next <= 1074.max(due), "32 to 64 blocks past the new landing, never earlier than before: {next} after {due}");
+        assert!(!same(&rng, &drawn), "drawn for the new landing");
+        lease.spacing_met(me, next);
+        assert_eq!(lease.spacing(me, me.0, t0, &mut rng), Spacing::Clear);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11190,7 +11507,9 @@ mod tests {
     /// outcome, a write, another wait or a failure, counts the cadence from
     /// the try. And the wait is said at the first of a run of tries that met
     /// it, not at every tick: any other outcome ends the run, and the next
-    /// such wait is said again.
+    /// such wait is said again. Every other failure's line is said at every
+    /// try, and a wait whose line is another's (the next era's listing, the
+    /// next knock) is said though the arm's last try waited too.
     #[test]
     fn a_spaced_try_starts_no_retry_cadence_and_is_said_once_for_a_run_of_ticks() {
         use super::claim_write::BurnerWait;
@@ -11204,10 +11523,28 @@ mod tests {
         }
         assert_eq!(paced_from::<()>(tried, &Err(anyhow!("a writer's error"))), Some(tried), "a failure is paced");
 
-        let mut said = false;
-        let run: Vec<bool> = [true, true, true, false, false, true, false, true, true].into_iter().map(|waits| spaced_first(&mut said, waits)).collect();
-        assert_eq!(run, [true, false, false, false, false, true, false, true, false], "said at the first tick of each run");
-        assert!(said, "the last try waited");
+        // What an arm says over a run of tries: (the try's line, whether it
+        // met T4's wait) and whether the line is said.
+        let tries: [(Option<&str>, bool, bool); 12] = [
+            (Some("era 4 waits its turn"), true, true),
+            (Some("era 4 waits its turn"), true, false),
+            (Some("era 4 waits its turn"), true, false),
+            (Some("era 4 failed"), false, true),
+            (Some("era 4 failed"), false, true),
+            (Some("era 4 waits its turn"), true, true),
+            (None, false, false),
+            (Some("era 4 waits its turn"), true, true),
+            (Some("era 4 waits its turn"), true, false),
+            (Some("era 5 waits its turn"), true, true),
+            (Some("era 5 waits its turn"), true, false),
+            (Some("era 4 waits its turn"), true, true),
+        ];
+        let mut said = None;
+        for (n, (line, waits, says)) in tries.into_iter().enumerate() {
+            let line = line.map(str::to_string);
+            assert_eq!(said_once(&mut said, line.clone(), waits), line.clone().filter(|_| says), "try {n}");
+            assert_eq!(said, line.filter(|_| waits), "try {n}: the memory is the line of a try that waited, and nothing after any other");
+        }
     }
 
     /// The knock arm's handling of a knock that met T4's wait (stage 4

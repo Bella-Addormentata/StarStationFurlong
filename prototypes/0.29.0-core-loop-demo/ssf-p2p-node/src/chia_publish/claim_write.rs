@@ -1074,6 +1074,9 @@ async fn write_slot<R: rand::Rng + ?Sized + Send>(
             if peak < block {
                 return Err(BurnerWait::Spaced.into());
             }
+            // Met: the key's later writes are not asked the peak for this
+            // wait again.
+            lease.spacing_met(payer, block);
         }
     }
     let (records, partial) = records_at(client, burner_ph).await?;
@@ -1194,11 +1197,14 @@ const CTX_CLAIM_WRITE_TEST: &str = "ssf-chia-claim-write-test-v1";
 const SELFTEST: &str = "⛓️🧪 claim-write selftest";
 
 /// How many times the self-test asks the writer while it only waits
-/// ([`BurnerWait`]), and how long it waits between asks: 45 minutes in all,
-/// past the longest T4 holds a burner behind another payer's spend, 20
-/// minutes while it is in flight and 64 blocks, about 20 minutes more, once
-/// it has landed (`chia_publish::SPACING_IN_FLIGHT_HOLD`,
-/// `chia_publish::SPACING_MAX_BLOCKS`).
+/// ([`BurnerWait`]), and how long it waits between asks: 44 minutes of
+/// waiting in all, past the longest T4 holds a burner behind ONE spend of
+/// another payer's, 20 minutes while it is in flight and 64 blocks, about
+/// 20 minutes more, once it has landed
+/// (`chia_publish::SPACING_IN_FLIGHT_HOLD`,
+/// `chia_publish::SPACING_MAX_BLOCKS`). A node whose other keys keep
+/// writing meanwhile can hold it longer, and the test then gives up with
+/// its last wait; it is run again.
 const SELFTEST_TRIES: u32 = 45;
 const SELFTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -2377,6 +2383,64 @@ mod tests {
         let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is held");
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Held), "the key's own spend first: {e:#}");
         assert!(chain.asked_spent.lock().unwrap().is_empty(), "held before the key's listing is read");
+        assert_eq!(sent(&chain), 0, "nothing sent");
+        assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
+    }
+
+    /// T4's wait, once met, is not asked of the peak again (stage 4 design
+    /// §4.3). Another burner's spend landed a block ago. With the agreed
+    /// peak at the latest block a wait can be drawn to, the knock's writer
+    /// goes on past T4, and the lease keeps the wait as met. The key's next
+    /// write, on a chain that gives no peak, is then not failed by T4 with
+    /// the key's listing unread, as a wait still owed is, fail closed: it
+    /// reads its listing and goes on to its claim, which waits for the peak
+    /// it cannot read.
+    #[tokio::test]
+    async fn a_knock_whose_wait_the_peak_met_is_not_asked_the_peak_for_it_again() {
+        use crate::chia_chain::testing::Scripted;
+        use crate::chia_chain::CoinListing;
+        use crate::chia_publish::SPACING_MAX_BLOCKS;
+        use rand::SeedableRng;
+        let net = ChiaNet::Testnet11;
+        let key = knock(net, 1);
+        let payer = Payer::of_burner(&key);
+        let other = burner(net, 2);
+        let coin = Coin::new(Bytes32::new([0x76; 32]), other.puzzle_hash(), 1);
+        let spent_at = SEEN_AT + 1;
+        let lease = WalletLease::new();
+        let input = ParkedInput { coin_id: coin.coin_id(), seen_at: Some(SEEN_AT) };
+        let bundle = SpendBundle::new(vec![], chia_bls::Signature::default());
+        lease.retire(&[], vec![(1, super::super::Settling { coins: vec![input], spent_at, bundle, payer: Some(Payer::of_burner(&other)) })], &[], &[], &[], Instant::now());
+        let found = || {
+            let spent = CoinRecord { coin, confirmed_block_index: SEEN_AT, spent: true, spent_block_index: spent_at };
+            CoinListing { records: vec![spent], truncated: false, next_cursor: None, judged_at: Some(spent_at + 1) }
+        };
+        let fuse = Mutex::new(GiftFuse::new());
+        let ask = |lease: &WalletLease| lease.spacing(payer, key.puzzle_hash(), Instant::now(), &mut rand::rngs::StdRng::seed_from_u64(9));
+
+        // Still owed, and no peak to compare its block with: T4 fails
+        // closed, the key's listing unread.
+        let chain = Scripted::new(vec![found(), page(vec![], false)]);
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{e:#}");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true], "the lease's settling coin alone");
+        assert!(matches!(ask(&lease), Spacing::Due(block) if block <= spent_at + SPACING_MAX_BLOCKS), "a wait is kept, not met");
+
+        // The peak at the latest block it can be due at: past T4, to the
+        // key's listing and on.
+        let chain = Scripted::new(vec![found(), page(vec![], false)]).with_peak(spent_at + SPACING_MAX_BLOCKS);
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("no dish is scripted, so nothing is written");
+        assert_ne!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::Spaced), "{e:#}");
+        assert!(chain.asked_spent.lock().unwrap().len() >= 2, "the key's listing was read");
+        assert_eq!(ask(&lease), Spacing::Clear, "the wait is met");
+        assert!(lease.is_settling(&coin.coin_id()), "with the landing still on the lease");
+
+        // No peak now: T4 asks for none, so the key's listing is read, and
+        // the claim is what waits for the peak.
+        let chain = Scripted::new(vec![found(), page(vec![], false)]);
+        let e = knock_on_lease(&lease, &chain, &fuse, &key).await.err().expect("the knock is not written");
+        assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::PeakUnavailable), "{e:#}");
+        assert_eq!(*chain.asked_spent.lock().unwrap(), vec![true, true], "the lease's coin, then the key's listing: T4 let it by");
         assert_eq!(sent(&chain), 0, "nothing sent");
         assert_eq!(fuse.lock().unwrap().gifts_in(0), 0, "no gift counted");
     }

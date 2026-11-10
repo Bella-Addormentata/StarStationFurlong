@@ -381,7 +381,8 @@ pub(crate) mod testing {
     /// each listing asked for spent coins, the coins each lookup by name
     /// asked for (`asked_names`, in the order asked), and how many bundles
     /// were handed to it (`sent`: a liveness question or a push, both
-    /// unanswered). The peak is answered only when one was given
+    /// unanswered, save a liveness question given its answer by
+    /// [`Scripted::with_liveness`]). The peak is answered only when one was given
     /// ([`Scripted::with_peak`]), and a coin's spend only when it was scripted
     /// ([`Scripted::with_spend`], [`Scripted::with_no_spend`]), whatever the
     /// height asked; each coin and height a spend was asked for is kept
@@ -392,6 +393,7 @@ pub(crate) mod testing {
         pub(crate) asked_names: std::sync::Mutex<Vec<Vec<Bytes32>>>,
         pub(crate) sent: std::sync::atomic::AtomicUsize,
         peak: Option<u32>,
+        live: Option<bool>,
         spends: HashMap<Bytes32, Option<PuzzleAndSolution>>,
         pub(crate) asked_spends: std::sync::Mutex<Vec<(Bytes32, u32)>>,
     }
@@ -404,6 +406,7 @@ pub(crate) mod testing {
                 asked_names: std::sync::Mutex::new(Vec::new()),
                 sent: std::sync::atomic::AtomicUsize::new(0),
                 peak: None,
+                live: None,
                 spends: HashMap::new(),
                 asked_spends: std::sync::Mutex::new(Vec::new()),
             }
@@ -412,6 +415,13 @@ pub(crate) mod testing {
         /// The same chain, answering `peak` as its peak height.
         pub(crate) fn with_peak(self, peak: u32) -> Self {
             Self { peak: Some(peak), ..self }
+        }
+
+        /// The same chain, answering every liveness question with `live`:
+        /// the bundle is in a mempool again, or every peer refused it for
+        /// good.
+        pub(crate) fn with_liveness(self, live: bool) -> Self {
+            Self { live: Some(live), ..self }
         }
 
         /// The same chain, answering `spend` as the spend of `coin`.
@@ -483,7 +493,8 @@ pub(crate) mod testing {
 
         fn spend_live(&self, _bundle: SpendBundle) -> impl Future<Output = Result<bool, ChainError>> + Send {
             self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            async { Err(silence()) }
+            let live = self.live.ok_or_else(silence);
+            async move { live }
         }
 
         fn push_tx(&self, _bundle: SpendBundle) -> impl Future<Output = Result<(), ChainError>> + Send {
