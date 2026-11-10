@@ -596,7 +596,7 @@ export function closeCrapsTable(tableId: string, closing: TableClosing = 'heard'
   // One transaction: no page sees the refunds without the table gone. (On a
   // doc holding every update whole: croupier.closeWhenWhole. What closes is a
   // craps table: clearTableKeys `closes`.)
-  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));
+  closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));
 }
 
 // ── Narration ─────────────────────────────────────────────────────────────────

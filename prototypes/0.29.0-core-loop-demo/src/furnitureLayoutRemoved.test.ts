@@ -217,8 +217,8 @@ describe("World's removal of a table", () => {
     expect(body.indexOf('} else if (removedKind === "craps-table") {\n      closeCrapsTable(itemId, closing);')).toBeGreaterThan(-1);
     const croupier = readFileSync(new URL('./croupier.ts', import.meta.url), 'utf8');
     const craps = readFileSync(new URL('./crapsCroupier.ts', import.meta.url), 'utf8');
-    expect(croupier).toContain("closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));");
-    expect(craps).toContain("closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));");
+    expect(croupier).toContain("closeWhenWhole(tableId, 'roulette', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));");
+    expect(craps).toContain("closeWhenWhole(tableId, 'craps', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'craps' })));");
     expect(croupier).toContain('clearTableKeys(tableId, closing, opts);');
     // (EditMode.removeSelected: the visuals and the table's session first, the layout's record after)
     const edit = readFileSync(new URL('./editMode.ts', import.meta.url), 'utf8');
@@ -228,6 +228,16 @@ describe("World's removal of a table", () => {
     expect(gone).toBeGreaterThan(down);
     expect(edit.indexOf('world.removeFurnitureVisuals(itemId);', down + 1)).toBe(-1);
     expect(edit.indexOf('deleteFurnitureItem(itemId);', gone + 1)).toBe(-1);
+  });
+
+  it("a teardown that waited for the rest of an update is dropped only for a table of its game back under the id: the room's check goes by the item's kind (croupier tableOfGameAmong, over World's furniture), so furniture of another kind there keeps no table's state and stakes (tableSplit specs)", () => {
+    // (the one line of each file that asks, and the one that answers: a line is what a failure shows, not the file)
+    const lines = (file: string, call: string): string[] =>
+      readFileSync(new URL(file, import.meta.url), 'utf8').split('\n').filter((line) => line.includes(call));
+    expect(lines('./croupier.ts', 'tableInRoom(')).toEqual(['    if (now || !tableInRoom(tableId, game)) close();']);
+    expect(lines('./main.ts', 'setTableInRoomPredicate(')).toEqual([
+      '  setTableInRoomPredicate((tableId, game) => tableOfGameAmong(FURNITURE, tableId, game));',
+    ]);
   });
 });
 

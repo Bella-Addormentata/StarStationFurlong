@@ -121,13 +121,22 @@ export function setSoleCroupierPredicate(fn: () => boolean): void {
   solePredicate = fn;
 }
 
-/** Is a table of this id in the room's furniture? main.ts registers the
- *  real check at boot (a removal heard on a doc not yet whole waits, and is
- *  dropped if the table is back by then: closeWhenWhole). */
-let tableInRoom: (tableId: string) => boolean = () => false;
+/** Is a table of this game under this id in the room's furniture? main.ts
+ *  registers the real check at boot (a removal heard on a doc not yet whole
+ *  waits, and is dropped if the table is back by then: closeWhenWhole). By
+ *  the game too: furniture of another kind that the id came to hold is not
+ *  the table back. */
+let tableInRoom: (tableId: string, game: GameName) => boolean = () => false;
 
-export function setTableInRoomPredicate(fn: (tableId: string) => boolean): void {
+export function setTableInRoomPredicate(fn: (tableId: string, game: GameName) => boolean): void {
   tableInRoom = fn;
+}
+
+/** That check over a room's furniture, as main.ts registers it: is the item
+ *  of this id a table of this game? */
+export function tableOfGameAmong(items: readonly { id: string; kind: string }[], tableId: string, game: GameName): boolean {
+  const kind = game === 'craps' ? 'craps-table' : 'roulette-table';
+  return items.some((item) => item.id === tableId && item.kind === kind);
 }
 
 /** May THIS client drive the auto-croupier here? True on the deed holder's
@@ -759,18 +768,22 @@ export function timerOnThisClock(
 export function closeTable(tableId: string, closing: TableClosing = 'heard'): void {
   // One transaction: no page sees the refunds without the table gone. (What
   // closes is a roulette table: clearTableKeys `closes`.)
-  closeWhenWhole(tableId, () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));
+  closeWhenWhole(tableId, 'roulette', () => transactCasino(() => refundAndClear(tableId, closing, { closes: 'roulette' })));
 }
 
 /** 📒 A table's removal, on a doc holding every update whole (casinoWhole):
  *  its refunds read the table's lists and book, and a table read as gone
  *  there would end an incarnation that isn't up. One heard meanwhile waits
  *  for the rest, and is dropped if the table is back in the room by then
- *  (put back: its opening clears what the removal left, tableOpening). */
-export function closeWhenWhole(tableId: string, close: () => void): void {
+ *  (put back: its opening clears what the removal left, tableOpening). Back
+ *  is a table of `game`, the game of the one taken down: other furniture
+ *  under the id by then (World takes down an item whose id came to hold
+ *  another kind), a sofa or a table of the other game, is not that table,
+ *  and the removal runs as it would have on a whole doc. */
+export function closeWhenWhole(tableId: string, game: GameName, close: () => void): void {
   let now = true;
   whenCasinoWhole(`close:${tableId}`, () => {
-    if (now || !tableInRoom(tableId)) close();
+    if (now || !tableInRoom(tableId, game)) close();
   }, tableId);
   now = false;
 }
