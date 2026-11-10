@@ -1368,26 +1368,13 @@ pub fn address_to_puzzle_hash(net: ChiaNet, address: &str) -> Result<Bytes32> {
 }
 
 /// Printed when the wallet loads (at startup, or when the Bank turns it on):
-/// what the load did, the key fingerprint, and the receive address on `net`,
-/// with how it is funded there. Never the words.
+/// what the load did, the key fingerprint, and on a test network the
+/// receive address, with how it is funded there. Off a test network no
+/// address of the wallet is printed ([`receive_line`], [`retired_line`]):
+/// the same log names the node's id. Never the words.
 pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
     if let Some(r) = &id.retired {
-        let kept = r.archived_as.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        match &r.old_address {
-            Some(old) => {
-                let beacon = r
-                    .old_beacon
-                    .as_ref()
-                    .map(|b| format!("; its beacon wallet, if the beacon ran, was {b}"))
-                    .unwrap_or_default();
-                println!(
-                    "🏦 SSF wallet: retired the old raw-seed wallet {old} (kept as {kept}; its coins stay at that address{beacon})"
-                );
-            }
-            None => println!(
-                "🏦 SSF wallet: retired an old chia_identity.seed that was not a 32-byte seed (kept as {kept})"
-            ),
-        }
+        println!("{}", retired_line(net, r));
     }
     if id.minted && net.is_test() {
         println!(
@@ -1412,18 +1399,52 @@ pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
     println!("{}", receive_line(net, &receive_address(net, &id.wallet)));
 }
 
-/// The receive address's line, and how it is funded on `net`. Off a test
-/// network the lane pays for no write from this wallet (stage 4 design
-/// §4.5 (1), `chia_publish::money_memo_refusal`), so the line promises none
-/// there: funding it would buy no listing. It says nothing of what the
-/// lane writes from other keys.
+/// The line of a raw-seed wallet the load retired: the archive's name, and
+/// on a test network the old wallet's address and its beacon wallet's, where
+/// its test coins stay. Off a test network it names neither: no build showed
+/// a raw-seed wallet's address there, and the log keeps the wallet's
+/// addresses away from the node id it prints ([`receive_line`]).
+fn retired_line(net: ChiaNet, r: &RetiredSeed) -> String {
+    let kept = r.archived_as.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match &r.old_address {
+        Some(old) if net.is_test() => {
+            let beacon =
+                r.old_beacon.as_ref().map(|b| format!("; its beacon wallet, if the beacon ran, was {b}")).unwrap_or_default();
+            format!("🏦 SSF wallet: retired the old raw-seed wallet {old} (kept as {kept}; its coins stay at that address{beacon})")
+        }
+        Some(_) => format!(
+            "🏦 SSF wallet: retired the old raw-seed wallet (kept as {kept}; any coins stay at its address, which this log does not print on {})",
+            net.name()
+        ),
+        None => format!("🏦 SSF wallet: retired an old chia_identity.seed that was not a 32-byte seed (kept as {kept})"),
+    }
+}
+
+/// The receive address's line, and how it is funded on `net`. On a test
+/// network it prints `addr`: a node run without a page is funded from this
+/// line, and test coins are free. Off a test network it prints no address
+/// and says where to read it: the log names the node's id at start, and an
+/// address beside it would tie the money address to the station in one file
+/// (docs/TDD/ChiaLanePrivacy.md §9). The lane pays for no write from this
+/// wallet there (stage 4 design §4.5 (1),
+/// `chia_publish::money_memo_refusal`), so the line promises none: funding
+/// it would buy no listing. It says nothing of what the lane writes from
+/// other keys.
 fn receive_line(net: ChiaNet, addr: &str) -> String {
-    let fund = if net.is_test() {
-        format!("Fund it at a {} faucet. {} is free. Once it holds a coin, the lane can publish/resolve presence.", net.name(), net.ticker())
-    } else {
-        format!("This address takes real {}. On {} the lane pays for no chain write from it.", net.ticker(), net.name())
-    };
-    format!("⛓️ ChiaHub lane: {} receive address {addr}\n   {fund}", net.name())
+    if net.is_test() {
+        return format!(
+            "⛓️ ChiaHub lane: {} receive address {addr}\n   Fund it at a {} faucet. {} is free. Once it holds a coin, the lane can publish/resolve presence.",
+            net.name(),
+            net.name(),
+            net.ticker()
+        );
+    }
+    format!(
+        "⛓️ ChiaHub lane: the {} receive address is in the SpacePhone's 🏦 BANK, under RECEIVE; this log does not print it\n   It takes real {}. On {} the lane pays for no chain write from it.",
+        net.name(),
+        net.ticker(),
+        net.name()
+    )
 }
 
 /// Tighten the identity file to owner-only on Unix; a no-op elsewhere
@@ -3208,8 +3229,47 @@ mod tests {
         // the lane publish. It speaks of this address alone, and does not
         // say the lane only reads the chain: a beacon is written from a key
         // of its own.
+        // Off a test network the line names no address (privacy gaps,
+        // docs/TDD/ChiaLanePrivacy.md §11): the log names the node's id,
+        // and the Bank shows the address.
         let line = receive_line(ChiaNet::Mainnet, "xch1q");
-        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. On Chia mainnet the lane pays for no chain write from it.");
+        assert_eq!(
+            line,
+            "⛓️ ChiaHub lane: the Chia mainnet receive address is in the SpacePhone's 🏦 BANK, under RECEIVE; this log does not print it\n   It takes real XCH. On Chia mainnet the lane pays for no chain write from it."
+        );
+        assert!(!line.contains("xch1q"), "{line}");
         assert!(!line.contains("faucet") && !line.contains("publish") && !line.contains("only reads"), "{line}");
+    }
+
+    /// A retired raw-seed wallet's line names its address, and its beacon
+    /// wallet's, on a test network alone; the archive's name is said on
+    /// every network.
+    #[test]
+    fn the_retired_line_names_the_old_addresses_on_a_test_network_alone() {
+        let retired = |old: Option<&str>, beacon: Option<&str>| RetiredSeed {
+            archived_as: PathBuf::from("data").join("chia_identity.seed.retired-1700000000"),
+            old_address: old.map(str::to_string),
+            old_beacon: beacon.map(str::to_string),
+        };
+        assert_eq!(
+            retired_line(ChiaNet::Testnet11, &retired(Some("txch1old"), Some("txch1beacon"))),
+            "🏦 SSF wallet: retired the old raw-seed wallet txch1old (kept as chia_identity.seed.retired-1700000000; its coins stay at that address; its beacon wallet, if the beacon ran, was txch1beacon)"
+        );
+        assert_eq!(
+            retired_line(ChiaNet::Testnet11, &retired(Some("txch1old"), None)),
+            "🏦 SSF wallet: retired the old raw-seed wallet txch1old (kept as chia_identity.seed.retired-1700000000; its coins stay at that address)"
+        );
+        let main = retired_line(ChiaNet::Mainnet, &retired(Some("xch1old"), Some("xch1beacon")));
+        assert_eq!(
+            main,
+            "🏦 SSF wallet: retired the old raw-seed wallet (kept as chia_identity.seed.retired-1700000000; any coins stay at its address, which this log does not print on Chia mainnet)"
+        );
+        assert!(!main.contains("xch1old") && !main.contains("xch1beacon"), "{main}");
+        for net in [ChiaNet::Testnet11, ChiaNet::Mainnet] {
+            assert_eq!(
+                retired_line(net, &retired(None, None)),
+                "🏦 SSF wallet: retired an old chia_identity.seed that was not a 32-byte seed (kept as chia_identity.seed.retired-1700000000)"
+            );
+        }
     }
 }

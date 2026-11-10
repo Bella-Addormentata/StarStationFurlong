@@ -57,6 +57,59 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
+/// Rewrite a file where it is, readable by its owner only: on Unix a new
+/// file is made 0600, and one an earlier run left broader is tightened once
+/// it is emptied and before any byte goes in (best-effort: a file system
+/// that keeps no modes leaves it as it is, and the write still happens);
+/// elsewhere the platform's default. Not atomic: a crash mid-write leaves a
+/// torn file. It is for the state files that were always written this way,
+/// whose readers take a torn or missing file for what it is (the room
+/// documents in `rooms/`), and for the fallback of
+/// [`write_private_replacing`].
+pub fn write_private_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(bytes)
+}
+
+/// Write `bytes` to `path` as a whole, readable by its owner only: into the
+/// temporary file `<name>.tmp` beside it ([`write_private_in_place`], so a
+/// stale temporary an earlier run left broader is tightened too), then a
+/// rename over the destination, which `std::fs::rename` replaces on every
+/// platform (on Windows through `MOVEFILE_REPLACE_EXISTING`). Windows can
+/// still refuse that rename while another process holds the destination open
+/// (a sharing violation); then the file is rewritten in place, owner-only as
+/// well, rather than left stale. Unlike [`write_private`] it syncs nothing and
+/// keeps that fallback: it is for the state files rewritten at every change
+/// (`wallet_lease.json`, where a stale parking would silently forget live
+/// spends and a torn one is unreadable and said at startup, #245 review,
+/// round 18; `chia_peers.json`), not for keys.
+pub fn write_private_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    write_private_in_place(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = std::fs::remove_file(&tmp);
+            write_private_in_place(path, bytes).map_err(|_| rename_err)
+        }
+    }
+}
+
 /// Remove a file [`write_private`] wrote, so that the removal survives a
 /// power loss as the write does: the directory is synced after it (on
 /// Unix). A file that is not there counts as removed, and nothing is synced
@@ -154,6 +207,66 @@ mod tests {
         let c = load_or_create_node_key(&path).unwrap();
         assert_ne!(c.public(), a.public(), "a damaged file is replaced by a fresh key");
         assert_eq!(mode(&path), 0o600, "rewriting a broader file tightens it to 0600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state files rewritten at every change (stage 4 privacy gaps,
+    /// docs/TDD/ChiaLanePrivacy.md §11): `write_private_in_place` and
+    /// `write_private_replacing` write the bytes whole, leave a new file
+    /// owner-only, and tighten one an older build left to the umask, the
+    /// stale temporary of a crashed write among them.
+    #[test]
+    fn a_state_file_is_rewritten_owner_only_in_place_and_by_replacing() {
+        let dir = std::env::temp_dir().join(format!("ssf-pf-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        let mode = |p: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        #[cfg(unix)]
+        let broaden = |p: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        type Write = fn(&Path, &[u8]) -> std::io::Result<()>;
+        let ways: [(&str, Write); 2] = [("in-place.bin", write_private_in_place), ("replacing.json", write_private_replacing)];
+        for (name, write) in ways {
+            let path = dir.join(name);
+            write(&path, b"first").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"first", "{name}");
+            #[cfg(unix)]
+            assert_eq!(mode(&path), 0o600, "{name}: a new file is owner-only");
+            // A longer file an older build wrote, left to the umask: the
+            // rewrite is whole (nothing of the old tail) and owner-only.
+            std::fs::write(&path, b"an older and longer file").unwrap();
+            #[cfg(unix)]
+            broaden(&path);
+            write(&path, b"second").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"second", "{name}");
+            #[cfg(unix)]
+            assert_eq!(mode(&path), 0o600, "{name}: a broader file is owner-only after the rewrite");
+        }
+        // The temporary of a write that crashed under an older build, left
+        // broad beside the destination: its mode does not come back with the
+        // rename, and no temporary is left behind.
+        let path = dir.join("replacing.json");
+        let tmp = dir.join("replacing.json.tmp");
+        std::fs::write(&tmp, b"torn").unwrap();
+        #[cfg(unix)]
+        broaden(&tmp);
+        write_private_replacing(&path, b"third").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        assert!(!tmp.exists(), "the temporary became the file");
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "a stale temporary's mode is not the file's");
+        // A destination the rename cannot replace (a directory stands in
+        // for Windows' sharing violation) fails with the rename's error,
+        // and the temporary is not left behind.
+        let taken = dir.join("taken.json");
+        std::fs::create_dir_all(&taken).unwrap();
+        assert!(write_private_replacing(&taken, b"x").is_err());
+        assert!(!dir.join("taken.json.tmp").exists(), "no temporary left after a failure");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
