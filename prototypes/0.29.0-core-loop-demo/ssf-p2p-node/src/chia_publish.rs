@@ -3042,23 +3042,21 @@ pub(crate) fn money_listing_step(
 /// the SSF wallet's step needs it ([`money_listing_step`]): on a test network
 /// (`net`) only, and only for a mark of `era` under `era_hint` whose payer is
 /// neither none nor the money key's text `money`. Every other mark leaves
-/// the step as it always was, so no root is made for it. The root is made
-/// from the wallet key `wallet` on `net` (§3.2) and dropped at once; the
-/// text is a puzzle hash, which no log line prints but the audit's own,
-/// with SSF_CHIA_AUDIT=1 ([`AuditBook::listing`]).
+/// the step as it always was, so nothing is derived for it. The key is
+/// derived from `root`, the publisher's own (§3.2, [`PublisherKeys::root`]),
+/// whose network is the one asked about; the text is a puzzle hash, which
+/// no log line prints but the audit's own, with SSF_CHIA_AUDIT=1
+/// ([`AuditBook::listing`]).
 pub(crate) fn money_path_burner_payer(
     mark: Option<&NodePublishMark>,
     era: u64,
     era_hint: &str,
     money: &str,
-    net: crate::chia_network::ChiaNet,
-    wallet: &SecretKey,
+    root: &crate::chia_burner::BurnerRoot,
     ck: &[u8; 32],
 ) -> Option<String> {
-    use crate::chia_burner::{BurnerRoot, MoneyKey};
-    let m = mark.filter(|m| net.is_test() && m.era == era && m.hint == era_hint)?;
+    let m = mark.filter(|m| root.net().is_test() && m.era == era && m.hint == era_hint)?;
     m.payer.as_deref().filter(|p| *p != money)?;
-    let root = BurnerRoot::of(&MoneyKey::new(wallet.clone()), net);
     Some(Payer::of_burner(&root.presence(ck, era)).hex())
 }
 
@@ -5461,20 +5459,22 @@ pub fn knock_leave(
 /// ([`WALLET_LEASE`], `claim_write::GIFT_FUSE`), the process's money lane
 /// (two agreeing peers, as the burner's writer takes it: stage 4 design
 /// §10), the wall clock and the OS random source: the knock the heartbeat
-/// writes (§13 row 10), from its own burner key K(h) once with a burner
-/// root (`root`, burner keys on), and paid for by the SSF wallet's key
-/// `chia_sk` with none, its clock read where the lease is reconciled, as it
-/// always was. Its one caller passes the process's network, which the lease
-/// and the bundle were always written on. Building the lane's handle first
+/// writes (§13 row 10), from its own burner key K(h) once on the burner
+/// path (`burners`, burner keys on), and paid for by the SSF wallet's key
+/// off it, which `keys` hold on a test network only
+/// ([`PublisherKeys::money`]), its clock read where the lease is
+/// reconciled, as it always was. Its one caller passes the process's
+/// network, which the lease and the bundle were always written on, and
+/// which the keys were made for. Building the lane's handle first
 /// reads nothing ([`crate::chia_chain::connect`] does no I/O), so the
 /// lease's checks, their order and their errors are the same as before. No
 /// test calls it: its lease, fuse and chain are the process's.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_knock(
     net: crate::chia_network::ChiaNet,
-    root: Option<&crate::chia_burner::BurnerRoot>,
+    keys: &PublisherKeys,
+    burners: bool,
     iroh_sk: &iroh::SecretKey,
-    chia_sk: &SecretKey,
     gate: &tokio::sync::Mutex<()>,
     leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
     req: &KnockRequest,
@@ -5483,7 +5483,7 @@ pub async fn publish_knock(
     now: u64,
 ) -> Result<KnockDone> {
     let client = crate::chia_chain::connect();
-    knock_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, root, iroh_sk, chia_sk, gate, leave, req, room_key, era, now, &mut rand::rngs::OsRng).await
+    knock_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, keys, burners, iroh_sk, gate, leave, req, room_key, era, now, &mut rand::rngs::OsRng).await
 }
 
 /// What the knock arm made of a request it tried ([`knock_on_path`]).
@@ -5503,32 +5503,36 @@ pub(crate) enum KnockDone {
 /// ([`knock_skipped`]), on a given lease, gift fuse, network, chain, clock
 /// and random source (the tests' own on the mock chain): every step the arm
 /// takes from the request to the write, so the heartbeat decides nothing
-/// between them (stage 4 design §13 row 10). The path is `root`: a burner
-/// root on the burner path (burner keys on, SSF_CHIA_BURNERS=1 on a test
-/// network), none on the money path, as the listing's path is chosen.
+/// between them (stage 4 design §13 row 10). The path is `burners`: the
+/// burner path with burner keys on (SSF_CHIA_BURNERS=1 on a test network),
+/// the money path with them off, as the listing's path is chosen. The keys
+/// are the publisher's (`keys`, [`PublisherKeys`]): the step is handed no
+/// wallet key, and asks the keys for one only where the SSF wallet pays.
 ///
 /// First, on a test network (the only one knocks are written on), the
 /// writes the lease still holds under the knock's inbox hint
 /// ([`knock_hint`], [`WalletLease::held_writes_under`]) are asked of
 /// [`lost_knock_entry`], with the payer of this host's own K(h)
-/// ([`knock_burner`]) and the SSF wallet's. K(h) is the burner root's on
-/// the burner path. On the money path the root is made from `chia_sk` on
-/// `net`, as the burner path makes it, only when the lease holds a write a
-/// burner paid for under the hint, and it is dropped at once. The lease is
-/// read under its gate, so a spend a reconciliation is moving meanwhile is
-/// not missed, and the gate is given back before the writer takes it. An
-/// entry it files is [`KnockDone::Refiled`], and nothing is written under
-/// the hint, so the SSF wallet and a burner never both write under it
-/// while the lease holds the first write (§8.3, the crash window).
-/// Otherwise the path's own writer writes the knock: from K(h), once, on
-/// the burner path
-/// ([`publish_knock_with`], at the instant `now` gives when it is called),
-/// and paid for by `chia_sk` on the money path, as on main
-/// ([`publish_knock_on`], `now` read where the lease is reconciled). The
-/// write comes back with the path it was written on (`from_burner`), the
-/// flag the arm's success line reads ([`knock_sent_line`]), so the line
-/// names the writer that wrote. An error comes back as the writer gave it,
-/// for [`knock_not_written`].
+/// ([`knock_burner`]) and the SSF wallet's. K(h) is the keys' root's on
+/// either path ([`PublisherKeys::root`]), derived on the money path only
+/// when the lease holds a write a burner paid for under the hint. The
+/// lease is read under its gate, so a spend a reconciliation is moving
+/// meanwhile is not missed, and the gate is given back before the writer
+/// takes it. An entry it files is [`KnockDone::Refiled`], and nothing is
+/// written under the hint, so the SSF wallet and a burner never both write
+/// under it while the lease holds the first write (§8.3, the crash
+/// window). Otherwise the path's own writer writes the knock: from K(h),
+/// once, on the burner path ([`publish_knock_with`], at the instant `now`
+/// gives when it is called), and paid for by the SSF wallet's key on the
+/// money path, as on main ([`publish_knock_on`], `now` read where the
+/// lease is reconciled). That key is the keys' to give
+/// ([`PublisherKeys::money`]): off a test network they hold none, and the
+/// step ends with the money writers' own refusal ([`MoneyMemoRefused`])
+/// before a writer is reached, so the lease's gate is not taken and the
+/// chain is asked nothing. The write comes back with the path it was
+/// written on (`from_burner`), the flag the arm's success line reads
+/// ([`knock_sent_line`]), so the line names the writer that wrote. An
+/// error comes back as the writer gave it, for [`knock_not_written`].
 #[allow(clippy::too_many_arguments)]
 async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -5536,9 +5540,9 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
     net: crate::chia_network::ChiaNet,
     client: &impl ChainAccess,
     now: impl FnOnce() -> Instant,
-    root: Option<&crate::chia_burner::BurnerRoot>,
+    keys: &PublisherKeys,
+    burners: bool,
     iroh_sk: &iroh::SecretKey,
-    chia_sk: &SecretKey,
     gate: &tokio::sync::Mutex<()>,
     leave: impl FnOnce() -> Result<Option<[u8; 32]>, Withdrawn>,
     req: &KnockRequest,
@@ -5547,32 +5551,24 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
     now_unix: u64,
     rng: &mut R,
 ) -> Result<KnockDone> {
+    let root = burners.then(|| keys.root());
     if net.is_test() {
         let hint = knock_hint(net, req, room_key, era);
-        let money = Payer::of(chia_sk);
+        let money = keys.money_payer();
         // Read under the lease's gate and given back here, before the
         // writer below takes the gate again (a `tokio` mutex, not
         // reentrant).
         let held = lease.held_writes_under(hint).await;
-        let own = || {
-            let key = match root {
-                Some(root) => knock_burner(root, net, req, room_key, era),
-                None => {
-                    use crate::chia_burner::{BurnerRoot, MoneyKey};
-                    knock_burner(&BurnerRoot::of(&MoneyKey::new(chia_sk.clone()), net), net, req, room_key, era)
-                }
-            };
-            Payer::of_burner(&key)
-        };
-        if let Some(entry) = lost_knock_entry(held, own, &money, root.is_some(), req, hint, era, now_unix) {
+        let own = || Payer::of_burner(&knock_burner(keys.root(), net, req, room_key, era));
+        if let Some(entry) = lost_knock_entry(held, own, &money, burners, req, hint, era, now_unix) {
             return Ok(KnockDone::Refiled(entry));
         }
     }
     let (hint, write) = match root {
-        Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, Payer::of(chia_sk), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,
-        None => publish_knock_on(lease, net, client, now, iroh_sk, chia_sk, gate, leave, req, room_key, era, now_unix).await?,
+        Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, keys.money_payer(), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,
+        None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,
     };
-    Ok(KnockDone::Written { hint, write, from_burner: root.is_some() })
+    Ok(KnockDone::Written { hint, write, from_burner: burners })
 }
 
 /// The knock [`publish_knock`] writes on the money path (no burner root,
@@ -6012,27 +6008,29 @@ pub(crate) enum BeaconDone {
 /// fuse ([`WALLET_LEASE`], `claim_write::GIFT_FUSE`), the money lane's
 /// chain, the wall clock and the OS random source, in the node's own data
 /// folder (the working folder every node file's path is relative to, so
-/// the empty path): the heartbeat's beacon arm, on the burner path (`root`)
-/// or off it.
+/// the empty path): the heartbeat's beacon arm, on the burner path
+/// (`burners`) or off it, with the publisher's keys (`keys`).
 pub(crate) async fn publish_beacon(
     net: crate::chia_network::ChiaNet,
-    root: Option<&crate::chia_burner::BurnerRoot>,
+    keys: &PublisherKeys,
+    burners: bool,
     iroh_sk: &iroh::SecretKey,
-    chia_sk: &SecretKey,
     era: u64,
     now: u64,
 ) -> Result<BeaconDone> {
     let client = crate::chia_chain::connect();
-    beacon_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, root, iroh_sk, chia_sk, std::path::Path::new(""), era, now, &mut rand::rngs::OsRng).await
+    beacon_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, keys, burners, iroh_sk, std::path::Path::new(""), era, now, &mut rand::rngs::OsRng).await
 }
 
 /// What the beacon arm makes of a due try in `era`, on a given lease, gift
 /// fuse, network, chain, clock and random source (the tests' own on the
 /// mock chain): every step the arm takes from the try to the write, so the
 /// heartbeat decides nothing between them (stage 4 design §13 row 10). The
-/// path is `root`: a burner root on the burner path (burner keys on,
-/// SSF_CHIA_BURNERS=1 on a test network), none off it, as the listing's and
-/// the knock's path is chosen, never by which key paid.
+/// path is `burners`: the burner path with burner keys on
+/// (SSF_CHIA_BURNERS=1 on a test network), the money path with them off, as
+/// the listing's and the knock's path is chosen, never by which key paid.
+/// The keys are the publisher's (`keys`, [`PublisherKeys`]): the step is
+/// handed no wallet key.
 ///
 /// First the beacon guard, on either path (§4.5 (7)): the other network's
 /// beacon mark in the data folder `data` ([`other_beacon_mark`] of `net`,
@@ -6043,17 +6041,21 @@ pub(crate) async fn publish_beacon(
 /// for its gate and the chain is asked nothing.
 ///
 /// Otherwise the path's own writer writes the beacon, and the key is chosen
-/// here, with the writer: on the burner path B as a burner key
-/// (`chia_burner::MoneyKey::beacon` of `chia_sk`, [`publish_beacon_with`],
-/// at the instant `now` gives when it is called), funded by the lobby dish
-/// for its first write; off it B as the beacon wallet's key
-/// ([`beacon_wallet_key`] of `chia_sk`, [`publish_beacon_on`], `now` read
-/// where the lease is reconciled), from a coin sent to it, as on main. The
-/// two are one key and one payer. The write comes back with the path it was
-/// written on (`from_burner`), which the arm's success line reads
-/// ([`beacon_sent_line`]). An error comes back as the writer gave it, for
-/// [`beacon_failure_line`]. A root of another network than `net` is refused
-/// before any writer is reached, as the listing's and the knock's are.
+/// here, with the writer: on the burner path B as a burner key, the keys'
+/// own ([`PublisherKeys::beacon`], [`publish_beacon_with`], at the instant
+/// `now` gives when it is called), funded by the lobby dish for its first
+/// write; off it B as the beacon wallet's key, made from the SSF wallet's
+/// key ([`beacon_wallet_key`], [`publish_beacon_on`], `now` read where the
+/// lease is reconciled), from a coin sent to it, as on main. The two are
+/// one key and one payer. The wallet key is the keys' to give
+/// ([`PublisherKeys::money`]): off a test network they hold none, and the
+/// money path ends with the money writers' own refusal
+/// ([`MoneyMemoRefused`]) before its writer is reached. The write comes
+/// back with the path it was written on (`from_burner`), which the arm's
+/// success line reads ([`beacon_sent_line`]). An error comes back as the
+/// writer gave it, for [`beacon_failure_line`]. Keys of another network
+/// than `net` are refused on the burner path before any writer is reached,
+/// as the listing's and the knock's root is.
 #[allow(clippy::too_many_arguments)]
 async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -6061,9 +6063,9 @@ async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
     net: crate::chia_network::ChiaNet,
     client: &impl ChainAccess,
     now: impl FnOnce() -> Instant,
-    root: Option<&crate::chia_burner::BurnerRoot>,
+    keys: &PublisherKeys,
+    burners: bool,
     iroh_sk: &iroh::SecretKey,
-    chia_sk: &SecretKey,
     data: &std::path::Path,
     era: u64,
     now_unix: u64,
@@ -6073,20 +6075,18 @@ async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
     if let Some(line) = beacon_guard(net, &other_mark, read_other_beacon(&other_mark), now_unix) {
         return Ok(BeaconDone::Guarded(line));
     }
-    let (hint, write) = match root {
-        Some(root) => {
-            anyhow::ensure!(
-                root.net() == net,
-                "the beacon's burner root is for {} and this write is on {}; nothing is written",
-                root.net().name(),
-                net.name()
-            );
-            let key = crate::chia_burner::MoneyKey::new(chia_sk.clone()).beacon();
-            publish_beacon_with(lease, fuse, net, client, now(), &key, iroh_sk, era, now_unix, rng).await?
-        }
-        None => publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(chia_sk), era, now_unix).await?,
+    let (hint, write) = if burners {
+        anyhow::ensure!(
+            keys.net() == net,
+            "the beacon's burner root is for {} and this write is on {}; nothing is written",
+            keys.net().name(),
+            net.name()
+        );
+        publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, rng).await?
+    } else {
+        publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix).await?
     };
-    Ok(BeaconDone::Written { hint, write, from_burner: root.is_some() })
+    Ok(BeaconDone::Written { hint, write, from_burner: burners })
 }
 
 /// This era's beacon written from its key B as a burner key (stage 4 design
@@ -6214,7 +6214,7 @@ pub async fn heartbeat_loop(
     hub: crate::SharedHub,
     iroh_ep: iroh::Endpoint,
     iroh_sk: iroh::SecretKey,
-    chia_sk: SecretKey,
+    keys: PublisherKeys,
 ) {
     // ⛓️ Chia off on this computer (chia_strict.rs) is asked first: no
     // wallet loads then and the Bank's TURN ON is refused, so this loop is
@@ -6225,7 +6225,9 @@ pub async fn heartbeat_loop(
     if crate::chia_strict::strict() {
         return;
     }
-    let net = crate::chia_network::net();
+    // The network is the keys': the one their root was made for, which
+    // `main.rs` takes from the process's own when it makes them.
+    let net = keys.net();
     // 🛑 Off a test network the SSF wallet pays for no memo spend (stage 4
     // design §4.5 (1)): asked once here, which logs it once, so the loop
     // writes no listing, knock or beacon, looks up no coin for one, and the
@@ -6243,15 +6245,18 @@ pub async fn heartbeat_loop(
     // wait or a busy chain (§10).
     let burners = burners_enabled();
     // The root the listing's burners and their slots come from, and the
-    // knocks' keys (§3.2), made once from the wallet key, on the burner path
-    // alone. Off a test network burner keys are never on ([`burners_of`]),
-    // so no root is made there, and with the flag off the listing arm and
-    // the knock arm are the SSF wallet's, as on main
-    // ([`money_listing_step`], [`publish_knock`] with no root).
-    let listing_root = burners.then(|| crate::chia_burner::BurnerRoot::of(&crate::chia_burner::MoneyKey::new(chia_sk.clone()), net));
+    // knocks' keys (§3.2): the keys' own ([`PublisherKeys::root`]), on the
+    // burner path alone. Off a test network burner keys are never on
+    // ([`burners_of`]), so the root is used for nothing there, and with the
+    // flag off the listing arm and the knock arm are the SSF wallet's, as
+    // on main ([`money_listing_step`], [`publish_knock`] off the burner
+    // path).
+    let listing_root: Option<&crate::chia_burner::BurnerRoot> = burners.then(|| keys.root());
     // The SSF wallet's payer text, as the marks file it, for the hint rule
-    // (§8.3) on either path.
-    let money_payer = Payer::of(&chia_sk).hex();
+    // (§8.3) on either path. A puzzle hash: the wallet key itself is in the
+    // keys on a test network only, and is asked of them at each write the
+    // SSF wallet pays for ([`PublisherKeys::money`]).
+    let money_payer = keys.money_payer().hex();
     // What the burner path's gates remember between ticks: the era's first
     // peak and its late start, a change waiting its jitter, and P(e)'s payer
     // text. No line prints it or anything in it: the audit's lines, with
@@ -6428,7 +6433,7 @@ pub async fn heartbeat_loop(
         // agreed peak this run saw in the era), not only on the ticks that
         // reach the beacon's own arm (`beacon_sees_peak`).
         if beacon_on {
-            beacon_sees_peak(&mut beacon_clock, listing_root.as_ref(), peak, &mut rand::rngs::OsRng);
+            beacon_sees_peak(&mut beacon_clock, listing_root, peak, &mut rand::rngs::OsRng);
         }
         // Every era-bound write of this tick (presence, knock, beacon) is
         // signed for the era of that peak, and the era guard's budget
@@ -6500,7 +6505,7 @@ pub async fn heartbeat_loop(
                     // now. Only a mark this station's listing key of now
                     // paid for is read that way: one a replaced contact
                     // key or wallet left is another key's.
-                    let own_burner = own_listing_burner(listing_root.as_ref(), &hub.contact_key, &m);
+                    let own_burner = own_listing_burner(listing_root, &hub.contact_key, &m);
                     let (word, lost) =
                         listing_verdict(&WALLET_LEASE, &mut foreign_pause, &m, own_burner.as_deref(), presence_standing(&peak_client, &m).await, now, now_unix);
                     match presence_step(&m, word, era, peak) {
@@ -6575,7 +6580,7 @@ pub async fn heartbeat_loop(
             if let Some(era) = era_now {
                 let found = lost_listing_mark(&WALLET_LEASE, node_mark.as_ref(), net, &hub.contact_key, era, listing_root.is_some(), &money_payer, |m| match &listing_root {
                     Some(root) => Some(listing_clock.burner_payer(root, &hub.contact_key, era, &m.hint)),
-                    None => money_path_burner_payer(Some(m), era, &m.hint, &money_payer, net, &chia_sk, &hub.contact_key),
+                    None => money_path_burner_payer(Some(m), era, &m.hint, &money_payer, keys.root(), &hub.contact_key),
                 })
                 .await;
                 if let Some(mark) = found {
@@ -6657,7 +6662,7 @@ pub async fn heartbeat_loop(
                         &self_id,
                         spend_held,
                         &money_payer,
-                        money_path_burner_payer(node_mark.as_ref(), era, era_hint, &money_payer, net, &chia_sk, &hub.contact_key).as_deref(),
+                        money_path_burner_payer(node_mark.as_ref(), era, era_hint, &money_payer, keys.root(), &hub.contact_key).as_deref(),
                     ),
                 };
                 let retry_ok = node_attempt
@@ -6670,9 +6675,15 @@ pub async fn heartbeat_loop(
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     let tried = Instant::now();
-                    let written = match &listing_root {
-                        Some(root) => publish_burner_presence(net, root, Payer::of(&chia_sk), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,
-                        None => publish_node_presence(net, &iroh_sk, &chia_sk, &hub.contact_key, era, &entries, now_unix).await,
+                    // Off the burner path the SSF wallet pays, with its own
+                    // key, which the keys hold on a test network only
+                    // ([`PublisherKeys::money`]).
+                    let written = match listing_root {
+                        Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,
+                        None => match keys.money() {
+                            Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix).await,
+                            Err(refused) => Err(refused.into()),
+                        },
                     };
                     // The retry cadence counts from this try, save after
                     // T4's wait, which is tried again at the next tick
@@ -6848,13 +6859,13 @@ pub async fn heartbeat_loop(
                 // wallet's and never beside the SSF wallet's knock under the
                 // hint (`claim_write::BurnerWait::MoneyUnderHint`); with
                 // burner keys off it is the SSF wallet's write, as on main.
-                let done = publish_knock(net, listing_root.as_ref(), &iroh_sk, &chia_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;
+                let done = publish_knock(net, &keys, burners, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;
                 // 🔎 Under the audit switch alone (§11): the address of this
                 // knock's key, once the step shows the key has written, by
                 // this write, by the write the lease still holds or by the
                 // chain's word ([`audit_knock`]). Said after the step's own
                 // line. Without the switch no line names it.
-                let audit_line = audit_knock(&mut audit, listing_root.as_ref(), net, &req, &room_key, era, &done);
+                let audit_line = audit_knock(&mut audit, listing_root, net, &req, &room_key, era, &done);
                 match done {
                     Ok(KnockDone::Refiled(entry)) => {
                         println!("{}", lost_knock_line(&req, era));
@@ -6985,7 +6996,7 @@ pub async fn heartbeat_loop(
                 serves_welcome,
                 retry_ok,
                 paused: paused_now(&mut foreign_pause, Some(era), now_unix).is_some(),
-                root: listing_root.as_ref(),
+                root: listing_root,
                 mark: beacon_mark.as_ref(),
                 era,
                 peak,
@@ -7000,7 +7011,7 @@ pub async fn heartbeat_loop(
                 // and the knock's are, never by which key paid: the
                 // guard first, on either path (§4.5 (7)), then the path's
                 // writer with the key it writes from.
-                let done = publish_beacon(net, listing_root.as_ref(), &iroh_sk, &chia_sk, era, now_unix).await;
+                let done = publish_beacon(net, &keys, burners, &iroh_sk, era, now_unix).await;
                 // Paced from this try, save after T4's wait (`paced_from`),
                 // whose line is said once for a run of such ticks.
                 beacon_attempt = paced_from(tried, &done);
@@ -7063,7 +7074,14 @@ pub async fn heartbeat_loop(
             if !due {
                 continue;
             }
-            let ok = match publish_presence(&iroh_sk, &chia_sk, &room_key, &addrs).await {
+            // The v1 room record is the SSF wallet's write, with its own
+            // key, which the keys hold on a test network only
+            // ([`PublisherKeys::money`]).
+            let published = match keys.money() {
+                Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,
+                Err(refused) => Err(refused.into()),
+            };
+            let ok = match published {
                 Ok(hint) => {
                     println!(
                         "⛓️ ChiaHub heartbeat: presence published for room {room} · hint {}",
@@ -7845,7 +7863,7 @@ mod tests {
         let swapped = Payer::of(&SecretKey::from_seed(&[63u8; 32])).hex();
         let changed = GATE_NOW + ADDR_CHANGE_DEBOUNCE_SECS;
         let step = |mark: &NodePublishMark, now: u64, sig: &str| {
-            let derived = money_path_burner_payer(Some(mark), e, &hint, &g.money, T11, &g.wallet, &g.ck);
+            let derived = money_path_burner_payer(Some(mark), e, &hint, &g.money, &g.root, &g.ck);
             money_listing_step(Some(mark), e, sig, now, &hint, GATE_NODE, false, &g.money, derived.as_deref())
         };
         let ours = g.mark(e, "a", GATE_NOW, Some(burner.clone()));
@@ -7958,16 +7976,16 @@ mod tests {
     /// where the hint rule could hold on it (stage 4 design §8.3): on a test
     /// network, for a mark of this era under this hint whose payer is
     /// neither none nor the money key's. Every other mark, and every mark
-    /// off a test network, makes no root at all.
+    /// under a root of no test network, derives nothing.
     #[test]
     fn the_ssf_wallets_step_derives_its_listing_burner_only_for_a_mark_another_payer_wrote_on_a_test_network() {
         let g = Gates::new();
         let e = 8;
         let hint = g.hint(e);
         let swapped = Payer::of(&SecretKey::from_seed(&[63u8; 32])).hex();
-        let derived = |mark: &NodePublishMark, net| money_path_burner_payer(Some(mark), e, &hint, &g.money, net, &g.wallet, &g.ck);
+        let derived = |mark: &NodePublishMark, root: &crate::chia_burner::BurnerRoot| money_path_burner_payer(Some(mark), e, &hint, &g.money, root, &g.ck);
         for (what, payer) in [("this wallet's burner's", g.burner(e)), ("another wallet's", swapped.clone())] {
-            assert_eq!(derived(&g.mark(e, "a", GATE_NOW, Some(payer)), T11), Some(g.burner(e)), "{what}");
+            assert_eq!(derived(&g.mark(e, "a", GATE_NOW, Some(payer)), &g.root), Some(g.burner(e)), "{what}");
         }
         for (what, mark) in [
             ("an older node's", g.mark(e, "a", GATE_NOW, None)),
@@ -7975,10 +7993,11 @@ mod tests {
             ("last era's", g.mark(e - 1, "a", GATE_NOW, Some(g.burner(e - 1)))),
             ("under another hint", NodePublishMark { hint: "another".into(), ..g.mark(e, "a", GATE_NOW, Some(swapped.clone())) }),
         ] {
-            assert_eq!(derived(&mark, T11), None, "{what}");
+            assert_eq!(derived(&mark, &g.root), None, "{what}");
         }
-        assert_eq!(derived(&g.mark(e, "a", GATE_NOW, Some(g.burner(e))), crate::chia_network::ChiaNet::Mainnet), None, "off a test network");
-        assert_eq!(money_path_burner_payer(None, e, &hint, &g.money, T11, &g.wallet, &g.ck), None, "no mark");
+        let mainnets = crate::chia_burner::BurnerRoot::of(&crate::chia_burner::MoneyKey::new(g.wallet.clone()), crate::chia_network::ChiaNet::Mainnet);
+        assert_eq!(derived(&g.mark(e, "a", GATE_NOW, Some(g.burner(e))), &mainnets), None, "off a test network");
+        assert_eq!(money_path_burner_payer(None, e, &hint, &g.money, &g.root, &g.ck), None, "no mark");
     }
 
     /// Stage 4 design §10's Phone Book sentences for a listing from a
@@ -13377,6 +13396,13 @@ use foreign_pause::{ForeignPause, Paused, FOREIGN_PAUSE_FILE};
 mod audit;
 use audit::AuditBook;
 pub use audit::{audit, audit_enabled, wallet_lines as audit_wallet_lines};
+
+/// What the publisher holds of the SSF wallet (stage 4 design §3.4): the
+/// burner root, the beacon's key, the wallet's payer and, on a test network
+/// only, the wallet key itself. The heartbeat is started with these and
+/// with no wallet key.
+mod keys;
+pub use keys::PublisherKeys;
 
 /// The writers and readers above, end to end through the real lane on the
 /// mock chain (stage 4 design §12).

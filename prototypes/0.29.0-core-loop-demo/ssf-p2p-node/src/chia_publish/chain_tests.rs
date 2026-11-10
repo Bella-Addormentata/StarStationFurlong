@@ -546,10 +546,11 @@ impl Setup {
     /// the next instant ([`Self::later`]), under a card gate of its own, with
     /// the room's word at spend time `leave`, dated `now_unix`, and the
     /// random source seeded by `seed`: the step the heartbeat takes for a
-    /// request it does not skip. On the burner path (`burner_path`) its root
-    /// is test wallet `wallet_n`'s on the test's network ([`root`]); off it
-    /// there is none, and `wallet_n`'s key pays. Its future is checked to be
-    /// `Send`, as the heartbeat's task needs it to be.
+    /// request it does not skip. Its keys are test wallet `wallet_n`'s on
+    /// the test's network ([`keys_on`]): on the burner path (`burner_path`)
+    /// their root's K(h) writes, and they hold no wallet key; off it
+    /// `wallet_n`'s key pays. Its future is checked to be `Send`, as the
+    /// heartbeat's task needs it to be.
     #[allow(clippy::too_many_arguments)]
     async fn arm_knock(
         &mut self,
@@ -563,10 +564,9 @@ impl Setup {
         seed: u64,
     ) -> Result<KnockDone> {
         let at = self.later();
-        let (root, payer, gate) = (root(wallet_n), wallet(wallet_n), tokio::sync::Mutex::new(()));
-        let path = burner_path.then_some(&root);
+        let (keys, gate) = (keys_on(wallet_n, burner_path), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(knock_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &payer, &gate, leave, req, &ROOM_KEY, era, now_unix, &mut rng)).await
+        sendable(knock_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, &keys, burner_path, node, &gate, leave, req, &ROOM_KEY, era, now_unix, &mut rng)).await
     }
 
     /// `node`'s beacon for `era`, dated `now_unix`, written from B, the
@@ -588,19 +588,19 @@ impl Setup {
     /// chain, at the next instant ([`Self::later`]), dated `now_unix`, in
     /// the data folder `data`, where the step itself finds the other
     /// network's beacon mark for its guard, with the random source seeded by
-    /// `seed`: the step the heartbeat takes for a beacon that is due. On the
-    /// burner path (`burner_path`) its root is test wallet `wallet_n`'s on
-    /// the test's network ([`root`]); off it there is none. The step is given
-    /// `wallet_n`'s key, the SSF wallet's, and derives B from it itself. Its
-    /// future is checked to be `Send`, as the heartbeat's task needs it to
-    /// be.
+    /// `seed`: the step the heartbeat takes for a beacon that is due. Its
+    /// keys are test wallet `wallet_n`'s on the test's network
+    /// ([`keys_on`]): on the burner path (`burner_path`) it writes from
+    /// their B, and they hold no wallet key; off it from B as the beacon
+    /// wallet's key, made from `wallet_n`'s key, which the keys hold on the
+    /// test's network. Its future is checked to be `Send`, as the
+    /// heartbeat's task needs it to be.
     #[allow(clippy::too_many_arguments)]
     async fn arm_beacon(&mut self, wallet_n: u8, burner_path: bool, node: &iroh::SecretKey, era: u64, data: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
         let at = self.later();
-        let (root, w) = (root(wallet_n), wallet(wallet_n));
-        let path = burner_path.then_some(&root);
+        let keys = keys_on(wallet_n, burner_path);
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &w, data, era, now_unix, &mut rng)).await
+        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, &keys, burner_path, node, data, era, now_unix, &mut rng)).await
     }
 
     /// The gifts the test's fuse counts against `era` ([`GiftFuse`]).
@@ -715,6 +715,33 @@ fn burner(n: u8, era: u64) -> BurnerKey {
 /// the one its listing burners and slots come from.
 fn root(n: u8) -> BurnerRoot {
     BurnerRoot::of(&MoneyKey::new(wallet(n)), NET)
+}
+
+/// The burner root of the wallet key `w` on the test's network, as the
+/// publisher's keys hold it ([`PublisherKeys::root`]).
+fn root_of(w: &SecretKey) -> BurnerRoot {
+    BurnerRoot::of(&MoneyKey::new(w.clone()), NET)
+}
+
+/// The publisher's keys of test wallet `n` on the test's network
+/// ([`PublisherKeys::of`]): what the heartbeat hands the knock's and the
+/// beacon's steps. On the test's network they hold the wallet key too.
+fn keys(n: u8) -> PublisherKeys {
+    PublisherKeys::of(NET, wallet(n))
+}
+
+/// The keys a step is handed on a path: on the burner path test wallet
+/// `n`'s keys with the wallet key dropped
+/// ([`PublisherKeys::without_wallet_key`]), which is what the publisher
+/// holds off a test network, so every burner-path step here is shown to
+/// need no wallet key; off it the keys as the test's network makes them,
+/// wallet key and all, for the SSF wallet's own write.
+fn keys_on(n: u8, burner_path: bool) -> PublisherKeys {
+    if burner_path {
+        keys(n).without_wallet_key()
+    } else {
+        keys(n)
+    }
 }
 
 /// A listing's entries of the one address `addr`, with `flags`.
@@ -3356,13 +3383,13 @@ async fn a_money_rewrite_after_a_burner_paid_listing_of_this_era_is_held_by_the_
     let moved = addrs_signature(&entries_of("203.0.113.9:4444", 0));
     let debounced = at + ADDR_CHANGE_DEBOUNCE_SECS;
     assert!(node_publish_due(Some(&mark), 0, &moved, debounced, &hint0, &id, false), "main's rule writes the change");
-    let derived = money_path_burner_payer(Some(&mark), 0, &hint0, &money, NET, &w, &CK);
+    let derived = money_path_burner_payer(Some(&mark), 0, &hint0, &money, &root_of(&w), &CK);
     assert_eq!(derived.as_deref(), Some(p0.as_str()), "derived for this mark: W's own P(0)");
     let step = money_listing_step(Some(&mark), 0, &moved, debounced, &hint0, &id, false, &money, derived.as_deref());
     assert_eq!(step, ListingStep::HeldByHint(PaidBy::Burner));
 
     let hint1 = hex::encode(chia_lane::derive_ck_hint(NET, &CK, 1));
-    let derived = money_path_burner_payer(Some(&mark), 1, &hint1, &money, NET, &w, &CK);
+    let derived = money_path_burner_payer(Some(&mark), 1, &hint1, &money, &root_of(&w), &CK);
     assert_eq!(derived, None, "a mark of another era derives nothing");
     for live in [&sig, &moved] {
         assert_eq!(money_listing_step(Some(&mark), 1, live, debounced, &hint1, &id, false, &money, None), ListingStep::Write, "{live}: a new era");
@@ -3704,7 +3731,7 @@ async fn a_listing_the_ssf_wallet_wrote_before_a_restart_that_lost_its_mark_is_f
     let step = burner_step(&mut ListingClock::default(), &w, Some(&mark), &node, (landed + 1 + CHANGE_JITTER_MAX_BLOCKS, at + ADDR_CHANGE_DEBOUNCE_SECS, &moved), &mut rng);
     assert_eq!(step, ListingStep::HeldByHint(PaidBy::Money), "held for the era");
 
-    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
+    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, &root_of(&w), &CK);
     assert_eq!(lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).await, None, "on the SSF wallet's path its own write is left to main's rule");
     assert_eq!(burner_path(&WalletLease::new(), None).await, None, "a lease that has forgotten the write rebuilds nothing");
     assert_eq!(s.sent(), HashSet::from([theirs.name()]), "P(0) never wrote");
@@ -3739,7 +3766,7 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     s.lease = WalletLease::new();
     restore(&s.lease, &path, &w);
     assert!(s.lease.outgoing_pending_for(Payer::of_burner(&burner(71, 0))), "P(0)'s spend restored, parked");
-    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, NET, &w, &CK);
+    let derive = |m: &NodePublishMark| money_path_burner_payer(Some(m), 0, &m.hint, &money, &root_of(&w), &CK);
     let lost = lost_listing_mark(&s.lease, None, NET, &CK, 0, false, &money, derive).await.expect("P(0)'s listing, filed again");
     let saved = NodePublishMark::written(0, 1, sig.clone(), at, hint, &write, id.clone());
     assert_eq!(lost, saved, "the mark the heartbeat would have saved");
@@ -3761,7 +3788,7 @@ async fn a_listing_from_the_burner_whose_mark_a_restart_lost_is_filed_again_and_
     let (hint0, moved) = (hex::encode(hint), addrs_signature(&entries_of("203.0.113.9:4444", 0)));
     let changed = at + ADDR_CHANGE_DEBOUNCE_SECS;
     assert_eq!(money_listing_step(None, 0, &sig, at, &hint0, &id, false, &money, None), ListingStep::Write, "with no mark main's rule writes at once");
-    let derived = money_path_burner_payer(Some(&lost), 0, &hint0, &money, NET, &w, &CK);
+    let derived = money_path_burner_payer(Some(&lost), 0, &hint0, &money, &root_of(&w), &CK);
     assert_eq!(derived.as_deref(), Some(p0.as_str()));
     assert_eq!(money_listing_step(Some(&lost), 0, &moved, changed, &hint0, &id, false, &money, derived.as_deref()), ListingStep::HeldByHint(PaidBy::Burner));
 
@@ -5316,14 +5343,14 @@ async fn a_knock_the_ssf_wallet_parks_under_the_hint_after_the_steps_read_holds_
     ] {
         s.lease = WalletLease::new();
         assert_eq!(s.lease.held_write_under(hint).await, None, "nothing under the hint when the step reads the lease");
-        let (root, gate) = (root(97), tokio::sync::Mutex::new(()));
+        let (keys, gate) = (keys_on(97, true), tokio::sync::Mutex::new(()));
         let mut rng = StdRng::seed_from_u64(1);
         let lease = &s.lease;
         let parks = || {
             lease.park_with_bundle_at([(coin.coin_id(), made)], Some((&theirs, money)), at).expect("W's knock, parked between the step's read and the writer's");
             at + reads
         };
-        let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, Some(&root), &node, &w, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+        let done = knock_on_path(lease, &s.fuse, NET, &s.money, parks, &keys, true, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
         let e = done.as_ref().err().expect("K(h) does not write beside W's knock");
         assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&wait), "{what}: {e:#}");
         assert!(is_typed_wait(e), "a wait: no attempt used");
@@ -6341,10 +6368,10 @@ async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_no
     let (f, _) = ready_dish(&s, 1).await;
     let (w, key, node, none) = (wallet(132), beacon_key(132), iroh::SecretKey::generate(), no_data_folder());
     for other in crate::chia_network::ChiaNet::ALL.into_iter().filter(|net| *net != NET) {
-        let root = BurnerRoot::of(&MoneyKey::new(w.clone()), other);
+        let theirs = PublisherKeys::of(other, w.clone());
         let at = s.later();
         let mut rng = StdRng::seed_from_u64(1);
-        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, Some(&root), &node, &w, &none, 0, unix_now(), &mut rng).await;
+        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &theirs, true, &node, &none, 0, unix_now(), &mut rng).await;
         let e = refused.as_ref().err().expect("a root of another network is refused");
         assert_eq!(format!("{e:#}"), format!("the beacon's burner root is for {} and this write is on testnet11; nothing is written", other.name()));
         assert!(!is_typed_wait(e), "a failure, not a wait");
@@ -6546,5 +6573,65 @@ async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_o
     let beaconed = burner_coin(&key, gifted.coins.parent);
     assert_eq!(beaconed.puzzle_hash, at, "the burner path's coin sits at the same address");
     assert_eq!(s.chain.record(beaconed.coin_id()).map(|r| r.2), Some(None));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §3.4: the knock's and the beacon's steps are handed the
+/// publisher's keys, and the SSF wallet's write needs the wallet key, which
+/// the keys hold on a test network only. Off the burner path, with keys
+/// that hold none:
+/// - keys made for a network that is no test network, on that network,
+///   which is what a mainnet node's heartbeat holds: each step ends with
+///   the money writers' own refusal, in their words;
+/// - the test network's keys with the wallet key dropped: each step ends
+///   with the keys' own words.
+///
+/// Either way it is a failure of the money writers' type, not a wait, the
+/// wallet's funded coin is not looked up, no node is asked anything,
+/// nothing is sent or parked and no gift is counted. With the wallet key
+/// held, the same steps write from the wallet's coins, as on main.
+#[tokio::test]
+async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and_asks_nothing() {
+    use crate::chia_network::ChiaNet;
+    let mut s = setup().await;
+    let (w, b, node, none) = (wallet(144), beacon_wallet(144), iroh::SecretKey::generate(), no_data_folder());
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
+    s.chain.farm().await;
+    let (req, _) = host_card([0x44; 32]);
+    let off_test: Vec<ChiaNet> = ChiaNet::ALL.into_iter().filter(|net| !net.is_test()).collect();
+    assert!(!off_test.is_empty(), "a network that is no test network");
+    let mut cases: Vec<(ChiaNet, PublisherKeys, String)> = off_test
+        .into_iter()
+        .map(|net| (net, PublisherKeys::of(net, w.clone()), money_memo_refusal(net).expect("the money writers refuse there")))
+        .collect();
+    cases.push((NET, keys(144).without_wallet_key(), super::keys::NO_MONEY_KEY.to_string()));
+    for (net, keys, words) in &cases {
+        let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+        let mut rng = StdRng::seed_from_u64(1);
+        let knocked = knock_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+        let at = s.later();
+        let beaconed = beacon_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &none, 0, unix_now(), &mut rng).await;
+        for (what, e) in [("knock", knocked.err().expect("no knock without the wallet key")), ("beacon", beaconed.err().expect("no beacon without the wallet key"))] {
+            assert_eq!(e.downcast_ref::<MoneyMemoRefused>(), Some(&MoneyMemoRefused(words.clone())), "{what} on {}: {e:#}", net.name());
+            assert!(!is_typed_wait(&e), "{what} on {}: a failure, not a wait", net.name());
+        }
+    }
+    assert!(s.asked_nothing(), "no node was asked anything");
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&coin.coin_id()) && !s.lease.is_taken(&funded.coin_id()) && !s.lease.outgoing_pending(), "nothing parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+
+    // The same steps with the wallet key held: the SSF wallet's own writes.
+    let (hint, write, from_burner) = arm_wrote(s.arm_knock(144, false, &node, &req, 0, || Ok(None), unix_now(), 2).await);
+    assert!(!from_burner);
+    assert_eq!(hint, knock_hint(NET, &req, &ROOM_KEY, 0));
+    assert_eq!((write.coins, write.payer), (WriteCoins::one(coin.coin_id()), Payer::of(&w)), "W pays for the knock, from its own coin");
+    s.chain.farm().await;
+    s.reconcile().await;
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(144, false, &node, 0, &none, unix_now(), 3).await);
+    assert!(!from_burner);
+    assert_eq!((write.coins, write.payer), (WriteCoins::one(funded.coin_id()), Payer::of(&b)), "B pays for the beacon, from its funded coin");
+    assert_eq!(s.gifts(0), 0, "no lobby coin claimed off the burner path");
     assert!(s.chain.unanswered().is_empty());
 }

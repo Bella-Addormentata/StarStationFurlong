@@ -98,9 +98,11 @@ impl MoneyKey {
     }
 
     /// The wallet key, for the money spends, which take it as a plain
-    /// `SecretKey` today. Never for the publisher: from PR 10 its entry
-    /// points take a [`BurnerKey`], and no `SecretKey` makes one.
-    #[cfg_attr(not(test), allow(dead_code))] // No caller outside the tests until the publisher's keys (PR 10h) hand the money spends their key through it.
+    /// `SecretKey` today. The publisher reaches it only through its own
+    /// keys (`chia_publish::PublisherKeys::money`), which hold a `MoneyKey`
+    /// on a test network alone, for the writes the SSF wallet still pays
+    /// for there. Never for a burner's write: those take a [`BurnerKey`],
+    /// and no `SecretKey` makes one.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
     }
@@ -320,7 +322,7 @@ mod tests {
     use clvmr::Allocator;
 
     use crate::chia_lane::{derive_inbox_hint, derive_lane_token, ERA_BLOCKS, KIND_BEACON};
-    use crate::chia_publish::beacon_wallet_key;
+    use crate::chia_publish::{beacon_wallet_key, PublisherKeys};
     use crate::chia_wallet::{keys_from_mnemonic, master_of, receive_address};
 
     /// A listing's contact key, a host's contact key and a room key for the
@@ -833,7 +835,9 @@ mod tests {
     /// `Deref` between the key types, `SecretKey` and raw bytes, in the
     /// directions and the owned or borrowed forms written below; `FromStr`;
     /// `Default`; the `serde` impls that would read or write a key; `Clone`
-    /// and `Copy` of the root; and `Display`. The positive controls show
+    /// and `Copy` of the root, `Clone` of the money key, and the same list
+    /// for the publisher's keys (`chia_publish::PublisherKeys`), which hold
+    /// the three; and `Display`. The positive controls show
     /// that the probe answers true where an impl exists, for every trait
     /// form used, so the false answers are not vacuous. No trait bound sees
     /// an inherent constructor, an accessor method or a field's visibility:
@@ -913,6 +917,34 @@ mod tests {
         refuted!(MoneyKey: std::fmt::Display);
         refuted!(BurnerRoot: std::fmt::Display);
         refuted!(BurnerKey: std::fmt::Display);
+        // The publisher's keys (`chia_publish::PublisherKeys`, §3.4): what
+        // the heartbeat is started with. They are made by their one
+        // constructor, from the wallet key and the network, are never
+        // copied, and give the wallet key up through no trait, so the
+        // heartbeat reaches it by `PublisherKeys::money` alone, which
+        // answers with a refusal off a test network
+        // (`chia_publish::keys`' own tests).
+        refuted!(PublisherKeys: Clone);
+        refuted!(PublisherKeys: Copy);
+        refuted!(PublisherKeys: Default);
+        refuted!(PublisherKeys: From<SecretKey>);
+        refuted!(PublisherKeys: From<MoneyKey>);
+        refuted!(PublisherKeys: From<BurnerRoot>);
+        refuted!(PublisherKeys: AsRef<SecretKey>);
+        refuted!(PublisherKeys: AsRef<MoneyKey>);
+        refuted!(PublisherKeys: std::borrow::Borrow<SecretKey>);
+        refuted!(PublisherKeys: std::borrow::Borrow<MoneyKey>);
+        refuted!(PublisherKeys: std::ops::Deref);
+        refuted!(PublisherKeys: Into<SecretKey>);
+        refuted!(&'static PublisherKeys: Into<SecretKey>);
+        refuted!(PublisherKeys: Into<MoneyKey>);
+        refuted!(&'static PublisherKeys: Into<MoneyKey>);
+        refuted!(SecretKey: TryFrom<&'static PublisherKeys>);
+        refuted!(MoneyKey: TryFrom<&'static PublisherKeys>);
+        refuted!(MoneyKey: Clone);
+        refuted!(PublisherKeys: serde::de::DeserializeOwned);
+        refuted!(PublisherKeys: serde::Serialize);
+        refuted!(PublisherKeys: std::fmt::Display);
 
         // Positive controls: the probe says true where an impl exists, for
         // each trait form above, including on these types themselves.
