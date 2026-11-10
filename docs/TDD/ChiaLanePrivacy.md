@@ -2,7 +2,7 @@
 
 > **Purpose:** the one place that says what a Star Station node writes to the Chia chain, what it asks Chia full nodes, what it keeps on disk about both, and what each kind of observer can learn from that. It is the written form of the mainnet privacy gate ([#231](https://github.com/Bella-Addormentata/StarStationFurlong/issues/231) P8, [#335](https://github.com/Bella-Addormentata/StarStationFurlong/issues/335) stage 4). §6 lists what the gate does not hide, and §10 is the review that has to pass before mainnet opens to players.
 >
-> **As of:** main after [#416](https://github.com/Bella-Addormentata/StarStationFurlong/pull/416), 2026-11-10. **Proven so far:** the node's reads have met real full nodes on testnet11 and mainnet ([#412](https://github.com/Bella-Addormentata/StarStationFurlong/pull/412)). No write of the burner path has: it has run on the mock chain only (`chia_peer/mock`, `chia_publish/chain_tests.rs`), and the two-machine drill has not happened. Mainnet exists only in a development build (the `chia-mainnet` cargo feature, which the release workflow never builds). A statement marked **inferred** is reasoned from Chia's rules, not observed.
+> **As of:** main after [#417](https://github.com/Bella-Addormentata/StarStationFurlong/pull/417), 2026-11-10. **Proven so far:** the node's reads have met real full nodes on testnet11 and mainnet ([#412](https://github.com/Bella-Addormentata/StarStationFurlong/pull/412)). No write of the burner path has: it has run on the mock chain only (`chia_peer/mock`, `chia_publish/chain_tests.rs`), and the two-machine drill has not happened. Mainnet exists only in a development build (the `chia-mainnet` cargo feature, which the release workflow never builds). A statement marked **inferred** is reasoned from Chia's rules, not observed.
 >
 > **Rule:** a change to what the node writes to the chain, asks of a full node, or stores about either updates this file in the same PR.
 
@@ -63,7 +63,7 @@ There are two kinds of request (`chia_chain.rs`):
 | What is asked | When | Lane | What it shows the peer |
 |---|---|---|---|
 | The chain's peak | Each tick with something to read for. Usually it is the peer's own announcement; the node asks only when that is more than 10 minutes old | Carrier | That this IP runs the client. |
-| The station's own listing hints, this era and the last | Every beat (32 blocks; `SSF_CHIA_BEAT_BLOCKS`) of a tick with something to read for. A station that does not list asks all the same, unless it has nothing else to read for either: no room that is not public, no card held, no inbox to watch and no knock in its book (`watch_loop`) | Carrier | Which listing hint belongs to this IP. |
+| The station's own listing hints, this era and the last | Every beat (32 blocks; `SSF_CHIA_BEAT_BLOCKS`), and only while the publisher may write the listing, as its last tick said (§2: LIST ME on, `SSF_CHIA_FINDABLE` not `0`, the SSF wallet on, `contact.key` saved; `presence_publishing`, read in `watch_loop` in `chia_watch.rs`). The read exists for that write alone (it tells when a listing landed), so a station that does not list never asks for these hints, and a build with no publisher never does | Carrier | Which listing hint belongs to this IP. |
 | Each contact's listing hints, this era and the last: every peer in `peers.json` with a contact key | Every beat, four times less often while the station is connected to every station that claims the key; 8 keys a tick at most (`MAX_CK_READS_PER_TICK`) | Carrier | The station's contact list, as hints. |
 | v1 room hints for each room that is not public, three UTC days | Every beat, four times less often for a room with a connected peer | Carrier | The station's private rooms, as hints. They carry no network tag, and the watcher reads them on mainnet too, so the same bytes are asked on both chains. |
 | Inbox hints for each room that shares cards, this era and the last | Every beat | Agreed | Which inboxes this IP watches. |
@@ -176,7 +176,7 @@ What is still true with all of §5 working.
 | v1 room records | Written for a room whose Chia mesh switch is on, paid by the wallet. | The same, still paid by the wallet and not spaced from the burner's writes. Both follow the same address change, the wallet's at once and the burner's 10 minutes or more later, which pairs the listing key with the wallet's address by time. | Never written (`publishable_rooms`); the switch is hidden. They are still read. |
 | Beacon, if lit | From B, which the operator funds by hand. | From B, funded by the lobby dish. | From B, funded by the lobby dish. |
 | TAKE A MOJO, GIVE | Yes. | Yes. | Refused, and nobody claims at any dish but the lobby (`dish_claim_refusal`). |
-| Test hooks | With their variables. | With their variables. | The three that write are ignored, with one line saying so. `SSF_CHIA_RESOLVE_TEST=1`, which only reads one fixed test hint, still runs. |
+| Test hooks | With their variables. | With their variables. | All four are ignored, with one line saying so: the three that write, and `SSF_CHIA_RESOLVE_TEST=1`, which only reads one fixed test hint (`test_hook_on` in `main.rs`). |
 | The 24 words | Shown by the desktop app in its own window. A page shows them only in a run the desktop app did not start, when the page's origin is listed in `SSF_BANK_DEV_PAGES`, and until the words are marked saved. | The same. | The desktop app's window only (`page_allowed`). A new wallet is made only while the app's channel is live (`may_mint`). |
 | Hints and seals | No network tag. | No network tag. | The genesis challenge mixed in; the lobby dish has its own address. |
 
@@ -187,7 +187,7 @@ So on testnet11 today nothing in §5 is in effect unless the operator sets the f
 | Switch | Where | Default | Stops | Does not stop |
 |---|---|---|---|---|
 | **CHIA off** | SETTINGS, NETWORK, the CHIA row (`chia_lane_off.json` at the data root, one switch for every network), or `SSF_NO_CHIA_LANE` set to anything but empty or `0` (`chia_strict.rs`) | Chia on | Everything in §2 and §3: no introducer lookup, no dial, no read, no write, and no wallet loaded at a start. Off takes effect at once; on at the node's next start. A wallet that was loaded before an in-game off stays in memory until the node stops, and publishes nothing. It wins over every other switch here. | iroh, the DHT, mDNS, relays and the public-IP lookup, which have their own switches, and the exchange of contact cards between stations. A request already being written when the lane closes may still go out, and so may a name lookup already at the resolver. |
-| **LIST ME** | SETTINGS, NETWORK, under the PHONE BOOK row (`chia_listing.json`, per network) | On for a test network, off for mainnet | The listing, knocks, and sending either again. | The beacon, v1 room records, every read, and what is already on chain. |
+| **LIST ME** | SETTINGS, NETWORK, under the PHONE BOOK row (`chia_listing.json`, per network) | On for a test network, off for mainnet | The listing, knocks, sending either again, and the watcher's read of the station's own listing hints (§3). | The beacon, v1 room records, every other read, and what is already on chain. |
 | `SSF_CHIA_FINDABLE=0` | Environment | Unset | The listing. | Knocks, which follow LIST ME alone. |
 | **SHARE CARD** | Per room (the room's Share Card row) | On, in private rooms only | Handing this station's card to that room's members, filing theirs, reading knocks for that room, and knocking on a host there (`may_use_cards` in `chia_rooms.rs`). | Cards already handed out, which keep working while the contact key stays. |
 | `SSF_CHIA_SHARE_CARD=0` | Environment | Unset | Handing out this station's card, in every room and in a knock. | Reading knocks, and writing them: a knock then goes out without the station's contact key and still names its node id. |
@@ -195,7 +195,7 @@ So on testnet11 today nothing in §5 is in effect unless the operator sets the f
 | `SSF_CHIA_BEACON=1` | Environment | Unset: no beacon | Nothing; setting it lights the beacon. | |
 | `SSF_CHIA_BURNERS=1` | Environment, test network only | Unset: the wallet pays | Setting it moves listing, knocks and beacon to the burner path. Off a test network that path is the only one. | v1 room records, which the wallet still pays for. |
 | `SSF_CHIA_WATCH=0` | Environment | Unset: the watcher runs | The watcher's reads on every beat and, with it, knocks. | The reads a failed dial makes, and the listing. |
-| `SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY` | Environment | Unset: public full nodes | With both set, every request goes to the operator's own full node and no other. Pin-only takes `1`, `true`, `on` or `yes`. | With no pin set, pin-only is ignored without a line saying so. |
+| `SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY` | Environment | Unset: public full nodes | With both set, every request goes to the operator's own full node and no other. Pin-only takes `1`, `true`, `on` or `yes`. | With no pin set, pin-only does nothing: public full nodes are asked, and one line at start says so (`pin_port_warnings` in `chia_peer_lane.rs`). |
 | **The SSF wallet** | The Bank's switch (`chia_wallet.json`, per network); `SSF_CHIA_LANE` holds it on (`1`) or off (any other value that is not empty) | Off until the player makes a wallet | With no wallet on, every write. Turning it on in the Bank loads the wallet and starts the publisher at once, in the same run. Turning it off takes effect at the node's next start; until then the wallet stays loaded and the node goes on writing. | Reads. |
 | `SSF_CHIA_AUDIT=1` | Environment | Unset | Nothing; setting it prints the address and puzzle hash of the station's burner keys in the node's own log, for the review in §10. Never key bytes. | |
 | Build features | `cargo build` | Release builds: `chia-publish`, no `chia-mainnet` | Without default features there is no lane; without `chia-publish`, no write; without `chia-mainnet`, the node stops at `SSF_CHIA_NETWORK=mainnet`. | |
@@ -280,14 +280,13 @@ A one-off developer review of what the chain actually shows. The game never depe
 
 **Gaps this document's check against the code found.** Each is a place where the code does less than a reader might assume. Most show only to the full nodes a station talks to or to someone at the computer; the timing ones show on the chain.
 - On mainnet the publisher never reads the money address, and the dish's own polls no longer do. The Bank still does when it shows the balance, and only while it is on screen: on open, on REFRESH, once after the wallet is turned on, and at the dish's polls. The two agreed full nodes of that moment then see the money address and the burner addresses from one IP. A balance needs a read; only a full node of one's own, or reading the balance through other peers than the burners', would close this.
-- LIST ME does not hold the beacon or a v1 room record, and with LIST ME off the watcher still asks a full node for the station's own listing hints, except on a station with nothing else to read for (§3).
+- LIST ME does not hold the beacon or a v1 room record. Each is lit by a switch of its own (§2).
 - v1 room hints are still read on mainnet, untagged (§6, 22). The v1 writer goes in stage 4 PR 12. `chia_lane.rs` says v1 stays readable for two eras, but no code ends the reads yet.
 - A machine that slept past its listing slot writes as soon as it wakes, and a station whose address changed since last era does not wait for its slot (§5, T2 and T3).
 - With burners on on testnet11, a room's v1 record is still paid by the wallet and not spaced, which pairs the listing key with the wallet's address by time (§7). It goes with the v1 writer.
 - The hint rule and the gift fuse rest on local files, not on the chain (§5, §7).
-- `SSF_CHIA_RESOLVE_TEST=1` still reads a fixed test hint on mainnet.
 - On a test network the default log prints the wallet's receive address at start, and its puzzle hash on a failed wallet-paid write (§9). Off a test network it prints neither.
-- Pin-only mode with no pin is ignored silently.
+- Pin-only mode with no pin does nothing, and says so at start (§8). It does not stop the node from asking public full nodes.
 
 ## 12. Where this comes from
 

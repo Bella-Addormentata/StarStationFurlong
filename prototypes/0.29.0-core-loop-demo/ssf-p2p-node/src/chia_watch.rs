@@ -597,11 +597,17 @@ pub async fn watch_loop(hub: crate::SharedHub, iroh_ep: iroh::Endpoint) {
         // get their own records, neither can shadow the other. Our own record
         // goes first: seeing it confirm tells the publisher the write landed
         // and clears every cooldown, since the peers see us at their next beat.
+        // 🕳️ It is read only while the publisher may write it
+        // (`self_publishing`: LIST ME on, a listing to keep up, its writer
+        // not refused). A station that does not list has no write to
+        // confirm, and the read would only show a full node which listing
+        // hint goes with this address (docs/TDD/ChiaLanePrivacy.md §3). A
+        // build with no publisher never reads it.
         // Only the chain reads need the peak; the holds planned from the cached
         // records (further below) run without one, as the room records' do.
         if peak > 0 {
             let own_ck = hub.contact_key;
-            if sched.due(SELF_SCHED_KEY, peak, false) {
+            if self_publishing && sched.due(SELF_SCHED_KEY, peak, false) {
                 match chia_resolve::read_ck(net, &client, &own_ck, peak, now_unix, &mut self_cursors).await {
                     Ok(found) => {
                         if let Some(newest) = found
@@ -1305,6 +1311,28 @@ mod tests {
         let s = BeatSchedule::new(0);
         assert_eq!(s.beat_blocks, 1, "zero is clamped, never a division by zero");
         assert_eq!(BeatSchedule::new(DEFAULT_BEAT_BLOCKS).beat_blocks, 32);
+    }
+
+    /// The watcher asks a full node for the station's own listing hints
+    /// only while the publisher may write the listing (LIST ME on): the
+    /// one read of our own contact key in this file sits behind the
+    /// publisher's word, and a beat is spent on it only then. Read from
+    /// the source, since the read is in the watcher's loop itself.
+    #[test]
+    fn the_own_listing_is_read_only_while_the_publisher_may_write_it() {
+        let source = include_str!("chia_watch.rs");
+        // Joined here so that this test's own lines are not counted.
+        let due = ["sched.due(SELF_SCHED_KEY", " peak, false)"].join(",");
+        let read = ["read_ck(net, &client, &own_ck", " peak, now_unix, &mut self_cursors)"].join(",");
+        assert_eq!(source.matches(&due).count(), 1, "one place spends the own key's beat");
+        assert_eq!(source.matches(&format!("if self_publishing && {due} {{")).count(), 1, "and it asks the publisher's word first");
+        assert_eq!(source.matches(&read).count(), 1, "one read of our own key");
+        let gate = source.find(&due).unwrap();
+        let own_read = source.find(&read).unwrap();
+        assert!(gate < own_read && !source[gate..own_read].contains('}'), "the read is the gate's first statement");
+        // The flag is the publisher's: on only while it may write the listing.
+        let flag = ["hub.presence_publishing", "load("].join(".");
+        assert_eq!(source.matches(&flag).count(), 1);
     }
 
     #[test]
