@@ -735,7 +735,10 @@ fn keys(n: u8) -> PublisherKeys {
 /// ([`PublisherKeys::without_wallet_key`]), which is what the publisher
 /// holds off a test network, so every burner-path step here is shown to
 /// need no wallet key; off it the keys as the test's network makes them,
-/// wallet key and all, for the SSF wallet's own write.
+/// wallet key and all, for the SSF wallet's own write. The burner path
+/// with the wallet key held, which a test network's station runs, has a
+/// test of its own
+/// (`on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_keys_and_leave_the_wallets_coin`).
 fn keys_on(n: u8, burner_path: bool) -> PublisherKeys {
     if burner_path {
         keys(n).without_wallet_key()
@@ -6633,5 +6636,45 @@ async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and
     assert!(!from_burner);
     assert_eq!((write.coins, write.payer), (WriteCoins::one(funded.coin_id()), Payer::of(&b)), "B pays for the beacon, from its funded coin");
     assert_eq!(s.gifts(0), 0, "no lobby coin claimed off the burner path");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// The burner path with the wallet key held, which is what a test network's
+/// station with burner keys on runs ([`PublisherKeys::of`] keeps the key
+/// there): the knock is written from K(h) and the beacon from B as a burner
+/// key, each from a lobby dish coin it claims, as from keys that hold no
+/// wallet key ([`keys_on`]). The SSF wallet's funded coin is never parked
+/// and stays unspent: holding the key changes nothing on this path.
+#[tokio::test]
+async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_keys_and_leave_the_wallets_coin() {
+    let mut s = setup().await;
+    let (w, node, none) = (wallet(145), iroh::SecretKey::generate(), no_data_folder());
+    let (req, _) = host_card([0x45; 32]);
+    let (k, b) = (knock_key(145, &req, 0), beacon_key(145));
+    let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let (dishes, _) = ready_dishes(&s, &[1, 1]).await;
+    let held = keys(145);
+    assert!(held.money().is_ok(), "the keys hold the wallet key, as on a test network");
+    let claimed = |key: &BurnerKey, write: &MemoWrite| dishes.iter().any(|f| write.coins == WriteCoins { parent: gift(key, *f).coin_id(), parked: f.coin_id() });
+
+    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+    let mut rng = StdRng::seed_from_u64(1);
+    let (hint, write, from_burner) = arm_wrote(knock_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await);
+    assert!(from_burner, "written on the burner path");
+    assert_eq!(hint, knock_hint(NET, &req, &ROOM_KEY, 0));
+    assert_eq!(write.payer, Payer::of_burner(&k), "K(h) pays");
+    assert!(claimed(&k, &write), "from a lobby dish coin it claims");
+    assert!(!s.lease.is_taken(&coin.coin_id()), "the SSF wallet's coin is not parked");
+    s.turn().await;
+
+    let at = s.later();
+    let (_, write, from_burner) = beacon_wrote(beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &none, 0, unix_now(), &mut rng).await);
+    assert!(from_burner, "written on the burner path");
+    assert_eq!(write.payer, Payer::of_burner(&b), "B pays, as a burner key");
+    assert!(claimed(&b, &write), "from a lobby dish coin it claims");
+    assert_eq!(s.gifts(0), 2, "each claimed its own lobby coin");
+    assert!(!s.lease.is_taken(&coin.coin_id()), "the SSF wallet's coin is not parked");
+    s.turn().await;
+    assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "and it is unspent");
     assert!(s.chain.unanswered().is_empty());
 }
