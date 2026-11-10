@@ -56,10 +56,14 @@
 //! off, as a clock set back since the count leaves it, is brought in to
 //! two hours from now ([`ForeignPause::keep_time`]). A clock set forward
 //! ends them early, which the node cannot tell from time passing: a spend
-//! the other copy makes after that is the second time. And a station that
-//! was stopped, or had burner keys off, when the two hours ended starts
-//! the watch afresh when it next runs: what the other copy wrote until
-//! then, in a later era too, is adopted and not told of.
+//! the other copy makes after that is the second time. A write this
+//! station made while its clock stood more than two hours ahead, first
+//! learned lost after the clock was set right and the two hours ended, is
+//! counted a second time: its stamp is past the end brought in, and no
+//! stamp of the old clock can be told from one of the new. And a station
+//! that was stopped, or had burner keys off, when the two hours ended
+//! starts the watch afresh when it next runs: what the other copy wrote
+//! until then, in a later era too, is adopted and not told of.
 
 use std::path::{Path, PathBuf};
 
@@ -264,12 +268,15 @@ impl ForeignPause {
     /// station made what the spend crossed: its look at the key's spent
     /// coins, or the write of its own that the spend took the coin of.
     /// `true` when it counts, as the era's first or a later one. `false`,
-    /// with no count, when `coin` was told of before, and when `made` is
-    /// before the end of the two hours on record: those are the owner's
-    /// time to stop the other copy, and what it spent before they ended,
-    /// whenever this station learns of it, is still the first time. The
-    /// first one of an era starts its two hours at `now`; a later one
-    /// starts no clock, since the era's end is what it waits for.
+    /// with no count, when `coin` was told of before, while the two hours
+    /// on record run, and when `made` is before their end: those are the
+    /// owner's time to stop the other copy, and what it spent before they
+    /// ended, whenever this station learns of it, is still the first time.
+    /// While they run nothing counts whatever `made` says: a clock set
+    /// back since the count stamped its writes ahead of the end brought
+    /// in ([`ForeignPause::keep_time`]). The first one of an era starts
+    /// its two hours at `now`; a later one starts no clock, since the
+    /// era's end is what it waits for.
     pub fn note_made(&mut self, era: u64, now: u64, coin: Bytes32, made: u64) -> bool {
         self.keep_time(now);
         if self.seen.contains(&coin) {
@@ -279,7 +286,7 @@ impl ForeignPause {
         if self.seen.len() > MAX_FOREIGN_SEEN {
             self.seen.remove(0);
         }
-        let counts = self.times == 0 || made >= self.until;
+        let counts = self.times == 0 || (!self.two_hours_run(now) && made >= self.until);
         if counts {
             if !self.joins(era) {
                 self.era = era;
@@ -545,10 +552,18 @@ mod tests {
         assert!(pause.watch_due(until));
         assert_eq!(ForeignPause::load(&path, KEYS).holds(7, until - 1), Some(Paused::TwoHours { until }), "saved: a restart does not start them again");
         assert!(!pause.note(7, T0 + HOUR, coin(2)), "what is told of meanwhile is the same time");
+        // So is a write the clock stamped while it stood ahead, an hour
+        // before the count: its stamp is past the end brought in, and it
+        // counts nothing while the two hours run all the same.
+        assert!(!pause.note_made(7, T0 + HOUR, coin(3), ahead - HOUR), "stamped ahead of the end, and still the same time");
+        assert_eq!(pause.holds(7, T0 + HOUR), Some(Paused::TwoHours { until }));
         pause.watch_renewed();
         for now in [until, T0 + 4 * HOUR, ahead + FOREIGN_PAUSE_SECS - 1] {
             assert_eq!(pause.holds(7, now), None, "at {now}: over, and it does not come back");
         }
+        // Told of once, that write counts nothing after them either.
+        assert!(!pause.note_made(7, until, coin(3), ahead - HOUR));
+        assert_eq!(pause.holds(7, until), None);
         // A count looks at the clock too: one told of with the clock right
         // again counts by the end brought in, not the one a year off.
         let mut counted = ForeignPause::in_memory();
