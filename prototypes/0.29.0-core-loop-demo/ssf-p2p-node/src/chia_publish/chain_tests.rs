@@ -239,6 +239,23 @@
 //! and the beacon's, one address on both paths
 //! (`the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_on_both_paths`).
 //!
+//! Off a test network burner keys are the only path, and the beacon is the
+//! one arm that writes there yet (§13 row 10, §4.5 (6)). Those tests run on
+//! a mock chain of mainnet's own ([`setup_on`]), which checks every
+//! signature against mainnet's genesis: a mainnet beacon is written from B
+//! with no wallet key held, funded by mainnet's lobby dish and by no other
+//! network's, while the knock's step is handed the closed path
+//! (`a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mainnets_own_lobby_dish_alone`),
+//! and one the mempools dropped is sent again by a lease that knows its
+//! wallet's payer
+//! (`a_mainnet_beacon_the_mempools_dropped_is_sent_again_by_a_lease_that_knows_its_wallets_payer_and_lands`).
+//! The beacon's push is dated for the other network's guard (§4.5 (7)) as
+//! its writer's last step
+//! (`a_beacons_push_is_dated_only_by_a_try_that_builds_a_bundle_and_a_date_that_cannot_be_saved_sends_nothing`),
+//! and the date alone, with no mark saved, holds the other network's beacon
+//! back in one data folder, in both directions
+//! (`a_beacon_pushed_on_one_network_holds_the_other_networks_beacon_back_for_14_days_though_no_mark_of_it_was_saved`).
+//!
 //! The claim and write aggregated by hand stays, in
 //! `an_ephemeral_coin_is_found_through_its_parent_by_every_lookup_the_resolver_makes`,
 //! as the readers' own proof: it asks nothing of any writer.
@@ -272,8 +289,11 @@ const ROOM_KEY: [u8; 32] = [23; 32];
 /// A chain, its two nodes, a lane on them at both trust levels, a wallet
 /// lease with no file, the gift fuse a burner's writes count their gifts in
 /// (stage 4 design §5.2), kept in memory alone, and the instant the lease is
-/// next reconciled at.
+/// next reconciled at. The chain is the test network's ([`setup`]) unless a
+/// test asks for another's ([`setup_on`]); the lease is reconciled on the
+/// chain's network.
 struct Setup {
+    net: crate::chia_network::ChiaNet,
     chain: MockChain,
     a: MockNode,
     b: MockNode,
@@ -286,13 +306,22 @@ struct Setup {
 }
 
 async fn setup() -> Setup {
-    let chain = MockChain::new(NET);
+    setup_on(NET).await
+}
+
+/// [`setup`] on a chain of `net`'s: its genesis, so its nodes take only a
+/// spend signed for `net`, and a lane that names `net` to them. The helpers
+/// that name [`NET`] (the test wallets' keys, [`lobby`], [`Setup::arm_beacon`])
+/// are the test network's still; a test on another network hands the steps
+/// that network's own keys ([`Setup::arm_beacon_on`]).
+async fn setup_on(net: crate::chia_network::ChiaNet) -> Setup {
+    let chain = MockChain::new(net);
     let (a, b) = chain.pair().await;
     let lane = chain.lane(&a, &b);
     let money = PeerLane::new(lane.clone(), Trust::Agreed);
     let carrier = PeerLane::new(lane.clone(), Trust::Carrier);
     let fuse = std::sync::Mutex::new(GiftFuse::new());
-    Setup { chain, a, b, lane, money, carrier, lease: WalletLease::new(), fuse, clock: Instant::now() }
+    Setup { net, chain, a, b, lane, money, carrier, lease: WalletLease::new(), fuse, clock: Instant::now() }
 }
 
 /// [`push_for`] of a write the wallet key `payer` signs and pays for.
@@ -343,6 +372,15 @@ impl Drop for Dir {
     }
 }
 
+/// The directory's path, so `&dir` is given where a path is asked for.
+impl std::ops::Deref for Dir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 impl Setup {
     /// Twice the grace past the last reconciliation: every spend parked
     /// before it, or parked again by it, is due.
@@ -358,7 +396,7 @@ impl Setup {
 
     async fn reconcile(&mut self) {
         let at = self.later();
-        self.lease.reconcile_at(NET, &self.money, at).await;
+        self.lease.reconcile_at(self.net, &self.money, at).await;
     }
 
     /// The next step ([`Self::later`]) runs at `instant`. T4 counts a
@@ -574,13 +612,15 @@ impl Setup {
     /// by the beacon's own seam ([`publish_beacon_with`]) on the test's
     /// lease, fuse, network and chain, at the next instant ([`Self::later`]),
     /// with the random source seeded by `seed`: the write the heartbeat makes
-    /// with burner keys on, once the beacon guard has let it by. Its future
-    /// is checked to be `Send`, as the heartbeat's task needs it to be.
+    /// with burner keys on, once the beacon guard has let it by. It dates no
+    /// push: the arm's step does that ([`beacon_on_path`],
+    /// [`Self::arm_beacon`]). Its future is checked to be `Send`, as the
+    /// heartbeat's task needs it to be.
     async fn beacon(&mut self, wallet: u8, node: &iroh::SecretKey, era: u64, now_unix: u64, seed: u64) -> Result<(Bytes32, MemoWrite)> {
         let at = self.later();
         let key = beacon_key(wallet);
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(publish_beacon_with(&self.lease, &self.fuse, NET, &self.money, at, &key, node, era, now_unix, &mut rng)).await
+        sendable(publish_beacon_with(&self.lease, &self.fuse, NET, &self.money, at, &key, node, era, now_unix, || Ok(()), &mut rng)).await
     }
 
     /// What the beacon arm's step makes of a due try for `node`'s beacon in
@@ -597,10 +637,18 @@ impl Setup {
     /// heartbeat's task needs it to be.
     #[allow(clippy::too_many_arguments)]
     async fn arm_beacon(&mut self, wallet_n: u8, burner_path: bool, node: &iroh::SecretKey, era: u64, data: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
-        let at = self.later();
         let keys = keys_on(wallet_n, burner_path);
+        self.arm_beacon_on(&keys, burner_path, node, era, data, now_unix, seed).await
+    }
+
+    /// [`Self::arm_beacon`] for `keys`, on the network the test's chain is
+    /// ([`setup_on`]): the step a node of that network takes with the keys
+    /// its heartbeat holds.
+    #[allow(clippy::too_many_arguments)]
+    async fn arm_beacon_on(&mut self, keys: &PublisherKeys, burner_path: bool, node: &iroh::SecretKey, era: u64, data: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
+        let at = self.later();
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, &keys, burner_path, node, data, era, now_unix, &mut rng)).await
+        sendable(beacon_on_path(&self.lease, &self.fuse, self.net, &self.money, move || at, keys, burner_path, node, data, era, now_unix, &mut rng)).await
     }
 
     /// The gifts the test's fuse counts against `era` ([`GiftFuse`]).
@@ -817,6 +865,16 @@ async fn ready_dishes(s: &Setup, amounts: &[u64]) -> (Vec<Coin>, u32) {
 async fn ready_dish(s: &Setup, amount: u64) -> (Coin, u32) {
     let (coins, made) = ready_dishes(s, &[amount]).await;
     (coins[0], made)
+}
+
+/// A coin of `amount` in `net`'s lobby dish on the test's chain, made and
+/// then [`GAP_BLOCKS`] blocks old, so it is ready to claim there if the
+/// chain is `net`'s, and is no dish coin at all if it is another network's.
+async fn ready_dish_of(s: &Setup, net: crate::chia_network::ChiaNet, amount: u64) -> Coin {
+    let coin = s.chain.fund(FaucetParams::lobby(net).puzzle_hash(), amount, None);
+    s.chain.farm().await;
+    s.chain.farm_blocks(GAP_BLOCKS).await;
+    coin
 }
 
 /// The gift g the claim of `dish` makes at `key`, which the burner's write
@@ -1108,12 +1166,14 @@ fn beacon_key(n: u8) -> BurnerKey {
     MoneyKey::new(wallet(n)).beacon()
 }
 
-/// A data folder for the beacon arm's step where nothing is: a folder of
-/// the temp directory that is never made, so it holds no beacon mark of the
-/// other network's and the guard lets every try by. No test here reads a
-/// real data folder.
-fn no_data_folder() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ssf-mock-chain-no-data-folder-{}-{}", std::process::id(), rand::random::<u64>()))
+/// A data folder of the test's own for the beacon arm's step, with nothing
+/// in it: a folder of the temp directory, removed when it is dropped. It
+/// holds no beacon file of the other network's, so the guard lets every try
+/// by, and the step dates this network's pushes in it
+/// ([`BEACON_PUSHED_FILE`]), as it does in a node's data folder. No test
+/// here reads a real data folder.
+fn empty_data_folder() -> Dir {
+    Dir::new("data-folder")
 }
 
 /// The other network's beacon mark in the test's own data folder `dir`, at
@@ -4119,7 +4179,7 @@ async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_
     let two_hours = Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS });
     assert_eq!(paused_now(&mut pause, Some(0), at), two_hours, "counted on the pause");
     assert_eq!(presence_step(&mark, told, 0, s.chain.peak()), PresenceStep::Void("never landed — another copy of this station spent its coin".into()));
-    assert_eq!(after_void_words(lost, two_hours, true, NET), "its next write waits for the pause to end");
+    assert_eq!(after_void_words(lost, two_hours, true, NET, true), "its next write waits for the pause to end");
     assert!(!listing_due(false, ListingStep::Write, true, two_hours));
 
     // While the two hours run the copy rewrites its listing once more, from
@@ -5486,7 +5546,7 @@ async fn the_next_eras_burner_beacon_is_written_from_bs_oldest_one_mojo_coin_wit
 #[tokio::test]
 async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_and_waits_behind_any_parked_spend() {
     let mut s = setup().await;
-    let (b, node, none) = (beacon_wallet(95), iroh::SecretKey::generate(), no_data_folder());
+    let (b, node, empty) = (beacon_wallet(95), iroh::SecretKey::generate(), empty_data_folder());
     let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
     let one = s.chain.fund(our_puzzle_hash(&b), 1, None);
     let (dish, _) = ready_dishes(&s, &[1, 1]).await;
@@ -5496,7 +5556,7 @@ async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_an
     assert_eq!(s.gifts(0), 1, "its gift");
     let sent = s.sent();
 
-    let held = s.arm_beacon(95, false, &node, 0, &none, unix_now(), 2).await;
+    let held = s.arm_beacon(95, false, &node, 0, &empty, unix_now(), 2).await;
     let e = held.as_ref().err().expect("it waits");
     assert_eq!(e.downcast_ref::<MemoWait>(), Some(&MemoWait::Settling("beacon".to_string())), "main's global check");
     assert!(is_typed_wait(e));
@@ -5509,7 +5569,7 @@ async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_an
 
     s.chain.farm().await;
     let now = unix_now();
-    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(95, false, &node, 0, &none, now, 3).await);
+    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(95, false, &node, 0, &empty, now, 3).await);
     assert!(!from_burner, "written off the burner path");
     assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 0)));
     assert_eq!(write.coins, WriteCoins::one(funded.coin_id()), "B's largest coin, as on main");
@@ -5540,17 +5600,17 @@ async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_an
 #[tokio::test]
 async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_settles() {
     let mut s = setup().await;
-    let (b, key, node, none) = (beacon_wallet(96), beacon_key(96), iroh::SecretKey::generate(), no_data_folder());
+    let (b, key, node, empty) = (beacon_wallet(96), beacon_key(96), iroh::SecretKey::generate(), empty_data_folder());
     let payer = Payer::of_burner(&key);
     let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
     let (f, _) = ready_dish(&s, 10).await;
-    let (_, money_write, from_burner) = beacon_wrote(s.arm_beacon(96, false, &node, 0, &none, unix_now(), 1).await);
+    let (_, money_write, from_burner) = beacon_wrote(s.arm_beacon(96, false, &node, 0, &empty, unix_now(), 1).await);
     assert!(!from_burner);
     assert_eq!((money_write.coins, money_write.payer), (WriteCoins::one(funded.coin_id()), payer), "from B's funded coin, B paying");
     assert!(s.lease.outgoing_pending_for(payer), "parked for B, the one payer of both paths");
     let sent = s.sent();
 
-    let held = s.arm_beacon(96, true, &node, 0, &none, unix_now(), 2).await;
+    let held = s.arm_beacon(96, true, &node, 0, &empty, unix_now(), 2).await;
     assert_eq!(beacon_waited(&held), Some(BurnerWait::Held), "B's own spend, in flight");
     names_no_beacon(held.as_ref().err().unwrap(), &key);
     assert_eq!(s.sent(), sent, "nothing new sent");
@@ -5558,12 +5618,12 @@ async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_s
     assert_eq!(s.gifts(0), 0);
 
     s.chain.farm().await;
-    let settling = s.arm_beacon(96, true, &node, 0, &none, unix_now(), 3).await;
+    let settling = s.arm_beacon(96, true, &node, 0, &empty, unix_now(), 3).await;
     assert_eq!(beacon_waited(&settling), Some(BurnerWait::Settling), "landed, B's spend settling");
     assert!(!s.lease.is_taken(&f.coin_id()) && s.gifts(0) == 0, "still nothing claimed");
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(96, true, &node, 0, &none, unix_now(), 4).await);
+    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon(96, true, &node, 0, &empty, unix_now(), 4).await);
     assert!(from_burner, "written on the burner path");
     assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "from the lobby dish coin it claims");
     assert_eq!(write.payer, payer);
@@ -5675,7 +5735,7 @@ async fn a_listing_a_knock_and_the_beacon_of_one_node_land_at_least_32_blocks_ap
 #[tokio::test]
 async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_go_out_at_the_blocks_drawn_for_them() {
     let mut s = setup().await;
-    let (w, node, none) = (wallet(131), iroh::SecretKey::generate(), no_data_folder());
+    let (w, node, empty) = (wallet(131), iroh::SecretKey::generate(), empty_data_folder());
     let ((req, host_kx), (behind, _)) = (host_card([0x31; 32]), host_card([0x32; 32]));
     let (k, b) = (knock_key(131, &req, 0), beacon_key(131));
     ready_dishes(&s, &[1, 1, 1]).await;
@@ -5697,7 +5757,7 @@ async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_g
     assert!(!line.contains(&Payer::of_burner(&k).hex()), "{line}");
     knock_names_no_burner(e, &req, &k);
 
-    let done = s.arm_beacon(131, true, &node, 0, &none, at, 3).await;
+    let done = s.arm_beacon(131, true, &node, 0, &empty, at, 3).await;
     assert_eq!(beacon_waited(&done), Some(BurnerWait::Spaced));
     let e = done.as_ref().err().expect("the beacon waits its turn");
     assert!(beacon_took_the_tick(&done), "the writer was reached: the tick is used");
@@ -5723,14 +5783,14 @@ async fn a_spaced_knock_and_beacon_wait_in_their_arms_with_no_attempt_used_and_g
     // The knock's landing holds the beacon again: its turn is drawn from
     // that landing, more than 64 blocks past the listing's, and so past the
     // block drawn for it from the listing's landing.
-    let again = s.arm_beacon(131, true, &node, 0, &none, at, 6).await;
+    let again = s.arm_beacon(131, true, &node, 0, &empty, at, 6).await;
     assert_eq!(beacon_waited(&again), Some(BurnerWait::Spaced));
     let beacon_due = knocked + spaced_by(6);
     assert!(beacon_due > listed + SPACING_MAX_BLOCKS);
     s.at_block(beacon_due - 1).await;
-    assert_eq!(beacon_waited(&s.arm_beacon(131, true, &node, 0, &none, at, 7).await), Some(BurnerWait::Spaced), "one block before its turn");
+    assert_eq!(beacon_waited(&s.arm_beacon(131, true, &node, 0, &empty, at, 7).await), Some(BurnerWait::Spaced), "one block before its turn");
     assert_eq!(s.chain.farm().await, beacon_due);
-    let (_, beacon, from_burner) = beacon_wrote(s.arm_beacon(131, true, &node, 0, &none, at, 8).await);
+    let (_, beacon, from_burner) = beacon_wrote(s.arm_beacon(131, true, &node, 0, &empty, at, 8).await);
     assert!(from_burner);
     let beaconed = s.chain.farm().await;
     assert_eq!(s.chain.record(beacon.coins.parked).and_then(|r| r.2), Some(beaconed));
@@ -6067,9 +6127,9 @@ async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_bea
 #[tokio::test]
 async fn a_burner_beacon_with_no_dish_coin_ready_waits_names_no_key_and_goes_out_once_one_is() {
     let mut s = setup().await;
-    let (key, node, none) = (beacon_key(125), iroh::SecretKey::generate(), no_data_folder());
+    let (key, node, empty) = (beacon_key(125), iroh::SecretKey::generate(), empty_data_folder());
     s.chain.farm().await;
-    let dry = s.arm_beacon(125, true, &node, 0, &none, unix_now(), 1).await;
+    let dry = s.arm_beacon(125, true, &node, 0, &empty, unix_now(), 1).await;
     assert_eq!(beacon_waited(&dry), Some(BurnerWait::NoCoinReady));
     let e = dry.as_ref().err().expect("it waited");
     assert!(is_typed_wait(e), "a wait, not a failure");
@@ -6084,7 +6144,7 @@ async fn a_burner_beacon_with_no_dish_coin_ready_waits_names_no_key_and_goes_out
 
     let (f, _) = ready_dish(&s, 10).await;
     let now = unix_now();
-    let (_, write, _) = beacon_wrote(s.arm_beacon(125, true, &node, 0, &none, now, 2).await);
+    let (_, write, _) = beacon_wrote(s.arm_beacon(125, true, &node, 0, &empty, now, 2).await);
     let g = gift(&key, f);
     assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "the ready coin, claimed");
     assert_eq!(s.gifts(0), 1);
@@ -6110,12 +6170,12 @@ async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_
     let f2 = s.chain.fund(lobby().puzzle_hash(), 10, None);
     s.chain.farm().await;
     s.chain.farm_blocks(GAP_BLOCKS - 1).await;
-    let (key, node, none) = (beacon_key(126), iroh::SecretKey::generate(), no_data_folder());
+    let (key, node, empty) = (beacon_key(126), iroh::SecretKey::generate(), empty_data_folder());
     let stranger = Bytes32::new([0x67; 32]);
     s.money.push_tx(claim(&lobby(), f, stranger)).await.unwrap();
     s.chain.block_before(ProtocolMessageTypes::SendTransaction);
 
-    let lost = s.arm_beacon(126, true, &node, 0, &none, unix_now(), 1).await;
+    let lost = s.arm_beacon(126, true, &node, 0, &empty, unix_now(), 1).await;
     assert!(!s.chain.reorg_staged(), "the block came as the beacon was sent");
     let why = beacon_refused(&lost).expect("every peer refused the push");
     assert_eq!(why.matches("DOUBLE_SPEND").count(), 2, "{why}");
@@ -6129,7 +6189,7 @@ async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_
     // A block every connection has filed, so the lane's peak is the chain's.
     s.chain.farm().await;
     let now = unix_now();
-    let (_, write, _) = beacon_wrote(s.arm_beacon(126, true, &node, 0, &none, now, 2).await);
+    let (_, write, _) = beacon_wrote(s.arm_beacon(126, true, &node, 0, &empty, now, 2).await);
     let g2 = gift(&key, f2);
     assert_eq!(write.coins, WriteCoins { parent: g2.coin_id(), parked: f2.coin_id() }, "another coin");
     assert_eq!(s.gifts(0), 1);
@@ -6149,9 +6209,9 @@ async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_
 async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_lands_once_cleared_with_no_fee() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 10).await;
-    let (key, node, none) = (beacon_key(127), iroh::SecretKey::generate(), no_data_folder());
+    let (key, node, empty) = (beacon_key(127), iroh::SecretKey::generate(), empty_data_folder());
     s.chain.set_full(true);
-    let turned_away = s.arm_beacon(127, true, &node, 0, &none, unix_now(), 1).await;
+    let turned_away = s.arm_beacon(127, true, &node, 0, &empty, unix_now(), 1).await;
     let why = beacon_refused(&turned_away).expect("every peer refused the push");
     assert!(why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO"), "{why}");
     let e = turned_away.as_ref().err().expect("refused");
@@ -6168,7 +6228,7 @@ async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_l
 
     s.chain.set_full(false);
     let now = unix_now();
-    let (_, write, _) = beacon_wrote(s.arm_beacon(127, true, &node, 0, &none, now, 2).await);
+    let (_, write, _) = beacon_wrote(s.arm_beacon(127, true, &node, 0, &empty, now, 2).await);
     let g = gift(&key, f);
     assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
     let bundle = s.chain.received().last().cloned().expect("the beacon was sent");
@@ -6189,9 +6249,9 @@ async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_l
 async fn a_burner_beacon_the_blown_fuse_holds_waits_claims_nothing_and_is_funded_in_the_next_era() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 10).await;
-    let (key, node, none) = (beacon_key(128), iroh::SecretKey::generate(), no_data_folder());
+    let (key, node, empty) = (beacon_key(128), iroh::SecretKey::generate(), empty_data_folder());
     s.preset_fuse(0, strangers(16));
-    let blown = s.arm_beacon(128, true, &node, 0, &none, unix_now(), 1).await;
+    let blown = s.arm_beacon(128, true, &node, 0, &empty, unix_now(), 1).await;
     assert_eq!(beacon_waited(&blown), Some(BurnerWait::FuseBlown { era: 0 }));
     let e = blown.as_ref().err().expect("it waited");
     assert!(is_typed_wait(e));
@@ -6199,7 +6259,7 @@ async fn a_burner_beacon_the_blown_fuse_holds_waits_claims_nothing_and_is_funded
     assert!(s.chain.received().is_empty() && !s.lease.is_taken(&f.coin_id()), "nothing sent or claimed");
     assert_eq!(s.gifts(0), 16);
 
-    let (hint, next_era, _) = beacon_wrote(s.arm_beacon(128, true, &node, 1, &none, unix_now(), 2).await);
+    let (hint, next_era, _) = beacon_wrote(s.arm_beacon(128, true, &node, 1, &empty, unix_now(), 2).await);
     assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 1)), "era 1's beacon hint");
     assert_eq!(next_era.payer, Payer::of_burner(&key), "the same B");
     assert_eq!(next_era.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() });
@@ -6369,12 +6429,12 @@ async fn a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_writt
 async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 1).await;
-    let (w, key, node, none) = (wallet(132), beacon_key(132), iroh::SecretKey::generate(), no_data_folder());
+    let (w, key, node, empty) = (wallet(132), beacon_key(132), iroh::SecretKey::generate(), empty_data_folder());
     for other in crate::chia_network::ChiaNet::ALL.into_iter().filter(|net| *net != NET) {
         let theirs = PublisherKeys::of(other, w.clone());
         let at = s.later();
         let mut rng = StdRng::seed_from_u64(1);
-        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &theirs, true, &node, &none, 0, unix_now(), &mut rng).await;
+        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &theirs, true, &node, &empty, 0, unix_now(), &mut rng).await;
         let e = refused.as_ref().err().expect("a root of another network is refused");
         assert_eq!(format!("{e:#}"), format!("the beacon's burner root is for {} and this write is on testnet11; nothing is written", other.name()));
         assert!(!is_typed_wait(e), "a failure, not a wait");
@@ -6384,7 +6444,7 @@ async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_no
     assert!(s.chain.received().is_empty(), "nothing sent");
     assert!(!s.lease.is_taken(&f.coin_id()) && !s.lease.outgoing_pending(), "nothing parked");
     assert_eq!(s.gifts(0), 0, "no gift counted");
-    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(132, true, &node, 0, &none, unix_now(), 2).await);
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(132, true, &node, 0, &empty, unix_now(), 2).await);
     assert!(from_burner);
     assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "the test network's own root writes");
     assert_eq!(s.gifts(0), 1);
@@ -6548,7 +6608,7 @@ async fn the_audits_line_for_a_knock_names_its_key_only_once_the_key_has_written
 #[tokio::test]
 async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_on_both_paths() {
     let mut s = setup().await;
-    let (w, b, key, node, none) = (wallet(143), beacon_wallet(143), beacon_key(143), iroh::SecretKey::generate(), no_data_folder());
+    let (w, b, key, node, empty) = (wallet(143), beacon_wallet(143), beacon_key(143), iroh::SecretKey::generate(), empty_data_folder());
     let lines = audit_wallet_lines(NET, &audit_of(Some(std::ffi::OsStr::new("1"))), true, &w);
     assert_eq!(lines.len(), 2, "the notice and the beacon's key: {lines:?}");
     assert!(lines[1].starts_with("🔎 ChiaHub audit: beacon key · address txch1"), "{}", lines[1]);
@@ -6556,7 +6616,7 @@ async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_o
 
     let funded = s.chain.fund(at, 1000, None);
     let (f, _) = ready_dish(&s, 10).await;
-    let (hint, paid, from_burner) = beacon_wrote(s.arm_beacon(143, false, &node, 0, &none, unix_now(), 1).await);
+    let (hint, paid, from_burner) = beacon_wrote(s.arm_beacon(143, false, &node, 0, &empty, unix_now(), 1).await);
     assert!(!from_burner);
     assert_eq!(paid.coins, WriteCoins::one(funded.coin_id()), "a coin sent to the address the line names pays for it");
     assert_eq!(text, paid.payer.hex());
@@ -6568,7 +6628,7 @@ async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_o
     // B's own spend settles first: the lease sees it landed, then deep.
     s.reconcile().await;
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    let (_, gifted, from_burner) = beacon_wrote(s.arm_beacon(143, true, &node, 0, &none, unix_now(), 2).await);
+    let (_, gifted, from_burner) = beacon_wrote(s.arm_beacon(143, true, &node, 0, &empty, unix_now(), 2).await);
     assert!(from_burner);
     assert_eq!(gifted.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "funded by the lobby dish");
     assert_eq!(text, gifted.payer.hex(), "one payer on both paths");
@@ -6597,7 +6657,7 @@ async fn the_audits_line_for_the_beacon_names_the_one_address_its_coin_sits_at_o
 async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and_asks_nothing() {
     use crate::chia_network::ChiaNet;
     let mut s = setup().await;
-    let (w, b, node, none) = (wallet(144), beacon_wallet(144), iroh::SecretKey::generate(), no_data_folder());
+    let (w, b, node, empty) = (wallet(144), beacon_wallet(144), iroh::SecretKey::generate(), empty_data_folder());
     let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
     let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
     s.chain.farm().await;
@@ -6614,7 +6674,7 @@ async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and
         let mut rng = StdRng::seed_from_u64(1);
         let knocked = knock_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
         let at = s.later();
-        let beaconed = beacon_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &none, 0, unix_now(), &mut rng).await;
+        let beaconed = beacon_on_path(&s.lease, &s.fuse, *net, &s.money, move || at, keys, false, &node, &empty, 0, unix_now(), &mut rng).await;
         for (what, e) in [("knock", knocked.err().expect("no knock without the wallet key")), ("beacon", beaconed.err().expect("no beacon without the wallet key"))] {
             assert_eq!(e.downcast_ref::<MoneyMemoRefused>(), Some(&MoneyMemoRefused(words.clone())), "{what} on {}: {e:#}", net.name());
             assert!(!is_typed_wait(&e), "{what} on {}: a failure, not a wait", net.name());
@@ -6632,7 +6692,7 @@ async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and
     assert_eq!((write.coins, write.payer), (WriteCoins::one(coin.coin_id()), Payer::of(&w)), "W pays for the knock, from its own coin");
     s.chain.farm().await;
     s.reconcile().await;
-    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(144, false, &node, 0, &none, unix_now(), 3).await);
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(144, false, &node, 0, &empty, unix_now(), 3).await);
     assert!(!from_burner);
     assert_eq!((write.coins, write.payer), (WriteCoins::one(funded.coin_id()), Payer::of(&b)), "B pays for the beacon, from its funded coin");
     assert_eq!(s.gifts(0), 0, "no lobby coin claimed off the burner path");
@@ -6648,7 +6708,7 @@ async fn off_the_burner_path_a_step_whose_keys_hold_no_wallet_key_is_refused_and
 #[tokio::test]
 async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_keys_and_leave_the_wallets_coin() {
     let mut s = setup().await;
-    let (w, node, none) = (wallet(145), iroh::SecretKey::generate(), no_data_folder());
+    let (w, node, empty) = (wallet(145), iroh::SecretKey::generate(), empty_data_folder());
     let (req, _) = host_card([0x45; 32]);
     let (k, b) = (knock_key(145, &req, 0), beacon_key(145));
     let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
@@ -6668,7 +6728,7 @@ async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_
     s.turn().await;
 
     let at = s.later();
-    let (_, write, from_burner) = beacon_wrote(beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &none, 0, unix_now(), &mut rng).await);
+    let (_, write, from_burner) = beacon_wrote(beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, &held, true, &node, &empty, 0, unix_now(), &mut rng).await);
     assert!(from_burner, "written on the burner path");
     assert_eq!(write.payer, Payer::of_burner(&b), "B pays, as a burner key");
     assert!(claimed(&b, &write), "from a lobby dish coin it claims");
@@ -6677,4 +6737,381 @@ async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_
     s.turn().await;
     assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "and it is unspent");
     assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §13 row 10 and §4.5 (6), on a mock chain of mainnet's
+/// own: what a mainnet node's heartbeat holds and hands its arms. Its keys
+/// hold no wallet key, burner keys are on with no flag, and its paths are
+/// the beacon's alone ([`burner_paths`]).
+///
+/// The beacon is written from B as a burner key, funded by mainnet's lobby
+/// dish and by nothing else. With only a coin at testnet11's lobby dish
+/// address on the chain it waits for a coin, asks for no funding, names no
+/// key and dates no push: another network's dish is no dish here. Once
+/// mainnet's lobby dish holds a ready coin the beacon claims it in its own
+/// bundle, signed by B alone for mainnet (the nodes check it against
+/// mainnet's genesis), with no fee, under mainnet's hint, and dates its push
+/// in mainnet's own folder. A newcomer on mainnet reads it as this node's
+/// beacon; under testnet11's hints there is nothing. The SSF wallet's coin
+/// is never parked or spent.
+///
+/// The knock's step is handed the listing's path, which is closed off a
+/// test network until the player's LIST ME: it ends with the money writers'
+/// refusal and asks the chain nothing.
+#[tokio::test]
+async fn a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mainnets_own_lobby_dish_alone() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let mut s = setup_on(Mainnet).await;
+    let (w, node, data) = (wallet(150), iroh::SecretKey::generate(), empty_data_folder());
+    crate::chia_network::make_state_dir(Mainnet, &data).unwrap();
+    restore(&s.lease, &data.join(Mainnet.path("wallet_lease.json")), &w);
+
+    let keys = PublisherKeys::of(Mainnet, w.clone());
+    assert!(keys.money().is_err(), "a mainnet node's keys hold no wallet key");
+    let paths = burner_paths(burners_of(Mainnet, None).0, refuse_money_memo(Mainnet).is_err());
+    assert_eq!(paths, BurnerPaths { beacon: true, listing: false }, "with no flag: the beacon's path, and no listing or knock path yet");
+    let key = MoneyKey::new(w.clone()).beacon();
+    assert_eq!(Payer::of_burner(keys.beacon()), Payer::of_burner(&key), "B, the keys' own");
+
+    let lobby = FaucetParams::lobby(Mainnet);
+    assert_ne!(lobby.puzzle_hash(), FaucetParams::lobby(NET).puzzle_hash(), "each network's lobby dish is its own");
+    let mine = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let theirs = ready_dish_of(&s, NET, 10).await;
+    let pushed = data.join(Mainnet.path(BEACON_PUSHED_FILE));
+
+    let dry = s.arm_beacon_on(&keys, paths.beacon, &node, 0, &data, unix_now(), 1).await;
+    assert_eq!(beacon_waited(&dry), Some(BurnerWait::NoCoinReady), "testnet11's lobby coin is no dish coin on mainnet");
+    let e = dry.as_ref().err().expect("it waited");
+    let line = beacon_failure_line(paths.beacon, 0, e);
+    assert_eq!(line, format!("⛓️ ChiaHub beacon: the era 0 beacon waits: {e:#} (retry in {} min)", HEARTBEAT_RETRY_SECS / 60));
+    assert!(!line.contains("funded separately") && !line.contains("faucet"), "{line}");
+    names_no_beacon(e, &key);
+    assert!(s.chain.received().is_empty() && !s.lease.outgoing_pending(), "nothing sent or parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::None, "a try that only waits dates no push");
+
+    // The knock's step, on the path the heartbeat hands it there.
+    let (req, _) = host_card([0x50; 32]);
+    let asked = |s: &Setup| (s.a.seen.lock().unwrap().len(), s.b.seen.lock().unwrap().len());
+    let quiet = asked(&s);
+    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+    let mut rng = StdRng::seed_from_u64(2);
+    let knocked = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+    let e = knocked.err().expect("no knock is written on mainnet yet");
+    assert_eq!(e.downcast_ref::<MoneyMemoRefused>(), Some(&MoneyMemoRefused(money_memo_refusal(Mainnet).expect("the money writers refuse there"))), "{e:#}");
+    assert_eq!(asked(&s), quiet, "and the chain was asked nothing for it");
+    assert!(s.chain.received().is_empty(), "nothing sent");
+
+    let f = ready_dish_of(&s, Mainnet, 10).await;
+    let now = unix_now();
+    let (hint, write, from_burner) = beacon_wrote(s.arm_beacon_on(&keys, paths.beacon, &node, 0, &data, now, 3).await);
+    assert!(from_burner, "written on the burner path");
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_beacon_hint(Mainnet, 0)), "era 0's beacon hint on mainnet");
+    assert_ne!(hint, Bytes32::new(chia_lane::derive_beacon_hint(NET, 0)), "which is not testnet11's");
+    let g = Coin::new(f.coin_id(), key.puzzle_hash(), lobby.gift);
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() }, "g as its parent, mainnet's lobby coin parked");
+    assert_eq!(write.payer, Payer::of_burner(&key), "B pays");
+    assert_ne!(write.payer, Payer::of(&w), "never the SSF wallet");
+    let bundle = s.chain.received().last().cloned().expect("the beacon was sent");
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin).collect::<Vec<_>>(), vec![f, g], "two spends: the lobby coin's claim, then g's");
+    assert_eq!(s.chain.fee_of(&bundle), 0, "a beacon pays no fee");
+    assert_eq!(s.gifts(0), 1, "one gift counted");
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now), "its push is dated in mainnet's own folder");
+    assert!(!data.join(BEACON_PUSHED_FILE).exists(), "and nothing at the folder's root, where testnet11's is kept");
+    assert!(s.lease.outgoing_pending_for(write.payer) && !s.lease.outgoing_pending_for(Payer::of(&w)), "parked for B, not for the SSF wallet");
+    assert!(!s.lease.is_taken(&mine.coin_id()) && !s.lease.is_taken(&theirs.coin_id()));
+
+    let landed = s.chain.farm().await;
+    let c0 = Coin::new(g.coin_id(), key.puzzle_hash(), 1);
+    let found = read_beacons(Mainnet, &s.carrier, landed, now).await.unwrap();
+    assert_eq!(
+        found.iter().map(|b| (b.hint, b.item.node_id, b.coin_id, b.confirmed_height)).collect::<Vec<_>>(),
+        vec![(hint, node.public(), c0.coin_id(), landed)],
+        "read on mainnet as this node's beacon, at B's 1-mojo coin"
+    );
+    assert!(read_beacons(NET, &s.carrier, landed, now).await.unwrap().is_empty(), "under testnet11's hints there is nothing");
+    let mark = BeaconMark::written(0, now, hint, &write, node.public().to_string());
+    s.reconcile().await;
+    let word = beacon_standing_on(&s.lease, Mainnet, &s.money, &mark).await;
+    assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "and the mark's own reader confirms it");
+    for (coin, what) in [(mine, "the SSF wallet's coin"), (theirs, "testnet11's lobby coin")] {
+        assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "{what}, unspent");
+    }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §13 row 10, the lease off a test network
+/// ([`WalletLease::asks_the_peers`]), on a mock chain of mainnet's own. B's
+/// first beacon lands and makes its coin c0, and its next beacon is a
+/// rewrite from c0, which every mempool then drops and forgets. Nothing
+/// else can spend c0, so the chain will never settle that spend by itself.
+///
+/// A lease that was not told its wallet's payer holds the same spend parked
+/// and sends nothing on mainnet, as every lease did before: the coin would
+/// stay parked for good, and B would wait on its own spend at every later
+/// try. The node's lease, restored as its wallet loads, knows the payer is
+/// a burner's: the next try's own reconciliation sends the saved bundle
+/// again, as it was built, and the try waits on it
+/// (`BurnerWait::Held`). It lands, is read as this node's beacon, and the
+/// try after that writes from the coin it made.
+#[tokio::test]
+async fn a_mainnet_beacon_the_mempools_dropped_is_sent_again_by_a_lease_that_knows_its_wallets_payer_and_lands() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let mut s = setup_on(Mainnet).await;
+    let (w, node, data) = (wallet(153), iroh::SecretKey::generate(), empty_data_folder());
+    crate::chia_network::make_state_dir(Mainnet, &data).unwrap();
+    restore(&s.lease, &data.join(Mainnet.path("wallet_lease.json")), &w);
+    let keys = PublisherKeys::of(Mainnet, w.clone());
+    let key = MoneyKey::new(w.clone()).beacon();
+    let f = ready_dish_of(&s, Mainnet, 10).await;
+    let now = unix_now();
+    let (hint, first, _) = beacon_wrote(s.arm_beacon_on(&keys, true, &node, 0, &data, now, 1).await);
+    let g = Coin::new(f.coin_id(), key.puzzle_hash(), FaucetParams::lobby(Mainnet).gift);
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    s.turn().await;
+    let c0 = Coin::new(g.coin_id(), key.puzzle_hash(), 1);
+    let made = s.chain.record(c0.coin_id()).expect("B's coin, from its first beacon").1;
+
+    let (again, rewrite, _) = beacon_wrote(s.arm_beacon_on(&keys, true, &node, 0, &data, now, 2).await);
+    assert_eq!((again, rewrite.coins, rewrite.payer), (hint, WriteCoins::one(c0.coin_id()), Payer::of_burner(&key)), "a rewrite, from B's own coin");
+    let bundle = s.chain.received().last().cloned().expect("the rewrite was sent");
+    let sent = s.sent();
+    s.chain.evict_all();
+    s.chain.forget_seen();
+    s.chain.farm().await;
+    assert!(s.chain.mempool().is_empty());
+    assert_eq!(s.chain.record(c0.coin_id()).map(|r| r.2), Some(None), "in no mempool, so in no block");
+
+    // A lease not told its wallet's payer: the same spend, parked for B.
+    let untold = WalletLease::new();
+    park_for(&untold, Payer::of_burner(&key), &bundle, &[(c0.coin_id(), made)]);
+    let pushes = s.asked(ProtocolMessageTypes::SendTransaction);
+    let at = s.later();
+    untold.reconcile_at(Mainnet, &s.money, at).await;
+    assert_eq!(s.asked(ProtocolMessageTypes::SendTransaction), pushes, "it sends nothing off a test network");
+    assert!(s.chain.mempool().is_empty() && untold.is_parked(&c0.coin_id()), "so the coin stays parked, with nothing to settle it");
+
+    // The node's own lease, at the next try.
+    let held = s.arm_beacon_on(&keys, true, &node, 0, &data, now, 3).await;
+    assert_eq!(beacon_waited(&held), Some(BurnerWait::Held), "B waits on its own spend");
+    assert_eq!(s.chain.mempool(), vec![bundle.name()], "which the try's reconciliation sent again");
+    assert_eq!(s.sent(), sent, "the saved bundle, never built again");
+    assert!(s.lease.is_parked(&c0.coin_id()), "live again, and still parked");
+
+    let landed = s.chain.farm().await;
+    let c1 = Coin::new(c0.coin_id(), key.puzzle_hash(), 1);
+    let found = read_beacons(Mainnet, &s.carrier, landed, now).await.unwrap();
+    assert_eq!(found.iter().map(|b| (b.item.node_id, b.coin_id, b.confirmed_height)).collect::<Vec<_>>(), vec![(node.public(), c1.coin_id(), landed)], "it landed, and is read");
+    s.turn().await;
+    let (_, next, _) = beacon_wrote(s.arm_beacon_on(&keys, true, &node, 0, &data, now, 4).await);
+    assert_eq!(next.coins, WriteCoins::one(c1.coin_id()), "and B writes again, from the coin it made");
+    assert_eq!(s.gifts(0), 1, "one gift in all");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.5 (7), the beacon's dated push, in the arm's step on
+/// both paths ([`beacon_on_path`], [`date_beacon_push`]). A try that only
+/// waits dates nothing: a burner beacon with no lobby coin ready, a beacon
+/// wallet with no coin. Where the date cannot be saved, here because a
+/// folder lies at the file's path, the write stops before anything is
+/// built: it is a failure and no wait, its text names the file and no key,
+/// and nothing is sent, claimed, parked or counted, on either path.
+///
+/// A write dates its push at the time the step was given, in a private
+/// file, off the burner path and on it. A later write moves the date
+/// forward, a try that waits leaves it, and a write dated earlier, as a
+/// clock set back gives, never moves it back. A push every peer refused was
+/// dated all the same: the date is made before the push, so no beacon
+/// leaves undated, and the guard errs on that side.
+#[tokio::test]
+async fn a_beacons_push_is_dated_only_by_a_try_that_builds_a_bundle_and_a_date_that_cannot_be_saved_sends_nothing() {
+    let mut s = setup().await;
+    let (key, b, node, data) = (beacon_key(152), beacon_wallet(152), iroh::SecretKey::generate(), empty_data_folder());
+    let pushed = data.join(NET.path(BEACON_PUSHED_FILE));
+    s.chain.farm().await;
+    let t0 = unix_now();
+
+    let dry = s.arm_beacon(152, true, &node, 0, &data, t0, 1).await;
+    assert_eq!(beacon_waited(&dry), Some(BurnerWait::NoCoinReady));
+    let unfunded = s.arm_beacon(152, false, &node, 0, &data, t0, 2).await;
+    let e = unfunded.as_ref().err().expect("the beacon wallet holds no coin");
+    assert_eq!(e.downcast_ref::<MemoWait>(), Some(&MemoWait::Unfunded(our_puzzle_hash(&b))), "{e:#}");
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::None, "a try that only waits dates nothing");
+
+    // The date cannot be saved.
+    std::fs::create_dir(&pushed).unwrap();
+    let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
+    let (f, _) = ready_dish(&s, 10).await;
+    for (burner_path, seed) in [(true, 3), (false, 4)] {
+        let failed = s.arm_beacon(152, burner_path, &node, 0, &data, t0, seed).await;
+        let e = failed.as_ref().err().expect("the date could not be saved");
+        let text = format!("{e:#}");
+        assert!(text.contains("this network's beacon_pushed.json could not be saved (") && text.contains("so the beacon was not sent"), "burner path {burner_path}: {text}");
+        assert!(!is_typed_wait(e) && !chain_busy(e), "burner path {burner_path}: a failure, not a wait");
+        assert!(beacon_took_the_tick(&failed), "the try reached its writer");
+        names_no_beacon(e, &key);
+    }
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&f.coin_id()) && !s.lease.is_taken(&funded.coin_id()) && !s.lease.outgoing_pending(), "nothing claimed or parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    assert!(pushed.is_dir(), "what lies at the path is left as it is");
+    std::fs::remove_dir(&pushed).unwrap();
+
+    // Off the burner path, then on it once that spend has settled.
+    let (_, write, _) = beacon_wrote(s.arm_beacon(152, false, &node, 0, &data, t0, 5).await);
+    assert_eq!(write.coins, WriteCoins::one(funded.coin_id()));
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(t0), "dated off the burner path");
+    assert_eq!(file_state(&pushed).0, format!(r#"{{"last_at":{t0}}}"#).into_bytes());
+    #[cfg(unix)]
+    assert_eq!(file_state(&pushed).1, 0o600, "a private file");
+    s.chain.farm().await;
+    s.reconcile().await;
+    s.chain.farm_blocks(SETTLED_DEPTH).await;
+    let t1 = t0 + 100;
+    let (_, write, _) = beacon_wrote(s.arm_beacon(152, true, &node, 0, &data, t1, 6).await);
+    let g = gift(&key, f);
+    assert_eq!(write.coins, WriteCoins { parent: g.coin_id(), parked: f.coin_id() });
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(t1), "and on it, moved forward");
+
+    let held = s.arm_beacon(152, true, &node, 0, &data, t1 + 500, 7).await;
+    assert_eq!(beacon_waited(&held), Some(BurnerWait::Held));
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(t1), "a try that waits moves no date");
+
+    s.turn().await;
+    let c0 = burner_coin(&key, g.coin_id());
+    let (_, rewrite, _) = beacon_wrote(s.arm_beacon(152, true, &node, 0, &data, t0 - 1000, 8).await);
+    assert_eq!(rewrite.coins, WriteCoins::one(c0.coin_id()));
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(t1), "a write dated earlier never moves the date back");
+
+    s.turn().await;
+    s.chain.set_full(true);
+    let sent = s.sent();
+    let t2 = t1 + 1000;
+    let refused = s.arm_beacon(152, true, &node, 0, &data, t2, 9).await;
+    assert!(beacon_refused(&refused).is_some_and(|why| why.contains("INVALID_FEE_TOO_CLOSE_TO_ZERO")), "every peer refused it");
+    assert_eq!(s.sent().len(), sent.len() + 1, "a bundle was built and offered");
+    assert!(s.chain.mempool().is_empty() && !s.lease.outgoing_pending(), "and is in no mempool");
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(t2), "dated all the same, before the push");
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.5 (7) across the two networks in one data folder, by
+/// the dated push alone ([`other_beacon`]). A mainnet node's beacon goes
+/// out and the node stops before its beacon mark is saved, so the folder
+/// holds mainnet's dated push and no mark. A testnet11 node started on the
+/// same folder a day later is refused its beacon on both paths, by the
+/// guard's line, which names the dated push: it asks its chain nothing,
+/// sends, claims and parks nothing, counts no gift and dates nothing.
+/// Fourteen days after mainnet's push testnet11's beacon goes out and dates
+/// its own push at the folder's root, leaving mainnet's file as it was.
+/// Mainnet's next beacon is then held back in its turn, by testnet11's
+/// date, and goes out once that is 14 days old, as a rewrite from B's coin.
+/// Before the push was dated, a beacon whose mark was never saved held
+/// nothing back.
+#[tokio::test]
+async fn a_beacon_pushed_on_one_network_holds_the_other_networks_beacon_back_for_14_days_though_no_mark_of_it_was_saved() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let (mut main, mut test) = (setup_on(Mainnet).await, setup().await);
+    let (w, node, data) = (wallet(151), iroh::SecretKey::generate(), empty_data_folder());
+    crate::chia_network::make_state_dir(Mainnet, &data).unwrap();
+    let main_keys = PublisherKeys::of(Mainnet, w.clone());
+    let key = MoneyKey::new(w.clone()).beacon();
+    let f_main = ready_dish_of(&main, Mainnet, 10).await;
+    let (f_test, _) = ready_dish(&test, 10).await;
+    let (main_pushed, test_pushed) = (data.join(Mainnet.path(BEACON_PUSHED_FILE)), data.join(NET.path(BEACON_PUSHED_FILE)));
+    assert_ne!(main_pushed, test_pushed, "a file for each network");
+    let t0 = unix_now();
+
+    let (_, first, _) = beacon_wrote(main.arm_beacon_on(&main_keys, true, &node, 0, &data, t0, 1).await);
+    let g = Coin::new(f_main.coin_id(), key.puzzle_hash(), FaucetParams::lobby(Mainnet).gift);
+    assert_eq!(first.coins, WriteCoins { parent: g.coin_id(), parked: f_main.coin_id() });
+    assert_eq!(read_other_beacon(&main_pushed), OtherBeacon::At(t0), "mainnet's push, dated");
+    for net in crate::chia_network::ChiaNet::ALL {
+        assert!(!data.join(net.path(BEACON_MARK_FILE)).exists(), "no beacon mark was saved on {}", net.name());
+    }
+    main.turn().await;
+    let before = file_state(&main_pushed);
+
+    // The testnet11 node on the same folder, a day later.
+    let day = t0 + 86_400;
+    for (burner_path, seed) in [(true, 2), (false, 3)] {
+        let done = test.arm_beacon(151, burner_path, &node, 0, &data, day, seed).await;
+        let line = beacon_guarded(&done).expect("held back by mainnet's dated push");
+        assert_eq!(Some(line.clone()), beacon_guard(NET, &main_pushed, OtherBeacon::At(t0), day), "the guard's own line");
+        assert!(line.contains(&main_pushed.display().to_string()), "naming the dated push: {line}");
+        assert!(!beacon_took_the_tick(&done), "a guarded try does not use the tick");
+    }
+    assert!(test.asked_nothing(), "its chain was asked nothing");
+    assert!(test.chain.received().is_empty(), "nothing sent");
+    assert!(!test.lease.is_taken(&f_test.coin_id()) && !test.lease.outgoing_pending(), "nothing claimed or parked");
+    assert_eq!(test.gifts(0), 0, "no gift counted");
+    assert_eq!(read_other_beacon(&test_pushed), OtherBeacon::None, "a guarded try dates nothing");
+
+    // Fourteen days after mainnet's push, testnet11's beacon goes out.
+    let t1 = t0 + BEACON_GUARD_SECS;
+    let (_, write, _) = beacon_wrote(test.arm_beacon(151, true, &node, 0, &data, t1, 4).await);
+    assert_eq!(write.coins, WriteCoins { parent: gift(&beacon_key(151), f_test).coin_id(), parked: f_test.coin_id() });
+    assert_eq!(read_other_beacon(&test_pushed), OtherBeacon::At(t1), "dated at the folder's root");
+    assert_eq!(file_state(&main_pushed), before, "mainnet's file is read by testnet11's step, never changed");
+
+    // And mainnet's next beacon is held back in its turn.
+    let done = main.arm_beacon_on(&main_keys, true, &node, 0, &data, t1 + 86_400, 5).await;
+    let line = beacon_guarded(&done).expect("held back by testnet11's dated push");
+    assert_eq!(Some(line), beacon_guard(Mainnet, &test_pushed, OtherBeacon::At(t1), t1 + 86_400));
+    assert_eq!(read_other_beacon(&main_pushed), OtherBeacon::At(t0), "and dates nothing");
+    let t2 = t1 + BEACON_GUARD_SECS;
+    let (_, rewrite, _) = beacon_wrote(main.arm_beacon_on(&main_keys, true, &node, 0, &data, t2, 6).await);
+    assert_eq!(rewrite.coins, WriteCoins::one(Coin::new(g.coin_id(), key.puzzle_hash(), 1).coin_id()), "a rewrite, from B's own coin on mainnet");
+    assert_eq!(read_other_beacon(&main_pushed), OtherBeacon::At(t2), "its date moved forward");
+    assert!(main.chain.unanswered().is_empty() && test.chain.unanswered().is_empty());
+}
+
+/// A data folder an older build left (stage 4 design §4.5 (7)): testnet11's
+/// beacon mark, written while the clock ran ahead, and no dated push beside
+/// it, since that build dated none. The clock has been put right. The next
+/// beacon's write replaces the mark, and its try dates the push no earlier
+/// than the mark it replaces ([`date_beacon_push_over`]): the later date is
+/// on file before the bundle is built, and is still there once the heartbeat
+/// has saved the new write's mark over the old one. Mainnet's guard holds
+/// by it: 14 days after the new write its beacon is still refused, with the
+/// line of a date under 14 days old that names the dated push, and it goes
+/// out 14 days after the old mark's date. Dated at the try's own time
+/// alone, the later date was on neither file after the write, and mainnet's
+/// beacon went out while the beacon the old mark recorded still carried it.
+#[tokio::test]
+async fn a_mark_dated_ahead_of_the_clock_is_carried_into_the_dated_push_before_the_next_write_replaces_it() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let (mut test, mut main) = (setup().await, setup_on(Mainnet).await);
+    let (node, data) = (iroh::SecretKey::generate(), empty_data_folder());
+    crate::chia_network::make_state_dir(Mainnet, &data).unwrap();
+    let main_keys = PublisherKeys::of(Mainnet, wallet(154));
+    ready_dish(&test, 10).await;
+    ready_dish_of(&main, Mainnet, 10).await;
+    let (mark, pushed) = (data.join(NET.path(BEACON_MARK_FILE)), data.join(NET.path(BEACON_PUSHED_FILE)));
+    let mark_at = |at: u64| serde_json::to_vec_pretty(&BeaconMark { era: 0, last_at: at, hint: "ab".into(), node_id: Some("n".into()), confirmed: true, ..Default::default() }).unwrap();
+    let t0 = unix_now();
+    let ahead = t0 + 3 * 86_400;
+
+    // The older build's mark, three days ahead of the clock as it now is.
+    std::fs::write(&mark, mark_at(ahead)).unwrap();
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::None, "that build dated no push");
+
+    // testnet11's next beacon, at the clock's time.
+    beacon_wrote(test.arm_beacon(154, true, &node, 0, &data, t0, 1).await);
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(ahead), "dated no earlier than the mark the write replaces");
+    // The heartbeat saves the new write's mark over the old one.
+    std::fs::write(&mark, mark_at(t0)).unwrap();
+    assert_eq!(other_beacon(&data, Mainnet), (pushed.clone(), OtherBeacon::At(ahead)), "the later date is still on file");
+
+    // Mainnet's beacon, 14 days after that write: still held back.
+    let early = t0 + BEACON_GUARD_SECS;
+    let done = main.arm_beacon_on(&main_keys, true, &node, 0, &data, early, 2).await;
+    let line = beacon_guarded(&done).expect("held back by the date the old mark carried");
+    assert_eq!(Some(line.clone()), beacon_guard(Mainnet, &pushed, OtherBeacon::At(ahead), early), "the guard's own line");
+    assert!(line.contains("is less than 14 days old") && line.contains(&pushed.display().to_string()), "{line}");
+    assert!(main.asked_nothing() && main.chain.received().is_empty(), "nothing asked or sent");
+    // And out 14 days after the old mark's date.
+    let (_, _, from_burner) = beacon_wrote(main.arm_beacon_on(&main_keys, true, &node, 0, &data, ahead + BEACON_GUARD_SECS, 3).await);
+    assert!(from_burner);
+    assert!(main.chain.unanswered().is_empty() && test.chain.unanswered().is_empty());
 }

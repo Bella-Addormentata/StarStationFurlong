@@ -6437,17 +6437,17 @@ mod test_hook_tests {
 /// what the load did, its key fingerprint and receive address, with the
 /// beacon on the beacon's line (which names its address only where the
 /// operator funds it, [`beacon_lines`]), with SSF_CHIA_BURNERS set to
-/// `1`, what burner keys do on this network, and with SSF_CHIA_AUDIT set
+/// `1`, what that does on this network, and with SSF_CHIA_AUDIT set
 /// to `1`, the audit's notice and the beacon key's address
 /// (`chia_publish::audit_wallet_lines`). Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
     chia_wallet::log_receive_address(net, id);
     // #231 P6b/D7: the beacon role pays from a key of its own, derived from
-    // the wallet key (so it changes with a re-mint). With burner keys off it
-    // is funded separately, at the address its line names. On the burner
-    // path the lobby dish funds it, and its line names no address (stage 4
-    // design §4.5 (8)).
+    // the wallet key (so it changes with a re-mint). With burner keys off,
+    // which only a test network can have, it is funded separately, at the
+    // address its line names. On the burner path the lobby dish funds it,
+    // and its line names no address (stage 4 design §4.5 (8)).
     if chia_publish::beacon_enabled() {
         let addr = chia_wallet::receive_address(net, &chia_publish::beacon_wallet_key(&id.wallet));
         let (line, warning) = beacon_lines(net, chia_publish::burners_enabled(), &addr);
@@ -6456,9 +6456,11 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
             eprintln!("{warning}");
         }
     }
-    // Stage 4 design §8 (2): burner keys on for a test network's run, or
-    // ignored off one, said as a refused test hook is; nothing is said when
-    // the variable is not `1`.
+    // Stage 4 design §8 (2): with the variable set to `1`, burner keys on
+    // for a test network's run, or the word that it changes nothing off
+    // one, where they are on without it; nothing is said when the variable
+    // is not `1`. The second arm is kept for a line said with them off,
+    // which no network gives now.
     match chia_publish::burners() {
         (true, Some(line)) => println!("{line}"),
         (false, Some(line)) => eprintln!("{line}"),
@@ -6476,16 +6478,17 @@ fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity)
 /// (stage 2, question 6): the node id it writes in the clear comes from
 /// `iroh_node_id.key`, which every network shares, so a node that beacons on
 /// testnet11 too writes the same id on both chains and can be linked across
-/// them. With burner keys on for the run (`burners`, which only a test
-/// network has) the lobby dish funds the beacon's key, so the line names
-/// no address and asks for no funding (stage 4 design §4.5 (8)); with them
-/// off it names `addr`, the beacon wallet's address, to be funded, as it
-/// always did.
+/// them. With burner keys on for the run (`burners`: with the flag on a
+/// test network, and always off one, `chia_publish::burners_of`) the lobby
+/// dish funds the beacon's key, so the line names no address and asks for
+/// no funding, on every network (stage 4 design §4.5 (8)). With them off on
+/// a test network it names `addr`, the beacon wallet's address, to be
+/// funded, as it always did. Off a test network with them off, which no
+/// run is, the beacon wallet pays for nothing (§4.5 (1)) and the line says
+/// to leave the address unfunded.
 #[cfg(feature = "chia-publish")]
 fn beacon_lines(net: chia_network::ChiaNet, burners: bool, addr: &str) -> (String, Option<String>) {
-    // 🛑 Off a test network the beacon writes nothing yet (stage 4 design
-    // §4.5 (1)), so the line says only that, and asks for no XCH there.
-    let line = if net.is_test() && burners {
+    let line = if burners {
         "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding".to_string()
     } else if net.is_test() {
         format!(
@@ -6493,13 +6496,14 @@ fn beacon_lines(net: chia_network::ChiaNet, burners: bool, addr: &str) -> (Strin
             net.name()
         )
     } else {
-        format!("⛓️ ChiaHub beacon (D7, opt-in): on, but on {} it writes nothing yet, so leave {addr} unfunded", net.name())
+        format!("⛓️ ChiaHub beacon (D7, opt-in): on, but on {} the beacon wallet pays for no chain write, so it writes nothing; leave {addr} unfunded", net.name())
     };
-    // The warning holds for when the beacon writes there (stage 4 design
-    // §13, PR 10): the switch is set now, and kept across the upgrade.
+    // The warning is of the link the node id makes. The beacon guard keeps
+    // one data folder's two beacons 14 days apart (§4.5 (7)); it is no
+    // promise that the two chains are never linked, so the warning stays.
     let warning = (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub beacon: once it writes on {}, it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
+            "⛓️ ChiaHub beacon: on {} it writes the same node id as on {} (iroh_node_id.key is shared by every network), so a node that also beacons on {} can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart.",
             net.name(),
             chia_network::ChiaNet::Testnet11.name(),
             chia_network::ChiaNet::Testnet11.name(),
@@ -6513,9 +6517,11 @@ mod beacon_line_tests {
     use super::beacon_lines;
     use crate::chia_network::ChiaNet;
 
-    /// Testnet11 keeps its one line with burner keys off. Mainnet adds the
-    /// warning that the beacon links this node's id across the two chains,
-    /// now that a mainnet node holds a wallet the beacon can pay from.
+    /// Testnet11 keeps its one line with burner keys off. Mainnet, where
+    /// the beacon is written from its own key (stage 4 design §13 row 10),
+    /// adds the warning that the beacon links this node's id across the two
+    /// chains. Its line asks for no real XCH and names no address
+    /// (§4.5 (8)): the lobby dish funds the key.
     #[test]
     fn the_mainnet_beacon_warns_that_it_links_the_node_id_across_chains() {
         let (line, warning) = beacon_lines(ChiaNet::Testnet11, false, "txch1beacon");
@@ -6524,35 +6530,39 @@ mod beacon_line_tests {
             "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund txch1beacon at a testnet11 faucet"
         );
         assert_eq!(warning, None);
-        // Stage 4 design §4.5 (1): the beacon writes nothing on mainnet
-        // yet, so its line says so once, and asks for no real XCH there.
-        // The warning is for when it writes there (PR 10), and says so.
-        let (line, warning) = beacon_lines(ChiaNet::Mainnet, false, "xch1beacon");
-        assert_eq!(line, "⛓️ ChiaHub beacon (D7, opt-in): on, but on Chia mainnet it writes nothing yet, so leave xch1beacon unfunded");
-        assert!(!line.contains("real XCH") && !line.contains("paid from"), "{line}");
+        let (line, warning) = beacon_lines(ChiaNet::Mainnet, true, "xch1beacon");
+        assert_eq!(
+            line,
+            "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding"
+        );
+        assert!(!line.contains("real XCH") && !line.contains("paid from") && !line.contains("xch1beacon"), "{line}");
         let warning = warning.expect("mainnet warns");
         assert_eq!(
             warning,
-            "⛓️ ChiaHub beacon: once it writes on Chia mainnet, it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
+            "⛓️ ChiaHub beacon: on Chia mainnet it writes the same node id as on testnet11 (iroh_node_id.key is shared by every network), so a node that also beacons on testnet11 can be linked across the two chains. Leave SSF_CHIA_BEACON unset here to keep them apart."
         );
+        assert!(!warning.contains("once it writes"), "it writes there now: {warning}");
     }
 
     /// Stage 4 design §4.5 (8): the beacon's line over every network and
-    /// path. With burner keys on, which only a test network has, the lobby
-    /// dish funds the beacon's key, so the line names no address and asks
-    /// for no funding. With them off it is the line it always was, with the
-    /// address to fund. Mainnet's line and warning are the same whatever
-    /// the flag says, since burner keys are never on there.
+    /// path. With burner keys on, which a test network has with its flag
+    /// and mainnet has always (`chia_publish::burners_of`, walked here over
+    /// every value of the flag), the lobby dish funds the beacon's key, so
+    /// the line names no address and asks for no funding. With them off on
+    /// a test network it is the line it always was, with the address to
+    /// fund. Mainnet with them off is a run no node makes: the line still
+    /// asks for no funding there, since the beacon wallet pays for nothing.
+    /// The warning is mainnet's on either path, and names no address.
     #[test]
     fn the_beacons_line_names_its_address_only_where_the_operator_funds_it() {
         const FUNDED: &str = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, paid from its own wallet; fund ADDR at a testnet11 faucet";
         const DISH: &str = "⛓️ ChiaHub beacon (D7, opt-in): on — it writes this node's id in the clear once per era while inbound-verified, from a key of its own that the lobby dish funds; it needs no funding";
-        const MAINNET: &str = "⛓️ ChiaHub beacon (D7, opt-in): on, but on Chia mainnet it writes nothing yet, so leave ADDR unfunded";
+        const UNPAID: &str = "⛓️ ChiaHub beacon (D7, opt-in): on, but on Chia mainnet the beacon wallet pays for no chain write, so it writes nothing; leave ADDR unfunded";
         let rows = [
             (ChiaNet::Testnet11, false, FUNDED, true, false),
             (ChiaNet::Testnet11, true, DISH, false, false),
-            (ChiaNet::Mainnet, false, MAINNET, true, true),
-            (ChiaNet::Mainnet, true, MAINNET, true, true),
+            (ChiaNet::Mainnet, false, UNPAID, true, true),
+            (ChiaNet::Mainnet, true, DISH, false, true),
         ];
         for (net, burners, want, names_addr, warns) in rows {
             let (line, warning) = beacon_lines(net, burners, "ADDR");
@@ -6560,8 +6570,16 @@ mod beacon_line_tests {
             assert_eq!(line.contains("ADDR"), names_addr, "{net:?}, burner keys {burners}: {line}");
             assert_eq!(warning.is_some(), warns, "{net:?}, burner keys {burners}");
             assert!(warning.is_none_or(|w| !w.contains("ADDR")), "{net:?}, burner keys {burners}: the warning names no address");
+            assert!(net.is_test() || !line.contains("fund ADDR"), "no line asks for real XCH: {line}");
         }
-        assert_eq!(beacon_lines(ChiaNet::Mainnet, true, "ADDR"), beacon_lines(ChiaNet::Mainnet, false, "ADDR"), "mainnet reads no flag");
+        // The line a node prints: burner keys as the network and the flag
+        // give them. Mainnet's is the dish's line whatever the flag holds.
+        for raw in [None, Some("0"), Some("1")] {
+            let burners = |net| crate::chia_publish::burners_of(net, raw.map(std::ffi::OsStr::new)).0;
+            assert_eq!(beacon_lines(ChiaNet::Mainnet, burners(ChiaNet::Mainnet), "ADDR").0, DISH, "mainnet with the flag {raw:?}");
+            let testnet = if raw == Some("1") { DISH } else { FUNDED };
+            assert_eq!(beacon_lines(ChiaNet::Testnet11, burners(ChiaNet::Testnet11), "ADDR").0, testnet, "testnet11 with the flag {raw:?}");
+        }
     }
 }
 
@@ -6784,14 +6802,17 @@ mod watcher_off_line_tests {
 /// 🏦 The line said once the Bank's TURN ON has loaded the wallet and
 /// remembered it. Publishing starts within a minute on a test network only:
 /// off one the SSF wallet pays for no chain write (stage 4 design §4.5 (1),
-/// `chia_publish::money_memo_refusal`), so the node only reads the chain.
+/// `chia_publish::money_memo_refusal`), and the node writes no listing and
+/// no knock yet (LIST ME, §4.5 (6)). The line does not say that the node
+/// only reads the chain: its beacon, where the operator turned it on, is
+/// written from a key of its own.
 #[cfg(feature = "chia-publish")]
 fn bank_on_line(net: chia_network::ChiaNet) -> String {
     if chia_publish::money_memo_refusal(net).is_none() {
         "🏦 SSF wallet: turned on in the Bank — publishing starts within a minute, and it is back on at the next start".to_string()
     } else {
         format!(
-            "🏦 SSF wallet: turned on in the Bank — on {} it pays for no chain write yet, so this node only reads the chain; it is back on at the next start",
+            "🏦 SSF wallet: turned on in the Bank — on {} it pays for no chain write, and this node writes no listing and no knock there yet; it is back on at the next start",
             net.name()
         )
     }
@@ -6803,7 +6824,10 @@ mod bank_on_line_tests {
     use crate::chia_network::ChiaNet;
 
     /// testnet11 keeps its line whole; off a test network the Bank's TURN ON
-    /// promises no publishing, which the SSF wallet pays for no more there.
+    /// promises no publishing, which the SSF wallet pays for no more there,
+    /// and says what is not written yet: the listing and the knocks. It no
+    /// longer says the node only reads the chain, since a beacon the
+    /// operator turned on is written there from a key of its own.
     #[test]
     fn the_bank_promises_publishing_on_a_test_network_only() {
         assert_eq!(
@@ -6813,9 +6837,9 @@ mod bank_on_line_tests {
         let line = bank_on_line(ChiaNet::Mainnet);
         assert_eq!(
             line,
-            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write yet, so this node only reads the chain; it is back on at the next start"
+            "🏦 SSF wallet: turned on in the Bank — on Chia mainnet it pays for no chain write, and this node writes no listing and no knock there yet; it is back on at the next start"
         );
-        assert!(!line.contains("publishing"), "{line}");
+        assert!(!line.contains("publishing") && !line.contains("only reads"), "{line}");
     }
 }
 

@@ -458,6 +458,7 @@ mod tests {
             "chia_peers.json",
             "publish_marks.json",
             "beacon_mark.json",
+            "beacon_pushed.json",
             "knocks.json",
         ] {
             assert_eq!(ChiaNet::Testnet11.path(name), Path::new(name), "testnet11 keeps the path it always had");

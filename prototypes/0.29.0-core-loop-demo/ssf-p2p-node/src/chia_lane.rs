@@ -208,7 +208,11 @@ fn strict_status(source: crate::chia_strict::OffSource) -> String {
 /// the SSF wallet pays for a chain write on this network (`pays`: on a test
 /// network only, the rule of `chia_publish::money_memo_refusal`), whether it
 /// loaded, and what holds it off. Where it pays for none, turning it on in
-/// the Bank publishes nothing either, so the line sends no one there.
+/// the Bank publishes nothing either, so the line sends no one there, and
+/// says what is not written yet: the listing and the knocks, which wait
+/// for the player's LIST ME (stage 4 design §4.5 (6)). It does not say the
+/// lane only reads there: a beacon the operator turned on is written from
+/// a key of its own.
 pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia_wallet_switch::EnvSwitch) -> &'static str {
     if !built {
         "not built"
@@ -217,7 +221,7 @@ pub fn publish_status(built: bool, pays: bool, wallet_on: bool, env: crate::chia
     } else if env == crate::chia_wallet_switch::EnvSwitch::Off {
         "off (SSF_CHIA_LANE holds the SSF wallet off)"
     } else if !pays {
-        "off (on this network the SSF wallet pays for no chain write yet, so the lane only reads the chain)"
+        "off (on this network the SSF wallet pays for no chain write, and no listing or knock is written yet)"
     } else {
         "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)"
     }
@@ -1039,7 +1043,9 @@ mod p6b_tests {
     /// The startup line's word on publishing, for each network: testnet11
     /// keeps every text it had; off a test network the SSF wallet pays for
     /// no chain write (stage 4 design §4.5 (1)), so publishing is off there,
-    /// wallet on or not, and the line sends no one to the Bank for it.
+    /// wallet on or not, and the line sends no one to the Bank for it. It
+    /// names what is not written yet, the listing and the knocks, and does
+    /// not say the lane only reads the chain.
     #[test]
     fn the_publish_status_says_publishing_is_on_only_where_the_ssf_wallet_pays() {
         use crate::chia_network::ChiaNet::{self, Mainnet, Testnet11};
@@ -1047,7 +1053,8 @@ mod p6b_tests {
         const ON: &str = "on (the SSF wallet is on)";
         const HELD_OFF: &str = "off (SSF_CHIA_LANE holds the SSF wallet off)";
         const BANK: &str = "off until the SSF wallet is turned on in the SpacePhone's Bank (a headless node: start it with SSF_CHIA_LANE=1)";
-        const PAYS_NONE: &str = "off (on this network the SSF wallet pays for no chain write yet, so the lane only reads the chain)";
+        const PAYS_NONE: &str = "off (on this network the SSF wallet pays for no chain write, and no listing or knock is written yet)";
+        assert!(!PAYS_NONE.contains("only reads"), "a beacon the operator turned on is written there from a key of its own");
         for env in [Unset, On, Off] {
             assert_eq!(publish_status(true, Testnet11.is_test(), true, env), ON, "{env:?}");
             assert_eq!(publish_status(true, Testnet11.is_test(), false, env), if env == Off { HELD_OFF } else { BANK }, "{env:?}");
