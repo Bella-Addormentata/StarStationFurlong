@@ -234,7 +234,7 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     expect(putBack(a)).toBe(0);
     del(a, root.key);
     expect(res(a)).toMatchObject({ live: true, base: { key: root.key } });
-    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, sessionMissing: false, pubs: [], returns: 0 }]);
+    expect(lacks(a)).toEqual([{ t: TABLE, inc: G.inc, ctx: G, u: 0, missing: 1, sessionMissing: false, sid: SID, sesMoves: 0, pubs: [], returns: 0 }]);
     expect(putBack(a)).toBe(1);
     expect(top(a).get(root.key)).toEqual(root.value);
     expect(lacks(a)).toEqual([]);
@@ -332,11 +332,16 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
   });
 
   it('the turns are the staked felts\' signers, as the page last counted them', async () => {
-    const [a, b] = await gameRoom(['A', 'B']);
-    bet(a, b);
-    del(a, root.key);
-    expect(lacks(a)).toMatchObject([{ missing: 1, pubs: [a.pub, b.pub].sort() }]);
-    expect(putBack(a)).toBe(1);
+    // (told in the order of the keys, whichever of the two pages has the lower: a page's key is new with every load)
+    let pages: Page[] = [];
+    for (const lower of [false, true]) {
+      pages = await pagesWhere((x, y) => (x.pub < y.pub) === lower);
+      bet(pages[0], pages[1]);
+      del(pages[0], root.key);
+      expect(lacks(pages[0])).toMatchObject([{ missing: 1, pubs: [pages[0].pub, pages[1].pub].sort() }]);
+      expect(putBack(pages[0])).toBe(1);
+    }
+    const [a, b] = pages;
     // B takes its bets down: a felt with nothing on it has no turn
     expect(b.table.writeComputedSlip(TABLE, [], T0 + STEP)).toBe('ok');
     run([a, b], T0 + STEP, T0 + 3_000);
@@ -791,6 +796,142 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     del(a, key);
     expect(lacks(a)).toEqual([]);
     expect(putBack(a)).toBe(0);
+  });
+
+  it('a session\'s map deleted with the delegation of a house whose round it holds, and opened again empty, lets go of nothing: the delegation is held while the game counts from the same base, the round is decided again once its records are back, and the delegation is put back', async () => {
+    const { a } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const dl = delegation(owner, H2.pub, PAGE_ROOM);
+    // (what the session holds, to hand back as its authors and witnesses would)
+    const records = [...(top(a).get(SES) as Y.Map<unknown>).entries()];
+    // a peer deletes the session's map and the delegation: the table is not whole, and the game is not counted
+    del(a, SES, key);
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: true }]);
+    // the map is opened again, empty: the fold counts no record of any house now
+    expect(a.casino.reopenFairOnlySession(TABLE, G.inc)).toBe(true);
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    expect(foldOf(a).rounds.map((v) => v.decided)).toEqual([]);
+    // the delegation is held all the same: the round it decided is in no checkpoint, and its records are on their way
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    // they come back, and the game is resolved again (its base written again by a peer): the round is decided as it was
+    a.doc.transact(() => {
+      const ses = top(a).get(SES) as Y.Map<unknown>;
+      for (const [k, v] of records) ses.set(k, v);
+    });
+    set(a, root.key, { ...root.value });
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: root.key } });
+    expect(foldOf(a).rounds.map((v) => v.decided)).toEqual(['house']);
+    expect(lacks(a)).toMatchObject([{ missing: 1 }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(dl);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('a delegation held for a house whose records are away is let go like any other when its signer holds the game no more', async () => {
+    const { a } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const xf = handOver(2);
+    const theirs = delegation(buyer, H2.pub, PAGE_ROOM);
+    a.doc.transact(() => {
+      top(a).set(xf.key, xf.value);
+      top(a).set(key, theirs);
+    });
+    expect(res(a)).toMatchObject({ holder: buyer.pub, pending: false });
+    expect(lacks(a)).toEqual([]);
+    // the session's map is deleted and opened again, empty: both delegations are held, the buyer's the one under the key
+    del(a, SES);
+    expect(a.casino.reopenFairOnlySession(TABLE, G.inc)).toBe(true);
+    expect(foldOf(a).rounds.map((v) => v.decided)).toEqual([]);
+    del(a, key);
+    expect(lacks(a)).toMatchObject([{ missing: 1 }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(theirs);
+    // the owner had handed the game to another a round before: the buyer never held it, and its delegation is a stranger's
+    const earlier = xferOf(G, owner, third, 1, DEED);
+    set(a, earlier.key, earlier.value);
+    expect(res(a)).toMatchObject({ holder: third.pub, pending: false });
+    expect(lacks(a)).toMatchObject([{ missing: 1 }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(delegation(owner, H2.pub, PAGE_ROOM));
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('a count that waits as the game moves on to another base lets go of the house left behind once it is whole: the base the delegations were kept under is the one of the last whole count', async () => {
+    const { a, b, at } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    // the root's house trims at round 1, and a player has bet in the session the trim opens before this page hears of
+    // either: the two come in one update
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: kit.houseCommit(H, 2), dl: delegation(owner, H.pub, PAGE_ROOM) });
+    b.doc.transact(() => {
+      top(b).set(trim.key, trim.value);
+      top(b).delete(SES);
+      top(b).set(`ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`, new Y.Map());
+    });
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    // the check of the trim uses up the time of the count, and the check of the bet is put off
+    let spent = 0;
+    a.casino.setComputedVerifyForTests({
+      now: () => spent,
+      verify: (pub, bytes, sig) => {
+        if (sig === trim.value.g) spent = 1_000_000;
+        return verifyIdentityStrict(pub, bytes, sig);
+      },
+    });
+    Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(a.doc)));
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(a).pending).toBe(true);
+    // the next count has its time, and is whole: H2's rounds are in the checkpoint, and its delegation is let go
+    del(a, key);
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+  });
+
+  it('a count that waits as the game moves on to another base keeps the delegation of a house whose answer it put off: a house not asked of yet is no house left behind', async () => {
+    const { a, at } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const dl = delegation(owner, H2.pub, PAGE_ROOM);
+    // (two pages that keep one verdict at a time: the first tells how many checks the count below makes before it asks
+    // of H2's delegation, the second has its time run out at that one)
+    const probe = await oneVerdictFrom(a, at);
+    const late = await oneVerdictFrom(a, at);
+    expect(foldOf(late).rounds.map((v) => v.decided)).toEqual(['house']);
+    // the root's house trims at round 1, and H2 joins the round after in the session the trim opens: one update
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: undefined, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    a.doc.transact(() => {
+      top(a).set(trim.key, trim.value);
+      top(a).delete(SES);
+      top(a).set(`ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`, new Y.Map());
+    });
+    house(a, kit.houseJoin(H2, 2));
+    const seen: string[] = [];
+    probe.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0, verify: (pub, bytes, sig) => { seen.push(sig); return verifyIdentityStrict(pub, bytes, sig); } });
+    Y.applyUpdate(probe.doc, Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(probe.doc)));
+    const before = seen.indexOf(dl.g);
+    expect(before).toBeGreaterThan(0);
+    let spent = 0;
+    let calls = 0;
+    late.casino.setComputedVerifyForTests({
+      authMax: 1,
+      now: () => spent,
+      verify: (pub, bytes, sig) => {
+        calls += 1;
+        if (calls === before) spent = 1_000_000;
+        return verifyIdentityStrict(pub, bytes, sig);
+      },
+    });
+    Y.applyUpdate(late.doc, Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(late.doc)));
+    expect(res(late)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(late).pending).toBe(true);
+    // its key is deleted meanwhile, and the next count has its time: the page held the delegation, and puts it back
+    calls = Number.NEGATIVE_INFINITY;
+    del(late, key);
+    expect(foldOf(late).pending).toBe(false);
+    expect(lacks(late)).toMatchObject([{ missing: 1 }]);
+    expect(putBack(late)).toBe(1);
+    expect(top(late).get(key)).toEqual(dl);
+    expect(lacks(late)).toEqual([]);
   });
 
   it('the live session\'s map gone is listed and opened again, empty; not while it is there, nor of a game that has ended', async () => {
@@ -1550,7 +1691,7 @@ describe('the put-back duty', () => {
     expect(a.table.computedContested(TABLE, clockOf(a, T))).toBe(true);
   });
 
-  it('a clock gone back a little starts the waits from where it went back to', async () => {
+  it('a clock gone back a little, to before the waits began, starts them from where it went back to', async () => {
     const [a, b] = await pagesWhere((x, y) => before('restore', 0, x, y));
     bet(a, b);
     let T = run([a, b], T0 + STEP, T0 + 2 * STEP);
@@ -1573,6 +1714,26 @@ describe('the put-back duty', () => {
     }
     expect(wrote.map((w) => w.at - stepped)).toEqual([framed(STAGGER_MS)]);
     expect(opened).toBe(framed(OPEN_WAIT_MS + (before('open', 0, b, a) ? 0 : STAGGER_MS)));
+  });
+
+  it('a clock gone back a little inside a wait leaves the wait running on the page\'s clock: its put-back comes that much later, and no wait starts again', async () => {
+    // (a page with no felt: its turn is OUTSIDER_WAIT_MS on)
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const { OUTSIDER_WAIT_MS } = a.table;
+    const wrote = putBacksOf([a], root.key);
+    clockOf(a, T);
+    del(a, root.key);
+    const t0 = T;
+    T = frames(a, T, t0 + 10_000 - STEP);
+    // ten seconds into its wait the page's clock reads 800 ms earlier: no wake (under TABLE_CLOCK_SLACK_MS)
+    a.skew = -800;
+    for (; T <= t0 + OUTSIDER_WAIT_MS + 5_000; T += STEP) {
+      NOW = T;
+      frame(T, a);
+      expect(a.croupier.tablesAwake(clockOf(a, T))).toBe(true);
+    }
+    expect(wrote.map((w) => w.at - t0)).toEqual([OUTSIDER_WAIT_MS + 800]);
   });
 
   it('a clock gone back a minute: the put-backs the page counted and its own last one, stamped after now, count for nothing', async () => {
@@ -1712,6 +1873,68 @@ describe('the put-back duty', () => {
     expect(top(a).get(SES)).toBeInstanceOf(Y.Map);
   });
 
+  it('a session another page opened, deleted again before this page\'s next look, is waited for anew: the map came and went, though no look of the page found it there', async () => {
+    // (a page with no felt: its turn is OUTSIDER_WAIT_MS on)
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const wait = a.table.OPEN_WAIT_MS + a.table.OUTSIDER_WAIT_MS;
+    clockOf(a, T);
+    del(a, SES);
+    const t0 = T;
+    T = frames(a, T, t0 + 3_000 - STEP);
+    // another page opens the session and a peer deletes it, both between two looks of this page
+    set(a, SES, new Y.Map());
+    del(a, SES);
+    const t1 = T;
+    T = frames(a, T, t1 + wait - STEP);
+    expect(top(a).has(SES)).toBe(false);
+    frames(a, T, t1 + wait);
+    expect(top(a).get(SES)).toBeInstanceOf(Y.Map);
+  });
+
+  it('a base that opens another session, with no map for that one either, is a wait of its own: from when it came', async () => {
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const wait = a.table.OPEN_WAIT_MS + a.table.OUTSIDER_WAIT_MS;
+    clockOf(a, T);
+    del(a, SES);
+    const t0 = T;
+    T = frames(a, T, t0 + 3_000 - STEP);
+    // the house's checkpoint of a later round comes: it opens another session, and the doc has no map for it
+    const trim = trimOf(G, 'p', { b: SID, u: 3, n: {}, h: kit.houseCommit(H, 4), dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const ses = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    set(a, trim.key, trim.value);
+    expect(res(a)).toMatchObject({ live: true, base: { key: trim.key } });
+    const t1 = T;
+    T = frames(a, T, t1 + wait - STEP);
+    expect(top(a).has(ses)).toBe(false);
+    frames(a, T, t1 + wait);
+    expect(top(a).get(ses)).toBeInstanceOf(Y.Map);
+    expect(top(a).has(SES)).toBe(false);
+  });
+
+  it('a key of another session of the game that comes or goes starts no wait again: only the map of the session the base opens does', async () => {
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    const wait = a.table.OPEN_WAIT_MS + a.table.OUTSIDER_WAIT_MS;
+    clockOf(a, T);
+    del(a, SES);
+    const t0 = T;
+    // a peer writes a map under another session's key of the game every second, and deletes it
+    const other = `ses:${TABLE}:${G.inc}:${'f'.repeat(SID.length)}`;
+    expect(other).not.toBe(SES);
+    let n = 0;
+    const peer = (): void => {
+      if (++n % 5 !== 0) return;
+      if (top(a).has(other)) del(a, other);
+      else set(a, other, new Y.Map());
+    };
+    T = frames(a, T, t0 + wait - STEP, peer);
+    expect(top(a).has(SES)).toBe(false);
+    frames(a, T, t0 + wait, peer);
+    expect(top(a).get(SES)).toBeInstanceOf(Y.Map);
+  });
+
   it('a session the page opened itself, deleted again before its next look, is waited for anew: a peer that deletes it at once gets one opening a wait, not one a look', async () => {
     // (a page with no felt: its turn is OUTSIDER_WAIT_MS on)
     const [a] = await gameRoom(['A']);
@@ -1752,5 +1975,39 @@ describe('the put-back duty', () => {
     expect(top(a).has(SES)).toBe(false);
     frames(a, T, t1 + OPEN_WAIT_MS);
     expect(top(a).get(SES)).toBeInstanceOf(Y.Map);
+  });
+
+  it('and when nothing of the game was listed in between for want of a check, the map gone all the while: a game the page keeps in mind has no wait left once it is not listed', async () => {
+    const [a] = await gameRoom(['A']);
+    let T = run([a], T0 + STEP, T0 + 2 * STEP);
+    // (a page that keeps one verdict at a time, and has no felt: its turns are OUTSIDER_WAIT_MS on)
+    const late = await oneVerdictFrom(a, T);
+    T = run([late], T, T + STEP);
+    const wait = late.table.OPEN_WAIT_MS + late.table.OUTSIDER_WAIT_MS;
+    clockOf(late, T);
+    del(late, root.key, SES);
+    const t0 = T;
+    T = frames(late, T, t0 + 2_000 - STEP);
+    // a peer puts the base back: the page keeps that put-back in mind, and waits for the session's map
+    set(late, root.key, root.value);
+    T = frames(late, T, T);
+    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, returns: 1 }]);
+    // no check can run, and the room's delegations change: the game waits with no base, and nothing of it is listed
+    late.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0, budgetMs: 0 });
+    set(late, delegationKey(third.pub), delegation(owner, third.pub, PAGE_ROOM));
+    expect(res(late)).toMatchObject({ pending: true, base: null });
+    T = frames(late, T, T);
+    expect(lacks(late)).toEqual([]);
+    // checks run again: the session is listed as missing again, and no key of it moved
+    late.casino.setComputedVerifyForTests({ authMax: 1, now: () => 0 });
+    clockOf(late, T);
+    del(late, delegationKey(third.pub));
+    const t1 = T;
+    expect(res(late)).toMatchObject({ pending: false, base: { key: root.key } });
+    expect(lacks(late)).toMatchObject([{ missing: 0, sessionMissing: true, sesMoves: 1 }]);
+    T = frames(late, T, t1 + wait - STEP);
+    expect(top(late).has(SES)).toBe(false);
+    frames(late, T, t1 + wait);
+    expect(top(late).get(SES)).toBeInstanceOf(Y.Map);
   });
 });

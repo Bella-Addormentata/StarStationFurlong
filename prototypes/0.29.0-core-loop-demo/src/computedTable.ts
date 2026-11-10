@@ -4528,6 +4528,11 @@ interface Keeping {
    *  missing). */
   at: number | null;
   missingAt: number | null;
+  /** The session that wait is for, and casinoDoc's count of the changes of its
+   *  key as this page last read it (FairOnlyRecovery sid, sesMoves): a map that
+   *  came and went since, or another session to open, is a wait of its own. */
+  sid: string | null;
+  sesMoves: number;
   /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
    *  and when it read each put-back since (its own and other pages'), within
    *  CONTESTED_CALM_MS. */
@@ -4567,9 +4572,14 @@ let keptAt: number | null = null;
  *   the same moment would lose the records put into one of them); the records'
  *   authors and witnesses put them back into it (reputDuty, witnessDuty).
  * On an awake page with the room's state in and its doc whole; a frame that
- * isn't starts the waits again. Not on a frame whose doc was bound afresh since
- * this page looked at its clock. Nothing is signed, and nothing is given up: a
- * page holds what it counted for as long as it is bound.
+ * isn't starts the waits again. A clock gone back to before a wait began starts
+ * it from there; one gone back by less leaves the wait running on this page's
+ * clock, so the page writes that much later and in its turn still (a wait
+ * started again would end somewhere among the turns after it), and one gone
+ * back by TABLE_CLOCK_SLACK_MS or more is a wake (croupier tablesAwake), whose
+ * lapse starts both waits again. Not on a frame whose doc was bound afresh
+ * since this page looked at its clock. Nothing is signed, and nothing is given
+ * up: a page holds what it counted for as long as it is bound.
  */
 function fairKeepDuty(pub: string, now: number): void {
   if (keptAt !== null && now >= keptAt && now - keptAt < TICK_MS) return;
@@ -4586,7 +4596,7 @@ function fairKeepDuty(pub: string, now: number): void {
     listed.add(key);
     let w = keeping.get(key);
     // (What came back before this page first saw the game lacking is not counted: when is not known.)
-    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, seen: r.returns, back: [], wroteAt: null, until: 0 });
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, sid: r.sid, sesMoves: r.sesMoves, seen: r.returns, back: [], wroteAt: null, until: 0 });
     const came = noteReturns(w, r.returns, now);
     if (!ready) {
       w.at = null;
@@ -4643,6 +4653,16 @@ function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): vo
 }
 
 function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
+  // (Each disappearance has its own wait, and each session: a map another page
+  // opened that a peer deleted before this page's next look was there and went,
+  // and a base that opens another session has another map to wait for. A wait
+  // that ran on through either would end out of its turn, beside the page whose
+  // turn it is, and of two maps made at once the doc keeps one.)
+  if (w.sid !== r.sid || w.sesMoves !== r.sesMoves) {
+    w.sid = r.sid;
+    w.sesMoves = r.sesMoves;
+    w.missingAt = null;
+  }
   if (!r.sessionMissing) {
     w.missingAt = null;
     return;

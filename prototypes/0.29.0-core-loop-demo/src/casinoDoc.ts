@@ -2256,6 +2256,14 @@ interface FairOnlyState {
   heldFin: unknown;
   heldHks: Map<string, HeldDelegation[]>;
   houseUsed: Set<string>;
+  /** …and the key of the base the game counted from when the delegations held
+   *  were last kept whole (null: never). While the game counts from that base
+   *  still, the delegation of a house no record of the live session is of now
+   *  stays held: the rounds it decided are in no checkpoint yet, and its
+   *  records are on their way back (a session's map a peer deleted, opened
+   *  again empty; a record a peer deleted and its author puts back). Let go of
+   *  when the game moves on to another base (keepHouses). */
+  hkBase: string | null;
   /** 🔒 Under the keys of the delegations held, the values the last count found
    *  there that are no good delegation of the house by a holder of the game (a
    *  stranger's, or one whose signature fails): the held one is written over
@@ -2271,6 +2279,12 @@ interface FairOnlyState {
    *  duty counts the ones that do not last). */
   lacking: boolean;
   returns: number;
+  /** 🔒 How many times, since the doc was bound, a transaction changed the key
+   *  of the session the game's base opens (its map came, went, or was written
+   *  over): each time it goes is a disappearance of its own for the page that
+   *  waits to open it again, though it came and went between two of its looks
+   *  (computedFairOnlyRecoveries sesMoves; computedTable openStep). */
+  sesMoves: number;
   /** The base the fold was last pointed at (null: none; undefined: never). */
   folded: CkRec | null | undefined;
   /** nextSid3 of the checkpoint last asked about (sid3Of). */
@@ -4031,7 +4045,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Set(), hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Set(), hkBase: null, hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
     : null;
   // (…and the page keeps which keys it answered were: their delegations are what
   // the fold's counts stand on, keepHouses.)
@@ -4498,7 +4512,17 @@ function keepStanding(fo: FairOnlyState, xfs: ReadonlyMap<string, unknown>): voi
  *  checks it counts the game again. One a checkpoint of the game carries needs
  *  no key and is not kept. While the fold or the resolution waits for a check
  *  (`waits`), what was held stays: the fold has not asked of every house then,
- *  or the chain is not whole (a holder not told yet is no stranger). */
+ *  or the chain is not whole (a holder not told yet is no stranger).
+ *
+ *  And while the game counts from the base the held ones were kept under
+ *  (`hkBase`), the houses of the delegations held are gone through with the
+ *  ones the fold counted a record of: a session's map a peer deleted comes back
+ *  empty (the put-back duty opens it, and the records' authors and witnesses
+ *  put them back into it after), so the fold of that moment counts no house's
+ *  record, and a delegation let go of then, with its key deleted too, would
+ *  leave the rounds its house decided undecided once the records are back. A
+ *  house no record is of is let go of when the game moves on to another base:
+ *  its rounds are in a checkpoint then. */
 function keepHouses(c: ComputedInc, waits: boolean): void {
   const fo = c.fo!;
   const chain = fo.res!.chain;
@@ -4506,10 +4530,13 @@ function keepHouses(c: ComputedInc, waits: boolean): void {
     for (let i = chain.length - 1; i >= 0; i--) if (chain[i].k === k) return i;
     return -1;
   };
+  const base = fo.res!.base?.key ?? null;
+  const pubs = new Set(fo.houseUsed);
+  if (base === fo.hkBase) for (const key of fo.heldHks.keys()) pubs.add(houseKeyParts(key)!.of);
   const kept = new Map<string, HeldDelegation[]>();
   const over = new Map<string, unknown>();
   let hkWaits = false;
-  for (const pub of fo.houseUsed) {
+  for (const pub of pubs) {
     const key = delegationKey(pub);
     const good = new Map<string, HeldDelegation>();
     for (const h of fo.heldHks.get(key) ?? []) {
@@ -4536,8 +4563,10 @@ function keepHouses(c: ComputedInc, waits: boolean): void {
     // (The latest holder's last; two of one holder's, by their hashes: every page that holds both names the same.)
     if (good.size > 0) kept.set(key, [...good.values()].sort((x, y) => x.at - y.at || (x.hash < y.hash ? -1 : 1)));
   }
-  if (!waits) fo.heldHks = kept;
-  else for (const [key, list] of kept) fo.heldHks.set(key, list);
+  if (!waits) {
+    fo.heldHks = kept;
+    fo.hkBase = base;
+  } else for (const [key, list] of kept) fo.heldHks.set(key, list);
   fo.hkOver = over;
   fo.hkWaits = hkWaits;
 }
@@ -4871,8 +4900,12 @@ function countTransaction(tr: Y.Transaction, map: Y.Map<unknown>, casino: Y.Map<
       if (!c) continue;
       whole.add(c);
       dirty.add(c);
-      // (🔒 A game's session gone is the put-back duty's to open again.)
-      if (c.fo) foCheck.add(c);
+      // (🔒 A game's session gone is the put-back duty's to open again, and each
+      // time the map of the session its base opens comes or goes is told: sesMoves.)
+      if (c.fo) {
+        foCheck.add(c);
+        if (at.sid === fairOnlySessionOf(c)) c.fo.sesMoves += 1;
+      }
     }
   }
   // A key pinned in this transaction counts for its player's felt in it.
@@ -5428,6 +5461,12 @@ export interface FairOnlyRecovery {
   /** The game is live and the session its base opens has no map in the doc
    *  (reopenFairOnlySession makes one). */
   sessionMissing: boolean;
+  /** The session the game's base opens (null: it has no base, or has ended),
+   *  and how many times a transaction changed its key since the doc was bound
+   *  (FairOnlyState sesMoves): the wait for its map is one disappearance's, and
+   *  one session's. */
+  sid: string | null;
+  sesMoves: number;
   /** The keys that take turns at it: the signers of the staked felts this page
    *  last counted in the game (none: every page waits as an outsider). */
   pubs: string[];
@@ -5470,10 +5509,17 @@ function fairOnlyLacks(c: ComputedInc, map: Y.Map<unknown>): [string, unknown][]
   return back;
 }
 
+/** The session game `c`'s base opens while the game is live, or null (no base,
+ *  or one that ends it). */
+function fairOnlySessionOf(c: ComputedInc): string | null {
+  const base = c.fo!.res?.base?.ck;
+  return base !== undefined && base.e !== 1 ? sid3Of(c, base) : null;
+}
+
 /** Whether game `c` is live and the session its base opens has no map. */
 function fairOnlySessionMissing(c: ComputedInc, map: Y.Map<unknown>): boolean {
-  const base = c.fo!.res?.base?.ck;
-  return base !== undefined && base.e !== 1 && !(map.get(sessionKey(c.t, c.inc, sid3Of(c, base))) instanceof Y.Map);
+  const sid = fairOnlySessionOf(c);
+  return sid !== null && !(map.get(sessionKey(c.t, c.inc, sid)) instanceof Y.Map);
 }
 
 /** 🔒 The FAIR ONLY games the doc has lost something of that this page holds
@@ -5494,7 +5540,10 @@ export function computedFairOnlyRecoveries(): FairOnlyRecovery[] {
     }
     const pubs = new Set<string>();
     for (const s of c.last?.felts.values() ?? []) if (s.rec.b.length > 0) pubs.add(s.rec.k);
-    out.push({ t: c.t, inc: c.inc, ctx: c.ctx, u: c.fo!.res?.base?.ck.u ?? 0, missing, sessionMissing, pubs: [...pubs].sort(), returns: c.fo!.returns });
+    out.push({
+      t: c.t, inc: c.inc, ctx: c.ctx, u: c.fo!.res?.base?.ck.u ?? 0, missing, sessionMissing,
+      sid: fairOnlySessionOf(c), sesMoves: c.fo!.sesMoves, pubs: [...pubs].sort(), returns: c.fo!.returns,
+    });
   }
   return out;
 }
@@ -5549,7 +5598,7 @@ export function reopenFairOnlySession(tableId: string, inc: string): boolean {
   const map = computedMap;
   const c = computedIncs.get(`${tableId}:${inc}`);
   if (!map || !c?.fo || !docAlive() || docHoldsPart() || !fairOnlySessionMissing(c, map)) return false;
-  const key = sessionKey(tableId, inc, sid3Of(c, c.fo.res!.base!.ck));
+  const key = sessionKey(tableId, inc, fairOnlySessionOf(c)!);
   boundDoc!.transact(() => {
     map.set(key, new Y.Map<unknown>());
   });
