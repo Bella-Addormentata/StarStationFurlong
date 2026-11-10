@@ -293,10 +293,10 @@ const latestSnapshot = new Map<string, number>();
  *  (see setFaucetReply): ordered among themselves, apart from the jar's view,
  *  since off a test network most statuses leave the wallet unread. */
 const walletOnFile = new Map<string, WalletFigures>();
-/** ⛓️ Per room, the error that has stood since the wallet was last read (see
- *  setFaucetReply): filed with every error, cleared only by a status that
- *  read the wallet. The Bank dates its balance by this one, not by the dish's
- *  error, which any answer clears. */
+/** ⛓️ Per room, the error that has stood since the wallet figures on file
+ *  were filed (see setFaucetReply): filed with every error, cleared only when
+ *  a status's wallet figures are filed in their place. The Bank dates its
+ *  balance by this one, not by the dish's error, which any answer clears. */
 const walletError = new Map<string, string>();
 const listeners = new Set<() => void>();
 /** The room whose node session this store listens to right now (see openFaucetRoom). */
@@ -336,12 +336,14 @@ export function latestFaucetError(roomId: string): string | null {
 }
 
 /** ⛓️ The error that dates the wallet figures on file (null when none does):
- *  the last one filed since a status last read the wallet. An answer that left
- *  the wallet unread clears `latestFaucetError`, since its jar was read, and
- *  leaves this one, since the balance it carries is the one kept from before
- *  the failure. An error does not say whether its request asked for the
- *  wallet, so every error dates the balance until the wallet is read again;
- *  the Bank reads it whenever it opens. */
+ *  the last one filed since those figures were. It goes only when a status's
+ *  wallet figures are filed in their place. An answer that left the wallet
+ *  unread clears `latestFaucetError`, since its jar was read, and leaves this
+ *  one: the balance it carries is the one kept from before the failure. So
+ *  does a wallet read answered late, an older look than the figures on file,
+ *  whose figures are not taken. An error does not say whether its request
+ *  asked for the wallet, so every error dates the balance until newer figures
+ *  are filed; the Bank reads the wallet whenever it opens. */
 export function latestWalletError(roomId: string): string | null {
   return walletError.get(roomId) ?? null;
 }
@@ -430,7 +432,8 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  reads figures the node sent with the status it judges. Such a status
  *  clears the dish's error and not the wallet's (latestWalletError): after a
  *  balance read that failed, the figures it is filed with are still the ones
- *  from before the failure. */
+ *  from before the failure. The wallet's error goes only with a status whose
+ *  wallet figures are filed. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (roomId !== openRoom) return;
   const before = latest.get(roomId);
@@ -461,7 +464,7 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     return;
   }
   // ⛓️ The dish's error goes with any answer. The wallet's goes below, and
-  // only with a status that read the wallet.
+  // only with a status whose wallet figures are filed.
   lastError.delete(roomId);
   // This action's own reply: the spend went out. Its floor is recorded BEFORE
   // the snapshot ordering below is consulted: a reply answered after a newer
@@ -486,9 +489,12 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     // wallet (what is on file is on this status's network by now: another
     // network's was cleared above).
     if (!st.walletSkipped) {
-      walletError.delete(roomId);
       const kept = walletOnFile.get(roomId);
       if (!(st.snapshot > 0 && kept !== undefined && st.snapshot < kept.snapshot)) {
+        // These figures are the balance from here on, so an error from
+        // before them no longer dates it. An older look's are not taken, and
+        // clear nothing: the balance on file is still from before the error.
+        walletError.delete(roomId);
         walletOnFile.set(roomId, {
           snapshot: st.snapshot,
           walletMojos: st.walletMojos,

@@ -5651,10 +5651,10 @@ function renderBankApp(): void {
       const confirming = owned !== null && spendable !== null && spendable < owned ? owned - spendable : 0n;
       // The balance is read over the room's link to the node, so there is
       // none before a room is joined. A failed read is shown as such (the
-      // store keeps the last error until a status that read the wallet clears
-      // it: a dish poll that left the wallet unread clears the dish's error,
-      // and says nothing about the balance) and a balance kept from before it
-      // is dated, not passed off as current.
+      // store keeps the last error until newer wallet figures are filed: a
+      // dish poll that left the wallet unread clears the dish's error, and
+      // says nothing about the balance) and a balance kept from before it is
+      // dated, not passed off as current.
       const balance = !roomId
         ? "shown once you are in a room (your node answers over the room's link)"
         : owned === null
