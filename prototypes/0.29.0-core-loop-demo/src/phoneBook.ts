@@ -32,8 +32,12 @@ export const PHONE_BOOK_GREY = 'rgba(224, 226, 238, 0.45)';
 const DEBOUNCE_MIN = 10;
 const CONFIRM_MIN = 30;
 
-/** The longest node text the tooltip repeats; the node's own log has the rest. */
-const ERROR_MAX = 160;
+/** The longest node text the tooltip repeats; the node's own log has the
+ *  rest. The node's longest sentences of its own fit whole: the pause for
+ *  another copy of this station (foreign_pause.rs PAUSED_TWO_HOURS_WORDS and
+ *  PAUSED_NEXT_EDITION_WORDS, 163 and 170 characters), whose last words say
+ *  when the station tries again. */
+const ERROR_MAX = 180;
 
 export interface PhoneBookIndicator {
   /** Draw the icon at all: the node publishes presence and has reported once. */

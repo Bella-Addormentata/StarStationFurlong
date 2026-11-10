@@ -77,7 +77,8 @@ pub const FOREIGN_PAUSE_SECS: u64 = 2 * 3600;
 pub const MAX_FOREIGN_SEEN: usize = 64;
 
 /// The Phone Book's words while the first pause of an era holds: §10's own
-/// sentences.
+/// sentences. The page shows them and the next edition's whole
+/// (phoneBook.ts `ERROR_MAX`).
 pub const PAUSED_TWO_HOURS_WORDS: &str =
     "Another copy of this station is writing its listing (the same words and contact key). Only one copy can. Stop the other one. This station tries again in two hours.";
 
@@ -666,6 +667,12 @@ mod tests {
         );
         let stem = "Another copy of this station is writing its listing (the same words and contact key). Only one copy can. Stop the other one. ";
         assert_eq!(era.strip_prefix(stem), Some("This station tries again in the next edition."));
+        // The page cuts a node's text past 180 characters (phoneBook.ts
+        // ERROR_MAX), which here would be when the station tries again, and
+        // a text that says "unfunded" sends a tap to the Bank.
+        for words in [two, era] {
+            assert!(words.chars().count() <= 180 && !words.to_lowercase().contains("unfunded"), "{words}");
+        }
     }
 
     #[test]

@@ -7945,8 +7945,8 @@ mod tests {
     /// a write or nothing due has none. A hold names the class of the payer
     /// that holds it, and says who writes the next era's listing on each
     /// path; none of the words says the next one goes out as the new era
-    /// starts on the burner path. Every text fits the page's 160 characters
-    /// and none sends it to the Bank.
+    /// starts on the burner path. Every text is under 160 characters, which
+    /// the page shows whole, and none sends it to the Bank.
     #[test]
     fn every_listing_wait_has_its_words_and_a_write_has_none() {
         use ListingStep::*;
@@ -8037,7 +8037,7 @@ mod tests {
             let words = unlanded_hold_words(by, burner_path);
             assert!(words.contains("did not make it into the book") && !words.contains("stays as it is"), "{words}");
             assert_eq!(words.contains("paid by the SSF wallet"), by == PaidBy::Money, "{words}");
-            assert!(words.chars().count() < 160 && !words.to_lowercase().contains("unfunded"), "fits the page's 160 characters: {words}");
+            assert!(words.chars().count() < 160 && !words.to_lowercase().contains("unfunded"), "under 160 characters, which the page shows whole: {words}");
             assert_eq!(
                 listing_readout(None, held, burner_path, true, Some("push_tx rejected"), true, true),
                 (Some(words.into()), ListingHold::Unlanded),
@@ -11918,7 +11918,7 @@ mod tests {
             "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write, so this node writes no listing, knock, beacon or room record there until burner keys land. It still reads the chain."
         );
         // The Phone Book row repeats it whole: the page cuts a node's text
-        // past 160 characters (phoneBook.ts ERROR_MAX). It follows every
+        // past 180 characters (phoneBook.ts ERROR_MAX). It follows every
         // state's words (phoneBook.test.ts), "Not in the Phone Book yet:"
         // among them, so it neither repeats nor denies a listing.
         let why = money_memo_refusal(ChiaNet::Mainnet).unwrap();

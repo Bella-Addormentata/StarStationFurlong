@@ -192,11 +192,38 @@ describe('phoneBookIndicator', () => {
     }
   });
 
+  it('shows the pause for another copy of this station whole, with when the station tries again', () => {
+    // The node's words while it pauses for a spend of its listing key by
+    // another copy of the station (foreign_pause.rs PAUSED_TWO_HOURS_WORDS
+    // and PAUSED_NEXT_EDITION_WORDS: stage 4 design §10's own sentences).
+    // They are the longest text the node sends, and their last words say
+    // when the station tries again, so the page cuts neither.
+    const twoHours = 'Another copy of this station is writing its listing (the same words and contact key). Only one copy can. Stop the other one. This station tries again in two hours.';
+    const nextEdition = 'Another copy of this station is writing its listing (the same words and contact key). Only one copy can. Stop the other one. This station tries again in the next edition.';
+    for (const words of [twoHours, nextEdition]) {
+      expect(phoneBookIndicator(withPresence({ error: words })).title)
+        .toBe(`Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 7) · ${words}`);
+      expect(phoneBookIndicator(withPresence({ state: 'sent', confirmed: false, error: words })).title)
+        .toBe(`Listing sent to the Phone Book, awaiting confirmation from the chain · ${words}`);
+      expect(phoneBookIndicator(withPresence({ state: 'outdated', current: false, error: words })).title)
+        .toBe(`Phone Book listing outdated: your addresses changed · ${words}`);
+      expect(phoneBookIndicator(withPresence({ state: 'outdated', era: 8, listed_era: 7, current: false, error: words })).title)
+        .toBe(`Phone Book listing outdated: it is from edition 7 and this is edition 8 · ${words}`);
+      const unlisted = phoneBookIndicator(withPresence({ state: 'unlisted', listed_era: 0, last_at: 0, confirmed: false, current: false, error: words }));
+      expect(unlisted.title).toBe(`Not in the Phone Book yet: ${words}`);
+      // The Network row repeats the same words, and a tap goes to the
+      // network row: there is nothing to fund.
+      expect(unlisted.row.value).toBe(unlisted.title);
+      expect(unlisted.opens).toBe('setnet');
+    }
+  });
+
   it('keeps the tooltip to one line: whitespace flattened, a long error cut', () => {
     const long = 'x'.repeat(400);
     const ind = phoneBookIndicator(withPresence({ state: 'unlisted', error: `  spend\n failed:  ${long}` }));
     expect(ind.title).toContain('spend failed: ');
-    expect(ind.title.length).toBeLessThan(200);
+    // Cut to 180 characters, the last of them the ellipsis.
+    expect(ind.title.length).toBe('Not in the Phone Book yet: '.length + 180);
     expect(ind.title.endsWith('…')).toBe(true);
     // An error of nothing but whitespace is no error.
     expect(phoneBookIndicator(withPresence({ state: 'unlisted', error: '  \n ' })).title).toBe('Not in the Phone Book yet: the first listing goes out shortly');
