@@ -28,10 +28,18 @@
 // settings), RECEIVE says so and why, above every wallet state: no switch,
 // no address, no balance. A wallet loaded before an in-run off stays loaded
 // until the node stops, but writes nothing to the chain.
+//
+// 📖 What the wallet has to do with the Phone Book follows the network and
+// the player's LIST ME (listMe.ts, stage 4 PR 11). On a test network the
+// wallet pays for the listing, while LIST ME is on. On a network whose coins
+// are real money it pays for no chain write: the listing and the knocks are
+// written from keys of their own that the lobby dish pays for, only while
+// LIST ME is on, so the wallet's address is never in the book, and RECEIVE
+// says so (`listing`).
 
 import { chiaBackOn, chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';
-import type { ChiaLane, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaListing, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 
 /** The page's own part: CREATE armed and waiting for CONFIRM, a request in
  *  flight, and the last request's failure in the page's or the node's words. */
@@ -50,6 +58,11 @@ export interface BankWalletView {
    *  real money). None without a node, or on a network the page does not
    *  know (`text` says so instead). */
   network: { text: string; warn: boolean } | null;
+  /** 📖 Under the network line, off a test network, while the node has an
+   *  SSF wallet to turn on or holds one: who pays for the Phone Book
+   *  listing there (`BANK_LISTING_LINE`). None on a test network, where
+   *  the wallet may be the payer, or from a node older than LIST ME. */
+  listing: string | null;
   /** The line above the address, or instead of it. */
   text: string;
   /** A warning under it: what turning on means, before CONFIRM. */
@@ -75,21 +88,53 @@ export const BANK_WALLET_BUTTON_ID = 'bank-wallet-switch';
  *  saves the switch, which is quick unless a chain read holds the gate. */
 export const TURN_TIMEOUT_MS = 45_000;
 
-const TURN_ON_WARNING = (net: ChiaNetwork): string =>
-  `Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address, and once the wallet holds a coin it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
-/** Off a test network it promises no mojo from the faucet dish: no lobby
- *  jar holds real XCH until the mainnet move itself, and the note under the
- *  address names no faucet there either. */
-const CREATE_WARNING = (net: ChiaNetwork): string =>
-  `Create an SSF wallet? Your node makes a new ${net.name} key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. Once the wallet holds a coin${net.test ? ' (one mojo from the faucet dish is enough)' : ''} it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
+/** 📖 The Bank's line off a test network (stage 4 design §4.5 (6)): the
+ *  SSF wallet pays for no Phone Book write there, so its address is never
+ *  on the chain beside one. */
+export const BANK_LISTING_LINE = "Your Phone Book listing is paid by the lobby dish, never by this wallet. This wallet's address is never in the book.";
+
+/** Where the player finds LIST ME. */
+const LIST_ME_WHERE = '⚙️ SETTINGS → 🌐 NETWORK';
+
+/** 📖 What a wallet turned on means for the Phone Book, in the warnings
+ *  before CONFIRM. `listing` is the node's LIST ME: none from a node older
+ *  than it, which listed itself on a test network whenever its wallet held
+ *  a coin and wrote nothing off one. `wallet` names the wallet in the
+ *  sentence; `dish` adds what the faucet dish gives, on a test network
+ *  only (no lobby jar is promised real coins here).
+ *
+ *  Off a test network it promises no listing from the wallet: there the
+ *  lobby dish pays, and only while LIST ME is on. On a test network with
+ *  LIST ME off it promises none either. */
+export function listsWhen(net: ChiaNetwork, listing: ChiaListing | undefined, wallet = 'the wallet', dish = false): string {
+  if (!net.test) {
+    return listing
+      ? `On ${net.name} ${wallet} pays for no Phone Book write, and its address is never in the book: your station is listed there only while LIST ME is on (${LIST_ME_WHERE}), paid by the lobby dish.`
+      : `On ${net.name} ${wallet} pays for no Phone Book write.`;
+  }
+  if (listing && !listing.on) {
+    return `LIST ME is off for ${net.name} (${LIST_ME_WHERE}), so your node writes no Phone Book listing there until you turn it on.`;
+  }
+  return `Once ${wallet} holds a coin${dish ? ' (one mojo from the faucet dish is enough)' : ''} it lists itself in the Phone Book on ${net.chain}.`;
+}
+
+const TURN_ON_WARNING = (net: ChiaNetwork, listing: ChiaListing | undefined): string =>
+  `Turn the SSF wallet back on? Your node loads the wallet it kept from before, with the same address. ${listsWhen(net, listing)} Tap CONFIRM.`;
+const CREATE_WARNING = (net: ChiaNetwork, listing: ChiaListing | undefined): string =>
+  `Create an SSF wallet? Your node makes a new ${net.name} key from 24 words, keeps them in its folder on this computer, and shows you the words to write down. ${listsWhen(net, listing, 'the wallet', true)} Tap CONFIRM.`;
 /** CREATE on a node older than the 24 words (#352's), which never says
  *  `mnemonic`: its wallet is a raw key, which the next update replaces. */
-const CREATE_OLDER_NODE_WARNING = (net: ChiaNetwork): string =>
+const CREATE_OLDER_NODE_WARNING = (net: ChiaNetwork, _listing: ChiaListing | undefined): string =>
   `Your station node is older than the Bank's 24-word backup: it makes a ${net.name} key you cannot write down, and updating Star Station later replaces that wallet with a new one at a new address. Update Star Station first, or tap CONFIRM to create it anyway.`;
-const CREATE_LEGACY_WARNING = (net: ChiaNetwork): string =>
-  `Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its ${net.coins} stay at its old address), makes a new ${net.name} key from 24 words at a new address, and shows you the words to write down. Once the new wallet holds a coin it lists itself in the Phone Book on ${net.chain}. Tap CONFIRM.`;
-const REMINTED = (net: ChiaNetwork): string =>
-  `Your node replaced its old SSF wallet with a new one made from 24 words, at a new address. The old wallet's ${net.coins} stay at its old address. Until the new one holds a coin, your node is not listed in the Phone Book.`;
+const CREATE_LEGACY_WARNING = (net: ChiaNetwork, listing: ChiaListing | undefined): string =>
+  `Create a new SSF wallet? Your node's wallet from before was not made from 24 words, so no other Chia wallet can open it. Your node retires it (its file stays in your node's folder, and its ${net.coins} stay at its old address), makes a new ${net.name} key from 24 words at a new address, and shows you the words to write down. ${listsWhen(net, listing, 'the new wallet')} Tap CONFIRM.`;
+/** The notice over a replaced wallet's new address. Only where the wallet
+ *  pays for the listing does an empty one hold the listing back: on a test
+ *  network, with LIST ME on. */
+const REMINTED = (net: ChiaNetwork, listing: ChiaListing | undefined): string => {
+  const replaced = `Your node replaced its old SSF wallet with a new one made from 24 words, at a new address. The old wallet's ${net.coins} stay at its old address.`;
+  return net.test && (!listing || listing.on) ? `${replaced} Until the new one holds a coin, your node is not listed in the Phone Book.` : replaced;
+};
 
 /** ⛓️ The network line: what the node's coins are. */
 export function networkLine(net: ChiaNetwork): { text: string; warn: boolean } {
@@ -121,7 +166,9 @@ export const olderNodeText = (net: ChiaNetwork): string =>
 export const UNKNOWN_NETWORK_TEXT = 'Your node runs on a Chia network this page does not know, so the Bank shows no address.';
 
 /** ⛓️ The note under RECEIVE's address, one per network: what to pay it
- *  with, and what one coin buys. `lead` is drawn bold. */
+ *  with, and what one coin buys. `lead` is drawn bold. Off a test network
+ *  a coin buys no chain write (the lobby dish pays for the listing and the
+ *  knocks), so the note asks for none. */
 export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
   return net.test
     ? {
@@ -130,7 +177,7 @@ export function receiveNote(net: ChiaNetwork): { lead: string; text: string } {
     }
     : {
       lead: `Real ${net.ticker}.`,
-      text: `This address takes real ${net.ticker} on ${net.name}. Scan the code or paste the address in a Chia wallet set to mainnet. Your node spends from it to write to the chain, so send only a little.`,
+      text: `This address takes real ${net.ticker} on ${net.name}. Scan the code or paste the address in a Chia wallet set to mainnet. Your node pays for no chain write from it, so it needs no coin, and your node keeps its key on this computer: send only a little.`,
     };
 }
 
@@ -164,7 +211,7 @@ export function chiaOffBankText(lane: ChiaLane, loaded: boolean, kept = false): 
 /** What the Bank's RECEIVE section shows about the wallet. */
 export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: BankWalletUi): BankWalletView {
   if (!fp) {
-    return { network: null, warning: null, notice: null, button: null, text: 'Your station node is not answering, so there is no wallet to show.', error: null, showsAddress: false };
+    return { network: null, listing: null, warning: null, notice: null, button: null, text: 'Your station node is not answering, so there is no wallet to show.', error: null, showsAddress: false };
   }
   const w = fp.chia_wallet;
   const error = ui.error ?? w?.error ?? null;
@@ -174,21 +221,27 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   if (fp.chia_lane?.off) {
     const loaded = w?.state === 'on' || fp.chia_address !== undefined;
     const kept = w?.seed === true || w?.legacy === true;
-    return { network: net ? networkLine(net) : null, warning: null, notice: null, button: null, text: chiaOffBankText(fp.chia_lane, loaded, kept), error: ui.error ?? null, showsAddress: false };
+    return { network: net ? networkLine(net) : null, listing: null, warning: null, notice: null, button: null, text: chiaOffBankText(fp.chia_lane, loaded, kept), error: ui.error ?? null, showsAddress: false };
   }
   // A network this page does not know: no address (the fingerprint parse
   // keeps none), no switch, and the reason.
-  if (!net) return { network: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };
-  const none = { network: networkLine(net), warning: null, notice: null, button: null } as const;
+  if (!net) return { network: null, listing: null, warning: null, notice: null, button: null, text: UNKNOWN_NETWORK_TEXT, error, showsAddress: false };
+  const listMe = fp.chia_listing;
+  // 📖 Who pays for the listing, off a test network: said wherever the
+  // node holds a wallet or can turn one on, and has a LIST ME to speak of.
+  const pays = !net.test && listMe && w && (w.state === 'on' || w.state === 'ready') ? BANK_LISTING_LINE : null;
+  const bare = { network: networkLine(net), listing: null, warning: null, notice: null, button: null } as const;
+  const none = { ...bare, listing: pays } as const;
   if (fp.chia_address) {
-    if (!w) return { ...none, text: '', error: null, showsAddress: true };
-    const notice = w.state === 'on' && w.reminted ? REMINTED(net) : null;
+    if (!w) return { ...bare, text: '', error: null, showsAddress: true };
+    const notice = w.state === 'on' && w.reminted ? REMINTED(net, listMe) : null;
     if (w.held) {
       return { ...none, notice, text: "SSF wallet on — SSF_CHIA_LANE=1 in your node's environment holds it on.", error, showsAddress: true };
     }
     if (w.stays) {
       return {
         network: none.network,
+        listing: pays,
         warning: null,
         notice,
         text: 'SSF wallet on — it comes back on whenever your node starts.',
@@ -199,6 +252,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
     }
     return {
       network: none.network,
+      listing: pays,
       warning: null,
       notice,
       text: 'SSF wallet on until your node stops: it is turned off, so it does not come back at the next start.',
@@ -209,7 +263,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   }
   if (!w) {
     return {
-      ...none,
+      ...bare,
       // Every node before the switch ran on testnet11 only.
       text: net.test
         ? 'Your station node has no wallet loaded, and it is older than the Bank\'s wallet switch: update Star Station, or start the node with SSF_CHIA_LANE=1.'
@@ -220,9 +274,9 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
   }
   switch (w.state) {
     case 'unbuilt':
-      return { ...none, text: 'This build of your station node only reads the chain, so it cannot hold a wallet. The Star Station installers ship a node that can.', error: null, showsAddress: false };
+      return { ...bare, text: 'This build of your station node only reads the chain, so it cannot hold a wallet. The Star Station installers ship a node that can.', error: null, showsAddress: false };
     case 'off':
-      return { ...none, text: "Your station node's SSF wallet is switched off by SSF_CHIA_LANE in its environment, so the Bank cannot turn it on.", error: null, showsAddress: false };
+      return { ...bare, text: "Your station node's SSF wallet is switched off by SSF_CHIA_LANE in its environment, so the Bank cannot turn it on.", error: null, showsAddress: false };
     case 'on':
       // On, but the address did not read as one of this network's: nothing to pay.
       return { ...none, text: `Your node's SSF wallet is on, but its address did not read as a ${net.name} address, so it is not shown.`, error, showsAddress: false };
@@ -235,17 +289,18 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       // started it, so a CREATE anywhere else would only be refused. A
       // wallet already on disk loads (TURN ON) either way.
       if (mintsOnlyInApp(net, w)) {
-        return { ...none, text: createInAppText(net), error, showsAddress: false };
+        return { ...bare, text: createInAppText(net), error, showsAddress: false };
       }
       if (ui.turning) {
-        return { network: none.network, warning: null, notice: null, text: 'Turning your SSF wallet on…', error: null, button: { act: 'confirm', label: 'TURNING ON…', danger: false, busy: true }, showsAddress: false };
+        return { network: none.network, listing: pays, warning: null, notice: null, text: 'Turning your SSF wallet on…', error: null, button: { act: 'confirm', label: 'TURNING ON…', danger: false, busy: true }, showsAddress: false };
       }
       if (ui.armed) {
         return {
           network: none.network,
+          listing: pays,
           text: 'Your station node has no SSF wallet on yet, so there is no address to pay.',
           // Only a node that says `mnemonic` makes its wallet from 24 words.
-          warning: (w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : w.mnemonic === true ? CREATE_WARNING : CREATE_OLDER_NODE_WARNING)(net),
+          warning: (w.seed ? TURN_ON_WARNING : legacy ? CREATE_LEGACY_WARNING : w.mnemonic === true ? CREATE_WARNING : CREATE_OLDER_NODE_WARNING)(net, listMe),
           notice: null,
           error,
           button: { act: 'confirm', label: '⚠ CONFIRM', danger: true, busy: false },
@@ -254,6 +309,7 @@ export function bankWalletView(fp: LocalFingerprint | null | undefined, ui: Bank
       }
       return {
         network: none.network,
+        listing: pays,
         warning: null,
         notice: null,
         text: w.seed

@@ -2297,27 +2297,41 @@ pub async fn find_spendable_coin_on(
 /// the wallet makes the money coin the parent of the record, so whoever
 /// paid RECEIVE is tied to every listing, knock and beacon it pays for. Off
 /// a test network every such write is a burner key's, funded by the lobby
-/// dish: the beacon's from its key B, where the operator turns it on
-/// ([`burner_paths`]), and the listing's and the knocks' once the player
-/// turns them on (LIST ME, stage 4 design §4.5 (6), PR 11). Until that
-/// switch lands a mainnet node writes no listing and no knock. The text is
-/// the player's: the Phone Book row says it after its state, whichever it
-/// is (a listing an older build wrote can still be listed, sent or
-/// outdated), so it says what this node no longer writes, never whether it
-/// is listed.
+/// dish: the beacon's from its key B, where the operator turns it on, and
+/// the listing's and the knocks' while the player's LIST ME is on
+/// ([`burner_paths`], `chia_listing`, stage 4 design §4.5 (6)). So the
+/// refusal stops no arm there: it is the answer of the money writers
+/// themselves ([`refuse_money_memo`], [`PublisherKeys::money`]), which no
+/// arm reaches off a test network, and of an arm that would be off its
+/// burner path ([`wallet_refusal`]). The text says what the wallet does not
+/// pay for, never whether the node is listed.
 pub fn money_memo_refusal(net: crate::chia_network::ChiaNet) -> Option<String> {
-    (!net.is_test()).then(|| format!("on {} the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet", net.name()))
+    (!net.is_test()).then(|| format!("on {} the SSF wallet pays for no Phone Book write", net.name()))
+}
+
+/// The SSF wallet's refusal ([`refuse_money_memo`]) as it holds one of the
+/// heartbeat's arms: only off that arm's burner path (`burner_path`,
+/// [`burner_paths`]), where the wallet would be the payer. On its burner
+/// path an arm writes from a key of its own that the lobby dish funds, so
+/// what the wallet pays for is nothing to it. Off a test network burner
+/// keys are always on ([`burners_of`]), so this holds no arm there today;
+/// it is kept so that a build which turned them off there would stop at
+/// the arm, with the wallet's words, before it stopped at the keys.
+fn wallet_refusal(money_refused: Option<&str>, burner_path: bool) -> Option<String> {
+    money_refused.filter(|_| !burner_path).map(str::to_string)
 }
 
 /// The log line for [`money_memo_refusal`], said once per process
 /// ([`refuse_money_memo`]): what the node writes off a test network, where
-/// the SSF wallet pays for none of it. No listing and no knock yet (LIST
-/// ME, PR 11), never a room record (stage 4 design §4.5 (2)), and the
-/// beacon from a burner key where it is turned on ([`burner_paths`]).
+/// the SSF wallet pays for none of it. The listing and the knocks from keys
+/// of their own while the player's LIST ME is on (`chia_listing`, stage 4
+/// design §4.5 (6)), never a room record (§4.5 (2)), and the beacon from a
+/// key of its own where it is turned on ([`burner_paths`]). Whether LIST
+/// ME is on is that switch's own line.
 pub fn money_memo_line(net: crate::chia_network::ChiaNet) -> Option<String> {
     (!net.is_test()).then(|| {
         format!(
-            "⛓️ ChiaHub: on {} the SSF wallet pays for no chain write. This node writes no listing and no knock there yet, and no room record. Its beacon, where it is turned on (SSF_CHIA_BEACON=1), is written from a key of its own that the lobby dish funds. It still reads the chain.",
+            "⛓️ ChiaHub: on {} the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is turned on (SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain.",
             net.name()
         )
     })
@@ -2362,15 +2376,15 @@ impl std::error::Error for MoneyMemoRefused {}
 /// network, behind SSF_CHIA_BURNERS=1, the claim-and-write's self-test hook
 /// and the listing from P(e), each knock from K(h) and the beacon from B as
 /// a burner key (§13 rows 9 and 10); off a test network the beacon from B
-/// alone, where the operator turned the beacon on, since there a burner key
-/// is the only path (§13 row 10) and the listing and the knocks wait for
-/// LIST ME (§4.5 (6), PR 11). Off the burner path the beacon arm is not due
-/// while this refuses ([`beacon_arm_due`]), and its seam would stop for
-/// want of the wallet key before B's wallet key is made
-/// ([`PublisherKeys::money`], whose refusal is this one). The heartbeat
-/// asks it once at its start, so a mainnet node plans no listing or knock
-/// that would be refused, looks up no coin for one, and says why on the
-/// Phone Book row.
+/// where the operator turned the beacon on, and the listing from P(e) and
+/// each knock from K(h) while the player's LIST ME is on (§4.5 (6),
+/// `chia_listing`), since there a burner key is the only path (§13 row 10).
+/// Off the burner path the beacon arm is not due while this refuses
+/// ([`beacon_arm_due`]), and its seam would stop for want of the wallet key
+/// before B's wallet key is made ([`PublisherKeys::money`], whose refusal
+/// is this one). The heartbeat asks it once at its start, so an arm off its
+/// burner path plans no write that would be refused, looks up no coin for
+/// one, and says why on the Phone Book row ([`wallet_refusal`]).
 pub fn refuse_money_memo(net: crate::chia_network::ChiaNet) -> Result<(), MoneyMemoRefused> {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some(why) = money_memo_refusal(net) else { return Ok(()) };
@@ -2791,7 +2805,20 @@ impl NodePublishMark {
     }
 }
 
-/// D4 shape: a publishing node is findable unless told otherwise.
+/// The listing arm's word for one tick: the player's LIST ME as it is now
+/// (`listed`, `chia_listing::ListMe::listed`), and only where the run may
+/// list at all (`may_list`: [`findable_enabled`] and a durable contact
+/// key). `None` when either is missing, so the arm does not run and its
+/// writers, which take the word, are not reached. `SSF_CHIA_FINDABLE=0`
+/// still wins: no switch turns the listing on against it (stage 4 design
+/// §4.5 (6)).
+fn findable_now(listed: Option<&crate::chia_listing::Listed>, may_list: bool) -> Option<&crate::chia_listing::Listed> {
+    listed.filter(|_| may_list)
+}
+
+/// D4 shape: a publishing node is findable unless told otherwise. Since
+/// LIST ME (`chia_listing`), "told otherwise" is this variable at `0` or
+/// the player's switch off; the variable wins.
 pub fn findable_enabled() -> bool {
     std::env::var("SSF_CHIA_FINDABLE").ok().as_deref() != Some("0")
 }
@@ -3141,18 +3168,20 @@ pub(crate) fn money_path_burner_payer(
 /// payer text for the rebuilt mark, asked only once a write is found. A
 /// write the rule would not hold on is left alone, so the step is the one
 /// it always was: the burner's own, on the burner path, and the SSF
-/// wallet's on its own path, as on main. Off a test network nothing is
-/// rebuilt; no listing is written there from the SSF wallet (§4.5) or,
-/// until the player's LIST ME opens it (§4.5 (6), PR 11), from a listing
-/// burner. A write the lease has
+/// wallet's on its own path, as on main. Off a test network the burner
+/// path is the listing's only path (§13 row 10), so there too this
+/// station's own P(e)'s write is left to the burner's rules, and what is
+/// rebuilt is a write another key paid for under the hint: a listing
+/// written before the wallet was replaced in the middle of the era, its
+/// lease kept. A write the lease has
 /// forgotten, or whose bundle was not saved, is not found: a marks file
 /// lost after the chain settled the era's write leaves nothing to rebuild
 /// from here.
 ///
 /// The lease is read under its gate ([`WalletLease::held_write_under`]),
-/// so the caller must not hold it. Off a test network, and with a mark of
-/// this era on record that names a write, nothing is read, and the step
-/// returns at once without waiting on the gate.
+/// so the caller must not hold it. With a mark of this era on record that
+/// names a write, nothing is read, and the step returns at once without
+/// waiting on the gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn lost_listing_mark(
     lease: &WalletLease,
@@ -3167,7 +3196,7 @@ pub(crate) async fn lost_listing_mark(
     let hint = Bytes32::new(chia_lane::derive_ck_hint(net, ck, era));
     let era_hint = hex::encode(hint.to_bytes());
     let on_record = mark.filter(|m| m.era == era && m.hint == era_hint);
-    if !net.is_test() || on_record.is_some_and(|m| !m.is_void()) {
+    if on_record.is_some_and(|m| !m.is_void()) {
         return None;
     }
     let held = lease.held_write_under(hint).await?;
@@ -3711,7 +3740,10 @@ pub fn presence_status_with(
 /// process's money lane and the wall clock, read where the lease is
 /// reconciled, as it always was. Building the lane's handle first reads
 /// nothing ([`crate::chia_chain::connect`] does no I/O), so the lease's
-/// checks, their order and their errors are the same as before.
+/// checks, their order and their errors are the same as before. Like the
+/// burner's writer it is reached with the word of the player's LIST ME
+/// (`_listed`, `chia_listing::Listed`).
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_node_presence(
     net: crate::chia_network::ChiaNet,
     iroh_sk: &iroh::SecretKey,
@@ -3720,6 +3752,7 @@ pub async fn publish_node_presence(
     era: u64,
     entries: &[AddrEntry],
     now: u64,
+    _listed: &crate::chia_listing::Listed,
 ) -> Result<(Bytes32, MemoWrite)> {
     let client = crate::chia_chain::connect();
     publish_node_presence_on(&WALLET_LEASE, net, &client, Instant::now, iroh_sk, chia_sk, ck, era, entries, now).await
@@ -3813,7 +3846,9 @@ async fn publish_node_presence_with<R: rand::Rng + ?Sized + Send>(
 /// writer takes it: stage 4 design §10), the wall clock and the OS random
 /// source: the listing the heartbeat writes from P(e) with burner keys on
 /// (§4.3, §13 row 10). No test calls it: its lease, fuse and chain are the
-/// process's.
+/// process's. It has no network check of its own: on every network it is
+/// reached with the word of the player's LIST ME (`_listed`,
+/// `chia_listing::Listed`, §4.5 (6)), which only a switch that is on gives.
 #[allow(clippy::too_many_arguments)]
 async fn publish_burner_presence(
     net: crate::chia_network::ChiaNet,
@@ -3824,6 +3859,7 @@ async fn publish_burner_presence(
     era: u64,
     entries: &[AddrEntry],
     now_unix: u64,
+    _listed: &crate::chia_listing::Listed,
 ) -> Result<(Bytes32, MemoWrite)> {
     let client = crate::chia_chain::connect();
     publish_node_presence_with(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now(), root, money, iroh_sk, ck, era, entries, now_unix, &mut rand::rngs::OsRng)
@@ -4057,9 +4093,10 @@ pub const BURNERS_ENV: &str = "SSF_CHIA_BURNERS";
 /// are on whatever the variable holds, since no memo spend leaves the money
 /// key there ([`refuse_money_memo`]) and a burner key is the only one left
 /// to write with. What is written with them there is not decided here: the
-/// heartbeat opens the beacon's arm alone, and the listing and the knocks
-/// stay closed until the player's LIST ME ([`burner_paths`], §4.5 (6),
-/// PR 11), which [`money_memo_line`] says once. Set to `1` there the
+/// beacon is the operator's to turn on (`SSF_CHIA_BEACON=1`, D7), and the
+/// listing and the knocks are the player's (LIST ME, `chia_listing`, §4.5
+/// (6), off there until turned on), as [`money_memo_line`] says once. Set
+/// to `1` there the
 /// variable is said to change nothing, in one line, and nothing exits; any
 /// other value says nothing.
 ///
@@ -4133,27 +4170,24 @@ struct BurnerPaths {
 }
 
 /// The heartbeat's paths for a run with burner keys on or off (`burners`,
-/// [`burners_enabled`]) on a network where the SSF wallet pays for a memo
-/// spend or does not (`money_refused`, [`refuse_money_memo`]: it pays on a
-/// test network only).
+/// [`burners_enabled`]).
 ///
-/// The beacon takes the burner path wherever burner keys are on: with the
+/// Every arm takes the burner path wherever burner keys are on: with the
 /// flag on a test network, and always off one, where it is the only path a
-/// beacon has (stage 4 design §13 row 10) and stays the operator's choice
-/// (`SSF_CHIA_BEACON=1`, D7).
+/// write has (stage 4 design §13 row 10: the SSF wallet pays for none
+/// there, [`refuse_money_memo`]).
 ///
-/// The listing and the knocks take it only where the SSF wallet pays too,
-/// so on a test network with the flag. Off a test network they are written
-/// on no path yet: there the player turns them on (LIST ME, §4.5 (6),
-/// off by default), and that switch is PR 11's. Until it lands their arms
-/// stay as closed as PR 1 left them, by the same refusal and with the same
-/// words on the Phone Book's row ([`listing_due`], [`knock_arm_open`],
-/// [`listing_readout`]), no key or slot is made for them from the root, and
-/// their seams are handed the money path, which ends in the keys' refusal
-/// ([`PublisherKeys::money`]). A node that listed with no word from its
-/// player is what §4.5 (6) rules out.
-fn burner_paths(burners: bool, money_refused: bool) -> BurnerPaths {
-    BurnerPaths { beacon: burners, listing: burners && !money_refused }
+/// A path says whose key would write, not whether anything is written. The
+/// beacon is the operator's choice on every network (`SSF_CHIA_BEACON=1`,
+/// D7). The listing and the knocks are the player's: the heartbeat asks
+/// LIST ME at every tick (`chia_listing`, §4.5 (6)), which is off on a
+/// network of real coins until the player turns it on, and with it off
+/// their arms do not run, no slot is drawn and nothing is looked up or
+/// written for them. Their writers take the switch's word as a value
+/// (`chia_listing::Listed`), so none is reached without it. A node that
+/// listed with no word from its player is what §4.5 (6) rules out.
+fn burner_paths(burners: bool) -> BurnerPaths {
+    BurnerPaths { beacon: burners, listing: burners }
 }
 
 /// #231 P6b/D7: a beacon is an entry point to the WELCOME room and nothing
@@ -5715,7 +5749,10 @@ pub fn knock_leave(
 /// which the keys were made for. Building the lane's handle first
 /// reads nothing ([`crate::chia_chain::connect`] does no I/O), so the
 /// lease's checks, their order and their errors are the same as before. No
-/// test calls it: its lease, fuse and chain are the process's.
+/// test calls it: its lease, fuse and chain are the process's. A knock is a
+/// Phone Book write, so on every network it is reached with the word of the
+/// player's LIST ME (`_listed`, `chia_listing::Listed`, stage 4 design §4.5
+/// (6)), which only a switch that is on gives.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_knock(
     net: crate::chia_network::ChiaNet,
@@ -5728,6 +5765,7 @@ pub async fn publish_knock(
     room_key: &[u8; 32],
     era: u64,
     now: u64,
+    _listed: &crate::chia_listing::Listed,
 ) -> Result<KnockDone> {
     let client = crate::chia_chain::connect();
     knock_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, keys, burners, iroh_sk, gate, leave, req, room_key, era, now, &mut rand::rngs::OsRng).await
@@ -5752,15 +5790,14 @@ pub(crate) enum KnockDone {
 /// takes from the request to the write, so the heartbeat decides nothing
 /// between them (stage 4 design §13 row 10). The path is `burners`, the
 /// listing's and the knocks' own ([`burner_paths`]): the burner path with
-/// burner keys on on a test network (SSF_CHIA_BURNERS=1), the money path
-/// with them off, and the money path off a test network too, where the
-/// knocks wait for the player's LIST ME (§4.5 (6), PR 11) and that path
-/// ends in the keys' refusal. The keys
+/// burner keys on (SSF_CHIA_BURNERS=1 on a test network, and always off
+/// one), the money path with them off, which off a test network would end
+/// in the keys' refusal. Whether the arm runs at all is the player's LIST
+/// ME, asked by the heartbeat before this step (§4.5 (6)). The keys
 /// are the publisher's (`keys`, [`PublisherKeys`]): the step is handed no
 /// wallet key, and asks the keys for one only where the SSF wallet pays.
 ///
-/// First, on a test network (the only one knocks are written on), the
-/// writes the lease still holds under the knock's inbox hint
+/// First the writes the lease still holds under the knock's inbox hint
 /// ([`knock_hint`], [`WalletLease::held_writes_under`]) are asked of
 /// [`lost_knock_entry`], with the payer of this host's own K(h)
 /// ([`knock_burner`]) and the SSF wallet's. K(h) is the keys' root's on
@@ -5778,8 +5815,8 @@ pub(crate) enum KnockDone {
 /// lease is reconciled). That key is the keys' to give
 /// ([`PublisherKeys::money`]): off a test network they hold none, and the
 /// step ends with the money writers' own refusal ([`MoneyMemoRefused`])
-/// before a writer is reached, so the lease's gate is not taken and the
-/// chain is asked nothing. The write comes back with the path it was
+/// before a writer is reached, so the chain is asked nothing. The write
+/// comes back with the path it was
 /// written on (`from_burner`), the flag the arm's success line reads
 /// ([`knock_sent_line`]), so the line names the writer that wrote. An
 /// error comes back as the writer gave it, for [`knock_not_written`].
@@ -5802,17 +5839,14 @@ async fn knock_on_path<R: rand::Rng + ?Sized + Send>(
     rng: &mut R,
 ) -> Result<KnockDone> {
     let root = burners.then(|| keys.root());
-    if net.is_test() {
-        let hint = knock_hint(net, req, room_key, era);
-        let money = keys.money_payer();
-        // Read under the lease's gate and given back here, before the
-        // writer below takes the gate again (a `tokio` mutex, not
-        // reentrant).
-        let held = lease.held_writes_under(hint).await;
-        let own = || Payer::of_burner(&knock_burner(keys.root(), net, req, room_key, era));
-        if let Some(entry) = lost_knock_entry(held, own, &money, burners, req, hint, era, now_unix) {
-            return Ok(KnockDone::Refiled(entry));
-        }
+    let hint = knock_hint(net, req, room_key, era);
+    let money = keys.money_payer();
+    // Read under the lease's gate and given back here, before the writer
+    // below takes the gate again (a `tokio` mutex, not reentrant).
+    let held = lease.held_writes_under(hint).await;
+    let own = || Payer::of_burner(&knock_burner(keys.root(), net, req, room_key, era));
+    if let Some(entry) = lost_knock_entry(held, own, &money, burners, req, hint, era, now_unix) {
+        return Ok(KnockDone::Refiled(entry));
     }
     let (hint, write) = match root {
         Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, keys.money_payer(), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,
@@ -6165,10 +6199,10 @@ pub fn sent_knock_of(req: &KnockRequest, era: u64, hint: Bytes32, write: &MemoWr
 /// filed: the window is closed for as long as the lease remembers the spend,
 /// until the chain settles it [`crate::chia_knock::SETTLED_DEPTH`] deep.
 ///
-/// The knock arm's step asks it ([`knock_on_path`]) only on a test network,
-/// where knocks are written, and only for a request the arm does not skip
-/// ([`knock_skipped`]): a host the book holds a knock on this era already
-/// has its entry.
+/// The knock arm's step asks it ([`knock_on_path`]) on every network,
+/// since knocks are written on each while the player's LIST ME is on, and
+/// only for a request the arm does not skip ([`knock_skipped`]): a host the
+/// book holds a knock on this era already has its entry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lost_knock_entry(
     held: impl IntoIterator<Item = HeldWrite>,
@@ -6514,34 +6548,35 @@ pub async fn heartbeat_loop(
         }
     };
     // 🛑 Off a test network the SSF wallet pays for no memo spend (stage 4
-    // design §4.5 (1)): asked once here, which logs it once, so the loop
-    // writes no listing and no knock, looks up no coin for one, and the
-    // Phone Book row says why. It still reads the agreed peak, which dates
-    // the row's edition, and judges a write an older build left; the
-    // watcher is not told to read this node's own listing for it.
+    // design §4.5 (1)): asked once here, which logs it once. It holds an
+    // arm only off that arm's burner path, where the wallet would pay
+    // ([`wallet_refusal`]).
     let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);
-    // Which arms write from burner keys this run ([`burner_paths`]). On a
-    // test network with SSF_CHIA_BURNERS=1, all three: the listing from
-    // this wallet's listing burner P(e) at its slot (stage 4 design §4.3,
-    // [`burner_listing_step`]), each knock from its own burner key K(h),
-    // once (§4.1, the knock row), and the beacon from its key B as a burner
-    // key, funded by the lobby dish, from its slot (§4.1, the beacon rows;
-    // §4.3 T5), with the knock rule (§5.2) and the words the knock and
-    // beacon lines give a wait or a busy chain (§10). Off a test network,
-    // where burner keys are the only path (§13 row 10), the beacon alone:
-    // the listing and the knocks wait for the player's LIST ME (§4.5 (6),
-    // PR 11), and until it lands their arms are held by the refusal above,
-    // as they were.
-    let paths = burner_paths(burners_enabled(), money_refused.is_some());
+    // Which arms write from burner keys this run ([`burner_paths`]): with
+    // SSF_CHIA_BURNERS=1 on a test network, and always off one, where
+    // burner keys are the only path (§13 row 10), all three. The listing
+    // from this wallet's listing burner P(e) at its slot (stage 4 design
+    // §4.3, [`burner_listing_step`]), each knock from its own burner key
+    // K(h), once (§4.1, the knock row), and the beacon from its key B as a
+    // burner key, funded by the lobby dish, from its slot (§4.1, the beacon
+    // rows; §4.3 T5), with the knock rule (§5.2) and the words the knock
+    // and beacon lines give a wait or a busy chain (§10). Whether the
+    // listing's and the knocks' arms run at all is the player's LIST ME,
+    // asked at every tick below (§4.5 (6)).
+    let paths = burner_paths(burners_enabled());
+    // The wallet's refusal as the listing's and the knocks' arms see it:
+    // theirs only off their burner path.
+    let listing_refused: Option<String> = wallet_refusal(money_refused.as_deref(), paths.listing);
     // The root the beacon's slot comes from (§4.3 T5), on the beacon's
     // burner path alone: the keys' own ([`PublisherKeys::root`]).
     let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());
     // The root the listing's burners and their slots come from, and the
-    // knocks' keys (§3.2), on the listing's burner path alone. Off a test
-    // network that path is not open yet, so no listing or knock key and no
-    // listing slot is made from the root there, and with the flag off the
-    // listing arm and the knock arm are the SSF wallet's, as on main
-    // ([`money_listing_step`], [`publish_knock`] off the burner path).
+    // knocks' keys (§3.2), on the listing's burner path alone. With the
+    // flag off on a test network the listing arm and the knock arm are the
+    // SSF wallet's, as on main ([`money_listing_step`], [`publish_knock`]
+    // off the burner path). A slot is drawn and a key made only in an arm
+    // that runs, so with LIST ME off none is, on any network; the pause's
+    // file below is the one thing read for the listing's keys before then.
     let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());
     // The SSF wallet's payer text, as the marks file it, for the hint rule
     // (§8.3) on either path. A puzzle hash: the wallet key itself is in the
@@ -6566,9 +6601,10 @@ pub async fn heartbeat_loop(
     // on the burner path alone, and asked by the listing's, the knock's and
     // the beacon's arms. Kept in its file on the listing's burner path
     // (`paths.listing`), for the listing keys of these words and this
-    // contact key alone ([`pause_keys`]); off it, where a mainnet node is
-    // too until LIST ME, nothing is ever counted, no file is read, and no
-    // arm is held.
+    // contact key alone ([`pause_keys`]); off it nothing is ever counted,
+    // no file is read, and no arm is held. On that path the file is read
+    // here whatever LIST ME says: a pause counted while the station listed
+    // still holds its beacon after the player turned the listing off.
     let mut foreign_pause = match &listing_root {
         Some(root) => ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE), &pause_keys(root, &hub.contact_key)),
         None => ForeignPause::in_memory(),
@@ -6595,17 +6631,15 @@ pub async fn heartbeat_loop(
     // under, since a peer lying about the height would file the record where
     // no reader looks. Read within `PEAK_MAX_AGE_SECS`, it serves the next ticks.
     let mut agreed_peak = crate::chia_resolve::ChainPeak::default();
-    // Findable: told so (D4 default) AND holding a durable contact key — a key
-    // for this run only is never published under, since the record would
-    // outlive it and contradict the node's one-key identity.
-    let findable = findable_enabled() && hub.contact_key_durable;
+    // Findable by the environment's word (`SSF_CHIA_FINDABLE` is not `0`)
+    // AND holding a durable contact key: a key for this run only is never
+    // published under, since the record would outlive it and contradict the
+    // node's one-key identity. Both are the run's; the player's LIST ME is
+    // asked at each tick ([`findable_now`]).
+    let may_list = findable_enabled() && hub.contact_key_durable;
     if findable_enabled() && !hub.contact_key_durable {
         println!("⛓️ ChiaHub presence: no durable contact key — per-node presence is not published this run");
     }
-    // Tell the watcher to read our own key every beat for as long as we may
-    // write it, rooms and peers or not: that read is what confirms a write.
-    // Off a test network this node writes none (`money_refused`).
-    hub.presence_publishing.store(findable && money_refused.is_none(), std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = &node_mark {
         println!(
             "⛓️ ChiaHub presence: last written in era {} (write {}, hint {}, {})",
@@ -6719,9 +6753,32 @@ pub async fn heartbeat_loop(
                 println!("⛓️ ChiaHub: the listing key's spent coins are watched afresh after the pause; what the other copy wrote during it is not counted a second time");
             }
         }
+        // 📖 The player's LIST ME for this network (chia_listing.rs, stage
+        // 4 design §4.5 (6)), asked anew at every tick, so a turn in the
+        // SpacePhone's Network settings holds from the next one. Its word is
+        // what the listing's and the knocks' writers below are handed; with
+        // none, neither arm runs. The knocks rung 6 queued before a turn to
+        // off are dropped with it (the route drops them too): the player's
+        // word covers them, and a later dial decides anew.
+        let listed: Option<crate::chia_listing::Listed> = hub.list_me.listed();
+        if listed.is_none() {
+            hub.knock_queue.lock().unwrap().clear();
+        }
+        let findable = findable_now(listed.as_ref(), may_list);
+        // Tell the watcher to read our own key every beat for as long as we
+        // may write it, rooms and peers or not: that read is what confirms
+        // a write. Not while the listing's arm is held off its burner path
+        // by the wallet's refusal (`listing_refused`).
+        hub.presence_publishing.store(findable.is_some() && listing_refused.is_none(), std::sync::atomic::Ordering::Relaxed);
+        if findable.is_none() {
+            // No listing is kept up this tick, so none is read out: after a
+            // turn to off the row says the switch's word (`chia_listing`),
+            // not the listing this node was keeping up before it.
+            hub.presence_status.lock().unwrap().take();
+        }
         let knock_waiting = !hub.knock_queue.lock().unwrap().is_empty();
         let mut peak = agreed_peak.fresh(now_unix).unwrap_or(0);
-        if peak == 0 && (findable || knock_waiting || beacon_on) {
+        if peak == 0 && (findable.is_some() || knock_waiting || beacon_on) {
             peak = crate::chia_resolve::peak_height(&peak_client).await.unwrap_or(0);
             if peak > 0 {
                 agreed_peak = crate::chia_resolve::ChainPeak::new(peak, now_unix);
@@ -6752,7 +6809,7 @@ pub async fn heartbeat_loop(
         };
 
         // ── #231 P6a: the node's OWN presence first (priority over room publishes) ──
-        if findable {
+        if let Some(listed) = findable {
             // The watcher read THIS write back from the chain (the record's
             // signed issued_at is the mark's push time): confirmed, nothing
             // more to retry, and seen on chain, which is what the top bar's
@@ -6971,7 +7028,7 @@ pub async fn heartbeat_loop(
                 // The pause for another copy of this station (§10) holds a
                 // write that is due; the step is what it was, so the readout
                 // below still knows which listing stands.
-                let due = listing_due(money_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));
+                let due = listing_due(listing_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));
                 // Due, and the peak not aged out during the lookups above.
                 if due && !peak_aged("presence") {
                     let tried = Instant::now();
@@ -6979,9 +7036,9 @@ pub async fn heartbeat_loop(
                     // key, which the keys hold on a test network only
                     // ([`PublisherKeys::money`]).
                     let written = match listing_root {
-                        Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,
+                        Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix, listed).await,
                         None => match keys.money() {
-                            Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix).await,
+                            Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix, listed).await,
                             Err(refused) => Err(refused.into()),
                         },
                     };
@@ -7068,7 +7125,7 @@ pub async fn heartbeat_loop(
             // its words are the text ([`paused_readout`]).
             let (why_not, hold) = paused_readout(
                 paused_now(&mut foreign_pause, era_now, now_unix),
-                listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),
+                listing_readout(listing_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),
             );
             let status = presence_status_with(
                 node_mark.as_ref(),
@@ -7098,8 +7155,12 @@ pub async fn heartbeat_loop(
         // age out.
         // The pause for another copy of this station (§10) holds the knocks
         // too: a request stays queued and goes out once the pause is over.
+        // 📖 And the arm opens only with LIST ME's word for this tick, which
+        // its writer is handed: asked first, so with it off nothing is read
+        // or said for a knock.
         let knock_paused = paused_now(&mut foreign_pause, (peak > 0).then(|| chia_lane::era_of(peak)), now_unix);
-        if knock_arm_open(knock_waiting, money_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged("knock") {
+        let knock_open = listed.as_ref().filter(|_| knock_arm_open(knock_waiting, listing_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged("knock"));
+        if let Some(listed) = knock_open {
             let era = chia_lane::era_of(peak);
             let next = loop {
                 let Some(req) = hub.knock_queue.lock().unwrap().pop_front() else { break None };
@@ -7160,7 +7221,7 @@ pub async fn heartbeat_loop(
                 // hint (`claim_write::BurnerWait::MoneyUnderHint`); off
                 // that path (`paths.listing`) it is the SSF wallet's write,
                 // as on main, which the keys refuse off a test network.
-                let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;
+                let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix, listed).await;
                 // 🔎 Under the audit switch alone (§11): the address of this
                 // knock's key, once the step shows the key has written, by
                 // this write, by the write the lease still holds or by the
@@ -10256,8 +10317,8 @@ mod tests {
             assert_eq!(after_void_words(true, None, false, T11, burner_path), last_era);
         }
         // What follows a void listing of this era is the path's word: off a
-        // test network nothing is written again off the burner path, where
-        // the listing stays until LIST ME opens it.
+        // test network nothing is written again off the burner path, since
+        // the SSF wallet pays for no listing there.
         let mainnet = crate::chia_network::ChiaNet::Mainnet;
         assert_eq!(after_void_words(false, None, true, mainnet, false), write_again_words(mainnet, false));
         assert_eq!(after_void_words(false, None, true, mainnet, true), write_again_words(mainnet, true));
@@ -11755,30 +11816,37 @@ mod tests {
     }
 
     /// [`lost_listing_mark`] returns at once, without waiting on the lease's
-    /// gate, where it has nothing to read: off a test network, where the
-    /// heartbeat asks it every beat as on any network, and with a mark of
-    /// this era on record that names a write. While another holds the gate,
-    /// both answer at once, on either path, so mainnet's beat never waits on
-    /// the lease here; with no such mark on a test network the step does
-    /// wait for the gate, and answers once it is given back.
+    /// gate, where it has nothing to read: with a mark of this era on record
+    /// that names a write. While another holds the gate it answers at once
+    /// then, on either path and on every network. With no such mark the
+    /// step does wait for the gate, and answers once it is given back, on
+    /// every network: off a test network too since LIST ME, where the
+    /// heartbeat asks it only while the player's LIST ME is on and listings
+    /// are written (with it off the listing's arm does not run, so that
+    /// beat waits on nothing here).
     #[tokio::test]
     async fn a_lost_listing_marks_step_waits_on_the_leases_gate_only_where_it_reads_the_lease() {
         use crate::chia_network::ChiaNet;
         let (lease, ck, era) = (WalletLease::new(), [0x76; 32], 3);
-        let on_record = NodePublishMark { era, hint: hex::encode(chia_lane::derive_ck_hint(T11, &ck, era)), last_at: 1_700_000_000, ..Default::default() };
-        assert!(!on_record.is_void());
         let gate = lease.lock().await;
         let soon = Duration::from_secs(5);
-        for burner_path in [true, false] {
-            let off = tokio::time::timeout(soon, lost_listing_mark(&lease, None, ChiaNet::Mainnet, &ck, era, burner_path, "", |_| None)).await;
-            assert_eq!(off, Ok(None), "off a test network, burner path {burner_path}: no wait on the gate");
-            let named = tokio::time::timeout(soon, lost_listing_mark(&lease, Some(&on_record), T11, &ck, era, burner_path, "", |_| None)).await;
-            assert_eq!(named, Ok(None), "a mark on record that names a write, burner path {burner_path}: no wait on the gate");
+        for net in ChiaNet::ALL {
+            let on_record = NodePublishMark { era, hint: hex::encode(chia_lane::derive_ck_hint(net, &ck, era)), last_at: 1_700_000_000, ..Default::default() };
+            assert!(!on_record.is_void());
+            for burner_path in [true, false] {
+                let named = tokio::time::timeout(soon, lost_listing_mark(&lease, Some(&on_record), net, &ck, era, burner_path, "", |_| None)).await;
+                assert_eq!(named, Ok(None), "a mark on record that names a write, on {net:?}, burner path {burner_path}: no wait on the gate");
+            }
         }
-        let mut read = std::pin::pin!(lost_listing_mark(&lease, None, T11, &ck, era, true, "", |_| None));
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut read).await.is_err(), "no mark on a test network: the lease is read, under its gate");
+        let mut reads: Vec<_> = ChiaNet::ALL.into_iter().map(|net| (net, Box::pin(lost_listing_mark(&lease, None, net, &ck, era, true, "", |_| None)))).collect();
+        assert!(reads.iter().any(|(net, _)| !net.is_test()) && reads.iter().any(|(net, _)| net.is_test()), "a test network and one that is none");
+        for (net, read) in &mut reads {
+            assert!(tokio::time::timeout(Duration::from_millis(100), read).await.is_err(), "no mark on {net:?}: the lease is read, under its gate");
+        }
         drop(gate);
-        assert_eq!(tokio::time::timeout(soon, read).await, Ok(None), "the gate given back: nothing held, nothing rebuilt");
+        for (net, read) in reads {
+            assert_eq!(tokio::time::timeout(soon, read).await, Ok(None), "the gate given back on {net:?}: nothing held, nothing rebuilt");
+        }
     }
 
     /// The writes the lease holds under one hint come newest first, by the
@@ -12433,10 +12501,12 @@ mod tests {
     /// wallet's keys pay for refuses off a test network, before it signs,
     /// whichever of them pays (the money key, or the beacon key made from
     /// it). The burner builder, `claim_write::build_burner_bundle`, signs
-    /// with a burner key alone and has no such refusal: its callers' gate is
-    /// SSF_CHIA_BURNERS on a test network (§13 rows 9 and 10). A test network builds
-    /// the spend as before. The refusal says why in the player's words, and
-    /// the log line names every write that stops.
+    /// with a burner key alone and has no such refusal: its callers' gates
+    /// are SSF_CHIA_BURNERS on a test network (§13 rows 9 and 10), the
+    /// operator's beacon switch and the player's LIST ME (§4.5 (6)). A test
+    /// network builds the spend as before. The refusal says what the wallet
+    /// does not pay for, and the log line names what is written there and
+    /// from which keys.
     #[test]
     fn off_a_test_network_the_ssf_wallet_pays_for_no_memo_spend() {
         use crate::chia_network::ChiaNet;
@@ -12456,31 +12526,31 @@ mod tests {
                 } else {
                     let err = built.unwrap_err();
                     let refused = err.downcast_ref::<MoneyMemoRefused>().expect("refused by the rule, not by a failed build");
-                    // Since review: a listing an older build wrote can still
-                    // be listed, sent or outdated, and the row says this
-                    // after each, so it says what stops, not "not listed".
-                    assert_eq!(refused.0, "on Chia mainnet the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet");
+                    // It says what the wallet does not pay for, and nothing
+                    // of whether the node lists: that is LIST ME's to say.
+                    assert_eq!(refused.0, "on Chia mainnet the SSF wallet pays for no Phone Book write");
                     assert_eq!(err.to_string(), refused.0);
                     assert_eq!(refuse_money_memo(net), Err(refused.clone()), "asked again, the same answer");
                 }
             }
         }
-        // The line says what is written there and by which key: no
-        // listing and no knock yet, no room record, and the beacon from a
-        // key of its own. It does not say the node only reads.
+        // The line says what is written there and by which key: the
+        // listing and the knocks while LIST ME is on, the beacon where it is
+        // turned on, each from a key of its own, and no room record. It does
+        // not say the node only reads, nor whether LIST ME is on: the
+        // switch has its own line (`chia_listing::start_line`).
         let line = money_memo_line(ChiaNet::Mainnet).unwrap();
         assert_eq!(
             line,
-            "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write. This node writes no listing and no knock there yet, and no room record. Its beacon, where it is turned on (SSF_CHIA_BEACON=1), is written from a key of its own that the lobby dish funds. It still reads the chain."
+            "⛓️ ChiaHub: on Chia mainnet the SSF wallet pays for no chain write. This node's listing and knocks, while LIST ME is on, and its beacon, where it is turned on (SSF_CHIA_BEACON=1), are each written from a key of their own that the lobby dish funds. No room record is written there. It still reads the chain."
         );
-        assert!(!line.contains("only reads") && !line.contains("until burner keys"), "{line}");
-        // The Phone Book row repeats it whole: the page cuts a node's text
-        // past 180 characters (phoneBook.ts ERROR_MAX). It follows every
-        // state's words (phoneBook.test.ts), "Not in the Phone Book yet:"
-        // among them, so it neither repeats nor denies a listing.
+        assert!(!line.contains("only reads") && !line.contains("until burner keys") && !line.contains("yet"), "{line}");
+        // The refusal is short enough for a row of the page to repeat whole
+        // (phoneBook.ts ERROR_MAX cuts a node's text past 180 characters),
+        // and neither claims nor denies a listing.
         let why = money_memo_refusal(ChiaNet::Mainnet).unwrap();
         assert!(why.chars().count() <= 160 && !why.contains('\u{2014}'), "{why}");
-        assert!(!why.contains("not listed") && !why.contains("Phone Book yet"), "{why}");
+        assert!(!why.contains("not listed") && !why.contains("yet") && !why.contains("writes no"), "{why}");
     }
 
     /// A voided listing or a forgotten beacon is written again on its
@@ -12607,38 +12677,63 @@ mod tests {
 
     /// Stage 4 design §13 row 10 and §4.5 (6): which of the heartbeat's
     /// arms write from burner keys ([`burner_paths`]), over every network
-    /// and every value of the flag as the process would read them
-    /// ([`burners_of`], [`refuse_money_memo`]).
+    /// and every value of the flag as the process would read it
+    /// ([`burners_of`]), and what the SSF wallet's refusal holds of them
+    /// ([`wallet_refusal`], [`refuse_money_memo`]).
     ///
     /// On a test network the flag moves the listing, the knocks and the
-    /// beacon together, as it has since they took the burner path. Off one
-    /// the beacon is on the burner path whatever the flag holds, its only
-    /// path there, and the listing and the knocks are on none: the player
-    /// turns those on (LIST ME), which this build does not have yet, so a
-    /// node lists on mainnet at nobody's word in no case.
+    /// beacon together, as it has since they took the burner path, and the
+    /// wallet refuses nothing. Off one every arm is on the burner path
+    /// whatever the flag holds, its only path there, and the wallet's
+    /// refusal holds none of them: whether the listing's and the knocks'
+    /// arms run is the player's LIST ME ([`findable_now`], and the word
+    /// their writers take), no longer the refusal. Only an arm off its
+    /// burner path where the wallet refuses is held by it, which no network
+    /// and flag of today give.
     #[test]
-    fn the_beacon_takes_the_burner_path_wherever_burner_keys_are_on_and_the_listing_only_where_the_wallet_pays_too() {
+    fn every_arm_takes_the_burner_path_wherever_burner_keys_are_on_and_the_wallets_refusal_holds_only_an_arm_off_it() {
         use crate::chia_network::ChiaNet;
         use std::ffi::OsStr;
-        for (burners, money_refused, beacon, listing) in
-            [(false, false, false, false), (true, false, true, true), (true, true, true, false), (false, true, false, false)]
-        {
-            assert_eq!(burner_paths(burners, money_refused), BurnerPaths { beacon, listing }, "burners {burners}, money refused {money_refused}");
+        for burners in [false, true] {
+            assert_eq!(burner_paths(burners), BurnerPaths { beacon: burners, listing: burners }, "burners {burners}");
+        }
+        let words = "the wallet's words";
+        for (refused, burner_path, held) in [(None, false, None), (None, true, None), (Some(words), true, None), (Some(words), false, Some(words.to_string()))] {
+            assert_eq!(wallet_refusal(refused, burner_path), held, "refused {refused:?}, burner path {burner_path}");
         }
         let mut seen = Vec::new();
         for net in ChiaNet::ALL {
             for raw in [None, Some("0"), Some("1")] {
-                let burners = burners_of(net, raw.map(OsStr::new)).0;
-                let paths = burner_paths(burners, refuse_money_memo(net).is_err());
-                let flagged = raw == Some("1");
-                assert_eq!(paths.beacon, !net.is_test() || flagged, "the beacon on {net:?} with {raw:?}");
-                assert_eq!(paths.listing, net.is_test() && flagged, "the listing and knocks on {net:?} with {raw:?}");
+                let paths = burner_paths(burners_of(net, raw.map(OsStr::new)).0);
+                let on = !net.is_test() || raw == Some("1");
+                assert_eq!(paths, BurnerPaths { beacon: on, listing: on }, "{net:?} with {raw:?}");
+                let refused = refuse_money_memo(net).err().map(|e| e.0);
+                assert_eq!(refused.is_some(), !net.is_test(), "the wallet refuses off a test network alone ({net:?})");
+                for path in [paths.listing, paths.beacon] {
+                    assert_eq!(wallet_refusal(refused.as_deref(), path), None, "no arm is held by the wallet's refusal on {net:?} with {raw:?}");
+                }
                 seen.push((net, paths));
             }
         }
-        assert!(seen.contains(&(ChiaNet::Mainnet, BurnerPaths { beacon: true, listing: false })), "mainnet was walked");
-        assert!(seen.contains(&(ChiaNet::Testnet11, BurnerPaths { beacon: true, listing: true })), "so was a test network with the flag");
-        assert!(seen.iter().all(|(net, paths)| net.is_test() || !paths.listing), "no listing or knock path off a test network");
+        assert!(seen.contains(&(ChiaNet::Mainnet, BurnerPaths { beacon: true, listing: true })), "mainnet was walked");
+        assert!(seen.contains(&(ChiaNet::Testnet11, BurnerPaths { beacon: false, listing: false })), "so was a test network without the flag");
+        assert!(seen.iter().all(|(net, paths)| net.is_test() || (paths.listing && paths.beacon)), "off a test network a burner key is every arm's path");
+    }
+
+    /// Stage 4 design §4.5 (6): the listing arm's word for a tick
+    /// ([`findable_now`]) is LIST ME's, and only where the run may list at
+    /// all. With the switch off there is none, whatever the run allows; and
+    /// with `SSF_CHIA_FINDABLE=0` or a contact key for this run only
+    /// (`may_list` false) the switch's word is not passed on, so the
+    /// variable still wins over a LIST ME that is on.
+    #[test]
+    fn the_listing_arm_runs_only_with_list_mes_word_and_where_the_run_may_list() {
+        let word = crate::chia_listing::Listed::for_test();
+        assert!(findable_now(Some(&word), true).is_some(), "LIST ME on, and the run may list");
+        assert!(findable_now(Some(&word), false).is_none(), "SSF_CHIA_FINDABLE=0 (or no durable contact key) wins over LIST ME");
+        for may_list in [false, true] {
+            assert!(findable_now(None, may_list).is_none(), "LIST ME off: no word, may list {may_list}");
+        }
     }
 
     /// The reasons a money-paid write waits are typed now, and say what the

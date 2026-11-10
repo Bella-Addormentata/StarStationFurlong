@@ -18,9 +18,10 @@
 //! never a money key, and has no network check of its own: the rules hold
 //! on every network, and which callers reach it, on which network, is their
 //! gate (`super::burner_paths`: SSF_CHIA_BURNERS on a test network, §13
-//! rows 9 and 10; off one the beacon's writer alone, until the player's
-//! LIST ME opens the listing's and the knocks', §4.5 (6)). Its tests run on
-//! each network for that reason.
+//! rows 9 and 10, and always off one; the beacon's writer where the
+//! operator turned the beacon on, and the listing's and the knocks' while
+//! the player's LIST ME is on, §4.5 (6)). Its tests run on each network
+//! for that reason.
 //!
 //! The writer ([`burner_write_with`], and [`burner_write`] on the node's own
 //! lease and chain) picks what a write spends under the gift rules of §5.2:

@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { MAINNET, TESTNET11 } from './chiaNetwork';
-import type { ChiaLane, ChiaPresence, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaListing, ChiaPresence, ChiaWalletSwitch, LocalFingerprint } from './nodeFingerprint';
 import { PHONE_BOOK_GREEN, PHONE_BOOK_GREY, phoneBookIconSvg, phoneBookIndicator } from './phoneBook';
 
 const BASE: LocalFingerprint = { hex: '00'.repeat(32), base64: 'A'.repeat(43) + '=', port: 4443, chia_net: TESTNET11 };
@@ -175,10 +175,11 @@ describe('phoneBookIndicator', () => {
     expect(phoneBookIndicator(withPresence({ state: 'outdated', current: false, error: 'chia wallet UNFUNDED' })).opens).toBe('bank');
   });
 
-  it("reads true in every state beside mainnet's refusal to pay for a write", () => {
-    // The node's text off a test network (chia_publish.rs money_memo_refusal).
-    // A listing an older build wrote there can still be listed, sent or
-    // outdated, so the text says what stops, never whether this node is listed.
+  it("reads true in every state beside an older mainnet node's refusal to pay for a write", () => {
+    // What a node older than LIST ME said off a test network, where its SSF
+    // wallet paid for no write and nothing else did. A listing an older
+    // build wrote there can still be listed, sent or outdated, so the text
+    // says what stops, never whether this node is listed.
     const refused = 'on Chia mainnet the SSF wallet pays for no Phone Book write, so this node writes no new listing there yet';
     const on = (p: Partial<ChiaPresence>) => phoneBookIndicator({ ...BASE, chia_net: MAINNET, chia_presence: { ...listed, ...p, error: refused } });
     expect(on({}).title).toBe(`Listed in this week's Phone Book: your node's 2 public addresses are on chain (edition 7) · ${refused}`);
@@ -233,21 +234,30 @@ describe('phoneBookIndicator', () => {
 describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
   const fp = (over: Partial<LocalFingerprint>): LocalFingerprint => ({ ...BASE, chia_net: net, ...over });
 
-  it('sends the player to the Bank only where the SSF wallet pays for a listing', () => {
+  const GREY = 'rgba(224, 226, 238, 0.6)';
+  /** LIST ME on: the network's default on a test network, the player's word off one. */
+  const listMeOn: ChiaListing = { on: true, chosen: !net.test };
+
+  it('sends the player to the Bank for a wallet not on yet, and nowhere from a node older than LIST ME off a test network', () => {
     const bank = "OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)";
-    const noWrite = 'OFF — on Chia mainnet the SSF wallet pays for no Phone Book write yet, so this node writes no listing there';
+    const older = 'OFF — on Chia mainnet this node writes no Phone Book listing: it is older than LIST ME (update Star Station)';
     // No chia_presence yet: the wallet is off, not made, or on before the
-    // heartbeat's first round, so the node's own refusal has not come.
+    // heartbeat's first round.
     const ready: ChiaWalletSwitch[] = [
       { state: 'ready', backup: 'native' },
       { state: 'ready', seed: true },
       ...(['page', 'none', undefined] as const).map((backup): ChiaWalletSwitch => ({ state: 'ready', ...(backup ? { backup } : {}) })),
     ];
     for (const chia_wallet of ready) {
+      // LIST ME on: the publisher runs only with the SSF wallet on, whoever
+      // pays, so the wallet is what is missing on either network.
+      expect(phoneBookIndicator(fp({ chia_wallet, chia_listing: listMeOn })).row.value).toBe(bank);
+      // A node with no LIST ME: off a test network it writes no listing
+      // whatever its wallet does, so the row sends the player nowhere.
       const row = phoneBookIndicator(fp({ chia_wallet })).row.value;
       if (net.test) expect(row).toBe(bank);
       else {
-        expect(row).toBe(noWrite);
+        expect(row).toBe(older);
         expect(row).not.toContain('BANK');
       }
     }
@@ -257,9 +267,12 @@ describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
       expect(on).toContain('the SSF wallet is on');
       expect(none).toContain('does not publish presence');
     } else {
-      expect(on).toBe(noWrite);
-      expect(none).toBe(noWrite);
+      expect(on).toBe(older);
+      expect(none).toBe(older);
     }
+    // LIST ME on and the wallet on, before the first round's readout.
+    expect(phoneBookIndicator(fp({ chia_wallet: { state: 'on' }, chia_listing: listMeOn })).row.value).toContain('the SSF wallet is on');
+    expect(phoneBookIndicator(fp({ chia_listing: listMeOn })).row.value).toContain('does not publish presence');
     // What holds the node off says so on either network.
     for (const state of ['unbuilt', 'off'] as const) {
       expect(phoneBookIndicator(fp({ chia_wallet: { state } })).row.value).not.toContain('mainnet');
@@ -270,6 +283,54 @@ describe.each([TESTNET11, MAINNET])('phoneBookIndicator on $name', (net) => {
 
   it('reads a listing the same way on either network', () => {
     expect(phoneBookIndicator(fp({ chia_presence: listed })).title).toBe(phoneBookIndicator(withPresence({})).title);
+    // LIST ME on changes nothing of a listing's readout.
+    expect(phoneBookIndicator(fp({ chia_presence: listed, chia_listing: listMeOn }))).toEqual(phoneBookIndicator(fp({ chia_presence: listed })));
+    expect(phoneBookIndicator(fp({ chia_presence: listed, chia_listing: { ...listMeOn, held: true } }))).toEqual(phoneBookIndicator(fp({ chia_presence: listed })));
+  });
+
+  it('hides the icon while LIST ME is off, whatever listing the node still reports, and points at the switch below', () => {
+    const offs: [ChiaListing, string][] = [
+      [{ on: false, chosen: false }, `OFF — LIST ME is off for ${net.name}, where it starts off: this node writes no listing and no knock there until you turn it on (LIST ME, below)`],
+      [{ on: false, chosen: true }, `OFF — LIST ME is off for ${net.name}: this node writes no listing and no knock there (LIST ME, below, turns it on)`],
+      [{ on: false, chosen: true, held: true }, `OFF — LIST ME is off for ${net.name}: this node writes no listing and no knock there (LIST ME, below, turns it on)`],
+      [{ on: false, chosen: false, damaged: true }, `OFF — the saved LIST ME switch could not be read, which counts as off: this node writes no listing and no knock on ${net.name} (LIST ME, below, saves it anew)`],
+    ];
+    // A readout from before the turn: the node drops it at its publisher's next round.
+    const presences: (ChiaPresence | undefined)[] = [listed, { ...listed, state: 'sent', confirmed: false }, { ...listed, state: 'outdated', current: false }, { ...listed, error: 'chia wallet unfunded' }, undefined];
+    const wallets: (ChiaWalletSwitch | undefined)[] = [{ state: 'on', stays: true }, { state: 'ready' }, { state: 'ready', backup: 'native' }, undefined];
+    for (const [chia_listing, value] of offs) {
+      for (const chia_presence of presences) {
+        for (const chia_wallet of wallets) {
+          const ind = phoneBookIndicator(fp({ chia_listing, ...(chia_presence ? { chia_presence } : {}), ...(chia_wallet ? { chia_wallet } : {}) }));
+          expect(ind.visible).toBe(false);
+          expect(ind.opens).toBeNull();
+          expect(ind.row).toEqual({ value, colour: GREY });
+          // Turning the wallet on lists nothing while LIST ME is off.
+          expect(ind.row.value).not.toContain('BANK');
+        }
+      }
+    }
+    // What LIST ME cannot change is said first: a wallet the environment
+    // holds off, a build with none.
+    const off: ChiaListing = { on: false, chosen: true };
+    expect(phoneBookIndicator(fp({ chia_listing: off, chia_wallet: { state: 'off' } })).row.value).toBe("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
+    expect(phoneBookIndicator(fp({ chia_listing: off, chia_wallet: { state: 'unbuilt' } })).row.value).toBe('OFF — this build of the node only reads the chain');
+    // And Chia off on this computer before either.
+    expect(phoneBookIndicator(fp({ chia_listing: off, chia_lane: { off: true } })).row.value).toBe('OFF — Chia is off on this computer, so this node neither reads nor writes the Phone Book');
+    // A network this page does not know is not named.
+    expect(phoneBookIndicator({ ...BASE, chia_net: null, chia_listing: { on: false, chosen: false } }).row.value)
+      .toBe('OFF — LIST ME is off: this node writes no listing and no knock there until you turn it on (LIST ME, below)');
+    expect(phoneBookIndicator({ ...BASE, chia_net: null, chia_listing: { on: false, chosen: false, damaged: true } }).row.value)
+      .toBe('OFF — the saved LIST ME switch could not be read, which counts as off: this node writes no listing and no knock (LIST ME, below, saves it anew)');
+  });
+
+  it("says the node's environment holds the listing off while LIST ME is on", () => {
+    const held: ChiaListing = { ...listMeOn, held: true };
+    const row = phoneBookIndicator(fp({ chia_listing: held, chia_wallet: { state: 'on' } }));
+    expect(row.visible).toBe(false);
+    expect(row.row).toEqual({ value: "OFF — SSF_CHIA_FINDABLE=0 in the node's environment holds its listing off (LIST ME is on, so its knocks are still written)", colour: GREY });
+    // The wallet not on yet is said first: nothing is written without it.
+    expect(phoneBookIndicator(fp({ chia_listing: held, chia_wallet: { state: 'ready' } })).row.value).toContain('BANK');
   });
 
   it('hides the icon while Chia is off on this computer, whatever listing the node reported before, and says why', () => {

@@ -149,6 +149,18 @@
           <span class="label">Phone Book</span>
           <span class="value" id="network-phone-book">--</span>
         </div>
+        <!-- 📖 LIST ME (listMe.ts): whether this station writes its listing and
+             its knocks on the node's Chia network, and the one button that turns
+             that on (after CONFIRM) or off. Off where the coins are real money
+             until the player turns it on here. main.ts writes these with
+             textContent, hidden and data-* only, so focus stays on the button
+             from LIST ME to CONFIRM to LISTING. -->
+        <div class="chia-lane-detail" id="list-me-detail">
+          <div id="list-me-note" hidden></div>
+          <button type="button" id="list-me-switch" hidden aria-describedby="list-me-note list-me-warning"></button>
+          <div id="list-me-warning" hidden></div>
+          <div id="list-me-error" role="status" hidden></div>
+        </div>
         <div class="network-row">
           <span class="label">Bridge</span>
           <span class="value" id="network-bridge-status">--</span>

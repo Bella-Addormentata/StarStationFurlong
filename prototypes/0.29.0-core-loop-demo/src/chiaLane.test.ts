@@ -347,8 +347,8 @@ describe('main.ts wires the CHIA row', () => {
 
   it('repaints the Bank when the lane changes', () => {
     const refresh = body('async function refreshLocalFingerprint(');
-    expect(refresh).toContain('localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null]');
-    expect(refresh).toContain('fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null]');
+    expect(refresh).toContain('localFingerprint?.chia_wallet ?? null, localFingerprint?.chia_lane ?? null, ');
+    expect(refresh).toContain('fingerprint.chia_wallet ?? null, fingerprint.chia_lane ?? null, ');
   });
 
   it('takes a fresh tap for every act but arm, and no held key', () => {

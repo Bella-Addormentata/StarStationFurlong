@@ -16,7 +16,7 @@
  */
 import { chiaOffWhy } from './chiaLane';
 import type { ChiaNetwork } from './chiaNetwork';
-import type { ChiaLane, ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
+import type { ChiaLane, ChiaListing, ChiaPresence, ChiaPresenceState, LocalFingerprint } from './nodeFingerprint';
 
 /** The two colours Dorkmo asked for: green for a current listing, grey for a
  *  stale one (and for none yet). The grey sits a little above the signal bars'
@@ -72,12 +72,26 @@ const notPublished = (value: string): PhoneBookIndicator => ({ ...NO_NODE, row: 
 const NOT_PUBLISHED = notPublished('OFF — this node does not publish presence (a read-only build, no SSF wallet, or SSF_CHIA_FINDABLE=0)');
 /** 🏦 The SSF wallet switch says why, when it is the reason (bankWallet.ts). */
 const WALLET_NOT_ON = notPublished("OFF — this node's SSF wallet is not on yet (turn it on in the SpacePhone's 🏦 BANK)");
-/** 🛑 Off a test network the SSF wallet pays for no chain write (stage 4
- *  design §4.5 (1), chia_publish.rs `money_memo_refusal`), so turning it on
- *  in the Bank, or making one, lists nothing there: the row says so instead
- *  of sending the player to the Bank. */
-const moneyPaysNoWrite = (net: ChiaNetwork): PhoneBookIndicator =>
-  notPublished(`OFF — on ${net.name} the SSF wallet pays for no Phone Book write yet, so this node writes no listing there`);
+/** 🛑 Off a test network a node older than LIST ME writes no listing: the
+ *  SSF wallet pays for no chain write there (stage 4 design §4.5 (1)), and
+ *  the keys that do are opened by a switch it does not have. So turning the
+ *  wallet on in the Bank lists nothing: the row says so instead of sending
+ *  the player there. */
+const olderThanListMe = (net: ChiaNetwork): PhoneBookIndicator =>
+  notPublished(`OFF — on ${net.name} this node writes no Phone Book listing: it is older than LIST ME (update Star Station)`);
+/** 📖 LIST ME is off (listMe.ts): the node writes no listing and no knock on
+ *  its network, whatever its wallet does. The switch stands under this row,
+ *  so the row says why and points at it. */
+const listMeIsOff = (net: ChiaNetwork | null, listing: ChiaListing): PhoneBookIndicator => {
+  const on = net ? ` on ${net.name}` : '';
+  if (listing.damaged) {
+    return notPublished(`OFF — the saved LIST ME switch could not be read, which counts as off: this node writes no listing and no knock${on} (LIST ME, below, saves it anew)`);
+  }
+  if (listing.chosen) return notPublished(`OFF — LIST ME is off${net ? ` for ${net.name}` : ''}: this node writes no listing and no knock there (LIST ME, below, turns it on)`);
+  return notPublished(`OFF — LIST ME is off${net ? ` for ${net.name}, where it starts off` : ''}: this node writes no listing and no knock there until you turn it on (LIST ME, below)`);
+};
+/** 📖 LIST ME on, the listing held off by the node's environment. */
+const FINDABLE_HELD_OFF = notPublished("OFF — SSF_CHIA_FINDABLE=0 in the node's environment holds its listing off (LIST ME is on, so its knocks are still written)");
 const WALLET_HELD_OFF = notPublished("OFF — SSF_CHIA_LANE in the node's environment holds its SSF wallet off");
 const READ_ONLY_BUILD = notPublished('OFF — this build of the node only reads the chain');
 /** ⛓️ Chia off on this computer (chiaLane.ts): the node reads and writes no
@@ -91,24 +105,34 @@ const WALLET_ON_UNREPORTED = notPublished("Not in the Phone Book yet — the SSF
 
 /** The icon for a fingerprint round. Hidden, with the row saying why, when
  *  the node did not answer this round (`null`: a cached green must not
- *  outlive the node), when Chia is off on this computer (a listing the node
- *  reported before an in-run off is no longer kept up), or when the node
- *  does not publish presence at all (a read-only build, no wallet,
- *  `SSF_CHIA_FINDABLE=0`, no durable contact key). */
+ *  outlive the node), when Chia is off on this computer or LIST ME is off
+ *  for the node's network (a listing the node reported before an in-run off
+ *  is no longer kept up), or when the node does not publish presence at all
+ *  (a read-only build, no wallet, `SSF_CHIA_FINDABLE=0`, no durable contact
+ *  key, or a node older than LIST ME off a test network). */
 export function phoneBookIndicator(fp: LocalFingerprint | null | undefined): PhoneBookIndicator {
   if (!fp) return NO_NODE;
   if (fp.chia_lane?.off) return chiaIsOff(fp.chia_lane);
-  const p = fp.chia_presence;
+  const listing = fp.chia_listing;
+  const state = fp.chia_wallet?.state;
+  // 📖 LIST ME off: the switch's word is the newest there is. A readout the
+  // node still carries from before the turn (it drops it at its publisher's
+  // next round) is of a listing it no longer keeps up. A wallet the
+  // environment holds off, or a build with none, is said first: turning
+  // LIST ME on would change nothing there.
+  const listed = !listing || listing.on;
+  const p = listed ? fp.chia_presence : undefined;
   if (!p) {
-    const state = fp.chia_wallet?.state;
     if (state === 'off') return WALLET_HELD_OFF;
     if (state === 'unbuilt') return READ_ONLY_BUILD;
-    // Before the heartbeat's first round, or with no wallet on at all, the
-    // node reports no listing, so its refusal has not reached this page yet.
-    if (fp.chia_net && !fp.chia_net.test) return moneyPaysNoWrite(fp.chia_net);
+    if (listing && !listing.on) return listMeIsOff(fp.chia_net, listing);
+    // A node with no LIST ME, off a test network: it writes no listing there
+    // whatever its wallet does.
+    if (!listing && fp.chia_net && !fp.chia_net.test) return olderThanListMe(fp.chia_net);
     switch (state) {
       case 'ready': return WALLET_NOT_ON;
-      case 'on': return WALLET_ON_UNREPORTED;
+      // The node never reports a listing it is told not to keep.
+      case 'on': return listing?.held ? FINDABLE_HELD_OFF : WALLET_ON_UNREPORTED;
       default: return NOT_PUBLISHED;
     }
   }

@@ -6740,9 +6740,9 @@ async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_
 }
 
 /// Stage 4 design §13 row 10 and §4.5 (6), on a mock chain of mainnet's
-/// own: what a mainnet node's heartbeat holds and hands its arms. Its keys
-/// hold no wallet key, burner keys are on with no flag, and its paths are
-/// the beacon's alone ([`burner_paths`]).
+/// own: what a mainnet node's heartbeat holds and hands its beacon's arm.
+/// Its keys hold no wallet key, burner keys are on with no flag, and a
+/// burner key is every arm's path ([`burner_paths`]).
 ///
 /// The beacon is written from B as a burner key, funded by mainnet's lobby
 /// dish and by nothing else. With only a coin at testnet11's lobby dish
@@ -6755,9 +6755,9 @@ async fn on_the_burner_path_keys_that_hold_the_wallet_key_write_from_the_burner_
 /// beacon; under testnet11's hints there is nothing. The SSF wallet's coin
 /// is never parked or spent.
 ///
-/// The knock's step is handed the listing's path, which is closed off a
-/// test network until the player's LIST ME: it ends with the money writers'
-/// refusal and asks the chain nothing.
+/// The listing's and the knocks' arms, which the player's LIST ME opens
+/// there, have a test of their own
+/// (`a_mainnet_listing_and_knock_are_written_from_keys_of_their_own_and_funded_by_mainnets_own_lobby_dish`).
 #[tokio::test]
 async fn a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mainnets_own_lobby_dish_alone() {
     use crate::chia_network::ChiaNet::Mainnet;
@@ -6768,8 +6768,8 @@ async fn a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mai
 
     let keys = PublisherKeys::of(Mainnet, w.clone());
     assert!(keys.money().is_err(), "a mainnet node's keys hold no wallet key");
-    let paths = burner_paths(burners_of(Mainnet, None).0, refuse_money_memo(Mainnet).is_err());
-    assert_eq!(paths, BurnerPaths { beacon: true, listing: false }, "with no flag: the beacon's path, and no listing or knock path yet");
+    let paths = burner_paths(burners_of(Mainnet, None).0);
+    assert_eq!(paths, BurnerPaths { beacon: true, listing: true }, "with no flag: a burner key is every arm's path");
     let key = MoneyKey::new(w.clone()).beacon();
     assert_eq!(Payer::of_burner(keys.beacon()), Payer::of_burner(&key), "B, the keys' own");
 
@@ -6789,18 +6789,6 @@ async fn a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mai
     assert!(s.chain.received().is_empty() && !s.lease.outgoing_pending(), "nothing sent or parked");
     assert_eq!(s.gifts(0), 0, "no gift counted");
     assert_eq!(read_other_beacon(&pushed), OtherBeacon::None, "a try that only waits dates no push");
-
-    // The knock's step, on the path the heartbeat hands it there.
-    let (req, _) = host_card([0x50; 32]);
-    let asked = |s: &Setup| (s.a.seen.lock().unwrap().len(), s.b.seen.lock().unwrap().len());
-    let quiet = asked(&s);
-    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
-    let mut rng = StdRng::seed_from_u64(2);
-    let knocked = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
-    let e = knocked.err().expect("no knock is written on mainnet yet");
-    assert_eq!(e.downcast_ref::<MoneyMemoRefused>(), Some(&MoneyMemoRefused(money_memo_refusal(Mainnet).expect("the money writers refuse there"))), "{e:#}");
-    assert_eq!(asked(&s), quiet, "and the chain was asked nothing for it");
-    assert!(s.chain.received().is_empty(), "nothing sent");
 
     let f = ready_dish_of(&s, Mainnet, 10).await;
     let now = unix_now();
@@ -6834,6 +6822,146 @@ async fn a_mainnet_beacon_is_written_from_b_with_no_wallet_key_and_funded_by_mai
     s.reconcile().await;
     let word = beacon_standing_on(&s.lease, Mainnet, &s.money, &mark).await;
     assert_eq!(word, Some((WriteStanding::Confirmed { height: landed, seen_at: Some(landed) }, false)), "and the mark's own reader confirms it");
+    for (coin, what) in [(mine, "the SSF wallet's coin"), (theirs, "testnet11's lobby coin")] {
+        assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "{what}, unspent");
+    }
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §4.5 (6) and §13 rows 10 and 11, on a mock chain of
+/// mainnet's own: what a mainnet station writes while its player's LIST ME
+/// is on. Its heartbeat holds keys with no wallet key and hands the
+/// listing's and the knocks' arms the burner path ([`burner_paths`]), the
+/// only path there; whether those arms run at all is the switch's word
+/// (`chia_listing`), which the seams below this test do not ask.
+///
+/// With only a coin at testnet11's lobby dish address on the chain, the
+/// listing and the knock each wait for a coin, send nothing and count no
+/// gift: another network's dish is no dish here. Once mainnet's lobby dish
+/// holds ready coins the listing is written from P(0) and the knock from
+/// K(h), keys of the wallet's mainnet root, each claiming a lobby coin of
+/// its own in its own bundle, with no fee, under mainnet's hints. The two
+/// share no key, gift or dish coin, and neither is the SSF wallet's.
+///
+/// The crash window (§8.3) is closed there as on a test network. A station
+/// that stops before its knock's entry is saved finds the knock on its
+/// lease at its next start and files it again, writing no second knock.
+/// Its own listing's write is left to the burner's rules; but for a station
+/// whose wallet was replaced in the middle of the era, with the lease
+/// kept, the listing the old wallet's P(0) wrote is filed again and holds
+/// the new wallet's P(0) by the hint rule: one hint never has two payers.
+///
+/// Once the block lands, a reader on mainnet finds the listing under the
+/// contact key and the host opens the knock; under testnet11's hints there
+/// is nothing. The SSF wallet's coin is never parked or spent.
+#[tokio::test]
+async fn a_mainnet_listing_and_knock_are_written_from_keys_of_their_own_and_funded_by_mainnets_own_lobby_dish() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let mut s = setup_on(Mainnet).await;
+    s.past_the_hold();
+    let dir = Dir::new("mainnet-list-me");
+    let path = dir.0.join("wallet_lease.json");
+    let (w, node) = (wallet(160), iroh::SecretKey::generate());
+    restore(&s.lease, &path, &w);
+
+    let keys = PublisherKeys::of(Mainnet, w.clone());
+    assert!(keys.money().is_err(), "a mainnet node's keys hold no wallet key");
+    let paths = burner_paths(burners_of(Mainnet, None).0);
+    assert!(paths.listing, "with no flag: the burner path, the listing's and the knocks' only one there");
+    let root = keys.root();
+    assert_eq!(root.net(), Mainnet, "the keys' root is mainnet's");
+    let money = keys.money_payer();
+    let (req, host_kx) = host_card([0x60; 32]);
+    let (p0, k) = (root.presence(&CK, 0), knock_burner(root, Mainnet, &req, &ROOM_KEY, 0));
+    let lobby = FaucetParams::lobby(Mainnet);
+    let mine = s.chain.fund(our_puzzle_hash(&w), 1000, None);
+    let theirs = ready_dish_of(&s, NET, 10).await;
+    let mut rng = StdRng::seed_from_u64(1);
+
+    // Dry: testnet11's lobby coin is no dish coin on mainnet.
+    let at = s.later();
+    let dry = publish_node_presence_with(&s.lease, &s.fuse, Mainnet, &s.money, at, root, money, &node, &CK, 0, &entries(), unix_now(), &mut rng).await.map(|(_, write)| write);
+    assert_eq!(waited(&dry), Some(BurnerWait::NoCoinReady), "the listing waits for a coin in mainnet's lobby dish");
+    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+    let dry = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, unix_now(), &mut rng).await;
+    let e = dry.err().expect("the knock waits too");
+    assert_eq!(e.downcast_ref::<BurnerWait>(), Some(&BurnerWait::NoCoinReady), "{e:#}");
+    assert!(is_typed_wait(&e), "a wait: no knock attempt used");
+    assert!(s.chain.received().is_empty() && !s.lease.outgoing_pending(), "nothing sent or parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+
+    let dishes: Vec<Coin> = (0..2).map(|_| s.chain.fund(lobby.puzzle_hash(), 10, None)).collect();
+    s.chain.farm().await;
+    s.chain.farm_blocks(GAP_BLOCKS).await;
+    let claimed = |key: &BurnerKey, write: &MemoWrite| {
+        dishes.iter().copied().find(|f| write.coins == WriteCoins { parent: Coin::new(f.coin_id(), key.puzzle_hash(), lobby.gift).coin_id(), parked: f.coin_id() })
+    };
+
+    // The listing, from P(0).
+    let now = unix_now();
+    let at = s.later();
+    let (hint, listing) = publish_node_presence_with(&s.lease, &s.fuse, Mainnet, &s.money, at, root, money, &node, &CK, 0, &entries(), now, &mut rng).await.expect("the listing goes out");
+    assert_eq!(hint, Bytes32::new(chia_lane::derive_ck_hint(Mainnet, &CK, 0)), "era 0's listing hint on mainnet");
+    assert_ne!(hint, Bytes32::new(chia_lane::derive_ck_hint(NET, &CK, 0)), "which is not testnet11's");
+    assert_eq!(listing.payer, Payer::of_burner(&p0), "P(0) pays");
+    assert_ne!(listing.payer, Payer::of(&w), "never the SSF wallet");
+    let f_listing = claimed(&p0, &listing).expect("from a mainnet lobby coin it claims: g its parent, the lobby coin parked");
+    let bundle = s.chain.received().last().cloned().expect("the listing was sent");
+    assert_eq!(bundle.coin_spends.iter().map(|cs| cs.coin.parent_coin_info).collect::<Vec<_>>(), vec![f_listing.parent_coin_info, f_listing.coin_id()], "two spends: the lobby coin's claim, then g's");
+    assert_eq!(s.chain.fee_of(&bundle), 0, "a listing pays no fee");
+
+    // The knock, from K(h), on the path the heartbeat hands its arm.
+    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+    let (knock_hint_now, knock, from_burner) =
+        arm_wrote(knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, now, &mut rng).await);
+    assert!(from_burner, "written on the burner path");
+    assert_eq!(knock_hint_now, knock_hint(Mainnet, &req, &ROOM_KEY, 0), "the host's inbox hint on mainnet");
+    assert_ne!(knock_hint_now, knock_hint(NET, &req, &ROOM_KEY, 0), "which is not testnet11's");
+    assert_eq!(knock.payer, Payer::of_burner(&k), "K(h) pays");
+    let f_knock = claimed(&k, &knock).expect("from a mainnet lobby coin it claims");
+    let bundle = s.chain.received().last().cloned().expect("the knock was sent");
+    assert_eq!(s.chain.fee_of(&bundle), 0, "a knock pays no fee");
+    assert!(f_knock != f_listing && k.puzzle_hash() != p0.puzzle_hash() && knock.payer != listing.payer, "two burners, two lobby coins");
+    assert_eq!(s.gifts(0), 2, "two gifts counted");
+    assert!(s.lease.outgoing_pending_for(listing.payer) && s.lease.outgoing_pending_for(knock.payer) && !s.lease.outgoing_pending_for(Payer::of(&w)), "parked for the burners, not for the SSF wallet");
+    assert!(!s.lease.is_taken(&mine.coin_id()) && !s.lease.is_taken(&theirs.coin_id()));
+    let sent = s.sent();
+    assert_eq!(sent.len(), 2, "the listing and the knock");
+
+    // The crash window: stopped before the knock's entry and the listing's
+    // mark were saved, and started again with its lease restored.
+    s.lease = WalletLease::new();
+    restore(&s.lease, &path, &w);
+    assert!(s.lease.outgoing_pending_for(knock.payer) && s.lease.outgoing_pending_for(listing.payer), "both spends restored, parked");
+    let (at, gate) = (s.later(), tokio::sync::Mutex::new(()));
+    let again = knock_on_path(&s.lease, &s.fuse, Mainnet, &s.money, move || at, &keys, paths.listing, &node, &gate, || Ok(None), &req, &ROOM_KEY, 0, now, &mut rng).await;
+    let filed = arm_refiled(&again).expect("the knock the lease still holds is filed again");
+    assert_eq!(
+        (filed.host.as_str(), filed.era, filed.coin_id, filed.parked, filed.payer),
+        (req.host.as_str(), 0, hex::encode(knock.coins.parent.to_bytes()), hex::encode(knock.coins.parked.to_bytes()), Some(knock.payer.hex())),
+        "K(h)'s own knock, by its coins and payer"
+    );
+    assert_eq!(s.sent(), sent, "and no second knock was sent");
+    let own = Payer::of_burner(&p0).hex();
+    assert_eq!(lost_listing_mark(&s.lease, None, Mainnet, &CK, 0, true, &money.hex(), |_| Some(own.clone())).await, None, "its own listing's write is left to the burner's rules");
+    // The wallet replaced in the middle of the era, the lease kept: the
+    // old wallet's P(0) wrote under the hint the new wallet's P(0) would.
+    let swapped = PublisherKeys::of(Mainnet, wallet(161));
+    let (new_money, new_own) = (swapped.money_payer().hex(), Payer::of_burner(&swapped.root().presence(&CK, 0)).hex());
+    assert_ne!(new_own, own, "another wallet, another P(0)");
+    let lost = lost_listing_mark(&s.lease, None, Mainnet, &CK, 0, true, &new_money, |_| Some(new_own.clone())).await.expect("the old wallet's listing, filed again on mainnet too");
+    assert_eq!(lost, NodePublishMark::written(0, 1, addrs_signature(&entries()), now, hint, &listing, node.public().to_string()), "the mark its writer would have saved");
+    assert_eq!(hint_rule_holds(Some(&lost), 0, &lost.hint, true, &new_money, Some(new_own.as_str())), Some(PaidBy::Other), "and the hint rule holds the new wallet's P(0) for the era");
+
+    let landed = s.chain.farm().await;
+    let found = read_ck(Mainnet, &s.carrier, &CK, landed, unix_now(), &mut HashMap::new()).await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].record.node_id, node.public().to_string(), "read on mainnet as this node's listing");
+    assert_eq!((found[0].coin_id, found[0].confirmed_height, found[0].hint), (burner_coin(&p0, listing.coins.parent).coin_id(), landed, hint), "at P(0)'s 1-mojo coin");
+    assert!(read_ck(NET, &s.carrier, &CK, landed, unix_now(), &mut HashMap::new()).await.unwrap().is_empty(), "under testnet11's hint there is nothing");
+    let opened = read_inbox(Mainnet, &s.carrier, &host_kx, &req.ck_host, &ROOM_KEY, ROOM, landed, unix_now(), &mut HashMap::new()).await.unwrap();
+    assert_eq!(opened.iter().map(|o| o.coin_id).collect::<Vec<_>>(), vec![burner_coin(&k, knock.coins.parent).coin_id()], "the host opens the knock on mainnet");
+    assert!(read_inbox(NET, &s.carrier, &host_kx, &req.ck_host, &ROOM_KEY, ROOM, landed, unix_now(), &mut HashMap::new()).await.unwrap().is_empty(), "and nothing under testnet11's");
     for (coin, what) in [(mine, "the SSF wallet's coin"), (theirs, "testnet11's lobby coin")] {
         assert_eq!(s.chain.record(coin.coin_id()).map(|r| r.2), Some(None), "{what}, unspent");
     }

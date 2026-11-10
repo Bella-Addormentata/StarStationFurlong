@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(code_lines(publish, "secret_key"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
-            "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix).await,",
+            "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix, listed).await,",
             "Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,",
         ]);
         assert_eq!(code_lines(publish, ".money()"), [
@@ -378,7 +378,7 @@ mod tests {
             "let money = keys.money_payer();",
             "Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, keys.money_payer(), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,",
             "let money_payer = keys.money_payer().hex();",
-            "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,",
+            "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix, listed).await,",
         ]);
         assert_eq!(code_lines(publish, "keys.beacon()"), ["publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, dated, rng).await?"]);
         for (name, other) in others {
@@ -401,10 +401,21 @@ mod tests {
     /// arm the path [`super::burner_paths`] gives it. It is a reading of
     /// text and no proof.
     /// - The heartbeat asks whether burner keys are on once, and makes its
-    ///   paths from that and the money refusal.
-    /// - The money refusal is read on seven lines and no more: where it is
-    ///   made, the paths, the Phone Book's flag, the listing's due rule and
-    ///   its readout, the knock's arm, and the beacon's due rule.
+    ///   paths from that alone. Since LIST ME (stage 4 PR 11) the money
+    ///   refusal no longer closes the listing's path off a test network:
+    ///   every arm takes the burner path wherever burner keys are on.
+    /// - The money refusal is read on three lines and no more: where it is
+    ///   made, where it is narrowed to the listing's and the knocks' arms
+    ///   off their burner path (`wallet_refusal`), and the beacon's due
+    ///   rule. The narrowed refusal is read on four more: the Phone Book's
+    ///   flag, the listing's due rule and its readout, and the knock's arm.
+    ///   Before LIST ME those four read the money refusal itself, which
+    ///   held both arms on every network of real coins.
+    /// - LIST ME is asked once a tick, and its word is read on nine lines:
+    ///   where it is asked, where a turn to off drops the queued knocks,
+    ///   the tick's findable, the listing's arm and its two writers, and
+    ///   the knock's arm and its writer. Each writer is handed the word, so
+    ///   the listing's and the knocks' arms run and write only with it.
     /// - The root is handed out twice: for the beacon's slot on the beacon's
     ///   path, and for the listing's and the knocks' keys on the listing's.
     ///   The money path's hint rule reads it on two more lines, and makes a
@@ -414,9 +425,9 @@ mod tests {
     ///   for a beacon written again.
     /// - The knock's seam, its line for a knock not written and the words
     ///   after a void listing are given the listing's path, and the
-    ///   listing's arm its root. So off a test network, where the listing's
-    ///   path is closed, a knock is handed the money path, which ends in
-    ///   the keys' refusal, and no listing or knock key is made.
+    ///   listing's arm its root. Off a test network that is the burner
+    ///   path, so no arm there is handed the money path, which would end
+    ///   in the keys' refusal.
     /// - The beacon's seam dates this network's push from the writer's last
     ///   step on both paths, no earlier than this network's own mark, which
     ///   the write replaces, and the forgotten mark's date is carried
@@ -430,8 +441,8 @@ mod tests {
         let publish = code(&publish);
         let heartbeat = item(publish, "\npub async fn heartbeat_loop(");
 
-        assert_eq!(code_lines(heartbeat, "burners_enabled()"), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
-        assert_eq!(code_lines(heartbeat, "burner_paths("), ["let paths = burner_paths(burners_enabled(), money_refused.is_some());"]);
+        assert_eq!(code_lines(heartbeat, "burners_enabled()"), ["let paths = burner_paths(burners_enabled());"]);
+        assert_eq!(code_lines(heartbeat, "burner_paths("), ["let paths = burner_paths(burners_enabled());"]);
         assert_eq!(code_lines(heartbeat, "let money_refused"), ["let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);"]);
         // Every read of the money key's refusal in the heartbeat. The last
         // is the beacon's due rule (`beacon_arm_due`), which holds the arm
@@ -440,13 +451,53 @@ mod tests {
         // run reaches that case: this reading alone keeps the line in place.
         assert_eq!(code_lines(heartbeat, "money_refused"), [
             "let money_refused: Option<String> = refuse_money_memo(net).err().map(|e| e.0);",
-            "let paths = burner_paths(burners_enabled(), money_refused.is_some());",
-            "hub.presence_publishing.store(findable && money_refused.is_none(), std::sync::atomic::Ordering::Relaxed);",
-            "let due = listing_due(money_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));",
-            "listing_readout(money_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),",
-            "if knock_arm_open(knock_waiting, money_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged(\"knock\") {",
+            "let listing_refused: Option<String> = wallet_refusal(money_refused.as_deref(), paths.listing);",
             "money_refused: money_refused.is_some(),",
         ]);
+        // Every read of that refusal as the listing's and the knocks' arms
+        // see it. Like the beacon's, no run reaches it off a test network
+        // today, and this reading keeps the four lines in place.
+        let knock_arm = "let knock_open = listed.as_ref().filter(|_| knock_arm_open(knock_waiting, listing_refused.is_some(), peak, knock_paced(knock_wait, Instant::now()), knock_paused) && !peak_aged(\"knock\"));";
+        assert_eq!(code_lines(heartbeat, "listing_refused"), [
+            "let listing_refused: Option<String> = wallet_refusal(money_refused.as_deref(), paths.listing);",
+            "hub.presence_publishing.store(findable.is_some() && listing_refused.is_none(), std::sync::atomic::Ordering::Relaxed);",
+            "let due = listing_due(listing_refused.is_some(), step, retry_ok, paused_now(&mut foreign_pause, Some(era), now_unix));",
+            "listing_readout(listing_refused.as_deref(), step, listing_root.is_some(), void, node_last_error.as_deref(), budget_spent, spend_live),",
+            knock_arm,
+        ]);
+        // 📖 LIST ME (stage 4 design §4.5 (6)): asked of the hub's switch
+        // once a tick, and every read of its word. The listing's arm opens
+        // on the tick's findable, which is made from it; the knock's arm
+        // on the word itself; and each of the three writers is handed it.
+        let knock_writer = "let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix, listed).await;";
+        let burner_writer = "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix, listed).await,";
+        let money_writer = "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix, listed).await,";
+        assert_eq!(code_lines(heartbeat, "list_me"), ["let listed: Option<crate::chia_listing::Listed> = hub.list_me.listed();"]);
+        assert_eq!(code_lines(heartbeat, "listed"), [
+            "let listed: Option<crate::chia_listing::Listed> = hub.list_me.listed();",
+            "if listed.is_none() {",
+            "let findable = findable_now(listed.as_ref(), may_list);",
+            "if let Some(listed) = findable {",
+            burner_writer,
+            money_writer,
+            knock_arm,
+            "if let Some(listed) = knock_open {",
+            knock_writer,
+        ]);
+        assert_eq!(code_lines(heartbeat, "findable"), [
+            "let may_list = findable_enabled() && hub.contact_key_durable;",
+            "if findable_enabled() && !hub.contact_key_durable {",
+            "let findable = findable_now(listed.as_ref(), may_list);",
+            "hub.presence_publishing.store(findable.is_some() && listing_refused.is_none(), std::sync::atomic::Ordering::Relaxed);",
+            "if findable.is_none() {",
+            "if peak == 0 && (findable.is_some() || knock_waiting || beacon_on) {",
+            "if let Some(listed) = findable {",
+        ]);
+        // The switch's word is a value only a switch that is on gives out,
+        // and each writer's signature asks for one.
+        for writer in ["\nasync fn publish_burner_presence(", "\npub async fn publish_node_presence(", "\npub async fn publish_knock("] {
+            assert_eq!(code_lines(item(publish, writer), "Listed"), ["_listed: &crate::chia_listing::Listed,"], "{writer}");
+        }
         assert_eq!(code_lines(heartbeat, "keys.root()"), [
             "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
             "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",
@@ -460,10 +511,11 @@ mod tests {
             "the money path's hint rule makes a listing key from a test network's root only"
         );
         assert_eq!(code_lines(heartbeat, "paths."), [
+            "let listing_refused: Option<String> = wallet_refusal(money_refused.as_deref(), paths.listing);",
             "let burner_root: Option<&crate::chia_burner::BurnerRoot> = paths.beacon.then(|| keys.root());",
             "let listing_root: Option<&crate::chia_burner::BurnerRoot> = paths.listing.then(|| keys.root());",
             "let next = after_void_words(lost, paused_now(&mut foreign_pause, Some(now), now_unix), era == now, net, paths.listing);",
-            "let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;",
+            knock_writer,
             "waits_its_turn = knock_not_written(paths.listing, req, &e, era, Instant::now(), &mut hub.knock_queue.lock().unwrap(), &mut knock_wait, &mut chain_knocked);",
             "println!(\"⛓️ ChiaHub beacon: the era {era} beacon {why}; {}\", write_again_words(net, paths.beacon));",
             "let done = publish_beacon(net, &keys, paths.beacon, &iroh_sk, era, now_unix).await;",
@@ -474,11 +526,10 @@ mod tests {
             "beacon_sees_peak(&mut beacon_clock, burner_root, peak, &mut rand::rngs::OsRng);",
             "root: burner_root,",
         ]);
-        assert_eq!(code_lines(heartbeat, "publish_knock("), ["let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;"]);
+        assert_eq!(code_lines(heartbeat, "publish_knock("), [knock_writer]);
         assert_eq!(code_lines(heartbeat, "publish_beacon("), ["let done = publish_beacon(net, &keys, paths.beacon, &iroh_sk, era, now_unix).await;"]);
-        assert_eq!(code_lines(heartbeat, "publish_burner_presence("), [
-            "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,",
-        ]);
+        assert_eq!(code_lines(heartbeat, "publish_burner_presence("), [burner_writer]);
+        assert_eq!(code_lines(heartbeat, "publish_node_presence("), [money_writer]);
         assert_eq!(code_lines(heartbeat, "let written = match "), ["let written = match listing_root {"], "the listing's writer is chosen by the listing's root");
 
         // The beacon's dated push: made in the seam, handed to both writers,
