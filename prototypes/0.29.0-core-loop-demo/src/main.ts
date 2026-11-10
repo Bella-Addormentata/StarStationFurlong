@@ -14,7 +14,7 @@ import type { InputManager } from "./input";
 import { isFormFieldTarget } from "./typingFocus";
 import type * as Y from "yjs";
 import { NetworkProvider } from "./network/NetworkProvider";
-import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetError, latestFaucetStatus, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
+import { clearFaucetRoom, closeFaucetRoom, failFaucetRequest, formatMojos, latestFaucetStatus, latestWalletError, openFaucetRoom, parseFaucetReply, setFaucetReply, subscribeFaucet } from "./faucetDish";
 import { qrSvg } from "./qrCode";
 import {
   acceptNodeCard,
@@ -5446,6 +5446,10 @@ async function openBankBackupWindow(): Promise<void> {
   renderBankApp();
 }
 
+/** ⛓️ A balance read that came due while the Bank was off screen, and waits
+ *  for it to be back (requestBankBalance). */
+let bankBalanceOwed = false;
+
 /** Ask the node for a faucet status, whose wallet half is RECEIVE's balance.
  *  The reply lands in the dish's store, whose subscribers repaint the view;
  *  a request that cannot leave (no node, a failed stream) is filed there too,
@@ -5453,14 +5457,42 @@ async function openBankBackupWindow(): Promise<void> {
  *  reading "reading the chain…" for good. Rooms without a dish have no poll
  *  of their own, so this runs on open and on REFRESH. The balance travels
  *  over the room's link to the node, so there is nothing to ask before a room
- *  is joined, and nothing while no wallet is loaded. */
+ *  is joined, and nothing while no wallet is loaded.
+ *
+ *  ⛓️ It asks only with the Bank on screen (statusAsksForBalance). A read
+ *  that comes due while it is not (a wallet turned on whose answer landed
+ *  after Tab put the phone away, or the window was minimised: turnBankWallet
+ *  waits on the node twice before it gets here) is owed, and sent when the
+ *  Bank is back on screen (the screen watch in renderBankApp), so the full
+ *  nodes are never asked for a balance nobody can see. */
 function requestBankBalance(): void {
+  bankBalanceOwed = false;
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !localFingerprint?.chia_address) return;
   // ⛓️ With Chia off the node reads no balance, and RECEIVE shows none.
   if (localFingerprint.chia_lane?.off) return;
-  const { seq, sent } = networkProvider.requestFaucet("status");
+  if (!statusAsksForBalance()) {
+    bankBalanceOwed = true;
+    return;
+  }
+  // ⛓️ The Bank asks for the wallet's coins by name: off a test network the
+  // node reads them for no other status.
+  const { seq, sent } = networkProvider.requestFaucet("status", undefined, true);
   sent.catch((e: unknown) => failFaucetRequest(roomId, "status", seq, e));
+}
+
+/** ⛓️ Does a faucet status sent now ask the node for the wallet's coins too?
+ *  Only while RECEIVE's balance is on screen: the Bank is the phone's view
+ *  AND the phone is out (bankViewOnScreen), AND the page itself is not
+ *  hidden. Tab puts the phone away without taking `active` off the Bank's
+ *  view, so the view's class alone would keep the dish's polls asking for a
+ *  balance nobody can see; and a minimised window or a background tab keeps
+ *  its timers, the dish's 60-second poll among them, so a phone left out on
+ *  the Bank would keep asking for as long as the player is away. With the
+ *  Bank off screen, and off a test network, those polls leave the wallet
+ *  unread. */
+function statusAsksForBalance(): boolean {
+  return bankViewOnScreen() && document.visibilityState !== "hidden";
 }
 
 function renderBankApp(): void {
@@ -5618,14 +5650,16 @@ function renderBankApp(): void {
       // on another chain, not yet re-read) is no balance of this address.
       const roomSt = roomId ? latestFaucetStatus(roomId) : null;
       const st = roomSt && roomSt.net?.id === net.id ? roomSt : null;
-      const err = roomId ? latestFaucetError(roomId) : null;
+      const err = roomId ? latestWalletError(roomId) : null;
       const owned = st?.walletMojos ?? null;
       const spendable = st?.walletSpendableMojos ?? owned;
       const confirming = owned !== null && spendable !== null && spendable < owned ? owned - spendable : 0n;
       // The balance is read over the room's link to the node, so there is
       // none before a room is joined. A failed read is shown as such (the
-      // store keeps the node's last error until a later answer clears it) and
-      // a balance kept from before it is dated, not passed off as current.
+      // store keeps the last error until newer wallet figures are filed: a
+      // dish poll that left the wallet unread clears the dish's error, and
+      // says nothing about the balance) and a balance kept from before it is
+      // dated, not passed off as current.
       const balance = !roomId
         ? "shown once you are in a room (your node answers over the room's link)"
         : owned === null
@@ -5793,11 +5827,15 @@ function renderBankApp(): void {
     const phone = document.getElementById("spacephone-container");
     const watch = new MutationObserver(() => {
       if (!treasuryViewOnScreen(view)) bankBackupLeftScreen();
+      // ⛓️ Back on screen: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     watch.observe(view, { attributes: true, attributeFilter: ["class"] });
     if (phone) watch.observe(phone, { attributes: true, attributeFilter: ["class"] });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") bankBackupLeftScreen();
+      // ⛓️ Shown again: the balance read that waited for it.
+      else if (bankBalanceOwed) requestBankBalance();
     });
     // ↑/↓ move between the view's buttons: Tab cannot (the app reserves it as
     // the phone's toggle and preventDefaults every press), and a COPY only a
@@ -11650,7 +11688,7 @@ async function init() {
   subscribeFaucet(() => {
     if (document.getElementById("phone-app-bank")?.classList.contains("active")) renderBankApp();
   });
-  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount);
+  world.onFaucetRequest = (op, amount) => networkProvider.requestFaucet(op, amount, statusAsksForBalance());
   // ⛓️ The dish trusts a status's network only when the fingerprint names it too.
   world.faucetChiaNet = () => localFingerprint?.chia_net;
   // ⛓️ And says Chia is off while the fingerprint does.
@@ -11667,7 +11705,7 @@ async function init() {
     if (reply) setFaucetReply(env.room, reply, typeof env.seq === "number" ? env.seq : undefined);
   });
   window.setInterval(() => {
-    if (world.hasFaucetDish()) networkProvider.requestFaucet("status").sent.catch(() => {});
+    if (world.hasFaucetDish()) networkProvider.requestFaucet("status", undefined, statusAsksForBalance()).sent.catch(() => {});
   }, 60_000);
 
   // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
