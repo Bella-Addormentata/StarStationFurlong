@@ -11,6 +11,7 @@ import {
   latestFaucetError,
   formatMojos,
   jarLevel,
+  keepWalletFigures,
   latestFaucetStatus,
   markFaucetPending,
   openFaucetRoom,
@@ -36,6 +37,7 @@ const status = (over: Partial<FaucetStatus> = {}): FaucetStatus => ({
   walletMojos: null,
   walletSpendableMojos: null,
   walletPartial: false,
+  walletSkipped: false,
   partial: false,
   note: '',
   spending: false,
@@ -202,6 +204,57 @@ describe.each([TESTNET11, MAINNET])('faucet dish on $name', (net) => {
     setFaucetReply(room, { op: 'status', ok: true, status: status({ net: other, snapshot: 2 }) });
     expect(latestFaucetStatus(room)?.snapshot).toBe(3);
     clearFaucetRoom(room);
+  });
+
+  it('keeps the wallet figures on file when a status left the wallet unread, and only then', () => {
+    const room = `wallet-kept-${net.id}`;
+    clearFaucetRoom(room);
+    openFaucetRoom(room);
+    // A dish poll before any read of the wallet: nothing to keep.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 1, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
+    // The Bank's read.
+    const read = status({ net, snapshot: 2, walletMojos: 5000n, walletSpendableMojos: 4000n, walletPartial: true });
+    setFaucetReply(room, { op: 'status', ok: true, status: read });
+    // A dish poll after it: the jar is the poll's, the wallet the Bank's.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 3, coins: 7, walletSkipped: true }) });
+    const kept = latestFaucetStatus(room);
+    expect([kept?.snapshot, kept?.coins, kept?.walletSkipped]).toEqual([3, 7, true]);
+    expect([kept?.walletMojos, kept?.walletSpendableMojos, kept?.walletPartial]).toEqual([5000n, 4000n, true]);
+    // And a second one keeps them still.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 4, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBe(5000n);
+    // A status that read the wallet replaces them, an absent wallet included.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 5 }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
+    // Nothing is kept across networks: the other network's dish starts empty.
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net, snapshot: 6, walletMojos: 9n }) });
+    const other = net === TESTNET11 ? MAINNET : TESTNET11;
+    setFaucetReply(room, { op: 'status', ok: true, status: status({ net: other, snapshot: 1, walletSkipped: true }) });
+    expect(latestFaucetStatus(room)?.walletMojos).toBeNull();
+    clearFaucetRoom(room);
+  });
+});
+
+describe('faucet dish: a status that left the wallet unread', () => {
+  it('reads walletSkipped from the wire, and an older node as false', () => {
+    expect(asFaucetStatus(wire({ walletSkipped: true }))?.walletSkipped).toBe(true);
+    expect(asFaucetStatus(wire())?.walletSkipped).toBe(false);
+    const older = wire();
+    delete older.walletSkipped;
+    expect(asFaucetStatus(older)?.walletSkipped).toBe(false);
+    // Only `true` counts: anything else is a status that read the wallet.
+    expect(asFaucetStatus({ ...wire(), walletSkipped: 'true' })?.walletSkipped).toBe(false);
+  });
+
+  it('keeps figures only for such a status, and only from a status on file', () => {
+    const onFile = status({ walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true });
+    const skipped = status({ walletSkipped: true, coins: 4 });
+    expect(keepWalletFigures(skipped, onFile)).toEqual({ ...skipped, walletMojos: 12n, walletSpendableMojos: 10n, walletPartial: true });
+    expect(keepWalletFigures(skipped, null)).toBe(skipped);
+    expect(keepWalletFigures(skipped, undefined)).toBe(skipped);
+    const read = status({ walletMojos: null });
+    expect(keepWalletFigures(read, onFile)).toBe(read);
   });
 });
 

@@ -4727,10 +4727,14 @@ export function createFaucetDishUI(deps: FaucetDishUIDeps): DeviceUI {
       <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0; gap:10px;">
         <span style="color:${CH_DIM};">${k}</span><span style="color:${CH_GOLD}; text-align:right;">${v}</span>
       </div>`;
-    const wallet = st?.walletMojos ?? null;
+    // ⛓️ The wallet's figures show here only from a status that read them
+    // itself. Off a test network the node leaves the wallet unread for the
+    // dish's polls (`walletSkipped`), and the figures the store keeps then
+    // are the Bank's last read, not this status's.
+    const wallet = st && !st.walletSkipped ? st.walletMojos : null;
     // GIVE spends what the node can spend NOW (owned minus coins still confirming
     // an earlier spend); the balance line shows what the wallet owns.
-    const spendable = st?.walletSpendableMojos ?? wallet;
+    const spendable = wallet === null ? null : (st?.walletSpendableMojos ?? wallet);
     const confirming = wallet !== null && spendable !== null && spendable < wallet ? wallet - spendable : 0n;
     // ⛓️ The network: the ticker, and whether the slot shows at all.
     drawnFor = fpNetKey();

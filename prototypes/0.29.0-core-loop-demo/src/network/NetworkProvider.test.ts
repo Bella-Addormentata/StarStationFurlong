@@ -476,6 +476,14 @@ describe('NetworkProvider — the faucet request stream', () => {
     await next.sent;
     expect(next.seq).toBe(2);
     expect(unframe(wt.opened[1].written)[0].seq).toBe(2);
+    // ⛓️ A status says `wallet` only when its asker shows the balance (the
+    // Bank): off a test network the node reads the wallet's coins for no
+    // other request, so a plain poll must not carry it.
+    expect(JSON.parse(atob(unframe(wt.opened[1].written)[0].payload as string))).toEqual({ op: 'status' });
+    await provider.requestFaucet('status', undefined, false).sent;
+    expect(JSON.parse(atob(unframe(wt.opened[2].written)[0].payload as string))).toEqual({ op: 'status' });
+    await provider.requestFaucet('status', undefined, true).sent;
+    expect(JSON.parse(atob(unframe(wt.opened[3].written)[0].payload as string))).toEqual({ op: 'status', wallet: true });
     await provider.disconnect();
   });
 

@@ -54,6 +54,13 @@ export interface FaucetStatus {
    *  permissionless as the faucet's): the two wallet totals cover the pages it
    *  read, the wallet holds more, and GIVE spends from the coins it read. */
   walletPartial: boolean;
+  /** ⛓️ The node has a wallet loaded and left it unread for this status: off
+   *  a test network it reads the wallet's coins only for a request that asks
+   *  for the balance (the Bank's), so that the dish's own polls do not show
+   *  full nodes the wallet's address. The three wallet fields above are then
+   *  the ones kept from the last status that read it (see setFaucetReply),
+   *  or null when none did. False from an older node. */
+  walletSkipped: boolean;
   /** The node's coin listing was cut short (a flood of outputs): coins, ready
    *  and totalMojos cover the pages it read; the jar holds more. */
   partial: boolean;
@@ -92,6 +99,22 @@ export interface FaucetReply {
 }
 
 export type FaucetOp = 'status' | 'claim' | 'give';
+
+/** ⛓️ `st` as the store files it over `onFile`, the room's status on file on
+ *  the same network (or none). A status whose node left the wallet unread
+ *  (`walletSkipped`) says nothing about the wallet, so the figures on file
+ *  are kept: a dish poll landing after the Bank's read would otherwise blank
+ *  RECEIVE's balance until the next REFRESH. Any other status is filed as it
+ *  came, the wallet's absence included (no wallet loaded reads as null). */
+export function keepWalletFigures(st: FaucetStatus, onFile: FaucetStatus | null | undefined): FaucetStatus {
+  if (!st.walletSkipped || !onFile) return st;
+  return {
+    ...st,
+    walletMojos: onFile.walletMojos,
+    walletSpendableMojos: onFile.walletSpendableMojos,
+    walletPartial: onFile.walletPartial,
+  };
+}
 
 /** A request on its way to the node (NetworkProvider.requestFaucet). `seq` is
  *  the request's number on the wire, which the node echoes on the reply; it is
@@ -158,6 +181,7 @@ export function asFaucetStatus(raw: unknown): FaucetStatus | null {
     walletMojos: wallet,
     walletSpendableMojos: spendable ?? wallet,
     walletPartial: r.walletPartial === true,
+    walletSkipped: r.walletSkipped === true,
     partial: r.partial === true,
     note: typeof r.note === 'string' ? r.note : '',
     spending: r.spending === true,
@@ -364,7 +388,12 @@ export function faucetPendingUnanswered(roomId: string): string | null {
  *  ⛓️ A status on another Chia network than the one on file (the node was
  *  restarted on another network) clears the room's dish first: the old
  *  status, its snapshot numbering, its error and its pending action all
- *  belong to the other chain. */
+ *  belong to the other chain.
+ *
+ *  ⛓️ A status whose node left the wallet unread keeps the wallet figures
+ *  on file (keepWalletFigures). That happens off a test network only, where
+ *  no TAKE or GIVE is ever pending, so the judging below reads figures the
+ *  node sent with the status it judges. */
 export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number): void {
   if (roomId !== openRoom) return;
   const before = latest.get(roomId);
@@ -414,7 +443,9 @@ export function setFaucetReply(roomId: string, reply: FaucetReply, seq?: number)
     const newest = latestSnapshot.get(roomId) ?? 0;
     if (!(st.snapshot > 0 && st.snapshot < newest)) {
       if (st.snapshot > 0) latestSnapshot.set(roomId, st.snapshot);
-      latest.set(roomId, st);
+      // ⛓️ The status on file is on the same network by now (another
+      // network's was cleared above).
+      latest.set(roomId, keepWalletFigures(st, latest.get(roomId)));
     }
   }
   // Judge the pending action on the newest view there is: the status just
