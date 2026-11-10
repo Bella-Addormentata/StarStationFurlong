@@ -30,9 +30,11 @@
 //! is how many blocks into an era a kind's first write is due, secret, and
 //! the same after a restart, because it is computed again from the words.
 //!
-//! Nothing here is written to disk (§3.3, "No new secret on disk"): the node
-//! keeps only the wallet key, and R and the burner keys are computed when
-//! needed.
+//! Nothing here is written to disk (§3.3, "No new secret on disk"): the
+//! file holds only the wallet key, and R and the burner keys are computed
+//! again from it at each run. The publisher makes R and B once, when it
+//! starts, and holds them for its run (`chia_publish::PublisherKeys`); the
+//! listing's and the knocks' keys are made from R at each use.
 //!
 //! What the derivations pass through is wiped as well: in [`BurnerRoot::of`]
 //! the copy of W and the material W ‖ G (R itself goes straight into the
@@ -98,11 +100,13 @@ impl MoneyKey {
     }
 
     /// The wallet key, for the money spends, which take it as a plain
-    /// `SecretKey` today. The publisher reaches it only through its own
-    /// keys (`chia_publish::PublisherKeys::money`), which hold a `MoneyKey`
-    /// on a test network alone, for the writes the SSF wallet still pays
-    /// for there. Never for a burner's write: those take a [`BurnerKey`],
-    /// and no `SecretKey` makes one.
+    /// `SecretKey` today. The publisher's keys read it once where they are
+    /// made, on every network, for the wallet's payer, which is a puzzle
+    /// hash (`chia_publish::PublisherKeys::of`). After that the publisher
+    /// reaches it only through them (`PublisherKeys::money`), and they hold
+    /// a `MoneyKey` on a test network alone, for the writes that still
+    /// take the wallet key there. Never for a burner's write: those take a
+    /// [`BurnerKey`], and no `SecretKey` makes one.
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.0
     }

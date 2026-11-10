@@ -11,19 +11,30 @@
 //! - the SSF wallet's payer, which is a puzzle hash and no key ([`Payer`]),
 //!   for the rules that tell the wallet's own writes from a burner's;
 //! - and, on a test network only, the wallet key itself ([`MoneyKey`]), for
-//!   the writes the SSF wallet still pays for there: the listing, the
-//!   knocks and the beacon with burner keys off, and the room records of
-//!   Chia Mesh (v1), until the money key leaves the publisher (PR 12).
+//!   the writes that still take it there: with burner keys off, the listing
+//!   and the knocks, which the SSF wallet pays for, and the beacon, which
+//!   the beacon wallet pays for with the key made from it
+//!   ([`super::beacon_wallet_key`]); and the room records of Chia Mesh
+//!   (v1), until the money key leaves the publisher (PR 12).
 //!
-//! Off a test network the wallet key is dropped here and never reaches the
-//! heartbeat: [`PublisherKeys::money`] is the one way to it, and there it
-//! answers with the refusal the money writers themselves give
-//! ([`super::refuse_money_memo`]). So the publisher's task cannot sign a
-//! spend of the Bank's coins on mainnet, whatever its code does later: it
-//! holds no key that could. Neither R nor B gives the wallet key back
-//! (each is a blake3 derivation of it, one-way: [`BurnerRoot::of`],
-//! [`super::beacon_wallet_key`]), and a [`BurnerKey`] gives no `SecretKey`
-//! at all.
+//! Off a test network the wallet key is dropped here, so the heartbeat is
+//! handed none: [`PublisherKeys::money`] is the one way to it through the
+//! keys, and there it answers with the refusal the money writers
+//! themselves give ([`super::refuse_money_memo`]). Neither R nor B gives
+//! the wallet key back (each is a blake3 derivation of it, one-way:
+//! [`BurnerRoot::of`], [`super::beacon_wallet_key`]), and a [`BurnerKey`]
+//! gives no `SecretKey` at all.
+//!
+//! What this does not do. The node still holds the wallet key on every
+//! network, in the hub (`HubState::chia_wallet`, for the Bank and the
+//! faucet dish), and the heartbeat holds the hub, for the rooms and the
+//! contact key. So the split is in what the publisher is handed and in
+//! what its code reads, not in what the process could reach: no code in
+//! `chia_publish.rs` or the files under it reads the hub's wallet key, and
+//! a test reads their source for that and for each line that takes the
+//! wallet key out of these keys
+//! (`tests::the_publisher_reads_the_wallet_key_only_through_its_own_keys`).
+//! It is a reading of text, not a proof by types.
 //!
 //! Not typed here, and left to PR 12 with the v1 writer's removal: the
 //! money writers themselves (`build_publish_bundle`, `publish_memo_on`)
@@ -47,9 +58,11 @@ use crate::chia_network::ChiaNet;
 pub(crate) const NO_MONEY_KEY: &str = "the publisher holds no SSF wallet key, so the SSF wallet pays for no Phone Book write from it";
 
 /// The publisher's keys for one network (§3.4), made once from the wallet
-/// key ([`Self::of`]). It is neither `Clone` nor `Copy`: the heartbeat owns
-/// the one copy, and each copy of R would be one more to wipe
-/// ([`BurnerRoot`]). Nothing here prints a key ([`fmt::Debug`] below).
+/// key ([`Self::of`]) when the publisher starts and held for its run, on
+/// every network and with the beacon on or off. It is neither `Clone` nor
+/// `Copy`: the heartbeat owns the one copy, and each copy of R would be one
+/// more to wipe ([`BurnerRoot`]). Nothing here prints a key
+/// ([`fmt::Debug`] below).
 pub struct PublisherKeys {
     /// R for the network the keys were made for.
     root: BurnerRoot,
@@ -58,8 +71,8 @@ pub struct PublisherKeys {
     /// The SSF wallet's payer: a puzzle hash, as the marks, the knock book
     /// and the lease file it.
     money_payer: Payer,
-    /// The wallet key, only where the SSF wallet pays for a memo spend (a
-    /// test network).
+    /// The wallet key, only where the money writers do not refuse a memo
+    /// spend (a test network).
     money: Option<MoneyKey>,
 }
 
@@ -82,6 +95,19 @@ impl PublisherKeys {
     /// The network the keys were made for, which is R's.
     pub fn net(&self) -> ChiaNet {
         self.root.net()
+    }
+
+    /// These keys if they were made for `net`, and the words to stop with
+    /// if they were made for another network. The heartbeat asks it once,
+    /// of the process's network, before anything else: its files, its
+    /// lease and its peers are that network's, and so must be the keys'
+    /// root and their rule for the wallet key.
+    pub(crate) fn for_net(self, net: ChiaNet) -> Result<PublisherKeys, String> {
+        if self.net() == net {
+            Ok(self)
+        } else {
+            Err(format!("the publisher's keys were made for {} and this node runs on {}", self.net().name(), net.name()))
+        }
     }
 
     /// R, for the listing's keys and slots and the knocks' keys.
@@ -109,9 +135,11 @@ impl PublisherKeys {
         self
     }
 
-    /// The wallet key, for a write the SSF wallet pays for. Off a test
-    /// network there is none, and the answer is the money writers' own
-    /// refusal, in their words, with nothing read and nothing said.
+    /// The wallet key, for a write that takes it: one the SSF wallet pays
+    /// for, or the beacon off the burner path, whose key is made from it.
+    /// Off a test network there is none, and the answer is the money
+    /// writers' own refusal, in their words, with nothing read and nothing
+    /// said.
     pub(crate) fn money(&self) -> Result<&MoneyKey, MoneyMemoRefused> {
         self.money.as_ref().ok_or_else(|| MoneyMemoRefused(super::money_memo_refusal(self.net()).unwrap_or_else(|| NO_MONEY_KEY.to_string())))
     }
@@ -210,61 +238,150 @@ mod tests {
         }
     }
 
+    /// The keys are let by for the network they were made for and for no
+    /// other, and the words for another name both networks and no key.
+    #[test]
+    fn keys_made_for_another_network_are_not_let_by() {
+        let mut refused = 0;
+        for made in ChiaNet::ALL {
+            for runs in ChiaNet::ALL {
+                let w = wallet(11);
+                let payer = Payer::of(&w);
+                match PublisherKeys::of(made, w.clone()).for_net(runs) {
+                    Ok(keys) => {
+                        assert_eq!(made, runs, "{} keys on {}", made.name(), runs.name());
+                        assert_eq!((keys.net(), keys.money_payer()), (runs, payer), "the same keys");
+                        assert_eq!(keys.money.is_some(), runs.is_test());
+                    }
+                    Err(why) => {
+                        refused += 1;
+                        assert_ne!(made, runs);
+                        assert_eq!(why, format!("the publisher's keys were made for {} and this node runs on {}", made.name(), runs.name()));
+                        assert!(!why.contains(&payer.hex()[..16]) && !why.contains(&hex::encode(w.to_bytes())[..16]));
+                    }
+                }
+            }
+        }
+        assert_eq!(refused, ChiaNet::ALL.len() * (ChiaNet::ALL.len() - 1), "every pair of two networks was tried");
+    }
+
     /// The lines of `source`, trimmed, that are code (no comment line) and
     /// hold `what`.
     fn code_lines<'a>(source: &'a str, what: &str) -> Vec<&'a str> {
         source.lines().map(str::trim).filter(|line| !line.starts_with("//") && line.contains(what)).collect()
     }
 
-    /// The heartbeat is started with the publisher's keys and holds the
-    /// wallet key in no other way, read from the source as `chia_burner`'s
-    /// pin scan reads its own file:
-    /// - `main.rs` makes the keys from the wallet key on the process's
-    ///   network and hands the heartbeat those, not the key;
-    /// - the heartbeat's own parameters are the hub, the endpoint, the node
-    ///   key and the keys, and its network is the keys';
-    /// - in `chia_publish.rs`, outside its tests, the wallet key is taken
-    ///   out of the keys (`.secret_key()`) on four lines and no other, each
-    ///   of them a write the SSF wallet pays for, behind
-    ///   [`PublisherKeys::money`]: the knock and the beacon off the burner
-    ///   path, in their seams, and the listing off the burner path and the
-    ///   v1 room record, in the heartbeat;
-    /// - the keys keep the wallet key by the money writers' own rule.
+    /// What comes before a file's own `mod tests`.
+    fn code(source: &str) -> &str {
+        &source[..source.find("\nmod tests {").expect("the file's tests")]
+    }
+
+    /// The item of `source` that opens with `header`, up to the `}` that
+    /// closes it at the start of a line.
+    fn item<'a>(source: &'a str, header: &str) -> &'a str {
+        let start = source.find(header).unwrap_or_else(|| panic!("{header}"));
+        assert!(!source[start + header.len()..].contains(header), "{header} opens one item");
+        let len = source[start..].find("\n}\n").expect("the item's end");
+        &source[start..start + len]
+    }
+
+    /// What the source says of the wallet key and the publisher, read as
+    /// `chia_burner`'s pin scan reads its own file. It is a reading of
+    /// text and no proof: it pins the plain spellings below, so a change
+    /// to one of them fails here and has to say why.
+    /// - `main.rs`'s `start_publisher` makes the keys from the wallet key
+    ///   on the process's own network, and hands the heartbeat those and
+    ///   not the key; nothing else in `main.rs` names the keys.
+    /// - The heartbeat's own parameters are the hub, the endpoint, the node
+    ///   key and the keys. Its network is the process's, and the first
+    ///   thing it does with the keys is stop if they were made for another
+    ///   ([`PublisherKeys::for_net`]).
+    /// - The keys hold four things, a `SecretKey` is named in this file
+    ///   only where the keys are made, and the wallet key is kept by the
+    ///   money writers' own rule.
+    /// - In `chia_publish.rs`, outside its tests, the wallet key is taken
+    ///   out of the keys (`secret_key`, under any spelling) on four lines
+    ///   and no other, each behind [`PublisherKeys::money`]: the knock and
+    ///   the beacon off the burner path, in their seams, and the listing
+    ///   off the burner path and the v1 room record, in the heartbeat. In
+    ///   this file it is read once, for the wallet's payer. The other
+    ///   files under `chia_publish` (the claim-and-write, the foreign
+    ///   pause, the audit) never read it and never name the keys.
+    /// - None of those files reads the hub's wallet key (`.chia_wallet`),
+    ///   which the node holds on every network for the Bank and the dish.
+    /// - The wallet's payer and the beacon's key are read out of the keys
+    ///   on the lines below and no other. Two of them are the heartbeat's
+    ///   own, which no test runs: the payer text for the hint rule, and
+    ///   the payer the listing's burner writer is given.
     ///
-    /// A change that hands the heartbeat a `SecretKey` again, or reads the
-    /// wallet key somewhere new, fails here and has to say why.
+    /// What it does not see: the wallet key reached from a file outside
+    /// `chia_publish`, or the hub's field under another name.
     #[test]
-    fn the_heartbeat_holds_the_wallet_key_only_through_the_publishers_keys() {
-        // What comes before a file's own `mod tests`.
-        fn code(source: &str) -> &str {
-            &source[..source.find("\nmod tests {").expect("the file's tests")]
-        }
+    fn the_publisher_reads_the_wallet_key_only_through_its_own_keys() {
         let main = include_str!("../main.rs");
         let publish = code(include_str!("../chia_publish.rs"));
         let this = code(include_str!("keys.rs"));
+        let others = [
+            ("claim_write.rs", code(include_str!("claim_write.rs"))),
+            ("foreign_pause.rs", code(include_str!("foreign_pause.rs"))),
+            ("audit.rs", code(include_str!("audit.rs"))),
+        ];
 
+        // main.rs: the keys are made once, for the process's network.
         assert_eq!(code_lines(main, "PublisherKeys"), ["let keys = chia_publish::PublisherKeys::of(net, chia_sk);"]);
         assert_eq!(code_lines(main, "heartbeat_loop("), ["chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, keys).await;"]);
+        let start = item(main, "\nfn start_publisher(");
+        assert_eq!(code_lines(start, "let net = "), ["let net = chia_network::net();"], "the keys' network is the process's");
+        assert_eq!(code_lines(start, "PublisherKeys").len(), 1, "made in start_publisher");
+        assert_eq!(code_lines(start, "heartbeat_loop(").len(), 1, "handed over in start_publisher");
 
-        let lines: Vec<&str> = publish.lines().map(str::trim).collect();
-        let start = lines.iter().position(|line| *line == "pub async fn heartbeat_loop(").expect("the heartbeat");
-        assert_eq!(lines[start + 1..start + 6], ["hub: crate::SharedHub,", "iroh_ep: iroh::Endpoint,", "iroh_sk: iroh::SecretKey,", "keys: PublisherKeys,", ") {"]);
-        assert_eq!(code_lines(publish, "let net = "), ["let net = keys.net();"], "the heartbeat's network is the keys'");
+        // The heartbeat: what it is handed, its network, and the keys'.
+        let heartbeat = item(publish, "\npub async fn heartbeat_loop(");
+        let lines: Vec<&str> = heartbeat.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines[1..6], ["hub: crate::SharedHub,", "iroh_ep: iroh::Endpoint,", "iroh_sk: iroh::SecretKey,", "keys: PublisherKeys,", ") {"]);
+        assert_eq!(code_lines(heartbeat, "let net = "), ["let net = crate::chia_network::net();"], "the heartbeat's network is the process's");
+        assert_eq!(code_lines(heartbeat, "keys")[..2], ["keys: PublisherKeys,", "let keys = match keys.for_net(net) {"], "the keys are asked for the network first");
+        assert_eq!(code_lines(heartbeat, "for_net(").len(), 1);
 
-        assert_eq!(code_lines(publish, ".secret_key()"), [
+        // The keys: four fields, and no `SecretKey` but where they are made.
+        let fields = item(this, "\npub struct PublisherKeys {");
+        assert_eq!(code_lines(fields, ":"), ["root: BurnerRoot,", "beacon: BurnerKey,", "money_payer: Payer,", "money: Option<MoneyKey>,"]);
+        assert_eq!(code_lines(this, "SecretKey"), ["use chia_bls::SecretKey;", "pub fn of(net: ChiaNet, wallet: SecretKey) -> PublisherKeys {"]);
+        assert_eq!(code_lines(this, "then_some(money)"), ["money: super::money_memo_refusal(net).is_none().then_some(money),"]);
+        assert_eq!(code_lines(this, "MoneyKey::new("), ["let money = MoneyKey::new(wallet);"]);
+        assert_eq!(code_lines(this, "secret_key"), ["money_payer: Payer::of(money.secret_key()),"]);
+
+        // Where the wallet key is taken out of the keys.
+        assert_eq!(code_lines(publish, "secret_key"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix).await?",
             "Ok(money) => publish_node_presence(net, &iroh_sk, money.secret_key(), &hub.contact_key, era, &entries, now_unix).await,",
             "Ok(money) => publish_presence(&iroh_sk, money.secret_key(), &room_key, &addrs).await,",
         ]);
-        assert_eq!(code_lines(publish, "keys.money()"), [
+        assert_eq!(code_lines(publish, ".money()"), [
             "None => publish_knock_on(lease, net, client, now, iroh_sk, keys.money()?.secret_key(), gate, leave, req, room_key, era, now_unix).await?,",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix).await?",
             "None => match keys.money() {",
             "let published = match keys.money() {",
         ]);
+        assert_eq!(code_lines(publish, "keys.money_payer()"), [
+            "let money = keys.money_payer();",
+            "Some(root) => publish_knock_with(lease, fuse, net, client, now(), root, keys.money_payer(), iroh_sk, gate, leave, req, room_key, era, now_unix, rng).await?,",
+            "let money_payer = keys.money_payer().hex();",
+            "Some(root) => publish_burner_presence(net, root, keys.money_payer(), &iroh_sk, &hub.contact_key, era, &entries, now_unix).await,",
+        ]);
+        assert_eq!(code_lines(publish, "keys.beacon()"), ["publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, rng).await?"]);
+        for (name, other) in others {
+            for what in ["secret_key", ".money()", "PublisherKeys"] {
+                assert_eq!(code_lines(other, what), [""; 0], "{name}: {what}");
+            }
+        }
 
-        assert_eq!(code_lines(this, "then_some(money)"), ["money: super::money_memo_refusal(net).is_none().then_some(money),"]);
-        assert_eq!(code_lines(this, "MoneyKey::new("), ["let money = MoneyKey::new(wallet);"]);
+        // The hub's wallet key is read by none of them.
+        for (name, source) in [("chia_publish.rs", publish), ("keys.rs", this)].into_iter().chain(others) {
+            assert_eq!(code_lines(source, ".chia_wallet"), [""; 0], "{name} reads the hub's wallet key");
+        }
+        // The scan sees the field where it is: main.rs sets it.
+        assert!(!code_lines(main, ".chia_wallet").is_empty());
     }
 }
