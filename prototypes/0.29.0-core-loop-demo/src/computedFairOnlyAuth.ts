@@ -101,6 +101,10 @@ export interface AuthRecords {
   cks: Iterable<readonly [string, unknown]>;
   xfs: Iterable<readonly [string, unknown]>;
   fin?: unknown;
+  /** More end orders to look at as `fin` is: ones the caller counted before and
+   *  keeps while the doc has lost them (a page holds what its game stood on, and
+   *  puts it back). An order proves itself, so where it comes from is nothing. */
+  fins?: Iterable<unknown>;
   delegations?: Iterable<unknown>;
 }
 
@@ -328,8 +332,10 @@ export function resolveGame(env: AuthEnv, t: string, inc: string, rec: AuthRecor
   if (base) {
     const finCandidates: FinRec[] = [];
     if (base.ck.f) finCandidates.push(base.ck.f);
-    const own = asFin(rec.fin);
-    if (own) finCandidates.push(own);
+    for (const raw of [rec.fin, ...(rec.fins ?? [])]) {
+      const own = asFin(raw);
+      if (own) finCandidates.push(own);
+    }
     for (const f of finCandidates) {
       if (!holds(f.k, base.ck.u)) continue;
       const fh = recHash(f);

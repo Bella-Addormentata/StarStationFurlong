@@ -500,7 +500,7 @@ describe('what a page takes for a FAIR ONLY game, and what is junk to it', () =>
     expect(chips(a, A)).toBe(now);
   });
 
-  it('what is something to the resolver moves the game, written or deleted: a transfer, an end order', async () => {
+  it('what is something to the resolver moves the game when it is written, and no more when it is deleted or written over: a transfer, an end order', async () => {
     const { page: a } = await openedPage();
     const res = () => a.casino.computedResolutionOf(T, P.inc)!;
     const first = res();
@@ -508,18 +508,24 @@ describe('what a page takes for a FAIR ONLY game, and what is junk to it', () =>
     put(a, xf);
     expect(res()).not.toBe(first);
     expect(res().holder).toBe(buyer.pub);
+    // deleted, or junk over it: the page counted it and holds it (PR 6c-4b-2), and the game is the buyer's still
     a.doc.transact(() => casinoComputed(a).delete(xf.key));
-    expect(res().holder).toBe(owner.pub);
+    expect(res().holder).toBe(buyer.pub);
+    put(a, { key: xf.key, value: { junk: 1 } });
+    expect(res().holder).toBe(buyer.pub);
     const fin = sealFin(P, owner.pub, owner.sign);
     put(a, fin);
     expect(res().fin).toEqual(fin.value);
     a.doc.transact(() => casinoComputed(a).delete(fin.key));
-    expect(res().fin).toBeNull();
-    // junk over a good record is a record gone
-    put(a, xf);
-    expect(res().holder).toBe(buyer.pub);
-    put(a, { key: xf.key, value: { junk: 1 } });
-    expect(res().holder).toBe(owner.pub);
+    expect(res().fin).toEqual(fin.value);
+    put(a, { key: fin.key, value: { junk: 1 } });
+    expect(res().fin).toEqual(fin.value);
+    // a page that binds the doc as it is now never counted either: the game is the owner's there, with no end order
+    const b = await loadPage(2);
+    const copyDoc = new Y.Doc();
+    Y.applyUpdate(copyDoc, Y.encodeStateAsUpdate(a.doc));
+    b.casino.bindCasinoDoc(copyDoc, ROOM);
+    expect(b.casino.computedResolutionOf(T, P.inc)).toMatchObject({ holder: owner.pub, fin: null });
   });
 });
 
@@ -633,7 +639,7 @@ describe('the base a page counts from', () => {
     expect(b.casino.readChips(A.pid)).toBe(100);
   });
 
-  it('keeps what it counted while a transfer puts it out of range, and goes on from it when the transfer is gone', async () => {
+  it('keeps what it counted while a transfer puts it out of range, and the transfer deleted puts nothing back in range', async () => {
     const { page: a } = await openedPage();
     const trim = trimOf(P, 'p'); // round 3, the owner's house
     trimTo(a, P, trim, [kit.slip(A, 4, [red(6)])]);
@@ -647,10 +653,10 @@ describe('the base a page counts from', () => {
     put(a, xf);
     expect(a.casino.computedResolutionOf(T, P.inc)).toMatchObject({ holder: buyer.pub, base: null, live: false });
     expect(chips(a, A)).toBe(100);
-    // the transfer gone: the game is the owner's again, and the page still has the trim
+    // the transfer deleted: the page counted it and holds it (PR 6c-4b-2), so the game is the buyer's still
     a.doc.transact(() => casinoComputed(a).delete(xf.key));
-    expect(a.casino.computedResolutionOf(T, P.inc)!.base?.key).toBe(trim.key);
-    expect(chips(a, A)).toBe(100 + 25 - 6);
+    expect(a.casino.computedResolutionOf(T, P.inc)).toMatchObject({ holder: buyer.pub, base: null, live: false });
+    expect(chips(a, A)).toBe(100);
   });
 
   it('a higher checkpoint takes over from the one it held, and is the one it holds then', async () => {
@@ -1073,10 +1079,17 @@ describe('which houses decide a round', () => {
     expect(chips(page, A)).toBe(100 + netOf(decided, A));
     expect(chips(page, B)).toBe(100 + netOf(decided, B));
     expect(netOf(decided, A)).not.toBe(0);
-    // and deleted again, it decides no more
+    // and deleted again, it decides still: the page holds the delegation its count stands on (PR 6c-4b-2)
     page.doc.transact(() => casinoComputed(page).delete(delegationKey(house2.pub)));
-    expect(chips(page, A)).toBe(100 - 10);
-    expect(chips(page, B)).toBe(100 - 5);
+    expect(chips(page, A)).toBe(100 + netOf(decided, A));
+    expect(chips(page, B)).toBe(100 + netOf(decided, B));
+    // a page that binds the doc as it is now never counted it: the round is undecided there
+    const late = await loadPage(2);
+    const copyDoc = new Y.Doc();
+    Y.applyUpdate(copyDoc, Y.encodeStateAsUpdate(page.doc));
+    late.casino.bindCasinoDoc(copyDoc, ROOM);
+    expect(late.casino.readChips(A.pid)).toBe(100 - 10);
+    expect(late.casino.readChips(B.pid)).toBe(100 - 5);
   });
 
   it('on a page bound to a doc that holds the delegation already, the round it decides counts', async () => {
@@ -1166,7 +1179,7 @@ describe('which houses decide a round', () => {
     expect(chips(a, B)).toBe(100 - 5);
   });
 
-  it('a delegation overwritten by junk takes its house away, and put back brings it', async () => {
+  it('a delegation overwritten by junk takes no house away from a page that counted it', async () => {
     const page = await loadPage(1);
     page.casino.buyInChips(A.pid, 100);
     page.casino.buyInChips(B.pid, 100);
@@ -1179,7 +1192,7 @@ describe('which houses decide a round', () => {
     put(page, dl);
     expect(chips(page, A)).toBe(100 + netOf(decided, A));
     put(page, { key: dl.key, value: { junk: 1 } });
-    expect(chips(page, A)).toBe(100 - 10);
+    expect(chips(page, A)).toBe(100 + netOf(decided, A));
     put(page, dl);
     expect(chips(page, A)).toBe(100 + netOf(decided, A));
   });

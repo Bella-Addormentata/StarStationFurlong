@@ -154,6 +154,8 @@ import {
   computedCommitHouse,
   computedEndedIncs,
   computedFairOnlyBytes,
+  computedFairOnlyRecoveries,
+  computedFairOnlyReturns,
   computedFoldOf,
   computedGameMovesOf,
   computedRedecide,
@@ -190,6 +192,7 @@ import {
   notifyCasinoView,
   ownerRunChosen,
   putBackHouseRecords,
+  putBackFairOnlyRecords,
   putComputedSwitchBack,
   readAllBets,
   readAllCrapsBets,
@@ -200,6 +203,7 @@ import {
   readSeats,
   readTableState,
   reopenComputedSession,
+  reopenFairOnlySession,
   restoreComputedCheckpoint,
   switchIncOf,
   switchLeft,
@@ -214,7 +218,7 @@ import {
   writeHouseSum,
   writeOwnerRunChosen,
 } from './casinoDoc';
-import type { ComputedRecovery, EndedComputed, RecoveryTrigger } from './casinoDoc';
+import type { ComputedRecovery, EndedComputed, FairOnlyRecovery, RecoveryTrigger } from './casinoDoc';
 import {
   abandonKey, asAbandon, asClose, asForfeit, asHouseCommit, asHouseReveal, asReveal, asSlipFor, canon, closeKey, dutyRank,
   forfeitKey, gameOfInc, houseCommitKey, houseRevealKey, houseRules, isPub, MAX_CHECKPOINT_PIDS, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_SLIP_BETS, MAX_TABLE_PID_BYTES, MAX_TABLE_PIDS, nextSid, parseKey,
@@ -336,6 +340,18 @@ export const JUNK_GAP_MS = 1_000;
  *  a page that stopped would leave the table to it. */
 export const CONTESTED_COUNT = 3;
 export const CONTESTED_CALM_MS = 60_000;
+/** 🔒 A page that has seen a FAIR ONLY game's records put back CONTESTED_COUNT
+ *  times within CONTESTED_CALM_MS, by itself or by another page, and finds
+ *  them gone again, puts none of that game back for this long (design B12, as
+ *  an owner-signed checkpoint's put-back stands down: casinoDoc
+ *  putBackHouseRecords), and says so on its ⚙ card (computedContested). It
+ *  loses nothing by waiting: it holds the records and counts from them
+ *  whatever the doc does, and what a put-back is for is the pages that come
+ *  later. A checkpoint weighs up to MAX_CHECKPOINT_BYTES, and a peer that
+ *  deletes one costs itself a few bytes: were each page to count only its own
+ *  put-backs, a room of n pages would send CONTESTED_COUNT × n checkpoints for
+ *  it before the last stood down. */
+export const KEEP_BACKOFF_MS = 600_000;
 
 /** A round a forfeit decided shows its result this long after the grace on
  *  this page ran out: every page has seen the seeds it was going to see. */
@@ -716,6 +732,8 @@ function lookAtClock(now: number): void {
     recovering.clear();
     recoveredAt = null;
     recoveryRanks.clear();
+    keeping.clear();
+    keptAt = null;
     clock.gen += 1;
     clock.inAt = null;
   }
@@ -2812,6 +2830,7 @@ export function tickComputedTables(tables: Iterable<ComputedTableRef>, now = Dat
   awayDuty(inRoom, now);
   compactDuty(getIdentityPub(), now);
   recoverDuty(getIdentityPub(), now);
+  fairKeepDuty(getIdentityPub(), now);
   houseDuty(now);
 }
 
@@ -4416,7 +4435,7 @@ function recoverDuty(pub: string, now: number): void {
 /** This page's turn for a duty among an incarnation's keys: STAGGER_MS a
  *  place (RECOVERY_PLACES at most), and OUTSIDER_WAIT_MS more for a page
  *  with none of them. */
-function turnOf(duty: Duty, r: ComputedRecovery, round: number, pub: string): number {
+function turnOf(duty: Duty, r: { ctx: FoldCtx; pubs: string[] }, round: number, pub: string): number {
   const idx = placeOf(duty, r.ctx, round, r.pubs, pub, recoveryRanks);
   return Math.min(idx, RECOVERY_PLACES) * STAGGER_MS + (idx >= r.pubs.length ? OUTSIDER_WAIT_MS : 0);
 }
@@ -4499,12 +4518,151 @@ function giveUpStep(w: Recovering, r: ComputedRecovery, now: number): void {
   if (giveUpComputed(r.t, r.inc)) w.lostAt = null;
 }
 
+/** What the put-back duty of a FAIR ONLY game's records waits out, on this
+ *  page's clock (by `<tableId>:<inc>`). */
+interface Keeping {
+  t: string;
+  inc: string;
+  /** Since when this page sees records of the game missing with none put back
+   *  meanwhile (null: none missing), and the map of its live session (null: not
+   *  missing). */
+  at: number | null;
+  missingAt: number | null;
+  /** casinoDoc computedFairOnlyReturns of the game as this page last read it,
+   *  and when it read each put-back since (its own and other pages'), within
+   *  CONTESTED_CALM_MS. */
+  seen: number;
+  back: number[];
+  /** This page's last put-back of the game (JUNK_GAP_MS; null: none). */
+  wroteAt: number | null;
+  /** It puts none back until then (KEEP_BACKOFF_MS; 0: never stood down). */
+  until: number;
+}
+const keeping = new Map<string, Keeping>();
+/** When the put-back duty last looked (at most every TICK_MS). */
+let keptAt: number | null = null;
+
+/**
+ * 12. 🔒 Put back what a peer deleted, or wrote junk over, of the records a
+ * FAIR ONLY game stands on (design §8.4 P2), of every game this page holds
+ * something of: the checkpoint it counts the game from (an ended game's too:
+ * its nets stand on it), and while the game is live the transfers of its
+ * chain, the end order standing and the delegations of its houses (casinoDoc
+ * computedFairOnlyRecoveries has which, and when one is missing). The page
+ * counts from what it holds meanwhile, so nothing waits on this: it is for the
+ * pages that come later, which can count nothing of a game whose base the doc
+ * lacks.
+ * - **The records**: at once, in turn (dutyRank('restore') among the signers of
+ *   the game's staked felts, STAGGER_MS a place; a page with no felt there
+ *   OUTSIDER_WAIT_MS later; the turns start again each time the records come
+ *   back and go), JUNK_GAP_MS after this page's last put-back of the game at
+ *   the earliest. Every page writes the values the doc held, under the keys it
+ *   held them at. After CONTESTED_COUNT put-backs within CONTESTED_CALM_MS
+ *   that did not last, whichever pages made them (casinoDoc counts every
+ *   put-back the page's doc sees, computedFairOnlyReturns), none for
+ *   KEEP_BACKOFF_MS: the room stands down together.
+ * - **The live session's map**, gone with the game live: an empty one
+ *   OPEN_WAIT_MS on, in turn (dutyRank('open')), with the room heard all the
+ *   while, as at a page-signed table (recoverDuty: two pages that made one at
+ *   the same moment would lose the records put into one of them); the records'
+ *   authors and witnesses put them back into it (reputDuty, witnessDuty).
+ * On an awake page with the room's state in and its doc whole; a frame that
+ * isn't starts the waits again. Not on a frame whose doc was bound afresh since
+ * this page looked at its clock. Nothing is signed, and nothing is given up: a
+ * page holds what it counted for as long as it is bound.
+ */
+function fairKeepDuty(pub: string, now: number): void {
+  if (keptAt !== null && now >= keptAt && now - keptAt < TICK_MS) return;
+  keptAt = now;
+  if (casinoDocEpoch() !== clock.epoch) return;
+  const games = computedFairOnlyRecoveries();
+  // (No game lacks anything, and none did of late: nothing to ask this page's
+  // clock or its doc about. A room with no FAIR ONLY game stops here.)
+  if (games.length === 0 && keeping.size === 0) return;
+  const ready = roomStateIn(now) && tablesAwake(now) && casinoWhole();
+  const listed = new Set<string>();
+  for (const r of games) {
+    const key = `${r.t}:${r.inc}`;
+    listed.add(key);
+    let w = keeping.get(key);
+    // (What came back before this page first saw the game lacking is not counted: when is not known.)
+    if (!w) keeping.set(key, w = { t: r.t, inc: r.inc, at: null, missingAt: null, seen: r.returns, back: [], wroteAt: null, until: 0 });
+    const came = noteReturns(w, r.returns, now);
+    if (!ready) {
+      w.at = null;
+      w.missingAt = null;
+      continue;
+    }
+    if (came) w.at = null;
+    keepStep(w, r, pub, now);
+    openStep(w, r, pub, now);
+  }
+  // (A game with nothing missing is not listed: its waits are over, and what
+  // is left of it is how often its records came back of late.)
+  for (const [key, w] of [...keeping]) {
+    if (listed.has(key)) continue;
+    noteReturns(w, computedFairOnlyReturns(w.t, w.inc), now);
+    w.at = null;
+    w.missingAt = null;
+    w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
+    if (w.back.length === 0 && now >= w.until) keeping.delete(key);
+  }
+}
+
+/** Count the put-backs of the game since this page last read them (`returns`:
+ *  casinoDoc computedFairOnlyReturns), each as of now: a look is TICK_MS after
+ *  the one before at the most on an awake page. Whether there was one. No more
+ *  than CONTESTED_COUNT of a look are kept: more say nothing more. */
+function noteReturns(w: Keeping, returns: number, now: number): boolean {
+  const came = returns - w.seen;
+  w.seen = returns;
+  for (let i = 0; i < Math.min(came, CONTESTED_COUNT); i++) w.back.push(now);
+  return came > 0;
+}
+
+function keepStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
+  if (r.missing === 0) {
+    w.at = null;
+    return;
+  }
+  if (w.at === null || w.at > now) w.at = now;
+  // (A clock gone back leaves no stand-down longer than one.)
+  if (w.until > now + KEEP_BACKOFF_MS) w.until = now + KEEP_BACKOFF_MS;
+  if (now < w.until) return;
+  w.back = w.back.filter((at) => at <= now && now - at < CONTESTED_CALM_MS);
+  if (w.back.length >= CONTESTED_COUNT) {
+    w.until = now + KEEP_BACKOFF_MS;
+    w.back = [];
+    notifyCasinoView(r.t);
+    return;
+  }
+  // (The turns of a room that stood down start when it is over: every page's wait ran out meanwhile.)
+  if (now < Math.max(w.at, w.until) + turnOf('restore', r, r.u, pub)) return;
+  if (w.wroteAt !== null && w.wroteAt <= now && now < w.wroteAt + JUNK_GAP_MS) return;
+  if (putBackFairOnlyRecords(r.t, r.inc) > 0) w.wroteAt = now;
+}
+
+function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): void {
+  if (!r.sessionMissing) {
+    w.missingAt = null;
+    return;
+  }
+  if (w.missingAt === null || w.missingAt > now) w.missingAt = now;
+  if (now < w.missingAt + OPEN_WAIT_MS + turnOf('open', r, r.u, pub) || !heardThrough(now - OPEN_WAIT_MS, now)) return;
+  if (reopenFairOnlySession(r.t, r.inc)) w.missingAt = null;
+}
+
 /** 🚩 Whether this page's restores of table `t`'s checkpoint keep being
  *  written over: CONTESTED_COUNT in a row, the last CONTESTED_CALM_MS ago at
- *  most. It goes on putting the head back all the same. */
+ *  most. It goes on putting the head back all the same. 🔒 At a FAIR ONLY game:
+ *  whether the put-backs of the game's records did not last, its own or
+ *  another page's, and it has stood down from them (KEEP_BACKOFF_MS). */
 export function computedContested(t: string, now = Date.now()): boolean {
   const inc = computedIncOf(t);
-  const w = inc === null ? undefined : recovering.get(`${t}:${inc}`);
+  if (inc === null) return false;
+  const k = keeping.get(`${t}:${inc}`);
+  if (k && now < k.until && k.until - now <= KEEP_BACKOFF_MS) return true;
+  const w = recovering.get(`${t}:${inc}`);
   return !!w && w.overAt !== null && w.overwrites >= CONTESTED_COUNT && w.overAt <= now && now - w.overAt <= CONTESTED_CALM_MS;
 }
 

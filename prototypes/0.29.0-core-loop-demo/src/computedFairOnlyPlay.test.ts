@@ -335,7 +335,7 @@ describe('when a game pauses its closes', () => {
     expect(ROOM).toBe(384 * 1024);
   });
 
-  it('a standing fin: the bets stay, no close comes, and one does when the order is gone', async () => {
+  it('a standing fin: the bets stay, no close comes, and none does when a peer deletes the order (the pages hold it, and it is put back)', async () => {
     const pages = await betting();
     const [a, b] = pages;
     const fin = sealFin(G, owner.pub, owner.sign);
@@ -349,8 +349,12 @@ describe('when a game pauses its closes', () => {
     }
     b.doc.transact(() => top(b).delete(fin.key));
     sync(late, ...pages);
-    run(pages, late + STEP, late + 30_000, { step: STEP, until: () => keysIn(a, 'c', 1).length > 0 });
-    expect(closesOf(a, 1).length).toBeGreaterThan(0);
+    for (const p of pages) expect(p.casino.computedResolutionOf(TABLE, G.inc)).toMatchObject({ live: true, fin: { k: owner.pub } });
+    run(pages, late + STEP, late + 30_000, { step: STEP });
+    for (const p of pages) {
+      expect(keysIn(p, 'c')).toEqual([]);
+      expect(top(p).get(fin.key)).toEqual(fin.value);
+    }
   });
 });
 

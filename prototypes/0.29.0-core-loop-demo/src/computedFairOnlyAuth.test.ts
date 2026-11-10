@@ -585,6 +585,37 @@ describe('ends and end orders (S5, S7)', () => {
     // no base: nothing to hold it against
     expect(resolve('p', [finBy(owner)]).res.fin).toBeNull();
   });
+
+  it('an end order the caller holds stands where the doc has none that does: after the doc\'s own, each one held in turn, and what is no order of a holder\'s passed over', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p'); // u = 3
+    // (at the round of the sale the seller and the buyer both hold the game: an order of either stands)
+    const xf = xferOf(P, owner, buyer, 3);
+    const mine = sealFin(P, owner.pub, owner.sign);
+    const theirs = sealFin(P, buyer.pub, buyer.sign);
+    const strangers = sealFin(P, stranger.pub, stranger.sign);
+    const forged = { ...mine.value, g: BAD_SIG };
+    const held = (entries: Entry[], fins: unknown[] | undefined, hold: string[] = []) =>
+      resolveGame(authEnv({ hold }).env, T, P.inc, { ...recordsOf(entries), fins });
+    expect(held([root, trim], [mine.value])).toMatchObject({ fin: mine.value, live: true, pending: false, invalid: [] });
+    // the doc's own is named before one held
+    expect(held([root, trim, xf, theirs], [mine.value]).fin).toEqual(theirs.value);
+    expect(held([root, trim, xf, mine], [theirs.value]).fin).toEqual(mine.value);
+    // what the doc has at the key does not stand: the one held does
+    expect(held([root, trim, { key: mine.key, value: { junk: 1 } }], [mine.value]).fin).toEqual(mine.value);
+    expect(held([root, trim, strangers], [mine.value]).fin).toEqual(mine.value);
+    expect(held([root, trim, { key: mine.key, value: forged }], [mine.value]).fin).toEqual(mine.value);
+    // among those held: junk, nothing, a stranger's and a forged one are passed over, and the first that stands is named
+    expect(held([root, trim, xf], [{ junk: 1 }, undefined, strangers.value, forged, theirs.value, mine.value]).fin).toEqual(theirs.value);
+    expect(held([root, trim], [forged]).fin).toBeNull();
+    expect(held([root, trim], [strangers.value]).fin).toBeNull();
+    // one put off is no end order yet
+    expect(held([root, trim], [mine.value], [hashOf(mine)])).toMatchObject({ fin: null, pending: true });
+    // none held, and no base to hold one against
+    expect(held([root, trim], []).fin).toBeNull();
+    expect(held([root, trim], undefined).fin).toBeNull();
+    expect(held([], [mine.value]).fin).toBeNull();
+  });
 });
 
 describe('what is not yet checked (pending)', () => {
