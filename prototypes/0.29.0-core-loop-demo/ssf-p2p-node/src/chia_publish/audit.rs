@@ -25,9 +25,12 @@
 //!   the lease with its entry lost, or reads from the chain that the key
 //!   already knocked (`super::audit_knock`, [`AuditBook::knock`]). A knock
 //!   that waits or fails names nothing, since its key holds nothing. A
-//!   knock an earlier run wrote is named only if this run is asked for it
-//!   again; otherwise its puzzle hash is the `payer` of its entry in
-//!   `knocks.json`, which keeps an entry for its era and the one after
+//!   knock an earlier run wrote is not named again while the knock book
+//!   holds it: the arm skips a request for that host before its step
+//!   (`super::knock_skipped`), so a later run names it only where the
+//!   book lost the entry and the knock is asked for again. Its puzzle
+//!   hash is otherwise the `payer` of its entry in `knocks.json`, which
+//!   keeps an entry for its era and the one after
 //!   (`chia_knock::KnockBook::prune`). So the knock keys of a drill need
 //!   the switch on in the runs that write them;
 //! - the beacon's key B, when the wallet loads with the beacon on

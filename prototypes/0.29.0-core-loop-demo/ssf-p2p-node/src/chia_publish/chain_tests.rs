@@ -6429,7 +6429,10 @@ async fn the_audits_line_for_an_eras_listing_key_names_the_address_that_eras_lis
 ///   nothing more in this run, and names the same key in a new run, but
 ///   not for another host's request and not off the burner path;
 /// - once it has settled, asked for again, it reads as already knocked by
-///   its key: nothing more in this run, the same line in a new one.
+///   its key: nothing more in this run, the same line in a new one. The
+///   step is asked here as a run whose knock book lost the entry asks it:
+///   with the entry there the arm skips the request before the step
+///   (`knock_skipped`).
 ///
 /// With the audit off none of these names anything.
 #[tokio::test]

@@ -5797,7 +5797,9 @@ pub(crate) fn knock_burner(
 ///   ([`knock_burner`]) as its payer;
 /// - a knock the chain shows that K(h) already wrote
 ///   (`claim_write::AlreadyKnocked`), as one an earlier run wrote reads
-///   when it is asked for again.
+///   when it is asked for again with its entry gone from the knock book.
+///   With the entry there the arm skips the request before the step
+///   ([`knock_skipped`]), and nothing is named.
 ///
 /// Nothing for a knock that waited, failed or was withdrawn, since its key
 /// holds nothing; nothing for one the SSF wallet paid for, written or
