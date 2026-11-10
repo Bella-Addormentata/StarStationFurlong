@@ -2780,9 +2780,19 @@ pub const PRESENCE_CONFIRM_TIMEOUT_SECS: u64 = 30 * 60;
 /// T2 of stage 4 design §4.3, coming online late: a run whose first agreed
 /// peak in an era is already at or past the listing's slot writes the era's
 /// first listing after a delay of 0 to this many blocks, about an hour at
-/// 18.75 s a block, drawn once for the era ([`ListingClock`]). Burner path
-/// only.
+/// 18.75 s a block, drawn once for the era ([`ListingClock`]). A run that
+/// comes back from an absence ([`AWAY_GAP_BLOCKS`]) with that write's block
+/// passed draws the delay afresh. Burner path only.
 pub const LATE_START_MAX_BLOCKS: u32 = 192;
+/// 🕳️ T2 for a run that was away: how many blocks may lie between two
+/// agreed peaks a slot's clock is shown before the run counts as having
+/// been away in between: a machine that slept, a lane that was cut off, a
+/// listing that was switched off. About ten minutes, well above the
+/// heartbeat's one-minute tick and the 90 seconds an agreed peak may age.
+/// Back from an absence with its slot (or its late start) passed, a clock
+/// draws a late start from the peak it came back at ([`note_peak`]): a
+/// write on the first tick after waking would date the waking on the chain.
+pub const AWAY_GAP_BLOCKS: u32 = 32;
 /// T3 of §4.3, an address or flag change: once the debounce has passed
 /// ([`ADDR_CHANGE_DEBOUNCE_SECS`], counted from the last write as the SSF
 /// wallet's clock counts it), the change is written after a further 0 to
@@ -3242,7 +3252,7 @@ pub(crate) enum ListingWait {
     /// T1: the era's slot, while last era's listing is still read.
     Slot,
     /// T2: a late start, drawn because this run first saw the era at or past
-    /// its slot.
+    /// its slot, or came back from an absence with the write's block passed.
     LateStart,
     /// T3: an address or flag change, waiting its debounce and jitter.
     Change,
@@ -3430,13 +3440,47 @@ fn late_due_at(first_peak: u32, d: u32, era: u64) -> u64 {
     (first + u64::from(d)).min(latest)
 }
 
-/// The first agreed peak this run saw in an era, and the late start drawn
-/// for it (T2), if it was at or past the era's slot.
+/// The agreed peak a slot's clock counts an era from, and the late start
+/// drawn for it (T2). It is the first one this run saw in the era, with a
+/// late start if that was at or past the era's slot; or, for a run that
+/// came back from an absence with its write's block passed, the peak it
+/// came back at, with a late start drawn then ([`note_peak`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FirstPeak {
     era: u64,
     peak: u32,
     late: Option<u32>,
+}
+
+/// Notes `peak`, an agreed peak in era `era`, on a slot's clock: `first`
+/// is the clock's [`FirstPeak`], `last` the last agreed peak it was shown,
+/// and `slot` the blocks into the era its write is due at (T1, T5).
+/// - The first peak the run sees in an era is kept, with a late start of 0
+///   to [`LATE_START_MAX_BLOCKS`] blocks drawn for it if it is at or past
+///   the slot (T2).
+/// - A later peak of the era changes nothing, unless the run was away
+///   since the last one (more than [`AWAY_GAP_BLOCKS`] blocks between the
+///   two) and the block its write was due at has passed meanwhile: the
+///   slot, or the end of a late start already drawn. The late start is
+///   then drawn afresh, counted from this peak. Without that, a machine
+///   that saw the era before its slot and slept past it would write on its
+///   first tick awake.
+///
+/// The clock cannot tell whether the era's write is still owed. That is
+/// its callers' to know: the slot's wait is asked only for an era's first
+/// write, so a draw made after that write went out holds nothing.
+fn note_peak<R: rand::Rng + ?Sized>(first: &mut Option<FirstPeak>, last: &mut Option<u32>, era: u64, peak: u32, slot: u64, rng: &mut R) {
+    let slot_at = era_start(era).saturating_add(slot);
+    let now = u64::from(peak);
+    let away = last.is_some_and(|l| now > u64::from(l) + u64::from(AWAY_GAP_BLOCKS));
+    *last = Some(peak);
+    let late = match first.filter(|f| f.era == era) {
+        None => now >= slot_at,
+        Some(FirstPeak { peak: counted_from, late: Some(d), .. }) if away && now >= late_due_at(counted_from, d, era) => true,
+        Some(FirstPeak { late: None, .. }) if away && now >= slot_at => true,
+        Some(_) => return,
+    };
+    *first = Some(FirstPeak { era, peak, late: late.then(|| rng.gen_range(0..=LATE_START_MAX_BLOCKS)) });
 }
 
 /// A change waiting its jitter (T3): the address set it is for (with the
@@ -3470,27 +3514,27 @@ struct BurnerPayerText {
 #[derive(Default)]
 pub(crate) struct ListingClock {
     first: Option<FirstPeak>,
+    /// The last agreed peak the clock was shown, in whatever era: what an
+    /// absence is told by ([`note_peak`]).
+    last_peak: Option<u32>,
     change: Option<ChangeSeen>,
     burner: Option<BurnerPayerText>,
 }
 
 impl ListingClock {
     /// Notes `peak`, an agreed peak in era `era`, whose listing's slot is
-    /// `slot` blocks into the era. The first one this run sees in an era is
-    /// kept, with a late start drawn for it if it is at or past the slot
-    /// (T2); later peaks of the era change nothing. A new era also drops a
-    /// change of another era, so a change pending at the boundary does not
-    /// fire on the new era's first tick.
+    /// `slot` blocks into the era ([`note_peak`]). The first one this run
+    /// sees in an era is kept, with a late start drawn for it if it is at
+    /// or past the slot (T2); later peaks of the era change nothing, but
+    /// for a run back from an absence with the write's block passed, which
+    /// draws a late start from the peak it came back at. A new era also
+    /// drops a change of another era, so a change pending at the boundary
+    /// does not fire on the new era's first tick.
     fn see_peak<R: rand::Rng + ?Sized>(&mut self, era: u64, peak: u32, slot: u64, rng: &mut R) {
         if self.change.as_ref().is_some_and(|c| c.era != era) {
             self.change = None;
         }
-        if self.first.is_some_and(|f| f.era == era) {
-            return;
-        }
-        let into = u64::from(peak).saturating_sub(era_start(era));
-        let late = (into >= slot).then(|| rng.gen_range(0..=LATE_START_MAX_BLOCKS));
-        self.first = Some(FirstPeak { era, peak, late });
+        note_peak(&mut self.first, &mut self.last_peak, era, peak, slot, rng);
     }
 
     /// What the era's first write still waits for at `peak` (T1, T2), or
@@ -5313,21 +5357,21 @@ fn beacon_guard(net: crate::chia_network::ChiaNet, file: &std::path::Path, seen:
 #[derive(Default, Debug)]
 pub(crate) struct BeaconClock {
     first: Option<FirstPeak>,
+    /// The last agreed peak the clock was shown: what an absence is told
+    /// by ([`note_peak`]).
+    last_peak: Option<u32>,
 }
 
 impl BeaconClock {
     /// Notes `peak`, an agreed peak in era `era`, whose beacon slot is
-    /// `slot` blocks into the era. The first one this run sees in an era is
-    /// kept, with a late start of 0 to [`LATE_START_MAX_BLOCKS`] blocks
-    /// drawn for it if it is at or past the slot; later peaks of the era
-    /// change nothing.
+    /// `slot` blocks into the era ([`note_peak`]). The first one this run
+    /// sees in an era is kept, with a late start of 0 to
+    /// [`LATE_START_MAX_BLOCKS`] blocks drawn for it if it is at or past
+    /// the slot; later peaks of the era change nothing, but for a run back
+    /// from an absence with the beacon's block passed, which draws a late
+    /// start from the peak it came back at.
     fn see_peak<R: rand::Rng + ?Sized>(&mut self, era: u64, peak: u32, slot: u64, rng: &mut R) {
-        if self.first.is_some_and(|f| f.era == era) {
-            return;
-        }
-        let into = u64::from(peak).saturating_sub(era_start(era));
-        let late = (into >= slot).then(|| rng.gen_range(0..=LATE_START_MAX_BLOCKS));
-        self.first = Some(FirstPeak { era, peak, late });
+        note_peak(&mut self.first, &mut self.last_peak, era, peak, slot, rng);
     }
 
     /// Whether the beacon's slot is open at `peak` in era `era`: from the
@@ -8129,10 +8173,99 @@ mod tests {
         for into in [10, slot - 1] {
             assert_eq!(g.step(&mut clock, Some(&last), block(e, into), GATE_NOW, sig, &mut rng), ListingStep::Wait(ListingWait::Slot), "{into} blocks in");
         }
-        for into in [slot, slot + 500] {
+        // A run that stays up is shown a peak every tick: the write stays
+        // due, tick after tick, until it has gone out.
+        for into in [slot, slot + 3, slot + 3 + u64::from(AWAY_GAP_BLOCKS)] {
             assert_eq!(g.step(&mut clock, Some(&last), block(e, into), GATE_NOW, sig, &mut rng), ListingStep::Write, "{into} blocks in");
         }
         assert_eq!(clock.first, Some(FirstPeak { era: e, peak: block(e, 10), late: None }), "the first peak this run saw in the era is kept");
+    }
+
+    /// 🕳️ T2 for a run that was away (docs/TDD/ChiaLanePrivacy.md §5): a
+    /// machine that saw the era before its slot and slept past it does not
+    /// write on its first tick awake, which would date the waking on the
+    /// chain. Shown a peak more than [`AWAY_GAP_BLOCKS`] after the last one,
+    /// with the slot passed meanwhile, the clock draws a late start of at
+    /// most [`LATE_START_MAX_BLOCKS`] from the peak it came back at. An
+    /// absence that ends before the slot draws nothing, and neither does a
+    /// run that stayed up across it. A late start slept past is drawn again.
+    #[test]
+    fn a_run_back_from_an_absence_with_its_slot_passed_waits_a_late_start_from_the_peak_it_came_back_at() {
+        let g = Gates::new();
+        let e = g.era_with_slots(8, 100);
+        let (slot, sig) = (g.slot(e), "198.51.100.7:4444/0");
+        let last = g.mark(e - 1, sig, GATE_NOW - 3600, Some(g.burner(e - 1)));
+        let gap = u64::from(AWAY_GAP_BLOCKS);
+        let woke = block(e, slot + 300);
+        // Saw the era ten blocks in, slept, woke 300 blocks past the slot.
+        let slept = |seed: u64| {
+            let mut clock = ListingClock::default();
+            assert_eq!(g.step(&mut clock, Some(&last), block(e, 10), GATE_NOW, sig, &mut seeded(seed)), ListingStep::Wait(ListingWait::Slot));
+            let step = g.step(&mut clock, Some(&last), woke, GATE_NOW, sig, &mut seeded(seed));
+            (clock, step)
+        };
+        let draws: Vec<u32> = (0..200).map(|seed| slept(seed).0.first.and_then(|f| f.late).expect("back past the slot: a late start is drawn")).collect();
+        assert!(draws.iter().all(|&d| d <= LATE_START_MAX_BLOCKS), "{draws:?}");
+        assert!(draws.iter().collect::<HashSet<_>>().len() > 16, "the draw follows the random source: {draws:?}");
+        let seed = (0..200u64).find(|&s| draws[s as usize] >= 2).unwrap();
+        let d = draws[seed as usize];
+        let (mut clock, step) = slept(seed);
+        assert_eq!(step, ListingStep::Wait(ListingWait::LateStart), "not on the first tick awake");
+        assert_eq!(clock.first, Some(FirstPeak { era: e, peak: woke, late: Some(d) }), "counted from the peak it came back at");
+        let mut other = seeded(999);
+        assert_eq!(g.step(&mut clock, Some(&last), woke + d - 1, GATE_NOW, sig, &mut other), ListingStep::Wait(ListingWait::LateStart), "the block before");
+        assert_eq!(g.step(&mut clock, Some(&last), woke + d, GATE_NOW, sig, &mut other), ListingStep::Write, "{d} blocks after waking");
+        assert_eq!(clock.first, Some(FirstPeak { era: e, peak: woke, late: Some(d) }), "ticks of a run that is up draw nothing more");
+        // A write of zero delay goes out at once: the draw includes it.
+        let zero = (0..200u64).find(|&s| draws[s as usize] == 0).map(slept);
+        assert!(zero.is_none_or(|(_, step)| step == ListingStep::Write));
+
+        // The bound: a peak exactly the gap after the last one is a run
+        // that stayed up, one block more is an absence.
+        for (after, away) in [(gap, false), (gap + 1, true)] {
+            let mut clock = ListingClock::default();
+            let mut rng = seeded(seed);
+            g.step(&mut clock, Some(&last), block(e, slot - 1), GATE_NOW, sig, &mut rng);
+            g.step(&mut clock, Some(&last), block(e, slot - 1 + after), GATE_NOW, sig, &mut rng);
+            assert_eq!(clock.first.is_some_and(|f| f.late.is_some()), away, "{after} blocks between two peaks across the slot");
+            assert_eq!(clock.first.map(|f| f.peak), Some(block(e, if away { slot - 1 + after } else { slot - 1 })));
+        }
+        // An absence that ends before the slot: the slot is still ahead,
+        // and the write goes out at it.
+        let mut clock = ListingClock::default();
+        let mut rng = seeded(seed);
+        for (into, want) in [(10, ListingStep::Wait(ListingWait::Slot)), (slot - 1, ListingStep::Wait(ListingWait::Slot)), (slot, ListingStep::Write)] {
+            assert_eq!(g.step(&mut clock, Some(&last), block(e, into), GATE_NOW, sig, &mut rng), want, "{into} blocks in");
+        }
+        assert_eq!(clock.first, Some(FirstPeak { era: e, peak: block(e, 10), late: None }), "no late start drawn");
+        // Up at the slot with the write still owed (a push that failed,
+        // say), then away: back, it waits again.
+        g.step(&mut clock, Some(&last), block(e, slot + 5), GATE_NOW, sig, &mut rng);
+        let back = block(e, slot + 5 + gap + 1);
+        g.step(&mut clock, Some(&last), back, GATE_NOW, sig, &mut rng);
+        assert!(clock.first.is_some_and(|f| f.peak == back && f.late.is_some()), "{:?}", clock.first);
+
+        // A late start slept past is drawn again, from the new waking; one
+        // not yet due when the run comes back is kept.
+        let first = block(e, slot + 50);
+        let mut late = ListingClock::default();
+        g.step(&mut late, Some(&last), first, GATE_NOW, sig, &mut seeded(seed));
+        let d1 = late.first.and_then(|f| f.late).expect("first seen past the slot");
+        if d1 > AWAY_GAP_BLOCKS + 1 {
+            g.step(&mut late, Some(&last), first + d1 - 1, GATE_NOW, sig, &mut other);
+            assert_eq!(late.first, Some(FirstPeak { era: e, peak: first, late: Some(d1) }), "back before it was due: kept");
+        }
+        let again = first + d1 + AWAY_GAP_BLOCKS + 1;
+        g.step(&mut late, Some(&last), again, GATE_NOW, sig, &mut other);
+        assert!(late.first.is_some_and(|f| f.peak == again && f.late.is_some_and(|d| d <= LATE_START_MAX_BLOCKS)), "{:?}", late.first);
+
+        // The next era starts its own count: its first peak, before its
+        // slot, draws nothing, however long the run was away.
+        let mut next = ListingClock::default();
+        let this = g.mark(e, sig, GATE_NOW, Some(g.burner(e)));
+        g.step(&mut next, Some(&last), block(e, 10), GATE_NOW, sig, &mut other);
+        g.step(&mut next, Some(&this), block(e + 1, 10), GATE_NOW + ERA_SECS, sig, &mut other);
+        assert_eq!(next.first, Some(FirstPeak { era: e + 1, peak: block(e + 1, 10), late: None }));
     }
 
     /// T2 (stage 4 design §4.3): a run whose first agreed peak in the era is
@@ -13560,7 +13693,7 @@ mod tests {
         // before the guard, as the listing's is.
         let latest = era_start(e) + u64::from(ERA_BLOCKS - ERA_GUARD_BLOCKS - LATE_GUARD_MARGIN_BLOCKS);
         let before = u32::try_from(latest - 5).unwrap();
-        let near_end = BeaconClock { first: Some(FirstPeak { era: e, peak: before, late: Some(LATE_START_MAX_BLOCKS) }) };
+        let near_end = BeaconClock { first: Some(FirstPeak { era: e, peak: before, late: Some(LATE_START_MAX_BLOCKS) }), ..BeaconClock::default() };
         assert!(!beacon_slot_open(Some(&g.root), &near_end, e, before + 4), "the block before the cut");
         assert!(beacon_slot_open(Some(&g.root), &near_end, e, before + 5), "due the margin before the guard, not 192 blocks on");
 
@@ -13579,6 +13712,56 @@ mod tests {
             assert!(beacon_arm_due(&mut untouched, &off, &mut other), "off the burner path the slot never holds it: {into} blocks in");
         }
         assert_eq!(untouched.first, None, "off the burner path the clock is never written");
+    }
+
+    /// 🕳️ The beacon's clock tells an absence as the listing's does
+    /// ([`note_peak`]): the beacon names the node id in the clear, so a run
+    /// that saw the era before the beacon's slot and came back past it
+    /// waits a late start counted from the peak it came back at, and does
+    /// not write on its first reachable tick awake. A run that stayed up
+    /// writes at the slot.
+    #[test]
+    fn a_beacon_back_from_an_absence_with_its_slot_passed_waits_a_late_start_from_the_peak_it_came_back_at() {
+        use crate::chia_burner::SLOT_BLOCKS;
+        let g = Gates::new();
+        let slot = |e: u64| g.root.slot(chia_lane::KIND_BEACON, e);
+        let e = (8u64..).find(|&e| (100..SLOT_BLOCKS - 500).contains(&slot(e))).unwrap();
+        let s = slot(e);
+        let woke = block(e, s + 300);
+        let slept = |seed: u64| {
+            let mut clock = BeaconClock::default();
+            assert!(!beacon_arm_due(&mut clock, &beacon_facts(&g, e, block(e, 10)), &mut seeded(seed)), "before the slot");
+            let due = beacon_arm_due(&mut clock, &beacon_facts(&g, e, woke), &mut seeded(seed));
+            (clock, due)
+        };
+        let draws: Vec<u32> = (0..64).map(|seed| slept(seed).0.first.and_then(|f| f.late).expect("back past the slot: a late start is drawn")).collect();
+        assert!(draws.iter().all(|&d| d <= LATE_START_MAX_BLOCKS), "{draws:?}");
+        assert!(draws.iter().collect::<HashSet<_>>().len() > 8, "the draw follows the random source: {draws:?}");
+        let seed = (0..64u64).find(|&seed| draws[seed as usize] >= 2).unwrap();
+        let d = draws[seed as usize];
+        let (mut clock, due_on_waking) = slept(seed);
+        assert!(!due_on_waking, "not on the first tick awake");
+        assert_eq!(clock.first, Some(FirstPeak { era: e, peak: woke, late: Some(d) }), "counted from the peak it came back at");
+        let mut other = seeded(999);
+        assert!(!beacon_arm_due(&mut clock, &beacon_facts(&g, e, woke + d - 1), &mut other), "the block before");
+        assert!(beacon_arm_due(&mut clock, &beacon_facts(&g, e, woke + d), &mut other), "{d} blocks after waking");
+
+        // A run that stayed up across the slot, a peak every gap at most.
+        let mut up = BeaconClock::default();
+        let mut rng = seeded(seed);
+        assert!(!beacon_arm_due(&mut up, &beacon_facts(&g, e, block(e, s - 1)), &mut rng));
+        assert!(beacon_arm_due(&mut up, &beacon_facts(&g, e, block(e, s - 1 + u64::from(AWAY_GAP_BLOCKS))), &mut rng), "the gap itself is no absence");
+        assert_eq!(up.first, Some(FirstPeak { era: e, peak: block(e, s - 1), late: None }));
+        // One block more is an absence.
+        let mut away = BeaconClock::default();
+        beacon_sees_peak(&mut away, Some(&g.root), block(e, s - 1), &mut rng);
+        beacon_sees_peak(&mut away, Some(&g.root), block(e, s + u64::from(AWAY_GAP_BLOCKS)), &mut rng);
+        assert!(away.first.is_some_and(|f| f.peak == block(e, s + u64::from(AWAY_GAP_BLOCKS)) && f.late.is_some()), "{away:?}");
+        // Off the burner path nothing is noted.
+        let mut off = BeaconClock::default();
+        beacon_sees_peak(&mut off, None, block(e, 10), &mut rng);
+        beacon_sees_peak(&mut off, None, woke, &mut rng);
+        assert_eq!((off.first, off.last_peak), (None, None));
     }
 
     /// T2's first peak is the first one the run saw, not the first tick the
@@ -13674,9 +13857,12 @@ mod tests {
                             peak,
                             node_id: GATE_NODE,
                         };
-                        // A run that saw the era at its first block: no late start.
+                        // A run that saw the era at its first block and
+                        // stayed up, shown a peak two blocks before the
+                        // slot at the latest: no late start.
                         let mut clock = BeaconClock::default();
                         clock.see_peak(e, block(e, 0), s, &mut seeded(1));
+                        clock.see_peak(e, block(e, s.saturating_sub(2)), s, &mut seeded(1));
                         let want = if burner_path { asked && !paused && at_slot } else { !money_refused && asked && !paused };
                         assert_eq!(
                             beacon_arm_due(&mut clock, &f, &mut seeded(2)),
