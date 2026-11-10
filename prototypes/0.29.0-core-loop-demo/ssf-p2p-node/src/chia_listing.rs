@@ -17,14 +17,24 @@
 //! that is there but cannot be read counts as off on every network, and the
 //! node says so.
 //!
-//! The SpacePhone's Network settings turn it with
-//! `POST /api/chia/listing?on=1` and `on=0` (main.rs), behind the wallet
-//! switch's gate (chia_wallet_switch::local_page). A turn holds from the
-//! publisher's next tick, within the run: turned on, the listing goes out as
-//! a station's first in an edition does; turned off, nothing more is
-//! written and the knocks waiting to be written are dropped. What is on the
-//! chain already stays there: readers stop finding a listing once its
-//! edition and the next have passed.
+//! The SpacePhone's Network settings turn it with `POST /api/chia/listing`
+//! (main.rs), behind the wallet switch's gate
+//! (chia_wallet_switch::local_page): `on=0` for off, and
+//! `on=1&net=<network id>&node=<iroh node id>` for on. An on is the
+//! player's word for one network on one station node, the ones whose
+//! warning stood on the page at CONFIRM, so it names both and only that
+//! node on that network takes it ([`listing_gate`]): a node started on
+//! another network at the same port meanwhile refuses. An off names
+//! neither and is always taken.
+//!
+//! A turn holds from the publisher's next tick, within the run: turned on,
+//! the listing goes out as a station's first in an edition does; turned
+//! off, nothing more is written, the knocks waiting to be written are
+//! dropped, and a write already sent is not sent again: the wallet lease
+//! asks this switch before a saved bundle of a listing's or a knock's goes
+//! to the peers once more (chia_publish.rs `Resend`). What is on the chain
+//! already stays there: readers stop finding a listing once its edition
+//! and the next have passed.
 //!
 //! `SSF_CHIA_FINDABLE=0` still wins for the listing: with it the station
 //! writes none, whatever the switch says ([`ListingView::held`]). The knocks
