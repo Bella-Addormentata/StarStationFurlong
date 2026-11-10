@@ -368,7 +368,10 @@ describe('the panel\'s moves', () => {
     // A save that lands after the panel closed changes nothing on the page.
     const closed = closeBackupPanel(saving, 3500);
     expect(applySave(closed, saving.saveTicket, { ok: true, note: null }, 4000)).toBe(closed);
-    expect(startSave(shown())).toEqual(shown()); // not armed: nothing goes out
+    // One reveal, compared with itself: two shown() calls can differ in shownWall
+    // (applyReveal stamps Date.now()) when the clock ticks between them.
+    const unarmed = shown();
+    expect(startSave(unarmed)).toBe(unarmed); // not armed: nothing goes out
   });
 
   it('a save answer lands only for its own save: not after LATER, a reopened Bank or another save', () => {
