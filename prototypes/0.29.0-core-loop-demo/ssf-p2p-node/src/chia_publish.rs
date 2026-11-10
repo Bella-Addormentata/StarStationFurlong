@@ -1744,6 +1744,13 @@ impl WalletLease {
     /// ([`claim_write::BurnerWait::Held`]) and never write again. A lease
     /// not told its wallet's payer cannot tell the two kinds apart, and
     /// asks about none.
+    ///
+    /// "Any other key" reads history, and holds by it: the refusal of
+    /// §4.5 (1) is older than the payer's record, so no build has filed
+    /// the SSF wallet, this one or one minted before it, as the payer of
+    /// a spend off a test network. A build that let a wallet pay there
+    /// would make a spend of an earlier wallet's read as a burner's here,
+    /// and would have to change this rule first.
     fn asks_the_peers(&self, net: crate::chia_network::ChiaNet, payer: Option<Payer>) -> bool {
         net.is_test() || matches!((payer, *self.money.lock().unwrap()), (Some(paid_by), Some(wallet)) if paid_by != wallet)
     }
@@ -4920,11 +4927,33 @@ struct BeaconPushed {
 /// is removed ([`forget_beacon_mark`]). The node never moves the date back
 /// and never removes the file.
 ///
-/// What that costs: a push dated here that did not leave after all (the
-/// lease would not park it, every peer refused it, the node stopped in
-/// between), or that never landed, still holds the other network's beacon
-/// back for 14 days. That is the guard's side to err on, and it touches
-/// only a data folder that beacons on both networks.
+/// What the date is, and what the guard keeps by it. `at` is the time the
+/// try's beacon is issued at, the same value its memo carries
+/// ([`beacon_memo`]), and the memo's expiry is [`BEACON_GUARD_SECS`] after
+/// it: the guard's 14 days are a beacon's lifetime. So when the guard lets
+/// one network's beacon out, every beacon the other network may have
+/// handed a peer is past the expiry it carries, and a reader, which takes
+/// no beacon past its expiry (`chia_resolve::decode_beacon_for`), holds an
+/// unexpired beacon of this node id from one network at most. That is also
+/// why the date never moves back: a push dated ahead by a clock that was
+/// wrong made a beacon that carries that date.
+///
+/// What the guard does not keep: when a block takes a beacon in. A bundle
+/// the lease hands the peers again ([`WalletLease::asks_the_peers`]) is
+/// the same bundle, with the dates it was issued with, so a block can take
+/// it in later than this file says, and the file's date is not moved for
+/// it. A reader takes it only from a block of its era and before its
+/// expiry; the chain shows the node id in the later block all the same.
+///
+/// What the file costs: a push dated here that did not leave after all
+/// (the lease would not park it, every peer refused it, the node stopped
+/// in between), or that never landed, still holds the other network's
+/// beacon back for 14 days, and a node whose pushes keep failing dates
+/// each try, so the other network waits 14 days from the last of them.
+/// That is the guard's side to err on, and it touches only a data folder
+/// that beacons on both networks. And a network's own beacon now needs
+/// this file written: where it cannot be (a full disk, a read-only
+/// folder), the beacon is not sent until it can, on the money path too.
 fn date_beacon_push(path: &std::path::Path, at: u64) -> std::io::Result<()> {
     let at = match read_other_beacon(path) {
         OtherBeacon::None => at,
@@ -4991,26 +5020,34 @@ fn read_other_beacon(path: &std::path::Path) -> OtherBeacon {
 /// The beacon guard (stage 4 design §4.5 (7)): why `net`'s beacon is not
 /// written at `now_unix`, given what the other network's beacon files say
 /// (`seen`, and `file` the one that says it: its mark or its dated push,
-/// [`other_beacon`]; the lines call either a mark), or `None` when it may
-/// be. A mark dated less than
-/// [`BEACON_GUARD_SECS`] ago refuses, one dated in the future among them;
-/// one exactly that old does not. A mark that cannot be read or dated
-/// refuses too. Any mark counts, pending or confirmed, whatever node id it
-/// names. The lines name the two networks and the file, and no key, puzzle
-/// hash or address.
+/// [`other_beacon`]; the lines call either the record of that network's
+/// last beacon), or `None` when it may be. A file dated less than
+/// [`BEACON_GUARD_SECS`] ago refuses, and so does one dated ahead of
+/// `now_unix`, with a line of its own that says a clock was wrong: the
+/// guard holds until 14 days after the date either way, since a beacon
+/// pushed under that date carries it. One exactly 14 days old does not
+/// refuse. A file that cannot be read or dated refuses too. Any mark
+/// counts, pending or confirmed, whatever node id it names. The lines name
+/// the two networks and the file, and no key, puzzle hash or address.
 fn beacon_guard(net: crate::chia_network::ChiaNet, file: &std::path::Path, seen: OtherBeacon, now_unix: u64) -> Option<String> {
     let (other, days) = (other_beacon_net(net), BEACON_GUARD_SECS / 86_400);
     match seen {
         OtherBeacon::None => None,
         OtherBeacon::At(at) if now_unix.saturating_sub(at) >= BEACON_GUARD_SECS => None,
+        OtherBeacon::At(at) if at > now_unix => Some(format!(
+            "⛓️ ChiaHub beacon: not written on {} while this data folder's last {} beacon ({}) is dated ahead of this computer's clock, which was wrong when that file was written or is wrong now: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out {days} days after that date",
+            net.name(),
+            other.name(),
+            file.display()
+        )),
         OtherBeacon::At(_) => Some(format!(
-            "⛓️ ChiaHub beacon: not written on {} while this data folder's {} beacon mark ({}) is less than {days} days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that mark is {days} days old",
+            "⛓️ ChiaHub beacon: not written on {} while this data folder's last {} beacon ({}) is less than {days} days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that beacon is {days} days old",
             net.name(),
             other.name(),
             file.display()
         )),
         OtherBeacon::Unreadable => Some(format!(
-            "⛓️ ChiaHub beacon: not written on {}: this data folder's {} beacon mark ({}) is there but cannot be read, so it may hold a beacon of the last {days} days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try",
+            "⛓️ ChiaHub beacon: not written on {}: this data folder's record of its last {} beacon ({}) is there but cannot be read, so it may hold a beacon of the last {days} days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try",
             net.name(),
             other.name(),
             file.display()
@@ -5083,7 +5120,8 @@ struct BeaconFacts<'a> {
     /// The retry cadence has passed since the last try.
     retry_ok: bool,
     /// The pause for another copy of this station holds (stage 4 design
-    /// §10, [`ForeignPause`]): never with burner keys off.
+    /// §10, [`ForeignPause`]): never off the listing's burner path, where
+    /// nothing is counted ([`burner_paths`]).
     paused: bool,
     /// The burner path's root, none off it.
     root: Option<&'a crate::chia_burner::BurnerRoot>,
@@ -6499,10 +6537,11 @@ pub async fn heartbeat_loop(
     // The pause for another copy of this station writing its listing (stage
     // 4 design §10): counted by the listing's verdict and its writer below,
     // on the burner path alone, and asked by the listing's, the knock's and
-    // the beacon's arms. Kept in its file with burner keys on, for the
-    // listing keys of these words and this contact key alone
-    // ([`pause_keys`]); with them off nothing is ever counted, no file is
-    // read, and no arm is held.
+    // the beacon's arms. Kept in its file on the listing's burner path
+    // (`paths.listing`), for the listing keys of these words and this
+    // contact key alone ([`pause_keys`]); off it, where a mainnet node is
+    // too until LIST ME, nothing is ever counted, no file is read, and no
+    // arm is held.
     let mut foreign_pause = match &listing_root {
         Some(root) => ForeignPause::load(&net.path(FOREIGN_PAUSE_FILE), &pause_keys(root, &hub.contact_key)),
         None => ForeignPause::in_memory(),
@@ -6579,14 +6618,15 @@ pub async fn heartbeat_loop(
     // The beacon guard's line last said (§4.5 (7)), so a run of refusals
     // prints once ([`beacon_guard_note`]).
     let mut beacon_guard_said: Option<String> = None;
-    // When the last knock only waited (burners on, `knock_failed`): the
-    // knock arm rests for the retry cadence from then (`knock_paced`).
-    // With burners off it is never set, and the arm is today's.
+    // When the last knock only waited (on the listing's burner path,
+    // `knock_failed`): the knock arm rests for the retry cadence from
+    // then (`knock_paced`). Off that path it is never set, and the arm is
+    // today's.
     let mut knock_wait: Option<Instant> = None;
     // The line of each arm's last try, if that met T4's wait (§4.3,
     // `spaced`), so it is said once for a run of such ticks (`said_once`).
-    // Only a burner's writer gives that wait, so with burners off none is
-    // set.
+    // Only a burner's writer gives that wait, so an arm off its burner
+    // path sets none.
     let mut listing_said: Option<String> = None;
     let mut knock_said: Option<String> = None;
     let mut beacon_said: Option<String> = None;
@@ -6643,7 +6683,7 @@ pub async fn heartbeat_loop(
         // Once the two hours of a pause for another copy of this station
         // have ended (§10), the lease's watch starts afresh, before the
         // listing's arm below writes again ([`renew_watch`]). Nothing is
-        // due with burner keys off, where nothing is ever counted.
+        // due off the listing's burner path, where nothing is ever counted.
         // Under the lease's gate, as every writer saves the lease: the
         // save is then of no parking half made by another task.
         if foreign_pause.watch_due(now_unix) {
@@ -7090,8 +7130,9 @@ pub async fn heartbeat_loop(
                 // knock row: a key that already wrote is
                 // `claim_write::AlreadyKnocked`), paid for by no key of the
                 // wallet's and never beside the SSF wallet's knock under the
-                // hint (`claim_write::BurnerWait::MoneyUnderHint`); with
-                // burner keys off it is the SSF wallet's write, as on main.
+                // hint (`claim_write::BurnerWait::MoneyUnderHint`); off
+                // that path (`paths.listing`) it is the SSF wallet's write,
+                // as on main, which the keys refuse off a test network.
                 let done = publish_knock(net, &keys, paths.listing, &iroh_sk, &hub.card_gate, leave, &req, &room_key, era, now_unix).await;
                 // 🔎 Under the audit switch alone (§11): the address of this
                 // knock's key, once the step shows the key has written, by
@@ -7125,7 +7166,7 @@ pub async fn heartbeat_loop(
                     }
                     // A knock withdrawn at spend time, or already written by
                     // its own key, is dropped with its line; every other
-                    // error is a wait (burners on) or an attempt used, back
+                    // error is a wait (on the burner path) or an attempt used, back
                     // in the queue or dropped, as `knock_failed` says
                     // (`knock_not_written`).
                     //
@@ -9467,8 +9508,11 @@ mod tests {
 
     /// 🛑 Stage 4 design §4.5 (1): off a test network no saved bundle the
     /// SSF wallet paid for goes out again. A mainnet node that an older
-    /// build left with a memo spend parked (a listing, knock or beacon the
-    /// SSF wallet paid for) restarts on this one: reconciliation asks the
+    /// build left with a memo spend parked (a listing or a knock the SSF
+    /// wallet paid for, filed here under the wallet's payer; one filed
+    /// with no payer, as the builds that wrote there filed every spend, is
+    /// kept back by the same rule, which the test named below walks)
+    /// restarts on this one: reconciliation asks the
     /// chain and never hands the bundle to a peer, neither as the liveness
     /// question nor once its block is gone and the spend is parked again.
     /// The coin stays parked until the chain lists it spent. A test network
@@ -13086,13 +13130,19 @@ mod tests {
             assert_eq!(other_beacon_net(other), net, "{net:?}: the two networks pair");
             let file = other_beacon_mark(net);
             let recent = format!(
-                "⛓️ ChiaHub beacon: not written on {} while this data folder's {} beacon mark ({}) is less than 14 days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that mark is 14 days old",
+                "⛓️ ChiaHub beacon: not written on {} while this data folder's last {} beacon ({}) is less than 14 days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that beacon is 14 days old",
+                net.name(),
+                other.name(),
+                file.display()
+            );
+            let ahead = format!(
+                "⛓️ ChiaHub beacon: not written on {} while this data folder's last {} beacon ({}) is dated ahead of this computer's clock, which was wrong when that file was written or is wrong now: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out 14 days after that date",
                 net.name(),
                 other.name(),
                 file.display()
             );
             let unreadable = format!(
-                "⛓️ ChiaHub beacon: not written on {}: this data folder's {} beacon mark ({}) is there but cannot be read, so it may hold a beacon of the last 14 days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try",
+                "⛓️ ChiaHub beacon: not written on {}: this data folder's record of its last {} beacon ({}) is there but cannot be read, so it may hold a beacon of the last 14 days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try",
                 net.name(),
                 other.name(),
                 file.display()
@@ -13101,11 +13151,14 @@ mod tests {
             for at in [0, now - 10 * ERA_SECS, now - BEACON_GUARD_SECS - 1, now - BEACON_GUARD_SECS] {
                 assert_eq!(beacon_guard(net, &file, OtherBeacon::At(at), now), None, "{net:?}: 14 days old or older goes out ({at})");
             }
-            for at in [now - BEACON_GUARD_SECS + 1, now - 1, now, now + 1, now + 10 * ERA_SECS, u64::MAX] {
-                assert_eq!(beacon_guard(net, &file, OtherBeacon::At(at), now).as_deref(), Some(recent.as_str()), "{net:?}: under 14 days old, or dated in the future ({at})");
+            for at in [now - BEACON_GUARD_SECS + 1, now - 1, now] {
+                assert_eq!(beacon_guard(net, &file, OtherBeacon::At(at), now).as_deref(), Some(recent.as_str()), "{net:?}: under 14 days old ({at})");
+            }
+            for at in [now + 1, now + 10 * ERA_SECS, u64::MAX] {
+                assert_eq!(beacon_guard(net, &file, OtherBeacon::At(at), now).as_deref(), Some(ahead.as_str()), "{net:?}: dated ahead of the clock ({at})");
             }
             assert_eq!(beacon_guard(net, &file, OtherBeacon::Unreadable, now).as_deref(), Some(unreadable.as_str()), "{net:?}: unreadable");
-            for line in [&recent, &unreadable] {
+            for line in [&recent, &ahead, &unreadable] {
                 let longest_hex = line.split(|c: char| !c.is_ascii_hexdigit()).map(str::len).max().unwrap_or(0);
                 assert!(longest_hex < 64 && !line.contains("xch1"), "no key, hash or address: {line}");
             }
@@ -13113,11 +13166,11 @@ mod tests {
         let file = std::path::Path::new("mark.json");
         assert_eq!(
             beacon_guard(ChiaNet::Testnet11, file, OtherBeacon::At(now), now).as_deref(),
-            Some("⛓️ ChiaHub beacon: not written on testnet11 while this data folder's Chia mainnet beacon mark (mark.json) is less than 14 days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that mark is 14 days old")
+            Some("⛓️ ChiaHub beacon: not written on testnet11 while this data folder's last Chia mainnet beacon (mark.json) is less than 14 days old: both beacons carry this node's id in the clear, so the two chains would be linked (stage 4 design §4.5 (7)); it goes out once that beacon is 14 days old")
         );
         assert_eq!(
             beacon_guard(ChiaNet::Mainnet, file, OtherBeacon::Unreadable, now).as_deref(),
-            Some("⛓️ ChiaHub beacon: not written on Chia mainnet: this data folder's testnet11 beacon mark (mark.json) is there but cannot be read, so it may hold a beacon of the last 14 days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try")
+            Some("⛓️ ChiaHub beacon: not written on Chia mainnet: this data folder's record of its last testnet11 beacon (mark.json) is there but cannot be read, so it may hold a beacon of the last 14 days, which would link the two chains (stage 4 design §4.5 (7)); it is read again at each try")
         );
     }
 
