@@ -3997,7 +3997,10 @@ async fn a_spend_of_our_burner_the_lease_never_parked_pauses_listing_for_two_hou
 /// so the listing's verdict retells it as lost to another copy of this
 /// station and counts it on the pause by c0 ([`listing_verdict`]); the mark
 /// is voided in those words. With the SSF wallet paying, the word stays as
-/// it came and nothing is counted.
+/// it came and nothing is counted. So it does for a station whose contact
+/// key or wallet was replaced after the rewrite went out: the mark's payer
+/// is no longer its listing key ([`own_listing_burner`]), and no pause is
+/// raised under the new keys.
 ///
 /// One episode is one time. The copy rewrites its listing once more while
 /// the two hours run, from the coin c1 its first rewrite made, which our
@@ -4034,21 +4037,43 @@ async fn a_rewrite_that_loses_its_coin_to_the_other_copys_rewrite_reads_dead_to_
     assert_eq!(s.chain.children(c0.coin_id()), vec![c1], "the coin our rewrite would have made, made by the copy's");
     assert!(s.chain.mempool().is_empty(), "the block spent the rewrite's coin, so the mempools let it go");
 
+    // The listing burner this station writes era 0 from, as the heartbeat
+    // makes it for the verdict: the mark's own payer.
+    let own = own_listing_burner(Some(&root(141)), &CK, &mark);
+    assert_eq!(own, Some(Payer::of_burner(&p0).hex()));
+    assert_eq!(mark.payer, own, "our listing burner paid for the rewrite");
+    let own = own.as_deref();
     let mut pause = ForeignPause::in_memory();
     let at = t + 1_800;
     s.reconcile().await;
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Pending), "the lease still holds the spend");
-    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, true, word.clone(), 0, at), (word, false), "pending is not retold");
+    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, own, word.clone(), 0, at), (word, false), "pending is not retold");
 
     s.chain.farm_blocks(SETTLED_DEPTH).await;
     s.reconcile().await;
     let word = presence_standing_on(&s.lease, NET, &s.money, &mark).await;
     assert_eq!(word.clone().map(|w| w.0), Some(WriteStanding::Dead("its coin went to another spend of ours")), "the chain's word");
-    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, false, word.clone(), 0, at), (word.clone(), false), "with the SSF wallet paying, as it came");
-    assert_eq!(paused_now(&mut pause, Some(0), at), None, "and nothing is counted for either");
-    assert_eq!(listing_word(&s.lease, &mark, true, word.clone()).1, Some(c0.coin_id()), "lost by c0");
-    let (told, lost) = listing_verdict(&s.lease, &mut pause, &mark, true, word, 0, at);
+    let money_path = own_listing_burner(None, &CK, &mark);
+    assert_eq!(money_path, None, "no listing burner with burner keys off");
+    assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, money_path.as_deref(), word.clone(), 0, at), (word.clone(), false), "with the SSF wallet paying, as it came");
+    // The same word read by a station whose listing key is no longer the
+    // mark's payer: its contact key or its wallet was replaced after the
+    // rewrite went out, and the mark stays on record until its next write.
+    // Whoever took c0 holds a key this station no longer writes from, so
+    // the word stays as it came and no pause is raised under the new keys.
+    for (what, replaced) in [
+        ("another contact key", own_listing_burner(Some(&root(141)), &[22; 32], &mark)),
+        ("another wallet", own_listing_burner(Some(&root(149)), &CK, &mark)),
+        ("another era's key", own_listing_burner(Some(&root(141)), &CK, &NodePublishMark { era: 1, ..mark.clone() })),
+    ] {
+        assert!(replaced.is_some() && replaced.as_deref() != own, "{what}");
+        assert!(s.lease.spent_once(&c0.coin_id()), "{what}: the lease's records alone would tell it");
+        assert_eq!(listing_verdict(&s.lease, &mut pause, &mark, replaced.as_deref(), word.clone(), 0, at), (word.clone(), false), "{what}");
+    }
+    assert_eq!(paused_now(&mut pause, Some(0), at), None, "and nothing is counted for any of them");
+    assert_eq!(listing_word(&s.lease, &mark, own, word.clone()).1, Some(c0.coin_id()), "lost by c0");
+    let (told, lost) = listing_verdict(&s.lease, &mut pause, &mark, own, word, 0, at);
     assert_eq!(told.clone().map(|w| w.0), Some(WriteStanding::Dead("another copy of this station spent its coin")), "one spend of ours, and it was not the one that took c0");
     assert!(lost);
     let two_hours = Some(Paused::TwoHours { until: at + FOREIGN_PAUSE_SECS });

@@ -5065,28 +5065,36 @@ async fn write_standing_on(
 /// ([`presence_standing`]). A write dead because its coin went to another
 /// spend is retold as dead to another copy
 /// ([`crate::chia_resolve::DEAD_FOREIGN`]) when all of this holds: the
-/// listing is written from burner keys (`burner_path`), the mark's write is
-/// of one coin (a rewrite: a first write's parked coin is the dish's, which
-/// anyone may claim), and exactly one spend of `lease` ever consumed that
-/// coin ([`WalletLease::spent_once`]), the mark's own. The coin is spent and
-/// that one spend's coin is nowhere, so the spend that took it was not
-/// ours, and only a holder of the listing's key could make it.
+/// mark's write was paid for by this station's listing burner for the
+/// mark's era, as its words and contact key make that key now
+/// (`own_burner`, [`own_listing_burner`]; `None` with burner keys off), the
+/// mark's write is of one coin (a rewrite: a first write's parked coin is
+/// the dish's, which anyone may claim), and exactly one spend of `lease`
+/// ever consumed that coin ([`WalletLease::spent_once`]), the mark's own.
+/// The coin is spent and that one spend's coin is nowhere, so the spend
+/// that took it was not ours, and only a holder of the listing's key could
+/// make it.
 ///
 /// Every other word is returned as it came, with no coin: a mark the SSF
 /// wallet paid for (its coins are not in those records), a coin a second
 /// spend of ours parked too, where "another spend of ours" stays possible,
-/// and anything with burner keys off. The beacon's mark and a knock's entry
-/// never come here: twins on the same words share those keys (§3.3), and a
-/// spend of theirs by a twin is no fault.
+/// and anything with burner keys off. So is the word on a mark another key
+/// paid for, as a write made before `contact.key` or the wallet was
+/// replaced leaves on record until this station's next write: whoever
+/// still holds that key is no copy of the station this is now, and the
+/// pause is for the listing keys of now alone ([`ForeignPause::load`]). The
+/// beacon's mark and a knock's entry never come here: twins on the same
+/// words share those keys (§3.3), and a spend of theirs by a twin is no
+/// fault.
 pub(crate) fn listing_word(
     lease: &WalletLease,
     mark: &NodePublishMark,
-    burner_path: bool,
+    own_burner: Option<&str>,
     word: Option<(crate::chia_resolve::WriteStanding, bool)>,
 ) -> (Option<(crate::chia_resolve::WriteStanding, bool)>, Option<Bytes32>) {
-    let only_ours = burner_path
-        .then(|| WriteCoins::filed(&mark.coin_id, &mark.parked))
-        .flatten()
+    let only_ours = own_burner
+        .filter(|own| mark.payer.as_deref() == Some(*own))
+        .and_then(|_| WriteCoins::filed(&mark.coin_id, &mark.parked))
         .filter(|coins| coins.parent == coins.parked && lease.spent_once(&coins.parked))
         .map(|coins| coins.parked);
     match (word, only_ours) {
@@ -5195,6 +5203,16 @@ fn knock_arm_open(waiting: bool, refused: bool, peak: u32, paced: bool, paused: 
     waiting && !refused && peak > 0 && !era_guard(peak) && paced && paused.is_none()
 }
 
+/// The payer text of this station's listing burner for the era of `mark`,
+/// P(e) (stage 4 design §3.2), as the wallet's words (`root`) and the
+/// contact key `ck` make that key now: what a mark must name as its payer
+/// for the loss of its coin to be another copy's ([`listing_word`]). `None`
+/// with burner keys off, which have no root. The text is a puzzle hash,
+/// which no log line prints.
+fn own_listing_burner(root: Option<&crate::chia_burner::BurnerRoot>, ck: &[u8; 32], mark: &NodePublishMark) -> Option<String> {
+    root.map(|root| Payer::of_burner(&root.presence(ck, mark.era)).hex())
+}
+
 /// The listing's standing as the lease's records tell it ([`listing_word`]),
 /// with a write lost to another copy of this station counted on the pause
 /// by the coin it was lost by ([`ForeignPause::note_made`], stage 4 design
@@ -5207,12 +5225,12 @@ fn listing_verdict(
     lease: &WalletLease,
     pause: &mut ForeignPause,
     mark: &NodePublishMark,
-    burner_path: bool,
+    own_burner: Option<&str>,
     word: Option<(crate::chia_resolve::WriteStanding, bool)>,
     era: u64,
     now: u64,
 ) -> (Option<(crate::chia_resolve::WriteStanding, bool)>, bool) {
-    let (word, lost_by) = listing_word(lease, mark, burner_path, word);
+    let (word, lost_by) = listing_word(lease, mark, own_burner, word);
     if let Some(coin) = lost_by {
         pause.note_made(era, now, coin, mark.last_at);
     }
@@ -6425,9 +6443,12 @@ pub async fn heartbeat_loop(
                     // spend that was not ours was lost to another copy of
                     // this station (§10, [`listing_verdict`]): counted on
                     // the pause by that coin, in the era the chain is in
-                    // now.
+                    // now. Only a mark this station's listing key of now
+                    // paid for is read that way: one a replaced contact
+                    // key or wallet left is another key's.
+                    let own_burner = own_listing_burner(listing_root.as_ref(), &hub.contact_key, &m);
                     let (word, lost) =
-                        listing_verdict(&WALLET_LEASE, &mut foreign_pause, &m, listing_root.is_some(), presence_standing(&peak_client, &m).await, now, now_unix);
+                        listing_verdict(&WALLET_LEASE, &mut foreign_pause, &m, own_burner.as_deref(), presence_standing(&peak_client, &m).await, now, now_unix);
                     match presence_step(&m, word, era, peak) {
                         PresenceStep::Keep => {}
                         PresenceStep::Void(why) => {
@@ -9549,8 +9570,9 @@ mod tests {
 
     /// Stage 4 design §10, the verdict's side: a listing's rewrite dead
     /// because its one coin went to another spend is told as lost to another
-    /// copy of this station only on the burner path, and only when the
-    /// lease's records hold exactly one spend of that coin, the write's own.
+    /// copy of this station only on the burner path, only for a mark this
+    /// station's listing key of now paid for, and only when the lease's
+    /// records hold exactly one spend of that coin, the write's own.
     #[test]
     fn a_listings_death_is_another_copys_only_by_the_leases_records_of_its_one_coin() {
         use crate::chia_resolve::{WriteStanding, DEAD_DISH_CLAIMED, DEAD_DROPPED, DEAD_FOREIGN, DEAD_OTHER_SPEND};
@@ -9570,23 +9592,44 @@ mod tests {
         park(wallet, money());
         let first = lease.park_with_bundle([(dish.coin_id(), 900)], &spending(&[dish, g]), burner()).unwrap();
         lease.release(&[first.spend]);
+        // The listing burner this station writes from now, as a payer's text,
+        // and the marks it paid for.
+        let ours = burner().hex();
+        let own = Some(ours.as_str());
         let mark = |coin_id: Bytes32, parked: Option<Bytes32>| NodePublishMark {
             coin_id: hex::encode(coin_id),
             parked: parked.map(hex::encode).unwrap_or_default(),
+            payer: Some(burner().hex()),
             ..Default::default()
         };
         let other_spend = || Some((Dead(DEAD_OTHER_SPEND), false));
         let rewrite = mark(once.coin_id(), Some(once.coin_id()));
-        // The one case: a rewrite on the burner path whose coin one spend of
-        // ours ever consumed.
-        assert_eq!(listing_word(&lease, &rewrite, true, other_spend()), (Some((Dead(DEAD_FOREIGN), false)), Some(once.coin_id())));
+        // The one case: a rewrite our listing burner paid for, whose coin one
+        // spend of ours ever consumed.
+        assert_eq!(listing_word(&lease, &rewrite, own, other_spend()), (Some((Dead(DEAD_FOREIGN), false)), Some(once.coin_id())));
         assert_eq!(
-            listing_word(&lease, &mark(once.coin_id(), None), true, Some((Dead(DEAD_OTHER_SPEND), true))),
+            listing_word(&lease, &mark(once.coin_id(), None), own, Some((Dead(DEAD_OTHER_SPEND), true))),
             (Some((Dead(DEAD_FOREIGN), true)), Some(once.coin_id())),
             "a mark that files its one coin once is the same write, and the lookup's other word is kept"
         );
         // With burner keys off the verdict is the one it always was.
-        assert_eq!(listing_word(&lease, &rewrite, false, other_spend()), (other_spend(), None));
+        assert_eq!(listing_word(&lease, &rewrite, None, other_spend()), (other_spend(), None));
+        // A mark another key paid for, as a write made before the contact key
+        // or the wallet was replaced leaves on record: the lease still holds
+        // its one spend of the coin, but whoever took the coin holds a key
+        // this station no longer writes from. The same mark read by a station
+        // whose key is another now, and a mark that names no payer, as an
+        // older build's does, are no different.
+        let theirs = beacon().hex();
+        for (what, m, own_burner) in [
+            ("paid by another key", NodePublishMark { payer: Some(theirs.clone()), ..rewrite.clone() }, own),
+            ("paid by the SSF wallet", NodePublishMark { payer: Some(money().hex()), ..rewrite.clone() }, own),
+            ("naming no payer", NodePublishMark { payer: None, ..rewrite.clone() }, own),
+            ("our key is another now", rewrite.clone(), Some(theirs.as_str())),
+        ] {
+            assert!(lease.spent_once(&once.coin_id()), "{what}: the records alone would tell it");
+            assert_eq!(listing_word(&lease, &m, own_burner, other_spend()), (other_spend(), None), "{what}");
+        }
         // Every other word on that mark passes through as it came. One that
         // already reads dead to another copy (the last) still names the
         // coin; the others name none.
@@ -9600,7 +9643,7 @@ mod tests {
             Some((Dead(DEAD_FOREIGN), false)),
         ] {
             let through = (word.clone(), word.as_ref().and_then(|(standing, _)| standing.is_foreign().then_some(once.coin_id())));
-            assert_eq!(listing_word(&lease, &rewrite, true, word), through);
+            assert_eq!(listing_word(&lease, &rewrite, own, word), through);
         }
         // Coins the records do not hold as one spend's alone: two spends of
         // ours, the SSF wallet's, a coin never parked, and a first write's
@@ -9611,10 +9654,11 @@ mod tests {
             ("a coin the lease never parked", mark(Bytes32::new([7u8; 32]), None)),
             ("a first write: g and the dish coin", mark(g.coin_id(), Some(dish.coin_id()))),
             ("two coins, the parked one recorded once", mark(g.coin_id(), Some(once.coin_id()))),
-            ("a mark that names no coin", NodePublishMark::default()),
-            ("a malformed coin", NodePublishMark { coin_id: "zz".into(), ..Default::default() }),
+            ("a mark that names no coin", NodePublishMark { payer: Some(burner().hex()), ..Default::default() }),
+            ("a malformed coin", NodePublishMark { coin_id: "zz".into(), payer: Some(burner().hex()), ..Default::default() }),
         ] {
-            assert_eq!(listing_word(&lease, &m, true, other_spend()), (other_spend(), None), "{what}");
+            assert_eq!(m.payer.as_deref(), own, "{what}: our key paid for it");
+            assert_eq!(listing_word(&lease, &m, own, other_spend()), (other_spend(), None), "{what}");
         }
         assert!(lease.spent_once(&g.coin_id()), "g is recorded once, but a first write is not judged by it");
         let _ = std::fs::remove_dir_all(&dir);
@@ -9757,31 +9801,39 @@ mod tests {
             let parking = lease.park_with_bundle([(coin.coin_id(), 900)], &spending(&[coin]), burner()).unwrap();
             lease.release(&[parking.spend]);
         }
-        let rewrite = |coin: Coin| NodePublishMark { coin_id: hex::encode(coin.coin_id()), parked: hex::encode(coin.coin_id()), ..Default::default() };
+        let (ours, theirs) = (burner().hex(), beacon().hex());
+        let own = Some(ours.as_str());
+        let rewrite =
+            |coin: Coin| NodePublishMark { coin_id: hex::encode(coin.coin_id()), parked: hex::encode(coin.coin_id()), payer: Some(burner().hex()), ..Default::default() };
         let other_spend = || Some((Dead(DEAD_OTHER_SPEND), false));
         let (era, t0) = (7u64, 1_700_000_000u64);
         let two_hours = Some(Paused::TwoHours { until: t0 + FOREIGN_PAUSE_SECS });
         let mut pause = ForeignPause::in_memory();
         // Nothing is counted for a word that is not a loss to another copy.
-        for (what, mark, burner_path, word) in [
-            ("burner keys off", rewrite(first), false, other_spend()),
-            ("pending", rewrite(first), true, Some((Pending, false))),
-            ("dropped", rewrite(first), true, Some((Dead(DEAD_DROPPED), false))),
-            ("the chain could not be asked", rewrite(first), true, None),
-            ("two spends of ours on the coin", rewrite(twice), true, other_spend()),
+        for (what, mark, own_burner, word) in [
+            ("burner keys off", rewrite(first), None, other_spend()),
+            ("pending", rewrite(first), own, Some((Pending, false))),
+            ("dropped", rewrite(first), own, Some((Dead(DEAD_DROPPED), false))),
+            ("the chain could not be asked", rewrite(first), own, None),
+            ("two spends of ours on the coin", rewrite(twice), own, other_spend()),
+            // A write made before the contact key or the wallet was
+            // replaced: another key paid for it, and no pause is raised
+            // under the keys of now for whoever still holds that one.
+            ("a mark another key paid for", NodePublishMark { payer: Some(theirs.clone()), ..rewrite(first) }, own, other_spend()),
+            ("our key is another now", rewrite(first), Some(theirs.as_str()), other_spend()),
         ] {
-            assert_eq!(listing_verdict(&lease, &mut pause, &mark, burner_path, word.clone(), era, t0), (word, false), "{what}");
+            assert_eq!(listing_verdict(&lease, &mut pause, &mark, own_burner, word.clone(), era, t0), (word, false), "{what}");
             assert_eq!(pause.holds(era, t0), None, "{what}");
         }
         // The loss: retold, and counted as the era's first.
-        assert_eq!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0), (Some((Dead(DEAD_FOREIGN), false)), true));
+        assert_eq!(listing_verdict(&lease, &mut pause, &rewrite(first), own, other_spend(), era, t0), (Some((Dead(DEAD_FOREIGN), false)), true));
         assert_eq!(pause.holds(era, t0), two_hours);
         // The same coin judged again, as on a tick before the mark is void:
         // still a loss, and counted no second time, during the two hours or
         // after them.
-        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + 60).1);
+        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), own, other_spend(), era, t0 + 60).1);
         assert_eq!(pause.holds(era, t0 + 60), two_hours);
-        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS).1);
+        assert!(listing_verdict(&lease, &mut pause, &rewrite(first), own, other_spend(), era, t0 + FOREIGN_PAUSE_SECS).1);
         assert!(renew_watch(&lease, &mut pause, t0 + FOREIGN_PAUSE_SECS));
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS), None, "the two hours are over, and the coin is not counted again");
         // What the log says comes next: the pause, only while one holds.
@@ -9800,12 +9852,12 @@ mod tests {
         let parking = lease.park_with_bundle([(early.coin_id(), 900)], &spending(&[early]), burner()).unwrap();
         lease.release(&[parking.spend]);
         let made_before = NodePublishMark { last_at: t0 + FOREIGN_PAUSE_SECS - 1, ..rewrite(early) };
-        assert!(listing_verdict(&lease, &mut pause, &made_before, true, other_spend(), era + 1, t0 + FOREIGN_PAUSE_SECS + 30).1);
+        assert!(listing_verdict(&lease, &mut pause, &made_before, own, other_spend(), era + 1, t0 + FOREIGN_PAUSE_SECS + 30).1);
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 30), None);
         assert_eq!(pause.holds(era + 1, t0 + FOREIGN_PAUSE_SECS + 30), None);
         // Another write, made after the two hours and lost: the era's second.
         let made_after = NodePublishMark { last_at: t0 + FOREIGN_PAUSE_SECS, ..rewrite(second) };
-        assert!(listing_verdict(&lease, &mut pause, &made_after, true, other_spend(), era, t0 + FOREIGN_PAUSE_SECS + 60).1);
+        assert!(listing_verdict(&lease, &mut pause, &made_after, own, other_spend(), era, t0 + FOREIGN_PAUSE_SECS + 60).1);
         assert_eq!(pause.holds(era, t0 + FOREIGN_PAUSE_SECS + 60), Some(Paused::UntilNextEra));
         assert_eq!(pause.holds(era + 1, t0 + FOREIGN_PAUSE_SECS + 60), None);
         let _ = std::fs::remove_dir_all(&dir);

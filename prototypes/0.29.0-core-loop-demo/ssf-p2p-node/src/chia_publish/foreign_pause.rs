@@ -39,7 +39,10 @@
 //! keys on and kept in memory, never noted, with them off. A pause is for
 //! the listing keys it was counted under ([`ForeignPause::load`]): new
 //! words or a new contact key make new listing keys, which no copy shares,
-//! and a pause on record for the old ones holds nothing.
+//! and a pause on record for the old ones holds nothing. Nor is one
+//! raised for a write the old keys paid for that is still on record
+//! (`super::listing_word`): whoever takes its coin holds a key this
+//! station no longer writes from.
 //!
 //! What it cannot tell apart from another copy, each bounded to the pauses
 //! above: a lease file put back from an earlier copy of itself (a restored
