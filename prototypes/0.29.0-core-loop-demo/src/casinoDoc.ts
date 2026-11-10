@@ -2241,12 +2241,17 @@ interface FairOnlyState {
    *  keepStanding, keepHouses): the transfers of the game's chain that have a
    *  key of their own (`xf:`), by key; the end order standing, when it came
    *  from the game's `fin:` key and not from the base (undefined: none); and
-   *  the delegations (`hk:`, by key) of the houses whose records the fold of
-   *  its live session counted (`houseUsed`: every key its HouseCheck answered
-   *  true for since the game was last resolved, when the fold asks them all
-   *  again): each good one by a holder of the game that this page has seen
-   *  under the house's key, the latest holder's last (a key holds one value,
-   *  and after a hand-over the buyer may delegate the node the seller did).
+   *  the delegations (by their houses' keys, `hk:`) of the houses whose records
+   *  the fold of its live session counted (`houseUsed`: every key its
+   *  HouseCheck answered true for since the game was last resolved, when the
+   *  fold asks them all again, each with the delegations the resolution went by
+   *  for it then, Resolution houseBy, by their hashes): the ones the count went
+   *  by, wherever the resolution found them (under the house's key, in an older
+   *  checkpoint of the game, among the ones this page offered it), but for one
+   *  the base carries, which the page holds with the base; and each good one by
+   *  a holder of the game that this page has seen under the house's key. The
+   *  latest holder's last (a key holds one value, and after a hand-over the
+   *  buyer may delegate the node the seller did).
    *  Offered to the resolver as if the doc held them still, as the base is: a
    *  transfer, an end order and a delegation each prove themselves and nothing
    *  takes one back, so one a peer deleted, or wrote something else over, moves
@@ -2255,20 +2260,24 @@ interface FairOnlyState {
   heldXfs: Map<string, unknown>;
   heldFin: unknown;
   heldHks: Map<string, HeldDelegation[]>;
-  houseUsed: Set<string>;
+  houseUsed: Map<string, Map<string, DelegationRec>>;
   /** …and the key of the base the game counted from when the delegations held
    *  were last kept whole (null: never). While the game counts from that base
    *  still, the delegation of a house no record of the live session is of now
    *  stays held: the rounds it decided are in no checkpoint yet, and its
    *  records are on their way back (a session's map a peer deleted, opened
    *  again empty; a record a peer deleted and its author puts back). Let go of
-   *  when the game moves on to another base (keepHouses). */
+   *  when the game moves on to another base (keepHouses), and kept again from
+   *  the resolution itself if a record of its house counts after that: a count
+   *  goes by nothing this page does not hold. */
   hkBase: string | null;
-  /** 🔒 Under the keys of the delegations held, the values the last count found
+  /** 🔒 Under the keys of the delegations held, the values the last look found
    *  there that are no good delegation of the house by a holder of the game (a
    *  stranger's, or one whose signature fails): the held one is written over
-   *  them (fairOnlyLacks). And whether one waited for its check then (`hkWaits`:
-   *  it is left for now, and the slice that checks it counts the game again). */
+   *  them (fairOnlyLacks). Looked at after each count, and while the game is
+   *  not counted because its table is not whole (keepHouses). And whether one
+   *  waited for its check then (`hkWaits`: it is left for now, and the slice
+   *  that checks it looks again). */
   hkOver: Map<string, unknown>;
   hkWaits: boolean;
   /** 🔒 Whether the doc lacked something this page holds of the game when that
@@ -4050,15 +4059,22 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Set(), hkBase: null, hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkBase: null, hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
     : null;
-  // (…and the page keeps which keys it answered were: their delegations are what
-  // the fold's counts stand on, keepHouses.)
+  // (…and the page keeps which keys it answered were, and the delegation the
+  // resolution went by for each: they are what the fold's counts stand on,
+  // keepHouses. Where the resolution found one, the room's key, an older
+  // checkpoint or this page's own offer, may hold it no more the next time the
+  // game is resolved.)
   const houses: HouseCheck = fo
     ? (pub, round) => {
-      const ok = fo.res?.houseAt(pub, round);
-      if (ok === true) fo.houseUsed.add(pub);
-      return ok;
+      // (Asked once: a second asking may find the verdict let go of, and this count's time spent.)
+      const by = fo.res?.houseBy(pub, round);
+      if (!by) return by === null ? false : undefined;
+      let used = fo.houseUsed.get(pub);
+      if (!used) fo.houseUsed.set(pub, used = new Map());
+      used.set(by.hash, by.value);
+      return true;
     }
     : houseOkOf;
   c = {
@@ -4336,8 +4352,14 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
   if (!casinoWhole(c.t)) {
     computedParked.add(c.key);
     c.stale = true;
-    // 🔒 (A game's put-backs are counted while it is not: noteFairOnlyLacks.)
-    if (c.fo && !docHoldsPart()) noteFairOnlyLacks(c, map);
+    // 🔒 (A game's put-backs are counted while it is not, noteFairOnlyLacks,
+    // and what stands under the keys of the delegations it holds is looked at
+    // as after a count, with no house let go of for want of a record: the
+    // fold asked of none, keepHouses.)
+    if (c.fo && !docHoldsPart()) {
+      keepHouses(c, c.fo.res!.pending, true);
+      noteFairOnlyLacks(c, map);
+    }
     return;
   }
   if (c.fo) {
@@ -4495,15 +4517,23 @@ function keepStanding(fo: FairOnlyState, xfs: ReadonlyMap<string, unknown>): voi
   else if (whole) fo.heldFin = undefined;
 }
 
-/** 🔒 Keep the delegations the game's houses stand on, of those the room holds
- *  under their own keys (FairOnlyState heldHks), and say what stands under
- *  those keys now (`hkOver`, `hkWaits`). For each key the fold counted a record
- *  of as a house's (`houseUsed`: a join, a reveal or a step-down of the live
- *  session, of a round decided or not: one that stopped counting would undo
- *  the round):
+/** 🔒 Keep the delegations the game's houses stand on (FairOnlyState heldHks),
+ *  and say what stands under their houses' keys now (`hkOver`, `hkWaits`). For
+ *  each key the fold counted a record of as a house's (`houseUsed`: a join, a
+ *  reveal or a step-down of the live session, of a round decided or not: one
+ *  that stopped counting would undo the round):
  *  - the ones held before, while their signers are holders of the game (each
  *    was checked when it was first kept, and a verdict the cache has let go
  *    since takes nothing back);
+ *  - the ones the count went by (the resolution's houseBy, noted as the fold
+ *    asked: checked there), wherever the resolution found them: under the
+ *    house's key, in a checkpoint of the game that is not its base (an older
+ *    one, which a peer may delete and compaction will), or among the ones this
+ *    page offered it. So a count goes by no delegation the page does not hold,
+ *    whatever was let go of before and whatever the doc loses after. But for
+ *    the one the base carries: the page holds the base, and that one needs no
+ *    key. A house that plays on under the delegation an older checkpoint
+ *    carries, after a base that carries another, has it put under its key;
  *  - and the value at `hk:<house>`, when it is a delegation of the house that a
  *    holder of the game signed and its check passes: the resolver's own check
  *    (the same id: one verdict), made here because the resolver asks only of a
@@ -4514,10 +4544,10 @@ function keepStanding(fo: FairOnlyState, xfs: ReadonlyMap<string, unknown>): voi
  *  delegation of the house or one whose signature fails, would leave the pages
  *  that come later without the house: the held one is written over it
  *  (fairOnlyLacks). One whose check waits is left for now, and the slice that
- *  checks it counts the game again. One a checkpoint of the game carries needs
- *  no key and is not kept. While the fold or the resolution waits for a check
- *  (`waits`), what was held stays: the fold has not asked of every house then,
- *  or the chain is not whole (a holder not told yet is no stranger).
+ *  checks it counts the game again. While the fold or the resolution waits for
+ *  a check (`waits`), what was held stays: the fold has not asked of every
+ *  house then, or the chain is not whole (a holder not told yet is no
+ *  stranger).
  *
  *  And while the game counts from the base the held ones were kept under
  *  (`hkBase`), the houses of the delegations held are gone through with the
@@ -4527,8 +4557,22 @@ function keepStanding(fo: FairOnlyState, xfs: ReadonlyMap<string, unknown>): voi
  *  record, and a delegation let go of then, with its key deleted too, would
  *  leave the rounds its house decided undecided once the records are back. A
  *  house no record is of is let go of when the game moves on to another base:
- *  its rounds are in a checkpoint then. */
-function keepHouses(c: ComputedInc, waits: boolean): void {
+ *  its rounds are in a checkpoint then. (Should a record of its house count in
+ *  the new base's session after that, under a resolution made while the page
+ *  held the delegation still, it is kept again from that resolution.)
+ *
+ *  While the game is not counted because its table is not whole (`parked`: the
+ *  map of the session this page counted from its base is gone), the keys of
+ *  all the delegations held are looked at all the same, and no house is let go
+ *  of for want of a record: the fold asked of none. A peer that deletes the map
+ *  and writes a stranger's delegation over a held one has the held one put back
+ *  at once, which waits for nobody to open the session again. The base the
+ *  game names then is the one the held ones are kept under from there (it
+ *  nearly always was: only a base whose one count waited was not), since the
+ *  session that is gone is that base's, and its records are on their way back.
+ *  A held one whose signer holds the game no more is let go of there as at any
+ *  whole count: the chain is the resolution's, not the fold's. */
+function keepHouses(c: ComputedInc, waits: boolean, parked = false): void {
   const fo = c.fo!;
   const chain = fo.res!.chain;
   const placeOf = (k: string): number => {
@@ -4536,8 +4580,9 @@ function keepHouses(c: ComputedInc, waits: boolean): void {
     return -1;
   };
   const base = fo.res!.base?.key ?? null;
-  const pubs = new Set(fo.houseUsed);
-  if (base === fo.hkBase) for (const key of fo.heldHks.keys()) pubs.add(houseKeyParts(key)!.of);
+  const carried = fo.res!.base?.ck.dl === undefined ? null : recHash(fo.res!.base.ck.dl);
+  const pubs = new Set(fo.houseUsed.keys());
+  if (parked || base === fo.hkBase) for (const key of fo.heldHks.keys()) pubs.add(houseKeyParts(key)!.of);
   const kept = new Map<string, HeldDelegation[]>();
   const over = new Map<string, unknown>();
   let hkWaits = false;
@@ -4548,6 +4593,10 @@ function keepHouses(c: ComputedInc, waits: boolean): void {
       const at = placeOf(asDelegation(h.value)!.k);
       if (at >= 0) good.set(h.hash, { ...h, at });
       else if (waits) good.set(h.hash, h);
+    }
+    // (One held before is the same record: the resolution was given the value this page holds, or the room's.)
+    for (const [hash, value] of fo.houseUsed.get(pub) ?? []) {
+      if (hash !== carried) good.set(hash, { value, hash, at: placeOf(value.k) });
     }
     const raw = hkRaw.get(key);
     const d = raw === undefined ? null : asDelegation(raw);
@@ -5600,12 +5649,19 @@ export function putBackFairOnlyRecords(tableId: string, inc: string): number {
  * witnessDuty), as reopenComputedSession does at a page-signed table. Whatever
  * the switch names (a game is live by its base alone, S7), and whether the doc
  * holds the base or only this page does. On a doc holding every update whole.
- * False (nothing written) otherwise.
+ * `waited`: the session the caller waited to open and the count of the game's
+ * session keys' changes it waited through (FairOnlyRecovery sid, sesMoves, as
+ * the put-back duty read them at its look). Nothing is opened when either is
+ * another now: a write the caller made since its look (a put-back, whose
+ * transaction makes a check that waited) may have moved the game to a base
+ * that opens another session, and that one's map has a wait and a turn of its
+ * own. False (nothing written) otherwise.
  */
-export function reopenFairOnlySession(tableId: string, inc: string): boolean {
+export function reopenFairOnlySession(tableId: string, inc: string, waited?: { sid: string | null; sesMoves: number }): boolean {
   const map = computedMap;
   const c = computedIncs.get(`${tableId}:${inc}`);
   if (!map || !c?.fo || !docAlive() || docHoldsPart() || !fairOnlySessionMissing(c, map)) return false;
+  if (waited && (waited.sid !== fairOnlySessionOf(c) || waited.sesMoves !== c.fo.sesMoves)) return false;
   const key = sessionKey(tableId, inc, fairOnlySessionOf(c)!);
   boundDoc!.transact(() => {
     map.set(key, new Y.Map<unknown>());

@@ -4698,7 +4698,9 @@ function openStep(w: Keeping, r: FairOnlyRecovery, pub: string, now: number): vo
   }
   if (w.missingAt === null || w.missingAt > now) w.missingAt = now;
   if (now < w.missingAt + OPEN_WAIT_MS + turnOf('open', r, r.u, pub) || !heardThrough(now - OPEN_WAIT_MS, now)) return;
-  if (reopenFairOnlySession(r.t, r.inc)) w.missingAt = null;
+  // (The session this page waited for, as it read it at this look: the
+  // put-back just made may have had a check made that names another base.)
+  if (reopenFairOnlySession(r.t, r.inc, { sid: r.sid, sesMoves: r.sesMoves })) w.missingAt = null;
 }
 
 /** 🚩 Whether this page's restores of table `t`'s checkpoint keep being

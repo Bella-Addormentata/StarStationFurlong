@@ -836,6 +836,50 @@ describe('who decides a round (houseAt)', () => {
     expect(held.res.houseAt(house.pub, 1), 'the root\'s own is checked with the root').toBe(true);
     expect(held.res.houseAt(stranger.pub, 1), 'no delegation at all: no').toBe(false);
   });
+
+  it('says which delegation it goes by (houseBy): the value it was given, with its hash; none where the house is not one, and not yet while one that could be it is put off', () => {
+    const root = rootOf(P, 'p');
+    const ours = delegation(owner, house2.pub);
+    const { res } = resolve('p', [root], { delegations: [ours] });
+    // the room's: the very value the caller gave, which it may hold and compare with what the doc holds later
+    expect(res.houseBy(house2.pub, 1)?.value).toBe(ours);
+    expect(res.houseBy(house2.pub, 1)?.hash).toBe(recHash(ours));
+    // the one the game's own checkpoint carries
+    expect(res.houseBy(house.pub, 1)).toEqual({ value: root.value.dl, hash: recHash(root.value.dl) });
+    expect(res.houseBy(house.pub, 0), 'there is no round 0').toBeNull();
+    expect(res.houseBy(stranger.pub, 1), 'a house nobody delegated').toBeNull();
+    // a forged one is none, and one put off is none yet
+    const forged = { ...ours, g: BAD_SIG };
+    expect(resolve('p', [root], { delegations: [forged] }).res.houseBy(house2.pub, 1)).toBeNull();
+    const held = resolve('p', [root], { delegations: [ours], hold: [recHash(ours) as string] });
+    expect(held.res.houseAt(house2.pub, 1)).toBeUndefined();
+    expect(held.res.houseBy(house2.pub, 1)).toBeUndefined();
+    expect(held.res.houseBy(stranger.pub, 1), 'no delegation at all: none, and nothing waited for').toBeNull();
+    // one put off does not hide one that holds: that one is the one gone by
+    const good = delegation(owner, house2.pub);
+    const beside = resolve('p', [root], { delegations: [forged, good], hold: [recHash(forged) as string] });
+    expect(beside.res.houseBy(house2.pub, 1)?.value).toBe(good);
+    // a game with nothing readable has no house
+    expect(resolve('p', []).res.houseBy(house.pub, 1)).toBeNull();
+  });
+
+  it('goes by the delegation the holder of the round signed, of two of one house, and by the room\'s copy before a checkpoint\'s', () => {
+    const root = rootOf(P, 'p');
+    const trim = trimOf(P, 'p');
+    const xf = xferOf(P, owner, buyer, 3);
+    const sellers = delegation(owner, house2.pub);
+    const buyers = delegation(buyer, house2.pub);
+    // the buyer's first: the order they are given in does not say which round each is for
+    const { res } = resolve('p', [root, trim, xf], { delegations: [buyers, sellers] });
+    expect(res.holder).toBe(buyer.pub);
+    expect(res.houseBy(house2.pub, 3)?.value, 'the round of the sale is the seller\'s').toBe(sellers);
+    expect(res.houseBy(house2.pub, 4)?.value, 'the round after it is the buyer\'s').toBe(buyers);
+    // the buyer's house's own checkpoint carries the buyer's delegation; a copy of it the room holds is given first
+    const adoption = trimOf(P, 'p', { u: 3, k: house2.pub, dl: buyers, x: [xf.value] });
+    const copy = { ...buyers };
+    expect(resolve('p', [root, trim, xf, adoption]).res.houseBy(house2.pub, 4)).toEqual({ value: buyers, hash: recHash(buyers) });
+    expect(resolve('p', [root, trim, xf, adoption], { delegations: [copy] }).res.houseBy(house2.pub, 4)?.value).toBe(copy);
+  });
 });
 
 describe('the table\'s game (S9)', () => {
