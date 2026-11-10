@@ -2718,32 +2718,34 @@ pub(crate) async fn resolve_pin(pin: &str, port: u16) -> Vec<SocketAddr> {
 
 fn load_store(path: &Path) -> Vec<StoredPeer> {
     match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<StoreFile>(&bytes) {
-            Ok(file) if file.v == 1 => file.peers,
-            Ok(file) => {
-                eprintln!("⛓️ chain peers: {} is version {}, which this node does not read; starting empty", path.display(), file.v);
-                vec![]
+        Ok(bytes) => {
+            // 🔒 A file an older build wrote was left to the umask; it names
+            // the full nodes this station used. Tightened as it is read; a
+            // failure is said and the peers are still taken.
+            if let Err(e) = crate::private_file::tighten_private(path) {
+                eprintln!("⛓️ chain peers: could not make {} readable by its owner only ({e})", path.display());
             }
-            Err(e) => {
-                eprintln!("⛓️ chain peers: {} unreadable ({e}); starting empty", path.display());
-                vec![]
+            match serde_json::from_slice::<StoreFile>(&bytes) {
+                Ok(file) if file.v == 1 => file.peers,
+                Ok(file) => {
+                    eprintln!("⛓️ chain peers: {} is version {}, which this node does not read; starting empty", path.display(), file.v);
+                    vec![]
+                }
+                Err(e) => {
+                    eprintln!("⛓️ chain peers: {} unreadable ({e}); starting empty", path.display());
+                    vec![]
+                }
             }
-        },
+        }
         Err(_) => vec![],
     }
 }
 
+/// Write the store whole, through a temporary and a rename, owner-only on
+/// Unix (`private_file::write_private_replacing`).
 fn write_store(path: &Path, file: &StoreFile) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            let _ = std::fs::remove_file(&tmp);
-            std::fs::write(path, &bytes).map_err(|_| rename_err)
-        }
-    }
+    crate::private_file::write_private_replacing(path, &bytes)
 }
 
 /// A listing's continuation: the height and header hash the next
@@ -6269,6 +6271,32 @@ mod tests {
         let lane = Arc::new(Lane::new(net, vec![pin.addr.to_string()], false, Some(store)).with_tls(TLS.clone()));
         assert_eq!(PeerLane::new(lane.clone(), Trust::Agreed).peak_height().await.unwrap(), 100);
         assert!(lane.state.lock().await.introduce_after.is_none(), "the pin and the stored peer agreed; the introducer was not asked");
+    }
+
+    /// 🔒 `chia_peers.json` names the full nodes this station used
+    /// (docs/TDD/ChiaLanePrivacy.md §9): it is written owner-only, and a
+    /// file an older build left to the umask is tightened when it is
+    /// loaded, its peers taken as before. Unix only, where the mode is the
+    /// rule.
+    #[cfg(unix)]
+    #[test]
+    fn the_peer_store_is_owner_only_and_tightened_when_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let store = temp_store("owner-only");
+        let _ = std::fs::remove_file(&store);
+        let peers = || vec![StoredPeer { addr: "203.0.113.5:58444".to_string(), last_ok: 7 }];
+        write_store(&store, &StoreFile { v: 1, peers: peers() }).unwrap();
+        assert_eq!(mode(&store), 0o600, "written owner-only");
+        assert!(!store.with_file_name(format!("{STORE_FILE}.tmp")).exists(), "through a temporary that became the file");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_store(&store).iter().map(|p| p.addr.clone()).collect::<Vec<_>>(), vec!["203.0.113.5:58444".to_string()]);
+        assert_eq!(mode(&store), 0o600, "tightened as it is loaded");
+        // A later save replaces a broader file with an owner-only one.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_store(&store, &StoreFile { v: 1, peers: peers() }).unwrap();
+        assert_eq!(mode(&store), 0o600);
+        let _ = std::fs::remove_file(&store);
     }
 
     #[test]
