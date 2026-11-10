@@ -415,7 +415,8 @@ mod tests {
     ///   path is closed, a knock is handed the money path, which ends in
     ///   the keys' refusal, and no listing or knock key is made.
     /// - The beacon's seam dates this network's push from the writer's last
-    ///   step on both paths, and the forgotten mark's date is carried
+    ///   step on both paths, no earlier than this network's own mark, which
+    ///   the write replaces, and the forgotten mark's date is carried
     ///   before the mark is removed.
     ///
     /// What it does not see: a path read under another name, or an arm
@@ -467,9 +468,10 @@ mod tests {
         // and called by each as its body, the last step before a bundle.
         let seam = item(publish, "\nasync fn beacon_on_path<");
         assert_eq!(code_lines(seam, "let pushed = "), ["let pushed = data.join(net.path(BEACON_PUSHED_FILE));"], "this network's own file");
-        assert_eq!(code_lines(seam, "date_beacon_push(").len(), 1);
+        assert_eq!(code_lines(seam, "let mark = "), ["let mark = data.join(net.path(BEACON_MARK_FILE));"], "and this network's own mark, which the write replaces");
+        assert_eq!(code_lines(seam, "date_beacon_push").len(), 1);
         assert_eq!(code_lines(seam, "dated"), [
-            "let dated = move || date_beacon_push(&pushed, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
+            "let dated = move || date_beacon_push_over(&pushed, &mark, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
             "publish_beacon_with(lease, fuse, net, client, now(), keys.beacon(), iroh_sk, era, now_unix, dated, rng).await?",
             "publish_beacon_on(lease, net, client, now, iroh_sk, &beacon_wallet_key(keys.money()?.secret_key()), era, now_unix, dated).await?",
         ]);
@@ -480,8 +482,12 @@ mod tests {
         }
         assert_eq!(code_lines(publish, "date_beacon_push("), [
             "fn date_beacon_push(path: &std::path::Path, at: u64) -> std::io::Result<()> {",
+            "date_beacon_push(pushed, at)",
             "date_beacon_push(pushed, last_at)?;",
-            "let dated = move || date_beacon_push(&pushed, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
+        ]);
+        assert_eq!(code_lines(publish, "date_beacon_push_over("), [
+            "fn date_beacon_push_over(pushed: &std::path::Path, mark: &std::path::Path, at: u64) -> std::io::Result<()> {",
+            "let dated = move || date_beacon_push_over(&pushed, &mark, now_unix).map_err(|e| anyhow!(\"this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent\"));",
         ]);
         assert_eq!(code_lines(heartbeat, "forget_beacon_mark("), ["if let Err(e) = forget_beacon_mark(beacon_mark_path, beacon_pushed_path, m.last_at) {"]);
         assert_eq!(code_lines(heartbeat, "let beacon_pushed_file = "), ["let beacon_pushed_file = crate::chia_network::net().path(BEACON_PUSHED_FILE);"]);

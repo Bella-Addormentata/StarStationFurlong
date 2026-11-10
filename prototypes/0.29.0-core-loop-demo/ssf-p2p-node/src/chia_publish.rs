@@ -4924,8 +4924,9 @@ struct BeaconPushed {
 /// and a beacon confirmed outside its era is on the chain. So each network
 /// dates its push here before the bundle is built
 /// ([`beacon_on_path`]), and a mark's date is carried here before the mark
-/// is removed ([`forget_beacon_mark`]). The node never moves the date back
-/// and never removes the file.
+/// is removed ([`forget_beacon_mark`]) or replaced by the next write's
+/// ([`date_beacon_push_over`]). The node never moves the date back and
+/// never removes the file.
 ///
 /// What the date is, and what the guard keeps by it. `at` is the time the
 /// try's beacon is issued at, the same value its memo carries
@@ -4962,6 +4963,29 @@ fn date_beacon_push(path: &std::path::Path, at: u64) -> std::io::Result<()> {
     };
     let bytes = serde_json::to_vec(&BeaconPushed { last_at: at }).map_err(std::io::Error::other)?;
     crate::chia_contact::write_private(path, &bytes)
+}
+
+/// Dates a beacon try's push at `at` in the network's dated push at
+/// `pushed` ([`date_beacon_push`]), and no earlier than the network's own
+/// beacon mark at `mark` is dated ([`read_other_beacon`], which reads it
+/// without changing it). The write that follows replaces that mark: the
+/// heartbeat saves the new one over it, and never through
+/// [`forget_beacon_mark`]. A mark this build wrote is dated no later than
+/// the push on file, which was dated before its beacon left. A mark an
+/// older build wrote has no dated push beside it, and where the clock ran
+/// ahead when it was written and has been put right since, its date is
+/// later than `at`: saved over with nothing kept, that date would be on
+/// neither file, and the other network's guard would open 14 days after
+/// this write while the beacon the old mark recorded still carries the
+/// later date. A mark that can be neither read nor dated is an error, as
+/// a dated push that cannot be is, and nothing is dated.
+fn date_beacon_push_over(pushed: &std::path::Path, mark: &std::path::Path, at: u64) -> std::io::Result<()> {
+    let at = match read_other_beacon(mark) {
+        OtherBeacon::None => at,
+        OtherBeacon::At(held) => held.max(at),
+        OtherBeacon::Unreadable => return Err(std::io::Error::other("this network's beacon mark is there but can be neither read nor dated")),
+    };
+    date_beacon_push(pushed, at)
 }
 
 /// Removes the beacon mark at `mark`, whose beacon was written at `last_at`,
@@ -6267,7 +6291,9 @@ pub(crate) async fn publish_beacon(
 /// for its gate and the chain is asked nothing.
 ///
 /// Then this network's own push is dated, for the other network's guard
-/// ([`date_beacon_push`] in `net`'s [`BEACON_PUSHED_FILE`] in `data`), as
+/// ([`date_beacon_push_over`] in `net`'s [`BEACON_PUSHED_FILE`] in `data`,
+/// no earlier than `net`'s own beacon mark there, which the write
+/// replaces), as
 /// the writer's last step before its bundle is built: after every wait,
 /// since a try that only waits sends nothing and dates nothing, and before
 /// the push, so no beacon leaves that the file does not date. If the date
@@ -6310,7 +6336,8 @@ async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
         return Ok(BeaconDone::Guarded(line));
     }
     let pushed = data.join(net.path(BEACON_PUSHED_FILE));
-    let dated = move || date_beacon_push(&pushed, now_unix).map_err(|e| anyhow!("this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent"));
+    let mark = data.join(net.path(BEACON_MARK_FILE));
+    let dated = move || date_beacon_push_over(&pushed, &mark, now_unix).map_err(|e| anyhow!("this network's {BEACON_PUSHED_FILE} could not be saved ({e}), so the beacon was not sent"));
     let (hint, write) = if burners {
         anyhow::ensure!(
             keys.net() == net,
@@ -13431,6 +13458,65 @@ mod tests {
             assert!(std::fs::symlink_metadata(&looped).unwrap().file_type().is_symlink(), "left as it is");
         }
         assert!(names(&dir).iter().all(|name| !name.ends_with(".tmp")), "no temporary is left: {:?}", names(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A beacon try dates its push no earlier than the mark its write
+    /// replaces ([`date_beacon_push_over`]). With no mark, or one dated
+    /// behind the try, the date is the try's. A mark dated ahead of it, as
+    /// an older build's is where the clock ran ahead and was put right, has
+    /// no dated push beside it: its date is the one saved, so it outlasts
+    /// the mark, and a later try does not move it back. A later date already
+    /// on file is kept. A mark that does not parse is dated by when it last
+    /// changed, as the guard dates it. One that can be neither read nor
+    /// dated is an error, and nothing is dated. The mark is never changed.
+    #[test]
+    fn a_beacon_push_is_dated_no_earlier_than_the_mark_its_write_replaces() {
+        let dir = beacon_files_dir("over");
+        let (mark, pushed) = (dir.join(BEACON_MARK_FILE), dir.join(BEACON_PUSHED_FILE));
+        let now = 1_700_000_000;
+        let mark_at = |at: u64| serde_json::to_vec_pretty(&BeaconMark { era: 3, last_at: at, hint: "ab".into(), node_id: Some("n".into()), confirmed: true, ..Default::default() }).unwrap();
+
+        date_beacon_push_over(&pushed, &mark, now).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now), "no mark: the try's own time");
+        std::fs::write(&mark, mark_at(now - 5)).unwrap();
+        date_beacon_push_over(&pushed, &mark, now + 10).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now + 10), "a mark dated behind the try");
+
+        // An older build's mark, dated ahead of the clock, and no dated push.
+        std::fs::remove_file(&pushed).unwrap();
+        let ahead = mark_at(now + 500);
+        std::fs::write(&mark, &ahead).unwrap();
+        date_beacon_push_over(&pushed, &mark, now + 20).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now + 500), "the mark's date, which its beacon carries");
+        assert_eq!(std::fs::read(&mark).unwrap(), ahead, "the mark is read, never changed");
+        // The heartbeat saves the new write's mark over it: the later date
+        // is still on file, and the next try does not move it back.
+        std::fs::write(&mark, mark_at(now + 20)).unwrap();
+        date_beacon_push_over(&pushed, &mark, now + 30).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now + 500), "it outlasts the mark");
+        date_beacon_push_over(&pushed, &mark, now + 600).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now + 600), "and moves forward with a later try");
+
+        // A mark that does not parse is dated by when it last changed.
+        std::fs::remove_file(&pushed).unwrap();
+        std::fs::write(&mark, b"not a mark").unwrap();
+        let OtherBeacon::At(changed) = read_other_beacon(&mark) else { panic!("dated by its last change") };
+        assert!(changed > now, "the wall clock is past the test's dates");
+        date_beacon_push_over(&pushed, &mark, now).unwrap();
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(changed));
+
+        // A mark that can be neither read nor dated: an error, and nothing
+        // is dated.
+        std::fs::remove_file(&pushed).unwrap();
+        let unreadable = dir.join("a\0b");
+        assert_eq!(read_other_beacon(&unreadable), OtherBeacon::Unreadable);
+        let e = date_beacon_push_over(&pushed, &unreadable, now).unwrap_err();
+        assert_eq!(e.to_string(), "this network's beacon mark is there but can be neither read nor dated");
+        assert!(!pushed.exists(), "nothing is dated");
+        date_beacon_push(&pushed, now + 900).unwrap();
+        assert!(date_beacon_push_over(&pushed, &unreadable, now + 950).is_err());
+        assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(now + 900), "and a date on file is left as it was");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

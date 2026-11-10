@@ -7065,3 +7065,53 @@ async fn a_beacon_pushed_on_one_network_holds_the_other_networks_beacon_back_for
     assert_eq!(read_other_beacon(&main_pushed), OtherBeacon::At(t2), "its date moved forward");
     assert!(main.chain.unanswered().is_empty() && test.chain.unanswered().is_empty());
 }
+
+/// A data folder an older build left (stage 4 design §4.5 (7)): testnet11's
+/// beacon mark, written while the clock ran ahead, and no dated push beside
+/// it, since that build dated none. The clock has been put right. The next
+/// beacon's write replaces the mark, and its try dates the push no earlier
+/// than the mark it replaces ([`date_beacon_push_over`]): the later date is
+/// on file before the bundle is built, and is still there once the heartbeat
+/// has saved the new write's mark over the old one. Mainnet's guard holds
+/// by it: 14 days after the new write its beacon is still refused, with the
+/// line of a date under 14 days old that names the dated push, and it goes
+/// out 14 days after the old mark's date. Dated at the try's own time
+/// alone, the later date was on neither file after the write, and mainnet's
+/// beacon went out while the beacon the old mark recorded still carried it.
+#[tokio::test]
+async fn a_mark_dated_ahead_of_the_clock_is_carried_into_the_dated_push_before_the_next_write_replaces_it() {
+    use crate::chia_network::ChiaNet::Mainnet;
+    let (mut test, mut main) = (setup().await, setup_on(Mainnet).await);
+    let (node, data) = (iroh::SecretKey::generate(), empty_data_folder());
+    crate::chia_network::make_state_dir(Mainnet, &data).unwrap();
+    let main_keys = PublisherKeys::of(Mainnet, wallet(154));
+    ready_dish(&test, 10).await;
+    ready_dish_of(&main, Mainnet, 10).await;
+    let (mark, pushed) = (data.join(NET.path(BEACON_MARK_FILE)), data.join(NET.path(BEACON_PUSHED_FILE)));
+    let mark_at = |at: u64| serde_json::to_vec_pretty(&BeaconMark { era: 0, last_at: at, hint: "ab".into(), node_id: Some("n".into()), confirmed: true, ..Default::default() }).unwrap();
+    let t0 = unix_now();
+    let ahead = t0 + 3 * 86_400;
+
+    // The older build's mark, three days ahead of the clock as it now is.
+    std::fs::write(&mark, mark_at(ahead)).unwrap();
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::None, "that build dated no push");
+
+    // testnet11's next beacon, at the clock's time.
+    beacon_wrote(test.arm_beacon(154, true, &node, 0, &data, t0, 1).await);
+    assert_eq!(read_other_beacon(&pushed), OtherBeacon::At(ahead), "dated no earlier than the mark the write replaces");
+    // The heartbeat saves the new write's mark over the old one.
+    std::fs::write(&mark, mark_at(t0)).unwrap();
+    assert_eq!(other_beacon(&data, Mainnet), (pushed.clone(), OtherBeacon::At(ahead)), "the later date is still on file");
+
+    // Mainnet's beacon, 14 days after that write: still held back.
+    let early = t0 + BEACON_GUARD_SECS;
+    let done = main.arm_beacon_on(&main_keys, true, &node, 0, &data, early, 2).await;
+    let line = beacon_guarded(&done).expect("held back by the date the old mark carried");
+    assert_eq!(Some(line.clone()), beacon_guard(Mainnet, &pushed, OtherBeacon::At(ahead), early), "the guard's own line");
+    assert!(line.contains("is less than 14 days old") && line.contains(&pushed.display().to_string()), "{line}");
+    assert!(main.asked_nothing() && main.chain.received().is_empty(), "nothing asked or sent");
+    // And out 14 days after the old mark's date.
+    let (_, _, from_burner) = beacon_wrote(main.arm_beacon_on(&main_keys, true, &node, 0, &data, ahead + BEACON_GUARD_SECS, 3).await);
+    assert!(from_burner);
+    assert!(main.chain.unanswered().is_empty() && test.chain.unanswered().is_empty());
+}
