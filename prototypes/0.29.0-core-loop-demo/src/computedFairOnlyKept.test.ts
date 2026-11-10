@@ -1315,6 +1315,265 @@ describe('what a page holds of a game, and what the doc lacks of it', () => {
     expect(lacks(a)).toEqual([]);
   });
 
+  it('nor does a base that only a count that waited went by: the page counts whole from the buyer\'s checkpoint, then from the root while a forged transfer of an earlier round is not checked yet; a book of the table\'s chips goes, the check fails, and the write that brings the book back empties the session of the buyer\'s checkpoint and deletes the delegation of the house that joined there, which is held still', async () => {
+    const [a] = await gameRoom(['A']);
+    const xf = handOver(1);
+    const key = delegationKey(H.pub);
+    const theirs = delegation(buyer, H.pub, PAGE_ROOM);
+    // the game handed over after round 1; the buyer's house trims at round 3 (a trim deletes the checkpoint it
+    // replaces), and the root's house, which the buyer delegates in the room, has joined round 4 in the session the
+    // trim opens
+    const trim = trimOf(G, 'p', { b: SID, u: 3, n: {}, h: undefined, k: H2.pub, dl: delegation(buyer, H2.pub, PAGE_ROOM), x: [xf.value] });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H, 4);
+    a.doc.transact(() => {
+      top(a).set(xf.key, xf.value);
+      top(a).set(trim.key, trim.value);
+      top(a).set(key, theirs);
+      top(a).delete(root.key);
+      top(a).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(a).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    const stands = { pending: false, live: true, holder: buyer.pub, base: { key: trim.key } };
+    expect(res(a)).toMatchObject(stands);
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toEqual([]);
+    // no check can run, and a peer writes a transfer of the owner's from round 0 with a signature that is not its
+    // own, the root again and an empty map for its session: the chain waits at the transfer, and the page counts from
+    // the root meanwhile
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    const forged = { ...xferOf(G, owner, third, 0, DEED).value, g: xf.value.g };
+    a.doc.transact(() => {
+      top(a).set(xfKey(TABLE, G.inc, xfId(forged)!), forged);
+      top(a).set(root.key, root.value);
+      top(a).set(SES, new Y.Map());
+    });
+    expect(res(a)).toMatchObject({ pending: true, holder: owner.pub, base: { key: root.key } });
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    // a book of the table's chips this page has read goes: the table is not whole. Checks run again and the forged
+    // transfer fails: the answer names the buyer's checkpoint again, and the page does not count from it yet
+    const chips = a.doc.getMap<unknown>('casinoChips');
+    const book = `book:${TABLE}:x`;
+    chips.set(book, 1);
+    chips.delete(book);
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+    set(a, delegationKey(third.pub), delegation(owner, third.pub, PAGE_ROOM));
+    expect(res(a)).toMatchObject(stands);
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    // the write that brings the book back puts an empty map in the place of that checkpoint's session and deletes the
+    // delegation: the page counts from the buyer's checkpoint again, with no record of any house, and holds the
+    // delegation its count of that session went by all the same
+    a.doc.transact(() => {
+      top(a).set(next, new Y.Map());
+      top(a).delete(key);
+      chips.set(book, 1);
+    });
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    expect(res(a)).toMatchObject(stands);
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(theirs);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('nor does the first count from a base that came while the table was not whole let go of a house: with a book of the table\'s chips away a checkpoint of round 1 comes, a house\'s join in the session it opens, and the write that brings the book back empties that session and deletes the delegation, which is held still', async () => {
+    const { a } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const dl = delegation(owner, H2.pub, PAGE_ROOM);
+    const chips = a.doc.getMap<unknown>('casinoChips');
+    const book = `book:${TABLE}:x`;
+    chips.set(book, 1);
+    chips.delete(book);
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    // the root's house trims at round 1, and H2 has joined the round after in the session the trim opens: the answer
+    // names the checkpoint, and the page reads nothing of its session
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: undefined, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H2, 2);
+    a.doc.transact(() => {
+      top(a).set(trim.key, trim.value);
+      top(a).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(a).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    // a peer puts an empty map in the place of that session's and deletes the delegation, in the write that brings
+    // the book back: the page's first count from the checkpoint finds no record of the house
+    a.doc.transact(() => {
+      top(a).set(next, new Y.Map());
+      top(a).delete(key);
+      chips.set(book, 1);
+    });
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(dl);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('nor when it came while the doc held part of an update: nothing is judged there, and the base the answer names is noted for the houses held all the same', async () => {
+    const { a, b, at } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const dl = delegation(owner, H2.pub, PAGE_ROOM);
+    // the second of two updates of a peer comes before the first: the doc holds part of an update, and no table of
+    // the room is counted
+    const [first, second] = updatesOf(b, () => { set(b, 'x:1', 1); set(b, 'x:2', 2); });
+    deliver(at, a, [second]);
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: undefined, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H2, 2);
+    a.doc.transact(() => {
+      top(a).set(trim.key, trim.value);
+      top(a).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(a).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    // a peer puts an empty map in the place of that session's and deletes the delegation, and the first update comes
+    a.doc.transact(() => {
+      top(a).set(next, new Y.Map());
+      top(a).delete(key);
+    });
+    expect(a.casino.casinoWhole(TABLE)).toBe(false);
+    deliver(at, a, [first]);
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(dl);
+    expect(lacks(a)).toEqual([]);
+  });
+
+  it('a count that waited takes from a house no base it is kept for: the root\'s house, which the buyer delegates and whose join the buyer\'s checkpoint counted, has a record at the root too, which the count from the root went by while a forged transfer waited, and with the session of the buyer\'s checkpoint emptied as the check fails its delegation is held still', async () => {
+    const [a] = await gameRoom(['A']);
+    const first = kit.houseJoin(H, 1);
+    house(a, first);
+    const xf = handOver(1);
+    const key = delegationKey(H.pub);
+    const theirs = delegation(buyer, H.pub, PAGE_ROOM);
+    const trim = trimOf(G, 'p', { b: SID, u: 3, n: {}, h: undefined, k: H2.pub, dl: delegation(buyer, H2.pub, PAGE_ROOM), x: [xf.value] });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H, 4);
+    a.doc.transact(() => {
+      top(a).set(xf.key, xf.value);
+      top(a).set(trim.key, trim.value);
+      top(a).set(key, theirs);
+      top(a).delete(root.key);
+      top(a).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(a).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    const stands = { pending: false, live: true, holder: buyer.pub, base: { key: trim.key } };
+    expect(res(a)).toMatchObject(stands);
+    expect(lacks(a)).toEqual([]);
+    // no check can run, and a peer writes a forged transfer of round 0, the root again, and the root's session with
+    // the house's join of round 1 as it was (checked long ago): the page counts from the root, and goes by that join
+    a.casino.setComputedVerifyForTests({ now: () => 0, budgetMs: 0 });
+    const forged = { ...xferOf(G, owner, third, 0, DEED).value, g: xf.value.g };
+    a.doc.transact(() => {
+      top(a).set(xfKey(TABLE, G.inc, xfId(forged)!), forged);
+      top(a).set(root.key, root.value);
+      const ses = new Y.Map<unknown>();
+      top(a).set(SES, ses);
+      ses.set(first.key, first.rec);
+    });
+    expect(res(a)).toMatchObject({ pending: true, holder: owner.pub, base: { key: root.key } });
+    // checks run again, and in that write the session of the buyer's checkpoint is emptied and the delegation deleted
+    a.casino.setComputedVerifyForTests({ now: () => 0 });
+    a.doc.transact(() => {
+      top(a).set(delegationKey(third.pub), delegation(owner, third.pub, PAGE_ROOM));
+      top(a).set(next, new Y.Map());
+      top(a).delete(key);
+    });
+    expect(res(a)).toMatchObject(stands);
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(theirs);
+  });
+
+  it('a count that waited keeps a house it went by a record of for its base: the game moves on to a checkpoint with a house\'s join in the session it opens, the count from it waits for a bet\'s check, and that session\'s map put there again, empty, with the delegation deleted, before a count is whole lets go of nothing', async () => {
+    const { a, b, at } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const dl = delegation(owner, H2.pub, PAGE_ROOM);
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: undefined, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H2, 2);
+    b.doc.transact(() => {
+      top(b).set(trim.key, trim.value);
+      top(b).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(b).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    // the check of the house's join uses up the time of the count, and the check of the bet is put off
+    let spent = 0;
+    a.casino.setComputedVerifyForTests({
+      now: () => spent,
+      verify: (pub, bytes, sig) => {
+        if (pub === H2.pub) spent = 1_000_000;
+        return verifyIdentityStrict(pub, bytes, sig);
+      },
+    });
+    Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(a.doc)));
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(a).pending).toBe(true);
+    // a peer puts an empty map in the place of that session's and deletes the delegation, in one write: the count is
+    // whole, no record is the house's, and the count that waited went by one at this base
+    a.doc.transact(() => {
+      top(a).set(next, new Y.Map());
+      top(a).delete(key);
+    });
+    expect(a.casino.casinoWhole(TABLE)).toBe(true);
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toMatchObject([{ missing: 1, sessionMissing: false }]);
+    expect(putBack(a)).toBe(1);
+    expect(top(a).get(key)).toEqual(dl);
+  });
+
+  it('a count that waited for nothing settles the base a house is kept for: once the game has counted whole from a checkpoint that went by the house\'s join, an earlier transfer that takes the game back to the root finds the house kept for the root no more, and with no record of it there it is let go', async () => {
+    const { a } = await decidedBy(H2);
+    const key = delegationKey(H2.pub);
+    const trim = trimOf(G, 'p', { b: SID, u: 1, n: {}, h: undefined, dl: delegation(owner, H.pub, PAGE_ROOM) });
+    const next = `ses:${TABLE}:${G.inc}:${nextSid3(G, trim.value)}`;
+    const join = kit.houseJoin(H2, 2);
+    a.doc.transact(() => {
+      top(a).set(trim.key, trim.value);
+      top(a).delete(SES);
+      const ses = new Y.Map<unknown>();
+      top(a).set(next, ses);
+      ses.set(join.key, join.rec);
+    });
+    expect(res(a)).toMatchObject({ pending: false, live: true, base: { key: trim.key } });
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toEqual([]);
+    // the owner had handed the game on before round 1: the trim is no checkpoint of the game's, which is at the root
+    // again, its session's map there empty, and the delegation is deleted in that write
+    const earlier = xferOf(G, owner, third, 0, DEED);
+    a.doc.transact(() => {
+      top(a).set(earlier.key, earlier.value);
+      top(a).set(SES, new Y.Map());
+      top(a).delete(key);
+    });
+    expect(res(a)).toMatchObject({ pending: false, live: true, holder: third.pub, base: { key: root.key } });
+    expect(foldOf(a).pending).toBe(false);
+    expect(lacks(a)).toEqual([]);
+    expect(putBack(a)).toBe(0);
+  });
+
   it('a delegation held for a house whose records are away is let go like any other when its signer holds the game no more', async () => {
     const { a } = await decidedBy(H2);
     const key = delegationKey(H2.pub);

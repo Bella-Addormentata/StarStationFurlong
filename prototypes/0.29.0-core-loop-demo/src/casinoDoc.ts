@@ -2281,16 +2281,21 @@ interface FairOnlyState {
   heldFin: unknown;
   heldHks: Map<string, HeldDelegation[]>;
   houseUsed: Map<string, Map<string, DelegationRec>>;
-  /** …and the key of the base the game counted from when the delegations held
-   *  were last kept whole (null: never). While the game counts from that base
-   *  still, the delegation of a house no record of the live session is of now
-   *  stays held: the rounds it decided are in no checkpoint yet, and its
-   *  records are on their way back (a session's map a peer deleted, opened
-   *  again empty; a record a peer deleted and its author puts back). Let go of
-   *  when the game moves on to another base (keepHouses), and kept again from
-   *  the resolution itself if a record of its house counts after that: a count
-   *  goes by nothing this page does not hold. */
-  hkBase: string | null;
+  /** …and, by the key of each house whose delegations are held, the keys of
+   *  the bases they are kept for (null: an answer that named no base): the
+   *  base of each count that went by a record of the house (keepHouses), and
+   *  the base each answer named while the game was not counted, its table not
+   *  whole (noteHousesParked). While the game counts from one of them, the
+   *  delegation of a house no record of the live session is of now stays
+   *  held: the rounds it decided are in no checkpoint yet, and its records are
+   *  on their way back (a session's map a peer deleted, opened again empty; a
+   *  record a peer deleted and its author puts back). A count that waited for
+   *  nothing settles it: the houses it keeps are kept for its base alone from
+   *  there, and a house no record is of that is not kept for that base is let
+   *  go of (the game moved on), and kept again from the resolution itself if
+   *  a record of its house counts after that: a count goes by nothing this
+   *  page does not hold. */
+  hkUnder: Map<string, (string | null)[]>;
   /** 🔒 Under the keys of the delegations held, the values the last look found
    *  there that are no good delegation of the house by a holder of the game (a
    *  stranger's, or one whose signature fails): the held one is written over
@@ -4079,7 +4084,7 @@ function trackComputed(t: string, inc: string): ComputedInc {
   const ctx: FoldCtx = { room: boundRoomId, t, inc };
   // 🔒 A FAIR ONLY game's houses are the ones its resolution says decide a round.
   const fo: FairOnlyState | null = isFairOnlyInc(inc)
-    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkBase: null, hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
+    ? { cks: new Map(), xfs: new Map(), fin: undefined, res: null, held: null, heldWhole: null, heldXfs: new Map(), heldFin: undefined, heldHks: new Map(), houseUsed: new Map(), hkUnder: new Map(), hkOver: new Map(), hkWaits: false, lacking: false, returns: 0, sesMoves: 0, folded: undefined, sidFor: null, sid: '', houses: NO_HOUSES, committing: undefined, committingWaits: false }
     : null;
   // (…and the page keeps which keys it answered were, and the delegation the
   // resolution went by for each: they are what the fold's counts stand on,
@@ -4375,10 +4380,15 @@ function countComputed(c: ComputedInc, map: Y.Map<unknown>, casino: Y.Map<unknow
     // 🔒 (A game's put-backs are counted while it is not, noteFairOnlyLacks,
     // and what stands under the keys of the delegations it holds is looked at
     // as after a count, with no house let go of for want of a record: the
-    // fold asked of none, keepHouses.)
-    if (c.fo && !docHoldsPart()) {
-      keepHouses(c, c.fo.res!.pending, true);
-      noteFairOnlyLacks(c, map);
+    // fold asked of none, keepHouses. Neither on a doc that holds part of an
+    // update, where nothing is judged; the base the answer names is noted for
+    // the houses held there too, which judges nothing: noteHousesParked.)
+    if (c.fo) {
+      noteHousesParked(c.fo);
+      if (!docHoldsPart()) {
+        keepHouses(c, c.fo.res!.pending, true);
+        noteFairOnlyLacks(c, map);
+      }
     }
     return;
   }
@@ -4612,37 +4622,38 @@ function settleStanding(fo: FairOnlyState): void {
  *  house then, or the chain is not whole (a holder not told yet is no
  *  stranger).
  *
- *  And while the game counts from the base the held ones were kept under
- *  (`hkBase`), the houses of the delegations held are gone through with the
- *  ones the fold counted a record of: a session's map a peer deleted comes back
- *  empty (the put-back duty opens it, and the records' authors and witnesses
- *  put them back into it after), so the fold of that moment counts no house's
- *  record, and a delegation let go of then, with its key deleted too, would
- *  leave the rounds its house decided undecided once the records are back. A
- *  house no record is of is let go of when the game moves on to another base:
- *  its rounds are in a checkpoint then. (Should a record of its house count in
- *  the new base's session after that, under a resolution made while the page
- *  held the delegation still, it is kept again from that resolution.)
+ *  And while the game counts from a base a house is kept for (`hkUnder`), the
+ *  house is gone through with the ones the fold counted a record of: a
+ *  session's map a peer deleted comes back empty (the put-back duty opens it,
+ *  and the records' authors and witnesses put them back into it after), so the
+ *  fold of that moment counts no house's record, and a delegation let go of
+ *  then, with its key deleted too, would leave the rounds its house decided
+ *  undecided once the records are back. A house no record is of is let go of
+ *  when the game moves on to another base: its rounds are in a checkpoint
+ *  then. (Should a record of its house count in the new base's session after
+ *  that, under a resolution made while the page held the delegation still, it
+ *  is kept again from that resolution.)
  *
- *  While the game is not counted because its table is not whole (`parked`: the
- *  map of the session this page counted from its base is gone, or something
- *  else of the table this page read is, casinoWhole: a table is whole or not as
- *  one), the keys of all the delegations held are looked at all the same, and
- *  no house is let go of for want of a record: the fold asked of none. A peer
- *  that deletes the map and writes a stranger's delegation over a held one has
- *  the held one put back at once, which waits for nobody to open the session
- *  again. The base the page last counted from is the one the held ones are
- *  kept under from there (it nearly always was: only a base whose one count
- *  waited was not): where the session that is gone is the game's own, it is
- *  that base's, and its records are on their way back. Not the base the answer
- *  names, where that is another: an answer is no count, and should that base
- *  be gone again before the page counts from it (a checkpoint that comes while
- *  a book of the table's chips is away, deleted in the write that brings the
- *  book back and empties the session's map), the game is at the base the page
- *  holds, and a house let go of there for want of a record would leave its
- *  round undecided once the records are back. (Where the page then counts
- *  from the base the answer named, the houses left behind are let go of
- *  there, as at any count from another base.)
+ *  Which bases a house is kept for is noted where the page learns it, by
+ *  house, and nowhere worked out after the fact from what else the page holds
+ *  (the base it counted from last may be one that a count that waited went
+ *  by, short of the chain: a forged transfer not checked yet):
+ *  - a count whose answer and fold waited for nothing settles it: every house
+ *    it keeps is kept for its base, and for that one alone from there;
+ *  - a count that waited adds its base for the houses it went by a record of
+ *    (and lets go of nothing, so it takes no base from any house either: the
+ *    game may be back at the one before, on what stood there);
+ *  - and while the game is not counted because its table is not whole
+ *    (noteHousesParked), the base each answer names is added for every house
+ *    held.
+ *  While the game is not counted (`parked`: the map of the session this page
+ *  counted from its base is gone, or something else of the table this page
+ *  read is, casinoWhole: a table is whole or not as one) the keys of all the
+ *  delegations held are looked at all the same (every house held is kept for
+ *  the base the answer names by then), and no house is let go of for want of
+ *  a record: the fold asked of none. A peer that deletes the session's map
+ *  and writes a stranger's delegation over a held one has the held one put
+ *  back at once, which waits for nobody to open the session again.
  *  A held one whose signer holds the game no more is let go of there as at any
  *  whole count: the chain is the resolution's, not the fold's. */
 function keepHouses(c: ComputedInc, waits: boolean, parked = false): void {
@@ -4655,7 +4666,7 @@ function keepHouses(c: ComputedInc, waits: boolean, parked = false): void {
   const base = fo.res!.base?.key ?? null;
   const carried = fo.res!.base?.ck.dl === undefined ? null : recHash(fo.res!.base.ck.dl);
   const pubs = new Set(fo.houseUsed.keys());
-  if (parked || base === fo.hkBase) for (const key of fo.heldHks.keys()) pubs.add(houseKeyParts(key)!.of);
+  for (const key of fo.heldHks.keys()) if (fo.hkUnder.get(key)?.includes(base)) pubs.add(houseKeyParts(key)!.of);
   const kept = new Map<string, HeldDelegation[]>();
   const over = new Map<string, unknown>();
   let hkWaits = false;
@@ -4690,12 +4701,38 @@ function keepHouses(c: ComputedInc, waits: boolean, parked = false): void {
     // (The latest holder's last; two of one holder's, by their hashes: every page that holds both names the same.)
     if (good.size > 0) kept.set(key, [...good.values()].sort((x, y) => x.at - y.at || (x.hash < y.hash ? -1 : 1)));
   }
-  if (!waits) {
-    fo.heldHks = kept;
-    fo.hkBase = parked ? fo.held?.key ?? null : base;
-  } else for (const [key, list] of kept) fo.heldHks.set(key, list);
+  if (!waits) fo.heldHks = kept;
+  else for (const [key, list] of kept) fo.heldHks.set(key, list);
+  // (The bases each house held is kept for: a count that waited for nothing
+  // settles on its own, and one that waited adds its own for the houses it
+  // went by. Nothing while the game is not counted: noteHousesParked.)
+  const under = new Map<string, (string | null)[]>();
+  for (const key of fo.heldHks.keys()) {
+    const was = fo.hkUnder.get(key) ?? [];
+    if (!parked && !waits) under.set(key, [base]);
+    else under.set(key, !parked && kept.has(key) && !was.includes(base) ? [...was, base] : was);
+  }
+  fo.hkUnder = under;
   fo.hkOver = over;
   fo.hkWaits = hkWaits;
+}
+
+/** 🔒 While a game is not counted because its table is not whole, note the
+ *  base its answer names for every house whose delegations this page holds
+ *  (FairOnlyState hkUnder). The page reads nothing of that base's session
+ *  then, and its first count from it may find an empty map a peer put in the
+ *  session's place: a house let go of there for want of a record would leave
+ *  its rounds undecided once the records are back. An answer is no count, so
+ *  this adds and takes nothing away: should that base be gone again before the
+ *  page counts from it (a checkpoint that comes while a book of the table's
+ *  chips is away, deleted in the write that brings the book back), the game is
+ *  at a base the houses were kept for before, and they are kept still. On a
+ *  doc that holds part of an update too: a table is as little counted there,
+ *  and noting a base judges nothing of what such a doc holds. */
+function noteHousesParked(fo: FairOnlyState): void {
+  if (!fo.res) return;
+  const base = fo.res.base?.key ?? null;
+  for (const [key, was] of fo.hkUnder) if (!was.includes(base)) fo.hkUnder.set(key, [...was, base]);
 }
 
 /** Resolve FAIR ONLY game `c` from the records it has now (design §8.3): the
