@@ -44,6 +44,7 @@ import {
   clearTableKeys,
   COMPUTED_MIN_BUILD,
   computedSwitchBare,
+  computedSwitchChecking,
   computedSwitchLost,
   creditTableOutcome,
   feltStake,
@@ -557,6 +558,9 @@ export function openBetting(tableId: string, round: number): void {
   // while its switch is lost (a peer took it away, the room puts it back):
   // its players are mid-round there.
   if (isComputedTable(tableId) || computedSwitchLost(tableId)) return;
+  // 🔒 Nor while the switch names a FAIR ONLY game this page is still
+  // checking: it may be the table's game a moment on (computedSwitchChecking).
+  if (computedSwitchChecking(tableId)) return;
   // One transaction: a name a removal left unmarked is marked as it opens.
   transactCasino(() => writeTableState(tableId, {
     kind: 'roulette',

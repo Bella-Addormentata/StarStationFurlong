@@ -98,6 +98,46 @@ export interface LocalFingerprint {
    *  deed holder delegates it (computedTable houseDuty). Absent from older
    *  nodes. Kept only in that shape. */
   house?: string;
+  /** 🧮 What the node's fold of the casino tables serves (the node's
+   *  `house_fold`, a `HouseFoldReport` in ssf-p2p-node main.rs), as far as a
+   *  page reads it: whether the owner's node can run FAIR ONLY tables
+   *  (computedTable setLocalHouseFold). Absent from a node built without the
+   *  fold, with its house off, or older. Kept only in the node's shape
+   *  (`parseHouseFold`). */
+  house_fold?: HouseFold;
+}
+
+/** 🧮 The node's fold, as a page reads its report: the incarnation letters it
+ *  folds (`rd` from the nodes that shadow house tables; a node that runs FAIR
+ *  ONLY games adds `p` and `q`), the rules versions it serves at those two
+ *  (`rv`: none from a node that serves neither), and whether the fold is off
+ *  (`off`, sent with a reason: turned off in the node's environment, or its
+ *  worker failed too often). The report's counters are the node's own. */
+export interface HouseFold {
+  letters: string;
+  rv: string[];
+  off?: true;
+}
+
+/** The node's `house_fold` in that shape, or undefined for anything else: no
+ *  object, `letters` not a string of up to 26 lower-case letters, an `rv` that
+ *  is there and is not a list of up to 16 rules versions as a game's name spells
+ *  one (a lower-case letter, then up to seven letters or digits). A report this
+ *  page cannot read is no report, and the page then offers nothing that needs
+ *  one. An `off` of any kind reads as off: whatever the reason, the fold runs
+ *  nothing now. Nothing else is copied. */
+export function parseHouseFold(v: unknown): HouseFold | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.letters !== 'string' || !/^[a-z]{0,26}$/.test(r.letters)) return undefined;
+  let rv: string[] = [];
+  if (r.rv !== undefined) {
+    if (!Array.isArray(r.rv) || r.rv.length > 16 || !r.rv.every((x) => typeof x === 'string' && /^[a-z][a-z0-9]{0,7}$/.test(x))) return undefined;
+    rv = [...(r.rv as string[])];
+  }
+  const fold: HouseFold = { letters: r.letters, rv };
+  if (r.off !== undefined && r.off !== null) fold.off = true;
+  return fold;
 }
 
 /** 📖 The four looks of the phone book: this edition's listing confirmed
@@ -420,5 +460,7 @@ export function parseNodeFingerprint(body: unknown): LocalFingerprint | null {
   if (typeof r.blob_cap === 'string' && /^[0-9a-f]{64}$/.test(r.blob_cap)) fp.blob_cap = r.blob_cap;
   if (r.torrent === true) fp.torrent = true;
   if (typeof r.house === 'string' && /^[A-Za-z0-9_-]{43}$/.test(r.house)) fp.house = r.house;
+  const fold = parseHouseFold(r.house_fold);
+  if (fold) fp.house_fold = fold;
   return fp;
 }
