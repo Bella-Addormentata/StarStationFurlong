@@ -3513,9 +3513,10 @@ pub fn burners_of(net: crate::chia_network::ChiaNet, raw: Option<&std::ffi::OsSt
 
 /// The process's [`BURNERS_ENV`] on its network ([`burners_of`]), read once,
 /// as `chia_wallet_switch::env_switch` reads `SSF_CHIA_LANE`: the startup
-/// line, the heartbeat's listing and knock paths and its knock rule, the
-/// dish's count of the wallet's spends in flight ([`wallet_spending`]) and
-/// the self-test hook see the same value. The network is settled before
+/// line, the beacon's startup line, the heartbeat's listing, knock and
+/// beacon paths and its knock rule, the dish's count of the wallet's spends
+/// in flight ([`wallet_spending`]) and the self-test hook see the same
+/// value. The network is settled before
 /// anything asks.
 pub fn burners() -> &'static (bool, Option<String>) {
     static BURNERS: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
@@ -3979,9 +3980,10 @@ pub struct BeaconMark {
     /// The parent of the beacon's own coin, hex: the coin whose spend made the
     /// coin carrying the beacon under the hint, which is how the write is
     /// found again ([`crate::chia_resolve::child_under_hint`]). For a beacon
-    /// the beacon wallet pays for, and for a burner's rewrite, it is also the
-    /// input the spend consumed; for a burner's first write it is the gift g,
-    /// and `parked` names the dish coin F the spend consumed (stage 4 design
+    /// written from B as the beacon wallet's key, with burner keys off, and
+    /// for B's rewrite as a burner key, it is also the input the spend
+    /// consumed; for B's first write as a burner key it is the gift g, and
+    /// `parked` names the dish coin F the spend consumed (stage 4 design
     /// §4.1, §4.4).
     #[serde(default)]
     pub coin_id: String,
@@ -5078,9 +5080,10 @@ pub(crate) enum BeaconDone {
 
 /// This era's beacon ([`beacon_on_path`]) on the node's own lease and gift
 /// fuse ([`WALLET_LEASE`], `claim_write::GIFT_FUSE`), the money lane's
-/// chain, the wall clock and the OS random source, with the guard reading
-/// the other network's mark in this data folder ([`other_beacon_mark`]):
-/// the heartbeat's beacon arm, on the burner path (`root`) or off it.
+/// chain, the wall clock and the OS random source, in the node's own data
+/// folder (the working folder every node file's path is relative to, so
+/// the empty path): the heartbeat's beacon arm, on the burner path (`root`)
+/// or off it.
 pub(crate) async fn publish_beacon(
     net: crate::chia_network::ChiaNet,
     root: Option<&crate::chia_burner::BurnerRoot>,
@@ -5090,7 +5093,7 @@ pub(crate) async fn publish_beacon(
     now: u64,
 ) -> Result<BeaconDone> {
     let client = crate::chia_chain::connect();
-    beacon_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, root, iroh_sk, chia_sk, &other_beacon_mark(net), era, now, &mut rand::rngs::OsRng).await
+    beacon_on_path(&WALLET_LEASE, &claim_write::GIFT_FUSE, net, &client, Instant::now, root, iroh_sk, chia_sk, std::path::Path::new(""), era, now, &mut rand::rngs::OsRng).await
 }
 
 /// What the beacon arm makes of a due try in `era`, on a given lease, gift
@@ -5102,8 +5105,9 @@ pub(crate) async fn publish_beacon(
 /// the knock's path is chosen, never by which key paid.
 ///
 /// First the beacon guard, on either path (§4.5 (7)): the other network's
-/// beacon mark in this data folder, `other_mark`, is read without changing
-/// it ([`read_other_beacon`]), and one less than 14 days old, or one that
+/// beacon mark in the data folder `data` ([`other_beacon_mark`] of `net`,
+/// never `net`'s own mark) is read without changing it
+/// ([`read_other_beacon`]), and one less than 14 days old, or one that
 /// cannot be read, refuses the beacon ([`beacon_guard`]). A guarded try is
 /// [`BeaconDone::Guarded`] with the guard's line: the lease is not asked
 /// for its gate and the chain is asked nothing.
@@ -5118,7 +5122,8 @@ pub(crate) async fn publish_beacon(
 /// two are one key and one payer. The write comes back with the path it was
 /// written on (`from_burner`), which the arm's success line reads
 /// ([`beacon_sent_line`]). An error comes back as the writer gave it, for
-/// [`beacon_failure_line`].
+/// [`beacon_failure_line`]. A root of another network than `net` is refused
+/// before any writer is reached, as the listing's and the knock's are.
 #[allow(clippy::too_many_arguments)]
 async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
     lease: &WalletLease,
@@ -5129,16 +5134,23 @@ async fn beacon_on_path<R: rand::Rng + ?Sized + Send>(
     root: Option<&crate::chia_burner::BurnerRoot>,
     iroh_sk: &iroh::SecretKey,
     chia_sk: &SecretKey,
-    other_mark: &std::path::Path,
+    data: &std::path::Path,
     era: u64,
     now_unix: u64,
     rng: &mut R,
 ) -> Result<BeaconDone> {
-    if let Some(line) = beacon_guard(net, other_mark, read_other_beacon(other_mark), now_unix) {
+    let other_mark = data.join(other_beacon_mark(net));
+    if let Some(line) = beacon_guard(net, &other_mark, read_other_beacon(&other_mark), now_unix) {
         return Ok(BeaconDone::Guarded(line));
     }
     let (hint, write) = match root {
-        Some(_) => {
+        Some(root) => {
+            anyhow::ensure!(
+                root.net() == net,
+                "the beacon's burner root is for {} and this write is on {}; nothing is written",
+                root.net().name(),
+                net.name()
+            );
             let key = crate::chia_burner::MoneyKey::new(chia_sk.clone()).beacon();
             publish_beacon_with(lease, fuse, net, client, now(), &key, iroh_sk, era, now_unix, rng).await?
         }
@@ -5854,122 +5866,120 @@ pub async fn heartbeat_loop(
         // measured bit: a beacon that cannot be reached is noise), paid by its
         // own key B: from a coin sent to its address with burner keys off, and
         // funded by the lobby dish on the burner path, from its slot.
-        if beacon_on {
-            if peak > 0 && !era_guard(peak) {
-                let era = chia_lane::era_of(peak);
-                // A mark of this era not yet settled is judged by the chain's
-                // word first (#272 review rounds 1 and 9): pending, it is
-                // confirmed, or dead (the mempool dropped the spend, or its
-                // coin went to another write) and the beacon due again;
-                // confirmed, it is judged until a lookup finds its coin
-                // SETTLED_DEPTH deep — the chain moving its block moves the
-                // mark, and a listing judged past its block that lacks the
-                // coin returns it to pending, with no replacement until the
-                // lease's word that the spend is dead. Marked final at the
-                // peers' acceptance, or at its first inclusion, a dropped
-                // beacon would leave this node undiscoverable for the rest of
-                // the era, restart or not.
-                if let Some(m) = beacon_mark.as_ref().filter(|m| m.unsettled_for(era, &self_id)).cloned() {
-                    match beacon_step(&m, beacon_standing(&peak_client, &m).await, era, peak) {
-                        BeaconStep::Keep => {}
-                        BeaconStep::Forget(why) => {
-                            println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; {}", write_again_words(net));
-                            beacon_mark = None;
-                            let _ = std::fs::remove_file(beacon_mark_path);
+        if beacon_on && peak > 0 && !era_guard(peak) {
+            let era = chia_lane::era_of(peak);
+            // A mark of this era not yet settled is judged by the chain's
+            // word first (#272 review rounds 1 and 9): pending, it is
+            // confirmed, or dead (the mempool dropped the spend, or its
+            // coin went to another write) and the beacon due again;
+            // confirmed, it is judged until a lookup finds its coin
+            // SETTLED_DEPTH deep — the chain moving its block moves the
+            // mark, and a listing judged past its block that lacks the
+            // coin returns it to pending, with no replacement until the
+            // lease's word that the spend is dead. Marked final at the
+            // peers' acceptance, or at its first inclusion, a dropped
+            // beacon would leave this node undiscoverable for the rest of
+            // the era, restart or not.
+            if let Some(m) = beacon_mark.as_ref().filter(|m| m.unsettled_for(era, &self_id)).cloned() {
+                match beacon_step(&m, beacon_standing(&peak_client, &m).await, era, peak) {
+                    BeaconStep::Keep => {}
+                    BeaconStep::Forget(why) => {
+                        println!("⛓️ ChiaHub beacon: the era {era} beacon {why}; {}", write_again_words(net));
+                        beacon_mark = None;
+                        let _ = std::fs::remove_file(beacon_mark_path);
+                    }
+                    BeaconStep::Save(mark) => {
+                        if mark.settled {
+                            println!(
+                                "⛓️ ChiaHub beacon: the era {era} beacon stands at height {} — found unmoved {} blocks deep, final",
+                                mark.confirmed_height,
+                                crate::chia_knock::SETTLED_DEPTH
+                            );
+                        } else if !mark.confirmed {
+                            println!(
+                                "⛓️ ChiaHub beacon: the block that confirmed the era {era} beacon at height {} is gone (a reorganization) — waiting for the chain's word again",
+                                m.confirmed_height
+                            );
+                        } else if m.confirmed && m.confirmed_height != 0 {
+                            println!(
+                                "⛓️ ChiaHub beacon: the chain moved the era {era} beacon from height {} to {} (a reorganization)",
+                                m.confirmed_height, mark.confirmed_height
+                            );
+                        } else {
+                            println!(
+                                "⛓️ ChiaHub beacon: the era {era} beacon is confirmed on chain at height {} — judged again until a lookup finds it {} blocks deep",
+                                mark.confirmed_height,
+                                crate::chia_knock::SETTLED_DEPTH
+                            );
                         }
-                        BeaconStep::Save(mark) => {
-                            if mark.settled {
-                                println!(
-                                    "⛓️ ChiaHub beacon: the era {era} beacon stands at height {} — found unmoved {} blocks deep, final",
-                                    mark.confirmed_height,
-                                    crate::chia_knock::SETTLED_DEPTH
-                                );
-                            } else if !mark.confirmed {
-                                println!(
-                                    "⛓️ ChiaHub beacon: the block that confirmed the era {era} beacon at height {} is gone (a reorganization) — waiting for the chain's word again",
-                                    m.confirmed_height
-                                );
-                            } else if m.confirmed && m.confirmed_height != 0 {
-                                println!(
-                                    "⛓️ ChiaHub beacon: the chain moved the era {era} beacon from height {} to {} (a reorganization)",
-                                    m.confirmed_height, mark.confirmed_height
-                                );
-                            } else {
-                                println!(
-                                    "⛓️ ChiaHub beacon: the era {era} beacon is confirmed on chain at height {} — judged again until a lookup finds it {} blocks deep",
-                                    mark.confirmed_height,
-                                    crate::chia_knock::SETTLED_DEPTH
-                                );
-                            }
-                            if let Err(e) = mark.save(beacon_mark_path) {
-                                eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
-                            }
-                            beacon_mark = Some(mark);
+                        if let Err(e) = mark.save(beacon_mark_path) {
+                            eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
                         }
+                        beacon_mark = Some(mark);
                     }
                 }
-                let inbound = hub.inbound_verified.lock().unwrap().clone();
-                let reachable = inbound.flags_for(false, peak, now_unix) != 0 || inbound.flags_for(true, peak, now_unix) != 0;
-                let retry_ok = beacon_attempt
-                    .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
-                    .unwrap_or(true);
-                // A beacon leads to the welcome room: none is written while
-                // this node does not serve it (#272 review round 3).
-                let serves_welcome = serves_welcome_room(&hub);
-                if !serves_welcome && !welcome_warned {
-                    eprintln!(
-                        "⛓️ ChiaHub beacon: not advertising — this node does not serve the welcome room (a beacon is an entry point to it; open the welcome room in the local browser once and the node keeps it)"
-                    );
-                    welcome_warned = true;
+            }
+            let inbound = hub.inbound_verified.lock().unwrap().clone();
+            let reachable = inbound.flags_for(false, peak, now_unix) != 0 || inbound.flags_for(true, peak, now_unix) != 0;
+            let retry_ok = beacon_attempt
+                .map(|t| t.elapsed() >= Duration::from_secs(HEARTBEAT_RETRY_SECS))
+                .unwrap_or(true);
+            // A beacon leads to the welcome room: none is written while
+            // this node does not serve it (#272 review round 3).
+            let serves_welcome = serves_welcome_room(&hub);
+            if !serves_welcome && !welcome_warned {
+                eprintln!(
+                    "⛓️ ChiaHub beacon: not advertising — this node does not serve the welcome room (a beacon is an entry point to it; open the welcome room in the local browser once and the node keeps it)"
+                );
+                welcome_warned = true;
+            }
+            // Whether a write is tried this tick is one pure step
+            // (`beacon_arm_due`): main's rule off the burner path, and on
+            // it the era's beacon slot as well (§4.3 T5), after a late
+            // start for a run that first saw the era past that slot.
+            let facts = BeaconFacts {
+                money_refused: money_refused.is_some(),
+                reachable,
+                serves_welcome,
+                retry_ok,
+                root: listing_root.as_ref(),
+                mark: beacon_mark.as_ref(),
+                era,
+                peak,
+                node_id: &self_id,
+            };
+            let due = beacon_arm_due(&mut beacon_clock, &facts, &mut rand::rngs::OsRng);
+            // Due, and the peak not aged out during the lookups above.
+            if due && !peak_aged("beacon") {
+                beacon_attempt = Some(Instant::now());
+                // The arm's whole step from here to the write is one seam
+                // (`beacon_on_path`), chosen by the path as the listing's
+                // and the knock's are, never by which key paid: the
+                // guard first, on either path (§4.5 (7)), then the path's
+                // writer with the key it writes from.
+                let done = publish_beacon(net, listing_root.as_ref(), &iroh_sk, &chia_sk, era, now_unix).await;
+                if let Some(line) = beacon_guard_note(&mut beacon_guard_said, &done) {
+                    eprintln!("{line}");
                 }
-                // Whether a write is tried this tick is one pure step
-                // (`beacon_arm_due`): main's rule off the burner path, and on
-                // it the era's beacon slot as well (§4.3 T5), after a late
-                // start for a run that first saw the era past that slot.
-                let facts = BeaconFacts {
-                    money_refused: money_refused.is_some(),
-                    reachable,
-                    serves_welcome,
-                    retry_ok,
-                    root: listing_root.as_ref(),
-                    mark: beacon_mark.as_ref(),
-                    era,
-                    peak,
-                    node_id: &self_id,
-                };
-                let due = beacon_arm_due(&mut beacon_clock, &facts, &mut rand::rngs::OsRng);
-                // Due, and the peak not aged out during the lookups above.
-                if due && !peak_aged("beacon") {
-                    beacon_attempt = Some(Instant::now());
-                    // The arm's whole step from here to the write is one seam
-                    // (`beacon_on_path`), chosen by the path as the listing's
-                    // and the knock's are, never by which key paid: the
-                    // guard first, on either path (§4.5 (7)), then the path's
-                    // writer with the key it writes from.
-                    let done = publish_beacon(net, listing_root.as_ref(), &iroh_sk, &chia_sk, era, now_unix).await;
-                    if let Some(line) = beacon_guard_note(&mut beacon_guard_said, &done) {
-                        eprintln!("{line}");
-                    }
-                    let took_the_tick = beacon_took_the_tick(&done);
-                    match done {
-                        // Nothing was pushed and the chain was asked nothing:
-                        // the try is paced as any other, and the tick goes on
-                        // to the rooms below.
-                        Ok(BeaconDone::Guarded(_)) => {}
-                        Ok(BeaconDone::Written { hint, write, from_burner }) => {
-                            let mark = BeaconMark::written(era, now_unix, hint, &write, self_id.clone());
-                            if let Err(e) = mark.save(beacon_mark_path) {
-                                eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
-                            }
-                            println!("{}", beacon_sent_line(write.acked, era, &mark.hint, from_burner));
-                            beacon_mark = Some(mark);
+                let took_the_tick = beacon_took_the_tick(&done);
+                match done {
+                    // Nothing was pushed and the chain was asked nothing:
+                    // the try is paced as any other, and the tick goes on
+                    // to the rooms below.
+                    Ok(BeaconDone::Guarded(_)) => {}
+                    Ok(BeaconDone::Written { hint, write, from_burner }) => {
+                        let mark = BeaconMark::written(era, now_unix, hint, &write, self_id.clone());
+                        if let Err(e) = mark.save(beacon_mark_path) {
+                            eprintln!("⛓️ ChiaHub beacon: could not save {BEACON_MARK_FILE}: {e}");
                         }
-                        // With burner keys off, the line it always had.
-                        Err(e) => eprintln!("{}", beacon_failure_line(listing_root.is_some(), era, &e)),
+                        println!("{}", beacon_sent_line(write.acked, era, &mark.hint, from_burner));
+                        beacon_mark = Some(mark);
                     }
-                    if took_the_tick {
-                        continue; // one spend per tick
-                    }
+                    // With burner keys off, the line it always had.
+                    Err(e) => eprintln!("{}", beacon_failure_line(listing_root.is_some(), era, &e)),
+                }
+                if took_the_tick {
+                    continue; // one spend per tick
                 }
             }
         }
@@ -9893,7 +9903,8 @@ mod tests {
     /// test network, and its line says what it does in this build: the
     /// listing and each knock written from burner keys of their own, a knock
     /// once per host and room per edition, the waits that use no attempt,
-    /// and the beacon paid as before. It names no busy chain among the
+    /// and the beacon, where it is on, written from a key of its own that
+    /// the lobby dish funds. It names no busy chain among the
     /// waits, since a push refused for its fee still uses an attempt (§10).
     /// `1` off a test network is ignored, with one line; any other value is
     /// off and says nothing, on every network. No environment is read.
@@ -10277,6 +10288,12 @@ mod tests {
         assert!(!beacon_arm_due(&mut clock, &beacon_facts(&g, e, first + d - 1), &mut other), "the block before");
         assert_eq!(clock.first, Some(FirstPeak { era: e, peak: first, late: Some(d) }), "drawn once: a later peak of the era draws nothing");
         assert!(beacon_arm_due(&mut clock, &beacon_facts(&g, e, first + d), &mut other), "{d} blocks after the first peak");
+        // The peak is noted whatever else holds: a tick that is not due
+        // for another reason still fixes the era's first peak and its draw.
+        let mut unreachable = BeaconClock::default();
+        let not_due = BeaconFacts { reachable: false, ..beacon_facts(&g, e, first) };
+        assert!(!beacon_arm_due(&mut unreachable, &not_due, &mut seeded(seed)), "not reachable: not due");
+        assert_eq!(unreachable.first, Some(FirstPeak { era: e, peak: first, late: Some(d) }), "noted, and its late start drawn, on a tick that was not due");
         // At the slot itself a first peak draws too: at or past it.
         let mut at_slot = BeaconClock::default();
         beacon_arm_due(&mut at_slot, &beacon_facts(&g, e, block(e, s)), &mut seeded(seed));

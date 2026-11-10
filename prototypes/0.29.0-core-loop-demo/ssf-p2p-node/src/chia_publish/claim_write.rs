@@ -33,7 +33,8 @@
 //!
 //! Outside the tests the writer is called by the listing's writer from its
 //! burner key P(e) (`publish_node_presence_with`, §13 row 10, PR 10b), by
-//! the knock's writer from K(h) (`publish_knock_with`, PR 10c), and by
+//! the knock's writer from K(h) (`publish_knock_with`, PR 10c), by the
+//! beacon's writer from its key B (`publish_beacon_with`, PR 10d), and by
 //! [`claim_write_selftest`], the hook that makes one real claim-and-write on
 //! a test network and reads it back through its ephemeral parent
 //! (SSF_CHIA_CLAIM_WRITE_TEST=1 with SSF_CHIA_BURNERS=1).

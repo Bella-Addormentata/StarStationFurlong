@@ -152,6 +152,8 @@
 //! and a reorganization that gives a first beacon's dish coin to a stranger
 //! has it written again from another coin, with one gift counted
 //! (`a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_written_again_from_another_coin_with_one_gift_counted`).
+//! The step refuses a burner root of another network
+//! (`a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing`).
 //!
 //! No test here calls the node's own writers, which run on the
 //! process-wide lease (`claim_write::burner_write`, [`publish_burner_presence`],
@@ -470,8 +472,9 @@ impl Setup {
 
     /// What the beacon arm's step makes of a due try for `node`'s beacon in
     /// `era` ([`beacon_on_path`]), on the test's lease, fuse, network and
-    /// chain, at the next instant ([`Self::later`]), dated `now_unix`, with
-    /// the beacon guard reading `other_mark` and the random source seeded by
+    /// chain, at the next instant ([`Self::later`]), dated `now_unix`, in
+    /// the data folder `data`, where the step itself finds the other
+    /// network's beacon mark for its guard, with the random source seeded by
     /// `seed`: the step the heartbeat takes for a beacon that is due. On the
     /// burner path (`burner_path`) its root is test wallet `wallet_n`'s on
     /// the test's network ([`root`]); off it there is none. The step is given
@@ -479,12 +482,12 @@ impl Setup {
     /// future is checked to be `Send`, as the heartbeat's task needs it to
     /// be.
     #[allow(clippy::too_many_arguments)]
-    async fn arm_beacon(&mut self, wallet_n: u8, burner_path: bool, node: &iroh::SecretKey, era: u64, other_mark: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
+    async fn arm_beacon(&mut self, wallet_n: u8, burner_path: bool, node: &iroh::SecretKey, era: u64, data: &std::path::Path, now_unix: u64, seed: u64) -> Result<BeaconDone> {
         let at = self.later();
         let (root, w) = (root(wallet_n), wallet(wallet_n));
         let path = burner_path.then_some(&root);
         let mut rng = StdRng::seed_from_u64(seed);
-        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &w, other_mark, era, now_unix, &mut rng)).await
+        sendable(beacon_on_path(&self.lease, &self.fuse, NET, &self.money, move || at, path, node, &w, data, era, now_unix, &mut rng)).await
     }
 
     /// The gifts the test's fuse counts against `era` ([`GiftFuse`]).
@@ -899,15 +902,16 @@ fn beacon_key(n: u8) -> BurnerKey {
     MoneyKey::new(wallet(n)).beacon()
 }
 
-/// A path for the beacon guard to read where nothing is, under a folder of
-/// the temp directory that is never made: no beacon of the other network's,
-/// so the guard lets every try by. No test here reads a real data folder.
-fn absent_mark() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ssf-mock-chain-no-beacon-mark-{}-{}", std::process::id(), rand::random::<u64>())).join(BEACON_MARK_FILE)
+/// A data folder for the beacon arm's step where nothing is: a folder of
+/// the temp directory that is never made, so it holds no beacon mark of the
+/// other network's and the guard lets every try by. No test here reads a
+/// real data folder.
+fn no_data_folder() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("ssf-mock-chain-no-data-folder-{}-{}", std::process::id(), rand::random::<u64>()))
 }
 
-/// The other network's beacon mark in the test's own folder `dir`, at the
-/// path the guard reads in a data folder ([`other_beacon_mark`]), written
+/// The other network's beacon mark in the test's own data folder `dir`, at
+/// the path the guard reads there ([`other_beacon_mark`]), written
 /// as a node of that network saves it, dated `last_at`, and left readable by
 /// all (0644 on unix) so a read that tightened it would show: its path.
 fn other_mark(dir: &Dir, last_at: u64) -> std::path::PathBuf {
@@ -4776,7 +4780,7 @@ async fn the_next_eras_burner_beacon_is_written_from_bs_oldest_one_mojo_coin_wit
 #[tokio::test]
 async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_and_waits_behind_any_parked_spend() {
     let mut s = setup().await;
-    let (b, node, none) = (beacon_wallet(95), iroh::SecretKey::generate(), absent_mark());
+    let (b, node, none) = (beacon_wallet(95), iroh::SecretKey::generate(), no_data_folder());
     let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
     let one = s.chain.fund(our_puzzle_hash(&b), 1, None);
     let (dish, _) = ready_dishes(&s, &[1, 1]).await;
@@ -4830,7 +4834,7 @@ async fn a_beacon_without_burner_keys_is_paid_from_bs_largest_coin_as_on_main_an
 #[tokio::test]
 async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_settles() {
     let mut s = setup().await;
-    let (b, key, node, none) = (beacon_wallet(96), beacon_key(96), iroh::SecretKey::generate(), absent_mark());
+    let (b, key, node, none) = (beacon_wallet(96), beacon_key(96), iroh::SecretKey::generate(), no_data_folder());
     let payer = Payer::of_burner(&key);
     let funded = s.chain.fund(our_puzzle_hash(&b), 1000, None);
     let (f, _) = ready_dish(&s, 10).await;
@@ -4867,9 +4871,12 @@ async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_s
 /// Stage 4 design §4.3 T4, not yet built (PR 10e), and what stands in for
 /// it: on the burner path the beacon does not go out while the lease parks
 /// any other spend of this node, whatever its payer
-/// (`BurnerWait::OtherWriteInFlight`), so it never shares a mempool window
-/// with another of this node's payers, as the beacon wallet's never did
-/// through main's global check. A knock the SSF wallet W paid for is in
+/// (`BurnerWait::OtherWriteInFlight`), so it is never pushed into a mempool
+/// window another of this node's payers has open, as the beacon wallet's
+/// never was through main's global check. The hold is one-way: a listing or
+/// a knock from its own burner does not wait on a parked beacon, as on the
+/// 10c head, until the payers are spaced. The beacon waits before the
+/// chain is asked for B's coins. A knock the SSF wallet W paid for is in
 /// flight: off the burner path the beacon waits by main's check, and on it
 /// by the burner's own, a wait whose line asks for no funding and names no
 /// key; nothing is sent, no lobby coin is claimed and no gift is counted.
@@ -4880,7 +4887,7 @@ async fn a_money_beacon_of_bs_still_in_flight_holds_the_burner_beacon_until_it_s
 #[tokio::test]
 async fn a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lands() {
     let mut s = setup().await;
-    let (w, key, node, none) = (wallet(122), beacon_key(122), iroh::SecretKey::generate(), absent_mark());
+    let (w, key, node, none) = (wallet(122), beacon_key(122), iroh::SecretKey::generate(), no_data_folder());
     let funded = s.chain.fund(key.puzzle_hash(), 1000, None);
     let coin = s.chain.fund(our_puzzle_hash(&w), 1000, None);
     let (dish, made) = ready_dishes(&s, &[1, 1]).await;
@@ -4891,8 +4898,10 @@ async fn a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lan
 
     let off = s.arm_beacon(122, false, &node, 0, &none, unix_now(), 1).await;
     assert_eq!(off.as_ref().err().and_then(|e| e.downcast_ref::<MemoWait>()), Some(&MemoWait::Settling("beacon".to_string())), "off the burner path: main's global check");
+    let listed = s.asked(ProtocolMessageTypes::RequestPuzzleState);
     let on = s.arm_beacon(122, true, &node, 0, &none, unix_now(), 2).await;
     assert_eq!(beacon_waited(&on), Some(BurnerWait::OtherWriteInFlight), "on it: the burner's own hold");
+    assert_eq!(s.asked(ProtocolMessageTypes::RequestPuzzleState), listed, "held before the chain is asked for B's coins");
     let e = on.as_ref().err().expect("it waited");
     assert!(is_typed_wait(e), "a wait, not a failure");
     assert_eq!(
@@ -4932,7 +4941,9 @@ async fn a_parked_spend_of_this_node_holds_the_beacon_on_both_paths_until_it_lan
 /// the other network's file is left as it was, its bytes and its mode. A
 /// mark dated exactly 14 days ago lets the beacon by on each path: off the
 /// burner path from B's funded coin, and, once that has settled, on it from
-/// a gift. A file there that does not parse is dated by when it last
+/// a gift, though this network's own fresh mark lies in the same folder:
+/// the step finds the other network's file in the folder it is given and
+/// never reads its own. A file there that does not parse is dated by when it last
 /// changed, read back from the file itself, and refuses again on both
 /// paths, the chain still asked nothing.
 #[tokio::test]
@@ -4950,7 +4961,7 @@ async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_bea
     let asked = |s: &Setup| (s.a.seen.lock().unwrap().len(), s.b.seen.lock().unwrap().len());
     assert!(s.asked_nothing(), "nothing asked before the first try");
     for (burner_path, seed) in [(true, 1), (false, 2)] {
-        let done = s.arm_beacon(123, burner_path, &node, 0, &path, now, seed).await;
+        let done = s.arm_beacon(123, burner_path, &node, 0, &dir.0, now, seed).await;
         let line = beacon_guarded(&done).expect("refused by the guard");
         assert_eq!(Some(line.clone()), beacon_guard(NET, &path, read_other_beacon(&path), now), "the guard's own line");
         assert!(line.contains(NET.name()) && line.contains(other_beacon_net(NET).name()) && line.contains(&path.display().to_string()), "{line}");
@@ -4962,15 +4973,21 @@ async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_bea
     assert_eq!(s.gifts(0), 0, "no gift counted");
     assert_eq!(file_state(&path), before, "the other network's file, as it was");
 
-    // Exactly 14 days old: the beacon goes out, on either path.
+    // Exactly 14 days old: the beacon goes out, on either path. This
+    // network's own mark, written a moment ago as the node saves it after a
+    // beacon, lies in the same folder and holds nothing back: the step
+    // reads the other network's file, never its own.
     let path = other_mark(&dir, now - BEACON_GUARD_SECS);
-    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, false, &node, 0, &path, now, 3).await);
+    let own = dir.0.join(NET.path(BEACON_MARK_FILE));
+    assert_ne!(own, path, "two files");
+    std::fs::write(&own, serde_json::to_vec(&BeaconMark { era: 0, last_at: now, hint: "bb".repeat(32), ..Default::default() }).unwrap()).unwrap();
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, false, &node, 0, &dir.0, now, 3).await);
     assert!(!from_burner);
     assert_eq!(write.coins, WriteCoins::one(funded.coin_id()), "off the burner path, from B's funded coin");
     s.chain.farm().await;
     s.reconcile().await;
     s.chain.farm_blocks(SETTLED_DEPTH).await;
-    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, true, &node, 0, &path, now, 4).await);
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(123, true, &node, 0, &dir.0, now, 4).await);
     assert!(from_burner);
     assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "on it, from a gift");
     assert_eq!(file_state(&path).0, serde_json::to_vec(&BeaconMark { era: 3, last_at: now - BEACON_GUARD_SECS, hint: "aa".repeat(32), ..Default::default() }).unwrap());
@@ -4982,7 +4999,7 @@ async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_bea
     let (quiet, sent) = (asked(&s), s.sent());
     for (burner_path, seed) in [(true, 5), (false, 6)] {
         let at = unix_now();
-        let done = s.arm_beacon(123, burner_path, &node, 0, &path, at, seed).await;
+        let done = s.arm_beacon(123, burner_path, &node, 0, &dir.0, at, seed).await;
         let line = beacon_guarded(&done).expect("refused by the guard");
         assert_eq!(Some(line), beacon_guard(NET, &path, OtherBeacon::At(changed), at));
         assert_eq!(asked(&s), quiet, "the chain was asked nothing (burner path: {burner_path})");
@@ -5001,7 +5018,7 @@ async fn a_fresh_beacon_mark_of_the_other_network_in_this_folder_refuses_the_bea
 #[tokio::test]
 async fn a_burner_beacon_with_no_dish_coin_ready_waits_names_no_key_and_goes_out_once_one_is() {
     let mut s = setup().await;
-    let (key, node, none) = (beacon_key(125), iroh::SecretKey::generate(), absent_mark());
+    let (key, node, none) = (beacon_key(125), iroh::SecretKey::generate(), no_data_folder());
     s.chain.farm().await;
     let dry = s.arm_beacon(125, true, &node, 0, &none, unix_now(), 1).await;
     assert_eq!(beacon_waited(&dry), Some(BurnerWait::NoCoinReady));
@@ -5044,7 +5061,7 @@ async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_
     let f2 = s.chain.fund(lobby().puzzle_hash(), 10, None);
     s.chain.farm().await;
     s.chain.farm_blocks(GAP_BLOCKS - 1).await;
-    let (key, node, none) = (beacon_key(126), iroh::SecretKey::generate(), absent_mark());
+    let (key, node, none) = (beacon_key(126), iroh::SecretKey::generate(), no_data_folder());
     let stranger = Bytes32::new([0x67; 32]);
     s.money.push_tx(claim(&lobby(), f, stranger)).await.unwrap();
     s.chain.block_before(ProtocolMessageTypes::SendTransaction);
@@ -5083,7 +5100,7 @@ async fn a_burner_beacon_that_loses_the_race_for_its_dish_coin_is_written_again_
 async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_lands_once_cleared_with_no_fee() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 10).await;
-    let (key, node, none) = (beacon_key(127), iroh::SecretKey::generate(), absent_mark());
+    let (key, node, none) = (beacon_key(127), iroh::SecretKey::generate(), no_data_folder());
     s.chain.set_full(true);
     let turned_away = s.arm_beacon(127, true, &node, 0, &none, unix_now(), 1).await;
     let why = beacon_refused(&turned_away).expect("every peer refused the push");
@@ -5123,7 +5140,7 @@ async fn a_burner_beacon_refused_by_a_full_mempool_reads_as_the_chain_busy_and_l
 async fn a_burner_beacon_the_blown_fuse_holds_waits_claims_nothing_and_is_funded_in_the_next_era() {
     let mut s = setup().await;
     let (f, _) = ready_dish(&s, 10).await;
-    let (key, node, none) = (beacon_key(128), iroh::SecretKey::generate(), absent_mark());
+    let (key, node, none) = (beacon_key(128), iroh::SecretKey::generate(), no_data_folder());
     s.preset_fuse(0, strangers(16));
     let blown = s.arm_beacon(128, true, &node, 0, &none, unix_now(), 1).await;
     assert_eq!(beacon_waited(&blown), Some(BurnerWait::FuseBlown { era: 0 }));
@@ -5219,7 +5236,7 @@ async fn a_clones_beacon_from_bs_coin_leaves_ours_to_be_written_from_the_coin_it
     s.chain.farm_to(ERA_BLOCKS).await;
 
     // The clone: a lease and a fuse of its own, the same wallet and node.
-    let ours = std::mem::replace(&mut s.lease, WalletLease::new());
+    let ours = std::mem::take(&mut s.lease);
     let our_fuse = std::mem::replace(&mut s.fuse, std::sync::Mutex::new(GiftFuse::new()));
     let (_, theirs) = s.beacon(130, &node, 1, now, 2).await.unwrap();
     assert_eq!(theirs.coins, WriteCoins::one(c0.coin_id()), "the clone writes from B's one coin");
@@ -5289,5 +5306,37 @@ async fn a_reorg_that_gives_a_first_beacons_dish_coin_to_a_stranger_has_it_writt
     let again = s.chain.farm().await;
     assert_eq!(beacons_of(&s, 0, again, now).await, vec![(node.public(), burner_coin(&key, g2.coin_id()).coin_id(), again)], "the old beacon is on no chain");
     assert_eq!(s.sent(), HashSet::from([saved.name(), rebuilt.name()]));
+    assert!(s.chain.unanswered().is_empty());
+}
+
+/// Stage 4 design §3.5: the beacon arm's step refuses a burner root of
+/// another network than the test's before it reaches a writer, with an
+/// error naming both networks and no key. It is a failure, not a wait. No
+/// node is asked anything, nothing is sent or parked, the ready lobby coin
+/// is not taken and no gift is counted. The same wallet's root for the
+/// test's network writes.
+#[tokio::test]
+async fn a_beacon_with_a_burner_root_of_another_network_is_refused_and_writes_nothing() {
+    let mut s = setup().await;
+    let (f, _) = ready_dish(&s, 1).await;
+    let (w, key, node, none) = (wallet(132), beacon_key(132), iroh::SecretKey::generate(), no_data_folder());
+    for other in crate::chia_network::ChiaNet::ALL.into_iter().filter(|net| *net != NET) {
+        let root = BurnerRoot::of(&MoneyKey::new(w.clone()), other);
+        let at = s.later();
+        let mut rng = StdRng::seed_from_u64(1);
+        let refused = beacon_on_path(&s.lease, &s.fuse, NET, &s.money, move || at, Some(&root), &node, &w, &none, 0, unix_now(), &mut rng).await;
+        let e = refused.as_ref().err().expect("a root of another network is refused");
+        assert_eq!(format!("{e:#}"), format!("the beacon's burner root is for {} and this write is on testnet11; nothing is written", other.name()));
+        assert!(!is_typed_wait(e), "a failure, not a wait");
+        names_no_beacon(e, &key);
+    }
+    assert!(s.asked_nothing(), "no node was asked anything");
+    assert!(s.chain.received().is_empty(), "nothing sent");
+    assert!(!s.lease.is_taken(&f.coin_id()) && !s.lease.outgoing_pending(), "nothing parked");
+    assert_eq!(s.gifts(0), 0, "no gift counted");
+    let (_, write, from_burner) = beacon_wrote(s.arm_beacon(132, true, &node, 0, &none, unix_now(), 2).await);
+    assert!(from_burner);
+    assert_eq!(write.coins, WriteCoins { parent: gift(&key, f).coin_id(), parked: f.coin_id() }, "the test network's own root writes");
+    assert_eq!(s.gifts(0), 1);
     assert!(s.chain.unanswered().is_empty());
 }

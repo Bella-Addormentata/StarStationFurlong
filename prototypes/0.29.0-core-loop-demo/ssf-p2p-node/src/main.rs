@@ -100,8 +100,8 @@ mod chia_at_rest;
 mod chia_publish;
 // Stage 4 (design §3): the burner keys, off every wallet path, that will pay
 // for the lane's writes. PR 9's claim-and-write and its self-test hook call
-// them, the listing is written from P(e) (PR 10b) and each knock from its own
-// K(h) (PR 10c); the beacon writer follows.
+// them, the listing is written from P(e) (PR 10b), each knock from its own
+// K(h) (PR 10c) and the beacon from its key B as a burner key (PR 10d).
 #[cfg(feature = "chia-publish")]
 mod chia_burner;
 #[cfg(feature = "chia-publish")]
@@ -6435,8 +6435,9 @@ mod test_hook_tests {
 
 /// The lines a loaded wallet prints, at startup or when the Bank turns it on:
 /// what the load did, its key fingerprint and receive address, with the
-/// beacon on the beacon's address and, with SSF_CHIA_BURNERS set to `1`,
-/// what burner keys do on this network. Never the words.
+/// beacon on the beacon's line (which names its address only where the
+/// operator funds it, [`beacon_lines`]) and, with SSF_CHIA_BURNERS set to
+/// `1`, what burner keys do on this network. Never the words.
 #[cfg(feature = "chia-publish")]
 fn announce_wallet(net: chia_network::ChiaNet, id: &chia_wallet::WalletIdentity) {
     chia_wallet::log_receive_address(net, id);
