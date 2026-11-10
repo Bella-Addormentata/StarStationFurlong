@@ -117,8 +117,14 @@ export const listMeOnNote = (net: ChiaNetwork | null): string => `LIST ME is on 
 /** On, with no SSF wallet on: no publisher runs, so the switch waits. */
 export const LIST_ME_NO_WALLET = "Nothing is written until the SSF wallet is on (the SpacePhone's 🏦 BANK).";
 
-export const listMeHeldNote = (net: ChiaNetwork | null): string =>
-  `LIST ME is on for ${where(net)}, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. Its knocks are still written.`;
+/** On, the listing held off by the node's environment, and no SSF wallet
+ *  on: the knocks wait for the wallet as every write does. */
+export const LIST_ME_HELD_NO_WALLET = "Its knocks are written once the SSF wallet is on (the SpacePhone's 🏦 BANK).";
+
+/** `walletWaits`: no SSF wallet is on, so no publisher runs and no knock is
+ *  written yet either. */
+export const listMeHeldNote = (net: ChiaNetwork | null, walletWaits = false): string =>
+  `LIST ME is on for ${where(net)}, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. ${walletWaits ? LIST_ME_HELD_NO_WALLET : 'Its knocks are still written.'}`;
 
 /** Off where the player never turned it: only where the coins are real. */
 export const listMeDefaultOffNote = (net: ChiaNetwork | null): string =>
@@ -183,9 +189,11 @@ export function listMeRow(fp: LocalFingerprint | null | undefined, ui: ListMeUi)
     return listing.on ? row(listMeChiaOffOnNote(net), unlist) : row(listMeChiaOffNote(net), null);
   }
   if (listing.on) {
-    if (listing.held) return row(listMeHeldNote(net), unlist);
-    const waits = fp.chia_wallet && fp.chia_wallet.state !== 'on' ? ` ${LIST_ME_NO_WALLET}` : '';
-    return row(listMeOnNote(net) + waits, unlist);
+    // No publisher runs until the SSF wallet is on: nothing is written yet,
+    // the knocks included where the environment holds the listing off.
+    const waits = !!fp.chia_wallet && fp.chia_wallet.state !== 'on';
+    if (listing.held) return row(listMeHeldNote(net, waits), unlist);
+    return row(listMeOnNote(net) + (waits ? ` ${LIST_ME_NO_WALLET}` : ''), unlist);
   }
   const note = listing.damaged ? listMeDamagedNote(net) : listing.chosen ? listMeOffNote(net) : listMeDefaultOffNote(net);
   // A LIST ME names its network to the node, and this page has no name for

@@ -211,6 +211,8 @@ pub struct WalletLease {
     /// those records: it is asked of the number wherever the bundle would go
     /// to the peers again ([`WalletLease::sends_again`]). Saved with the
     /// parking, in the same write, for the spends the file still holds.
+    /// Every spend of a file that keeps no marks, an older build's, is
+    /// here too ([`WalletLease::load`]): what it was is not on record.
     listed: std::sync::Mutex<BTreeSet<u64>>,
     /// The node's LIST ME switch, asked at each reconciliation
     /// ([`WalletLease::ask_list_me`]): whether it is on now. `None` until
@@ -242,6 +244,14 @@ type ListMeAsk = Box<dyn Fn() -> bool + Send + Sync>;
 /// key or a knock's is what off means; a writer that waits on every parked
 /// spend (the SSF wallet's own on a test network, [`publish_memo_on`]: the
 /// beacon it pays for there) waits with it.
+///
+/// A spend an older build parked carries no word of which it was: that
+/// build kept no marks, and on a test network it wrote the listing and the
+/// knocks whatever the player said. So every spend of a lease file with no
+/// marks in it is held as LIST ME's ([`WalletLease::load`]), a beacon's or
+/// a dish's among them: none of them can be told from a listing's, and one
+/// held back wrongly costs only the wait above, where one sent wrongly is a
+/// write the player stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resend {
     /// Whatever LIST ME says: the beacon's writes (their own setting,
@@ -651,11 +661,14 @@ struct LeaseFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     own_spends: Vec<OwnSpend>,
     /// The parked and settling spends that are LIST ME's
-    /// ([`Resend::WhileListed`]), by number. Absent in files older builds
-    /// wrote, whose spends are sent again as they always were; an older
-    /// build reads the file and skips this, as for a payer.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    list_me: Vec<u64>,
+    /// ([`Resend::WhileListed`]), by number: written by every build that
+    /// keeps the marks, with none to name as with some. Absent in a file an
+    /// older build wrote, and in one an older build wrote over this build's
+    /// (it reads the file and skips this, as for a payer). Such a file does
+    /// not say what its spends were, and [`WalletLease::load`] holds every
+    /// one of them as LIST ME's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list_me: Option<Vec<u64>>,
 }
 
 /// One coin of [`OwnSpends`] as the lease file keeps it.
@@ -1496,17 +1509,22 @@ impl WalletLease {
             Ok(bytes) => match serde_json::from_slice::<LeaseFile>(&bytes) {
                 Ok(file) => self
                     .load(&file, Instant::now())
-                    .map(|counts| (file.spends, counts))
+                    .map(|counts| (file.spends, counts, file.list_me.is_none()))
                     .map_err(|e| format!("{} holds a {e}", path.display())),
                 Err(e) => Err(format!("{} is unreadable ({e})", path.display())),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, (0, 0))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, (0, 0), false)),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         };
         match read {
-            Ok((_, (0, 0))) => {}
-            Ok((spends, (parked, settling))) => println!(
-                "⛓️ wallet lease: {parked} coin(s) still parked and {settling} spend(s) still settling from the last run (spends up to #{spends}); the chain and the mempool settle them"
+            Ok((_, (0, 0), _)) => {}
+            Ok((spends, (parked, settling), unmarked)) => println!(
+                "⛓️ wallet lease: {parked} coin(s) still parked and {settling} spend(s) still settling from the last run (spends up to #{spends}); the chain and the mempool settle them{}",
+                if unmarked {
+                    ". An older build wrote the file, which does not say which spends were a listing's or a knock's: none of them is sent again while LIST ME is off"
+                } else {
+                    ""
+                }
             ),
             Err(why) => {
                 eprintln!(
@@ -1643,11 +1661,27 @@ impl WalletLease {
         let settling_count = settling.len();
         // LIST ME's marks, for the spends the file holds: a number it holds
         // no spend for marks nothing, and is left out.
+        //
+        // 📖 A file with no marks in it at all is an older build's, and says
+        // nothing of what its spends were. On a test network such a build
+        // wrote the listing and the knocks with no word from the player,
+        // and a spend of theirs still parked here would go to the peers
+        // again after an UNLIST ME. None can be told from a beacon's or a
+        // dish's, so every spend the file holds is marked ([`Resend`]), and
+        // the next save names them.
         {
             let mut listed = self.listed.lock().unwrap();
-            for spend in &file.list_me {
-                if parked.iter().any(|(_, held, _)| held == spend) || settling.iter().any(|(held, _)| held == spend) {
-                    listed.insert(*spend);
+            match &file.list_me {
+                Some(marked) => {
+                    for spend in marked {
+                        if parked.iter().any(|(_, held, _)| held == spend) || settling.iter().any(|(held, _)| held == spend) {
+                            listed.insert(*spend);
+                        }
+                    }
+                }
+                None => {
+                    listed.extend(parked.iter().map(|(_, spend, _)| *spend));
+                    listed.extend(settling.iter().map(|(spend, _)| *spend));
                 }
             }
         }
@@ -1752,7 +1786,7 @@ impl WalletLease {
             settling,
             own_watching,
             own_spends,
-            list_me,
+            list_me: Some(list_me),
         }
     }
 
@@ -11628,7 +11662,7 @@ mod tests {
             let beacons = restored_in(&dir, &format!("beacon-{}", net.id()));
             switched(&beacons);
             beacons.park_with_bundle_at([(id, 900)], Some((&plain, beacon())), t0).unwrap();
-            assert!(!std::fs::read_to_string(dir.join(format!("beacon-{}.json", net.id()))).unwrap().contains("list_me"));
+            assert!(std::fs::read_to_string(dir.join(format!("beacon-{}.json", net.id()))).unwrap().contains("\"list_me\": []"), "no mark, and the file says so");
             let chain = live(None, 1000);
             beacons.reconcile_at(net, &chain, t1).await;
             assert_eq!(sent(&chain), 1, "{net:?}: the beacon has its own setting");
@@ -11645,6 +11679,125 @@ mod tests {
         let loaded = WalletLease::new();
         loaded.restore(&stray, money());
         assert!(loaded.listed.lock().unwrap().is_empty() && loaded.sealed.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 📖 A lease file an older build wrote keeps no LIST ME marks, and on
+    /// a test network that build wrote the listing and the knocks with no
+    /// word from the player. What each of its spends was is not on record,
+    /// so every one is held as LIST ME's ([`WalletLease::load`]): none goes
+    /// to the peers again while the switch is off, parked or settling when
+    /// the older build stopped, and each does once it is on. The next save
+    /// names them, so they stay marked through later restarts. A file this
+    /// build wrote says which spends it marks, with none to name as with
+    /// some, and a spend it does not name is sent as ever.
+    #[tokio::test]
+    async fn an_older_builds_lease_file_has_every_spend_held_as_list_mes() {
+        use crate::chia_chain::{testing::Scripted, CoinListing, CoinRecord};
+        use crate::chia_network::ChiaNet;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let dir = std::env::temp_dir().join(format!("ssf-lease-older-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = SpendBundle::new(vec![], Signature::default());
+        let ours = Coin::new(Bytes32::new([96u8; 32]), Bytes32::new([2u8; 32]), 1);
+        let id = ours.coin_id();
+        let page = |spent: Option<u32>, judged_at: u32| CoinListing {
+            records: vec![CoinRecord { coin: ours, confirmed_block_index: 900, spent: spent.is_some(), spent_block_index: spent.unwrap_or(0) }],
+            truncated: false,
+            next_cursor: None,
+            judged_at: Some(judged_at),
+        };
+        let sent = |chain: &Scripted| chain.sent.load(Relaxed);
+        let live = |spent: Option<u32>, judged_at: u32| Scripted::new(vec![page(spent, judged_at)]).with_liveness(true);
+        let switched = |lease: &WalletLease| {
+            let on = std::sync::Arc::new(AtomicBool::new(false));
+            let asked = on.clone();
+            lease.ask_list_me(move || asked.load(Relaxed));
+            on
+        };
+        // The file as an older build left it: the same, with no marks in it.
+        let older = |from: &std::path::Path, to: &std::path::Path| {
+            let mut file: LeaseFile = serde_json::from_slice(&std::fs::read(from).unwrap()).unwrap();
+            assert!(file.list_me.take().is_some(), "this build always says which spends it marks");
+            std::fs::write(to, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+            assert!(!std::fs::read_to_string(to).unwrap().contains("list_me"));
+        };
+
+        for net in ChiaNet::ALL {
+            // A spend parked with its bundle and no mark, as a beacon's is.
+            let name = format!("wrote-{}", net.id());
+            let wrote = restored_in(&dir, &name);
+            let parking = wrote.park_with_bundle_at([(id, 900)], Some((&plain, burner())), Instant::now()).unwrap();
+            let own_file = dir.join(format!("{name}.json"));
+            assert!(std::fs::read_to_string(&own_file).unwrap().contains("\"list_me\": []"));
+
+            // This build's file: the spend is not LIST ME's, and is asked
+            // about with the switch off.
+            let own = WalletLease::new();
+            own.restore(&own_file, money());
+            switched(&own);
+            let chain = live(None, 1000);
+            own.reconcile_at(net, &chain, Instant::now() + RECONCILE_GRACE).await;
+            assert_eq!(sent(&chain), 1, "{net:?}: this build's file names no mark for it");
+
+            // The older build's: held, with the switch off or never named.
+            let older_file = dir.join(format!("older-{}.json", net.id()));
+            older(&own_file, &older_file);
+            for told in [true, false] {
+                let lease = WalletLease::new();
+                lease.restore(&older_file, money());
+                if told {
+                    switched(&lease);
+                }
+                let chain = live(None, 1000);
+                lease.reconcile_at(net, &chain, Instant::now() + RECONCILE_GRACE).await;
+                assert_eq!(sent(&chain), 0, "{net:?}: an older build's spend, told {told}");
+                assert!(lease.is_parked(&id), "{net:?}: and its coin stays parked");
+            }
+
+            // The next save names it, the chain's word still settles it, and
+            // a block gone after it landed parks it again unsent.
+            let lease = WalletLease::new();
+            lease.restore(&older_file, money());
+            let on = switched(&lease);
+            let t1 = Instant::now() + RECONCILE_GRACE;
+            lease.reconcile_at(net, &live(Some(1000), 1001), t1).await;
+            assert!(lease.is_settling(&id), "{net:?}");
+            assert!(
+                std::fs::read_to_string(&older_file).unwrap().contains(&format!("\"list_me\": [\n    {}\n  ]", parking.spend)),
+                "{net:?}: saved by this build, the file names the mark"
+            );
+            lease.reconcile_at(net, &live(None, 1000), t1).await;
+            assert!(lease.is_parked(&id), "{net:?}: parked again");
+            let t2 = t1 + RECONCILE_GRACE;
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(sent(&chain), 0, "{net:?}: parked again, and still held");
+
+            // LIST ME on: asked like any other spend.
+            on.store(true, Relaxed);
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t2).await;
+            assert_eq!(sent(&chain), 1, "{net:?}: on, the liveness question is asked");
+
+            // A spend the older build left settling is held the same way
+            // once its block is gone.
+            let landed = restored_in(&dir, &format!("landed-{}", net.id()));
+            landed.park_with_bundle_at([(id, 900)], Some((&plain, burner())), Instant::now()).unwrap();
+            landed.reconcile_at(net, &live(Some(1000), 1001), Instant::now() + RECONCILE_GRACE).await;
+            assert!(landed.is_settling(&id), "{net:?}");
+            let settling_file = dir.join(format!("older-settling-{}.json", net.id()));
+            older(&dir.join(format!("landed-{}.json", net.id())), &settling_file);
+            let lease = WalletLease::new();
+            lease.restore(&settling_file, money());
+            switched(&lease);
+            let t1 = Instant::now() + RECONCILE_GRACE;
+            lease.reconcile_at(net, &live(None, 1000), t1).await;
+            assert!(lease.is_parked(&id), "{net:?}: its block gone, parked again");
+            let chain = live(None, 1000);
+            lease.reconcile_at(net, &chain, t1 + RECONCILE_GRACE).await;
+            assert_eq!(sent(&chain), 0, "{net:?}: a spend an older build left settling");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

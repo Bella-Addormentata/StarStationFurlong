@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { MAINNET, TESTNET11 } from './chiaNetwork';
 import {
-  LIST_ME_BUTTON_ID, LIST_ME_NO_WALLET, LIST_ME_NOT_CONFIRMED, LIST_ME_TIMEOUT_MS, LIST_ME_UNKNOWN_NETWORK, listMeChiaOffNote, listMeChiaOffOnNote,
+  LIST_ME_BUTTON_ID, LIST_ME_HELD_NO_WALLET, LIST_ME_NO_WALLET, LIST_ME_NOT_CONFIRMED, LIST_ME_TIMEOUT_MS, LIST_ME_UNKNOWN_NETWORK, listMeChiaOffNote, listMeChiaOffOnNote,
   listMeDamagedNote, listMeDefaultOffNote, listMeHeldNote, listMeOffNote, listMeOnNote, listMeRow, listMeStands, listMeTarget, listMeTurnOf, listMeWarning,
   turnListMe, type ListMeUi,
 } from './listMe';
@@ -88,8 +88,12 @@ describe.each([TESTNET11, MAINNET])('listMeRow on $name', (net) => {
       expect(listMeRow(fp(ON, { chia_wallet }), IDLE).note).toBe(waiting ? `${listMeOnNote(net)} ${LIST_ME_NO_WALLET}` : listMeOnNote(net));
     }
     // The environment holds the listing off: the switch cannot change that, and still turns off.
-    for (const chia_wallet of [undefined, { state: 'ready' }, { state: 'on' }] as (ChiaWalletSwitch | undefined)[]) {
-      expect(listMeRow(fp({ ...ON, held: true }, chia_wallet ? { chia_wallet } : {}), IDLE)).toEqual({ note: listMeHeldNote(net), warning: null, error: null, button: UNLIST });
+    // Its knocks wait for the SSF wallet as every write does, and the note says so.
+    for (const [chia_wallet, waiting] of [[undefined, false], ...waits] as [ChiaWalletSwitch | undefined, boolean][]) {
+      const held = listMeRow(fp({ ...ON, held: true }, chia_wallet ? { chia_wallet } : {}), IDLE);
+      expect(held).toEqual({ note: listMeHeldNote(net, waiting), warning: null, error: null, button: UNLIST });
+      expect(held.note!.endsWith(waiting ? LIST_ME_HELD_NO_WALLET : 'Its knocks are still written.')).toBe(true);
+      expect(held.note!.includes('Its knocks are still written.')).toBe(!waiting);
     }
   });
 
@@ -121,7 +125,7 @@ describe.each([TESTNET11, MAINNET])('listMeRow on $name', (net) => {
 
   it('names the network, and the payer only where the SSF wallet never is one', () => {
     const texts = [
-      listMeOnNote(net), listMeHeldNote(net), listMeDefaultOffNote(net), listMeOffNote(net), listMeDamagedNote(net), listMeChiaOffOnNote(net),
+      listMeOnNote(net), listMeHeldNote(net), listMeHeldNote(net, true), listMeDefaultOffNote(net), listMeOffNote(net), listMeDamagedNote(net), listMeChiaOffOnNote(net),
       listMeChiaOffNote(net), listMeWarning(net), listMeWarning(net, true),
     ];
     for (const text of texts) {
@@ -166,6 +170,9 @@ describe('the LIST ME texts, whole', () => {
       'LIST ME is off for testnet11: your station writes no Phone Book listing and no knock there. What it wrote before stays on the chain; readers stop finding a listing once its edition and the next have passed.',
     );
     expect(listMeHeldNote(TESTNET11)).toBe("LIST ME is on for testnet11, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. Its knocks are still written.");
+    expect(listMeHeldNote(TESTNET11, true)).toBe(
+      "LIST ME is on for testnet11, but SSF_CHIA_FINDABLE=0 in your node's environment holds its listing off, and the switch here cannot change that. Its knocks are written once the SSF wallet is on (the SpacePhone's 🏦 BANK).",
+    );
     expect(listMeDamagedNote(TESTNET11)).toBe(
       'The saved LIST ME switch could not be read, and a switch that cannot be read counts as off: your station writes no Phone Book listing and no knock on testnet11. Turned on here, it is saved anew.',
     );
