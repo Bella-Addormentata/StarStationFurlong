@@ -64,9 +64,15 @@ type Stream = SplitStream<Socket>;
 /// The wallet protocol version this node speaks (the one `chia-protocol` 0.36
 /// encodes; a Chia release that moves it means a chia-crate bump, plan §14).
 pub const PROTOCOL_VERSION: &str = "0.0.37";
-/// One bound for the TCP connect, the TLS handshake, the websocket upgrade and
-/// the Chia handshake, each.
+/// One bound for the TLS handshake, the websocket upgrade and the Chia
+/// handshake, each.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The bound for the TCP connect alone. Most addresses a full node gossips
+/// take no connection at all (home nodes behind a router; on testnet11 about
+/// ninety-nine in a hundred, live check 2026-11-10), and each such dial lasts
+/// this long: five seconds leave room for a lost first packet and its
+/// resend, and let a request try twice the addresses it could in ten.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long one request may wait for its answer. A full node that stays
 /// silent (it answers nothing for a transaction it does not hold, for one) is
 /// `Unanswered` after this, never guessed at.
@@ -562,7 +568,8 @@ impl PeerConn {
         outcome
     }
 
-    /// TCP, TLS and the websocket upgrade, each within [`CONNECT_TIMEOUT`];
+    /// TCP within [`DIAL_TIMEOUT`], TLS and the websocket upgrade each within
+    /// [`CONNECT_TIMEOUT`];
     /// then the reader is started, counted in `readers` when there are any,
     /// and the connection is ready for the handshake ([`Self::bind`]), whose
     /// answer comes on the receiver.
@@ -573,7 +580,7 @@ impl PeerConn {
         readers: Option<&Readers>,
     ) -> Result<(Arc<Self>, oneshot::Receiver<Handshake>)> {
         let addr = canonical(addr);
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        let tcp = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow!("tcp connect timed out"))?
             .context("tcp connect")?;

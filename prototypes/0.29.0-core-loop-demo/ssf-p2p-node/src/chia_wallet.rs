@@ -1415,12 +1415,13 @@ pub fn log_receive_address(net: ChiaNet, id: &WalletIdentity) {
 /// The receive address's line, and how it is funded on `net`. Off a test
 /// network the lane pays for no write from this wallet (stage 4 design
 /// §4.5 (1), `chia_publish::money_memo_refusal`), so the line promises none
-/// there: funding it would buy no listing.
+/// there: funding it would buy no listing. It says nothing of what the
+/// lane writes from other keys.
 fn receive_line(net: ChiaNet, addr: &str) -> String {
     let fund = if net.is_test() {
         format!("Fund it at a {} faucet. {} is free. Once it holds a coin, the lane can publish/resolve presence.", net.name(), net.ticker())
     } else {
-        format!("This address takes real {}. On {} the lane writes nothing from it and only reads the chain.", net.ticker(), net.name())
+        format!("This address takes real {}. On {} the lane pays for no chain write from it.", net.ticker(), net.name())
     };
     format!("⛓️ ChiaHub lane: {} receive address {addr}\n   {fund}", net.name())
 }
@@ -3204,9 +3205,11 @@ mod tests {
         );
         // Stage 4 design §4.5 (1): off a test network the SSF wallet pays
         // for no write, so the mainnet line no longer says a coin there lets
-        // the lane publish.
+        // the lane publish. It speaks of this address alone, and does not
+        // say the lane only reads the chain: a beacon is written from a key
+        // of its own.
         let line = receive_line(ChiaNet::Mainnet, "xch1q");
-        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. On Chia mainnet the lane writes nothing from it and only reads the chain.");
-        assert!(!line.contains("faucet") && !line.contains("publish"), "{line}");
+        assert_eq!(line, "⛓️ ChiaHub lane: Chia mainnet receive address xch1q\n   This address takes real XCH. On Chia mainnet the lane pays for no chain write from it.");
+        assert!(!line.contains("faucet") && !line.contains("publish") && !line.contains("only reads"), "{line}");
     }
 }

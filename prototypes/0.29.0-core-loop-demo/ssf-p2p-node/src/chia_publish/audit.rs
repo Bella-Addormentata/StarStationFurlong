@@ -36,9 +36,8 @@
 //! - the beacon's key B, when the wallet loads with the beacon on
 //!   (`SSF_CHIA_BEACON=1`), on either path: B is one key and one address
 //!   with burner keys on or off ([`wallet_lines`]). It is named wherever
-//!   the beacon is on, also where the beacon writes nothing yet (off a
-//!   test network, where the beacon's own line names the same address
-//!   and says so);
+//!   the beacon is on, on every network: on the burner path, the only one
+//!   off a test network, the beacon's own startup line names no address;
 //! - the claim-and-write self-test's key, when that hook runs
 //!   (`claim_write::claim_write_selftest`).
 //!
@@ -94,7 +93,7 @@ pub fn audit_of(raw: Option<&OsStr>) -> (bool, Option<String>) {
         return (false, None);
     }
     let notice = format!(
-        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+        "🔎 ChiaHub audit ({AUDIT_ENV}=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
     );
     (true, Some(notice))
 }
@@ -156,8 +155,8 @@ pub(crate) fn audit_line(net: ChiaNet, key: AuditKey, payer: Payer) -> String {
 /// ([`super::beacon_wallet_key`]). B pays for the beacon on either path,
 /// as the beacon wallet's key or as a burner key, at one address, so its
 /// line is the same with burner keys on or off. It is said wherever the
-/// beacon is on, also on a network where the beacon writes nothing yet,
-/// where nothing sits at the address.
+/// beacon is on, on every network, whether or not a coin sits at the
+/// address yet.
 pub fn wallet_lines(net: ChiaNet, audit: &(bool, Option<String>), beacon_on: bool, wallet: &SecretKey) -> Vec<String> {
     let (true, notice) = audit else {
         return Vec::new();
@@ -285,7 +284,7 @@ mod tests {
             (
                 true,
                 Some(
-                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
+                    "🔎 ChiaHub audit (SSF_CHIA_AUDIT=1): on, for the sign-off review. This log names the address and the puzzle hash of the keys this station's chain writes come from: each era's listing key and each knock's key once it has written (on a test network, with SSF_CHIA_BURNERS=1), and the beacon's key (with SSF_CHIA_BEACON=1). It prints no key, secret or public. Keep this log private: whoever reads it can tell which chain writes are this station's. Leave the switch unset otherwise."
                         .to_string()
                 )
             )

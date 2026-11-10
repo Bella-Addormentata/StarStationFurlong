@@ -110,10 +110,12 @@ const CHIA_FILES: &[&str] = &[
     "wallet_lease.json",
     // The knock book (`KNOCKS_FILE`, src/chia_knock.rs).
     "knocks.json",
-    // The publisher's and the beacon's marks (`NODE_MARK_FILE`,
-    // `BEACON_MARK_FILE`, src/chia_publish.rs).
+    // The publisher's and the beacon's marks, and the date of the beacon's
+    // last push (`NODE_MARK_FILE`, `BEACON_MARK_FILE`, `BEACON_PUSHED_FILE`,
+    // src/chia_publish.rs).
     "publish_marks.json",
     "beacon_mark.json",
+    "beacon_pushed.json",
 ];
 
 /// Mainnet's own folder of state files (`MAINNET_DIR`, src/chia_network.rs).
