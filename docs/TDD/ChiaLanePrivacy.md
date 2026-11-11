@@ -195,7 +195,7 @@ So on testnet11 today nothing in §5 is in effect unless the operator sets the f
 | `SSF_CHIA_BEACON=1` | Environment | Unset: no beacon | Nothing; setting it lights the beacon. | |
 | `SSF_CHIA_BURNERS=1` | Environment, test network only | Unset: the wallet pays | Setting it moves listing, knocks and beacon to the burner path. Off a test network that path is the only one. | v1 room records, which the wallet still pays for. |
 | `SSF_CHIA_WATCH=0` | Environment | Unset: the watcher runs | The watcher's reads on every beat and, with it, knocks. | The reads a failed dial makes, and the listing. |
-| `SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY` | Environment | Unset: public full nodes | With both set, every request goes to the operator's own full node and no other. Pin-only takes `1`, `true`, `on` or `yes`. | With no pin set, pin-only does nothing: public full nodes are asked, and one line at start says so (`pin_port_warnings` in `chia_peer_lane.rs`). |
+| `SSF_CHIA_PEERS`, `SSF_CHIA_PIN_ONLY` | Environment | Unset: public full nodes | With both set, every request goes to the operator's own full node and no other. Pin-only takes `1`, `true`, `on` or `yes`. Pin-only with no pin named asks no full node at all: every chain read and write fails, with the answer an unreachable pin gives, until a pin is named; the peer store is neither read nor written, and one line at start says so (`PIN_ONLY_NO_PIN_WORDS` and `pin_port_warnings` in `chia_peer_lane.rs`). | A pin without pin-only: public full nodes are still asked beside it (§3). |
 | **The SSF wallet** | The Bank's switch (`chia_wallet.json`, per network); `SSF_CHIA_LANE` holds it on (`1`) or off (any other value that is not empty) | Off until the player makes a wallet | With no wallet on, every write. Turning it on in the Bank loads the wallet and starts the publisher at once, in the same run. Turning it off takes effect at the node's next start; until then the wallet stays loaded and the node goes on writing. | Reads. |
 | `SSF_CHIA_AUDIT=1` | Environment | Unset | Nothing; setting it prints the address and puzzle hash of the station's burner keys in the node's own log, for the review in §10. Never key bytes. | |
 | Build features | `cargo build` | Release builds: `chia-publish`, no `chia-mainnet` | Without default features there is no lane; without `chia-publish`, no write; without `chia-mainnet`, the node stops at `SSF_CHIA_NETWORK=mainnet`. | |
@@ -286,7 +286,6 @@ A one-off developer review of what the chain actually shows. The game never depe
 - With burners on on testnet11, a room's v1 record is still paid by the wallet and not spaced, which pairs the listing key with the wallet's address by time (§7). It goes with the v1 writer.
 - The hint rule and the gift fuse rest on local files, not on the chain (§5, §7).
 - On a test network the default log prints the wallet's receive address at start, and its puzzle hash on a failed wallet-paid write (§9). Off a test network it prints neither.
-- Pin-only mode with no pin does nothing, and says so at start (§8). It does not stop the node from asking public full nodes.
 
 ## 12. Where this comes from
 

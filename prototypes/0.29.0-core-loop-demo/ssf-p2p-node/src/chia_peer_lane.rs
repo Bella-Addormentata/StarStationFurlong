@@ -23,7 +23,9 @@
 //!     default it must agree with one public peer from another network group
 //!     (so at most three pin addresses connect, one place kept for that peer);
 //!     `SSF_CHIA_PIN_ONLY=1` makes the pin's verdict final alone (and dials no
-//!     public peer at all). An unreachable pin is a non‑final verdict on money
+//!     public peer at all); set with no pin, it leaves nobody to ask, and
+//!     every request fails until one is named ([`PIN_ONLY_NO_PIN_WORDS`]).
+//!     An unreachable pin is a non‑final verdict on money
 //!     paths, never a silent fall‑back to public peers; the presence lane may
 //!     still read from public peers meanwhile. A pin that is down is dialled
 //!     again after [`PIN_RETRY_AFTER`] whether or not another pin is up: the
@@ -340,12 +342,11 @@ impl PeerLane {
 pub struct Lane {
     net: Network,
     pins: Vec<String>,
-    /// Pin-only mode in effect: asked for, with a pin to ask.
+    /// Pin-only mode, as the operator asked for it: the pins' verdict is
+    /// final alone, and no public peer is dialled. With no pin there is
+    /// nobody to ask: every request fails ([`PIN_ONLY_NO_PIN_WORDS`]), and
+    /// the startup warnings say so ([`pin_port_warnings`]).
     pin_only: bool,
-    /// Pin-only mode as the operator asked for it, pin or no pin: with no
-    /// pin it does nothing, and the startup warnings say so
-    /// ([`pin_port_warnings`]).
-    pin_only_asked: bool,
     store_path: Option<PathBuf>,
     tls: tokio::sync::OnceCell<Arc<rustls::ClientConfig>>,
     /// The pool: held for choosing and bookkeeping alone, never across a dial,
@@ -485,12 +486,20 @@ pub fn pins_from_env() -> Vec<String> {
 }
 
 /// `SSF_CHIA_PIN_ONLY=1`: the pins' verdict is final alone, and no public peer
-/// is dialled.
+/// is dialled, whether or not a pin is named ([`PIN_ONLY_NO_PIN_WORDS`]).
 pub fn pin_only_from_env() -> bool {
     std::env::var("SSF_CHIA_PIN_ONLY")
         .ok()
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
 }
+
+/// 🕳️ Why every request fails in pin-only mode with no pin
+/// (`SSF_CHIA_PIN_ONLY` set, `SSF_CHIA_PEERS` naming no full node): the
+/// operator asked that only their own full node be asked, and named none.
+/// It fails shut: a slip in the setup of a privacy switch must not show
+/// public full nodes everything the station reads
+/// (docs/TDD/ChiaLanePrivacy.md §3, §8).
+pub const PIN_ONLY_NO_PIN_WORDS: &str = "SSF_CHIA_PIN_ONLY is set and SSF_CHIA_PEERS names no full node, so no full node is asked";
 
 fn unanswered(why: String) -> ChainError {
     ChainError::Unanswered(anyhow!("{why}"))
@@ -508,15 +517,12 @@ impl Lane {
     }
 
     pub fn new(net: Network, pins: Vec<String>, pin_only: bool, store_path: Option<PathBuf>) -> Self {
-        let pin_only_asked = pin_only;
-        let pin_only = pin_only && !pins.is_empty();
         let closed = tokio::sync::watch::Sender::new(false);
         let readers = Readers::new(closed.subscribe());
         Self {
             net,
             pins,
             pin_only,
-            pin_only_asked,
             store_path,
             tls: tokio::sync::OnceCell::new(),
             state: tokio::sync::Mutex::new(LaneState::default()),
@@ -698,6 +704,11 @@ impl Lane {
                 self.off_why.map(|why| format!(" ({why})")).unwrap_or_default(),
                 self.net.id
             )
+        } else if self.pin_only && self.pins.is_empty() {
+            format!(
+                "no {} full node. SSF_CHIA_PIN_ONLY is set and SSF_CHIA_PEERS names none: nothing is asked, and the peer store is neither read nor written, until a pin is named",
+                self.net.id
+            )
         } else if self.pins.is_empty() {
             format!(
                 "{} full nodes via {} and peer gossip; money paths need two agreeing peers",
@@ -719,11 +730,10 @@ impl Lane {
         }
     }
 
-    /// The startup warnings for this lane's pins ([`pin_port_warnings`]),
-    /// from pin-only mode as it was asked for: asked with no pin, it does
-    /// nothing, and that is said.
+    /// The startup warnings for this lane's pins ([`pin_port_warnings`]):
+    /// pin-only mode with no pin asks nobody, and that is said.
     pub fn pin_port_warnings(&self) -> Vec<String> {
-        pin_port_warnings(&self.pins, self.pin_only_asked, &self.net)
+        pin_port_warnings(&self.pins, self.pin_only, &self.net)
     }
 
     async fn tls(&self) -> Result<Arc<rustls::ClientConfig>, ChainError> {
@@ -778,9 +788,20 @@ impl Lane {
     /// refusal is [`ChainError::Refused`], since no peer was asked: a fresh
     /// push refused so spent nothing, and a spend already parked stays parked
     /// (its lookups fail).
+    ///
+    /// 🕳️ Pin-only mode with no pin fails here too, right after
+    /// ([`PIN_ONLY_NO_PIN_WORDS`]): as [`ChainError::Unanswered`], the answer
+    /// a pin that cannot be reached gives.
     async fn peers_for(&self, trust: Trust) -> Result<Vec<Arc<PeerConn>>, ChainError> {
         self.refuse_if_closed()?;
         let pinned = !self.pins.is_empty();
+        // 🕳️ Pin-only mode with no pin: nobody to ask. The operator asked
+        // that no public full node be asked, so none is: the request fails
+        // here, as it does while a pin cannot be reached, before the store
+        // is read, an introducer asked or a peer dialled.
+        if self.pin_only && !pinned {
+            return Err(unanswered(PIN_ONLY_NO_PIN_WORDS.to_string()));
+        }
         let started = Instant::now();
         let spent = || started.elapsed() >= self.budget;
         // One pass more than there are dial rounds: the peers the LAST round
@@ -2644,17 +2665,18 @@ fn pin_port(pin: &str) -> PinPort {
 /// another port serves `net` otherwise. A pin without a port takes the
 /// network's and never warns.
 ///
-/// `pin_only` is the mode as the operator asked for it. Asked with no pin
-/// at all it does nothing ([`Lane::new`]): public full nodes are found and
-/// asked as if it were unset, which an operator who set it to keep the
-/// station's requests on a full node of their own would not expect. One
-/// line says so (docs/TDD/ChiaLanePrivacy.md §8).
+/// Pin-only mode with no pin at all asks nobody ([`PIN_ONLY_NO_PIN_WORDS`]):
+/// the operator set it to keep the station's requests on a full node of
+/// their own, so a missing or mistyped `SSF_CHIA_PEERS` must not send them
+/// to public full nodes instead. One line says that every chain read and
+/// write fails until a pin is named, and how to undo either setting
+/// (docs/TDD/ChiaLanePrivacy.md §8).
 ///
 /// Pure, so a test can run it for both networks.
 pub fn pin_port_warnings(pins: &[String], pin_only: bool, net: &Network) -> Vec<String> {
     if pin_only && pins.is_empty() {
         return vec![format!(
-            "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so it does nothing: public {} full nodes are found and asked as if it were unset. To ask a full node of your own alone, name it in SSF_CHIA_PEERS.",
+            "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so no {} full node is asked at all: every chain read and write fails until a pin is named. Name your own full node in SSF_CHIA_PEERS, or unset SSF_CHIA_PIN_ONLY to ask public full nodes.",
             net.id
         )];
     }
@@ -7061,12 +7083,12 @@ mod tests {
         for (net, other) in [(Network::testnet11(), 8444u16), (Network::mainnet(), 58444u16)] {
             let right = net.port;
             assert!(pin_port_warnings(&[], false, &net).is_empty(), "no pins, nothing to say");
-            // Pin-only asked for with no pin does nothing, and one line
-            // says so: public full nodes are asked.
+            // Pin-only asked for with no pin asks nobody, and one line
+            // says so, with the way out of either setting.
             assert_eq!(
                 pin_port_warnings(&[], true, &net),
                 vec![format!(
-                    "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so it does nothing: public {} full nodes are found and asked as if it were unset. To ask a full node of your own alone, name it in SSF_CHIA_PEERS.",
+                    "⛓️ Chain lane: SSF_CHIA_PIN_ONLY is set, but SSF_CHIA_PEERS names no full node, so no {} full node is asked at all: every chain read and write fails until a pin is named. Name your own full node in SSF_CHIA_PEERS, or unset SSF_CHIA_PIN_ONLY to ask public full nodes.",
                     net.id
                 )]
             );
@@ -7150,11 +7172,15 @@ mod tests {
         assert!(pinned.describe().contains("plus one public peer"));
         let only = Lane::new(Network::testnet11(), vec!["10.0.0.2".to_string()], true, None);
         assert!(only.describe().contains("ONLY"));
-        // Pin-only without a pin is just the public posture, and the
-        // lane's startup warnings say that it does nothing.
+        // Pin-only without a pin is no public posture: nobody is asked,
+        // and the lane's startup line and warnings both say so.
         let none = Lane::new(Network::testnet11(), vec![], true, None);
-        assert!(!none.pin_only);
-        assert_eq!(none.describe(), public.describe());
+        assert!(none.pin_only);
+        assert_eq!(
+            none.describe(),
+            "no testnet11 full node. SSF_CHIA_PIN_ONLY is set and SSF_CHIA_PEERS names none: nothing is asked, and the peer store is neither read nor written, until a pin is named"
+        );
+        assert!(!none.describe().contains("introducer") && !none.describe().contains("gossip"), "{}", none.describe());
         assert_eq!(none.pin_port_warnings(), pin_port_warnings(&[], true, &Network::testnet11()));
         assert_eq!(none.pin_port_warnings().len(), 1);
         assert!(public.pin_port_warnings().is_empty() && only.pin_port_warnings().is_empty());
@@ -7184,6 +7210,51 @@ mod tests {
                 other => panic!("{what}: {other:?}"),
             }
         }
+    }
+
+    /// 🕳️ Pin-only mode with no pin fails shut. No public full node is
+    /// asked, though one is queued, another is in the peer store and the
+    /// introducer has a name to look up (one this machine answers itself,
+    /// so a lane that did ask would ask no outside host). Every operation
+    /// fails, at both trust levels, with the words that name the two
+    /// settings; nothing is dialled, the store is neither read nor
+    /// rewritten. The same peers with pin-only unset answer, so the test
+    /// would see a lane that fell back to them.
+    #[tokio::test]
+    async fn pin_only_mode_with_no_pin_asks_no_full_node() {
+        let queued = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let stored = full_node(vec![state(1, 90, None)], (1, None), Some(peak_at(100))).await;
+        let store = temp_store("pin-only-no-pin");
+        write_store(&store, &StoreFile { v: 1, peers: vec![StoredPeer { addr: stored.addr.to_string(), last_ok: unix_now() }] }).unwrap();
+        let before = std::fs::read(&store).unwrap();
+        let shut = Arc::new(
+            Lane::new(Network { introducers: vec!["localhost".to_string()], ..net() }, vec![], true, Some(store.clone()))
+                .with_candidates(vec![(queued.addr, Source::Introducer)])
+                .with_tls(TLS.clone()),
+        );
+        assert!(shut.pin_only && shut.pins.is_empty() && !shut.is_closed());
+        for trust in [Trust::Carrier, Trust::Agreed] {
+            for (what, err) in every_op(&PeerLane::new(shut.clone(), trust)).await {
+                match err {
+                    Some(ChainError::Unanswered(why)) => assert_eq!(why.to_string(), PIN_ONLY_NO_PIN_WORDS, "{what}"),
+                    other => panic!("{what}: {other:?}"),
+                }
+            }
+        }
+        {
+            let state = shut.state.lock().await;
+            assert!(!state.store_loaded && state.known.is_empty(), "the store was never read");
+            assert!(state.introduce_after.is_none(), "the introducer was never asked");
+            assert!(state.conns.is_empty() && state.pin_target.is_none(), "nothing connected");
+        }
+        assert!(shut.dialled.borrow().is_empty(), "nothing dialled");
+        assert_eq!(std::fs::read(&store).unwrap(), before, "chia_peers.json is as it was");
+
+        // Pin-only unset: the same queued peer and the same store answer.
+        let open = lane(vec![(queued.addr, Source::Introducer)], vec![], false, Some(store.clone()));
+        assert_eq!(PeerLane::new(open.clone(), Trust::Carrier).peak_height().await.unwrap(), 100);
+        assert!(open.live_count().await >= 1, "a public peer was dialled");
+        let _ = std::fs::remove_file(&store);
     }
 
     /// ⛓️ Chia off (`SSF_NO_CHIA_LANE`): a closed lane has no pins and no
