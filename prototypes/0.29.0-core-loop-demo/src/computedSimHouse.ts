@@ -367,8 +367,12 @@ export class SimHouse {
     const fo = this.games(room, doc, comp, mem, now, writes, out);
     const fairTables = (rd?.fair ?? 0) + fo.settled;
 
-    // The heartbeat, while a table runs Fair.
-    if (fairTables > 0 && !this.steppingDown && (mem.lastBeat === null || now - mem.lastBeat >= HEARTBEAT_MS)) {
+    // The heartbeat, while a table runs Fair. 🔒 And not while it settles at
+    // any game it serves: the beat is the room's, so a page at that game
+    // would hear it and close at once, and a close first read while settling
+    // is never revealed for. (The other tables go without a beat for
+    // SETTLE_MS at most, well inside HOUSE_HEARD_MS.)
+    if (fairTables > 0 && fo.settled === fo.serving && !this.steppingDown && (mem.lastBeat === null || now - mem.lastBeat >= HEARTBEAT_MS)) {
       // It counts on from the doc's beat only as it signed it: a peer's copy
       // with a higher count would push its own past what the pages take.
       const beat = comp.get(beatKey(this.pub));
@@ -506,7 +510,7 @@ export class SimHouse {
    *  it settles is one it never reveals (the bettors would have to abandon
    *  it: a voided round and half a minute at every return of the house). So
    *  it is heard at a game only once it is ready to reveal there. */
-  private games(room: string, doc: Y.Doc, comp: Y.Map<unknown>, mem: RoomMem, now: number, writes: Write[], out: HouseTickOut): { settled: number; reput: Write[] } {
+  private games(room: string, doc: Y.Doc, comp: Y.Map<unknown>, mem: RoomMem, now: number, writes: Write[], out: HouseTickOut): { settled: number; serving: number; reput: Write[] } {
     const reput: Write[] = [];
     const byGame = new Map<string, { t: string; inc: string; cks: [string, unknown][]; xfs: [string, unknown][]; fin: unknown }>();
     const gameAt = (t: string, inc: string) => {
@@ -537,17 +541,21 @@ export class SimHouse {
     }
     const partial = (doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null;
     let settled = 0;
+    let serving = 0;
     for (const key of [...byGame.keys()].sort()) {
       const { t, inc, cks, xfs, fin } = byGame.get(key)!;
       const row = this.rows.get(`${room}|${t}|${inc}`);
       const rec: AuthRecords = { cks: row ? [...cks, [row.key, row.value]] : cks, xfs, fin, delegations };
       const res = resolveGame({ room, sig: (id, pub, bytes, sig) => this.verified(['auth', id, '', '', ''], pub, bytes, sig) }, t, inc, rec);
-      // N5: its last checkpoint, gone from the doc, while no authority's stands above it.
-      if (row && !comp.has(row.key) && res.base?.key === row.key) reput.push({ ses: null, key: row.key, value: row.value as unknown as Record<string, unknown> });
+      // N5: its last checkpoint, gone from the doc or with something else under
+      // its key, while no authority's stands above it.
+      const held = row ? comp.get(row.key) : undefined;
+      if (row && !(isPlain(held) && recHash(held) === recHash(row.value)) && res.base?.key === row.key) reput.push({ ses: null, key: row.key, value: row.value as unknown as Record<string, unknown> });
       if (res.newer || res.pending || !res.live || !res.base) continue;
       const B = res.base.ck;
       const by = res.houseBy(this.pub, B.u + 1);
       if (!by) continue;
+      serving += 1;
       const ctx: FoldCtx = { room, t, inc };
       const sid = nextSid3(ctx, B);
       const sesKey = `ses:${t}:${inc}:${sid}`;
@@ -563,7 +571,7 @@ export class SimHouse {
       if (now - mem.tables.get(`${t}|${inc}`)!.firstRead >= SETTLE_MS) settled += 1;
       if (res.fin === null) this.trimDuty(doc, mem, { ctx, res, base: res.base, dl: by.value, sesKey }, read, now, writes);
     }
-    return { settled, reput };
+    return { settled, serving, reput };
   }
 
   /** Table ctx's live session, the one `base` opens, as house.rs read_table
@@ -748,7 +756,7 @@ export class SimHouse {
    *  an abandon. */
   private decide(read: TableRead, c: Close, forfeits: Forfeit[], abandons: [string, number, string, Record<string, unknown>][]): Decision | null {
     const { ctx } = read;
-    const craps = ctx.inc.startsWith('k') || ctx.inc.startsWith('d');
+    const craps = gameOfInc(ctx.inc) === 'craps';
     // P, the frozen slips there and good (at roulette with chips on:
     // computedFold frozenOk), and how many aren't (M).
     const present: [string, string, Slip][] = [];

@@ -1748,8 +1748,11 @@ export class Sim {
       const id = `${t}:${inc}:${res.base.sid}:${v.r}:${v.close}`;
       const d = v.house ? `h:${v.house.hash}` : v.abandon ? `z:${v.abandon.hash}` : '';
       const o = v.decided === 'house' ? (v.craps ? v.craps.dice : v.pocket) : null;
-      addIn(this.reached, id, JSON.stringify([netsText(n), d, o]));
-      if (i === decided.length - 1) addIn(this.reachedLast, id, JSON.stringify([canon(res.carry ?? null), res.required]));
+      const reached = [netsText(n), d, o];
+      addIn(this.reached, id, JSON.stringify(reached));
+      // (What it hands on, with what it reached: one fold's whole state, so a
+      // checkpoint cannot take its nets of one honest fold and its carry of another.)
+      if (i === decided.length - 1) addIn(this.reachedLast, id, JSON.stringify([...reached, canon(res.carry ?? null), res.required]));
     }
   }
 
@@ -1789,7 +1792,7 @@ export class Sim {
       if (!got) out.push(`${by} counted ${key} (round ${ck.u}), a round no honest page folded decided on that close`);
       else if (!got.has(want)) out.push(`${by} counted ${key} (round ${ck.u}) holding ${want}, the honest pages folded ${[...got].join(' or ')}`);
       if (ck.e === 1) continue;
-      const last = JSON.stringify([canon(ck.s ?? null), ck.h ?? null]);
+      const last = JSON.stringify([nets, ck.d ?? '', ck.o ?? null, canon(ck.s ?? null), ck.h ?? null]);
       const gotLast = this.reachedLast.get(id);
       if (got && !gotLast?.has(last)) out.push(`${by} counted ${key} (round ${ck.u}) handing on ${last}, the honest pages had ${[...(gotLast ?? [])].join(' or ') || 'never that round as their last'}`);
     }

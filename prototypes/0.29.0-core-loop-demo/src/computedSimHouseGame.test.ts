@@ -12,13 +12,14 @@
 
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { basisOf, canonFelt } from './computedCraps';
 import { ckKey, readCk, sealFin } from './computedFairOnly';
 import type { CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
-import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, owner, P, recordsOf, ROOM, rootOf, T, trimOf } from './computedFairOnlyKit';
+import { authEnv, delegation, DL_HOUSE, house as H, house2 as H2, OPENING_CARRY, owner, P, Q, recordsOf, ROOM, rootOf, T, trimOf } from './computedFairOnlyKit';
 import { foldGameOf, MAX_HELD_ROUNDS, nextSid3, recHash, TableFold } from './computedFold';
-import type { CloseRec, FoldResult, SlipRec } from './computedFold';
-import { beatKey, delegationKey } from './computedHouse';
+import type { CloseRec, FoldCtx, FoldResult, SlipRec } from './computedFold';
+import { beatKey, delegationKey, HEARTBEAT_MS } from './computedHouse';
 import { HOUSE_IDLE_MS, HOUSE_SWEEP_BYTES, HOUSE_TRIM_AFTER_MS, HOUSE_TRIM_ROUNDS, REVEAL_CUTOFF_MS, SETTLE_MS, SimHouse } from './computedSimHouse';
 import { ComputedKit, red, testIdentity, trustAll } from './computedTestKit';
 import type { Built } from './computedTestKit';
@@ -38,11 +39,11 @@ class GameRoom {
   house = new SimHouse(H.secret);
   now = 1_000_000;
 
-  constructor(root = ROOT) {
+  constructor(root = ROOT, readonly g: FoldCtx = P) {
     this.doc.transact(() => {
       for (const id of [owner, alice, bob, mallory]) this.doc.getMap('players').set(id.pid, { keyB64: id.pub });
       this.top().set(root.key, root.value);
-      this.top().set(`ses:${T}:${P.inc}:${nextSid3(P, root.value)}`, new Y.Map());
+      this.top().set(`ses:${T}:${this.g.inc}:${nextSid3(this.g, root.value)}`, new Y.Map());
     });
   }
 
@@ -59,7 +60,7 @@ class GameRoom {
 
   /** The game's checkpoints in the doc, the best first (the highest round). */
   cks(): { key: string; ck: CkRec }[] {
-    return [...this.top().entries()].filter(([k]) => k.startsWith(`ck:${T}:${P.inc}:`))
+    return [...this.top().entries()].filter(([k]) => k.startsWith(`ck:${T}:${this.g.inc}:`))
       .map(([key, v]) => ({ key, ck: v as CkRec })).sort((a, b) => b.ck.u - a.ck.u);
   }
 
@@ -68,15 +69,15 @@ class GameRoom {
   }
 
   sid(): string {
-    return nextSid3(P, this.base());
+    return nextSid3(this.g, this.base());
   }
 
   sesKeys(): string[] {
-    return [...this.top().keys()].filter((k) => k.startsWith(`ses:${T}:${P.inc}:`));
+    return [...this.top().keys()].filter((k) => k.startsWith(`ses:${T}:${this.g.inc}:`));
   }
 
   ses(): Y.Map<unknown> {
-    return this.top().get(`ses:${T}:${P.inc}:${this.sid()}`) as Y.Map<unknown>;
+    return this.top().get(`ses:${T}:${this.g.inc}:${this.sid()}`) as Y.Map<unknown>;
   }
 
   put(...recs: Built<unknown>[]): void {
@@ -124,7 +125,7 @@ class GameRoom {
 
   /** The live session folded by the pages' fold, as a page that trusts the house would. */
   fold(): FoldResult {
-    const tf = new TableFold(P, trustAll, undefined, foldGameOf(P), (pub) => pub === H.pub || pub === H2.pub);
+    const tf = new TableFold(this.g, trustAll, undefined, foldGameOf(this.g), (pub) => pub === H.pub || pub === H2.pub);
     tf.setFairOnlyBase(this.base());
     tf.reset([...this.ses().entries()]);
     return tf.result();
@@ -165,6 +166,53 @@ describe("the simulations' house at a FAIR ONLY game: whose game, and its rounds
     expect(room.house.wrote.beats).toBe(beats);
     room.run(2 * TICK);
     expect(room.house.wrote.beats).toBe(beats + 1);
+  });
+
+  it("while it settles at another game it serves it is not heard at all (the beat is the room's): a page there would close at once", () => {
+    const room = new GameRoom().start();
+    // (Its first beat was at the end of the settle: the next is due HEARTBEAT_MS on.)
+    room.run(2_000);
+    const second = rootOf(Q, 'q');
+    const ses = `ses:${T}:${Q.inc}:${nextSid3(Q, second.value)}`;
+    room.doc.transact(() => {
+      room.top().set(second.key, second.value);
+      room.top().set(ses, new Y.Map());
+    });
+    const beats = room.house.wrote.beats;
+    // It first reads the second game a tick on, and has settled there SETTLE_MS after that: past the beat that was due.
+    expect(2_000 + TICK + SETTLE_MS).toBeGreaterThan(HEARTBEAT_MS + 2 * TICK);
+    room.run(SETTLE_MS);
+    expect(room.house.wrote.beats).toBe(beats);
+    expect((room.top().get(ses) as Y.Map<unknown>).size).toBe(0);
+    room.run(2 * TICK);
+    expect(room.house.wrote.beats).toBe(beats + 1);
+    expect([...(room.top().get(ses) as Y.Map<unknown>).keys()].filter((k) => k.startsWith('o:1:'))).toHaveLength(1);
+  });
+
+  it('craps: a frozen slip with no chips on (a take-down) is counted like any other: with its seed gone from the session the roll is not decided, and the next roll waits', () => {
+    const kq = new ComputedKit(Q);
+    const room = new GameRoom(rootOf(Q, 'q'), Q).start();
+    const stamp = (pid: string): string => basisOf(OPENING_CARRY, pid);
+    const field = canonFelt([{ type: 'field', amount: 5 }]);
+    const a = kq.crapsSlip(alice, 1, [], stamp(alice.pid));
+    const b = kq.crapsSlip(bob, 1, field, stamp(bob.pid));
+    const c1 = kq.close(bob, 1, room.sid(), [a, b], kq.houseCommit(H, 1));
+    const seedA = kq.reveal(1, 'alice');
+    room.put(a, b, c1, seedA, kq.reveal(1, 'bob'));
+    room.tick(TICK);
+    // Its reveal counts both slips.
+    expect(room.recs('h:1:').map((v) => v.n)).toEqual([[a.hash, b.hash].sort()]);
+    expect(room.fold().rounds.find((v) => v.r === 1)?.decided).toBe('house');
+    // Alice's seed is deleted: the pages' fold waits for it, and so does the house.
+    room.doc.transact(() => room.ses().delete(seedA.key));
+    expect(room.fold().rounds.find((v) => v.r === 1)?.decided ?? null).toBeNull();
+    const b2 = kq.crapsSlip(bob, 2, field, stamp(bob.pid));
+    room.put(b2, kq.close(bob, 2, c1.hash, [b2], kq.houseCommit(H, 2)), kq.reveal(2, 'bob'));
+    room.run(2_000);
+    expect(room.recs('h:2:')).toHaveLength(0);
+    room.put(seedA);
+    room.tick(TICK);
+    expect(room.recs('h:2:')).toHaveLength(1);
   });
 
   it('serves no game whose root names another house, and none of rules it does not know', () => {
@@ -530,6 +578,18 @@ describe("the simulations' house at a FAIR ONLY game: what it puts back", () => 
     room.run(1_200);
     expect(room.top().get(key)).toEqual(ck);
     expect(room.house.rowPutBacks).toBe(2);
+  });
+
+  it('its last checkpoint again when something else lies under its key (a page reads no base there)', () => {
+    for (const junk of ['junk', { v: 1 }, null]) {
+      const { room, key, ck } = trimmed();
+      room.doc.transact(() => room.top().set(key, junk));
+      expect(resolved(room).base).toBeNull();
+      room.run(1_200);
+      expect(room.top().get(key), JSON.stringify(junk)).toEqual(ck);
+      expect(room.house.rowPutBacks, JSON.stringify(junk)).toBe(1);
+      expect(resolved(room).base?.key).toBe(key);
+    }
   });
 
   it('not while a checkpoint of the game with a higher round stands in the doc', () => {
