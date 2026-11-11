@@ -762,6 +762,8 @@ export class Sim {
    *  that was the last decided, the carry and the commitment the next must
    *  name); and every base an honest page counted. */
   private readonly houseCks = new Set<string>();
+  /** The opening roots their openers wrote (the keys). */
+  private readonly openedRoots = new Set<string>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
@@ -1045,9 +1047,12 @@ export class Sim {
       for (const k of top ?? []) {
         if (!k?.startsWith('ck:') || !computed.has(k)) continue;
         if (tr.origin === HOUSE_ORIGIN) this.houseCks.add(k);
-        else if (tr.origin !== NET && !sp.cheats && !this.houseCks.has(k)) {
+        else if (tr.origin !== NET && !sp.cheats && !this.houseCks.has(k) && !this.openedRoots.has(k)) {
+          // (Its own root at the opening; any page may put that root back
+          // later: casinoDoc putBackFairOnlyRecords, the opener asleep too.)
           const v = computed.get(k) as { b?: unknown; k?: unknown } | undefined;
-          if (!(v && v.b === 'g' && v.k === p.pub)) this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
+          if (v && v.b === 'g' && v.k === p.pub) this.openedRoots.add(k);
+          else this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
         }
       }
     });

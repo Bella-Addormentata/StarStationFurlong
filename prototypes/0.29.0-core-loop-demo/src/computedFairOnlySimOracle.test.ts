@@ -115,6 +115,26 @@ describe('a page that writes a checkpoint', () => {
     await sim.run(2_000);
     expect(sim.violations.some((v) => /B wrote the checkpoint .* which no house signed/.test(v)), sim.violations.join('\n')).toBe(true);
   }, TIMEOUT);
+  it('but a page that puts the opening root back, the opener asleep, is none: any page may (casinoDoc putBackFairOnlyRecords)', async () => {
+    const sim = await Sim.open({ name: 'fair-only-root-back', seed: seed(1217), pages: named('ABC'), houseNode: true, fairOnly: true });
+    await sim.run(20_000);
+    const T = 'roulette-1';
+    const C = sim.pages.find((sp) => sp.name === 'C')!;
+    const inc = C.p.casino.computedIncOf(T)!;
+    const top = C.p.doc.getMap<unknown>('casinoComputed');
+    const roots = [...top.keys()].filter((k) => k.startsWith(`ck:${T}:${inc}:`));
+    expect(roots, sim.label).toHaveLength(1);
+    expect(sim.houseCheckpoints, sim.label).toBe(0);
+    sim.sleep(sim.house, false);
+    await sim.run(1_000);
+    C.cheats = true;
+    C.p.doc.transact(() => top.delete(roots[0]));
+    await sim.run(10_000);
+    await sim.syncAll();
+    const B = sim.pages.find((sp) => sp.name === 'B')!;
+    expect(B.p.doc.getMap('casinoComputed').has(roots[0]), sim.label).toBe(true);
+    expect(sim.violations, sim.label).toEqual([]);
+  }, TIMEOUT);
 });
 
 describe("the oracle's own base rule", () => {
