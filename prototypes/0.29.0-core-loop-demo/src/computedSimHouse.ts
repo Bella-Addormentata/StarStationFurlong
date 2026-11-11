@@ -1149,7 +1149,18 @@ export class SimHouse {
     };
     for (const s of res.felts.values()) if (!res.revealedCommits.has(s.rec.c)) copy(s.key);
     for (const j of res.joins) copy(`o:${res.open}:${j.hash}`);
-    for (const key of carried) copy(key);
+    // (Round u's records are what their keys say, or are left behind: junk a
+    // peer wrote over one would else ride every sweep, and press the next.)
+    for (const key of carried) {
+      const v = ses.get(key);
+      let whole = false;
+      try {
+        whole = v !== undefined && recHash(v) === key.slice(key.lastIndexOf(':') + 1);
+      } catch {
+        whole = false;
+      }
+      if (whole) copy(key);
+    }
     return copies;
   }
 

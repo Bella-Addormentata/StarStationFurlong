@@ -154,10 +154,19 @@ describe('cheats against a FAIR ONLY game', () => {
     const X = peer(sim, 'X');
     const node = sim.node!;
     let n = 0;
+    let rootCopies = 0;
     const dump = (): boolean => {
       const game = gameOn(X);
       if (!game) return false;
       X.p.doc.transact(() => {
+        // With the first, a copy of the opening root under the cheat's own signature: no page reads it as the
+        // root, and the oracle must not take it for the one the house's sweep repeats.
+        if (n === 0 && game.base.ck.b === 'g') {
+          const { g: _g, ...body } = game.base.ck;
+          const copy = sealCk(game.ctx, body, (bytes) => X.p.keypair.signIdentity(bytes));
+          game.top.set(copy.key, copy.value);
+          rootCopies += 1;
+        }
         for (let i = 0; i * 1_024 < JUNK; i++) game.ses.set(`junk-${n++}`, 'x'.repeat(1_000));
       });
       return true;
@@ -192,6 +201,7 @@ describe('cheats against a FAIR ONLY game', () => {
     fairOnlyFinish(sim, s);
     expect(first, sim.label).not.toBeNull();
     expect(decidedBefore, sim.label).toBe(0);
+    expect(rootCopies, sim.label).toBe(1);
     expect(sweptAt, sim.label).not.toBeNull();
     expect(sweptAt! - first!, sim.label).toBeLessThanOrEqual(HOUSE_SWEEP_MIN_MS + 1_000);
     expect(dumps.length, sim.label).toBeGreaterThanOrEqual(4);

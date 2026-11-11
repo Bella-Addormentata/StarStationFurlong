@@ -655,6 +655,17 @@ describe("the simulations' house at a FAIR ONLY game: the sweep (N3s)", () => {
     expect(room.recs('h:2:').map((v) => v.x)).toEqual([[c.hash]]);
   });
 
+  it("junk a peer wrote over a carried seed is not carried: the sweep leaves it behind, and no sweep follows for it", () => {
+    const { room, r1 } = trimmed();
+    const seed = kit.reveal(1, 'bob').key;
+    room.doc.transact(() => room.ses().set(seed, 'x'.repeat(HOUSE_SWEEP_BYTES)));
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+    expect([...room.ses().keys()].sort()).toEqual([`h:1:${recHash(r1.h)}`, kit.reveal(1, 'alice').key].sort());
+    room.run(HOUSE_SWEEP_MIN_MS + 2_400, 1_000);
+    expect(room.house.sweeps).toBe(1);
+  });
+
   it('a house that restarted since the trim carries the decider on, and not what else lies under round u', () => {
     const { room, r1 } = trimmed();
     room.house.restart();

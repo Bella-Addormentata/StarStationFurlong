@@ -765,8 +765,10 @@ export class Sim {
   /** The opening roots their openers wrote (the keys). */
   private readonly openedRoots = new Set<string>();
   /** Every checkpoint a page's doc held that reads whole, by the session it
-   *  opens (`<t>:<inc>:<nextSid3>`): what a sweep says it repeats. */
-  private readonly ckBySession = new Map<string, { key: string; ck: CkRec }>();
+   *  opens (`<t>:<inc>:<nextSid3>`): what a sweep says it repeats. Each of
+   *  them: the session id binds no signer, so a copy of a checkpoint under
+   *  another signature opens the same session, and anyone can write one. */
+  private readonly ckBySession = new Map<string, { key: string; ck: CkRec }[]>();
   /** The last base the oracle's own rule gave each load of a page, by `<t>|<inc>` (foBase). */
   private readonly foHeld = new WeakMap<Page, Map<string, FoBase>>();
   private readonly reached = new Map<string, Set<string>>();
@@ -1786,7 +1788,10 @@ export class Sim {
     const inc = parts[parts.length - 2];
     const t = parts.slice(1, -2).join(':');
     const ck = value as CkRec;
-    this.ckBySession.set(`${t}:${inc}:${nextSid3({ room: PAGE_ROOM, t, inc }, ck)}`, { key, ck });
+    const id = `${t}:${inc}:${nextSid3({ room: PAGE_ROOM, t, inc }, ck)}`;
+    const at = this.ckBySession.get(id) ?? [];
+    this.ckBySession.set(id, at);
+    if (!at.some((c) => c.key === key)) at.push({ key, ck });
   }
 
   get houseCheckpoints(): number {
@@ -1821,19 +1826,24 @@ export class Sim {
       // the folds, as any; a root, to its opener's.
       // (Field for field, but the session closed, the sweep count and who signed. A record canon cannot read holds nothing.)
       const content = (c: CkRec): string | null => canon({ ok: c.ok, j: c.j, rv: c.rv, ts: c.ts, u: c.u, l: c.l, d: c.d, o: c.o, n: c.n, s: c.s, h: c.h, x: c.x, e: c.e });
-      let ground: { key: string; ck: CkRec } | null = { key, ck };
-      while (ground && ground.ck.w !== undefined) {
-        const swept: CkRec = ground.ck;
-        const prev = this.ckBySession.get(`${t}:${inc}:${swept.b}`);
+      // (At each step every record that opens the swept session and holds
+      // the same: they close one session, so the walk back is one walk. A
+      // root among them counts if its opener wrote it: a copy under another
+      // signature beside it is nobody's root.)
+      let grounds: { key: string; ck: CkRec }[] = [{ key, ck }];
+      while (grounds.length > 0 && grounds[0].ck.w !== undefined) {
+        const swept: CkRec = grounds[0].ck;
         const held = content(swept);
-        ground = prev && held !== null && (prev.ck.w ?? 0) === swept.w! - 1 && content(prev.ck) === held ? prev : null;
+        grounds = (this.ckBySession.get(`${t}:${inc}:${swept.b}`) ?? [])
+          .filter((prev) => held !== null && (prev.ck.w ?? 0) === swept.w! - 1 && content(prev.ck) === held);
       }
-      if (!ground) {
+      if (grounds.length === 0) {
         out.push(`${by} counted ${key} (round ${ck.u}, sweep ${ck.w}), which repeats no checkpoint the room held`);
         continue;
       }
+      const ground = grounds[0];
       if (ground.ck.b === 'g') {
-        if (!this.openedRoots.has(ground.key)) out.push(`${by} counted ${key} (round ${ck.u}, sweep ${ck.w}), of a root no honest page opened`);
+        if (!grounds.some((c) => this.openedRoots.has(c.key))) out.push(`${by} counted ${key} (round ${ck.u}, sweep ${ck.w}), of a root no honest page opened`);
         continue;
       }
       const id = `${t}:${inc}:${ground.ck.b}:${ck.u}:${ck.l}`;
