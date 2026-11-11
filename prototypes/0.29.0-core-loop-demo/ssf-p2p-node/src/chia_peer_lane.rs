@@ -2526,9 +2526,10 @@ fn gossip_take(named: Vec<(SocketAddr, u64)>, held: &HashSet<SocketAddr>, now: u
 /// most dials, so dead addresses cannot shut new ones out; a queue full of
 /// addresses that never failed admits a newcomer of a source and network group
 /// it holds none of, in place of one it holds twice over, and otherwise keeps
-/// what it has; except that an address the introducer names always finds a
-/// place among the stored and gossiped ones, and never loses its own to one
-/// of them ([`displaceable`]). Whatever named it, an
+/// what it has; except that of the two sorts a pair needs (an address the
+/// introducer names, a stored or gossiped one), a newcomer of the sort the
+/// queue holds fewer of always finds a place among the other, and never loses
+/// one to it ([`displaceable`]). Whatever named it, an
 /// address off the public internet (loopback, LAN, link-local, carrier-grade
 /// NAT: [`public`]) is set aside, never queued; only a pin may name one.
 fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
@@ -2592,36 +2593,41 @@ fn push_candidates(state: &mut LaneState, mut new: Vec<Candidate>) {
 }
 
 /// Which queued address a newcomer may take the place of when the queue is
-/// full. A stored or gossiped newcomer never takes the place of a fresh
-/// candidate (one the introducer named this run), and a fresh newcomer always
-/// finds a place while the queue holds a stored or gossiped address. Only a
-/// fresh peer can complete the pair a pool of stored and gossiped peers lacks:
-/// such a pool, when full, dials nothing but a candidate that would
-/// ([`Lane::dial`]), so the untried gossip it keeps collecting is never taken
-/// out of the queue by a dial. Under the rules for equals below alone, that
-/// gossip pushes out the introducer's addresses cooling after a failed dial
-/// (the most failed go first), and a queue it has filled with addresses of
-/// all different kinds refuses whatever the introducer names next. A node
-/// stood so for 83 minutes, four peers connected and no chain read answered:
-/// the introducer named six addresses twice in that time and not one was
-/// dialled (two-computer drill, 2026-11-11).
+/// full. A pair needs a fresh peer (one the introducer named this run) and a
+/// stored or gossiped one, so the queue must not lose either sort to the
+/// other: a newcomer of the sort the queue holds FEWER of always finds a
+/// place among the other sort, and never the other way round. Among its own
+/// sort a newcomer is judged as an equal (below).
 ///
-/// Among the places a newcomer may take (for a fresh one: the stored and
-/// gossiped addresses, while there are any): the one that has failed the most
+/// Judged all alike, the two sorts starved each other. A full pool of stored
+/// and gossiped peers dials nothing but a candidate that would complete a
+/// pair ([`Lane::dial`]), so the untried gossip it keeps collecting is never
+/// taken out of the queue by a dial: that gossip pushed out the introducer's
+/// addresses cooling after a failed dial (the most failed go first), and a
+/// queue it had filled with addresses of all different kinds refused whatever
+/// the introducer named next. A node stood so for 83 minutes, four peers
+/// connected and no chain read answered: the introducer named six addresses
+/// twice in that time and not one was dialled (two-computer drill,
+/// 2026-11-11). The mirror case is a queue of nothing but the introducer's
+/// addresses, none of which can pair with a pool in their own network group:
+/// the gossiped address from elsewhere that could must get in too.
+///
+/// Among the places a newcomer may take: the one that has failed the most
 /// dials, if any has failed, so dead addresses cannot shut new ones out; else
 /// the last queued address of a source and network group the queue holds
-/// twice or more. A fresh newcomer with neither takes the last stored or
-/// gossiped address. Any other newcomer gets that place only when it brings a
-/// source and network group the queue holds none of: a queue full of untried
-/// addresses all in one network group would otherwise shut out the one
-/// candidate from elsewhere that could complete a pair for as long as none of
-/// them is dialled, and money requests would stay unanswered with a usable
-/// peer in hand. `None`: the queue keeps what it has.
+/// twice or more. A newcomer of the scarcer sort with neither takes the last
+/// address of the other sort. An equal gets that redundant place only when it
+/// brings a source and network group the queue holds none of: a queue full of
+/// untried addresses all in one network group would otherwise shut out the
+/// one candidate from elsewhere that could complete a pair for as long as
+/// none of them is dialled, and money requests would stay unanswered with a
+/// usable peer in hand. `None`: the queue keeps what it has.
 fn displaceable(queue: &VecDeque<Candidate>, cand: &Candidate) -> Option<usize> {
     let fresh = cand.source().is_fresh();
-    let over_unfresh = fresh && queue.iter().any(|c| !c.source().is_fresh());
-    // The places open to this newcomer.
-    let open = |c: &Candidate| if fresh { !over_unfresh || !c.source().is_fresh() } else { !c.source().is_fresh() };
+    let alike = queue.iter().filter(|c| c.source().is_fresh() == fresh).count();
+    // The newcomer's sort is the scarcer one: its places are the other sort's.
+    let scarce = alike < queue.len() - alike;
+    let open = |c: &Candidate| (c.source().is_fresh() == fresh) != scarce;
     if let Some(worst) = queue.iter().filter(|c| open(c)).map(|c| c.failures).max().filter(|f| *f > 0) {
         return queue.iter().position(|c| open(c) && c.failures == worst);
     }
@@ -2631,7 +2637,7 @@ fn displaceable(queue: &VecDeque<Candidate>, cand: &Candidate) -> Option<usize> 
         *held.entry(kind(c)).or_default() += 1;
     }
     let redundant = queue.iter().rposition(|c| open(c) && held[&kind(c)] > 1);
-    if over_unfresh {
+    if scarce {
         return redundant.or_else(|| queue.iter().rposition(|c| open(c)));
     }
     if queue.iter().any(|c| kind(c) == kind(cand)) {
@@ -6765,6 +6771,43 @@ mod tests {
         fresh_only.candidates[3].failures = 1;
         push_candidates(&mut fresh_only, vec![Candidate::new(named, Source::Introducer)]);
         assert!(fresh_only.candidates.iter().any(|c| c.addr == named) && !fresh_only.candidates.iter().any(|c| c.addr == untried(3)));
+    }
+
+    #[test]
+    fn a_queue_full_of_the_introducers_addresses_still_takes_a_gossiped_one() {
+        // The mirror of the drill's stall: every queued address is the
+        // introducer's, untried, all in one network group, the pool's own, so
+        // none can pair with it. The gossiped address from elsewhere that
+        // could is the scarce sort here, and gets in; so does the next. Once
+        // the queue holds as many of one sort as of the other, each keeps to
+        // its own places.
+        let mut state = LaneState::default();
+        let crowd = |n: usize| SocketAddr::from(([10, 9, (n / 256) as u8, (n % 256) as u8], 58444));
+        for n in 0..CANDIDATE_CAP {
+            state.candidates.push_back(Candidate::new(crowd(n), Source::Introducer));
+        }
+        let elsewhere = |n: u8| SocketAddr::from(([10, 20 + n, 0, 1], 58444));
+        push_candidates(&mut state, vec![Candidate::new(elsewhere(0), Source::Gossip), Candidate::new(elsewhere(1), Source::Store)]);
+        assert_eq!(state.candidates.len(), CANDIDATE_CAP, "the queue stays at its cap");
+        assert!(state.candidates.iter().any(|c| c.addr == elsewhere(0)) && state.candidates.iter().any(|c| c.addr == elsewhere(1)), "the scarce sort gets in");
+        assert_eq!(state.candidates.iter().filter(|c| c.source() == Source::Introducer).count(), CANDIDATE_CAP - 2, "each in place of one of the introducer's");
+        // And an introducer address named now does not push them out again:
+        // its own sort is the plentiful one, and holds its kind already.
+        let late = SocketAddr::from(([10, 9, 200, 1], 58444));
+        push_candidates(&mut state, vec![Candidate::new(late, Source::Introducer)]);
+        assert!(!state.candidates.iter().any(|c| c.addr == late), "an equal of a kind the queue holds finds no place");
+        assert!(state.candidates.iter().any(|c| c.addr == elsewhere(0)) && state.candidates.iter().any(|c| c.addr == elsewhere(1)), "and the two from elsewhere stay");
+        // Half and half: neither sort is scarce, neither takes from the other.
+        let mut even = LaneState::default();
+        for n in 0..CANDIDATE_CAP / 2 {
+            even.candidates.push_back(Candidate::new(untried(n), Source::Introducer));
+            even.candidates.push_back(Candidate::new(untried(1000 + n), Source::Gossip));
+        }
+        for source in [Source::Introducer, Source::Gossip] {
+            let newcomer = untried(5000);
+            push_candidates(&mut even, vec![Candidate::new(newcomer, source)]);
+            assert!(!even.candidates.iter().any(|c| c.addr == newcomer), "{source:?}: nothing of its own sort has failed or is redundant");
+        }
     }
 
     #[tokio::test]
