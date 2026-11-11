@@ -1146,6 +1146,68 @@ mod node_proof_tests {
     }
 }
 
+/// 🖥️ The UDP port a node's own pages reach it on (its WebTransport server).
+/// The page reads it from the fingerprint, so nothing else names it.
+const DEFAULT_WT_PORT: u16 = 4443;
+
+/// The page port for this run: [`DEFAULT_WT_PORT`], or the one `SSF_WT_PORT`
+/// names (1 to 65535). The port is fixed so that it can go into the
+/// fingerprint before the server is bound, which is why a second node on one
+/// computer (a developer's, or a drill beside an installed game) cannot share
+/// the default and names another here. It is the standalone node's setting:
+/// the desktop app looks at the default port to tell whether a node already
+/// runs (`acquire_p2p_node` in src-tauri). A value that is no port leaves
+/// the default and comes back with a warning to print.
+fn wt_port_of(raw: Option<&str>) -> (u16, Option<String>) {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return (DEFAULT_WT_PORT, None);
+    };
+    match raw.parse::<u16>() {
+        Ok(port) if port != 0 => (port, None),
+        _ => (DEFAULT_WT_PORT, Some(format!("⚠️ Invalid SSF_WT_PORT '{raw}' (want 1-65535); using the default {DEFAULT_WT_PORT}"))),
+    }
+}
+
+/// What a start says when the page port cannot be bound: which port, and the
+/// way out when another node already holds it.
+fn wt_bind_failure(port: u16) -> String {
+    format!(
+        "Failed to bind the page's WebTransport server on UDP {port}. If another Star Station node is running on this computer, stop it, or start this one with SSF_WT_PORT set to a free port"
+    )
+}
+
+#[cfg(test)]
+mod wt_port_tests {
+    use super::{wt_bind_failure, wt_port_of, DEFAULT_WT_PORT};
+
+    /// The page port is 4443 unless `SSF_WT_PORT` names a real port; a value
+    /// that is no port keeps the default and says so.
+    #[test]
+    fn the_page_port_is_the_default_unless_ssf_wt_port_names_a_port() {
+        assert_eq!(DEFAULT_WT_PORT, 4443);
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(wt_port_of(unset), (4443, None), "{unset:?}");
+        }
+        assert_eq!(wt_port_of(Some("4444")), (4444, None));
+        assert_eq!(wt_port_of(Some(" 65535 ")), (65535, None));
+        for bad in ["0", "65536", "-1", "44x", "four"] {
+            let (port, warning) = wt_port_of(Some(bad));
+            assert_eq!(port, 4443, "{bad}");
+            let warning = warning.unwrap_or_else(|| panic!("{bad}: no warning"));
+            assert!(warning.contains(&format!("'{bad}'")) && warning.contains("SSF_WT_PORT") && warning.contains("4443"), "{warning}");
+        }
+    }
+
+    /// A start that cannot bind the page port names the port and both ways
+    /// out, since the usual cause is a node already running.
+    #[test]
+    fn a_page_port_that_cannot_be_bound_names_the_port_and_the_way_out() {
+        let words = wt_bind_failure(4443);
+        assert!(words.contains("UDP 4443") && words.contains("SSF_WT_PORT") && words.contains("stop it"), "{words}");
+        assert!(wt_bind_failure(4500).contains("UDP 4500"));
+    }
+}
+
 #[cfg(test)]
 mod fingerprint_json_tests {
     use super::Fingerprint;
@@ -2436,7 +2498,13 @@ async fn node_main() -> Result<()> {
     }
 
     // 2. Start WebTransport Server for local browser tab GUI connections
-    let listen_port = 4443;
+    let (listen_port, wt_port_warning) = wt_port_of(std::env::var("SSF_WT_PORT").ok().as_deref());
+    if let Some(warning) = wt_port_warning {
+        eprintln!("{warning}");
+    }
+    if listen_port != DEFAULT_WT_PORT {
+        println!("📌 SSF_WT_PORT={listen_port}: this node's pages reach it on UDP {listen_port} (default {DEFAULT_WT_PORT})");
+    }
     let identity = Identity::self_signed(["localhost", "127.0.0.1"])
         .map_err(|e| anyhow!("Failed to generate self-signed identity: {:?}", e))?;
     
@@ -2460,8 +2528,7 @@ async fn node_main() -> Result<()> {
         .with_identity(identity)
         .build();
 
-    let wt_endpoint = WtEndpoint::server(wt_config)
-        .map_err(|e| anyhow!("Failed to bind wtransport server: {:?}", e))?;
+    let wt_endpoint = WtEndpoint::server(wt_config).map_err(|e| anyhow!("{}: {:?}", wt_bind_failure(listen_port), e))?;
 
     // #231 P6a: the contact identity and the address book, loaded (or minted)
     // beside the iroh key, and the room caps persisted by earlier runs so the
