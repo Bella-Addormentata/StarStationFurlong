@@ -771,6 +771,9 @@ export class Sim {
   private readonly ckBySession = new Map<string, { key: string; ck: CkRec }[]>();
   /** The last base the oracle's own rule gave each load of a page, by `<t>|<inc>` (foBase). */
   private readonly foHeld = new WeakMap<Page, Map<string, FoBase>>();
+  /** …and the games whose best checkpoint in the doc it has not held yet,
+   *  the doc holding part of an update when it was read (foBase, foCatchUp). */
+  private readonly foBehind = new WeakMap<Page, Map<string, FoldCtx>>();
   private readonly reached = new Map<string, Set<string>>();
   private readonly reachedLast = new Map<string, Set<string>>();
   private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
@@ -1488,6 +1491,7 @@ export class Sim {
     }
     for (const sp of this.pages) {
       if (sp.mode !== 'up') continue;
+      this.foCatchUp(sp);
       this.observe(sp);
       if (beat) this.audit(sp);
     }
@@ -2292,15 +2296,51 @@ export class Sim {
     // still, whatever lesser checkpoint the doc holds meanwhile (an old one
     // laid back in). So does the oracle's count, for that load of the page:
     // the last base this rule gave it stands until the doc holds a better.
+    // Only what the page counted from, though: a page counts nothing of a
+    // doc that holds part of an update (casinoDoc countComputed parks it,
+    // and judges no record there), so a checkpoint that comes and goes
+    // meanwhile was never its base. The doc's best is then read without
+    // being held, and held once the doc is whole and the page's count has
+    // settled (foCatchUp: the page checks what came meanwhile in a slice of
+    // a later frame, and counts from it then).
     const held = this.foHeld.get(sp.p) ?? new Map<string, FoBase>();
     this.foHeld.set(sp.p, held);
+    const behind = this.foBehind.get(sp.p) ?? new Map<string, FoldCtx>();
+    this.foBehind.set(sp.p, behind);
     const name = `${ctx.t}|${ctx.inc}`;
     const was = held.get(name);
-    if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) return was;
+    if (was && (!best || outranks(was.ck, was.key.slice(prefix.length), best.ck, best.id))) {
+      behind.delete(name);
+      return was;
+    }
     if (!best) return null;
     const base = { key: best.key, ck: best.ck, houses };
+    if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) {
+      behind.set(name, ctx);
+      return was ?? base;
+    }
+    behind.delete(name);
     held.set(name, base);
     return base;
+  }
+
+  /** After page sp's frame: a game whose best checkpoint the oracle read on
+   *  a doc that held part of an update is read again once the page counts
+   *  from another base than the oracle holds for it (the doc whole, the
+   *  page checks what came meanwhile when the game is next counted, which
+   *  may be frames on), and held from here as the page holds it. Only the
+   *  moment is the page's: which checkpoint is the oracle's own rule's, and
+   *  a page that counted from another reads differently from the cold count. */
+  private foCatchUp(sp: SimPage): void {
+    const behind = this.foBehind.get(sp.p);
+    if (!behind || behind.size === 0) return;
+    this.enter(sp);
+    if ((sp.p.doc.store as unknown as { pendingStructs: unknown }).pendingStructs !== null) return;
+    const computed = sp.p.doc.getMap('casinoComputed');
+    for (const [name, ctx] of [...behind]) {
+      const counted = sp.p.casino.computedResolutionOf(ctx.t, ctx.inc)?.base?.key;
+      if (counted !== undefined && counted !== this.foHeld.get(sp.p)?.get(name)?.key) this.foBase(sp, computed, ctx);
+    }
   }
 
   /** Each player's chips as casinoDoc reads them against what a cold fold of

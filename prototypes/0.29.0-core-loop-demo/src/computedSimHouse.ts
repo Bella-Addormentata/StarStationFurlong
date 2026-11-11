@@ -31,7 +31,7 @@ import type { CkRec } from './computedFairOnly';
 import { resolveGame } from './computedFairOnlyAuth';
 import type { AuthRecords, Counted, Resolution } from './computedFairOnlyAuth';
 import {
-  asAbandon, asCheckpointFor, asForfeit, asHouseCommit, asHouseReveal, asSlipFor, dutyRank, foldGameOf, gameOfInc, hasFields, houseCommitOf, houseRules,
+  asAbandon, asCheckpointFor, canon, asForfeit, asHouseCommit, asHouseReveal, asSlipFor, dutyRank, foldGameOf, gameOfInc, hasFields, houseCommitOf, houseRules,
   isPlain, isPub, isSig, MAX_CLOSES_PER_ROUND, MAX_FROZEN, MAX_HELD_ROUNDS, MAX_HOUSE_COUNTED, MAX_TABLE_PIDS, nextSid, nextSid3, parseKey, recHash,
   signBytes, slipCommit, TableFold,
 } from './computedFold';
@@ -1095,18 +1095,28 @@ export class SimHouse {
     // that restarted since carries the decider alone: the rest is for show).
     // Each is what its key says, or is junk as any other key is: junk a peer
     // wrote over one would else ride every sweep and press the next, and
-    // would not be counted among the keys this sweep clears.
+    // would not be counted among the keys this sweep clears. What is carried
+    // is no junk by its weight either (the fold keeps none of round u, so
+    // `rawBytes - keptBytes` holds it): a sweep would clear none of it, and
+    // a round whose records weigh HOUSE_SWEEP_BYTES would be swept every
+    // HOUSE_SWEEP_MIN_MS for nothing.
     const ses = doc.getMap('casinoComputed').get(g.sesKey) as Y.Map<unknown>;
-    const carried = (mem.carried?.base === g.base.key ? mem.carried.keys : B.d === undefined ? [] : [`${B.d.slice(0, 1)}:${B.u}:${B.d.slice(2)}`])
-      .filter((key) => {
-        try {
-          return recHash(ses.get(key)) === key.slice(key.lastIndexOf(':') + 1);
-        } catch {
-          return false;
-        }
-      });
+    const carried: string[] = [];
+    let carriedBytes = 0;
+    for (const key of mem.carried?.base === g.base.key ? mem.carried.keys : B.d === undefined ? [] : [`${B.d.slice(0, 1)}:${B.u}:${B.d.slice(2)}`]) {
+      const v = ses.get(key);
+      let hash: string | null = null;
+      try {
+        hash = recHash(v);
+      } catch {
+        hash = null;
+      }
+      if (hash === null || hash !== key.slice(key.lastIndexOf(':') + 1)) continue;
+      carried.push(key);
+      carriedBytes += key.length + canon(v)!.length;
+    }
     const junkKeys = read.keys - res.felts.size - res.joins.length - carried.length;
-    if (res.rawBytes - res.keptBytes < HOUSE_SWEEP_BYTES && junkKeys < HOUSE_SWEEP_KEYS) return;
+    if (res.rawBytes - res.keptBytes - carriedBytes < HOUSE_SWEEP_BYTES && junkKeys < HOUSE_SWEEP_KEYS) return;
     const { g: _sig, e: _e, f: _f, ...content } = B;
     let body: Record<string, unknown> = { ...content, b: read.sid, w: (B.w ?? 0) + 1, dl: g.dl, k: this.pub };
     if (this.faultTrim) body = this.faultTrim(body);

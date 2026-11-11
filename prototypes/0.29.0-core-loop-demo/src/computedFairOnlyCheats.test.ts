@@ -393,7 +393,14 @@ describe('cheats against a FAIR ONLY game', () => {
       },
       ({ inc }) => {
         X.p.doc.getMap('casino').delete(`cfg:computed:${T}`);
-        checks.push({ what: `the switch deleted at ${sim.elapsed} ms`, due: sim.elapsed + 2_000, ok: (sp) => sp.p.casino.computedIncOf(T) === inc });
+        // The table plays the game on with no switch (S9: the switch is a hint, computedIncOf), every time. And
+        // the pages put the switch back (P4) in their turns, the first time: later ones find the room standing
+        // down (three put-backs that did not last within CONTESTED_CALM_MS, the junk over the base's key among
+        // them: none for KEEP_BACKOFF_MS, computedTable fairKeepDuty), and the switch is back when that is over.
+        checks.push({ what: `the switch deleted at ${sim.elapsed} ms, the game played`, due: sim.elapsed + 2_000, ok: (sp) => sp.p.casino.computedIncOf(T) === inc });
+        if (done.switch === 0) {
+          checks.push({ what: `the switch deleted at ${sim.elapsed} ms`, due: sim.elapsed + 10_000, ok: (sp) => sp.p.casino.switchIncOf(T) === inc });
+        }
         done.switch += 1;
       },
       // A Friendly close of the open round, while a commitment is carried.

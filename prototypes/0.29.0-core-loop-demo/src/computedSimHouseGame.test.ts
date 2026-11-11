@@ -666,6 +666,26 @@ describe("the simulations' house at a FAIR ONLY game: the sweep (N3s)", () => {
     expect(room.house.sweeps).toBe(1);
   });
 
+  it("what is carried is no junk by its weight: junk short of SWEEP_BYTES without round u's records is left, a little more is swept", () => {
+    const { room } = trimmed();
+    const raw = (): number => room.fold().rawBytes - room.fold().keptBytes;
+    const carried = raw();
+    expect(carried).toBeGreaterThan(500);
+    // (A junk key of 1,000 characters weighs 1,000 and its key and quotes.)
+    room.doc.transact(() => {
+      for (let i = 0; raw() + 1_100 < HOUSE_SWEEP_BYTES + carried - 100; i++) room.ses().set(`junk-${i}`, 'x'.repeat(1_000));
+    });
+    room.doc.transact(() => room.ses().set('fill', 'x'.repeat(HOUSE_SWEEP_BYTES + carried - 100 - raw() - 6)));
+    expect(raw()).toBeGreaterThanOrEqual(HOUSE_SWEEP_BYTES);
+    expect(raw() - carried).toBeLessThan(HOUSE_SWEEP_BYTES);
+    room.run(HOUSE_SWEEP_MIN_MS + 2_400, 1_000);
+    expect(room.house.sweeps).toBe(0);
+    room.doc.transact(() => room.ses().set('more', 'x'.repeat(200)));
+    expect(raw() - carried).toBeGreaterThanOrEqual(HOUSE_SWEEP_BYTES);
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+  });
+
   it('a carried seed written over is one junk key more: with it HOUSE_SWEEP_KEYS are swept, one fewer are not', () => {
     const { room, r1 } = trimmed();
     const seed = kit.reveal(1, 'bob').key;
