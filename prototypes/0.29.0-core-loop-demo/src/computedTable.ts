@@ -246,7 +246,8 @@ import type { CkRec, FinRec } from './computedFairOnly';
 import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import type { DelegationRec } from './computedHouse';
 import {
-  BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, SHOW_MS,
+  BET_WINDOW_MS, canRunCroupier, CRAPS_BET_WINDOW_MS, CRAPS_SHOOTER_MS, CRAPS_SHOW_MS, leaseIsOldBuild, refundAndClear, roomStateIn, setLocalClosing,
+  SHOW_MS,
   TABLE_CLOCK_SLACK_MS, TABLE_LEASE_LAPSE_MS, tablesAwake, tablesWakeCount,
 } from './croupier';
 import { forgetSeed, keepSeed, keyFor, REVEAL_GRACE_MS, seedFor } from './fairTableSeeds';
@@ -5084,7 +5085,8 @@ export function computedCompactionPending(): boolean {
  *  table or the session's map of stays there until it is whole, through a
  *  stand-down too, whose end the page must be awake at), or a live game this
  *  page has something at stake in (serveLeftGames: its seed to reveal, its
- *  close, its abandon, what it puts back). Both are an awake page's, and with
+ *  close, its abandon, what it puts back), or a game this page holds with an
+ *  end order standing (fairEndDuty: its end). All are an awake page's, and with
  *  the room's last table out World would mark no frame: the page would read as
  *  asleep a lapse on, and for good. (Without this term the table went back by
  *  the first page in turn alone, OPEN_WAIT_MS on and a second before the
@@ -5095,6 +5097,11 @@ export function computedCompactionPending(): boolean {
 export function computedFairOnlyPending(): boolean {
   try {
     if (computedFairOnlyChecking() > 0) return true;
+    // (A game this key holds whose end order stands: its end is this page's
+    // to write once its round is decided, fairEndDuty, a felt of its player
+    // in the round or none, and with its table taken out of the room there
+    // may be no other table to keep the page awake for it.)
+    if (computedGamesEnding(getIdentityPub()).length > 0) return true;
     if (fairTables.size === 0) return false;
     const me = getPlayerId();
     for (const st of fairTables.values()) {
@@ -5636,7 +5643,9 @@ function fairEndOf(ctx: FoldCtx, B: CkRec, res: FoldResult, fin: FinRec): { key:
 
 /**
  * 🔒 The page that holds FAIR ONLY game of `game` at table `t` ends it (design
- * §8.6; the ⚙ card's way back, once it has the line). Only the game's holder
+ * §8.6; the ⚙ card's way back, once it has the line): each one its key holds
+ * there, where it holds more than one, in the one write, 'ok' once all are
+ * over and 'ending' while any waits for its round. Only the game's holder
  * can: the end order is signed by this page's key, and counts on every page
  * only from an owner-level key that holds the game (S5).
  * - **No round in flight** (no close of the open round in): ONE transaction
@@ -5663,29 +5672,67 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
   const gate = switchGate(t, now);
   if (gate === 'asleep' || gate === 'reconnecting') return gate;
   const me = getIdentityPub();
-  const inc = computedGamesHeldBy(t, me).find((held) => gameOfInc(held) === game);
-  if (inc === undefined) {
+  // (Every game of `game` this key holds at the table: two of the holder's
+  // pages pressing at once open one each (switchFairOnlyOn), the table plays
+  // the one its switch names, and with that one ended it would play the
+  // other. The table is to leave them all, so all are ended, in one write.)
+  const held = computedGamesHeldBy(t, me).filter((inc) => gameOfInc(inc) === game);
+  if (held.length === 0) {
     const played = computedIncOf(t);
     return played !== null && isFairOnlyInc(played) && gameOfInc(played) === game && isComputedTable(t) ? 'theirs' : 'ok';
   }
-  const resolved = computedResolutionOf(t, inc);
-  const res = computedFoldOf(t, inc);
-  if (!resolved || resolved.pending || !resolved.base || !res || res.pending) return 'reconnecting';
-  if (game === 'craps' && !again && contractRides(res.carry as CrapsCarry)) return 'contract';
-  const ctx: FoldCtx = { room: casinoRoomId(), t, inc };
-  const fin = resolved.fin ?? sealFin(ctx, me, signIdentity).value;
-  // (Sound first: what it notes is noted with a round in flight too, so a
-  // wait that began for one loss does not stand in for the next.)
-  const sound = fairSound(t, inc, res, now);
-  const end = fairQuiet(res) && sound ? fairEndOf(ctx, resolved.base.ck, res, fin) : null;
-  if (end === null && resolved.fin !== null) return 'ending';
-  const done = transactCasino(() => {
-    if (!writeFairOnlyEnd(t, inc, resolved.fin === null ? fin : null, end)) return false;
-    writeOwnerRunChosen(t, true);
-    return true;
+  const games: { inc: string; fin: FinRec | null; base: CkRec; res: FoldResult }[] = [];
+  for (const inc of held) {
+    const resolved = computedResolutionOf(t, inc);
+    const res = computedFoldOf(t, inc);
+    if (!resolved || resolved.pending || !resolved.base || !res || res.pending) return 'reconnecting';
+    games.push({ inc, fin: resolved.fin, base: resolved.base.ck, res });
+  }
+  if (game === 'craps' && !again && games.some((g) => contractRides(g.res.carry as CrapsCarry))) return 'contract';
+  const writes = games.map((g) => {
+    const ctx: FoldCtx = { room: casinoRoomId(), t, inc: g.inc };
+    const fin = g.fin ?? sealFin(ctx, me, signIdentity).value;
+    // (Sound first: what it notes is noted with a round in flight too, so a
+    // wait that began for one loss does not stand in for the next.)
+    const sound = fairSound(t, g.inc, g.res, now);
+    const end = fairQuiet(g.res) && sound ? fairEndOf(ctx, g.base, g.res, fin) : null;
+    return { inc: g.inc, fin: g.fin === null ? fin : null, end };
   });
-  return !done ? 'reconnecting' : end ? 'ok' : 'ending';
+  // (A game whose order stands and whose end waits has nothing to write.)
+  const owed = writes.filter((w) => w.fin !== null || w.end !== null);
+  const done = transactCasino(() => {
+    let all = true;
+    let any = false;
+    for (const w of owed) {
+      if (writeFairOnlyEnd(t, w.inc, w.fin, w.end)) any = true;
+      else all = false;
+    }
+    if (any) writeOwnerRunChosen(t, true);
+    return all;
+  });
+  return !done ? 'reconnecting' : writes.every((w) => w.end !== null) ? 'ok' : 'ending';
 }
+
+/**
+ * 🔒 The page that holds a FAIR ONLY game of `game` at table `t` takes the
+ * table out of the room (design §8.6, B14.3): the game ends with its table,
+ * as a press of the switch ends it (switchFairOnlyOff, a second press: bets
+ * that ride a craps point go back with the end), in the removal's own
+ * transaction (croupier closeTable and crapsCroupier closeCrapsTable call it
+ * first, through croupier's localClosing). Quiet, the end order and the ended
+ * checkpoint; with a round in flight the end order alone, and the end follows
+ * (the house's, or fairEndDuty's). Either way the order stands as the table
+ * goes, so no page puts the table back (casinoDoc fairOnlyTableOut).
+ *
+ * Only that page's removal: a page that holds no game at the table writes
+ * nothing here, and the pages put the table back (P5). So too where the press
+ * is refused ('asleep', 'reconnecting'): the table goes from this page's room
+ * and comes back with the game still on.
+ */
+export function endFairOnlyAtRemoval(t: string, game: GameName, now = Date.now()): FairOnlyOffResult {
+  return switchFairOnlyOff(t, game, now, true);
+}
+setLocalClosing((t, game) => { endFairOnlyAtRemoval(t, game); });
 
 /** By `<tableId>:<inc>`: when this page first saw the game quiet under an end
  *  order, on its clock (fairEndDuty). */

@@ -809,6 +809,288 @@ describe("the end order standing, the round decided: the holder's wait", () => {
   });
 });
 
+// ── 6c-5b-2: the table taken out of the room ─────────────────────────────────
+
+const layoutOf = (p: Page) => p.doc.getMap<unknown>('furniture');
+/** The table as the room's layout holds it (furnitureDoc FurnitureRecord). */
+const PLACED = { kind: 'roulette-table', x: 2, z: -3, rot: 1, movable: true };
+/** Page p takes the table out of the room at T as the editor does: the teardown first (World
+ *  removeFurnitureVisuals: croupier closeTable, 'local'), the layout's record after. The updates it sent. */
+function removeAt(p: Page, T: number): Uint8Array[] {
+  clockOf(p, T);
+  vi.setSystemTime(T + p.skew);
+  return updatesOf(p, () => {
+    p.croupier.closeTable(TABLE, 'local');
+    p.doc.transact(() => { layoutOf(p).delete(TABLE); });
+  });
+}
+/** A game room with the table in the layout, seen there by every page. */
+async function placedRoom(names: string[]) {
+  const room = await gameRoom(names);
+  const [a] = room.pages;
+  a.doc.transact(() => { layoutOf(a).set(TABLE, PLACED); });
+  sync(room.at, ...room.pages);
+  run(room.pages, room.at + STEP, room.at + 3 * STEP);
+  return { ...room, at: room.at + 4 * STEP };
+}
+
+describe('the page that holds a FAIR ONLY game takes its table out of the room', () => {
+  it('quiet: the end order and the ended checkpoint go in the teardown\'s own update, the game is over on every page with its nets, and nobody puts the table back', async () => {
+    const { pages, at, inc, kit } = await placedRoom(['A', 'B']);
+    const [a, b] = pages;
+    const played = houseRound(pages, kit, 1, at);
+    const sent = removeAt(a, played.at);
+    expect(sent).toHaveLength(2);
+    const before = new Y.Doc();
+    Y.applyUpdate(before, Y.encodeStateAsUpdate(b.doc));
+    Y.applyUpdate(before, sent[0]);
+    // (The first update alone: the order, the end, and the table's keys gone, the layout's record still in.)
+    expect(before.getMap('casinoComputed').has(`fin:${TABLE}:${inc}`)).toBe(true);
+    expect(before.getMap('furniture').has(TABLE)).toBe(true);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, k: a.pub });
+    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    // (The end comes first in the teardown: what a press leaves for a table that stays, the choice of owner-run
+    // play, goes with the table's other settings.)
+    expect(casinoOf(a).has(`cfg:ownerrun:${TABLE}`)).toBe(false);
+    sync(played.at, ...pages);
+    // (Longer than the pages wait to put a table back: the spec below.)
+    run(pages, played.at + STEP, played.at + 150_000);
+    for (const p of pages) {
+      expect(layoutOf(p).has(TABLE)).toBe(false);
+      expect(casinoOf(p).has(`cfg:computed:${TABLE}`)).toBe(false);
+      expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false, base: { ck: { e: 1, u: 1 } } });
+      for (const q of pages) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(played.deltas.get(q.pid)));
+    }
+  });
+
+  it('with a round in flight: the end order alone goes with the table, the round is decided with the table out, and the end follows; nobody puts the table back', async () => {
+    const { pages, at, inc, kit } = await placedRoom(['A', 'B']);
+    const [a, b] = pages;
+    house(a, kit.houseJoin(H, 1));
+    clockOf(a, at);
+    expect(a.table.writeComputedSlip(TABLE, [red(10)], at)).toBe('ok');
+    clockOf(b, at);
+    expect(b.table.writeComputedSlip(TABLE, [black(20)], at)).toBe('ok');
+    sync(at, ...pages);
+    const closedAt = run(pages, at + STEP, at + 30_000, { until: () => keysIn(a, 'c', 1).length > 0 });
+    const [close] = closesOf(a, 1);
+    removeAt(a, closedAt);
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+    expect(endOf(a, inc)).toBeUndefined();
+    sync(closedAt, ...pages);
+    const seedsAt = run(pages, closedAt + STEP, closedAt + 12_000, { until: () => pages.every((p) => keysIn(p, 'x', 1).length === 2) });
+    expect(seedsAt).toBeLessThan(closedAt + 12_000);
+    house(b, kit.houseReveal(H, 1, [hashIn(keysIn(a, 'c', 1)[0])], frozenOf(close), { c: null }));
+    sync(seedsAt, ...pages);
+    const deltas = foldOf(a).rounds.find((x) => x.r === 1)!.deltas;
+    run(pages, seedsAt + STEP, seedsAt + 150_000);
+    for (const p of pages) {
+      expect(layoutOf(p).has(TABLE)).toBe(false);
+      expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false, base: { ck: { e: 1, u: 1 } } });
+      for (const q of pages) expect(p.casino.readChips(q.pid)).toBe(1_000 + Number(deltas.get(q.pid)));
+    }
+  });
+
+  it('a page that does not hold the game takes the table out: no end order, and the pages put the table back with the game on', async () => {
+    const { pages, at, inc } = await placedRoom(['A', 'B']);
+    const [a, b] = pages;
+    removeAt(b, at);
+    expect(finOf(b, inc)).toBeUndefined();
+    sync(at, ...pages);
+    const backAt = run(pages, at + STEP, at + 120_000, { until: () => pages.every((p) => layoutOf(p).has(TABLE)) });
+    expect(backAt).toBeLessThan(at + 120_000);
+    for (const p of pages) {
+      expect(finOf(p, inc)).toBeUndefined();
+      expect(layoutOf(p).get(TABLE)).toEqual(PLACED);
+      expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true });
+      expect(p.casino.isComputedTable(TABLE)).toBe(true);
+    }
+    expect(a.casino.computedGamesHeldBy(TABLE, a.pub)).toEqual([inc]);
+  });
+
+  it('its page just woken (the press would say asleep): the removal writes no end order, and the table goes back with the game on', async () => {
+    const { pages, at, inc } = await placedRoom(['A', 'B']);
+    const [a] = pages;
+    // (No frame for a minute: the page's clock jumped.)
+    const T = at + 60_000;
+    removeAt(a, T);
+    expect(finOf(a, inc)).toBeUndefined();
+    const backAt = run([a], T + STEP, T + 180_000, { until: () => layoutOf(a).has(TABLE) });
+    expect(backAt).toBeLessThan(T + 180_000);
+    expect(finOf(a, inc)).toBeUndefined();
+    expect(a.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: true });
+    expect(a.casino.isComputedTable(TABLE)).toBe(true);
+  });
+
+  it('on a doc that holds part of an update the teardown waits, and the end order goes with it once the rest is in', async () => {
+    const { pages, at, inc } = await placedRoom(['A', 'B']);
+    const [a, b] = pages;
+    const [first, second] = updatesOf(b, () => {
+      b.doc.transact(() => b.doc.getMap('scratch').set('a', 1));
+      b.doc.transact(() => b.doc.getMap('scratch').set('b', 2));
+    });
+    Y.applyUpdate(a.doc, second);
+    const sent = removeAt(a, at);
+    // (Only the layout's record: the teardown, and the end with it, wait for the doc to be whole.)
+    expect(sent).toHaveLength(1);
+    expect(finOf(a, inc)).toBeUndefined();
+    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(true);
+    Y.applyUpdate(a.doc, first);
+    // (What waited for the whole doc runs in a microtask after the update's transaction: casinoDoc whenCasinoWhole.)
+    await Promise.resolve();
+    expect(finOf(a, inc)).toMatchObject({ k: a.pub });
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 0 });
+    expect(casinoOf(a).has(`cfg:computed:${TABLE}`)).toBe(false);
+    expect(layoutOf(a).has(TABLE)).toBe(false);
+  });
+
+  for (const how of ['the press', 'the removal'] as const) {
+    it(`two games of the holder's at the table (two of its pages pressed FAIR ONLY at once): ${how} ends both in the one write, and the table plays neither`, async () => {
+      const { pages, at: t1 } = await houseRoom(['A', 'B']);
+      const [a, b] = pages;
+      const a2 = await loadPage('A2', 3, { reloadOf: a });
+      a2.table.setLocalHouse(H.pub);
+      a2.table.setLocalHouseFold(FOLD);
+      const all = [a, a2, b];
+      sync(t1, ...all);
+      const T = run(all, t1 + STEP, t1 + 30_000, { until: () => a2.casino.houseOnline() && a2.table.fairOnlyOfferRefusal() === null });
+      expect(press(a, T)).toBe('ok');
+      expect(press(a2, T, { j: 'fedcba9876543210' })).toBe('ok');
+      a.doc.transact(() => { layoutOf(a).set(TABLE, PLACED); });
+      sync(T, ...all);
+      const games = [nameOf(a, T), nameOf(a, T, 'p', TABLE, 'fedcba9876543210')].sort();
+      run(all, T + STEP, T + 3 * STEP);
+      expect(a.casino.computedGamesHeldBy(TABLE, a.pub)).toEqual(games);
+      const at = T + 4 * STEP;
+      let sent: Uint8Array[];
+      if (how === 'the press') {
+        let out: string | undefined;
+        sent = updatesOf(a, () => { out = off(a, at); });
+        expect(out).toBe('ok');
+        expect(sent).toHaveLength(1);
+      } else {
+        sent = removeAt(a, at);
+        expect(sent).toHaveLength(2);
+      }
+      for (const inc of games) expect(endOf(a, inc)).toMatchObject({ e: 1, u: 0, k: a.pub });
+      sync(at, ...all);
+      // (Longer than the pages wait to put a table back.)
+      run(all, at + STEP, at + 150_000);
+      for (const p of all) {
+        expect(p.casino.computedGamesHeldBy(TABLE, a.pub)).toEqual([]);
+        expect(p.casino.isComputedTable(TABLE)).toBe(false);
+        for (const inc of games) expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+        expect(layoutOf(p).has(TABLE)).toBe(how === 'the press');
+      }
+    });
+  }
+
+  it("the holder has no bet in the round and its table was the room's last: its page stays awake for the end it owes, and writes it once the round is decided", async () => {
+    const { pages, inc, kit, at, close, closeHash } = await endingRoom(true);
+    const [a, b] = pages;
+    // (The end order stands from the press of endingRoom; the house is slow. No table in the room from here.)
+    // (Longer than a page that marks no frame takes to read as asleep.)
+    const SLOW = 2 * a.croupier.TABLE_LEASE_LAPSE_MS;
+    run(pages, at + STEP, at + SLOW, { tables: [] });
+    expect(endOf(a, inc)).toBeUndefined();
+    expect(a.table.tableFrame(0)).toBe(true);
+    house(b, kit.houseReveal(H, 1, [closeHash], frozenOf(close), { c: null }));
+    sync(at + SLOW, ...pages);
+    run(pages, at + SLOW + STEP, at + SLOW + a.table.FAIR_END_WAIT_MS + 4_000, { tables: [] });
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: closeHash, k: a.pub });
+  });
+
+  it('a removal the holder\'s page hears, not its own, ends nothing', async () => {
+    const { pages, at, inc } = await placedRoom(['A', 'B']);
+    const [a] = pages;
+    clockOf(a, at);
+    const sent = updatesOf(a, () => a.croupier.closeTable(TABLE, 'heard'));
+    expect(finOf(a, inc)).toBeUndefined();
+    expect(sent.length).toBeLessThanOrEqual(1);
+  });
+});
+
+// ── 6c-5b-2: the way back (design §8.7 "Moving back") ────────────────────────
+
+describe('after the end of a FAIR ONLY game the table is the owner\'s again', () => {
+  /** The house's end of the game, at round 1 as page a folds it, as its N6 writes it: the end in, the root and the
+   *  session out. */
+  function houseEnds(a: Page, b: Page, inc: string, ctx: FoldCtx): void {
+    const v = foldOf(a).rounds.find((x) => x.r === 1)!;
+    const root = cksOf(a, inc)[0];
+    const { g: _g, ...body } = root;
+    const theirs = sealCk(ctx, {
+      ...body, b: nextSid3(ctx, root), u: 1, l: v.close, d: `h:${v.house!.hash}`, o: v.pocket!,
+      n: Object.fromEntries([...foldOf(a).nets].map(([pid, n]) => [pid, String(n)])), e: 1, f: finOf(a, inc)!, k: H.pub,
+    }, (bytes) => houseSign(H.secret, bytes));
+    b.doc.transact(() => {
+      for (const k of [...top(b).keys()]) if (k.startsWith(`ses:${TABLE}:${inc}:`) || k.startsWith(`ck:${TABLE}:${inc}:`)) top(b).delete(k);
+      top(b).set(theirs.key, theirs.value);
+    });
+  }
+
+  for (const by of ['the holder\'s page', 'the house'] as const) {
+    it(`ended by ${by}: owner-run, not switched on again by itself, and the owner's own switch makes it a players' table under a fresh name; FAIR ONLY again opens another game`, async () => {
+      let pages: Page[]; let inc: string; let T: number;
+      if (by === 'the house') {
+        const room = await endingRoom();
+        ({ pages, inc } = room);
+        const [a, b] = pages;
+        house(b, room.kit.houseReveal(H, 1, [room.closeHash], frozenOf(room.close), { c: null }));
+        sync(room.at, ...pages);
+        run(pages, room.at + STEP, room.at + 2_400);
+        houseEnds(a, b, inc, room.ctx);
+        sync(room.at + 2_400, ...pages);
+        T = room.at + 2_400 + 12_000;
+        run(pages, room.at + 2_600, T);
+      } else {
+        const room = await gameRoom(['A', 'B']);
+        ({ pages, inc } = room);
+        const played = houseRound(pages, room.kit, 1, room.at);
+        expect(off(pages[0], played.at)).toBe('ok');
+        sync(played.at, ...pages);
+        T = played.at + 2_000;
+        run(pages, played.at + STEP, T);
+      }
+      const [a] = pages;
+      const chips = pages.map((p) => a.casino.readChips(p.pid));
+      for (const p of pages) {
+        expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+        expect(p.casino.isComputedTable(TABLE)).toBe(false);
+        expect(p.casino.ownerRunChosen(TABLE)).toBe(true);
+      }
+      // The driving page leaves it owner-run.
+      clockOf(a, T);
+      expect(a.table.autoSwitchComputed(TABLE, 'roulette', T)).toBe(false);
+      expect(a.casino.isComputedTable(TABLE)).toBe(false);
+      // The owner's RUN WITHOUT THE OWNER: a players' table on a name that is no game's.
+      expect(a.table.switchComputedOn(TABLE, 'roulette', T + STEP)).toBe('ok');
+      sync(T + STEP, ...pages);
+      run(pages, T + 2 * STEP, T + 5 * STEP);
+      const named = (casinoOf(a).get(`cfg:computed:${TABLE}`) as { inc: string }).inc;
+      expect(named).not.toBe(inc);
+      expect(named[0]).toMatch(/[ckrd]/);
+      for (const p of pages) {
+        expect(p.casino.isComputedTable(TABLE)).toBe(true);
+        expect(p.casino.computedIncOf(TABLE)).toBe(named);
+        expect(pages.map((q) => p.casino.readChips(q.pid))).toEqual(chips);
+      }
+      // And FAIR ONLY again: another game, its own name.
+      expect(press(a, T + 6 * STEP, { j: 'fedcba9876543210' })).toBe('ok');
+      sync(T + 6 * STEP, ...pages);
+      run(pages, T + 7 * STEP, T + 10 * STEP);
+      const next = nameOf(a, T + 6 * STEP, 'p', TABLE, 'fedcba9876543210');
+      expect(next).not.toBe(inc);
+      for (const p of pages) {
+        expect(p.casino.computedIncOf(TABLE)).toBe(next);
+        expect(p.casino.computedResolutionOf(TABLE, next)).toMatchObject({ live: true });
+        expect(p.casino.computedResolutionOf(TABLE, inc)).toMatchObject({ live: false });
+        expect(pages.map((q) => p.casino.readChips(q.pid))).toEqual(chips);
+      }
+    });
+  }
+});
+
 describe('writeFairOnlyEnd', () => {
   it('writes nothing for a game the doc holds nothing of, with nothing to write, an end order or a checkpoint that reads as none, or a checkpoint that is no end of this game', async () => {
     const { pages, at, inc, ctx } = await gameRoom(['A', 'B']);

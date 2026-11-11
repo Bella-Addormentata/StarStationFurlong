@@ -1432,15 +1432,26 @@ export class Sim {
   /** A removal of table t from the room, by the house's page (closeTable,
    *  as World's furniture removal calls it); each other page hears it a
    *  link's delay later and closes the table too. */
-  async remove(house: SimPage, t: string): Promise<void> {
+  async remove(house: SimPage, t: string, game: GameName = 'roulette'): Promise<void> {
+    // (A craps table's teardown as crapsCroupier closeCrapsTable makes it:
+    // the pages load no crapsCroupier.)
+    const close = (sp: SimPage, closing: 'local' | 'heard'): void => {
+      if (game === 'roulette') sp.p.croupier.closeTable(t, closing);
+      else {
+        sp.p.croupier.closeWhenWhole(t, 'craps', () => sp.p.casino.transactCasino(() => {
+          sp.p.croupier.closingLocally(t, 'craps', closing);
+          sp.p.croupier.refundAndClear(t, closing, { closes: 'craps' });
+        }));
+      }
+    };
     house.inRoom.delete(t);
-    await this.as(house, () => house.p.croupier.closeTable(t, 'local'));
+    await this.as(house, () => close(house, 'local'));
     for (const sp of this.pages) {
       if (sp === house) continue;
       this.at(this.T - SIM_T0 + between(this.rand, 50, 400), async () => {
         sp.inRoom.delete(t);
         if (sp.mode === 'gone') return;
-        await this.as(sp, () => sp.p.croupier.closeTable(t, 'heard'));
+        await this.as(sp, () => close(sp, 'heard'));
       });
     }
   }
