@@ -1093,8 +1093,18 @@ export class SimHouse {
     if (mem.lastSweep !== null && now - mem.lastSweep < HOUSE_SWEEP_MIN_MS) return;
     // Round u's decider, and the reveals its trim copied with it (a house
     // that restarted since carries the decider alone: the rest is for show).
+    // Each is what its key says, or is junk as any other key is: junk a peer
+    // wrote over one would else ride every sweep and press the next, and
+    // would not be counted among the keys this sweep clears.
+    const ses = doc.getMap('casinoComputed').get(g.sesKey) as Y.Map<unknown>;
     const carried = (mem.carried?.base === g.base.key ? mem.carried.keys : B.d === undefined ? [] : [`${B.d.slice(0, 1)}:${B.u}:${B.d.slice(2)}`])
-      .filter((key) => (doc.getMap('casinoComputed').get(g.sesKey) as Y.Map<unknown>).has(key));
+      .filter((key) => {
+        try {
+          return recHash(ses.get(key)) === key.slice(key.lastIndexOf(':') + 1);
+        } catch {
+          return false;
+        }
+      });
     const junkKeys = read.keys - res.felts.size - res.joins.length - carried.length;
     if (res.rawBytes - res.keptBytes < HOUSE_SWEEP_BYTES && junkKeys < HOUSE_SWEEP_KEYS) return;
     const { g: _sig, e: _e, f: _f, ...content } = B;
@@ -1149,18 +1159,7 @@ export class SimHouse {
     };
     for (const s of res.felts.values()) if (!res.revealedCommits.has(s.rec.c)) copy(s.key);
     for (const j of res.joins) copy(`o:${res.open}:${j.hash}`);
-    // (Round u's records are what their keys say, or are left behind: junk a
-    // peer wrote over one would else ride every sweep, and press the next.)
-    for (const key of carried) {
-      const v = ses.get(key);
-      let whole = false;
-      try {
-        whole = v !== undefined && recHash(v) === key.slice(key.lastIndexOf(':') + 1);
-      } catch {
-        whole = false;
-      }
-      if (whole) copy(key);
-    }
+    for (const key of carried) copy(key);
     return copies;
   }
 

@@ -666,6 +666,22 @@ describe("the simulations' house at a FAIR ONLY game: the sweep (N3s)", () => {
     expect(room.house.sweeps).toBe(1);
   });
 
+  it('a carried seed written over is one junk key more: with it HOUSE_SWEEP_KEYS are swept, one fewer are not', () => {
+    const { room, r1 } = trimmed();
+    const seed = kit.reveal(1, 'bob').key;
+    room.doc.transact(() => {
+      room.ses().set(seed, 0);
+      for (let i = 0; i < HOUSE_SWEEP_KEYS - 2; i++) room.ses().set(`a${i}`, 0);
+    });
+    expect(room.fold().rawBytes - room.fold().keptBytes).toBeLessThan(HOUSE_SWEEP_BYTES);
+    room.run(2_400);
+    expect(room.house.sweeps).toBe(0);
+    room.doc.transact(() => room.ses().set('b', 0));
+    room.run(1_200);
+    expect(room.house.sweeps).toBe(1);
+    expect([...room.ses().keys()].filter((k) => !k.startsWith('o:')).sort()).toEqual([`h:1:${recHash(r1.h)}`, kit.reveal(1, 'alice').key].sort());
+  });
+
   it('a house that restarted since the trim carries the decider on, and not what else lies under round u', () => {
     const { room, r1 } = trimmed();
     room.house.restart();
