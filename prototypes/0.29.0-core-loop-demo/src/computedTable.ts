@@ -628,6 +628,13 @@ interface TableState {
    *  a modified game rewriting a round it has seen the seeds of). */
   chainClose: Map<number, string>;
   replaced: number | null;
+  /** 🔒 At a FAIR ONLY game, by round: the close this page first saw a
+   *  house reveal decide on the live session's chain, and when it first saw
+   *  such a round read decided under another close since (fairSound): the
+   *  closer took their frozen slip away and laid another close of the round
+   *  in, and an end waits. */
+  houseClose: Map<number, string>;
+  swapAt: number | null;
 }
 
 /** The binding the per-table state belongs to, the wake count and clock
@@ -716,6 +723,7 @@ function forgetWaits(st: TableState): void {
   st.seedOutAt = null;
   st.askedFor = null;
   st.shortAt = null;
+  st.swapAt = null;
   // (A copy keeps its value: only when it went missing starts again.)
   for (const w of st.witness.values()) for (const copy of w.copies.values()) copy.missingAt = null;
 }
@@ -813,7 +821,7 @@ function newTable(t: string, inc: string): TableState {
     tickedAt: null, reputAt: null, wakeAt: 0,
     lastD: null, lastRes: null, cpDiff: null, forged: null, attested: null, pendingAttest: null, scan: null, view: null, told: null, check: null, checks: new Map(),
     missingAt: new Map(), opened: new Map(), seedOutAt: null, askedFor: null, witness: new Map(), witnessVer: 0, lost: null,
-    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null,
+    decidedTo: null, shortAt: null, chainClose: new Map(), replaced: null, houseClose: new Map(), swapAt: null,
   };
 }
 
@@ -1371,10 +1379,15 @@ function rodeAsBuilt(rec: AnySlipRec | null): boolean {
  *  the ⚙ card only. A session change starts the record afresh (what a
  *  checkpoint covers is final); the flag stays. */
 function noteReplaced(st: TableState, res: FoldResult, moved: boolean): void {
-  if (moved) st.chainClose.clear();
+  if (moved) {
+    st.chainClose.clear();
+    st.houseClose.clear();
+    st.swapAt = null;
+  }
   let sc: Scan | null = null;
   for (const v of res.rounds) {
     if (!v.decided) continue;
+    if (v.decided === 'house' && !st.houseClose.has(v.r)) st.houseClose.set(v.r, v.close);
     const was = st.chainClose.get(v.r);
     st.chainClose.set(v.r, v.close);
     if (was === undefined || was === v.close || !watchedClose(st, v)) continue;
@@ -5556,6 +5569,14 @@ function fairSound(t: string, inc: string, res: FoldResult, now: number): boolea
   noteMissing(st, now);
   if (witnessLost(st, res, now).size > 0) return false;
   if (st.shortAt !== null && now - st.shortAt < MISSING_WAIT_MS) return false;
+  // (A round the house decided that reads decided under another close: the
+  // chain is as long, and short of the round all the same.)
+  if (res.rounds.some((v) => v.decided && st.houseClose.has(v.r) && st.houseClose.get(v.r) !== v.close)) {
+    st.swapAt ??= now;
+    if (now - st.swapAt < MISSING_WAIT_MS) return false;
+  } else {
+    st.swapAt = null;
+  }
   for (const round of res.rounds) {
     const at = st.missingAt.get(round.close);
     if (round.missing.length > 0 && (at === undefined || now - at < MISSING_WAIT_MS)) return false;
@@ -5625,7 +5646,10 @@ export function switchFairOnlyOff(t: string, game: GameName = 'roulette', now = 
   if (game === 'craps' && !again && contractRides(res.carry as CrapsCarry)) return 'contract';
   const ctx: FoldCtx = { room: casinoRoomId(), t, inc };
   const fin = resolved.fin ?? sealFin(ctx, me, signIdentity).value;
-  const end = fairQuiet(res) && fairSound(t, inc, res, now) ? fairEndOf(ctx, resolved.base.ck, res, fin) : null;
+  // (Sound first: what it notes is noted with a round in flight too, so a
+  // wait that began for one loss does not stand in for the next.)
+  const sound = fairSound(t, inc, res, now);
+  const end = fairQuiet(res) && sound ? fairEndOf(ctx, resolved.base.ck, res, fin) : null;
   if (end === null && resolved.fin !== null) return 'ending';
   const done = transactCasino(() => {
     if (!writeFairOnlyEnd(t, inc, resolved.fin === null ? fin : null, end)) return false;
@@ -5664,9 +5688,11 @@ function fairEndDuty(pub: string, now: number): void {
     listed.add(key);
     const resolved = computedResolutionOf(t, inc);
     const res = computedFoldOf(t, inc);
-    const ready = tablesAwake(now) && casinoWhole(t) && computedSettled()
-      && !!resolved && !resolved.pending && !!resolved.base && !!resolved.fin && !!res && !res.pending && fairQuiet(res)
-      && fairSound(t, inc, res, now);
+    const checked = tablesAwake(now) && casinoWhole(t) && computedSettled()
+      && !!resolved && !resolved.pending && !!resolved.base && !!resolved.fin && !!res && !res.pending;
+    // (Sound before quiet, as the press: noted with a round in flight too.)
+    const sound = checked && fairSound(t, inc, res!, now);
+    const ready = sound && fairQuiet(res!);
     if (!ready) {
       endingSince.delete(key);
       continue;

@@ -23,7 +23,7 @@ import {
   run as runBare, sync, updatesOf,
 } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { black, ComputedKit, red, testHouse } from './computedTestKit';
+import { black, ComputedKit, red, testHouse, testIdentity } from './computedTestKit';
 import type { Built } from './computedTestKit';
 import type { HouseFold } from './nodeFingerprint';
 
@@ -491,6 +491,80 @@ describe("the end order standing, the round decided: the holder's wait", () => {
     expect(endOf(again, inc)).toBeUndefined();
     expect(off(again, at + STEP + MISSING)).toBe('ok');
     expect(endOf(again, inc)).toMatchObject({ e: 1, u: 1 });
+  });
+
+  it("the holder's page loaded again: the missing slip back while the round is in flight again, then gone again half a minute on, a press waits MISSING_WAIT_MS afresh", async () => {
+    const { pages, inc, kit, at, close, closeHash } = await endingRoom(true);
+    const [a, b] = pages;
+    house(b, kit.houseReveal(H, 1, [closeHash], frozenOf(close), { c: null }));
+    sync(at, ...pages);
+    const closer = pages.find((p) => p.pub === close.k)!;
+    const cheat = pages.slice(1).find((p) => p !== closer)!;
+    const slip = keysIn(a, 's', 1).find((k) => k.startsWith(`s:1:${cheat.pid}:`) && frozenOf(close).includes(hashIn(k)))!;
+    const [reveal] = keysIn(a, 'h', 1);
+    const [slipRec, revealRec] = [recOf<unknown>(a, slip), recOf<unknown>(a, reveal)];
+    a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(slip));
+    const again = await loadPage('A', 9, { reloadOf: a });
+    sync(at, a, again);
+    const ses = () => again.casino.computedSessionForWrite(TABLE)!;
+    const round = () => again.casino.computedFoldOf(TABLE, inc)!.rounds.find((x) => x.r === 1);
+    expect(off(again, at + STEP)).toBe('ending');
+    // The slip back, and the house's reveal gone: the round is in flight again.
+    again.doc.transact(() => {
+      ses().set(slip, slipRec);
+      ses().delete(reveal);
+    });
+    expect(again.casino.computedFoldOf(TABLE, inc)!.tip).toMatchObject({ r: 1 });
+    expect(off(again, at + 2_000)).toBe('ending');
+    // The reveal back and the slip gone again, the first wait run out.
+    again.doc.transact(() => {
+      ses().set(reveal, revealRec);
+      ses().delete(slip);
+    });
+    expect(round()).toMatchObject({ decided: 'house', missing: [cheat.pid] });
+    const MISSING = again.table.MISSING_WAIT_MS;
+    const from = at + STEP + MISSING + STEP;
+    const said: string[] = [];
+    for (let T = from; T < from + MISSING; T += STEP) said.push(off(again, T));
+    expect(new Set(said)).toEqual(new Set(['ending']));
+    expect(endOf(again, inc)).toBeUndefined();
+    expect(off(again, from + MISSING)).toBe('ok');
+    expect(endOf(again, inc)).toMatchObject({ e: 1, u: 1 });
+  });
+
+  it("the closer takes their frozen slip away and lays another close of the round in, voided by their own abandon: the round reads decided, but not as the house decided it, and no press and no wait ends the game on it for MISSING_WAIT_MS; the slip back, the end is at the house's round", async () => {
+    const { pages, at, inc, kit, ctx } = await gameRoom(['A']);
+    const [a] = pages;
+    const [X, Y] = [testIdentity('xena'), testIdentity('yuri')];
+    a.doc.transact(() => {
+      for (const id of [X, Y]) a.doc.getMap('players').set(id.pid, { keyB64: id.pub, name: id.pid });
+    });
+    for (const id of [X, Y]) a.casino.buyInChips(id.pid, 100);
+    const sid = nextSid3(ctx, cksOf(a, inc)[0]);
+    const [x1, y1] = [kit.slip(X, 1, [red(10)]), kit.slip(Y, 1, [black(20)])];
+    const join = kit.houseJoin(H, 1);
+    const c1 = kit.close(X, 1, sid, [x1, y1], join.rec.c);
+    house(a, join, x1, y1, c1, kit.reveal(1, X.pid), kit.reveal(1, Y.pid), kit.houseReveal(H, 1, [c1.hash], [x1.hash, y1.hash]));
+    run(pages, at, at + 4 * STEP);
+    expect(foldOf(a).rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', close: c1.hash });
+    // The swap.
+    const x2 = kit.slip(X, 1, [red(1)]);
+    const c2 = kit.close(X, 1, sid, [x2], join.rec.c);
+    a.doc.transact(() => a.casino.computedSessionForWrite(TABLE)!.delete(x1.key));
+    house(a, x2, c2, kit.abandon(X, 1, c2.hash));
+    expect(foldOf(a).rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'void', close: c2.hash });
+    const T = at + 5 * STEP;
+    expect(off(a, T)).toBe('ending');
+    const MISSING = a.table.MISSING_WAIT_MS;
+    run(pages, T + STEP, T + MISSING - 2 * STEP);
+    expect(off(a, T + MISSING - STEP)).toBe('ending');
+    expect(endOf(a, inc)).toBeUndefined();
+    // The slip back (a witness's put-back): the house's round stands, and the end counts it.
+    house(a, x1);
+    const back = T + MISSING;
+    run(pages, back, back + a.table.FAIR_END_WAIT_MS + 4 * STEP);
+    expect(endOf(a, inc)).toMatchObject({ e: 1, u: 1, l: c1.hash });
+    expect(Object.keys(endOf(a, inc)!.n).sort()).toEqual([X.pid, Y.pid].sort());
   });
 
   it("a close of the next round that names the house's standing commitment, in from a page that had not heard the end order, starts the wait again; voided, the end follows", async () => {

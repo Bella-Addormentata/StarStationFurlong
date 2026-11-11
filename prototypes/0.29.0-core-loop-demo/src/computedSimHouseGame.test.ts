@@ -1032,6 +1032,32 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
     });
   }
 
+  for (const ending of [false, true]) {
+    it(`another bettor's slip gone, back with a close of the next round in, and gone again half a minute on: the session is not ${ending ? 'ended' : 'trimmed'} without them for MISSING_WAIT_MS more`, () => {
+      const room = new GameRoom().start();
+      const r1 = room.played(1, SID);
+      room.doc.transact(() => room.ses().delete(r1.b.key));
+      expect(room.fold().rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', missing: ['bob'] });
+      room.run(HOUSE_TRIM_AFTER_MS + 1_000, 1_000);
+      room.put(r1.b);
+      const r2 = room.closed(2, r1.c.hash);
+      if (ending) order(room);
+      room.tick(1_000);
+      room.doc.transact(() => {
+        for (const k of [r2.c.key, r2.a.key, r2.b.key, r1.b.key]) room.ses().delete(k);
+      });
+      if (!ending) room.junk(HOUSE_SWEEP_BYTES);
+      expect(room.fold()).toMatchObject({ tip: null });
+      expect(room.fold().rounds.find((v) => v.r === 1)).toMatchObject({ decided: 'house', missing: ['bob'] });
+      room.tick(29_000);
+      room.run(27_000, 1_000);
+      expect(room.house.sweeps + room.house.trims + room.house.ends).toBe(0);
+      room.run(5_000, 1_000);
+      expect({ trims: room.house.trims, ends: room.house.ends }).toEqual(ending ? { trims: 0, ends: 1 } : { trims: 1, ends: 0 });
+      expect(Object.keys(room.base().n)).toEqual(['alice']);
+    });
+  }
+
   it('no checkpoint from a doc that holds part of an update: no trim, no sweep and no end until the rest is in', () => {
     // (The second of two updates alone: the doc parks it until the first comes.)
     const park = (room: GameRoom): (() => void) => {
@@ -1070,6 +1096,28 @@ describe("the simulations' house at a FAIR ONLY game: the end (N6)", () => {
     junked.run(2_000, 1_000);
     expect(junked.house.sweeps).toBe(1);
   });
+
+  for (const ending of [false, true]) {
+    it(`the closer deletes the frozen slip and lays another close of the round in, voided by their own abandon: the round reads decided, but not as this house decided it, and the session is not ${ending ? 'ended' : 'trimmed'} on it for MISSING_WAIT_MS; the slip back, its own round stands`, () => {
+      const room = new GameRoom().start();
+      if (ending) order(room);
+      const r1 = room.played(1, SID);
+      room.doc.transact(() => room.ses().delete(r1.a.key));
+      const a2 = kit.slip(alice, 1, [red(9)]);
+      const c2 = kit.close(alice, 1, SID, [a2], kit.houseCommit(H, 1));
+      room.put(a2, c2, kit.abandon(alice, 1, c2.hash));
+      const swapped = room.fold();
+      expect(swapped.rounds.find((v) => v.r === 1)).toMatchObject({ close: c2.hash, decided: 'void' });
+      if (!ending) room.junk(HOUSE_SWEEP_BYTES);
+      room.run(28_000, 1_000);
+      expect(room.house.sweeps + room.house.trims + room.house.ends).toBe(0);
+      room.put(r1.a);
+      room.run(HOUSE_TRIM_AFTER_MS + 2_000, 1_000);
+      expect({ trims: room.house.trims, ends: room.house.ends }).toEqual(ending ? { trims: 0, ends: 1 } : { trims: 1, ends: 0 });
+      expect(room.base()).toMatchObject({ u: 1, l: r1.c.hash, d: `h:${recHash(r1.h)}` });
+      expect(Object.keys(room.base().n).sort()).toEqual(['alice', 'bob']);
+    });
+  }
 
   it("the closer deletes the frozen slip its last reveal counted (another bettor's is a slip missing, waited for as a trim waits): the game is not ended at the base's round, without the round, for MISSING_WAIT_MS; the slip back, the end counts the round", () => {
     const { room, r1 } = lastRound();

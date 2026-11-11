@@ -1027,6 +1027,7 @@ export class SimHouse {
     // (Noted at every checked fold, a close of the open round in or not: a
     // wait that began for one loss must not stand in for the next.)
     const short = this.readsShort(g, res, mem, now);
+    const waits = this.missingWaits(res, mem, now);
     if (res.tip) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
@@ -1047,16 +1048,6 @@ export class SimHouse {
     }
     let at = mem.decidedAt.get(D.close);
     if (at === undefined) mem.decidedAt.set(D.close, at = now);
-    let waits = false;
-    for (const v of res.rounds) {
-      if (!v.decided || v.missing.length === 0) {
-        mem.missingAt.delete(v.close);
-        continue;
-      }
-      let since = mem.missingAt.get(v.close);
-      if (since === undefined) mem.missingAt.set(v.close, since = now);
-      if (now - since < MISSING_WAIT_MS) waits = true;
-    }
     if (waits || now - at < HOUSE_TRIM_AFTER_MS) return;
     let roomKept = 0;
     for (const table of room.tables.values()) if (table.fo) roomKept += table.kept;
@@ -1098,6 +1089,25 @@ export class SimHouse {
     writes.push({ trim: { t: ctx.t, inc: ctx.inc, key: sealed.key, value: sealed.value, ses: `ses:${ctx.t}:${ctx.inc}:${nextSid3(ctx, sealed.value)}`, copies: this.copiesOf(doc, g, res, carried) } });
   }
 
+  /** Whether a decided round of the session folded as `res` has a frozen
+   *  slip missing, and has for less than MISSING_WAIT_MS as this house read
+   *  it. Noted at every checked fold, a close of the open round in or not:
+   *  a slip that came back ends its wait, so one that goes again waits
+   *  afresh. */
+  private missingWaits(res: FoldResult, mem: TableMem, now: number): boolean {
+    let waits = false;
+    for (const v of res.rounds) {
+      if (!v.decided || v.missing.length === 0) {
+        mem.missingAt.delete(v.close);
+        continue;
+      }
+      let since = mem.missingAt.get(v.close);
+      if (since === undefined) mem.missingAt.set(v.close, since = now);
+      if (now - since < MISSING_WAIT_MS) waits = true;
+    }
+    return waits;
+  }
+
   /** 🔒 Whether game g's session, folded as `res`, reads short of a round
    *  this house itself revealed in it (its state file's last reveal: a round
    *  past the base whose reveal it wrote into this session), and has for less
@@ -1114,9 +1124,12 @@ export class SimHouse {
   private readsShort(g: Game, res: FoldResult, mem: TableMem, now: number): boolean {
     const done = this.lastOf(g.ctx);
     const r = done?.d?.[0];
-    let to = g.base.ck.u;
-    for (const v of res.rounds) if (v.decided) to = v.r;
-    if (r === undefined || r <= g.base.ck.u || to >= r || !done!.kept.some((k) => k.ses === g.sesKey && k.key.startsWith(`h:${r}:`))) {
+    // (As it decided it: under the close its reveal listed first. A round
+    // that reads decided under another close, say one the closer laid in
+    // beside the deleted slip and voided with their own abandon, is as short
+    // of its round as one that reads undecided.)
+    const stands = res.rounds.some((v) => v.r === r && !!v.decided && v.close === done!.d![1]);
+    if (r === undefined || r <= g.base.ck.u || stands || !done!.kept.some((k) => k.ses === g.sesKey && k.key.startsWith(`h:${r}:`))) {
       mem.shortAt = null;
       return false;
     }
@@ -1151,6 +1164,7 @@ export class SimHouse {
     if (res.pending) return;
     // (Noted at every checked fold, as trimDuty notes it.)
     const short = this.readsShort(g, res, mem, now);
+    const waits = this.missingWaits(res, mem, now);
     if (res.tip || res.openCloses.some((c) => c.state !== 'invalid')) return;
     let D: RoundView | undefined;
     for (const v of res.rounds) if (v.decided) D = v;
@@ -1169,16 +1183,6 @@ export class SimHouse {
       }
       let at = mem.decidedAt.get(past.close);
       if (at === undefined) mem.decidedAt.set(past.close, at = now);
-      let waits = false;
-      for (const v of res.rounds) {
-        if (!v.decided || v.missing.length === 0) {
-          mem.missingAt.delete(v.close);
-          continue;
-        }
-        let since = mem.missingAt.get(v.close);
-        if (since === undefined) mem.missingAt.set(v.close, since = now);
-        if (now - since < MISSING_WAIT_MS) waits = true;
-      }
       if (waits || now - at < HOUSE_TRIM_AFTER_MS) return;
     }
     const n: Record<string, string> = {};
