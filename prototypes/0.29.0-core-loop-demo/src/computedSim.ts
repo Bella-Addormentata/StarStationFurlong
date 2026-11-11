@@ -85,11 +85,13 @@ import { sha256 } from '@noble/hashes/sha256';
 import { utf8ToBytes } from '@noble/hashes/utils';
 import { CrapsHarness, crapsChangeKind, crapsShownOf } from './computedCrapsSim';
 import type { CrapsBotSpec, Place } from './computedCrapsSim';
-import { canon, gameOfInc, houseCommitOf, parseKey, seedTable, slipCommit } from './computedFold';
+import { FAIR_ONLY_RV, isFairOnlyInc, parseFairOnlyKey, readCk } from './computedFairOnly';
+import type { CkRec } from './computedFairOnly';
+import { canon, gameOfInc, houseCommitOf, MAX_HELD_ROUNDS, parseKey, seedTable, signBytes, slipCommit } from './computedFold';
 import type { Checkpoint, FoldCtx, FoldResult, GameName, RoundView, SigCheck } from './computedFold';
 import { loadPage, PAGE_ROOM } from './computedPageKit';
 import type { Page } from './computedPageKit';
-import { HOUSE_HEARD_MS } from './computedHouse';
+import { HOUSE_HEARD_MS, roomSignBytes } from './computedHouse';
 import { HOUSE_ORIGIN, SimHouse } from './computedSimHouse';
 import { RobotWatch } from './computedSimRobot';
 import { b64url, snapshot } from './computedTestKit';
@@ -111,7 +113,7 @@ export const SIM_MINUTES = SIM_LONG ? 15 : 3;
 export const SIM_SEED_OFFSET = typeof process !== 'undefined' ? Number(process.env.SIM_SEED ?? 0) || 0 : 0;
 
 const NET = Symbol('sim-net');
-const COMPUTED_INC = /^[ckrd][0-9a-f]{24}$/;
+const COMPUTED_INC = /^[ckrdpq][0-9a-f]{24}$/;
 const COMPUTED_SID = /^(?:g|[0-9a-f]{24})$/;
 
 // ── 🎲 Seeded randomness ─────────────────────────────────────────────────────
@@ -615,8 +617,9 @@ export class Net {
 // ── 🧮 Counting a page's doc cold ────────────────────────────────────────────
 
 interface Cold {
-  /** By `<t>:<inc>`: the fold of every incarnation the doc holds. */
-  folds: Map<string, { ctx: FoldCtx; cp: Checkpoint | null; res: FoldResult; live: boolean }>;
+  /** By `<t>:<inc>`: the fold of every incarnation the doc holds (`ck`: a
+   *  FAIR ONLY game's base, as the oracle reads it: foBase). */
+  folds: Map<string, { ctx: FoldCtx; cp: Checkpoint | null; ck?: CkRec | null; res: FoldResult; live: boolean }>;
   nets: Map<string, bigint>;
   held: Map<string, bigint>;
 }
@@ -630,6 +633,10 @@ function incOfKey(key: string): { t: string; inc: string } | null {
     rest = key.slice('ses:'.length, cut);
   } else if (key.startsWith('sum:')) {
     rest = key.slice('sum:'.length);
+  } else if (key.startsWith('ck:')) {
+    // 🔒 A FAIR ONLY game's checkpoint.
+    const pk = parseFairOnlyKey(key);
+    return pk && pk.kind === 'ck' ? { t: pk.t, inc: pk.inc } : null;
   } else {
     return null;
   }
@@ -708,7 +715,15 @@ export interface SimOptions {
    *  page holds the room's deed and delegates the node's key; the node joins,
    *  reveals and beats through that page's doc (nodeUp: it runs). */
   houseNode?: boolean;
+  /** 🔒 Every table plays a FAIR ONLY game (design §8.7, with houseNode): the
+   *  node says it runs them, and the house's page opens one at each house
+   *  table as soon as it may (switchFairOnlyOn, pressed every tick until it
+   *  answers ok). The bots bet once every game is open. */
+  fairOnly?: boolean;
 }
+
+/** 🔒 A FAIR ONLY game's base as the oracle reads it from a doc (foBase). */
+interface FoBase { key: string; ck: CkRec; houses: Set<string> }
 
 /** ms for which no per-tick bookkeeping runs (a spec's own loop may). */
 export class Sim {
@@ -736,6 +751,21 @@ export class Sim {
   readonly node: SimHouse | null;
   nodeUp = true;
   private nodeOn: Page | null = null;
+  /** 🔒 fairOnly: when the house's page opened each table's game (ms into the
+   *  run), and what its press answered before. */
+  readonly opened = new Map<string, number>();
+  readonly openRefusals: Record<string, number> = {};
+  /** 🔒 The checkpoint oracle at FAIR ONLY games (design §16.2). The
+   *  checkpoints the house node wrote (their keys); what every honest page's
+   *  own fold reached after each decided round, by `<t>:<inc>:<session>:<r>:
+   *  <close>` (the nets, how it was decided and its outcome; and, of a round
+   *  that was the last decided, the carry and the commitment the next must
+   *  name); and every base an honest page counted. */
+  private readonly houseCks = new Set<string>();
+  private readonly reached = new Map<string, Set<string>>();
+  private readonly reachedLast = new Map<string, Set<string>>();
+  private readonly foBases = new Map<string, { t: string; inc: string; ck: CkRec; by: string }>();
+  private noTransfers = false;
   /** What broke an invariant while it ran (empty when all held). */
   readonly violations: string[] = [];
   private readonly entropy: Rng;
@@ -789,7 +819,7 @@ export class Sim {
   /** The heal has run: the scenarios' disturbances stop. */
   healed = false;
   /** The heaviest live session seen, to fold cold at the end (coldFoldMs). */
-  private biggest: { bytes: number; ctx: FoldCtx; cp: Checkpoint | null; entries: [string, unknown][]; keyOf: (pid: string) => string | undefined } | null = null;
+  private biggest: { bytes: number; ctx: FoldCtx; cp: Checkpoint | null; fo: FoBase | null; entries: [string, unknown][]; keyOf: (pid: string) => string | undefined } | null = null;
 
   private constructor(readonly opts: SimOptions) {
     this.rand = simRng(opts.seed);
@@ -846,6 +876,8 @@ export class Sim {
       const ok = house.p.table.switchComputedOn(t, sim.gameOf(t), now);
       if (ok !== 'ok') throw new Error(`${sim.label}: the house's switch-on of ${t} answered ${ok}`);
     }
+    // 🔒 The bots bet once the games are open (the opening wants a quiet table).
+    if (opts.fairOnly) for (const sp of sim.pages) sp.betting = false;
     await sim.syncAll();
     // (A page loaded after another missed what that one wrote before it came:
     // held back until the sync just now, which is the start, not the run.)
@@ -1008,6 +1040,16 @@ export class Sim {
       }
       const top = tr.changed.get(computed as unknown as Y.AbstractType<Y.YEvent<Y.AbstractType<unknown>>>);
       for (const k of top ?? []) if (k?.startsWith('sum:')) this.sumsSeen.add(canon(computed.get(k)) ?? '');
+      // 🔒 A FAIR ONLY game's checkpoints are its house's (design §8.4 P1): a
+      // page writes its own opening root, and puts back one the house wrote.
+      for (const k of top ?? []) {
+        if (!k?.startsWith('ck:') || !computed.has(k)) continue;
+        if (tr.origin === HOUSE_ORIGIN) this.houseCks.add(k);
+        else if (tr.origin !== NET && !sp.cheats && !this.houseCks.has(k)) {
+          const v = computed.get(k) as { b?: unknown; k?: unknown } | undefined;
+          if (!(v && v.b === 'g' && v.k === p.pub)) this.violate(`${sp.name} wrote the checkpoint ${k} at ${this.elapsed} ms, which no house signed`);
+        }
+      }
     });
     p.doc.on('afterTransaction', (tr: Y.Transaction) => {
       if (tr.origin === NET || tr.origin === HOUSE_ORIGIN || sp.p !== p || sp.cheats) return;
@@ -1412,6 +1454,7 @@ export class Sim {
     const beat = (this.T - SIM_T0) % RESYNC_MS === 0;
     if (beat) this.net.resync();
     if (this.node) await this.houseTick();
+    if (this.opts.fairOnly) await this.openGames();
     for (const sp of this.pages) {
       if (sp.mode !== 'up' || this.T < sp.pauseUntil) continue;
       if (beat) await this.as(sp, (now) => this.sit(sp, now));
@@ -1439,10 +1482,28 @@ export class Sim {
     await this.as(sp, (now) => {
       if (this.nodeOn !== sp.p) {
         sp.p.table.setLocalHouse(this.node!.pub);
+        // 🔒 (…and, from the same fingerprint, what its fold runs.)
+        if (this.opts.fairOnly) sp.p.table.setLocalHouseFold({ letters: 'rdpq', rv: [FAIR_ONLY_RV] });
         this.nodeOn = sp.p;
       }
       this.node!.tick(PAGE_ROOM, sp.p.doc, this.T, now);
     });
+  }
+
+  /** 🔒 The house's page opens a FAIR ONLY game at each table (fairOnly), as
+   *  its owner's press of the ⚙ card's line would: every tick until the
+   *  opening answers ok. Then the bots bet. */
+  private async openGames(): Promise<void> {
+    if (this.opened.size === this.tables.length) return;
+    const sp = this.house;
+    if (sp.mode !== 'up' || !this.net.connected(sp) || !sp.roomIn) return;
+    for (const t of this.tables) {
+      if (this.opened.has(t)) continue;
+      const said = await this.as(sp, (now) => sp.p.table.switchFairOnlyOn(t, this.gameOf(t), now));
+      if (said === 'ok') this.opened.set(t, this.elapsed);
+      else this.openRefusals[said] = (this.openRefusals[said] ?? 0) + 1;
+    }
+    if (this.opened.size === this.tables.length && !this.healed) for (const q of this.pages) q.betting = true;
   }
 
   /** Page sp hears update `u` (from the network). While its doc holds part
@@ -1638,12 +1699,14 @@ export class Sim {
         if (ses) {
           this.biggest = {
             bytes: res.rawBytes, ctx: { room: PAGE_ROOM, t, inc }, cp,
+            fo: isFairOnlyInc(inc) ? this.foBase(sp, sp.p.doc.getMap('casinoComputed'), { room: PAGE_ROOM, t, inc }) : null,
             entries: [...ses.entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]),
             keyOf: this.keyOf(sp),
           };
         }
       }
       if (casino.isComputedTable(t) && casino.computedIncOf(t) === inc) sp.lastLive.set(key, { u: to, nets: netsText(res.nets) });
+      if (isFairOnlyInc(inc)) this.observeGame(sp, t, inc, res);
       const craps = this.craps !== null && gameOfInc(inc) === 'craps';
       for (const v of res.rounds) {
         if (!this.closeAt.has(v.close)) this.closeAt.set(v.close, this.T);
@@ -1661,6 +1724,76 @@ export class Sim {
       this.flipsOf(sp, t, inc, res, now);
       this.stallOf(sp, t, key, res, croupier.tablesAwake(now) && casino.casinoWhole(t) && casino.computedSettled(t));
     }
+  }
+
+  /** 🔒 The checkpoint oracle's notes at a FAIR ONLY game (design §16.2), from
+   *  honest page sp's own fold of it: what each decided round reached, the
+   *  base the page counts, and that no round is decided more than
+   *  MAX_HELD_ROUNDS past it. Held against each other once the run is over
+   *  (gameProblems). */
+  private observeGame(sp: SimPage, t: string, inc: string, res: FoldResult): void {
+    if (sp.cheats) return;
+    const base = sp.p.casino.computedResolutionOf(t, inc)?.base;
+    if (base && base.ck.u > 0 && !this.foBases.has(base.key)) this.foBases.set(base.key, { t, inc, ck: base.ck, by: `${sp.name} at ${this.elapsed} ms` });
+    if (res.pending) return;
+    const n = new Map(res.base.n);
+    const decided = res.rounds.filter((v) => v.decided);
+    for (const [i, v] of decided.entries()) {
+      if (v.r - res.base.u > MAX_HELD_ROUNDS) this.violate(`${sp.name} folded ${t} round ${v.r} decided at ${this.elapsed} ms, ${v.r - res.base.u} past its base`);
+      for (const [pid, d] of v.deltas) {
+        const net = (n.get(pid) ?? 0n) + d;
+        if (net === 0n) n.delete(pid);
+        else n.set(pid, net);
+      }
+      const id = `${t}:${inc}:${res.base.sid}:${v.r}:${v.close}`;
+      const d = v.house ? `h:${v.house.hash}` : v.abandon ? `z:${v.abandon.hash}` : '';
+      const o = v.decided === 'house' ? (v.craps ? v.craps.dice : v.pocket) : null;
+      addIn(this.reached, id, JSON.stringify([netsText(n), d, o]));
+      if (i === decided.length - 1) addIn(this.reachedLast, id, JSON.stringify([canon(res.carry ?? null), res.required]));
+    }
+  }
+
+  /** 🔒 How many checkpoints of FAIR ONLY games the house node wrote, and how
+   *  many bases past a root the honest pages counted (gameProblems holds each
+   *  to the oracle). */
+  get houseCheckpoints(): number {
+    return this.houseCks.size;
+  }
+
+  get basesCounted(): number {
+    return this.foBases.size;
+  }
+
+  /** 🔒 Once the run is over: every base an honest page counted at a FAIR ONLY
+   *  game is its authority's (the opener's house, by the opener's signed
+   *  delegation: the oracle knows no transfers yet), and honestly reachable:
+   *  some honest page's own fold of the session it closes reached that round
+   *  on that close with those nets, decided so, with that outcome, and left
+   *  the carry and the commitment the checkpoint hands on. */
+  gameProblems(): string[] {
+    const out: string[] = [];
+    const ref = this.pages.find((sp) => sp.mode === 'up') ?? this.pages[0];
+    const verify = ref.p.keypair.verifyIdentityStrict;
+    for (const [key, { t, inc, ck, by }] of this.foBases) {
+      const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
+      const { g, ...body } = ck;
+      const dl = ck.dl;
+      const signed = dl !== undefined && dl.h === ck.k && dl.k === ck.ok && ck.x === undefined
+        && verify(dl.k, roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g)
+        && verify(ck.k, signBytes('ck', ctx, body), g);
+      if (!signed) out.push(`${by} counted ${key}, which the game's house did not sign`);
+      const id = `${t}:${inc}:${ck.b}:${ck.u}:${ck.l}`;
+      const nets = JSON.stringify(Object.keys(ck.n).sort().map((pid) => [pid, ck.n[pid]]));
+      const want = JSON.stringify([nets, ck.d ?? '', ck.o ?? null]);
+      const got = this.reached.get(id);
+      if (!got) out.push(`${by} counted ${key} (round ${ck.u}), a round no honest page folded decided on that close`);
+      else if (!got.has(want)) out.push(`${by} counted ${key} (round ${ck.u}) holding ${want}, the honest pages folded ${[...got].join(' or ')}`);
+      if (ck.e === 1) continue;
+      const last = JSON.stringify([canon(ck.s ?? null), ck.h ?? null]);
+      const gotLast = this.reachedLast.get(id);
+      if (got && !gotLast?.has(last)) out.push(`${by} counted ${key} (round ${ck.u}) handing on ${last}, the honest pages had ${[...(gotLast ?? [])].join(' or ') || 'never that round as their last'}`);
+    }
+    return out;
   }
 
   /** A decided round page sp folded, worked out afresh from the records its
@@ -2013,6 +2146,23 @@ export class Sim {
     if (sp.p.casino.computedRecoveryOn()) for (const r of sp.p.casino.computedRecoveries()) incs.set(`${r.t}:${r.inc}`, { t: r.t, inc: r.inc });
     for (const [key, { t, inc }] of [...incs].sort(([a], [b]) => (a < b ? -1 : 1))) {
       const ctx: FoldCtx = { room: PAGE_ROOM, t, inc };
+      if (isFairOnlyInc(inc)) {
+        // 🔒 A FAIR ONLY game: from the base the oracle reads, with its
+        // houses; live while it has one that is no end, whatever the switch
+        // says (the pages serve a game its table has left).
+        const fb = this.foBase(sp, map, ctx);
+        const ses = fb ? map.get(`ses:${t}:${inc}:${fold.nextSid3(ctx, fb.ck)}`) : undefined;
+        const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
+        const tf = new fold.TableFold(ctx, this.checkFor(sp, ctx), keyOf, fold.foldGameOf(ctx), (pub) => fb?.houses.has(pub) ?? false);
+        tf.setFairOnlyBase(fb?.ck ?? null);
+        tf.reset(entries);
+        const res = tf.result();
+        const live = fb !== null && fb.ck.e !== 1;
+        out.folds.set(key, { ctx, cp: null, ck: fb?.ck ?? null, res, live });
+        addTo(out.nets, res.nets);
+        if (live) addTo(out.held, res.held);
+        continue;
+      }
       const cp = fold.asCheckpointFor(ctx)(map.get(`sum:${t}:${inc}`)) ?? fold.asCheckpointFor(ctx)(held.get(key) ?? undefined);
       const ses = map.get(`ses:${t}:${inc}:${fold.nextSid(ctx, cp)}`);
       const entries = ses instanceof Y.Map ? [...(ses as Y.Map<unknown>).entries()].map(([k, v]): [string, unknown] => [k, v === undefined ? null : v]) : [];
@@ -2029,6 +2179,49 @@ export class Sim {
       if (live) addTo(out.held, res.held);
     }
     return out;
+  }
+
+  /** 🔒 A FAIR ONLY game's base in page sp's doc, by the oracle's own rule
+   *  (design §8.3 S1 to S3, with no transfer: one in a record is a violation
+   *  until the oracle follows them): of the checkpoints that read whole
+   *  (readCk), the opener's root under the opener's signature and those a
+   *  house signed that the opener's signed delegation in the record names;
+   *  the best by round, then an end, then sweeps, then the lowest id. And the
+   *  houses those delegations name. */
+  private foBase(sp: SimPage, map: Y.Map<unknown>, ctx: FoldCtx): FoBase | null {
+    const verify = sp.p.keypair.verifyIdentityStrict;
+    const ok = (id: string, pub: string, bytes: () => Uint8Array, sig: string): boolean => {
+      const key = `fo|${ctx.t}|${ctx.inc}|${id}`;
+      let v = this.verdicts.get(key);
+      if (v === undefined) this.verdicts.set(key, v = verify(pub, bytes(), sig));
+      return v;
+    };
+    const prefix = `ck:${ctx.t}:${ctx.inc}:`;
+    const houses = new Set<string>();
+    let best: { key: string; id: string; ck: CkRec } | null = null;
+    for (const [key, value] of map.entries()) {
+      if (!key.startsWith(prefix)) continue;
+      const r = readCk(PAGE_ROOM, key, value);
+      if (r.kind !== 'ok') continue;
+      const { ck, id } = r;
+      if (ck.x !== undefined) {
+        if (!this.noTransfers) this.violate(`${key} carries a transfer, which the oracle does not follow yet`);
+        this.noTransfers = true;
+        continue;
+      }
+      const { g, ...body } = ck;
+      const dl = ck.dl;
+      const dlOk = dl !== undefined && dl.k === ck.ok && ok(`dl|${dl.h}|${dl.g}`, dl.k, () => roomSignBytes('hkey', PAGE_ROOM, '', { v: dl.v, h: dl.h, k: dl.k }), dl.g);
+      const root = ck.b === 'g';
+      if (!(root ? ck.k === ck.ok && dlOk : dlOk && dl!.h === ck.k)) continue;
+      if (!ok(`ck|${id}`, ck.k, () => signBytes('ck', ctx, body), g)) continue;
+      houses.add(dl!.h);
+      const better = best === null || ck.u > best.ck.u
+        || (ck.u === best.ck.u && ((ck.e ?? 0) > (best.ck.e ?? 0)
+          || ((ck.e ?? 0) === (best.ck.e ?? 0) && ((ck.w ?? 0) > (best.ck.w ?? 0) || ((ck.w ?? 0) === (best.ck.w ?? 0) && id < best.id)))));
+      if (better) best = { key, id, ck };
+    }
+    return best ? { key: best.key, ck: best.ck, houses } : null;
   }
 
   /** Each player's chips as casinoDoc reads them against what a cold fold of
@@ -2253,8 +2446,13 @@ export class Sim {
       const nets = [...cold.folds].map(([k, f]) => [k, [...f.res.nets].sort(([a], [b]) => (a < b ? -1 : 1)).map(([p, n]) => [p, n.toString()])]);
       const L = casino.readCageLedger();
       const balances = Object.keys(L.balances).sort().map((p) => [p, L.balances[p]]);
+      // 🔒 The base each page counts at a FAIR ONLY game.
+      const bases = this.tables.map((t) => {
+        const inc = casino.computedIncOf(t);
+        return [t, inc, inc !== null && isFairOnlyInc(inc) ? casino.computedResolutionOf(t, inc)?.base?.key ?? null : null];
+      });
       return {
-        tables, nets,
+        tables, nets, bases,
         chips: pids.map((pid) => [pid, casino.readChips(pid)]),
         cage: { ...L, balances },
       };
@@ -2264,7 +2462,7 @@ export class Sim {
     const want = read(ref);
     for (const sp of up.slice(1)) {
       const got = read(sp);
-      for (const part of ['tables', 'nets', 'chips', 'cage'] as const) {
+      for (const part of ['tables', 'nets', 'bases', 'chips', 'cage'] as const) {
         const a = JSON.stringify(want[part]);
         const b = JSON.stringify(got[part]);
         if (a !== b) out.push(`${this.label}: ${sp.name}'s ${part} differ from ${ref.name}'s:\n  ${ref.name}: ${a.slice(0, 600)}\n  ${sp.name}: ${b.slice(0, 600)}`);
@@ -2282,8 +2480,12 @@ export class Sim {
     if (!b) return { cpu: 0, wall: 0 };
     const wall = performance.now();
     const cpu = process.cpuUsage();
-    const tf = new sp.p.fold.TableFold(b.ctx, this.checkFor(sp, b.ctx, false), b.keyOf, sp.p.fold.foldGameOf(b.ctx), (pub) => sp.p.casino.houseOkOf(pub));
-    tf.setBase(b.cp);
+    const tf = new sp.p.fold.TableFold(
+      b.ctx, this.checkFor(sp, b.ctx, false), b.keyOf, sp.p.fold.foldGameOf(b.ctx),
+      b.fo ? (pub) => b.fo!.houses.has(pub) : (pub) => sp.p.casino.houseOkOf(pub),
+    );
+    if (isFairOnlyInc(b.ctx.inc)) tf.setFairOnlyBase(b.fo?.ck ?? null);
+    else tf.setBase(b.cp);
     tf.reset(b.entries);
     tf.result();
     const spent = process.cpuUsage(cpu);
@@ -2365,6 +2567,12 @@ export class Sim {
 }
 
 const said = (s: Shown): string => `${s.decided} ${s.seen}`;
+
+const addIn = (m: Map<string, Set<string>>, key: string, v: string): void => {
+  let set = m.get(key);
+  if (!set) m.set(key, set = new Set());
+  set.add(v);
+};
 
 /** Nets as text, by player. */
 const netsText = (m: ReadonlyMap<string, bigint>): string => JSON.stringify([...m].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => [k, n.toString()]));
