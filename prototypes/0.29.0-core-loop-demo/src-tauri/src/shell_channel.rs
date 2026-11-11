@@ -40,6 +40,12 @@ pub const CHANNEL_ENV: &str = "SSF_SHELL_CHANNEL";
 /// The variable the node reads its Chia network from.
 pub const NETWORK_ENV: &str = "SSF_CHIA_NETWORK";
 
+/// The standalone node's own setting for the page's WebTransport port. The
+/// bundled node never gets it: the app tells "a node already runs" by
+/// finding UDP 4443 taken (`acquire_p2p_node`), so a sidecar on another port
+/// would go unseen by the next launch.
+pub const WT_PORT_ENV: &str = "SSF_WT_PORT";
+
 /// The first word of every reply line.
 pub const FRAME_TAG: &str = "ssf-shell/1";
 
@@ -86,9 +92,10 @@ pub const SHELL_NET: Net = TESTNET11;
 pub const SHELL_NET: Net = MAINNET;
 
 /// The command that starts the node at `program`, for every spawn. It
-/// removes `SSF_CHIA_NETWORK` and `SSF_SHELL_CHANNEL` from the child's
-/// environment, so a variable in the player's environment can never move the
-/// bundled node to another chain or turn its channel on. A `chia-mainnet`
+/// removes `SSF_CHIA_NETWORK`, `SSF_SHELL_CHANNEL` and `SSF_WT_PORT` from the
+/// child's environment, so a variable in the player's environment can never
+/// move the bundled node to another chain, turn its channel on, or move it
+/// off the page port the app looks for a running node on. A `chia-mainnet`
 /// build then sets the network to mainnet (the node must be a `chia-mainnet`
 /// build too, or it exits and the hello fails). Only [`attach`] sets the
 /// channel's variable.
@@ -96,6 +103,7 @@ pub fn node_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove(NETWORK_ENV);
     cmd.env_remove(CHANNEL_ENV);
+    cmd.env_remove(WT_PORT_ENV);
     if cfg!(feature = "chia-mainnet") {
         cmd.env(NETWORK_ENV, MAINNET.id);
     }
@@ -809,7 +817,8 @@ mod tests {
         assert_eq!(envs.get(std::ffi::OsStr::new(CHANNEL_ENV)), Some(&Some(std::ffi::OsStr::new("1"))));
         let net = if cfg!(feature = "chia-mainnet") { Some(std::ffi::OsStr::new("mainnet")) } else { None };
         assert_eq!(envs.get(std::ffi::OsStr::new(NETWORK_ENV)), Some(&net));
-        assert_eq!(envs.len(), 2);
+        assert_eq!(envs.get(std::ffi::OsStr::new(WT_PORT_ENV)), Some(&None), "still removed");
+        assert_eq!(envs.len(), 3);
     }
 
     /// On Linux the guard is the real prctl: once it says the pipes are

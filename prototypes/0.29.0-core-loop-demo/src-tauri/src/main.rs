@@ -397,12 +397,15 @@ mod tests {
     use super::*;
 
     /// Both sidecar spawns go through `node_command`, which removes
-    /// SSF_CHIA_NETWORK and SSF_SHELL_CHANNEL from the child's environment
-    /// (a removed variable shows in `get_envs` as `None`); a `chia-mainnet`
-    /// build then sets the network to mainnet. Nothing is spawned and
-    /// nothing is read from this process's environment.
+    /// SSF_CHIA_NETWORK, SSF_SHELL_CHANNEL and SSF_WT_PORT from the child's
+    /// environment (a removed variable shows in `get_envs` as `None`); a
+    /// `chia-mainnet` build then sets the network to mainnet. SSF_WT_PORT is
+    /// the standalone node's setting: a sidecar on another page port would
+    /// leave UDP 4443 free, and the next launch would take that for "no node
+    /// runs". Nothing is spawned and nothing is read from this process's
+    /// environment.
     #[test]
-    fn the_sidecar_never_inherits_the_chia_network_or_the_shell_channel() {
+    fn the_sidecar_never_inherits_the_chia_network_the_shell_channel_or_the_page_port() {
         let net = if cfg!(feature = "chia-mainnet") { Some(std::ffi::OsStr::new("mainnet")) } else { None };
         for program in [std::ffi::OsStr::new("ssf-p2p-node"), std::ffi::OsStr::new("/opt/ssf/ssf-p2p-node")] {
             let cmd = node_command(program);
@@ -411,8 +414,12 @@ mod tests {
             envs.sort();
             assert_eq!(
                 envs,
-                vec![(std::ffi::OsStr::new("SSF_CHIA_NETWORK"), net), (std::ffi::OsStr::new("SSF_SHELL_CHANNEL"), None)],
-                "both removed (mainnet set back under chia-mainnet), and nothing else changed"
+                vec![
+                    (std::ffi::OsStr::new("SSF_CHIA_NETWORK"), net),
+                    (std::ffi::OsStr::new("SSF_SHELL_CHANNEL"), None),
+                    (std::ffi::OsStr::new("SSF_WT_PORT"), None),
+                ],
+                "all three removed (mainnet set back under chia-mainnet), and nothing else changed"
             );
         }
     }
